@@ -200,6 +200,10 @@ multipath / fabrics (defer).
 
 ## 4. Invariants & safety properties
 
+- The AER supervisor always reaches an await point, including when no NVMe
+  controller is installed. An empty controller registry parks for the normal
+  supervisor poll interval, permitting peer executor tasks to make progress.
+
 - PRP / SGL lists validated against the DMA buffer's bounds.
 - No DMA buffer a command may still reference is freed: I/O uses persistent
   scratch and PRP-list pages, a timed-out I/O marks the controller dead, and a

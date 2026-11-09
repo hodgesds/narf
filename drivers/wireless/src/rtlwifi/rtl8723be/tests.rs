@@ -1682,18 +1682,16 @@ fn be_factory() -> crate::rtlwifi::efuse::Factory {
     }
 }
 
+/// A NAPC row: (channel, bandwidth, offset, curve-value fn).
+type NapcRow = (u8, u8, u8, fn(u8, u8) -> i16);
+
 /// Build a NAPC envelope from the documented layout (header 96, rows of
 /// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
 /// `rows` are (channel, bandwidth, offset, curve-value fn) for v2, or
 /// (channel, 20, 0, fn) for v1. The identity is the board's factory
 /// identity; the MAC matches the factory. The curve fn takes the curve
 /// index (0 CCK, 1 OFDM, 2 HT) and the TXAGC index.
-fn be_napc_fixture(
-    version: u16,
-    antenna: i16,
-    qualified: i16,
-    rows: &[(u8, u8, u8, fn(u8, u8) -> i16)],
-) -> Vec<u8> {
+fn be_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRow]) -> Vec<u8> {
     let factory = be_factory();
     let identity = crate::rtlwifi::radio::factory_identity(&factory);
     let total = 96 + rows.len() * 388;
@@ -1927,7 +1925,7 @@ fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
     let domain = be_us_domain();
     let factory = be_factory();
     let bytes = be_napc_fixture(1, 0, 80, &[(6, 20, 0, be_rising)]);
-    let cal = match envelope::Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
+    let _cal = match envelope::Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory) {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("8723BE packet cal"),
     };
@@ -2038,11 +2036,11 @@ fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
         return TestResult::Fail("8723BE packet RTS descriptor bytes");
     }
     // Refusal before any byte is written: sentinel slot unchanged.
-    let refused = |mut frame: TxFrame| -> bool {
+    let refused = |frame: TxFrame| -> bool {
         let mut s = trx::TxDesc {
             dw: [0xdead_beef; 16],
         };
-        if owner.fill_tx_slot(&mut s, &mut frame).is_ok() {
+        if owner.fill_tx_slot(&mut s, &frame).is_ok() {
             return false;
         }
         s.dw == [0xdead_beef; 16]

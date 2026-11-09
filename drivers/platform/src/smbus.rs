@@ -29,7 +29,8 @@
 //!   011 = Word Data 100 = Process Call 101 = Block
 //!
 //! HST_STS bits: bit 0 = HOST_BUSY, bit 1 = INTR (success), bit 2 =
-//!   DEV_ERR, bit 3 = BUS_ERR, bit 4 = FAILED. Write-1-to-clear.
+//!   DEV_ERR, bit 3 = BUS_ERR, bit 4 = FAILED, bit 7 = BYTE_DONE
+//!   (one block byte clocked in). Write-1-to-clear.
 
 extern crate alloc;
 
@@ -69,6 +70,10 @@ const STS_INTR: u8 = 1 << 1;
 const STS_DEV_ERR: u8 = 1 << 2;
 const STS_BUS_ERR: u8 = 1 << 3;
 const STS_FAILED: u8 = 1 << 4;
+/// BYTE_DONE (bit 7): set once per byte during block
+/// transfers — the per-byte completion signal the I2C block
+/// read polls (Linux `i2c-i801.c` `SMBHSTSTS_BYTE_DONE`).
+const STS_BYTE_DONE: u8 = 1 << 7;
 const STS_ALL_ERRS: u8 = STS_DEV_ERR | STS_BUS_ERR | STS_FAILED;
 
 // HST_CNT bits.
@@ -76,6 +81,11 @@ const CNT_START: u8 = 1 << 6;
 const CNT_PROTO_BYTE_DATA: u8 = 0b010 << 2;
 const CNT_PROTO_WORD_DATA: u8 = 0b011 << 2;
 const CNT_PROTO_BLOCK: u8 = 0b101 << 2;
+/// I2C Block Read (`I801_I2C_BLOCK_DATA`, 0x18) and I2C Block
+/// Last (`I801_I2C_BLOCK_LAST`, 0x38) — HST_CNT protocol 110 /
+/// 111, ICH5 and later. See [`Smbus::read_i2c_block_data`].
+const CNT_PROTO_I2C_BLOCK: u8 = 0b110 << 2;
+const CNT_PROTO_I2C_BLOCK_LAST: u8 = 0b111 << 2;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SmbusError {
@@ -162,6 +172,35 @@ impl Smbus {
         // SAFETY: x86_64 PIO.
         unsafe {
             pio_out8(self.io_base + SMB_HST_STS, STS_INTR | STS_ALL_ERRS);
+        }
+        Ok(())
+    }
+
+    /// Wait for BYTE_DONE (one block byte clocked in) or any
+    /// error bit. Mirrors the per-byte wait in Linux
+    /// `i2c-i801.c` `i801_block_transaction_byte_by_byte`
+    /// (MAX_TIMEOUT 100 ms per byte).
+    fn wait_byte_done(&self) -> Result<(), SmbusError> {
+        let done = narf_scheduler::responsive_spin_until(
+            // SAFETY: x86_64 PIO.
+            || unsafe { pio_in8(self.io_base + SMB_HST_STS) }
+                & (STS_BYTE_DONE | STS_BUS_ERR | STS_DEV_ERR | STS_FAILED)
+                != 0,
+            narf_time::Deadline::after_ms(100),
+        );
+        if !done {
+            return Err(SmbusError::Timeout);
+        }
+        // SAFETY: x86_64 PIO.
+        let s = unsafe { pio_in8(self.io_base + SMB_HST_STS) };
+        if s & STS_BUS_ERR != 0 {
+            return Err(SmbusError::BusError);
+        }
+        if s & STS_DEV_ERR != 0 {
+            return Err(SmbusError::DeviceError);
+        }
+        if s & STS_FAILED != 0 {
+            return Err(SmbusError::Failed);
         }
         Ok(())
     }
@@ -264,6 +303,77 @@ impl Smbus {
             *slot = unsafe { pio_in8(self.io_base + SMB_HOST_BLOCK_DB) };
         }
         Ok(count)
+    }
+
+    /// Read a block at `cmd` from device `addr` into `buf`,
+    /// returning the number of payload bytes read (always
+    /// `buf.len()` on success).
+    ///
+    /// I2C Block Read (`i2c_smbus_read_i2c_block_data`,
+    /// Linux `Documentation/i2c/smbus-protocol`): unlike the
+    /// SMBus Block Read ([`Smbus::read_block_data`]) the
+    /// slave sends no Count byte — the host counts. The ICH
+    /// host issues it byte-by-byte (Linux `i2c-i801.c`
+    /// `i801_block_transaction_byte_by_byte`, ICH5 and later
+    /// — every controller this driver recognises): the slave
+    /// address goes out with the R/#W bit CLEAR even for
+    /// reads, and the command byte in HST_D1 (ICH5 datasheet
+    /// p.240, via i801); the byte count is preloaded in
+    /// HST_D0; each byte is clocked with HST_CNT protocol
+    /// 110 (`I2C_BLOCK_DATA`, 0x18), the last with 111
+    /// (`I2C_BLOCK_LAST`, 0x38), polling the BYTE_DONE
+    /// status bit and popping the byte from HOST_BLOCK_DB.
+    /// The block buffer (E32B) is never used for this
+    /// transaction — i801 routes I2C block reads around it,
+    /// and this driver never enables it.
+    ///
+    /// Needs silicon validation like the rest of this host
+    /// driver (no I2C block read has run against real
+    /// hardware in this tree yet); the RMI4-over-SMBus v1
+    /// transport is the first consumer.
+    pub fn read_i2c_block_data(
+        &self,
+        addr: u8,
+        cmd: u8,
+        buf: &mut [u8],
+    ) -> Result<usize, SmbusError> {
+        if buf.is_empty() || buf.len() > 32 {
+            return Err(SmbusError::Failed);
+        }
+        self.wait_idle()?;
+        // SAFETY: x86_64 PIO.
+        unsafe {
+            // R/#W clear even when reading; command in DAT1.
+            pio_out8(self.io_base + SMB_XMIT_SLVA, addr << 1);
+            pio_out8(self.io_base + SMB_HST_D1, cmd);
+            // Host-counted length.
+            pio_out8(self.io_base + SMB_HST_D0, buf.len() as u8);
+        }
+        let last = buf.len() - 1;
+        for (i, slot) in buf.iter_mut().enumerate() {
+            let proto = if i == last {
+                CNT_PROTO_I2C_BLOCK_LAST
+            } else {
+                CNT_PROTO_I2C_BLOCK
+            };
+            // SAFETY: x86_64 PIO.
+            unsafe {
+                pio_out8(
+                    self.io_base + SMB_HST_CNT,
+                    proto | if i == 0 { CNT_START } else { 0 },
+                );
+            }
+            self.wait_byte_done()?;
+            // SAFETY: same.
+            *slot = unsafe { pio_in8(self.io_base + SMB_HOST_BLOCK_DB) };
+            // Signal SMBBLKDAT ready (write-1-to-clear), as
+            // i801 does after every byte.
+            // SAFETY: same.
+            unsafe {
+                pio_out8(self.io_base + SMB_HST_STS, STS_BYTE_DONE | STS_INTR);
+            }
+        }
+        Ok(buf.len())
     }
 
     /// Write a block at `cmd` on device `addr`.

@@ -1911,9 +1911,7 @@ mod tests {
     kernel_test_in!("drivers/net/igb", smoke_igb_vmdq_rar_words);
 
     fn smoke_igb_vmdq_switch_words() -> TestResult {
-        if vt_ctl_default_pool_word(0xFFFF_FFFF, 7)
-            != (0xFFFF_FFFF & !0x380 & !(1 << 29)) | (7 << 7)
-        {
+        if vt_ctl_default_pool_word(0xFFFF_FFFF, 7) != (!0x380 & !(1 << 29)) | (7 << 7) {
             return TestResult::Fail("igb VT_CTL default-pool word drift");
         }
         if vt_ctl_replication_word(0, true) != VT_CTL_VM_REPL_EN

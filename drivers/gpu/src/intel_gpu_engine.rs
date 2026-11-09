@@ -387,6 +387,22 @@ impl Engine {
             0x1108101d
         }
     }
+    /// Dword index (relative to REGS) of the CTX_TIMESTAMP (0x3a8) value
+    /// slot in this engine's LRC image. The second LRI group starts with
+    /// 0x3a8 (see `xcs_image` and `context_image` in guc_sched.rs);
+    /// #1821 grew the RCS first group (15→16 off Gen12), moving that
+    /// group from dword 0x21 to 0x23 on non-Gen12 render, so its value
+    /// slot moved from 0x23 to 0x25. Gen12 render keeps the 14-register
+    /// first group and every non-render image pins the second group at
+    /// 0x21, so 0x23 stays correct there. Same predicate as the :1774
+    /// golden-restore fix (PR #1872).
+    pub(crate) fn timestamp_value_slot(self, platform: GtPlatform) -> u64 {
+        if self == Self::Rcs0 && !platform.is_gen12() {
+            0x25
+        } else {
+            0x23
+        }
+    }
 }
 
 /// xe_hw_engine_enable_ring for the GuC-owned engine. GT/render wake and
@@ -815,6 +831,26 @@ pub(crate) mod tests {
                 crate::intel_gpu_gt::Gen12Platform::TigerLake
             )),
             0x1108101b
+        );
+        // CTX_TIMESTAMP value slot (#1871): moved to 0x25 on non-Gen12
+        // render with the #1821 group growth; 0x23 elsewhere.
+        assert_eq!(
+            Engine::Rcs0.timestamp_value_slot(GtPlatform::Alchemist),
+            0x25
+        );
+        assert_eq!(
+            Engine::Rcs0.timestamp_value_slot(GtPlatform::Gen12(
+                crate::intel_gpu_gt::Gen12Platform::TigerLake
+            )),
+            0x23
+        );
+        assert_eq!(
+            Engine::Bcs0.timestamp_value_slot(GtPlatform::Battlemage),
+            0x23
+        );
+        assert_eq!(
+            Engine::Ccs0.timestamp_value_slot(GtPlatform::Alchemist),
+            0x23
         );
         let set = EngineSet::of(&[Engine::Rcs0, Engine::Ccs0]);
         assert!(set.contains(Engine::Ccs0) && !set.contains(Engine::Bcs0));

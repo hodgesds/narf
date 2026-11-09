@@ -219,8 +219,11 @@ use super::super::connection::Beacon;
 fn mld_beacon(bssid: [u8; 6], channel: u8, mld: [u8; 6], link: Option<u8>, eml: u16) -> Beacon {
     let mut ies = alloc::vec![0, 3, b'm', b'l', b'o'];
     if let Some(link) = link {
-        // Basic MLE: link id + EML capabilities present.
-        let mut body = alloc::vec![0x90, 0, 11];
+        // Basic MLE: link id + EML capabilities present. Common-info
+        // length: 1 (this length byte) + 6 (MLD address) + 1 (link id) +
+        // 2 (EML capabilities) = 10, as required by
+        // BasicMultiLink::parse (wireless/src/association/mlo.rs).
+        let mut body = alloc::vec![0x90, 0, 10];
         body.extend_from_slice(&mld);
         body.push(link);
         body.extend_from_slice(&eml.to_le_bytes());

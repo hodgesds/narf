@@ -81,6 +81,11 @@ Splitting `initramfs/` out of `narf-filesystem/` gains:
 
 ## 3. Design principles
 
+Boot-policy interface: `rd.luks.key`, `rd.luks.prompt=serial`,
+`rd.luks.uuid`, `rd.luks.tries`, and `rd.luks.timeout` configure the
+credential provider described in §5. Root selection remains the filesystem
+and block layers' responsibility; the EFI loader only hands off the archive.
+
 1. **Stage once, borrow forever.** The kernel boot path stages
    the parsed `Initramfs` exactly once into a process-global
    `OnceLock`-shaped static; subsequent consumers borrow
@@ -117,6 +122,13 @@ Splitting `initramfs/` out of `narf-filesystem/` gains:
 ### 4.1 Bootloader-supplied region
 
 Multi-architecture handoff:
+
+- **Native EFI** (x86_64, `cargo xtask efi-image`): the EFI application
+  embeds the kernel, uncompressed CPIO archive and command line. It copies
+  the archive into page-aligned EFI loader pages below 4 GiB, retains them
+  as reserved memory, and emits the same Multiboot2 `initramfs` module below.
+  Existing staging, firmware discovery and the opt-in LUKS keyfile provider
+  consume it without a separate archive on the ESP. See `docs/NATIVE_UEFI.md`.
 
 - **multiboot2** (x86_64, BIOS/UEFI): the bootloader places the
   CPIO archive at a 4-KiB-aligned phys address and emits a
@@ -254,6 +266,19 @@ command-line option is absent. Zeroization covers the per-attempt copy; the
 measured, read-only source bytes remain in the permanently staged initramfs and
 therefore should be treated as a boot-lifetime secret.
 
+Alternatively, `rd.luks.prompt=serial rd.luks.uuid=<container-uuid>` installs a
+no-echo serial provider. Keyfile and prompt policies are mutually exclusive.
+It reads the raw serial byte ring/UART before userspace, accepts printable
+ASCII with backspace, and cancels on Ctrl-C/Escape. Passphrases are limited to
+512 bytes, held in one preallocated zeroizing buffer, and never logged.
+`rd.luks.timeout=<seconds>` bounds each attempt (default 90, range 1–300);
+`rd.luks.tries=<n>` bounds wrong-passphrase attempts (default 3, range 1–5).
+The self-waking input future runs through `block_on_spin` without holding a
+lock across a poll. USB keyboard, TPM-unseal, and early-userspace policy are
+separate follow-ups. Both credential policies require a valid explicit `root=`;
+a failed required root mount terminates boot rather than launching a fallback
+initramfs shell. The EFI loader never sees credentials or opens LUKS volumes.
+
 ## 6. Migration plan from the current state
 
 Today `Initramfs` lives in `narf-filesystem` as a public type;
@@ -290,9 +315,11 @@ swaps its source from `narf_firmware::staged_initramfs()` to
 - **Initramfs writes.** This crate is read-only. A future
   ramfs / tmpfs that borrows the same byte-storage shape would
   be a sibling crate, not an extension here.
-- **Compression.** xz / zstd / gzip-compressed initramfs
-  archives stay decoded by the bootloader (Linux convention)
-  — `boot/` hands us already-decompressed bytes.
+- **Compression.** Current NARF staging and the native EFI source-build path
+  accept uncompressed CPIO `newc`. Bounded decompression is future work in
+  kernel initramfs handling, with explicit output/work limits and ownership.
+  Linux's `init/initramfs.c::unpack_to_rootfs` performs decompression in the
+  kernel; bootloader decompression is not a Linux requirement.
 - **Pivot-root / pseudo-FS overlay.** NARF doesn't have a
   "real root after pivot" phase; the initramfs is the only
   in-memory FS until userspace mounts virtiofs / 9p.
@@ -308,6 +335,13 @@ swaps its source from `narf_firmware::staged_initramfs()` to
   partitions ever land.
 
 ## 8. Open questions
+
+- An early-userspace root that unlocks an installed root needs explicit
+  archive ownership before reclamation: firmware and executable consumers
+  currently retain permanent borrowed slices. Credential buffers acquired
+  interactively or from a TPM should not require permanently embedding a
+  plaintext keyfile. These are follow-up contracts, not behavior of the
+  initial native EFI loader.
 
 - Should the staging static be **per-cpu** for read scalability?
   Lookup is rare (Stage::Bootstrap one-shot, Stage::Late

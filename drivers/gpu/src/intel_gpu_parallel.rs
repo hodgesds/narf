@@ -193,13 +193,21 @@ pub(super) fn prepare<A: BootAllocator>(
             image.write32(REGS + 5 * 4, 0);
             image.write32(REGS + 9 * 4, ring.ggtt_offset());
             image.write32(REGS + 11 * 4, 0x1001);
-            image.write32(REGS + 0x23 * 4, 0);
-            for slot in (0x25..=0x33).step_by(2) {
+            // Second LRI group values (see guc_sched.rs submit_inner):
+            // the header sits at 0x23 on non-Gen12 render after #1821,
+            // 0x21 elsewhere. Zero its nine value slots, never the header;
+            // the resident root descriptor goes in the last two values.
+            let second = if lane.engine == Engine::Rcs0 && !spec.platform.is_gen12() {
+                0x23
+            } else {
+                0x21
+            };
+            for slot in ((second + 2)..=(second + 18)).step_by(2) {
                 image.write32(REGS + slot * 4, 0);
             }
             let root = spec.resident.space().root_descriptor();
-            image.write32(REGS + 0x31 * 4, (root >> 32) as u32);
-            image.write32(REGS + 0x33 * 4, root as u32);
+            image.write32(REGS + (second + 16) * 4, (root >> 32) as u32);
+            image.write32(REGS + (second + 18) * 4, root as u32);
             let address = (!spec.resident.skip_batch()).then_some(addresses[index]);
             let mut words = if lane.engine.is_media() {
                 crate::intel_gpu_engine::media_ring(
@@ -221,9 +229,9 @@ pub(super) fn prepare<A: BootAllocator>(
                 )
             };
             if lane.placements.iter().count() > 1 {
-                job_timeout::setup_virtual(image, spec.platform);
+                job_timeout::setup_virtual(image, lane.engine, spec.platform);
             } else {
-                job_timeout::setup(image, spec.platform);
+                job_timeout::setup(image, lane.engine, spec.platform);
             }
             job_timeout::prefix(image.ggtt_offset(), spec.stamp, lane.engine, &mut words);
             if words.len() % 2 != 0 {

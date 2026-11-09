@@ -154,22 +154,23 @@ jobs:
         uses: ./.github/actions/setup-rust-cache
         with:
           components: rust-src llvm-tools-preview
-      - name: Install Limine
-        uses: ./.github/actions/setup-limine
-      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask build --arch=x86_64
+      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask efi-image
+      - run: cd target && sha256sum narf-x86_64.efi >narf-x86_64.efi.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-native-efi
+          path: |
+            target/narf-x86_64.efi
+            target/narf-x86_64.efi.sha256
       - run: |
           sudo apt-get update
           sudo apt-get install -y mtools
       - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask image --arch=aarch64
-      - run: |
-          mkdir -p target/narf-uefi
-          cp "$LIMINE_PATH/BOOTX64.EFI" target/narf-uefi/BOOTX64.EFI
       - uses: actions/upload-artifact@v4
         with:
           name: kernel
           path: |
-            target/x86_64-unknown-none/release/narf-frame
-            target/narf-uefi/BOOTX64.EFI
+            target/narf-x86_64.efi
             target/narf-frame-aarch64.efi-elf
             target/narf-uefi-aarch64/narf.efi
 
@@ -186,7 +187,7 @@ jobs:
             xorriso ovmf qemu-efi-aarch64 \
             qemu-system-x86 qemu-system-arm \
             cpio mtools dosfstools e2fsprogs
-      - name: Install Limine
+      - name: Install Limine for the retained legacy-media gate
         uses: ./.github/actions/setup-limine
       - name: Set up Rust + shared compiler cache
         uses: ./.github/actions/setup-rust-cache
@@ -195,6 +196,7 @@ jobs:
       # Exercise the removable-media path through OVMF first. This
       # verification build has boot-smoke enabled and must emit its
       # serial success marker before exiting through isa-debug-exit.
+      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask efi-image --smoke
       - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask iso-boot --arch=x86_64
       - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask iso-boot --arch=aarch64
       # Rebuild without boot-smoke so the published image keeps running.
@@ -225,6 +227,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-iso
+          path: assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-native-efi
           path: assets
       - name: Write consolidated package checksums
         run: |

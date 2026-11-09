@@ -176,3 +176,92 @@ fn navi22_plane_refusals() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/amdgpu/navi22-plane", navi22_plane_refusals);
+
+fn navi22_plane_plans_two_planes_jointly() -> TestResult {
+    let t = timing(148_500, (1920, 2200, 88, 44), (1080, 1125, 4, 5));
+    let lit = lit(&t);
+    let primary = Request::full_screen(1920, 1920, 1080, &t);
+    // A 480x270 video overlay upscaled 2x into the centre of the screen.
+    let overlay = Request {
+        pitch: 480,
+        width: 480,
+        height: 270,
+        src: (0, 0, 480, 270),
+        dst: (720, 405, 960, 540),
+    };
+    let Ok(two) = plan_two(&t, 3_650_000, &soc(), &lit, &primary, &overlay) else {
+        return TestResult::Fail("two-plane plan refused");
+    };
+    // The primary keeps the lit placement; the overlay scales 2x.
+    if two.primary.scaler.viewport != scl::Rect::new(0, 0, 1920, 1080)
+        || two.overlay.scaler.recout != scl::Rect::new(720, 405, 960, 540)
+        || (two.overlay.scaler.h_taps, two.overlay.scaler.v_taps) != (4, 4)
+    {
+        return TestResult::Fail("two-plane scalers wrong");
+    }
+    // One joint plan: the same clocks and watermarks on both planes, within
+    // the lit stream's clocks; the cursor is budgeted on the primary only.
+    if two.primary.plan.clocks != two.overlay.plan.clocks
+        || two.primary.plan.hubbub != two.overlay.plan.hubbub
+        || two.primary.plan.clocks.dppclk_khz > lit.clocks.dppclk_khz
+        || two.primary.plan.clocks.dispclk_khz > lit.clocks.dispclk_khz
+        || two.primary.plan.cursor.is_none()
+        || two.overlay.plan.cursor.is_some()
+    {
+        return TestResult::Fail("two-plane joint plan wrong");
+    }
+    // Each plane has its own HUBP pacing registers, and the slave's DPP
+    // clock comes from the joint plan.
+    if two.primary.plan.registers == two.overlay.plan.registers || two.overlay_dppclk_khz == 0 {
+        return TestResult::Fail("two planes share one pipe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-plane",
+    navi22_plane_plans_two_planes_jointly
+);
+
+fn navi22_plane_two_plane_refusals() -> TestResult {
+    let t = timing(148_500, (1920, 2200, 88, 44), (1080, 1125, 4, 5));
+    let lit = lit(&t);
+    let primary = Request::full_screen(1920, 1920, 1080, &t);
+    // SRC past the overlay framebuffer.
+    let outside = Request {
+        pitch: 480,
+        width: 480,
+        height: 270,
+        src: (100, 0, 480, 270),
+        dst: (0, 0, 480, 270),
+    };
+    if plan_two(&t, 3_650_000, &soc(), &lit, &primary, &outside) != Err(Refusal::Invalid) {
+        return TestResult::Fail("malformed overlay admitted");
+    }
+    // 3:1 down needs 2.25x the pixel rate of DPPCLK.
+    let three = Request {
+        pitch: 5760,
+        width: 5760,
+        height: 3240,
+        src: (0, 0, 5760, 3240),
+        dst: (0, 0, 1920, 1080),
+    };
+    if plan_two(&t, 3_650_000, &soc(), &lit, &primary, &three) != Err(Refusal::Clock) {
+        return TestResult::Fail("over-clock overlay admitted");
+    }
+    // An ODM stream refuses the two-plane path.
+    let basis = Basis {
+        timing: t,
+        vco_khz: 3_650_000,
+        soc: soc(),
+        lit,
+        odm: true,
+    };
+    if basis.plan_two(&primary, &primary) != Err(Refusal::Odm) {
+        return TestResult::Fail("ODM two-plane plan admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-plane",
+    navi22_plane_two_plane_refusals
+);

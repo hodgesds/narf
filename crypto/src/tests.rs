@@ -700,3 +700,103 @@ fn smoke_crypto_blake3_known_message() -> TestResult {
     }
 }
 kernel_test_in!("crypto", smoke_crypto_blake3_known_message);
+
+// SEC-C2 (#1551): redacted `Debug` on secret-holding primitives.
+// A direct `{:?}` must never print secret limbs, key halves, or
+// in-flight message bytes. The marker limb below would appear
+// verbatim (as a decimal limb) under the old derived `Debug`;
+// the filler bytes would appear as decimal byte arrays.
+fn smoke_crypto_debug_redaction() -> TestResult {
+    use crate::curve25519::{FieldElement, Point};
+    use crate::p256::{AffinePoint, Fp, ProjectivePoint, Scalar};
+    use crate::pbkdf2_sha1::Sha1;
+    use crate::poly1305::Poly1305;
+    use crate::sha256::Sha256;
+    use crate::sha512::Sha512;
+    use alloc::format;
+
+    // Distinctive marker limb: decimal rendering under a derived
+    // `Debug` would be "1234605616436508552".
+    const MARKER: u64 = 0x1122_3344_5566_7788;
+    const MARKER_DEC: &str = "1234605616436508552";
+
+    let scalar = Scalar::from_limbs([MARKER, 0, 0, 0]);
+    let dbg = format!("{scalar:?}");
+    if !dbg.contains("<redacted") || dbg.contains(MARKER_DEC) {
+        return TestResult::Fail("Scalar Debug leaks limbs");
+    }
+
+    let fp = Fp::from_limbs([MARKER, 0, 0, 0]);
+    let dbg = format!("{fp:?}");
+    if !dbg.contains("<redacted") || dbg.contains(MARKER_DEC) {
+        return TestResult::Fail("Fp Debug leaks limbs");
+    }
+
+    let affine = AffinePoint {
+        x: fp,
+        y: fp,
+        infinity: false,
+    };
+    let dbg = format!("{affine:?}");
+    if !dbg.contains("<redacted") || dbg.contains(MARKER_DEC) {
+        return TestResult::Fail("AffinePoint Debug leaks coordinates");
+    }
+
+    let projective = ProjectivePoint {
+        x: fp,
+        y: fp,
+        z: fp,
+    };
+    let dbg = format!("{projective:?}");
+    if !dbg.contains("<redacted") || dbg.contains(MARKER_DEC) {
+        return TestResult::Fail("ProjectivePoint Debug leaks coordinates");
+    }
+
+    let fe = FieldElement([MARKER as i64, 0, 0, 0, 0]);
+    let dbg = format!("{fe:?}");
+    if !dbg.contains("<redacted") || dbg.contains(MARKER_DEC) {
+        return TestResult::Fail("FieldElement Debug leaks limbs");
+    }
+
+    let point = Point {
+        x: fe,
+        y: fe,
+        z: fe,
+        t: fe,
+    };
+    let dbg = format!("{point:?}");
+    if !dbg.contains("<redacted") || dbg.contains(MARKER_DEC) {
+        return TestResult::Fail("Point Debug leaks coordinates");
+    }
+
+    // `s` limb for a 0x88 key: u32 LE 0x88888888 = 2290649224.
+    let poly = Poly1305::new(&[0x88u8; 32]);
+    let dbg = format!("{poly:?}");
+    if !dbg.contains("<redacted") || dbg.contains("2290649224") {
+        return TestResult::Fail("Poly1305 Debug leaks key halves");
+    }
+
+    let mut sha256 = Sha256::new();
+    sha256.update(&[0xAAu8; 8]);
+    let dbg = format!("{sha256:?}");
+    if !dbg.contains("<redacted") || dbg.contains("170, 170") {
+        return TestResult::Fail("Sha256 Debug leaks in-flight bytes");
+    }
+
+    let mut sha512 = Sha512::new();
+    sha512.update(&[0xBBu8; 8]);
+    let dbg = format!("{sha512:?}");
+    if !dbg.contains("<redacted") || dbg.contains("187, 187") {
+        return TestResult::Fail("Sha512 Debug leaks in-flight bytes");
+    }
+
+    let mut sha1 = Sha1::new();
+    sha1.update(&[0xCCu8; 8]);
+    let dbg = format!("{sha1:?}");
+    if !dbg.contains("<redacted") || dbg.contains("204, 204") {
+        return TestResult::Fail("Sha1 Debug leaks in-flight bytes");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("crypto", smoke_crypto_debug_redaction);

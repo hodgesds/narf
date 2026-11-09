@@ -18,7 +18,7 @@
 //!     discrete owners publish their `Snapshot` — retained across a
 //!     rejected refresh, never fabricated;
 //!   - the last sample exposed through [`snapshot()`] for diagnostics and
-//!     for the future `gpu_temp_mc` provider.
+//!     for the `gpu_temp_mc` provider.
 //!
 //! Grounded in the Linux amdgpu driver (yocto mirror of mainline, fetched
 //! 2026-11-06; the NARF in-tree v13 decode was re-checked against the
@@ -55,15 +55,11 @@
 //!     mmio, epoch))` once the owner and mailbox live somewhere
 //!     `'static` (cf. `amdgpu_navi22_power::start`, which spawns
 //!     against the discrete platform singleton).
-//!   - It does not register the `gpu_temp_mc` provider. That half needs
-//!     `amdgpu_smu_temp` from the still-open draft PR #1697 (it owns
-//!     the provider registration and the discrete-owner reads). When
-//!     #1697 lands, the rebase is three lines: an `edge_from_apu`
-//!     arm in `gpu_temp_mc_from` reading
-//!     `amdgpu_smu_apu_telemetry::snapshot()`'s
+//!   - It does not register the `gpu_temp_mc` provider. That half lives
+//!     in `amdgpu_smu_temp` (PR #1697 wired the discrete arms; the APU
+//!     arm in `gpu_temp_mc_from` reads `snapshot()`'s
 //!     [`ApuSnapshot::edge_temperature_milli_c`], consulted after the
-//!     discrete owners, plus the `snapshot()` call in `gpu_temp_mc()`.
-//!     Duplicating #1697's unmerged module here was the wrong trade.
+//!     discrete owners).
 //!
 //! # Lifetime
 //!
@@ -384,8 +380,8 @@ impl ApuTelemetryOwner<DmaBuffer> {
     }
 }
 
-/// Last telemetry state, published to diagnostics and (once #1697
-/// lands) to the power service's `gpu_temp_mc` provider.
+/// Last telemetry state, published to diagnostics and to the power
+/// service's `gpu_temp_mc` provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ApuSnapshot {
     /// Most recent successful sample; retained across a rejected refresh.
@@ -400,8 +396,9 @@ impl ApuSnapshot {
     /// Edge temperature in milli-degrees Celsius from the last
     /// published sample. `None` when the owner never published — the
     /// field stays unknown rather than reporting a fabricated zero
-    /// (the hwmon class rule). This is the value the future
-    /// `gpu_temp_mc` arm reads; see the module docs for the rebase.
+    /// (the hwmon class rule). This is the value the `gpu_temp_mc`
+    /// arm reads (`amdgpu_smu_temp::gpu_temp_mc_from`, after the
+    /// discrete owners).
     pub fn edge_temperature_milli_c(&self) -> Option<i32> {
         self.metrics.map(|m| m.edge_temperature_milli_c())
     }

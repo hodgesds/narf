@@ -396,13 +396,15 @@ pub unsafe fn baseline_power_on(mmio: &MmioRegion) -> Result<(), MacError> {
 /// 7. Set `B_BE_PLATFORM_EN | B_BE_APB_WRAP_EN`. Bit 3 is NOT set:
 ///    it is undefined on BE (no `B_BE_AXIDMA_EN`).
 ///
-/// NOT transcribed here (remainder, with the full per-chip table):
-/// the AFE/ANAPAR/FEN_RST_ENABLE writes, the `R_BE_HCI_OPT_CTRL`
-/// HAXIDMA/WLAN IO enables and their polls, the
-/// `B_BE_PCIE_FORCE_IBX_EN` clear, the XTAL SI writes, and the
-/// ADIE pad-power writes — the tail of `rtw8922a_pwr_on_func`.
+/// The tail of `rtw8922a_pwr_on_func` is owned by
+/// `mac_pre_init_8922a` (`power_on_tail`, run from
+/// `pci::bring_up` right after this head): the AFE/ANAPAR/
+/// FEN_RST_ENABLE writes, the `R_BE_HCI_OPT_CTRL` HAXIDMA/WLAN
+/// IO enables and their polls, the `B_BE_PCIE_FORCE_IBX_EN`
+/// clear, the XTAL SI writes, and the ADIE pad-power writes.
 /// The MAC-reset state machine (`rtw89_mac_reset_pwr_state_be`,
-/// `mac_be.c:474`) is likewise the future mac_pre_init owner's.
+/// `mac_be.c:474`) is likewise owned there (`reset_pwr_state`),
+/// and runs before the tail.
 ///
 /// # Safety
 /// Caller owns the BAR2 MMIO exclusively for the duration of the

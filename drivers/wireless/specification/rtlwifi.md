@@ -3413,12 +3413,22 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   (dual-dual 1T1R functions never transmit two streams). The 5 GHz
   ceiling is the spanning-rule ceiling capped by the `regd.c`
   5140-5360 / 5460-5860 MHz 30 dBm blocks (DFS/NO_IR/indoor rules
-  refuse); `domain_ceiling` stays 2.4 GHz-only. Still open:
-  `Prepared::Chip::Rtl8192de` integration + the production
+  refuse); `domain_ceiling` stays 2.4 GHz-only. Step 6 (follow-up
+  to #1865, #1888) adds DM init (`rtl92d_dm_init`), the
+  `rtl92de_hw_init` early-mode / ASPM back-door / hardware-security
+  steps, the IQK reload wired into the channel switch, and the
+  5 GHz native-admission gate (`native_channel`: a dual-dual MAC0
+  function admits the 5 GHz plan, MAC1 admits 2.4 GHz 1–11). Still
+  open: `Prepared::Chip::Rtl8192de` integration + the production
   `rtl92de_hw_init` orchestrator, AMPDU aggregation / RDG/HTC / LPS
   hardware sequence numbers / encryption sectype / TX-report requests
   / multi-station rate-id / MAC-id, card disable / power-off adapter,
-  and the H2C rate-mask send.
+  and the H2C rate-mask send. Still open from #1888: LC calibrate,
+  the reserved-page packet, and the TX-report C2H path — Linux v6.1
+  gives 92D no C2H arrival route (`rtl92de_rx_query_desc` never
+  sets `packet_report_type`; the `IMR_C2HCMD` dispatch in `pci.c`
+  is gated to RTL8723AE), so a requested report can only resolve
+  via the 3 s timeout.
 
 ## 4. Invariants
 

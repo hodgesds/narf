@@ -38,15 +38,18 @@
 //!   already refuses them; BE matches.
 //! - MACID is capped at the chip's 32 stations
 //!   (`SUPPORT_MACID_NUM`), not the 128 the generic queue allows.
-//! - No TXWD_INFO block is built in pass 1: [`build_header`]
+//! - No TXWD_INFO block is built by default: [`build_header`]
 //!   clears BODY0 bit 22 (WDINFO_EN) on the caller-supplied v2
 //!   body, matching the AX transport's "no info block present"
-//!   rule. The v2 info fill is a remainder.
-//! - FWCMD header framing for H2C bodies (`fwcmd_hdr`, type /
-//!   category / class / func / sequence) is the caller's: the
-//!   station owner builds CCTL/BA-CAM/RA bodies, and the framing
-//!   layer that wraps them is a separate remainder. This module
-//!   moves caller-framed buffers across CH12.
+//!   rule. [`build_header_with_info`] appends a caller-filled
+//!   v2 info block (`txrx_be::fill_txwd_info_v2`) and leaves the
+//!   bit set, mirroring Linux `rtw89_core_fill_txdesc_v2`'s
+//!   `en_wd_info` opt-in.
+//! - FWCMD header framing for H2C bodies is the caller's: the
+//!   station owner builds CCTL/BA-CAM/RA bodies, and
+//!   `fwcmd_8922a::frame_h2c` wraps them (type / category /
+//!   class / func / sequence) for this module to move across
+//!   CH12.
 
 use alloc::vec::Vec;
 
@@ -57,6 +60,8 @@ use super::tx_transport::{self, Completion, Ticket, TxQueue};
 
 /// TXWD_BODY_V2 size in bytes (`chip_8922a::TXWD_BODY_SIZE`).
 pub(super) const TXWD_BODY_V2_SIZE: usize = 32;
+/// TXWD_INFO_V2 size in bytes (`chip_8922a::TXWD_INFO_SIZE`).
+pub(super) const TXWD_INFO_SIZE: usize = 32;
 /// TXWP info block size in bytes (`struct rtw89_pci_tx_wp_info`,
 /// 4 × u16).
 pub(super) const TXWP_SIZE: usize = 8;
@@ -187,13 +192,31 @@ pub(super) fn fill_addr_info_v1(
 }
 
 /// Build the complete header bytes for one data frame: the
-/// caller-supplied 32-byte v2 body (with WDINFO_EN cleared: no
-/// info block follows in pass 1) + the 8-byte WP info block
+/// caller-supplied 32-byte v2 body + the 8-byte WP info block
 /// (`seq0 = sequence | VALID`, `seq1..seq3 = 0`) + the v1
 /// address-info entries for the frame. The caller places these
 /// bytes into header DMA memory and syncs them before kick.
 pub(super) fn build_header(
     body: &[u8; TXWD_BODY_V2_SIZE],
+    sequence: u16,
+    frame_dma: u64,
+    frame_len: usize,
+) -> Result<Vec<u8>, Error> {
+    build_header_with_info(body, None, sequence, frame_dma, frame_len)
+}
+
+/// Build the complete header bytes for one data frame with a
+/// TXWD_INFO v2 block: the 32-byte v2 body + the 32-byte info
+/// block (`txrx_be::fill_txwd_info_v2` output) + the 8-byte WP
+/// info block + the v1 address-info entries. With `info` the
+/// body's BODY0 bit 22 (WDINFO_EN) is left set so the firmware
+/// reads the block that follows; without it the bit is cleared,
+/// as in [`build_header`]. Linux `rtw89_core_fill_txdesc_v2`
+/// fills the info block only when `desc_info->en_wd_info` is
+/// set (`core.c:1870`); the same opt-in applies here.
+pub(super) fn build_header_with_info(
+    body: &[u8; TXWD_BODY_V2_SIZE],
+    info: Option<&[u8; TXWD_INFO_SIZE]>,
     sequence: u16,
     frame_dma: u64,
     frame_len: usize,
@@ -204,11 +227,17 @@ pub(super) fn build_header(
     if frame_dma > FRAME_DMA_MASK {
         return Err(Error::BadDma);
     }
-    let mut header = Vec::with_capacity(TXWD_BODY_V2_SIZE + TXWP_SIZE + 60);
+    let mut header = Vec::with_capacity(TXWD_BODY_V2_SIZE + TXWD_INFO_SIZE + TXWP_SIZE + 60);
     let mut dw0 = u32::from_le_bytes(body[0..4].try_into().unwrap());
-    dw0 &= !(1 << 22); // No WD_INFO block follows.
+    match info {
+        Some(_) => dw0 |= 1 << 22, // WD_INFO block follows.
+        None => dw0 &= !(1 << 22), // No WD_INFO block follows.
+    }
     header.extend_from_slice(&dw0.to_le_bytes());
     header.extend_from_slice(&body[4..TXWD_BODY_V2_SIZE]);
+    if let Some(info) = info {
+        header.extend_from_slice(info);
+    }
     header.extend_from_slice(&(sequence | TXWP_VALID).to_le_bytes());
     header.extend_from_slice(&[0u8; 6]);
     let mut addr = [0u8; ADDR_INFO_MAX_NR * ADDR_INFO_ENTRY_SIZE];
@@ -288,8 +317,29 @@ impl DataTx {
     /// without publishing or ringing the doorbell. `args.bd` is the
     /// channel's descriptor ring slice (indexed by slot).
     /// `args.body` is the caller-built 32-byte v2 body (typically
-    /// `txrx_be::encode_txwd_be` output for the station).
+    /// `txrx_be::encode_txwd_be` output for the station). No
+    /// TXWD_INFO block follows (BODY0 bit 22 cleared).
     pub(super) fn prepare(&mut self, args: PrepareArgs<'_>) -> Result<Prepared, Error> {
+        self.prepare_inner(args, None)
+    }
+
+    /// Like [`Self::prepare`], but appends the caller-filled
+    /// 32-byte TXWD_INFO v2 block (`txrx_be::fill_txwd_info_v2`
+    /// output) after the v2 body and leaves BODY0 bit 22
+    /// (WDINFO_EN) set.
+    pub(super) fn prepare_with_info(
+        &mut self,
+        args: PrepareArgs<'_>,
+        info: &[u8; TXWD_INFO_SIZE],
+    ) -> Result<Prepared, Error> {
+        self.prepare_inner(args, Some(info))
+    }
+
+    fn prepare_inner(
+        &mut self,
+        args: PrepareArgs<'_>,
+        info: Option<&[u8; TXWD_INFO_SIZE]>,
+    ) -> Result<Prepared, Error> {
         if args.channel >= 12 {
             return Err(Error::BadChannel);
         }
@@ -319,7 +369,13 @@ impl DataTx {
                 args.qsel,
             )
             .map_err(|(error, _)| map_tx_error(error))?;
-        let header = build_header(args.body, ticket.sequence, args.frame_dma, args.frame_len)?;
+        let header = build_header_with_info(
+            args.body,
+            info,
+            ticket.sequence,
+            args.frame_dma,
+            args.frame_len,
+        )?;
         let entry = args
             .bd
             .get_mut(ticket.slot as usize)

@@ -201,6 +201,50 @@ kernel_test_in!(
     freesync_dp_sst_caps_follow_amdgpu_dm_update_freesync_caps
 );
 
+/// The DP enable chain: DPCD caps + EDID range -> VrrRange -> DRR bounds
+/// -> LFC admission on a 144 Hz mode, and no LFC admission on a 60 Hz
+/// mode in the same range (its effective range is under 2:1).
+fn freesync_dp_caps_to_drr_to_lfc_admission() -> TestResult {
+    let mut dpcd = [0u8; 16];
+    dpcd[7] = 0x41;
+    let range = dp_sst_caps(&edid_48_144(), &dpcd).unwrap();
+    let t = qhd144();
+    let bounds = drr(&t, range).unwrap();
+    if bounds
+        != (Drr {
+            v_total_min: 1497,
+            v_total_max: 4491,
+        })
+    {
+        return TestResult::Fail("DRR bounds");
+    }
+    let config = LfcConfig::new(&t, range).unwrap();
+    if config.base() != bounds || config.timing() != t {
+        return TestResult::Fail("LFC admission");
+    }
+    let hd60 = Timing {
+        pixel_clock_khz: 148_500,
+        h_active: 1920,
+        h_total: 2200,
+        h_front_porch: 88,
+        h_sync_width: 44,
+        v_active: 1080,
+        v_total: 1125,
+        v_front_porch: 4,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    if drr(&hd60, range).is_none() || LfcConfig::new(&hd60, range).is_some() {
+        return TestResult::Fail("60 Hz mode LFC admission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/freesync",
+    freesync_dp_caps_to_drr_to_lfc_admission
+);
+
 fn freesync_vtotals_match_mod_freesync_build_vrr_params() -> TestResult {
     let t = qhd144();
     // Hand-computed from Linux's integer code: nominal 143994361 uHz, so the

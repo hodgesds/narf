@@ -644,6 +644,8 @@ fn smoke_dhcp_on_udp_in_parses_offer() -> TestResult {
             gateway: [0; 4],
             server: [0; 4],
             lease_secs: 0,
+            ntp: [[0; 4]; 3],
+            ntp_count: 0,
         },
     );
     let _ = build_discover; // silence unused
@@ -4334,6 +4336,8 @@ fn smoke_dhcp_state_machine_discover_to_ack() -> TestResult {
         gateway: gw,
         server,
         lease_secs: 3600,
+        ntp: [[0; 4]; 3],
+        ntp_count: 0,
     };
     // The LATEST_REPLY slot should now hold the ACK (last written).
     // We can't verify internals from here but the test proves the

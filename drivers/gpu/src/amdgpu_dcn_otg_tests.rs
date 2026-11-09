@@ -479,6 +479,181 @@ kernel_test_in!(
     dcn30_otg_drr_bounds_manual_trigger_and_fixed_restore
 );
 
+/// DCN30 LFC end to end, mirroring the DCN401 BTR apply: a 48-144 Hz
+/// range on a 144 Hz mode admits DRR bounds 1497..4491, admits BTR, a
+/// 100 ms render engages insertion (seven 14285 us frames, first repeat
+/// total 3079 lines), the seven VUPDATEs run the insertion out and the
+/// admitted range resumes, and a fast render disengages BTR.
+fn dcn30_otg_lfc_engages_inserts_and_disengages() -> TestResult {
+    use crate::amdgpu_freesync::{drr, Drr, LfcConfig, VrrRange};
+    let t = Timing {
+        pixel_clock_khz: 586_322,
+        h_active: 2560,
+        h_total: 2720,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 1440,
+        v_total: 1497,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: false,
+    };
+    let range = VrrRange {
+        min_hz: 48,
+        max_hz: 144,
+    };
+    let bounds = drr(&t, range).unwrap();
+    if bounds
+        != (Drr {
+            v_total_min: 1497,
+            v_total_max: 4491,
+        })
+    {
+        return TestResult::Fail("DRR bounds for 48-144 Hz on a 144 Hz mode");
+    }
+    let config = LfcConfig::new(&t, range).unwrap();
+    if config.base() != bounds {
+        return TestResult::Fail("LFC base is not the admitted DRR bounds");
+    }
+    let mut e = engine(1);
+    e.profile = Profile::Navi22;
+    if e.program_timing(&t, &sync()).is_err() {
+        return TestResult::Fail("DRR timing setup");
+    }
+    e.state = State::Running;
+    let base = OTG_STRIDE as usize;
+    // No DRR yet: BTR has nothing to insert into.
+    if e.configure_dcn30_lfc(Some(config)) != Err(Error::Busy) {
+        return TestResult::Fail("LFC admitted without DRR");
+    }
+    if e.configure_dcn30_drr(Some(bounds)) != Ok(Some(bounds)) {
+        return TestResult::Fail("DRR setup");
+    }
+    // A config for other bounds is refused without writes.
+    let writes = e.io.writes.len();
+    let other = LfcConfig::new(
+        &t,
+        VrrRange {
+            min_hz: 48,
+            max_hz: 120,
+        },
+    )
+    .unwrap();
+    if e.configure_dcn30_lfc(Some(other)) != Err(Error::Invalid) || e.io.writes.len() != writes {
+        return TestResult::Fail("LFC admitted for foreign bounds");
+    }
+    if e.configure_dcn30_lfc(Some(config)).is_err() || !e.dcn30_lfc_active() {
+        return TestResult::Fail("LFC admission");
+    }
+    let writes = e.io.writes.len();
+    if e.configure_dcn30_lfc(Some(config)).is_err() || e.io.writes.len() != writes {
+        return TestResult::Fail("unchanged LFC reprogrammed");
+    }
+    // Frame 0 was snapshotted at admission; one VUPDATE, then a first
+    // flip at t=0 records the render clock without engaging.
+    e.io.values[base + 0x1b4c] = 1;
+    if e.dcn30_lfc_preflip(0, false).is_err()
+        || e.io.values[base + 0x1b31] != bounds.v_total_max - 1
+        || e.io.values[base + 0x1b30] != bounds.v_total_min - 1
+    {
+        return TestResult::Fail("first preflip changed the totals");
+    }
+    // A 100 ms render engages BTR (seven 14285 us frames); entering BTR
+    // waits for the next VUPDATE, so the totals stay admitted for now.
+    e.io.values[base + 0x1b4c] = 2;
+    if e.dcn30_lfc_preflip(100_000, false).is_err()
+        || e.io.values[base + 0x1b31] != bounds.v_total_max - 1
+        || e.io.values[base + 0x1b30] != bounds.v_total_min - 1
+    {
+        return TestResult::Fail("BTR engage changed the totals early");
+    }
+    // The first VUPDATE repeats one 14285 us frame (3079 lines, DP floor).
+    let repeat = config.total_from_duration(14_285, false).unwrap();
+    if repeat != 3079 {
+        return TestResult::Fail("BTR repeat total for a 14285 us frame");
+    }
+    e.io.values[base + 0x1b4c] = 3;
+    if e.dcn30_lfc_progress(false).is_err()
+        || e.io.values[base + 0x1b31] != repeat - 1
+        || e.io.values[base + 0x1b30] != repeat - 1
+    {
+        return TestResult::Fail("first BTR VUPDATE did not fix the repeat total");
+    }
+    // The remaining six VUPDATEs run the insertion out; the last one
+    // restores the admitted variable range.
+    for frame in 4..=9 {
+        e.io.values[base + 0x1b4c] = frame;
+        if e.dcn30_lfc_progress(false).is_err() {
+            return TestResult::Fail("BTR VUPDATE");
+        }
+    }
+    if e.io.values[base + 0x1b31] != bounds.v_total_max - 1
+        || e.io.values[base + 0x1b30] != bounds.v_total_min - 1
+    {
+        return TestResult::Fail("BTR exit did not restore the admitted range");
+    }
+    // A 16 ms render is back inside the range: BTR disengages.
+    e.io.values[base + 0x1b4c] = 10;
+    if e.dcn30_lfc_preflip(116_000, false).is_err()
+        || e.io.values[base + 0x1b31] != bounds.v_total_max - 1
+        || e.io.values[base + 0x1b30] != bounds.v_total_min - 1
+    {
+        return TestResult::Fail("fast render did not disengage BTR");
+    }
+    // A missed VUPDATE discards the cycle instead of shortening the
+    // wrong frame: re-engage, then jump the frame count by two.
+    e.io.values[base + 0x1b4c] = 11;
+    if e.dcn30_lfc_preflip(116_000, false).is_err() {
+        return TestResult::Fail("re-engage setup");
+    }
+    e.io.values[base + 0x1b4c] = 12;
+    if e.dcn30_lfc_preflip(216_000, false).is_err() {
+        return TestResult::Fail("re-engage");
+    }
+    e.io.values[base + 0x1b4c] = 14;
+    if e.dcn30_lfc_progress(false).is_err()
+        || e.io.values[base + 0x1b31] != bounds.v_total_max - 1
+        || e.io.values[base + 0x1b30] != bounds.v_total_min - 1
+    {
+        return TestResult::Fail("missed VUPDATE did not restore the admitted range");
+    }
+    // Resync re-snapshots the frame count and restores the range.
+    if e.dcn30_lfc_resync().is_err()
+        || e.io.values[base + 0x1b31] != bounds.v_total_max - 1
+        || e.io.values[base + 0x1b30] != bounds.v_total_min - 1
+    {
+        return TestResult::Fail("LFC resync");
+    }
+    // Retiring BTR leaves the admitted range programmed.
+    if e.configure_dcn30_lfc(None).is_err()
+        || e.dcn30_lfc_active()
+        || e.io.values[base + 0x1b31] != bounds.v_total_max - 1
+        || e.io.values[base + 0x1b30] != bounds.v_total_min - 1
+    {
+        return TestResult::Fail("LFC retire");
+    }
+    // Re-admitting, then returning to fixed refresh, retires BTR with it.
+    if e.configure_dcn30_lfc(Some(config)).is_err() || !e.dcn30_lfc_active() {
+        return TestResult::Fail("LFC re-admission");
+    }
+    if e.configure_dcn30_drr(None) != Ok(None) || e.dcn30_lfc_active() {
+        return TestResult::Fail("fixed refresh did not retire BTR");
+    }
+    if e.configure_dcn30_lfc(Some(config)) != Err(Error::Busy) {
+        return TestResult::Fail("LFC admitted without DRR after retire");
+    }
+    e.profile = Profile::Dcn314;
+    if e.configure_dcn30_lfc(Some(config)) != Err(Error::Unsupported) {
+        return TestResult::Fail("LFC used an unverified register layout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    dcn30_otg_lfc_engages_inserts_and_disengages
+);
+
 fn otg_dcn30_live_global_sync_follows_dcn20_program_tg() -> TestResult {
     let mut otg = engine(1);
     otg.profile = Profile::Navi22;

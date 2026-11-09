@@ -394,12 +394,10 @@ impl power::Io for Fake {
         0
     }
 
-    fn delay_us(&mut self, _us: u64) -> impl core::future::Future<Output = ()> {
-        async {}
-    }
+    async fn delay_us(&mut self, _us: u64) {}
 
-    fn read_ecv(&mut self) -> impl core::future::Future<Output = Result<Option<u8>, power::Error>> {
-        async { Ok(None) }
+    async fn read_ecv(&mut self) -> Result<Option<u8>, power::Error> {
+        Ok(None)
     }
 }
 

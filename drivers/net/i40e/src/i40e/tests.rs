@@ -10,12 +10,13 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
     desc_buf_addr, is_supported_device, mac_is_invalid, name_for, set_desc_buf_addr, AqDesc,
-    AqError, AqOpcode, FirmwareVersion, LinkSpeed, LinkStatus, MacAddresses, AQC_LARGE_BUF_CHECK,
-    AQLEN_ENABLE, AQ_BUF_BYTES, AQ_FLAG_BUF, AQ_FLAG_DD, AQ_FLAG_ERR, AQ_FLAG_LB, AQ_FLAG_RD,
-    AQ_RING_BYTES, AQ_RING_LEN, GLNVM_ULD_READY, I40E_DEV_SFP_XL710, I40E_VENDOR,
-    LINK_INFO_LINK_UP, LINK_INFO_MEDIA_AVAILABLE, MAC_ADDR_LAN_VALID, PFGEN_CTRL_PFSWR,
-    REG_GLGEN_RSTAT, REG_GLNVM_ULD, REG_PFGEN_CTRL, REG_PF_ARQBAL, REG_PF_ARQT, REG_PF_ATQBAH,
-    REG_PF_ATQBAL, REG_PF_ATQH, REG_PF_ATQLEN, REG_PF_ATQT, SUPPORTED_DEVICE_IDS,
+    AqError, AqOpcode, FirmwareVersion, I40ePhyType, LinkSpeed, LinkStatus, MacAddresses,
+    PhyAbilities, PhyConfig, AQC_LARGE_BUF_CHECK, AQLEN_ENABLE, AQ_BUF_BYTES, AQ_FLAG_BUF,
+    AQ_FLAG_DD, AQ_FLAG_ERR, AQ_FLAG_LB, AQ_FLAG_RD, AQ_RING_BYTES, AQ_RING_LEN, GLNVM_ULD_READY,
+    I40E_DEV_SFP_XL710, I40E_VENDOR, LINK_INFO_LINK_UP, LINK_INFO_MEDIA_AVAILABLE,
+    MAC_ADDR_LAN_VALID, PFGEN_CTRL_PFSWR, PHY_ABILITIES_RESP_LEN, PHY_ENABLE_AN, PHY_ENABLE_LINK,
+    PHY_FEC_AUTO, REG_GLGEN_RSTAT, REG_GLNVM_ULD, REG_PFGEN_CTRL, REG_PF_ARQBAL, REG_PF_ARQT,
+    REG_PF_ATQBAH, REG_PF_ATQBAL, REG_PF_ATQH, REG_PF_ATQLEN, REG_PF_ATQT, SUPPORTED_DEVICE_IDS,
 };
 
 // ── PCI match table ──────────────────────────────────────────────────
@@ -115,6 +116,12 @@ fn smoke_i40e_aq_opcodes() -> TestResult {
     }
     if AqOpcode::GetLinkStatus as u16 != 0x0607 {
         return TestResult::Fail("get_link_status opcode wrong");
+    }
+    if AqOpcode::GetPhyAbilities as u16 != 0x0600 {
+        return TestResult::Fail("get_phy_abilities opcode wrong");
+    }
+    if AqOpcode::SetPhyConfig as u16 != 0x0601 {
+        return TestResult::Fail("set_phy_config opcode wrong");
     }
     TestResult::Pass
 }
@@ -220,6 +227,9 @@ fn smoke_i40e_link_status_decode() -> TestResult {
     if s.speed() != LinkSpeed::Speed10Gb || s.speed().label() != "10G" {
         return TestResult::Fail("10G speed decoded wrong");
     }
+    if s.phy_type_decoded() != I40ePhyType::Sfi || s.phy_type_decoded().name() != "SFI" {
+        return TestResult::Fail("phy_type 0x07 should decode to SFI");
+    }
     if s.max_frame_size != 9728 {
         return TestResult::Fail("max_frame_size decoded wrong");
     }
@@ -237,6 +247,184 @@ fn smoke_i40e_link_status_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/i40e", smoke_i40e_link_status_decode);
+
+// ── PHY type table (issue #867) ──────────────────────────────────────
+
+fn smoke_i40e_phy_type_decode() -> TestResult {
+    // Every named value of Linux `enum i40e_aq_phy_type`
+    // (i40e_adminq_cmd.h lines 1384–1428, torvalds/linux @
+    // cbbddb6): byte, variant, Linux constant suffix. The table
+    // is checked in full, not sampled — a transposed byte here
+    // would mislabel a module in iface metadata.
+    let cases: [(u8, I40ePhyType, &str); 43] = [
+        (0x00, I40ePhyType::Sgmii, "SGMII"),
+        (0x01, I40ePhyType::Base1000Kx, "1000BASE_KX"),
+        (0x02, I40ePhyType::Base10GKx4, "10GBASE_KX4"),
+        (0x03, I40ePhyType::Base10GKr, "10GBASE_KR"),
+        (0x04, I40ePhyType::Base40GKr4, "40GBASE_KR4"),
+        (0x05, I40ePhyType::Xaui, "XAUI"),
+        (0x06, I40ePhyType::Xfi, "XFI"),
+        (0x07, I40ePhyType::Sfi, "SFI"),
+        (0x08, I40ePhyType::Xlaui, "XLAUI"),
+        (0x09, I40ePhyType::Xlppi, "XLPPI"),
+        (0x0A, I40ePhyType::Base40GCr4Cu, "40GBASE_CR4_CU"),
+        (0x0B, I40ePhyType::Base10GCr1Cu, "10GBASE_CR1_CU"),
+        (0x0C, I40ePhyType::Base10GAoc, "10GBASE_AOC"),
+        (0x0D, I40ePhyType::Base40GAoc, "40GBASE_AOC"),
+        (0x0E, I40ePhyType::Unrecognized, "UNRECOGNIZED"),
+        (0x0F, I40ePhyType::Unsupported, "UNSUPPORTED"),
+        (0x11, I40ePhyType::Base100Tx, "100BASE_TX"),
+        (0x12, I40ePhyType::Base1000T, "1000BASE_T"),
+        (0x13, I40ePhyType::Base10GT, "10GBASE_T"),
+        (0x14, I40ePhyType::Base10GSr, "10GBASE_SR"),
+        (0x15, I40ePhyType::Base10GLr, "10GBASE_LR"),
+        (0x16, I40ePhyType::Base10GSfppCu, "10GBASE_SFPP_CU"),
+        (0x17, I40ePhyType::Base10GCr1, "10GBASE_CR1"),
+        (0x18, I40ePhyType::Base40GCr4, "40GBASE_CR4"),
+        (0x19, I40ePhyType::Base40GSr4, "40GBASE_SR4"),
+        (0x1A, I40ePhyType::Base40GLr4, "40GBASE_LR4"),
+        (0x1B, I40ePhyType::Base1000Sx, "1000BASE_SX"),
+        (0x1C, I40ePhyType::Base1000Lx, "1000BASE_LX"),
+        (0x1D, I40ePhyType::Base1000TOptical, "1000BASE_T_OPTICAL"),
+        (0x1E, I40ePhyType::Base20GKr2, "20GBASE_KR2"),
+        (0x1F, I40ePhyType::Base25GKr, "25GBASE_KR"),
+        (0x20, I40ePhyType::Base25GCr, "25GBASE_CR"),
+        (0x21, I40ePhyType::Base25GSr, "25GBASE_SR"),
+        (0x22, I40ePhyType::Base25GLr, "25GBASE_LR"),
+        (0x23, I40ePhyType::Base25GAoc, "25GBASE_AOC"),
+        (0x24, I40ePhyType::Base25GAcc, "25GBASE_ACC"),
+        (0x26, I40ePhyType::Base2_5GT, "2_5GBASE_T"),
+        (0x27, I40ePhyType::Base5GT, "5GBASE_T"),
+        (
+            0x30,
+            I40ePhyType::Base2_5GTLinkStatus,
+            "2_5GBASE_T_LINK_STATUS",
+        ),
+        (0x31, I40ePhyType::Base5GTLinkStatus, "5GBASE_T_LINK_STATUS"),
+        (
+            0xFD,
+            I40ePhyType::NotSupportedHighTemp,
+            "NOT_SUPPORTED_HIGH_TEMP",
+        ),
+        (0xFE, I40ePhyType::Empty, "EMPTY"),
+        (0xFF, I40ePhyType::Default, "DEFAULT"),
+    ];
+    for (byte, want, name) in cases {
+        let got = I40ePhyType::from_byte(byte);
+        if got != want || got.name() != name || got.as_byte() != byte {
+            return TestResult::Fail("phy_type table entry decoded wrong");
+        }
+    }
+    // The enum's gaps have no name in Linux either (0x10, 0x25,
+    // 0x28–0x2F, 0x32–0xFC): an unknown byte must stay unknown
+    // and keep its byte, never borrow a neighbour's name.
+    for byte in [0x10u8, 0x25, 0x28, 0x2F, 0x32, 0xFC] {
+        let got = I40ePhyType::from_byte(byte);
+        if got != I40ePhyType::Unknown(byte) || got.name() != "UNKNOWN" || got.as_byte() != byte {
+            return TestResult::Fail("unnamed phy_type byte was given a name");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_phy_type_decode);
+
+fn smoke_i40e_phy_abilities_parse() -> TestResult {
+    // Fixture built from `struct i40e_aq_get_phy_abilities_resp`
+    // (i40e_adminq_cmd.h lines 1501–1528): phy_type bitmap LE32
+    // @0, link_speed @4, abilities @5, eee_capability LE16 @6,
+    // eer LE32 @8, phy_type_ext @13, phy_id[4] @16,
+    // module_type[3] @20, qualified_module_count @23.
+    if PHY_ABILITIES_RESP_LEN != 0x218 {
+        return TestResult::Fail("get_phy_abilities response length wrong");
+    }
+    let mut buf = [0u8; 0x218];
+    // 25GBASE_SR (0x21) is NOT a bitmap bit: the firmware bitmap is
+    // LE32, so bit 33 cannot be set — Linux carries 25G support in
+    // `phy_type_ext` (`I40E_AQ_PHY_TYPE_EXT_25G_SR = 0x04`, set at
+    // buf[13] below), and `supports()` reads false past bit 31.
+    let bitmap: u32 = (1u32 << 0x07) | (1u32 << 0x14);
+    buf[0..4].copy_from_slice(&bitmap.to_le_bytes());
+    buf[4] = 1 << 3; // I40E_LINK_SPEED_10GB
+    buf[5] = 0x03; // PAUSE_TX | PAUSE_RX
+    buf[6..8].copy_from_slice(&0x0006u16.to_le_bytes());
+    buf[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    buf[13] = 0x04; // PHY_TYPE_EXT_25G_SR
+    buf[16..20].copy_from_slice(&[0x02, 0x00, 0x00, 0x00]);
+    buf[20..23].copy_from_slice(&[0x03, 0x00, 0x00]);
+    buf[23] = 2;
+    let Some(abilities) = PhyAbilities::parse(&buf) else {
+        return TestResult::Fail("phy abilities fixture did not parse");
+    };
+    if abilities.phy_type_bitmap != bitmap || abilities.link_speed != (1 << 3) {
+        return TestResult::Fail("phy abilities bitmap/speed decoded wrong");
+    }
+    if abilities.abilities != 0x03 || abilities.eee_capability != 0x0006 {
+        return TestResult::Fail("phy abilities pause/EEE decoded wrong");
+    }
+    if abilities.eer != 0x1234_5678 || abilities.phy_type_ext != 0x04 {
+        return TestResult::Fail("phy abilities EER/ext decoded wrong");
+    }
+    if abilities.phy_id != [0x02, 0x00, 0x00, 0x00]
+        || abilities.module_type != [0x03, 0x00, 0x00]
+        || abilities.qualified_module_count != 2
+    {
+        return TestResult::Fail("phy abilities module fields decoded wrong");
+    }
+    if !abilities.supports(I40ePhyType::Sfi) || !abilities.supports(I40ePhyType::Base10GSr) {
+        return TestResult::Fail("supported PHY types did not read back");
+    }
+    // 25GBASE_SR reads false from the bitmap by design (bit 0x21 is
+    // past the LE32); its support is signaled by `phy_type_ext`
+    // (asserted above as 0x04), not by a bitmap bit.
+    if abilities.supports(I40ePhyType::Base25GSr) {
+        return TestResult::Fail("25G PHY type read from the u32 bitmap");
+    }
+    if abilities.supports(I40ePhyType::Base10GLr)
+        || abilities.supports(I40ePhyType::Unknown(0x10))
+        || abilities.supports(I40ePhyType::Default)
+    {
+        return TestResult::Fail("unsupported PHY type read as supported");
+    }
+    if PhyAbilities::parse(&buf[..23]).is_some() {
+        return TestResult::Fail("short phy abilities buffer parsed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_phy_abilities_parse);
+
+fn smoke_i40e_phy_config_encode() -> TestResult {
+    // Fixture built from `struct i40e_aq_set_phy_config`
+    // (i40e_adminq_cmd.h lines 1531–1558): phy_type LE32 @0,
+    // link_speed @4, abilities @5, eee_capability LE16 @6,
+    // eer LE32 @8, low_power_ctrl @12, phy_type_ext @13,
+    // fec_config @14, reserved @15.
+    let config = PhyConfig {
+        phy_type: (1u32 << 0x07) | (1u32 << 0x14),
+        link_speed: 1 << 3,
+        abilities: PHY_ENABLE_LINK | PHY_ENABLE_AN,
+        eee_capability: 0x0006,
+        eer: 0,
+        low_power_ctrl: 0,
+        phy_type_ext: 0x04,
+        fec_config: PHY_FEC_AUTO,
+    };
+    let params = config.encode();
+    let want_bitmap: u32 = (1u32 << 0x07) | (1u32 << 0x14);
+    if params[0..4] != want_bitmap.to_le_bytes() {
+        return TestResult::Fail("set_phy_config phy_type bitmap encoded wrong");
+    }
+    if params[4] != (1 << 3) || params[5] != (PHY_ENABLE_LINK | PHY_ENABLE_AN) {
+        return TestResult::Fail("set_phy_config speed/abilities encoded wrong");
+    }
+    if params[6..8] != 0x0006u16.to_le_bytes() || params[8..12] != [0u8; 4] {
+        return TestResult::Fail("set_phy_config EEE/EER encoded wrong");
+    }
+    if params[12] != 0 || params[13] != 0x04 || params[14] != PHY_FEC_AUTO || params[15] != 0 {
+        return TestResult::Fail("set_phy_config ext/FEC/reserved encoded wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/i40e", smoke_i40e_phy_config_encode);
 
 fn smoke_i40e_link_speed_is_a_bitmask_not_an_ordinal() -> TestResult {
     // `enum i40e_aq_link_speed` is one-hot and its shifts are not in

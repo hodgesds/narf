@@ -954,16 +954,35 @@ interfaces and limits.
 - **Boot media:** `cargo xtask image` builds boot media and `iso-boot`
   checks UEFI boot in QEMU. These are distinct from a successful USB boot
   on the target laptops.
-- **Native UEFI installation:** x86_64 and aarch64 native packages install an
-  isolated `/EFI/NARF` payload plus a Boot Loader Specification entry. CI boots
-  the x86_64 package through OVMF, installed-style GRUB, config-bound Limine,
-  and its hash-bound kernel; AAVMF boots the aarch64 package through NARF's
-  kernel-bound loader. Secure Boot CI enrolls an ephemeral certificate, boots
-  the signed x86_64 chain, and requires a one-byte kernel modification to be
-  rejected. GRUB, systemd-boot, rEFInd, CachyOS Limine, distribution signing,
-  and persistent local `sbctl` signing are implemented without changing UEFI
-  NVRAM or the host's default entry. Production key enrollment, rotation, and
-  revocation remain administrator/distribution policy.
+- **Self-contained x86_64 EFI:** `cargo xtask efi-image` embeds kernel,
+  CPIO initramfs, and command line in a versioned, SHA-256-checked `.narf`
+  section, with `--run` / `--smoke` OVMF modes. It reuses the kernel's
+  Multiboot2 entry. Native distribution packages use this image by default;
+  explicit legacy Limine packages and existing media layouts remain available.
+  See [native EFI build/install/run](docs/NATIVE_UEFI.md). Physical laptop
+  acceptance, relocatable placement, TPM-backed unlock, and early-userspace
+  root switching remain open.
+- **Encrypted native boot:** opt-in initramfs keyfiles or bounded no-echo
+  serial prompts route LUKS1/LUKS2 credentials through block's authenticated
+  readers. Named root mounts support `ro` and `rootflags`; root policies select
+  the outer container UUID. Decrypted write authority remains tied to the
+  exact designated backing registration. Required-root failure stops boot.
+  Cryptsetup-generated LUKS1/LUKS2 fixtures pass unlock, retry, cancellation,
+  and timeout under OVMF. Writable btrfs validation uses an independently
+  decrypted QEMU overlay plus host btrfs checks. The virtio sync adapter now
+  handles complete multi-sector writes. USB/graphical password input is not
+  implemented.
+- **Native UEFI installation:** x86_64 and aarch64 packages install isolated
+  `/EFI/NARF` payloads and BLS entries. Native x86 upgrades verify the embedded
+  payload, publish one complete image, and remove obsolete managed sidecars;
+  adopted host Multiboot policy requires explicit migration. Signed native
+  OVMF acceptance passes with `SecureBoot=1`/`SetupMode=0`; firmware explicitly
+  rejects unsigned images and modified embedded kernel, archive, and command
+  line. The existing kernel Secure Boot cache is not populated by this handoff.
+  Package tests cover legacy x86, native x86, aarch64, and persistent sbctl
+  signing. Physical acceptance is tracked separately in the hardware guide;
+  production key enrollment, rotation, and revocation remain administrator
+  policy. No UEFI NVRAM or host default entry changes are made by the helper.
 
 ## Isolation and hardware limits
 
