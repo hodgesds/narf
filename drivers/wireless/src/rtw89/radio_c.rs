@@ -336,6 +336,9 @@ pub(super) fn error(e: Error) -> power::Error {
         rfk::Error::Terminal => power::Error::Terminal,
         rfk::Error::Policy => power::Error::Access,
         rfk::Error::Table => power::Error::Unsupported,
+        // The firmware reported a failed RFK step; the radio is in an
+        // unknown calibration state, so the error is terminal.
+        rfk::Error::Report => power::Error::Terminal,
     }
 }
 

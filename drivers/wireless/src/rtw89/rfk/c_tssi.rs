@@ -95,8 +95,10 @@ impl Tracking {
         Ok(Self { delta })
     }
     /// `_tssi_set_tmeter_tbl` row selection by `chan->subband_type`:
-    /// (up, down) for `path`.
-    fn rows(&self, subband: u8, path: u8) -> (&[i8; SWING], &[i8; SWING]) {
+    /// (up, down) for `path`. Shared with the BE TSSI H2C fill, which
+    /// is the same Linux function (`rtw89_phy_rfk_tssi_fill_fwcmd_\
+    /// tmeter_tbl`) with the 8922A multiplier.
+    pub(in super::super) fn rows(&self, subband: u8, path: u8) -> (&[i8; SWING], &[i8; SWING]) {
         // (up type, down type) for path A / path B.
         let (types, index) = match subband {
             1 => ([(7, 6), (5, 4)], 0),
