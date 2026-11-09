@@ -496,12 +496,13 @@ impl VirtioBlkPci {
         let payload = alloc_coherent(data.len().max(4096), DomainId::DRIVER_0)
             .map_err(|_| VirtioPciError::BarMapFailed)?;
         let payload_phys = payload.dma_addr().raw();
-        // SAFETY: the DMA allocation covers the complete caller payload.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
+        // This is coherent RAM. Copy before add_buffer publishes the chain
+        // through its release barrier; byte-wise volatile stores only prevent
+        // the compiler from using memcpy/vector stores for the same bytes.
+        // SAFETY: the fresh DMA allocation covers data.len() bytes, cannot
+        // overlap the caller's live slice, and remains owned until completion.
         unsafe {
-            for (i, &byte) in data.iter().enumerate() {
-                core::ptr::write_volatile(payload.cpu_mut_ptr_at::<u8>(i as u64), byte);
-            }
+            core::ptr::copy_nonoverlapping(data.as_ptr(), payload.cpu_mut_ptr::<u8>(), data.len());
         }
         // For Write, payload is read-only from the device's POV.
         let descs = [
