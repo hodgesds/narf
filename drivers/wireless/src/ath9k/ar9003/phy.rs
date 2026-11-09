@@ -12,7 +12,10 @@
 //! off; HT40, half/quarter rate and PAPRD are not prepared.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
-use super::{board, eeprom::Identity, field, ini::Tables, power, power::Image, rmw, Revision};
+use super::{
+    board, eeprom::Identity, field, ini::Tables, power, power::Image, rmw, serdes::PllPwrsave,
+    Revision,
+};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
 
 const AR_CR: u64 = 0x0008;
@@ -283,6 +286,7 @@ fn last_cl<const C: usize>(rows: &[[u32; C]], column: usize, seen: &mut Option<u
 pub(in crate::ath9k) fn expected(
     revision: &Revision,
     identity: &Identity,
+    pll_pwrsave: PllPwrsave,
     image: &Image,
     frequency: u16,
     ctl: u16,
@@ -292,7 +296,7 @@ pub(in crate::ath9k) fn expected(
         return Err(BringUpError::Policy);
     }
     let plan = power::plan(image, frequency, ctl, power_limit, identity.tx_chainmask)?;
-    let tables = Tables::for_revision(revision, identity);
+    let tables = Tables::for_revision(revision, identity, pll_pwrsave);
     let five = frequency >= 4800;
     let modes_index = if five { 1 } else { 4 };
     let mut cl = None;
@@ -346,6 +350,7 @@ pub(in crate::ath9k) fn prepare(
     io: &mut impl RegisterIo,
     revision: &Revision,
     identity: &Identity,
+    pll_pwrsave: PllPwrsave,
     image: &Image,
     frequency: u16,
     ctl: u16,
@@ -355,7 +360,7 @@ pub(in crate::ath9k) fn prepare(
         return Err(BringUpError::Policy);
     }
     let plan = power::plan(image, frequency, ctl, power_limit, identity.tx_chainmask)?;
-    let tables = Tables::for_revision(revision, identity);
+    let tables = Tables::for_revision(revision, identity, pll_pwrsave);
     let five = frequency >= 4800;
     if !io.authorized() {
         return Err(BringUpError::DeviceGone);

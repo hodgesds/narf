@@ -93,6 +93,11 @@ pub(super) struct Owner {
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
     revision: ar9003::Revision,
+    /// `ah->config.pll_pwrsave` resolved for this exact subsystem.
+    pll_pwrsave: ar9003::serdes::PllPwrsave,
+    /// PCI config `0x70c` word (`ath_pci_aspm_init`'s `aspm_l1_fix`);
+    /// the AR9462 SerDes restore consumes it, 0 when the read failed.
+    aspm_l1_fix: u32,
     /// `ah->WARegVal`.
     wa: u32,
     identity: ar9003::eeprom::Identity,
@@ -139,7 +144,15 @@ fn ctl_at(identity: &ar9003::eeprom::Identity, frequency: u16) -> Result<u16, Br
 /// inactive (zero) probe power limit.
 fn prepared_at(o: &Owner, frequency: u16) -> Result<ar9003::phy::Prepared, BringUpError> {
     let ctl = ctl_at(&o.identity, frequency)?;
-    ar9003::phy::expected(&o.revision, &o.identity, &o.image, frequency, ctl, 0)
+    ar9003::phy::expected(
+        &o.revision,
+        &o.identity,
+        o.pll_pwrsave,
+        &o.image,
+        frequency,
+        ctl,
+        0,
+    )
 }
 
 /// The signed `N93A` (AR9580: `N95A`) record keyed to `frequency`.
@@ -230,14 +243,41 @@ pub(super) fn probe(
     let revision = identified.powered.revision;
     let identity = identified.identity;
     let image = identified.restored.image;
+    // `__ath9k_hw_init`'s `pll_pwrsave` resolution for this exact
+    // subsystem, and the AR9462 L1-entry-latency fix word
+    // (`ath_pci_aspm_init` reads PCI config `0x70c`); a failed read
+    // leaves 0, which writes nothing.
+    let pll_pwrsave = ar9003::serdes::PllPwrsave::resolve(
+        revision.chip,
+        device.id.subsystem_vendor,
+        device.id.subsystem_id,
+    );
+    let aspm_l1_fix = if revision.chip == ar9003::Chip::Ar9462 {
+        identity::invoke(&cap, || narf_bus::pci::read_config32(&cap, &device, 0x70c))
+            .ok()
+            .and_then(|read| read.ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
     // ath9k_hw_reset reads AR_CFG_LED from the awake chip before its
     // chip reset; here the identification power-on stands for it.
     let led = read_led(&mut io).map_err(|e| bad("AR_CFG_LED read", e))?;
     let ctl = ctl_at(&identity, PRIMARY).map_err(|e| bad("regulatory CTL", e))?;
-    let prepared = ar9003::phy::prepare(&mut io, &revision, &identity, &image, PRIMARY, ctl, 0)
-        .map_err(|e| bad("baseband preparation", e))?;
-    let expected = ar9003::phy::expected(&revision, &identity, &image, PRIMARY, ctl, 0)
-        .map_err(|e| bad("preparation facts", e))?;
+    let prepared = ar9003::phy::prepare(
+        &mut io,
+        &revision,
+        &identity,
+        pll_pwrsave,
+        &image,
+        PRIMARY,
+        ctl,
+        0,
+    )
+    .map_err(|e| bad("baseband preparation", e))?;
+    let expected =
+        ar9003::phy::expected(&revision, &identity, pll_pwrsave, &image, PRIMARY, ctl, 0)
+            .map_err(|e| bad("preparation facts", e))?;
     if prepared != expected {
         return Err(bad("preparation facts", BringUpError::BadState));
     }
@@ -279,6 +319,8 @@ pub(super) fn probe(
         device,
         cap,
         revision,
+        pll_pwrsave,
+        aspm_l1_fix,
         wa: identified.powered.wa,
         identity,
         image,
@@ -381,6 +423,13 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
     )?;
     grant.invoke(|| ar9003::power::program(&mut io, &plan))?;
     o.prepared.power = plan;
+    // `ath9k_start` resets the SerDes registers before the station
+    // runs (`ath9k_hw_configpcipowersave(ah, false)`): the low-power
+    // array plus `AR_PCIE_PM_CTRL_ENA` and the latched `AR_WA` word.
+    let tables = ar9003::ini::Tables::for_revision(&o.revision, &identity, o.pll_pwrsave);
+    grant.invoke(|| {
+        ar9003::serdes::configure(&mut io, &o.revision, &tables, false, o.wa, o.aspm_l1_fix)
+    })?;
     let prepared = o.prepared;
     let report = {
         // SAFETY: probe or the last generation reset identified this
@@ -563,8 +612,16 @@ async fn reset(
         }
         let ctl = ctl_at(&o.identity, target)?;
         let identity = o.identity;
-        let prepared =
-            ar9003::phy::prepare(&mut io, &o.revision, &identity, &o.image, target, ctl, 0)?;
+        let prepared = ar9003::phy::prepare(
+            &mut io,
+            &o.revision,
+            &identity,
+            o.pll_pwrsave,
+            &o.image,
+            target,
+            ctl,
+            0,
+        )?;
         if prepared != prepared_at(&o, target)? {
             return Err(BringUpError::BadState);
         }
@@ -671,6 +728,15 @@ pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         }
         o.removed = true;
         let reclaimed = retire(&mut o).await;
+        if reclaimed {
+            // `ath9k_stop` parks the PCIe SerDes in its awake array
+            // (`ath9k_hw_configpcipowersave(ah, true)`); best effort
+            // on a device that is already going away.
+            let mut io = identity::Registers::new(o.mmio, o.cap);
+            let tables = ar9003::ini::Tables::for_revision(&o.revision, &o.identity, o.pll_pwrsave);
+            let _ =
+                ar9003::serdes::configure(&mut io, &o.revision, &tables, true, o.wa, o.aspm_l1_fix);
+        }
         drop(o);
         let mut retained = OWNER.lock();
         if retained.as_ref().is_some_and(|r| Arc::ptr_eq(r, &owner)) {

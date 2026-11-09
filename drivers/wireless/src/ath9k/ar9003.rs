@@ -28,6 +28,7 @@ pub(super) mod mac;
 pub(super) mod packet;
 pub(super) mod phy;
 pub(super) mod power;
+pub(super) mod serdes;
 pub(super) mod templates;
 
 use super::identity::{BringUpError, RegisterIo};
