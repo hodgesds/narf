@@ -221,9 +221,9 @@ pub(super) fn prepare<A: BootAllocator>(
                 )
             };
             if lane.placements.iter().count() > 1 {
-                job_timeout::setup_virtual(image, spec.platform);
+                job_timeout::setup_virtual(image, lane.engine, spec.platform);
             } else {
-                job_timeout::setup(image, spec.platform);
+                job_timeout::setup(image, lane.engine, spec.platform);
             }
             job_timeout::prefix(image.ggtt_offset(), spec.stamp, lane.engine, &mut words);
             if words.len() % 2 != 0 {

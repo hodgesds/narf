@@ -1405,9 +1405,9 @@ impl<A: BootAllocator> GuCScheduler<A> {
         };
         if user.is_some() {
             if placements.iter().count() > 1 {
-                job_timeout::setup_virtual(&image, self.platform);
+                job_timeout::setup_virtual(&image, engine, self.platform);
             } else {
-                job_timeout::setup(&image, self.platform);
+                job_timeout::setup(&image, engine, self.platform);
             }
             job_timeout::prefix(image.ggtt_offset(), stamp, engine, &mut words);
         }
@@ -1695,6 +1695,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         &context.image,
                         context.stamp,
                         context.placements,
+                        self.platform,
                         ct.window(),
                     )?
                 } else {
@@ -1702,6 +1703,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                         &context.image,
                         context.stamp,
                         context.engine,
+                        self.platform,
                         ct.window(),
                     )?
                 };
@@ -1731,6 +1733,7 @@ impl<A: BootAllocator> GuCScheduler<A> {
                             &lane.image,
                             context.stamp,
                             lane.placements,
+                            self.platform,
                             ct.window(),
                         )?;
                         if child_progressed {
