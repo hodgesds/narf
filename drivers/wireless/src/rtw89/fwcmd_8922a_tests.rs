@@ -38,7 +38,7 @@ fn smoke_rtw89_fwcmd_8922a_frame() -> TestResult {
     // dword0 = CAT (1:0) | CLASS (7:2) | FUNC (15:8) |
     // DEL_TYPE (19:16) = 0 | SEQ (31:24).
     let dw0 = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
-    if dw0 != 0x1 | (0x5 << 2) | (0x2 << 8) | (0x0 << 24) {
+    if dw0 != 0x1 | (0x5 << 2) | (0x2 << 8) {
         return TestResult::Fail("FWCMD hdr0 fields wrong");
     }
     // dword1 = TOTAL_LEN (13:0) | REC_ACK (14) | DONE_ACK (15).

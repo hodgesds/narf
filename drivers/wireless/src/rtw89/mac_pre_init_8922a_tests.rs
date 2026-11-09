@@ -127,7 +127,7 @@ fn smoke_rtw89_mac_pre_init_xtal_si() -> TestResult {
         Some(cmd) => *cmd,
         None => return TestResult::Fail("XTAL-SI write issued no command"),
     };
-    let want: u32 = 0xE0 | (0x02 << 8) | (0x02 << 16) | (0x00 << 24) | (1 << 31);
+    let want: u32 = 0xE0 | (0x02 << 8) | (0x02 << 16) | (1 << 31);
     if cmd != want {
         return TestResult::Fail("XTAL-SI write command word wrong");
     }
@@ -140,7 +140,7 @@ fn smoke_rtw89_mac_pre_init_xtal_si() -> TestResult {
     // Read path: the seeded value comes back in the DATA field.
     let mut m = Model::new().with_xtal(0x41, 0x5A);
     match read_xtal_si(&mut m, 0x41) {
-        Ok(v) if v == 0x5A => {}
+        Ok(0x5A) => {}
         _ => return TestResult::Fail("XTAL-SI read did not return the seeded value"),
     }
     let cmd = match m.xtal_cmds.first() {
@@ -335,7 +335,7 @@ fn smoke_rtw89_mac_pre_init_tail() -> TestResult {
         return TestResult::Fail("first XTAL-SI write must be (PLL,0x02,0x02)");
     }
     let last = m.xtal_cmds[16];
-    if last != 0xA1 | (0x00 << 8) | (0x02 << 16) | (1 << 31) {
+    if last != 0xA1 | (0x02 << 16) | (1 << 31) {
         return TestResult::Fail("last XTAL-SI write must be (SRAM_CTRL,0,0x02)");
     }
     // CV-conditional ISO sequence ran (cv=1 != CAV): write-mask

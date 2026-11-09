@@ -675,10 +675,12 @@ fn smoke_rtw89_prepared_8922a_prepare_data_with_info() -> TestResult {
     // One info field set so the block is distinguishable from the
     // body: STBC + port 3 + ampdu 64.
     let mut info = [0u8; 32];
-    let mut info_in = TxwdInfoV2::default();
-    info_in.stbc = true;
-    info_in.port = 3;
-    info_in.ampdu_num = 64;
+    let info_in = TxwdInfoV2 {
+        stbc: true,
+        port: 3,
+        ampdu_num: 64,
+        ..Default::default()
+    };
     if fill_txwd_info_v2(&info_in, &mut info).is_none() {
         return TestResult::Fail("fill_txwd_info_v2 failed");
     }
@@ -709,7 +711,7 @@ fn smoke_rtw89_prepared_8922a_prepare_data_with_info() -> TestResult {
     if prepared.header[32..64] != info {
         return TestResult::Fail("info block bytes wrong in header");
     }
-    if u16::from_le_bytes(prepared.header[64..66].try_into().unwrap()) != (0 | 0x8000) {
+    if u16::from_le_bytes(prepared.header[64..66].try_into().unwrap()) != 0x8000 {
         return TestResult::Fail("WP seq0 wrong with info block");
     }
     // The plain path is unchanged: same body, no info block.

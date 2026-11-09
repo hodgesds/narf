@@ -248,8 +248,10 @@ fn smoke_rtw89_be_txwd_info_v2_fill() -> TestResult {
         return TestResult::Fail("TXWD_INFO default info5..7 must be zero");
     }
     // Broadcast: RTS_EN clears, HW_RTS_EN stays.
-    let mut info = TxwdInfoV2::default();
-    info.is_bmc = true;
+    let info = TxwdInfoV2 {
+        is_bmc: true,
+        ..Default::default()
+    };
     let mut out = [0u8; 32];
     if fill_txwd_info_v2(&info, &mut out).is_none() {
         return TestResult::Fail("TXWD_INFO v2 fill rejected broadcast");
@@ -259,38 +261,52 @@ fn smoke_rtw89_be_txwd_info_v2_fill() -> TestResult {
     }
     // Fail-closed: each overflowing field refuses, never truncates.
     let mut out = [0u8; 32];
-    let mut bad = TxwdInfoV2::default();
-    bad.port = 8;
+    let bad = TxwdInfoV2 {
+        port: 8,
+        ..Default::default()
+    };
     if fill_txwd_info_v2(&bad, &mut out).is_some() {
         return TestResult::Fail("TXWD_INFO must reject port > 7");
     }
-    let mut bad = TxwdInfoV2::default();
-    bad.tx_cnt_lmt = 0x40;
+    let bad = TxwdInfoV2 {
+        tx_cnt_lmt: 0x40,
+        ..Default::default()
+    };
     if fill_txwd_info_v2(&bad, &mut out).is_some() {
         return TestResult::Fail("TXWD_INFO must reject tx_cnt_lmt > 63");
     }
-    let mut bad = TxwdInfoV2::default();
-    bad.data_retry_lowest_rate = 0x1000;
+    let bad = TxwdInfoV2 {
+        data_retry_lowest_rate: 0x1000,
+        ..Default::default()
+    };
     if fill_txwd_info_v2(&bad, &mut out).is_some() {
         return TestResult::Fail("TXWD_INFO must reject data_retry_lowest_rate > 4095");
     }
-    let mut bad = TxwdInfoV2::default();
-    bad.sn = 0x10;
+    let bad = TxwdInfoV2 {
+        sn: 0x10,
+        ..Default::default()
+    };
     if fill_txwd_info_v2(&bad, &mut out).is_some() {
         return TestResult::Fail("TXWD_INFO must reject sn > 15");
     }
-    let mut bad = TxwdInfoV2::default();
-    bad.ampdu_density = 8;
+    let bad = TxwdInfoV2 {
+        ampdu_density: 8,
+        ..Default::default()
+    };
     if fill_txwd_info_v2(&bad, &mut out).is_some() {
         return TestResult::Fail("TXWD_INFO must reject ampdu_density > 7");
     }
-    let mut bad = TxwdInfoV2::default();
-    bad.sec_cam_idx = 0x100;
+    let bad = TxwdInfoV2 {
+        sec_cam_idx: 0x100,
+        ..Default::default()
+    };
     if fill_txwd_info_v2(&bad, &mut out).is_some() {
         return TestResult::Fail("TXWD_INFO must reject sec_cam_idx > 255");
     }
-    let mut bad = TxwdInfoV2::default();
-    bad.nltf = 4;
+    let bad = TxwdInfoV2 {
+        nltf: 4,
+        ..Default::default()
+    };
     if fill_txwd_info_v2(&bad, &mut out).is_some() {
         return TestResult::Fail("TXWD_INFO must reject nltf > 3");
     }
