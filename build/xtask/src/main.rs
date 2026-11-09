@@ -13621,7 +13621,7 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         composition_modules.push((composition::module_guest_path(component), bytes));
     }
 
-    // Build the 5 coreutils and read their ELFs.
+    // Build the 6 coreutils and read their ELFs.
     // Each crate lives at userspace/coreutils/<name>/ and uses
     // <name>.ld as its linker script. They land in the CPIO at
     // "bin/<name>" so the shell's "/bin/<name>" PATH resolution
@@ -13631,7 +13631,7 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     // invoked at its own /bin/<name> path. We split them into
     // separate ELFs rather than a multi-call binary to keep the
     // no_std build simple.
-    let coreutil_names = ["echo", "pwd", "cat", "ls", "ps"];
+    let coreutil_names = ["echo", "pwd", "cat", "ls", "ps", "fetch"];
     let mut coreutil_bytes: Vec<(String, Vec<u8>)> = Vec::new();
     for name in coreutil_names {
         let crate_dir = format!("userspace/coreutils/{}", name);

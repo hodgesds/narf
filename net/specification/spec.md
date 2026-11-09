@@ -87,6 +87,20 @@ user-UMEM + shared `mmap` ring layout (`XDP_PGOFF_*`, `XDP_MMAP_OFFSETS`,
 `XDP_STATISTICS`) are supported, alongside `NETLINK_ROUTE` `tc` (`taprio`,
 `cbs`, `etf`) and `NETLINK_GENERIC` `ethtool` MAC Merge (`ETHTOOL_MSG_MM_*`).
 
+`net::fetch` is the HTTP(S) fetch client (issue #1759): `Url::parse`
+(`http`/`https`, literal-IPv4-or-hostname host, default ports 80/443),
+`fetch(url, opts, connect)` — the transport-generic engine over any
+`FetchStream` (GET, redirects up to 5 hops, `Content-Length` / chunked /
+close-delimited bodies, 16 MiB body cap, 64 KiB head cap) — plus the
+production entry points `fetch_url(url, roots)` / `fetch_url_at(url,
+roots, now_unix)`, which resolve via `dns::resolve_a` (literal IPv4
+first), connect TCP, and for `https://` run the TLS 1.3 handshake
+(`net::tls_client`, SNI + hostname verification on) against a
+caller-provisioned `RootStore`. The store starts empty by design; there
+is no skip-verification mode and no baked-in production root store
+(open remainder #1802). IPv6 URLs are rejected; HTTP/2, request
+bodies, cookies and authentication are out of scope.
+
 
 ### 3.1 Interface object
 
@@ -1671,6 +1685,25 @@ its Ethernet driver brings up a link. References (public-only):
   with OWS trimming, `iter_chunks` / `encode_chunk` for chunked
   bodies including chunk-ext stripping, terminating zero-length
   chunk handling.
+
+### HTTP(S) fetch client (`fetch`)
+- **RFC 9112** — HTTP/1.1 (see above). **RFC 9110** §15 (status
+  codes) + §10.2.2 (`Location` redirects). **RFC 3986** §3.2.2
+  (host), §3.3 (path), §5.2 (relative resolution), §5.2.4
+  (dot-segment removal). **RFC 8446** — TLS 1.3, via `tls_client`.
+- Surfaced: `Url::parse` + `resolve_relative` + `host_header`,
+  `FetchStream` (short reads, `Ok(0)` = EOF) with `MemStream`
+  (fixture), `TcpStream` (TCP connect + pump, EOF via
+  `readable()`/FIN, 30 s read deadline) and `TlsStream` (TLS
+  client + spill buffer), `fetch` (transport-generic engine:
+  GET, redirects, `Content-Length` / chunked / close-delimited),
+  `fetch_url` / `fetch_url_at` (DNS → TCP → TLS → GET). Roots are
+  caller-provisioned; no skip-verification mode; no baked-in
+  production store (#1802). IPv6, HTTP/2, request bodies,
+  cookies, auth: out of scope. The `/bin/fetch` coreutil
+  (`userspace/coreutils/fetch`) is the HTTP-only userspace binary
+  over `narf-libc` sockets (literal IPv4 only, no close-delimited
+  bodies — `narf-libc` `recv` never surfaces EOF).
 
 ### mDNS / DNS-SD (`pkt_mdns`)
 - **RFC 6762** — Multicast DNS (S. Cheshire & M. Krochmal, Feb

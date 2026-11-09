@@ -45,7 +45,7 @@ use crate::tls_x509::{parse_certificate, sha256, RootStore, X509Error};
 use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 
 /// Hex decoder for the trace constants.
-fn hex(s: &str) -> Vec<u8> {
+pub(crate) fn hex(s: &str) -> Vec<u8> {
     let s = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() / 2);
     for pair in s.chunks(2) {
@@ -90,7 +90,8 @@ const CLIENT_HELLO_RECORD: &str = "16030100c4010000c00303cb34ecb1e78163ba1c38c6d
     4001";
 
 /// The full ServerHello record (95 bytes), RFC 8448 §3.
-const SERVER_HELLO_RECORD: &str = "160303005a020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5\
+pub(crate) const SERVER_HELLO_RECORD: &str =
+    "160303005a020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5\
     cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6\
     cc253b833df1dd69b1b04e751f0f002b00020304";
 
@@ -200,7 +201,7 @@ const OPENSSL_NOW: u64 = 1_798_761_600;
 /// 1302, groups 001d/0017/0018/0019/0100/0101/0102/0103/0104, the
 /// trace's 15 signature schemes, psk modes, record_size_limit 16385,
 /// renegotiation_info, extended_master_secret.
-fn rfc_config<'a>(roots: &'a RootStore<'a>) -> ClientConfig<'a> {
+pub(crate) fn rfc_config<'a>(roots: &'a RootStore<'a>) -> ClientConfig<'a> {
     let mut config = ClientConfig::new(roots, RFC_NOW);
     config.server_name = Some("server");
     // The trace cert's CN is `rsa`, not `server`, and it has no SAN —
@@ -271,7 +272,7 @@ fn seal_aes_record(key: &[u8; 16], iv: &[u8; 12], seq: u64, plaintext: &[u8]) ->
 // Building a flight record is itself an assertion (it anchors the
 // construction to the RFC bytes), so these helpers report failure
 // instead of panicking: the caller fails the test with the reason.
-fn flight_record() -> Result<Vec<u8>, &'static str> {
+pub(crate) fn flight_record() -> Result<Vec<u8>, &'static str> {
     let mut inner = flight_plaintext();
     inner.push(0x16); // inner content type: handshake
     let record = seal_aes_record(&arr16(S_HS_KEY), &arr12(S_HS_IV), 0, &inner);
@@ -285,7 +286,7 @@ fn flight_record() -> Result<Vec<u8>, &'static str> {
 }
 
 /// The NewSessionTicket record (server ap keys, seq 0).
-fn nst_record() -> Result<Vec<u8>, &'static str> {
+pub(crate) fn nst_record() -> Result<Vec<u8>, &'static str> {
     let mut inner = hex(NEW_SESSION_TICKET);
     inner.push(0x16);
     let record = seal_aes_record(&arr16(S_AP_KEY), &arr12(S_AP_IV), 0, &inner);
@@ -298,11 +299,23 @@ fn nst_record() -> Result<Vec<u8>, &'static str> {
     Ok(record)
 }
 
+/// The server application-data record (server ap keys, seq 1)
+/// carrying `payload` as one TLS record. Shared with the fetch
+/// tests, which deliver an HTTP response as the payload.
+pub(crate) fn server_app_record_for(payload: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let mut inner = payload.to_vec();
+    inner.push(0x17); // inner content type: application_data
+    Ok(seal_aes_record(
+        &arr16(S_AP_KEY),
+        &arr12(S_AP_IV),
+        1,
+        &inner,
+    ))
+}
+
 /// The server application-data record (server ap keys, seq 1).
 fn server_app_record() -> Result<Vec<u8>, &'static str> {
-    let mut inner = app_payload();
-    inner.push(0x17); // inner content type: application_data
-    let record = seal_aes_record(&arr16(S_AP_KEY), &arr12(S_AP_IV), 1, &inner);
+    let record = server_app_record_for(&app_payload())?;
     if record.len() != 72 {
         return Err("server app record length");
     }
@@ -314,7 +327,7 @@ fn server_app_record() -> Result<Vec<u8>, &'static str> {
 
 /// A store trusting the RFC 8448 trace certificate (self-signed,
 /// pinned by the test).
-fn rfc_store() -> RootStore<'static> {
+pub(crate) fn rfc_store() -> RootStore<'static> {
     let mut store = RootStore::new();
     // An unparsable fixture cert leaves the store empty, so the chain
     // assertions fail the test instead of panicking the guest.

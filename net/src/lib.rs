@@ -76,6 +76,7 @@ pub mod cbpf;
 pub mod dhcp;
 pub mod dns;
 pub mod ethtool;
+pub mod fetch;
 pub mod gro;
 pub mod gso;
 pub mod http;
@@ -147,6 +148,8 @@ mod dhcp_dns_e2e_tests;
 mod e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod errno_linux_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod fetch_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod ip_fragment_tests;
 #[cfg(any(test, feature = "kernel-test"))]
