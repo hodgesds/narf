@@ -1697,10 +1697,13 @@ The networking axis cycle continued past app-layer protocols into
 the time-sync, real-time-streaming, IPv6-config, and IPv4-error /
 multicast layers a kernel network stack also needs.
 
-### NTPv4 (`pkt_ntp`)
+### NTPv4 (`pkt_ntp` + `sntp`)
 - **RFC 5905** — Network Time Protocol Version 4 (D. Mills et al,
   June 2010). §6 NTP timestamp format. §7.3 Packet Header Variables.
-  §7.5 Packet Header Format.
+  §7.5 Packet Header Format. §7.4 Kiss-o'-Death. §8 on-wire protocol
+  (`theta = 1/2 * [(T2-T1) + (T3-T4)]`, `delta = (T4-T1) - (T3-T2)`,
+  bogus check, delay clamp). §14 SNTP (single server). §16 UDP port
+  123. Appendix A `STEPT` 0.128 s, `PANICT` 1000 s.
 - **RFC 868** — referenced for the historical 1900-01-01 NTP prime
   epoch.
 - Surfaced: `NtpHeader::encode/decode` (LI/VN/Mode byte packing,
@@ -1708,6 +1711,15 @@ multicast layers a kernel network stack also needs.
   Root Dispersion, 4-byte Reference ID, four 64-bit timestamps).
   `unix_to_ntp` / `ntp_to_unix` with the 2_208_988_800-second epoch
   offset. `client_request` SNTP-style builder.
+- Surfaced (`sntp`, issue #1764): `SntpConfig` (explicit server IPv4,
+  no default, no hardcoded pool), `exchange` (UDP socket API:
+  ephemeral bind + connect + send/recv with deadline, `drain_pump`
+  while waiting), `validate_reply` (§9.2 format checks, §8 bogus
+  check, KoD), `compute_offset_delay`, `resolve_server` (DNS A
+  lookup, caller-chosen name), `discipline_sample` /
+  `sync_once` (feed the sample to `narf_time::ntp::apply_sample`).
+  Out of scope: discovery (DHCP option 42 unparsed), authentication
+  (no MAC/Autokey/NTS), multi-server selection, poll daemon, IPv6.
 
 ### WebSocket (`ws`)
 - **RFC 6455** — The WebSocket Protocol (I. Fette & A. Melnikov,
