@@ -1082,9 +1082,11 @@ that died between `begin` and the submit fails with ENOENT instead of
 retiring on a gone queue, and a per-context job never falls back to the
 kernel ring. The fixed-address OAR/OAC_OACONTROL writes land regardless
 of context, and the RING_CONTEXT_CONTROL write reaches the bound queue's
-saved state (that register is per-context saved state); OACTXCONTROL's
-effect through this path is unverified (whether it is context-saved is
-unverified in-tree).
+saved state (that register is per-context saved state); OACTXCONTROL is
+context-saved too: it sits in the RCS image template with the disabled
+value 0 and the image hook programs the pinned context's saved image
+with the resume bit at stream enable (see below), so the programming
+survives a context switch and the live job and the image value agree.
 
 i915 per-context open (`PERF_PROP_CTX_HANDLE`, 1) looks the handle up
 in the opening file's render namespace and pins it: the session
@@ -1110,13 +1112,20 @@ must be confirmed there — and a request runs no-preempt only when the
 extension is present AND the submitted context holds a
 HOLD_PREEMPTION pin. The no-preempt flag is a scheduler seam today:
 submission itself is NotImplemented. OACTXCONTROL (engine base +
-0x360) is NOT written into the pinned context's saved LRC image by
-this change: the template lists do not carry it, and adding it with a
-zero default would clobber the live programming on the next context
-switch (registers absent from the image keep their live value;
-registers in the image are restored from it). A pin-time/attach-time
-image-value hook, modelled on the RCS `patch_pdp_values` pattern, is
-the tracked remainder.
+0x360) IS written into the pinned context's saved LRC image: the RCS
+image template carries the register with the disabled value 0, and at
+stream enable the OA layer records the resume bit on the pinned
+context (`UserContext::oa_oactxcontrol`) and the submit path applies
+it to the freshly built image after any state restore, so the
+programming survives a context switch (the live per-context job
+programs the same value). Disable, GT stop, and pin release clear the
+recorded value; an unpinned context's image is untouched. The value
+is the resume bit only — the Gen12 image value (Linux i915_perf.c
+`gen12_configure_oar_context`); period/timer bits live in the
+Gen8–11 encoding and the OAG global control, not this slot. The
+image slot is found by scanning the image's MI_LOAD_REGISTER_IMM
+groups (Linux `oa_context_image_offset`); engines whose template
+carries no slot (Xe2 render, compute) keep the live-only path.
 
 Stream descriptors are read-only and take ioctls 0x6900..0x6904
 (ENABLE/DISABLE/CONFIG/STATUS/INFO); anything else is EINVAL. Reads copy
@@ -1135,7 +1144,7 @@ full-reset proofs. NARF limits:
   card holds at most 1024 ids.
 - Current authority is rechecked on every read and control for privileged streams.
 - OA syncs are supported (in-fences awaited, out-fences and user-fences signaled). OAR and OAC exec-queue streams (`DRM_XE_OA_PROPERTY_EXEC_QUEUE_ID`) are supported on single-width Render (OAR) and Compute (OAC) queues, with per-context OAR/OAC programming at enable/disable (see above). Engine-format mismatches (OAC on Render, OAR on Compute) or queue-less OAR/OAC streams are EINVAL.
-- i915 per-context streams (`PERF_PROP_CTX_HANDLE`) are supported with context lookup, pinning and read-time report filtering (see above). `HOLD_PREEMPTION` requires `CTX_HANDLE` and the capability gate; the execbuffer `ext_perf` extension gates the no-preempt request flag. The OACTXCONTROL value in the pinned context's saved LRC image is NOT written by this change (tracked remainder).
+- i915 per-context streams (`PERF_PROP_CTX_HANDLE`) are supported with context lookup, pinning and read-time report filtering (see above). `HOLD_PREEMPTION` requires `CTX_HANDLE` and the capability gate; the execbuffer `ext_perf` extension gates the no-preempt request flag. The OACTXCONTROL value in the pinned context's saved LRC image is written at stream enable (resume bit only, Gen12 image value).
 - mmap follows `xe_oa_mmap`'s checks: EACCES without privilege, EINVAL
   unless the length is the whole buffer, and EINVAL for write, exec or
   MAP_SHARED(_VALIDATE); the maximum protection is read. A mapping that

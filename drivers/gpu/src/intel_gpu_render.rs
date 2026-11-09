@@ -469,8 +469,9 @@ impl Namespaces {
     /// succeeds (the Linux-observable result) and the pin's record simply
     /// stops matching new reports. Context ids are never reused
     /// (`next_context` only increments), so a stale pin cannot alias a
-    /// new context. A refcount belongs with the LRC-image hook (see
-    /// `intel_gpu_oa::per_context_job`); revisit this when it lands.
+    /// new context. A refcount still belongs with the LRC-image hook
+    /// (issue #1821 landed the hook itself; the refcount is the open
+    /// remainder).
     fn oa_pin(&mut self, id: u32, hold: bool) -> bool {
         if id == 0 || !self.contexts.contains_key(&id) {
             return false;
@@ -1049,13 +1050,22 @@ impl RenderFile {
                 }
                 // The hardware context id is the gem handle: NARF
                 // programs no distinct LRC tag per context yet (see
-                // intel_gpu_oa::PinToken).
+                // intel_gpu_oa::PinToken). The pinned context's GuC
+                // user context rides the token so the OA layer can
+                // program its saved LRC image at stream enable
+                // (issue #1821).
+                let user = namespaces
+                    .lock()
+                    .contexts
+                    .get(&id)
+                    .map(|ctx| ctx.user.clone());
                 Some(crate::intel_gpu_oa::PinToken::new(
                     id,
                     id,
                     Arc::new(move |id| {
                         unpin_ns.lock().oa_unpin_hold(id);
                     }),
+                    user,
                 ))
             };
             return Some(crate::intel_gpu_oa::errno(

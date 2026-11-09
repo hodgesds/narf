@@ -1293,6 +1293,17 @@ impl<A: BootAllocator> GuCScheduler<A> {
         } else {
             context_image(&image, self.platform, ring.ggtt_offset());
         }
+        // OACTXCONTROL image value (issue #1821): after the image is
+        // built — and after any state restore above, which overwrites
+        // the REGS page from the claim's snapshot — program the claim's
+        // value into the image's OACTXCONTROL slot so the programming
+        // survives a context switch. The slot is absent on engines
+        // whose template does not carry it; the apply then no-ops.
+        if let Some(claim) = &user {
+            if let Some(value) = claim.oa_oactxcontrol() {
+                crate::intel_gpu_engine::apply_oa_oactxcontrol(&image, engine.base(), value);
+            }
+        }
         let mutating = resident.is_some() || prefix.is_some();
         let mut words: Vec<u32> = if let Some(prefix) = prefix {
             let mut words = alloc::vec![0x04000001];
@@ -2466,7 +2477,7 @@ fn render_completion(
     }
 }
 
-fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
+pub(crate) fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
     if platform.is_gen12() {
         // gen12_rcs_offsets: thirteen first-group registers, five NOOPs,
         // then the common nine timestamp/PDP registers and RCS-only groups.
@@ -2501,10 +2512,19 @@ fn context_image(image: &impl GpuBacking, platform: GtPlatform, ring: u32) {
     }
     // Literal register groups from xe_lrc.c's DG2/MTL/Xe2 RCS tables;
     // lengths and command placement differ from the Gen12 execlists codec.
+    //
+    // The first group carries OACTXCONTROL (engine base + 0x360) last,
+    // value default 0 (the disabled value). The OA image hook programs
+    // this slot at stream enable; the default is load-bearing — adding
+    // the register without the hook would restore 0 over the live
+    // programming on the next context switch (Linux i915_perf.c
+    // `gen12_configure_oar_context` writes the image slot, never the
+    // template). This list is cursor-based, so the extra register shifts
+    // the following groups consistently.
     let groups: &[&[u32]] = &[
         &[
             0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180,
-            0x2b4, 0x120, 0x124,
+            0x2b4, 0x120, 0x124, 0x360,
         ],
         if platform.is_xe2() {
             &[
