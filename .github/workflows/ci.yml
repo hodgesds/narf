@@ -175,7 +175,7 @@ jobs:
         run: cargo xtask clippy-changed --arch=host --packages "$CI_CLIPPY_CRATES"
 
   uefi-loader:
-    name: aarch64 UEFI loader
+    name: UEFI loader unit tests and aarch64 lint
     needs: changes
     if: needs.changes.outputs.run_uefi == 'true'
     runs-on: ubuntu-latest
@@ -223,6 +223,9 @@ jobs:
             mtools \
             dosfstools \
             e2fsprogs \
+            btrfs-progs \
+            cryptsetup-bin \
+            python3-cryptography \
             ovmf \
             qemu-efi-aarch64 \
             xorriso \
@@ -253,7 +256,15 @@ jobs:
       - name: cargo xtask iso-boot (firmware UEFI)
         run: cargo xtask iso-boot --arch=${{ matrix.arch }}
 
-      - name: Native-package UEFI boot (GRUB -> Limine)
+      - name: Self-contained native EFI boot (OVMF -> NARF)
+        if: matrix.arch == 'x86_64'
+        run: cargo xtask efi-image --smoke
+
+      - name: NVMe supervisor without a controller
+        if: matrix.arch == 'x86_64'
+        run: cargo xtask test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme
+
+      - name: Native-package UEFI boot (GRUB -> native NARF EFI)
         if: matrix.arch == 'x86_64'
         env:
           NARF_UEFI_SKIP_BASE_ISO_BOOT: "1"
@@ -265,11 +276,19 @@ jobs:
           NARF_UEFI_SKIP_BASE_ISO_BOOT: "1"
         run: packaging/test-aarch64-package-boot.sh
 
-      - name: Native-package Secure Boot (signed Limine -> bound kernel)
+      - name: Native-package Secure Boot (signed native EFI + tamper rejection)
         if: matrix.arch == 'x86_64'
         env:
           NARF_UEFI_SKIP_BASE_ISO_BOOT: "1"
         run: packaging/test-secure-boot.sh
+
+      - name: Native encrypted root (cryptsetup LUKS1/LUKS2)
+        if: matrix.arch == 'x86_64'
+        run: |
+          cargo xtask efi-image
+          python3 packaging/test-native-luks.py \
+            --kernel target/native-uefi-x86_64/kernel.elf \
+            --initramfs target/native-uefi-x86_64/initramfs.cpio
 
       # xAPIC fallback boot. With x2APIC masked off, every LAPIC access is
       # MMIO instead of an MSR — the path real Renoir/Phoenix firmware puts

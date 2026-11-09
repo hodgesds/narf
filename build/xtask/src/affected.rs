@@ -400,6 +400,9 @@ pub fn plan(
             p.run_uefi = true;
             continue;
         }
+        if f.starts_with("boot/protocol/") {
+            p.run_uefi = true;
+        }
         if f.ends_with("/Cargo.toml")
             && !crates.iter().any(|c| f == &format!("{}/Cargo.toml", c.dir))
             && !embedded_input(f)
@@ -443,11 +446,18 @@ pub fn plan(
     } else {
         p.changed_crates.clone()
     };
-    // Host tools are the only std binaries in this workspace. Unlinked
-    // driver/module crates still need bare-metal linting when they change.
+    // The boot protocol kit is consumed by host tools and the isolated EFI
+    // loader, so it has no frame unit-graph entry. Lint its host-safe API here;
+    // the dedicated EFI gates compile its target use. Unlinked driver/module
+    // crates still need bare-metal linting when they change.
     p.host_clippy_crates = lint
         .iter()
-        .filter(|c| matches!(c.as_str(), "xtask" | "cargo-narf" | "narf-btrfs-host"))
+        .filter(|c| {
+            matches!(
+                c.as_str(),
+                "xtask" | "cargo-narf" | "narf-btrfs-host" | "narf-boot-protocol"
+            )
+        })
         .cloned()
         .collect();
     p.clippy_crates = lint.difference(&p.host_clippy_crates).cloned().collect();
@@ -1462,6 +1472,7 @@ mod tests {
         let mut crates = fixture();
         crates.push(ci("xtask", "build/xtask", &[]));
         crates.push(ci("cargo-narf", "build/cargo-narf", &[]));
+        crates.push(ci("narf-boot-protocol", "boot/protocol", &[]));
         let p = plan(
             &["build/xtask/src/main.rs".into()],
             &crates,
@@ -1482,6 +1493,16 @@ mod tests {
             false,
         );
         assert!(p.run_uefi && !p.full && !p.run_clippy);
+        let p = plan(
+            &["boot/protocol/src/lib.rs".into()],
+            &crates,
+            &tags(),
+            &BTreeMap::new(),
+            "pull_request",
+            false,
+        );
+        assert!(p.run_uefi && p.run_boot_smoke && !p.run_clippy);
+        assert_eq!(p.host_clippy_crates, strings(&["narf-boot-protocol"]));
     }
 
     #[test]

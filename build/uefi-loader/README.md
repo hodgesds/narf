@@ -1,4 +1,17 @@
-# NARF aarch64 UEFI loader
+# NARF UEFI loader
+
+The x86_64 build is a self-contained EFI application with embedded kernel,
+initramfs, and command line. Build it with `cargo xtask efi-image`, run it
+through OVMF with `--run`, or require a clean shutdown with `--smoke`.
+See [build, install, and run instructions](../../docs/NATIVE_UEFI.md).
+Its `.narf` PE section contains a versioned payload manifest; the loader
+checks each SHA-256 before parsing the ELF. It reports firmware SecureBoot/
+SetupMode while services are live. It uses `narf-boot-protocol` to validate the ELF and emit Multiboot2, then a
+position-independent mode bridge enters the existing 32-bit kernel stub.
+EFI loader/runtime/boot-services allocations and the complete final descriptor
+map are retained; a fixed-address kernel allocation collision fails visibly.
+
+## aarch64
 
 This `aarch64-unknown-uefi` application is staged as the standard
 `EFI/BOOT/BOOTAA64.EFI` removable-media loader by `cargo xtask image

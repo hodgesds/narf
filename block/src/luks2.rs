@@ -1173,6 +1173,10 @@ pub(crate) mod tests {
     }
 
     fn luks2_fixture() -> (Arc<dyn BlockDeviceSync>, [u8; 4096]) {
+        luks2_fixture_with_size(4096)
+    }
+
+    fn luks2_fixture_with_size(payload_size: usize) -> (Arc<dyn BlockDeviceSync>, [u8; 4096]) {
         let passphrase = b"correct horse battery staple";
         let slot_salt = [0x22u8; 32];
         let digest_salt = [0x33u8; 32];
@@ -1246,7 +1250,7 @@ pub(crate) mod tests {
         )
         .expect("payload encryption");
 
-        let mut image = alloc::vec![0u8; DATA_OFFSET + 4096];
+        let mut image = alloc::vec![0u8; DATA_OFFSET + payload_size];
         image[KEYSLOT_OFFSET..KEYSLOT_OFFSET + KEYSLOT_SIZE].copy_from_slice(&keyslot);
         image[DATA_OFFSET..DATA_OFFSET + ciphertext.len()].copy_from_slice(&ciphertext);
         let primary = serialized_header(MAGIC_PRIMARY, 0, 7, &json);
@@ -1263,6 +1267,85 @@ pub(crate) mod tests {
             plaintext,
         )
     }
+
+    fn smoke_luks2_root_policy_mapping() -> TestResult {
+        use crate::{disk_policy as policy, encrypted::EncryptedBlockDevice, registry};
+        const UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        let saved = registry::__snapshot_for_test();
+        registry::__reset_for_test();
+        policy::__reset_root_for_test();
+        policy::__set_policy_for_test(Some(policy::DiskPolicy::All));
+        policy::__set_root_arg_for_test(Some(Some("UUID=01234567-89ab-cdef-0123-456789abcdef")));
+        let result = (|| -> Result<(), &'static str> {
+            let (raw, _) = luks2_fixture_with_size(128 * 1024);
+            registry::register_block_device(
+                "luks-test-disk",
+                Arc::new(ImageDevice {
+                    bytes: IrqSafeSpinLock::new(alloc::vec![0; 512 * 1024]),
+                }),
+            );
+            registry::register_partition_device(
+                "luks-test-diskp1",
+                "luks-test-disk",
+                raw,
+                Some(registry::PartitionMetadata {
+                    fs_uuid: UUID.into(),
+                    ..Default::default()
+                }),
+            );
+            let backing =
+                registry::find_block_device("luks-test-diskp1").ok_or("missing backing")?;
+            let view = EncryptedBlockDevice::open_luks2(backing, b"correct horse battery staple")
+                .map_err(|_| "fixture unlock failed")?;
+            // This is an identity probe fixture, not a mountable btrfs image.
+            // Write the literal btrfs identification bytes through real XTS.
+            let mut superblock = [0u8; 4096];
+            superblock[64..72].copy_from_slice(b"_BHRfS_M");
+            view.write(16, 1, &superblock)
+                .map_err(|_| "prepare inner filesystem")?;
+            policy::__set_policy_for_test(Some(policy::DiskPolicy::RootRw));
+            let uuid = crate::partition::parse_uuid(UUID).ok_or("UUID")?;
+            if policy::designate_encrypted_root("luks-test-disk", uuid, &view)
+                != Err(policy::PolicyError::NotAPartition)
+            {
+                return Err("encrypted root accepted a whole disk");
+            }
+            policy::designate_encrypted_root("luks-test-diskp1", uuid, &view)
+                .map_err(|_| "encrypted designation")?;
+            if registry::register_encrypted_root("wrong", "luks-test-disk", view).is_ok() {
+                return Err("mapping accepted an unrelated backing registration");
+            }
+            let backing =
+                registry::find_block_device("luks-test-diskp1").ok_or("missing backing")?;
+            let view = EncryptedBlockDevice::open_luks2(backing, b"correct horse battery staple")
+                .map_err(|_| "reopen")?;
+            registry::register_encrypted_root("luks-test-crypt", "luks-test-diskp1", view)
+                .map_err(|_| "register mapping")?;
+            let mapped = registry::find_block_device("luks-test-crypt").ok_or("mapping absent")?;
+            if !policy::write_allowed("luks-test-crypt")
+                || policy::write_allowed("luks-test-disk")
+                || mapped.write(0, 1, &[0x55; 4096]).is_err()
+            {
+                return Err("encrypted mapping did not retain exactly its partition authority");
+            }
+            registry::unregister_block_device("luks-test-diskp1");
+            if mapped.write(0, 1, &[0; 4096]) != Err(BlockIoError::ReadOnly)
+                || policy::root_writable()
+            {
+                return Err("removing backing registration failed to revoke retained mapping");
+            }
+            Ok(())
+        })();
+        policy::__reset_root_for_test();
+        policy::__set_policy_for_test(None);
+        policy::__set_root_arg_for_test(None);
+        registry::__restore_for_test(saved);
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(reason) => TestResult::Fail(reason),
+        }
+    }
+    kernel_test_in!("block/luks2", smoke_luks2_root_policy_mapping);
 
     fn smoke_luks2_redundant_header_and_unlock() -> TestResult {
         use crate::encrypted::{

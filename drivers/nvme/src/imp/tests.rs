@@ -6,6 +6,32 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+/// Run with the minimal hardware profile. Poll the actual production future,
+/// without mutating controller state or requiring a scheduler task. Before the
+/// fix, this poll never returned on a machine without an NVMe controller.
+fn smoke_nvme_aer_supervisor_parks_without_controllers() -> TestResult {
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    if super::controller_count() != 0 {
+        return TestResult::Skip("requires the no-NVMe minimal hardware profile");
+    }
+    let mut supervisor = pin!(super::aer_supervisor_task());
+    let mut context = Context::from_waker(Waker::noop());
+    match supervisor.as_mut().poll(&mut context) {
+        Poll::Pending => TestResult::Pass,
+        Poll::Ready(()) => {
+            TestResult::Fail("AER supervisor must remain live for later controllers")
+        }
+    }
+}
+kernel_test_in!(
+    "drivers/nvme",
+    smoke_nvme_aer_supervisor_parks_without_controllers
+);
+
 fn smoke_nvme_samsung_pci_matches() -> TestResult {
     // Structural smoke: register the NVMe driver and verify the
     // Samsung PM9A1 / 970 EVO / 990 PRO VID/DID entries plus the

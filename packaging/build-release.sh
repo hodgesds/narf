@@ -7,6 +7,7 @@ usage: packaging/build-release.sh --version VERSION
        [--formats all|deb,rpm,arch,gentoo,tar] [--skip-build]
        [--arch auto|x86_64|aarch64] [--output DIR] [--source-date-epoch EPOCH]
        [--uefi-loader FILE] [--limine-efi FILE] [--limine-tool FILE]
+       [--cmdline TEXT] [--initramfs FILE]
        [--secure-boot-key FILE --secure-boot-cert FILE]
 EOF
     exit 2
@@ -23,6 +24,7 @@ uefi_loader=${NARF_UEFI_LOADER:-}
 limine_tool=${NARF_LIMINE_TOOL:-}
 secure_boot_key=${NARF_SECURE_BOOT_KEY:-}
 secure_boot_cert=${NARF_SECURE_BOOT_CERT:-}
+efi_args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version) [[ $# -ge 2 ]] || usage; version=${2#v}; shift 2 ;;
@@ -36,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --limine-tool) [[ $# -ge 2 ]] || usage; limine_tool=$2; shift 2 ;;
         --secure-boot-key) [[ $# -ge 2 ]] || usage; secure_boot_key=$2; shift 2 ;;
         --secure-boot-cert) [[ $# -ge 2 ]] || usage; secure_boot_cert=$2; shift 2 ;;
+        --cmdline|--initramfs) [[ $# -ge 2 ]] || usage; efi_args+=("$1" "$2"); shift 2 ;;
         *) usage ;;
     esac
 done
@@ -88,6 +91,7 @@ case "$arch" in
     x86_64)
         target_triple=x86_64-unknown-none
         loader_kind=limine
+        [[ -n $limine_efi ]] || loader_kind=native
         pe_machine=6486
         deb_arch=amd64
         rpm_arch=x86_64
@@ -97,9 +101,22 @@ case "$arch" in
         arch_license="'GPL-2.0-or-later' 'BSD-2-Clause'"
         gentoo_license='GPL-2+ BSD-2'
         if [[ $skip_build -eq 0 ]]; then
-            SOURCE_DATE_EPOCH=$source_epoch cargo xtask build --arch=x86_64
+            if [[ $loader_kind == native ]]; then
+                SOURCE_DATE_EPOCH=$source_epoch cargo xtask efi-image "${efi_args[@]}"
+            else
+                SOURCE_DATE_EPOCH=$source_epoch cargo xtask build --arch=x86_64
+            fi
         fi
         kernel=$root/target/$target_triple/release/narf-frame
+        if [[ $loader_kind == native ]]; then
+            uefi_loader=${uefi_loader:-$root/target/narf-x86_64.efi}
+            python3 packaging/native-efi.py "$uefi_loader" --extract "$work/native" \
+                --manifest "$work/bundle.json"
+            kernel=$work/native/kernel.elf
+            rpm_license='GPL-2.0-or-later'
+            arch_license="'GPL-2.0-or-later'"
+            gentoo_license='GPL-2+'
+        fi
         ;;
     aarch64)
         target_triple=aarch64-unknown-none
@@ -118,6 +135,10 @@ case "$arch" in
         kernel=$root/target/narf-frame-aarch64.efi-elf
         ;;
 esac
+if [[ ${#efi_args[@]} -gt 0 && ($skip_build -eq 1 || $loader_kind != native) ]]; then
+    echo "--cmdline/--initramfs require a native x86_64 build (without --skip-build)" >&2
+    exit 1
+fi
 
 [[ -f $kernel ]] || {
     echo "missing canonical $arch kernel artifact: $kernel" >&2
@@ -219,8 +240,10 @@ EOF
     verified_loader=$work/narf.efi.verified
     packaging/bind-limine-config.py "$bound_loader" "$config" "$verified_loader"
     mv "$verified_loader" "$bound_loader"
-else
+elif [[ $loader_kind == narf ]]; then
     packaging/bind-aarch64-uefi.py "$uefi_loader" "$kernel" "$bound_loader"
+else
+    cp "$uefi_loader" "$bound_loader"
 fi
 
 secure_boot_signed=no
@@ -251,6 +274,10 @@ install -m 0755 packaging/42_narf "$stage/etc/grub.d/42_narf"
 install -m 0755 packaging/narf-uefi "$stage/usr/bin/narf-uefi"
 install -m 0644 "$bound_loader" "$stage/usr/lib/narf/uefi/narf.efi"
 install -m 0644 "$kernel" "$stage/usr/lib/narf/uefi/narf-frame"
+if [[ $loader_kind == native ]]; then
+    install -m 0755 packaging/native-efi.py "$stage/usr/lib/narf/uefi/native-efi.py"
+    install -m 0644 "$work/bundle.json" "$stage/usr/lib/narf/uefi/bundle.json"
+fi
 printf '%s\n' "$version" >"$stage/usr/lib/narf/uefi/version"
 printf '%s\n' "$arch" >"$stage/usr/lib/narf/uefi/arch"
 printf '%s\n' "$loader_kind" >"$stage/usr/lib/narf/uefi/loader-kind"
@@ -261,6 +288,7 @@ if [[ $loader_kind == limine ]]; then
 fi
 install -m 0644 LICENSE README.md "$stage/usr/share/doc/narf/"
 install -m 0644 packaging/README.md "$stage/usr/share/doc/narf/PACKAGING.md"
+install -m 0644 docs/NATIVE_UEFI.md "$stage/usr/share/doc/narf/NATIVE_UEFI.md"
 if [[ $loader_kind == limine ]]; then
     install -m 0644 packaging/LIMINE-LICENSE "$stage/usr/share/licenses/narf/LIMINE"
 fi
@@ -297,7 +325,7 @@ Section: kernel
 Priority: optional
 Architecture: $deb_arch
 Maintainer: NARF maintainers
-Depends: util-linux
+Depends: util-linux, python3
 Suggests: grub-common
 Homepage: https://github.com/hodgesds/narf
 Description: NARF framekernel boot image
@@ -345,7 +373,7 @@ License: $rpm_license
 URL: https://github.com/hodgesds/narf
 Source0: $payload.tar.gz
 BuildArch: $rpm_arch
-Requires: coreutils, grep, sed, util-linux
+Requires: coreutils, grep, sed, util-linux, python3
 Suggests: grub2-tools, sbctl
 
 %description
@@ -406,7 +434,7 @@ pkgdesc='NARF framekernel boot image'
 arch=('$arch_pkg_arch')
 url='https://github.com/hodgesds/narf'
 license=($arch_license)
-depends=('coreutils' 'grep' 'sed' 'util-linux')
+depends=('coreutils' 'grep' 'sed' 'util-linux' 'python')
 optdepends=('grub: GRUB BIOS or UEFI menu integration'
             'limine-tool: CachyOS Limine menu integration'
             'refind: automatic EFI loader discovery'
@@ -472,7 +500,7 @@ SRC_URI="https://github.com/hodgesds/narf/releases/download/v$version/$payload.t
 LICENSE="$gentoo_license"
 SLOT="0"
 KEYWORDS="~$gentoo_keyword"
-RDEPEND="sys-apps/coreutils sys-apps/grep sys-apps/sed sys-apps/util-linux"
+RDEPEND="sys-apps/coreutils sys-apps/grep sys-apps/sed sys-apps/util-linux dev-lang/python"
 
 src_unpack() {
     mkdir -p "\${S}" || die

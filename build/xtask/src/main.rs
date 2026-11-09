@@ -41,6 +41,7 @@ mod cachyos_root;
 mod ci_clippy;
 mod composition;
 mod crate_release;
+mod efi_image;
 mod http3_smoke;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
@@ -108,6 +109,8 @@ enum Cmd {
     Relocs(RelocsArgs),
     /// Cross-compile the kernel.
     Build(BuildArgs),
+    /// Build a self-contained x86_64 EFI image; optionally run it through OVMF.
+    EfiImage(efi_image::Args),
     /// Cross-compile and boot under QEMU.
     Run(BuildArgs),
     /// Cross-compile and run kernel tests under QEMU.
@@ -15411,6 +15414,7 @@ fn main() -> Result<()> {
             cargo_build(&args, &workspace_root()?)?;
             Ok(())
         }
+        Cmd::EfiImage(args) => efi_image::run(&args),
         Cmd::BuildModule(args) => {
             build_module(&args, &workspace_root()?)?;
             Ok(())
@@ -15607,6 +15611,8 @@ fn host_test_cmd() -> Result<()> {
                 "test",
                 "-p",
                 "narf-lib",
+                "-p",
+                "narf-boot-protocol",
                 "-p",
                 "narf-hid",
                 "-p",

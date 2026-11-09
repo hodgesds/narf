@@ -59,7 +59,7 @@ struct PackageArgs {
     #[arg(long)]
     source_date_epoch: Option<u64>,
 
-    /// Limine BOOTX64.EFI to embed in native packages.
+    /// Select the legacy x86_64 Limine packaging path.
     #[arg(long)]
     limine_efi: Option<PathBuf>,
 
@@ -78,6 +78,14 @@ struct PackageArgs {
     /// X.509 certificate used by sbsign; requires --secure-boot-key.
     #[arg(long, requires = "secure_boot_key")]
     secure_boot_cert: Option<PathBuf>,
+
+    /// Command line embedded in a newly built native x86_64 image.
+    #[arg(long, conflicts_with = "skip_build")]
+    cmdline: Option<String>,
+
+    /// Complete newc archive embedded in a newly built native x86_64 image.
+    #[arg(long, conflicts_with = "skip_build")]
+    initramfs: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -106,7 +114,7 @@ struct InstallArgs {
     #[arg(long)]
     source_date_epoch: Option<u64>,
 
-    /// Limine BOOTX64.EFI to embed in the native package.
+    /// Select the legacy x86_64 Limine packaging path.
     #[arg(long)]
     limine_efi: Option<PathBuf>,
 
@@ -125,6 +133,14 @@ struct InstallArgs {
     /// X.509 certificate used by sbsign; requires --secure-boot-key.
     #[arg(long, requires = "secure_boot_key")]
     secure_boot_cert: Option<PathBuf>,
+
+    /// Command line embedded in a newly built native x86_64 image.
+    #[arg(long, conflicts_with = "skip_build")]
+    cmdline: Option<String>,
+
+    /// Complete newc archive embedded in a newly built native x86_64 image.
+    #[arg(long, conflicts_with = "skip_build")]
+    initramfs: Option<PathBuf>,
 
     /// Pass the native package manager's non-interactive confirmation flag.
     #[arg(long)]
@@ -229,6 +245,8 @@ struct PackagerOptions<'a> {
     limine_tool: Option<&'a Path>,
     secure_boot_key: Option<&'a Path>,
     secure_boot_cert: Option<&'a Path>,
+    cmdline: Option<&'a str>,
+    initramfs: Option<&'a Path>,
 }
 
 fn main() -> ExitCode {
@@ -262,6 +280,8 @@ fn run() -> Result<()> {
                     limine_tool: args.limine_tool.as_deref(),
                     secure_boot_key: args.secure_boot_key.as_deref(),
                     secure_boot_cert: args.secure_boot_cert.as_deref(),
+                    cmdline: args.cmdline.as_deref(),
+                    initramfs: args.initramfs.as_deref(),
                 },
             )
         }
@@ -290,6 +310,8 @@ fn run() -> Result<()> {
                     limine_tool: args.limine_tool.as_deref(),
                     secure_boot_key: args.secure_boot_key.as_deref(),
                     secure_boot_cert: args.secure_boot_cert.as_deref(),
+                    cmdline: args.cmdline.as_deref(),
+                    initramfs: args.initramfs.as_deref(),
                 },
             )?;
             let artifact = find_artifact(&output, format, &args.version, arch)?;
@@ -448,6 +470,12 @@ fn run_packager(root: &Path, options: PackagerOptions<'_>) -> Result<()> {
     }
     if let Some(cert) = options.secure_boot_cert {
         command.arg("--secure-boot-cert").arg(cert);
+    }
+    if let Some(cmdline) = options.cmdline {
+        command.arg("--cmdline").arg(cmdline);
+    }
+    if let Some(initramfs) = options.initramfs {
+        command.arg("--initramfs").arg(initramfs);
     }
     let status = command.status().context("launching native package build")?;
     if !status.success() {
