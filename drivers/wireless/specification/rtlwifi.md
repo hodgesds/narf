@@ -3099,8 +3099,11 @@ keeps the chip diagnostic until admission lands.
   indices, the RF channel step and `set_bw_mode` (the `rtl_op_config`
   order; indices at the operating width). `Prepared::configure_rtl8723be_channel(grant)`
   (RadioConfigured/ChannelConfigured → ChannelConfigured) requires the
-  grant's factory identity. No production path mints a grant yet: the
-  signed per-board envelope is a later step. Test
+  grant's factory identity. The signed per-board envelope
+  (`envelope.rs`, #1461) mints the `Permission` the packet owner
+  transmits under, and the channel `Grant` is minted from that
+  permission's operating point (`Grant::bounded` caps every index at the
+  Linux factory value). Test
   `smoke_rtl8723be_rfpath_lck_bandwidth_and_channel` (written,
   unexecuted).
 - `iqk` — `rtl8723be_phy_iq_calibrate(hw, false)`: `0x948` save/restore,
@@ -3159,12 +3162,12 @@ keeps the chip diagnostic until admission lands.
   (LPS-enter flow, self-reset on MCUFWDL BIT7 + ready, MCU reset,
   MCUFWDL 0, card-disable flow, RSV_CTRL+1 pulse, RSV_CTRL 0x0e); the
   rebuild owner composes it with admission. None of this is reachable from
-  probe yet: BT coexistence (`halbtc8723b1ant` / `2ant`, which Linux runs
-  on every 8723BE board, `bt_exist` or not) and the signed envelope are
-  outstanding. Tests `smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm`,
+  probe yet (chip diagnostic): the coexistence owner is wired (pass 3
+  below) and the signed envelope is delivered (#1461); probe admission
+  is the outstanding step. Tests `smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm`,
   `smoke_rtl8723be_ra_mask_dm_and_rx_pwdb`,
   `smoke_rtl8723be_c2h_irq_and_card_disable` (written, unexecuted).
-- BT coexistence, pass 1 (not wired, not admitted). `btcoex/btc.rs` is the
+- BT coexistence, pass 1 (wired via the pass-3 owner below; not admitted). `btcoex/btc.rs` is the
   `halbtcoutsrc.c` / `rtl_btc.c` glue: `BtCoexist` (`struct btc_coexist`
   state; `bind` = `exhalbtc_initlize_variables` +
   `exhalbtc_bind_bt_coex_withadapter` from `HwPg::rtl8723be(&Adapter)`:
@@ -3263,10 +3266,13 @@ keeps the chip diagnostic until admission lands.
   makes in Linux is recorded by `BtcHal` (`LpsNotified`) and replayed
   after the outer notify (both 8723B handlers only set
   `coex_sta->under_lps`, read only by debugfs); the watchdog cadence is
-  enforced from the caller's clock. Outstanding: the 8723BE station /
-  packet owner that calls `ips`/`lps_*`/`scan`/`connect`/`media_status`/
-  `special_packet`/`watchdog`/`c2h` and implements `C2hSource` over its
-  RX ring, and admission (signed envelope, probe). Tests
+  enforced from the caller's clock. The station / packet owner that
+  calls those methods now exists (`packet::Owner`, #1461): it implements
+  `C2hSource` over its RX ring (`C2hQueue`), dispatches RX C2H into the
+  coexistence owner, and calls `ips` / `lps_*` / `scan` / `connect` /
+  `media_status` / `special_packet` / `eapol` / `watchdog` / `c2h`.
+  Outstanding: probe admission only (the signed envelope is delivered,
+  #1461). Tests
   `smoke_rtl8723be_coex_owner_lps_c2h_watchdog_halt`, the coexistence
   order checks added to `smoke_rtl8723be_erfon_block_and_channel_grant`
   and `smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt` (written,
@@ -3278,7 +3284,8 @@ keeps the chip diagnostic until admission lands.
 pieces it uses (PCI `0x8723`, 1T1R 2.4 GHz HT with Bluetooth; the
 RTL8192C generation: 92CE-style descriptors, its own `pwrseq` flows and
 its own coexistence in `hal_btc.c` / `hal_bt_coexist.c`). Probe keeps the
-chip diagnostic (no firmware owner is built for it yet).
+chip diagnostic (the firmware owner is built — `firmware_transport::Owner`
+admits `0x8723` via `run_8723ae` — but probe does not run it yet).
 
 - `version` — `_rtl8723e_read_chip_version`: `NORMAL_CHIP | CHIP_8723`,
   `CHIP_VENDOR_UMC` from `REG_SYS_CFG[19]` with the `CHIP_VER_RTL_MASK` cut
@@ -3341,13 +3348,31 @@ chip diagnostic (no firmware owner is built for it yet).
   consumed without effect; `C2H_V0_BT_INFO` (12) parses via
   `rtl8723e_dm_bt_parse_bt_info` (original byte 0, retry byte 1 when the
   body is at least 2 bytes, inquiry page bit 2, connection bit 0) and
-  returns the four fields as `BtInfo` for the future coexistence owner
-  (the `btc_periodical` trigger and `bt_busy` / idle-state updates are
-  that owner's duty). No production caller yet: the future AE packet
-  owner schedules `c2h::drain` when `irq::IsrStatus::c2h_pending` is set,
-  mirroring the `pci.c` fwevt gate, which is 8723AE-only. Tests
+  returns the four fields as `BtInfo` for the coexistence owner
+  (`coex::Owner::ingest` + `periodical`, fed by the packet owner's
+  `service_c2h`). `packet::Owner::service_c2h` schedules `c2h::drain`
+  when `irq::IsrStatus::c2h_pending` is set, mirroring the `pci.c`
+  fwevt gate, which is 8723AE-only (fixture-tested; no live IRQ caller
+  yet — probe keeps the chip diagnostic). Tests
   `smoke_rtl8723ae_c2h_mailbox_close_protocol`,
   `smoke_rtl8723ae_c2h_mailbox_bt_info` (written, unexecuted).
+- `coex` — the 8723AE Bluetooth-coexistence owner, pass 1 (#1458): board
+  binding, `BtInfo` ingestion per `rtl8723e_dm_bt_parse_bt_info`, the
+  periodical decision (shared `btcoex` matrix) and the DM primitives
+  (`hal_bt_coexist.c`); the 1-ant / 2-ant mechanism trees live in `dm.rs`
+  (#1470: `run_mechanism`, 2-ant dispatch, `set_bt_dm`, `_8723a` all-off).
+  Remainder: the RF halves — the RF half of `agc_table` and the
+  LPF-corner RF write (`RF90_PATH_A`) — are flagged (`agc_rf_pending` /
+  `lpf_rf_pending`), not silently dropped, pending an `rf.rs` RF-write
+  API; the 1-ant path is a Linux stub, ported as a no-op.
+- `envelope` — signed per-board NAPC power envelopes, 2.4 GHz only
+  (#1458): `Calibration::permission_for` mints the `Permission` the
+  packet owner transmits under (v1/v2 rows, CCK/OFDM/HT 1SS curves,
+  no BB swing, no factory per-rate TXAGC cap).
+- `packet` — the AE packet owner (#1458): 92CE-style TX descriptor
+  fill, RX descriptor query, firmware + envelope admission gates
+  (`Owner::admit`, `admit_tx`) and the mailbox service entry
+  (`service_c2h`). The chip is still not admitted (probe diagnostic).
 
 ### RTL8192DE retained runtime (in progress, not admitted)
 
@@ -3546,7 +3571,7 @@ runtimes remain separate from the retained RTL8188EE owner.
 
 | Row | Concrete blocker |
 |---|---|
-| `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE; blocked on the rtl8723ae/rtl8723be chip runtimes |
+| `bt_coexistence` | Bluetooth coexistence on RTL8723AE/BE: the per-chip coexistence owners are delivered (8723AE pass-1 owner + 1-/2-ant mechanism trees, #1458/#1470; 8723BE owner with 1-/2-antenna dispatch and every `rtl_btc_ops` call site, #1351); blocked on probe admission for both chips (diagnostic-only) and the 8723AE coex RF halves (pending an `rf.rs` RF-write API) |
 | `dynamic_antenna_selection` | Native factory type1/2 hardware diversity and SMART type4, actual PHY mux/descriptor/training/restore and separate signed NEAN per-selector/thermal full-program qualification are implemented above, pending release compilation/native acceptance. Original static records remain unchanged; board measurements and physical mapping/RF acceptance remain external |
 | `five_ghz_operation` | 5GHz band operation on RTL8192DE/RTL8821AE; blocked on the rtl8192de/rtl8821ae chip runtimes (RTL8188EE is 2.4GHz-only) |
 | `ht40` | Source-correct native HT20/40/secondary selection and signed NEHT v4 full-program qualification are implemented above, pending coordinated native acceptance. Existing NEHT v2/v3 remain20MHz. Measured per-device board data and physical acceptance remain external |
