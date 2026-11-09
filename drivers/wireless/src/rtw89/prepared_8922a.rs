@@ -35,19 +35,30 @@
 //!    `observe_data_report` for completions.
 //!
 //! What this owner deliberately does NOT own (later steps):
-//! - FWCMD header framing for H2C bodies (type/category/class/func/
-//!   sequence): the station owner builds CCTL/BA-CAM/RA bodies and
-//!   this owner moves caller-framed buffers across CH12. The C2H
-//!   completion path IS owned here now (`complete`, chip-row step
-//!   7): it drains RPQ/RXQ for serviced interrupt events and
-//!   routes C2H messages, but H2C buffers are still retained in
-//!   `h2c_retained` — no ack can be matched to one until the
-//!   FWCMD framing lane records a sequence per retained buffer.
-//! - The TXWD_INFO v2 fill: `prepare_data` clears BODY0 bit 22
-//!   (WDINFO_EN) via `tx_8922a::build_header`, as in pass 1.
 //! - 6 GHz admission, MLO multi-link, legacy-mode admission.
 //! - Firmware download (`prepared::load` selects the image; the
 //!   download plan + secure loader are a separate lane).
+//!
+//! What this owner DOES own since the remainder lane:
+//! - FWCMD header framing for H2C bodies
+//!   (`fwcmd_8922a::frame_h2c`, type/category/class/func/
+//!   sequence, via the shared `H2cSeqAllocator`): the station
+//!   owner builds CCTL/BA-CAM/RA bodies, this owner frames them
+//!   and records the identity per retained buffer
+//!   (`retain_h2c`), and the C2H completion path releases a
+//!   buffer on its matching ack (`release_h2c_by_ack`, surfaced
+//!   in `Outcome::h2c_released`).
+//! - The TXWD_INFO v2 fill (`prepare_data_with_info`):
+//!   `txrx_be::fill_txwd_info_v2` output appended after the v2
+//!   body with BODY0 bit 22 set. Plain `prepare_data` still
+//!   clears the bit (no info block).
+//! - The mac_pre_init owner (`mac_pre_init_8922a`): the MAC
+//!   reset (`reset_pwr_state`) + full `pwr_on_func` tail run in
+//!   `pci::bring_up` between the power-on head and the EFUSE
+//!   factory read — Linux `rtw89_chip_info_setup` order
+//!   (`core.c:7388..7409`: chip-ver read, `rtw89_mac_pwr_on`,
+//!   then `rtw89_chip_efuse_info_setup`) — and the retained
+//!   chip version (`record_chip_ver` / `chip_ver`).
 //!
 //! DMA retention contract: a submitted data frame's header + frame
 //! `DmaBuffer`s are retained here (keyed by their DMA addresses)
@@ -71,18 +82,23 @@ use super::dma_8922a;
 use super::dma_be::{self, Regs};
 use super::efuse_be::BeFactory;
 use super::eht::{EhtOperation, EhtStation, EHT_8922A};
+use super::fwcmd_8922a::{self, FramedH2c, Released};
+use super::h2c::H2cSeqAllocator;
 use super::irq_be::BindingBe;
+use super::mac_pre_init_8922a::{self, HalChipVer};
 use super::power;
 use super::ra_mask::{self, StationCaps};
+use super::rx_packet::Ack;
 use super::station_8922a::{self, Request, Station};
-use super::tx_8922a::{self, H2cPrepared, PrepareArgs, Prepared, Retained};
+use super::tx_8922a::{self, H2cPrepared, PrepareArgs, Prepared, Retained, TXWD_INFO_SIZE};
 use super::tx_transport::Completion;
 
-/// Maximum BE data-header bytes: 32-byte TXWD_BODY_V2 + 8-byte WP
-/// info + at most 10 v1 address-info entries × 6 bytes. A submitter
-/// allocates this much header DMA before `prepare_data`, then copies
+/// Maximum BE data-header bytes: 32-byte TXWD_BODY_V2 + 32-byte
+/// TXWD_INFO_V2 + 8-byte WP info + at most 10 v1 address-info
+/// entries × 6 bytes. A submitter allocates this much header DMA
+/// before `prepare_data` / `prepare_data_with_info`, then copies
 /// only the built length (`Prepared::header.len()`).
-pub(super) const MAX_HEADER_BYTES: usize = 100;
+pub(super) const MAX_HEADER_BYTES: usize = 132;
 
 /// Prepared-owner failures. Every variant is a refusal; a refused
 /// call leaves no partially-programmed artifact behind except the
@@ -188,6 +204,31 @@ impl super::irq::Regs for MmioRegs<'_> {
     }
 }
 
+/// [`mac_pre_init_8922a::Regs`] over the same BAR2 window, for
+/// the MAC reset / pwr_on tail / chip-version read. Infallible:
+/// BAR2 MMIO cannot fail; the tail's polls are bounded
+/// attempt-count loops over these reads.
+impl mac_pre_init_8922a::Regs for MmioRegs<'_> {
+    fn read8(&mut self, address: u32) -> u8 {
+        // SAFETY: caller's owned-BAR2 contract; `address` is a
+        // BAR2 offset inside the mapped window.
+        unsafe { self.0.read8(address as u64) }
+    }
+
+    fn read32(&mut self, address: u32) -> u32 {
+        <Self as Regs>::read32(self, address)
+    }
+
+    fn write8(&mut self, address: u32, value: u8) {
+        // SAFETY: same.
+        unsafe { self.0.write8(address as u64, value) }
+    }
+
+    fn write32(&mut self, address: u32, value: u32) {
+        <Self as Regs>::write32(self, address, value)
+    }
+}
+
 /// The prepared 8922A device: factory identity, admitted stations,
 /// BE data + H2C transport owners, and ring state. Constructed by
 /// `pci::bring_up` for a probed 8922A device and retained on
@@ -208,8 +249,18 @@ pub(crate) struct Prepared8922a {
     /// Submitted data frames' DMA buffers, keyed by
     /// (header DMA, frame DMA); freed on RPQ release.
     data_retained: Vec<(u64, u64, DmaBuffer, DmaBuffer)>,
-    /// Submitted H2C buffers; freed by the future C2H path.
-    h2c_retained: Vec<DmaBuffer>,
+    /// Firmware-command sequence allocator shared by every
+    /// framed H2C command this owner submits.
+    h2c_seq: H2cSeqAllocator,
+    /// Submitted H2C buffers, each with the FWCMD identity the
+    /// firmware echoes in its C2H ack. A buffer leaves this list
+    /// only on its ack (see `release_h2c_by_ack`).
+    h2c_retained: Vec<(FramedH2c, DmaBuffer)>,
+    /// Core chip version read during the MAC pre-init
+    /// (`mac_pre_init_8922a::read_chip_ver`). `None` until the
+    /// pre-init runs — the pci owner records it, not the probe
+    /// path, so the field is set exactly once per bring-up.
+    chip_ver: Option<HalChipVer>,
     /// C2H completion worker state (RPQ/RXQ host write pointers
     /// + RXQ assembly). Rebuilt by `program_rings` at the
     ///   programmed depths, reset by `stop_dma`.
@@ -233,7 +284,9 @@ impl Prepared8922a {
             rings_programmed: false,
             irq: None,
             data_retained: Vec::new(),
+            h2c_seq: H2cSeqAllocator::new(),
             h2c_retained: Vec::new(),
+            chip_ver: None,
             completion: completion_8922a::Worker::new(DEFAULT_RXBD_NUM, DEFAULT_RXBD_NUM)
                 .map_err(Error::Completion)?,
         })
@@ -394,6 +447,13 @@ impl Prepared8922a {
                 .map_err(Error::Completion)?;
             outcome.dropped += rxq_out.dropped;
             outcome.frames.extend(rxq_out.frames);
+            for routed in &rxq_out.c2h {
+                if let Some(ack) = &routed.ack {
+                    if let Some(released) = self.release_h2c_by_ack(ack) {
+                        outcome.h2c_released.push(released);
+                    }
+                }
+            }
             outcome.c2h.extend(rxq_out.c2h);
             outcome.ppdu.extend(rxq_out.ppdu);
             outcome.work_done += rxq_out.work;
@@ -576,6 +636,7 @@ impl Prepared8922a {
     /// without publishing or ringing the doorbell (see
     /// [`tx_8922a::DataTx::prepare`]). Refused unless the rings
     /// are programmed and `args.mac_id` is an admitted station.
+    /// No TXWD_INFO block follows (BODY0 bit 22 cleared).
     pub(super) fn prepare_data(&mut self, args: PrepareArgs<'_>) -> Result<Prepared, Error> {
         if !self.rings_programmed {
             return Err(Error::NotProgrammed);
@@ -584,6 +645,26 @@ impl Prepared8922a {
             return Err(Error::NoStation);
         }
         self.data.prepare(args).map_err(Error::Transport)
+    }
+
+    /// Like [`Self::prepare_data`], but appends the caller-filled
+    /// 32-byte TXWD_INFO v2 block (`txrx_be::fill_txwd_info_v2`
+    /// output) after the v2 body and leaves BODY0 bit 22
+    /// (WDINFO_EN) set.
+    pub(super) fn prepare_data_with_info(
+        &mut self,
+        args: PrepareArgs<'_>,
+        info: &[u8; TXWD_INFO_SIZE],
+    ) -> Result<Prepared, Error> {
+        if !self.rings_programmed {
+            return Err(Error::NotProgrammed);
+        }
+        if self.station(args.mac_id).is_none() {
+            return Err(Error::NoStation);
+        }
+        self.data
+            .prepare_with_info(args, info)
+            .map_err(Error::Transport)
     }
 
     /// Publish a prepared frame and ring its doorbell. The caller
@@ -678,9 +759,73 @@ impl Prepared8922a {
         }
     }
 
-    /// Retain a submitted H2C buffer until the C2H completion
-    /// path releases it (later step).
-    pub(super) fn retain_h2c(&mut self, buf: DmaBuffer) {
-        self.h2c_retained.push(buf);
+    /// Frame one H2C body with the FWCMD header
+    /// (`fwcmd_8922a::frame_h2c`): 8-byte header + body into
+    /// `out`, the sequence allocated from the shared allocator.
+    /// Returns the command identity and the total wire length.
+    /// Refused when `out` is too small or the payload cannot fit
+    /// the 14-bit total-length field — never truncated. The
+    /// caller places the framed bytes into H2C DMA memory, calls
+    /// `prepare_h2c` + `kick_h2c`, then retains the buffer with
+    /// `retain_h2c(framed, buf)`.
+    pub(super) fn frame_h2c(
+        &self,
+        cat: u8,
+        class: u8,
+        func: u8,
+        payload: &[u8],
+        rec_ack: bool,
+        done_ack: bool,
+        out: &mut [u8],
+    ) -> Option<(FramedH2c, usize)> {
+        fwcmd_8922a::frame_h2c(
+            &self.h2c_seq,
+            cat,
+            class,
+            func,
+            payload,
+            rec_ack,
+            done_ack,
+            out,
+        )
+    }
+
+    /// Retain a submitted H2C buffer, keyed by the FWCMD
+    /// identity `frame_h2c` returned, until the C2H completion
+    /// path releases it on its matching ack
+    /// (`release_h2c_by_ack`).
+    pub(super) fn retain_h2c(&mut self, framed: FramedH2c, buf: DmaBuffer) {
+        self.h2c_retained.push((framed, buf));
+    }
+
+    /// Release the retained H2C buffer whose FWCMD identity
+    /// `ack` echoes, reporting its DONE_ACK return code (or
+    /// `None` for a REC_ACK). `None` when no retained buffer
+    /// matches — an unmatched ack releases nothing.
+    pub(super) fn release_h2c_by_ack(&mut self, ack: &Ack) -> Option<Released> {
+        let index = self
+            .h2c_retained
+            .iter()
+            .position(|(framed, _)| fwcmd_8922a::matches_ack(ack, framed))?;
+        let (framed, buf) = self.h2c_retained.remove(index);
+        drop(buf);
+        Some(Released {
+            framed,
+            result: ack.result,
+        })
+    }
+
+    /// Record the core chip version read during the MAC
+    /// pre-init (`mac_pre_init_8922a::read_chip_ver`). Called by
+    /// the pci owner once per bring-up, after it runs the reset +
+    /// tail and reads the chip version.
+    pub(super) fn record_chip_ver(&mut self, ver: HalChipVer) {
+        self.chip_ver = Some(ver);
+    }
+
+    /// The core chip version read during the MAC pre-init, if
+    /// the pre-init has run.
+    pub(super) fn chip_ver(&self) -> Option<HalChipVer> {
+        self.chip_ver
     }
 }

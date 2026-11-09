@@ -9,12 +9,13 @@
 use super::chip_8922a;
 use super::completion_8922a::Error as CompletionError;
 use super::completion_8922a::*;
-use super::dma::{TxBd, TXBD_OPT_LS, TXCH_NUM};
+use super::dma::{TxBd, TXCH_NUM};
 use super::dma_be::Regs;
 use super::efuse_be::BeFactory;
 use super::irq::Events;
 use super::prepared_8922a::Error as PreparedError;
 use super::prepared_8922a::*;
+use super::rx_packet::Ack;
 use super::rx_packet::C2h;
 use super::station_8922a::{Band, Request};
 use super::tx_8922a::{PrepareArgs, BUFFER_DMA_MASK, DATA_RING_DEPTH, FRAME_DMA_MASK};
@@ -514,6 +515,119 @@ fn smoke_rtw89_completion_8922a_rxq_c2h() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_completion_8922a_rxq_c2h
+);
+
+fn smoke_rtw89_completion_8922a_h2c_ack_release() -> TestResult {
+    let (mut owner, mut regs) = match programmed_owner(256) {
+        Ok(pair) => pair,
+        Err(why) => return TestResult::Fail(why),
+    };
+    // Frame two H2C commands (MAC / class 5 / func 2, 4-byte
+    // bodies, both acks) and retain their buffers. Sequences
+    // allocate 0 then 1 from the shared allocator.
+    let mut framed_bytes = [0u8; 12];
+    let (framed0, total0) = match owner.frame_h2c(
+        0x1,
+        0x5,
+        0x2,
+        &[0xAA, 0xBB, 0xCC, 0xDD],
+        true,
+        true,
+        &mut framed_bytes,
+    ) {
+        Some(framed) => framed,
+        None => return TestResult::Fail("frame_h2c for seq 0 failed"),
+    };
+    let buf0 = match alloc_coherent_masked(total0, DomainId::DRIVER_0, BUFFER_DMA_MASK) {
+        Ok(buf) => buf,
+        Err(_) => return TestResult::Fail("H2C buffer alloc failed"),
+    };
+    owner.retain_h2c(framed0, buf0);
+    let (framed1, total1) = match owner.frame_h2c(
+        0x1,
+        0x5,
+        0x2,
+        &[0x11, 0x22, 0x33, 0x44],
+        true,
+        true,
+        &mut framed_bytes,
+    ) {
+        Some(framed) => framed,
+        None => return TestResult::Fail("frame_h2c for seq 1 failed"),
+    };
+    let buf1 = match alloc_coherent_masked(total1, DomainId::DRIVER_0, BUFFER_DMA_MASK) {
+        Ok(buf) => buf,
+        Err(_) => return TestResult::Fail("H2C buffer alloc failed"),
+    };
+    owner.retain_h2c(framed1, buf1);
+    if framed0.seq != 0 || framed1.seq != 1 {
+        return TestResult::Fail("framed sequences must allocate 0 then 1");
+    }
+    // RXQ buffer 0: MAC INFO DONE_ACK echoing the seq-1 command
+    // (w0 = cat 1 | func 1; w1 = 12; w2 = cat 1 | class 5 |
+    // func 2 | result 0<<16 | seq 1<<24).
+    let mut done_ack1 = Vec::new();
+    done_ack1.extend_from_slice(&0x101u32.to_le_bytes());
+    done_ack1.extend_from_slice(&12u32.to_le_bytes());
+    done_ack1.extend_from_slice(&(0x215u32 | (1u32 << 24)).to_le_bytes());
+    // RXQ buffer 1: DONE_ACK for a sequence that was never
+    // framed (seq 9) — it must release nothing.
+    let mut done_ack9 = Vec::new();
+    done_ack9.extend_from_slice(&0x101u32.to_le_bytes());
+    done_ack9.extend_from_slice(&12u32.to_le_bytes());
+    done_ack9.extend_from_slice(&(0x215u32 | (9u32 << 24)).to_le_bytes());
+    let mut rxq = empty_buffers(256);
+    let mut content = rxd(10, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+    content.extend_from_slice(&done_ack1);
+    rxq[0] = segment(true, true, &content);
+    let mut content = rxd(10, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
+    content.extend_from_slice(&done_ack9);
+    rxq[1] = segment(true, true, &content);
+    let mut rpq = empty_buffers(256);
+    regs.set_idx(0xB160, 2, 255);
+    let outcome = match owner.complete(
+        &mut regs,
+        Events {
+            rx: true,
+            ..Default::default()
+        },
+        &mut refs(&mut rxq),
+        &mut refs(&mut rpq),
+        64,
+    ) {
+        Ok(outcome) => outcome,
+        Err(_) => return TestResult::Fail("complete failed"),
+    };
+    if outcome.c2h.len() != 2 || outcome.work_done != 2 {
+        return TestResult::Fail("RXQ C2H outcome wrong");
+    }
+    if outcome.h2c_released.len() != 1
+        || outcome.h2c_released[0].framed != framed1
+        || outcome.h2c_released[0].result != Some(0)
+    {
+        return TestResult::Fail("only the seq-1 ack must release, with result 0");
+    }
+    // The seq-0 buffer survives: a direct release by its ack
+    // still finds it, and a repeat finds nothing.
+    let ack0 = Ack {
+        category: 1,
+        class: 5,
+        function: 2,
+        sequence: 0,
+        result: Some(0),
+    };
+    match owner.release_h2c_by_ack(&ack0) {
+        Some(released) if released.framed == framed0 => {}
+        _ => return TestResult::Fail("seq-0 buffer must survive complete()"),
+    }
+    if owner.release_h2c_by_ack(&ack0).is_some() {
+        return TestResult::Fail("double release accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_completion_8922a_h2c_ack_release
 );
 
 fn smoke_rtw89_completion_8922a_halt() -> TestResult {

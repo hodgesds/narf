@@ -90,10 +90,11 @@ pub(super) fn encode_txwd_be(info: &TxwdBeInfo, out: &mut [u8]) -> Option<()> {
 // kernel — so these EHT bits have no Linux fill site to copy, and
 // this function encodes exactly the txrx.h positions with
 // caller-supplied values instead of inventing trigger conditions.
-// Composition contract: this is NOT a complete info-block fill —
-// the future fill must OR these bits into its info4/info7 alongside
-// the RTS and UL fields, and the transport keeps BODY0_WDINFO_EN
-// cleared until a complete info block follows, as today.
+// Composition contract: [`fill_txwd_info_v2`] is the complete
+// info-block fill — it ORs these bits into its info4/info7
+// alongside the RTS and UL fields, and the transport keeps
+// BODY0_WDINFO_EN cleared until a complete info block follows,
+// as today (see `tx_8922a::build_header_with_info`).
 
 /// BE TXWD_INFO dword 4 `SW_EHT_NLTF_SWITCH` bit 20 (`txrx.h:307`).
 pub(super) const INFO4_SW_EHT_NLTF_SWITCH: u32 = 1 << 20;
@@ -101,6 +102,200 @@ pub(super) const INFO4_SW_EHT_NLTF_SWITCH: u32 = 1 << 20;
 pub(super) const INFO4_SW_EHT_NLTF_MASK: u32 = 0x3 << 21;
 /// BE TXWD_INFO dword 7 `UL_EHT_USR_PRES` bit 16 (`txrx.h:336`).
 pub(super) const INFO7_UL_EHT_USR_PRES: u32 = 1 << 16;
+
+/// TXWD_INFO v2 block size in bytes (`chip_8922a::TXWD_INFO_SIZE`).
+pub(super) const TXWD_INFO_V2_SIZE: usize = 32;
+
+// ── BE TXWD_INFO v2 fill ────────────────────────────────────────────
+//
+// The complete info-block fill, mirroring Linux
+// `rtw89_core_fill_txdesc_v2` (`core.c:1849..1876`, torvalds/linux
+// @ cbbddb6) with the EHT bits from `eht_info_fields` OR'd into
+// info4/info7. Linux fills info0/1/2/4 only and leaves
+// info3/5/6/7 zero (info7 has no Linux fill site — the EHT bit
+// is this tree's only info7 contribution, as in `eht.rs`);
+// this fill does the same, so a zeroed info block is the
+// documented default for every field the caller does not set.
+
+/// BE TXWD_INFO dword 0 `DATA_STBC` bit 12 (`txrx.h:254`).
+pub(super) const INFO0_DATA_STBC: u32 = 1 << 12;
+/// BE TXWD_INFO dword 0 `DATA_LDPC` bit 11 (`txrx.h:253`).
+pub(super) const INFO0_DATA_LDPC: u32 = 1 << 11;
+/// BE TXWD_INFO dword 0 `DISDATAFB` bit 10 (`txrx.h:252`).
+pub(super) const INFO0_DISDATAFB: u32 = 1 << 10;
+/// BE TXWD_INFO dword 0 `MULTIPORT_ID` bits 6:4 (`txrx.h:250`).
+pub(super) const INFO0_MULTIPORT_ID_SHIFT: u32 = 4;
+/// BE TXWD_INFO dword 0 `MULTIPORT_ID` mask.
+pub(super) const INFO0_MULTIPORT_ID_MASK: u32 = 0x7 << INFO0_MULTIPORT_ID_SHIFT;
+/// BE TXWD_INFO dword 0 `DATA_TXCNT_LMT_SEL` bit 22 (`txrx.h:256`).
+pub(super) const INFO0_DATA_TXCNT_LMT_SEL: u32 = 1 << 22;
+/// BE TXWD_INFO dword 0 `DATA_TXCNT_LMT` bits 21:16 (`txrx.h:255`).
+pub(super) const INFO0_DATA_TXCNT_LMT_SHIFT: u32 = 16;
+/// BE TXWD_INFO dword 0 `DATA_TXCNT_LMT` mask.
+pub(super) const INFO0_DATA_TXCNT_LMT_MASK: u32 = 0x3F << INFO0_DATA_TXCNT_LMT_SHIFT;
+/// BE TXWD_INFO dword 1 `MAX_AGG_NUM` bits 7:0 (`txrx.h:262`).
+pub(super) const INFO1_MAX_AGG_NUM_MASK: u32 = 0xFF;
+/// BE TXWD_INFO dword 1 `A_CTRL_BSR` bit 14 (`txrx.h:266`).
+pub(super) const INFO1_A_CTRL_BSR: u32 = 1 << 14;
+/// BE TXWD_INFO dword 1 `DATA_RTY_LOWEST_RATE` bits 27:16
+/// (`txrx.h:268`).
+pub(super) const INFO1_DATA_RTY_LOWEST_RATE_SHIFT: u32 = 16;
+/// BE TXWD_INFO dword 1 `DATA_RTY_LOWEST_RATE` mask.
+pub(super) const INFO1_DATA_RTY_LOWEST_RATE_MASK: u32 = 0xFFF << INFO1_DATA_RTY_LOWEST_RATE_SHIFT;
+/// BE TXWD_INFO dword 1 `SW_DEFINE` bits 31:28 (`txrx.h:269`).
+pub(super) const INFO1_SW_DEFINE_SHIFT: u32 = 28;
+/// BE TXWD_INFO dword 1 `SW_DEFINE` mask.
+pub(super) const INFO1_SW_DEFINE_MASK: u32 = 0xF << INFO1_SW_DEFINE_SHIFT;
+/// BE TXWD_INFO dword 2 `AMPDU_DENSITY` bits 20:18 (`txrx.h:278`).
+pub(super) const INFO2_AMPDU_DENSITY_SHIFT: u32 = 18;
+/// BE TXWD_INFO dword 2 `AMPDU_DENSITY` mask.
+pub(super) const INFO2_AMPDU_DENSITY_MASK: u32 = 0x7 << INFO2_AMPDU_DENSITY_SHIFT;
+/// BE TXWD_INFO dword 2 `FORCE_KEY_EN` bit 8 (`txrx.h:273`).
+pub(super) const INFO2_FORCE_KEY_EN: u32 = 1 << 8;
+/// BE TXWD_INFO dword 2 `SEC_CAM_IDX` bits 7:0 (`txrx.h:272`).
+pub(super) const INFO2_SEC_CAM_IDX_MASK: u32 = 0xFF;
+/// BE TXWD_INFO dword 2 `SPE_RPT_V1` bit 30 (`txrx.h:281`).
+pub(super) const INFO2_SPE_RPT_V1: u32 = 1 << 30;
+/// BE TXWD_INFO dword 4 `RTS_EN` bit 27 (`txrx.h:310`).
+pub(super) const INFO4_RTS_EN: u32 = 1 << 27;
+/// BE TXWD_INFO dword 4 `HW_RTS_EN` bit 31 (`txrx.h:312`).
+pub(super) const INFO4_HW_RTS_EN: u32 = 1 << 31;
+
+/// Inputs for one BE TXWD_INFO v2 block, mirroring the
+/// `struct rtw89_tx_desc_info` fields
+/// `rtw89_core_fill_txdesc_v2` reads (`core.c:1798..1867`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TxwdInfoV2 {
+    /// STBC for this frame (info0 `DATA_STBC`).
+    pub(super) stbc: bool,
+    /// LDPC for this frame (info0 `DATA_LDPC`).
+    pub(super) ldpc: bool,
+    /// Disable data-rate fallback (info0 `DISDATAFB`).
+    pub(super) dis_data_fb: bool,
+    /// Multi-port id, 0..=7 (info0 `MULTIPORT_ID`).
+    pub(super) port: u8,
+    /// TX-count-limit select (info0 `DATA_TXCNT_LMT_SEL`).
+    pub(super) tx_cnt_lmt_en: bool,
+    /// TX-count limit, 0..=63 (info0 `DATA_TXCNT_LMT`).
+    pub(super) tx_cnt_lmt: u8,
+    /// Maximum A-MPDU aggregation (info1 `MAX_AGG_NUM`).
+    pub(super) ampdu_num: u8,
+    /// A-Control BSR present (info1 `A_CTRL_BSR`).
+    pub(super) a_ctrl_bsr: bool,
+    /// Lowest rate for data retries, 0..=4095 (info1
+    /// `DATA_RTY_LOWEST_RATE`).
+    pub(super) data_retry_lowest_rate: u16,
+    /// Software sequence number, 0..=15 (info1 `SW_DEFINE`).
+    pub(super) sn: u8,
+    /// A-MPDU density, 0..=7 (info2 `AMPDU_DENSITY`).
+    pub(super) ampdu_density: u8,
+    /// Force key encryption (info2 `FORCE_KEY_EN`).
+    pub(super) sec_en: bool,
+    /// Security CAM index, 0..=255 (info2 `SEC_CAM_IDX`).
+    pub(super) sec_cam_idx: u16,
+    /// Special report request (info2 `SPE_RPT_V1`).
+    pub(super) report: bool,
+    /// Broadcast/multicast frame: `RTS_EN` is the negation of
+    /// this (`core.c:1858`, `rts_en = !desc_info->is_bmc`).
+    pub(super) is_bmc: bool,
+    /// EHT software-NLTF switch (info4, via `eht_info_fields`).
+    pub(super) nltf_switch: bool,
+    /// EHT software-NLTF value, 0..=3 (info4).
+    pub(super) nltf: u8,
+    /// UL EHT user present (info7, via `eht_info_fields`).
+    pub(super) ul_eht_usr_pres: bool,
+}
+
+impl Default for TxwdInfoV2 {
+    /// All-zero info block (unicast, no EHT overrides): the
+    /// fail-closed default — only `HW_RTS_EN` (always 1) and
+    /// `RTS_EN` (unicast) are set by the fill itself.
+    fn default() -> Self {
+        Self {
+            stbc: false,
+            ldpc: false,
+            dis_data_fb: false,
+            port: 0,
+            tx_cnt_lmt_en: false,
+            tx_cnt_lmt: 0,
+            ampdu_num: 0,
+            a_ctrl_bsr: false,
+            data_retry_lowest_rate: 0,
+            sn: 0,
+            ampdu_density: 0,
+            sec_en: false,
+            sec_cam_idx: 0,
+            report: false,
+            is_bmc: false,
+            nltf_switch: false,
+            nltf: 0,
+            ul_eht_usr_pres: false,
+        }
+    }
+}
+
+/// Fill a 32-byte BE TXWD_INFO v2 block from `info`, mirroring
+/// Linux `rtw89_core_fill_txdesc_v2` info0/1/2/4 plus the EHT
+/// bits. `None` when a field overflows its wire width or `out`
+/// is short — never truncated. Dwords 3/5/6 are zero (Linux
+/// leaves them unfilled); dword 7 carries only the EHT UL-user
+/// bit.
+pub(super) fn fill_txwd_info_v2(info: &TxwdInfoV2, out: &mut [u8]) -> Option<()> {
+    if out.len() < TXWD_INFO_V2_SIZE
+        || info.port > 7
+        || info.tx_cnt_lmt > 0x3F
+        || info.data_retry_lowest_rate > 0xFFF
+        || info.sn > 0xF
+        || info.ampdu_density > 7
+        || info.sec_cam_idx > 0xFF
+    {
+        return None;
+    }
+    let (eht4, eht7) = eht_info_fields(info.nltf_switch, info.nltf, info.ul_eht_usr_pres)?;
+    let mut dw0: u32 = 0;
+    if info.stbc {
+        dw0 |= INFO0_DATA_STBC;
+    }
+    if info.ldpc {
+        dw0 |= INFO0_DATA_LDPC;
+    }
+    if info.dis_data_fb {
+        dw0 |= INFO0_DISDATAFB;
+    }
+    dw0 |= ((info.port as u32) << INFO0_MULTIPORT_ID_SHIFT) & INFO0_MULTIPORT_ID_MASK;
+    if info.tx_cnt_lmt_en {
+        dw0 |= INFO0_DATA_TXCNT_LMT_SEL;
+    }
+    dw0 |= ((info.tx_cnt_lmt as u32) << INFO0_DATA_TXCNT_LMT_SHIFT) & INFO0_DATA_TXCNT_LMT_MASK;
+    let mut dw1: u32 = (info.ampdu_num as u32) & INFO1_MAX_AGG_NUM_MASK;
+    if info.a_ctrl_bsr {
+        dw1 |= INFO1_A_CTRL_BSR;
+    }
+    dw1 |= ((info.data_retry_lowest_rate as u32) << INFO1_DATA_RTY_LOWEST_RATE_SHIFT)
+        & INFO1_DATA_RTY_LOWEST_RATE_MASK;
+    dw1 |= ((info.sn as u32) << INFO1_SW_DEFINE_SHIFT) & INFO1_SW_DEFINE_MASK;
+    let mut dw2: u32 = 0;
+    dw2 |= ((info.ampdu_density as u32) << INFO2_AMPDU_DENSITY_SHIFT) & INFO2_AMPDU_DENSITY_MASK;
+    if info.sec_en {
+        dw2 |= INFO2_FORCE_KEY_EN;
+    }
+    dw2 |= (info.sec_cam_idx as u32) & INFO2_SEC_CAM_IDX_MASK;
+    if info.report {
+        dw2 |= INFO2_SPE_RPT_V1;
+    }
+    let mut dw4: u32 = INFO4_HW_RTS_EN | eht4;
+    if !info.is_bmc {
+        dw4 |= INFO4_RTS_EN;
+    }
+    out[0..4].copy_from_slice(&dw0.to_le_bytes());
+    out[4..8].copy_from_slice(&dw1.to_le_bytes());
+    out[8..12].copy_from_slice(&dw2.to_le_bytes());
+    out[12..16].fill(0);
+    out[16..20].copy_from_slice(&dw4.to_le_bytes());
+    out[20..28].fill(0);
+    out[28..32].copy_from_slice(&eht7.to_le_bytes());
+    Some(())
+}
 
 /// EHT field contribution to the BE TXWD_INFO block: the info4
 /// software-NLTF bits and the info7 UL-EHT-user bit for one frame.
