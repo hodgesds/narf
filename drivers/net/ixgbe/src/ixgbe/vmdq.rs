@@ -1464,10 +1464,8 @@ pub fn mailbox_pump_step(
             if vf >= num_vfs {
                 break;
             }
-            if vf_reset_pending(bank, vf) {
-                if clear_vf_reset_event(bank, vf).is_ok() {
-                    outcome.resets |= 1u64 << vf;
-                }
+            if vf_reset_pending(bank, vf) && clear_vf_reset_event(bank, vf).is_ok() {
+                outcome.resets |= 1u64 << vf;
             }
             let req_bit = MBVFICR_VFREQ_VF1 << i;
             if word & req_bit != 0 {
