@@ -1503,18 +1503,18 @@ kernel_test_in!(
 
 // ── Shared-scratch-buffer race (#1988) ─────────────────────────────
 
-/// Test-only block device that models real DMA timing: the transfer
-/// into/out of the request buffer happens when the device first
-/// executes the request (first poll of the submit future), and
-/// completion is signalled only on a later poll.
-///
-/// `RamBlockDevice` instead transfers synchronously inside
-/// `submit()` and completes on the first poll, so two sector ops
-/// can never interleave at the `.await` point and a shared
-/// scratch-buffer race is invisible against it. This device makes
-/// the interleave observable: poll op A (transfer A lands in the
-/// scratch buffer, A pends), poll op B (transfer B lands in the
-/// same scratch buffer, B pends), poll A again (A copies out).
+// Test-only block device that models real DMA timing: the transfer
+// into/out of the request buffer happens when the device first
+// executes the request (first poll of the submit future), and
+// completion is signalled only on a later poll.
+//
+// `RamBlockDevice` instead transfers synchronously inside
+// `submit()` and completes on the first poll, so two sector ops
+// can never interleave at the `.await` point and a shared
+// scratch-buffer race is invisible against it. This device makes
+// the interleave observable: poll op A (transfer A lands in the
+// scratch buffer, A pends), poll op B (transfer B lands in the
+// same scratch buffer, B pends), poll A again (A copies out).
 
 // ── Partial-sector read-modify-write race (#1996) ──────────────────
 //
@@ -1742,15 +1742,17 @@ kernel_test_in!(
     smoke_fat_concurrent_read_sector_returns_own_bytes
 );
 
+type DeferredFileFixture = (
+    alloc::sync::Arc<DeferredDmaDevice>,
+    alloc::sync::Arc<super::volume::FatVolume<DeferredDmaDevice>>,
+    alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+);
+
 /// Mount the `build_fat12_image(128, b"narf\n")` fixture on a
 /// [`DeferredDmaDevice`] and look up its one file, `NARF.TXT`
 /// (cluster 2, data sector 4). Returns the device (for post-write
 /// snapshots), the mounted volume, and the file node.
-fn mount_deferred_volume_with_file() -> Option<(
-    alloc::sync::Arc<DeferredDmaDevice>,
-    alloc::sync::Arc<super::volume::FatVolume<DeferredDmaDevice>>,
-    alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-)> {
+fn mount_deferred_volume_with_file() -> Option<DeferredFileFixture> {
     use narf_filesystem::FsInstance;
     use narf_lib::id::DomainId;
 

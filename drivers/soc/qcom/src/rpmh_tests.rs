@@ -116,7 +116,7 @@ fn smoke_qcom_rpmh_tcs_write_v30() -> TestResult {
     let d = FakeDelay::new();
     let fake = RscFake::new(TCS_BASE + 0x24);
     // ID register: major 3 selects the 3.0 table (stride 24).
-    fake.inner.set(0, (3 << 16) | (0 << 8));
+    fake.inner.set(0, 3 << 16);
     let rsc = Rsc::probe(&fake, TCS_BASE);
     let r = run(rsc.write_active(&d, &[(0x0000_a000, 0x1111), (0x0000_b000, 0x2222)], true));
     kt_assert_eq!(r, Some(Ok(())));

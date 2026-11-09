@@ -1082,14 +1082,14 @@ fn smoke_e1000_multi_instance_two_nic(e1000_addrs: &[narf_bus::BusAddr]) -> Test
     // send is the cookie-1 dispatch proof.
     let ctrls = [&ctrl0, &ctrl1];
     let names = [name0, name1];
-    for i in 0..2 {
+    for (i, &name) in names.iter().enumerate() {
         let mut frame = [0u8; 64];
         frame[..6].fill(0xFF);
         frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, (i + 1) as u8]);
         frame[12] = 0xFF;
         frame[13] = 0xFF;
         let heads = [ctrl0.tx_next_to_use(), ctrl1.tx_next_to_use()];
-        if narf_net::iface::send_on(names[i], &frame).is_err() {
+        if narf_net::iface::send_on(name, &frame).is_err() {
             return TestResult::Fail("send_on TX failed (two-NIC branch)");
         }
         for (j, c) in ctrls.iter().enumerate() {

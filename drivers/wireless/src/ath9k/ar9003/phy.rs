@@ -346,6 +346,10 @@ pub(in crate::ath9k) fn expected(
 /// chip reset (`ar9003::set_reset` + `set_power_awake`). `ctl` and
 /// `power_limit` are `ath9k_hw_apply_txpower`'s inputs. The power plan is
 /// computed before the first write.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keep per-device identity and reset policy explicit alongside channel power inputs"
+)]
 pub(in crate::ath9k) fn prepare(
     io: &mut impl RegisterIo,
     revision: &Revision,

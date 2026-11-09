@@ -290,11 +290,15 @@ fn smoke_rtw8852a_rf_native_window_uses_a_rf_bases() -> TestResult {
     // (`rf_base_addr` {0xc000, 0xd000} + 0x3fc, plus AX `cr_base` 0x10000),
     // not B's 0x1f3fc.
     region.len = 0x1d3fc;
+    // SAFETY: the advertised window fits in the private aligned register
+    // RAM, retained for this sequential test without concurrent I/O.
     let edge = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852A, 0) }.unwrap();
     if edge.a_phy_window() != Err(Error::Access) {
         return TestResult::Fail("A PHY window accepted a BAR ending at its last dword");
     }
     region.len = 0x1d400;
+    // SAFETY: the expanded window still fits in the same retained private
+    // register RAM; all views are used sequentially by this test.
     let io = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852A, 0) }.unwrap();
     if io.a_phy_window() != Ok(()) {
         return TestResult::Fail("complete current A PHY window rejected");
@@ -303,6 +307,8 @@ fn smoke_rtw8852a_rf_native_window_uses_a_rf_bases() -> TestResult {
         return TestResult::Fail("A chip took B's RF window");
     }
     region.len = 0x20000;
+    // SAFETY: words backs the entire advertised window, remains alive,
+    // and is accessed only by this sequential test's native I/O views.
     let b = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852B, 0) }.unwrap();
     if b.a_phy_window() != Err(Error::Unsupported) {
         return TestResult::Fail("B chip took A's RF window");

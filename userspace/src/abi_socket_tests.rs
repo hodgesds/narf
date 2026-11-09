@@ -5378,10 +5378,7 @@ fn inet_ghost_connect_case(listen_ip: [u8; 4], port: u16) -> Result<(), &'static
         buf[4..8].copy_from_slice(&ip);
         (buf, 16)
     }
-    let srv = match open_inet_stream() {
-        Ok(fd) => fd,
-        Err(e) => return Err(e),
-    };
+    let srv = open_inet_stream()?;
     let (addr, alen) = inet_sockaddr(listen_ip, port);
     match call(
         Syscall::SocketBind.raw(),
@@ -5394,10 +5391,7 @@ fn inet_ghost_connect_case(listen_ip: [u8; 4], port: u16) -> Result<(), &'static
         Some(0) => {}
         _ => return Err("server listen failed"),
     }
-    let cli = match open_inet_stream() {
-        Ok(fd) => fd,
-        Err(e) => return Err(e),
-    };
+    let cli = open_inet_stream()?;
     let (caddr, calen) = inet_sockaddr([127, 0, 0, 1], port);
     crate::socket::SocketFile::__test_arm_inet_connect_pre_enqueue_hook(
         crate::socket::SocketFile::__test_unregister_inet_listener,
@@ -5415,10 +5409,7 @@ fn inet_ghost_connect_case(listen_ip: [u8; 4], port: u16) -> Result<(), &'static
     }
     // The address/port was released: a fresh listener can bind it and
     // serve a normal connect/accept.
-    let srv2 = match open_inet_stream() {
-        Ok(fd) => fd,
-        Err(e) => return Err(e),
-    };
+    let srv2 = open_inet_stream()?;
     let (addr2, alen2) = inet_sockaddr(listen_ip, port);
     match call(
         Syscall::SocketBind.raw(),
@@ -5431,10 +5422,7 @@ fn inet_ghost_connect_case(listen_ip: [u8; 4], port: u16) -> Result<(), &'static
         Some(0) => {}
         _ => return Err("fresh listener listen failed after the ghost connect"),
     }
-    let cli2 = match open_inet_stream() {
-        Ok(fd) => fd,
-        Err(e) => return Err(e),
-    };
+    let cli2 = open_inet_stream()?;
     match call(
         Syscall::SocketConnect.raw(),
         a2(cli2, caddr.as_ptr() as u64, calen),
