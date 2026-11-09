@@ -1568,6 +1568,11 @@ impl ColdBoot {
             .map_err(Error::Display)?;
         for (index, report) in reports.iter().enumerate() {
             self.refresh_hdmi_vrr(index, &report.detection).await;
+            feed_detection_audio(
+                &self.sequence.backend.gpu,
+                &report.connector,
+                &report.detection,
+            );
         }
         Ok(reports)
     }
@@ -1583,6 +1588,13 @@ impl ColdBoot {
             .await
             .map_err(Error::Display)?;
         self.refresh_hdmi_vrr(index, &detection).await;
+        if let Some(connector) = self
+            .display_connectors()
+            .and_then(|c| c.get(index))
+            .copied()
+        {
+            feed_detection_audio(&self.sequence.backend.gpu, &connector, &detection);
+        }
         Ok(detection)
     }
     /// Query at most once for an unchanged HDMI EDID. Capabilities remain
@@ -2837,6 +2849,30 @@ impl ColdBoot {
     ) -> Result<crate::amdgpu_dcn30_cursor::Shown, crate::amdgpu_dcn_clk::Error> {
         let (scanout, pool, flush) = self.presentation()?;
         scanout.set_cursor(pool, image, at, flush)
+    }
+}
+
+/// Feed one detection's EDID into the KMS audio caps (#1786): the
+/// live DDC/AUX read's blob reaches `feed_connector_edid` through
+/// the device-tag crosswalk, so the caps land on the connector the
+/// blob was read from. A connected sink feeds; a sink that cannot
+/// be read (or is gone) clears the caps so they read unknown,
+/// never stale caps from a previous sink. Not an error when the
+/// tag has no KMS connector or the blob carries no CEA block —
+/// the feed's own contract covers both — so the result is dropped.
+pub(crate) fn feed_detection_audio(
+    gpu: &crate::amdgpu::AmdGpu,
+    connector: &crate::amdgpu_navi22_display::Connector,
+    detection: &crate::amdgpu_navi22_display::Detection,
+) {
+    use crate::amdgpu_navi22_display::Detection;
+    match detection {
+        Detection::Connected(sink) => {
+            let _ = gpu.feed_connector_edid_for_device(connector.path.device_tag, &sink.edid);
+        }
+        Detection::Disconnected | Detection::Failed(_) => {
+            let _ = gpu.clear_connector_audio_caps_for_device(connector.path.device_tag);
+        }
     }
 }
 

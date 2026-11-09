@@ -2413,11 +2413,10 @@ impl AmdGpu {
     /// Feed one connector's audio caps from a full EDID blob (#1712).
     /// Scans the extension blocks for the CEA-861 block (tag 0x02),
     /// parses its audio blocks, and feeds the result into the KMS
-    /// connector. The live DDC/AUX read that produces the blob per
-    /// connector is follow-up work (#1786); this is the feed call
-    /// the issue names as missing. A missing speaker block falls
-    /// back to the FL/FR baseline (0x01) every HDMI sink must
-    /// accept. The blob's preferred mode is retained on the
+    /// connector. The live DDC/AUX read reaches this feed through
+    /// `feed_detection_audio` (#1786). A missing speaker block falls
+    /// back to the FL/FR baseline (0x01) every HDMI sink must accept.
+    /// The blob's preferred mode is retained on the
     /// connector as well (#1787) — the first timing
     /// `edid_timings` yields, EDID 1.3+'s preferred mode — so the
     /// DRM/fb caller can modeset a connect without a second read.
@@ -2428,6 +2427,68 @@ impl AmdGpu {
     /// CEA block, no KMS state, or the connector index is out of
     /// range.
     pub fn feed_connector_edid(&self, connector_idx: u8, edid: &[u8]) -> bool {
+        let mut guard = KMS_STATE.lock();
+        let Some(kms) = guard.as_mut() else {
+            return false;
+        };
+        Self::feed_edid_into(kms, connector_idx, edid)
+    }
+
+    /// Feed one connector's audio caps from a full EDID blob (#1786),
+    /// resolving the KMS connector by ATOM `usDeviceTag` — the same
+    /// crosswalk `bind_hpd_from_inventory` uses between the inventory
+    /// display paths the detector reports and the ATOM-table
+    /// connectors `feed_connector_edid` indexes. The detector's
+    /// report order is inventory order, not ATOM-table order, so a
+    /// report index must never be fed as the connector index.
+    /// Returns `false` when no KMS connector carries the tag (or
+    /// there is no CEA block / no KMS state), as
+    /// `feed_connector_edid` does.
+    pub fn feed_connector_edid_for_device(&self, device_tag: u16, edid: &[u8]) -> bool {
+        let mut guard = KMS_STATE.lock();
+        let Some(kms) = guard.as_mut() else {
+            return false;
+        };
+        let Some((connector_idx, _)) = kms
+            .connectors
+            .iter()
+            .enumerate()
+            .find(|(_, conn)| conn.device_tag == device_tag)
+        else {
+            return false;
+        };
+        Self::feed_edid_into(kms, connector_idx as u8, edid)
+    }
+
+    /// Forget one connector's fed audio caps (#1786): a sink whose
+    /// EDID can no longer be read (or is gone) leaves the caps
+    /// unknown, never stale caps from a previous sink. The plan
+    /// layer falls back to the baseline LPCM stereo 48 kHz stream
+    /// for unknown caps. Returns `false` when no KMS connector
+    /// carries the tag or there is no KMS state.
+    pub fn clear_connector_audio_caps_for_device(&self, device_tag: u16) -> bool {
+        let mut guard = KMS_STATE.lock();
+        let Some(kms) = guard.as_mut() else {
+            return false;
+        };
+        let Some(conn) = kms
+            .connectors
+            .iter_mut()
+            .find(|c| c.device_tag == device_tag)
+        else {
+            return false;
+        };
+        conn.audio_caps = None;
+        true
+    }
+
+    /// The CEA-861 scan + feed half of `feed_connector_edid`,
+    /// shared by the index- and device-tag-addressed feeds.
+    fn feed_edid_into(
+        kms: &mut crate::amdgpu_modeset::KmsState,
+        connector_idx: u8,
+        edid: &[u8],
+    ) -> bool {
         use crate::amdgpu_hdmi_audio::parse_cea_audio_blocks;
         use crate::amdgpu_modeset::{
             feed_connector_audio_caps, feed_connector_preferred_mode, PreferredMode,
@@ -2437,10 +2498,6 @@ impl AmdGpu {
             return false;
         }
         let count = edid[126] as usize;
-        let mut guard = KMS_STATE.lock();
-        let Some(kms) = guard.as_mut() else {
-            return false;
-        };
         // Preferred mode first: it comes from the base block's
         // detailed timings, independent of whether any extension
         // carries a CEA block.
@@ -4434,6 +4491,233 @@ mod hdmi_dp_audio_kms_tests {
         }
         TestResult::Pass
     }
+    kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_feed_connector_edid);
+
+    kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_feed_connector_edid);
+
+    /// A 128-byte EDID base block: the valid header plus the 1080p60
+    /// detailed timing the display tests use (148.5 MHz, 1920x1080).
+    fn edid_base() -> [u8; 128] {
+        let mut base = [0u8; 128];
+        base[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+        // 148.5 MHz, 1920+280 x 1080+45, sync 88/44, 4/5, +h +v.
+        base[54..72].copy_from_slice(&[
+            0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0, 0, 0, 0, 0,
+            0x1e,
+        ]);
+        base
+    }
+
+    /// EDID block checksum: the wrapping sum of all 128 bytes is 0.
+    fn fix_checksum(block: &mut [u8]) {
+        let sum = block[..127].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        block[127] = 0u8.wrapping_sub(sum);
+    }
+
+    /// A 256-byte EDID (base + one CEA extension) carrying one LPCM
+    /// SAD and a speaker allocation block, with valid block
+    /// checksums — the blob a fake DDC/AUX transport returns. The
+    /// CEA layout mirrors the direct-feed test above.
+    fn edid_with_cea(sad: [u8; 3], speakers: u8) -> alloc::vec::Vec<u8> {
+        let mut base = edid_base();
+        base[126] = 1;
+        fix_checksum(&mut base);
+        let mut cea = [0u8; 128];
+        cea[0] = 0x02; // CEA-861 tag
+        cea[1] = 0x03; // revision
+        cea[2] = 10; // DTD offset: collection is bytes 4..10
+        cea[4] = 0x23; // audio data block, tag 1, length 3
+        cea[5..8].copy_from_slice(&sad);
+        cea[8] = 0x81; // speaker allocation block, tag 4, length 1
+        cea[9] = speakers;
+        fix_checksum(&mut cea);
+        let mut e = alloc::vec::Vec::new();
+        e.extend_from_slice(&base);
+        e.extend_from_slice(&cea);
+        e
+    }
+
+    /// End-to-end #1786: a fake AUX/DDC transport returns known EDID
+    /// blobs; the Navi22 detector reads them and the new wiring
+    /// feeds the SAD + speaker caps onto the KMS connector each
+    /// blob's device tag names. The board is deliberately ordered
+    /// so report index and KMS index disagree (DP first in the
+    /// inventory, HDMI first in the ATOM table), proving the feed
+    /// follows the tag, not the position. A sink whose EDID can no
+    /// longer be read clears the caps back to unknown; an EDID with
+    /// no CEA block feeds nothing.
+    fn smoke_amdgpu_navi22_edid_feed_through_detection() -> TestResult {
+        use crate::amdgpu_dcn30_ddc::tests::{engine, set_hpd, Fake, Sink as Model};
+        use crate::amdgpu_dcn_inventory::{Connector as Kind, Path};
+        use crate::amdgpu_navi22_boot::feed_detection_audio;
+        use crate::amdgpu_navi22_display::{Detection, Detector};
+        let _guard = KmsGuard;
+        let mut words = [0u32; 16];
+        let gpu = fixture_gpu(&mut words, true);
+        // KMS in ATOM-table order: HDMI (tag 0x0002) first, DP
+        // (tag 0x0008) second.
+        let mut kms = KmsState::new(4);
+        kms.ingest_atom_paths(
+            [
+                DisplayPath {
+                    device_tag: 0x0002,
+                    connector_kind: ConnectorKind::HdmiA,
+                    connector_index: 2,
+                    gpu_object_id: 0x1101,
+                },
+                DisplayPath {
+                    device_tag: 0x0008,
+                    connector_kind: ConnectorKind::Dp,
+                    connector_index: 1,
+                    gpu_object_id: 0x1102,
+                },
+            ]
+            .iter()
+            .copied(),
+        );
+        *KMS_STATE.lock() = Some(kms);
+        *HPD_STATE.lock() = Some(HpdMachine::new());
+        // Inventory order is the reverse: DP first, HDMI second.
+        let board = [
+            Path {
+                connector: Kind::DisplayPort,
+                connector_instance: 1,
+                transmitter: 1,
+                aux: Some(1),
+                hpd: 2,
+                device_tag: 0x0008,
+                max_speed_mhz: 0,
+            },
+            Path {
+                connector: Kind::HdmiTypeA,
+                connector_instance: 1,
+                transmitter: 3,
+                aux: Some(3),
+                hpd: 4,
+                device_tag: 0x0002,
+                max_speed_mhz: 0,
+            },
+        ];
+        // Both sinks present: LPCM stereo 48 kHz + FL/FR on HDMI,
+        // LPCM 6-channel 32/44.1/48 kHz + FL/FR/LFE/FC on DP.
+        let mut fake = Fake::new();
+        fake.aux[1] = Some(Model::new(edid_with_cea([0x0d, 0x07, 0x00], 0x07)));
+        fake.ddc[3] = Some(Model::new(edid_with_cea([0x09, 0x04, 0x00], 0x01)));
+        set_hpd(&mut fake, 1, true);
+        set_hpd(&mut fake, 3, true);
+        let Ok(mut detector) = Detector::new_with(engine(fake), &board) else {
+            return TestResult::Fail("detector");
+        };
+        let Ok(reports) = narf_scheduler::block_on_spin(detector.detect_all()) else {
+            return TestResult::Fail("detect_all");
+        };
+        if reports.len() != 2 {
+            return TestResult::Fail("two reports expected");
+        }
+        for report in &reports {
+            feed_detection_audio(&gpu, &report.connector, &report.detection);
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after feed");
+            };
+            // The HDMI report (index 1) fed KMS connector 0 by tag.
+            let Some(caps) = &kms.connectors[0].audio_caps else {
+                return TestResult::Fail("HDMI caps missing");
+            };
+            if caps.sads.len() != 1
+                || caps.sads[0].format != AudioFormat::LinearPcm
+                || caps.sads[0].channel_count != 2
+                || !caps.sads[0].sample_rates.r48k
+                || caps.speakers != 0x01
+            {
+                return TestResult::Fail("HDMI caps wrong");
+            }
+            // The DP report (index 0) fed KMS connector 1 by tag.
+            let Some(caps) = &kms.connectors[1].audio_caps else {
+                return TestResult::Fail("DP caps missing");
+            };
+            if caps.sads.len() != 1
+                || caps.sads[0].format != AudioFormat::LinearPcm
+                || caps.sads[0].channel_count != 6
+                || !caps.sads[0].sample_rates.r32k
+                || !caps.sads[0].sample_rates.r44k
+                || !caps.sads[0].sample_rates.r48k
+                || caps.speakers != 0x07
+            {
+                return TestResult::Fail("DP caps wrong");
+            }
+        }
+        // An unknown tag feeds nothing.
+        if gpu.feed_connector_edid_for_device(0x9999, &edid_with_cea([0x09, 0x04, 0x00], 0x01)) {
+            return TestResult::Fail("unknown tag must not feed");
+        }
+        // The HDMI sink goes unreadable while HPD stays high: its
+        // report is Failed, and the feed clears its caps back to
+        // unknown while the DP caps survive.
+        let mut fake = Fake::new();
+        fake.aux[1] = Some(Model::new(edid_with_cea([0x0d, 0x07, 0x00], 0x07)));
+        set_hpd(&mut fake, 1, true);
+        set_hpd(&mut fake, 3, true);
+        let Ok(mut detector) = Detector::new_with(engine(fake), &board) else {
+            return TestResult::Fail("detector for failed read");
+        };
+        let Ok(reports) = narf_scheduler::block_on_spin(detector.detect_all()) else {
+            return TestResult::Fail("detect_all for failed read");
+        };
+        if !matches!(reports[1].detection, Detection::Failed(_)) {
+            return TestResult::Fail("unreadable HDMI sink must report Failed");
+        }
+        for report in &reports {
+            feed_detection_audio(&gpu, &report.connector, &report.detection);
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after clear");
+            };
+            if kms.connectors[0].audio_caps.is_some() {
+                return TestResult::Fail("failed read must clear HDMI caps");
+            }
+            if kms.connectors[1].audio_caps.is_none() {
+                return TestResult::Fail("DP caps must survive the HDMI failure");
+            }
+        }
+        // An EDID with no CEA block feeds nothing: caps stay unknown.
+        let mut base = edid_base();
+        fix_checksum(&mut base);
+        let mut fake = Fake::new();
+        fake.ddc[3] = Some(Model::new(base.to_vec()));
+        set_hpd(&mut fake, 3, true);
+        let Ok(mut detector) = Detector::new_with(engine(fake), &board) else {
+            return TestResult::Fail("detector for no-CEA EDID");
+        };
+        let Ok(reports) = narf_scheduler::block_on_spin(detector.detect_all()) else {
+            return TestResult::Fail("detect_all for no-CEA EDID");
+        };
+        if !matches!(reports[1].detection, Detection::Connected(_)) {
+            return TestResult::Fail("no-CEA EDID must still detect Connected");
+        }
+        for report in &reports {
+            feed_detection_audio(&gpu, &report.connector, &report.detection);
+        }
+        {
+            let guard = KMS_STATE.lock();
+            let Some(kms) = guard.as_ref() else {
+                return TestResult::Fail("KMS state missing after no-CEA feed");
+            };
+            if kms.connectors[0].audio_caps.is_some() {
+                return TestResult::Fail("no-CEA EDID must not feed caps");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_amdgpu_navi22_edid_feed_through_detection
+    );
+
     kernel_test_in!("drivers/gpu", smoke_amdgpu_kms_feed_connector_edid);
 
     /// Fake DRM/fb consumer (#1787): feed a 1080p60 EDID (CEA
