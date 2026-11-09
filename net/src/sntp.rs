@@ -11,14 +11,14 @@
 //! - RFC 5905 — Network Time Protocol Version 4 (June 2010).
 //!   §6 NTP timestamp format (64-bit: seconds since the 1900 prime epoch
 //!   + 2^-32 fractions). §7.3/§7.5 packet header (48-byte fixed header).
-//!   §7.4 kiss-o'-death packets (stratum 0 + 4-byte kiss code; DENY/RSTR
-//!   demobilise the association, RATE backs the poll interval off).
-//!   §8 on-wire protocol: `theta = 1/2 * [(T2-T1) + (T3-T4)]`,
-//!   `delta = (T4-T1) - (T3-T2)`; the bogus check (origin timestamp must
-//!   match the transmitted T1), the duplicate check, and the rule that
-//!   `delta` is clamped not less than the system precision. §14 SNTP.
-//!   §16: UDP/TCP port 123. Appendix A: `STEPT` 0.128 s, `PANICT` 1000 s.
-//!   <https://datatracker.ietf.org/doc/html/rfc5905>
+//!     §7.4 kiss-o'-death packets (stratum 0 + 4-byte kiss code; DENY/RSTR
+//!     demobilise the association, RATE backs the poll interval off).
+//!     §8 on-wire protocol: `theta = 1/2 * [(T2-T1) + (T3-T4)]`,
+//!     `delta = (T4-T1) - (T3-T2)`; the bogus check (origin timestamp must
+//!     match the transmitted T1), the duplicate check, and the rule that
+//!     `delta` is clamped not less than the system precision. §14 SNTP.
+//!     §16: UDP/TCP port 123. Appendix A: `STEPT` 0.128 s, `PANICT` 1000 s.
+//!     <https://datatracker.ietf.org/doc/html/rfc5905>
 //! - Linux `kernel/time/ntp.c` (`second_overflow`, `ntp_update_offset`)
 //!   and `include/{linux,uapi/linux}/timex.h` — the discipline model the
 //!   sample feeds; see `narf_time::ntp` for the per-constant grounding.
