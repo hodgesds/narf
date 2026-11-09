@@ -34,6 +34,7 @@ use narf_capabilities::{Cap, Read, Write};
 use narf_driver_runtime::DomainId;
 use narf_filesystem::{DirOps, FsError, FsInstance};
 use narf_io::{alloc_coherent, register_with_cap, resolve_cap, unregister, DmaBuffer};
+use narf_lib::mutex::Mutex;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::superblock::Superblock;
@@ -75,6 +76,44 @@ pub struct MinixVolume<B: BlockDevice> {
     /// FAT driver — held synchronously during the copy span only,
     /// never across an `await`.
     io: IrqSafeSpinLock<VolumeIo>,
+    /// Serialises block-level read-modify-write sequences per volume
+    /// (#1998): `write_inode`, `alloc_bitmap_bit`, `free_bitmap_bit`,
+    /// and `write_file`'s per-zone span each read a MINIX block,
+    /// patch it in memory, and write it back, and two such sequences
+    /// for the same block interleave — both read the pre-write block,
+    /// both patch different offsets/bits, the second write-back
+    /// clobbers the first's update (lost inode update, double bitmap
+    /// allocation, lost zone bytes). The guard is held across the
+    /// whole read → patch → write, per sequence, and only there.
+    /// `narf_lib::mutex::Mutex` parks waiters on the scheduler waker
+    /// instead of disabling IRQs, so holding it across `.await` is
+    /// safe; an `IrqSafeSpinLock` could never cover an await span.
+    ///
+    /// Lock order is total, `block_rmw` before `io`: `block_rmw` is
+    /// only ever acquired when no other volume lock is held (each
+    /// site takes it as its first lock action), and while it is held
+    /// the only other lock acquired is `io`, taken synchronously
+    /// inside `read_sector` / `write_sector` for the copy span and
+    /// never across an `await` — `io` is never held while acquiring
+    /// `block_rmw` (every `io` acquisition is a take-and-release
+    /// around a synchronous operation). No site calls another
+    /// `block_rmw` taker while holding the guard: `write_inode`,
+    /// `alloc_bitmap_bit` and `free_bitmap_bit` call only
+    /// `read_block` / `write_block` inside the span, and
+    /// `write_file` takes the guard strictly after `map_block_alloc`
+    /// returns — the map allocates through `alloc_bitmap_bit`,
+    /// which takes this same mutex, so holding it across the map
+    /// would nest the mutex and park forever. The `root_inode` /
+    /// `inode_cells` spinlocks are taken only after the guard is
+    /// dropped. No other code takes `block_rmw`, so no cycle can
+    /// form. Forward order against the sibling lanes (not yet on
+    /// main): #1994's `rmw` is taken *inside* `write_block`'s
+    /// sub-LBS branch, and #1987 turns `io` into an async mutex
+    /// taken inside the sector ops — both are acquired strictly
+    /// inside calls made while `block_rmw` is already held, so the
+    /// order `block_rmw` → `rmw` → `io` stays total and neither can
+    /// ever be held while acquiring `block_rmw`.
+    block_rmw: Mutex<()>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
     /// The root directory's inode, read at mount (Linux `minix_fill_super`
@@ -270,6 +309,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
+            block_rmw: Mutex::new(()),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
             root_inode: IrqSafeSpinLock::new(None),
             cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
@@ -699,13 +739,23 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
     // ── Write paths ─────────────────────────────────────────────
 
     /// Write inode `ino` (1-based) back into the inode table.
+    ///
+    /// The read → encode → write is serialised per volume (#1998):
+    /// two concurrent `write_inode`s to different inodes in one
+    /// inode-table block would otherwise both read, both encode
+    /// different offsets, and the second write-back would clobber
+    /// the first's update. The guard is dropped before the
+    /// `root_inode` / cell publishes below, which need no cover.
     pub async fn write_inode(&self, ino: u32, inode: &super::inode::Inode) -> Result<(), FsError> {
         let (block, off_in_block) = self.sb.inode_location(ino).ok_or(FsError::NotFound)?;
         let bs = self.sb.block_size as usize;
         let mut buf = vec![0u8; bs];
-        self.read_block(block, &mut buf).await?;
-        inode.encode(self.sb.version, &mut buf, off_in_block as usize);
-        self.write_block(block, &buf).await?;
+        {
+            let _block_rmw = self.block_rmw.lock().await;
+            self.read_block(block, &mut buf).await?;
+            inode.encode(self.sb.version, &mut buf, off_in_block as usize);
+            self.write_block(block, &buf).await?;
+        }
         if ino == super::MINIX_ROOT_INO {
             *self.root_inode.lock() = Some(*inode);
         }
@@ -732,12 +782,21 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
     /// the convention "inode 0 / zone 0 means absent"). The MINIX
     /// `mkfs` initialises bit 0 = 1 for that reason; we honour it on
     /// allocation by skipping bit 0 of the first bitmap block.
+    ///
+    /// The scan → set → write is serialised per volume (#1998): two
+    /// concurrent allocations would otherwise both read the same
+    /// bitmap block, both find the same first zero bit, and hand the
+    /// same inode/zone ordinal out twice. The guard covers the whole
+    /// scan loop — the claim is only atomic if no other scan can
+    /// interleave between the read of a block and the write-back
+    /// that sets the bit.
     async fn alloc_bitmap_bit(
         &self,
         start_block: u32,
         n_blocks: u32,
         max_ordinal: u32,
     ) -> Result<u32, FsError> {
+        let _block_rmw = self.block_rmw.lock().await;
         let bs = self.sb.block_size as usize;
         let mut buf = vec![0u8; bs];
         for blk in 0..n_blocks {
@@ -770,12 +829,19 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
     /// Bitmap-free helper. Clears the bit corresponding to `ordinal`
     /// in the bitmap region. Idempotent at the byte level; if the bit
     /// was already clear we still write the (unchanged) block back.
+    ///
+    /// The read → clear → write is serialised per volume (#1998):
+    /// a free racing a concurrent alloc (or another free) would
+    /// otherwise write back a stale block and clobber the alloc's
+    /// set bit — the ordinal stays handed out while its bit reads
+    /// clear, so it is handed out a second time.
     async fn free_bitmap_bit(
         &self,
         start_block: u32,
         n_blocks: u32,
         ordinal: u32,
     ) -> Result<(), FsError> {
+        let _block_rmw = self.block_rmw.lock().await;
         let bs = self.sb.block_size as usize;
         let bits_per_block = (bs * 8) as u32;
         let blk_offset = ordinal / bits_per_block;
@@ -1332,12 +1398,26 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             let n = core::cmp::min(remaining, zs as usize - zone_offset);
             let zone_no = self.map_block_alloc(inode, block_in_file).await?;
             // Read-modify-write the zone unless we're rewriting the whole thing.
+            //
+            // The zone write is serialised per volume (#1998), one
+            // guard per zone iteration, taken AFTER `map_block_alloc`
+            // returns: the map allocates through `alloc_bitmap_bit`,
+            // which takes this same mutex, so holding it across the
+            // map would nest the mutex and park forever. The guard
+            // covers the whole-zone branch too — a whole-zone
+            // overwrite landing inside a concurrent partial RMW's
+            // span would otherwise be clobbered by that span's stale
+            // write-back. Only `read_zone` / `write_zone` run inside
+            // the span, and neither takes this mutex, so no nesting.
             let mut zbuf = vec![0u8; zs as usize];
-            if zone_offset != 0 || n != zs as usize {
-                self.read_zone(zone_no, &mut zbuf).await?;
+            {
+                let _block_rmw = self.block_rmw.lock().await;
+                if zone_offset != 0 || n != zs as usize {
+                    self.read_zone(zone_no, &mut zbuf).await?;
+                }
+                zbuf[zone_offset..zone_offset + n].copy_from_slice(&src[total..total + n]);
+                self.write_zone(zone_no, &zbuf).await?;
             }
-            zbuf[zone_offset..zone_offset + n].copy_from_slice(&src[total..total + n]);
-            self.write_zone(zone_no, &zbuf).await?;
             total += n;
             remaining -= n;
             cur_off += n as u64;
