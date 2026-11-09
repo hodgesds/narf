@@ -14778,13 +14778,32 @@ struct that owns BAR5 (`drivers/gpu/src/amdgpu.rs`):
   call from the driver's main loop or a scheduled wakeup — and
   returns the connector indices that stabilised as connected,
   marked `Connected` in KMS. The caller modesets each with its
-  mode via `modeset_connector`.
+  mode via `modeset_newly_connected`.
 - `AmdGpu::feed_connector_edid(connector_idx, edid)` scans a full
   EDID blob's extension blocks for the CEA-861 block and feeds
   the parsed audio caps into the connector (a missing speaker
-  block falls back to the FL/FR baseline 0x01). Returns `false`
-  when there is no CEA block, no KMS state, or the connector
-  index is out of range.
+  block falls back to the FL/FR baseline 0x01). It also retains
+  the blob's preferred mode on the connector (first timing
+  `edid_timings` yields, EDID 1.3+'s preferred mode) for the
+  DRM/fb caller below; a blob with no usable timing leaves the
+  previous preferred mode untouched. Returns `false` when there
+  is no CEA block, no KMS state, or the connector index is out of
+  range.
+- `AmdGpu::modeset_connected(connector_idx)` is the DRM/fb caller
+  for one newly connected connector (#1787): it modesets the
+  connector with its retained EDID preferred mode (stride = mode
+  width, surface = the VRAM aperture base `set_mode` scans out
+  of) via `modeset_connector`. Returns `Ok(true)` when the modeset
+  ran, `Ok(false)` when no preferred mode is known — the
+  connector stays unmodeset, never given an invented mode — and
+  propagates the `modeset_connector` error when a modeset was
+  attempted and failed.
+- `AmdGpu::modeset_newly_connected(connected)` is the driver-loop
+  entry point (#1787): it runs `modeset_connected` for every
+  connector `poll_hotplug` just marked `Connected` and returns
+  one outcome per connector, so one failure never aborts the
+  rest. The IH HPD drainer task (`serve_ih_hpd`) calls it after
+  `service_hotplug` on every tick and logs each outcome.
 - Probe-time KMS ownership: `probe()` calls
   `AmdGpu::init_kms_from_vbios` after capturing the VBIOS, which
   builds the topology via `AmdGpu::kms_from_vbios` (ATOM
@@ -14814,15 +14833,15 @@ struct that owns BAR5 (`drivers/gpu/src/amdgpu.rs`):
   applied plan only; multi-connector resume goes through
   `resume_display_audio`.
 
-Explicitly not in this surface: the live IH ring drainer that
-produces the cookies `handle_hotplug_event` consumes, the live
-DDC/AUX transport read that produces the EDID blob
-`feed_connector_edid` consumes, and the DRM/fb caller that
-supplies connect modes to `modeset_connector` — those are the
-remaining integration points; the KMS core now owns the state
-and the apply calls. Intel display-side audio programming is
-out of scope while another agent works Intel GPU; no Intel
-modeset file is touched.
+Explicitly not in this surface: the live DDC/AUX transport read
+that produces the EDID blob `feed_connector_edid` consumes (#1786),
+and the starter that spawns the IH HPD drainer task
+(`start_ih_hpd` has no production caller yet — the #1785 wiring
+remainder, which also decides legacy-KMS vs native-display HPD
+ownership per boot). The KMS core now owns the state, the apply
+calls, and the DRM/fb caller that supplies connect modes. Intel
+display-side audio programming is out of scope while another agent
+works Intel GPU; no Intel modeset file is touched.
 
 ### VirtIO-GPU rendering
 
