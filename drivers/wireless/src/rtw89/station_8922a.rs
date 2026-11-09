@@ -3,14 +3,25 @@
 //!
 //! This is the owner the EHT step-2 lane's `EhtStation` facet was
 //! written for (`eht.rs`: "the facet the future 8922A station owner
-//! composes once admission exists"). It admits one EHT station at a
+//! composes once admission exists"). It admits one station at a
 //! time against the chip container's static caps and produces the
 //! firmware artifacts admission programs: the G7 default CMAC table
 //! (`cctl_g7::build_default`), the G7 association CMAC table
 //! (`cctl_g7::build_assoc`, Linux `fw.c`
 //! `rtw89_fw_h2c_assoc_cmac_tbl_g7`), the BA-CAM v1 slot map
-//! (`bacam_v1::BaCam`, 24 slots / 8 dynamic), and the TXWD_INFO
-//! EHT fields from the facet (`txrx_be::eht_info_fields`).
+//! (`bacam_v1::BaCam`, 24 slots / 8 dynamic), and — for EHT
+//! stations — the TXWD_INFO EHT fields from the facet
+//! (`txrx_be::eht_info_fields`).
+//!
+//! Two admission paths share one [`MacIdPool`], so EHT and
+//! legacy-mode stations coexist: EHT stations admit via [`admit`]
+//! with an `EhtStation` facet; legacy-mode stations (legacy-only,
+//! HT, VHT, HE — everything non-EHT) admit via [`admit_legacy`]
+//! with a [`LegacyCaps`] facet carrying the peer's negotiated
+//! rates and caps. The legacy record builds its RA v1 command on
+//! demand from those caps ([`LegacyStation::ra_h2c`], via
+//! `ra_mask::build`, Linux `phy.c` `rtw89_phy_ra_sta_update`);
+//! the EHT record does not (see below).
 //!
 //! Fail-closed by construction: every check that can refuse does
 //! so with a named [`Error`] before any artifact is built, and no
@@ -22,9 +33,12 @@
 //! releasing its MACID back to the [`MacIdPool`] on disconnect.
 //!
 //! Deliberate narrowings (all stated, none silent):
-//! - EHT stations only. Legacy/HE/VHT/HT-only admission needs
-//!   its own RA/CCTL paths and is a remainder; this owner takes
-//!   an `EhtStation` facet as a required input.
+//! - Legacy-mode admission is the non-EHT path: a legacy
+//!   request carrying EHT support is refused
+//!   (`EhtInLegacyRequest`) instead of being silently
+//!   downgraded — an EHT peer belongs on [`admit`]. The
+//!   legacy facet carries no EHT caps by construction, so a
+//!   legacy record can never program EHT RA or TXWD fields.
 //! - Single-link. MLO multi-link (chip supports 2 links) is a
 //!   remainder; admission carries one link's parameters.
 //! - 2.4/5 GHz only. 6 GHz is refused (`SixGhzPowerMissing`)
@@ -40,11 +54,20 @@
 //!   Parsing them from peer EHT/HE IEs is a remainder; zero pads
 //!   mean the peer advertised neither EHT nor HE caps (Linux
 //!   memsets the pads and only fills them from EHT/HE caps).
-//! - The RA v1 command is NOT built here: its mask needs the
-//!   peer's negotiated MCS map + RSSI, which admission does not
-//!   have. `ra_v1::build_ra_v1` is the builder the RA lane fills
-//!   once those inputs exist; the station record carries the
-//!   structural inputs (MACID, band, width, NSS) that lane needs.
+//! - The RA v1 command is NOT built for EHT stations here:
+//!   its mask needs the peer's negotiated MCS map + RSSI,
+//!   which the EHT facet does not carry. `ra_v1::build_ra_v1`
+//!   is the builder the RA lane fills once those inputs exist;
+//!   the EHT station record carries the structural inputs
+//!   (MACID, band, width, NSS) that lane needs. The legacy
+//!   record is the exception: admission stores the negotiated
+//!   caps, so [`LegacyStation::ra_h2c`] builds the command on
+//!   demand via `ra_mask::build`.
+//! - 6 GHz legacy admission stays refused
+//!   (`SixGhzPowerMissing`): the 6 GHz power program is the
+//!   separate 6 GHz lane's work, and composing it into the
+//!   legacy path (HE20 6 GHz stations) is a follow-up once
+//!   that program exists, not part of this remainder.
 
 use super::{
     bacam_v1::{self, BaCam},
@@ -52,6 +75,7 @@ use super::{
     chip_8922a,
     efuse_be::BeFactory,
     eht::EhtStation,
+    ra_mask::{self, HeCaps, HtCaps, VhtCaps},
 };
 
 /// Operating band of the admitted link.
@@ -129,6 +153,17 @@ pub(super) enum Error {
     Cctl(cctl_g7::Error),
     /// BA-CAM map rejection (cannot happen for 24 slots).
     BaCam(bacam_v1::Error),
+    /// A legacy-mode request carrying EHT support: an EHT
+    /// peer belongs on [`admit`], not [`admit_legacy`].
+    EhtInLegacyRequest,
+    /// Legacy caps with an empty supported-rates bitmap:
+    /// Linux's RA update never sees one (an associated
+    /// station's supported-rates IE is non-empty by
+    /// construction), and admitting it would program a zero
+    /// RA mask.
+    NoSupportedRates,
+    /// RA command build rejection for a legacy station.
+    Ra(ra_mask::Error),
 }
 
 /// MACID allocator over the chip's station slots
@@ -308,6 +343,268 @@ pub(super) fn admit(
         nss: req.nss,
         aid: req.aid,
         facet,
+        bacam,
+        default_cctl,
+        assoc_cctl,
+    })
+}
+
+// ── Legacy-mode admission ──────────────────────────────────────────────
+//
+// Everything non-EHT: legacy-only (CCK/OFDM), HT, VHT, and HE
+// peers. The CCTL composition is the same G7 builders the EHT
+// path uses, with EHT support off: the assoc table's lowest
+// rate arm is CCK1 on 2.4 GHz (non-P2P) and OFDM6 otherwise
+// (`cctl_g7::build_assoc`), the punctured-subchannel arm stays
+// unprogrammed, the BSR format bit follows the peer's HE
+// support, and the PPE pads are caller-supplied (zero when the
+// peer has neither EHT nor HE caps — Linux memsets the pads
+// and only fills them from EHT/HE caps). RA is computed from
+// the negotiated caps stored here, mirroring Linux `phy.c`
+// `rtw89_phy_ra_sta_update` via `ra_mask::build`.
+//
+// The validation checks run in the same order as [`admit`]
+// (band, EHT-exclusion, rates, width, NSS, primary, AID,
+// port, pads) so a request failing several checks always
+// reports the same refusal on either path; no MACID is
+// consumed by a refused request. The two check sequences are
+// deliberately duplicated rather than factored into a shared
+// helper: the 6 GHz lane is reworking `admit`'s opening
+// checks on its own branch, and a shared helper would collide
+// with it. Factor them once that lane lands.
+
+/// Highest non-EHT mode a legacy station negotiated, in
+/// Linux's `rtw89_phy_ra_sta_update` else-if priority
+/// (HE beats VHT beats HT beats legacy-only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LegacyMode {
+    /// CCK/OFDM only: no HT/VHT/HE caps.
+    Legacy,
+    /// HT caps, no VHT/HE caps.
+    Ht,
+    /// VHT caps, no HE caps.
+    Vht,
+    /// HE caps.
+    He,
+}
+
+/// The peer's negotiated legacy-mode capabilities: the
+/// inputs `ra_mask::compute` needs beyond the link
+/// parameters [`Request`] already carries. This is the
+/// legacy analogue of the [`EhtStation`] facet: it holds
+/// what the peer advertised, not what the chip supports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LegacyCaps {
+    /// Legacy supported-rates bitmap, in Linux's
+    /// convention: on 2.4 GHz the bits ARE the mask bits
+    /// (CCK 0..3, OFDM 4..11); on 5/6 GHz the bitmap is
+    /// shifted left by 4, so bit 0 lands on OFDM bit 4.
+    /// Must be nonzero (see [`Error::NoSupportedRates`]).
+    pub(super) supp_rates: u16,
+    /// HT caps, if the peer advertises HT.
+    pub(super) ht: Option<HtCaps>,
+    /// VHT caps, if the peer advertises VHT.
+    pub(super) vht: Option<VhtCaps>,
+    /// HE caps, if the peer advertises HE.
+    pub(super) he: Option<HeCaps>,
+    /// Average RSSI (raw units; Linux halves it).
+    pub(super) rssi: u8,
+    /// ER capability from the station link.
+    pub(super) er_cap: bool,
+}
+
+/// An admitted 8922A legacy-mode station: its identity, its
+/// link, the peer's negotiated caps, and the firmware
+/// artifacts admission programmed for it. The caller sends
+/// the CCTL bodies over H2C and owns the BA-CAM map for the
+/// station's lifetime, exactly as for [`Station`]; the two
+/// record types share the [`MacIdPool`], so EHT and legacy
+/// stations coexist with distinct MACIDs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LegacyStation {
+    /// Own MAC, from the BE factory identity.
+    pub(super) own: [u8; 6],
+    /// Peer MAC.
+    pub(super) peer: [u8; 6],
+    /// Allocated MACID (released via [`MacIdPool::free`]).
+    pub(super) macid: u8,
+    /// Operating band.
+    pub(super) band: Band,
+    /// Operating width in MHz.
+    pub(super) width_mhz: u32,
+    /// Primary channel number.
+    pub(super) primary: u8,
+    /// Spatial streams.
+    pub(super) nss: u8,
+    /// Association ID.
+    pub(super) aid: u16,
+    /// Peer's negotiated legacy-mode caps (RA inputs).
+    pub(super) caps: LegacyCaps,
+    /// BA-CAM v1 slot map (24 slots; entry index written to
+    /// firmware is the bitmap index + 8 dynamic slots).
+    pub(super) bacam: BaCam,
+    /// G7 default CMAC table for this MACID.
+    pub(super) default_cctl: DefaultCmac,
+    /// G7 association CMAC table for this station.
+    pub(super) assoc_cctl: DefaultCmac,
+}
+
+impl LegacyStation {
+    /// Highest non-EHT mode this station negotiated, in
+    /// Linux's else-if priority.
+    pub(super) fn mode(&self) -> LegacyMode {
+        if self.caps.he.is_some() {
+            LegacyMode::He
+        } else if self.caps.vht.is_some() {
+            LegacyMode::Vht
+        } else if self.caps.ht.is_some() {
+            LegacyMode::Ht
+        } else {
+            LegacyMode::Legacy
+        }
+    }
+
+    /// EHT contribution to the BE TXWD_INFO block for this
+    /// station: always (0, 0). A legacy station programs no
+    /// EHT TXWD override — the facet carries no EHT state —
+    /// so the transport ORs in nothing for it.
+    pub(super) fn txwd_info_eht(&self) -> Option<(u32, u32)> {
+        Some((0, 0))
+    }
+
+    /// Build the BE RA v1 H2C command for this station from
+    /// the negotiated caps admission stored, via
+    /// `ra_mask::build` (Linux `phy.c`
+    /// `rtw89_phy_ra_sta_update`). `phy_idx` is the PHY
+    /// index Linux reports as `band_num`; `upd_mask` /
+    /// `upd_bw_nss` are the caller's change flags — a fresh
+    /// station update passes both false.
+    pub(super) fn ra_h2c(
+        &self,
+        phy_idx: u8,
+        upd_mask: bool,
+        upd_bw_nss: bool,
+    ) -> Result<[u32; 6], Error> {
+        let caps = ra_mask::StationCaps {
+            band: self.band,
+            width_mhz: self.width_mhz,
+            supp_rates: self.caps.supp_rates,
+            ht: self.caps.ht,
+            vht: self.caps.vht,
+            he: self.caps.he,
+            eht: None,
+            rx_nss: self.nss,
+            tx_nss: chip_8922a::TX_NSS as u8,
+            rssi: self.caps.rssi,
+            // 8922AE variant: `rtw8922ae_vs_variant
+            // .no_mcs_12_13` (see `eht::EHT_CAP_8922AE_INPUTS`
+            // and `ra_mask` docs).
+            no_mcs_12_13: true,
+            er_cap: self.caps.er_cap,
+        };
+        ra_mask::build(&caps, self.macid, phy_idx, upd_mask, upd_bw_nss).map_err(Error::Ra)
+    }
+
+    /// Build a BA-CAM v1 H2C body for one of this station's
+    /// BlockAck sessions. Single-link pass-1: MLD off,
+    /// MAC-index 0, so band-select is clear. `bitmap_idx`
+    /// must come from [`BaCam::acquire`] on [`Self::bacam`].
+    pub(super) fn ba_h2c(
+        &self,
+        tid: u32,
+        bmap_size: u32,
+        ssn: u32,
+        bitmap_idx: u32,
+    ) -> Result<bacam_v1::BaCamH2c, Error> {
+        bacam_v1::build_h2c(
+            true,
+            self.macid as u32,
+            tid,
+            bmap_size,
+            ssn,
+            bitmap_idx,
+            chip_8922a::BACAM_DYNAMIC_NUM as u32,
+            false,
+            false,
+        )
+        .map_err(Error::BaCam)
+    }
+
+    /// Release this station's MACID back to the pool.
+    /// The station record itself is then dead; the caller
+    /// must not send further H2C for it.
+    pub(super) fn release_macid(&self, pool: &mut MacIdPool) {
+        pool.free(self.macid);
+    }
+}
+
+/// Admit one legacy-mode station. `req` is the shared
+/// admission request; `req.eht_support` must be false and
+/// `req.punctured` is not consumed (Linux reads the
+/// puncturing bitmap only when EHT is supported).
+/// `req.has_he` must agree with the facet's HE caps — the
+/// caller supplies both, as with the PPE pads — and drives
+/// the assoc table's BSR format bit.
+pub(super) fn admit_legacy(
+    factory: &BeFactory,
+    caps: &LegacyCaps,
+    pool: &mut MacIdPool,
+    req: &Request,
+) -> Result<LegacyStation, Error> {
+    if req.band == Band::Ghz6 {
+        return Err(Error::SixGhzPowerMissing);
+    }
+    if req.eht_support {
+        return Err(Error::EhtInLegacyRequest);
+    }
+    if caps.supp_rates == 0 {
+        return Err(Error::NoSupportedRates);
+    }
+    if !chip_8922a::SUPPORT_BANDWIDTHS_MHZ.contains(&req.width_mhz) {
+        return Err(Error::WidthNotAdvertised);
+    }
+    if req.nss == 0 || req.nss as usize > chip_8922a::TX_NSS {
+        return Err(Error::NssOutOfRange);
+    }
+    if req.primary == 0 {
+        return Err(Error::BadPrimary);
+    }
+    if req.aid > 0xFFF {
+        return Err(Error::AidOutOfRange);
+    }
+    if req.port > 7 {
+        return Err(Error::PortOutOfRange);
+    }
+    if req.pads.iter().any(|p| *p > 3) {
+        return Err(Error::PadsOutOfRange);
+    }
+    let macid = pool.alloc()?;
+    let default_cctl = cctl_g7::build_default(macid as u32, req.mgq_rpt_en).map_err(Error::Cctl)?;
+    let assoc_cctl = cctl_g7::build_assoc(
+        macid as u32,
+        req.band == Band::Ghz2,
+        req.p2p,
+        req.port as u32,
+        req.ap_mode,
+        false,
+        0,
+        req.pads,
+        req.aid,
+        req.station_mode,
+        req.has_he,
+    )
+    .map_err(Error::Cctl)?;
+    let bacam = BaCam::new(chip_8922a::BACAM_NUM).map_err(Error::BaCam)?;
+    Ok(LegacyStation {
+        own: factory.mac,
+        peer: req.peer,
+        macid,
+        band: req.band,
+        width_mhz: req.width_mhz,
+        primary: req.primary,
+        nss: req.nss,
+        aid: req.aid,
+        caps: *caps,
         bacam,
         default_cctl,
         assoc_cctl,
