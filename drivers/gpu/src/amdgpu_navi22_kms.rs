@@ -58,6 +58,10 @@ pub struct ConnectorState {
     pub hdmi_limits: Limits,
     pub color_relight: bool,
     pub vrr: Option<crate::amdgpu_freesync::AmdVsdb>,
+    /// A DP sink's FreeSync range from `dp_sst_caps` (EDID range + the
+    /// DPCD MSA-ignore bit), or None when the sink is not DP FreeSync
+    /// capable. HDMI sinks use `vrr` above instead.
+    pub dp_vrr: Option<crate::amdgpu_freesync::VrrRange>,
 }
 impl ConnectorState {
     /// Whether the single-pipe owner can drive this connector (HDMI, or
@@ -205,6 +209,7 @@ impl Kms {
                     .find(|o| o.port == report.connector && o.edid == edid)
                     .map_or_else(OutputSettings::default, |o| o.shown_output),
                 vrr: None,
+                dp_vrr: None,
                 color_relight: old
                     .iter()
                     .find(|o| o.port == report.connector && o.edid == edid)
@@ -489,6 +494,37 @@ pub fn crtc_display(crtc_id: u32) -> Option<u8> {
     crate::amdgpu_navi48_kms::crtc_display(crtc_id).filter(|&d| usize::from(d) < MAX_CRTCS)
 }
 
+/// Whether a connector's sink is VRR-capable for at least one offered
+/// mode: an HDMI sink through its AMD VSDB range (a FreeSync SPD builds
+/// for the mode), a DP sink through its `dp_sst_caps` range (DRR bounds
+/// build for the mode). Absent sinks and sinks with no usable range are
+/// fixed refresh.
+pub fn vrr_capable(c: &ConnectorState) -> bool {
+    if !c.present {
+        return false;
+    }
+    if c.vrr.is_some_and(|caps| {
+        caps.range().is_some_and(|range| {
+            c.modes.iter().any(|t| {
+                crate::amdgpu_freesync::hdmi_info_packet(
+                    t,
+                    range,
+                    caps.version,
+                    crate::amdgpu_freesync::HdmiState::Disabled,
+                )
+                .is_some()
+            })
+        })
+    }) {
+        return true;
+    }
+    c.dp_vrr.is_some_and(|range| {
+        c.modes
+            .iter()
+            .any(|t| crate::amdgpu_freesync::drr(t, range).is_some())
+    })
+}
+
 /// Publish the connectors and CRTCs on the registered amdgpu card: every
 /// connector may drive every CRTC (one DIG per stream, any pipe), as DC's
 /// `possible_crtcs`.
@@ -537,25 +573,7 @@ pub fn publish() {
             possible_crtcs: (1 << MAX_CRTCS) - 1,
         })
         .collect();
-    let vrr: Vec<bool> = inventory
-        .iter()
-        .map(|c| {
-            c.present
-                && c.vrr.is_some_and(|caps| {
-                    caps.range().is_some_and(|range| {
-                        c.modes.iter().any(|t| {
-                            crate::amdgpu_freesync::hdmi_info_packet(
-                                t,
-                                range,
-                                caps.version,
-                                crate::amdgpu_freesync::HdmiState::Disabled,
-                            )
-                            .is_some()
-                        })
-                    })
-                })
-        })
-        .collect();
+    let vrr: Vec<bool> = inventory.iter().map(vrr_capable).collect();
     with_card(|card| {
         apply_card_vrr(card, &crtcs, &connectors, Some(&vrr));
         for &d in &off {

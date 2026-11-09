@@ -126,6 +126,11 @@ const DP_SEC_CNTL: u64 = 0x212b;
 const DP_SEC_STREAM_ENABLE: u32 = 1 << 0;
 // linux: DP0_DP_SEC_CNTL__DP_SEC_GSP0_ENABLE_MASK
 const DP_SEC_GSP0_ENABLE: u32 = 1 << 20;
+// linux: DP0_DP_SEC_CNTL__DP_SEC_GSP2_ENABLE_MASK (GSP2 is the SPD slot:
+// amdgpu_dcn401_uhbr_video.rs "GSP0 (VSC), GSP2 (SPD), GSP3 (HDR)";
+// the bit follows the in-tree GSP0 (bit 20) / GSP3 (bit 23) numbering,
+// and DCN401's DP FreeSync publish enables the same bit, 1 << 22).
+const DP_SEC_GSP2_ENABLE: u32 = 1 << 22;
 // linux: DP0_DP_SEC_CNTL__DP_SEC_GSP3_ENABLE_MASK
 const DP_SEC_GSP3_ENABLE: u32 = 1 << 23;
 // linux: mmDP0_DP_SEC_FRAMING4
@@ -544,6 +549,25 @@ impl Stream {
             DP_SEC_CNTL,
             DP_SEC_GSP3_ENABLE,
             if hdr.is_some() { DP_SEC_GSP3_ENABLE } else { 0 },
+        )?;
+        if self.read(DP_SEC_CNTL)? != 0 {
+            self.update(DP_SEC_CNTL, DP_SEC_STREAM_ENABLE, DP_SEC_STREAM_ENABLE)?;
+        }
+        Ok(())
+    }
+    /// The AMD FreeSync SPD (VPG generic 2, GSP2) on a running DP SST
+    /// stream, as DCN401's `freesync_publish` programs it on the DIO
+    /// encoder (generic 2, `1 << 22` in DP_SEC_CNTL); `None` stops only
+    /// the SPD, leaving VSC and HDR enables alone. The secondary stream
+    /// stays on while anything is enabled, as in `update_info_packets`.
+    pub async fn update_spd_packet(&mut self, spd: Option<&[u8; 36]>) -> Result<(), Error> {
+        if let Some(spd) = spd {
+            self.vpg_packet(2, spd).await?;
+        }
+        self.update(
+            DP_SEC_CNTL,
+            DP_SEC_GSP2_ENABLE,
+            if spd.is_some() { DP_SEC_GSP2_ENABLE } else { 0 },
         )?;
         if self.read(DP_SEC_CNTL)? != 0 {
             self.update(DP_SEC_CNTL, DP_SEC_STREAM_ENABLE, DP_SEC_STREAM_ENABLE)?;
