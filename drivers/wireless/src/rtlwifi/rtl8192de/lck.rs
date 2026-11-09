@@ -90,7 +90,7 @@ pub const ROFDM0_XBAGCCORE1: u16 = 0x0c58;
 pub const RF_MODE_RESTORE: u8 = 0x50;
 
 /// RF standby value written to RF_AC (`phy.c:2547`, `0x010000`).
-pub const RF_AC_STANDBY: u32 = 0x0100_00;
+pub const RF_AC_STANDBY: u32 = 0x0001_0000;
 /// RF_SYN_G4 curve-index mask in the LCK reload (`phy.c:2495`).
 pub const RELOAD_SYN_G4_MASK: u32 = 0x3f800;
 /// RF_CHNLBW LC-calibration-begin bit (`phy.c:2557-2560`, `0x08000`).
@@ -214,11 +214,7 @@ pub struct LcOutcome {
 }
 
 fn abs_diff(a: u32, b: u32) -> u32 {
-    if a >= b {
-        a - b
-    } else {
-        b - a
-    }
+    a.abs_diff(b)
 }
 
 /// `_rtl92d_is_legal_5g_channel` (`rtl8192de/phy.c:2422-2431`).
@@ -392,14 +388,14 @@ pub async fn lc_calibrate_sw(
         poll_timed_out: [false; 2],
     };
     let mut rf_mode = [0u8; 2];
-    for index in 0..path_count {
+    for (index, mode) in rf_mode.iter_mut().enumerate().take(path_count) {
         let path = if index == 0 { Path::A } else { Path::B };
         let offset = if index == 0 {
             ROFDM0_XAAGCCORE1
         } else {
             ROFDM0_XBAGCCORE1
         };
-        rf_mode[index] = io.read8(offset)?;
+        *mode = io.read8(offset)?;
         phy::set_rf(io, path, RF_AC, phy::RFREG_OFFSET_MASK, RF_AC_STANDBY).await?;
         if cfg.init_ready {
             phy::set_rf(io, path, RF_SYN_G7, 1 << 17, 0x0).await?;
@@ -444,14 +440,14 @@ pub async fn lc_calibrate_sw(
         }
         phy::set_rf(io, path, RF_SYN_G7, 1 << 17, 0x1).await?;
     }
-    for index in 0..path_count {
+    for (index, mode) in rf_mode.iter().enumerate().take(path_count) {
         let offset = if index == 0 {
             ROFDM0_XAAGCCORE1
         } else {
             ROFDM0_XBAGCCORE1
         };
         io.write8(offset, RF_MODE_RESTORE)?;
-        io.write8(offset, rf_mode[index])?;
+        io.write8(offset, *mode)?;
     }
     if tmpreg & CONT_TX_ACTIVE != 0 {
         io.write8(REG_CONT_TX, tmpreg)?;
