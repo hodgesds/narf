@@ -725,7 +725,7 @@ pub(crate) fn oactxcontrol_value_slot<B: GpuBacking>(image: &B, base: u32) -> Op
             // The header's low field is (2 * nregs - 1): each register
             // contributes a register dword and a value dword. Dword
             // indices are u64 throughout (the image cursor is u64).
-            let nregs = (((word & 0x3FF) + 1) / 2) as u64;
+            let nregs = (word & 0x3FF).div_ceil(2) as u64;
             for i in 0..nregs {
                 let reg_dw = dw + 1 + i * 2;
                 let val_dw = reg_dw + 1;
