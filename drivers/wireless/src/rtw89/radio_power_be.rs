@@ -416,6 +416,16 @@ const _: () =
 /// Limit and RU-limit pages per ntx (BE geometry).
 type Pages = ([[i8; LIMIT_PAGE_BYTES]; 2], [[i8; LIMIT_RU_PAGE_BYTES]; 2]);
 
+/// Test view of a plan: (by-rate words, offset, limit pages, RU pages, shape).
+#[cfg(any(test, feature = "kernel-test"))]
+pub(super) type PlanParts = (
+    [u32; BYRATE_WORDS],
+    [i8; 8],
+    [[i8; LIMIT_PAGE_BYTES]; 2],
+    [[i8; LIMIT_RU_PAGE_BYTES]; 2],
+    [u8; 2],
+);
+
 /// One BE TX power program for one channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Plan {
@@ -444,15 +454,7 @@ impl Plan {
     }
     /// Test view: (by-rate words, offset, limit pages, RU pages, shape).
     #[cfg(any(test, feature = "kernel-test"))]
-    pub(super) fn parts(
-        &self,
-    ) -> (
-        [u32; BYRATE_WORDS],
-        [i8; 8],
-        [[i8; LIMIT_PAGE_BYTES]; 2],
-        [[i8; LIMIT_RU_PAGE_BYTES]; 2],
-        [u8; 2],
-    ) {
+    pub(super) fn parts(&self) -> PlanParts {
         (
             self.byrate_words(),
             self.offset,
