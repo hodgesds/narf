@@ -195,11 +195,13 @@ pub(super) fn build_default(macid: u32, mgq_rpt_en: bool) -> Result<DefaultCmac,
 ///   subchannel mask is NOT reused here — Linux writes the
 ///   live puncturing bitmap instead).
 /// - w5: nominal packet padding per width (20/40/80/160/320),
-///   2 bits each, caller-supplied from the peer's PPE thresholds
-///   (zero when the peer has neither EHT nor HE caps — Linux
-///   memsets the pads and only fills them from EHT/HE caps);
-///   m5: all five padding fields. PPE parsing from peer IEs is
-///   NOT done here; the caller supplies the pads.
+///   2 bits each, supplied by the caller from the peer's PPE
+///   thresholds (zero when the peer has neither EHT nor HE caps
+///   — Linux memsets the pads and only fills them from EHT/HE
+///   caps); m5: all five padding fields. PPE parsing from peer
+///   IEs is NOT done here — the 8922A station owner parses the
+///   pads (`ppe::parse_assoc_ppe`, issue #1882) and passes them
+///   in; this builder only validates their 2-bit range.
 /// - w6: AID (12 bits) + ULDL (station mode); m6: both fields.
 /// - w8: BSR queue-size format = peer HE support; m8: its bit.
 ///

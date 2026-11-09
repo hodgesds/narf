@@ -2,6 +2,77 @@
 use super::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+/// Inert register model for the antenna-diversity tick: reads return the
+/// last written word (0 by default), writes are traced, every access
+/// admitted; no RF or sequencing behaviour.
+struct Model {
+    words: Vec<u32>,
+    trace: Vec<(u32, u32)>,
+}
+impl Model {
+    fn new() -> Self {
+        Self {
+            words: alloc::vec![0; 0x20000 / 4],
+            trace: Vec::new(),
+        }
+    }
+    fn word(&self, address: u32) -> u32 {
+        self.words[address as usize / 4]
+    }
+}
+impl power::Io for Model {
+    fn read8(&mut self, _: u32) -> Result<u8, power::Error> {
+        Err(power::Error::Access)
+    }
+    fn read16(&mut self, _: u32) -> Result<u16, power::Error> {
+        Err(power::Error::Access)
+    }
+    fn read32(&mut self, a: u32) -> Result<u32, power::Error> {
+        Ok(self.word(a))
+    }
+    fn write8(&mut self, _: u32, _: u8) -> Result<(), power::Error> {
+        Err(power::Error::Access)
+    }
+    fn write16(&mut self, _: u32, _: u16) -> Result<(), power::Error> {
+        Err(power::Error::Access)
+    }
+    fn write32(&mut self, a: u32, v: u32) -> Result<(), power::Error> {
+        self.words[a as usize / 4] = v;
+        self.trace.push((a, v));
+        Ok(())
+    }
+    fn now_us(&self) -> u64 {
+        0
+    }
+    async fn delay_us(&mut self, _: u64) {}
+    async fn read_ecv(&mut self) -> Result<Option<u8>, power::Error> {
+        Err(power::Error::Unsupported)
+    }
+}
+impl Interface for Model {
+    fn admit(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn rf_read(&mut self, _: u8, _: u32, _: u32) -> Result<u32, Error> {
+        Ok(0)
+    }
+    async fn rf_write(&mut self, _: u8, _: u32, _: u32, _: u32) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn begin(&mut self, _: crate::rtw89::rfk::Kind) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn end(&mut self, _: crate::rtw89::rfk::Kind) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn pause(&mut self) -> Result<u32, Error> {
+        Ok(0)
+    }
+    async fn resume(&mut self, _: u32) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 fn calibration(thermal: u8, pa: u8) -> factory_51::Calibration {
     factory_51::Calibration {
         thermal: 0,
@@ -119,6 +190,8 @@ fn smoke_rtw89_n51_radio_owner_starts_new() -> TestResult {
         || radio.epoch() != 0
         || radio.tracker().is_some()
         || radio.antdiv().is_some()
+        || radio.antdiv_training()
+        || radio.antdiv_period_ms() != 0
         || radio.init().results().is_some()
         || radio.rfk().state() != ChannelState::New
     {
@@ -129,4 +202,93 @@ fn smoke_rtw89_n51_radio_owner_starts_new() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_n51_radio_owner_starts_new
+);
+
+/// phy.c `rtw89_phy_antdiv_parse` / `_track` / `antdiv_work` through the
+/// retained owner: PPDU observations feed the target stats, a target-RSSI
+/// move starts training with the 30 ms collect step, the odd step swaps
+/// to the aux antenna and programs ANTSEL, and the decision step picks
+/// the antenna with the better EVM and programs it. The ANTSEL program
+/// is `set_ant` for TX on RF_B (default AUX): CGCS_CTRL + RX_ORI +
+/// TX_ORI on AUX, RX_ALT on MAIN (`R_P0_ANTSEL` 0x1586C = 0x21010).
+fn smoke_rtw89_n51_antdiv_parse_and_periodic_track_drive_ant_sel() -> TestResult {
+    use crate::rtw89::rx_packet::{AntDivObservation, PpduClass};
+    // No retained owner: observations are dropped, ticks are no-ops.
+    let mut radio = Radio::default();
+    let mut io = Model::new();
+    radio.parse_ppdu(AntDivObservation {
+        class: PpduClass::Ofdm,
+        rssi: 60,
+        evm: 0,
+    });
+    if radio.antdiv_tick(&mut io).is_err()
+        || radio.antdiv().is_some()
+        || radio.antdiv_training()
+        || radio.antdiv_period_ms() != 0
+        || !io.trace.is_empty()
+    {
+        return TestResult::Fail("antenna diversity ran without a retained owner");
+    }
+    // Retained owner on RF_A.
+    let mut radio = Radio {
+        antdiv: Some(antdiv_51::AntDiv::new(antdiv_51::RF_A, antdiv_51::RF_A)),
+        ..Radio::default()
+    };
+    let observe = |radio: &mut Radio, rssi: u8, evm: u8| {
+        for _ in 0..5 {
+            radio.parse_ppdu(AntDivObservation {
+                class: PpduClass::Ofdm,
+                rssi,
+                evm,
+            });
+        }
+    };
+    // Target RSSI 60 vs previous 0 starts training: count-0 step opens
+    // the collect gate for 30 ms and programs nothing.
+    observe(&mut radio, 60, 0);
+    if radio.antdiv_tick(&mut io).is_err()
+        || !radio.antdiv_training()
+        || radio.antdiv_period_ms() != 30
+        || !io.trace.is_empty()
+    {
+        return TestResult::Fail("target RSSI move did not start antdiv training");
+    }
+    // Main window (RF_A, RSSI 70, EVM 5), then the odd step swaps to the
+    // aux antenna for 110 ms and programs ANTSEL.
+    observe(&mut radio, 70, 5);
+    if radio.antdiv_tick(&mut io).is_err()
+        || !radio.antdiv_training()
+        || radio.antdiv_period_ms() != 110
+        || io.word(0x1_586c) != 0x21010
+        || radio.antdiv().unwrap().antenna_rx() != antdiv_51::RF_B
+    {
+        return TestResult::Fail("antdiv training step did not swap and program ANTSEL");
+    }
+    // First aux window (RF_B, RSSI 40, EVM 30): the even step re-opens
+    // the collect gate for 30 ms.
+    observe(&mut radio, 40, 30);
+    if radio.antdiv_tick(&mut io).is_err()
+        || !radio.antdiv_training()
+        || radio.antdiv_period_ms() != 30
+        || io.word(0x1_586c) != 0x21010
+    {
+        return TestResult::Fail("antdiv training step did not re-open collection");
+    }
+    // Second aux window: the decision step picks RF_B on EVM
+    // (30 vs main 5, over the threshold 8) and programs it.
+    observe(&mut radio, 40, 30);
+    if radio.antdiv_tick(&mut io).is_err()
+        || radio.antdiv_training()
+        || radio.antdiv_period_ms() != 0
+        || io.word(0x1_586c) != 0x21010
+        || radio.antdiv().unwrap().antenna_rx() != antdiv_51::RF_B
+        || radio.antdiv().unwrap().antenna_tx() != antdiv_51::RF_B
+    {
+        return TestResult::Fail("antdiv decision did not pick the better-EVM antenna");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_n51_antdiv_parse_and_periodic_track_drive_ant_sel
 );

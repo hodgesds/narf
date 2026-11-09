@@ -18,6 +18,10 @@ narf-init         = { path = "../init" }
 narf-capabilities = { path = "../capabilities" }
 narf-boot         = { path = "../boot" }
 narf-block        = { path = "../block" }
+narf-console      = { path = "../console" }
+narf-scheduler    = { path = "../scheduler" }
+narf-time         = { path = "../time" }
+narf-input        = { path = "../input" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 zeroize           = { version = "1", default-features = false, features = ["alloc"] }
 

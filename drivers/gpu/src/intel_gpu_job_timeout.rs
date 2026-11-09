@@ -16,7 +16,6 @@ use core::sync::atomic::{fence, Ordering};
 const START: u64 = 0x808;
 const JOB_TIMESTAMP: u64 = 0x810;
 const ENGINE_RECEIPT: u64 = 0x818;
-const TIMESTAMP: u64 = REGS + 0x23 * 4;
 /// Private, cache-line-aligned PPHWSP space outside the breadcrumbs.
 const RESTORE_BATCH: u64 = 0x900;
 const ACTIVE: u32 = 1;
@@ -24,25 +23,41 @@ const ACTIVE: u32 = 1;
 /// Install a trusted per-context batch, run after every restore. Its private
 /// GGTT stores are followed by MI_BATCH_BUFFER_END. Unlike a
 /// ring-only marker, this stays correct when GuC preempts and resumes a job.
-pub(super) fn setup(image: &impl GpuBacking, platform: GtPlatform) {
-    setup_inner(image, platform, false);
+pub(super) fn setup(image: &impl GpuBacking, engine: Engine, platform: GtPlatform) {
+    setup_inner(image, engine, platform, false);
 }
 
-pub(super) fn setup_virtual(image: &impl GpuBacking, platform: GtPlatform) {
-    setup_inner(image, platform, true);
+pub(super) fn setup_virtual(image: &impl GpuBacking, engine: Engine, platform: GtPlatform) {
+    setup_inner(image, engine, platform, true);
 }
 
-fn setup_inner(image: &impl GpuBacking, platform: GtPlatform, virtual_engine: bool) {
+fn setup_inner(
+    image: &impl GpuBacking,
+    engine: Engine,
+    platform: GtPlatform,
+    virtual_engine: bool,
+) {
     let address = image.ggtt_offset();
+    // The CTX_TIMESTAMP value slot follows the second LRI group, which
+    // #1821 moved on non-Gen12 render (issue #1871): writing ACTIVE to
+    // the stale 0x23 slot would overwrite that group's header instead.
+    let timestamp = REGS + engine.timestamp_value_slot(platform) * 4;
     let mut words = Vec::new();
     if virtual_engine {
         // xe_lrc.c::setup_utilization_wa: CS-relative ENGINE_ID captured
         // before marking this restore active, outside every user mapping.
         words.extend_from_slice(&[0x12480002, 0x8c, address + ENGINE_RECEIPT as u32, 0]);
     }
-    words.extend_from_slice(&[0x10400002, address + TIMESTAMP as u32, 0, ACTIVE]);
+    words.extend_from_slice(&[0x10400002, address + timestamp as u32, 0, ACTIVE]);
     if platform == GtPlatform::Battlemage {
-        words.extend_from_slice(&[0x10400002, address + (REGS + 0x25 * 4) as u32, 0, 0]);
+        // Xe2 carries a second register (0x3ac) after CTX_TIMESTAMP in
+        // the same group; the batch clears its saved value alongside the
+        // ACTIVE marker. Its value slot follows the 0x3a8 value by one
+        // register (two dwords) — 0x27 on non-Gen12 render after #1821,
+        // 0x25 elsewhere. The branch predates #1821 (commit 4f2f7c1b6),
+        // when 0x25 was this same slot on every engine; the gate stays
+        // Battlemage-only.
+        words.extend_from_slice(&[0x10400002, address + (timestamp + 8) as u32, 0, 0]);
     }
     words.push(0x05000000);
     for (i, word) in words.into_iter().enumerate() {
@@ -104,9 +119,10 @@ impl Runtime {
         image: &impl GpuBacking,
         stamp: u32,
         engine: Engine,
+        platform: GtPlatform,
         window: &impl MmioWindow,
     ) -> Result<(bool, bool), SchedulingError> {
-        self.expired_on(image, stamp, EngineSet::of(&[engine]), window)
+        self.expired_on(image, stamp, EngineSet::of(&[engine]), platform, window)
     }
 
     pub(super) fn expired_on(
@@ -114,6 +130,7 @@ impl Runtime {
         image: &impl GpuBacking,
         stamp: u32,
         placements: EngineSet,
+        platform: GtPlatform,
         window: &impl MmioWindow,
     ) -> Result<(bool, bool), SchedulingError> {
         fence(Ordering::Acquire);
@@ -126,6 +143,11 @@ impl Runtime {
             _ => {}
         }
         let engine = observed_engine(image, stamp, placements)?.ok_or(SchedulingError::Protocol)?;
+        // The saved CTX_TIMESTAMP lives in the same moved slot the
+        // restore batch marks ACTIVE (issue #1871): reading the stale
+        // 0x23 slot on non-Gen12 Rcs0 would return the second LRI
+        // group's header, not a timestamp.
+        let timestamp = REGS + engine.timestamp_value_slot(platform) * 4;
         let rpm = window.read32(0xd00);
         if rpm == u32::MAX || rpm != window.read32(0xd00) {
             return Err(SchedulingError::Protocol);
@@ -138,7 +160,7 @@ impl Runtime {
             _ => return Err(SchedulingError::Protocol),
         };
         let frequency = crystal >> (3 - ((rpm >> 1) & 3));
-        let mut saved = image.read32(TIMESTAMP);
+        let mut saved = image.read32(timestamp);
         let mut current = saved;
         let mut active = false;
         if saved == ACTIVE {
@@ -153,7 +175,7 @@ impl Runtime {
             // reads. In that case its new saved value wins over the other
             // context's live counter (xe_lrc_timestamp's read-again rule).
             fence(Ordering::Acquire);
-            saved = image.read32(TIMESTAMP);
+            saved = image.read32(timestamp);
             if observed_engine(image, stamp, placements)? != Some(engine) {
                 // GuC migrated between the receipt and MMIO observations.
                 self.previous_active = None;
@@ -210,7 +232,7 @@ mod tests {
                 0x2240 => self.lrca,
                 0x23a8 => {
                     if let Some(image) = self.switched {
-                        image.write32(TIMESTAMP, 3_000_000);
+                        image.write32(timestamp(Engine::Rcs0, GtPlatform::Alchemist), 3_000_000);
                     }
                     self.current
                 }
@@ -219,6 +241,31 @@ mod tests {
         }
         fn write32(&self, _: u64, _: u32) {
             panic!("watchdog must not write MMIO");
+        }
+    }
+    /// Byte offset of the CTX_TIMESTAMP value slot for an engine/platform
+    /// pair under test.
+    fn timestamp(engine: Engine, platform: GtPlatform) -> u64 {
+        REGS + engine.timestamp_value_slot(platform) * 4
+    }
+    /// Run the image's restore batch against the image itself: each
+    /// MI_STORE_DWORD_IMM writes its value to the image dword its GGTT
+    /// address names. The batch the timeout path installs carries only
+    /// those stores plus MI_BATCH_BUFFER_END.
+    fn execute_restore_batch(image: &Image) {
+        let base = u64::from(image.ggtt_offset());
+        let pointer = image.read32(REGS + 0x13 * 4);
+        let mut off = u64::from(pointer & !1) - base;
+        loop {
+            let op = image.read32(off);
+            if op == 0x05000000 {
+                break;
+            }
+            assert_eq!(op, 0x10400002, "restore batch carries only dword stores");
+            let address = image.read32(off + 4);
+            let value = image.read32(off + 12);
+            image.write32(u64::from(address) - base, value);
+            off += 16;
         }
     }
     fn image() -> Image {
@@ -234,31 +281,76 @@ mod tests {
     }
 
     fn smoke_guc_runtime_restore_and_ring_vectors() -> TestResult {
-        for platform in [GtPlatform::Alchemist, GtPlatform::Battlemage] {
+        // (platform, engine, virtual, expected restore-batch words).
+        // The CTX_TIMESTAMP store targets the moved 0x25 slot on
+        // non-Gen12 Rcs0 (issue #1871) and 0x23 elsewhere; the
+        // Battlemage upper-slot store follows it by one register.
+        let gen12 = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        for (platform, engine, virtual_engine, expected) in [
+            (
+                GtPlatform::Alchemist,
+                Engine::Rcs0,
+                false,
+                alloc::vec![0x10400002, 0x01001094, 0, 1, 0x05000000],
+            ),
+            (
+                GtPlatform::Alchemist,
+                Engine::Bcs0,
+                false,
+                alloc::vec![0x10400002, 0x0100108c, 0, 1, 0x05000000],
+            ),
+            (
+                GtPlatform::Battlemage,
+                Engine::Rcs0,
+                false,
+                alloc::vec![
+                    0x10400002, 0x01001094, 0, 1, 0x10400002, 0x0100109c, 0, 0, 0x05000000,
+                ],
+            ),
+            (
+                GtPlatform::Battlemage,
+                Engine::Bcs0,
+                false,
+                alloc::vec![
+                    0x10400002, 0x0100108c, 0, 1, 0x10400002, 0x01001094, 0, 0, 0x05000000,
+                ],
+            ),
+            (
+                gen12,
+                Engine::Rcs0,
+                false,
+                alloc::vec![0x10400002, 0x0100108c, 0, 1, 0x05000000],
+            ),
+            (
+                GtPlatform::Alchemist,
+                Engine::Rcs0,
+                true,
+                alloc::vec![
+                    0x12480002, 0x8c, 0x01000818, 0, 0x10400002, 0x01001094, 0, 1, 0x05000000,
+                ],
+            ),
+        ] {
             let image = image();
-            setup(&image, platform);
+            if virtual_engine {
+                setup_virtual(&image, engine, platform);
+            } else {
+                setup(&image, engine, platform);
+            }
             assert_eq!(image.read32(REGS + 0x13 * 4), 0x01000901);
             assert_eq!(
-                &image.0.borrow()[0x900 / 4..0x910 / 4],
-                &[0x10400002, 0x0100108c, 0, 1]
+                &image.0.borrow()[0x900 / 4..0x900 / 4 + expected.len()],
+                expected.as_slice()
             );
-            if platform == GtPlatform::Battlemage {
-                assert_eq!(
-                    &image.0.borrow()[0x910 / 4..0x924 / 4],
-                    &[0x10400002, 0x01001094, 0, 0, 0x05000000]
-                );
+        }
+        let image = image();
+        for engine in Engine::ALL {
+            let mut words = alloc::vec![0x04000001];
+            prefix(image.ggtt_offset(), 7, engine, &mut words);
+            assert_eq!(&words[..4], &[0x12480002, 0x3a8, 0x01000810, 0]);
+            if engine.simple_ring() {
+                assert_eq!(&words[4..], &[0x04000001]);
             } else {
-                assert_eq!(image.read32(0x910), 0x05000000);
-            }
-            for engine in Engine::ALL {
-                let mut words = alloc::vec![0x04000001];
-                prefix(image.ggtt_offset(), 7, engine, &mut words);
-                assert_eq!(&words[..4], &[0x12480002, 0x3a8, 0x01000810, 0]);
-                if engine.simple_ring() {
-                    assert_eq!(&words[4..], &[0x04000001]);
-                } else {
-                    assert_eq!(&words[4..], &[0x10400002, 0x01000808, 0, 7, 0x04000001]);
-                }
+                assert_eq!(&words[4..], &[0x10400002, 0x01000808, 0, 7, 0x04000001]);
             }
         }
         TestResult::Pass
@@ -266,6 +358,48 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/intel_gpu_user",
         smoke_guc_runtime_restore_and_ring_vectors
+    );
+
+    fn smoke_guc_runtime_restore_batch_executes_on_moved_slot() -> TestResult {
+        // Build a real LRC image, install the restore batch, then run the
+        // batch against the image: the ACTIVE marker must land in the
+        // 0x3a8 value slot while the second group's header survives.
+        // The old stale slot (0x23 on non-Gen12 render) is the header
+        // itself — executing the old batch would overwrite it with 1.
+        let gen12 = GtPlatform::Gen12(crate::intel_gpu_gt::Gen12Platform::TigerLake);
+        for (platform, header) in [
+            (GtPlatform::Alchemist, 0x23u64),
+            (GtPlatform::Battlemage, 0x23u64),
+            (gen12, 0x21u64),
+        ] {
+            let image = image();
+            crate::intel_gpu_guc_sched::context_image(&image, platform, 0x01002000);
+            assert_eq!(image.read32(REGS + header * 4), 0x11081011);
+            assert_eq!(
+                image.read32(REGS + (header + 1) * 4),
+                Engine::Rcs0.base() + 0x3a8
+            );
+            let slot = timestamp(Engine::Rcs0, platform);
+            assert_eq!(image.read32(slot), 0);
+            if platform == GtPlatform::Battlemage {
+                // Seed the 0x3ac upper slot so the batch's clearing
+                // store is observable, not a no-op over a zero.
+                image.write32(slot + 8, 0x5a5a_5a5a);
+            }
+            setup(&image, Engine::Rcs0, platform);
+            execute_restore_batch(&image);
+            assert_eq!(image.read32(REGS + header * 4), 0x11081011);
+            assert_eq!(image.read32(slot), ACTIVE);
+            if platform == GtPlatform::Battlemage {
+                // The 0x3ac upper slot is cleared beside the marker.
+                assert_eq!(image.read32(slot + 8), 0);
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/intel_gpu_user",
+        smoke_guc_runtime_restore_batch_executes_on_moved_slot
     );
 
     fn smoke_guc_runtime_queued_preempted_and_stuck() -> TestResult {
@@ -279,30 +413,30 @@ mod tests {
             switched: None,
         };
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &unavailable),
+            runtime.expired(&image, 7, Engine::Rcs0, GtPlatform::Alchemist, &unavailable),
             Ok((false, false))
         );
         image.write32(START, 7);
-        image.write32(TIMESTAMP, 3_000_000);
+        image.write32(timestamp(Engine::Rcs0, GtPlatform::Alchemist), 3_000_000);
         let other = window(&image, 900_000_000);
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &other),
+            runtime.expired(&image, 7, Engine::Rcs0, GtPlatform::Alchemist, &other),
             Ok((false, true))
         );
         // Frozen inactive LRC time is preemption, not a guilty hang.
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &other),
+            runtime.expired(&image, 7, Engine::Rcs0, GtPlatform::Alchemist, &other),
             Ok((false, false))
         );
-        image.write32(TIMESTAMP, ACTIVE);
+        image.write32(timestamp(Engine::Rcs0, GtPlatform::Alchemist), ACTIVE);
         let active = window(&image, 4_000_000);
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &active),
+            runtime.expired(&image, 7, Engine::Rcs0, GtPlatform::Alchemist, &active),
             Ok((false, true))
         );
         // Two unchanged active samples identify a stopped hardware counter.
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &active),
+            runtime.expired(&image, 7, Engine::Rcs0, GtPlatform::Alchemist, &active),
             Ok((true, false))
         );
         TestResult::Pass
@@ -316,20 +450,32 @@ mod tests {
         let image = image();
         image.write32(START, 7);
         image.write32(JOB_TIMESTAMP, u32::MAX - 2_999_999);
-        image.write32(TIMESTAMP, 3_000_000);
+        image.write32(timestamp(Engine::Rcs0, GtPlatform::Alchemist), 3_000_000);
         let mut runtime = Runtime::default();
         // Counter wrap represents two seconds at the actual 3 MHz clock.
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &window(&image, 0)),
+            runtime.expired(
+                &image,
+                7,
+                Engine::Rcs0,
+                GtPlatform::Alchemist,
+                &window(&image, 0)
+            ),
             Ok((false, true))
         );
-        image.write32(TIMESTAMP, 12_000_000);
+        image.write32(timestamp(Engine::Rcs0, GtPlatform::Alchemist), 12_000_000);
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &window(&image, 0)),
+            runtime.expired(
+                &image,
+                7,
+                Engine::Rcs0,
+                GtPlatform::Alchemist,
+                &window(&image, 0)
+            ),
             Ok((true, true))
         );
         image.write32(JOB_TIMESTAMP, 0);
-        image.write32(TIMESTAMP, ACTIVE);
+        image.write32(timestamp(Engine::Rcs0, GtPlatform::Alchemist), ACTIVE);
         let switched = Window {
             current: 900_000_000,
             lrca: image.ggtt_offset(),
@@ -337,11 +483,11 @@ mod tests {
             switched: Some(&image),
         };
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &switched),
+            runtime.expired(&image, 7, Engine::Rcs0, GtPlatform::Alchemist, &switched),
             Ok((false, true))
         );
         // An actual saved timestamp of one must not borrow another LRC's time.
-        image.write32(TIMESTAMP, ACTIVE);
+        image.write32(timestamp(Engine::Rcs0, GtPlatform::Alchemist), ACTIVE);
         let other = Window {
             current: 900_000_000,
             lrca: image.ggtt_offset() + 4096,
@@ -350,11 +496,17 @@ mod tests {
         };
         image.write32(JOB_TIMESTAMP, 100);
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &other),
+            runtime.expired(&image, 7, Engine::Rcs0, GtPlatform::Alchemist, &other),
             Ok((false, false))
         );
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &window(&image, u32::MAX)),
+            runtime.expired(
+                &image,
+                7,
+                Engine::Rcs0,
+                GtPlatform::Alchemist,
+                &window(&image, u32::MAX)
+            ),
             Err(SchedulingError::Protocol)
         );
         let bad_clock = Window {
@@ -364,12 +516,18 @@ mod tests {
             switched: None,
         };
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &bad_clock),
+            runtime.expired(&image, 7, Engine::Rcs0, GtPlatform::Alchemist, &bad_clock),
             Err(SchedulingError::Protocol)
         );
         image.write32(START, 8);
         assert_eq!(
-            runtime.expired(&image, 7, Engine::Rcs0, &window(&image, 0)),
+            runtime.expired(
+                &image,
+                7,
+                Engine::Rcs0,
+                GtPlatform::Alchemist,
+                &window(&image, 0)
+            ),
             Err(SchedulingError::Protocol)
         );
         TestResult::Pass
@@ -414,7 +572,7 @@ mod tests {
             assert_eq!(observed_engine(&image, 7, placements), Ok(None));
             for engine in placements.iter() {
                 image.write32(START, 7);
-                image.write32(TIMESTAMP, ACTIVE);
+                image.write32(timestamp(engine, GtPlatform::Alchemist), ACTIVE);
                 let receipt =
                     engine.physical_instance() << 4 | if engine.is_compute() { 5 } else { 3 };
                 image.write32(ENGINE_RECEIPT, receipt);
@@ -428,13 +586,13 @@ mod tests {
                 // context: the physical receipt is part of the observation.
                 assert!(
                     !runtime
-                        .expired_on(&image, 7, placements, &window)
+                        .expired_on(&image, 7, placements, GtPlatform::Alchemist, &window)
                         .unwrap()
                         .0
                 );
                 assert!(
                     runtime
-                        .expired_on(&image, 7, placements, &window)
+                        .expired_on(&image, 7, placements, GtPlatform::Alchemist, &window)
                         .unwrap()
                         .0
                 );
@@ -443,7 +601,7 @@ mod tests {
         let placements = EngineSet::of(&[Engine::Ccs1, Engine::Ccs3]);
         let image = image();
         image.write32(START, 7);
-        image.write32(TIMESTAMP, ACTIVE);
+        image.write32(timestamp(Engine::Ccs1, GtPlatform::Alchemist), ACTIVE);
         image.write32(ENGINE_RECEIPT, 0x15);
         let racing = VirtualWindow {
             image: &image,
@@ -451,7 +609,7 @@ mod tests {
             migrate: Some(0x35),
         };
         assert_eq!(
-            Runtime::default().expired_on(&image, 7, placements, &racing),
+            Runtime::default().expired_on(&image, 7, placements, GtPlatform::Alchemist, &racing),
             Ok((false, false))
         );
         for bad in [0, 3, 5, 0x25, 0x83, u32::MAX] {

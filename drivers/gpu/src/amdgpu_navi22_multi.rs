@@ -811,6 +811,38 @@ impl Group {
             .configure_hdmi_vrr(caps, enabled)
             .await
     }
+    /// The DP FreeSync enable path for one stream of the context.
+    pub async fn configure_dp_vrr<A: Aux + Send>(
+        &mut self,
+        stream: usize,
+        range: Option<crate::amdgpu_freesync::VrrRange>,
+        enabled: bool,
+        aux: &mut A,
+    ) -> Result<Option<crate::amdgpu_freesync::Drr>, Error> {
+        self.members
+            .get_mut(stream)
+            .ok_or(Error::Invalid)?
+            .configure_dp_vrr(range, enabled, aux)
+            .await
+    }
+    /// BTR preflip on one stream's DCN30 DRR: no-op without admitted BTR.
+    pub fn lfc_preflip(&mut self, stream: usize, now_us: u32) -> Result<(), Error> {
+        self.members
+            .get_mut(stream)
+            .ok_or(Error::Invalid)?
+            .lfc_preflip(now_us)
+    }
+    /// Service one observed VUPDATE on one stream's admitted BTR.
+    pub fn lfc_progress(&mut self, stream: usize) -> Result<(), Error> {
+        self.members
+            .get_mut(stream)
+            .ok_or(Error::Invalid)?
+            .lfc_progress()
+    }
+    /// Whether BTR frame insertion is admitted on one stream.
+    pub fn lfc_active(&self, stream: usize) -> bool {
+        self.members.get(stream).is_some_and(|m| m.lfc_active())
+    }
     /// Update one stream's HDMI metadata without retiring the context.
     pub async fn update_hdmi_metadata(
         &mut self,

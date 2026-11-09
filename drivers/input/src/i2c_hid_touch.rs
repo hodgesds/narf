@@ -212,18 +212,20 @@ pub fn build_elan_caps(
 /// transport (HID or SMBus): slot-protocol-B axes, clickpad
 /// button, `INPUT_PROP_POINTER | INPUT_PROP_BUTTONPAD`.
 ///
-/// Axis ranges are the decoder field widths — F$12 carries u16
-/// coordinates, F$11 12-bit ones — until the F$11/F$12
-/// sensor-maximum queries are decoded at probe time (remainder:
-/// the true maxima narrow the range libinput scales through).
+/// Axis ranges are the sensor maxima decoded at probe time
+/// (F$12 Control 8 / F$11 Control 6/8 — field-width fallbacks
+/// when the query reads failed), with one slot per reported
+/// object/finger.
 pub fn build_rmi_caps(probe: &Rmi4DeviceProbe, identity: &DeviceCaps) -> DeviceCaps {
     let mut caps = identity.clone();
-    let (max, slots) = if probe.f12.is_some() {
-        (0xFFFF, 10)
-    } else {
-        (0x0FFF, 5)
-    };
-    add_mt_axes(&mut caps, slots, axis(0, max), axis(0, max));
+    let (max_x, max_y) = probe.sensor_axis_maxima();
+    let slots = probe.sensor_slots();
+    add_mt_axes(
+        &mut caps,
+        slots,
+        axis(0, max_x as i32),
+        axis(0, max_y as i32),
+    );
     caps.add_abs_info(abs::ABS_PRESSURE, axis(0, 255));
     caps.add_abs_info(abs::ABS_MT_PRESSURE, axis(0, 255));
     caps.add_key(evkey::BTN_TOUCH);

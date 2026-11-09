@@ -55,14 +55,26 @@ impl Model {
             })
             .map(|(i, _)| i)
             .ok_or("native MLD translation lacks actual MAC HE/EHT receipt")?;
+        // The associated MAC is the last (3,8) carrying an association id
+        // (byte 36): only the post-response MAC is built with
+        // `station_api::mac(2, local, Some(response.aid))`. The
+        // pre-association MAC (connection.rs:692) and the disconnect MAC
+        // (connection.rs:3770) carry aid None, so bytes 36..40 of those are
+        // template zeros and must never be read as the associated MAC's esr
+        // fields. Until an associated MAC exists, association has not
+        // completed and none of the post-association invariants below apply.
+        let associated = commands
+            .iter()
+            .rev()
+            .find(|(g, c, b)| (*g, *c) == (3, 8) && b.len() == 52 && b[36] == 1)
+            .map(|(_, _, b)| b);
+        let Some(associated) = associated else {
+            return Ok(());
+        };
         require(
-            commands
-                .iter()
-                .rev()
-                .find(|(g, c, _)| (*g, *c) == (3, 8))
-                .is_some_and(|(_, _, b)| {
-                    b.len() == 52 && b[12..18] == self.context.own_mld() && b[24] == 1 && b[26] == 1
-                }),
+            associated[12..18] == self.context.own_mld()
+                && associated[24] == 1
+                && associated[26] == 1,
             "native MLD translation outlived current MAC EHT setup",
         )?;
         // mld/iface.c iwl_mld_mac_cmd_fill_sta: the FakeAp response Basic
@@ -70,11 +82,7 @@ impl Model {
         // capabilities nor a medium sync delay, so the associated MAC
         // carries esr_transition_timeout 0 and the 0x10ac default delay.
         require(
-            commands
-                .iter()
-                .rev()
-                .find(|(g, c, _)| (*g, *c) == (3, 8))
-                .is_some_and(|(_, _, b)| b[37] == 0 && b[38..40] == [0xac, 0x10]),
+            associated[37] == 0 && associated[38..40] == [0xac, 0x10],
             "native MLD associated MAC lacks the default esr fields",
         )?;
         let link = commands

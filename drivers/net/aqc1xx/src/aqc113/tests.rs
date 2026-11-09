@@ -766,3 +766,282 @@ fn smoke_aqc113_fake_boot_failure() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/aqc113", smoke_aqc113_fake_boot_failure);
+
+// ── Multi-instance (issue #795) ────────────────────────────────────
+
+/// Same shape as `smoke_ixgbe_multi_instance_cookie_dispatch` in
+/// `drivers/net/ixgbe/src/ixgbe/tests.rs`: two AQC devices probe,
+/// both register in the `CONTROLLERS` vec; a transmit on the second
+/// device routes to the second instance (not the first); removing
+/// one device leaves the other functional. The QEMU test VM has no
+/// AQC silicon, so only the no-silicon branch runs in CI; the live
+/// branch runs on real hardware with one or two AQC NICs. The
+/// endpoint piece for a QEMU two-NIC run is #1632.
+///
+/// Routing is proven by the posted frame itself, not by the send
+/// result: `transmit` copies the frame into the slot buffer and
+/// advances `tx_head` when the descriptor is posted, before the
+/// 250 ms DD-writeback poll, so a link-down device still shows the
+/// post on the right instance even when the poll times out — and a
+/// concurrent stack frame on another port cannot fake the addressed
+/// port's slot bytes.
+fn smoke_aqc113_multi_instance_cookie_dispatch() -> TestResult {
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: the kernel-test runner executes post-boot, so the memory
+    // map and allocator are online; `ECAM_DEFAULT_BASE` is the standard
+    // MMCONFIG window and the enumerator only reads 4-byte config words,
+    // rejecting all-1s for unpopulated slots.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let aqc_addrs: Vec<narf_bus::BusAddr> = devs
+        .iter()
+        .filter(|d| {
+            matches!(&d.kind, BusKind::Pcie { .. })
+                && d.id.vendor == super::AQC_VENDOR
+                && super::ALL_DEV_IDS.contains(&d.id.device)
+        })
+        .map(|d| d.addr)
+        .collect();
+    let n = aqc_addrs.len();
+    if n == 0 {
+        if super::instance_count() != 0 {
+            return TestResult::Fail("instance_count != 0 with no aqc113 silicon");
+        }
+        if super::controller(0).is_some() {
+            return TestResult::Fail("controller(0) Some with no aqc113 silicon");
+        }
+        if super::controller(usize::MAX).is_some() {
+            return TestResult::Fail("controller(MAX) Some with no aqc113 silicon");
+        }
+        if super::is_probed() {
+            return TestResult::Fail("is_probed with no aqc113 silicon");
+        }
+        if super::with_controller(0, |c| c.mac).is_some() {
+            return TestResult::Fail("with_controller(0) Some with no aqc113 silicon");
+        }
+        if super::with_controller_mut(0, |_| ()).is_some() {
+            return TestResult::Fail("with_controller_mut(0) Some with no aqc113 silicon");
+        }
+        // Detach is a no-op without silicon — must not panic, and
+        // must not conjure an instance.
+        super::aqc113_detach(0);
+        super::aqc113_detach(usize::MAX);
+        if super::instance_count() != 0 {
+            return TestResult::Fail("detach conjured an instance with no silicon");
+        }
+        // Cookie dispatch without a controller fails instead of
+        // resolving to a first (nonexistent) instance.
+        let frame = [0u8; 64];
+        if super::aqc113_send_frame(0, &frame, narf_net::TxMeta::plain()).is_ok() {
+            return TestResult::Fail("aqc113_send_frame resolved cookie 0 with no silicon");
+        }
+        if super::aqc113_send_frame(1, &frame, narf_net::TxMeta::plain()).is_ok() {
+            return TestResult::Fail("aqc113_send_frame resolved cookie 1 with no silicon");
+        }
+        if narf_net::iface::send_on("eth999", &frame).is_ok() {
+            return TestResult::Fail("send_on resolved a nonexistent iface");
+        }
+        return TestResult::Pass;
+    }
+    __reset_for_test();
+    super::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !super::is_probed() {
+        return TestResult::Fail("aqc113 not probed");
+    }
+    if super::instance_count() != n {
+        return TestResult::Fail("instance_count != enumerated AQC device count after probe");
+    }
+    if super::controller(n).is_some() {
+        return TestResult::Fail("controller(n) Some with n NICs");
+    }
+    if super::controller(usize::MAX).is_some() {
+        return TestResult::Fail("controller(MAX) Some");
+    }
+    // One distinct published name per controller, each resolvable,
+    // each bound to the PCI address it was probed at.
+    let mut names: Vec<&str> = Vec::new();
+    let mut ctrls: Vec<alloc::sync::Arc<super::AqcNic>> = Vec::new();
+    for (i, addr) in aqc_addrs.iter().enumerate().take(n) {
+        let ctrl = match super::controller(i) {
+            Some(c) => c,
+            None => return TestResult::Fail("controller(i) None after probe"),
+        };
+        if ctrl.addr != *addr {
+            return TestResult::Fail("controller(i) bound to the wrong PCI address");
+        }
+        let name = ctrl.ifname();
+        if name.is_empty() {
+            return TestResult::Fail("published name empty after probe");
+        }
+        if names.contains(&name) {
+            return TestResult::Fail("two controllers share one published name");
+        }
+        if narf_net::iface::lookup(name).is_none() {
+            return TestResult::Fail("iface not published under its name");
+        }
+        names.push(name);
+        ctrls.push(ctrl);
+    }
+    // Re-probe keeps the same Arcs (same-function dedup by PCI addr).
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    if super::instance_count() != n {
+        return TestResult::Fail("instance_count changed across re-probe");
+    }
+    for (i, ctrl) in ctrls.iter().enumerate().take(n) {
+        let after = match super::controller(i) {
+            Some(c) => c,
+            None => return TestResult::Fail("controller(i) vanished across re-probe"),
+        };
+        if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(ctrl) {
+            return TestResult::Fail("re-probe replaced controller(i)");
+        }
+    }
+    // Registry adapter borrows the NIC's own rings (first port):
+    // querying them must not take the consumer/producer out of the
+    // NIC's ring.
+    let ring_ptr =
+        narf_net::registry().with_interface(names[0], |i| i.rx_ring() as *const _ as usize);
+    if ring_ptr != Some(&ctrls[0].rx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
+    }
+    if ctrls[0].rx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("querying rx_ring took the NIC's RX ring");
+    }
+    let tx_ptr =
+        narf_net::registry().with_interface(names[0], |i| i.tx_ring() as *const _ as usize);
+    if tx_ptr != Some(&ctrls[0].tx_ipc_ring as *const _ as usize) {
+        return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
+    }
+    if ctrls[0].tx_ipc_ring.lock().is_none() {
+        return TestResult::Fail("querying tx_ring took the NIC's TX ring");
+    }
+    // Send routing: a frame addressed to port i lands in port i's
+    // TX slot buffer and no other port's next slot. The frame is
+    // distinctive (broadcast dst, locally-administered src, 0xFFFF
+    // ethertype) so no background frame can fake it.
+    let mut frame = [0u8; 64];
+    frame[..6].fill(0xFF);
+    frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
+    frame[12] = 0xFF;
+    frame[13] = 0xFF;
+    for (i, name) in names.iter().enumerate().take(n) {
+        let heads: Vec<u32> = ctrls.iter().map(|c| *c.tx_head.lock()).collect();
+        let _ = narf_net::iface::send_on(name, &frame);
+        for (j, c) in ctrls.iter().enumerate() {
+            let slot = (heads[j] as usize) % super::RING_LEN;
+            let posted = slot_matches_frame(c, slot, &frame);
+            if j == i {
+                if !posted {
+                    return TestResult::Fail(
+                        "send_on did not post the frame to the addressed port's TX ring",
+                    );
+                }
+                if *c.tx_head.lock() == heads[j] {
+                    return TestResult::Fail("send_on left the addressed port's TX head unmoved");
+                }
+            } else if posted {
+                return TestResult::Fail(
+                    "send_on posted the frame to a port other than the addressed one",
+                );
+            }
+        }
+    }
+    if n >= 2 {
+        // Direct cookie dispatch: cookie 1 resolves to the second
+        // instance, never the first.
+        let heads: Vec<u32> = ctrls.iter().map(|c| *c.tx_head.lock()).collect();
+        let _ = super::aqc113_send_frame(1, &frame, narf_net::TxMeta::plain());
+        if !slot_matches_frame(&ctrls[1], (heads[1] as usize) % super::RING_LEN, &frame) {
+            return TestResult::Fail("cookie-1 send did not post to the second controller");
+        }
+        if slot_matches_frame(&ctrls[0], (heads[0] as usize) % super::RING_LEN, &frame) {
+            return TestResult::Fail("cookie-1 send posted to the first controller");
+        }
+    }
+    // Removing one device leaves the other functional: detach port
+    // 0, then port 1 (when present) still carries traffic and the
+    // detached port's cookie no longer resolves.
+    super::aqc113_detach(0);
+    if super::instance_count() != n - 1 {
+        return TestResult::Fail("instance_count did not drop after detach(0)");
+    }
+    if super::controller(0).is_some() {
+        return TestResult::Fail("controller(0) still live after detach(0)");
+    }
+    if super::with_controller(0, |c| c.mac).is_some() {
+        return TestResult::Fail("with_controller(0) still resolves after detach(0)");
+    }
+    // Detach is idempotent.
+    super::aqc113_detach(0);
+    if super::instance_count() != n - 1 {
+        return TestResult::Fail("second detach(0) changed instance_count");
+    }
+    if n >= 2 {
+        let survivor = match super::controller(1) {
+            Some(c) => c,
+            None => return TestResult::Fail("controller(1) lost after detach(0)"),
+        };
+        if alloc::sync::Arc::as_ptr(&survivor) != alloc::sync::Arc::as_ptr(&ctrls[1]) {
+            return TestResult::Fail("detach(0) replaced controller(1)");
+        }
+        let head = *survivor.tx_head.lock();
+        let _ = narf_net::iface::send_on(names[1], &frame);
+        if !slot_matches_frame(&survivor, (head as usize) % super::RING_LEN, &frame) {
+            return TestResult::Fail("surviving port stopped transmitting after detach(0)");
+        }
+        if super::aqc113_send_frame(0, &frame, narf_net::TxMeta::plain()).is_ok() {
+            return TestResult::Fail("detached cookie 0 still transmits");
+        }
+    }
+    // Hot re-bind: a detached entry does not block re-probe of its
+    // address, so a fresh probe reclaims the function (at a new
+    // cookie — the vec never shrinks) while the survivor keeps its
+    // own cookie and Arc.
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    if super::instance_count() != n {
+        return TestResult::Fail("instance_count did not recover after re-probe");
+    }
+    if n >= 2 {
+        let after = match super::controller(1) {
+            Some(c) => c,
+            None => return TestResult::Fail("controller(1) vanished across re-bind"),
+        };
+        if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrls[1]) {
+            return TestResult::Fail("re-bind replaced the surviving controller(1)");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/aqc113",
+    smoke_aqc113_multi_instance_cookie_dispatch
+);
+
+/// True when the TX slot buffer `slot` of `ctrl` currently holds
+/// the first 14 bytes of `frame` — the routing proof for
+/// [`smoke_aqc113_multi_instance_cookie_dispatch`]: `transmit`
+/// copies the frame into the slot buffer before posting the
+/// descriptor, so the bytes land exactly on the instance that was
+/// addressed.
+fn slot_matches_frame(ctrl: &super::AqcNic, slot: usize, frame: &[u8]) -> bool {
+    for (k, expected) in frame[..14].iter().enumerate() {
+        // SAFETY: `slot` is reduced mod `RING_LEN` by the caller, so it
+        // indexes a live TX pool buffer; `k < 14`, so the read stays
+        // within the frame prefix; the reads are volatile, as in the
+        // driver's own receive path.
+        let b = unsafe { core::ptr::read_volatile(ctrl.tx_pool[slot].cpu_ptr_at::<u8>(k as u64)) };
+        if b != *expected {
+            return false;
+        }
+    }
+    true
+}

@@ -136,9 +136,9 @@ cargo narf install --version 0.5.0
 `apt`/`dpkg`, `dnf`/`rpm`, or `pacman`; it never copies files directly into
 `/boot`. Gentoo output is generated as an overlay-ready ebuild rather than
 installed automatically because overlay registration is host policy.
-The packager reuses Limine from `LIMINE_PATH`, common system locations, or a
-previous x86_64 image build; otherwise pass
-`--limine-efi /path/to/BOOTX64.EFI` explicitly.
+The x86 packager builds a native single-file EFI image containing its kernel,
+initramfs, and command line. Pass `--cmdline` or `--initramfs` to customize it.
+`--limine-efi /path/to/BOOTX64.EFI` explicitly selects legacy packaging.
 
 Native packages support x86_64 UEFI/legacy BIOS and aarch64 UEFI. Their loaders
 are cryptographically bound to the exact configuration and kernel. A
@@ -157,6 +157,13 @@ goal of running the installed CachyOS root as NARF userspace.
 ---
 
 ## Quick start
+
+For a self-contained x86_64 EFI application that firmware can boot directly,
+without Limine, run `cargo xtask efi-image`; add `--run` to boot through OVMF
+or `--smoke` for a clean-shutdown gate. See
+[Build, run, and install native EFI](docs/NATIVE_UEFI.md) for ESP installation,
+boot-manager entries, firmware inclusion, and current limits. Native x86
+packages use this image by default; existing media layouts remain available.
 
 **Prerequisites:** Rust nightly (pinned in `rust-toolchain.toml`),
 `qemu-system-x86_64` + `qemu-system-aarch64`, `xorriso`, `mtools`,

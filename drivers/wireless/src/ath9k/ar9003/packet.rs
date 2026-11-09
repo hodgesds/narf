@@ -756,7 +756,9 @@ impl<P: Port> Packet<P> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
-        let events = irq::cause(&self.port, mask.imr)?;
+        // No MCI engine is owned yet (follow-up: live-owner
+        // integration); MCI interrupts are not routed.
+        let events = irq::cause(&self.port, mask.imr, false)?;
         irq::kill(&self.port, mask.msi)?;
         let Some(events) = events else {
             return Ok(None);

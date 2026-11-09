@@ -7,12 +7,13 @@
 //! (`rtw8922a_set_channel_mac`, `rtw8922a_chan_to_rf18_val`), the BB
 //! bandwidth class (`rtw8922a_set_lna_tia_gain`), the EHT arms of
 //! `rtw8922a_bb_postinit` and `rtw8922a_cfg_rx_nss_limit`, and the EHT
-//! RX CRC counter block. This module programs nothing on its own: there
-//! is no production caller yet, because the 8922A station owner (DMA
-//! control sequence, station admission, firmware/RF/power profile) is
-//! still the remainder of the `rtl8922a` row. Like the negotiated-TTLM
-//! engine, this is implemented-but-not-advertised: the tables are
-//! fixture-pinned now so the future owner wires up verified values.
+//! RX CRC counter block. The 8922A station owner exists now
+//! (`station_8922a.rs` admission via `prepared_8922a.rs`) and composes
+//! the `EhtStation` facet, the MCS/NSS maps, and the TXWD_INFO EHT
+//! fields below; the width tables and PHY programs in this module are
+//! still fixture-pinned with no production caller yet — the channel
+//! programming that would consume them is the remaining step, not a
+//! missing owner.
 //!
 //! Deliberate narrowings, each a grounded absence, not an oversight:
 //! - The RFMOD width table has NO 320MHz arm. `rtw8922a_set_channel_mac`
@@ -264,9 +265,10 @@ pub(super) const B_CNT_EHT_CRC_ERR: u32 = 0xFFFF << 16;
 /// maximum MPDU length is `chip_8922a::MAX_EHT_MPDU_CAP` (7991,
 /// `rtw8922a.c:3222`). MCS/NSS capability maps are deliberately NOT
 /// part of this struct: they live in `EhtCap` below, computed by
-/// `eht_cap` from the same `rtw89_init_eht_cap` source. No production caller consumes
-/// this profile yet; the future 8922A station owner advertises it
-/// once admission exists.
+/// `eht_cap` from the same `rtw89_init_eht_cap` source. The profile is
+/// exposed to the owner via `Prepared8922a::eht_profile()`; the width
+/// programming that would consume it (channel programming) has no
+/// production caller yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct EhtOperation {
     /// 320MHz EHT operation is supported on this chip.
@@ -502,11 +504,11 @@ pub(super) const EHT_CAP_8922AE_INPUTS: EhtCapInputs = EhtCapInputs {
 //
 // The EHT side of station ownership for 8922A: the advertised
 // capability plus the per-station EHT TX parameters that program
-// the TXWD_INFO EHT fields. This is the facet the future 8922A
-// station owner composes once admission exists (chip row); it does
-// NOT do admission, DMA control, or the firmware/RF/power profile,
-// and it has no production constructor caller yet — the same
-// implemented-but-not-advertised posture as step 1. Fail-closed
+// the TXWD_INFO EHT fields. This is the facet the 8922A station
+// owner composes (`station_8922a::admit` via
+// `prepared_8922a::admit_station`, which calls
+// `EhtStation::new_8922ae`); it does NOT do admission, DMA control,
+// or the firmware/RF/power profile itself. Fail-closed
 // defaults: TX EHT overrides off, so a facet that has negotiated
 // nothing programs no EHT TX override (info dwords (0, 0)).
 

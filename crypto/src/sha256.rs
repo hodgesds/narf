@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+use core::fmt;
+
 /// SHA-256 Constants (K)
 /// Reference: <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf#page=11> (Section 4.2.2)
 const K: [u32; 64] = [
@@ -67,12 +69,27 @@ fn sigma1_small(x: u32) -> u32 {
 }
 
 /// SHA-256 State
-#[derive(Debug)]
 pub struct Sha256 {
     h: [u32; 8],
     block: [u8; 64],
     block_len: usize,
     total_len: u64,
+}
+
+/// SEC-C2 (#1551): the internal `block` holds in-flight message
+/// bytes and `h` holds key-adjacent intermediate state (HMAC pads
+/// flow through here) — `Debug` is hand-written and redacts them;
+/// only the public lengths print. The derived `Debug` printed
+/// all four fields.
+impl fmt::Debug for Sha256 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sha256")
+            .field("h", &"<redacted>")
+            .field("block", &"<redacted>")
+            .field("block_len", &self.block_len)
+            .field("total_len", &self.total_len)
+            .finish()
+    }
 }
 
 impl Default for Sha256 {

@@ -738,7 +738,7 @@ mod tests {
         }
 
         fn bar_slot(off: u64) -> Option<usize> {
-            if off < POS + SRIOV_BAR_OFF || off >= POS + SRIOV_BAR_OFF + 24 {
+            if !(POS + SRIOV_BAR_OFF..POS + SRIOV_BAR_OFF + 24).contains(&off) {
                 return None;
             }
             Some(((off - POS - SRIOV_BAR_OFF) / 4) as usize)

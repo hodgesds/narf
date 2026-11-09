@@ -4,28 +4,33 @@
 //! had no production provider: the only SMU temperature surface was a
 //! decode on a metrics-table snapshot (`amdgpu_smu::parse_metrics`,
 //! exercised only from tests), with no live handle and no provider
-//! registration. The discrete telemetry owners close that gap — each
+//! registration. The telemetry owners close that gap — each
 //! refreshes PMFW metrics on a one-second cadence through the retained
 //! SMU owner and publishes the last sample (`amdgpu_navi22_power` for
-//! SMU11/Navi22, `amdgpu_navi48_power` for SMU14/Navi48, the same
-//! cached table Linux serves sysfs reads from). This module reads the
-//! last published **edge** temperature from those owners and registers
-//! it as the power service's `gpu_temp_mc` provider.
+//! SMU11/Navi22, `amdgpu_navi48_power` for SMU14/Navi48,
+//! `amdgpu_smu_apu_telemetry` for SMU 12/13 Renoir/Phoenix APUs, the
+//! same cached table Linux serves sysfs reads from). This module reads
+//! the last published **edge** temperature from those owners and
+//! registers it as the power service's `gpu_temp_mc` provider.
 //!
 //! Edge (`temp1`, `METRICS_TEMPERATURE_EDGE`) is the package sensor
 //! the snapshot field is documented for — the same choice the hwmon
 //! surface makes for `temp1_input`; hotspot (`temp2`, junction) is
 //! the thermal-trip sensor, not the package temperature. The value
-//! flows through unchanged: the telemetry `Metrics` already carry
-//! milli-degrees Celsius, so no rescaling happens here.
+//! flows through unchanged: the discrete telemetry `Metrics` already
+//! carry milli-degrees Celsius, so no rescaling happens here; the
+//! APU sample arrives in centi-Celsius and its
+//! `edge_temperature_milli_c()` accessor converts (centi-C × 10).
 //!
-//! A machine with neither discrete owner publishing a sample yields
+//! A machine with no telemetry owner publishing a sample yields
 //! `None` — the field stays unknown rather than reporting a
-//! fabricated zero (the hwmon class rule). That includes APU-only
-//! machines (Renoir/Phoenix, SMU 12/13): the v13.0.4 metrics decode
-//! exists but the DMA transfer handshake that would refresh it is
-//! unwired (`amdgpu_smu.rs`), so there is still no live APU source;
-//! wiring an APU telemetry owner is the follow-up, not this lane.
+//! fabricated zero (the hwmon class rule). That still includes
+//! APU-only machines (Renoir/Phoenix, SMU 12/13) until the APU owner
+//! is attached: the owner exists (`amdgpu_smu_apu_telemetry`) and
+//! this module already reads its last published sample, but no APU
+//! platform singleton exists to retain the owner and spawn its 1 s
+//! monitor, so no live APU sample is published yet; the attach is
+//! the remaining #1698 remainder.
 
 use alloc::sync::Arc;
 
@@ -34,6 +39,7 @@ use narf_power::service::{register_state_providers, StateProviders};
 
 use crate::amdgpu_navi22_power::Snapshot as Navi22Snapshot;
 use crate::amdgpu_navi48_power::Snapshot as Navi48Snapshot;
+use crate::amdgpu_smu_apu_telemetry::ApuSnapshot;
 
 /// Edge temperature in milli-degrees Celsius from one generation's
 /// last published snapshot. `None` when the owner never published,
@@ -53,25 +59,37 @@ fn edge_from_navi48(snapshot: Option<Navi48Snapshot>) -> Option<i32> {
         .map(|t| t.metrics.edge_milli)
 }
 
-/// First live edge reading across the discrete telemetry owners, in
-/// milli-degrees Celsius. Navi22 is consulted first, then Navi48; a
-/// snapshot without telemetry does not shadow a live reading from
-/// the other generation. `None` when neither owner has a sample.
+/// Edge temperature in milli-degrees Celsius from the APU owner's
+/// last published snapshot. `None` when the owner never published,
+/// or its last sample is absent (owner started, no refresh yet).
+fn edge_from_apu(snapshot: Option<ApuSnapshot>) -> Option<i32> {
+    snapshot.and_then(|s| s.edge_temperature_milli_c())
+}
+
+/// First live edge reading across the telemetry owners, in
+/// milli-degrees Celsius. Navi22 is consulted first, then Navi48,
+/// then the APU owner; a snapshot without telemetry does not shadow
+/// a live reading from another owner. `None` when no owner has a
+/// sample.
 pub(crate) fn gpu_temp_mc_from(
     navi22: Option<Navi22Snapshot>,
     navi48: Option<Navi48Snapshot>,
+    apu: Option<ApuSnapshot>,
 ) -> Option<i32> {
-    edge_from_navi22(navi22).or_else(|| edge_from_navi48(navi48))
+    edge_from_navi22(navi22)
+        .or_else(|| edge_from_navi48(navi48))
+        .or_else(|| edge_from_apu(apu))
 }
 
 /// Current GPU package temperature in milli-degrees Celsius, read
-/// live from the last published discrete telemetry sample: the
-/// Navi22 (SMU11) or Navi48 (SMU14) owner's edge temperature.
-/// `None` when no discrete owner has published a sample.
+/// live from the last published telemetry sample: the Navi22 (SMU11),
+/// Navi48 (SMU14), or APU (SMU 12/13) owner's edge temperature.
+/// `None` when no owner has published a sample.
 pub fn gpu_temp_mc() -> Option<i32> {
     gpu_temp_mc_from(
         crate::amdgpu_navi22_power::snapshot(),
         crate::amdgpu_navi48_power::snapshot(),
+        crate::amdgpu_smu_apu_telemetry::snapshot(),
     )
 }
 

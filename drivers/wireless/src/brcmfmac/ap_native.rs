@@ -158,6 +158,14 @@ pub(crate) enum Scope {
     /// `qtxpower`, so this scope leaves the primary's device-wide event
     /// mask (it only adds the AP SME bits) and PHY modes untouched.
     Secondary {
+        /// The secondary interface's firmware indices (`ifp->ifidx`,
+        /// `ifp->bsscfgidx`): the pair a firmware event for this BSS
+        /// carries. Linux `fweh.c` dispatches by `bsscfgidx` to the
+        /// owning `ifp`, so the session's events already arrive
+        /// demuxed to this vif; the transition gate admits exactly
+        /// this pair (`ap_wire::event_transition`).
+        ifidx: u8,
+        bsscfgidx: u8,
         /// `BRCMF_C_DOWN` + `apsta 0` before `SET_INFRA`: Linux issues
         /// them for an AP vif only when `ifp->ifidx == 0` or the firmware
         /// has neither `BRCMF_FEAT_RSDB` nor `BRCMF_FEAT_MCHAN`.
@@ -177,6 +185,9 @@ pub(crate) enum Scope {
     /// (`brcmf_fil_bss_enable_le`), and stopped by `bss` disable
     /// (`brcmf_cfg80211_stop_ap` non-AP branch).
     Go {
+        /// The GO connection bsscfg's firmware interface index
+        /// (`ifp->ifidx`).
+        ifidx: u8,
         /// The GO connection bsscfg's firmware index (`ifp->bsscfgidx`).
         bsscfgidx: u8,
     },
@@ -194,10 +205,25 @@ impl Scope {
         features: super::vif_wire::Features,
         other_ap: bool,
         other_secondary_active: bool,
+        ifidx: u8,
+        bsscfgidx: u8,
     ) -> Self {
         Self::Secondary {
+            ifidx,
+            bsscfgidx,
             down_apsta: !features.mchan && !other_ap,
             mbss: features.mbss && !other_secondary_active,
+        }
+    }
+    /// The (ifidx, bsscfgidx) pair this scope's firmware events carry:
+    /// (0, 0) for the primary, the vif's own pair otherwise.
+    pub(crate) fn indices(self) -> (u8, u8) {
+        match self {
+            Self::Primary => (0, 0),
+            Self::Secondary {
+                ifidx, bsscfgidx, ..
+            } => (ifidx, bsscfgidx),
+            Self::Go { ifidx, bsscfgidx } => (ifidx, bsscfgidx),
         }
     }
     /// Whether this scope writes (and therefore must save and restore) the
@@ -218,7 +244,7 @@ impl Scope {
     /// The P2P GO scope's bsscfg index.
     pub(super) fn go(self) -> Option<u8> {
         match self {
-            Self::Go { bsscfgidx } => Some(bsscfgidx),
+            Self::Go { bsscfgidx, .. } => Some(bsscfgidx),
             _ => None,
         }
     }
@@ -547,7 +573,9 @@ pub(super) async fn program<R: Fullmac>(
     set(runtime, &guard, ap_wire::SET_DTIM, plan.config.dtim_period).await?;
     let (down_apsta, mbss) = match scope {
         Scope::Primary => (true, false),
-        Scope::Secondary { down_apsta, mbss } => (down_apsta, mbss),
+        Scope::Secondary {
+            down_apsta, mbss, ..
+        } => (down_apsta, mbss),
         Scope::Go { .. } => (false, false),
     };
     let go = scope.go();

@@ -1192,24 +1192,18 @@ fn enter_absolute_mode_v3_pinnacle<T: AlpsTransport>(t: &mut T) -> bool {
         if !write_current_reg(t, table, reg | 0x01) {
             return None;
         }
-        if read_reg(t, table, addr_command, 0x0144).is_none() {
-            return None;
-        }
+        read_reg(t, table, addr_command, 0x0144)?;
         if !write_current_reg(t, table, 0x04) {
             return None;
         }
-        if read_reg(t, table, addr_command, 0x0159).is_none() {
-            return None;
-        }
+        read_reg(t, table, addr_command, 0x0159)?;
         if !write_current_reg(t, table, 0x03) {
             return None;
         }
         if !write_reg(t, table, addr_command, 0x0163, 0x03) {
             return None;
         }
-        if read_reg(t, table, addr_command, 0x0162).is_none() {
-            return None;
-        }
+        read_reg(t, table, addr_command, 0x0162)?;
         if !write_reg(t, table, addr_command, 0x0162, 0x04) {
             return None;
         }
@@ -1242,9 +1236,7 @@ fn enter_absolute_mode_v3_rushmore<T: AlpsTransport>(t: &mut T) -> bool {
         return false;
     }
     let ok = (|| {
-        if read_reg(t, table, addr_command, 0xc2d9).is_none() {
-            return None;
-        }
+        read_reg(t, table, addr_command, 0xc2d9)?;
         if !write_reg(t, table, addr_command, 0xc2cb, 0x00) {
             return None;
         }
@@ -1350,9 +1342,7 @@ fn enter_absolute_mode_v7<T: AlpsTransport>(t: &mut T) -> bool {
         return false;
     }
     let ok = (|| {
-        if read_reg(t, table, addr_command, 0xc2d9).is_none() {
-            return None;
-        }
+        read_reg(t, table, addr_command, 0xc2d9)?;
         let _ = v3_v7_resolution(
             t,
             table,
@@ -2160,8 +2150,8 @@ impl AlpsDecoder {
         if p[1] == 0x7f && p[2] == 0x7f && p[4] == 0x7f {
             return AlpsDecode::none();
         }
-        let x = ((((p[0] & 0x20) << 2) | (p[1] & 0x7f)) as u8) as i8;
-        let y = ((((p[0] & 0x10) << 3) | (p[2] & 0x7f)) as u8) as i8;
+        let x = (((p[0] & 0x20) << 2) | (p[1] & 0x7f)) as i8;
+        let y = (((p[0] & 0x10) << 3) | (p[2] & 0x7f)) as i8;
         let z = (p[4] & 0x7f) as i32;
         let left = p[3] & 0x01 != 0;
         let right = p[3] & 0x02 != 0;
@@ -2219,9 +2209,11 @@ impl AlpsDecoder {
         let offset = (2 * self.multi_packet) as usize;
         self.multi_data[offset] = p[6];
         self.multi_data[offset + 1] = p[7];
-        let mut f = AlpsFields::default();
-        f.left = p[4] & 0x01 != 0;
-        f.right = p[4] & 0x02 != 0;
+        let mut f = AlpsFields {
+            left: p[4] & 0x01 != 0,
+            right: p[4] & 0x02 != 0,
+            ..Default::default()
+        };
         f.st.x = (((p[1] & 0x7f) as i32) << 4)
             | (((p[3] & 0x30) as i32) >> 2)
             | (((p[0] & 0x30) as i32) >> 4);
@@ -2473,7 +2465,7 @@ impl AlpsDecoder {
             Ss4PacketId::One => {
                 f.mt[0].x = ss4_1f_x(p);
                 f.mt[0].y = ss4_1f_y(p);
-                f.pressure = ((ss4_1f_z(p) * 2) & 0x7f) as i32;
+                f.pressure = (ss4_1f_z(p) * 2) & 0x7f;
                 // A button hold reports x, y and pressure of 0
                 // — claim zero contacts so the cursor does not
                 // jump when a touch is released under a held
@@ -2739,11 +2731,11 @@ fn ss4_is_5f_detected(p: &[u8; 6]) -> bool {
 }
 
 fn ss4_ts_x(p: &[u8; 6]) -> i32 {
-    ((((p[0] & 0x01) << 7) | (p[1] & 0x7F)) as u8) as i8 as i32
+    (((p[0] & 0x01) << 7) | (p[1] & 0x7F)) as i8 as i32
 }
 
 fn ss4_ts_y(p: &[u8; 6]) -> i32 {
-    -(((((p[3] & 0x01) << 7) | (p[2] & 0x7F)) as u8) as i8 as i32)
+    -((((p[3] & 0x01) << 7) | (p[2] & 0x7F)) as i8 as i32)
 }
 
 fn ss4_ts_z(p: &[u8; 6]) -> i32 {

@@ -253,6 +253,8 @@ fn smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts() -> TestResul
             mac_id: 0,
             rssi: 150,
             cfo: None,
+            evm: 0,
+            class: PpduClass::Cck,
         })))
     {
         return TestResult::Fail("valid PPDU status did not yield RSSI_AVG");
@@ -305,6 +307,8 @@ fn smoke_rtw89_rx_ppdu_status_yields_rssi_only_when_linux_accepts() -> TestResul
             mac_id: 3,
             rssi: 90,
             cfo: None,
+            evm: 0,
+            class: PpduClass::Cck,
         })))
     {
         return TestResult::Fail("PPDU status MAC ID not taken from RXD dword5");
@@ -336,6 +340,8 @@ fn smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux() -> TestResult {
             mac_id: 0,
             rssi: 120,
             cfo: Some(-3),
+            evm: 0,
+            class: PpduClass::Ofdm,
         })))
     {
         return TestResult::Fail("IE01 FD_CFO not sign-extended from S(12,2)");
@@ -347,6 +353,8 @@ fn smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux() -> TestResult {
             mac_id: 0,
             rssi: 120,
             cfo: None,
+            evm: 0,
+            class: PpduClass::Cck,
         })))
     {
         return TestResult::Fail("CCK PPDU produced a CFO sample");
@@ -356,6 +364,79 @@ fn smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_rx_ppdu_status_ie01_cfo_matches_linux
+);
+fn smoke_rtw89_rx_ppdu_class_follows_rate_mode_and_ofdm6() -> TestResult {
+    // txrx.h `rtw89_get_data_rate_mode` + phy.c `sts_instance_add`:
+    // NON_HT below OFDM6 -> CCK, NON_HT at/above OFDM6 -> OFDM, any
+    // other mode -> non-legacy.
+    for (rate, class) in [
+        (0, PpduClass::Cck),
+        (3, PpduClass::Cck),
+        (4, PpduClass::Ofdm),
+        (11, PpduClass::Ofdm),
+        (0x80, PpduClass::NonLegacy),
+        (0x8f, PpduClass::NonLegacy),
+        (0x100, PpduClass::NonLegacy),
+        (0x109, PpduClass::NonLegacy),
+        (0x180, PpduClass::NonLegacy),
+        (0x18b, PpduClass::NonLegacy),
+    ] {
+        if ppdu_class(rate) != class {
+            return TestResult::Fail("PPDU class differs from the rate-mode split");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_rx_ppdu_class_follows_rate_mode_and_ofdm6
+);
+fn smoke_rtw89_rx_ppdu_status_ie01_evm_matches_linux() -> TestResult {
+    // One IE01 (32 bytes) carrying `ofdm.evm_min` 0x2a in w2 [23:16].
+    let mut body = vec![0u8; 24];
+    body[0..4].copy_from_slice(&1u32.to_le_bytes());
+    body[4..8].copy_from_slice(&(1u32 << 16).to_le_bytes());
+    let w0 = 11 | (1 << 7) | (5 << 8) | (120 << 24);
+    let mut status = vec![0u8; 40];
+    status[0..4].copy_from_slice(&(w0 as u32).to_le_bytes());
+    status[8..12].copy_from_slice(&1u32.to_le_bytes());
+    status[12..16].copy_from_slice(&((0xffdu32) << 8).to_le_bytes());
+    status[16..20].copy_from_slice(&(0x2au32 << 16).to_le_bytes());
+    body.extend_from_slice(&status);
+    let mut ofdm = ppdu_packet(&body, true, 0);
+    let d1 = 4u32 << 16; // RTW89_HW_RATE_OFDM6
+    ofdm[8..12].copy_from_slice(&d1.to_le_bytes());
+    let mut assembler = Assembler::default();
+    if assembler.segment(&ofdm, false)
+        != Ok(Some(Event::PhyStatus(PhyStatus {
+            mac_id: 0,
+            rssi: 120,
+            cfo: Some(-3),
+            evm: 0x2a,
+            class: PpduClass::Ofdm,
+        })))
+    {
+        return TestResult::Fail("IE01 evm_min not taken from w2 GENMASK(23,16)");
+    }
+    // CCK PPDUs carry no EVM sample (rate below RTW89_HW_RATE_OFDM6):
+    // Linux leaves `ofdm.evm_min` zeroed.
+    let cck = ppdu_packet(&body, true, 0);
+    if assembler.segment(&cck, false)
+        != Ok(Some(Event::PhyStatus(PhyStatus {
+            mac_id: 0,
+            rssi: 120,
+            cfo: None,
+            evm: 0,
+            class: PpduClass::Cck,
+        })))
+    {
+        return TestResult::Fail("CCK PPDU produced an EVM sample");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_rx_ppdu_status_ie01_evm_matches_linux
 );
 fn smoke_rtw8852c_rx_ppdu_status_ie01_takes_premb_cfo() -> TestResult {
     // IE01 w1: FD_CFO [19:8] = -3, PREMB_CFO [31:20] = -5 (S(12,2)).
@@ -372,8 +453,8 @@ fn smoke_rtw8852c_rx_ppdu_status_ie01_takes_premb_cfo() -> TestResult {
     ofdm[8..12].copy_from_slice(&(4u32 << 16).to_le_bytes()); // OFDM6
     let descriptor = Descriptor::parse(&ofdm).unwrap();
     // core.c rtw89_core_parse_phy_status_ie01: cfo_src_fd (B) vs not (C).
-    if phy_status(&descriptor, &body, false) != Some((120, Some(-3)))
-        || phy_status(&descriptor, &body, true) != Some((120, Some(-5)))
+    if phy_status(&descriptor, &body, false) != Some((120, Some(-3), 0))
+        || phy_status(&descriptor, &body, true) != Some((120, Some(-5), 0))
     {
         return TestResult::Fail("IE01 CFO source does not follow cfo_src_fd");
     }

@@ -190,11 +190,7 @@ fn smoke_rtw89_be_efuse_ddv_dump() -> TestResult {
     if fake.delays.len() != 1 + 1_000_000 {
         return TestResult::Fail("BE DDV RDY poll must tick 1 µs to a 1 s timeout");
     }
-    if fake
-        .writes
-        .iter()
-        .any(|w| *w == (PMC_DBG_CTRL2 as u64, 1, 0x00))
-    {
+    if fake.writes.contains(&(PMC_DBG_CTRL2 as u64, 1, 0x00)) {
         return TestResult::Fail("BE DDV timeout must leave power-cut enabled");
     }
     TestResult::Pass
@@ -439,6 +435,33 @@ fn smoke_rtw89_be_efuse_readers() -> TestResult {
     {
         return TestResult::Fail("BE secure MSS decode wrong");
     }
+    // Secure: valid index 0 + same MSS → secure, magnitude 0x8000100.
+    // cryp_sel 0xF07E: form 0x7E palindrome with zero pair at index 0,
+    // idx byte 0xF0 (nibbles XOR to 0xF) → index 0 → 0x8000100.
+    let mut fake = Fake::new();
+    fake.ctrl1_data.push(0xF07E_036C);
+    let sec = match read_secure(&mut fake, false) {
+        Ok(sec) => sec,
+        Err(_) => return TestResult::Fail("BE secure read failed on index 0"),
+    };
+    if !sec.secure_boot
+        || sec.sb_sel_mgn != Some(0x8000100)
+        || sec.mss_dev_type != Some(MssDevType::WinlinInbox)
+        || sec.mss_cust_idx != 25
+        || sec.mss_key_num != 12
+    {
+        return TestResult::Fail("BE secure index-0 decode wrong");
+    }
+    // The Linux-mapped device indices (efuse.c get_mss_dev_type_idx):
+    // raw nibbles 0xC/0xA/0x9/0x6 map to 0/1/2/3, default 0xF stays 0xF.
+    if MssDevType::WinlinInbox.index() != 0
+        || MssDevType::NonlinInboxNonCob.index() != 1
+        || MssDevType::NonlinInboxCob.index() != 2
+        || MssDevType::NonwinInbox.index() != 3
+        || MssDevType::Default.index() != 15
+    {
+        return TestResult::Fail("BE MSS device index is not the Linux mapping");
+    }
     // Secure: valid index but unknown dev type → insecure, yet the
     // magnitude stays set (Linux sets it before the MSS decode).
     let mut fake = Fake::new();
@@ -471,6 +494,8 @@ fn smoke_rtw89_be_factory_read() -> TestResult {
     fake.ctrl1_data.push(0x0020_0000);
     // Thermal dump: 42, unsigned.
     fake.ctrl1_data.push(0x0000_002A);
+    // Secure window: default cryp-sel → secure boot off.
+    fake.ctrl1_data.push(0xFFFF_0000);
     // MAC from PCIe BAR registers (LE per u16).
     fake.set16(MAC_ADDR_PCIE as u64, 0x2211);
     fake.set16((MAC_ADDR_PCIE + 2) as u64, 0x4433);
@@ -490,6 +515,9 @@ fn smoke_rtw89_be_factory_read() -> TestResult {
     }
     if factory.cv != Some(2) || factory.thermal_k != Some(42) {
         return TestResult::Fail("BE factory cut/thermal wrong");
+    }
+    if factory.secure != SecureInfo::disabled() {
+        return TestResult::Fail("BE factory secure state wrong on default cryp-sel");
     }
     TestResult::Pass
 }

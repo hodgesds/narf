@@ -347,8 +347,8 @@ pub fn host_interface_command<B: RegBank>(
         return Err(HicError::ResponseTooBig);
     }
     response[0] = header;
-    for i in 1..total {
-        response[i] = bank.read32(REG_FLEX_MNG + (i as u64) * 4);
+    for (i, slot) in response.iter_mut().enumerate().take(total).skip(1) {
+        *slot = bank.read32(REG_FLEX_MNG + (i as u64) * 4);
     }
     Ok(total)
 }

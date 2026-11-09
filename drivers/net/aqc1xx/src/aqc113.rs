@@ -1152,7 +1152,7 @@ pub(crate) fn read_link_status(regs: &impl RegIo) -> LinkStatus {
 
 // ── Live driver state ───────────────────────────────────────────────
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 use narf_driver_runtime::{
@@ -1216,6 +1216,19 @@ pub struct AqcNic {
     pub fw_version: u32,
     /// Firmware filter capabilities at bring-up.
     pub filter_caps: FilterCaps,
+    /// PCI address this controller was probed at — the per-device
+    /// identity the `CONTROLLERS` dedup and detach paths key on
+    /// (issue #795). Two AQC functions never share a `BusAddr`.
+    pub addr: narf_bus::BusAddr,
+    /// Set by [`aqc113_detach`]; datapath entry points fail fast
+    /// once set, and [`live_controller`] filters the slot out, so a
+    /// detached device's cookie stops resolving while its slot —
+    /// and every other controller's cookie — stays valid.
+    detached: AtomicBool,
+    /// Interface name `publish_netdev_with_context` assigned this
+    /// NIC (`eth%d`); per-device, so a second AQC port's pump and
+    /// adapter report its own name instead of the first port's.
+    ifname: crate::publish::IfName,
     /// Last observed link state (refreshed by the RX pump).
     pub link_up: bool,
     /// Last observed negotiated speed in Mbit/s, when up.
@@ -1245,6 +1258,7 @@ unsafe impl Sync for AqcNic {}
 impl core::fmt::Debug for AqcNic {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AqcNic")
+            .field("addr", &self.addr)
             .field("mac", &self.mac)
             .field("fw_version", &self.fw_version)
             .field("filter_caps", &self.filter_caps)
@@ -1371,6 +1385,9 @@ impl AqcNic {
             filter_caps,
             link_up: link.carrier,
             link_mbps: if link.carrier { Some(link.mbps) } else { None },
+            addr: device.addr,
+            detached: AtomicBool::new(false),
+            ifname: crate::publish::IfName::new(),
             irq_vector: None,
             msix: None,
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
@@ -1413,12 +1430,20 @@ impl AqcNic {
         Ok(v)
     }
 
+    /// This NIC's interface name; empty until probe published it.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
+
     /// Transmit a single Ethernet frame. Polled completion: spins
     /// on the slot's descriptor-DD writeback bit until the NIC
     /// sets it. Frames up to the TX slot buffer (16384 bytes) are
     /// accepted; the chip pads frames < 64 bytes itself.
     pub fn transmit(&self, frame: &[u8], meta: &TxMeta) -> Result<(), NicError> {
         let _ = meta;
+        if self.detached.load(Ordering::Acquire) {
+            return Err(NicError::Other("aqc113 device detached"));
+        }
         if frame.is_empty() || frame.len() > TX_BUF_LEN {
             return Err(NicError::FrameTooLong);
         }
@@ -1476,6 +1501,9 @@ impl AqcNic {
     /// waiting. A completed-but-errored or multi-descriptor frame
     /// is dropped (its descriptor is still refilled).
     pub fn receive_with_meta(&self) -> Option<(alloc::vec::Vec<u8>, RxCsumResult)> {
+        if self.detached.load(Ordering::Acquire) {
+            return None;
+        }
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
@@ -1575,31 +1603,53 @@ pub fn link_sample(status: LinkStatus) -> crate::publish::LinkSample {
     )
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<AqcNic>>> = IrqSafeSpinLock::new(None);
+/// Every probed controller, by probe order. The index is the cookie
+/// the kernel-side stack's send path resolves through
+/// [`aqc113_send_frame`] — the i40e `CONTROLLERS` pattern, so a
+/// second AQC113 on the same machine probes, binds, and carries
+/// traffic instead of being dropped by a singleton slot (issue
+/// #795). The vec never shrinks: detaches mark the device in place
+/// instead of removing its slot, so a live controller's cookie
+/// stays valid for the kernel lifetime.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<AqcNic>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
-/// `dev_alloc_name`). Set once at probe; the device lives as long as
-/// the kernel, so the name is leaked into a `&'static str`.
-static AQC113_IFNAME: crate::publish::IfName = crate::publish::IfName::new();
-
-/// This NIC's interface name; empty until it has registered.
-pub fn aqc113_ifname() -> &'static str {
-    AQC113_IFNAME.get()
+/// The probed controller at `index`, if it is live (probed and not
+/// detached). The index is the cookie probe assigned (see
+/// `CONTROLLERS`); it is stable because the vec never shrinks.
+fn live_controller(index: usize) -> Option<Arc<AqcNic>> {
+    CONTROLLERS
+        .lock()
+        .get(index)
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .cloned()
 }
 
-/// SendFn registered with `narf_net::iface` at probe time. Routes the
-/// kernel-side TCP stack's outbound frames through `AqcNic::transmit`.
-/// The Arc is cloned out rather than holding the IRQ-masking
-/// CONTROLLER lock across `transmit` (same reasoning as e1000).
-fn aqc113_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let ctrl = CONTROLLER.lock().clone().ok_or(())?;
+/// `SendCtxFn` registered with `narf_net::iface` at probe time.
+/// Routes the kernel-side TCP stack's outbound frames through
+/// `AqcNic::transmit`; the cookie is the controller's index in
+/// `CONTROLLERS`. The Arc is cloned out rather than holding the
+/// IRQ-masking `CONTROLLERS` lock across `transmit` (same
+/// reasoning as e1000).
+fn aqc113_send_frame(cookie: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = live_controller(cookie as usize).ok_or(())?;
     ctrl.transmit(frame, &meta).map_err(|_| ())
 }
 
-/// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
-/// returns `Ok(())` when the controller is already brought up.
+/// Probe entry — installed via `bus::register_pci_driver`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    // A second probe of the SAME live function is a no-op success
+    // (the old idempotent behaviour): the bus re-walks devices, and
+    // rebuilding a second `AqcNic` for the same silicon would let two
+    // instances drive one chip's rings. A second FUNCTION binds as a
+    // new instance instead of being dropped (issue #795). A detached
+    // entry does not block a re-probe of its address, so a hot
+    // re-bind after detach can reclaim the function.
+    if CONTROLLERS
+        .lock()
+        .iter()
+        .any(|c| c.addr == device.addr && !c.detached.load(Ordering::Acquire))
+    {
         return Ok(());
     }
     // MEM_SPACE + BUS_MASTER are both required: the chip DMAs the
@@ -1623,10 +1673,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
-    *CONTROLLER.lock() = Some(dev.clone());
+    // Retain before any ring DMA address reaches the device; the
+    // index is this instance's send-path cookie (see `CONTROLLERS`).
+    let index = {
+        let mut g = CONTROLLERS.lock();
+        g.push(dev.clone());
+        g.len() - 1
+    };
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name: alloc::string::String::from("aqc113"),
+        name: alloc::string::String::from(name_for(device.id.device)),
         kind: narf_drivers::BoundKind::Net,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
@@ -1634,12 +1690,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
 
     // Publish to the kernel-side stack (issue #784): a dynamic `eth%d`
-    // name + carrier metadata via the shared helper. The frame-ring
-    // registration below stays.
-    let mac = with_controller(|c| c.mac).unwrap_or([0; 6]);
-    let status = with_controller(|c| c.link_status()).unwrap_or_default();
-    let name = crate::publish::publish_netdev(mac, aqc113_send_frame, link_sample(status));
-    AQC113_IFNAME.set(name);
+    // name + carrier metadata via the shared helper. The send hook
+    // carries this instance's `CONTROLLERS` index as its cookie, so
+    // each port's outbound frames resolve to its own NIC.
+    let mac = dev.mac;
+    let status = dev.link_status();
+    let name = crate::publish::publish_netdev_with_context(
+        mac,
+        index as u64,
+        aqc113_send_frame,
+        link_sample(status),
+    );
+    dev.ifname.set(name);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -1647,7 +1709,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, Aqc113Nic);
+        let _ = narf_net::registry().register(&auth, Aqc113Nic { nic: dev.clone() });
     }
 
     // No pump spawn here: `bring_up` spawned the device's single RX/TX
@@ -1689,7 +1751,7 @@ async fn aqc113_rx_pump(device: Arc<AqcNic>, mut rx_prod: Producer<Frame, RX_RIN
         let sample = link_sample(device.link_status());
         if sample != last_sample {
             last_sample = sample;
-            crate::publish::publish_link(aqc113_ifname(), sample);
+            crate::publish::publish_link(device.ifname(), sample);
         }
         if let Some((pkt, csum)) = device.receive_with_meta() {
             let dma_buf =
@@ -1711,7 +1773,7 @@ async fn aqc113_rx_pump(device: Arc<AqcNic>, mut rx_prod: Producer<Frame, RX_RIN
             // the kernel stack in place. The mirror is non-blocking —
             // a full/closed ring drops its copy, never the stack's
             // packet.
-            let name = aqc113_ifname();
+            let name = device.ifname();
             crate::publish::dispatch_rx(
                 name,
                 &mut frame,
@@ -1747,29 +1809,32 @@ pub fn register_pci_driver() {
     }
 }
 
-/// `true` once `probe` has installed a controller.
+/// Frame-ring / `Interface` adapter for one probed AQC113. The old
+/// zero-sized `Aqc113Nic` resolved every call through the
+/// module-level `CONTROLLER` singleton, so a second AQC113's
+/// interface reported the first port's MAC, link state, and rings
+/// (issue #795). The rings are borrowed from the NIC's own
+/// `rx_ipc_ring` / `tx_ipc_ring` fields. The name always comes from
+/// `AqcNic::ifname()`, which is `""` before probe publishes it.
 #[derive(Debug)]
-pub struct Aqc113Nic;
+pub struct Aqc113Nic {
+    nic: Arc<AqcNic>,
+}
 
 impl narf_net::Interface for Aqc113Nic {
     fn name(&self) -> &str {
-        // The dynamic `eth%d` name once published (issue #784); the
-        // family name before probe gets that far.
-        let n = aqc113_ifname();
-        if n.is_empty() {
-            "aqc113"
-        } else {
-            n
-        }
+        self.nic.ifname()
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        // Probe-time value, gated on detach: a detached device
+        // reports down so the stack stops routing at it.
+        self.nic.link_up && !self.nic.detached.load(Ordering::Acquire)
     }
     fn offloads(&self) -> narf_net::OffloadCapabilities {
         // Stage 2: plain frames only — no checksum offload, no TSO,
@@ -1783,51 +1848,30 @@ impl narf_net::Interface for Aqc113Nic {
         }
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-                if r.is_some() {
-                    // Ring consumer attached: enable the RX mirror
-                    // (e1000's `rx_mirror_enabled` moment).
-                    crate::publish::note_rx_mirror_attached(aqc113_ifname());
-                }
-            }
-        });
-        &RING
+        // Ring consumer attached: enable this instance's RX mirror —
+        // the old take-into-static set the attach note at this
+        // moment — and record the attach under this port's own name,
+        // so detach can clear it.
+        crate::publish::note_rx_mirror_attached(self.nic.ifname());
+        &self.nic.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.nic.tx_ipc_ring
     }
 }
 
 impl crate::HwNic for Aqc113Nic {
     fn name(&self) -> &'static str {
-        let n = aqc113_ifname();
-        if n.is_empty() {
-            "aqc113"
-        } else {
-            n
-        }
+        self.nic.ifname()
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.nic.mac
     }
     fn mtu(&self) -> u32 {
         1500
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.link_up).unwrap_or(false)
+        self.nic.link_up && !self.nic.detached.load(Ordering::Acquire)
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::MarvellAqc113
@@ -1846,20 +1890,72 @@ impl crate::HwNic for Aqc113Nic {
     }
 }
 
-pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+/// Detach the bound aqc113 device at `index`, if any: device half
+/// (set the datapath gate, so `transmit` / `receive_with_meta`
+/// fail fast and the parked pumps stop touching the rings), then
+/// the registry half the net spec §3 obliges — publish link down,
+/// clear the RX-mirror attach note for the interface name (names
+/// are lowest-free-allocated and reused), and unregister the
+/// interface. Idempotent: an out-of-range index or an
+/// already-detached device does nothing. The async pumps are not
+/// joined (they hold `Arc<AqcNic>` clones), but every datapath
+/// entry point fails fast once detached, so a parked pump can no
+/// longer touch the device. The `CONTROLLERS` slot is kept so other
+/// controllers' cookies stay valid. (No `device_pm` withdrawal:
+/// this family never registered `DevicePmOps` — it has no
+/// suspend/resume path yet.)
+pub fn aqc113_detach(index: usize) {
+    let Some(device) = CONTROLLERS.lock().get(index).cloned() else {
+        return;
+    };
+    if device.detached.load(Ordering::Acquire) {
+        return;
+    }
+    device.detached.store(true, Ordering::Release);
+    let name = device.ifname();
+    crate::publish::publish_link(name, crate::publish::LinkSample::DOWN);
+    crate::publish::clear_rx_mirror_attached(name);
+    let _ = narf_net::iface::unregister(name);
 }
 
-/// Test-side accessor: run `f` against the probed controller.
-pub fn with_controller<R>(f: impl FnOnce(&AqcNic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|a| f(a))
+/// `true` once at least one controller has been probed and not
+/// detached.
+pub fn is_probed() -> bool {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .any(|c| !c.detached.load(Ordering::Acquire))
+}
+
+/// Number of live controllers. The index of a controller in
+/// `CONTROLLERS` is its send-path cookie; the vec never shrinks, so
+/// a live controller's cookie is stable for the kernel lifetime.
+pub fn instance_count() -> usize {
+    CONTROLLERS
+        .lock()
+        .iter()
+        .filter(|c| !c.detached.load(Ordering::Acquire))
+        .count()
+}
+
+/// Clone the controller handle at `index`, holding `CONTROLLERS`
+/// only for the refcount bump. Returns `None` for an out-of-range
+/// index or a detached device.
+pub fn controller(index: usize) -> Option<Arc<AqcNic>> {
+    live_controller(index)
+}
+
+/// Test-side accessor: run `f` against the live probed controller
+/// at `index` (i40e shape).
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&AqcNic) -> R) -> Option<R> {
+    live_controller(index).map(|a| f(&a))
 }
 
 /// Mutable accessor — used by tests that want to switch on MSI-X
 /// after probe.
-pub fn with_controller_mut<R>(f: impl FnOnce(&mut AqcNic) -> R) -> Option<R> {
-    CONTROLLER
+pub fn with_controller_mut<R>(index: usize, f: impl FnOnce(&mut AqcNic) -> R) -> Option<R> {
+    CONTROLLERS
         .lock()
-        .as_mut()
+        .get_mut(index)
         .map(|a| f(Arc::get_mut(a).expect("AqcNic static has multiple owners")))
 }

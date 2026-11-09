@@ -12,7 +12,6 @@
 //! constants beyond the in-tree WMI band-cap bits (`wmi.rs`).
 
 use alloc::vec;
-use core::future::Future;
 
 use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 
@@ -88,9 +87,7 @@ impl CeIrq for FakeIrq {
     fn take_pending(&self) -> u32 {
         0
     }
-    fn wait(&self, _ms: u32) -> impl Future<Output = ()> + Send {
-        async {}
-    }
+    async fn wait(&self, _ms: u32) {}
 }
 
 impl super::super::runtime::DpIrq for FakeIrq {
@@ -104,16 +101,14 @@ impl super::super::runtime::DpIrq for FakeIrq {
 struct FakeQmi;
 
 impl QmiFw for FakeQmi {
-    fn firmware_start(
+    async fn firmware_start(
         &mut self,
         _mode: u32,
         _shadow_reg_v2: &[u32],
-    ) -> impl Future<Output = Result<(), WlfwError>> {
-        async { Ok(()) }
+    ) -> Result<(), WlfwError> {
+        Ok(())
     }
-    fn firmware_stop(&mut self) -> impl Future<Output = ()> {
-        async {}
-    }
+    async fn firmware_stop(&mut self) {}
 }
 
 /// A ready IPQ6018-shaped core: CE allocated with no ring MSI
@@ -266,7 +261,7 @@ fn smoke_ath11k_ahb_netdev_dispatch() -> TestResult {
         MacConfig::wcn6855(),
         None,
     );
-    let cookie = (shared.radio_id << 2) | 0;
+    let cookie = shared.radio_id << 2;
 
     // Before registration nothing routes to this cookie.
     kt_assert_eq!(

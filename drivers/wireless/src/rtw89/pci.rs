@@ -214,6 +214,26 @@ unsafe fn bring_up_registers(
     // from this register for every generation (`core.c:7134`).
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let chip_version = unsafe { mac::read_chip_version(&mmio_bar2) };
+    // 8922A MAC pre-init (chip-row remainder): the MAC
+    // power-state reset + full `pwr_on_func` tail, in Linux
+    // `rtw89_chip_info_setup` order (`core.c:7388..7409`:
+    // chip-ver read, `rtw89_mac_pwr_on`, then the EFUSE read
+    // below). The core chip version is read here too and retained
+    // on the owner once constructed (`record_chip_ver`). A
+    // refused pre-init aborts the probe — Linux behaves the same
+    // (a failed power-on aborts the probe; no blind retry).
+    let mut chip_ver_8922a = None;
+    if is_8922a {
+        let mut pre_init_regs = super::prepared_8922a::MmioRegs(&mmio_bar2);
+        super::mac_pre_init_8922a::reset_pwr_state(&mut pre_init_regs)
+            .map_err(|_| ProbeError::PowerOn(mac::MacError::Timeout))?;
+        super::mac_pre_init_8922a::power_on_tail(&mut pre_init_regs, true, chip_version)
+            .map_err(|_| ProbeError::PowerOn(mac::MacError::Timeout))?;
+        chip_ver_8922a = Some(
+            super::mac_pre_init_8922a::read_chip_ver(&mut pre_init_regs, chip_version)
+                .map_err(|_| ProbeError::PowerOn(mac::MacError::Timeout))?,
+        );
+    }
     // 8922A reads its factory identity (MAC + RFE + PHY-cap + cut +
     // thermal) through the BE EFUSE protocol; AX chips use the AX map.
     // The factory is retained for the Prepared owner below.
@@ -329,10 +349,14 @@ unsafe fn bring_up_registers(
     // `rtw89_pci_ops_reset`, after the DMA pre-init halves and the
     // MAC reset (`Prepared8922a::program_rings`).
     let be_8922a = match factory_8922a {
-        Some(factory) => Some(IrqSafeSpinLock::new(
-            super::prepared_8922a::Prepared8922a::new(factory, chip_version)
-                .map_err(|_| ProbeError::NoMemory)?,
-        )),
+        Some(factory) => {
+            let mut owner = super::prepared_8922a::Prepared8922a::new(factory, chip_version)
+                .map_err(|_| ProbeError::NoMemory)?;
+            if let Some(ver) = chip_ver_8922a {
+                owner.record_chip_ver(ver);
+            }
+            Some(IrqSafeSpinLock::new(owner))
+        }
         None => None,
     };
     Ok(Rtw89Device {
@@ -638,9 +662,10 @@ impl Rtw89Device {
 
     /// BE H2C submit for a probed 8922A device: move one
     /// caller-framed buffer across CH12. The buffer's DMA is
-    /// retained by the owner until the future C2H completion path
-    /// releases it. FWCMD header framing is the caller's (later
-    /// step).
+    /// retained by the owner, keyed by `framed` (the identity
+    /// `Prepared8922a::frame_h2c` returned when the caller framed
+    /// `buf`), until the C2H completion path releases it on its
+    /// matching ack.
     ///
     /// # Safety
     /// Same live-ring/no-reset contract as [`Self::submit_be_data`]:
@@ -648,17 +673,19 @@ impl Rtw89Device {
     /// running, no reset/removal racing.
     pub(super) unsafe fn submit_be_h2c(
         &self,
+        framed: super::fwcmd_8922a::FramedH2c,
         buf: &[u8],
     ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
         crate::rtw88::pci_park::invoke(&self.cap, || {
             // SAFETY: caller's live initialized ring/no-reset contract.
-            unsafe { self.submit_be_h2c_authorized(buf) }
+            unsafe { self.submit_be_h2c_authorized(framed, buf) }
         })
         .map_err(|_| super::prepared_8922a::Error::Authority)?
     }
 
     unsafe fn submit_be_h2c_authorized(
         &self,
+        framed: super::fwcmd_8922a::FramedH2c,
         buf: &[u8],
     ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
         use super::dma::{TxBd, DEFAULT_TXBD_NUM, TXCH_CH12};
@@ -685,7 +712,7 @@ impl Rtw89Device {
             )
         };
         let prepared = owner.prepare_h2c(bd, dma_buf.dma_addr().raw(), buf.len())?;
-        owner.retain_h2c(dma_buf);
+        owner.retain_h2c(framed, dma_buf);
         ring_dma.sync(
             prepared.slot as usize * core::mem::size_of::<TxBd>(),
             core::mem::size_of::<TxBd>(),

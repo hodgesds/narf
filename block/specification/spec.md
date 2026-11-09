@@ -309,6 +309,27 @@ escape through the block trait.
 reader. Root orchestration registers a successfully mounted mapping as
 `cryptroot`.
 
+`install_luks_passphrase_provider_with_attempts(provider, attempts)` bounds
+retries to 1–5. Only `WrongPassphrase` retries; cancellation, timeout, metadata,
+unsupported format, and resource-limit failures are final. Each passphrase
+buffer is zeroized before another attempt. The original installation function
+retains one-attempt semantics.
+
+`disk_policy::designate_encrypted_root(name, container_uuid, &view)` retains
+all partition, on-medium UUID, uniqueness, ESP, hotplug, and revocation checks.
+It requires the concrete authenticated adapter to wrap the exact registered
+backing Arc; root-rw additionally requires btrfs inside that adapter. In root
+policies, `root=UUID=` selects the **outer LUKS UUID**; an inner UUID alone does
+not authorize probing every encrypted disk.
+`registry::register_encrypted_root(name, parent, view)` registers that concrete
+adapter before named filesystem construction. It refuses name collisions and
+parent replacement, keeps a fresh view registration ID, and delegates writes
+only to the original backing registration's live designation. Whole-disk and
+unrelated partition guards remain read-only. Removing/replacing the designated
+backing device revokes both guards. A failed root mount removes the view.
+`fs_detect::detect_filesystem_sync(&dyn BlockDeviceSync)` offers the same
+read-only probes as the Arc wrapper before adapter registration.
+
 ## 4. Invariants & safety properties
 
 - No byte of I/O data ever lives in `block/` address space; all

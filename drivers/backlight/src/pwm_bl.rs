@@ -723,7 +723,10 @@ mod tests {
         dev.set_brightness(0);
         for op in pwm.ops() {
             match op {
-                Op::Config { polarity, .. } if polarity == Polarity::Inversed => {}
+                Op::Config {
+                    polarity: Polarity::Inversed,
+                    ..
+                } => {}
                 Op::Config { .. } => {
                     return TestResult::Fail("config polarity must be Inversed");
                 }

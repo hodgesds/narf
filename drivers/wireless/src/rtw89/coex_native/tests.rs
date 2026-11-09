@@ -329,16 +329,16 @@ fn smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg() -> TestRes
     let p = Protocol51;
     if p.init(1, 2, 0x13) != Some([0, 12, 0, 1, 10, 0x10, 1, 2, 0x0a, 3, 6, 3, 0, 0])
         || p.init(3, 2, 1) != Some([0, 12, 1, 2, 10, 0x10, 3, 2, 0x04, 1, 6, 3, 0, 0])
+        || p.init(2, 2, 1) != Some([0, 12, 1, 2, 10, 0x12, 2, 2, 0x04, 1, 6, 3, 0, 0])
+        || p.init(5, 2, 1) != Some([0, 12, 1, 2, 10, 0x12, 5, 2, 0x04, 1, 6, 3, 0, 0])
         || p.init(0, 2, 1).is_some()
-        || p.init(2, 2, 1).is_some()
-        || p.init(5, 2, 1).is_some()
         || p.off_policy() != Protocol.off_policy()
     {
         return TestResult::Fail(
             "RTL8851B cxinit/policy encoding differs from rtw8851b_btc_set_rfe",
         );
     }
-    for rfe in [1u8, 3] {
+    for rfe in [1u8, 3, 2, 5] {
         let mut io = Model::new(0);
         let mut owner = Coex::default();
         // SAFETY: inert owned bytes and explicit model qualification.
@@ -361,8 +361,8 @@ fn smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg() -> TestRes
             return TestResult::Fail("RTL8851B PTA/grant state differs from Linux");
         }
     }
-    // The diversity and rfe 0 layouts never touch the device.
-    for rfe in [0u8, 2] {
+    // The rfe 0 layout never touches the device.
+    for rfe in [0u8] {
         let mut io = Model::new(0);
         let mut owner = Coex::default();
         // SAFETY: same inert model.
