@@ -323,23 +323,31 @@ pub unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
     r
 }
 
-/// `accept(fd, *addr, *len)`. Loops over the kernel single-shot
-/// accept until a connection arrives.
+/// `accept(fd, *addr, *len)`. Single-shot: the kernel parks a
+/// blocking accept on WouldBlock and re-executes it in-kernel
+/// (`userspace/src/handlers/compat.inc.rs::accept_common`), so
+/// whatever the kernel returns here is terminal — `>= 0` is the
+/// new fd, `< 0` is `-errno` (bad fd, not a socket, full fd table,
+/// faulting addr, …). There is nothing for libc to retry: a
+/// WouldBlock never reaches us on a blocking socket, and on a
+/// non-blocking socket it arrives as `-EAGAIN`, which POSIX says
+/// to surface at once, not spin on (musl does not retry it).
+///
+/// The previous loop retried on ANY negative return, so a real
+/// error on a blocking fd — or `-EAGAIN` on a non-blocking fd with
+/// no pending connection — spun forever instead of being reported
+/// (#1947; same hang class as #1936, fixed for recvfrom by #1941).
 ///
 /// # Safety
 /// `addr` and `len` may be NULL; if non-null they must point at
 /// writable sockaddr-shaped storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
-    loop {
-        let r = narf_user_runtime::accept(fd, addr as *mut u8, len);
-        if r >= 0 {
-            return r;
-        }
-        // Kernel parked us briefly; retry. The yield happens
-        // kernel-side via the same sleep-deadline path sys_futex
-        // uses.
+    let r = narf_user_runtime::accept(fd, addr as *mut u8, len);
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
     }
+    r
 }
 
 /// `shutdown(fd, how)`.

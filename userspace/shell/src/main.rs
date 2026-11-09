@@ -999,6 +999,16 @@ fn socktest_run(fd: i32) {
     use core::sync::atomic::Ordering;
     SOCKTEST_LISTENING.store(0, Ordering::SeqCst);
     SOCKTEST_RESULT.store(0, Ordering::SeqCst);
+    // #1947: accept() on a bad fd must fail promptly (-EBADF). The
+    // old libc accept looped on ANY negative return, so this call
+    // spun forever instead of reporting the error.
+    // SAFETY: Valid memory or trusted environment
+    let bad = unsafe { libc::accept(-1, core::ptr::null_mut(), core::ptr::null_mut()) };
+    if bad >= 0 {
+        // SAFETY: Valid memory or trusted environment
+        unsafe { write_all(fd, b"socktest: accept(-1) unexpectedly succeeded\n"); }
+        return;
+    }
     // Spawn the listener thread.
     let mut tid: u64 = 0;
     let attr = core::ptr::null::<libc::pthread_attr_t>();
