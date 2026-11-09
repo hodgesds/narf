@@ -203,6 +203,76 @@ fn smoke_input_hotplug_publication() -> TestResult {
 }
 kernel_test_in!("filesystem/input-hotplug", smoke_input_hotplug_publication);
 
+fn smoke_input_sysfs_id_subdir() -> TestResult {
+    use narf_input::evdev::{bus, DeviceCaps, InputId, ROUTER};
+
+    crate::sysfs::populate_input_class();
+    let mut caps = DeviceCaps {
+        name: String::from("id subdir fixture"),
+        id: InputId::new(bus::USB, 0x046d, 0xc31c, 0x0111),
+        ..DeviceCaps::default()
+    };
+    caps.add_key(30);
+    let (id, _node) = ROUTER.register_device(caps);
+    let n = id.0 - 1;
+    let result = (|| {
+        use crate::DirOps;
+        let root = crate::sysfs::get_root();
+        let input = root
+            .get_child("devices")?
+            .get_child("platform")?
+            .get_child("narf-input")?
+            .get_child(&alloc::format!("input{}", n))?;
+        // `id/` is a real child directory, not a slash-named attr: the
+        // attr map of inputN holds no "id/…" entry, while get_child
+        // resolves the directory itself.
+        if input.attr_show("id/bustype").is_some() {
+            return None;
+        }
+        let id_dir = input.get_child("id")?;
+        // Linux "%04x\n" form (drivers/input/input.c INPUT_DEV_ID_ATTR),
+        // not the "%x" form of the uevent PRODUCT= line.
+        if id_dir.attr_show("bustype")? != "0003\n"
+            || id_dir.attr_show("vendor")? != "046d\n"
+            || id_dir.attr_show("product")? != "c31c\n"
+            || id_dir.attr_show("version")? != "0111\n"
+        {
+            return None;
+        }
+        // The uevent PRODUCT= line stays byte-identical ("%x" form).
+        let uevent = input.attr_show("uevent")?;
+        if !uevent.starts_with("PRODUCT=3/46d/c31c/111\n") {
+            return None;
+        }
+        // Walkable through the VFS: lookup_dir resolves `id/` and the
+        // directory enumerates all four files.
+        let dir = crate::sysfs::SysKobjDir { kobj: input };
+        let id_vfs = dir.lookup_dir("id")?;
+        let names: Vec<String> = id_vfs
+            .enumerate(0, 16)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for want in ["bustype", "vendor", "product", "version"] {
+            if !names.iter().any(|name| name == want) {
+                return None;
+            }
+        }
+        // Each id file also resolves as a VFS file.
+        if id_vfs.lookup("vendor").is_none() {
+            return None;
+        }
+        Some(())
+    })();
+    ROUTER.unregister_device(id);
+    if result.is_some() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("inputN id/ subdirectory missing, misformatted, or not walkable")
+    }
+}
+kernel_test_in!("filesystem/input-id-subdir", smoke_input_sysfs_id_subdir);
+
 // ── Minimal fake block device for tests ───────────────────────────────
 
 use alloc::vec;
