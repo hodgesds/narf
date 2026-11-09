@@ -338,7 +338,11 @@ fn smoke_i40e_phy_abilities_parse() -> TestResult {
         return TestResult::Fail("get_phy_abilities response length wrong");
     }
     let mut buf = [0u8; 0x218];
-    let bitmap: u32 = (1u32 << 0x07) | (1u32 << 0x14) | (1u32 << 0x21);
+    // 25GBASE_SR (0x21) is NOT a bitmap bit: the firmware bitmap is
+    // LE32, so bit 33 cannot be set — Linux carries 25G support in
+    // `phy_type_ext` (`I40E_AQ_PHY_TYPE_EXT_25G_SR = 0x04`, set at
+    // buf[13] below), and `supports()` reads false past bit 31.
+    let bitmap: u32 = (1u32 << 0x07) | (1u32 << 0x14);
     buf[0..4].copy_from_slice(&bitmap.to_le_bytes());
     buf[4] = 1 << 3; // I40E_LINK_SPEED_10GB
     buf[5] = 0x03; // PAUSE_TX | PAUSE_RX
@@ -366,11 +370,14 @@ fn smoke_i40e_phy_abilities_parse() -> TestResult {
     {
         return TestResult::Fail("phy abilities module fields decoded wrong");
     }
-    if !abilities.supports(I40ePhyType::Sfi)
-        || !abilities.supports(I40ePhyType::Base10GSr)
-        || !abilities.supports(I40ePhyType::Base25GSr)
-    {
+    if !abilities.supports(I40ePhyType::Sfi) || !abilities.supports(I40ePhyType::Base10GSr) {
         return TestResult::Fail("supported PHY types did not read back");
+    }
+    // 25GBASE_SR reads false from the bitmap by design (bit 0x21 is
+    // past the LE32); its support is signaled by `phy_type_ext`
+    // (asserted above as 0x04), not by a bitmap bit.
+    if abilities.supports(I40ePhyType::Base25GSr) {
+        return TestResult::Fail("25G PHY type read from the u32 bitmap");
     }
     if abilities.supports(I40ePhyType::Base10GLr)
         || abilities.supports(I40ePhyType::Unknown(0x10))
