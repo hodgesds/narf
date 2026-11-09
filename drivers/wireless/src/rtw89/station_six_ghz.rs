@@ -74,7 +74,7 @@ fn constraint(raw: i8) -> i8 {
 /// and regulatory-client EIRP and PSD limits (PSD + `10 * log10(20)`).
 /// `Ok(None)`: no valid default-category TPE. `Err`: an 80+80MHz AP channel
 /// (not rearranged here) or a primary outside `ap`.
-pub(super) fn tpe(ies: &[u8], ap: &six_ghz::SixGhzChannel) -> Result<Option<i8>, ()> {
+pub(in crate::rtw89) fn tpe(ies: &[u8], ap: &six_ghz::SixGhzChannel) -> Result<Option<i8>, ()> {
     let have: u32 = match ap.width {
         _ if ap.discontiguous => return Err(()),
         Width::Twenty => 1,

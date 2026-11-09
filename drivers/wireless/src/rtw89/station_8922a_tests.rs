@@ -5,6 +5,8 @@ use super::ppe_tests::{IES_E1_EHT_PPE_NSS2, IES_H1_HE_PPE_NSS1};
 use super::ra_mask::{HeCaps, HtCaps, VhtCaps};
 use super::station_8922a::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_wireless::association::{phy::Width, six_ghz::SixGhzChannel};
+use narf_wireless::reg::PowerType6Ghz;
 
 fn factory() -> BeFactory {
     BeFactory {
@@ -40,6 +42,7 @@ fn base_req() -> Request<'static> {
         has_he: true,
         mgq_rpt_en: false,
         p2p: false,
+        six_ghz: None,
     }
 }
 
@@ -179,13 +182,57 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
     };
     let mut pool = MacIdPool::new();
     let mut req = base_req();
-    let cases: [(Request<'_>, Error); 8] = [
+    let lpi = SixGhzAdmission {
+        power: PowerType6Ghz::Lpi,
+        tpe_dbm: None,
+    };
+    let cases: [(Request, Error); 13] = [
         (
             Request {
                 band: Band::Ghz6,
                 ..req
             },
             Error::SixGhzPowerMissing,
+        ),
+        (
+            Request {
+                band: Band::Ghz6,
+                width_mhz: 40,
+                six_ghz: Some(lpi),
+                ..req
+            },
+            Error::SixGhzWidthUnsupported,
+        ),
+        (
+            Request {
+                band: Band::Ghz6,
+                width_mhz: 20,
+                six_ghz: Some(SixGhzAdmission {
+                    power: PowerType6Ghz::Lpi,
+                    tpe_dbm: Some(20),
+                }),
+                ..req
+            },
+            Error::SixGhzTpeNotStandard,
+        ),
+        (
+            Request {
+                band: Band::Ghz6,
+                width_mhz: 20,
+                six_ghz: Some(SixGhzAdmission {
+                    power: PowerType6Ghz::Sp,
+                    tpe_dbm: Some(-19),
+                }),
+                ..req
+            },
+            Error::SixGhzTpeBelowMinimum,
+        ),
+        (
+            Request {
+                six_ghz: Some(lpi),
+                ..req
+            },
+            Error::SixGhzContextUnexpected,
         ),
         (
             Request {
@@ -206,6 +253,13 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
         (Request { primary: 0, ..req }, Error::BadPrimary),
         (Request { aid: 0x1000, ..req }, Error::AidOutOfRange),
         (Request { port: 8, ..req }, Error::PortOutOfRange),
+        (
+            Request {
+                pads: [4, 0, 0, 0, 0],
+                ..req
+            },
+            Error::PadsOutOfRange,
+        ),
     ];
     for (case, want) in cases.iter() {
         match admit(&f, facet, &mut pool, case) {
@@ -268,6 +322,140 @@ fn smoke_rtw89_8922a_admit_ppe_from_peer_ies() -> TestResult {
     TestResult::Pass
 }
 
+fn smoke_rtw89_8922a_admit_6ghz_tpe_power_program() -> TestResult {
+    let ap80 = SixGhzChannel {
+        primary: 5,
+        primary_mhz: 5975,
+        width: Width::Eighty,
+        discontiguous: false,
+        center_mhz: 5985,
+        center2_mhz: None,
+    };
+    // The 8922A TPE entry point is the shared mac80211/regd.c
+    // parse (the 8852C template's goldens): local EIRP
+    // 20/40/80 (raw 72/80/88) constrains to 26 dBm, the
+    // regulatory-client PSD (N = 4, primary subchannel 1, raw
+    // 40) to 23 dBm, and the intersected constraint is the min.
+    let eirp = [195, 4, 0x02, 72, 80, 88];
+    let both = [195, 4, 0x02, 72, 80, 88, 195, 5, 0x1b, 30, 40, 50, 60];
+    let cases: [(&[u8], Option<i8>); 5] = [
+        (&eirp, Some(26)),
+        (&both, Some(23)),
+        // Subordinate category: validated, unused.
+        (&[195, 2, 0x40, 0], None),
+        // EIRP count 3 with two values: invalid, ignored.
+        (&[195, 3, 0x03, 10, 10], None),
+        // PSD count 0: one value for every subchannel, (21-19)/2 + 13.
+        (&[195, 2, 0x08, 21], Some(14)),
+    ];
+    for (ies, expected) in cases {
+        if tpe(ies, &ap80) != Ok(expected) {
+            return TestResult::Fail("8922A 6GHz TPE differs from mac80211/regd.c");
+        }
+    }
+    // 80+80 and a primary outside the AP channel refuse.
+    if tpe(
+        &eirp,
+        &SixGhzChannel {
+            discontiguous: true,
+            ..ap80
+        },
+    ) != Err(())
+    {
+        return TestResult::Fail("80+80 AP channel must refuse TPE");
+    }
+    if tpe(
+        &eirp,
+        &SixGhzChannel {
+            primary_mhz: 7000,
+            ..ap80
+        },
+    ) != Err(())
+    {
+        return TestResult::Fail("primary outside AP channel must refuse TPE");
+    }
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    let mut pool = MacIdPool::new();
+    let mut req = base_req();
+    req.band = Band::Ghz6;
+    req.width_mhz = 20;
+    req.primary = 5;
+    // LPI without a TPE admits with an unconstrained program:
+    // phy.c `rtw89_phy_get_tpe_constraint` with no TPE is
+    // `dbm_to_mac(S8_MAX)` = 63.
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Lpi,
+        tpe_dbm: None,
+    });
+    let st = match admit(&f, facet, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz LPI admission refused"),
+    };
+    let program = match st.six_ghz() {
+        Some(program) => program,
+        None => return TestResult::Fail("6GHz station records no power program"),
+    };
+    if program.power != PowerType6Ghz::Lpi
+        || program.tpe_dbm != None
+        || program.tpe_mac != 63
+        || program.reg_6ghz_power() != 1
+        || st.band != Band::Ghz6
+        || st.width_mhz != 20
+        || st.primary != 5
+    {
+        return TestResult::Fail("6GHz LPI power program mismatch");
+    }
+    // Standard Power with the intersected TPE (23 dBm) admits;
+    // the MAC-unit constraint is 23 << 1 = 46.
+    let tpe_std = match tpe(&both, &ap80) {
+        Ok(Some(c)) => c,
+        _ => return TestResult::Fail("STD TPE must compute"),
+    };
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Sp,
+        tpe_dbm: Some(tpe_std),
+    });
+    let st = match admit(&f, facet, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz STD admission refused"),
+    };
+    let program = match st.six_ghz() {
+        Some(program) => program,
+        None => return TestResult::Fail("6GHz STD station records no power program"),
+    };
+    if program.power != PowerType6Ghz::Sp
+        || program.tpe_dbm != Some(23)
+        || program.tpe_mac != 46
+        || program.reg_6ghz_power() != 2
+    {
+        return TestResult::Fail("6GHz STD power program mismatch");
+    }
+    // VLP admits; a 2.4/5 GHz station records no program.
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Vlp,
+        tpe_dbm: None,
+    });
+    let st = match admit(&f, facet, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz VLP admission refused"),
+    };
+    if st.six_ghz().is_some_and(|p| p.reg_6ghz_power() != 0) {
+        return TestResult::Fail("6GHz VLP power program mismatch");
+    }
+    let st5 = match admit(&f, facet, &mut pool, &base_req()) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("5GHz admission refused"),
+    };
+    if st5.six_ghz().is_some() {
+        return TestResult::Fail("5GHz station must record no 6GHz program");
+    }
+    TestResult::Pass
+}
+
 fn smoke_rtw89_8922a_macid_pool() -> TestResult {
     let mut pool = MacIdPool::new();
     for want in 0..32u8 {
@@ -305,6 +493,10 @@ kernel_test_in!(
 );
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_assoc_2g_ap);
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_admit_refusals);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_admit_6ghz_tpe_power_program
+);
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_macid_pool);
 kernel_test_in!(
     "drivers/wireless/rtw89",

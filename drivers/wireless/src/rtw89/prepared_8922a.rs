@@ -29,13 +29,23 @@
 //!    (trxdma RX on, wpdma on, `txdma_ch(true)`,
 //!    `txdma_fw_ch(true)`, `configure_mit`).
 //! 6. `admit_station` — MACID, G7 default + assoc CCTL, BA-CAM map,
-//!    EHT facet from the chip default (`EhtStation::new_8922ae`).
+//!    EHT facet from the chip default (`EhtStation::new_8922ae`),
+//!    and, on 6 GHz, the 6 GHz power program
+//!    (`station_8922a::SixGhzAdmission` → `SixGhzProgram`:
+//!    client power type + regd.c TPE constraint, 20 MHz only).
 //! 7. `prepare_data` / `kick_data` (CH0..11) and `prepare_h2c` /
 //!    `kick_h2c` (CH12), then `observe_data_rp` /
 //!    `observe_data_report` for completions.
 //!
 //! What this owner deliberately does NOT own (later steps):
-//! - 6 GHz admission, MLO multi-link, legacy-mode admission.
+//! - MLO multi-link, legacy-mode admission.
+//! - The register-level 6 GHz TX-power program
+//!   (`rtw8922a_set_txpwr`: by-rate / limit / limit-RU pages on
+//!   BE registers, shape, diff, ref, SAR-diff) and the wide-6 GHz
+//!   TPE rearrange (40/80/160 MHz): admission records the
+//!   20 MHz primary-subchannel TPE constraint (`SixGhzProgram`)
+//!   the program consumes, but nothing here writes power
+//!   registers.
 //! - Firmware download (`prepared::load` selects the image; the
 //!   download plan + secure loader are a separate lane).
 //!

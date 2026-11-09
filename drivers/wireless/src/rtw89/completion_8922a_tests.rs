@@ -97,6 +97,7 @@ fn base_req() -> Request<'static> {
         has_he: true,
         mgq_rpt_en: false,
         p2p: false,
+        six_ghz: None,
     }
 }
 

@@ -41,10 +41,24 @@
 //!   legacy record can never program EHT RA or TXWD fields.
 //! - Single-link. MLO multi-link (chip supports 2 links) is a
 //!   remainder; admission carries one link's parameters.
-//! - 2.4/5 GHz only. 6 GHz is refused (`SixGhzPowerMissing`)
-//!   until the 6 GHz TX-power program (TPE) lands — transmitting
-//!   on 6 GHz with unprogrammed power would be wrong, so the
-//!   refusal is explicit, not a silent 5 GHz fallback.
+//! - 2.4/5 GHz only, plus 6 GHz at 20 MHz with a 6 GHz power
+//!   program. A 6 GHz request must carry [`SixGhzAdmission`]
+//!   (the AP's client power type + the regd.c TPE constraint from
+//!   [`tpe`]); without it admission is refused
+//!   (`SixGhzPowerMissing`), so 6 GHz is never transmitted with
+//!   unprogrammed power. The TPE is the primary-20 MHz
+//!   subchannel constraint only, so wider 6 GHz widths are
+//!   refused (`SixGhzWidthUnsupported`): a wide station would
+//!   need the full-width EIRP/PSD rearrange (a follow-up), and
+//!   admitting it on the primary subchannel's constraint alone
+//!   could over-permit power on the other subchannels.
+//!   The admitted [`Station`] records the program as
+//!   [`SixGhzProgram`], including the phy.c TPE constraint in
+//!   MAC units the future `rtw8922a_set_txpwr` limit program
+//!   consumes. The register-level program itself (by-rate /
+//!   limit / limit-RU pages on BE registers, shape, diff, ref,
+//!   SAR-diff) is a follow-up: it needs the firmware TXPWR
+//!   elements container this owner does not hold.
 //! - 320 MHz refused (`WidthNotAdvertised`): the width is
 //!   programmed by the EHT lane but deliberately NOT advertised
 //!   (chip bandwidths top at 160 MHz, `rtw8922a.c:3263..3266`).
@@ -81,7 +95,10 @@ use super::{
     eht::EhtStation,
     ppe,
     ra_mask::{self, HeCaps, HtCaps, VhtCaps},
+    radio_power_c::tpe_mac,
 };
+use narf_wireless::association::six_ghz::SixGhzChannel;
+use narf_wireless::reg::PowerType6Ghz;
 
 /// Operating band of the admitted link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,8 +107,113 @@ pub(super) enum Band {
     Ghz2,
     /// 5 GHz.
     Ghz5,
-    /// 6 GHz (refused until the 6 GHz power program lands).
+    /// 6 GHz (admitted only with a [`SixGhzAdmission`] power
+    /// program; 20 MHz only, see the module docs).
     Ghz6,
+}
+
+/// The caller-supplied 6 GHz power program for one admission
+/// request: the AP's client power type (cfg80211
+/// `cfg80211_6ghz_power_type`, from the AP's HE 6 GHz
+/// Operation regulatory info via
+/// `six_ghz::He6GhzOperation::power_type`) and, for Standard
+/// Power only, the regd.c TPE constraint in dBm from [`tpe`].
+/// A 6 GHz request without this context is refused
+/// (`Error::SixGhzPowerMissing`); a non-6 GHz request
+/// carrying one is refused (`Error::SixGhzContextUnexpected`).
+///
+/// Country policy (a 6 GHz-blocked country, the VLP block
+/// for US/CA) is NOT checked here: it lives with the REGD
+/// element owner (`radio_power_c::SixGhzPower::new`, which
+/// needs the container's REGD map and the host regulatory
+/// country — neither of which this owner holds), and the
+/// future `rtw8922a_set_txpwr` program refuses a context
+/// that policy does not admit. Admission records the
+/// AP-advertised power type as-is; it programs no power.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SixGhzAdmission {
+    /// AP client power type (VLP/LPI/SP).
+    pub(super) power: PowerType6Ghz,
+    /// regd.c intersected TPE constraint (dBm), Standard
+    /// Power only; `None` means the AP advertised no usable
+    /// default-category TPE (no TPE constraint applies).
+    pub(super) tpe_dbm: Option<i8>,
+}
+
+/// The 6 GHz power program recorded on an admitted station:
+/// the validated admission context plus the phy.c TPE
+/// constraint in MAC units that the TX-power limit program
+/// consumes (`rtw89_phy_get_tpe_constraint`, via
+/// `radio_power_c::tpe_mac`): 63 when no TPE constrains the
+/// link, so the limit pages are capped by the regulatory
+/// tables alone. This is the program's admission-level
+/// artifact; the register writes are the follow-up
+/// `rtw8922a_set_txpwr` lane's (Linux `rtw8922a.c`
+/// `rtw8922a_set_txpwr`: generic
+/// `rtw89_phy_set_txpwr_{byrate,offset,limit,limit_ru}` plus
+/// the 8922A `set_tx_shape` / `set_txpwr_diff` /
+/// `set_txpwr_ref` / `set_txpwr_sar_diff` steps).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SixGhzProgram {
+    /// AP client power type (VLP/LPI/SP).
+    pub(super) power: PowerType6Ghz,
+    /// regd.c intersected TPE constraint (dBm), STD only.
+    pub(super) tpe_dbm: Option<i8>,
+    /// phy.c `rtw89_phy_get_tpe_constraint` in MAC units
+    /// (63 = no TPE constraint).
+    pub(super) tpe_mac: i8,
+}
+
+impl SixGhzProgram {
+    /// Validate `admission` into a program. Fail-closed:
+    /// a TPE is meaningful only for Standard Power
+    /// (`radio_power_c::Plan::from_elements_6ghz` refuses a
+    /// TPE under any other `reg_6ghz_power`), and a TPE
+    /// constraint below `RTW89_MIN_VALID_POWER_CONSTRAINT`
+    /// (-10 dBm) is `-EINVAL` in regd.c
+    /// (`rtw89_reg_6ghz_tpe_recalc`).
+    fn from_admission(admission: SixGhzAdmission) -> Result<Self, Error> {
+        if admission.tpe_dbm.is_some() && admission.power != PowerType6Ghz::Sp {
+            return Err(Error::SixGhzTpeNotStandard);
+        }
+        if admission.tpe_dbm.is_some_and(|c| c < -10) {
+            return Err(Error::SixGhzTpeBelowMinimum);
+        }
+        Ok(Self {
+            power: admission.power,
+            tpe_dbm: admission.tpe_dbm,
+            tpe_mac: tpe_mac(admission.tpe_dbm),
+        })
+    }
+
+    /// `enum rtw89_reg_6ghz_power` of this program
+    /// (VLP 0 = DFLT, LPI 1, STD 2), as regd.c
+    /// `rtw89_reg_6ghz_power_recalc` maps the client power
+    /// type (see `radio_power_c::SixGhzPower`).
+    pub(super) fn reg_6ghz_power(self) -> u8 {
+        match self.power {
+            PowerType6Ghz::Vlp => 0,
+            PowerType6Ghz::Lpi => 1,
+            PowerType6Ghz::Sp => 2,
+        }
+    }
+}
+
+/// The 8922A 6 GHz TPE entry point: the regd.c
+/// `rtw89_calculate_tpe` constraint (dBm) for a 20 MHz
+/// station on the primary inside the AP's HE 6 GHz channel
+/// `ap`, from the AP's Transmit Power Envelope elements in
+/// `ies`. It is the shared mac80211/regd.c parse
+/// (`station_six_ghz::tpe`, the 8852C template: validate,
+/// parse, rearrange to the used 20 MHz chandef, intersect
+/// the local and regulatory-client EIRP/PSD limits); the
+/// 8922A owner adds the admission rules around its result
+/// ([`SixGhzProgram::from_admission`]) rather than a second
+/// copy of the parse. `Ok(None)`: no valid default-category
+/// TPE. `Err`: an 80+80 MHz AP channel or a primary outside
+/// `ap` — the caller refuses the join.
+pub(super) fn tpe(ies: &[u8], ap: &SixGhzChannel) -> Result<Option<i8>, ()> {
+    super::station::six::tpe(ies, ap)
 }
 
 /// One admission request: the peer, the link, and the
@@ -133,6 +255,9 @@ pub(super) struct Request<'a> {
     pub(super) mgq_rpt_en: bool,
     /// P2P vif (assoc lowest-rate arm is always OFDM6).
     pub(super) p2p: bool,
+    /// 6 GHz power program (required for `Band::Ghz6`,
+    /// refused on any other band).
+    pub(super) six_ghz: Option<SixGhzAdmission>,
 }
 
 /// Admission failures. Every variant is a refusal, never a
@@ -140,8 +265,20 @@ pub(super) struct Request<'a> {
 /// partially-programmed artifact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
-    /// 6 GHz requested before the 6 GHz power program exists.
+    /// 6 GHz requested without a 6 GHz power program
+    /// (`SixGhzAdmission` absent).
     SixGhzPowerMissing,
+    /// A 6 GHz power program supplied for a non-6 GHz band.
+    SixGhzContextUnexpected,
+    /// A TPE constraint supplied for a non-Standard-Power
+    /// 6 GHz program (a TPE constrains STD only).
+    SixGhzTpeNotStandard,
+    /// A Standard-Power TPE constraint below -10 dBm
+    /// (`RTW89_MIN_VALID_POWER_CONSTRAINT`, regd.c `-EINVAL`).
+    SixGhzTpeBelowMinimum,
+    /// A 6 GHz width above 20 MHz (the TPE rearrange is
+    /// validated for the primary 20 MHz subchannel only).
+    SixGhzWidthUnsupported,
     /// Width outside 20/40/80/160 (includes 320 MHz).
     WidthNotAdvertised,
     /// NSS zero or above the chip's 2-stream cap.
@@ -253,9 +390,19 @@ pub(super) struct Station {
     pub(super) default_cctl: DefaultCmac,
     /// G7 association CMAC table for this station.
     pub(super) assoc_cctl: DefaultCmac,
+    /// 6 GHz power program (`Some` exactly when
+    /// `band == Band::Ghz6`).
+    pub(super) six_ghz: Option<SixGhzProgram>,
 }
 
 impl Station {
+    /// The 6 GHz power program of this station, if it is a
+    /// 6 GHz station: the client power type, the TPE
+    /// constraint (dBm, STD only) and its MAC-unit form.
+    pub(super) fn six_ghz(&self) -> Option<SixGhzProgram> {
+        self.six_ghz
+    }
+
     /// EHT contribution to the BE TXWD_INFO block for this
     /// station: (info4 bits, info7 bits) from the facet.
     /// `None` only on an out-of-range NLTF value, which
@@ -307,11 +454,17 @@ pub(super) fn admit(
     pool: &mut MacIdPool,
     req: &Request,
 ) -> Result<Station, Error> {
-    if req.band == Band::Ghz6 {
-        return Err(Error::SixGhzPowerMissing);
-    }
+    let six_ghz = match (req.band, req.six_ghz) {
+        (Band::Ghz6, None) => return Err(Error::SixGhzPowerMissing),
+        (Band::Ghz6, Some(admission)) => Some(SixGhzProgram::from_admission(admission)?),
+        (_, Some(_)) => return Err(Error::SixGhzContextUnexpected),
+        (_, None) => None,
+    };
     if !chip_8922a::SUPPORT_BANDWIDTHS_MHZ.contains(&req.width_mhz) {
         return Err(Error::WidthNotAdvertised);
+    }
+    if req.band == Band::Ghz6 && req.width_mhz != 20 {
+        return Err(Error::SixGhzWidthUnsupported);
     }
     if req.nss == 0 || req.nss as usize > chip_8922a::TX_NSS {
         return Err(Error::NssOutOfRange);
@@ -361,6 +514,7 @@ pub(super) fn admit(
         bacam,
         default_cctl,
         assoc_cctl,
+        six_ghz,
     })
 }
 

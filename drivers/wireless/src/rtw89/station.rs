@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 #[path = "station_fragment.rs"]
 mod fragment;
 #[path = "station_six_ghz.rs"]
-mod six;
+pub(super) mod six;
 #[path = "station_tx_amsdu.rs"]
 mod tx_amsdu;
 
