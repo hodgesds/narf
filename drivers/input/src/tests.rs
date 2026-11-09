@@ -3618,7 +3618,23 @@ mod i2c_hid_touch_smokes {
             0x01, 0x00, 0x02, 0x01, 0x20, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01,
         ]));
         bus.stage_read(read_data_report(&[0x48, 0x08]));
-        // (7)-(8) Phase-2 fallback reads, consumed by the
+        // (7)-(14) F$12 sensor-maximum decode, in the session's
+        // order: Query 0 (descriptors present), the control
+        // descriptor (register 8 present, size 15, subpackets
+        // 0–4), the data descriptor (register 1 present, size
+        // 80, subpackets 0–4 → 5 objects), then Control 8
+        // (sensor tuning: maxima 0x2000 x 0x4000).
+        bus.stage_read(read_data_report(&[0x01]));
+        bus.stage_read(read_data_report(&[0x03]));
+        bus.stage_read(read_data_report(&[0x02, 0x00, 0x01]));
+        bus.stage_read(read_data_report(&[0x0F, 0x1F]));
+        bus.stage_read(read_data_report(&[0x02]));
+        bus.stage_read(read_data_report(&[0x02, 0x02]));
+        bus.stage_read(read_data_report(&[0x50, 0x1F]));
+        let mut ctrl8 = [0u8; 15];
+        ctrl8[0..4].copy_from_slice(&[0x00, 0x20, 0x00, 0x40]);
+        bus.stage_read(read_data_report(&ctrl8));
+        // (15)-(16) Phase-2 fallback reads, consumed by the
         // multi-source ATTN below — in the order the pump issues
         // them (F$30 button read first, then the F$12 Data 1
         // read): the F$30 data byte (0xFE: GPIO 0 low = clickpad
@@ -3673,20 +3689,37 @@ mod i2c_hid_touch_smokes {
             if probe.source_mask_for(0x12) != 0x01 || probe.source_mask_for(0x30) != 0x04 {
                 return TestResult::Fail("interrupt map wrong");
             }
+            // The F$12 sensor maxima come from Control 8 and
+            // the object count from the Data-1 descriptor.
+            match probe.f12_sensor {
+                Some(s) if s.max_x == 0x2000 && s.max_y == 0x4000 && s.max_objects == 5 => {}
+                _ => return TestResult::Fail("probe must decode the F$12 sensor maxima"),
+            }
             // The probe issued one read-addr output report per
-            // register read (4 PDT + F$01 query + F$30 query)
-            // plus one set-page output report.
+            // register read (4 PDT + F$01 query + F$30 query +
+            // 8 F$12 sensor-maximum reads) plus one set-page
+            // output report.
             let writes = bus.writes();
             let is_out =
                 |w: &alloc::vec::Vec<u8>, id: u8| w.len() >= 9 && (w[2] >> 4) == 0x02 && w[8] == id;
-            if writes.iter().filter(|w| is_out(w, 0x0A)).count() != 6 {
-                return TestResult::Fail("probe must issue 6 read-addr output reports");
+            if writes.iter().filter(|w| is_out(w, 0x0A)).count() != 14 {
+                return TestResult::Fail("probe must issue 14 read-addr output reports");
             }
             if writes.iter().filter(|w| is_out(w, 0x09)).count() != 1 {
                 return TestResult::Fail("probe must issue 1 set-page output report");
             }
             let caps =
                 crate::i2c_hid_touch::build_rmi_caps(&probe, &narf_input::evdev::DeviceCaps::new());
+            // Caps carry the decoded maxima (5 slots → 0..4).
+            let x = caps.abs_info(narf_input::abs::ABS_MT_POSITION_X);
+            let y = caps.abs_info(narf_input::abs::ABS_MT_POSITION_Y);
+            let slot = caps.abs_info(narf_input::abs::ABS_MT_SLOT);
+            if x.map(|a| a.max) != Some(0x2000)
+                || y.map(|a| a.max) != Some(0x4000)
+                || slot.map(|a| a.max) != Some(4)
+            {
+                return TestResult::Fail("caps must carry the decoded sensor maxima");
+            }
             let (evdev_id, node) = narf_input::evdev::ROUTER.register_device(caps);
             let mut state = crate::rmi4_core::Rmi4PumpState::new();
             // Phase 1: single-source ATTN (F$12 only) — fast path.
@@ -3703,9 +3736,12 @@ mod i2c_hid_touch_smokes {
             };
             crate::i2c_hid_bind::pump_rmi_attn(&mut session, &probe, &attn1, &mut state, &node)
                 .await;
+            // Raw 0x1000/0x2000 scaled through the decoded
+            // sensor maxima (0..0x2000 / 0..0x4000) → 0x7FFF
+            // on both axes.
             match pop_touch() {
-                Some(t) if t.state == TouchState::Down && t.x == 0x1000 && t.y == 0x2000 => {}
-                Some(_) => return TestResult::Fail("phase 1: expected Down at 0x1000/0x2000"),
+                Some(t) if t.state == TouchState::Down && t.x == 0x7FFF && t.y == 0x7FFF => {}
+                Some(_) => return TestResult::Fail("phase 1: expected Down at 0x7FFF/0x7FFF"),
                 None => return TestResult::Fail("phase 1: no TouchEvent in ring"),
             }
             // Phase 2: multi-source ATTN (F$12 + F$30) — the
@@ -3963,6 +3999,303 @@ fn smoke_rmi4_f30_button_bitmap_to_btn_codes() -> TestResult {
 kernel_test_in!(
     "drivers/input/rmi4",
     smoke_rmi4_f30_button_bitmap_to_btn_codes
+);
+
+fn smoke_rmi4_f11_finger_count_from_query1() -> TestResult {
+    use crate::rmi4_core::F11SensorInfo;
+    // Linux `f11_2d_construct_data`: nr == 5 means 10 fingers,
+    // otherwise nr + 1.
+    let cases: [(u8, usize); 5] = [(0x00, 1), (0x01, 2), (0x04, 5), (0x05, 10), (0x07, 8)];
+    for (query1, expected) in cases {
+        if F11SensorInfo::fingers_from_query1(query1) != expected {
+            return TestResult::Fail("F$11 Query 1 finger count wrong");
+        }
+    }
+    // Upper bits of Query 1 are other flags, not the count.
+    if F11SensorInfo::fingers_from_query1(0x84) != 5 {
+        return TestResult::Fail("F$11 Query 1 must mask the finger count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/rmi4",
+    smoke_rmi4_f11_finger_count_from_query1
+);
+
+fn smoke_rmi4_f12_register_descriptor_parse() -> TestResult {
+    use crate::rmi4_core::parse_register_descriptor;
+    // Control descriptor for a sensor with only register 8
+    // (sensor tuning): presence [size=2, bitmap regs {8}],
+    // structure [size=15, subpacket map 0b00011111 → 5].
+    let desc = match parse_register_descriptor(&[0x02, 0x00, 0x01], &[0x0F, 0x1F]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("control descriptor parse failed"),
+    };
+    if desc.items.len() != 1 {
+        return TestResult::Fail("expected one control register");
+    }
+    let tuning = &desc.items[0];
+    if tuning.reg != 8 || tuning.reg_size != 15 || tuning.num_subpackets != 5 {
+        return TestResult::Fail("control register 8 decoded wrong");
+    }
+    if !tuning.has_subpacket(0) || !tuning.has_subpacket(4) || tuning.has_subpacket(5) {
+        return TestResult::Fail("control register 8 subpacket map wrong");
+    }
+    if desc.reg_offset(8) != Some(0) {
+        return TestResult::Fail("single-register offset must be 0");
+    }
+    // Data descriptor for a sensor with only register 1
+    // (objects, 80 bytes = 5 objects × 8, 5 subpackets).
+    let desc = match parse_register_descriptor(&[0x02, 0x02], &[0x50, 0x1F]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("data descriptor parse failed"),
+    };
+    if desc.items.len() != 1 || desc.items[0].reg != 1 || desc.items[0].reg_size != 80 {
+        return TestResult::Fail("data register 1 decoded wrong");
+    }
+    if desc.items[0].num_subpackets != 5 {
+        return TestResult::Fail("data register 1 object count wrong");
+    }
+    // 16-bit structure-size form: presence[0] == 0 → size is
+    // the LE16 in presence[1..3], bitmap starts at presence[3].
+    let desc = match parse_register_descriptor(&[0x00, 0x02, 0x00, 0x02], &[0x50, 0x1F]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("16-bit struct-size parse failed"),
+    };
+    if desc.items.len() != 1 || desc.items[0].reg != 1 {
+        return TestResult::Fail("16-bit struct-size bitmap wrong");
+    }
+    // Multi-byte subpacket map: 0x81 then 0x02 → subpackets 0
+    // and 8 (bit 7 of the first byte continues the map).
+    let desc = match parse_register_descriptor(&[0x02, 0x02], &[0x50, 0x81, 0x02]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("multi-byte subpacket map parse failed"),
+    };
+    if desc.items[0].num_subpackets != 2
+        || !desc.items[0].has_subpacket(0)
+        || !desc.items[0].has_subpacket(8)
+    {
+        return TestResult::Fail("multi-byte subpacket map wrong");
+    }
+    // Short-structure tolerance (upstream June 2026): the
+    // bitmap claims registers 1 and 8, but the structure only
+    // holds register 1 — register 8 is dropped, not fatal.
+    let desc = match parse_register_descriptor(&[0x03, 0x02, 0x01], &[0x50, 0x1F]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("short-structure parse failed"),
+    };
+    if desc.items.len() != 1 || desc.items[0].reg != 1 {
+        return TestResult::Fail("short structure must drop the trailing register");
+    }
+    // Byte offsets are the sum of the preceding register
+    // sizes: reg 1 (80 bytes) then reg 8 starts at 80.
+    if desc.reg_offset(1) != Some(0) {
+        return TestResult::Fail("first register offset must be 0");
+    }
+    let desc = match parse_register_descriptor(&[0x03, 0x02, 0x01], &[0x50, 0x1F, 0x0F, 0x1F]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("two-register parse failed"),
+    };
+    if desc.reg_offset(8) != Some(80) {
+        return TestResult::Fail("second register offset must be the first size");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/rmi4",
+    smoke_rmi4_f12_register_descriptor_parse
+);
+
+fn smoke_rmi4_f12_sensor_tuning_decode() -> TestResult {
+    use crate::rmi4_core::{decode_f12_sensor_tuning, parse_register_descriptor};
+    let desc = match parse_register_descriptor(&[0x02, 0x00, 0x01], &[0x0F, 0x1F]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("descriptor parse failed"),
+    };
+    let tuning = &desc.items[0];
+    let (max_x, max_y) = match decode_f12_sensor_tuning(tuning, &[0x34, 0x12, 0x45, 0x23]) {
+        Some(m) => m,
+        None => return TestResult::Fail("sensor tuning decode failed"),
+    };
+    if max_x != 0x1234 || max_y != 0x2345 {
+        return TestResult::Fail("sensor maxima are little-endian u16s");
+    }
+    // Subpacket 0 absent → no maxima.
+    let desc = match parse_register_descriptor(&[0x02, 0x00, 0x01], &[0x0F, 0x02]) {
+        Ok(d) => d,
+        Err(_) => return TestResult::Fail("descriptor parse failed"),
+    };
+    if decode_f12_sensor_tuning(&desc.items[0], &[0x34, 0x12, 0x45, 0x23]).is_some() {
+        return TestResult::Fail("missing subpacket 0 must yield no maxima");
+    }
+    // Fewer than 4 tuning bytes → no maxima.
+    if decode_f12_sensor_tuning(tuning, &[0x34, 0x12]).is_some() {
+        return TestResult::Fail("short tuning block must yield no maxima");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/input/rmi4", smoke_rmi4_f12_sensor_tuning_decode);
+
+/// Minimal in-memory [`Rmi4Transport`] for the sync probe
+/// tests: flat page-0 memory for plain registers plus a
+/// packet-register table. A read starting at a packet address
+/// returns that packet's bytes (all bytes of an RMI4 packet
+/// register live at one address — Linux
+/// `rmi_read_register_desc` relies on this), while a read
+/// starting elsewhere returns consecutive memory bytes. The
+/// SMBus v1 transport cannot model this (it splits block reads
+/// into word/byte reads at incrementing addresses), so the
+/// sync F$12 descriptor decode is covered here, not through
+/// the SMBus fake.
+struct MemTransport {
+    mem: [u8; 256],
+    packets: &'static [(u16, &'static [u8])],
+}
+
+impl crate::rmi4_core::Rmi4Transport for MemTransport {
+    fn read_block(
+        &mut self,
+        addr: u16,
+        dst: &mut [u8],
+    ) -> Result<(), crate::rmi4_core::TransportError> {
+        if let Some((_, pkt)) = self.packets.iter().find(|(a, _)| *a == addr) {
+            for (i, b) in dst.iter_mut().enumerate() {
+                *b = pkt.get(i).copied().unwrap_or(0);
+            }
+            return Ok(());
+        }
+        for (i, b) in dst.iter_mut().enumerate() {
+            let a = addr.wrapping_add(i as u16);
+            *b = if a < 256 { self.mem[a as usize] } else { 0 };
+        }
+        Ok(())
+    }
+
+    fn write_block(
+        &mut self,
+        _addr: u16,
+        _src: &[u8],
+    ) -> Result<(), crate::rmi4_core::TransportError> {
+        Ok(())
+    }
+}
+
+/// Page-0 image with F$11 + F$12 sensor maxima wired up (see
+/// [`MemTransport`]): PDT entries (F$12 @ 0xE9, F$11 @ 0xE3,
+/// F$01 @ 0xDD, F$30 @ 0xD7, terminator @ 0xD1), the F$01
+/// query (manufacturer 1) at 0x10, the F$30 query (8 lines)
+/// at 0x20, F$11 Query 1 (4 → 5 fingers) at 0x51 with
+/// control maxima 0x0C80 x 0x0960 at 0x58/0x5A, and the F$12
+/// descriptors (control register 0, size 1, precedes register
+/// 8 so the Control-8 read lands at offset 1 — this pins the
+/// byte-sum offset, not a register count; data register 1,
+/// 80 bytes, 10 subpackets) with Control-8 maxima
+/// 0x1234 x 0x2345 at control_base + 1 (0x81).
+fn mem_transport_with_sensor_maxima() -> MemTransport {
+    let mut mem = [0u8; 256];
+    // Entry layout: [query, cmd, ctrl, data, intr|ver, func].
+    mem[0xE9..0xEF].copy_from_slice(&[0x30, 0x31, 0x80, 0x33, 0x01, 0x12]);
+    mem[0xE3..0xE9].copy_from_slice(&[0x50, 0x51, 0x52, 0x53, 0x01, 0x11]);
+    mem[0xDD..0xE3].copy_from_slice(&[0x10, 0x11, 0x12, 0x13, 0x01, 0x01]);
+    mem[0xD7..0xDD].copy_from_slice(&[0x20, 0x21, 0x22, 0x23, 0x01, 0x30]);
+    // Terminator at 0xD1 stays zero (function 0x00).
+    mem[0x10..0x1B].copy_from_slice(&[
+        0x01, 0x00, 0x02, 0x01, 0x20, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01,
+    ]);
+    mem[0x20..0x22].copy_from_slice(&[0x48, 0x08]);
+    // F$11: Query 1 at 0x51 (nr_fingers = 4 → 5 fingers),
+    // maxima at control_base + 6 (0x58) / + 8 (0x5A).
+    mem[0x51] = 0x04;
+    mem[0x58..0x5C].copy_from_slice(&[0x80, 0x0C, 0x60, 0x09]);
+    // F$12: Query 0 at 0x30 (descriptors present).
+    mem[0x30] = 0x01;
+    // Descriptor size bytes (plain registers).
+    mem[0x34] = 0x03; // control descriptor: 3-byte presence
+    mem[0x37] = 0x02; // data descriptor: 2-byte presence
+                      // Control 8 (sensor tuning) at control_base + 1 (0x81):
+                      // maxima 0x1234 x 0x2345 in the first 4 bytes.
+    mem[0x81..0x85].copy_from_slice(&[0x34, 0x12, 0x45, 0x23]);
+    MemTransport {
+        mem,
+        packets: &[
+            // Control descriptor presence at 0x35: structure
+            // size 4, bitmap regs {0, 8}.
+            (0x35, &[0x04, 0x01, 0x01]),
+            // Control descriptor structure at 0x36: reg 0
+            // (size 1, 1 subpacket), reg 8 (size 15,
+            // subpackets 0–4).
+            (0x36, &[0x01, 0x01, 0x0F, 0x1F]),
+            // Data descriptor presence at 0x38: structure
+            // size 3, bitmap regs {1}.
+            (0x38, &[0x03, 0x02]),
+            // Data descriptor structure at 0x39: reg 1
+            // (size 80, subpackets 0–9 → 10 objects).
+            (0x39, &[0x50, 0xFF, 0x07]),
+        ],
+    }
+}
+
+fn smoke_rmi4_probe_decodes_f11_f12_sensor_maxima() -> TestResult {
+    use crate::rmi4_core::{probe_device, F11SensorInfo, F12SensorInfo};
+    let mut t = mem_transport_with_sensor_maxima();
+    let probe = match probe_device(&mut t) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("probe failed on the maxima image"),
+    };
+    if probe.f11_sensor
+        != Some(F11SensorInfo {
+            max_x: 0x0C80,
+            max_y: 0x0960,
+            max_fingers: 5,
+        })
+    {
+        return TestResult::Fail("F$11 sensor maxima / finger count wrong");
+    }
+    if probe.f12_sensor
+        != Some(F12SensorInfo {
+            max_x: 0x1234,
+            max_y: 0x2345,
+            max_objects: 10,
+        })
+    {
+        return TestResult::Fail("F$12 sensor maxima / object count wrong");
+    }
+    // 10 objects, not the fallback 5 — the decode ran.
+    if probe.f12_max_objects() != 10 || probe.f11_max_fingers() != 5 {
+        return TestResult::Fail("probe counts must be the decoded values");
+    }
+    if probe.sensor_axis_maxima() != (0x1234, 0x2345) || probe.sensor_slots() != 10 {
+        return TestResult::Fail("probe axis maxima / slots wrong");
+    }
+    let caps = crate::i2c_hid_touch::build_rmi_caps(&probe, &narf_input::evdev::DeviceCaps::new());
+    let x = caps.abs_info(narf_input::abs::ABS_MT_POSITION_X);
+    let y = caps.abs_info(narf_input::abs::ABS_MT_POSITION_Y);
+    let slot = caps.abs_info(narf_input::abs::ABS_MT_SLOT);
+    if x.map(|a| a.max) != Some(0x1234) || y.map(|a| a.max) != Some(0x2345) {
+        return TestResult::Fail("caps axis ranges must be the decoded maxima");
+    }
+    if slot.map(|a| a.max) != Some(9) {
+        return TestResult::Fail("caps must offer one slot per decoded object");
+    }
+    // F$12 without descriptors falls back to the F$11 sensor:
+    // same image with Query 0 bit 0 clear.
+    let mut t = mem_transport_with_sensor_maxima();
+    t.mem[0x30] = 0x00;
+    let probe = match probe_device(&mut t) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("probe failed on the no-descriptor image"),
+    };
+    if probe.f12_sensor.is_some() {
+        return TestResult::Fail("no-descriptor F$12 must not decode");
+    }
+    if probe.sensor_axis_maxima() != (0x0C80, 0x0960) || probe.sensor_slots() != 5 {
+        return TestResult::Fail("fallback must use the F$11 sensor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/input/rmi4",
+    smoke_rmi4_probe_decodes_f11_f12_sensor_maxima
 );
 
 // ── HID multi-touch class driver smokes ──────────────────────────
@@ -6757,15 +7090,23 @@ mod smbus_rmi_smokes {
     const OP_WRITE_WORD: u8 = 3;
     const OP_READ_BLOCK: u8 = 4;
     const OP_WRITE_BLOCK: u8 = 5;
+    /// I2C block read (`read_i2c_block_data`).
+    const OP_READ_I2C_BLOCK: u8 = 6;
 
     /// Faithful miniature RMI4-over-SMBus device (see the module
-    /// docs). Page-0 only; reads on any other page return zero.
+    /// docs). Page-0 only for the flat image, plus a page-1 bank
+    /// for the page-boundary test; reads on any other page return
+    /// zero. `packets` models multi-byte packet registers: a
+    /// read at a registered address streams that packet's bytes,
+    /// not the flat-memory window at the following addresses.
     #[derive(Debug)]
     struct FakeSmbus {
         mem: IrqSafeSpinLock<[u8; 256]>,
+        mem1: IrqSafeSpinLock<[u8; 256]>,
         page: IrqSafeSpinLock<u8>,
         version: u8,
         map: IrqSafeSpinLock<[(u16, u8); 8]>,
+        packets: IrqSafeSpinLock<Vec<(u16, Vec<u8>)>>,
         writes: IrqSafeSpinLock<Vec<(u8, u8, Vec<u8>)>>,
         reads: IrqSafeSpinLock<Vec<(u8, u8)>>,
     }
@@ -6774,26 +7115,54 @@ mod smbus_rmi_smokes {
         fn new(mem: [u8; 256], version: u8) -> Self {
             Self {
                 mem: IrqSafeSpinLock::new(mem),
+                mem1: IrqSafeSpinLock::new([0u8; 256]),
                 page: IrqSafeSpinLock::new(0),
                 version,
                 map: IrqSafeSpinLock::new([(0, 0); 8]),
+                packets: IrqSafeSpinLock::new(Vec::new()),
                 writes: IrqSafeSpinLock::new(Vec::new()),
                 reads: IrqSafeSpinLock::new(Vec::new()),
             }
         }
 
+        /// Register a multi-byte packet register: a read of K
+        /// bytes at `addr` (full 16-bit RMI address) returns
+        /// the packet's first K bytes — this is what makes an
+        /// F$12 descriptor packet different from consecutive
+        /// scalar registers, whose K bytes live at K
+        /// consecutive addresses.
+        fn register_packet(&self, addr: u16, bytes: &[u8]) {
+            self.packets.lock().push((addr, bytes.to_vec()));
+        }
+
+        fn packet_at(&self, addr: u16) -> Option<Vec<u8>> {
+            self.packets
+                .lock()
+                .iter()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, b)| b.clone())
+        }
+
         fn read_mem(&self, addr: u16) -> u8 {
-            if *self.page.lock() != 0 || addr >= 256 {
+            if addr >= 256 {
                 return 0;
             }
-            self.mem.lock()[addr as usize]
+            match *self.page.lock() {
+                0 => self.mem.lock()[addr as usize],
+                1 => self.mem1.lock()[addr as usize],
+                _ => 0,
+            }
         }
 
         fn write_mem(&self, addr: u16, value: u8) {
-            if *self.page.lock() != 0 || addr >= 256 {
+            if addr >= 256 {
                 return;
             }
-            self.mem.lock()[addr as usize] = value;
+            match *self.page.lock() {
+                0 => self.mem.lock()[addr as usize] = value,
+                1 => self.mem1.lock()[addr as usize] = value,
+                _ => {}
+            }
         }
     }
 
@@ -6802,6 +7171,12 @@ mod smbus_rmi_smokes {
             self.reads.lock().push((OP_READ_BYTE, cmd));
             if cmd == 0xFD {
                 return Ok(self.version);
+            }
+            let full = ((*self.page.lock() as u16) << 8) | cmd as u16;
+            if let Some(pkt) = self.packet_at(full) {
+                if let Some(b) = pkt.first() {
+                    return Ok(*b);
+                }
             }
             Ok(self.read_mem(cmd as u16))
         }
@@ -6818,8 +7193,16 @@ mod smbus_rmi_smokes {
         }
         fn read_word_data(&self, _addr: u8, cmd: u8) -> Result<u16, SmbusError> {
             self.reads.lock().push((OP_READ_WORD, cmd));
-            let lo = self.read_mem(cmd as u16);
-            let hi = self.read_mem(cmd.wrapping_add(1) as u16);
+            let full = ((*self.page.lock() as u16) << 8) | cmd as u16;
+            let pkt = self.packet_at(full);
+            let lo = match &pkt {
+                Some(p) if !p.is_empty() => p[0],
+                _ => self.read_mem(cmd as u16),
+            };
+            let hi = match &pkt {
+                Some(p) if p.len() > 1 => p[1],
+                _ => self.read_mem(cmd.wrapping_add(1) as u16),
+            };
             Ok(u16::from_le_bytes([lo, hi]))
         }
         fn write_word_data(&self, _addr: u8, cmd: u8, value: u16) -> Result<(), SmbusError> {
@@ -6840,10 +7223,37 @@ mod smbus_rmi_smokes {
             if count as usize > buf.len() {
                 return Err(SmbusError::Failed);
             }
-            for i in 0..count as usize {
-                buf[i] = self.read_mem(rmiaddr.wrapping_add(i as u16));
+            for (i, slot) in buf.iter_mut().enumerate().take(count as usize) {
+                *slot = self.read_mem(rmiaddr.wrapping_add(i as u16));
             }
             Ok(count as usize)
+        }
+        fn read_i2c_block_data(
+            &self,
+            _addr: u8,
+            cmd: u8,
+            buf: &mut [u8],
+        ) -> Result<usize, SmbusError> {
+            self.reads.lock().push((OP_READ_I2C_BLOCK, cmd));
+            if buf.is_empty() || buf.len() > 32 {
+                return Err(SmbusError::Failed);
+            }
+            let full = ((*self.page.lock() as u16) << 8) | cmd as u16;
+            if let Some(pkt) = self.packet_at(full) {
+                // A packet register streams its own bytes; a
+                // read longer than the packet is short, never
+                // padded with the next register's bytes.
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                return Ok(n);
+            }
+            // No packet here: scalar registers stream the
+            // consecutive-address window (the device
+            // auto-increments), as the flat image models.
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = self.read_mem(cmd.wrapping_add(i as u8) as u16);
+            }
+            Ok(buf.len())
         }
         fn write_block_data(&self, _addr: u8, cmd: u8, data: &[u8]) -> Result<(), SmbusError> {
             self.writes
@@ -6948,14 +7358,18 @@ mod smbus_rmi_smokes {
         {
             return TestResult::Fail("v1 probe must page-select to 0");
         }
-        // The 6-byte PDT entry at 0xE9 is assembled from word
-        // reads at 0xE9 / 0xEB / 0xED (no plain block-read op on
-        // the ICH host — see the transport docs).
+        // The 6-byte PDT entry at 0xE9 is one I2C block read —
+        // a single master-recv, the form the v1 device speaks
+        // (see the transport docs). No word/byte assembly.
         let reads = fake.reads.lock();
-        for cmd in [0xE9u8, 0xEB, 0xED] {
-            if !reads.iter().any(|(op, c)| *op == OP_READ_WORD && *c == cmd) {
-                return TestResult::Fail("PDT entry must be read as words at 0xE9/0xEB/0xED");
-            }
+        if !reads
+            .iter()
+            .any(|(op, c)| *op == OP_READ_I2C_BLOCK && *c == 0xE9)
+        {
+            return TestResult::Fail("PDT entry must be one I2C block read at 0xE9");
+        }
+        if reads.iter().any(|(op, _)| *op == OP_READ_WORD) {
+            return TestResult::Fail("v1 reads must not assemble blocks from word reads");
         }
         TestResult::Pass
     }
@@ -7160,6 +7574,185 @@ mod smbus_rmi_smokes {
     }
     kernel_test_in!("drivers/input/smbus-rmi", smoke_smbus_rmi_f12_data_decode);
 
+    fn smoke_smbus_rmi_v1_f12_descriptor_packets() -> TestResult {
+        // F$12 register-descriptor layout (Linux
+        // `rmi_read_register_desc`): 1 size byte at the query
+        // base, the N-byte presence packet at query+1, the
+        // S-byte structure packet at query+1+N. The packets
+        // are multi-byte registers: every byte of a packet
+        // streams from the ONE packet address, so a block
+        // assembled from word/byte reads at incrementing
+        // addresses mixes in the next register's first byte.
+        let mut mem = synaptics_page0();
+        // Size byte N=3 at the F$12 query base (0x00).
+        mem[0x00] = 0x03;
+        // The flat window disagrees with the packets on
+        // purpose: 0x02 holds 0x99 (the next register's byte)
+        // and 0x06 holds 0x00 (an F$12 Data1 byte).
+        mem[0x02] = 0x99;
+        let fake = FakeSmbus::new(mem, 0x00); // v1
+        fake.register_packet(0x01, &[0x11, 0x22, 0x33]);
+        fake.register_packet(0x04, &[0x44, 0x55, 0x66]);
+        // The old assembly, spelled out through the fake:
+        // word(0x01) + byte(0x02) mixes the presence packet
+        // with the next register's byte, and word(0x04) +
+        // byte(0x06) does the same to the structure packet.
+        let w = match fake.read_word_data(SMBUS_RMI_DEFAULT_ADDR, 0x01) {
+            Ok(w) => w,
+            Err(_) => return TestResult::Fail("fake word read failed"),
+        };
+        let b = match fake.read_byte_data(SMBUS_RMI_DEFAULT_ADDR, 0x02) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("fake byte read failed"),
+        };
+        if [w.to_le_bytes()[0], w.to_le_bytes()[1], b] == [0x11, 0x22, 0x33] {
+            return TestResult::Fail("fixture must make the old presence assembly wrong");
+        }
+        let w = match fake.read_word_data(SMBUS_RMI_DEFAULT_ADDR, 0x04) {
+            Ok(w) => w,
+            Err(_) => return TestResult::Fail("fake word read failed"),
+        };
+        let b = match fake.read_byte_data(SMBUS_RMI_DEFAULT_ADDR, 0x06) {
+            Ok(b) => b,
+            Err(_) => return TestResult::Fail("fake byte read failed"),
+        };
+        if [w.to_le_bytes()[0], w.to_le_bytes()[1], b] == [0x44, 0x55, 0x66] {
+            return TestResult::Fail("fixture must make the old structure assembly wrong");
+        }
+        let mark = fake.reads.lock().len();
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mut size = [0u8; 1];
+        if t.read_block(0x00, &mut size).is_err() {
+            return TestResult::Fail("descriptor size read failed");
+        }
+        if size != [0x03] {
+            return TestResult::Fail("descriptor size byte wrong");
+        }
+        let mut presence = [0u8; 3];
+        if t.read_block(0x01, &mut presence).is_err() {
+            return TestResult::Fail("presence packet read failed");
+        }
+        if presence != [0x11, 0x22, 0x33] {
+            return TestResult::Fail("presence packet bytes wrong");
+        }
+        let mut structure = [0u8; 3];
+        if t.read_block(0x04, &mut structure).is_err() {
+            return TestResult::Fail("structure packet read failed");
+        }
+        if structure != [0x44, 0x55, 0x66] {
+            return TestResult::Fail("structure packet bytes wrong");
+        }
+        // One single-transaction I2C block read per packet —
+        // plus the probe's version-byte read, nothing else.
+        let reads = fake.reads.lock();
+        if reads[mark..]
+            != [
+                (OP_READ_BYTE, 0xFD),
+                (OP_READ_I2C_BLOCK, 0x00),
+                (OP_READ_I2C_BLOCK, 0x01),
+                (OP_READ_I2C_BLOCK, 0x04),
+            ]
+        {
+            return TestResult::Fail("each descriptor read must be one I2C block read");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v1_f12_descriptor_packets
+    );
+
+    fn smoke_smbus_rmi_v1_packet_read_page_boundary() -> TestResult {
+        // A read straddling a page boundary is split into one
+        // I2C block read per page, with a page-select between
+        // them — a single transaction never crosses the
+        // boundary (the device auto-increment wraps inside
+        // the page, and 0xFF is the page-select register
+        // itself). The byte at 0xFF reads back as the flat
+        // image byte there (0x5A here); on hardware it is the
+        // page-select register's value, so a descriptor packet
+        // laid out across 0xFF would not parse — RMI4 layout
+        // keeps packets inside a page, so this is a
+        // documented corner, not a supported layout.
+        let mut mem = synaptics_page0();
+        mem[0xFE] = 0xAA;
+        mem[0xFF] = 0x5A;
+        let fake = FakeSmbus::new(mem, 0x00); // v1
+        fake.mem1.lock()[0x00] = 0xCC;
+        fake.mem1.lock()[0x01] = 0xDD;
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mark = fake.reads.lock().len();
+        let mut buf = [0u8; 4];
+        if t.read_block(0xFE, &mut buf).is_err() {
+            return TestResult::Fail("page-straddling read failed");
+        }
+        if buf != [0xAA, 0x5A, 0xCC, 0xDD] {
+            return TestResult::Fail("page-straddling read bytes wrong");
+        }
+        let reads = fake.reads.lock();
+        if reads[mark..] != [(OP_READ_I2C_BLOCK, 0xFE), (OP_READ_I2C_BLOCK, 0x00)] {
+            return TestResult::Fail("straddling read must be two per-page I2C block reads");
+        }
+        drop(reads);
+        // Exactly one page-select to page 1 — between the two
+        // chunks (the probe selected page 0 once already).
+        let writes = fake.writes.lock();
+        let to_page1 = writes
+            .iter()
+            .filter(|(op, cmd, data)| *op == OP_WRITE_BYTE && *cmd == 0xFF && data == &[1])
+            .count();
+        if to_page1 != 1 {
+            return TestResult::Fail("straddling read must page-select to 1 once");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v1_packet_read_page_boundary
+    );
+
+    fn smoke_smbus_rmi_v1_packet_read_chunks_at_32() -> TestResult {
+        // A 40-byte read is two I2C block reads (32 + 8): the
+        // SMBus 32-byte block cap binds every chunk, with the
+        // address advancing like the reference v1 loop. Flat
+        // scalar registers stream consecutive addresses, so
+        // the second chunk continues at 0x60.
+        let mut mem = synaptics_page0();
+        for i in 0..40usize {
+            mem[0x40 + i] = 0x40 + i as u8;
+        }
+        let fake = FakeSmbus::new(mem, 0x00); // v1
+        let mut t = SmbusRmiTransport::new(&fake, SMBUS_RMI_DEFAULT_ADDR);
+        if t.probe_version().is_err() {
+            return TestResult::Fail("v1 probe_version failed");
+        }
+        let mark = fake.reads.lock().len();
+        let mut buf = [0u8; 40];
+        if t.read_block(0x40, &mut buf).is_err() {
+            return TestResult::Fail("40-byte v1 read failed");
+        }
+        for (i, &byte) in buf.iter().enumerate() {
+            if byte != 0x40 + i as u8 {
+                return TestResult::Fail("40-byte v1 read bytes wrong");
+            }
+        }
+        let reads = fake.reads.lock();
+        if reads[mark..] != [(OP_READ_I2C_BLOCK, 0x40), (OP_READ_I2C_BLOCK, 0x60)] {
+            return TestResult::Fail("40-byte read must be I2C block reads at 0x40 and 0x60");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/smbus-rmi",
+        smoke_smbus_rmi_v1_packet_read_chunks_at_32
+    );
+
     // ── ATTN pump (issue #1682) ─────────────────────────────────
     //
     // The fake device is the attention source here: the F$01
@@ -7203,7 +7796,7 @@ mod smbus_rmi_smokes {
         // (0x14) — not the device-status byte at 0x13.
         let reads = fake.reads.lock();
         let post_probe = &reads[n_reads_before..];
-        if post_probe.first() != Some(&(OP_READ_BYTE, 0x14)) {
+        if post_probe.first() != Some(&(OP_READ_I2C_BLOCK, 0x14)) {
             return TestResult::Fail(
                 "ATTN service must read the F$01 interrupt status at 0x14 first",
             );
@@ -7289,7 +7882,7 @@ mod smbus_rmi_smokes {
         // Only the one status-byte read after the probe — no
         // F$12 / F$30 data reads on a spurious wake.
         let reads = fake.reads.lock();
-        if reads[n_reads_before..] != [(OP_READ_BYTE, 0x14)] {
+        if reads[n_reads_before..] != [(OP_READ_I2C_BLOCK, 0x14)] {
             return TestResult::Fail("zero-source ATTN must issue exactly one status read");
         }
         TestResult::Pass
@@ -8296,7 +8889,7 @@ impl crate::psmouse::Ps2Transport for FakePs2 {
 /// One sliced command + GETINFO on the wire, spelled out
 /// literally (Linux `psmouse_sliced_command`: `0xE6`, then `0xE8`
 /// + each 2-bit slice, most significant first; the query number
-/// selects the response).
+///   selects the response).
 fn syn_query_wire(query: u8) -> [u8; 10] {
     [
         0xE6,

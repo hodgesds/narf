@@ -120,6 +120,10 @@ memory-window ownership and do not use this control-register path.
   advertisement is honest (#841). A device that does not offer flush is
   treated as write-through, and a non-S_OK flush status surfaces as an
   error rather than silent success.
+  The sync write adapter handles the complete `n_blocks` range, validating
+  buffer length and LBA arithmetic before submitting each sector through
+  the existing polled primitive. Multi-sector filesystem or encrypted writes
+  must not be rejected as `BufferTooSmall` merely because they span one LBA.
 - VirtIO sound PCI queries PCM_INFO for every stream and registers the
   first viable output stream as playback device 0 and, when the device
   reports one, the first viable input stream as capture device 0 with

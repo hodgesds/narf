@@ -87,14 +87,18 @@ unsafe impl Io for Startup {
         if self.monitor.is_some() {
             return Err(power::Error::Terminal);
         }
-        // RTL8852B, or RTL8852C / RTL8851B once its signed program
+        // RTL8852A/B, or RTL8852C / RTL8851B once its signed program
         // installed its ordinary grant (`Native::prepare_radio_c` /
         // `prepare_radio_51`): 2.4/5GHz station without B companion
-        // programs.
+        // programs. RTL8852A takes B's ordinary station path: its
+        // `support_bands` are 2.4/5GHz and `support_bandwidths` 20/40/80MHz
+        // (`rtw8852a.c:2410..2416` @ 05441d6), and the station codec is
+        // B's (see `station_control::Controller::new`).
         if self.identity.is_none_or(|identity| {
             !matches!(
                 identity.chip(),
-                super::super::mac::ChipId::Rtl8852B
+                super::super::mac::ChipId::Rtl8852A
+                    | super::super::mac::ChipId::Rtl8852B
                     | super::super::mac::ChipId::Rtl8852C
                     | super::super::mac::ChipId::Rtl8851B
             )
@@ -759,7 +763,15 @@ unsafe impl Io for Startup {
             .submit_packet_rate(bytes, report, rate)
     }
     fn packet_poll(&mut self) -> Result<packet::Step, packet::Error> {
-        self.station_native()?.poll_packets()
+        let step = self.station_native()?.poll_packets()?;
+        // phy.c `rtw89_phy_antdiv_parse` hookup: a MACID-matched,
+        // to-self PPDU observation from this poll feeds the retained
+        // RTL8851B diversity owner. No-op without one (non-diversity
+        // boards and other chips retain no `antdiv_51` owner).
+        if let Some(observation) = step.antdiv {
+            self.radio_51.parse_ppdu(observation);
+        }
+        Ok(step)
     }
     fn irq_start(
         &mut self,

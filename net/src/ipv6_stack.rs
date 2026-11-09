@@ -27,7 +27,7 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -833,8 +833,9 @@ pub fn build_dad_ns_packet(target: [u8; 16]) -> Vec<u8> {
 // - RFC 4443 — ICMPv6. §2.2 (reply source determination), §2.3
 //   (pseudo-header checksum), §2.4(c) (error truncation to the
 //   minimum IPv6 MTU) + (e) (when an error must NOT be originated)
-//   + (f) (error rate limiting — NOT implemented here, see
-//   `send_icmp6_error_in`), §3 (error formats), §4 (echo).
+//   + (f) (error rate limiting — the token bucket in
+//   `icmp6_error_rate_limiter`, applied by `send_icmp6_error_in`),
+//   §3 (error formats), §4 (echo).
 //   <https://datatracker.ietf.org/doc/html/rfc4443>
 // - RFC 4861 — Neighbor Discovery. §7.2.2 (sending NS), §7.2.4
 //   (solicited NA), §7.2.6 (unsolicited NA).
@@ -875,6 +876,10 @@ pub enum Icmp6SendError {
     /// RFC 4443 §2.4(e): an error message must not be originated for
     /// this invoking packet. Nothing was queued or sent.
     ErrorSuppressed,
+    /// RFC 4443 §2.4(f): the originated-error rate limit was
+    /// exhausted. Nothing was queued or sent; the caller may retry
+    /// after the bucket refills.
+    RateLimited,
 }
 
 /// Emit one ICMPv6 message on an already-resolved interface: stamp
@@ -1196,6 +1201,214 @@ fn error_may_originate(kind: Icmp6ErrorKind, invoking: &[u8]) -> bool {
     true
 }
 
+// ── ICMPv6 originated-error rate limiting (RFC 4443 §2.4(f)) ────────
+//
+// §2.4(f) REQUIRES an IPv6 node to limit the rate of ICMPv6 error
+// messages it originates, "in order to limit the bandwidth and
+// forwarding costs incurred by originating ICMPv6 error messages",
+// and the §2.4(e)/(f) restrictions take precedence over any
+// requirement elsewhere to originate an error. The recommended method
+// is a token bucket: up to B error messages in a burst, refilling at
+// an average rate of N per second. The parameters SHOULD be
+// configurable; for a small/mid-size device the RFC's example
+// defaults are B=10, N=10/s, and those are the defaults here — NARF
+// is a host, not a high-end router, so no deviation from the RFC
+// examples is warranted.
+//
+// Scope decision: ONE bucket per node (global), not per-interface or
+// per-destination. The RFC frames the limit per node ("an IPv6 node
+// MUST limit the rate of ICMPv6 error messages it originates"), and
+// a single bucket is the smallest mechanism that satisfies the MUST
+// without unbounded per-destination state (which would need bounded
+// eviction). Trade-off, stated plainly: one destination flooding the
+// stack with erroneous packets can exhaust the shared bucket and
+// suppress errors to other destinations until it refills. A
+// per-destination limiter is a possible follow-up if that starvation
+// matters; it is not required by §2.4(f).
+//
+// The algorithm mirrors `crate::netfilter::IcmpRateLimit` (the IPv4
+// ICMP bucket): lock-free atomics, refill from the monotonic clock,
+// `try_acquire(now_ns)` takes an explicit clock so tests can inject
+// time deterministically. The bucket is consulted by
+// `send_icmp6_error_in`, so every originator is covered; the
+// `#1727` RX-triggered error generators consume the same entry point
+// (`icmp6_error_rate_limiter`) instead of growing a second limiter.
+
+/// Token-bucket burst for originated ICMPv6 errors (RFC 4443
+/// §2.4(f) example default for a small/mid-size device).
+pub const ICMPV6_ERROR_RATE_LIMIT_BURST: u64 = 10;
+
+/// Token-bucket refill rate, errors per second, for originated
+/// ICMPv6 errors (RFC 4443 §2.4(f) example default for a
+/// small/mid-size device).
+pub const ICMPV6_ERROR_RATE_LIMIT_PER_SEC: u64 = 10;
+
+/// Token-bucket limiter for originated ICMPv6 errors (RFC 4443
+/// §2.4(f)). Lock-free: atomics only, no spinlock, so it is safe on
+/// the RX-driven error paths that call `send_icmp6_error_in`.
+#[derive(Debug)]
+pub struct Icmp6ErrorRateLimiter {
+    /// Tokens currently available.
+    tokens: AtomicU64,
+    /// Last refill time in nanoseconds (monotonic).
+    last_refill_ns: AtomicU64,
+    /// Maximum tokens / bucket capacity (B).
+    capacity: AtomicU64,
+    /// Refill rate in tokens per second (N).
+    rate_per_sec: AtomicU64,
+}
+
+impl Icmp6ErrorRateLimiter {
+    pub const fn new(burst: u64, rate_per_sec: u64) -> Self {
+        Self {
+            tokens: AtomicU64::new(burst),
+            last_refill_ns: AtomicU64::new(0),
+            capacity: AtomicU64::new(burst),
+            rate_per_sec: AtomicU64::new(rate_per_sec),
+        }
+    }
+
+    /// Try to consume one token. Returns `true` on success (caller
+    /// may originate the ICMPv6 error), `false` on rate-limit (drop
+    /// instead, returning [`Icmp6SendError::RateLimited`]).
+    ///
+    /// `now_ns` is the current monotonic time in nanoseconds. Tests
+    /// inject this directly; production callers use
+    /// [`Icmp6ErrorRateLimiter::try_acquire_now`].
+    pub fn try_acquire(&self, now_ns: u64) -> bool {
+        self.refill(now_ns);
+        // Optimistic decrement.
+        loop {
+            let cur = self.tokens.load(Ordering::Acquire);
+            if cur == 0 {
+                return false;
+            }
+            if self
+                .tokens
+                .compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// [`Icmp6ErrorRateLimiter::try_acquire`] at the current
+    /// monotonic time. This is the entry point originators call:
+    /// `icmp6_error_rate_limiter().try_acquire_now()`.
+    pub fn try_acquire_now(&self) -> bool {
+        self.try_acquire(narf_scheduler::narf_time::monotonic_ns())
+    }
+
+    /// Refill based on elapsed time since the last refill.
+    /// Idempotent — callers don't need to lock around it.
+    fn refill(&self, now_ns: u64) {
+        let last = self.last_refill_ns.load(Ordering::Acquire);
+        if now_ns <= last {
+            return;
+        }
+        let elapsed = now_ns - last;
+        // Tokens-to-add = (elapsed_ns * rate) / 1e9.
+        let rate = self.rate_per_sec.load(Ordering::Acquire);
+        let to_add = elapsed.saturating_mul(rate) / 1_000_000_000;
+        if to_add == 0 {
+            return;
+        }
+        // CAS last_refill_ns so concurrent callers don't double-count.
+        if self
+            .last_refill_ns
+            .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // Cap tokens at capacity.
+        let capacity = self.capacity.load(Ordering::Acquire);
+        let mut cur = self.tokens.load(Ordering::Acquire);
+        loop {
+            let new = core::cmp::min(capacity, cur.saturating_add(to_add));
+            match self
+                .tokens
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Reconfigure the bucket (RFC 4443 §2.4(f): "The rate-limiting
+    /// parameters SHOULD be configurable"). `burst` is B, the maximum
+    /// burst size; `rate_per_sec` is N, the long-term average rate.
+    /// A burst of 0 disables originated errors entirely; a rate of 0
+    /// never refills. Tokens above a shrunk capacity are clamped
+    /// away at once, so the new burst bound applies immediately.
+    pub fn configure(&self, burst: u64, rate_per_sec: u64) {
+        self.capacity.store(burst, Ordering::Release);
+        self.rate_per_sec.store(rate_per_sec, Ordering::Release);
+        // Clamp any surplus tokens to the new capacity.
+        let mut cur = self.tokens.load(Ordering::Acquire);
+        loop {
+            let new = core::cmp::min(burst, cur);
+            match self
+                .tokens
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Current burst bound (B).
+    pub fn burst(&self) -> u64 {
+        self.capacity.load(Ordering::Acquire)
+    }
+
+    /// Current refill rate (N, errors per second).
+    pub fn rate_per_sec(&self) -> u64 {
+        self.rate_per_sec.load(Ordering::Acquire)
+    }
+
+    /// Currently available tokens (smoke instrumentation).
+    pub fn tokens_available(&self) -> u64 {
+        self.tokens.load(Ordering::Acquire)
+    }
+
+    /// Restore the RFC 4443 §2.4(f) example defaults (B=10, N=10/s)
+    /// with a full bucket. Test-only; also called from
+    /// [`__reset_for_test`] so every smoke starts un-limited.
+    #[doc(hidden)]
+    pub fn __reset_for_test(&self) {
+        self.capacity
+            .store(ICMPV6_ERROR_RATE_LIMIT_BURST, Ordering::Release);
+        self.rate_per_sec
+            .store(ICMPV6_ERROR_RATE_LIMIT_PER_SEC, Ordering::Release);
+        self.tokens
+            .store(ICMPV6_ERROR_RATE_LIMIT_BURST, Ordering::Release);
+        self.last_refill_ns.store(0, Ordering::Release);
+    }
+}
+
+/// The node's single originated-ICMPv6-error token bucket
+/// (RFC 4443 §2.4(f), defaults B=10, N=10/s).
+static ICMP6_ERROR_RATE_LIMIT: Icmp6ErrorRateLimiter = Icmp6ErrorRateLimiter::new(
+    ICMPV6_ERROR_RATE_LIMIT_BURST,
+    ICMPV6_ERROR_RATE_LIMIT_PER_SEC,
+);
+
+/// The global originated-ICMPv6-error rate limiter. This is the
+/// small entry point every error originator consumes — including the
+/// #1727 RX-triggered error generators, which are specified as
+/// subject to this limit: call `try_acquire_now()` before
+/// originating, and drop (returning [`Icmp6SendError::RateLimited`])
+/// when it returns `false`. `send_icmp6_error_in` already does this
+/// for the send path itself, so generators that go through it are
+/// covered without a second check.
+pub fn icmp6_error_rate_limiter() -> &'static Icmp6ErrorRateLimiter {
+    &ICMP6_ERROR_RATE_LIMIT
+}
+
 /// Originate an ICMPv6 error message for `invoking` (RFC 4443 §3).
 /// `src_ip` is this node's address the error is sent from (the
 /// address the invoking packet was destined to); the error's
@@ -1203,16 +1416,19 @@ fn error_may_originate(kind: Icmp6ErrorKind, invoking: &[u8]) -> bool {
 /// §3, "Destination Address"). The invoking packet is quoted up to
 /// the minimum-IPv6-MTU bound (RFC 4443 §2.4(c)) and the §2.4(e)
 /// suppression rules are applied — a suppressed error returns
-/// `ErrorSuppressed` and sends nothing.
+/// `ErrorSuppressed` and sends nothing. The §2.4(f) token bucket
+/// ([`icmp6_error_rate_limiter`]) is then consulted: an exhausted
+/// bucket returns `RateLimited` and sends nothing, so the §2.4(e)/(f)
+/// restrictions take precedence over any requirement to originate an
+/// error, as §2.4 requires. Callers no longer need to self-throttle
+/// per-packet on a fast path — the limiter bounds the originated
+/// rate — but they must still only originate errors for packets the
+/// stack itself drops for a specific reason.
 ///
-/// NOT implemented (RFC 4443 §2.4(f)): rate limiting of originated
-/// errors. A token bucket is a separate lane; until it lands, callers
-/// must only originate errors for packets the stack itself drops for
-/// a specific reason, never per-packet on a fast path. Likewise the
-/// (e.4)/(e.5) link-layer multicast/broadcast checks need the RX path
-/// to forward the L2 destination, which it currently strips — callers
-/// answering a link-layer multicast/broadcast frame must suppress
-/// themselves.
+/// The (e.4)/(e.5) link-layer multicast/broadcast checks still need
+/// the RX path to forward the L2 destination, which it currently
+/// strips — callers answering a link-layer multicast/broadcast frame
+/// must suppress themselves.
 pub fn send_icmp6_error(
     iface_name: &str,
     src_ip: [u8; 16],
@@ -1234,6 +1450,13 @@ pub fn send_icmp6_error_in(
 ) -> Result<(), Icmp6SendError> {
     if !error_may_originate(kind, invoking) {
         return Err(Icmp6SendError::ErrorSuppressed);
+    }
+    // RFC 4443 §2.4(f): limit the rate of originated errors. The
+    // bucket is checked after the §2.4(e) suppression rules so a
+    // suppressed error never burns a token, and before any frame is
+    // built or queued so a limited error costs nothing.
+    if !ICMP6_ERROR_RATE_LIMIT.try_acquire_now() {
+        return Err(Icmp6SendError::RateLimited);
     }
     // §3: the error's destination is the invoking packet's source.
     let dst_ip: [u8; 16] = invoking[8..24].try_into().unwrap();
@@ -1571,4 +1794,5 @@ pub fn __reset_for_test() {
     FRAGS.lock().clear();
     PMTU.lock().clear();
     PENDING_ICMP6.lock().clear();
+    ICMP6_ERROR_RATE_LIMIT.__reset_for_test();
 }

@@ -835,6 +835,14 @@ kernel_test_in!("drivers/net/e1000", smoke_e1000_qemu_fwsm_dance_is_noop);
 /// controller's `rx_ipc_ring`, and the controller still owns its
 /// ring after attach. A re-probe hands back the same `Arc`.
 ///
+/// Two-device branch (issue #1632, `XTASK_QEMU_SECOND_NIC=1`): with
+/// two same-family NICs attached, both probe as live instances at
+/// cookies 0 and 1 — distinct `Arc`s, distinct published names and
+/// MACs — and a `send_on` on the second name routes through cookie
+/// 1: the posted frame's bytes land in the second instance's TX
+/// slot buffer (same shape as the aqc113 #1992 fixture proves
+/// cookie-1 routing) and in no other port's next slot.
+///
 /// No-silicon branch runs in CI on every config: with no device
 /// present the vec must be empty and the registry send must fail.
 /// A second NIC of the same family is only provable with two
@@ -851,17 +859,22 @@ fn smoke_e1000_multi_instance_cookie_dispatch() -> TestResult {
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has_e1000 = devs.iter().any(|d| {
-        matches!(&d.kind, BusKind::Pcie { .. })
-            && d.id.vendor == e1000::E1000_VENDOR
-            && (d.id.device == e1000::E1000_DEV_82540EM
-                || d.id.device == e1000::E1000_DEV_82545EM
-                || d.id.device == e1000::E1000_DEV_82544GC
-                || d.id.device == e1000::E1000E_DEV_82574L)
-    });
+    let e1000_addrs: alloc::vec::Vec<narf_bus::BusAddr> = devs
+        .iter()
+        .filter(|d| {
+            matches!(&d.kind, BusKind::Pcie { .. })
+                && d.id.vendor == e1000::E1000_VENDOR
+                && (d.id.device == e1000::E1000_DEV_82540EM
+                    || d.id.device == e1000::E1000_DEV_82545EM
+                    || d.id.device == e1000::E1000_DEV_82544GC
+                    || d.id.device == e1000::E1000E_DEV_82574L)
+        })
+        .map(|d| d.addr)
+        .collect();
+    let n = e1000_addrs.len();
     // No silicon: the vec must be empty and cookie-0 send must fail
     // at the registry (no iface registered for this family).
-    if !has_e1000 {
+    if n == 0 {
         if e1000::instance_count() != 0 {
             return TestResult::Fail("instance_count != 0 with no e1000 silicon");
         }
@@ -885,6 +898,13 @@ fn smoke_e1000_multi_instance_cookie_dispatch() -> TestResult {
     }
     if !e1000::is_probed() {
         return TestResult::Fail("e1000 not probed");
+    }
+    // Two NICs: the two-device branch below (issue #1632).
+    if n == 2 {
+        return smoke_e1000_multi_instance_two_nic(&e1000_addrs);
+    }
+    if n != 1 {
+        return TestResult::Fail("unexpected e1000 device count");
     }
     if e1000::instance_count() != 1 {
         return TestResult::Fail("instance_count != 1 after single-NIC probe");
@@ -941,6 +961,154 @@ fn smoke_e1000_multi_instance_cookie_dispatch() -> TestResult {
     }
     if ctrl.tx_ipc_ring.lock().is_none() {
         return TestResult::Fail("attach took the NIC's TX ring");
+    }
+    TestResult::Pass
+}
+
+/// Two-device branch of [`smoke_e1000_multi_instance_cookie_dispatch`]
+/// (issue #1632): runs after probe, with two same-family NICs attached
+/// (`XTASK_QEMU_SECOND_NIC=1`). Both must probe as live instances at
+/// cookies 0 and 1 — distinct `Arc`s bound to distinct PCI functions,
+/// with distinct published names and MACs — and a `send_on` on the
+/// second name must route through cookie 1: the posted frame's bytes
+/// land in the second instance's TX slot buffer and advance its TX
+/// cursor, and in no other port's next slot. Routing is proven by the
+/// posted frame itself, not by the send result: `tx_enqueue` copies
+/// the frame into `tx_pool[slot]` before posting the descriptor, so
+/// a link-down device still shows the post on the right instance —
+/// and a concurrent stack frame on another port cannot fake the
+/// addressed port's slot bytes.
+fn smoke_e1000_multi_instance_two_nic(e1000_addrs: &[narf_bus::BusAddr]) -> TestResult {
+    use crate::e1000;
+    use narf_bus::{bootstrap_registry_authority, probe_all_pci};
+    if e1000::instance_count() != 2 {
+        return TestResult::Fail("instance_count != 2 after two-NIC probe");
+    }
+    let ctrl0 = match e1000::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) None after two-NIC probe"),
+    };
+    let ctrl1 = match e1000::controller(1) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(1) None after two-NIC probe"),
+    };
+    if e1000::controller(2).is_some() {
+        return TestResult::Fail("controller(2) Some with two NICs");
+    }
+    if e1000::controller(usize::MAX).is_some() {
+        return TestResult::Fail("controller(MAX) Some");
+    }
+    // Distinct instances, each bound to the PCI function it was
+    // probed at — not two handles to one controller.
+    if alloc::sync::Arc::as_ptr(&ctrl0) == alloc::sync::Arc::as_ptr(&ctrl1) {
+        return TestResult::Fail("controller(0) and controller(1) are the same Arc");
+    }
+    if ctrl0.addr != e1000_addrs[0] {
+        return TestResult::Fail("controller(0) bound to the wrong PCI address");
+    }
+    if ctrl1.addr != e1000_addrs[1] {
+        return TestResult::Fail("controller(1) bound to the wrong PCI address");
+    }
+    let name0 = ctrl0.ifname();
+    let name1 = ctrl1.ifname();
+    if name0.is_empty() {
+        return TestResult::Fail("published name empty after two-NIC probe (port 0)");
+    }
+    if name1.is_empty() {
+        return TestResult::Fail("published name empty after two-NIC probe (port 1)");
+    }
+    if name0 == name1 {
+        return TestResult::Fail("two controllers share one published name");
+    }
+    if narf_net::iface::lookup(name0).is_none() {
+        return TestResult::Fail("iface not published under its name (port 0)");
+    }
+    if narf_net::iface::lookup(name1).is_none() {
+        return TestResult::Fail("iface not published under its name (port 1)");
+    }
+    // QEMU auto-assigns distinct MACs to the two NICs (52:54:00:12:34:56,
+    // counting the last octet upward); the fixture pins distinctness,
+    // not the values.
+    if ctrl0.mac == ctrl1.mac {
+        return TestResult::Fail("two controllers share one MAC");
+    }
+    // A repeat probe must hand back the same Arcs (same-address dedup).
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+    if e1000::instance_count() != 2 {
+        return TestResult::Fail("instance_count changed across re-probe");
+    }
+    let after0 = match e1000::controller(0) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(0) vanished across re-probe"),
+    };
+    if alloc::sync::Arc::as_ptr(&after0) != alloc::sync::Arc::as_ptr(&ctrl0) {
+        return TestResult::Fail("re-probe replaced controller(0)");
+    }
+    let after1 = match e1000::controller(1) {
+        Some(c) => c,
+        None => return TestResult::Fail("controller(1) vanished across re-probe"),
+    };
+    if alloc::sync::Arc::as_ptr(&after1) != alloc::sync::Arc::as_ptr(&ctrl1) {
+        return TestResult::Fail("re-probe replaced controller(1)");
+    }
+    // Ring identity, both ports: the registry adapter borrows each
+    // NIC's own ring — no static take happened at attach.
+    for (ctrl, name) in [(&ctrl0, name0), (&ctrl1, name1)] {
+        let ring_ptr =
+            narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
+        if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
+            return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
+        }
+        if ctrl.rx_ipc_ring.lock().is_none() {
+            return TestResult::Fail("attach took the NIC's RX ring");
+        }
+        let tx_ptr =
+            narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
+        if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
+            return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
+        }
+        if ctrl.tx_ipc_ring.lock().is_none() {
+            return TestResult::Fail("attach took the NIC's TX ring");
+        }
+    }
+    // Send routing: a frame posted to port i lands in port i's TX
+    // slot buffer and advances port i's TX cursor, and in no other
+    // port's next slot. The frames are distinctive per port
+    // (broadcast dst, locally-administered src with the port index
+    // in the last byte, 0xFFFF ethertype) so no background frame can
+    // fake the addressed port's slot bytes. `send_on` resolves the
+    // name to the cookie the probe registered, so the second name's
+    // send is the cookie-1 dispatch proof.
+    let ctrls = [&ctrl0, &ctrl1];
+    let names = [name0, name1];
+    for (i, &name) in names.iter().enumerate() {
+        let mut frame = [0u8; 64];
+        frame[..6].fill(0xFF);
+        frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, (i + 1) as u8]);
+        frame[12] = 0xFF;
+        frame[13] = 0xFF;
+        let heads = [ctrl0.tx_next_to_use(), ctrl1.tx_next_to_use()];
+        if narf_net::iface::send_on(name, &frame).is_err() {
+            return TestResult::Fail("send_on TX failed (two-NIC branch)");
+        }
+        for (j, c) in ctrls.iter().enumerate() {
+            let posted = c.tx_slot_matches(heads[j], &frame);
+            if j == i {
+                if !posted {
+                    return TestResult::Fail(
+                        "send_on did not post the frame to the addressed port's TX ring",
+                    );
+                }
+                if c.tx_next_to_use() == heads[j] {
+                    return TestResult::Fail("send_on left the addressed port's TX head unmoved");
+                }
+            } else if posted {
+                return TestResult::Fail(
+                    "send_on posted the frame to a port other than the addressed one",
+                );
+            }
+        }
     }
     TestResult::Pass
 }
@@ -3203,6 +3371,7 @@ fn smoke_netdev_carrier_transitions() -> TestResult {
             duplex: Some(narf_net::iface::LinkDuplex::Full),
             media_available: None,
             phy_type: None,
+            phy_type_name: None,
         },
     ) {
         return TestResult::Fail("publish_link rejected the up transition");
@@ -3240,7 +3409,8 @@ fn smoke_netdev_media_publication() -> TestResult {
     let Some(down0) = narf_net::iface::lookup(&name) else {
         return TestResult::Fail("media fixture iface missing after publish");
     };
-    if down0.media_available.is_some() || down0.phy_type.is_some() {
+    if down0.media_available.is_some() || down0.phy_type.is_some() || down0.phy_type_name.is_some()
+    {
         return TestResult::Fail("media fixture did not start unknown");
     }
     if !publish_link(
@@ -3251,6 +3421,7 @@ fn smoke_netdev_media_publication() -> TestResult {
             duplex: None,
             media_available: Some(true),
             phy_type: Some(0x07),
+            phy_type_name: Some("SFI"),
         },
     ) {
         return TestResult::Fail("publish_link rejected the media up sample");
@@ -3260,6 +3431,9 @@ fn smoke_netdev_media_publication() -> TestResult {
     };
     if up.media_available != Some(true) || up.phy_type != Some(0x07) {
         return TestResult::Fail("media state did not reach iface metadata");
+    }
+    if up.phy_type_name != Some("SFI") {
+        return TestResult::Fail("decoded phy_type name did not reach iface metadata");
     }
     // Link down, module still seated: carrier and speed clear,
     // media and PHY type survive.
@@ -3271,6 +3445,7 @@ fn smoke_netdev_media_publication() -> TestResult {
             duplex: None,
             media_available: Some(true),
             phy_type: Some(0x07),
+            phy_type_name: Some("SFI"),
         },
     ) {
         return TestResult::Fail("publish_link rejected the media down sample");
@@ -3284,6 +3459,9 @@ fn smoke_netdev_media_publication() -> TestResult {
     if down1.media_available != Some(true) || down1.phy_type != Some(0x07) {
         return TestResult::Fail("down sample dropped the seated-module state");
     }
+    if down1.phy_type_name != Some("SFI") {
+        return TestResult::Fail("down sample dropped the decoded phy_type name");
+    }
     // Empty cage: media flips to absent, and the PHY type of the
     // removed module clears with it — an empty cage has no type.
     if !publish_link(
@@ -3294,6 +3472,7 @@ fn smoke_netdev_media_publication() -> TestResult {
             duplex: None,
             media_available: Some(false),
             phy_type: None,
+            phy_type_name: None,
         },
     ) {
         return TestResult::Fail("publish_link rejected the empty-cage sample");
@@ -3301,7 +3480,10 @@ fn smoke_netdev_media_publication() -> TestResult {
     let Some(cage) = narf_net::iface::lookup(&name) else {
         return TestResult::Fail("media fixture iface missing after cage sample");
     };
-    if cage.media_available != Some(false) || cage.phy_type.is_some() {
+    if cage.media_available != Some(false)
+        || cage.phy_type.is_some()
+        || cage.phy_type_name.is_some()
+    {
         return TestResult::Fail("empty-cage sample did not land media state");
     }
     TestResult::Pass

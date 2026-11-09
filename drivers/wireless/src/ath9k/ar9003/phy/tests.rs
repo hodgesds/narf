@@ -174,7 +174,16 @@ fn smoke_ath9k_ar9300_prepare_channel_registers() -> TestResult {
         (5180, 20243, 4, 18218, 0x104, 5_657_941),
     ] {
         let mut io = Regs::default();
-        let Ok(prepared) = prepare(&mut io, &revision, &id, &image, frequency, 0xe0, 40) else {
+        let Ok(prepared) = prepare(
+            &mut io,
+            &revision,
+            &id,
+            super::super::serdes::PllPwrsave::resolve(Chip::Ar9300, 0, 0),
+            &image,
+            frequency,
+            0xe0,
+            40,
+        ) else {
             return TestResult::Fail("20 MHz channel preparation was refused");
         };
         let five = frequency > 4000;
@@ -226,7 +235,18 @@ fn smoke_ath9k_ar9300_prepare_channel_registers() -> TestResult {
     }
     // Japan 2484 writes the CCK FIR rows; band and channel refusals.
     let mut io = Regs::default();
-    if prepare(&mut io, &revision, &id, &image, 2484, 0xe0, 40).is_err() {
+    if prepare(
+        &mut io,
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(Chip::Ar9300, 0, 0),
+        &image,
+        2484,
+        0xe0,
+        40,
+    )
+    .is_err()
+    {
         return TestResult::Fail("2484 MHz preparation was refused");
     }
     let japan = super::super::initvals::AR9300_2P2_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484;
@@ -240,8 +260,16 @@ fn smoke_ath9k_ar9300_prepare_channel_registers() -> TestResult {
     no_5g.op_flags = 0x2;
     for (identity, frequency) in [(id, 5170u16), (id, 2413), (no_5g, 5180)] {
         let mut io = Regs::default();
-        if prepare(&mut io, &revision, &identity, &image, frequency, 0xe0, 40)
-            != Err(BringUpError::Policy)
+        if prepare(
+            &mut io,
+            &revision,
+            &identity,
+            super::super::serdes::PllPwrsave::resolve(Chip::Ar9300, 0, 0),
+            &image,
+            frequency,
+            0xe0,
+            40,
+        ) != Err(BringUpError::Policy)
             || !io.writes.is_empty()
         {
             return TestResult::Fail("unsupported channel or band was prepared or wrote registers");
@@ -573,8 +601,25 @@ fn smoke_ath9k_ar9300_expected_preparation_matches_prepare() -> TestResult {
         }
         let mut io = Regs::default();
         let (Ok(prepared), Ok(facts)) = (
-            prepare(&mut io, &revision, &id, &image, frequency, 0xe0, 0),
-            expected(&revision, &id, &image, frequency, 0xe0, 0),
+            prepare(
+                &mut io,
+                &revision,
+                &id,
+                super::super::serdes::PllPwrsave::resolve(Chip::Ar9300, 0, 0),
+                &image,
+                frequency,
+                0xe0,
+                0,
+            ),
+            expected(
+                &revision,
+                &id,
+                super::super::serdes::PllPwrsave::resolve(Chip::Ar9300, 0, 0),
+                &image,
+                frequency,
+                0xe0,
+                0,
+            ),
         ) else {
             return TestResult::Fail("AR9300 preparation or its expected facts refused");
         };
@@ -582,7 +627,16 @@ fn smoke_ath9k_ar9300_expected_preparation_matches_prepare() -> TestResult {
             return TestResult::Fail("AR9300 expected preparation differs from prepare");
         }
     }
-    if expected(&revision, &id, &image, 2465, 0xe0, 0) != Err(BringUpError::Policy) {
+    if expected(
+        &revision,
+        &id,
+        super::super::serdes::PllPwrsave::resolve(Chip::Ar9300, 0, 0),
+        &image,
+        2465,
+        0xe0,
+        0,
+    ) != Err(BringUpError::Policy)
+    {
         return TestResult::Fail("AR9300 expected preparation admitted an off-raster channel");
     }
     TestResult::Pass

@@ -1281,6 +1281,7 @@ fn igb_link_sample_from_status(status: u32) -> crate::publish::LinkSample {
         // copper/fiber/SerDes, not caged modules (issue #791).
         media_available: None,
         phy_type: None,
+        phy_type_name: None,
     }
 }
 

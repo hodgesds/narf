@@ -9,6 +9,7 @@ members = [
     "aml",
     "arch",
     "boot",
+    "boot/protocol",
     "console",
     "memory",
     "time",

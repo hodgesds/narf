@@ -323,23 +323,31 @@ pub unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
     r
 }
 
-/// `accept(fd, *addr, *len)`. Loops over the kernel single-shot
-/// accept until a connection arrives.
+/// `accept(fd, *addr, *len)`. Single-shot: the kernel parks a
+/// blocking accept on WouldBlock and re-executes it in-kernel
+/// (`userspace/src/handlers/compat.inc.rs::accept_common`), so
+/// whatever the kernel returns here is terminal — `>= 0` is the
+/// new fd, `< 0` is `-errno` (bad fd, not a socket, full fd table,
+/// faulting addr, …). There is nothing for libc to retry: a
+/// WouldBlock never reaches us on a blocking socket, and on a
+/// non-blocking socket it arrives as `-EAGAIN`, which POSIX says
+/// to surface at once, not spin on (musl does not retry it).
+///
+/// The previous loop retried on ANY negative return, so a real
+/// error on a blocking fd — or `-EAGAIN` on a non-blocking fd with
+/// no pending connection — spun forever instead of being reported
+/// (#1947; same hang class as #1936, fixed for recvfrom by #1941).
 ///
 /// # Safety
 /// `addr` and `len` may be NULL; if non-null they must point at
 /// writable sockaddr-shaped storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
-    loop {
-        let r = narf_user_runtime::accept(fd, addr as *mut u8, len);
-        if r >= 0 {
-            return r;
-        }
-        // Kernel parked us briefly; retry. The yield happens
-        // kernel-side via the same sleep-deadline path sys_futex
-        // uses.
+    let r = narf_user_runtime::accept(fd, addr as *mut u8, len);
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
     }
+    r
 }
 
 /// `shutdown(fd, how)`.
@@ -439,9 +447,20 @@ pub unsafe extern "C" fn sendto(
     r
 }
 
-/// `recvfrom(fd, *buf, len, flags, *addr, *alen)`. Loops over the
-/// kernel single-shot recv until at least 1 byte arrives or the
-/// peer closes (returns 0).
+/// `recvfrom(fd, *buf, len, flags, *addr, *alen)`. Single-shot: the
+/// kernel parks a blocking recv on WouldBlock and re-executes it
+/// (`userspace/src/handlers/sys_socket_recv.rs`), so whatever the
+/// kernel returns here is terminal — `> 0` bytes, `0` = EOF (peer
+/// FIN / closed socket, per `userspace/src/socket.rs::do_recv`),
+/// `< 0` = `-errno`. There is nothing for libc to retry: a
+/// WouldBlock never reaches us on a blocking socket, and on a
+/// non-blocking socket it arrives as `-EAGAIN`, which POSIX says
+/// to surface at once, not spin on.
+///
+/// The previous loop retried on `r == 0`, conflating EOF with
+/// WouldBlock (the kernel never returns 0 for WouldBlock), so
+/// `recv()` could never return 0 and close-delimited reads hung
+/// forever (#1936).
 ///
 /// # Safety
 /// `buf` must be writable for `len` bytes.
@@ -457,30 +476,12 @@ pub unsafe extern "C" fn recvfrom(
     if len == 0 {
         return 0;
     }
-    // Peek loop: kernel returns 0 to indicate "WouldBlock — try
-    // again after a yield"; -1 to indicate genuine error. A real
-    // 0-length read on a closed socket would also return 0, but
-    // for connected SOCK_STREAM that's only after shutdown — for
-    // now we conflate "would-block" and "EOF" as "loop". The
-    // kernel-side park keeps the spin cheap.
-    loop {
-        let r = narf_user_runtime::recvfrom(
-            fd,
-            buf as *mut u8,
-            len,
-            flags as u32,
-            addr as *mut u8,
-            alen,
-        );
-        if r > 0 {
-            return r;
-        }
-        if r < 0 {
-            crate::errno::set_errno(crate::errno::EINVAL);
-            return r;
-        }
-        // r == 0 — kernel parked us; retry.
+    let r =
+        narf_user_runtime::recvfrom(fd, buf as *mut u8, len, flags as u32, addr as *mut u8, alen);
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
     }
+    r
 }
 
 /// `getsockopt(fd, level, name, *val, *vlen)`.

@@ -8,6 +8,14 @@
 //! register block. It does NOT include the firmware/RF/power/station
 //! profile (BB/RF tables, TX-power program, calibration, station
 //! composition) — that profile is the remainder of the `rtl8922a` TSV row.
+//! What of it now exists: the firmware-parameter load path
+//! (`radio_assets` admits Rtl8922A: BB/GAIN/RADIO_A idx0/RADIO_B idx1/
+//! NCTL from the container, no static fallback), the BE TX-power
+//! program (`radio_power_be::Plan`), and the power-trim parse
+//! (`efuse_be::BeFactory::power_trim`). Still open: BE BB/RF/NCTL table
+//! application, calibration `Board::new_be`, power-trim application,
+//! periodic thermal/TSSI tracking, RFK execution, FW security
+//! (follow-ups of #1878).
 //!
 //! Deliberate narrowings, all from the Linux struct itself:
 //! - `support_bandwidths` is 20/40/80/160 MHz. 320 MHz EHT operation is

@@ -32,14 +32,17 @@
 //! `enum rtw89_rf_path_bit`: `RF_A = BIT(0) = 1`, `RF_B = BIT(1) = 2`.
 //!
 //! The runtime track (`parse` / `track` / `step`) is a pure state
-//! machine: it takes already-classified PPDU observations because NARF
-//! has no PPDU rate model yet to express Linux's
-//! `rtw89_get_data_rate_mode` + `RTW89_HW_RATE_OFDM6` split (NON_HT
-//! rate below OFDM6 -> CCK, otherwise OFDM; any other mode ->
-//! non-legacy). Hooking `parse` into the PHYSTS path and `track` /
-//! `step` into periodic work is the open remainder, not part of this
-//! module: the scheduler that owns the 30 ms / 110 ms / immediate
-//! re-queue periods does not exist yet in the rtw89 owner.
+//! machine over already-classified PPDU observations
+//! (`super::rx_packet::AntDivObservation`, classified by
+//! `super::rx_packet::ppdu_class` from Linux's
+//! `rtw89_get_data_rate_mode` + `RTW89_HW_RATE_OFDM6` split).
+//! `radio_51::Radio::parse_ppdu` feeds it from the MACID-matched
+//! PHYSTS path and `Radio::track` drives `track` / `step` on the 2 s
+//! track tick; the 30 ms / 110 ms / immediate re-queue periods Linux's
+//! `antdiv_work` uses are recorded as the requested period
+//! (`Radio::antdiv_period_ms`), because NARF has no sub-second
+//! delayed-work scheduler yet.
+use super::rx_packet::PpduClass;
 use super::{phy_operating, power, rfk};
 use alloc::vec::Vec;
 
@@ -199,19 +202,6 @@ impl Ewma {
     fn read(self) -> u32 {
         self.internal >> 10
     }
-}
-
-/// Already-classified PPDU observation, standing in for Linux's
-/// `rtw89_rx_phy_ppdu` rate until NARF carries a PPDU rate model: the
-/// caller maps the rate via `rtw89_get_data_rate_mode` plus the
-/// `RTW89_HW_RATE_OFDM6` split (NON_HT below OFDM6 -> [`PpduClass::Cck`],
-/// NON_HT at/above OFDM6 -> [`PpduClass::Ofdm`], any other mode ->
-/// [`PpduClass::NonLegacy`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PpduClass {
-    Cck,
-    Ofdm,
-    NonLegacy,
 }
 
 /// One `rtw89_antdiv_stats` instance: per-class EWMA RSSI, per-class

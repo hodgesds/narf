@@ -240,7 +240,7 @@ fn smoke_rtw89_dma_8922a_doorbells() -> TestResult {
     // Index readback round-trips the fake's word.
     let mut m = Model::new().with32(0xB108, 0x0012_0034);
     match read_tx_idx(&mut m, 2) {
-        Ok(word) if word == 0x0012_0034 => {}
+        Ok(0x0012_0034) => {}
         _ => return TestResult::Fail("TX idx readback wrong"),
     }
     // Refusals: out-of-range channels.

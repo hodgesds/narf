@@ -39,46 +39,46 @@ use super::radio_assets::{Assets, Element};
 use super::rfk::Error;
 
 /// `RTW89_FW_ELEMENT_ID_*`.
-const ID_BYRATE: u32 = 9;
-const ID_LMT_2GHZ: u32 = 10;
-const ID_LMT_5GHZ: u32 = 11;
-const ID_LMT_6GHZ: u32 = 12;
-const ID_LMT_RU_2GHZ: u32 = 13;
-const ID_LMT_RU_5GHZ: u32 = 14;
-const ID_LMT_RU_6GHZ: u32 = 15;
-const ID_TX_SHAPE_LMT: u32 = 16;
-const ID_REGD: u32 = 20;
+pub(super) const ID_BYRATE: u32 = 9;
+pub(super) const ID_LMT_2GHZ: u32 = 10;
+pub(super) const ID_LMT_5GHZ: u32 = 11;
+pub(super) const ID_LMT_6GHZ: u32 = 12;
+pub(super) const ID_LMT_RU_2GHZ: u32 = 13;
+pub(super) const ID_LMT_RU_5GHZ: u32 = 14;
+pub(super) const ID_LMT_RU_6GHZ: u32 = 15;
+pub(super) const ID_TX_SHAPE_LMT: u32 = 16;
+pub(super) const ID_REGD: u32 = 20;
 /// `RTW89_WW`.
-const WW: u8 = 0;
+pub(super) const WW: u8 = 0;
 /// `RTW89_REGD_NUM`, `RTW89_NTX_NUM`, `RTW89_BF_NUM`, `RTW89_RS_LMT_NUM`,
 /// `RTW89_RU_NUM`, `RTW89_BAND_NUM`, `RTW89_BYR_BW_NUM`,
 /// `NUM_OF_RTW89_REG_6GHZ_POWER`.
-const REGD_NUM: u8 = 16;
-const NTX_NUM: u8 = 2;
-const BF_NUM: u8 = 2;
-const RS_LMT_NUM: u8 = 3;
-const RU_NUM: u8 = 8;
-const BAND_NUM: u8 = 3;
-const BYR_BW_NUM: u8 = 5;
-const REG_6GHZ_POWER_NUM: u8 = 3;
+pub(super) const REGD_NUM: u8 = 16;
+pub(super) const NTX_NUM: u8 = 2;
+pub(super) const BF_NUM: u8 = 2;
+pub(super) const RS_LMT_NUM: u8 = 3;
+pub(super) const RU_NUM: u8 = 8;
+pub(super) const BAND_NUM: u8 = 3;
+pub(super) const BYR_BW_NUM: u8 = 5;
+pub(super) const REG_6GHZ_POWER_NUM: u8 = 3;
 /// `RTW89_6G_BW_NUM` (`RTW89_CHANNEL_WIDTH_320 + 1`), `RTW89_6G_CH_NUM`.
-const BW_6G_NUM: u8 = 5;
-const CH_6G_NUM: u8 = 120;
+pub(super) const BW_6G_NUM: u8 = 5;
+pub(super) const CH_6G_NUM: u8 = 120;
 /// `enum rtw89_regulation_type` members regd.c treats specially.
 const ETSI: u8 = 1;
 const UK: u8 = 14;
 /// `RTW89_REGD_MAX_COUNTRY_NUM` (U8_MAX).
 const MAX_COUNTRY_NUM: u32 = 255;
 /// `RTW89_MIN_VALID_POWER_CONSTRAINT` (dBm).
-const MIN_VALID_POWER_CONSTRAINT: i8 = -10;
+pub(super) const MIN_VALID_POWER_CONSTRAINT: i8 = -10;
 /// `enum rtw89_rate_section`.
-const RS_CCK: u8 = 0;
-const RS_OFDM: u8 = 1;
-const RS_MCS: u8 = 2;
-const RS_HEDCM: u8 = 3;
-const RS_OFFSET: u8 = 4;
+pub(super) const RS_CCK: u8 = 0;
+pub(super) const RS_OFDM: u8 = 1;
+pub(super) const RS_MCS: u8 = 2;
+pub(super) const RS_HEDCM: u8 = 3;
+pub(super) const RS_OFFSET: u8 = 4;
 /// `RTW89_SAR_TXPWR_MAC_MAX` (no SAR source) and `txpwr_factor_rf - mac`.
-const SAR_MAC_MAX: i8 = 63;
+pub(super) const SAR_MAC_MAX: i8 = 63;
 
 /// MAC CRs (`R_AX_PWR_*`) and PHY CRs (NARF PHY window = 0x10000 + CR).
 const R_AX_PWR_RATE_OFST_CTRL: u32 = 0xd204;
@@ -88,9 +88,10 @@ const R_AX_PWR_RU_LMT: u32 = 0xd33c;
 const R_AX_BANDEDGE_CFG: u32 = 0xd94c;
 const PHY: u32 = 0x1_0000;
 
-/// One selected `struct rtw89_txpwr_conf`.
+/// One selected `struct rtw89_txpwr_conf`. Shared with the BE plan,
+/// which iterates the same selected configuration.
 #[derive(Clone, Copy)]
-struct Conf<'a> {
+pub(super) struct Conf<'a> {
     rfe: u8,
     size: usize,
     data: &'a [u8],
@@ -99,7 +100,8 @@ struct Conf<'a> {
 impl<'a> Conf<'a> {
     /// `rtw89_for_each_in_txpwr_conf` + `__fw_txpwr_entry_acceptable`:
     /// yields the first `known` bytes (zero padded) of each acceptable entry.
-    fn entries(self, known: usize) -> impl Iterator<Item = [u8; 16]> + 'a {
+    /// Shared with the BE plan, which iterates the same fw.c entries.
+    pub(super) fn entries(self, known: usize) -> impl Iterator<Item = [u8; 16]> + 'a {
         self.data.chunks_exact(self.size).filter_map(move |e| {
             if e.len() > known && e[known..].iter().any(|&v| v != 0) {
                 return None;
@@ -114,8 +116,9 @@ impl<'a> Conf<'a> {
 
 /// fw.c `rtw89_fw_recognize_txpwr_from_elm` over the container order.
 /// Malformed headers (size inconsistent with `num_ents * ent_sz`) fail
-/// closed instead of being iterated.
-fn select(elements: &[Element], id: u32, rfe: u8) -> Result<Option<Conf<'_>>, Error> {
+/// closed instead of being iterated. Shared with the BE plan
+/// (`radio_power_be`), which selects the same fw.c elements.
+pub(super) fn select(elements: &[Element], id: u32, rfe: u8) -> Result<Option<Conf<'_>>, Error> {
     let mut conf: Option<Conf<'_>> = None;
     for elm in elements.iter().filter(|e| e.id == id) {
         let h = elm.bytes.get(..8).ok_or(Error::Table)?;
@@ -171,7 +174,10 @@ fn offset(ch: u8, delta: i16) -> u8 {
 }
 
 /// `rtw89_phy_txpwr_rf_to_mac` (factor rf 2, mac 1: arithmetic >> 1).
-fn rf_to_mac(v: i8) -> i8 {
+/// Shared with the BE plan: 8922A carries the same factors
+/// (`chip_8922a::{TXPWR_FACTOR_BB, TXPWR_FACTOR_RF, TXPWR_FACTOR_MAC}`
+/// = 3/2/1).
+pub(super) fn rf_to_mac(v: i8) -> i8 {
     v >> 1
 }
 
@@ -270,7 +276,8 @@ const NA: u8 = 4;
 /// constraint in dBm): `rtw89_phy_txpwr_dbm_without_tolerance` then
 /// `rtw89_phy_txpwr_dbm_to_mac` (factor 1, clamped to -64..63). Without
 /// a TPE it is `dbm_to_mac(S8_MAX)` = 63, the existing SAR-free bound.
-fn tpe_mac(constraint: Option<i8>) -> i8 {
+/// Shared with the BE plan (same phy.c function reads both gens).
+pub(super) fn tpe_mac(constraint: Option<i8>) -> i8 {
     let Some(dbm) = constraint else {
         return SAR_MAC_MAX;
     };
@@ -278,8 +285,11 @@ fn tpe_mac(constraint: Option<i8>) -> i8 {
     (i16::from(dbm) << 1).clamp(-64, 63) as i8
 }
 
-/// The selected per-band configurations.
-struct Rules<'a> {
+/// The selected per-band configurations. Shared with the BE plan
+/// (`radio_power_be`): phy.c `rtw89_phy_read_txpwr_limit{,_ru}` is
+/// generation-independent, so the BE limit/RU pages read through the
+/// same rules with BE page geometry.
+pub(super) struct Rules<'a> {
     band: Band,
     lmt: Conf<'a>,
     ru: Conf<'a>,
@@ -289,7 +299,31 @@ struct Rules<'a> {
     cstr: i8,
 }
 
-impl Rules<'_> {
+impl<'a> Rules<'a> {
+    /// Select the band's TXPWR_LMT / LMT_RU configurations for `rfe`
+    /// (fw.c `rtw89_fw_recognize_txpwr_from_elm`); `six` is the 6GHz
+    /// regd.c context with its TPE constraint, `None` off 6GHz.
+    pub(super) fn for_channel(
+        elements: &'a [Element],
+        rfe: u8,
+        band: Band,
+        six: Option<(SixGhzPower, Option<i8>)>,
+    ) -> Result<Rules<'a>, Error> {
+        let (lmt_id, ru_id) = match band {
+            Band::Ghz2 => (ID_LMT_2GHZ, ID_LMT_RU_2GHZ),
+            Band::Ghz5 => (ID_LMT_5GHZ, ID_LMT_RU_5GHZ),
+            Band::Ghz6 => (ID_LMT_6GHZ, ID_LMT_RU_6GHZ),
+        };
+        Ok(Self {
+            band,
+            lmt: select(elements, lmt_id, rfe)?.ok_or(Error::Table)?,
+            ru: select(elements, ru_id, rfe)?.ok_or(Error::Table)?,
+            six: six.map(|(p, _)| p),
+            cstr: tpe_mac(six.and_then(|(_, t)| t)),
+        })
+    }
+    /// Channel count of these rules' band (2.4GHz: 14; 5GHz: 53;
+    /// 6GHz: `RTW89_6G_CH_NUM`).
     fn ch_num(&self) -> u8 {
         match self.band {
             Band::Ghz2 => 14,
@@ -307,7 +341,8 @@ impl Rules<'_> {
     /// phy.c `rtw89_phy_read_txpwr_limit` without DAG or SAR:
     /// `min3(rf_to_mac(lmt), 63, cstr)`; 2.4/5GHz read regd WW (no
     /// country, no TPE), 6GHz `[regd][reg6]` else `[WW][DFLT]`.
-    fn limit(&self, bw: u8, ntx: u8, rs: u8, bf: u8, ch: u8) -> i8 {
+    /// Shared with the BE plan (same phy.c reader feeds the BE pages).
+    pub(super) fn limit(&self, bw: u8, ntx: u8, rs: u8, bf: u8, ch: u8) -> i8 {
         if bw >= self.bw_num() {
             return 0;
         }
@@ -358,14 +393,17 @@ impl Rules<'_> {
         }
         rf_to_mac(v).min(SAR_MAC_MAX)
     }
-    fn limit_bf(&self, bw: u8, ntx: u8, rs: u8, ch: u8) -> [i8; 2] {
+    /// `[nonbf, bf]` limits for one (bw, rs, ch). Shared with the BE
+    /// plan (same phy.c reader feeds the BE pages).
+    pub(super) fn limit_bf(&self, bw: u8, ntx: u8, rs: u8, ch: u8) -> [i8; 2] {
         [
             self.limit(bw, ntx, rs, 0, ch),
             self.limit(bw, ntx, rs, 1, ch),
         ]
     }
     /// phy.c `rtw89_phy_read_txpwr_limit_ru` (same default state).
-    fn limit_ru(&self, ru: u8, ntx: u8, ch: u8) -> i8 {
+    /// Shared with the BE plan (same phy.c reader feeds the BE RU pages).
+    pub(super) fn limit_ru(&self, ru: u8, ntx: u8, ch: u8) -> i8 {
         let idx = channel_to_idx(self.band, ch);
         let ch_num = self.ch_num();
         if let Some(six) = self.six {
@@ -485,6 +523,32 @@ impl Rules<'_> {
         }
         page
     }
+}
+
+/// fw.c `rtw89_fw_load_tx_shape_lmt`; core.h `rtw89_get_tx_shape_idx`
+/// with `reg6_pwr` = `RTW89_REG_6GHZ_POWER_DFLT` off 6GHz (regd WW
+/// there); on 6GHz the 6GHz regd and `reg_6ghz_power`. Returns
+/// `[CCK, OFDM]` shape indices. Shared with the BE plan, whose
+/// `rtw8922a_set_tx_shape` reads only the OFDM index.
+pub(super) fn tx_shape(
+    elements: &[Element],
+    rfe: u8,
+    band: Band,
+    six: Option<SixGhzPower>,
+) -> Result<[u8; 2], Error> {
+    let shape_conf = select(elements, ID_TX_SHAPE_LMT, rfe)?.ok_or(Error::Table)?;
+    let b = band as u8;
+    let (shape_regd, shape_reg6) = six.map_or((WW, 0), |p| (p.regd, p.power));
+    let mut shape = [0u8; 2];
+    for e in shape_conf.entries(5) {
+        if e[0] >= BAND_NUM || e[1] >= 2 || e[2] >= REGD_NUM || e[4] >= REG_6GHZ_POWER_NUM {
+            continue;
+        }
+        if e[0] == b && e[2] == shape_regd && e[4] == shape_reg6 {
+            shape[usize::from(e[1])] = e[3];
+        }
+    }
+    Ok(shape)
 }
 
 /// `rtw89_8852c_tssi_dbw_table` (rtw8852c_table.c), FLAT/LOW/MID/HIGH.
@@ -737,20 +801,8 @@ impl Plan {
             return Err(Error::Policy);
         }
         let band = channel.band();
-        let (lmt_id, ru_id) = match band {
-            Band::Ghz2 => (ID_LMT_2GHZ, ID_LMT_RU_2GHZ),
-            Band::Ghz5 => (ID_LMT_5GHZ, ID_LMT_RU_5GHZ),
-            Band::Ghz6 => (ID_LMT_6GHZ, ID_LMT_RU_6GHZ),
-        };
         let byrate = select(elements, ID_BYRATE, rfe)?.ok_or(Error::Table)?;
-        let rules = Rules {
-            band,
-            lmt: select(elements, lmt_id, rfe)?.ok_or(Error::Table)?,
-            ru: select(elements, ru_id, rfe)?.ok_or(Error::Table)?,
-            six: six.map(|(p, _)| p),
-            cstr: tpe_mac(six.and_then(|(_, t)| t)),
-        };
-        let shape_conf = select(elements, ID_TX_SHAPE_LMT, rfe)?.ok_or(Error::Table)?;
+        let rules = Rules::for_channel(elements, rfe, band, six)?;
         let b = band as u8;
 
         // fw.c `rtw89_fw_load_txpwr_byrate` into `byr[band][bw]`; AX reads
@@ -812,19 +864,7 @@ impl Plan {
             *o = rf_to_mac(v);
         }
 
-        // fw.c `rtw89_fw_load_tx_shape_lmt`; core.h `rtw89_get_tx_shape_idx`
-        // with `reg6_pwr` = `RTW89_REG_6GHZ_POWER_DFLT` off 6GHz (regd WW
-        // there); on 6GHz the 6GHz regd and `reg_6ghz_power`.
-        let (shape_regd, shape_reg6) = six.map_or((WW, 0), |(p, _)| (p.regd, p.power));
-        let mut shape = [0u8; 2];
-        for e in shape_conf.entries(5) {
-            if e[0] >= BAND_NUM || e[1] >= 2 || e[2] >= REGD_NUM || e[4] >= REG_6GHZ_POWER_NUM {
-                continue;
-            }
-            if e[0] == b && e[2] == shape_regd && e[4] == shape_reg6 {
-                shape[usize::from(e[1])] = e[3];
-            }
-        }
+        let shape = tx_shape(elements, rfe, band, six.map(|(p, _)| p))?;
         Ok(Self {
             channel,
             byrate: rate,

@@ -12,11 +12,16 @@
 //! descriptors ([`trx`]) and the packet owner ([`packet`]). Step 3 adds
 //! the power-on sequence ([`power`]), the LLT ([`llt`]) and MAC init
 //! ([`mac`]). Step 4 adds the station chains ([`station`], the rate
-//! table [`rate`], the H2C mailbox [`h2c`]), bands/HT/QoS/lifecycle
+//! table [`rate`], the H2C mailbox [`h2c`], the reserved-page packet
+//! [`rsvd_page`]), bands/HT/QoS/lifecycle
 //! ([`channel`], [`lifecycle`]), the TX-power levels ([`txpower`]) and
 //! the DE factory table ([`phy::PgStore`]) plus the BB/RF access they
 //! need ([`phy`]). Step 5 adds the 5 GHz envelope rows (NAPC v3) and
-//! the 2SS HT rates ([`ht`]). It is not admitted yet (probe keeps it diagnostic); the
+//! the 2SS HT rates ([`ht`]). Step 6 adds the DM init ([`dm`]), the
+//! `rtl92de_hw_init` early-mode / ASPM back-door / hardware-security
+//! steps ([`mac`]), the IQK reload ([`calib`], wired into the
+//! channel switch), and the 5 GHz native-admission gate
+//! ([`native_channel`]). It is not admitted yet (probe keeps it diagnostic); the
 //! `Prepared` integration and the production `rtl92de_hw_init`
 //! orchestrator are remainders.
 //!
@@ -57,10 +62,17 @@
 //!   DBI cross-function path, and the factory power-group table.
 //! - [`txpower`] — TX-power levels from the EFUSE factory map.
 //! - [`lifecycle`] — `init_sw_vars` / `deinit_sw_vars` / ASPM state.
+//! - [`dm`] — DM init (`rtl92d_dm_init`): DIG table, dynamic TX
+//!   power, EDCA turbo, rate-adaptive mask, TX-power tracking.
+//! - [`calib`] — IQK calibration reload
+//!   (`rtl92d_phy_reload_iqk_setting`) with the stored per-channel
+//!   matrix.
 
 #![allow(dead_code)]
 
+pub mod calib;
 pub mod channel;
+pub mod dm;
 pub mod envelope;
 pub mod fw;
 pub mod h2c;
@@ -72,6 +84,7 @@ pub mod packet;
 pub mod phy;
 pub mod power;
 pub mod rate;
+pub mod rsvd_page;
 pub mod station;
 pub mod tables;
 pub mod trx;
@@ -260,6 +273,28 @@ pub fn sw_consequences(mode: MacPhyMode, current_band: Band) -> SwConsequences {
             rxbuffersize: Some(4096),
             default_channel,
         },
+    }
+}
+
+/// Whether `channel` is natively admittable for one function: the
+/// channel must be a station channel
+/// ([`envelope::station_channel`]) and inside the function's bandset
+/// ([`mode_info`]). A dual-dual MAC0 function (5 GHz bandset) admits
+/// the 5 GHz plan and no 2.4 GHz channel; a dual-dual MAC1 function
+/// admits 2.4 GHz channels 1–11 and no 5 GHz channel; single and
+/// dual-single functions admit both bands. This is the gate the
+/// future `prepare_rtl8192de` native entry calls, mirroring
+/// `prepare_rtl8821ae`'s `station_channel` check; the entry itself
+/// (and the `Prepared::Chip::Rtl8192de` integration it needs) is a
+/// later step.
+pub fn native_channel(channel: u8, mode: MacPhyMode, interface_index: u8) -> bool {
+    if !envelope::station_channel(channel) {
+        return false;
+    }
+    match mode_info(mode, interface_index).bandset {
+        BandSet::On2Ghz => channel <= 14,
+        BandSet::On5Ghz => channel >= 36,
+        BandSet::OnBoth => true,
     }
 }
 

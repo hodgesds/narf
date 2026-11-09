@@ -2496,8 +2496,7 @@ impl VirtioNetPci {
         // SAFETY: device-cfg region was mapped at bring_up; field
         // at offset 6 stays valid for the controller's lifetime.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let s = unsafe { r.read16(CFG_STATUS) };
-        s
+        unsafe { r.read16(CFG_STATUS) }
     }
 
     /// True when the device is asking for an announce: the
@@ -6309,6 +6308,8 @@ mod tx_tests {
             fx.dev.device_cfg = Some(region);
             // Fixture negotiates nothing: no ack, no pending, even
             // with S_ANNOUNCE raised in STATUS.
+            // SAFETY: CFG_STATUS is a two-byte field within the live,
+            // fixture-owned 4096-byte coherent page mapped above.
             unsafe {
                 fx.dev
                     .device_cfg
@@ -6333,6 +6334,8 @@ mod tx_tests {
                 return Err("S_ANNOUNCE did not read as pending");
             }
             // LINK_UP alone is not an announce request.
+            // SAFETY: the fixture's coherent config page is still live;
+            // CFG_STATUS is within its 4096-byte extent.
             unsafe {
                 fx.dev
                     .device_cfg
@@ -6344,6 +6347,8 @@ mod tx_tests {
                 return Err("LINK_UP alone read as announce pending");
             }
             // Both bits set: still pending.
+            // SAFETY: the same fixture-owned config mapping remains valid
+            // for this in-bounds two-byte status write.
             unsafe {
                 fx.dev
                     .device_cfg
@@ -6389,6 +6394,8 @@ mod tx_tests {
             fx.dev.device_cfg = Some(region);
             fx.dev.has_status = true;
             fx.dev.has_guest_announce = true;
+            // SAFETY: CFG_STATUS lies within the coherent page owned by
+            // this fixture, which stays live through handle_config_change.
             unsafe {
                 fx.dev
                     .device_cfg
@@ -6400,6 +6407,8 @@ mod tx_tests {
             if !fx.dev.link_up() {
                 return Err("link did not read up after announce handle");
             }
+            // SAFETY: the fixture-owned page remains live and the same
+            // two-byte status field remains within its mapped extent.
             unsafe {
                 fx.dev
                     .device_cfg

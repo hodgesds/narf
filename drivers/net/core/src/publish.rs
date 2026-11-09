@@ -74,9 +74,19 @@ pub struct LinkSample {
     pub media_available: Option<bool>,
     /// Raw firmware PHY-type code, when the status source reports
     /// one (issue #791 / #867). Family-defined; for i40e it is the
-    /// AQ `get_link_status` phy_type byte. Decoding it to a name
-    /// is #867's table work.
+    /// AQ `get_link_status` phy_type byte. The decoded name, when
+    /// the family knows it, rides in [`Self::phy_type_name`].
     pub phy_type: Option<u8>,
+    /// Decoded PHY-type name, when the status source reports one
+    /// (issue #867). Family-defined, always a `&'static str` from
+    /// that family's sourced table — for i40e the
+    /// `I40E_PHY_TYPE_*` suffix (`"SFI"`, `"10GBASE_SR"`); other
+    /// families publish their own table's names as they gain
+    /// decodes, and `None` until then. It is a name, not a second
+    /// code: the raw byte stays in [`Self::phy_type`], so an
+    /// unnamed byte is still reportable. Like `phy_type` it is
+    /// carrier-independent and clears with an empty cage.
+    pub phy_type_name: Option<&'static str>,
 }
 
 impl LinkSample {
@@ -87,6 +97,7 @@ impl LinkSample {
         duplex: None,
         media_available: None,
         phy_type: None,
+        phy_type_name: None,
     };
 
     /// A carrier-up sample with the negotiated speed/duplex, either of
@@ -98,6 +109,7 @@ impl LinkSample {
             duplex,
             media_available: None,
             phy_type: None,
+            phy_type_name: None,
         }
     }
 
@@ -110,6 +122,7 @@ impl LinkSample {
             duplex: None,
             media_available: None,
             phy_type: None,
+            phy_type_name: None,
         }
     }
 }
@@ -185,8 +198,16 @@ pub fn publish_netdev_with_context(
 pub fn publish_link(name: &str, sample: LinkSample) -> bool {
     let published =
         narf_net::iface::set_link_metadata(name, sample.carrier, sample.speed_mbps, sample.duplex);
-    if sample.media_available.is_some() || sample.phy_type.is_some() {
-        narf_net::iface::set_link_media(name, sample.media_available, sample.phy_type);
+    if sample.media_available.is_some()
+        || sample.phy_type.is_some()
+        || sample.phy_type_name.is_some()
+    {
+        narf_net::iface::set_link_media(
+            name,
+            sample.media_available,
+            sample.phy_type,
+            sample.phy_type_name,
+        );
     }
     published
 }

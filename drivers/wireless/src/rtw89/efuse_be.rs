@@ -461,6 +461,25 @@ pub(super) enum MssDevType {
     NonwinInbox,
     Default,
 }
+impl MssDevType {
+    /// Linux-mapped device index (`efuse.c:400..425`
+    /// `get_mss_dev_type_idx`): the raw fuse nibbles 0xC/0xA/0x9/0x6
+    /// map to 0/1/2/3 and the default 0xF stays 0xF
+    /// (`RTW89_FW_MSS_DEV_TYPE_FWSEC_DEF`). This is the index
+    /// `fw.c::__get_mssc_key_idx` multiplies into the MSS bitmap —
+    /// the same index space the AX fuse decoder produces in
+    /// `secure::Fuses`, so one signature-selection rule serves both
+    /// generations.
+    pub(super) const fn index(self) -> u8 {
+        match self {
+            Self::WinlinInbox => 0,
+            Self::NonlinInboxNonCob => 1,
+            Self::NonlinInboxCob => 2,
+            Self::NonwinInbox => 3,
+            Self::Default => 15,
+        }
+    }
+}
 
 /// Decoded firmware-secure state (`efuse_be.c:488..540` +
 /// `efuse.c:370..402`). `secure_boot` is false on every early-out path
@@ -473,6 +492,19 @@ pub(super) struct SecureInfo {
     pub(super) mss_dev_type: Option<MssDevType>,
     pub(super) mss_cust_idx: u8,
     pub(super) mss_key_num: u8,
+}
+impl SecureInfo {
+    /// Erased/default secure state: secure boot off, no magnitude, no
+    /// MSS selection (the `sb_cryp_sel == 0xFFFF` early-out).
+    pub(super) const fn disabled() -> Self {
+        Self {
+            secure_boot: false,
+            sb_sel_mgn: None,
+            mss_dev_type: None,
+            mss_cust_idx: 0,
+            mss_key_num: 0,
+        }
+    }
 }
 
 /// `get_sb_cryp_sel_idx` (`efuse_be.c:530..560`): the low byte must be
@@ -594,6 +626,11 @@ pub(super) struct BeFactory {
     pub(super) phycap: [u8; chip_8922a::PHYCAP_SIZE],
     pub(super) cv: Option<u8>,
     pub(super) thermal_k: Option<i16>,
+    /// Firmware-secure fuse state (`read_secure`, Linux
+    /// `rtw89_efuse_read_fw_secure_be`): the secure-download plan's
+    /// input. A failed secure-window read fails this factory read
+    /// rather than defaulting to secure-boot-off.
+    pub(super) secure: SecureInfo,
 }
 
 fn read_mac(io: &mut impl Io, hci: Hci, hci_log: &[u8]) -> [u8; 6] {
@@ -661,6 +698,10 @@ impl BeFactory {
             Err(BeEfuseError::NotPresent) => None,
             Err(e) => return Err(e),
         };
+        // The secure window is read last, in the same powered dump
+        // window as the map above: the download plan must know the
+        // real fuse state before any image is trusted.
+        let secure = read_secure(io, cut_is_cav)?;
         Ok(BeFactory {
             mac,
             rfe_type: rf_log[RF_RFE_TYPE_OFF],
@@ -669,7 +710,68 @@ impl BeFactory {
             phycap,
             cv,
             thermal_k,
+            secure,
         })
+    }
+}
+
+/// `struct rtw89_power_trim_info` (core.h:7066) as parsed from the
+/// PHY-cap window — the parse half of the 8922A power trim. The
+/// application half (RF writes) is NOT here: it needs the
+/// `RR_BIASA` TXG/TXA/BIASD field constants, which are a follow-up.
+/// Linux stores the thermal trim as an s8 in a u8 array; NARF keeps
+/// the signed value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Test-driven until the trim application (#1878 follow-up) consumes it.
+pub(super) struct PowerTrim {
+    /// `thermal_trim[2]` (s8, magnitude GENMASK(5, 0), BIT(6) set =
+    /// positive; 0xFF on a path means unprogrammed: that path is 0
+    /// and parsing stops there).
+    pub(super) thermal: [i8; 2],
+    /// `pg_thermal_trim`: false once the first unprogrammed path is hit.
+    pub(super) pg_thermal: bool,
+    /// `pa_bias_trim[2]` raw bytes (2G nibble low, 5G nibble high).
+    pub(super) pa_bias: [u8; 2],
+    /// `pad_bias_trim[2]` raw bytes (same nibble split).
+    pub(super) pad_bias: [u8; 2],
+    /// `pg_pa_bias_trim`: `phycap[0] != 0xFF`. Linux gates BOTH the
+    /// PA-bias and the pad-bias application on this one flag.
+    pub(super) pg_pa_pad: bool,
+}
+
+// The trim window (offsets 0x33/0x34/0x35) fits `PHYCAP_SIZE` 0x38.
+const _: () = assert!(chip_8922a::PHYCAP_SIZE > 0x35);
+
+impl BeFactory {
+    /// `rtw8922a_phycap_parsing_thermal_trim` /
+    /// `_pa_bias_trim` / `_pad_bias_trim` (rtw8922a.c:908..1005) over
+    /// the PHY-cap window (`phycap_addr` 0x1700, offsets relative to
+    /// it): thermal at {0x1706, 0x1733}, PA bias at {0x1707, 0x1734},
+    /// pad bias at {0x1708, 0x1735}, PA/pad programmed flag at
+    /// phycap[0] (0x1700). Parse only — no RF writes.
+    #[allow(dead_code)] // Test-driven until the trim application (#1878 follow-up) consumes it.
+    pub(super) fn power_trim(&self) -> PowerTrim {
+        const THERMAL: [usize; 2] = [6, 0x33];
+        const PA_BIAS: [usize; 2] = [7, 0x34];
+        const PAD_BIAS: [usize; 2] = [8, 0x35];
+        let mut thermal = [0i8; 2];
+        let mut pg_thermal = true;
+        for (i, &off) in THERMAL.iter().enumerate() {
+            let raw = self.phycap[off];
+            if raw == 0xFF {
+                pg_thermal = false;
+                break;
+            }
+            let mag = (raw & 0x3f) as i8;
+            thermal[i] = if raw & 0x40 != 0 { mag } else { -mag };
+        }
+        PowerTrim {
+            thermal,
+            pg_thermal,
+            pa_bias: [self.phycap[PA_BIAS[0]], self.phycap[PA_BIAS[1]]],
+            pad_bias: [self.phycap[PAD_BIAS[0]], self.phycap[PAD_BIAS[1]]],
+            pg_pa_pad: self.phycap[0] != 0xFF,
+        }
     }
 }
 

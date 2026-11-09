@@ -182,6 +182,11 @@ pub(super) struct Step {
     pub(super) rssi: Option<u8>,
     /// IE01 CFO for this owner's MACID (`rtw89_phy_cfo_parse`).
     pub(super) cfo: Option<i16>,
+    /// One-path antenna-diversity PPDU observation for this owner's
+    /// MACID (phy.c `rtw89_phy_antdiv_parse`): class, `RSSI_AVG`, IE01
+    /// EVM. Fed to the retained diversity owner by the station's
+    /// `packet_poll`; `None` when no PPDU status arrived on this poll.
+    pub(super) antdiv: Option<rx_packet::AntDivObservation>,
     /// AP role only: the long-RXD `AX_RXD_MAC_ID` of `frame` (zero for a
     /// short RXD), the hardware address-CAM classification of the peer.
     pub(super) rx_mac_id: Option<u8>,
@@ -352,13 +357,21 @@ impl Core {
         if own == [0; 6]
             || own[0] & 1 != 0
             || mac_id != 0
-            || !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B)
-            // C and RTL8851B: the ordinary station rings only (BE0/MGMT8,
+            || !matches!(
+                chip,
+                ChipId::Rtl8852A
+                    | ChipId::Rtl8852B
+                    | ChipId::Rtl8852C
+                    | ChipId::Rtl8851B
+            )
+            // A, C and RTL8851B: the ordinary station rings only (BE0/MGMT8,
             // plus ACH1..3 under the signed all-AC QoS program); no AP role.
-            || matches!(chip, ChipId::Rtl8852C | ChipId::Rtl8851B)
-                && (ap
-                    || queues != format::Queue::ordinary(false)
-                        && queues != format::Queue::ordinary(true))
+            || matches!(
+                chip,
+                ChipId::Rtl8852A | ChipId::Rtl8852C | ChipId::Rtl8851B
+            ) && (ap
+                || queues != format::Queue::ordinary(false)
+                    && queues != format::Queue::ordinary(true))
         {
             return Err(Error::Packet);
         }
@@ -428,7 +441,9 @@ impl Core {
     }
     /// Admit up to `AGG_WINDOW` aggregated data frames in flight. Only the
     /// signed aggregate program (`Program::Ampdu`, which requires HT20)
-    /// enables this, before `start`.
+    /// enables this, before `start`. RTL8852A has no A-domain aggregate
+    /// program yet (the `Program::Ampdu` recipe is RTL8852B-labeled), so
+    /// it stays refused here until that program lands.
     pub(super) fn enable_aggregation(&mut self) -> Result<(), Error> {
         if self.phase != Phase::Prepared
             || self.rx < RxPhy::Ht
@@ -479,9 +494,12 @@ impl Core {
         if self.phase != Phase::Prepared
             || self.rx < RxPhy::Ht
             || !self.aggregate
-            // No C or RTL8851B A-MSDU path (`transmit_c`/`transmit_51`
-            // refuse A-MSDU subframes).
-            || matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B)
+            // No A, C or RTL8851B A-MSDU path (`transmit_a`/`transmit_c`/
+            // `transmit_51` refuse A-MSDU subframes).
+            || matches!(
+                self.chip,
+                ChipId::Rtl8852A | ChipId::Rtl8852C | ChipId::Rtl8851B
+            )
             || limit == 0
             || limit > super::tx_amsdu::MAX_BODY
         {
@@ -573,7 +591,10 @@ impl Core {
             return Err(Error::State);
         }
         if agg.is_some() && !self.aggregate
-            || matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) && fragment.is_some()
+            || matches!(
+                self.chip,
+                ChipId::Rtl8852A | ChipId::Rtl8852C | ChipId::Rtl8851B
+            ) && fragment.is_some()
         {
             return Err(Error::Packet);
         }
@@ -651,6 +672,17 @@ impl Core {
             let preparation = (|| {
                 let (mut header, actual) = if self.chip == ChipId::Rtl8852C {
                     format::transmit_c(
+                        bytes,
+                        source,
+                        self.mac_id,
+                        ticket.sequence,
+                        packet.body.dma_addr().raw(),
+                        radio_report,
+                        rate,
+                        agg,
+                    )?
+                } else if self.chip == ChipId::Rtl8852A {
+                    format::transmit_a(
                         bytes,
                         source,
                         self.mac_id,
@@ -937,6 +969,11 @@ impl Core {
                 if status.mac_id == self.mac_id {
                     step.rssi = Some(status.rssi);
                     step.cfo = status.cfo;
+                    step.antdiv = Some(rx_packet::AntDivObservation {
+                        class: status.class,
+                        rssi: status.rssi,
+                        evm: status.evm,
+                    });
                 }
             }
             // A PPDU above the signed RX PHY program (HT without `Ht`, HE

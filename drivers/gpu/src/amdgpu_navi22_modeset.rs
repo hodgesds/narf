@@ -51,7 +51,7 @@ use crate::{
     amdgpu_dcn30_takeover::{self as takeover, Inherited, IpRequest, Regs, Takeover},
     amdgpu_dcn_hubp::{Hubp, Surface},
     amdgpu_dcn_otg::{GlobalSync, Otg},
-    amdgpu_dcn_plane::{Dpp, Encoding, Mpc, Opp},
+    amdgpu_dcn_plane::{BlendConfig, Dpp, Encoding, Mpc, Opp},
     amdgpu_dml::{self as dml, Config, Format, Plane, Timing},
     amdgpu_dml30 as dml30, amdgpu_dp_training as training,
     amdgpu_navi22_bios::{
@@ -917,6 +917,9 @@ pub struct Pipeline {
     /// `hdmi_settings` when the pipe's output format is programmed.
     dp_format: DpFormat,
     hdmi_vrr: Option<(Option<crate::amdgpu_freesync::AmdVsdb>, bool)>,
+    /// The DP FreeSync state `configure_dp_vrr` last committed, as
+    /// `hdmi_vrr` is for HDMI.
+    dp_vrr: Option<(Option<crate::amdgpu_freesync::VrrRange>, bool)>,
     /// ODM 2:1 ([`hdmi_plan`]): the secondary pipe's front end and the
     /// plane with both slices.
     slice: Option<Slice>,
@@ -926,6 +929,13 @@ pub struct Pipeline {
     /// global sync now in effect (DC's cached `hubbub1->watermarks` and
     /// `pipe_dlg_param`).
     plane: Option<crate::amdgpu_navi22_plane::Update>,
+    /// The slave overlay's front end, leased from the pipe pool
+    /// ([`OverlayPipe`]), and its placement — the second plane of the
+    /// joint two-plane update — once programmed. `None` on a stream with
+    /// no overlay. The overlay has no OPP of its own: its MPCC sits above
+    /// the primary's in the tree, on the primary's OTG.
+    overlay: Option<OverlayPipe>,
+    overlay_update: Option<crate::amdgpu_navi22_plane::Update>,
     live_watermarks: Option<dml30::WatermarkSet>,
     live_sync: Option<GlobalSync>,
 }
@@ -1033,9 +1043,12 @@ impl Pipeline {
                 hdmi_settings: hdmi::OutputSettings::default(),
                 dp_format: DpFormat::DEFAULT,
                 hdmi_vrr: None,
+                dp_vrr: None,
                 slice: None,
                 odm: None,
                 plane: None,
+                overlay: None,
+                overlay_update: None,
                 live_watermarks: None,
                 live_sync: None,
             })
@@ -2058,6 +2071,11 @@ impl Pipeline {
             }
         }
         if reached >= Step::Plane {
+            // The overlay leaves the tree first, so the primary's release
+            // below sees a single-MPCC tree rather than orphaning the slave.
+            if self.overlay.is_some() {
+                record(self.release_overlay().await);
+            }
             record(self.mpc.release(self.route.pipe).map_err(Error::Block));
             record(self.hubp.blank().await.map_err(Error::Block));
             if let Some(slice) = self.slice.as_mut() {
@@ -2473,12 +2491,102 @@ impl Pipeline {
             })
             .map(|p| p.bytes());
         self.otg.configure_dcn30_drr(bounds)?;
+        // The same DCN30 bounds admit BTR when the range is wide enough
+        // (LfcConfig's 2:1 rule); otherwise BTR is retired.
+        let lfc = bounds
+            .and(range)
+            .and_then(|r| fs::LfcConfig::new(&timing, r));
+        self.otg.configure_dcn30_lfc(lfc)?;
         if usable.is_some() || self.hdmi_vrr.is_some_and(|(c, _)| c.is_some()) {
             self.dig.hdmi_info_packets(&stream).await?;
         }
         self.hdmi = Some(stream);
         self.hdmi_vrr = Some((usable, enabled));
         Ok(bounds)
+    }
+    /// `link_dpms.c enable_stream_features` for the running DP stream:
+    /// read DP_DOWNSPREAD_CTRL, set or clear IGNORE_MSA_TIMING_PARAM, and
+    /// write it back only when it changed (DCN401's `dp_stream_features`).
+    async fn dp_msa_ignore<A: Aux + Send>(
+        &mut self,
+        aux: &mut A,
+        ignore: bool,
+    ) -> Result<(), Error> {
+        use crate::amdgpu_freesync::{DPCD_DOWNSPREAD_CTRL, DPCD_IGNORE_MSA_TIMING_PARAM};
+        let mut current = [0u8; 1];
+        aux.read(DPCD_DOWNSPREAD_CTRL, &mut current).await?;
+        let next = if ignore {
+            current[0] | DPCD_IGNORE_MSA_TIMING_PARAM
+        } else {
+            current[0] & !DPCD_IGNORE_MSA_TIMING_PARAM
+        };
+        if next != current[0] {
+            aux.write(DPCD_DOWNSPREAD_CTRL, &[next]).await?;
+        }
+        Ok(())
+    }
+    /// Ask `enable` for exactly this timing (None: the sink's preferred)
+    /// on a DisplayPort stream: the DP FreeSync enable path, mirroring
+    /// `configure_hdmi_vrr`. The sink-side MSA ignore is set before the
+    /// totals stretch (and cleared after they return to fixed refresh),
+    /// the DCN30 DRR bounds and BTR admission follow, and the AMD FreeSync
+    /// SPD goes out on VPG generic 2. An unchanged request is a no-op.
+    pub async fn configure_dp_vrr<A: Aux + Send>(
+        &mut self,
+        range: Option<crate::amdgpu_freesync::VrrRange>,
+        enabled: bool,
+        aux: &mut A,
+    ) -> Result<Option<crate::amdgpu_freesync::Drr>, Error> {
+        use crate::amdgpu_freesync::{self as fs};
+        if self.state != State::At(Step::Running) || self.connector.signal != Signal::DisplayPort {
+            return Err(Error::Invalid);
+        }
+        let timing = self.output.ok_or(Error::Invalid)?.timing;
+        let usable = range.filter(|r| fs::info_packet(&timing, *r, false, false).is_some());
+        let bounds = usable.filter(|_| enabled).and_then(|r| fs::drr(&timing, r));
+        if self.dp_vrr == Some((usable, enabled)) {
+            return Ok(bounds);
+        }
+        let want_msa = usable.is_some() && enabled;
+        if want_msa {
+            self.dp_msa_ignore(aux, true).await?;
+        }
+        self.otg.configure_dcn30_drr(bounds)?;
+        let lfc = bounds
+            .and(usable)
+            .and_then(|r| fs::LfcConfig::new(&timing, r));
+        self.otg.configure_dcn30_lfc(lfc)?;
+        let packet =
+            usable.and_then(|r| fs::info_packet(&timing, r, false, enabled).map(|p| p.bytes()));
+        self.dp_stream.update_spd_packet(packet.as_ref()).await?;
+        if !want_msa {
+            self.dp_msa_ignore(aux, false).await?;
+        }
+        self.dp_vrr = Some((usable, enabled));
+        Ok(bounds)
+    }
+    /// BTR preflip on the running stream's DCN30 DRR: no-op without
+    /// admitted BTR. `now_us` is monotonic microseconds, as DCN401's
+    /// `lfc_preflip` takes them.
+    pub fn lfc_preflip(&mut self, now_us: u32) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) {
+            return Ok(());
+        }
+        let hdmi = self.connector.signal == Signal::Hdmi;
+        Ok(self.otg.dcn30_lfc_preflip(now_us, hdmi)?)
+    }
+    /// Service one observed VUPDATE while BTR is admitted on the running
+    /// stream. No-op without admitted BTR.
+    pub fn lfc_progress(&mut self) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) {
+            return Ok(());
+        }
+        let hdmi = self.connector.signal == Signal::Hdmi;
+        Ok(self.otg.dcn30_lfc_progress(hdmi)?)
+    }
+    /// Whether BTR frame insertion is admitted on the running stream.
+    pub fn lfc_active(&self) -> bool {
+        self.otg.dcn30_lfc_active()
     }
     /// Metadata-only updates do not blank or retrain TMDS. Format/depth and
     /// HDR enable/disable transitions still go through normal modesetting.
@@ -2643,13 +2751,39 @@ impl Pipeline {
         })
     }
     /// [`crate::amdgpu_navi22_plane::plan`] for `request` on the lit stream.
+    /// Refused while an overlay is live: the single plan's clocks and
+    /// watermarks do not budget it — place through [`Pipeline::plan_overlay`].
     pub fn plan_plane(
         &self,
         request: &crate::amdgpu_navi22_plane::Request,
     ) -> Result<crate::amdgpu_navi22_plane::Update, crate::amdgpu_navi22_plane::Refusal> {
+        if self.overlay.is_some() {
+            return Err(crate::amdgpu_navi22_plane::Refusal::Overlay);
+        }
         self.plane_basis()
             .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)?
             .plan(request)
+    }
+    /// [`crate::amdgpu_navi22_plane::plan_two`] for `primary` and `overlay`
+    /// on the lit stream: the joint two-plane update an overlay commit
+    /// programs. Planning is pure — it does not lease the slave pipe.
+    pub fn plan_overlay(
+        &self,
+        primary: &crate::amdgpu_navi22_plane::Request,
+        overlay: &crate::amdgpu_navi22_plane::Request,
+    ) -> Result<crate::amdgpu_navi22_plane::TwoPlaneUpdate, crate::amdgpu_navi22_plane::Refusal>
+    {
+        self.plane_basis()
+            .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)?
+            .plan_two(primary, overlay)
+    }
+    /// The leased slave pipe, if an overlay is live.
+    pub fn overlay_pipe(&self) -> Option<u8> {
+        self.overlay.as_ref().map(|o| o.pipe)
+    }
+    /// The overlay's placement, once programmed.
+    pub fn overlay_request(&self) -> Option<crate::amdgpu_navi22_plane::Request> {
+        self.overlay_update.map(|u| u.request)
     }
     /// The DML30 plan the pipe runs under now: the placement's after a
     /// plane update, else the modeset's.
@@ -2690,7 +2824,22 @@ impl Pipeline {
     /// and deadline registers with the cursor's, the DSCL scaler, the
     /// MPCC background, the viewport and the surface pitch. The address
     /// follows from the flip owner inside the same lock.
+    ///
+    /// Refused while an overlay is live: the single-plane update's clocks
+    /// and watermarks do not budget it — commit through
+    /// [`Pipeline::program_two_planes`].
     pub async fn program_plane(
+        &mut self,
+        u: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<(), Error> {
+        if self.overlay.is_some() {
+            return Err(Error::Busy);
+        }
+        self.program_plane_inner(u).await
+    }
+    /// [`Pipeline::program_plane`] without the overlay guard: the two-plane
+    /// commit programs the joint primary update through here.
+    async fn program_plane_inner(
         &mut self,
         u: &crate::amdgpu_navi22_plane::Update,
     ) -> Result<(), Error> {
@@ -2734,6 +2883,109 @@ impl Pipeline {
             .map_err(Error::Hubbub)?;
         Ok(())
     }
+    /// Lease a slave pipe for an overlay on this running stream
+    /// ([`overlay::lease_slave`]): the preferred mirror pipe, else the
+    /// highest free one. `used` names every pipe other streams hold — their
+    /// primaries, ODM secondaries and slaves; this stream's pipe and its
+    /// ODM secondary are excluded inside. Refused when the stream is not
+    /// running, is split across ODM pipes (an overlay beside ODM is not
+    /// modelled), already has an overlay, or the pool is exhausted. The
+    /// pipe is powered when the overlay is programmed, not here.
+    pub fn lease_overlay(&mut self, used: &[u8]) -> Result<u8, Error> {
+        if self.state != State::At(Step::Running)
+            || self.odm.is_some()
+            || self.slice.is_some()
+            || self.overlay.is_some()
+        {
+            return Err(Error::Busy);
+        }
+        let pipes = crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.pipes();
+        let lease = overlay::lease_slave(pipes, self.route.pipe, used).ok_or(Error::Busy)?;
+        let pipe = lease.pipe;
+        // SAFETY: the lease is this stream's slave pipe, held by no other
+        // stream, ODM secondary or overlay; the caller's display ownership
+        // covers it.
+        self.overlay = Some(unsafe { OverlayPipe::new(&self.gpu, self.regs.authority, pipe)? });
+        Ok(pipe)
+    }
+    /// `dcn20_program_front_end_for_ctx` for the overlay, under the OTG's
+    /// pipe-control lock the caller holds: the joint primary update first
+    /// ([`Pipeline::program_plane`]'s body), then the slave front end —
+    /// power, DPP DTO, DPP program and scaler, the HUBP on the primary's
+    /// VTG with the overlay pipe's DLG/TTU registers, viewport and pitch,
+    /// and the MPCC inserted above the primary's with `blend`. The surface
+    /// address follows from the flip owner inside the same lock, and the
+    /// slave HUBP is unblanked after it ([`Pipeline::unblank_overlay`]).
+    pub async fn program_two_planes(
+        &mut self,
+        u: &crate::amdgpu_navi22_plane::TwoPlaneUpdate,
+        blend: &BlendConfig,
+    ) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) || self.odm.is_some() {
+            return Err(Error::Busy);
+        }
+        if self.overlay.is_none() {
+            return Err(Error::Invalid);
+        }
+        self.program_plane_inner(&u.primary).await?;
+        let pipe = self.overlay.as_ref().ok_or(Error::Invalid)?.pipe;
+        // The slave front end, as `program_slice` powers and programs the
+        // ODM secondary — except the overlay has its own scaler and its
+        // MPCC goes above the primary's in the tree, not on its own OPP.
+        self.power_on_pipe(pipe).await?;
+        self.clocks
+            .pipe_clock(pipe, u.overlay_dppclk_khz)
+            .map_err(Error::Block)?;
+        let overlay = self.overlay.as_mut().ok_or(Error::Invalid)?;
+        let r = &u.overlay.request;
+        overlay.dpp.program(Format::Rgb32, r.width, r.height)?;
+        overlay.dpp.set_scaler(&u.overlay.scaler)?;
+        overlay.hubp.select_vtg(self.route.pipe)?;
+        overlay.hubp.setup(&u.overlay.plan.registers)?;
+        let vp = u.overlay.scaler.viewport;
+        overlay
+            .hubp
+            .set_viewport(vp.x as u32, vp.y as u32, vp.width as u32, vp.height as u32)?;
+        overlay.hubp.set_pitch(r.pitch)?;
+        overlay
+            .mpc
+            .insert_plane(pipe, self.route.pipe, Some(self.route.pipe), blend)
+            .map_err(Error::Block)?;
+        self.overlay_update = Some(u.overlay);
+        Ok(())
+    }
+    /// Unblank the slave HUBP once its front end and surface address are
+    /// programmed (the modeset unblanks the primary and the ODM slice the
+    /// same way, after programming). No overlay: refused.
+    pub async fn unblank_overlay(&mut self) -> Result<(), Error> {
+        self.overlay
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .hubp
+            .unblank()
+            .await?;
+        Ok(())
+    }
+    /// Tear the overlay down: unlink its MPCC from the tree, blank the
+    /// slave HUBP, and return the pipe to the pool. No overlay: a no-op.
+    /// The scanout's flip side is detached separately
+    /// ([`crate::amdgpu_navi22_scanout::Scanout::detach_overlay`]); on a
+    /// live stream call that first, so no flip completion waits on the
+    /// parked HUBP.
+    pub async fn release_overlay(&mut self) -> Result<(), Error> {
+        let Some(mut overlay) = self.overlay.take() else {
+            return Ok(());
+        };
+        self.overlay_update = None;
+        // Front end first, as `tear_down` releases the primary's MPCC
+        // before blanking its HUBP.
+        overlay
+            .mpc
+            .remove_plane(self.route.pipe)
+            .map_err(Error::Block)?;
+        overlay.hubp.blank().await?;
+        Ok(())
+    }
 }
 
 /// Opt-in power saving (amdgpu_navi22_power_policy): the DAL clock owner,
@@ -2747,6 +2999,10 @@ impl Pipeline {
 #[path = "amdgpu_navi22_multi.rs"]
 mod multi;
 pub use multi::*;
+
+#[path = "amdgpu_navi22_overlay.rs"]
+mod overlay;
+pub use overlay::*;
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_modeset_tests.rs"]

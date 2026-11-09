@@ -41,7 +41,7 @@ const N51_RECIPE: &[u8] = b"rtw89_mac_init(8851B) then phy.c rtw89_phy_dm_init: 
 /// RTL8851B WLAN-only coexistence recipe the native owner runs at core.c
 /// `rtw89_btc_ntfy_init` (rtw8851b.c `rtw8851b_btc_set_rfe` +
 /// `rtw8851b_btc_init_cfg`, single WL RF path S0).
-const N51_COEX_RECIPE: &[u8] = b"rtw89_btc_ntfy_init WL-only: rtw8851b_btc_set_rfe (rfe 3n+1 ant num 1 shared bt0 BTG wa 1, 3n+3 num 2 dedicated bt0 alone sw external; single_pos/btg_pos S0, stream 1, no div; rfe 0 and 3n+2 refused), rtw8851b_btc_init_cfg (rtw89_mac_coex_init RTK inner without PTA_WL_TX_EN/RSP_CHK_BTCCA, wl_pri TX_RESP/BEACON, path A RR_WLSEL 0 + LUTWE trx mask SS 0x5ff RX 0x5df TX 0x55f shared/0x5ff, group remap +3 shared, break 0xf0ffffff, BT cnt en|rst), scbd 0x4003, cxinit v0 (adie kt = XTAL_SI_CV acv), cxctrl v1, txpwr ctrl off, _set_ant WONLY (cfg_gnt 0x77007700, ctrl path, plut 0x111), OFF_BT policy";
+const N51_COEX_RECIPE: &[u8] = b"rtw89_btc_ntfy_init WL-only: rtw8851b_btc_set_rfe (rfe 3n+1 ant num 1 shared bt0 BTG wa 1, 3n+3 num 2 dedicated bt0 alone sw external, 3n+2 dedicated + diversity ant_info div bit; single_pos/btg_pos S0, stream 1; rfe 0 refused), rtw8851b_btc_init_cfg (rtw89_mac_coex_init RTK inner without PTA_WL_TX_EN/RSP_CHK_BTCCA, wl_pri TX_RESP/BEACON, path A RR_WLSEL 0 + LUTWE trx mask SS 0x5ff RX 0x5df TX 0x55f shared/0x5ff, group remap +3 shared, break 0xf0ffffff, BT cnt en|rst), scbd 0x4003, cxinit v0 (adie kt = XTAL_SI_CV acv), cxctrl v1, txpwr ctrl off, _set_ant WONLY (cfg_gnt 0x77007700, ctrl path, plut 0x111), OFF_BT policy";
 impl Board {
     pub fn new(
         factory: &Factory,

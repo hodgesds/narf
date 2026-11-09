@@ -1,4 +1,5 @@
 use super::*;
+use crate::rtw89::efuse_be::{MssDevType, SecureInfo};
 use crate::rtw89::prepared::{self, Files};
 use alloc::{vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -58,6 +59,132 @@ fn firmware(version: u8, security: usize, formatted: bool) -> Vec<u8> {
     image.extend((0..4057).map(|n| (n % 251) as u8));
     image
 }
+
+fn smoke_rtw89_8922a_secure_download_plan() -> TestResult {
+    // The 8922A secure download plan, end to end: the valid BE efuse
+    // vector (cryp-sel index 0, magnitude 0x8000100; WinlinInbox,
+    // customer 25, key 12) selects the fuse-matching MSS signature
+    // out of a v1 formatted security section, under the upstream
+    // version-0/all-clear default list (rtw8922a.c:3215).
+    let fuses = Fuses::from_be(
+        ChipId::Rtl8922A,
+        SecureInfo {
+            secure_boot: true,
+            sb_sel_mgn: Some(0x8000100),
+            mss_dev_type: Some(MssDevType::WinlinInbox),
+            mss_cust_idx: 25,
+            mss_key_num: 12,
+        },
+    );
+    // `firmware(1, 1, true)` layout: 48-byte v1 base + 2×16-byte
+    // descriptors = 80-byte header; the security content (960 bytes)
+    // starts at 80; its formatted pool starts at 1040 (32-byte
+    // header, 256-byte bitmap, then 2×512-byte signatures). Bit 412
+    // (device 0, customer 25, key 12) is bitmap byte 51, bit 4; the
+    // helper's bit-0/1/7 byte is cleared so the rank is 0 and the
+    // first signature (0x41 fill) is selected. The matching magnitude
+    // is 0x8000100 deliberately: `sb_sel_ver` (content bytes 58..62)
+    // overlaps `key_sign_len` (bytes 60..62) in fw.h's section
+    // union, and 0x8000100 is the magnitude whose overlap reads as
+    // a 512-byte signature length (0x0800 >> 2); 0xC000180 would
+    // parse as 48-byte signatures.
+    let mut bytes = firmware(1, 1, true);
+    bytes[1040 + 32] = 0;
+    bytes[1040 + 32 + 51] = 0x10;
+    bytes[80 + 58..80 + 62].copy_from_slice(&0x8000100u32.to_le_bytes());
+    let plan = match DownloadPlan::new(
+        prepare(bytes.clone(), ChipId::Rtl8922A),
+        fuses,
+        Blacklist::upstream(ChipId::Rtl8922A),
+    ) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("8922A secure plan refused a matching image"),
+    };
+    if plan.chip() != ChipId::Rtl8922A
+        || !plan.secure_enabled()
+        || plan.section_count() != 2
+        || plan.name() != "rtw89/rtw8922a_fw-4.bin"
+    {
+        return TestResult::Fail("8922A secure plan identity/count wrong");
+    }
+    let key = plan.chunk(0, 0).unwrap();
+    if key.len() != 960 || key[448..] != vec![0x41; 512] {
+        return TestResult::Fail("8922A plan did not couple the fuse-selected signature");
+    }
+    // A foreign magnitude ignores the section: secure hardware with
+    // no matching signature is refused, never downloaded unsigned.
+    let mut foreign = bytes.clone();
+    foreign[80 + 58..80 + 62].copy_from_slice(&0xC000180u32.to_le_bytes());
+    if !matches!(
+        DownloadPlan::new(
+            prepare(foreign, ChipId::Rtl8922A),
+            fuses,
+            Blacklist::upstream(ChipId::Rtl8922A)
+        ),
+        Err(Error::Secure(secure::Error::MissingSignature))
+    ) {
+        return TestResult::Fail("8922A foreign magnitude fell back to an unsigned image");
+    }
+    // A zero magnitude is the "any suite" value: selection proceeds.
+    let mut any = bytes.clone();
+    any[80 + 58..80 + 62].fill(0);
+    if DownloadPlan::new(
+        prepare(any, ChipId::Rtl8922A),
+        fuses,
+        Blacklist::upstream(ChipId::Rtl8922A),
+    )
+    .is_err()
+    {
+        return TestResult::Fail("8922A zero magnitude refused a matching image");
+    }
+    // Secure hardware without a security section, and without a
+    // blacklist policy, are both refused.
+    if !matches!(
+        DownloadPlan::new(
+            prepare(firmware(1, 0, false), ChipId::Rtl8922A),
+            fuses,
+            Blacklist::upstream(ChipId::Rtl8922A)
+        ),
+        Err(Error::Secure(secure::Error::MissingSignature))
+    ) {
+        return TestResult::Fail("8922A secure hardware loaded an unsigned image");
+    }
+    if !matches!(
+        DownloadPlan::new(prepare(bytes.clone(), ChipId::Rtl8922A), fuses, None),
+        Err(Error::Secure(secure::Error::UnknownBlacklist))
+    ) {
+        return TestResult::Fail("8922A enabled fuses accepted a missing policy");
+    }
+    let mut deny = [0u8; 32];
+    deny[0] = 1;
+    if !matches!(
+        DownloadPlan::new(
+            prepare(bytes.clone(), ChipId::Rtl8922A),
+            fuses,
+            Some(Blacklist::authenticated(0, deny))
+        ),
+        Err(Error::Secure(secure::Error::Blacklisted))
+    ) {
+        return TestResult::Fail("8922A authenticated list did not reject bit 0");
+    }
+    // Secure boot off: the same image downloads without signature
+    // substitution, exactly like the AX disabled path.
+    let off = Fuses::from_be(ChipId::Rtl8922A, SecureInfo::disabled());
+    let plain = DownloadPlan::new(
+        prepare(bytes, ChipId::Rtl8922A),
+        off,
+        Blacklist::upstream(ChipId::Rtl8922A),
+    )
+    .unwrap();
+    if plain.secure_enabled() || plain.chunk(0, 0).unwrap()[448..] != vec![0x99; 512] {
+        return TestResult::Fail("8922A disabled fuses changed the unsigned payload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_secure_download_plan
+);
 
 fn smoke_rtw89_download_compaction_and_raw_chunks() -> TestResult {
     let original = firmware(1, 2, true);

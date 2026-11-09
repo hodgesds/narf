@@ -192,7 +192,7 @@ fn smoke_rtw89_nhm_init_and_trigger() -> TestResult {
     if trigger(&mut io, &mut state).is_err() {
         return TestResult::Fail("NHM trigger failed");
     }
-    if io.get(R_NHM_CFG) != 0x24C2_710 {
+    if io.get(R_NHM_CFG) != 0x024C_2710 {
         return TestResult::Fail("NHM trigger CFG word wrong");
     }
     // TH1 = 42 | 48<<8 | 54<<16 | 60<<24; TH5 = 70 | 80<<8 | 90<<16 |

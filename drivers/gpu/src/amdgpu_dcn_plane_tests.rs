@@ -509,3 +509,182 @@ kernel_test_in!(
     "drivers/gpu/dcn-plane",
     plane_dcn30_mpcc_background_is_black
 );
+
+/// The overlay tree: the primary muxed alone, the slave MPCC inserted above
+/// it (`mpc1_insert_plane` with `insert_above_mpcc` the primary), then
+/// removed (`mpc1_remove_mpcc` from the top).
+fn plane_mpc_inserts_overlay_above_primary_and_removes_it() -> TestResult {
+    let mut mpc = block(0, 0x0680);
+    mpc.profile = Profile::Navi22;
+    if mpc.mpc_mux_plane(0, 0).is_err() {
+        return TestResult::Fail("primary mux refused");
+    }
+    // The slave MPCC is instance 5; one Fake file holds the whole tree.
+    mpc.instance = 5;
+    if mpc
+        .mpc_insert_plane(5, 0, Some(0), &BlendConfig::opaque())
+        .is_err()
+    {
+        return TestResult::Fail("overlay insert refused");
+    }
+    let at = |reg: u64| (reg + 5 * MPCC_STRIDE) as usize;
+    if mpc.io.values[at(MPCC_TOP_SEL)] & 0xf != 5
+        || mpc.io.values[at(MPCC_BOT_SEL)] & 0xf != 0
+        || mpc.io.values[at(MPCC_OPP_ID)] & 0xf != 0
+        || mpc.io.values[at(MPCC_UPDATE_LOCK_SEL)] & 0xf != 0
+    {
+        return TestResult::Fail("overlay mux wrong");
+    }
+    // Blending over the primary: mode 3, global-alpha blend, opaque gains.
+    let control = mpc.io.values[at(MPCC_CONTROL)];
+    if control & MPCC_MODE != MPCC_BLEND_MODE_TOP_BOT_BLENDING
+        || control & MPCC_ALPHA_BLND_MODE != 2 << 4
+        || control & MPCC_GLOBAL_ALPHA != 0xff << 16
+        || control & MPCC_GLOBAL_GAIN != 0xff << 24
+        || control & MPCC_BG_BPC != 4 << 8
+        || control & MPCC_BOT_GAIN_MODE != 0
+        || mpc.io.values[at(MPCC_TOP_GAIN)] != 0x1f000
+        || mpc.io.values[at(MPCC_BOT_GAIN_INSIDE)] != 0x1f000
+        || mpc.io.values[at(MPCC_BOT_GAIN_OUTSIDE)] != 0x1f000
+    {
+        return TestResult::Fail("overlay blend wrong");
+    }
+    // The mux names the slave; the primary keeps its own top-only mode.
+    if mpc.io.values[MPC_OUT_MUX as usize] & 0xf != 5
+        || mpc.io.values[MPCC_CONTROL as usize] & MPCC_MODE != MPCC_BLEND_MODE_TOP_LAYER_ONLY
+        || mpc.io.values[MPCC_BOT_SEL as usize] & 0xf != 0xf
+    {
+        return TestResult::Fail("primary disturbed by the insert");
+    }
+    if mpc.mpc_tree_head(0) != Ok(5) {
+        return TestResult::Fail("tree head is not the overlay");
+    }
+    if mpc.mpc_remove_plane(0).is_err() {
+        return TestResult::Fail("overlay remove refused");
+    }
+    if mpc.io.values[MPC_OUT_MUX as usize] & 0xf != 0
+        || mpc.io.values[at(MPCC_TOP_SEL)] & 0xf != 0xf
+        || mpc.io.values[at(MPCC_BOT_SEL)] & 0xf != 0xf
+        || mpc.io.values[at(MPCC_OPP_ID)] & 0xf != 0xf
+        || mpc.io.values[at(MPCC_UPDATE_LOCK_SEL)] & 0xf != 0xf
+        || mpc.io.values[MPCC_CONTROL as usize] & MPCC_MODE != MPCC_BLEND_MODE_TOP_LAYER_ONLY
+    {
+        return TestResult::Fail("overlay remove left the tree wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_mpc_inserts_overlay_above_primary_and_removes_it
+);
+
+/// Appending at the bottom (`insert_above_mpcc` NULL): the old bottom
+/// starts blending, and removing the bottom leaves it passing through.
+fn plane_mpc_appends_below_and_removes_bottom() -> TestResult {
+    let mut mpc = block(0, 0x0680);
+    mpc.profile = Profile::Navi22;
+    if mpc.mpc_mux_plane(0, 0).is_err() {
+        return TestResult::Fail("primary mux refused");
+    }
+    mpc.instance = 5;
+    if mpc
+        .mpc_insert_plane(5, 0, None, &BlendConfig::opaque())
+        .is_err()
+    {
+        return TestResult::Fail("bottom insert refused");
+    }
+    let at = |reg: u64| (reg + 5 * MPCC_STRIDE) as usize;
+    if mpc.io.values[at(MPCC_BOT_SEL)] & 0xf != 0xf
+        || mpc.io.values[at(MPCC_CONTROL)] & MPCC_MODE != MPCC_BLEND_MODE_TOP_LAYER_ONLY
+        || mpc.io.values[MPCC_CONTROL as usize] & MPCC_MODE != MPCC_BLEND_MODE_TOP_BOT_BLENDING
+        || mpc.io.values[MPC_OUT_MUX as usize] & 0xf != 0
+    {
+        return TestResult::Fail("bottom append linked wrong");
+    }
+    if mpc.mpc_remove_plane(0).is_err() {
+        return TestResult::Fail("bottom remove refused");
+    }
+    if mpc.io.values[MPCC_BOT_SEL as usize] & 0xf != 0xf
+        || mpc.io.values[MPCC_CONTROL as usize] & MPCC_MODE != MPCC_BLEND_MODE_TOP_LAYER_PASSTHROUGH
+        || mpc.io.values[MPC_OUT_MUX as usize] & 0xf != 0
+    {
+        return TestResult::Fail("bottom remove left the primary blending");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_mpc_appends_below_and_removes_bottom
+);
+
+/// A link that cannot be made fails before any register is written: above
+/// an MPCC that is not in the tree, above itself, or on an out-of-range
+/// pipe.
+fn plane_mpc_insert_above_unknown_mpcc_fails_without_writes() -> TestResult {
+    let mut mpc = block(0, 0x0680);
+    mpc.profile = Profile::Navi22;
+    if mpc.mpc_mux_plane(0, 0).is_err() {
+        return TestResult::Fail("primary mux refused");
+    }
+    mpc.instance = 5;
+    let count = mpc.io.writes.len();
+    if mpc.mpc_insert_plane(5, 0, Some(3), &BlendConfig::opaque()) != Err(Error::Invalid)
+        || mpc.mpc_insert_plane(5, 0, Some(5), &BlendConfig::opaque()) != Err(Error::Invalid)
+        || mpc.mpc_insert_plane(6, 0, None, &BlendConfig::opaque()) != Err(Error::Invalid)
+        || mpc.mpc_insert_plane(5, 6, None, &BlendConfig::opaque()) != Err(Error::Invalid)
+        || mpc.io.writes.len() != count
+    {
+        return TestResult::Fail("bad insert wrote registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_mpc_insert_above_unknown_mpcc_fails_without_writes
+);
+
+/// `mpc2_update_blending`'s field composition for the three alpha modes.
+fn plane_mpc_blend_modes() -> TestResult {
+    let mut mpc = block(0, 0x0680);
+    mpc.profile = Profile::Navi22;
+    // Opaque: global-alpha mode, opaque alpha and gain, bpc 4.
+    if mpc.mpc_set_blend(0, &BlendConfig::opaque()).is_err()
+        || mpc.io.values[MPCC_CONTROL as usize] != 0xffff_0420
+        || mpc.io.values[MPCC_TOP_GAIN as usize] != 0x1f000
+    {
+        return TestResult::Fail("opaque blend wrong");
+    }
+    // Per-pixel alpha, pre-multiplied: mode 0, multiplied bit set.
+    if mpc
+        .mpc_set_blend(0, &BlendConfig::per_pixel_alpha(true))
+        .is_err()
+        || mpc.io.values[MPCC_CONTROL as usize] != 0xffff_0440
+    {
+        return TestResult::Fail("per-pixel blend wrong");
+    }
+    // Per-pixel alpha with a plane alpha: combined mode, gain in both fields.
+    if mpc
+        .mpc_set_blend(0, &BlendConfig::per_pixel_alpha_with_gain(false, 0x80))
+        .is_err()
+        || mpc.io.values[MPCC_CONTROL as usize] != 0x8080_0410
+    {
+        return TestResult::Fail("combined-gain blend wrong");
+    }
+    // Out-of-field values are refused, not truncated.
+    let bad_bpc = BlendConfig {
+        background_color_bpc: 8,
+        ..BlendConfig::opaque()
+    };
+    let bad_gain = BlendConfig {
+        bottom_gain_mode: 2,
+        ..BlendConfig::opaque()
+    };
+    if mpc.mpc_set_blend(0, &bad_bpc) != Err(Error::Invalid)
+        || mpc.mpc_set_blend(0, &bad_gain) != Err(Error::Invalid)
+        || mpc.mpc_set_blend(6, &BlendConfig::opaque()) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("bad blend accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn-plane", plane_mpc_blend_modes);

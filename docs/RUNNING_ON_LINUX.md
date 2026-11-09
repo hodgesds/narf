@@ -147,6 +147,23 @@ builds are incremental.
 
 ## 3. Boot it & log in
 
+### Self-contained native EFI (x86_64)
+
+To boot through UEFI without Limine, build the single-file source artifact:
+
+```sh
+cargo xtask efi-image
+cargo xtask efi-image --run
+cargo xtask efi-image --smoke
+```
+
+The normal output is `target/narf-x86_64.efi`; smoke mode writes a separate
+image and powers off after boot. The run path needs QEMU + OVMF and uses a
+read-only virtual FAT ESP containing only the EFI application. It embeds the
+kernel, initramfs and command line. Native x86 packages use this image by
+default; ISO/media commands retain their existing layouts. See [native EFI](NATIVE_UEFI.md) for installation
+on an ESP, GRUB/systemd-boot entries, firmware selection, and current limits.
+
 ### 3.1 The async demo
 
 ```sh

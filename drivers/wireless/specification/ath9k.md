@@ -876,6 +876,81 @@ They compose the production lifetime helpers with complete model cold-reset
 primitives; they do not instantiate the singleton native PCI controller.
 Release/native execution and physical acceptance remain pending.
 
+### 3.12 MCI Bluetooth coexistence (AR9462/AR9565)
+
+The MCI engine (`drivers/wireless/src/ath9k/ar9003/mci.rs`, ported from
+Linux `drivers/net/wireless/ath/ath9k/ar9003_mci.c` @ `cbbddb6`) and its
+btcoex glue (`ar9003/btcoex.rs`, from `btcoex.c`) implement the MCI
+message exchange between WLAN and the on-chip BT controller.
+
+Capability: `identify()` reads `AR_ENT_OTP` (`0x40d8`) and
+`fill_cap_info` sets `ATH9K_HW_CAP_MCI` (`BIT(15)`) for AR9462/AR9565
+unless `AR_ENT_OTP_49GHZ_DISABLE` (`0x00100000`) is set.
+`btcoex::mci_is_enabled` is `btcoex_enabled && hw_caps &
+ATH9K_HW_CAP_MCI` (`hw.h::ath9k_hw_mci_is_enabled`).
+
+Scheme: `btcoex::init_scheme` selects NONE when coexistence is
+disabled, MCI when the capability is set, 3WIRE otherwise (every AR9003
+part satisfies `AR_SREV_9300_20_OR_LATER`, so the AR9280 2WIRE branch is
+unreachable). `btcoex::init_mci` installs the Linux defaults, including
+the `0x2201` (AR9462) / `0xa4c1` (other) config word, the BT 3.0 default
+version, and the WLAN channel map `[0, 0xffffffff, 0xffffffff,
+0x7fffffff]`.
+
+Engine: `Mci` owns the 16-slot GPM ring (`[u8; 256]`, no allocation).
+`send_message` sends one MCI message (header byte, `len`, timestamp
+flag) and waits for `SW_MSG_DONE`; it returns false and queues the GPM
+when MCI mode is off or BT sleeps. `handle_interrupt` is the
+`ath_mci_intr` bottom half: it walks the GPM ring, dispatching
+calibration GPMs to the cal handshake and coex-agent GPMs to the profile
+handler, and reports a BT calibration reset request. `get_isr` latches
+the raw/RX-message causes and `CONT_STATUS`, returning false on a
+dead-card read. `irq::cause` reports `Events.mci` when the async cause
+carries the MCI bit (`0x80`, `ATH9K_INT_MCI` `0x200`) while MCI is
+enabled; the owner runs `get_isr` plus `handle_interrupt` on its
+`RegisterIo` path when it is set.
+
+Calibration: `init_cal_req` / `init_cal_done` exchange the WLAN
+calibration request/done GPMs; `start_reset` grants BT its window and
+waits up to 25 ms for calibration done; `end_reset` wakes BT back up
+and reports `EndReset::RecalibrationNeeded` when the caller must re-run
+calibration (re-arming the TIMING4 gain/DC/IQ-cal bit via
+`set_timing4_gain_dc_iq_cal`).
+
+Channel map: `update_wlan_channels` rebuilds the WLAN channel map for
+the current 2 GHz channel (±10 MHz, ±20 more for HT40, plus a 7-channel
+guard) and sends it to BT; 5 GHz channels are skipped.
+`get_max_txpower` caps concurrent-TX power at `0x14` (HT20) / `0x10`
+(HT40) when concurrent TX is on, else no cap.
+
+Weights: `btcoex::set_weight` / `bt_stomp` program the WLAN weight
+tables (`mci_wlan_weights` for AR9462/AR9565, `ar9003_wlan_weights`
+otherwise) with the concurrent-TX priority overlay; `enable_mci` /
+`disable_mci` write the weights and the quiet-ack CTS enable.
+
+GPIO: `observation_set_up` routes the MCI (or TX/RX, or BT) observation
+signals to GPIO 0..3 (and 5) per the `ATH_MCI_CONFIG_MCI_OBS_*` bits;
+the MCI GPIO mux values are `MCI_WLAN_DATA 0x16`, `MCI_WLAN_CLK 0x17`,
+`MCI_BT_DATA 0x18`, `MCI_BT_CLK 0x19`.
+
+Deliberate deviations, all documented in code: the Linux deadbeef spin
+loops (`reset_req_wakeup`, `set_power_awake`) are bounded at 1000
+iterations instead of looping forever on a dead card; `end_reset` does
+not run calibration itself — the caller owns the run. Linux never
+assigns `mci->wlan_ver_major/minor`, so the coex version response
+answers 0.0, kept verbatim. AIC is hard-disabled in Linux
+(`ar9003_aic.c` returns false), so the AIC states read 0.
+
+Not in this step: the live-owner integration (owner holds `Btcoex`,
+`service_begin` routes `Events.mci`, reset path calls
+`start_reset`/`end_reset`, periodic `check_bt`, channel change calls
+`switch_2g5g`/`update_wlan_channels`); the driver-layer BT profile list
+and duty-cycle scheme; the 2WIRE/3WIRE btcoex enable/init paths; the WoW
+`mci_enabled` flag integration (open draft PR #1921 wires it once MCI
+lands). Fixture tests cover the message exchange end to end, capability
+gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
+walk, and the calibration handshake.
+
 ## 4. Invariants
 
 - PCI parking is verified by command-register readback before BAR sizing: BME
@@ -1205,8 +1280,8 @@ AR9287 calibration branches and two-chain masks; AR9280 `eeprom_def.c`,
 `ar9280_initvals` (AR9280_2) and 5 GHz; AR5416/AR9160 the AR5008 PHY
 (`ar5008_phy.c` analog RF banks) and `eeprom_def.c`; AR9380/AR9485/AR9580/
 AR9462/AR9565 the AR9003 EDMA TX-status/RX-FIFO path (`ar9003_mac.c`),
-`eeprom_9003.c`, per-chip `ar9003_*_initvals.h`, `ar9003_calib.c`, plus MCI
-for AR9462/AR9565.
+`eeprom_9003.c`, per-chip `ar9003_*_initvals.h` and `ar9003_calib.c`.
+(MCI for AR9462/AR9565 is ported; see §3.12.)
 
 **Per-chip profile foundation (`ar9287_enablement`).** `chips.rs` decodes `AR_SREV` exactly as
 `hw.c::ath9k_hw_read_revisions` (new `0xff` format: `(srev & 0xfffc0000) >> 12`
@@ -2098,7 +2173,7 @@ chain masks (`ar9003_hw_set_chain_masks`, APM-reduced selfgen), `TX_CL_CAL`
 from the INI `AR_PHY_CL_CAL_ENABLE` fact sets `AR_PHY_CL_CAL_CTL` and
 forces the AGC calibration, `TX_IQ_CAL` programs the
 `AR_PHY_TX_IQCAL_CONTROL_1` `DELPT` 32 field (without
-`TX_IQ_ON_AGC_CAL`, which is `AR_SREV_9485_OR_LATER`, Linux never runs
+`TX_IQ_ON_AGC_CAL`, Linux never runs
 `ar9003_hw_tx_iq_cal_post_proc` or `_reload` on AR9300), the carrier-leak
 bracket (PHY inactive, 5 µs, `RX_DELAY_DELAY`, PHY active; INI delay
 restored after), the AGC `CAL` poll for `AH_WAIT_TIMEOUT`, the
@@ -2107,7 +2182,23 @@ whatever the poll returned), the `CLC_SUCCESS` sample of
 `ar9003_hw_cl_cal_post_proc`, runtime chain masks and
 `ar9003_hw_init_cal_common` (IQ mismatch calibration started with
 `PER_MAX_LOG_COUNT`). An AGC timeout fails the attempt (`ath9k_hw_reset`
-`-EIO`). `Periodic::start` is the reset tail's `ath9k_hw_loadnf`
+`-EIO`). The per-chip branches of `ar9003_hw_init_cal_settings`
+(`ar9003_calib.c:321-323`): `TX_IQ_CAL` is `AR_SREV_9300_20_OR_LATER`
+(every modeled chip) and `TX_IQ_ON_AGC_CAL` is `AR_SREV_9485_OR_LATER`
+non-9340 (AR9485, AR9462, AR9565); on those chips `run` sets
+`AR_PHY_TX_IQCAL_CONTROL_0` `ENABLE_TXIQ_CAL` and runs
+`ar9003_hw_tx_iq_cal_post_proc` after the AGC calibration — the
+chan-info reads, `ar9003_hw_calc_iq_corr` (with `ar9003_hw_solve_iq_cal`
+and `ar9003_hw_find_mag_approx`), `ar9003_hw_tx_iq_cal_outlier_detection`
+(`:901`: the `CORR_COEFF_B1/B2` table only when not AR9485) and the
+`TXIQCAL_DONE` state carried in the report, which a fast channel change
+would `ar9003_hw_tx_iq_cal_reload` (`:1162`: same not-9485 table). The
+AR9485 TX IQCAL register map splits from the other parts
+(`TX_IQCAL_CONTROL_0` 0xa5c4, `CONTROL_1` 0xa5c8, `STATUS_B0` 0xa5f0,
+`CORR_COEFF_B0` 0xa5d0, against 0xa644/0xa648/0xa68c/0xa650). Not ported:
+the AR9550 three-pass `ar955x_tx_iq_cal_median` (no AR9550 is modeled)
+and `ar9003_hw_dynamic_osdac_selection` with its `ar9003_hw_tx_iq_cal`
+caller. `Periodic::start` is the reset tail's `ath9k_hw_loadnf`
 (result ignored as Linux) + `ath9k_hw_start_nfcal(ah, true)`;
 `Periodic::tick` is `ath_ani_calibrate` without ANI over
 `ar9003_hw_calibrate`: the one-entry circular IQ list (no AR9003
@@ -2115,7 +2206,10 @@ calibration timeout; `ar9003_hw_iqcal_collect` accumulates the
 `ah->txchainmask` chains of `AR_PHY_CAL_MEAS_0/1/2`,
 `ar9003_hw_iqcalibrate` over `numChains` with the `> 0x80000000` sign
 test, ±63 clamps, 7-bit `AR_PHY_RX_IQCAL_CORR_B0/1/2` fields and the
-chain-0 enable), the 20 min `ath9k_hw_reset_calvalid` restart, and on
+chain-0 enable — and on AR9565 a saturated (±63) coefficient aborts the
+whole calibration, `:273`, with no write and no enable, while the
+calibration is still marked done), the 20 min
+`ath9k_hw_reset_calvalid` restart, and on
 the 30 s long calibration `ath9k_hw_getnf` (`ar9003_hw_do_getnf` over
 `AR_PHY_CCA_0/1/2`, `ath9k_hw_nf_sanitize` with the AR9300 limits
 -110/-125/-60 (2 GHz) and -115/-125/-60 (5 GHz), the five-entry history),
@@ -2128,7 +2222,12 @@ band's value the previous `ath9k_hw_apply_txpower` left); the
 `caldata->tx_clcal` copy is not kept (only fast channel change, not
 ported, would reload it). Smokes (written, not executed):
 `smoke_ath9k_ar9300_init_and_periodic_calibration`,
-`smoke_ath9k_ar9300_calibration_refusals`.
+`smoke_ath9k_ar9300_calibration_refusals`,
+`smoke_ath9k_ar9003_tx_iq_enabled_cals`,
+`smoke_ath9k_ar9565_tx_iq_cal_post_proc`,
+`smoke_ath9k_ar9485_tx_iq_cal_post_proc`,
+`smoke_ath9k_ar9003_tx_iq_cal_outlier_and_reload`,
+`smoke_ath9k_ar9565_rx_iq_saturation_abort`.
 
 AR9300 signed records (step 5a, format only). `admission::Facts::new_ar9300`
 keys the 128-byte `N93A` v1 record (same layout as `N87A`/`N80A`) to one
@@ -2249,8 +2348,11 @@ failures, `DeviceGone` or `BadState` stop it); otherwise
 `ath9k_hw_disable` (COLD `set_reset_reg`, `ath9k_hw_init_pll`) +
 `ath9k_set_power_sleep` for AR9300 without MCI (`AR_STA_ID1_PWR_SAV` set,
 `AR_RTC_FORCE_WAKE_EN` and `AR_RTC_RESET_EN` cleared, 2 µs, `AR_WA`
-without `AR_WA_D3_L1_DISABLE`; no `AR_RC` write). `ar9003_hw_configpcipowersave`
-is not called (Linux calls it from `ath9k_stop`, not `ath_pci_suspend`).
+without `AR_WA_D3_L1_DISABLE`; no `AR_RC` write).
+`ar9003_hw_configpcipowersave` runs only from `initialize`
+(`ath9k_start`, restore) and `remove` (`ath9k_stop`, power-off); it is
+not called on suspend (Linux calls it from `ath9k_stop`, not
+`ath_pci_suspend`) or on reset.
 Resume clears PCI config 0x41 and runs the generation reset (COLD).
 The owner carries no HT, EDCA, QoS, block-ack, aggregation or power-save
 program, matching the AR9280 station scope; ANI is not ported. Smokes
@@ -2320,8 +2422,10 @@ the common default). `phy::prepare`/`expected` program the sys2ant
 postamble (9462-only in Linux) and the RX-gain overrides, and count
 the override writes; Linux sets no DFS array for the AR9462, so
 `dfs` stays empty, and the PCIe SerDes arrays are the
-`pciephy_clkreq_disable_L1` table in both slots (Linux gates them on
-`pll_pwrsave`, not modeled here). The owner matches `0x0034` as
+`pciephy_clkreq_disable_L1` table in both slots only when
+`pll_pwrsave` enables them (awake on CONTROL+ON_D3, low-power on
+CONTROL+ON_D0; `ath9k_hw_init_config` forces 7 for this chip, so the
+resolved default sets both). The owner matches `0x0034` as
 `ath9k-ar9462` and the admission record is `N46A` v1 (two-chain) under
 `ath9k/ar9462-admit-v1-ch<N>-<mac>.bin`, binding the 2p0/2p1 INI
 preparation. AR9300/AR9580 tables and streams are unchanged. Smokes
@@ -2329,17 +2433,12 @@ preparation. AR9300/AR9580 tables and streams are unchanged. Smokes
 `smoke_ath9k_ar9462_revision_and_ini_selection` (FNV-1a oracle over
 the 755 default-selected 2 GHz HT20 rows for each of 2.0 and 2.1, and
 every TX/RX gain mode with the mode 2/3 override arrays, computed
-from the local Linux headers) and
+from the local Linux headers, plus the SerDes `pll_pwrsave` selection
+matrix) and
 `smoke_ath9k_ar9462_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: MCI Bluetooth coexistence, WoW
-(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`) and per-chip calibration
-branches. The AR9462 board-value deltas are implemented in
-`ar9003/board.rs::set_board_values` (TOP bias, 24-bit switch table,
-SPDT, chain-1 table/attenuation at `rxchainmask == 0x2`, OTP
-`thermo_cal`, swreg into PMU1, the 9462 XTAL, chainmask-gated
-thermometer, and the xPA-timing / quick-drop / xLNA gates);
-`smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom` covers
-them per chip through the fixture.
+Remainder, not in this step: WoW
+(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
+deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
 **AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
 `ar9003::Chip::Ar9485` is PCIe `0x0032`
@@ -2360,9 +2459,10 @@ mac-postamble `#define` is transcribed from
 `ini::Tables::for_revision` dispatches `ar9003_hw_init_mode_regs` on
 the `AR_SREV_9485_11_OR_LATER` branch: `Tables::ar9485` is the 1.1 set
 (BB pre array, allmodes radio postamble, no SoC postamble, no fast
-clock, no DFS; the `pcie_phy_clkreq_disable_L1` SerDes table in both
-slots — Linux gates the `pll_on_cdr_on` table on `pll_pwrsave`, not
-modeled here) plus `ar9003_tx_gain_table_apply` (modes 0/1/2/3 are the
+clock, no DFS; the SerDes tables are selected on `pll_pwrsave` —
+CONTROL set programs the `pll_on_cdr_on_clkreq_disable_L1` table in
+both slots, CONTROL clear the `pcie_phy_clkreq_disable_L1` table) plus
+`ar9003_tx_gain_table_apply` (modes 0/1/2/3 are the
 9485 lowest/high/low-ob/db/high-power tables; mode 4 falls through to
 the AR9300 2p2 mixed table; modes 5/6 are the green/green-spur tables;
 mode 7 sets nothing and keeps the mode-0 lowest-ob/db default; index
@@ -2380,22 +2480,12 @@ AR9300/AR9580 tables and streams are unchanged. Smokes (written, not
 executed):
 `smoke_ath9k_ar9485_revision_and_ini_selection` (FNV-1a oracle over
 the 648 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
-computed from the local Linux headers) and
+computed from the local Linux headers, plus the SerDes `pll_pwrsave`
+selection matrix) and
 `smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: MCI Bluetooth coexistence, WoW, per-chip
-calibration branches (including the 9485 spur-mitigation code), and the
-SerDes `pll_pwrsave` conditional programming. The AR9485 board-value
-deltas are implemented in `ar9003/board.rs::set_board_values` (TOP2
-bias, antenna-diversity/LNA-diversity fields with LNA combining, the
-fixed PMU1/PMU2 set and the PGM/PWD sequence, the 9485 XTAL,
-chainmask-gated thermometer, and the xPA-timing / quick-drop / xLNA
-gates); `smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom`
-covers them per chip through the fixture. Still open: the
-board-conditional deltas that need `bt_ant_diversity` or an
-`ath_hw_config` value (xLNA GPIO, `ant_ctrl_comm2g_switch_enable`,
-`xatten_margin_cfg`, `alt_mingainidx`) and the 5 GHz per-chip-refusal
-design question (see the `set_board_values` lane record in the PR
-body).
+Remainder, not in this step: WoW, the
+AR9485 board-value deltas and per-chip calibration branches (including
+the 9485 antenna-diversity/LNA-diversity code).
 
 **AR9565 (`ar9565_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
@@ -2431,28 +2521,51 @@ low-ob/db table by `#define` — and index >= 8 is mode 0) and
 `expected` need no 9565 change (the sys2ant postamble and RX-gain
 overrides are empty for this chip). Linux sets no DFS array for the
 AR9565, so `dfs` stays empty, and the PCIe SerDes arrays are the
-`pciephy_clkreq_disable_L1` table in both slots (Linux gates them on
-`pll_pwrsave`, not modeled here). The owner matches `0x0036` as
+`pciephy_clkreq_disable_L1` table in both slots only when
+`pll_pwrsave` enables them (awake on CONTROL+ON_D3, low-power on
+CONTROL+ON_D0; `ath9k_hw_init_config` forces 7 for this chip, so the
+resolved default sets both, and the 1.1 table `#define`-aliases the
+1.0 table). The owner matches `0x0036` as
 `ath9k-ar9565` and the admission record is `N65A` v1 (one-chain)
 under `ath9k/ar9565-admit-v1-ch<N>-<mac>.bin`, binding the 1p0/1p1
 INI preparation. AR9300/AR9580/AR9462 tables and streams are
 unchanged. Smokes (written, not executed):
 `smoke_ath9k_ar9565_revision_and_ini_selection` (FNV-1a oracle over
 the 711 default-selected 2 GHz HT20 rows for each of 1.0 and 1.1, and
-every TX/RX gain mode, computed from the local Linux headers) and
+every TX/RX gain mode, computed from the local Linux headers, plus
+the SerDes `pll_pwrsave` selection matrix) and
 `smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: MCI Bluetooth coexistence, WoW
-(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), per-chip calibration
-branches, and the SerDes `pll_pwrsave` gating. The AR9565 board-value
-deltas are implemented in `ar9003/board.rs::set_board_values` (TOP
-bias, 24-bit switch table, SPDT, the default `ant_div_control` 0xc9
-with LNA combining, swreg / PWD into PMU1, the 9565 XTAL,
-chainmask-gated thermometer, and the xPA-timing / quick-drop / xLNA
-gates); `smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom`
-covers them per chip through the fixture. Still open: the
-board-conditional deltas that need `bt_ant_diversity` or an
-`ath_hw_config` value (see the `set_board_values` lane record in the
-PR body).
+Remainder, not in this step: WoW
+(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), the AR9565 board-value
+deltas and per-chip calibration branches.
+
+**SerDes `pll_pwrsave` (`ar9003/serdes.rs`, modeled).**
+`ah->config.pll_pwrsave` (`hw.h`, u8: CONTROL `BIT(0)`, ON_D3
+`BIT(1)`, ON_D0 `BIT(2)`) resolves in `PllPwrsave::resolve`: 1 by
+default, 0 for the 17 `ATH9K_PCI_NO_PLL_PWRSAVE` subsystems in
+`pci.c` (all AR9485 `0x0032` cards), 7 forced by
+`ath9k_hw_init_config` for AR9462/AR9565. Selection in
+`ini::Tables::for_revision`: AR9300 programs its table in both slots
+unconditionally, AR9580 has no SerDes arrays, AR9485 selects
+`pll_on_cdr_on` on CONTROL set and `clkreq` on CONTROL clear (both
+slots), AR9462/AR9565 set each slot only on CONTROL plus its ON bit.
+Programming is `serdes::configure` (`ar9003_hw_configpcipowersave`):
+on restore it sets `AR_PCIE_PM_CTRL_ENA` (`0x4014`) and writes the
+latched `AR_WA` word (`0x4004`), then writes the low-power array; on
+power-off only the awake array; AR9462 first applies the
+L1-entry-latency fix (`0x570c`, from PCI config `0x70c`, written only
+when the top byte is `0x17`). The owner resolves `pll_pwrsave` at
+probe from the exact subsystem and reads PCI config `0x70c` for
+AR9462, calls `configure(..., false, ...)` from `initialize`
+(`ath9k_start`) and `configure(..., true, ...)` best-effort from
+`remove` (`ath9k_stop`); never from reset or suspend. Smokes
+(written, not executed):
+`smoke_ath9k_ar9003_serdes_pll_pwrsave_resolution` (the 17
+NO_PLL_PWRSAVE subsystems resolve to 0, AR9462/AR9565 to 7, other
+AR9485 to 1) and
+`smoke_ath9k_ar9003_serdes_configpcipowersave_sequence` (the exact
+restore/power-off op sequences, the L1-fix gating, empty slots, and
+revoked authority).
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.
