@@ -1,4 +1,4 @@
-//! Decompressed-extent cache.
+//! Verified extent-data cache: decompressed extents and uncompressed windows.
 //!
 //! A compressed btrfs extent (CachyOS: `compress=zstd:1`, up to 128 KiB of
 //! data per extent) can only be decoded whole. Without a cache, every read of
@@ -6,6 +6,10 @@
 //! executable or a shared library reads 4 KiB at a time, so a single 128 KiB
 //! extent was decompressed up to 32 times per process. That made a stock
 //! systemd boot from a zstd root miss its 90 s unit start timeouts.
+//! Uncompressed reads also reuse checksum-checked requested windows, avoiding
+//! repeated block I/O. Their compression tag is `COMPRESS_NONE`; no read is
+//! widened to populate the cache. Verification-disabled views bypass this
+//! uncompressed cache, so they cannot populate it with unchecked bytes.
 //!
 //! Correctness, since this sits on the read path of a writable root:
 //!
@@ -33,6 +37,7 @@
 //!   recently used entry is evicted first. One spinlock serializes the
 //!   bookkeeping, and the data is shared out as `Arc<Vec<u8>>`, so the lock is
 //!   never held across I/O or decompression.
+//!   An entry-count limit also bounds bookkeeping for tiny read windows.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -42,8 +47,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Upper bound on cached decompressed bytes, across all volumes.
+/// Upper bound on cached extent bytes, across all volumes.
 pub const BUDGET_BYTES: usize = 32 << 20;
+const MAX_ENTRIES: usize = 8192;
 
 /// Identity of a volume: its allocation address. Stable while any entry holds
 /// its `Weak`.
@@ -82,9 +88,10 @@ static CACHE: IrqSafeSpinLock<Cache> = IrqSafeSpinLock::new(Cache {
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
-/// The largest compressed extent btrfs writes (`BTRFS_MAX_COMPRESSED`).
-/// Invalidation scans this far below a write's start for overlapping entries.
-const MAX_COMPRESSED: u64 = 128 * 1024;
+/// Maximum cached on-disk span (`BTRFS_MAX_COMPRESSED` for compressed data).
+/// Uncompressed windows use the same bound so an overlapping write anywhere
+/// in either kind of entry is found by the bounded invalidation scan.
+pub(crate) const MAX_DISK_BYTES: u64 = 128 * 1024;
 
 /// A cache handle for one volume.
 #[derive(Clone)]
@@ -136,7 +143,7 @@ fn key(vol: VolKey, id: ExtentId) -> Key {
     }
 }
 
-/// Look up a decompressed extent.
+/// Look up a decompressed extent or verified uncompressed window.
 pub fn get(vol: &VolumeRef, id: ExtentId) -> Option<Arc<Vec<u8>>> {
     let mut cache = CACHE.lock();
     cache.clock += 1;
@@ -160,11 +167,16 @@ pub fn epoch(vol: &VolumeRef) -> u64 {
     CACHE.lock().epochs.get(&vol.key).copied().unwrap_or(0)
 }
 
-/// Insert a verified, successfully decompressed extent read while the volume's
-/// epoch was `epoch`. It is dropped if a write has moved the epoch since.
+/// Insert a verified extent window or successfully decompressed extent read
+/// while the volume's epoch was `epoch`. A later write epoch rejects the fill.
 pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<u8>>) {
     let size = plain.len();
-    if size == 0 || size > BUDGET_BYTES / 4 {
+    if size == 0
+        || size > BUDGET_BYTES / 4
+        || id.disk_num_bytes == 0
+        || id.disk_num_bytes > MAX_DISK_BYTES
+        || (id.compression == crate::format::COMPRESS_NONE && size as u64 != id.disk_num_bytes)
+    {
         return;
     }
     let mut cache = CACHE.lock();
@@ -187,7 +199,7 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
             .epochs
             .retain(|vol_key, _| *vol_key == vol.key || live.contains(vol_key));
     }
-    while cache.bytes + size > BUDGET_BYTES {
+    while cache.bytes + size > BUDGET_BYTES || cache.entries.len() >= MAX_ENTRIES {
         let Some(victim) = cache
             .entries
             .iter()
@@ -224,7 +236,7 @@ pub fn invalidate(vol: VolKey, logical: u64, len: usize) {
     }
     let lo = Key {
         vol,
-        disk_bytenr: logical.saturating_sub(MAX_COMPRESSED),
+        disk_bytenr: logical.saturating_sub(MAX_DISK_BYTES),
         disk_num_bytes: 0,
         compression: 0,
         generation: 0,

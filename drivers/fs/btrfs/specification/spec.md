@@ -95,6 +95,19 @@ walk only the requested window. A small read must not collect the inode's
 entire extent list. Reader epochs, checksum verification, the compressed-extent
 cache and zero filling of holes still cover these reads.
 
+Uncompressed reads covered entirely by valid data checksums retain windows up to
+128 KiB in the shared 32 MiB extent cache. Keys include shared-core identity,
+logical byte range, compression tag and file-extent generation. Reads never
+widen their requested window to fill the cache. Logical writes invalidate
+overlapping entries before and after I/O, and a fill crossing a write epoch
+is not retained. Verification-disabled views and larger windows bypass this
+uncompressed cache. The maximum cached disk span also bounds invalidation's
+backward scan; it is enforced at insertion for both entry kinds.
+Missing-checksum sectors (including pending writes before commit) remain
+readable through the existing policy but never populate verified windows.
+An 8,192-entry ceiling bounds bookkeeping for tiny ranges as well as payload
+bytes.
+
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
 or shared mappings retain the original inode, data and xattrs. They remain

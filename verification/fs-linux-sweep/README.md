@@ -123,7 +123,9 @@ python3 verification/fs-linux-sweep/controlled_host.py --apply \
   --linux-kernel /path/to/vmlinuz --samples 100
 ```
 
-Full collection uses 100 fresh boots per kernel per format (800 total), with
+Full collection uses 100 fresh boots per kernel per format (800 total by
+default). Pass `--filesystems btrfs` to either measurement runner for a focused
+200-boot comparison after a Btrfs-only change. Collection uses
 randomized order, fresh 512 MiB images, 8 MiB data files and 1,024 directory
 entries. Every boot must pass the offline checker and independent content
 readback for persistent formats. Tmpfs is a memory baseline: the guest creates

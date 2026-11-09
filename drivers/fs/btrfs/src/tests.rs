@@ -17,6 +17,7 @@ use crate::chunk::ChunkMap;
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
+mod data_cache;
 mod extent_window;
 mod safety;
 mod snapshots;
@@ -305,6 +306,7 @@ struct WritableSparseDevice {
     runs: Vec<(u64, Vec<u8>)>,
     total: u64,
     lba_size: u32,
+    reads: core::sync::atomic::AtomicUsize,
     overlay: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
@@ -321,6 +323,8 @@ impl narf_block::BlockDeviceSync for WritableSparseDevice {
         n_blocks: u16,
         out: &mut [u8],
     ) -> Result<(), narf_block::BlockIoError> {
+        self.reads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let bs = u64::from(self.lba_size);
         let start = lba * bs;
         let len = u64::from(n_blocks) * bs;
@@ -389,6 +393,7 @@ fn writable_sparse(sparse: &[u8]) -> Arc<WritableSparseDevice> {
         runs,
         total,
         lba_size: 512,
+        reads: core::sync::atomic::AtomicUsize::new(0),
         overlay: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
     })
 }
@@ -398,6 +403,7 @@ fn blank_writable(total: u64) -> Arc<WritableSparseDevice> {
         runs: Vec::new(),
         total,
         lba_size: 512,
+        reads: core::sync::atomic::AtomicUsize::new(0),
         overlay: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
     })
 }

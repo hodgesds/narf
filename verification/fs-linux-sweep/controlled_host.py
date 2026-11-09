@@ -146,6 +146,8 @@ def main():
     p.add_argument("--narf-kernel", type=Path, required=True)
     p.add_argument("--linux-kernel", type=Path, required=True)
     p.add_argument("--samples", type=int, default=100)
+    p.add_argument("--filesystems", nargs="+", choices=["ext2", "ext4", "btrfs", "tmpfs"],
+                   default=["ext2", "ext4", "btrfs", "tmpfs"])
     args = p.parse_args()
     if args.restore_existing:
         state = json.loads((args.workdir / "host-controls.json").read_text())
@@ -207,7 +209,8 @@ def main():
             os.sched_setaffinity(0, {10})
         command = ["setarch", "x86_64", "-R", sys.executable, str(Path(__file__).with_name("measure.py")),
                    "--workdir", str(args.workdir), "--prepared-directory", "--samples", str(args.samples),
-                   "--narf-kernel", str(args.narf_kernel.resolve()), "--linux-kernel", str(args.linux_kernel.resolve())]
+                   "--narf-kernel", str(args.narf_kernel.resolve()), "--linux-kernel", str(args.linux_kernel.resolve()),
+                   "--filesystems", *args.filesystems]
         env = dict(os.environ, NARF_FS_HOST_STATE=str(state_path))
         child = subprocess.Popen(command, env=env, preexec_fn=enter, start_new_session=True)
         code = child.wait()

@@ -219,12 +219,9 @@ pub async fn read_file<B: BlockDevice + 'static>(
                 if compression == format::COMPRESS_NONE {
                     // Read only the bytes the window needs.
                     let logical = disk_bytenr + extent_offset + (ov_start - file_start);
-                    let data = match csum_root {
-                        Some(root) => {
-                            crate::csum::read_checked(vol, root, logical, read_len).await?
-                        }
-                        None => vol.read_logical(logical, read_len).await?,
-                    };
+                    let data =
+                        read_uncompressed_cached(vol, csum_root, logical, read_len, le64(body, 0)?)
+                            .await?;
                     dst[d0..d0 + read_len].copy_from_slice(&data);
                 } else {
                     // Compressed extents are decoded whole, then sliced. The
@@ -260,6 +257,51 @@ pub async fn read_file<B: BlockDevice + 'static>(
         cursor.advance().await?;
     }
     Ok(want)
+}
+
+/// Cache only the requested uncompressed range, bounded by the invalidation
+/// scan's maximum disk span. Identity includes the file extent generation;
+/// every logical write invalidates overlapping entries across all views of
+/// this shared core. A fill crossing a write epoch is not retained.
+async fn read_uncompressed_cached<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    csum_root: Option<u64>,
+    logical: u64,
+    len: usize,
+    generation: u64,
+) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
+    use crate::decompress_cache as cache;
+    let core: alloc::sync::Weak<crate::volume::VolCore<B>> =
+        alloc::sync::Arc::downgrade(vol.core());
+    let owner: alloc::sync::Weak<dyn core::any::Any + Send + Sync> = core;
+    let handle = cache::VolumeRef::new(owner);
+    let id = cache::ExtentId {
+        disk_bytenr: logical,
+        disk_num_bytes: len as u64,
+        compression: format::COMPRESS_NONE,
+        generation,
+    };
+    // A view that skips verification must neither consume nor populate the
+    // shared verified-range cache. Larger reads retain the uncached path.
+    let cacheable = csum_root.is_some() && len != 0 && len as u64 <= cache::MAX_DISK_BYTES;
+    if cacheable {
+        if let Some(data) = cache::get(&handle, id) {
+            return Ok(data);
+        }
+    }
+    let epoch = if cacheable { cache::epoch(&handle) } else { 0 };
+    let (data, fully_verified) = match csum_root {
+        Some(root) => crate::csum::read_checked_for_cache(vol, root, logical, len).await?,
+        None => (vol.read_logical(logical, len).await?, false),
+    };
+    let data = alloc::sync::Arc::new(data);
+    // A checksum-policy-enabled read may still have missing checksum items
+    // (nodatasum, or data staged before its first commit). Recheck those on
+    // every read instead of letting an unchecked fill outlive that commit.
+    if cacheable && fully_verified {
+        cache::insert(&handle, id, epoch, alloc::sync::Arc::clone(&data));
+    }
+    Ok(data)
 }
 
 /// Read, checksum-verify and decompress a whole compressed extent, through the
