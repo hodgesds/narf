@@ -85,6 +85,42 @@ pub struct SinkAudioCaps {
     pub speakers: u8,
 }
 
+/// A sink's EDID preferred mode (#1787): the first timing
+/// `edid_timings` yields for the blob, which EDID 1.3+ makes the
+/// preferred mode (base block's first detailed timing). The DRM/fb
+/// caller (`AmdGpu::modeset_connected`) modesets a newly connected
+/// connector with exactly this — width, height and refresh only,
+/// because `plan_modeset` re-derives the full DCN timing from
+/// those three via `timing_for_mode`. `None` means no EDID has
+/// been fed for the connector yet, or the fed blob carried no
+/// usable timing: the connector stays unmodeset rather than
+/// falling back to an invented mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PreferredMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+}
+
+impl PreferredMode {
+    /// Derive the preferred mode from one `edid_timings` entry.
+    /// Refresh is the pixel clock over the frame (`pixel_clock_khz
+    /// * 1000 / (h_total * v_total)`); a zero total is a malformed
+    /// timing, not a 0 Hz mode.
+    pub fn from_dml_timing(timing: &crate::amdgpu_dml::Timing) -> Option<Self> {
+        if timing.h_total == 0 || timing.v_total == 0 {
+            return None;
+        }
+        let frame = u64::from(timing.h_total) * u64::from(timing.v_total);
+        let refresh = u64::from(timing.pixel_clock_khz) * 1000 / frame;
+        Some(Self {
+            width: timing.h_active,
+            height: timing.v_active,
+            refresh_hz: u32::try_from(refresh).unwrap_or(u32::MAX),
+        })
+    }
+}
+
 /// One KMS connector. Index into [`KmsState::connectors`] doubles
 /// as the connector's stable ID for the duration of a probe.
 #[derive(Clone, Debug)]
@@ -106,6 +142,11 @@ pub struct Connector {
     /// layer falls back to the baseline LPCM stereo 48 kHz stream
     /// every HDMI sink must accept.
     pub audio_caps: Option<SinkAudioCaps>,
+    /// The sink's EDID preferred mode, retained when an EDID blob
+    /// is fed for this connector. `None` until a feed — the
+    /// DRM/fb caller leaves the connector unmodeset rather than
+    /// inventing a mode.
+    pub preferred_mode: Option<PreferredMode>,
 }
 
 impl Connector {
@@ -260,6 +301,7 @@ impl KmsState {
                 bound_encoder: None,
                 device_tag: path.device_tag,
                 audio_caps: None,
+                preferred_mode: None,
             });
         }
     }
@@ -466,6 +508,23 @@ pub fn feed_connector_audio_caps(
         return false;
     };
     conn.audio_caps = Some(SinkAudioCaps { sads, speakers });
+    true
+}
+
+/// Retain a connector's EDID preferred mode (#1787), resolved by
+/// the caller from a fed EDID blob. Returns `false` when the
+/// connector index is out of range; overwriting a previous mode
+/// on a re-feed is the caller's intent (a re-plugged sink may
+/// report a different preferred mode).
+pub fn feed_connector_preferred_mode(
+    kms: &mut KmsState,
+    connector_idx: u8,
+    mode: PreferredMode,
+) -> bool {
+    let Some(conn) = kms.connectors.get_mut(connector_idx as usize) else {
+        return false;
+    };
+    conn.preferred_mode = Some(mode);
     true
 }
 
@@ -1038,6 +1097,7 @@ mod smoke_tests {
             bound_encoder: Some(0),
             device_tag: 0x0080,
             audio_caps: None,
+            preferred_mode: None,
         });
         s.encoders.push(Encoder {
             kind: EncoderKind::Hdmi,
