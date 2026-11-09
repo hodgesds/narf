@@ -50,10 +50,14 @@
 //!   (chip bandwidths top at 160 MHz, `rtw8922a.c:3263..3266`).
 //! - The primary channel is checked nonzero only. Exact channel
 //!   legality lives with the channel/regulatory plan, not here.
-//! - Assoc PPE pads are caller-supplied (2 bits per width).
-//!   Parsing them from peer EHT/HE IEs is a remainder; zero pads
-//!   mean the peer advertised neither EHT nor HE caps (Linux
-//!   memsets the pads and only fills them from EHT/HE caps).
+//! - Assoc PPE pads are parsed from the peer's association IEs
+//!   (`ppe::parse_assoc_ppe`, issue #1882) at admission, EHT
+//!   first then HE, and stored on the station record; zero pads
+//!   still mean the peer advertised neither EHT nor HE caps
+//!   (Linux memsets the pads and only fills them from EHT/HE
+//!   caps). The G7 assoc builder still takes raw pads and
+//!   validates their 2-bit range — the parse output is always
+//!   in range by construction.
 //! - The RA v1 command is NOT built for EHT stations here:
 //!   its mask needs the peer's negotiated MCS map + RSSI,
 //!   which the EHT facet does not carry. `ra_v1::build_ra_v1`
@@ -75,6 +79,7 @@ use super::{
     chip_8922a,
     efuse_be::BeFactory,
     eht::EhtStation,
+    ppe,
     ra_mask::{self, HeCaps, HtCaps, VhtCaps},
 };
 
@@ -92,7 +97,7 @@ pub(super) enum Band {
 /// One admission request: the peer, the link, and the
 /// caller-supplied station parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Request {
+pub(super) struct Request<'a> {
     /// Peer MAC address.
     pub(super) peer: [u8; 6],
     /// Operating band.
@@ -117,9 +122,11 @@ pub(super) struct Request {
     /// Punctured-subchannel bitmap (only read when
     /// `eht_support`; written inverted into w4).
     pub(super) punctured: u16,
-    /// Nominal packet padding per width, 20/40/80/160/320
-    /// order, 2 bits each (see module docs).
-    pub(super) pads: [u8; 5],
+    /// The peer's association IEs: concatenated `[id, len, ...]`
+    /// elements starting at the first IE (see `ppe`). Admission
+    /// parses the Assoc PPE pads from them; there is no separate
+    /// pad input anymore.
+    pub(super) peer_ies: &'a [u8],
     /// Peer HE support (CCTL w8 BSR format bit).
     pub(super) has_he: bool,
     /// MGQ report enable (default CCTL w0).
@@ -145,8 +152,6 @@ pub(super) enum Error {
     AidOutOfRange,
     /// Port above the 3-bit CCTL field.
     PortOutOfRange,
-    /// A PPE pad above its 2-bit field.
-    PadsOutOfRange,
     /// Primary channel zero.
     BadPrimary,
     /// CMAC builder rejection (MACID/field overflow).
@@ -234,6 +239,13 @@ pub(super) struct Station {
     pub(super) aid: u16,
     /// EHT facet (advertised cap + TXWD EHT overrides).
     pub(super) facet: EhtStation,
+    /// Assoc PPE pads parsed from the peer's association IEs
+    /// (20/40/80/160/320 MHz order, 2 bits each), the values
+    /// programmed into the assoc CCTL w5. Zero means the peer
+    /// advertised neither EHT nor HE caps. The EHT station
+    /// owner gates PPE-dependent behavior on these, not on
+    /// caller-supplied values.
+    pub(super) pads: [u8; 5],
     /// BA-CAM v1 slot map (24 slots; entry index written to
     /// firmware is the bitmap index + 8 dynamic slots).
     pub(super) bacam: BaCam,
@@ -313,9 +325,11 @@ pub(super) fn admit(
     if req.port > 7 {
         return Err(Error::PortOutOfRange);
     }
-    if req.pads.iter().any(|p| *p > 3) {
-        return Err(Error::PadsOutOfRange);
-    }
+    // Pads come from the peer's IEs, never from the caller: the
+    // parse output is always five 2-bit values, so no
+    // PadsOutOfRange refusal exists anymore (the assoc builder
+    // still validates its own input).
+    let pads = ppe::parse_assoc_ppe(req.peer_ies, req.nss);
     let macid = pool.alloc()?;
     let default_cctl = cctl_g7::build_default(macid as u32, req.mgq_rpt_en).map_err(Error::Cctl)?;
     let assoc_cctl = cctl_g7::build_assoc(
@@ -326,7 +340,7 @@ pub(super) fn admit(
         req.ap_mode,
         req.eht_support,
         req.punctured,
-        req.pads,
+        pads,
         req.aid,
         req.station_mode,
         req.has_he,
@@ -343,6 +357,7 @@ pub(super) fn admit(
         nss: req.nss,
         aid: req.aid,
         facet,
+        pads,
         bacam,
         default_cctl,
         assoc_cctl,

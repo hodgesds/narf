@@ -144,6 +144,9 @@ mod power;
 mod power_native;
 mod power_regs;
 mod power_tables;
+mod ppe;
+#[cfg(any(test, feature = "kernel-test"))]
+mod ppe_tests;
 mod prepared;
 mod prepared_8922a;
 mod qos;
