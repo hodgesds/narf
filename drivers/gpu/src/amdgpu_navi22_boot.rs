@@ -1568,6 +1568,11 @@ impl ColdBoot {
             .map_err(Error::Display)?;
         for (index, report) in reports.iter().enumerate() {
             self.refresh_hdmi_vrr(index, &report.detection).await;
+            feed_detection_audio(
+                &self.sequence.backend.gpu,
+                &report.connector,
+                &report.detection,
+            );
         }
         Ok(reports)
     }
@@ -1583,6 +1588,13 @@ impl ColdBoot {
             .await
             .map_err(Error::Display)?;
         self.refresh_hdmi_vrr(index, &detection).await;
+        if let Some(connector) = self
+            .display_connectors()
+            .and_then(|c| c.get(index))
+            .copied()
+        {
+            feed_detection_audio(&self.sequence.backend.gpu, &connector, &detection);
+        }
         Ok(detection)
     }
     /// Query at most once for an unchanged HDMI EDID. Capabilities remain
@@ -2516,6 +2528,108 @@ impl ColdBoot {
         }
         Ok(())
     }
+    /// Configure FreeSync on an owned running DP stream and its flip
+    /// service. Both are serialized by the platform owner over this await.
+    /// `range` is the KMS connector's `dp_sst_caps` range, or None.
+    pub async fn configure_dp_vrr(
+        &mut self,
+        group_stream: Option<usize>,
+        range: Option<crate::amdgpu_freesync::VrrRange>,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        match group_stream {
+            Some(k) => {
+                let h = &mut self.sequence.backend;
+                let connector = h
+                    .group
+                    .as_ref()
+                    .ok_or(Error::Invalid)?
+                    .members()
+                    .get(k)
+                    .ok_or(Error::Invalid)?
+                    .connector();
+                let display = h.display.as_mut().ok_or(Error::Invalid)?;
+                let index = display
+                    .connectors()
+                    .iter()
+                    .position(|c| *c == connector)
+                    .ok_or(Error::Invalid)?;
+                let mut aux = crate::amdgpu_navi22_display::DisplayAux { display, index };
+                h.group
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .configure_dp_vrr(k, range, enabled, &mut aux)
+                    .await
+                    .map_err(Error::Modeset)?;
+            }
+            None => {
+                let bounds = {
+                    let (pipeline, mut aux, _, _) = self.lit_display()?;
+                    pipeline
+                        .configure_dp_vrr(range, enabled, &mut aux)
+                        .await
+                        .map_err(Error::Modeset)?
+                };
+                self.sequence
+                    .backend
+                    .scanout
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .configure_vrr(bounds)
+                    .map_err(|e| Error::Modeset(crate::amdgpu_navi22_modeset::Error::Block(e)))?;
+            }
+        }
+        Ok(())
+    }
+    /// BTR preflip on the lit single pipe and every group stream, before
+    /// a flip is armed: no-op without admitted BTR. A refused preflip
+    /// fails the flip, as DCN401's scanout propagates `lfc_preflip`.
+    pub fn display_lfc_preflip(&mut self) -> Result<(), crate::amdgpu_dcn_clk::Error> {
+        use crate::amdgpu_dcn_clk::Error as E;
+        let map = |e: crate::amdgpu_navi22_modeset::Error| match e {
+            crate::amdgpu_navi22_modeset::Error::Block(e) => e,
+            crate::amdgpu_navi22_modeset::Error::Unsupported => E::Unsupported,
+            _ => E::Busy,
+        };
+        // DCN401's `lfc_preflip` takes monotonic microseconds.
+        let now_us = (narf_time::wall::monotonic_ns() / 1000) as u32;
+        let h = &mut self.sequence.backend;
+        if let Some(pipeline) = h.modeset.as_mut() {
+            pipeline.lfc_preflip(now_us).map_err(map)?;
+        }
+        if let Some(group) = h.group.as_mut() {
+            for k in 0..group.members().len() {
+                group.lfc_preflip(k, now_us).map_err(map)?;
+            }
+        }
+        Ok(())
+    }
+    /// Service one observed VUPDATE on every admitted BTR stream (the
+    /// monitor pass calls this): no-op without admitted BTR. A refused
+    /// stream is reported, not fatal to the pass, as Navi48's LFC frame
+    /// service does.
+    pub fn display_lfc_progress(&mut self) {
+        use core::fmt::Write;
+        let h = &mut self.sequence.backend;
+        let refused = |e: crate::amdgpu_navi22_modeset::Error| {
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: navi22 LFC frame service refused: {e:?}"
+            );
+        };
+        if let Some(pipeline) = h.modeset.as_mut() {
+            if let Err(e) = pipeline.lfc_progress() {
+                refused(e);
+            }
+        }
+        if let Some(group) = h.group.as_mut() {
+            for k in 0..group.members().len() {
+                if let Err(e) = group.lfc_progress(k) {
+                    refused(e);
+                }
+            }
+        }
+    }
     /// Packet-only update on a running stream (group member or single).
     pub async fn update_hdmi_metadata(
         &mut self,
@@ -2604,6 +2718,7 @@ impl ColdBoot {
     pub async fn flip_display(
         &mut self,
     ) -> Result<crate::amdgpu_navi22_scanout::FlipDone, crate::amdgpu_dcn_clk::Error> {
+        self.display_lfc_preflip()?;
         let (scanout, _, flush) = self.presentation()?;
         scanout.flip(flush).await
     }
@@ -2614,6 +2729,7 @@ impl ColdBoot {
         kind: crate::amdgpu_navi22_scanout::ArmedKind,
         external: u64,
     ) -> Result<crate::amdgpu_navi22_scanout::Armed, crate::amdgpu_dcn_clk::Error> {
+        self.display_lfc_preflip()?;
         let (scanout, _, flush) = self.presentation()?;
         scanout.arm(kind, external, flush)
     }
@@ -2667,6 +2783,7 @@ impl ColdBoot {
         update: &crate::amdgpu_navi22_plane::Update,
     ) -> Result<crate::amdgpu_navi22_scanout::Armed, crate::amdgpu_dcn_clk::Error> {
         use crate::amdgpu_dcn_clk::Error as E;
+        self.display_lfc_preflip()?;
         let h = &mut self.sequence.backend;
         let scanout = h.scanout.as_mut().ok_or(E::Invalid)?;
         let pipeline = h.modeset.as_mut().ok_or(E::Invalid)?;
@@ -2694,6 +2811,7 @@ impl ColdBoot {
         &mut self,
         address: u64,
     ) -> Result<crate::amdgpu_navi22_scanout::FlipDone, crate::amdgpu_dcn_clk::Error> {
+        self.display_lfc_preflip()?;
         let (scanout, _, flush) = self.presentation()?;
         scanout.flip_external(address, flush).await
     }
@@ -2702,6 +2820,7 @@ impl ColdBoot {
         &mut self,
     ) -> Result<Option<crate::amdgpu_navi22_scanout::FlipDone>, crate::amdgpu_dcn_clk::Error> {
         use crate::amdgpu_dcn_clk::Error as E;
+        self.display_lfc_preflip()?;
         // The owned front is the lit plane: a client placement shown now is
         // undone with the flip back.
         let h = &mut self.sequence.backend;
@@ -2730,6 +2849,30 @@ impl ColdBoot {
     ) -> Result<crate::amdgpu_dcn30_cursor::Shown, crate::amdgpu_dcn_clk::Error> {
         let (scanout, pool, flush) = self.presentation()?;
         scanout.set_cursor(pool, image, at, flush)
+    }
+}
+
+/// Feed one detection's EDID into the KMS audio caps (#1786): the
+/// live DDC/AUX read's blob reaches `feed_connector_edid` through
+/// the device-tag crosswalk, so the caps land on the connector the
+/// blob was read from. A connected sink feeds; a sink that cannot
+/// be read (or is gone) clears the caps so they read unknown,
+/// never stale caps from a previous sink. Not an error when the
+/// tag has no KMS connector or the blob carries no CEA block —
+/// the feed's own contract covers both — so the result is dropped.
+pub(crate) fn feed_detection_audio(
+    gpu: &crate::amdgpu::AmdGpu,
+    connector: &crate::amdgpu_navi22_display::Connector,
+    detection: &crate::amdgpu_navi22_display::Detection,
+) {
+    use crate::amdgpu_navi22_display::Detection;
+    match detection {
+        Detection::Connected(sink) => {
+            let _ = gpu.feed_connector_edid_for_device(connector.path.device_tag, &sink.edid);
+        }
+        Detection::Disconnected | Detection::Failed(_) => {
+            let _ = gpu.clear_connector_audio_caps_for_device(connector.path.device_tag);
+        }
     }
 }
 

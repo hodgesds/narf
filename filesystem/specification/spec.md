@@ -179,6 +179,18 @@ credential provider, its inner filesystem is detected and mounted, and the
 adapter is registered as `cryptroot`. Missing credentials and authenticated
 unlock failures surface as `RootMountError::LuksUnlock`; they never fall
 through to an unrelated disk.
+The decrypted view is registered before named filesystem construction so
+`ro` and `rootflags=` work. Failed construction or attachment unregisters the
+mapping. In root-ro/root-rw policy, selection uses the outer container UUID
+and block verifies the exact backing registration before designation.
+`RootMountError::LuksMapping(BlockIoError)` reports a name collision or a
+backing registration that changed while the decrypted view was installed.
+Root-policy mounts always use the named constructor, including a default
+`root-rw` without `rootflags`, so a refused writable mount cannot silently
+become a read-only root through the generic factory.
+Opting into `rd.luks.key` or `rd.luks.prompt` requires an explicit valid root
+selector; a failed selected-root mount is fatal, rather than returning to
+the development initramfs login.
 
 `try_mount_root_with_options` additionally accepts
 `RootMountOptions::tmpfs_overlay`. When set (the explicit-`root=`

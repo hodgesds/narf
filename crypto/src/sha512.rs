@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+use core::fmt;
+
 const K: [u64; 80] = [
     0x428a2f98d728ae22,
     0x7137449123ef65cd,
@@ -99,12 +101,26 @@ const H0: [u64; 8] = [
     0x5be0cd19137e2179,
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Sha512 {
     h: [u64; 8],
     buffer: [u8; 128],
     buffer_len: usize,
     total_len: u128,
+}
+
+/// SEC-C2 (#1551): same redaction as `Sha256` — the internal
+/// `buffer` holds in-flight message bytes and `h` holds
+/// intermediate state. Only the public lengths print.
+impl fmt::Debug for Sha512 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sha512")
+            .field("h", &"<redacted>")
+            .field("buffer", &"<redacted>")
+            .field("buffer_len", &self.buffer_len)
+            .field("total_len", &self.total_len)
+            .finish()
+    }
 }
 
 impl Default for Sha512 {

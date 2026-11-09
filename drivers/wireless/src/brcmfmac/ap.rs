@@ -150,6 +150,7 @@ impl Session {
             source,
             sources: Vec::new(),
             policy,
+            scope,
             role: Epoch::new(),
             copy: Epoch::new(),
             peer: None,
@@ -436,7 +437,7 @@ impl Session {
     fn native_event(&mut self, event: NativeEvent) -> Result<(), Error> {
         let header = event.header;
         use super::ap_wire::{event_transition, Transition};
-        let transition = event_transition(&header, self.plan.own)?;
+        let transition = event_transition(&header, self.plan.own, self.scope.indices())?;
         if transition == Transition::Failed {
             return Err(Error::Failed);
         }

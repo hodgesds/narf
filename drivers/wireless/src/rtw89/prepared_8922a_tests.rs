@@ -120,10 +120,11 @@ fn factory() -> BeFactory {
         phycap: [0u8; chip_8922a::PHYCAP_SIZE],
         cv: None,
         thermal_k: None,
+        secure: super::efuse_be::SecureInfo::disabled(),
     }
 }
 
-fn base_req() -> Request {
+fn base_req() -> Request<'static> {
     Request {
         peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB],
         band: Band::Ghz5,
@@ -136,7 +137,7 @@ fn base_req() -> Request {
         station_mode: true,
         eht_support: true,
         punctured: 0,
-        pads: [0; 5],
+        peer_ies: &[],
         has_he: true,
         mgq_rpt_en: false,
         p2p: false,
@@ -373,7 +374,7 @@ fn smoke_rtw89_prepared_8922a_full_sequence() -> TestResult {
         Ok(completed) if completed.is_empty() => {}
         _ => return TestResult::Fail("RP update completed without a report"),
     }
-    let record = (1u32 << 13) | (0u32 << 8) | 0u32;
+    let record = 1u32 << 13;
     match owner.observe_data_report(&record.to_le_bytes()) {
         Ok(Some(completion))
             if completion.status == 1

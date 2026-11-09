@@ -1071,6 +1071,8 @@ unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
     // Checksum + mapped-window validation first: header, full
     // firmware-declared length, and the 8-bit ACPI checksum
     // (ACPI 6.5 §5.2) are all verified before slicing.
+    // SAFETY: the caller supplies a physical table address backed by the
+    // boot mapping; the callee validates its range before reading.
     let hdr = unsafe { narf_acpi::verify_table_checksum(phys)? };
     let total = hdr.length as usize;
     if total <= 36 {

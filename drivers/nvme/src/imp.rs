@@ -5244,6 +5244,13 @@ fn aer_poll_instance(instance: u32) {
 async fn aer_supervisor_task() {
     loop {
         let n = controller_count();
+        if n == 0 {
+            // The supervisor is spawned even on machines with no NVMe. The
+            // empty for-loop below has no await point and would monopolize
+            // the executor, preventing init/getty and every peer from polling.
+            narf_time::sleep_ms(AER_SUPERVISOR_POLL_MS).await;
+            continue;
+        }
         for instance in 0..n as u32 {
             let v = with_controller_at(instance, |c| c.irq_vector).flatten();
             match v {

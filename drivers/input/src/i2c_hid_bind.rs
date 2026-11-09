@@ -802,12 +802,15 @@ async fn pump_task_inner(
             Ok(probe) => {
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  i2c-hid-pump: {}: RMI4-over-HID bound (manufacturer={}, f11={}, f12={}, f30={})",
+                    "  i2c-hid-pump: {}: RMI4-over-HID bound (manufacturer={}, f11={}, f12={}, f30={}, max={}x{}, slots={})",
                     path,
                     probe.product.manufacturer_id,
                     probe.f11.is_some(),
                     probe.f12.is_some(),
                     probe.f30.is_some(),
+                    probe.sensor_axis_maxima().0,
+                    probe.sensor_axis_maxima().1,
+                    probe.sensor_slots(),
                 );
                 let caps = crate::i2c_hid_touch::build_rmi_caps(
                     &probe,
@@ -1453,12 +1456,13 @@ pub(crate) async fn pump_rmi_attn(
                 decode_f12_data1(attn.data, nobj).ok()
             } else {
                 // Multi-source ATTN: read Data 1 back from the
-                // register (5 objects; the true object count
-                // comes from the F$12 query at probe time —
-                // remainder).
-                let mut buf = alloc::vec![0u8; 5 * F12_OBJECT_SIZE];
+                // register — `probe.f12_max_objects()` objects,
+                // decoded at probe time from the F$12 Data-1
+                // descriptor (fallback 5).
+                let nobj = probe.f12_max_objects();
+                let mut buf = alloc::vec![0u8; nobj * F12_OBJECT_SIZE];
                 match session.read_block(f12.data_base as u16, &mut buf).await {
-                    Ok(()) => decode_f12_data1(&buf, 5).ok(),
+                    Ok(()) => decode_f12_data1(&buf, nobj).ok(),
                     Err(_) => None,
                 }
             };
@@ -1472,17 +1476,7 @@ pub(crate) async fn pump_rmi_attn(
                         pressure: o.z as i32,
                     })
                     .collect();
-                state.pump_contacts(
-                    Some(node),
-                    &contacts,
-                    btn_left,
-                    crate::rmi4_core::Rmi4PumpBounds {
-                        x_min: 0,
-                        x_max: 0xFFFF,
-                        y_min: 0,
-                        y_max: 0xFFFF,
-                    },
-                );
+                state.pump_contacts(Some(node), &contacts, btn_left, probe.sensor_bounds());
             }
         }
         return;
@@ -1490,8 +1484,10 @@ pub(crate) async fn pump_rmi_attn(
     if f11_mask != 0 && sources & f11_mask != 0 {
         if let Some(f11) = &probe.f11 {
             let single_source = sources == f11_mask;
-            // F$11 frame: 1 finger-state byte + 5 bytes per finger.
-            let max_fingers = 5usize;
+            // F$11 frame: 1 finger-state byte + 5 bytes per
+            // finger; the finger count comes from the F$11
+            // Query 1 register at probe time (fallback 5).
+            let max_fingers = probe.f11_max_fingers();
             let decoded = if single_source {
                 TouchpadReport::parse(attn.data, max_fingers).ok()
             } else {
@@ -1512,17 +1508,7 @@ pub(crate) async fn pump_rmi_attn(
                         pressure: 0,
                     })
                     .collect();
-                state.pump_contacts(
-                    Some(node),
-                    &contacts,
-                    btn_left,
-                    crate::rmi4_core::Rmi4PumpBounds {
-                        x_min: 0,
-                        x_max: 0x0FFF,
-                        y_min: 0,
-                        y_max: 0x0FFF,
-                    },
-                );
+                state.pump_contacts(Some(node), &contacts, btn_left, probe.sensor_bounds());
             }
         }
     }

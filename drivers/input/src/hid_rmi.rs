@@ -48,9 +48,14 @@ use alloc::vec::Vec;
 
 use crate::i2c_hid::{I2cHidDriver, I2cHidError};
 use crate::rmi4_core::{
-    build_interrupt_map, find_function, F01ProductInfo, F30Query, PdtEntry, Rmi4DeviceProbe,
-    Rmi4Transport, TransportError, F01_DEVICE_CONTROL, F11_2D_TOUCHPAD, F12_2D_TOUCHPAD_NEXT,
-    F30_GPIO_LED, PDT_ENTRY_SIZE, PDT_FIRST_SLOT_OFFSET, PDT_LAST_SLOT_OFFSET,
+    build_interrupt_map, decode_f12_sensor_tuning, find_function, parse_register_descriptor,
+    register_descriptor_header, F01ProductInfo, F11SensorInfo, F12SensorInfo, F30Query, PdtEntry,
+    Rmi4DeviceProbe, Rmi4Transport, RmiRegDescriptor, TransportError, F01_DEVICE_CONTROL,
+    F11_2D_TOUCHPAD, F11_CTRL_SENSOR_MAX_X_POS_OFFSET, F12_2D_TOUCHPAD_NEXT,
+    F12_CTRL_SENSOR_TUNING, F12_DATA_OBJECT_DATA, F12_QUERY_HAS_DESCRIPTORS, F30_GPIO_LED,
+    PDT_ENTRY_SIZE, PDT_FIRST_SLOT_OFFSET, PDT_LAST_SLOT_OFFSET, RMI4_FALLBACK_F11_MAX,
+    RMI4_FALLBACK_F12_MAX, RMI4_FALLBACK_MAX_COUNT, RMI4_PUMP_MAX_SLOTS, RMI_REG_DESC_PRESENCE_MAX,
+    RMI_REG_DESC_STRUCT_MAX,
 };
 
 // ── Device ID table ────────────────────────────────────────────────
@@ -623,8 +628,144 @@ impl<'d> HidRmiSession<'d> {
             .map_err(map_hid_error)
     }
 
+    /// Decode the F$11 sensor limits over this session (see
+    /// `crate::rmi4_core::decode_f11_sensor` for the layout).
+    async fn decode_f11_sensor(&mut self, f11: &PdtEntry) -> Option<F11SensorInfo> {
+        let mut query1 = [0u8; 1];
+        self.read_block(f11.query_base as u16 + 1, &mut query1)
+            .await
+            .ok()?;
+        let mut info = F11SensorInfo {
+            max_x: RMI4_FALLBACK_F11_MAX,
+            max_y: RMI4_FALLBACK_F11_MAX,
+            max_fingers: F11SensorInfo::fingers_from_query1(query1[0]),
+        };
+        let mut ctrl = [0u8; 4];
+        if self
+            .read_block(
+                f11.control_base as u16 + F11_CTRL_SENSOR_MAX_X_POS_OFFSET,
+                &mut ctrl,
+            )
+            .await
+            .is_ok()
+        {
+            let max_x = u16::from_le_bytes([ctrl[0], ctrl[1]]);
+            let max_y = u16::from_le_bytes([ctrl[2], ctrl[3]]);
+            if max_x > 0 {
+                info.max_x = max_x;
+            }
+            if max_y > 0 {
+                info.max_y = max_y;
+            }
+        }
+        Some(info)
+    }
+
+    /// Read one register descriptor over this session (see
+    /// `crate::rmi4_core::read_register_descriptor`).
+    async fn read_register_descriptor(
+        &mut self,
+        addr: u16,
+    ) -> Result<RmiRegDescriptor, TransportError> {
+        let mut size = [0u8; 1];
+        self.read_block(addr, &mut size).await?;
+        let presence_len = size[0] as usize;
+        if presence_len > RMI_REG_DESC_PRESENCE_MAX {
+            return Err(TransportError::Protocol);
+        }
+        if presence_len == 0 {
+            return Ok(RmiRegDescriptor::default());
+        }
+        let mut presence = alloc::vec![0u8; presence_len];
+        self.read_block(addr + 1, &mut presence).await?;
+        let (struct_size, _) =
+            register_descriptor_header(&presence).map_err(|_| TransportError::Protocol)?;
+        if struct_size > RMI_REG_DESC_STRUCT_MAX {
+            return Err(TransportError::Protocol);
+        }
+        let mut structure = alloc::vec![0u8; struct_size];
+        self.read_block(addr + 2, &mut structure).await?;
+        parse_register_descriptor(&presence, &structure).map_err(|_| TransportError::Protocol)
+    }
+
+    /// Decode the F$12 sensor limits over this session (see
+    /// `crate::rmi4_core::decode_f12_sensor` for the layout).
+    async fn decode_f12_sensor(&mut self, f12: &PdtEntry) -> Option<F12SensorInfo> {
+        let mut query0 = [0u8; 1];
+        self.read_block(f12.query_base as u16, &mut query0)
+            .await
+            .ok()?;
+        if (query0[0] & F12_QUERY_HAS_DESCRIPTORS) == 0 {
+            return None;
+        }
+        // Descriptors live at query_base + 1 (query), + 4
+        // (control), + 7 (data), three RMI addresses apart
+        // (Linux `rmi_f12_probe`). The query descriptor itself
+        // is never consumed after parsing — Linux reads it, we
+        // skip it.
+        let ctrl_desc = self
+            .read_register_descriptor(f12.query_base as u16 + 4)
+            .await
+            .ok();
+        let data_desc = self
+            .read_register_descriptor(f12.query_base as u16 + 7)
+            .await
+            .ok();
+        if ctrl_desc.is_none() && data_desc.is_none() {
+            return None;
+        }
+        let mut info = F12SensorInfo {
+            max_x: RMI4_FALLBACK_F12_MAX,
+            max_y: RMI4_FALLBACK_F12_MAX,
+            max_objects: RMI4_FALLBACK_MAX_COUNT,
+        };
+        if let Some(desc) = &ctrl_desc {
+            if let Some(item) = desc.item(F12_CTRL_SENSOR_TUNING) {
+                // Linux caps the tuning read at its 15-byte buffer.
+                if item.reg_size <= 15 {
+                    if let Some(offset) = desc.reg_offset(F12_CTRL_SENSOR_TUNING) {
+                        let mut buf = [0u8; 15];
+                        if self
+                            .read_block(
+                                f12.control_base as u16 + offset as u16,
+                                &mut buf[..item.reg_size],
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            if let Some((max_x, max_y)) =
+                                decode_f12_sensor_tuning(item, &buf[..item.reg_size])
+                            {
+                                if max_x > 0 {
+                                    info.max_x = max_x;
+                                }
+                                if max_y > 0 {
+                                    info.max_y = max_y;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(desc) = &data_desc {
+            if let Some(data1) = desc.item(F12_DATA_OBJECT_DATA) {
+                if data1.num_subpackets > 0 {
+                    // Clamped to the pump's fixed slot table (Linux
+                    // allocates `nbr_fingers` slots dynamically; our
+                    // `Rmi4PumpState` holds `RMI4_PUMP_MAX_SLOTS`).
+                    info.max_objects = (data1.num_subpackets as usize).min(RMI4_PUMP_MAX_SLOTS);
+                }
+            }
+        }
+        Some(info)
+    }
+
     /// Probe the device: set RMI mode with ATTN reports, walk the
-    /// page-0 PDT, and read the F$01 product-info query block.
+    /// page-0 PDT, read the F$01 product-info query block, and
+    /// decode the F$11/F$12 sensor-maximum queries (best-effort —
+    /// a failed sensor read leaves the probe field `None` and
+    /// the consumers fall back to the placeholders).
     /// Returns the shared [`Rmi4DeviceProbe`] the bind pump and
     /// the SMBus transport both consume. Fails when the device
     /// does not answer in RMI mode or has no F$01 function — the
@@ -680,6 +821,16 @@ impl<'d> HidRmiSession<'d> {
             }
         }
         let interrupt_map = build_interrupt_map(&table);
+        // F$11 / F$12 sensor maxima (best-effort — see the
+        // doc comment on `probe`).
+        let mut f11_sensor = None;
+        if let Some(f) = &f11 {
+            f11_sensor = self.decode_f11_sensor(f).await;
+        }
+        let mut f12_sensor = None;
+        if let Some(f) = &f12 {
+            f12_sensor = self.decode_f12_sensor(f).await;
+        }
         Ok(Rmi4DeviceProbe {
             table,
             product,
@@ -687,6 +838,8 @@ impl<'d> HidRmiSession<'d> {
             f12,
             f30,
             f30_gpio_count,
+            f11_sensor,
+            f12_sensor,
             interrupt_map,
         })
     }

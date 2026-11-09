@@ -309,6 +309,42 @@ pub(super) fn transmit_profile(
         fragments: false,
     })
 }
+/// RTL8852A ordinary station TXWD (rtw8852a.c `rtw8852a_chip_info`:
+/// `txwd_body_size` = sizeof(`rtw89_txwd_body`), the RTL8852B v0 layout,
+/// and rtw8852ae.c `rtw89_pci_fill_txaddr_info`): management, non-QoS and
+/// (under the signed RTL8852A programs) QoS data at a fixed rate or firmware
+/// RA, with HE +HTC and `DATA_ER`; no A-MSDU (no RTL8852A A-MSDU program)
+/// and no fragments. Originator A-MPDU stays refused upstream
+/// (`packet_core` admits no A aggregate program yet), so `agg` is only
+/// ever `None` here until that program lands.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn transmit_a(
+    frame: &[u8],
+    own: [u8; 6],
+    mac_id: u8,
+    sequence: u16,
+    address: u64,
+    report: bool,
+    rate: u8,
+    agg: Option<Agg>,
+) -> Result<(Vec<u8>, Queue), Error> {
+    if amsdu(frame) {
+        return Err(Error::Frame);
+    }
+    transmit_profile_inner(Tx {
+        chip: ChipId::Rtl8852A,
+        frame,
+        own,
+        mac_id,
+        sequence,
+        address,
+        report,
+        rate,
+        agg,
+        limit: None,
+        fragments: false,
+    })
+}
 /// RTL8851B ordinary station TXWD (rtw8851b.c `rtw8851b_chip_info`:
 /// `txwd_body_size` = sizeof(`rtw89_txwd_body`), the RTL8852B v0 layout,
 /// and rtw8851be.c `rtw89_pci_fill_txaddr_info`): management, non-QoS and
@@ -460,6 +496,10 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
     let c = match chip {
         ChipId::Rtl8852B => false,
         ChipId::Rtl8852C if !fragments && limit.is_none() => true,
+        // RTL8852A: the AX v0 body (`txwd_body_size`/`txwd_info_size` as
+        // RTL8852B, `rtw8852a.c:2473..2474` @ 05441d6, pci.c
+        // `rtw89_pci_fill_txaddr_info`); no A-MSDU or fragment program.
+        ChipId::Rtl8852A if !fragments && limit.is_none() => false,
         // RTL8851B: the AX v0 body (`txwd_body_size`/`txwd_info_size` as
         // RTL8852B, pci.c `rtw89_pci_fill_txaddr_info`); no A-MSDU or
         // fragment program.

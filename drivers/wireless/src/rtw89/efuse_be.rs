@@ -461,6 +461,25 @@ pub(super) enum MssDevType {
     NonwinInbox,
     Default,
 }
+impl MssDevType {
+    /// Linux-mapped device index (`efuse.c:400..425`
+    /// `get_mss_dev_type_idx`): the raw fuse nibbles 0xC/0xA/0x9/0x6
+    /// map to 0/1/2/3 and the default 0xF stays 0xF
+    /// (`RTW89_FW_MSS_DEV_TYPE_FWSEC_DEF`). This is the index
+    /// `fw.c::__get_mssc_key_idx` multiplies into the MSS bitmap —
+    /// the same index space the AX fuse decoder produces in
+    /// `secure::Fuses`, so one signature-selection rule serves both
+    /// generations.
+    pub(super) const fn index(self) -> u8 {
+        match self {
+            Self::WinlinInbox => 0,
+            Self::NonlinInboxNonCob => 1,
+            Self::NonlinInboxCob => 2,
+            Self::NonwinInbox => 3,
+            Self::Default => 15,
+        }
+    }
+}
 
 /// Decoded firmware-secure state (`efuse_be.c:488..540` +
 /// `efuse.c:370..402`). `secure_boot` is false on every early-out path
@@ -473,6 +492,19 @@ pub(super) struct SecureInfo {
     pub(super) mss_dev_type: Option<MssDevType>,
     pub(super) mss_cust_idx: u8,
     pub(super) mss_key_num: u8,
+}
+impl SecureInfo {
+    /// Erased/default secure state: secure boot off, no magnitude, no
+    /// MSS selection (the `sb_cryp_sel == 0xFFFF` early-out).
+    pub(super) const fn disabled() -> Self {
+        Self {
+            secure_boot: false,
+            sb_sel_mgn: None,
+            mss_dev_type: None,
+            mss_cust_idx: 0,
+            mss_key_num: 0,
+        }
+    }
 }
 
 /// `get_sb_cryp_sel_idx` (`efuse_be.c:530..560`): the low byte must be
@@ -594,6 +626,11 @@ pub(super) struct BeFactory {
     pub(super) phycap: [u8; chip_8922a::PHYCAP_SIZE],
     pub(super) cv: Option<u8>,
     pub(super) thermal_k: Option<i16>,
+    /// Firmware-secure fuse state (`read_secure`, Linux
+    /// `rtw89_efuse_read_fw_secure_be`): the secure-download plan's
+    /// input. A failed secure-window read fails this factory read
+    /// rather than defaulting to secure-boot-off.
+    pub(super) secure: SecureInfo,
 }
 
 fn read_mac(io: &mut impl Io, hci: Hci, hci_log: &[u8]) -> [u8; 6] {
@@ -661,6 +698,10 @@ impl BeFactory {
             Err(BeEfuseError::NotPresent) => None,
             Err(e) => return Err(e),
         };
+        // The secure window is read last, in the same powered dump
+        // window as the map above: the download plan must know the
+        // real fuse state before any image is trusted.
+        let secure = read_secure(io, cut_is_cav)?;
         Ok(BeFactory {
             mac,
             rfe_type: rf_log[RF_RFE_TYPE_OFF],
@@ -669,6 +710,7 @@ impl BeFactory {
             phycap,
             cv,
             thermal_k,
+            secure,
         })
     }
 }

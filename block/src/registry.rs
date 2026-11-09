@@ -321,6 +321,9 @@ pub struct RegisteredBlockDevice {
     /// [`crate::disk_policy::designate_root`] designates. A device
     /// re-registered under the same name gets a new one.
     pub dev_id: crate::disk_policy::DevId,
+    /// Authenticated encrypted view: retain only the backing registration's
+    /// write authority. Ordinary devices have no delegated authority.
+    pub(crate) write_parent: Option<crate::disk_policy::DevId>,
     /// GPT metadata, if this entry is a partition. `None` for
     /// whole-disk parents and for legacy-MBR partitions.
     pub partition: Option<PartitionMetadata>,
@@ -357,7 +360,7 @@ pub fn register_block_device_with_meta(
     dev: Arc<dyn BlockDeviceSync>,
     partition: Option<PartitionMetadata>,
 ) {
-    register_entry(name, None, dev, partition, None);
+    let _ = register_entry(name, None, dev, partition, None, None);
 }
 
 /// Register a whole disk together with its hardware identity. Partitions
@@ -368,7 +371,7 @@ pub fn register_block_device_with_identity(
     dev: Arc<dyn BlockDeviceSync>,
     identity: DiskIdentity,
 ) {
-    register_entry(name, None, dev, None, Some(Arc::new(identity)));
+    let _ = register_entry(name, None, dev, None, Some(Arc::new(identity)), None);
 }
 
 /// Register partition `name` of the already-registered disk `parent_name`.
@@ -381,7 +384,32 @@ pub fn register_partition_device(
     dev: Arc<dyn BlockDeviceSync>,
     partition: Option<PartitionMetadata>,
 ) {
-    register_entry(name, Some(parent_name), dev, partition, None);
+    let _ = register_entry(name, Some(parent_name), dev, partition, None, None);
+}
+
+/// Register a decrypted boot-root view without broadening the backing guard's
+/// authority. The concrete authenticated adapter must wrap this exact live
+/// registration. Existing names are never replaced by this operation.
+pub fn register_encrypted_root(
+    name: &'static str,
+    parent_name: &str,
+    dev: crate::encrypted::EncryptedBlockDevice,
+) -> Result<(), BlockIoError> {
+    let parent = block_devices()
+        .into_iter()
+        .find(|e| e.name == parent_name)
+        .ok_or(BlockIoError::DeviceRemoved)?;
+    if !dev.wraps(&parent.dev) || find_block_device(name).is_some() {
+        return Err(BlockIoError::DriverError);
+    }
+    register_entry(
+        name,
+        Some(parent_name),
+        Arc::new(dev),
+        None,
+        None,
+        Some(parent.dev_id),
+    )
 }
 
 /// `N` of a `<parent>p<N>` (or `<parent><N>`, as `sda1`) partition name.
@@ -397,10 +425,16 @@ fn register_entry(
     dev: Arc<dyn BlockDeviceSync>,
     partition: Option<PartitionMetadata>,
     identity: Option<Arc<DiskIdentity>>,
-) {
+    write_parent: Option<crate::disk_policy::DevId>,
+) -> Result<(), BlockIoError> {
     let (entry, replaced) = {
         let mut g = REGISTRY.lock();
         let parent_entry = parent_name.and_then(|parent| g.iter().find(|e| e.name == parent));
+        if let Some(id) = write_parent {
+            if g.iter().any(|e| e.name == name) || parent_entry.is_none_or(|p| p.dev_id != id) {
+                return Err(BlockIoError::DeviceRemoved);
+            }
+        }
         let disk = parent_entry
             .map(|e| e.disk)
             .unwrap_or_else(crate::disk_policy::new_disk_id);
@@ -409,7 +443,11 @@ fn register_entry(
         let partno = parent_name.and_then(|p| partno_from_name(name, p));
         // Every entry — disk or partition, any transport — is wrapped in the
         // `narf.disks` guard; nothing in the registry is reachable unguarded.
-        let guard = crate::disk_policy::PolicyGuard::new(name, disk, dev);
+        let mut guard = crate::disk_policy::PolicyGuard::new(name, disk, dev);
+        // Only register_encrypted_root can request delegation; tie it to the
+        // same parent snapshot under the registry lock, never a reused name.
+        let write_parent = write_parent.filter(|id| parent_entry.is_some_and(|p| p.dev_id == *id));
+        guard.write_parent = write_parent;
         let dev_id = guard.dev_id();
         let entry = RegisteredBlockDevice {
             name,
@@ -419,6 +457,7 @@ fn register_entry(
             dev: Arc::new(guard) as Arc<dyn BlockDeviceSync>,
             disk,
             dev_id,
+            write_parent,
             partition,
         };
         let replaced = if let Some(pos) = g.iter().position(|e| e.name == name) {
@@ -439,6 +478,7 @@ fn register_entry(
     // non-default policy must re-`install_io_scheduler` after
     // re-bring-up.
     crate::io_scheduler::reserve_io_scheduler_slot(name);
+    Ok(())
 }
 
 /// Snapshot of currently-registered block devices.

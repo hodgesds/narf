@@ -251,9 +251,21 @@ pub struct NetIfaceEntry {
     /// Raw firmware PHY-type code, when the driver reports one
     /// (issue #791 / #867). The code is family-defined — for i40e
     /// it is the AQ `get_link_status` phy_type byte
-    /// (`I40E_PHY_TYPE_*`); decoding it to a name is #867's table
-    /// work, not this field's job.
+    /// (`I40E_PHY_TYPE_*`); the decoded name rides in
+    /// [`Self::phy_type_name`].
     pub phy_type: Option<u8>,
+    /// Decoded PHY-type name, when the driver reports one (issue
+    /// #867). Family-defined, always a `&'static str` from that
+    /// family's sourced table — for i40e the `I40E_PHY_TYPE_*`
+    /// suffix (`"SFI"`, `"10GBASE_SR"`). Other families publish
+    /// their own table's names as they gain decodes, `None` until
+    /// then. Like `phy_type` it survives carrier-down and clears
+    /// with an empty cage, so no name is ever reported for a
+    /// module that is no longer seated. Rtnetlink/sysfs surfacing
+    /// of the media fields is still open (see #867): the fields
+    /// exist so a consumer can read them, no sysfs/rtnetlink file
+    /// renders them yet.
+    pub phy_type_name: Option<&'static str>,
     /// Authoritative software-path counters shared by sysfs, procfs, and
     /// rtnetlink. Driver-specific error paths can add to these through the
     /// accounting helpers below as they gain detailed hardware reporting.
@@ -867,6 +879,7 @@ fn register_inner(
     let duplex = old.as_ref().and_then(|old| old.duplex);
     let media_available = old.as_ref().and_then(|old| old.media_available);
     let phy_type = old.as_ref().and_then(|old| old.phy_type);
+    let phy_type_name = old.as_ref().and_then(|old| old.phy_type_name);
     let stats = old.as_ref().map_or_else(
         || IfaceCounterSnapshot::empty(&name),
         |old| old.stats.clone(),
@@ -935,6 +948,7 @@ fn register_inner(
         duplex,
         media_available,
         phy_type,
+        phy_type_name,
         stats,
         offloads: old
             .as_ref()
@@ -1481,6 +1495,9 @@ pub struct NetIfaceSnapshot {
     /// Raw firmware PHY-type code, mirrored from the entry
     /// (issue #791 / #867). Family-defined; see the entry field.
     pub phy_type: Option<u8>,
+    /// Decoded PHY-type name, mirrored from the entry (issue
+    /// #867). Family-defined; see the entry field.
+    pub phy_type_name: Option<&'static str>,
     pub stats: IfaceCounterSnapshot,
     /// Offloads this interface's send path honors; the stack requests them
     /// via [`crate::TxMeta`] rather than computing in software.
@@ -1690,6 +1707,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         duplex: entry.duplex,
         media_available: entry.media_available,
         phy_type: entry.phy_type,
+        phy_type_name: entry.phy_type_name,
         stats: entry.stats.clone(),
         offloads: entry.offloads,
         software_gro: entry.software_gro,
@@ -1990,7 +2008,12 @@ pub fn set_link_metadata_for(
 /// carrier-down sample must still land here. `None` leaves the
 /// stored value untouched — a family that reports no media state
 /// never clears another sample's.
-pub fn set_link_media(name: &str, media_available: Option<bool>, phy_type: Option<u8>) -> bool {
+pub fn set_link_media(
+    name: &str,
+    media_available: Option<bool>,
+    phy_type: Option<u8>,
+    phy_type_name: Option<&'static str>,
+) -> bool {
     let _capture = monitor::PUBLISH.lock();
     let mut guard = IFACES.lock();
     let Some(entry) = guard
@@ -1999,7 +2022,7 @@ pub fn set_link_media(name: &str, media_available: Option<bool>, phy_type: Optio
     else {
         return false;
     };
-    update_link_media(entry, media_available, phy_type);
+    update_link_media(entry, media_available, phy_type, phy_type_name);
     true
 }
 
@@ -2150,6 +2173,7 @@ fn update_link_media(
     entry: &mut NetIfaceEntry,
     media_available: Option<bool>,
     phy_type: Option<u8>,
+    phy_type_name: Option<&'static str>,
 ) {
     // Carrier-independent by design (see `set_link_media`): only
     // `Some` overwrites, so a carrier-down sample carrying the
@@ -2157,16 +2181,22 @@ fn update_link_media(
     // erases a previous observation. One exception: an empty cage
     // has no PHY type, so `media_available = Some(false)` clears
     // any stale type — a reader must never see a type for a
-    // module that is no longer seated.
+    // module that is no longer seated. The decoded name follows
+    // the raw code exactly: it clears with the cage and only
+    // lands when the cage is not empty.
     if let Some(media_available) = media_available {
         entry.media_available = Some(media_available);
         if !media_available {
             entry.phy_type = None;
+            entry.phy_type_name = None;
         }
     }
     if entry.media_available != Some(false) {
         if let Some(phy_type) = phy_type {
             entry.phy_type = Some(phy_type);
+        }
+        if let Some(phy_type_name) = phy_type_name {
+            entry.phy_type_name = Some(phy_type_name);
         }
     }
 }

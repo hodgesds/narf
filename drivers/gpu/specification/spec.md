@@ -4779,11 +4779,11 @@ zeros rather than stale data. The last sample is published like the
 discrete owners' `Snapshot` — retained across a clean rejection,
 never fabricated — and the monitor exits on a terminal SMU failure
 or an epoch change. The owner does not itself register the
-`gpu_temp_mc` provider: that half belongs to the discrete-owner
-provider module (`amdgpu_smu_temp`, PR #1697) and is a rebase
-remainder there, and attaching the owner at APU bring-up (the
-`'static` owner + mailbox slot, cf. `amdgpu_navi22_power::start`)
-is a separate integration step.
+`gpu_temp_mc` provider: `amdgpu_smu_temp::gpu_temp_mc` reads its
+last published sample after the discrete owners, and attaching the
+owner at APU bring-up (the `'static` owner + mailbox slot, cf.
+`amdgpu_navi22_power::start`) is a separate integration step — no
+APU platform singleton exists on main to attach it to.
 
 `unsafe deep_sleep_control().await` is `smu_v14_0_deep_sleep_control(true)`
 as SMU 14.0.2 maps it: for each DS feature of Linux's walk the board supports
@@ -9970,6 +9970,33 @@ of the given type ENOENT. Non-atomic cards keep set_property_legacy. Model-teste
 `dcn401-deadline`, `dcn401-scanout`, `navi48-modeset`, `navi48-kms`, `drm`,
 `drm_ioctl`); not validated on hardware.
 
+**Navi 22 (DCN 3.0) overlays — DRM layer only (#1950).** Navi22
+publishes two shared overlays (dc caps' `max_slave_planes = 2` on DCN
+3.0, also `max_slave_yuv_planes = 2` and `max_slave_rgb_planes = 2`;
+Linux v6.12 `dc/resource/dcn30/dcn30_resource.c`) at plane ids
+0x44/0x45, with the same 19-format overlay list as Navi48 and the
+cursor planes at 0x46+ after them (contiguous, as amdgpu_dm registers
+each CRTC's cursor after every primary and overlay). The primaries
+stay synthesized (their CRTC's `primary_fb`): the primary's immutable
+zpos is 2 (`max_slave_planes`), overlay k's default zpos is 7 + k
+(`primary_zpos + 1 + drm_plane_index`). `check()` gains a
+synthesized-primary mode: the overlay CRTC-switch rule, the overlay
+format list, DCN30's scaling/viewport/rotation caps (16x upscale,
+167 downscale, 12-pixel minimum viewport, no 90/270 turn of a linear
+surface), linear surfaces only, and an enabled CRTC's primary required
+via `primary_fb`. Only a CRTC with an enabled overlay returns a setup;
+a primary-only CRTC stays on the synthesized path. Color properties
+stay on any YUV plane including overlays (the tree's deviation from
+Linux, which attaches them to the primary only); matching Linux there
+is a separate tree-wide cleanup. ADDFB2 takes a format any plane takes
+(`drm_any_plane_has_format`): a two-plane NV12/P010 framebuffer over
+the dumb path or a GEM one once an overlay plane takes the format,
+with its chroma plane recorded and validated. The display side that
+programs the overlays is #1951, and `present_planes` still refuses
+overlays on Navi22 until then — this lands together with #1951, never
+alone. Model-tested only (`navi22`, `drm`, `drm_ioctl`); not validated
+on hardware.
+
 ### Navi 48 seamless shared-clock changes
 
 A configuration change that keeps running displays lit follows
@@ -14778,13 +14805,32 @@ struct that owns BAR5 (`drivers/gpu/src/amdgpu.rs`):
   call from the driver's main loop or a scheduled wakeup — and
   returns the connector indices that stabilised as connected,
   marked `Connected` in KMS. The caller modesets each with its
-  mode via `modeset_connector`.
+  mode via `modeset_newly_connected`.
 - `AmdGpu::feed_connector_edid(connector_idx, edid)` scans a full
   EDID blob's extension blocks for the CEA-861 block and feeds
   the parsed audio caps into the connector (a missing speaker
-  block falls back to the FL/FR baseline 0x01). Returns `false`
-  when there is no CEA block, no KMS state, or the connector
-  index is out of range.
+  block falls back to the FL/FR baseline 0x01). It also retains
+  the blob's preferred mode on the connector (first timing
+  `edid_timings` yields, EDID 1.3+'s preferred mode) for the
+  DRM/fb caller below; a blob with no usable timing leaves the
+  previous preferred mode untouched. Returns `false` when there
+  is no CEA block, no KMS state, or the connector index is out of
+  range.
+- `AmdGpu::modeset_connected(connector_idx)` is the DRM/fb caller
+  for one newly connected connector (#1787): it modesets the
+  connector with its retained EDID preferred mode (stride = mode
+  width, surface = the VRAM aperture base `set_mode` scans out
+  of) via `modeset_connector`. Returns `Ok(true)` when the modeset
+  ran, `Ok(false)` when no preferred mode is known — the
+  connector stays unmodeset, never given an invented mode — and
+  propagates the `modeset_connector` error when a modeset was
+  attempted and failed.
+- `AmdGpu::modeset_newly_connected(connected)` is the driver-loop
+  entry point (#1787): it runs `modeset_connected` for every
+  connector `poll_hotplug` just marked `Connected` and returns
+  one outcome per connector, so one failure never aborts the
+  rest. The IH HPD drainer task (`serve_ih_hpd`) calls it after
+  `service_hotplug` on every tick and logs each outcome.
 - Probe-time KMS ownership: `probe()` calls
   `AmdGpu::init_kms_from_vbios` after capturing the VBIOS, which
   builds the topology via `AmdGpu::kms_from_vbios` (ATOM
@@ -14814,15 +14860,15 @@ struct that owns BAR5 (`drivers/gpu/src/amdgpu.rs`):
   applied plan only; multi-connector resume goes through
   `resume_display_audio`.
 
-Explicitly not in this surface: the live IH ring drainer that
-produces the cookies `handle_hotplug_event` consumes, the live
-DDC/AUX transport read that produces the EDID blob
-`feed_connector_edid` consumes, and the DRM/fb caller that
-supplies connect modes to `modeset_connector` — those are the
-remaining integration points; the KMS core now owns the state
-and the apply calls. Intel display-side audio programming is
-out of scope while another agent works Intel GPU; no Intel
-modeset file is touched.
+Explicitly not in this surface: the live DDC/AUX transport read
+that produces the EDID blob `feed_connector_edid` consumes (#1786),
+and the starter that spawns the IH HPD drainer task
+(`start_ih_hpd` has no production caller yet — the #1785 wiring
+remainder, which also decides legacy-KMS vs native-display HPD
+ownership per boot). The KMS core now owns the state, the apply
+calls, and the DRM/fb caller that supplies connect modes. Intel
+display-side audio programming is out of scope while another agent
+works Intel GPU; no Intel modeset file is touched.
 
 ### VirtIO-GPU rendering
 

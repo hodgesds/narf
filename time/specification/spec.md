@@ -164,9 +164,18 @@ rating that's also monotonic. Record the decision for telemetry.
 
 ### 3.5 Wall-clock discipline (Stage 4)
 
-- **NTP client** — optional userspace daemon producing a signed
-  adjustment stream that the kernel applies to the wall-clock offset.
-  Kernel never sources NTP directly.
+- **NTP client** — the in-kernel SNTP client (`narf_net::sntp`,
+  issue #1764) performs one UDP exchange against an explicit server
+  (RFC 5905 §14), validates the reply (§8 offset/delay, bogus check,
+  kiss-o'-death), and feeds the sample to the kernel discipline loop
+  (§3.6). The kernel therefore *does* source NTP directly for the
+  bootstrap sync the desktop and TLS certificate validation need — the
+  Stage-4 "optional userspace daemon producing a signed adjustment
+  stream" remains the future direction (a daemon can take over via the
+  same `adjtimex` surface), but no such daemon exists yet and the
+  clock cannot wait for one. Server discovery (DHCP option 42),
+  authentication (NTS), and a periodic poll daemon are follow-ups;
+  the client names no default server.
 - **PTP (IEEE 1588)** — driver-level hook under `drivers/net/` for
   timestamps; discipline handled by the same userspace path.
 - Wall-clock slewing is rate-limited; leap-seconds handled via smear
@@ -187,6 +196,18 @@ pub mod ntp {
     /// Current TAI offset, seconds (`ADJ_TAI`).
     pub fn tai_offset() -> i32;
 
+    /// Apply one SNTP sample: step the wall clock over the 128 ms
+    /// threshold, else feed the phase to the PLL (`ADJ_OFFSET` path with
+    /// full FLL/PLL frequency learning). First accepted sample takes over
+    /// discipline (sets `STA_PLL`, clears `STA_UNSYNC`).
+    pub fn apply_sample(
+        offset_ns: i64, delay_ns: i64, root_dispersion_ns: i64, stratum: u8, now_sec: i64,
+    ) -> DisciplineOutcome;
+    /// Per-second discipline step (`second_overflow()`'s phase half):
+    /// bump `time_maxerror`, drain `time_offset` exponentially into the
+    /// wall offset. Called once per wall second from `clockevent::on_tick`.
+    pub fn tick_second();
+
     // ADJ_*, STA_*, TIME_* constants (include/uapi/linux/timex.h).
 }
 ```
@@ -198,10 +219,16 @@ daemon clears the bit. `userspace/`'s `adjtimex` / `clock_adjtime` handlers
 own the user-struct copy, the `CAP_SYS_TIME` gate and the `ADJ_SETOFFSET`
 step into the wall offset; everything else is state kept here.
 
-The *variables* are modelled; the discipline loop is not. See the
-`narf_time::ntp` module docs for the LINUX-GAPs that follow from that —
-`ADJ_OFFSET`/`ADJ_FREQUENCY` are recorded but never worked off, there is no
-leap-second state machine on this path (that is §3.5's smear), and no PPS.
+The discipline loop exists now (issue #1764): `ADJ_OFFSET` runs the full
+Linux `ntp_update_offset()` (PLL + FLL frequency learning against
+`time_reftime`), and `tick_second()` — driven once per wall second from
+the clockevent tick — drains `time_offset` exponentially into the wall
+offset, which is where phase lands on NARF (there is no timekeeper
+multiplier to steer). The slew is therefore applied at 1 Hz granularity:
+each second's jump is at most `MAXPHASE >> (SHIFT_PLL + time_constant)`.
+What is still missing, see the `narf_time::ntp` module docs: the leap
+state machine on this path (that is §3.5's smear), the `ADJ_ADJTIME`
+single-shot drain, and PPS.
 
 ## 4. Invariants & safety properties
 

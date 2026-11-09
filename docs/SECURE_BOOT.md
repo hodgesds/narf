@@ -9,10 +9,12 @@ machine's UEFI `db` or by the active shim/MOK policy.
 Secure Boot covers the complete NARF boot chain rather than only the first EFI
 executable:
 
-- On x86_64, packaging writes a BLAKE2b-512 suffix on the exact NARF kernel
-  path and enrolls the exact `limine.conf` digest into the Limine EFI image.
-  Limine enforces both values whenever UEFI Secure Boot is active, following
-  its documented [Secure Boot policy](https://github.com/limine-bootloader/limine/blob/v12.x/USAGE.md#secure-boot).
+- On x86_64, the default native image embeds kernel, initramfs, and command
+  line in its `.narf` PE section. Firmware verifies the complete image before
+  entry; the loader verifies the three embedded SHA-256 hashes before parsing
+  the kernel. EFI load options cannot override the embedded policy.
+- Explicit legacy `--limine-efi` packages retain the enrolled configuration
+  digest and BLAKE2b-bound kernel path enforced by Limine's Secure Boot policy.
 - On aarch64, packaging binds the exact kernel's BLAKE2b-512 digest into the
   NARF EFI loader before signing. The loader rejects a missing binding or a
   different kernel before parsing its ELF headers or copying any segment.
@@ -101,12 +103,18 @@ packaging/test-secure-boot.sh
 packaging/test-aarch64-package-boot.sh
 ```
 
-The x86_64 gate creates an ephemeral certificate, signs the bound Limine image,
-enrolls that certificate in a disposable OVMF variable store, boots the package
-with Secure Boot enforced, then changes one kernel byte and requires the second
-boot to fail. The aarch64 gate boots the native package under AAVMF and performs
-the same tampered-kernel negative check. No test key is retained or suitable
-for production.
+The x86_64 gate creates an ephemeral certificate, signs and installs the native
+package, enrolls that certificate in a disposable OVMF variable store, and
+requires a clean boot with the EFI entry reporting `SecureBoot=1` and `SetupMode=0`. It then
+requires explicit firmware authentication rejection of unsigned images and
+independent modifications to the embedded kernel, initramfs, and command line.
+A timeout alone is not a passing rejection. Logs and a JSON report are retained
+under `target/secure-boot-native/`; no private key is retained. The explicit
+legacy gate is `packaging/test-secure-boot.sh --limine`. The aarch64 gate boots
+the native package under AAVMF and checks a tampered separate kernel.
+
+Physical-machine qualification uses [native hardware acceptance](NATIVE_UEFI_HARDWARE.md)
+and remains separate from OVMF results. Test keys are never production keys.
 
 Secure Boot authentication is distinct from TPM measured boot, rollback
 protection, certificate revocation, and key rotation. Those policies remain

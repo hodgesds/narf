@@ -1132,6 +1132,25 @@ impl DmaMem {
             self.wr32(i, 0);
         }
     }
+
+    /// CPU pointer to the (aligned) start of this buffer.
+    ///
+    /// Fixture-only (`pub(crate)`): a CE/HTC/WMI target fake must keep
+    /// working on a ring / bounce buffer after the owning `Ce` has
+    /// moved into the core, and a raw pointer is the only handle that
+    /// survives the move (the `DmaMem` itself moves; the buffer does
+    /// not). Same shared-reference discipline as [`Self::wr32`] and
+    /// `DmaBuffer::cpu_mut_ptr`: the device may write into the buffer
+    /// while the CPU holds only a shared reference, so callers must
+    /// observe the ring protocol (one side writes each word).
+    pub(crate) fn cpu_ptr(&self) -> *const u8 {
+        self.buf.cpu_ptr_at(self.off as u64)
+    }
+
+    /// Mutable counterpart to [`Self::cpu_ptr`], same discipline.
+    pub(crate) fn cpu_mut_ptr(&self) -> *mut u8 {
+        self.buf.cpu_mut_ptr_at(self.off as u64)
+    }
 }
 
 /// `dma_rmb()`.

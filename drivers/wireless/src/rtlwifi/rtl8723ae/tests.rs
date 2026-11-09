@@ -788,17 +788,15 @@ fn ae_factory() -> crate::rtlwifi::efuse::Factory {
     }
 }
 
+/// A NAPC row: (channel, bandwidth, offset, curve-value fn).
+type NapcRow = (u8, u8, u8, fn(u8) -> i16);
+
 /// Build a NAPC envelope from the documented layout (header 96, rows of
 /// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
 /// `rows` are (channel, bandwidth, offset, curve-value fn) for v2, or
 /// (channel, 20, 0, fn) for v1. The identity is the board's factory
 /// identity; the MAC matches the factory.
-fn napc_fixture(
-    version: u16,
-    antenna: i16,
-    qualified: i16,
-    rows: &[(u8, u8, u8, fn(u8) -> i16)],
-) -> Vec<u8> {
+fn napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRow]) -> Vec<u8> {
     let factory = ae_factory();
     let identity = crate::rtlwifi::radio::factory_identity(&factory);
     let total = 96 + rows.len() * 388;
@@ -1258,7 +1256,7 @@ fn dm_h2c_fills(writes: &[(u16, u32, u8)]) -> Vec<(u8, Vec<u8>)> {
 }
 
 /// Find a fill by command id in a reconstructed fill list.
-fn dm_find<'a>(fills: &'a [(u8, Vec<u8>)], id: u8) -> Option<&'a [u8]> {
+fn dm_find(fills: &[(u8, Vec<u8>)], id: u8) -> Option<&[u8]> {
     fills
         .iter()
         .find(|(i, _)| *i == id)
@@ -1863,7 +1861,6 @@ kernel_test_in!(
 /// PTA on); combined is FW then SW then HW.
 fn smoke_rtl8723ae_dm_all_off_sequences() -> TestResult {
     use coex::*;
-    use dm::*;
     // A-cut: tra_tdma must NOT appear in the FW sequence.
     let io = fw_fake(false, false, false, false);
     let mut owner = Owner::bind(&coex_bt());

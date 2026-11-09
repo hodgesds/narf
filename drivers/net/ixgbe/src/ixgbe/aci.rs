@@ -338,13 +338,13 @@ pub fn aci_execute<B: RegBank>(
     // response (EV set, C clear) overwrites it from
     // PF_HIDA_2 — exactly Linux's order.
     if hicr & PF_HICR_SV != 0 {
-        for i in 0..ACI_DESC_DWORDS {
-            desc[i] = bank.read32(REG_PF_HIDA_BASE + (i as u64) * 4);
+        for (i, slot) in desc.iter_mut().enumerate() {
+            *slot = bank.read32(REG_PF_HIDA_BASE + (i as u64) * 4);
         }
     }
     if hicr & PF_HICR_EV != 0 && hicr & PF_HICR_C == 0 {
-        for i in 0..ACI_DESC_DWORDS {
-            desc[i] = bank.read32(REG_PF_HIDA_2_BASE + (i as u64) * 4);
+        for (i, slot) in desc.iter_mut().enumerate() {
+            *slot = bank.read32(REG_PF_HIDA_2_BASE + (i as u64) * 4);
         }
     }
     if hicr & PF_HICR_C != 0 {
@@ -617,15 +617,15 @@ pub fn parse_link_status(buf: &[u8]) -> Result<LinkStatus, AciError> {
 /// Read the device capabilities and report whether the
 /// firmware supports EEE (Linux `ixgbe_discover_dev_caps`
 /// + `ixgbe_parse_dev_caps`: the list_dev_caps command
-/// returns capability elements — 32 bytes each (`libie`
-/// `libie_aqc_list_caps_elem`: cap LE16 @0, major_ver u8
-/// @2, minor_ver u8 @3, number LE32 @4, logical_id LE32
-/// @8, phys_id LE32 @12, rsvd 16 bytes) — and the EEE
-/// element (`ACI_CAPS_EEE`) carries eee_support in its
-/// number field). `buf` must hold `ACI_MAX_BUFFER_SIZE`
-/// bytes; the returned count comes from the response
-/// descriptor's params, so a short buffer reports
-/// `BadLength` rather than scanning garbage.
+///   returns capability elements — 32 bytes each (`libie`
+///   `libie_aqc_list_caps_elem`: cap LE16 @0, major_ver u8
+///   @2, minor_ver u8 @3, number LE32 @4, logical_id LE32
+///   @8, phys_id LE32 @12, rsvd 16 bytes) — and the EEE
+///   element (`ACI_CAPS_EEE`) carries eee_support in its
+///   number field). `buf` must hold `ACI_MAX_BUFFER_SIZE`
+///   bytes; the returned count comes from the response
+///   descriptor's params, so a short buffer reports
+///   `BadLength` rather than scanning garbage.
 pub fn find_dev_cap_eee<B: RegBank>(
     bank: &mut B,
     buf: &mut [u8],

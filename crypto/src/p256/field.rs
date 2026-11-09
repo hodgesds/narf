@@ -29,6 +29,7 @@
 //! bits, no table lookups indexed by secrets.
 
 use core::cmp::Ordering;
+use core::fmt;
 
 /// P-256 prime in little-endian limbs:
 /// p = 0xFFFFFFFF00000001 0000000000000000 00000000FFFFFFFF FFFFFFFFFFFFFFFF
@@ -42,8 +43,17 @@ pub const P: [u64; 4] = [
 
 /// A field element in GF(p), stored as 4 little-endian u64 limbs and
 /// always fully reduced after any exported operation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Fp(pub [u64; 4]);
+
+/// SEC-C2 (#1551): field elements can hold secret intermediates
+/// (ECDH shared secrets, SAE values) — `Debug` is hand-written
+/// and redacted; the derived `Debug` printed all four limbs.
+impl fmt::Debug for Fp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Fp").field(&"<redacted: 32 bytes>").finish()
+    }
+}
 
 impl Fp {
     /// The additive identity.

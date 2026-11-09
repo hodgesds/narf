@@ -1792,6 +1792,13 @@ impl FwFakeBank {
     }
 
     /// Exclusive access to the state.
+    // `mut_from_ref` is allowed here deliberately: the fake is
+    // test-local and single-threaded (see the struct docs), the
+    // state lives behind `UnsafeCell` for exactly this interior
+    // mutability, and `&mut self` is impossible — the firmware
+    // simulation runs inside `RegBank::read32`, which takes
+    // `&self` (queues.rs).
+    #[allow(clippy::mut_from_ref)]
     fn state_mut(&self) -> &mut FwFakeState {
         // SAFETY: test-local, never shared across tasks.
         unsafe { &mut *self.state.get() }
@@ -1862,8 +1869,8 @@ impl FwFakeBank {
         let activity = (word1 >> 16) as u16;
         st.hic_activities_seen.push(activity);
         let mut data = [0u32; 4];
-        for i in 0..4 {
-            data[i] = st.regs[base + 2 + i].swap_bytes();
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = st.regs[base + 2 + i].swap_bytes();
         }
         st.last_hic_data = data;
         let status = if self.mode == FwMode::HicBadRetStatus {
@@ -1909,9 +1916,7 @@ impl FwFakeBank {
         let hida = (aci::REG_PF_HIDA_BASE / 4) as usize;
         let hiba = (aci::REG_PF_HIBA_BASE / 4) as usize;
         let mut req = [0u32; aci::ACI_DESC_DWORDS];
-        for i in 0..aci::ACI_DESC_DWORDS {
-            req[i] = st.regs[hida + i];
-        }
+        req[..aci::ACI_DESC_DWORDS].copy_from_slice(&st.regs[hida..(aci::ACI_DESC_DWORDS + hida)]);
         let opcode = aci::desc_opcode(&req);
         st.aci_opcodes_seen.push(opcode);
         // Capture an RD (host-to-firmware) buffer before
@@ -1958,9 +1963,7 @@ impl FwFakeBank {
             b[..chunk.len()].copy_from_slice(chunk);
             st.regs[hiba + i] = u32::from_le_bytes(b);
         }
-        for i in 0..aci::ACI_DESC_DWORDS {
-            st.regs[hida + i] = resp[i];
-        }
+        st.regs[hida..(aci::ACI_DESC_DWORDS + hida)].copy_from_slice(&resp[..aci::ACI_DESC_DWORDS]);
         let mut hicr = st.regs[(aci::REG_PF_HICR / 4) as usize];
         hicr &= !aci::PF_HICR_C;
         if self.mode != FwMode::AciNoSvEv {
@@ -2082,7 +2085,14 @@ fn smoke_ixgbe_eee_hic_header() -> TestResult {
     if hic_checksum(&[5, 20, 0]) != 0xE7 {
         return TestResult::Fail("HIC checksum wrong");
     }
-    if (5u16 + 20 + 0 + 0xE7) & 0xFF != 0 {
+    // Sum the header bytes plus the computed checksum: the total
+    // must be 0 mod 256. (The literal form `5 + 20 + 0 + 0xE7`
+    // folds to the constant 0, so the check was vacuous — using
+    // the computed checksum makes it a real property check.)
+    let total: u16 = [5, 20, 0, hic_checksum(&[5, 20, 0])]
+        .into_iter()
+        .fold(0u16, |acc, b| acc + u16::from(b));
+    if total & 0xFF != 0 {
         return TestResult::Fail("HIC checksum does not zero the total");
     }
     TestResult::Pass

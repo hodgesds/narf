@@ -12,6 +12,7 @@ const OWN: [u8; 6] = [2, 4, 6, 8, 10, 12];
 const AP: [u8; 6] = [2, 3, 5, 7, 11, 13];
 
 struct Source {
+    chip: ChipId,
     secure: bool,
     cut: u8,
     xtal: u8,
@@ -48,7 +49,7 @@ impl Io for Source {
 }
 impl crate::rtw89::factory::Source for Source {
     fn profile(&self) -> (ChipId, u8) {
-        (ChipId::Rtl8852B, self.cut)
+        (self.chip, self.cut)
     }
     async fn physical(&mut self, start: u16, bytes: &mut [u8]) -> Result<(), Error> {
         bytes.fill(255);
@@ -71,6 +72,11 @@ impl crate::rtw89::factory::Source for Source {
                 bytes[cursor + 1] = ((block & 15) << 4) as u8 | (15 ^ (1 << ((offset % 8) / 2)));
                 bytes[cursor + 2..cursor + 4].copy_from_slice(&pair);
             }
+        } else if (start, bytes.len()) == (0x5e9, 5) {
+            // RTL8852A takes the direct 0x5e9 extra-bytes read (no PHY-cap
+            // window): power-k marker, ECV, secure bytes, same values the
+            // B/C PHY-cap windows carry at 0x5e9..0x5ee.
+            bytes.copy_from_slice(&[0xaa, 0x1f, 0xff, 0xff, 0xff]);
         } else {
             assert_eq!((start, bytes.len()), (0x580, 128));
             bytes[0x69] = 0xaa;
@@ -88,6 +94,19 @@ pub(in crate::rtw89) fn factory(secure: bool) -> Factory {
 pub(in crate::rtw89) fn factory_with_profile(cut: u8, xtal: u8, rfe: u8, secure: bool) -> Factory {
     factory_with_mac(cut, xtal, rfe, secure, OWN)
 }
+pub(in crate::rtw89) fn factory_with_chip(chip: ChipId, secure: bool) -> Factory {
+    let mut factory = Factory::default();
+    narf_scheduler::block_on(factory.read(&mut Source {
+        chip,
+        secure,
+        cut: 1,
+        xtal: 0x33,
+        rfe: 5,
+        own: OWN,
+    }))
+    .unwrap();
+    factory
+}
 pub(in crate::rtw89) fn factory_with_mac(
     cut: u8,
     xtal: u8,
@@ -97,6 +116,7 @@ pub(in crate::rtw89) fn factory_with_mac(
 ) -> Factory {
     let mut factory = Factory::default();
     narf_scheduler::block_on(factory.read(&mut Source {
+        chip: ChipId::Rtl8852B,
         secure,
         cut,
         xtal,
@@ -1568,4 +1588,68 @@ fn smoke_rtw8851b_station_offers_one_stream_he_vht() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8851b_station_offers_one_stream_he_vht
+);
+
+fn smoke_rtw8852a_station_owner_matches_b_codec_and_gates_noise() -> TestResult {
+    let a_factory = factory_with_chip(ChipId::Rtl8852A, false);
+    let b_factory = factory(false);
+    let a = Controller::new(&a_factory).unwrap();
+    let b = Controller::new(&b_factory).unwrap();
+    if !a.supports_noise()
+        || b.supports_noise()
+        || a.own() != OWN
+        || a.bacam_num() != 2
+        || b.bacam_num() != 2
+        || a.default_cctl() != b.default_cctl()
+        || a.fixed_cctl(false) != b.fixed_cctl(false)
+        || a.fixed_cctl(true) != b.fixed_cctl(true)
+    {
+        return TestResult::Fail("A station owner is not B's shared codec or noise gate");
+    }
+    if Controller::new(&Factory::default()).is_ok() {
+        return TestResult::Fail("station owner admitted without a factory identity");
+    }
+    // The whole MAC-layer sequence must be byte-identical to B's: A shares
+    // B's CCTLINFO_UD tables, BA CAM geometry and role/join/CAM commands.
+    let mut a_packets = Vec::new();
+    let mut b_packets = Vec::new();
+    let mut a_writes = Vec::new();
+    let mut b_writes = Vec::new();
+    for (factory, packets, writes) in [
+        (&a_factory, &mut a_packets, &mut a_writes),
+        (&b_factory, &mut b_packets, &mut b_writes),
+    ] {
+        let mut control = Controller::new(factory).unwrap();
+        let admission = Admission::new();
+        let mut model = Model::new();
+        narf_scheduler::block_on(control.initialize(&mut model, &admission)).unwrap();
+        if control.phase() != Phase::Passive {
+            return TestResult::Fail("station owner did not reach Passive");
+        }
+        let peer =
+            narf_scheduler::block_on(control.prepare_peer(&mut model, AP, &admission)).unwrap();
+        narf_scheduler::block_on(control.commit_peer(&mut model, AP, 42, true, &admission))
+            .unwrap();
+        if control.phase() != Phase::Associated {
+            return TestResult::Fail("station owner did not reach Associated");
+        }
+        narf_scheduler::block_on(control.disconnect(&mut model, &admission)).unwrap();
+        if control.phase() != Phase::Stopped
+            || peer.current().is_ok()
+            || !admission.closed()
+            || model.consumed != model.packets.len()
+        {
+            return TestResult::Fail("station owner terminal cleanup reopened the peer");
+        }
+        *packets = model.packets;
+        *writes = model.writes;
+    }
+    if a_packets != b_packets || a_writes != b_writes {
+        return TestResult::Fail("A station H2C/register stream differs from B's");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_station_owner_matches_b_codec_and_gates_noise
 );

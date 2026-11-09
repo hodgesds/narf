@@ -127,6 +127,15 @@ static PRIMARY_IDX: AtomicUsize = AtomicUsize::new(0);
 /// any frame.vector == TICK_VECTOR calls into [`on_tick`].
 pub static TICK_VECTOR: AtomicU8 = AtomicU8::new(0);
 
+/// Nanoseconds per second, for the NTP second-boundary check in [`on_tick`].
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+
+/// Last wall second (monotonic seconds) the NTP discipline tick ran for.
+/// `0` at boot, so the first tick runs it once. Claimed with `swap` in
+/// [`on_tick`] so exactly one CPU runs [`crate::ntp::tick_second`] per
+/// second even when several CPUs tick concurrently.
+static LAST_NTP_SECOND: AtomicU64 = AtomicU64::new(0);
+
 /// Register a backend. Idempotent on the same pointer (no-op if
 /// already present). Panics if MAX_BACKENDS is exceeded — that's
 /// a build-config bug, not a runtime error.
@@ -232,6 +241,16 @@ pub fn primary() -> Option<&'static dyn ClockEvent> {
 /// CPUs whose per-CPU LAPIC timer is broken (or stopped in deep
 /// C-states) still get scheduler / wheel ticks.
 ///
+/// Once per wall second it also runs the NTP discipline tick
+/// ([`crate::ntp::tick_second`]): the per-second half of Linux's
+/// `second_overflow()`, which drains the adjtimex phase into the wall
+/// clock. The second boundary is detected off the monotonic clock, not a
+/// tick count, so the hook stays correct whatever rate the backend was
+/// armed at (boot arms 1000 Hz, but that is boot config, not a contract
+/// this module may assume). The `swap` claims each new second exactly
+/// once even when several CPUs tick concurrently; the cost on the hot
+/// path is one monotonic read plus one atomic per tick.
+///
 /// Called with IF=0 (trap context) and the backend's per-vector
 /// dispatch lock NOT held; safe to call from any IRQ handler.
 #[inline]
@@ -246,6 +265,14 @@ pub fn on_tick() {
     // in practice: the wheel waker is never the last Arc ref (the task's slot
     // owns one) outside the rare exited-task case.
     let _ = crate::timer_wheel::fire_due(now);
+    // NTP discipline: once per wall second. `monotonic_ns()` is atomics +
+    // a cycle read, safe in IRQ context; `tick_second()` is one spinlock
+    // plus atomics. Before any sample was applied the boot state has
+    // `time_offset == 0`, so this is a maxerror bump and nothing else.
+    let secs = crate::monotonic_ns() / NSEC_PER_SEC;
+    if LAST_NTP_SECOND.swap(secs, Ordering::AcqRel) != secs {
+        crate::ntp::tick_second();
+    }
     // Broadcast to CPUs in BROADCAST_MASK if a sender's installed.
     // No-op until SMP wires `set_broadcast_sender` + per-CPU
     // registration. Single-CPU NARF: mask is always 0, no-op.

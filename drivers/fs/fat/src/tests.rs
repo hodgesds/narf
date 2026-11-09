@@ -299,12 +299,10 @@ kernel_test_in!(
 
 // ── End-to-end mount + I/O against RamBlockDevice ──────────────────
 
-/// Synchronous-only future poll. RamBlockDevice's `submit` returns
-/// `Ready` after the in-memory copy, so every FAT operation we
-/// drive here completes on the first poll.
-fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
-    use core::pin::Pin;
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+/// A waker that does nothing: the harness re-polls futures
+/// directly, so no wake is ever needed to make progress.
+fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
     fn raw_waker() -> RawWaker {
         unsafe fn no_clone(_: *const ()) -> RawWaker {
             raw_waker()
@@ -318,7 +316,16 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     // null data pointer, so the contract for `Waker::from_raw` (the
     // vtable functions are sound for the given data pointer) holds.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    unsafe { Waker::from_raw(raw_waker()) }
+}
+
+/// Synchronous-only future poll. RamBlockDevice's `submit` returns
+/// `Ready` after the in-memory copy, so every FAT operation we
+/// drive here completes on the first poll.
+fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` is a local owned by this function and is not moved for
     // the remainder of its scope (it is only polled through `pinned`),
@@ -329,6 +336,67 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         Poll::Ready(v) => Some(v),
         Poll::Pending => None,
     }
+}
+
+/// Poll a future to completion, re-polling while it pends. For ops
+/// on [`DeferredDmaDevice`], whose submits pend exactly once, every
+/// op needs only a handful of polls; a future still pending after
+/// the bound is a harness failure, not a slow device.
+fn drive<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: same pinning argument as `poll_once`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    for _ in 0..256 {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Drive two futures to completion by alternating polls: poll the
+/// first, then the second, repeat until both are ready. Each future
+/// is polled while the other is suspended at its `.await` — the
+/// interleaving two sequential `poll_once` calls can never produce,
+/// and the one a shared scratch buffer's race needs to be observed.
+/// Returns `None` for a future still pending after the bound.
+fn poll_two<F1, F2>(mut fut1: F1, mut fut2: F2) -> (Option<F1::Output>, Option<F2::Output>)
+where
+    F1: core::future::Future,
+    F2: core::future::Future,
+{
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: same pinning argument as `poll_once`: both futures
+    // are locals owned by this fn and never moved after this point.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let mut fut1 = unsafe { Pin::new_unchecked(&mut fut1) };
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let mut fut2 = unsafe { Pin::new_unchecked(&mut fut2) };
+    let mut out1 = None;
+    let mut out2 = None;
+    for _ in 0..64 {
+        if out1.is_none() {
+            if let Poll::Ready(v) = fut1.as_mut().poll(&mut cx) {
+                out1 = Some(v);
+            }
+        }
+        if out2.is_none() {
+            if let Poll::Ready(v) = fut2.as_mut().poll(&mut cx) {
+                out2 = Some(v);
+            }
+        }
+        if out1.is_some() && out2.is_some() {
+            break;
+        }
+    }
+    (out1, out2)
 }
 
 /// Pack a 12-bit FAT entry into a byte buffer at index `idx`.
@@ -1432,3 +1500,423 @@ kernel_test_in!(
     "drivers/fs/fat",
     smoke_fat_mmap_identity_slot_reuse_after_rename
 );
+
+// ── Shared-scratch-buffer race (#1988) ─────────────────────────────
+
+// Test-only block device that models real DMA timing: the transfer
+// into/out of the request buffer happens when the device first
+// executes the request (first poll of the submit future), and
+// completion is signalled only on a later poll.
+//
+// `RamBlockDevice` instead transfers synchronously inside
+// `submit()` and completes on the first poll, so two sector ops
+// can never interleave at the `.await` point and a shared
+// scratch-buffer race is invisible against it. This device makes
+// the interleave observable: poll op A (transfer A lands in the
+// scratch buffer, A pends), poll op B (transfer B lands in the
+// same scratch buffer, B pends), poll A again (A copies out).
+
+// ── Partial-sector read-modify-write race (#1996) ──────────────────
+//
+// Harness shape shared with #1990 / #1988 (`DeferredDmaDevice`,
+// `drive`, `poll_two`): a fake block device whose submits transfer
+// on the first poll and pend exactly once, so `poll_two` can
+// interleave two operations at their submit await points. Deduped against #1990's copy on rebase.
+
+/// A fake block device whose submits transfer on the first poll,
+/// then pend exactly once, so a concurrent op can interleave, and
+/// complete on the second poll. The transfer lands in the shared
+/// DMA scratch buffer at submit time — the interleave observable:
+/// poll op A (transfer A lands in the scratch buffer, A pends),
+/// poll op B (transfer B lands in the same scratch buffer, B
+/// pends), poll A again (A copies out).
+///
+/// Deviation from the `BlockDevice::submit` contract, documented
+/// here rather than hidden: a pending submit never wakes its waker
+/// — the harness re-polls it directly (`drive` / `poll_two`).
+/// Test-only; never used outside this module.
+struct DeferredDmaDevice {
+    storage: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>>,
+    logical_block_size: u32,
+    capacity_blocks: u64,
+}
+
+impl DeferredDmaDevice {
+    fn from_image(lbs: u32, image: alloc::vec::Vec<u8>) -> alloc::sync::Arc<Self> {
+        assert!(
+            image.len() % lbs as usize == 0,
+            "DeferredDmaDevice image length must be a multiple of lbs"
+        );
+        let capacity_blocks = (image.len() / lbs as usize) as u64;
+        alloc::sync::Arc::new(Self {
+            storage: narf_lib::sync::IrqSafeSpinLock::new(image),
+            logical_block_size: lbs,
+            capacity_blocks,
+        })
+    }
+
+    fn snapshot(&self) -> alloc::vec::Vec<u8> {
+        self.storage.lock().clone()
+    }
+
+    /// Perform the DMA transfer for `req`: reads copy storage into
+    /// the request buffer, writes copy the request buffer into
+    /// storage. Mirrors `RamBlockDevice::do_io`'s bounds and
+    /// cap-resolution behaviour.
+    fn transfer(&self, req: &narf_block::BlockRequest) -> Result<(), narf_block::BlockError> {
+        use narf_block::{BlockError, BlockOp};
+        let buffer = narf_io::resolve_cap(&req.buffer).ok_or(BlockError::PermissionDenied)?;
+        let lbs = self.logical_block_size as u64;
+        let end = req
+            .lba
+            .checked_add(u64::from(req.blocks))
+            .ok_or(BlockError::InvalidRange)?;
+        if end > self.capacity_blocks {
+            return Err(BlockError::InvalidRange);
+        }
+        let start = (req.lba * lbs) as usize;
+        let span = (u64::from(req.blocks) * lbs) as usize;
+        if buffer.len() < span {
+            return Err(BlockError::InvalidRange);
+        }
+        let mut storage = self.storage.lock();
+        match req.op {
+            BlockOp::Read => {
+                let src = &storage[start..start + span];
+                // SAFETY: `buffer.as_mut_ptr()` returns a raw ptr into
+                // the identity-mapped DMA buffer; the cap → registry
+                // resolve guarantees the buffer is alive for the
+                // duration of the `Arc` we hold. The buffer is at
+                // least `span` bytes (checked above) and `src` is
+                // exactly `span` bytes of in-range storage.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
+                let dst = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), span) };
+                dst.copy_from_slice(src);
+                Ok(())
+            }
+            BlockOp::Write { .. } => {
+                // SAFETY: same identity-map argument as the read arm.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
+                let src = unsafe { core::slice::from_raw_parts(buffer.as_ptr(), span) };
+                storage[start..start + span].copy_from_slice(src);
+                Ok(())
+            }
+            BlockOp::WriteZeroes => {
+                for b in &mut storage[start..start + span] {
+                    *b = 0;
+                }
+                Ok(())
+            }
+            BlockOp::Trim => Ok(()),
+        }
+    }
+}
+
+impl narf_block::BlockDevice for DeferredDmaDevice {
+    fn logical_block_size(&self) -> u32 {
+        self.logical_block_size
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.logical_block_size
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.capacity_blocks
+    }
+    fn supports(&self, feature: narf_block::BlockFeature) -> bool {
+        matches!(
+            feature,
+            narf_block::BlockFeature::Flush | narf_block::BlockFeature::WriteZeroes
+        )
+    }
+    fn submit(
+        &self,
+        req: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        DeferredSubmit {
+            device: self,
+            req,
+            transferred: false,
+        }
+    }
+    async fn flush(&self) {}
+    async fn discard(&self, _range: narf_block::LbaRange) {}
+    async fn cancel(&self, _tag: u64) -> narf_block::CancelResult {
+        narf_block::CancelResult::NotFound
+    }
+}
+
+/// The submit future for [`DeferredDmaDevice`]: transfers on the
+/// first poll, then pends once so a concurrent op can interleave,
+/// and completes on the second poll.
+struct DeferredSubmit<'a> {
+    device: &'a DeferredDmaDevice,
+    req: narf_block::BlockRequest,
+    transferred: bool,
+}
+
+impl core::future::Future for DeferredSubmit<'_> {
+    type Output = narf_block::BlockCompletion;
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        use core::task::Poll;
+        let this = self.as_mut().get_mut();
+        if !this.transferred {
+            this.transferred = true;
+            return match this.device.transfer(&this.req) {
+                Ok(()) => Poll::Pending,
+                Err(e) => Poll::Ready(narf_block::BlockCompletion {
+                    tag: 0,
+                    user_tag: this.req.user_tag,
+                    result: Err(e),
+                }),
+            };
+        }
+        Poll::Ready(narf_block::BlockCompletion {
+            tag: 0,
+            user_tag: this.req.user_tag,
+            result: Ok(()),
+        })
+    }
+}
+
+/// Two otherwise-unused 512-byte device sectors in the 128-sector
+/// fixture image (sectors 60/62 — mount reads only sector 0, the
+/// root directory sits at sector 3 and the file data at sector 4),
+/// filled with distinct patterns by `mount_deferred_volume` so a
+/// sector op returning the other sector's bytes is observable.
+const RACE_LBA_A: u64 = 60;
+const RACE_LBA_B: u64 = 62;
+
+/// Mount a FAT12 image on a [`DeferredDmaDevice`] with the two race
+/// sectors filled with distinct patterns (`0xA5` at `RACE_LBA_A`,
+/// `0x5A` at `RACE_LBA_B`). Returns the device (for post-write
+/// snapshots) and the mounted volume.
+fn mount_deferred_volume() -> Option<(
+    alloc::sync::Arc<DeferredDmaDevice>,
+    alloc::sync::Arc<super::volume::FatVolume<DeferredDmaDevice>>,
+)> {
+    use narf_lib::id::DomainId;
+
+    use super::volume::FatVolume;
+
+    let mut img = build_fat12_image(128, b"narf\n");
+    img[(RACE_LBA_A as usize) * 512..(RACE_LBA_A as usize + 1) * 512].fill(0xA5);
+    img[(RACE_LBA_B as usize) * 512..(RACE_LBA_B as usize + 1) * 512].fill(0x5A);
+    let device = DeferredDmaDevice::from_image(512, img);
+    let volume = drive(FatVolume::mount(device.clone(), DomainId::DRIVER_0))?.ok()?;
+    Some((device, volume))
+}
+
+/// Two `read_sector` calls for different LBAs, interleaved at the
+/// submit await point, must each return their own sector's bytes.
+/// Before #1988 the second submit overwrote the shared DMA scratch
+/// buffer before the first op copied out, so the first op returned
+/// the second sector's bytes.
+fn smoke_fat_concurrent_read_sector_returns_own_bytes() -> TestResult {
+    let (_device, volume) = match mount_deferred_volume() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on deferred device failed"),
+    };
+    let mut dst_a = alloc::vec![0u8; 512];
+    let mut dst_b = alloc::vec![0u8; 512];
+    let fut_a = volume.read_sector(RACE_LBA_A, &mut dst_a);
+    let fut_b = volume.read_sector(RACE_LBA_B, &mut dst_b);
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    match (ra, rb) {
+        (Some(Ok(())), Some(Ok(()))) => {}
+        _ => return TestResult::Fail("concurrent read_sector did not complete"),
+    }
+    if dst_a.iter().any(|b| *b != 0xA5) {
+        return TestResult::Fail("read_sector A returned another sector's bytes");
+    }
+    if dst_b.iter().any(|b| *b != 0x5A) {
+        return TestResult::Fail("read_sector B returned another sector's bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_concurrent_read_sector_returns_own_bytes
+);
+
+type DeferredFileFixture = (
+    alloc::sync::Arc<DeferredDmaDevice>,
+    alloc::sync::Arc<super::volume::FatVolume<DeferredDmaDevice>>,
+    alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+);
+
+/// Mount the `build_fat12_image(128, b"narf\n")` fixture on a
+/// [`DeferredDmaDevice`] and look up its one file, `NARF.TXT`
+/// (cluster 2, data sector 4). Returns the device (for post-write
+/// snapshots), the mounted volume, and the file node.
+fn mount_deferred_volume_with_file() -> Option<DeferredFileFixture> {
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::FatVolume;
+
+    let img = build_fat12_image(128, b"narf\n");
+    let device = DeferredDmaDevice::from_image(512, img);
+    let volume = drive(FatVolume::mount(device.clone(), DomainId::DRIVER_0))?.ok()?;
+    let root = volume.root();
+    let file = drive(root.lookup_async("NARF.TXT"))?.ok()?;
+    Some((device, volume, file))
+}
+
+/// Two concurrent partial-sector writes to different offsets of
+/// one sector must both survive: each patch lands in its own slice
+/// of the shared sector, and the bytes neither write keep their
+/// on-disk contents.
+///
+/// Harness limitation, stated plainly: this test cannot fail
+/// pre-fix under single-threaded cooperative polling. The
+/// read → patch → write span holds no pended await between the
+/// read completing and the write submitting, so under `poll_two`
+/// the span runs inside one poll of its task and no other task
+/// can run inside it — and on the bare-main tree the shared DMA
+/// scratch buffer additionally hands the second reader the first
+/// writer's staged bytes, so the second patch is laid on top of
+/// the first rather than on the pre-write sector. (On the
+/// #1990-stacked tree the same poll-atomicity follows from the
+/// barging `io` mutex: the releasing task re-acquires `io` in the
+/// same poll.) Post-#1990 the race is therefore an SMP race: two
+/// CPUs genuinely overlapping the sequences, both reading the
+/// pre-write sector into their own buffers before either writes
+/// back. The deterministic FAIL-pre-fix / PASS-post-fix evidence
+/// for the race itself is the host simulation (see the PR body),
+/// which models that two-CPU overlap with barriers. What this
+/// fixture does pin down in CI: the fix's end-state invariant
+/// through the real `write` path, and liveness of the chosen
+/// design — the tempting alternative (hold `io` across the
+/// sequence) nests the same mutex and parks forever, so
+/// `poll_two` would return `None` here and the test would fail
+/// instead of hanging the suite.
+fn smoke_fat_concurrent_partial_sector_writes_both_patches_survive() -> TestResult {
+    let (device, _volume, file) = match mount_deferred_volume_with_file() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount + lookup on deferred device failed"),
+    };
+    // Both writes land in the file's single data sector (sector 4):
+    // A patches [16..144), B patches [272..400). The ranges
+    // [0..16), [144..272), [400..512) are never written and must
+    // keep the fixture bytes ("narf\n" + zeros).
+    let data_a = alloc::vec![0xA1u8; 128];
+    let data_b = alloc::vec![0xB2u8; 128];
+    let fut_a = file.write(16, &data_a);
+    let fut_b = file.write(272, &data_b);
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    match (ra, rb) {
+        (Some(Ok(128)), Some(Ok(128))) => {}
+        _ => return TestResult::Fail("concurrent partial-sector writes did not complete"),
+    }
+    if file.stat().size != 400 {
+        return TestResult::Fail("stat.size after concurrent partial writes wrong");
+    }
+    let mut back = alloc::vec![0u8; 400];
+    match drive(file.read(0, &mut back)) {
+        Some(Ok(400)) => {}
+        _ => return TestResult::Fail("read-back of the written sector did not complete"),
+    }
+    if &back[0..5] != b"narf\n" || back[5..16].iter().any(|b| *b != 0) {
+        return TestResult::Fail("bytes before the first patch changed");
+    }
+    if back[16..144].iter().any(|b| *b != 0xA1) {
+        return TestResult::Fail("patch A lost to the concurrent write");
+    }
+    if back[144..272].iter().any(|b| *b != 0) {
+        return TestResult::Fail("bytes between the patches changed");
+    }
+    if back[272..400].iter().any(|b| *b != 0xB2) {
+        return TestResult::Fail("patch B lost to the concurrent write");
+    }
+    let stored = device.snapshot();
+    let sec = 4 * 512;
+    if &stored[sec..sec + 5] != b"narf\n" || stored[sec + 5..sec + 16].iter().any(|b| *b != 0) {
+        return TestResult::Fail("device sector: bytes before the first patch changed");
+    }
+    if stored[sec + 16..sec + 144].iter().any(|b| *b != 0xA1) {
+        return TestResult::Fail("device sector does not hold patch A");
+    }
+    if stored[sec + 144..sec + 272].iter().any(|b| *b != 0) {
+        return TestResult::Fail("device sector: bytes between the patches changed");
+    }
+    if stored[sec + 272..sec + 400].iter().any(|b| *b != 0xB2) {
+        return TestResult::Fail("device sector does not hold patch B");
+    }
+    if stored[sec + 400..sec + 512].iter().any(|b| *b != 0) {
+        return TestResult::Fail("device sector: bytes after the second patch changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/fat",
+    smoke_fat_concurrent_partial_sector_writes_both_patches_survive
+);
+
+/// A `read_sector` racing a `write_sector` must return the sector's
+/// on-disk bytes, not the bytes the write just staged into the
+/// shared scratch buffer. The read is polled first: before #1988
+/// its submit landed the sector's bytes in the scratch buffer, then
+/// the write's stage-in overwrote them before the read copied out.
+fn smoke_fat_read_sector_racing_write_sector() -> TestResult {
+    let (device, volume) = match mount_deferred_volume() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on deferred device failed"),
+    };
+    let mut dst = alloc::vec![0u8; 512];
+    let staged = alloc::vec![0x3C; 512];
+    let fut_r = volume.read_sector(RACE_LBA_B, &mut dst);
+    let fut_w = volume.write_sector(RACE_LBA_A, &staged);
+    let (rr, rw) = poll_two(fut_r, fut_w);
+    match (rr, rw) {
+        (Some(Ok(())), Some(Ok(()))) => {}
+        _ => return TestResult::Fail("racing read/write_sector did not complete"),
+    }
+    if dst.iter().any(|b| *b != 0x5A) {
+        return TestResult::Fail("read_sector racing write_sector returned staged write bytes");
+    }
+    let stored = device.snapshot();
+    if stored[(RACE_LBA_A as usize) * 512..(RACE_LBA_A as usize + 1) * 512]
+        .iter()
+        .any(|b| *b != 0x3C)
+    {
+        return TestResult::Fail("write_sector racing a read did not land");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_read_sector_racing_write_sector);
+
+/// A single partial-sector write still lands exactly its own slice
+/// of the sector and leaves the surrounding bytes untouched.
+fn smoke_fat_single_partial_sector_write() -> TestResult {
+    let (device, _volume, file) = match mount_deferred_volume_with_file() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount + lookup on deferred device failed"),
+    };
+    let data = alloc::vec![0xC3u8; 128];
+    match drive(file.write(16, &data)) {
+        Some(Ok(128)) => {}
+        _ => return TestResult::Fail("single partial-sector write did not complete"),
+    }
+    let mut back = alloc::vec![0u8; 144];
+    match drive(file.read(0, &mut back)) {
+        Some(Ok(144)) => {}
+        _ => return TestResult::Fail("read-back of the written sector did not complete"),
+    }
+    if &back[0..5] != b"narf\n" || back[5..16].iter().any(|b| *b != 0) {
+        return TestResult::Fail("bytes before the patch changed");
+    }
+    if back[16..144].iter().any(|b| *b != 0xC3) {
+        return TestResult::Fail("single partial-sector write read back wrong bytes");
+    }
+    let stored = device.snapshot();
+    let sec = 4 * 512;
+    if stored[sec + 144..sec + 512].iter().any(|b| *b != 0) {
+        return TestResult::Fail("bytes after the patch changed in the device sector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_single_partial_sector_write);

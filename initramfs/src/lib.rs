@@ -25,6 +25,7 @@ extern crate alloc;
 use narf_lib::sync::IrqSafeSpinLock;
 use zeroize::Zeroizing;
 
+mod credentials;
 mod tests;
 
 // Re-exports of the CPIO parser surface that lives in
@@ -216,8 +217,53 @@ pub fn register_initcalls() {
     // Opt-in non-interactive encrypted-root policy. The key file is an exact
     // byte string in the measured initramfs; no newline trimming or text
     // decoding occurs. `rd.luks.uuid=` optionally pins the intended container.
-    narf_init::register(Stage::Early, "luks-keyfile-provider", || {
-        if narf_boot::args().value("rd.luks.key").is_none() {
+    narf_init::register(Stage::Early, "luks-credential-provider", || {
+        let args = narf_boot::args();
+        if args.value("rd.luks.prompt").is_some() || args.value("rd.luks.key").is_some() {
+            for key in [
+                "rd.luks.prompt",
+                "rd.luks.key",
+                "rd.luks.uuid",
+                "rd.luks.timeout",
+                "rd.luks.tries",
+            ] {
+                assert!(
+                    args.values(key).count() <= 1,
+                    "repeated LUKS boot policy option"
+                );
+            }
+            assert!(
+                narf_filesystem::root_selector::RootSelector::from_cmdline(narf_boot::cmdline())
+                    .is_some(),
+                "LUKS boot policy requires an explicit valid root= selector"
+            );
+        }
+        if let Some(prompt) = args.value("rd.luks.prompt") {
+            if prompt != "serial"
+                || args.value("rd.luks.key").is_some()
+                || args.value("rd.luks.uuid").is_none()
+            {
+                panic!("LUKS serial prompt requires rd.luks.uuid and no rd.luks.key");
+            }
+            let selected = args.value("rd.luks.uuid").unwrap();
+            assert!(
+                narf_block::partition::parse_uuid(
+                    selected.strip_prefix("luks-").unwrap_or(selected)
+                )
+                .is_some(),
+                "LUKS serial prompt requires a canonical container UUID"
+            );
+            let attempts = args
+                .value("rd.luks.tries")
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(3);
+            narf_block::encrypted::install_luks_passphrase_provider_with_attempts(
+                credentials::serial_provider,
+                attempts,
+            );
+            return InitResult::Ok;
+        }
+        if args.value("rd.luks.key").is_none() {
             return InitResult::NotPresent;
         }
         narf_block::encrypted::install_luks_passphrase_provider(luks_keyfile_provider);

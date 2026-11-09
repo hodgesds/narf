@@ -15,8 +15,8 @@ reach the hand-off (that's `frame/`), paging after hand-off (`memory/`).
 
 ## 2. Assumptions
 
-- Bootloader handed us control in a documented state (Limine protocol
-  on x86_64, U-Boot FDT entry on aarch64).
+- Bootloader handed us control in a documented state (Multiboot2 or Xen PVH
+  on x86_64, Linux/U-Boot FDT entry on aarch64).
 - Kernel image is linked at its runtime virtual address.
 - **All data supplied via `BootInfo` is treated as untrusted input.**
   "Documented state" does not mean "correct state." `boot/` validates
@@ -24,6 +24,25 @@ reach the hand-off (that's `frame/`), paging after hand-off (`memory/`).
   in §3.
 
 ## 3. Public interface
+
+The native x86_64 EFI application (`cargo xtask efi-image`) embeds its
+kernel, initramfs and command line, then produces the existing Multiboot2
+handoff. `narf-boot-protocol` (`boot/protocol/`) validates the ELF load plan
+and constructs the information block without kernel or EFI dependencies.
+The loader's mode bridge supplies EAX=`0x36d76289`, EBX=physical information
+pointer, paging off and interrupts disabled. Existing kernel entry, KASLR,
+and normalized `BootInfo` consumers are shared with other Multiboot2 loaders.
+
+The loader retains the complete final EFI descriptor map in tag 17, in
+addition to the coalesced type-6 map, and preserves the system table through
+tag 12. EFI loader code/data, the kernel, initramfs, bridge, information block,
+runtime and boot-services regions stay reserved. Boot-services reclamation
+requires an explicit firmware-table lifetime audit. Native EFI currently
+requires the kernel's fixed physical load range to be available; a collision
+is fatal. Command-line
+and initramfs bytes are embedded before any administrator signing. Firmware
+load options do not override them. Build/install/run instructions and limits
+are in `docs/NATIVE_UEFI.md`.
 
 ```rust
 #[repr(C)]
@@ -137,11 +156,13 @@ from turning into a kernel-side memory-corruption primitive.
 ## 5. Architecture notes
 
 ### x86_64
-- **Limine is the sole Stage 1 bootloader.** Multiboot2 is a Stage 4
-  stretch goal and not supported in CI until then. This prevents the
-  codebase from growing two divergent boot paths.
-- Protocol requires higher-half kernel + feature-request markers.
-- Memory map from Limine features; ACPI RSDP via Limine feature.
+- Limine supplies Multiboot2 for existing UEFI media and explicit legacy packages;
+  QEMU direct boot uses Xen PVH. Both enter the same 32-bit kernel stub.
+- The Stage-5 native EFI loader also supplies Multiboot2, with a small
+  64-bit-to-32-bit mode bridge. It embeds all boot payloads in one PE image.
+- Memory map, RSDP copy, initramfs and framebuffer use the corresponding
+  Multiboot2 tags. Native EFI passes BGRX GOP only; other layouts remain
+  serial-only until the kernel framebuffer ABI describes channel masks.
 
 ### aarch64
 - Direct Linux/U-Boot FDT entry and the `BOOTAA64.EFI` removable-media
@@ -177,16 +198,19 @@ Stage 1.
 
 ### 8.1 Bootloader portfolio (resolved)
 
-**Decision (was open):** **Limine on x86_64; UEFI-stub on
-aarch64; multiboot2 fallback for CI.** Three loaders, all
-producing the same `RawBootInfo` shape that `frame/` consumes.
+**Current portfolio:** Limine-backed x86_64 media/legacy packages, default
+self-contained x86_64 native EFI packages, aarch64 EFI/FDT, and Xen PVH direct boot
+for x86_64 CI. All normalize through the same `BootInfo` consumed by `frame/`.
 
-- **Limine** is the primary x86_64 bootloader: well-maintained,
+- **Limine** remains the existing x86_64 media bootloader: well-maintained,
   modern, supports the protocol features we care about
   (high-half kernel, KASLR, Smarter ACPI handoff).
-- **multiboot2** stays as a CI fallback because QEMU's
-  `-kernel` direct-load path is multiboot2; this lets us boot
-  fresh kernels in xtask without re-imaging.
+- **Native EFI** is built with `cargo xtask efi-image`; its standard
+  Multiboot2 handoff reuses the existing kernel entry. It is not yet the
+  default for existing media or distribution-package commands.
+- **Xen PVH** is QEMU's x86_64 `-kernel` direct-load path; it lets xtask
+  boot fresh kernels without re-imaging. Multiboot2 remains supported for
+  Limine, GRUB and the native EFI application.
 - **UEFI loader** on aarch64 is the SystemReady-compatible removable
   media path and is boot-gated with AAVMF; `-kernel` direct entry
   remains the fast functional-test path. Native packages may place the kernel
@@ -236,33 +260,26 @@ Stage::Late once a real driver (bochs-display, virtio-gpu) is
 probed. Until then, `console/` owns the linear FB at the
 boot-mapped address.
 
-## 9. RawBootInfo wire format
+## 9. RawBootInfo entry wrapper
 
-Locked at v1.0. Bootloaders MUST produce this exact layout;
-subsequent kernel code reads it once and discards.
+The implemented entry wrapper in `boot/src/info.rs` is two 64-bit fields.
+Architecture assembly constructs it from registers and passes it to Rust;
+it is not a serialized copy of the normalized `BootInfo` structure.
 
 ```rust
 #[repr(C)]
 pub struct RawBootInfo {
-    pub magic:        u64,           // 0x4E_41_52_46_42_4F_4F_54 = "NARFBOOT"
-    pub abi_version:  u32,           // currently 1
-    pub _reserved:    u32,
-    pub mem_map:      [MemRegion; MEM_MAP_MAX],   // 64 entries
-    pub mem_map_len:  u32,
-    pub kernel_phys:  u64,           // physical base of loaded kernel
-    pub kernel_size:  u64,
-    pub framebuffer:  Option<Framebuffer>,
-    pub rsdp:         Option<PhysAddr>,           // x86_64
-    pub dtb:          Option<PhysAddr>,           // aarch64
-    pub initramfs:    Option<(PhysAddr, u64)>,    // (base, size)
-    pub cmdline:      [u8; 256],
-    pub cmdline_len:  u32,
+    pub magic: u64,
+    pub payload: PhysAddr,
 }
 ```
 
-Adding a field at the end with a `_reserved`-renaming follows
-`BOOT_ABI_MINOR` bump rules. Any layout change is a
-`BOOT_ABI_MAJOR` bump (flag-day).
+`magic` and `payload` identify the protocol-specific structure: Multiboot2
+magic plus information pointer, PVH's start-info pointer (identified by its
+payload magic), or the FDT handoff. Multiboot2 tags and FDT properties carry
+the extensible payload. The earlier inline `NARFBOOT` structure documented
+here was never the implemented entry ABI. This correction does not change
+the kernel's register or struct layout.
 
 ## 10. Open questions
 

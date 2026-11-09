@@ -8,9 +8,11 @@
 //! stream's timing and bounding-box state.
 //!
 //! The lit configuration is itself a request (the owned surface, full
-//! screen, unscaled), so returning to it is the same update. The
-//! programming lives in `amdgpu_navi22_modeset` (`Pipeline::program_plane`)
-//! and the flip in `amdgpu_navi22_scanout`.
+//! screen, unscaled), so returning to it is the same update. [`plan_two`]
+//! is the same for a primary with a slave overlay beside it: one joint
+//! DML30 plan for both planes, on the one stream's timing. The
+//! programming lives in `amdgpu_navi22_modeset` (`Pipeline::program_plane`,
+//! `Pipeline::program_two_planes`) and the flip in `amdgpu_navi22_scanout`.
 use crate::{
     amdgpu_dcn30_scl as scl,
     amdgpu_dml::{Config, Format, Plane, Timing},
@@ -51,6 +53,21 @@ pub struct Update {
     pub plan: dml30::Plan,
 }
 
+/// Everything a lit stream shows with a slave overlay beside its primary:
+/// the primary's and the overlay's placements, each with its own scaler and
+/// DML30 plan, planned jointly (`dcn30_validate_bandwidth` runs DML30 on
+/// the whole context: one DISPCLK and DPPCLK step, the summed read
+/// bandwidth, one watermark set, each pipe's DLG/TTU registers). The two
+/// plans share the joint clocks, watermarks and DRAM-clock-change support;
+/// `overlay_dppclk_khz` is the slave pipe's DPP DTO
+/// (`dml30::PlanePlan::dppclk_khz`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TwoPlaneUpdate {
+    pub primary: Update,
+    pub overlay: Update,
+    pub overlay_dppclk_khz: u32,
+}
+
 /// Why a placement cannot be shown on the lit pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -65,6 +82,10 @@ pub enum Refusal {
     /// LINUX-GAP: dcn3_update_clocks would raise them in prepare_bandwidth;
     /// NARF's DCN30 clock owner only sets them at a modeset.
     Clock,
+    /// A slave overlay is live: place through the two-plane path
+    /// ([`plan_two`]), not the single-plane one — the single plan's
+    /// clocks and watermarks do not budget the overlay.
+    Overlay,
     /// The stream is split across two ODM pipes.
     /// LINUX-GAP: DC builds a viewport per ODM slice; this owner programs
     /// a placed plane on a single pipe only.
@@ -90,21 +111,43 @@ impl Basis {
         }
         plan(&self.timing, self.vco_khz, &self.soc, &self.lit, request)
     }
+    /// [`plan_two`] on this stream: a primary and a slave overlay placed
+    /// together. An ODM stream refuses every placement. Planning is pure:
+    /// it does not lease the slave pipe; the caller leases it before
+    /// programming the update.
+    pub fn plan_two(
+        &self,
+        primary: &Request,
+        overlay: &Request,
+    ) -> Result<TwoPlaneUpdate, Refusal> {
+        if self.odm {
+            return Err(Refusal::Odm);
+        }
+        plan_two(
+            &self.timing,
+            self.vco_khz,
+            &self.soc,
+            &self.lit,
+            primary,
+            overlay,
+        )
+    }
 }
 
 /// `hubp2_program_size`'s pitch field and DCN30's 14-bit viewport fields.
 const MAX_PITCH: u32 = 0x4000; // linux: n/a (HUBPREQ0_DCSURF_SURFACE_PITCH__PITCH_MASK + 1)
 
-/// The scaler data and DML30 plan for `request` on the lit single-pipe
-/// stream of `timing`, whose own plan is `lit` on bounding-box state
-/// `soc`. Nothing is programmed.
-pub fn plan(
+/// The scaler and DML30 stream for `request` on `timing`: the
+/// `resource_build_scaling_params` scaler for the lit pipe, then the
+/// `dcn20_populate_dml_pipes_from_context` stream for it. `cursors` is the
+/// cursor count this plane's pipe budgets (the cursor is budgeted once, on
+/// the primary).
+fn stream_for(
     timing: &Timing,
     vco_khz: u32,
-    soc: &dml30::Soc,
-    lit: &dml30::Plan,
     request: &Request,
-) -> Result<Update, Refusal> {
+    cursors: u32,
+) -> Result<(scl::ScalerData, dml30::Stream), Refusal> {
     let r = request;
     let fits = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
     if r.pitch == 0
@@ -146,7 +189,7 @@ pub fn plan(
         },
         dentist_vco_khz: vco_khz,
         // dcn20_populate_dml_pipes_from_context budgets the cursor.
-        cursors: 1,
+        cursors,
     };
     let stream = dml30::Stream {
         scale: Some(dml30::Scale {
@@ -157,6 +200,42 @@ pub fn plan(
         }),
         ..dml30::Stream::tmds(config)
     };
+    Ok((scaler, stream))
+}
+
+/// A [`dml30::Plan`] for one plane of a joint plan, as [`dml30::plan_stream`]
+/// builds it from the joint plan's first plane.
+fn plan_of(joint: &dml30::JointPlan, index: usize) -> Result<dml30::Plan, Refusal> {
+    let plane = joint
+        .planes
+        .get(index)
+        .ok_or(Refusal::Mode(crate::amdgpu_dml::Error::Invalid))?;
+    let pipe = plane.pipes[0].ok_or(Refusal::Mode(crate::amdgpu_dml::Error::Invalid))?;
+    Ok(dml30::Plan {
+        prefetch_mode: joint.prefetch_mode,
+        geometry: plane.geometry,
+        clocks: joint.clocks,
+        watermarks: joint.watermarks,
+        prefetch: plane.prefetch,
+        registers: pipe.registers,
+        hubbub: joint.hubbub,
+        dram_clock_change: joint.dram_clock_change,
+        urgent_bandwidth_thousandths: joint.urgent_bandwidth_thousandths,
+        cursor: pipe.cursor,
+    })
+}
+
+/// The scaler data and DML30 plan for `request` on the lit single-pipe
+/// stream of `timing`, whose own plan is `lit` on bounding-box state
+/// `soc`. Nothing is programmed.
+pub fn plan(
+    timing: &Timing,
+    vco_khz: u32,
+    soc: &dml30::Soc,
+    lit: &dml30::Plan,
+    request: &Request,
+) -> Result<Update, Refusal> {
+    let (scaler, stream) = stream_for(timing, vco_khz, request, 1)?;
     let plan = dml30::plan_stream(&stream, soc).map_err(Refusal::Mode)?;
     if plan.clocks.dppclk_khz > lit.clocks.dppclk_khz
         || plan.clocks.dispclk_khz > lit.clocks.dispclk_khz
@@ -167,6 +246,55 @@ pub fn plan(
         request: *request,
         scaler,
         plan,
+    })
+}
+
+/// The scaler data and DML30 plans for `primary` and `overlay` on the lit
+/// stream of `timing`, planned jointly as one two-plane configuration:
+/// the two streams share `timing` (one OTG), the cursor is budgeted on the
+/// primary only, and the joint clocks must fit the lit stream's — the same
+/// admission [`plan`] applies to one plane. Nothing is programmed.
+pub fn plan_two(
+    timing: &Timing,
+    vco_khz: u32,
+    soc: &dml30::Soc,
+    lit: &dml30::Plan,
+    primary: &Request,
+    overlay: &Request,
+) -> Result<TwoPlaneUpdate, Refusal> {
+    let (primary_scaler, primary_stream) = stream_for(timing, vco_khz, primary, 1)?;
+    let (overlay_scaler, overlay_stream) = stream_for(timing, vco_khz, overlay, 0)?;
+    let joint = dml30::plan_joint(&[primary_stream, overlay_stream], soc).map_err(Refusal::Mode)?;
+    if joint.planes.iter().any(|p| p.odm != dml30::Odm::None) {
+        // The lit stream fits on one pipe, so the same timing cannot need
+        // ODM — but a joint plan that split a plane would only program its
+        // first slice here. Refuse rather than drive half a plane.
+        return Err(Refusal::Odm);
+    }
+    let primary_plan = plan_of(&joint, 0)?;
+    let overlay_plan = plan_of(&joint, 1)?;
+    if primary_plan.clocks.dppclk_khz > lit.clocks.dppclk_khz
+        || primary_plan.clocks.dispclk_khz > lit.clocks.dispclk_khz
+    {
+        return Err(Refusal::Clock);
+    }
+    let overlay_dppclk_khz = joint
+        .planes
+        .get(1)
+        .map(|p| p.dppclk_khz)
+        .ok_or(Refusal::Mode(crate::amdgpu_dml::Error::Invalid))?;
+    Ok(TwoPlaneUpdate {
+        primary: Update {
+            request: *primary,
+            scaler: primary_scaler,
+            plan: primary_plan,
+        },
+        overlay: Update {
+            request: *overlay,
+            scaler: overlay_scaler,
+            plan: overlay_plan,
+        },
+        overlay_dppclk_khz,
     })
 }
 

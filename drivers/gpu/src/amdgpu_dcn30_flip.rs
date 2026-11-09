@@ -142,8 +142,12 @@ pub(crate) struct Engine<I: Io> {
     /// The ODM 2:1 secondary HUBP on the same OTG, fetching the same surface
     /// from its own viewport.
     pub(crate) odm: Option<u8>,
+    /// The slave overlay HUBP on the same OTG, fetching its own surface.
+    pub(crate) overlay: Option<u8>,
     /// The surface the last flip requested (`hubp->request_address`).
     pub(crate) requested: Option<u64>,
+    /// The surface the last overlay flip requested, if one was armed.
+    pub(crate) overlay_requested: Option<u64>,
 }
 impl<I: Io> Engine<I> {
     fn hubp(&self, reg: u64) -> u64 {
@@ -180,18 +184,21 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         if self.odm.is_none() {
-            return self.program_hubp(self.pipe, address);
+            self.program_hubp(self.pipe, address)?;
+        } else {
+            // commit_planes_for_stream's pipe_control_lock (optc1_lock): every
+            // ODM slice's address latches at the same VUPDATE. The lock is
+            // always released so a failure cannot freeze the OTG's updates.
+            self.otg_lock(true)?;
+            let pipes: [Option<u8>; 2] = [Some(self.pipe), self.odm];
+            let mut result = Ok(());
+            for pipe in pipes.into_iter().flatten() {
+                result = result.and_then(|()| self.program_hubp(pipe, address));
+            }
+            result.and(self.otg_lock(false))?;
         }
-        // commit_planes_for_stream's pipe_control_lock (optc1_lock): every
-        // ODM slice's address latches at the same VUPDATE. The lock is
-        // always released so a failure cannot freeze the OTG's updates.
-        self.otg_lock(true)?;
-        let pipes: [Option<u8>; 2] = [Some(self.pipe), self.odm];
-        let mut result = Ok(());
-        for pipe in pipes.into_iter().flatten() {
-            result = result.and_then(|()| self.program_hubp(pipe, address));
-        }
-        result.and(self.otg_lock(false))
+        self.requested = Some(address);
+        Ok(())
     }
     /// [`Engine::program_flip`] with the caller already holding the OTG's
     /// pipe-control lock (`commit_planes_for_stream`'s
@@ -205,7 +212,42 @@ impl<I: Io> Engine<I> {
         for pipe in pipes.into_iter().flatten() {
             self.program_hubp(pipe, address)?;
         }
+        self.requested = Some(address);
         Ok(())
+    }
+    /// Arm a VSYNC flip of the overlay HUBP to `address`, taking the OTG's
+    /// pipe-control lock around it: the overlay's half of
+    /// `commit_planes_for_stream`, so the overlay address latches at the
+    /// same VUPDATE as the primary's, on its own HUBP. The lock is always
+    /// released so a failure cannot freeze the OTG's updates.
+    pub(crate) fn program_overlay(&mut self, address: u64) -> Result<(), Error> {
+        let overlay = self.overlay.ok_or(Error::Invalid)?;
+        if address == 0 || address >= 1 << ADDRESS_BITS || address % ADDRESS_ALIGN != 0 {
+            return Err(Error::Invalid);
+        }
+        self.otg_lock(true)?;
+        let programmed = self.program_hubp(overlay, address);
+        let unlocked = self.otg_lock(false);
+        programmed.and(unlocked)?;
+        self.overlay_requested = Some(address);
+        Ok(())
+    }
+    /// [`Engine::program_overlay`] with the caller already holding the OTG's
+    /// pipe-control lock: the overlay address, no lock of its own.
+    pub(crate) fn program_overlay_locked(&mut self, address: u64) -> Result<(), Error> {
+        let overlay = self.overlay.ok_or(Error::Invalid)?;
+        if address == 0 || address >= 1 << ADDRESS_BITS || address % ADDRESS_ALIGN != 0 {
+            return Err(Error::Invalid);
+        }
+        self.program_hubp(overlay, address)?;
+        self.overlay_requested = Some(address);
+        Ok(())
+    }
+    /// Forget the overlay HUBP: the overlay was released, so no flip
+    /// completion waits on it. The HUBP itself is blanked by the pipeline.
+    pub(crate) fn clear_overlay(&mut self) {
+        self.overlay = None;
+        self.overlay_requested = None;
     }
     /// `optc1_lock` / `optc1_unlock` for a caller sequencing a plane
     /// update inside the lock.
@@ -225,9 +267,7 @@ impl<I: Io> Engine<I> {
             io.write(high, (address >> 32) as u32 & ADDRESS_HIGH_MASK);
             // The low half last: it latches the high half and arms the flip.
             io.write(low, address as u32);
-        })?;
-        self.requested = Some(address);
-        Ok(())
+        })
     }
     /// `optc1_lock` / `optc1_unlock` of this OTG (its LOCK_SEL was set when
     /// the pipeline lit it). Linux's status wait only logs a timeout.
@@ -251,13 +291,22 @@ impl<I: Io> Engine<I> {
         self.access(|io| io.write(reg, 1))
     }
     /// `hubp2_is_flip_pending` against the last requested surface.
-    /// With ODM, `dc_plane_get_status` ORs it over every slice's HUBP.
+    /// With ODM, `dc_plane_get_status` ORs it over every slice's HUBP; an
+    /// armed overlay HUBP holds the commit the same way, against its own
+    /// requested surface.
     pub(crate) fn pending(&mut self) -> Result<bool, Error> {
         let requested = self.requested.ok_or(Error::Invalid)?;
         let pipes: [Option<u8>; 2] = [Some(self.pipe), self.odm];
         for pipe in pipes.into_iter().flatten() {
             if self.read(Self::hubp_of(pipe, FLIP_CONTROL))? & FLIP_PENDING != 0
                 || self.in_use_of(pipe)? != requested
+            {
+                return Ok(true);
+            }
+        }
+        if let (Some(overlay), Some(requested)) = (self.overlay, self.overlay_requested) {
+            if self.read(Self::hubp_of(overlay, FLIP_CONTROL))? & FLIP_PENDING != 0
+                || self.in_use_of(overlay)? != requested
             {
                 return Ok(true);
             }
@@ -429,7 +478,9 @@ impl Flip {
             authority,
             pipe,
             odm: None,
+            overlay: None,
             requested: None,
+            overlay_requested: None,
         }))
     }
     pub fn pipe(&self) -> u8 {
@@ -445,6 +496,33 @@ impl Flip {
         }
         self.0.odm = Some(pipe);
         Ok(self)
+    }
+    /// Also flip the slave overlay `pipe` (same OTG, its own surface).
+    ///
+    /// # Safety
+    /// As [`Flip::new`], for `pipe`'s HUBP too. `pipe` must not be the
+    /// primary's or the ODM secondary's.
+    pub unsafe fn with_overlay(mut self, gpu: &AmdGpu, pipe: u8) -> Result<Self, Error> {
+        // SAFETY: forwarded.
+        unsafe { self.set_overlay(gpu, pipe)? };
+        Ok(self)
+    }
+    /// [`Flip::with_overlay`] on an owned flip, for a pipeline that leased
+    /// the slave pipe after this flip owner was created.
+    ///
+    /// # Safety
+    /// As [`Flip::new`], for `pipe`'s HUBP too.
+    pub unsafe fn set_overlay(&mut self, gpu: &AmdGpu, pipe: u8) -> Result<(), Error> {
+        if pipe == self.0.pipe || self.0.odm == Some(pipe) || pipe >= Profile::resolve(gpu)?.pipes()
+        {
+            return Err(Error::Invalid);
+        }
+        self.0.overlay = Some(pipe);
+        Ok(())
+    }
+    /// The slave overlay pipe, if one is flipped.
+    pub fn overlay(&self) -> Option<u8> {
+        self.0.overlay
     }
     /// Position and last completed DRR total sampled in the same frame.
     pub fn position_drr(&mut self) -> Result<(Position, u32), Error> {
@@ -466,6 +544,19 @@ impl Flip {
     /// [`Flip::program`] inside a pipe-control lock the caller holds.
     pub fn program_locked(&mut self, address: u64) -> Result<(), Error> {
         self.0.program_flip_locked(address)
+    }
+    /// Arm a VSYNC flip of the overlay HUBP to `address`; `wait` observes
+    /// it latch alongside the primary's.
+    pub fn program_overlay(&mut self, address: u64) -> Result<(), Error> {
+        self.0.program_overlay(address)
+    }
+    /// [`Flip::program_overlay`] inside a pipe-control lock the caller holds.
+    pub fn program_overlay_locked(&mut self, address: u64) -> Result<(), Error> {
+        self.0.program_overlay_locked(address)
+    }
+    /// Forget the overlay HUBP after the pipeline released it.
+    pub fn clear_overlay(&mut self) {
+        self.0.clear_overlay()
     }
     /// `optc1_lock` (true) / `optc1_unlock` (false) of this OTG.
     pub fn pipe_control_lock(&mut self, lock: bool) -> Result<(), Error> {
