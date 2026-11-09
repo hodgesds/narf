@@ -108,6 +108,7 @@ mod firmware_registry;
 mod fragment_rx;
 mod fragment_wire;
 pub mod fw;
+mod fwcmd_8922a;
 pub mod fwdl;
 pub mod h2c;
 mod he_htc;
@@ -120,6 +121,7 @@ mod lps_packets;
 mod lps_wire;
 pub mod mac;
 pub mod mac_init;
+mod mac_pre_init_8922a;
 mod mac_runtime;
 mod mac_runtime_regs;
 mod monitor;
@@ -300,6 +302,12 @@ mod txpower_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod nhm_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod fwcmd_8922a_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod mac_pre_init_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;
