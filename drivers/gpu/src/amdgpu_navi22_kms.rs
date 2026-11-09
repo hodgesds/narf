@@ -626,12 +626,18 @@ fn apply_card_vrr(
     card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
     // Share connector/CRTC bookkeeping, not DCN401's plane capabilities.
-    // This presenter shows one linear 8888 primary per CRTC; overlays and
-    // GFX12 tiling have no implementation here, so the primaries stay the
-    // synthesized ones. Each CRTC has its DRM_PLANE_TYPE_CURSOR plane
-    // (amdgpu_dm_crtc_init), shown on the DCN30 hardware cursor.
-    card.native_planes.retain(|p| p.is_cursor());
-    card.overlay_formats = None;
+    // This presenter shows one linear 8888 primary per CRTC, and the
+    // primaries stay the synthesized ones; GFX12 tiling has no
+    // implementation here. DCN 3.0 publishes two shared overlays, though
+    // (dc caps' max_slave_planes = 2), with the 19-format list and one
+    // cursor plane per CRTC after them. The DRM layer publishes them
+    // (#1950); the display side that programs them is #1951, and
+    // present_planes still refuses overlays until then — this lands with
+    // #1951, never alone.
+    let crtc_ids: alloc::vec::Vec<u32> = card.crtcs.iter().map(|c| c.id).collect();
+    card.native_planes =
+        crate::drm_native_planes::overlay_cursor_planes_for(&card.native_planes, &crtc_ids);
+    card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
     card.gfx12_modifiers = false;
 }
 
