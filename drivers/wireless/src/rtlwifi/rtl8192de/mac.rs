@@ -9,11 +9,14 @@
 //! the retained packet owner / `Prepared` integration, as for
 //! RTL8192CE: the TX/RX descriptor physical addresses
 //! (`REG_BCNQ_DESA` … `REG_RX_DESA`, from the OS ring DMA addresses).
-//! Omitted with reason: `_rtl92de_gen_refresh_led_state` (LED only),
+//! Omitted with reason: `_rtl92de_gen_refresh_led_state` (LED only).
 //! `rtl92d_phy_config_maccoexist_rfpage` is included ([`maccoexist_rfpage`])
-//! since it is plain register writes, while `rtl92d_enable_hw_security_config`
-//! stays software — the shared software CCMP path is used, so
-//! `REG_SECCFG` stays 0 ([`station_identity`]).
+//! since it is plain register writes. The `rtl92de_hw_init` early-mode
+//! block ([`early_mode`]), the ASPM back-door
+//! ([`enable_aspm_back_door`]) and the hardware-security enable
+//! ([`enable_hw_security_config`]) are included the same way; with
+//! software crypto the security enable writes nothing, so
+//! `REG_SECCFG` stays 0 as in [`station_identity`].
 //!
 //! Two faithful departures from the RTL8192CE port are deliberate.
 //! The `REG_APSD_CTRL` BIT(7) poll waits *for* the bit, exactly as
@@ -22,6 +25,7 @@
 //! set. And `REG_FAST_EDCA_CTRL` is a word write (`0x6666`), as Linux
 //! writes it here (the 92CE port wrote a dword).
 
+use super::power::REG_CR;
 use super::{ampdu_factor_base, MacPhyMode};
 use crate::rtlwifi::firmware_transport::Io;
 use crate::rtlwifi::prepare::Error;
@@ -94,6 +98,17 @@ pub const REG_SECCFG: u16 = 0x0680;
 /// `REG_PCIE_CTRL_REG + 3` value written by `_rtl92de_init_mac`
 /// (early-mode disable is the `0x4d0` byte below it).
 pub const PCIE_CTRL_REG_3: u8 = 0x33;
+/// `REG_EARLYMODE_CONTROL` (early-mode control byte).
+pub const REG_EARLYMODE_CTRL: u16 = 0x04d0;
+/// `SCR_TXUSEDK` / `SCR_RXUSEDK` / `SCR_TXENCENABLE` /
+/// `SCR_RXENCENABLE` / `SCR_TXBCUSEDK` / `SCR_RXBCUSEDK`
+/// (`rtl8192de/reg.h`).
+pub const SCR_TXUSEDK: u8 = 1 << 0;
+pub const SCR_RXUSEDK: u8 = 1 << 1;
+pub const SCR_TXENCENABLE: u8 = 1 << 2;
+pub const SCR_RXENCENABLE: u8 = 1 << 3;
+pub const SCR_TXBCUSEDK: u8 = 1 << 6;
+pub const SCR_RXBCUSEDK: u8 = 1 << 7;
 /// `REG_BWOPMODE` value: `BW_OPMODE_20MHZ` (`rtl8192d/reg.h`).
 pub const BWOPMODE_20MHZ: u8 = 1 << 2;
 
@@ -151,7 +166,7 @@ pub async fn init_mac(io: &impl Io, mode: MacPhyMode) -> Result<(), Error> {
     byte(io, REG_FWHW_TXQ_CTRL + 1, 0x1f)?;
     dword(io, REG_RCR, RCR)?;
     dword(io, REG_TCR, TCR)?;
-    w8(io, 0x04d0, 0x00)?;
+    w8(io, REG_EARLYMODE_CTRL, 0x00)?;
     byte(io, REG_PCIE_CTRL_REG + 3, PCIE_CTRL_REG_3)?;
     dword(io, REG_INT_MIG, 0)?;
     let value = io.read8(REG_APSD_CTRL)?;
@@ -208,6 +223,84 @@ pub fn trim_receive_config(io: &impl Io) -> Result<u32, Error> {
     let rcr = io.read32(REG_RCR)? & !RCR_ACRC32_AICV;
     dword(io, REG_RCR, rcr)?;
     Ok(rcr)
+}
+
+/// The `rtl92de_hw_init` early-mode block (`rtl8192de/hw.c:913-931`):
+/// `REG_TCR + 1` (`0x605`) always gains `0x30`; when early mode is
+/// enabled (`rtlhal->earlymode_enable`,
+/// [`super::lifecycle::SwVars::earlymode_enable`]) the early-mode
+/// control byte gains `0x1f`, the packet-count byte (`0x4d3`) is
+/// `0x80`, and `REG_TCR + 1` gains `0x40`. `_rtl92de_init_mac`
+/// clears the control byte first ([`init_mac`]).
+pub fn early_mode(io: &impl Io, enable: bool) -> Result<(), Error> {
+    let tcr1 = io.read8(REG_TCR + 1)?;
+    io.write8(REG_TCR + 1, tcr1 | 0x30)?;
+    if enable {
+        let em = io.read8(REG_EARLYMODE_CTRL)?;
+        io.write8(REG_EARLYMODE_CTRL, em | 0x1f)?;
+        io.write8(REG_EARLYMODE_CTRL + 3, 0x80)?;
+        let tcr1 = io.read8(REG_TCR + 1)?;
+        io.write8(REG_TCR + 1, tcr1 | 0x40)?;
+    }
+    Ok(())
+}
+
+/// `_rtl92de_enable_aspm_back_door` (`rtl8192de/hw.c:833-847`): the
+/// DBI control writes (`0x34b`, `0x350`, `0x352`) with the
+/// back-door byte (`0x349`) `0x1b` when the back door is supported
+/// ([`super::lifecycle::AspmVars::support_backdoor`]) and `0x03`
+/// otherwise.
+pub fn enable_aspm_back_door(io: &impl Io, support_backdoor: bool) -> Result<(), Error> {
+    io.write8(0x34b, 0x93)?;
+    io.write16(0x350, 0x870c)?;
+    io.write8(0x352, 0x1)?;
+    io.write8(0x349, if support_backdoor { 0x1b } else { 0x03 })?;
+    io.write16(0x350, 0x2718)?;
+    io.write8(0x352, 0x1)?;
+    Ok(())
+}
+
+/// Inputs to `rtl92de_enable_hw_security_config`
+/// (`rtl8192de/hw.c:849-873`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HwSecurity {
+    /// `rtlpriv->cfg->mod_params->sw_crypto`.
+    pub sw_crypto: bool,
+    /// `rtlpriv->sec.use_sw_sec`.
+    pub use_sw_sec: bool,
+    /// `rtlpriv->sec.use_defaultkey`.
+    pub use_defaultkey: bool,
+}
+
+impl HwSecurity {
+    /// The `REG_SECCFG` value, or `None` when software crypto leaves
+    /// hardware encryption closed: either software-crypto flag
+    /// returns before any write, so `REG_SECCFG` stays 0 (the
+    /// in-tree station behaviour, [`station_identity`]). Otherwise
+    /// TX/RX encryption enable plus the broadcast-key bits, with the
+    /// default-key bits when a default key is in use.
+    pub fn seccfg(self) -> Option<u8> {
+        if self.sw_crypto || self.use_sw_sec {
+            return None;
+        }
+        let mut value = SCR_TXENCENABLE | SCR_RXENCENABLE | SCR_RXBCUSEDK | SCR_TXBCUSEDK;
+        if self.use_defaultkey {
+            value |= SCR_TXUSEDK | SCR_RXUSEDK;
+        }
+        Some(value)
+    }
+}
+
+/// `rtl92de_enable_hw_security_config`: with hardware security the
+/// `REG_CR + 1` byte is `0x02` and `REG_SECCFG` takes
+/// [`HwSecurity::seccfg`]; with software crypto nothing is written.
+pub fn enable_hw_security_config(io: &impl Io, sec: HwSecurity) -> Result<(), Error> {
+    let Some(value) = sec.seccfg() else {
+        return Ok(());
+    };
+    w8(io, REG_CR + 1, 0x02)?;
+    byte(io, REG_SECCFG, value)?;
+    Ok(())
 }
 
 /// `rtl92de_enable_interrupt` / `rtl92de_disable_interrupt`
