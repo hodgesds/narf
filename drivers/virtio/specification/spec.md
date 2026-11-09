@@ -120,10 +120,19 @@ memory-window ownership and do not use this control-register path.
   advertisement is honest (#841). A device that does not offer flush is
   treated as write-through, and a non-S_OK flush status surfaces as an
   error rather than silent success.
-  The sync write adapter handles the complete `n_blocks` range, validating
-  buffer length and LBA arithmetic before submitting each sector through
-  the existing polled primitive. Multi-sector filesystem or encrypted writes
-  must not be rejected as `BufferTooSmall` merely because they span one LBA.
+  `BlockDeviceSync::capacity` reads the mandatory device configuration's
+  64-bit capacity in 512-byte sectors, bracketing the two word reads with
+  `config_generation` to avoid torn resize snapshots. Missing/truncated
+  configuration refuses probe; an unprobed controller or a configuration
+  that changes throughout eight bounded samples reports unknown capacity
+  (`0`). Filesystem adapters receive this capacity through `SyncBlock`.
+  `VirtioBlkPci::write_sectors(sector, data)` accepts a nonempty, sector-aligned
+  payload of up to `u16::MAX` sectors and sends it as one descriptor chain,
+  retaining one contiguous DMA allocation through terminal completion. The
+  sync adapter accepts multi-sector writes, validates buffer length and range
+  overflow, and treats zero-sector writes as no-ops. It does not split a
+  Btrfs metadata node into independent sector writes; `write_sector` delegates
+  to the same request path.
 - VirtIO sound PCI queries PCM_INFO for every stream and registers the
   first viable output stream as playback device 0 and, when the device
   reports one, the first viable input stream as capture device 0 with

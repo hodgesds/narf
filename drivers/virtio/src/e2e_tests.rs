@@ -1146,6 +1146,69 @@ kernel_test_in!(
     smoke_e2e_blk_live_block_device_registered
 );
 
+/// Filesystems must see the actual device size, and its last sector must be
+/// addressable. The historical zero-capacity stub makes Btrfs reject mount.
+fn smoke_e2e_blk_live_capacity_last_sector() -> TestResult {
+    if !crate::blk_pci::is_probed() {
+        return TestResult::Skip("no virtio-blk-pci device");
+    }
+    let Some(device) = narf_block::find_block_device("vblk0") else {
+        return TestResult::Fail("probed virtio block device missing from registry");
+    };
+    let sectors = device.capacity();
+    if sectors == 0 || device.lba_size() != 512 {
+        return TestResult::Fail("virtio block capacity must be nonzero 512-byte sectors");
+    }
+    let mut data = [0u8; 512];
+    if device.read(sectors - 1, 1, &mut data).is_err() {
+        return TestResult::Fail("last advertised virtio block sector is unreadable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/e2e",
+    smoke_e2e_blk_live_capacity_last_sector
+);
+
+/// A 16 KiB node must fit in one sync write. Preserve and restore the test
+/// disk's tail, and check both neighboring sectors for overruns.
+fn smoke_e2e_blk_live_multisector_write() -> TestResult {
+    if !crate::blk_pci::is_probed() {
+        return TestResult::Skip("no virtio-blk-pci device");
+    }
+    let Some(device) = narf_block::find_block_device("vblk0") else {
+        return TestResult::Fail("probed virtio block device missing from registry");
+    };
+    let sectors = device.capacity();
+    if sectors < 34 {
+        return TestResult::Fail("virtio block disk too small for multi-sector regression");
+    }
+    let start = sectors - 34;
+    let mut original = alloc::vec![0u8; 34 * 512];
+    if device.read(start, 34, &mut original).is_err() {
+        return TestResult::Fail("cannot preserve multi-sector test range");
+    }
+    let mut expected = original.clone();
+    for (i, byte) in expected[512..33 * 512].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(0x5b) ^ ((i >> 9) as u8) ^ 0xc3;
+    }
+    let wrote = device.write(start + 1, 32, &expected[512..33 * 512]);
+    let flushed = device.flush();
+    let mut actual = alloc::vec![0u8; 34 * 512];
+    let read = device.read(start, 34, &mut actual);
+    // Restore even on failure: an I/O error need not mean nothing was written.
+    let restored = device.write(start, 34, &original);
+    let restore_flush = device.flush();
+    if restored.is_err() || restore_flush.is_err() {
+        return TestResult::Fail("cannot restore multi-sector test range");
+    }
+    if wrote.is_err() || flushed.is_err() || read.is_err() || actual != expected {
+        return TestResult::Fail("multi-sector write/read or neighboring-sector check failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/e2e", smoke_e2e_blk_live_multisector_write);
+
 /// Smoke 19 — virtio-net `CONTROLLERS` lock is NOT held across the
 /// `with_at` / `with_controller` closure (re-entrancy deadlock regression).
 ///

@@ -42,6 +42,17 @@ build orchestration (`build/`), release sign-off (`process/`).
 
 ## 3. Test taxonomy
 
+`verification/fs-linux-sweep/run.py` provides opt-in x86_64 filesystem
+diagnostics against Linux with identical static userspace workloads and seeded
+ext2/ext4/Btrfs images. Its default invocation fails closed with structured
+`PreconditionFailed`; `--diagnostic` permits bounded functional runs that
+retain raw timings but emit no performance record. Every guest uses a disposable
+image copy. Guest completion, per-case data verification, read-only Linux
+filesystem checks and independently extracted persistent content must all pass
+for that combination to pass. This diagnostic tool does not satisfy or replace
+the controlled-run and statistical protocol in §8. Workload details, mount
+differences and CLI usage live in `verification/fs-linux-sweep/README.md`.
+
 Wi-Fi and GPU implementations and maintained validation execute native Rust.
 They do not extract Linux/Mesa C functions, compile C shims, slice Rust source
 into temporary adapters, or invoke Python/compiler wrappers for comparisons.

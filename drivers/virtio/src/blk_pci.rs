@@ -14,10 +14,10 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion, CC_DEVICE_FEATURE,
-    CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS, CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
-    CC_NUM_QUEUES, CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
-    CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
+    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion, CC_CONFIG_GENERATION,
+    CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS, CC_DRIVER_FEATURE,
+    CC_DRIVER_FEATURE_SELECT, CC_NUM_QUEUES, CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER,
+    CC_QUEUE_ENABLE, CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
 use crate::queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_WRITE};
 use crate::{
@@ -56,6 +56,77 @@ pub const MAX_READ_SECTORS: u16 = 8;
 
 /// virtio-blk completion status.
 pub const VIRTIO_BLK_S_OK: u8 = 0;
+
+/// A bounded configuration snapshot, not a device-completion wait. Continual
+/// config changes leave capacity unknown instead of publishing a torn value.
+fn stable_capacity(mut sample: impl FnMut() -> (u8, u32, u32, u8)) -> Option<u64> {
+    for _ in 0..8 {
+        let (before, low, high, after) = sample();
+        if before == after {
+            return Some(u64::from(low) | (u64::from(high) << 32));
+        }
+    }
+    None
+}
+
+mod capacity_tests {
+    use super::stable_capacity;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_blk_pci_capacity_64bit_sectors() -> TestResult {
+        // Do not scale by a block-size feature or truncate the high word.
+        if stable_capacity(|| (7, 0x1234_5678, 2, 7)) != Some(0x2_1234_5678)
+            || stable_capacity(|| (0, 0, 0, 0)) != Some(0)
+        {
+            return TestResult::Fail("block capacity lost its sector units or high word");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/virtio", smoke_blk_pci_capacity_64bit_sectors);
+
+    fn smoke_blk_pci_capacity_resize_retry() -> TestResult {
+        let mut reads = 0;
+        let capacity = stable_capacity(|| {
+            reads += 1;
+            if reads == 1 {
+                (254, u32::MAX, 2, 255) // resize crossed the two word reads
+            } else {
+                (255, 0, 3, 255)
+            }
+        });
+        if capacity != Some(0x3_0000_0000) || reads != 2 {
+            return TestResult::Fail("block capacity accepted a torn resize snapshot");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/virtio", smoke_blk_pci_capacity_resize_retry);
+
+    fn smoke_blk_pci_capacity_unstable_bounded() -> TestResult {
+        let mut reads = 0;
+        let capacity = stable_capacity(|| {
+            reads += 1;
+            (255, 0, 1, 0) // generation wrap is still a changed snapshot
+        });
+        if capacity.is_some() || reads != 8 {
+            return TestResult::Fail("unstable block config was accepted or retried without bound");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/virtio", smoke_blk_pci_capacity_unstable_bounded);
+
+    fn smoke_blk_pci_sync_write_bounds() -> TestResult {
+        use narf_block::{BlockDeviceSync, BlockIoError};
+        let device = super::VirtioBlkBlockSync;
+        if device.write(u64::MAX, 0, &[]) != Ok(())
+            || device.write(0, 2, &[0; 512]) != Err(BlockIoError::BufferTooSmall)
+            || device.write(u64::MAX, 1, &[0; 512]) != Err(BlockIoError::OutOfRange)
+        {
+            return TestResult::Fail("sync block write bounds/no-op contract changed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/virtio", smoke_blk_pci_sync_write_bounds);
+}
 
 // Written only after a request has already failed to complete for one second,
 // then read by the feature-gated fatal stall watchdog. Keeping diagnostics off
@@ -99,6 +170,8 @@ struct BlkHeader {
 /// header/status pool.
 pub struct VirtioBlkPci {
     common: VirtioRegion,
+    /// Mandatory block configuration; capacity is always in 512-byte sectors.
+    device_cfg: VirtioRegion,
     notify: VirtioRegion,
     /// `notify_off_multiplier` from the Notify cap header.
     notify_off_multiplier: u32,
@@ -160,6 +233,15 @@ impl VirtioBlkPci {
         // SAFETY: same.
         let notify = unsafe { map_cap(device, &caps.notify) }?;
         let notify_off_multiplier = caps.notify.notify_off_multiplier;
+        let device_cap = caps
+            .device_cfg
+            .as_ref()
+            .ok_or(VirtioPciError::NoVendorCap)?;
+        // SAFETY: caller owns the device; map_cap validates the BAR window.
+        let device_cfg = unsafe { map_cap(device, device_cap) }?;
+        if device_cfg.length < 8 || common.length <= CC_CONFIG_GENERATION {
+            return Err(VirtioPciError::InvalidArgument);
+        }
 
         // 3. Reset device.
         // SAFETY: identity-mapped MMIO.
@@ -286,6 +368,7 @@ impl VirtioBlkPci {
 
         Ok(Self {
             common,
+            device_cfg,
             notify,
             notify_off_multiplier,
             queue: IrqSafeSpinLock::new(Some(queue)),
@@ -298,6 +381,26 @@ impl VirtioBlkPci {
             ready: true,
             flush_supported,
         })
+    }
+
+    /// VirtIO 1.2 §5.2.4: the first little-endian u64 in block config is
+    /// capacity in 512-byte sectors, independent of optional block-size fields.
+    /// Bracket both halves with config_generation so a resize cannot tear it.
+    fn capacity_sectors(&self) -> u64 {
+        stable_capacity(|| {
+            // SAFETY: bring_up checks the generation byte and both capacity
+            // halves fit their mapped regions; the installed request gate
+            // keeps the controller reference exclusive during this read.
+            unsafe {
+                let before = self.common.read8(CC_CONFIG_GENERATION);
+                let low = self.device_cfg.read32(0);
+                let high = self.device_cfg.read32(4);
+                compiler_fence(Ordering::Acquire);
+                let after = self.common.read8(CC_CONFIG_GENERATION);
+                (before, low, high, after)
+            }
+        })
+        .unwrap_or(0)
     }
 
     /// Switch the controller to MSI-X-driven completion. Walks the
@@ -356,6 +459,20 @@ impl VirtioBlkPci {
 
     /// Issue a single 512-byte write at `sector`. Polled.
     pub fn write_sector(&self, sector: u64, data: &[u8; 512]) -> Result<(), VirtioPciError> {
+        self.write_sectors(sector, data)
+    }
+
+    /// Write a contiguous sector range with one descriptor chain. In
+    /// particular, a filesystem metadata node must not be split into separate
+    /// 512-byte commands. The request owns its DMA payload until completion.
+    pub fn write_sectors(&self, sector: u64, data: &[u8]) -> Result<(), VirtioPciError> {
+        if data.is_empty()
+            || data.len() % 512 != 0
+            || data.len() / 512 > u16::MAX as usize
+            || sector.checked_add((data.len() / 512) as u64).is_none()
+        {
+            return Err(VirtioPciError::InvalidArgument);
+        }
         // Build header into the per-request pool slot 0.
         let pool_phys = self.pool.dma_addr().raw();
         let header_phys = pool_phys;
@@ -375,12 +492,11 @@ impl VirtioBlkPci {
                 0xFFu8,
             );
         }
-        // Stage the payload into a fresh DMA page.
-        let payload =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+        // Stage the complete request into one contiguous DMA allocation.
+        let payload = alloc_coherent(data.len().max(4096), DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
         let payload_phys = payload.dma_addr().raw();
-        // SAFETY: page-sized DMA buffer; fill the first 512 bytes
-        // with the caller's data.
+        // SAFETY: the DMA allocation covers the complete caller payload.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, &byte) in data.iter().enumerate() {
@@ -397,7 +513,7 @@ impl VirtioBlkPci {
             },
             VirtqDesc {
                 addr: payload_phys,
-                len: 512,
+                len: data.len() as u32,
                 flags: 0,
                 next: 0,
             },
@@ -1403,8 +1519,10 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         512
     }
     fn capacity(&self) -> u64 {
-        0
-    } // Stage-4 stub — capacity from device cfg lands later.
+        probed_device()
+            .map(|(_gate, device)| device.capacity_sectors())
+            .unwrap_or(0)
+    }
     fn read(
         &self,
         lba: u64,
@@ -1451,25 +1569,20 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         }
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
-        let required = usize::from(n_blocks) * 512;
-        if data.len() < required {
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        let need = n_blocks as usize * 512;
+        if data.len() < need {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        // Same reasoning as `read` above.
-        let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         if lba.checked_add(u64::from(n_blocks)).is_none() {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        // The synchronous sector primitive is polled; batching at this layer
-        // must preserve every sector of an ordinary BlockDeviceSync request.
-        // Btrfs metadata and encrypted adapters routinely write multiple LBAs.
-        for (offset, sector) in data[..required].chunks_exact(512).enumerate() {
-            let mut buf = [0u8; 512];
-            buf.copy_from_slice(sector);
-            dev.write_sector(lba + offset as u64, &buf)
-                .map_err(|_| narf_block::BlockIoError::DriverError)?;
-        }
-        Ok(())
+        // Same reasoning as `read` above.
+        let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        dev.write_sectors(lba, &data[..need])
+            .map_err(|_| narf_block::BlockIoError::DriverError)
     }
     /// Drain the device write cache via T_FLUSH when negotiated
     /// (#841). A failed flush surfaces as `DriverError`, never as

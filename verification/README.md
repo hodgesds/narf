@@ -6,3 +6,5 @@ targets (cap table, IPC ring parsers), optional Kani proofs on TCB code.
 - Spec: [`specification/spec.md`](./specification/spec.md)
 - Research: [`research/README.md`](./research/README.md)
 - Stage: 1 (harness) → 4 (full matrix + fuzzing).
+- Filesystem comparison diagnostics: [`fs-linux-sweep/README.md`](./fs-linux-sweep/README.md)
+  (ext2/ext4/Btrfs, disposable QEMU images, independent Linux integrity checks).
