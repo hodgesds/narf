@@ -468,19 +468,36 @@ fn stop_and_pm() -> Result<(), &'static str> {
     b.bus.d3_ack(true);
     run(Endpoint::suspend(&*b.device))
         .map_err(|_| "monitor actual native filter0 and D3 suspend")?;
-    if b.bus.dma_enabled()
-        || b.device.monitor_deliver(copies)
-        || narf_net::iface::lookup(&b.name).is_some_and(|i| i.carrier)
-    {
-        return Err("monitor system suspend retained old capture/token authority");
+    // D3 suspend retires the old capture/token authority and the carrier,
+    // but retains DMA by design: Linux `brcmf_pcie_pm_enter_D3` touches
+    // neither BME nor the rings (the bus only goes DOWN; the D3 ack is the
+    // firmware's promise its DMA engines stopped), and NARF `brcmfmac.md`
+    // "System suspend" keeps the rings retained for the hot `leave_d3`
+    // resume; BME is cleared only by the confirmed stop
+    // (`Runtime::quiesce`, removal/reset). The monitor arm converges on
+    // the same `suspend_transport`/`enter_d3` as AP/station, and nothing
+    // in `monitor_suspend` parks DMA. The station D3/D0 smoke asserts
+    // the same retention (`dma.len()` unchanged, `dropped == 0`).
+    if b.device.monitor_deliver(copies) {
+        return Err("monitor system suspend replayed old capture");
+    }
+    if narf_net::iface::lookup(&b.name).is_some_and(|i| i.carrier) {
+        return Err("monitor system suspend left carrier up");
+    }
+    if !b.bus.dma_enabled() {
+        return Err("monitor system suspend freed DMA rings (D3 retains rings/BME)");
     }
     b.bus.d0_alive();
     run(Endpoint::resume(&*b.device)).map_err(|_| "monitor actual D0 hot receipt")?;
     run(b.device.monitor_worker());
-    if b.bus.monitor_change(|p| p.mode) != 0
-        || narf_net::iface::lookup(&b.name).is_some_and(|i| i.carrier)
-    {
+    if b.bus.monitor_change(|p| p.mode) != 0 {
         return Err("monitor resume replayed old receiver/format activation without new UP");
+    }
+    if narf_net::iface::lookup(&b.name).is_some_and(|i| i.carrier) {
+        return Err("monitor resume re-raised carrier without new UP");
+    }
+    if !b.bus.dma_enabled() {
+        return Err("monitor hot resume lost DMA rings");
     }
     b.admin
         .set_link(false)
