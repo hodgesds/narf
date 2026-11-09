@@ -948,6 +948,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-boot-protocol"
+version = "0.0.0"
+
+[[package]]
 name = "narf-bpf"
 version = "0.0.0"
 dependencies = [
@@ -2932,10 +2936,14 @@ dependencies = [
  "narf-block",
  "narf-boot",
  "narf-capabilities",
+ "narf-console",
  "narf-filesystem",
  "narf-init",
+ "narf-input",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
+ "narf-time",
  "zeroize",
 ]
 
@@ -4331,6 +4339,7 @@ dependencies = [
  "blake3",
  "clap",
  "ed25519-dalek",
+ "narf-boot-protocol",
  "proc-macro2",
  "quinn",
  "rcgen",

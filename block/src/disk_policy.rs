@@ -548,6 +548,25 @@ fn revoke(reason: &str) {
 /// identity metadata, and the device itself; see [`PolicyError`] for every
 /// refusal. Succeeds at most once per boot.
 pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), PolicyError> {
+    designate_root_inner(device_name, fs_uuid, None)
+}
+
+/// Designate a LUKS container by its outer UUID. The read-write policy also
+/// verifies that its authenticated decrypted view contains btrfs, while the
+/// original partition identity and uniqueness checks remain in force.
+pub fn designate_encrypted_root(
+    device_name: &str,
+    container_uuid: [u8; 16],
+    view: &crate::encrypted::EncryptedBlockDevice,
+) -> Result<(), PolicyError> {
+    designate_root_inner(device_name, container_uuid, Some(view))
+}
+
+fn designate_root_inner(
+    device_name: &str,
+    fs_uuid: [u8; 16],
+    view: Option<&crate::encrypted::EncryptedBlockDevice>,
+) -> Result<(), PolicyError> {
     let policy = policy();
     if !policy.is_root_policy() {
         return Err(PolicyError::NotRootPolicy);
@@ -568,6 +587,9 @@ pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), Policy
         .find(|e| e.name == device_name)
         .ok_or(PolicyError::NoSuchDevice)?;
     let meta = entry.partition.as_ref().ok_or(PolicyError::NotAPartition)?;
+    if view.is_some_and(|view| !view.wraps(&entry.dev)) {
+        return Err(PolicyError::IdentityMismatch);
+    }
     if parse_uuid(&meta.fs_uuid) != Some(fs_uuid) {
         return Err(PolicyError::IdentityMismatch);
     }
@@ -581,11 +603,13 @@ pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), Policy
     if meta.is_efi_system_partition() || entry_is_vfat(entry) {
         return Err(PolicyError::EfiOrVfat);
     }
+    let root_is_btrfs = if let Some(view) = view {
+        crate::fs_detect::detect_filesystem_sync(view)
+    } else {
+        crate::fs_detect::detect_filesystem(&entry.dev)
+    };
     if policy == DiskPolicy::RootRw
-        && !matches!(
-            crate::fs_detect::detect_filesystem(&entry.dev),
-            Ok(Some(crate::fs_detect::FsType::Btrfs))
-        )
+        && !matches!(root_is_btrfs, Ok(Some(crate::fs_detect::FsType::Btrfs)))
     {
         return Err(PolicyError::NotBtrfs);
     }
@@ -627,9 +651,14 @@ pub fn designate_root(device_name: &str, fs_uuid: [u8; 16]) -> Result<(), Policy
         return Err(PolicyError::Ambiguous);
     }
     let uuid = format_uuid_bytes(&fs_uuid);
+    let identity_kind = if view.is_some() {
+        "LUKS container"
+    } else {
+        "btrfs"
+    };
     framed(&match policy {
         DiskPolicy::RootRw => alloc::format!(
-            "disks: WRITABLE: {} (btrfs UUID {uuid}) is the ONLY writable device \
+            "disks: WRITABLE: {} ({identity_kind} UUID {uuid}) is the ONLY writable device \
              (narf.disks=root-rw); every other disk and partition is read-only",
             entry.name
         ),
@@ -731,7 +760,7 @@ pub fn automount_allowed(device_name: &str) -> bool {
                             .as_ref()
                             .is_some_and(|meta| parse_uuid(&meta.fs_uuid) == want)
                 }
-                Some(d) if d.dev == entry.dev_id => true,
+                Some(d) if d.dev == entry.dev_id || entry.write_parent == Some(d.dev) => true,
                 // Same physical disk: the registry's disk id (a partition
                 // inherits its parent's) and, when the transport reports one,
                 // the same hardware identity (PCI path, serial, namespace).
@@ -754,8 +783,11 @@ pub fn write_allowed(device_name: &str) -> bool {
         DiskPolicy::RootRo => {
             entry_named(device_name).is_some_and(|e| log_stick_writable(e.dev_id))
         }
-        DiskPolicy::RootRw => entry_named(device_name)
-            .is_some_and(|e| dev_writable(e.dev_id) || log_stick_writable(e.dev_id)),
+        DiskPolicy::RootRw => entry_named(device_name).is_some_and(|e| {
+            dev_writable(e.dev_id)
+                || e.write_parent.is_some_and(dev_writable)
+                || log_stick_writable(e.dev_id)
+        }),
     }
 }
 
@@ -780,6 +812,7 @@ pub struct PolicyGuard {
     dev: DevId,
     inner: Arc<dyn BlockDeviceSync>,
     warned: AtomicBool,
+    pub(crate) write_parent: Option<DevId>,
 }
 
 impl core::fmt::Debug for PolicyGuard {
@@ -801,6 +834,7 @@ impl PolicyGuard {
             dev: new_dev_id(),
             inner,
             warned: AtomicBool::new(false),
+            write_parent: None,
         }
     }
 
@@ -819,7 +853,11 @@ impl PolicyGuard {
             DiskPolicy::All => true,
             DiskPolicy::BootOnly => disk_trusted(self.disk),
             DiskPolicy::RootRo => log_stick_writable(self.dev),
-            DiskPolicy::RootRw => dev_writable(self.dev) || log_stick_writable(self.dev),
+            DiskPolicy::RootRw => {
+                dev_writable(self.dev)
+                    || self.write_parent.is_some_and(dev_writable)
+                    || log_stick_writable(self.dev)
+            }
         }
     }
 }

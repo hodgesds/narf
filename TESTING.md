@@ -14,6 +14,10 @@ QEMU boot to a full real-hardware install on a Renoir-class laptop.
 | btrfs root-rw harness on the host (no QEMU, ~1–2 min) | `cargo xtask btrfs-host-rw [--seeds N --ops N --cuts N --exhaustive]` |
 | Build a bootable ISO | `cargo xtask image --arch=x86_64` |
 | ISO + boot under OVMF UEFI | `cargo xtask iso-boot --arch=x86_64` |
+| Build a self-contained EFI application without Limine | `cargo xtask efi-image` |
+| Native EFI + clean shutdown under OVMF | `cargo xtask efi-image --smoke` |
+| Native EFI + serial login/shell | `cargo xtask efi-image --run` |
+| NVMe regression with no controller installed | `cargo xtask test --arch=x86_64 --hw-profile=minimal --subsystem drivers/nvme` |
 | Installed x86_64 UEFI package | `packaging/test-uefi-boot.sh` |
 | Installed aarch64 UEFI package | `packaging/test-aarch64-package-boot.sh` |
 | Enforced Secure Boot + tamper rejection | `packaging/test-secure-boot.sh` |
@@ -21,8 +25,10 @@ QEMU boot to a full real-hardware install on a Renoir-class laptop.
 | Burn ISO to USB stick | `sudo cargo xtask disk-write --device /dev/sdX` |
 | Lay down GPT + ESP + ext4 install | `sudo cargo xtask disk-write-partitioned --device /dev/sdX --yes` |
 
-Every command takes `--arch=aarch64` instead of `--arch=x86_64` if you
-want to exercise the ARM path.
+Kernel build/test and the established UEFI image paths also accept
+`--arch=aarch64`. The self-contained `efi-image` command and interactive
+userspace currently support x86_64. See [native EFI](docs/NATIVE_UEFI.md)
+for artifact layout, installation, configuration, and current limits.
 
 ## Prerequisites
 
@@ -486,3 +492,13 @@ cargo xtask boot-smoke --arch=aarch64
 The boot-smoke phase is the load-bearing check — it catches the
 class of regression that smokes can't see because they exercise
 modules in isolation rather than the full init flow.
+
+Native EFI package acceptance uses `packaging/test-secure-boot.sh` (enforcing
+OVMF, signed image, unsigned and three embedded-payload rejection cases) and
+`packaging/test-native-luks.py` (cryptsetup LUKS1/LUKS2, unlock/retry/cancel/
+timeout and writable btrfs interoperability). Commands and dependencies are
+in [native EFI](docs/NATIVE_UEFI.md). These tests use temporary files and do not
+require host mounts, device-mapper, or an installed host bootloader. GRUB
+chainload compatibility is a separate optional test requiring existing tools;
+it is not a dependency of direct NARF EFI boot. Physical acceptance follows
+[the hardware procedure](docs/NATIVE_UEFI_HARDWARE.md).
