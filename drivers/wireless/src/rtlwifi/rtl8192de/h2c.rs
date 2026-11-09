@@ -20,10 +20,10 @@
 //!   `RT_MEDIA_DISCONNECT`).
 //!
 //! Not this step: the H2C rate-mask send
-//! (`rtl92d_update_hal_rate_mask`, multi-station rate-id / MAC-id),
-//! the power-mode command (`rtl92d_set_fw_pwrmode_cmd`, LPS) and the
-//! reserved-page packet (`rtl92d_set_fw_rsvdpagepkt`) — all later
-//! steps.
+//! (`rtl92d_update_hal_rate_mask`, multi-station rate-id / MAC-id) and
+//! the power-mode command (`rtl92d_set_fw_pwrmode_cmd`, LPS) — later
+//! steps. The reserved-page packet (`rtl92d_set_fw_rsvdpagepkt`) lives
+//! in [`super::rsvd_page`].
 
 use crate::rtlwifi::firmware_transport::Io;
 use crate::rtlwifi::prepare::Error;
@@ -35,6 +35,9 @@ pub const REG_HMEBOX_0: u16 = 0x01d0;
 
 /// `enum rtl_h2c_cmd` (`wifi.h`).
 pub const H2C_JOINBSSRPT: u8 = 2;
+
+/// `H2C_RSVDPAGE` (`wifi.h` `enum rtl8192c_h2c_cmd`).
+pub const H2C_RSVDPAGE: u8 = 3;
 
 /// `RT_MEDIA_CONNECT` / `RT_MEDIA_DISCONNECT`.
 pub const MEDIA_CONNECT: u8 = 1;

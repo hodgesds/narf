@@ -34,9 +34,9 @@
 //!   register write results — [`acm_ctrl`] is the direct
 //!   `HW_VAR_ACM_CTRL` write.
 //! - `HW_VAR_H2C_FW_JOINBSSRPT`: the `REG_CR + 1` / `REG_BCN_CTRL` /
-//!   `REG_FWHW_TXQ_CTRL + 2` dance and the join-bss H2C command. The
-//!   `rtl92d_set_fw_rsvdpagepkt(hw, 0)` step is a remainder: the
-//!   reserved-page packet needs the TX packet path of a later step.
+//!   `REG_FWHW_TXQ_CTRL + 2` dance, the reserved-page packet upload
+//!   ([`super::rsvd_page::set_fw_rsvdpagepkt`]) between the two beacon
+//!   halves, and the join-bss H2C command.
 //! - `rtl92d_set_qos` is `rtl92d_dm_init_edca_turbo` only (software
 //!   state; [`edca_turbo_init`]); the `REG_EDCA_BE_PARAM` turbo write
 //!   lives in the DM watchdog (`rtl92d_dm_check_edca_turbo`), a later
@@ -590,11 +590,12 @@ pub fn resume(io: &impl Io, saved: u8) -> Result<(), Error> {
 /// `HW_VAR_H2C_FW_JOINBSSRPT` (`rtl92de_set_hw_reg`) + the join-bss
 /// H2C command. On connect: the AID write, `REG_CR + 1` BIT(0),
 /// `REG_BCN_CTRL` BIT(3) clear / BIT(4) set, `REG_FWHW_TXQ_CTRL + 2`
-/// BIT(6) clear (restored afterwards when it was set), then BIT(3)
-/// set / BIT(4) clear and `REG_CR + 1` BIT(0) clear. The
-/// `rtl92d_set_fw_rsvdpagepkt(hw, 0)` step between the two beacon
-/// halves is a remainder (reserved-page packet construction belongs to
-/// a later step); the H2C report is still sent.
+/// BIT(6) clear (restored afterwards when it was set), then the
+/// reserved-page packet upload ([`super::rsvd_page::set_fw_rsvdpagepkt`]:
+/// patched pages into the caller's buffer, beacon descriptor 0, the
+/// beacon doorbell, the `H2C_RSVDPAGE` location command), then BIT(3)
+/// set / BIT(4) clear and `REG_CR + 1` BIT(0) clear. The H2C report is
+/// sent after the upload.
 pub async fn join_bss_report(
     io: &impl Io,
     mailbox: &mut Mailbox,
@@ -602,6 +603,7 @@ pub async fn join_bss_report(
     assoc_id: u16,
     mstatus: u8,
     rf_on: bool,
+    upload: super::rsvd_page::Upload<'_>,
 ) -> Result<(), Error> {
     if mstatus == h2c::MEDIA_CONNECT {
         set_aid(io, assoc_id)?;
@@ -612,7 +614,7 @@ pub async fn join_bss_report(
         let tmp_reg422 = io.read8(REG_FWHW_TXQ_CTRL + 2)?;
         let recover = tmp_reg422 & (1 << 6) != 0;
         io.write8(REG_FWHW_TXQ_CTRL + 2, tmp_reg422 & !(1 << 6))?;
-        // Remainder: rtl92d_set_fw_rsvdpagepkt(hw, 0).
+        super::rsvd_page::set_fw_rsvdpagepkt(io, mailbox, upload, assoc_id, rf_on).await?;
         bcn.set(io, 1 << 3, 0)?;
         bcn.set(io, 0, 1 << 4)?;
         if recover {

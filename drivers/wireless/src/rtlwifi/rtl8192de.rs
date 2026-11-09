@@ -12,7 +12,8 @@
 //! descriptors ([`trx`]) and the packet owner ([`packet`]). Step 3 adds
 //! the power-on sequence ([`power`]), the LLT ([`llt`]) and MAC init
 //! ([`mac`]). Step 4 adds the station chains ([`station`], the rate
-//! table [`rate`], the H2C mailbox [`h2c`]), bands/HT/QoS/lifecycle
+//! table [`rate`], the H2C mailbox [`h2c`], the reserved-page packet
+//! [`rsvd_page`]), bands/HT/QoS/lifecycle
 //! ([`channel`], [`lifecycle`]), the TX-power levels ([`txpower`]) and
 //! the DE factory table ([`phy::PgStore`]) plus the BB/RF access they
 //! need ([`phy`]). Step 5 adds the 5 GHz envelope rows (NAPC v3) and
@@ -72,6 +73,7 @@ pub mod packet;
 pub mod phy;
 pub mod power;
 pub mod rate;
+pub mod rsvd_page;
 pub mod station;
 pub mod tables;
 pub mod trx;
