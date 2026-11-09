@@ -30,13 +30,43 @@
 //!   and advances `pwrgroup_cnt` when index 13
 //!   (`RTXAGC_B_MCS15_MCS12`) lands. A group index past
 //!   `MAX_PG_GROUP` (Linux would overrun the array) is refused.
+//! - `rtl92d_phy_mac_config` (`rtl8192d/phy.c`): the `MAC_2T`
+//!   byte-walk, then `REG_MAX_AGGR_NUM` (`0x04ca`) `0x0b` on a
+//!   single-MAC part / `0x07` on a dual-MAC part.
+//! - `rtl92d_phy_bb_config` (`rtl8192d/phy.c`): `SYS_FUNC_EN`
+//!   `BIT(13) | BIT(0) | BIT(1)`, `AFE_PLL_CTRL` `0x83` / `0xdb`,
+//!   `RF_CTRL` `RF_EN | RF_RSTB | RF_SDMRSTB`, `SYS_FUNC_EN`
+//!   `FEN_PPLL | FEN_PCIEA | FEN_DIO_PCIE | FEN_BB_GLB_RSTN |
+//!   FEN_BBRSTB`, `AFE_XTAL_CTRL+1` `0x80`, `LEDCFG0` `BIT(23)`
+//!   unless `IS_92D_SINGLEPHY` — which is the RF type, not the
+//!   MAC/PHY mode: the macro is true exactly for `RF_2T2R`
+//!   (`rtl8192de/def.h`), so the LED bit is set on 1T parts only —
+//!   then the `PHY_REG` walk (`set_bbreg` `MASKDWORD` + `udelay(1)`),
+//!   the PG walk unless autoload failed, and the AGC walk — `AGCTAB`
+//!   on MAC0, or `AGCTAB_2G` / `AGCTAB_5G` on MAC1 by band —
+//!   returning `cck_high_power`, the `RFPGA0_XA_HSSIPARAMETER2`
+//!   `0x200` bit.
+//! - `rtl92d_phy_rf6052_config` (`rtl8192de/rf.c`): 1 path on
+//!   `RF_1T1R`, 2 otherwise; dual-dual branches load the other
+//!   MAC's radio table over DBI first (early-returning when the
+//!   other MAC already loaded it, or when the other PHY was just
+//!   powered up); interface 1 (MAC1, otherwise) loads only
+//!   `radio_b` on path A (`true_bpath`); otherwise A takes
+//!   `radioa` and B takes `radiob`, each under the RF-env
+//!   save/restore dance, with `rtl_rfreg_delay` per `(reg, val)`
+//!   pair. `rtl92d_phy_config_rf_with_headerfile` picks the
+//!   internal-PA table per path and swaps the DMDP radio tables
+//!   (`radiob_txt` on path A loads the `radio_b` table).
+//! - `rtl92d_phy_get_hw_reg_originalvalue` (`rtl8192d/phy.c`):
+//!   `initialgain[0..3]` from `ROFDM0_X{A,B,C,D}AGCCORE1` byte 0,
+//!   `framesync` from `ROFDM0_RXDETECTOR3` byte 0, `framesync_c34`
+//!   from `ROFDM0_RXDETECTOR2` as a dword.
 //!
-//! Not ported: the DBI-redirected `rtl92d_phy_set_bb_reg` (active only
-//! while `during_mac1init_radioa` / `during_mac0init_radiob`, i.e.
-//! inside `rtl92d_phy_rf6052_config`'s DMDP flow) and the RF table
-//! loads themselves — those belong to the PHY/BB/RF config lane.
+//! Not ported: `rtl92d_phy_lc_calibrate` (RF LC calibration, a
+//! follow-up lane) and the IQK reload (`rtl92d_phy_reset_iqk_result`
+//! is software-only; the IQK reload itself is a follow-up lane).
 
-use super::RfType;
+use super::{Band, MacPhyMode, RfType};
 use crate::rtlwifi::firmware_transport::Io;
 use crate::rtlwifi::prepare::Error;
 
@@ -69,6 +99,38 @@ pub const RFPGA0_XAB_RFPARAMETER: u16 = 0x0878;
 pub const RFPGA0_ANALOGPARAMETER2: u16 = 0x0884;
 pub const RFPGA0_ADDALLOCKEN: u16 = 0x0888;
 pub const RFPGA0_ANALOGPARAMETER4: u16 = 0x088c;
+pub const RFPGA0_XCD_RFPARAMETER: u16 = 0x087c;
+pub const ROFDM0_RXDETECTOR2: u16 = 0x0c34;
+pub const ROFDM0_RXDETECTOR3: u16 = 0x0c38;
+pub const ROFDM0_XAAGCCORE1: u16 = 0x0c50;
+pub const ROFDM0_XBAGCCORE1: u16 = 0x0c58;
+pub const ROFDM0_XCAGCCORE1: u16 = 0x0c60;
+pub const ROFDM0_XDAGCCORE1: u16 = 0x0c68;
+
+/// `REG_AFE_PLL_CTRL` (`rtl8192d/reg.h`).
+pub const REG_AFE_PLL_CTRL: u16 = 0x0028;
+/// `REG_RF_CTRL` (`rtl8192d/reg.h`).
+pub const REG_RF_CTRL: u16 = 0x001f;
+/// `REG_LEDCFG0` (`rtl8192d/reg.h`).
+pub const REG_LEDCFG0: u16 = 0x004c;
+/// `REG_MAX_AGGR_NUM` (`rtl8192d/reg.h`).
+pub const REG_MAX_AGGR_NUM: u16 = 0x04ca;
+
+/// `RF_EN` / `RF_RSTB` / `RF_SDMRSTB` (`rtl8192d/reg.h`).
+pub const RF_EN: u8 = 1 << 0;
+pub const RF_RSTB: u8 = 1 << 1;
+pub const RF_SDMRSTB: u8 = 1 << 2;
+
+/// `FEN_*` bits of `REG_SYS_FUNC_EN` (`rtl8192d/reg.h`).
+pub const FEN_BBRSTB: u8 = 1 << 0;
+pub const FEN_BB_GLB_RSTN: u8 = 1 << 1;
+pub const FEN_DIO_PCIE: u8 = 1 << 5;
+pub const FEN_PCIEA: u8 = 1 << 6;
+pub const FEN_PPLL: u8 = 1 << 7;
+
+/// `B3WIREADDRESSLENGTH` / `B3WIREDATALENGTH` (`rtl8192d/reg.h`).
+pub const B3WIREADDRESSLENGTH: u32 = 0x400;
+pub const B3WIREDATALENGTH: u32 = 0x800;
 pub const RFPGA1_RFMOD: u16 = 0x0900;
 pub const RCCK0_SYSTEM: u16 = 0x0a00;
 pub const ROFDM0_TRXPATHENABLE: u16 = 0x0c04;
@@ -391,4 +453,402 @@ pub async fn agc_table_walk(io: &impl Io, table: &[u32]) -> Result<(), Error> {
         io.delay_us(1).await;
     }
     Ok(())
+}
+
+// ── PHY/BB/RF config (`rtl92de_hw_init` tail) ──────────────────────────
+
+/// `rtl_addr_delay`: the `0xf9..=0xfe` RF-register addresses are
+/// delays, not writes (shared with the 92CE port).
+pub const fn addr_delay_us(addr: u32) -> u64 {
+    match addr {
+        0xfe => 50_000,
+        0xfd => 5_000,
+        0xfc => 1_000,
+        0xfb => 50,
+        0xfa => 5,
+        0xf9 => 1,
+        _ => 0,
+    }
+}
+
+/// Which function a BB register access targets. Linux's
+/// `rtl92d_phy_set_bb_reg` / `rtl92d_phy_query_bb_reg` redirect
+/// through DBI while `during_mac1init_radioa` /
+/// `during_mac0init_radiob` is set — i.e. inside
+/// `rtl92d_phy_rf6052_config`'s DMDP flow, when one function loads
+/// the other PHY's radio table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BbTarget {
+    /// The local function (no redirect).
+    Local,
+    /// MAC1 initialising radio A on PHY0 (`during_mac1init_radioa`):
+    /// DBI direct `BIT(3)`.
+    DbiMac1RadioA,
+    /// MAC0 initialising radio B on PHY1 (`during_mac0init_radiob`):
+    /// DBI direct `BIT(3) | BIT(2)`.
+    DbiMac0RadioB,
+}
+
+impl BbTarget {
+    const fn dbi_direct(self) -> u8 {
+        match self {
+            BbTarget::Local => 0,
+            BbTarget::DbiMac1RadioA => 1 << 3,
+            BbTarget::DbiMac0RadioB => (1 << 3) | (1 << 2),
+        }
+    }
+}
+
+/// `rtl92d_phy_set_bb_reg` for an explicit target (local MMIO, or a
+/// DBI write when the target is redirected).
+pub async fn set_bb_target(
+    io: &impl Io,
+    at: u16,
+    mask: u32,
+    value: u32,
+    target: BbTarget,
+) -> Result<(), Error> {
+    if target == BbTarget::Local {
+        return set_bb(io, at, mask, value);
+    }
+    let data = if mask == MASKDWORD {
+        value
+    } else {
+        let original = read_dword_dbi(io, at, target.dbi_direct()).await?;
+        (original & !mask) | (value << shift(mask))
+    };
+    write_dword_dbi(io, at, data, target.dbi_direct())
+}
+
+/// `rtl92d_phy_query_bb_reg` for an explicit target.
+pub async fn get_bb_target(
+    io: &impl Io,
+    at: u16,
+    mask: u32,
+    target: BbTarget,
+) -> Result<u32, Error> {
+    let original = if target == BbTarget::Local {
+        io.read32(at)?
+    } else {
+        read_dword_dbi(io, at, target.dbi_direct()).await?
+    };
+    Ok((original & mask) >> shift(mask))
+}
+
+/// `_rtl92d_phy_rf_serial_write` for an explicit target (a
+/// `MASKDWORD` BB write, so the target's local/DBI choice is the
+/// whole behaviour).
+pub fn rf_write_target(
+    io: &impl Io,
+    path: Path,
+    offset: u32,
+    data: u32,
+    target: BbTarget,
+) -> Result<(), Error> {
+    let word = ((offset << 20) | (data & 0x000f_ffff)) & 0x0fff_ffff;
+    // Synchronous: the DBI write has no settle delay.
+    match target {
+        BbTarget::Local => set_bb(io, path.regs().rf3wire_offset, MASKDWORD, word),
+        _ => write_dword_dbi(io, path.regs().rf3wire_offset, word, target.dbi_direct()),
+    }
+}
+
+/// `_rtl92d_phy_rf_serial_read` for an explicit target.
+pub async fn rf_read_target(
+    io: &impl Io,
+    path: Path,
+    offset: u32,
+    target: BbTarget,
+) -> Result<u32, Error> {
+    let regs = path.regs();
+    let tmplong = get_bb_target(io, RFPGA0_XA_HSSIPARAMETER2, MASKDWORD, target).await?;
+    let tmplong2 = if path == Path::A {
+        tmplong
+    } else {
+        get_bb_target(io, regs.rfhssi_para2, MASKDWORD, target).await?
+    };
+    let tmplong2 = (tmplong2 & !BLSSIREADADDRESS) | (offset << 23) | BLSSIREADEDGE;
+    set_bb_target(
+        io,
+        RFPGA0_XA_HSSIPARAMETER2,
+        MASKDWORD,
+        tmplong & !BLSSIREADEDGE,
+        target,
+    )
+    .await?;
+    io.delay_us(10).await;
+    set_bb_target(io, regs.rfhssi_para2, MASKDWORD, tmplong2, target).await?;
+    io.delay_us(100).await;
+    set_bb_target(
+        io,
+        RFPGA0_XA_HSSIPARAMETER2,
+        MASKDWORD,
+        tmplong | BLSSIREADEDGE,
+        target,
+    )
+    .await?;
+    io.delay_us(10).await;
+    let pi = get_bb_target(io, regs.rfhssi_para1, 1 << 8, target).await? != 0;
+    get_bb_target(
+        io,
+        if pi { regs.rf_rbpi } else { regs.rf_rb },
+        BLSSIREADBACKDATA,
+        target,
+    )
+    .await
+}
+
+/// `rtl92d_phy_set_rf_reg` for an explicit target.
+pub async fn set_rf_target(
+    io: &impl Io,
+    path: Path,
+    offset: u32,
+    mask: u32,
+    value: u32,
+    target: BbTarget,
+) -> Result<(), Error> {
+    if mask == 0 {
+        return Ok(());
+    }
+    let data = if mask == RFREG_OFFSET_MASK {
+        value
+    } else {
+        (rf_read_target(io, path, offset, target).await? & !mask) | (value << shift(mask))
+    };
+    rf_write_target(io, path, offset, data, target)
+}
+
+/// `rtl92d_phy_mac_config` (`rtl8192d/phy.c`): the `MAC_2T` table
+/// as byte writes, then `REG_MAX_AGGR_NUM` — `0x0b` on a
+/// single-MAC part, `0x07` otherwise (dual-MAC, including the
+/// never-selected dual-MAC-single-PHY mode).
+pub fn mac_config(io: &impl Io, mode: MacPhyMode) -> Result<(), Error> {
+    for pair in super::tables::MAC_2T.chunks_exact(2) {
+        let at = u16::try_from(pair[0]).map_err(|_| Error::Descriptor)?;
+        io.write8(at, pair[1] as u8)?;
+    }
+    let aggr = if mode == MacPhyMode::SingleMacSinglePhy {
+        0x0b
+    } else {
+        0x07
+    };
+    io.write8(REG_MAX_AGGR_NUM, aggr)?;
+    Ok(())
+}
+
+/// The `rtl92d_phy_bb_config` report: whether the CCK path runs at
+/// high power (`RFPGA0_XA_HSSIPARAMETER2` bit `0x200`), and the
+/// factory power-group store (absent when autoload failed, so the
+/// PG walk was skipped).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BbReport {
+    pub cck_high_power: bool,
+    pub pg: Option<PgStore>,
+}
+
+/// `rtl92d_phy_bb_config` (`rtl8192d/phy.c`).
+pub async fn bb_config(
+    io: &impl Io,
+    rf_type: RfType,
+    interface_index: u8,
+    band_5g: bool,
+    autoload_fail: bool,
+) -> Result<BbReport, Error> {
+    let lo = io.read8(super::fw::REG_SYS_FUNC_EN)?;
+    let hi = io.read8(super::fw::REG_SYS_FUNC_EN + 1)?;
+    let regval = u16::from_le_bytes([lo, hi]) | (1 << 13) | 1 | (1 << 1);
+    io.write16(super::fw::REG_SYS_FUNC_EN, regval)?;
+    io.write8(REG_AFE_PLL_CTRL, 0x83)?;
+    io.write8(REG_AFE_PLL_CTRL + 1, 0xdb)?;
+    let rf = io.read8(REG_RF_CTRL)?;
+    io.write8(REG_RF_CTRL, rf | RF_EN | RF_RSTB | RF_SDMRSTB)?;
+    io.write8(
+        super::fw::REG_SYS_FUNC_EN,
+        FEN_PPLL | FEN_PCIEA | FEN_DIO_PCIE | FEN_BB_GLB_RSTN | FEN_BBRSTB,
+    )?;
+    io.write8(super::power::REG_AFE_XTAL_CTRL + 1, 0x80)?;
+    // `IS_92D_SINGLEPHY` is the RF type (true exactly for 2T2R),
+    // not the MAC/PHY mode: the LED bit is set on 1T parts only.
+    if rf_type != RfType::TwoT2R {
+        let led = io.read32(REG_LEDCFG0)?;
+        io.write32(REG_LEDCFG0, led | (1 << 23))?;
+    }
+    for pair in super::tables::PHY_REG_2T.chunks_exact(2) {
+        let us = addr_delay_us(pair[0]);
+        if us != 0 {
+            io.delay_us(us).await;
+        }
+        let at = u16::try_from(pair[0]).map_err(|_| Error::Descriptor)?;
+        set_bb(io, at, MASKDWORD, pair[1])?;
+        io.delay_us(1).await;
+    }
+    let pg = if autoload_fail {
+        None
+    } else {
+        Some(PgStore::from_pg(&super::tables::PHY_REG_PG)?)
+    };
+    let band = if band_5g { Band::On5Ghz } else { Band::On2Ghz };
+    agc_table_walk(io, super::agc_table(interface_index, band)).await?;
+    let cck_high_power = get_bb(io, RFPGA0_XA_HSSIPARAMETER2, 0x200)? != 0;
+    Ok(BbReport { cck_high_power, pg })
+}
+
+/// One radio-table load inside `rtl92d_phy_rf6052_config`: the
+/// path, the table, and the BB target (local, or DBI-redirected
+/// when this function loads the other PHY's radio).
+#[derive(Clone, Copy, Debug)]
+struct RfLoad {
+    path: Path,
+    table: &'static [u32],
+    target: BbTarget,
+}
+
+/// The RF-env save/restore dance plus `rtl_rfreg_delay` walk for
+/// one [`RfLoad`] (the per-iteration body of
+/// `rtl92d_phy_rf6052_config`).
+async fn rf_load(io: &impl Io, load: RfLoad) -> Result<(), Error> {
+    let regs = load.path.regs();
+    let env_mask = match load.path {
+        Path::A => BRFSI_RFENV,
+        Path::B => BRFSI_RFENV << 16,
+    };
+    let saved = get_bb_target(io, regs.rfintfs, env_mask, load.target).await?;
+    set_bb_target(io, regs.rfintfe, BRFSI_RFENV << 16, 0x1, load.target).await?;
+    io.delay_us(1).await;
+    set_bb_target(io, regs.rfintfo, BRFSI_RFENV, 0x1, load.target).await?;
+    io.delay_us(1).await;
+    set_bb_target(io, regs.rfhssi_para2, B3WIREADDRESSLENGTH, 0x0, load.target).await?;
+    io.delay_us(1).await;
+    set_bb_target(io, regs.rfhssi_para2, B3WIREDATALENGTH, 0x0, load.target).await?;
+    io.delay_us(1).await;
+    for pair in load.table.chunks_exact(2) {
+        if (0xf9..=0xfe).contains(&pair[0]) {
+            io.delay_us(addr_delay_us(pair[0])).await;
+        } else {
+            set_rf_target(
+                io,
+                load.path,
+                pair[0],
+                RFREG_OFFSET_MASK,
+                pair[1],
+                load.target,
+            )
+            .await?;
+            io.delay_us(1).await;
+        }
+    }
+    set_bb_target(io, regs.rfintfs, env_mask, saved, load.target).await?;
+    Ok(())
+}
+
+/// `rtl92d_phy_rf6052_config` (`rtl8192de/rf.c`), with the DMDP
+/// branches: on a dual-MAC-dual-PHY part, MAC0 starting on 2.4 GHz
+/// (interface 0) loads radio A locally, then radio B over DBI onto
+/// PHY1 — unless the other MAC is already on, in which case both
+/// tables are already loaded and this is a no-op; MAC1 starting on
+/// 5 GHz (interface 1) mirrors it, loading radio A over DBI onto
+/// PHY0 first, then radio B locally. Interface 1 on 2.4 GHz loads
+/// only radio B on both paths (`true_bpath`). The other PHY is
+/// powered down again afterwards when it was just enabled for the
+/// load. `internal_pa_5g` is the EFUSE per-path internal-PA flag
+/// (`rtl92d_phy_config_rf_with_headerfile` table selection).
+pub async fn rf_config(
+    io: &impl Io,
+    mode: MacPhyMode,
+    interface_index: u8,
+    band_5g: bool,
+    rf_type: RfType,
+    internal_pa_5g: [bool; 2],
+) -> Result<(), Error> {
+    let (radioa, radiob) = super::radio_tables(internal_pa_5g);
+    let mut loads = [RfLoad {
+        path: Path::A,
+        table: radioa,
+        target: BbTarget::Local,
+    }; 2];
+    let mut count = 0usize;
+    let mut powerdown: Option<bool> = None;
+    if mode == MacPhyMode::DualMacDualPhy && !band_5g && interface_index == 0 {
+        if enable_anotherphy(io, true).await? {
+            loads[0] = RfLoad {
+                path: Path::A,
+                table: radioa,
+                target: BbTarget::Local,
+            };
+            loads[1] = RfLoad {
+                path: Path::A,
+                table: radiob,
+                target: BbTarget::DbiMac0RadioB,
+            };
+            count = 2;
+            powerdown = Some(true);
+        } else {
+            return Ok(());
+        }
+    } else if mode == MacPhyMode::DualMacDualPhy && band_5g && interface_index == 1 {
+        if enable_anotherphy(io, false).await? {
+            loads[0] = RfLoad {
+                path: Path::A,
+                table: radioa,
+                target: BbTarget::DbiMac1RadioA,
+            };
+            loads[1] = RfLoad {
+                path: Path::A,
+                table: radiob,
+                target: BbTarget::Local,
+            };
+            count = 2;
+            powerdown = Some(false);
+        } else {
+            return Ok(());
+        }
+    } else if mode == MacPhyMode::DualMacDualPhy && interface_index == 1 {
+        for (i, &path) in rf_type.rf_paths().iter().enumerate() {
+            loads[i] = RfLoad {
+                path,
+                table: radiob,
+                target: BbTarget::Local,
+            };
+        }
+        count = rf_type.rf_paths().len();
+    } else {
+        for (i, &path) in rf_type.rf_paths().iter().enumerate() {
+            loads[i] = RfLoad {
+                path,
+                table: if path == Path::A { radioa } else { radiob },
+                target: BbTarget::Local,
+            };
+        }
+        count = rf_type.rf_paths().len();
+    }
+    for load in loads[..count].iter() {
+        rf_load(io, *load).await?;
+    }
+    if let Some(bmac0) = powerdown {
+        powerdown_anotherphy(io, bmac0).await?;
+    }
+    Ok(())
+}
+
+/// `rtl92d_phy_get_hw_reg_originalvalue` (`rtl8192d/phy.c`): the
+/// default initial gains, the frame-sync byte, and the
+/// frame-sync C34 dword.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OriginalValues {
+    pub initialgain: [u8; 4],
+    pub framesync: u8,
+    pub framesync_c34: u32,
+}
+
+pub fn original_values(io: &impl Io) -> Result<OriginalValues, Error> {
+    Ok(OriginalValues {
+        initialgain: [
+            get_bb(io, ROFDM0_XAAGCCORE1, MASKBYTE0)? as u8,
+            get_bb(io, ROFDM0_XBAGCCORE1, MASKBYTE0)? as u8,
+            get_bb(io, ROFDM0_XCAGCCORE1, MASKBYTE0)? as u8,
+            get_bb(io, ROFDM0_XDAGCCORE1, MASKBYTE0)? as u8,
+        ],
+        framesync: get_bb(io, ROFDM0_RXDETECTOR3, MASKBYTE0)? as u8,
+        framesync_c34: get_bb(io, ROFDM0_RXDETECTOR2, MASKDWORD)?,
+    })
 }

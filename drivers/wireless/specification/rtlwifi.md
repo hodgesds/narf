@@ -3413,22 +3413,43 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   (dual-dual 1T1R functions never transmit two streams). The 5 GHz
   ceiling is the spanning-rule ceiling capped by the `regd.c`
   5140-5360 / 5460-5860 MHz 30 dBm blocks (DFS/NO_IR/indoor rules
-  refuse); `domain_ceiling` stays 2.4 GHz-only. Step 6 (follow-up
-  to #1865, #1888) adds DM init (`rtl92d_dm_init`), the
-  `rtl92de_hw_init` early-mode / ASPM back-door / hardware-security
-  steps, the IQK reload wired into the channel switch, and the
-  5 GHz native-admission gate (`native_channel`: a dual-dual MAC0
-  function admits the 5 GHz plan, MAC1 admits 2.4 GHz 1–11). Still
-  open: `Prepared::Chip::Rtl8192de` integration + the production
-  `rtl92de_hw_init` orchestrator, AMPDU aggregation / RDG/HTC / LPS
-  hardware sequence numbers / encryption sectype / TX-report requests
-  / multi-station rate-id / MAC-id, card disable / power-off adapter,
-  and the H2C rate-mask send. Still open from #1888: LC calibrate,
-  the reserved-page packet, and the TX-report C2H path — Linux v6.1
+  refuse); `domain_ceiling` stays 2.4 GHz-only. The remainder
+  (issue #1865) is delivered: `Prepared::Chip::Rtl8192de`
+  (`from_device(0x8193)`, next-desc byte 40, mode-dependent LLT,
+  IMR `0x120`/`0x128`, the `0x301` DMA stop), the radio owner
+  (`bind_rtl8192de_mode` before `prepare`, `configure_rtl8192de`
+  re-qualifying mode / test chip / autoload / cut from live registers
+  and EFUSE, `configure_rtl8192de_channel` over the `N92D` permission,
+  `configure_rtl8192de_mac`), the station-power `Base`/`Grant` and
+  `stage_rtl8192de_calibration`, native `prepare_rtl8192de` /
+  `admit_rtl8192de` (2.4 GHz channels 1-11; the PCI function index
+  comes from the retained `PciIo`), the `rtl92de_hw_init`
+  orchestrator (`init::configure`: power-on, MAC, BB/RF tail, TX-power
+  level, dual-MAC RF-ready poll), AMPDU density / RDG / HTC-LPS hwseq
+  / sectype / TX-report (`SPE_RPT` + `SW_DEFINE` sequence) /
+  rate-id / MAC-id in the packet owner and descriptors, the H2C
+  rate-mask send (`update_hal_rate_mask`, admitted-gated) and the
+  RPWM LPS enter/leave (`0x02` / `0x0c`), and card disable /
+  power-off (`check_poweroff`, `poweroff_adapter`, `card_disable`).
+  NARF order is download → prepare (LLT + rings) → configure
+  (power-on + MAC + PHY tail); BME stays off throughout, so the
+  deferred power-on is safe. RDG is dead in upstream Linux v6.1
+  (`mac->rdg_en` is never assigned), so the RDG descriptor bit is
+  carried but never set by the link. Step 6 (follow-up to #1865,
+  #1888) adds DM init (`rtl92d_dm_init`), the `rtl92de_hw_init`
+  early-mode / ASPM back-door / hardware-security steps, the IQK
+  reload wired into the channel switch, and the 5 GHz
+  native-admission gate (`native_channel`: a dual-dual MAC0
+  function admits the 5 GHz plan, MAC1 admits 2.4 GHz 1–11).
+  Still open (follow-up):
+  LC calibrate, IQK reload, the reserved-page packet, DM init,
+  earlymode, the ASPM back-door, HW security enable (keyed on the
+  software-crypto decision), TX-report arrival matching (no C2H path on 92D yet — Linux v6.1
   gives 92D no C2H arrival route (`rtl92de_rx_query_desc` never
   sets `packet_report_type`; the `IMR_C2HCMD` dispatch in `pci.c`
   is gated to RTL8723AE), so a requested report can only resolve
-  via the 3 s timeout.
+  via the 3 s timeout), and 5 GHz native admission (the envelope already
+  carries 5 GHz rows; the native entry stays 2.4 GHz).
 
 ## 4. Invariants
 

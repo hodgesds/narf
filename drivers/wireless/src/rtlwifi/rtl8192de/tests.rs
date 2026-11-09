@@ -1105,7 +1105,7 @@ fn smoke_rtl8192de_packet_admission_and_fill() -> TestResult {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("8192DE packet permission"),
     };
-    let owner = Owner::admit(
+    let mut owner = Owner::admit(
         crate::rtlwifi::firmware_transport::Info {
             version: 0x1234,
             subversion: 0x56,
@@ -1127,6 +1127,13 @@ fn smoke_rtl8192de_packet_admission_and_fill() -> TestResult {
         short: false,
         rts: None,
         next_desc: 0x4000_0000,
+        mode: WirelessMode::N24g,
+        cipher: KeyCipher::None,
+        ampdu_density: None,
+        adaptive: false,
+        eapol: false,
+        nullfunc: false,
+        rdg_en: false,
     };
     if owner.fill_tx_slot(&mut slot, &frame).is_err()
         || slot.own()
@@ -1194,6 +1201,11 @@ struct DeMacModel {
     poip_reads: u32,
     apsd_set_after: u32,
     apsd_reads: u32,
+    /// Physical EFUSE bytes (`REG_EFUSE_CTRL` protocol model: the
+    /// address latched by `CTRL+1`/`CTRL+2` reads back the byte at
+    /// that address with `VALID` set).
+    efuse: [u8; 512],
+    efuse_addr: u16,
 }
 
 #[derive(Clone)]
@@ -1225,6 +1237,11 @@ impl Io for DeMacFake {
     }
     fn read32(&self, reg: u16) -> Result<u32, FwError> {
         let g = self.0.lock();
+        if reg == version::REG_EFUSE_CTRL {
+            // Hardware completes the byte read: `VALID` set, the
+            // latched physical byte as the low byte.
+            return Ok(u32::from(g.efuse[usize::from(g.efuse_addr)]) | version::EFUSE_CTRL_VALID);
+        }
         let r = usize::from(reg);
         Ok(u32::from_le_bytes([
             g.regs[r],
@@ -1234,7 +1251,13 @@ impl Io for DeMacFake {
         ]))
     }
     fn write8(&self, reg: u16, value: u8) -> Result<(), FwError> {
-        self.0.lock().regs[usize::from(reg)] = value;
+        let mut g = self.0.lock();
+        if reg == version::REG_EFUSE_CTRL + 1 {
+            g.efuse_addr = (g.efuse_addr & 0x300) | u16::from(value);
+        } else if reg == version::REG_EFUSE_CTRL + 2 {
+            g.efuse_addr = (g.efuse_addr & 0xff) | ((u16::from(value) & 3) << 8);
+        }
+        g.regs[usize::from(reg)] = value;
         Ok(())
     }
     fn write16(&self, reg: u16, value: u16) -> Result<(), FwError> {
@@ -1274,6 +1297,8 @@ fn de_mac_fake() -> DeMacFake {
         poip_reads: 0,
         apsd_set_after: 2,
         apsd_reads: 0,
+        efuse: [0xffu8; 512],
+        efuse_addr: 0,
     })))
 }
 
@@ -3659,4 +3684,707 @@ fn smoke_rtl8192de_native_channel() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_native_channel
+);
+
+// ── remainder (#1865): rate mask, TX report, rate-id/MAC-id, LPS, ───────
+// ── card disable/power-off, version qualification, hw_init ───────────────
+
+/// `rtl92de_update_hal_rate_mask` payload vectors (Linux
+/// `rtl8192de/hw.c:1873-2006`): B/G/A/N masks, 1T/2T, 40/20 MHz, RSSI
+/// levels, SMPS-static, MAC id `aid + 1`, short-GI MAC-id rule, and
+/// the wide default mask.
+fn smoke_rtl8192de_rate_mask() -> TestResult {
+    use h2c::*;
+    use rate::WirelessMode;
+    let base = Peer {
+        mode: WirelessMode::B,
+        supp_rates: [0xfff, 0],
+        rx_mask: [0, 0],
+        sgi20: false,
+        sgi40: false,
+        mimo_ps_static: false,
+        ap_or_adhoc: false,
+        aid: 0,
+    };
+    // B: 0xfff & 0x0d (CCK bit 2 set), index B (6), station MAC id 0.
+    let mask = rate_mask(&base, RfType::TwoT2R, Band::On2Ghz, false, 3);
+    if mask.payload != [0x0d, 0x00, 0x00, 0x60, 0x80]
+        || mask.ratr_index != RATR_INX_WIRELESS_B
+        || mask.mac_id != 0
+    {
+        return TestResult::Fail("8192DE rate mask B");
+    }
+    // G, RSSI 1: 0x0f00, index GB (4).
+    let g = Peer {
+        mode: WirelessMode::G,
+        ..base
+    };
+    let mask = rate_mask(&g, RfType::TwoT2R, Band::On2Ghz, false, 1);
+    if mask.payload != [0x00, 0x0f, 0x00, 0x40, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_GB {
+        return TestResult::Fail("8192DE rate mask G rssi1");
+    }
+    // A on 5 GHz: 5G supp rates shifted, 0x0ff0, index G (5).
+    let a = Peer {
+        mode: WirelessMode::A,
+        supp_rates: [0, 0xfff],
+        ..base
+    };
+    let mask = rate_mask(&a, RfType::TwoT2R, Band::On5Ghz, false, 3);
+    if mask.payload != [0xf0, 0x0f, 0x00, 0x50, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_G {
+        return TestResult::Fail("8192DE rate mask A");
+    }
+    // N 2.4 GHz, 2T2R, 40 MHz, RSSI 3, short GI: 0x0f0f_f015,
+    // index NGB (0), MAC id 0 with the short-GI bit.
+    let n = Peer {
+        mode: WirelessMode::N24g,
+        supp_rates: [0xfff, 0],
+        rx_mask: [0xff, 0xff],
+        sgi40: true,
+        ..base
+    };
+    let mask = rate_mask(&n, RfType::TwoT2R, Band::On2Ghz, true, 3);
+    if mask.payload != [0x15, 0xf0, 0x0f, 0x0f, 0xa0]
+        || mask.ratr_index != RATR_INX_WIRELESS_NGB
+        || mask.mac_id != 0
+    {
+        return TestResult::Fail("8192DE rate mask N 2T 40M");
+    }
+    // N with SMPS static, RSSI 2: 0x0007_f000.
+    let smps = Peer {
+        mimo_ps_static: true,
+        ..n
+    };
+    let mask = rate_mask(&smps, RfType::TwoT2R, Band::On2Ghz, true, 2);
+    if mask.payload != [0x00, 0xf0, 0x07, 0x00, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_NGB {
+        return TestResult::Fail("8192DE rate mask N SMPS static");
+    }
+    // N 5 GHz, 1T1R, 20 MHz, RSSI 1: 0x000f_0000, index NG (1).
+    let n5 = Peer {
+        mode: WirelessMode::N5g,
+        supp_rates: [0, 0xfff],
+        rx_mask: [0xff, 0xff],
+        ..base
+    };
+    let mask = rate_mask(&n5, RfType::OneT1R, Band::On5Ghz, false, 1);
+    if mask.payload != [0x00, 0x00, 0x0f, 0x10, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_NG {
+        return TestResult::Fail("8192DE rate mask N5 1T 20M");
+    }
+    // AP peer, aid 2: MAC id 3, short GI forced off.
+    let ap = Peer {
+        ap_or_adhoc: true,
+        aid: 2,
+        ..n
+    };
+    let mask = rate_mask(&ap, RfType::TwoT2R, Band::On2Ghz, true, 3);
+    if mask.payload[4] != 0x83 || mask.mac_id != 3 {
+        return TestResult::Fail("8192DE rate mask AP macid");
+    }
+    // Unknown mode: the wide default mask, index NGB (0).
+    let unknown = Peer {
+        mode: WirelessMode::Unknown,
+        ..n
+    };
+    let mask = rate_mask(&unknown, RfType::TwoT2R, Band::On2Ghz, true, 3);
+    if mask.payload != [0xff, 0xf0, 0x0f, 0x0f, 0xa0] || mask.ratr_index != RATR_INX_WIRELESS_NGB {
+        return TestResult::Fail("8192DE rate mask unknown");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_rate_mask
+);
+
+/// The H2C rate-mask send: the admitted gate refuses an empty mask
+/// and any unadmitted rate, and a fully admitted mask lands in the
+/// mailbox as `H2C_RA_MASK` with the 5-byte payload; RF off drops
+/// the send without a write.
+fn smoke_rtl8192de_rate_mask_send() -> TestResult {
+    use h2c::*;
+    use rate::WirelessMode;
+    let peer = Peer {
+        mode: WirelessMode::N24g,
+        supp_rates: [0xfff, 0],
+        rx_mask: [0xff, 0xff],
+        sgi20: false,
+        sgi40: true,
+        mimo_ps_static: false,
+        ap_or_adhoc: false,
+        aid: 0,
+    };
+    // Empty mask: no supported rates at all.
+    let io = de_mac_fake();
+    let mut mailbox = Mailbox::new();
+    let empty = Peer {
+        supp_rates: [0, 0],
+        rx_mask: [0, 0],
+        ..peer
+    };
+    match narf_scheduler::block_on(update_hal_rate_mask(
+        &mut mailbox,
+        &io,
+        &empty,
+        RfType::TwoT2R,
+        Band::On2Ghz,
+        true,
+        3,
+        0x0fff_ffff,
+        true,
+    )) {
+        Err(PrepError::Power(_)) => {}
+        _ => return TestResult::Fail("8192DE rate mask empty admitted"),
+    }
+    // Unadmitted rate: the 2T 40 MHz mask names rates outside 0xfff.
+    let io = de_mac_fake();
+    let mut mailbox = Mailbox::new();
+    match narf_scheduler::block_on(update_hal_rate_mask(
+        &mut mailbox,
+        &io,
+        &peer,
+        RfType::TwoT2R,
+        Band::On2Ghz,
+        true,
+        3,
+        0x0000_0fff,
+        true,
+    )) {
+        Err(PrepError::Power(_)) => {}
+        _ => return TestResult::Fail("8192DE rate mask unadmitted admitted"),
+    }
+    // Fully admitted: the 5-byte payload lands in box 0
+    // (`H2C_RA_MASK` with BIT(7) set, then the payload bytes).
+    let io = de_mac_fake();
+    let mut mailbox = Mailbox::new();
+    let mask = match narf_scheduler::block_on(update_hal_rate_mask(
+        &mut mailbox,
+        &io,
+        &peer,
+        RfType::TwoT2R,
+        Band::On2Ghz,
+        true,
+        3,
+        0x0fff_ffff,
+        true,
+    )) {
+        Ok(mask) => mask,
+        Err(_) => return TestResult::Fail("8192DE rate mask send failed"),
+    };
+    if mask.payload != [0x15, 0xf0, 0x0f, 0x0f, 0xa0]
+        || mailbox.last_hmeboxnum != 1
+        || de_mac_read8(&io, REG_HMEBOX_EXT_0 + 2) != 0x15
+        || de_mac_read8(&io, REG_HMEBOX_EXT_0 + 3) != 0xf0
+        || de_mac_read8(&io, REG_HMEBOX_0 + 4) != 0x86
+        || de_mac_read8(&io, REG_HMEBOX_0 + 5) != 0x0f
+        || de_mac_read8(&io, REG_HMEBOX_0 + 6) != 0x0f
+        || de_mac_read8(&io, REG_HMEBOX_0 + 7) != 0xa0
+    {
+        return TestResult::Fail("8192DE rate mask mailbox bytes");
+    }
+    // RF off: dropped without a write.
+    let io = de_mac_fake();
+    let mut mailbox = Mailbox::new();
+    if narf_scheduler::block_on(update_hal_rate_mask(
+        &mut mailbox,
+        &io,
+        &peer,
+        RfType::TwoT2R,
+        Band::On2Ghz,
+        true,
+        3,
+        0x0fff_ffff,
+        false,
+    ))
+    .is_err()
+        || mailbox.last_hmeboxnum != 0
+        || de_mac_read32(&io, REG_HMEBOX_0) != 0
+    {
+        return TestResult::Fail("8192DE rate mask RF-off drop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_rate_mask_send
+);
+
+/// A packet owner on channel 6 for the TX-report / rate-id tests
+/// (same envelope fixture as the packet admission test).
+fn de_tx_owner() -> Option<packet::Owner> {
+    use envelope::*;
+    let factory = de_factory();
+    let domain = de_us_domain();
+    let bytes = de_napc_fixture(1, 0, 80, &[(6, 20, 0, de_rising)]);
+    let cal = Calibration::from_verified(&bytes, Some([0xabu8; 32]), &factory).ok()?;
+    let permission = cal.permission_for(&domain, Operating::twenty(6)).ok()?;
+    Some(packet::Owner::admit(
+        crate::rtlwifi::firmware_transport::Info {
+            version: 0x1234,
+            subversion: 0x56,
+            payload: 100,
+        },
+        permission,
+    ))
+}
+
+/// TX-report frames (EAPOL / nullfunc): `SPE_RPT` (dword 2 bit 19)
+/// plus the `SW_DEFINE` sequence `(++sn & 0x3f) << 2`; ordinary data
+/// carries neither. `sectype`: none 0, WEP/TKIP 1, CCMP 3.
+fn smoke_rtl8192de_tx_report_and_sectype() -> TestResult {
+    use packet::*;
+    let Some(mut owner) = de_tx_owner() else {
+        return TestResult::Fail("8192DE TX report owner");
+    };
+    let frame = TxFrame {
+        op: envelope::Operating::twenty(6),
+        class: FrameClass::Data { priority: 3 },
+        len: 100,
+        buf_addr: 0x3000_0000,
+        rate: 12,
+        seq: 0x42,
+        short: false,
+        rts: None,
+        next_desc: 0x4000_0000,
+        mode: rate::WirelessMode::N24g,
+        cipher: KeyCipher::None,
+        ampdu_density: None,
+        adaptive: false,
+        eapol: false,
+        nullfunc: false,
+        rdg_en: false,
+    };
+    // Ordinary data: no report bits.
+    let mut slot = trx::TxDesc::default();
+    if owner.fill_tx_slot(&mut slot, &frame).is_err()
+        || slot.dw[2] & (1 << 19) != 0
+        || slot.dw[6] & 0xfff != 0
+    {
+        return TestResult::Fail("8192DE TX report ordinary data");
+    }
+    // EAPOL: report with sn 4, then 8.
+    let mut slot = trx::TxDesc::default();
+    if owner
+        .fill_tx_slot(
+            &mut slot,
+            &TxFrame {
+                eapol: true,
+                ..frame
+            },
+        )
+        .is_err()
+        || slot.dw[2] & (1 << 19) == 0
+        || slot.dw[6] & 0xfff != 4
+    {
+        return TestResult::Fail("8192DE TX report EAPOL first");
+    }
+    let mut slot = trx::TxDesc::default();
+    if owner
+        .fill_tx_slot(
+            &mut slot,
+            &TxFrame {
+                eapol: true,
+                ..frame
+            },
+        )
+        .is_err()
+        || slot.dw[6] & 0xfff != 8
+    {
+        return TestResult::Fail("8192DE TX report EAPOL second");
+    }
+    // Nullfunc: report with sn 12.
+    let mut slot = trx::TxDesc::default();
+    if owner
+        .fill_tx_slot(
+            &mut slot,
+            &TxFrame {
+                nullfunc: true,
+                ..frame
+            },
+        )
+        .is_err()
+        || slot.dw[2] & (1 << 19) == 0
+        || slot.dw[6] & 0xfff != 12
+    {
+        return TestResult::Fail("8192DE TX report nullfunc");
+    }
+    // Sectype mapping on the same frame shape.
+    for (cipher, sectype) in [
+        (KeyCipher::None, 0u32),
+        (KeyCipher::Wep, 1),
+        (KeyCipher::Tkip, 1),
+        (KeyCipher::Ccmp, 3),
+    ] {
+        let mut slot = trx::TxDesc::default();
+        if owner
+            .fill_tx_slot(&mut slot, &TxFrame { cipher, ..frame })
+            .is_err()
+            || (slot.dw[1] >> 22) & 3 != sectype
+        {
+            return TestResult::Fail("8192DE TX sectype");
+        }
+    }
+    // The report helpers agree with the descriptor bits.
+    if !wants_tx_report(true, false)
+        || !wants_tx_report(false, true)
+        || wants_tx_report(false, false)
+        || ETH_P_PAE != 0x888e
+    {
+        return TestResult::Fail("8192DE TX report predicate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_tx_report_and_sectype
+);
+
+/// Rate-id / MAC-id: a data frame under an installed AP link takes
+/// the link's index and MAC id with the driver rate; an adaptive
+/// frame takes the firmware rate; management takes MC (7) with MAC
+/// id 0. AMPDU density, RDG and the LPS hwseq rule ride the same
+/// descriptor fields; the mode fallback covers stations.
+fn smoke_rtl8192de_rate_id_macid() -> TestResult {
+    use h2c::*;
+    use packet::*;
+    use rate::WirelessMode;
+    if rate_index_for_mode(WirelessMode::N24g) != RATR_INX_WIRELESS_NGB
+        || rate_index_for_mode(WirelessMode::N5g) != RATR_INX_WIRELESS_NG
+        || rate_index_for_mode(WirelessMode::G) != RATR_INX_WIRELESS_GB
+        || rate_index_for_mode(WirelessMode::B) != RATR_INX_WIRELESS_B
+        || rate_index_for_mode(WirelessMode::A) != RATR_INX_WIRELESS_G
+        || rate_index_for_mode(WirelessMode::Unknown) != RATR_INX_WIRELESS_NGB
+    {
+        return TestResult::Fail("8192DE rate index mode fallback");
+    }
+    let Some(mut owner) = de_tx_owner() else {
+        return TestResult::Fail("8192DE rate-id owner");
+    };
+    // AP link: N 2.4 GHz peer, aid 2 → MAC id 3, index NGB (0).
+    let peer = Peer {
+        mode: WirelessMode::N24g,
+        supp_rates: [0xfff, 0],
+        rx_mask: [0xff, 0xff],
+        sgi20: false,
+        sgi40: false,
+        mimo_ps_static: false,
+        ap_or_adhoc: true,
+        aid: 2,
+    };
+    let mask = rate_mask(&peer, RfType::TwoT2R, Band::On2Ghz, false, 3);
+    owner.install_rate_mask(mask, WirelessMode::N24g, 5, false);
+    let Some(link) = owner.link() else {
+        return TestResult::Fail("8192DE rate-id link missing");
+    };
+    if link.ratr_index != RATR_INX_WIRELESS_NGB || link.mac_id != 3 || link.ampdu_density != 5 {
+        return TestResult::Fail("8192DE rate-id link values");
+    }
+    let frame = TxFrame {
+        op: envelope::Operating::twenty(6),
+        class: FrameClass::Data { priority: 3 },
+        len: 100,
+        buf_addr: 0x3000_0000,
+        rate: 12,
+        seq: 0x42,
+        short: false,
+        rts: None,
+        next_desc: 0x4000_0000,
+        mode: WirelessMode::N24g,
+        cipher: KeyCipher::None,
+        ampdu_density: Some(5),
+        adaptive: false,
+        eapol: false,
+        nullfunc: false,
+        rdg_en: false,
+    };
+    // Data, non-adaptive: link index/MAC id, driver rate (dw4 bit 8),
+    // AMPDU bit + density 5.
+    let mut slot = trx::TxDesc::default();
+    if owner.fill_tx_slot(&mut slot, &frame).is_err()
+        || (slot.dw[1] >> 16) & 0xf != 0
+        || slot.macid() != 3
+        || slot.dw[4] & (1 << 8) == 0
+        || slot.dw[1] & (1 << 5) == 0
+        || (slot.dw[2] >> 20) & 7 != 5
+    {
+        return TestResult::Fail("8192DE rate-id data link");
+    }
+    // Data, adaptive: firmware rate (dw4 bit 8 clear), same ids.
+    let mut slot = trx::TxDesc::default();
+    if owner
+        .fill_tx_slot(
+            &mut slot,
+            &TxFrame {
+                adaptive: true,
+                ..frame
+            },
+        )
+        .is_err()
+        || (slot.dw[1] >> 16) & 0xf != 0
+        || slot.macid() != 3
+        || slot.dw[4] & (1 << 8) != 0
+    {
+        return TestResult::Fail("8192DE rate-id adaptive data");
+    }
+    // Management: MC (7), MAC id 0, driver rate.
+    let mut slot = trx::TxDesc::default();
+    if owner
+        .fill_tx_slot(
+            &mut slot,
+            &TxFrame {
+                class: FrameClass::Mgmt,
+                ..frame
+            },
+        )
+        .is_err()
+        || (slot.dw[1] >> 16) & 0xf != RATR_INX_WIRELESS_MC
+        || slot.macid() != 0
+        || slot.dw[4] & (1 << 8) == 0
+    {
+        return TestResult::Fail("8192DE rate-id management");
+    }
+    // RDG on QoS data: dw1 bit 7 + dw0 bit 25.
+    let mut slot = trx::TxDesc::default();
+    if owner
+        .fill_tx_slot(
+            &mut slot,
+            &TxFrame {
+                rdg_en: true,
+                ..frame
+            },
+        )
+        .is_err()
+        || slot.dw[1] & (1 << 7) == 0
+        || slot.dw[0] & (1 << 25) == 0
+    {
+        return TestResult::Fail("8192DE rate-id RDG");
+    }
+    // LPS hwseq on a non-QoS frame under an fwctrl_lps link: dw4
+    // bit 7 + pkt id 8.
+    owner.install_rate_mask(mask, WirelessMode::N24g, 5, true);
+    let mut slot = trx::TxDesc::default();
+    if owner
+        .fill_tx_slot(
+            &mut slot,
+            &TxFrame {
+                class: FrameClass::Mgmt,
+                ..frame
+            },
+        )
+        .is_err()
+        || slot.dw[4] & (1 << 7) == 0
+        || (slot.dw[3] >> 28) & 0xf != trx::LPS_PKT_ID
+    {
+        return TestResult::Fail("8192DE rate-id LPS hwseq");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_rate_id_macid
+);
+
+/// LPS RPWM: enter (`0x02`, RF off) and leave (`0x0c`, RF on) fill
+/// `H2C_PWRM` with the one-byte payload; the `pwrmode` record is
+/// `[mode, 1, 5]`; RF off drops the send.
+fn smoke_rtl8192de_lps_rpwm() -> TestResult {
+    use h2c::*;
+    if pwrmode(FW_PS_ACTIVE_MODE) != [0, 1, MAX_LPS_AWAKE_INTERVAL]
+        || pwrmode(FW_PS_DTIM_MODE) != [3, 1, MAX_LPS_AWAKE_INTERVAL]
+    {
+        return TestResult::Fail("8192DE LPS pwrmode payload");
+    }
+    let io = de_mac_fake();
+    let mut mailbox = Mailbox::new();
+    if narf_scheduler::block_on(enter_leisure(&mut mailbox, &io, true)).is_err()
+        || mailbox.last_hmeboxnum != 1
+        || de_mac_read8(&io, REG_HMEBOX_0) != H2C_PWRM
+        || de_mac_read8(&io, REG_HMEBOX_0 + 1) != 0x02
+    {
+        return TestResult::Fail("8192DE LPS enter RPWM");
+    }
+    let io = de_mac_fake();
+    let mut mailbox = Mailbox::new();
+    if narf_scheduler::block_on(leave_leisure(&mut mailbox, &io, true)).is_err()
+        || mailbox.last_hmeboxnum != 1
+        || de_mac_read8(&io, REG_HMEBOX_0) != H2C_PWRM
+        || de_mac_read8(&io, REG_HMEBOX_0 + 1) != 0x0c
+    {
+        return TestResult::Fail("8192DE LPS leave RPWM");
+    }
+    let io = de_mac_fake();
+    let mut mailbox = Mailbox::new();
+    if narf_scheduler::block_on(enter_leisure(&mut mailbox, &io, false)).is_err()
+        || mailbox.last_hmeboxnum != 0
+    {
+        return TestResult::Fail("8192DE LPS RF-off drop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_lps_rpwm
+);
+
+/// Card disable / power-off: single-MAC powers off (DMA stop, RF
+/// off, `SYS_FUNC_EN` `0xE2`, second DMA stop, `CR` 0, power-off
+/// sequence); dual-MAC with the other MAC still on refuses to power
+/// off; `check_poweroff` clears the MAC-ON bit and marks the
+/// in-process bit only when the other MAC is off.
+fn smoke_rtl8192de_card_disable() -> TestResult {
+    use power::*;
+    // Single MAC, MAC0 on: full disable powers off.
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(REG_MAC0)] |= MAC0_ON;
+    let mut bcn = station::BcnCtrl::default();
+    match narf_scheduler::block_on(card_disable(
+        &io,
+        MacPhyMode::SingleMacSinglePhy,
+        0,
+        &mut bcn,
+    )) {
+        Ok(true) => {}
+        _ => return TestResult::Fail("8192DE card disable single refused"),
+    }
+    if de_mac_read8(&io, REG_PCIE_CTRL_REG + 1) != 0xff
+        || de_mac_read8(&io, fw::REG_SYS_FUNC_EN) != 0xe2
+        || de_mac_read8(&io, REG_CR) != 0x00
+        || de_mac_read8(&io, REG_MAC0) & MAC0_ON != 0
+        || de_mac_read16(&io, REG_GPIO_IO_SEL) != 0x0790
+        || de_mac_read8(&io, phy::REG_AFE_PLL_CTRL) != 0x80
+    {
+        return TestResult::Fail("8192DE card disable single trace");
+    }
+    // Dual MAC, other MAC still on: no power-off.
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(REG_MAC1)] |= MAC1_ON;
+    let mut bcn = station::BcnCtrl::default();
+    match narf_scheduler::block_on(card_disable(&io, MacPhyMode::DualMacDualPhy, 0, &mut bcn)) {
+        Ok(false) => {}
+        _ => return TestResult::Fail("8192DE card disable dual other-on"),
+    }
+    if de_mac_read8(&io, phy::REG_AFE_PLL_CTRL) != 0x00 {
+        return TestResult::Fail("8192DE card disable dual powered off");
+    }
+    // `check_poweroff` units.
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(REG_MAC0)] |= MAC0_ON;
+    match check_poweroff(&io, MacPhyMode::SingleMacSinglePhy, 0) {
+        Ok(true) => {}
+        _ => return TestResult::Fail("8192DE check poweroff single"),
+    }
+    if de_mac_read8(&io, REG_MAC0) & MAC0_ON != 0 {
+        return TestResult::Fail("8192DE check poweroff single bit");
+    }
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(REG_MAC0)] |= MAC0_ON;
+    io.0.lock().regs[usize::from(REG_MAC1)] |= MAC1_ON;
+    match check_poweroff(&io, MacPhyMode::DualMacDualPhy, 0) {
+        Ok(false) => {}
+        _ => return TestResult::Fail("8192DE check poweroff dual other-on"),
+    }
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(REG_MAC0)] |= MAC0_ON;
+    match check_poweroff(&io, MacPhyMode::DualMacDualPhy, 0) {
+        Ok(true) => {}
+        _ => return TestResult::Fail("8192DE check poweroff dual other-off"),
+    }
+    if de_mac_read8(&io, REG_POWER_OFF_IN_PROCESS) & POWER_OFF_IN_PROCESS == 0 {
+        return TestResult::Fail("8192DE check poweroff in-process bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_card_disable
+);
+
+/// Version qualification: the EFUSE chip-version word decodes to
+/// C (`0xAA55`), D (`0x9966`), E (`0xCC33`) or D for anything else;
+/// `REG_9346CR` BIT(5) is the autoload-OK flag; `REG_SYS_CFG`
+/// bits 19:16 clear means a test chip.
+fn smoke_rtl8192de_version_cut() -> TestResult {
+    let io = de_mac_fake();
+    for (high, low, cut) in [
+        (0xaa, 0x55, version::Cut::C),
+        (0x99, 0x66, version::Cut::D),
+        (0xcc, 0x33, version::Cut::E),
+        (0x12, 0x34, version::Cut::D),
+    ] {
+        io.0.lock().efuse[0x3fe] = high;
+        io.0.lock().efuse[0x3ff] = low;
+        match narf_scheduler::block_on(version::read_cut(&io)) {
+            Ok(found) if found == cut => {}
+            _ => return TestResult::Fail("8192DE version cut decode"),
+        }
+    }
+    if !version::Cut::D.d_or_e_cut()
+        || !version::Cut::E.d_or_e_cut()
+        || version::Cut::C.d_or_e_cut()
+    {
+        return TestResult::Fail("8192DE version d_or_e_cut");
+    }
+    io.0.lock().regs[usize::from(version::REG_9346CR)] = 0x20;
+    match version::autoload_failed(&io) {
+        Ok(false) => {}
+        _ => return TestResult::Fail("8192DE version autoload ok"),
+    }
+    io.0.lock().regs[usize::from(version::REG_9346CR)] = 0x00;
+    match version::autoload_failed(&io) {
+        Ok(true) => {}
+        _ => return TestResult::Fail("8192DE version autoload fail"),
+    }
+    match version::is_test_chip(&io) {
+        Ok(true) => {}
+        _ => return TestResult::Fail("8192DE version test chip"),
+    }
+    io.0.lock().regs[usize::from(version::REG_SYS_CFG) + 2] = 0x01;
+    match version::is_test_chip(&io) {
+        Ok(false) => {}
+        _ => return TestResult::Fail("8192DE version normal chip"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_version_cut
+);
+
+/// The `rtl92de_hw_init` orchestrator on a single-MAC 2.4 GHz
+/// function: power-on, MAC/BB/RF tail, TX-power level at channel 1,
+/// and the radio report (mode, band, RF type, RF on, PG store).
+fn smoke_rtl8192de_hw_init() -> TestResult {
+    let efuse = match txpower::Efuse::from_hwinfo(&level_hwinfo(), false, false) {
+        Ok(efuse) => efuse,
+        Err(_) => return TestResult::Fail("8192DE hw_init efuse"),
+    };
+    let io = de_mac_fake();
+    let radio = match narf_scheduler::block_on(init::configure(
+        &io,
+        &init::Params {
+            mode: MacPhyMode::SingleMacSinglePhy,
+            interface_index: 0,
+            band: Band::On2Ghz,
+            mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            efuse,
+            rf_type: RfType::TwoT2R,
+            channel: 1,
+            bw40: false,
+            autoload_fail: false,
+        },
+    )) {
+        Ok(radio) => radio,
+        Err(_) => return TestResult::Fail("8192DE hw_init configure"),
+    };
+    if radio.mode != MacPhyMode::SingleMacSinglePhy
+        || radio.band != Band::On2Ghz
+        || radio.rf_type != RfType::TwoT2R
+        || !radio.rf_on
+        || radio.pg.is_none()
+    {
+        return TestResult::Fail("8192DE hw_init radio report");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_hw_init
 );

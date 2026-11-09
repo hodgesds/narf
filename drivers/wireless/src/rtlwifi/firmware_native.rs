@@ -321,6 +321,16 @@ impl PciIo {
         })
         .map_err(|_| Error::Access)?
     }
+    /// The PCI function number of the retained device, if it is a PCIe
+    /// device (`BusAddr::Pcie`). Dual-function parts (RTL8192DE: one
+    /// function per MAC) select their per-function factory and radio
+    /// parameters from it.
+    pub(super) fn function(&self) -> Option<u8> {
+        match self.device.addr {
+            narf_bus::BusAddr::Pcie(address) => Some(address.function),
+            _ => None,
+        }
+    }
     pub(super) fn verify_factory(&self, expected: &super::efuse::Factory) -> Result<(), Error> {
         self.access(0xcf, 1, || {
             self.check_identity()?;

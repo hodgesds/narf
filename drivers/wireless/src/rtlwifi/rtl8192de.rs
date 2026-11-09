@@ -77,6 +77,7 @@ pub mod envelope;
 pub mod fw;
 pub mod h2c;
 pub mod ht;
+pub mod init;
 pub mod lifecycle;
 pub mod llt;
 pub mod mac;
@@ -89,6 +90,7 @@ pub mod station;
 pub mod tables;
 pub mod trx;
 pub mod txpower;
+pub mod version;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub(crate) mod tests;

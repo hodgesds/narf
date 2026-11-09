@@ -98,13 +98,19 @@ pub unsafe fn disable_interrupts(mmio: &MmioRegion) {
 }
 
 /// Interrupt-mask register pair `(HIMR, HIMRE)` of the matched chip: the
-/// RTL8192CE family (`rtl8192ce/reg.h`) masks at `0x120` / `0x128`
-/// (`rtl92ce_disable_interrupt`), the others at the 88EE `0xb0` / `0xb8`.
+/// RTL8192CE family (`rtl8192ce/reg.h`) and RTL8192DE (`rtl8192de/reg.h`)
+/// mask at `0x120` / `0x128` (`rtl92ce_disable_interrupt`,
+/// `rtl92d_disable_interrupt`), the others at the 88EE `0xb0` / `0xb8`.
 pub const fn imr_pair(did: u16) -> (u64, u64) {
     if super::rtl8192ce::is_8192ce(did) {
         (
             super::rtl8192ce::mac::REG_HIMR as u64,
             super::rtl8192ce::mac::REG_HIMRE as u64,
+        )
+    } else if did == super::regs::RTL_DEV_8192DE {
+        (
+            super::rtl8192de::mac::REG_HIMR as u64,
+            super::rtl8192de::mac::REG_HIMRE as u64,
         )
     } else {
         (REG_HIMR, REG_HIMRE)

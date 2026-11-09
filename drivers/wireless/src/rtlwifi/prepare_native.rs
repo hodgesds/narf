@@ -407,6 +407,91 @@ pub(super) async fn admit_rtl8192ee<I: super::firmware_transport::Io, M: Memory>
         .stage_rtl8192ee_calibration(calibration, domain)
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))
 }
+
+/// RTL8192DE retained continuation to an admitted 2.4 GHz station owner:
+/// registry firmware (`rtl8192defw.bin`), the one-shot packet claim,
+/// DMA32 rings, the mode-dependent LLT (the mode is bound from the PROM
+/// before the prepare runs), the `rtl92de_hw_init` tail, then the channel
+/// from the signed per-board `N92D` envelope under current host policy,
+/// the operational MAC and the staged envelope the station re-proves at
+/// every publication. Packet DMA, CR gates and IRQs stay closed until
+/// the station service starts. 5 GHz native admission is future work:
+/// the envelope carries 5 GHz rows, but the native entry stays on
+/// 2.4 GHz channels 1-11 (the 8821AE dual-band gate is the only
+/// exception), so a dual-dual MAC0 function (5 GHz bandset) admits no
+/// channel here yet.
+pub(super) async fn prepare_rtl8192de(
+    firmware: Arc<Owner<PciIo>>,
+    retained: Arc<Retained>,
+    factory: Arc<super::efuse::Factory>,
+    channel: u8,
+) -> Result<(), Error> {
+    if !(1..=11).contains(&channel) || firmware.device_id() != super::regs::RTL_DEV_8192DE {
+        return Err(Error::State);
+    }
+    let interface_index = firmware.native().function().ok_or(Error::State)?;
+    if firmware.status().stage == super::firmware_transport::Stage::Detected {
+        firmware.initialize_registered().await?;
+        let mode =
+            super::rtl8192de::mode_from_prom(super::rtl8192de::Interface::Pci, &factory.logical)
+                .ok_or(Error::State)?;
+        let mut prepared = allocate(firmware, 128)?;
+        prepared.bind_rtl8192de_mode(mode)?;
+        prepare_retained(&retained, prepared).await?;
+        let mut storage = retained.lock().await;
+        storage
+            .as_mut()
+            .ok_or(Error::State)?
+            .configure_rtl8192de(&factory, interface_index)
+            .await?;
+    } else if firmware.status().stage != super::firmware_transport::Stage::Ready {
+        return Err(Error::State);
+    }
+    let mut storage = retained.lock().await;
+    let prepared = storage.as_mut().ok_or(Error::State)?;
+    if prepared.phase() == super::prepare::Phase::MacConfigured && prepared.station_transmit_ready()
+    {
+        return Ok(());
+    }
+    let domain = narf_wireless::reg::db::ensure_domain()
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))?;
+    admit_rtl8192de(prepared, &factory, &domain, channel).await
+}
+
+/// RadioConfigured/ChannelConfigured → MacConfigured with a staged `N92D`
+/// envelope (20 MHz permission on `channel`) for the owner's probed device
+/// and measured RF type; a MacConfigured owner without one only stages it.
+/// Shared by native provisioning and the interface's readiness path.
+pub(super) async fn admit_rtl8192de<I: super::firmware_transport::Io, M: Memory>(
+    prepared: &mut Prepared<I, M>,
+    factory: &super::efuse::Factory,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    channel: u8,
+) -> Result<(), Error> {
+    use super::prepare::Phase;
+    prepared.rtl8192de_binding().ok_or(Error::State)?;
+    let calibration =
+        super::rtl8192de::envelope::Calibration::load_registered(factory).map_err(Error::Power)?;
+    if matches!(
+        prepared.phase(),
+        Phase::RadioConfigured | Phase::ChannelConfigured
+    ) {
+        let permission = calibration
+            .permission(domain, channel)
+            .map_err(Error::Power)?;
+        prepared.configure_rtl8192de_channel(permission).await?;
+        prepared.configure_rtl8192de_mac(factory)?;
+    }
+    if prepared.phase() != Phase::MacConfigured {
+        return Err(Error::State);
+    }
+    if prepared.station_calibration_present() {
+        return Ok(());
+    }
+    prepared
+        .stage_rtl8192de_calibration(calibration, domain)
+        .map_err(|_| Error::Power(super::channel_power::Error::Policy))
+}
 pub(super) async fn initialize_registered(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
@@ -433,6 +518,9 @@ pub(super) async fn initialize_registered_on_channel(
     }
     if super::rtl8192ce::is_8192ce(firmware.device_id()) {
         return prepare_rtl8192ce(firmware, retained, factory, channel).await;
+    }
+    if firmware.device_id() == super::regs::RTL_DEV_8192DE {
+        return prepare_rtl8192de(firmware, retained, factory, channel).await;
     }
     if firmware.device_id() != super::regs::RTL_DEV_8188EE {
         return Err(Error::State);
