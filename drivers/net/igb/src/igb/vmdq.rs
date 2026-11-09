@@ -21,14 +21,21 @@
 //! allocation and the caller enables the bus half first; live PF
 //! queue relocation to `rbase_offset` (NARF igb bring-up is
 //! queue-0-only, so the pool-queue math here is fixture-proven until
-//! a multi-queue bring-up lands); VF rate limiting
-//! (`igb_ndo_set_vf_bw`); `SET_MULTICAST` MTA restore on PF
-//! multicast-list change (`igb_restore_vf_multicasts`); the
-//! `MAX_JUMBO_FRAME_SIZE` clamp on SET_LPE (that constant lives
-//! outside the drivers-only reference trees, so SET_LPE clamps to
-//! the VMOLR RLPML field width instead). The mailbox interrupt pump
-//! (`Igb::vt_mailbox_pump_step`, in `igb.rs`) consumes MBVFICR and
-//! drives this dispatcher; it lives there because it owns MMIO.
+//! a multi-queue bring-up lands); the `MAX_JUMBO_FRAME_SIZE` clamp
+//! on SET_LPE (that constant lives outside the drivers-only
+//! reference trees, so SET_LPE clamps to the VMOLR RLPML field width
+//! instead). VF rate limiting (`igb_ndo_set_vf_bw` /
+//! `igb_set_vf_rate_limit` / `igb_check_vf_rate_limit`) and MTA
+//! restore on PF multicast-list change
+//! (`igb_restore_vf_multicasts`) are implemented here; the PF-side
+//! caller is `Igb::vt_restore_vf_multicasts` (in `igb.rs`) —
+//! NARF has no `set_rx_mode` / PF MTA writer yet, so no in-tree
+//! caller rewrites the PF MTA today and the restore half waits on
+//! that lane (see `restore_vf_multicast`).
+//!
+//! The mailbox interrupt pump (`Igb::vt_mailbox_pump_step`, in
+//! `igb.rs`) consumes MBVFICR and drives this dispatcher; it lives
+//! there because it owns MMIO.
 
 use super::{
     VlanFilter, IGB_82576, IGB_82576_NS, IGB_I210_COPPER, IGB_I210_COPPER_FLASHLESS,
@@ -154,6 +161,31 @@ pub const DTXCTL_VLAN_ADDED: u32 = 0x0008;
 pub const REG_RPLOLR: u64 = 0x05AF0;
 /// RPLOLR VLAN-strip (e1000_82575.h:253).
 pub const RPLOLR_STRVLAN: u32 = 0x4000_0000;
+
+/// RTTDQSEL — Tx Desc Plane Queue Select (e1000_regs.h:233).
+/// Write-only: selects which VF's queue the RTTBCNRC write that
+/// follows applies to (Linux `igb_set_vf_rate_limit`: "vf X uses
+/// queue X").
+pub const REG_RTTDQSEL: u64 = 0x3604;
+/// RTTBCNRM — Tx BCN Rate-scheduler MMW (e1000_regs.h:235).
+/// Linux `igb_set_vf_rate_limit` always writes 0x14 here (the
+/// MMW_SIZE for 9728-byte jumbo support).
+pub const REG_RTTBCNRM: u64 = 0x3690;
+/// RTTBCNRM value Linux programs (igb_main.c:18307).
+pub const RTTBCNRM_MMW_SIZE: u32 = 0x14;
+/// RTTBCNRC — Tx BCN Rate-Scheduler Config (e1000_regs.h:237).
+/// Write-only: the rate-factor word for the queue RTTDQSEL
+/// selected.
+pub const REG_RTTBCNRC: u64 = 0x36B0;
+/// RTTBCNRC rate-scheduler enable (e1000_defines.h:1936).
+pub const RTTBCNRC_RS_ENA: u32 = 0x8000_0000;
+/// RTTBCNRC fractional rate-factor mask (e1000_defines.h:1938).
+pub const RTTBCNRC_RF_DEC_MASK: u32 = 0x0000_3FFF;
+/// RTTBCNRC integer rate-factor shift (e1000_defines.h:1940).
+pub const RTTBCNRC_RF_INT_SHIFT: u32 = 14;
+/// RTTBCNRC integer rate-factor mask (e1000_defines.h:1942-1944:
+/// `RF_DEC_MASK << RF_INT_SHIFT`).
+pub const RTTBCNRC_RF_INT_MASK: u32 = 0x0FFF_C000;
 
 /// MTA base — Multicast Table Array, 128 words (e1000_regs.h:283).
 pub const REG_MTA_BASE: u64 = 0x05200;
@@ -488,6 +520,37 @@ pub const fn mta_set(hash: u16) -> (usize, u32) {
     (word, bit)
 }
 
+/// Whether this device id has the e1000_82576 MAC type, the only
+/// one Linux rate limiting supports (`igb_ndo_set_vf_bw` /
+/// `igb_check_vf_rate_limit` bail unless `hw->mac.type ==
+/// e1000_82576`). The mapping is `igb_get_invariants_82575`
+/// (e1000_82575.c:1069-1087); NARF claims only the 82576 and
+/// 82576-NS ids of that family.
+pub const fn rate_limit_supported(device_id: u16) -> bool {
+    device_id == IGB_82576 || device_id == IGB_82576_NS
+}
+
+/// RTTBCNRC word for `tx_rate` Mbps on a `link_speed` Mbps link
+/// (Linux `igb_set_vf_rate_limit`): 0 when unthrottled, else
+/// RS_ENA plus the integer rate factor (`link_speed / tx_rate`,
+/// FIELD_PREP'd into RF_INT_MASK) plus the fractional remainder
+/// scaled by 2^14 (`(link_speed - rf_int * tx_rate) * 2^14 /
+/// tx_rate`, masked to RF_DEC_MASK). The remainder arithmetic
+/// runs in u64 so the scaling cannot overflow; the integer field
+/// is masked before shifting, which is exactly FIELD_PREP's
+/// semantics.
+pub const fn vf_rate_limit_bcnrc(tx_rate: u32, link_speed: u32) -> u32 {
+    if tx_rate == 0 {
+        return 0;
+    }
+    let rf_int = link_speed / tx_rate;
+    let rf_dec = (((link_speed - rf_int * tx_rate) as u64 * (1u64 << RTTBCNRC_RF_INT_SHIFT))
+        / tx_rate as u64) as u32;
+    RTTBCNRC_RS_ENA
+        | ((rf_int & RTTBCNRC_RF_DEC_MASK) << RTTBCNRC_RF_INT_SHIFT)
+        | (rf_dec & RTTBCNRC_RF_DEC_MASK)
+}
+
 /// Errors from VT configuration and mailbox dispatch.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VmdqError {
@@ -510,6 +573,10 @@ pub enum VmdqError {
     /// Operation refused (untrusted VF overriding a PF-set MAC,
     /// VF overriding an admin-set VLAN, invalid MAC).
     Refused,
+    /// Rate limiting is not supported on this MAC type (Linux
+    /// `igb_ndo_set_vf_bw` returns -EOPNOTSUPP unless the MAC type
+    /// is e1000_82576).
+    Unsupported,
     /// A program overflowed its fixed write budget (fail-closed:
     /// nothing is applied).
     ProgramOverflow,
@@ -621,6 +688,17 @@ pub struct VfState {
     /// Full multicast count as reported by the VF (uncapped: > 30
     /// forces VMOLR.MPME even though only 30 hashes are stored).
     pub mc_count: usize,
+    /// VF asked for multicast-promiscuous (Linux
+    /// `IGB_VF_FLAG_MULTI_PROMISC`, set by SET_PROMISC with the
+    /// multicast bit, cleared by every other SET_PROMISC and by
+    /// VF reset). `restore_vf_multicast` re-applies MPME for it
+    /// instead of the stored hashes.
+    pub multi_promisc: bool,
+    /// Admin-set TX rate limit in Mbps, 0 = unthrottled (Linux
+    /// `vf_data_storage.tx_rate`, `igb_ndo_set_vf_bw`). Survives
+    /// VF reset, like Linux's (only a link-speed change clears it,
+    /// via `check_vf_rate_limit`).
+    pub tx_rate: u16,
     /// VLAN stripping enabled for this VF (VMOLR.STRVLAN).
     pub vlan_strip: bool,
 }
@@ -640,6 +718,8 @@ impl VfState {
             pf_qos: 0,
             mc_hashes: [0; MAX_VF_MC_HASHES],
             mc_count: 0,
+            multi_promisc: false,
+            tx_rate: 0,
             vlan_strip: false,
         }
     }
@@ -708,6 +788,12 @@ pub struct VtState {
     /// no production setter exists yet, so this stays false until a
     /// promiscuous-VLAN path sets it).
     pub vlan_promisc: bool,
+    /// Link speed in Mbps the VF rate limits were programmed
+    /// against (Linux `adapter->vf_rate_link_speed`, set by
+    /// `igb_ndo_set_vf_bw`, cleared by `igb_check_vf_rate_limit`
+    /// on a speed change). 0 = no rate limit was ever set, so the
+    /// re-check is a no-op.
+    pub vf_rate_link_speed: u32,
 }
 
 impl VtState {
@@ -739,6 +825,7 @@ impl VtState {
             vfre: 0,
             vfte: 0,
             vlan_promisc: false,
+            vf_rate_link_speed: 0,
         })
     }
 
@@ -1237,6 +1324,11 @@ impl VtState {
         // stored MAC right after this runs).
         let saved = *vf_data;
         // Flags keep only PF_SET_MAC; CTS is re-earned by RESET.
+        // The TX rate limit survives (Linux keeps `tx_rate` across
+        // `igb_vf_reset`; only a link-speed change clears it), but
+        // the multicast-promiscuous flag does not (it is a flag,
+        // and `igb_vf_reset` clears all flags but PF_SET_MAC), so
+        // it stays at `VfState::new()`'s false.
         *vf_data = VfState::new();
         vf_data.mac = saved.mac;
         vf_data.pf_set_mac = saved.pf_set_mac;
@@ -1244,6 +1336,7 @@ impl VtState {
         vf_data.spoofchk_enabled = saved.spoofchk_enabled;
         vf_data.pf_vlan = saved.pf_vlan;
         vf_data.pf_qos = saved.pf_qos;
+        vf_data.tx_rate = saved.tx_rate;
         let pf_vlan = saved.pf_vlan;
         let pf_qos = saved.pf_qos;
         let mut prog = self.clear_vf_vlvf(vf)?;
@@ -1525,9 +1618,15 @@ impl VtState {
         };
         let mut info = msg_word(msg, 0) & VT_MSGINFO_MASK;
         let mut prog = Program::new();
+        // Linux `igb_set_vf_promisc` clears the unicast and
+        // multicast promiscuous flags first, then re-sets the
+        // multicast one only when the message asks for it; the
+        // restore path reads the flag back.
+        self.vfs[vf].multi_promisc = false;
         let mut word = self.vmolr[pool] & !(VMOLR_ROPE | VMOLR_ROMPE | VMOLR_MPME);
         if info & VF_SET_PROMISC_MULTICAST != 0 {
             word |= VMOLR_MPME;
+            self.vfs[vf].multi_promisc = true;
             info &= !VF_SET_PROMISC_MULTICAST;
         } else if self.vfs[vf].mc_count > MAX_VF_MC_HASHES {
             word |= VMOLR_MPME;
@@ -1715,6 +1814,121 @@ impl VtState {
         self.vfs[vf].spoofchk_enabled = enable;
         Ok(())
     }
+
+    /// Program one VF's TX rate limit (Linux
+    /// `igb_set_vf_rate_limit`): select the VF's queue, write the
+    /// fixed MMW_SIZE, then the rate-factor word. `tx_rate` 0
+    /// programs a zero word, i.e. unthrottled.
+    fn rate_limit_program(vf: usize, tx_rate: u32, link_speed: u32) -> Result<Program, VmdqError> {
+        let mut prog = Program::new();
+        prog.push_write(REG_RTTDQSEL, vf as u32)?;
+        prog.push_write(REG_RTTBCNRM, RTTBCNRM_MMW_SIZE)?;
+        prog.push_write(REG_RTTBCNRC, vf_rate_limit_bcnrc(tx_rate, link_speed))?;
+        Ok(prog)
+    }
+
+    /// PF admin: set a VF's TX rate limit (Linux
+    /// `igb_ndo_set_vf_bw`, `ndo_set_vf_rate`). `link_speed_mbps`
+    /// is the already-mapped actual link speed (Linux
+    /// `igb_link_mbps`: 100 -> 100, 1000 -> 1000, anything else,
+    /// including 10 Mb/s, -> 0) and `link_up` is STATUS.LU; the
+    /// MMIO-owning caller supplies both. Refusals mirror Linux
+    /// exactly: non-82576 MAC type is `Unsupported` (-EOPNOTSUPP);
+    /// a nonzero minimum rate, an out-of-range VF, a down link, a
+    /// negative rate, or a rate above the link speed is `Refused`
+    /// (-EINVAL). On success the stored rate and the link speed it
+    /// was programmed against are kept for `check_vf_rate_limit`.
+    /// Reachable from the PF admin path only — there is no VF
+    /// mailbox message for rate limits, so the dispatcher does not
+    /// route here.
+    pub fn set_vf_bw(
+        &mut self,
+        vf: usize,
+        min_tx_rate: i32,
+        max_tx_rate: i32,
+        link_speed_mbps: u32,
+        link_up: bool,
+    ) -> Result<Program, VmdqError> {
+        if !rate_limit_supported(self.device_id) {
+            return Err(VmdqError::Unsupported);
+        }
+        if min_tx_rate != 0 {
+            return Err(VmdqError::Refused);
+        }
+        self.check_vf(vf)?;
+        if !link_up || max_tx_rate < 0 || max_tx_rate as u32 > link_speed_mbps {
+            return Err(VmdqError::Refused);
+        }
+        self.vf_rate_link_speed = link_speed_mbps;
+        self.vfs[vf].tx_rate = max_tx_rate as u16;
+        Self::rate_limit_program(vf, max_tx_rate as u32, link_speed_mbps)
+    }
+
+    /// Re-apply every VF's stored TX rate limit after a link-speed
+    /// change (Linux `igb_check_vf_rate_limit`, the watchdog half
+    /// of rate limiting). A no-op when no rate was ever set
+    /// (`vf_rate_link_speed` is 0) or the MAC type is not 82576.
+    /// When the speed moved, every stored rate is cleared first
+    /// and the recorded speed is forgotten, so the next call is a
+    /// no-op until a fresh `set_vf_bw` — exactly Linux's
+    /// "Link speed has been changed. VF Transmit rate is disabled".
+    /// The returned program holds 3 writes per allocated VF and
+    /// always fits the 48-write budget (7 VFs * 3 = 21).
+    pub fn check_vf_rate_limit(&mut self, link_speed_mbps: u32) -> Result<Program, VmdqError> {
+        let mut prog = Program::new();
+        if self.vf_rate_link_speed == 0 || !rate_limit_supported(self.device_id) {
+            return Ok(prog);
+        }
+        if link_speed_mbps != self.vf_rate_link_speed {
+            for vf in 0..self.num_vfs {
+                self.vfs[vf].tx_rate = 0;
+            }
+            self.vf_rate_link_speed = 0;
+        }
+        for vf in 0..self.num_vfs {
+            let sub = Self::rate_limit_program(vf, self.vfs[vf].tx_rate as u32, link_speed_mbps)?;
+            Self::append_program(&mut prog, sub)?;
+        }
+        Ok(prog)
+    }
+
+    /// Restore one VF's multicast state after the PF's multicast
+    /// list changed (the per-VF body of Linux
+    /// `igb_restore_vf_multicasts`): rebuild the VF's VMOLR
+    /// ROMPE/MPME bits from the stored hash count and the
+    /// multicast-promiscuous flag, and re-emit the stored hashes
+    /// as MTA OR-sets. A VF with no hashes gets a bare VMOLR
+    /// write clearing both bits; a VF with > 30 hashes or the
+    /// promiscuous flag gets MPME and no MTA sets.
+    ///
+    /// Why per-VF: the Linux function loops over all VFs, but a
+    /// single NARF `Program` holds at most 30 MTA sets, and 7 VFs
+    /// with 30 hashes each would need 210 — so the all-VF restore
+    /// is `Igb::vt_restore_vf_multicasts`, which applies one
+    /// per-VF program at a time. Linux calls the restore from
+    /// `igb_set_rx_mode` / `igb_write_mc_addr_list`, i.e. after
+    /// the PF MTA is rewritten; NARF has no `set_rx_mode` / PF
+    /// MTA writer yet, so the caller that lands the PF
+    /// multicast-list path must call the `Igb` method after its
+    /// MTA rewrite — this function is the restore half, not the
+    /// list-change half.
+    pub fn restore_vf_multicast(&mut self, vf: usize) -> Result<Program, VmdqError> {
+        let pool = self.check_vf(vf)?;
+        let mut prog = Program::new();
+        let mut word = self.vmolr[pool] & !(VMOLR_ROMPE | VMOLR_MPME);
+        if self.vfs[vf].mc_count > MAX_VF_MC_HASHES || self.vfs[vf].multi_promisc {
+            word |= VMOLR_MPME;
+        } else if self.vfs[vf].mc_count > 0 {
+            word |= VMOLR_ROMPE;
+            for j in 0..self.vfs[vf].mc_count.min(MAX_VF_MC_HASHES) {
+                let (w, bit) = mta_set(self.vfs[vf].mc_hashes[j]);
+                prog.push_mta(mta_addr(w), bit)?;
+            }
+        }
+        self.vmolr[pool] = word;
+        prog.push_write(vmolr_addr(pool), word)?;
+        Ok(prog)
+    }
 }
 
 /// Read message word `i`, zero-filling past the end (Linux reads a
@@ -1784,10 +1998,21 @@ mod tests {
             || REG_TXSWC != 0x05ACC
             || REG_DTXCTL != 0x03590
             || REG_RPLOLR != 0x05AF0
+            || REG_RTTDQSEL != 0x3604
+            || REG_RTTBCNRM != 0x3690
+            || REG_RTTBCNRC != 0x36B0
+            || RTTBCNRM_MMW_SIZE != 0x14
             || mta_addr(0) != 0x05200
             || mta_addr(127) != 0x053FC
         {
             return TestResult::Fail("igb vmdq register offset drift");
+        }
+        if RTTBCNRC_RS_ENA != 0x8000_0000
+            || RTTBCNRC_RF_DEC_MASK != 0x0000_3FFF
+            || RTTBCNRC_RF_INT_SHIFT != 14
+            || RTTBCNRC_RF_INT_MASK != 0x0FFF_C000
+        {
+            return TestResult::Fail("igb RTTBCNRC field drift");
         }
         if ral_addr(0) != 0x05400
             || rah_addr(0) != 0x05404
@@ -2248,4 +2473,234 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/igb", smoke_igb_vmdq_admin);
+
+    fn smoke_igb_vmdq_vf_rate_limit() -> TestResult {
+        // Pure rate-factor words (Linux `igb_set_vf_rate_limit`):
+        // 1000/500 -> rf_int 2, rf_dec 0.
+        if vf_rate_limit_bcnrc(500, 1000) != 0x8000_8000 {
+            return TestResult::Fail("igb VF rate 500@1000 factor drift");
+        }
+        // 1000/250 -> rf_int 4.
+        if vf_rate_limit_bcnrc(250, 1000) != 0x8001_0000 {
+            return TestResult::Fail("igb VF rate 250@1000 factor drift");
+        }
+        // 1000/333 -> rf_int 3, rf_dec (1 * 16384) / 333 = 49.
+        if vf_rate_limit_bcnrc(333, 1000) != 0x8000_C031 {
+            return TestResult::Fail("igb VF rate 333@1000 fractional factor drift");
+        }
+        // Unthrottled programs a zero word.
+        if vf_rate_limit_bcnrc(0, 1000) != 0 {
+            return TestResult::Fail("igb VF rate 0 does not program unthrottled");
+        }
+        // Gate: only the 82576 MAC type.
+        if !rate_limit_supported(IGB_82576)
+            || !rate_limit_supported(IGB_82576_NS)
+            || rate_limit_supported(IGB_I350_COPPER)
+        {
+            return TestResult::Fail("igb VF rate-limit MAC-type gate drift");
+        }
+        let mut vt = vt_82576_2();
+        // Set 500 Mbps on VF 0 at 1 Gbps, link up: queue select,
+        // MMW_SIZE, factor word; stored rate + link speed kept.
+        let prog = match vt.set_vf_bw(0, 0, 500, 1000, true) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb set_vf_bw refused a valid limit"),
+        };
+        if prog.n_writes != 3
+            || prog.writes[0] != RegWrite::new(REG_RTTDQSEL, 0)
+            || prog.writes[1] != RegWrite::new(REG_RTTBCNRM, 0x14)
+            || prog.writes[2] != RegWrite::new(REG_RTTBCNRC, 0x8000_8000)
+            || vt.vfs[0].tx_rate != 500
+            || vt.vf_rate_link_speed != 1000
+        {
+            return TestResult::Fail("igb set_vf_bw 500@1000 program drift");
+        }
+        // Clear: rate 0 restores the unthrottled word.
+        let prog = match vt.set_vf_bw(0, 0, 0, 1000, true) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb set_vf_bw refused a clear"),
+        };
+        if prog.writes[2] != RegWrite::new(REG_RTTBCNRC, 0) || vt.vfs[0].tx_rate != 0 {
+            return TestResult::Fail("igb set_vf_bw clear does not restore unthrottled");
+        }
+        // Refusals: out-of-range VF, nonzero min rate, rate above
+        // the link, negative rate, link down.
+        if vt.set_vf_bw(2, 0, 500, 1000, true).is_ok()
+            || vt.set_vf_bw(0, 100, 500, 1000, true).is_ok()
+            || vt.set_vf_bw(0, 0, 1001, 1000, true).is_ok()
+            || vt.set_vf_bw(0, 0, -1, 1000, true).is_ok()
+            || vt.set_vf_bw(0, 0, 500, 1000, false).is_ok()
+        {
+            return TestResult::Fail("igb set_vf_bw accepted an out-of-range limit");
+        }
+        // A refused set leaves the stored rate untouched.
+        if vt.vfs[0].tx_rate != 0 {
+            return TestResult::Fail("igb refused set_vf_bw mutated stored rate");
+        }
+        // Non-82576 MAC type: -EOPNOTSUPP, even for a valid limit.
+        let mut i350 = VtState::new(IGB_I350_COPPER, 2).unwrap();
+        if !matches!(
+            i350.set_vf_bw(0, 0, 500, 1000, true),
+            Err(VmdqError::Unsupported)
+        ) {
+            return TestResult::Fail("igb set_vf_bw accepted a rate on I350");
+        }
+        // Re-check: set both VFs, then re-apply at the same speed.
+        vt.set_vf_bw(0, 0, 500, 1000, true).unwrap();
+        vt.set_vf_bw(1, 0, 250, 1000, true).unwrap();
+        let prog = match vt.check_vf_rate_limit(1000) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb check_vf_rate_limit failed at same speed"),
+        };
+        if prog.n_writes != 6
+            || prog.writes[0] != RegWrite::new(REG_RTTDQSEL, 0)
+            || prog.writes[2] != RegWrite::new(REG_RTTBCNRC, 0x8000_8000)
+            || prog.writes[3] != RegWrite::new(REG_RTTDQSEL, 1)
+            || prog.writes[5] != RegWrite::new(REG_RTTBCNRC, 0x8001_0000)
+        {
+            return TestResult::Fail("igb check_vf_rate_limit same-speed re-apply drift");
+        }
+        // Speed change to 100: rates cleared, recorded speed
+        // forgotten, both VFs re-programmed unthrottled.
+        let prog = match vt.check_vf_rate_limit(100) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb check_vf_rate_limit failed on speed change"),
+        };
+        if vt.vfs[0].tx_rate != 0
+            || vt.vfs[1].tx_rate != 0
+            || vt.vf_rate_link_speed != 0
+            || prog.n_writes != 6
+            || prog.writes[2] != RegWrite::new(REG_RTTBCNRC, 0)
+            || prog.writes[5] != RegWrite::new(REG_RTTBCNRC, 0)
+        {
+            return TestResult::Fail("igb check_vf_rate_limit speed-change reset drift");
+        }
+        // Nothing stored any more: the next check is a no-op.
+        let prog = match vt.check_vf_rate_limit(100) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb check_vf_rate_limit failed when idle"),
+        };
+        if prog.n_writes != 0 {
+            return TestResult::Fail("igb check_vf_rate_limit not a no-op when unset");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_vmdq_vf_rate_limit);
+
+    fn smoke_igb_vmdq_restore_vf_multicasts() -> TestResult {
+        let mut vt = vt_82576_2();
+        let filter = VlanFilter::new();
+        // Register VF multicast hashes through the mailbox path:
+        // VF 0 takes 2 hashes (0x1111, 0x2222), VF 1 takes 1 (0x5555).
+        vt.dispatch(0, &[VF_RESET], &filter).unwrap();
+        vt.dispatch(1, &[VF_RESET], &filter).unwrap();
+        let mc0 = [VF_SET_MULTICAST | (2 << 16), 0x2222_1111, 0x4444_3333];
+        vt.dispatch(0, &mc0, &filter).unwrap();
+        let mc1 = [VF_SET_MULTICAST | (1 << 16), 0x6666_5555];
+        vt.dispatch(1, &mc1, &filter).unwrap();
+        if vt.vfs[0].mc_count != 2 || vt.vfs[1].mc_count != 1 {
+            return TestResult::Fail("igb VF multicast registration drift");
+        }
+        // Simulate the PF multicast-list change: Linux
+        // `igb_set_rx_mode` rewrites the MTA (dropping every VF
+        // hash) and the PF-side VMOLR bits. The MTA flush itself
+        // belongs to the future `set_rx_mode` path; here the VMOLR
+        // shadows are cleared the way that rewrite would clear
+        // them, and the restore must put the VF state back.
+        vt.vmolr[0] &= !(VMOLR_ROMPE | VMOLR_MPME);
+        vt.vmolr[1] &= !(VMOLR_ROMPE | VMOLR_MPME);
+        let prog = match vt.restore_vf_multicast(0) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb restore_vf_multicast failed for VF 0"),
+        };
+        // 0x1111 -> word 8, bit 17; 0x2222 -> word 17, bit 2.
+        if prog.n_mta_sets != 2
+            || prog.mta_sets[0] != (mta_addr(8), 1 << 17)
+            || prog.mta_sets[1] != (mta_addr(17), 1 << 2)
+            || prog.n_writes != 1
+            || prog.writes[0].addr != vmolr_addr(0)
+            || prog.writes[0].value & VMOLR_ROMPE == 0
+            || vt.vmolr[0] & VMOLR_ROMPE == 0
+        {
+            return TestResult::Fail("igb restore_vf_multicast VF 0 program drift");
+        }
+        // VF 1: its single hash comes back (0x5555 -> word 42, bit 21).
+        let prog = match vt.restore_vf_multicast(1) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb restore_vf_multicast failed for VF 1"),
+        };
+        if prog.n_mta_sets != 1
+            || prog.mta_sets[0] != (mta_addr(42), 1 << 21)
+            || vt.vmolr[1] & VMOLR_ROMPE == 0
+        {
+            return TestResult::Fail("igb restore_vf_multicast VF 1 program drift");
+        }
+        // Out-of-range VF fails closed.
+        if vt.restore_vf_multicast(2).is_ok() {
+            return TestResult::Fail("igb restore_vf_multicast accepted an out-of-range VF");
+        }
+        // > 30 hashes: MPME, no MTA sets. Register 31 hashes on
+        // VF 0 through the message path (count stays 31, 30 stored).
+        let mut msg = [0u32; 16];
+        msg[0] = VF_SET_MULTICAST | (31 << 16);
+        for i in 1..16 {
+            msg[i] = 0x0001_0001;
+        }
+        vt.dispatch(0, &msg, &filter).unwrap();
+        if vt.vfs[0].mc_count != 31 {
+            return TestResult::Fail("igb VF multicast >30 count drift");
+        }
+        vt.vmolr[0] &= !(VMOLR_ROMPE | VMOLR_MPME);
+        let prog = match vt.restore_vf_multicast(0) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb restore_vf_multicast failed for >30 hashes"),
+        };
+        if prog.n_mta_sets != 0 || vt.vmolr[0] & VMOLR_MPME == 0 || vt.vmolr[0] & VMOLR_ROMPE != 0 {
+            return TestResult::Fail("igb restore_vf_multicast >30 hashes drift");
+        }
+        // Multicast-promiscuous VF: restore re-applies MPME
+        // instead of the hashes.
+        vt.dispatch(1, &[VF_SET_PROMISC | VF_SET_PROMISC_MULTICAST], &filter)
+            .unwrap();
+        if !vt.vfs[1].multi_promisc {
+            return TestResult::Fail("igb SET_PROMISC did not set multi_promisc");
+        }
+        vt.vmolr[1] &= !(VMOLR_ROMPE | VMOLR_MPME);
+        let prog = match vt.restore_vf_multicast(1) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb restore_vf_multicast failed for promisc VF"),
+        };
+        if prog.n_mta_sets != 0 || vt.vmolr[1] & VMOLR_MPME == 0 || vt.vmolr[1] & VMOLR_ROMPE != 0 {
+            return TestResult::Fail("igb restore_vf_multicast promisc VF drift");
+        }
+        // Plain SET_PROMISC clears the flag: the stored hash comes back.
+        vt.dispatch(1, &[VF_SET_PROMISC], &filter).unwrap();
+        if vt.vfs[1].multi_promisc {
+            return TestResult::Fail("igb plain SET_PROMISC did not clear multi_promisc");
+        }
+        vt.vmolr[1] &= !(VMOLR_ROMPE | VMOLR_MPME);
+        let prog = match vt.restore_vf_multicast(1) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb restore_vf_multicast failed after unpromisc"),
+        };
+        if prog.n_mta_sets != 1 || vt.vmolr[1] & VMOLR_ROMPE == 0 {
+            return TestResult::Fail("igb restore_vf_multicast after unpromisc drift");
+        }
+        // A VF with no hashes gets a bare VMOLR write clearing
+        // both bits and no MTA sets.
+        let mut vt2 = vt_82576_2();
+        vt2.vmolr[0] |= VMOLR_ROMPE | VMOLR_MPME;
+        let prog = match vt2.restore_vf_multicast(0) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("igb restore_vf_multicast failed for empty VF"),
+        };
+        if prog.n_mta_sets != 0
+            || prog.n_writes != 1
+            || vt2.vmolr[0] & (VMOLR_ROMPE | VMOLR_MPME) != 0
+        {
+            return TestResult::Fail("igb restore_vf_multicast empty VF drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_vmdq_restore_vf_multicasts);
 }

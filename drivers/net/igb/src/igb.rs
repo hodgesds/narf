@@ -2495,6 +2495,92 @@ impl Igb {
         Ok(())
     }
 
+    /// PF admin: set a VF's TX rate limit (Linux
+    /// `igb_ndo_set_vf_bw`). Reads STATUS once for the link-up bit
+    /// and the negotiated speed (Linux `igb_link_mbps`: 100 ->
+    /// 100, 1000 -> 1000, anything else, including 10 Mb/s, -> 0
+    /// — deliberately not the publish decoder, which reports
+    /// 10 Mb/s for the 00b field) and applies the VT program.
+    /// There is no VF mailbox message for rate limits, so this is
+    /// PF-admin only.
+    pub fn vt_set_vf_bw(
+        &self,
+        vf: usize,
+        min_tx_rate: i32,
+        max_tx_rate: i32,
+    ) -> Result<(), IgbError> {
+        let status = self.read_status();
+        let link_up = status & STATUS_LU != 0;
+        let link_speed_mbps = match status & STATUS_SPEED_MASK {
+            STATUS_SPEED_1000 | STATUS_SPEED_1000_ALT => 1000,
+            STATUS_SPEED_100 => 100,
+            _ => 0,
+        };
+        let mut vt_guard = self.vt.lock();
+        let Some(vt) = vt_guard.as_mut() else {
+            return Err(IgbError::Other("igb VT not allocated"));
+        };
+        let mut filter = self.vlan_filter.lock();
+        let program = vt
+            .set_vf_bw(vf, min_tx_rate, max_tx_rate, link_speed_mbps, link_up)
+            .map_err(|e| match e {
+                vmdq::VmdqError::Unsupported => {
+                    IgbError::Other("igb VF rate limit unsupported on this device")
+                }
+                _ => IgbError::Other("igb VF rate limit refused (bad VF, rate, or link down)"),
+            })?;
+        self.apply_vt_program(&program, &mut filter);
+        Ok(())
+    }
+
+    /// Re-apply every VF's stored TX rate limit after a link-speed
+    /// change (Linux `igb_check_vf_rate_limit`, the watchdog half
+    /// of rate limiting). No-op when no rate was ever set. NARF
+    /// has no link watchdog yet; call this from the link-change
+    /// path when one lands.
+    pub fn vt_check_vf_rate_limit(&self) -> Result<(), IgbError> {
+        let status = self.read_status();
+        let link_speed_mbps = match status & STATUS_SPEED_MASK {
+            STATUS_SPEED_1000 | STATUS_SPEED_1000_ALT => 1000,
+            STATUS_SPEED_100 => 100,
+            _ => 0,
+        };
+        let mut vt_guard = self.vt.lock();
+        let Some(vt) = vt_guard.as_mut() else {
+            return Err(IgbError::Other("igb VT not allocated"));
+        };
+        let mut filter = self.vlan_filter.lock();
+        let program = vt
+            .check_vf_rate_limit(link_speed_mbps)
+            .map_err(|_| IgbError::Other("igb VF rate limit re-check failed"))?;
+        self.apply_vt_program(&program, &mut filter);
+        Ok(())
+    }
+
+    /// Restore every VF's multicast state after the PF's multicast
+    /// list changed (Linux `igb_restore_vf_multicasts`, called
+    /// from `igb_set_rx_mode` / `igb_write_mc_addr_list` after the
+    /// PF MTA is rewritten). Applies one per-VF program at a time
+    /// — a single program cannot hold all VFs' MTA sets. NARF has
+    /// no `set_rx_mode` / PF MTA writer yet, so nothing in-tree
+    /// calls this today; the PF multicast-list path that lands
+    /// must call it after its MTA rewrite, or VF multicast
+    /// entries will be silently dropped by that rewrite.
+    pub fn vt_restore_vf_multicasts(&self) -> Result<(), IgbError> {
+        let mut vt_guard = self.vt.lock();
+        let Some(vt) = vt_guard.as_mut() else {
+            return Err(IgbError::Other("igb VT not allocated"));
+        };
+        let mut filter = self.vlan_filter.lock();
+        for vf in 0..vt.num_vfs {
+            let program = vt
+                .restore_vf_multicast(vf)
+                .map_err(|_| IgbError::Other("igb VF multicast restore failed"))?;
+            self.apply_vt_program(&program, &mut filter);
+        }
+        Ok(())
+    }
+
     /// Whether the pump owes VF `vf` an ack-NACK: the VF acked a PF
     /// message without CTS and has not been NACKed yet this epoch
     /// (Linux `igb_rcv_ack_from_vf`, whose 2 s `last_nack` throttle
