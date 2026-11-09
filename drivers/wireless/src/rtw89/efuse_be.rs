@@ -715,6 +715,66 @@ impl BeFactory {
     }
 }
 
+/// `struct rtw89_power_trim_info` (core.h:7066) as parsed from the
+/// PHY-cap window — the parse half of the 8922A power trim. The
+/// application half (RF writes) is NOT here: it needs the
+/// `RR_BIASA` TXG/TXA/BIASD field constants, which are a follow-up.
+/// Linux stores the thermal trim as an s8 in a u8 array; NARF keeps
+/// the signed value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Test-driven until the trim application (#1878 follow-up) consumes it.
+pub(super) struct PowerTrim {
+    /// `thermal_trim[2]` (s8, magnitude GENMASK(5, 0), BIT(6) set =
+    /// positive; 0xFF on a path means unprogrammed: that path is 0
+    /// and parsing stops there).
+    pub(super) thermal: [i8; 2],
+    /// `pg_thermal_trim`: false once the first unprogrammed path is hit.
+    pub(super) pg_thermal: bool,
+    /// `pa_bias_trim[2]` raw bytes (2G nibble low, 5G nibble high).
+    pub(super) pa_bias: [u8; 2],
+    /// `pad_bias_trim[2]` raw bytes (same nibble split).
+    pub(super) pad_bias: [u8; 2],
+    /// `pg_pa_bias_trim`: `phycap[0] != 0xFF`. Linux gates BOTH the
+    /// PA-bias and the pad-bias application on this one flag.
+    pub(super) pg_pa_pad: bool,
+}
+
+// The trim window (offsets 0x33/0x34/0x35) fits `PHYCAP_SIZE` 0x38.
+const _: () = assert!(chip_8922a::PHYCAP_SIZE > 0x35);
+
+impl BeFactory {
+    /// `rtw8922a_phycap_parsing_thermal_trim` /
+    /// `_pa_bias_trim` / `_pad_bias_trim` (rtw8922a.c:908..1005) over
+    /// the PHY-cap window (`phycap_addr` 0x1700, offsets relative to
+    /// it): thermal at {0x1706, 0x1733}, PA bias at {0x1707, 0x1734},
+    /// pad bias at {0x1708, 0x1735}, PA/pad programmed flag at
+    /// phycap[0] (0x1700). Parse only — no RF writes.
+    #[allow(dead_code)] // Test-driven until the trim application (#1878 follow-up) consumes it.
+    pub(super) fn power_trim(&self) -> PowerTrim {
+        const THERMAL: [usize; 2] = [6, 0x33];
+        const PA_BIAS: [usize; 2] = [7, 0x34];
+        const PAD_BIAS: [usize; 2] = [8, 0x35];
+        let mut thermal = [0i8; 2];
+        let mut pg_thermal = true;
+        for (i, &off) in THERMAL.iter().enumerate() {
+            let raw = self.phycap[off];
+            if raw == 0xFF {
+                pg_thermal = false;
+                break;
+            }
+            let mag = (raw & 0x3f) as i8;
+            thermal[i] = if raw & 0x40 != 0 { mag } else { -mag };
+        }
+        PowerTrim {
+            thermal,
+            pg_thermal,
+            pa_bias: [self.phycap[PA_BIAS[0]], self.phycap[PA_BIAS[1]]],
+            pad_bias: [self.phycap[PAD_BIAS[0]], self.phycap[PAD_BIAS[1]]],
+            pg_pa_pad: self.phycap[0] != 0xFF,
+        }
+    }
+}
+
 /// Read the full 8922A factory identity over PCIe BAR2: the BE
 /// analog of `efuse::read_mac` for the probe path. `cut` is the
 /// chip-version field from `R_AX_SYS_CFG1` (Linux reads `cv` from

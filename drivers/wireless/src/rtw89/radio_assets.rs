@@ -11,6 +11,23 @@
 //! the shipped `rtw8851b_fw-1.bin` carries BB, GAIN, RADIO_A idx 0 and NCTL;
 //! a RADIO_B element is refused and, with no static rtw8851b_table.c copy, a
 //! container missing any of the four is refused (`Error::Element`).
+//!
+//! RTL8922A mirrors `rtw8922a_chip_info.rf_table = {}` (and
+//! `bb_table` / `bb_gain_table` / `nctl_table` / `dflt_parms` all NULL,
+//! "load parm from fw"): the element-built tables are the only source.
+//! fw.c `rtw89_build_phy_tbl_from_elm` stores a RADIO element at
+//! `rf_radio[reg2.idx]` and phy.c `rtw89_phy_init_rf_reg` reads
+//! `rf_radio[path]`, so the idx must equal the path — RADIO_A idx 0,
+//! RADIO_B idx 1 (the B order, not the C `{radiob, radioa}` static
+//! order). With no static rtw8922a_table.c copy, a container missing
+//! any of the five tables is refused (`Error::Element`).
+//!
+//! Aid note (all chips): core.c assigns `hal.aid` from XTAL only for
+//! BE; fw.c ignores an element whose nonzero aid differs from
+//! `hal.aid`. NARF keeps only aid-0 elements and skips every other
+//! element entirely — a documented narrowing, not a silent default:
+//! a BE container whose PHY tables all carry a nonzero aid is refused
+//! for missing tables rather than matched against an unknown aid.
 use super::{mac::ChipId, prepared::PreparedFirmware, radio_table::Pair, radio_tables_b};
 use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +71,7 @@ impl Assets {
     pub fn from_prepared(image: &PreparedFirmware) -> Result<Self, Error> {
         if !matches!(
             image.chip(),
-            ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+            ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B | ChipId::Rtl8922A
         ) {
             return Err(Error::Unsupported);
         }
@@ -74,8 +91,9 @@ impl Assets {
     pub(super) fn parse_for(chip: ChipId, bytes: &[u8]) -> Result<Self, Error> {
         let c = chip == ChipId::Rtl8852C;
         let n51 = chip == ChipId::Rtl8851B;
+        let be = chip == ChipId::Rtl8922A;
         // Chips without a static table fallback in NARF.
-        let no_static = c || n51;
+        let no_static = c || n51 || be;
         let mut digest = narf_crypto::sha256::Sha256::new();
         digest.update(bytes);
         let mut result = Self {
@@ -142,6 +160,9 @@ impl Assets {
                     let idx = bytes[cursor + 24];
                     // Path slot = reg2.idx in Linux; B ships A at 0, C ships
                     // `{radiob, radioa}` so RADIO_A is slot 1 and RADIO_B 0.
+                    // BE (8922A, empty static rf_table) takes the idx == path
+                    // order: fw.c stores at rf_radio[idx] and phy.c reads
+                    // rf_radio[path].
                     let (a, b) = if c { (1, 0) } else { (0, 1) };
                     if (id == 4 && idx != a)
                         || (id == 5 && (n51 || idx != b))
@@ -176,6 +197,7 @@ impl Assets {
         }
         if c && result.tables.iter().any(Option::is_none)
             || n51 && [0, 1, 2, 4].iter().any(|&i| result.tables[i].is_none())
+            || be && result.tables.iter().any(Option::is_none)
         {
             return Err(Error::Element);
         }
@@ -215,9 +237,13 @@ impl Assets {
         self.chip
     }
     /// Index 0 BB, 1 BB gain, 2 RF path A, 3 RF path B, 4 NCTL. RTL8851B
-    /// has no path B table (index 3 is `None`).
+    /// has no path B table (index 3 is `None`). RTL8922A returns the
+    /// firmware tables (no static fallback).
     pub fn table(&self, index: usize) -> Option<&[Pair]> {
-        if matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B) {
+        if matches!(
+            self.chip,
+            ChipId::Rtl8852C | ChipId::Rtl8851B | ChipId::Rtl8922A
+        ) {
             return self.tables.get(index)?.as_deref();
         }
         let defaults = [
@@ -420,5 +446,57 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/rtw89",
         smoke_rtw89_n51_radio_assets_follow_linux_single_radioa_slot
+    );
+    fn smoke_rtw89_be_radio_assets_follow_linux_empty_rf_table() -> TestResult {
+        let pair = |a: u32| [a.to_le_bytes(), 0x12345u32.to_le_bytes()].concat();
+        // The 8922A layout: BB, GAIN, RADIO_A idx0, RADIO_B idx1, NCTL;
+        // all aid 0 (rtw8922a_chip_info.rf_table = {}: the element idx
+        // must equal the path, fw.c rf_radio[idx] / phy.c rf_radio[path]).
+        let full = |a_idx: u8, b_idx: u8, skip: Option<u32>| {
+            let mut bytes = container();
+            for (id, idx) in [(2, 0), (3, 0), (4, a_idx), (5, b_idx), (8, 0)] {
+                if skip != Some(id) {
+                    add(&mut bytes, id, 0, idx, &pair(0x100 + id));
+                }
+            }
+            add(&mut bytes, 9, 0, 0, &[1, 2, 3, 4, 5, 6, 7, 8]);
+            bytes
+        };
+        let Ok(assets) = Assets::parse_for(ChipId::Rtl8922A, &full(0, 1, None)) else {
+            return TestResult::Fail("8922A BB/GAIN/RADIO_A idx0/RADIO_B idx1/NCTL refused");
+        };
+        for (index, id) in [(0, 2), (1, 3), (2, 4), (3, 5), (4, 8)] {
+            if assets.table(index) != Some(&[Pair(0x100 + id, 0x12345)][..]) {
+                return TestResult::Fail("8922A element did not land in its Linux path table");
+            }
+        }
+        if assets.chip() != ChipId::Rtl8922A
+            || assets.elements().len() != 1
+            || assets.elements()[0].id != 9
+        {
+            return TestResult::Fail("8922A lost its chip or its retained TXPWR element");
+        }
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        if assets.bind(&mut hash, 1, 0).is_err() {
+            return TestResult::Fail("8922A five-table set did not bind");
+        }
+        // The C `{radiob, radioa}` slot order, and any missing table,
+        // are refused: no static rtw8922a_table.c fallback is fabricated.
+        if Assets::parse_for(ChipId::Rtl8922A, &full(1, 0, None)).is_ok() {
+            return TestResult::Fail("8922A accepted the C radio slot order");
+        }
+        for id in [2, 3, 4, 5, 8] {
+            if Assets::parse_for(ChipId::Rtl8922A, &full(0, 1, Some(id))).is_ok() {
+                return TestResult::Fail("8922A container with a missing PHY table was defaulted");
+            }
+        }
+        if Assets::parse_for(ChipId::Rtl8922A, &[0u8; 64]).is_ok() {
+            return TestResult::Fail("legacy 8922A image without elements produced PHY tables");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw89",
+        smoke_rtw89_be_radio_assets_follow_linux_empty_rf_table
     );
 }

@@ -7,9 +7,13 @@
 //! (torvalds/linux @ 05441d6). This is the profile half of
 //! the TX-power program: the per-path calibration values
 //! read out of efuse, in typed form, with no RF writes.
-//! The consumer half — by-rate TX-power tables, thermal
-//! tracking, TSSI compensation loops, regulatory limits —
-//! is a separate remainder, as is Prepared wiring.
+//! The consumer half is now `radio_power_be::Plan` (by-rate
+//! TX-power tables, regulatory limits, shape, diff/ref/SAR,
+//! from the container's firmware TXPWR elements) and
+//! `efuse_be::BeFactory::power_trim` (thermal / PA-bias /
+//! pad-bias trim parse from the PHY-cap window). Still open:
+//! periodic thermal / TSSI tracking, TSSI compensation loops,
+//! and the RFK reruns (follow-ups of #1878).
 //!
 //! Inputs are the raw efuse field values, not an efuse
 //! map struct: NARF's 8922A efuse support stops at block
