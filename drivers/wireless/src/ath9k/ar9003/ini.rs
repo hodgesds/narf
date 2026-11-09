@@ -16,7 +16,7 @@ use super::initvals_ar9462::*;
 use super::initvals_ar9485::*;
 use super::initvals_ar9565::*;
 use super::initvals_ar9580::*;
-use super::{eeprom::Identity, Chip, Revision};
+use super::{eeprom::Identity, serdes::PllPwrsave, Chip, Revision};
 
 /// Which `ar9003_tx_gain_table_mode*` table applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,14 +92,18 @@ pub(in crate::ath9k) struct Tables {
 impl Tables {
     /// `ar9003_hw_init_mode_regs` + `ar9003_hw_init_mode_gain_regs` for
     /// the decoded silicon: `AR_SREV_9580` is tested before the AR9300
-    /// default branch.
-    pub fn for_revision(revision: &Revision, identity: &Identity) -> Self {
+    /// default branch. `pll_pwrsave` is `__ath9k_hw_init`'s resolved
+    /// `ah->config.pll_pwrsave`; it selects the PCIe SerDes arrays
+    /// (see `super::serdes`): the AR9485 table swap and the
+    /// AR9462/AR9565 slot presence. The AR9300's SerDes table is
+    /// unconditional and the AR9580 has none, so neither reads it.
+    pub fn for_revision(revision: &Revision, identity: &Identity, pll_pwrsave: PllPwrsave) -> Self {
         match revision.chip {
             Chip::Ar9300 => Self::ar9300(revision, identity),
             Chip::Ar9580 => Self::ar9580(identity),
-            Chip::Ar9462 => Self::ar9462(revision, identity),
-            Chip::Ar9565 => Self::ar9565(revision, identity),
-            Chip::Ar9485 => Self::ar9485(identity),
+            Chip::Ar9462 => Self::ar9462(revision, identity, pll_pwrsave),
+            Chip::Ar9565 => Self::ar9565(revision, identity, pll_pwrsave),
+            Chip::Ar9485 => Self::ar9485(identity, pll_pwrsave),
         }
     }
 
@@ -216,11 +220,12 @@ impl Tables {
     /// baseband core/postamble overrides and the 5G-XLNA array; mode 3
     /// is the 5G-XLNA-only table — an alias of the mixed table — with
     /// the 5G-XLNA array; index `>= 4` keeps the common default).
-    /// Linux sets no `ini_dfs` for the AR9462, so `dfs` stays empty; the
-    /// PCIe SerDes arrays are the `pciephy_clkreq_disable_L1` table in
-    /// both slots (Linux gates them on `pll_pwrsave`, which this
-    /// preparation does not model yet, like the AR9300's).
-    pub fn ar9462(revision: &Revision, identity: &Identity) -> Self {
+    /// Linux sets no `ini_dfs` for the AR9462, so `dfs` stays empty.
+    /// The PCIe SerDes slots are the `pciephy_clkreq_disable_L1`
+    /// table only when `pll_pwrsave` enables them (awake on CONTROL
+    /// + ON_D3, low-power on CONTROL + ON_D0); with the resolved
+    /// default 7 both are set.
+    pub fn ar9462(revision: &Revision, identity: &Identity, pll_pwrsave: PllPwrsave) -> Self {
         // 2.1 owns only its MAC core, baseband postamble and SoC
         // preamble; every other 2.1 name aliases the 2.0 table. The
         // branch names the 2.1 tables throughout, as the Linux 2.1
@@ -245,7 +250,6 @@ impl Tables {
             mix_core,
             mix_post,
             xlna,
-            serdes,
             fast_clock,
             txfir,
         ) = if revision.ar9462_21() {
@@ -269,7 +273,6 @@ impl Tables {
                 AR9462_2P1_BASEBAND_CORE_MIX_RXGAIN,
                 AR9462_2P1_BASEBAND_POSTAMBLE_MIX_RXGAIN,
                 AR9462_2P1_BASEBAND_POSTAMBLE_5G_XLNA,
-                AR9462_2P1_PCIEPHY_CLKREQ_DISABLE_L1,
                 AR9462_2P1_MODES_FAST_CLOCK,
                 AR9462_2P1_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
             )
@@ -294,11 +297,33 @@ impl Tables {
                 AR9462_2P0_BASEBAND_CORE_MIX_RXGAIN,
                 AR9462_2P0_BASEBAND_POSTAMBLE_MIX_RXGAIN,
                 AR9462_2P0_BASEBAND_POSTAMBLE_5G_XLNA,
-                AR9462_2P0_PCIEPHY_CLKREQ_DISABLE_L1,
                 AR9462_2P0_MODES_FAST_CLOCK,
                 AR9462_2P0_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
             )
         };
+        // The SerDes slots are the `pciephy_clkreq_disable_L1` table
+        // only when `pll_pwrsave` enables them (awake on CONTROL +
+        // ON_D3, low-power on CONTROL + ON_D0); with the resolved
+        // default 7 both are set, with 0 both stay unset. The 2.1
+        // table `#define`-aliases the 2.0 table, so the revision only
+        // picks which name is spelled.
+        let serdes_table = if revision.ar9462_21() {
+            AR9462_2P1_PCIEPHY_CLKREQ_DISABLE_L1
+        } else {
+            AR9462_2P0_PCIEPHY_CLKREQ_DISABLE_L1
+        };
+        let (serdes, serdes_low_power) = (
+            if pll_pwrsave.control() && pll_pwrsave.on_d3() {
+                serdes_table
+            } else {
+                &[][..]
+            },
+            if pll_pwrsave.control() && pll_pwrsave.on_d0() {
+                serdes_table
+            } else {
+                &[][..]
+            },
+        );
         let (tx_gain, tx_gain_kind) = match identity.tx_gain {
             1 => (high_tx, TxGain::HighObDb),
             2 => (AR9300_MODES_LOW_OB_DB_TX_GAIN_TABLE_2P2, TxGain::LowObDb),
@@ -331,7 +356,7 @@ impl Tables {
             rxgain_bb_postamble,
             rxgain_xlna,
             pcie_serdes: serdes,
-            pcie_serdes_low_power: serdes,
+            pcie_serdes_low_power: serdes_low_power,
             fast_clock,
             cck_fir_japan_2484: txfir,
             dfs: &[],
@@ -354,11 +379,11 @@ impl Tables {
     /// name `#define`-aliases its 1.0 table), so only that array is
     /// selected on `ar9565_11_or_later`; the gain tables are the 1.0
     /// constants for both revisions. Linux sets no `ini_dfs` for the
-    /// AR9565, so `dfs` stays empty; the PCIe SerDes arrays are the
-    /// `pciephy_clkreq_disable_L1` table in both slots (Linux gates them
-    /// on `pll_pwrsave`, which this preparation does not model yet, like
-    /// the AR9462's).
-    pub fn ar9565(revision: &Revision, identity: &Identity) -> Self {
+    /// AR9565, so `dfs` stays empty. The PCIe SerDes slots are the
+    /// `pciephy_clkreq_disable_L1` table only when `pll_pwrsave`
+    /// enables them (awake on CONTROL + ON_D3, low-power on CONTROL
+    /// + ON_D0); with the resolved default 7 both are set.
+    pub fn ar9565(revision: &Revision, identity: &Identity, pll_pwrsave: PllPwrsave) -> Self {
         let radio_post = if revision.ar9565_11_or_later() {
             AR9565_1P1_RADIO_POSTAMBLE
         } else {
@@ -378,6 +403,21 @@ impl Tables {
             1 => (AR9565_1P0_COMMON_WO_XLNA_RX_GAIN_TABLE, RxGain::WithoutXlna),
             _ => (AR9565_1P0_COMMON_RX_GAIN_TABLE, RxGain::Common),
         };
+        // Same SerDes gating as the AR9462: each slot is the
+        // `pciephy_clkreq_disable_L1` table only when `pll_pwrsave`
+        // enables it. The 1.1 table `#define`-aliases the 1.0 table.
+        let (serdes, serdes_low_power) = (
+            if pll_pwrsave.control() && pll_pwrsave.on_d3() {
+                AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1
+            } else {
+                &[][..]
+            },
+            if pll_pwrsave.control() && pll_pwrsave.on_d0() {
+                AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1
+            } else {
+                &[][..]
+            },
+        );
         Self {
             mac_core: AR9565_1P0_MAC_CORE,
             mac_post: AR9565_1P0_MAC_POSTAMBLE,
@@ -395,8 +435,8 @@ impl Tables {
             rxgain_bb_core: &[],
             rxgain_bb_postamble: &[],
             rxgain_xlna: &[],
-            pcie_serdes: AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1,
-            pcie_serdes_low_power: AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1,
+            pcie_serdes: serdes,
+            pcie_serdes_low_power: serdes_low_power,
             fast_clock: AR9565_1P0_MODES_FAST_CLOCK,
             cck_fir_japan_2484: AR9565_1P0_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
             dfs: &[],
@@ -408,17 +448,18 @@ impl Tables {
     /// `ar9003_hw_init_mode_regs`' `AR_SREV_9485_11_OR_LATER` branch: the
     /// 1.1 MAC/BB/radio/SoC arrays (BB pre, allmodes radio postamble, no
     /// SoC postamble, no fast clock, no DFS), the Japan 2484 CCK FIR
-    /// alias of the AR9300 2p2 table, and the `pcie_phy_clkreq_disable_L1`
-    /// SerDes table in both slots (Linux gates the
-    /// `pll_on_cdr_on_clkreq_disable_L1` table on `pll_pwrsave`, not
-    /// modeled here). Then `ar9003_tx_gain_table_apply` (index `>= 8` is
-    /// mode 0; mode 4 has no 9485 arm and falls through to the AR9300 2p2
-    /// mixed table; mode 7 sets nothing for non-9340, so it keeps the
-    /// mode-0 lowest-ob/db default, which is the low-ob/db table) and
+    /// alias of the AR9300 2p2 table, and the SerDes tables selected on
+    /// `pll_pwrsave`: CONTROL set programs the
+    /// `pll_on_cdr_on_clkreq_disable_L1` table in both slots, CONTROL
+    /// clear the `pcie_phy_clkreq_disable_L1` table. Then
+    /// `ar9003_tx_gain_table_apply` (index `>= 8` is mode 0; mode 4 has
+    /// no 9485 arm and falls through to the AR9300 2p2 mixed table; mode
+    /// 7 sets nothing for non-9340, so it keeps the mode-0 lowest-ob/db
+    /// default, which is the low-ob/db table) and
     /// `ar9003_rx_gain_table_apply` (mode 1 is the wo-XLNA table; modes
     /// 2/3 are AR9462-only and keep the wo-XLNA default; index `>= 4`
     /// keeps the common default).
-    pub fn ar9485(identity: &Identity) -> Self {
+    pub fn ar9485(identity: &Identity, pll_pwrsave: PllPwrsave) -> Self {
         let (tx_gain, tx_gain_kind) = match identity.tx_gain {
             1 => (AR9485MODES_HIGH_OB_DB_TX_GAIN_1_1, TxGain::HighObDb),
             2 => (AR9485MODES_LOW_OB_DB_TX_GAIN_1_1, TxGain::LowObDb),
@@ -438,6 +479,21 @@ impl Tables {
             1..=3 => (AR9485COMMON_WO_XLNA_RX_GAIN_1_1, RxGain::WithoutXlna),
             _ => (AR9485_COMMON_RX_GAIN_1_1, RxGain::Common),
         };
+        // SerDes selection on `pll_pwrsave`: CONTROL set is the
+        // `pll_on_cdr_on` table in both slots (the resolved default
+        // for a plain AR9485 card), CONTROL clear the `clkreq` table
+        // (the `ATH9K_PCI_NO_PLL_PWRSAVE` subsystems).
+        let (serdes, serdes_low_power) = if pll_pwrsave.control() {
+            (
+                AR9485_1_1_PLL_ON_CDR_ON_CLKREQ_DISABLE_L1,
+                AR9485_1_1_PLL_ON_CDR_ON_CLKREQ_DISABLE_L1,
+            )
+        } else {
+            (
+                AR9485_1_1_PCIE_PHY_CLKREQ_DISABLE_L1,
+                AR9485_1_1_PCIE_PHY_CLKREQ_DISABLE_L1,
+            )
+        };
         Self {
             mac_core: AR9485_1_1_MAC_CORE,
             mac_post: AR9485_1_1_MAC_POSTAMBLE,
@@ -455,8 +511,8 @@ impl Tables {
             rxgain_bb_core: &[],
             rxgain_bb_postamble: &[],
             rxgain_xlna: &[],
-            pcie_serdes: AR9485_1_1_PCIE_PHY_CLKREQ_DISABLE_L1,
-            pcie_serdes_low_power: AR9485_1_1_PCIE_PHY_CLKREQ_DISABLE_L1,
+            pcie_serdes: serdes,
+            pcie_serdes_low_power: serdes_low_power,
             fast_clock: &[],
             cck_fir_japan_2484: AR9300_2P2_BASEBAND_CORE_TXFIR_COEFF_JAPAN_2484,
             dfs: &[],

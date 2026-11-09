@@ -2348,8 +2348,11 @@ failures, `DeviceGone` or `BadState` stop it); otherwise
 `ath9k_hw_disable` (COLD `set_reset_reg`, `ath9k_hw_init_pll`) +
 `ath9k_set_power_sleep` for AR9300 without MCI (`AR_STA_ID1_PWR_SAV` set,
 `AR_RTC_FORCE_WAKE_EN` and `AR_RTC_RESET_EN` cleared, 2 µs, `AR_WA`
-without `AR_WA_D3_L1_DISABLE`; no `AR_RC` write). `ar9003_hw_configpcipowersave`
-is not called (Linux calls it from `ath9k_stop`, not `ath_pci_suspend`).
+without `AR_WA_D3_L1_DISABLE`; no `AR_RC` write).
+`ar9003_hw_configpcipowersave` runs only from `initialize`
+(`ath9k_start`, restore) and `remove` (`ath9k_stop`, power-off); it is
+not called on suspend (Linux calls it from `ath9k_stop`, not
+`ath_pci_suspend`) or on reset.
 Resume clears PCI config 0x41 and runs the generation reset (COLD).
 The owner carries no HT, EDCA, QoS, block-ack, aggregation or power-save
 program, matching the AR9280 station scope; ANI is not ported. Smokes
@@ -2419,8 +2422,10 @@ the common default). `phy::prepare`/`expected` program the sys2ant
 postamble (9462-only in Linux) and the RX-gain overrides, and count
 the override writes; Linux sets no DFS array for the AR9462, so
 `dfs` stays empty, and the PCIe SerDes arrays are the
-`pciephy_clkreq_disable_L1` table in both slots (Linux gates them on
-`pll_pwrsave`, not modeled here). The owner matches `0x0034` as
+`pciephy_clkreq_disable_L1` table in both slots only when
+`pll_pwrsave` enables them (awake on CONTROL+ON_D3, low-power on
+CONTROL+ON_D0; `ath9k_hw_init_config` forces 7 for this chip, so the
+resolved default sets both). The owner matches `0x0034` as
 `ath9k-ar9462` and the admission record is `N46A` v1 (two-chain) under
 `ath9k/ar9462-admit-v1-ch<N>-<mac>.bin`, binding the 2p0/2p1 INI
 preparation. AR9300/AR9580 tables and streams are unchanged. Smokes
@@ -2428,7 +2433,8 @@ preparation. AR9300/AR9580 tables and streams are unchanged. Smokes
 `smoke_ath9k_ar9462_revision_and_ini_selection` (FNV-1a oracle over
 the 755 default-selected 2 GHz HT20 rows for each of 2.0 and 2.1, and
 every TX/RX gain mode with the mode 2/3 override arrays, computed
-from the local Linux headers) and
+from the local Linux headers, plus the SerDes `pll_pwrsave` selection
+matrix) and
 `smoke_ath9k_ar9462_admission_records_bind_part_channel_and_magic`.
 Remainder, not in this step: WoW
 (`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
@@ -2453,9 +2459,10 @@ mac-postamble `#define` is transcribed from
 `ini::Tables::for_revision` dispatches `ar9003_hw_init_mode_regs` on
 the `AR_SREV_9485_11_OR_LATER` branch: `Tables::ar9485` is the 1.1 set
 (BB pre array, allmodes radio postamble, no SoC postamble, no fast
-clock, no DFS; the `pcie_phy_clkreq_disable_L1` SerDes table in both
-slots — Linux gates the `pll_on_cdr_on` table on `pll_pwrsave`, not
-modeled here) plus `ar9003_tx_gain_table_apply` (modes 0/1/2/3 are the
+clock, no DFS; the SerDes tables are selected on `pll_pwrsave` —
+CONTROL set programs the `pll_on_cdr_on_clkreq_disable_L1` table in
+both slots, CONTROL clear the `pcie_phy_clkreq_disable_L1` table) plus
+`ar9003_tx_gain_table_apply` (modes 0/1/2/3 are the
 9485 lowest/high/low-ob/db/high-power tables; mode 4 falls through to
 the AR9300 2p2 mixed table; modes 5/6 are the green/green-spur tables;
 mode 7 sets nothing and keeps the mode-0 lowest-ob/db default; index
@@ -2473,12 +2480,12 @@ AR9300/AR9580 tables and streams are unchanged. Smokes (written, not
 executed):
 `smoke_ath9k_ar9485_revision_and_ini_selection` (FNV-1a oracle over
 the 648 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
-computed from the local Linux headers) and
+computed from the local Linux headers, plus the SerDes `pll_pwrsave`
+selection matrix) and
 `smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`.
 Remainder, not in this step: WoW, the
 AR9485 board-value deltas and per-chip calibration branches (including
-the 9485 antenna-diversity/LNA-diversity code), and the SerDes
-`pll_pwrsave` conditional programming.
+the 9485 antenna-diversity/LNA-diversity code).
 
 **AR9565 (`ar9565_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
@@ -2514,20 +2521,51 @@ low-ob/db table by `#define` — and index >= 8 is mode 0) and
 `expected` need no 9565 change (the sys2ant postamble and RX-gain
 overrides are empty for this chip). Linux sets no DFS array for the
 AR9565, so `dfs` stays empty, and the PCIe SerDes arrays are the
-`pciephy_clkreq_disable_L1` table in both slots (Linux gates them on
-`pll_pwrsave`, not modeled here). The owner matches `0x0036` as
+`pciephy_clkreq_disable_L1` table in both slots only when
+`pll_pwrsave` enables them (awake on CONTROL+ON_D3, low-power on
+CONTROL+ON_D0; `ath9k_hw_init_config` forces 7 for this chip, so the
+resolved default sets both, and the 1.1 table `#define`-aliases the
+1.0 table). The owner matches `0x0036` as
 `ath9k-ar9565` and the admission record is `N65A` v1 (one-chain)
 under `ath9k/ar9565-admit-v1-ch<N>-<mac>.bin`, binding the 1p0/1p1
 INI preparation. AR9300/AR9580/AR9462 tables and streams are
 unchanged. Smokes (written, not executed):
 `smoke_ath9k_ar9565_revision_and_ini_selection` (FNV-1a oracle over
 the 711 default-selected 2 GHz HT20 rows for each of 1.0 and 1.1, and
-every TX/RX gain mode, computed from the local Linux headers) and
+every TX/RX gain mode, computed from the local Linux headers, plus
+the SerDes `pll_pwrsave` selection matrix) and
 `smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic`.
 Remainder, not in this step: WoW
 (`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), the AR9565 board-value
-deltas and per-chip calibration branches, and the SerDes `pll_pwrsave`
-gating.
+deltas and per-chip calibration branches.
+
+**SerDes `pll_pwrsave` (`ar9003/serdes.rs`, modeled).**
+`ah->config.pll_pwrsave` (`hw.h`, u8: CONTROL `BIT(0)`, ON_D3
+`BIT(1)`, ON_D0 `BIT(2)`) resolves in `PllPwrsave::resolve`: 1 by
+default, 0 for the 17 `ATH9K_PCI_NO_PLL_PWRSAVE` subsystems in
+`pci.c` (all AR9485 `0x0032` cards), 7 forced by
+`ath9k_hw_init_config` for AR9462/AR9565. Selection in
+`ini::Tables::for_revision`: AR9300 programs its table in both slots
+unconditionally, AR9580 has no SerDes arrays, AR9485 selects
+`pll_on_cdr_on` on CONTROL set and `clkreq` on CONTROL clear (both
+slots), AR9462/AR9565 set each slot only on CONTROL plus its ON bit.
+Programming is `serdes::configure` (`ar9003_hw_configpcipowersave`):
+on restore it sets `AR_PCIE_PM_CTRL_ENA` (`0x4014`) and writes the
+latched `AR_WA` word (`0x4004`), then writes the low-power array; on
+power-off only the awake array; AR9462 first applies the
+L1-entry-latency fix (`0x570c`, from PCI config `0x70c`, written only
+when the top byte is `0x17`). The owner resolves `pll_pwrsave` at
+probe from the exact subsystem and reads PCI config `0x70c` for
+AR9462, calls `configure(..., false, ...)` from `initialize`
+(`ath9k_start`) and `configure(..., true, ...)` best-effort from
+`remove` (`ath9k_stop`); never from reset or suspend. Smokes
+(written, not executed):
+`smoke_ath9k_ar9003_serdes_pll_pwrsave_resolution` (the 17
+NO_PLL_PWRSAVE subsystems resolve to 0, AR9462/AR9565 to 7, other
+AR9485 to 1) and
+`smoke_ath9k_ar9003_serdes_configpcipowersave_sequence` (the exact
+restore/power-off op sequences, the L1-fix gating, empty slots, and
+revoked authority).
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.

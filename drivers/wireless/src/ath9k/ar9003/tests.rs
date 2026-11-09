@@ -640,7 +640,11 @@ fn smoke_ath9k_ar9580_revision_split_and_ini_selection() -> TestResult {
     let mut tables_for = |gain: u8| {
         restored.image[eeprom::field::TXRX_GAIN] = gain;
         let identity = eeprom::Identity::decode(Chip::Ar9580, &restored).ok()?;
-        Some(Tables::for_revision(&revision, &identity))
+        Some(Tables::for_revision(
+            &revision,
+            &identity,
+            serdes::PllPwrsave::resolve(Chip::Ar9580, 0, 0),
+        ))
     };
     let Some(default) = tables_for(0x00) else {
         return TestResult::Fail("identity refused");
@@ -867,14 +871,14 @@ fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
         mac_rev: 3,
         ..rev20
     };
-    let mut tables_for = |gain: u8, revision: &Revision| {
+    let mut tables_for = |gain: u8, revision: &Revision, pll: serdes::PllPwrsave| {
         // A genuine AR9462 board carries two-chain EEPROM masks; the
         // shared AR9300 template's three-chain mask (0x77) is foreign to
         // this chip and `Identity::decode` rightly refuses it.
         restored.image[eeprom::field::TXRX_MASK] = 0x33;
         restored.image[eeprom::field::TXRX_GAIN] = gain;
         let identity = eeprom::Identity::decode(Chip::Ar9462, &restored).ok()?;
-        Some(Tables::for_revision(revision, &identity))
+        Some(Tables::for_revision(revision, &identity, pll))
     };
     // FNV-1a oracle over the Linux order mac/bb/radio/soc core+post,
     // sys2ant postamble, rx, tx gain at 2G HT20 (computed from the local
@@ -909,7 +913,9 @@ fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
     };
     use super::initvals as i;
     use super::initvals_ar9462 as t;
-    let Some(default20) = tables_for(0x00, &rev20) else {
+    // `ath9k_hw_init_config` forces 7 for this chip.
+    let pll9462 = serdes::PllPwrsave::resolve(Chip::Ar9462, 0, 0);
+    let Some(default20) = tables_for(0x00, &rev20, pll9462) else {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default20) != (0x6b83_5b40_4777_8dd5, 755)
@@ -931,7 +937,34 @@ fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
     {
         return TestResult::Fail("AR9462 2p0 default INI selection differs from Linux");
     }
-    let Some(default21) = tables_for(0x00, &rev21) else {
+    // SerDes slots follow `pll_pwrsave`: the awake array only on
+    // CONTROL+ON_D3, the low-power array only on CONTROL+ON_D0.
+    // (`ath9k_hw_init_config` forces 7 for this chip, so the resolved
+    // default sets both.)
+    for (bits, awake, low) in [
+        (7u8, 3usize, 3usize),
+        (0, 0, 0),
+        (1, 0, 0),
+        (3, 3, 0),
+        (5, 0, 3),
+    ] {
+        let Some(tables) = tables_for(0x00, &rev20, serdes::PllPwrsave::from_bits(bits)) else {
+            return TestResult::Fail("identity refused");
+        };
+        if tables.pcie_serdes.len() != awake
+            || tables.pcie_serdes_low_power.len() != low
+            || (awake > 0
+                && !core::ptr::eq(tables.pcie_serdes, t::AR9462_2P0_PCIEPHY_CLKREQ_DISABLE_L1))
+            || (low > 0
+                && !core::ptr::eq(
+                    tables.pcie_serdes_low_power,
+                    t::AR9462_2P0_PCIEPHY_CLKREQ_DISABLE_L1,
+                ))
+        {
+            return TestResult::Fail("AR9462 SerDes selection differs from Linux");
+        }
+    }
+    let Some(default21) = tables_for(0x00, &rev21, pll9462) else {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default21) != (0xf5f2_6f37_ac39_d73d, 755)
@@ -1110,7 +1143,7 @@ fn smoke_ath9k_ar9462_revision_and_ini_selection() -> TestResult {
         (x, x_hash),
     ) in checks
     {
-        let Some(tables) = tables_for(gain, &rev20) else {
+        let Some(tables) = tables_for(gain, &rev20, pll9462) else {
             return TestResult::Fail("identity refused");
         };
         // Empty override arrays compare by emptiness: two distinct `&[]`
@@ -1215,14 +1248,14 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
         mac_rev: 2,
         ..rev10
     };
-    let mut tables_for = |gain: u8, revision: &Revision| {
+    let mut tables_for = |gain: u8, revision: &Revision, pll: serdes::PllPwrsave| {
         // A genuine AR9565 board carries one-chain EEPROM masks; the
         // shared AR9300 template's three-chain mask (0x77) is foreign to
         // this chip and `Identity::decode` rightly refuses it.
         restored.image[eeprom::field::TXRX_MASK] = 0x11;
         restored.image[eeprom::field::TXRX_GAIN] = gain;
         let identity = eeprom::Identity::decode(Chip::Ar9565, &restored).ok()?;
-        Some(Tables::for_revision(revision, &identity))
+        Some(Tables::for_revision(revision, &identity, pll))
     };
     // FNV-1a oracle over the Linux order mac/bb/radio/soc core+post,
     // sys2ant postamble, rx, tx gain at 2G HT20 (computed from the local
@@ -1257,7 +1290,9 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
     };
     use super::initvals as i;
     use super::initvals_ar9565 as t;
-    let Some(default10) = tables_for(0x00, &rev10) else {
+    // `ath9k_hw_init_config` forces 7 for this chip.
+    let pll9565 = serdes::PllPwrsave::resolve(Chip::Ar9565, 0, 0);
+    let Some(default10) = tables_for(0x00, &rev10, pll9565) else {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default10) != (0xacd9_a70b_8756_3d5a, 711)
@@ -1276,7 +1311,34 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
     {
         return TestResult::Fail("AR9565 1p0 default INI selection differs from Linux");
     }
-    let Some(default11) = tables_for(0x00, &rev11) else {
+    // SerDes slots follow `pll_pwrsave`: the awake array only on
+    // CONTROL+ON_D3, the low-power array only on CONTROL+ON_D0.
+    // (`ath9k_hw_init_config` forces 7 for this chip, so the resolved
+    // default sets both; the 1.1 table is the 1.0 table by `#define`.)
+    for (bits, awake, low) in [
+        (7u8, 3usize, 3usize),
+        (0, 0, 0),
+        (1, 0, 0),
+        (3, 3, 0),
+        (5, 0, 3),
+    ] {
+        let Some(tables) = tables_for(0x00, &rev10, serdes::PllPwrsave::from_bits(bits)) else {
+            return TestResult::Fail("identity refused");
+        };
+        if tables.pcie_serdes.len() != awake
+            || tables.pcie_serdes_low_power.len() != low
+            || (awake > 0
+                && !core::ptr::eq(tables.pcie_serdes, t::AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1))
+            || (low > 0
+                && !core::ptr::eq(
+                    tables.pcie_serdes_low_power,
+                    t::AR9565_1P0_PCIEPHY_CLKREQ_DISABLE_L1,
+                ))
+        {
+            return TestResult::Fail("AR9565 SerDes selection differs from Linux");
+        }
+    }
+    let Some(default11) = tables_for(0x00, &rev11, pll9565) else {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default11) != (0x550e_5802_200a_6506, 711)
@@ -1376,7 +1438,7 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
         ),
     ];
     for (gain, table, tx, tx_hash, rx, rx_hash) in checks {
-        let Some(tables) = tables_for(gain, &rev10) else {
+        let Some(tables) = tables_for(gain, &rev10, pll9565) else {
             return TestResult::Fail("identity refused");
         };
         if tables.tx_gain_kind != tx
@@ -1397,7 +1459,7 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
         (0x40, (0x1a89_dc82_fb67_258b, 711)),
         (0x01, (0x2628_b5d3_2011_bf01, 711)),
     ] {
-        let Some(tables) = tables_for(gain, &rev11) else {
+        let Some(tables) = tables_for(gain, &rev11, pll9565) else {
             return TestResult::Fail("identity refused");
         };
         if oracle(&tables) != want {
@@ -1471,14 +1533,14 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
         mac_rev: 2,
         ..rev11
     };
-    let mut tables_for = |gain: u8, revision: &Revision| {
+    let mut tables_for = |gain: u8, revision: &Revision, pll: serdes::PllPwrsave| {
         // A genuine AR9485 board carries single-chain EEPROM masks; the
         // shared AR9300 template's three-chain mask (0x77) is foreign to
         // this chip and `Identity::decode` rightly refuses it.
         restored.image[eeprom::field::TXRX_MASK] = 0x11;
         restored.image[eeprom::field::TXRX_GAIN] = gain;
         let identity = eeprom::Identity::decode(Chip::Ar9485, &restored).ok()?;
-        Some(Tables::for_revision(revision, &identity))
+        Some(Tables::for_revision(revision, &identity, pll))
     };
     // FNV-1a oracle over the Linux order mac/bb/radio/soc core+post, BB
     // pre, allmodes radio postamble, rx, tx gain at 2G HT20 (computed
@@ -1515,7 +1577,8 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
     };
     use super::initvals as i;
     use super::initvals_ar9485 as t;
-    let Some(default) = tables_for(0x00, &rev11) else {
+    let pll9485 = serdes::PllPwrsave::resolve(Chip::Ar9485, 0, 0);
+    let Some(default) = tables_for(0x00, &rev11, pll9485) else {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default) != (0x9169_df72_650e_e951, 648)
@@ -1534,8 +1597,31 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
     {
         return TestResult::Fail("AR9485 1.1 default INI selection differs from Linux");
     }
+    // SerDes slots follow CONTROL alone: set selects the
+    // `pll_on_cdr_on` table in both slots, clear the `clkreq` table in
+    // both. (A default card resolves to 1, so today's code programs
+    // the wrong — `clkreq` — table; a NO_PLL_PWRSAVE subsystem
+    // resolves to 0 and keeps it.)
+    for (bits, table, first) in [
+        (
+            1u8,
+            t::AR9485_1_1_PLL_ON_CDR_ON_CLKREQ_DISABLE_L1,
+            0x1801_265eu32,
+        ),
+        (0, t::AR9485_1_1_PCIE_PHY_CLKREQ_DISABLE_L1, 0x1801_3e5e),
+    ] {
+        let Some(tables) = tables_for(0x00, &rev11, serdes::PllPwrsave::from_bits(bits)) else {
+            return TestResult::Fail("identity refused");
+        };
+        if !core::ptr::eq(tables.pcie_serdes, table)
+            || !core::ptr::eq(tables.pcie_serdes_low_power, table)
+            || tables.pcie_serdes.first().map(|r| r[1]) != Some(first)
+        {
+            return TestResult::Fail("AR9485 SerDes selection differs from Linux");
+        }
+    }
     // 1.2-or-later silicon selects the same 1.1 set.
-    let Some(default12) = tables_for(0x00, &rev12) else {
+    let Some(default12) = tables_for(0x00, &rev12, pll9485) else {
         return TestResult::Fail("identity refused");
     };
     if oracle(&default12) != (0x9169_df72_650e_e951, 648)
@@ -1656,7 +1742,7 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
         ),
     ];
     for (gain, table, tx, tx_hash, rx, rx_hash) in checks {
-        let Some(tables) = tables_for(gain, &rev11) else {
+        let Some(tables) = tables_for(gain, &rev11, pll9485) else {
             return TestResult::Fail("identity refused");
         };
         if tables.tx_gain_kind != tx
