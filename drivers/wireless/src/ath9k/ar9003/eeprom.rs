@@ -39,11 +39,11 @@ const AR_EEPROM_STATUS_DATA_BUSY: u32 = 0x0001_0000;
 const AR_EEPROM_STATUS_DATA_PROT_ACCESS: u32 = 0x0004_0000;
 /// `AR9300_OTP_BASE`, `AR9300_OTP_STATUS`, `AR9300_OTP_READ_DATA` (non
 /// AR9340/AR9550).
-const AR9300_OTP_BASE: u64 = 0x14000;
-const AR9300_OTP_STATUS: u64 = 0x15f18;
-const AR9300_OTP_READ_DATA: u64 = 0x15f1c;
-const AR9300_OTP_STATUS_TYPE: u32 = 0x7;
-const AR9300_OTP_STATUS_VALID: u32 = 0x4;
+pub(in crate::ath9k) const AR9300_OTP_BASE: u64 = 0x14000;
+pub(in crate::ath9k) const AR9300_OTP_STATUS: u64 = 0x15f18;
+pub(in crate::ath9k) const AR9300_OTP_READ_DATA: u64 = 0x15f1c;
+pub(in crate::ath9k) const AR9300_OTP_STATUS_TYPE: u32 = 0x7;
+pub(in crate::ath9k) const AR9300_OTP_STATUS_VALID: u32 = 0x4;
 
 /// `struct ar9300_eeprom` field offsets (packed).
 pub(in crate::ath9k) mod field {
@@ -86,6 +86,7 @@ pub(in crate::ath9k) mod field {
     pub const CTL_FREQBIN_5G: usize = 944;
     pub const CTL_POWER_5G: usize = 1016;
     // `ar9300_BaseExtension_1` (at `EXT1`).
+    pub const EXT1_ANT_DIV_CONTROL: usize = 0;
     pub const EXT1_MISC_ENABLE: usize = 3;
     pub const EXT1_TEMPSLOPE_EXTENSION: usize = 4;
     pub const EXT1_QUICK_DROP_LOW: usize = 12;
@@ -114,6 +115,7 @@ pub(in crate::ath9k) mod modal {
     pub const ANTENNA_GAIN: usize = 46;
     pub const TX_END_TO_XPA_OFF: usize = 49;
     pub const TX_FRAME_TO_XPA_ON: usize = 51;
+    pub const SWITCH_COM_SPDT: usize = 61;
     pub const XLNA_BIAS_STRENGTH: usize = 63;
 }
 

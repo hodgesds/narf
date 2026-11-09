@@ -2332,8 +2332,14 @@ every TX/RX gain mode with the mode 2/3 override arrays, computed
 from the local Linux headers) and
 `smoke_ath9k_ar9462_admission_records_bind_part_channel_and_magic`.
 Remainder, not in this step: MCI Bluetooth coexistence, WoW
-(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
-deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
+(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`) and per-chip calibration
+branches. The AR9462 board-value deltas are implemented in
+`ar9003/board.rs::set_board_values` (TOP bias, 24-bit switch table,
+SPDT, chain-1 table/attenuation at `rxchainmask == 0x2`, OTP
+`thermo_cal`, swreg into PMU1, the 9462 XTAL, chainmask-gated
+thermometer, and the xPA-timing / quick-drop / xLNA gates);
+`smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom` covers
+them per chip through the fixture.
 **AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
 `ar9003::Chip::Ar9485` is PCIe `0x0032`
@@ -2376,10 +2382,20 @@ executed):
 the 648 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
 computed from the local Linux headers) and
 `smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: MCI Bluetooth coexistence, WoW, the
-AR9485 board-value deltas and per-chip calibration branches (including
-the 9485 antenna-diversity/LNA-diversity code), and the SerDes
-`pll_pwrsave` conditional programming.
+Remainder, not in this step: MCI Bluetooth coexistence, WoW, per-chip
+calibration branches (including the 9485 spur-mitigation code), and the
+SerDes `pll_pwrsave` conditional programming. The AR9485 board-value
+deltas are implemented in `ar9003/board.rs::set_board_values` (TOP2
+bias, antenna-diversity/LNA-diversity fields with LNA combining, the
+fixed PMU1/PMU2 set and the PGM/PWD sequence, the 9485 XTAL,
+chainmask-gated thermometer, and the xPA-timing / quick-drop / xLNA
+gates); `smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom`
+covers them per chip through the fixture. Still open: the
+board-conditional deltas that need `bt_ant_diversity` or an
+`ath_hw_config` value (xLNA GPIO, `ant_ctrl_comm2g_switch_enable`,
+`xatten_margin_cfg`, `alt_mingainidx`) and the 5 GHz per-chip-refusal
+design question (see the `set_board_values` lane record in the PR
+body).
 
 **AR9565 (`ar9565_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
@@ -2426,9 +2442,17 @@ the 711 default-selected 2 GHz HT20 rows for each of 1.0 and 1.1, and
 every TX/RX gain mode, computed from the local Linux headers) and
 `smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic`.
 Remainder, not in this step: MCI Bluetooth coexistence, WoW
-(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), the AR9565 board-value
-deltas and per-chip calibration branches, and the SerDes `pll_pwrsave`
-gating.
+(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), per-chip calibration
+branches, and the SerDes `pll_pwrsave` gating. The AR9565 board-value
+deltas are implemented in `ar9003/board.rs::set_board_values` (TOP
+bias, 24-bit switch table, SPDT, the default `ant_div_control` 0xc9
+with LNA combining, swreg / PWD into PMU1, the 9565 XTAL,
+chainmask-gated thermometer, and the xPA-timing / quick-drop / xLNA
+gates); `smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom`
+covers them per chip through the fixture. Still open: the
+board-conditional deltas that need `bt_ant_diversity` or an
+`ath_hw_config` value (see the `set_board_values` lane record in the
+PR body).
 
 SoC/AHB parts (AR9100, AR9330/9340, QCA955x/953x/956x) and the USB
 `ath9k_htc` AR9271/AR7010 driver are outside this PCIe driver.

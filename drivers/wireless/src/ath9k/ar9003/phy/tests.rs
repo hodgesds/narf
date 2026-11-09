@@ -273,7 +273,7 @@ fn smoke_ath9k_ar9300_board_values_follow_eeprom_flags() -> TestResult {
     image[map::MODAL_2G + modal::XLNA_BIAS_STRENGTH] = 0b10_01_11;
     let mut io = Regs::default();
     io.regs.insert(0x700c, 0x5);
-    if board::set_board_values(&mut io, &image, 2437, 7, 7).is_err() {
+    if board::set_board_values(&mut io, Chip::Ar9300, &image, 2437, 7, 7).is_err() {
         return TestResult::Fail("board values with regulator on were refused");
     }
     let reg1 = io.writes.iter().position(|&w| w == (0x700c, 0x4));
@@ -302,7 +302,7 @@ fn smoke_ath9k_ar9300_board_values_follow_eeprom_flags() -> TestResult {
     image[map::MODAL_5G + modal::XATTEN1_DB] = 20;
     image[map::EXT2 + map::EXT2_XATTEN1_DB_HIGH] = 30;
     let mut io = Regs::default();
-    if board::set_board_values(&mut io, &image, 5340, 1, 1).is_err() {
+    if board::set_board_values(&mut io, Chip::Ar9300, &image, 5340, 1, 1).is_err() {
         return TestResult::Fail("5 GHz board values were refused");
     }
     // interpolate(5340, 5180, 5500, 10, 20) = 10 + 5 = 15.
@@ -319,6 +319,240 @@ fn smoke_ath9k_ar9300_board_values_follow_eeprom_flags() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9300_board_values_follow_eeprom_flags
+);
+
+/// A 2 GHz board image with every board-value field set to a
+/// distinguishing value: xPA timing + regulator on + tuning caps,
+/// drive strength + quick drop + xLNA + thermometer 1, swreg
+/// `0x12345678`, tuning caps `0xab`, bias 3, switch tables
+/// `0x00abcdef` / `0x00123456`, chain tables `0x0123` / `0x0abc` /
+/// `0x0456`, SPDT `0x0f0f`, xPA on/off `0x5a` / `0xa5`, quick drop -3,
+/// xLNA `0b10_01_11`, noise-floor thresholds -10/-20/-30, minCCApwr 2G
+/// enabled, xatten 10/11/12 dB with margins 5/6/7.
+fn board_image() -> Image {
+    let mut image = AR9300_DEFAULT;
+    image[map::FEATURE_ENABLE] = 0x80 | 0x10 | 0x40;
+    image[map::MISC_CONFIGURATION] = 0x1 | 0x10 | 0x40 | (2 << 1);
+    image[map::SWREG..map::SWREG + 4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    image[map::TUNING_CAPS] = 0xab;
+    image[map::EXT1 + map::EXT1_MISC_ENABLE] = 4;
+    let m = map::MODAL_2G;
+    image[m + modal::XPA_BIAS_LVL] = 3;
+    image[m + modal::ANT_CTRL_COMMON..m + modal::ANT_CTRL_COMMON + 4]
+        .copy_from_slice(&0x00ab_cdefu32.to_le_bytes());
+    image[m + modal::ANT_CTRL_COMMON2..m + modal::ANT_CTRL_COMMON2 + 4]
+        .copy_from_slice(&0x0012_3456u32.to_le_bytes());
+    for (chain, table) in [0x0123u16, 0x0abc, 0x0456].into_iter().enumerate() {
+        image[m + modal::ANT_CTRL_CHAIN + 2 * chain..m + modal::ANT_CTRL_CHAIN + 2 * chain + 2]
+            .copy_from_slice(&table.to_le_bytes());
+        image[m + modal::XATTEN1_DB + chain] = 10 + chain as u8;
+        image[m + modal::XATTEN1_MARGIN + chain] = 5 + chain as u8;
+        image[m + modal::NOISE_FLOOR_THRESH + chain] = (-10 - 10 * chain as i32) as i8 as u8;
+    }
+    image[m + modal::SWITCH_COM_SPDT..m + modal::SWITCH_COM_SPDT + 2]
+        .copy_from_slice(&0x0f0fu16.to_le_bytes());
+    image[m + modal::TX_FRAME_TO_XPA_ON] = 0x5a;
+    image[m + modal::TX_END_TO_XPA_OFF] = 0xa5;
+    image[m + modal::QUICK_DROP] = (-3i8) as u8;
+    image[m + modal::XLNA_BIAS_STRENGTH] = 0b10_01_11;
+    image
+}
+
+fn smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom() -> TestResult {
+    // AR9462, 2 GHz, rx == 0x2: TOP (not TOP2), 24-bit switch table,
+    // SPDT + GLB_CONTROL bit 0, chain-1 table and attenuation into the
+    // chain-0 registers, thermo cal from OTP word 1, swreg into PMU1,
+    // tuning caps at the 9462 XTAL, thermometer on chains 0-1 only, and
+    // no xPA-timing / quick-drop / xLNA writes.
+    let mut image = board_image();
+    let mut io = Regs::default();
+    io.regs.insert(0x15f18, 0x4);
+    io.regs.insert(0x15f1c, 0x3412);
+    if board::set_board_values(&mut io, Chip::Ar9462, &image, 2437, 2, 2).is_err() {
+        return TestResult::Fail("AR9462 board values were refused");
+    }
+    if io.regs.get(&0x1628c).copied().unwrap_or(0) & 0x300 != 0x300
+        || io.regs.contains_key(&0x16288)
+        || io.regs.contains_key(&0x16290)
+        || io.regs.get(&0xa288).copied().unwrap_or(0) != 0xabcdef
+        || io.regs.get(&0x20044).copied().unwrap_or(0) != 0xf0f1
+        || io.regs.get(&0xa284).copied().unwrap_or(0) & 0xfff != 0xabc
+        || io.regs.get(&0xb284).copied().unwrap_or(0) & 0xfff != 0xabc
+        || io.regs.contains_key(&0xc284)
+        || io.regs.get(&0x9e18).copied().unwrap_or(0) != 0x600b
+        || io.regs.get(&0xae18).copied().unwrap_or(0) != 0x600b
+        || io.regs.contains_key(&0xbe18)
+        || io.regs.get(&0xa450).copied().unwrap_or(0) != 0x13412
+        || io.regs.get(&0x16340).copied().unwrap_or(0) != 0x1234_5678
+        || io.regs.contains_key(&0x7008)
+        || io.regs.get(&0x16298).copied().unwrap_or(0) & 0x7ffe_0000 != 0x2b56_0000
+        || io.regs.get(&0x1610c).copied().unwrap_or(0) & 0x3000_0000 != 0x2000_0000
+        || io.regs.get(&0x1650c).copied().unwrap_or(0) & 0x3000_0000 != 0x3000_0000
+        || io.regs.contains_key(&0x1690c)
+        || io.regs.get(&0xa264).copied().unwrap_or(0) != 0xa5a5_0000
+        || io.regs.get(&0x9e14).copied().unwrap_or(0) & 0x03c0_0000 != 0
+        || io.regs.get(&0x1610c).copied().unwrap_or(0) >> 30 != 0
+        || io.regs.get(&0x160c0).copied().unwrap_or(0) != 0x00b6_db40
+        || io.regs.contains_key(&0x9e20)
+        || io.regs.get(&0xae20).copied().unwrap_or(0) != 0x1ec
+        || io.regs.contains_key(&0xbe20)
+    {
+        return TestResult::Fail("AR9462 board values differ from ar9003_eeprom.c");
+    }
+    // Thermo cal with ko == kg == 0, and with the OTP read failing, both
+    // write nothing to AR_PHY_BB_THERM_ADC_3.
+    let mut io = Regs::default();
+    io.regs.insert(0x15f18, 0x4);
+    io.regs.insert(0x15f1c, 0);
+    if board::set_board_values(&mut io, Chip::Ar9462, &image, 2437, 2, 2).is_err()
+        || io.regs.contains_key(&0xa450)
+    {
+        return TestResult::Fail("AR9462 zero thermo cal wrote or was refused");
+    }
+    let mut io = Regs::default();
+    if board::set_board_values(&mut io, Chip::Ar9462, &image, 2437, 2, 2).is_err()
+        || io.regs.contains_key(&0xa450)
+    {
+        return TestResult::Fail("AR9462 failed OTP read wrote thermo cal or was refused");
+    }
+    // AR9462, 5 GHz, rx == 0x2: chain-1 attenuation interpolates into
+    // both EXT_ATTEN_CTL_0 and EXT_ATTEN_CTL_1.
+    image[map::EXT2 + map::EXT2_XATTEN1_DB_LOW + 1] = 10;
+    image[map::MODAL_5G + modal::XATTEN1_DB + 1] = 20;
+    image[map::EXT2 + map::EXT2_XATTEN1_DB_HIGH + 1] = 30;
+    image[map::EXT2 + map::EXT2_XATTEN1_MARGIN_LOW + 1] = 4;
+    image[map::MODAL_5G + modal::XATTEN1_MARGIN + 1] = 8;
+    image[map::EXT2 + map::EXT2_XATTEN1_MARGIN_HIGH + 1] = 12;
+    image[map::EXT1 + map::EXT1_MISC_ENABLE] = 8;
+    image[map::MODAL_5G + modal::NOISE_FLOOR_THRESH + 1] = (-20i8) as u8;
+    let mut io = Regs::default();
+    io.regs.insert(0x15f18, 0x4);
+    io.regs.insert(0x15f1c, 0x3412);
+    if board::set_board_values(&mut io, Chip::Ar9462, &image, 5340, 2, 2).is_err()
+        || io.regs.get(&0x9e18).copied().unwrap_or(0) != 0x600f
+        || io.regs.get(&0xae18).copied().unwrap_or(0) != 0x600f
+        || io.regs.contains_key(&0xbe18)
+        || io.regs.get(&0xae20).copied().unwrap_or(0) != 0x1ec
+    {
+        return TestResult::Fail("AR9462 5 GHz board values differ from ar9003_eeprom.c");
+    }
+    // AR9485, regulator on, ant_div_control 0xc9 (LNA combining):
+    // TOP2 bias, 16-bit switch table, antenna-diversity fields, the
+    // fixed PMU set, tuning caps at the 9485 XTAL, thermometer on chain
+    // 0 only, and no SPDT / thermo-cal / xPA-timing / quick-drop / xLNA
+    // writes.
+    let mut image = board_image();
+    image[map::EXT1 + map::EXT1_ANT_DIV_CONTROL] = 0xc9;
+    let mut io = Regs::default();
+    if board::set_board_values(&mut io, Chip::Ar9485, &image, 2437, 1, 1).is_err() {
+        return TestResult::Fail("AR9485 board values were refused");
+    }
+    if io.regs.get(&0x16284).copied().unwrap_or(0) & 0xf000 != 0x3000
+        || io.regs.contains_key(&0x16288)
+        || io.regs.contains_key(&0x1628c)
+        || io.regs.get(&0xa288).copied().unwrap_or(0) != 0xcdef
+        || io.regs.get(&0xa28c).copied().unwrap_or(0) != 0x123456
+        || io.regs.contains_key(&0x20044)
+        || io.regs.get(&0x9e28).copied().unwrap_or(0) != 0x1300_0000
+        || io.regs.get(&0x9fc0).copied().unwrap_or(0) != 0x2000
+        || io.regs.get(&0x16c40).copied().unwrap_or(0) != 0x131c_827a
+        || io.regs.get(&0x16c44).copied().unwrap_or(0) != 0x1020_0000
+        || io.regs.get(&0x16290).copied().unwrap_or(0) & 0x7ffe_0000 != 0x2b56_0000
+        || io.regs.get(&0x1610c).copied().unwrap_or(0) & 0x3000_0000 != 0x2000_0000
+        || io.regs.contains_key(&0x1650c)
+        || io.regs.contains_key(&0x1690c)
+        || io.regs.contains_key(&0xa450)
+        || io.regs.get(&0xa264).copied().unwrap_or(0) != 0xa5a5_0000
+        || io.regs.get(&0x9e14).copied().unwrap_or(0) & 0x03c0_0000 != 0
+        || io.regs.get(&0x1610c).copied().unwrap_or(0) >> 30 != 0
+        || io.regs.get(&0x9e20).copied().unwrap_or(0) != 0x1f6
+        || io.regs.get(&0x9e18).copied().unwrap_or(0) != 0x500a
+        || io.regs.get(&0xa284).copied().unwrap_or(0) & 0xfff != 0x123
+        || io.regs.contains_key(&0xb284)
+    {
+        return TestResult::Fail("AR9485 board values differ from ar9003_eeprom.c");
+    }
+    // AR9485, regulator off: the PMU PGM/PWD sequence, no RTC write.
+    image[map::FEATURE_ENABLE] &= !0x10;
+    let mut io = Regs::default();
+    if board::set_board_values(&mut io, Chip::Ar9485, &image, 2437, 1, 1).is_err()
+        || io.regs.get(&0x16c40).copied().unwrap_or(0) != 0x1
+        || io.regs.get(&0x16c44).copied().unwrap_or(0) != 0x200000
+        || io.regs.contains_key(&0x7048)
+    {
+        return TestResult::Fail("AR9485 regulator-off values differ from ar9003_eeprom.c");
+    }
+    // AR9485, ant_div_control 0x41 (no LNA combining): only the base
+    // diversity fields, fast-div clear.
+    image[map::FEATURE_ENABLE] |= 0x10;
+    image[map::EXT1 + map::EXT1_ANT_DIV_CONTROL] = 0x41;
+    let mut io = Regs::default();
+    if board::set_board_values(&mut io, Chip::Ar9485, &image, 2437, 1, 1).is_err()
+        || io.regs.get(&0x9e28).copied().unwrap_or(0) != 0x0300_0000
+        || io.regs.get(&0x9fc0).copied().unwrap_or(0) != 0
+    {
+        return TestResult::Fail("AR9485 non-combining diversity values differ");
+    }
+    // AR9565: TOP (not TOP2), 24-bit switch table, SPDT, the DEFAULT
+    // ant_div_control 0xc9 (the EEPROM byte is 0x00 here and must be
+    // ignored), swreg into PMU1, thermometer on chain 0 only.
+    let mut image = board_image();
+    image[map::EXT1 + map::EXT1_ANT_DIV_CONTROL] = 0x00;
+    let mut io = Regs::default();
+    if board::set_board_values(&mut io, Chip::Ar9565, &image, 2437, 1, 1).is_err() {
+        return TestResult::Fail("AR9565 board values were refused");
+    }
+    if io.regs.get(&0x1628c).copied().unwrap_or(0) & 0x300 != 0x300
+        || io.regs.get(&0xa288).copied().unwrap_or(0) != 0xabcdef
+        || io.regs.get(&0x20044).copied().unwrap_or(0) != 0xf0f1
+        || io.regs.get(&0x9e28).copied().unwrap_or(0) != 0x1300_0000
+        || io.regs.get(&0x9fc0).copied().unwrap_or(0) != 0x2000
+        || io.regs.get(&0x16340).copied().unwrap_or(0) != 0x1234_5678
+        || io.regs.get(&0x16298).copied().unwrap_or(0) & 0x7ffe_0000 != 0x2b56_0000
+        || io.regs.get(&0x1610c).copied().unwrap_or(0) & 0x3000_0000 != 0x2000_0000
+        || io.regs.contains_key(&0x1650c)
+        || io.regs.contains_key(&0xa450)
+    {
+        return TestResult::Fail("AR9565 board values differ from ar9003_eeprom.c");
+    }
+    // AR9565, regulator off: PMU1 PWD only, no RTC write.
+    image[map::FEATURE_ENABLE] &= !0x10;
+    let mut io = Regs::default();
+    if board::set_board_values(&mut io, Chip::Ar9565, &image, 2437, 1, 1).is_err()
+        || io.regs.get(&0x16340).copied().unwrap_or(0) != 0x1
+        || io.regs.contains_key(&0x7048)
+    {
+        return TestResult::Fail("AR9565 regulator-off values differ from ar9003_eeprom.c");
+    }
+    // AR9580 keeps the AR9300 branch: TOP + THERM bias, xPA timing,
+    // quick drop, xLNA, XTAL 0x16294, thermometer on all three chains.
+    let image = board_image();
+    let mut io = Regs::default();
+    io.regs.insert(0x700c, 0x5);
+    if board::set_board_values(&mut io, Chip::Ar9580, &image, 2437, 7, 7).is_err() {
+        return TestResult::Fail("AR9580 board values were refused");
+    }
+    if io.regs.get(&0x16288).copied().unwrap_or(0) & 0x300 != 0x300
+        || io.regs.get(&0x16290).copied().unwrap_or(0) & 0x7 != 0x4
+        || io.regs.get(&0xa264).copied().unwrap_or(0) & 0xff00 != 0x5a00
+        || io.regs.get(&0x9e14).copied().unwrap_or(0) & 0x03c0_0000
+            != ((-3i32 as u32) << 22) & 0x03c0_0000
+        || io.regs.get(&0x1610c).copied().unwrap_or(0) >> 30 != 0b11
+        || io.regs.get(&0x1650c).copied().unwrap_or(0) >> 30 != 0b01
+        || io.regs.get(&0x1690c).copied().unwrap_or(0) >> 30 != 0b10
+        || io.regs.get(&0x16294).copied().unwrap_or(0) & 0x7ffe_0000 != 0x2b56_0000
+        || io.regs.get(&0x1610c).copied().unwrap_or(0) & 0x3000_0000 != 0x2000_0000
+        || io.regs.get(&0x1650c).copied().unwrap_or(0) & 0x3000_0000 != 0x3000_0000
+        || io.regs.get(&0x1690c).copied().unwrap_or(0) & 0x3000_0000 != 0x2000_0000
+    {
+        return TestResult::Fail("AR9580 board values differ from the AR9300 branch");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_ar9485_ar9565_board_values_follow_eeprom
 );
 
 /// `expected` derives exactly what `prepare` returns (INI-defined
