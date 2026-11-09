@@ -60,6 +60,10 @@ and verifies the runner-specific §8.2 controls with rollback; a pilot emits no
 performance record. `analyze.rs` reuses xtask's statistics with 10,000 bootstrap
 resamples, Welch/Mann–Whitney tests, suite-wide BH q=0.05 and declared δ=3%.
 The metric is elapsed invariant TSC cycles for fixed work, lower is better.
+Tmpfs adds a volatile baseline with guest-side final byte/name checks rather
+than an offline persistent-image check. FAT32 (`vfat`) is opt-in diagnostic
+coverage with read-only fsck and independent mtools extraction; it is not
+promoted to the timed write comparison while directory sync is unimplemented.
 Kernel image hashes identify the compared binaries; source reference status
 does not establish the installed Linux image's build provenance. This is not
 a schema-2 regression record for two clean source builds.

@@ -91,10 +91,16 @@ def make_image(work, seed, fs, btrfs_features=None):
         command = ["mkfs.btrfs", "-f", "-n", "16384", "-s", "4096", "--rootdir", str(seed), str(image)]
         if btrfs_features:
             command[1:1] = ["-O", btrfs_features]
+    elif fs == "vfat":
+        command = ["mkfs.vfat", "-F", "32", str(image)]
     else:
         command = ["mke2fs", "-F", "-t", fs, "-b", "4096", "-d", str(seed), str(image)]
     if run_logged(command, work / f"mkfs-{fs}.log"):
         raise RuntimeError(f"mkfs failed: {fs}")
+    if fs == "vfat":
+        command = ["mcopy", "-s", "-i", str(image)] + [str(p) for p in sorted(seed.iterdir())] + ["::/"]
+        if run_logged(command, work / "seed-vfat.log"):
+            raise RuntimeError("could not seed FAT32 image")
     return image
 
 
@@ -183,6 +189,7 @@ def verify_restored(tree, cases):
 
 def check_image(work, image, side, fs, cases, timeout):
     checker = (["btrfs", "check", "--readonly", "--check-data-csum", str(image)] if fs == "btrfs"
+               else ["fsck.vfat", "-n", str(image)] if fs == "vfat"
                else ["e2fsck", "-f", "-n", str(image)])
     log = work / f"{side}-{fs}-check.log"
     code = run_logged(checker, log, timeout=timeout)
@@ -191,6 +198,7 @@ def check_image(work, image, side, fs, cases, timeout):
     tree = work / f"{side}-{fs}-restored"
     tree.mkdir()
     restore = (["btrfs", "restore", str(image), str(tree)] if fs == "btrfs"
+               else ["mcopy", "-s", "-i", str(image), "::*", str(tree)] if fs == "vfat"
                else ["debugfs", "-R", f'rdump / "{tree}"', str(image)])
     restore_log = work / f"{side}-{fs}-restore.log"
     restore_code = run_logged(restore, restore_log, timeout=timeout)
@@ -206,7 +214,7 @@ def main():
     parser.add_argument("--workdir", type=Path, help="new directory for disposable images and logs")
     parser.add_argument("--narf-kernel", type=Path)
     parser.add_argument("--linux-kernel", type=Path)
-    parser.add_argument("--filesystems", nargs="+", choices=["ext2", "ext4", "btrfs"], default=["ext2", "ext4", "btrfs"])
+    parser.add_argument("--filesystems", nargs="+", choices=["ext2", "ext4", "btrfs", "vfat"], default=["ext2", "ext4", "btrfs"])
     parser.add_argument("--sides", nargs="+", choices=["narf", "linux"], default=["narf", "linux"])
     parser.add_argument("--accel", choices=["kvm", "tcg"], default="kvm")
     parser.add_argument("--timeout", type=int, default=300)

@@ -1,6 +1,6 @@
 # Filesystem comparison sweep
 
-Initial diagnostic workload for NARF versus Linux on ext2, ext4, and Btrfs.
+Diagnostic workload for NARF versus Linux on ext2, ext4, Btrfs and FAT32.
 The same static musl binary and the same seeded image for each format run on
 both kernels. Each guest gets its own writable image copy; the base hashes are
 checked again after the sweep. No host mounts or privileged filesystem tools
@@ -38,6 +38,10 @@ to narrow the sweep, or `--btrfs-features '^block-group-tree'` to explicitly
 investigate an older Btrfs layout. The default uses the installed mkfs defaults;
 its feature list is recorded in `mkfs-btrfs.log`. Compatibility variants should
 use separate work directories so the default-layout result remains visible.
+`--filesystems vfat` adds FAT32 diagnostics and requires `mkfs.vfat`,
+`fsck.vfat` and mtools (`mcopy`). Images are seeded and independently
+extracted without host mounts. FAT32 is not promoted to the timed write
+comparison while its VFS directory-sync hooks inherit no-op defaults.
 The default accelerator is KVM; passing `--accel tcg` is explicit. Every guest
 and offline checker has a host timeout; an individual failure does not stop
 the remaining filesystem/kernel combinations. The runner exits nonzero when
@@ -117,10 +121,14 @@ python3 verification/fs-linux-sweep/controlled_host.py --apply \
   --linux-kernel /path/to/vmlinuz --samples 100
 ```
 
-Full collection uses 100 fresh boots per kernel per format (600 total), with
+Full collection uses 100 fresh boots per kernel per format (800 total), with
 randomized order, fresh 512 MiB images, 8 MiB data files and 1,024 directory
 entries. Every boot must pass the offline checker and independent content
-readback. A failure preserves its image and aborts collection. Kernel, source
+readback for persistent formats. Tmpfs is a memory baseline: the guest creates
+the seed before all timers and verifies every final file/name before success;
+there is no offline or durability check for a volatile filesystem. Its
+first-read case is necessarily memory-backed. A failure preserves its image
+and aborts collection. Kernel, source
 and base-image hashes are recorded and checked again after collection. The
 installed Linux image is identified by its hash; the local source reference
 and its dirty status are recorded separately, without asserting build provenance.
@@ -145,8 +153,9 @@ not power-loss durability or equivalent journal/flush guarantees.
 
 `analyze.rs` reuses `build/xtask/src/bench_stats.rs`. It reports median and mean
 with 95% bootstrap CIs (10,000 resamples), p95/p99/p99.9 and CV. Welch and
-Mann–Whitney tests receive separate BH corrections across all 33 comparisons
-at q=0.05. Both must agree, and the ratio CI must exceed the declared 3% delta,
+Mann–Whitney tests receive separate BH corrections across the selected suite
+at q=0.05 (44 comparisons by default). Both must agree, and the ratio CI must
+exceed the declared 3% delta,
 to label a difference. Insufficient samples prevent a performance record.
 These kernel-to-kernel comparisons are not a before/after optimization claim
 or a schema-2 CI regression record for two clean source builds.

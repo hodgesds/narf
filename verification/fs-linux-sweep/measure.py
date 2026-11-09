@@ -42,6 +42,7 @@ def validate_log(path, code, side):
     valid = (code == 0 and len(env) == 1 and len(found) == len(CONTRACT)
              and [r["name"] for r in rows] == list(CONTRACT)
              and len(re.findall(r"^FSBENCH_DONE cases=11$", text, re.M)) == 1
+             and len(re.findall(r"^FSBENCH_VERIFY files=1159$", text, re.M)) == 1
              and "FSBENCH_FAIL" not in text
              and all(r["cycles"] > 0 and (r["work"], r["unit"]) == CONTRACT[r["name"]] for r in rows))
     if side == "linux": valid = valid and re.findall(r"^FSRUN-RC=(\d+)$", text, re.M) == ["0"]
@@ -49,6 +50,9 @@ def validate_log(path, code, side):
 
 
 def persistent_check(work, image, fs, tag):
+    if fs == "tmpfs":
+        return dict(passed=True, scope="volatile; complete guest byte/name checks required by validate_log",
+                    offline_check="not-applicable", checked_files=1159)
     log = work / f"{tag}-check.log"
     checker = (["btrfs", "check", "--readonly", "--check-data-csum", str(image)] if fs == "btrfs"
                else ["e2fsck", "-f", "-n", str(image)])
@@ -180,7 +184,7 @@ def main():
     p.add_argument("--linux-kernel", type=Path, required=True)
     p.add_argument("--samples", type=int, default=100)
     p.add_argument("--pilot", action="store_true")
-    p.add_argument("--filesystems", nargs="+", choices=["ext2", "ext4", "btrfs"], default=["ext2", "ext4", "btrfs"])
+    p.add_argument("--filesystems", nargs="+", choices=["ext2", "ext4", "btrfs", "tmpfs"], default=["ext2", "ext4", "btrfs", "tmpfs"])
     args = p.parse_args()
     if not args.pilot and args.samples < 100: p.error("full sweeps require 100 independent boots per side/format")
     controls = json.loads(Path(os.environ["NARF_FS_HOST_STATE"]).read_text()) if "NARF_FS_HOST_STATE" in os.environ else None
@@ -197,7 +201,14 @@ def main():
     (seed / "lookup").mkdir(parents=True)
     for name in ["seed.bin", "overwrite.bin", "append.bin"]: (seed / name).write_bytes(pattern())
     for i in range(1024): (seed / "lookup" / f"n{i:04d}").write_bytes(b"x")
-    bases = {fs: diagnostics.make_image(work, seed, fs) for fs in args.filesystems}
+    bases = {}
+    for fs in args.filesystems:
+        if fs == "tmpfs":
+            image = work / "base-tmpfs.img"
+            with image.open("xb") as stream: stream.truncate(512 * 1024 * 1024)
+            bases[fs] = image
+        else:
+            bases[fs] = diagnostics.make_image(work, seed, fs)
     initrds = {fs: diagnostics.initrd(work, binary, fs) for fs in args.filesystems}
     hashes = {fs: diagnostics.sha256(image) for fs, image in bases.items()}
     aux = work / "auxiliary.img"
@@ -211,7 +222,7 @@ def main():
         kernels[side] = target
     report = dict(classification="PilotOnly" if args.pilot else "Collecting", performance_record=False,
                   source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-                  source_sha256={str(path.relative_to(ROOT)): diagnostics.sha256(path) for path in [HERE / "bench.c", HERE / "measure.py", HERE / "controlled_host.py", HERE / "analyze.rs", ROOT / "build/xtask/src/bench_stats.rs"]},
+                  source_sha256={str(path.relative_to(ROOT)): diagnostics.sha256(path) for path in [HERE / "bench.c", HERE / "measure.py", HERE / "controlled_host.py", HERE / "analyze.rs", HERE / "run.py", ROOT / "build/xtask/src/bench_stats.rs"]},
                   kernel_sha256={k: diagnostics.sha256(v) for k, v in kernels.items()}, base_hashes=hashes,
                   host_controls=controls, cases=CONTRACT, samples=[], complete=False,
                   metric="elapsed invariant TSC cycles; lower is better", warmup="two 4 KiB create/fsyncs, cached read/stat warmups; first-read has no file-data warmup",

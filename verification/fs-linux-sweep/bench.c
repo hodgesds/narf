@@ -211,6 +211,61 @@ static void metadata(void) {
     require(close(dir) == 0, "close-directory");
 }
 
+/* tmpfs has no persistent image to seed. Populate it before all timers; its
+ * first read is necessarily memory-backed, as are its later cached reads. */
+static void seed_tmpfs(void) {
+    for (size_t i = 0; i < FILE_BYTES; i++) data[i] = byte_at(i);
+    const char *files[] = {"seed.bin", "overwrite.bin", "append.bin"};
+    for (unsigned i = 0; i < 3; i++) {
+        int fd = file(files[i], O_CREAT | O_EXCL | O_RDWR);
+        for (size_t offset = 0; offset < FILE_BYTES; offset += CHUNK)
+            io(fd, data + offset, CHUNK, offset, 1);
+        require(close(fd) == 0, "close-tmpfs-seed");
+    }
+    require(mkdir("lookup", 0755) == 0, "mkdir-tmpfs-lookup");
+    for (unsigned i = 0; i < NAMES; i++) {
+        char name[32]; snprintf(name, sizeof(name), "lookup/n%04u", i);
+        int fd = file(name, O_CREAT | O_EXCL | O_WRONLY);
+        require(write(fd, "x", 1) == 1, "seed-tmpfs-lookup");
+        require(close(fd) == 0, "close-tmpfs-lookup");
+    }
+}
+
+static void verify_final(void) {
+    const char *files[] = {"seed.bin", "overwrite.bin", "append.bin", "out-sequential", "out-fsync-each", "warmup0", "warmup1"};
+    const size_t sizes[] = {FILE_BYTES, FILE_BYTES, FILE_BYTES + CHUNK, FILE_BYTES, 64 * PAGE, PAGE, PAGE};
+    const unsigned salts[] = {0, 0xa5, 0, 0xa5, 0x3c};
+    for (unsigned i = 0; i < 7; i++) {
+        int fd = file(files[i], O_RDONLY);
+        struct stat st;
+        require(fstat(fd, &st) == 0 && st.st_size == (off_t)sizes[i], "final-size");
+        full_read(fd, scratch, sizes[i]);
+        if (i == 2) {
+            check(scratch, 0, FILE_BYTES, 0);
+            check(scratch + FILE_BYTES, FILE_BYTES, CHUNK, 0x5a);
+        } else if (i < 5) {
+            check(scratch, 0, sizes[i], salts[i]);
+        } else {
+            for (size_t j = 0; j < PAGE; j++) require(scratch[j] == 0, "final-warmup-bytes");
+        }
+        require(close(fd) == 0, "close-final");
+    }
+    for (unsigned i = 0; i < NAMES; i++) {
+        char name[32], value[2]; snprintf(name, sizeof(name), "lookup/n%04u", i);
+        int fd = file(name, O_RDONLY);
+        require(read(fd, value, sizeof(value)) == 1 && value[0] == 'x', "final-lookup-bytes");
+        require(close(fd) == 0, "close-final-lookup");
+    }
+    for (unsigned i = 0; i < CREATED; i++) {
+        char name[32]; struct stat st;
+        snprintf(name, sizeof(name), "created%04u", i);
+        require(stat(name, &st) == -1 && errno == ENOENT, "final-old-name-absent");
+        snprintf(name, sizeof(name), "renamed%04u", i);
+        require(stat(name, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 0, "final-renamed");
+    }
+    puts("FSBENCH_VERIFY files=1159");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     require(argc == 4, "usage-device-fstype-mountpoint");
@@ -235,6 +290,7 @@ int main(int argc, char **argv) {
                       MS_NOATIME | (existing ? MS_REMOUNT : 0), NULL) == 0, "mount-noatime");
     }
     require(chdir(argv[3]) == 0, "chdir");
+    if (!strcmp(argv[2], "tmpfs")) seed_tmpfs();
     memset(data, 0, sizeof(data)); memset(scratch, 0, sizeof(scratch));
     for (unsigned i = 0; i < 2; i++) {
         char name[32]; snprintf(name, sizeof(name), "warmup%u", i);
@@ -242,7 +298,7 @@ int main(int argc, char **argv) {
         io(fd, data, PAGE, 0, 1); require(fsync(fd) == 0, "warmup-fsync");
         require(close(fd) == 0, "warmup-close");
     }
-    reads(); writes(); metadata();
+    reads(); writes(); metadata(); verify_final();
     int dir = file(".", O_RDONLY | O_DIRECTORY);
     require(syncfs(dir) == 0, "syncfs"); require(close(dir) == 0, "close-syncfs");
     require(chdir("/") == 0, "chdir-root");

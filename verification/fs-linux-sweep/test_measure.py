@@ -16,7 +16,7 @@ class MeasurementValidation(unittest.TestCase):
         self.log = Path(self.directory.name) / "guest.log"
         self.lines = ["FSBENCH_ENV native=0 no_randomize=1 file_bytes=8388608 random_ops=4096 names=1024"]
         self.lines += [f"FSBENCH name={n} cycles=1000 work={w} unit={u}" for n, (w, u) in measure.CONTRACT.items()]
-        self.lines += ["FSBENCH_DONE cases=11", "FSRUN-RC=0"]
+        self.lines += ["FSBENCH_VERIFY files=1159", "FSBENCH_DONE cases=11", "FSRUN-RC=0"]
 
     def parse(self, lines=None, code=0):
         self.log.write_text("\n".join(self.lines if lines is None else lines) + "\n")
@@ -37,6 +37,7 @@ class MeasurementValidation(unittest.TestCase):
         self.assertFalse(self.parse(self.lines + ["FSBENCH_FAIL step=sync errno=5"]))
         self.assertFalse(self.parse(code=124))
         self.assertFalse(self.parse(self.lines[:-1]))
+        self.assertFalse(self.parse([s for s in self.lines if not s.startswith("FSBENCH_VERIFY")]))
 
 
 class HostControls(unittest.TestCase):
