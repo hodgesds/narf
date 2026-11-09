@@ -2604,12 +2604,23 @@ fn smoke_rtl8192de_tsf_interrupt_beacon() -> TestResult {
         return TestResult::Fail("8192DE resume restore");
     }
     // Join-bss connect: the AID write, the CR/BCN dance with the TXQ
-    // BIT(6) restore, then the H2C report in box 0.
+    // BIT(6) restore, the reserved-page upload (patched pages, beacon
+    // descriptor 0 with OWN, the beacon doorbell, the H2C_RSVDPAGE
+    // location in box 0), then the H2C report in box 1.
     let io = de_mac_fake();
     io.0.lock().regs[usize::from(power::REG_CR) + 1] = 0x55;
     io.0.lock().regs[usize::from(mac::REG_FWHW_TXQ_CTRL) + 2] = 0x40;
     let mut bcn = station::BcnCtrl::default();
     let mut mailbox = h2c::Mailbox::new();
+    let mut desc = trx::TxDesc::default();
+    desc.set_next(0x2000_0000);
+    let mut packet = [0u8; rsvd_page::LEN];
+    let own = [0x02, 0, 0, 0, 0, 1];
+    let bssid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    let expected = match rsvd_page::pages(own, bssid, 0x0007) {
+        Ok(pages) => pages,
+        Err(_) => return TestResult::Fail("8192DE reserved pages for join"),
+    };
     if narf_scheduler::block_on(station::join_bss_report(
         &io,
         &mut mailbox,
@@ -2617,22 +2628,44 @@ fn smoke_rtl8192de_tsf_interrupt_beacon() -> TestResult {
         0x0007,
         h2c::MEDIA_CONNECT,
         true,
+        rsvd_page::Upload {
+            desc: &mut desc,
+            packet: &mut packet,
+            buffer_addr: 0x1000_0000,
+            own,
+            bssid,
+            band_5g: false,
+            fwctrl_lps: false,
+        },
     ))
     .is_err()
         || de_mac_read16(&io, station::REG_BCN_PSR_RPT) != 0x0007
         || de_mac_read8(&io, power::REG_CR + 1) != 0x54
         || de_mac_read8(&io, mac::REG_BCN_CTRL) != 0x0f
         || de_mac_read8(&io, mac::REG_FWHW_TXQ_CTRL + 2) != 0x40
-        || de_mac_read8(&io, h2c::REG_HMEBOX_0) != h2c::H2C_JOINBSSRPT
-        || de_mac_read8(&io, h2c::REG_HMEBOX_0 + 1) != 1
-        || mailbox.last_hmeboxnum != 1
+        || de_mac_read16(&io, mac::REG_PCIE_CTRL_REG) != 0x10
+        || packet != expected
+        || !desc.own()
+        || desc.queue_sel() != trx::QSLT_BEACON
+        || desc.pkt_size() != 768
+        || desc.buffer_addr() != 0x1000_0000
+        || desc.dw[10] != 0x2000_0000
+        || de_mac_read8(&io, h2c::REG_HMEBOX_0) != h2c::H2C_RSVDPAGE
+        || de_mac_read8(&io, h2c::REG_HMEBOX_0 + 1) != 4
+        || de_mac_read8(&io, h2c::REG_HMEBOX_0 + 2) != 2
+        || de_mac_read8(&io, h2c::REG_HMEBOX_0 + 3) != 3
+        || de_mac_read8(&io, h2c::REG_HMEBOX_0 + 4) != h2c::H2C_JOINBSSRPT
+        || de_mac_read8(&io, h2c::REG_HMEBOX_0 + 5) != 1
+        || mailbox.last_hmeboxnum != 2
     {
         return TestResult::Fail("8192DE join-bss connect");
     }
-    // Disconnect: no register dance, report byte 0.
+    // Disconnect: no register dance and no upload, report byte 0.
     let io = de_mac_fake();
     let mut bcn = station::BcnCtrl::default();
     let mut mailbox = h2c::Mailbox::new();
+    let mut desc = trx::TxDesc::default();
+    let mut packet = [0u8; rsvd_page::LEN];
     if narf_scheduler::block_on(station::join_bss_report(
         &io,
         &mut mailbox,
@@ -2640,18 +2673,39 @@ fn smoke_rtl8192de_tsf_interrupt_beacon() -> TestResult {
         0,
         h2c::MEDIA_DISCONNECT,
         true,
+        rsvd_page::Upload {
+            desc: &mut desc,
+            packet: &mut packet,
+            buffer_addr: 0x1000_0000,
+            own: [0x02, 0, 0, 0, 0, 1],
+            bssid: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            band_5g: false,
+            fwctrl_lps: false,
+        },
     ))
     .is_err()
         || de_mac_read16(&io, station::REG_BCN_PSR_RPT) != 0
         || de_mac_read8(&io, h2c::REG_HMEBOX_0 + 1) != 0
         || mailbox.last_hmeboxnum != 1
+        || desc.own()
+        || packet != [0u8; rsvd_page::LEN]
+        || de_mac_read16(&io, mac::REG_PCIE_CTRL_REG) != 0
     {
         return TestResult::Fail("8192DE join-bss disconnect");
     }
-    // RF off: the report is dropped.
+    // RF off: the upload still runs (Linux uploads unconditionally on
+    // connect) but both H2C sends are dropped.
     let io = de_mac_fake();
     let mut bcn = station::BcnCtrl::default();
     let mut mailbox = h2c::Mailbox::new();
+    let mut desc = trx::TxDesc::default();
+    let mut packet = [0u8; rsvd_page::LEN];
+    let own = [0x02, 0, 0, 0, 0, 1];
+    let bssid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    let expected = match rsvd_page::pages(own, bssid, 0x0007) {
+        Ok(pages) => pages,
+        Err(_) => return TestResult::Fail("8192DE reserved pages for RF-off join"),
+    };
     if narf_scheduler::block_on(station::join_bss_report(
         &io,
         &mut mailbox,
@@ -2659,10 +2713,22 @@ fn smoke_rtl8192de_tsf_interrupt_beacon() -> TestResult {
         0x0007,
         h2c::MEDIA_CONNECT,
         false,
+        rsvd_page::Upload {
+            desc: &mut desc,
+            packet: &mut packet,
+            buffer_addr: 0x1000_0000,
+            own,
+            bssid,
+            band_5g: false,
+            fwctrl_lps: false,
+        },
     ))
     .is_err()
         || mailbox.last_hmeboxnum != 0
         || de_mac_read8(&io, h2c::REG_HMEBOX_0) != 0
+        || packet != expected
+        || !desc.own()
+        || de_mac_read16(&io, mac::REG_PCIE_CTRL_REG) != 0x10
     {
         return TestResult::Fail("8192DE join-bss RF-off drop");
     }
@@ -2671,6 +2737,130 @@ fn smoke_rtl8192de_tsf_interrupt_beacon() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_tsf_interrupt_beacon
+);
+
+/// `rsvd_page`: the template is verbatim (SHA-256, page heads), `pages`
+/// substitutes only the Linux fields, the location is `[4, 2, 3]`, the
+/// command descriptor is `fill_cmd` + OWN with the ring link kept, the
+/// doorbell is `REG_PCIE_CTRL_REG` word `BIT(4)`, and a bad AID refuses
+/// the upload before any register write.
+fn smoke_rtl8192de_rsvd_page_template_and_upload() -> TestResult {
+    use super::rsvd_page as rp;
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(&rp::TEMPLATE);
+    let digest = hash.finalize();
+    let mut hex = [0u8; 64];
+    for (i, b) in digest.iter().enumerate() {
+        hex[2 * i] = b"0123456789abcdef"[usize::from(b >> 4)];
+        hex[2 * i + 1] = b"0123456789abcdef"[usize::from(b & 15)];
+    }
+    if hex[..] != *rp::TEMPLATE_SHA256.as_bytes() {
+        return TestResult::Fail("template digest");
+    }
+    let heads = [0, 2 * 128, 3 * 128, 4 * 128].map(|at| rp::TEMPLATE[at]);
+    if heads != [0x80, 0xa4, 0x48, 0x50] {
+        return TestResult::Fail("page frame-control layout");
+    }
+    let own = [2, 0, 0, 0, 0, 1];
+    let bssid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    let pages = match rp::pages(own, bssid, 5) {
+        Ok(pages) => pages,
+        Err(_) => return TestResult::Fail("valid AID refused"),
+    };
+    if pages[10..16] != own
+        || pages[16..22] != bssid
+        || pages[258..260] != [0x05, 0xc0]
+        || pages[260..266] != bssid
+        || pages[266..272] != own
+    {
+        return TestResult::Fail("beacon / PS-Poll substitution");
+    }
+    for page in [3, 4] {
+        let at = page * 128;
+        if pages[at + 4..at + 10] != bssid
+            || pages[at + 10..at + 16] != own
+            || pages[at + 16..at + 22] != bssid
+        {
+            return TestResult::Fail("Null / probe-response A1-A3");
+        }
+    }
+    // Only the Linux fields change; the page-1 tail and the whole of
+    // page 5 are untouched template bytes.
+    let mut changed = 0;
+    for (a, b) in pages.iter().zip(rp::TEMPLATE.iter()) {
+        changed += usize::from(a != b);
+    }
+    if changed > 12 + 14 + 18 + 18
+        || pages[224..256] != rp::TEMPLATE[224..256]
+        || pages[640..768] != rp::TEMPLATE[640..768]
+        || rp::pages(own, bssid, 0).is_ok()
+        || rp::pages(own, bssid, 2008).is_ok()
+    {
+        return TestResult::Fail("only Linux fields change / AID bound");
+    }
+    if rp::RSVDPAGE_LOCATION != [4, 2, 3] || h2c::H2C_RSVDPAGE != 3 {
+        return TestResult::Fail("location command");
+    }
+    // Command descriptor: beacon queue, 1M, rate id 7, MAC id 0,
+    // 768-byte buffer, OWN published, ring link kept.
+    let mut desc = trx::TxDesc::default();
+    desc.set_next(0x2000_0000);
+    rp::fill_cmd_desc(&mut desc, 0x1000_0000, false, false);
+    if !desc.own()
+        || desc.queue_sel() != trx::QSLT_BEACON
+        || desc.tx_rate() != trx::DESC_RATE1M
+        || desc.macid() != trx::CMD_MACID
+        || desc.pkt_size() != 768
+        || desc.buffer_addr() != 0x1000_0000
+        || desc.dw[10] != 0x2000_0000
+    {
+        return TestResult::Fail("command descriptor");
+    }
+    // 5 GHz: 6M; firmware LPS: hwseq enable + packet id 8.
+    let mut desc5 = trx::TxDesc::default();
+    rp::fill_cmd_desc(&mut desc5, 0x1000_0000, true, true);
+    if desc5.tx_rate() != trx::DESC_RATE6M
+        || desc5.dw[4] & (1 << 7) == 0
+        || (desc5.dw[3] >> 28) & 0xf != 8
+    {
+        return TestResult::Fail("5 GHz / LPS command descriptor");
+    }
+    // Doorbell + bad-AID refusal before any register write.
+    let io = de_mac_fake();
+    if rp::tx_polling(&io).is_err() || de_mac_read16(&io, mac::REG_PCIE_CTRL_REG) != 0x10 {
+        return TestResult::Fail("beacon doorbell");
+    }
+    let io = de_mac_fake();
+    let mut mailbox = h2c::Mailbox::new();
+    let mut desc = trx::TxDesc::default();
+    let mut packet = [0u8; rp::LEN];
+    if narf_scheduler::block_on(rp::set_fw_rsvdpagepkt(
+        &io,
+        &mut mailbox,
+        rp::Upload {
+            desc: &mut desc,
+            packet: &mut packet,
+            buffer_addr: 0x1000_0000,
+            own,
+            bssid,
+            band_5g: false,
+            fwctrl_lps: false,
+        },
+        0,
+        true,
+    )) != Err(crate::rtlwifi::prepare::Error::Packet)
+        || desc.own()
+        || packet != [0u8; rp::LEN]
+        || de_mac_read16(&io, mac::REG_PCIE_CTRL_REG) != 0
+        || mailbox.last_hmeboxnum != 0
+    {
+        return TestResult::Fail("bad AID admitted a partial upload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_rsvd_page_template_and_upload
 );
 
 /// Lifecycle: `SwVars` defaults per mode/band, ASPM state, the
