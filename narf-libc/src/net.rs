@@ -468,14 +468,8 @@ pub unsafe extern "C" fn recvfrom(
     if len == 0 {
         return 0;
     }
-    let r = narf_user_runtime::recvfrom(
-        fd,
-        buf as *mut u8,
-        len,
-        flags as u32,
-        addr as *mut u8,
-        alen,
-    );
+    let r =
+        narf_user_runtime::recvfrom(fd, buf as *mut u8, len, flags as u32, addr as *mut u8, alen);
     if r < 0 {
         crate::errno::set_errno(crate::errno::EINVAL);
     }
