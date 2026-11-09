@@ -14,7 +14,18 @@ fn smoke_rtw89_fwcmd_8922a_frame() -> TestResult {
     // MAC / FR_EXCHG / CCTLINFO_UD (2), payload 4 bytes, both acks.
     let payload = [0xAA, 0xBB, 0xCC, 0xDD];
     let mut out = [0u8; 32];
-    let (framed, total) = match frame_h2c(&alloc, 0x1, 0x5, 0x2, &payload, true, true, &mut out) {
+    let (framed, total) = match frame_h2c(
+        &alloc,
+        H2cCmd {
+            cat: 0x1,
+            class: 0x5,
+            func: 0x2,
+        },
+        &payload,
+        true,
+        true,
+        &mut out,
+    ) {
         Some(framed) => framed,
         None => return TestResult::Fail("frame_h2c refused a valid command"),
     };
@@ -42,7 +53,18 @@ fn smoke_rtw89_fwcmd_8922a_frame() -> TestResult {
     // path never forces rec_ack (the AX seq%4 quirk is absent):
     // a no-ack command at seq 1 keeps both ack bits clear.
     let mut out = [0u8; 8];
-    let (framed, _) = match frame_h2c(&alloc, 0x1, 0x5, 0x2, &[], false, false, &mut out) {
+    let (framed, _) = match frame_h2c(
+        &alloc,
+        H2cCmd {
+            cat: 0x1,
+            class: 0x5,
+            func: 0x2,
+        },
+        &[],
+        false,
+        false,
+        &mut out,
+    ) {
         Some(framed) => framed,
         None => return TestResult::Fail("frame_h2c refused an empty payload"),
     };
@@ -55,12 +77,38 @@ fn smoke_rtw89_fwcmd_8922a_frame() -> TestResult {
     }
     // Refusals: short output buffer, over-long payload.
     let mut out = [0u8; 11];
-    if frame_h2c(&alloc, 0x1, 0x5, 0x2, &payload, false, false, &mut out).is_some() {
+    if frame_h2c(
+        &alloc,
+        H2cCmd {
+            cat: 0x1,
+            class: 0x5,
+            func: 0x2,
+        },
+        &payload,
+        false,
+        false,
+        &mut out,
+    )
+    .is_some()
+    {
         return TestResult::Fail("frame_h2c accepted a short output buffer");
     }
     let big = [0u8; MAX_PAYLOAD_LEN + 1];
     let mut out = [0u8; 16];
-    if frame_h2c(&alloc, 0x1, 0x5, 0x2, &big, false, false, &mut out).is_some() {
+    if frame_h2c(
+        &alloc,
+        H2cCmd {
+            cat: 0x1,
+            class: 0x5,
+            func: 0x2,
+        },
+        &big,
+        false,
+        false,
+        &mut out,
+    )
+    .is_some()
+    {
         return TestResult::Fail("frame_h2c accepted an over-long payload");
     }
     TestResult::Pass

@@ -12,6 +12,7 @@ use super::completion_8922a::*;
 use super::dma::{TxBd, TXCH_NUM};
 use super::dma_be::Regs;
 use super::efuse_be::BeFactory;
+use super::fwcmd_8922a::H2cCmd;
 use super::irq::Events;
 use super::prepared_8922a::Error as PreparedError;
 use super::prepared_8922a::*;
@@ -527,9 +528,11 @@ fn smoke_rtw89_completion_8922a_h2c_ack_release() -> TestResult {
     // allocate 0 then 1 from the shared allocator.
     let mut framed_bytes = [0u8; 12];
     let (framed0, total0) = match owner.frame_h2c(
-        0x1,
-        0x5,
-        0x2,
+        H2cCmd {
+            cat: 0x1,
+            class: 0x5,
+            func: 0x2,
+        },
         &[0xAA, 0xBB, 0xCC, 0xDD],
         true,
         true,
@@ -544,9 +547,11 @@ fn smoke_rtw89_completion_8922a_h2c_ack_release() -> TestResult {
     };
     owner.retain_h2c(framed0, buf0);
     let (framed1, total1) = match owner.frame_h2c(
-        0x1,
-        0x5,
-        0x2,
+        H2cCmd {
+            cat: 0x1,
+            class: 0x5,
+            func: 0x2,
+        },
         &[0x11, 0x22, 0x33, 0x44],
         true,
         true,

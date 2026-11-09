@@ -82,7 +82,7 @@ use super::dma_8922a;
 use super::dma_be::{self, Regs};
 use super::efuse_be::BeFactory;
 use super::eht::{EhtOperation, EhtStation, EHT_8922A};
-use super::fwcmd_8922a::{self, FramedH2c, Released};
+use super::fwcmd_8922a::{self, FramedH2c, H2cCmd, Released};
 use super::h2c::H2cSeqAllocator;
 use super::irq_be::BindingBe;
 use super::mac_pre_init_8922a::{self, HalChipVer};
@@ -770,24 +770,13 @@ impl Prepared8922a {
     /// `retain_h2c(framed, buf)`.
     pub(super) fn frame_h2c(
         &self,
-        cat: u8,
-        class: u8,
-        func: u8,
+        cmd: H2cCmd,
         payload: &[u8],
         rec_ack: bool,
         done_ack: bool,
         out: &mut [u8],
     ) -> Option<(FramedH2c, usize)> {
-        fwcmd_8922a::frame_h2c(
-            &self.h2c_seq,
-            cat,
-            class,
-            func,
-            payload,
-            rec_ack,
-            done_ack,
-            out,
-        )
+        fwcmd_8922a::frame_h2c(&self.h2c_seq, cmd, payload, rec_ack, done_ack, out)
     }
 
     /// Retain a submitted H2C buffer, keyed by the FWCMD

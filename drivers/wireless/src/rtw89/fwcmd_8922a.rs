@@ -43,6 +43,20 @@ use super::txrx::{encode_h2c_header, H2C_HEADER_LEN};
 /// must fit in 0x3FFF.
 pub(super) const MAX_PAYLOAD_LEN: usize = 0x3FFF - H2C_HEADER_LEN;
 
+/// Identity of one H2C command (category, class, function):
+/// the address the firmware routes it by. The sequence is
+/// allocated per command by `frame_h2c` and is not part of
+/// the identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct H2cCmd {
+    /// Command category (`H2C_CAT_*`).
+    pub(super) cat: u8,
+    /// Command class within the category.
+    pub(super) class: u8,
+    /// Command function within the class.
+    pub(super) func: u8,
+}
+
 /// Identity of one framed H2C command: the address the firmware
 /// routes it by plus the sequence the C2H ack echoes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,9 +89,7 @@ pub(super) struct Released {
 /// never truncated.
 pub(super) fn frame_h2c(
     alloc: &H2cSeqAllocator,
-    cat: u8,
-    class: u8,
-    func: u8,
+    cmd: H2cCmd,
     payload: &[u8],
     rec_ack: bool,
     done_ack: bool,
@@ -88,9 +100,9 @@ pub(super) fn frame_h2c(
     }
     let seq = alloc.next();
     encode_h2c_header(
-        cat,
-        class,
-        func,
+        cmd.cat,
+        cmd.class,
+        cmd.func,
         seq,
         payload.len() as u16,
         rec_ack,
@@ -101,9 +113,9 @@ pub(super) fn frame_h2c(
     Some((
         FramedH2c {
             seq,
-            cat,
-            class,
-            func,
+            cat: cmd.cat,
+            class: cmd.class,
+            func: cmd.func,
         },
         H2C_HEADER_LEN + payload.len(),
     ))
