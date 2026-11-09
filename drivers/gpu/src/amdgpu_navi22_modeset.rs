@@ -51,7 +51,7 @@ use crate::{
     amdgpu_dcn30_takeover::{self as takeover, Inherited, IpRequest, Regs, Takeover},
     amdgpu_dcn_hubp::{Hubp, Surface},
     amdgpu_dcn_otg::{GlobalSync, Otg},
-    amdgpu_dcn_plane::{Dpp, Encoding, Mpc, Opp},
+    amdgpu_dcn_plane::{BlendConfig, Dpp, Encoding, Mpc, Opp},
     amdgpu_dml::{self as dml, Config, Format, Plane, Timing},
     amdgpu_dml30 as dml30, amdgpu_dp_training as training,
     amdgpu_navi22_bios::{
@@ -929,6 +929,13 @@ pub struct Pipeline {
     /// global sync now in effect (DC's cached `hubbub1->watermarks` and
     /// `pipe_dlg_param`).
     plane: Option<crate::amdgpu_navi22_plane::Update>,
+    /// The slave overlay's front end, leased from the pipe pool
+    /// ([`OverlayPipe`]), and its placement — the second plane of the
+    /// joint two-plane update — once programmed. `None` on a stream with
+    /// no overlay. The overlay has no OPP of its own: its MPCC sits above
+    /// the primary's in the tree, on the primary's OTG.
+    overlay: Option<OverlayPipe>,
+    overlay_update: Option<crate::amdgpu_navi22_plane::Update>,
     live_watermarks: Option<dml30::WatermarkSet>,
     live_sync: Option<GlobalSync>,
 }
@@ -1040,6 +1047,8 @@ impl Pipeline {
                 slice: None,
                 odm: None,
                 plane: None,
+                overlay: None,
+                overlay_update: None,
                 live_watermarks: None,
                 live_sync: None,
             })
@@ -2062,6 +2071,11 @@ impl Pipeline {
             }
         }
         if reached >= Step::Plane {
+            // The overlay leaves the tree first, so the primary's release
+            // below sees a single-MPCC tree rather than orphaning the slave.
+            if self.overlay.is_some() {
+                record(self.release_overlay().await);
+            }
             record(self.mpc.release(self.route.pipe).map_err(Error::Block));
             record(self.hubp.blank().await.map_err(Error::Block));
             if let Some(slice) = self.slice.as_mut() {
@@ -2737,13 +2751,39 @@ impl Pipeline {
         })
     }
     /// [`crate::amdgpu_navi22_plane::plan`] for `request` on the lit stream.
+    /// Refused while an overlay is live: the single plan's clocks and
+    /// watermarks do not budget it — place through [`Pipeline::plan_overlay`].
     pub fn plan_plane(
         &self,
         request: &crate::amdgpu_navi22_plane::Request,
     ) -> Result<crate::amdgpu_navi22_plane::Update, crate::amdgpu_navi22_plane::Refusal> {
+        if self.overlay.is_some() {
+            return Err(crate::amdgpu_navi22_plane::Refusal::Overlay);
+        }
         self.plane_basis()
             .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)?
             .plan(request)
+    }
+    /// [`crate::amdgpu_navi22_plane::plan_two`] for `primary` and `overlay`
+    /// on the lit stream: the joint two-plane update an overlay commit
+    /// programs. Planning is pure — it does not lease the slave pipe.
+    pub fn plan_overlay(
+        &self,
+        primary: &crate::amdgpu_navi22_plane::Request,
+        overlay: &crate::amdgpu_navi22_plane::Request,
+    ) -> Result<crate::amdgpu_navi22_plane::TwoPlaneUpdate, crate::amdgpu_navi22_plane::Refusal>
+    {
+        self.plane_basis()
+            .ok_or(crate::amdgpu_navi22_plane::Refusal::Invalid)?
+            .plan_two(primary, overlay)
+    }
+    /// The leased slave pipe, if an overlay is live.
+    pub fn overlay_pipe(&self) -> Option<u8> {
+        self.overlay.as_ref().map(|o| o.pipe)
+    }
+    /// The overlay's placement, once programmed.
+    pub fn overlay_request(&self) -> Option<crate::amdgpu_navi22_plane::Request> {
+        self.overlay_update.map(|u| u.request)
     }
     /// The DML30 plan the pipe runs under now: the placement's after a
     /// plane update, else the modeset's.
@@ -2784,7 +2824,22 @@ impl Pipeline {
     /// and deadline registers with the cursor's, the DSCL scaler, the
     /// MPCC background, the viewport and the surface pitch. The address
     /// follows from the flip owner inside the same lock.
+    ///
+    /// Refused while an overlay is live: the single-plane update's clocks
+    /// and watermarks do not budget it — commit through
+    /// [`Pipeline::program_two_planes`].
     pub async fn program_plane(
+        &mut self,
+        u: &crate::amdgpu_navi22_plane::Update,
+    ) -> Result<(), Error> {
+        if self.overlay.is_some() {
+            return Err(Error::Busy);
+        }
+        self.program_plane_inner(u).await
+    }
+    /// [`Pipeline::program_plane`] without the overlay guard: the two-plane
+    /// commit programs the joint primary update through here.
+    async fn program_plane_inner(
         &mut self,
         u: &crate::amdgpu_navi22_plane::Update,
     ) -> Result<(), Error> {
@@ -2828,6 +2883,109 @@ impl Pipeline {
             .map_err(Error::Hubbub)?;
         Ok(())
     }
+    /// Lease a slave pipe for an overlay on this running stream
+    /// ([`overlay::lease_slave`]): the preferred mirror pipe, else the
+    /// highest free one. `used` names every pipe other streams hold — their
+    /// primaries, ODM secondaries and slaves; this stream's pipe and its
+    /// ODM secondary are excluded inside. Refused when the stream is not
+    /// running, is split across ODM pipes (an overlay beside ODM is not
+    /// modelled), already has an overlay, or the pool is exhausted. The
+    /// pipe is powered when the overlay is programmed, not here.
+    pub fn lease_overlay(&mut self, used: &[u8]) -> Result<u8, Error> {
+        if self.state != State::At(Step::Running)
+            || self.odm.is_some()
+            || self.slice.is_some()
+            || self.overlay.is_some()
+        {
+            return Err(Error::Busy);
+        }
+        let pipes = crate::amdgpu_dcn_profile::Profile::resolve(&self.gpu)?.pipes();
+        let lease = overlay::lease_slave(pipes, self.route.pipe, used).ok_or(Error::Busy)?;
+        let pipe = lease.pipe;
+        // SAFETY: the lease is this stream's slave pipe, held by no other
+        // stream, ODM secondary or overlay; the caller's display ownership
+        // covers it.
+        self.overlay = Some(unsafe { OverlayPipe::new(&self.gpu, self.regs.authority, pipe)? });
+        Ok(pipe)
+    }
+    /// `dcn20_program_front_end_for_ctx` for the overlay, under the OTG's
+    /// pipe-control lock the caller holds: the joint primary update first
+    /// ([`Pipeline::program_plane`]'s body), then the slave front end —
+    /// power, DPP DTO, DPP program and scaler, the HUBP on the primary's
+    /// VTG with the overlay pipe's DLG/TTU registers, viewport and pitch,
+    /// and the MPCC inserted above the primary's with `blend`. The surface
+    /// address follows from the flip owner inside the same lock, and the
+    /// slave HUBP is unblanked after it ([`Pipeline::unblank_overlay`]).
+    pub async fn program_two_planes(
+        &mut self,
+        u: &crate::amdgpu_navi22_plane::TwoPlaneUpdate,
+        blend: &BlendConfig,
+    ) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) || self.odm.is_some() {
+            return Err(Error::Busy);
+        }
+        if self.overlay.is_none() {
+            return Err(Error::Invalid);
+        }
+        self.program_plane_inner(&u.primary).await?;
+        let pipe = self.overlay.as_ref().ok_or(Error::Invalid)?.pipe;
+        // The slave front end, as `program_slice` powers and programs the
+        // ODM secondary — except the overlay has its own scaler and its
+        // MPCC goes above the primary's in the tree, not on its own OPP.
+        self.power_on_pipe(pipe).await?;
+        self.clocks
+            .pipe_clock(pipe, u.overlay_dppclk_khz)
+            .map_err(Error::Block)?;
+        let overlay = self.overlay.as_mut().ok_or(Error::Invalid)?;
+        let r = &u.overlay.request;
+        overlay.dpp.program(Format::Rgb32, r.width, r.height)?;
+        overlay.dpp.set_scaler(&u.overlay.scaler)?;
+        overlay.hubp.select_vtg(self.route.pipe)?;
+        overlay.hubp.setup(&u.overlay.plan.registers)?;
+        let vp = u.overlay.scaler.viewport;
+        overlay
+            .hubp
+            .set_viewport(vp.x as u32, vp.y as u32, vp.width as u32, vp.height as u32)?;
+        overlay.hubp.set_pitch(r.pitch)?;
+        overlay
+            .mpc
+            .insert_plane(pipe, self.route.pipe, Some(self.route.pipe), blend)
+            .map_err(Error::Block)?;
+        self.overlay_update = Some(u.overlay);
+        Ok(())
+    }
+    /// Unblank the slave HUBP once its front end and surface address are
+    /// programmed (the modeset unblanks the primary and the ODM slice the
+    /// same way, after programming). No overlay: refused.
+    pub async fn unblank_overlay(&mut self) -> Result<(), Error> {
+        self.overlay
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .hubp
+            .unblank()
+            .await?;
+        Ok(())
+    }
+    /// Tear the overlay down: unlink its MPCC from the tree, blank the
+    /// slave HUBP, and return the pipe to the pool. No overlay: a no-op.
+    /// The scanout's flip side is detached separately
+    /// ([`crate::amdgpu_navi22_scanout::Scanout::detach_overlay`]); on a
+    /// live stream call that first, so no flip completion waits on the
+    /// parked HUBP.
+    pub async fn release_overlay(&mut self) -> Result<(), Error> {
+        let Some(mut overlay) = self.overlay.take() else {
+            return Ok(());
+        };
+        self.overlay_update = None;
+        // Front end first, as `tear_down` releases the primary's MPCC
+        // before blanking its HUBP.
+        overlay
+            .mpc
+            .remove_plane(self.route.pipe)
+            .map_err(Error::Block)?;
+        overlay.hubp.blank().await?;
+        Ok(())
+    }
 }
 
 /// Opt-in power saving (amdgpu_navi22_power_policy): the DAL clock owner,
@@ -2841,6 +2999,10 @@ impl Pipeline {
 #[path = "amdgpu_navi22_multi.rs"]
 mod multi;
 pub use multi::*;
+
+#[path = "amdgpu_navi22_overlay.rs"]
+mod overlay;
+pub use overlay::*;
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_modeset_tests.rs"]
