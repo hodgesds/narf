@@ -597,10 +597,13 @@ pub async unsafe fn recover() -> Result<boot::Report, crate::amdgpu_navi22_recov
 // System (S3) suspend goes through the recovery shape instead: the
 // console pauses and IH is disabled, and resume rebuilds the owner with
 // `into_recovery`, as recovery does. That rebuild needs a recoverable
-// owner, and a trained GDDR6 owner is not one (`ColdBoot::recoverable`:
-// GDDR6 retention/replay is not wired), so S3 refuses on trained
-// hardware rather than suspending into a lost device. Runtime suspend has
-// no such gate: the retained owner is all it needs.
+// owner; a trained GDDR6 owner is one once its trainer finished, because
+// `into_recovery` retains the trainer and replays its cache
+// (`PSP_MEM_TRAIN_RESUME`) before SOS loads, so S3 no longer refuses on
+// trained hardware. An owner whose trainer never finished, failed, or was
+// cancelled mid-replay still refuses rather than suspending into a lost
+// device. Runtime suspend has no such gate: the retained owner is all it
+// needs.
 //
 // D3hot may reset engine registers (IH ring pointers, queue doorbells)
 // that only a fresh owner re-initializes; if the hardware run shows lost
@@ -744,7 +747,8 @@ async unsafe fn suspend_gated(runtime: bool) -> Result<(), boot::Error> {
         return Err(boot::Error::Busy);
     }
     if !runtime {
-        // Refuse before touching hardware state: a trained owner cannot be
+        // Refuse before touching hardware state: an owner whose trainer
+        // never finished, failed, or was cancelled mid-replay cannot be
         // rebuilt (see `ColdBoot::recoverable`), so an S3 resume could not
         // restore it.
         let owner = OWNER.lock().await;
@@ -812,8 +816,11 @@ pub async unsafe fn runtime_suspend() -> Result<(), boot::Error> {
 
 /// S3 through the async system-PM phase: drain, quiesce and park (see
 /// [`runtime_suspend`]), pausing the console and disabling IH as recovery
-/// does. Refuses on a trained owner: without GDDR6 retention the resume
-/// could not rebuild it (see `ColdBoot::recoverable`).
+/// does. Refuses when the owner is not recoverable — including a trained
+/// owner whose trainer never finished (see `ColdBoot::recoverable`). A
+/// finished trainer is retained across the rebuild and replayed
+/// (`PSP_MEM_TRAIN_RESUME`) before SOS loads, so S3 no longer refuses on
+/// trained hardware.
 ///
 /// # Safety
 /// As [`recover`]: no external CPU mapping user, PCI or firmware owner may

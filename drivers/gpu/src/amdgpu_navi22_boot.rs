@@ -372,6 +372,11 @@ struct Hardware {
     reset: Option<crate::amdgpu_reset_navi22::Reset>,
     reset_report: Option<crate::amdgpu_reset_navi22::Report>,
     training: Option<gddr6::Trainer>,
+    /// The trainer finished before a mode1 reset; replay its cache
+    /// (PSP_MEM_TRAIN_RESUME) instead of cold training. Set only by
+    /// `into_recovery`, which always installs a recovery reset alongside
+    /// it, so a replay never runs without a completed reset first.
+    training_resume: bool,
     bootstrap: Option<sos::Bootloader>,
     psp: Option<psp::Psp>,
     smu: Option<smu::Smu>,
@@ -697,7 +702,17 @@ impl Backend for Hardware {
             }
             Stage::MemoryTraining => {
                 if let Some(training) = self.training.as_mut() {
-                    training.run().await.map_err(Error::Training)?;
+                    if self.training_resume {
+                        // SAFETY: into_recovery proved the mode1 reset
+                        // completed and handed over the retained trainer; no
+                        // VRAM client runs before this stage, and SOS has
+                        // not loaded yet, as `Trainer::resume` requires.
+                        unsafe { training.resume() }
+                            .await
+                            .map_err(Error::Training)?;
+                    } else {
+                        training.run().await.map_err(Error::Training)?;
+                    }
                 }
             }
             Stage::Sos => {
@@ -1232,6 +1247,7 @@ impl ColdBoot {
                     reset: None,
                     reset_report: None,
                     training: None,
+                    training_resume: false,
                     bootstrap: Some(bootstrap),
                     psp: None,
                     smu: None,
@@ -1297,6 +1313,7 @@ impl ColdBoot {
                     reset: None,
                     reset_report: None,
                     training: Some(training),
+                    training_resume: false,
                     bootstrap: None,
                     psp: None,
                     smu: None,
@@ -1883,19 +1900,36 @@ impl ColdBoot {
             .map_err(Error::Queues)
     }
     /// Whether `into_recovery` can rebuild this owner: a completed boot with
-    /// a board power table and IH, and no GDDR6 training to replay. Linux
+    /// a board power table and IH, and either no GDDR6 training or a trainer
+    /// that finished (or was skipped) so its cache can be replayed. Linux
     /// replays it as `PSP_MEM_TRAIN_RESUME`; the shared `gddr6::Trainer::resume`
-    /// implements that replay (RDNA4 wires it), but RDNA2 recovery
-    /// reconstruction drops the trainer, so a trained owner stays
-    /// unrecoverable until retention, replay order and cancellation are wired
-    /// and tested here.
+    /// implements that replay, and `into_recovery` retains the trainer and
+    /// replays it at the MemoryTraining stage, after the mode1 reset and
+    /// before SOS loads. A trainer that never finished, failed, or was
+    /// cancelled mid-replay stays unrecoverable: rebuilding onto untrained
+    /// memory would lose the device, so S3 and recovery refuse instead.
     pub fn recoverable(&self) -> bool {
         let h = &self.sequence.backend;
         matches!(self.sequence.state, State::FirmwareReady(_))
-            && h.training.is_none()
+            && self.training_replayable()
             && h.firmware.power.is_some()
             && h.psp.is_some()
             && h.ih.is_some()
+    }
+    /// Whether the retained GDDR6 trainer can be replayed after the ASIC
+    /// lost its trained state: no trainer, or one that finished — or was
+    /// skipped (resident SOS, runtime-DB disable) — so `Trainer::resume`
+    /// accepts it. A trainer that never finished, failed, or was cancelled
+    /// mid-replay cannot be replayed; `Trainer::resume` refuses it, and the
+    /// owner stays unrecoverable rather than rebuilding onto untrained
+    /// memory.
+    pub fn training_replayable(&self) -> bool {
+        self.sequence.backend.training.as_ref().is_none_or(|t| {
+            matches!(
+                t.state(),
+                gddr6::State::Ready | gddr6::State::ResidentSos | gddr6::State::Disabled
+            )
+        })
     }
     /// Recovery quiesce: bounded `navi10_ih_irq_disable`, after which every
     /// IH subscriber (fence routing, thermal) has received `Disabled`.
@@ -1918,9 +1952,12 @@ impl ColdBoot {
     /// same GPU snapshot, authority, pool and prepared firmware, a
     /// `Reset::new_recovery` mode1 reset in `ResetOnInit`, and newly reserved
     /// memory hubs, SDMA proof, IH and kernel queues (same BAR2 doorbells).
-    /// With the first boot's display routes, DMUB storage and the native
-    /// display owner are prepared again, so the run restarts DMUB as cold
-    /// boot did; the modeset is the platform's (`amdgpu_navi22_kms`).
+    /// A finished GDDR6 trainer is retained, not dropped: the rebuilt run
+    /// replays its cache (`PSP_MEM_TRAIN_RESUME`) at the MemoryTraining
+    /// stage, after the reset and before SOS loads. With the first boot's
+    /// display routes, DMUB storage and the native display owner are
+    /// prepared again, so the run restarts DMUB as cold boot did; the
+    /// modeset is the platform's (`amdgpu_navi22_kms`).
     /// Every old owner is dropped without I/O, so its
     /// published VRAM stays quarantined. No device I/O happens here.
     ///
@@ -1942,6 +1979,7 @@ impl ColdBoot {
             queues,
             display,
             display_bios,
+            training,
             ..
         } = self.sequence.backend;
         // Linux's DM resume re-lights the display: DMUB restarts in the
@@ -1961,6 +1999,15 @@ impl ColdBoot {
         boot.boot_mclk_khz = boot_mclk_khz;
         boot.unmapped = unmapped;
         boot.sequence.backend.secure_dmub = secure_dmub;
+        // The trained state did not survive mode1: the new boot replays it.
+        // `recoverable` already proved this trainer finished (or was
+        // skipped), so its cache is the one `Trainer::resume` replays at
+        // the MemoryTraining stage, after the recovery reset below and
+        // before SOS loads.
+        if let Some(trainer) = training {
+            boot.sequence.backend.training = Some(trainer);
+            boot.sequence.backend.training_resume = true;
+        }
         let h = &mut boot.sequence.backend;
         // SAFETY: forwarded recovery contract; construction has no I/O.
         h.reset = Some(
