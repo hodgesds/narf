@@ -2245,8 +2245,8 @@ impl CeTargetFake {
 
     /// `WMI_SERVICE_AVAILABLE_EVENTID`: `struct
     /// wmi_service_available_event` (segment offset + 4-word bitmap)
-    /// + the 4-word extended bitmap. EXT2 (220) lives in the 128..256
-    /// segment: word (220-128)/32 = 2, bit (220-128)%32 = 28.
+    /// plus the 4-word extended bitmap. EXT2 (220) lives in the
+    /// 128..256 segment: word (220-128)/32 = 2, bit (220-128)%32 = 28.
     fn service_available_event(advertise_ext2: bool) -> Vec<u8> {
         let w2 = if advertise_ext2 {
             wmi_svc_bit::EXT2_MSG_SEG_W2
@@ -2551,24 +2551,25 @@ struct WlfwObs {
     out_qrtr_empty: bool,
 }
 
-/// Drive the WCN6750 bring-up through `qmi_ready` with the WLFW
-/// server and a `CeTargetFake` pumped once per host poll. Steps are
-/// driven individually (as `booted_live` does) so the fake can be
-/// captured after `hal_ce_alloc`, while the test still owns `live`.
-/// Returns the `qmi_ready` result (`None` when it did not settle),
-/// the fake with its observations, the WLFW observations, and `live`
-/// for the outcome assertions. The unwind `rproc_shutdown` that
-/// `bring_up` runs after a failed `qmi_ready` is skipped: it sends
-/// no QMI, and the `firmware_stop` unwind (the trailing WLAN_MODE)
-/// already ran inside `qmi_ready`'s error path.
-fn drive_wcn6750_core_start(
-    script: CeTargetScript,
-) -> (
+/// Outcome of [`drive_wcn6750_core_start`]: the `qmi_ready` result
+/// (`None` when it did not settle), the fake with its observations,
+/// the WLFW observations, and `live` for the outcome assertions.
+type CoreStartOutcome = (
     Option<Result<(), AhbError>>,
     CeTargetFake,
     WlfwObs,
     Box<LiveAhb<Env>>,
-) {
+);
+
+/// Drive the WCN6750 bring-up through `qmi_ready` with the WLFW
+/// server and a `CeTargetFake` pumped once per host poll. Steps are
+/// driven individually (as `booted_live` does) so the fake can be
+/// captured after `hal_ce_alloc`, while the test still owns `live`.
+/// The unwind `rproc_shutdown` that `bring_up` runs after a failed
+/// `qmi_ready` is skipped: it sends no QMI, and the `firmware_stop`
+/// unwind (the trailing WLAN_MODE) already ran inside `qmi_ready`'s
+/// error path.
+fn drive_wcn6750_core_start(script: CeTargetScript) -> CoreStartOutcome {
     let blob: &'static [u8] = Box::leak(sc7280_wifi_dt().into_boxed_slice());
     let node = find_ahb_devices(blob)[0].0.clone();
     let p = Box::new(AhbPlatform::probe(blob, &node).unwrap());
@@ -2633,6 +2634,14 @@ fn drive_wcn6750_core_start(
             server.pump();
             fake.pump();
         }
+        // The final poll can post host frames synchronously — the
+        // SRING_SETUPs `pdev_create` sends inside the completing
+        // `qmi_ready` poll — and then return Ready with no further
+        // pump in between, so reap them here or the fake's
+        // observations lag the host by one pump. The server needs no
+        // trailing pump: its QMI traffic spans awaits, so the in-loop
+        // pumps already reaped it.
+        fake.pump();
         out
     };
     let obs = WlfwObs {
