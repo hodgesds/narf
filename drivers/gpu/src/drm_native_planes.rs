@@ -788,13 +788,15 @@ fn check_dcn30_linear(card: &Card, p: &PlaneState) -> Result<(), FsError> {
     Ok(())
 }
 
+/// A plane's destination rectangle on the CRTC: (x, y, width, height).
+type DstRect = (i32, i32, u32, u32);
+/// A plane's source rectangle in the framebuffer: (x, y, width, height).
+type SrcRect = (u32, u32, u32, u32);
+
 /// Whether `p` is placed (not the full-frame primary at the mode), as the
 /// bridge's `placement_of` reads it: the positioned/scaled rectangles,
 /// destination first.
-fn placed_rects(
-    p: &PlaneState,
-    mode: (u32, u32),
-) -> Option<((i32, i32, u32, u32), (u32, u32, u32, u32))> {
+fn placed_rects(p: &PlaneState, mode: (u32, u32)) -> Option<(DstRect, SrcRect)> {
     let dst = (p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h);
     let src = (p.src_x, p.src_y, p.src_w, p.src_h);
     (dst != (0, 0, mode.0, mode.1) || src != (0, 0, mode.0, mode.1)).then_some((dst, src))
@@ -2713,9 +2715,9 @@ mod tests {
             || cursor_ids(&card) != [DCN30_CURSOR_PLANE_ID_BASE, DCN30_CURSOR_PLANE_ID_BASE + 1]
             || card.native_planes.iter().any(|p| p.primary_of.is_some())
             || max_cursor_size(&card) != 256
-            || formats_of(&card, PRIMARY_PLANE_ID_BASE).map_or(true, |f| f != DCN30_PRIMARY_FORMATS)
+            || formats_of(&card, PRIMARY_PLANE_ID_BASE).is_none_or(|f| f != DCN30_PRIMARY_FORMATS)
             || formats_of(&card, OVERLAY_PLANE_ID_BASE)
-                .map_or(true, |f| f != crate::amdgpu_navi48_kms::PLANE_FORMATS)
+                .is_none_or(|f| f != crate::amdgpu_navi48_kms::PLANE_FORMATS)
         {
             return TestResult::Fail("DCN30 publication");
         }
