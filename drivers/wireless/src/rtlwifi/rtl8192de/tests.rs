@@ -254,7 +254,7 @@ fn smoke_rtl8192de_firmware_header_geometry() -> TestResult {
     if fw::parse(&mismatch).is_ok() {
         return TestResult::Fail("8192DE RAM-code size mismatch admitted");
     }
-    if fw::parse(&[]).is_ok() || fw::parse(&vec![0u8; fw::HEADER]).is_ok() {
+    if fw::parse(&[]).is_ok() || fw::parse(&[0u8; fw::HEADER]).is_ok() {
         return TestResult::Fail("8192DE empty image admitted");
     }
     TestResult::Pass
@@ -288,7 +288,7 @@ impl Io for DeFwFake {
             g.wait_reads += 1;
             if g.wait_reads >= g.wait_finish_after {
                 g.regs[usize::from(reg)] &= !fw::IN_PROCESS_BIT;
-                g.regs[usize::from(fw::REG_MCUFWDL)] |= fw::MCUFWDL_EN as u8 | 0x02;
+                g.regs[usize::from(fw::REG_MCUFWDL)] |= fw::MCUFWDL_EN | 0x02;
             }
         }
         // The firmware raises the MAC-ready bit once the image is
@@ -663,16 +663,16 @@ fn de_factory() -> crate::rtlwifi::efuse::Factory {
     }
 }
 
+/// A NAPC v2 row: (channel, bandwidth, offset, curve-value fn).
+type NapcRowV2 = (u8, u8, u8, fn(u8, u8) -> i16);
+/// A NAPC v3 row: (channel, band, bandwidth, offset, curve-value fn).
+type NapcRowV3 = (u8, u8, u8, u8, fn(u8, u8, u8) -> i16);
+
 /// Build a NAPC envelope from the documented layout (header 96, rows of
 /// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
 /// `rows` are (channel, bandwidth, offset, curve-value fn) for v2, or
 /// (channel, 20, 0, fn) for v1.
-fn de_napc_fixture(
-    version: u16,
-    antenna: i16,
-    qualified: i16,
-    rows: &[(u8, u8, u8, fn(u8, u8) -> i16)],
-) -> Vec<u8> {
+fn de_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRowV2]) -> Vec<u8> {
     let factory = de_factory();
     let identity = crate::rtlwifi::radio::factory_identity(&factory);
     let total = 96 + rows.len() * 388;
@@ -766,11 +766,7 @@ fn de_us_5g_domain() -> narf_wireless::reg::RegulatoryDomain {
 /// rows of 516 bytes: channel/band/bandwidth/offset + four 64-entry
 /// curves). `rows` are (channel, band, bandwidth, offset, curve fn)
 /// with the curve fn taking (band, curve, index).
-fn de_napc_v3_fixture(
-    antenna: i16,
-    qualified: i16,
-    rows: &[(u8, u8, u8, u8, fn(u8, u8, u8) -> i16)],
-) -> Vec<u8> {
+fn de_napc_v3_fixture(antenna: i16, qualified: i16, rows: &[NapcRowV3]) -> Vec<u8> {
     let factory = de_factory();
     let identity = crate::rtlwifi::radio::factory_identity(&factory);
     let total = 96 + rows.len() * 516;
@@ -929,7 +925,7 @@ fn smoke_rtl8192de_envelope_v3_5ghz_two_stream() -> TestResult {
     use envelope::*;
     let factory = de_factory();
     let domain5 = de_us_5g_domain();
-    let rows: &[(u8, u8, u8, u8, fn(u8, u8, u8) -> i16)] = &[
+    let rows: &[NapcRowV3] = &[
         (6, 0, 20, 0, de_v3_rising),
         (36, 1, 20, 0, de_v3_rising),
         (40, 1, 20, 0, de_v3_rising),
@@ -2415,7 +2411,7 @@ fn smoke_rtl8192de_qos_ht() -> TestResult {
     let io = de_mac_fake();
     // Factor 0 clamps every nibble above 4 (base 0xb972a841).
     match station::ampdu_factor(&io, super::MacPhyMode::SingleMacSinglePhy, 0) {
-        Ok(Some(word)) if word == 0x4442_4441 => {}
+        Ok(Some(0x4442_4441)) => {}
         _ => return TestResult::Fail("8192DE AMPDU factor clamp"),
     }
     if de_mac_read32(&io, mac::REG_AGGLEN_LMT) != 0x4442_4441 {
@@ -2423,7 +2419,7 @@ fn smoke_rtl8192de_qos_ht() -> TestResult {
     }
     // Factor 2 allows nibbles up to 0xf: the base word is unchanged.
     match station::ampdu_factor(&io, super::MacPhyMode::SingleMacSinglePhy, 2) {
-        Ok(Some(word)) if word == 0xb972_a841 => {}
+        Ok(Some(0xb972_a841)) => {}
         _ => return TestResult::Fail("8192DE AMPDU factor no-op"),
     }
     if station::ampdu_factor(&io, super::MacPhyMode::SingleMacSinglePhy, 4)
@@ -2547,9 +2543,9 @@ fn smoke_rtl8192de_tsf_interrupt_beacon() -> TestResult {
         return TestResult::Fail("8192DE IBSS TSF correct");
     }
     let io = de_mac_fake();
-    if station::int_migration(&io, true).unwrap_or(false) != true
+    if !station::int_migration(&io, true).unwrap_or(false)
         || de_mac_read32(&io, mac::REG_INT_MIG) != 0xfe00_0fa0
-        || station::int_migration(&io, false).unwrap_or(true) != false
+        || station::int_migration(&io, false).unwrap_or(true)
         || de_mac_read32(&io, mac::REG_INT_MIG) != 0
     {
         return TestResult::Fail("8192DE interrupt migration");
@@ -2765,7 +2761,7 @@ fn smoke_rtl8192de_phy_access() -> TestResult {
     }
     io.0.lock().regs[0x8a0..0x8a4].copy_from_slice(&0x54321u32.to_le_bytes());
     match narf_scheduler::block_on(phy::rf_read(&io, phy::Path::A, 0x18)) {
-        Ok(v) if v == 0x54321 => {}
+        Ok(0x54321) => {}
         _ => return TestResult::Fail("8192DE RF 3-wire read"),
     }
     if de_mac_read32(&io, 0x824) != 0x8000_0000 {
@@ -2793,7 +2789,7 @@ fn smoke_rtl8192de_phy_access() -> TestResult {
     let io = de_mac_fake();
     io.0.lock().regs[0x34c..0x350].copy_from_slice(&0x1122_3344u32.to_le_bytes());
     match narf_scheduler::block_on(phy::read_dword_dbi(&io, 0x888, 0x08)) {
-        Ok(v) if v == 0x1122_3344 => {}
+        Ok(0x1122_3344) => {}
         _ => return TestResult::Fail("8192DE DBI read"),
     }
     if de_mac_read16(&io, phy::REG_DBI_CTRL) != 0x888

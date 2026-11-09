@@ -9,7 +9,7 @@
 use super::chip_8922a;
 use super::completion_8922a::Error as CompletionError;
 use super::completion_8922a::*;
-use super::dma::{TxBd, TXBD_OPT_LS, TXCH_NUM};
+use super::dma::{TxBd, TXCH_NUM};
 use super::dma_be::Regs;
 use super::efuse_be::BeFactory;
 use super::irq::Events;
@@ -101,6 +101,7 @@ fn base_req() -> Request {
 /// dword0 pkt_len bits 13:0, shift 15:14, drv 19:18, hdr 21:20,
 /// phy 23:22, type 29:24, long bit 31; dword2 mac_id bits 9:0,
 /// seq 27:16, tid 31:28; dword3 from the caller.
+#[allow(clippy::too_many_arguments)] // the BE RXD dword fields, one per Linux txrx.h position
 fn rxd(
     pkt_type: u8,
     pkt_len: u16,
@@ -211,25 +212,25 @@ fn refs(bufs: &mut [Vec<u8>]) -> Vec<&mut [u8]> {
 
 fn smoke_rtw89_completion_8922a_available() -> TestResult {
     // Eq-is-full seed: wp = len - 1, nothing readable at RP 0.
-    if available_be((0 << 16) | 255, 255, 256) != Ok(0)
+    if available_be(255, 255, 256) != Ok(0)
         || available_be((1 << 16) | 255, 255, 256) != Ok(1)
         || available_be((255 << 16) | 255, 255, 256) != Ok(255)
     {
         return TestResult::Fail("available_be seed cases wrong");
     }
     // Ring wrap at len 4: wp 3, RP 0..3, then wp 0.
-    if available_be((0 << 16) | 3, 3, 4) != Ok(0)
+    if available_be(3, 3, 4) != Ok(0)
         || available_be((1 << 16) | 3, 3, 4) != Ok(1)
         || available_be((3 << 16) | 3, 3, 4) != Ok(3)
-        || available_be((0 << 16) | 0, 0, 4) != Ok(3)
-        || available_be((2 << 16) | 0, 0, 4) != Ok(1)
-        || available_be((1 << 16) | 0, 0, 4) != Ok(0)
+        || available_be(0, 0, 4) != Ok(3)
+        || available_be(2 << 16, 0, 4) != Ok(1)
+        || available_be(1 << 16, 0, 4) != Ok(0)
     {
         return TestResult::Fail("available_be wrap cases wrong");
     }
     // Desync: low half not the host WP, RP past the ring, gone
     // device, degenerate depth, WP past the ring.
-    if available_be((1 << 16) | 0, 255, 256).is_ok()
+    if available_be(1 << 16, 255, 256).is_ok()
         || available_be((256 << 16) | 255, 255, 256).is_ok()
         || available_be(u32::MAX, 255, 256).is_ok()
         || available_be(0, 0, 1).is_ok()
