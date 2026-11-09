@@ -309,6 +309,79 @@ kernel_test_in!(
     navi22_kms_routes_the_hdmi_sink_and_offers_admitted_modes
 );
 
+/// A DP sink's `dp_sst_caps` range publishes VRR-capable for an offered
+/// mode in range, and nothing when the DPCD MSA-ignore bit is clear, the
+/// range is too narrow for DRR, or the sink is absent. The HDMI VSDB
+/// state stays untouched by the DP range.
+fn navi22_kms_dp_freesync_range_publishes_vrr_capable() -> TestResult {
+    use crate::amdgpu_freesync::{dp_sst_caps, VrrRange};
+    // An EDID with a 48-144 Hz range-limits-only descriptor.
+    let mut edid = vec![0u8; 128];
+    edid[0x13] = 4;
+    edid[0x18] = 1;
+    edid[54..72].copy_from_slice(&[0, 0, 0, 0xfd, 0, 48, 144, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    let mut dpcd = [0u8; 16];
+    dpcd[7] = 0x41;
+    let range = dp_sst_caps(&edid, &dpcd);
+    if range
+        != Some(VrrRange {
+            min_hz: 48,
+            max_hz: 144,
+        })
+    {
+        return TestResult::Fail("DP SST caps");
+    }
+    let mut k = Kms::new();
+    let report = Report {
+        connector: port(Kind::DisplayPort, Signal::DisplayPort, 0),
+        detection: Detection::Connected(Sink {
+            edid: edid.clone(),
+            preferred: None,
+            hdmi: false,
+            dpcd: Some(dpcd),
+        }),
+    };
+    k.reconcile_sinks(core::slice::from_ref(&report), |_, _| Some(vec![hd()]));
+    if k.connectors.len() != 1 {
+        return TestResult::Fail("connector count");
+    }
+    // Reconciliation carries no DP range of its own (the platform fills
+    // it from the detection's DPCD); the HDMI VSDB stays empty.
+    if k.connectors[0].dp_vrr.is_some() || k.connectors[0].vrr.is_some() {
+        return TestResult::Fail("reconcile invented a VRR range");
+    }
+    k.connectors[0].dp_vrr = range;
+    if !vrr_capable(&k.connectors[0]) {
+        return TestResult::Fail("DP sink not VRR-capable");
+    }
+    // No MSA-ignore bit: no DP range, fixed refresh.
+    let mut dpcd_off = [0u8; 16];
+    dpcd_off[7] = 0x01;
+    k.connectors[0].dp_vrr = dp_sst_caps(&edid, &dpcd_off);
+    if vrr_capable(&k.connectors[0]) {
+        return TestResult::Fail("DP sink without MSA ignore advertised VRR");
+    }
+    // A range too narrow for DRR admits nothing.
+    k.connectors[0].dp_vrr = Some(VrrRange {
+        min_hz: 58,
+        max_hz: 60,
+    });
+    if vrr_capable(&k.connectors[0]) {
+        return TestResult::Fail("narrow DP range advertised VRR");
+    }
+    // An absent sink never advertises VRR.
+    k.connectors[0].present = false;
+    k.connectors[0].dp_vrr = range;
+    if vrr_capable(&k.connectors[0]) {
+        return TestResult::Fail("absent DP sink advertised VRR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_dp_freesync_range_publishes_vrr_capable
+);
+
 fn navi22_kms_converges_requests() -> TestResult {
     let mut k = Kms::new();
     k.reconcile(&reports(true, 1), admitted);

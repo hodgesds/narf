@@ -917,6 +917,9 @@ pub struct Pipeline {
     /// `hdmi_settings` when the pipe's output format is programmed.
     dp_format: DpFormat,
     hdmi_vrr: Option<(Option<crate::amdgpu_freesync::AmdVsdb>, bool)>,
+    /// The DP FreeSync state `configure_dp_vrr` last committed, as
+    /// `hdmi_vrr` is for HDMI.
+    dp_vrr: Option<(Option<crate::amdgpu_freesync::VrrRange>, bool)>,
     /// ODM 2:1 ([`hdmi_plan`]): the secondary pipe's front end and the
     /// plane with both slices.
     slice: Option<Slice>,
@@ -1033,6 +1036,7 @@ impl Pipeline {
                 hdmi_settings: hdmi::OutputSettings::default(),
                 dp_format: DpFormat::DEFAULT,
                 hdmi_vrr: None,
+                dp_vrr: None,
                 slice: None,
                 odm: None,
                 plane: None,
@@ -2473,12 +2477,102 @@ impl Pipeline {
             })
             .map(|p| p.bytes());
         self.otg.configure_dcn30_drr(bounds)?;
+        // The same DCN30 bounds admit BTR when the range is wide enough
+        // (LfcConfig's 2:1 rule); otherwise BTR is retired.
+        let lfc = bounds
+            .and(range)
+            .and_then(|r| fs::LfcConfig::new(&timing, r));
+        self.otg.configure_dcn30_lfc(lfc)?;
         if usable.is_some() || self.hdmi_vrr.is_some_and(|(c, _)| c.is_some()) {
             self.dig.hdmi_info_packets(&stream).await?;
         }
         self.hdmi = Some(stream);
         self.hdmi_vrr = Some((usable, enabled));
         Ok(bounds)
+    }
+    /// `link_dpms.c enable_stream_features` for the running DP stream:
+    /// read DP_DOWNSPREAD_CTRL, set or clear IGNORE_MSA_TIMING_PARAM, and
+    /// write it back only when it changed (DCN401's `dp_stream_features`).
+    async fn dp_msa_ignore<A: Aux + Send>(
+        &mut self,
+        aux: &mut A,
+        ignore: bool,
+    ) -> Result<(), Error> {
+        use crate::amdgpu_freesync::{DPCD_DOWNSPREAD_CTRL, DPCD_IGNORE_MSA_TIMING_PARAM};
+        let mut current = [0u8; 1];
+        aux.read(DPCD_DOWNSPREAD_CTRL, &mut current).await?;
+        let next = if ignore {
+            current[0] | DPCD_IGNORE_MSA_TIMING_PARAM
+        } else {
+            current[0] & !DPCD_IGNORE_MSA_TIMING_PARAM
+        };
+        if next != current[0] {
+            aux.write(DPCD_DOWNSPREAD_CTRL, &[next]).await?;
+        }
+        Ok(())
+    }
+    /// Ask `enable` for exactly this timing (None: the sink's preferred)
+    /// on a DisplayPort stream: the DP FreeSync enable path, mirroring
+    /// `configure_hdmi_vrr`. The sink-side MSA ignore is set before the
+    /// totals stretch (and cleared after they return to fixed refresh),
+    /// the DCN30 DRR bounds and BTR admission follow, and the AMD FreeSync
+    /// SPD goes out on VPG generic 2. An unchanged request is a no-op.
+    pub async fn configure_dp_vrr<A: Aux + Send>(
+        &mut self,
+        range: Option<crate::amdgpu_freesync::VrrRange>,
+        enabled: bool,
+        aux: &mut A,
+    ) -> Result<Option<crate::amdgpu_freesync::Drr>, Error> {
+        use crate::amdgpu_freesync::{self as fs};
+        if self.state != State::At(Step::Running) || self.connector.signal != Signal::DisplayPort {
+            return Err(Error::Invalid);
+        }
+        let timing = self.output.ok_or(Error::Invalid)?.timing;
+        let usable = range.filter(|r| fs::info_packet(&timing, *r, false, false).is_some());
+        let bounds = usable.filter(|_| enabled).and_then(|r| fs::drr(&timing, r));
+        if self.dp_vrr == Some((usable, enabled)) {
+            return Ok(bounds);
+        }
+        let want_msa = usable.is_some() && enabled;
+        if want_msa {
+            self.dp_msa_ignore(aux, true).await?;
+        }
+        self.otg.configure_dcn30_drr(bounds)?;
+        let lfc = bounds
+            .and(usable)
+            .and_then(|r| fs::LfcConfig::new(&timing, r));
+        self.otg.configure_dcn30_lfc(lfc)?;
+        let packet =
+            usable.and_then(|r| fs::info_packet(&timing, r, false, enabled).map(|p| p.bytes()));
+        self.dp_stream.update_spd_packet(packet.as_ref()).await?;
+        if !want_msa {
+            self.dp_msa_ignore(aux, false).await?;
+        }
+        self.dp_vrr = Some((usable, enabled));
+        Ok(bounds)
+    }
+    /// BTR preflip on the running stream's DCN30 DRR: no-op without
+    /// admitted BTR. `now_us` is monotonic microseconds, as DCN401's
+    /// `lfc_preflip` takes them.
+    pub fn lfc_preflip(&mut self, now_us: u32) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) {
+            return Ok(());
+        }
+        let hdmi = self.connector.signal == Signal::Hdmi;
+        Ok(self.otg.dcn30_lfc_preflip(now_us, hdmi)?)
+    }
+    /// Service one observed VUPDATE while BTR is admitted on the running
+    /// stream. No-op without admitted BTR.
+    pub fn lfc_progress(&mut self) -> Result<(), Error> {
+        if self.state != State::At(Step::Running) {
+            return Ok(());
+        }
+        let hdmi = self.connector.signal == Signal::Hdmi;
+        Ok(self.otg.dcn30_lfc_progress(hdmi)?)
+    }
+    /// Whether BTR frame insertion is admitted on the running stream.
+    pub fn lfc_active(&self) -> bool {
+        self.otg.dcn30_lfc_active()
     }
     /// Metadata-only updates do not blank or retrain TMDS. Format/depth and
     /// HDR enable/disable transitions still go through normal modesetting.
