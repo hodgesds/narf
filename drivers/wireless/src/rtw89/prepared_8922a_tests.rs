@@ -372,7 +372,7 @@ fn smoke_rtw89_prepared_8922a_full_sequence() -> TestResult {
         Ok(completed) if completed.is_empty() => {}
         _ => return TestResult::Fail("RP update completed without a report"),
     }
-    let record = (1u32 << 13) | (0u32 << 8) | 0u32;
+    let record = 1u32 << 13;
     match owner.observe_data_report(&record.to_le_bytes()) {
         Ok(Some(completion))
             if completion.status == 1

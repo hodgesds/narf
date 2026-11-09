@@ -163,7 +163,7 @@ fn smoke_rtw89_8852a_board_blacklist() -> TestResult {
         return TestResult::Fail("8852A must have no upstream blacklist");
     }
     let enabled = Fuses::decode(ChipId::Rtl8852A, 255, 0x7f);
-    if enabled.map(|f| f.enabled()).unwrap_or(false) != true {
+    if !enabled.map(|f| f.enabled()).unwrap_or(false) {
         return TestResult::Fail("8852A legacy fuses must decode enabled");
     }
     let enabled = Fuses::decode(ChipId::Rtl8852A, 255, 0x7f).unwrap();

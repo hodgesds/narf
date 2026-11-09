@@ -190,11 +190,7 @@ fn smoke_rtw89_be_efuse_ddv_dump() -> TestResult {
     if fake.delays.len() != 1 + 1_000_000 {
         return TestResult::Fail("BE DDV RDY poll must tick 1 µs to a 1 s timeout");
     }
-    if fake
-        .writes
-        .iter()
-        .any(|w| *w == (PMC_DBG_CTRL2 as u64, 1, 0x00))
-    {
+    if fake.writes.contains(&(PMC_DBG_CTRL2 as u64, 1, 0x00)) {
         return TestResult::Fail("BE DDV timeout must leave power-cut enabled");
     }
     TestResult::Pass
