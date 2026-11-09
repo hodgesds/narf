@@ -1593,8 +1593,8 @@ kernel_test_in!(
 fn smoke_rtw8852a_station_owner_matches_b_codec_and_gates_noise() -> TestResult {
     let a_factory = factory_with_chip(ChipId::Rtl8852A, false);
     let b_factory = factory(false);
-    let mut a = Controller::new(&a_factory).unwrap();
-    let mut b = Controller::new(&b_factory).unwrap();
+    let a = Controller::new(&a_factory).unwrap();
+    let b = Controller::new(&b_factory).unwrap();
     if !a.supports_noise()
         || b.supports_noise()
         || a.own() != OWN

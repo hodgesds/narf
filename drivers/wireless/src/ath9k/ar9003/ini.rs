@@ -222,8 +222,8 @@ impl Tables {
     /// the 5G-XLNA array; index `>= 4` keeps the common default).
     /// Linux sets no `ini_dfs` for the AR9462, so `dfs` stays empty.
     /// The PCIe SerDes slots are the `pciephy_clkreq_disable_L1`
-    /// table only when `pll_pwrsave` enables them (awake on CONTROL
-    /// + ON_D3, low-power on CONTROL + ON_D0); with the resolved
+    /// table only when `pll_pwrsave` enables them (awake on
+    /// `CONTROL + ON_D3`, low-power on `CONTROL + ON_D0`); with the resolved
     /// default 7 both are set.
     pub fn ar9462(revision: &Revision, identity: &Identity, pll_pwrsave: PllPwrsave) -> Self {
         // 2.1 owns only its MAC core, baseband postamble and SoC

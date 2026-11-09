@@ -259,9 +259,7 @@ fn smoke_input_sysfs_id_subdir() -> TestResult {
             }
         }
         // Each id file also resolves as a VFS file.
-        if id_vfs.lookup("vendor").is_none() {
-            return None;
-        }
+        id_vfs.lookup("vendor")?;
         Some(())
     })();
     ROUTER.unregister_device(id);

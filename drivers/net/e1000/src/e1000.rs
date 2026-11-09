@@ -3769,13 +3769,14 @@ impl E1000 {
         if slot >= TX_RING_LEN || frame.len() < 14 {
             return false;
         }
-        // SAFETY: `slot < TX_RING_LEN`, so it indexes a live TX pool
-        // buffer; the reads are volatile, as in the driver's own
-        // transmit path.
-        for k in 0..14usize {
+        let _state = self.tx_state.lock();
+        for (k, expected) in frame.iter().take(14).enumerate() {
+            // SAFETY: slot selects a live TX pool buffer, which holds
+            // at least 14 bytes; k stays within those bytes. The TX lock
+            // excludes CPU writers, and the device only reads TX data.
             let b =
                 unsafe { core::ptr::read_volatile(self.tx_pool[slot].cpu_ptr_at::<u8>(k as u64)) };
-            if b != frame[k] {
+            if b != *expected {
                 return false;
             }
         }
