@@ -37,9 +37,15 @@
 //! Not this step (remainders, listed in the PR body): the IMR reload
 //! (`_rtl92d_phy_reload_imr_setting`, RF IMR tables), the RF setting
 //! switch (`_rtl92d_phy_switch_rf_setting`, curve-index tables),
-//! the IQK reload (`rtl92d_phy_reload_iqk_setting`), and the LCK
-//! in-progress wait — all calibration-table work owned by later lanes.
+//! and the LCK in-progress wait — all calibration-table work owned
+//! by later lanes. The IQK reload ([`super::calib`]) runs here, at
+//! the end of [`switch_channel`], as in Linux's step machine.
+//!
+//! [`switch_channel`] takes the caller's [`super::calib::IqkMatrix`]
+//! (reset by `rtl92de_hw_init` before any switch) and reloads the
+//! stored matrix for the new channel once the RF writes land.
 
+use super::calib::{self, IqkContext, IqkMatrix};
 use super::phy::{self, PgStore};
 use super::txpower::{self, Efuse};
 use super::{Band, BandSet, MacPhyMode, RfType};
@@ -559,7 +565,8 @@ pub struct SwitchOutcome {
 /// bandwidth changes and LCK calibration, as Linux's
 /// `sw_chnl_inprogress` / `set_bwmode_inprogress` / `lck_inprogress`
 /// guards do; the band/channel consistency guards are enforced here.
-/// The IMR reload, RF setting switch and IQK reload are remainders.
+/// The IMR reload and RF setting switch are remainders; the IQK
+/// reload runs at the end, once the RF writes land.
 #[allow(clippy::too_many_arguments)]
 pub async fn switch_channel(
     io: &impl Io,
@@ -574,6 +581,7 @@ pub async fn switch_channel(
     channel: u8,
     bw40: bool,
     chnlval: &mut [u32; 2],
+    iqk: &mut IqkMatrix,
 ) -> Result<SwitchOutcome, Error> {
     let mut rf3c = None;
     if mode == MacPhyMode::SingleMacSinglePhy && *bandset == BandSet::OnBoth {
@@ -630,6 +638,19 @@ pub async fn switch_channel(
         chnlval[p] = rfreg_chnlval(channel, *band == Band::On5Ghz, chnlval[p]);
         phy::set_rf(io, path, phy::RF_CHNLBW, phy::RFREG_OFFSET_MASK, chnlval[p]).await?;
     }
+    // "do IQK when all parameters are ready": the stored-matrix
+    // reload for the new channel (`rtl92d_phy_reload_iqk_setting`).
+    calib::reload_iqk_setting(
+        io,
+        channel,
+        iqk,
+        &IqkContext {
+            single_phy,
+            mode,
+            interface_index,
+            band: *band,
+        },
+    )?;
     Ok(SwitchOutcome {
         switched: true,
         bandset: *bandset,
@@ -652,6 +673,7 @@ pub async fn configure(
     single_phy: bool,
     op: &Operating,
     chnlval: &mut [u32; 2],
+    iqk: &mut IqkMatrix,
 ) -> Result<SwitchOutcome, Error> {
     let outcome = switch_channel(
         io,
@@ -666,6 +688,7 @@ pub async fn configure(
         op.wide,
         op.bw40,
         chnlval,
+        iqk,
     )
     .await?;
     if outcome.switched {

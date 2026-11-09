@@ -360,7 +360,7 @@ fn check_interrupts() -> Result<(), &'static str> {
     model.set(0x7044, 2);
     model.set(0x80, 0x41);
     model.set(0xc0, 0x41);
-    let events = irq::cause(&port, mask.imr)
+    let events = irq::cause(&port, mask.imr, false)
         .map_err(|_| "cause fault")?
         .ok_or("pending cause lost")?;
     if !events.rx_hp || events.rx_lp || !events.tx || events.reset() {
@@ -370,7 +370,7 @@ fn check_interrupts() -> Result<(), &'static str> {
     model.set(0xc0, 0x0080_0000);
     model.set(0x8c, 0x0001_0000);
     model.set(0xa7c0, 0x1f);
-    let events = irq::cause(&port, mask.imr)
+    let events = irq::cause(&port, mask.imr, false)
         .map_err(|_| "cause fault")?
         .ok_or("watchdog cause lost")?;
     if events.bb_watchdog != Some(0x1f) || !events.reset() || model.reg(0xa7c0) != 0x17 {
@@ -379,7 +379,7 @@ fn check_interrupts() -> Result<(), &'static str> {
     model.set(0x4038, 0);
     model.set(0x80, 0);
     model.set(0x4028, 0x1000);
-    let events = irq::cause(&port, mask.imr)
+    let events = irq::cause(&port, mask.imr, false)
         .map_err(|_| "cause fault")?
         .ok_or("sync cause lost")?;
     if !events.fatal
@@ -391,8 +391,25 @@ fn check_interrupts() -> Result<(), &'static str> {
         return Err("completion timeout not pulsed and reported fatal");
     }
     model.set(0x4028, 0);
-    if !matches!(irq::cause(&port, mask.imr), Ok(None)) {
+    if !matches!(irq::cause(&port, mask.imr, false), Ok(None)) {
         return Err("idle cause reported");
+    }
+    // MCI routing: the async MCI bit reports only when MCI is enabled.
+    if irq::INT_MCI != 0x200 {
+        return Err("INT_MCI is not 0x200");
+    }
+    model.set(0x4038, 0x80);
+    let events = irq::cause(&port, mask.imr, true)
+        .map_err(|_| "cause fault (mci)")?
+        .ok_or("mci cause lost")?;
+    if !events.mci {
+        return Err("async MCI bit not reported with MCI enabled");
+    }
+    let events = irq::cause(&port, mask.imr, false)
+        .map_err(|_| "cause fault (mci off)")?
+        .ok_or("mci cause lost (off)")?;
+    if events.mci {
+        return Err("async MCI bit reported with MCI disabled");
     }
     Ok(())
 }

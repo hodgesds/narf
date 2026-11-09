@@ -57,18 +57,24 @@
 //!   responses, ...) are separate lanes.
 //! - H2C buffer release on C2H acknowledgement: the ack (MAC
 //!   INFO REC_ACK / DONE_ACK, `rx_packet::C2h::ack`) is parsed
-//!   and surfaced, but `Prepared8922a::retain_h2c` records no
-//!   FWCMD sequence (FWCMD header framing is a separate
-//!   remainder), so no ack can yet be matched to a retained
-//!   buffer. FIFO-freeing on any ack would be fabrication.
+//!   and surfaced, and the Prepared owner matches it to a
+//!   retained buffer by the (category, class, function,
+//!   sequence) `fwcmd_8922a` recorded when the buffer was
+//!   framed (`Prepared8922a::retain_h2c` / `release_h2c_by_ack`);
+//!   an unmatched ack releases nothing.
 //! - BlockAck reorder: delivered WIFI frames carry `reorder` /
 //!   `seq` / `tid` in their metadata for the future reorder
 //!   owner; this worker delivers in arrival order.
 //! - A-MSDU deaggregation and RX fragment reassembly: torn
 //!   A-MSDU cuts are dropped; reassembly is a separate lane.
 //! - 6 GHz admission, MLO multi-link, legacy-mode admission,
-//!   the full `pwr_on_func` tail / `mac_pre_init` owner, `cid`
-//!   retention, AX-path 8922A refusals.
+//!   the full `pwr_on_func` tail / `mac_pre_init` owner (now
+//!   `mac_pre_init_8922a`), `cid` retention (now
+//!   `mac_pre_init_8922a::HalChipVer`), AX-path 8922A refusals
+//!   (verified already-delivered: see `tx_transport`,
+//!   `packet_format`, `packet_core`, `efuse`, `factory`,
+//!   `fifo`, `bdram`, `command_queue`, `download_dma`,
+//!   `irq::Mask::config`, `station_control::Controller::new`).
 
 use alloc::vec::Vec;
 
@@ -503,6 +509,12 @@ pub(super) struct Outcome {
     pub(super) rx_unavailable: bool,
     /// Re-enable the interrupt mask: work done is under budget.
     pub(super) rearm: bool,
+    /// Retained H2C buffers released by C2H acknowledgements
+    /// during this run (`fwcmd_8922a::Released`, in ack order).
+    /// Filled by the Prepared owner, not the worker: the worker
+    /// routes the acks, the owner matches them to retained
+    /// buffers.
+    pub(super) h2c_released: Vec<super::fwcmd_8922a::Released>,
 }
 
 /// Drain one RPQ buffer's 4-byte records into `data`. The

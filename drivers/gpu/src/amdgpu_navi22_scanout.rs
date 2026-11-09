@@ -15,6 +15,7 @@ use crate::{
     amdgpu_dcn30_cursor::{self as cursor, Cursor},
     amdgpu_dcn30_flip::{Flip, Interrupt, Position},
     amdgpu_dcn_clk::Error,
+    amdgpu_dcn_plane::BlendConfig,
     amdgpu_dml::Timing,
     amdgpu_vram::{Pool, Reservation},
 };
@@ -567,6 +568,105 @@ impl Scanout {
         }
         Ok(())
     }
+    /// [`Scanout::arm`] for a frame whose primary and overlay placements
+    /// both differ (`commit_planes_for_stream`, full update of two planes):
+    /// the joint update's raised watermarks first (`prepare_bandwidth`),
+    /// then under the OTG's pipe-control lock both planes' registers
+    /// ([`crate::amdgpu_navi22_modeset::Pipeline::program_two_planes`])
+    /// and both surface addresses, so all of it latches at one VUPDATE.
+    /// The slave HUBP is unblanked last, inside the lock, once its address
+    /// is armed. Completion waits for both HUBPs (`Flip::pending` covers
+    /// the overlay). A failure after the lock leaves the pipe's state
+    /// unknown: the owner fails as a flip that never latched does.
+    pub async fn arm_two_planes(
+        &mut self,
+        kind: ArmedKind,
+        external: u64,
+        overlay_address: u64,
+        pipeline: &mut crate::amdgpu_navi22_modeset::Pipeline,
+        update: &crate::amdgpu_navi22_plane::TwoPlaneUpdate,
+        blend: &BlendConfig,
+    ) -> Result<Armed, Error> {
+        self.running()?;
+        if pipeline.overlay_pipe().is_none() {
+            return Err(Error::Invalid);
+        }
+        let address = match kind {
+            ArmedKind::Back => self.buffers.back().ok_or(Error::Invalid)?.address,
+            ArmedKind::External => external,
+        };
+        let mut longest = self.timing;
+        if let Some(bounds) = self.vrr {
+            longest.v_total = bounds.v_total_max;
+        }
+        self.program_two_planes_locked(pipeline, update, blend, address, overlay_address)
+            .await?;
+        self.state = State::Flipping;
+        if self.vrr.is_some() {
+            if let Err(error) = self.flip.manual_trigger() {
+                self.state = State::Failed(error);
+                return Err(error);
+            }
+        }
+        Ok(Armed {
+            epoch: self.epoch,
+            address,
+            kind,
+            deadline: narf_time::Deadline::after_us(flip_timeout_us(&longest)),
+        })
+    }
+    /// Attach the slave overlay `pipe`'s HUBP to this flip owner (the
+    /// pipeline leased it): its address is armed beside the primary's and
+    /// its latch gates flip completion.
+    ///
+    /// # Safety
+    /// As [`Scanout::new`], for `pipe`'s HUBP too.
+    pub unsafe fn attach_overlay(&mut self, gpu: &AmdGpu, pipe: u8) -> Result<(), Error> {
+        // SAFETY: forwarded pipe ownership.
+        unsafe { self.flip.set_overlay(gpu, pipe) }
+    }
+    /// Forget the overlay HUBP after the pipeline released the overlay
+    /// (`Pipeline::release_overlay`): no flip completion waits on the
+    /// parked HUBP. The primary keeps presenting.
+    pub fn detach_overlay(&mut self) {
+        self.flip.clear_overlay();
+    }
+    /// The HDP flush, the raised watermarks, then both planes' registers
+    /// and both addresses under the pipe-control lock (always released). A
+    /// failure after the lock fails the owner.
+    async fn program_two_planes_locked(
+        &mut self,
+        pipeline: &mut crate::amdgpu_navi22_modeset::Pipeline,
+        update: &crate::amdgpu_navi22_plane::TwoPlaneUpdate,
+        blend: &BlendConfig,
+        address: u64,
+        overlay_address: u64,
+    ) -> Result<(), Error> {
+        // The producer's CPU writes must reach VRAM before the latch.
+        pipeline.flush().map_err(pipeline_error)?;
+        pipeline
+            .prepare_plane(&update.primary)
+            .await
+            .map_err(pipeline_error)?;
+        self.flip.pipe_control_lock(true)?;
+        let programmed = match pipeline.program_two_planes(update, blend).await {
+            Ok(()) => match self.flip.program_locked(address) {
+                Ok(()) => match self.flip.program_overlay_locked(overlay_address) {
+                    Ok(()) => pipeline.unblank_overlay().await.map_err(pipeline_error),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(pipeline_error(e)),
+        };
+        // The lock is always released, so a failure cannot freeze updates.
+        let unlocked = self.flip.pipe_control_lock(false);
+        if let Err(error) = programmed.and(unlocked) {
+            self.state = State::Failed(error);
+            return Err(error);
+        }
+        Ok(())
+    }
     /// [`Scanout::return_to_owned`] when the pipe shows another placement
     /// than the owned front's (a client framebuffer in place, or a placed
     /// copy): the owned front's full-screen plane `update` latches with its
@@ -825,6 +925,9 @@ impl Scanout {
     pub fn stop(&mut self) -> Result<(), Error> {
         let hidden = self.cursor.hide();
         self.disable_interrupts();
+        // The overlay's HUBP is parked by the pipeline teardown that
+        // follows; no flip completion waits on it after this.
+        self.flip.clear_overlay();
         // An armed (unlatched) flip is not a failure: the caller's pipeline
         // disable drains HUBP before `release`, so both surfaces become
         // reclaimable. Leaving it Flipping made `release` refuse and leaked

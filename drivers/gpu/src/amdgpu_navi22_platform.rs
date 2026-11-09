@@ -1492,6 +1492,14 @@ fn reconcile_displays(boot: &mut boot::ColdBoot, reports: &[crate::amdgpu_navi22
         for (index, connector) in kms.connectors.iter_mut().enumerate() {
             connector.hdmi_limits = boot.display_hdmi_limits(&connector.port);
             connector.vrr = boot.hdmi_vrr_caps(index);
+            // A DP sink's FreeSync range from its EDID and the DPCD caps
+            // detection read (`dp_sst_caps`); HDMI sinks keep `vrr`.
+            connector.dp_vrr = match reports.get(index).map(|r| &r.detection) {
+                Some(Detection::Connected(sink)) => sink
+                    .dpcd
+                    .and_then(|dpcd| crate::amdgpu_freesync::dp_sst_caps(&sink.edid, &dpcd)),
+                _ => None,
+            };
         }
     }
     // What the sinks' HPD looked like at this detection.
@@ -1739,6 +1747,43 @@ async fn converge_hdmi_vrr(boot: &mut boot::ColdBoot) {
     }
 }
 
+/// Apply live DP VRR controls under the same owner used for flips. No KMS
+/// guard survives an await. Failure takes the existing safe relight path.
+async fn converge_dp_vrr(boot: &mut boot::ColdBoot) {
+    use crate::amdgpu_navi22_kms::{KMS, MAX_CRTCS};
+    let updates: alloc::vec::Vec<_> = {
+        let kms = KMS.lock();
+        (0..MAX_CRTCS)
+            .filter_map(|d| {
+                let crtc = kms.crtc_at(d)?;
+                let shown = crtc.shown.as_ref()?;
+                let n = crtc.route?;
+                let c = kms.connectors.get(n)?;
+                (crtc.active
+                    && crtc.requested.is_none_or(|t| t == shown.1)
+                    && c.port.signal == crate::amdgpu_navi22_display::Signal::DisplayPort
+                    && !c.color_relight
+                    && !c.output.needs_modeset(c.shown_output))
+                .then_some((d, n, c.port, c.dp_vrr, crtc.vrr_enabled))
+            })
+            .collect()
+    };
+    for (d, n, port, range, enabled) in updates {
+        let group = GROUP_CRTCS.lock().iter().position(|&crtc| crtc == d);
+        if group.is_none() && d != 0 {
+            continue;
+        }
+        if boot.configure_dp_vrr(group, range, enabled).await.is_err() {
+            let mut kms = KMS.lock();
+            if let Some(c) = kms.connectors.get_mut(n).filter(|c| c.port == port) {
+                c.color_relight = true;
+                kms.attempted = None;
+                kms.attempted_group = None;
+            }
+        }
+    }
+}
+
 /// Metadata updates are serialized with the display owner. A newer request
 /// arriving during the await remains pending: mark only the captured state
 /// applied. A failed packet update requests the usual bounded relight.
@@ -1976,6 +2021,11 @@ async unsafe fn monitor_pass() {
     }
     update_hdmi_metadata(boot).await;
     converge_hdmi_vrr(boot).await;
+    converge_dp_vrr(boot).await;
+    // The monitor pass is the per-VUPDATE BTR service on Navi22 (50 ms
+    // steps): a missed VUPDATE only resets the BTR cycle, it never
+    // shortens the wrong frame.
+    boot.display_lfc_progress();
     // SAFETY: as below; a lit or wanted multi-stream context owns the pass.
     if unsafe { converge_group(boot, running) }.await {
         return;
@@ -2578,6 +2628,10 @@ fn trace_refusal(refusal: crate::amdgpu_navi22_plane::Refusal) {
             crate::amdgpu_navi22_plane::Refusal::Geometry(_) => 1,
             crate::amdgpu_navi22_plane::Refusal::Mode(_) => 2,
             crate::amdgpu_navi22_plane::Refusal::Clock => 3,
+            // Only produced when a slave overlay is live and the
+            // single-plane plan is attempted; the two-plane path
+            // (plan_two) is the one that admits it.
+            crate::amdgpu_navi22_plane::Refusal::Overlay => 5,
             crate::amdgpu_navi22_plane::Refusal::Odm => 4,
         };
     if LOGGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {

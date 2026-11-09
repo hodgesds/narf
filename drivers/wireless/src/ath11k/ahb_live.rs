@@ -279,6 +279,15 @@ impl<E: AhbEnv> LiveAhb<E> {
     pub fn hif(&self) -> Option<&CeHif<AhbIo<&'static E::Regs>, AhbIrq>> {
         self.hif.as_ref()
     }
+
+    /// The CE pipes before `core_ready` takes them into the HIF
+    /// (WCN6750: after `hal_ce_alloc`). Fixture-only: a CE/HTC/WMI
+    /// target fake captures the ring handles from this before the
+    /// bring-up future moves the `Ce` into the core.
+    pub(crate) fn ce(&self) -> Option<&Ce> {
+        self.ce.as_ref()
+    }
+
     pub fn is_booted(&self) -> bool {
         matches!(
             &self.rproc,

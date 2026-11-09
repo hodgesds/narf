@@ -22,10 +22,23 @@
 
 #![allow(dead_code)]
 
+use core::fmt;
+
 /// A field element in GF(2^255 - 19).
 /// Represented as 5 51-bit limbs in i64.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct FieldElement(pub(crate) [i64; 5]);
+
+/// SEC-C2 (#1551): field elements can hold secret intermediates
+/// (ECDH shared secrets) — `Debug` is hand-written and redacted;
+/// the derived `Debug` printed all five limbs.
+impl fmt::Debug for FieldElement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FieldElement")
+            .field(&"<redacted: 32 bytes>")
+            .finish()
+    }
+}
 
 impl FieldElement {
     pub const ZERO: Self = FieldElement([0; 5]);
@@ -285,12 +298,25 @@ impl PartialEq for FieldElement {
 
 impl Eq for FieldElement {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Point {
     pub x: FieldElement,
     pub y: FieldElement,
     pub z: FieldElement,
     pub t: FieldElement,
+}
+
+/// SEC-C2 (#1551): same redaction as `FieldElement` — extended
+/// coordinates can hold secret intermediates (ECDH shared point).
+impl fmt::Debug for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Point")
+            .field("x", &"<redacted>")
+            .field("y", &"<redacted>")
+            .field("z", &"<redacted>")
+            .field("t", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PartialEq for Point {

@@ -92,6 +92,14 @@ impl AspmVars {
             const_support_pciaspm: aspm_support,
         }
     }
+
+    /// `support_backdoor` from `const_support_pciaspm` (`pci.c`):
+    /// only the explicit ASPM-support setting (1) enables the
+    /// back door (and ASPM); 0 refuses ASPM outright and 2 leaves
+    /// it to the chipset setting (Intel bridges only).
+    pub fn support_backdoor(&self) -> bool {
+        self.const_support_pciaspm == 1
+    }
 }
 
 /// The `rtl92d_init_sw_vars` state for one function.

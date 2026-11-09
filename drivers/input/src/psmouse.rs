@@ -806,19 +806,21 @@ pub fn synaptics_query_hardware<T: Ps2Transport>(
             }
         }
     }
-    if syn_ext_cap_requests(hw.capabilities) >= 4 {
-        if synaptics_send_cmd(t, SYN_QUE_EXT_CAPAB_0C, &mut r) {
-            hw.ext_cap_0c = ((r[0] as u32) << 16) | ((r[1] as u32) << 8) | r[2] as u32;
-        }
+    if syn_ext_cap_requests(hw.capabilities) >= 4
+        && synaptics_send_cmd(t, SYN_QUE_EXT_CAPAB_0C, &mut r)
+    {
+        hw.ext_cap_0c = ((r[0] as u32) << 16) | ((r[1] as u32) << 8) | r[2] as u32;
     }
 
     // Resolution and reported coordinate limits (major >= 4 only).
     if syn_id_major(hw.identity) >= 4 {
-        if synaptics_send_cmd(t, SYN_QUE_RESOLUTION, &mut r) {
-            if r[0] != 0 && (r[1] & 0x80) != 0 && r[2] != 0 {
-                hw.x_res = r[0] as u32;
-                hw.y_res = r[2] as u32;
-            }
+        if synaptics_send_cmd(t, SYN_QUE_RESOLUTION, &mut r)
+            && r[0] != 0
+            && (r[1] & 0x80) != 0
+            && r[2] != 0
+        {
+            hw.x_res = r[0] as u32;
+            hw.y_res = r[2] as u32;
         }
         if syn_ext_cap_requests(hw.capabilities) >= 5
             && syn_cap_max_dimensions(hw.ext_cap_0c)
@@ -1030,7 +1032,7 @@ fn send_retry<T: Ps2Transport>(t: &mut T, byte: u8) -> bool {
 /// `0xF8`-prefixed sequences for v2/v3/v4, with the v4 form
 /// repeating the `0x00` (READWRITE) step before the value).
 fn elantech_write_reg<T: Ps2Transport>(t: &mut T, hw_version: u8, reg: u8, val: u8) -> bool {
-    if reg < 0x07 || reg > 0x26 || (0x12..0x20).contains(&reg) {
+    if !(0x07..=0x26).contains(&reg) || (0x12..0x20).contains(&reg) {
         return false;
     }
     match hw_version {
@@ -1077,7 +1079,7 @@ fn elantech_write_reg<T: Ps2Transport>(t: &mut T, hw_version: u8, reg: u8, val: 
 /// is `param[0]` of the `GETINFO` reply, except on hw v4 where it
 /// is `param[1]`.
 fn elantech_read_reg<T: Ps2Transport>(t: &mut T, hw_version: u8, reg: u8) -> Option<u8> {
-    if reg < 0x07 || reg > 0x26 || (0x12..0x20).contains(&reg) {
+    if !(0x07..=0x26).contains(&reg) || (0x12..0x20).contains(&reg) {
         return None;
     }
     let mut param = [0u8; 3];
@@ -1257,10 +1259,10 @@ fn query_elantech_info<T: Ps2Transport>(
 
 /// Elantech detect (Linux `elantech_detect` + `elantech_query_info`
 /// + `elantech_set_absolute_mode`): the magic knock, the firmware
-/// version query with its signature check, the capability/range
-/// queries, and the absolute-mode register writes. `None` on any
-/// failure — the caller falls through to the reset + wheel knocks,
-/// exactly as Linux falls back to standard PS/2.
+///   version query with its signature check, the capability/range
+///   queries, and the absolute-mode register writes. `None` on any
+///   failure — the caller falls through to the reset + wheel knocks,
+///   exactly as Linux falls back to standard PS/2.
 fn detect_elantech<T: Ps2Transport>(t: &mut T) -> Option<ElantechInfo> {
     // Use magic knock to detect Elantech touchpad. RESET_DIS is
     // 0xF6 (`CMD_SET_DEFAULTS`).
@@ -1672,11 +1674,11 @@ pub fn decode_elantech_v1(
     let fingers = if fw_version < 0x020000 {
         // byte 0:  D   U  p1  p2   1  p3   R   L
         // byte 1:  f   0  th  tw  x9  x8  y9  y8
-        (((packet[1] & 0x80) >> 7) + ((packet[1] & 0x30) >> 4)) as u8
+        ((packet[1] & 0x80) >> 7) + ((packet[1] & 0x30) >> 4)
     } else {
         // byte 0: n1  n0  p2  p1   1  p3   R   L
         // byte 1:  0   0   0   0  x9  x8  y9  y8
-        ((packet[0] & 0xc0) >> 6) as u8
+        (packet[0] & 0xc0) >> 6
     };
     if jumpy_cursor {
         if fingers != 1 {
@@ -1687,8 +1689,10 @@ pub fn decode_elantech_v1(
             return None;
         }
     }
-    let mut frame = ElantechFrame::default();
-    frame.fingers = fingers;
+    let mut frame = ElantechFrame {
+        fingers,
+        ..Default::default()
+    };
     if fingers != 0 {
         // byte 2: x7..x0; byte 3: y7..y0.
         let x = (((packet[1] & 0x0c) as u32) << 6) | packet[2] as u32;
@@ -1718,12 +1722,14 @@ pub fn decode_elantech_v2(
     y_max: u32,
 ) -> ElantechFrame {
     // byte 0: n1  n0   .   .   .   .   R   L
-    let mut fingers = ((packet[0] & 0xc0) >> 6) as u8;
+    let mut fingers = (packet[0] & 0xc0) >> 6;
     if fingers == 3 && packet[3] & 0x80 != 0 {
         fingers = 4;
     }
-    let mut frame = ElantechFrame::default();
-    frame.fingers = fingers;
+    let mut frame = ElantechFrame {
+        fingers,
+        ..Default::default()
+    };
     let (mut x1, mut y1, mut x2, mut y2) = (0u32, 0u32, 0u32, 0u32);
     let (mut pres, mut width) = (0u16, 0u16);
     match fingers {
@@ -1792,7 +1798,7 @@ pub fn decode_elantech_v3(
     y_max: u32,
     buttonpad: bool,
 ) -> Option<ElantechFrame> {
-    let fingers = ((packet[0] & 0xc0) >> 6) as u8;
+    let fingers = (packet[0] & 0xc0) >> 6;
     let (mut x1, mut y1, mut x2, mut y2) = (0u32, 0u32, 0u32, 0u32);
     match fingers {
         1 | 3 => {
@@ -1820,8 +1826,10 @@ pub fn decode_elantech_v3(
     }
     let pres = ((packet[1] & 0xf0) | ((packet[4] & 0xf0) >> 4)) as u16;
     let width = (((packet[0] & 0x30) >> 2) | ((packet[3] & 0x30) >> 4)) as u16;
-    let mut frame = ElantechFrame::default();
-    frame.fingers = fingers;
+    let mut frame = ElantechFrame {
+        fingers,
+        ..Default::default()
+    };
     if fingers != 0 {
         frame.slots[0] = ElantechSlot {
             active: true,
@@ -1929,9 +1937,11 @@ pub fn decode_elantech_v4(
         }
         _ => return None,
     }
-    let mut frame = ElantechFrame::default();
-    frame.slots = state.slots;
-    frame.fingers = state.active_mask.count_ones() as u8;
+    let mut frame = ElantechFrame {
+        slots: state.slots,
+        fingers: state.active_mask.count_ones() as u8,
+        ..Default::default()
+    };
     // For clickpads map both buttons to BTN_LEFT.
     if buttonpad {
         frame.left = packet[0] & 0x03 != 0;
@@ -2028,7 +2038,7 @@ pub fn synaptics_invert_y(y: i32) -> i32 {
 /// `w = ((b0 & 0x30) >> 2) | ((b0 & 0x04) >> 1) | ((b3 & 0x04) >> 2)`,
 /// left = `b0 & 0x01`, right = `b0 & 0x02`.
 pub fn decode_synaptics_newabs(buf: &[u8; 6]) -> SynapticsHwState {
-    let w = (((buf[0] & 0x30) >> 2) | ((buf[0] & 0x04) >> 1) | ((buf[3] & 0x04) >> 2)) as u8;
+    let w = ((buf[0] & 0x30) >> 2) | ((buf[0] & 0x04) >> 1) | ((buf[3] & 0x04) >> 2);
     let x = synaptics_wrap(
         ((buf[3] as i32 & 0x10) << 8) | ((buf[1] as i32 & 0x0f) << 8) | buf[4] as i32,
     );
@@ -2051,7 +2061,7 @@ pub fn decode_synaptics_newabs(buf: &[u8; 6]) -> SynapticsHwState {
 /// `w = ((b1 & 0x80) >> 4) | ((b0 & 0x04) >> 1)`,
 /// left = `b0 & 0x01`, right = `b0 & 0x02`.
 pub fn decode_synaptics_oldabs(buf: &[u8; 6]) -> SynapticsHwState {
-    let w = (((buf[1] & 0x80) >> 4) | ((buf[0] & 0x04) >> 1)) as u8;
+    let w = ((buf[1] & 0x80) >> 4) | ((buf[0] & 0x04) >> 1);
     let x = synaptics_wrap(((buf[1] as i32 & 0x1f) << 8) | buf[2] as i32);
     let y = synaptics_wrap(((buf[4] as i32 & 0x1f) << 8) | buf[5] as i32);
     SynapticsHwState {
@@ -2100,14 +2110,6 @@ impl SynapticsPktType {
         }
     }
 }
-
-/// Per-byte validation (Linux `synaptics_validate_byte`).
-/// Only bytes 0..=4 are validated (the 6th byte completes the
-/// packet); `idx` outside that range is invalid.
-/// Masks/results, verbatim from Linux:
-/// * NEWABS strict: mask `{0xC8,0,0,0xC8,0}`, result `{0x80,0,0,0xC0,0}`
-/// * NEWABS relaxed: mask `{0xC0,0,0,0xC0,0}`, result `{0x80,0,0,0xC0,0}`
-/// * OLDABS: mask `{0xC0,0x60,0,0xC0,0x60}`, result `{0xC0,0,0,0x80,0}`
 
 /// Per-byte validation (Linux `synaptics_validate_byte`).
 /// Only bytes 0..=4 are validated (the 6th byte completes the

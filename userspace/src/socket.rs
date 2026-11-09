@@ -3721,6 +3721,34 @@ impl SocketFile {
             }
             Reg::None => {}
         }
+        // #1995: retiring the listener's state is what closes the
+        // ghost-connect window. Unpublishing the name above is not
+        // enough: the state stayed `InetListener` / `Inet6Listener`
+        // with `listening: true`, so a `connect()` that had already
+        // cloned the listener `Arc` from the registry could still
+        // enqueue into the dead listener's queue and return success.
+        // The state lock serializes this transition against the
+        // enqueue-time state check in the `dispatch_inet_stream` /
+        // `dispatch_inet6_stream` Connect arms — whichever takes the
+        // lock first wins, and a connect that enqueued first raced a
+        // live listener. The registry locks are released before this
+        // lock is taken, so the LISTENERS→state order the connect
+        // paths use is preserved and no new lock order is introduced.
+        // The pending queue drops with the listener `Arc` once the
+        // racing connect's clone is released. Idempotent: a second
+        // release re-runs the self-guarded unpublish above (it cannot
+        // evict a new listener that rebound the address since — the
+        // port release is likewise idempotent) and re-clears this flag.
+        {
+            let mut state = self.state.lock();
+            match &mut *state {
+                SocketState::InetListener { listening, .. }
+                | SocketState::Inet6Listener { listening, .. } => {
+                    *listening = false;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -9211,6 +9239,47 @@ impl SocketFile {
         SocketOpResult::Err(SockError::InvalidArg)
     }
 
+    /// Test-only staging seam for the #1995 ghost-connect window
+    /// (kernel-test builds only; compiled out of production kernels).
+    /// A `connect()` holds a cloned listener `Arc` between the registry
+    /// lookup and the enqueue-time state check, and no single-threaded
+    /// seam existed there to stage the close racing in between — so the
+    /// window could only be observed, never pinned. An armed hook runs
+    /// at exactly that point, after the lookup and before any state is
+    /// touched, with the cloned listener. The regression test arms it
+    /// with [`__test_unregister_inet_listener`], which runs the
+    /// listener's last-close teardown (`unregister()`) mid-connect.
+    /// The hook is copied out of the lock before it is called, so it
+    /// never runs while the seam lock is held. The AF_INET6 half is
+    /// identical in shape (same `listening` flag, same enqueue guard).
+    /// (Same one-liner as #1993's `__test_unregister_listener`, kept
+    /// under an inet-specific name so the two parallel lanes do not
+    /// collide; the two can be unified once both have landed.)
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_unregister_inet_listener(listener: &SocketFile) {
+        listener.unregister();
+    }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_arm_inet_connect_pre_enqueue_hook(hook: fn(&SocketFile)) {
+        *INET_CONNECT_PRE_ENQUEUE_HOOK.lock() = Some(hook);
+    }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_disarm_inet_connect_pre_enqueue_hook() {
+        *INET_CONNECT_PRE_ENQUEUE_HOOK.lock() = None;
+    }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_arm_inet6_connect_pre_enqueue_hook(hook: fn(&SocketFile)) {
+        *INET6_CONNECT_PRE_ENQUEUE_HOOK.lock() = Some(hook);
+    }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_disarm_inet6_connect_pre_enqueue_hook() {
+        *INET6_CONNECT_PRE_ENQUEUE_HOOK.lock() = None;
+    }
+
     fn dispatch_unix_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
@@ -9950,6 +10019,19 @@ impl SocketFile {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
                 };
+                // #1995 staging seam (kernel-test only): an armed hook runs
+                // here, after the registry lookup cloned the listener `Arc`
+                // and before the enqueue-time state check — the exact point
+                // where a racing last-close can interleave. The hook is
+                // copied out of the lock before it is called, so it never
+                // runs while the seam lock is held.
+                #[cfg(feature = "kernel-test")]
+                {
+                    let hook = *INET_CONNECT_PRE_ENQUEUE_HOOK.lock();
+                    if let Some(hook) = hook {
+                        hook(&listener);
+                    }
+                }
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
                 let server_end = SocketFile::new(AF_INET, SOCK_STREAM);
@@ -11039,6 +11121,19 @@ impl SocketFile {
                         }
                     }
                 };
+                // #1995 staging seam (kernel-test only): an armed hook runs
+                // here, after the registry lookup cloned the listener `Arc`
+                // and before the enqueue-time state check — the exact point
+                // where a racing last-close can interleave. The hook is
+                // copied out of the lock before it is called, so it never
+                // runs while the seam lock is held.
+                #[cfg(feature = "kernel-test")]
+                {
+                    let hook = *INET6_CONNECT_PRE_ENQUEUE_HOOK.lock();
+                    if let Some(hook) = hook {
+                        hook(&listener);
+                    }
+                }
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
                 let server_end = SocketFile::new(AF_INET6, SOCK_STREAM);
@@ -12498,6 +12593,16 @@ fn unbind_path_key(key: &UnixPathKey) -> bool {
 /// connect path serves them until the NIC TX side wires in.
 static INET_LISTENERS: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::new(None);
 
+/// Test-only staging seam for the #1995 ghost-connect window
+/// (kernel-test builds only; compiled out of production kernels).
+/// Holds the hook
+/// [`SocketFile::__test_arm_inet_connect_pre_enqueue_hook`] installs,
+/// invoked by `dispatch_inet_stream` Connect after the registry
+/// lookup and before the enqueue-time state check.
+#[cfg(feature = "kernel-test")]
+static INET_CONNECT_PRE_ENQUEUE_HOOK: IrqSafeSpinLock<Option<fn(&SocketFile)>> =
+    IrqSafeSpinLock::new(None);
+
 /// One AF_INET stream port reservation (the `inet_bind_bucket` owner list),
 /// held from bind(2) (or listen(2) autobind) until close whether or not the
 /// socket listens, so a second bind of the port is EADDRINUSE as
@@ -12517,6 +12622,19 @@ static INET_TCP_BINDS: IrqSafeSpinLock<Vec<InetTcpBind>> = IrqSafeSpinLock::new(
 /// AF_INET6 listener registry keyed by (ipv6, port). Same loopback-
 /// only constraint as INET_LISTENERS.
 static INET6_LISTENERS: IrqSafeSpinLock<Option<Inet6Map>> = IrqSafeSpinLock::new(None);
+
+/// Test-only staging seam for the #1995 ghost-connect window, AF_INET6
+/// half (kernel-test builds only; compiled out of production kernels).
+/// Holds the hook
+/// [`SocketFile::__test_arm_inet6_connect_pre_enqueue_hook`] installs,
+/// invoked by `dispatch_inet6_stream` Connect after the registry
+/// lookup and before the enqueue-time state check. The Inet6 connect
+/// path shares the Inet shape exactly (same `listening` flag, same
+/// enqueue guard), so it gets the same seam even though the #1995
+/// regression test only stages the AF_INET cases.
+#[cfg(feature = "kernel-test")]
+static INET6_CONNECT_PRE_ENQUEUE_HOOK: IrqSafeSpinLock<Option<fn(&SocketFile)>> =
+    IrqSafeSpinLock::new(None);
 
 /// One AF_INET6 stream port reservation — see `InetTcpBind`.
 struct Inet6TcpBind {

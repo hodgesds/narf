@@ -169,3 +169,152 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_be_txwd_info_eht_fields
 );
+
+fn smoke_rtw89_be_txwd_info_v2_fill() -> TestResult {
+    // All-ones inputs (within each field's width): any shift/mask
+    // error changes a word. Expected words computed from the
+    // Linux txrx.h bit positions, not from the fill under test.
+    let info = TxwdInfoV2 {
+        stbc: true,
+        ldpc: true,
+        dis_data_fb: true,
+        port: 7,
+        tx_cnt_lmt_en: true,
+        tx_cnt_lmt: 0x3F,
+        ampdu_num: 0xFF,
+        a_ctrl_bsr: true,
+        data_retry_lowest_rate: 0xFFF,
+        sn: 0xF,
+        ampdu_density: 7,
+        sec_en: true,
+        sec_cam_idx: 0xFF,
+        report: true,
+        is_bmc: false,
+        nltf_switch: true,
+        nltf: 3,
+        ul_eht_usr_pres: true,
+    };
+    let mut out = [0u8; 32];
+    if fill_txwd_info_v2(&info, &mut out).is_none() {
+        return TestResult::Fail("TXWD_INFO v2 fill rejected valid inputs");
+    }
+    let dw = |o: &[u8], i: usize| u32::from_le_bytes([o[i], o[i + 1], o[i + 2], o[i + 3]]);
+    // info0 = STBC | LDPC | DISDATAFB | PORT(6:4) | TXCNT_LMT_SEL |
+    // TXCNT_LMT(21:16).
+    let want0: u32 = (1 << 12) | (1 << 11) | (1 << 10) | (7 << 4) | (1 << 22) | (0x3F << 16);
+    if dw(&out, 0) != want0 {
+        return TestResult::Fail("TXWD_INFO info0 fields wrong");
+    }
+    // info1 = MAX_AGG_NUM | A_CTRL_BSR | DATA_RTY_LOWEST_RATE |
+    // SW_DEFINE.
+    let want1: u32 = 0xFF | (1 << 14) | (0xFFF << 16) | (0xF << 28);
+    if dw(&out, 4) != want1 {
+        return TestResult::Fail("TXWD_INFO info1 fields wrong");
+    }
+    // info2 = AMPDU_DENSITY | FORCE_KEY_EN | SEC_CAM_IDX | SPE_RPT_V1.
+    let want2: u32 = (7 << 18) | (1 << 8) | 0xFF | (1 << 30);
+    if dw(&out, 8) != want2 {
+        return TestResult::Fail("TXWD_INFO info2 fields wrong");
+    }
+    // info3 zero (no Linux fill site).
+    if dw(&out, 12) != 0 {
+        return TestResult::Fail("TXWD_INFO info3 must stay zero");
+    }
+    // info4 = RTS_EN (unicast) | HW_RTS_EN | EHT NLTF switch + NLTF 3.
+    let want4: u32 = (1 << 27) | (1 << 31) | (1 << 20) | (3 << 21);
+    if dw(&out, 16) != want4 {
+        return TestResult::Fail("TXWD_INFO info4 fields wrong");
+    }
+    // info5/6 zero (no Linux fill site).
+    if dw(&out, 20) != 0 || dw(&out, 24) != 0 {
+        return TestResult::Fail("TXWD_INFO info5/6 must stay zero");
+    }
+    // info7 = UL_EHT_USR_PRES only.
+    if dw(&out, 28) != 1 << 16 {
+        return TestResult::Fail("TXWD_INFO info7 fields wrong");
+    }
+    // Default (unicast, no overrides): only RTS_EN + HW_RTS_EN.
+    let mut out = [0u8; 32];
+    if fill_txwd_info_v2(&TxwdInfoV2::default(), &mut out).is_none() {
+        return TestResult::Fail("TXWD_INFO v2 fill rejected defaults");
+    }
+    if dw(&out, 0) != 0 || dw(&out, 4) != 0 || dw(&out, 8) != 0 || dw(&out, 12) != 0 {
+        return TestResult::Fail("TXWD_INFO default info0..3 must be zero");
+    }
+    if dw(&out, 16) != (1 << 27) | (1 << 31) {
+        return TestResult::Fail("TXWD_INFO default info4 must be RTS_EN|HW_RTS_EN");
+    }
+    if dw(&out, 20) != 0 || dw(&out, 24) != 0 || dw(&out, 28) != 0 {
+        return TestResult::Fail("TXWD_INFO default info5..7 must be zero");
+    }
+    // Broadcast: RTS_EN clears, HW_RTS_EN stays.
+    let info = TxwdInfoV2 {
+        is_bmc: true,
+        ..Default::default()
+    };
+    let mut out = [0u8; 32];
+    if fill_txwd_info_v2(&info, &mut out).is_none() {
+        return TestResult::Fail("TXWD_INFO v2 fill rejected broadcast");
+    }
+    if dw(&out, 16) != 1 << 31 {
+        return TestResult::Fail("TXWD_INFO broadcast info4 must be HW_RTS_EN only");
+    }
+    // Fail-closed: each overflowing field refuses, never truncates.
+    let mut out = [0u8; 32];
+    let bad = TxwdInfoV2 {
+        port: 8,
+        ..Default::default()
+    };
+    if fill_txwd_info_v2(&bad, &mut out).is_some() {
+        return TestResult::Fail("TXWD_INFO must reject port > 7");
+    }
+    let bad = TxwdInfoV2 {
+        tx_cnt_lmt: 0x40,
+        ..Default::default()
+    };
+    if fill_txwd_info_v2(&bad, &mut out).is_some() {
+        return TestResult::Fail("TXWD_INFO must reject tx_cnt_lmt > 63");
+    }
+    let bad = TxwdInfoV2 {
+        data_retry_lowest_rate: 0x1000,
+        ..Default::default()
+    };
+    if fill_txwd_info_v2(&bad, &mut out).is_some() {
+        return TestResult::Fail("TXWD_INFO must reject data_retry_lowest_rate > 4095");
+    }
+    let bad = TxwdInfoV2 {
+        sn: 0x10,
+        ..Default::default()
+    };
+    if fill_txwd_info_v2(&bad, &mut out).is_some() {
+        return TestResult::Fail("TXWD_INFO must reject sn > 15");
+    }
+    let bad = TxwdInfoV2 {
+        ampdu_density: 8,
+        ..Default::default()
+    };
+    if fill_txwd_info_v2(&bad, &mut out).is_some() {
+        return TestResult::Fail("TXWD_INFO must reject ampdu_density > 7");
+    }
+    let bad = TxwdInfoV2 {
+        sec_cam_idx: 0x100,
+        ..Default::default()
+    };
+    if fill_txwd_info_v2(&bad, &mut out).is_some() {
+        return TestResult::Fail("TXWD_INFO must reject sec_cam_idx > 255");
+    }
+    let bad = TxwdInfoV2 {
+        nltf: 4,
+        ..Default::default()
+    };
+    if fill_txwd_info_v2(&bad, &mut out).is_some() {
+        return TestResult::Fail("TXWD_INFO must reject nltf > 3");
+    }
+    // Short buffer refuses.
+    if fill_txwd_info_v2(&TxwdInfoV2::default(), &mut out[..31]).is_some() {
+        return TestResult::Fail("TXWD_INFO must reject a short buffer");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_be_txwd_info_v2_fill);

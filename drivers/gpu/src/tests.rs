@@ -1246,6 +1246,7 @@ fn smoke_amdgpu_hpd_bind_from_inventory() -> TestResult {
         bound_encoder: None,
         device_tag: 0x0002,
         audio_caps: None,
+        preferred_mode: None,
     });
     kms.connectors.push(Connector {
         kind: ConnectorKind::Dp,
@@ -1255,6 +1256,7 @@ fn smoke_amdgpu_hpd_bind_from_inventory() -> TestResult {
         bound_encoder: None,
         device_tag: 0x0001,
         audio_caps: None,
+        preferred_mode: None,
     });
     let mut hpd = crate::amdgpu_hpd::HpdMachine::new();
     let paths = [

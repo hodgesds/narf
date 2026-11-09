@@ -598,6 +598,36 @@ impl CePipe {
             .map(|b| b.paddr() + i as u64 * self.buf_sz as u64)
     }
 
+    /// Fixture-only: descriptor memory of the source ring, while it is
+    /// still owned by this pipe — `init_pipes` hands it to the HAL
+    /// (after that, use `Hal::ring_mem`). A CE/HTC/WMI target fake
+    /// captures this before the bring-up future moves the `Ce`.
+    pub(crate) fn src_ring_mem(&self) -> Option<&DmaMem> {
+        self.src_ring.as_ref().and_then(|r| r.mem.as_ref())
+    }
+
+    /// Fixture-only: descriptor memory of the destination ring (same
+    /// pre-`init_pipes` lifetime as [`Self::src_ring_mem`]).
+    pub(crate) fn dst_ring_mem(&self) -> Option<&DmaMem> {
+        self.dest_ring.as_ref().and_then(|r| r.mem.as_ref())
+    }
+
+    /// Fixture-only: descriptor memory of the destination status ring
+    /// (same pre-`init_pipes` lifetime as [`Self::src_ring_mem`]).
+    pub(crate) fn status_ring_mem(&self) -> Option<&DmaMem> {
+        self.status_ring.as_ref().and_then(|r| r.mem.as_ref())
+    }
+
+    /// Fixture-only: TX bounce buffer (`src nentries * src_sz_max`).
+    pub(crate) fn tx_buf_mem(&self) -> Option<&DmaMem> {
+        self.tx_buf.as_ref()
+    }
+
+    /// Fixture-only: RX buffers (`dest nentries * buf_sz`).
+    pub(crate) fn rx_buf_mem(&self) -> Option<&DmaMem> {
+        self.rx_buf.as_ref()
+    }
+
     pub fn hp_timer(&self) -> HpUpdateTimer {
         self.hp_timer
     }

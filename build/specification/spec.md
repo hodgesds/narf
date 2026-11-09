@@ -22,6 +22,23 @@ and CI compiler-cache integration.
 
 ## 3. Public interface
 
+- `cargo xtask efi-image [--arch=x86_64] [--run | --smoke]` builds a
+  self-contained PE/COFF application embedding the kernel, CPIO initramfs, and
+  command line. Defaults to `boot-init` and `narf.disks=boot-only`; smoke mode
+  adds `boot-smoke` and writes a distinct artifact. `--prebuilt ELF` selects an
+  exact existing kernel without rebuilding it; `--initramfs CPIO` supplies the
+  complete uncompressed `newc` archive; `--cmdline STRING` binds boot policy;
+  `--output EFI` selects the output path. The generated archive includes
+  init/shell/coreutils, selected firmware, and composed modules. A supplied
+  archive cannot be combined with firmware globs or composed modules.
+  Command lines exceeding kernel capacity are rejected. QEMU boots an isolated
+  read-only FAT directory containing only `EFI/BOOT/BOOTX64.EFI`; smoke mode
+  requires the existing clean-exit marker and natural ACPI shutdown. Existing
+  media commands retain their layouts; default native x86 packages use this
+  image. `--root-image RAW` attaches a regular raw file as a modern virtio-blk
+  device with a disposable snapshot, never a host block device.
+  See `docs/NATIVE_UEFI.md`.
+
 - Commands with common kernel build arguments accept
   `--composition FILE`, repeatable `--builtin-crate MANIFEST`, and repeatable
   `--module-crate MANIFEST`. The versioned composition selects Cargo packages
@@ -186,6 +203,10 @@ and CI compiler-cache integration.
   distinct MAC (52:54:00:12:34:56, then counting the last octet upward).
   Kernel-test config:
   `XTASK_QEMU_SECOND_NIC=1 cargo xtask test --arch=x86_64 --subsystem drivers/net/e1000`.
+  CI runs that invocation as the `run_second_nic` shard of the `kernel-test`
+  job (x86_64 only) whenever the e1000 driver, the net hub, or the bus
+  changes, a frame/verification change re-links the test harness, or the
+  run is full.
 - `cargo xtask affected --base REF --head REF --event EVENT` computes CI jobs,
   directly changed packages, reverse-dependent packages, and kernel subsystem
   filters from Cargo metadata and Rust registration tokens. PRs use their head
@@ -323,9 +344,11 @@ and CI compiler-cache integration.
   --secure-boot-cert FILE]` — wrap the canonical architecture-specific kernel
   and bound EFI loader in native distribution packages, install an isolated
   `/EFI/NARF` payload and BLS Type #1 entry through `narf-uefi`, and emit a
-  checksummed release manifest. x86_64 enrolls the exact Limine configuration
-  digest and places the kernel BLAKE2b-512 digest in its boot path; it retains
-  direct legacy-BIOS GRUB boot. aarch64 binds that digest into NARF's loader.
+  checksummed release manifest. Default x86_64 packages use the complete native
+  EFI image, inspect its embedded SHA-256 bundle, and extract that exact kernel
+  for the BIOS copy. Explicit `--limine-efi` packages retain configuration/kernel
+  digest binding. `--cmdline` and `--initramfs` configure new native builds.
+  The ESP needs only the native EFI application; BIOS GRUB remains available. aarch64 binds that digest into NARF's loader.
   Optional signing uses administrator/distribution inputs through `sbsign` and
   verifies the output with `sbverify`; private keys never enter package staging.
   UEFI GRUB chainloads the payload; systemd-boot, rEFInd, and CachyOS Limine
@@ -397,7 +420,7 @@ and CI compiler-cache integration.
 ### x86_64
 - Target: `x86_64-unknown-none`.
 - Linker script places kernel at `-2GiB` (kernel high-half).
-- Bootloader: Limine by default; multiboot2 supported.
+- Bootloader: native EFI for x86 packages; Limine for existing media; Multiboot2 handoff supported.
 
 ### aarch64
 - Kernel target: `aarch64-unknown-none`; EFI loader target:

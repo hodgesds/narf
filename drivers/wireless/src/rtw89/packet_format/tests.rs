@@ -376,3 +376,51 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info
 );
+
+fn smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_refuses_amsdu() -> TestResult {
+    // A shares B's AX v0 TXWD body/info/WP/address-info layout, so the
+    // frozen B references must reproduce byte-identically through
+    // `transmit_a`.
+    for (index, expected) in HEADERS.iter().enumerate() {
+        let bytes = frame(if index < 2 { 100 } else { 2304 }, index & 1 != 0);
+        let result = transmit_a(
+            &bytes,
+            OWN,
+            0,
+            if index == 3 { 511 } else { index as u16 },
+            if index >= 2 {
+                0xf_1234_5000
+            } else {
+                0x1234_5000
+            },
+            index >= 2,
+            0,
+            None,
+        );
+        if result.as_ref().map(|(bytes, _)| bytes.as_slice()) != Ok(expected.as_slice()) {
+            return TestResult::Fail(
+                "A full body/info/WP/address-info differs from the frozen B reference",
+            );
+        }
+    }
+    // A-MSDU QoS (control bit 0x80) has no A program; the 36-bit DMA mask
+    // binds A like B; the AX ring registers are B's.
+    let mut qos = frame(100, false);
+    qos[0] = 0x88;
+    qos[24..26].fill(0);
+    let mut amsdu = qos.clone();
+    amsdu[24] = 0x80;
+    if transmit_a(&amsdu, OWN, 0, 1, 0x1000, false, FIRMWARE_RA, None).is_ok()
+        || transmit_a(&qos, OWN, 0, 1, 0x10_0000_0000, false, FIRMWARE_RA, None).is_ok()
+        || transmit_a(&qos, OWN, 0, 1, DMA_MASK - 3, false, FIRMWARE_RA, None).is_ok()
+        || Queue::Data.regs_for(ChipId::Rtl8852A).desa_l != Queue::Data.regs().desa_l
+        || Queue::Management.regs_for(ChipId::Rtl8852A).desa_l != Queue::Management.regs().desa_l
+    {
+        return TestResult::Fail("A A-MSDU admission, DMA mask or AX ring registers differ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_refuses_amsdu
+);

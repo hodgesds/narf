@@ -1,5 +1,12 @@
 # build/xtask — Build / Run / Test Orchestrator
 
+`cargo xtask efi-image` builds an opt-in, self-contained x86_64 EFI application
+at `target/narf-x86_64.efi`. `--run` boots it through OVMF; `--smoke` builds a
+separate smoke image and requires the kernel's clean shutdown. It needs no
+Limine or ISO/FAT image utilities. See [native EFI](../../docs/NATIVE_UEFI.md)
+for building, configuration, installation, and current limits. Existing
+`image`, `iso-boot`, and package commands retain their previous behavior.
+
 `xtask` is the primary developer entrypoint for NARF. It is a
 workspace-local binary invoked as `cargo xtask <command>`, and it owns
 everything between a source checkout and a kernel running under QEMU or
@@ -132,3 +139,8 @@ are built and exercised. `test` drives the suite registered through
 produce the NRFW blobs the kernel's firmware subsystem consumes.
 
 - Spec: [`build/specification/spec.md`](../specification/spec.md)
+
+The native EFI QEMU launcher accepts `--root-image FILE` with `--run` or
+`--smoke`, attaching a regular raw image through modern virtio-blk and a
+disposable snapshot. Snapshot scratch storage remains under the staging
+folder. See the native EFI guide for serial LUKS policy and fixture tests.

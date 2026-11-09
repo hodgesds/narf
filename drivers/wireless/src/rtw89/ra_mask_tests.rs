@@ -310,7 +310,7 @@ fn smoke_rtw89_ra_mask_build() -> TestResult {
     // | band 1 << 29 (0x20000000) = 0x20003800.
     // w4: mode_eht 34 (0x22) | bw_eht 2 << 8 (0x200)
     // = 0x222; w5 = 0 (no upper mask in Linux).
-    if words[0] != 0x1002_A84
+    if words[0] != 0x0100_2A84
         || words[1] != 0xF0FF_F010
         || words[2] != 0x3F
         || words[3] != 0x2000_3800
@@ -323,7 +323,7 @@ fn smoke_rtw89_ra_mask_build() -> TestResult {
     let Ok(words) = build(&caps, 0x2A, 0, true, true) else {
         return TestResult::Fail("ra mask build upd rejects");
     };
-    if words[0] != (0x1002_A84 | 0xC000_0000) {
+    if words[0] != (0x0100_2A84 | 0xC000_0000) {
         return TestResult::Fail("ra mask build upd bits");
     }
     TestResult::Pass

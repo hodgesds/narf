@@ -7,12 +7,13 @@ use super::efuse_be::BeFactory;
 use super::fw::FwError;
 use super::irq::Line;
 use super::mac::ChipId;
+use super::mac_pre_init_8922a::{Cid, HalChipVer};
 use super::prepared::{self, Files};
 use super::prepared_8922a::*;
 use super::ra_mask::{EhtCaps, StationCaps};
 use super::station_8922a::{Band, Error as StationError, Request};
 use super::tx_8922a::{PrepareArgs, DATA_RING_DEPTH};
-use super::txrx_be::{encode_txwd_be, TxwdBeInfo};
+use super::txrx_be::{encode_txwd_be, fill_txwd_info_v2, TxwdBeInfo, TxwdInfoV2};
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -119,10 +120,11 @@ fn factory() -> BeFactory {
         phycap: [0u8; chip_8922a::PHYCAP_SIZE],
         cv: None,
         thermal_k: None,
+        secure: super::efuse_be::SecureInfo::disabled(),
     }
 }
 
-fn base_req() -> Request {
+fn base_req() -> Request<'static> {
     Request {
         peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB],
         band: Band::Ghz5,
@@ -135,7 +137,7 @@ fn base_req() -> Request {
         station_mode: true,
         eht_support: true,
         punctured: 0,
-        pads: [0; 5],
+        peer_ies: &[],
         has_he: true,
         mgq_rpt_en: false,
         p2p: false,
@@ -372,7 +374,7 @@ fn smoke_rtw89_prepared_8922a_full_sequence() -> TestResult {
         Ok(completed) if completed.is_empty() => {}
         _ => return TestResult::Fail("RP update completed without a report"),
     }
-    let record = (1u32 << 13) | (0u32 << 8) | 0u32;
+    let record = 1u32 << 13;
     match owner.observe_data_report(&record.to_le_bytes()) {
         Ok(Some(completion))
             if completion.status == 1
@@ -602,4 +604,140 @@ fn smoke_rtw89_prepared_8922a_irq_bind_fails_cleanly() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_prepared_8922a_irq_bind_fails_cleanly
+);
+
+fn smoke_rtw89_prepared_8922a_chip_ver() -> TestResult {
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    if owner.chip_ver().is_some() {
+        return TestResult::Fail("chip_ver must be None before the pre-init runs");
+    }
+    owner.record_chip_ver(HalChipVer {
+        cv: 1,
+        cid: Cid::Cid7090,
+        acv: 2,
+        aid: 0x1234,
+    });
+    match owner.chip_ver() {
+        Some(ver)
+            if ver.cv == 1 && ver.cid == Cid::Cid7090 && ver.acv == 2 && ver.aid == 0x1234 => {}
+        _ => return TestResult::Fail("chip_ver record/accessor wrong"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_chip_ver
+);
+
+fn smoke_rtw89_prepared_8922a_prepare_data_with_info() -> TestResult {
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let mut regs = Model::new();
+    if owner
+        .pre_init_dma_before_reset(&mut regs, 256, 256)
+        .is_err()
+    {
+        return TestResult::Fail("pre_init before_reset failed");
+    }
+    let mut regs = Model::new().with32(INIT_CFG1, 0).with_bound_clears();
+    if owner.pre_init_dma_after_reset(&mut regs).is_err() {
+        return TestResult::Fail("pre_init after_reset failed");
+    }
+    let tx_phys: [u64; TXCH_NUM] = core::array::from_fn(|i| 0x1_0000 + (i as u64) * 0x800);
+    let rx_phys: [u64; 2] = [0x2_0000, 0x2_1000];
+    if owner
+        .program_rings(&mut regs, &tx_phys, &rx_phys, 256, 256)
+        .is_err()
+    {
+        return TestResult::Fail("program_rings failed");
+    }
+    if owner.admit_station(&base_req()).is_err() {
+        return TestResult::Fail("admit_station failed");
+    }
+    let mut body = [0u8; 32];
+    if encode_txwd_be(
+        &TxwdBeInfo {
+            channel: 0,
+            qsel: 0,
+            mac_id: 0,
+            pkt_size: 100,
+        },
+        &mut body,
+    )
+    .is_none()
+    {
+        return TestResult::Fail("encode_txwd_be failed");
+    }
+    // One info field set so the block is distinguishable from the
+    // body: STBC + port 3 + ampdu 64.
+    let mut info = [0u8; 32];
+    let info_in = TxwdInfoV2 {
+        stbc: true,
+        port: 3,
+        ampdu_num: 64,
+        ..Default::default()
+    };
+    if fill_txwd_info_v2(&info_in, &mut info).is_none() {
+        return TestResult::Fail("fill_txwd_info_v2 failed");
+    }
+    let mut bd = vec![TxBd::default(); DATA_RING_DEPTH as usize];
+    let prepared = match owner.prepare_data_with_info(
+        PrepareArgs {
+            channel: 0,
+            mac_id: 0,
+            qsel: 0,
+            body: &body,
+            header_dma: 0x20000,
+            frame_dma: 0x10000,
+            frame_len: 100,
+            bd: &mut bd,
+        },
+        &info,
+    ) {
+        Ok(prepared) => prepared,
+        Err(_) => return TestResult::Fail("prepare_data_with_info failed"),
+    };
+    // 32 body + 32 info + 8 WP + 6 addr-info (100-byte frame).
+    if prepared.header.len() != 78 || bd[0].length != 78 {
+        return TestResult::Fail("info header length wrong");
+    }
+    if u32::from_le_bytes(prepared.header[0..4].try_into().unwrap()) & (1 << 22) == 0 {
+        return TestResult::Fail("WDINFO_EN not set with info block");
+    }
+    if prepared.header[32..64] != info {
+        return TestResult::Fail("info block bytes wrong in header");
+    }
+    if u16::from_le_bytes(prepared.header[64..66].try_into().unwrap()) != 0x8000 {
+        return TestResult::Fail("WP seq0 wrong with info block");
+    }
+    // The plain path is unchanged: same body, no info block.
+    let mut bd = vec![TxBd::default(); DATA_RING_DEPTH as usize];
+    let plain = match owner.prepare_data(PrepareArgs {
+        channel: 0,
+        mac_id: 0,
+        qsel: 0,
+        body: &body,
+        header_dma: 0x20000,
+        frame_dma: 0x10000,
+        frame_len: 100,
+        bd: &mut bd,
+    }) {
+        Ok(prepared) => prepared,
+        Err(_) => return TestResult::Fail("prepare_data failed"),
+    };
+    if plain.header.len() != 46
+        || u32::from_le_bytes(plain.header[0..4].try_into().unwrap()) & (1 << 22) != 0
+    {
+        return TestResult::Fail("plain prepare_data must stay 46 bytes with WDINFO_EN clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_prepare_data_with_info
 );

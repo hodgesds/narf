@@ -58,6 +58,10 @@ pub struct ConnectorState {
     pub hdmi_limits: Limits,
     pub color_relight: bool,
     pub vrr: Option<crate::amdgpu_freesync::AmdVsdb>,
+    /// A DP sink's FreeSync range from `dp_sst_caps` (EDID range + the
+    /// DPCD MSA-ignore bit), or None when the sink is not DP FreeSync
+    /// capable. HDMI sinks use `vrr` above instead.
+    pub dp_vrr: Option<crate::amdgpu_freesync::VrrRange>,
 }
 impl ConnectorState {
     /// Whether the single-pipe owner can drive this connector (HDMI, or
@@ -205,6 +209,7 @@ impl Kms {
                     .find(|o| o.port == report.connector && o.edid == edid)
                     .map_or_else(OutputSettings::default, |o| o.shown_output),
                 vrr: None,
+                dp_vrr: None,
                 color_relight: old
                     .iter()
                     .find(|o| o.port == report.connector && o.edid == edid)
@@ -489,6 +494,37 @@ pub fn crtc_display(crtc_id: u32) -> Option<u8> {
     crate::amdgpu_navi48_kms::crtc_display(crtc_id).filter(|&d| usize::from(d) < MAX_CRTCS)
 }
 
+/// Whether a connector's sink is VRR-capable for at least one offered
+/// mode: an HDMI sink through its AMD VSDB range (a FreeSync SPD builds
+/// for the mode), a DP sink through its `dp_sst_caps` range (DRR bounds
+/// build for the mode). Absent sinks and sinks with no usable range are
+/// fixed refresh.
+pub fn vrr_capable(c: &ConnectorState) -> bool {
+    if !c.present {
+        return false;
+    }
+    if c.vrr.is_some_and(|caps| {
+        caps.range().is_some_and(|range| {
+            c.modes.iter().any(|t| {
+                crate::amdgpu_freesync::hdmi_info_packet(
+                    t,
+                    range,
+                    caps.version,
+                    crate::amdgpu_freesync::HdmiState::Disabled,
+                )
+                .is_some()
+            })
+        })
+    }) {
+        return true;
+    }
+    c.dp_vrr.is_some_and(|range| {
+        c.modes
+            .iter()
+            .any(|t| crate::amdgpu_freesync::drr(t, range).is_some())
+    })
+}
+
 /// Publish the connectors and CRTCs on the registered amdgpu card: every
 /// connector may drive every CRTC (one DIG per stream, any pipe), as DC's
 /// `possible_crtcs`.
@@ -537,25 +573,7 @@ pub fn publish() {
             possible_crtcs: (1 << MAX_CRTCS) - 1,
         })
         .collect();
-    let vrr: Vec<bool> = inventory
-        .iter()
-        .map(|c| {
-            c.present
-                && c.vrr.is_some_and(|caps| {
-                    caps.range().is_some_and(|range| {
-                        c.modes.iter().any(|t| {
-                            crate::amdgpu_freesync::hdmi_info_packet(
-                                t,
-                                range,
-                                caps.version,
-                                crate::amdgpu_freesync::HdmiState::Disabled,
-                            )
-                            .is_some()
-                        })
-                    })
-                })
-        })
-        .collect();
+    let vrr: Vec<bool> = inventory.iter().map(vrr_capable).collect();
     with_card(|card| {
         apply_card_vrr(card, &crtcs, &connectors, Some(&vrr));
         for &d in &off {
@@ -608,12 +626,18 @@ fn apply_card_vrr(
     card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
     // Share connector/CRTC bookkeeping, not DCN401's plane capabilities.
-    // This presenter shows one linear 8888 primary per CRTC; overlays and
-    // GFX12 tiling have no implementation here, so the primaries stay the
-    // synthesized ones. Each CRTC has its DRM_PLANE_TYPE_CURSOR plane
-    // (amdgpu_dm_crtc_init), shown on the DCN30 hardware cursor.
-    card.native_planes.retain(|p| p.is_cursor());
-    card.overlay_formats = None;
+    // This presenter shows one linear 8888 primary per CRTC, and the
+    // primaries stay the synthesized ones; GFX12 tiling has no
+    // implementation here. DCN 3.0 publishes two shared overlays, though
+    // (dc caps' max_slave_planes = 2), with the 19-format list and one
+    // cursor plane per CRTC after them. The DRM layer publishes them
+    // (#1950); the display side that programs them is #1951, and
+    // present_planes still refuses overlays until then — this lands with
+    // #1951, never alone.
+    let crtc_ids: alloc::vec::Vec<u32> = card.crtcs.iter().map(|c| c.id).collect();
+    card.native_planes =
+        crate::drm_native_planes::overlay_cursor_planes_for(&card.native_planes, &crtc_ids);
+    card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
     card.gfx12_modifiers = false;
 }
 

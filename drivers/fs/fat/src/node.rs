@@ -610,6 +610,13 @@ impl<B: BlockDevice + 'static> FatNode<B> {
                 if n == lbs as usize {
                     self.volume.write_sector(lba, &zeros).await?;
                 } else {
+                    // Partial edge sector of the zeroed range —
+                    // read-modify-write, serialised by the RMW
+                    // mutex (#1996) like `write`'s partial branch:
+                    // a data write racing this zero-fill on the
+                    // same sector would otherwise clobber the
+                    // zeroed slice (or vice versa).
+                    let _rmw = self.volume.rmw.lock().await;
                     self.volume.read_sector(lba, &mut sector).await?;
                     sector[sector_offset..sector_offset + n].fill(0);
                     self.volume.write_sector(lba, &sector).await?;
@@ -753,6 +760,17 @@ impl<B: BlockDevice + 'static> FatNode<B> {
             Some(loc) => loc,
             None => return Ok(()),
         };
+        // Read-modify-write of the directory-entry sector
+        // (#1996): two metadata syncs for different entries in
+        // one directory sector — or a sync racing a directory
+        // slot write — would otherwise both read the pre-write
+        // sector and the second write-back would clobber the
+        // first's entry. The whole sequence is serialised by the
+        // RMW mutex. The entry location is resolved before the
+        // guard is taken, and the `state` lock below is a
+        // synchronous span released before the write, so nothing
+        // nests under the RMW lock.
+        let _rmw = self.volume.rmw.lock().await;
         let lbs = self.volume.bpb.bytes_per_sec as usize;
         let mut sector = vec![0u8; lbs];
         self.volume.read_sector(lba, &mut sector).await?;
@@ -784,6 +802,13 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         offset: usize,
         entries: &[DirSlotWrite],
     ) -> Result<(), FsError> {
+        // Read-modify-write of directory sectors (#1996): each
+        // sector is read, patched with one or more 32-byte slots,
+        // and written back, so the whole run is serialised by the
+        // RMW mutex — a concurrent slot write or metadata sync on
+        // the same sector would otherwise clobber the slots this
+        // run just patched.
+        let _rmw = self.volume.rmw.lock().await;
         let lbs = self.volume.bpb.bytes_per_sec as usize;
         let mut current_lba = lba;
         let mut current_offset = offset;
@@ -908,6 +933,11 @@ impl<B: BlockDevice + 'static> FatNode<B> {
     /// the SFN need to walk back and tombstone every preceding LFN
     /// slot — this helper handles a single slot.
     async fn tombstone_slot(&self, lba: u64, offset: usize) -> Result<(), FsError> {
+        // Single-byte read-modify-write of a directory sector
+        // (#1996): serialised by the RMW mutex like
+        // `sync_metadata`, so a tombstone racing a metadata sync
+        // or a slot write on the same sector cannot clobber it.
+        let _rmw = self.volume.rmw.lock().await;
         let lbs = self.volume.bpb.bytes_per_sec as usize;
         let mut sector = vec![0u8; lbs];
         self.volume.read_sector(lba, &mut sector).await?;
@@ -1075,14 +1105,28 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
                 while sector_in_cluster < self.volume.bpb.sec_per_clus as u32 && remaining > 0 {
                     let lba = lba_start + sector_in_cluster as u64;
                     let n = core::cmp::min(remaining, lbs_us - sector_offset);
+                    // Partial-sector write — read-modify-write so we
+                    // don't clobber the surrounding bytes. The whole
+                    // sequence is serialised by the per-volume RMW
+                    // mutex (#1996): two concurrent partial writes
+                    // to different offsets of one sector would
+                    // otherwise both read the pre-write sector and
+                    // the second write-back would clobber the
+                    // first's patch. The guard is taken only in
+                    // this branch, never on the whole-sector fast
+                    // path, and is released once the write submits.
+                    let _rmw = if n < lbs_us {
+                        Some(self.volume.rmw.lock().await)
+                    } else {
+                        None
+                    };
                     if n < lbs_us {
-                        // Partial-sector write — read-modify-write
-                        // so we don't clobber the surrounding bytes.
                         self.volume.read_sector(lba, &mut sector).await?;
                     }
                     sector[sector_offset..sector_offset + n]
                         .copy_from_slice(&buf[total_written..total_written + n]);
                     self.volume.write_sector(lba, &sector).await?;
+                    drop(_rmw);
                     total_written += n;
                     remaining -= n;
                     sector_in_cluster += 1;

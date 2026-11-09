@@ -262,7 +262,10 @@ impl<I: Io> Detector<I> {
         }
         Ok(self.connectors.iter().position(|c| c.hpd == Some(instance)))
     }
-    async fn detect_all(&mut self) -> Result<Vec<Report>, Error> {
+    /// Detect every connector in table order. `pub(crate)` so the
+    /// #1786 end-to-end test can drive the detector with a fake
+    /// transport; production callers go through `Display`.
+    pub(crate) async fn detect_all(&mut self) -> Result<Vec<Report>, Error> {
         let mut reports = Vec::new();
         reports
             .try_reserve_exact(self.connectors.len())

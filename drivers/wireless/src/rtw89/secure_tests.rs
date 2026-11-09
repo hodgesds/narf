@@ -1,3 +1,4 @@
+use super::super::efuse_be::{MssDevType, SecureInfo};
 use super::*;
 use alloc::vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -156,6 +157,106 @@ kernel_test_in!(
     smoke_rtw89_signature_rank_dimensions_and_dsp_stride
 );
 
+fn smoke_rtw89_8922a_be_secure_selection_and_blacklist() -> TestResult {
+    // The valid BE efuse vector from the efuse-reader fixtures:
+    // cryp-sel index 0 (magnitude 0x8000100), b1 0x6C / b2 0x03 →
+    // WinlinInbox, customer 25, key 12 (efuse_be.c / efuse.c v1).
+    let info = SecureInfo {
+        secure_boot: true,
+        sb_sel_mgn: Some(0x8000100),
+        mss_dev_type: Some(MssDevType::WinlinInbox),
+        mss_cust_idx: 25,
+        mss_key_num: 12,
+    };
+    let fuses = Fuses::from_be(ChipId::Rtl8922A, info);
+    if !fuses.enabled() || fuses.chip() != ChipId::Rtl8922A {
+        return TestResult::Fail("8922A BE fuses did not decode enabled");
+    }
+    // Formatted pool: 4 devices × 32 customers × 16 keys = 2048-bit
+    // bitmap; (device 0, customer 25, key 12) is bit 412, byte 51.
+    let mut image = vec![0; 288 + 512];
+    image[21] = 4;
+    image[24..26].copy_from_slice(&32u16.to_le_bytes());
+    image[26..28].copy_from_slice(&16u16.to_le_bytes());
+    image[32 + 51] = 0x10;
+    image[288..].fill(0xa7);
+    let pool = SignaturePool {
+        offset: 0,
+        len: image.len(),
+        signatures_offset: 288,
+        signature_len: 512,
+        signature_count: 1,
+        bitmap: true,
+    };
+    // Matching magnitude selects rank 0; zero is the "any suite"
+    // value; the other programmed magnitude ignores the section.
+    let mut content = [0u8; 64];
+    content[58..62].copy_from_slice(&0x8000100u32.to_le_bytes());
+    if fuses.signature(&image, pool, &content) != Ok(Some(288..800)) {
+        return TestResult::Fail("8922A BE magnitude match did not select");
+    }
+    content[58..62].fill(0);
+    if fuses.signature(&image, pool, &content) != Ok(Some(288..800)) {
+        return TestResult::Fail("8922A zero magnitude did not select");
+    }
+    content[58..62].copy_from_slice(&0xC000180u32.to_le_bytes());
+    if fuses.signature(&image, pool, &content) != Ok(None) {
+        return TestResult::Fail("8922A foreign magnitude selected a signature");
+    }
+    // Narrower key dimension must not alias another customer/key.
+    content[58..62].copy_from_slice(&0x8000100u32.to_le_bytes());
+    image[26..28].copy_from_slice(&8u16.to_le_bytes());
+    if fuses.signature(&image, pool, &content) != Ok(None) {
+        return TestResult::Fail("8922A out-of-dimension key aliased another entry");
+    }
+    image[26..28].copy_from_slice(&16u16.to_le_bytes());
+    // 8922A carries Linux's version-0/all-clear default list
+    // (rtw8922a.c:3215), exactly like 8852B/8852C.
+    let policy = match Blacklist::upstream(ChipId::Rtl8922A) {
+        Some(policy) if policy.has_chip_list() => policy,
+        _ => return TestResult::Fail("8922A upstream policy is not the default list"),
+    };
+    let clear = [0u8; 64];
+    if fuses.check_blacklist(Some(policy), &clear).is_err() {
+        return TestResult::Fail("8922A default list rejected clear content");
+    }
+    if fuses.check_blacklist(None, &clear) != Err(Error::UnknownBlacklist) {
+        return TestResult::Fail("8922A enabled fuses accepted a missing policy");
+    }
+    let mut deny = [0u8; 32];
+    deny[0] = 1;
+    let mut listed = [0u8; 40];
+    listed[32] = 0;
+    listed[33] = 0;
+    if fuses.check_blacklist(Some(Blacklist::authenticated(0, deny)), &listed)
+        != Err(Error::Blacklisted)
+    {
+        return TestResult::Fail("8922A authenticated list did not reject bit 0");
+    }
+    // Secure boot off: no selection, no policy needed.
+    let off = Fuses::from_be(ChipId::Rtl8922A, SecureInfo::disabled());
+    if off.enabled()
+        || off.signature(&image, pool, &content) != Ok(None)
+        || off.check_blacklist(None, &clear).is_err()
+    {
+        return TestResult::Fail("8922A disabled BE fuses behaved as enabled");
+    }
+    // Secure-boot-on without an MSS selection is fail-closed, never
+    // silently enabled.
+    let no_mss = SecureInfo {
+        secure_boot: true,
+        ..SecureInfo::disabled()
+    };
+    if Fuses::from_be(ChipId::Rtl8922A, no_mss).enabled() {
+        return TestResult::Fail("8922A secure boot without MSS selection enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_be_secure_selection_and_blacklist
+);
+
 fn smoke_rtw89_8852a_board_blacklist() -> TestResult {
     // Upstream has no 8852A blacklist, and NARF must not fall back to
     // the 8851B signature-only path for A.
@@ -163,7 +264,7 @@ fn smoke_rtw89_8852a_board_blacklist() -> TestResult {
         return TestResult::Fail("8852A must have no upstream blacklist");
     }
     let enabled = Fuses::decode(ChipId::Rtl8852A, 255, 0x7f);
-    if enabled.map(|f| f.enabled()).unwrap_or(false) != true {
+    if !enabled.map(|f| f.enabled()).unwrap_or(false) {
         return TestResult::Fail("8852A legacy fuses must decode enabled");
     }
     let enabled = Fuses::decode(ChipId::Rtl8852A, 255, 0x7f).unwrap();

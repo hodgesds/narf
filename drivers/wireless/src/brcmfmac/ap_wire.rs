@@ -25,6 +25,15 @@ pub(super) const DEAUTH_REASON: u32 = 201;
 
 /// One source for Session transitions and pending Program SET barriers.
 /// The event must already be the actual native firmware event envelope.
+/// `expected` is the (ifidx, bsscfgidx) pair of the vif this session
+/// serves (Linux `fweh.c::brcmf_fweh_event_worker` dispatches each event
+/// by `bsscfgidx` to its owning `ifp` before any handler runs, and the AP
+/// handler `cfg80211.c::brcmf_notify_connect_status_ap` performs no
+/// ifidx/bsscfgidx check of its own). The transport demux already routes
+/// each event to its own vif's session, so the gate admits exactly this
+/// session's pair and rejects another vif's event as malformed — it must
+/// not hard-code (0, 0), which drops every secondary AP / P2P GO
+/// indication (ASSOC_IND 8, REASSOC_IND 10) before the session sees it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Transition {
     Benign,
@@ -36,8 +45,9 @@ pub(crate) enum Transition {
 pub(crate) fn event_transition(
     header: &crate::cyw43439::events::EventHeader,
     own: [u8; 6],
+    expected: (u8, u8),
 ) -> Result<Transition, Error> {
-    if header.if_idx != 0 || header.bsscfg_idx != 0 {
+    if header.if_idx != expected.0 || header.bsscfg_idx != expected.1 {
         return Err(Error::Malformed);
     }
     Ok(match header.event_type {
