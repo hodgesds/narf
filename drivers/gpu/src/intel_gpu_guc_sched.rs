@@ -1284,8 +1284,18 @@ impl<A: BootAllocator> GuCScheduler<A> {
             image.write32(REGS + 5 * 4, 0);
             image.write32(REGS + 9 * 4, ring.ggtt_offset());
             image.write32(REGS + 11 * 4, 0x1001);
-            image.write32(REGS + 0x23 * 4, 0);
-            for slot in (0x25..=0x33).step_by(2) {
+            // Zero the second LRI group's value slots on restore. The
+            // group header moved when #1821 grew the RCS first group: on
+            // non-Gen12 render it sits at dword 0x23, not 0x21, so its
+            // values start at 0x25. Zeroing 0x23 would clobber the header
+            // itself (GuC HW test :1774). Other engines keep the fixed
+            // 0x21 start, so their range is unchanged.
+            let second = if engine == Engine::Rcs0 && !self.platform.is_gen12() {
+                0x23
+            } else {
+                0x21
+            };
+            for slot in ((second + 2)..=(second + 18)).step_by(2) {
                 image.write32(REGS + slot * 4, 0);
             }
         } else if engine != Engine::Rcs0 {
@@ -2307,7 +2317,19 @@ impl<A: BootAllocator> GuCScheduler<A> {
             golden.write32(REGS + 0x13 * 4, 0);
             golden.write32(REGS + 0x15 * 4, 0);
         }
-        for slot in [5, 7, 9, 0x23] {
+        // The 0x3a8 (CTX_TIMESTAMP) value slot moved with the second
+        // group header when #1821 grew the RCS first group: dword 0x25
+        // on non-Gen12 render, 0x23 elsewhere. Zeroing 0x23 would poison
+        // the golden with a zeroed group header (GuC HW test :1774 —
+        // every golden restore copies it, so the submit-time zeroing
+        // fix alone cannot cure it). Slots 5/7/9 are first-group values,
+        // unchanged by the growth.
+        let timestamp = if engine == Engine::Rcs0 && !self.platform.is_gen12() {
+            0x25
+        } else {
+            0x23
+        };
+        for slot in [5, 7, 9, timestamp] {
             golden.write32(REGS + slot * 4, 0);
         }
         r.allocator
