@@ -156,7 +156,7 @@ fn ant_ctrl_apply(
     // `AR_SWITCH_TABLE_COM_AR9462_ALL` 0xffffff for the AR9462/AR9565,
     // `AR_SWITCH_TABLE_COM_ALL` 0xffff for the rest.
     let mask = if matches!(chip, Chip::Ar9462 | Chip::Ar9565) {
-        0xffff_ff
+        0x00ff_ffff
     } else {
         0xffff
     };
