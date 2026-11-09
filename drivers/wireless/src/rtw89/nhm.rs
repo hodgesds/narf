@@ -9,15 +9,18 @@
 //! (`rtw89_ccx_regs_ax`, `phy.c:8954`) supplies the control registers;
 //! the 8852A tables below supply the threshold/report register pairs.
 //!
-//! This module programs nothing on its own: there is no production
-//! caller yet, because the 8852A station owner (admission, DMA
-//! control, firmware/RF/power profile) is still the remainder of the
-//! `rtl8852a` row. Like the negotiated-TTLM engine and the EHT tables,
-//! this is implemented-but-not-advertised: the model is fixture-pinned
-//! now so the future owner wires up verified values. The future owner
-//! gates every entry point on `SUPPORT_NOISE_8852A`, matching Linux's
-//! early returns in `rtw89_phy_nhm_trigger`, `rtw89_phy_nhm_get_result`,
-//! and `rtw89_phy_nhm_setting_init`.
+//! This module programs nothing on its own: the 8852A station owner now
+//! exists (`station_control::Controller` admits RTL8852A, and
+//! `supports_noise()` gates every entry point on `SUPPORT_NOISE_8852A`),
+//! but no production caller triggers a measurement yet — the trigger /
+//! get-result entry points stay fixture-pinned until the radio (BB/RF)
+//! owner wires the measurement into the channel plan. Like the
+//! negotiated-TTLM engine and the EHT tables, this is
+//! implemented-but-not-advertised: the model is fixture-pinned now so the
+//! future owner wires up verified values. The future owner gates every
+//! entry point on `SUPPORT_NOISE_8852A`, matching Linux's early returns
+//! in `rtw89_phy_nhm_trigger`, `rtw89_phy_nhm_get_result`, and
+//! `rtw89_phy_nhm_setting_init`.
 //!
 //! Deliberate narrowings, each a grounded absence, not an oversight:
 //! - The IFS-CLM register writes inside Linux's `rtw89_phy_ccx_trigger`

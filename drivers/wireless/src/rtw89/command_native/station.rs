@@ -524,6 +524,7 @@ impl control::Interface for Access<'_> {
             return Err(power::Error::Terminal);
         }
         match self.native.chip {
+            ChipId::Rtl8852A => self.native.io.a_station_window(indirect)?,
             ChipId::Rtl8852B => self.native.io.b_station_window(indirect)?,
             ChipId::Rtl8852C => self.native.io.c_station_window(indirect)?,
             ChipId::Rtl8851B => self.native.io.n51_station_window(indirect)?,

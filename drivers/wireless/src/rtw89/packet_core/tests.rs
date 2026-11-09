@@ -1248,3 +1248,44 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_packet_rx_width_follows_programmed_channel
 );
+
+fn smoke_rtw8852a_packet_rings_use_ax_desa_and_refuse_unproven_programs() -> TestResult {
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852A;
+    let Ok(mut core) = Core::prepare_with(&mut model, OWN, 0, false, RxPhy::Ht) else {
+        return TestResult::Fail("A ordinary rings refused");
+    };
+    // No A-domain aggregate (Ampdu) program and no A-MSDU path.
+    if core.enable_aggregation().is_ok() || core.enable_amsdu(1).is_ok() {
+        return TestResult::Fail("A A-MPDU admitted or A-MSDU admitted");
+    }
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852A;
+    if Core::prepare_with(&mut model, OWN, 0, true, RxPhy::Legacy).is_err() {
+        return TestResult::Fail("A all-AC QoS rings refused");
+    }
+    let mut model = Model::new();
+    model.chip = ChipId::Rtl8852A;
+    if Core::prepare(&mut model, OWN, 0).is_err()
+        || Core::prepare_ap(&mut model, OWN, false, RxPhy::Legacy).is_ok()
+    {
+        return TestResult::Fail("A station ring preparation or AP refusal");
+    }
+    // rtw89_pci_ch_dma_addr_set: ACH0 0x1110/0x1114, CH8 0x1150/0x1154
+    // with the shared NUM registers; the V1 DESA stays untouched.
+    let half = |model: &mut Model, a: u32| power::Io::read16(model, a).unwrap();
+    if model.word(0x1110) == 0
+        || model.word(0x1150) == 0
+        || half(&mut model, 0x1024) != format::DEPTH
+        || half(&mut model, 0x1034) != format::DEPTH
+        || model.word(0x1230) != 0
+        || model.word(0x1270) != 0
+    {
+        return TestResult::Fail("A ring bases did not follow the AX address set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_packet_rings_use_ax_desa_and_refuse_unproven_programs
+);
