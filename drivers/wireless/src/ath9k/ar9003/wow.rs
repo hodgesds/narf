@@ -722,8 +722,8 @@ fn keep_alive_pattern(io: &mut impl RegisterIo, revision: &Revision, params: &Ke
     } else {
         12
     };
-    for i in 0..KAL_NUM_DATA_WORDS {
-        io.write32(txbuf(base + i), data_word[i]);
+    for (i, word) in data_word.iter().take(KAL_NUM_DATA_WORDS).enumerate() {
+        io.write32(txbuf(base + i), *word);
     }
 }
 
@@ -747,10 +747,10 @@ fn set_powermode_wow_sleep(
         if io.read32(AR_MAC_PCU_GEN_TIMER_TSF_SEL) == 0 {
             rmw(io, AR_DIRECT_CONNECT, AR_DC_TSF2_ENABLE, 0)?;
         }
-    } else if revision.ar9485() {
-        if io.read32(AR_NDP2_TIMER_MODE) & AR_GEN_TIMERS2_MODE_ENABLE_MASK == 0 {
-            rmw(io, AR_DIRECT_CONNECT, AR_DC_TSF2_ENABLE, 0)?;
-        }
+    } else if revision.ar9485()
+        && io.read32(AR_NDP2_TIMER_MODE) & AR_GEN_TIMERS2_MODE_ENABLE_MASK == 0
+    {
+        rmw(io, AR_DIRECT_CONNECT, AR_DC_TSF2_ENABLE, 0)?;
     }
     if mci_enabled {
         io.write32(AR_RTC_KEEP_AWAKE, 0x2);

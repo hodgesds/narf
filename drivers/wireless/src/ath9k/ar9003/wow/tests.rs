@@ -30,7 +30,16 @@ impl RegisterIo for Model {
     }
     fn write32(&mut self, offset: u64, value: u32) {
         self.ops.push(Op::Write(offset, value));
-        self.registers.insert(offset, value);
+        // AR_CR_RXD is a command bit: writing it must not clear the
+        // AR_CR_RXE status bits, which reflect the Rx DMA engine state
+        // and clear only when the engine actually stops (reg.h). The
+        // seeded RXE value is what the wait_us stop decision reads.
+        let stored = if offset == AR_CR {
+            value | (self.registers.get(&offset).copied().unwrap_or(0) & AR_CR_RXE)
+        } else {
+            value
+        };
+        self.registers.insert(offset, stored);
     }
     fn wait_us(
         &mut self,
@@ -224,7 +233,8 @@ fn smoke_ath9k_wow_apply_pattern_programs_slots_and_refuses_overflow() -> TestRe
         return TestResult::Fail("WoW pattern 0 did not set event mask bit 8");
     }
     // Extended slot 8 programs AR_MAC_PCU_WOW4, the second event mask
-    // and LENGTH3 (pattern 8 shift 24).
+    // and LENGTH3 (pattern 8 shift 24). The mask base is
+    // reg_wow.h::AR_WOW_TB_MASK(8) = 0xec00 + (8 << 5) = 0xed00.
     model.ops.clear();
     let pattern = [0xabu8; MAX_PATTERN_SIZE];
     let mask = [0x5au8; MAX_PATTERN_MASK_SIZE];
@@ -236,7 +246,7 @@ fn smoke_ath9k_wow_apply_pattern_programs_slots_and_refuses_overflow() -> TestRe
     }
     if last_write(&model.ops, 0x8370) != Some(0x1)
         || last_write(&model.ops, 0xe900) != Some(0xabab_abab)
-        || last_write(&model.ops, 0xee00) != Some(0x5a5a_5a5a)
+        || last_write(&model.ops, 0xed00) != Some(0x5a5a_5a5a)
         || last_write(&model.ops, 0x8380) != Some(0x1600_0000)
         || wow.event_mask2 != 0x100
     {
