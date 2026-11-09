@@ -661,7 +661,7 @@ pub(crate) fn xcs_image(engine: Engine, image: &impl GpuBacking, platform: GtPla
     // registers, so it fits; Xe2/compute/media images already carry 15
     // and have no room, so they keep the live-only path (their image hook
     // is a follow-up, as is OAC on compute).
-    if engine == Engine::Rcs0 && first.len() + 1 <= 15 {
+    if engine == Engine::Rcs0 && first.len() < 15 {
         first.push(OACTXCONTROL_OFF);
     }
     let second: &[u32] = if xe2 {
@@ -723,8 +723,9 @@ pub(crate) fn oactxcontrol_value_slot<B: GpuBacking>(image: &B, base: u32) -> Op
         }
         if word & 0xFF000000 == MI_LRI_HEADER {
             // The header's low field is (2 * nregs - 1): each register
-            // contributes a register dword and a value dword.
-            let nregs = ((word & 0x3FF) + 1) / 2;
+            // contributes a register dword and a value dword. Dword
+            // indices are u64 throughout (the image cursor is u64).
+            let nregs = (((word & 0x3FF) + 1) / 2) as u64;
             for i in 0..nregs {
                 let reg_dw = dw + 1 + i * 2;
                 let val_dw = reg_dw + 1;
