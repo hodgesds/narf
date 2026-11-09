@@ -868,19 +868,19 @@ fn smoke_aqc113_multi_instance_cookie_dispatch() -> TestResult {
     // each bound to the PCI address it was probed at.
     let mut names: Vec<&str> = Vec::new();
     let mut ctrls: Vec<alloc::sync::Arc<super::AqcNic>> = Vec::new();
-    for i in 0..n {
+    for (i, addr) in aqc_addrs.iter().enumerate().take(n) {
         let ctrl = match super::controller(i) {
             Some(c) => c,
             None => return TestResult::Fail("controller(i) None after probe"),
         };
-        if ctrl.addr != aqc_addrs[i] {
+        if ctrl.addr != *addr {
             return TestResult::Fail("controller(i) bound to the wrong PCI address");
         }
         let name = ctrl.ifname();
         if name.is_empty() {
             return TestResult::Fail("published name empty after probe");
         }
-        if names.iter().any(|m| *m == name) {
+        if names.contains(&name) {
             return TestResult::Fail("two controllers share one published name");
         }
         if narf_net::iface::lookup(name).is_none() {
@@ -895,12 +895,12 @@ fn smoke_aqc113_multi_instance_cookie_dispatch() -> TestResult {
     if super::instance_count() != n {
         return TestResult::Fail("instance_count changed across re-probe");
     }
-    for i in 0..n {
+    for (i, ctrl) in ctrls.iter().enumerate().take(n) {
         let after = match super::controller(i) {
             Some(c) => c,
             None => return TestResult::Fail("controller(i) vanished across re-probe"),
         };
-        if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrls[i]) {
+        if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(ctrl) {
             return TestResult::Fail("re-probe replaced controller(i)");
         }
     }
@@ -932,9 +932,9 @@ fn smoke_aqc113_multi_instance_cookie_dispatch() -> TestResult {
     frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x01]);
     frame[12] = 0xFF;
     frame[13] = 0xFF;
-    for i in 0..n {
+    for (i, name) in names.iter().enumerate().take(n) {
         let heads: Vec<u32> = ctrls.iter().map(|c| *c.tx_head.lock()).collect();
-        let _ = narf_net::iface::send_on(names[i], &frame);
+        let _ = narf_net::iface::send_on(name, &frame);
         for (j, c) in ctrls.iter().enumerate() {
             let slot = (heads[j] as usize) % super::RING_LEN;
             let posted = slot_matches_frame(c, slot, &frame);
@@ -1033,12 +1033,13 @@ kernel_test_in!(
 /// descriptor, so the bytes land exactly on the instance that was
 /// addressed.
 fn slot_matches_frame(ctrl: &super::AqcNic, slot: usize, frame: &[u8]) -> bool {
-    // SAFETY: `slot` is reduced mod `RING_LEN` by the caller, so it
-    // indexes a live TX pool buffer; the reads are volatile, as in
-    // the driver's own receive path.
-    for k in 0..14usize {
+    for (k, expected) in frame[..14].iter().enumerate() {
+        // SAFETY: `slot` is reduced mod `RING_LEN` by the caller, so it
+        // indexes a live TX pool buffer; `k < 14`, so the read stays
+        // within the frame prefix; the reads are volatile, as in the
+        // driver's own receive path.
         let b = unsafe { core::ptr::read_volatile(ctrl.tx_pool[slot].cpu_ptr_at::<u8>(k as u64)) };
-        if b != frame[k] {
+        if b != *expected {
             return false;
         }
     }
