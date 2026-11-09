@@ -214,11 +214,11 @@ fn smoke_ath9k_wow_apply_pattern_programs_slots_and_refuses_overflow() -> TestRe
         0x3322_1100,
         0x0000_5544,
     ];
-    for i in 0..64 {
-        expected.push(Op::Write(
-            0xe100 + i as u64 * 4,
-            if i < 6 { words[i] } else { 0 },
-        ));
+    for (i, word) in words.iter().enumerate() {
+        expected.push(Op::Write(0xe100 + i as u64 * 4, *word));
+    }
+    for i in words.len()..64 {
+        expected.push(Op::Write(0xe100 + i as u64 * 4, 0));
     }
     expected.push(Op::Write(0xec00, 0xffc0_03fe));
     for i in 1..8 {
@@ -311,14 +311,14 @@ fn smoke_ath9k_wow_enable_ar9462_two_ghz() -> TestResult {
         Op::Write(0x8288, 0xfa0),
     ];
     // Keep-alive descriptor words (tx_tries 0, CCK 1M, chainmask 3).
-    let ctl = [0x3f00_1cu32, 0, 0xf0000, 0x1b, 0, 0, 0, 0xc, 0, 0, 0, 0];
+    let ctl = [0x003f_001c_u32, 0, 0xf0000, 0x1b, 0, 0, 0, 0xc, 0, 0, 0, 0];
     for (i, word) in ctl.iter().enumerate() {
         expected.push(Op::Write(0xe000 + i as u64 * 4, *word));
     }
     // AR9462 2.0 extra descriptor word, then the frame at word 13.
     expected.push(Op::Write(0xe030, 0));
     let data = [
-        0x3d01_48u32,
+        0x003d_0148_u32,
         0x3322_1100,
         0x0300_5544,
         0x5634_127f,
@@ -404,7 +404,7 @@ fn smoke_ath9k_wow_enable_ar9485_five_ghz_no_triggers() -> TestResult {
     // 5 GHz OFDM 6M, one chain, frame at word 12 (no extra descriptor).
     if last_write(&model.ops, 0xe00c) != Some(0xb)
         || last_write(&model.ops, 0xe01c) != Some(0x4)
-        || last_write(&model.ops, 0xe030) != Some(0x3d01_48)
+        || last_write(&model.ops, 0xe030) != Some(0x003d_0148)
         || last_write(&model.ops, 0xe044) != Some(0x5544)
     {
         return TestResult::Fail("5 GHz keep-alive frame differs from ar9003_wow.c");
