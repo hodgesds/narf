@@ -2628,6 +2628,10 @@ fn trace_refusal(refusal: crate::amdgpu_navi22_plane::Refusal) {
             crate::amdgpu_navi22_plane::Refusal::Geometry(_) => 1,
             crate::amdgpu_navi22_plane::Refusal::Mode(_) => 2,
             crate::amdgpu_navi22_plane::Refusal::Clock => 3,
+            // Only produced when a slave overlay is live and the
+            // single-plane plan is attempted; the two-plane path
+            // (plan_two) is the one that admits it.
+            crate::amdgpu_navi22_plane::Refusal::Overlay => 5,
             crate::amdgpu_navi22_plane::Refusal::Odm => 4,
         };
     if LOGGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
