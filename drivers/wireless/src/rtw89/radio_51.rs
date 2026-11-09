@@ -165,9 +165,18 @@ pub(super) struct Radio {
     track: Option<Track>,
     /// Retained antenna-diversity runtime for `rfe_type % 3 == 2` boards
     /// (`antdiv_51::AntDiv`); `None` for non-diversity boards and before
-    /// [`Self::prepare_controls`]. The live PHYSTS/periodic hookup is
-    /// still open, so this state is retained but not yet driven.
+    /// [`Self::prepare_controls`]. Driven by [`Self::parse_ppdu`] from
+    /// the PHYSTS path and by [`Self::track`] on the periodic tick.
     antdiv: Option<antdiv_51::AntDiv>,
+    /// An antenna-diversity training run is in progress: `track` /
+    /// `step` run once per tick until a decision step ends it.
+    antdiv_training: bool,
+    /// Requested re-queue period (ms) of the last training step
+    /// (`antdiv_51` `TRAINNING_INTVL_MS` 30 / `DELAY_MS` 110); 0 when
+    /// no training step is pending. NARF has no sub-second
+    /// delayed-work scheduler, so the actual cadence is the 2 s
+    /// track tick; the period is recorded for the caller that does.
+    antdiv_period_ms: u32,
     epoch: u32,
 }
 
@@ -207,6 +216,82 @@ impl Radio {
     }
     pub fn antdiv(&self) -> Option<&antdiv_51::AntDiv> {
         self.antdiv.as_ref()
+    }
+    /// Whether an antenna-diversity training run is in progress.
+    pub fn antdiv_training(&self) -> bool {
+        self.antdiv_training
+    }
+    /// Requested re-queue period (ms) of the last training step; 0 when
+    /// no training step is pending.
+    pub fn antdiv_period_ms(&self) -> u32 {
+        self.antdiv_period_ms
+    }
+
+    /// phy.c `rtw89_phy_antdiv_parse` hookup: feed one MACID-matched,
+    /// to-self PPDU observation into the retained diversity owner.
+    /// core.c `rtw89_core_rx_parse_phy_sts` calls it at the end of the
+    /// IE walk + RPL-to-RSSI conversion, only on a fully-parsed PHYSTS.
+    /// No-op on non-diversity boards and before `prepare_controls`:
+    /// there is no retained owner. The caller classifies the PPDU and
+    /// gates on MACID/to-self before this point.
+    pub fn parse_ppdu(&mut self, observation: super::rx_packet::AntDivObservation) {
+        if let Some(antdiv) = self.antdiv.as_mut() {
+            antdiv.parse(observation.class, observation.rssi, observation.evm);
+        }
+    }
+
+    /// One `rtw89_phy_antdiv_work` step on a copied-out owner: program
+    /// ANTSEL when the step carries one, record the requested re-queue
+    /// period, clear training on a decision.
+    fn antdiv_step(
+        &mut self,
+        io: &mut impl Interface,
+        antdiv: &mut antdiv_51::AntDiv,
+    ) -> Result<(), Error> {
+        match antdiv.step() {
+            antdiv_51::Work::Training { period_ms, set_ant } => {
+                self.antdiv_period_ms = period_ms;
+                if let Some(fields) = set_ant {
+                    for &(address, mask, value) in &fields {
+                        apply(io, address, mask, value)?;
+                    }
+                }
+            }
+            antdiv_51::Work::Decision { set_ant } => {
+                self.antdiv_training = false;
+                self.antdiv_period_ms = 0;
+                for &(address, mask, value) in &set_ant {
+                    apply(io, address, mask, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One antenna-diversity periodic tick (core.c `rtw89_track_work` ->
+    /// phy.c `rtw89_phy_antdiv_track` -> `antdiv_work`): while not
+    /// training, a target-RSSI move of at least `RSSI_DIFF_TH` starts
+    /// training and runs the first step immediately (Linux queues
+    /// `antdiv_work` with period 0); while training, one step per
+    /// tick. `track` is deliberately not re-run mid-training: with no
+    /// traffic the empty target reads RSSI 0, which would restart
+    /// training every tick and it would never complete. A failed
+    /// ANTSEL program leaves the radio non-Ready, as a failed DPK
+    /// step does.
+    fn antdiv_tick(&mut self, io: &mut impl Interface) -> Result<(), Error> {
+        let Some(mut antdiv) = self.antdiv else {
+            return Ok(());
+        };
+        if !self.antdiv_training {
+            if antdiv.track() == antdiv_51::TrackOutcome::StartTraining {
+                self.antdiv_training = true;
+                self.antdiv_step(io, &mut antdiv)?;
+            }
+        } else {
+            self.antdiv_step(io, &mut antdiv)?;
+        }
+        self.antdiv = Some(antdiv);
+        Ok(())
     }
 
     /// `rtw8851b_bb_sethw` (`radio_init::controls_51`), the phy.c DM
@@ -360,9 +445,11 @@ impl Radio {
     }
 
     /// One core.c `rtw89_track_work` RF step (thermal update +
-    /// `rtw8851b_rfk_track`) on a Ready radio. Linux skips the work while
-    /// `rtwdev->scanning`; `scanning` returns `Ok(false)` with no access.
-    /// A failed step leaves the tracker terminal and the radio non-Ready.
+    /// `rtw8851b_rfk_track`, then the antenna-diversity periodic tick
+    /// when a diversity owner is retained) on a Ready radio. Linux
+    /// skips the work while `rtwdev->scanning`; `scanning` returns
+    /// `Ok(false)` with no access. A failed step leaves the tracker
+    /// terminal and the radio non-Ready.
     ///
     /// # Safety
     /// Same retained owner on a Ready radio; no concurrent RFK/PHY/reset/
@@ -382,6 +469,7 @@ impl Radio {
         self.state = State::Preparing;
         // SAFETY: caller contract.
         let ran = unsafe { self.channel.track(io, tracker, false) }.await?;
+        self.antdiv_tick(io)?;
         self.state = State::Ready;
         Ok(ran)
     }

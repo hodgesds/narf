@@ -759,7 +759,15 @@ unsafe impl Io for Startup {
             .submit_packet_rate(bytes, report, rate)
     }
     fn packet_poll(&mut self) -> Result<packet::Step, packet::Error> {
-        self.station_native()?.poll_packets()
+        let step = self.station_native()?.poll_packets()?;
+        // phy.c `rtw89_phy_antdiv_parse` hookup: a MACID-matched,
+        // to-self PPDU observation from this poll feeds the retained
+        // RTL8851B diversity owner. No-op without one (non-diversity
+        // boards and other chips retain no `antdiv_51` owner).
+        if let Some(observation) = step.antdiv {
+            self.radio_51.parse_ppdu(observation);
+        }
+        Ok(step)
     }
     fn irq_start(
         &mut self,

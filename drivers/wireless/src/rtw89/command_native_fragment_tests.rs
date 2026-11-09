@@ -339,3 +339,57 @@ kernel_test_in!(
     "drivers/wireless/rtw89/fragmentation",
     smoke_rtw8852b_fragment_native_final_producer_loss_and_original_current_fences
 );
+fn ppdu_step() -> Result<(), &'static str> {
+    let (mut f, _, _, _) = setup();
+    // MACID-matched PPDU status: RSSI + CFO reach the station tracker
+    // and the classified observation reaches the diversity owner.
+    f.0.native
+        .retain_event(rx_packet::Event::PhyStatus(rx_packet::PhyStatus {
+            mac_id: 0,
+            rssi: 120,
+            cfo: Some(-3),
+            evm: 0x2a,
+            class: rx_packet::PpduClass::Ofdm,
+        }))
+        .map_err(|_| "actual PPDU status retain")?;
+    let step =
+        f.0.native
+            .poll_packets()
+            .map_err(|_| "actual PPDU status poll")?;
+    if step.rssi != Some(120)
+        || step.cfo != Some(-3)
+        || step.antdiv
+            != Some(rx_packet::AntDivObservation {
+                class: rx_packet::PpduClass::Ofdm,
+                rssi: 120,
+                evm: 0x2a,
+            })
+    {
+        return Err("PPDU status did not reach the packet step");
+    }
+    // Another MACID's report is not this owner's observation.
+    f.0.native
+        .retain_event(rx_packet::Event::PhyStatus(rx_packet::PhyStatus {
+            mac_id: 3,
+            rssi: 90,
+            cfo: None,
+            evm: 0,
+            class: rx_packet::PpduClass::Cck,
+        }))
+        .map_err(|_| "actual foreign PPDU status retain")?;
+    let step =
+        f.0.native
+            .poll_packets()
+            .map_err(|_| "actual foreign PPDU poll")?;
+    if step.rssi.is_some() || step.cfo.is_some() || step.antdiv.is_some() {
+        return Err("foreign MACID PPDU status reached this owner's step");
+    }
+    Ok(())
+}
+fn smoke_rtw89_b_packet_ppdu_status_feeds_antdiv_observation() -> TestResult {
+    ppdu_step().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_b_packet_ppdu_status_feeds_antdiv_observation
+);

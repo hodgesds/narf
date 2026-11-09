@@ -182,6 +182,11 @@ pub(super) struct Step {
     pub(super) rssi: Option<u8>,
     /// IE01 CFO for this owner's MACID (`rtw89_phy_cfo_parse`).
     pub(super) cfo: Option<i16>,
+    /// One-path antenna-diversity PPDU observation for this owner's
+    /// MACID (phy.c `rtw89_phy_antdiv_parse`): class, `RSSI_AVG`, IE01
+    /// EVM. Fed to the retained diversity owner by the station's
+    /// `packet_poll`; `None` when no PPDU status arrived on this poll.
+    pub(super) antdiv: Option<rx_packet::AntDivObservation>,
     /// AP role only: the long-RXD `AX_RXD_MAC_ID` of `frame` (zero for a
     /// short RXD), the hardware address-CAM classification of the peer.
     pub(super) rx_mac_id: Option<u8>,
@@ -937,6 +942,11 @@ impl Core {
                 if status.mac_id == self.mac_id {
                     step.rssi = Some(status.rssi);
                     step.cfo = status.cfo;
+                    step.antdiv = Some(rx_packet::AntDivObservation {
+                        class: status.class,
+                        rssi: status.rssi,
+                        evm: status.evm,
+                    });
                 }
             }
             // A PPDU above the signed RX PHY program (HT without `Ht`, HE

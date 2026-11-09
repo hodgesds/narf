@@ -3873,7 +3873,7 @@ recipient path is reached under the signed C HT program (above).
 B bytes are unchanged. Unexecuted case:
 `smoke_rtw8852c_ba_cam_v0_ext_wire_and_dynamic_init_follow_fw_c`.
 
-### RTL8851B retained runtime (partial; composed through the station, antenna diversity open)
+### RTL8851B retained runtime (partial; composed through the station, antenna diversity driven)
 
 Chip row `rtl8851b`. These owners are the chip-specific RTL8851B
 (`10ec:b851`, 1T1R AX, 2.4/5GHz, 20/40/80MHz) pieces under the retained
@@ -4108,7 +4108,10 @@ and `_edcca_regs` match RTL8852B's byte for byte, `cfo_hw_comp` is set on both,
 and core.c `support_cckpd` is true for every RTL8851B cut), then `nctl_51`. An
 antenna-diversity RFE (mac.c `rtw89_mac_setup_phycap`: one path and
 `rfe_type % 3 == 2`, which gates `rtw8851b_rfe_gpio` and `rtw89_phy_antdiv_*`)
-is refused before any write until that owner exists. `prepare` then runs:
+is composed by `prepare_controls` between the DM sub-inits and NCTL, in
+Linux dm_init order: `antdiv_init` (state reset + `reg_init` writes), then
+`rfe_gpio` (BB + MAC halves, `rfe_type <= 50` bound), then the initial
+`set_ant` on RF_A, retained as `Radio.antdiv` (`antdiv_51`). `prepare` then runs:
 `rfk::n51::Init`, `rtw8851b_set_txpwr_ctrl` (`radio_power_c::reference_51`,
 which `visit_51` now shares), `rtw8851b_power_trim` (path A),
 `rtw8851b_bb_cfg_txrx_path` (`ctrl_rx_path(RF_A)` with `set_gain_offset` on the
@@ -4123,13 +4126,26 @@ first channel or a band change `coex_switch_band` + `rtw8851b_tssi_scan`.
 `rfk_channel` is `rtw8851b_rfk_channel`: conn_rfk, RX DCK with the retained
 `is_tssi_mode`, IQK, 30ms, TSSI, 30ms, DPK. `retune` repeats only those two
 steps. `track(scanning)` is one `rtw89_track_work` RF step
-(`n51_dpk::Track::step`). It returns without any access while scanning, as core.c
-skips the work when `rtwdev->scanning` is set. Nothing natively calls this owner
-yet. Unexecuted cases:
+(`n51_dpk::Track::step`, then the antenna-diversity periodic tick when a
+diversity owner is retained: `rtw89_phy_antdiv_track` / `antdiv_work`,
+training then decision, programming ANTSEL through `set_ant`). It returns
+without any access while scanning, as core.c skips the work when
+`rtwdev->scanning` is set. `station_rf_tracking` calls it for RTL8851B
+through `track_radio_51`. The PHYSTS side is driven too: `rx_packet`
+classifies each PPDU (`ppdu_class`: rate mode + the OFDM6 split) and reads
+IE01 `evm_min`, the packet owner carries the classified observation in
+`Step.antdiv` for the owner's MACID, and `packet_poll` feeds it to
+`Radio::parse_ppdu` (`rtw89_phy_antdiv_parse`). The 30/110 ms re-queue
+periods Linux's `antdiv_work` uses are recorded as the requested period
+(`Radio::antdiv_period_ms`); NARF has no sub-second delayed-work
+scheduler, so the actual cadence is the 2 s track tick, and NARF feeds
+antdiv only from to-self + MACID-matched PPDU reports (Linux parses every
+parsed PHYSTS). Unexecuted cases:
 `smoke_rtw89_n51_set_channel_help_follows_rtw8851b`,
 `smoke_rtw89_n51_channel_owner_gates_rfk_and_scan_tracking`,
 `smoke_rtw89_n51_dm_init_txrx_path_and_power_trim_follow_rtw8851b`,
-`smoke_rtw89_n51_radio_owner_starts_new`.
+`smoke_rtw89_n51_radio_owner_starts_new`,
+`smoke_rtw89_n51_antdiv_parse_and_periodic_track_drive_ant_sel`.
 
 **RTL8851B signed records (`calibration_policy::Board::new_51`,
 `radio_policy_51`).** The RTL8851B family mirrors C's with its own magics,
@@ -4141,9 +4157,11 @@ PCI IDs, the logical map, the 128-byte PHY-cap window at 0x580
 (`n51_phycap`), cut/RFE/XTAL and `Assets::bind`; it requires a firmware on a
 known RTL8851B BTC ABI row (`coex_native::Protocol51`: coex.c
 `rtw89_btc_ver_defs` 0.29.29 up to the 0.29.133 v7 row, field-for-field the
-RTL8852B 0.29.29 row; the shipped `rtw8851b_fw-1.bin` is 0.29.41.5) and has
-no identity for an antenna-diversity RFE (`rfe_type % 3 == 2`) until that
-owner exists. Its record is `N51B` v1 (`rtw89/rtw8851b-cal-v1-<mac>.bin`, 96
+RTL8852B 0.29.29 row; the shipped `rtw8851b_fw-1.bin` is 0.29.41.5) and
+admits antenna-diversity RFEs (`rfe_type % 3 == 2`) through the `antdiv_51`
+owner composed by `radio_51::prepare_controls`; `Protocol51::init` encodes
+the diversity layout (dedicated antennas + the `ant_info` DIVERSITY bit,
+fw.h `RTW89_H2C_CXINIT_ANT_INFO_DIVERSITY`). Its record is `N51B` v1 (`rtw89/rtw8851b-cal-v1-<mac>.bin`, 96
 bytes, B's v1 layout) over the cold 2402..2422 span. The firmware PHY-cap
 receipt gains an RTL8851B decode (`firmware_phycap::Receipt::decode_51`:
 mac.c `rtw89_mac_setup_phycap_part0` with `chip->tx_nss`/`rx_nss` 1 and the
@@ -4300,9 +4318,10 @@ case in `smoke_rtw8851b_full_radio_base_record_is_n51b_v2_exact_and_revocable`.
 (`hal->ant_diversity` from `rtw89_mac_setup_phycap` `rfe_type % 3 == 2`:
 phy.c `rtw89_phy_antdiv_init/_reg_init/_parse/_track/_set_ant`, core.c
 `antdiv_work` and per-PPDU parse) and the matching coexistence/antenna
-settings remain, so `calibration_policy::Board::new_51`,
-`radio_51::prepare_controls` and `Protocol51::init` still refuse
-rfe 3n+2 boards; the row is not complete.
+settings are now driven end to end (`rx_packet::ppdu_class` + IE01 EVM,
+`packet_core::Step.antdiv`, `Radio::parse_ppdu` / `track`, and the
+`Protocol51::init` diversity row); the row's remainder is the
+chip-specific firmware/RF/power/station ownership still open above.
 
 ### RTL8852B AP native wiring: AP packet owner, MACID/port TXWD, CH9 HIQ (partial; no interface caller)
 
@@ -4575,6 +4594,6 @@ triage above remains separate from implementation.
 | `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only. The host PS/service-period owner (`ap_ps.rs`) and AP H2C wire (`ap_wire.rs`) exist (§3 "RTL8852B AP groundwork"), and the AP MAC/firmware control owner (`ap_control.rs`: port program, CAM, CMAC/DMAC tables, MACID pause, peer MACIDs, BCN_UPD, start/stop; §3 "RTL8852B AP MAC/firmware control owner") exist, but no native caller, signed AP channel/power admission, multi-peer TXWD/RX MACID path, HIQ/CH9 ring or public AP controls compose them. |
 | `wow` | Source layer only (`wow_wire.rs`, `prepared::load_wow`; section 3 "RTL8852B Wake-on-WLAN source layer"): no native TRX-halt/firmware-swap/security-CAM/system-PM owner exists yet. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
 | `rtl8852a` | Step 1 done: NHM noise monitoring (`nhm.rs`, fixture-tested — 8852A-only threshold/report tables, 11k thresholds with the WA override, weighted-average noise, trigger/set/get-result model, `support_noise` true) and the authenticated board secure-policy load path (`Blacklist::board_8852a`; upstream 8852A policy is NULL but NARF takes no 8851B-style signature-only fallback for A). Still absent: a station owner for A — `station_control::Controller::new` admits B/C/8851B only — plus BB/RF/calibration/power, packet/station composition, RFK tables, and DMA/transport for A, so native A operation cannot be advertised yet. |
-| `rtl8851b` | Source identifies the 1TX/1RX dual-band chip. The exact secure policy is now pinned (Linux NULL `fw_blacklist`: no host chip list, content bounds still enforced, MSS signature still required) and the one-path antenna-diversity owner exists (`antdiv_51`, composed into `radio_51::prepare_controls` with retained state: `rfe_gpio` incl. the `<= 50` GPIO bound, `reg_init`/`set_ant` programs, EWMA stats + training/decision/track state machine). Remaining: hooking the state machine into the PHYSTS path and periodic work, and the remaining chip-specific firmware/RF/power/station ownership. |
+| `rtl8851b` | Source identifies the 1TX/1RX dual-band chip. The exact secure policy is now pinned (Linux NULL `fw_blacklist`: no host chip list, content bounds still enforced, MSS signature still required) and the one-path antenna-diversity owner exists (`antdiv_51`, composed into `radio_51::prepare_controls` with retained state: `rfe_gpio` incl. the `<= 50` GPIO bound, `reg_init`/`set_ant` programs, EWMA stats + training/decision/track state machine) and is driven end to end (`rx_packet::ppdu_class` + IE01 EVM, `packet_core::Step.antdiv`, `Radio::parse_ppdu` / `track`, and the `Protocol51::init` diversity row with the `ant_info` DIVERSITY bit). Remaining: the chip-specific firmware/RF/power/station ownership. |
 | `rtl8852c` | The advertised AX-v1/three-band hardware description is not a native station profile. C needs the exact generation-specific PCI/descriptor transport plus firmware/security, RF/calibration/power and station composition; the current retained Controller/N52B profile is B-only. |
 | `rtl8922a` | BE EFUSE (DDV physical dump, 3-byte-header logical parse, per-block driver, PHY-cap window, secure/ECV/thermal-K readers, BAR MAC), chip container, BE TXD body v2 encode, BE RXD short v2 parse, v2 interrupt mask/enable/disable/recognize, and BE RA H2C v1 builder are implemented (`chip_8922a.rs`, `efuse_be.rs`, `txrx_be.rs`, `irq_be.rs`, `ra_v1.rs`, fixture-tested). Runtime step 1 is also implemented: BE PCI DMA control sequence (`dma_be`: WPDMA/TRXDMA/TXDMA channel + FW channel, index clear, mode-op, BDRAM reset, MIT, post-init tail, DMA-all), BACAM_V1 H2C encoding + slot map with Linux eviction rule (`bacam_v1`), G7 default CMAC table (`cctl_g7`). Steps 2–7 are also implemented, fixture-tested: station owner + admission (`station_8922a.rs`, step 2), TX-power profile + CCTL update builders + RA mask (`txpower_8922a.rs` TSSI/gain-offset parse, `cctl_g7` ampdu/txtime/punctured, `ra_mask`, step 3), BE DMA ring programming + transport (`dma_8922a.rs`, `tx_8922a.rs`, step 4), Prepared wiring + probe admission (`prepared_8922a.rs`, `pci.rs` bring-up, step 5), interrupt config/mask + v2 classification + MSI binding (`irq_be.rs` `IsrsBe::events`, `BindingBe`, step 6), and the C2H completion path (`completion_8922a.rs`: NAPI-order RPQ then RXQ drain, C2H envelope parse + route, H2C-ack surfacing, TX receipts freeing retained DMA buffers, step 7). Still absent: the complete firmware/RF/power/station profile (BB/RF tables — NULL in Linux, loaded from firmware — TX-power program including by-rate tables, thermal/TSSI tracking and regulatory limits, calibration, firmware-security wiring), FWCMD header framing for H2C bodies (so H2C-ack → retained-buffer matching is still open), TXWD_INFO v2 fill, 6GHz admission, MLO multi-link, legacy-mode admission, the full `pwr_on_func` tail / `mac_pre_init` owner, `cid` retention, the MAC/PHY/BTC C2H handlers, BA reorder, A-MSDU deaggregation, RX fragment reassembly, and 8922A admission into `station_control`. The 8922A dispatch gates still rejecting the chip, verified on main: `bdram.rs`, `command_queue.rs`, `download_dma.rs`, `efuse.rs` MAC path, `factory.rs`, `fifo.rs`, `irq.rs` `Mask::config`, `station_control.rs` `Controller::new`. Native EHT/320MHz cannot be enabled by shared IE encoders before that owner exists. |
