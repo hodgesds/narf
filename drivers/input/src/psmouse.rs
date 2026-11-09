@@ -1674,11 +1674,11 @@ pub fn decode_elantech_v1(
     let fingers = if fw_version < 0x020000 {
         // byte 0:  D   U  p1  p2   1  p3   R   L
         // byte 1:  f   0  th  tw  x9  x8  y9  y8
-        (((packet[1] & 0x80) >> 7) + ((packet[1] & 0x30) >> 4))
+        ((packet[1] & 0x80) >> 7) + ((packet[1] & 0x30) >> 4)
     } else {
         // byte 0: n1  n0  p2  p1   1  p3   R   L
         // byte 1:  0   0   0   0  x9  x8  y9  y8
-        ((packet[0] & 0xc0) >> 6)
+        (packet[0] & 0xc0) >> 6
     };
     if jumpy_cursor {
         if fingers != 1 {
