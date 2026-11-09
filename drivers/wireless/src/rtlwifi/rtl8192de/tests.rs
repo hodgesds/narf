@@ -1213,6 +1213,18 @@ struct DeMacModel {
     /// lives at the top of the physical space (`0x3FE`/`0x3FF`).
     efuse: [u8; 1024],
     efuse_addr: u16,
+    delays: u64,
+    delay_us_total: u64,
+    /// 3-wire RF register-file model, armed only by the LC tests (see
+    /// `de_mac_rf_set`): `phy::rf_read`/`rf_write` go through the BB
+    /// HSSI/LSSI registers, so the fake decodes the serial word and
+    /// stages per-offset RF values into the path readback register.
+    /// Unarmed, the flat staged bytes rule exactly as before.
+    rf_model: bool,
+    rf_regs: [[u32; 256]; 2],
+    rf_present: [[bool; 256]; 2],
+    rf_g6_set_after: [u32; 2],
+    rf_g6_reads: [u32; 2],
 }
 
 #[derive(Clone)]
@@ -1285,12 +1297,25 @@ impl Io for DeMacFake {
                 g.regs[r + 3] &= !0xc0;
             }
         }
+        if g.rf_model {
+            match reg {
+                0x840 => rf_record(&mut g, 0, value),
+                0x844 => rf_record(&mut g, 1, value),
+                0x824 => rf_stage(&mut g, 0, value),
+                0x82c => rf_stage(&mut g, 1, value),
+                _ => {}
+            }
+        }
         Ok(())
     }
     fn write_bytes(&self, _reg: u16, _bytes: &[u8]) -> Result<(), FwError> {
         Err(FwError::Access)
     }
-    async fn delay_us(&self, _micros: u64) {}
+    async fn delay_us(&self, micros: u64) {
+        let mut g = self.0.lock();
+        g.delays += 1;
+        g.delay_us_total += micros;
+    }
 }
 
 fn de_mac_fake() -> DeMacFake {
@@ -1306,7 +1331,96 @@ fn de_mac_fake() -> DeMacFake {
         apsd_reads: 0,
         efuse: [0xffu8; 1024],
         efuse_addr: 0,
+        delays: 0,
+        delay_us_total: 0,
+        rf_model: false,
+        rf_regs: [[0; 256]; 2],
+        rf_present: [[false; 256]; 2],
+        rf_g6_set_after: [u32::MAX; 2],
+        rf_g6_reads: [0; 2],
     })))
+}
+
+/// 3-wire serial write word (`phy::rf_write`): `(offset << 20) |
+/// (data & 0xfffff)`. Records the RF register file for the path.
+fn rf_record(g: &mut DeMacModel, path: usize, word: u32) {
+    let offset = ((word >> 20) & 0xff) as usize;
+    g.rf_regs[path][offset] = word & 0x000f_ffff;
+    g.rf_present[path][offset] = true;
+}
+
+/// 3-wire serial read command (`phy::rf_read`): `(offset << 23) |
+/// BLSSIREADEDGE`. Only the command write (edge set, nonzero offset)
+/// stages the modeled value into the path's readback register; the
+/// edge-low / edge-high framing writes carry a zero offset field and
+/// are ignored, so an RF_AC (offset 0) read never clobbers the
+/// readback. The RF_SYN_G6 poll bit sets once `rf_g6_set_after`
+/// stagings have happened (`u32::MAX` = never, the timeout path).
+fn rf_stage(g: &mut DeMacModel, path: usize, value: u32) {
+    const BLSSIREADEDGE: u32 = 0x8000_0000;
+    if value & BLSSIREADEDGE == 0 {
+        return;
+    }
+    let offset = ((value >> 23) & 0x7f) as usize;
+    if offset == 0 || !g.rf_present[path][offset] {
+        return;
+    }
+    let mut staged = g.rf_regs[path][offset];
+    if offset as u32 == lck::RF_SYN_G6 {
+        g.rf_g6_reads[path] += 1;
+        if g.rf_g6_reads[path] >= g.rf_g6_set_after[path] {
+            staged |= 1 << 11;
+        }
+    }
+    // Readback register: 0x8a0/0x8a4, or 0x8b8/0x8bc when the path's
+    // HSSI parameter-1 PI bit (bit 8) is set.
+    let para1 = if path == 0 { 0x820 } else { 0x828 };
+    let pi = u32::from_le_bytes([
+        g.regs[para1],
+        g.regs[para1 + 1],
+        g.regs[para1 + 2],
+        g.regs[para1 + 3],
+    ]) & (1 << 8)
+        != 0;
+    let rb = if path == 0 {
+        if pi {
+            0x8b8
+        } else {
+            0x8a0
+        }
+    } else if pi {
+        0x8bc
+    } else {
+        0x8a4
+    };
+    g.regs[rb..rb + 4].copy_from_slice(&staged.to_le_bytes());
+}
+
+/// Arm the RF model and program one modeled RF register for a path.
+fn de_mac_rf_set(io: &DeMacFake, path: usize, offset: u32, value: u32) {
+    let mut g = io.0.lock();
+    g.rf_model = true;
+    g.rf_regs[path][offset as usize & 0xff] = value;
+    g.rf_present[path][offset as usize & 0xff] = true;
+}
+
+/// Read back a modeled RF register for a path (0 when never written).
+fn de_mac_rf_get(io: &DeMacFake, path: usize, offset: u32) -> u32 {
+    io.0.lock().rf_regs[path][offset as usize & 0xff]
+}
+
+/// Arm the RF model and set after how many RF_SYN_G6 stagings the
+/// BIT(11) poll bit sets for a path (`u32::MAX` = never).
+fn de_mac_rf_set_g6_after(io: &DeMacFake, path: usize, after: u32) {
+    let mut g = io.0.lock();
+    g.rf_model = true;
+    g.rf_g6_set_after[path] = after;
+}
+
+/// (`delay_us` calls, total delayed µs) observed so far.
+fn de_mac_delays(io: &DeMacFake) -> (u64, u64) {
+    let g = io.0.lock();
+    (g.delays, g.delay_us_total)
 }
 
 fn de_mac_read8(io: &DeMacFake, reg: u16) -> u8 {
@@ -3179,6 +3293,7 @@ fn smoke_rtl8192de_configure_end_to_end() -> TestResult {
         &op,
         &mut chnlval,
         &mut iqk,
+        false,
     )) {
         Ok(outcome) => outcome,
         Err(_) => return TestResult::Fail("8192DE configure 2.4G"),
@@ -3219,6 +3334,7 @@ fn smoke_rtl8192de_configure_end_to_end() -> TestResult {
         &op,
         &mut chnlval,
         &mut iqk,
+        false,
     )) {
         Ok(outcome) => outcome,
         Err(_) => return TestResult::Fail("8192DE configure 5G"),
@@ -3260,6 +3376,7 @@ fn smoke_rtl8192de_configure_end_to_end() -> TestResult {
         false,
         &mut chnlval,
         &mut iqk,
+        false,
     )) {
         Ok(outcome) => outcome,
         Err(_) => return TestResult::Fail("8192DE band guard 5G"),
@@ -3284,6 +3401,7 @@ fn smoke_rtl8192de_configure_end_to_end() -> TestResult {
         false,
         &mut chnlval,
         &mut iqk,
+        false,
     )) {
         Ok(outcome) => outcome,
         Err(_) => return TestResult::Fail("8192DE band guard 2.4G"),
@@ -3845,6 +3963,63 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
     }
     TestResult::Pass
 }
+
+/// LC tables + `calc_curvindex`: table lengths and spot values (the
+/// generator/checker pair verifies every entry against Linux v6.1),
+/// the 5 GHz legality list, the nearest-count rule on a synthetic
+/// case (first minimum wins), the skip-keeps-prior-value rule on 5 GHz,
+/// and the reload-path selection.
+fn smoke_rtl8192de_lck_tables() -> TestResult {
+    if lck::TARGETCHNL_5G.len() != 221
+        || lck::TARGETCHNL_2G.len() != 14
+        || lck::CHANNEL_5G.len() != 49
+        || lck::TARGETCHNL_5G[0] != 25141
+        || lck::TARGETCHNL_5G[220] != 25166
+        || lck::TARGETCHNL_2G[0] != 26084
+        || lck::TARGETCHNL_2G[13] != 25328
+        || lck::CHANNEL_5G[0] != 36
+        || lck::CHANNEL_5G[48] != 177
+    {
+        return TestResult::Fail("8192DE LCK tables");
+    }
+    if !lck::is_legal_5g_channel(36)
+        || !lck::is_legal_5g_channel(165)
+        || !lck::is_legal_5g_channel(177)
+        || !lck::is_legal_5g_channel(142)
+        || lck::is_legal_5g_channel(1)
+        || lck::is_legal_5g_channel(14)
+        || lck::is_legal_5g_channel(35)
+    {
+        return TestResult::Fail("8192DE LCK 5G legality");
+    }
+    // Synthetic nearest-count: target 100 is equidistant (10) from
+    // counts 90 (j=0) and 110 (j=1) — first minimum wins; target 200
+    // is equidistant (10) from 190 (j=2) and 210 (j=3) — j=2 wins.
+    let mut counts = [0xffffu32; lck::CV_CURVE_CNT * 2];
+    counts[0] = 90;
+    counts[1] = 110;
+    counts[2] = 190;
+    counts[3] = 210;
+    let mut index = [0u32; 2];
+    lck::calc_curvindex(&[100, 200], &counts, false, &mut index);
+    if index != [0, 2] {
+        return TestResult::Fail("8192DE LCK curveindex nearest");
+    }
+    // 5 GHz skip: channels 1-2 are illegal, so the slots keep their
+    // prior values.
+    let mut index = [99u32; 2];
+    lck::calc_curvindex(&[25141, 25116], &counts, true, &mut index);
+    if index != [99, 99] {
+        return TestResult::Fail("8192DE LCK curveindex 5G skip");
+    }
+    if lck::reload_path(super::Band::On5Ghz, super::RfType::OneT1R) != phy::Path::A
+        || lck::reload_path(super::Band::On2Ghz, super::RfType::TwoT2R) != phy::Path::B
+        || lck::reload_path(super::Band::On2Ghz, super::RfType::OneT1R) != phy::Path::A
+    {
+        return TestResult::Fail("8192DE LCK reload path");
+    }
+    TestResult::Pass
+}
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_rate_mask
@@ -4361,6 +4536,255 @@ fn smoke_rtl8192de_card_disable() -> TestResult {
     }
     TestResult::Pass
 }
+
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_lck_tables
+);
+
+/// LC curve counts for the end-to-end tests. Path A (5 GHz) counts
+/// make the odd slots win: odd value `(0xc0ee0 & 0xfffe0) >> 5` =
+/// 24703, even value 0, so every 5 GHz target (21007-25679) lands on
+/// an odd index (first odd slot, j=1). Path B counts are all zero, so
+/// the even slot j=0 wins everywhere.
+fn lck_curve_counts(io: &DeMacFake) {
+    de_mac_rf_set(io, 0, lck::RF_LCK_CURVE_CNT_LO, 0x000c_0ee0);
+    de_mac_rf_set(io, 0, lck::RF_LCK_CURVE_CNT_HI, 0x0000_0000);
+    de_mac_rf_set(io, 1, lck::RF_LCK_CURVE_CNT_LO, 0x0000_0000);
+    de_mac_rf_set(io, 1, lck::RF_LCK_CURVE_CNT_HI, 0x0000_0000);
+}
+
+/// End-to-end `_rtl92d_phy_lc_calibrate_sw` on the packet-TX case
+/// (`0xd03` clear): 2 paths, the SYN_G6 poll setting on the 3rd
+/// staging (100 ms each), curve-index computation (5 GHz odd slot,
+/// 2.4 GHz even slot), and the full restore (RF modes, `0xd03` /
+/// TXPAUSE, ANALOGPARAMETER4, SYN_G7 BIT(17) set, CHNLBW bit clear,
+/// SYN_G4 reload for channel 36).
+fn smoke_rtl8192de_lc_calibrate_sw() -> TestResult {
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(lck::ROFDM0_XAAGCCORE1)] = 0xa5;
+    io.0.lock().regs[usize::from(lck::ROFDM0_XBAGCCORE1)] = 0x5a;
+    de_mac_rf_set(&io, 0, lck::RF_SYN_G6, 0);
+    de_mac_rf_set(&io, 1, lck::RF_SYN_G6, 0);
+    de_mac_rf_set_g6_after(&io, 0, 3);
+    de_mac_rf_set_g6_after(&io, 1, 3);
+    lck_curve_counts(&io);
+    let mut lck_state = lck::Lck::new();
+    let cfg = lck::LcConfig {
+        rf_type: super::RfType::TwoT2R,
+        mode: super::MacPhyMode::SingleMacSinglePhy,
+        interface_index: 0,
+        current_channel: 36,
+        band: super::Band::On5Ghz,
+        init_ready: true,
+        act_scanning: false,
+    };
+    let outcome = match narf_scheduler::block_on(lck::lc_calibrate_sw(&io, &mut lck_state, &cfg)) {
+        Ok(outcome) => outcome,
+        Err(_) => return TestResult::Fail("8192DE LC calibrate sw"),
+    };
+    if outcome.path_count != 2
+        || outcome.poll_ms != [100, 100]
+        || outcome.poll_timed_out != [false, false]
+        || outcome.scan_wait_us != 0
+        || lck_state.in_progress
+        || lck_state.curveindex_5g[35] != 1
+        || lck_state.curveindex_2g[0] != 0
+    {
+        return TestResult::Fail("8192DE LC calibrate outcome");
+    }
+    if de_mac_read8(&io, lck::REG_TXPAUSE) != 0x00
+        || de_mac_read32(&io, phy::RFPGA0_ANALOGPARAMETER4) & 0x00f0_0000 != 0
+        || de_mac_read8(&io, lck::ROFDM0_XAAGCCORE1) != 0xa5
+        || de_mac_read8(&io, lck::ROFDM0_XBAGCCORE1) != 0x5a
+    {
+        return TestResult::Fail("8192DE LC calibrate restore");
+    }
+    if de_mac_rf_get(&io, 0, lck::RF_SYN_G7) & (1 << 17) == 0
+        || de_mac_rf_get(&io, 1, lck::RF_SYN_G7) & (1 << 17) == 0
+        || de_mac_rf_get(&io, 0, phy::RF_CHNLBW) & lck::CHNLBW_LC_BEGIN != 0
+        || de_mac_rf_get(&io, 1, phy::RF_CHNLBW) & lck::CHNLBW_LC_BEGIN != 0
+        || de_mac_rf_get(&io, 0, lck::RF_LCK_CURVE_SEL) != 63
+        || de_mac_rf_get(&io, 1, lck::RF_LCK_CURVE_SEL) != 63
+        || de_mac_rf_get(&io, 0, lck::RF_SYN_G4) != 0x800
+    {
+        return TestResult::Fail("8192DE LC calibrate RF state");
+    }
+    // Exact delay accounting: per path 200 RF reads (3 delays each)
+    // + 2 poll delays; plus 1 reload RF read. 400 reads x 120 µs +
+    // 4 x 50 ms + 120 µs = 248120 µs over 1207 calls.
+    if de_mac_delays(&io) != (1207, 248_120) {
+        return TestResult::Fail("8192DE LC calibrate delays");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_lc_calibrate_sw
+);
+
+/// End-to-end `rtl92d_phy_lc_calibrate` on the continuous-TX case
+/// (`0xd03` = `0x70`): 1 path, scan wait (2000 µs), the SYN_G6 poll
+/// timing out (850 ms), `init_ready` false skipping the LC-begin RF
+/// writes, and the `0xd03` restore.
+fn smoke_rtl8192de_lc_calibrate() -> TestResult {
+    let io = de_mac_fake();
+    io.0.lock().regs[usize::from(lck::REG_CONT_TX)] = 0x70;
+    io.0.lock().regs[usize::from(lck::ROFDM0_XAAGCCORE1)] = 0x33;
+    de_mac_rf_set(&io, 0, lck::RF_SYN_G6, 0);
+    lck_curve_counts(&io);
+    let mut lck_state = lck::Lck::new();
+    let cfg = lck::LcConfig {
+        rf_type: super::RfType::OneT1R,
+        mode: super::MacPhyMode::SingleMacSinglePhy,
+        interface_index: 1,
+        current_channel: 1,
+        band: super::Band::On2Ghz,
+        init_ready: false,
+        act_scanning: true,
+    };
+    let outcome = match narf_scheduler::block_on(lck::lc_calibrate(&io, &mut lck_state, &cfg)) {
+        Ok(outcome) => outcome,
+        Err(_) => return TestResult::Fail("8192DE LC calibrate"),
+    };
+    if outcome.path_count != 1
+        || outcome.poll_ms != [850, 0]
+        || outcome.poll_timed_out != [true, false]
+        || outcome.scan_wait_us != 2000
+        || lck_state.in_progress
+        || lck_state.curveindex_2g[0] != 1
+    {
+        return TestResult::Fail("8192DE LC calibrate timeout outcome");
+    }
+    if de_mac_read8(&io, lck::REG_CONT_TX) != 0x70
+        || de_mac_read8(&io, lck::REG_TXPAUSE) != 0x00
+        || de_mac_read32(&io, phy::RFPGA0_ANALOGPARAMETER4) & 0x00f0_0000 != 0
+        || de_mac_read8(&io, lck::ROFDM0_XAAGCCORE1) != 0x33
+        || de_mac_rf_get(&io, 0, lck::RF_SYN_G7) != 0x20000
+        || de_mac_rf_get(&io, 0, phy::RF_CHNLBW) != 0
+        || de_mac_rf_get(&io, 0, lck::RF_SYN_G4) != 0x800
+    {
+        return TestResult::Fail("8192DE LC calibrate timeout state");
+    }
+    // 40 scan delays + 213 RF reads (3 delays each) + 17 poll delays
+    // + 1 reload RF read: 699 calls, 877680 µs.
+    if de_mac_delays(&io) != (699, 877_680) {
+        return TestResult::Fail("8192DE LC calibrate timeout delays");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_lc_calibrate
+);
+
+/// `_rtl92d_phy_reload_lck_setting` directly: 5 GHz / 2.4 GHz path
+/// selection, the SYN_G4 merge (`curve << 11`), the dual-dual other-PHY
+/// enable + RF-env save/restore + powerdown, and the bad-channel
+/// refusals.
+fn smoke_rtl8192de_reload_lck_setting() -> TestResult {
+    // 5 GHz channel 36, single mode: path A, curve 42.
+    let io = de_mac_fake();
+    let mut lck_state = lck::Lck::new();
+    lck_state.curveindex_5g[35] = 42;
+    if narf_scheduler::block_on(lck::reload_lck_setting(
+        &io,
+        &lck_state,
+        super::Band::On5Ghz,
+        super::RfType::TwoT2R,
+        super::MacPhyMode::SingleMacSinglePhy,
+        0,
+        36,
+    ))
+    .is_err()
+        || de_mac_rf_get(&io, 0, lck::RF_SYN_G4) != 42 << 11
+        || de_mac_rf_get(&io, 1, lck::RF_SYN_G4) != 0
+    {
+        return TestResult::Fail("8192DE reload LCK 5G");
+    }
+    // 2.4 GHz channel 1, single-PHY (2T2R): path B, curve 7.
+    let io = de_mac_fake();
+    let mut lck_state = lck::Lck::new();
+    lck_state.curveindex_2g[0] = 7;
+    if narf_scheduler::block_on(lck::reload_lck_setting(
+        &io,
+        &lck_state,
+        super::Band::On2Ghz,
+        super::RfType::TwoT2R,
+        super::MacPhyMode::SingleMacSinglePhy,
+        0,
+        1,
+    ))
+    .is_err()
+        || de_mac_rf_get(&io, 1, lck::RF_SYN_G4) != 7 << 11
+        || de_mac_rf_get(&io, 0, lck::RF_SYN_G4) != 0
+    {
+        return TestResult::Fail("8192DE reload LCK 2G single");
+    }
+    // 2.4 GHz channel 1, dual (1T1R): path A, curve 7.
+    let io = de_mac_fake();
+    if narf_scheduler::block_on(lck::reload_lck_setting(
+        &io,
+        &lck_state,
+        super::Band::On2Ghz,
+        super::RfType::OneT1R,
+        super::MacPhyMode::SingleMacSinglePhy,
+        0,
+        1,
+    ))
+    .is_err()
+        || de_mac_rf_get(&io, 0, lck::RF_SYN_G4) != 7 << 11
+    {
+        return TestResult::Fail("8192DE reload LCK 2G dual");
+    }
+    // Dual-dual 5 GHz on MAC1: the other-PHY enable runs (DBI powerdown
+    // lands last, CTRL 0xf840), the RF-env enable sets bits 20+4 of
+    // 0x860, and the SYN_G4 write still lands.
+    let io = de_mac_fake();
+    lck_state.curveindex_5g[35] = 42;
+    if narf_scheduler::block_on(lck::reload_lck_setting(
+        &io,
+        &lck_state,
+        super::Band::On5Ghz,
+        super::RfType::OneT1R,
+        super::MacPhyMode::DualMacDualPhy,
+        1,
+        36,
+    ))
+    .is_err()
+        || de_mac_rf_get(&io, 0, lck::RF_SYN_G4) != 42 << 11
+        || de_mac_read16(&io, phy::REG_DBI_CTRL) != 0xf840
+        || de_mac_read32(&io, 0x860) != 0x0010_0010
+    {
+        return TestResult::Fail("8192DE reload LCK dual-dual");
+    }
+    // Bad channels are refused: 0, and past the band table.
+    let io = de_mac_fake();
+    if narf_scheduler::block_on(lck::reload_lck_setting(
+        &io,
+        &lck_state,
+        super::Band::On2Ghz,
+        super::RfType::TwoT2R,
+        super::MacPhyMode::SingleMacSinglePhy,
+        0,
+        0,
+    ))
+    .is_ok()
+        || narf_scheduler::block_on(lck::reload_lck_setting(
+            &io,
+            &lck_state,
+            super::Band::On2Ghz,
+            super::RfType::TwoT2R,
+            super::MacPhyMode::SingleMacSinglePhy,
+            0,
+            15,
+        ))
+        .is_ok()
+    {
+        return TestResult::Fail("8192DE reload LCK bad channel admitted");
+    }
+    TestResult::Pass
+}
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_card_disable
@@ -4412,6 +4836,39 @@ fn smoke_rtl8192de_version_cut() -> TestResult {
     }
     TestResult::Pass
 }
+
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_reload_lck_setting
+);
+
+/// `wait_dualphy_rf_ready` (hw.c:1002-1024): BIT(11) setting on the
+/// 5th staging returns ready; never setting times out after 10000
+/// polls.
+fn smoke_rtl8192de_wait_dualphy_rf_ready() -> TestResult {
+    let io = de_mac_fake();
+    de_mac_rf_set(&io, 0, lck::RF_SYN_G6, 0);
+    de_mac_rf_set_g6_after(&io, 0, 5);
+    match narf_scheduler::block_on(lck::wait_dualphy_rf_ready(&io)) {
+        Ok(true) => {}
+        _ => return TestResult::Fail("8192DE dual-PHY RF ready"),
+    }
+    // 5 iterations x (1 poll delay + 1 RF read x 3 delays) = 20
+    // calls, 5 x 50 µs + 5 x 120 µs = 850 µs.
+    if de_mac_delays(&io) != (20, 850) {
+        return TestResult::Fail("8192DE dual-PHY RF ready delays");
+    }
+    let io = de_mac_fake();
+    de_mac_rf_set(&io, 0, lck::RF_SYN_G6, 0);
+    match narf_scheduler::block_on(lck::wait_dualphy_rf_ready(&io)) {
+        Ok(false) => {}
+        _ => return TestResult::Fail("8192DE dual-PHY RF timeout"),
+    }
+    if de_mac_delays(&io) != (40_000, 1_700_000) {
+        return TestResult::Fail("8192DE dual-PHY RF timeout delays");
+    }
+    TestResult::Pass
+}
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_version_cut
@@ -4453,7 +4910,72 @@ fn smoke_rtl8192de_hw_init() -> TestResult {
     }
     TestResult::Pass
 }
+
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_wait_dualphy_rf_ready
+);
+
+/// Channel-switch LCK wait: a set `lck_inprogress` snapshot waits the
+/// full 1000 ms bound (20 x 50 ms delays) before the switch still
+/// proceeds; a clear snapshot adds no wait.
+fn smoke_rtl8192de_switch_channel_lck_wait() -> TestResult {
+    let efuse = match txpower::Efuse::from_hwinfo(&level_hwinfo(), false, false) {
+        Ok(efuse) => efuse,
+        Err(_) => return TestResult::Fail("8192DE LCK wait EFUSE decode"),
+    };
+    let pg = zero_pg();
+    let run = |lck: bool| -> Option<(bool, u64, u64)> {
+        let io = de_mac_fake();
+        let mut band = super::Band::On2Ghz;
+        let mut bandset = super::BandSet::OnBoth;
+        let mut chnlval = [0x1234_5600u32; 2];
+        // Fresh matrix per run: `switch_channel` reloads the stored
+        // matrix for the new channel, and the matrix is reset before
+        // any switch (`rtl92de_hw_init`).
+        let mut iqk = calib::IqkMatrix::new();
+        let outcome = narf_scheduler::block_on(channel::switch_channel(
+            &io,
+            &efuse,
+            &pg,
+            super::RfType::TwoT2R,
+            super::MacPhyMode::SingleMacSinglePhy,
+            0,
+            &mut band,
+            &mut bandset,
+            true,
+            6,
+            false,
+            &mut chnlval,
+            &mut iqk,
+            lck,
+        ))
+        .ok()?;
+        let (delays, total) = de_mac_delays(&io);
+        Some((outcome.switched, delays, total))
+    };
+    let (switched_clear, delays_clear, total_clear) = match run(false) {
+        Some(v) => v,
+        None => return TestResult::Fail("8192DE LCK wait clear run"),
+    };
+    let (switched_set, delays_set, total_set) = match run(true) {
+        Some(v) => v,
+        None => return TestResult::Fail("8192DE LCK wait set run"),
+    };
+    if !switched_clear
+        || !switched_set
+        || delays_set - delays_clear != 20
+        || total_set - total_clear != 1_000_000
+    {
+        return TestResult::Fail("8192DE LCK wait bound");
+    }
+    TestResult::Pass
+}
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8192de",
     smoke_rtl8192de_hw_init
+);
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_switch_channel_lck_wait
 );
