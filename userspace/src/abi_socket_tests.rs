@@ -39,6 +39,18 @@ fn open_unix_stream() -> Result<u64, &'static str> {
     }
 }
 
+/// Open an AF_INET SOCK_STREAM socket via the real `socket(2)` handler and
+/// return its fd. Panics-as-Err if the handler reports the -1 sentinel.
+/// Only used by the #1995 `kernel-test` regression cases.
+#[cfg(feature = "kernel-test")]
+fn open_inet_stream() -> Result<u64, &'static str> {
+    let n = Syscall::SocketOpen.raw();
+    match call(n, a2(AF_INET, SOCK_STREAM, 0)) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("socket(AF_INET, SOCK_STREAM) did not return a valid fd"),
+    }
+}
+
 fn open_unix_pair(kind: u64) -> Result<(u64, u64), &'static str> {
     let mut sv = [0u8; 8];
     if call(
@@ -5332,6 +5344,137 @@ fn smoke_abi_inet_dgram_send_wakes_parked_reader() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_inet_dgram_send_wakes_parked_reader
+);
+
+/// Regression for #1995 (inet ghost-connect window, the AF_INET analog of
+/// #1103): `connect()` clones the listener `Arc` from the socket registry,
+/// and if the listener's last fd closed in between, `unregister()` removed
+/// the name but left the state `InetListener` with `listening: true` — so
+/// the in-flight connect enqueued into a dead listener and returned
+/// success, with nobody left to ever accept it.
+///
+/// The interleaving is staged deterministically with the `kernel-test`
+/// seam in `dispatch_inet_stream` Connect: the armed hook runs the
+/// listener's last-close teardown (`unregister()`) after the lookup
+/// cloned the `Arc` and before the enqueue-time state check. Pre-fix
+/// the connect returns success (the test fails); post-fix the state
+/// check refuses it with -ECONNREFUSED. The seam is disarmed on every
+/// path out of the connect call, so a failure here cannot poison later
+/// cases. The tail of the test re-binds the released address/port and
+/// runs a normal connect/accept, proving the fix did not break the
+/// live path.
+///
+/// `listen_ip` is the address the listener binds; the client always
+/// connects to 127.0.0.1, which reaches an INADDR_ANY listener through
+/// the registry's wildcard fallback — so the loopback case exercises
+/// the exact-key lookup and the INADDR_ANY case the fallback lookup.
+#[cfg(feature = "kernel-test")]
+fn inet_ghost_connect_case(listen_ip: [u8; 4], port: u16) -> Result<(), &'static str> {
+    // sockaddr_in: family(u16 LE) + port(u16 BE) + addr(u32 BE) + pad.
+    fn inet_sockaddr(ip: [u8; 4], port: u16) -> ([u8; 16], u64) {
+        let mut buf = [0u8; 16];
+        buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        buf[2..4].copy_from_slice(&port.to_be_bytes());
+        buf[4..8].copy_from_slice(&ip);
+        (buf, 16)
+    }
+    let srv = match open_inet_stream() {
+        Ok(fd) => fd,
+        Err(e) => return Err(e),
+    };
+    let (addr, alen) = inet_sockaddr(listen_ip, port);
+    match call(
+        Syscall::SocketBind.raw(),
+        a2(srv, addr.as_ptr() as u64, alen),
+    ) {
+        Some(0) => {}
+        _ => return Err("server bind failed"),
+    }
+    match call(Syscall::SocketListen.raw(), a1(srv, 16)) {
+        Some(0) => {}
+        _ => return Err("server listen failed"),
+    }
+    let cli = match open_inet_stream() {
+        Ok(fd) => fd,
+        Err(e) => return Err(e),
+    };
+    let (caddr, calen) = inet_sockaddr([127, 0, 0, 1], port);
+    crate::socket::SocketFile::__test_arm_inet_connect_pre_enqueue_hook(
+        crate::socket::SocketFile::__test_unregister_inet_listener,
+    );
+    let r = call(
+        Syscall::SocketConnect.raw(),
+        a2(cli, caddr.as_ptr() as u64, calen),
+    );
+    crate::socket::SocketFile::__test_disarm_inet_connect_pre_enqueue_hook();
+    match r {
+        Some(ECONNREFUSED) => {}
+        _ => {
+            return Err("connect racing the listener's last close succeeded into a dead listener");
+        }
+    }
+    // The address/port was released: a fresh listener can bind it and
+    // serve a normal connect/accept.
+    let srv2 = match open_inet_stream() {
+        Ok(fd) => fd,
+        Err(e) => return Err(e),
+    };
+    let (addr2, alen2) = inet_sockaddr(listen_ip, port);
+    match call(
+        Syscall::SocketBind.raw(),
+        a2(srv2, addr2.as_ptr() as u64, alen2),
+    ) {
+        Some(0) => {}
+        _ => return Err("fresh listener bind failed after the ghost connect"),
+    }
+    match call(Syscall::SocketListen.raw(), a1(srv2, 16)) {
+        Some(0) => {}
+        _ => return Err("fresh listener listen failed after the ghost connect"),
+    }
+    let cli2 = match open_inet_stream() {
+        Ok(fd) => fd,
+        Err(e) => return Err(e),
+    };
+    match call(
+        Syscall::SocketConnect.raw(),
+        a2(cli2, caddr.as_ptr() as u64, calen),
+    ) {
+        Some(0) => {}
+        _ => return Err("normal connect to the fresh listener failed"),
+    }
+    let conn = match call(Syscall::SocketAccept.raw(), a0(srv2)) {
+        Some(fd) if fd >= 0 => fd as u64,
+        _ => return Err("fresh listener accept did not return a connection fd"),
+    };
+    let _ = call(Syscall::Close.raw(), a0(cli));
+    let _ = call(Syscall::Close.raw(), a0(cli2));
+    let _ = call(Syscall::Close.raw(), a0(conn));
+    let _ = call(Syscall::Close.raw(), a0(srv));
+    let _ = call(Syscall::Close.raw(), a0(srv2));
+    Ok(())
+}
+
+/// #1995, loopback listener half: the listener binds 127.0.0.1.
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_socket_inet_connect_racing_listener_close_refused() -> TestResult {
+    with_setup(|| inet_ghost_connect_case([127, 0, 0, 1], 47341))
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_inet_connect_racing_listener_close_refused
+);
+
+/// #1995, INADDR_ANY listener half: the listener binds 0.0.0.0 and the
+/// client still connects to 127.0.0.1, via the wildcard fallback.
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_socket_inet_any_connect_racing_listener_close_refused() -> TestResult {
+    with_setup(|| inet_ghost_connect_case([0, 0, 0, 0], 47342))
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_inet_any_connect_racing_listener_close_refused
 );
 
 /// SCM_RIGHTS: sendmsg an fd over one socketpair half, recvmsg the other
