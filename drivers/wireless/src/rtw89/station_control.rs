@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! RTL8852B one-shot MAC0/PHY0 station controls. No packet/CMAC/DMA activation.
+//! RTL8852A/B one-shot MAC0/PHY0 station controls. No packet/CMAC/DMA activation.
+//!
+//! RTL8852A takes RTL8852B's station codec: `rtw8852a_chip_info` has the
+//! same `h2c_cctl_func_id` (`H2C_FUNC_MAC_CCTLINFO_UD`, 0x2),
+//! `bacam_num` 2 / `bacam_ver` RTW89_BACAM_V0 and `addrcam_ver` 0 as
+//! RTL8852B (Linux `rtw8852a.c:2434..2437,2472` @ 05441d6).
 use super::{
     factory::Factory,
     mac::ChipId,
@@ -187,7 +192,7 @@ pub(super) enum Phase {
     Failed,
 }
 pub(super) struct Controller {
-    /// RTL8852B or RTL8852C: selects the CMAC control-table H2C
+    /// RTL8852A/B or RTL8852C: selects the CMAC control-table H2C
     /// (`h2c_cctl_func_id` `CCTLINFO_UD` / `CCTLINFO_UD_V1`).
     chip: ChipId,
     own: [u8; 6],
@@ -196,7 +201,7 @@ pub(super) struct Controller {
     peer: Option<Peer>,
     admission: Option<Admission>,
     /// Static BA CAM entries (`rtw8852b bacam_num = 2`): owning TID.
-    /// Static BA CAM owners: `bacam_num` 2 on B, 8 on C (only the first
+    /// Static BA CAM owners: `bacam_num` 2 on A/B, 8 on C (only the first
     /// `bacam_num()` slots are used).
     ba_cam: [Option<u8>; 8],
     /// Random scan address currently in the address CAM SMA.
@@ -229,7 +234,12 @@ impl Controller {
         // RTL8851B takes B's station codec: `rtw8851b_chip_info` has the
         // same `h2c_cctl_func_id` (CCTLINFO_UD), `bacam_num` 2 /
         // `bacam_ver` RTW89_BACAM_V0 and `addrcam_ver` 0 as RTL8852B.
-        if !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B) {
+        // RTL8852A takes the same codec on the same fields
+        // (`rtw8852a.c:2434..2437,2472` @ 05441d6).
+        if !matches!(
+            chip,
+            ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+        ) {
             return Err(Error::Unsupported);
         }
         Ok(Self {
@@ -248,6 +258,13 @@ impl Controller {
     pub(super) fn own(&self) -> [u8; 6] {
         self.own
     }
+    /// NHM noise monitoring is supported only on RTL8852A (Linux
+    /// `rtw8852a.c:2419` `chip->support_noise`; `nhm::SUPPORT_NOISE_8852A`).
+    /// This owner is the NHM caller the step-1 model was waiting for:
+    /// entry points stay gated on this, never on the bare chip id.
+    pub(super) fn supports_noise(&self) -> bool {
+        self.chip == ChipId::Rtl8852A && super::nhm::SUPPORT_NOISE_8852A
+    }
     /// fw.c `rtw89_fw_h2c_default_cmac_tbl` (class 5, `h2c_cctl_func_id`).
     fn default_cctl(&self) -> (u8, [u8; 68]) {
         if self.chip == ChipId::Rtl8852C {
@@ -264,7 +281,7 @@ impl Controller {
             (2, codec::fixed_cctl(ghz5))
         }
     }
-    /// `rtw8852b_chip_info.bacam_num` 2 / `rtw8852c_chip_info.bacam_num` 8.
+    /// `rtw8852a/b_chip_info.bacam_num` 2 / `rtw8852c_chip_info.bacam_num` 8.
     fn bacam_num(&self) -> usize {
         if self.chip == ChipId::Rtl8852C {
             8

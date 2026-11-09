@@ -265,3 +265,55 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_rf_native_window_and_current_authority
 );
+
+fn smoke_rtw8852a_rf_native_window_uses_a_rf_bases() -> TestResult {
+    use super::super::{mac::ChipId, power_native::NativeIo};
+    use narf_bus::{BusDeviceCap, MmioRegion};
+    use narf_capabilities::{Cap, Write};
+    let authority = Cap::<BusDeviceCap, Write>::bootstrap();
+    let mut words = vec![0u32; 0x20000 / 4];
+    let mut region = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: words.as_mut_ptr() as u64,
+        len: 0x10000,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    // SAFETY: complete private aligned register RAM; the short advertised BAR
+    // must reject the A RF aperture before touching it.
+    let short = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852A, 0) }.unwrap();
+    if short.a_phy_window() != Err(Error::Access) {
+        return TestResult::Fail("MAC-sized BAR became A RF aperture authority");
+    }
+    // The bound is exact: A's last direct RF dword is 0x1d3fc
+    // (`rf_base_addr` {0xc000, 0xd000} + 0x3fc, plus AX `cr_base` 0x10000),
+    // not B's 0x1f3fc.
+    region.len = 0x1d3fc;
+    let edge = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852A, 0) }.unwrap();
+    if edge.a_phy_window() != Err(Error::Access) {
+        return TestResult::Fail("A PHY window accepted a BAR ending at its last dword");
+    }
+    region.len = 0x1d400;
+    let io = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852A, 0) }.unwrap();
+    if io.a_phy_window() != Ok(()) {
+        return TestResult::Fail("complete current A PHY window rejected");
+    }
+    if io.b_phy_window() != Err(Error::Unsupported) {
+        return TestResult::Fail("A chip took B's RF window");
+    }
+    region.len = 0x20000;
+    let b = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852B, 0) }.unwrap();
+    if b.a_phy_window() != Err(Error::Unsupported) {
+        return TestResult::Fail("B chip took A's RF window");
+    }
+    authority.revoke();
+    if io.a_phy_window() != Err(Error::Access) {
+        return TestResult::Fail("revoked A PHY window accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_rf_native_window_uses_a_rf_bases
+);
