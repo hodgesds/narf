@@ -500,15 +500,24 @@ fn tx_iq_outlier_and_reload() -> Result<(), &'static str> {
     // Outlier detection rewrote both measurements to mag 2 / phs 3
     // (`iqc_coeff` 259); each CORR_COEFF register carries two
     // measurements, even in the `00` field and odd in the `01` field.
+    // The odd write is a read-modify-write (`REG_RMW_FIELD`), so it
+    // carries the even field the first write programmed:
+    // `259 | (259 << 14)`, not `259 << 14` alone.
     if data.num_measures != [2, 2, 2]
         || data.tx_corr_coeff[0] != [259, 259, 259]
         || data.tx_corr_coeff[1] != [259, 259, 259]
         || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259).is_none()
         || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B1, 259).is_none()
         || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B2, 259).is_none()
-        || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259 << 14).is_none()
-        || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B1, 259 << 14).is_none()
-        || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B2, 259 << 14).is_none()
+        || io
+            .wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259 | (259 << 14))
+            .is_none()
+        || io
+            .wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B1, 259 | (259 << 14))
+            .is_none()
+        || io
+            .wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B2, 259 | (259 << 14))
+            .is_none()
         || io.raw(AR_PHY_TX_IQCAL_CONTROL_3) & TX_IQCAL_CONTROL_3_IQCORR_EN == 0
         || io.raw(RX_IQCAL_CORR[0]) & RX_IQCAL_CORR_B0_LOOPBACK_IQCORR_EN == 0
     {
@@ -520,7 +529,9 @@ fn tx_iq_outlier_and_reload() -> Result<(), &'static str> {
     if io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259).is_none()
         || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B1, 259).is_none()
         || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B2, 259).is_none()
-        || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259 << 14).is_none()
+        || io
+            .wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 259 | (259 << 14))
+            .is_none()
         || io.raw(AR_PHY_TX_IQCAL_CONTROL_3) & TX_IQCAL_CONTROL_3_IQCORR_EN == 0
         || io.raw(RX_IQCAL_CORR[0]) & RX_IQCAL_CORR_B0_LOOPBACK_IQCORR_EN == 0
     {
@@ -532,7 +543,7 @@ fn tx_iq_outlier_and_reload() -> Result<(), &'static str> {
     tx_iq_cal_reload(&mut io, &revision, 1, &data).map_err(|_| "9485 reload failed")?;
     if io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0_9485, 259).is_none()
         || io
-            .wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0_9485, 259 << 14)
+            .wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0_9485, 259 | (259 << 14))
             .is_none()
         || io
             .writes
