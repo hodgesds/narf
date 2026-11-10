@@ -20,6 +20,19 @@
 //! moves the tree without advancing the view (a failed commit, the
 //! whole-repack growth path, log replay) leaves it stale and it is reloaded.
 //!
+//! Data extents are carved first-fit from the lowest address. Tree blocks are
+//! carved next-fit: each from the lowest free space at or after the end of
+//! the last one, starting again from the bottom only when nothing above
+//! fits, and across transactions (`BtrfsVolume::node_cursor`). Linux
+//! allocates metadata the same way, from a cluster it works through
+//! (`find_free_extent` with `fs_info->meta_alloc_cluster`). What it buys is
+//! locality in the extent tree: the blocks one commit writes sit side by
+//! side, so their `METADATA_ITEM`s share a leaf, and so do the items of the
+//! blocks the next commit replaces. Filling the lowest holes instead puts
+//! every commit's blocks wherever earlier ones happened to be freed, their
+//! items in as many leaves, each of which the commit must then replace too
+//! — a cost that grows with the tree, not with the transaction.
+//!
 //! Without a free-space tree it falls back to appending strictly **above** the
 //! extent tree's high-water mark (freed space is not reused). Either way, running
 //! out of space surfaces as `NoSpace`, which lets the caller grow the filesystem
@@ -172,11 +185,13 @@ pub(crate) fn subtract_pinned(free: Vec<(u64, u64)>, pinned: &[(u64, u64)]) -> V
 static VIEW_AUDIT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(cfg!(feature = "kernel-test"));
 
-/// Turn the free-space view audit on or off: with it on, every commit
-/// re-reads the free-space tree it just wrote and fails if the in-memory
-/// view it advanced differs. The audit reads the whole tree, so it is for
-/// tests and harnesses (it is on by default in kernel-test builds), never
-/// for a production mount.
+/// Turn the commit audit on or off: with it on, every commit re-reads the
+/// free-space tree it just wrote and fails if the in-memory view it advanced
+/// differs, and sums every block group's `used` and fails if that is not
+/// what moving the superblock's `bytes_used` by its own changes gives (as
+/// commits after a mount's first otherwise do). The audit reads the whole
+/// free-space and block-group trees, so it is for tests and harnesses (it is
+/// on by default in kernel-test builds), never for a production mount.
 pub fn set_view_audit(on: bool) {
     VIEW_AUDIT.store(on, core::sync::atomic::Ordering::Release);
 }
@@ -444,6 +459,10 @@ pub struct Withheld {
     /// Per allocation class (0 metadata / system, 1 data): a request of at
     /// least `.0` bytes fits in no usable range starting below `.1`.
     hints: [(u64, u64); 2],
+    /// End of the last tree block allocated, by this allocator or an earlier
+    /// one of the filesystem: the next is carved at or after it when
+    /// anything there fits.
+    node_cursor: u64,
 }
 
 impl Withheld {
@@ -511,6 +530,16 @@ impl Withheld {
     }
 }
 
+/// Counts the free ranges one allocation examines, for
+/// [`crate::stats::Totals::alloc_ranges_examined`].
+struct Examined(u64);
+
+impl Drop for Examined {
+    fn drop(&mut self) {
+        crate::stats::note_alloc_ranges(self.0);
+    }
+}
+
 /// A single mutation's space allocator: reclaiming from the free-space tree, or
 /// appending past the extent-tree high-water when there is none.
 #[derive(Clone, Debug)]
@@ -555,7 +584,10 @@ impl Allocator {
                 excluded: vol.super_stripe_exclusions(),
             });
         };
-        let mut withheld = Withheld::default();
+        let mut withheld = Withheld {
+            node_cursor: vol.node_cursor(),
+            ..Withheld::default()
+        };
         // Superblock copies under a chunk are never allocatable.
         for (start, len) in vol.super_stripe_exclusions() {
             withheld.exclude(&view, start, len);
@@ -629,9 +661,42 @@ impl Allocator {
                 system,
             } => {
                 let class = usize::from(kind == format::BLOCK_GROUP_DATA);
+                let mut examined = Examined(0);
+                if kind == format::BLOCK_GROUP_METADATA && !*system {
+                    // Next fit: the lowest space at or after the cursor,
+                    // which may lie inside a range that starts below it.
+                    let cursor = withheld.node_cursor;
+                    let first = view
+                        .ranges
+                        .range(..=cursor)
+                        .next_back()
+                        .filter(|&(&rs, &(rl, _))| rs.saturating_add(rl) > cursor)
+                        .map_or(cursor, |(&rs, _)| rs);
+                    for (&rs, &(rl, flags)) in view.ranges.range(first..) {
+                        examined.0 += 1;
+                        if rl < size || flags & kind == 0 || !FreeView::usable(flags, *system) {
+                            continue;
+                        }
+                        for (gs, ge) in withheld.gaps(rs, rs + rl) {
+                            let start = align_up(gs.max(cursor), align);
+                            let Some(end) = start.checked_add(size) else {
+                                continue;
+                            };
+                            if end <= ge {
+                                withheld.add(start, end);
+                                *withheld.bytes.entry(flags).or_insert(0) += size;
+                                withheld.node_cursor = end;
+                                vol.set_node_cursor(end);
+                                return Ok(start);
+                            }
+                        }
+                    }
+                    // Nothing above the cursor: start again from the bottom.
+                }
                 let (hint_size, hint_start) = withheld.hints[class];
                 let from = if size >= hint_size { hint_start } else { 0 };
                 for (&rs, &(rl, flags)) in view.ranges.range(from..) {
+                    examined.0 += 1;
                     if rl < size || flags & kind == 0 || !FreeView::usable(flags, *system) {
                         continue;
                     }
@@ -647,6 +712,10 @@ impl Allocator {
                             // larger request cannot fit there either.
                             if size <= hint_size || from == 0 {
                                 withheld.hints[class] = (size, rs);
+                            }
+                            if kind == format::BLOCK_GROUP_METADATA && !*system {
+                                withheld.node_cursor = end;
+                                vol.set_node_cursor(end);
                             }
                             return Ok(start);
                         }

@@ -248,6 +248,12 @@ impl ChunkMap {
         Ok(e.length - (logical - e.logical_start))
     }
 
+    /// `(start, length)` of the chunk that contains `logical`.
+    pub fn chunk_bounds(&self, logical: u64) -> Result<(u64, u64), FsError> {
+        let e = self.entry(logical)?;
+        Ok((e.logical_start, e.length))
+    }
+
     /// Logical ranges whose physical copies cover a superblock copy
     /// (`physical_supers`, e.g. 64 KiB / 64 MiB / 256 GiB). Linux
     /// `exclude_super_stripes` reverse-maps each superblock offset through

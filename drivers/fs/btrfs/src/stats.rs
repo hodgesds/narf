@@ -70,6 +70,9 @@ pub struct Totals {
     pub device_reads: u64,
     /// Tree nodes written.
     pub written: TreeCounts,
+    /// Free ranges the allocators examined to place data extents and tree
+    /// blocks (first fit walks the free space until something fits).
+    pub alloc_ranges_examined: u64,
     /// Not totals: the metadata blocks the last batch commit allocated for
     /// its own trees (the root tree's re-pack aside), and what its batch had
     /// reserved for them.
@@ -87,6 +90,7 @@ impl Totals {
             read: self.read.since(&earlier.read),
             device_reads: self.device_reads - earlier.device_reads,
             written: self.written.since(&earlier.written),
+            alloc_ranges_examined: self.alloc_ranges_examined - earlier.alloc_ranges_examined,
             last_commit_blocks: self.last_commit_blocks,
             last_commit_reserved: self.last_commit_reserved,
         }
@@ -132,6 +136,7 @@ static TOTAL_ROUNDS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_READ: TreeCounters = TreeCounters::new();
 static TOTAL_DEVICE_READS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_WRITTEN: TreeCounters = TreeCounters::new();
+static TOTAL_ALLOC_RANGES: AtomicU64 = AtomicU64::new(0);
 static LAST_COMMIT_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static LAST_COMMIT_RESERVED: AtomicU64 = AtomicU64::new(0);
 
@@ -143,9 +148,15 @@ pub fn totals() -> Totals {
         read: TOTAL_READ.load(),
         device_reads: TOTAL_DEVICE_READS.load(Relaxed),
         written: TOTAL_WRITTEN.load(),
+        alloc_ranges_examined: TOTAL_ALLOC_RANGES.load(Relaxed),
         last_commit_blocks: LAST_COMMIT_BLOCKS.load(Relaxed),
         last_commit_reserved: LAST_COMMIT_RESERVED.load(Relaxed),
     }
+}
+
+/// Count the free ranges one allocation examined.
+pub(crate) fn note_alloc_ranges(examined: u64) {
+    TOTAL_ALLOC_RANGES.fetch_add(examined, Relaxed);
 }
 
 /// Count one node read from the device (a node-cache miss).

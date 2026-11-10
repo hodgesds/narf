@@ -180,6 +180,35 @@ view and withheld by each allocator, so the pinning rule is unchanged. With
 `verification/btrfs-host`) every commit re-reads the tree and fails on any
 difference from the view.
 
+Data extents are carved first-fit from the lowest address. Tree blocks are
+carved next-fit: each from the lowest free space at or after the end of the
+last one, across transactions, starting again from the bottom only when
+nothing above fits (Linux allocates metadata from a cluster it works through,
+`find_free_extent` with `meta_alloc_cluster`). The blocks one commit writes
+then sit side by side, their `METADATA_ITEM`s share an extent-tree leaf, and
+so do the items of the blocks the next commit replaces; filling the lowest
+holes instead scatters both over as many leaves, each of which the commit has
+to replace as well. The placement is a preference only: every address handed
+out is free space of the right block-group type, as before.
+
+A commit looks up only the block groups it allocates from or frees into, by
+the key the chunk map gives (a block group is its chunk), and fails if the
+tree does not hold exactly that item. The first commit of a mount writes the
+superblock's `bytes_used` as the sum of every block group's `used`; later
+commits move it by the net of the groups they changed (Linux
+`btrfs_update_block_group`), and a failed commit makes the next one sum
+again. With the audit on, every commit sums all block groups and fails if
+moving the value does not give the same.
+So what a small commit reads and writes follows the transaction: the leaves
+of the extent, block-group, csum and free-space trees its records reach, each
+once, and the (small, whole-repacked) root tree — not the number of block
+groups, the size of those trees, or the number of recording passes
+(`smoke_btrfs_commit_cost_tracks_change_not_tree_size`).
+
+Tree blocks nothing references any more — replaced by a commit, or written
+and replaced again inside one batch — are dropped from the node cache, which
+is bounded by emptying it when it fills.
+
 Metadata space is reserved before an operation is accepted, never inside a
 commit (`write/reserve.rs`, Linux `btrfs_start_transaction` /
 `btrfs_block_rsv_add`). An operation is staged only while the free metadata

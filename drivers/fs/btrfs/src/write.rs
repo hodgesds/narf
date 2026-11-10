@@ -2978,6 +2978,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             // an earlier operation of the batch already wrote it, those bytes
             // are unreferenced garbage no committed tree points at.
             self.state.dirty.remove(&addr);
+            self.vol.forget_node(addr);
         }
         Ok(())
     }
@@ -3981,11 +3982,47 @@ async fn total_block_group_used<B: BlockDevice + 'static>(
     Ok(total)
 }
 
-/// The block group `(start, len)` covering `addr`, from a `read_block_groups` list.
-fn bg_of(bgs: &[(u64, u64, Vec<u8>)], addr: u64) -> Option<(u64, u64)> {
-    bgs.iter()
-        .find(|&&(s, l, _)| addr >= s && addr < s + l)
-        .map(|&(s, l, _)| (s, l))
+/// The block groups a commit reaches, fetched as it reaches them: a commit
+/// touches a handful of the hundreds an installed root has, and reading them
+/// all cost every commit a walk of the whole block-group tree.
+struct TouchedGroups {
+    /// The tree holding the `BLOCK_GROUP_ITEM`s.
+    tree: u64,
+    /// `start -> (length, committed item body)`.
+    groups: BTreeMap<u64, (u64, Vec<u8>)>,
+}
+
+impl TouchedGroups {
+    /// The already fetched group `(start, len)` covering `addr`.
+    fn cached(&self, addr: u64) -> Option<(u64, u64)> {
+        let (&start, &(len, _)) = self.groups.range(..=addr).next_back()?;
+        (addr - start < len).then_some((start, len))
+    }
+
+    /// The group `(start, len)` covering `addr`. A block group is its chunk
+    /// (Linux `read_one_block_group` checks each against the other, as
+    /// `block_group::validate_block_groups` does at mount), so the chunk map
+    /// gives the item's key; a tree that does not hold exactly that item
+    /// fails the commit.
+    async fn of<B: BlockDevice + 'static>(
+        &mut self,
+        vol: &BtrfsVolume<B>,
+        addr: u64,
+    ) -> Result<(u64, u64), FsError> {
+        if let Some(group) = self.cached(addr) {
+            return Ok(group);
+        }
+        let (start, len) = vol
+            .logical_chunk_bounds(addr)
+            .map_err(|_| FsError::InvalidData)?;
+        let key = BtrfsKey::new(start, format::BLOCK_GROUP_ITEM_KEY, len);
+        let body = btree::find_item(vol, self.tree, &key)
+            .await?
+            .filter(|body| body.len() >= block_group::BLOCK_GROUP_ITEM_SIZE)
+            .ok_or(FsError::InvalidData)?;
+        self.groups.insert(start, (len, body));
+        Ok((start, len))
+    }
 }
 
 /// Route `BLOCK_GROUP_ITEM` edits to the tree that holds block groups:
@@ -5532,8 +5569,10 @@ fn commit_txn<'a, B: BlockDevice + 'static>(
         if let Err(error) = &result {
             use core::fmt::Write as _;
             // Whatever the failed commit left behind, the next allocator
-            // starts from the free-space tree on disk, not from memory.
+            // starts from the free-space tree on disk, not from memory, and
+            // the next commit sums the block groups again.
             vol.set_free_view(None);
+            vol.set_bytes_used_summed(false);
             vol.commit_stats()
                 .pending_reservation
                 .store(0, core::sync::atomic::Ordering::Relaxed);
@@ -5628,16 +5667,21 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     }
 
     // Block groups: from the extent tree, or from the block-group tree
-    // (objectid 11) on a `BLOCK_GROUP_TREE` filesystem. Path COW touches only
-    // the leaves the edits reach in either.
+    // (objectid 11) on a `BLOCK_GROUP_TREE` filesystem. Only the groups the
+    // transaction allocates from or frees into are looked up, and path COW
+    // touches only the leaves holding their items.
     let bg_home = block_group::bg_home(vol, root_tree).await?;
-    let mut bgs = block_group::read_block_groups(vol, bg_home.scan_root(old_ext)).await?;
+    let mut groups = TouchedGroups {
+        tree: bg_home.scan_root(old_ext),
+        groups: BTreeMap::new(),
+    };
     if let Some(chunk) = &txn.chunk_alloc {
         // The new group is empty: one free extent spanning it, in extent
-        // form, added to the free-space tree with each round's edits
+        // form, added to the free-space tree with each pass's edits
         // (`FstEdit::add_block_group`).
-        bgs.push((chunk.logical, chunk.length, chunk.bg_item.clone()));
-        bgs.sort_by_key(|&(start, _, _)| start);
+        groups
+            .groups
+            .insert(chunk.logical, (chunk.length, chunk.bg_item.clone()));
         if old_fst.is_none() {
             return Err(FsError::NoSpace);
         }
@@ -5967,7 +6011,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
                 if in_new_group(start) {
                     continue;
                 }
-                let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
+                let group = groups.of(vol, start).await?;
                 fst_window.prepare(vol, fst_root, group, start, len).await?;
             }
             let mut edit = fst_window.edit(ss);
@@ -5979,7 +6023,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
                 .map(|&a| (a, nodesize))
                 .chain(txn.new_data.iter().map(|d| (d.id.bytenr, d.id.len)));
             for (start, len) in used {
-                let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
+                let group = groups.of(vol, start).await?;
                 edit.mark_used(group, start, len)?;
             }
             let freed = want_freed
@@ -5987,7 +6031,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
                 .map(|&a| (a, nodesize))
                 .chain(data_changes.released.iter().copied());
             for (start, len) in freed {
-                let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
+                let group = groups.of(vol, start).await?;
                 edit.mark_free(group, start, len)?;
             }
             let fst_edits = fst_window.take_edits(edit.into_items());
@@ -5999,51 +6043,38 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         // pass.
         commit_phase(4);
         let mut ext_edits: Vec<Edit> = Vec::new();
-        let mut bg_dirty: BTreeSet<u64> = BTreeSet::new();
-        let mut account = |start: u64, delta: i64| -> Result<(), FsError> {
-            let (group, _) = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
-            let net = bg_net.entry(group).or_insert(0);
-            *net = net.checked_add(delta).ok_or(FsError::InvalidData)?;
-            bg_dirty.insert(group);
-            Ok(())
-        };
+        // Changes of `used`, by address.
+        let mut deltas: Vec<(u64, i64)> = Vec::new();
         let node = i64::try_from(nodesize).map_err(|_| FsError::InvalidData)?;
         for &(addr, owner, level) in &add_new {
             let key = BtrfsKey::new(addr, format::METADATA_ITEM_KEY, u64::from(level));
             extent_key_absent(vol, old_ext, &key).await?;
             ext_edits.push(Edit::Upsert(key, ext_item_meta(gen, owner)));
-            account(addr, node)?;
+            deltas.push((addr, node));
         }
-        for &(addr, level) in &drop_new {
+        for &(addr, level) in drop_new.iter().chain(&add_freed) {
             ext_edits.push(Edit::Delete(BtrfsKey::new(
                 addr,
                 format::METADATA_ITEM_KEY,
                 u64::from(level),
             )));
-            account(addr, -node)?;
+            deltas.push((addr, -node));
         }
-        for &(addr, level) in &add_freed {
-            ext_edits.push(Edit::Delete(BtrfsKey::new(
-                addr,
-                format::METADATA_ITEM_KEY,
-                u64::from(level),
-            )));
-            account(addr, -node)?;
-        }
+        let mut bg_dirty: BTreeSet<u64> = BTreeSet::new();
         if first {
             ext_edits.extend(meta_changes.edits.iter().cloned());
             ext_edits.extend(data_changes.edits.iter().cloned());
             for &(bytenr, len) in &data_changes.allocated {
-                account(
+                deltas.push((
                     bytenr,
                     i64::try_from(len).map_err(|_| FsError::InvalidData)?,
-                )?;
+                ));
             }
             for &(bytenr, len) in &data_changes.released {
-                account(
+                deltas.push((
                     bytenr,
                     -i64::try_from(len).map_err(|_| FsError::InvalidData)?,
-                )?;
+                ));
             }
             if let Some(chunk) = &txn.chunk_alloc {
                 // The new group's item goes in whether or not anything was
@@ -6051,18 +6082,25 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
                 bg_dirty.insert(chunk.logical);
             }
         }
-        for (start, len, body) in bgs.iter().filter(|(start, _, _)| bg_dirty.contains(start)) {
-            let net = bg_net.get(start).copied().unwrap_or(0);
+        for (addr, delta) in deltas {
+            let (group, _) = groups.of(vol, addr).await?;
+            let net = bg_net.entry(group).or_insert(0);
+            *net = net.checked_add(delta).ok_or(FsError::InvalidData)?;
+            bg_dirty.insert(group);
+        }
+        for start in bg_dirty {
+            let (len, body) = groups.groups.get(&start).ok_or(FsError::InvalidData)?;
+            let net = bg_net.get(&start).copied().unwrap_or(0);
             let used = i64::try_from(le64(body, 0)?)
                 .ok()
                 .and_then(|used| used.checked_add(net))
                 .and_then(|used| u64::try_from(used).ok())
-                .filter(|&used| used <= *len)
+                .filter(|used| used <= len)
                 .ok_or(FsError::InvalidData)?;
             let mut item = body.clone();
             item[0..8].copy_from_slice(&used.to_le_bytes());
             ext_edits.push(Edit::Upsert(
-                BtrfsKey::new(*start, format::BLOCK_GROUP_ITEM_KEY, *len),
+                BtrfsKey::new(start, format::BLOCK_GROUP_ITEM_KEY, *len),
                 item,
             ));
         }
@@ -6210,9 +6248,9 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     }
     nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
     for (addr, buf) in &nodes {
-        // Cache each node as it is written: `total_block_group_used` below
-        // reads part of this very tree straight back, and without this every
-        // one of those reads is a miss the write itself created.
+        // Cache each node as it is written: the next operation reads part
+        // of these very trees straight back, and without this every one of
+        // those reads is a miss the write itself created.
         if txn.root_flags.is_some() {
             vol.write_node_root_admin(*addr, buf).await?;
         } else {
@@ -6220,9 +6258,6 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         }
     }
 
-    // Superblock `bytes_used` is the sum of every block group's `used`, read back
-    // from the freshly-written extent tree so it can never drift from the block
-    // groups (each group's net went in with its item above).
     // Stand in for a crash at the one instant the COW invariant is load
     // bearing: nodes written, superblock still pointing at the previous tree.
     #[cfg(feature = "kernel-test")]
@@ -6233,10 +6268,38 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         return Err(FsError::Unsupported);
     }
 
-    let bytes_used = total_block_group_used(vol, bgt_root.unwrap_or(ext_root)).await?;
-
     let mut raw = vol.read_raw_superblock().await?;
     let old_gen = le64(&raw, 72)?;
+    // Superblock `bytes_used` is the sum of every block group's `used`. The
+    // first commit of a mount sums them, so whatever the superblock held
+    // before is replaced by what the block groups say; after that it moves
+    // by what each commit added to and took from the groups, as Linux moves
+    // it with each `btrfs_update_block_group` — summing again would read
+    // every block group for every commit. With the audit on, every commit
+    // sums, and one whose own arithmetic disagrees fails.
+    let moved = i64::try_from(le64(&raw, 120)?)
+        .ok()
+        .and_then(|used| {
+            bg_net
+                .values()
+                .try_fold(used, |sum, &net| sum.checked_add(net))
+        })
+        .and_then(|used| u64::try_from(used).ok());
+    let trusted = vol.bytes_used_summed();
+    let bytes_used = if trusted && !crate::allocator::view_audit() {
+        moved.ok_or(FsError::InvalidData)?
+    } else {
+        let summed = total_block_group_used(vol, bgt_root.unwrap_or(ext_root)).await?;
+        if trusted && moved != Some(summed) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: superblock bytes_used would move to {moved:?}, the block groups hold {summed}"
+            );
+            return Err(FsError::InvalidData);
+        }
+        summed
+    };
     raw[72..80].copy_from_slice(&gen.to_le_bytes());
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes());
     // `root_level`: the root tree grows a level once it splits (many subvolume
@@ -6270,6 +6333,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // superblock reaches the device, mirroring `btrfs_finish_extent_commit`
     // running only after `write_all_supers`.
     let staged_full = vol.stage_superblock(raw, txn.root_flags.is_some());
+    vol.set_bytes_used_summed(true);
 
     if let Some(f) = alloc.floor() {
         vol.set_alloc_floor(f);
@@ -6322,6 +6386,10 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     vol.set_free_view(advanced);
     if audit {
         crate::allocator::audit_view(vol).await?;
+    }
+    // The replaced blocks are in no tree any more.
+    for &(addr, _) in &freed_meta {
+        vol.forget_node(addr);
     }
     // Bound how much a crash discards and how long pinned extents withhold
     // space. `sync_to_disk` is the same path `fsync` takes, so the batch is

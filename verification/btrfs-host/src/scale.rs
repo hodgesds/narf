@@ -24,8 +24,9 @@
 //! loop (create a temporary file, write, fsync, rename over the old name),
 //! log appends with fsync, and bursts of creates and unlinks closed by one
 //! directory fsync — and every commit is recorded: nodes visited and written
-//! per tree, fixed-point rounds, blocks allocated beyond the batch's
-//! reservation, and wall time. The counts are deterministic; the times are
+//! per tree, passes of recording its own blocks, blocks allocated beyond the
+//! batch's reservation, free ranges the allocators examined, and wall time.
+//! The counts are deterministic; the times are
 //! indicative only. The workload runs once without the free-space view audit
 //! (which re-reads the whole tree and would be counted) and once with it, so
 //! every commit of the second pass is compared with the tree it wrote.
@@ -206,7 +207,7 @@ fn spread(commits: &[Commit], figure: impl Fn(&Commit) -> u64) -> String {
 
 fn report(kind: &str, commits: &[Commit]) -> String {
     format!(
-        "      {kind}: {} commits; rounds {}; visited fst {} extent {} block-group {} csum {} root {} (from the device {}); wrote fst {} all trees {}; over reservation {}; {} ms",
+        "      {kind}: {} commits; passes {}; visited fst {} extent {} block-group {} csum {} root {} (from the device {}); wrote fst {} all trees {}; over reservation {}; free ranges examined by the allocators {}; {} ms",
         commits.len(),
         spread(commits, |c| c.cost.rounds),
         spread(commits, |c| c.cost.read.free_space),
@@ -218,6 +219,7 @@ fn report(kind: &str, commits: &[Commit]) -> String {
         spread(commits, |c| c.cost.written.free_space),
         spread(commits, |c| c.cost.written.total()),
         spread(commits, |c| c.overrun()),
+        spread(commits, |c| c.cost.alloc_ranges_examined),
         {
             let mut ms: Vec<f64> = commits
                 .iter()

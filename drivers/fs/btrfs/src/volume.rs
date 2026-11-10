@@ -499,6 +499,33 @@ impl<B: BlockDevice> VolCore<B> {
         self.free_view.lock().take()
     }
 
+    /// Where the last tree block was allocated (its end), for the next
+    /// allocator to carry on from ([`crate::allocator::Allocator`]).
+    pub(crate) fn node_cursor(&self) -> u64 {
+        self.node_cursor.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Remember where the last tree block was allocated.
+    pub(crate) fn set_node_cursor(&self, cursor: u64) {
+        self.node_cursor
+            .store(cursor, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a commit of this mount has already written a superblock
+    /// `bytes_used` it summed from the block groups, so later commits may
+    /// move it by their own changes instead of summing again.
+    pub(crate) fn bytes_used_summed(&self) -> bool {
+        self.bytes_used_summed
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record (or, with `false`, forget) that the superblock's `bytes_used`
+    /// is the sum of the block groups.
+    pub(crate) fn set_bytes_used_summed(&self, summed: bool) {
+        self.bytes_used_summed
+            .store(summed, core::sync::atomic::Ordering::Release);
+    }
+
     /// No mount of this filesystem may write (mounted or remounted ro).
     pub(crate) fn is_core_read_only(&self) -> bool {
         self.read_only.load(core::sync::atomic::Ordering::Acquire)
@@ -755,6 +782,11 @@ pub struct VolCore<B: BlockDevice> {
     /// it ([`crate::allocator::FreeView`]). `None` until then, and again
     /// whenever it may no longer match the tree.
     free_view: IrqSafeSpinLock<Option<Arc<crate::allocator::FreeView>>>,
+    /// End of the last tree block allocated (0: none yet). A hint only.
+    node_cursor: core::sync::atomic::AtomicU64,
+    /// A commit of this mount summed the block groups into the superblock's
+    /// `bytes_used` ([`Self::bytes_used_summed`]).
+    bytes_used_summed: core::sync::atomic::AtomicBool,
     /// Run when the last mount (view) of this core drops: commits whatever a
     /// writable core still holds (see [`commit_on_last_drop`]). A function
     /// pointer because `Drop` cannot carry the `'static` bound committing
@@ -1419,6 +1451,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Logical bytes left in the containing chunk/block group.
     pub(crate) fn logical_chunk_remaining(&self, logical: u64) -> Result<u64, FsError> {
         self.state.lock().chunk_map.chunk_remaining(logical)
+    }
+
+    /// `(start, length)` of the chunk — and so of the block group — that
+    /// contains `logical`.
+    pub(crate) fn logical_chunk_bounds(&self, logical: u64) -> Result<(u64, u64), FsError> {
+        self.state.lock().chunk_map.chunk_bounds(logical)
     }
 
     /// Resolve every direct copy of a logical byte, preserving device ids.
@@ -2114,6 +2152,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             fs_batch: Mutex::new(None),
             stats: crate::stats::CommitStats::default(),
             free_view: IrqSafeSpinLock::new(None),
+            node_cursor: core::sync::atomic::AtomicU64::new(0),
+            bytes_used_summed: core::sync::atomic::AtomicBool::new(false),
             last_view_dropped: commit_on_last_drop::<B>,
             drop_commit_tried: core::sync::atomic::AtomicBool::new(false),
             state: IrqSafeSpinLock::new(VolState {
@@ -2850,6 +2890,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             cache.entries.clear();
         }
         cache.entries.insert(logical, Arc::new(buf.to_vec()));
+    }
+
+    /// Drop the cached copy of a tree block nothing references any more: one
+    /// a commit replaced, or one a batch wrote and then replaced again.
+    ///
+    /// The cache is bounded by emptying it when it fills, so every dead
+    /// block left in it brings the next emptying — and the re-reading of
+    /// every live node — closer. A reader still walking a tree that holds
+    /// the block reads it back from the device, where it stays intact until
+    /// its space is unpinned.
+    pub(crate) fn forget_node(&self, logical: u64) {
+        self.nodes.lock().entries.remove(&logical);
     }
 
     /// Write one metadata node and keep it cached.
