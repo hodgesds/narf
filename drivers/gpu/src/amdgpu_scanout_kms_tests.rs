@@ -1117,3 +1117,127 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     kms_sync_allocation_reclaims_visible_vram_with_borrowed_admission
 );
+
+/// Navi22 as it publishes itself since the DCN30 overlays: synthesized
+/// primaries (plane 0x40 + n, the CRTC's `primary_fb`) under two native
+/// overlays and a cursor plane per CRTC. The primary is still the
+/// synthesized one, so an atomic commit's primary framebuffer is still a
+/// prepare_fb target (amdgpu_dm_plane_helper_prepare_fb pins every
+/// plane's buffer), and a positioned primary keeps its SRC and CRTC
+/// rectangles to the presenter (amdgpu_dm_plane_fill_dc_scaling_info).
+/// The request is KWin's on a screen showing only the pointer: the pointer
+/// image on the primary at the pointer position, overlays and cursor
+/// plane off.
+fn kms_synthesized_primary_under_overlays_keeps_target_and_placement() -> TestResult {
+    let Ok(f) = Fixture::new(4) else {
+        return TestResult::Fail("fixture");
+    };
+    {
+        let mut c = f.mode.lock();
+        c.driver_name = "amdgpu";
+        c.gfx12_modifiers = false;
+        c.native_planes = crate::drm_native_planes::overlay_cursor_planes_for(&[], &[CRTC]);
+        c.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        c.plane_formats = Some(&[DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888]);
+        if !c.has_native_kms_planes() {
+            return TestResult::Fail("fixture publishes no native overlay");
+        }
+    }
+    let Ok(object) = f.object() else {
+        return TestResult::Fail("BO");
+    };
+    let Ok(fb) = f.fb(object.clone(), MASTER, false) else {
+        return TestResult::Fail("ADDFB2");
+    };
+    let overlays = crate::drm_native_planes::overlay_ids(&f.mode.lock());
+    let cursor = crate::drm_native_planes::cursor_ids(&f.mode.lock())[0];
+    // obj69{IN_FENCE_FD=-1 FB_ID=0 CRTC_ID=0} obj68{..} obj70{..}
+    // obj64{CRTC_H CRTC_W CRTC_Y CRTC_X SRC_H SRC_W SRC_Y SRC_X
+    // IN_FENCE_FD FB_ID CRTC_ID}: a 32x12 view at CRTC (16, 0) of the
+    // 64x12 mode.
+    let off = [
+        PLANE_IN_FENCE_FD_PROP_ID,
+        PLANE_FB_ID_PROP_ID,
+        PLANE_CRTC_ID_PROP_ID,
+    ];
+    let mut props: Vec<u32> = Vec::new();
+    let mut values: Vec<u64> = Vec::new();
+    for _ in 0..3 {
+        props.extend_from_slice(&off);
+        values.extend_from_slice(&[u64::MAX, 0, 0]);
+    }
+    props.extend_from_slice(&[
+        PLANE_CRTC_H_PROP_ID,
+        PLANE_CRTC_W_PROP_ID,
+        PLANE_CRTC_Y_PROP_ID,
+        PLANE_CRTC_X_PROP_ID,
+        PLANE_SRC_H_PROP_ID,
+        PLANE_SRC_W_PROP_ID,
+        PLANE_SRC_Y_PROP_ID,
+        PLANE_SRC_X_PROP_ID,
+        PLANE_IN_FENCE_FD_PROP_ID,
+        PLANE_FB_ID_PROP_ID,
+        PLANE_CRTC_ID_PROP_ID,
+    ]);
+    values.extend_from_slice(&[
+        12,
+        32,
+        0,
+        16,
+        12 << 16,
+        32 << 16,
+        0,
+        0,
+        u64::MAX,
+        u64::from(fb),
+        u64::from(CRTC),
+    ]);
+    let request = atomic(
+        &[overlays[1], overlays[0], cursor, PRIMARY],
+        &[3, 3, 3, 11],
+        &props,
+        &values,
+    );
+    if !one_target(&request, &f.mode.lock(), &object) {
+        return TestResult::Fail("synthesized primary's framebuffer is no prepare_fb target");
+    }
+    if request.validate(f.index, &f.mode, MASTER, None).is_err() {
+        return TestResult::Fail("positioned synthesized primary refused");
+    }
+    let mut state = crate::drm::atomic::AtomicState::default();
+    state.planes.push(crate::drm::atomic::PlaneState {
+        id: PRIMARY,
+        crtc_id: Some(CRTC),
+        fb_id: Some(fb),
+        crtc_x: 16,
+        crtc_y: 0,
+        crtc_w: 32,
+        crtc_h: 12,
+        src_x: 0,
+        src_y: 0,
+        src_w: 32,
+        src_h: 12,
+        ..Default::default()
+    });
+    let placed = synthesized_primary_placement(&f.mode.lock(), &state, CRTC, fb);
+    if placed
+        != Some(crate::drm::card::Placement {
+            src: (0, 0, 32, 12),
+            dst: (16, 0, 32, 12),
+        })
+    {
+        return TestResult::Fail("positioned synthesized primary lost its placement");
+    }
+    // The full screen unscaled is no placement.
+    state.planes[0].crtc_x = 0;
+    state.planes[0].crtc_w = 64;
+    state.planes[0].src_w = 64;
+    if synthesized_primary_placement(&f.mode.lock(), &state, CRTC, fb).is_some() {
+        return TestResult::Fail("full-screen primary reported a placement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    kms_synthesized_primary_under_overlays_keeps_target_and_placement
+);

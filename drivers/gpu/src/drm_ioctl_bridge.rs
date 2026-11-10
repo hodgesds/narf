@@ -6728,29 +6728,9 @@ fn atomic_commit(
                 .filter_map(|&(crtc_id, fb_id)| {
                     let fb = card.framebuffer(fb_id).ok()?;
                     let gem_handle = fb.gem_handle;
-                    // A positioned or scaled primary of a native card
-                    // without native planes (check_native_plane).
-                    let placement =
-                        card.plane_formats
-                            .filter(|_| amdgpu && !card.has_native_kms_planes())
-                            .and_then(|_| {
-                                let plane = state.planes.iter().find(|p| {
-                                    p.crtc_id == Some(crtc_id) && p.fb_id == Some(fb_id)
-                                })?;
-                                let mode = state
-                                    .crtcs
-                                    .iter()
-                                    .find(|c| c.id == crtc_id)
-                                    .and_then(|c| c.mode)
-                                    .or_else(|| card.crtc(crtc_id).ok().and_then(|c| c.mode))?;
-                                placement_of(
-                                    (
-                                        (plane.crtc_x, plane.crtc_y, plane.crtc_w, plane.crtc_h),
-                                        (plane.src_x, plane.src_y, plane.src_w, plane.src_h),
-                                    ),
-                                    (mode.width, mode.height),
-                                )
-                            });
+                    let placement = amdgpu
+                        .then(|| synthesized_primary_placement(&card, &state, crtc_id, fb_id))
+                        .flatten();
                     Some((
                         crtc_id,
                         card.virtgpu_import(gem_handle).cloned(),
@@ -7538,6 +7518,56 @@ fn check_native_plane(
         return Err(FsError::NoSpace);
     }
     Ok(())
+}
+
+/// Whether the card's primary planes are the bridge's synthesized ones
+/// (each CRTC's `primary_fb` behind plane 0x40 + n) rather than native
+/// planes: a card without native planes, one with cursor planes alone, or
+/// Navi22 on DCN 3.0, whose two native overlays sit over synthesized
+/// primaries. `Card::has_native_kms_planes` is true for the last (an
+/// overlay is a native non-cursor plane), so it does not answer this.
+pub(crate) fn synthesized_primaries(card: &crate::drm::card::Card) -> bool {
+    #[cfg(feature = "amdgpu")]
+    if crate::drm_native_planes::has_synthesized_primaries(card) {
+        return true;
+    }
+    !card.has_native_kms_planes()
+}
+
+/// The placement an atomic commit gives the synthesized primary showing
+/// `fb_id` on `crtc_id`, on a native card (one that lists plane formats):
+/// its SRC and CRTC rectangles when it is positioned or scaled
+/// (`check_native_plane`, `drm_native_planes::check`), None when it shows
+/// the full screen unscaled. amdgpu_dm hands DC every plane's rectangles
+/// (amdgpu_dm_plane_fill_dc_scaling_info); the presenter takes them from
+/// here.
+fn synthesized_primary_placement(
+    card: &crate::drm::card::Card,
+    state: &crate::drm::atomic::AtomicState,
+    crtc_id: u32,
+    fb_id: u32,
+) -> Option<crate::drm::card::Placement> {
+    card.plane_formats?;
+    if !synthesized_primaries(card) {
+        return None;
+    }
+    let plane = state
+        .planes
+        .iter()
+        .find(|p| p.crtc_id == Some(crtc_id) && p.fb_id == Some(fb_id))?;
+    let mode = state
+        .crtcs
+        .iter()
+        .find(|c| c.id == crtc_id)
+        .and_then(|c| c.mode)
+        .or_else(|| card.crtc(crtc_id).ok().and_then(|c| c.mode))?;
+    placement_of(
+        (
+            (plane.crtc_x, plane.crtc_y, plane.crtc_w, plane.crtc_h),
+            (plane.src_x, plane.src_y, plane.src_w, plane.src_h),
+        ),
+        (mode.width, mode.height),
+    )
 }
 
 /// The placement of a primary with `rects` on a CRTC of `mode` (width,

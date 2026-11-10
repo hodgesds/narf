@@ -1205,9 +1205,12 @@ pub struct NativePlane {
     pub legacy_position: (i32, i32),
 }
 impl Card {
-    /// Whether DRM's primary and overlay planes are native planes
-    /// (`drm_native_planes`). A card with cursor planes alone (Navi22)
-    /// keeps the synthesized primary path.
+    /// Whether the card has a native primary or overlay plane
+    /// (`drm_native_planes`). A card with cursor planes alone keeps the
+    /// synthesized primary path. True for Navi22 too, whose native
+    /// overlays sit over synthesized primaries: ask
+    /// `drm_ioctl_bridge::synthesized_primaries` whether the primaries are
+    /// native.
     pub fn has_native_kms_planes(&self) -> bool {
         self.native_planes.iter().any(|p| !p.is_cursor())
     }

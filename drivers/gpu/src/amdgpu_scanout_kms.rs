@@ -506,7 +506,7 @@ fn atomic_fbs(card: &crate::drm::card::Card, req: AtomicRequest<'_>) -> Result<V
             .filter(|n| *n <= req.props.len() && *n <= req.values.len())
             .ok_or(FsError::InvalidData)?;
         let primary = || {
-            if card.has_native_kms_planes() {
+            if !synthesized_primaries(card) {
                 return None;
             }
             let index = object.checked_sub(crate::drm_native_planes::PRIMARY_PLANE_ID_BASE)?;
