@@ -2508,6 +2508,8 @@ fn smoke_igc_ethtool_regs_dump_layout() -> TestResult {
         (0x5404, 0xb0),
         (0x5404 + 4 * 8, 0xb4),
         (0xe000, 0xc0),
+        (0xe0c0, 0xc3),
+        (0xe004, 0xface),
         (0x55b0, 0x55),
         (0x5ccc, 0xe7),
     ]);
@@ -2519,6 +2521,7 @@ fn smoke_igc_ethtool_regs_dump_layout() -> TestResult {
     m.regs.borrow_mut().insert(0x4100, 0x77);
     let dump = crate::igc::control::regs_dump(&m, &counters);
     check!(dump.len() == 740, "register dump is not 740 words");
+    check!(dump[152] == 0xface, "TDBAH0 overwritten by TDBAL3");
     check!(
         dump[0] == 0x1111_1111
             && dump[1] == 0x2222_2222

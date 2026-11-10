@@ -2398,7 +2398,8 @@ impl SocketFile {
             ETHTOOL_GLINK => {
                 // `ethtool_get_link`: netif_running && the driver's carrier;
                 // `lo` is always on.
-                let link = u32::from(name == "lo" || iface.is_some_and(|nic| nic.link_up));
+                let link =
+                    u32::from(name == "lo" || iface.is_some_and(|nic| nic.link_up && nic.carrier));
                 let mut value = [0u8; 8];
                 value[0..4].copy_from_slice(&ETHTOOL_GLINK.to_ne_bytes());
                 value[4..8].copy_from_slice(&link.to_ne_bytes());
@@ -2421,12 +2422,12 @@ impl SocketFile {
                 // SAFETY: codec bounds every variable-length request to 64 KiB.
                 unsafe { crate::handlers::copy_from_user(&mut request, data) }
                     .map_err(|_| FsError::BadAddress)?;
-                narf_net::ethtool::execute(name, &mut request)
+                let result = narf_net::ethtool::execute_with_result(name, &mut request)
                     .map_err(|e| map_admin_ioctl_error(narf_net::AdminError::DeviceError(e)))?;
                 // SAFETY: output occupies the same bounded user buffer.
                 unsafe { crate::handlers::copy_to_user(data, &request) }
                     .map_err(|_| FsError::BadAddress)?;
-                Ok(0)
+                Ok(u64::from(result))
             }
         }
     }

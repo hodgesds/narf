@@ -1817,6 +1817,55 @@ kernel_test_in!(
     smoke_ext4_metadata_csum_create_persists_initial_attrs
 );
 
+/// The ext4 backend must preserve the root owner and setuid bit that sudo's
+/// legacy-stat check and the generic exec credential path both consume.
+fn smoke_ext4_sudo_mode_stat_views_survive_remount() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    let mut image = build_ext4_extent_image(b"sudo-like");
+    if sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+        return TestResult::Fail("metadata-csum fixture signing failed");
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(value) => value,
+        Err(error) => return TestResult::Fail(error),
+    };
+    if !matches!(poll_once(file.set_owners(0, 0)), Some(Ok(())))
+        || !matches!(poll_once(file.set_perms(0o4755)), Some(Ok(())))
+    {
+        return TestResult::Fail("sudo-like ext4 metadata update failed");
+    }
+    // A fresh backing device prevents an inode cache from satisfying the
+    // second observation without reading the persisted checksummed inode.
+    let fresh_device = RamBlockDevice::from_image(512, device.snapshot());
+    let (_fresh_volume, fresh_file) = match mount_ext4_data(fresh_device) {
+        Ok(value) => value,
+        Err(error) => return TestResult::Fail(error),
+    };
+    for node in [&file, &fresh_file] {
+        if node.owners() != (0, 0)
+            || node.stat().mode.perms != 0o4755
+            || !matches!(poll_once(node.stat_async()), Some(Ok(stat)) if stat.mode.perms == 0o4755)
+        {
+            return TestResult::Fail("ext4 stat hid setuid or root ownership");
+        }
+        // ext-family nodes use sys_statx's legacy-stat fallback rather than
+        // a native statx hook. That fallback combines the checked stat above
+        // with owners()/inode_attrs(); Unsupported is the hook contract.
+        match poll_once(node.statx_async(0, 0x7ff)) {
+            Some(Err(narf_filesystem::FsError::Unsupported)) => {}
+            Some(Ok(stat)) if stat.uid == 0 && stat.gid == 0 && stat.mode == 0o104755 => {}
+            _ => return TestResult::Fail("ext4 native statx disagreed with legacy metadata"),
+        }
+    }
+    drop(volume);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2/special_mode",
+    smoke_ext4_sudo_mode_stat_views_survive_remount
+);
+
 /// Rolling back a created inode must leave a valid deleted on-disk record.
 /// Clearing only its bitmap bit leaves a zero deletion time and stale mode,
 /// which e2fsck reports as a corrupt free inode.

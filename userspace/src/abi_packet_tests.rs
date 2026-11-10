@@ -2448,6 +2448,47 @@ fn smoke_abi_packet_so_txtime_and_scm_txtime() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_packet_so_txtime_and_scm_txtime);
 
+fn smoke_abi_ethtool_carrier_and_feature_status() -> TestResult {
+    with_setup(|| {
+        nic(true)?;
+        let fd = open_packet(SOCK_DGRAM, ETH_P_IP)?;
+        let mut ifr = [0u8; 40];
+        ifr[..NIC.len()].copy_from_slice(NIC.as_bytes());
+        let mut value = [0u8; 8];
+        value[..4].copy_from_slice(&0x0au32.to_ne_bytes());
+        ifr[16..24].copy_from_slice(&(value.as_mut_ptr() as u64).to_ne_bytes());
+        for (admin, carrier, want) in [(true, false, 0u32), (true, true, 1), (false, true, 0)] {
+            narf_net::iface::set_link_state(NIC, admin);
+            narf_net::iface::set_link_metadata(NIC, carrier, None, None);
+            expect(
+                sys(Syscall::Ioctl, a2(fd, 0x8946, ifr.as_mut_ptr() as u64)) == Some(0),
+                "ETHTOOL_GLINK ioctl",
+            )?;
+            expect(
+                u32::from_ne_bytes(value[4..8].try_into().unwrap()) == want,
+                "GLINK must require administrative up and carrier",
+            )?;
+        }
+        let mut features = [0u8; 16];
+        features[..4].copy_from_slice(&0x3bu32.to_ne_bytes());
+        features[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        features[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        features[12..16].copy_from_slice(&1u32.to_ne_bytes());
+        ifr[16..24].copy_from_slice(&(features.as_mut_ptr() as u64).to_ne_bytes());
+        expect(
+            sys(Syscall::Ioctl, a2(fd, 0x8946, ifr.as_mut_ptr() as u64)) == Some(1),
+            "SFEATURES must preserve positive UNSUPPORTED status through ioctl",
+        )?;
+        close(fd);
+        nic_down();
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/ethtool",
+    smoke_abi_ethtool_carrier_and_feature_status
+);
+
 fn smoke_abi_netlink_tc_taprio_cbs_etf_and_ethtool_mm() -> TestResult {
     #[derive(Debug)]
     struct TsnNic {
@@ -2631,7 +2672,7 @@ fn smoke_abi_netlink_tc_taprio_cbs_etf_and_ethtool_mm() -> TestResult {
         mm_set[4..6].copy_from_slice(&0x14u16.to_ne_bytes()); // GENL_ID_ETHTOOL
         mm_set[6..8].copy_from_slice(&0x05u16.to_ne_bytes()); // NLM_F_REQUEST | NLM_F_ACK
         mm_set[8..12].copy_from_slice(&7u32.to_ne_bytes());
-        mm_set[16] = 36; // ETHTOOL_MSG_MM_SET
+        mm_set[16] = 43; // ETHTOOL_MSG_MM_SET
         mm_set[17] = 1;
         push_nla(&mut mm_set, 1 | 0x8000, &hdr_nla); // ETHTOOL_A_MM_HEADER
         push_nla(&mut mm_set, 2, &[1u8]); // ETHTOOL_A_MM_PMAC_ENABLED
@@ -2668,7 +2709,7 @@ fn smoke_abi_netlink_tc_taprio_cbs_etf_and_ethtool_mm() -> TestResult {
         mm_get[4..6].copy_from_slice(&0x14u16.to_ne_bytes());
         mm_get[6..8].copy_from_slice(&0x01u16.to_ne_bytes()); // NLM_F_REQUEST
         mm_get[8..12].copy_from_slice(&8u32.to_ne_bytes());
-        mm_get[16] = 35; // ETHTOOL_MSG_MM_GET
+        mm_get[16] = 42; // ETHTOOL_MSG_MM_GET
         mm_get[17] = 1;
         push_nla(&mut mm_get, 1 | 0x8000, &hdr_nla);
         let mm_get_len = mm_get.len() as u32;
@@ -2680,7 +2721,7 @@ fn smoke_abi_netlink_tc_taprio_cbs_etf_and_ethtool_mm() -> TestResult {
         let mut reply = [0u8; 256];
         let (r, _, _) = recvfrom(genl_fd, &mut reply, MSG_DONTWAIT);
         expect(
-            r.is_some_and(|n| n > 20) && reply[16] == 44, // ETHTOOL_MSG_MM_GET_REPLY
+            r.is_some_and(|n| n > 20) && reply[16] == 42, // ETHTOOL_MSG_MM_GET_REPLY
             "ETHTOOL_MSG_MM_GET_REPLY not returned",
         )?;
 
@@ -2690,7 +2731,7 @@ fn smoke_abi_netlink_tc_taprio_cbs_etf_and_ethtool_mm() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/ethtool",
     smoke_abi_netlink_tc_taprio_cbs_etf_and_ethtool_mm
 );
 

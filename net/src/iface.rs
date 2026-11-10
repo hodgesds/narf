@@ -276,6 +276,9 @@ pub struct NetIfaceEntry {
     /// checksum/TSO offload via [`crate::TxMeta`] instead of doing the work
     /// in software.
     pub offloads: crate::OffloadCapabilities,
+    pub(crate) offload_hardware: crate::OffloadCapabilities,
+    pub(crate) feature_wanted: Option<u64>,
+    pub(crate) gro_supported: bool,
     /// Whether this interface opts into the kernel stack's software GRO stage.
     /// This is deliberately per-interface: one GRO-capable driver must not
     /// change receive semantics for another driver's poll loop.
@@ -368,7 +371,8 @@ pub fn set_offloads(name: &str, offloads: crate::OffloadCapabilities) {
         .as_mut()
         .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
     {
-        entry.offloads = offloads;
+        entry.offload_hardware = offloads;
+        crate::ethtool::features::apply(entry);
     }
 }
 
@@ -400,8 +404,28 @@ pub fn set_software_gro(name: &str, enabled: bool) -> bool {
     else {
         return false;
     };
+    entry.gro_supported |= enabled;
     entry.software_gro = enabled;
+    if let Some(wanted) = &mut entry.feature_wanted {
+        if enabled {
+            *wanted |= 1 << 14;
+        } else {
+            *wanted &= !(1 << 14);
+        }
+    }
     true
+}
+
+pub(crate) fn with_features<T>(
+    name: &str,
+    f: impl FnOnce(&mut NetIfaceEntry) -> T,
+) -> Result<T, i32> {
+    let mut g = IFACES.lock();
+    let entry = g
+        .as_mut()
+        .and_then(|entries| entries.iter_mut().find(|e| e.name == name))
+        .ok_or(19)?;
+    Ok(f(entry))
 }
 
 /// Opt an interface into zero-copy TX (P-F) with an iface-owned recycling pool
@@ -953,6 +977,11 @@ fn register_inner(
         offloads: old
             .as_ref()
             .map_or_else(Default::default, |old| old.offloads),
+        offload_hardware: old
+            .as_ref()
+            .map_or_else(Default::default, |old| old.offload_hardware),
+        feature_wanted: old.as_ref().and_then(|old| old.feature_wanted),
+        gro_supported: old.as_ref().is_some_and(|old| old.gro_supported),
         software_gro: old.as_ref().is_some_and(|old| old.software_gro),
         // A re-probe preserves any zero-copy TX opt-in (hook + pool + headroom)
         // so the stack keeps the same recycling pool across a driver reset.
