@@ -42,33 +42,6 @@ build orchestration (`build/`), release sign-off (`process/`).
 
 ## 3. Test taxonomy
 
-`verification/fs-linux-sweep/probe.c` defines x86_64 filesystem diagnostics
-against Linux with identical static userspace workloads and seeded
-ext2/ext4/Btrfs images. Functional runs retain raw timings but emit no
-performance record. Every guest uses a disposable
-image copy. Guest completion, per-case data verification, read-only Linux
-filesystem checks and independently extracted persistent content must all pass
-for that combination to pass. This diagnostic tool does not satisfy or replace
-the controlled-run and statistical protocol in §8. Workload details, mount
-differences live in `verification/fs-linux-sweep/README.md`. Python collection
-and host-provisioning scripts used for local investigations are untracked;
-keep their exact sources and control/restoration records with run artifacts.
-
-Controlled comparisons using `verification/fs-linux-sweep/bench.c` require
-matched KVM configurations, fresh images, independent boots per side/format,
-mandatory offline structural/content checks and the §8.2 host controls with
-rollback. A pilot emits no performance record. Use 100 samples per side/format
-when CV exceeds 5%. `analyze.rs` reuses xtask's statistics with 10,000 bootstrap
-resamples, Welch/Mann–Whitney tests, suite-wide BH q=0.05 and declared δ=3%.
-The metric is elapsed invariant TSC cycles for fixed work, lower is better.
-Tmpfs adds a volatile baseline with guest-side final byte/name checks rather
-than an offline persistent-image check. FAT32 (`vfat`) is opt-in diagnostic
-coverage with read-only fsck and independent mtools extraction; it is not
-promoted to the timed write comparison while directory sync is unimplemented.
-Kernel image hashes identify the compared binaries; source reference status
-does not establish the installed Linux image's build provenance. This is not
-a schema-2 regression record for two clean source builds.
-
 Wi-Fi and GPU implementations and maintained validation execute native Rust.
 They do not extract Linux/Mesa C functions, compile C shims, slice Rust source
 into temporary adapters, or invoke Python/compiler wrappers for comparisons.

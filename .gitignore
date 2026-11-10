@@ -54,6 +54,3 @@ systemd_ctx.md
 # Local notes
 /cachy.md
 /youtube.md
-
-# Local filesystem sweep orchestration
-/verification/fs-linux-sweep/*.py
