@@ -676,6 +676,11 @@ struct ModuleRegisters {
     bar: u64,
 }
 impl super::hardware::Registers for ModuleRegisters {
+    fn note(&self, message: &'static str) {
+        log("igc(.ko): ");
+        log(message);
+        log("\n");
+    }
     fn read(&self, reg: u64) -> u32 {
         mmio_read(self.dev, self.bar, reg).unwrap_or(u32::MAX)
     }
