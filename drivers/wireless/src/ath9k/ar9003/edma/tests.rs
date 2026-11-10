@@ -205,3 +205,70 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9300_edma_rx_status
 );
+
+fn smoke_ath9k_ar9300_edma_rx_status_sample_never_mixes_occupants() -> TestResult {
+    // A receive buffer is handed to the device with its 48-byte status
+    // cleared, and the host may be sampling it when the device writes the
+    // completed status. Model the device posting the WHOLE status after
+    // each possible number of host loads. Whatever the interleaving, a
+    // sample that reports AR_RxDone must be the completed status in full:
+    // with the cleared buffer's words under a set AR_RxDone the frame is
+    // delivered with a zero length and a wrong `more` flag.
+    let old = [0u32; 12];
+    let mut new = [0u32; 12];
+    for (index, word) in new.iter_mut().enumerate() {
+        *word = 0xA500_0000 | ((index as u32) << 8);
+    }
+    new[0] = 0x168c << 16; // AR_DescId: Atheros vendor id
+    new[2] = 0x1000 | 0x5EA; // more + datalen
+    new[11] = 0x3; // AR_RxDone | AR_RxFrameOK
+
+    for post_after in 0..=12usize {
+        let slot = core::cell::Cell::new(old);
+        let loads = core::cell::Cell::new(0usize);
+        let acquired = core::cell::Cell::new(false);
+        let sampled = sample_rx_status(
+            |index| {
+                if loads.get() == post_after {
+                    slot.set(new);
+                }
+                loads.set(loads.get() + 1);
+                Ok::<u32, ()>(slot.get()[index])
+            },
+            || acquired.set(true),
+        );
+        let Ok(sampled) = sampled else {
+            return TestResult::Fail("infallible status sample failed");
+        };
+        let Some(status) = sampled else {
+            // Not completed yet: the driver polls again.
+            if post_after == 0 {
+                return TestResult::Fail("a status posted before the sample read as pending");
+            }
+            if loads.get() != 1 || acquired.get() {
+                return TestResult::Fail("a pending status was read past its done word");
+            }
+            continue;
+        };
+        if loads.get() != 12 || !acquired.get() {
+            return TestResult::Fail("a completed sample is not done word, barrier, 11 words");
+        }
+        let words: [u32; 12] = core::array::from_fn(|index| {
+            u32::from_le_bytes(status[4 * index..4 * index + 4].try_into().unwrap())
+        });
+        if words != new {
+            return TestResult::Fail("AR_RxDone sampled with words of the cleared status");
+        }
+        let Ok(Some(decoded)) = process_rx(&status) else {
+            return TestResult::Fail("completed status sample did not decode");
+        };
+        if decoded.datalen != 0x5EA || !decoded.more {
+            return TestResult::Fail("AR_RxDone sampled with a stale datalen or more flag");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9300_edma_rx_status_sample_never_mixes_occupants
+);
