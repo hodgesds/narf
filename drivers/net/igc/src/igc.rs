@@ -44,6 +44,12 @@ pub const IMS_RXO: u32 = 1 << 6;
 pub const IMS_RXDMT0: u32 = 1 << 4;
 pub const IMS_RXT0: u32 = 1 << 7;
 pub const IMS_DEFAULT: u32 = IMS_TXDW | IMS_LSC | IMS_RXO | IMS_RXDMT0 | IMS_RXT0;
+pub const IMS_DOUTSYNC: u32 = 1 << 28;
+pub const IMS_DRSTA: u32 = 1 << 30;
+/// Causes for the MSI-X "other" vector (Linux `igc_irq_enable`). Queue
+/// causes are routed through IVAR; leaving them in IMS as well would
+/// raise the administrative vector for ordinary traffic.
+pub const IMS_MSIX_OTHER: u32 = IMS_LSC | IMS_DOUTSYNC | IMS_DRSTA;
 pub const GPIE_NSICR: u32 = 1 << 0;
 pub const GPIE_MULTIPLE_MSIX: u32 = 1 << 4;
 pub const GPIE_EIAME: u32 = 1 << 30;
@@ -469,12 +475,28 @@ pub(crate) struct IrqRoute {
     cpu: u32,
     index: u8,
 }
-static ISR_HW: [IrqSafeSpinLock<Option<Hardware>>; 256] =
+/// Hardware bound to each kernel vector, with the EIMS bits its handler
+/// must restore. EIAM auto-masks every MSI-X vector when it fires: queue
+/// vectors are re-armed by their pump after polling, while nothing else
+/// services the administrative vector, so its handler re-arms it itself
+/// (Linux `igc_msix_other`).
+static ISR_HW: [IrqSafeSpinLock<Option<(Hardware, u32)>>; 256] =
     [const { IrqSafeSpinLock::new(None) }; 256];
+/// EIMS bits the handler for MSI-X entry `index` re-arms on its own.
+pub const fn isr_rearm_mask(index: u8) -> u32 {
+    if index == 0 {
+        1
+    } else {
+        0
+    }
+}
 fn igc_isr(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
-    let hw = *ISR_HW[cookie as usize & 255].lock();
-    if let Some(hw) = hw {
+    let bound = *ISR_HW[cookie as usize & 255].lock();
+    if let Some((hw, rearm)) = bound {
         let _ = hw.read(0x1500);
+        if rearm != 0 {
+            hw.write(0x1524, rearm);
+        }
     }
     narf_interrupts::dispatch::IrqStatus::Handled
 }
@@ -599,7 +621,8 @@ impl Igc {
         // Retain before any ring DMA address reaches the device.
         RETAINED.lock().push(controller.clone());
         for route in &controller.irq_routes {
-            *ISR_HW[route.vector as usize].lock() = Some(controller.hw);
+            *ISR_HW[route.vector as usize].lock() =
+                Some((controller.hw, isr_rearm_mask(route.index)));
             narf_interrupts::dispatch::install_handler_named(
                 route.vector,
                 "igc",
@@ -736,7 +759,8 @@ impl Igc {
                 // SAFETY: device and allocated MSI-X entries are exclusively owned.
                 unsafe { table.program_vector(u16::from(route.index), target, route.vector) }
                     .map_err(|_| IgcError::BarMapFailed)?;
-                *ISR_HW[route.vector as usize].lock() = Some(self.hw);
+                *ISR_HW[route.vector as usize].lock() =
+                    Some((self.hw, isr_rearm_mask(route.index)));
             }
             // SAFETY: all reserved entries have valid routes.
             unsafe { table.enable() }.map_err(|_| IgcError::BarMapFailed)?;
@@ -880,7 +904,7 @@ impl Igc {
         self.hw.write(0x152c, mask);
         self.hw.write(0x1530, mask);
         self.hw.write(0x1524, mask);
-        self.hw.write(0x1508, IMS_DEFAULT);
+        self.hw.write(0x1508, IMS_MSIX_OTHER);
     }
     pub fn mac(&self) -> [u8; 6] {
         self.config.lock().mac
