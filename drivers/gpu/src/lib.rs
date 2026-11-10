@@ -978,10 +978,6 @@ pub fn register_initcalls() {
         intel_gpu::register_pci_driver();
         InitResult::Ok
     });
-    narf_init::register(Stage::Subsys, "nvidia-gpu-pci", || {
-        nvidia_gpu::register_pci_driver();
-        InitResult::Ok
-    });
     narf_init::register(Stage::Subsys, "qxl-gpu-pci", || {
         qxl::register_pci_driver();
         InitResult::Ok
