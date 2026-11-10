@@ -1073,27 +1073,23 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     }
 
     /// `fsync` must leave every write that has already returned durable on
-    /// disk. When `data_only` is true (`fdatasync`), data blocks and their
-    /// modified tree nodes were already submitted to the block device during
-    /// `write` and `batch_stage`; a device flush barrier is sufficient to make
-    /// the non-volatile media durable without forcing a synchronous multi-round
-    /// transaction commit that freezes concurrent operations.
+    /// disk: it delegates to [`BtrfsVolume::sync_to_disk_exclusive`], which
+    /// commits the open batch and writes the staged superblock.
     ///
-    /// For full `fsync` (`data_only == false`), it delegates to
-    /// [`BtrfsVolume::sync_to_disk_exclusive`], which commits the open batch
-    /// and writes the staged superblock.
+    /// `fdatasync` (`data_only`) does the same. It may skip metadata that is
+    /// not needed to read the data back (timestamps), never the metadata
+    /// that is: the file's size and the extent items naming its new data.
+    /// Those live in the open batch — their tree nodes are on the device,
+    /// but no superblock names them, so after a crash the mount starts from
+    /// the previous tree and the write is gone. A device flush alone
+    /// therefore made nothing of an `fdatasync`ed write durable. Linux's
+    /// `btrfs_sync_file` makes no distinction either: its `datasync`
+    /// argument is only traced, and both calls log the same inode state.
     ///
     /// (The tree-log is only used to *replay* a crashed volume's log on mount,
-    /// not to defer writes, so it plays no part here.)
-    fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            let vol = self.volume()?;
-            if data_only {
-                vol.flush().await
-            } else {
-                vol.sync_to_disk_exclusive().await
-            }
-        })
+    /// not to defer writes, so both are a full commit.)
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
     }
 
     fn stat(&self) -> Stat {
@@ -1331,15 +1327,10 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     /// A directory's `fsync`/`syncfs` makes every returned write durable, as
     /// a file's does (see [`FileOps::fsync`] above): `sync(2)`, `syncfs` on a
     /// directory fd and `fsync` of a directory after a rename all land here.
-    fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            let vol = self.volume()?;
-            if data_only {
-                vol.flush().await
-            } else {
-                vol.sync_to_disk_exclusive().await
-            }
-        })
+    /// `fdatasync` of a directory is no weaker: its entries are metadata,
+    /// and they are durable only once committed.
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
     }
 
     /// `syncfs(2)`, and the generic `sync(2)` / pre-shutdown sync of every
