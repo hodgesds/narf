@@ -42,6 +42,10 @@ writes do not pass through the byte-copy helpers.
 Network device ioctls bridge bounded native NIC controls to Linux ethtool:
 link settings, rings/channels/RSS/coalescing, pause/EEE/WoL, counters/names,
 register/NVM reads, diagnostics, link restart and supported L2 flow rules.
+Feature ioctl/netlink queries share the actual interface offload policy.
+SFEATURES preserves Linux's positive status bitmap through the ioctl return;
+GLINK requires administrative up and carrier. Generic Netlink exposes the
+implemented native controls and both compact and verbose feature bitsets.
 Existing network namespace checks and `CAP_NET_ADMIN` policy precede mutations.
 `SIOCSHWTSTAMP`/`SIOCGHWTSTAMP` report the effective ALL/NONE RX and ON/OFF TX
 configuration. AF_PACKET `SO_TIMESTAMPING` reports raw hardware RX times and
@@ -1913,8 +1917,9 @@ through `AdminError::DeviceError`.
 `IFNAMSIZ-1` and at an alias colon (`ENODEV`; every namespace has `lo`); an
 `ETHTOOL_PERQUEUE` sub-command (`EFAULT`); `CAP_NET_ADMIN` for any
 (sub-)command outside `__dev_ethtool`'s unprivileged list (`EPERM`). A device
-without driver information (`lo`) and every other command return
-`EOPNOTSUPP`. `GDRVINFO` reports the driver's name, its version or else the
+without driver information (`lo`) returns `EOPNOTSUPP` for GDRVINFO;
+remaining commands use the bounded native codec described above, returning
+`EOPNOTSUPP` for controls without an implementation. `GDRVINFO` reports the driver's name, its version or else the
 kernel release, and its bus name (`e1000`: PCI name; `virtio_net` `1.0.0`:
 `virtio_bus_name()`); `GLINK` reports `netif_running` and carrier.
 

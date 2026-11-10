@@ -64,10 +64,36 @@ a live clear-on-read register), and `statistics()` appends the Linux
 global, net and per-queue statistic names after the driver's own names.
 Link ksettings use 2-word masks; advertising carries TP always and
 speeds / Pause / Asym_Pause only while autoneg is on, and a set must
-advertise a subset of supported modes. `GPERMADDR`, NVM writes
-(`SEEEPROM`), full RXNFC rule fields, MM set rounding and the shared
-codec's 32-rule flow cap remain unimplemented (see the igc ethtool
-surface-gaps issue).
+advertise a subset of supported modes. The initial `GLINKSETTINGS` negotiation
+returns a negative required word count and success. `GSSET_INFO` queries each
+requested set independently; feature strings also work without driver controls.
+`GPERMADDR`, NVM writes and full RXNFC fields use native hooks.
+
+Both ioctl and Generic Netlink expose feature names and HW/wanted/active
+bitmaps. `GFEATURES` / `SFEATURES` use 32-bit blocks and preserve Linux's
+nonnegative UNSUPPORTED/WISH result flags. `GFLAGS` / `SFLAGS` expose the VLAN
+insertion policy. Feature changes select the kernel stack's checksum, VLAN and
+TSO requests through `iface::offloads`; they preserve the hardware capabilities
+and wanted policy across reinitialization. They do not reprogram the silicon
+or override an explicit native frame's `TxMeta`. TSO requires TX checksum and
+the contract's coupled IPv4/IPv6 TSO capability. Software GRO can only be enabled
+on interfaces whose driver has already opted into the poll-completion flush
+contract. Unsupported features remain unavailable; SG/software GSO are not
+invented from the hardware TSO capability.
+
+Generic Netlink supports string sets, link information/modes/state, debug, WOL,
+features, private flags, rings, channels, coalescing, pause, EEE and timestamp
+information, plus MAC Merge (Linux command IDs 42/43, reply 42). Compact and
+verbose bitsets share the ioctl/native state. Mutations validate attributes
+before applying changes and require namespace administration or a matching
+delegated interface handle. Dumps filter by the socket's network namespace.
+Linux standardized `STATS_GET` groups and hardware operations without a native
+implementation return EOPNOTSUPP; vendor counters remain available via GSTATS.
+Live interfaces without a device hook return EOPNOTSUPP, absent interfaces
+return ENODEV. Timestamp capability claims come from `NicControl::timestamp_info`;
+a generic control defaults to software timestamping and never inherits I225 PHC
+capabilities. Link queries require both administrative up and physical carrier.
+
 
 `enable_zero_copy_tx_context` preserves an owned-frame device cookie alongside
 queue-local recycling. `Frame::tx_timing` carries an optional hardware timestamp
