@@ -1520,6 +1520,14 @@ enum SocketState {
         /// half of each pair is given to the connecter.
         pending: VecDeque<Arc<SocketFile>>,
     },
+    /// AF_UNIX listening socket whose last descriptor closed:
+    /// `unregister()` removed its name from the registry and retired
+    /// it here, so an in-flight `connect()` that cloned the listener
+    /// `Arc` before the close cannot enqueue into its now-unreachable
+    /// pending queue — the enqueue-time state check refuses instead
+    /// (issue #1103). The pending queue drops with the old state.
+    /// (A unit variant: nothing reads a dead listener's address.)
+    UnixListenerClosed,
     /// AF_UNIX connected endpoint. Two ring buffers — one for
     /// each direction — shared between this end and the peer.
     UnixConnected {
@@ -3749,6 +3757,24 @@ impl SocketFile {
                 _ => {}
             }
         }
+        // #1103: retiring the listener's state is what closes the
+        // ghost-connect window. Unpublishing the name above is not
+        // enough: the state stayed `UnixListener`, so a `connect()`
+        // that had already cloned the listener `Arc` from the registry
+        // could still enqueue into the dead listener's queue and return
+        // success. The state lock serializes this transition against
+        // the enqueue-time state check in `dispatch_unix_stream`
+        // Connect — whichever takes the lock first wins, and a connect
+        // that enqueued first raced a live listener. The registry locks
+        // are released before this lock is taken, so the
+        // LISTENERS→state order the connect path uses is preserved and
+        // no new lock order is introduced. The pending queue drops with
+        // the old state. Idempotent: a second release finds the dead
+        // state (the `Reg::None` path above) and skips this.
+        let is_listener = matches!(&*self.state.lock(), SocketState::UnixListener { .. });
+        if is_listener {
+            *self.state.lock() = SocketState::UnixListenerClosed;
+        }
     }
 }
 
@@ -4908,6 +4934,9 @@ impl SocketFile {
                 self.inet_dgram_poll_bits(false)
             }
             SocketState::Fresh | SocketState::UnixBound { .. } => 0,
+            // A listener whose last descriptor closed is never ready:
+            // its queue is gone and no fd can accept from it (#1103).
+            SocketState::UnixListenerClosed => 0,
             // An AF_INET listener is accept-ready (POLL_IN) when its
             // loopback `pending` queue OR — for a wired (off-box) listen
             // — the kernel-stack accept-queue has a completed connection.
@@ -9239,7 +9268,7 @@ impl SocketFile {
         SocketOpResult::Err(SockError::InvalidArg)
     }
 
-    /// Test-only staging seam for the #1995 ghost-connect window
+    /// Test-only staging seam for the #1103 (unix) and #1995 (inet) ghost-connect windows
     /// (kernel-test builds only; compiled out of production kernels).
     /// A `connect()` holds a cloned listener `Arc` between the registry
     /// lookup and the enqueue-time state check, and no single-threaded
@@ -9247,14 +9276,15 @@ impl SocketFile {
     /// window could only be observed, never pinned. An armed hook runs
     /// at exactly that point, after the lookup and before any state is
     /// touched, with the cloned listener. The regression test arms it
-    /// with [`__test_unregister_inet_listener`], which runs the
+    /// with [`__test_unregister_listener`] (unix) or
+    /// [`__test_unregister_inet_listener`] (inet/inet6), which runs the
     /// listener's last-close teardown (`unregister()`) mid-connect.
     /// The hook is copied out of the lock before it is called, so it
     /// never runs while the seam lock is held. The AF_INET6 half is
     /// identical in shape (same `listening` flag, same enqueue guard).
-    /// (Same one-liner as #1993's `__test_unregister_listener`, kept
-    /// under an inet-specific name so the two parallel lanes do not
-    /// collide; the two can be unified once both have landed.)
+    /// (The unix and inet seams are parallel one-liners under
+    /// family-specific names so the two lanes do not collide; the two
+    /// can be unified once both have landed.)
     #[cfg(feature = "kernel-test")]
     pub(crate) fn __test_unregister_inet_listener(listener: &SocketFile) {
         listener.unregister();
@@ -9278,6 +9308,23 @@ impl SocketFile {
     #[cfg(feature = "kernel-test")]
     pub(crate) fn __test_disarm_inet6_connect_pre_enqueue_hook() {
         *INET6_CONNECT_PRE_ENQUEUE_HOOK.lock() = None;
+    }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_arm_unix_connect_pre_enqueue_hook(hook: fn(&SocketFile)) {
+        *UNIX_CONNECT_PRE_ENQUEUE_HOOK.lock() = Some(hook);
+    }
+
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_disarm_unix_connect_pre_enqueue_hook() {
+        *UNIX_CONNECT_PRE_ENQUEUE_HOOK.lock() = None;
+    }
+
+    /// Canonical seam hook for the #1103 regression: run the listener's
+    /// last-close teardown on the listener a `connect()` just cloned.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_unregister_listener(listener: &SocketFile) {
+        listener.unregister();
     }
 
     fn dispatch_unix_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
@@ -9488,6 +9535,19 @@ impl SocketFile {
                         };
                     }
                 };
+                // #1103 staging seam (kernel-test only): an armed hook runs
+                // here, after the registry lookup cloned the listener `Arc`
+                // and before the enqueue-time state check — the exact point
+                // where a racing last-close can interleave. The hook is
+                // copied out of the lock before it is called, so it never
+                // runs while the seam lock is held.
+                #[cfg(feature = "kernel-test")]
+                {
+                    let hook = *UNIX_CONNECT_PRE_ENQUEUE_HOOK.lock();
+                    if let Some(hook) = hook {
+                        hook(&listener);
+                    }
+                }
                 // Reject an already-connected (or otherwise non-connectable) fd
                 // BEFORE minting/queuing any server endpoint. The old order
                 // pushed server_end onto the listener's pending queue and only
@@ -12396,6 +12456,15 @@ type Inet4Map = BTreeMap<(u64, u32, u16), Arc<SocketFile>>;
 type Inet6Map = BTreeMap<(u64, [u8; 16], u16), Arc<SocketFile>>;
 
 static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
+    IrqSafeSpinLock::new(None);
+
+/// Test-only staging seam for the #1103 ghost-connect window
+/// (kernel-test builds only; compiled out of production kernels).
+/// Holds the hook [`SocketFile::__test_arm_unix_connect_pre_enqueue_hook`]
+/// installs, invoked by `dispatch_unix_stream` Connect after the
+/// registry lookup and before the enqueue-time state check.
+#[cfg(feature = "kernel-test")]
+static UNIX_CONNECT_PRE_ENQUEUE_HOOK: IrqSafeSpinLock<Option<fn(&SocketFile)>> =
     IrqSafeSpinLock::new(None);
 
 /// `unix-latency-trace` starved-accept attribution sweep, called from the
