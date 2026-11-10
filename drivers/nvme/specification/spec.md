@@ -82,11 +82,37 @@ multipath / fabrics (defer).
   not identity); a mismatch stops the foreign device again and returns
   `NvmeError::IdentityChanged`, and a changed namespace set on the same
   controller is reported as `RecoveryReport::namespaces_changed` for
-  re-publication. The block entry points recover lazily: the first
-  submit / flush that finds the controller dead runs the recovery
-  under the slot's request gate before proceeding (the timed-out
-  request itself is never replayed). A controller that cannot be shown
-  stopped stays dead and I/O keeps failing. `remove_controller` is also
+  re-publication. A controller that cannot be shown stopped stays dead
+  and I/O keeps failing; the first submit / flush that finds a
+  controller dead tries the recovery again before proceeding.
+- **Command timeout → reset → replay** (Linux `nvme_timeout`,
+  `nvme_reset_work`, `nvme_retry_req`). Every I/O-queue command — Read,
+  Write, Flush, Dataset Management, Write Zeroes — has `IO_TIMEOUT_MS` =
+  30 s (Linux `nvme_io_timeout`); admin commands keep 5 s and are never
+  replayed, so a broken controller still fails its probe in seconds.
+  When the budget runs out the CQ is looked at once more before the
+  command is declared lost (Linux `nvme_poll_irqdisable`, "timeout,
+  completion polled"; counted by `late_completions()`). A lost command
+  marks the controller dead, and the sync block entry points
+  (`NvmeBlockSync` / `NvmeNamespaceBlock` read / write / write_fua /
+  flush / trim, `NvmeBlockDevice` submit / flush / discard) then
+  **reset the controller at the timeout site and replay the request**
+  (`run_with_replay`), under the request gate held from the first
+  attempt through the reset to the last replay, so no other command can
+  run in between. The replay budget is `IO_MAX_RETRIES` = 5 (Linux
+  `nvme_max_retries`) *consecutive timeouts on the controller* — reset
+  by any completed command — so one request is attempted at most six
+  times, and a controller that stopped answering altogether costs later
+  requests one attempt each. The request fails (`CompletionTimeout` →
+  `BlockIoError::DriverError` / `BlockError::IOError`) when the budget
+  is spent, the reset fails, the namespace set changed across the reset
+  (re-published, not replayed: the request's geometry is stale), or the
+  final shutdown has begun (no reset then). Each replay restarts the
+  request at its first block and re-stages every chunk from the caller's
+  data; all five request kinds are idempotent under repetition with
+  nothing in between. Deviation from Linux: no Abort command is sent
+  first — the first expiry resets. `io_replays()` counts replays.
+  `remove_controller` is also
   the driver's bus remove hook (bus §9.5): a `Detach` event for its
   function withdraws its block devices and node and disables it.
 - **Namespace scan** (`imp::ns`, Linux `nvme_scan_work`): Active Namespace List
@@ -109,8 +135,9 @@ multipath / fabrics (defer).
   UUID / PARTUUID or `DiskIdentity`.
 - **Flush / FUA / shutdown** (`imp::shutdown`). `IdentifyController::{vwc,
   rtd3e}`; `Controller::has_volatile_write_cache()`, `flush_nsid(nsid)` (I/O
-  opcode 0x00 when VWC bit 0 is set, else a no-op success; 30 s budget, a
-  timeout marks the controller dead), FUA = Write CDW12 bit 30 (native;
+  opcode 0x00 when VWC bit 0 is set, else a no-op success; the 30 s I/O
+  budget, a timeout marks the controller dead and the block entry points
+  reset + replay), FUA = Write CDW12 bit 30 (native;
   `capabilities().fua = true`), `Controller::shutdown()` (flush every
   namespace, then CC.SHN = normal and wait for CSTS.SHST = complete within
   `clamp(RTD3E, 5 s, 60 s)`, Linux `nvme_disable_ctrl(shutdown)`; I/O refused
@@ -163,8 +190,9 @@ multipath / fabrics (defer).
   vector + installed handler each. Production submissions
   (`nvm_io_dma`, `nvm_io_multipage`, hence every block-layer read /
   write) route through `submit_sqe_irq` — IRQ-driven wait on the
-  queue's vector `fire_count` with a CQE-phase fallback, 5 s budget,
-  CID-matched drain — whenever the picked queue has a vector; the polled
+  queue's vector `fire_count` with a CQE-phase fallback, 30 s budget
+  (`IO_TIMEOUT_MS`), CID-matched drain, one last CQ look at expiry —
+  whenever the picked queue has a vector; the polled
   `Queue::submit` stays the fallback for vector-less boots.
   `submit_io_irq_async` is the async form, composed from
   `submit_io_begin` (SQE + doorbell, wait future constructed
@@ -208,6 +236,12 @@ multipath / fabrics (defer).
 - No DMA buffer a command may still reference is freed: I/O uses persistent
   scratch and PRP-list pages, a timed-out I/O marks the controller dead, and a
   timed-out admin passthrough leaks its pages.
+- A timed-out request is replayed only after the controller was confirmed
+  stopped (CC.EN=0, CSTS.RDY=0) and its queues rebuilt, with the request gate
+  held throughout, and only if the namespace set is unchanged. Replays are
+  bounded (`IO_MAX_RETRIES` consecutive timeouts per controller); nothing but
+  the idempotent block requests (read, write, flush, deallocate, write zeroes)
+  is ever replayed — no admin command, no passthrough.
 - A completion cannot be processed before its submission entry is valid
   (paired ordering).
 - The admin queue is never used on the I/O fast path.
@@ -394,7 +428,9 @@ head:
   through `try_take_io_cqe`: only the CQE carrying the
   submitted CID is accepted; strays are consumed and dropped
   and the wait repeats within the command deadline. The sync
-  path loops inside `submit_sqe_irq` (5 s budget); the async
+  path loops inside `submit_sqe_irq` (30 s budget, then
+  `reap_io_cqe`: one non-blocking drain of up to `depth` head
+  entries before the command is declared lost); the async
   form is `submit_io_begin` (which returns the CID) + await +
   `submit_io_finish`, whose CID-aware drain re-checks the head
   after the await — the lost-wakeup window the old single-shot

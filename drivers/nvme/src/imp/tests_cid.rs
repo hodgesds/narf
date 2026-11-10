@@ -555,3 +555,52 @@ fn smoke_nvme_timeout_is_counted() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_timeout_is_counted);
+
+fn smoke_nvme_polled_last_look_finds_completion() -> TestResult {
+    // The polled matcher looks at the CQ once more after its budget is
+    // spent, and that look walks past a stray: with the wait made blind
+    // (the late-completion hook) and the CQ holding a stray followed by
+    // our completion, the command must still succeed — counted as a late
+    // completion, not as a timeout — and the stray must be counted.
+    let Some(mut fake) = fake_cid_controller() else {
+        return TestResult::Fail("fake CID controller setup failed");
+    };
+    let ctrl = &mut fake.ctrl;
+    // SAFETY: `cq_io` is a live 4 KiB coherent page; slots 0..1.
+    unsafe {
+        stage_cqe(fake.cq_io, 0, 9, 1, IO_STRAY_SENTINEL);
+        stage_cqe(fake.cq_io, 1, 0, 1, OWN_SENTINEL);
+    }
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = IoOpcode::Read as u32;
+    sqe.nsid = 1;
+    sqe.prp1 = fake.id_dma;
+    let (late0, timeouts0, strays0) = (
+        super::late_completions(),
+        super::command_timeouts(),
+        super::stray_cqe_drops(),
+    );
+    let (Some(io), Some(bar0)) = (ctrl.io_queues.first_mut(), ctrl.bar0_region.as_ref()) else {
+        return TestResult::Fail("fake controller has no I/O queue / BAR0");
+    };
+    super::IO_LATE_FOR_TEST.store(1, core::sync::atomic::Ordering::Release);
+    // SAFETY: fake I/O queue + RAM-backed BAR; no device is involved.
+    let r = unsafe { io.submit_raw_ms(bar0, sqe, 20, None) };
+    let taken = super::IO_LATE_FOR_TEST.swap(0, core::sync::atomic::Ordering::AcqRel) == 0;
+    if !taken {
+        return TestResult::Fail("the submit never took the fault: nothing was tested");
+    }
+    match r {
+        Ok(cqe) if cqe.cmd_specific == OWN_SENTINEL && cqe.cid == 0 => {}
+        Ok(_) => return TestResult::Fail("the last look returned the wrong completion"),
+        Err(_) => return TestResult::Fail("a completion sitting in the CQ was declared lost"),
+    }
+    if super::late_completions() != late0 + 1 || super::command_timeouts() != timeouts0 {
+        return TestResult::Fail("late completion not counted, or counted as a timeout");
+    }
+    if super::stray_cqe_drops() != strays0 + 1 {
+        return TestResult::Fail("the stray ahead of the late completion was not counted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_polled_last_look_finds_completion);

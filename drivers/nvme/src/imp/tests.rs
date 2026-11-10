@@ -2549,9 +2549,17 @@ fn smoke_nvme_controller_slot_is_stable() -> TestResult {
     // And it must survive ordinary traffic through the unlocked path.
     // The I/O result itself is irrelevant here (earlier smokes may
     // have reset the device's queues); only the address matters.
+    //
+    // When an earlier smoke did orphan the installed queues, this read
+    // is a genuine command timeout followed by the reset + replay — which
+    // must not move the slot either. Only the wait is shortened: the
+    // production 30 s budget would be spent in full on a completion that
+    // cannot come.
     use narf_block::BlockDeviceSync;
     let mut sector = [0u8; 512];
+    super::IO_TIMEOUT_MS_FOR_TEST.store(500, core::sync::atomic::Ordering::Release);
     let _ = nvme::NvmeBlockSync.read(0, 1, &mut sector);
+    super::IO_TIMEOUT_MS_FOR_TEST.store(0, core::sync::atomic::Ordering::Release);
     match nvme::dbg_slot_addr() {
         Some(a) if a == before => TestResult::Pass,
         Some(_) => TestResult::Fail("controller slot moved across a read"),
