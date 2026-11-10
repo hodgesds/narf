@@ -1045,3 +1045,64 @@ fn slot_matches_frame(ctrl: &super::AqcNic, slot: usize, frame: &[u8]) -> bool {
     }
     true
 }
+
+fn smoke_aqc113_rxd_wb_sample_never_mixes_occupants() -> TestResult {
+    // An armed RX slot holds the read format (buffer address, zero header
+    // address) until the NIC overwrites it with the write-back, and the
+    // host may be sampling the slot at that moment. Model the NIC posting
+    // the WHOLE write-back after each possible number of host loads.
+    // Whatever the interleaving, a sample that reports DD must be the
+    // write-back in full: with the armed slot's address bits read as
+    // `type` under a fresh DD the frame is dropped or its checksum
+    // verdict is wrong.
+    //
+    // `hw_atl_rxd_wb_s`: type at bytes 0..4, rss_hash 4..8, status 8..10
+    // (DD bit 0, EOP bit 1), pkt_len 10..12, next_desc_ptr 12..14, vlan
+    // 14..16.
+    let old = [0x2345_6000u32, 0x0000_0001, 0, 0];
+    let new = [
+        0x0008_0045u32,
+        0x5EED_CAFE,
+        0x0003 | (0x05EA << 16),
+        0x0007 | (0x0123 << 16),
+    ];
+
+    for post_after in 0..=4usize {
+        let slot = core::cell::Cell::new(old);
+        let loads = core::cell::Cell::new(0usize);
+        let sampled = RxdWb::sample(|dword| {
+            if loads.get() == post_after {
+                slot.set(new);
+            }
+            loads.set(loads.get() + 1);
+            slot.get()[dword]
+        });
+        let Some(wb) = sampled else {
+            // Not completed yet: the driver polls again.
+            if post_after == 0 {
+                return TestResult::Fail("a write-back posted before the sample read as armed");
+            }
+            if loads.get() != 1 {
+                return TestResult::Fail("an incomplete slot was read past its status dword");
+            }
+            continue;
+        };
+        if loads.get() != 4 {
+            return TestResult::Fail("a completed sample is not exactly four dword loads");
+        }
+        if wb.status != 0x0003 || wb.pkt_len != 0x05EA {
+            return TestResult::Fail("fresh DD sampled with a stale packet length");
+        }
+        if wb.type_ != 0x0008_0045 || wb.rss_hash != 0x5EED_CAFE {
+            return TestResult::Fail("fresh DD sampled with the armed slot's address as type");
+        }
+        if wb.next_desc_ptr != 0x0007 || wb.vlan != 0x0123 {
+            return TestResult::Fail("fresh DD sampled with a stale VLAN dword");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/aqc113",
+    smoke_aqc113_rxd_wb_sample_never_mixes_occupants
+);

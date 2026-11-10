@@ -696,6 +696,47 @@ pub struct RxdWb {
 }
 const _: () = assert!(core::mem::size_of::<RxdWb>() == 16);
 
+impl RxdWb {
+    /// Sample an RX ring slot the NIC may be completing right now.
+    /// `dword(i)` reads little-endian dword `i` of the 16-byte slot.
+    ///
+    /// The NIC writes the descriptor back while the host polls it, so a
+    /// sample must never pair a fresh DD with fields of the slot's
+    /// previous contents. Dword 2 carries `status` (DD, EOP, RX status)
+    /// and `pkt_len`: it is taken first and as ONE load, so a set DD
+    /// always comes with the length written with it. `type`, the RSS
+    /// hash and the VLAN dword are loaded only after DD was seen. `None`
+    /// means "not completed": nothing else of the slot was read. Linux
+    /// `hw_atl_b0_hw_ring_rx_receive` tests `rxd_wb->status & 1` before
+    /// it reads anything else.
+    ///
+    /// A whole-struct `read_volatile` gives no such order: the compiler
+    /// lowers it to separate field loads in an order of its choosing,
+    /// and loading `type_` before `status` shows the armed slot's buffer
+    /// address bits as packet type / DMA error / checksum-enable under a
+    /// DD posted between the two loads.
+    #[inline]
+    pub(crate) fn sample(mut dword: impl FnMut(usize) -> u32) -> Option<Self> {
+        let status_len = dword(2);
+        if status_len as u16 & RXD_WB_DD == 0 {
+            return None;
+        }
+        // Pair the NIC's DD write with the loads that follow it.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        let type_ = dword(0);
+        let rss_hash = dword(1);
+        let next_vlan = dword(3);
+        Some(Self {
+            type_,
+            rss_hash,
+            status: status_len as u16,
+            pkt_len: (status_len >> 16) as u16,
+            next_desc_ptr: next_vlan as u16,
+            vlan: (next_vlan >> 16) as u16,
+        })
+    }
+}
+
 // TXD `ctl` bits (`hw_atl_b0_internal.h`).
 pub(crate) const TXD_CTL_DESC_TYPE_TXD: u32 = 0x0000_0001;
 pub(crate) const TXD_CTL_BLEN: u32 = 0x000F_FFF0;
@@ -1508,13 +1549,16 @@ impl AqcNic {
         let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
-        // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
-        let wb = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxdWb>())
-        };
-        if wb.status & RXD_WB_DD == 0 {
-            return None;
-        }
+        let wb = RxdWb::sample(|dword| {
+            // SAFETY: identity-mapped DMA ring; `slot < RING_LEN` and
+            // `dword < 4`, so the aligned dword lies inside descriptor
+            // `slot`.
+            u32::from_le(unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(desc_addr + dword as u64 * 4).kernel_ptr::<u32>(),
+                )
+            })
+        })?;
         let decoded = decode_rx_wb(&wb, RX_BUF_LEN as u32);
         let buf_phys = self.rx_pool[slot].dma_addr().raw();
 
