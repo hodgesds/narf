@@ -875,19 +875,15 @@ impl Mlx5Hca {
             .ok_or(Mlx5Error::UnknownQp)?;
         let cap = 1u32 << e.params.log_eq_size;
         let off = ((e.consumer % cap) as usize) * eqe::EQE_LEN;
-        let mut bytes = [0u8; eqe::EQE_LEN];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            // SAFETY: `phys` is the identity-mapped DMA EQ buffer; `off` is the
+        // Owner byte first, the rest only once software owns the entry.
+        let Some(bytes) = eqe::sample(|i| {
+            // SAFETY: `pages[0]` is the coherent DMA EQ buffer; `off` is the
             // in-range entry offset and `i < eqe::EQE_LEN`, so the read stays
             // within the EQE.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe {
-                core::ptr::read_volatile(e.pages[0].cpu_ptr_at::<u8>(off as u64 + i as u64))
-            };
-        }
-        if eqe::is_hw_owned(&bytes) {
+            unsafe { core::ptr::read_volatile(e.pages[0].cpu_ptr_at::<u8>(off as u64 + i as u64)) }
+        }) else {
             return Ok(None);
-        }
+        };
         let view = eqe::decode_eqe(&bytes);
         e.consumer = e.consumer.wrapping_add(1);
         Ok(Some(view))
@@ -1132,18 +1128,15 @@ impl Mlx5Hca {
             .ok_or(Mlx5Error::UnknownCq)?;
         let cq_capacity = 1u32 << c.params.log_cq_size;
         let off = ring::cq_offset_of(c.consumer, cq_capacity);
-        let mut bytes = [0u8; cqe::CQE_LEN];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b =
-                // SAFETY: `cq_phys` is the identity-mapped DMA CQ buffer; `off` is
-                // the in-range entry offset and `i < cqe::CQE_LEN`, so the read
-                // stays within the CQE.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe { core::ptr::read_volatile(c.pages[0].cpu_ptr_at::<u8>(off as u64 + i as u64)) };
-        }
-        if cqe::is_hw_owned(&bytes) {
+        // Owner byte first, the rest only once software owns the entry.
+        let Some(bytes) = cqe::sample(|i| {
+            // SAFETY: `pages[0]` is the coherent DMA CQ buffer; `off` is the
+            // in-range entry offset and `i < cqe::CQE_LEN`, so the read stays
+            // within the CQE.
+            unsafe { core::ptr::read_volatile(c.pages[0].cpu_ptr_at::<u8>(off as u64 + i as u64)) }
+        }) else {
             return Ok(None);
-        }
+        };
         let view = cqe::decode_cqe(&bytes);
         c.consumer = c.consumer.wrapping_add(1);
         Ok(Some(view))

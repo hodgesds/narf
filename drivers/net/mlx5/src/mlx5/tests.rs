@@ -2151,3 +2151,86 @@ fn smoke_mlx5_destroy_opcodes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_destroy_opcodes);
+
+// ── CQE / EQE sampling order ────────────────────────────────────────
+
+/// Run `sample` against a 64-byte slot holding `old` that the HCA
+/// overwrites with the WHOLE of `new` after each possible number of host
+/// loads. Whatever the interleaving, a software-owned sample must be
+/// `new` in full; a hardware-owned slot must not be read past its owner
+/// byte.
+fn entry_sample_never_mixes(
+    old: [u8; 64],
+    new: [u8; 64],
+    sample: impl Fn(&mut dyn FnMut(usize) -> u8) -> Option<[u8; 64]>,
+) -> Result<(), &'static str> {
+    for post_after in 0..=64usize {
+        let slot = core::cell::Cell::new(old);
+        let loads = core::cell::Cell::new(0usize);
+        let sampled = sample(&mut |i| {
+            if loads.get() == post_after {
+                slot.set(new);
+            }
+            loads.set(loads.get() + 1);
+            slot.get()[i]
+        });
+        let Some(got) = sampled else {
+            // Still hardware-owned: the driver polls again.
+            if post_after == 0 {
+                return Err("an entry posted before the sample read as hardware-owned");
+            }
+            if loads.get() != 1 {
+                return Err("a hardware-owned slot was read past its owner byte");
+            }
+            continue;
+        };
+        if loads.get() != 64 {
+            return Err("a software-owned sample is not exactly 64 byte loads");
+        }
+        if got != new {
+            return Err("software-owned entry sampled with the previous occupant's bytes");
+        }
+    }
+    Ok(())
+}
+
+fn smoke_mlx5_cqe_sample_never_mixes_occupants() -> TestResult {
+    // PRM CQE: byte_count at 0x14, status 0x37, wqe_counter 0x38, owner
+    // bit 0 of byte 0x3F. The slot's previous occupant is still marked
+    // hardware-owned when the HCA posts into it.
+    let mut old = [0x11u8; 64];
+    old[0x3F] = 0x01; // hardware-owned
+    let mut new = [0u8; 64];
+    for (i, b) in new.iter_mut().enumerate() {
+        *b = 0x80 | i as u8;
+    }
+    new[0x3F] = 0x20; // software-owned, opcode nibble set
+    match entry_sample_never_mixes(old, new, |byte| super::cqe::sample(byte)) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/net/mlx5",
+    smoke_mlx5_cqe_sample_never_mixes_occupants
+);
+
+fn smoke_mlx5_eqe_sample_never_mixes_occupants() -> TestResult {
+    // PRM EQE: event type at 0x01, sub-type 0x03, CQN 0x38, owner bit 0
+    // of byte 0x3F.
+    let mut old = [0x22u8; 64];
+    old[0x3F] = 0x01; // hardware-owned
+    let mut new = [0u8; 64];
+    for (i, b) in new.iter_mut().enumerate() {
+        *b = 0x40 | i as u8;
+    }
+    new[0x3F] = 0x00; // software-owned
+    match entry_sample_never_mixes(old, new, |byte| super::eqe::sample(byte)) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/net/mlx5",
+    smoke_mlx5_eqe_sample_never_mixes_occupants
+);
