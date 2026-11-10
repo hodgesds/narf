@@ -1715,8 +1715,8 @@ impl narf_power::device_pm::DevicePmOps for BtUsbPm {
 /// BT device whose recorded hub context matches the port the
 /// supervisor's idle-suspend pass is about to gate.
 pub fn register() {
-    let _ = crate::class_registry::register_suspend_hook("btusb", |slot, port| {
-        alloc::boxed::Box::pin(suspend_btusb_port(slot, port))
+    let _ = crate::class_registry::register_suspend_hook("btusb", |controller, slot, port| {
+        alloc::boxed::Box::pin(suspend_btusb_port(controller, slot, port))
     });
 }
 
@@ -1742,13 +1742,17 @@ pub fn register() {
 ///   so a device that cannot arm simply stays awake.
 /// - Armed → park the HCI pump ([`narf_bluetooth::pm`]) and record
 ///   the arming, then `SuspendOutcome::Parked`.
-async fn suspend_btusb_port(hub_slot: u8, port: u8) -> crate::class_registry::SuspendOutcome {
+async fn suspend_btusb_port(
+    controller: u8,
+    hub_slot: u8,
+    port: u8,
+) -> crate::class_registry::SuspendOutcome {
     use crate::class_registry::SuspendOutcome;
     // Read what arming needs, then release before any await.
     let target = {
         let g = BTUSB_DEVICES.lock();
         g.iter().find_map(|d| {
-            if d.hub_port == Some((hub_slot, port)) {
+            if d.controller == controller && d.hub_port == Some((hub_slot, port)) {
                 Some((d.slot_id, d.controller, d.hci_index))
             } else {
                 None
@@ -1788,7 +1792,10 @@ async fn suspend_btusb_port(hub_slot: u8, port: u8) -> crate::class_registry::Su
     narf_bluetooth::pm::park_autosuspend(hci_index);
     let g = BTUSB_DEVICES.lock();
     match g.iter().find(|d| {
-        d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id && d.hci_index == hci_index
+        d.controller == controller
+            && d.hub_port == Some((hub_slot, port))
+            && d.slot_id == slot_id
+            && d.hci_index == hci_index
     }) {
         Some(rec) => {
             rec.wakeup_armed.store(true, Ordering::Release);
@@ -1809,7 +1816,8 @@ pub async fn resume_btusb_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port:
         let g = BTUSB_DEVICES.lock();
         g.iter()
             .find(|d| {
-                d.hub_port == Some((hub_slot, port))
+                d.controller == xhci_dev.id()
+                    && d.hub_port == Some((hub_slot, port))
                     && narf_bluetooth::pm::is_runtime_suspended(d.hci_index)
             })
             .map(|d| d.hci_index)
@@ -1828,10 +1836,12 @@ pub async fn resume_btusb_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port:
 /// Hub ports holding a runtime-suspended btusb device. Mirrors
 /// `hid::hub_ports`, filtered to parked devices: the wake-watch
 /// step's candidate list.
-pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
+pub fn suspended_hub_ports(controller: u8) -> Vec<(u8, u8)> {
     let g = BTUSB_DEVICES.lock();
     g.iter()
-        .filter(|d| narf_bluetooth::pm::is_runtime_suspended(d.hci_index))
+        .filter(|d| {
+            d.controller == controller && narf_bluetooth::pm::is_runtime_suspended(d.hci_index)
+        })
         .filter_map(|d| d.hub_port)
         .collect()
 }
@@ -1845,7 +1855,7 @@ pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
 /// Called from the supervisor's Phase 7, next to
 /// `wake_suspended_nic_ports`.
 pub async fn wake_suspended_ports(xhci_dev: &crate::xhci::Xhci) {
-    for (hub_slot, port) in suspended_hub_ports() {
+    for (hub_slot, port) in suspended_hub_ports(xhci_dev.id()) {
         if crate::attach::hub_port_suspend_change(xhci_dev, hub_slot, port).await == Some(true) {
             let _ = resume_btusb_port(xhci_dev, hub_slot, port).await;
         }
@@ -2130,7 +2140,7 @@ mod tests {
     fn smoke_btusb_suspend_hook_not_mine() -> TestResult {
         use crate::class_registry::SuspendOutcome;
         reset_all();
-        let out = narf_scheduler::block_on(suspend_btusb_port(0xEE, 7));
+        let out = narf_scheduler::block_on(suspend_btusb_port(0, 0xEE, 7));
         reset_all();
         if out != SuspendOutcome::NotMine {
             return TestResult::Fail("hook claimed a port with no BT device");
@@ -2148,7 +2158,7 @@ mod tests {
         // Idle timeout 0 = "never autosuspend": the hook vetoes
         // gating instead of parking.
         narf_bluetooth::pm::set_idle_timeout_ms(0, 0);
-        let out = narf_scheduler::block_on(suspend_btusb_port(0xEE, 7));
+        let out = narf_scheduler::block_on(suspend_btusb_port(0, 0xEE, 7));
         let still_unparked = !narf_bluetooth::pm::is_runtime_suspended(0);
         reset_all();
         if out != SuspendOutcome::ParkFailed {
@@ -2173,7 +2183,7 @@ mod tests {
         // Default idle timeout (30 s) + already parked: idempotent
         // re-park with no arming attempt (no xHCI exists here).
         narf_bluetooth::pm::park_autosuspend(0);
-        let out = narf_scheduler::block_on(suspend_btusb_port(0xEE, 7));
+        let out = narf_scheduler::block_on(suspend_btusb_port(0, 0xEE, 7));
         let still_parked = narf_bluetooth::pm::is_runtime_suspended(0);
         reset_all();
         if out != SuspendOutcome::Parked {
@@ -2194,10 +2204,20 @@ mod tests {
         BTUSB_DEVICES
             .lock()
             .push(fake_device(4, 0, Some((0xEE, 8)), 1));
-        // Only hci0 is parked; hci1 stays awake.
+        let other = fake_device(3, 1, Some((0xEE, 7)), 2);
+        BTUSB_DEVICES.lock().push(other);
+        narf_bluetooth::pm::park_autosuspend(2);
+        // hci0 and hci2 share hub/slot numbers on different controllers.
         narf_bluetooth::pm::park_autosuspend(0);
-        let ports = suspended_hub_ports();
+        let ports = suspended_hub_ports(0);
+        let other_ports = suspended_hub_ports(1);
+        let unrelated = narf_scheduler::block_on(suspend_btusb_port(2, 0xEE, 7));
         reset_all();
+        if other_ports != alloc::vec![(0xEE, 7)]
+            || unrelated != crate::class_registry::SuspendOutcome::NotMine
+        {
+            return TestResult::Fail("Bluetooth suspend selection crossed USB controllers");
+        }
         if ports != alloc::vec![(0xEE, 7)] {
             return TestResult::Fail("wake-watch list missed the parked port or kept the live one");
         }

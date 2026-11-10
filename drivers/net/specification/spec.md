@@ -71,7 +71,7 @@ depend on it — and alongside it each family's probe registers with
 (`publish_netdev`, or `publish_netdev_with_context` for multi-instance
 families — i40e, and since issue #795 e1000, igb, ixgbe, r8169,
 forcedeth, and atheros, and since issue #1631 rtl8125, rtl8126,
-rtl8127, rtl8139, and tg3 — whose send path resolves its instance by
+rtl8127, rtl8139, tg3, and vmxnet3 — whose send path resolves its instance by
 cookie). Each multi-instance family retains its probed controllers in
 a `CONTROLLERS` vec (never shrunk, so cookies stay stable across
 detaches), exposes indexed `controller(index)` /
@@ -83,7 +83,14 @@ yet — its TX/RX datapath is still a stub — so it has no cookie send
 path.) The iface
 registration allocates a dynamic `eth%d` name from the central allocator;
 hardcoded frame-ring names (`eth3`, `eth4`, per-chip labels) survive only as
-pre-publication fallbacks. RX fan-out follows e1000's `dispatch_rx_frame`
+pre-publication fallbacks. VMXNET3's `controller(index)` and `instance_count()`
+address all instances; its existing `probed_controller()`, `with_controller(f)`
+and `vmxnet3_ifname()` remain first-device diagnostic helpers. Each
+`Vmxnet3Iface(Arc<Vmxnet3Nic>)` exposes that device's own rings, live carrier
+and MAC. RX pumps, synchronous drains and link updates use the instance's
+name; TX uses its stable registry cookie.
+
+RX fan-out follows e1000's `dispatch_rx_frame`
 contract, generalised in `publish::dispatch_rx`: each received frame is
 dispatched to the kernel stack in place via `iface::on_rx_frame_from` — a
 path whose XDP program may rewrite or resize the frame and whose classifier
@@ -254,8 +261,12 @@ interfaces, clocks, PM/AER hooks and handlers; vectors and allocations release
 only after successful drain. The `.ko` now shares the reset/PHY/queue protocol
 and provides an advanced-descriptor copy datapath through the device C ABI,
 with an exit drain and explicit DMA retention on failed teardown. Its current
-C transmit callback has one instance per loaded module; the built-in path has
-full per-function state. Module control/offload parity is not claimed.
+C transmit callback receives its device token through
+`narf_netif_register_with_context`; both e1000 and IGC modules keep separate
+BAR/DMA handles, ring cursors, interface indices and TX serialization per
+function. Each module image retains up to 32 states without an allocator.
+Failed probes consume a state until unload; exhaustion returns `ENOSPC`
+without changing an existing device. Module control/offload parity is not claimed.
 
 Physical acceptance remains open on the host I225-V (`0000:0e:00.0`,
 `8086:15f3`, revision 01): probe/IRQ routing; negotiated speeds and replug;

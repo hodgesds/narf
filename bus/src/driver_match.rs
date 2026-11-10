@@ -529,8 +529,18 @@ pub type ModuleCallbackCallGate = fn(u64, ModuleCallbackFn, u64) -> i32;
 /// duration of the call and names kernel-owned, read-only bytes.
 pub type ModuleTxFn = extern "C" fn(frame: *const u8, len: usize) -> i32;
 
+/// Transmit callback that receives the device token it was registered against.
+pub type ModuleTxCtxFn = extern "C" fn(dev_token: u64, frame: *const u8, len: usize) -> i32;
+
+/// Legacy and device-aware callbacks share the same lifecycle/domain gate.
+#[derive(Clone, Copy, Debug)]
+pub enum ModuleTxCallback {
+    Legacy(ModuleTxFn),
+    WithDevice(ModuleTxCtxFn),
+}
+
 /// Domain/lifecycle gate for network-stack transmit callbacks.
-pub type ModuleTxCallGate = fn(u64, ModuleTxFn, &[u8]) -> i32;
+pub type ModuleTxCallGate = fn(u64, ModuleTxCallback, u64, &[u8]) -> i32;
 
 static MODULE_PROBE_CALL_GATE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
@@ -578,7 +588,7 @@ fn call_module_callback(owner: u64, callback: ModuleCallbackFn, cookie: u64) -> 
     gate(owner, callback, cookie)
 }
 
-fn call_module_tx(owner: u64, callback: ModuleTxFn, frame: &[u8]) -> i32 {
+fn call_module_tx(owner: u64, callback: ModuleTxCallback, token: u64, frame: &[u8]) -> i32 {
     let gate = MODULE_TX_CALL_GATE.load(core::sync::atomic::Ordering::Acquire);
     if gate == 0 {
         return -19;
@@ -586,7 +596,7 @@ fn call_module_tx(owner: u64, callback: ModuleTxFn, frame: &[u8]) -> i32 {
     // SAFETY: only `set_module_tx_call_gate` writes this atomic and stores a
     // `ModuleTxCallGate` function address.
     let gate: ModuleTxCallGate = unsafe { core::mem::transmute(gate) };
-    gate(owner, callback, frame)
+    gate(owner, callback, token, frame)
 }
 
 struct ModuleThunk {
@@ -706,7 +716,7 @@ struct ModulePoller {
 struct ModuleNetIface {
     name: alloc::string::String,
     ifindex: u32,
-    tx_callback: ModuleTxFn,
+    tx_callback: ModuleTxCallback,
 }
 
 const MODULE_IRQ_HANDLER_NAME: &str = "module-msix";
@@ -1541,7 +1551,7 @@ fn module_net_tx_bridge(token: u64, frame: &[u8], meta: narf_net::TxMeta) -> Res
     if cap.invoke(DeviceOp(|| ())).is_err() {
         return Err(());
     }
-    let result = call_module_tx(owner, callback, frame);
+    let result = call_module_tx(owner, callback, token, frame);
     if let Some(ctx) = DEVICE_CTXS
         .lock()
         .iter_mut()
@@ -1567,7 +1577,26 @@ pub fn module_netif_register(
     mac: [u8; 6],
     tx_callback: ModuleTxFn,
 ) -> Result<u32, i32> {
-    let cap = {
+    module_netif_register_inner(owner, token, mac, ModuleTxCallback::Legacy(tx_callback))
+}
+
+/// Device-aware variant; the callback receives this context's validated token.
+pub fn module_netif_register_with_context(
+    owner: u64,
+    token: u64,
+    mac: [u8; 6],
+    tx_callback: ModuleTxCtxFn,
+) -> Result<u32, i32> {
+    module_netif_register_inner(owner, token, mac, ModuleTxCallback::WithDevice(tx_callback))
+}
+
+fn module_netif_register_inner(
+    owner: u64,
+    token: u64,
+    mac: [u8; 6],
+    tx_callback: ModuleTxCallback,
+) -> Result<u32, i32> {
+    let (cap, device) = {
         let g = DEVICE_CTXS.lock();
         let Some(ctx) = g
             .iter()
@@ -1578,13 +1607,27 @@ pub fn module_netif_register(
         if ctx.net_iface.is_some() {
             return Err(-16);
         }
-        ctx.cap
+        (ctx.cap, ctx.device)
     };
     if cap.invoke(DeviceOp(|| ())).is_err() {
         return Err(-19);
     }
 
     let name = narf_net::iface::register_with_context("eth%d", mac, token, module_net_tx_bridge);
+    let bus_info = match device.addr {
+        crate::BusAddr::Pcie(address) => alloc::format!("{address:?}"),
+        crate::BusAddr::Mmio(_) => alloc::string::String::new(),
+    };
+    let driver = MODULE_THUNKS
+        .lock()
+        .iter()
+        .find(|thunk| {
+            thunk.owner == owner
+                && thunk.vendor == device.id.vendor
+                && thunk.device == device.id.device
+        })
+        .map_or("module", |thunk| thunk.name);
+    narf_net::iface::set_driver_info(&name, driver, None, bus_info);
     let Some(ifindex) = narf_net::iface::ifindex_of(&name) else {
         let _ = narf_net::iface::unregister(&name);
         return Err(-5);
@@ -1844,6 +1887,21 @@ pub fn __module_netif_count_for_test(owner: u64) -> usize {
         .count()
 }
 
+/// Device tokens and interface indices retained by one module's registrations.
+#[doc(hidden)]
+pub fn __module_netif_instances_for_test(owner: u64) -> Vec<(u64, u32)> {
+    DEVICE_CTXS
+        .lock()
+        .iter()
+        .filter(|ctx| ctx.owner == owner)
+        .filter_map(|ctx| {
+            ctx.net_iface
+                .as_ref()
+                .map(|iface| (ctx.token, iface.ifindex))
+        })
+        .collect()
+}
+
 #[doc(hidden)]
 pub fn __module_netif_stats_for_test(owner: u64) -> (u64, u64, u64) {
     let g = DEVICE_CTXS.lock();
@@ -1900,6 +1958,17 @@ pub fn __module_netif_send_for_test(owner: u64, frame: &[u8]) -> bool {
             .map(|iface| iface.ifindex)
     };
     ifindex.is_some_and(|ifindex| narf_net::iface::send_on_ifindex(ifindex, frame).is_ok())
+}
+
+#[doc(hidden)]
+pub fn __module_netif_send_for_device_for_test(owner: u64, token: u64, frame: &[u8]) -> bool {
+    let ifindex = DEVICE_CTXS
+        .lock()
+        .iter()
+        .find(|ctx| ctx.owner == owner && ctx.token == token)
+        .and_then(|ctx| ctx.net_iface.as_ref())
+        .map(|iface| iface.ifindex);
+    ifindex.is_some_and(|index| narf_net::iface::send_on_ifindex(index, frame).is_ok())
 }
 
 #[doc(hidden)]

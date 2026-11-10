@@ -141,6 +141,7 @@ narf_spawn_poller(dev, cb: usize, cookie: u64) -> i32
 **Stage 4 — netif registration + the e1000.ko proof**
 ```
 narf_netif_register(dev, mac: *const u8 /*6*/, tx_cb: extern "C" fn(frame: *const u8, len: usize) -> i32, out_ifindex: *mut u32) -> i32
+narf_netif_register_with_context(dev, mac: *const u8 /*6*/, tx_cb: extern "C" fn(dev: u64, frame: *const u8, len: usize) -> i32, out_ifindex: *mut u32) -> i32
 narf_netif_rx(dev, ifindex: u32, frame: *mut u8, len: usize) -> i32  // synchronous stack delivery; XDP may rewrite
 ```
 The kernel registers a legacy-stack interface with a permanent in-tree

@@ -696,6 +696,9 @@ pub struct UvcControl {
 /// One bound UVC device — control interface plus its streaming alternates.
 #[derive(Clone, Debug)]
 pub struct UvcDevice {
+    /// Retired entries keep their index so other cameras' in-flight work stays
+    /// tied to the original binding. No operation may use a retired entry.
+    pub detached: bool,
     pub slot_id: u8,
     /// `bInterfaceNumber` of the VideoControl interface.
     pub vc_iface: u8,
@@ -1277,7 +1280,10 @@ pub async fn control_get_with<T: UvcTransport>(
     let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
     let (slot_id, vc_iface, pu_unit_id, ct_unit_id, len) = {
         let devices = UVC_DEVICES.lock();
-        let device = devices.get(idx).ok_or(ERRNO_ENODEV)?;
+        let device = devices
+            .get(idx)
+            .filter(|device| !device.detached)
+            .ok_or(ERRNO_ENODEV)?;
         let entry = device
             .controls
             .iter()
@@ -1323,7 +1329,10 @@ pub async fn control_set_with<T: UvcTransport>(
     let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
     let (slot_id, vc_iface, pu_unit_id, ct_unit_id, len) = {
         let devices = UVC_DEVICES.lock();
-        let device = devices.get(idx).ok_or(ERRNO_ENODEV)?;
+        let device = devices
+            .get(idx)
+            .filter(|device| !device.detached)
+            .ok_or(ERRNO_ENODEV)?;
         let entry = device
             .controls
             .iter()
@@ -1430,6 +1439,7 @@ pub async fn try_bind_video_with_transport<T: UvcTransport>(
     let mut g = UVC_DEVICES.lock();
     let idx = g.len();
     g.push(UvcDevice {
+        detached: false,
         slot_id,
         vc_iface,
         vs_iface,
@@ -1473,7 +1483,10 @@ pub async fn try_bind_video_already_addressed(
     let idx = try_bind_video_with_transport(xhci_dev, slot_id, cfg, hub_port).await?;
     let video_node = {
         let devices = UVC_DEVICES.lock();
-        devices.get(idx).map(|device| device.video_node)
+        devices
+            .get(idx)
+            .filter(|device| !device.detached)
+            .map(|device| device.video_node)
     };
     if let Some(video_node) = video_node {
         narf_drivers_video::devfs_bridge::set_stream_ops(video_node, video_stream_ops());
@@ -1682,7 +1695,10 @@ pub async fn activate_video_stream_with<T: UvcTransport>(
 ) -> Result<UvcStreamingEndpoint, UvcError> {
     let (slot_id, endpoint) = {
         let devices = UVC_DEVICES.lock();
-        let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
+        let device = devices
+            .get(idx)
+            .filter(|device| !device.detached)
+            .ok_or(UvcError::NotVideo)?;
         let vs_iface = device.vs_iface;
         if let Some(active) = device.active_stream {
             let selected = select_video_streaming_endpoint_for_activation(
@@ -1733,7 +1749,10 @@ pub async fn activate_video_stream_with<T: UvcTransport>(
         .map_err(|_| UvcError::SetInterfaceFailed)?;
 
     let mut devices = UVC_DEVICES.lock();
-    let device = devices.get_mut(idx).ok_or(UvcError::NotVideo)?;
+    let device = devices
+        .get_mut(idx)
+        .filter(|device| !device.detached)
+        .ok_or(UvcError::NotVideo)?;
     device.active_stream = Some(endpoint);
     // A successful activation starts a new stream generation: pumps
     // of older generations are now stale (they exit at their next
@@ -1777,7 +1796,10 @@ pub async fn deactivate_video_stream_with<T: UvcTransport>(
 ) -> Result<(), UvcError> {
     let (slot_id, active) = {
         let mut devices = UVC_DEVICES.lock();
-        let device = devices.get_mut(idx).ok_or(UvcError::NotVideo)?;
+        let device = devices
+            .get_mut(idx)
+            .filter(|device| !device.detached)
+            .ok_or(UvcError::NotVideo)?;
         device.capture_stop_requested = true;
         // The negotiated control goes with the stream: a later pump
         // must never reassemble against superseded parameters.
@@ -1814,7 +1836,11 @@ pub struct UvcNegotiatedStream {
 /// negotiation + activation, so the capture pump can derive its
 /// reassembler configuration from the negotiated stream parameters.
 fn retain_negotiated_stream(idx: usize, accepted: VsProbeCommit) {
-    if let Some(device) = UVC_DEVICES.lock().get_mut(idx) {
+    if let Some(device) = UVC_DEVICES
+        .lock()
+        .get_mut(idx)
+        .filter(|device| !device.detached)
+    {
         device.negotiated = Some(accepted);
     }
 }
@@ -1850,7 +1876,10 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
 ) -> Result<UvcNegotiatedStream, UvcError> {
     let (slot_id, vs_iface, uvc_version) = {
         let devices = UVC_DEVICES.lock();
-        let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
+        let device = devices
+            .get(idx)
+            .filter(|device| !device.detached)
+            .ok_or(UvcError::NotVideo)?;
         (device.slot_id, device.vs_iface, device.uvc_version)
     };
     // The wire length follows the device's VC HEADER bcdUVC, not the
@@ -1954,7 +1983,7 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
     // successful negotiation writes the record.
     {
         let mut devices = UVC_DEVICES.lock();
-        if let Some(device) = devices.get_mut(idx) {
+        if let Some(device) = devices.get_mut(idx).filter(|device| !device.detached) {
             device.last_stream = Some(accepted);
         }
     }
@@ -1977,7 +2006,7 @@ pub async fn negotiate_and_activate_video_stream_with<T: UvcTransport>(
 /// coexist, which the generation checks in the pump make harmless.
 pub fn claim_capture_pump(idx: usize) -> Option<u64> {
     let mut devices = UVC_DEVICES.lock();
-    let device = devices.get_mut(idx)?;
+    let device = devices.get_mut(idx).filter(|device| !device.detached)?;
     let generation = device.stream_generation;
     if generation == 0 || device.capture_pump_generation == generation {
         return None;
@@ -1991,7 +2020,11 @@ pub fn claim_capture_pump(idx: usize) -> Option<u64> {
 /// exit must never clear the mark of the successor pump that
 /// superseded it.
 pub fn release_capture_pump(idx: usize, generation: u64) {
-    if let Some(device) = UVC_DEVICES.lock().get_mut(idx) {
+    if let Some(device) = UVC_DEVICES
+        .lock()
+        .get_mut(idx)
+        .filter(|device| !device.detached)
+    {
         if device.capture_pump_generation == generation {
             device.capture_pump_generation = 0;
         }
@@ -2037,7 +2070,7 @@ async fn pump_video_frames(idx: usize, generation: u64) -> Result<(), UvcError> 
 /// touches no lifecycle state at all.
 fn take_pump_exit_request(idx: usize, generation: u64) -> bool {
     let mut devices = UVC_DEVICES.lock();
-    let Some(device) = devices.get_mut(idx) else {
+    let Some(device) = devices.get_mut(idx).filter(|device| !device.detached) else {
         return true;
     };
     if device.stream_generation != generation {
@@ -2082,7 +2115,10 @@ pub async fn pump_video_frames_with<T: UvcTransport>(
 ) -> Result<(), UvcError> {
     let (slot_id, endpoint, video_node, reassembly, controller, hub_port) = {
         let devices = UVC_DEVICES.lock();
-        let device = devices.get(idx).ok_or(UvcError::NotVideo)?;
+        let device = devices
+            .get(idx)
+            .filter(|device| !device.detached)
+            .ok_or(UvcError::NotVideo)?;
         (
             device.slot_id,
             device.active_stream.ok_or(UvcError::NoStreamingEndpoint)?,
@@ -2383,7 +2419,10 @@ fn noop_waker() -> core::task::Waker {
 pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UvcError> {
     let (slot_id, endpoint) = {
         let g = UVC_DEVICES.lock();
-        let dev = g.get(idx).ok_or(UvcError::NotVideo)?;
+        let dev = g
+            .get(idx)
+            .filter(|device| !device.detached)
+            .ok_or(UvcError::NotVideo)?;
         let endpoint = dev.active_stream.ok_or(UvcError::NoStreamingEndpoint)?;
         (dev.slot_id, endpoint)
     };
@@ -2406,7 +2445,11 @@ pub fn capture_one_packet(idx: usize, out: &mut [u8]) -> Result<usize, UvcError>
 }
 
 pub fn attached_uvc_count() -> usize {
-    UVC_DEVICES.lock().len()
+    UVC_DEVICES
+        .lock()
+        .iter()
+        .filter(|device| !device.detached)
+        .count()
 }
 
 #[doc(hidden)]
@@ -2417,67 +2460,41 @@ pub fn __reset_uvc_for_test() {
     UVC_PM_SUSPENDED.store(false, Ordering::SeqCst);
 }
 
-/// Detach half of UVC bind for one slot: drop every `UVC_DEVICES`
-/// entry bound to `slot_id` and unregister each entry's
-/// `/dev/video<N>` node, so a replug re-binds from scratch and a
-/// stale node can never STREAMON against a slot id the dispatcher
-/// has since handed to another device.
-///
-/// Panic-free and idempotent by the #893 hook contract: no indexing
-/// and no fallible unwraps on any path, and detaching a slot with no
-/// UVC binding (or detaching twice) is a silent no-op. The capture
-/// pump needs no explicit kill: the stop flag is set before removal,
-/// and a pump that wakes after removal exits on its own — its
-/// `take_pump_exit_request` sees the entry gone (or a different
-/// device's generation at the reused index), its next
-/// `get_device(video_node)` finds the unregistered node, and its
-/// `isoch_in`/`bulk_in` on the disabled slot errors out. Registered as the
-/// class-registry unbind hook, so the supervisor's hub-detach path
-/// (`attach::detach_slot` → `dispatch_unbind`) reaches it; see also
-/// [`detach_all_uvc`] for the controller-recovery path.
+/// Retire one controller/slot's cameras and withdraw their video nodes.
+/// Registry indices are never compacted or reused: another camera's capture
+/// pump or an in-flight control future must keep addressing its own binding.
+/// Repeated detach is a no-op, and retired indices reject new operations.
 pub fn detach_uvc(controller: u8, slot_id: u8) {
-    let ours = |device: &UvcDevice| device.controller == controller && device.slot_id == slot_id;
-    let video_nodes: Vec<usize> = {
-        let mut devices = UVC_DEVICES.lock();
-        for device in devices.iter_mut() {
-            if ours(device) {
-                device.capture_stop_requested = true;
-            }
-        }
-        // Collect-then-retain: the node unregister below takes the
-        // video registry lock, which must never be taken while the
-        // UVC registry lock is held.
-        let nodes: Vec<usize> = devices
-            .iter()
-            .filter(|device| ours(device))
-            .map(|device| device.video_node)
-            .collect();
-        devices.retain(|device| !ours(device));
-        nodes
-    };
-    for node in video_nodes {
-        let _ = narf_drivers_video::devfs_bridge::unregister_video(node);
-    }
+    detach_matching_uvc(|device| device.controller == controller && device.slot_id == slot_id);
 }
 
-/// Wholesale variant of [`detach_uvc`] for controller recovery
-/// (`attach::detach_all_bindings`): drop every UVC binding on
-/// `controller` and unregister its video node, regardless of slot. Infallible and
-/// idempotent, same pump-exit reasoning as [`detach_uvc`].
+/// Retire every camera belonging to a recovering controller.
 pub fn detach_all_uvc(controller: u8) {
+    detach_matching_uvc(|device| device.controller == controller);
+}
+
+fn detach_matching_uvc(matches: impl Fn(&UvcDevice) -> bool) {
     let video_nodes: Vec<usize> = {
         let mut devices = UVC_DEVICES.lock();
-        for device in devices.iter_mut().filter(|d| d.controller == controller) {
+        let mut nodes = Vec::new();
+        for device in devices
+            .iter_mut()
+            .filter(|device| !device.detached && matches(device))
+        {
+            device.detached = true;
             device.capture_stop_requested = true;
+            device.active_stream = None;
+            device.negotiated = None;
+            device.last_stream = None;
+            device.suspended_stream = None;
+            device.formats = Vec::new();
+            device.streaming_endpoints = Vec::new();
+            device.controls = Vec::new();
+            nodes.push(device.video_node);
         }
-        let nodes: Vec<usize> = devices
-            .iter()
-            .filter(|d| d.controller == controller)
-            .map(|device| device.video_node)
-            .collect();
-        devices.retain(|d| d.controller != controller);
         nodes
     };
+    // The video registry lock must never nest inside the UVC registry lock.
     for node in video_nodes {
         let _ = narf_drivers_video::devfs_bridge::unregister_video(node);
     }
@@ -2506,7 +2523,11 @@ fn uvc_errno(error: UvcError) -> i64 {
 
 /// The live controller of the UVC device at registry index `idx`.
 fn controller_of(idx: usize) -> Option<alloc::sync::Arc<crate::xhci::Xhci>> {
-    let controller = UVC_DEVICES.lock().get(idx)?.controller;
+    let controller = UVC_DEVICES
+        .lock()
+        .get(idx)
+        .filter(|device| !device.detached)?
+        .controller;
     crate::xhci::controller_by_id(controller)
 }
 
@@ -2515,7 +2536,7 @@ pub fn uvc_index_for_video_node(node: usize) -> Option<usize> {
     UVC_DEVICES
         .lock()
         .iter()
-        .position(|device| device.video_node == node)
+        .position(|device| !device.detached && device.video_node == node)
 }
 
 /// Build the desired VS PROBE payload for the S_FMT-committed format.
@@ -2593,7 +2614,10 @@ pub async fn stream_start_with<T: UvcTransport>(
     let idx = uvc_index_for_video_node(node).ok_or(ERRNO_ENODEV)?;
     let desired = {
         let devices = UVC_DEVICES.lock();
-        let device = devices.get(idx).ok_or(ERRNO_ENODEV)?;
+        let device = devices
+            .get(idx)
+            .filter(|device| !device.detached)
+            .ok_or(ERRNO_ENODEV)?;
         desired_probe_commit(device, format).ok_or(ERRNO_EIO)?
     };
     negotiate_and_activate_video_stream_with(transport, idx, desired)
@@ -2639,7 +2663,7 @@ fn video_stream_stop(node: usize) -> narf_drivers_video::v4l2_ioctl::StreamHookF
                 // software teardown remains.
                 if let Some(idx) = uvc_index_for_video_node(node) {
                     let mut devices = UVC_DEVICES.lock();
-                    if let Some(device) = devices.get_mut(idx) {
+                    if let Some(device) = devices.get_mut(idx).filter(|device| !device.detached) {
                         device.capture_stop_requested = true;
                         device.active_stream = None;
                         device.negotiated = None;
@@ -2744,7 +2768,12 @@ fn pm_finish_resume() {
 /// `ensure_port_awake` precedent). No-op for root-port cameras
 /// (`hub_port` is `None`) and when the port is already awake.
 async fn ensure_uvc_port_awake(xhci_dev: &crate::xhci::Xhci, idx: usize) {
-    let Some((hub_slot, port)) = UVC_DEVICES.lock().get(idx).and_then(|d| d.hub_port) else {
+    let Some((hub_slot, port)) = UVC_DEVICES
+        .lock()
+        .get(idx)
+        .filter(|device| !device.detached)
+        .and_then(|d| d.hub_port)
+    else {
         return;
     };
     if !crate::attach::hub_port_is_suspended(xhci_dev.id(), hub_slot, port) {
@@ -2760,8 +2789,8 @@ async fn ensure_uvc_port_awake(xhci_dev: &crate::xhci::Xhci, idx: usize) {
 /// crate's Stage::Subsys initcalls; registration tolerates
 /// duplicates (see [`crate::class_registry::register_suspend_hook`]).
 pub fn register() {
-    let _ = crate::class_registry::register_suspend_hook("uvcvideo", |slot, port| {
-        alloc::boxed::Box::pin(suspend_uvc_port(slot, port))
+    let _ = crate::class_registry::register_suspend_hook("uvcvideo", |controller, slot, port| {
+        alloc::boxed::Box::pin(suspend_uvc_port(controller, slot, port))
     });
 }
 
@@ -2778,15 +2807,15 @@ pub fn register() {
 /// (`Parked`: nothing to do; the next STREAMON resumes the port
 /// first). Idempotent and panic-free.
 pub(crate) async fn suspend_uvc_port(
+    controller: u8,
     hub_slot: u8,
     port: u8,
 ) -> crate::class_registry::SuspendOutcome {
     use crate::class_registry::SuspendOutcome;
     let devices = UVC_DEVICES.lock();
-    let Some(device) = devices
-        .iter()
-        .find(|d| d.hub_port == Some((hub_slot, port)))
-    else {
+    let Some(device) = devices.iter().find(|d| {
+        !d.detached && d.controller == controller && d.hub_port == Some((hub_slot, port))
+    }) else {
         return SuspendOutcome::NotMine;
     };
     if device.active_stream.is_some() {
@@ -2817,14 +2846,14 @@ pub async fn prepare_suspend_with<T: UvcTransport>(transport: &T, controller: u8
         devices
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.controller == controller && d.active_stream.is_some())
+            .filter(|(_, d)| !d.detached && d.controller == controller && d.active_stream.is_some())
             .map(|(idx, d)| (idx, d.last_stream))
             .collect()
     };
     for (idx, last) in streaming {
         {
             let mut devices = UVC_DEVICES.lock();
-            if let Some(device) = devices.get_mut(idx) {
+            if let Some(device) = devices.get_mut(idx).filter(|device| !device.detached) {
                 device.suspended_stream = last;
             }
         }
@@ -2855,7 +2884,7 @@ pub async fn resume_replay_with<T: UvcTransport>(
         let mut devices = UVC_DEVICES.lock();
         let mut out = Vec::new();
         for (idx, device) in devices.iter_mut().enumerate() {
-            if device.controller != controller {
+            if device.detached || device.controller != controller {
                 continue;
             }
             if let Some(desired) = device.suspended_stream.take() {
@@ -2870,6 +2899,7 @@ pub async fn resume_replay_with<T: UvcTransport>(
         if UVC_DEVICES
             .lock()
             .get(idx)
+            .filter(|device| !device.detached)
             .is_some_and(|d| d.active_stream.is_some())
         {
             continue;
@@ -2950,7 +2980,9 @@ impl narf_power::system_pm::AsyncSystemPm for UvcSystemPm {
                     devices
                         .iter()
                         .enumerate()
-                        .filter(|(_, d)| d.controller == xhci.id() && d.suspended_stream.is_some())
+                        .filter(|(_, d)| {
+                            !d.detached && d.controller == xhci.id() && d.suspended_stream.is_some()
+                        })
                         .map(|(idx, _)| idx)
                         .collect()
                 };

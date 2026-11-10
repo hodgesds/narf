@@ -188,6 +188,7 @@ So the surface is small and grows deliberately. Today:
 | `narf_irq_set_handler` | `(u64, u16, usize, u64) -> i32` | attach `extern "C" fn(u64) -> i32`; callback runs in task context |
 | `narf_spawn_poller` | `(u64, usize, u64) -> i32` | immediate then 1-ms task-context callback; non-zero return retires it |
 | `narf_netif_register` | `(u64, *const u8, usize, *mut u32) -> i32` | register a copy-mode Ethernet interface and TX callback; requires `NetIface` |
+| `narf_netif_register_with_context` | `(u64, *const u8, usize, *mut u32) -> i32` | TX callback receives `(dev_token, frame, len)`; use for multiple devices per module; requires `NetIface` |
 | `narf_netif_rx` | `(u64, u32, *mut u8, usize) -> i32` | synchronously deliver copied RX bytes to the registered interface |
 
 Declare them as you would any foreign function:
@@ -222,6 +223,13 @@ callback passed to `narf_netif_register` borrows its frame only until return;
 copy or DMA it synchronously. The RX buffer passed to `narf_netif_rx` is also
 borrowed synchronously and may be rewritten in place by the stack before the
 call returns.
+
+For multiple adapters, use `narf_netif_register_with_context` with an
+`extern "C" fn(u64, *const u8, usize) -> i32` callback. Resolve all BARs,
+DMA buffers, ring positions and serialization by the supplied device token.
+Two cards with identical PCI IDs are separate contexts. The e1000 and IGC
+examples retain up to 32 independent contexts per module image and return
+`ENOSPC` when their state table fills.
 
 These stay undefined in the object you build; the loader resolves them
 against KSYMTAB and patches the call sites. A name the kernel does not

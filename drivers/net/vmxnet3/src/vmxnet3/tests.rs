@@ -518,6 +518,77 @@ fn smoke_vmxnet3_get_link_decode() -> TestResult {
 kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_get_link_decode);
 
 // ── Stage 3: publication ────────────────────────────────────────────
+// Exercise two real QEMU devices with XTASK_QEMU_VMXNET3=1 and
+// XTASK_QEMU_SECOND_NIC=1. A re-walk must preserve both controller handles.
+fn smoke_vmxnet3_multi_instance() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci};
+    // SAFETY: q35 ECAM is mapped by the x86 test harness; init is idempotent.
+    let _ = unsafe { narf_bus::init(narf_bus::x86_64::ECAM_DEFAULT_BASE) };
+    let addresses: alloc::vec::Vec<_> = devices()
+        .into_iter()
+        .filter(|d| {
+            d.id.vendor == vmxnet3::VMWARE_VENDOR && d.id.device == vmxnet3::VMWARE_DEV_VMXNET3
+        })
+        .map(|d| d.addr)
+        .collect();
+    if addresses.is_empty() {
+        return TestResult::Skip("no vmxnet3 device present");
+    }
+    narf_bus::driver_match::__reset_for_test();
+    vmxnet3::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() || vmxnet3::instance_count() != addresses.len() {
+        return TestResult::Fail("not every vmxnet3 PCI function was probed");
+    }
+    let controllers: alloc::vec::Vec<_> = (0..addresses.len())
+        .map(|i| vmxnet3::controller(i).unwrap())
+        .collect();
+    for (index, controller) in controllers.iter().enumerate() {
+        if !addresses.contains(&controller.addr) || controller.ifname().is_empty() {
+            return TestResult::Fail("vmxnet3 instance lost its address or interface name");
+        }
+        for other in &controllers[..index] {
+            if Arc::ptr_eq(controller, other)
+                || controller.addr == other.addr
+                || controller.ifname() == other.ifname()
+            {
+                return TestResult::Fail("vmxnet3 PCI functions share controller state or a name");
+            }
+        }
+        let iface = vmxnet3::Vmxnet3Iface(controller.clone());
+        if !core::ptr::eq(iface.rx_ring(), &controller.rx_ipc_ring)
+            || !core::ptr::eq(iface.tx_ring(), &controller.tx_ipc_ring)
+        {
+            return TestResult::Fail("vmxnet3 adapter resolved another device's rings");
+        }
+        let counts: alloc::vec::Vec<_> = controllers.iter().map(|c| c.stats().tx_ok).collect();
+        let mut frame = [0u8; 64];
+        frame[..6].fill(0xff);
+        frame[6..12].copy_from_slice(&controller.mac);
+        frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+        if narf_net::iface::send_on(controller.ifname(), &frame).is_err() {
+            return TestResult::Fail("vmxnet3 instance TX failed");
+        }
+        for (peer, before) in counts.into_iter().enumerate() {
+            if controllers[peer].stats().tx_ok != before + u64::from(peer == index) {
+                return TestResult::Fail("vmxnet3 TX callback reached the wrong PCI function");
+            }
+        }
+    }
+    let _ = probe_all_pci(&authority);
+    for (index, before) in controllers.iter().enumerate() {
+        if !vmxnet3::controller(index).is_some_and(|after| Arc::ptr_eq(before, &after)) {
+            return TestResult::Fail("vmxnet3 reprobe replaced a live controller");
+        }
+    }
+    if vmxnet3::instance_count() != controllers.len() {
+        return TestResult::Fail("vmxnet3 reprobe duplicated an interface");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_multi_instance);
+
 // Gated on the device being present: under QEMU with
 // `XTASK_QEMU_VMXNET3=1` this runs live; everywhere else it skips.
 
@@ -525,7 +596,7 @@ fn smoke_vmxnet3_published_iface() -> TestResult {
     if !vmxnet3::is_probed() {
         return TestResult::Skip("no vmxnet3 device present");
     }
-    let iface = vmxnet3::Vmxnet3Iface;
+    let iface = vmxnet3::Vmxnet3Iface(vmxnet3::probed_controller().unwrap());
     if iface.name().is_empty() {
         return TestResult::Fail("published iface has no name");
     }

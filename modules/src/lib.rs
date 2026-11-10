@@ -204,8 +204,18 @@ fn module_callback_call_gate(owner: u64, callback: narf_bus::ModuleCallbackFn, c
     call_in_module_context(owner, || callback(cookie))
 }
 
-fn module_tx_call_gate(owner: u64, callback: narf_bus::ModuleTxFn, frame: &[u8]) -> i32 {
-    call_in_module_context(owner, || callback(frame.as_ptr(), frame.len()))
+fn module_tx_call_gate(
+    owner: u64,
+    callback: narf_bus::ModuleTxCallback,
+    token: u64,
+    frame: &[u8],
+) -> i32 {
+    call_in_module_context(owner, || match callback {
+        narf_bus::ModuleTxCallback::Legacy(callback) => callback(frame.as_ptr(), frame.len()),
+        narf_bus::ModuleTxCallback::WithDevice(callback) => {
+            callback(token, frame.as_ptr(), frame.len())
+        }
+    })
 }
 
 fn install_bus_call_gate() {

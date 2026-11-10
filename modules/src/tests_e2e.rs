@@ -970,12 +970,15 @@ fn e2e_driver_module_drives_device() -> TestResult {
         // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the harness maps;
         // `init` only walks that ECAM region and is idempotent on re-entry.
         let _ = unsafe { narf_bus::init(narf_bus::x86_64::ECAM_DEFAULT_BASE) };
-        let has_e1000 = devices().iter().any(|d| {
-            matches!(&d.kind, BusKind::Pcie { .. })
-                && d.id.vendor == E1000_VENDOR
-                && d.id.device == E1000_DEV_82540EM
-        });
-        if has_e1000 {
+        let e1000_count = devices()
+            .iter()
+            .filter(|d| {
+                matches!(&d.kind, BusKind::Pcie { .. })
+                    && d.id.vendor == E1000_VENDOR
+                    && d.id.device == E1000_DEV_82540EM
+            })
+            .count();
+        if e1000_count != 0 {
             let authority = bootstrap_registry_authority();
             match probe_all_pci(&authority) {
                 // Only the module's match is registered (we reset the table), so
@@ -994,7 +997,9 @@ fn e2e_driver_module_drives_device() -> TestResult {
             }
             // Two descriptor rings + 8 TX buffers + 256 RX buffers. The
             // Stage-2 scratch allocation was freed before ring bring-up.
-            if narf_bus::driver_match::__module_dma_buffer_count_for_test(module.id.0) != 266 {
+            if narf_bus::driver_match::__module_dma_buffer_count_for_test(module.id.0)
+                != 266 * e1000_count
+            {
                 narf_bus::driver_match::__reset_for_test();
                 return TestResult::Fail(
                     "module probe did not retain the expected DMA rings/buffers",
@@ -1013,13 +1018,17 @@ fn e2e_driver_module_drives_device() -> TestResult {
                 narf_bus::driver_match::__reset_for_test();
                 return TestResult::Fail("module task-context poll callback returned an error");
             }
-            if narf_bus::driver_match::__module_dma_buffer_count_for_test(module.id.0) != 266 {
+            if narf_bus::driver_match::__module_dma_buffer_count_for_test(module.id.0)
+                != 266 * e1000_count
+            {
                 narf_bus::driver_match::__reset_for_test();
                 return TestResult::Fail("poll callback changed the persistent DMA buffer set");
             }
-            if narf_bus::driver_match::__module_netif_count_for_test(module.id.0) != 1 {
+            if narf_bus::driver_match::__module_netif_count_for_test(module.id.0) != e1000_count {
                 narf_bus::driver_match::__reset_for_test();
-                return TestResult::Fail("module did not register exactly one network interface");
+                return TestResult::Fail(
+                    "module did not register one interface per matching PCI function",
+                );
             }
 
             // Send a real ARP request through the registered interface. The
@@ -1116,6 +1125,37 @@ fn e2e_driver_module_drives_device() -> TestResult {
             {
                 narf_bus::driver_match::__reset_for_test();
                 return TestResult::Fail("module RX callback did not rearm its descriptor");
+            }
+
+            // Both identical cards live in one module image. Sending on either
+            // ifindex must modify only that device's retained TX descriptor ring.
+            let instances = narf_bus::driver_match::__module_netif_instances_for_test(owner);
+            for &(target, _) in &instances {
+                let mut before = Vec::new();
+                for &(token, _) in &instances {
+                    let mut ring = [0u8; 128];
+                    if narf_bus::module_dma_read(owner, token, 2, 0, &mut ring) != 0 {
+                        return TestResult::Fail("module multi-device TX ring snapshot failed");
+                    }
+                    before.push(ring);
+                }
+                let mut frame = [0u8; 64];
+                frame[..6].fill(0xff);
+                frame[6..12].copy_from_slice(&source_mac);
+                frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+                if !narf_bus::driver_match::__module_netif_send_for_device_for_test(
+                    owner, target, &frame,
+                ) {
+                    return TestResult::Fail("per-device module TX callback failed");
+                }
+                for (&(token, _), previous) in instances.iter().zip(before) {
+                    let mut after = [0u8; 128];
+                    if narf_bus::module_dma_read(owner, token, 2, 0, &mut after) != 0
+                        || (after != previous) != (token == target)
+                    {
+                        return TestResult::Fail("module TX callback crossed device contexts");
+                    }
+                }
             }
         }
     }
