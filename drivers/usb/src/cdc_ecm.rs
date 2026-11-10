@@ -1215,12 +1215,16 @@ pub fn probe(
 /// Class suspend hook for one hub port. Self-filters on the
 /// record's hub context; idempotent. Never holds the record
 /// lock across an await.
-async fn suspend_ecm_port(hub_slot: u8, port: u8) -> crate::class_registry::SuspendOutcome {
+async fn suspend_ecm_port(
+    controller: u8,
+    hub_slot: u8,
+    port: u8,
+) -> crate::class_registry::SuspendOutcome {
     use crate::class_registry::SuspendOutcome;
     let target = {
         let g = CDC_ECM_DEVICES.lock();
         g.iter().find_map(|d| {
-            if !d.detached && d.hub_port == Some((hub_slot, port)) {
+            if d.controller == controller && !d.detached && d.hub_port == Some((hub_slot, port)) {
                 if d.suspended {
                     Some(None)
                 } else {
@@ -1253,10 +1257,12 @@ async fn suspend_ecm_port(hub_slot: u8, port: u8) -> crate::class_registry::Susp
         .await
         .is_ok();
     let mut g = CDC_ECM_DEVICES.lock();
-    match g
-        .iter_mut()
-        .find(|d| !d.detached && d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id)
-    {
+    match g.iter_mut().find(|d| {
+        d.controller == controller
+            && !d.detached
+            && d.hub_port == Some((hub_slot, port))
+            && d.slot_id == slot_id
+    }) {
         Some(rec) => {
             rec.suspended = true;
             rec.wakeup_armed = armed;
@@ -1272,8 +1278,12 @@ async fn suspend_ecm_port(hub_slot: u8, port: u8) -> crate::class_registry::Susp
 pub async fn resume_ecm_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port: u8) -> bool {
     let idx = {
         let g = CDC_ECM_DEVICES.lock();
-        g.iter()
-            .position(|d| !d.detached && d.suspended && d.hub_port == Some((hub_slot, port)))
+        g.iter().position(|d| {
+            d.controller == xhci_dev.id()
+                && !d.detached
+                && d.suspended
+                && d.hub_port == Some((hub_slot, port))
+        })
     };
     let Some(idx) = idx else {
         return false;
@@ -1294,10 +1304,10 @@ pub async fn resume_ecm_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port: u
 
 /// Hub ports holding a parked (suspended, non-detached) ECM
 /// record: the wake-watch step's candidate list.
-pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
+pub fn suspended_hub_ports(controller: u8) -> Vec<(u8, u8)> {
     let g = CDC_ECM_DEVICES.lock();
     g.iter()
-        .filter(|d| !d.detached && d.suspended)
+        .filter(|d| d.controller == controller && !d.detached && d.suspended)
         .filter_map(|d| d.hub_port)
         .collect()
 }
@@ -1305,7 +1315,7 @@ pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
 /// Wake-watch step: resume a parked ECM port only on an
 /// observed remote-wakeup edge.
 pub async fn wake_suspended_ports(xhci_dev: &crate::xhci::Xhci) {
-    for (hub_slot, port) in suspended_hub_ports() {
+    for (hub_slot, port) in suspended_hub_ports(xhci_dev.id()) {
         if crate::attach::hub_port_suspend_change(xhci_dev, hub_slot, port).await == Some(true) {
             let _ = resume_ecm_port(xhci_dev, hub_slot, port).await;
         }
@@ -1324,8 +1334,8 @@ pub fn register_initcalls() {
             Ok(())
         },
     );
-    let _ = crate::class_registry::register_suspend_hook("cdc-ecm", |slot, port| {
-        alloc::boxed::Box::pin(suspend_ecm_port(slot, port))
+    let _ = crate::class_registry::register_suspend_hook("cdc-ecm", |controller, slot, port| {
+        alloc::boxed::Box::pin(suspend_ecm_port(controller, slot, port))
     });
 }
 
@@ -1847,13 +1857,27 @@ pub mod tests {
             };
         {
             let mut g = CDC_ECM_DEVICES.lock();
+            let mut other = mk(7, Some((2, 3)), true, false);
+            other.controller = 1;
+            g.push(other);
             g.push(mk(7, Some((2, 3)), true, false));
             g.push(mk(8, Some((2, 4)), false, false));
             g.push(mk(9, None, true, false));
             g.push(mk(10, Some((2, 5)), true, true));
         }
-        let ports = suspended_hub_ports();
+        let ports = suspended_hub_ports(0);
+        let other_ports = suspended_hub_ports(1);
+        let no_ports = suspended_hub_ports(2);
+        let owns = narf_scheduler::block_on(suspend_ecm_port(1, 2, 3));
+        let unrelated = narf_scheduler::block_on(suspend_ecm_port(2, 2, 3));
         __reset_ecm_for_test();
+        if other_ports != alloc::vec![(2, 3)]
+            || !no_ports.is_empty()
+            || owns != crate::class_registry::SuspendOutcome::Parked
+            || unrelated != crate::class_registry::SuspendOutcome::NotMine
+        {
+            return TestResult::Fail("suspend or wake-watch selection crossed USB controllers");
+        }
         if ports != alloc::vec![(2, 3)] {
             return TestResult::Fail("suspended_hub_ports selected the wrong ports");
         }

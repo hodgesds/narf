@@ -2920,21 +2920,35 @@ kernel_test_in!(
 static SUSPEND_PARKED_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static SUSPEND_FAILED_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static SUSPEND_NOTMINE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SUSPEND_LAST_CONTROLLER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 // Each dummy hook is its own fn: the outcome is a
 // compile-time value per fn (a closure capturing its outcome
 // could not coerce to the hook fn-pointer type).
-fn suspend_hook_parked(_slot: u8, _port: u8) -> crate::class_registry::SuspendFuture {
+fn suspend_hook_parked(
+    controller: u8,
+    _slot: u8,
+    _port: u8,
+) -> crate::class_registry::SuspendFuture {
+    SUSPEND_LAST_CONTROLLER.store(controller, core::sync::atomic::Ordering::SeqCst);
     SUSPEND_PARKED_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::Parked })
 }
 
-fn suspend_hook_failed(_slot: u8, _port: u8) -> crate::class_registry::SuspendFuture {
+fn suspend_hook_failed(
+    _controller: u8,
+    _slot: u8,
+    _port: u8,
+) -> crate::class_registry::SuspendFuture {
     SUSPEND_FAILED_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::ParkFailed })
 }
 
-fn suspend_hook_notmine(_slot: u8, _port: u8) -> crate::class_registry::SuspendFuture {
+fn suspend_hook_notmine(
+    _controller: u8,
+    _slot: u8,
+    _port: u8,
+) -> crate::class_registry::SuspendFuture {
     SUSPEND_NOTMINE_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     alloc::boxed::Box::pin(async { crate::class_registry::SuspendOutcome::NotMine })
 }
@@ -2950,13 +2964,17 @@ fn smoke_usb_class_registry_suspend_dispatch() -> TestResult {
     if register_suspend_hook("test-suspend-failed", suspend_hook_failed).is_err()
         || register_suspend_hook("test-suspend-parked", suspend_hook_parked).is_err()
         || register_suspend_hook("test-suspend-notmine", suspend_hook_notmine).is_err()
+        || register_suspend_hook("test-suspend-parked", suspend_hook_parked).is_err()
     {
         return TestResult::Fail("suspend-hook registration failed");
     }
     let failed_before = SUSPEND_FAILED_CALLS.load(core::sync::atomic::Ordering::SeqCst);
     let parked_before = SUSPEND_PARKED_CALLS.load(core::sync::atomic::Ordering::SeqCst);
     let notmine_before = SUSPEND_NOTMINE_CALLS.load(core::sync::atomic::Ordering::SeqCst);
-    let report = narf_scheduler::block_on(dispatch_suspend(0xEE, 7));
+    let report = narf_scheduler::block_on(dispatch_suspend(1, 0xEE, 7));
+    if SUSPEND_LAST_CONTROLLER.load(core::sync::atomic::Ordering::SeqCst) != 1 {
+        return TestResult::Fail("suspend dispatch lost the controller identity");
+    }
     if SUSPEND_FAILED_CALLS.load(core::sync::atomic::Ordering::SeqCst) != failed_before + 1 {
         return TestResult::Fail("failing suspend hook was not called exactly once");
     }
@@ -3935,6 +3953,7 @@ fn smoke_usb_uvc_reassembly_config_from_negotiated() -> TestResult {
         frames: alloc::vec![],
     };
     let device = UvcDevice {
+        detached: false,
         slot_id: 7,
         vc_iface: 0,
         vs_iface: 1,
@@ -11724,14 +11743,21 @@ fn smoke_uvc_pm_suspend_hook_vetoes_streaming_parks_idle() -> TestResult {
         Ok(v) => v,
         Err(e) => return TestResult::Fail(e),
     };
-    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0xC0, 1)) != SuspendOutcome::ParkFailed
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0, 0xC0, 1))
+        != SuspendOutcome::ParkFailed
     {
         return TestResult::Fail("hook should veto gating a streaming camera");
     }
-    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0xC0, 2)) != SuspendOutcome::NotMine {
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(1, 0xC0, 1)) != SuspendOutcome::NotMine
+    {
+        return TestResult::Fail("camera on another USB controller vetoed this port");
+    }
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0, 0xC0, 2)) != SuspendOutcome::NotMine
+    {
         return TestResult::Fail("hook should ignore a port with no UVC device");
     }
-    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0xEE, 7)) != SuspendOutcome::NotMine {
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0, 0xEE, 7)) != SuspendOutcome::NotMine
+    {
         return TestResult::Fail("hook should ignore an unrelated hub/port");
     }
     // Idle the camera through the STREAMOFF teardown: the hook may
@@ -11740,7 +11766,8 @@ fn smoke_uvc_pm_suspend_hook_vetoes_streaming_parks_idle() -> TestResult {
     {
         return TestResult::Fail("STREAMOFF teardown should succeed");
     }
-    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0xC0, 1)) != SuspendOutcome::Parked {
+    if narf_scheduler::block_on(crate::uvc::suspend_uvc_port(0, 0xC0, 1)) != SuspendOutcome::Parked
+    {
         return TestResult::Fail("hook should park an idle bound camera");
     }
     TestResult::Pass
@@ -11848,7 +11875,7 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
     }
     let (node7, node8) = {
         let devices = crate::uvc::UVC_DEVICES.lock();
-        let first = match devices.iter().find(|d| d.slot_id == 7) {
+        let first = match devices.iter().find(|d| !d.detached && d.slot_id == 7) {
             Some(d) => d.video_node,
             None => return TestResult::Fail("slot 7 binding missing"),
         };
@@ -11869,6 +11896,22 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
     {
         return TestResult::Fail("both nodes must resolve before detach");
     }
+    let survivor_index = crate::uvc::uvc_index_for_video_node(node8);
+    let Some(survivor_index) = survivor_index else {
+        return TestResult::Fail("surviving camera has no registry index");
+    };
+    let format = narf_drivers_video::v4l2_ioctl::PixFormat {
+        width: 640,
+        height: 480,
+        fourcc: u32::from_le_bytes(*b"YUYV"),
+    };
+    if narf_scheduler::block_on(crate::uvc::stream_start_with(&*transport, node8, format)).is_err()
+    {
+        return TestResult::Fail("second camera could not start before unplug");
+    }
+    let Some(generation) = crate::uvc::claim_capture_pump(survivor_index) else {
+        return TestResult::Fail("second camera could not claim its capture pump");
+    };
     crate::uvc::detach_uvc(0, 7);
     if crate::uvc::attached_uvc_count() != 1 {
         return TestResult::Fail("detach must drop exactly one binding");
@@ -11876,7 +11919,7 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
     if crate::uvc::UVC_DEVICES
         .lock()
         .iter()
-        .any(|d| d.slot_id == 7)
+        .any(|d| !d.detached && d.slot_id == 7)
     {
         return TestResult::Fail("slot 7 binding must be gone");
     }
@@ -11885,6 +11928,22 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
     }
     if narf_drivers_video::devfs_bridge::get_device(node8).is_none() {
         return TestResult::Fail("survivor node must keep resolving");
+    }
+    if crate::uvc::uvc_index_for_video_node(node8) != Some(survivor_index)
+        || crate::uvc::uvc_index_for_video_node(node7).is_some()
+    {
+        return TestResult::Fail("camera detach retargeted a capture-pump registry index");
+    }
+    if crate::uvc::UVC_DEVICES.lock()[survivor_index].capture_pump_generation != generation
+        || narf_scheduler::block_on(crate::uvc::deactivate_video_stream_with(
+            &*transport,
+            survivor_index,
+        ))
+        .is_err()
+        || narf_scheduler::block_on(crate::uvc::stream_start_with(&*transport, node8, format))
+            .is_err()
+    {
+        return TestResult::Fail("surviving camera lost its stream after another camera unplugged");
     }
     // Idempotent, and unknown slots are a silent no-op.
     crate::uvc::detach_uvc(0, 7);
@@ -11914,7 +11973,7 @@ fn smoke_uvc_detach_drops_binding_and_node() -> TestResult {
     let rebound_node = match crate::uvc::UVC_DEVICES
         .lock()
         .iter()
-        .find(|d| d.slot_id == 7)
+        .find(|d| !d.detached && d.slot_id == 7)
     {
         Some(d) => d.video_node,
         None => return TestResult::Fail("re-bound slot 7 binding missing"),

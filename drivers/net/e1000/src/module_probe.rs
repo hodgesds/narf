@@ -63,19 +63,74 @@ const RX_RING_LEN: usize = 256;
 const DMA_BUF_LEN: usize = 2048;
 const DESC_LEN: usize = 16;
 
-static DEV_TOKEN: AtomicU64 = AtomicU64::new(0);
-static BAR0: AtomicU64 = AtomicU64::new(0);
-static TX_RING: AtomicU64 = AtomicU64::new(0);
-static RX_RING: AtomicU64 = AtomicU64::new(0);
-static IFINDEX: AtomicU32 = AtomicU32::new(0);
-static TX_TAIL: AtomicU32 = AtomicU32::new(0);
-static RX_HEAD: AtomicU32 = AtomicU32::new(0);
-static TX_BUSY: AtomicBool = AtomicBool::new(false);
-static READY: AtomicBool = AtomicBool::new(false);
-static TX_BUFS: [AtomicU64; TX_RING_LEN] = [const { AtomicU64::new(0) }; TX_RING_LEN];
-static TX_ADDRS: [AtomicU64; TX_RING_LEN] = [const { AtomicU64::new(0) }; TX_RING_LEN];
-static RX_BUFS: [AtomicU64; RX_RING_LEN] = [const { AtomicU64::new(0) }; RX_RING_LEN];
-static RX_ADDRS: [AtomicU64; RX_RING_LEN] = [const { AtomicU64::new(0) }; RX_RING_LEN];
+// Module builds have no allocator: retain up to 32 independent device states.
+// Slots are never recycled while module text is live, including failed probes,
+// so an old callback cannot resolve to a replacement device's DMA buffers.
+const MAX_DEVICES: usize = 32;
+
+struct DeviceState {
+    dev_token: AtomicU64,
+    bar0: AtomicU64,
+    tx_ring: AtomicU64,
+    rx_ring: AtomicU64,
+    ifindex: AtomicU32,
+    tx_tail: AtomicU32,
+    rx_head: AtomicU32,
+    tx_busy: AtomicBool,
+    ready: AtomicBool,
+    tx_bufs: [AtomicU64; TX_RING_LEN],
+    tx_addrs: [AtomicU64; TX_RING_LEN],
+    rx_bufs: [AtomicU64; RX_RING_LEN],
+    rx_addrs: [AtomicU64; RX_RING_LEN],
+}
+
+impl DeviceState {
+    const fn new() -> Self {
+        Self {
+            dev_token: AtomicU64::new(0),
+            bar0: AtomicU64::new(0),
+            tx_ring: AtomicU64::new(0),
+            rx_ring: AtomicU64::new(0),
+            ifindex: AtomicU32::new(0),
+            tx_tail: AtomicU32::new(0),
+            rx_head: AtomicU32::new(0),
+            tx_busy: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
+            tx_bufs: [const { AtomicU64::new(0) }; TX_RING_LEN],
+            tx_addrs: [const { AtomicU64::new(0) }; TX_RING_LEN],
+            rx_bufs: [const { AtomicU64::new(0) }; RX_RING_LEN],
+            rx_addrs: [const { AtomicU64::new(0) }; RX_RING_LEN],
+        }
+    }
+}
+
+static DEVICES: [DeviceState; MAX_DEVICES] = [const { DeviceState::new() }; MAX_DEVICES];
+
+fn device_state(token: u64) -> Option<&'static DeviceState> {
+    if token == 0 {
+        return None;
+    }
+    DEVICES
+        .iter()
+        .find(|state| state.dev_token.load(Ordering::Acquire) == token)
+}
+
+fn reserve_device(token: u64) -> Result<&'static DeviceState, i32> {
+    if token == 0 {
+        return Err(-22);
+    }
+    for state in &DEVICES {
+        match state
+            .dev_token
+            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return Ok(state),
+            Err(existing) if existing == token => return Err(-16),
+            Err(_) => {}
+        }
+    }
+    Err(-28) // ENOSPC, without disturbing any bound device.
+}
 
 // PCI command-register bits.
 const PCI_CMD_MEM_SPACE: u16 = 1 << 1;
@@ -115,7 +170,7 @@ unsafe extern "C" {
     fn narf_msix_claim(dev: u64, out_vector: *mut u16) -> i32;
     fn narf_irq_set_handler(dev: u64, vector: u16, callback: usize, cookie: u64) -> i32;
     fn narf_spawn_poller(dev: u64, callback: usize, cookie: u64) -> i32;
-    fn narf_netif_register(
+    fn narf_netif_register_with_context(
         dev: u64,
         mac: *const u8,
         tx_callback: usize,
@@ -178,7 +233,7 @@ fn tx_descriptor(address: u64, len: usize) -> [u8; DESC_LEN] {
     desc
 }
 
-fn init_dma_rings(dev: u64, bar: u64) -> Result<(), i32> {
+fn init_dma_rings(state: &DeviceState, dev: u64, bar: u64) -> Result<(), i32> {
     // e1000 requires TDLEN/RDLEN to be 128-byte multiples. A page-sized
     // allocation keeps both rings naturally aligned and leaves growth room.
     // SAFETY: allocations are retained by the device context until teardown.
@@ -198,8 +253,8 @@ fn init_dma_rings(dev: u64, bar: u64) -> Result<(), i32> {
             return Err(-12);
         }
         let address = dma_address(dev, buffer)?;
-        TX_BUFS[slot].store(buffer, Ordering::Relaxed);
-        TX_ADDRS[slot].store(address, Ordering::Relaxed);
+        state.tx_bufs[slot].store(buffer, Ordering::Relaxed);
+        state.tx_addrs[slot].store(address, Ordering::Relaxed);
     }
 
     for slot in 0..RX_RING_LEN {
@@ -223,8 +278,8 @@ fn init_dma_rings(dev: u64, bar: u64) -> Result<(), i32> {
         {
             return Err(-5);
         }
-        RX_BUFS[slot].store(buffer, Ordering::Relaxed);
-        RX_ADDRS[slot].store(address, Ordering::Relaxed);
+        state.rx_bufs[slot].store(buffer, Ordering::Relaxed);
+        state.rx_addrs[slot].store(address, Ordering::Relaxed);
     }
 
     mmio_write(dev, bar, E1000_TDBAL, tx_ring_addr as u32)?;
@@ -246,35 +301,36 @@ fn init_dma_rings(dev: u64, bar: u64) -> Result<(), i32> {
         RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC,
     )?;
 
-    TX_RING.store(tx_ring, Ordering::Relaxed);
-    RX_RING.store(rx_ring, Ordering::Relaxed);
-    TX_TAIL.store(0, Ordering::Relaxed);
-    RX_HEAD.store(0, Ordering::Relaxed);
+    state.tx_ring.store(tx_ring, Ordering::Relaxed);
+    state.rx_ring.store(rx_ring, Ordering::Relaxed);
+    state.tx_tail.store(0, Ordering::Relaxed);
+    state.rx_head.store(0, Ordering::Relaxed);
     Ok(())
 }
 
-fn transmit_frame(frame: &[u8]) -> i32 {
-    if frame.is_empty() || frame.len() > 1518 || !READY.load(Ordering::Acquire) {
+fn transmit_frame(state: &DeviceState, frame: &[u8]) -> i32 {
+    if frame.is_empty() || frame.len() > 1518 || !state.ready.load(Ordering::Acquire) {
         return -90; // -EMSGSIZE / not ready
     }
-    if TX_BUSY
+    if state
+        .tx_busy
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         return -11; // -EAGAIN
     }
-    let rc = transmit_frame_locked(frame);
-    TX_BUSY.store(false, Ordering::Release);
+    let rc = transmit_frame_locked(state, frame);
+    state.tx_busy.store(false, Ordering::Release);
     rc
 }
 
-fn transmit_frame_locked(frame: &[u8]) -> i32 {
-    let dev = DEV_TOKEN.load(Ordering::Acquire);
-    let bar = BAR0.load(Ordering::Acquire);
-    let ring = TX_RING.load(Ordering::Acquire);
-    let tail = TX_TAIL.load(Ordering::Relaxed) as usize % TX_RING_LEN;
-    let buffer = TX_BUFS[tail].load(Ordering::Relaxed);
-    let address = TX_ADDRS[tail].load(Ordering::Relaxed);
+fn transmit_frame_locked(state: &DeviceState, frame: &[u8]) -> i32 {
+    let dev = state.dev_token.load(Ordering::Acquire);
+    let bar = state.bar0.load(Ordering::Acquire);
+    let ring = state.tx_ring.load(Ordering::Acquire);
+    let tail = state.tx_tail.load(Ordering::Relaxed) as usize % TX_RING_LEN;
+    let buffer = state.tx_bufs[tail].load(Ordering::Relaxed);
+    let address = state.tx_addrs[tail].load(Ordering::Relaxed);
     if dev == 0 || bar == 0 || ring == 0 || buffer == 0 || address == 0 {
         return -19;
     }
@@ -306,24 +362,28 @@ fn transmit_frame_locked(frame: &[u8]) -> i32 {
         )
     };
     if waited != 0 {
+        state.ready.store(false, Ordering::Release);
         return waited;
     }
-    TX_TAIL.store(next, Ordering::Release);
+    state.tx_tail.store(next, Ordering::Release);
     0
 }
 
-extern "C" fn net_tx(frame: *const u8, len: usize) -> i32 {
+extern "C" fn net_tx(dev_token: u64, frame: *const u8, len: usize) -> i32 {
     if frame.is_null() {
         return -22;
     }
+    let Some(state) = device_state(dev_token) else {
+        return -19;
+    };
     // SAFETY: the kernel net bridge borrows exactly `len` readable bytes for
     // this synchronous callback and retains ownership.
-    transmit_frame(unsafe { core::slice::from_raw_parts(frame, len) })
+    transmit_frame(state, unsafe { core::slice::from_raw_parts(frame, len) })
 }
 
-fn poll_receive(dev: u64, bar: u64) -> i32 {
-    let ring = RX_RING.load(Ordering::Acquire);
-    let ifindex = IFINDEX.load(Ordering::Acquire);
+fn poll_receive(state: &DeviceState, dev: u64, bar: u64) -> i32 {
+    let ring = state.rx_ring.load(Ordering::Acquire);
+    let ifindex = state.ifindex.load(Ordering::Acquire);
     if ring == 0 || ifindex == 0 {
         return -19;
     }
@@ -333,7 +393,7 @@ fn poll_receive(dev: u64, bar: u64) -> i32 {
     let mut frame = core::mem::MaybeUninit::<[u8; DMA_BUF_LEN]>::uninit();
     let frame_ptr = frame.as_mut_ptr().cast::<u8>();
     for _ in 0..RX_RING_LEN {
-        let head = RX_HEAD.load(Ordering::Relaxed) as usize % RX_RING_LEN;
+        let head = state.rx_head.load(Ordering::Relaxed) as usize % RX_RING_LEN;
         let mut desc = [0u8; DESC_LEN];
         // SAFETY: descriptor slot is inside the retained ring.
         if unsafe {
@@ -353,7 +413,7 @@ fn poll_receive(dev: u64, bar: u64) -> i32 {
         }
         let len = u16::from_le_bytes([desc[8], desc[9]]) as usize;
         let complete = desc[12] & RXD_STAT_EOP != 0 && desc[13] == 0;
-        let buffer = RX_BUFS[head].load(Ordering::Relaxed);
+        let buffer = state.rx_bufs[head].load(Ordering::Relaxed);
         if complete && (14..=DMA_BUF_LEN).contains(&len) {
             // SAFETY: `len` is bounded by the persistent RX buffer size.
             if unsafe { narf_dma_read(dev, buffer, 0, frame_ptr, len) } != 0 {
@@ -366,7 +426,7 @@ fn poll_receive(dev: u64, bar: u64) -> i32 {
             }
         }
 
-        let address = RX_ADDRS[head].load(Ordering::Relaxed);
+        let address = state.rx_addrs[head].load(Ordering::Relaxed);
         let fresh = rx_descriptor(address);
         // SAFETY: re-arm the descriptor only after the frame was consumed.
         if unsafe {
@@ -384,25 +444,35 @@ fn poll_receive(dev: u64, bar: u64) -> i32 {
         if mmio_write(dev, bar, E1000_RDT, head as u32).is_err() {
             return -5;
         }
-        RX_HEAD.store(((head + 1) % RX_RING_LEN) as u32, Ordering::Release);
+        state
+            .rx_head
+            .store(((head + 1) % RX_RING_LEN) as u32, Ordering::Release);
     }
     0
 }
 
 extern "C" fn datapath_poll(dev_token: u64) -> i32 {
-    if !READY.load(Ordering::Acquire) || DEV_TOKEN.load(Ordering::Acquire) != dev_token {
+    let Some(state) = device_state(dev_token) else {
+        return -19;
+    };
+    if !state.ready.load(Ordering::Acquire) || state.dev_token.load(Ordering::Acquire) != dev_token
+    {
         return -19;
     }
-    let bar = BAR0.load(Ordering::Acquire);
+    let bar = state.bar0.load(Ordering::Acquire);
     // ICR is read-to-clear. IRQ delivery and periodic fallback share this
     // callback, so acknowledging here is safe for both modes.
     let _ = mmio_read(dev_token, bar, E1000_ICR);
-    poll_receive(dev_token, bar)
+    poll_receive(state, dev_token, bar)
 }
 
 /// C-ABI probe thunk. Brings the 82540 up through opaque kernel handles and
 /// registers the copy-mode interface. A bogus token fails closed.
 extern "C" fn probe_c(dev_token: u64, _reserved: u64) -> i32 {
+    let state = match reserve_device(dev_token) {
+        Ok(state) => state,
+        Err(errno) => return errno,
+    };
     // SAFETY: C-ABI kernel export; `dev_token` is the call-gated handle this
     // probe was invoked with.
     if unsafe { narf_pci_enable(dev_token, PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER) } != 0 {
@@ -513,7 +583,7 @@ extern "C" fn probe_c(dev_token: u64, _reserved: u64) -> i32 {
         return -5;
     }
 
-    if let Err(errno) = init_dma_rings(dev_token, bar0) {
+    if let Err(errno) = init_dma_rings(state, dev_token, bar0) {
         return errno;
     }
     // Allocating the persistent rings must not make the freed scratch handle
@@ -532,19 +602,21 @@ extern "C" fn probe_c(dev_token: u64, _reserved: u64) -> i32 {
         return -5;
     }
 
-    DEV_TOKEN.store(dev_token, Ordering::Relaxed);
-    BAR0.store(bar0, Ordering::Relaxed);
-    READY.store(true, Ordering::Release);
+    state.dev_token.store(dev_token, Ordering::Relaxed);
+    state.bar0.store(bar0, Ordering::Relaxed);
+    state.ready.store(true, Ordering::Release);
 
     let mut ifindex = 0u32;
     // SAFETY: `mac` and `ifindex` are live locals and `net_tx` remains mapped
     // until the context is torn down before module unmap.
-    if unsafe { narf_netif_register(dev_token, mac.as_ptr(), net_tx as usize, &mut ifindex) } != 0
+    if unsafe {
+        narf_netif_register_with_context(dev_token, mac.as_ptr(), net_tx as usize, &mut ifindex)
+    } != 0
         || ifindex == 0
     {
         return -5;
     }
-    IFINDEX.store(ifindex, Ordering::Release);
+    state.ifindex.store(ifindex, Ordering::Release);
 
     // Stage-3 IRQ path. QEMU's legacy 82540EM model commonly has no MSI-X
     // capability, so `-EOPNOTSUPP` is an expected fallback to the periodic

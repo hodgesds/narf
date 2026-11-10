@@ -577,6 +577,42 @@ kernel_abi! {
         }
     }
 
+    /// Register a device-aware Ethernet TX callback and return its ifindex.
+    /// `tx_callback` is an `extern "C" fn(u64, *const u8, usize) -> i32`; it runs in
+    /// the module's effective domain, receives `dev`, and consumes the frame before
+    /// returning.
+    ///
+    /// # Safety
+    /// `mac` names six readable bytes, `out_ifindex` names writable `u32`
+    /// storage, and `tx_callback` remains valid until device teardown.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_netif_register_with_context(
+        dev: u64,
+        mac: *const u8,
+        tx_callback: usize,
+        out_ifindex: *mut u32,
+    ) -> i32 {
+        if mac.is_null() || tx_callback == 0 || out_ifindex.is_null() {
+            return -22;
+        }
+        // SAFETY: the module promises six readable bytes.
+        let mut mac_bytes = [0u8; 6];
+        // SAFETY: the module promises six readable bytes.
+        mac_bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(mac, 6) });
+        // SAFETY: the callback address has the documented C signature and the
+        // bus context removes it before module text is unmapped.
+        let tx_callback: narf_bus::ModuleTxCtxFn = unsafe { core::mem::transmute(tx_callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_netif_register_with_context(owner, dev, mac_bytes, tx_callback) {
+            Ok(ifindex) => {
+                // SAFETY: non-null above; caller promises writable storage.
+                unsafe { out_ifindex.write(ifindex) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
     /// Deliver one copied Ethernet frame from a module RX ring into the kernel
     /// stack. The stack may rewrite bytes in place for XDP before the call
     /// returns; the module retains ownership of the backing storage.
@@ -763,6 +799,7 @@ fn smoke_kabi_netif_exports_require_cap() -> TestResult {
     });
     for name in [
         "narf_netif_register",
+        "narf_netif_register_with_context",
         "narf_wireless_open",
         "narf_wireless_submit",
         "narf_wireless_poll",

@@ -45,7 +45,7 @@
 //!     completion ring and fans frames out through `dispatch_rx_frame`
 //!     (ring mirror + kernel-stack delivery, e1000's shape).
 //! - **Netdev publication** — probe registers an `eth%d` netdev via
-//!   `narf_drivers_net_core::publish::publish_netdev` and stamps the
+//!   `narf_drivers_net_core::publish::publish_netdev_with_context` and stamps the
 //!   initial link sample from the `GET_LINK` reply. Carrier stops
 //!   being a probe-time photograph: the RX pump polls the
 //!   `DriverShared.ecr` event word (`vmxnet3_drv.c::vmxnet3_do_poll`
@@ -255,8 +255,11 @@ pub struct Vmxnet3Stats {
 // ── Driver state ────────────────────────────────────────────────────
 
 /// Live vmxnet3 controller. Built by `bring_up`; stored in a static
-/// `IrqSafeSpinLock` so the test harness can poke it after probe.
+/// instance registry so callbacks and diagnostics can retain it after probe.
 pub struct Vmxnet3Nic {
+    /// Bus identity and published name belong to this function, not the family.
+    pub addr: narf_bus::BusAddr,
+    ifname: crate::publish::IfName,
     /// PT register window (BAR0). Doorbells.
     pt: MmioRegion,
     /// VD register window (BAR1). Control plane.
@@ -339,6 +342,11 @@ impl core::fmt::Debug for Vmxnet3Nic {
 }
 
 impl Vmxnet3Nic {
+    /// The name assigned to this NIC, or empty before publication.
+    pub fn ifname(&self) -> &'static str {
+        self.ifname.get()
+    }
+
     /// Bring up the controller. See module-level docs for the
     /// 5-step sequence; this implements Stage 0 + Stage 1 + Stage 2
     /// plus the Stage 3 frame-ring channels: the returned
@@ -635,6 +643,8 @@ impl Vmxnet3Nic {
 
         Ok((
             Self {
+                addr: device.addr,
+                ifname: crate::publish::IfName::new(),
                 pt,
                 vd,
                 shared,
@@ -982,7 +992,7 @@ impl Vmxnet3Nic {
             .live_link_speed_mbps
             .swap(sample.speed_mbps.unwrap_or(0), Ordering::AcqRel);
         if prev_up != sample.carrier || prev_speed != sample.speed_mbps.unwrap_or(0) {
-            crate::publish::publish_link(vmxnet3_ifname(), sample);
+            crate::publish::publish_link(self.ifname(), sample);
         }
     }
 
@@ -1207,16 +1217,13 @@ impl Vmxnet3Nic {
 
 // ── Driver-match registration ───────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Arc<Vmxnet3Nic>>> = IrqSafeSpinLock::new(None);
+// Append-only: a stack send cookie remains tied to its original PCI function.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<Vmxnet3Nic>>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
-/// `dev_alloc_name`). Set once at probe; the device lives as long as the
-/// kernel, so the name is leaked into a `&'static str`.
-static VMXNET3_IFNAME: IrqSafeSpinLock<Option<&'static str>> = IrqSafeSpinLock::new(None);
-
-/// This NIC's interface name; empty until it has registered.
+/// First NIC's interface name for diagnostics; empty before publication.
 pub fn vmxnet3_ifname() -> &'static str {
-    VMXNET3_IFNAME.lock().unwrap_or("")
+    probed_controller().map_or("", |c| c.ifname())
 }
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent.
@@ -1224,7 +1231,7 @@ pub fn probe(
     device: BusDevice,
     cap: Cap<BusDeviceCap, WriteCap>,
 ) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() {
+    if CONTROLLERS.lock().iter().any(|c| c.addr == device.addr) {
         return Ok(());
     }
     // MEM_SPACE + BUS_MASTER + INTX_DISABLE — same shape as the other
@@ -1248,8 +1255,11 @@ pub fn probe(
     };
     *dev_inner.rx_ipc_prod.lock() = Some(rx_prod);
     let dev = Arc::new(dev_inner);
-    *CONTROLLER.lock() = Some(dev.clone());
-    spawn_pumps(dev.clone(), tx_cons);
+    let index = {
+        let mut controllers = CONTROLLERS.lock();
+        controllers.push(dev.clone());
+        controllers.len() - 1
+    };
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("vmxnet3"),
@@ -1265,7 +1275,12 @@ pub fn probe(
     // frames off the NIC ring directly while spinning, since the
     // spawned RX-pump task can't run while a syscall is parked
     // in `responsive_spin_until`.
-    let name = crate::publish::publish_netdev(dev.mac, vmxnet3_send_frame, dev.link_sample());
+    let name = crate::publish::publish_netdev_with_context(
+        dev.mac,
+        index as u64,
+        vmxnet3_send_frame,
+        dev.link_sample(),
+    );
     // `vmxnet3_get_drvinfo`: driver "vmxnet3", no version (the core reports the
     // kernel release), bus_info = pci_name().
     let bus_info = match device.addr {
@@ -1273,11 +1288,11 @@ pub fn probe(
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
     };
     narf_net::iface::set_driver_info(&name, "vmxnet3", None, bus_info);
-    *VMXNET3_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
+    dev.ifname.set(name);
     narf_net::iface::install_rx_drain(rx_pump_step);
     // One RX queue, MTU-sized descriptors: software GRO is what
     // amortizes the shared stack work under burst, e1000's rationale.
-    let _ = narf_net::iface::set_software_gro(vmxnet3_ifname(), true);
+    let _ = narf_net::iface::set_software_gro(dev.ifname(), true);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -1285,8 +1300,10 @@ pub fn probe(
         None => None,
     };
     if let Some(auth) = auth {
-        let _ = narf_net::registry().register(&auth, Vmxnet3Iface);
+        let _ = narf_net::registry().register(&auth, Vmxnet3Iface(dev.clone()));
     }
+
+    spawn_pumps(dev, tx_cons);
 
     Ok(())
 }
@@ -1346,7 +1363,7 @@ fn dispatch_rx_frame(device: &Vmxnet3Nic, frame: &mut [u8]) {
             }
         }
     }
-    crate::publish::deliver_rx(vmxnet3_ifname(), frame);
+    crate::publish::deliver_rx(device.ifname(), frame);
 }
 
 /// Called from a kernel-side polling task spawned at boot. Drains one
@@ -1355,21 +1372,21 @@ fn dispatch_rx_frame(device: &Vmxnet3Nic, frame: &mut [u8]) {
 /// spinning, since the spawned RX-pump task can't run while a syscall
 /// is parked in `responsive_spin_until` (e1000's shape).
 pub fn rx_pump_step() -> bool {
-    match probed_controller() {
-        Some(c) => {
-            c.poll_events();
-            c.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| dispatch_rx_frame(&c, frame)) != 0
-        }
-        None => false,
+    let controllers = CONTROLLERS.lock().clone();
+    let mut any = false;
+    for c in controllers {
+        c.poll_events();
+        any |= c.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| dispatch_rx_frame(&c, frame)) != 0;
     }
+    any
 }
 
-/// Stack `SendFn`: transmit through the probed controller. Clone the
-/// `Arc` out rather than holding the IRQ-masking CONTROLLER lock
+/// Stack `SendCtxFn`: transmit through the cookie's controller. Clone the
+/// `Arc` out rather than holding the IRQ-masking CONTROLLERS lock
 /// across `transmit` (e1000's thundering-herd note). No offloads are
 /// advertised, so `meta` is ignored and every frame goes out plain.
-fn vmxnet3_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
-    let ctrl = probed_controller().ok_or(())?;
+fn vmxnet3_send_frame(cookie: u64, frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = controller(usize::try_from(cookie).map_err(|_| ())?).ok_or(())?;
     ctrl.transmit(frame).map_err(|_| ())
 }
 
@@ -1387,13 +1404,13 @@ pub fn register_pci_driver() {
 
 /// `true` once `probe` has installed a controller.
 pub fn is_probed() -> bool {
-    CONTROLLER.lock().is_some()
+    instance_count() != 0
 }
 
-/// Clone the installed controller handle, holding `CONTROLLER` only for
+/// Clone the first installed controller handle, holding `CONTROLLERS` only for
 /// the refcount bump.
 ///
-/// `CONTROLLER` is an `IrqSafeSpinLock`, so holding it across a device
+/// `CONTROLLERS` is an `IrqSafeSpinLock`, so holding it across a device
 /// round-trip masks interrupts on the waiting CPU for the whole wait
 /// and forces every other CPU touching the NIC to spin with interrupts
 /// masked too. Cloning the `Arc` out instead keeps the device alive
@@ -1402,23 +1419,33 @@ pub fn is_probed() -> bool {
 /// only across the bounded descriptor post/drain, never across a
 /// device wait.
 pub fn probed_controller() -> Option<Arc<Vmxnet3Nic>> {
-    CONTROLLER.lock().clone()
+    controller(0)
+}
+
+/// Resolve the stable send cookie assigned at probe.
+pub fn controller(index: usize) -> Option<Arc<Vmxnet3Nic>> {
+    CONTROLLERS.lock().get(index).cloned()
+}
+
+/// Number of retained PCI functions.
+pub fn instance_count() -> usize {
+    CONTROLLERS.lock().len()
 }
 
 /// Test-side accessor.
 pub fn with_controller<R>(f: impl FnOnce(&Vmxnet3Nic) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(|c| f(c))
+    probed_controller().map(|c| f(&c))
 }
 
 #[derive(Debug)]
-pub struct Vmxnet3Iface;
+pub struct Vmxnet3Iface(pub Arc<Vmxnet3Nic>);
 
 impl Interface for Vmxnet3Iface {
     fn name(&self) -> &str {
-        vmxnet3_ifname()
+        self.0.ifname()
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.0.mac
     }
     fn mtu(&self) -> u32 {
         DEFAULT_MTU as u32
@@ -1426,47 +1453,29 @@ impl Interface for Vmxnet3Iface {
     fn link_up(&self) -> bool {
         // Live carrier, maintained by the RX pump's ECR drain /
         // periodic GET_LINK re-sample — not the probe-time snapshot.
-        with_controller(|c| c.live_link_up.load(Ordering::Acquire)).unwrap_or(false)
+        self.0.live_link_up.load(Ordering::Acquire)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.rx_ipc_ring.lock().take();
-                if r.is_some() {
-                    c.rx_mirror_enabled.store(true, Ordering::Release);
-                }
-            }
-        });
-        &RING
+        self.0.rx_mirror_enabled.store(true, Ordering::Release);
+        &self.0.rx_ipc_ring
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-        static RING: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> =
-            IrqSafeSpinLock::new(None);
-        with_controller(|c| {
-            let mut r = RING.lock();
-            if r.is_none() {
-                *r = c.tx_ipc_ring.lock().take();
-            }
-        });
-        &RING
+        &self.0.tx_ipc_ring
     }
 }
 
 impl crate::HwNic for Vmxnet3Iface {
     fn name(&self) -> &'static str {
-        vmxnet3_ifname()
+        self.0.ifname()
     }
     fn mac(&self) -> [u8; 6] {
-        with_controller(|c| c.mac).unwrap_or([0; 6])
+        self.0.mac
     }
     fn mtu(&self) -> u32 {
         DEFAULT_MTU as u32
     }
     fn link_up(&self) -> bool {
-        with_controller(|c| c.live_link_up.load(Ordering::Acquire)).unwrap_or(false)
+        self.0.live_link_up.load(Ordering::Acquire)
     }
     fn model(&self) -> crate::NicModel {
         crate::NicModel::VmwareVmxnet3

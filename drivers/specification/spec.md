@@ -157,6 +157,16 @@ review.
 
 ### 3.4 Dual-build placement and the current module bridge
 
+The additive C export `narf_netif_register_with_context(dev, mac, tx, out_ifindex)`
+requires `NetIface:Write` and registers
+`extern "C" fn(dev: u64, frame: *const u8, len: usize) -> i32`. The kernel
+passes the original device token on every transmit through the same
+capability check and module lifecycle/domain gate as the legacy
+`narf_netif_register` export. The legacy callback signature remains supported.
+Drivers supporting several devices in one module image must resolve their
+state by this token; module identity or PCI vendor/device IDs alone cannot
+select a device instance.
+
 An in-tree dual-build driver declares one static registration path for the
 kernel image and one C-ABI registration path for a `.ko`. Built-in code and
 resource placement remain compile-time choices (e1000 assigns coherent rings

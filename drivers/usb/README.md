@@ -22,6 +22,14 @@ probe paths: they are discovered and logged but defer live operation,
 since the bring-up target hardware is xHCI-only, while the registrations
 keep expansion cards and future SoCs from showing up as unbound devices.
 
+Several xHCI controllers and identical USB devices can coexist. Bindings
+carry the controller ID as well as the slot and hub-port numbers, including
+runtime suspend and wake selection. USB serial, input, storage, camera,
+sound and smart-card publications allocate per-device names and minors;
+unplugging one instance preserves the others. NICs appear as separate
+interfaces in `/sys/class/net`, while USB serial adapters have separate
+`/dev/ttyUSB<N>` or `/dev/ttyACM<N>` nodes and tty sysfs entries.
+
 ## Enumeration and transfers
 
 Above the controller sit the shared mechanisms every class driver uses:
@@ -45,7 +53,7 @@ parsing, keyboard, mouse, touchpad, and consumer-control decoders, plus
 vendor quirk tables for Apple, Microsoft, Logitech (Unifying/DJ
 receivers and HID++), and Wacom. Communications Device Class support
 covers CDC descriptor parsing, ACM (USB serial modems, feeding the
-`/dev/ttyUSB*` nodes through a devfs bridge) and NCM (USB networking),
+`/dev/ttyACM*` nodes through a devfs bridge) and NCM (USB networking),
 alongside dedicated USB-Ethernet drivers for the Realtek RTL8152/8153
 family. Mass Storage uses Bulk-Only Transport with an embedded SCSI
 command set to present USB drives to the block layer. USB Audio (UAC)

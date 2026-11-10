@@ -128,8 +128,8 @@ impl LinkSample {
 }
 
 /// The interface name `iface::register` assigned a driver, held for
-/// the kernel's lifetime. One static per driver family, mirroring
-/// e1000's `E1000_IFNAME`: the name is leaked into a `&'static str`
+/// the kernel's lifetime. Each device instance owns its own slot;
+/// the name is leaked into a `&'static str`
 /// because the device — and therefore its registration — lives as long
 /// as the kernel.
 #[derive(Debug)]

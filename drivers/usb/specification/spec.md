@@ -161,6 +161,21 @@ also consult upstream Linux GPL sources.
   bound after the supervisors start gets its own. The interrupt handler
   services every controller. System PM halts/resumes every controller, and
   class resume replays run per controller.
+- Runtime suspend dispatch is
+  `class_registry::dispatch_suspend(controller, hub_slot, port)`;
+  `UsbSuspendFn` receives the same three coordinates. r8152, CDC-NCM,
+  CDC-ECM, btusb and UVC match the controller before selecting a record or
+  vetoing a port suspend. Resume and `suspended_hub_ports(controller)` wake
+  snapshots use the same identity, including when two controllers assign
+  the same slot and downstream port. Detaching one controller's device
+  preserves the other device's interface and devfs/sysfs publication.
+  Class drivers and suspend hooks each have a 32-entry registration budget;
+  repeated registration under the same name does not consume another entry.
+- UVC registry indices are append-only. Detach marks matching entries retired,
+  stops their streams, releases descriptor/control tables and withdraws video
+  nodes. Indexed operations reject retired entries. Removing a camera never
+  shifts another camera's capture-pump or pending-control index; a replug
+  receives a new index and video node.
 - Before an installed `narf.disks=root-ro|root-rw` root is mounted, USB late
   initialization primes the normal supervisors (one per controller; the
   root may sit behind any of them) if the unique `root=UUID=` is
@@ -245,12 +260,12 @@ also consult upstream Linux GPL sources.
   on a root port — and each NIC record stores it as `hub_port`
   plus a `suspended` park flag and a `wakeup_armed` flag. The
   supervisor's `idle_suspend_pass` calls `dispatch_suspend`
-  for a candidate port BEFORE gating it (a gated port blocks
+  with the controller ID for a candidate port BEFORE gating it (a gated port blocks
   all transfers, including the arming transfer); if any hook
   reports a failed park, gating is skipped that cycle and
   retried next cycle. Hooks are async (a sync hook bridging
   with `block_on` would panic inside the supervisor's executor
-  poll) and self-filter by hub context; they never hold their
+  poll) and self-filter by controller and hub context; they never hold their
   record lock across an await. Per-family park shapes: all
   three pumps park in place (yield without transfers, error
   counts, or link sampling; `pump_running` stays true, so

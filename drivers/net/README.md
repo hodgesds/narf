@@ -26,6 +26,27 @@ its PCI ids as a built-in; `e1000-module-only` suppresses that claim so an
 initramfs-loaded `e1000.ko` can own the device exclusively. Run `cargo xtask
 e1000-module-net-smoke --arch=x86_64` for the live TCP/UDP/DNS acceptance path.
 
+Operational PCI Ethernet drivers bind per bus address, including identical cards.
+VMXNET3 exposes independent `ethN` interfaces, frame rings and link state;
+e1000 and IGC also retain independent state for up to 32 devices in one
+loadable module image. Interfaces appear individually in `/sys/class/net`
+and rtnetlink; Ethernet interfaces do not allocate devfs character nodes.
+USB Ethernet adapters publish separate `usb-rtlN`, `usb-ncmN`, `usb-ecmN`,
+and other family-specific interfaces through the USB class drivers.
+Wi-Fi drivers in `drivers/wireless/` have separate ownership paths. Several
+PCI families still retain one controller; support for multiple Wi-Fi
+adapters, including USB Wi-Fi, needs a separate audit.
+
+To exercise two identical virtual NICs without configuring host networking:
+
+```sh
+XTASK_QEMU_VMXNET3=1 XTASK_QEMU_SECOND_NIC=1 cargo xtask test --arch=x86_64 --subsystem drivers/net/vmxnet3
+XTASK_QEMU_SECOND_NIC=1 cargo xtask test --arch=x86_64 --subsystem modules/e2e
+```
+
+These use QEMU user networking. Physical-device acceptance remains a separate
+check; successful enumeration alone does not validate hardware traffic.
+
 ## Conventions
 
 - Each driver lives in `src/<name>.rs` (or `src/<name>/` directory

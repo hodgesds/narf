@@ -1640,35 +1640,73 @@ pub mod tests {
     // ── Registry / detach ────────────────────────────────────
 
     fn smoke_serial_detach_unregisters_publication() -> TestResult {
-        devfs_bridge::__reset_for_test();
+        use narf_filesystem::sysfs::{__reset_for_test as reset_sysfs, class_register};
+        reset_sysfs();
         clear_serial(0);
-        let idx = devfs_bridge::register_tty_usb(ChipFamily::Cp210x);
-        SERIAL_PORTS.of(0).lock().push(BoundPort {
-            slot_id: 42,
-            family: ChipFamily::Cp210x,
-            pid: 0xEA60,
-            tty_index: idx,
-            iface: 0,
-            bulk_in_dci: 3,
-            bulk_out_dci: 2,
-            settings: LineSettings::default(),
-            modem: ModemStatus::default(),
-            hub_port: None,
-        });
-        if bound_count() != 1 || devfs_bridge::port_count() != 1 {
-            return TestResult::Fail("bound port should be registered + published");
+        clear_serial(1);
+        devfs_bridge::__reset_for_test();
+        for controller in 0..2 {
+            let idx = devfs_bridge::register_tty_usb(ChipFamily::Cp210x);
+            SERIAL_PORTS.of(controller).lock().push(BoundPort {
+                slot_id: 42,
+                family: ChipFamily::Cp210x,
+                pid: 0xEA60,
+                tty_index: idx,
+                iface: 0,
+                bulk_in_dci: 3,
+                bulk_out_dci: 2,
+                settings: LineSettings::default(),
+                modem: ModemStatus::default(),
+                hub_port: None,
+            });
+            devfs_bridge::get_port(idx)
+                .unwrap()
+                .lock()
+                .rx
+                .push(&[b'A' + controller]);
         }
-        if !detach_serial(0, 42) {
-            return TestResult::Fail("detach should report a removal");
+        let result = (|| {
+            if bound_count() != 2 || devfs_bridge::port_count() != 2 {
+                return Err("identical serial adapters did not both publish");
+            }
+            let tty = class_register("tty");
+            for (name, minor, expected) in
+                [("ttyUSB0", "188:0\n", b'A'), ("ttyUSB1", "188:1\n", b'B')]
+            {
+                let node = tty.get_child(name).ok_or("serial sysfs node missing")?;
+                if node.attr_show("dev").as_deref() != Some(minor) {
+                    return Err("identical serial adapters share a device number");
+                }
+                let file = devfs_bridge::lookup_tty_usb(name).ok_or("serial devfs node missing")?;
+                let mut byte = [0u8; 1];
+                if narf_scheduler::block_on(file.read(0, &mut byte)) != Ok(1) || byte[0] != expected
+                {
+                    return Err("serial devfs read crossed controller bindings");
+                }
+            }
+            if !detach_serial(0, 42) || detach_serial(0, 42) {
+                return Err("serial detach was not idempotent");
+            }
+            if bound_count() != 1
+                || devfs_bridge::lookup_tty_usb("ttyUSB0").is_some()
+                || tty.get_child("ttyUSB0").is_some()
+                || devfs_bridge::lookup_tty_usb("ttyUSB1").is_none()
+                || tty.get_child("ttyUSB1").is_none()
+            {
+                return Err("detach removed the other controller's serial device");
+            }
+            Ok(())
+        })();
+        clear_serial(0);
+        clear_serial(1);
+        devfs_bridge::__reset_for_test();
+        reset_sysfs();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(message) => TestResult::Fail(message),
         }
-        if bound_count() != 0 || devfs_bridge::port_count() != 0 {
-            return TestResult::Fail("detach must drop binding and publication");
-        }
-        if detach_serial(0, 42) {
-            return TestResult::Fail("second detach should report no removal");
-        }
-        TestResult::Pass
     }
+
     kernel_test_in!(
         "drivers/usb/serial/port",
         smoke_serial_detach_unregisters_publication

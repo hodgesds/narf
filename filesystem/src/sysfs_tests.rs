@@ -835,8 +835,8 @@ fn smoke_sysfs_net_boot_add_uses_canonical_device_paths() -> TestResult {
 
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
-    fn two_devices() -> Vec<NetIfaceInfo> {
-        alloc::vec![
+    fn three_devices() -> Vec<NetIfaceInfo> {
+        let mut devices = alloc::vec![
             NetIfaceInfo {
                 name: "lo".to_string(),
                 mac: [0; 6],
@@ -877,10 +877,18 @@ fn smoke_sysfs_net_boot_add_uses_canonical_device_paths() -> TestResult {
                 }),
                 ..NetIfaceInfo::default()
             },
-        ]
+        ];
+        let mut second = devices[1].clone();
+        second.name = "eth1".to_string();
+        second.ifindex = 3;
+        second.mac[5] = 0x57;
+        second.carrier = false;
+        second.pci_parent.as_mut().unwrap().device = 4;
+        devices.push(second);
+        devices
     }
 
-    crate::sysfs::install_net_snapshot_hook(two_devices);
+    crate::sysfs::install_net_snapshot_hook(three_devices);
     crate::sysfs::populate_net_class();
     crate::uevent::begin_boot_udevd_replay();
     let emitted = crate::sysfs::emit_net_device_add_events();
@@ -935,8 +943,29 @@ fn smoke_sysfs_net_boot_add_uses_canonical_device_paths() -> TestResult {
             .iter()
             .filter(|event| event.action == UeventAction::Add && event.subsystem == "net")
             .collect();
-        if emitted != 2 || net_adds.len() != 2 {
+        if emitted != 3 || net_adds.len() != 3 {
             return Err("boot replay did not emit one ADD per network device");
+        }
+        if class_net.get_symlink("eth1").as_deref()
+            != Some("../../devices/pci0000:00/0000:00:04.0/net/eth1")
+        {
+            return Err("identical second NIC lost its own sysfs parent");
+        }
+        let second = root
+            .get_child("devices")
+            .and_then(|d| d.get_child("pci0000:00"))
+            .and_then(|h| h.get_child("0000:00:04.0"))
+            .and_then(|p| p.get_child("net"))
+            .and_then(|n| n.get_child("eth1"))
+            .ok_or("second identical NIC missing from sysfs")?;
+        if second.attr_show("ifindex").as_deref() != Some("3\n")
+            || second.attr_show("carrier").as_deref() != Some("0\n")
+            || canonical.attr_show("carrier").as_deref() != Some("1\n")
+            || !net_adds
+                .iter()
+                .any(|e| e.devpath == "/devices/pci0000:00/0000:00:04.0/net/eth1")
+        {
+            return Err("identical NIC attributes or ADD events crossed instances");
         }
         let eth0 = net_adds
             .into_iter()

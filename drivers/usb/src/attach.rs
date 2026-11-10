@@ -375,7 +375,7 @@ pub async fn idle_suspend_pass(xhci_dev: &crate::xhci::Xhci) -> usize {
         // retries next cycle; a detach in between drops the
         // candidate (its bound bit clears). Ports claimed by no
         // hook gate exactly as before.
-        let report = crate::class_registry::dispatch_suspend(*slot, *p).await;
+        let report = crate::class_registry::dispatch_suspend(xhci_dev.id(), *slot, *p).await;
         if report.failed > 0 {
             continue;
         }

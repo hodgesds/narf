@@ -6872,12 +6872,12 @@ async fn rx_pump(device: Arc<USBDevice>, idx: usize) {
 /// returns `Parked` without re-arming). Never holds the record
 /// lock across an await: lock to find, release, transfer, lock
 /// to set flags.
-async fn suspend_r8152_port(hub_slot: u8, port: u8) -> SuspendOutcome {
+async fn suspend_r8152_port(controller: u8, hub_slot: u8, port: u8) -> SuspendOutcome {
     // Read what arming needs, then release before any await.
     let target = {
         let g = RTL_DEVICES.lock();
         g.iter().find_map(|d| {
-            if !d.detached && d.hub_port == Some((hub_slot, port)) {
+            if d.controller == controller && !d.detached && d.hub_port == Some((hub_slot, port)) {
                 if d.suspended {
                     Some(None)
                 } else {
@@ -6922,10 +6922,12 @@ async fn suspend_r8152_port(hub_slot: u8, port: u8) -> SuspendOutcome {
     // (a detach in between wins; the pass's gating of a
     // device-less port is harmless).
     let mut g = RTL_DEVICES.lock();
-    match g
-        .iter_mut()
-        .find(|d| !d.detached && d.hub_port == Some((hub_slot, port)) && d.slot_id == slot_id)
-    {
+    match g.iter_mut().find(|d| {
+        d.controller == controller
+            && !d.detached
+            && d.hub_port == Some((hub_slot, port))
+            && d.slot_id == slot_id
+    }) {
         Some(rec) => {
             rec.suspended = true;
             rec.wakeup_armed = armed;
@@ -6944,8 +6946,12 @@ async fn suspend_r8152_port(hub_slot: u8, port: u8) -> SuspendOutcome {
 pub async fn resume_r8152_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port: u8) -> bool {
     let idx = {
         let g = RTL_DEVICES.lock();
-        g.iter()
-            .position(|d| !d.detached && d.suspended && d.hub_port == Some((hub_slot, port)))
+        g.iter().position(|d| {
+            d.controller == xhci_dev.id()
+                && !d.detached
+                && d.suspended
+                && d.hub_port == Some((hub_slot, port))
+        })
     };
     let Some(idx) = idx else {
         return false;
@@ -6967,10 +6973,10 @@ pub async fn resume_r8152_port(xhci_dev: &crate::xhci::Xhci, hub_slot: u8, port:
 /// Hub ports holding a parked (suspended, non-detached) r8152
 /// record. Mirrors `hid::hub_ports`, filtered to parked
 /// devices: the wake-watch step's candidate list.
-pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
+pub fn suspended_hub_ports(controller: u8) -> Vec<(u8, u8)> {
     let g = RTL_DEVICES.lock();
     g.iter()
-        .filter(|d| !d.detached && d.suspended)
+        .filter(|d| d.controller == controller && !d.detached && d.suspended)
         .filter_map(|d| d.hub_port)
         .collect()
 }
@@ -6981,7 +6987,7 @@ pub fn suspended_hub_ports() -> Vec<(u8, u8)> {
 /// acks the change bit, so no double-resume. Ports with no
 /// edge stay suspended.
 pub async fn wake_suspended_ports(xhci_dev: &crate::xhci::Xhci) {
-    for (hub_slot, port) in suspended_hub_ports() {
+    for (hub_slot, port) in suspended_hub_ports(xhci_dev.id()) {
         if crate::attach::hub_port_suspend_change(xhci_dev, hub_slot, port).await == Some(true) {
             let _ = resume_r8152_port(xhci_dev, hub_slot, port).await;
         }
@@ -7119,8 +7125,8 @@ pub fn detach_all_r8152(controller: u8) {
 /// failure with `Err(())`, never by panicking).
 pub fn register() {
     let _ = register_class_driver_with_unbind("r8152", MATCHES, probe, detach_r8152_slot);
-    let _ = crate::class_registry::register_suspend_hook("r8152", |slot, port| {
-        alloc::boxed::Box::pin(suspend_r8152_port(slot, port))
+    let _ = crate::class_registry::register_suspend_hook("r8152", |controller, slot, port| {
+        alloc::boxed::Box::pin(suspend_r8152_port(controller, slot, port))
     });
 }
 
@@ -10282,16 +10288,30 @@ pub mod tests {
             };
         {
             let mut g = RTL_DEVICES.lock();
+            let mut other = mk(7, Some((2, 3)), true, false);
+            other.controller = 1;
+            g.push(other);
             g.push(mk(7, Some((2, 3)), true, false));
             g.push(mk(8, Some((2, 4)), false, false));
             g.push(mk(9, None, true, false));
             g.push(mk(10, Some((2, 5)), true, true));
         }
-        let ports = suspended_hub_ports();
+        let ports = suspended_hub_ports(0);
+        let other_ports = suspended_hub_ports(1);
+        let no_ports = suspended_hub_ports(2);
+        let owns = narf_scheduler::block_on(suspend_r8152_port(1, 2, 3));
+        let unrelated = narf_scheduler::block_on(suspend_r8152_port(2, 2, 3));
         RTL_DEVICES.lock().clear();
         // Only the live parked hub-port device selects; the
         // running hub-port device, the parked root-port device
         // (no hub to gate), and the detached record do not.
+        if other_ports != alloc::vec![(2, 3)]
+            || !no_ports.is_empty()
+            || owns != crate::class_registry::SuspendOutcome::Parked
+            || unrelated != crate::class_registry::SuspendOutcome::NotMine
+        {
+            return TestResult::Fail("suspend or wake-watch selection crossed USB controllers");
+        }
         if ports != alloc::vec![(2, 3)] {
             return TestResult::Fail("suspended_hub_ports selected the wrong ports");
         }

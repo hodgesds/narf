@@ -40,6 +40,15 @@
 
 ## 3. Public interface
 
+`module_netif_register_with_context(owner, token, mac, ModuleTxCtxFn)`
+registers a device-aware copy-mode Ethernet callback with signature
+`extern "C" fn(token, frame, len) -> i32`. TX resolves the registered
+device token and validates its capability before entering the module's
+existing lifecycle/domain gate. `ModuleTxCallback::{Legacy, WithDevice}`
+preserves the old callback registration interface. Neither callback may
+retain the borrowed frame after returning. Driver information records the
+owning PCI BDF so identical adapters get separate sysfs parents.
+
 `driver_match::module_dma_retain_on_teardown(owner, token, retain)` verifies
 current device authority and owner before changing teardown retention. A module
 sets retention before posting DMA addresses and clears it only after a proven

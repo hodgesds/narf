@@ -162,16 +162,16 @@ pub type SuspendFuture = Pin<Box<dyn Future<Output = SuspendOutcome> + Send>>;
 /// Suspend hook signature — async, returning a boxed future (see
 /// the module docs: a sync hook could not bridge to transfers
 /// from inside the supervisor's executor poll). Called with the
-/// parent hub's slot id and the downstream port number, for a port
+/// controller index, parent hub's slot id and downstream port number, for a port
 /// the supervisor's idle-suspend pass is about to gate. The hook
 /// self-filters: it parks only a live (non-detached) device whose
-/// recorded hub context equals `(hub_slot, port)`, and returns
+/// recorded context equals `(controller, hub_slot, port)`, and returns
 /// [`SuspendOutcome::NotMine`] otherwise. It must be idempotent
 /// (an already-parked device returns `Parked` without re-arming)
 /// and panic-free (see the [`UsbUnbindFn`] contract: panic is
 /// fatal by policy). It must never hold its record lock across an
 /// `.await`: lock to find, release, transfer, lock to set flags.
-pub type UsbSuspendFn = fn(hub_slot: u8, port: u8) -> SuspendFuture;
+pub type UsbSuspendFn = fn(controller: u8, hub_slot: u8, port: u8) -> SuspendFuture;
 
 /// Unbind function signature — synchronous. Called with the controller
 /// index ([`crate::xhci::Xhci::id`]) and slot id of a device being
@@ -210,9 +210,10 @@ pub struct UnbindReport {
 
 // ── Registry internals ──────────────────────────────────────────────
 
-/// Maximum registered USB class drivers. 16 is more than enough for
-/// the foreseeable future (rtl8xxxu + btusb + cdc-acm + … etc.).
-const MAX_DRIVERS: usize = 16;
+/// Bound the class-driver/hook inventory, not the number of USB devices.
+/// The in-tree Ethernet, wireless and peripheral families have outgrown the
+/// original 16-entry budget once diagnostic hooks are registered as well.
+const MAX_DRIVERS: usize = 32;
 
 struct DriverEntry {
     name: &'static str,
@@ -309,6 +310,9 @@ fn register_class_driver_inner(
 /// hooks.
 pub fn register_suspend_hook(name: &'static str, hook: UsbSuspendFn) -> Result<(), UsbProbeError> {
     let mut g = SUSPEND_HOOKS.lock();
+    if g.iter().any(|entry| entry.name == name) {
+        return Ok(());
+    }
     if g.len() >= MAX_DRIVERS {
         return Err(UsbProbeError::RegistryFull);
     }
@@ -318,7 +322,7 @@ pub fn register_suspend_hook(name: &'static str, hook: UsbSuspendFn) -> Result<(
 
 /// Invoke every registered suspend hook for one hub port, in
 /// registration order, awaiting each before running the next.
-/// Hooks self-filter by `(hub_slot, port)` against their own
+/// Hooks self-filter by `(controller, hub_slot, port)` against their own
 /// records. A `ParkFailed` outcome is counted and dispatch
 /// CONTINUES with the remaining hooks (same isolation rule as
 /// [`dispatch_unbind`]): one hook's failure must never skip
@@ -329,7 +333,7 @@ pub fn register_suspend_hook(name: &'static str, hook: UsbSuspendFn) -> Result<(
 /// with no resume path. Ports claimed by no hook gate exactly as
 /// before (the HID behavior: no hook, no park step, gate as
 /// today).
-pub async fn dispatch_suspend(hub_slot: u8, port: u8) -> SuspendReport {
+pub async fn dispatch_suspend(controller: u8, hub_slot: u8, port: u8) -> SuspendReport {
     let hooks: Vec<UsbSuspendFn> = {
         let g = SUSPEND_HOOKS.lock();
         g.iter().map(|entry| entry.hook).collect()
@@ -341,7 +345,7 @@ pub async fn dispatch_suspend(hub_slot: u8, port: u8) -> SuspendReport {
     };
     for hook in hooks {
         report.invoked += 1;
-        match hook(hub_slot, port).await {
+        match hook(controller, hub_slot, port).await {
             SuspendOutcome::NotMine => {}
             SuspendOutcome::Parked => report.parked += 1,
             SuspendOutcome::ParkFailed => report.failed += 1,
