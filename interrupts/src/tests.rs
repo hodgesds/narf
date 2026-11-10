@@ -1057,6 +1057,36 @@ fn smoke_vector_never_hands_out_fixed_vectors() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts", smoke_vector_never_hands_out_fixed_vectors);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_apic_id_of_cpu_is_by_identity_not_madt_order() -> TestResult {
+    // Scheduler CPU ids are APIC IDs. Steering an MSI by MADT position
+    // instead reaches the wrong CPU whenever firmware lists CPUs out of
+    // APIC-ID order, so the lookup must be by value.
+    let mut listed = 0usize;
+    while let Some(apic) = narf_acpi::apic_id_at(listed) {
+        if crate::apic_id_of_cpu(apic as usize) != Some(apic) {
+            return TestResult::Fail("listed APIC ID not resolved to itself");
+        }
+        listed += 1;
+    }
+    if listed == 0 {
+        return TestResult::Skip("no MADT processor entries");
+    }
+    let absent =
+        (0..=255usize).find(|id| (0..listed).all(|i| narf_acpi::apic_id_at(i) != Some(*id as u32)));
+    if let Some(absent) = absent {
+        if crate::apic_id_of_cpu(absent).is_some() {
+            return TestResult::Fail("APIC ID absent from the MADT was accepted");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts",
+    smoke_apic_id_of_cpu_is_by_identity_not_madt_order
+);
+
 fn smoke_vector_alloc_block_zero_rejected() -> TestResult {
     // alloc_block(0) is meaningless; it must surface OutOfRange
     // rather than silently succeed with no reservation.

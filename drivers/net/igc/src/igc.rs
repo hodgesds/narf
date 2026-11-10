@@ -490,13 +490,19 @@ pub const fn isr_rearm_mask(index: u8) -> u32 {
         0
     }
 }
+/// Acknowledge one MSI-X vector: clear the legacy causes (ICR is
+/// clear-on-read under GPIE.NSICR), then restore the EIMS bits this
+/// handler owns.
+pub(crate) fn service_vector(r: &impl Registers, rearm: u32) {
+    let _ = r.read(0x1500);
+    if rearm != 0 {
+        r.write(0x1524, rearm);
+    }
+}
 fn igc_isr(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
     let bound = *ISR_HW[cookie as usize & 255].lock();
     if let Some((hw, rearm)) = bound {
-        let _ = hw.read(0x1500);
-        if rearm != 0 {
-            hw.write(0x1524, rearm);
-        }
+        service_vector(&hw, rearm);
     }
     narf_interrupts::dispatch::IrqStatus::Handled
 }
@@ -752,7 +758,7 @@ impl Igc {
         if let Some(table) = self.msix.lock().as_mut() {
             for route in &self.irq_routes {
                 #[cfg(target_arch = "x86_64")]
-                let target = narf_interrupts::apic_id_at(route.cpu as usize)
+                let target = narf_interrupts::apic_id_of_cpu(route.cpu as usize)
                     .ok_or(IgcError::BarMapFailed)?;
                 #[cfg(target_arch = "aarch64")]
                 let target = 0;
@@ -844,6 +850,19 @@ impl Igc {
         // All ring bases, handlers and retained allocations precede BME.
         // Global engines must run before QUEUE_ENABLE can acknowledge.
         let activation = hardware::activate_queues(&self.hw, &rx_counts[..queues.len()], || {
+            // set_command repeats this walk; doing it here first reports
+            // when firmware left a port above the NIC unable to forward its
+            // DMA and MSI-X (the physical I225 completion stall).
+            let enabled = narf_bus::pci::enable_upstream_bridges(&self.device);
+            if enabled != 0 {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "[igc] {} enabled forwarding on {enabled} upstream bridge(s): {:x?}",
+                    self.name(),
+                    narf_bus::pci::upstream_bridge_commands(&self.device)
+                );
+            }
             narf_bus::pci::set_command(&self.hw.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
                 .map_err(|_| IgcError::BarMapFailed)?;
             let command = narf_bus::pci::read_command(&self.hw.cap, &self.device)
@@ -1265,6 +1284,22 @@ impl Igc {
                 "[igc] PCIe device_control={:#x} device_status={:#x}",
                 status.device_control,
                 status.device_status,
+            );
+        }
+        // Whether the path to the root forwards this NIC's writes, and
+        // whether any of its MSI-X messages ever reached a CPU.
+        let _ = writeln!(
+            narf_console::Writer,
+            "[igc] upstream bridge commands: {:x?}",
+            narf_bus::pci::upstream_bridge_commands(&self.device)
+        );
+        for route in &self.irq_routes {
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] msix entry {} vector {} fired {}",
+                route.index,
+                route.vector,
+                narf_interrupts::dispatch::fire_count(route.vector)
             );
         }
         for (q, queue) in self.queues().iter().enumerate() {
