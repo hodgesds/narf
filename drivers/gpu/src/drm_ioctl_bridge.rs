@@ -670,7 +670,8 @@ impl VirtGpuRenderState {
         if self.find(handle).is_some() {
             return Err(FsError::AlreadyExists);
         }
-        let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(invalid_at(line!()))?;
+        let dev =
+            narf_drivers_virtio::gpu_pci::probed_device().ok_or_else(|| invalid_at(line!()))?;
         self.ensure_context(dev)?;
         dev.attach_virgl_resource(self.ctx_id, resource.resource_id)
             .map_err(map_gpu_transport_error)?;
@@ -911,8 +912,10 @@ pub(crate) fn read_exec_syncobjs(
     for index in 0..count {
         let offset = u64::from(index)
             .checked_mul(u64::from(stride))
-            .ok_or(invalid_at(line!()))?;
-        let address = base.checked_add(offset).ok_or(invalid_at(line!()))?;
+            .ok_or_else(|| invalid_at(line!()))?;
+        let address = base
+            .checked_add(offset)
+            .ok_or_else(|| invalid_at(line!()))?;
         let address = usize::try_from(address).map_err(|_| invalid_at(line!()))?;
         // Linux zero-fills the part omitted by a short extensible stride.
         let mut wire = [0u8; 16];
@@ -959,7 +962,7 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
     const BLOB_FLAG_USE_MASK: u32 =
         BLOB_FLAG_USE_MAPPABLE | BLOB_FLAG_USE_SHAREABLE | BLOB_FLAG_USE_CROSS_DEVICE;
 
-    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(invalid_at(line!()))?;
+    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or_else(|| invalid_at(line!()))?;
     if !dev.resource_blob_enabled()
         || req.size == 0
         || req.blob_flags & !BLOB_FLAG_USE_MASK != 0
@@ -1043,7 +1046,7 @@ fn handle_resource_create_blob(arg: usize, state: &VirtGpuRenderState) -> Result
             )
             .map_err(|_| invalid_at(line!()))?;
             if req.blob_flags & BLOB_FLAG_USE_MAPPABLE != 0 {
-                let base = dev.host_visible_base().ok_or(invalid_at(line!()))?;
+                let base = dev.host_visible_base().ok_or_else(|| invalid_at(line!()))?;
                 let offset = dev
                     .alloc_host_visible(req.size)
                     .ok_or(FsError::OutOfMemory)?;
@@ -1323,7 +1326,8 @@ fn register_card_virtgpu_resource(
         (req.bo_handle, false)
     };
     let resource = state.find(old_handle).ok_or(FsError::NotFound)?;
-    let mode_state = crate::drm_registry::mode_state(card_index).ok_or(invalid_at(line!()))?;
+    let mode_state =
+        crate::drm_registry::mode_state(card_index).ok_or_else(|| invalid_at(line!()))?;
     let handle = {
         let card = mode_state.lock();
         if card.gem.lookup(old_handle).is_none() {
@@ -1442,7 +1446,8 @@ fn dispatch_virtgpu_render_inner(
         }
         DRM_IOCTL_VIRTGPU_CONTEXT_INIT => {
             let req: DrmVirtGpuContextInitUapi = read_uapi(arg)?;
-            let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(invalid_at(line!()))?;
+            let dev =
+                narf_drivers_virtio::gpu_pci::probed_device().ok_or_else(|| invalid_at(line!()))?;
             if !dev.context_init_enabled() || !dev.virgl_enabled() || req.num_params > 4 {
                 return Err(invalid_at(line!()));
             }
@@ -1610,7 +1615,7 @@ fn dispatch_virtgpu_render_inner(
                         && capset.capset_max_version >= req.cap_set_ver
                         && capset.capset_max_size != 0
                 })
-                .ok_or(invalid_at(line!()))?;
+                .ok_or_else(|| invalid_at(line!()))?;
             let caps = dev
                 .virgl_capset(req.cap_set_id, req.cap_set_ver)
                 .map_err(map_gpu_transport_error)?;
@@ -1681,7 +1686,7 @@ fn dispatch_virtgpu_render_inner(
                             .get(dep.handle)
                             .map_err(|_| invalid_at(line!()))?
                             .fence()
-                            .ok_or(invalid_at(line!()))
+                            .ok_or_else(|| invalid_at(line!()))
                     })
                     .collect::<Result<Vec<_>, _>>()?
             };
@@ -1840,7 +1845,7 @@ pub fn dispatch_virtgpu_mmap(
         return Err(invalid_at(line!()));
     }
     let handle = (offset >> 12) as u32;
-    let resource = state.find(handle).ok_or(invalid_at(line!()))?;
+    let resource = state.find(handle).ok_or_else(|| invalid_at(line!()))?;
     if !resource.is_cpu_mappable() || len > resource.len() {
         return Err(invalid_at(line!()));
     }
@@ -2084,27 +2089,29 @@ pub fn dispatch_card(
 
 /// Bring-up visibility for every ioctl on a DRM card or render fd (KMS,
 /// amdgpu GEM/VM/CS/BO-list/info, syncobj): log an EINVAL once per ioctl
-/// command, with the line [`invalid_at`] last recorded in this file (0 when
-/// the error was built in another module). The driver dispatchers run
+/// command, check and rule, with the line [`invalid_at`] last recorded in
+/// this file (0 when the error was built in another module) and the rule
+/// [`refused`] last named. The driver dispatchers run
 /// before [`dispatch_card_for_file`], so its own trace misses them.
 pub(crate) fn note_drm_fd_einval(cmd: u32, result: &Result<u64, FsError>) {
     if !matches!(result, Err(FsError::InvalidData)) {
         return;
     }
-    static SEEN: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u32, u32)>> =
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u32, u32, &'static str)>> =
         narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
     let line = LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed);
+    let why = last_refusal().unwrap_or("");
     {
         let mut seen = SEEN.lock();
-        if seen.len() >= 64 || seen.contains(&(cmd, line)) {
+        if seen.len() >= 64 || seen.contains(&(cmd, line, why)) {
             return;
         }
-        seen.push((cmd, line));
+        seen.push((cmd, line, why));
     }
     use core::fmt::Write;
     let _ = writeln!(
         narf_console::Writer,
-        "  drm: fd ioctl {cmd:#010x} (nr {:#x}) EINVAL (last bridge line {line})",
+        "  drm: fd ioctl {cmd:#010x} (nr {:#x}) EINVAL (last bridge line {line}, why=\"{why}\")",
         drm_uapi::ioc_nr(cmd),
     );
 }
@@ -2112,7 +2119,31 @@ pub(crate) fn note_drm_fd_einval(cmd: u32, result: &Result<u64, FsError>) {
 /// Clear the recorded [`invalid_at`] line before an fd ioctl runs, so a
 /// trace names this call's check rather than an earlier one's.
 pub(crate) fn reset_invalid_line() {
-    LAST_INVALID_LINE.store(0, core::sync::atomic::Ordering::Relaxed);
+    use core::sync::atomic::Ordering::Relaxed;
+    LAST_INVALID_LINE.store(0, Relaxed);
+    // Every DRM fd ioctl resets: one load unless a rule was named since.
+    if REFUSAL_NAMED.load(Relaxed) {
+        REFUSAL_NAMED.store(false, Relaxed);
+        *LAST_REFUSAL.lock() = None;
+    }
+}
+
+/// The rule [`refused`] last named (None: none since the reset).
+pub(crate) fn last_refusal() -> Option<&'static str> {
+    if !REFUSAL_NAMED.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    *LAST_REFUSAL.lock()
+}
+
+/// EINVAL from a named rule: `reason` says which object or property broke
+/// which Linux check, for the refusal traces ([`note_atomic_rejection`],
+/// [`note_drm_fd_einval`]). Only ever called on a refusal, never on the
+/// path of a request that succeeds.
+pub(crate) fn refused(reason: &'static str) -> FsError {
+    *LAST_REFUSAL.lock() = Some(reason);
+    REFUSAL_NAMED.store(true, core::sync::atomic::Ordering::Relaxed);
+    FsError::InvalidData
 }
 
 /// The source line [`invalid_at`] last recorded (0: none since the reset).
@@ -2847,7 +2878,7 @@ fn wait_vblank_begin(
         0 => usize::from(flags & VBLANK_SECONDARY != 0),
         high => (high >> 1) as usize,
     };
-    let crtc_id = card.crtcs.get(index).ok_or(invalid_at(line!()))?.id;
+    let crtc_id = card.crtcs.get(index).ok_or_else(|| invalid_at(line!()))?.id;
     // drm_vblank_get fails on a CRTC whose vblank is off.
     let t = card.vblank_time(crtc_id).map_err(|_| invalid_at(line!()))?;
     let mut target = if kind & VBLANK_RELATIVE != 0 {
@@ -2859,7 +2890,7 @@ fn wait_vblank_begin(
         target = t.count + 1;
     }
     if flags & VBLANK_EVENT != 0 {
-        let mut queue = events.ok_or(invalid_at(line!()))?.lock();
+        let mut queue = events.ok_or_else(|| invalid_at(line!()))?.lock();
         queue
             .ensure_flip_event_space(1)
             .map_err(|_| FsError::OutOfMemory)?;
@@ -2985,7 +3016,7 @@ fn handle_crtc_queue_sequence(
     if flags & NEXT_ON_MISS != 0 && crate::drm::card::vblank_passed(t.count, target) {
         target = t.count + 1;
     }
-    let mut queue = events.ok_or(invalid_at(line!()))?.lock();
+    let mut queue = events.ok_or_else(|| invalid_at(line!()))?.lock();
     queue
         .ensure_flip_event_space(1)
         .map_err(|_| FsError::OutOfMemory)?;
@@ -3757,7 +3788,7 @@ fn blob_value(
         return Ok(0);
     }
     let id = u32::try_from(value).map_err(|_| invalid_at(line!()))?;
-    let data = card.property_blob(id).ok_or(invalid_at(line!()))?;
+    let data = card.property_blob(id).ok_or_else(|| invalid_at(line!()))?;
     if size.is_some_and(|n| data.len() != n) || element.is_some_and(|n| data.len() % n != 0) {
         return Err(invalid_at(line!()));
     }
@@ -3864,14 +3895,17 @@ fn crtc_color_property(
                 card,
                 value,
                 Some(
-                    card.intel_lut_sizes(crtc).ok_or(invalid_at(line!()))?.1 * COLOR_LUT_ENTRY_SIZE,
+                    card.intel_lut_sizes(crtc)
+                        .ok_or_else(|| invalid_at(line!()))?
+                        .1
+                        * COLOR_LUT_ENTRY_SIZE,
                 ),
                 None,
             )?;
             #[cfg(feature = "intel")]
             if id != 0 {
                 crate::intel_gpu_color::DegammaLut::decode_profile(
-                    card.property_blob(id).ok_or(invalid_at(line!()))?,
+                    card.property_blob(id).ok_or_else(|| invalid_at(line!()))?,
                     card.intel_lut_profile(),
                 )?;
             }
@@ -4077,8 +4111,10 @@ fn connector_color_property(
             if native.and_then(|n| n.color_format).is_none() {
                 return Err(invalid_at(line!()));
             }
-            change.color_format =
-                Some(crate::drm::card::ColorFormat::from_linux(value).ok_or(invalid_at(line!()))?);
+            change.color_format = Some(
+                crate::drm::card::ColorFormat::from_linux(value)
+                    .ok_or_else(|| invalid_at(line!()))?,
+            );
         }
         COLORSPACE_PROP_ID => {
             if native.and_then(|n| n.colorspace).is_none()
@@ -5574,11 +5610,25 @@ fn atomic_card(card: &crate::drm::card::Card) -> bool {
 /// atomic path has dozens of silent EINVAL returns). Best effort under
 /// concurrent ioctls; the atomic handler resets it per request.
 static LAST_INVALID_LINE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The rule that last refused a request, in words ([`refused`]): the
+/// checks outside this file (`drm_native_planes`) have no line here to
+/// record. Reset with the line.
+static LAST_REFUSAL: narf_lib::sync::IrqSafeSpinLock<Option<&'static str>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Whether [`LAST_REFUSAL`] holds a rule, so the per-ioctl reset and the
+/// traces take its lock only after a refusal named one.
+static REFUSAL_NAMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[inline]
 fn invalid_at(line: u32) -> FsError {
     LAST_INVALID_LINE.store(line, core::sync::atomic::Ordering::Relaxed);
     FsError::InvalidData
+}
+
+/// [`invalid_at`] with the rule in words ([`refused`]).
+fn invalid_why(line: u32, reason: &'static str) -> FsError {
+    LAST_INVALID_LINE.store(line, core::sync::atomic::Ordering::Relaxed);
+    refused(reason)
 }
 
 fn handle_atomic(
@@ -5748,9 +5798,16 @@ fn note_atomic_rejection(
         narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
     let mut error_text = alloc::string::String::new();
     let _ = write!(error_text, "{error:?}");
+    // The check that refused it is part of the key: two requests with the
+    // same properties refused by different rules are both worth a line.
+    let line_at = LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed);
+    let why = last_refusal().unwrap_or("");
     let error_key = error_text
         .bytes()
-        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+        .chain(why.bytes())
+        .fold(u64::from(line_at), |h, b| {
+            h.wrapping_mul(31).wrapping_add(u64::from(b))
+        });
     {
         let mut seen = SEEN.lock();
         if seen.len() >= ATOMIC_REJECT_LOG_LIMIT
@@ -5765,8 +5822,7 @@ fn note_atomic_rejection(
     let mut line = alloc::string::String::new();
     let _ = write!(
         line,
-        "  drm: ATOMIC refused flags={flags:#x} err={error_text} at drm_ioctl_bridge.rs:{}:",
-        LAST_INVALID_LINE.load(core::sync::atomic::Ordering::Relaxed)
+        "  drm: ATOMIC refused flags={flags:#x} err={error_text} at drm_ioctl_bridge.rs:{line_at} why=\"{why}\":"
     );
     let mut at = 0usize;
     let card = mode_state.lock();
@@ -5831,6 +5887,8 @@ fn atomic_commit(
         ..
     } = req;
     let total_props = props.len();
+    // A refusal below names this request's check, not an earlier one's.
+    reset_invalid_line();
 
     // The exact timing an atomic MODE_ID set, for the native display.
     let mut native_modes: Vec<(u32, crate::drm::ioctl::DrmModeModeInfo)> = Vec::new();
@@ -5888,7 +5946,7 @@ fn atomic_commit(
             let end = prop_index
                 .checked_add(object_prop_count)
                 .filter(|end| *end <= props.len())
-                .ok_or(invalid_at(line!()))?;
+                .ok_or_else(|| invalid_at(line!()))?;
             let object_props = &props[prop_index..end];
             let object_values = &values[prop_index..end];
             prop_index = end;
@@ -5947,7 +6005,10 @@ fn atomic_commit(
                 // dm_check_cursor_fb on SRC_* in 16.16: an enabled cursor
                 // shows its whole framebuffer from 0,0, so no fraction.
                 if fraction && cursor_plane_shown(&card, &plane) {
-                    return Err(invalid_at(line!()));
+                    return Err(invalid_why(
+                        line!(),
+                        "cursor plane SRC_X/Y/W/H: fractional (dm_check_cursor_fb)",
+                    ));
                 }
                 if let (Some(crtc_ids), Some(crtc_id)) = (event_crtc_ids.as_mut(), plane.crtc_id) {
                     if !crtc_ids.contains(&crtc_id) {
@@ -6056,7 +6117,7 @@ fn atomic_commit(
                                 let mode = card
                                     .property_blob(value as u32)
                                     .filter(|blob| blob.len() == 68)
-                                    .ok_or(invalid_at(line!()))?;
+                                    .ok_or_else(|| invalid_at(line!()))?;
                                 // A native display runs only its published
                                 // timing; any other is refused at check time.
                                 if !card.accepts_mode_blob(mode) {
@@ -6177,7 +6238,10 @@ fn atomic_commit(
                             let bpc = max_bpc_value(&card, object_id, value)?;
                             // A modeset of the CRTC the connector drove.
                             if max_bpc_modeset(&card, object_id, bpc) && !state.allow_modeset {
-                                return Err(invalid_at(line!()));
+                                return Err(invalid_why(
+                                    line!(),
+                                    "connector 'max bpc' change is a modeset without ALLOW_MODESET (drm_atomic_helper_check_modeset)",
+                                ));
                             }
                             max_bpcs.retain(|(id, _)| *id != object_id);
                             max_bpcs.push((object_id, bpc));
@@ -6198,7 +6262,10 @@ fn atomic_commit(
                         color,
                     )? && !state.allow_modeset
                     {
-                        return Err(invalid_at(line!()));
+                        return Err(invalid_why(
+                            line!(),
+                            "connector Colorspace/HDR change is a modeset without ALLOW_MODESET (amdgpu_dm_connector_atomic_check)",
+                        ));
                     }
                     connector_colors.retain(|(id, _)| *id != object_id);
                     connector_colors.push((object_id, color));
@@ -6305,7 +6372,10 @@ fn atomic_commit(
                         )
                     },
                 ) {
-                    return Err(invalid_at(line!()));
+                    return Err(invalid_why(
+                        line!(),
+                        "DC refuses the CRTC's primary and overlay planes together (dc_validate_global_state)",
+                    ));
                 }
             }
             for plane in &state.planes {
@@ -6464,7 +6534,10 @@ fn atomic_commit(
                 });
             }
             if !crate::amdgpu_native_kms::output_formats_supported(&outputs, &routes) {
-                return Err(invalid_at(line!()));
+                return Err(invalid_why(
+                    line!(),
+                    "no HDMI output format carries the requested mode, planes and max bpc (dc_validate_stream)",
+                ));
             }
         }
 
@@ -6473,11 +6546,11 @@ fn atomic_commit(
         // exhausting this drm_file's 4 KiB event budget is ENOMEM and must not
         // mutate display state.
         let mut event_queue = if req.flags & PAGE_FLIP_EVENT != 0 {
-            let crtc_ids = event_crtc_ids.as_ref().ok_or(invalid_at(line!()))?;
+            let crtc_ids = event_crtc_ids.as_ref().ok_or_else(|| invalid_at(line!()))?;
             if crtc_ids.is_empty() {
                 return Err(invalid_at(line!()));
             }
-            let queue = events.ok_or(invalid_at(line!()))?.lock();
+            let queue = events.ok_or_else(|| invalid_at(line!()))?.lock();
             queue
                 .ensure_flip_event_space(crtc_ids.len())
                 .map_err(|_| FsError::OutOfMemory)?;
@@ -7005,8 +7078,8 @@ fn cursor_universal_native(
             a.check(&card)?;
         }
         card.crtc(req.crtc_id).map_err(|_| FsError::NotFound)?;
-        let cursor =
-            *crate::drm_native_planes::cursor_of(&card, req.crtc_id).ok_or(invalid_at(line!()))?;
+        let cursor = *crate::drm_native_planes::cursor_of(&card, req.crtc_id)
+            .ok_or_else(|| invalid_at(line!()))?;
         let mut wrapped = None;
         let fb_id = if req.flags & DRM_MODE_CURSOR_BO == 0 {
             cursor.fb_id
@@ -7320,7 +7393,7 @@ fn handle_map_dumb(
         let card = mode_state.lock();
         card.dumb_backing(req.handle)
             .map(|b| b.mmap_offset)
-            .ok_or(invalid_at(line!()))?
+            .ok_or_else(|| invalid_at(line!()))?
     };
 
     req.offset = mmap_offset;
@@ -7681,7 +7754,7 @@ fn handle_setcrtc_decoded(
             if req.count_connectors != 1 || req.set_connectors_ptr == 0 {
                 return Err(invalid_at(line!()));
             }
-            let id = setcrtc_connector.ok_or(invalid_at(line!()))?;
+            let id = setcrtc_connector.ok_or_else(|| invalid_at(line!()))?;
             if card.connector(id).is_err() {
                 return Err(invalid_at(line!()));
             }
@@ -8114,7 +8187,7 @@ fn handle_page_flip_decoded(
         if validate_only {
             if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
                 events
-                    .ok_or(invalid_at(line!()))?
+                    .ok_or_else(|| invalid_at(line!()))?
                     .lock()
                     .ensure_flip_event_space(1)
                     .map_err(|_| FsError::OutOfMemory)?;
@@ -8134,7 +8207,7 @@ fn handle_page_flip_decoded(
         // Reserve Linux's per-file event space before changing the CRTC, so an
         // ENOMEM failure leaves scanout state untouched.
         let mut event_queue = if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            let queue = events.ok_or(invalid_at(line!()))?.lock();
+            let queue = events.ok_or_else(|| invalid_at(line!()))?.lock();
             queue
                 .ensure_flip_event_space(1)
                 .map_err(|_| FsError::OutOfMemory)?;
@@ -8247,7 +8320,7 @@ fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> R
     // or reservation lock here, so an asynchronous render submission can
     // finish and reap its fence without lock inversion.
     wait_virgl_scanout_writes(resource)?;
-    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or(invalid_at(line!()))?;
+    let dev = narf_drivers_virtio::gpu_pci::probed_device().ok_or_else(|| invalid_at(line!()))?;
     narf_console::fb_take_for_user();
     dev.present_virgl_resource(resource.resource_id, width, height)
         .map_err(map_gpu_transport_error)
@@ -8847,7 +8920,7 @@ pub fn dispatch_mmap(card_index: u32, offset: u64, len: usize) -> Result<Vec<u64
     let card = mode_state.lock();
     let backing = card
         .dumb_backing_by_offset(offset)
-        .ok_or(invalid_at(line!()))?;
+        .ok_or_else(|| invalid_at(line!()))?;
     if len > backing.byte_len {
         return Err(invalid_at(line!()));
     }
@@ -8974,7 +9047,7 @@ pub fn without_kms(card_index: u32, cmd: u32, arg: usize) -> Option<Result<u64, 
             // SAFETY: `arg` is the ioctl struct pointer; 16 bytes.
             let mut b = unsafe { copy_in(arg, 16)? };
             let cap = u64::from_le_bytes(b[0..8].try_into().unwrap());
-            let value = amdgpu_cap_value(cap).ok_or(invalid_at(line!()))?;
+            let value = amdgpu_cap_value(cap).ok_or_else(|| invalid_at(line!()))?;
             b[8..16].copy_from_slice(&value.to_le_bytes());
             // SAFETY: as above.
             unsafe { copy_out(arg, &b)? };

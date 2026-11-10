@@ -42,6 +42,7 @@ use crate::amdgpu_dcn401_spl::{Rect, Rotation};
 use crate::amdgpu_navi48_boot::{DrmPlaneState, OverlayPlane, PlaneGeometry, PlaneSetup};
 use crate::drm::atomic::{AtomicState, PlaneState};
 use crate::drm::card::{Card, NativePlane, PlaneProps};
+use crate::drm_ioctl_bridge::refused;
 use alloc::vec::Vec;
 use narf_filesystem::FsError;
 
@@ -446,11 +447,13 @@ pub fn set_property(
         match prop {
             CURSOR_BLEND_PROP_ID => {
                 if !CURSOR_BLEND_ENUMS.iter().any(|&(v, _)| v == value) {
-                    return Err(FsError::InvalidData);
+                    return Err(refused(
+                        "cursor plane 'pixel blend mode': not one of its enum values",
+                    ));
                 }
                 props.blend = value as u8;
             }
-            CURSOR_ZPOS_PROP_ID => return Err(FsError::InvalidData),
+            CURSOR_ZPOS_PROP_ID => return Err(refused("cursor plane 'zpos' is immutable")),
             _ => return Ok(false),
         }
         return Ok(true);
@@ -460,39 +463,48 @@ pub fn set_property(
     let props = plane.props.get_or_insert(props_of);
     match prop {
         ALPHA_PROP_ID if overlay => {
-            props.alpha = u16::try_from(value).map_err(|_| FsError::InvalidData)?;
+            props.alpha =
+                u16::try_from(value).map_err(|_| refused("plane 'alpha' above 0xffff"))?;
         }
         BLEND_PROP_ID => {
             if !BLEND_ENUMS.iter().any(|&(v, _)| v == value) {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "plane 'pixel blend mode': not one of its enum values",
+                ));
             }
             props.blend = value as u8;
         }
         ZPOS_PROP_ID if overlay => {
             if value > 254 {
-                return Err(FsError::InvalidData);
+                return Err(refused("overlay plane 'zpos' above 254"));
             }
             props.zpos = value as u8;
         }
         // The primary's zpos is immutable: never settable.
-        PRIMARY_ZPOS_PROP_ID if !overlay => return Err(FsError::InvalidData),
+        PRIMARY_ZPOS_PROP_ID if !overlay => {
+            return Err(refused("primary plane 'zpos' is immutable"))
+        }
         ROTATION_PROP_ID => {
             // The bitmask's valid bits, then exactly one rotation
             // (drm_atomic_plane_set_property).
             if value & !0xf != 0 || !(value & 0xf).is_power_of_two() {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "plane 'rotation': unknown bits or not exactly one rotation",
+                ));
             }
             props.rotation = value as u8;
         }
         COLOR_ENCODING_PROP_ID if yuv => {
             if !COLOR_ENCODING_ENUMS.iter().any(|&(v, _)| v == value) {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "plane 'COLOR_ENCODING': not one of its enum values",
+                ));
             }
             props.color_encoding = value as u8;
         }
         COLOR_RANGE_PROP_ID if yuv => {
             if !COLOR_RANGE_ENUMS.iter().any(|&(v, _)| v == value) {
-                return Err(FsError::InvalidData);
+                return Err(refused("plane 'COLOR_RANGE': not one of its enum values"));
             }
             props.color_range = value as u8;
         }
@@ -606,11 +618,14 @@ pub fn plane_surface(
         crate::drm::card::PixelFormat::Nv12 | crate::drm::card::PixelFormat::P010
     );
     Ok(PlaneSurface {
-        tiling: Tiling::from_modifier(fb.modifier).ok_or(FsError::InvalidData)?,
+        tiling: Tiling::from_modifier(fb.modifier).ok_or_else(|| {
+            refused("plane FB_ID: framebuffer modifier is not a tiling DC scans out")
+        })?,
         // The DRM color properties only affect YCbCr formats.
         color: if yuv {
-            YuvColor::from_props(props.color_encoding, props.color_range)
-                .ok_or(FsError::InvalidData)?
+            YuvColor::from_props(props.color_encoding, props.color_range).ok_or_else(|| {
+                refused("plane COLOR_ENCODING/COLOR_RANGE: no DC color space for the pair")
+            })?
         } else {
             YuvColor::default()
         },
@@ -665,7 +680,7 @@ pub fn check_plane(p: &PlaneState, mode: (u32, u32)) -> Result<(), FsError> {
         vh = mh - y;
     }
     if vw < 0 || vh < 0 || vw < MIN_VIEWPORT * 2 || vh < MIN_VIEWPORT {
-        return Err(FsError::InvalidData);
+        return Err(refused("plane CRTC_X/Y/W/H: less than 24x12 visible on the CRTC (amdgpu_dm_plane_helper_check_state)"));
     }
     // drm_rect_calc_hscale/vscale in DRM's 16.16 src/dst convention:
     // min_scale = 1.0 / max_upscale, max_scale = 1.0 / min_downscale.
@@ -681,19 +696,21 @@ pub fn check_plane(p: &PlaneState, mode: (u32, u32)) -> Result<(), FsError> {
     for (src, dst) in [(sw << 16, w), (sh << 16, h)] {
         let scale = calc_scale(src, dst);
         if dst != 0 && !(min_scale..=max_scale).contains(&scale) {
-            return Err(FsError::InvalidData);
+            return Err(refused("plane SRC/CRTC size: scaling outside the plane's limits (drm_atomic_helper_check_plane_state)"));
         }
     }
     // amdgpu_dm_plane_fill_dc_scaling_info (DC's dst/src, 1000 == 1.0).
     if p.src_w == 0 || p.src_h == 0 || p.crtc_w == 0 || p.crtc_h == 0 {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "plane SRC_W/SRC_H/CRTC_W/CRTC_H: zero (amdgpu_dm_plane_fill_dc_scaling_info)",
+        ));
     }
     let scale_w = w * 1000 / i64::from(p.src_w);
     let scale_h = h * 1000 / i64::from(p.src_h);
     if !(MIN_DOWNSCALE..=MAX_UPSCALE).contains(&scale_w)
         || !(MIN_DOWNSCALE..=MAX_UPSCALE).contains(&scale_h)
     {
-        return Err(FsError::InvalidData);
+        return Err(refused("plane SRC/CRTC size: scaling outside DC's limits (amdgpu_dm_plane_fill_dc_scaling_info)"));
     }
     Ok(())
 }
@@ -783,7 +800,7 @@ fn check_dcn30_linear(card: &Card, p: &PlaneState) -> Result<(), FsError> {
     };
     let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
     if fb.modifier != crate::amdgpu_dm_modifiers::LINEAR {
-        return Err(FsError::InvalidData);
+        return Err(refused("plane FB_ID: framebuffer modifier is not LINEAR (DCN30 scans out linear surfaces only)"));
     }
     Ok(())
 }
@@ -820,7 +837,9 @@ pub fn check(
             };
             let old = plane_state(card, p.id).and_then(|s| s.crtc_id);
             if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "cursor plane CRTC_ID: moved straight to another CRTC (drm_atomic_plane_check)",
+                ));
             }
             check_cursor_plane(card, native, p)?;
         }
@@ -842,10 +861,14 @@ pub fn check(
         // drm_atomic_plane_check: no direct move between CRTCs, and a
         // primary only on its own CRTC.
         if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
-            return Err(FsError::InvalidData);
+            return Err(refused(
+                "plane CRTC_ID: moved straight to another CRTC (drm_atomic_plane_check)",
+            ));
         }
         if native.primary_of.is_some() && p.crtc_id.is_some() && p.crtc_id != native.primary_of {
-            return Err(FsError::InvalidData);
+            return Err(refused(
+                "primary plane CRTC_ID: not its own CRTC (possible_crtcs)",
+            ));
         }
         if native.is_cursor() {
             check_cursor_plane(card, native, p)?;
@@ -860,7 +883,7 @@ pub fn check(
                 card.overlay_formats.unwrap_or(&[])
             };
             if !formats.contains(&format) {
-                return Err(FsError::InvalidData);
+                return Err(refused("plane FB_ID: framebuffer format not in the plane's format list (drm_atomic_plane_check)"));
             }
         }
         crtcs.extend(old.into_iter().chain(p.crtc_id));
@@ -888,7 +911,7 @@ pub fn check(
             .find(|p| p.primary_of == Some(crtc_id))
             .and_then(|p| final_state(card, state, p.id));
         if enabled && primary.is_none_or(|p| p.fb_id.is_none()) {
-            return Err(FsError::InvalidData);
+            return Err(refused("cursor plane on an enabled CRTC without its primary plane (dm_crtc_helper_atomic_check)"));
         }
     }
     let mut out = Vec::new();
@@ -920,9 +943,10 @@ pub fn check(
         }
         // dm_crtc_helper_atomic_check: an enabled CRTC needs its primary.
         let Some(primary) = primary else {
-            return Err(FsError::InvalidData);
+            return Err(refused("enabled CRTC without a framebuffer on its primary plane (dm_crtc_helper_atomic_check)"));
         };
-        let mode = mode_of(crtc_id).ok_or(FsError::InvalidData)?;
+        let mode =
+            mode_of(crtc_id).ok_or_else(|| refused("enabled CRTC has no mode after the commit"))?;
         for p in core::iter::once(&primary).chain(&overlays) {
             check_plane(p, (mode.width, mode.height))?;
         }
@@ -962,7 +986,9 @@ fn check_synthesized(
             let old = plane_state(card, p.id).and_then(|s| s.crtc_id);
             // drm_atomic_plane_check: no direct move between CRTCs.
             if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "plane CRTC_ID: moved straight to another CRTC (drm_atomic_plane_check)",
+                ));
             }
             if native.is_cursor() {
                 check_cursor_plane(card, native, p)?;
@@ -972,7 +998,7 @@ fn check_synthesized(
             if let Some(fb) = p.fb_id {
                 let format = card.framebuffer(fb).map_err(|_| FsError::NotFound)?.format as u32;
                 if !card.overlay_formats.unwrap_or(&[]).contains(&format) {
-                    return Err(FsError::InvalidData);
+                    return Err(refused("overlay plane FB_ID: framebuffer format not in the overlay format list (drm_atomic_plane_check)"));
                 }
             }
             crtcs.extend(old.into_iter().chain(p.crtc_id));
@@ -984,16 +1010,20 @@ fn check_synthesized(
         let own = card.crtcs[index].id;
         let old = card.crtcs[index].primary_fb.map(|_| own);
         if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
-            return Err(FsError::InvalidData);
+            return Err(refused(
+                "primary plane CRTC_ID: moved straight to another CRTC (drm_atomic_plane_check)",
+            ));
         }
         // A primary only on its own CRTC.
         if p.crtc_id.is_some() && p.crtc_id != Some(own) {
-            return Err(FsError::InvalidData);
+            return Err(refused(
+                "primary plane CRTC_ID: not its own CRTC (possible_crtcs)",
+            ));
         }
         if let Some(fb) = p.fb_id {
             let format = card.framebuffer(fb).map_err(|_| FsError::NotFound)?.format as u32;
             if !card.plane_formats.unwrap_or(&[]).contains(&format) {
-                return Err(FsError::InvalidData);
+                return Err(refused("primary plane FB_ID: framebuffer format not in the primary format list (drm_atomic_plane_check)"));
             }
         }
         crtcs.extend(old.into_iter().chain(p.crtc_id));
@@ -1015,7 +1045,7 @@ fn check_synthesized(
             .find(|c| c.id == crtc_id)
             .map_or(crtc.enabled, |c| c.enable);
         if enabled && synthesized_primary_fb(card, state, crtc_id).is_none() {
-            return Err(FsError::InvalidData);
+            return Err(refused("cursor plane on an enabled CRTC without its primary plane (dm_crtc_helper_atomic_check)"));
         }
     }
     let mut out = Vec::new();
@@ -1031,13 +1061,14 @@ fn check_synthesized(
         if !enabled {
             continue;
         }
-        let mode = mode_of(crtc_id).ok_or(FsError::InvalidData)?;
+        let mode =
+            mode_of(crtc_id).ok_or_else(|| refused("enabled CRTC has no mode after the commit"))?;
         let mode = (mode.width, mode.height);
         // dm_crtc_helper_atomic_check: an enabled CRTC needs its primary.
         let Some(primary) =
             synthesized_primary(card, state, crtc_id, mode).filter(|p| p.fb_id.is_some())
         else {
-            return Err(FsError::InvalidData);
+            return Err(refused("enabled CRTC without a framebuffer on its primary plane (dm_crtc_helper_atomic_check)"));
         };
         let overlays: Vec<PlaneState> = overlay_ids(card)
             .into_iter()
@@ -1050,7 +1081,11 @@ fn check_synthesized(
         }
         if let Some((dst, src)) = placed_rects(&primary, mode) {
             let fb = card
-                .framebuffer(primary.fb_id.ok_or(FsError::InvalidData)?)
+                .framebuffer(
+                    primary
+                        .fb_id
+                        .ok_or_else(|| refused("primary plane has no framebuffer"))?,
+                )
                 .map_err(|_| FsError::NotFound)?;
             if !crate::amdgpu_native_kms::primary_placement_admitted(
                 (fb.pitch, fb.width, fb.height),
@@ -1058,7 +1093,7 @@ fn check_synthesized(
                 src,
                 dst,
             ) {
-                return Err(FsError::InvalidData);
+                return Err(refused("primary plane placement: DC refuses it on the lit stream (dc_validate_global_state)"));
             }
         }
         if overlays.is_empty() {
@@ -1102,26 +1137,36 @@ pub fn check_cursor_max(
 ) -> Result<(), FsError> {
     let (src_x, src_y, src_w, src_h) = src;
     if src_x != 0 || src_y != 0 {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane SRC_X/SRC_Y: not 0 (amdgpu_dm_check_native_cursor_state)",
+        ));
     }
     if fb.width > max || fb.height > max {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane FB_ID: framebuffer larger than max_cursor_size (dm_check_cursor_fb)",
+        ));
     }
     if u64::from(src_w) != u64::from(fb.width) << 16
         || u64::from(src_h) != u64::from(fb.height) << 16
     {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane SRC_W/SRC_H: not the whole framebuffer (dm_check_cursor_fb)",
+        ));
     }
     // Pitch in pixels (ARGB8888's cpp is 4).
     let pitch = fb.pitch / 4;
     if fb.width != pitch || !matches!(pitch, 64 | 128 | 256) {
-        return Err(FsError::InvalidData);
+        return Err(refused("cursor plane FB_ID: pitch is not the width, or not 64, 128 or 256 pixels (dm_check_cursor_fb)"));
     }
     if !fb.linear {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane FB_ID: framebuffer is not linear (dm_check_cursor_fb)",
+        ));
     }
     if src_w >> 16 != crtc.0 || src_h >> 16 != crtc.1 {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane CRTC_W/CRTC_H: scaled (amdgpu_dm_check_native_cursor_state)",
+        ));
     }
     Ok(())
 }
@@ -1133,7 +1178,9 @@ pub fn check_cursor_max(
 /// values would).
 fn check_cursor_plane(card: &Card, native: &NativePlane, p: &PlaneState) -> Result<(), FsError> {
     if p.crtc_id.is_some() && p.crtc_id != native.cursor_of {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane CRTC_ID: not its own CRTC (possible_crtcs)",
+        ));
     }
     let (Some(_), Some(fb_id)) = (p.crtc_id, p.fb_id) else {
         return Ok(());
@@ -1141,7 +1188,9 @@ fn check_cursor_plane(card: &Card, native: &NativePlane, p: &PlaneState) -> Resu
     let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
     let linear = fb.modifier == crate::amdgpu_dm_modifiers::LINEAR;
     if !CURSOR_FORMATS.contains(&(fb.format as u32)) || !linear {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane FB_ID: not a linear ARGB8888 framebuffer (drm_atomic_plane_check)",
+        ));
     }
     let fb = CursorFb {
         width: fb.width,
@@ -1294,15 +1343,16 @@ fn display_planes(
     mode: (u32, u32),
 ) -> Result<DisplayPlanes, FsError> {
     let fourcc = |p: &PlaneState| -> Result<u32, FsError> {
-        let fb = p.fb_id.ok_or(FsError::InvalidData)?;
+        let fb = p.fb_id.ok_or_else(|| refused("plane has no framebuffer"))?;
         Ok(card.framebuffer(fb).map_err(|_| FsError::NotFound)?.format as u32)
     };
     let format_of = |p: &PlaneState| -> Result<SurfaceFormat, FsError> {
-        SurfaceFormat::from_fourcc(fourcc(p)?).ok_or(FsError::InvalidData)
+        SurfaceFormat::from_fourcc(fourcc(p)?)
+            .ok_or_else(|| refused("plane FB_ID: framebuffer format DC has no surface format for"))
     };
     let geometry = |p: &PlaneState, format: SurfaceFormat, overlay: bool| {
         let fb = card
-            .framebuffer(p.fb_id.ok_or(FsError::InvalidData)?)
+            .framebuffer(p.fb_id.ok_or_else(|| refused("plane has no framebuffer"))?)
             .map_err(|_| FsError::NotFound)?;
         let props = p.props.unwrap_or(PlaneProps::new(0));
         let surface = plane_surface(fb, props)?;
@@ -1311,7 +1361,7 @@ fn display_planes(
         // be scanned vertically, so dc_validate_global_state refuses a
         // linear plane rotated 90 or 270 whatever the mode.
         if rotation.orthogonal() && surface.tiling.swizzle == Swizzle::Linear {
-            return Err(FsError::InvalidData);
+            return Err(refused("plane 'rotation': a linear surface cannot be rotated 90 or 270 (dc_validate_global_state)"));
         }
         Ok::<_, FsError>(PlaneGeometry {
             src_x: p.src_x,
@@ -1333,7 +1383,7 @@ fn display_planes(
     let primary_at = order
         .iter()
         .position(|p| p.id == primary.id)
-        .ok_or(FsError::InvalidData)?;
+        .ok_or_else(|| refused("primary plane missing from the CRTC's plane order"))?;
     let format = format_of(primary)?;
     let g = geometry(primary, format, false)?;
     // A tiled or 4:2:0 primary always goes to DC as a placed plane (its
@@ -1347,7 +1397,7 @@ fn display_planes(
     // What should_reset_plane compares, with each plane's normalized zpos.
     let drm = |p: &PlaneState| -> Result<DrmPlaneState, FsError> {
         let fb = card
-            .framebuffer(p.fb_id.ok_or(FsError::InvalidData)?)
+            .framebuffer(p.fb_id.ok_or_else(|| refused("plane has no framebuffer"))?)
             .map_err(|_| FsError::NotFound)?;
         let props = p.props.unwrap_or(PlaneProps::new(0));
         Ok(DrmPlaneState {
@@ -1366,7 +1416,8 @@ fn display_planes(
             normalized_zpos: order
                 .iter()
                 .position(|q| q.id == p.id)
-                .ok_or(FsError::InvalidData)? as u8,
+                .ok_or_else(|| refused("plane missing from the CRTC's plane order"))?
+                as u8,
         })
     };
     let mut setup = PlaneSetup {
@@ -1378,7 +1429,9 @@ fn display_planes(
     let mut ids = [None; MAX_OVERLAYS];
     for (k, p) in order.iter().filter(|p| p.id != primary.id).enumerate() {
         if k >= MAX_OVERLAYS {
-            return Err(FsError::InvalidData);
+            return Err(refused(
+                "more overlay planes on the CRTC than DC has slave planes",
+            ));
         }
         let format = format_of(p)?;
         setup.overlays[k] = Some(OverlayPlane {
@@ -1549,7 +1602,7 @@ fn setcrtc_planes_synthesized(
     };
     Some(check_plane(&state, mode).and_then(|()| {
         if !linear {
-            return Err(FsError::InvalidData);
+            return Err(refused("SETCRTC primary: framebuffer modifier is not LINEAR (DCN30 scans out linear surfaces only)"));
         }
         display_planes(card, crtc_id, &state, &overlays, mode)
     }))
@@ -2898,6 +2951,74 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/drm", drm_native_planes_dcn30_synthesized_check);
+
+    /// KWin's probe on a screen showing only the pointer, as an RX 6750 XT
+    /// logged it (TEST_ONLY | NONBLOCK): both overlays and the cursor
+    /// plane off, the 41x40 pointer image on the primary at the pointer
+    /// position of a 3840x2160 mode. With the pointer at the bottom edge
+    /// (CRTC_Y 2156) only 4 rows stay on the CRTC, and
+    /// amdgpu_dm_plane_helper_check_state refuses a non-cursor plane with
+    /// less than MIN_VIEWPORT_SIZE (12) rows or 2 * MIN_VIEWPORT_SIZE
+    /// columns visible; KWin then composites. The same image wholly on the
+    /// CRTC, or with exactly 12 rows or 24 columns left, is accepted. The
+    /// refusal names its rule.
+    fn drm_native_planes_dcn30_kwin_pointer_on_primary() -> TestResult {
+        let (mut card, _) = dcn30_card();
+        let pointer = {
+            let handle = card.gem.alloc(0x3000_0000, 41 * 40 * 4).unwrap();
+            card.addfb2(41, 40, AR24, 41 * 4, handle).unwrap()
+        };
+        let uhd = |_: u32| {
+            Some(crate::Mode {
+                width: 3840,
+                height: 2160,
+                refresh_hz: 60,
+                bpp: 32,
+            })
+        };
+        let request = |x: i32, y: i32| {
+            let mut state = AtomicState::default();
+            for id in [
+                OVERLAY_PLANE_ID_BASE + 1,
+                OVERLAY_PLANE_ID_BASE,
+                DCN30_CURSOR_PLANE_ID_BASE,
+            ] {
+                let mut off = plane_state(&card, id).unwrap();
+                off.fb_id = None;
+                off.crtc_id = None;
+                state.planes.push(off);
+            }
+            state
+                .planes
+                .push(on(PRIMARY_PLANE_ID_BASE, pointer, (41, 40), (x, y, 41, 40)));
+            check(&card, &state, uhd)
+        };
+        // The logged request.
+        if request(1490, 2156) != Err(FsError::InvalidData) {
+            return TestResult::Fail("4 visible rows accepted");
+        }
+        if crate::drm_ioctl_bridge::last_refusal().is_none_or(|why| !why.contains("24x12 visible"))
+        {
+            return TestResult::Fail("refusal does not name the viewport rule");
+        }
+        // 11 rows or 23 columns left are refused, 12 and 24 accepted.
+        if request(1490, 2149) != Err(FsError::InvalidData)
+            || request(3817, 1000) != Err(FsError::InvalidData)
+        {
+            return TestResult::Fail("less than the minimum viewport accepted");
+        }
+        for (x, y) in [(1490, 1000), (1490, 2148), (3816, 1000), (-17, 1000)] {
+            match request(x, y) {
+                Ok(out) if out.is_empty() => {}
+                _ => return TestResult::Fail("positioned pointer primary refused"),
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_dcn30_kwin_pointer_on_primary
+    );
 
     /// Commit/displays round-trip on DCN30: no overlay, no display; an
     /// overlay on, the CRTC's display carries it; the overlay off, the
