@@ -54,21 +54,26 @@ fn fragmented_groups(vol: &ScaleVol) -> Option<usize> {
     Some(groups)
 }
 
-/// Create one 4 KiB file and commit it, returning what that commit cost.
+/// Create one 4 KiB file and commit it, returning what that commit cost:
+/// this filesystem's counters, and the node visits and writes per tree.
 fn probe_commit(
     vol: &ScaleVol,
     dir: &Arc<dyn narf_filesystem::DirOps>,
     name: &str,
-) -> Option<crate::stats::CommitStatsSnapshot> {
+) -> Option<(crate::stats::CommitStatsSnapshot, crate::stats::Totals)> {
     poll_once(vol.sync_to_disk())?.ok()?;
     let before = vol.commit_stats().snapshot();
+    let trees_before = crate::stats::totals();
     let file = poll_once(dir.create(name))?.ok()?;
     let written = poll_once(file.write(0, &[0x5a; 4096]))?.ok()?;
     if written != 4096 {
         return None;
     }
     poll_once(vol.sync_to_disk())?.ok()?;
-    Some(vol.commit_stats().snapshot().since(&before))
+    Some((
+        vol.commit_stats().snapshot().since(&before),
+        crate::stats::totals().since(&trees_before),
+    ))
 }
 
 /// Add `count` 4 KiB preallocated files named `{prefix}{i}` and then remove
@@ -99,11 +104,12 @@ fn fragment(
     Ok(())
 }
 
-/// A commit's free-space-tree work must follow what the transaction changed,
-/// not how large the tree is: the same one-small-file commit is measured on
-/// a filesystem whose free-space tree is a few blocks, and again after the
-/// tree has been fragmented across several block groups into a multi-level
-/// tree many times that size.
+/// A commit's free-space-tree and block-group work must follow what the
+/// transaction changed, not how large the trees are or how many passes the
+/// commit takes: the same one-small-file commit is measured on a filesystem
+/// whose free-space tree is a few blocks, and again after the tree has been
+/// fragmented across several block groups into a multi-level tree many
+/// times that size.
 fn smoke_btrfs_commit_cost_tracks_change_not_tree_size() -> TestResult {
     use core::fmt::Write as _;
     const STEP: usize = 3000;
@@ -148,7 +154,7 @@ fn smoke_btrfs_commit_cost_tracks_change_not_tree_size() -> TestResult {
         crate::allocator::set_view_audit(false);
         let cost = probe_commit(&vol, &dir, &alloc::format!("probe{step}"));
         crate::allocator::set_view_audit(true);
-        let Some(cost) = cost else {
+        let Some((cost, trees)) = cost else {
             return TestResult::Fail("scale: probe commit failed");
         };
         let Some(shape) = fst_shape(&vol) else {
@@ -158,7 +164,8 @@ fn smoke_btrfs_commit_cost_tracks_change_not_tree_size() -> TestResult {
             narf_console::Writer,
             "btrfs-scale: fst {} blocks level {} ({} free extents, {} fragmented groups): \
              small commit read {} fst nodes, wrote {} fst / {} metadata nodes, {} commit(s), \
-             {} round(s), {} allocator build(s) ({} from disk, {} us)",
+             {} pass(es), {} allocator build(s) ({} from disk, {} us); visited extent {} \
+             block-group {} csum {} root {} nodes",
             shape.0,
             shape.1,
             shape.2,
@@ -171,8 +178,12 @@ fn smoke_btrfs_commit_cost_tracks_change_not_tree_size() -> TestResult {
             cost.alloc_builds,
             cost.alloc_disk_builds,
             narf_time::wall::cycles_to_ns(cost.alloc_build_cycles) / 1000,
+            trees.read.extent,
+            trees.read.block_group,
+            trees.read.csum,
+            trees.read.root,
         );
-        rows.push((shape, cost));
+        rows.push((shape, cost, trees));
     }
     let (small, large) = (&rows[0], &rows[rows.len() - 1]);
     if large.0 .1 == 0 || large.0 .0 < small.0 .0 * 8 {
@@ -181,7 +192,7 @@ fn smoke_btrfs_commit_cost_tracks_change_not_tree_size() -> TestResult {
     if fragmented_groups(&vol).unwrap_or(0) < 3 {
         return TestResult::Fail("scale: fragmentation did not spread over block groups");
     }
-    for (shape, cost) in &rows {
+    for (shape, cost, trees) in &rows {
         // Height x touched leaves: the new data extent, the new metadata
         // blocks and the freed ones land in a handful of leaves, each
         // rewritten with its ancestors once.
@@ -197,12 +208,28 @@ fn smoke_btrfs_commit_cost_tracks_change_not_tree_size() -> TestResult {
         if cost.alloc_disk_builds != 0 {
             return TestResult::Fail("scale: an allocator re-read the free-space tree");
         }
-        // Reads are node visits (every descent counts its whole path): one
-        // descent per touched leaf to fetch it, and one per round to COW it.
-        if cost.fst_nodes_read > (cost.rounds + 3) * height * cost.fst_nodes_written + 16 {
-            return TestResult::Fail(
-                "scale: free-space-tree reads exceed rounds x height x leaves",
-            );
+        // Reads are node visits (every descent counts its whole path). A
+        // touched leaf is fetched once (one descent, and another when the
+        // item before the range lives in the previous leaf) and path-COWed
+        // once (one descent, and its right sibling for the density check) —
+        // however many passes the commit takes to record its own blocks:
+        // after the first, the leaf is the commit's own and is edited in
+        // place, not read back. (When every pass recomputed the tree from
+        // the committed one, this was 68 to 133 reads for the same commits.)
+        if cost.fst_nodes_read > (3 * height + 1) * cost.fst_nodes_written + 4 {
+            return TestResult::Fail("scale: free-space-tree reads exceed height x touched leaves");
+        }
+        // The commit allocates from and frees into two or three block
+        // groups, and looks up and rewrites only those: not one read per
+        // block group of the filesystem, twice.
+        if trees.read.block_group > 12 {
+            return TestResult::Fail("scale: block-group reads follow the number of groups");
+        }
+        // Each pass records the blocks the previous one allocated and
+        // replaced, so their number is the depth of that chain, a few; far
+        // from the guard that fails a commit.
+        if cost.rounds > 16 {
+            return TestResult::Fail("scale: recording the commit's blocks took many passes");
         }
     }
     // The tree more than doubled between the first fragmented state and

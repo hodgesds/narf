@@ -54,7 +54,7 @@
 //! delayed refs run from `btrfs_run_delayed_refs` until none remain). Applying the
 //! per-edit bound to that closure does not converge: it prices every record
 //! as landing in a leaf nothing else touches, which the allocator — handing
-//! out addresses lowest-first — does not produce. Linux does not reserve for
+//! out neighbouring addresses — does not produce. Linux does not reserve for
 //! it per operation either. It keeps a **global reserve** no ordinary
 //! reservation may use, sized from the trees the commit-critical work
 //! rewrites (`btrfs_update_global_block_rsv`: the bytes used by the root,
