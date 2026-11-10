@@ -289,6 +289,7 @@ pub mod dsc;
 pub mod dsi;
 pub mod edid;
 pub mod font8x8;
+pub mod logo;
 pub mod splash;
 pub use console::{install_fb_console, FbConsole};
 pub use cursor::Cursor;

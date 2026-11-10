@@ -852,3 +852,139 @@ fn smoke_csi2_data_type_constants() -> TestResult {
 }
 
 kernel_test_in!("graphics/csi2", smoke_csi2_data_type_constants);
+
+fn smoke_graphics_logo_blit_copies_pixels() -> TestResult {
+    use crate::{
+        logo::{blit, BOOT_TILE, SPLASH_CIRCLE},
+        Framebuffer, Pixel32,
+    };
+    use alloc::vec;
+    // 128x128 in-memory FB, cleared to black.
+    let mut buf = vec![Pixel32::BLACK.raw(); 128 * 128];
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let mut fb = unsafe { Framebuffer::new(ptr, 128, 128, 128) };
+    blit(&mut fb, &BOOT_TILE, 32, 32);
+    // Absolute anchors from the source art through the RGB565
+    // expansion in `logo::rgb565_to_pixel32`: the tile's cream
+    // ground at its corners, sloth brown at its centre.
+    if buf[32 * 128 + 32] != Pixel32::rgb(255, 247, 239).raw() {
+        return TestResult::Fail("tile corner not cream");
+    }
+    if buf[(32 + 32) * 128 + (32 + 32)] != Pixel32::rgb(148, 93, 57).raw() {
+        return TestResult::Fail("tile centre not sloth brown");
+    }
+    // Nothing outside the 64x64 tile was touched.
+    if buf[0] != Pixel32::BLACK.raw() || buf[31 * 128 + 31] != Pixel32::BLACK.raw() {
+        return TestResult::Fail("blit wrote outside the tile");
+    }
+    // The circle's near-black ground and orange ring survive the blit.
+    let mut buf2 = vec![Pixel32::WHITE.raw(); 256 * 256];
+    let ptr2 = buf2.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let mut fb2 = unsafe { Framebuffer::new(ptr2, 256, 256, 256) };
+    blit(&mut fb2, &SPLASH_CIRCLE, 0, 0);
+    if buf2[0] != Pixel32::rgb(16, 20, 16).raw() {
+        return TestResult::Fail("circle corner not near-black");
+    }
+    if buf2[20 * 256 + 128] != Pixel32::rgb(214, 93, 41).raw() {
+        return TestResult::Fail("circle ring not orange");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics", smoke_graphics_logo_blit_copies_pixels);
+
+fn smoke_graphics_logo_cpu_tiles() -> TestResult {
+    use crate::{
+        logo::{draw_cpu_tiles, tiles_that_fit, TILE_GAP, TILE_SIZE},
+        Framebuffer, Pixel32,
+    };
+    use alloc::vec;
+    if tiles_that_fit(1024) != 14 {
+        return TestResult::Fail("1024px should fit 14 tiles");
+    }
+    if tiles_that_fit(63) != 0 {
+        return TestResult::Fail("63px should fit 0 tiles");
+    }
+    // 4 CPUs on a 1024-wide fb -> 4 tiles, left-aligned.
+    let mut buf = vec![Pixel32::BLACK.raw(); 128 * 1024];
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let mut fb = unsafe { Framebuffer::new(ptr, 1024, 128, 1024) };
+    let drawn = draw_cpu_tiles(&mut fb, 4, 0);
+    if drawn != 4 {
+        return TestResult::Fail("4 cpus should draw 4 tiles");
+    }
+    // Tile corners are cream; the gaps between tiles stay background.
+    for i in 0..4u32 {
+        let x = i * (TILE_SIZE + TILE_GAP);
+        if buf[x as usize] != Pixel32::rgb(255, 247, 239).raw() {
+            return TestResult::Fail("tile corner not cream");
+        }
+    }
+    if buf[TILE_SIZE as usize] != Pixel32::BLACK.raw() {
+        return TestResult::Fail("gap pixel painted");
+    }
+    // Unknown CPU count (0) draws exactly one tile.
+    let mut buf1 = vec![Pixel32::BLACK.raw(); 128 * 1024];
+    let ptr1 = buf1.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let mut fb1 = unsafe { Framebuffer::new(ptr1, 1024, 128, 1024) };
+    if draw_cpu_tiles(&mut fb1, 0, 0) != 1 {
+        return TestResult::Fail("0 cpus should draw 1 tile");
+    }
+    // One CPU: the single tile is centered, not cornered.
+    let centred_x = (1024 - TILE_SIZE) / 2;
+    if buf1[centred_x as usize] != Pixel32::rgb(255, 247, 239).raw() {
+        return TestResult::Fail("single tile not centered");
+    }
+    if buf1[0] != Pixel32::BLACK.raw() {
+        return TestResult::Fail("single tile leaked to the corner");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics", smoke_graphics_logo_cpu_tiles);
+
+fn smoke_graphics_logo_tiles_cap_and_clip() -> TestResult {
+    use crate::{
+        logo::{blit, draw_cpu_tiles, BOOT_TILE},
+        Framebuffer, Pixel32,
+    };
+    use alloc::vec;
+    // 200px wide, 8 CPUs: only 2 tiles fit — no shrink, no wrap.
+    let mut buf = vec![Pixel32::BLACK.raw(); 128 * 200];
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let mut fb = unsafe { Framebuffer::new(ptr, 200, 128, 200) };
+    if draw_cpu_tiles(&mut fb, 8, 0) != 2 {
+        return TestResult::Fail("200px should cap at 2 tiles");
+    }
+    // Rightmost column untouched: nothing was drawn past the edge.
+    for y in 0..128 {
+        if buf[y * 200 + 199] != Pixel32::BLACK.raw() {
+            return TestResult::Fail("tile wrote past the right edge");
+        }
+    }
+    // A framebuffer narrower than one tile draws nothing at all.
+    let mut small = vec![Pixel32::BLACK.raw(); 40 * 40];
+    let sptr = small.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let mut sfb = unsafe { Framebuffer::new(sptr, 40, 40, 40) };
+    if draw_cpu_tiles(&mut sfb, 4, 0) != 0 {
+        return TestResult::Fail("40px fb should draw 0 tiles");
+    }
+    if small.iter().any(|&p| p != Pixel32::BLACK.raw()) {
+        return TestResult::Fail("narrow fb was touched");
+    }
+    // A blit half off the framebuffer clips instead of writing OOB.
+    let mut clip = vec![Pixel32::BLACK.raw(); 64 * 64];
+    let cptr = clip.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let mut cfb = unsafe { Framebuffer::new(cptr, 64, 64, 64) };
+    blit(&mut cfb, &BOOT_TILE, 32, 32);
+    if clip[32 * 64 + 32] != Pixel32::rgb(255, 247, 239).raw() {
+        return TestResult::Fail("clipped blit corner wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics", smoke_graphics_logo_tiles_cap_and_clip);

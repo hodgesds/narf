@@ -4650,7 +4650,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             });
 
             narf_init::register(narf_init::Stage::Late, "virtio-gpu-splash", || {
-                use narf_graphics::Pixel32;
                 // `probed_device` avoids holding the IRQ-masking
                 // controller lock across the init/flush round-trips;
                 // the device's request gate serialises submitters.
@@ -4667,11 +4666,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                     // SAFETY: BSP, no concurrent draw.
                     let mut fb = unsafe { d.framebuffer() };
-                    let half = 16u32;
-                    fb.fill_rect(0, 0, half, half, Pixel32::RED);
-                    fb.fill_rect(half, 0, half, half, Pixel32::GREEN);
-                    fb.fill_rect(0, half, half, half, Pixel32::BLUE);
-                    fb.fill_rect(half, half, half, half, Pixel32::NARF_FG);
+                    // The sloth, centered: the orange-circle logo on the
+                    // (initially black) scanout. The old 4-quadrant test
+                    // pattern this replaces was a placeholder, never a
+                    // logo.
+                    narf_graphics::logo::blit_centered(
+                        &mut fb,
+                        &narf_graphics::logo::SPLASH_CIRCLE,
+                    );
                     let _ = d.flush();
                     let mode = d.mode();
                     (mode.width, mode.height)
@@ -4680,7 +4682,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     Some((w, h)) if w > 0 => {
                         let _ = writeln!(
                             console::Writer,
-                            "  splash: {}x{} virtio-gpu scanout painted (4-quadrant)",
+                            "  splash: {}x{} virtio-gpu scanout painted (narf logo)",
                             w,
                             h
                         );

@@ -1,9 +1,10 @@
 //! End-of-boot splash composer.
 //!
 //! Paints a one-screen "kernel up" panel through the global
-//! `FbConsole`: a coloured title bar at the top, a body listing
-//! the kernel build + a few invariants the user might want to see
-//! at a glance, and the mouse cursor on top.
+//! `FbConsole`: a coloured title bar at the top, one sloth tile per
+//! CPU across the top of the body (see `logo`), a body listing the
+//! kernel build + a few invariants the user might want to see at a
+//! glance, and the mouse cursor on top.
 //!
 //! Independent of the actual data sources — callers pass a
 //! `BootInfo` snapshot they've already collected. This crate
@@ -11,7 +12,7 @@
 
 use core::fmt::Write;
 
-use crate::{console::GLOBAL_FB_CONSOLE, Cursor, Pixel32};
+use crate::{console::GLOBAL_FB_CONSOLE, logo, Cursor, Pixel32};
 
 #[derive(Copy, Clone, Debug)]
 pub struct BootInfo<'a> {
@@ -29,6 +30,10 @@ const TITLE_BAR_FG: Pixel32 = Pixel32::WHITE;
 const BODY_BG: Pixel32 = Pixel32::NARF_BG;
 const BODY_FG: Pixel32 = Pixel32::NARF_FG;
 const ACCENT: Pixel32 = Pixel32::rgb(0x40, 0xC0, 0xFF);
+/// Top of the per-CPU sloth tile row: 8px below the accent rule.
+/// Tiles are 64px tall; the body text starts 8px below the row.
+const TILE_ROW_TOP: u32 = TITLE_BAR_HEIGHT + 2 + 8;
+const BODY_TOP: u32 = TILE_ROW_TOP + logo::TILE_SIZE + 8;
 
 /// Render the boot panel into the global framebuffer console.
 /// Returns true if a console was installed and the panel painted.
@@ -58,17 +63,22 @@ pub fn render(info: &BootInfo<'_>) -> bool {
     // Centred-ish: write 1 char of left padding + content.
     let _ = writeln!(con, " NARF {} \u{2014} {}", info.version, info.arch);
 
-    // Body. Move cursor below the title bar (3 glyph rows + the 2-px rule).
+    // One sloth per CPU, Tux-style, across the top of the body.
+    {
+        let fb = con.fb_mut();
+        logo::draw_cpu_tiles(fb, info.cpu_count, TILE_ROW_TOP);
+    }
+
+    // Body. Move cursor below the tile row (glyph rows are 8px).
     con.fg = BODY_FG;
     con.bg = BODY_BG;
     con.home();
-    // Skip the title-bar rows visually by writing blank lines.
-    let title_rows = (TITLE_BAR_HEIGHT + 2) / 8;
-    for _ in 0..title_rows {
+    // Skip the title-bar + tile rows visually by writing blank lines.
+    let body_rows = BODY_TOP.div_ceil(8);
+    for _ in 0..body_rows {
         let _ = writeln!(con);
     }
 
-    let _ = writeln!(con);
     let _ = writeln!(con, " kernel:    NARF v{}", info.version);
     let _ = writeln!(con, " arch:      {}", info.arch);
     let _ = writeln!(con, " enforcer:  {}", info.backend);
