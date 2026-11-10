@@ -295,16 +295,6 @@ impl Revision {
         self.chip == Chip::Ar9462 && self.mac_rev >= AR_SREV_REVISION_9462_20
     }
 
-    /// `AR_SREV_9565`.
-    pub fn ar9565(&self) -> bool {
-        self.chip == Chip::Ar9565
-    }
-
-    /// `AR_SREV_9485`.
-    pub fn ar9485(&self) -> bool {
-        self.chip == Chip::Ar9485
-    }
-
     /// `AR_SREV_9462_21`.
     pub fn ar9462_21(&self) -> bool {
         self.chip == Chip::Ar9462 && self.mac_rev == AR_SREV_REVISION_9462_21

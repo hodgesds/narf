@@ -2641,9 +2641,7 @@ mod tests {
         // VF 0 through the message path (count stays 31, 30 stored).
         let mut msg = [0u32; 16];
         msg[0] = VF_SET_MULTICAST | (31 << 16);
-        for i in 1..16 {
-            msg[i] = 0x0001_0001;
-        }
+        msg[1..].fill(0x0001_0001);
         vt.dispatch(0, &msg, &filter).unwrap();
         if vt.vfs[0].mc_count != 31 {
             return TestResult::Fail("igb VF multicast >30 count drift");
