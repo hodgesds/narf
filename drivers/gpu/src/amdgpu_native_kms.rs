@@ -164,6 +164,13 @@ pub fn display_admits_planes(
         )
         .is_ok()
 }
+/// Whether the HDMI output format search ([`output_formats_supported`])
+/// also admits the output's planes, so a CRTC driving HDMI needs no
+/// separate [`display_admits_planes`]. Navi48's search plans the planes
+/// with each candidate format; Navi22's validates the stream alone.
+pub fn output_search_admits_planes() -> bool {
+    !navi22()
+}
 /// DC's validation of a positioned or scaled primary of an `fb` (pitch in
 /// bytes, width, height) on a CRTC of `mode` (Navi22's lit stream; other
 /// cards validate their planes elsewhere).

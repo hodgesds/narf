@@ -1241,3 +1241,38 @@ kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     kms_synthesized_primary_under_overlays_keeps_target_and_placement
 );
+
+/// A commit the check accepts is one the presenter shows
+/// (dc_validate_global_state admits what dc_commit_streams programs): an
+/// overlay on a CRTC driving HDMI skips the display's own admission only
+/// where the HDMI format search plans the planes itself (Navi48). Navi22's
+/// search validates the stream alone and its presenter shows no overlay
+/// yet, so its display is still asked and the overlay is refused, on HDMI
+/// as on DisplayPort; the compositor then composites onto the primary.
+fn kms_hdmi_planes_admitted_by_whoever_plans_them() -> TestResult {
+    // Navi22 on HDMI: the display decides, and refuses.
+    if planes_admitted(true, false, || false) {
+        return TestResult::Fail("HDMI overlay admitted with no plane admission at all");
+    }
+    if !planes_admitted(true, false, || true) {
+        return TestResult::Fail("HDMI overlay refused though its display admits it");
+    }
+    // Navi48 on HDMI: the format search decides; the display is not asked.
+    let mut asked = false;
+    if !planes_admitted(true, true, || {
+        asked = true;
+        false
+    }) || asked
+    {
+        return TestResult::Fail("HDMI format search did not decide the planes");
+    }
+    // Any other output: the display decides.
+    if planes_admitted(false, true, || false) || !planes_admitted(false, false, || true) {
+        return TestResult::Fail("non-HDMI planes not decided by their display");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    kms_hdmi_planes_admitted_by_whoever_plans_them
+);

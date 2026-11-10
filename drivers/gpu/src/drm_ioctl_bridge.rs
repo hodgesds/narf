@@ -6290,17 +6290,20 @@ fn atomic_commit(
                     .iter()
                     .find(|(id, _)| *id == dp.crtc_id)
                     .map(|(_, w)| w);
-                if native_output_on_crtc(&card, dp.crtc_id, connector)
-                    .is_some_and(|n| n.color_format.is_some())
-                {
-                    continue;
-                }
-                if !crate::amdgpu_native_kms::display_admits_planes(
-                    d,
-                    connector,
-                    wire,
-                    dp.primary_format,
-                    &dp.setup,
+                let hdmi = native_output_on_crtc(&card, dp.crtc_id, connector)
+                    .is_some_and(|n| n.color_format.is_some());
+                if !planes_admitted(
+                    hdmi,
+                    crate::amdgpu_native_kms::output_search_admits_planes(),
+                    || {
+                        crate::amdgpu_native_kms::display_admits_planes(
+                            d,
+                            connector,
+                            wire,
+                            dp.primary_format,
+                            &dp.setup,
+                        )
+                    },
                 ) {
                     return Err(invalid_at(line!()));
                 }
@@ -7518,6 +7521,18 @@ fn check_native_plane(
         return Err(FsError::NoSpace);
     }
     Ok(())
+}
+
+/// dc_validate_global_state for a touched CRTC's primary and overlay
+/// planes: the display's own admission (`display`), unless the CRTC drives
+/// an HDMI output whose format search plans the planes with every
+/// candidate format (`search_admits_planes`), which then decides. A search
+/// that validates the stream alone (Navi22's) admits no planes, so the
+/// display is still asked: a commit the check accepts must be one the
+/// presenter shows.
+#[cfg(feature = "amdgpu")]
+fn planes_admitted(hdmi: bool, search_admits_planes: bool, display: impl FnOnce() -> bool) -> bool {
+    (hdmi && search_admits_planes) || display()
 }
 
 /// Whether the card's primary planes are the bridge's synthesized ones
