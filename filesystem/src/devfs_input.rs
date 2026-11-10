@@ -1370,6 +1370,11 @@ impl DirOps for DevInputAliasDir {
         let result = crate::devfs::dynamic_unlink(self.dynamic_map(), name);
         Box::pin(async move { result })
     }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_rename(self.dynamic_map(), old_name, new_name);
+        Box::pin(async move { result })
+    }
 }
 
 impl DirOps for DevInputDir {
@@ -1706,6 +1711,55 @@ fn smoke_devfs_input_dynamic_symlink_create_and_unlink() -> narf_kernel_test::Te
 narf_kernel_test::kernel_test_in!(
     "filesystem/devfs_input",
     smoke_devfs_input_dynamic_symlink_create_and_unlink
+);
+
+fn smoke_input_alias_atomic_udev_publication() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let result = (|| {
+        for kind in ["by-id", "by-path"] {
+            let Some(dir) = DevInputDir.lookup_dir(kind) else {
+                return TestResult::Fail("input alias directory missing");
+            };
+            if narf_scheduler::block_on(dir.symlink("narf-udev-alias", "../event0")).is_err() {
+                return TestResult::Fail("input initial alias create failed");
+            }
+            let stage =
+                match narf_scheduler::block_on(dir.symlink(".#narf-udev-stage", "../event1")) {
+                    Ok(stage) => stage,
+                    Err(_) => return TestResult::Fail("input staged alias create failed"),
+                };
+            if narf_scheduler::block_on(dir.rename(".#narf-udev-stage", "narf-udev-alias")).is_err()
+                || dir.lookup(".#narf-udev-stage").is_some()
+            {
+                return TestResult::Fail("input alias publication failed");
+            }
+            let Some(alias) = DevInputDir
+                .lookup_dir(kind)
+                .and_then(|fresh| fresh.lookup("narf-udev-alias"))
+            else {
+                return TestResult::Fail("published input alias missing after lookup");
+            };
+            let mut target = [0; 32];
+            if alias.ino() != stage.ino()
+                || !matches!(narf_scheduler::block_on(alias.read(0, &mut target)), Ok(n)
+                    if &target[..n] == b"../event1")
+            {
+                return TestResult::Fail("input alias lost target or inode during rename");
+            }
+        }
+        TestResult::Pass
+    })();
+    for kind in ["by-id", "by-path"] {
+        if let Some(dir) = DevInputDir.lookup_dir(kind) {
+            let _ = narf_scheduler::block_on(dir.unlink("narf-udev-alias"));
+            let _ = narf_scheduler::block_on(dir.unlink(".#narf-udev-stage"));
+        }
+    }
+    result
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/devfs_alias",
+    smoke_input_alias_atomic_udev_publication
 );
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
