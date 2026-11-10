@@ -168,6 +168,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             &op,
             &mut state.radio.chnlval,
             &mut state.radio.iqk,
+            // No `Lck` state is owned here (LC calibration has no
+            // production caller yet), so the snapshot is clear and no
+            // LCK wait runs — main's behavior, unchanged.
+            false,
         )
         .await?;
         state.bandset = outcome.bandset;
