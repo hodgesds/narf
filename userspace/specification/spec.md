@@ -1988,9 +1988,16 @@ keeps `p_memsz` with `p_filesz = 0`. A page whose frame is not System RAM is
 written as zeros, never read through the direct map. Core dumps emit ELF64
 metadata with
 `PT_NOTE` data immediately after the ELF header, before the VMA program-header
-table. Metadata is written as one sequential buffer (retrying short writes),
-so a partial dump preserves process identity and raw register notes before a
-large table or memory payload. A nonempty write returning zero is a failure.
+table. Metadata is prepared as one sequential buffer and emitted in at most 64-KiB
+operations (retrying short writes), so a partial dump preserves process identity
+and raw register notes before a large table or memory payload. A nonempty write
+returning zero is a failure. Pending SIGKILL interrupts emission, including an
+I/O wait whose filesystem never wakes: the core writer registers its own signal
+waker before checking pending signals. Only its current operation may survive
+cancellation. That operation owns its resolved file and copied buffer and drains
+in executor context to terminal completion; it never borrows the dying process
+or reports the unfinished dump as complete. A permanently stalled backend can
+retain that one operation indefinitely rather than freeing possibly active I/O.
 `NT_PRSTATUS` currently contains the architecture's raw `user_regs_struct`,
 not Linux's full `elf_prstatus`; `NT_PRPSINFO` and optional `NT_AUXV` accompany
 it. Full Linux `NT_PRSTATUS`, `NT_SIGINFO`, and `NT_FILE` remain unsupported.
