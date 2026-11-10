@@ -161,11 +161,14 @@ fn smoke_rtw89_factory_snapshot_matches_linux_layout_and_actual_controls() -> Te
                         != [
                             (0, 1216),
                             match chip {
-                                ChipId::Rtl8852B | ChipId::Rtl8851B => (0x580, 128),
+                                ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8851B => {
+                                    (0x580, 128)
+                                }
                                 ChipId::Rtl8852C => (0x590, 0x60),
                                 _ => (0x5e9, 5),
                             },
                         ]
+                    || factory.a_phycap().is_some() != (chip == ChipId::Rtl8852A)
                     || factory.b_phycap().is_some() != (chip == ChipId::Rtl8852B)
                     || factory.c_phycap().is_some() != (chip == ChipId::Rtl8852C)
                     || factory.n51_phycap().is_some() != (chip == ChipId::Rtl8851B)
@@ -203,6 +206,7 @@ fn smoke_rtw89_factory_failure_cancel_and_corrected_cut_keep_identity_private() 
                 || factory.state() != State::Reading
                 || factory.identity().is_some()
                 || factory.logical().is_some()
+                || factory.a_phycap().is_some()
                 || factory.b_phycap().is_some()
                 || factory.n51_phycap().is_some()
             {
@@ -532,3 +536,83 @@ pub(in crate::rtw89) fn c_identity() -> Identity {
     narf_scheduler::block_on(factory.read(&mut source)).unwrap();
     factory.identity().unwrap()
 }
+
+fn smoke_rtw89_a_phycap_and_efuse_match_linux_rtw8852a_layout() -> TestResult {
+    use super::super::factory_a::Calibration;
+    use super::{A_PHYCAP_ADDR, A_PHYCAP_SIZE};
+    // rtw8852a.c `rtw8852a_chip_info.{phycap_addr,phycap_size}`; the efuse
+    // and trim offsets below are rtw8852a.h `struct rtw8852a_efuse`
+    // (path_a_tssi 0x210, path_b_tssi 0x23a, path_a_therm 0x2d0,
+    // path_b_therm 0x2d1) and rtw8852a.c (tssi_trim {0x5d6, 0x5ab},
+    // thermal trim {0x5df, 0x5dc}, PA bias trim {0x5de, 0x5db}).
+    if (A_PHYCAP_ADDR, A_PHYCAP_SIZE) != (0x580, 128) {
+        return TestResult::Fail("A PHY-cap window differs from rtw8852a_chip_info");
+    }
+    let mut source = SourceModel::new(ChipId::Rtl8852A);
+    let mut factory = Factory::default();
+    if ready(factory.read(&mut source)) != Some(Ok(())) {
+        return TestResult::Fail("A full PHY-cap snapshot failed");
+    }
+    let mut expected = source.phycap;
+    expected[0x69..0x6e].copy_from_slice(&source.extra);
+    if factory.a_phycap() != Some(&expected)
+        || factory.b_phycap().is_some()
+        || factory.c_phycap().is_some()
+        || factory.n51_phycap().is_some()
+        || super::super::factory_b::Calibration::from_factory(&factory).is_some()
+        || super::super::factory_c::Calibration::from_factory(&factory).is_some()
+    {
+        return TestResult::Fail("A PHY-cap window substituted or crossed into B/C owners");
+    }
+    let Some(a) = Calibration::from_factory(&factory) else {
+        return TestResult::Fail("A calibration refused a complete factory snapshot");
+    };
+    // The model leaves the logical TSSI/thermal bytes unset (0); the
+    // 0x2b8 record ([255, 0x33]) pins the thermal offsets against a shift.
+    if a.thermal_trim != [0x5f, 0x5c]
+        || a.pa_bias != [0x5e, 0x5b]
+        || a.tssi_trim
+            != [
+                [0x56, 0x55, 0x54, 0x53, 0x52, 0x51, 0x50, 0x4f],
+                [0x2b, 0x2a, 0x29, 0x28, 0x27, 0x26, 0x25, 0x24],
+            ]
+        || !a.trim_programmed
+        || !a.thermal_programmed
+        || !a.pa_programmed
+        || a.thermal != [0, 0]
+        || a.tssi_cck != [[0; 6]; 2]
+        || a.tssi_mcs != [[0; 19]; 2]
+    {
+        return TestResult::Fail("A PHY-cap/efuse values or validity flags were misdecoded");
+    }
+    let mut source = SourceModel::new(ChipId::Rtl8852A);
+    source.phycap.fill(255);
+    let mut factory = Factory::default();
+    if ready(factory.read(&mut source)) != Some(Ok(())) {
+        return TestResult::Fail("erased A PHY-cap map rejected before policy");
+    }
+    let a = Calibration::from_factory(&factory).unwrap();
+    if a.trim_programmed || a.thermal_programmed || a.pa_programmed || a.tssi_trim != [[0; 8]; 2] {
+        return TestResult::Fail("A erased interpretation fabricated programmed calibration");
+    }
+    for cancel in [false, true] {
+        let mut source = SourceModel::new(ChipId::Rtl8852A);
+        if cancel {
+            source.pending = Some(1);
+        } else {
+            source.fail = Some(1);
+        }
+        let mut factory = Factory::default();
+        if ready(factory.read(&mut source)) == Some(Ok(()))
+            || factory.a_phycap().is_some()
+            || Calibration::from_factory(&factory).is_some()
+        {
+            return TestResult::Fail("uncertain A PHY-cap read published calibration");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_phycap_and_efuse_match_linux_rtw8852a_layout
+);

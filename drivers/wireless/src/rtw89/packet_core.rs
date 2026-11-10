@@ -200,7 +200,8 @@ struct Submission<'a> {
 }
 pub(super) struct Core {
     phase: Phase,
-    /// RTL8852B or RTL8852C (ordinary station rings only).
+    /// RTL8852A, RTL8852B or RTL8852C (ordinary station rings only, plus
+    /// the AP role on A/B).
     chip: ChipId,
     own: [u8; 6],
     mac_id: u8,
@@ -359,19 +360,17 @@ impl Core {
             || mac_id != 0
             || !matches!(
                 chip,
-                ChipId::Rtl8852A
-                    | ChipId::Rtl8852B
-                    | ChipId::Rtl8852C
-                    | ChipId::Rtl8851B
+                ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
             )
-            // A, C and RTL8851B: the ordinary station rings only (BE0/MGMT8,
+            // C and RTL8851B: the ordinary station rings only (BE0/MGMT8,
             // plus ACH1..3 under the signed all-AC QoS program); no AP role.
-            || matches!(
-                chip,
-                ChipId::Rtl8852A | ChipId::Rtl8852C | ChipId::Rtl8851B
-            ) && (ap
-                || queues != format::Queue::ordinary(false)
-                    && queues != format::Queue::ordinary(true))
+            // A admits the same rings and the AP role as B: both use the
+            // AX TXWD v0 path (`rtw89_core_fill_txdesc`) and the same
+            // `AX_DMA_ADDR_SET` ring registers.
+            || matches!(chip, ChipId::Rtl8852C | ChipId::Rtl8851B)
+                && (ap
+                    || queues != format::Queue::ordinary(false)
+                        && queues != format::Queue::ordinary(true))
         {
             return Err(Error::Packet);
         }
@@ -449,7 +448,7 @@ impl Core {
             || self.rx < RxPhy::Ht
             || !matches!(
                 self.chip,
-                ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+                ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
             )
         {
             return Err(Error::State);
@@ -491,6 +490,13 @@ impl Core {
         Ok(())
     }
     pub(super) fn enable_amsdu(&mut self, limit: usize) -> Result<(), Error> {
+        // A admits A-MSDU only to its own `max_amsdu_limit` (3500), not B's
+        // 5000 (`rtw8852a_chip_info` vs `rtw8852b_chip_info`).
+        let ceiling = if self.chip == ChipId::Rtl8852A {
+            super::tx_amsdu::MAX_BODY_A
+        } else {
+            super::tx_amsdu::MAX_BODY
+        };
         if self.phase != Phase::Prepared
             || self.rx < RxPhy::Ht
             || !self.aggregate
@@ -501,7 +507,7 @@ impl Core {
                 ChipId::Rtl8852A | ChipId::Rtl8852C | ChipId::Rtl8851B
             )
             || limit == 0
-            || limit > super::tx_amsdu::MAX_BODY
+            || limit > ceiling
         {
             return Err(Error::State);
         }
@@ -888,8 +894,13 @@ impl Core {
                     &descriptor,
                 )?;
                 barrier();
-                port.write16(kind.regs().idx as u32, ring.queue.write_pointer())?;
-                if port.read16(kind.regs().idx as u32)? & 0x0fff != ring.queue.write_pointer() {
+                port.write16(
+                    kind.regs_for(self.chip).idx as u32,
+                    ring.queue.write_pointer(),
+                )?;
+                if port.read16(kind.regs_for(self.chip).idx as u32)? & 0x0fff
+                    != ring.queue.write_pointer()
+                {
                     return Err(Error::Access);
                 }
                 self.next_id = next_id;

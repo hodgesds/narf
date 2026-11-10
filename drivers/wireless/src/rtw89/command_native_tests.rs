@@ -87,7 +87,7 @@ impl Fixture {
             armed: false,
             state: State::Configuring,
             receive: super::super::rx_dma::Rx::default(),
-            radio: super::super::rf_access::Rf::default(),
+            radio: super::super::rf_access::Rf::for_chip(chip),
             runtime_sequence: 0,
             station_runtime: station::Runtime::default(),
             sleep_blocked: false,

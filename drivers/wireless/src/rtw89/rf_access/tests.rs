@@ -259,6 +259,37 @@ fn smoke_rtw89_b_rf_native_window_and_current_authority() -> TestResult {
     {
         return TestResult::Fail("revoked RF transaction changed native BAR state");
     }
+    // RTL8852A: the same AX PHY offset with `rf_base_addr` {0xc000, 0xd000},
+    // so the window ends at the path-B last direct RF dword 0x1d3fc and the
+    // A direct read lands at 0x1d154 (0x10000 + 0xd000 + 0x154).
+    let authority = Cap::<BusDeviceCap, Write>::bootstrap();
+    let mut words = vec![0u32; 0x20000 / 4];
+    let mut region = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: words.as_mut_ptr() as u64,
+        len: 0x10000,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    // SAFETY: complete private aligned register RAM; the short advertised BAR
+    // must reject A RF before touching even its existing MAC-sized window.
+    let short = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852A, 0) }.unwrap();
+    if short.a_phy_window() != Err(Error::Access) {
+        return TestResult::Fail("MAC-sized BAR became A RF aperture authority");
+    }
+    region.len = 0x20000;
+    // SAFETY: same actual allocation covers the full A direct RF window.
+    let mut io = unsafe { NativeIo::new(region, authority, ChipId::Rtl8852A, 0) }.unwrap();
+    if io.a_phy_window() != Ok(()) || io.b_phy_window() != Err(Error::Unsupported) {
+        return TestResult::Fail("complete current A PHY window rejected or crossed into B");
+    }
+    words[0x1d154 / 4] = 0xabcde;
+    let mut rf = Rf::for_chip(ChipId::Rtl8852A);
+    // SAFETY: full current native A window proved above, exclusive inert RAM.
+    if ready(unsafe { rf.read(&mut io, 1, 0x10055, 0xff00) }) != Some(Ok(0xbc)) {
+        return TestResult::Fail("native A RF did not use the A path aperture");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
@@ -319,7 +350,59 @@ fn smoke_rtw8852a_rf_native_window_uses_a_rf_bases() -> TestResult {
     }
     TestResult::Pass
 }
+
+fn smoke_rtw89_a_rf_direct_uses_a_bases() -> TestResult {
+    use super::super::mac::ChipId;
+    // Linux rtw8852a.c `rtw8852a_chip_info.rf_base_addr` {0xc000, 0xd000}:
+    // every frozen B direct case replays on A with the same values and the
+    // same SWSI path, only the direct aperture moves 0x2000 down
+    // (path 0: 0x1e154 -> 0x1c154, path 1: 0x1f154 -> 0x1d154).
+    for &(write, seed, path, address, mask, value, trace) in CASES {
+        let mut rf = Rf::for_chip(ChipId::Rtl8852A);
+        let mut io = Model::new(seed);
+        let expected: Vec<(u8, u32, u32)> = trace
+            .iter()
+            .map(|&(op, a, v)| {
+                (
+                    op,
+                    if address & 0x10000 != 0 {
+                        a - 0x2000
+                    } else {
+                        a
+                    },
+                    v,
+                )
+            })
+            .collect();
+        if ready(execute(&mut rf, &mut io, write, path, address, mask)) != Some(Ok(value))
+            || io.trace != expected
+            || rf.state() != State::Idle
+        {
+            return TestResult::Fail(
+                "A RF transaction differs from the B frozen reference outside the direct base",
+            );
+        }
+    }
+    // The B owner is unchanged: default and for_chip(B) agree on B's bases.
+    for &(write, seed, path, address, mask, value, trace) in CASES {
+        let mut rf = Rf::for_chip(ChipId::Rtl8852B);
+        let mut io = Model::new(seed);
+        if ready(execute(&mut rf, &mut io, write, path, address, mask)) != Some(Ok(value))
+            || io.trace != trace
+            || rf.state() != State::Idle
+        {
+            return TestResult::Fail("for_chip(B) moved a B RF transaction");
+        }
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852a_rf_native_window_uses_a_rf_bases
+);
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_rf_direct_uses_a_bases
 );

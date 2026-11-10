@@ -68,10 +68,14 @@ pub struct Factory {
     state: State,
     identity: Option<Identity>,
     logical: Vec<u8>,
+    a_phycap: Option<[u8; 128]>,
     b_phycap: Option<[u8; 128]>,
     c_phycap: Option<[u8; C_PHYCAP_SIZE]>,
     n51_phycap: Option<[u8; 128]>,
 }
+/// rtw8852a.c `rtw8852a_chip_info.{phycap_addr,phycap_size}`.
+pub(super) const A_PHYCAP_ADDR: u16 = 0x580;
+pub(super) const A_PHYCAP_SIZE: usize = 128;
 /// rtw8852c.c `rtw8852c_chip_info.{phycap_addr,phycap_size}`.
 pub(super) const C_PHYCAP_ADDR: u16 = 0x590;
 pub(super) const C_PHYCAP_SIZE: usize = 0x60;
@@ -81,6 +85,7 @@ impl Default for Factory {
             state: State::New,
             identity: None,
             logical: Vec::new(),
+            a_phycap: None,
             b_phycap: None,
             c_phycap: None,
             n51_phycap: None,
@@ -96,6 +101,14 @@ impl Factory {
     }
     pub fn logical(&self) -> Option<&[u8]> {
         (self.state == State::Ready).then_some(self.logical.as_slice())
+    }
+    /// The complete RTL8852A PHY-cap window (`rtw8852a_chip_info.phycap_addr`
+    /// 0x580, `phycap_size` 128), present only after a completed read. Kept
+    /// apart from the RTL8852B window so no B owner can consume it.
+    pub(super) fn a_phycap(&self) -> Option<&[u8; 128]> {
+        (self.state == State::Ready)
+            .then_some(self.a_phycap.as_ref())
+            .flatten()
     }
     pub(super) fn b_phycap(&self) -> Option<&[u8; 128]> {
         (self.state == State::Ready)
@@ -148,21 +161,21 @@ impl Factory {
         }
         // Linux physical power-k marker0x5e9, ECV0x5ea, secure0x5ec/5ed.
         let mut extra = [0; 5];
-        let window = if matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8851B) {
+        let window = if matches!(chip, ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8851B) {
             // The PHY-cap map is separate from the1216-byte sparse map
-            // (rtw8852b/rtw8851b `phycap_addr` 0x580, `phycap_size` 128).
+            // (rtw8852a/b/rtw8851b `phycap_addr` 0x580, `phycap_size` 128).
             // Read every byte before exposing trim/TSSI or secure inputs.
             let mut bytes = [0; 128];
-            io.physical(0x580, &mut bytes).await?;
+            io.physical(A_PHYCAP_ADDR, &mut bytes).await?;
             extra.copy_from_slice(&bytes[0x69..0x6e]);
             Some(bytes)
         } else {
             None
         };
-        let (b_phycap, n51_phycap) = if chip == ChipId::Rtl8851B {
-            (None, window)
-        } else {
-            (window, None)
+        let (a_phycap, b_phycap, n51_phycap) = match chip {
+            ChipId::Rtl8852A => (window, None, None),
+            ChipId::Rtl8851B => (None, None, window),
+            _ => (None, window, None),
         };
         let c_phycap = if chip == ChipId::Rtl8852C {
             // C's PHY-cap window 0x590..0x5f0 contains the same 0x5e9..0x5ee
@@ -198,6 +211,7 @@ impl Factory {
             fuses,
         };
         self.logical = logical;
+        self.a_phycap = a_phycap;
         self.b_phycap = b_phycap;
         self.c_phycap = c_phycap;
         self.n51_phycap = n51_phycap;

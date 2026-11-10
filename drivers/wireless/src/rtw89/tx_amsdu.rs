@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Directional RTW8852B TX A-MSDU facts; no RX capability or RF authority.
 pub(super) const MAX_BODY: usize = 5000; // rtw8852b_chip_info.max_amsdu_limit
+/// RTL8852A A-MSDU ceiling (`rtw8852a_chip_info.max_amsdu_limit`): A
+/// admits A-MSDU bodies only to 3500 bytes, not B's 5000.
+pub(super) const MAX_BODY_A: usize = 3500;
 pub(super) const PREFIX: usize = 8;
 
 /// Native AX OUTSRC/RA/STS for MACID0. Linux phy.c::get_max_amsdu_len
