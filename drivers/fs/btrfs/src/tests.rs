@@ -18,6 +18,7 @@ use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
 mod batch_commit;
+mod commit_scale;
 mod data_cache;
 mod extent_window;
 mod safety;
@@ -11405,10 +11406,12 @@ fn smoke_btrfs_block_group_tree_read() -> TestResult {
         .map(|&(s, l, _)| (s, l))
         .collect();
     match poll_once(crate::allocator::Allocator::build(&vol)) {
-        Some(Ok(crate::allocator::Allocator::Reclaim { ranges })) => {
-            if ranges
-                .iter()
-                .any(|&(r, _, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
+        Some(Ok(alloc @ crate::allocator::Allocator::Reclaim { .. })) => {
+            let ranges = alloc.__test_offered_ranges();
+            if ranges.is_empty()
+                || ranges
+                    .iter()
+                    .any(|&(r, _, _)| sys.iter().any(|&(s, l)| r >= s && r < s + l))
             {
                 return TestResult::Fail("allocator offered system block group space");
             }

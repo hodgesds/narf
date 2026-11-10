@@ -130,11 +130,42 @@ accepted changes durable, leaving any unreaped orphan record for recovery.
 
 ## 4. Invariants
 
-Free-space bitmap edits accumulate only in a private logical leaf. Each
-changed block group's free-run count is recomputed after all allocations and
-releases for that fixed-point round, before packing or publishing any node.
-Bitmap ranges are found by their ordered keys, with coverage and body bounds
-checked across every bitmap boundary. The on-disk format is unchanged.
+A commit maintains the free-space tree incrementally (`write/free_space.rs`,
+Linux `btrfs_add_to_free_space_tree` / `btrfs_remove_from_free_space_tree`
+run from the delayed refs): it reads only the leaves holding the items its
+allocations and frees reach (the block group's `FREE_SPACE_INFO`, the
+`FREE_SPACE_EXTENT` or `FREE_SPACE_BITMAP` items around each range), edits a
+private copy of those items, and path-COWs the result, so the blocks read and
+written are bounded by tree height × touched leaves for every round of the
+fixed point, independent of the size of the tree
+(`smoke_btrfs_commit_cost_tracks_change_not_tree_size`). Each block group
+keeps the form its `FREE_SPACE_INFO.flags` selects; none is converted.
+Extent-form frees merge with an adjacent free extent on either side, never
+across a block-group boundary. Bitmap ranges are found by their ordered keys,
+with coverage and body bounds checked across every bitmap boundary, and
+`extent_count` moves by the delta the bits on either side of the range give
+(Linux `modify_free_space_bitmap`). An allocation of space the tree does not
+hold free, or a free of space it already does, fails the commit before
+anything is written. The free-space tree's own new and replaced blocks are
+metadata allocations and frees that edit it again; they join the extent and
+block-group trees' in the commit's fixed point, which is bounded (64 rounds)
+and fails closed. Free-space leaves are kept dense: an overflowing leaf is
+split evenly, and a sparse committed leaf an edit reaches absorbs its right
+sibling. The on-disk format is unchanged.
+
+The allocator carves from one in-memory copy of the committed free-space tree
+per filesystem (`allocator::FreeView`, Linux's per-block-group free-space
+cache), read from disk on first use and advanced by each commit with exactly
+the ranges that commit marked used and free in the tree. It is tied to the
+tree root (address + generation) it mirrors and is re-read from disk whenever
+that does not match: at mount, after a failed or aborted commit, after a
+chunk allocation or any other transaction that changes block groups, and
+after any path that writes the tree outside `commit_txn`. Pinned extents,
+roots held by lock-free readers and superblock mirror stripes are free in the
+view and withheld by each allocator, so the pinning rule is unchanged. With
+`allocator::set_view_audit` (on in kernel-test builds and in
+`verification/btrfs-host`) every commit re-reads the tree and fails on any
+difference from the view.
 
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.

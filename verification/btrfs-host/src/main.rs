@@ -12,6 +12,7 @@
 mod crash;
 mod dev;
 mod fixture;
+mod fst;
 mod host;
 mod linux;
 mod model;
@@ -43,7 +44,7 @@ USAGE: narf-btrfs-host [OPTIONS]
                     others scale from it; 0 disables the crash pass)
   --exhaustive      crash-test every flush boundary plus two random cuts per
                     flush window (slow)
-  --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate
+  --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate,fst
                     (default all)
   --jobs N          concurrent `btrfs check` processes in the crash pass
                     (default 3)
@@ -53,7 +54,7 @@ USAGE: narf-btrfs-host [OPTIONS]
 ";
 
 /// The default selection (`regress` = every `regress-*` case).
-pub const SCENARIOS: [&str; 5] = ["regress", "root", "snapshots", "lba4k", "gate"];
+pub const SCENARIOS: [&str; 6] = ["regress", "root", "snapshots", "lba4k", "gate", "fst"];
 /// Names `--scenario` also accepts.
 const REGRESS: [&str; 3] = [
     "regress-zstd-tail",
@@ -620,6 +621,10 @@ fn main() {
         }
     };
     host::init();
+    // Every commit re-reads the free-space tree it wrote and compares it
+    // with the in-memory view the driver advanced; a difference fails the
+    // commit (and so the workload).
+    narf_drivers_fs_btrfs::allocator::set_view_audit(true);
     let t0 = Instant::now();
     let scenarios = [
         regress("regress-zstd-tail", regress_zstd_tail),
@@ -684,6 +689,17 @@ fn main() {
                 Err(e) => {
                     failed += 1;
                     println!("gate: FAIL\n{e}");
+                }
+            }
+            continue;
+        }
+        if name == "fst" {
+            match fst::run(&args) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    failed += 1;
+                    println!("fst: FAIL\n{e}");
+                    narf::reset();
                 }
             }
             continue;
