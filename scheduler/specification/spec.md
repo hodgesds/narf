@@ -27,6 +27,36 @@ those — it is the glue, not the signal source.
 
 ## 3. Public interface
 
+### Caller authority and lifetime
+
+`create_user_authority(TaskId)` creates a prepared `Arc<CallerAuthority>`
+and a unique `AuthorityControl` together before task publication. The Task
+and scheduler slot retain the same owner; spawn publishes it only after
+inherited state is installed. No native capability is implicitly inherited
+by compatibility fork/clone. An abandoned preparation unregisters and retires
+its owner. `AuthorityControl::{retire, replace_image}` belong to Task lifecycle;
+a retained dispatch handle cannot obtain lifecycle control. Scheduler slot
+destruction also retires admission. `release_caller_authority` removes only
+the matching registration, including while passive owners retain storage.
+
+`CallerAuthority::{image, domain_for_image}` read one atomic admission word
+with logical domain, publication/retirement state and execution generation.
+Image exhaustion retires permanently. Scope restoration changes only the
+domain bits, preserving retirement and generation. `enter_domain_scope` and
+`exit_domain_scope` couple the architecture's logical scope transition with
+this task-owned state; hardware rights/fences remain architecture-owned.
+The current KernelTask and its slot share that domain state across preemption,
+migration and direct transfer. Executor/trap FRAME entry is separate.
+
+`CallerAuthority::validate_caps` resolves the fixed cap array under one
+owner-local lock, with an empty-array fast path. `task_authority(TaskId)` and
+the existing lookup/install/transfer functions are cold management APIs over
+an ordered task index. Dispatch retains its source directly; cross-task
+transfer resolves only its selected receiver through that index.
+`AuthorityWatch` is registered once per dispatcher; queue blocking arms its
+waker and rechecks admission to avoid lost retirement/exec/session-close wakes.
+Arc ownership pins storage and does not prove liveness.
+
 ### 3.1 Core executor API
 
 ```rust
@@ -893,7 +923,8 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
 
 ## 4. Invariants & safety properties
 
-- A task always polls inside the domain it was spawned with.
+- A task initially polls in its spawn domain and resumes in its saved domain;
+  scope entry/exit updates the same task-owned logical authority state.
 - A user task polls with its own address-space root active. On both
   architectures the executor captures the complete incoming root once, retains
   an `Arc` to every root while hardware can reference it, skips the register

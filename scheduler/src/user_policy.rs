@@ -675,8 +675,9 @@ mod tests {
             // Policy-fixture slot: an unregistered table. Policy
             // tests never resolve caps; the registry path is covered
             // by the scheduler's own spawn-path fixtures.
-            cap_table: Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
-                narf_capabilities::CapTable::new(),
+            authority: Arc::new(crate::CallerAuthority::prepared(
+                id,
+                narf_lib::id::DomainId::FRAME,
             )),
             affinity_generation,
             addr_space: None,

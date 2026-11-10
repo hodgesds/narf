@@ -2967,6 +2967,7 @@ fn do_execve_resolved(
     // "memory allocation of N bytes failed" kernel-heap OOM panic.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if narf_scheduler::stackful::user_own_stack_enabled() {
+        let _ = crate::user_task::with_current_task_owner(native_exec_commit);
         let entry = new_proc.entry.0.as_u64();
         let rsp = new_proc.stack_top.as_u64();
         #[cfg(target_arch = "x86_64")]
@@ -14404,10 +14405,29 @@ pub(crate) fn signalfd_arc_from_fd(
 /// dispatching the (synchronous) syscall body so a parallel
 /// `OpCode::Cancel` lands cleanly.
 pub fn abi_file_op_bridge(
+    subject: Option<narf_abi::DispatchContext<'_>>,
     kind: narf_abi::FileOpKind,
     args: &narf_abi::FileOpArgs,
     cx: &narf_abi::CancelCtx<'_>,
 ) -> narf_abi::FileOpReturn {
+    // The legacy syscall body below is only valid on the owner's own
+    // continuation. Never impersonate a different submitting task by running
+    // its fd/MM operations against this worker's ambient current state.
+    let owner_matches = subject.is_some_and(|subject| {
+        crate::user_task::with_current_task_owner(|owner| {
+            core::ptr::eq(owner.authority.as_ref(), subject.authority)
+                && subject.authority.domain_for_image(subject.image).is_ok()
+        })
+        .unwrap_or(false)
+    });
+    #[cfg(feature = "kernel-test")]
+    let owner_matches = owner_matches || subject.is_none();
+    if !owner_matches {
+        return narf_abi::FileOpReturn {
+            status: narf_abi::NarfStatus::Unsupported as u32,
+            value: 0,
+        };
+    }
     if cx.is_cancel_requested() {
         // Signal Cancelled to the dispatcher (status=2 mirrors
         // NarfStatus::Cancelled). The dispatcher converts to
@@ -14502,12 +14522,17 @@ pub fn abi_file_op_bridge(
 /// that task's own table, so the task cannot spend another task's
 /// capabilities through its rings.
 pub fn spawn_dispatcher_for(task_id: u64) -> Option<narf_scheduler::TaskId> {
-    let ends = take_kernel_ends(task_id)?;
+    let (session, ends) = {
+        let mut table = BOOTSTRAP_TABLE.lock();
+        let entry = table.as_mut()?.get_mut(&task_id)?;
+        (entry.session.clone(), entry.kernel.take()?)
+    };
     Some(narf_scheduler::spawn(async move {
-        let mut d = narf_abi::Dispatcher::for_task(
+        let mut d = narf_abi::Dispatcher::for_authority(
             ends.sq_drain,
             ends.cq_prod,
-            narf_scheduler::TaskId(task_id),
+            session.authority.clone(),
+            Some(session.closed.clone()),
         );
         d.run().await;
     }))

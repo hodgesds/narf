@@ -65,6 +65,14 @@
 
 extern crate alloc;
 
+mod authority;
+#[cfg(feature = "kernel-test")]
+pub use authority::__set_task_active_domain_for_test;
+pub use authority::{
+    create_user_authority, enter_domain_scope, exit_domain_scope, prepare_user_authority,
+    release_caller_authority, task_authority, AuthorityControl, AuthorityWatch, CallerAuthority,
+};
+
 pub mod accounting;
 pub mod admission;
 pub mod affinity;
@@ -188,7 +196,8 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::AtomicU64;
 
-use narf_capabilities::{Cap, CapError, CapKind, CapSlot, CapTable, CapType, Grant, Rights, Spend};
+use narf_capabilities::{Cap, CapError, CapKind, CapSlot, CapType, Rights, Spend};
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::AddressSpace;
 use narf_time::Instant;
@@ -567,142 +576,39 @@ fn unregister_live_user_address_space(id: TaskId) {
         .retain(|(existing, _)| *existing != id);
 }
 
-// ── Per-task capability tables (#1363 wiring) ───────────────────────
-///
-/// The slot owns its `CapTable` (see `TaskSlot::cap_table`); this
-/// registry is only an index so ABI dispatch can reach the submitting
-/// task's table by `TaskId`. A queue scan cannot do that job: the
-/// executor pops a slot off its ready queue for the whole poll, so
-/// the submitting task — running in user mode or inside its trap
-/// while the dispatcher drains — is usually off-queue. The registry
-/// is installed at spawn (before enqueue, so no dispatch can observe
-/// a live task without a table) and removed only with the final slot
-/// drop, mirroring `LIVE_USER_ADDRESS_SPACES`. Lock order is always
-/// registry → table → object-table; no path takes them in another
-/// order, and `Drop` takes only the registry lock.
-type LiveTaskCapTables = alloc::vec::Vec<(TaskId, Arc<IrqSafeSpinLock<CapTable>>)>;
-static TASK_CAP_TABLES: IrqSafeSpinLock<LiveTaskCapTables> =
-    IrqSafeSpinLock::new(alloc::vec::Vec::new());
-
-/// Create a task's table and register it. Called by every spawn path
-/// before the slot is enqueued. The returned `Arc` is stored in the
-/// slot, which owns the table; the registry holds the second `Arc`
-/// as the dispatch-lookup index.
-fn register_task_cap_table(id: TaskId) -> Arc<IrqSafeSpinLock<CapTable>> {
-    let table = Arc::new(IrqSafeSpinLock::new(CapTable::new()));
-    let mut live = TASK_CAP_TABLES.lock();
-    debug_assert!(live.iter().all(|(existing, _)| *existing != id));
-    live.push((id, table.clone()));
-    table
-}
-
-fn unregister_task_cap_table(id: TaskId) {
-    TASK_CAP_TABLES
-        .lock()
-        .retain(|(existing, _)| *existing != id);
-}
-
-/// Resolve one presented wire slot against `task`'s own table
-/// (capabilities/ §8 steps 1–4 via `CapTable::lookup`). An unknown
-/// task id fails closed as `Revoked`: a task with no table cannot
-/// prove any cap, so dispatch must not run its op. This is the
-/// lookup ABI dispatch calls for every non-empty `Submission::caps`
-/// entry; see `narf_abi::validate_submission_caps`.
+// Task-id selection is a cold management operation. Dispatch retains the
+// task-owned CallerAuthority and never calls these adapters per submission.
 pub fn lookup_task_cap(task: TaskId, presented: CapSlot) -> Result<CapSlot, CapError> {
-    let tables = TASK_CAP_TABLES.lock();
-    let table = tables
-        .iter()
-        .find(|(existing, _)| *existing == task)
-        .map(|(_, table)| Arc::clone(table))
-        .ok_or(CapError::Revoked)?;
-    // Drop the registry guard before taking the table lock: the
-    // table's epoch check takes the global object-table lock, and
-    // no path ever takes the registry lock under a table lock.
-    drop(tables);
-    // Bind the result before returning: the `IrqSafeSpinLockGuard`
-    // temporary borrows `table`, and a tail-expression temporary
-    // outlives the function's locals, so returning the call directly
-    // would drop `table` while the guard's `Drop` may still use it.
-    let resolved = table.lock().lookup(presented);
-    resolved
+    task_authority(task)
+        .ok_or(CapError::Revoked)?
+        .lookup(presented)
 }
 
-/// Install a bootstrap cap into `task`'s table (capabilities/ §9.7
-/// reserved region, slots 0..16). The task-creation path: the
-/// creator holds the cap and the task id, and installs before the
-/// task's first dispatch. Fails closed (`Revoked`) for an unknown
-/// task id and `CapTableFull` past the 16-slot bootstrap region.
 pub fn install_task_bootstrap_cap<T: CapType, R: Rights>(
     task: TaskId,
     cap: &Cap<T, R>,
 ) -> Result<u32, CapError> {
-    let tables = TASK_CAP_TABLES.lock();
-    let table = tables
-        .iter()
-        .find(|(existing, _)| *existing == task)
-        .map(|(_, table)| Arc::clone(table))
-        .ok_or(CapError::Revoked)?;
-    drop(tables);
-    // Bind before returning (see `lookup_task_cap`): the lock
-    // guard temporary borrows `table` and outlives locals in a
-    // tail expression.
-    let slot = table.lock().install_bootstrap(cap);
-    slot
+    task_authority(task)
+        .ok_or(CapError::Revoked)?
+        .install_bootstrap(cap)
 }
 
-/// Grant-gated cross-task transfer at the ABI level (capabilities/
-/// §9.1, `OpCode::CapTransfer`). Resolves both presented slots
-/// against the sender's table, then installs the resolved entry
-/// into the receiver's table. The presented grant must itself
-/// assert the `Grant` right — presenting a downgraded view of a
-/// Grant cap does not exercise grant authority — and the resolved
-/// entries must name the same object with the same type tag. An
-/// unknown sender or receiver fails closed as `Revoked`; the
-/// receiver's fresh slot number (≥ 16) is returned on success.
-/// The sender and receiver locks are never held at once, so a
-/// self-transfer (sender == receiver) cannot deadlock.
 pub fn transfer_task_cap(
     sender: TaskId,
     receiver: TaskId,
     grant: CapSlot,
     cap: CapSlot,
 ) -> Result<u32, CapError> {
-    if grant.rights & Grant::BITS == 0 {
-        return Err(CapError::RightsTooWeak);
-    }
-    let (grant_entry, cap_entry) = {
-        let tables = TASK_CAP_TABLES.lock();
-        let sender_table = tables
-            .iter()
-            .find(|(existing, _)| *existing == sender)
-            .map(|(_, table)| Arc::clone(table))
-            .ok_or(CapError::Revoked)?;
-        drop(tables);
-        let g = sender_table.lock();
-        let grant_entry = g.lookup(grant)?;
-        let cap_entry = g.lookup(cap)?;
-        (grant_entry, cap_entry)
-    };
-    let tables = TASK_CAP_TABLES.lock();
-    let receiver_table = tables
-        .iter()
-        .find(|(existing, _)| *existing == receiver)
-        .map(|(_, table)| Arc::clone(table))
-        .ok_or(CapError::Revoked)?;
-    drop(tables);
-    // Bind before returning (see `lookup_task_cap`): the lock
-    // guard temporary borrows `receiver_table` and outlives
-    // locals in a tail expression.
-    let slot = receiver_table
-        .lock()
-        .install_transfer(grant_entry, cap_entry);
-    slot
+    let sender = task_authority(sender).ok_or(CapError::Revoked)?;
+    let receiver = task_authority(receiver).ok_or(CapError::Revoked)?;
+    sender.transfer_to(&receiver, grant, cap)
 }
 
 impl Drop for TaskSlot {
     fn drop(&mut self) {
         unregister_live_user_address_space(self.id);
-        unregister_task_cap_table(self.id);
+        self.authority.retire();
+        authority::unregister(self.id);
         if let Some(address_space) = self.addr_space.as_ref() {
             // Final slot drop is the execution-liveness boundary for this MM:
             // the future cannot be polled again after Drop begins. Passive Arc
@@ -2623,19 +2529,9 @@ pub(crate) struct TaskSlot {
     /// `RunQueue` projection can read its `priority`/`class`/
     /// `affinity` fields.
     pub(crate) spec: TaskSpec,
-    /// Per-task capability table (capabilities/ §9.7, #1363 wiring).
-    /// Created empty at spawn — every lookup fails `Revoked` until
-    /// the creator installs bootstrap caps via
-    /// `install_task_bootstrap_cap` (slots 0..16) or a Grant-gated
-    /// transfer lands (`transfer_task_cap`). The slot owns the table;
-    /// `TASK_CAP_TABLES` holds a second `Arc` as the dispatch-lookup
-    /// index, removed on final drop. ABI dispatch resolves a
-    /// submission's caps against this table only — never the global
-    /// object table — so a task cannot spend another task's caps.
-    /// Held purely for ownership — lookups go through the registry,
-    /// never read, hence the allow.
-    #[allow(dead_code)]
-    cap_table: Arc<IrqSafeSpinLock<CapTable>>,
+    /// Stable caller identity, grants and domain state, prepared before the
+    /// slot is published. Dispatchers borrow this same owner directly.
+    authority: Arc<CallerAuthority>,
     /// Last affinity-registry generation folded into `spec.affinity`. Most
     /// dispatches only compare this against one shard-local atomic; the
     /// registry lock is taken only after an actual affinity update.
@@ -2716,6 +2612,7 @@ impl core::fmt::Debug for TaskSlot {
 /// or any other scheduler-owned data is touched.
 #[inline]
 fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
+    let _authority = authority::CurrentGuard::enter(&slot.authority);
     let executor_domain = narf_memory::save_domain_state();
     let task_domain = slot.domain_saved.unwrap_or(executor_domain);
     // Avoid an identity restore.  On the stackful user path the outer
@@ -2727,6 +2624,8 @@ fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
         narf_memory::restore_domain_state(&task_domain);
     }
 
+    let incoming_reported = narf_arch::current_domain_byte();
+    narf_arch::set_current_domain_byte(slot.authority.domain.load(Ordering::Acquire));
     let result = slot.task.as_mut().poll(ctx);
 
     let returned_task_domain = narf_memory::save_domain_state();
@@ -2737,6 +2636,7 @@ fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
     if returned_task_domain != executor_domain {
         narf_memory::restore_domain_state(&executor_domain);
     }
+    narf_arch::set_current_domain_byte(incoming_reported);
     slot.domain_saved = Some(returned_task_domain);
     result
 }
@@ -3008,7 +2908,7 @@ pub fn __reset_queues_for_test() {
     // already unregistered via `Drop`, but a test that discards a
     // slot without dropping it (staged wake inbox, deferred exec
     // replacement) must not leak its table into the next test.
-    TASK_CAP_TABLES.lock().clear();
+    authority::reset();
     // A task can queue an in-poll exec replacement and then remain pending.
     // Tests that discard its slot must also discard that deferred owner or the
     // replacement address space leaks into the next test.
@@ -4227,6 +4127,19 @@ pub fn spawn_with_spec<F>(f: F, spec: TaskSpec) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    spawn_with_spec_in_domain(f, spec, DomainId::FRAME)
+}
+
+/// [`spawn_with_spec`] with an explicit spawn-time active domain for
+/// the task-owned §8 step-5 authority. Plain tasks
+/// and start in `FRAME`; stackful spawns pass
+/// `StackfulOptions::domain` (the same value stamped into the
+/// stackful `domain_byte`) so authority and `current_domain()`
+/// agree from the task's first poll.
+fn spawn_with_spec_in_domain<F>(f: F, spec: TaskSpec, domain: DomainId) -> TaskId
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let mut spec = spec;
     assert!(
         spec.budget.is_valid(),
@@ -4243,7 +4156,8 @@ where
     let cpu = target_cpu(&spec);
     let affinity_generation = register_task_affinity(id, spec.affinity, false);
     let awake = new_wake_cell(id, 0, false);
-    let cap_table = register_task_cap_table(id);
+    let authority = authority::prepare(id, domain);
+    authority.publish();
     let slot = TaskSlot {
         user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
@@ -4251,7 +4165,7 @@ where
         awake,
         id,
         spec,
-        cap_table,
+        authority,
         affinity_generation,
         addr_space: None,
         account: BudgetAccount::new(),
@@ -4304,7 +4218,8 @@ where
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let affinity_generation = register_task_affinity(id, spec.affinity, true);
     let awake = new_wake_cell(id, cpu as u32, false);
-    let cap_table = register_task_cap_table(id);
+    let authority = authority::prepare(id, opts.domain);
+    authority.publish();
     let slot = TaskSlot {
         user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
@@ -4312,7 +4227,7 @@ where
         awake,
         id,
         spec,
-        cap_table,
+        authority,
         affinity_generation,
         addr_space: None,
         account: BudgetAccount::new(),
@@ -4379,6 +4294,16 @@ pub struct StackfulOptions {
     /// aligned. Default `stackful::DEFAULT_KERNEL_STACK_BYTES`
     /// (16 KiB).
     pub stack_bytes: usize,
+    /// Active domain the task reports (`current_domain()`) while it
+    /// runs — the stackful `KernelTask::domain_byte` init. Default
+    /// `DomainId::FRAME` (a fresh task has no scope open).
+    /// `spawn_user` sets `USERSPACE_K`: a user task's kernel-side
+    /// work runs in the per-task kernel-side user domain
+    /// (security-model/ §4.1), and ABI dispatch (§8 step 5) reads the
+    /// same value from the task-owned authority —
+    /// the two must agree, or the two dispatch entries would enforce
+    /// different domains for one task.
+    pub domain: DomainId,
 }
 
 impl Default for StackfulOptions {
@@ -4389,6 +4314,7 @@ impl Default for StackfulOptions {
             no_preempt: false,
             user_preempt: false,
             stack_bytes: stackful::DEFAULT_KERNEL_STACK_BYTES,
+            domain: DomainId::FRAME,
         }
     }
 }
@@ -4417,7 +4343,7 @@ where
 {
     let mut adapter = stackful::StackfulAdapter::with_options(f, opts);
     adapter.apply_options();
-    spawn_with_spec(adapter, spec)
+    spawn_with_spec_in_domain(adapter, spec, opts.domain)
 }
 
 /// Spawn a stackful task HARD-pinned to `cpu` (otherwise default
@@ -4531,6 +4457,11 @@ where
         crate::StackfulOptions {
             no_preempt: true,
             user_preempt: true,
+            // The task's kernel-side work (syscall traps, ABI ring
+            // dispatch) runs in USERSPACE_K — the same value the
+            // authority is initialized with below, so
+            // `current_domain()` and dispatch agree.
+            domain: DomainId::USERSPACE_K,
             ..Default::default()
         },
         user_scheduling.control.clone(),
@@ -4569,7 +4500,8 @@ where
     // expose the task to the OOM selector/reaper.
     addr_space.scheduler_attach_user_task();
     register_live_user_address_space(id, &addr_space);
-    let cap_table = register_task_cap_table(id);
+    let authority = prepare_user_authority(id);
+    authority.publish();
     let slot = TaskSlot {
         user_scheduling: Some(user_scheduling),
         dispatch_reason: policy::DispatchReason::Policy,
@@ -4577,7 +4509,7 @@ where
         awake,
         id,
         spec,
-        cap_table,
+        authority,
         affinity_generation,
         addr_space: Some(addr_space),
         account: BudgetAccount::new(),

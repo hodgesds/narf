@@ -25,6 +25,25 @@ applications above NARF.
 
 ## 3. Public interface
 
+Native Bootstrap installs a kernel-owned session in the executing Task. It
+retains the submitting task's scheduler authority, execution generation,
+explicit SQ/CQ page pins, address-space ownership and a terminal close flag.
+Pins outlive munmap and keep kernel ring aliases valid until session release. The
+wire header cannot choose its owner. RingKick borrows this session and owner
+for its synchronous stack lifetime, without global bootstrap/task lookup or
+per-operation Arc traffic. Bootstrap replacement closes the previous session;
+successful exec replaces the authority image and closes old sessions before
+entering the new image. Exit revokes admission before zombie publication.
+Unspawned `PendingUserProcess` destruction retires and unregisters preparation.
+Kernel ring endpoints are taken exactly once.
+
+Async dispatch binds its originating session once and keeps that context
+through admission to the backend. The native FD/MM bridge verifies that the
+executing task owns the supplied authority; foreign-worker operations return
+`Unsupported` until an explicit owner-aware backend exists. It never resolves
+FDs or user addresses using a worker's ambient context. This kernel-only
+context is not part of the frozen user ABI.
+
 Sync-file FILE_INFO preserves native `DrmFence::status` errors for each leaf.
 Poll and count-only FILE_INFO remain pending until all leaves terminate;
 terminal errors then make the aggregate readable. Detailed FILE_INFO follows

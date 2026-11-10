@@ -58,3 +58,6 @@ pub(crate) mod phc;
 
 #[cfg(feature = "kernel-test")]
 mod read_options_tests;
+
+#[cfg(feature = "kernel-test")]
+mod native_authority_tests;

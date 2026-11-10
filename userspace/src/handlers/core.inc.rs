@@ -905,6 +905,7 @@ struct BootstrapHeader {
 // page.
 
 use alloc::collections::BTreeMap;
+use core::sync::atomic::AtomicBool;
 use narf_abi::{
     Completion, CompletionDrain, CompletionQueue, SharedRing, Submission, SubmissionDrain,
     SubmissionQueue, completion_channel, submission_channel,
@@ -955,12 +956,93 @@ pub struct SharedRingPair {
     pub cq_user_vaddr: u64,
 }
 
+/// A task's kernel-owned shared-ring binding. User-visible header fields
+/// never select its owner. Arcs pin backings; authority/image checks gate use.
+#[derive(Debug)]
+pub(crate) struct NativeSession {
+    pub(crate) shared: SharedRingPair,
+    pub(crate) authority: Arc<narf_scheduler::CallerAuthority>,
+    pub(crate) image: u64,
+    pub(crate) closed: Arc<AtomicBool>,
+    // AddressSpace ownership alone does not retain pages after munmap.
+    _ring_pages: [narf_memory::address_space::UserPagePin; 2],
+    _address_space: Arc<AddressSpace>,
+}
+
+impl NativeSession {
+    pub(crate) fn context(&self) -> narf_abi::DispatchContext<'_> {
+        narf_abi::DispatchContext::new(&self.authority, self.image)
+    }
+    pub(crate) fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.authority.notify_dispatchers();
+        }
+    }
+}
+
+impl Drop for NativeSession {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Private current-continuation cell. Readers only borrow through
+/// with_current_task_owner; foreign threads never mutate this field.
+pub(crate) struct NativeSessionSlot(core::cell::UnsafeCell<Option<Arc<NativeSession>>>);
+// SAFETY: replacement is exclusive to the owning task's executing Bootstrap
+// continuation. Reap cannot destroy a Task while its future/continuation runs.
+// Cross-task users own their session Arc instead of accessing this cell.
+unsafe impl Sync for NativeSessionSlot {}
+impl NativeSessionSlot {
+    pub(crate) const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(None))
+    }
+    /// Caller must be this Task's executing continuation.
+    pub(crate) unsafe fn get(&self) -> Option<&Arc<NativeSession>> {
+        // SAFETY: the caller proves serialization with replacement.
+        unsafe { (&*self.0.get()).as_ref() }
+    }
+    /// Caller must be the owner committing exec, with no native-ring borrow.
+    pub(crate) unsafe fn clear(&self) {
+        // SAFETY: exclusive owner continuation; no borrow escapes this cell.
+        let previous = unsafe { (&mut *self.0.get()).take() };
+        if let Some(previous) = previous {
+            previous.close();
+        }
+    }
+    /// Caller must be this Task's executing continuation with no session borrow.
+    pub(crate) unsafe fn replace(&self, session: Arc<NativeSession>) {
+        // SAFETY: sole executing continuation; no mutable reference escapes.
+        let previous = unsafe { (&mut *self.0.get()).replace(session) };
+        if let Some(previous) = previous {
+            previous.close();
+        }
+    }
+}
+
+/// Successful exec invalidates all old native bindings before publishing
+/// the new image. Retained workers own their backings until they stop.
+pub(crate) fn native_exec_commit(owner: &crate::task::Task) {
+    owner.authority_control.replace_image();
+    // SAFETY: called only by this owner's exec continuation, never by a
+    // remote observer or while a RingKick borrow is active.
+    unsafe { owner.native_session.clear() };
+    let previous = BOOTSTRAP_TABLE
+        .lock()
+        .as_mut()
+        .and_then(|map| map.remove(&owner.tid));
+    if let Some(previous) = previous {
+        previous.session.close();
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // fields read by the future dispatcher integration
 struct PerTaskBootstrap {
-    kernel: TaskRings,
-    user: UserRingEnds,
+    kernel: Option<TaskRings>,
+    user: Option<UserRingEnds>,
     shared: Option<SharedRingPair>,
+    session: Arc<NativeSession>,
     sq_cap_id: u64,
     cq_cap_id: u64,
 }
@@ -971,7 +1053,12 @@ static BOOTSTRAP_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, Per
 /// Initialise the per-task bootstrap registry. Boot calls this
 /// once before any user task can issue `Syscall::Bootstrap`.
 pub fn bootstrap_init() {
-    *BOOTSTRAP_TABLE.lock() = Some(BTreeMap::new());
+    let previous = BOOTSTRAP_TABLE.lock().replace(BTreeMap::new());
+    if let Some(previous) = previous {
+        for entry in previous.values() {
+            entry.session.close();
+        }
+    }
 }
 
 /// Initialise every per-task state table the new syscalls depend
@@ -1085,7 +1172,7 @@ pub fn init_per_task_state() {
 /// Reset the registry — test hook; drops every per-task ring set.
 #[doc(hidden)]
 pub fn __test_bootstrap_reset() {
-    *BOOTSTRAP_TABLE.lock() = Some(BTreeMap::new());
+    bootstrap_init();
 }
 
 /// Diagnostic: number of tasks that have called Bootstrap.
@@ -1102,61 +1189,13 @@ pub fn bootstrap_live_count() -> usize {
 /// harness (and a future relibc shim) to drive the rings from
 /// the user side.
 pub fn take_user_ends(task: u64) -> Option<UserRingEnds> {
-    let mut g = BOOTSTRAP_TABLE.lock();
-    let map = g.as_mut()?;
-    let entry = map.remove(&task)?;
-    // Re-insert just the kernel side so the dispatcher still has
-    // it. Replace the user side with one we can never pop again
-    // (a fresh ownerless pair so the table stays consistent).
-    let placeholder_user = {
-        let (_dead_sq, _drop_sq_drain) = submission_channel::<64>();
-        let (_drop_cq_prod, _dead_cq) = completion_channel::<64>();
-        UserRingEnds {
-            sq_prod: _dead_sq,
-            cq_drain: _dead_cq,
-        }
-    };
-    map.insert(
-        task,
-        PerTaskBootstrap {
-            kernel: entry.kernel,
-            user: placeholder_user,
-            shared: entry.shared,
-            sq_cap_id: entry.sq_cap_id,
-            cq_cap_id: entry.cq_cap_id,
-        },
-    );
-    Some(entry.user)
+    BOOTSTRAP_TABLE.lock().as_mut()?.get_mut(&task)?.user.take()
 }
 
-/// Pull this task's kernel-side ring ends out for the dispatcher
-/// task to drive. Returns `None` if Bootstrap hasn't run for
-/// `task`. Once taken, only one dispatcher can serve the task —
-/// re-taking returns the placeholder set the prior take left
-/// behind.
+/// Transfer the unique consumer endpoints once. A second take fails without
+/// allocating ownerless replacement rings.
 pub fn take_kernel_ends(task: u64) -> Option<TaskRings> {
-    let mut g = BOOTSTRAP_TABLE.lock();
-    let map = g.as_mut()?;
-    let entry = map.remove(&task)?;
-    let placeholder_kernel = {
-        let (_drop_sq_prod, dead_sq_drain) = submission_channel::<64>();
-        let (dead_cq_prod, _drop_cq_drain) = completion_channel::<64>();
-        TaskRings {
-            sq_drain: dead_sq_drain,
-            cq_prod: dead_cq_prod,
-        }
-    };
-    map.insert(
-        task,
-        PerTaskBootstrap {
-            kernel: placeholder_kernel,
-            user: entry.user,
-            shared: entry.shared,
-            sq_cap_id: entry.sq_cap_id,
-            cq_cap_id: entry.cq_cap_id,
-        },
-    );
-    Some(entry.kernel)
+    BOOTSTRAP_TABLE.lock().as_mut()?.get_mut(&task)?.kernel.take()
 }
 
 /// Look up the shared ring pair Bootstrap minted for `task`.
@@ -1178,14 +1217,31 @@ static NEXT_CAP_ID: AtomicU64 = AtomicU64::new(0x4000_0000);
 /// return the kernel-side phys + user vaddr handles.
 unsafe fn mint_shared_ring_pair(
     as_ref: &alloc::sync::Arc<AddressSpace>,
-) -> Result<SharedRingPair, ()> {
+) -> Result<(SharedRingPair, [narf_memory::address_space::UserPagePin; 2]), ()> {
     type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
     type CqRing = SharedRing<Completion, BOOTSTRAP_SHARED_RING_DEPTH>;
     const _: () = assert!(core::mem::size_of::<SqRing>() <= 4096);
     const _: () = assert!(core::mem::size_of::<CqRing>() <= 4096);
 
-    let sq_phys = narf_memory::alloc_frame().map_err(|_| ())?.start_address();
-    let cq_phys = narf_memory::alloc_frame().map_err(|_| ())?.start_address();
+    let sq_frame = narf_memory::alloc_frame().map_err(|_| ())?;
+    let cq_frame = match narf_memory::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            narf_memory::free_frame(sq_frame);
+            return Err(());
+        }
+    };
+    let sq_phys = sq_frame.start_address();
+    let cq_phys = cq_frame.start_address();
+    // SAFETY: these fresh allocator frames are exclusively owned here and
+    // have not been published in any VMA. Pin before mapping so a sibling
+    // unmap or fork can never observe an unretained kernel ring backing.
+    let pins = unsafe {
+        [
+            narf_memory::address_space::UserPagePin::retain_ram(sq_phys),
+            narf_memory::address_space::UserPagePin::retain_ram(cq_phys),
+        ]
+    };
     // SAFETY: identity-mapped low 4 GiB + page-aligned phys.
     unsafe {
         core::ptr::write_bytes(sq_phys.kernel_mut_ptr::<u8>(), 0, 4096);
@@ -1197,33 +1253,45 @@ unsafe fn mint_shared_ring_pair(
     let sq_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
     let cq_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
 
-    as_ref
+    if as_ref
         .map_region(Region {
             base: VirtAddr::new(sq_vaddr),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![sq_phys].into(),
         })
-        .map_err(|_| ())?;
-    as_ref
+        .is_err()
+    {
+        narf_memory::free_frame(sq_frame);
+        narf_memory::free_frame(cq_frame);
+        return Err(());
+    }
+    if as_ref
         .map_region(Region {
             base: VirtAddr::new(cq_vaddr),
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![cq_phys].into(),
         })
-        .map_err(|_| ())?;
+        .is_err()
+    {
+        narf_memory::free_frame(cq_frame);
+        return Err(());
+    }
     // SAFETY: `as_ref` has a valid root and the two SharedRing regions were just
     // registered above; materialize installs PTEs only for those regions.
     // SAFETY: Valid memory or trusted environment
     unsafe { as_ref.materialize() }.map_err(|_| ())?;
 
-    Ok(SharedRingPair {
-        sq_phys,
-        cq_phys,
-        sq_user_vaddr: sq_vaddr,
-        cq_user_vaddr: cq_vaddr,
-    })
+    Ok((
+        SharedRingPair {
+            sq_phys,
+            cq_phys,
+            sq_user_vaddr: sq_vaddr,
+            cq_user_vaddr: cq_vaddr,
+        },
+        pins,
+    ))
 }
 
 // ── Open — arg0=path-ptr, arg1=path-len, arg2=mount-path-ptr,
@@ -14918,8 +14986,9 @@ fn release_task_tables(tid: u64) {
     // drops those descriptions, and `Drop for OpenFileDescription` releases
     // them — including the shared holds this sweep could never attribute and
     // therefore leaked for the life of the boot.
-    if let Some(m) = BOOTSTRAP_TABLE.lock().as_mut() {
-        m.remove(&tid);
+    let bootstrap = BOOTSTRAP_TABLE.lock().as_mut().and_then(|m| m.remove(&tid));
+    if let Some(entry) = bootstrap {
+        entry.session.close();
     }
     if let Some(m) = ROBUST_LIST_TABLE.lock().as_mut() {
         // The owner-died walk already ran in the task's own exit

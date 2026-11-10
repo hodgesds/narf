@@ -74,7 +74,7 @@ pub fn enter() -> Confined {
     // Record the scope before narrowing. `current_domain()` must be true for
     // the whole guard, and BPF is a domain like any other: code that asks
     // which domain it is running in should get BPF here, not FRAME.
-    let prev_domain = narf_arch::enter_domain_scope(narf_lib::id::DomainId::BPF.raw());
+    let prev_domain = narf_scheduler::enter_domain_scope(narf_lib::id::DomainId::BPF.raw());
     let preempt = narf_scheduler::preempt_disable();
     let guard_cleanup = Some(crate::types::GuardCleanupScope::enter());
     #[cfg(target_arch = "x86_64")]
@@ -169,7 +169,7 @@ impl Drop for Confined {
         // still active. Normal release disarmed the slot; an abnormal program
         // termination leaves it armed and releases here.
         drop(self.guard_cleanup.take());
-        narf_arch::exit_domain_scope(self.prev_domain);
+        narf_scheduler::exit_domain_scope(self.prev_domain);
         #[cfg(target_arch = "x86_64")]
         if let Some(saved) = self.saved {
             use narf_arch::DomainPrimitive;

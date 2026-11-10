@@ -10,6 +10,23 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
+    let authority = crate::user_task::with_current_task_owner(|owner| owner.authority.clone());
+    #[cfg(feature = "kernel-test")]
+    let authority = authority.or_else(|| {
+        narf_scheduler::__set_task_active_domain_for_test(
+            narf_scheduler::TaskId(task),
+            narf_lib::id::DomainId::USERSPACE_K,
+        );
+        narf_scheduler::task_authority(narf_scheduler::TaskId(task))
+    });
+    let Some(authority) = authority else {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    };
+    let Ok(image) = authority.image() else {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    };
 
     // Allocate a phys frame, zero it, install at a fresh user vaddr
     // (mmap-cursor-style — same scheme `sys_mmap` uses).
@@ -20,6 +37,9 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // SAFETY: this fresh allocator frame is still exclusively owned here.
+    // A sibling sharing this MM may unmap its VMA before header writes finish.
+    let _header_pin = unsafe { narf_memory::address_space::UserPagePin::retain_ram(phys) };
     // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
     unsafe {
         core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
@@ -38,6 +58,7 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
         })
         .is_err()
     {
+        narf_memory::free_frame(narf_memory::frame::PhysFrame::new(phys));
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -66,7 +87,7 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     // SAFETY: `as_ref` is the calling task's valid AddressSpace; `mint_shared_ring_pair`
     // allocates fresh frames, maps them into it, and materializes them under that AS.
     // SAFETY: Valid memory or trusted environment
-    let shared = match unsafe { mint_shared_ring_pair(&as_ref) } {
+    let (shared, ring_pages) = match unsafe { mint_shared_ring_pair(&as_ref) } {
         Ok(s) => s,
         Err(()) => {
             ctx.set_return(SyscallReturn::invalid_op());
@@ -74,14 +95,23 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
         }
     };
 
+    let session = Arc::new(NativeSession {
+        shared,
+        authority,
+        image,
+        closed: Arc::new(AtomicBool::new(false)),
+        _ring_pages: ring_pages,
+        _address_space: as_ref.clone(),
+    });
     let entry = PerTaskBootstrap {
-        kernel: TaskRings { sq_drain, cq_prod },
-        user: UserRingEnds { sq_prod, cq_drain },
+        kernel: Some(TaskRings { sq_drain, cq_prod }),
+        user: Some(UserRingEnds { sq_prod, cq_drain }),
         shared: Some(shared),
+        session: session.clone(),
         sq_cap_id,
         cq_cap_id,
     };
-    {
+    let previous = {
         let mut g = BOOTSTRAP_TABLE.lock();
         let map = match g.as_mut() {
             Some(m) => m,
@@ -91,8 +121,16 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
             }
         };
         // Replace any prior bootstrap state for this task.
-        map.insert(task, entry);
+        map.insert(task, entry)
+    };
+    if let Some(previous) = previous {
+        previous.session.close();
     }
+    let _ = crate::user_task::with_current_task_owner(|owner| {
+        // SAFETY: Bootstrap executes on this owner's sole continuation. No
+        // RingKick session borrow exists during a Bootstrap call.
+        unsafe { owner.native_session.replace(session.clone()) };
+    });
 
     // Write the header. Capslot ids land in `sq_cap`/`cq_cap` so
     // the user runtime can name the rings.

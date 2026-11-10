@@ -65,6 +65,7 @@ use narf_ipc::{Consumer, Producer};
 pub use narf_ipc::{
     SharedConsumer, SharedProducer, SharedRing, SharedTryRecvError, SharedTrySendError,
 };
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_tracing::FnTime;
 
@@ -218,7 +219,8 @@ pub struct FileOpReturn {
     pub value: u64,
 }
 
-pub type FileOpBridge = fn(FileOpKind, &FileOpArgs, &CancelCtx<'_>) -> FileOpReturn;
+pub type FileOpBridge =
+    fn(Option<DispatchContext<'_>>, FileOpKind, &FileOpArgs, &CancelCtx<'_>) -> FileOpReturn;
 
 static FILE_OP_BRIDGE: IrqSafeSpinLock<Option<FileOpBridge>> = IrqSafeSpinLock::new(None);
 
@@ -230,10 +232,15 @@ pub fn install_file_op_bridge(bridge: FileOpBridge) {
     *FILE_OP_BRIDGE.lock() = Some(bridge);
 }
 
-fn dispatch_file_op(kind: FileOpKind, args: &FileOpArgs, cx: &CancelCtx<'_>) -> FileOpReturn {
-    let g = FILE_OP_BRIDGE.lock();
-    match *g {
-        Some(b) => b(kind, args, cx),
+fn dispatch_file_op(
+    subject: Option<DispatchContext<'_>>,
+    kind: FileOpKind,
+    args: &FileOpArgs,
+    cx: &CancelCtx<'_>,
+) -> FileOpReturn {
+    let bridge = *FILE_OP_BRIDGE.lock();
+    match bridge {
+        Some(b) => b(subject, kind, args, cx),
         None => FileOpReturn {
             status: 1, /* InvalidOp */
             value: 0,
@@ -290,8 +297,8 @@ pub fn install_cpu_op_bridge(bridge: CpuOpBridge) {
 }
 
 fn dispatch_cpu_op(kind: CpuOpKind, args: &CpuOpArgs, cx: &CancelCtx<'_>) -> CpuOpReturn {
-    let g = CPU_OP_BRIDGE.lock();
-    match *g {
+    let bridge = *CPU_OP_BRIDGE.lock();
+    match bridge {
         Some(b) => b(kind, args, cx),
         None => CpuOpReturn {
             status: 1, /* InvalidOp */
@@ -412,6 +419,47 @@ impl OpCode {
     #[inline]
     pub const fn as_u32(self) -> u32 {
         self as u32
+    }
+
+    /// Per-op required domain — capabilities/ §8 step 5 (#1547).
+    ///
+    /// The domain the calling task's active domain must match for the
+    /// op to dispatch (`Err(DomainMismatch)` otherwise — see
+    /// `check_submission_domain`). The table lives here, in `abi/`,
+    /// because `capabilities/` cannot name the `DomainId` type
+    /// (namespace owned by security-model/ §4.1) and neither the
+    /// `CapSlot` wire format (frozen, capabilities/ §8 v1.0) nor the
+    /// object-table entry records a domain — so the check belongs at
+    /// dispatch, where the calling task's active domain is known
+    /// (the bound `CallerAuthority` logical domain).
+    ///
+    /// Assignment rule, grounded in security-model/ §4.1 ownership:
+    /// every op in the enum today is submitted by a user task through
+    /// its rings, and dispatch is kernel-side handling of that task's
+    /// own ring submissions — the per-task kernel-side state
+    /// (`USERSPACE_K`: "cap table mirror, ABI ring control") is what
+    /// the op acts on. So every user-submittable op requires
+    /// `USERSPACE_K`: a submission from a task active in any other
+    /// domain (a driver domain, the FRAME/TCB domain, `KEYS`, …) is
+    /// a domain confusion, not a user operation. In-subsystem
+    /// authorisation is untouched by this leg: the power ops still
+    /// enforce their own `narf_power` rules, the file ops their fd
+    /// rules, `CapTransfer` its Grant gate.
+    ///
+    /// `None` = domain-agnostic: `DomainEnter` / `DomainExit` are
+    /// domain-*transition* ops whose target domain is dynamic —
+    /// named by `caps[0]`, a `Cap<Domain>` — so no static required
+    /// domain exists for them. Their step-5 leg (target-domain match)
+    /// needs the `Domain` cap type, which does not exist in-tree yet
+    /// (neither does a dispatch arm: both ops currently complete
+    /// `InvalidOp`); that is an explicit remainder, not a silent
+    /// skip. Future ops that belong to another domain (driver-only,
+    /// `KEYS`-only) get their `Some(...)` entry here when they land.
+    pub const fn required_domain(self) -> Option<DomainId> {
+        match self {
+            OpCode::DomainEnter | OpCode::DomainExit => None,
+            _ => Some(DomainId::USERSPACE_K),
+        }
     }
 }
 
@@ -832,26 +880,57 @@ pub fn cap_error_status(e: CapError) -> NarfStatus {
     }
 }
 
-/// Validate every non-empty cap in `caps` against the submitting
-/// task's own table (capabilities/ §8 steps 1–4 via
-/// `CapTable::lookup`, reached through the scheduler's per-task
-/// registry). The resolved object always comes from the table,
-/// never from the presented bytes, so a wire slot copied across
-/// tasks resolves at most to the submitter's own entry at that
-/// position — never to the victim's object.
-///
-/// `owner == None` (legacy unbound dispatcher) has no table to
-/// check against: any presented cap fails closed as `Forbidden`
-/// while cap-less submissions pass. There is no un-wired fallback
-/// that silently accepts a cap.
-///
-/// Shared by `Dispatcher::dispatch_one` and the synchronous
-/// `sys_ring_kick` path so both dispatch entries enforce the same
-/// gate. Step 5 of §8 (domain-tag match) is NOT done here: it
-/// needs the op's required domain, which no per-op table models
-/// yet — a remainder, not a silent skip.
+/// §8 step 5 (domain-tag match). Pure function over the op's
+/// required domain (`OpCode::required_domain`) and the calling task's
+/// active domain — the two facts dispatch must compare. An op with no
+/// required domain (`DomainEnter` / `DomainExit`, whose target domain
+/// is dynamic) always passes; any other op passes only when the
+/// active domain equals the required one, else
+/// `Err(CapError::DomainMismatch)`. Dispatch maps that to
+/// `NarfStatus::Forbidden` via `cap_error_status` (an unknown owner —
+/// no registered task — maps to `CapRevoked` instead, at the call
+/// sites). Kept separate from `validate_submission_caps` so both the
+/// pure table and the pure comparison are unit-testable without a
+/// scheduler, and so the step order in §8 (steps 1–4, then 5) is
+/// visible at the call sites.
+pub fn check_submission_domain(op: OpCode, active_domain: DomainId) -> Result<(), CapError> {
+    match op.required_domain() {
+        None => Ok(()),
+        Some(required) if required == active_domain => Ok(()),
+        Some(_) => Err(CapError::DomainMismatch),
+    }
+}
+
+/// Borrowed request subject. Kernel-owned references never cross the wire.
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchContext<'a> {
+    pub authority: &'a narf_scheduler::CallerAuthority,
+    pub image: u64,
+}
+impl<'a> DispatchContext<'a> {
+    pub const fn new(authority: &'a narf_scheduler::CallerAuthority, image: u64) -> Self {
+        Self { authority, image }
+    }
+    pub fn validate(&self, sub: &Submission) -> Result<(), NarfStatus> {
+        self.authority
+            .domain_for_image(self.image)
+            .map_err(cap_error_status)?;
+        self.authority
+            .validate_caps(&sub.caps)
+            .map_err(cap_error_status)?;
+        let domain = self
+            .authority
+            .domain_for_image(self.image)
+            .map_err(cap_error_status)?;
+        check_submission_domain(sub.op, domain).map_err(cap_error_status)
+    }
+}
+
+/// Compatibility helper for explicit owner handles. A missing owner rejects
+/// every presented cap; production dispatch uses DispatchContext::validate,
+/// which locks a nonempty owner's table once for the fixed cap array.
 pub fn validate_submission_caps(
-    owner: Option<narf_scheduler::TaskId>,
+    owner: Option<&narf_scheduler::CallerAuthority>,
     caps: &[CapSlot; 4],
 ) -> Result<(), NarfStatus> {
     for presented in caps.iter() {
@@ -861,9 +940,24 @@ pub fn validate_submission_caps(
         let Some(owner) = owner else {
             return Err(NarfStatus::Forbidden);
         };
-        narf_scheduler::lookup_task_cap(owner, *presented).map_err(cap_error_status)?;
+        owner.lookup(*presented).map_err(cap_error_status)?;
     }
     Ok(())
+}
+
+/// Compare an explicitly bound owner's current logical domain with the op's
+/// required domain. Production DispatchContext also pins the image generation.
+/// None is reserved for legacy kernel-test fixtures.
+pub fn check_owner_domain(
+    owner: Option<&narf_scheduler::CallerAuthority>,
+    op: OpCode,
+) -> Result<(), NarfStatus> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let image = owner.image().map_err(cap_error_status)?;
+    let domain = owner.domain_for_image(image).map_err(cap_error_status)?;
+    check_submission_domain(op, domain).map_err(cap_error_status)
 }
 
 /// Pending-cancel registry — tags whose producers have issued an
@@ -1035,6 +1129,16 @@ impl PendingCancels {
     }
 }
 
+fn binding_live(
+    authority: Option<&narf_scheduler::CallerAuthority>,
+    image: Option<u64>,
+    lease: Option<&AtomicBool>,
+) -> bool {
+    !lease.is_some_and(|closed| closed.load(Ordering::Acquire))
+        && authority
+            .is_none_or(|owner| image.is_some_and(|image| owner.domain_for_image(image).is_ok()))
+}
+
 /// In-kernel ABI dispatcher. Drains a submission ring and dispatches
 /// to the appropriate subsystems.
 #[derive(Debug)]
@@ -1042,23 +1146,32 @@ pub struct Dispatcher<const N: usize> {
     sq: SubmissionDrain<N>,
     cq: CompletionQueue<N>,
     pending: PendingCancels,
-    /// Submitting task whose `CapTable` validates `Submission::caps`
-    /// (capabilities/ §8 steps 1–4, #1363 wiring). `None` is the
-    /// legacy unbound dispatcher: it has no table to check against,
-    /// so any presented cap fails closed as `Forbidden` while
-    /// cap-less submissions still dispatch (see
-    /// `validate_submission_caps`).
+    /// Identity retained for diagnostics and unknown-owner rejection. The
+    /// authority below supplies all admission facts, without resolving this id.
     owner: Option<narf_scheduler::TaskId>,
+    authority: Option<Arc<narf_scheduler::CallerAuthority>>,
+    image: Option<u64>,
+    lease: Option<Arc<AtomicBool>>,
+    watch: Option<Arc<narf_scheduler::AuthorityWatch>>,
 }
 
 impl<const N: usize> Dispatcher<N> {
-    /// Create a new dispatcher from a ring pair.
+    /// Legacy constructor. Production submissions fail closed until bound;
+    /// kernel-test fixtures may dispatch empty-cap operations without an owner.
     pub const fn new(sq: SubmissionDrain<N>, cq: CompletionQueue<N>) -> Self {
         Self {
             sq,
             cq,
             pending: PendingCancels::new(),
-            owner: None,
+            owner: if cfg!(feature = "kernel-test") {
+                None
+            } else {
+                Some(narf_scheduler::TaskId::NONE)
+            },
+            authority: None,
+            image: None,
+            lease: None,
+            watch: None,
         }
     }
 
@@ -1066,19 +1179,68 @@ impl<const N: usize> Dispatcher<N> {
     /// Every non-empty cap in a submission is resolved against
     /// `owner`'s own table before the op body runs; a task can
     /// therefore never spend another task's capabilities through
-    /// this dispatcher. This is the production constructor —
-    /// `spawn_dispatcher_for` binds the task Bootstrap minted the
-    /// rings for.
-    pub const fn for_task(
+    /// this dispatcher. The op's required domain is likewise checked
+    /// against `owner`'s active domain (§8 step 5, #1547). This is
+    /// the production constructor — `spawn_dispatcher_for` binds the
+    /// task Bootstrap minted the rings for.
+    pub fn for_task(
         sq: SubmissionDrain<N>,
         cq: CompletionQueue<N>,
         owner: narf_scheduler::TaskId,
     ) -> Self {
+        match narf_scheduler::task_authority(owner) {
+            Some(authority) => Self::for_authority(sq, cq, authority, None),
+            None => Self {
+                sq,
+                cq,
+                pending: PendingCancels::new(),
+                owner: Some(owner),
+                authority: None,
+                image: None,
+                lease: None,
+                watch: None,
+            },
+        }
+    }
+
+    /// Bind once using the task-owned authority rather than an identity index.
+    pub fn for_authority(
+        sq: SubmissionDrain<N>,
+        cq: CompletionQueue<N>,
+        authority: Arc<narf_scheduler::CallerAuthority>,
+        lease: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        let image = authority.image().ok();
+        let watch = Some(authority.watch());
         Self {
             sq,
             cq,
             pending: PendingCancels::new(),
-            owner: Some(owner),
+            owner: Some(authority.task_id()),
+            authority: Some(authority),
+            image,
+            lease,
+            watch,
+        }
+    }
+
+    fn subject(&self) -> Result<Option<DispatchContext<'_>>, NarfStatus> {
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|closed| closed.load(Ordering::Acquire))
+        {
+            return Err(NarfStatus::CapRevoked);
+        }
+        match (&self.authority, self.image, self.owner) {
+            (Some(authority), Some(image), _) => {
+                authority
+                    .domain_for_image(image)
+                    .map_err(cap_error_status)?;
+                Ok(Some(DispatchContext::new(authority, image)))
+            }
+            (_, _, Some(_)) => Err(NarfStatus::CapRevoked),
+            _ => Ok(None),
         }
     }
 
@@ -1086,19 +1248,68 @@ impl<const N: usize> Dispatcher<N> {
     /// is closed.
     pub async fn run(&mut self) {
         loop {
-            // 1. Receive next submission.
-            let Ok(sub) = self.sq.recv().await else {
-                // User-side dropped their SQ producer; EOF.
+            // A retirement/session-close wake also releases an idle SQ or a
+            // full CQ. Register only when queue polling actually blocks, and
+            // recheck afterward to close the wake-before-register race.
+            let received = {
+                let authority = self.authority.as_deref();
+                let image = self.image;
+                let lease = self.lease.as_deref();
+                let watch = self.watch.as_deref();
+                let live = || binding_live(authority, image, lease);
+                let mut receive = core::pin::pin!(self.sq.recv());
+                core::future::poll_fn(|cx| {
+                    if !live() {
+                        return core::task::Poll::Ready(None);
+                    }
+                    match core::future::Future::poll(receive.as_mut(), cx) {
+                        core::task::Poll::Ready(result) => core::task::Poll::Ready(result.ok()),
+                        core::task::Poll::Pending => {
+                            if let Some(watch) = watch {
+                                watch.register(cx);
+                            }
+                            if live() {
+                                core::task::Poll::Pending
+                            } else {
+                                core::task::Poll::Ready(None)
+                            }
+                        }
+                    }
+                })
+                .await
+            };
+            let Some(sub) = received else {
                 break;
             };
-
-            // 2. Dispatch.
             let completion = self.dispatch_one(sub).await;
-
-            // 3. Post completion.
-            // If the user-side dropped their CQ consumer, we can't
-            // deliver anymore; terminate.
-            if self.cq.send(completion).await.is_err() {
+            let delivered = {
+                let authority = self.authority.as_deref();
+                let image = self.image;
+                let lease = self.lease.as_deref();
+                let watch = self.watch.as_deref();
+                let live = || binding_live(authority, image, lease);
+                let mut send = core::pin::pin!(self.cq.send(completion));
+                core::future::poll_fn(|cx| {
+                    if !live() {
+                        return core::task::Poll::Ready(false);
+                    }
+                    match core::future::Future::poll(send.as_mut(), cx) {
+                        core::task::Poll::Ready(result) => core::task::Poll::Ready(result.is_ok()),
+                        core::task::Poll::Pending => {
+                            if let Some(watch) = watch {
+                                watch.register(cx);
+                            }
+                            if live() {
+                                core::task::Poll::Pending
+                            } else {
+                                core::task::Poll::Ready(false)
+                            }
+                        }
+                    }
+                })
+                .await
+            };
+            if !delivered {
                 break;
             }
 
@@ -1117,7 +1328,11 @@ impl<const N: usize> Dispatcher<N> {
         // own table before any op body — or cancel bookkeeping — can
         // observe the submission. A failure short-circuits with the
         // cap status; the op never runs.
-        if let Err(status) = validate_submission_caps(self.owner, &sub.caps) {
+        let admission = self.subject().and_then(|subject| match subject {
+            Some(subject) => subject.validate(&sub),
+            None => validate_submission_caps(None, &sub.caps),
+        });
+        if let Err(status) = admission {
             return Completion::with(tag, status, [0; 6]);
         }
         // Enter the sub into the chain registry; assigns a chain id
@@ -1179,12 +1394,16 @@ impl<const N: usize> Dispatcher<N> {
                     None => Completion::with(tag, NarfStatus::Forbidden, [0; 6]),
                     Some(owner) => {
                         let target = narf_scheduler::TaskId(sub.inline[0]);
-                        match narf_scheduler::transfer_task_cap(
-                            owner,
-                            target,
-                            sub.caps[0],
-                            sub.caps[1],
-                        ) {
+                        let result = narf_scheduler::task_authority(target)
+                            .ok_or(CapError::Revoked)
+                            .and_then(|target| {
+                                self.authority
+                                    .as_ref()
+                                    .ok_or(CapError::Revoked)?
+                                    .transfer_to(&target, sub.caps[0], sub.caps[1])
+                            });
+                        let _ = owner;
+                        match result {
                             Ok(slot) => {
                                 let mut result = [0u64; 6];
                                 result[0] = u64::from(slot);
@@ -1233,7 +1452,7 @@ impl<const N: usize> Dispatcher<N> {
                     Some(t) => CancelCtx::from_token(t),
                     None => CancelCtx::detached(),
                 };
-                let r = dispatch_file_op(kind, &args, &cx);
+                let r = dispatch_file_op(self.subject().ok().flatten(), kind, &args, &cx);
                 // Bridge may have observed the cancel and returned
                 // status=2 (Cancelled). Translate per CANCELLABLE.
                 match r.status {

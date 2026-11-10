@@ -195,22 +195,27 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
     };
+    let process = || crate::UserProcess {
+        program_bias: 0,
+        pid: crate::ProcessId(0xC10E),
+        address_space: address_space.clone(),
+        entry: crate::loader::EntryPoint(narf_memory::VirtAddr::new(0x400000)),
+        stack_top: narf_memory::VirtAddr::new(0x7fff_ffff_f000),
+        fs_base: None,
+        gs_base: 0,
+        entry_arg: None,
+        loaded_mappings: alloc::vec::Vec::new(),
+        page_in_plan: alloc::vec::Vec::new(),
+    };
     let pending = crate::user_task::prepare_user_process_initial(
-        crate::UserProcess {
-            program_bias: 0,
-            pid: crate::ProcessId(0xC10E),
-            address_space: address_space.clone(),
-            entry: crate::loader::EntryPoint(narf_memory::VirtAddr::new(0x400000)),
-            stack_top: narf_memory::VirtAddr::new(0x7fff_ffff_f000),
-            fs_base: None,
-            gs_base: 0,
-            entry_arg: None,
-            loaded_mappings: alloc::vec::Vec::new(),
-            page_in_plan: alloc::vec::Vec::new(),
-        },
+        process(),
         narf_scheduler::TaskSpec::user_task(),
     );
     let child = pending.task_id();
+    let authority = narf_scheduler::task_authority(child).unwrap();
+    if authority.image().is_ok() {
+        return TestResult::Fail("prepared authority was already live");
+    }
 
     if crate::task::task_get(child.raw()).is_none() {
         return TestResult::Fail("pending child was not registered");
@@ -220,6 +225,9 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
     }
 
     pending.spawn();
+    if authority.image().is_err() {
+        return TestResult::Fail("published authority is not live");
+    }
     let published = narf_scheduler::address_space_of(child)
         .is_some_and(|actual| Arc::ptr_eq(&actual, &address_space));
     narf_scheduler::__reset_queues_for_test();
@@ -228,11 +236,28 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
     if !published {
         return TestResult::Fail("published child missing its address space");
     }
+    // Keep passive observers alive while abandoning a second preparation.
+    // Neither its Task nor its authority index may keep admission available.
+    let abandoned = crate::user_task::prepare_user_process_initial(
+        process(),
+        narf_scheduler::TaskSpec::user_task(),
+    );
+    let abandoned_id = abandoned.task_id();
+    let observer = crate::task::task_get(abandoned_id.raw()).unwrap();
+    let retained = narf_scheduler::task_authority(abandoned_id).unwrap();
+    drop(abandoned);
+    if crate::task::task_get(abandoned_id.raw()).is_some()
+        || narf_scheduler::task_authority(abandoned_id).is_some()
+        || retained.image().is_ok()
+    {
+        return TestResult::Fail("abandoned preparation retained registration or admission");
+    }
+    drop(observer);
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
-    "userspace",
+    "userspace/authority",
     smoke_userspace_pending_spawn_publishes_only_after_inheritance
 );
 
@@ -397,12 +422,12 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
         args: SyscallArgs::default(),
         ret: None,
     };
+    narf_scheduler::__reset_queues_for_test();
     kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
         return TestResult::Fail("Bootstrap returned non-Ok");
     }
 
-    narf_scheduler::__reset_queues_for_test();
     let dispatcher_task = spawn_dispatcher_for(FAKE_TASK);
     if dispatcher_task.is_none() {
         return TestResult::Fail("spawn_dispatcher_for returned None");
@@ -410,10 +435,7 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
 
     // A second call must return None — kernel ends already taken.
     if spawn_dispatcher_for(FAKE_TASK).is_some() {
-        // Don't bail — placeholder ends spawn a no-op dispatcher that
-        // immediately EOFs. But the helper *should* still return Some
-        // because take_kernel_ends returns the placeholder. So this
-        // is informational, not a failure.
+        return TestResult::Fail("kernel endpoints consumed twice");
     }
 
     let user_ends = crate::take_user_ends(FAKE_TASK).expect("ue");
@@ -450,7 +472,10 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_userspace_spawn_dispatcher_for_helper);
+kernel_test_in!(
+    "userspace/authority",
+    smoke_userspace_spawn_dispatcher_for_helper
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_dup_clones_fd() -> TestResult {

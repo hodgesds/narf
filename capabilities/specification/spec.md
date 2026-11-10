@@ -62,11 +62,14 @@ impl<T, R: Rights> Cap<T, R> {
     /// runtime checks behind §8 steps 3–4 (SEC-B2, #1282): epoch
     /// (`Revoked`), object-table kind cross-check (`TypeMismatch`),
     /// slot `type_tag` (`TypeMismatch`), slot rights cover `R::BITS`
-    /// (`RightsTooWeak`) — in that order, under a single
-    /// object-table lock acquisition (`epoch_and_kind`). §8 step 5
-    /// (domain-tag match) is NOT checked here: no domain is recorded
-    /// on the cap or the object-table entry and no per-op
-    /// required-domain table exists yet (remainder #1547).
+    /// (`RightsTooWeak`) — in that order, using one indexed
+    /// metadata read (`epoch_and_kind`) without a global lock. §8 step 5
+    /// (domain-tag match) is NOT checked here — it is enforced at
+    /// ABI dispatch instead (#1547): the per-op required-domain
+    /// table is `OpCode::required_domain` (`abi/`), and
+    /// `DispatchContext::validate` compares it against the submitting
+    /// task's active domain in `Dispatcher::dispatch_one` and
+    /// `sys_ring_kick`.
     pub fn invoke<O: CapOp<T, R>>(&self, op: O) -> Result<O::Output, CapError>;
 
     /// Destroy this cap *and* bump the object's epoch so every other
@@ -126,6 +129,16 @@ atomically loads the object epoch and compares to the slot; a
 mismatch short-circuits to `Err(Revoked)`. `revoke(cap)` increments
 the object epoch — O(1) mass invalidation of every derived + badged
 cap that references it, regardless of how many tasks hold them.
+
+**Indexed metadata.** Object indices are never reused. A sparse four-byte
+index directory publishes immutable kinds and stable leaves once; readers
+perform three acquire pointer loads and an acquire epoch load, with no global
+read lock or search. Kind is initialized before release publication of epoch 1
+and never changes, so `epoch_and_kind` observes a coherent kind/epoch pair.
+Allocation failure leaves an invalid hole and `bootstrap_with` reports
+`CapTableFull`; the legacy infallible mint retains its panic policy. Published
+pages are permanent. Epoch wrap reaches terminal zero and never revives an
+old capability. Neither `CapSlot` nor task-local slot addressing changes.
 
 **This is the single most important runtime invariant in NARF's
 security model:** *holding a `Cap<T, R>` proves you were granted
@@ -366,10 +379,17 @@ submitting task's own table (the #1363 wiring, merged PR #1502); in
 the kernel, `Cap::invoke` performs the runtime equivalents of steps
 3–4 for the typed path — epoch, object-table kind cross-check,
 slot `type_tag`, slot rights — before `execute` runs. Step 5
-(domain-tag match) is implemented nowhere yet: no per-op
-required-domain table exists, and neither the cap nor the
-object-table entry records a domain. That is a tracked remainder
-(#1547), not a silent skip.
+(domain-tag match) is enforced at ABI dispatch (#1547): the per-op
+required-domain table is `OpCode::required_domain` (`abi/` — every
+user-submittable op requires `DomainId::USERSPACE_K`, security-model/
+§4.1; `DomainEnter`/`DomainExit` carry no static requirement, their
+target domain being dynamic). `DispatchContext::validate` compares it against
+its directly bound task authority's logical domain, after steps 1–4. The same
+atomic state checks live publication and execution-image generation; a stale
+or retired context completes `CapRevoked`, and mismatch completes `Forbidden`.
+Scope entry/exit, suspension and migration preserve this task-owned state.
+Production unbound dispatch fails closed; legacy empty-cap test fixtures do
+not represent a production grant.
 
 ## 9. Resolved decisions
 
@@ -406,27 +426,24 @@ into the receiver's table via `CapTable::install_transfer`.
 
 ### 9.2 Per-object epoch storage
 
-**Decision:** epoch lives **in-object**, in a fixed-position
-header word added to the kernel-side struct. Concretely, every
-type that implements `CapType` must include:
+**Decision:** the current implementation stores the epoch and immutable kind
+in a stable `object_table` entry addressed by the capability's global object
+index. Wire indices still select the submitting task's own table first;
+only the resolved entry supplies this global index. `CapType` implementors
+do not need an intrusive object header or a generated offset accessor.
 
-```rust
-#[repr(C)]
-pub struct CapHeader {
-    pub epoch:    AtomicU32,
-    pub kind_tag: u32,      // matches CapKind::KIND, for double-check
-}
-```
+The index is split across lazily allocated 256-way directories and leaves.
+Readers use three acquire pointer loads and one acquire epoch load, without
+a registry search or global read lock. Kind is initialized before release
+publication of epoch 1 and never changes, so a nonzero acquire epoch also
+publishes a valid kind. Published metadata never moves or gets reclaimed;
+indices are never reused. Failed allocation leaves an invalid hole and the
+fallible mint reports `CapTableFull`. Epoch exhaustion reaches terminal zero,
+which cannot be revived by another revoke or mistaken for a new object.
 
-as the first 8 bytes of its struct. The `cap_invoke!` macro
-generated by the `CapType` derive writes the field at the right
-offset on object construction. Hot-path `invoke()` reads
-`(*ptr).epoch.load(Acquire)` — one cache line, no indirection.
-
-A separate audit-only epoch table is **not** maintained; if
-audit needs to know "what was the previous epoch", it can
-inspect the panic / revoke event log. Saves a domain hop and
-the per-revoke double write.
+There is one authoritative epoch per object. Audit history remains in the
+panic/revoke event log, rather than an additional epoch table or a second
+write on every revocation.
 
 ### 9.3 `DOMAIN_CAPS` vs `DOMAIN_FRAME`
 
@@ -569,27 +586,25 @@ the object-table cross-check (`kind_at(index) == T::KIND`)
 catches that forgery. The two `TypeMismatch` sources are distinct
 forgeries and are pinned separately in fixtures.
 
-Why one lock acquisition: the epoch and kind facts come from a
-single locked read (`object_table::epoch_and_kind`), so `invoke`
-still performs exactly one object-table lock acquisition — the
-same as the old epoch-only path. A naive `current_epoch` +
-`kind_at` sequence would have added a second acquisition, which
-the #1282 perf bar fails outright (see below). The `type_tag` /
-rights legs are same-slot integer compares: no lock, no table
-touch. `check_live` keeps its epoch-only contract for
-`derive` / `transfer` / `install_bootstrap`, which do their own
-type checks where needed.
+The epoch and immutable kind come from one stable indexed metadata read
+(`object_table::epoch_and_kind`), with acquire publication and no global read
+lock. The type-tag and rights checks remain same-slot integer comparisons.
+`check_live` retains its epoch-only contract for derive/transfer/bootstrap,
+which perform their own type checks where needed.
 
 Why no domain check here: neither the cap nor the object-table
 entry records a domain, the wire format is frozen (§8), and no
-per-op required-domain table exists yet (the #1363 wiring's
-stated remainder, merged PR #1502) — so there is nothing
-authoritative for `invoke` to compare a caller domain against,
-and `capabilities/` cannot name the `DomainId` type (namespace
-owned by security-model/ §4.1). The step-5 check belongs at
-dispatch, where the calling task's active domain is known;
-tracked as #1547. `DomainMismatch` therefore remains unproduced
-by any production path.
+per-op required-domain table exists in `capabilities/` — so there
+is nothing authoritative for `invoke` to compare a caller domain
+against, and `capabilities/` cannot name the `DomainId` type
+(namespace owned by security-model/ §4.1). The step-5 check belongs
+at dispatch, where the calling task's active domain is known, and
+it is implemented there (#1547): `OpCode::required_domain` (`abi/`)
+is the per-op table, the directly bound task authority is
+the caller-domain source, and `DispatchContext::validate` enforces the
+match in `Dispatcher::dispatch_one` and `sys_ring_kick`.
+`DomainMismatch` is therefore produced by dispatch, not by this
+path.
 
 Composition with the #1363 wiring (merged PR #1502): that PR owns
 `CapTable::lookup` and the ABI dispatch gate (§8 steps 1–4 at the
@@ -600,6 +615,13 @@ minted or derived cap, whose slot already carries the right kind,
 type tag, and rights. Composition with the #1281 mechanism (merged
 PR #1542): `bootstrap_with`-minted caps carry the same slot
 shape, so they pass the new legs unchanged. Note: #1542 landed first with §9.8 (creator-gated mint), so this section is §9.9.
+
+Remainders: the `DomainEnter`/`DomainExit` dynamic target-domain leg
+(their target domain is named by `caps[0]`, a `Cap<Domain>` — no
+`Domain` cap type and no dispatch arm exist yet, so both ops still
+complete `InvalidOp`). Task-owned logical scope tracking is implemented in
+the scheduler, separate from temporary trap domain neutralization. Performance
+claims require verification/ §8; kernel tests alone establish no timings.
 
 Perf class (b) — hot path, unmeasured, with measurement plan:
 `check_live` is documented as "the hot-path check for every op."
@@ -616,7 +638,10 @@ must become lock-free-read first. No measurement was possible in
 this lane (no real hardware); the plan is the explicit close
 condition for #1282.
 
-Remainders: §8 step 5, tracked in #1547.
+Remainders: §8 step 5 is implemented at dispatch (#1547); the
+remaining items are the `DomainEnter`/`DomainExit` dynamic
+target-domain leg and the step-5 measurement plan, both listed
+above.
 
 ## 10. ABI versioning
 

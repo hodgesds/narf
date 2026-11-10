@@ -165,7 +165,7 @@ pub fn enter(domain: DomainId) -> DomainScope {
     // makes a per-domain decision possible further down -- a tagged heap
     // allocation has to know whose it is -- and it must be true for the whole
     // scope, including the part of `enter` that follows.
-    let prev_domain = narf_arch::enter_domain_scope(domain.raw());
+    let prev_domain = narf_scheduler::enter_domain_scope(domain.raw());
     #[cfg(target_arch = "x86_64")]
     {
         if narf_arch::x86_64::pks::is_active() || narf_arch::x86_64::pcid::is_active() {
@@ -387,7 +387,7 @@ fn scrub_dead_stack() {
 }
 
 pub fn exit(scope: DomainScope) {
-    narf_arch::exit_domain_scope(scope.prev_domain);
+    narf_scheduler::exit_domain_scope(scope.prev_domain);
     #[cfg(target_arch = "x86_64")]
     {
         if narf_arch::x86_64::pks::is_active() || narf_arch::x86_64::pcid::is_active() {
