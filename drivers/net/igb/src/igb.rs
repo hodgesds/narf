@@ -1319,6 +1319,42 @@ struct AdvRxDescWb {
 const _: () = assert!(core::mem::size_of::<AdvRxDescRead>() == 16);
 const _: () = assert!(core::mem::size_of::<AdvRxDescWb>() == 16);
 
+impl AdvRxDescWb {
+    /// Sample an RX ring slot the chip may be completing right now.
+    /// `word(i)` reads little-endian qword `i` of the 16-byte slot.
+    ///
+    /// The chip writes the descriptor back while the host polls it, so a
+    /// sample must never pair a fresh DD with fields of the slot's previous
+    /// contents. Qword 1 carries status/error (with DD), the frame length
+    /// and the VLAN tag: it is taken first and as ONE load, so a set DD
+    /// always comes with the length written with it. Qword 0 (RSS hash +
+    /// packet info) is loaded only after DD was seen, when the whole
+    /// write-back is in place. `None` means "not completed": nothing else
+    /// of the slot was read. Linux `igb_clean_rx_irq` does the same: it
+    /// tests `wb.upper.length`, then `dma_rmb()`, then reads the rest.
+    ///
+    /// A whole-struct `read_volatile` gives no such order: the compiler
+    /// lowers it to separate field loads in an order of its choosing, and
+    /// loading `length` before `status_error` shows a stale length under a
+    /// DD posted between the two loads.
+    #[inline]
+    fn sample(mut word: impl FnMut(usize) -> u64) -> Option<Self> {
+        let upper = word(1);
+        if upper as u32 & ADV_RXD_STAT_DD == 0 {
+            return None;
+        }
+        // Pair the chip's DD write with the loads that follow it.
+        compiler_fence(Ordering::SeqCst);
+        let lower = word(0);
+        Some(Self {
+            lower,
+            status_error: upper as u32,
+            length: (upper >> 32) as u16,
+            vlan: (upper >> 48) as u16,
+        })
+    }
+}
+
 /// Bit 0 of `AdvRxDescWb::status_error` — Descriptor Done.
 const ADV_RXD_STAT_DD: u32 = 1 << 0;
 /// Bit 1 — End of Packet.
@@ -3410,11 +3446,9 @@ impl Igb {
         let ring_phys = self.rx_ring_buf.dma_addr().raw();
         let desc_ptr = narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64)
             .kernel_mut_ptr::<AdvRxDescWb>();
-        // SAFETY: mapped DMA; idx < RX_RING_LEN.
-        let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
-        if desc.status_error & ADV_RXD_STAT_DD == 0 {
+        let Some(desc) = self.rx_completed_desc(idx) else {
             return 0;
-        }
+        };
         let len = (desc.length as usize).min(out.len()).min(FRAME_SIZE);
         let slots = self.rx_buf_pool.lock();
         let buf_phys = slots[idx].dma_addr().raw();
@@ -3482,11 +3516,9 @@ impl Igb {
         while drained < limit {
             let desc_ptr = narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64)
                 .kernel_mut_ptr::<AdvRxDescWb>();
-            // SAFETY: mapped DMA; idx < RX_RING_LEN.
-            let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
-            if desc.status_error & ADV_RXD_STAT_DD == 0 {
+            let Some(desc) = self.rx_completed_desc(idx) else {
                 break;
-            }
+            };
             let len = (desc.length as usize).min(FRAME_SIZE);
             // Re-arm keeps the slot's own buffer address — the slot<->buffer
             // pairing is stable for the device's lifetime (set at probe).
@@ -3551,11 +3583,9 @@ impl Igb {
         while frames.len() < limit {
             let desc_ptr = narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64)
                 .kernel_mut_ptr::<AdvRxDescWb>();
-            // SAFETY: mapped DMA; idx < RX_RING_LEN.
-            let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
-            if desc.status_error & ADV_RXD_STAT_DD == 0 {
+            let Some(desc) = self.rx_completed_desc(idx) else {
                 break;
-            }
+            };
             let len = (desc.length as usize).min(FRAME_SIZE);
             let replacement = match alloc_coherent(FRAME_SIZE, DomainId::DRIVER_0) {
                 Ok(replacement) => replacement,
@@ -3609,14 +3639,33 @@ impl Igb {
         self.rx_drain_in_place(1, f) != 0
     }
 
+    /// The completed write-back of RX slot `idx`, or `None` while the chip
+    /// still owns it. DD-first, see [`AdvRxDescWb::sample`].
+    fn rx_completed_desc(&self, idx: usize) -> Option<AdvRxDescWb> {
+        debug_assert!(idx < RX_RING_LEN);
+        AdvRxDescWb::sample(|word| {
+            // SAFETY: coherent RX ring mapped for the controller's lifetime;
+            // `idx < RX_RING_LEN` at every caller and `word` is 0 or 1, so
+            // the aligned qword lies inside slot `idx`.
+            u64::from_le(unsafe {
+                core::ptr::read_volatile(
+                    self.rx_ring_buf
+                        .cpu_ptr_at::<u64>((idx * 16 + word * 8) as u64),
+                )
+            })
+        })
+    }
+
     /// Whether queue 0 has a completed descriptor at the software head.
     fn rx_has_pending(&self) -> bool {
         let idx = *self.rx_head.lock() as usize;
-        let ring_phys = self.rx_ring_buf.dma_addr().raw();
-        let desc_ptr =
-            narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64).kernel_ptr::<AdvRxDescWb>();
-        // SAFETY: mapped DMA; idx < RX_RING_LEN.
-        unsafe { core::ptr::read_volatile(desc_ptr) }.status_error & ADV_RXD_STAT_DD != 0
+        // SAFETY: coherent RX ring; `idx < RX_RING_LEN`. The status/error
+        // dword (with DD) sits at byte 8 of the slot and is the only field
+        // sampled.
+        let status_error = u32::from_le(unsafe {
+            core::ptr::read_volatile(self.rx_ring_buf.cpu_ptr_at::<u32>((idx * 16 + 8) as u64))
+        });
+        status_error & ADV_RXD_STAT_DD != 0
     }
 
     /// Re-enable the shared MSI-X vector after a NAPI-style drain.
@@ -5991,5 +6040,63 @@ mod tests {
     kernel_test_in!(
         "drivers/net/igb",
         smoke_igb_pm_resume_renegotiates_and_unmasks
+    );
+
+    fn smoke_igb_rx_wb_sample_never_mixes_occupants() -> TestResult {
+        // An armed RX slot holds the read format (packet buffer address,
+        // zero header address) until the chip overwrites it with the
+        // write-back, and the host may be sampling the slot at that moment.
+        // Model the chip posting the WHOLE write-back after each possible
+        // number of host loads. Whatever the interleaving, a sample that
+        // reports DD must be the write-back in full: with the armed slot's
+        // fields under a fresh DD the driver delivers a frame of the wrong
+        // length.
+        const ARMED_ADDR: u64 = 0x0000_0001_2345_6000;
+        const NEW_LOWER: u64 = 0x5EED_CAFE_0000_0321;
+        const NEW_LEN: u16 = 0x05EA;
+        const NEW_VLAN: u16 = 0x0123;
+        // Datasheet write-back qword 1: status/error at bytes 8..11
+        // (DD bit 0, EOP bit 1), length at 12..13, VLAN tag at 14..15.
+        let old = [ARMED_ADDR, 0u64];
+        let new = [
+            NEW_LOWER,
+            0x3 | ((NEW_LEN as u64) << 32) | ((NEW_VLAN as u64) << 48),
+        ];
+
+        for post_after in 0..=2usize {
+            let slot = core::cell::Cell::new(old);
+            let loads = core::cell::Cell::new(0usize);
+            let sampled = AdvRxDescWb::sample(|word| {
+                if loads.get() == post_after {
+                    slot.set(new);
+                }
+                loads.set(loads.get() + 1);
+                slot.get()[word]
+            });
+            let Some(desc) = sampled else {
+                // Not completed yet: the driver polls again.
+                if post_after == 0 {
+                    return TestResult::Fail("a write-back posted before the sample read as armed");
+                }
+                if loads.get() != 1 {
+                    return TestResult::Fail("an incomplete slot was read past its DD word");
+                }
+                continue;
+            };
+            if loads.get() != 2 {
+                return TestResult::Fail("a completed sample is not exactly two qword loads");
+            }
+            if desc.status_error != 0x3 || desc.length != NEW_LEN || desc.vlan != NEW_VLAN {
+                return TestResult::Fail("fresh DD sampled with a stale length or VLAN tag");
+            }
+            if desc.lower != NEW_LOWER {
+                return TestResult::Fail("fresh DD sampled with the armed slot's qword 0");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/igb",
+        smoke_igb_rx_wb_sample_never_mixes_occupants
     );
 }
