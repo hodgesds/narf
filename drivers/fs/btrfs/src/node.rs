@@ -1101,7 +1101,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 .div_ceil(512),
             mode: Mode {
                 file_type: self.inode().file_type(),
-                perms: self.inode().perms() & 0o777,
+                perms: self.inode().perms(),
             },
             // The on-disk `btrfs_timespec`, not 0 (every btrfs file claimed
             // 1970). The exact value travels in `InodeAttrs::mtime_ns`.
@@ -1711,7 +1711,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     }
 
     fn dir_mode(&self) -> u16 {
-        self.inode().perms() & 0o777
+        self.inode().perms()
     }
 
     fn set_dir_mode_async<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
