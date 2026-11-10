@@ -19,6 +19,8 @@ pub(crate) trait Registers {
     fn flush(&self) {
         let _ = self.read(8);
     }
+    /// Report a tolerated hardware irregularity. Silent by default.
+    fn note(&self, _message: &'static str) {}
 }
 
 // Keep the timeout construction at the caller: outlining its enum copy can
@@ -557,9 +559,13 @@ pub(crate) fn flush_receive_fifo(r: &impl Registers) -> Result<(), IgcError> {
             value != u32::MAX && value & ENABLE == 0
         })
     }) {
-        // No receive buffers have been published. The lifecycle caller
-        // must still drain/reset before reclaiming these retained rings.
-        return Err(IgcError::Other("management RX queues did not stop"));
+        if (0..4).any(|q| r.read(0xc028 + q * 0x40) == u32::MAX) {
+            return Err(IgcError::Other("RX queue state unavailable"));
+        }
+        // Linux igc_rx_fifo_flush_base only reports this and flushes
+        // anyway. Nothing can be written meanwhile: the rings are still
+        // empty, and the reject policy below drops every frame.
+        r.note("RX queue disable timed out after 10 ms; flushing anyway");
     }
 
     r.write(0x5008, rfctl & !LEF);

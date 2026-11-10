@@ -367,6 +367,10 @@ impl Registers for Hardware {
         let deadline = narf_time::Deadline::after_us(us);
         narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
     }
+    fn note(&self, message: &'static str) {
+        use core::fmt::Write;
+        let _ = writeln!(narf_console::Writer, "[igc] {message}");
+    }
 }
 
 /// Cumulative diagnostics. Hardware counters are clear-on-read and sampled

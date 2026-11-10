@@ -783,30 +783,65 @@ kernel_test_in!(
 );
 
 fn smoke_igc_fifo_refusal_never_publishes_receive_buffers() -> TestResult {
-    for reject_filter in [false, true] {
-        let m = Model::new();
-        m.regs.borrow_mut().insert(0x5820, 0x20000);
-        hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
-        if reject_filter {
-            m.rejected_register.set(Some(0x5008));
-        } else {
-            m.stuck_rx_disable.set(true);
-        }
-        check!(
-            hardware::activate_queues(&m, &[256], || Ok(())).is_err(),
-            "FIFO prerequisite refusal was accepted"
-        );
-        check!(
-            (0..4).all(|q| m.value(0xc018 + q * 0x40) == 0)
-                && !m.writes.borrow().iter().any(|&(r, _)| r == 0x5004),
-            "FIFO refusal published buffers or changed length before queue drain"
-        );
-    }
+    let m = Model::new();
+    m.regs.borrow_mut().insert(0x5820, 0x20000);
+    hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+    m.rejected_register.set(Some(0x5008));
+    check!(
+        hardware::activate_queues(&m, &[256], || Ok(())).is_err(),
+        "FIFO prerequisite refusal was accepted"
+    );
+    check!(
+        (0..4).all(|q| m.value(0xc018 + q * 0x40) == 0)
+            && !m.writes.borrow().iter().any(|&(r, _)| r == 0x5004),
+        "FIFO refusal published buffers or changed length before queue drain"
+    );
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/net/igc/init",
     smoke_igc_fifo_refusal_never_publishes_receive_buffers
+);
+
+fn smoke_igc_fifo_flush_tolerates_late_queue_disable() -> TestResult {
+    // Linux igc_rx_fifo_flush_base logs "Queue disable timed out after
+    // 10ms" and still flushes. Refusing instead would leave the interface
+    // unregistered on a controller that is merely slow to acknowledge.
+    let m = Model::new();
+    m.regs
+        .borrow_mut()
+        .extend([(0x5820, 0x20000), (0x5004, 1522)]);
+    hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+    m.stuck_rx_disable.set(true);
+    check!(
+        hardware::activate_queues(&m, &[256], || Ok(())).is_ok(),
+        "a late RX queue disable aborted activation"
+    );
+    // The model's flag also requires the queues to read disabled, which
+    // is exactly what this controller has not yet acknowledged.
+    check!(
+        matches!(m.delays.borrow().as_slice(), [(2000, _)]),
+        "the reject window was skipped after a late queue disable"
+    );
+    check!(
+        m.value(0x5004) == 1522 && m.value(0xc018) == 255,
+        "receive length was not restored or RX buffers were not published"
+    );
+    let writes = m.writes.borrow();
+    let restored = writes.iter().rposition(|&(r, _)| r == 0x5004).unwrap();
+    let published = writes
+        .iter()
+        .position(|&(r, v)| r == 0xc018 && v != 0)
+        .unwrap();
+    check!(
+        restored < published,
+        "RX tails posted while the reject policy was still in force"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc/init",
+    smoke_igc_fifo_flush_tolerates_late_queue_disable
 );
 
 fn smoke_igc_queue_rejected_configuration_never_enables_dma() -> TestResult {
