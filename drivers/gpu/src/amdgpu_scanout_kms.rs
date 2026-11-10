@@ -597,6 +597,10 @@ pub(super) struct CommitAdmission<'a> {
     _uninhabited: (core::convert::Infallible, core::marker::PhantomData<&'a ()>),
 }
 impl CommitAdmission<'_> {
+    /// The open (DRM master) the commit is admitted for.
+    pub(super) fn open(&self) -> u64 {
+        self.open
+    }
     pub(super) fn check(&self, card: &crate::drm::card::Card) -> Result<(), FsError> {
         if !card.is_master(self.open) {
             return Err(FsError::PermissionDenied);

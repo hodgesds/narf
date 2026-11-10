@@ -6595,6 +6595,12 @@ fn atomic_commit(
                 );
                 return Err(invalid_at(line!()));
             }
+            note_commit_milestones(
+                &card,
+                admission.map_or(0, scanout_kms::CommitAdmission::open),
+                req.flags,
+                &state,
+            );
             // A framebuffer CLOSEFB released while shown goes once this
             // commit took its planes off it.
             for (phys, order) in card.collect_closed_fbs() {
@@ -6867,11 +6873,19 @@ fn atomic_commit(
         crate::amdgpu_native_kms::request_connector_max_bpc(connector, bpc);
     }
 
+    // Accepted requests, TEST_ONLY probes included; `commits` counts the
+    // ones that were not probes, and `present` says whether this one handed
+    // a framebuffer to a presenter (never true for a probe).
+    let commits = if test_only {
+        ATOMIC_COMMITS.load(Ordering::Relaxed)
+    } else {
+        ATOMIC_COMMITS.fetch_add(1, Ordering::Relaxed) + 1
+    };
     let (log, n) = should_log(&ATOMIC_N);
     if log {
         let _ = writeln!(
             narf_console::Writer,
-            "  drm: ATOMIC #{n} objs={} props={} flags={:#x} present={}",
+            "  drm: ATOMIC #{n} objs={} props={} flags={:#x} present={} commits={commits}",
             objects.len(),
             total_props,
             req.flags,
@@ -7499,6 +7513,8 @@ pub(crate) fn release_dumb_backing_ref(card_index: u32, gem_handle: u32) {
 static SETCRTC_N: AtomicU64 = AtomicU64::new(0);
 static PAGEFLIP_N: AtomicU64 = AtomicU64::new(0);
 static ATOMIC_N: AtomicU64 = AtomicU64::new(0);
+/// Accepted atomic requests that were commits, not TEST_ONLY probes.
+static ATOMIC_COMMITS: AtomicU64 = AtomicU64::new(0);
 static BLIT_N: AtomicU64 = AtomicU64::new(0);
 static NOBACKING_N: AtomicU64 = AtomicU64::new(0);
 static NOSCANOUT_N: AtomicU64 = AtomicU64::new(0);
@@ -7594,6 +7610,113 @@ fn check_native_plane(
         return Err(FsError::NoSpace);
     }
     Ok(())
+}
+
+/// Bring-up milestones of one DRM master (`open`, 0 where the caller has
+/// none): its first committed modeset, the first framebuffer it commits
+/// to a primary plane, and the first that covers the whole CRTC unscaled
+/// (a composited desktop, as opposed to KWin's pointer-only frame on a
+/// positioned primary). Each is logged once per open, so a session that
+/// shows nothing can be told apart from one that never committed. Called
+/// for an accepted commit only, never for a TEST_ONLY probe; the steady
+/// state is one short table lookup per commit.
+fn note_commit_milestones(
+    card: &crate::drm::card::Card,
+    open: u64,
+    flags: u32,
+    state: &crate::drm::atomic::AtomicState,
+) {
+    const MODESET: u8 = 1;
+    const PRIMARY: u8 = 2;
+    const FULL: u8 = 4;
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<Vec<(u64, u8)>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    let seen = SEEN
+        .lock()
+        .iter()
+        .find(|(o, _)| *o == open)
+        .map_or(0, |&(_, bits)| bits);
+    if seen == MODESET | PRIMARY | FULL {
+        return;
+    }
+    let mode_of = |crtc_id: u32| {
+        state
+            .crtcs
+            .iter()
+            .find(|c| c.id == crtc_id)
+            .map(|c| c.mode)
+            .unwrap_or_else(|| card.crtc(crtc_id).ok().and_then(|c| c.mode))
+    };
+    let is_primary = |id: u32| {
+        card.native_planes
+            .iter()
+            .any(|p| p.id == id && p.primary_of.is_some())
+            || (synthesized_primaries(card)
+                && id
+                    .checked_sub(PLANE_ID_BASE)
+                    .is_some_and(|i| (i as usize) < card.crtcs.len()))
+    };
+    let mut now = 0u8;
+    if seen & MODESET == 0 {
+        if let Some(c) = state.crtcs.iter().find(|c| c.needs_modeset()) {
+            now |= MODESET;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  drm: open {open:#x} first modeset committed: flags={flags:#x} crtc{} active={} mode={:?}",
+                c.id,
+                c.active,
+                c.mode.map(|m| (m.width, m.height, m.refresh_hz)),
+            );
+        }
+    }
+    for p in state.planes.iter().filter(|p| is_primary(p.id)) {
+        let (Some(crtc_id), Some(fb_id)) = (p.crtc_id, p.fb_id) else {
+            continue;
+        };
+        let full = mode_of(crtc_id).is_some_and(|m| {
+            (p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h) == (0, 0, m.width, m.height)
+                && (p.src_w, p.src_h) == (m.width, m.height)
+        });
+        let bit = if full { FULL } else { 0 } | PRIMARY;
+        if bit & !(seen | now) == 0 {
+            continue;
+        }
+        now |= bit;
+        let fb = card
+            .framebuffer(fb_id)
+            .map(|fb| (fb.width, fb.height))
+            .unwrap_or_default();
+        let _ = writeln!(
+            narf_console::Writer,
+            "  drm: open {open:#x} first {} primary frame committed: flags={flags:#x} plane{} crtc{crtc_id} fb{fb_id} {}x{} src=({},{},{},{}) crtc=({},{},{},{})",
+            if full { "full-screen" } else { "positioned" },
+            p.id,
+            fb.0,
+            fb.1,
+            p.src_x,
+            p.src_y,
+            p.src_w,
+            p.src_h,
+            p.crtc_x,
+            p.crtc_y,
+            p.crtc_w,
+            p.crtc_h,
+        );
+    }
+    if now == 0 {
+        return;
+    }
+    let mut table = SEEN.lock();
+    match table.iter_mut().find(|(o, _)| *o == open) {
+        Some(entry) => entry.1 |= now,
+        None => {
+            // A bounded table: the oldest open's milestones go first.
+            if table.len() >= 32 {
+                table.remove(0);
+            }
+            table.push((open, now));
+        }
+    }
 }
 
 /// dc_validate_global_state for a touched CRTC's primary and overlay
