@@ -26,7 +26,7 @@ The crate stays narrowly a parser: it turns descriptor bytes into
 structured data and validates checksums, and leaves transport (the
 actual DDC/AUX read) and mode selection to its callers. The `graphics`
 crate wraps it through a thin adapter, and the GPU driver in
-`drivers/nvidia` pulls EDID over its DisplayPort AUX path and feeds the
+`drivers/gpu/nvidia` pulls EDID over its DisplayPort AUX path and feeds the
 bytes here to learn a sink's timings.
 
 The crate is `no_std` and dependency-light, needing only the kernel

@@ -1,4 +1,4 @@
-# drivers/nvidia — NVIDIA GPU Driver
+# drivers/gpu/nvidia — NVIDIA GPU Driver
 
 `narf-drivers-nvidia` is the NVIDIA GPU driver scaffold. It targets the
 discrete and mobile GeForce parts from Maxwell forward — GTX through
