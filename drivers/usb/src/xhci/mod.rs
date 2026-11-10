@@ -78,10 +78,6 @@ mod bulk_owner;
 mod bulk_stop;
 mod bulk_stop_native;
 mod completion;
-mod control_cancel;
-#[cfg(feature = "kernel-test")]
-#[path = "control_tests.rs"]
-mod control_tests;
 mod event_wait;
 #[cfg(feature = "kernel-test")]
 #[path = "isoch_tests.rs"]
@@ -274,14 +270,6 @@ const DB_HC_COMMAND: u32 = 0;
 const DCI_CONTROL_EP: u32 = 1;
 /// Transfer ring size for the default control endpoint.
 const CTRL_TR_TRBS: usize = 64;
-/// Post-reset recovery before the first SETUP: TRSTRCY (10 ms, USB 2.0
-/// §7.1.7.3) plus Linux `hub_port_reset`'s extra 40 ms.
-const PORT_RESET_RECOVERY_MS: u64 = 50;
-/// Quiet time after a successful Address Device (Linux `hub_port_init`
-/// after `hub_set_address`; USB 2.0 §9.2.6.3 requires at least 2 ms).
-const SET_ADDRESS_RECOVERY_MS: u64 = 10;
-/// Timeout reports printed per controller before going quiet.
-const TIMEOUT_REPORT_LIMIT: u32 = 16;
 
 // Standard USB request constants (§9.4 USB 2.0).
 pub const USB_REQ_GET_DESCRIPTOR: u8 = 6;
@@ -543,11 +531,6 @@ pub struct Xhci {
     /// visibility must imply its preceding forced TEs already quarantined.
     demux_publication: IrqSafeSpinLock<()>,
     events_overflowed: core::sync::atomic::AtomicU32,
-    /// Command and control-stage waits that expired since bring-up.
-    /// The supervisor samples it around an enumeration attempt so a
-    /// timed-out attempt is charged more of the port's retry budget
-    /// than a fast failure; it also rate-limits the timeout report.
-    timeouts: core::sync::atomic::AtomicU32,
     /// Number of completed full controller recoveries
     /// (`recover_controller`) since bring-up. The supervisor watches
     /// this epoch: a change means every slot, binding and handle from
@@ -1890,7 +1873,6 @@ impl Xhci {
             transfer_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::with_capacity(64)),
             demux_publication: IrqSafeSpinLock::new(()),
             events_overflowed: core::sync::atomic::AtomicU32::new(0),
-            timeouts: core::sync::atomic::AtomicU32::new(0),
             recovery_epoch: core::sync::atomic::AtomicU64::new(0),
             running: true,
             msix,
@@ -2260,12 +2242,12 @@ impl Xhci {
                     if ok {
                         // TRSTRCY (USB 2.0 §7.1.7.3 / §9.2.6.2):
                         // ≥10 ms quiet between PR clear and the
-                        // first SETUP, plus the 40 ms of margin
-                        // Linux `hub_port_reset` adds for devices
-                        // that ignore SET_ADDRESS right at the
-                        // boundary (the hub-class reset in
-                        // `hub.rs` waits the same 50 ms).
-                        Self::settle(PORT_RESET_RECOVERY_MS).await;
+                        // first SETUP. Spin-yield for ~25 ms via
+                        // TSC deadline (not the wheel).
+                        let recovery = narf_time::Deadline::after_ms(25);
+                        while !recovery.expired() {
+                            narf_scheduler::yield_now().await;
+                        }
                         return Ok(post);
                     }
                     narf_scheduler::yield_now().await;
@@ -2274,17 +2256,6 @@ impl Xhci {
             narf_scheduler::yield_now().await;
         }
         Err(XhciError::PortResetTimeout)
-    }
-
-    /// Quiet period on the bus. Yields through the executor's
-    /// self-wake path against a TSC deadline — the same wheel-bypass
-    /// wait `port_reset` and `await_event` use — and touches no
-    /// hardware register.
-    async fn settle(ms: u64) {
-        let deadline = narf_time::Deadline::after_ms(ms);
-        while !deadline.expired() {
-            narf_scheduler::yield_now().await;
-        }
     }
 
     /// Ring the host-controller's Command Ring doorbell. Stream-id /
@@ -2613,16 +2584,11 @@ impl Xhci {
     /// the queue between submit and await without the sync waiter
     /// timing out, because the await reads the queue (not the
     /// raw event ring directly).
-    ///
-    /// `wait` selects the deadline (`event_wait::Wait`): 5000 ms for
-    /// commands and control-transfer stages, 250 ms for the one-shot
-    /// bulk/isoch polls.
     async fn await_event(
         &self,
-        wait: event_wait::Wait,
         mut predicate: impl FnMut(&[u32; 4]) -> bool,
     ) -> Result<[u32; 4], XhciError> {
-        let deadline = narf_time::Deadline::after_ms(wait.timeout_ms());
+        let deadline = narf_time::Deadline::after_ms(250);
         loop {
             match event_wait::poll_batch(
                 || self.take_matching_event(&mut predicate),
@@ -2631,12 +2597,7 @@ impl Xhci {
             ) {
                 Ok(Some(event)) => return Ok(event),
                 Ok(None) => {}
-                Err(event_wait::PollError::TimedOut) => {
-                    if wait != event_wait::Wait::Transfer {
-                        self.timeouts.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Err(XhciError::CmdTimeout);
-                }
+                Err(event_wait::PollError::TimedOut) => return Err(XhciError::CmdTimeout),
                 Err(event_wait::PollError::Source(error)) => return Err(error),
             }
             // Wheel-bypass: yield_now self-wakes via cx.waker(),
@@ -2647,7 +2608,7 @@ impl Xhci {
             // wheel works for the panel paint task — same workaround
             // pattern as port_reset and supervisor enumeration polling.
             // Trade-off: CPU is busier (re-polls every executor
-            // round vs. parked-then-irq), but the outer `wait`
+            // round vs. parked-then-irq), but the outer 250 ms
             // deadline still bounds the busy phase. Other tasks
             // make progress via 10 ms preemption.
             narf_scheduler::yield_now().await;
@@ -2669,7 +2630,7 @@ impl Xhci {
         command: u64,
         predicate: impl FnMut(&[u32; 4]) -> bool,
     ) -> Result<[u32; 4], XhciError> {
-        match self.await_event(event_wait::Wait::Command, predicate).await {
+        match self.await_event(predicate).await {
             Ok(event) => Ok(event),
             Err(XhciError::CmdTimeout) => {
                 self.retire_command_receipt(command);
@@ -2697,7 +2658,7 @@ impl Xhci {
         // If the controller wedged itself (HCE), attempt a soft
         // re-init before submitting the command. HCE is RO and only
         // clears on HCRST — without recovery the doorbell write
-        // below has no effect and we'd time out 5 s later.
+        // below has no effect and we'd time out 250 ms later.
         // `soft_recover` refuses while any slot is reserved; with
         // live devices the recovery path is `recover_controller`,
         // driven by the supervisor (it invalidates every binding),
@@ -2932,15 +2893,6 @@ impl Xhci {
         if device.generation != generation || !device.endpoint_configuration {
             return Err(XhciError::CmdFailed(0xfd));
         }
-        Ok(self.read_endpoint_context(device, dci))
-    }
-
-    /// Raw output-context read of one endpoint's state + TR Dequeue
-    /// Pointer. `dci` must be 1..=31. Without a preceding command
-    /// completion the value is only a snapshot (diagnostics); the
-    /// recovery coordinators call it through
-    /// `endpoint_context_snapshot`, under their claim.
-    fn read_endpoint_context(&self, device: &Device, dci: u8) -> (u8, u64) {
         let offset = usize::from(dci) * self.context_stride() as usize;
         device._device_ctx.sync(offset, 16);
         device_dma_barrier();
@@ -2954,7 +2906,7 @@ impl Xhci {
                 core::ptr::read_volatile(device._device_ctx.cpu_ptr_at::<u64>(offset as u64 + 8)),
             )
         };
-        ((state & 7) as u8, dequeue)
+        Ok(((state & 7) as u8, dequeue))
     }
 
     /// Recover a halted endpoint — the recovery the spec's bulk
@@ -3109,12 +3061,6 @@ impl Xhci {
             device.endpoint_configuration = false;
         }
         Ok(())
-    }
-
-    /// Command and control-stage waits that have expired on this
-    /// controller since bring-up (monotonic, wraps).
-    pub(crate) fn timeout_count(&self) -> u32 {
-        self.timeouts.load(Ordering::Relaxed)
     }
 
     /// Drain at most one ring capacity, retaining owned command/transfer
@@ -3418,50 +3364,40 @@ impl Xhci {
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
         }
-        // Block scope: the slot-table and device-table guards must not be
-        // part of this future's state across the settle await below.
-        {
-            let slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
-            if !slots.matches(slot_id, generation) {
-                return Err(XhciError::NotReady);
-            }
-            let (input, dev_ctx, ctrl_tr, ctrl_data) = retained.complete();
-
-            // Slot is now Addressed. Stash the per-slot state.
-            let dev = Device {
-                generation,
-                endpoint_configuration: false,
-                control: bulk_owner::ControlState::new(),
-                slot_id,
-                port,
-                speed,
-                topology,
-                max_packet_ep0: mps,
-                _device_ctx: dev_ctx,
-                ctrl_tr,
-                ctrl_pcs: 1,
-                ctrl_enq: 0,
-                ctrl_data,
-                eps: alloc::vec::Vec::new(),
-            };
-            let mut g = self.devices.lock();
-            let need = (slot_id as usize) + 1;
-            while g.len() < need {
-                g.push(None);
-            }
-            g[slot_id as usize] = Some(dev);
-            drop(g);
-            drop(slots);
-            // input drops here — the Address Device command consumed
-            // its contents during processing.
-            let _ = input;
+        let slots = self.slots.try_lock().ok_or(XhciError::NotReady)?;
+        if !slots.matches(slot_id, generation) {
+            return Err(XhciError::NotReady);
         }
-        // SET_ADDRESS recovery (USB 2.0 §9.2.6.3: the device gets
-        // 2 ms before it must answer at the new address). Linux
-        // `hub_port_init` sleeps 10 ms after `hub_set_address`
-        // ("let the SET_ADDRESS settle"); the first descriptor read
-        // follows immediately, so the delay lives here.
-        Self::settle(SET_ADDRESS_RECOVERY_MS).await;
+        let (input, dev_ctx, ctrl_tr, ctrl_data) = retained.complete();
+
+        // Slot is now Addressed. Stash the per-slot state.
+        let dev = Device {
+            generation,
+            endpoint_configuration: false,
+            control: bulk_owner::ControlState::new(),
+            slot_id,
+            port,
+            speed,
+            topology,
+            max_packet_ep0: mps,
+            _device_ctx: dev_ctx,
+            ctrl_tr,
+            ctrl_pcs: 1,
+            ctrl_enq: 0,
+            ctrl_data,
+            eps: alloc::vec::Vec::new(),
+        };
+        let mut g = self.devices.lock();
+        let need = (slot_id as usize) + 1;
+        while g.len() < need {
+            g.push(None);
+        }
+        g[slot_id as usize] = Some(dev);
+        drop(g);
+        drop(slots);
+        // input drops here — the Address Device command consumed
+        // its contents during processing.
+        let _ = input;
         Ok(slot_id)
     }
 
@@ -3780,11 +3716,7 @@ impl Xhci {
         }
         let trb_off = (dev.ctrl_enq * 16) as u64;
         let trb_addr = dev.ctrl_tr.dma_addr().raw() + trb_off;
-        if (d3_no_cycle & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT == TRB_TYPE_SETUP_STAGE {
-            // The Setup TRB requests no event; one against it is an
-            // error that must end the TD (retained, never lossy).
-            dev.control.expect_setup(trb_addr).map_err(bulk_error)?;
-        } else if d3_no_cycle & TRB_IOC != 0 {
+        if d3_no_cycle & TRB_IOC != 0 {
             dev.control.expect(trb_addr).map_err(bulk_error)?;
         }
         let d3 = d3_no_cycle | (dev.ctrl_pcs & TRB_CYCLE_BIT);
@@ -3818,12 +3750,10 @@ impl Xhci {
         Ok(trb_off)
     }
 
-    /// Match the Transfer Event generated by one specific TRB in a
+    /// Wait for the Transfer Event generated by one specific TRB in a
     /// control-transfer TD.  A control TD has separate Data and Status
     /// Stage TRBs; both can request an event, so matching only slot + EP0
     /// would let the status event from transfer N complete transfer N+1.
-    /// Stage waits use `control_td_event_matches`, which adds the
-    /// Setup-stage failure rule on top of this identity check.
     pub(crate) fn control_transfer_event_matches(t: &[u32; 4], slot_id: u8, trb_phys: u64) -> bool {
         let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
@@ -3836,45 +3766,6 @@ impl Xhci {
             && (event_trb & !0xFu64) == trb_phys
     }
 
-    /// Whether a Transfer Event ends the control-stage wait for
-    /// `stage_trb`: either that TRB's own event, or a failure reported
-    /// against the TD's Setup Stage TRB. The Setup TRB requests no event,
-    /// so the only events that name it are errors — a failed SETUP
-    /// transaction (USB Transaction Error) or a stall the xHC attributes
-    /// to the TRB it was executing. Linux `process_ctrl_td` ends the TD
-    /// on an error event against any of its TRBs; before this, such an
-    /// event matched no waiter and surfaced as a timeout with EP0 halted.
-    pub(crate) fn control_td_event_matches(
-        t: &[u32; 4],
-        slot_id: u8,
-        stage_trb: u64,
-        setup_trb: u64,
-    ) -> bool {
-        if Self::control_transfer_event_matches(t, slot_id, stage_trb) {
-            return true;
-        }
-        let code = (t[2] >> 24) as u8;
-        code != 1 && code != 13 && Self::control_transfer_event_matches(t, slot_id, setup_trb)
-    }
-
-    /// Result of one control-stage Transfer Event. Success (1) always
-    /// passes; Short Packet (13) only where the caller allows it (an IN
-    /// data stage that returned fewer bytes than requested).
-    fn control_stage_status(event: &[u32; 4], short_ok: bool) -> Result<(), XhciError> {
-        let code = (event[2] >> 24) as u8;
-        if code == 1 || (short_ok && code == 13) {
-            Ok(())
-        } else {
-            Err(XhciError::CmdFailed(code))
-        }
-    }
-
-    /// Completion codes that leave EP0 Halted on the xHC: Babble (3),
-    /// USB Transaction Error (4), Stall (6).
-    const fn control_failure_halts(code: u8) -> bool {
-        matches!(code, 3 | 4 | 6)
-    }
-
     /// A control transfer that completed with a halting code (Babble 3,
     /// USB Transaction Error 4, Stall 6) leaves EP0 Halted on the xHC and
     /// its software claim busy, so every later request on the device
@@ -3882,120 +3773,11 @@ impl Xhci {
     /// Dequeue (`xhci_handle_halted_endpoint`); `reset_endpoint` does both
     /// and releases the claim. Other failures leave EP0 running.
     async fn recover_halted_control(&self, slot_id: u8, generation: u64, code: u8) {
-        if Self::control_failure_halts(code) {
+        if matches!(code, 3 | 4 | 6) {
             let _ = self
                 .reset_endpoint(slot_id, generation, DCI_CONTROL_EP as u8)
                 .await;
         }
-    }
-
-    /// Terminal bookkeeping shared by `control_in` / `control_out`: a
-    /// halting completion code runs halted-endpoint recovery, a stage
-    /// timeout cancels the still-published TD. Either way EP0 is usable
-    /// for the next request once the recovery proves the pipe stopped.
-    async fn settle_control_failure(&self, slot_id: u8, generation: u64, error: XhciError) {
-        match error {
-            XhciError::CmdFailed(code) => {
-                self.recover_halted_control(slot_id, generation, code).await
-            }
-            XhciError::CmdTimeout => self.cancel_timed_out_control(slot_id, generation).await,
-            _ => {}
-        }
-    }
-
-    /// Cancel a control TD whose stage wait expired. The TD is still
-    /// published and its claim still busy; without this every later
-    /// request on the device fails `NotReady`. Linux: `usb_kill_urb` →
-    /// `xhci_urb_dequeue` (Stop Endpoint) → `xhci_handle_cmd_stop_ep` /
-    /// `xhci_invalidate_cancelled_tds` (Set TR Dequeue Pointer), with a
-    /// halted endpoint routed to Reset Endpoint. Best-effort like
-    /// `retire_timed_out_isoch`: a failed cancel keeps the claim closed
-    /// rather than reopening a possibly-live ring, and the timeout stays
-    /// the reported error.
-    async fn cancel_timed_out_control(&self, slot_id: u8, generation: u64) {
-        let report = self.timeouts.load(Ordering::Relaxed) <= TIMEOUT_REPORT_LIMIT;
-        if report {
-            self.report_control_timeout(slot_id, generation);
-        }
-        let result = control_cancel::run(&ControlCancel {
-            xhci: self,
-            slot: slot_id,
-            generation,
-        })
-        .await;
-        if report {
-            use core::fmt::Write as _;
-            let _ = writeln!(
-                narf_console::Writer,
-                "  xhci{}: slot {} control timeout cancel: {:?}",
-                self.id,
-                slot_id,
-                result
-            );
-        }
-    }
-
-    /// Cold path, timeout only: what the controller knows about the TD
-    /// that never completed. EP0 state Running (1) with no event means
-    /// the device kept NAKing; Halted (2), or an event below, means the
-    /// transfer errored and its event was not attributed to the waiter.
-    fn report_control_timeout(&self, slot_id: u8, generation: u64) {
-        use core::fmt::Write as _;
-        let usbsts = self.usbsts();
-        let (context, port, receipts) = {
-            let devices = self.devices.lock();
-            match devices.get(usize::from(slot_id)).and_then(Option::as_ref) {
-                Some(device) if device.generation == generation => (
-                    Some(self.read_endpoint_context(device, DCI_CONTROL_EP as u8)),
-                    device.port,
-                    device.control.receipts(),
-                ),
-                _ => (None, 0, [None; 3]),
-            }
-        };
-        // Copy the unmatched events out before printing: the console
-        // must not run under the IRQ-safe queue lock.
-        let mut unmatched = [[0u32; 4]; 4];
-        let mut count = 0;
-        for event in self.transfer_events.lock().iter() {
-            if event[3] >> 24 == u32::from(slot_id) {
-                if count < unmatched.len() {
-                    unmatched[count] = *event;
-                }
-                count += 1;
-            }
-        }
-        let _ = writeln!(
-            narf_console::Writer,
-            "  xhci{}: slot {} control timeout: ep0 (state, dequeue)={:x?} usbsts={:#x} portsc={:x?} overflowed={}",
-            self.id,
-            slot_id,
-            context,
-            usbsts,
-            self.portsc(port),
-            self.events_overflowed.load(Ordering::Relaxed),
-        );
-        for (name, receipt) in ["setup", "stage", "stage"].iter().zip(receipts) {
-            if let Some((pointer, event)) = receipt {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  xhci{}: slot {}   {} trb={:#x} event={:x?}",
-                    self.id,
-                    slot_id,
-                    name,
-                    pointer,
-                    event
-                );
-            }
-        }
-        let _ = writeln!(
-            narf_console::Writer,
-            "  xhci{}: slot {}   unmatched transfer events={} first={:x?}",
-            self.id,
-            slot_id,
-            count,
-            &unmatched[..count.min(unmatched.len())]
-        );
     }
 
     fn begin_control(&self, slot_id: u8, generation: u64) -> Result<(u64, u64, usize), XhciError> {
@@ -4113,9 +3895,8 @@ impl Xhci {
                 out,
             )
             .await;
-        if let Err(error) = result {
-            self.settle_control_failure(slot_id, generation, error)
-                .await;
+        if let Err(XhciError::CmdFailed(code)) = result {
+            self.recover_halted_control(slot_id, generation, code).await;
         }
         result
     }
@@ -4170,8 +3951,7 @@ impl Xhci {
             TRT_NO_DATA
         };
         let setup_d3 = (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT) | TRB_IDT | (trt << 16);
-        let setup_trb =
-            ctrl_tr_phys + self.ctrl_enqueue(slot_id, setup_d0, setup_d1, setup_d2, setup_d3)?;
+        self.ctrl_enqueue(slot_id, setup_d0, setup_d1, setup_d2, setup_d3)?;
 
         // ── Data Stage TRB (§6.4.1.2.2) ───────────────────────────
         // dword0/1 = data buffer phys
@@ -4209,27 +3989,28 @@ impl Xhci {
 
         let data_ev = if let Some(data_trb) = data_trb {
             Some(
-                self.await_event(event_wait::Wait::ControlStage, |t| {
-                    Self::control_td_event_matches(t, slot_id, data_trb, setup_trb)
-                })
-                .await?,
+                self.await_event(|t| Self::control_transfer_event_matches(t, slot_id, data_trb))
+                    .await?,
             )
         } else {
             None
         };
         if let Some(ev) = data_ev {
+            let ccode = ((ev[2] >> 24) & 0xFF) as u8;
             // Completion code 1 = Success, 13 = Short Packet (also
             // OK for Get Descriptor when the device reports fewer
-            // bytes than the request asked for). A failure reported
-            // against the Setup TRB ends the TD here as well.
-            Self::control_stage_status(&ev, true)?;
+            // bytes than the request asked for).
+            if ccode != 1 && ccode != 13 {
+                return Err(XhciError::CmdFailed(ccode));
+            }
         }
         let status_ev = self
-            .await_event(event_wait::Wait::ControlStage, |t| {
-                Self::control_td_event_matches(t, slot_id, status_trb, setup_trb)
-            })
+            .await_event(|t| Self::control_transfer_event_matches(t, slot_id, status_trb))
             .await?;
-        Self::control_stage_status(&status_ev, false)?;
+        let ccode = ((status_ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
         // Transfer Length residue lives in dword2[23:0]. Bytes
         // actually transferred = w_length - residue.
         let residue = data_ev.unwrap_or(status_ev)[2] & 0x00FF_FFFF;
@@ -4305,9 +4086,8 @@ impl Xhci {
                 data,
             )
             .await;
-        if let Err(error) = result {
-            self.settle_control_failure(slot_id, generation, error)
-                .await;
+        if let Err(XhciError::CmdFailed(code)) = result {
+            self.recover_halted_control(slot_id, generation, code).await;
         }
         result
     }
@@ -4357,8 +4137,7 @@ impl Xhci {
             TRT_NO_DATA
         };
         let setup_d3 = (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT) | TRB_IDT | (trt << 16);
-        let setup_trb =
-            ctrl_tr_phys + self.ctrl_enqueue(slot_id, setup_d0, setup_d1, setup_d2, setup_d3)?;
+        self.ctrl_enqueue(slot_id, setup_d0, setup_d1, setup_d2, setup_d3)?;
 
         // ── Data Stage TRB (DIR=OUT) ──────────────────────────────
         let data_trb = if w_length > 0 {
@@ -4387,23 +4166,25 @@ impl Xhci {
 
         let data_ev = if let Some(data_trb) = data_trb {
             Some(
-                self.await_event(event_wait::Wait::ControlStage, |t| {
-                    Self::control_td_event_matches(t, slot_id, data_trb, setup_trb)
-                })
-                .await?,
+                self.await_event(|t| Self::control_transfer_event_matches(t, slot_id, data_trb))
+                    .await?,
             )
         } else {
             None
         };
         if let Some(ev) = data_ev {
-            Self::control_stage_status(&ev, false)?;
+            let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+            if ccode != 1 {
+                return Err(XhciError::CmdFailed(ccode));
+            }
         }
         let status_ev = self
-            .await_event(event_wait::Wait::ControlStage, |t| {
-                Self::control_td_event_matches(t, slot_id, status_trb, setup_trb)
-            })
+            .await_event(|t| Self::control_transfer_event_matches(t, slot_id, status_trb))
             .await?;
-        Self::control_stage_status(&status_ev, false)?;
+        let ccode = ((status_ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
         let residue = data_ev.unwrap_or(status_ev)[2] & 0x00FF_FFFF;
         if residue > u32::from(w_length) {
             return Err(XhciError::CmdFailed(0xFB));
@@ -5228,9 +5009,7 @@ impl Xhci {
             return Err(XhciError::CmdFailed(0xF9));
         }
         self.validate_isoch(token)?;
-        let event = self
-            .await_event(event_wait::Wait::Transfer, |event| token.matches(event))
-            .await?;
+        let event = self.await_event(|event| token.matches(event)).await?;
         self.complete_isoch(token, &event, Some(out))?
             .ok_or(XhciError::NotReady)
     }
@@ -5240,9 +5019,7 @@ impl Xhci {
             return Err(XhciError::CmdFailed(0xF8));
         }
         self.validate_isoch(token)?;
-        let event = self
-            .await_event(event_wait::Wait::Transfer, |event| token.matches(event))
-            .await?;
+        let event = self.await_event(|event| token.matches(event)).await?;
         self.complete_isoch(token, &event, None)?
             .ok_or(XhciError::NotReady)
     }
@@ -5479,9 +5256,7 @@ impl Xhci {
             return Err(XhciError::CmdFailed(0xF9));
         }
         self.validate_bulk(token)?;
-        let event = self
-            .await_event(event_wait::Wait::Transfer, |event| token.matches(event))
-            .await?;
+        let event = self.await_event(|event| token.matches(event)).await?;
         self.complete_bulk(token, &event, Some(out))?
             .ok_or(XhciError::NotReady)
     }
@@ -5491,9 +5266,7 @@ impl Xhci {
             return Err(XhciError::CmdFailed(0xF8));
         }
         self.validate_bulk(token)?;
-        let event = self
-            .await_event(event_wait::Wait::Transfer, |event| token.matches(event))
-            .await?;
+        let event = self.await_event(|event| token.matches(event)).await?;
         self.complete_bulk(token, &event, None)?
             .ok_or(XhciError::NotReady)
     }
@@ -5767,88 +5540,6 @@ fn bulk_error(error: bulk_owner::Error) -> XhciError {
         bulk_owner::Error::BadLength => XhciError::CmdFailed(0xF9),
         bulk_owner::Error::Malformed => XhciError::CmdFailed(0xFB),
         bulk_owner::Error::Completion(code) => XhciError::CmdFailed(code),
-    }
-}
-
-/// xHCI adapter for the EP0 timeout-cancellation coordinator
-/// (`control_cancel::run`), bound to one slot generation.
-struct ControlCancel<'a> {
-    xhci: &'a Xhci,
-    slot: u8,
-    generation: u64,
-}
-impl control_cancel::Bus for ControlCancel<'_> {
-    type Error = XhciError;
-    fn claim(&self) -> Result<control_cancel::Plan, XhciError> {
-        let mut devices = self.xhci.devices.lock();
-        let device = match devices
-            .get_mut(usize::from(self.slot))
-            .and_then(Option::as_mut)
-        {
-            Some(device) if self.generation != 0 && device.generation == self.generation => device,
-            _ => return Err(XhciError::CmdFailed(0xfd)),
-        };
-        if device.endpoint_configuration {
-            return Err(XhciError::NotReady);
-        }
-        device
-            .control
-            .begin_cancel(device.generation, self.generation)
-            .map_err(bulk_error)?;
-        let (enqueue, cycle) =
-            Xhci::canonical_cursor(CTRL_TR_TRBS, device.ctrl_enq, device.ctrl_pcs);
-        let target =
-            (device.ctrl_tr.dma_addr().raw() + (enqueue as u64) * 16) | u64::from(cycle & 1);
-        device.endpoint_configuration = true;
-        Ok(control_cancel::Plan {
-            slot: self.slot,
-            generation: self.generation,
-            target,
-            enqueue,
-            cycle,
-        })
-    }
-    async fn command(&self, words: [u32; 4]) -> Result<u8, XhciError> {
-        match <Xhci as bulk_stop::Bus>::command(self.xhci, words).await {
-            Ok(()) => Ok(1),
-            // A real completion code is the coordinator's to judge; the
-            // 0xF0+ range is this driver's own synthetic failures.
-            Err(XhciError::CmdFailed(code)) if code < 0xf0 => Ok(code),
-            Err(error) => Err(error),
-        }
-    }
-    fn context(&self, plan: &control_cancel::Plan) -> Result<bulk_stop::Context, XhciError> {
-        let (state, dequeue) = self.xhci.endpoint_context_snapshot(
-            plan.slot,
-            plan.generation,
-            DCI_CONTROL_EP as u8,
-        )?;
-        Ok(bulk_stop::Context { state, dequeue })
-    }
-    fn commit(&self, plan: control_cancel::Plan) -> Result<(), XhciError> {
-        // Re-verify the claim, then purge EP0's queued events. The demux
-        // publication lock ordered every forced event before the command
-        // completions this follows; the quarantine held the rest.
-        self.xhci
-            .endpoint_context_snapshot(plan.slot, plan.generation, DCI_CONTROL_EP as u8)?;
-        self.xhci.transfer_events.lock().retain(|event| {
-            !(((event[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) == TRB_TYPE_TRANSFER_EVENT
-                && event[3] >> 24 == u32::from(plan.slot)
-                && (event[3] >> 16) & 0x1f == DCI_CONTROL_EP)
-        });
-        let mut devices = self.xhci.devices.lock();
-        let device = match devices
-            .get_mut(usize::from(plan.slot))
-            .and_then(Option::as_mut)
-        {
-            Some(device) if device.generation == plan.generation => device,
-            _ => return Err(XhciError::CmdFailed(0xfd)),
-        };
-        device.control.force_reset();
-        device.ctrl_enq = plan.enqueue;
-        device.ctrl_pcs = plan.cycle;
-        device.endpoint_configuration = false;
-        Ok(())
     }
 }
 
