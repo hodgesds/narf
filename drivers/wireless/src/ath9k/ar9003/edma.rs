@@ -354,6 +354,45 @@ pub(in crate::ath9k) struct RxStatus {
     pub key_miss: bool,
 }
 
+/// Sample the 48-byte receive status at the head of a receive buffer the
+/// device may be completing right now. `word(i)` reads little-endian
+/// status word `i`; `acquire` is the barrier that pairs with the device's
+/// `AR_RxDone` write.
+///
+/// The device writes the status while the host polls it, so a sample must
+/// never pair a set `AR_RxDone` with words of the cleared status the
+/// buffer was handed back with. Word 11 carries `AR_RxDone`: it is taken
+/// first and as ONE load; words 0..=10 are loaded only after it was seen
+/// set, when the whole status is in place. `Ok(None)` means "not
+/// completed": nothing else of the status was read. Linux
+/// `ath9k_hw_process_rxdesc_edma` tests `status11 & AR_RxDone` before it
+/// reads anything else.
+///
+/// Copying the status in ascending order loaded word 11 LAST, so a status
+/// posted during the copy showed the cleared buffer's zero `datalen` and
+/// `more` under a set `AR_RxDone`.
+pub(in crate::ath9k) fn sample_rx_status<E>(
+    mut word: impl FnMut(usize) -> Result<u32, E>,
+    acquire: impl FnOnce(),
+) -> Result<Option<[u8; RXS_BYTES]>, E> {
+    const DONE_WORD: usize = RXS_BYTES / 4 - 1;
+    let done = word(DONE_WORD)?;
+    if done & 1 == 0 {
+        return Ok(None);
+    }
+    acquire();
+    let mut status = [0u8; RXS_BYTES];
+    for index in 0..=DONE_WORD {
+        let value = if index == DONE_WORD {
+            done
+        } else {
+            word(index)?
+        };
+        status[4 * index..4 * index + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(Some(status))
+}
+
 /// `ath9k_hw_process_rxdesc_edma` over the first 48 bytes of a receive
 /// buffer (little-endian words): `Ok(None)` while `AR_RxDone` is clear or
 /// the descriptor is not a receive status (`-EINPROGRESS`), `Err` for a

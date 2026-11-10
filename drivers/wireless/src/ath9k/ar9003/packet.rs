@@ -677,13 +677,17 @@ impl<P: Port> Packet<P> {
             let buffer = &storage.rx[index];
             let step = port.access(true, || {
                 buffer.sync();
-                let head = buffer.bytes(0, RXS_BYTES)?;
+                // AR_RxDone first and alone; the status words and payload
+                // are snapshotted only once it is acquired, so the length
+                // and `more` below belong to the completed status.
+                let Some(head) =
+                    edma::sample_rx_status(|index| buffer.word(4 * index), || buffer.sync())?
+                else {
+                    return Ok(None);
+                };
                 let Some(status) = edma::process_rx(&head).map_err(|_| Error::Descriptor)? else {
                     return Ok(None);
                 };
-                // AR_RxDone acquired: snapshot the status words and payload.
-                buffer.sync();
-                let head = buffer.bytes(0, RXS_BYTES)?;
                 let length = usize::from(status.datalen);
                 if length > usize::from(RX_DATA) {
                     return Err(Error::Descriptor);
