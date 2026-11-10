@@ -51,7 +51,8 @@ multipath / fabrics (defer).
 - New `NvmeError` variants: `UnsupportedPageSize` (CAP.MPSMIN > 4 KiB, bring-up
   refused as Linux `nvme_enable_ctrl` does), `BadTransfer`,
   `ExceedsMaxTransfer`, `ControllerDead` (an I/O command timed out; later I/O
-  refused), `NamespaceUnusable`.
+  refused), `NamespaceUnusable`, `GateTimeout` (the controller's request gate
+  never came free; see the gate paragraph below).
 - `NvmeBlockSync` / `NvmeBlockDevice` split a request into commands of at
   most `min(max_transfer, 128 KiB scratch)` / `max_transfer` bytes, in units of
   the namespace's LBA size.
@@ -74,6 +75,25 @@ multipath / fabrics (defer).
   gate. IRQ/masked and non-stackful callers service pending TLB-shootdown
   and membarrier acknowledgements while waiting; they never re-enable IRQs
   or invoke framebuffer/device pumps from the gate wait.
+  **The gate wait is attributed and bounded.** Every acquisition records
+  the holder (CPU, scheduler task id) and the TSC time alongside the gate
+  — two relaxed atomic stores, nothing on release, nothing else on the
+  uncontended path. A waiter that has waited `GATE_STALL_WARN_MS` (2 s)
+  logs who holds the gate and for how long, the holder's last progress
+  mark, and who is waiting (CPU, task, interrupt state, and whether the
+  holder is on the waiter's own CPU), repeating every
+  `GATE_STALL_REPORT_EVERY_MS` (10 s). Once the holder has shown no
+  progress for `GATE_STALL_FAIL_MS` (60 s) of the waiter's wait, the
+  waiter logs an error and fails with `NvmeError::GateTimeout`: block I/O
+  returns `BlockIoError::DriverError` / `BlockError::IOError`,
+  `with_controller*` / `admin_passthrough*` return `None`, the AER
+  supervisor skips the round, `remove_controller` returns `Some(false)`
+  without touching the controller. It is an error, not a panic: a waiter
+  nested on its holder's stack (a wait loop that pumps the scheduler into
+  a task wanting the same controller) releases the holder by returning.
+  The reset + replay path marks progress after each reset, so a holder
+  working through a timeout is not mistaken for a stalled one.
+  `gate_stall_reports()` / `gate_timeouts()` count both events.
 - **Reset / recovery + hot-remove** (Linux `nvme_reset_work` / `remove`).
   `Controller::reset_recover(cap) -> Result<RecoveryReport, NvmeError>`:
   snapshot identity (IDENTIFY + namespace set), `disable_after_failure`,
