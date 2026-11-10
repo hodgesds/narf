@@ -3879,3 +3879,54 @@ kernel_test_in!(
     "drivers/nvidia/pci",
     smoke_nvidia_pci_probe_accepts_nvidia_device
 );
+
+// ── Single Nvidia PCI probe owner (crate-split step 1) ──────────
+
+fn smoke_nvidia_single_pci_probe_owner() -> TestResult {
+    // Step 1 of the Nvidia crate split: `drivers/nvidia` is the
+    // single PCI probe owner for Nvidia hardware. The
+    // `narf-drivers-gpu` copy's `nvidia-gpu-pci` registration is
+    // deleted, so no match whose probe is not this crate's
+    // `pci::probe` may carry an Nvidia name. This guards the
+    // probe race: both crates registered the same 13 PCI IDs, and
+    // the gpu copy's probe was the only claimant for its
+    // gpu-only 0x2820 — a card this crate does not register —
+    // so the less-complete driver owned that card outright.
+    //
+    // The fixture (re-)registers the crate's own matches first so
+    // it does not depend on initcall ordering in the harness:
+    // `register` is idempotent on (name, kind), so re-adding the
+    // crate's entries is a no-op when boot already ran them.
+    // A pre-fix tree still fails: the gpu copy's 13 overlapping
+    // entries share (name, kind) with this crate's and collapse
+    // onto them, but its gpu-only 0x2820 entry
+    // ("nvidia-ad104-4080m") has no counterpart here, so it
+    // survives the re-registration and trips the foreign-owner
+    // check below.
+    //
+    // Probe identity is compared with `core::ptr::fn_addr_eq`
+    // (not `==`): raw fn-pointer comparison is linted
+    // (`unpredictable_function_pointer_comparisons`) because
+    // fn addresses are not guaranteed unique across codegen units.
+    crate::pci::register_pci_driver();
+    let ours_probe: narf_bus::PciProbeFn = crate::pci::probe;
+    let regs = narf_bus::registered_pci_drivers();
+    let ours = regs
+        .iter()
+        .filter(|m| core::ptr::fn_addr_eq(m.probe, ours_probe))
+        .count();
+    if ours != crate::chip::KNOWN_DEVICES.len() + 1 {
+        return TestResult::Fail(
+            "crate's own Nvidia registrations are not KNOWN_DEVICES + class backstop",
+        );
+    }
+    for m in regs.iter() {
+        if (m.name.starts_with("nvidia-") || m.name == "nvidia-class")
+            && !core::ptr::fn_addr_eq(m.probe, ours_probe)
+        {
+            return TestResult::Fail("a second Nvidia PCI probe owner is registered");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/pci", smoke_nvidia_single_pci_probe_owner);

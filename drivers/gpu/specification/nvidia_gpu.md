@@ -9,6 +9,15 @@
 > The `open-gpu-kernel-modules` MIT-licensed portion is consulted
 > directly; GPL-2.0 files in that tree are explicitly excluded
 > (each consumed file's SPDX header is checked).
+>
+> **Probe ownership (crate-split step 1):** PCI probe
+> registration for NVIDIA hardware lives in
+> `narf-drivers-nvidia` (`drivers/nvidia/src/pci.rs`), which is
+> the single probe owner. This crate's `nvidia_gpu::probe` and
+> its ID table (§5) remain as codec / test coverage only — they
+> are not registered with the bus match table. The codec files'
+> fate (merge into the crate vs delete) is step 3, pending the
+> provenance call.
 
 ## 1. Coverage
 
