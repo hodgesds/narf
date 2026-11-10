@@ -163,7 +163,59 @@ pub fn set_command(
     unsafe {
         cfg_write16(cfg, COMMAND_OFFSET, new);
     }
+    if bits & cmd::BUS_MASTER != 0 {
+        enable_upstream_bridges(device);
+    }
     Ok(new)
+}
+
+/// The Command value a bridge needs to forward its secondary side's
+/// traffic, or `None` when it already does (or the bridge is gone).
+///
+/// A type-1 function with Bus Master Enable clear handles memory requests
+/// arriving on its secondary side as Unsupported Requests, which silently
+/// drops the downstream device's DMA writes and MSI/MSI-X messages while
+/// its register accesses keep working.
+pub const fn bridge_forwarding_command(command: u16) -> Option<u16> {
+    let wanted = command | cmd::MEM_SPACE | cmd::BUS_MASTER;
+    if command == u16::MAX || wanted == command {
+        None
+    } else {
+        Some(wanted)
+    }
+}
+
+/// Serializes Command updates on bridges, which several downstream
+/// drivers share and none of them owns.
+static BRIDGE_COMMAND: narf_lib::sync::IrqSafeSpinLock<()> =
+    narf_lib::sync::IrqSafeSpinLock::new(());
+
+/// Linux `pci_enable_bridge`: before a function may master the bus, every
+/// bridge between it and the root must decode memory and forward upstream
+/// requests. Firmware is not required to leave that enabled on ports it
+/// did not boot from. Returns how many bridges had to be changed.
+pub fn enable_upstream_bridges(device: &BusDevice) -> usize {
+    let mut changed = 0;
+    let mut current = *device;
+    // A segment has at most 256 buses, which bounds any acyclic chain.
+    for _ in 0..256 {
+        let Some(bridge) = upstream_bridge(&current) else {
+            break;
+        };
+        if let Ok(cfg) = pcie_cfg_phys(&bridge) {
+            let _guard = BRIDGE_COMMAND.lock();
+            // SAFETY: the Command register is inside the bridge's registered
+            // config window; the lock excludes other bridge Command writers.
+            unsafe {
+                if let Some(command) = bridge_forwarding_command(cfg_read16(cfg, COMMAND_OFFSET)) {
+                    cfg_write16(cfg, COMMAND_OFFSET, command);
+                    changed += 1;
+                }
+            }
+        }
+        current = bridge;
+    }
+    changed
 }
 
 /// Mask `bits` out of the device's Command register, leaving every

@@ -176,6 +176,12 @@ pub unsafe fn program_msi(
         .ok_or(MsiError::Unsupported)?;
         crate::vmd_irq::remap_message(entry)
     } else {
+        // Without interrupt remapping an xAPIC MSI address carries an
+        // 8-bit destination; a wider APIC ID would alias another CPU.
+        #[cfg(target_arch = "x86_64")]
+        if target_apic_id > 0xFF {
+            return Err(MsiError::Unsupported);
+        }
         msi_message(target_apic_id, base_irq)
     };
 

@@ -642,6 +642,114 @@ fn smoke_pci_command_bme_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus", smoke_pci_command_bme_round_trip);
 
+fn smoke_pci_bridge_forwarding_command() -> TestResult {
+    // Physical I225 regression: firmware left Bus Master Enable clear on
+    // the switch port above the NIC, so descriptor writeback, RX payload
+    // and MSI-X messages were dropped while MMIO kept working.
+    use crate::pci::{bridge_forwarding_command, cmd};
+    let forwarding = cmd::MEM_SPACE | cmd::BUS_MASTER;
+    if bridge_forwarding_command(cmd::IO_SPACE | cmd::MEM_SPACE) != Some(cmd::IO_SPACE | forwarding)
+    {
+        return TestResult::Fail("bridge without BME was not enabled");
+    }
+    if bridge_forwarding_command(cmd::INTX_DISABLE) != Some(cmd::INTX_DISABLE | forwarding) {
+        return TestResult::Fail("unrelated Command bits were not preserved");
+    }
+    if bridge_forwarding_command(cmd::IO_SPACE | forwarding).is_some() {
+        return TestResult::Fail("forwarding bridge was rewritten");
+    }
+    if bridge_forwarding_command(u16::MAX).is_some() {
+        return TestResult::Fail("absent bridge was written");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_pci_bridge_forwarding_command);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_bus_master_enables_upstream_bridge() -> TestResult {
+    // Granting an endpoint Bus Master must also make its parent bridge
+    // forward upstream requests (Linux pci_enable_bridge). Only an idle
+    // bus is disturbed: every function behind the bridge has BME clear.
+    use crate::pci::{bridge_bus_range, clear_command, cmd, read_command, set_command};
+    use crate::pci::{enable_upstream_bridges, upstream_bridge};
+    use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: ECAM identity-mapped; init idempotent.
+    let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
+
+    let authority = bootstrap_registry_authority();
+    let devs = devices();
+    for dev in devs.iter().copied() {
+        let BusKind::Pcie { addr, .. } = dev.kind else {
+            continue;
+        };
+        if bridge_bus_range(&dev).is_some() {
+            continue;
+        }
+        let Some(bridge) = upstream_bridge(&dev) else {
+            continue;
+        };
+        if bridge_bus_range(&bridge).is_none_or(|(sec, sub)| sec != sub) {
+            continue;
+        }
+        let mut idle = true;
+        let mut caps = alloc::vec::Vec::new();
+        for other in devs.iter().copied() {
+            let on_bus = matches!(other.kind, BusKind::Pcie { addr: a, .. }
+                if a.segment == addr.segment && a.bus == addr.bus);
+            if !on_bus {
+                continue;
+            }
+            match claim_device_cap(&authority, other.addr) {
+                Ok((_h, cap)) => {
+                    if read_command(&cap, &other).is_ok_and(|c| c & cmd::BUS_MASTER == 0) {
+                        caps.push((other, cap));
+                    } else {
+                        idle = false;
+                    }
+                }
+                Err(_) => idle = false,
+            }
+        }
+        if !idle {
+            continue;
+        }
+        let Some((_, cap)) = caps.iter().find(|(d, _)| d.addr == dev.addr) else {
+            continue;
+        };
+        let Ok((_bh, bridge_cap)) = claim_device_cap(&authority, bridge.addr) else {
+            continue;
+        };
+        let Ok(original) = read_command(&bridge_cap, &bridge) else {
+            continue;
+        };
+        if clear_command(&bridge_cap, &bridge, cmd::BUS_MASTER).is_err() {
+            return TestResult::Fail("could not park the bridge");
+        }
+        let granted = set_command(cap, &dev, cmd::BUS_MASTER);
+        let after = read_command(&bridge_cap, &bridge);
+        let again = enable_upstream_bridges(&dev);
+        let _ = clear_command(cap, &dev, cmd::BUS_MASTER);
+        if original & cmd::BUS_MASTER == 0 {
+            let _ = clear_command(&bridge_cap, &bridge, cmd::BUS_MASTER);
+        }
+        if granted.is_err() {
+            return TestResult::Fail("set_command(BUS_MASTER) failed");
+        }
+        let forwarding = cmd::MEM_SPACE | cmd::BUS_MASTER;
+        if !after.is_ok_and(|c| c & forwarding == forwarding) {
+            return TestResult::Fail("upstream bridge still blocks bus mastering");
+        }
+        if again != 0 {
+            return TestResult::Fail("already-forwarding bridge was rewritten");
+        }
+        return TestResult::Pass;
+    }
+    TestResult::Skip("no idle endpoint behind a PCI bridge")
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus", smoke_pci_bus_master_enables_upstream_bridge);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pci_match_specificity() -> TestResult {
     // Specificity rules: VendorDevice > Class > Vendor.
@@ -1480,6 +1588,9 @@ fn smoke_msix_program_block() -> TestResult {
 
     for i in 0..4 {
         let _ = vector::free(base + i);
+    }
+    if table.table_mapped() {
+        return TestResult::Fail("table BAR resolved before any programming");
     }
     TestResult::Pass
 }
