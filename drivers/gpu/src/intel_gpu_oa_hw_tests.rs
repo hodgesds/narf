@@ -204,6 +204,10 @@ fn smoke_oa_per_context_job_executes_on_bound_queue_and_saves_state() -> TestRes
     .unwrap();
     let mut gt = GuCGt::from_staged_hardware(boot).unwrap();
     hardware_discovery(&mut gt, &io, 0xdfc);
+    // Reserve the OA unit before scheduling: `oa_device` returns None
+    // without it (see `GuCGt::oa_device`, `parts.oa`), which panicked at
+    // `:220` on the first runs that reached this test.
+    gt.prepare_oa().unwrap();
     hardware_scheduling(&mut gt, &io);
     let completion = gt.begin_context_defaults(26).unwrap();
     let mut registered = BTreeMap::new();
