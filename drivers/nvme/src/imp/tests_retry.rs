@@ -299,3 +299,115 @@ kernel_test_in!(
     "drivers/nvme/retry",
     smoke_nvme_late_completion_is_polled_qemu
 );
+
+/// The cap-addressed submit path (`nvme_submit_blocking`) hands the device
+/// the caller's own DMA buffer. When its request fails with a timeout the
+/// controller has been reset at the timeout site — confirmed disabled, so
+/// nothing can still write the buffer — and the buffer is returned to the
+/// caller as usual: not retained, its reference count unchanged.
+fn smoke_nvme_timed_out_buffer_released_after_confirmed_reset_qemu() -> TestResult {
+    use narf_block::{BlockError, BlockOp, BlockRequest, QosHint};
+    use narf_io::{alloc_coherent, register_with_cap, resolve_cap};
+    use narf_lib::id::DomainId;
+    with_fault_fixture(|_d, hooks| {
+        let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "alloc_coherent failed")?;
+        let write_cap = register_with_cap(buf);
+        let cap = write_cap
+            .derive::<narf_capabilities::Read>()
+            .map_err(|_| "derive Read from live write cap failed")?;
+        let req = BlockRequest {
+            op: BlockOp::Read,
+            lba: SCRATCH_LBA,
+            blocks: 1,
+            buffer: cap,
+            qos: QosHint::Latency,
+            user_tag: 0,
+        };
+        let buffer = resolve_cap(&req.buffer).ok_or("cap did not resolve to its buffer")?;
+        let refs0 = Arc::strong_count(&buffer);
+        let retained0 = super::retained_io_buffers();
+        let replays0 = super::io_replays();
+
+        hooks.lose(u32::MAX);
+        let r = super::nvme_submit_blocking(&req, Some(buffer.clone()));
+        hooks.lose(0);
+        if r != Err(BlockError::IOError) {
+            return Err("a submit that keeps timing out did not return the I/O error");
+        }
+        if super::io_replays() != replays0 + IO_MAX_RETRIES as u64 {
+            return Err("the cap-addressed submit was not replayed IO_MAX_RETRIES times");
+        }
+        // Reset at the timeout site: alive again, hence confirmed stopped
+        // in between.
+        if super::with_controller_at(0, |c| c.is_dead() || c.may_still_dma()) != Some(false) {
+            return Err("the controller was not reset before the request returned");
+        }
+        if super::retained_io_buffers() != retained0 || Arc::strong_count(&buffer) != refs0 {
+            return Err("the buffer was retained although the controller was confirmed disabled");
+        }
+        // And the same request works once the device answers.
+        if super::nvme_submit_blocking(&req, Some(buffer.clone())).is_err() {
+            return Err("the request did not succeed once the device answered");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/nvme/retry",
+    smoke_nvme_timed_out_buffer_released_after_confirmed_reset_qemu
+);
+
+/// The other half: when the controller could NOT be shown disabled after
+/// the timeout it may still write the buffer, so one reference is leaked
+/// and the memory can never be recycled under that write — whether the
+/// controller is merely dead-and-unstopped, or its gate cannot even be
+/// taken to find out. A controller that is alive again, or dead but
+/// confirmed stopped, retains nothing. Device-less slots: only the
+/// decision is under test.
+fn smoke_nvme_timed_out_buffer_retained_while_device_live() -> TestResult {
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    let Ok(buf) = alloc_coherent(4096, DomainId::DRIVER_0) else {
+        return TestResult::Fail("alloc_coherent failed");
+    };
+    let buffer = Arc::new(buf);
+    let slot_with = |dead: bool, stop_confirmed: bool| {
+        let mut c = super::Controller::new(0);
+        c.dead = dead;
+        c.stop_confirmed = stop_confirmed;
+        super::leak_slot(u32::MAX, None, c)
+    };
+    let retained0 = super::retained_io_buffers();
+
+    // Alive again (it was reset), and dead-but-confirmed-stopped: quiet.
+    super::retain_buffer_while_device_live(slot_with(false, false), &buffer);
+    super::retain_buffer_while_device_live(slot_with(true, true), &buffer);
+    if Arc::strong_count(&buffer) != 1 || super::retained_io_buffers() != retained0 {
+        return TestResult::Fail("a buffer was retained for a controller that cannot DMA");
+    }
+
+    // Dead and never confirmed stopped: the device may still write it.
+    super::retain_buffer_while_device_live(slot_with(true, false), &buffer);
+    if Arc::strong_count(&buffer) != 2 || super::retained_io_buffers() != retained0 + 1 {
+        return TestResult::Fail("the buffer of a possibly-live command was not retained");
+    }
+
+    // The gate cannot be taken: nothing is known, so fail closed.
+    let stuck = slot_with(false, false);
+    stuck.req_gate.store(true, Ordering::Release);
+    super::GATE_STALL_WARN_MS_FOR_TEST.store(10, Ordering::Release);
+    super::GATE_STALL_FAIL_MS_FOR_TEST.store(30, Ordering::Release);
+    super::retain_buffer_while_device_live(stuck, &buffer);
+    super::GATE_STALL_WARN_MS_FOR_TEST.store(0, Ordering::Release);
+    super::GATE_STALL_FAIL_MS_FOR_TEST.store(0, Ordering::Release);
+    if Arc::strong_count(&buffer) != 3 || super::retained_io_buffers() != retained0 + 2 {
+        return TestResult::Fail("the buffer was not retained when the controller was unreachable");
+    }
+    // The two leaked references are the point of the test; the page stays
+    // allocated for the rest of the boot.
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/retry",
+    smoke_nvme_timed_out_buffer_retained_while_device_live
+);
