@@ -200,6 +200,15 @@ when their reservation does not fit (Linux
 `btrfs_start_transaction_fallback_global_rsv`, `evict_refill_and_join`), so a
 full filesystem can still be emptied; the batch then commits at once.
 
+`fsync` and `fdatasync`, on a file or a directory, both commit the open
+transaction and write its superblock (`sync_to_disk_exclusive`). `fdatasync`
+is not weaker: the size and extent items a write's data is read back through
+live in the open batch until it commits, so a device flush alone makes
+nothing of that write durable (`smoke_btrfs_fdatasync_survives_a_later_crash`;
+Linux `btrfs_sync_file` ignores `datasync` too). Neither goes through a tree
+log: the driver replays a log at mount and can write one (`write_log`), but
+`fsync` does not use it.
+
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.
 Device ownership remains pinned by the returned filesystem instance.

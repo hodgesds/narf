@@ -813,6 +813,22 @@ kernel_test_in!(
 /// red the moment that happens instead of a user discovering it after a power
 /// cut.
 fn smoke_btrfs_fsync_survives_a_later_crash() -> TestResult {
+    sync_survives_a_later_crash(false)
+}
+
+/// The same promise for `fdatasync`: it may leave timestamps behind, never
+/// the size and extents the data is read back through. A device flush alone
+/// kept neither — the write sat in the open batch, and the crash below took
+/// it.
+fn smoke_btrfs_fdatasync_survives_a_later_crash() -> TestResult {
+    sync_survives_a_later_crash(true)
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_fdatasync_survives_a_later_crash
+);
+
+fn sync_survives_a_later_crash(data_only: bool) -> TestResult {
     use narf_filesystem::FsInstance;
     let vol = match mount_sparse(FIXTURE_SPARSE) {
         Ok(v) => v,
@@ -834,7 +850,7 @@ fn smoke_btrfs_fsync_survives_a_later_crash() -> TestResult {
         _ => return TestResult::Fail("the write to be fsynced failed"),
     }
     // The promise under test.
-    match poll_once(durable.fsync(false)) {
+    match poll_once(durable.fsync(data_only)) {
         Some(Ok(())) => {}
         _ => return TestResult::Fail("fsync did not report success"),
     }
