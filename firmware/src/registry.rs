@@ -17,6 +17,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_capabilities::{Cap, Read};
 use narf_io::{alloc_coherent, DmaBuffer};
@@ -75,6 +76,12 @@ static INITRAMFS: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new())
 static ROOTFS: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 static HOT_INSTALL: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 
+// A rejected explicit wireless policy must not look absent to the Linux
+// world-domain fallback. Only a later verified signed installation clears
+// this latch; admitting an unsigned development blob cannot clear it.
+const REGULATORY_POLICY: &str = "wireless-regulatory.bin";
+static REGULATORY_POLICY_REJECTED: AtomicBool = AtomicBool::new(false);
+
 /// Cap-binding routing table. Indexed by cap sequence number;
 /// kept in priority order matching the source tiers above. A
 /// `Cap<FirmwareBlob, Read>::view()` looks up its sequence here
@@ -104,7 +111,11 @@ fn lookup(name: &str) -> Option<CapBinding> {
 /// Mint a fresh `Cap<FirmwareBlob, Read>` for the named blob. The
 /// caller has already validated the registry-authority cap.
 pub(crate) fn open_blob(name: &str) -> Result<Cap<FirmwareBlob, Read>, FirmwareError> {
-    let mut binding = lookup(name).ok_or(FirmwareError::NotFound)?;
+    let binding = lookup(name);
+    if name == REGULATORY_POLICY && REGULATORY_POLICY_REJECTED.load(Ordering::Acquire) {
+        return Err(FirmwareError::SignatureInvalid);
+    }
+    let mut binding = binding.ok_or(FirmwareError::NotFound)?;
     // The cap minted via `Cap::bootstrap()` and routed through the
     // standard cap object table; the registry-side binding stays
     // alive in the BINDINGS vec until the cap is revoked.
@@ -169,8 +180,19 @@ pub(crate) fn install_blob(
     source: BlobSource,
 ) -> Result<(), FirmwareError> {
     // 1. Decode + verify the trailer.
-    let trailer = signature::decode(bytes)?;
-    signature::verify(&trailer)?;
+    let validated = signature::decode(bytes).and_then(|trailer| {
+        signature::verify(&trailer)?;
+        Ok(trailer)
+    });
+    let trailer = match validated {
+        Ok(trailer) => trailer,
+        Err(error) => {
+            if name == REGULATORY_POLICY {
+                REGULATORY_POLICY_REJECTED.store(true, Ordering::Release);
+            }
+            return Err(error);
+        }
+    };
 
     // 2. Allocate a DMA-coherent page rounded up to 4 KiB
     //    boundaries. Use the firmware-domain by convention; today
@@ -217,6 +239,9 @@ pub(crate) fn install_blob(
     let mut g = tier.lock();
     g.retain(|e| e.name != name);
     g.push(entry);
+    if name == REGULATORY_POLICY && signer.is_some() {
+        REGULATORY_POLICY_REJECTED.store(false, Ordering::Release);
+    }
     Ok(())
 }
 
@@ -272,4 +297,5 @@ pub fn __reset_for_test() {
     ROOTFS.lock().clear();
     HOT_INSTALL.lock().clear();
     BINDINGS.lock().clear();
+    REGULATORY_POLICY_REJECTED.store(false, Ordering::Release);
 }

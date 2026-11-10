@@ -554,6 +554,70 @@ the wrapped payloads and embed the authorized public keys as described in the
 [firmware specification](../firmware/specification/spec.md). Never treat a
 blob's presence in CachyOS as proof that the matching NARF driver is complete.
 
+#### Linux wireless regulatory database
+
+NARF includes the standard upstream `wireless-regdb` database and verifies
+its `regulatory.db.p7s` signature during the build against the public
+certificates shipped by Linux. Install the OpenSSL CLI on the build host.
+No private key, separate NARF policy signing setup or extra initramfs
+firmware selection is needed for the default database.
+
+Boot starts with the database's world (`00`) rules. `iw reg get` reports the
+active shared policy. A privileged `iw reg set CC` selects an actual country
+from the authenticated database; use the country where the device operates.
+The driver still applies its hardware, calibration, power and channel limits.
+Policy changes may require a driver restart under its existing safety rules.
+Unsupported rule features are conservatively excluded or rejected; this
+does not establish complete Linux radio compatibility.
+
+To use an updated upstream-signed database from the installed Linux package,
+set the directory when building:
+
+```sh
+NARF_WIRELESS_REGDB=/usr/lib/firmware \
+  cargo xtask image --arch=x86_64
+```
+
+Keep the device's required vendor-firmware selections. The directory must
+contain both `regulatory.db` and `regulatory.db.p7s`; a missing or invalid
+signature fails the build. Trust comes from the fixed upstream public
+certificates, never a certificate supplied inside the signature. Rebuild
+to incorporate database updates; runtime loading of replacement Linux
+databases is not implemented. See [asset provenance and update rules](../firmware/regdb/README.md).
+
+An explicit signed deployment policy can still override the Linux default.
+Its country and channel/power rules use [NRGD format](../wireless/specification/spec.md#35-deployment-regulatory-policy),
+with a detached Ed25519 signature over `BLAKE3(payload)` (64 raw bytes) and
+a raw 32-byte public key. Package that policy using:
+
+```sh
+cargo xtask pack-firmware \
+  --name wireless-regulatory.bin \
+  --payload /absolute/path/deployment/policy.nrgd \
+  --signature /absolute/path/deployment/policy.sig \
+  --public-key /absolute/path/deployment/signer.pub
+```
+
+For this optional override, the kernel must also trust that public key. Set
+`NARF_FIRMWARE_TRUSTED_KEYS` to an absolute path to a text file containing
+one 64-digit hexadecimal Ed25519 public key per line; this is separate from
+the raw public-key file used by `pack-firmware`. An unconfigured build trusts
+no firmware signers. Include the policy in the early firmware selection:
+
+```sh
+NARF_FIRMWARE_TRUSTED_KEYS=/absolute/path/deployment/trusted-keys.txt \
+  cargo xtask image --arch=x86_64 \
+  --initramfs-firmware wireless-regulatory.bin
+```
+
+Signing is external to the image builder; it does not need the private key.
+The unsigned vendor-firmware allowance does not permit an unsigned deployment
+override. A rejected explicit policy prevents boot fallback to the world
+domain; a country hint cannot relax an active deployment override. Runtime
+policy staging does not revoke an already active snapshot: its trusted owner
+must clear or replace the shared installation under the driver's existing
+policy-change rules.
+
 #### QCNFA765 / WCN6855 (`17cb:1103`) first radio pass
 
 The Qualcomm QCNFA765 enumerates as a WCN6855 HW2.1 PCI function. Import only

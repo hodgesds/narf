@@ -1853,6 +1853,7 @@ pub(crate) const OPERATIONS: &[GenlOperation] = &[
     op(62, DO, OPEN),        // GET_POWER_SAVE
     op(79, DO, UNS),         // SET_REKEY_OFFLOAD
     op(31, DO | DUMP, OPEN), // GET_REG
+    op(27, DO, ADMIN),       // REQ_SET_REG: global regulatory policy
 ];
 /// `nl80211_mcgrps`, in Linux's order. None carries `GENL_MCAST_CAP_*`, so
 /// `genl_bind` lets any socket join any of them. NARF publishes on config,

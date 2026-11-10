@@ -1177,6 +1177,19 @@ fn route(
     if command == station::GET_REG {
         return station::get_reg(bytes, dump, context.net_ns_id);
     }
+    if command == 27 {
+        request_regulatory_country(bytes, &context, crate::reg::db::select_linux_country)?;
+        let domain = station::global_regdom()?;
+        let mut attrs = Vec::new();
+        let mut alpha2 = domain.alpha2.to_vec();
+        alpha2.push(0);
+        push_attr(&mut attrs, 33, &alpha2);
+        // NL80211_REGDOM_SET_BY_USER, NL80211_REGDOM_TYPE_COUNTRY.
+        push_attr(&mut attrs, 48, &[1]);
+        push_attr(&mut attrs, 49, &[u8::from(domain.alpha2 == *b"00")]);
+        publish_event(NL80211_FAMILY_ID, 20, 0, GenlReply { command: 36, attrs });
+        return Ok(Vec::new());
+    }
     if matches!(
         command,
         START_AP
@@ -1278,6 +1291,39 @@ fn route(
         execute(iface, admin, namespace, index, operation).await;
     });
     Ok(Vec::new()) // generic netlink emits the requested ACK
+}
+
+/// A country hint selects authenticated database data; it cannot supply rules,
+/// installation facts or an interface delegation in place of global authority.
+fn request_regulatory_country(
+    bytes: &[u8],
+    context: &RequestContext<'_>,
+    select: impl FnOnce([u8; 2]) -> Result<(), crate::reg::policy::Error>,
+) -> Result<(), i32> {
+    if !context.init_net_admin || context.net_ns_id != 0 {
+        return Err(EPERM);
+    }
+    let attrs = attributes(bytes)?;
+    if attrs.iter().any(|(kind, _)| !matches!(kind, 33 | 154)) {
+        return Err(EINVAL);
+    }
+    if u32_attr(&attrs, 154)?.unwrap_or(0) != 0 {
+        // Cellular/indoor hints have additional authority and lifetime
+        // semantics and are not implemented by this country selector.
+        return Err(EOPNOTSUPP);
+    }
+    let country = attr(&attrs, 33).ok_or(EINVAL)?;
+    if !matches!(country.len(), 2 | 3) || country.len() == 3 && country[2] != 0 {
+        return Err(EINVAL);
+    }
+    let alpha2 = [country[0], country[1]];
+    if !crate::reg::linux::valid_alpha2(alpha2) {
+        return Err(EINVAL);
+    }
+    select(alpha2).map_err(|error| match error {
+        crate::reg::policy::Error::Authority => EPERM,
+        _ => EINVAL,
+    })
 }
 
 /// `NL80211_CMD_SET_SAR_SPECS` → `set_sar_specs`. The wiphy advertises its
