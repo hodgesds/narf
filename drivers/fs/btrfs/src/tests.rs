@@ -14050,7 +14050,7 @@ fn smoke_btrfs_setattr_model() -> TestResult {
         return TestResult::Fail("chmod failed");
     }
     let after_chmod = raw(&vol);
-    if mode(&after_chmod) != 0o100000 | 0o6755 || f.stat().mode.perms != 0o755 {
+    if mode(&after_chmod) != 0o100000 | 0o6755 || f.stat().mode.perms != 0o6755 {
         return TestResult::Fail("chmod did not set exactly the permission bits");
     }
     if seq(&after_chmod) <= seq(&before) {
@@ -14125,7 +14125,7 @@ fn smoke_btrfs_setattr_model() -> TestResult {
     let _ = d;
     if !matches!(poll_once(dnode.set_perms(0o2775)), Some(Ok(())))
         || !matches!(poll_once(dnode.set_owners(5, 5)), Some(Ok(())))
-        || dnode.stat().mode.perms & 0o7777 != 0o775
+        || dnode.stat().mode.perms != 0o2775
     {
         return TestResult::Fail("directory chmod/chown failed");
     }
@@ -14133,3 +14133,69 @@ fn smoke_btrfs_setattr_model() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_setattr_model);
+
+/// A root-owned sudo-like inode must expose setuid through both legacy stat
+/// and statx, including a fresh mount of metadata written by another instance.
+fn smoke_btrfs_special_modes_survive_stat_and_remount() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("fixture did not mount"),
+    };
+    let file = match poll_once(vol.root().create("sudo-like")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let dir = match poll_once(vol.root().mkdir("special-dir")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    if !matches!(poll_once(file.set_owners(0, 0)), Some(Ok(())))
+        || !matches!(poll_once(file.set_perms(0o4755)), Some(Ok(())))
+        || !matches!(poll_once(dir.set_dir_mode_async(0o3775)), Some(Ok(())))
+        || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+    {
+        return TestResult::Fail("special modes could not be persisted");
+    }
+    for read_only in [false, true] {
+        let fresh = if read_only {
+            mount_writable_ro(dev.clone())
+        } else {
+            mount_writable(dev.clone())
+        };
+        let fresh = match fresh {
+            Ok(fresh) => fresh,
+            Err(_) => return TestResult::Fail("remount failed"),
+        };
+        let root = fresh.root();
+        let file = match poll_once(root.lookup_async("sudo-like")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("sudo-like lookup failed"),
+        };
+        if file.owners() != (0, 0)
+            || file.stat().mode.perms != 0o4755
+            || !matches!(poll_once(file.stat_async()), Some(Ok(stat)) if stat.mode.perms == 0o4755)
+            || !matches!(poll_once(file.statx_async(0, 0x7ff)), Some(Ok(stat))
+                if stat.uid == 0 && stat.gid == 0 && stat.mode == 0o104755)
+        {
+            return TestResult::Fail("stat stripped setuid or disagreed with statx/ownership");
+        }
+        let dir = match poll_once(root.lookup_dir_async("special-dir")) {
+            Some(Ok(dir)) => dir,
+            _ => return TestResult::Fail("special directory lookup failed"),
+        };
+        let dir_file = match poll_once(root.lookup_async("special-dir")) {
+            Some(Ok(dir)) => dir,
+            _ => return TestResult::Fail("directory file view lookup failed"),
+        };
+        if dir.dir_mode() != 0o3775 || dir_file.stat().mode.perms != 0o3775 {
+            return TestResult::Fail("directory views lost setgid or sticky bits");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/special_mode",
+    smoke_btrfs_special_modes_survive_stat_and_remount
+);

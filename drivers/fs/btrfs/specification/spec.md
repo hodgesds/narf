@@ -21,6 +21,10 @@ Directory ownership and mode updates through `DirOps` use the same persistent
 inode update path as `FileOps`. In particular, the ownership and mode assigned
 by `mkdir(2)` are visible through both views and survive remounting; directory
 setters propagate write errors instead of silently accepting an update.
+`FileOps::stat`/`stat_async`, `statx_async` and `DirOps::dir_mode` preserve
+all twelve inode permission bits (`0o7777`), including setuid, setgid and
+sticky bits. Ownership is reported independently. Exec and namespace policy
+still decide whether those bits confer privilege or restrict mutations.
 
 Write safety (`rw_gate`):
 

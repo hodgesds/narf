@@ -517,7 +517,7 @@ async fn run_files(
     a.set_owners(uid, gid).await.map_err(|_| "chown")?;
     a.set_times(Some(atime), Some(mtime))
         .map_err(|_| "utimensat")?;
-    if a.owners() != (uid, gid) || u32::from(a.stat().mode.perms) != mode & 0o777 {
+    if a.owners() != (uid, gid) || u32::from(a.stat().mode.perms) != mode & 0o7777 {
         return Err("chmod/chown not visible through stat");
     }
     // systemd-shutdown: remount / read-only; nothing may write; then rw.
