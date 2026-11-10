@@ -539,11 +539,11 @@ kernel_test_in!("drivers/nvme/multi", smoke_nvme_namespace_scan_decode);
 /// LBA window the QEMU smokes scribble on (then restore): past both images'
 /// partition tables (the GPT entries end at LBA 33) and inside the first
 /// 64 KiB that btrfs leaves unused on nvme0's fixture.
-const SCRATCH_LBA: u64 = 40;
+pub(super) const SCRATCH_LBA: u64 = 40;
 /// 40 × 512 B = 20 KiB: a PRP-list transfer (more than two pages).
-const SCRATCH_BLOCKS: u16 = 40;
+pub(super) const SCRATCH_BLOCKS: u16 = 40;
 
-fn pattern(seed: u8) -> Vec<u8> {
+pub(super) fn pattern(seed: u8) -> Vec<u8> {
     (0..SCRATCH_BLOCKS as usize * 512)
         .map(|i| (i as u8).wrapping_mul(31) ^ seed)
         .collect()
@@ -553,7 +553,7 @@ fn pattern(seed: u8) -> Vec<u8> {
 /// it in place. Other smokes in this crate reset the first QEMU controller
 /// from stack-local `Controller`s (orphaning the probed queues); this gives
 /// the multi-controller smokes a live controller regardless of order.
-fn reinstall(instance: u32) -> Result<(), &'static str> {
+pub(super) fn reinstall(instance: u32) -> Result<(), &'static str> {
     use narf_bus::{bootstrap_registry_authority, claim_device_cap};
     let Some(Some(dev)) = super::with_controller_at(instance, |c| c.bus_device()) else {
         return Err("installed controller has no bus device");

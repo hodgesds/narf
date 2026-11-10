@@ -38,10 +38,11 @@ mod tests_dsm;
 mod tests_flush;
 mod tests_gate;
 mod tests_multi;
+mod tests_retry;
 
 use core::cell::UnsafeCell;
 use core::future::Future;
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use narf_block::{
@@ -737,6 +738,10 @@ impl Queue {
         let opcode = (sqe.cdw0 & 0xFF) as u8;
         let started = narf_time::now_cycles();
         let fires_at_submit = vector.map(narf_interrupts::fire_count);
+        // Test-only fault injection, I/O queues only (see
+        // [`IO_LOSE_FOR_TEST`] / [`IO_LATE_FOR_TEST`]).
+        let lose = self.qid != 0 && take_test_fault(&IO_LOSE_FOR_TEST);
+        let late = self.qid != 0 && take_test_fault(&IO_LATE_FOR_TEST);
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         // Preserve opcode (low 8 bits) + FUSE/PSDT (bits 8..15) and
@@ -748,9 +753,11 @@ impl Queue {
             write_sqe(&self.sq_buf, self.sq_tail, &sqe);
         }
         self.sq_tail = (self.sq_tail + 1) % self.depth;
-        // SAFETY: identity-mapped MMIO doorbell.
-        unsafe {
-            bar0.write32(self.sq_db_off(), self.sq_tail as u32);
+        if !lose {
+            // SAFETY: identity-mapped MMIO doorbell.
+            unsafe {
+                bar0.write32(self.sq_db_off(), self.sq_tail as u32);
+            }
         }
 
         // Wait for OUR completion, not just the next one: once AERs
@@ -768,33 +775,26 @@ impl Queue {
         // a later command's completion either. A dropped stray is
         // counted and reported ([`note_stray_cqe`]); a timeout is
         // reported where it is declared ([`log_cmd_timeout`]).
+        //
+        // The command is declared lost only after one last look at the
+        // CQ once the budget is spent (Linux `nvme_timeout` →
+        // `nvme_poll_irqdisable`, "timeout, completion polled"): the
+        // budget can run out right after a stray was consumed, with
+        // our completion sitting in the next slot. That last look
+        // never blocks and examines at most `depth` entries.
         let deadline = narf_time::Deadline::after_ms(timeout_ms);
+        if late {
+            // Injected late completion: ignore the CQ for the whole
+            // budget, so only the last look can find the entry.
+            let _ = narf_scheduler::responsive_spin_until(|| false, deadline);
+        }
+        let mut last_look = self.depth;
         loop {
-            if deadline.expired() {
-                log_cmd_timeout(
-                    bar0,
-                    self,
-                    opcode,
-                    cid,
-                    vector,
-                    fires_at_submit,
-                    Some(started),
-                );
-                return Err(NvmeError::CompletionTimeout);
-            }
-            let remaining_ms = narf_time::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000;
-            // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
-            let waited = unsafe {
-                wait_cqe_ms(
-                    &self.cq_buf,
-                    self.cq_head,
-                    self.cq_phase,
-                    remaining_ms.max(1),
-                )
-            };
-            let cqe = match waited {
-                Ok(cqe) => cqe,
-                Err(e) => {
+            let expired = deadline.expired();
+            let cqe = if expired {
+                // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
+                let cqe = unsafe { peek_cqe(&self.cq_buf, self.cq_head) };
+                if last_look == 0 || (cqe.status & 1) != (self.cq_phase & 1) {
                     log_cmd_timeout(
                         bar0,
                         self,
@@ -804,13 +804,35 @@ impl Queue {
                         fires_at_submit,
                         Some(started),
                     );
-                    return Err(e);
+                    return Err(NvmeError::CompletionTimeout);
+                }
+                last_look -= 1;
+                cqe
+            } else {
+                let remaining_ms = narf_time::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000;
+                // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
+                let waited = unsafe {
+                    wait_cqe_ms(
+                        &self.cq_buf,
+                        self.cq_head,
+                        self.cq_phase,
+                        remaining_ms.max(1),
+                    )
+                };
+                match waited {
+                    Ok(cqe) => cqe,
+                    // The slice ran out with nothing fresh at the head;
+                    // loop for the last look once the deadline has passed.
+                    Err(_) => continue,
                 }
             };
 
             let (head, phase) = (self.cq_head, self.cq_phase);
             self.advance_head(bar0);
             if cqe.is_for(cid) {
+                if expired {
+                    note_late_completion(bar0.phys.raw(), self.qid, opcode, cid, started);
+                }
                 return Ok(cqe);
             }
             if self.qid == 0 && self.untrack_aer_cid(cqe.cid) {
@@ -1063,8 +1085,10 @@ impl Controller {
     /// is on non-volatile media (NVM Command Set 1.0c §3.2.2). Linux
     /// `nvme_setup_flush`. Without a volatile write cache every completed
     /// write is already durable and no command is sent (Linux only turns on
-    /// `REQ_PREFLUSH` for a VWC controller). A completion timeout marks the
-    /// controller dead, like every other I/O timeout.
+    /// `REQ_PREFLUSH` for a VWC controller). A completion timeout
+    /// ([`IO_TIMEOUT_MS`]) marks the controller dead, like every other I/O
+    /// timeout; the block entry points then reset it and replay the Flush
+    /// ([`run_with_replay`]).
     pub fn flush_nsid(&mut self, nsid: u32) -> Result<(), NvmeError> {
         if self.dead {
             return Err(NvmeError::ControllerDead);
@@ -1082,7 +1106,7 @@ impl Controller {
         // earlier writes are complete; one Flush on any queue covers them.
         // A Flush carries no data pointer.
         let qi = self.pick_queue();
-        self.submit_sqe_polled(qi, sqe, FLUSH_TIMEOUT_MS)?;
+        self.submit_sqe_polled(qi, sqe, io_timeout_ms())?;
         self.flushes_completed += 1;
         Ok(())
     }
@@ -1090,9 +1114,11 @@ impl Controller {
     /// Submit a prebuilt SQE on I/O queue `qi` and poll its CQ for the
     /// completion, within `timeout_ms`. The polled sibling of
     /// [`Self::submit_sqe_irq`]: Flush, Dataset Management and Write
-    /// Zeroes always take it, Read/Write when the queue has no vector. A
+    /// Zeroes always take it, Read/Write when the queue has no vector.
+    /// Callers pass [`io_timeout_ms`] (Linux `NVME_IO_TIMEOUT`, 30 s). A
     /// completion timeout marks the controller dead — the command and any
-    /// page it names may still be live in the device.
+    /// page it names may still be live in the device — and leaves the
+    /// reset + replay to the block entry points ([`run_with_replay`]).
     ///
     /// The caller guarantees what every I/O path here does: the SQE's data
     /// pointer (if any) names DMA memory that outlives the command — the
@@ -1233,7 +1259,7 @@ impl Controller {
             // The range-list page is persistent DMA memory that
             // outlives the command.
             let qi = self.pick_queue();
-            self.submit_sqe_polled(qi, sqe, CQE_TIMEOUT_MS)?;
+            self.submit_sqe_polled(qi, sqe, io_timeout_ms())?;
         }
         Ok(())
     }
@@ -1289,7 +1315,7 @@ impl Controller {
             sqe.cdw12 = (n - 1) as u32;
             // Write Zeroes carries no data pointer.
             let qi = self.pick_queue();
-            self.submit_sqe_polled(qi, sqe, CQE_TIMEOUT_MS)?;
+            self.submit_sqe_polled(qi, sqe, io_timeout_ms())?;
             at += n;
             left -= n;
         }
@@ -3127,9 +3153,14 @@ impl Controller {
     /// with a CQE-phase check as the lost-interrupt fallback (QEMU
     /// has been observed to lose an MSI on hot reset paths).
     /// `responsive_spin_until` ticks sleep_pumps so the FB cursor /
-    /// serial drain stay alive. Wall-clock budget 5 s; a timeout
-    /// marks the controller dead (the command's data / PRP-list
-    /// pages may still be DMA targets). Requires
+    /// serial drain stay alive. Wall-clock budget [`IO_TIMEOUT_MS`]
+    /// (30 s, Linux `NVME_IO_TIMEOUT`). When it runs out the CQ is
+    /// looked at one last time ([`Self::reap_io_cqe`], Linux
+    /// `nvme_timeout` → `nvme_poll_irqdisable`); only then is the
+    /// command declared lost and the controller marked dead (the
+    /// command's data / PRP-list pages may still be DMA targets).
+    /// The reset + replay happen in the block entry points
+    /// ([`run_with_replay`]), which own the slot. Requires
     /// `io_irq_vectors[qi]` to exist; callers without a vector use
     /// the polled [`Queue::submit`] instead.
     fn submit_sqe_irq(&mut self, qi: usize, mut sqe: Sqe) -> Result<(), NvmeError> {
@@ -3138,7 +3169,11 @@ impl Controller {
         let opcode = (sqe.cdw0 & 0xFF) as u8;
         let started = narf_time::now_cycles();
         let fires_at_submit = Some(narf_interrupts::fire_count(v));
-        let deadline = narf_time::Deadline::after_ms(5_000);
+        // Test-only fault injection (see [`IO_LOSE_FOR_TEST`] /
+        // [`IO_LATE_FOR_TEST`]).
+        let lose = take_test_fault(&IO_LOSE_FOR_TEST);
+        let late = take_test_fault(&IO_LATE_FOR_TEST);
+        let deadline = narf_time::Deadline::after_ms(io_timeout_ms());
 
         // Auto-CID + ring SQ tail doorbell. Scoped so the queue
         // borrow ends before the wait below; the CID is kept for
@@ -3153,30 +3188,33 @@ impl Controller {
                 write_sqe(&io.sq_buf, io.sq_tail, &sqe);
             }
             io.sq_tail = (io.sq_tail + 1) % io.depth;
-            // SAFETY: identity-mapped MMIO doorbell.
-            unsafe {
-                bar0.write32(io.sq_db_off(), io.sq_tail as u32);
+            if !lose {
+                // SAFETY: identity-mapped MMIO doorbell.
+                unsafe {
+                    bar0.write32(io.sq_db_off(), io.sq_tail as u32);
+                }
             }
             cid
         };
 
         // Wait for OUR completion: loop until the CQE carrying our
         // CID arrives at the head (see `try_take_io_cqe`). Each
-        // wait is bounded by the shared 5 s deadline; the
-        // fire_count baseline is re-read per iteration and the CQE
-        // phase is always re-checked, so an MSI that lands between
+        // wait is bounded by the shared deadline; the fire_count
+        // baseline is re-read per iteration and the CQE phase is
+        // always re-checked, so an MSI that lands between
         // iterations cannot be missed.
         loop {
+            if late {
+                // Injected late completion: ignore the CQ for the
+                // whole budget, so only the last look can find it.
+                let _ = narf_scheduler::responsive_spin_until(|| false, deadline);
+                break;
+            }
             if self.try_take_io_cqe(qi, cid, opcode)? {
                 return Ok(());
             }
             if deadline.expired() {
-                // The command (and its data / PRP-list pages) may
-                // still be live in the device; stop trusting this
-                // queue.
-                self.report_io_timeout(qi, opcode, cid, fires_at_submit, Some(started));
-                self.dead = true;
-                return Err(NvmeError::CompletionTimeout);
+                break;
             }
             let remaining_ms = narf_time::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000;
             let baseline = narf_interrupts::fire_count(v);
@@ -3195,13 +3233,50 @@ impl Controller {
                 narf_time::Deadline::after_ms(remaining_ms.max(1)),
             );
             if !done {
-                // The command (and its data / PRP-list pages) may still be
-                // live in the device; stop trusting this queue.
-                self.report_io_timeout(qi, opcode, cid, fires_at_submit, Some(started));
-                self.dead = true;
-                return Err(NvmeError::CompletionTimeout);
+                break;
             }
         }
+
+        // The budget is spent. One last look at the CQ before the
+        // command is declared lost: the deadline can pass right after
+        // a stray was consumed with ours in the next slot, and Linux
+        // `nvme_timeout` polls the queue for exactly this reason.
+        if self.reap_io_cqe(qi, cid, opcode)? {
+            if let Some(bar0) = self.bar0_region.as_ref() {
+                let qid = self.io_queues.get(qi).map_or(0, |q| q.qid);
+                note_late_completion(bar0.phys.raw(), qid, opcode, cid, started);
+            }
+            return Ok(());
+        }
+        // The command (and its data / PRP-list pages) may still be
+        // live in the device; stop trusting this queue.
+        self.report_io_timeout(qi, opcode, cid, fires_at_submit, Some(started));
+        self.dead = true;
+        Err(NvmeError::CompletionTimeout)
+    }
+
+    /// Non-blocking drain of I/O queue `qi` for the CQE carrying `cid`:
+    /// consume fresh head entries (strays are counted and dropped by
+    /// [`Self::try_take_io_cqe`]) until ours turns up (`Ok(true)`), the
+    /// head goes stale, or `depth` entries were examined (`Ok(false)`).
+    /// `Err` when ours arrived with a nonzero status.
+    fn reap_io_cqe(&mut self, qi: usize, cid: u16, opcode: u8) -> Result<bool, NvmeError> {
+        let depth = self.io_queues.get(qi).map_or(1, |q| q.depth.max(1));
+        for _ in 0..depth {
+            if self.try_take_io_cqe(qi, cid, opcode)? {
+                return Ok(true);
+            }
+            let Some(io) = self.io_queues.get(qi) else {
+                return Ok(false);
+            };
+            // SAFETY: cq_buf is a live identity-mapped DMA page.
+            let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+            if (cqe.status & 1) != (io.cq_phase & 1) {
+                return Ok(false);
+            }
+            // A fresh stray was consumed; look at the next slot.
+        }
+        Ok(false)
     }
 
     /// Report a completion timeout of command `cid` on I/O queue `qi`
@@ -3620,7 +3695,7 @@ impl Controller {
         // The data range and the PRP-list page are DMA memory that
         // outlives the command (the caller owns the data buffer across
         // this synchronous call; the list is persistent).
-        self.submit_sqe_polled(qi, sqe, CQE_TIMEOUT_MS).map(|_| ())
+        self.submit_sqe_polled(qi, sqe, io_timeout_ms()).map(|_| ())
     }
 
     /// Polled NVM Read/Write of `n_blocks` LBAs to / from `buf` starting
@@ -3774,7 +3849,7 @@ impl Controller {
         }
         // The caller's pages and the persistent PRP-list page stay
         // mapped across this synchronous submit.
-        self.submit_sqe_polled(qi, sqe, CQE_TIMEOUT_MS).map(|_| ())
+        self.submit_sqe_polled(qi, sqe, io_timeout_ms()).map(|_| ())
     }
 }
 
@@ -4020,11 +4095,96 @@ fn log_cmd_timeout(
     );
 }
 
-/// Default completion budget for admin and read/write commands.
+/// Commands whose completion was only found by the last look at the CQ
+/// after their budget ran out (see [`note_late_completion`]).
+static LATE_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+/// Timed-out block requests replayed after a controller reset (see
+/// [`run_with_replay`]).
+static IO_REPLAYS: AtomicU64 = AtomicU64::new(0);
+
+/// Commands since boot whose completion was found by the final CQ poll at
+/// timeout rather than by the wait (Linux "timeout, completion polled").
+pub fn late_completions() -> u64 {
+    LATE_COMPLETIONS.load(Ordering::Relaxed)
+}
+
+/// Block requests replayed after a timeout + controller reset since boot.
+pub fn io_replays() -> u64 {
+    IO_REPLAYS.load(Ordering::Relaxed)
+}
+
+/// Count and report a command that ran out its budget but whose completion
+/// was sitting in the CQ at the last look. It completed, so nothing is
+/// reset or replayed — but the wait missed it, which on an IRQ-driven
+/// queue means the interrupt and the phase check both failed to end the
+/// wait in time. Linux `nvme_timeout`: "I/O tag %d (%04x) QID %d timeout,
+/// completion polled".
+fn note_late_completion(bar: u64, qid: u16, opcode: u8, cid: u16, started: u64) {
+    use core::fmt::Write as _;
+    let n = LATE_COMPLETIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    let ms = narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(started)) / 1_000_000;
+    let _ = writeln!(
+        narf_console::Writer,
+        "nvme: bar {bar:#x}: WARNING: opcode {opcode:#04x} cid {cid:#06x} queue {qid} timed out \
+         after {ms} ms, completion polled (late completion #{n})"
+    );
+}
+
+/// Completion budget for admin commands (bring-up, namespace scan, queue
+/// creation, passthrough). Deliberately NOT Linux's 60 s `admin_timeout`:
+/// bring-up runs synchronously on the boot path, and an absent or broken
+/// controller must fail its probe in seconds, not minutes. Admin commands
+/// are never replayed.
 const CQE_TIMEOUT_MS: u64 = 5_000;
-/// Completion budget for a Flush: draining a large volatile cache can take
-/// far longer than a read; Linux gives every I/O `NVME_IO_TIMEOUT` (30 s).
-const FLUSH_TIMEOUT_MS: u64 = 30_000;
+/// Completion budget for every I/O-queue command — Read, Write, Flush,
+/// Dataset Management, Write Zeroes: Linux `nvme_io_timeout` /
+/// `NVME_IO_TIMEOUT`, 30 s. A healthy drive can legitimately take seconds
+/// (garbage collection, a large cache flush, a power-state exit); 5 s was
+/// short enough to fail a write inside a filesystem commit.
+pub const IO_TIMEOUT_MS: u64 = 30_000;
+/// How many times a timed-out block request is replayed after the
+/// controller was reset, before the error is returned: Linux
+/// `nvme_max_retries` (5). See [`run_with_replay`].
+pub const IO_MAX_RETRIES: u32 = 5;
+
+/// Test hook: when nonzero, the I/O completion budget in milliseconds
+/// instead of [`IO_TIMEOUT_MS`]. Only the in-kernel smokes set it.
+#[doc(hidden)]
+pub static IO_TIMEOUT_MS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+/// Test hook: the next N I/O-queue commands are *lost* — the SQE is
+/// written but the SQ doorbell is not rung, so the device never sees the
+/// command and no completion ever arrives. Only the in-kernel smokes set
+/// it.
+#[doc(hidden)]
+pub static IO_LOSE_FOR_TEST: AtomicU32 = AtomicU32::new(0);
+/// Test hook: the next N I/O-queue commands complete *late* — the command
+/// is submitted normally but the wait ignores the CQ until the budget is
+/// spent, so only the last look at the CQ can find the completion. Only
+/// the in-kernel smokes set it.
+#[doc(hidden)]
+pub static IO_LATE_FOR_TEST: AtomicU32 = AtomicU32::new(0);
+
+/// The I/O completion budget in force: [`IO_TIMEOUT_MS`] unless a smoke
+/// shortened it.
+#[inline]
+fn io_timeout_ms() -> u64 {
+    match IO_TIMEOUT_MS_FOR_TEST.load(Ordering::Relaxed) {
+        0 => IO_TIMEOUT_MS,
+        ms => ms,
+    }
+}
+
+/// Consume one injected fault from `counter`, if any is armed. One relaxed
+/// load when none is — the production cost of the hooks.
+#[inline]
+fn take_test_fault(counter: &AtomicU32) -> bool {
+    if counter.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+}
 
 /// Spin until CQ entry `index` has the expected phase tag, then return it;
 /// `CompletionTimeout` after `timeout_ms`.
@@ -4039,9 +4199,9 @@ unsafe fn wait_cqe_ms(
     timeout_ms: u64,
 ) -> Result<Cqe, NvmeError> {
     // responsive_spin_until keeps cursor/FB/serial alive on a slow
-    // or stuck controller. 5 s wall-clock budget — NVMe admin
-    // commands (IDENTIFY etc.) are sub-millisecond on real hardware;
-    // 5 s is the "real wedge" threshold.
+    // or stuck controller, and re-checks the condition once after the
+    // deadline, so an entry that turned fresh at the very end is not
+    // reported as a timeout.
     let done = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: caller guarantees buf is page-aligned and large
@@ -4369,13 +4529,13 @@ fn nvme_submit_blocking(
     // Interrupts stay enabled for the whole transfer: hold the
     // device's request gate, not the IRQ-masking CONTROLLERS lock.
     // See `InstalledController`.
-    let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    let slot = slot_of(0).ok_or(BlockError::DeviceRemoved)?;
+    let mut ctrl = acquire(slot);
     if ctrl.is_dead() {
-        // A previous command timed out. Reset/recover the controller
-        // in place before refusing this request too (see
-        // `recover_slot`); the timed-out request itself is never
-        // replayed — it may have partially completed. The guard is
-        // dropped first: recovery takes the gate itself.
+        // An earlier request left the controller dead (its replays ran
+        // out, or the reset at the timeout failed). Try the reset again
+        // before refusing this request too (see `recover_slot`). The
+        // guard is dropped first: recovery takes the gate itself.
         drop(ctrl);
         recover_slot(0).map_err(map_nvme_err)?;
         ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
@@ -4386,26 +4546,28 @@ fn nvme_submit_blocking(
     // for WriteZeroes and silently succeeded for Trim, #927). A
     // controller without the ONCS bit fails the request via
     // `NvmeError::NotImplemented` — never a silent success.
-    let (opcode, fua) = match req.op {
-        BlockOp::Read => (IoOpcode::Read as u8, false),
-        BlockOp::Write { fua } => (IoOpcode::Write as u8, fua),
+    let (opcode, fua, what) = match req.op {
+        BlockOp::Read => (IoOpcode::Read as u8, false, "read"),
+        BlockOp::Write { fua } => (IoOpcode::Write as u8, fua, "write"),
         BlockOp::Trim => {
-            let ns = ctrl.primary_geom();
-            return ctrl
-                .dataset_mgmt_ns(
+            return run_with_replay(slot, ctrl, "discard", |ctrl| {
+                let ns = ctrl.primary_geom();
+                ctrl.dataset_mgmt_ns(
                     ns,
                     &[LbaRange {
                         start: req.lba,
                         blocks: req.blocks as u64,
                     }],
                 )
-                .map_err(map_nvme_err);
+            })
+            .map_err(map_nvme_err);
         }
         BlockOp::WriteZeroes => {
-            let ns = ctrl.primary_geom();
-            return ctrl
-                .write_zeroes_ns(ns, req.lba, req.blocks as u64)
-                .map_err(map_nvme_err);
+            return run_with_replay(slot, ctrl, "write-zeroes", |ctrl| {
+                let ns = ctrl.primary_geom();
+                ctrl.write_zeroes_ns(ns, req.lba, req.blocks as u64)
+            })
+            .map_err(map_nvme_err);
         }
     };
     let lba_bytes = ctrl.lba_bytes as u64;
@@ -4419,50 +4581,65 @@ fn nvme_submit_blocking(
     // command takes a window of the buffer and the PRPs are built over
     // it. Split at the controller's maximum transfer (MDTS), the way
     // the Linux block layer splits at `max_hw_sectors`.
-    let per_cmd = core::cmp::max(1, ctrl.max_transfer_bytes() as u64 / lba_bytes) as u32;
-    let mut done: u32 = 0;
-    while done < req.blocks {
-        let n = core::cmp::min(per_cmd, req.blocks - done);
-        let ns = ctrl.primary_geom();
-        ctrl.nvm_io_ns_at(
-            ns,
-            fua,
-            opcode,
-            req.lba.saturating_add(done as u64),
-            n,
-            &buffer,
-            (done as u64 * lba_bytes) as usize,
-        )
-        .map_err(map_nvme_err)?;
-        done += n;
-    }
-    Ok(())
+    //
+    // A replay (see `run_with_replay`) restarts the request at its first
+    // block. The buffer is the caller's, pinned by the `Arc` for this
+    // whole call and written by nobody else: a write's payload is intact
+    // for the replay, and a read's destination is simply filled again.
+    run_with_replay(slot, ctrl, what, |ctrl| {
+        let per_cmd = core::cmp::max(1, ctrl.max_transfer_bytes() as u64 / lba_bytes) as u32;
+        let mut done: u32 = 0;
+        while done < req.blocks {
+            let n = core::cmp::min(per_cmd, req.blocks - done);
+            let ns = ctrl.primary_geom();
+            ctrl.nvm_io_ns_at(
+                ns,
+                fua,
+                opcode,
+                req.lba.saturating_add(done as u64),
+                n,
+                &buffer,
+                (done as u64 * lba_bytes) as usize,
+            )?;
+            done += n;
+        }
+        Ok(())
+    })
+    .map_err(map_nvme_err)
 }
 
 /// Dataset Management (Deallocate) over `ranges` of the primary
 /// namespace of controller instance 0 — the async `discard` path.
 fn nvme_discard_primary(ranges: &[LbaRange]) -> Result<(), BlockError> {
-    let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    let slot = slot_of(0).ok_or(BlockError::DeviceRemoved)?;
+    let mut ctrl = acquire(slot);
     if ctrl.is_dead() {
         // Same dead-controller recovery as the submit path.
         drop(ctrl);
         recover_slot(0).map_err(map_nvme_err)?;
         ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
     }
-    let ns = ctrl.primary_geom();
-    ctrl.dataset_mgmt_ns(ns, ranges).map_err(map_nvme_err)
+    run_with_replay(slot, ctrl, "discard", |ctrl| {
+        let ns = ctrl.primary_geom();
+        ctrl.dataset_mgmt_ns(ns, ranges)
+    })
+    .map_err(map_nvme_err)
 }
 
 fn nvme_flush_primary() -> Result<(), BlockError> {
-    let mut ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
+    let slot = slot_of(0).ok_or(BlockError::DeviceRemoved)?;
+    let mut ctrl = acquire(slot);
     if ctrl.is_dead() {
         // Same dead-controller recovery as the submit path.
         drop(ctrl);
         recover_slot(0).map_err(map_nvme_err)?;
         ctrl = probed_controller().ok_or(BlockError::DeviceRemoved)?;
     }
-    let nsid = ctrl.primary_nsid;
-    ctrl.flush_nsid(nsid).map_err(map_nvme_err)
+    run_with_replay(slot, ctrl, "flush", |ctrl| {
+        let nsid = ctrl.primary_nsid;
+        ctrl.flush_nsid(nsid)
+    })
+    .map_err(map_nvme_err)
 }
 
 fn map_nvme_err(e: NvmeError) -> BlockError {
@@ -4507,7 +4684,7 @@ pub const PCI_PROGIF_NVME: u8 = 0x02;
 ///
 /// Why a leaked slot instead of `IrqSafeSpinLock<Option<Controller>>`:
 /// every NVMe I/O is a device round-trip — submit an SQE, then
-/// busy-poll the CQ for up to 5 s (`wait_cqe`). Holding an
+/// wait on the CQ for up to 30 s ([`IO_TIMEOUT_MS`]). Holding an
 /// `IrqSafeSpinLock` across that transfer masks interrupts on the
 /// waiting CPU for the whole round-trip and forces every other CPU
 /// doing I/O to spin on the same lock, also interrupts-masked. Under a
@@ -4548,6 +4725,10 @@ struct InstalledController {
     bdf: Option<narf_bus::PcieAddr>,
     /// Set by [`remove_controller`]: every later I/O is refused.
     removed: AtomicBool,
+    /// Command timeouts on this controller since a command last completed
+    /// — the replay budget of [`run_with_replay`]. Written only under
+    /// `req_gate`.
+    timeout_streak: AtomicU32,
     /// This controller's DMA scratch for the sync block path, leaked on
     /// first use. Its contents are serialised by `req_gate`; this lock
     /// only covers the lazy init.
@@ -4614,6 +4795,7 @@ fn leak_slot(
         instance,
         bdf,
         removed: AtomicBool::new(false),
+        timeout_streak: AtomicU32::new(0),
         scratch: IrqSafeSpinLock::new(None),
         shutdown_regs: IrqSafeSpinLock::new(shutdown_regs),
         ctrl: UnsafeCell::new(ctrl),
@@ -4898,11 +5080,12 @@ fn sync_io(
         return Err(BlockIoError::DeviceRemoved);
     }
     if ctrl.is_dead() {
-        // A previous command timed out. Reset/recover the controller
-        // in place (dropping the guard first — recovery takes the
-        // gate itself), then re-acquire and resolve the namespace
-        // geometry fresh: the recovery re-scan may have changed it,
-        // and an identity mismatch will have removed the slot.
+        // An earlier request left the controller dead (its replays ran
+        // out, or the reset at the timeout failed). Try the reset again
+        // (dropping the guard first — recovery takes the gate itself),
+        // then re-acquire and resolve the namespace geometry fresh: the
+        // recovery re-scan may have changed it, and an identity mismatch
+        // will have removed the slot.
         drop(ctrl);
         recover_slot(instance).map_err(map_nvme_sync_err)?;
         ctrl = acquire(slot);
@@ -4917,63 +5100,180 @@ fn sync_io(
         return Err(BlockIoError::BufferTooSmall);
     }
     let buf = slot_scratch(slot).ok_or(BlockIoError::DriverError)?;
-    let chunk = nvme_sync_chunk_blocks(buf.len(), ctrl.max_transfer_bytes(), ns.lba_bytes) as usize;
-    let opcode = if write {
-        IoOpcode::Write as u8
+    let (opcode, what) = if write {
+        (IoOpcode::Write as u8, "write")
     } else {
-        IoOpcode::Read as u8
+        (IoOpcode::Read as u8, "read")
     };
     let mut data = data;
-    let mut done = 0usize;
-    while done < n_blocks as usize {
-        let n = core::cmp::min(chunk, n_blocks as usize - done);
-        let bytes = n * lba_bytes;
-        let at = done * lba_bytes;
-        if let SyncData::Out(src) = &data {
-            // SAFETY: the scratch is a live coherent DMA buffer of at least
-            // `bytes` bytes (chunk is bounded by it); `src[at..at + bytes]`
-            // is in bounds (`need` checked above) and a kernel slice cannot
-            // overlap the DMA buffer.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.as_ptr().add(at),
-                    buf.cpu_mut_ptr::<u8>(),
-                    bytes,
-                );
+    // A replay (see `run_with_replay`) restarts the request at its first
+    // block and stages each chunk again from the caller's slice, so what a
+    // replayed write sends never depends on what the scratch held when the
+    // first attempt timed out; a replayed read fills the scratch, and then
+    // the caller's buffer, afresh. `ns` stays valid across a replay: one
+    // only happens when the reset found the namespace set unchanged.
+    run_with_replay(slot, ctrl, what, |ctrl| {
+        let chunk =
+            nvme_sync_chunk_blocks(buf.len(), ctrl.max_transfer_bytes(), ns.lba_bytes) as usize;
+        let mut done = 0usize;
+        while done < n_blocks as usize {
+            let n = core::cmp::min(chunk, n_blocks as usize - done);
+            let bytes = n * lba_bytes;
+            let at = done * lba_bytes;
+            if let SyncData::Out(src) = &data {
+                // SAFETY: the scratch is a live coherent DMA buffer of at
+                // least `bytes` bytes (chunk is bounded by it);
+                // `src[at..at + bytes]` is in bounds (`need` checked above)
+                // and a kernel slice cannot overlap the DMA buffer.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(at),
+                        buf.cpu_mut_ptr::<u8>(),
+                        bytes,
+                    );
+                }
+                // Publish the payload before the SQE + doorbell that lets
+                // the device DMA-read it.
+                compiler_fence(Ordering::Release);
             }
-            // Publish the payload before the SQE + doorbell that lets
-            // the device DMA-read it.
-            compiler_fence(Ordering::Release);
+            ctrl.nvm_io_ns_at(
+                ns,
+                fua,
+                opcode,
+                lba.saturating_add(done as u64),
+                n as u32,
+                buf,
+                0,
+            )?;
+            if let SyncData::In(dst) = &mut data {
+                // The CQ poll inside `nvm_io_ns_at` is what makes the
+                // device's writes visible; fence so the compiler cannot
+                // hoist this bulk copy above it.
+                compiler_fence(Ordering::Acquire);
+                // SAFETY: as above, with `dst[at..at + bytes]` in bounds.
+                // Bulk copy rather than a per-byte volatile loop: the
+                // payload is coherent DMA memory, not MMIO.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        buf.cpu_ptr::<u8>(),
+                        dst.as_mut_ptr().add(at),
+                        bytes,
+                    );
+                }
+            }
+            done += n;
         }
-        ctrl.nvm_io_ns_at(
-            ns,
-            fua,
-            opcode,
-            lba.saturating_add(done as u64),
-            n as u32,
-            buf,
-            0,
-        )
-        .map_err(map_nvme_sync_err)?;
-        if let SyncData::In(dst) = &mut data {
-            // The CQ poll inside `nvm_io_ns_at` is what makes the device's
-            // writes visible; fence so the compiler cannot hoist this bulk
-            // copy above it.
-            compiler_fence(Ordering::Acquire);
-            // SAFETY: as above, with `dst[at..at + bytes]` in bounds. Bulk
-            // copy rather than a per-byte volatile loop: the payload is
-            // coherent DMA memory, not MMIO.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    buf.cpu_ptr::<u8>(),
-                    dst.as_mut_ptr().add(at),
-                    bytes,
-                );
+        Ok(())
+    })
+    .map_err(map_nvme_sync_err)
+}
+
+/// Run block request `op` (`what`, for the log) against the controller
+/// behind `ctrl`, and when one of its commands times out do what Linux
+/// does instead of failing the request: reset the controller here, at the
+/// timeout — not lazily on the next request — and replay the request, at
+/// most [`IO_MAX_RETRIES`] times (Linux `nvme_timeout` → `nvme_reset_ctrl`;
+/// `nvme_reset_work` cancels the outstanding requests, which
+/// `nvme_complete_rq` → `nvme_retry_req` requeues until `nvme_max_retries`).
+/// A filesystem therefore sees an error only when the controller cannot
+/// be brought back or keeps timing out — not for one slow command.
+///
+/// Why a replay cannot duplicate, reorder or corrupt:
+///  - One command is in flight per controller (the gate), and `ctrl` —
+///    the gate — is held from the first attempt through the reset to the
+///    last replay, so no other request can run in between.
+///  - The replay only happens after [`Controller::reset_recover`]
+///    confirmed CC.EN=0 / CSTS.RDY=0, which aborts whatever the device
+///    still had of the timed-out command, and rebuilt every queue: no
+///    completion of the old command can reach the new queues, and the
+///    device can no longer read or write the old command's buffers.
+///    A reset that cannot confirm the stop fails, and nothing is replayed.
+///  - Every request that comes through here is idempotent when repeated
+///    with the same arguments and nothing in between: Read, Write (same
+///    data to the same LBAs — whether the first attempt wrote none, some
+///    or all of it), Flush, Dataset Management deallocate and Write Zeroes
+///    (same ranges). `op` rebuilds each command from the caller's
+///    arguments, so nothing a timed-out attempt left in the controller's
+///    scratch or PRP-list pages is reused (those pages are reallocated by
+///    the reset anyway).
+///  - If the reset reports a changed namespace set the request is NOT
+///    replayed: its geometry was resolved against the old set.
+///
+/// The budget is the slot's `timeout_streak` — timeouts since a command
+/// last completed — rather than a per-request counter, so a controller
+/// that stopped answering altogether costs the first request its
+/// replays and every later one a single attempt. Each exhausted or
+/// refused replay still leaves the controller reset, not dead.
+///
+/// `op` must be restartable from scratch. Consumes the guard.
+fn run_with_replay<T>(
+    slot: &'static InstalledController,
+    mut ctrl: ControllerGuard,
+    what: &str,
+    mut op: impl FnMut(&mut Controller) -> Result<T, NvmeError>,
+) -> Result<T, NvmeError> {
+    use core::fmt::Write as _;
+    let mut replays = 0u32;
+    loop {
+        match op(&mut ctrl) {
+            Err(NvmeError::CompletionTimeout) => {}
+            r => {
+                // A completion — success or an error status — is the
+                // controller answering: the streak is over.
+                if matches!(r, Ok(_) | Err(NvmeError::CommandFailed { .. }))
+                    && slot.timeout_streak.load(Ordering::Relaxed) != 0
+                {
+                    slot.timeout_streak.store(0, Ordering::Relaxed);
+                }
+                return r;
             }
         }
-        done += n;
+        let name = ns::controller_name(slot.instance);
+        let streak = slot.timeout_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if SHUTTING_DOWN.load(Ordering::Acquire) {
+            // The final shutdown is waiting for this gate to send
+            // CC.SHN; a reset now would only race it.
+            let _ = writeln!(
+                narf_console::Writer,
+                "nvme: {name}: ERROR: {what} timed out during shutdown; not reset, not replayed"
+            );
+            return Err(NvmeError::CompletionTimeout);
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "nvme: {name}: {what} timed out ({streak} consecutive command timeout(s)); \
+             resetting the controller"
+        );
+        ctrl = match recover_held(slot, ctrl) {
+            Ok(Some(ctrl)) => ctrl,
+            Ok(None) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "nvme: {name}: ERROR: namespace set changed across the reset; \
+                     {what} not replayed"
+                );
+                return Err(NvmeError::CompletionTimeout);
+            }
+            // Logged by `recover_held`; the controller stays dead and the
+            // next request tries the reset again.
+            Err(_) => return Err(NvmeError::CompletionTimeout),
+        };
+        if streak > IO_MAX_RETRIES {
+            let _ = writeln!(
+                narf_console::Writer,
+                "nvme: {name}: ERROR: {what} failed: {streak} consecutive command timeouts \
+                 (replayed {replays} time(s), limit {IO_MAX_RETRIES}); returning an I/O error"
+            );
+            return Err(NvmeError::CompletionTimeout);
+        }
+        replays += 1;
+        IO_REPLAYS.fetch_add(1, Ordering::Relaxed);
+        let _ = writeln!(
+            narf_console::Writer,
+            "nvme: {name}: replaying {what} (replay {replays}, timeout streak {streak} of \
+             {IO_MAX_RETRIES})"
+        );
     }
-    Ok(())
 }
 
 /// Caller buffer of [`sync_io`].
@@ -5071,7 +5371,7 @@ fn sync_flush(instance: u32, nsid: Option<u32>) -> Result<(), narf_block::BlockI
         }
     }
     let ns = geom(&ctrl, nsid).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-    ctrl.flush_nsid(ns.nsid).map_err(map_nvme_sync_err)
+    run_with_replay(slot, ctrl, "flush", |ctrl| ctrl.flush_nsid(ns.nsid)).map_err(map_nvme_sync_err)
 }
 
 /// Whether namespace `nsid` (`None` = primary) of controller
@@ -5111,13 +5411,15 @@ fn sync_trim(
         }
     }
     let ns = geom(&ctrl, nsid).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-    ctrl.dataset_mgmt_ns(
-        ns,
-        &[LbaRange {
-            start: lba,
-            blocks: n_blocks,
-        }],
-    )
+    run_with_replay(slot, ctrl, "discard", |ctrl| {
+        ctrl.dataset_mgmt_ns(
+            ns,
+            &[LbaRange {
+                start: lba,
+                blocks: n_blocks,
+            }],
+        )
+    })
     .map_err(map_nvme_sync_err)
 }
 
@@ -5305,13 +5607,13 @@ fn withdraw_controller_publications(instance: u32) {
 /// [`resume_slot`]).
 ///
 /// Gate discipline: the reset runs under the slot's request gate,
-/// acquired here — callers (the block entry points) drop their
-/// guard before calling, because re-publication
-/// (`register_controller`) itself serialises on the gate and it is
-/// not reentrant. The gate is an atomic spun with interrupts
-/// enabled, and no registry lock is held across the reset's bounded
-/// waits. A racing caller that finds the controller already
-/// recovered returns `Ok` immediately.
+/// acquired here — callers (the block entry points, when they find
+/// the controller already dead) drop their guard before calling. The
+/// timeout path, which already holds the gate and must keep it for
+/// the replay, calls [`recover_held`] directly. The gate is an atomic
+/// spun with interrupts enabled, and no registry lock is held across
+/// the reset's bounded waits. A racing caller that finds the
+/// controller already recovered returns `Ok` immediately.
 ///
 /// On a namespace-set change the controller's publications are
 /// withdrawn and re-registered from the fresh scan; the cap minted
@@ -5326,57 +5628,74 @@ fn withdraw_controller_publications(instance: u32) {
 /// binds the new device under this instance, exactly as after
 /// [`remove_controller`].
 fn recover_slot(instance: u32) -> Result<(), NvmeError> {
-    use core::fmt::Write as _;
     let slot = slot_of(instance).ok_or(NvmeError::NotReady)?;
+    recover_held(slot, acquire(slot)).map(|_| ())
+}
+
+/// [`recover_slot`] under a gate the caller already holds. Returns the
+/// guard — the gate never released — when the controller is live again
+/// with the namespace set it had before (`Ok(Some)`), which is what lets
+/// [`run_with_replay`] replay a timed-out request with nothing able to
+/// run in between. `Ok(None)` means the controller is live but its
+/// namespace set changed: the gate had to be released to re-publish the
+/// block devices (`register_controller` serialises on the gate, which is
+/// not reentrant), so the caller's view of the namespaces is stale. On
+/// `Err` the gate is released and the controller stays dead (or, for
+/// [`NvmeError::IdentityChanged`], removed).
+fn recover_held(
+    slot: &'static InstalledController,
+    mut ctrl: ControllerGuard,
+) -> Result<Option<ControllerGuard>, NvmeError> {
+    use core::fmt::Write as _;
+    let instance = slot.instance;
     let name = ns::controller_name(instance);
-    // The reset proper, under the gate; the outcome is acted on
-    // after the guard drops (see the gate note above). The minted
-    // cap travels with the outcome: re-publication needs it.
-    let (device, outcome, cap) = {
-        let mut ctrl = acquire(slot);
-        if ctrl.is_suspended() {
-            // Suspend wins over recovery: a suspended controller is
-            // `dead` because the PM teardown put it down, not because
-            // a command wedged it, and resurrecting it here would
-            // serve I/O the suspend window exists to refuse.
-            // Recovery of a suspended controller is deferred to
-            // resume (`resume_slot` re-inits it); refuse the caller
-            // instead. Checked before the not-dead early return so
-            // the refusal holds whatever state the teardown left.
-            return Err(NvmeError::NotReady);
-        }
-        if !ctrl.is_dead() {
-            return Ok(());
-        }
-        let device = ctrl.bus_device().ok_or(NvmeError::NotReady)?;
-        let authority = narf_bus::bootstrap_registry_authority();
-        let (_handle, cap) = narf_bus::claim_device_cap(&authority, device.addr)
-            .map_err(|_| NvmeError::ControllerFailed)?;
-        let _ = writeln!(
-            narf_console::Writer,
-            "nvme: {name}: controller dead (command timeout); resetting in place"
-        );
-        let outcome = ctrl.reset_recover(&cap);
-        if matches!(outcome, Err(NvmeError::IdentityChanged)) {
-            slot.removed.store(true, Ordering::Release);
-        }
-        (device, outcome, cap)
-    };
+    if ctrl.is_suspended() {
+        // Suspend wins over recovery: a suspended controller is
+        // `dead` because the PM teardown put it down, not because
+        // a command wedged it, and resurrecting it here would
+        // serve I/O the suspend window exists to refuse.
+        // Recovery of a suspended controller is deferred to
+        // resume (`resume_slot` re-inits it); refuse the caller
+        // instead. Checked before the not-dead early return so
+        // the refusal holds whatever state the teardown left.
+        return Err(NvmeError::NotReady);
+    }
+    if !ctrl.is_dead() {
+        return Ok(Some(ctrl));
+    }
+    let device = ctrl.bus_device().ok_or(NvmeError::NotReady)?;
+    let authority = narf_bus::bootstrap_registry_authority();
+    let (_handle, cap) = narf_bus::claim_device_cap(&authority, device.addr)
+        .map_err(|_| NvmeError::ControllerFailed)?;
+    let _ = writeln!(
+        narf_console::Writer,
+        "nvme: {name}: controller dead (command timeout); resetting in place"
+    );
+    let outcome = ctrl.reset_recover(&cap);
+    if matches!(outcome, Err(NvmeError::IdentityChanged)) {
+        // Before the gate is released, so no racing caller can adopt
+        // the foreign device.
+        slot.removed.store(true, Ordering::Release);
+    }
     match outcome {
         Ok(report) => {
             if report.namespaces_changed {
+                // Re-publication takes the gate itself.
+                drop(ctrl);
                 withdraw_controller_publications(instance);
                 register_controller(instance, device, cap);
                 let _ = writeln!(
                     narf_console::Writer,
                     "nvme: {name}: recovered; namespace set changed, re-published"
                 );
+                Ok(None)
             } else {
                 let _ = writeln!(narf_console::Writer, "nvme: {name}: recovered; I/O resumed");
+                Ok(Some(ctrl))
             }
-            Ok(())
         }
         Err(NvmeError::IdentityChanged) => {
+            drop(ctrl);
             withdraw_controller_publications(instance);
             let _ = writeln!(
                 narf_console::Writer,
@@ -5508,9 +5827,10 @@ async fn aer_supervisor_task() {
 /// How long the final shutdown waits for an in-flight command to release a
 /// controller before it gives up on the Flush and sends CC.SHN regardless —
 /// Linux `nvme_dev_disable(shutdown = true)` waits `NVME_IO_TIMEOUT` (30 s)
-/// for the queues to freeze. Every request holding the gate is itself bounded
-/// by its completion budget (5 s per command), so a healthy controller always
-/// drains well inside this.
+/// for the queues to freeze. A healthy controller's in-flight command drains
+/// well inside this; a command that is itself timing out ([`IO_TIMEOUT_MS`],
+/// the same 30 s) does not, and the shutdown then takes the forced path —
+/// [`run_with_replay`] neither resets nor replays once shutdown has begun.
 pub const SHUTDOWN_DRAIN_TIMEOUT_MS: u64 = 30_000;
 
 /// What the final shutdown of one controller did.
