@@ -407,6 +407,36 @@ also consult upstream Linux GPL sources.
 - `Xhci::control_in` and `Xhci::control_out` identify Data and Status Stage
   completion events by their originating control-ring TRB and drain both before
   returning. A queued Status completion may never satisfy the next control TD.
+  The Setup Stage TRB is retained as a third, error-only receipt: it requests
+  no event, so a Transfer Event that names it is a failure (Linux
+  `process_ctrl_td` ends the TD on an error against any of its TRBs). Such an
+  event is latched by the EP0 owner — never the lossy shared queue — and ends
+  whichever stage is being awaited as `CmdFailed(code)`; a halting code
+  (Babble 3, Transaction Error 4, Stall 6) then runs `Xhci::reset_endpoint`
+  for DCI 1 before the error is returned. Each stage wait is bounded at
+  5000 ms (Linux `USB_CTRL_GET_TIMEOUT` / `USB_CTRL_SET_TIMEOUT`); command
+  waits (Enable/Disable Slot, Address Device, Configure/Evaluate, Stop/Reset
+  Endpoint, Set TR Dequeue) are bounded at 5000 ms (Linux
+  `XHCI_CMD_DEFAULT_TIMEOUT`). The compatibility one-shot bulk/isoch waits
+  keep their 250 ms poll bound.
+- A control stage timeout (`CmdTimeout`) cancels the still-published TD
+  before it is reported: under the slot's configuration claim the EP0 owner
+  quarantines every DCI 1 Transfer Event for the slot, then Stop Endpoint
+  (skipped when the output context already reads Stopped; a Halted context,
+  or a Context State Error from Stop followed by a Halted readback, takes
+  Reset Endpoint instead) and Set TR Dequeue Pointer at the canonical
+  Link-boundary enqueue cursor. Readback must show Stopped at exactly that
+  dequeue; only then are EP0's queued events purged and the claim released,
+  so the next control transfer on the device is accepted. Any failure after
+  the claim leaves EP0 terminally busy, as for `reset_endpoint`. This mirrors
+  Linux `usb_kill_urb` → `xhci_urb_dequeue` → `xhci_handle_cmd_stop_ep`. The
+  first 16 timeouts per controller also log the EP0 output-context state and
+  dequeue, USBSTS, PORTSC, the TD's receipts and any unmatched Transfer
+  Events for the slot. A timed-out *command* is still only retired
+  (tombstoned); Command Abort (CRCR.CA) is not issued.
+- Root-port reset waits 50 ms (TRSTRCY 10 ms + 40 ms, Linux `hub_port_reset`,
+  same as the hub-class reset) before the first SETUP, and Address Device
+  waits 10 ms after its successful completion (Linux `hub_port_init`).
 - `USBDevice::{begin_bulk_in,begin_bulk_out}` submit one 1..4096-byte TD
   and return a `BulkToken`; `poll_bulk_in(token, out)` / `poll_bulk_out(token)`
   return `None` while the same TD remains active. A receive buffer must cover
@@ -592,7 +622,10 @@ also consult upstream Linux GPL sources.
   data toggles restart together; EP0 skips the CLEAR_FEATURE step.
 - The supervisor drives root and hub enumeration to a terminal result using
   the hardware operations' individual deadlines. It does not cancel an
-  in-flight owner at a whole-port deadline. Pending enumeration and hub-status
+  in-flight owner at a whole-port deadline. A failed attempt during which a
+  command or control stage timed out is charged half of the port's 8-attempt
+  retry budget (two such attempts exhaust it); the 5000 ms per-operation
+  deadline is not shortened to bound a dead device's cost. Pending enumeration and hub-status
   waits service existing nonblocking report pumps, with bound suspended ports
   resumed before the first pump in each supervisor cycle.
 - Terminal enumeration failures and device detach share slot cleanup. They
