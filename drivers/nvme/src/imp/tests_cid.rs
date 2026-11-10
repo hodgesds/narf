@@ -604,3 +604,214 @@ fn smoke_nvme_polled_last_look_finds_completion() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_polled_last_look_finds_completion);
+
+// ── Async path (`submit_io_begin` / `submit_io_poll` / `submit_io_irq_async`) ──
+//
+// Driven against the RAM-backed controller: the "device" is whatever the
+// test stages into the CQ, and the queue's interrupt is whatever the test
+// feeds to `narf_interrupts::on_irq` — so a wake that is not the command's
+// completion, a completion with no interrupt, and a completion that never
+// comes are each exact, not a matter of timing.
+
+/// A [`fake_cid_controller`] whose I/O queue is IRQ-driven on a freshly
+/// allocated vector and whose primary namespace accepts one-block I/O.
+/// The vector is released when the fixture drops.
+struct FakeAsyncCtrl {
+    fake: FakeCidCtrl,
+    vector: u8,
+}
+
+impl Drop for FakeAsyncCtrl {
+    fn drop(&mut self) {
+        let _ = narf_interrupts::vector::free(self.vector);
+    }
+}
+
+fn fake_async_controller() -> Option<FakeAsyncCtrl> {
+    let mut fake = fake_cid_controller()?;
+    let vector = narf_interrupts::vector::alloc().ok()?;
+    fake.ctrl.io_irq_vectors.push(vector);
+    fake.ctrl.ns_usable = true;
+    fake.ctrl.lba_bytes = 512;
+    fake.ctrl.nsze = 1024;
+    // Model a controller that was enabled: a command that times out on it
+    // may still be live in the device.
+    fake.ctrl.stop_confirmed = false;
+    Some(FakeAsyncCtrl { fake, vector })
+}
+
+/// A waker that does nothing: the tests poll by hand.
+fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    unsafe fn no_clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    unsafe fn no_op(_: *const ()) {}
+    const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+    // SAFETY: the vtable's functions ignore the (null) data pointer.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) }
+}
+
+/// Shortened I/O budget for one async smoke, restored on every exit.
+struct ShortIoBudget;
+
+impl ShortIoBudget {
+    fn set(ms: u64) -> Self {
+        super::IO_TIMEOUT_MS_FOR_TEST.store(ms, core::sync::atomic::Ordering::Release);
+        ShortIoBudget
+    }
+}
+
+impl Drop for ShortIoBudget {
+    fn drop(&mut self) {
+        super::IO_TIMEOUT_MS_FOR_TEST.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
+    // The queue's vector firing is a reason to look at the CQ, not proof
+    // that this command completed: the late MSI of an earlier polled Flush
+    // on the same queue, or another queue sharing the vector, bumps it
+    // too. The async wait must go round again — the pre-fix path declared
+    // the completion lost on the spot (controller dead,
+    // `CompletionTimeout`). And a completion that arrives with NO
+    // interrupt must still be found, by the wait's poll slice, long
+    // before the command's budget.
+    use core::future::Future;
+    use core::task::{Context, Poll};
+    let Some(mut fx) = fake_async_controller() else {
+        return TestResult::Fail("fake async controller setup failed");
+    };
+    let vector = fx.vector;
+    let cq_io = fx.fake.cq_io;
+    let buf_ptr: *const narf_io::DmaBuffer = &fx.fake._id_page;
+    let timeouts0 = super::command_timeouts();
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let outcome = {
+        // SAFETY: the identify page lives in `fx`, which outlives this
+        // block; the future only reads the buffer's address and length.
+        let buf = unsafe { &*buf_ptr };
+        let mut fut =
+            core::pin::pin!(fx
+                .fake
+                .ctrl
+                .submit_io_irq_async(IoOpcode::Read as u8, 0, 1, buf));
+        if fut.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("async read resolved with nothing in the CQ");
+        }
+        // An interrupt on the queue's vector that is not our completion.
+        for _ in 0..3 {
+            narf_interrupts::on_irq(vector);
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                return TestResult::Fail(
+                    "a spurious wake ended the wait (completion declared lost)",
+                );
+            }
+        }
+        // Our completion, with no interrupt at all.
+        // SAFETY: `cq_io` is the fake queue's live CQ page; slot 0.
+        unsafe { stage_cqe(cq_io, 0, 0, 1, OWN_SENTINEL) };
+        let give_up = narf_time::Deadline::after_ms(super::ASYNC_CQ_POLL_MS * 8);
+        loop {
+            if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
+                break Some(r);
+            }
+            if give_up.expired() {
+                break None;
+            }
+            core::hint::spin_loop();
+        }
+    };
+    match outcome {
+        Some(Ok(())) => {}
+        Some(Err(_)) => return TestResult::Fail("async read failed although its CQE arrived"),
+        None => return TestResult::Fail("a completion without an interrupt was never polled"),
+    }
+    if fx.fake.ctrl.is_dead() || super::command_timeouts() != timeouts0 {
+        return TestResult::Fail("a completed async command left the controller dead / timed out");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/async",
+    smoke_nvme_async_spurious_wake_is_not_a_lost_completion
+);
+
+fn smoke_nvme_async_timeout_checks_cq_before_failing() -> TestResult {
+    // `submit_io_poll` before the deadline: "not yet" is not an error and
+    // a stray at the head is consumed without ending the command. At the
+    // deadline the CQ is looked at one last time: a completion sitting
+    // there is taken (late completion, no timeout); only an empty CQ
+    // makes the command lost (timeout counted, controller dead).
+    let Some(mut fx) = fake_async_controller() else {
+        return TestResult::Fail("fake async controller setup failed");
+    };
+    let cq_io = fx.fake.cq_io;
+    let buf_ptr: *const narf_io::DmaBuffer = &fx.fake._id_page;
+    // SAFETY: the identify page lives in `fx` for the whole test.
+    let buf = unsafe { &*buf_ptr };
+    let budget = ShortIoBudget::set(40);
+    let ctrl = &mut fx.fake.ctrl;
+    let (late0, timeouts0, strays0) = (
+        super::late_completions(),
+        super::command_timeouts(),
+        super::stray_cqe_drops(),
+    );
+
+    // Command 1 (CID 0): a stray first, then its completion after expiry.
+    let Ok(io) = ctrl.submit_io_begin(IoOpcode::Read as u8, 0, 1, buf) else {
+        return TestResult::Fail("submit_io_begin failed");
+    };
+    if !matches!(ctrl.submit_io_poll(&io), Ok(false)) || ctrl.is_dead() {
+        return TestResult::Fail("an in-flight command with an empty CQ was not 'not yet'");
+    }
+    // SAFETY: `cq_io` is the fake queue's live CQ page; slots 0..1.
+    unsafe { stage_cqe(cq_io, 0, 0x55, 1, IO_STRAY_SENTINEL) };
+    if !matches!(ctrl.submit_io_poll(&io), Ok(false)) || ctrl.is_dead() {
+        return TestResult::Fail("a stray at the head ended the command");
+    }
+    if super::stray_cqe_drops() != strays0 + 1 {
+        return TestResult::Fail("the stray was not consumed and counted");
+    }
+    // SAFETY: as above.
+    unsafe { stage_cqe(cq_io, 1, 0, 1, OWN_SENTINEL) };
+    let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(60));
+    if !matches!(ctrl.submit_io_poll(&io), Ok(true)) {
+        return TestResult::Fail("a completion in the CQ at the deadline was declared lost");
+    }
+    if super::late_completions() != late0 + 1
+        || super::command_timeouts() != timeouts0
+        || ctrl.is_dead()
+    {
+        return TestResult::Fail("the last look's completion was not a late completion");
+    }
+
+    // Command 2 (CID 1): nothing ever arrives.
+    let Ok(io) = ctrl.submit_io_begin(IoOpcode::Read as u8, 0, 1, buf) else {
+        return TestResult::Fail("second submit_io_begin failed");
+    };
+    let _ = narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(60));
+    if !matches!(
+        ctrl.submit_io_poll(&io),
+        Err(super::NvmeError::CompletionTimeout)
+    ) {
+        return TestResult::Fail("a command with no completion did not time out at its deadline");
+    }
+    drop(budget);
+    if super::command_timeouts() != timeouts0 + 1 || !ctrl.is_dead() {
+        return TestResult::Fail(
+            "the lost command was not counted / the controller not marked dead",
+        );
+    }
+    // Dead and never confirmed disabled: its buffers may still be DMA
+    // targets (what `nvme_submit_blocking` keys its buffer retention on).
+    if !ctrl.may_still_dma() {
+        return TestResult::Fail("a dead, never-stopped controller reads as DMA-quiet");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/async",
+    smoke_nvme_async_timeout_checks_cq_before_failing
+);

@@ -214,10 +214,22 @@ multipath / fabrics (defer).
   (`IO_TIMEOUT_MS`), CID-matched drain, one last CQ look at expiry —
   whenever the picked queue has a vector; the polled
   `Queue::submit` stays the fallback for vector-less boots.
-  `submit_io_irq_async` is the async form, composed from
-  `submit_io_begin` (SQE + doorbell, wait future constructed
-  pre-doorbell) + await + `submit_io_finish` (CID-aware CQE drain);
-  the split
+  `submit_io_irq_async` is the async form: `submit_io_begin(opcode,
+  lba, n_blocks, buf) -> Result<IoInFlight, NvmeError>` (SQE +
+  doorbell), then the loop "arm `IoInFlight::wait()`, check
+  `submit_io_poll(&IoInFlight) -> Result<bool, NvmeError>`, await the
+  wait" until the poll reports the command finished. A wake is only a
+  reason to look at the CQ: `Ok(false)` — not yet — for a wake that
+  was not this command's completion (another queue on a shared vector,
+  the late MSI of an earlier polled Flush on the same queue), never a
+  lost completion. Each wait is bounded by `ASYNC_CQ_POLL_MS` (250 ms)
+  as well as the command's deadline (`IO_TIMEOUT_MS`, shared by all its
+  waits), so a completion whose interrupt never arrives is found by the
+  next check; only when the deadline has passed and a last look at the
+  CQ finds nothing does the poll return `CompletionTimeout` and mark
+  the controller dead. Waits are armed before the CQ check they follow,
+  which is what closes the lost-wakeup window. (`submit_io_finish`, the
+  former single-shot drain, is gone.) The split
   lets a caller release the slot gate across the await — no
   `IrqSafeSpinLock` is ever held across a suspension point and no
   `block_on` appears on this path. The composed async form still
@@ -256,6 +268,14 @@ multipath / fabrics (defer).
 - No DMA buffer a command may still reference is freed: I/O uses persistent
   scratch and PRP-list pages, a timed-out I/O marks the controller dead, and a
   timed-out admin passthrough leaks its pages.
+- A caller-owned data buffer (`NvmeBlockDevice::submit`'s cap-resolved
+  `DmaBuffer`) is not released under a command that may still be live: a
+  request that fails with a timeout returns only after the controller was
+  reset at the timeout site, and if the controller is still dead without a
+  confirmed stop (`Controller::may_still_dma()`: CSTS.RDY never dropped, the
+  final shutdown had begun, or the gate could not be taken to find out) one
+  reference to the buffer is leaked (`retained_io_buffers()`), as
+  `disable_after_failure` leaks the queues.
 - A timed-out request is replayed only after the controller was confirmed
   stopped (CC.EN=0, CSTS.RDY=0) and its queues rebuilt, with the request gate
   held throughout, and only if the namespace set is unchanged. Replays are
@@ -451,11 +471,9 @@ head:
   path loops inside `submit_sqe_irq` (30 s budget, then
   `reap_io_cqe`: one non-blocking drain of up to `depth` head
   entries before the command is declared lost); the async
-  form is `submit_io_begin` (which returns the CID) + await +
-  `submit_io_finish`, whose CID-aware drain re-checks the head
-  after the await — the lost-wakeup window the old single-shot
-  form's pre-doorbell construction handled is closed by the
-  pre-doorbell future construction plus that re-check.
+  form is `submit_io_begin` + a loop of `IoInFlight::wait` /
+  `submit_io_poll` (the same `reap_io_cqe` drain on every wake,
+  fatal only at the command's deadline) — see §3.
 - Diagnostics: `Controller::aer_outstanding()` (AER CIDs still
   tracked on the admin queue — a completion stashed by
   `submit_raw_ms` untracks its CID, so the count drops until

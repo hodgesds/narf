@@ -548,6 +548,12 @@ pub struct Controller {
     /// targets, so later I/O is refused with
     /// [`NvmeError::ControllerDead`].
     dead: bool,
+    /// True while the controller is known to be disabled: never enabled,
+    /// or CC.EN=0 with CSTS.RDY=0 confirmed by
+    /// [`Controller::disable_after_failure`]. Cleared when bring-up
+    /// writes CC.EN=1. A controller that is `dead` without this cannot be
+    /// shown to have stopped DMA-ing ([`Controller::may_still_dma`]).
+    stop_confirmed: bool,
     /// Set by [`Controller::suspend_pm`] once the controller has been
     /// quiesced (Flush + CC.SHN) and torn down for system suspend, and
     /// cleared by [`Controller::resume_pm`] after a full re-init and
@@ -915,6 +921,52 @@ fn post_one_aer(admin: &mut Queue, bar0: &MmioRegion) {
     }
 }
 
+/// How long one wait of the async I/O path may park before the CQ is
+/// checked regardless of whether the queue's vector fired: the phase-poll
+/// fallback for a lost or never-delivered MSI (the sync path checks the
+/// CQE phase continuously; this is its async equivalent). The same
+/// cadence as the AER supervisor's poll.
+pub const ASYNC_CQ_POLL_MS: u64 = 250;
+
+/// One I/O command in flight on the async path, from
+/// [`Controller::submit_io_begin`] until [`Controller::submit_io_poll`]
+/// reports it finished. Plain data: holding it borrows nothing.
+#[derive(Copy, Clone, Debug)]
+pub struct IoInFlight {
+    /// Index into `io_queues` the command was submitted on.
+    qi: usize,
+    /// Its command identifier on that queue.
+    cid: u16,
+    /// Its opcode, for error and timeout reports (a CQE carries none).
+    opcode: u8,
+    /// The queue's interrupt vector.
+    vector: u8,
+    /// When the command is given up on (shared by every wait).
+    deadline: narf_time::Deadline,
+    /// `now_cycles()` at submission, for the timeout report.
+    started: u64,
+    /// The vector's `fire_count` at submission, for the timeout report.
+    fires_at_submit: u64,
+}
+
+impl IoInFlight {
+    /// A wait for this command's next reason to look at the CQ: the
+    /// queue's vector firing, or [`ASYNC_CQ_POLL_MS`] passing, or the
+    /// command's deadline — whichever is first. The `fire_count` baseline
+    /// is taken here, so arm the wait BEFORE the CQ check it follows;
+    /// an interrupt that lands between the check and the await then
+    /// resolves the wait at once instead of being lost.
+    pub fn wait(&self) -> narf_time::Timeout<narf_interrupts::WaitForIrq> {
+        let slice = narf_time::Deadline::after_ms(ASYNC_CQ_POLL_MS);
+        narf_interrupts::wait_for_irq_until(self.vector, slice.min(self.deadline))
+    }
+
+    /// The interrupt vector of the queue the command is on.
+    pub fn vector(&self) -> u8 {
+        self.vector
+    }
+}
+
 /// Subset of the IDENTIFY CONTROLLER page we currently parse.
 /// Layout per NVMe base spec §5.15.2.1.
 #[derive(Copy, Clone, Debug)]
@@ -1036,6 +1088,7 @@ impl Controller {
             prp_list: None,
             dsm_page: None,
             dead: false,
+            stop_confirmed: true,
             suspended: false,
             suspend_snapshot: None,
             in_flight_dma: Vec::new(),
@@ -1442,6 +1495,17 @@ impl Controller {
         self.dead
     }
 
+    /// `true` when a command that timed out may still be live in the
+    /// device: the controller is dead and was not confirmed disabled
+    /// since. Memory such a command names — a caller's data buffer — must
+    /// not be freed or reused while this holds. A controller that is
+    /// alive again got there through a confirmed stop
+    /// ([`Controller::reset_recover`] refuses to re-enable otherwise),
+    /// which aborted whatever it still had.
+    pub fn may_still_dma(&self) -> bool {
+        self.dead && !self.stop_confirmed
+    }
+
     /// `true` between a successful [`Controller::suspend_pm`] and the
     /// matching [`Controller::resume_pm`].
     pub fn is_suspended(&self) -> bool {
@@ -1586,6 +1650,7 @@ impl Controller {
 
         // ── 5. Re-enable the controller ───────────────────────────
         let cc = CC_EN | CC_CSS_NVM | CC_MPS_4K | CC_AMS_RR | CC_IOSQES_64 | CC_IOCQES_16;
+        self.stop_confirmed = false;
         // SAFETY: same window.
         unsafe {
             bar0.write32(REG_CC, cc);
@@ -1807,6 +1872,7 @@ impl Controller {
         let pages = core::mem::take(&mut self.in_flight_dma);
         self.io_queue_locks.clear();
         self.dead = true;
+        self.stop_confirmed = stopped;
         if stopped {
             drop((admin, io, prp_list, dsm_page, pages));
         } else {
@@ -3373,41 +3439,39 @@ impl Controller {
     }
 
     /// Begin an IRQ-driven I/O submission: build the SQE, pick a
-    /// queue, construct the IRQ wait future, then write the SQE +
-    /// ring the doorbell. Returns `(queue index, cid, vector, wait)`.
+    /// queue, write the SQE and ring the doorbell. Returns the
+    /// in-flight command ([`IoInFlight`]); the caller then loops
+    /// "arm a wait ([`IoInFlight::wait`]), check the CQ
+    /// ([`Self::submit_io_poll`]), await the wait" until the poll
+    /// reports the command finished — see
+    /// [`Self::submit_io_irq_async`], which is exactly that loop.
     ///
     /// This is the `block_on` / `IrqSafeSpinLock`-across-await
     /// restructure (AGENTS.md): NO await happens here and NO
-    /// borrow is held across the caller's await — the returned
-    /// future owns only the vector + its `fire_count` baseline, so
-    /// the caller may release the slot gate (an atomic, never an
+    /// borrow is held across the caller's await — the wait future
+    /// owns only the vector + its `fire_count` baseline, so the
+    /// caller may release the slot gate (an atomic, never an
     /// IRQ-masking lock) before awaiting, then re-acquire and call
-    /// [`Self::submit_io_finish`]. The per-queue locks are only
-    /// ever held in the short sync phases on either side of the
-    /// await, never across it; no `block_on` appears anywhere on
-    /// this path.
+    /// `submit_io_poll`. The per-queue locks are only ever held in
+    /// the short sync phases on either side of the await, never
+    /// across it; no `block_on` appears anywhere on this path.
     ///
-    /// The same queue index must be used for begin and finish —
-    /// switching queues mid-flight would corrupt the picked
-    /// queue's CQ head/phase tracking. `n_blocks == 0` is a
-    /// [`NvmeError::BadTransfer`] here (via `build_nvm_sqe`);
-    /// callers that treat empty transfers as success check first,
-    /// as [`Self::submit_io_irq_async`] does.
+    /// No wait needs to exist before the doorbell: every wait is
+    /// armed *before* the CQ check that follows it, so a completion
+    /// whose interrupt fired before the wait was armed is already in
+    /// the CQ when that check runs, and one that fires after is seen
+    /// by the wait.
+    ///
+    /// `n_blocks == 0` is a [`NvmeError::BadTransfer`] here (via
+    /// `build_nvm_sqe`); callers that treat empty transfers as
+    /// success check first, as [`Self::submit_io_irq_async`] does.
     pub fn submit_io_begin(
         &mut self,
         opcode: u8,
         lba: u64,
         n_blocks: u16,
         buf: &DmaBuffer,
-    ) -> Result<
-        (
-            usize,
-            u16,
-            u8,
-            narf_time::Timeout<narf_interrupts::WaitForIrq>,
-        ),
-        NvmeError,
-    > {
+    ) -> Result<IoInFlight, NvmeError> {
         if self.io_queues.is_empty() {
             return Err(NvmeError::NoIoQueue);
         }
@@ -3419,121 +3483,112 @@ impl Controller {
             buf.len(),
         )?;
         let qi = self.pick_queue();
-        let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
+        let vector = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
+        let started = narf_time::now_cycles();
+        let fires_at_submit = narf_interrupts::fire_count(vector);
+        // The same budget as the sync path (Linux `NVME_IO_TIMEOUT`).
+        let deadline = narf_time::Deadline::after_ms(io_timeout_ms());
 
-        // CRITICAL ORDERING: construct the WaitForIrq future
-        // BEFORE writing the SQ doorbell. WaitForIrq snapshots
-        // fire_count at construction (interrupts/wait.rs:31).
-        // If we doorbell first then construct the future, an
-        // MSI that lands in the ~microsecond window in between
-        // bumps fire_count, the future captures the post-IRQ
-        // value as its baseline, and the await parks forever
-        // waiting for a second MSI that never comes.
-        //
-        // 30 s deadline matches Linux NVMe's default
-        // command timeout (drivers/nvme/host/nvme.c:NVME_DEFAULT_TIMEOUT).
-        // On expiry we surface CompletionTimeout so the upper
-        // layer can decide between retry / controller reset /
-        // EIO to the requestor.
-        let deadline = narf_time::Deadline::after_ms(30_000);
-        let wait = narf_interrupts::wait_for_irq_until(v, deadline);
-
-        // Submit + ring doorbell. All self-borrows released at
-        // the closing brace; the CID is kept for the drain loop.
-        let cid = {
-            let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-            let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-            let cid = io.next_cid;
-            io.next_cid = io.next_cid.wrapping_add(1);
-            sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
-            // SAFETY: queue page-aligned; sq_tail bounded.
-            unsafe {
-                write_sqe(&io.sq_buf, io.sq_tail, &sqe);
-            }
-            io.sq_tail = (io.sq_tail + 1) % io.depth;
-            // SAFETY: identity-mapped MMIO doorbell.
-            unsafe {
-                bar0.write32(io.sq_db_off(), io.sq_tail as u32);
-            }
-            cid
-        };
-
-        Ok((qi, cid, v, wait))
+        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let cid = io.next_cid;
+        io.next_cid = io.next_cid.wrapping_add(1);
+        sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+        // SAFETY: queue page-aligned; sq_tail bounded.
+        unsafe {
+            write_sqe(&io.sq_buf, io.sq_tail, &sqe);
+        }
+        io.sq_tail = (io.sq_tail + 1) % io.depth;
+        // SAFETY: identity-mapped MMIO doorbell.
+        unsafe {
+            bar0.write32(io.sq_db_off(), io.sq_tail as u32);
+        }
+        Ok(IoInFlight {
+            qi,
+            cid,
+            opcode,
+            vector,
+            deadline,
+            started,
+            fires_at_submit,
+        })
     }
 
-    /// Finish an IRQ-driven I/O submission begun by
-    /// [`Self::submit_io_begin`], after the caller awaited the
-    /// returned wait future: drain the CQE carrying `cid` from
-    /// queue `qi` (see [`Self::try_take_io_cqe`]) and ring the
-    /// CQ-head doorbell. The head CQE may be a stray — another
-    /// submitter's late completion — which is consumed and
-    /// dropped; only our own CQE is accepted. Bounded by the
-    /// queue depth: after `depth` consumed entries without ours,
-    /// the queue wrapped without our completion. The CQE phase
-    /// must have flipped (the IRQ fired); if it has not, returns
-    /// `CompletionTimeout` and marks the controller dead — the
-    /// command may still be live in the device, so its buffers
-    /// must not be reused. The `opcode` is only for the
-    /// [`NvmeError::CommandFailed`] report (the CQE carries no
-    /// opcode).
-    pub fn submit_io_finish(&mut self, qi: usize, cid: u16, opcode: u8) -> Result<(), NvmeError> {
-        // At most `depth` head entries can precede ours (the queue
-        // holds no more than that); each iteration consumes one,
-        // so the loop always terminates.
-        let depth = self
-            .io_queues
-            .get(qi)
-            .map_or(1, |q| q.depth.max(1) as usize);
-        for _ in 0..depth {
-            if self.try_take_io_cqe(qi, cid, opcode)? {
-                return Ok(());
+    /// Check on command `io` begun by [`Self::submit_io_begin`], on
+    /// the queue it was submitted on. Never blocks.
+    ///
+    /// - `Ok(true)`: its completion was consumed (status zero). Done.
+    /// - `Ok(false)`: not completed yet and the budget is not spent.
+    ///   Whatever woke the caller — another queue's interrupt on a
+    ///   shared vector, the late MSI of an earlier polled Flush on
+    ///   this queue, the wait's poll slice running out — was not
+    ///   this command's completion, and that is not an error: await
+    ///   a fresh [`IoInFlight::wait`] and poll again. Strays at the
+    ///   CQ head are consumed, counted and dropped on the way.
+    /// - `Err(CommandFailed)`: it completed with an error status.
+    /// - `Err(CompletionTimeout)`: the budget is spent and one last
+    ///   look at the CQ did not find it. The controller is marked
+    ///   dead — the command may still be live in the device, so its
+    ///   buffers must not be reused or freed until the controller is
+    ///   reset. A completion found by that last look is `Ok(true)`
+    ///   (counted as a late completion).
+    pub fn submit_io_poll(&mut self, io: &IoInFlight) -> Result<bool, NvmeError> {
+        let expired = io.deadline.expired();
+        if self.reap_io_cqe(io.qi, io.cid, io.opcode)? {
+            if expired {
+                if let Some(bar0) = self.bar0_region.as_ref() {
+                    let qid = self.io_queues.get(io.qi).map_or(0, |q| q.qid);
+                    note_late_completion(bar0.phys.raw(), qid, io.opcode, io.cid, io.started);
+                }
             }
-            // `try_take_io_cqe` consumed a stray, or nothing was
-            // fresh at the head: peek to tell which.
-            let Some(io) = self.io_queues.get(qi) else {
-                self.dead = true;
-                return Err(NvmeError::CompletionTimeout);
-            };
-            // SAFETY: cq_buf is a live identity-mapped DMA page.
-            let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-            if (cqe.status & 1) != (io.cq_phase & 1) {
-                // The IRQ fired but our CQE is not at the head: the
-                // completion was lost (or the IRQ belonged to another
-                // queue sharing the vector). Same treatment as the sync
-                // path's timeout — the buffers may still be DMA targets.
-                self.report_io_timeout(qi, opcode, cid, None, None);
-                self.dead = true;
-                return Err(NvmeError::CompletionTimeout);
-            }
-            // A fresh stray was consumed above; loop for the next slot.
+            return Ok(true);
         }
-        // The queue wrapped without our completion.
-        self.report_io_timeout(qi, opcode, cid, None, None);
+        if !expired {
+            return Ok(false);
+        }
+        self.report_io_timeout(
+            io.qi,
+            io.opcode,
+            io.cid,
+            Some(io.fires_at_submit),
+            Some(io.started),
+        );
         self.dead = true;
         Err(NvmeError::CompletionTimeout)
     }
 
-    /// Async sibling of `submit_io_irq`. Submits the command,
-    /// then `wait_for_irq(vector).await`s the MSI-X completion
-    /// instead of spinning on `fire_count`. Lets the executor
-    /// run other tasks during the I/O — the difference between
-    /// "kernel pauses for the entire I/O" and "kernel does
-    /// other work while the device is busy".
+    /// Async sibling of `submit_io_irq`. Submits the command, then
+    /// parks on the queue's MSI-X vector instead of spinning on
+    /// `fire_count`. Lets the executor run other tasks during the
+    /// I/O — the difference between "kernel pauses for the entire
+    /// I/O" and "kernel does other work while the device is busy".
     ///
-    /// Composed from [`Self::submit_io_begin`] + await +
-    /// [`Self::submit_io_finish`]. The composed form still holds
-    /// `&mut self` — i.e. the slot gate — across the await: that
-    /// is sound here because the gate is an atomic that leaves
-    /// IRQs live (no `IrqSafeSpinLock` is held across the
-    /// suspension point), so the MSI wake can fire; the cost is
-    /// whole-controller serialisation for the I/O duration, the
-    /// same as the sync path. Callers that need the gate released
-    /// across the await use `submit_io_begin` / `submit_io_finish`
-    /// directly. Completion matching is CID-aware (see
-    /// [`Self::try_take_io_cqe`]); true concurrency still needs a
-    /// per-queue CID waiter table + the `InstalledController`
-    /// request-gate → async-Mutex migration, so until then one
-    /// async I/O is in flight per controller.
+    /// The wait is a loop, not a single await: arm a wait, check the
+    /// CQ, await, repeat, until the command's shared deadline
+    /// ([`IO_TIMEOUT_MS`]). A wake that is not this command's
+    /// completion just goes round again, and each wait is also
+    /// bounded by [`ASYNC_CQ_POLL_MS`], so a completion whose
+    /// interrupt never arrives is found by the next CQ check instead
+    /// of costing the whole budget. Only when the deadline has
+    /// passed and a last look at the CQ still finds nothing is the
+    /// command declared lost (controller dead, `CompletionTimeout`).
+    ///
+    /// The composed form still holds `&mut self` — i.e. the slot
+    /// gate — across the await: that is sound here because the gate
+    /// is an atomic that leaves IRQs live (no `IrqSafeSpinLock` is
+    /// held across the suspension point), so the MSI wake can fire;
+    /// the cost is whole-controller serialisation for the I/O
+    /// duration, the same as the sync path. Callers that need the
+    /// gate released across the await use `submit_io_begin` /
+    /// `submit_io_poll` directly. Completion matching is CID-aware
+    /// (see [`Self::try_take_io_cqe`]); true concurrency still needs
+    /// a per-queue CID waiter table + the `InstalledController`
+    /// request-gate → async-Mutex migration, so until then one async
+    /// I/O is in flight per controller.
+    ///
+    /// Dropping the future before it resolves abandons the command
+    /// in the device; its completion is then a stray for the next
+    /// submitter (consumed, counted, logged).
     pub async fn submit_io_irq_async(
         &mut self,
         opcode: u8,
@@ -3547,26 +3602,17 @@ impl Controller {
         if n_blocks == 0 {
             return Ok(());
         }
-        let (qi, cid, _v, wait) = self.submit_io_begin(opcode, lba, n_blocks, buf)?;
-
-        // Park until the MSI-X completion fires OR the 30 s
-        // deadline expires. The first poll returns Ready if MSI
-        // fired between the future's construction (above, pre-
-        // doorbell) and now.
-        match wait.await {
-            Ok(_) => {}
-            Err(_elapsed) => {
-                // Same as the sync path: the buffers may still be DMA
-                // targets, so the controller is no longer trusted.
-                self.report_io_timeout(qi, opcode, cid, None, None);
-                self.dead = true;
-                return Err(NvmeError::CompletionTimeout);
+        let io = self.submit_io_begin(opcode, lba, n_blocks, buf)?;
+        loop {
+            // Arm BEFORE the check: see `submit_io_begin`.
+            let wait = io.wait();
+            if self.submit_io_poll(&io)? {
+                return Ok(());
             }
+            // Either outcome — the vector fired, or the slice ran out —
+            // means "look at the CQ again".
+            let _ = wait.await;
         }
-
-        // Drain the CQE carrying our CID + ring CQ-head doorbell
-        // on the SAME queue we submitted on.
-        self.submit_io_finish(qi, cid, opcode)
     }
 
     /// Validate an NVM Read/Write against the controller and namespace
@@ -4591,7 +4637,7 @@ fn nvme_submit_blocking(
     // block. The buffer is the caller's, pinned by the `Arc` for this
     // whole call and written by nobody else: a write's payload is intact
     // for the replay, and a read's destination is simply filled again.
-    run_with_replay(slot, ctrl, what, |ctrl| {
+    let result = run_with_replay(slot, ctrl, what, |ctrl| {
         let per_cmd = core::cmp::max(1, ctrl.max_transfer_bytes() as u64 / lba_bytes) as u32;
         let mut done: u32 = 0;
         while done < req.blocks {
@@ -4609,8 +4655,53 @@ fn nvme_submit_blocking(
             done += n;
         }
         Ok(())
-    })
-    .map_err(map_nvme_err)
+    });
+    if matches!(result, Err(NvmeError::CompletionTimeout)) {
+        retain_buffer_while_device_live(slot, &buffer);
+    }
+    result.map_err(map_nvme_err)
+}
+
+/// Request buffers kept alive forever because a timed-out command might
+/// still DMA into them (see [`retain_buffer_while_device_live`]).
+static RETAINED_IO_BUFFERS: AtomicU64 = AtomicU64::new(0);
+
+/// Buffers leaked since boot to keep a possibly-live command's DMA target
+/// from being recycled.
+pub fn retained_io_buffers() -> u64 {
+    RETAINED_IO_BUFFERS.load(Ordering::Relaxed)
+}
+
+/// A request on `slot` using the caller's `buffer` failed with a command
+/// timeout. Linux `nvme_timeout` disables the controller
+/// (`nvme_dev_disable`) before it completes the request, so the request's
+/// pages are never handed back under a live command; here the reset at the
+/// timeout site ([`run_with_replay`]) normally does the same. When it
+/// could not — the controller is still dead and was never confirmed
+/// disabled (CSTS.RDY would not drop, the function is gone, the final
+/// shutdown has begun, or the gate cannot even be taken to find out) —
+/// the device may yet write a late read's data into the buffer, so one
+/// reference to it is leaked: the memory can then never be recycled under
+/// that write, exactly as [`Controller::disable_after_failure`] leaks the
+/// queues when RDY never clears.
+fn retain_buffer_while_device_live(
+    slot: &'static InstalledController,
+    buffer: &alloc::sync::Arc<DmaBuffer>,
+) {
+    use core::fmt::Write as _;
+    let quiet = acquire(slot).is_ok_and(|ctrl| !ctrl.may_still_dma());
+    if quiet {
+        return;
+    }
+    core::mem::forget(alloc::sync::Arc::clone(buffer));
+    RETAINED_IO_BUFFERS.fetch_add(1, Ordering::Relaxed);
+    let _ = writeln!(
+        narf_console::Writer,
+        "nvme: {}: ERROR: controller not confirmed disabled after a command timeout; \
+         keeping the request's {} byte DMA buffer alive forever (the device may still write it)",
+        ns::controller_name(slot.instance),
+        buffer.len(),
+    );
 }
 
 /// Dataset Management (Deallocate) over `ranges` of the primary
