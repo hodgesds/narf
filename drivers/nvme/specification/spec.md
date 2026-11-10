@@ -404,13 +404,32 @@ head:
   tracked on the admin queue — a completion stashed by
   `submit_raw_ms` untracks its CID, so the count drops until
   `drain_aer` reposts) and `Controller::stray_aer_len()`.
+- No stray is dropped silently. Every dropped stray (both
+  matchers; a stashed AER completion is not a drop) is counted —
+  `stray_cqe_drops()` — and the 1st, 10th, 100th, ... is logged
+  with the queue, CQ head index and phase, the expected CID and
+  the seen CQE's CID / SQ id / SQ head / status / result (Linux
+  `nvme_handle_cqe`: "invalid id %d completed on queue %d").
+- Every completion timeout is logged where it is declared and
+  counted — `command_timeouts()`: opcode, CID, queue, elapsed
+  time, CQ head index + phase and the head CQE (marked FRESH
+  when its phase tag says a completion is sitting there
+  unconsumed), SQ tail, CSTS, the queue's interrupt vector with
+  its `fire_count` and the number of times it fired since the
+  command was submitted, and whether this CPU has interrupts
+  enabled / is in an interrupt handler (Linux `nvme_timeout`:
+  "I/O tag %d (%04x) opcode %#x QID %d timeout"). The async
+  finish path reports the same line without the elapsed time.
 
 **Fixture:** `imp/tests_cid.rs` drives the real
 `submit_raw_ms` loop against a RAM-backed fake controller
 with spec-laid-out pre-posted CQEs (§4.6): a stray AER error
 completion at the admin head is skipped (event word stashed,
 then drained + reposted) and the submit returns its own CQE;
-an I/O-queue stray is dropped, never stashed. A live AER
+an I/O-queue stray is dropped, never stashed — and counted
+by both matchers (`smoke_nvme_stray_drop_is_counted`); a
+command against a silent CQ times out, is counted once and
+consumes nothing (`smoke_nvme_timeout_is_counted`). A live AER
 event cannot be synthesised on QEMU from the harness (no QMP
 hot-attach), so the live event half is silicon-only — the
 same carve-out as the AER supervisor.

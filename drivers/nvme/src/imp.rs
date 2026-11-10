@@ -41,7 +41,7 @@ mod tests_multi;
 
 use core::cell::UnsafeCell;
 use core::future::Future;
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use narf_block::{
@@ -717,10 +717,13 @@ impl Queue {
     /// task posting concurrently — Stage-3 single-threaded).
     unsafe fn submit_raw(&mut self, bar0: &MmioRegion, sqe: Sqe) -> Result<Cqe, NvmeError> {
         // SAFETY: forwarded under the caller's contract.
-        unsafe { self.submit_raw_ms(bar0, sqe, CQE_TIMEOUT_MS) }
+        unsafe { self.submit_raw_ms(bar0, sqe, CQE_TIMEOUT_MS, None) }
     }
 
     /// [`Self::submit_raw`] with a completion budget of `timeout_ms`.
+    /// `vector` is the interrupt vector this queue's CQ is wired to, if
+    /// any; the wait itself is polled, the vector only feeds the timeout
+    /// report ([`log_cmd_timeout`]).
     ///
     /// # Safety
     /// Same invariants as [`Queue::submit_raw`].
@@ -729,7 +732,11 @@ impl Queue {
         bar0: &MmioRegion,
         mut sqe: Sqe,
         timeout_ms: u64,
+        vector: Option<u8>,
     ) -> Result<Cqe, NvmeError> {
+        let opcode = (sqe.cdw0 & 0xFF) as u8;
+        let started = narf_time::now_cycles();
+        let fires_at_submit = vector.map(narf_interrupts::fire_count);
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         // Preserve opcode (low 8 bits) + FUSE/PSDT (bits 8..15) and
@@ -758,23 +765,50 @@ impl Queue {
         // other stray — another command's late completion, only
         // possible if the single-submitter invariant was broken —
         // is consumed and dropped so it can never be mistaken for
-        // a later command's completion either.
+        // a later command's completion either. A dropped stray is
+        // counted and reported ([`note_stray_cqe`]); a timeout is
+        // reported where it is declared ([`log_cmd_timeout`]).
         let deadline = narf_time::Deadline::after_ms(timeout_ms);
         loop {
             if deadline.expired() {
+                log_cmd_timeout(
+                    bar0,
+                    self,
+                    opcode,
+                    cid,
+                    vector,
+                    fires_at_submit,
+                    Some(started),
+                );
                 return Err(NvmeError::CompletionTimeout);
             }
             let remaining_ms = narf_time::cycles_to_ns(deadline.remaining_cycles()) / 1_000_000;
             // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
-            let cqe = unsafe {
+            let waited = unsafe {
                 wait_cqe_ms(
                     &self.cq_buf,
                     self.cq_head,
                     self.cq_phase,
                     remaining_ms.max(1),
-                )?
+                )
+            };
+            let cqe = match waited {
+                Ok(cqe) => cqe,
+                Err(e) => {
+                    log_cmd_timeout(
+                        bar0,
+                        self,
+                        opcode,
+                        cid,
+                        vector,
+                        fires_at_submit,
+                        Some(started),
+                    );
+                    return Err(e);
+                }
             };
 
+            let (head, phase) = (self.cq_head, self.cq_phase);
             self.advance_head(bar0);
             if cqe.is_for(cid) {
                 return Ok(cqe);
@@ -787,9 +821,11 @@ impl Queue {
                     self.stray_aer[self.stray_aer_len as usize] = cqe.cmd_specific;
                     self.stray_aer_len += 1;
                 }
+                continue;
             }
-            // Otherwise: another command's completion. Consumed
-            // and dropped above; keep waiting for ours.
+            // Otherwise: another command's completion. Consumed and
+            // dropped above, reported here; keep waiting for ours.
+            note_stray_cqe(bar0.phys.raw(), self.qid, head, phase, cid, &cqe);
         }
     }
 
@@ -800,10 +836,11 @@ impl Queue {
     /// Same invariants as [`Queue::submit_raw`].
     unsafe fn submit(&mut self, bar0: &MmioRegion, sqe: Sqe) -> Result<Cqe, NvmeError> {
         // SAFETY: forwarded under the caller's contract.
-        unsafe { self.submit_ms(bar0, sqe, CQE_TIMEOUT_MS) }
+        unsafe { self.submit_ms(bar0, sqe, CQE_TIMEOUT_MS, None) }
     }
 
-    /// [`Self::submit`] with a completion budget of `timeout_ms`.
+    /// [`Self::submit`] with a completion budget of `timeout_ms`; `vector`
+    /// as in [`Self::submit_raw_ms`].
     ///
     /// # Safety
     /// Same invariants as [`Queue::submit_raw`].
@@ -812,10 +849,11 @@ impl Queue {
         bar0: &MmioRegion,
         sqe: Sqe,
         timeout_ms: u64,
+        vector: Option<u8>,
     ) -> Result<Cqe, NvmeError> {
         let opcode = (sqe.cdw0 & 0xFF) as u8;
         // SAFETY: forwarded under the caller's `submit` contract.
-        let cqe = unsafe { self.submit_raw_ms(bar0, sqe, timeout_ms)? };
+        let cqe = unsafe { self.submit_raw_ms(bar0, sqe, timeout_ms, vector)? };
         let nvme_status = cqe.status >> 1;
         if nvme_status != 0 {
             return Err(NvmeError::CommandFailed {
@@ -1042,24 +1080,41 @@ impl Controller {
         sqe.nsid = nsid;
         // Every I/O path consumes its completion before returning, so all
         // earlier writes are complete; one Flush on any queue covers them.
+        // A Flush carries no data pointer.
         let qi = self.pick_queue();
+        self.submit_sqe_polled(qi, sqe, FLUSH_TIMEOUT_MS)?;
+        self.flushes_completed += 1;
+        Ok(())
+    }
+
+    /// Submit a prebuilt SQE on I/O queue `qi` and poll its CQ for the
+    /// completion, within `timeout_ms`. The polled sibling of
+    /// [`Self::submit_sqe_irq`]: Flush, Dataset Management and Write
+    /// Zeroes always take it, Read/Write when the queue has no vector. A
+    /// completion timeout marks the controller dead — the command and any
+    /// page it names may still be live in the device.
+    ///
+    /// The caller guarantees what every I/O path here does: the SQE's data
+    /// pointer (if any) names DMA memory that outlives the command — the
+    /// caller's buffer across this synchronous call, or one of the
+    /// controller's persistent pages.
+    fn submit_sqe_polled(
+        &mut self,
+        qi: usize,
+        sqe: Sqe,
+        timeout_ms: u64,
+    ) -> Result<Cqe, NvmeError> {
+        let vector = self.io_irq_vectors.get(qi).copied();
         let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        // SAFETY: the I/O queue and BAR0 are live; a Flush carries no data
-        // pointer.
-        let r = unsafe { io.submit_ms(bar0, sqe, FLUSH_TIMEOUT_MS) };
-        match r {
-            Ok(_) => {
-                self.flushes_completed += 1;
-                Ok(())
-            }
-            Err(e) => {
-                if e == NvmeError::CompletionTimeout {
-                    self.dead = true;
-                }
-                Err(e)
-            }
+        // SAFETY: the I/O queue and BAR0 are live, `&mut self` makes this
+        // the queue's only submitter, and the data pointer is valid per
+        // this function's contract.
+        let r = unsafe { io.submit_ms(bar0, sqe, timeout_ms, vector) };
+        if let Err(NvmeError::CompletionTimeout) = r {
+            self.dead = true;
         }
+        r
     }
 
     /// Identify Controller ONCS bit 2: the controller supports the
@@ -1175,16 +1230,10 @@ impl Controller {
             sqe.cdw10 = (chunk.len() - 1) as u32;
             // CDW11 bit 2 = Attribute – Deallocate (Figure 40).
             sqe.cdw11 = DSM_CDW11_DEALLOCATE;
+            // The range-list page is persistent DMA memory that
+            // outlives the command.
             let qi = self.pick_queue();
-            let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-            let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-            // SAFETY: io queue + bar are live; the range-list page is
-            // persistent DMA memory that outlives the command.
-            let r = unsafe { io.submit(bar0, sqe) };
-            if let Err(NvmeError::CompletionTimeout) = r {
-                self.dead = true;
-            }
-            r?;
+            self.submit_sqe_polled(qi, sqe, CQE_TIMEOUT_MS)?;
         }
         Ok(())
     }
@@ -1238,16 +1287,9 @@ impl Controller {
             sqe.cdw11 = (at >> 32) as u32;
             // CDW12 bits[15:0] = NLB, 0-based (Figure 73).
             sqe.cdw12 = (n - 1) as u32;
+            // Write Zeroes carries no data pointer.
             let qi = self.pick_queue();
-            let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-            let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-            // SAFETY: io queue + bar are live; Write Zeroes carries
-            // no data pointer.
-            let r = unsafe { io.submit(bar0, sqe) };
-            if let Err(NvmeError::CompletionTimeout) = r {
-                self.dead = true;
-            }
-            r?;
+            self.submit_sqe_polled(qi, sqe, CQE_TIMEOUT_MS)?;
             at += n;
             left -= n;
         }
@@ -3094,6 +3136,8 @@ impl Controller {
         let v = *self.io_irq_vectors.get(qi).ok_or(NvmeError::Msix)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         let opcode = (sqe.cdw0 & 0xFF) as u8;
+        let started = narf_time::now_cycles();
+        let fires_at_submit = Some(narf_interrupts::fire_count(v));
         let deadline = narf_time::Deadline::after_ms(5_000);
 
         // Auto-CID + ring SQ tail doorbell. Scoped so the queue
@@ -3130,6 +3174,7 @@ impl Controller {
                 // The command (and its data / PRP-list pages) may
                 // still be live in the device; stop trusting this
                 // queue.
+                self.report_io_timeout(qi, opcode, cid, fires_at_submit, Some(started));
                 self.dead = true;
                 return Err(NvmeError::CompletionTimeout);
             }
@@ -3152,9 +3197,27 @@ impl Controller {
             if !done {
                 // The command (and its data / PRP-list pages) may still be
                 // live in the device; stop trusting this queue.
+                self.report_io_timeout(qi, opcode, cid, fires_at_submit, Some(started));
                 self.dead = true;
                 return Err(NvmeError::CompletionTimeout);
             }
+        }
+    }
+
+    /// Report a completion timeout of command `cid` on I/O queue `qi`
+    /// ([`log_cmd_timeout`]). Read-only: the caller decides what the
+    /// timeout means for the controller.
+    fn report_io_timeout(
+        &self,
+        qi: usize,
+        opcode: u8,
+        cid: u16,
+        fires_at_submit: Option<u64>,
+        started: Option<u64>,
+    ) {
+        if let (Some(io), Some(bar0)) = (self.io_queues.get(qi), self.bar0_region.as_ref()) {
+            let vector = self.io_irq_vectors.get(qi).copied();
+            log_cmd_timeout(bar0, io, opcode, cid, vector, fires_at_submit, started);
         }
     }
 
@@ -3174,11 +3237,14 @@ impl Controller {
         if (cqe.status & 1) != (io.cq_phase & 1) {
             return Ok(false); // no fresh completion at the head
         }
+        let (head, phase) = (io.cq_head, io.cq_phase);
         io.advance_head(bar0);
         if !cqe.is_for(cid) {
             // Stray completion (another submitter's late CQE, or a
-            // corrupted head): consumed and dropped above. The
-            // caller waits and retries for ours.
+            // corrupted head): consumed and dropped above, counted
+            // and reported here. The caller waits and retries for
+            // ours.
+            note_stray_cqe(bar0.phys.raw(), io.qid, head, phase, cid, &cqe);
             return Ok(false);
         }
         let nvme_status = cqe.status >> 1;
@@ -3355,12 +3421,14 @@ impl Controller {
                 // completion was lost (or the IRQ belonged to another
                 // queue sharing the vector). Same treatment as the sync
                 // path's timeout — the buffers may still be DMA targets.
+                self.report_io_timeout(qi, opcode, cid, None, None);
                 self.dead = true;
                 return Err(NvmeError::CompletionTimeout);
             }
             // A fresh stray was consumed above; loop for the next slot.
         }
         // The queue wrapped without our completion.
+        self.report_io_timeout(qi, opcode, cid, None, None);
         self.dead = true;
         Err(NvmeError::CompletionTimeout)
     }
@@ -3410,6 +3478,7 @@ impl Controller {
             Err(_elapsed) => {
                 // Same as the sync path: the buffers may still be DMA
                 // targets, so the controller is no longer trusted.
+                self.report_io_timeout(qi, opcode, cid, None, None);
                 self.dead = true;
                 return Err(NvmeError::CompletionTimeout);
             }
@@ -3548,17 +3617,10 @@ impl Controller {
         if self.io_irq_vectors.get(qi).is_some() {
             return self.submit_sqe_irq(qi, sqe);
         }
-        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        // SAFETY: io queue + bar are live; the data range and the PRP
-        // list page are DMA memory that outlives the command (the caller
-        // owns the data buffer across this synchronous call; the list is
-        // persistent).
-        let r = unsafe { io.submit(bar0, sqe) };
-        if let Err(NvmeError::CompletionTimeout) = r {
-            self.dead = true;
-        }
-        r.map(|_| ())
+        // The data range and the PRP-list page are DMA memory that
+        // outlives the command (the caller owns the data buffer across
+        // this synchronous call; the list is persistent).
+        self.submit_sqe_polled(qi, sqe, CQE_TIMEOUT_MS).map(|_| ())
     }
 
     /// Polled NVM Read/Write of `n_blocks` LBAs to / from `buf` starting
@@ -3710,16 +3772,9 @@ impl Controller {
         if self.io_irq_vectors.get(qi).is_some() {
             return self.submit_sqe_irq(qi, sqe);
         }
-        let io = self.io_queues.get_mut(qi).ok_or(NvmeError::NoIoQueue)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        // SAFETY: io queue + bar are live; the caller's pages and the
-        // persistent PRP-list page stay mapped across this synchronous
-        // submit.
-        let r = unsafe { io.submit(bar0, sqe) };
-        if let Err(NvmeError::CompletionTimeout) = r {
-            self.dead = true;
-        }
-        r.map(|_| ())
+        // The caller's pages and the persistent PRP-list page stay
+        // mapped across this synchronous submit.
+        self.submit_sqe_polled(qi, sqe, CQE_TIMEOUT_MS).map(|_| ())
     }
 }
 
@@ -3820,6 +3875,150 @@ const DSM_CDW11_DEALLOCATE: u32 = 1 << 2;
 const MAX_WRITE_ZEROES_BLOCKS: u64 = 0x1_0000;
 
 const _: () = assert!(DSM_MAX_RANGES * DSM_RANGE_BYTES <= prp::NVME_CTRL_PAGE_SIZE);
+
+/// Completions consumed from a CQ whose CID matched no waiter, across all
+/// controllers (see [`note_stray_cqe`]).
+static STRAY_CQE_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Commands declared timed out, across all controllers (see
+/// [`log_cmd_timeout`]).
+static CMD_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Stray completions dropped since boot: CQEs that were fresh at a CQ head
+/// but carried a CID no waiter was matching (an outstanding AER's
+/// completion is stashed, not dropped, and is not counted).
+pub fn stray_cqe_drops() -> u64 {
+    STRAY_CQE_DROPS.load(Ordering::Relaxed)
+}
+
+/// Command completion timeouts since boot (admin and I/O).
+pub fn command_timeouts() -> u64 {
+    CMD_TIMEOUTS.load(Ordering::Relaxed)
+}
+
+/// Whether the `n`th occurrence of a repeating event is logged: the 1st,
+/// 10th, 100th, ... so a storm cannot flood the console.
+fn log_due_decade(n: u64) -> bool {
+    let mut p = 1u64;
+    loop {
+        if p == n {
+            return true;
+        }
+        if p > n / 10 {
+            return false;
+        }
+        p *= 10;
+    }
+}
+
+/// Count, and (rate-limited) report, a completion that was consumed from
+/// queue `qid` at CQ index `head` under phase tag `phase` while the waiter
+/// was matching `expected_cid`. Linux `nvme_handle_cqe` warns "invalid id
+/// %d completed on queue %d" for the same event. With one command in
+/// flight per controller a stray means the device completed a command the
+/// host no longer tracks (a late completion of a timed-out command) or
+/// posted a corrupt entry — either way worth knowing about.
+fn note_stray_cqe(bar: u64, qid: u16, head: u16, phase: u16, expected_cid: u16, cqe: &Cqe) {
+    use core::fmt::Write as _;
+    let n = STRAY_CQE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if log_due_decade(n) {
+        let _ = writeln!(
+            narf_console::Writer,
+            "nvme: bar {bar:#x}: WARNING: stray completion dropped on queue {qid} \
+             (cq head {head}, phase {}): expected cid {expected_cid:#06x}, seen cid {:#06x} \
+             sqid {} sqhd {} status {:#06x} result {:#010x} (stray #{n})",
+            phase & 1,
+            cqe.cid,
+            cqe.sq_id,
+            cqe.sq_head,
+            cqe.status >> 1,
+            cqe.cmd_specific,
+        );
+    }
+}
+
+/// Count and report a command completion timeout where it is declared:
+/// the command (`opcode`, `cid`, queue), what the CQ head holds right now,
+/// CSTS, the queue's interrupt vector with its `fire_count` (and how many
+/// times it fired since the command was submitted, when the caller sampled
+/// `fires_at_submit`), this CPU's interrupt state and the elapsed time
+/// since `started` (`now_cycles` at submission). Linux `nvme_timeout`
+/// prints the same class of line ("I/O tag %d (%04x) opcode %#x (%s) QID
+/// %d timeout"). Not rate-limited: every timeout costs its whole budget
+/// first.
+fn log_cmd_timeout(
+    bar0: &MmioRegion,
+    q: &Queue,
+    opcode: u8,
+    cid: u16,
+    vector: Option<u8>,
+    fires_at_submit: Option<u64>,
+    started: Option<u64>,
+) {
+    use core::fmt::Write as _;
+    let n = CMD_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    // SAFETY: cq_buf is the queue's live coherent CQ page; cq_head < depth.
+    let head = unsafe { peek_cqe(&q.cq_buf, q.cq_head) };
+    // SAFETY: BAR0 is this controller's mapped register window; CSTS is a
+    // read-only, side-effect-free register.
+    let csts = unsafe { bar0.read32(REG_CSTS) };
+    let fresh = (head.status & 1) == (q.cq_phase & 1);
+    let mut w = narf_console::Writer;
+    let _ = write!(
+        w,
+        "nvme: bar {:#x}: ERROR: command timeout #{n}: opcode {opcode:#04x} cid {cid:#06x} \
+         queue {}",
+        bar0.phys.raw(),
+        q.qid,
+    );
+    match started {
+        Some(t) => {
+            let ms = narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(t)) / 1_000_000;
+            let _ = write!(w, " after {ms} ms");
+        }
+        None => {
+            let _ = write!(w, " (elapsed n/a)");
+        }
+    }
+    let _ = write!(
+        w,
+        "; cq head {} phase {} head-cqe[{} cid {:#06x} sqid {} sqhd {} status {:#06x}]; \
+         sq tail {}; csts {csts:#x}",
+        q.cq_head,
+        q.cq_phase & 1,
+        if fresh { "FRESH" } else { "stale" },
+        head.cid,
+        head.sq_id,
+        head.sq_head,
+        head.status >> 1,
+        q.sq_tail,
+    );
+    match vector {
+        Some(v) => {
+            let fires = narf_interrupts::fire_count(v);
+            let _ = write!(w, "; vector {v} fire_count {fires}");
+            if let Some(f0) = fires_at_submit {
+                let _ = write!(w, " (+{} since submit)", fires.saturating_sub(f0));
+            }
+        }
+        None => {
+            let _ = write!(w, "; vector none (polled)");
+        }
+    }
+    let _ = writeln!(
+        w,
+        "; irqs {}{}",
+        if narf_memory::context::irqs_enabled() {
+            "enabled"
+        } else {
+            "DISABLED"
+        },
+        if narf_lib::context::in_irq() {
+            ", in irq"
+        } else {
+            ""
+        },
+    );
+}
 
 /// Default completion budget for admin and read/write commands.
 const CQE_TIMEOUT_MS: u64 = 5_000;
