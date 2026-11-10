@@ -123,6 +123,11 @@ pub enum NvmeError {
     /// The namespace's LBA format cannot be used for block I/O (LBA
     /// size outside 512..=4096 bytes, or per-block metadata).
     NamespaceUnusable,
+    /// The controller's request gate did not come free: whoever holds it
+    /// made no progress for [`GATE_STALL_FAIL_MS`] while this caller
+    /// waited. The holder and the wait were logged; nothing was sent to
+    /// the device for this caller. See [`acquire`].
+    GateTimeout,
 }
 
 // ── Register offsets (NVMe base spec §3.1) ──────────────────────────
@@ -4530,7 +4535,7 @@ fn nvme_submit_blocking(
     // device's request gate, not the IRQ-masking CONTROLLERS lock.
     // See `InstalledController`.
     let slot = slot_of(0).ok_or(BlockError::DeviceRemoved)?;
-    let mut ctrl = acquire(slot);
+    let mut ctrl = acquire(slot).map_err(map_nvme_err)?;
     if ctrl.is_dead() {
         // An earlier request left the controller dead (its replays ran
         // out, or the reset at the timeout failed). Try the reset again
@@ -4612,7 +4617,7 @@ fn nvme_submit_blocking(
 /// namespace of controller instance 0 — the async `discard` path.
 fn nvme_discard_primary(ranges: &[LbaRange]) -> Result<(), BlockError> {
     let slot = slot_of(0).ok_or(BlockError::DeviceRemoved)?;
-    let mut ctrl = acquire(slot);
+    let mut ctrl = acquire(slot).map_err(map_nvme_err)?;
     if ctrl.is_dead() {
         // Same dead-controller recovery as the submit path.
         drop(ctrl);
@@ -4628,7 +4633,7 @@ fn nvme_discard_primary(ranges: &[LbaRange]) -> Result<(), BlockError> {
 
 fn nvme_flush_primary() -> Result<(), BlockError> {
     let slot = slot_of(0).ok_or(BlockError::DeviceRemoved)?;
-    let mut ctrl = acquire(slot);
+    let mut ctrl = acquire(slot).map_err(map_nvme_err)?;
     if ctrl.is_dead() {
         // Same dead-controller recovery as the submit path.
         drop(ctrl);
@@ -4718,6 +4723,18 @@ struct InstalledController {
     /// Serialises device round-trips and all references into `ctrl`.
     /// Acquired by [`acquire`] without changing the caller's interrupt state.
     req_gate: AtomicBool,
+    /// Who took `req_gate` last: CPU in bits 63:48, scheduler task id (0 =
+    /// outside any task poll) in bits 47:0. Diagnostic only — written right
+    /// after the gate is won, read unsynchronised by waiters that have
+    /// been waiting long enough to report ([`GateWait`]).
+    gate_owner: AtomicU64,
+    /// `narf_time::now_cycles()` when `req_gate` was last taken. Diagnostic
+    /// only, as `gate_owner`.
+    gate_since: AtomicU64,
+    /// `narf_time::now_cycles()` of the holder's last progress mark
+    /// ([`mark_gate_progress`]): a holder that legitimately keeps the gate
+    /// across a reset and a replay is not a stalled holder.
+    gate_progress: AtomicU64,
     /// Probe-order instance: the controller is `nvme<instance>`.
     instance: u32,
     /// PCI function this slot drives (`None` for a device-less test
@@ -4792,6 +4809,9 @@ fn leak_slot(
     let shutdown_regs = shutdown_regs_of(&ctrl);
     alloc::boxed::Box::leak(alloc::boxed::Box::new(InstalledController {
         req_gate: AtomicBool::new(false),
+        gate_owner: AtomicU64::new(0),
+        gate_since: AtomicU64::new(0),
+        gate_progress: AtomicU64::new(0),
         instance,
         bdf,
         removed: AtomicBool::new(false),
@@ -4887,22 +4907,204 @@ impl Drop for ControllerGuard {
     }
 }
 
+/// How long a gate waiter waits before it first reports the holder.
+pub const GATE_STALL_WARN_MS: u64 = 2_000;
+/// Interval between a waiter's further reports while it keeps waiting.
+pub const GATE_STALL_REPORT_EVERY_MS: u64 = 10_000;
+/// A gate waiter gives up with [`NvmeError::GateTimeout`] once the gate has
+/// been held, with no progress mark from its holder, for this long while
+/// the waiter waited. Twice the I/O budget ([`IO_TIMEOUT_MS`]): the longest
+/// a healthy holder goes between marks is one command's budget (a reset
+/// and every replay mark progress), so only a holder that is not running
+/// at all — or a controller whose reset itself is taking minutes — trips
+/// it.
+pub const GATE_STALL_FAIL_MS: u64 = 60_000;
+
+/// Test hooks: when nonzero, replace [`GATE_STALL_WARN_MS`] /
+/// [`GATE_STALL_FAIL_MS`]. Read only by a waiter that is already
+/// contended, never on the uncontended path.
+#[doc(hidden)]
+pub static GATE_STALL_WARN_MS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+#[doc(hidden)]
+pub static GATE_STALL_FAIL_MS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+
+/// Gate-stall reports logged, and gate waits that failed, since boot.
+static GATE_STALL_REPORTS: AtomicU64 = AtomicU64::new(0);
+static GATE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Times a waiter reported a long wait for a controller's request gate.
+pub fn gate_stall_reports() -> u64 {
+    GATE_STALL_REPORTS.load(Ordering::Relaxed)
+}
+
+/// Gate waits that ended in [`NvmeError::GateTimeout`].
+pub fn gate_timeouts() -> u64 {
+    GATE_TIMEOUTS.load(Ordering::Relaxed)
+}
+
+/// Bits of `gate_owner` holding the task id; the CPU sits above them.
+const GATE_OWNER_TASK_BITS: u32 = 48;
+
+/// This context as a `gate_owner` word.
+#[inline]
+fn gate_owner_word() -> u64 {
+    let cpu = narf_lib::percpu::current_cpu() as u64;
+    let task = narf_scheduler::current_task_id().raw();
+    (cpu << GATE_OWNER_TASK_BITS) | (task & ((1 << GATE_OWNER_TASK_BITS) - 1))
+}
+
+/// Try once to take `slot`'s gate; on success record who holds it and
+/// since when. The record is the whole hot-path cost of the stall
+/// diagnostics: two relaxed stores (plus one TSC read and two per-CPU
+/// reads) per acquisition — no lock, no branch on the wait state, nothing
+/// on release. Every acquisition goes through here, including the
+/// shutdown / suspend / resume drains that poll the gate themselves.
+#[inline]
+fn try_take_gate(slot: &InstalledController) -> bool {
+    if slot
+        .req_gate
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    slot.gate_owner.store(gate_owner_word(), Ordering::Relaxed);
+    slot.gate_since
+        .store(narf_time::now_cycles(), Ordering::Relaxed);
+    true
+}
+
+/// Mark progress by the gate's holder: it is alive and moving (a reset
+/// finished, a replay is starting), so waiters measure the stall from
+/// here. Called under the gate.
+fn mark_gate_progress(slot: &InstalledController) {
+    slot.gate_progress
+        .store(narf_time::now_cycles(), Ordering::Relaxed);
+}
+
+/// One contended wait for a gate: when it began and when it next reports.
+/// Created only after the first spin round failed.
+struct GateWait {
+    started: u64,
+    fail_ms: u64,
+    next_report_ms: u64,
+}
+
+impl GateWait {
+    fn begin() -> Self {
+        let pick = |hook: &AtomicU64, default: u64| match hook.load(Ordering::Relaxed) {
+            0 => default,
+            ms => ms,
+        };
+        let warn_ms = pick(&GATE_STALL_WARN_MS_FOR_TEST, GATE_STALL_WARN_MS);
+        Self {
+            started: narf_time::now_cycles(),
+            fail_ms: pick(&GATE_STALL_FAIL_MS_FOR_TEST, GATE_STALL_FAIL_MS),
+            next_report_ms: warn_ms,
+        }
+    }
+
+    /// Report a long wait when one is due; `Err` once the holder has
+    /// shown no progress for the fail bound while this waiter waited.
+    fn check(&mut self, slot: &InstalledController) -> Result<(), NvmeError> {
+        use core::fmt::Write as _;
+        let ms = |cycles: u64| narf_time::cycles_to_ns(cycles) / 1_000_000;
+        let now = narf_time::now_cycles();
+        let waited_ms = ms(now.saturating_sub(self.started));
+        if waited_ms < self.next_report_ms {
+            return Ok(());
+        }
+        // Unsynchronised reads of the holder's record: it may belong to a
+        // holder that has since released (the gate changes hands while we
+        // starve), which the report then shows as a short hold.
+        let owner = slot.gate_owner.load(Ordering::Relaxed);
+        let since = slot.gate_since.load(Ordering::Relaxed);
+        let progress = slot.gate_progress.load(Ordering::Relaxed).max(since);
+        let held_ms = ms(now.saturating_sub(since));
+        // The stall this waiter can vouch for: no progress by the holder
+        // since the later of "it last marked progress" and "we arrived".
+        let stalled_ms = ms(now.saturating_sub(progress.max(self.started)));
+        let failed = stalled_ms >= self.fail_ms;
+        let holder_cpu = owner >> GATE_OWNER_TASK_BITS;
+        let holder_task = owner & ((1 << GATE_OWNER_TASK_BITS) - 1);
+        let cpu = narf_lib::percpu::current_cpu() as u64;
+        let irqs = narf_memory::context::irqs_enabled();
+        let in_irq = narf_lib::context::in_irq();
+        GATE_STALL_REPORTS.fetch_add(1, Ordering::Relaxed);
+        let mut w = narf_console::Writer;
+        let _ = write!(
+            w,
+            "nvme: {}: {}: request gate {} by cpu {holder_cpu} task {holder_task} for {held_ms} ms \
+             (last progress {} ms ago); waiter cpu {cpu} task {} waited {waited_ms} ms, irqs {}{}",
+            ns::controller_name(slot.instance),
+            if failed { "ERROR" } else { "WARNING" },
+            if slot.req_gate.load(Ordering::Relaxed) {
+                "held"
+            } else {
+                "last held"
+            },
+            ms(now.saturating_sub(progress)),
+            narf_scheduler::current_task_id().raw(),
+            if irqs { "enabled" } else { "DISABLED" },
+            if in_irq { ", in irq" } else { "" },
+        );
+        if holder_cpu == cpu {
+            // The holder took the gate on this CPU. Unless it is a task
+            // this waiter can yield to, it cannot run until this wait
+            // ends — the nested-pump / interrupted-holder deadlock.
+            let _ = write!(
+                w,
+                "; holder is on THIS cpu (it runs only if this waiter yields or returns)"
+            );
+        }
+        if failed {
+            GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            let _ = writeln!(
+                w,
+                "; no progress for {stalled_ms} ms (limit {} ms): giving up, this request fails",
+                self.fail_ms
+            );
+            return Err(NvmeError::GateTimeout);
+        }
+        let _ = writeln!(w);
+        // Next report in `GATE_STALL_REPORT_EVERY_MS`, or when the fail
+        // bound falls due, whichever is first.
+        let to_fail = self.fail_ms.saturating_sub(stalled_ms).max(1);
+        self.next_report_ms = waited_ms + GATE_STALL_REPORT_EVERY_MS.min(to_fail);
+        Ok(())
+    }
+}
+
 /// Take `slot`'s gate without masking interrupts. A brief spin handles a
 /// holder running on another CPU; a longer wait yields so a holder suspended
 /// on this CPU can resume. Atomic contexts cannot yield and must service
 /// pending TLB/membarrier work, which the holder may be waiting for.
-fn acquire(slot: &'static InstalledController) -> ControllerGuard {
+///
+/// The wait is neither anonymous nor unbounded. A waiter that has waited
+/// [`GATE_STALL_WARN_MS`] logs who holds the gate (CPU, task), for how
+/// long, and who is waiting (CPU, task, interrupt state), and repeats that
+/// every [`GATE_STALL_REPORT_EVERY_MS`]. Once the holder has shown no
+/// progress for [`GATE_STALL_FAIL_MS`] of the waiter's wait, the waiter
+/// logs an error and returns [`NvmeError::GateTimeout`] — it does not
+/// panic. An error is the right failure here because it can be survived
+/// and, in the one known way to wedge the gate, it *un*-wedges it: a
+/// holder whose wait loop runs the scheduler pump, which polls a task
+/// that wants the same controller, has the waiter sitting on top of the
+/// holder's own stack — the holder cannot resume until the waiter
+/// returns, and a panic there would take the machine down with the root
+/// filesystem's holder merely preempted by its own callee. A waiter
+/// that fails gets an I/O error; the log line says exactly who was
+/// stuck behind whom.
+fn acquire(slot: &'static InstalledController) -> Result<ControllerGuard, NvmeError> {
+    let mut wait: Option<GateWait> = None;
     loop {
         for _ in 0..64 {
-            if slot
-                .req_gate
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return ControllerGuard { slot };
+            if try_take_gate(slot) {
+                return Ok(ControllerGuard { slot });
             }
             core::hint::spin_loop();
         }
+        wait.get_or_insert_with(GateWait::begin).check(slot)?;
         if !narf_memory::context::irqs_enabled()
             || narf_lib::context::in_irq()
             || !narf_scheduler::cooperative_yield()
@@ -4914,13 +5116,17 @@ fn acquire(slot: &'static InstalledController) -> ControllerGuard {
 }
 
 /// Exclusive access to controller `instance`, or `None` if it is not
-/// installed (or was removed).
+/// installed (or was removed), or its gate could not be taken
+/// ([`NvmeError::GateTimeout`]).
 ///
 /// `smoke_nvme_controller_slot_is_stable` pins the address-stability
 /// invariant this relies on: a repeat probe must not move or replace an
 /// installed slot.
 fn controller_at(instance: u32) -> Option<ControllerGuard> {
-    slot_of(instance).map(acquire)
+    // A gate that never came free reads as "no controller" here: the
+    // stall was logged by `acquire`, and every caller already treats
+    // `None` as "cannot be served".
+    slot_of(instance).and_then(|slot| acquire(slot).ok())
 }
 
 /// Exclusive access to the first controller (`nvme0`).
@@ -5075,7 +5281,7 @@ fn sync_io(
     // serialises the controller's scratch, so acquire it BEFORE touching
     // the buffer.
     let slot = slot_of(instance).ok_or(BlockIoError::DeviceRemoved)?;
-    let mut ctrl = acquire(slot);
+    let mut ctrl = acquire(slot).map_err(map_nvme_sync_err)?;
     if slot.removed.load(Ordering::Acquire) {
         return Err(BlockIoError::DeviceRemoved);
     }
@@ -5088,7 +5294,7 @@ fn sync_io(
         // will have removed the slot.
         drop(ctrl);
         recover_slot(instance).map_err(map_nvme_sync_err)?;
-        ctrl = acquire(slot);
+        ctrl = acquire(slot).map_err(map_nvme_sync_err)?;
         if slot.removed.load(Ordering::Acquire) {
             return Err(BlockIoError::DeviceRemoved);
         }
@@ -5258,6 +5464,9 @@ fn run_with_replay<T>(
             // next request tries the reset again.
             Err(_) => return Err(NvmeError::CompletionTimeout),
         };
+        // Still the holder, and moving: gate waiters measure a stall from
+        // here, not from the first attempt.
+        mark_gate_progress(slot);
         if streak > IO_MAX_RETRIES {
             let _ = writeln!(
                 narf_console::Writer,
@@ -5357,7 +5566,7 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
 /// Flush namespace `nsid` (`None` = primary) of controller `instance`.
 fn sync_flush(instance: u32, nsid: Option<u32>) -> Result<(), narf_block::BlockIoError> {
     let slot = slot_of(instance).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-    let mut ctrl = acquire(slot);
+    let mut ctrl = acquire(slot).map_err(map_nvme_sync_err)?;
     if slot.removed.load(Ordering::Acquire) {
         return Err(narf_block::BlockIoError::DeviceRemoved);
     }
@@ -5365,7 +5574,7 @@ fn sync_flush(instance: u32, nsid: Option<u32>) -> Result<(), narf_block::BlockI
         // Same dead-controller recovery as the I/O path.
         drop(ctrl);
         recover_slot(instance).map_err(map_nvme_sync_err)?;
-        ctrl = acquire(slot);
+        ctrl = acquire(slot).map_err(map_nvme_sync_err)?;
         if slot.removed.load(Ordering::Acquire) {
             return Err(narf_block::BlockIoError::DeviceRemoved);
         }
@@ -5397,7 +5606,7 @@ fn sync_trim(
     n_blocks: u64,
 ) -> Result<(), narf_block::BlockIoError> {
     let slot = slot_of(instance).ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-    let mut ctrl = acquire(slot);
+    let mut ctrl = acquire(slot).map_err(map_nvme_sync_err)?;
     if slot.removed.load(Ordering::Acquire) {
         return Err(narf_block::BlockIoError::DeviceRemoved);
     }
@@ -5405,7 +5614,7 @@ fn sync_trim(
         // Same dead-controller recovery as the I/O path.
         drop(ctrl);
         recover_slot(instance).map_err(map_nvme_sync_err)?;
-        ctrl = acquire(slot);
+        ctrl = acquire(slot).map_err(map_nvme_sync_err)?;
         if slot.removed.load(Ordering::Acquire) {
             return Err(narf_block::BlockIoError::DeviceRemoved);
         }
@@ -5569,12 +5778,19 @@ fn register_controller(instance: u32, device: narf_bus::BusDevice, cap: Cap<BusD
 /// untouched.
 ///
 /// Returns `None` if `instance` is not installed, else whether the
-/// controller was confirmed stopped.
+/// controller was confirmed stopped (`false` also when its request gate
+/// never came free, in which case it was not touched).
 pub fn remove_controller(instance: u32, cap: &Cap<BusDeviceCap, Write>) -> Option<bool> {
     let slot = slot_of(instance)?;
     slot.removed.store(true, Ordering::Release);
     withdraw_controller_publications(instance);
-    let mut ctrl = acquire(slot);
+    // The slot is already refusing new requests. If the in-flight one
+    // never releases the gate the controller cannot be touched safely:
+    // report it as not confirmed stopped. Its DMA stays with the leaked
+    // slot, exactly as when CSTS.RDY never drops.
+    let Ok(mut ctrl) = acquire(slot) else {
+        return Some(false);
+    };
     Some(ctrl.disable_after_failure(cap))
 }
 
@@ -5629,7 +5845,7 @@ fn withdraw_controller_publications(instance: u32) {
 /// [`remove_controller`].
 fn recover_slot(instance: u32) -> Result<(), NvmeError> {
     let slot = slot_of(instance).ok_or(NvmeError::NotReady)?;
-    recover_held(slot, acquire(slot)).map(|_| ())
+    recover_held(slot, acquire(slot)?).map(|_| ())
 }
 
 /// [`recover_slot`] under a gate the caller already holds. Returns the
@@ -5752,7 +5968,10 @@ fn aer_poll_instance(instance: u32) {
     // the same hold so no I/O can interleave with the namespace-set
     // swap; re-publication happens after the guard drops.
     let (changed, device) = {
-        let mut ctrl = acquire(slot);
+        // A stalled gate was logged by `acquire`; skip this round.
+        let Ok(mut ctrl) = acquire(slot) else {
+            return;
+        };
         if slot.removed.load(Ordering::Acquire) || ctrl.is_dead() || ctrl.is_suspended() {
             return;
         }
@@ -5857,15 +6076,7 @@ fn shutdown_slot(
 ) -> SlotShutdown {
     use core::fmt::Write as _;
     let name = ns::controller_name(slot.instance);
-    let got = drain_ms > 0
-        && wait(
-            &mut || {
-                slot.req_gate
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            },
-            drain_ms,
-        );
+    let got = drain_ms > 0 && wait(&mut || try_take_gate(slot), drain_ms);
     if got {
         let mut ctrl = ControllerGuard { slot };
         return match ctrl.shutdown() {
@@ -6028,15 +6239,7 @@ fn suspend_slot(
     drain_ms: u64,
     wait: &mut dyn FnMut(&mut dyn FnMut() -> bool, u64) -> bool,
 ) -> SlotSuspend {
-    let got = drain_ms > 0
-        && wait(
-            &mut || {
-                slot.req_gate
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            },
-            drain_ms,
-        );
+    let got = drain_ms > 0 && wait(&mut || try_take_gate(slot), drain_ms);
     if !got {
         return SlotSuspend::Busy;
     }
@@ -6065,15 +6268,7 @@ fn resume_slot(
     drain_ms: u64,
     wait: &mut dyn FnMut(&mut dyn FnMut() -> bool, u64) -> bool,
 ) -> SlotResume {
-    let got = drain_ms > 0
-        && wait(
-            &mut || {
-                slot.req_gate
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            },
-            drain_ms,
-        );
+    let got = drain_ms > 0 && wait(&mut || try_take_gate(slot), drain_ms);
     if !got {
         return SlotResume::Busy;
     }
