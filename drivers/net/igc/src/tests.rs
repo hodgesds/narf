@@ -25,12 +25,14 @@ struct Model {
     phy: RefCell<BTreeMap<u8, u16>>,
     mmd: RefCell<BTreeMap<(u16, u16), u16>>,
     writes: RefCell<Vec<(u64, u32)>>,
+    delays: RefCell<Vec<(u64, bool)>>,
     /// Shadow-RAM words landed by SRWR writes, backing later EERD reads.
     shadow: RefCell<BTreeMap<u16, u16>>,
     mmd_dev: Cell<u16>,
     mmd_reg: Cell<u16>,
     stuck_master: Cell<bool>,
     stuck_queue: Cell<bool>,
+    stuck_rx_disable: Cell<bool>,
     require_start_prerequisites: Cell<bool>,
     pci_master: Cell<bool>,
     stuck_nvm: Cell<bool>,
@@ -99,6 +101,14 @@ impl Registers for Model {
         if reg & 0x3f == 0x28 && self.stuck_queue.get() {
             value &= !(1 << 25);
         }
+        if self.stuck_rx_disable.get()
+            && (0xc028..=0xc0e8).contains(&reg)
+            && reg & 0x3f == 0x28
+            && self.value(reg) & (1 << 25) != 0
+            && value & (1 << 25) == 0
+        {
+            value |= 1 << 25;
+        }
         if self.require_start_prerequisites.get()
             && ((0xe028..=0xe0e8).contains(&reg) || (0xc028..=0xc0e8).contains(&reg))
             && reg & 0x3f == 0x28
@@ -165,7 +175,13 @@ impl Registers for Model {
         }
         false
     }
-    fn delay(&self, _: u64) {}
+    fn delay(&self, us: u64) {
+        let rejecting = self.value(0x5004) == 0
+            && self.value(0x5008) & 0x50000 == 0x10000
+            && self.value(0x100) & (2 | 4 | 0x20) == 2 | 0x20
+            && (0..4).all(|q| self.value(0xc028 + q * 0x40) & (1 << 25) == 0);
+        self.delays.borrow_mut().push((us, rejecting));
+    }
 }
 
 macro_rules! check {
@@ -685,6 +701,112 @@ fn smoke_igc_activation_refusal_never_posts_receive_buffers() -> TestResult {
 kernel_test_in!(
     "drivers/net/igc",
     smoke_igc_activation_refusal_never_posts_receive_buffers
+);
+
+fn smoke_igc_rx_erratum_precedes_buffer_publication() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().insert(0x5008, 0x40020);
+    hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+    hardware::activate_queues(&m, &[256], || Ok(())).unwrap();
+    check!(
+        m.value(0x5008) == 0x50020,
+        "IPv6 erratum or unrelated RFCTL bits lost"
+    );
+    let writes = m.writes.borrow();
+    let erratum = writes
+        .iter()
+        .position(|&(reg, v)| reg == 0x5008 && v & 0x10000 != 0)
+        .unwrap();
+    let publish = writes
+        .iter()
+        .position(|&(reg, v)| reg == 0xc018 && v != 0)
+        .unwrap();
+    check!(
+        erratum < publish,
+        "RX buffers published before parser erratum"
+    );
+    check!(
+        !writes.iter().any(|&(reg, _)| reg == 0x5004) && m.delays.borrow().is_empty(),
+        "management flush ran without management receive enabled"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc/init",
+    smoke_igc_rx_erratum_precedes_buffer_publication
+);
+
+fn smoke_igc_management_fifo_flush_restores_queue_policy() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().extend([
+        (0x5820, 0x20000),
+        (0x5008, 0x40020),
+        (0x5004, 1522),
+        (0x100, 0x04008024),
+    ]);
+    for q in 0..2 {
+        hardware::queue(&m, q, 0x1000, 0x2000, 256).unwrap();
+    }
+    hardware::activate_queues(&m, &[256; 2], || Ok(())).unwrap();
+    check!(
+        m.delays.borrow().as_slice() == [(2000, true)],
+        "FIFO flush did not reject all traffic for the bounded delay"
+    );
+    check!(
+        m.value(0x5004) == 1522
+            && m.value(0x5008) == 0x50020
+            && m.value(0x100) == 0x04008026
+            && (0..2)
+                .all(|q| m.value(0xc028 + q * 0x40) == 0x02010808
+                    && m.value(0xc018 + q * 0x40) == 255)
+            && (2..4).all(|q| m.value(0xc028 + q * 0x40) == 0),
+        "FIFO flush lost active queue configuration or enabled an unused queue"
+    );
+    let writes = m.writes.borrow();
+    let restore = writes
+        .iter()
+        .rposition(|&(r, v)| r == 0x5008 && v == 0x50020)
+        .unwrap();
+    let publish = writes
+        .iter()
+        .position(|&(r, v)| r == 0xc018 && v != 0)
+        .unwrap();
+    check!(
+        restore < publish,
+        "RX tails posted during temporary FIFO rejection"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc/init",
+    smoke_igc_management_fifo_flush_restores_queue_policy
+);
+
+fn smoke_igc_fifo_refusal_never_publishes_receive_buffers() -> TestResult {
+    for reject_filter in [false, true] {
+        let m = Model::new();
+        m.regs.borrow_mut().insert(0x5820, 0x20000);
+        hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+        if reject_filter {
+            m.rejected_register.set(Some(0x5008));
+        } else {
+            m.stuck_rx_disable.set(true);
+        }
+        check!(
+            hardware::activate_queues(&m, &[256], || Ok(())).is_err(),
+            "FIFO prerequisite refusal was accepted"
+        );
+        check!(
+            (0..4).all(|q| m.value(0xc018 + q * 0x40) == 0)
+                && !m.writes.borrow().iter().any(|&(r, _)| r == 0x5004),
+            "FIFO refusal published buffers or changed length before queue drain"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc/init",
+    smoke_igc_fifo_refusal_never_publishes_receive_buffers
 );
 
 fn smoke_igc_queue_rejected_configuration_never_enables_dma() -> TestResult {
