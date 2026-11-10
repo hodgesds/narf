@@ -35,7 +35,7 @@ pub mod rw_gate {
     pub const ROOT_RW_INCOMPAT: u64;     // narrow production-root set
     pub enum Profile { Default, RootRw } // RootRw under narf.disks=root-rw
     pub enum Refusal { Incompat(u64), CompatRo(u64), FreeSpaceTreeInvalid,
-        NoFreeSpaceTree, LogTree(u64), ChecksumType(u16), SectorSize(u32),
+        NoFreeSpaceTree, ChecksumType(u16), SectorSize(u32),
         NodeSize(u32), ErrorState, SuperFlags(u64), Generation, MultiDevice(u64),
         BalanceInProgress, ReplaceInProgress, RelocationInProgress,
         Snapshotted { root: u64, last_snapshot: u64 }, DeadRoot(u64),
@@ -253,8 +253,67 @@ is not weaker: the size and extent items a write's data is read back through
 live in the open batch until it commits, so a device flush alone makes
 nothing of that write durable (`smoke_btrfs_fdatasync_survives_a_later_crash`;
 Linux `btrfs_sync_file` ignores `datasync` too). Neither goes through a tree
-log: the driver replays a log at mount and can write one (`write_log`), but
-`fsync` does not use it.
+log; `write::write_log` (hand-built items, for tests) is the only writer.
+
+**Tree-log replay** (`write/log_replay.rs`, `write/tree_log.rs`). A
+read-write mount of a filesystem whose superblock names a log
+(`log_root != 0`: Linux, or NARF, fsynced and went down before the next
+commit) replays it before anything else writes, as Linux
+`btrfs_recover_log_trees` does and in both write profiles — a pending log is
+not an `rw_gate` refusal. The log root tree's `ROOT_ITEM`s are keyed
+`(BTRFS_TREE_LOG_OBJECTID = -6, ROOT_ITEM, subvolume id)`; every log block
+must be owned by `-6` and carry generation `super.generation + 1`, as Linux
+reads them. Stage by stage, with the Linux function each step is:
+
+| step | Linux | here |
+|---|---|---|
+| pin the log's blocks and its not-yet-allocated data extents before any allocation | `process_one_buffer`, `btrfs_pin_extent_for_log_replay`, `btrfs_exclude_logged_extents` | `LogCore::pin`; `BtrfsVolume::pinned_ranges` subtracts them in every allocator |
+| skip inodes logged with no links | `wc->ignore_cur_inode` | `replay_root` |
+| xattrs absent from the log are deleted | `replay_xattr_deletes` | `replay_xattr_deletes` |
+| directory entries inside a `DIR_LOG_INDEX` range but not in the log are unlinked | `replay_dir_deletes`, `find_dir_range`, `check_item_in_log` | `replay_dir_deletes` |
+| inode items, with the `nbytes` / directory-size / `generation == 0` rules | `overwrite_item` | `overwrite_inode` |
+| a regular file's extents beyond its size are dropped | `btrfs_drop_extents` in `replay_one_buffer` | `drop_extents` (`fileops::carve`) |
+| logged `DIR_INDEX` items | `replay_one_dir_item`, `replay_one_name`, `delete_conflicting_dir_entry`, `insert_one_name` | `replay_dir_index` |
+| logged `INODE_REF` / `INODE_EXTREF` items | `add_inode_ref`, `__add_inode_ref`, `inode_in_dir`, `unlink_refs_not_in_log`, `unlink_extrefs_not_in_log`, `unlink_old_inode_refs`, `backref_in_log` | `add_inode_ref`, `clear_for_ref`, `inode_in_dir`, `backref_in_log` |
+| linking / unlinking one name | `btrfs_add_link`, `btrfs_unlink_inode`, `drop_one_dir_item` | `add_link`, `unlink`, `drop_one_dir_item` |
+| file extents: drop what the item overlaps, insert it, take a reference on an extent that exists or allocate it (extent item, block group, free-space tree) | `replay_one_extent`, `btrfs_lookup_data_extent`, `btrfs_inc_extent_ref`, `btrfs_alloc_logged_file_extent` | `replay_one_extent`, `extent_exists`; the batch's `added_data` / `new_data` |
+| checksums of each replayed range replace the csum tree's | `btrfs_lookup_csums_list` on the log, `btrfs_del_csums`, `btrfs_csum_file_blocks` | `replay_csums` → `tree_log::take_replayed_csums` in `commit_txn` |
+| link counts from back references; an inode left with none is orphaned | `link_to_fixup_dir`, `fixup_inode_link_counts`, `count_inode_refs`, `count_inode_extrefs`, `btrfs_insert_orphan_item` | `fixup_inode_link_counts`, `count_refs` |
+| commit; the committed superblock has `log_root = 0`; the log's space is released after it is written | `btrfs_commit_transaction`, `btrfs_free_log_root_tree` | `finish`; `tree_log::on_commit` (every commit clears `log_root` and moves the log pins to the pinned set) |
+
+The replay is one transaction, as in Linux: it holds the operation lock and
+`hold_commits`, stages on the global reserve (Linux replays with
+`btrfs_start_transaction(root, 0)`), and `tree_log::on_commit` fails any
+commit attempted before the last stage is done. Nothing is durable until the
+one superblock that carries the replayed trees and `log_root = 0`, so a
+crash at any write leaves either the log in place (replayed again by NARF or
+by Linux — an intermediate commit would have advanced the generation past
+what Linux accepts for the log's blocks) or the finished replay
+(`smoke_btrfs_log_replay_survives_a_crash_at_any_write`). A replay that
+fails aborts the filesystem without a superblock write and the mount fails
+with the log intact.
+
+Differences from Linux in replay, all refusing rather than guessing: a log
+for a subvolume whose tree is still shared with a snapshot root
+(`Unsupported`; privatising it would be a second transaction); a directory
+entry or back reference naming another subvolume; a name or index
+collision Linux resolves by a partial insert (`InvalidData`); a back
+reference that would have to move to an `INODE_EXTREF`. A directory left
+with no link is emptied and deleted in the replay instead of through an
+orphan item (the writer's orphan reclaim handles files only); files get the
+orphan item and are reclaimed by `recover_orphans` after the replay commits.
+Qgroup counts are not maintained by replay.
+
+Verification: `smoke_btrfs_replays_a_linux_written_log` replays
+`testdata/fixture-linuxlog.img.sparse` (a log a real kernel wrote; regenerate
+with `narf-btrfs-host --emit-linux-log-fixture`) to the tree Linux's own
+replay yields; `cargo xtask btrfs-host-rw --scenario fsync-linux` has a real
+kernel (the host's, under QEMU, no root needed) write logs with scripted and
+random workloads, kills it, and replays each crashed image with that kernel
+and with NARF: the trees must be identical, both must pass
+`btrfs check --check-data-csum`, and the NARF-replayed image must mount on
+Linux unchanged. Without a bootable kernel the scenario reports itself
+unverified, never passed.
 
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.

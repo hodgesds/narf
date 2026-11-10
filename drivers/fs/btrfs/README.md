@@ -325,28 +325,17 @@ therefore writable without leaving superblock copies out of sync. On a
 multi-device commit the same common transaction state is written to every
 member while each member retains its own embedded devid, size and UUID fields.
 
-**fsync / tree-log.** Every mutation is a synchronous commit — it flips the
-superblock to a new generation and flushes the device before returning — so a
-file's data is durable the moment `write` returns and `FileOps::fsync` only
-re-issues a device-flush barrier (there is no deferred transaction to force out).
-The **tree-log** is therefore used for crash *recovery*, not deferred durability:
-`replay_log` runs once at mount, and if the superblock names an unreplayed log
-(`log_root != 0`, as a crash between an fsync and the next commit leaves it) it
-preloads every mapped subvolume log, merges each into its own fs tree with
-path-COW commits, and zeroes the pointer only after all roots recover. `write_log`
-produces such a log — the mounted subvolume's log tree plus the `log_root` tree
-mapping `subvolid → log`, in currently-free space (like btrfs's
-pinned log extents, deliberately not recorded in the extent/free-space trees) —
-so the write+replay round-trip is exercised in-kernel
-(`smoke_btrfs_tree_log_replay` and the nested-subvolume replay smoke). Ordinary
-logged items are upserted, while modern
-`DIR_LOG_INDEX` authoritative ranges replay missing entries through the normal
-unlink/rmdir transactions. Logged directory indexes also reconstruct their
-hash-keyed `DIR_ITEM` twins; log-only range markers never leak into the FS tree.
-Log emission targets the mounted subvolume, and replay applies every
-`subvolid -> log` mapping before clearing the superblock pointer. Ordinary
-mutations in any writable mounted subvolume remain synchronous full commits and
-do not depend on the log for durability.
+**fsync / tree-log.** `fsync` and `fdatasync` commit the open transaction
+and write its superblock. A tree log — which Linux writes on fsync, and which
+a crash before the next commit leaves named by `super.log_root` — is replayed
+at a read-write mount exactly as Linux `btrfs_recover_log_trees` replays it
+(`write/log_replay.rs`): inode items, names, link counts, xattr and directory
+deletions, and file extents with their extent-tree references, free-space
+accounting and checksums, in one transaction whose superblock clears the
+log. The specification lists the Linux function behind each step and how it
+is verified against a real kernel. A read-only mount leaves a log alone.
+`write::write_log` builds a log from hand-made items for the in-kernel
+tests.
 
 Bound (fails loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels. Trees
 taller than two levels are exercised in-kernel (`smoke_btrfs_tall_tree` writes and

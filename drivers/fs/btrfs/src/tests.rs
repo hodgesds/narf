@@ -23,6 +23,7 @@ mod data_cache;
 mod extent_window;
 mod safety;
 mod snapshots;
+mod tree_log;
 
 // ── Shared test harness ────────────────────────────────────────────
 
@@ -4516,7 +4517,16 @@ fn smoke_btrfs_tree_log_deletion_replay() -> TestResult {
         return TestResult::Fail("new directory indexes are not consecutive");
     }
     let range_key = BtrfsKey::new(parent, format::DIR_LOG_INDEX_KEY, range_start);
+    // A directory's log always carries its inode item, and replay looks for
+    // deletions only in directories whose inode item it finds
+    // (`replay_one_buffer` → `replay_dir_deletes`): log it as Linux does.
+    let parent_key = BtrfsKey::new(parent, format::INODE_ITEM_KEY, 0);
+    let parent_item = match poll_once(btree::find_item(&vol, fs_root, &parent_key)) {
+        Some(Ok(Some(body))) => body,
+        _ => return TestResult::Fail("parent inode item unavailable"),
+    };
     let log_items = [
+        (parent_key, parent_item),
         (range_key, range_end.to_le_bytes().to_vec()),
         (keep_key, keep_body),
     ];
@@ -11542,11 +11552,13 @@ fn smoke_btrfs_rw_gate_superblock_refusals() -> TestResult {
             None,
             Some(Refusal::Incompat(format::INCOMPAT_MIXED_GROUPS)),
         ),
+        // A pending log tree is no refusal: the mount replays it
+        // (`write::log_replay`), as Linux does, in both profiles.
         (
             "pending log tree",
             |sb, _| sb.log_root = 0x1234_0000,
             None,
-            Some(Refusal::LogTree(0x1234_0000)),
+            None,
         ),
         (
             "xxhash64 checksums",

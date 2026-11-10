@@ -85,9 +85,11 @@ pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
 pub const BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
 /// Objectid all data-checksum items share (`BTRFS_EXTENT_CSUM_OBJECTID`, -10).
 pub const EXTENT_CSUM_OBJECTID: u64 = (-10i64) as u64;
-/// The tree-log tree (`BTRFS_TREE_LOG_OBJECTID`, -7): the fsync log root, and the
-/// objectid of the log-root tree that maps each subvolume to its log.
-pub const TREE_LOG_OBJECTID: u64 = (-7i64) as u64;
+/// The tree-log tree (`BTRFS_TREE_LOG_OBJECTID`, -6): the owner of every log
+/// tree block, and the objectid of the log root tree's `ROOT_ITEM`s, whose
+/// key offset is the subvolume each log belongs to. (-7 is
+/// `BTRFS_TREE_LOG_FIXUP_OBJECTID`, which only ever appears in memory.)
+pub const TREE_LOG_OBJECTID: u64 = (-6i64) as u64;
 /// First object id available to files/dirs; also the fs-tree root directory.
 pub const FIRST_FREE_OBJECTID: u64 = 256;
 /// Highest object id available to files/dirs (`BTRFS_LAST_FREE_OBJECTID`, -256);

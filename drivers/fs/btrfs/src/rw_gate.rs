@@ -126,8 +126,6 @@ pub enum Refusal {
     /// block groups are not mixed (the fallback allocator cannot keep data
     /// and metadata apart there).
     NoFreeSpaceTree,
-    /// A non-empty fsync log tree that Linux would replay first.
-    LogTree(u64),
     /// Checksum algorithm the profile does not write.
     ChecksumType(u16),
     /// Sector size the profile does not write.
@@ -207,10 +205,6 @@ impl fmt::Display for Refusal {
             ),
             Refusal::NoFreeSpaceTree => f.write_str(
                 "no free-space tree (space_cache=v2 required unless every block group is mixed)",
-            ),
-            Refusal::LogTree(at) => write!(
-                f,
-                "non-empty fsync log tree at {at:#x} (needs Linux log replay; mount it once on Linux)"
             ),
             Refusal::ChecksumType(c) => write!(f, "checksum type {c} not written in this mode"),
             Refusal::SectorSize(s) => write!(f, "sectorsize {s} not written in this mode"),
@@ -365,9 +359,6 @@ pub fn check_superblock(
     if profile == Profile::RootRw {
         if sb.compat_ro_flags & ROOT_RW_REQUIRED_COMPAT_RO != ROOT_RW_REQUIRED_COMPAT_RO {
             return Err(Refusal::NoFreeSpaceTree);
-        }
-        if sb.log_root != 0 {
-            return Err(Refusal::LogTree(sb.log_root));
         }
         if sb.csum_type != format::CSUM_TYPE_CRC32 {
             return Err(Refusal::ChecksumType(sb.csum_type));

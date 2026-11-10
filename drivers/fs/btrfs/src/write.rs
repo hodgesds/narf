@@ -81,7 +81,9 @@ mod free_space_edit_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "write/free_space_tests.rs"]
 mod free_space_tests;
+mod log_replay;
 pub(crate) mod reserve;
+pub(crate) mod tree_log;
 use crate::block_group::{self, BgHome};
 use crate::btree::{
     self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
@@ -96,6 +98,7 @@ use crate::volume::{BalanceProfiles, BalanceStats, BtrfsVolume};
 pub use fileops::{
     fallocate_file, truncate_file, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
 };
+pub use log_replay::replay_log;
 
 // Header field offsets rewritten when a node is stamped.
 const HDR_BYTENR: usize = 48;
@@ -5617,7 +5620,11 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         matches!(quota_mode, QuotaMode::Simple { .. }),
     )
     .await?;
-    let touch_csum = !txn.new_data.is_empty() || !data_changes.released.is_empty();
+    // A log replay also replaces the checksums of every range it replayed
+    // with the ones the log carried (`tree_log::take_replayed_csums`).
+    let replayed_csums = tree_log::take_replayed_csums(vol);
+    let touch_csum =
+        !txn.new_data.is_empty() || !data_changes.released.is_empty() || !replayed_csums.is_empty();
     let old_csum = match touch_csum {
         true => Some(roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID).await?),
         false => None,
@@ -5697,9 +5704,29 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // Path-COW touches only the root-to-leaf paths the edits reach, which is
     // what the fs and extent trees beside it already do.
     let mut csum_edits: Vec<Edit> = match old_csum {
-        Some((csum_root, _)) => csum_release_edits(vol, csum_root, &data_changes.released).await?,
-        None => Vec::new(),
+        Some((csum_root, _)) if replayed_csums.is_empty() => {
+            csum_release_edits(vol, csum_root, &data_changes.released).await?
+        }
+        Some((csum_root, _)) => {
+            let width = crate::checksum::size(vol.csum_type())? as u64;
+            let sectorsize = u64::from(vol.sectorsize());
+            let mut ranges = data_changes.released.clone();
+            ranges.extend(
+                replayed_csums
+                    .iter()
+                    .map(|(start, sums)| (*start, sums.len() as u64 / width * sectorsize)),
+            );
+            csum_release_edits(vol, csum_root, &ranges).await?
+        }
+        None if replayed_csums.is_empty() => Vec::new(),
+        None => return Err(FsError::InvalidData),
     };
+    csum_edits.extend(replayed_csums.into_iter().map(|(start, sums)| {
+        Edit::Upsert(
+            BtrfsKey::new(format::EXTENT_CSUM_OBJECTID, format::EXTENT_CSUM_KEY, start),
+            sums,
+        )
+    }));
     // A `nodatasum` extent has no checksums and gets no (empty) csum item.
     csum_edits.extend(
         txn.new_data
@@ -6269,6 +6296,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     }
 
     let mut raw = vol.read_raw_superblock().await?;
+    tree_log::on_commit(vol, &mut raw)?;
     let old_gen = le64(&raw, 72)?;
     // Superblock `bytes_used` is the sum of every block group's `used`. The
     // first commit of a mount sums them, so whatever the superblock held
@@ -8960,210 +8988,6 @@ pub async fn write_log<B: BlockDevice + 'static>(
     Ok(())
 }
 
-/// If the superblock names an unreplayed tree-log, merge it into the fs tree and
-/// clear the pointer — btrfs crash recovery, run once at mount. Returns whether a
-/// log was replayed.
-///
-/// Ordinary items are `Upsert`ed into the fs tree. Before those upserts, modern
-/// `DIR_LOG_INDEX` authoritative ranges remove each committed `DIR_INDEX` entry
-/// whose index/name is absent from the log, using the normal unlink/rmdir COW
-/// paths so inode refs, link counts, data extents, checksums and parent metadata
-/// stay consistent. Log-only range items are never copied into the FS tree.
-async fn replay_log_items<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-    log_items: Vec<(BtrfsKey, Vec<u8>)>,
-) -> Result<(), FsError> {
-    ensure_private_subvol(vol).await?;
-    // Current Linux kernels log directory indexes only. Decode them once up
-    // front both to validate the log before applying ranges and to make
-    // same-index/name authority checks unambiguous.
-    let mut logged_dir_indexes = Vec::new();
-    for (key, body) in &log_items {
-        if key.item_type != format::DIR_INDEX_KEY {
-            continue;
-        }
-        let entries = decode_dir_items(body)?;
-        if entries.len() != 1 {
-            return Err(FsError::InvalidData);
-        }
-        logged_dir_indexes.push((key.objectid, key.offset, entries[0].name.clone()));
-    }
-
-    // Linux tree logs describe directory removals indirectly: each range says
-    // the log is authoritative for DIR_INDEX offsets [start, end]. A committed
-    // entry in that range which has no same-index/name entry in the log was
-    // deleted before fsync and must be unlinked during recovery.
-    let mut deletions = Vec::new();
-    for (range_key, range_body) in &log_items {
-        if range_key.item_type != format::DIR_LOG_INDEX_KEY {
-            continue;
-        }
-        if range_body.len() != 8 {
-            return Err(FsError::InvalidData);
-        }
-        let range_end = le64(range_body, 0)?;
-        if range_end < range_key.offset {
-            return Err(FsError::InvalidData);
-        }
-        let (fs_root, _) = vol.fs_tree_root();
-        for (key, body) in
-            btree::collect_for(vol, fs_root, range_key.objectid, format::DIR_INDEX_KEY).await?
-        {
-            if key.offset < range_key.offset || key.offset > range_end {
-                continue;
-            }
-            let entries = decode_dir_items(&body)?;
-            if entries.len() != 1 {
-                return Err(FsError::InvalidData); // DIR_INDEX offsets are unique
-            }
-            let entry = &entries[0];
-            let present = logged_dir_indexes.iter().any(|(dir, index, name)| {
-                *dir == key.objectid && *index == key.offset && *name == entry.name
-            });
-            if !present
-                && !deletions
-                    .iter()
-                    .any(|(dir, index, _, _)| *dir == key.objectid && *index == key.offset)
-            {
-                deletions.push((key.objectid, key.offset, entry.name.clone(), entry.ftype));
-            }
-        }
-    }
-    deletions.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    for (parent, _index, name, ftype) in deletions {
-        let result = if ftype == format::FT_DIR {
-            rmdir_dir(vol, parent, &name).await
-        } else {
-            unlink_file(vol, parent, &name).await
-        };
-        match result {
-            Ok(()) | Err(FsError::NotFound) => {}
-            Err(e) => return Err(e),
-        }
-    }
-
-    // Merge ordinary logged items after deletions. Range markers are log-only
-    // metadata and must never appear in the committed FS tree.
-    let mut edits = Vec::new();
-    for (key, body) in log_items {
-        if key.item_type == format::DIR_LOG_ITEM_KEY || key.item_type == format::DIR_LOG_INDEX_KEY {
-            continue;
-        }
-        edits.push(Edit::Upsert(key, body.clone()));
-        if key.item_type != format::DIR_INDEX_KEY {
-            continue;
-        }
-
-        // Linux no longer logs the hash-keyed DIR_ITEM twin. Reconstruct it
-        // from the logged DIR_INDEX body so lookup and readdir remain coherent.
-        // Merge at record granularity because multiple logged/existing names can
-        // share the same CRC32C hash bucket.
-        let entries = decode_dir_items(&body)?;
-        if entries.len() != 1 {
-            return Err(FsError::InvalidData);
-        }
-        let entry = &entries[0];
-        let dir_item_key = BtrfsKey::new(
-            key.objectid,
-            format::DIR_ITEM_KEY,
-            u64::from(name_hash(entry.name.as_bytes())),
-        );
-        let (fs_root, _) = vol.fs_tree_root();
-        let pending = edits.iter().rposition(|edit| edit.key() == &dir_item_key);
-        let mut bucket = match pending.map(|slot| match &edits[slot] {
-            Edit::Upsert(_, pending_body) => pending_body.clone(),
-            Edit::Delete(_) => Vec::new(),
-        }) {
-            Some(body) => body,
-            None => btree::find_item(vol, fs_root, &dir_item_key)
-                .await?
-                .unwrap_or_default(),
-        };
-        if find_dir_item(&bucket, &entry.name).is_ok() {
-            bucket = remove_dir_item(&bucket, &entry.name)?;
-        }
-        bucket = append_dir_item(Some(&bucket), &entry.name, &body)?;
-        let edit = Edit::Upsert(dir_item_key, bucket);
-        if let Some(slot) = pending {
-            edits[slot] = edit;
-        } else {
-            edits.push(edit);
-        }
-    }
-    if !edits.is_empty() {
-        commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
-    }
-
-    Ok(())
-}
-
-/// Replay every subvolume mapping in the log-root tree. All log items are read
-/// before the first transaction because log blocks are pinned-but-unaccounted
-/// and may be reused by a replay commit's allocator.
-pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<bool, FsError> {
-    let sb = vol.superblock();
-    if sb.log_root == 0 {
-        return Ok(false);
-    }
-    let start = BtrfsKey::new(format::TREE_LOG_OBJECTID, format::ROOT_ITEM_KEY, 0);
-    let mut cursor = btree::Cursor::seek(vol, sb.log_root, &start).await?;
-    let mut logs = Vec::new();
-    while let Some((key, root_item)) = cursor.current()? {
-        if key.objectid != format::TREE_LOG_OBJECTID || key.item_type != format::ROOT_ITEM_KEY {
-            break;
-        }
-        if root_item.len() < 239 {
-            return Err(FsError::InvalidData);
-        }
-        let log_root = le64(root_item, 176)?;
-        let mut items = Vec::new();
-        let mut log_cursor = btree::Cursor::seek(vol, log_root, &BtrfsKey::new(0, 0, 0)).await?;
-        while let Some((item_key, body)) = log_cursor.current()? {
-            items.push((item_key, body.to_vec()));
-            log_cursor.advance().await?;
-        }
-        logs.push((key.offset, items));
-        cursor.advance().await?;
-    }
-    if logs.is_empty() {
-        return Err(FsError::InvalidData);
-    }
-
-    let original_root = vol.fs_tree_id();
-    for (root_id, items) in logs {
-        if root_id != vol.fs_tree_id() {
-            vol.switch_to_subvol(&crate::volume::Subvol::Id(root_id))
-                .await?;
-        }
-        if !vol.supports_writes() {
-            return Err(FsError::Unsupported);
-        }
-        replay_log_items(vol, items).await?;
-    }
-    if original_root != vol.fs_tree_id() {
-        vol.switch_to_subvol(&crate::volume::Subvol::Id(original_root))
-            .await?;
-    }
-
-    // Clear the log pointer only after every mapped root is authoritative —
-    // which means committed and durable, not merely applied. The replay above
-    // goes through the ordinary batched write path, so its edits sit in an
-    // open batch whose superblock has not been written. Clearing the pointer
-    // without this sync destroys the log while what it described is still only
-    // in memory, and a crash in that window loses the replay outright.
-    vol.sync_to_disk().await?;
-    let mut raw = vol.read_raw_superblock().await?;
-    raw[format::OFF_LOG_ROOT..format::OFF_LOG_ROOT + 8].copy_from_slice(&0u64.to_le_bytes());
-    raw[format::OFF_LOG_ROOT_TRANSID..format::OFF_LOG_ROOT_TRANSID + 8]
-        .copy_from_slice(&0u64.to_le_bytes());
-    raw[format::OFF_LOG_ROOT_LEVEL] = 0;
-    crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await?;
-    vol.write_superblock(&raw).await?;
-    vol.clear_log_root();
-    Ok(true)
-}
-
 /// Allocated physical ranges belonging to one member, in device-offset order.
 /// Device replace copies these ranges; device removal requires the list empty.
 pub(crate) async fn device_extent_ranges<B: BlockDevice + 'static>(
@@ -10584,6 +10408,7 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     let bytes_used =
         total_block_group_used(vol, bgt_root.map_or(ext_root_addr, |(addr, _)| addr)).await?;
     let mut raw = vol.read_raw_superblock().await?;
+    tree_log::on_commit(vol, &mut raw)?;
     let old_gen = le64(&raw, 72)?;
     raw[72..80].copy_from_slice(&gen.to_le_bytes()); // generation
     raw[80..88].copy_from_slice(&root_root_addr.to_le_bytes()); // root

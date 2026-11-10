@@ -735,6 +735,9 @@ pub struct VolCore<B: BlockDevice> {
     /// transaction; it sits here until NARF has a transaction object, which is
     /// sound only while at most one commit is in flight.
     pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
+    /// Tree-log state: the space a log on disk occupies outside the
+    /// committed trees ([`crate::write::tree_log`]).
+    pub(crate) tree_log: crate::write::tree_log::LogCore,
     /// Tree roots a lock-free reader is walking from, with a count per
     /// address ([`BtrfsVolume::pin_live_root`]). A reader verifies every
     /// child it reads against its parent's pointer (generation, level, first
@@ -2142,6 +2145,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             #[cfg(feature = "kernel-test")]
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            tree_log: crate::write::tree_log::LogCore::new(),
             reader_roots: IrqSafeSpinLock::new(BTreeMap::new()),
             reader_epochs: IrqSafeSpinLock::new(ReaderEpochs::default()),
             evictions: core::sync::atomic::AtomicU64::new(0),
@@ -2200,6 +2204,36 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if let Some(live) = core.state.lock().subvols.get_mut(&id) {
             live.mounts += 1;
         }
+        view.fs_tree_id = id;
+        drop(view);
+        volume
+    }
+
+    /// A view of `core` rooted at subvolume `id` for log replay, which
+    /// reaches subvolumes no mount has selected yet: `id` is tracked from
+    /// its committed `(root, level)` unless a mount already tracks it (whose
+    /// live root is then kept). The subvolume stays tracked after the view
+    /// drops: the replay's transaction publishes its root at commit.
+    pub(crate) fn view_for_replay(
+        core: &Arc<VolCore<B>>,
+        id: u64,
+        root: u64,
+        level: u8,
+        flags: u64,
+    ) -> Arc<Self> {
+        let volume = Self::new_view(core.clone(), false);
+        let mut view = volume.view.lock();
+        core.state
+            .lock()
+            .subvols
+            .entry(id)
+            .or_insert(LiveSubvol {
+                root,
+                level,
+                flags,
+                mounts: 0,
+            })
+            .mounts += 1;
         view.fs_tree_id = id;
         drop(view);
         volume
@@ -2807,6 +2841,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// subtract.
     pub(crate) fn pinned_ranges(&self) -> alloc::vec::Vec<(u64, u64)> {
         let mut ranges = self.pinned.lock().clone();
+        ranges.extend(self.tree_log.pinned());
         ranges.extend(
             self.reader_epochs
                 .lock()
