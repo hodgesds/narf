@@ -378,6 +378,20 @@ fn poll_receive(state: &DeviceState, dev: u64, bar: u64) -> i32 {
     let frame_ptr = frame.as_mut_ptr().cast::<u8>();
     for _ in 0..RX_RING_LEN {
         let head = state.rx_head.load(Ordering::Relaxed) as usize % RX_RING_LEN;
+        // DD first, as one byte load. The 16-byte copy below is a `memcpy`
+        // whose load order is unspecified; taken while the device may still
+        // be completing the slot it can pair a fresh DD with the armed
+        // slot's length. Copy the descriptor only once DD says it is whole
+        // (Linux: DD test, `dma_rmb()`, then the rest).
+        let mut status = 0u8;
+        // SAFETY: byte 8 of the descriptor slot is inside the retained
+        // ring; `status` is one writable byte.
+        if unsafe { narf_dma_read(dev, ring, (head * DESC_LEN + 8) as u64, &mut status, 1) } != 0 {
+            return -5;
+        }
+        if status & RXD_STAT_DD == 0 {
+            break;
+        }
         let mut desc = [0u8; DESC_LEN];
         // SAFETY: descriptor slot is inside the retained ring.
         if unsafe {
