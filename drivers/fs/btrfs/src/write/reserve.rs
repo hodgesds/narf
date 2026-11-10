@@ -50,8 +50,8 @@
 //! Those blocks are themselves metadata allocations: each needs an extent
 //! item and leaves free space, and each committed block they replace is
 //! freed — more edits to the extent, block-group and free-space trees, whose
-//! blocks need recording in turn (the commit's fixed point; Linux's delayed
-//! refs run from `btrfs_run_delayed_refs` until none remain). Applying the
+//! blocks need recording in turn (the commit's recording passes; Linux's
+//! delayed refs run from `btrfs_run_delayed_refs` until none remain). Applying the
 //! per-edit bound to that closure does not converge: it prices every record
 //! as landing in a leaf nothing else touches, which the allocator — handing
 //! out addresses lowest-first — does not produce. Linux does not reserve for

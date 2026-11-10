@@ -136,9 +136,8 @@ run from the delayed refs): it reads only the leaves holding the items its
 allocations and frees reach (the block group's `FREE_SPACE_INFO`, the
 `FREE_SPACE_EXTENT` or `FREE_SPACE_BITMAP` items around each range), edits a
 private copy of those items, and path-COWs the result, so the blocks read and
-written are bounded by tree height × touched leaves for every round of the
-fixed point, independent of the size of the tree
-(`smoke_btrfs_commit_cost_tracks_change_not_tree_size`). Each block group
+written are bounded by tree height × touched leaves, independent of the size
+of the tree (`smoke_btrfs_commit_cost_tracks_change_not_tree_size`). Each block group
 keeps the form its `FREE_SPACE_INFO.flags` selects; none is converted.
 Extent-form frees merge with an adjacent free extent on either side, never
 across a block-group boundary. Bitmap ranges are found by their ordered keys,
@@ -147,11 +146,25 @@ with coverage and body bounds checked across every bitmap boundary, and
 (Linux `modify_free_space_bitmap`). An allocation of space the tree does not
 hold free, or a free of space it already does, fails the commit before
 anything is written. The free-space tree's own new and replaced blocks are
-metadata allocations and frees that edit it again; they join the extent and
-block-group trees' in the commit's fixed point, which is bounded (64 rounds)
-and fails closed. Free-space leaves are kept dense: an overflowing leaf is
-split evenly, and a sparse committed leaf an edit reaches absorbs its right
-sibling. The on-disk format is unchanged.
+metadata allocations and frees that edit it again, as the extent and
+block-group trees' are. A commit records them the way Linux runs its delayed
+refs (`btrfs_run_delayed_refs` under `commit_cowonly_roots`): the three path
+COWs stay open, each pass records the blocks no earlier pass recorded — into
+leaves that, once COWed, are edited in place — and the commit is complete
+when a pass leaves none. A committed block is replaced at most once and no
+address is handed out twice, so the passes end; a guard of 1024 passes fails
+the commit before anything is written. (The earlier fixed point, which
+recomputed all three trees from the committed ones every round until two
+rounds agreed, did not settle within its 64 rounds on a filesystem of 320
+block groups with three-level trees; `cargo xtask btrfs-host-rw --scenario
+scale` reproduces that shape.) What the trees hold afterwards is a function
+of the final block lists alone. Each new block's `METADATA_ITEM` key is
+checked absent from the committed extent tree before it is inserted. Extent
+and free-space leaves are kept dense: an overflowing leaf is split evenly
+(or left full when everything added sorts after what it held), and a sparse
+committed leaf an edit reaches absorbs its right sibling; the sparser those
+trees, the more leaves the records of one commit's blocks reach. The on-disk
+format is unchanged.
 
 The allocator carves from one in-memory copy of the committed free-space tree
 per filesystem (`allocator::FreeView`, Linux's per-block-group free-space
@@ -280,7 +293,14 @@ against a model through NARF, `btrfs check` (with data csums) and
 write/flush/FUA stream is replayed at bounded cut points (`--exhaustive`:
 every flush) with volatile writes dropped or torn, and each crashed image
 must pass `btrfs check` and remount with exactly a committed state. The
-`regress-*` scenarios are minimal reproductions of bugs it found.
+`regress-*` scenarios are minimal reproductions of bugs it found. The `scale`
+scenario builds the shape of an installed root on a sparse image — 320
+mostly-full 1 GiB DATA block groups with some 370,000 single-sector free
+extents spread over them, three-level free-space and extent trees —
+runs a desktop-like workload in small transactions (save-file
+loop, log appends with fsync, bursts of creates and unlinks), and reports per
+commit the nodes visited and written per tree, the recording passes, the
+blocks allocated beyond the reservation and the wall time.
 
 `cargo xtask btrfs-cycles [--cycles 50] [--seed N] [--jobs N]` runs the
 in-kernel driver through many mount lifetimes in one boot per guest

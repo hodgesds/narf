@@ -759,8 +759,8 @@ impl Allocator {
         }
     }
 
-    /// Snapshot the allocator's free state so the commit's metadata fixed point
-    /// can re-hand-out the same addresses each round ([`Allocator::restore`]).
+    /// Snapshot the allocator's free state, so a caller can hand out the
+    /// same addresses again ([`Allocator::restore`]).
     pub fn snapshot(&self) -> Allocator {
         self.clone()
     }

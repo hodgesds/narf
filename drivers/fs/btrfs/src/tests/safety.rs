@@ -1400,9 +1400,9 @@ fn smoke_btrfs_chunk_profile_and_size() -> TestResult {
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_chunk_profile_and_size);
 
-/// The fixed point's leaf "touch" deletes a METADATA_ITEM key only after
-/// confirming it is absent from the committed extent tree: a live block's
-/// key is refused, a free address's accepted.
+/// A commit inserts (and may delete again) a new block's METADATA_ITEM key
+/// only after confirming it is absent from the committed extent tree: a live
+/// block's key is refused, a free address's accepted.
 fn smoke_btrfs_touch_key_must_be_absent() -> TestResult {
     let dev = writable_sparse(FIXTURE_BGT_SPARSE);
     let Ok(vol) = mount_writable(dev) else {
@@ -1418,14 +1418,14 @@ fn smoke_btrfs_touch_key_must_be_absent() -> TestResult {
     };
     let live = BtrfsKey::new(ext_root, format::METADATA_ITEM_KEY, u64::from(ext_level));
     if !matches!(
-        poll_once(crate::write::touch_key_absent(&*vol, ext_root, &live)),
+        poll_once(crate::write::extent_key_absent(&*vol, ext_root, &live)),
         Some(Err(FsError::InvalidData))
     ) {
         return TestResult::Fail("a live block's extent key was accepted as absent");
     }
     let free = BtrfsKey::new(u64::MAX - 0xffff, format::METADATA_ITEM_KEY, 0);
     if !matches!(
-        poll_once(crate::write::touch_key_absent(&*vol, ext_root, &free)),
+        poll_once(crate::write::extent_key_absent(&*vol, ext_root, &free)),
         Some(Ok(()))
     ) {
         return TestResult::Fail("an absent key was refused");

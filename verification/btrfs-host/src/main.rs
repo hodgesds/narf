@@ -18,6 +18,7 @@ mod host;
 mod linux;
 mod model;
 mod narf;
+mod scale;
 mod workload;
 
 #[cfg(test)]
@@ -46,7 +47,7 @@ USAGE: narf-btrfs-host [OPTIONS]
   --exhaustive      crash-test every flush boundary plus two random cuts per
                     flush window (slow)
   --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate,fst,
-                    enospc
+                    enospc,scale
                     (default all)
   --jobs N          concurrent `btrfs check` processes in the crash pass
                     (default 3)
@@ -56,7 +57,7 @@ USAGE: narf-btrfs-host [OPTIONS]
 ";
 
 /// The default selection (`regress` = every `regress-*` case).
-pub const SCENARIOS: [&str; 7] = [
+pub const SCENARIOS: [&str; 8] = [
     "regress",
     "root",
     "snapshots",
@@ -64,6 +65,7 @@ pub const SCENARIOS: [&str; 7] = [
     "gate",
     "fst",
     "enospc",
+    "scale",
 ];
 /// Names `--scenario` also accepts.
 const REGRESS: [&str; 3] = [
@@ -703,11 +705,11 @@ fn main() {
             }
             continue;
         }
-        if name == "fst" || name == "enospc" {
-            let run = if name == "fst" {
-                fst::run(&args)
-            } else {
-                enospc::run(&args)
+        if name == "fst" || name == "enospc" || name == "scale" {
+            let run = match name.as_str() {
+                "fst" => fst::run(&args),
+                "enospc" => enospc::run(&args),
+                _ => scale::run(&args),
             };
             match run {
                 Ok(s) => println!("{s}"),
