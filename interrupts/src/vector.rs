@@ -1,9 +1,10 @@
 //! Per-arch IRQ vector allocator.
 //!
-//! x86_64: hands out IDT vectors in `48..=240` (32–47 are reserved
-//!   for legacy IRQ-stub layout, 0xFE/0xFF for spurious + self-IPI
-//!   conventions). The returned u8 is the LAPIC delivery vector,
-//!   which doubles as the dispatch-table slot index.
+//! x86_64: hands out IDT vectors in `48..=239`, except 128 (32–47 are
+//!   reserved for legacy IRQ-stub layout, 128 is the `int 0x80` gate,
+//!   0xF0 and up are fixed IPI / error / spurious vectors). The
+//!   returned u8 is the LAPIC delivery vector, which doubles as the
+//!   dispatch-table slot index.
 //! aarch64: hands out logical-IRQ slots in `0..=240` that the ITS
 //!   layer multiplexes onto LPI INTIDs (INTID = LPI_BASE + slot).
 //!   Stage-3 caps total at 240 — well above any plausible Stage-3
@@ -23,7 +24,27 @@ pub const ALLOC_BASE: u8 = 48;
 pub const ALLOC_BASE: u8 = 0;
 
 /// Last allocatable vector (inclusive).
+#[cfg(target_arch = "x86_64")]
+pub const ALLOC_MAX: u8 = 239;
+#[cfg(not(target_arch = "x86_64"))]
 pub const ALLOC_MAX: u8 = 240;
+
+/// The x86 `int 0x80` gate. The trap path treats this vector as a system
+/// call before it looks at interrupts, so a device interrupt delivered on
+/// it would run a bogus syscall and never be acknowledged.
+#[cfg(target_arch = "x86_64")]
+pub const SYSCALL_VECTOR: u8 = 128;
+
+/// `true` for vectors the allocator may hand to a device. On x86_64 the
+/// range stops below the fixed IPI vectors (`VECTOR_TLB_SHOOTDOWN` = 0xF0
+/// and up) and excludes the `int 0x80` gate.
+pub const fn allocatable(vector: u8) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if vector == SYSCALL_VECTOR {
+        return false;
+    }
+    vector >= ALLOC_BASE && vector <= ALLOC_MAX
+}
 
 /// Why an alloc failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -61,6 +82,9 @@ fn start_enabled(vector: u8) {
 /// Linear scan; collisions are CAS-resolved.
 pub fn alloc() -> Result<u8, VectorError> {
     for v in ALLOC_BASE..=ALLOC_MAX {
+        if !allocatable(v) {
+            continue;
+        }
         let (w, bit) = split(v);
         // Try to flip 0 → 1 atomically.
         let mut cur = USED[w].load(Ordering::Relaxed);
@@ -86,7 +110,7 @@ pub fn alloc() -> Result<u8, VectorError> {
 /// [`alloc`] caller (MSI / LPI) can be handed the same slot.
 /// `AlreadyFree` is never returned; a taken vector is `Exhausted`.
 pub fn reserve(vector: u8) -> Result<(), VectorError> {
-    if !(ALLOC_BASE..=ALLOC_MAX).contains(&vector) {
+    if !allocatable(vector) {
         return Err(VectorError::OutOfRange);
     }
     let (w, bit) = split(vector);
@@ -132,6 +156,13 @@ pub fn alloc_block_aligned(n: u8, align: u8) -> Result<u8, VectorError> {
         let mut owned: u8 = 0;
         for i in 0..n {
             let v = base + i;
+            if !allocatable(v) {
+                for j in 0..owned {
+                    let (rw, rbit) = split(base + j);
+                    USED[rw].fetch_and(!rbit, Ordering::AcqRel);
+                }
+                continue 'outer;
+            }
             let (w, bit) = split(v);
             let mut cur = USED[w].load(Ordering::Relaxed);
             let mut acquired = false;
@@ -173,7 +204,7 @@ pub fn alloc_block_aligned(n: u8, align: u8) -> Result<u8, VectorError> {
 /// Release a previously-allocated vector. `AlreadyFree` if the bit
 /// wasn't set — points at a double-free in caller code.
 pub fn free(vector: u8) -> Result<(), VectorError> {
-    if !(ALLOC_BASE..=ALLOC_MAX).contains(&vector) {
+    if !allocatable(vector) {
         return Err(VectorError::OutOfRange);
     }
     let (w, bit) = split(vector);
