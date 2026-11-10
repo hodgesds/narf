@@ -251,6 +251,41 @@ fn nvme_admin_irq() {}
 pub static FAIL_IDENTIFY_FOR_TEST: AtomicBool = AtomicBool::new(false);
 fn nvme_io_irq() {}
 
+/// Test hook: the next N MSI-X entry programmings by
+/// [`Controller::bring_up`] (admin entry 0) / [`Controller::create_io_queue`]
+/// (I/O entry 1) fail, as `MsixTable::program_vector` does when the table
+/// BAR cannot be mapped. Only the in-kernel smokes set it.
+#[doc(hidden)]
+pub static FAIL_MSIX_PROGRAM_FOR_TEST: AtomicU32 = AtomicU32::new(0);
+
+/// The APIC ID this driver's MSI-X entries are steered to.
+///
+/// Every entry targets one CPU, as before: completions are consumed by
+/// whichever CPU is waiting (the vector's global `fire_count`), so the
+/// target only has to be a CPU that exists and takes interrupts. That CPU
+/// is scheduler CPU 0, resolved to a real APIC ID through
+/// `narf_interrupts::apic_id_of_cpu` (as `drivers/net/igc` does) instead of
+/// the literal 0 the entries used to carry: scheduler CPU ids are APIC
+/// IDs, so on a machine whose firmware lists an enabled CPU with APIC ID 0
+/// the destination is unchanged, and on one that does not — where a
+/// literal 0 addressed no CPU at all and every interrupt was lost — the
+/// entries go to the CPU doing the bring-up. 0 when the topology is not
+/// known (no MADT), as before.
+fn msix_target_apic_id() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        narf_interrupts::apic_id_of_cpu(0)
+            .or_else(|| narf_interrupts::apic_id_of_cpu(narf_lib::percpu::current_cpu()))
+            .unwrap_or(0)
+    }
+    // No APIC: the argument is the ITS DeviceID, which this driver has
+    // always passed as 0.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
 #[non_exhaustive]
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -522,6 +557,12 @@ pub struct Controller {
     /// the public surface so the param-snapshot path doesn't have to
     /// reach into a Vec.
     pub irq_vector: Option<u8>,
+    /// The admin queue's own IDT vector (MSI-X entry 0), allocated by
+    /// `bring_up`. Kept apart from `irq_vector`, which the multi-queue
+    /// setup repoints at the first I/O queue's vector: this is the one
+    /// the AER supervisor parks on, and the one that must be released
+    /// with the controller.
+    admin_irq_vector: Option<u8>,
     /// Largest data transfer per command in bytes: Identify Controller
     /// MDTS in CAP.MPSMIN units, clamped to
     /// [`prp::NVME_HOST_MAX_TRANSFER`]. One page until `bring_up` has
@@ -858,7 +899,7 @@ impl Queue {
             }
             // Otherwise: another command's completion. Consumed and
             // dropped above, reported here; keep waiting for ours.
-            note_stray_cqe(bar0.phys.raw(), self.qid, head, phase, cid, &cqe);
+            note_stray_cqe(bar0.phys.raw(), self.qid, head, phase, Some(cid), &cqe);
         }
     }
 
@@ -1083,6 +1124,7 @@ impl Controller {
             nsze: 0,
             msix: None,
             irq_vector: None,
+            admin_irq_vector: None,
             max_transfer: prp::NVME_CTRL_PAGE_SIZE as u32,
             ns_usable: false,
             prp_list: None,
@@ -1520,6 +1562,18 @@ impl Controller {
         c
     }
 
+    /// The admin queue's interrupt vector, if its MSI-X entry was
+    /// programmed.
+    pub fn admin_irq_vector(&self) -> Option<u8> {
+        self.admin_irq_vector
+    }
+
+    /// The vector an AER completion fires: the admin queue's. (Falls back
+    /// to `irq_vector` for a controller set up without `bring_up`.)
+    fn aer_wait_vector(&self) -> Option<u8> {
+        self.admin_irq_vector.or(self.irq_vector)
+    }
+
     /// `true` once `bring_up` has completed.
     pub fn is_ready(&self) -> bool {
         self.admin.is_some()
@@ -1702,8 +1756,12 @@ impl Controller {
         self.msix = narf_bus::msix::enable_msix(cap, device).ok();
         if let Some(table) = self.msix.as_mut() {
             if let Ok(v) = narf_interrupts::vector::alloc() {
-                // Program MSI-X slot 0 for Admin queue.
-                // Target the BSP (apic_id=0) for now.
+                // Program MSI-X slot 0 for the admin queue, steered to
+                // `msix_target_apic_id`, then set the table's global
+                // enable. Either step can fail (the table BAR does not
+                // map, a config write is refused); an entry that was not
+                // written must not be advertised as this queue's vector.
+                let injected = take_test_fault(&FAIL_MSIX_PROGRAM_FOR_TEST);
                 // SAFETY: `table` was just obtained from `enable_msix(cap,
                 // device)` for this device, so we hold its BAR exclusively
                 // via the `&mut` borrow of `self.msix` (no other writer to
@@ -1711,13 +1769,31 @@ impl Controller {
                 // alloc()`, so slot 0 is a valid, owned vector index, and
                 // `enable()` runs last to gate MSI delivery only after the
                 // entry is fully programmed (PCIe-recommended order).
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe {
-                    let _ = table.program_vector(0, 0, v);
-                    let _ = table.enable();
+                let programmed = !injected
+                    && unsafe {
+                        table.program_vector(0, msix_target_apic_id(), v).is_ok()
+                            && table.enable().is_ok()
+                    };
+                if programmed {
+                    self.irq_vector = Some(v);
+                    self.admin_irq_vector = Some(v);
+                    narf_interrupts::install_handler(v, nvme_admin_irq);
+                } else {
+                    // The admin queue has no vector: `admin_irq_vector`
+                    // stays `None` (its commands are polled anyway, and the AER
+                    // supervisor falls back to its timer), so a single
+                    // I/O queue that would share entry 0 is created with
+                    // IEN=0. The table itself is kept: the I/O queue
+                    // setups program, check and enable their own entries.
+                    use core::fmt::Write as _;
+                    let _ = narf_interrupts::vector::free(v);
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "nvme: bar {:#x}: WARNING: MSI-X admin entry could not be programmed; \
+                         admin queue has no interrupt vector",
+                        bar0.phys.raw()
+                    );
                 }
-                self.irq_vector = Some(v);
-                narf_interrupts::install_handler(v, nvme_admin_irq);
             }
         }
         let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
@@ -1853,12 +1929,22 @@ impl Controller {
             // the controller is disabled (or abandoned) so no source fires.
             unsafe { table.disable() };
         }
-        for v in self
+        // Every vector this controller allocated, each exactly once: the
+        // admin queue's, and the I/O queues' (`irq_vector` aliases one of
+        // them — the admin vector on the single-pair path, the first I/O
+        // vector on the multi-queue path — and must not be freed twice,
+        // nor the admin vector forgotten, which leaked one IDT vector and
+        // its handler per multi-queue bring-up, i.e. per controller reset).
+        let mut vectors: Vec<u8> = self
             .irq_vector
             .take()
             .into_iter()
+            .chain(self.admin_irq_vector.take())
             .chain(self.io_irq_vectors.drain(..))
-        {
+            .collect();
+        vectors.sort_unstable();
+        vectors.dedup();
+        for v in vectors {
             narf_interrupts::dispatch::clear_handler(v);
             let _ = narf_interrupts::vector::free(v);
         }
@@ -1969,26 +2055,45 @@ impl Controller {
                 // admin queue (Linux `nvme_create_cq`: `vector =
                 // dev->num_vecs == 1 ? 0 : qid`). Naming IV 1 here would be
                 // an Invalid Interrupt Vector and fail Create I/O CQ.
-                if self.irq_vector.is_some() {
+                if self.admin_irq_vector.is_some() {
                     ien = 1;
                 }
             } else if let Ok(v) = narf_interrupts::vector::alloc() {
                 // Use MSI-X slot 1 for the first I/O queue.
+                let injected = take_test_fault(&FAIL_MSIX_PROGRAM_FOR_TEST);
                 // SAFETY: `table` is this device's MSI-X table from
                 // `enable_msix`, held exclusively here via the `&mut` borrow
                 // of `self.msix` (no concurrent writer). `v` came from
                 // `narf_interrupts::vector::alloc()`, and slot 1 is within the
-                // table (the Admin queue used slot 0). The table was already
-                // globally enabled during `init`, so programming a new entry
-                // here just adds the I/O CQ's vector.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe {
-                    let _ = table.program_vector(1, 0, v);
+                // table (the Admin queue used slot 0). The global enable is
+                // normally already set by `bring_up`; it is set (again)
+                // here because a bring-up whose admin entry could not be
+                // programmed never reached it, and an IEN=1 queue behind a
+                // disabled table would never interrupt.
+                let programmed = !injected
+                    && unsafe {
+                        table.program_vector(1, msix_target_apic_id(), v).is_ok()
+                            && table.enable().is_ok()
+                    };
+                if programmed {
+                    iv = 1;
+                    ien = 1;
+                    irq_vec = Some(v);
+                    narf_interrupts::install_handler(v, nvme_io_irq);
+                } else {
+                    // The entry was not written: creating the CQ with
+                    // IEN=1 would point it at an unprogrammed entry. Keep
+                    // IV=0 / IEN=0 — a polled queue, which every I/O path
+                    // supports — and give the vector back.
+                    use core::fmt::Write as _;
+                    let _ = narf_interrupts::vector::free(v);
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "nvme: bar {:#x}: WARNING: MSI-X I/O entry could not be programmed; \
+                         I/O queue created polled (IEN=0)",
+                        bar0.phys.raw()
+                    );
                 }
-                iv = 1;
-                ien = 1;
-                irq_vec = Some(v);
-                narf_interrupts::install_handler(v, nvme_io_irq);
             }
         }
 
@@ -2411,7 +2516,7 @@ impl Controller {
             // MSI-X table exclusively (no concurrent writer); the
             // table-slot index was alloc_block'd above.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            if unsafe { msix.program_vector(io_base + i, 0, v) }.is_err() {
+            if unsafe { msix.program_vector(io_base + i, msix_target_apic_id(), v) }.is_err() {
                 let _ = narf_interrupts::vector::free(v);
                 for v in vectors {
                     let _ = narf_interrupts::vector::free(v);
@@ -2711,8 +2816,9 @@ impl Controller {
         start_nsid: u32,
         out: &mut [u32],
     ) -> Result<usize, NvmeError> {
-        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        if !self.is_ready() {
+            return Err(NvmeError::NotReady);
+        }
         let buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
         let mut sqe = Sqe::zero();
@@ -2720,10 +2826,7 @@ impl Controller {
         sqe.nsid = start_nsid;
         sqe.prp1 = buf.dma_addr().raw();
         sqe.cdw10 = admin::CNS_NAMESPACE_LIST as u32;
-        // SAFETY: admin queue + BAR live; buf is a fresh DMA page.
-        unsafe {
-            admin.submit(bar0, sqe)?;
-        }
+        let buf = self.admin_submit_data(sqe, buf)?;
         // Parse: up to 1024 NSIDs, LE u32 each. A zero terminates.
         let base = buf.cpu_ptr::<u32>();
         let cap = out.len().min(1024);
@@ -2833,8 +2936,9 @@ impl Controller {
         &mut self,
         nsid: u32,
     ) -> Result<admin::IdentifyNamespaceData, NvmeError> {
-        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        if !self.is_ready() {
+            return Err(NvmeError::NotReady);
+        }
         let buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
         let mut sqe = Sqe::zero();
@@ -2842,10 +2946,7 @@ impl Controller {
         sqe.nsid = nsid;
         sqe.prp1 = buf.dma_addr().raw();
         sqe.cdw10 = admin::CNS_NAMESPACE as u32;
-        // SAFETY: admin queue + BAR live.
-        unsafe {
-            admin.submit(bar0, sqe)?;
-        }
+        let buf = self.admin_submit_data(sqe, buf)?;
         // Read the 4 KiB response into a slice and parse.
         let base = buf.cpu_ptr::<u8>();
         let mut raw = alloc::vec![0u8; 4096];
@@ -2961,10 +3062,8 @@ impl Controller {
 
         // ── 2. Live admin CQ ────────────────────────────────────
         // Peek every slot from the current head forward; stop when
-        // the phase tag doesn't match (no more completions), or
-        // when the head entry is not an outstanding AER's
-        // completion (another command's CQE — leave it for its
-        // waiter).
+        // the phase tag doesn't match (no more completions).
+        let mut orphans = 0u16;
         loop {
             // SAFETY: admin CQ DMA buffer is live + identity-mapped;
             // cq_head is always < admin.depth.
@@ -2973,12 +3072,26 @@ impl Controller {
             if (cqe.status & 1) != (admin.cq_phase & 1) {
                 break; // no more completed entries
             }
-            // CID gate: only an outstanding AER's completion is
-            // consumed here. A head entry carrying another CID is
-            // a normal admin command's completion — leave it for
-            // its waiter.
+            // CID gate: only an outstanding AER's completion is an
+            // event. A head entry carrying any other CID has no
+            // waiter and never will: admin commands are synchronous
+            // under `&mut self` (each consumes its own CQE before it
+            // returns), so nothing can be mid-wait while this drain
+            // runs. It is the late completion of an admin command
+            // that timed out. Left at the head it would block every
+            // AER behind it until some later admin command happened
+            // to drop it — so drop it here: consumed, counted and
+            // reported like any other stray. Bounded by the queue
+            // depth.
             if !admin.is_aer_cid(cqe.cid) {
-                break;
+                if orphans >= admin.depth {
+                    break;
+                }
+                orphans += 1;
+                let (head, phase) = (admin.cq_head, admin.cq_phase);
+                admin.advance_head(bar0);
+                note_stray_cqe(bar0.phys.raw(), admin.qid, head, phase, None, &cqe);
+                continue;
             }
             admin.untrack_aer_cid(cqe.cid);
 
@@ -3073,6 +3186,33 @@ impl Controller {
         Ok(())
     }
 
+    /// Submit admin command `sqe`, whose data pointer names `buf`, and
+    /// hand the buffer back once the command completed. When the command
+    /// times out it may still be live in the device — a late Identify or
+    /// Security Receive would write into `buf` — so the buffer is NOT
+    /// returned to the caller to be dropped: it is parked in
+    /// `in_flight_dma`, which is released only once
+    /// [`Self::disable_after_failure`] has confirmed the controller
+    /// stopped (and leaked if it never does). An error-status completion
+    /// is a completion: the device is done with the buffer, which is
+    /// freed here.
+    fn admin_submit_data(&mut self, sqe: Sqe, buf: DmaBuffer) -> Result<DmaBuffer, NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        // SAFETY: admin queue + BAR live; `buf` is live DMA memory owned
+        // here for the whole command, and parked below if the command
+        // outlives this call.
+        match unsafe { admin.submit(bar0, sqe) } {
+            Ok(_) => Ok(buf),
+            Err(e) => {
+                if e == NvmeError::CompletionTimeout {
+                    self.in_flight_dma.push(buf);
+                }
+                Err(e)
+            }
+        }
+    }
+
     // ── Admin: Security Send (opcode 0x81) ───────────────────────────────
 
     /// Security Send (NVMe Base 2.0c §5.25, opcode 0x81).
@@ -3100,8 +3240,6 @@ impl Controller {
                 core::ptr::write_volatile(base.add(i), b);
             }
         }
-        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         let sqe = build_security_sqe(
             admin::OPC_SECURITY_SEND,
             secp,
@@ -3109,11 +3247,7 @@ impl Controller {
             tl,
             buf.dma_addr().raw(),
         );
-        // SAFETY: admin queue + BAR live; DMA buffer valid for submit duration.
-        unsafe {
-            admin.submit(bar0, sqe)?;
-        }
-        drop(buf);
+        drop(self.admin_submit_data(sqe, buf)?);
         Ok(())
     }
 
@@ -3141,8 +3275,6 @@ impl Controller {
         let al = buf.len() as u32;
         let dma =
             alloc_coherent(buf.len(), DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
-        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
-        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         let sqe = build_security_sqe(
             admin::OPC_SECURITY_RECEIVE,
             secp,
@@ -3150,10 +3282,7 @@ impl Controller {
             al,
             dma.dma_addr().raw(),
         );
-        // SAFETY: admin queue + BAR live; DMA buffer valid for submit duration.
-        unsafe {
-            admin.submit(bar0, sqe)?;
-        }
+        let dma = self.admin_submit_data(sqe, dma)?;
         // Copy DMA buffer into caller's slice.
         // SAFETY: identity-mapped DMA page; buf.len() == al.
         unsafe {
@@ -3390,7 +3519,7 @@ impl Controller {
             // corrupted head): consumed and dropped above, counted
             // and reported here. The caller waits and retries for
             // ours.
-            note_stray_cqe(bar0.phys.raw(), io.qid, head, phase, cid, &cqe);
+            note_stray_cqe(bar0.phys.raw(), io.qid, head, phase, Some(cid), &cqe);
             return Ok(false);
         }
         let nvme_status = cqe.status >> 1;
@@ -4038,21 +4167,30 @@ fn log_due_decade(n: u64) -> bool {
 
 /// Count, and (rate-limited) report, a completion that was consumed from
 /// queue `qid` at CQ index `head` under phase tag `phase` while the waiter
-/// was matching `expected_cid`. Linux `nvme_handle_cqe` warns "invalid id
+/// was matching `expected_cid` (`None`: nobody was waiting on the queue at
+/// all — see [`Controller::drain_aer_events`]). Linux `nvme_handle_cqe` warns "invalid id
 /// %d completed on queue %d" for the same event. With one command in
 /// flight per controller a stray means the device completed a command the
 /// host no longer tracks (a late completion of a timed-out command) or
 /// posted a corrupt entry — either way worth knowing about.
-fn note_stray_cqe(bar: u64, qid: u16, head: u16, phase: u16, expected_cid: u16, cqe: &Cqe) {
+fn note_stray_cqe(bar: u64, qid: u16, head: u16, phase: u16, expected_cid: Option<u16>, cqe: &Cqe) {
     use core::fmt::Write as _;
     let n = STRAY_CQE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
     if log_due_decade(n) {
-        let _ = writeln!(
-            narf_console::Writer,
+        let mut w = narf_console::Writer;
+        let _ = write!(
+            w,
             "nvme: bar {bar:#x}: WARNING: stray completion dropped on queue {qid} \
-             (cq head {head}, phase {}): expected cid {expected_cid:#06x}, seen cid {:#06x} \
-             sqid {} sqhd {} status {:#06x} result {:#010x} (stray #{n})",
-            phase & 1,
+             (cq head {head}, phase {}): ",
+            phase & 1
+        );
+        let _ = match expected_cid {
+            Some(cid) => write!(w, "expected cid {cid:#06x}"),
+            None => write!(w, "no command waiting"),
+        };
+        let _ = writeln!(
+            w,
+            ", seen cid {:#06x} sqid {} sqhd {} status {:#06x} result {:#010x} (stray #{n})",
             cqe.cid,
             cqe.sq_id,
             cqe.sq_head,
@@ -6116,7 +6254,7 @@ async fn aer_supervisor_task() {
             continue;
         }
         for instance in 0..n as u32 {
-            let v = with_controller_at(instance, |c| c.irq_vector).flatten();
+            let v = with_controller_at(instance, |c| c.aer_wait_vector()).flatten();
             match v {
                 Some(v) => {
                     let _ = narf_interrupts::wait_for_irq_until(

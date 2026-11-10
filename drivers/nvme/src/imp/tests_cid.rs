@@ -815,3 +815,112 @@ kernel_test_in!(
     "drivers/nvme/async",
     smoke_nvme_async_timeout_checks_cq_before_failing
 );
+
+fn smoke_nvme_aer_drain_drops_orphan_admin_completion() -> TestResult {
+    // The late completion of an admin command that timed out has no
+    // waiter. Sitting at the admin CQ head it used to stop the AER drain
+    // cold — every event behind it stayed undelivered until some later
+    // admin command happened to drop it. The drain now drops it itself
+    // (counted as a stray) and delivers the AER behind it.
+    let Some(mut fake) = fake_cid_controller() else {
+        return TestResult::Fail("fake CID controller setup failed");
+    };
+    let ctrl = &mut fake.ctrl;
+    if ctrl.post_aer_commands(1).is_err() || ctrl.aer_outstanding() != 1 {
+        return TestResult::Fail("post_aer_commands failed");
+    }
+    // Slot 0: an orphan (CID 7 — neither the AER, CID 0, nor anything
+    // waited for). Slot 1: the AER's completion.
+    // SAFETY: `cq_admin` is a live 4 KiB coherent page; slots 0..1.
+    unsafe {
+        stage_cqe(fake.cq_admin, 0, 7, 0, IO_STRAY_SENTINEL);
+        stage_cqe(fake.cq_admin, 1, 0, 0, AER_EVENT);
+    }
+    let strays0 = super::stray_cqe_drops();
+    let drain = ctrl.drain_aer_events();
+    if drain.drained != 1 {
+        return TestResult::Fail("an orphan completion at the head blocked the AER drain");
+    }
+    if super::stray_cqe_drops() != strays0 + 1 {
+        return TestResult::Fail("the orphan admin completion was not counted as a stray");
+    }
+    if ctrl.aer_outstanding() != 1 {
+        return TestResult::Fail("the drained AER was not reposted");
+    }
+    if ctrl.admin.as_ref().map(|q| q.cq_head) != Some(2) {
+        return TestResult::Fail("the drain did not consume both entries");
+    }
+    // Nothing fresh left: a second drain is a no-op.
+    if ctrl.drain_aer_events().drained != 0 || super::stray_cqe_drops() != strays0 + 1 {
+        return TestResult::Fail("an empty admin CQ drained or dropped something");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme",
+    smoke_nvme_aer_drain_drops_orphan_admin_completion
+);
+
+fn smoke_nvme_admin_data_buffer_parked_on_timeout() -> TestResult {
+    // An admin command with a data buffer (Identify, Security Send /
+    // Receive) that times out may still be live in the device, so its
+    // buffer is not freed with the error: it is parked in `in_flight_dma`
+    // until the controller is confirmed stopped. A completion — even an
+    // error status — means the device is done with the buffer, which is
+    // then freed as before. (The timeout half waits out the real 5 s
+    // admin budget.)
+    let Some(mut fake) = fake_cid_controller() else {
+        return TestResult::Fail("fake CID controller setup failed");
+    };
+    let ctrl = &mut fake.ctrl;
+    let mut out = [0u32; 4];
+
+    // CID 0: completes with an error status (phase tag 1, status 2).
+    // SAFETY: `cq_admin` is a live 4 KiB coherent page; slot 0.
+    unsafe {
+        core::ptr::write_volatile(
+            fake.cq_admin as *mut Cqe,
+            Cqe {
+                cmd_specific: 0,
+                _resv: 0,
+                sq_head: 0,
+                sq_id: 0,
+                cid: 0,
+                status: AER_ERR_STATUS,
+            },
+        );
+    }
+    if !matches!(
+        ctrl.identify_ns_list(0, &mut out),
+        Err(super::NvmeError::CommandFailed { .. })
+    ) {
+        return TestResult::Fail("an error-status Identify did not report CommandFailed");
+    }
+    if !ctrl.in_flight_dma.is_empty() {
+        return TestResult::Fail("a completed command's buffer was parked");
+    }
+
+    // CID 1: never completes.
+    let timeouts0 = super::command_timeouts();
+    if !matches!(
+        ctrl.identify_ns_list(0, &mut out),
+        Err(super::NvmeError::CompletionTimeout)
+    ) {
+        return TestResult::Fail("a silent admin CQ did not time the Identify out");
+    }
+    if super::command_timeouts() != timeouts0 + 1 {
+        return TestResult::Fail("the admin timeout was not counted");
+    }
+    if ctrl.in_flight_dma.len() != 1 {
+        return TestResult::Fail("a timed-out admin command's data buffer was freed");
+    }
+    // An admin timeout does not take the controller's I/O down with it.
+    if ctrl.is_dead() {
+        return TestResult::Fail("an admin timeout marked the controller dead");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme",
+    smoke_nvme_admin_data_buffer_parked_on_timeout
+);

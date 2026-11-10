@@ -1032,3 +1032,224 @@ kernel_test_in!(
     "drivers/nvme/multi",
     smoke_nvme_detach_event_removes_controller_qemu
 );
+
+// ── MSI-X entry programming ────────────────────────────────────────
+
+/// An MSI-X entry that could not be programmed is never advertised as a
+/// queue's vector. QEMU, second controller, stack-local bring-ups with
+/// the programming made to fail:
+///  - the admin entry: the admin queue gets no vector; the I/O queue
+///    setups (single pair, and preferred) still program, check and enable
+///    their own entries;
+///  - the single I/O queue's entry: that queue is created polled
+///    (IEN=0, no vector) while the admin vector stays.
+///
+/// Either way I/O works. A normal bring-up afterwards gets its vectors
+/// back, and every entry is steered at an APIC ID firmware lists.
+fn smoke_nvme_msix_program_failure_falls_back_to_polled_qemu() -> TestResult {
+    use super::FAIL_MSIX_PROGRAM_FOR_TEST;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    if super::controller_count() < 2 {
+        return TestResult::Skip("needs two NVMe controllers");
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The steering target is a CPU that exists: under QEMU's MADT,
+        // APIC ID 0 — what the entries used to hard-code.
+        let target = super::msix_target_apic_id();
+        let known = narf_interrupts::apic_id_of_cpu(0).is_some();
+        if known && narf_interrupts::apic_id_of_cpu(target as usize) != Some(target) {
+            return TestResult::Fail(
+                "MSI-X entries are steered at an APIC ID firmware does not list",
+            );
+        }
+        if narf_interrupts::apic_id_of_cpu(0) == Some(0) && target != 0 {
+            return TestResult::Fail("MSI-X target moved off CPU 0 although it exists");
+        }
+    }
+    let Some(Some(dev)) = super::with_controller_at(1, |c| c.bus_device()) else {
+        return TestResult::Fail("nvme1 has no bus device");
+    };
+    let authority = bootstrap_registry_authority();
+    let Ok((_h, cap)) = claim_device_cap(&authority, dev.addr) else {
+        return TestResult::Fail("claim_device_cap(nvme1) failed");
+    };
+    let Ok(buf) = alloc_coherent(4096, DomainId::DRIVER_0) else {
+        return TestResult::Fail("alloc_coherent failed");
+    };
+    // Stack-local bring-ups cross the installed controller's queues (the
+    // harness pattern `reinstall` documents); it is reinstalled at the
+    // end, whatever the verdict.
+    let verdict = (|| -> Result<(), &'static str> {
+        // Admin entry fails.
+        let mut ctrl = super::Controller::from_device(dev);
+        FAIL_MSIX_PROGRAM_FOR_TEST.store(1, Ordering::Release);
+        let up = ctrl.bring_up(&cap);
+        let taken = FAIL_MSIX_PROGRAM_FOR_TEST.swap(0, Ordering::AcqRel) == 0;
+        up.map_err(|_| "bring_up failed when the admin MSI-X entry could not be programmed")?;
+        if !taken {
+            ctrl.disable_after_failure(&cap);
+            return Err("bring_up never programmed an admin MSI-X entry: nothing was tested");
+        }
+        if ctrl.admin_irq_vector().is_some() || ctrl.irq_vector.is_some() {
+            ctrl.disable_after_failure(&cap);
+            return Err("an unprogrammed admin entry was kept as the admin vector");
+        }
+        // The I/O queue's own entry is programmed, checked and enabled
+        // independently of the admin entry: the single pair works.
+        if ctrl.create_io_queue().is_err() {
+            ctrl.disable_after_failure(&cap);
+            return Err("create_io_queue failed after an admin MSI-X failure");
+        }
+        let io_ok = ctrl.read_lba(0, 1, &buf).is_ok();
+        ctrl.disable_after_failure(&cap);
+        if !io_ok {
+            return Err("I/O failed on the single pair after an admin MSI-X failure");
+        }
+
+        // Same failure, preferred (multi-queue) setup.
+        let mut ctrl = super::Controller::from_device(dev);
+        FAIL_MSIX_PROGRAM_FOR_TEST.store(1, Ordering::Release);
+        let up = ctrl.bring_up(&cap);
+        FAIL_MSIX_PROGRAM_FOR_TEST.store(0, Ordering::Release);
+        up.map_err(|_| "bring_up failed on the second admin MSI-X failure")?;
+        if ctrl.create_io_queues_preferred(&cap).is_err() {
+            ctrl.disable_after_failure(&cap);
+            return Err("the preferred queue setup failed after an admin MSI-X failure");
+        }
+        let io_ok = ctrl.read_lba(0, 1, &buf).is_ok();
+        let admin_vectorless = ctrl.admin_irq_vector().is_none();
+        ctrl.disable_after_failure(&cap);
+        if !io_ok {
+            return Err("I/O failed on the preferred queues after an admin MSI-X failure");
+        }
+        if !admin_vectorless {
+            return Err("the I/O queue setup advertised the unprogrammed admin entry");
+        }
+
+        // I/O entry fails; the admin entry is fine.
+        let mut ctrl = super::Controller::from_device(dev);
+        ctrl.bring_up(&cap).map_err(|_| "second bring_up failed")?;
+        if ctrl.admin_irq_vector().is_none() {
+            ctrl.disable_after_failure(&cap);
+            return Err("a normal bring_up did not get its admin vector back");
+        }
+        FAIL_MSIX_PROGRAM_FOR_TEST.store(1, Ordering::Release);
+        let created = ctrl.create_io_queue();
+        let taken = FAIL_MSIX_PROGRAM_FOR_TEST.swap(0, Ordering::AcqRel) == 0;
+        if created.is_err() {
+            ctrl.disable_after_failure(&cap);
+            return Err("create_io_queue failed instead of falling back to a polled queue");
+        }
+        let polled = ctrl.io_irq_vectors().is_empty();
+        let admin_kept = ctrl.admin_irq_vector().is_some();
+        let io_ok = ctrl.read_lba(0, 1, &buf).is_ok();
+        ctrl.disable_after_failure(&cap);
+        if !taken {
+            // A one-entry table shares entry 0 and programs nothing here.
+            return Ok(());
+        }
+        if !polled {
+            return Err("an unprogrammed I/O entry was kept as the queue's vector");
+        }
+        if !admin_kept {
+            return Err("the I/O entry's failure took the admin vector with it");
+        }
+        if !io_ok {
+            return Err("I/O failed on the polled (IEN=0) queue");
+        }
+        Ok(())
+    })();
+    FAIL_MSIX_PROGRAM_FOR_TEST.store(0, Ordering::Release);
+    let restored = reinstall(1);
+    if let Err(e) = verdict {
+        return TestResult::Fail(e);
+    }
+    if let Err(e) = restored {
+        return TestResult::Fail(e);
+    }
+    // The reinstalled controller is interrupt-capable again.
+    if super::with_controller_at(1, |c| c.admin_irq_vector().is_some()) != Some(true) {
+        return TestResult::Fail("nvme1 did not get its admin vector back after the fallbacks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/multi",
+    smoke_nvme_msix_program_failure_falls_back_to_polled_qemu
+);
+
+/// Every IDT vector a controller allocated goes back when it is disabled
+/// — in particular the admin queue's, which the multi-queue setup used to
+/// lose track of (it repoints `irq_vector` at the first I/O queue's
+/// vector), leaking one vector and its handler per bring-up: per
+/// controller reset, now that a command timeout resets. QEMU, second
+/// controller, stack-local.
+fn smoke_nvme_disable_releases_every_vector_qemu() -> TestResult {
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap};
+    if super::controller_count() < 2 {
+        return TestResult::Skip("needs two NVMe controllers");
+    }
+    let Some(Some(dev)) = super::with_controller_at(1, |c| c.bus_device()) else {
+        return TestResult::Fail("nvme1 has no bus device");
+    };
+    let authority = bootstrap_registry_authority();
+    let Ok((_h, cap)) = claim_device_cap(&authority, dev.addr) else {
+        return TestResult::Fail("claim_device_cap(nvme1) failed");
+    };
+    let verdict = (|| -> Result<(), &'static str> {
+        let mut ctrl = super::Controller::from_device(dev);
+        ctrl.bring_up(&cap).map_err(|_| "bring_up failed")?;
+        let admin = ctrl.admin_irq_vector();
+        if ctrl.create_io_queues_preferred(&cap).is_err() {
+            ctrl.disable_after_failure(&cap);
+            return Err("create_io_queues_preferred failed");
+        }
+        let io: Vec<u8> = ctrl.io_irq_vectors().to_vec();
+        let admin_tracked = ctrl.admin_irq_vector() == admin;
+        let all_live = admin
+            .iter()
+            .chain(io.iter())
+            .all(|&v| narf_interrupts::vector::is_allocated(v));
+        let stopped = ctrl.disable_after_failure(&cap);
+        let Some(admin) = admin else {
+            return Err("QEMU's controller came up without an admin vector");
+        };
+        if io.is_empty() {
+            return Err("QEMU's controller came up without I/O vectors");
+        }
+        if io.contains(&admin) {
+            return Err("the admin queue and an I/O queue were given the same vector");
+        }
+        if !admin_tracked || !all_live {
+            return Err("the queue setup lost track of a vector it still owns");
+        }
+        if !stopped {
+            return Err("the controller was not confirmed stopped");
+        }
+        if narf_interrupts::vector::is_allocated(admin) {
+            return Err("disabling the controller leaked the admin queue's vector");
+        }
+        if io.iter().any(|&v| narf_interrupts::vector::is_allocated(v)) {
+            return Err("disabling the controller leaked an I/O queue's vector");
+        }
+        if ctrl.admin_irq_vector().is_some() || !ctrl.io_irq_vectors().is_empty() {
+            return Err("a disabled controller still names vectors it released");
+        }
+        Ok(())
+    })();
+    let restored = reinstall(1);
+    if let Err(e) = verdict {
+        return TestResult::Fail(e);
+    }
+    if let Err(e) = restored {
+        return TestResult::Fail(e);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/multi",
+    smoke_nvme_disable_releases_every_vector_qemu
+);
