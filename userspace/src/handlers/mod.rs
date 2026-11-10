@@ -59,5 +59,5 @@ pub(crate) mod phc;
 #[cfg(feature = "kernel-test")]
 mod read_options_tests;
 
-#[cfg(feature = "kernel-test")]
+#[cfg(all(feature = "kernel-test", feature = "native-ring"))]
 mod native_authority_tests;

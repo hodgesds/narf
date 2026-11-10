@@ -25,6 +25,14 @@ applications above NARF.
 
 ## 3. Public interface
 
+The `native-ring` Cargo feature is off by default. Enabling it registers
+`Bootstrap` (0x4001) and `RingKick` (0x4003), compiles native session/dispatcher
+support, and forwards the feature to `narf-abi` and `narf-scheduler`.
+Without it these syscall numbers remain reserved and return `InvalidOp`
+through the existing native syscall return convention; Tasks contain no
+native session or caller-authority fields.
+The Linux-compatible syscall surface and kernel IPC rings are independent.
+
 Native Bootstrap installs a kernel-owned session in the executing Task. It
 retains the submitting task's scheduler authority, execution generation,
 explicit SQ/CQ page pins, address-space ownership and a terminal close flag.
@@ -1445,12 +1453,9 @@ architectural slots remain advertised through `possible` without appearing as
 phantom nodes to Linux perf's directory-based topology reader. Membership is a
 Linux-compatible `nodeN/memoryM -> ../../memory/memoryM` symlink.
 
-Bootstrap: every new process receives two ring pairs (submit + complete)
-for the kernel ABI plus a read-only config page with capability
-handles to its parent-granted services. Additional ring pairs for
-inter-service communication are obtained by presenting `Cap<RingPair,
-Alloc>` to the kernel's ring-pair allocator. The bootstrap config page
-includes one `Cap<RingPair, Alloc>` as a pre-granted capability.
+With `native-ring`, an explicit Bootstrap call allocates the calling task's
+submit/completion ring pairs and read-only config page. Fork/clone do not
+implicitly establish a native session or grant native capabilities.
 
 **Maximum ring pairs per process: 64 (default; system-wide tunable).**
 Exhaustion fails subsequent allocations with `Err(RingPairBudget)`.

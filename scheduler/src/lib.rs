@@ -65,13 +65,18 @@
 
 extern crate alloc;
 
+#[cfg(feature = "native-ring")]
 mod authority;
-#[cfg(feature = "kernel-test")]
+#[cfg(all(feature = "kernel-test", feature = "native-ring"))]
 pub use authority::__set_task_active_domain_for_test;
+#[cfg(feature = "native-ring")]
 pub use authority::{
     create_user_authority, enter_domain_scope, exit_domain_scope, prepare_user_authority,
     release_caller_authority, task_authority, AuthorityControl, AuthorityWatch, CallerAuthority,
 };
+
+#[cfg(not(feature = "native-ring"))]
+pub use narf_arch::{enter_domain_scope, exit_domain_scope};
 
 pub mod accounting;
 pub mod admission;
@@ -196,7 +201,9 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::AtomicU64;
 
-use narf_capabilities::{Cap, CapError, CapKind, CapSlot, CapType, Rights, Spend};
+use narf_capabilities::{Cap, CapKind, CapType, Spend};
+#[cfg(feature = "native-ring")]
+use narf_capabilities::{CapError, CapSlot, Rights};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::AddressSpace;
@@ -578,12 +585,14 @@ fn unregister_live_user_address_space(id: TaskId) {
 
 // Task-id selection is a cold management operation. Dispatch retains the
 // task-owned CallerAuthority and never calls these adapters per submission.
+#[cfg(feature = "native-ring")]
 pub fn lookup_task_cap(task: TaskId, presented: CapSlot) -> Result<CapSlot, CapError> {
     task_authority(task)
         .ok_or(CapError::Revoked)?
         .lookup(presented)
 }
 
+#[cfg(feature = "native-ring")]
 pub fn install_task_bootstrap_cap<T: CapType, R: Rights>(
     task: TaskId,
     cap: &Cap<T, R>,
@@ -593,6 +602,7 @@ pub fn install_task_bootstrap_cap<T: CapType, R: Rights>(
         .install_bootstrap(cap)
 }
 
+#[cfg(feature = "native-ring")]
 pub fn transfer_task_cap(
     sender: TaskId,
     receiver: TaskId,
@@ -607,8 +617,11 @@ pub fn transfer_task_cap(
 impl Drop for TaskSlot {
     fn drop(&mut self) {
         unregister_live_user_address_space(self.id);
-        self.authority.retire();
-        authority::unregister(self.id);
+        #[cfg(feature = "native-ring")]
+        {
+            self.authority.retire();
+            authority::unregister(self.id);
+        }
         if let Some(address_space) = self.addr_space.as_ref() {
             // Final slot drop is the execution-liveness boundary for this MM:
             // the future cannot be polled again after Drop begins. Passive Arc
@@ -2531,7 +2544,10 @@ pub(crate) struct TaskSlot {
     pub(crate) spec: TaskSpec,
     /// Stable caller identity, grants and domain state, prepared before the
     /// slot is published. Dispatchers borrow this same owner directly.
+    #[cfg(feature = "native-ring")]
     authority: Arc<CallerAuthority>,
+    #[cfg(not(feature = "native-ring"))]
+    domain: narf_lib::id::DomainId,
     /// Last affinity-registry generation folded into `spec.affinity`. Most
     /// dispatches only compare this against one shard-local atomic; the
     /// registry lock is taken only after an actual affinity update.
@@ -2612,6 +2628,7 @@ impl core::fmt::Debug for TaskSlot {
 /// or any other scheduler-owned data is touched.
 #[inline]
 fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
+    #[cfg(feature = "native-ring")]
     let _authority = authority::CurrentGuard::enter(&slot.authority);
     let executor_domain = narf_memory::save_domain_state();
     let task_domain = slot.domain_saved.unwrap_or(executor_domain);
@@ -2625,8 +2642,15 @@ fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
     }
 
     let incoming_reported = narf_arch::current_domain_byte();
+    #[cfg(feature = "native-ring")]
     narf_arch::set_current_domain_byte(slot.authority.domain.load(Ordering::Acquire));
+    #[cfg(not(feature = "native-ring"))]
+    narf_arch::set_current_domain_byte(slot.domain.raw());
     let result = slot.task.as_mut().poll(ctx);
+    #[cfg(not(feature = "native-ring"))]
+    {
+        slot.domain = DomainId::new(narf_arch::current_domain_byte());
+    }
 
     let returned_task_domain = narf_memory::save_domain_state();
     // A stackful task's kernel_switch restores the suspended executor domain
@@ -2908,6 +2932,7 @@ pub fn __reset_queues_for_test() {
     // already unregistered via `Drop`, but a test that discards a
     // slot without dropping it (staged wake inbox, deferred exec
     // replacement) must not leak its table into the next test.
+    #[cfg(feature = "native-ring")]
     authority::reset();
     // A task can queue an in-poll exec replacement and then remain pending.
     // Tests that discard its slot must also discard that deferred owner or the
@@ -4156,7 +4181,9 @@ where
     let cpu = target_cpu(&spec);
     let affinity_generation = register_task_affinity(id, spec.affinity, false);
     let awake = new_wake_cell(id, 0, false);
+    #[cfg(feature = "native-ring")]
     let authority = authority::prepare(id, domain);
+    #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
         user_scheduling: None,
@@ -4165,7 +4192,10 @@ where
         awake,
         id,
         spec,
+        #[cfg(feature = "native-ring")]
         authority,
+        #[cfg(not(feature = "native-ring"))]
+        domain,
         affinity_generation,
         addr_space: None,
         account: BudgetAccount::new(),
@@ -4218,7 +4248,9 @@ where
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let affinity_generation = register_task_affinity(id, spec.affinity, true);
     let awake = new_wake_cell(id, cpu as u32, false);
+    #[cfg(feature = "native-ring")]
     let authority = authority::prepare(id, opts.domain);
+    #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
         user_scheduling: None,
@@ -4227,7 +4259,10 @@ where
         awake,
         id,
         spec,
+        #[cfg(feature = "native-ring")]
         authority,
+        #[cfg(not(feature = "native-ring"))]
+        domain: opts.domain,
         affinity_generation,
         addr_space: None,
         account: BudgetAccount::new(),
@@ -4500,7 +4535,9 @@ where
     // expose the task to the OOM selector/reaper.
     addr_space.scheduler_attach_user_task();
     register_live_user_address_space(id, &addr_space);
+    #[cfg(feature = "native-ring")]
     let authority = prepare_user_authority(id);
+    #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
         user_scheduling: Some(user_scheduling),
@@ -4509,7 +4546,10 @@ where
         awake,
         id,
         spec,
+        #[cfg(feature = "native-ring")]
         authority,
+        #[cfg(not(feature = "native-ring"))]
+        domain: DomainId::USERSPACE_K,
         affinity_generation,
         addr_space: Some(addr_space),
         account: BudgetAccount::new(),

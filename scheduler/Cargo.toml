@@ -23,6 +23,9 @@ narf-console      = { path = "../console" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
+# Native userspace ring authority and task binding. Opt-in.
+native-ring = []
+
 kernel-test = ["narf-capabilities/kernel-test"]
 # High-resolution tick (Linux CONFIG_SCHED_HRTICK): per-task one-shot slice
 # timer via the timer wheel, so a task is preempted precisely at slice

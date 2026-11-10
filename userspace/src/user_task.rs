@@ -939,6 +939,7 @@ fn current_task_owner_ptr() -> *const crate::task::Task {
 /// current_task_owner this performs no Arc increment/decrement. The borrow
 /// cannot escape the callback or be used to create a reference with static
 /// lifetime. Current-user-context publication follows direct resume/migration.
+#[cfg(feature = "native-ring")]
 pub(crate) fn with_current_task_owner<R>(
     f: impl for<'a> FnOnce(&'a crate::task::Task) -> R,
 ) -> Option<R> {
@@ -3543,6 +3544,7 @@ impl core::future::Future for UserTaskFuture {
                 // longjmp'ing here; we're the sole consumer.
                 // SAFETY: Valid memory or trusted environment
                 let req = unsafe { alloc::boxed::Box::from_raw(req_ptr) };
+                #[cfg(feature = "native-ring")]
                 crate::handlers::native_exec_commit(&this.task);
                 this.process.address_space = req.new_as;
                 this.process.entry = crate::EntryPoint(narf_memory::VirtAddr::new(req.entry));

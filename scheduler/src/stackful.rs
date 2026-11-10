@@ -767,6 +767,7 @@ pub fn handle_user_fpu_unavailable() -> bool {
     materialize_user_fpu(cpu, unsafe { &*task })
 }
 
+#[cfg(feature = "native-ring")]
 pub(crate) fn update_current_authority_domain(domain: u8) -> bool {
     let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
     if p.is_null() {
@@ -1929,7 +1930,11 @@ pub struct KernelTask {
     /// that domain for whatever runs next — which picks the wrong
     /// `domain_heap` window and misfires `block::encrypted`'s assertion,
     /// silently in both cases.
+    #[cfg(feature = "native-ring")]
     domain_byte: Arc<crate::authority::DomainState>,
+    #[cfg(not(feature = "native-ring"))]
+    domain_byte: core::sync::atomic::AtomicU8,
+    #[cfg(feature = "native-ring")]
     authority: Option<Arc<crate::CallerAuthority>>,
     /// Pointer to the executor's `KernelContext`. The executor
     /// stores its own ctx address here before switching in; the
@@ -2167,10 +2172,14 @@ impl KernelTask {
             // provably unreferenced and thus safe to recycle.
             recyclable_stack: AtomicBool::new(false),
             // A fresh task has no scope open, so it reports FRAME.
+            #[cfg(feature = "native-ring")]
             domain_byte: Arc::new(crate::authority::DomainState::new(
                 narf_lib::id::DomainId::FRAME,
                 true,
             )),
+            #[cfg(not(feature = "native-ring"))]
+            domain_byte: core::sync::atomic::AtomicU8::new(narf_lib::id::DomainId::FRAME.raw()),
+            #[cfg(feature = "native-ring")]
             authority: None,
             // `KernelContext::default()` is a real register struct on x86_64
             // and a unit struct elsewhere; the allow covers the unit-struct
@@ -2301,6 +2310,7 @@ impl KernelTask {
         exec_ctx: &mut KernelContext,
         waker: &Waker,
     ) -> Poll<()> {
+        #[cfg(feature = "native-ring")]
         if self.authority.is_none() {
             if let Some(owner) = crate::authority::clone_poll_owner() {
                 self.domain_byte = owner.domain.clone();
@@ -2626,6 +2636,7 @@ impl KernelTask {
         exec_ctx: &mut KernelContext,
         waker: &Waker,
     ) -> Poll<()> {
+        #[cfg(feature = "native-ring")]
         if self.authority.is_none() {
             if let Some(owner) = crate::authority::clone_poll_owner() {
                 self.domain_byte = owner.domain.clone();

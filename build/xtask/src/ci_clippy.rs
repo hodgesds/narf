@@ -31,6 +31,7 @@ const CONTEXTS: &[&str] = &[
     "boot-smoke,cgroup-all,bpf-idle,bpf-leds",
     "boot-smoke,cgroup-all,bpf-idle,bpf-leds,container",
     "user-mode-e2e",
+    "user-mode-e2e,native-ring",
 ];
 
 /// Cargo's unit graph separates host build dependencies from target code;

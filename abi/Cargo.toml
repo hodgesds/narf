@@ -21,6 +21,9 @@ narf-tracing      = { path = "../tracing" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
+# Native userspace ring dispatcher. Wire types remain available without it.
+native-ring = ["narf-scheduler/native-ring"]
+
 kernel-test = ["narf-scheduler/kernel-test"]
 
 [lints]

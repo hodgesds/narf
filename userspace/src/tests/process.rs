@@ -212,7 +212,9 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
         narf_scheduler::TaskSpec::user_task(),
     );
     let child = pending.task_id();
+    #[cfg(feature = "native-ring")]
     let authority = narf_scheduler::task_authority(child).unwrap();
+    #[cfg(feature = "native-ring")]
     if authority.image().is_ok() {
         return TestResult::Fail("prepared authority was already live");
     }
@@ -225,6 +227,7 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
     }
 
     pending.spawn();
+    #[cfg(feature = "native-ring")]
     if authority.image().is_err() {
         return TestResult::Fail("published authority is not live");
     }
@@ -244,12 +247,14 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
     );
     let abandoned_id = abandoned.task_id();
     let observer = crate::task::task_get(abandoned_id.raw()).unwrap();
+    #[cfg(feature = "native-ring")]
     let retained = narf_scheduler::task_authority(abandoned_id).unwrap();
     drop(abandoned);
-    if crate::task::task_get(abandoned_id.raw()).is_some()
-        || narf_scheduler::task_authority(abandoned_id).is_some()
-        || retained.image().is_ok()
-    {
+    #[cfg(feature = "native-ring")]
+    if narf_scheduler::task_authority(abandoned_id).is_some() || retained.image().is_ok() {
+        return TestResult::Fail("abandoned preparation retained native admission");
+    }
+    if crate::task::task_get(abandoned_id.raw()).is_some() {
         return TestResult::Fail("abandoned preparation retained registration or admission");
     }
     drop(observer);
@@ -349,6 +354,7 @@ kernel_test_in!(
 // (relocated from verification/src/lib.rs)
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
     // After Bootstrap mints rings,
     // `crate::spawn_dispatcher_for(task)` should transfer
@@ -472,6 +478,7 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 kernel_test_in!(
     "userspace/authority",
     smoke_userspace_spawn_dispatcher_for_helper

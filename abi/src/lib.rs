@@ -50,7 +50,9 @@
 
 extern crate alloc;
 
+#[cfg(feature = "native-ring")]
 use alloc::sync::Arc;
+#[cfg(feature = "native-ring")]
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -219,19 +221,23 @@ pub struct FileOpReturn {
     pub value: u64,
 }
 
+#[cfg(feature = "native-ring")]
 pub type FileOpBridge =
     fn(Option<DispatchContext<'_>>, FileOpKind, &FileOpArgs, &CancelCtx<'_>) -> FileOpReturn;
 
+#[cfg(feature = "native-ring")]
 static FILE_OP_BRIDGE: IrqSafeSpinLock<Option<FileOpBridge>> = IrqSafeSpinLock::new(None);
 
 /// Install the bridge that routes ring-submitted file ops into the
 /// kernel's regular syscall path. Boot calls this once with
 /// `narf_userspace::handlers::abi_file_op_bridge`. The bridge is
 /// handed a `CancelCtx` it polls between meaningful steps.
+#[cfg(feature = "native-ring")]
 pub fn install_file_op_bridge(bridge: FileOpBridge) {
     *FILE_OP_BRIDGE.lock() = Some(bridge);
 }
 
+#[cfg(feature = "native-ring")]
 fn dispatch_file_op(
     subject: Option<DispatchContext<'_>>,
     kind: FileOpKind,
@@ -296,6 +302,7 @@ pub fn install_cpu_op_bridge(bridge: CpuOpBridge) {
     *CPU_OP_BRIDGE.lock() = Some(bridge);
 }
 
+#[cfg(feature = "native-ring")]
 fn dispatch_cpu_op(kind: CpuOpKind, args: &CpuOpArgs, cx: &CancelCtx<'_>) -> CpuOpReturn {
     let bridge = *CPU_OP_BRIDGE.lock();
     match bridge {
@@ -849,6 +856,7 @@ pub fn completion_channel<const N: usize>() -> (CompletionQueue<N>, CompletionDr
 /// Build the right cancellation outcome for a submission given its
 /// flags. Spec §3.1: CANCELLABLE → `Cancelled`; non-CANCELLABLE →
 /// `CancelRequested` (op kept running, caller awaits eventual Ok).
+#[cfg(feature = "native-ring")]
 fn cancel_outcome(tag: Tag, flags: SubmissionFlags) -> Completion {
     let status = if flags.contains(SubmissionFlags::CANCELLABLE) {
         NarfStatus::Cancelled
@@ -903,10 +911,12 @@ pub fn check_submission_domain(op: OpCode, active_domain: DomainId) -> Result<()
 
 /// Borrowed request subject. Kernel-owned references never cross the wire.
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "native-ring")]
 pub struct DispatchContext<'a> {
     pub authority: &'a narf_scheduler::CallerAuthority,
     pub image: u64,
 }
+#[cfg(feature = "native-ring")]
 impl<'a> DispatchContext<'a> {
     pub const fn new(authority: &'a narf_scheduler::CallerAuthority, image: u64) -> Self {
         Self { authority, image }
@@ -929,6 +939,7 @@ impl<'a> DispatchContext<'a> {
 /// Compatibility helper for explicit owner handles. A missing owner rejects
 /// every presented cap; production dispatch uses DispatchContext::validate,
 /// which locks a nonempty owner's table once for the fixed cap array.
+#[cfg(feature = "native-ring")]
 pub fn validate_submission_caps(
     owner: Option<&narf_scheduler::CallerAuthority>,
     caps: &[CapSlot; 4],
@@ -948,6 +959,7 @@ pub fn validate_submission_caps(
 /// Compare an explicitly bound owner's current logical domain with the op's
 /// required domain. Production DispatchContext also pins the image generation.
 /// None is reserved for legacy kernel-test fixtures.
+#[cfg(feature = "native-ring")]
 pub fn check_owner_domain(
     owner: Option<&narf_scheduler::CallerAuthority>,
     op: OpCode,
@@ -971,11 +983,13 @@ pub fn check_owner_domain(
 /// will widen this into per-inflight-tag cancel flags so mid-op
 /// cancellation can interrupt a long-running await.
 #[derive(Debug)]
+#[cfg(feature = "native-ring")]
 struct PendingCancels {
     inner: IrqSafeSpinLock<CancelInner>,
 }
 
 #[derive(Debug)]
+#[cfg(feature = "native-ring")]
 struct CancelInner {
     /// Tags directly targeted by an `OpCode::Cancel`.
     tags: Vec<u64>,
@@ -1001,6 +1015,7 @@ struct CancelInner {
     inflight: Vec<Arc<CancelToken>>,
 }
 
+#[cfg(feature = "native-ring")]
 impl PendingCancels {
     const fn new() -> Self {
         Self {
@@ -1129,6 +1144,7 @@ impl PendingCancels {
     }
 }
 
+#[cfg(feature = "native-ring")]
 fn binding_live(
     authority: Option<&narf_scheduler::CallerAuthority>,
     image: Option<u64>,
@@ -1142,6 +1158,7 @@ fn binding_live(
 /// In-kernel ABI dispatcher. Drains a submission ring and dispatches
 /// to the appropriate subsystems.
 #[derive(Debug)]
+#[cfg(feature = "native-ring")]
 pub struct Dispatcher<const N: usize> {
     sq: SubmissionDrain<N>,
     cq: CompletionQueue<N>,
@@ -1155,6 +1172,7 @@ pub struct Dispatcher<const N: usize> {
     watch: Option<Arc<narf_scheduler::AuthorityWatch>>,
 }
 
+#[cfg(feature = "native-ring")]
 impl<const N: usize> Dispatcher<N> {
     /// Legacy constructor. Production submissions fail closed until bound;
     /// kernel-test fixtures may dispatch empty-cap operations without an owner.

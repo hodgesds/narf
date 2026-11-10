@@ -2967,6 +2967,7 @@ fn do_execve_resolved(
     // "memory allocation of N bytes failed" kernel-heap OOM panic.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if narf_scheduler::stackful::user_own_stack_enabled() {
+        #[cfg(feature = "native-ring")]
         let _ = crate::user_task::with_current_task_owner(native_exec_commit);
         let entry = new_proc.entry.0.as_u64();
         let rsp = new_proc.stack_top.as_u64();
@@ -14404,6 +14405,7 @@ pub(crate) fn signalfd_arc_from_fd(
 /// per-inflight token the dispatcher hands us — we check it before
 /// dispatching the (synchronous) syscall body so a parallel
 /// `OpCode::Cancel` lands cleanly.
+#[cfg(feature = "native-ring")]
 pub fn abi_file_op_bridge(
     subject: Option<narf_abi::DispatchContext<'_>>,
     kind: narf_abi::FileOpKind,
@@ -14521,6 +14523,7 @@ pub fn abi_file_op_bridge(
 /// #1363 wiring): every cap a submission presents resolves against
 /// that task's own table, so the task cannot spend another task's
 /// capabilities through its rings.
+#[cfg(feature = "native-ring")]
 pub fn spawn_dispatcher_for(task_id: u64) -> Option<narf_scheduler::TaskId> {
     let (session, ends) = {
         let mut table = BOOTSTRAP_TABLE.lock();
@@ -14569,6 +14572,7 @@ fn init_module_result(
 /// subsystems can install richer handlers over the same slots
 /// (e.g. a real file-descriptor-backed `Read`).
 pub fn install_core_syscalls(table: &mut SyscallTable) {
+    #[cfg(feature = "native-ring")]
     table.install_raw(Syscall::Bootstrap, "bootstrap", RawFnHandler(sys_bootstrap));
     table.install_raw(Syscall::Write, "write", RawFnHandler(sys_write));
     table.install_raw(Syscall::Writev, "writev", RawFnHandler(sys_writev));
@@ -14803,6 +14807,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "firmware_install",
         RawFnHandler(sys_firmware_install),
     );
+    #[cfg(feature = "native-ring")]
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid, "getpid", RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid, "getppid", RawFnHandler(sys_getppid));
@@ -16567,6 +16572,7 @@ mod handler_sys_adjtimex;
 mod handler_sys_arch_prctl;
 #[path = "sys_at2_reshape.rs"]
 mod handler_sys_at2_reshape;
+#[cfg(feature = "native-ring")]
 #[path = "sys_bootstrap.rs"]
 mod handler_sys_bootstrap;
 #[path = "sys_bpf.rs"]
@@ -16906,6 +16912,7 @@ mod handler_sys_renameat;
 mod handler_sys_renameat2;
 #[path = "sys_restart_syscall.rs"]
 mod handler_sys_restart_syscall;
+#[cfg(feature = "native-ring")]
 #[path = "sys_ring_kick.rs"]
 mod handler_sys_ring_kick;
 #[path = "sys_rmdir.rs"]
@@ -17228,7 +17235,6 @@ pub(crate) use {
     },
     handler_sys_adjtimex::sys_adjtimex,
     handler_sys_at2_reshape::sys_at2_reshape,
-    handler_sys_bootstrap::sys_bootstrap,
     handler_sys_brk::sys_brk,
     handler_sys_capget::sys_capget,
     handler_sys_capset::sys_capset,
@@ -17378,7 +17384,6 @@ pub(crate) use {
     handler_sys_renameat::sys_renameat,
     handler_sys_renameat2::sys_renameat2,
     handler_sys_restart_syscall::sys_restart_syscall,
-    handler_sys_ring_kick::sys_ring_kick,
     handler_sys_rmdir::{rmdir_absolute, sys_rmdir},
     handler_sys_rseq::sys_rseq,
     handler_sys_rt_sigaction::sys_rt_sigaction,
@@ -17495,3 +17500,6 @@ pub(crate) use {
     handler_sys_writev::sys_writev,
     handler_sys_yield::sys_yield,
 };
+
+#[cfg(feature = "native-ring")]
+pub(crate) use {handler_sys_bootstrap::sys_bootstrap, handler_sys_ring_kick::sys_ring_kick};

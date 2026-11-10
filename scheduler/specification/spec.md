@@ -29,6 +29,13 @@ those — it is the glue, not the signal source.
 
 ### Caller authority and lifetime
 
+Caller-authority APIs and state described here require `native-ring`, off
+by default. With it disabled, task creation/poll/retirement do not allocate,
+publish, or consult native authority state. Stackful tasks keep their logical
+domain byte directly; plain futures save it across polls. Domain scope
+wrappers use the architecture entry/exit implementation directly. Hardware
+domain save/restore, executor policy, and generic IPC remain independent.
+
 `create_user_authority(TaskId)` creates a prepared `Arc<CallerAuthority>`
 and a unique `AuthorityControl` together before task publication. The Task
 and scheduler slot retain the same owner; spawn publishes it only after

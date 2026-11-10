@@ -50,6 +50,9 @@ narf-modules      = { path = "../modules" }
 narf-power        = { path = "../power" }
 
 [features]
+# Native Bootstrap/RingKick ABI and per-task sessions. Off by default.
+native-ring = ["narf-abi/native-ring", "narf-scheduler/native-ring"]
+
 # Default-on so the workspace's `cargo xtask kernel-test` driver
 # (which doesn't enable any per-crate features explicitly) still
 # builds the Linux-shaped surface into the kernel. Strip with

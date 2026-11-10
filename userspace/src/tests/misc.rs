@@ -59,7 +59,61 @@ fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_syscall_table_roundtrip);
 
+fn smoke_userspace_native_ring_feature_registration() -> TestResult {
+    let mut table = crate::SyscallTable::new();
+    crate::install_core_syscalls(&mut table);
+    for call in [crate::Syscall::Bootstrap, crate::Syscall::RingKick] {
+        if table.name_of(call).is_some() != cfg!(feature = "native-ring") {
+            return TestResult::Fail("native ring registration disagrees with feature");
+        }
+        #[cfg(not(feature = "native-ring"))]
+        {
+            struct Probe(crate::SyscallArgs, crate::SyscallReturn);
+            impl crate::TrapContext for Probe {
+                fn args(&self) -> &crate::SyscallArgs {
+                    &self.0
+                }
+                fn set_return(&mut self, ret: crate::SyscallReturn) {
+                    self.1 = ret;
+                }
+                fn user_rsp(&self) -> u64 {
+                    0
+                }
+                fn rip(&self) -> u64 {
+                    0
+                }
+                fn set_rip(&mut self, _: u64) {}
+                fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+                    false
+                }
+            }
+            let mut probe = Probe(crate::SyscallArgs::default(), crate::SyscallReturn::ok(0));
+            table.dispatch(call, &mut probe);
+            if probe.1.status != narf_abi::NarfStatus::InvalidOp || probe.1.value != (-38i64) as u64
+            {
+                return TestResult::Fail("disabled native ring call did not return ENOSYS");
+            }
+        }
+    }
+    for call in [
+        crate::Syscall::Read,
+        crate::Syscall::Write,
+        crate::Syscall::Mmap,
+        crate::Syscall::GetPid,
+    ] {
+        if table.name_of(call).is_none() {
+            return TestResult::Fail("Linux-compatible syscall missing");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/authority",
+    smoke_userspace_native_ring_feature_registration
+);
+
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     // Bootstrap mints a SharedRing pair + maps it into the user
     // AS. Drive it via the kernel-identity-mapped phys (which
@@ -259,12 +313,14 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     TestResult::Pass
 }
 #[cfg(all(target_arch = "x86_64", not(feature = "user-mode-e2e")))]
+#[cfg(feature = "native-ring")]
 kernel_test_in!(
     "userspace/authority",
     smoke_userspace_shared_ring_kick_round_trip
 );
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     // Full Bootstrap path: mint config page + ring pair, spawn
     // an `abi::Dispatcher` task on the kernel-side ends, and
@@ -404,6 +460,7 @@ fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 kernel_test_in!(
     "userspace/authority",
     smoke_userspace_bootstrap_rings_round_trip
@@ -3430,6 +3487,7 @@ kernel_test_in!("userspace", smoke_userspace_setsid_makes_session_leader);
 // ── relocated from verification ──
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -3667,9 +3725,11 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_abi_dispatcher_serves_file_ops);
+#[cfg(feature = "native-ring")]
+kernel_test_in!("userspace/authority", smoke_abi_dispatcher_serves_file_ops);
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     // Same shape as smoke_abi_dispatcher_serves_file_ops, but
     // exercises the Mmap/Munmap ring path. Submit `OpCode::Mmap`
@@ -3826,7 +3886,8 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_abi_dispatcher_serves_mmap);
+#[cfg(feature = "native-ring")]
+kernel_test_in!("userspace/authority", smoke_abi_dispatcher_serves_mmap);
 
 fn smoke_syscall_versioning_dispatch() -> TestResult {
     // Build a private SyscallTable with a v0 + v1 handler for the

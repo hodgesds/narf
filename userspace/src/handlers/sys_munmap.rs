@@ -79,6 +79,7 @@ fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u
 /// syscall 11, that operation was published as base-only and removes the
 /// complete VMA beginning at the supplied address. Keep it out of
 /// `sys_munmap` so a raw Linux call with `len == 0` still returns `EINVAL`.
+#[cfg(feature = "native-ring")]
 pub(crate) fn munmap_native_v1(as_ref: &AddressSpace, base: u64) -> Result<(), ()> {
     let base = VirtAddr::new(base);
     let region_len = as_ref.lookup(base).map(|region| region.len).unwrap_or(0);

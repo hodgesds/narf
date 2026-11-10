@@ -2661,6 +2661,7 @@ fn register(
     });
 }
 
+#[cfg(any(target_arch = "x86_64", feature = "native-ring"))]
 pub(crate) fn unmap_current(base: u64) {
     if let Some(address_space_id) = current_address_space_id() {
         if let Some(owners) = existing_mapping_owners(address_space_id) {

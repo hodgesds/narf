@@ -230,20 +230,25 @@ pub fn fork_mapped_file_address_space(parent_id: u64, child_id: u64) {
 pub use mapped_file::truncate_file_mappings;
 
 pub use elf::{parse as parse_elf, ElfError};
+#[cfg(feature = "native-ring")]
 pub use handlers::{
-    abi_file_op_bridge, active_user_as, address_space_lookup, bootstrap_init, bootstrap_live_count,
-    clear_exit_landing, clear_mempolicy_for_fault, cwd_init, cwd_of, default_signal_delivery,
+    abi_file_op_bridge, bootstrap_live_count, shared_rings_for, spawn_dispatcher_for,
+    take_kernel_ends, take_user_ends, SharedRingPair, TaskRings, UserRingEnds,
+    BOOTSTRAP_SHARED_RING_DEPTH,
+};
+pub use handlers::{
+    active_user_as, address_space_lookup, bootstrap_init, clear_exit_landing,
+    clear_mempolicy_for_fault, cwd_init, cwd_of, default_signal_delivery,
     default_sync_signal_delivery, delegate_stack_admin_to_generic_socket,
     delegate_stack_admin_to_route_socket, exit_landing, hostname_init, init_per_task_state,
     install_address_space_for_task_lookup, install_address_space_lookup,
     install_all_address_spaces_lookup, install_core_syscalls, install_signal_delivery_hook,
     install_sync_signal_hook, install_task_id_lookup, nice_init, pgid_init, prctl_init,
     publish_mempolicy_for_fault, release_external_shared_frame, restore_address_space_lookup,
-    retain_external_shared_frame, rlimit_init, sched_param_init, set_exit_landing,
-    shared_rings_for, sid_init, sigaction_init, sigaction_lookup, signal_delivery_hook,
-    signal_init, signal_mask_for_delivery, signal_mask_of, signal_pending_of, spawn_dispatcher_for,
-    sync_signal_hook, take_kernel_ends, take_user_ends, uidgid_init, umask_init, vector_to_signum,
-    SharedRingPair, SyncFaultInfo, TaskRings, UserRingEnds, BOOTSTRAP_SHARED_RING_DEPTH,
+    retain_external_shared_frame, rlimit_init, sched_param_init, set_exit_landing, sid_init,
+    sigaction_init, sigaction_lookup, signal_delivery_hook, signal_init, signal_mask_for_delivery,
+    signal_mask_of, signal_pending_of, sync_signal_hook, uidgid_init, umask_init, vector_to_signum,
+    SyncFaultInfo,
 };
 pub use loader::{
     apply_relocations, load_elf_bytes, load_elf_into_at, load_into, EntryPoint, LoadBytesError,

@@ -675,6 +675,7 @@ mod tests {
             // Policy-fixture slot: an unregistered table. Policy
             // tests never resolve caps; the registry path is covered
             // by the scheduler's own spawn-path fixtures.
+            #[cfg(feature = "native-ring")]
             authority: Arc::new(crate::CallerAuthority::prepared(
                 id,
                 narf_lib::id::DomainId::FRAME,
@@ -683,6 +684,8 @@ mod tests {
             addr_space: None,
             account: crate::BudgetAccount::new(),
             donation: None,
+            #[cfg(not(feature = "native-ring"))]
+            domain: narf_lib::id::DomainId::FRAME,
             domain_saved: None,
             rt_reservation: None,
             nproc_guard: None,

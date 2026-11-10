@@ -23,6 +23,12 @@ per-driver), nor the in-kernel ring implementation (that's `ipc/`).
 
 ## 3. Public interface
 
+The `native-ring` Cargo feature enables the native ring dispatcher and its
+caller-authority bindings. It is off by default and forwarded by `narf-frame`
+through `narf-userspace`. Without it, wire types and generic `narf-ipc` rings
+remain available, but userspace Bootstrap/RingKick handlers are absent.
+Linux-compatible syscalls do not pass through native ring admission.
+
 Sketch: the ABI is defined by a pair of rings per task — a submission
 ring and a completion ring, plus a capability-table handle namespace.
 No `int 0x80` / `svc` syscalls on the fast path.

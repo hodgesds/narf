@@ -8,6 +8,7 @@
 extern crate alloc;
 
 #[cfg(feature = "kernel-test")]
+#[cfg(feature = "native-ring")]
 mod authority_lifecycle {
     use super::*;
     use crate::{completion_channel, submission_channel, Completion, Dispatcher, Submission, Tag};
@@ -84,6 +85,7 @@ mod authority_lifecycle {
     kernel_test_in!("abi/authority", smoke_abi_exec_wakes_full_completion_queue);
 }
 
+#[cfg(feature = "native-ring")]
 use core::future::Future;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -94,6 +96,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 /// them at spawn and the §8 step-5 leg passes. A plain `spawn`ed
 /// owner would be recorded as `FRAME` and every submission would
 /// complete `Forbidden`.
+#[cfg(feature = "native-ring")]
 fn spawn_owner<F>(f: F) -> narf_scheduler::TaskId
 where
     F: Future<Output = ()> + Send + 'static,
@@ -217,6 +220,7 @@ fn smoke_abi_ring_roundtrip() -> TestResult {
 }
 kernel_test_in!("abi", smoke_abi_ring_roundtrip);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_roundtrip() -> TestResult {
     use crate::{
         completion_channel, submission_channel, Dispatcher, NarfStatus, OpCode, Submission, Tag,
@@ -276,10 +280,12 @@ fn smoke_abi_dispatcher_roundtrip() -> TestResult {
         _ => TestResult::Fail("Dispatcher never completed roundtrip"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatcher_roundtrip);
 
 // ── cancel protocol ────────────────────────────────────────────────
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cancel_before_target_marks_cancelled() -> TestResult {
     // §3.1 protocol: a Cancel submitted *before* its target is drained
     // must complete the target with `Cancelled` (when CANCELLABLE is
@@ -339,8 +345,10 @@ fn smoke_abi_cancel_before_target_marks_cancelled() -> TestResult {
         _ => TestResult::Fail("cancel protocol round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cancel_before_target_marks_cancelled);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
     // §3.1: a target without CANCELLABLE completes with
     // `CancelRequested` so the caller knows the op ran to completion.
@@ -388,8 +396,10 @@ fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
         _ => TestResult::Fail("dispatcher did not run the protocol"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cancel_non_cancellable_marks_request);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_latency_accumulates() -> TestResult {
     // The Dispatcher wraps each dispatch_one in a FnTime::scope guard,
     // so after N successful submissions the public ABI_DISPATCH_LATENCY
@@ -446,8 +456,10 @@ fn smoke_abi_dispatch_latency_accumulates() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_latency_accumulates);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
     // §3.1 "Linked submissions": cancelling any member of a LINKED
     // chain auto-cancels the rest of the chain. Here the producer
@@ -535,8 +547,10 @@ fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
         _ => TestResult::Fail("linked chain roundtrip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_linked_chain_cancels_forward);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
     // §3.1: the cancel op is non-blocking and always succeeds even
     // when the target tag never shows up. A subsequent unrelated
@@ -592,6 +606,7 @@ fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
         _ => TestResult::Fail("dispatcher never drained"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cancel_stale_tag_is_noop);
 
 // ── extended abi coverage ──────────────────────────────────────────
@@ -858,6 +873,7 @@ fn smoke_abi_tag_round_trip_and_default() -> TestResult {
 }
 kernel_test_in!("abi", smoke_abi_tag_round_trip_and_default);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_handles_multiple_back_to_back() -> TestResult {
     // The existing dispatcher smoke runs two submissions. This one
     // runs eight in a row and asserts strict in-order completion.
@@ -908,8 +924,10 @@ fn smoke_abi_dispatcher_handles_multiple_back_to_back() -> TestResult {
         _ => TestResult::Fail("dispatcher never finished 8 ops"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatcher_handles_multiple_back_to_back);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op() -> TestResult {
     // A submission with an OpCode the dispatcher doesn't recognise
     // (e.g. RingSend without a wired ring) must complete with
@@ -961,6 +979,7 @@ fn smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op() -> TestResult {
         _ => TestResult::Fail("dispatcher never drained"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!(
     "abi",
     smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op
@@ -1148,6 +1167,7 @@ fn smoke_abi_cancel_ctx_from_token_observes_flag() -> TestResult {
 }
 kernel_test_in!("abi", smoke_abi_cancel_ctx_from_token_observes_flag);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
     // Install a file-op bridge that flips a parallel cancel via the
     // dispatcher's `request_inflight_cancel` hook from inside itself
@@ -1261,8 +1281,10 @@ fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
         _ => TestResult::Fail("producer did not drain a completion"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatcher_inflight_cancel_during_bridge);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestResult {
     // Mid-op cancel against a non-CANCELLABLE submission must surface
     // `CancelRequested` per spec §3.1.
@@ -1361,11 +1383,13 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
         _ => TestResult::Fail("producer never saw a completion"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!(
     "abi",
     smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request
 );
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cancel_after_target_completes_is_noop() -> TestResult {
     // Cancel arriving *after* its target already completed must be a
     // benign no-op: the cancel op completes Ok; no later submission
@@ -1426,8 +1450,10 @@ fn smoke_abi_cancel_after_target_completes_is_noop() -> TestResult {
         _ => TestResult::Fail("dispatcher round-trip aborted"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cancel_after_target_completes_is_noop);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_request_inflight_cancel_miss_returns_false() -> TestResult {
     // The diagnostic hook returns false when no inflight token
     // matches — i.e. a cancel for a never-submitted tag against a
@@ -1441,6 +1467,7 @@ fn smoke_abi_request_inflight_cancel_miss_returns_false() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_request_inflight_cancel_miss_returns_false);
 
 // ── per-task cap-table dispatch (#1363 wiring) ──────────────────────
@@ -1453,6 +1480,7 @@ kernel_test_in!("abi", smoke_abi_request_inflight_cancel_miss_returns_false);
 // task runs. No fixture reads a value back out of the table it is
 // testing and feeds it in as the expectation.
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_validates_caps_against_owner_table() -> TestResult {
     // The §8 gate: a bound dispatcher resolves every presented cap
     // against the submitting task's OWN table before the op runs.
@@ -1554,8 +1582,10 @@ fn smoke_abi_dispatch_validates_caps_against_owner_table() -> TestResult {
         _ => TestResult::Fail("cap-gate round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_validates_caps_against_owner_table);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_cross_task_caps_fail() -> TestResult {
     // A wire slot copied across tasks resolves only against the
     // submitter's own table: B presenting A's bytes hits B's OWN
@@ -1653,8 +1683,10 @@ fn smoke_abi_dispatch_cross_task_caps_fail() -> TestResult {
         _ => TestResult::Fail("cross-task round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_cross_task_caps_fail);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_unbound_rejects_presented_caps() -> TestResult {
     // The un-wired fallback fails closed: a legacy unbound
     // dispatcher has no table, so any presented cap is Forbidden,
@@ -1703,8 +1735,10 @@ fn smoke_abi_dispatch_unbound_rejects_presented_caps() -> TestResult {
         _ => TestResult::Fail("unbound round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_unbound_rejects_presented_caps);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cap_transfer_end_to_end() -> TestResult {
     // §9.1 through the ABI: A transfers a Read cap to B with
     // `OpCode::CapTransfer`; B then spends the received slot through
@@ -1837,6 +1871,7 @@ fn smoke_abi_cap_transfer_end_to_end() -> TestResult {
         _ => TestResult::Fail("transfer round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cap_transfer_end_to_end);
 
 // ── §8 step 5 domain-tag check (#1547) ───────────────────────────
@@ -1902,6 +1937,7 @@ fn smoke_abi_domain_table_pins() -> TestResult {
 }
 kernel_test_in!("abi", smoke_abi_domain_table_pins);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_wrong_domain_forbidden() -> TestResult {
     // §8 step 5 end-to-end (negative): an owner task active in FRAME
     // submits a cap-less Noop through its bound dispatcher; the op
@@ -1941,8 +1977,10 @@ fn smoke_abi_dispatch_wrong_domain_forbidden() -> TestResult {
         _ => TestResult::Fail("wrong-domain round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_wrong_domain_forbidden);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_right_domain_ok() -> TestResult {
     // §8 step 5 end-to-end (positive): the same submission from an
     // owner active in USERSPACE_K completes Ok — the domain leg
@@ -1981,8 +2019,10 @@ fn smoke_abi_dispatch_right_domain_ok() -> TestResult {
         _ => TestResult::Fail("right-domain round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_right_domain_ok);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_unknown_owner_revoked() -> TestResult {
     // §8 step 5 fail-closed: a dispatcher bound to a task id the
     // scheduler has never registered completes the submission with
@@ -2024,4 +2064,5 @@ fn smoke_abi_dispatch_unknown_owner_revoked() -> TestResult {
         _ => TestResult::Fail("unknown-owner round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_unknown_owner_revoked);

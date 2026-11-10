@@ -860,17 +860,22 @@ pub fn clear_exit_landing() {
 // is `arg0..=arg5` ignored on entry; on success `value` =
 // config-page user vaddr.
 
+#[cfg(feature = "native-ring")]
 const ABI_BOOTSTRAP_MAGIC: u32 = 0x4E_41_52_46; // "NARF" LE
+#[cfg(feature = "native-ring")]
 const ABI_BOOTSTRAP_VERSION: u32 = 3;
 /// Ring depth for the kernel-only Arc<Ring> pair. Powers-of-two only.
+#[cfg(feature = "native-ring")]
 const BOOTSTRAP_RING_DEPTH: u64 = 64;
 /// Ring depth for the user-mappable SharedRing pair. Powers-of-two
 /// only. Each SharedRing must fit in a single 4 KiB page; 16 entries
 /// keeps `SharedRing<Submission, 16>` (2368 bytes) and
 /// `SharedRing<Completion, 16>` (1088 bytes) well within budget.
+#[cfg(feature = "native-ring")]
 pub const BOOTSTRAP_SHARED_RING_DEPTH: usize = 16;
 
 #[repr(C)]
+#[cfg(feature = "native-ring")]
 struct BootstrapHeader {
     magic: u32,
     version: u32,
@@ -905,20 +910,25 @@ struct BootstrapHeader {
 // page.
 
 use alloc::collections::BTreeMap;
+#[cfg(feature = "native-ring")]
 use core::sync::atomic::AtomicBool;
+#[cfg(feature = "native-ring")]
 use narf_abi::{
     Completion, CompletionDrain, CompletionQueue, SharedRing, Submission, SubmissionDrain,
     SubmissionQueue, completion_channel, submission_channel,
 };
+#[cfg(any(target_arch = "x86_64", feature = "native-ring"))]
 use narf_memory::PhysAddr;
 
 /// Kernel-side keep of the ring pair Bootstrap minted for a task.
 /// Stored under the task id; SMP-safe via the outer lock.
+#[cfg(feature = "native-ring")]
 pub struct TaskRings {
     pub sq_drain: SubmissionDrain<64>,
     pub cq_prod: CompletionQueue<64>,
 }
 
+#[cfg(feature = "native-ring")]
 impl core::fmt::Debug for TaskRings {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TaskRings").finish_non_exhaustive()
@@ -929,11 +939,13 @@ impl core::fmt::Debug for TaskRings {
 /// here too so the kernel can still talk to user-side endpoints
 /// before the user picks them up via cap (the cap slot id is just
 /// a stable opaque key Stage-4 callers exchange).
+#[cfg(feature = "native-ring")]
 pub struct UserRingEnds {
     pub sq_prod: SubmissionQueue<64>,
     pub cq_drain: CompletionDrain<64>,
 }
 
+#[cfg(feature = "native-ring")]
 impl core::fmt::Debug for UserRingEnds {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UserRingEnds").finish_non_exhaustive()
@@ -945,6 +957,7 @@ impl core::fmt::Debug for UserRingEnds {
 /// them through the low-4-GiB identity map. `SharedProducer` /
 /// `SharedConsumer` are constructed on demand in `sys_ring_kick`.
 #[derive(Copy, Clone, Debug)]
+#[cfg(feature = "native-ring")]
 pub struct SharedRingPair {
     /// Phys base of the SubmissionRing page (kernel reads).
     pub sq_phys: PhysAddr,
@@ -959,6 +972,7 @@ pub struct SharedRingPair {
 /// A task's kernel-owned shared-ring binding. User-visible header fields
 /// never select its owner. Arcs pin backings; authority/image checks gate use.
 #[derive(Debug)]
+#[cfg(feature = "native-ring")]
 pub(crate) struct NativeSession {
     pub(crate) shared: SharedRingPair,
     pub(crate) authority: Arc<narf_scheduler::CallerAuthority>,
@@ -969,6 +983,7 @@ pub(crate) struct NativeSession {
     _address_space: Arc<AddressSpace>,
 }
 
+#[cfg(feature = "native-ring")]
 impl NativeSession {
     pub(crate) fn context(&self) -> narf_abi::DispatchContext<'_> {
         narf_abi::DispatchContext::new(&self.authority, self.image)
@@ -980,6 +995,7 @@ impl NativeSession {
     }
 }
 
+#[cfg(feature = "native-ring")]
 impl Drop for NativeSession {
     fn drop(&mut self) {
         self.close();
@@ -988,11 +1004,14 @@ impl Drop for NativeSession {
 
 /// Private current-continuation cell. Readers only borrow through
 /// with_current_task_owner; foreign threads never mutate this field.
+#[cfg(feature = "native-ring")]
 pub(crate) struct NativeSessionSlot(core::cell::UnsafeCell<Option<Arc<NativeSession>>>);
+#[cfg(feature = "native-ring")]
 // SAFETY: replacement is exclusive to the owning task's executing Bootstrap
 // continuation. Reap cannot destroy a Task while its future/continuation runs.
 // Cross-task users own their session Arc instead of accessing this cell.
 unsafe impl Sync for NativeSessionSlot {}
+#[cfg(feature = "native-ring")]
 impl NativeSessionSlot {
     pub(crate) const fn new() -> Self {
         Self(core::cell::UnsafeCell::new(None))
@@ -1022,6 +1041,7 @@ impl NativeSessionSlot {
 
 /// Successful exec invalidates all old native bindings before publishing
 /// the new image. Retained workers own their backings until they stop.
+#[cfg(feature = "native-ring")]
 pub(crate) fn native_exec_commit(owner: &crate::task::Task) {
     owner.authority_control.replace_image();
     // SAFETY: called only by this owner's exec continuation, never by a
@@ -1038,6 +1058,7 @@ pub(crate) fn native_exec_commit(owner: &crate::task::Task) {
 
 #[derive(Debug)]
 #[allow(dead_code)] // fields read by the future dispatcher integration
+#[cfg(feature = "native-ring")]
 struct PerTaskBootstrap {
     kernel: Option<TaskRings>,
     user: Option<UserRingEnds>,
@@ -1047,16 +1068,21 @@ struct PerTaskBootstrap {
     cq_cap_id: u64,
 }
 
+#[cfg(feature = "native-ring")]
 static BOOTSTRAP_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, PerTaskBootstrap>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task bootstrap registry. Boot calls this
 /// once before any user task can issue `Syscall::Bootstrap`.
+/// This compatibility boot hook is a no-op without `native-ring`.
 pub fn bootstrap_init() {
-    let previous = BOOTSTRAP_TABLE.lock().replace(BTreeMap::new());
-    if let Some(previous) = previous {
-        for entry in previous.values() {
-            entry.session.close();
+    #[cfg(feature = "native-ring")]
+    {
+        let previous = BOOTSTRAP_TABLE.lock().replace(BTreeMap::new());
+        if let Some(previous) = previous {
+            for entry in previous.values() {
+                entry.session.close();
+            }
         }
     }
 }
@@ -1171,11 +1197,13 @@ pub fn init_per_task_state() {
 
 /// Reset the registry — test hook; drops every per-task ring set.
 #[doc(hidden)]
+#[cfg(feature = "native-ring")]
 pub fn __test_bootstrap_reset() {
     bootstrap_init();
 }
 
 /// Diagnostic: number of tasks that have called Bootstrap.
+#[cfg(feature = "native-ring")]
 pub fn bootstrap_live_count() -> usize {
     BOOTSTRAP_TABLE
         .lock()
@@ -1188,12 +1216,14 @@ pub fn bootstrap_live_count() -> usize {
 /// transferring ownership to the caller. Used by the test
 /// harness (and a future relibc shim) to drive the rings from
 /// the user side.
+#[cfg(feature = "native-ring")]
 pub fn take_user_ends(task: u64) -> Option<UserRingEnds> {
     BOOTSTRAP_TABLE.lock().as_mut()?.get_mut(&task)?.user.take()
 }
 
 /// Transfer the unique consumer endpoints once. A second take fails without
 /// allocating ownerless replacement rings.
+#[cfg(feature = "native-ring")]
 pub fn take_kernel_ends(task: u64) -> Option<TaskRings> {
     BOOTSTRAP_TABLE.lock().as_mut()?.get_mut(&task)?.kernel.take()
 }
@@ -1202,6 +1232,7 @@ pub fn take_kernel_ends(task: u64) -> Option<TaskRings> {
 /// Returns the kernel-side phys addresses + user vaddrs so the
 /// dispatcher (or `sys_ring_kick`) can attach to the same backing
 /// the user binds against. Idempotent.
+#[cfg(feature = "native-ring")]
 pub fn shared_rings_for(task: u64) -> Option<SharedRingPair> {
     let g = BOOTSTRAP_TABLE.lock();
     g.as_ref()?.get(&task)?.shared
@@ -1210,11 +1241,13 @@ pub fn shared_rings_for(task: u64) -> Option<SharedRingPair> {
 /// Monotonic capslot allocator for the SQ/CQ pair. Stage-4
 /// structural — Stage-5 routes through the real `capabilities/`
 /// table so revoke + transfer work.
+#[cfg(feature = "native-ring")]
 static NEXT_CAP_ID: AtomicU64 = AtomicU64::new(0x4000_0000);
 
 /// Allocate two phys pages, init a SharedRing in each, map both
 /// into `as_ref` at successive vaddrs from the MMAP cursor, and
 /// return the kernel-side phys + user vaddr handles.
+#[cfg(feature = "native-ring")]
 unsafe fn mint_shared_ring_pair(
     as_ref: &alloc::sync::Arc<AddressSpace>,
 ) -> Result<(SharedRingPair, [narf_memory::address_space::UserPagePin; 2]), ()> {
@@ -14986,7 +15019,9 @@ fn release_task_tables(tid: u64) {
     // drops those descriptions, and `Drop for OpenFileDescription` releases
     // them — including the shared holds this sweep could never attribute and
     // therefore leaked for the life of the boot.
+    #[cfg(feature = "native-ring")]
     let bootstrap = BOOTSTRAP_TABLE.lock().as_mut().and_then(|m| m.remove(&tid));
+    #[cfg(feature = "native-ring")]
     if let Some(entry) = bootstrap {
         entry.session.close();
     }

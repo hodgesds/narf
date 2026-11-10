@@ -855,6 +855,14 @@ jobs:
           cargo xtask test --arch=x86_64 --features cgroup-all,container \
             --subsystem drivers/net/e1000 --kernel-tests-only
 
+      - name: cargo xtask test — native ring opt-in
+        timeout-minutes: 20
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "1200"
+        run: |
+          cargo xtask test --arch=${{ matrix.arch }} --features native-ring \
+            --subsystem abi,scheduler,userspace/authority --kernel-tests-only
+
       # Run the tests the `user-mode-e2e` feature gates. The clippy pass in
       # `clippy-kernel` proves they COMPILE on both arches; this proves they
       # pass, and it is the only CI step that executes user code for real —
