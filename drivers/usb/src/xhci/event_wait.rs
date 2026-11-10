@@ -8,12 +8,18 @@ pub(super) type Event = [u32; 4];
 pub(super) const QUEUE_DEPTH: usize = 64;
 pub(super) const DRAIN_BUDGET: usize = 32;
 
-/// Deadline class of one wait. Commands and control-transfer stages get
-/// Linux's bounds — `XHCI_CMD_DEFAULT_TIMEOUT` and `USB_CTRL_GET_TIMEOUT` /
-/// `USB_CTRL_SET_TIMEOUT`, 5000 ms each (USB 2.0 §9.2.6.1 caps any request
-/// at 5 s; a device may legally NAK a control stage far longer than
-/// 250 ms). The compatibility one-shot bulk/isoch waits are short internal
-/// polls whose callers re-arm them; they keep 250 ms.
+/// Deadline class of one wait.
+///
+/// Linux allows commands and control-transfer stages 5000 ms
+/// (`XHCI_CMD_DEFAULT_TIMEOUT`, `USB_CTRL_GET_TIMEOUT`), and USB 2.0
+/// §9.2.6.1 lets a device take that long. This driver cannot yet afford
+/// it: `Xhci::await_event` waits by re-polling on every executor round
+/// instead of sleeping, so a silent device keeps the USB supervisor
+/// runnable for the whole deadline. With 5000 ms, one unresponsive
+/// high-speed device on a physical host held it for tens of seconds and
+/// the boot never reached the display manager. Every class therefore
+/// keeps the 250 ms bound until that wait can block; the classes stay
+/// distinct so the longer bounds can return without touching callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Wait {
     Command,
@@ -23,8 +29,7 @@ pub(super) enum Wait {
 impl Wait {
     pub const fn timeout_ms(self) -> u64 {
         match self {
-            Self::Command | Self::ControlStage => 5000,
-            Self::Transfer => 250,
+            Self::Command | Self::ControlStage | Self::Transfer => 250,
         }
     }
 }

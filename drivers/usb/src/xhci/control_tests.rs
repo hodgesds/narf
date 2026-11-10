@@ -183,35 +183,33 @@ fn wait_data_stage(timeout_ms: u64, answer_ms: u64) -> Result<[u32; 4], ()> {
     }
 }
 
-/// Defect 1: a control-IN whose Data stage completes 400 ms after the
-/// doorbell — later than the old shared 250 ms bound — succeeds under
-/// the control-stage deadline, which is Linux's 5000 ms
-/// (`USB_CTRL_GET_TIMEOUT`). Commands get the same 5000 ms
-/// (`XHCI_CMD_DEFAULT_TIMEOUT`); the one-shot bulk/isoch poll keeps its
-/// short bound, under which the same answer would still time out.
-fn smoke_xhci_control_stage_outlives_legacy_250ms_deadline() -> TestResult {
-    if event_wait::Wait::ControlStage.timeout_ms() != 5000
-        || event_wait::Wait::Command.timeout_ms() != 5000
-        || event_wait::Wait::Transfer.timeout_ms() != 250
-    {
-        return TestResult::Fail("wait-class deadlines changed");
+/// The stage wait is a busy re-poll, so its deadline is also how long a
+/// silent device keeps the USB supervisor runnable. On hardware a
+/// 5000 ms bound stalled the boot; every wait class is pinned to 250 ms
+/// until the wait can sleep. A stage answering inside the bound still
+/// succeeds, and one answering after it is a timeout (which the cancel
+/// path then recovers), never an unbounded wait.
+fn smoke_xhci_control_stage_wait_stays_boot_safe() -> TestResult {
+    for wait in [
+        event_wait::Wait::ControlStage,
+        event_wait::Wait::Command,
+        event_wait::Wait::Transfer,
+    ] {
+        if wait.timeout_ms() != 250 {
+            return TestResult::Fail("a busy-polled wait exceeds the 250 ms boot-safe bound");
+        }
     }
     let data = transfer(SLOT, DATA, 13, 4);
-    if wait_data_stage(event_wait::Wait::ControlStage.timeout_ms(), 400) != Ok(data) {
-        return TestResult::Fail("control stage completing at 400 ms timed out");
+    let bound = event_wait::Wait::ControlStage.timeout_ms();
+    if wait_data_stage(bound, 240) != Ok(data) {
+        return TestResult::Fail("control stage completing inside the bound timed out");
     }
-    if wait_data_stage(event_wait::Wait::ControlStage.timeout_ms(), 4990) != Ok(data) {
-        return TestResult::Fail("control stage completing inside 5000 ms timed out");
-    }
-    if wait_data_stage(event_wait::Wait::ControlStage.timeout_ms(), 5010) != Err(()) {
-        return TestResult::Fail("control stage wait is unbounded");
-    }
-    if wait_data_stage(event_wait::Wait::Transfer.timeout_ms(), 400) != Err(()) {
-        return TestResult::Fail("fixture no longer reproduces the 250 ms failure");
+    if wait_data_stage(bound, 400) != Err(()) {
+        return TestResult::Fail("control stage wait outlived its bound");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/usb/xhci",
-    smoke_xhci_control_stage_outlives_legacy_250ms_deadline
+    smoke_xhci_control_stage_wait_stays_boot_safe
 );

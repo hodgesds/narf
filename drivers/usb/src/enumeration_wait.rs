@@ -31,12 +31,12 @@ pub(crate) const TIMEOUT_ATTEMPTS: u8 = 2;
 
 /// Charge one failed enumeration attempt against a port's retry budget
 /// (`max` attempts for fast failures). An attempt during which a command
-/// or control stage ran into its 5 s deadline costs `max / TIMEOUT_ATTEMPTS`
+/// or control stage ran into its deadline costs `max / TIMEOUT_ATTEMPTS`
 /// of the budget, so a device that never answers is abandoned after
-/// `TIMEOUT_ATTEMPTS` attempts instead of `max`. The per-transfer deadline
-/// stays at the 5 s a slow-but-working device is entitled to; the bound on
-/// how long a dead device can occupy the supervisor comes from retrying
-/// less. Linux bounds the same case with `PORT_INIT_TRIES` /
+/// `TIMEOUT_ATTEMPTS` attempts instead of `max`: every timed-out wait
+/// keeps the supervisor busy for its whole deadline, so the bound on how
+/// long a dead device can occupy it comes from retrying less. Linux
+/// bounds the same case with `PORT_INIT_TRIES` /
 /// `SET_CONFIG_TRIES` in `hub_port_connect`.
 pub(crate) const fn charge_failure(count: u8, max: u8, timed_out: bool) -> u8 {
     let cost = if timed_out {
@@ -117,7 +117,7 @@ mod tests {
         attempts
     }
 
-    /// With 5 s command/control deadlines a dead device must not get the
+    /// A dead device must not get the
     /// full fast-failure budget: timeouts exhaust it in TIMEOUT_ATTEMPTS
     /// attempts, fast failures still get every attempt, and the counter
     /// lands exactly on the budget so the give-up report fires once.

@@ -2614,9 +2614,8 @@ impl Xhci {
     /// timing out, because the await reads the queue (not the
     /// raw event ring directly).
     ///
-    /// `wait` selects the deadline (`event_wait::Wait`): 5000 ms for
-    /// commands and control-transfer stages, 250 ms for the one-shot
-    /// bulk/isoch polls.
+    /// `wait` selects the deadline class (`event_wait::Wait`); all are
+    /// 250 ms while this loop re-polls instead of sleeping.
     async fn await_event(
         &self,
         wait: event_wait::Wait,
@@ -2697,7 +2696,7 @@ impl Xhci {
         // If the controller wedged itself (HCE), attempt a soft
         // re-init before submitting the command. HCE is RO and only
         // clears on HCRST — without recovery the doorbell write
-        // below has no effect and we'd time out 5 s later.
+        // below has no effect and we'd time out later.
         // `soft_recover` refuses while any slot is reserved; with
         // live devices the recovery path is `recover_controller`,
         // driven by the supervisor (it invalidates every binding),
