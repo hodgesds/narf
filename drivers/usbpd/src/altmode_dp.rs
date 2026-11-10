@@ -190,6 +190,22 @@ impl DpAltModePort {
     /// One Discovery step. Caller drives this from a poll loop.
     pub fn step(&self, cap: &Cap<UsbPd, Grant>) -> Result<DpAltStep, DpAltError> {
         cap.invoke(NoopOp)?;
+        if matches!(
+            self.port.state(),
+            crate::tcpm::PortState::Unattached | crate::tcpm::PortState::ErrorRecovery
+        ) {
+            if self.gpu_wiring_dispatched.load(Ordering::Acquire) != 0 {
+                // Retry a refused local stop on later detached polls. Do
+                // not reset the state machine and replay over a live owner.
+                if dp_gpu_bridge::notify_dp_exited(self.connector).is_err() {
+                    return Ok(DpAltStep::NotReady);
+                }
+                self.gpu_wiring_dispatched.store(0, Ordering::Release);
+            }
+            *self.driver.lock() = DpAltModeDriver::new();
+            self.next_msg_id.store(0, Ordering::Release);
+            return Ok(DpAltStep::NotReady);
+        }
         // RX arbitration (#1215): the TCPC RX FIFO has one consumer.
         // DP discovery must not pop frames while cable discovery is
         // still awaiting its SOP' / SOP'' answer, or a cable ACK
@@ -258,8 +274,7 @@ impl DpAltModePort {
         // Atomic CAS so the dispatch fires once per attach even if
         // step() is racing in two tasks. The flag is cleared if the
         // port goes back through `Idle` (e.g. cable yank → re-attach)
-        // but Stage-1 doesn't yet plumb that reset — first-attach
-        // coverage is what real-HW bring-up needs.
+        // and step() resets it only after a detached bridge has stopped.
         if self
             .gpu_wiring_dispatched
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -311,9 +326,8 @@ impl DpAltModePort {
         // dispatch above is the hardware handoff; this is the class
         // observation of the same event. Exit on detach is handled by
         // the TCPM task's connector sync, which clears entered modes.
-        // Re-attach entry inherits the pre-existing first-attach-only
-        // dispatch limit: the driver state machine never leaves Active
-        // on contract loss, so a second entry is not re-fed.
+        // Physical detach also stops the GPU session and resets discovery;
+        // contract renegotiation keeps the active session intact.
         self.typec.set_alt_mode(
             narf_drivers_extcon::typec::AltMode::DisplayPort(link.pin_assignment),
             true,
@@ -669,6 +683,19 @@ pub(crate) mod tests {
         }
         if !typec.cable_state(narf_drivers_extcon::cable::Cable::Dp) {
             return TestResult::Fail("DP entry not reflected in TypecConnector cable state");
+        }
+        {
+            let mut cc = chip.cc.lock();
+            cc.cc1 = CcState::Open;
+            cc.cc2 = CcState::Open;
+        }
+        let _ = port.step(&cap).unwrap();
+        if !matches!(alt.step(&cap), Ok(DpAltStep::NotReady))
+            || alt.state() != AltModeState::Idle
+            || alt.active_cfg().is_some()
+            || alt.gpu_wiring_dispatched.load(Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("detach must release bridge and reset per-attach discovery");
         }
         TestResult::Pass
     }

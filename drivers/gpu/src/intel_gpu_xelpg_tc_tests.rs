@@ -245,15 +245,20 @@ fn smoke_mtl_tc_pin_d_lanes_and_sudden_disconnect_roll_back() -> TestResult {
     let io = TcFake::new(XeLpgPort::Tc4);
     io.pica_isr.set(pica_dp_alt_hotplug(3));
     io.pin.set(PIN_ASSIGNMENT_D);
-    if connect(&io, XeLpgPort::Tc4, false, 1)
-        != Err(TcError::PartialLaneOwnership {
-            pin_assignment: PIN_ASSIGNMENT_D,
+    let conn = match connect(&io, XeLpgPort::Tc4, false, 2) {
+        Ok(conn) if conn.max_lanes == 2 => conn,
+        _ => return TestResult::Fail("pin assignment D must admit two DP lanes"),
+    };
+    if disconnect(&io, &conn).is_err() || io.buf() & TC_PHY_OWNERSHIP != 0 {
+        return TestResult::Fail("pin D disconnect must release ownership");
+    }
+    if connect(&io, XeLpgPort::Tc4, false, 4)
+        != Err(TcError::InsufficientLanes {
+            max: 2,
+            required: 4,
         })
     {
-        return TestResult::Fail("pin assignment D must refuse partial lane ownership");
-    }
-    if io.buf() & TC_PHY_OWNERSHIP != 0 {
-        return TestResult::Fail("refused connect must release PHY ownership");
+        return TestResult::Fail("pin D must still refuse four DP lanes");
     }
     // No pin assignment: zero lanes cannot carry even one required lane.
     let none = TcFake::new(XeLpgPort::Tc4);
@@ -285,17 +290,27 @@ kernel_test_in!(
 );
 
 fn smoke_mtl_tc_tbt_combo_and_access_refusals() -> TestResult {
-    // TBT-alt: refused before any TCSS/ownership write.
+    // A live TBT-alt route is observed without taking its PHY from USB4.
     let io = TcFake::new(XeLpgPort::Tc2);
     io.pica_isr.set(pica_tbt_hotplug(1));
-    if connect(&io, XeLpgPort::Tc2, false, 1) != Err(TcError::TbtAltUnsupported)
+    let conn = match connect(&io, XeLpgPort::Tc2, false, 1) {
+        Ok(conn) if conn.mode == TcMode::TbtAlt => conn,
+        _ => return TestResult::Fail("live TBT-alt must connect without taking the PHY"),
+    };
+    if !io.buf_writes().is_empty()
+        || connection_intact(&io, &conn) != Ok(true)
+        || disconnect(&io, &conn).is_err()
         || !io.buf_writes().is_empty()
     {
-        return TestResult::Fail("TBT-alt must refuse without touching the PHY");
+        return TestResult::Fail("TBT lifecycle must preserve fabric PHY ownership");
+    }
+    io.pica_isr.set(0);
+    if connection_intact(&io, &conn) != Ok(false) {
+        return TestResult::Fail("lost fabric HPD must invalidate TBT connection");
     }
     // Nothing connected on a Type-C port: default mode is TBT, refused.
     let empty = TcFake::new(XeLpgPort::Tc2);
-    if connect(&empty, XeLpgPort::Tc2, false, 1) != Err(TcError::TbtAltUnsupported)
+    if connect(&empty, XeLpgPort::Tc2, false, 1) != Err(TcError::TunnelUnavailable)
         || !empty.buf_writes().is_empty()
     {
         return TestResult::Fail("empty Type-C port must refuse without writes");
@@ -377,7 +392,7 @@ fn smoke_mtl_tc_legacy_declaration_fixup_and_lane_table() -> TestResult {
     // Undeclared: the same SDE bit is invisible, so the TBT default refuses.
     let undeclared = TcFake::new(XeLpgPort::Tc3);
     undeclared.sde_isr.set(sde_tc_hotplug(2));
-    if connect(&undeclared, XeLpgPort::Tc3, false, 4) != Err(TcError::TbtAltUnsupported) {
+    if connect(&undeclared, XeLpgPort::Tc3, false, 4) != Err(TcError::TunnelUnavailable) {
         return TestResult::Fail("undeclared legacy wiring must stay unadvertised");
     }
     TestResult::Pass

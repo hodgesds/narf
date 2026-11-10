@@ -112,11 +112,10 @@ pub struct SpinDelayer;
 
 impl MstDelayer for SpinDelayer {
     fn delay_us(&mut self, us: u64) {
-        let budget = narf_time::wall::ns_to_cycles(us.saturating_mul(1_000));
-        let start = narf_time::now_cycles();
-        while narf_time::now_cycles().wrapping_sub(start) < budget {
-            core::hint::spin_loop();
-        }
+        let _ = narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ns(us.saturating_mul(1_000)),
+        );
     }
 }
 
@@ -133,6 +132,13 @@ pub struct IntelMstAux<'a, M: MmioWindow + ?Sized, D: MstDelayer = SpinDelayer> 
 impl<'a, M: MmioWindow + ?Sized> IntelMstAux<'a, M, SpinDelayer> {
     pub fn new(mmio: &'a M, ddi: Ddi) -> Self {
         Self::with_delayer(mmio, ddi, SpinDelayer)
+    }
+
+    pub(crate) fn xelpdp(mmio: &'a M, port: crate::intel_gpu_xelpg::XeLpgPort, tbt: bool) -> Self {
+        Self {
+            aux: IntelAux::xelpdp(mmio, port.aux_base(), tbt),
+            delayer: SpinDelayer,
+        }
     }
 }
 

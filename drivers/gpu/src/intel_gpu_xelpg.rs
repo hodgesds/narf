@@ -53,12 +53,12 @@
 //! - HDMI PLL states (C10/C20 carry separate HDMI tables) land
 //!   with the HDMI lane; this module's lookups return `None` for
 //!   non-DP rates.
-//! - Lane reversal and DP-alt single-lane (pin assignment D)
-//!   ownership are not modelled: both PHY lanes are always owned.
-//!   Type-C callers admit only pin assignments that hand display
-//!   both PHY lanes (`intel_gpu_xelpg_tc`); DP-alt mode only
-//!   changes the one-lane TX-disable pattern
-//!   ([`enable_port_pll_owned`]).
+//! - The explicit PLL request retains PHY ownership separately from DP
+//!   width. Pin D owns lane 0; native/legacy board reversal selects lane 1
+//!   for maxPCLK and reverses the TX enables. TCSS handles cable flip in
+//!   DP-alt, where software board reversal is refused.
+//! - Live Thunderbolt routes use the fabric's TBT clock handshake and do
+//!   not program or reset the C20 PHY.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
@@ -363,6 +363,67 @@ fn ddi_clock_select_mask<M: MmioWindow + ?Sized>(mmio: &M) -> u32 {
 }
 /// Clock select for a PHY PLL output (maxPCLK): the DP value.
 pub const DDI_CLOCK_SELECT_MAXPCLK: u32 = 0x8 << 12;
+
+pub const TBT_CLOCK_REQUEST: u32 = 1 << 19;
+pub const TBT_CLOCK_ACK: u32 = 1 << 18;
+
+/// `intel_mtl_tbt_pll_enable_clock`: use the fabric's clock, with no
+/// C20 reset, SRAM or message-bus transaction against the USB-owned PHY.
+pub fn enable_tbt_clock<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    rate: LinkRate,
+) -> Result<(), Cx0Error> {
+    if port.tc_index().is_none() || !mmio.display_access_ok() {
+        return Err(Cx0Error::ProtocolMismatch);
+    }
+    let select = match rate {
+        LinkRate::DpRbr => 0xC,
+        LinkRate::DpHbr => 0xD,
+        LinkRate::DpHbr2 => 0xE,
+        LinkRate::DpHbr3 => 0xF,
+        _ => return Err(Cx0Error::UnsupportedRate),
+    };
+    let off = port.port_clock_ctl();
+    rmw(
+        mmio,
+        off,
+        ddi_clock_select_mask(mmio) | FORWARD_CLOCK_UNGATE,
+        (select << 12) | FORWARD_CLOCK_UNGATE,
+    );
+    let value = mmio.read32(off);
+    if value == u32::MAX || !mmio.display_access_ok() {
+        return Err(Cx0Error::PhyError);
+    }
+    mmio.write32(off, value | TBT_CLOCK_REQUEST);
+    compiler_fence(Ordering::SeqCst);
+    if !wait_for(mmio, off, TBT_CLOCK_ACK, true, 100_000) || !mmio.display_access_ok() {
+        return Err(Cx0Error::Timeout);
+    }
+    Ok(())
+}
+
+/// `intel_mtl_tbt_pll_disable_clock`; the fabric keeps its PHY and tunnel.
+pub fn disable_tbt_clock<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+) -> Result<(), Cx0Error> {
+    if port.tc_index().is_none() || !mmio.display_access_ok() {
+        return Err(Cx0Error::ProtocolMismatch);
+    }
+    let off = port.port_clock_ctl();
+    rmw(mmio, off, TBT_CLOCK_REQUEST, 0);
+    if !wait_for(mmio, off, TBT_CLOCK_ACK, false, 10_000) || !mmio.display_access_ok() {
+        return Err(Cx0Error::Timeout);
+    }
+    rmw(
+        mmio,
+        off,
+        ddi_clock_select_mask(mmio) | FORWARD_CLOCK_UNGATE,
+        0,
+    );
+    Ok(())
+}
 /// `XELPDP_FORWARD_CLOCK_UNGATE` (PORT_CLOCK_CTL bit 10).
 pub const FORWARD_CLOCK_UNGATE: u32 = 1 << 10;
 /// `XELPDP_LANE1_PHY_CLOCK_SELECT` (PORT_CLOCK_CTL bit 8).
@@ -470,6 +531,7 @@ pub struct Cx0Phy<'a, M: MmioWindow + ?Sized> {
     /// `DISPLAY_VER < 30`: reset the bus after every completed
     /// transaction ([`MmioWindow::cx0_xe3`]).
     settle_reset: bool,
+    lanes: PhyLaneConfig,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Cx0Phy<'a, M> {
@@ -486,6 +548,50 @@ pub const LANE0: u8 = 0b01;
 /// Lane mask bit for PHY lane 1.
 pub const LANE1: u8 = 0b10;
 
+/// PHY ownership and board wiring, independent of the negotiated DP width.
+/// `intel_cx0_get_owned_lane_mask`: DP-alt pin D lends only lane 0 to
+/// display. Cable orientation in DP-alt is handled by the TCSS mux; board
+/// lane reversal is valid only outside DP-alt.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PhyLaneConfig {
+    owned: u8,
+    reversed: bool,
+}
+
+impl PhyLaneConfig {
+    pub const NATIVE: Self = Self {
+        owned: BOTH_LANES,
+        reversed: false,
+    };
+
+    pub fn for_route(dp_alt: bool, max_lanes: u8, reversed: bool) -> Result<Self, Cx0Error> {
+        if !matches!(max_lanes, 1 | 2 | 4) || (dp_alt && reversed) {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
+        Ok(Self {
+            owned: if dp_alt && max_lanes <= 2 {
+                LANE0
+            } else {
+                BOTH_LANES
+            },
+            reversed,
+        })
+    }
+
+    pub const fn owned_mask(self) -> u8 {
+        self.owned
+    }
+    pub const fn reversed(self) -> bool {
+        self.reversed
+    }
+    fn maxpclk_lane(self) -> u32 {
+        u32::from(self.reversed)
+    }
+    fn admits(self, width: u8) -> bool {
+        matches!(width, 1 | 2 | 4) && (self.owned == BOTH_LANES || width <= 2)
+    }
+}
+
 impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
     /// Create a transport for `port` over the BAR0 window `mmio`.
     pub fn new(mmio: &'a M, port: XeLpgPort) -> Self {
@@ -493,6 +599,14 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
             mmio,
             port,
             settle_reset: !mmio.cx0_xe3(),
+            lanes: PhyLaneConfig::NATIVE,
+        }
+    }
+
+    pub fn with_lanes(mmio: &'a M, port: XeLpgPort, lanes: PhyLaneConfig) -> Self {
+        Self {
+            lanes,
+            ..Self::new(mmio, port)
         }
     }
 
@@ -647,6 +761,9 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
         data: u8,
         committed: bool,
     ) -> Result<(), Cx0Error> {
+        if lane_mask == 0 || lane_mask & !self.lanes.owned != 0 {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
         for lane in 0..2u32 {
             if lane_mask & (1 << lane) == 0 {
                 continue;
@@ -666,6 +783,9 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
     /// Read one VDR byte (from the first lane in `lane_mask` —
     /// PLL state lives on the master lane).
     pub fn read(&self, lane_mask: u8, addr: u16) -> Result<u8, Cx0Error> {
+        if lane_mask == 0 || lane_mask & !self.lanes.owned != 0 {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
         let lane = lane_mask.trailing_zeros();
         if lane >= 2 {
             return Err(Cx0Error::ProtocolMismatch);
@@ -691,6 +811,9 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
         set: u8,
         committed: bool,
     ) -> Result<(), Cx0Error> {
+        if lane_mask == 0 || lane_mask & !self.lanes.owned != 0 {
+            return Err(Cx0Error::ProtocolMismatch);
+        }
         for lane in 0..2u32 {
             if lane_mask & (1 << lane) == 0 {
                 continue;
@@ -721,6 +844,9 @@ impl<'a, M: MmioWindow + ?Sized> Cx0Phy<'a, M> {
     /// PHY transaction batch): timer field = 0xA000.
     pub fn program_msgbus_timer(&self) {
         for lane in 0..2u64 {
+            if self.lanes.owned & (1 << lane) == 0 {
+                continue;
+            }
             rmw(
                 self.mmio,
                 self.port.msgbus_timer_ln0() + lane * 4,
@@ -1165,14 +1291,14 @@ fn c20_pll_program_vdr<M: MmioWindow + ?Sized>(
     // Steps 4-6: VDR parameters (`intel_c20_program_vdr_params`) —
     // custom width, the serdes rate byte and, for HDMI, the HDMI rate.
     phy.rmw(
-        BOTH_LANES,
+        phy.lanes.owned,
         C20_VDR_CUSTOM_WIDTH,
         C20_CUSTOM_WIDTH_MASK,
         vdr.custom_width,
         true,
     )?;
     phy.rmw(
-        BOTH_LANES,
+        phy.lanes.owned,
         C20_VDR_CUSTOM_SERDES_RATE,
         C20_SERDES_RATE_MASK,
         vdr.serdes_rate,
@@ -1180,7 +1306,7 @@ fn c20_pll_program_vdr<M: MmioWindow + ?Sized>(
     )?;
     if let Some(rate) = vdr.hdmi_rate {
         phy.rmw(
-            BOTH_LANES,
+            phy.lanes.owned,
             C20_VDR_HDMI_RATE,
             C20_HDMI_RATE_MASK,
             rate & C20_HDMI_RATE_MASK,
@@ -1189,7 +1315,7 @@ fn c20_pll_program_vdr<M: MmioWindow + ?Sized>(
     }
     // Step 7: toggle the context selection to load the new state.
     phy.rmw(
-        BOTH_LANES,
+        phy.lanes.owned,
         C20_VDR_CUSTOM_SERDES_RATE,
         C20_CONTEXT_TOGGLE,
         if cntx { 0 } else { C20_CONTEXT_TOGGLE },
@@ -1211,13 +1337,15 @@ fn powerdown_change<M: MmioWindow + ?Sized>(
     let buf_ctl2 = port.buf_ctl2();
     let mut set = 0u32;
     let mut update = 0u32;
+    let mut state_mask = 0u32;
     for lane in 0..2u32 {
         if lane_mask & (1 << lane) != 0 {
             set |= lane_powerdown_new_state(lane, state);
             update |= lane_powerdown_update(lane);
+            state_mask |= lane_powerdown_new_state(lane, 0xF);
         }
     }
-    rmw(mmio, buf_ctl2, POWERDOWN_NEW_STATE_MASK_BOTH, set);
+    rmw(mmio, buf_ctl2, state_mask, set);
     for lane in 0..2u32 {
         if lane_mask & (1 << lane) != 0
             && !wait_for(
@@ -1267,11 +1395,25 @@ const REFCLK_TIMEOUT_NS: u64 = 10_000;
 /// pipe resets, request refclk on lane 0, run the reset-grade
 /// powerdown transition, set up the steady-state power fields,
 /// and release the resets.
-fn phy_lane_reset<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort) -> Result<(), Cx0Error> {
+fn phy_lane_reset<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    lanes: PhyLaneConfig,
+) -> Result<(), Cx0Error> {
     let buf_ctl1 = port.buf_ctl1();
     let buf_ctl2 = port.buf_ctl2();
-    let resets = lane_pipe_reset(0) | lane_pipe_reset(1);
-    let status = lane_phy_current_status(0) | lane_phy_current_status(1);
+    let resets = lane_pipe_reset(0)
+        | if lanes.owned == BOTH_LANES {
+            lane_pipe_reset(1)
+        } else {
+            0
+        };
+    let status = lane_phy_current_status(0)
+        | if lanes.owned == BOTH_LANES {
+            lane_phy_current_status(1)
+        } else {
+            0
+        };
     if !wait_for(
         mmio,
         buf_ctl1,
@@ -1286,23 +1428,28 @@ fn phy_lane_reset<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort) -> Result<(
         return Err(Cx0Error::Timeout);
     }
     let clock_ctl = port.port_clock_ctl();
-    let refclk_req_both = lane_pclk_refclk_request(0) | lane_pclk_refclk_request(1);
+    let refclk_req_both = lane_pclk_refclk_request(0)
+        | if lanes.owned == BOTH_LANES {
+            lane_pclk_refclk_request(1)
+        } else {
+            0
+        };
     rmw(
         mmio,
         clock_ctl,
         refclk_req_both,
-        lane_pclk_refclk_request(0),
+        lane_pclk_refclk_request(lanes.maxpclk_lane()),
     );
     if !wait_for(
         mmio,
         clock_ctl,
-        lane_pclk_refclk_ack(0),
+        lane_pclk_refclk_ack(lanes.maxpclk_lane()),
         true,
         REFCLK_TIMEOUT_NS,
     ) {
         return Err(Cx0Error::Timeout);
     }
-    powerdown_change(mmio, port, BOTH_LANES, P2_STATE_RESET)?;
+    powerdown_change(mmio, port, lanes.owned, P2_STATE_RESET)?;
     // `intel_cx0_setup_powerdown`: ready state P2 in BUF_CTL2,
     // active state P0 + zero lane staggering in BUF_CTL3.
     rmw(mmio, buf_ctl2, POWER_STATE_READY_MASK, P2_STATE_READY << 4);
@@ -1331,14 +1478,24 @@ fn program_phy_lane<M: MmioWindow + ?Sized>(
     dp_alt: bool,
 ) -> Result<(), Cx0Error> {
     // GENMASK8(3, 0) << lane_count, per-TX bit i.
-    let mut disables: u8 = 0x0F << lane_count;
+    if !phy.lanes.admits(lane_count) || (dp_alt && phy.lanes.reversed) {
+        return Err(Cx0Error::ProtocolMismatch);
+    }
+    let mut disables: u8 = if phy.lanes.reversed {
+        0x0F >> lane_count
+    } else {
+        0x0F << lane_count
+    };
     if dp_alt && lane_count == 1 {
         disables = (disables & !0x3) | 0x1;
     }
-    phy.msgbus_access_begin(BOTH_LANES)?;
+    phy.msgbus_access_begin(phy.lanes.owned)?;
     for i in 0..4u16 {
         let tx = i % 2 + 1;
         let lane_mask = if i < 2 { LANE0 } else { LANE1 };
+        if lane_mask & phy.lanes.owned == 0 {
+            continue;
+        }
         let set = if disables & (1 << i) != 0 {
             TX_CONTROL2_DISABLE_SINGLE_TX
         } else {
@@ -1352,7 +1509,7 @@ fn program_phy_lane<M: MmioWindow + ?Sized>(
             true,
         )?;
     }
-    phy.msgbus_access_commit(BOTH_LANES, false)?;
+    phy.msgbus_access_commit(phy.lanes.owned, false)?;
     Ok(())
 }
 
@@ -1363,15 +1520,26 @@ fn set_pclk_pll_request<M: MmioWindow + ?Sized>(
     mmio: &M,
     port: XeLpgPort,
     on: bool,
+    lanes: PhyLaneConfig,
 ) -> Result<(), Cx0Error> {
     let clock_ctl = port.port_clock_ctl();
-    let req_both = lane_pclk_pll_request(0) | lane_pclk_pll_request(1);
+    let req_both = lane_pclk_pll_request(0)
+        | if lanes.owned == BOTH_LANES {
+            lane_pclk_pll_request(1)
+        } else {
+            0
+        };
     if on {
-        rmw(mmio, clock_ctl, req_both, lane_pclk_pll_request(0));
+        rmw(
+            mmio,
+            clock_ctl,
+            req_both,
+            lane_pclk_pll_request(lanes.maxpclk_lane()),
+        );
         if !wait_for(
             mmio,
             clock_ctl,
-            lane_pclk_pll_ack(0),
+            lane_pclk_pll_ack(lanes.maxpclk_lane()),
             true,
             PCLK_PLL_ENABLE_TIMEOUT_NS,
         ) {
@@ -1382,7 +1550,7 @@ fn set_pclk_pll_request<M: MmioWindow + ?Sized>(
         if !wait_for(
             mmio,
             clock_ctl,
-            lane_pclk_pll_ack(0),
+            lane_pclk_pll_ack(lanes.maxpclk_lane()),
             false,
             PCLK_PLL_ENABLE_TIMEOUT_NS,
         ) {
@@ -1463,7 +1631,7 @@ pub fn enable_port_pll_khz<M: MmioWindow + ?Sized>(
         FORWARD_CLOCK_UNGATE | DDI_CLOCK_SELECT_MAXPCLK | SSC_ENABLE_PLLB,
     );
     // 2-3. Lane reset, then power state ready.
-    phy_lane_reset(mmio, port)?;
+    phy_lane_reset(mmio, port, PhyLaneConfig::NATIVE)?;
     powerdown_change(mmio, port, BOTH_LANES, P2_STATE_READY)?;
     // 4-6. Timer, PLL state, TX enables.
     phy.program_msgbus_timer();
@@ -1475,7 +1643,7 @@ pub fn enable_port_pll_khz<M: MmioWindow + ?Sized>(
         compiler_fence(Ordering::SeqCst);
     }
     // 8. PLL request + ACK poll.
-    set_pclk_pll_request(mmio, port, true)?;
+    set_pclk_pll_request(mmio, port, true, PhyLaneConfig::NATIVE)?;
     Ok(())
 }
 
@@ -1510,6 +1678,8 @@ pub enum Cx0PllState {
 /// Everything `intel_cx0pll_enable` needs beyond the port.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PllRequest {
+    /// PHY lanes owned by this connection and the VBT's board reversal.
+    pub lanes: PhyLaneConfig,
     /// PLL state for the port's PHY kind.
     pub state: Cx0PllState,
     /// Port clock in kHz (`DDI_CLK_VALFREQ`).
@@ -1536,7 +1706,7 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
     port: XeLpgPort,
     req: &PllRequest,
 ) -> Result<(), Cx0Error> {
-    if !matches!(req.lane_count, 1 | 2 | 4) {
+    if !req.lanes.admits(req.lane_count) || (req.dp_alt && req.lanes.reversed) {
         return Err(Cx0Error::UnsupportedRate);
     }
     let c10 = match (&req.state, port.phy()) {
@@ -1544,8 +1714,17 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
         (Cx0PllState::C20(..), PhyKind::C20) => false,
         _ => return Err(Cx0Error::UnsupportedRate),
     };
-    let phy = Cx0Phy::new(mmio, port);
-    rmw(mmio, port.buf_ctl1(), PORT_BUF_REVERSAL, 0);
+    let phy = Cx0Phy::with_lanes(mmio, port, req.lanes);
+    rmw(
+        mmio,
+        port.buf_ctl1(),
+        PORT_BUF_REVERSAL,
+        if req.lanes.reversed {
+            PORT_BUF_REVERSAL
+        } else {
+            0
+        },
+    );
     rmw(
         mmio,
         port.port_clock_ctl(),
@@ -1554,10 +1733,17 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
             | ddi_clock_select_mask(mmio)
             | SSC_ENABLE_PLLA
             | SSC_ENABLE_PLLB,
-        FORWARD_CLOCK_UNGATE | DDI_CLOCK_SELECT_MAXPCLK | if req.ssc { SSC_ENABLE_PLLB } else { 0 },
+        FORWARD_CLOCK_UNGATE
+            | DDI_CLOCK_SELECT_MAXPCLK
+            | if req.ssc { SSC_ENABLE_PLLB } else { 0 }
+            | if req.lanes.reversed {
+                LANE1_PHY_CLOCK_SELECT
+            } else {
+                0
+            },
     );
-    phy_lane_reset(mmio, port)?;
-    powerdown_change(mmio, port, BOTH_LANES, P2_STATE_READY)?;
+    phy_lane_reset(mmio, port, req.lanes)?;
+    powerdown_change(mmio, port, req.lanes.owned, P2_STATE_READY)?;
     phy.program_msgbus_timer();
     match &req.state {
         Cx0PllState::C10(state) => c10_pll_program(&phy, state)?,
@@ -1568,7 +1754,7 @@ pub fn enable_port_pll_state<M: MmioWindow + ?Sized>(
         mmio.write32(off, req.port_clock_khz);
         compiler_fence(Ordering::SeqCst);
     }
-    set_pclk_pll_request(mmio, port, true)?;
+    set_pclk_pll_request(mmio, port, true, req.lanes)?;
     if req.hdmi && c10 {
         powerdown_change(mmio, port, BOTH_LANES, P0_STATE_ACTIVE)?;
         powerdown_change(mmio, port, BOTH_LANES, P2_STATE_READY)?;
@@ -1609,6 +1795,7 @@ pub fn dp_pll_request(
         ),
     };
     Ok(PllRequest {
+        lanes: PhyLaneConfig::NATIVE,
         state,
         port_clock_khz,
         lane_count,
@@ -1715,14 +1902,14 @@ pub fn reprogram_pll_khz<M: MmioWindow + ?Sized>(
     port_clock_khz: u32,
 ) -> Result<(), Cx0Error> {
     let phy = Cx0Phy::new(mmio, port);
-    set_pclk_pll_request(mmio, port, false)?;
+    set_pclk_pll_request(mmio, port, false, PhyLaneConfig::NATIVE)?;
     phy.program_msgbus_timer();
     program_pll_state(&phy, port_clock_khz)?;
     if let Some(off) = port.clk_valfreq() {
         mmio.write32(off, port_clock_khz);
         compiler_fence(Ordering::SeqCst);
     }
-    set_pclk_pll_request(mmio, port, true)?;
+    set_pclk_pll_request(mmio, port, true, PhyLaneConfig::NATIVE)?;
     Ok(())
 }
 
@@ -1730,7 +1917,7 @@ pub fn reprogram_pll_khz<M: MmioWindow + ?Sized>(
 /// the ACK to clear). Used by the modeset's pipeline-disable
 /// step; the PHY power state is left for the next enable.
 pub fn disable_port_pll<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort) -> Result<(), Cx0Error> {
-    set_pclk_pll_request(mmio, port, false)
+    set_pclk_pll_request(mmio, port, false, PhyLaneConfig::NATIVE)
 }
 
 /// Reprogram only the per-TX enables after link training settled
@@ -1766,27 +1953,37 @@ pub fn disable_port_pll_complete<M: MmioWindow + ?Sized>(
     mmio: &M,
     port: XeLpgPort,
 ) -> Result<(), Cx0Error> {
-    let phy = Cx0Phy::new(mmio, port);
+    disable_port_pll_lanes(mmio, port, PhyLaneConfig::NATIVE)
+}
+
+/// Disable only the PHY lanes retained by the route, preserving USB's
+/// lane-1 reset, powerdown, message bus and clock requests in pin D.
+pub fn disable_port_pll_lanes<M: MmioWindow + ?Sized>(
+    mmio: &M,
+    port: XeLpgPort,
+    lanes: PhyLaneConfig,
+) -> Result<(), Cx0Error> {
+    let phy = Cx0Phy::with_lanes(mmio, port, lanes);
     phy.program_msgbus_timer();
     let state = match port.phy() {
         PhyKind::C10 => P2PG_STATE_DISABLE,
         PhyKind::C20 => P4PG_STATE_DISABLE,
     };
-    powerdown_change(mmio, port, BOTH_LANES, state)?;
+    powerdown_change(mmio, port, lanes.owned, state)?;
     let clock_ctl = port.port_clock_ctl();
-    let requests = lane_pclk_pll_request(0)
-        | lane_pclk_pll_request(1)
-        | lane_pclk_refclk_request(0)
-        | lane_pclk_refclk_request(1);
+    let mut requests = 0;
+    let mut acks = 0;
+    for lane in 0..2 {
+        if lanes.owned & (1 << lane) != 0 {
+            requests |= lane_pclk_pll_request(lane) | lane_pclk_refclk_request(lane);
+            acks |= lane_pclk_pll_ack(lane) | lane_pclk_refclk_ack(lane);
+        }
+    }
     rmw(mmio, clock_ctl, requests, 0);
     if let Some(off) = port.clk_valfreq() {
         mmio.write32(off, 0);
         compiler_fence(Ordering::SeqCst);
     }
-    let acks = lane_pclk_pll_ack(0)
-        | lane_pclk_pll_ack(1)
-        | lane_pclk_refclk_ack(0)
-        | lane_pclk_refclk_ack(1);
     if !wait_for(mmio, clock_ctl, acks, false, PCLK_PLL_DISABLE_TIMEOUT_NS) {
         return Err(Cx0Error::Timeout);
     }
@@ -1910,9 +2107,12 @@ pub fn set_signal_levels_khz<M: MmioWindow + ?Sized>(
     lane_count: u8,
     levels: &[(u8, u8); 4],
 ) -> Result<(), Cx0Error> {
+    if !phy.lanes.admits(lane_count) {
+        return Err(Cx0Error::ProtocolMismatch);
+    }
     let table = trans_table(phy.port.phy());
     phy.program_msgbus_timer();
-    phy.msgbus_access_begin(BOTH_LANES)?;
+    phy.msgbus_access_begin(phy.lanes.owned)?;
     if phy.port.phy() == PhyKind::C10 {
         // `intel_c10_get_tx_vboost_lvl` / `..._term_ctl`, DP
         // branch: external (non-eDP) HBR2/HBR3 links get the
@@ -1964,13 +2164,13 @@ pub fn set_signal_levels_khz<M: MmioWindow + ?Sized>(
         )?;
     }
     phy.rmw(
-        BOTH_LANES,
+        phy.lanes.owned,
         C10_VDR_OVRD,
         0,
         C10_VDR_OVRD_TX1 | C10_VDR_OVRD_TX2,
         true,
     )?;
-    phy.msgbus_access_commit(BOTH_LANES, false)?;
+    phy.msgbus_access_commit(phy.lanes.owned, false)?;
     Ok(())
 }
 
@@ -2061,6 +2261,10 @@ pub fn program_port_buf_ctl<M: MmioWindow + ?Sized>(mmio: &M, port: XeLpgPort, l
         port_width(lane_count),
     );
 }
+
+#[cfg(any(test, feature = "kernel-test"))]
+#[path = "intel_gpu_usbc_tests.rs"]
+mod usbc_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
@@ -2241,8 +2445,14 @@ pub mod tests {
                 let mut v = (s & !0x5500_0000) | ((s & 0x2200_0000) >> 1);
                 if !self.no_clock_ack.get() {
                     v |= (s & 0x8800_0000) >> 1;
+                    v |= (s & TBT_CLOCK_REQUEST) >> 1;
                 }
-                return v;
+                return v & !TBT_CLOCK_ACK
+                    | if !self.no_clock_ack.get() {
+                        (s & TBT_CLOCK_REQUEST) >> 1
+                    } else {
+                        0
+                    };
             }
             if off == self.port.buf_ctl1() {
                 let s = self.stored(off);

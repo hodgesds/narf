@@ -79,9 +79,11 @@
 //! 18 bpp; the 8 bpc route is unchanged. DP 1.4 rates RBR–HBR3 with the
 //! C10/C20 tables in [`crate::intel_gpu_xelpg`]; a stream that neither
 //! bpp carries refuses unless the sink decompresses DSC (below).
-//! UHBR (128b/132b, C20 MPLLA), MST, TBT-alt tunnels, audio and lane
-//! reversal are refused or unadvertised (HDMI is the separate route
-//! described below).
+//! UHBR (128b/132b, C20 MPLLA) and audio remain unadvertised. Live TBT
+//! routes select fabric-owned AUX/clocking. MST uses the shared sideband
+//! manager and a single primary transport across independent Pipe B-D
+//! streams. Native/legacy VBT lane reversal reaches the PHY; DP-alt cable
+//! flip remains a TCSS mux operation.
 //!
 //! ## DSC with FEC
 //!
@@ -100,10 +102,10 @@
 //! only logs it). The stop reverses it: sink decompression off before the
 //! transcoder, `intel_dsc_disable` and the PPS SDP enable after the function
 //! deselect, FEC off after `DP_TP_CTL`, then the sink's FEC ready. The
-//! Pipes owner already sets display 14's `DP_FEC_BS_JITTER_WA`. Per-iteration source pattern/level updates
-//! inside the shared training loop keep the existing MTL simplification:
-//! TPS1 and zero levels are staged before training, the trained levels
-//! after.
+//! Pipes owner already sets display 14's `DP_FEC_BS_JITTER_WA`. The shared
+//! training loop programs each source pattern and drive level before its
+//! matching sink write. A rate/width fallback stops the buffer before
+//! retuning the owned PHY or fabric clock and restarting CR/EQ.
 //!
 //! Sources (Linux b90c984d): `intel_ddi.c` (`mtl_ddi_pre_enable_dp`,
 //! `mtl_ddi_prepare_link_retrain`, `intel_ddi_init_dp_buf_reg`,
@@ -115,6 +117,10 @@
 //! `hsw_crtc_disable`, `hsw_configure_cpu_transcoder`).
 
 use core::sync::atomic::{compiler_fence, AtomicU8, Ordering};
+
+#[path = "intel_gpu_xelpg_mst.rs"]
+mod mst;
+pub use mst::{MstFailure, MtlMstRoute};
 
 use crate::dp_aux::AuxChannel as _;
 use crate::dp_edid::{read_full_edid, EdidReadError};
@@ -130,9 +136,10 @@ use crate::intel_gpu_modeset::{Framebuffer, Mode, ModesetError};
 use crate::intel_gpu_pipes::{Pipe, Transcoder};
 use crate::intel_gpu_vbt::{dp_ssc_enabled, Vbt, VbtEncoder, VbtPlatform, DP_MAX_DOWNSPREAD};
 use crate::intel_gpu_xelpg::{
-    disable_d2d, disable_port_pll_complete, dp_pll_request, enable_d2d, enable_port_pll_state,
-    program_port_buf_ctl, set_signal_levels, wait_port_buf_active, wait_port_buf_idle, Cx0Error,
-    Cx0Phy, XeLpgPort, PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
+    disable_d2d, disable_port_pll_lanes, disable_tbt_clock, dp_pll_request, enable_d2d,
+    enable_port_pll_state, enable_tbt_clock, program_port_buf_ctl, set_signal_levels,
+    wait_port_buf_active, wait_port_buf_idle, Cx0Error, Cx0Phy, PhyLaneConfig, XeLpgPort,
+    PORT_BUF_IO_SELECT_TBT, PORT_BUF_PHY_IDLE,
 };
 use crate::intel_gpu_xelpg_dsc::{self as dsc, DscPlan, DscRefusal};
 use crate::intel_gpu_xelpg_hdmi::{
@@ -218,6 +225,7 @@ const fn ddi_port_width(lanes: u8) -> u32 {
 /// Typed refusal or failure of the MTL external route.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExternalError {
+    Mst(MstFailure),
     /// Not a Meteor Lake (display 14) device.
     UnsupportedGeneration,
     /// DDI A is the internal panel port; it is never an external route.
@@ -457,12 +465,41 @@ pub(crate) fn preflight<M: MmioWindow + ?Sized>(
     port: XeLpgPort,
     display: &MtlDisplay,
 ) -> Result<PipeChoice, ExternalError> {
+    preflight_lanes(io, port, display, PhyLaneConfig::NATIVE)
+}
+
+fn pll_clock_mask(lanes: PhyLaneConfig) -> u32 {
+    let mut mask = 0;
+    for lane in 0..2 {
+        if lanes.owned_mask() & (1 << lane) != 0 {
+            mask |= crate::intel_gpu_xelpg::lane_pclk_pll_request(lane)
+                | crate::intel_gpu_xelpg::lane_pclk_pll_ack(lane);
+        }
+    }
+    mask
+}
+
+fn preflight_lanes<M: MmioWindow + ?Sized>(
+    io: &M,
+    port: XeLpgPort,
+    display: &MtlDisplay,
+    lanes: PhyLaneConfig,
+) -> Result<PipeChoice, ExternalError> {
+    preflight_clock(io, port, display, pll_clock_mask(lanes))
+}
+
+fn preflight_clock<M: MmioWindow + ?Sized>(
+    io: &M,
+    port: XeLpgPort,
+    display: &MtlDisplay,
+    clock_mask: u32,
+) -> Result<PipeChoice, ExternalError> {
     if !io.display_access_ok() {
         return Err(ExternalError::AccessLost);
     }
     let ddi = read(io, port.ddi_buf_ctl())?;
     let clock = read(io, port.port_clock_ctl())?;
-    if ddi & DDI_BUF_CTL_ENABLE != 0 || clock & 0xCC00_0000 != 0 {
+    if ddi & DDI_BUF_CTL_ENABLE != 0 || clock & clock_mask != 0 {
         return Err(ExternalError::PortBusy);
     }
     let pipe = free_pipe(io)?;
@@ -534,6 +571,10 @@ fn phy_err(e: Cx0Error) -> ExternalError {
 /// release.
 #[derive(Clone, Debug)]
 pub struct MtlSinkProbe {
+    /// MST stream transport; absent for SST.
+    pub mst: Option<MstStreamConfig>,
+    /// Board wiring from the VBT; DP-alt cable flip is handled by TCSS.
+    pub lane_reversal: bool,
     /// The external port.
     pub port: XeLpgPort,
     /// Type-C ownership (TC ports only).
@@ -563,7 +604,31 @@ pub struct MtlSinkProbe {
     pub pipe_bpp: u32,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct MstStreamConfig {
+    pub master: Transcoder,
+    pub slots: u8,
+}
+
 impl MtlSinkProbe {
+    fn tbt(&self) -> bool {
+        self.tc.is_some_and(|tc| tc.mode == TcMode::TbtAlt)
+    }
+    fn clock_mask(&self) -> Result<u32, ExternalError> {
+        Ok(if self.tbt() {
+            crate::intel_gpu_xelpg::TBT_CLOCK_REQUEST | crate::intel_gpu_xelpg::TBT_CLOCK_ACK
+        } else {
+            pll_clock_mask(self.phy_lanes()?)
+        })
+    }
+    fn phy_lanes(&self) -> Result<PhyLaneConfig, ExternalError> {
+        PhyLaneConfig::for_route(
+            self.dp_alt(),
+            self.tc.map_or(4, |tc| tc.max_lanes),
+            self.lane_reversal,
+        )
+        .map_err(phy_err)
+    }
     fn dp_alt(&self) -> bool {
         self.tc.is_some_and(|tc| tc.mode == TcMode::DpAlt)
     }
@@ -590,17 +655,21 @@ pub fn release_probe<M: MmioWindow + ?Sized>(
 /// Phase 1: connect, power AUX, read caps + EDID and negotiate. Only the
 /// port's TC/AUX/FIA registers are touched; every failure after the
 /// Type-C connect rolls it back.
-pub fn probe_sink<M: MmioWindow + ?Sized>(
+fn probe_link<M: MmioWindow + ?Sized>(
     io: &M,
     generation: Generation,
     port: XeLpgPort,
     legacy_port: bool,
-) -> Result<MtlSinkProbe, ExternalError> {
+) -> Result<LinkProbe, ExternalError> {
     if generation != Generation::MeteorLake {
         return Err(ExternalError::UnsupportedGeneration);
     }
     if port == XeLpgPort::A {
         return Err(ExternalError::UnsupportedPort);
+    }
+    // Do not acquire/release Type-C ownership behind an inherited live DDI.
+    if read(io, port.ddi_buf_ctl())? & DDI_BUF_CTL_ENABLE != 0 {
+        return Err(ExternalError::PortBusy);
     }
     let tc = match port.tc_index() {
         Some(_) => Some(tc_connect(io, port, legacy_port, 1)?),
@@ -619,11 +688,60 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
         }
         return Err(e.into());
     }
-    let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
+    let mut aux = IntelAux::xelpdp(
+        io,
+        port.aux_base(),
+        tc.is_some_and(|conn| conn.mode == TcMode::TbtAlt),
+    );
     // `read_caps`'s DPCD read, keeping the raw bytes for DP_MAX_DOWNSPREAD.
     let mut raw = [0u8; DPCD_RECEIVER_CAP_BYTES];
     aux.dpcd_read(0, &mut raw)
         .map_err(|e| rollback(ExternalError::Link(LinkError::AuxFailure(e))))?;
+    Ok(LinkProbe { port, tc, raw })
+}
+
+#[derive(Copy, Clone, Debug)]
+struct LinkProbe {
+    port: XeLpgPort,
+    tc: Option<TcConnection>,
+    raw: [u8; 16],
+}
+impl LinkProbe {
+    fn tbt(self) -> bool {
+        self.tc.is_some_and(|tc| tc.mode == TcMode::TbtAlt)
+    }
+    fn aux<'a, M: MmioWindow + ?Sized>(self, io: &'a M) -> IntelAux<'a, M> {
+        IntelAux::xelpdp(io, self.port.aux_base(), self.tbt())
+    }
+    fn release<M: MmioWindow + ?Sized>(self, io: &M) -> Result<(), ExternalError> {
+        aux_power_disable(io, self.port)?;
+        if let Some(tc) = self.tc {
+            tc_disconnect(io, &tc)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn probe_sink<M: MmioWindow + ?Sized>(
+    io: &M,
+    generation: Generation,
+    port: XeLpgPort,
+    legacy_port: bool,
+) -> Result<MtlSinkProbe, ExternalError> {
+    let link = probe_link(io, generation, port, legacy_port)?;
+    probe_sink_link(io, link)
+}
+
+fn probe_sink_link<M: MmioWindow + ?Sized>(
+    io: &M,
+    link: LinkProbe,
+) -> Result<MtlSinkProbe, ExternalError> {
+    let LinkProbe { port, tc, raw } = link;
+    let rollback = |error| {
+        let _ = link.release(io);
+        error
+    };
+    let mut aux = link.aux(io);
     let caps = DpcdCaps::decode(&raw);
     let max_downspread = raw[DP_MAX_DOWNSPREAD];
     let mut edid = [0u8; EDID_CAPACITY];
@@ -719,6 +837,8 @@ pub fn probe_sink<M: MmioWindow + ?Sized>(
         return Err(rollback(ExternalError::AccessLost));
     }
     Ok(MtlSinkProbe {
+        mst: None,
+        lane_reversal: false,
         port,
         tc,
         caps,
@@ -852,13 +972,35 @@ pub fn activate<M: MmioWindow + ?Sized>(
     fb: Framebuffer,
     display: &MtlDisplay,
 ) -> Result<MtlExternalRoute, ActivateError> {
+    activate_with_payload(io, probe, fb, display, &mut |_| Ok(()))
+}
+
+#[allow(clippy::result_large_err)]
+fn activate_with_payload<M: MmioWindow + ?Sized>(
+    io: &M,
+    mut probe: MtlSinkProbe,
+    fb: Framebuffer,
+    display: &MtlDisplay,
+    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
+) -> Result<MtlExternalRoute, ActivateError> {
+    if let Err(e) = probe.phy_lanes() {
+        return Err(ActivateError::Refused(probe, e));
+    }
     if let Err(e) = crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &probe.mode) {
         return Err(ActivateError::Refused(probe, e.into()));
     }
-    let choice = match preflight(io, probe.port, display) {
+    let choice = match preflight_clock(
+        io,
+        probe.port,
+        display,
+        probe.clock_mask().expect("validated above"),
+    ) {
         Ok(choice) => choice,
         Err(e) => return Err(ActivateError::Refused(probe, e)),
     };
+    if let Some(mst) = probe.mst.as_mut() {
+        mst.master = choice.pipe.transcoder();
+    }
     if let Some(conn) = probe.tc {
         match connection_intact(io, &conn) {
             Ok(true) => {}
@@ -904,7 +1046,7 @@ pub fn activate<M: MmioWindow + ?Sized>(
         pipe: choice.pipe,
         reservation: None,
     };
-    match program(io, &mut route, choice, &ext, display.pipe_dmc) {
+    match program(io, &mut route, choice, &ext, display.pipe_dmc, payload) {
         Ok(()) => {
             route.state = RouteState::Live;
             Ok(route)
@@ -925,6 +1067,7 @@ fn program<M: MmioWindow + ?Sized>(
     choice: PipeChoice,
     ext: &ExternalPipe,
     dmc: &'static (dyn PipeDmc + Sync),
+    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
 ) -> Result<(), ExternalError> {
     // 1. Power wells (intel_modeset_get_crtc_power_domains), then the
     // pre-plane update and the first step of hsw_crtc_enable
@@ -933,7 +1076,9 @@ fn program<M: MmioWindow + ?Sized>(
     route.reservation = Some(reserve_pipe(io, choice, ext, dmc)?);
     let (rate, lanes) = (route.probe.negotiated.rate, route.probe.negotiated.lanes);
     let mut trained = enable_port(io, route, rate, lanes)?;
-    if route.probe.dsc.is_some() && (trained.rate != rate || trained.lanes != lanes) {
+    if (route.probe.dsc.is_some() || route.probe.mst.is_some())
+        && (trained.rate != rate || trained.lanes != lanes)
+    {
         // The DSC configuration was computed for this link.
         return Err(ExternalError::Dsc(DscRefusal::TrainingFallback));
     }
@@ -961,7 +1106,7 @@ fn program<M: MmioWindow + ?Sized>(
         }
         trained = retry;
     }
-    finish(io, route, &trained)?;
+    finish(io, route, &trained, payload)?;
     route.trained = trained;
     Ok(())
 }
@@ -990,25 +1135,16 @@ fn enable_port<M: MmioWindow + ?Sized>(
     // 5. Port PLL (intel_cx0pll_enable) for the planned width.
     // A legacy-mode C20 port also clears the MPLLB CAL_DONE banks first
     // (intel_c20_protocol_switch_valid).
-    let request = dp_pll_request(
-        port,
-        pll_rate,
-        lanes,
-        route.probe.dp_alt(),
-        route.probe.legacy(),
-        route.probe.ssc,
-    )
-    .map_err(phy_err)?;
-    enable_port_pll_state(io, port, &request).map_err(phy_err)?;
+    enable_clock(io, &route.probe, pll_rate, lanes)?;
     // 6.a TRANS_CLK_SEL = TGL_TRANS_CLK_SEL_PORT(phy).
     write(io, trans_clk_sel(trans), trans_clk_sel_port(port))?;
     // 6.c TRANS_DDI_FUNC_CTL configured without ENABLE.
-    let func = dp_func(port, lanes, route.probe.pipe_bpp);
+    let func = stream_func(&route.probe, lanes);
     write(io, trans_ddi_func_ctl(trans), func & !TRANS_DDI_FUNC_ENABLE)?;
     // intel_dp_set_power(D0), intel_dp_sink_enable_decompression and
     // intel_dp_sink_set_fec_ready, before training.
     if let Some(plan) = route.probe.dsc {
-        let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
         let link = |e| ExternalError::Link(LinkError::AuxFailure(e));
         aux.dpcd_write(dsc::DP_SET_POWER, &[dsc::DP_SET_POWER_D0])
             .map_err(link)?;
@@ -1027,11 +1163,25 @@ fn enable_port<M: MmioWindow + ?Sized>(
     write(
         io,
         dp_tp_ctl(trans),
-        DP_TP_CTL_ENABLE | DP_TP_CTL_LINK_TRAIN_PAT1 | enhanced,
+        DP_TP_CTL_ENABLE
+            | DP_TP_CTL_LINK_TRAIN_PAT1
+            | enhanced
+            | if route.probe.mst.is_some() {
+                1 << 27
+            } else {
+                0
+            },
     )?;
     enable_d2d(io, port).map_err(phy_err)?;
-    let phy = Cx0Phy::new(io, port);
-    set_signal_levels(&phy, pll_rate, lanes, &[(0, 0); 4]).map_err(phy_err)?;
+    let phy = Cx0Phy::with_lanes(io, port, route.probe.phy_lanes()?);
+    if !route.probe.tbt()
+        && route
+            .probe
+            .mst
+            .is_none_or(|mst| mst.master == route.pipe.transcoder())
+    {
+        set_signal_levels(&phy, pll_rate, lanes, &[(0, 0); 4]).map_err(phy_err)?;
+    }
     program_port_buf_ctl(io, port, lanes);
     write(
         io,
@@ -1040,14 +1190,125 @@ fn enable_port<M: MmioWindow + ?Sized>(
     )?;
     wait_port_buf_active(io, port).map_err(phy_err)?;
     // 6.k DisplayPort training over the owned AUX channel.
-    let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
-    train_link(&mut aux, rate, lanes, |us| {
+    let aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
+    let mut failure = None;
+    let mut aux = crate::intel_gpu_modeset::training::TrainingAux::new(
+        aux,
+        crate::intel_gpu_modeset::training::State::new(pll_rate, lanes),
+        |state: &crate::intel_gpu_modeset::training::State, change| {
+            training_update(io, route, state, change).map_err(|error| {
+                failure = Some(error);
+                crate::dp_aux::AuxError::Nacked
+            })
+        },
+    );
+    let result = train_link(&mut aux, rate, lanes, |us| {
         let _ = narf_scheduler::responsive_spin_until(
             || false,
             narf_time::Deadline::after_ns(us as u64 * 1_000),
         );
     })
-    .map_err(ExternalError::Link)
+    .map_err(ExternalError::Link);
+    match failure {
+        Some(error) => Err(error),
+        None => result,
+    }
+}
+
+fn enable_clock<M: MmioWindow + ?Sized>(
+    io: &M,
+    probe: &MtlSinkProbe,
+    rate: crate::intel_gpu_pll::LinkRate,
+    lanes: u8,
+) -> Result<(), ExternalError> {
+    let port = probe.port;
+    let buf = read(io, port.buf_ctl1())?;
+    write(
+        io,
+        port.buf_ctl1(),
+        (buf & !PORT_BUF_IO_SELECT_TBT)
+            | if probe.tbt() {
+                PORT_BUF_IO_SELECT_TBT
+            } else {
+                0
+            },
+    )?;
+    if probe.tbt() {
+        enable_tbt_clock(io, port, rate).map_err(phy_err)?;
+    } else {
+        let mut request =
+            dp_pll_request(port, rate, lanes, probe.dp_alt(), probe.legacy(), probe.ssc)
+                .map_err(phy_err)?;
+        request.lanes = probe.phy_lanes()?;
+        enable_port_pll_state(io, port, &request).map_err(phy_err)?;
+    }
+    Ok(())
+}
+
+fn training_update<M: MmioWindow + ?Sized>(
+    io: &M,
+    route: &MtlExternalRoute,
+    state: &crate::intel_gpu_modeset::training::State,
+    change: crate::intel_gpu_modeset::training::Change,
+) -> Result<(), ExternalError> {
+    use crate::intel_gpu_modeset::training::Change;
+    let probe = &route.probe;
+    let port = probe.port;
+    let trans = route_pipe(route)?.transcoder();
+    match change {
+        Change::Configure => Ok(()),
+        Change::Levels if !state.dirty && !probe.tbt() => set_signal_levels(
+            &Cx0Phy::with_lanes(io, port, probe.phy_lanes()?),
+            state.rate,
+            state.lanes,
+            &state.levels,
+        )
+        .map_err(phy_err),
+        Change::Levels => Ok(()),
+        Change::Pattern => {
+            if state.pattern == 1 && state.dirty {
+                if state.lanes > probe.tc.map_or(4, |tc| tc.max_lanes) {
+                    return Err(ExternalError::TrainingMismatch);
+                }
+                let ddi = read(io, port.ddi_buf_ctl())?;
+                write(io, port.ddi_buf_ctl(), ddi & !DDI_BUF_CTL_ENABLE)?;
+                wait_port_buf_idle(io, port).map_err(phy_err)?;
+                disable_d2d(io, port).map_err(phy_err)?;
+                if probe.tbt() {
+                    disable_tbt_clock(io, port).map_err(phy_err)?;
+                } else {
+                    disable_port_pll_lanes(io, port, probe.phy_lanes()?).map_err(phy_err)?;
+                }
+                enable_clock(io, probe, state.rate, state.lanes)?;
+                if !probe.tbt() {
+                    set_signal_levels(
+                        &Cx0Phy::with_lanes(io, port, probe.phy_lanes()?),
+                        state.rate,
+                        state.lanes,
+                        &state.levels,
+                    )
+                    .map_err(phy_err)?;
+                }
+                enable_d2d(io, port).map_err(phy_err)?;
+                program_port_buf_ctl(io, port, state.lanes);
+                write(
+                    io,
+                    port.ddi_buf_ctl(),
+                    ddi_port_width(state.lanes) | DDI_BUF_CTL_ENABLE,
+                )?;
+                wait_port_buf_active(io, port).map_err(phy_err)?;
+            }
+            let old = read(io, dp_tp_ctl(trans))?;
+            let bits = state
+                .pattern_bits()
+                .map_err(|_| ExternalError::TrainingMismatch)?;
+            write(
+                io,
+                dp_tp_ctl(trans),
+                (old & !(DP_TP_CTL_LINK_TRAIN_MASK | (1 << 7))) | bits,
+            )
+        }
+    }
 }
 
 /// `TRANS_DDI_FUNC_CTL` for DP SST on `port` at `lanes`, with the pipe's
@@ -1058,6 +1319,18 @@ fn dp_func(port: XeLpgPort, lanes: u8, pipe_bpp: u32) -> u32 {
         crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_SST,
         lanes,
     ) | dsc::trans_ddi_bpc(pipe_bpp)
+}
+
+fn stream_func(probe: &MtlSinkProbe, lanes: u8) -> u32 {
+    let sst = dp_func(probe.port, lanes, probe.pipe_bpp);
+    match probe.mst {
+        Some(mst) => {
+            (sst & !(7 << 24))
+                | crate::intel_gpu_pipes::TRANS_DDI_MODE_DP_MST
+                | ((mst.master as u32) << 10)
+        }
+        None => sst,
+    }
 }
 
 /// `intel_cpu_transcoder_set_m1_n1` for `trans`; `LINK_N1` last, it
@@ -1102,6 +1375,7 @@ fn finish<M: MmioWindow + ?Sized>(
     io: &M,
     route: &mut MtlExternalRoute,
     trained: &TrainedLink,
+    payload: &mut dyn FnMut(Transcoder) -> Result<(), ExternalError>,
 ) -> Result<(), ExternalError> {
     let port = route.probe.port;
     let mode = route.probe.mode;
@@ -1111,16 +1385,40 @@ fn finish<M: MmioWindow + ?Sized>(
     for (i, lane) in trained.vswing_pe.lanes.iter().enumerate() {
         levels[i] = (lane.swing, lane.pre_emph);
     }
-    set_signal_levels(&Cx0Phy::new(io, port), pll_rate, lanes, &levels).map_err(phy_err)?;
+    if !route.probe.tbt()
+        && route
+            .probe
+            .mst
+            .is_none_or(|mst| mst.master == route.pipe.transcoder())
+    {
+        set_signal_levels(
+            &Cx0Phy::with_lanes(io, port, route.probe.phy_lanes()?),
+            pll_rate,
+            lanes,
+            &levels,
+        )
+        .map_err(phy_err)?;
+    }
     let rp = route
         .reservation
         .as_mut()
         .ok_or(ExternalError::Pipe(PipeRefusal::Sequence))?;
     let (pipe, trans) = (rp.pipe, rp.transcoder());
-    let tp = read(io, dp_tp_ctl(trans))?;
+    let master = route.probe.mst.map_or(trans, |mst| mst.master);
+    let tp = read(io, dp_tp_ctl(master))?;
+    if route.probe.mst.is_some() && master == trans {
+        write(
+            io,
+            dp_tp_ctl(master),
+            (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | (2 << 8),
+        )?;
+        if !wait_bit(io, dp_tp_ctl(master) + 4, 1 << 25, true, 800_000) {
+            return Err(ExternalError::Mst(MstFailure::Act));
+        }
+    }
     write(
         io,
-        dp_tp_ctl(trans),
+        dp_tp_ctl(master),
         (tp & !DP_TP_CTL_LINK_TRAIN_MASK) | DP_TP_CTL_LINK_TRAIN_NORMAL,
     )?;
     let lost = |_| ExternalError::AccessLost;
@@ -1153,14 +1451,27 @@ fn finish<M: MmioWindow + ?Sized>(
     }
     rp.pipes.program_timings(io, pipe)?;
     // intel_ddi_enable: function, then the transcoder.
-    let func = dp_func(port, lanes, pipe_bpp);
+    let mut func = stream_func(&route.probe, lanes);
+    if let Some(mst) = route.probe.mst {
+        let off = trans.base() + crate::intel_gpu_pipes::PIPE_DATA_M1_OFFSET;
+        let mn = read(io, off)?;
+        write(
+            io,
+            off,
+            (mn & !(0x7F << 25)) | (u32::from(mst.slots - 1) << 25),
+        )?;
+        func |= 1 << 8;
+        write(io, trans_ddi_func_ctl(trans), func & !(1 << 8))?;
+        mst::source_payload(io, trans, master, true)?;
+        payload(trans)?;
+    }
     write(io, trans_ddi_func_ctl(trans), func)?;
     let start = read(io, pipe.base() + FRMCOUNT)?;
     rp.pipes.enable(io, pipe)?;
     // intel_ddi_wait_for_fec_status(true): Linux only logs a timeout.
     if plan.is_some_and(|p| p.fec) {
         let _ = dsc::wait_fec_live(io, trans, true);
-        let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
         let _ = dsc::wait_fec_detected(&mut aux, |us| {
             let _ = narf_scheduler::responsive_spin_until(
                 || false,
@@ -1201,7 +1512,7 @@ fn observe_live<M: MmioWindow + ?Sized>(
             let live = io.read32(base + PLANE_SURFLIVE_1);
             let route_now = io.read32(trans_ddi_func_ctl(trans));
             let clock = io.read32(trans_clk_sel(trans));
-            let tp = io.read32(dp_tp_ctl(trans));
+            let tp = io.read32(dp_tp_ctl(route.probe.mst.map_or(trans, |mst| mst.master)));
             let buf = io.read32(port.buf_ctl1());
             let ddi = io.read32(port.ddi_buf_ctl());
             refused = !io.display_access_ok() || frame == u32::MAX || ddi == u32::MAX;
@@ -1261,7 +1572,7 @@ fn stop_port<M: MmioWindow + ?Sized>(
     // Sink to D3 before the port goes down (a NACK never replaces the
     // local idle proof).
     if route.probe.caps.dpcd_rev >= 0x11 {
-        let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
         let _ = aux.dpcd_write(DPCD_SET_POWER, &[DP_SET_POWER_D3]);
     }
     // intel_ddi_buf_disable (display 14): DDI_CTL_DE off, PHY idle, D2D
@@ -1277,20 +1588,27 @@ fn stop_port<M: MmioWindow + ?Sized>(
     if fec {
         dsc::disable_fec(io, trans).map_err(|_| ExternalError::AccessLost)?;
         let _ = dsc::wait_fec_live(io, trans, false);
-        let mut aux = IntelAux::xelpdp(io, port.aux_base(), false);
+        let mut aux = IntelAux::xelpdp(io, port.aux_base(), route.probe.tbt());
         let _ = dsc::set_sink_fec_ready(&mut aux, false);
     }
     // TRANS_CLK_SEL: no clock to the transcoder.
     write(io, trans_clk_sel(trans), 0)?;
     // intel_cx0pll_disable, then deselect Thunderbolt IO.
-    disable_port_pll_complete(io, port).map_err(|_| stop_failed)?;
+    if route.probe.tbt() {
+        disable_tbt_clock(io, port).map_err(|_| stop_failed)?;
+    } else {
+        disable_port_pll_lanes(io, port, route.probe.phy_lanes()?).map_err(|_| stop_failed)?;
+    }
     let buf = read(io, port.buf_ctl1())?;
     write(io, port.buf_ctl1(), buf & !PORT_BUF_IO_SELECT_TBT)?;
     // Final observation of every stopped port resource.
     let ddi = read(io, port.ddi_buf_ctl())?;
     let buf = read(io, port.buf_ctl1())?;
     let clock = read(io, port.port_clock_ctl())?;
-    if ddi & DDI_BUF_CTL_ENABLE != 0 || buf & PORT_BUF_PHY_IDLE == 0 || clock & 0xCC00_0000 != 0 {
+    if ddi & DDI_BUF_CTL_ENABLE != 0
+        || buf & PORT_BUF_PHY_IDLE == 0
+        || clock & route.probe.clock_mask()? != 0
+    {
         return Err(stop_failed);
     }
     Ok(())
@@ -1315,7 +1633,7 @@ fn stop_local<M: MmioWindow + ?Sized>(
     // intel_ddi_disable_dp: the sink's decompression off before the
     // transcoder (best effort, as in Linux).
     if route.probe.dsc.is_some() {
-        let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), false);
+        let mut aux = IntelAux::xelpdp(io, route.probe.port.aux_base(), route.probe.tbt());
         let _ = dsc::set_sink_decompression(&mut aux, false);
     }
     let rp = route
@@ -1395,7 +1713,7 @@ impl MtlExternalRoute {
     /// reports CR_DONE | CHANNEL_EQ_DONE | SYMBOL_LOCKED and inter-lane
     /// alignment is done.
     pub fn link_ok<M: MmioWindow + ?Sized>(&self, io: &M) -> Result<bool, ExternalError> {
-        let mut aux = IntelAux::xelpdp(io, self.probe.port.aux_base(), false);
+        let mut aux = IntelAux::xelpdp(io, self.probe.port.aux_base(), self.probe.tbt());
         let mut status = [0u8; 3];
         aux.dpcd_read(0x202, &mut status)
             .map_err(|e| ExternalError::Link(LinkError::AuxFailure(e)))?;
@@ -1419,6 +1737,8 @@ impl MtlExternalRoute {
 /// without one production uses [`MtlPortPolicy::NO_VBT`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MtlPortDecl {
+    /// VBT board lane reversal (never the USB-C cable orientation).
+    pub lane_reversal: bool,
     /// The port carries DisplayPort.
     pub dp: bool,
     /// The port carries native HDMI (TMDS).
@@ -1434,6 +1754,7 @@ pub struct MtlPortDecl {
 impl MtlPortDecl {
     /// No output on this port.
     pub const NONE: Self = Self {
+        lane_reversal: false,
         dp: false,
         hdmi: false,
         legacy: false,
@@ -1442,6 +1763,7 @@ impl MtlPortDecl {
     /// `init_vbt_missing_defaults` for a non-TC port other than A and E:
     /// `DEVICE_TYPE_TMDS_DVI_SIGNALING | DEVICE_TYPE_DISPLAYPORT_OUTPUT`.
     pub const COMBO_DP_HDMI: Self = Self {
+        lane_reversal: false,
         dp: true,
         hdmi: true,
         legacy: false,
@@ -1449,6 +1771,7 @@ impl MtlPortDecl {
     };
     /// A USB-C connector: DP-alt only.
     pub const USB_C: Self = Self {
+        lane_reversal: false,
         dp: true,
         hdmi: false,
         legacy: false,
@@ -1456,6 +1779,7 @@ impl MtlPortDecl {
     };
     /// A Type-C PHY wired to a native HDMI connector.
     pub const LEGACY_HDMI: Self = Self {
+        lane_reversal: false,
         dp: false,
         hdmi: true,
         legacy: true,
@@ -1565,8 +1889,7 @@ impl MtlPortPolicy {
 /// rule. Encoders this route cannot drive as declared become
 /// [`MtlPortDecl::NONE`] (fail closed): DSI and eDP encoders, a VBT AUX
 /// channel other than the port's own (`default_aux_ch`; the AUX, power
-/// and Type-C paths are keyed by port), lane reversal (the route never
-/// programs `PORT_REVERSAL`), and a Type-C port marked dedicated external
+/// and Type-C paths are keyed by port), and a Type-C port marked dedicated external
 /// (Linux then treats it as non-Type-C; this route always owns it through
 /// TCSS).
 pub fn decl_from_encoder(port: XeLpgPort, encoder: &VbtEncoder) -> MtlPortDecl {
@@ -1574,12 +1897,7 @@ pub fn decl_from_encoder(port: XeLpgPort, encoder: &VbtEncoder) -> MtlPortDecl {
     let foreign_aux = encoder
         .aux_ch
         .is_some_and(|aux| u32::from(aux) != port.port_enum());
-    if encoder.dsi
-        || encoder.edp
-        || foreign_aux
-        || encoder.lane_reversal
-        || (type_c && !encoder.type_c)
-    {
+    if encoder.dsi || encoder.edp || foreign_aux || (type_c && !encoder.type_c) {
         return MtlPortDecl::NONE;
     }
     let hdmi = encoder.hdmi_ddc.is_some();
@@ -1587,6 +1905,7 @@ pub fn decl_from_encoder(port: XeLpgPort, encoder: &VbtEncoder) -> MtlPortDecl {
         return MtlPortDecl::NONE;
     }
     MtlPortDecl {
+        lane_reversal: encoder.lane_reversal,
         dp: encoder.dp,
         hdmi,
         legacy: type_c && encoder.tc_legacy,
@@ -1614,20 +1933,20 @@ pub enum RoutePlan {
 /// returns a digital EDID (`intel_hdmi_set_edid`). With a single owned
 /// route this is ordered: DP first, HDMI only on a DPCD read failure.
 /// Native HDMI needs DDI B or a declared legacy Type-C port; DP-alt and
-/// TBT-alt never carry TMDS, and TBT-alt carries nothing owned here.
+/// TBT-alt never carry TMDS. A TBT route carries only its live DP tunnel.
 pub const fn route_plan(port: XeLpgPort, decl: MtlPortDecl, live: LiveMode) -> RoutePlan {
     let type_c = port.tc_index().is_some();
     let mode_ok = match live {
         LiveMode::Native => !type_c && !matches!(port, XeLpgPort::A),
         LiveMode::Legacy => type_c && decl.legacy_effective(),
         LiveMode::DpAlt => type_c,
-        LiveMode::TbtAlt => false,
+        LiveMode::TbtAlt => type_c,
     };
     if !mode_ok {
         return RoutePlan::Refuse;
     }
     let dp = decl.dp;
-    let hdmi = decl.hdmi && !matches!(live, LiveMode::DpAlt);
+    let hdmi = decl.hdmi && !matches!(live, LiveMode::DpAlt | LiveMode::TbtAlt);
     match (dp, hdmi) {
         (true, true) => RoutePlan::DpThenHdmi,
         (true, false) => RoutePlan::Dp,
@@ -1649,6 +1968,7 @@ pub enum MtlProtocol {
     Dp,
     /// HDMI TMDS.
     Hdmi,
+    DpMst,
 }
 
 /// A refusal or failure from either route.
@@ -1661,12 +1981,13 @@ pub enum RouteError {
 }
 
 /// One owned external route of either protocol.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum MtlRoute {
     /// DisplayPort SST.
     Dp(MtlExternalRoute),
     /// HDMI TMDS.
     Hdmi(MtlHdmiRoute),
+    Mst(alloc::boxed::Box<MtlMstRoute>),
 }
 
 impl MtlRoute {
@@ -1675,6 +1996,7 @@ impl MtlRoute {
         match self {
             MtlRoute::Dp(r) => r.port(),
             MtlRoute::Hdmi(r) => r.port(),
+            MtlRoute::Mst(r) => r.port(),
         }
     }
 
@@ -1683,6 +2005,7 @@ impl MtlRoute {
         match self {
             MtlRoute::Dp(_) => MtlProtocol::Dp,
             MtlRoute::Hdmi(_) => MtlProtocol::Hdmi,
+            MtlRoute::Mst(_) => MtlProtocol::DpMst,
         }
     }
 
@@ -1691,6 +2014,7 @@ impl MtlRoute {
         match self {
             MtlRoute::Dp(r) => r.pipe(),
             MtlRoute::Hdmi(r) => r.pipe(),
+            MtlRoute::Mst(r) => r.first().map_or(Pipe::B, |(pipe, _, _)| pipe),
         }
     }
 
@@ -1699,6 +2023,7 @@ impl MtlRoute {
         match self {
             MtlRoute::Dp(r) => r.state() == RouteState::Live,
             MtlRoute::Hdmi(r) => r.state() == HdmiRouteState::Live,
+            MtlRoute::Mst(r) => r.live(),
         }
     }
 
@@ -1707,6 +2032,7 @@ impl MtlRoute {
         match self {
             MtlRoute::Dp(r) => r.state() == RouteState::Stopped,
             MtlRoute::Hdmi(r) => r.state() == HdmiRouteState::Stopped,
+            MtlRoute::Mst(r) => r.stopped(),
         }
     }
 
@@ -1714,6 +2040,7 @@ impl MtlRoute {
         match self {
             MtlRoute::Dp(r) => r.stop(io).map_err(RouteError::Dp),
             MtlRoute::Hdmi(r) => r.stop(io).map_err(RouteError::Hdmi),
+            MtlRoute::Mst(r) => r.stop(io).map_err(RouteError::Dp),
         }
     }
 
@@ -1727,6 +2054,9 @@ impl MtlRoute {
             MtlRoute::Hdmi(r) => r
                 .release(io)
                 .map_err(|(r, e)| (MtlRoute::Hdmi(r), RouteError::Hdmi(e))),
+            MtlRoute::Mst(r) => r
+                .release(io)
+                .map_err(|(r, error)| (MtlRoute::Mst(r), RouteError::Dp(error))),
         }
     }
 }
@@ -1919,17 +2249,14 @@ impl MtlExternalService {
             RoutePlan::Refuse => ServiceOutcome::Refused {
                 port,
                 error: RouteError::Dp(match live {
-                    LiveMode::TbtAlt => ExternalError::Tc(TcError::TbtAltUnsupported),
+                    LiveMode::TbtAlt => ExternalError::Tc(TcError::TunnelUnavailable),
                     _ => ExternalError::UnsupportedPort,
                 }),
             },
             RoutePlan::Hdmi => self.connect_hdmi(io, port, legacy, alloc),
             RoutePlan::Dp | RoutePlan::DpThenHdmi => {
-                match probe_sink(io, Generation::MeteorLake, port, legacy) {
-                    Ok(mut probe) => {
-                        probe.ssc = dp_ssc_enabled(self.policy.use_ssc, probe.max_downspread);
-                        self.connect_dp(io, probe, alloc)
-                    }
+                match probe_link(io, Generation::MeteorLake, port, legacy) {
+                    Ok(link) => self.connect_output(io, link, alloc),
                     Err(e) if plan == RoutePlan::DpThenHdmi && dpcd_absent(&e) => {
                         self.connect_hdmi(io, port, legacy, alloc)
                     }
@@ -1944,6 +2271,56 @@ impl MtlExternalService {
             self.live = live;
         }
         outcome
+    }
+
+    fn connect_output<M: MmioWindow + ?Sized>(
+        &mut self,
+        io: &M,
+        link: LinkProbe,
+        alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+    ) -> ServiceOutcome {
+        let port = link.port;
+        let mut cap = [0];
+        if link.raw[0] >= 0x12 {
+            if let Err(error) = link.aux(io).dpcd_read(0x21, &mut cap) {
+                let _ = link.release(io);
+                return ServiceOutcome::Refused {
+                    port,
+                    error: RouteError::Dp(ExternalError::Link(LinkError::AuxFailure(error))),
+                };
+            }
+        }
+        if cap[0] & 1 != 0 {
+            match MtlMstRoute::connect(io, link, self.policy.decl(port), &self.display, alloc) {
+                Ok(route) => {
+                    let (pipe, mode, fb) = route.first().expect("live MST has a first stream");
+                    self.route = Some(MtlRoute::Mst(route));
+                    ServiceOutcome::Activated {
+                        port,
+                        protocol: MtlProtocol::DpMst,
+                        pipe,
+                        mode,
+                        fb,
+                    }
+                }
+                Err((mut route, error)) => {
+                    let _ = route.stop(io);
+                    self.settle_failed(io, MtlRoute::Mst(route), RouteError::Dp(error))
+                }
+            }
+        } else {
+            match probe_sink_link(io, link) {
+                Ok(mut probe) => {
+                    probe.lane_reversal = self.policy.decl(port).lane_reversal;
+                    probe.ssc = dp_ssc_enabled(self.policy.use_ssc, probe.max_downspread);
+                    self.connect_dp(io, probe, alloc)
+                }
+                Err(error) => ServiceOutcome::Refused {
+                    port,
+                    error: RouteError::Dp(error),
+                },
+            }
+        }
     }
 
     fn connect_dp<M: MmioWindow + ?Sized>(
@@ -1996,7 +2373,7 @@ impl MtlExternalService {
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let ddc = self.policy.ddc_pin(port);
-        let probe = match probe_hdmi(io, Generation::MeteorLake, port, legacy, ddc) {
+        let mut probe = match probe_hdmi(io, Generation::MeteorLake, port, legacy, ddc) {
             Ok(probe) => probe,
             Err(e) => {
                 return ServiceOutcome::Refused {
@@ -2005,6 +2382,8 @@ impl MtlExternalService {
                 }
             }
         };
+        probe.pll.lanes = PhyLaneConfig::for_route(false, 4, self.policy.decl(port).lane_reversal)
+            .expect("native PHY has both lanes");
         let fb = match alloc(&probe.mode) {
             Some(fb) => fb,
             None => {
@@ -2106,15 +2485,26 @@ impl MtlExternalService {
         let owned = self.route.as_ref().map(|r| (r.port(), r.protocol()));
         let owns = owned.map(|(p, _)| p) == Some(port);
         match event.kind {
-            MtlHpdKind::Connected(LiveMode::TbtAlt) => ServiceOutcome::Refused {
-                port,
-                error: RouteError::Dp(ExternalError::Tc(TcError::TbtAltUnsupported)),
-            },
             MtlHpdKind::Connected(live) if self.route.is_none() => {
                 self.connect(io, port, live, alloc)
             }
             MtlHpdKind::Connected(_) => ServiceOutcome::Unchanged,
             MtlHpdKind::Disconnected if owns => self.withdraw(io),
+            MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::DpMst)) => {
+                let unchanged = match self.route.as_mut() {
+                    Some(MtlRoute::Mst(route)) => route.unchanged(io) == Ok(true),
+                    _ => false,
+                };
+                if unchanged {
+                    ServiceOutcome::Unchanged
+                } else {
+                    let live = self.live;
+                    match self.withdraw(io) {
+                        ServiceOutcome::Withdrawn { .. } => self.connect(io, port, live, alloc),
+                        other => other,
+                    }
+                }
+            }
             // HDMI has no IRQ_HPD (`intel_hdmi` installs no hpd_pulse).
             MtlHpdKind::ShortPulse if owned == Some((port, MtlProtocol::Dp)) => {
                 let healthy = match self.route.as_ref() {

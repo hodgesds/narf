@@ -31,16 +31,11 @@
 //!
 //! ## Qualified profile and refusals
 //!
-//! - DP-alt and legacy modes run the full source connect sequence.
-//!   Legacy mode needs the board's `legacy_port` fact (VBT); this tree has
-//!   no VBT parser, so production callers pass `false` and a legacy sink
-//!   stays invisible exactly as in the source with that flag.
-//! - Thunderbolt-alt refuses with [`TcError::TbtAltUnsupported`]: display
-//!   does not own the PHY there and the TBT DP-IN tunnel has no owner in
-//!   this tree.
-//! - DP-alt pin assignment D (two DP lanes, PHY lane 1 owned by USB)
-//!   refuses with [`TcError::PartialLaneOwnership`] after the source
-//!   rollback: the Cx0 layer drives both PHY lanes' message buses.
+//! - DP-alt and VBT-declared legacy modes run the source connect sequence.
+//! - Pin D retains a two-lane main-link ceiling and lends only PHY lane 0
+//!   to display; PLL/TX/stop callers retain that ownership shape.
+//! - Live TBT HPD admits a fabric-owned route without taking the PHY or
+//!   requesting TCSS power. Missing live HPD returns TunnelUnavailable.
 //! - The TC-cold block itself (`POWER_DOMAIN_TC_COLD_OFF`) maps to no
 //!   Xe-LPDP power well; the TCSS power request below is the hardware
 //!   side of the block.
@@ -134,9 +129,8 @@ pub enum TcError {
     NotTypeC,
     /// Register authority was lost or a status read returned all-ones.
     AccessLost,
-    /// The sink is Thunderbolt-alt: the PHY belongs to the TBT subsystem
-    /// and no TBT DP-IN tunnel owner exists.
-    TbtAltUnsupported,
+    /// No live fabric DP-IN route is present on the Type-C port.
+    TunnelUnavailable,
     /// The IOM never reported the PHY ready for a display owner.
     PhyNotReady,
     /// TCSS power did not reach the requested state in 5 ms.
@@ -149,11 +143,6 @@ pub enum TcError {
         max: u8,
         /// Lanes the caller required.
         required: u8,
-    },
-    /// The DP-alt pin assignment hands display only PHY lane 0.
-    PartialLaneOwnership {
-        /// Raw pin assignment.
-        pin_assignment: u8,
     },
     /// A foreign AUX transaction is in flight on this port.
     AuxBusy,
@@ -424,7 +413,22 @@ fn connect_mode<M: MmioWindow + ?Sized>(
     required_lanes: u8,
 ) -> Result<TcConnection, TcError> {
     match mode {
-        TcMode::TbtAlt | TcMode::Disconnected => return Err(TcError::TbtAltUnsupported),
+        TcMode::TbtAlt => {
+            // The live PICA bit proves the fabric's DP-IN route; its AUX
+            // path and PLL belong to USB4, never to the display PHY owner.
+            if live_status_mask(io, tc, legacy_port)? & TcMode::TbtAlt.bit() == 0 {
+                return Err(TcError::TunnelUnavailable);
+            }
+            return Ok(TcConnection {
+                port,
+                tc,
+                mode,
+                legacy_port,
+                pin_assignment: PIN_ASSIGNMENT_NONE,
+                max_lanes: 4,
+            });
+        }
+        TcMode::Disconnected => return Err(TcError::TunnelUnavailable),
         TcMode::DpAlt | TcMode::Legacy => {}
     }
     enable_tcss_power(io, port, tc, true, mode)?;
@@ -441,12 +445,6 @@ fn connect_mode<M: MmioWindow + ?Sized>(
                 return Err(TcError::InsufficientLanes {
                     max: max_lanes,
                     required: required_lanes,
-                });
-            }
-            // Qualified profile: both PHY lanes must be display-owned.
-            if max_lanes != 4 {
-                return Err(TcError::PartialLaneOwnership {
-                    pin_assignment: pin,
                 });
             }
         }
@@ -501,6 +499,13 @@ pub fn connect<M: MmioWindow + ?Sized>(
 /// `xelpdp_tc_phy_disconnect` for a display-owned connection: release PHY
 /// ownership, then drop the TCSS power request and wait for it to settle.
 pub fn disconnect<M: MmioWindow + ?Sized>(io: &M, conn: &TcConnection) -> Result<(), TcError> {
+    if conn.mode == TcMode::TbtAlt {
+        return if io.display_access_ok() {
+            Ok(())
+        } else {
+            Err(TcError::AccessLost)
+        };
+    }
     take_ownership(io, conn.port, false)?;
     enable_tcss_power(io, conn.port, conn.tc, false, conn.mode)
 }
@@ -511,6 +516,9 @@ pub fn connection_intact<M: MmioWindow + ?Sized>(
     io: &M,
     conn: &TcConnection,
 ) -> Result<bool, TcError> {
+    if conn.mode == TcMode::TbtAlt {
+        return Ok(live_status_mask(io, conn.tc, conn.legacy_port)? & TcMode::TbtAlt.bit() != 0);
+    }
     Ok(phy_is_ready(io, conn.tc)?
         && phy_is_owned(io, conn.port)?
         && tcss_power_enabled(io, conn.port)?)

@@ -2588,6 +2588,9 @@ fn unsupported_external_for_bar(bar: &MmioRegion) -> bool {
             .is_some_and(|state| state.bar == bar.phys.raw())
 }
 pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
+    if !crate::intel_gpu_dp_bridge::sessions_stopped(bar.phys.raw()) {
+        return false;
+    }
     !unsupported_external_for_bar(bar)
         && DP_SESSION
             .lock()
@@ -2612,6 +2615,10 @@ pub(crate) fn external_routes_stopped(bar: &MmioRegion) -> bool {
 
 /// Retained MTL external scanout allocation: (BAR physical base, allocation).
 static MTL_SCANOUT: IrqSafeSpinLock<Option<(u64, ScanoutAllocation)>> = IrqSafeSpinLock::new(None);
+// MST secondary surfaces have separate GGTT and physical backing. The
+// boot-console publication remains the first stream, as with SST.
+static MTL_EXTRA_SCANOUTS: IrqSafeSpinLock<alloc::vec::Vec<(u64, u8, ScanoutAllocation)>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 /// Serial of the published MTL external image (0 = none published).
 static MTL_PUBLISHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The pipe (CRTC) scanning out the published MTL external image, as
@@ -2672,17 +2679,42 @@ fn mtl_external_pass<M: crate::intel_gpu_aux::MmioWindow + ?Sized>(
         return false;
     };
     before_event();
+    let mut next_scanout = 0u8;
     let mut alloc_fb = |mode: &crate::intel_gpu_modeset::Mode| {
+        let index = next_scanout;
+        next_scanout = next_scanout.checked_add(1)?;
         let width = u32::from(mode.h_active);
         let size = scanout_size_bytes(width, u32::from(mode.v_active));
-        let reuse = (*MTL_SCANOUT.lock())
-            .filter(|(owner, retained)| *owner == bar && retained.size_bytes >= size)
-            .map(|(_, retained)| retained);
+        let reuse = if index == 0 {
+            (*MTL_SCANOUT.lock())
+                .filter(|(owner, retained)| *owner == bar && retained.size_bytes >= size)
+                .map(|(_, retained)| retained)
+        } else {
+            MTL_EXTRA_SCANOUTS
+                .lock()
+                .iter()
+                .find(|(owner, slot, retained)| {
+                    *owner == bar && *slot == index && retained.size_bytes >= size
+                })
+                .map(|(_, _, retained)| *retained)
+        };
         let allocation = match reuse {
             Some(retained) => retained,
             None => {
                 let fresh = alloc(size)?;
-                *MTL_SCANOUT.lock() = Some((bar, fresh));
+                if index == 0 {
+                    *MTL_SCANOUT.lock() = Some((bar, fresh));
+                } else {
+                    let mut surfaces = MTL_EXTRA_SCANOUTS.lock();
+                    if let Some(entry) = surfaces
+                        .iter_mut()
+                        .find(|(owner, slot, _)| *owner == bar && *slot == index)
+                    {
+                        entry.2 = fresh;
+                    } else {
+                        surfaces.push((bar, index, fresh));
+                    }
+                }
                 fresh
             }
         };

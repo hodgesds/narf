@@ -186,6 +186,12 @@ pub trait DpAltModeGpuBridge: Send + Sync + fmt::Debug {
     /// a real DDI on this silicon, so the caller can log "connected
     /// to DDI X" vs "no DDI here".
     fn enter_dp_mode(&self, cfg: &DpLinkConfig) -> Result<(), DpBridgeError>;
+
+    /// Stop a session on detach. Default implementations have no retained
+    /// hardware; owners must retain resources if stop cannot be proved.
+    fn exit_dp_mode(&self, _connector: ConnectorId) -> Result<(), DpBridgeError> {
+        Ok(())
+    }
 }
 
 // ── Registry ───────────────────────────────────────────────────────
@@ -242,6 +248,19 @@ pub fn notify_dp_entered(cfg: &DpLinkConfig) -> Option<(&'static str, Result<(),
     None
 }
 
+/// Deliver detach with no registry lock held. Every bridge releases only
+/// its own retained session; one failure cannot hide another owner's exit.
+pub fn notify_dp_exited(connector: ConnectorId) -> Result<(), DpBridgeError> {
+    let bridges = BRIDGES.lock().clone();
+    let mut result = Ok(());
+    for bridge in bridges {
+        if let Err(error) = bridge.exit_dp_mode(connector) {
+            result = Err(error);
+        }
+    }
+    result
+}
+
 // ── Smoke tests ────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -282,6 +301,60 @@ pub(crate) mod tests {
             Ok(())
         }
     }
+
+    fn smoke_dp_exit_delivers_all_bridges_and_preserves_failure() -> TestResult {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Exit {
+            name: &'static str,
+            calls: Arc<AtomicUsize>,
+            fail: bool,
+        }
+        impl DpAltModeGpuBridge for Exit {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn enter_dp_mode(&self, _: &DpLinkConfig) -> Result<(), DpBridgeError> {
+                Ok(())
+            }
+            fn exit_dp_mode(&self, _: ConnectorId) -> Result<(), DpBridgeError> {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                // Snapshot access here would deadlock under a registry lock.
+                let _ = registered_bridges();
+                if self.fail {
+                    Err(DpBridgeError::ModesetFailed)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let saved = registered_bridges();
+        __test_reset_bridges();
+        let calls = Arc::new(AtomicUsize::new(0));
+        register_bridge(Arc::new(Exit {
+            name: "exit-fails",
+            calls: calls.clone(),
+            fail: true,
+        }));
+        register_bridge(Arc::new(Exit {
+            name: "exit-follows",
+            calls: calls.clone(),
+            fail: false,
+        }));
+        let result = notify_dp_exited(ConnectorId::from_index(0));
+        __test_reset_bridges();
+        for bridge in saved {
+            register_bridge(bridge);
+        }
+        if result != Err(DpBridgeError::ModesetFailed) || calls.load(Ordering::Acquire) != 2 {
+            return TestResult::Fail("exit failure must not hide another bridge's detach");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/usbpd/dp-gpu-bridge",
+        smoke_dp_exit_delivers_all_bridges_and_preserves_failure
+    );
 
     fn smoke_lanes_for_pin_table() -> TestResult {
         if lanes_for_pin(DpPinAssignment::A) != 4 {

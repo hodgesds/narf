@@ -80,6 +80,39 @@ epoch lease. Adopted native scanouts require their owner's live publication;
 boot GPU quarantine refuses copy targets. This does not grant a physical
 fbdev mmap of rebased generic scanouts.
 
+### Intel USB-C display transports
+
+Display-14 Meteor/Arrow Lake external sessions accept DP-alt pin D with
+two DP lanes while preserving USB's PHY lane 1. `PhyLaneConfig` separates
+physical ownership from the negotiated link width; PLL, TX, reset, powerdown
+and stop operations use that retained ownership. Native/legacy VBT lane
+reversal selects lane-1 maxPCLK and the reversed TX pair. DP-alt cable
+orientation remains a TCSS mux function and does not set board reversal.
+
+The same hotplug service accepts live Thunderbolt/USB4 DP-IN routes: PICA
+TBT HPD is required, AUX selects TBT IO, and the display uses the fabric
+clock without claiming or reprogramming C20. The existing USB4 connection
+manager or firmware provisions the tunnel; GPU connector indices never
+substitute for USB4 router/adapter identity.
+
+MST on that route uses the shared sideband manager, downstream EDID, PBN
+admission and independent Pipe B-D surfaces. A primary transcoder owns the
+link; secondary streams share its trained configuration and require fresh
+local ACT and sink ACT_HANDLED before enable. Topology changes rebuild the
+stream set, stopping secondaries before the primary. Failed stop retains
+the source and all backing. The boot-console publication selects the first
+stream; this does not create a multi-monitor compositor or a new DRM ABI.
+
+`intel_gpu_gen12_tc::DklPort` supplies source-qualified Tiger Lake and
+Alder Lake-P Dekel banked PLL/clock/TX operations. The Gen12 USB-PD bridge
+holds TC-cold/AUX/PHY ownership across a session and negotiates within the
+PD lane limit. Its detach hook proves pipe/link stop before releasing the
+scanout, pipe claim and power reference. Alder Lake-S/N are not admitted
+through the Dekel Type-C path. This bridge requires native TC connector
+numbering and exposes TC1..TC5 (TC1..TC4 on ADL-P); arbitrary UCSI numbering
+needs board routing data. These transports have native models; Intel silicon
+and dock interoperability remain separate acceptance work.
+
 ### Intel scanout takeover and restore
 
 `intel_gpu_modeset::Modeset::modeset_fixed` and
