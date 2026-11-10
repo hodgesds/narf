@@ -47,7 +47,7 @@ class NetworkCapture(unittest.TestCase):
         (self.sys / 'bus/pci/devices/0000:0e:00.0/driver').symlink_to(driver)
         (self.sys / 'class/net/eth0/device').symlink_to(
             self.sys / 'bus/pci/devices/0000:0e:00.0')
-        for tool in ('ethtool', 'ip', 'nmcli', 'journalctl', 'lspci'):
+        for tool in ('ethtool', 'ip', 'nmcli', 'journalctl', 'lspci', 'iw', 'genl'):
             path = self.tools / tool
             path.write_text('''#!/usr/bin/bash
 tool=${0##*/}
@@ -56,6 +56,12 @@ if [ "$tool" = ethtool ]; then
     case "$STUB_MODE:$*" in
         unsupported:*' -i '*) exit 95 ;;
         stuck:*' -S '*) trap '' TERM; exec /usr/bin/sleep 30 ;;
+    esac
+fi
+if [ "$tool" = iw ]; then
+    case "$STUB_MODE:$*" in
+        missing-wireless:*) exit 127 ;;
+        stuck-wireless:dev) trap '' TERM; exec /usr/bin/sleep 30 ;;
     esac
 fi
 printf 'fixture %s result\n' "$tool"
@@ -113,6 +119,43 @@ printf 'fixture %s result\n' "$tool"
         # sends KILL. Following read-only queries must still run.
         self.assertIn('query-exit: 137', output)
         self.assertIn('query: ethtool --disable-netlink -d eth0', output)
+        self.assertIn('fixture journalctl result', output)
+
+    def test_wireless_discovery_records_netlink_and_sysfs_identity(self):
+        for relative, value in {
+            'class/net/wlan0/ifindex': '3',
+            'class/net/wlan0/type': '1',
+            'class/net/wlan0/uevent': 'INTERFACE=wlan0\nIFINDEX=3\nDEVTYPE=wlan',
+            'class/ieee80211/phy0/index': '0',
+            'class/ieee80211/phy0/name': 'phy0',
+        }.items():
+            path = self.sys / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value + '\n')
+        phy = self.sys / 'class/ieee80211/phy0'
+        (self.sys / 'class/net/wlan0/phy80211').symlink_to(phy)
+        output = self.run_capture()
+        self.assertIn('DEVTYPE=wlan', output)
+        self.assertIn(f'phy80211: {phy}', output)
+        self.assertIn('phy-index: 0\nphy-name: phy0', output)
+        queries = self.log.read_text().splitlines()
+        for query in ('genl ctrl get name nl80211', 'iw dev', 'iw phy',
+                      'iw reg get', 'iw dev wlan0 info'):
+            self.assertEqual(queries.count(query), 1)
+        self.assertNotIn('iw dev eth0 info', queries)
+        self.assertNotIn('iw dev lo info', queries)
+
+    def test_missing_wireless_tool_does_not_stop_collection(self):
+        output = self.run_capture('missing-wireless')
+        self.assertIn('query-exit: 127', output)
+        self.assertIn('interface: eth0', output)
+        self.assertIn('fixture journalctl result', output)
+
+    def test_stuck_wireless_discovery_does_not_hide_later_evidence(self):
+        output = self.run_capture('stuck-wireless')
+        self.assertIn('query-exit: 137', output)
+        self.assertIn('query: iw phy', output)
+        self.assertIn('interface: eth0', output)
         self.assertIn('fixture journalctl result', output)
 
 
