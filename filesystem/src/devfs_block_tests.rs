@@ -706,6 +706,77 @@ kernel_test_in!(
     smoke_devfs_disk_by_uuid_symlink_roundtrip
 );
 
+/// udev publishes every alias with symlink(temp) + rename(temp, canonical),
+/// even when a partition-derived alias already exists at the destination.
+fn smoke_disk_alias_atomic_udev_publication() -> TestResult {
+    use crate::{DirOps, FileType};
+    use narf_block::registry::{
+        __restore_for_test, __snapshot_for_test, register_block_device_with_meta, PartitionMetadata,
+    };
+
+    let snapshot = __snapshot_for_test();
+    let canonical = "narf-udev-alias-test";
+    register_block_device_with_meta(
+        "vblk-udev-alias-test",
+        FakeBlockDevice::filled(4, 512, 0),
+        Some(PartitionMetadata {
+            gpt_type_guid: alloc::string::String::new(),
+            partlabel: canonical.into(),
+            partuuid: canonical.into(),
+            fs_uuid: canonical.into(),
+        }),
+    );
+    crate::devfs_block::__reset_disk_links_for_test();
+    let result = (|| {
+        for kind in ["by-label", "by-uuid", "by-partuuid", "by-id", "by-path"] {
+            let Some(dir) = crate::devfs_block::DevDiskDir.lookup_dir(kind) else {
+                return TestResult::Fail("disk alias directory missing");
+            };
+            // For the identity views this creates an existing overlay;
+            // the other views already have the generated partition alias.
+            let _ = poll_once(dir.symlink(canonical, "../../vblk-old"));
+            let stage = match poll_once(dir.symlink(".#udev-stage", "../../vblk-current")) {
+                Some(Ok(stage)) => stage,
+                _ => return TestResult::Fail("disk udev staging symlink failed"),
+            };
+            if !matches!(
+                poll_once(dir.rename(".#udev-stage", canonical)),
+                Some(Ok(()))
+            ) || dir.lookup(".#udev-stage").is_some()
+            {
+                return TestResult::Fail("disk alias staged rename failed");
+            }
+            let Some(fresh) = crate::devfs_block::DevDiskDir.lookup_dir(kind) else {
+                return TestResult::Fail("disk alias directory disappeared");
+            };
+            let Some(alias) = fresh.lookup(canonical) else {
+                return TestResult::Fail("published disk alias missing");
+            };
+            let mut target = [0; 64];
+            if alias.ino() != stage.ino()
+                || !matches!(poll_once(alias.read(0, &mut target)), Some(Ok(n))
+                    if &target[..n] == b"../../vblk-current")
+                || fresh
+                    .enumerate(0, usize::MAX)
+                    .iter()
+                    .filter(|(name, kind)| name == canonical && *kind == FileType::Symlink)
+                    .count()
+                    != 1
+            {
+                return TestResult::Fail("published disk alias lost inode, target, or uniqueness");
+            }
+        }
+        TestResult::Pass
+    })();
+    crate::devfs_block::__reset_disk_links_for_test();
+    __restore_for_test(snapshot);
+    result
+}
+kernel_test_in!(
+    "filesystem/devfs_alias",
+    smoke_disk_alias_atomic_udev_publication
+);
+
 // ── mount(2) block sources: registry names behind /dev/ paths ─────────
 
 fn smoke_block_source_name_resolves_dev_paths() -> TestResult {

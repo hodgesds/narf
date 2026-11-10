@@ -155,6 +155,16 @@ live entries, with duplicate names suppressed. Static names precede providers,
 then the block registry, then udev-created runtime nodes. Existing USB serial,
 video and RFCOMM installation wrappers adapt to this provider API.
 
+The existing `/dev/disk/by-*` and `/dev/input/by-*` writable symlink
+overlays support same-directory atomic rename, including replacement of an
+alias, so udev can publish a staged symlink. An overlay takes precedence over
+a generated alias of the same name and enumeration lists that name once.
+Protected static root paths cannot be replaced: renaming a staged symlink to
+a static symlink with the same destination only consumes the staged entry,
+preserving the static inode and target. `/dev/rtc0` ownership and permissions
+persist across lookups so authorized udev metadata updates survive closing
+the original fd; device identity and RTC operations remain fixed.
+
 `sysfs::register_provider(SysfsProvider)` registers a named boot population
 callback. `populate_all()` snapshots callbacks and invokes them without its
 lock. Providers support explicit refresh after probes and use the existing

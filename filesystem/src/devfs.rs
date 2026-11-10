@@ -1952,7 +1952,7 @@ fn dynamic_rmdir(nodes: &IrqSafeSpinLock<DynamicMap>, name: &str) -> Result<(), 
     }
 }
 
-fn dynamic_rename(
+pub(crate) fn dynamic_rename(
     nodes: &IrqSafeSpinLock<DynamicMap>,
     old_name: &str,
     new_name: &str,
@@ -2135,8 +2135,42 @@ impl DirOps for DevDir {
     }
 
     fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
-        if !valid_leaf_name(new_name) || static_entry_type(new_name).is_some() {
+        if !valid_leaf_name(new_name) {
             return Box::pin(async { Err(FsError::Busy) });
+        }
+        if static_entry_type(new_name).is_some() {
+            return Box::pin(async move {
+                // udev stages every alias and then renameat()s it, including
+                // /dev/rtc -> rtc0. Static paths remain protected: only an
+                // equivalent symlink is an idempotent success. Consume the
+                // staged link without replacing the static inode or target.
+                let entry = entries::find(new_name).ok_or(FsError::Busy)?;
+                if entry.file_type != FileType::Symlink {
+                    return Err(FsError::Busy);
+                }
+                let node = (entry.file)().ok_or(FsError::Busy)?;
+                let size = usize::try_from(node.stat().size).map_err(|_| FsError::Busy)?;
+                if size > 4096 {
+                    return Err(FsError::Busy);
+                }
+                let mut target = alloc::vec![0; size];
+                if node.read(0, &mut target).await? != size {
+                    return Err(FsError::Busy);
+                }
+                let target = core::str::from_utf8(&target).map_err(|_| FsError::Busy)?;
+                let mut entries = DYNAMIC_NODES.lock();
+                match entries.get(old_name) {
+                    Some(DynamicNode::Symlink { target: source, .. })
+                        if source == target
+                            || (!source.starts_with('/')
+                                && target.strip_prefix("/dev/") == Some(source.as_str())) =>
+                    {
+                        entries.remove(old_name);
+                        Ok(())
+                    }
+                    _ => Err(FsError::Busy),
+                }
+            });
         }
         let result = dynamic_rename(&DYNAMIC_NODES, old_name, new_name);
         Box::pin(async move { result })
@@ -2908,6 +2942,59 @@ fn smoke_dev_static_linux_metadata() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_static_linux_metadata);
+
+fn smoke_static_alias_udev_rename_preserves_protection() -> TestResult {
+    let dir = DevDir;
+    let staged = ".#narf-static-alias-stage";
+    let Some(original) = dir.lookup("rtc") else {
+        return TestResult::Fail("static RTC alias missing");
+    };
+    let result = (|| {
+        for target in ["rtc0", "/dev/rtc0"] {
+            if !matches!(poll_once_devfs(dir.symlink(staged, target)), Some(Ok(_)))
+                || !matches!(poll_once_devfs(dir.rename(staged, "rtc")), Some(Ok(())))
+                || dir.lookup(staged).is_some()
+            {
+                return TestResult::Fail("equivalent RTC alias could not be published by udev");
+            }
+        }
+        let Some(current) = dir.lookup("rtc") else {
+            return TestResult::Fail("idempotent rename removed the static RTC alias");
+        };
+        let mut target = [0; 32];
+        if current.ino() != original.ino()
+            || !matches!(poll_once_devfs(current.read(0, &mut target)), Some(Ok(n))
+                if &target[..n] == b"/dev/rtc0")
+        {
+            return TestResult::Fail("idempotent rename replaced the static RTC inode or target");
+        }
+        for (target, name) in [
+            ("zero", "rtc"),
+            ("zero", "null"),
+            ("/dev//proc/self/fd", "fd"),
+            ("/dev/proc/self/fd", "fd"),
+            ("/dev//rtc0", "rtc"),
+        ] {
+            if !matches!(poll_once_devfs(dir.symlink(staged, target)), Some(Ok(_)))
+                || !matches!(
+                    poll_once_devfs(dir.rename(staged, name)),
+                    Some(Err(FsError::Busy))
+                )
+                || dir.lookup(staged).is_none()
+            {
+                return TestResult::Fail("unrelated static target consumed the staged symlink");
+            }
+            let _ = poll_once_devfs(dir.unlink(staged));
+        }
+        TestResult::Pass
+    })();
+    let _ = poll_once_devfs(dir.unlink(staged));
+    result
+}
+kernel_test_in!(
+    "filesystem/devfs_alias",
+    smoke_static_alias_udev_rename_preserves_protection
+);
 
 /// Readdir must agree with lookup and must not advertise optional hardware
 /// nodes until their driver has actually registered a backing object.
