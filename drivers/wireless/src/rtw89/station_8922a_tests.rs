@@ -1,7 +1,7 @@
 use super::chip_8922a;
 use super::efuse_be::BeFactory;
 use super::eht::EhtStation;
-use super::ppe_tests::IES_E1_EHT_PPE_NSS2;
+use super::ppe_tests::{IES_E1_EHT_PPE_NSS2, IES_H1_HE_PPE_NSS1};
 use super::ra_mask::{HeCaps, HtCaps, VhtCaps};
 use super::station_8922a::*;
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -324,7 +324,7 @@ kernel_test_in!(
 
 // ── Legacy-mode admission fixtures ─────────────────────────────────────
 
-fn legacy_req() -> Request {
+fn legacy_req() -> Request<'static> {
     Request {
         peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB],
         band: Band::Ghz2,
@@ -337,7 +337,7 @@ fn legacy_req() -> Request {
         station_mode: true,
         eht_support: false,
         punctured: 0,
-        pads: [0; 5],
+        peer_ies: &[],
         has_he: false,
         mgq_rpt_en: false,
         p2p: false,
@@ -589,7 +589,7 @@ fn smoke_rtw89_8922a_admit_legacy_he() -> TestResult {
         primary: 36,
         aid: 9,
         has_he: true,
-        pads: [1, 2, 0, 0, 0],
+        peer_ies: IES_H1_HE_PPE_NSS1,
         ..legacy_req()
     };
     let st = match admit_legacy(&f, &caps, &mut pool, &req) {
@@ -599,16 +599,16 @@ fn smoke_rtw89_8922a_admit_legacy_he() -> TestResult {
     if st.macid != 0 || st.mode() != LegacyMode::He || st.width_mhz != 80 {
         return TestResult::Fail("admitted HE station record mismatch");
     }
-    // Assoc golden, HE arm: OFDM6 lowest rate; caller
-    // pads [1, 2] packed into w5; HE peer => BSR bit (w8 2);
-    // AID 9 + station mode.
+    // Assoc golden, HE arm: OFDM6 lowest rate; peer IE pads
+    // [2, 1, 0, 2, 1] packed into w5 (0x186); HE peer => BSR bit
+    // (w8 2); AID 9 + station mode.
     let a = &st.assoc_cctl;
     if a.c0 != 0x80
         || a.w[1] != 0x4000_0000
         || a.m[1] != 0xF000_0000
         || a.w[4] != 0
         || a.m[4] != 0x7
-        || a.w[5] != 0x9
+        || a.w[5] != 0x186
         || a.m[5] != 0x3FF
         || a.w[6] != 0x8000_0009
         || a.m[6] != 0x8000_0FFF
@@ -639,7 +639,7 @@ fn smoke_rtw89_8922a_admit_legacy_refusals() -> TestResult {
     let mut pool = MacIdPool::new();
     let req = legacy_req();
     let caps = legacy_caps();
-    let cases: [(Request, LegacyCaps, Error); 11] = [
+    let cases: [(Request, LegacyCaps, Error); 10] = [
         (
             Request {
                 band: Band::Ghz6,
@@ -685,14 +685,6 @@ fn smoke_rtw89_8922a_admit_legacy_refusals() -> TestResult {
         (Request { primary: 0, ..req }, caps, Error::BadPrimary),
         (Request { aid: 0x1000, ..req }, caps, Error::AidOutOfRange),
         (Request { port: 8, ..req }, caps, Error::PortOutOfRange),
-        (
-            Request {
-                pads: [4, 0, 0, 0, 0],
-                ..req
-            },
-            caps,
-            Error::PadsOutOfRange,
-        ),
     ];
     for (case_req, case_caps, want) in cases.iter() {
         match admit_legacy(&f, case_caps, &mut pool, case_req) {

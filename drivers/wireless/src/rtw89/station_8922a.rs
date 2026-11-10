@@ -558,8 +558,8 @@ impl LegacyStation {
 /// `req.punctured` is not consumed (Linux reads the
 /// puncturing bitmap only when EHT is supported).
 /// `req.has_he` must agree with the facet's HE caps — the
-/// caller supplies both, as with the PPE pads — and drives
-/// the assoc table's BSR format bit.
+/// caller supplies both — and drives the assoc table's BSR
+/// format bit. PPE pads are parsed from `req.peer_ies`.
 pub(super) fn admit_legacy(
     factory: &BeFactory,
     caps: &LegacyCaps,
@@ -590,9 +590,7 @@ pub(super) fn admit_legacy(
     if req.port > 7 {
         return Err(Error::PortOutOfRange);
     }
-    if req.pads.iter().any(|p| *p > 3) {
-        return Err(Error::PadsOutOfRange);
-    }
+    let pads = ppe::parse_assoc_ppe(req.peer_ies, req.nss);
     let macid = pool.alloc()?;
     let default_cctl = cctl_g7::build_default(macid as u32, req.mgq_rpt_en).map_err(Error::Cctl)?;
     let assoc_cctl = cctl_g7::build_assoc(
@@ -603,7 +601,7 @@ pub(super) fn admit_legacy(
         req.ap_mode,
         false,
         0,
-        req.pads,
+        pads,
         req.aid,
         req.station_mode,
         req.has_he,

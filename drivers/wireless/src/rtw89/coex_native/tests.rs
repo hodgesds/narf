@@ -362,7 +362,8 @@ fn smoke_rtw8851b_wlan_only_coex_init_follows_rtw8851b_btc_init_cfg() -> TestRes
         }
     }
     // The rfe 0 layout never touches the device.
-    for rfe in [0u8] {
+    {
+        let rfe = 0u8;
         let mut io = Model::new(0);
         let mut owner = Coex::default();
         // SAFETY: same inert model.

@@ -533,6 +533,7 @@ fn smoke_rtw89_be_factory_power_trim() -> TestResult {
         phycap,
         cv: None,
         thermal_k: None,
+        secure: SecureInfo::disabled(),
     };
     let mut cap = [0u8; chip_8922a::PHYCAP_SIZE];
     // Thermal: path A 0x45 = +5 (BIT(6) set); path B 0x03 = -3.
