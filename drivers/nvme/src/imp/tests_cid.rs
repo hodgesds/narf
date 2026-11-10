@@ -316,3 +316,91 @@ fn smoke_nvme_cid_io_stray_dropped() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_cid_io_stray_dropped);
+
+/// One CQ slot as the two little-endian qwords of base spec §4.6:
+/// qword 0 = DW0 (command specific) + DW1 (reserved), qword 1 = SQ head
+/// (bytes 8..9), SQ id (10..11, here 1), CID (12..13), status + phase tag
+/// (14..15).
+fn cqe_words(cmd_specific: u32, sq_head: u16, cid: u16, status: u16) -> [u64; 2] {
+    [
+        cmd_specific as u64,
+        sq_head as u64 | (1 << 16) | ((cid as u64) << 32) | ((status as u64) << 48),
+    ]
+}
+
+fn smoke_nvme_cqe_sample_never_mixes_occupants() -> TestResult {
+    // A slot of a wrapped CQ still holds its previous occupant — an older
+    // command's CID under the old phase tag — when the controller posts the
+    // awaited completion into it, and the host may be reading the slot at
+    // that moment. Model the controller posting the WHOLE new entry after
+    // each possible number of host loads. Whatever the interleaving, a
+    // sample whose phase tag is fresh must be the new entry in full: with
+    // the old occupant's CID under the fresh tag the waiter drops its own
+    // completion as a stray and times out on a command that completed.
+    const OLD_CID: u16 = 0x52BC;
+    const NEW_CID: u16 = 0x52C0;
+    const OLD_RESULT: u32 = 0x0BAD_0BAD;
+    let old = cqe_words(OLD_RESULT, 1, OLD_CID, 0); // stale phase tag 0
+    let new = cqe_words(OWN_SENTINEL, 1, NEW_CID, 1); // fresh phase tag 1
+
+    for post_after in 0..=2usize {
+        let slot = core::cell::Cell::new(old);
+        let loads = core::cell::Cell::new(0usize);
+        let cqe = Cqe::sample(|word| {
+            if loads.get() == post_after {
+                slot.set(new);
+            }
+            loads.set(loads.get() + 1);
+            slot.get()[word]
+        });
+        if loads.get() != 2 {
+            return TestResult::Fail("a CQE sample is not exactly two qword loads");
+        }
+        if cqe.status & 1 != 1 {
+            // Not a completion yet: the waiter polls again.
+            if post_after == 0 {
+                return TestResult::Fail("an entry posted before the sample read as stale");
+            }
+            continue;
+        }
+        if cqe.cid != NEW_CID {
+            return TestResult::Fail("fresh phase tag sampled with the previous occupant's CID");
+        }
+        if cqe.cmd_specific != OWN_SENTINEL || cqe.sq_head != 1 || cqe.sq_id != 1 {
+            return TestResult::Fail("fresh phase tag sampled with stale result fields");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_cqe_sample_never_mixes_occupants);
+
+fn smoke_nvme_peek_cqe_decodes_spec_layout() -> TestResult {
+    // `peek_cqe` over real memory: bytes laid out from base spec §4.6 must
+    // decode to the same fields, at a non-zero slot index.
+    let Ok(page) = alloc_coherent(4096, DomainId::DRIVER_0) else {
+        return TestResult::Fail("alloc_coherent failed");
+    };
+    let bytes: [u8; 16] = [
+        0x19, 0x16, 0xD0, 0xC1, // DW0: command specific
+        0, 0, 0, 0, // DW1: reserved
+        0x03, 0x00, // SQ head pointer
+        0x01, 0x00, // SQ identifier
+        0xC0, 0x52, // command identifier
+        0x05, 0x00, // phase tag 1 + status field 2
+    ];
+    // SAFETY: slot 2 (bytes 32..48) of a live 4 KiB coherent page.
+    let cqe = unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.cpu_mut_ptr::<u8>().add(32), 16);
+        super::peek_cqe(&page, 2)
+    };
+    if cqe.cmd_specific != OWN_SENTINEL
+        || cqe.sq_head != 3
+        || cqe.sq_id != 1
+        || cqe.cid != 0x52C0
+        || cqe.status != 5
+    {
+        return TestResult::Fail("peek_cqe decoded a field from the wrong bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_peek_cqe_decodes_spec_layout);

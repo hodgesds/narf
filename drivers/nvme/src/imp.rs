@@ -327,6 +327,38 @@ impl Cqe {
     fn is_for(&self, cid: u16) -> bool {
         self.cid == cid
     }
+
+    /// Sample a CQ slot the controller may be posting into right now.
+    /// `word(i)` reads little-endian qword `i` of the 16-byte entry.
+    ///
+    /// The controller posts a completion while the host polls the slot, so
+    /// the sample must never pair the new phase tag with fields of the
+    /// slot's previous occupant. Qword 1 carries SQ head, SQ id, CID and
+    /// status + phase tag: it is taken first and as ONE load, so a fresh
+    /// phase tag always comes with the CID posted with it. Qword 0 (the
+    /// command-specific result) is taken afterwards, when a fresh phase tag
+    /// already seen means the whole entry is in place (Linux
+    /// `nvme_cqe_pending` then `nvme_handle_cqe`: status first, the rest
+    /// after).
+    ///
+    /// A field-by-field read of the entry loaded `cid` before `status`. A
+    /// completion posted between the two loads then showed the previous
+    /// occupant's CID under the new phase tag: the waiter took its own
+    /// completion for a stray, consumed and dropped it, and timed out on a
+    /// command that had completed.
+    #[inline]
+    fn sample(mut word: impl FnMut(usize) -> u64) -> Self {
+        let hi = word(1);
+        let lo = word(0);
+        Self {
+            cmd_specific: lo as u32,
+            _resv: (lo >> 32) as u32,
+            sq_head: hi as u16,
+            sq_id: (hi >> 16) as u16,
+            cid: (hi >> 32) as u16,
+            status: (hi >> 48) as u16,
+        }
+    }
 }
 
 // ── Controller ──────────────────────────────────────────────────────
@@ -3758,14 +3790,20 @@ unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
 
 /// Read the CQ entry at `index` without polling. Used by the
 /// MSI-X-driven path which tracks completion via fire_count instead.
+/// The entry is sampled phase-tag-first ([`Cqe::sample`]); the caller
+/// still decides from the phase tag whether it is a fresh completion.
 ///
 /// # Safety
 /// `buf` must be a live coherent DMA buffer sized for at least
 /// `index + 1` 16-byte CQEs.
 unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
-    let base = buf.cpu_ptr::<Cqe>();
-    // SAFETY: caller guarantees buf is page-aligned and large enough.
-    unsafe { core::ptr::read_volatile(base.add(index as usize)) }
+    // Two qwords per 16-byte entry; the buffer is page-aligned.
+    let base = buf.cpu_ptr::<u64>();
+    Cqe::sample(|word| {
+        // SAFETY: caller guarantees buf is page-aligned and large enough;
+        // `word` is 0 or 1, inside entry `index`.
+        u64::from_le(unsafe { core::ptr::read_volatile(base.add(index as usize * 2 + word)) })
+    })
 }
 
 /// Ranges per Dataset Management command: CDW10's Number of Ranges
@@ -3801,7 +3839,6 @@ unsafe fn wait_cqe_ms(
     expected_phase: u16,
     timeout_ms: u64,
 ) -> Result<Cqe, NvmeError> {
-    let base = buf.cpu_ptr::<Cqe>();
     // responsive_spin_until keeps cursor/FB/serial alive on a slow
     // or stuck controller. 5 s wall-clock budget — NVMe admin
     // commands (IDENTIFY etc.) are sub-millisecond on real hardware;
@@ -3810,8 +3847,7 @@ unsafe fn wait_cqe_ms(
         || {
             // SAFETY: caller guarantees buf is page-aligned and large
             // enough; index is bounded.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let cqe = unsafe { core::ptr::read_volatile(base.add(index as usize)) };
+            let cqe = unsafe { peek_cqe(buf, index) };
             (cqe.status & 1) == (expected_phase & 1)
         },
         narf_time::Deadline::after_ms(timeout_ms),
@@ -3819,9 +3855,9 @@ unsafe fn wait_cqe_ms(
     if !done {
         return Err(NvmeError::CompletionTimeout);
     }
+    // The phase tag was seen fresh above, so the entry is complete.
     // SAFETY: caller guarantees buf is page-aligned and large enough.
-    let cqe = unsafe { core::ptr::read_volatile(base.add(index as usize)) };
-    Ok(cqe)
+    Ok(unsafe { peek_cqe(buf, index) })
 }
 
 /// Pull our subset of fields out of the IDENTIFY CONTROLLER page.
