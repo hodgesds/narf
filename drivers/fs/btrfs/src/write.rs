@@ -6,10 +6,10 @@
 //! root-to-leaf paths, so a commit's cost follows what the transaction
 //! changed; only the root tree (a handful of blocks) is whole-repacked. Every
 //! tree may be multi-level. The extent, block-group and free-space trees
-//! record their own new blocks, so [`commit_txn`] resolves the
-//! mutually-dependent block sets with a fixed point, re-handing out addresses
-//! from the same base until the block set stabilises (bounded; a commit that
-//! does not settle fails without writing a superblock).
+//! record their own new blocks, so [`commit_txn`] keeps their path COWs open
+//! and records, pass after pass, the blocks the previous pass allocated and
+//! replaced until none are left — Linux's delayed refs (bounded; a commit
+//! that exceeds the bound fails without writing a superblock).
 //!
 //! The metadata a commit needs is reserved before each operation is accepted
 //! ([`reserve`]): an operation whose reservation does not fit is refused
@@ -1230,7 +1230,7 @@ fn fs_commit_from(out: CowOut, gen: u64, csum_type: u16) -> Result<FsCommit, FsE
 /// How many operations accumulate into one on-disk transaction.
 ///
 /// Every operation used to be its own transaction, which meant every single
-/// `create`/`unlink`/`write` paid a full commit: the extent-tree fixed point,
+/// `create`/`unlink`/`write` paid a full commit: recording its blocks,
 /// then a writeout of the whole extent + csum + root + free-space set. Those
 /// costs are per *transaction*, not per operation, so batching amortises them.
 ///
@@ -1852,23 +1852,25 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
 }
 
 /// Fail closed unless `key` is absent from the committed extent tree at
-/// `ext_root`. The fixed point "touches" a leaf by deleting a METADATA_ITEM
-/// key it believes absent (a block an earlier round allocated from free
-/// space); if the allocator ever handed out an address that still has a
-/// committed extent item, that delete would drop a live block's record, so
-/// the commit fails (and the filesystem aborts read-only) instead.
-pub(crate) async fn touch_key_absent<B: BlockDevice + 'static>(
+/// `ext_root`. A commit records each block it allocated by inserting the
+/// block's METADATA_ITEM key, and deletes that key again if the block is
+/// dropped before the commit ends; the block came from free space, so the
+/// key must not exist. If the allocator ever handed out an address that
+/// still has a committed extent item, the insert would replace a live
+/// block's record and the delete would drop it, so the commit fails (and the
+/// filesystem aborts read-only) instead.
+pub(crate) async fn extent_key_absent<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ext_root: u64,
     key: &BtrfsKey,
 ) -> Result<(), FsError> {
-    match btree::find_item(vol, ext_root, key).await? {
-        None => Ok(()),
-        Some(_) => {
+    match btree::contains_key(vol, ext_root, key).await? {
+        false => Ok(()),
+        true => {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "btrfs: commit would delete the live extent record {key:?}; refusing"
+                "btrfs: commit would replace the live extent record {key:?}; refusing"
             );
             Err(FsError::InvalidData)
         }
@@ -2747,17 +2749,20 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
     }
 
     /// [`Self::new`] for a tree whose items come and go all over its key
-    /// space (the free-space tree), which plain path COW would leave ever
-    /// sparser: a leaf only ever split full-then-remainder, and never
-    /// rejoined once deletions thinned it. With this, an overflowing leaf is
-    /// split evenly, and a committed leaf that is under a third full when an
-    /// edit reaches it takes in its right sibling when the two fit in three
-    /// quarters of a leaf (Linux pushes and merges on delete,
-    /// `btrfs_del_items`).
+    /// space (the extent and free-space trees), which plain path COW would
+    /// leave ever sparser: a leaf only ever split full-then-remainder, and
+    /// never rejoined once deletions thinned it. With this, a leaf that
+    /// overflows is split evenly — unless everything added sorts after what
+    /// it held, which leaves it full and starts the next (Linux
+    /// `push_leaf_left` before `split_leaf`) — and a committed leaf that is
+    /// under a third full when an edit reaches it takes in its right sibling
+    /// when the two fit in three quarters of a leaf (Linux pushes and merges
+    /// on delete, `btrfs_del_items`).
     ///
-    /// The merge is decided from the *committed* leaves alone, never from
-    /// the edited contents, so in the commit's fixed point it is a function
-    /// of which leaves a round touches, like everything else there.
+    /// Density is what keeps a commit small. Every block a commit replaces
+    /// has an extent item to delete and free space to return, in leaves the
+    /// commit must then replace too; the sparser those trees, the more
+    /// leaves that reaches.
     pub(crate) async fn new_compacting(
         vol: &'a BtrfsVolume<B>,
         gen: u64,
@@ -3155,8 +3160,18 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                     }
                 }
             }
+            let appends = items.last().is_none_or(|(last, _)| {
+                group.iter().all(|edit| match edit {
+                    Edit::Upsert(key, _) => key > last,
+                    Edit::Delete(_) => true,
+                })
+            });
             let items = leaf_apply_edits(items, group);
-            regroup_leaves_even(&leaf, &items, self.nodesize)?
+            if appends {
+                regroup_leaves(&leaf, &items, self.nodesize)?
+            } else {
+                regroup_leaves_even(&leaf, &items, self.nodesize)?
+            }
         } else {
             cow_leaf_apply(&leaf, group, self.nodesize)?
         };
@@ -3224,8 +3239,26 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         Ok(taken)
     }
 
+    /// Every block this COW has made so far, `(addr, level)`.
+    fn new_blocks(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
+        self.state
+            .pending
+            .iter()
+            .map(|(&addr, &(_, level))| (addr, level))
+    }
+
+    /// Every committed block this COW has replaced so far, `(addr, level)`.
+    fn freed(&self) -> &[(u64, u8)] {
+        &self.state.freed
+    }
+
+    /// Finalize: the new root, the new blocks and the committed blocks freed.
+    fn finish(self) -> CowOut {
+        self.state.into_cow_out()
+    }
+
     /// Apply all `edits`, then finalize: returns the new root + the new/freed
-    /// blocks. `alloc` allocates every new node (before the metadata fixed point).
+    /// blocks. `alloc` allocates every new node.
     pub(crate) async fn apply(
         mut self,
         alloc: &mut Allocator,
@@ -3953,71 +3986,6 @@ fn bg_of(bgs: &[(u64, u64, Vec<u8>)], addr: u64) -> Option<(u64, u64)> {
     bgs.iter()
         .find(|&&(s, l, _)| addr >= s && addr < s + l)
         .map(|&(s, l, _)| (s, l))
-}
-
-/// The extent-tree edits for a commit: a `METADATA_ITEM` per new/freed block, an
-/// `EXTENT_ITEM` per new/freed data extent, and a `BLOCK_GROUP_ITEM` re-write for
-/// each group whose `used` changed. All are keyed `Upsert`/`Delete`s the path-COW
-/// engine can apply.
-fn build_ext_edits(
-    new_meta: &[(u64, u64, u8)],
-    freed_meta: &[(u64, u8)],
-    meta: &MetaChanges,
-    data: &DataChanges,
-    bgs: &[(u64, u64, Vec<u8>)],
-    gen: u64,
-    nodesize: i64,
-) -> Result<Vec<Edit>, FsError> {
-    let mut edits = Vec::new();
-    for &(addr, owner, lvl) in new_meta {
-        edits.push(Edit::Upsert(
-            BtrfsKey::new(addr, format::METADATA_ITEM_KEY, u64::from(lvl)),
-            ext_item_meta(gen, owner),
-        ));
-    }
-    for &(addr, lvl) in freed_meta {
-        edits.push(Edit::Delete(BtrfsKey::new(
-            addr,
-            format::METADATA_ITEM_KEY,
-            u64::from(lvl),
-        )));
-    }
-    edits.extend(meta.edits.iter().cloned());
-    edits.extend(data.edits.iter().cloned());
-    for (start, len, body) in bgs {
-        let (s, e) = (*start, start + len);
-        let mut net = 0i64;
-        for &(a, _, _) in new_meta {
-            if a >= s && a < e {
-                net += nodesize;
-            }
-        }
-        for &(a, _) in freed_meta {
-            if a >= s && a < e {
-                net -= nodesize;
-            }
-        }
-        for &(b, l) in &data.allocated {
-            if b >= s && b < e {
-                net += l as i64;
-            }
-        }
-        for &(b, l) in &data.released {
-            if b >= s && b < e {
-                net -= l as i64;
-            }
-        }
-        if net != 0 {
-            let mut nb = body.clone();
-            let used = (le64(&nb, 0)? as i64 + net) as u64;
-            nb[0..8].copy_from_slice(&used.to_le_bytes());
-            edits.push(Edit::Upsert(
-                BtrfsKey::new(*start, format::BLOCK_GROUP_ITEM_KEY, *len),
-                nb,
-            ));
-        }
-    }
-    Ok(edits)
 }
 
 /// Route `BLOCK_GROUP_ITEM` edits to the tree that holds block groups:
@@ -5490,18 +5458,17 @@ pub(crate) async fn quota_status<B: BlockDevice + 'static>(
 
 /// Finalize a mutation. The fs tree arrives prebuilt (path-COW for ordinary
 /// file/namespace mutations; selected subvolume operations may repack it). The
-/// **extent tree is path-COWed** — only paths containing changed block/data
-/// records are rewritten — while the csum, root and free-space trees are still
-/// whole-repacked (they stay small).
+/// csum, extent, block-group and free-space trees are path-COWed — only paths
+/// containing changed records are rewritten — and the root tree is
+/// whole-repacked (it stays small).
 ///
-/// The extent tree records its own new blocks, so how many blocks it (and the
-/// other trees) produce depends on that record — a mutual recursion (btrfs's
-/// delayed refs). `commit_txn` resolves it with a **fixed point**: it re-hands-out
-/// every address from the same base each round (`Allocator::restore`), path-COWs
-/// the extent tree and whole-repacks the rest, and repeats until the extent tree's
-/// block set and the free-space leaf count stop changing. Only the converged
-/// round is written. Fixed set of block groups (no chunk allocation here — the
-/// caller grows and retries on `NoSpace`).
+/// The extent, block-group and free-space trees record their own new blocks,
+/// so how many blocks they produce depends on that record — a mutual
+/// recursion (btrfs's delayed refs). `commit_txn` resolves it as Linux does:
+/// the three path COWs stay open, and each pass records the blocks the
+/// previous one allocated and replaced, until a pass leaves none. Nothing is
+/// written before that. Fixed set of block groups (no chunk allocation here —
+/// the caller grows and retries on `NoSpace`).
 /// A boxed future: keeps the large commit/flush state machines off the
 /// polling task's stack.
 ///
@@ -5515,13 +5482,11 @@ pub(crate) async fn quota_status<B: BlockDevice + 'static>(
 pub(crate) type BoxFut<'a, T> =
     core::pin::Pin<Box<dyn core::future::Future<Output = Result<T, FsError>> + Send + 'a>>;
 
-/// Where the running commit is (`COMMIT_PHASE`) and which fixed-point round
-/// it reached (`COMMIT_ROUND`), for the log line a failed commit prints.
+/// Where the running commit is (`COMMIT_PHASE`) and which pass of recording
+/// its blocks it reached (`COMMIT_ROUND`), for the log line a failed commit
+/// prints.
 static COMMIT_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static COMMIT_ROUND: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Which parts of the last fixed-point round differed from the round before
-/// (bits: extent new/freed/root, block-group new/freed/root, FST leaves).
-static COMMIT_UNSETTLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn commit_phase(phase: u32) {
     COMMIT_PHASE.store(phase, core::sync::atomic::Ordering::Relaxed);
@@ -5574,18 +5539,17 @@ fn commit_txn<'a, B: BlockDevice + 'static>(
                 .store(0, core::sync::atomic::Ordering::Relaxed);
             let phase = match COMMIT_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
                 1 => "resolving references",
-                2 => "fixed point: csum tree",
-                3 => "fixed point: root/free-space blocks",
-                4 => "fixed point: extent/block-group trees",
-                5 => "fixed point did not converge",
+                2 => "csum tree",
+                3 => "recording blocks: free-space tree",
+                4 => "recording blocks: extent/block-group trees",
+                5 => "recording blocks: too many passes",
                 6 => "writing",
                 _ => "?",
             };
             let _ = writeln!(
                 narf_console::Writer,
-                "btrfs: commit of generation {gen} failed ({error:?}) at {phase}, round {} (unsettled {:#x})",
-                COMMIT_ROUND.load(core::sync::atomic::Ordering::Relaxed),
-                COMMIT_UNSETTLED.load(core::sync::atomic::Ordering::Relaxed)
+                "btrfs: commit of generation {gen} failed ({error:?}) at {phase}, pass {}",
+                COMMIT_ROUND.load(core::sync::atomic::Ordering::Relaxed)
             );
         }
         result
@@ -5810,398 +5774,332 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     }
     let root_groups = group_items(vol, &root_logical)?;
     let root_nc = tree_block_count(root_groups.len(), ns);
-    let base = alloc.snapshot();
+    // ── Record the transaction's blocks in the extent, block-group and ────
+    // ── free-space trees ──────────────────────────────────────────────────
+    //
+    // Every new metadata block needs a METADATA_ITEM, leaves free space and
+    // counts toward its block group's `used`; every committed block the
+    // transaction replaces loses its item, returns to free space and comes
+    // off `used`. Recording that path-COWs the three trees, and the blocks
+    // those COWs allocate and replace need recording in turn.
+    //
+    // Linux queues each allocation and free as a delayed ref and runs the
+    // queue until it is empty (`btrfs_run_delayed_refs`, looped from
+    // `commit_cowonly_roots`). So does this: the three path COWs stay open,
+    // and each pass records exactly the blocks no earlier pass recorded —
+    // into leaves that, once COWed, are edited in place and allocate nothing
+    // more. A committed block is replaced at most once and the allocator
+    // never hands an address out twice, so every pass has strictly less left
+    // to do than the tree it works on, and the loop ends when a pass leaves
+    // nothing unrecorded.
+    //
+    // (It used to be a fixed point instead: every round restored the
+    // allocator and recomputed all three trees from the committed ones,
+    // until two rounds agreed. One more block in an early tree then moved
+    // every later allocation of the round, whose records fell into other
+    // leaves, which changed the block counts again; on a filesystem with
+    // hundreds of block groups and three-level trees that did not settle
+    // within its 64 rounds, and the commit — with every operation batched
+    // into it — was lost.)
+    //
+    // What the trees end up holding is still a function of the final block
+    // lists alone: the free-space items are recomputed from the committed
+    // ones each pass (`FstWindow::edit`) and only the difference from the
+    // previous pass is applied, an extent item is keyed by its block, and a
+    // group's `used` is its committed value plus the net of the lists.
+    commit_phase(2);
+    let csum_out = match old_csum {
+        Some((root, level)) => Some(
+            PathCow::new(vol, gen, root, level)
+                .await?
+                .apply(&mut alloc, &csum_edits)
+                .await?,
+        ),
+        None => None,
+    };
+    commit_phase(3);
+    let root_addrs = alloc_nodes(&mut alloc, vol, root_nc)?;
 
-    // ── Mutual fixed point: whole-repack root, path-COW csum/fst/ext/bgt ─
-    #[allow(clippy::type_complexity)]
-    struct Done {
-        /// The converged round's freed set, so the pin below covers exactly
-        /// what this transaction actually released.
-        freed_meta: Vec<(u64, u8)>,
-        /// The converged round's new metadata blocks, for the in-memory
-        /// free-space view.
-        new_meta: Vec<u64>,
-        csum_nodes: Vec<(u64, Vec<u8>, u8)>,
-        root_addrs: Vec<u64>,
-        /// The free-space tree's path COW, when the filesystem has one.
-        fst: Option<CowOut>,
-        csum_root: (u64, u8),
-        ext_nodes: Vec<(u64, Vec<u8>, u8)>,
-        ext_root: u64,
-        ext_level: u8,
-        /// The block-group tree's path COW, when the filesystem has one.
-        bgt: Option<CowOut>,
-    }
-    let mut done: Option<Done> = None;
-    let mut prev_ext_new: Vec<(u64, u8)> = Vec::new();
-    let mut prev_ext_freed: Vec<(u64, u8)> = Vec::new();
-    let mut prev_ext_root = 0u64;
-    // The block-group tree is self-referential through the extent tree the
-    // same way the extent tree is through itself: its new blocks need
-    // METADATA_ITEMs and change their block group's `used`, which edits the
-    // block-group tree again. Linux settles this with delayed refs; here the
-    // previous round's blocks feed the next round until both trees are stable.
-    let mut prev_bgt_new: Vec<(u64, u8)> = Vec::new();
-    let mut prev_bgt_freed: Vec<(u64, u8)> = Vec::new();
-    let mut prev_bgt_root = 0u64;
-    // And so is the free-space tree: its new blocks leave free space and the
-    // blocks it replaces return to it, which edits the tree again. Linux runs
-    // these updates from the delayed refs (`alloc_reserved_extent`,
-    // `do_free_extent_accounting`) and loops until none are left
-    // (`btrfs_run_delayed_refs` under `commit_cowonly_roots`).
-    let mut prev_fst_new: Vec<(u64, u8)> = Vec::new();
-    let mut prev_fst_freed: Vec<(u64, u8)> = Vec::new();
-    let mut prev_fst_root = 0u64;
-    // Committed free-space-tree items fetched so far; the committed tree
-    // does not change while the commit computes, so rounds share them.
-    let mut fst_window = free_space::FstWindow::default();
-
-    // A split extent tree can require more than a dozen rounds: recording the
-    // prior round's new extent-tree nodes may COW additional paths, whose nodes
-    // must themselves be recorded in the following round. The sequence is
-    // bounded and monotonic on supported trees, but the 12-round historical cap
-    // cut off a real 14-round convergence during the NVMe late-init smoke.
-    const MAX_FIXED_POINT_ROUNDS: usize = 64;
-    const MONOTONE_AFTER_ROUND: usize = 8;
-    // Block groups whose BLOCK_GROUP_ITEM any round has rewritten.
-    let mut bg_touched: BTreeSet<u64> = BTreeSet::new();
-    // Every new metadata block any round recorded, `(addr, level)`.
-    let mut meta_seen: BTreeSet<(u64, u8)> = BTreeSet::new();
-    let mut rounds_run = 0u64;
-    for round in 0..MAX_FIXED_POINT_ROUNDS {
-        rounds_run = round as u64 + 1;
-        COMMIT_ROUND.store(round as u32, core::sync::atomic::Ordering::Relaxed);
-        commit_phase(2);
-        alloc.restore(&base);
-        // Path-COW the csum tree BEFORE the allocations below: its new blocks
-        // are metadata this round must account for, exactly as the extent
-        // tree's are.
-        let csum_out = match old_csum {
-            Some((c, lvl)) => Some(
-                PathCow::new(vol, gen, c, lvl)
-                    .await?
-                    .apply(&mut alloc, &csum_edits)
-                    .await?,
-            ),
-            None => None,
-        };
-        commit_phase(3);
-        let root_addrs = alloc_nodes(&mut alloc, vol, root_nc)?;
-
-        // Every new metadata block: fs (fixed) + this round's csum/root +
-        // last round's free-space/extent/block-group-tree blocks (the
-        // self-reference).
-        let mut new_meta: Vec<(u64, u64, u8)> = fs_new_meta.clone();
-        if let Some(out) = &csum_out {
-            new_meta.extend(
-                out.nodes
-                    .iter()
-                    .map(|&(a, _, l)| (a, format::CSUM_TREE_OBJECTID, l)),
-            );
-        }
-        collect_tree_meta(
-            &root_addrs,
-            root_groups.len(),
-            ns,
-            format::ROOT_TREE_OBJECTID,
-            &mut new_meta,
-        );
-        for &(a, l) in &prev_fst_new {
-            new_meta.push((a, format::FREE_SPACE_TREE_OBJECTID, l));
-        }
-        for &(a, l) in &prev_ext_new {
-            new_meta.push((a, format::EXTENT_TREE_OBJECTID, l));
-        }
-        for &(a, l) in &prev_bgt_new {
-            new_meta.push((a, format::BLOCK_GROUP_TREE_OBJECTID, l));
-        }
-        // The previous round's free-space/extent/block-group-tree blocks were
-        // allocated AFTER that round's csum/root blocks, but this round's are
-        // allocated (from the same restored base) BEFORE those trees are
-        // COWed again — so before convergence, a block this round gave the csum
-        // tree can be one the extent tree held last round. Recording it twice
-        // would mark it used twice in the free-space tree (a hard error) and
-        // charge its block group twice; one record per address is right for
-        // this round, and the converged round never has a collision (every
-        // allocation then repeats the previous round's exactly).
-        let before = new_meta.len();
-        {
-            let mut seen = BTreeSet::new();
-            new_meta.retain(|&(a, _, _)| seen.insert(a));
-        }
-        let collided = new_meta.len() != before;
-
-        let mut freed_meta: Vec<(u64, u8)> = fs_freed.clone();
-        freed_meta.extend(root_old.iter().copied());
-        if let Some(out) = &csum_out {
-            freed_meta.extend(out.freed.iter().copied());
-        }
-        freed_meta.extend(prev_fst_freed.iter().copied());
-        freed_meta.extend(prev_ext_freed.iter().copied());
-        freed_meta.extend(prev_bgt_freed.iter().copied());
-
-        // Every block any round recorded and this one does not: after a few
-        // rounds the leaves they would be recorded in are rewritten anyway,
-        // so the set of leaves a round COWs only grows (see below).
-        let current: BTreeSet<u64> = new_meta.iter().map(|&(a, _, _)| a).collect();
-        meta_seen.extend(new_meta.iter().map(|&(a, _, l)| (a, l)));
-        let untouched: Vec<(u64, u8)> = if round >= MONOTONE_AFTER_ROUND {
-            meta_seen
+    // Blocks whose records are known before the loop starts: the subvolume
+    // trees' (already written), the csum tree's and the root tree's.
+    let mut fixed_new: Vec<(u64, u64, u8)> = fs_new_meta.clone();
+    if let Some(out) = &csum_out {
+        fixed_new.extend(
+            out.nodes
                 .iter()
-                .copied()
-                .filter(|(addr, _)| !current.contains(addr))
-                .collect()
-        } else {
-            Vec::new()
-        };
+                .map(|&(a, _, l)| (a, format::CSUM_TREE_OBJECTID, l)),
+        );
+    }
+    collect_tree_meta(
+        &root_addrs,
+        root_groups.len(),
+        ns,
+        format::ROOT_TREE_OBJECTID,
+        &mut fixed_new,
+    );
+    let mut fixed_freed: Vec<(u64, u8)> = fs_freed.clone();
+    fixed_freed.extend(root_old.iter().copied());
+    if let Some(out) = &csum_out {
+        fixed_freed.extend(out.freed.iter().copied());
+    }
 
-        // Free-space tree: mark every new block used, return every freed
-        // block, and path-COW the leaves those edits reach. The edits are
-        // computed against the committed tree, so a round is a pure function
-        // of the block lists above.
-        let fst_out = match old_fst {
-            Some((fst_root, fst_level)) => {
-                let used = new_meta
-                    .iter()
-                    .map(|&(a, _, _)| (a, nodesize))
-                    .chain(txn.new_data.iter().map(|d| (d.id.bytenr, d.id.len)));
-                let freed = freed_meta
-                    .iter()
-                    .map(|&(a, _)| (a, nodesize))
-                    .chain(data_changes.released.iter().copied());
-                // The new block group has no committed items to fetch.
-                let in_new_group = |addr: u64| {
-                    txn.chunk_alloc.as_ref().is_some_and(|chunk| {
-                        addr >= chunk.logical && addr < chunk.logical + chunk.length
-                    })
-                };
-                for (start, len) in used.clone().chain(freed.clone()) {
-                    if in_new_group(start) {
-                        continue;
-                    }
-                    let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
-                    fst_window.prepare(vol, fst_root, group, start, len).await?;
-                }
-                let mut edit = fst_window.edit(ss);
-                if let Some(chunk) = &txn.chunk_alloc {
-                    edit.add_block_group(chunk.logical, chunk.length)?;
-                }
-                for (start, len) in used {
-                    let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
-                    edit.mark_used(group, start, len)?;
-                }
-                for (start, len) in freed {
-                    let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
-                    edit.mark_free(group, start, len)?;
-                }
-                let mut fst_edits = edit.finish();
-                // Where a round's blocks land decides which free-space leaves
-                // it edits, whose replacements are next round's blocks: the
-                // set can alternate like the extent tree's. Touch the leaves
-                // of every block an earlier round recorded (a delete of a key
-                // no tree holds changes nothing but COWs the leaf).
-                for &(addr, _) in &untouched {
-                    if in_new_group(addr) {
-                        continue;
-                    }
-                    let (group, _) = bg_of(&bgs, addr).ok_or(FsError::InvalidData)?;
-                    fst_edits.push(Edit::Delete(free_space::touch_key(addr)));
-                    fst_edits.push(Edit::Delete(BtrfsKey::new(
-                        group,
-                        format::FREE_SPACE_INFO_KEY,
-                        u64::MAX,
-                    )));
-                }
-                Some(
-                    PathCow::new_compacting(vol, gen, fst_root, fst_level)
-                        .await?
-                        .apply(&mut alloc, &fst_edits)
-                        .await?,
-                )
-            }
-            None => None,
-        };
-        let mut cur_fst_new: Vec<(u64, u8)> = fst_out
+    let mut ext_cow = PathCow::new_compacting(vol, gen, old_ext, old_ext_level).await?;
+    // `update_block_group_item` writes to `btrfs_block_group_root()`: on a
+    // block-group-tree filesystem the BLOCK_GROUP_ITEM rewrites go to tree
+    // 11, never into the extent tree.
+    let mut bgt_cow = match bg_home {
+        BgHome::BlockGroupTree { root, level } => Some(PathCow::new(vol, gen, root, level).await?),
+        BgHome::ExtentTree => None,
+    };
+    let mut fst_cow = match old_fst {
+        Some((root, level)) => Some(PathCow::new_compacting(vol, gen, root, level).await?),
+        None => None,
+    };
+    // Committed free-space-tree items fetched so far, and what the tree in
+    // progress holds for them.
+    let mut fst_window = free_space::FstWindow::default();
+    // The new block group has no committed items to fetch.
+    let in_new_group = |addr: u64| {
+        txn.chunk_alloc
             .as_ref()
-            .map(|out| out.nodes.iter().map(|&(a, _, l)| (a, l)).collect())
-            .unwrap_or_default();
-        let mut cur_fst_freed = fst_out
-            .as_ref()
-            .map(|out| out.freed.clone())
-            .unwrap_or_default();
-        cur_fst_new.sort_unstable();
-        cur_fst_freed.sort_unstable();
-        let cur_fst_root = fst_out.as_ref().map_or(0, |out| out.root_addr);
+            .is_some_and(|chunk| addr >= chunk.logical && addr < chunk.logical + chunk.length)
+    };
 
-        // Path-COW the extent tree with this round's records.
-        commit_phase(4);
-        let ext_edits = build_ext_edits(
-            &new_meta,
-            &freed_meta,
-            &meta_changes,
-            &data_changes,
-            &bgs,
-            gen,
-            nodesize as i64,
-        )?;
-        // `update_block_group_item` writes to `btrfs_block_group_root()`: on a
-        // block-group-tree filesystem the BLOCK_GROUP_ITEM rewrites go to tree
-        // 11, never into the extent tree.
-        let mut ext_edits = ext_edits;
-        if let Some(chunk) = &txn.chunk_alloc {
-            ext_edits.push(Edit::Upsert(
-                BtrfsKey::new(chunk.logical, format::BLOCK_GROUP_ITEM_KEY, chunk.length),
-                chunk.bg_item.clone(),
-            ));
-        }
-        // Which block groups' items a round rewrites depends on where the
-        // previous round put its block-group-tree blocks (their group's
-        // `used` changes), and that decides which leaves this round COWs:
-        // the set can alternate between two rounds forever. After a few
-        // rounds every group any round touched is rewritten (unchanged ones
-        // with their committed item, a no-op on content), so the edited set
-        // only grows and the fixed point settles.
-        // The extent tree has the same feedback through its own items: each
-        // round records the previous round's new blocks, whose keys decide
-        // which leaves it COWs, whose new blocks the next round records (seen
-        // as a crash/round-trip commit unsettled in the extent tree, 0x7).
-        // After a few rounds every block any round recorded and this one did
-        // not is "touched" with a delete of its METADATA_ITEM key: the block
-        // was free when the commit began (rounds allocate only from free
-        // space), so the key is absent and the delete changes nothing but
-        // COWs the leaf it would live in. The touched leaf set then only
-        // grows, as the block-group set below does.
-        for &(addr, level) in &untouched {
-            let key = BtrfsKey::new(addr, format::METADATA_ITEM_KEY, u64::from(level));
-            touch_key_absent(vol, old_ext, &key).await?;
-            ext_edits.push(Edit::Delete(key));
-        }
-        let edited: BTreeSet<u64> = ext_edits
-            .iter()
-            .filter(|e| e.key().item_type == format::BLOCK_GROUP_ITEM_KEY)
-            .map(|e| e.key().objectid)
-            .collect();
-        bg_touched.extend(edited.iter().copied());
-        if round >= MONOTONE_AFTER_ROUND {
-            for (start, len, item) in &bgs {
-                if bg_touched.contains(start) && !edited.contains(start) {
-                    ext_edits.push(Edit::Upsert(
-                        BtrfsKey::new(*start, format::BLOCK_GROUP_ITEM_KEY, *len),
-                        item.clone(),
-                    ));
-                }
-            }
-        }
-        let (ext_edits, bg_edits) = split_block_group_edits(ext_edits, bg_home);
-        let ext_out = PathCow::new(vol, gen, old_ext, old_ext_level)
-            .await?
-            .apply(&mut alloc, &ext_edits)
-            .await?;
-        let bgt_out = match bg_home {
-            BgHome::BlockGroupTree { root, level } => Some(
-                PathCow::new(vol, gen, root, level)
-                    .await?
-                    .apply(&mut alloc, &bg_edits)
-                    .await?,
-            ),
-            BgHome::ExtentTree => None,
-        };
-        let mut cur_bgt_new: Vec<(u64, u8)> = bgt_out
-            .as_ref()
-            .map(|out| out.nodes.iter().map(|&(a, _, l)| (a, l)).collect())
-            .unwrap_or_default();
-        let mut cur_bgt_freed = bgt_out
-            .as_ref()
-            .map(|out| out.freed.clone())
-            .unwrap_or_default();
-        cur_bgt_new.sort_unstable();
-        cur_bgt_freed.sort_unstable();
-        let cur_bgt_root = bgt_out.as_ref().map_or(0, |out| out.root_addr);
-
-        let mut cur_ext_new: Vec<(u64, u8)> =
-            ext_out.nodes.iter().map(|&(a, _, l)| (a, l)).collect();
-        let mut cur_ext_freed = ext_out.freed.clone();
-        cur_ext_new.sort_unstable();
-        cur_ext_freed.sort_unstable();
-
-        let mut pf_new = prev_fst_new.clone();
-        let mut pf_freed = prev_fst_freed.clone();
-        pf_new.sort_unstable();
-        pf_freed.sort_unstable();
-        let mut p_new = prev_ext_new.clone();
-        let mut p_freed = prev_ext_freed.clone();
-        p_new.sort_unstable();
-        p_freed.sort_unstable();
-        let mut pb_new = prev_bgt_new.clone();
-        let mut pb_freed = prev_bgt_freed.clone();
-        pb_new.sort_unstable();
-        pb_freed.sort_unstable();
-        let unsettled = u32::from(cur_ext_new != p_new)
-            | u32::from(cur_ext_freed != p_freed) << 1
-            | u32::from(ext_out.root_addr != prev_ext_root) << 2
-            | u32::from(cur_bgt_new != pb_new) << 3
-            | u32::from(cur_bgt_freed != pb_freed) << 4
-            | u32::from(cur_bgt_root != prev_bgt_root) << 5
-            | u32::from(cur_fst_new != pf_new) << 6
-            | u32::from(cur_fst_freed != pf_freed) << 7
-            | u32::from(cur_fst_root != prev_fst_root) << 8;
-        COMMIT_UNSETTLED.store(unsettled, core::sync::atomic::Ordering::Relaxed);
-        let converged = unsettled == 0;
-        if converged {
-            // A converged round repeats the previous one's allocations, so a
-            // collision here would be two trees on one block: refuse it.
-            if collided {
+    // What the trees in progress record: new blocks `addr -> (owner, level)`
+    // and freed committed blocks `addr -> level`.
+    let mut recorded_new: BTreeMap<u64, (u64, u8)> = BTreeMap::new();
+    let mut recorded_freed: BTreeMap<u64, u8> = BTreeMap::new();
+    // Net change of `used` per block group (by start) the lists give.
+    let mut bg_net: BTreeMap<u64, i64> = BTreeMap::new();
+    // A bound no real commit approaches (each pass records at least one
+    // block, and a block is recorded once): a guard against a defect in the
+    // loop, failing the commit before anything is written.
+    const MAX_RECORD_PASSES: u64 = 1024;
+    let mut passes = 0u64;
+    loop {
+        COMMIT_ROUND.store(passes as u32, core::sync::atomic::Ordering::Relaxed);
+        // Every block the transaction holds or has freed, as of now.
+        let mut want_new: BTreeMap<u64, (u64, u8)> = BTreeMap::new();
+        let trees = [
+            (format::EXTENT_TREE_OBJECTID, Some(&ext_cow)),
+            (format::BLOCK_GROUP_TREE_OBJECTID, bgt_cow.as_ref()),
+            (format::FREE_SPACE_TREE_OBJECTID, fst_cow.as_ref()),
+        ];
+        let cow_new = trees.iter().flat_map(|&(owner, cow)| {
+            cow.into_iter()
+                .flat_map(move |cow| cow.new_blocks().map(move |(a, l)| (a, owner, l)))
+        });
+        for (addr, owner, level) in fixed_new.iter().copied().chain(cow_new) {
+            // Two trees on one block.
+            if want_new.insert(addr, (owner, level)).is_some() {
                 return Err(FsError::InvalidData);
             }
-            if round >= MONOTONE_AFTER_ROUND {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "btrfs: commit of generation {gen} settled in round {round}"
-                );
+        }
+        let mut want_freed: BTreeMap<u64, u8> = BTreeMap::new();
+        let cow_freed = trees
+            .iter()
+            .flat_map(|&(_, cow)| cow.into_iter().flat_map(|cow| cow.freed().iter().copied()));
+        for (addr, level) in fixed_freed.iter().copied().chain(cow_freed) {
+            // A block freed twice.
+            if want_freed.insert(addr, level).is_some() {
+                return Err(FsError::InvalidData);
             }
-            let csum_root = csum_out
-                .as_ref()
-                .map_or((0, 0), |out| (out.root_addr, out.root_level));
-            done = Some(Done {
-                freed_meta: freed_meta.clone(),
-                new_meta: new_meta.iter().map(|&(a, _, _)| a).collect(),
-                csum_nodes: csum_out.map(|out| out.nodes).unwrap_or_default(),
-                root_addrs,
-                fst: fst_out,
-                csum_root,
-                ext_nodes: ext_out.nodes,
-                ext_root: ext_out.root_addr,
-                ext_level: ext_out.root_level,
-                bgt: bgt_out,
-            });
+        }
+
+        // What this pass has to record: blocks that appeared, blocks the
+        // COWs made and then dropped again (a leaf an edit emptied), and
+        // committed blocks replaced since the last pass.
+        let mut add_new: Vec<(u64, u64, u8)> = Vec::new();
+        for (&addr, &(owner, level)) in &want_new {
+            match recorded_new.get(&addr) {
+                None => add_new.push((addr, owner, level)),
+                Some(&recorded) if recorded == (owner, level) => {}
+                Some(_) => return Err(FsError::InvalidData),
+            }
+        }
+        let drop_new: Vec<(u64, u8)> = recorded_new
+            .iter()
+            .filter(|(addr, _)| !want_new.contains_key(addr))
+            .map(|(&addr, &(_, level))| (addr, level))
+            .collect();
+        let mut add_freed: Vec<(u64, u8)> = Vec::new();
+        for (&addr, &level) in &want_freed {
+            match recorded_freed.get(&addr) {
+                None => add_freed.push((addr, level)),
+                Some(&recorded) if recorded == level => {}
+                Some(_) => return Err(FsError::InvalidData),
+            }
+        }
+        // A committed block, once replaced, stays replaced.
+        if recorded_freed
+            .keys()
+            .any(|addr| !want_freed.contains_key(addr))
+        {
+            return Err(FsError::InvalidData);
+        }
+        let first = passes == 0;
+        if !first && add_new.is_empty() && drop_new.is_empty() && add_freed.is_empty() {
             break;
         }
-        prev_ext_new = cur_ext_new;
-        prev_ext_freed = cur_ext_freed;
-        prev_ext_root = ext_out.root_addr;
-        prev_bgt_new = cur_bgt_new;
-        prev_bgt_freed = cur_bgt_freed;
-        prev_bgt_root = cur_bgt_root;
-        prev_fst_new = cur_fst_new;
-        prev_fst_freed = cur_fst_freed;
-        prev_fst_root = cur_fst_root;
+        if passes == MAX_RECORD_PASSES {
+            commit_phase(5);
+            return Err(FsError::NoSpace);
+        }
+        passes += 1;
+
+        // Free-space tree: every new block used, every freed block free
+        // again, computed against the committed items, and the difference
+        // from the last pass path-COWed in.
+        if let (Some((fst_root, _)), Some(cow)) = (old_fst, fst_cow.as_mut()) {
+            let meta_ranges = add_new
+                .iter()
+                .map(|&(a, _, _)| a)
+                .chain(drop_new.iter().map(|&(a, _)| a))
+                .chain(add_freed.iter().map(|&(a, _)| a))
+                .map(|a| (a, nodesize));
+            let data_ranges = txn
+                .new_data
+                .iter()
+                .map(|d| (d.id.bytenr, d.id.len))
+                .chain(data_changes.released.iter().copied())
+                .filter(|_| first);
+            for (start, len) in meta_ranges.chain(data_ranges) {
+                if in_new_group(start) {
+                    continue;
+                }
+                let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
+                fst_window.prepare(vol, fst_root, group, start, len).await?;
+            }
+            let mut edit = fst_window.edit(ss);
+            if let Some(chunk) = &txn.chunk_alloc {
+                edit.add_block_group(chunk.logical, chunk.length)?;
+            }
+            let used = want_new
+                .keys()
+                .map(|&a| (a, nodesize))
+                .chain(txn.new_data.iter().map(|d| (d.id.bytenr, d.id.len)));
+            for (start, len) in used {
+                let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
+                edit.mark_used(group, start, len)?;
+            }
+            let freed = want_freed
+                .keys()
+                .map(|&a| (a, nodesize))
+                .chain(data_changes.released.iter().copied());
+            for (start, len) in freed {
+                let group = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
+                edit.mark_free(group, start, len)?;
+            }
+            let fst_edits = fst_window.take_edits(edit.into_items());
+            cow.apply_edits(&mut alloc, &fst_edits).await?;
+        }
+
+        // Extent tree: an item per new block, none for a freed or dropped
+        // one; the transaction's reference changes go in with the first
+        // pass.
+        commit_phase(4);
+        let mut ext_edits: Vec<Edit> = Vec::new();
+        let mut bg_dirty: BTreeSet<u64> = BTreeSet::new();
+        let mut account = |start: u64, delta: i64| -> Result<(), FsError> {
+            let (group, _) = bg_of(&bgs, start).ok_or(FsError::InvalidData)?;
+            let net = bg_net.entry(group).or_insert(0);
+            *net = net.checked_add(delta).ok_or(FsError::InvalidData)?;
+            bg_dirty.insert(group);
+            Ok(())
+        };
+        let node = i64::try_from(nodesize).map_err(|_| FsError::InvalidData)?;
+        for &(addr, owner, level) in &add_new {
+            let key = BtrfsKey::new(addr, format::METADATA_ITEM_KEY, u64::from(level));
+            extent_key_absent(vol, old_ext, &key).await?;
+            ext_edits.push(Edit::Upsert(key, ext_item_meta(gen, owner)));
+            account(addr, node)?;
+        }
+        for &(addr, level) in &drop_new {
+            ext_edits.push(Edit::Delete(BtrfsKey::new(
+                addr,
+                format::METADATA_ITEM_KEY,
+                u64::from(level),
+            )));
+            account(addr, -node)?;
+        }
+        for &(addr, level) in &add_freed {
+            ext_edits.push(Edit::Delete(BtrfsKey::new(
+                addr,
+                format::METADATA_ITEM_KEY,
+                u64::from(level),
+            )));
+            account(addr, -node)?;
+        }
+        if first {
+            ext_edits.extend(meta_changes.edits.iter().cloned());
+            ext_edits.extend(data_changes.edits.iter().cloned());
+            for &(bytenr, len) in &data_changes.allocated {
+                account(
+                    bytenr,
+                    i64::try_from(len).map_err(|_| FsError::InvalidData)?,
+                )?;
+            }
+            for &(bytenr, len) in &data_changes.released {
+                account(
+                    bytenr,
+                    -i64::try_from(len).map_err(|_| FsError::InvalidData)?,
+                )?;
+            }
+            if let Some(chunk) = &txn.chunk_alloc {
+                // The new group's item goes in whether or not anything was
+                // allocated from it.
+                bg_dirty.insert(chunk.logical);
+            }
+        }
+        for (start, len, body) in bgs.iter().filter(|(start, _, _)| bg_dirty.contains(start)) {
+            let net = bg_net.get(start).copied().unwrap_or(0);
+            let used = i64::try_from(le64(body, 0)?)
+                .ok()
+                .and_then(|used| used.checked_add(net))
+                .and_then(|used| u64::try_from(used).ok())
+                .filter(|&used| used <= *len)
+                .ok_or(FsError::InvalidData)?;
+            let mut item = body.clone();
+            item[0..8].copy_from_slice(&used.to_le_bytes());
+            ext_edits.push(Edit::Upsert(
+                BtrfsKey::new(*start, format::BLOCK_GROUP_ITEM_KEY, *len),
+                item,
+            ));
+        }
+        let (ext_edits, bg_edits) = split_block_group_edits(ext_edits, bg_home);
+        ext_cow.apply_edits(&mut alloc, &ext_edits).await?;
+        if let Some(cow) = bgt_cow.as_mut() {
+            cow.apply_edits(&mut alloc, &bg_edits).await?;
+        }
+
+        for (addr, owner, level) in add_new {
+            recorded_new.insert(addr, (owner, level));
+        }
+        for (addr, _) in drop_new {
+            recorded_new.remove(&addr);
+        }
+        recorded_freed.extend(add_freed);
     }
-    let Done {
-        freed_meta,
-        new_meta,
-        csum_nodes,
-        root_addrs,
-        fst,
-        csum_root,
-        ext_nodes,
-        ext_root,
-        ext_level,
-        bgt,
-    } = done.ok_or_else(|| {
-        commit_phase(5);
-        FsError::NoSpace
-    })?;
+    let rounds_run = passes;
+    if passes >= 16 {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs: commit of generation {gen} recorded its blocks in {passes} passes"
+        );
+    }
+    let ext_out = ext_cow.finish();
+    let bgt = bgt_cow.map(PathCow::finish);
+    let fst = fst_cow.map(PathCow::finish);
+    let (ext_nodes, ext_root, ext_level) = (ext_out.nodes, ext_out.root_addr, ext_out.root_level);
+    let csum_root = csum_out
+        .as_ref()
+        .map_or((0, 0), |out| (out.root_addr, out.root_level));
+    let csum_nodes = csum_out.map(|out| out.nodes).unwrap_or_default();
+    // Exactly what this transaction allocated and released, for the pins,
+    // the audit of the freed blocks and the in-memory free-space view.
+    let new_meta: Vec<u64> = recorded_new.keys().copied().collect();
+    let freed_meta: Vec<(u64, u8)> = recorded_freed.into_iter().collect();
     commit_phase(6);
     // What the commit allocated for its own trees, against what its batch
     // reserved for them (the root tree's re-pack is the global reserve's).
@@ -6324,7 +6222,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
 
     // Superblock `bytes_used` is the sum of every block group's `used`, read back
     // from the freshly-written extent tree so it can never drift from the block
-    // groups (`build_ext_edits` already committed each group's net).
+    // groups (each group's net went in with its item above).
     // Stand in for a crash at the one instant the COW invariant is load
     // bearing: nodes written, superblock still pointing at the previous tree.
     #[cfg(feature = "kernel-test")]
@@ -6379,7 +6277,6 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // The allocators share the free-space view; let go of it so the view
     // can be advanced in place below.
     drop(alloc);
-    drop(base);
     vol.commit_roots(
         root_root_addr,
         fs_root_addr,

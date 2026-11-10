@@ -131,7 +131,7 @@ struct NodeCache {
 
 /// Cached nodes. At a 16 KiB nodesize this bounds the cache at 4 MiB in
 /// kernel-test and 64 MiB in production, comfortably holding the working set a
-/// commit's fixed point revisits while staying a fixed, predictable cost.
+/// commit revisits while staying a fixed, predictable cost.
 const NODE_CACHE_MAX: usize = if cfg!(feature = "kernel-test") {
     256
 } else {
@@ -731,12 +731,11 @@ pub struct VolCore<B: BlockDevice> {
     evictions: core::sync::atomic::AtomicU64,
     /// Metadata node cache, keyed by logical address.
     ///
-    /// A commit path-COWs the extent tree once per fixed-point round, and a
-    /// round re-reads the same nodes the previous one did — measured at 724
-    /// rounds across 152 commits in the boot write smoke, with that re-reading
-    /// the single largest cost in the whole commit. Every miss costs an
-    /// (emulated) device read plus a full-node checksum verification, and both
-    /// are pure repetition for a block nothing has written since.
+    /// Consecutive commits path-COW the same upper levels of the extent,
+    /// csum and free-space trees, and every operation descends the fs tree
+    /// from its root. Every miss costs an (emulated) device read plus a
+    /// full-node checksum verification, and both are pure repetition for a
+    /// block nothing has written since.
     nodes: IrqSafeSpinLock<NodeCache>,
     /// Set when a transaction was lost after its operations had already
     /// reported success. See [`Self::abort_transaction`].
@@ -1624,9 +1623,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     ///
     /// A cache hit here is an `Arc` bump rather than a `nodesize` memcpy. That
     /// matters because the commit path's hottest reader — the extent tree's
-    /// path COW, re-run once per fixed-point round — descends the same
-    /// internal nodes for every edit, and each descent used to copy 16 KiB per
-    /// level. Callers that need to mutate a node still take `read_node` and
+    /// path COW — descends the same internal nodes for every edit, and each
+    /// descent used to copy 16 KiB per level. Callers that need to mutate a node still take `read_node` and
     /// get their own copy.
     pub async fn read_node_shared(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
         // A block of the running batch is rewritten in place at the same
@@ -1684,6 +1682,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             {
                 continue;
             }
+            crate::stats::note_device_read();
             let shared = Arc::new(core::mem::take(&mut buf));
             // Only cache a node that passed BOTH checks above — a copy that
             // failed one is retried from another mirror, and caching it would

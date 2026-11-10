@@ -24,6 +24,135 @@ pub fn max_reserve_overrun() -> u64 {
 /// Offset of the `owner` field in a tree-node header.
 const HDR_OWNER: usize = 88;
 
+/// Node counts split by the tree the node belongs to (its header's owner).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeCounts {
+    pub root: u64,
+    pub extent: u64,
+    pub csum: u64,
+    pub free_space: u64,
+    pub block_group: u64,
+    /// Subvolume, chunk, device, quota and every other tree.
+    pub other: u64,
+}
+
+impl TreeCounts {
+    /// Sum over every tree.
+    pub fn total(&self) -> u64 {
+        self.root + self.extent + self.csum + self.free_space + self.block_group + self.other
+    }
+
+    fn since(&self, earlier: &Self) -> Self {
+        Self {
+            root: self.root - earlier.root,
+            extent: self.extent - earlier.extent,
+            csum: self.csum - earlier.csum,
+            free_space: self.free_space - earlier.free_space,
+            block_group: self.block_group - earlier.block_group,
+            other: self.other - earlier.other,
+        }
+    }
+}
+
+/// Running totals over every btrfs mounted since boot ([`totals`]), for
+/// harnesses that judge what a commit costs: the difference of two samples
+/// taken around one commit is that commit's cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    /// Transactions committed, and the passes they took to record their
+    /// own blocks.
+    pub commits: u64,
+    pub rounds: u64,
+    /// Tree nodes handed to a reader. Cache hits are included: this counts
+    /// the blocks a walk visits, not device I/O.
+    pub read: TreeCounts,
+    /// Of those, the nodes that were read from the device (cache misses).
+    pub device_reads: u64,
+    /// Tree nodes written.
+    pub written: TreeCounts,
+    /// Not totals: the metadata blocks the last batch commit allocated for
+    /// its own trees (the root tree's re-pack aside), and what its batch had
+    /// reserved for them.
+    pub last_commit_blocks: u64,
+    pub last_commit_reserved: u64,
+}
+
+impl Totals {
+    /// What happened between `earlier` and `self` (the `last_commit_*`
+    /// fields are carried over as they are).
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            commits: self.commits - earlier.commits,
+            rounds: self.rounds - earlier.rounds,
+            read: self.read.since(&earlier.read),
+            device_reads: self.device_reads - earlier.device_reads,
+            written: self.written.since(&earlier.written),
+            last_commit_blocks: self.last_commit_blocks,
+            last_commit_reserved: self.last_commit_reserved,
+        }
+    }
+}
+
+/// [`TreeCounts`] as atomics.
+#[derive(Debug)]
+struct TreeCounters([AtomicU64; 6]);
+
+impl TreeCounters {
+    const fn new() -> Self {
+        Self([const { AtomicU64::new(0) }; 6])
+    }
+
+    fn bump(&self, node: &[u8]) {
+        let slot = match format::le64(node, HDR_OWNER) {
+            Ok(format::ROOT_TREE_OBJECTID) => 0,
+            Ok(format::EXTENT_TREE_OBJECTID) => 1,
+            Ok(format::CSUM_TREE_OBJECTID) => 2,
+            Ok(format::FREE_SPACE_TREE_OBJECTID) => 3,
+            Ok(format::BLOCK_GROUP_TREE_OBJECTID) => 4,
+            _ => 5,
+        };
+        self.0[slot].fetch_add(1, Relaxed);
+    }
+
+    fn load(&self) -> TreeCounts {
+        let at = |slot: usize| self.0[slot].load(Relaxed);
+        TreeCounts {
+            root: at(0),
+            extent: at(1),
+            csum: at(2),
+            free_space: at(3),
+            block_group: at(4),
+            other: at(5),
+        }
+    }
+}
+
+static TOTAL_COMMITS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_ROUNDS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_READ: TreeCounters = TreeCounters::new();
+static TOTAL_DEVICE_READS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_WRITTEN: TreeCounters = TreeCounters::new();
+static LAST_COMMIT_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static LAST_COMMIT_RESERVED: AtomicU64 = AtomicU64::new(0);
+
+/// The running [`Totals`].
+pub fn totals() -> Totals {
+    Totals {
+        commits: TOTAL_COMMITS.load(Relaxed),
+        rounds: TOTAL_ROUNDS.load(Relaxed),
+        read: TOTAL_READ.load(),
+        device_reads: TOTAL_DEVICE_READS.load(Relaxed),
+        written: TOTAL_WRITTEN.load(),
+        last_commit_blocks: LAST_COMMIT_BLOCKS.load(Relaxed),
+        last_commit_reserved: LAST_COMMIT_RESERVED.load(Relaxed),
+    }
+}
+
+/// Count one node read from the device (a node-cache miss).
+pub(crate) fn note_device_read() {
+    TOTAL_DEVICE_READS.fetch_add(1, Relaxed);
+}
+
 /// Counters of one mounted filesystem ([`crate::volume::VolCore`]).
 #[derive(Debug, Default)]
 pub(crate) struct CommitStats {
@@ -36,7 +165,8 @@ pub(crate) struct CommitStats {
     pub(crate) meta_nodes_written: AtomicU64,
     /// Transactions committed.
     pub(crate) commits: AtomicU64,
-    /// Fixed-point rounds over all commits, and of the last one.
+    /// Passes of recording a commit's own blocks, over all commits and of
+    /// the last one.
     pub(crate) rounds: AtomicU64,
     pub(crate) last_rounds: AtomicU64,
     /// Allocators built, how many of those read the free-space tree from
@@ -127,6 +257,7 @@ impl CommitStats {
 
     /// Count one node handed to a reader.
     pub(crate) fn note_read(&self, node: &[u8]) {
+        TOTAL_READ.bump(node);
         if format::le64(node, HDR_OWNER).ok() == Some(format::FREE_SPACE_TREE_OBJECTID) {
             self.fst_nodes_read.fetch_add(1, Relaxed);
         }
@@ -134,14 +265,18 @@ impl CommitStats {
 
     /// Count one node about to be written.
     pub(crate) fn note_write(&self, node: &[u8]) {
+        TOTAL_WRITTEN.bump(node);
         self.meta_nodes_written.fetch_add(1, Relaxed);
         if format::le64(node, HDR_OWNER).ok() == Some(format::FREE_SPACE_TREE_OBJECTID) {
             self.fst_nodes_written.fetch_add(1, Relaxed);
         }
     }
 
-    /// Count one finished commit that took `rounds` fixed-point rounds.
+    /// Count one finished commit that recorded its blocks in `rounds`
+    /// passes.
     pub(crate) fn note_commit(&self, rounds: u64) {
+        TOTAL_COMMITS.fetch_add(1, Relaxed);
+        TOTAL_ROUNDS.fetch_add(rounds, Relaxed);
         self.commits.fetch_add(1, Relaxed);
         self.rounds.fetch_add(rounds, Relaxed);
         self.last_rounds.store(rounds, Relaxed);
@@ -160,6 +295,8 @@ impl CommitStats {
         let reserved = self.pending_reservation.swap(0, Relaxed).checked_sub(1)?;
         self.last_commit_blocks.store(blocks, Relaxed);
         self.last_commit_reserved.store(reserved, Relaxed);
+        LAST_COMMIT_BLOCKS.store(blocks, Relaxed);
+        LAST_COMMIT_RESERVED.store(reserved, Relaxed);
         let overrun = blocks.saturating_sub(reserved);
         self.max_reserve_overrun.fetch_max(overrun, Relaxed);
         MAX_RESERVE_OVERRUN.fetch_max(overrun, Relaxed);

@@ -251,13 +251,14 @@ without a parity journal, a crash during the data/parity update window can leave
 an inconsistent stripe; NARF does not yet implement a write-hole log or the
 newer stripe tree.
 
-**Every tree may be any height**, up to `BTRFS_MAX_LEVEL` (8). The fs and extent
-trees use path COW, rewriting only touched root-to-leaf paths. The smaller csum,
-root, free-space, and enabled quota trees are still read as logical item sets and repacked into
-as many `nodesize` leaves and internal levels as needed. The extent tree records
-its own new blocks, so the transaction resolves the mutually-dependent extent
-and whole-repacked tree block counts with a fixed point, reusing the same
-allocation base each round and writing only the converged set.
+**Every tree may be any height**, up to `BTRFS_MAX_LEVEL` (8). The fs, csum,
+extent, block-group and free-space trees use path COW, rewriting only touched
+root-to-leaf paths. The root and enabled quota trees are still read as logical
+item sets and repacked into as many `nodesize` leaves and internal levels as
+needed. The extent, block-group and free-space trees record their own new
+blocks, so a commit keeps their path COWs open and records, pass after pass,
+the blocks the previous pass allocated and replaced until none are left
+(Linux's delayed refs); nothing is written before that.
 
 **Profile-aware chunk growth** (`write::grow_add_chunk`) allocates either one
 mixed group or separate DATA and METADATA groups, plus a SYSTEM group when the

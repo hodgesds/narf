@@ -11,11 +11,20 @@ crash-consistency replay of the recorded write/flush stream.
 
 Scenarios (`--scenario`): `regress`, `root`, `snapshots`, `lba4k`, `gate`,
 `fst` (free-space trees maintained incrementally: grown multi-level by
-thousands of punched holes, and the bitmap fixture) and `enospc` (metadata
+thousands of punched holes, and the bitmap fixture), `enospc` (metadata
 filled on a full device until `ENOSPC`, and block groups filled until a DATA
-or METADATA chunk is allocated at reservation time — never an abort). Every
-commit is audited against the on-disk free-space tree, and the run reports
-the most any commit allocated beyond its batch's reservation.
+or METADATA chunk is allocated at reservation time — never an abort) and
+`scale` (the shape of an installed root on a sparse image: hundreds of
+mostly-full DATA block groups, free space in hundreds of thousands of
+single-sector pieces, three-level free-space and extent trees;
+then a desktop-like workload in small transactions, with what each commit
+cost — nodes visited and written per tree, recording passes, blocks beyond
+the reservation, wall time — reported). Every commit is audited against the
+on-disk free-space tree (in `scale`, every commit of its second workload
+pass), and the run reports the most any commit allocated beyond its batch's
+reservation. `scale` takes a few minutes and about 2 GiB of disk at the
+default `--ops`; it scales down with it and is then not held to the tree
+depth.
 Defaults are seed 1, 2 seeds per scenario, 3000 ops in `root` (the others
 scale from it), 48 crash cut points in `root` (0 disables the crash pass),
 and 3 concurrent `btrfs check` processes. Run it with
@@ -30,6 +39,7 @@ and 3 concurrent `btrfs check` processes. Run it with
 | `linux` | Linux userspace (`btrfs check`, `btrfs restore`, `dump-tree`) as the independent oracle |
 | `crash` | replay of write-stream prefixes under a volatile-write-cache device model |
 | `fixture` | fixture images |
+| `fst`, `enospc`, `scale` | the scenarios of those names |
 | `host` | host stand-ins the kernel crate graph needs in a `std` process (RAM, linker anchors, executor) |
 
 `file_loading_tests` holds the `#[cfg(test)]` file-loading tests.

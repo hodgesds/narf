@@ -46,7 +46,7 @@ fn smoke_btrfs_fst_edit_extent_groups() -> TestResult {
         );
         items.insert(extent(start, len), Vec::new());
     }
-    let window = free_space::FstWindow::__test_whole_tree(items.clone());
+    let mut window = free_space::FstWindow::__test_whole_tree(items.clone());
     let mut edit = window.edit(SS);
     // The last sector of group 0, a middle range, and the first sector of
     // group 1.
@@ -65,7 +65,7 @@ fn smoke_btrfs_fst_edit_extent_groups() -> TestResult {
         return TestResult::Fail("fst edit: accepted an operation the tree contradicts");
     }
     let mut after = items.clone();
-    apply_fst_edits(&mut after, edit.finish());
+    apply_fst_edits(&mut after, window.take_edits(edit.into_items()));
     let want: Vec<BtrfsKey> = alloc::vec![
         extent(BG, 16 * SS),
         extent(BG + 20 * SS, BG - 21 * SS),
@@ -84,27 +84,27 @@ fn smoke_btrfs_fst_edit_extent_groups() -> TestResult {
     }
     // Free the last sector of group 0: it joins its left neighbour, not the
     // free extent that starts the next group. Then free the rest.
-    let window = free_space::FstWindow::__test_whole_tree(after.clone());
+    let mut window = free_space::FstWindow::__test_whole_tree(after.clone());
     let mut edit = window.edit(SS);
     if edit.mark_free(groups[0], 2 * BG - SS, SS).is_err() {
         return TestResult::Fail("fst edit: freeing at a group boundary failed");
     }
     let mut boundary = after.clone();
-    apply_fst_edits(&mut boundary, edit.finish());
+    apply_fst_edits(&mut boundary, window.take_edits(edit.into_items()));
     if !boundary.contains_key(&extent(BG + 20 * SS, BG - 20 * SS))
         || !boundary.contains_key(&extent(2 * BG + SS, BG - SS))
         || fst_count(&boundary, BG, BG) != Some(2)
     {
         return TestResult::Fail("fst edit: a free extent merged across a block-group boundary");
     }
-    let window = free_space::FstWindow::__test_whole_tree(boundary.clone());
+    let mut window = free_space::FstWindow::__test_whole_tree(boundary.clone());
     let mut edit = window.edit(SS);
     if edit.mark_free(groups[0], BG + 16 * SS, 4 * SS).is_err()
         || edit.mark_free(groups[1], 2 * BG, SS).is_err()
     {
         return TestResult::Fail("fst edit: freeing failed");
     }
-    apply_fst_edits(&mut boundary, edit.finish());
+    apply_fst_edits(&mut boundary, window.take_edits(edit.into_items()));
     if boundary != items {
         return TestResult::Fail("fst edit: an alloc/free round trip changed the tree");
     }
@@ -125,7 +125,7 @@ fn smoke_btrfs_fst_edit_new_block_group() -> TestResult {
         BtrfsKey::new(BG, format::FREE_SPACE_INFO_KEY, BG),
         fst_info(0, false),
     );
-    let window = free_space::FstWindow::__test_whole_tree(items.clone());
+    let mut window = free_space::FstWindow::__test_whole_tree(items.clone());
     let mut edit = window.edit(SS);
     if edit.add_block_group(2 * BG, BG).is_err()
         || edit.add_block_group(2 * BG, BG).is_ok()
@@ -133,7 +133,7 @@ fn smoke_btrfs_fst_edit_new_block_group() -> TestResult {
     {
         return TestResult::Fail("fst edit: adding a block group failed");
     }
-    apply_fst_edits(&mut items, edit.finish());
+    apply_fst_edits(&mut items, window.take_edits(edit.into_items()));
     if fst_count(&items, 2 * BG, BG) != Some(1)
         || !items.contains_key(&BtrfsKey::new(
             2 * BG + 4 * SS,
@@ -244,7 +244,7 @@ fn smoke_btrfs_fst_edit_matches_whole_leaf_helpers() -> TestResult {
             let (start, len) = group(g);
             ((start, len), start + at as u64 * SS, n as u64 * SS)
         };
-        let window = free_space::FstWindow::__test_whole_tree(items.clone());
+        let mut window = free_space::FstWindow::__test_whole_tree(items.clone());
         let mut edit = window.edit(SS);
         let mut dirty = BTreeSet::new();
         for op in &allocs {
@@ -267,7 +267,7 @@ fn smoke_btrfs_fst_edit_matches_whole_leaf_helpers() -> TestResult {
         if fst_finish_bitmaps(&mut leaf, SS, &dirty).is_err() {
             return TestResult::Fail("fst edit: whole-leaf recount failed");
         }
-        apply_fst_edits(&mut items, edit.finish());
+        apply_fst_edits(&mut items, window.take_edits(edit.into_items()));
         let Ok(reference) = leaf_items(&leaf) else {
             return TestResult::Fail("fst edit: reference leaf unreadable");
         };

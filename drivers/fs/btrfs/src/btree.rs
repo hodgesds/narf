@@ -309,6 +309,33 @@ pub async fn find_item<B: BlockDevice + 'static>(
     }
 }
 
+/// Whether the tree rooted at `root` holds an item with exactly `key`:
+/// [`find_item`] without copying a node or the item out of the cache.
+pub(crate) async fn contains_key<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root: u64,
+    key: &BtrfsKey,
+) -> Result<bool, FsError> {
+    let mut node = vol.read_node_shared(root).await?;
+    for _ in 0..=MAX_LEVEL {
+        let n = nritems(&node)? as usize;
+        if level(&node)? == 0 {
+            let slot = leaf_lower_bound(&node, n, key)?;
+            return Ok(slot < n && leaf_item_key(&node, slot)? == *key);
+        }
+        if n == 0 {
+            return Err(FsError::InvalidData);
+        }
+        let slot = internal_child_slot(&node, n, key)?;
+        let child = vol
+            .read_node_shared(internal_blockptr(&node, slot)?)
+            .await?;
+        verify_child(&node, slot, &child)?;
+        node = child;
+    }
+    Err(FsError::InvalidData)
+}
+
 /// The `(key, body)` of the greatest item whose key is strictly less than
 /// `ceiling`, or `None` if the tree has no item before it. Descends to where
 /// `ceiling` would sit, then — if that leaf holds nothing below it — backtracks to

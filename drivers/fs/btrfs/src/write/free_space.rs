@@ -35,15 +35,19 @@ use crate::btree;
 use crate::format::{self, BtrfsKey};
 use crate::volume::BtrfsVolume;
 
-/// The committed free-space-tree items a commit has looked at so far.
+/// The committed free-space-tree items a commit has looked at so far, and
+/// what the tree the commit is building holds in their place.
 ///
 /// The committed tree does not change while a commit computes, so what one
-/// fixed-point round fetched stays valid for the next and is not fetched
-/// again.
+/// pass of recording the commit's blocks fetched stays valid for the next
+/// and is not fetched again.
 #[derive(Debug, Default)]
 pub(super) struct FstWindow {
     /// Committed items, unmodified.
     items: BTreeMap<BtrfsKey, Vec<u8>>,
+    /// The same keys as the tree in progress holds them: the committed
+    /// items, with every edit [`Self::take_edits`] has handed out applied.
+    applied: BTreeMap<BtrfsKey, Vec<u8>>,
     /// Key spans already fetched, `first -> (last, from_start, to_end)`:
     /// every committed item with a key in `[first, last]` is in `items`.
     /// `from_start` / `to_end` say that nothing precedes `first` / follows
@@ -60,7 +64,25 @@ impl FstWindow {
             BtrfsKey::new(0, 0, 0),
             (BtrfsKey::new(u64::MAX, u8::MAX, u64::MAX), true, true),
         );
-        Self { items, loaded }
+        Self {
+            applied: items.clone(),
+            items,
+            loaded,
+        }
+    }
+
+    /// Remember one committed item. Every fetched span is complete, so an
+    /// item seen for the first time lies outside all of them and no edit can
+    /// have put anything at its key: a tree that disagrees is corrupt.
+    fn add(&mut self, key: BtrfsKey, body: Vec<u8>) -> Result<(), FsError> {
+        if self.items.contains_key(&key) {
+            return Ok(());
+        }
+        if self.applied.insert(key, body.clone()).is_some() {
+            return Err(FsError::InvalidData);
+        }
+        self.items.insert(key, body);
+        Ok(())
     }
 
     /// Fetch every committed item with a key in `[lo, hi]`, the last item
@@ -96,7 +118,7 @@ impl FstWindow {
                     Some((first, _)) if slot > 0 => (*first, false),
                     _ => match btree::last_before(vol, root, &lo).await? {
                         Some((key, body)) => {
-                            self.items.insert(key, body);
+                            self.add(key, body)?;
                             (key, false)
                         }
                         None => (lo, true),
@@ -106,7 +128,9 @@ impl FstWindow {
             if let Some((key, _)) = items.last() {
                 last = *key;
             }
-            self.items.extend(items);
+            for (key, body) in items {
+                self.add(key, body)?;
+            }
             if last > hi {
                 to_end = false;
                 break;
@@ -118,7 +142,7 @@ impl FstWindow {
             // Nothing at or after `lo`: the tree's last item precedes it.
             None => match btree::last_before(vol, root, &lo).await? {
                 Some((key, body)) => {
-                    self.items.insert(key, body);
+                    self.add(key, body)?;
                     (key, false)
                 }
                 None => (lo, true),
@@ -155,22 +179,40 @@ impl FstWindow {
         .await
     }
 
-    /// Start editing: a private copy of everything fetched.
-    pub(super) fn edit(&self, sectorsize: u64) -> FstEdit<'_> {
+    /// Start editing: a private copy of everything fetched, as committed.
+    pub(super) fn edit(&self, sectorsize: u64) -> FstEdit {
         FstEdit {
-            committed: &self.items,
             items: self.items.clone(),
             sectorsize,
         }
     }
+
+    /// The key edits that take the tree in progress from what it holds — the
+    /// committed items, with every earlier call's edits applied — to
+    /// `desired` ([`FstEdit::into_items`] of an edit started from this
+    /// window as it is now), which it holds from here on.
+    pub(super) fn take_edits(&mut self, desired: BTreeMap<BtrfsKey, Vec<u8>>) -> Vec<Edit> {
+        let mut edits = Vec::new();
+        for key in self.applied.keys() {
+            if !desired.contains_key(key) {
+                edits.push(Edit::Delete(*key));
+            }
+        }
+        for (key, body) in &desired {
+            if self.applied.get(key) != Some(body) {
+                edits.push(Edit::Upsert(*key, body.clone()));
+            }
+        }
+        self.applied = desired;
+        edits
+    }
 }
 
-/// One round's edits to the free-space tree, over the items an
-/// [`FstWindow`] fetched. Every range passed to [`Self::mark_used`] /
+/// The free-space tree's items as a transaction's allocations and frees leave
+/// them, over the committed items an [`FstWindow`] fetched. Every range passed to [`Self::mark_used`] /
 /// [`Self::mark_free`] must have been [`FstWindow::prepare`]d.
 #[derive(Debug)]
-pub(super) struct FstEdit<'w> {
-    committed: &'w BTreeMap<BtrfsKey, Vec<u8>>,
+pub(super) struct FstEdit {
     items: BTreeMap<BtrfsKey, Vec<u8>>,
     sectorsize: u64,
 }
@@ -179,7 +221,7 @@ fn extent_key(start: u64, len: u64) -> BtrfsKey {
     BtrfsKey::new(start, format::FREE_SPACE_EXTENT_KEY, len)
 }
 
-impl FstEdit<'_> {
+impl FstEdit {
     /// Add an empty block group: its info item and one free extent spanning
     /// it, in extent form (Linux `add_new_free_space_info` +
     /// `add_block_group_free_space`).
@@ -436,28 +478,9 @@ impl FstEdit<'_> {
         self.adjust_count(bg_start, bg_len, 1 - removed)
     }
 
-    /// The key edits that turn the committed items into the edited ones.
-    pub(super) fn finish(self) -> Vec<Edit> {
-        let mut edits = Vec::new();
-        for key in self.committed.keys() {
-            if !self.items.contains_key(key) {
-                edits.push(Edit::Delete(*key));
-            }
-        }
-        for (key, body) in self.items {
-            if self.committed.get(&key) != Some(&body) {
-                edits.push(Edit::Upsert(key, body));
-            }
-        }
-        edits
+    /// The edited items: every fetched item the edits left, and every item
+    /// they added.
+    pub(super) fn into_items(self) -> BTreeMap<BtrfsKey, Vec<u8>> {
+        self.items
     }
-}
-
-/// A key no valid free-space tree holds, which sorts into the leaf holding
-/// the item that covers `addr` (the last real key at or below it: a bitmap
-/// with offset `u64::MAX` does not exist). Deleting it changes nothing and
-/// path-COWs that leaf — how the commit's fixed point keeps the set of
-/// leaves it rewrites from shrinking between rounds.
-pub(super) fn touch_key(addr: u64) -> BtrfsKey {
-    BtrfsKey::new(addr, format::FREE_SPACE_BITMAP_KEY, u64::MAX)
 }
