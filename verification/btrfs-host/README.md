@@ -19,7 +19,7 @@ mostly-full DATA block groups, free space in hundreds of thousands of
 single-sector pieces, three-level free-space and extent trees;
 then a desktop-like workload in small transactions, with what each commit
 cost — nodes visited and written per tree, recording passes, blocks beyond
-the reservation, wall time — reported) and `fsync-linux` (the tree log
+the reservation, wall time — reported) and `fsync-linux`, `fsync-narf`, `fsync-sweep` (the tree log
 against a real kernel, below). Every commit is audited against the
 on-disk free-space tree (in `scale`, every commit of its second workload
 pass), and the run reports the most any commit allocated beyond its batch's
@@ -66,6 +66,20 @@ ones). Linux runs it and is killed at `crash`; the image is then replayed
 twice from copies, by Linux and by NARF, and the two trees must be
 identical, pass `btrfs check --check-data-csum`, keep what the script's
 fsyncs promised, and the NARF-replayed image must mount on Linux unchanged.
+
+`fsync-narf` is the other direction: NARF runs the scripts with its log
+writer on, the image is copied at `crash`, and the same two replays and
+checks follow — a real kernel replaying logs NARF wrote. It prints how the
+fsyncs were served (logged, committed and why, nothing to do) and what the
+sixty-file write-temp + fsync + rename burst cost in superblock writes and
+commits.
+
+`fsync-sweep` cuts NARF's recorded write stream of three scripts after
+every write (a spread beyond `4 × --cuts` writes; `--exhaustive` for all),
+once keeping every write and once dropping the ones no flush had covered,
+and requires each resulting image to replay under NARF with every returned
+fsync intact and to pass `btrfs check`; every eighth cut is also replayed by
+Linux and compared.
 
 When no kernel can be booted (no readable `/boot/vmlinuz*`, btrfs built as a
 module, no QEMU, no static libc) the scenario prints

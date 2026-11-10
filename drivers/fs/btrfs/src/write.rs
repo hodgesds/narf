@@ -99,6 +99,7 @@ pub use fileops::{
     fallocate_file, truncate_file, FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
 };
 pub use log_replay::replay_log;
+pub use tree_log::set_fsync_via_log;
 
 // Header field offsets rewritten when a node is stamped.
 const HDR_BYTENR: usize = 48;

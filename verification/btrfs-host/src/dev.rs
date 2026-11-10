@@ -48,6 +48,9 @@ pub struct RecDev {
     flushes: AtomicU64,
     /// Generation of every primary superblock written, in order.
     sb_gens: Mutex<Vec<u64>>,
+    /// `log_root` of every primary superblock written, in the same order:
+    /// non-zero for a tree-log sync, zero for a transaction commit.
+    sb_log_roots: Mutex<Vec<u64>>,
 }
 
 impl RecDev {
@@ -78,6 +81,7 @@ impl RecDev {
             writes: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
             sb_gens: Mutex::new(Vec::new()),
+            sb_log_roots: Mutex::new(Vec::new()),
         }
     }
 
@@ -100,6 +104,11 @@ impl RecDev {
     /// Generations of the primary superblocks written so far.
     pub fn sb_gens(&self) -> Vec<u64> {
         self.sb_gens.lock().unwrap().clone()
+    }
+
+    /// `log_root` of the primary superblocks written so far.
+    pub fn sb_log_roots(&self) -> Vec<u64> {
+        self.sb_log_roots.lock().unwrap().clone()
     }
 
     pub fn sb_count(&self) -> usize {
@@ -137,6 +146,7 @@ impl RecDev {
                 }
                 if i == 0 && data[0x20..0x30] == self.fsid {
                     self.sb_gens.lock().unwrap().push(sb_generation(data));
+                    self.sb_log_roots.lock().unwrap().push(sb_log_root(data));
                 }
                 return;
             }
@@ -237,6 +247,11 @@ impl BlockDeviceSync for RecDev {
             fua: true,
         }
     }
+}
+
+/// `btrfs_super_block::log_root`.
+pub fn sb_log_root(sb: &[u8]) -> u64 {
+    u64::from_le_bytes(sb[0x60..0x68].try_into().unwrap())
 }
 
 pub fn sb_generation(sb: &[u8]) -> u64 {

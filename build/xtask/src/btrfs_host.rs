@@ -30,7 +30,8 @@ pub struct Args {
     #[arg(long)]
     pub exhaustive: bool,
     /// Comma-separated scenarios
-    /// (regress,root,snapshots,lba4k,gate,fst,enospc,scale,fsync-linux).
+    /// (regress,root,snapshots,lba4k,gate,fst,enospc,scale,fsync-linux,
+    /// fsync-narf,fsync-sweep).
     #[arg(long)]
     pub scenario: Option<String>,
     /// Random scripts per tree-log scenario besides the fixed cases.

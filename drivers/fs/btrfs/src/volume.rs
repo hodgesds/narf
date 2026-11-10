@@ -2740,6 +2740,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// between another CPU's tree reads and its staging.
     pub async fn sync_to_disk_exclusive(&self) -> Result<(), FsError> {
         let _op = self.op_lock().lock().await;
+        self.sync_to_disk_op_locked().await
+    }
+
+    /// [`Self::sync_to_disk_exclusive`] for a caller already holding the
+    /// operation lock (an fsync that found it has to commit).
+    pub(crate) async fn sync_to_disk_op_locked(&self) -> Result<(), FsError> {
         // Reclaiming orphans is housekeeping this call does on the way; what
         // it owes its caller is the commit. An orphan that cannot be
         // reclaimed for lack of space must not cost the sync — the commit
@@ -2784,6 +2790,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// this commit came from was taken before it started, so there is nothing
     /// of its own left to flush, and calling back into the batch machinery
     /// from inside a commit makes the two mutually recursive for no gain.
+    /// Whether a commit's superblock is still waiting to be written.
+    pub(crate) fn has_staged_super(&self) -> bool {
+        self.staged_super.lock().is_some()
+    }
+
     pub(crate) async fn write_staged_super(&self) -> Result<(), FsError> {
         let staged = self.staged_super.lock().take();
         let Some((raw, root_admin)) = staged else {

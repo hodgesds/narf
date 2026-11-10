@@ -1086,10 +1086,17 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     /// `btrfs_sync_file` makes no distinction either: its `datasync`
     /// argument is only traced, and both calls log the same inode state.
     ///
-    /// (The tree-log is only used to *replay* a crashed volume's log on mount,
-    /// not to defer writes, so both are a full commit.)
+    /// Both go through [`crate::write::tree_log::fsync_inode`], which logs
+    /// the inode or, for whatever the log cannot express, commits.
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
+        Box::pin(async move {
+            let vol = self.volume()?;
+            if self.tree_root.is_some() {
+                // A pinned nested subvolume is read-only through this node.
+                return vol.sync_to_disk_exclusive().await;
+            }
+            crate::write::tree_log::fsync_inode(&vol, self.ino, false).await
+        })
     }
 
     fn stat(&self) -> Stat {
@@ -1328,9 +1335,16 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
     /// a file's does (see [`FileOps::fsync`] above): `sync(2)`, `syncfs` on a
     /// directory fd and `fsync` of a directory after a rename all land here.
     /// `fdatasync` of a directory is no weaker: its entries are metadata,
-    /// and they are durable only once committed.
+    /// and they are durable only once committed. A directory is not logged:
+    /// its fsync always commits ([`crate::write::tree_log::Fallback`]).
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
+        Box::pin(async move {
+            let vol = self.volume()?;
+            if self.tree_root.is_some() {
+                return vol.sync_to_disk_exclusive().await;
+            }
+            crate::write::tree_log::fsync_inode(&vol, self.ino, true).await
+        })
     }
 
     /// `syncfs(2)`, and the generic `sync(2)` / pre-shutdown sync of every

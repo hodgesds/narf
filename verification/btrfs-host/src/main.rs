@@ -49,7 +49,7 @@ USAGE: narf-btrfs-host [OPTIONS]
   --exhaustive      crash-test every flush boundary plus two random cuts per
                     flush window (slow)
   --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate,fst,
-                    enospc,scale,fsync-linux
+                    enospc,scale,fsync-linux,fsync-narf,fsync-sweep
                     (default all)
   --fsync-cases N   random scripts in each tree-log scenario besides the fixed
                     ones (default: four per seed)
@@ -67,7 +67,7 @@ USAGE: narf-btrfs-host [OPTIONS]
 ";
 
 /// The default selection (`regress` = every `regress-*` case).
-pub const SCENARIOS: [&str; 9] = [
+pub const SCENARIOS: [&str; 11] = [
     "regress",
     "root",
     "snapshots",
@@ -77,6 +77,8 @@ pub const SCENARIOS: [&str; 9] = [
     "enospc",
     "scale",
     "fsync-linux",
+    "fsync-narf",
+    "fsync-sweep",
 ];
 /// Names `--scenario` also accepts.
 const REGRESS: [&str; 3] = [
@@ -751,12 +753,23 @@ fn main() {
             }
             continue;
         }
-        if ["fst", "enospc", "scale", "fsync-linux"].contains(&name.as_str()) {
+        if [
+            "fst",
+            "enospc",
+            "scale",
+            "fsync-linux",
+            "fsync-narf",
+            "fsync-sweep",
+        ]
+        .contains(&name.as_str())
+        {
             let run = match name.as_str() {
                 "fst" => fst::run(&args),
                 "enospc" => enospc::run(&args),
                 "scale" => scale::run(&args),
-                _ => fsynclog::run_linux(&args),
+                "fsync-linux" => fsynclog::run_linux(&args),
+                "fsync-narf" => fsynclog::run_narf(&args),
+                _ => fsynclog::run_sweep(&args),
             };
             match run {
                 Ok(s) => {

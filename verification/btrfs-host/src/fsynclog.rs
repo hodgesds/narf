@@ -20,17 +20,29 @@
 //! as some fsync left it, never empty or torn.
 //!
 //! `fsync-linux`: Linux writes the log (the guest is killed at `crash`).
+//! `fsync-narf`: NARF writes it — the scripts run through NARF's VFS and the
+//! image is copied at `crash`, before anything else can reach it — and the
+//! run reports how many fsyncs went through the log and how many had to
+//! commit, with the superblock writes and commits a sixty-file
+//! write-temp + fsync + rename burst cost.
+//! `fsync-sweep`: NARF runs a script while the device records every write;
+//! the image is then rebuilt as it would be had power failed after each
+//! write (all of a sample when there are many; with and without the
+//! writes no flush had covered yet), and every one of those images must
+//! replay under NARF to a state that keeps each fsync that had returned by
+//! then, and pass `btrfs check`; a spread of them is also replayed by
+//! Linux and compared.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use narf_filesystem::{DirOps, FileType, FsInstance};
+use narf_filesystem::{DirOps, FileOps, FileType, FsError, FsInstance};
 
 use crate::dev::{self, RecDev};
 use crate::host::block_on;
 use crate::linuxvm::{self, Ent, Listing, Vm};
-use crate::narf::read_all;
+use crate::narf::{dir_at, file_at, read_all, split};
 use crate::workload::Rng;
 use crate::{fixture, linux, narf};
 
@@ -38,6 +50,24 @@ use crate::{fixture, linux, narf};
 const SUBVOLS: [&str; 2] = ["@", "@home"];
 
 const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The files every case starts from (`make_pristine`): `(path, length,
+/// compressible)`. `mkfs.btrfs --compress zstd:1` stores the compressible
+/// one as zstd extents, as most of a real root is stored.
+const FIXTURE_FILES: [(&str, usize, bool); 4] = [
+    ("@/etc/hostname", 5, false),
+    ("@/usr/lib/blob", 300_000, false),
+    ("@/usr/share/words", 200_000, true),
+    ("@home/user/.profile", 40, false),
+];
+
+fn fixture_bytes(len: usize, compressible: bool) -> Vec<u8> {
+    if compressible {
+        (0..len).map(|i| b'a' + (i / 64 % 7) as u8).collect()
+    } else {
+        linuxvm::pattern_bytes(len as u64, 0, len)
+    }
+}
 
 // ── The script model ───────────────────────────────────────────────
 
@@ -100,6 +130,23 @@ impl ScriptModel {
             m.inodes.push(Node::Dir);
             m.names.insert(sv.to_string(), m.inodes.len() - 1);
         }
+        // The fixture's own files and directories, committed.
+        for (path, len, compressible) in FIXTURE_FILES {
+            let mut dir = String::new();
+            for part in path.rsplit_once('/').unwrap().0.split('/') {
+                if !dir.is_empty() {
+                    dir.push('/');
+                }
+                dir.push_str(part);
+                if !m.names.contains_key(&dir) {
+                    m.inodes.push(Node::Dir);
+                    m.names.insert(dir.clone(), m.inodes.len() - 1);
+                }
+            }
+            m.inodes.push(Node::File(fixture_bytes(len, compressible)));
+            m.names.insert(path.to_string(), m.inodes.len() - 1);
+        }
+        m.apply("sync");
         m
     }
 
@@ -468,6 +515,162 @@ impl Mounted {
     }
 }
 
+// ── Running a script through NARF's VFS ────────────────────────────
+
+impl Mounted {
+    fn resolve(&self, path: &str) -> Result<(Arc<dyn DirOps>, String), String> {
+        for (i, sv) in SUBVOLS.iter().enumerate() {
+            if path == *sv {
+                return Ok((self.views[i].root(), String::new()));
+            }
+            if let Some(rest) = path.strip_prefix(&format!("{sv}/")) {
+                return Ok((self.views[i].root(), rest.to_string()));
+            }
+        }
+        Err(format!("script path {path} is outside {SUBVOLS:?}"))
+    }
+
+    async fn file(&self, path: &str) -> Result<Arc<dyn FileOps>, String> {
+        let (root, rel) = self.resolve(path)?;
+        file_at(&root, &rel)
+            .await
+            .map_err(|e| format!("{path}: {e:?}"))
+    }
+
+    /// `open(path, O_CREAT, 0644)`, as the guest's `write` and `falloc` do.
+    async fn open_or_create(&self, path: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        let (root, rel) = self.resolve(path).map_err(|_| FsError::NotFound)?;
+        let (p, n) = split(&rel);
+        let dir = dir_at(&root, p).await?;
+        match dir.lookup_async(n).await {
+            Err(FsError::NotFound) => {
+                let f = dir.create(n).await?;
+                f.set_perms(0o644).await?;
+                Ok(f)
+            }
+            other => other,
+        }
+    }
+
+    /// Run one script line (not `crash`) through NARF's VFS.
+    pub fn run_line(&self, line: &str) -> Result<(), String> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let num = |i: usize| w[i].parse::<u64>().unwrap();
+        let fail = |e: FsError| format!("`{line}`: {e:?}");
+        block_on(async {
+            match w[0] {
+                "mkdir" => {
+                    let (root, rel) = self.resolve(w[1])?;
+                    let (p, n) = split(&rel);
+                    dir_at(&root, p)
+                        .await
+                        .map_err(fail)?
+                        .mkdir(n)
+                        .await
+                        .map_err(fail)?;
+                }
+                "write" => {
+                    let f = self.open_or_create(w[1]).await.map_err(fail)?;
+                    let data = linuxvm::pattern_bytes(num(4), num(2), num(3) as usize);
+                    let mut done = 0;
+                    while done < data.len() {
+                        let n = f
+                            .write(num(2) + done as u64, &data[done..])
+                            .await
+                            .map_err(fail)?;
+                        if n == 0 {
+                            return Err(format!("`{line}`: short write"));
+                        }
+                        done += n;
+                    }
+                }
+                "truncate" => self
+                    .file(w[1])
+                    .await?
+                    .truncate(num(2))
+                    .await
+                    .map_err(fail)?,
+                "falloc" => self
+                    .open_or_create(w[1])
+                    .await
+                    .map_err(fail)?
+                    .fallocate(num(2) as u32, num(3), num(4))
+                    .await
+                    .map_err(fail)?,
+                "fsync" => self.file(w[1]).await?.fsync(false).await.map_err(fail)?,
+                "fdatasync" => self.file(w[1]).await?.fsync(true).await.map_err(fail)?,
+                "fsyncdir" => {
+                    let (root, rel) = self.resolve(w[1])?;
+                    dir_at(&root, &rel)
+                        .await
+                        .map_err(fail)?
+                        .fsync(false)
+                        .await
+                        .map_err(fail)?;
+                }
+                "rename" | "link" => {
+                    let (root, from) = self.resolve(w[1])?;
+                    let (root2, to) = self.resolve(w[2])?;
+                    let (fp, fname) = split(&from);
+                    let (tp, tname) = split(&to);
+                    let fd = dir_at(&root, fp).await.map_err(fail)?;
+                    let td = dir_at(&root2, tp).await.map_err(fail)?;
+                    if w[0] == "rename" {
+                        fd.rename_to(fname, &*td, tname, 0).await.map_err(fail)?;
+                    } else {
+                        fd.link_to(fname, &*td, tname).await.map_err(fail)?;
+                    }
+                }
+                "symlink" => {
+                    let (root, rel) = self.resolve(w[2])?;
+                    let (p, n) = split(&rel);
+                    dir_at(&root, p)
+                        .await
+                        .map_err(fail)?
+                        .symlink(n, w[1])
+                        .await
+                        .map_err(fail)?;
+                }
+                "unlink" | "rmdir" => {
+                    let (root, rel) = self.resolve(w[1])?;
+                    let (p, n) = split(&rel);
+                    let dir = dir_at(&root, p).await.map_err(fail)?;
+                    if w[0] == "unlink" {
+                        dir.unlink(n).await.map_err(fail)?;
+                    } else {
+                        dir.rmdir(n).await.map_err(fail)?;
+                    }
+                }
+                "chmod" => {
+                    let perms = u16::from_str_radix(w[2], 8).unwrap();
+                    self.file(w[1])
+                        .await?
+                        .set_perms(perms)
+                        .await
+                        .map_err(fail)?;
+                }
+                "setxattr" => {
+                    let value = linuxvm::pattern_bytes(num(4), 0, num(3) as usize);
+                    self.file(w[1])
+                        .await?
+                        .set_xattr(w[2], &value, 0)
+                        .await
+                        .map_err(fail)?;
+                }
+                "rmxattr" => self
+                    .file(w[1])
+                    .await?
+                    .remove_xattr(w[2])
+                    .await
+                    .map_err(fail)?,
+                "sync" => self.views[0].root().syncfs().await.map_err(fail)?,
+                other => return Err(format!("unknown script op {other}")),
+            }
+            Ok(())
+        })
+    }
+}
+
 // ── Cases ──────────────────────────────────────────────────────────
 
 /// One named script.
@@ -706,6 +909,32 @@ pub fn fixed_cases() -> Vec<Case> {
              crash",
         ),
         case(
+            "compressed-overwrite",
+            "write @/usr/share/words 5000 20000 61
+             fsync @/usr/share/words
+             crash",
+        ),
+        case(
+            "compressed-truncate",
+            "truncate @/usr/share/words 70001
+             fsync @/usr/share/words
+             crash",
+        ),
+        case(
+            "compressed-punch",
+            "falloc @/usr/share/words 3 16384 65536
+             fsync @/usr/share/words
+             crash",
+        ),
+        case(
+            "compressed-append",
+            "write @/usr/share/words 200000 30000 62
+             fdatasync @/usr/share/words
+             write @/usr/lib/blob 100000 5000 63
+             fsync @/usr/lib/blob
+             crash",
+        ),
+        case(
             "symlink-and-dir-fsync",
             "mkdir @/sl
              sync
@@ -938,14 +1167,10 @@ pub fn log_root_of(img: &Path) -> u64 {
 pub fn make_pristine(dir: &Path) -> Result<(PathBuf, [u8; 16], u32), String> {
     let rootdir = dir.join("rootdir");
     let _ = std::fs::remove_dir_all(&rootdir);
-    for (path, len) in [
-        ("@/etc/hostname", 5usize),
-        ("@/usr/lib/blob", 300_000),
-        ("@home/user/.profile", 40),
-    ] {
+    for (path, len, compressible) in FIXTURE_FILES {
         let p = rootdir.join(path);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, linuxvm::pattern_bytes(len as u64, 0, len)).unwrap();
+        std::fs::write(&p, fixture_bytes(len, compressible)).unwrap();
     }
     let pristine = dir.join("pristine.img");
     fixture::mkfs(
@@ -1333,4 +1558,499 @@ pub fn emit_fixture(args: &crate::Args, out: &Path) -> Result<String, String> {
         out.display(),
         vm.describe()
     ))
+}
+
+// ── NARF writes the log ────────────────────────────────────────────
+
+/// How NARF served the fsyncs of one stretch of work.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FsyncCost {
+    pub logged: u64,
+    pub clean: u64,
+    pub committed: u64,
+    pub superblocks: u64,
+    pub commits: u64,
+}
+
+fn fsync_cost_now(dev: &RecDev) -> FsyncCost {
+    let (logged, clean, committed) = narf_drivers_fs_btrfs::stats::fsync_counts();
+    let log_roots = dev.sb_log_roots();
+    FsyncCost {
+        logged,
+        clean,
+        committed,
+        superblocks: log_roots.len() as u64,
+        commits: log_roots.iter().filter(|&&root| root == 0).count() as u64,
+    }
+}
+
+impl FsyncCost {
+    fn since(self, earlier: FsyncCost) -> FsyncCost {
+        FsyncCost {
+            logged: self.logged - earlier.logged,
+            clean: self.clean - earlier.clean,
+            committed: self.committed - earlier.committed,
+            superblocks: self.superblocks - earlier.superblocks,
+            commits: self.commits - earlier.commits,
+        }
+    }
+}
+
+/// One script run through NARF up to its `crash`.
+struct NarfRun {
+    /// The image as the crash left it.
+    crashed: PathBuf,
+    model: ScriptModel,
+    /// What the part of the script after its last `sync` cost.
+    cost: FsyncCost,
+    /// The device requests of the whole script, when recorded.
+    events: Vec<dev::Ev>,
+    /// `events.len()` after each script line.
+    marks: Vec<usize>,
+}
+
+/// Run `case` through NARF on a copy of the pristine image up to its
+/// `crash`.
+fn narf_runs(ctx: &Ctx, what: &str, case: &Case, record: bool) -> Result<NarfRun, String> {
+    let work = ctx.dir.join(format!("{what}.work.img"));
+    let crashed = ctx.dir.join(format!("{what}.crashed.img"));
+    linux::clone_file(&ctx.pristine, &work);
+    // The log path is off by default until it replaces the commit path;
+    // these scenarios are what proves it, so they run with it on.
+    narf_drivers_fs_btrfs::write::set_fsync_via_log(true);
+    let mounted = Mounted::mount(&work, ctx.fsid, ctx.nodesize)?;
+    let mut model = ScriptModel::new();
+    let mut base = fsync_cost_now(&mounted.dev);
+    // Log length after each script line, for the crash sweep.
+    let mut marks = Vec::new();
+    if record {
+        // The sweep starts from the pristine image, so the mount's own
+        // writes (none on a clean image) would have to be in the record.
+        mounted.dev.set_recording(true);
+    }
+    let mut log_len = 0usize;
+    let mut events: Vec<dev::Ev> = Vec::new();
+    for line in &case.script {
+        if !model.apply(line) {
+            break;
+        }
+        mounted
+            .run_line(line)
+            .map_err(|e| format!("{what}: {e}\nklog:\n{}", crate::host::klog_take_filtered()))?;
+        if line == "sync" {
+            base = fsync_cost_now(&mounted.dev);
+        }
+        if record {
+            let new = mounted.dev.take_log();
+            log_len += new.len();
+            events.extend(new);
+            marks.push(log_len);
+        }
+    }
+    let cost = fsync_cost_now(&mounted.dev).since(base);
+    // The crash: whatever the device holds now, and nothing the driver
+    // would still write on the way down.
+    linux::clone_file(&work, &crashed);
+    mounted.dev.set_recording(false);
+    mounted.unmount()?;
+    narf_drivers_fs_btrfs::write::set_fsync_via_log(false);
+    let _ = std::fs::remove_file(&work);
+    Ok(NarfRun {
+        crashed,
+        model,
+        cost,
+        events,
+        marks,
+    })
+}
+
+/// Scenario `fsync-narf`.
+pub fn run_narf(args: &crate::Args) -> Result<String, String> {
+    let t0 = std::time::Instant::now();
+    let Some(vm) = locate_vm(args, "fsync-narf")? else {
+        return Ok("fsync-narf: UNVERIFIED (skipped)".into());
+    };
+    let dir = args.workdir.join("fsync-narf");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (pristine, fsid, nodesize) = make_pristine(&dir)?;
+    let ctx = Ctx {
+        vm: Some(&vm),
+        dir: dir.clone(),
+        pristine,
+        fsid,
+        nodesize,
+    };
+    let all = cases(args);
+    let (mut logs, mut failures) = (0, Vec::new());
+    let mut total = FsyncCost::default();
+    let mut burst = None;
+    let fallbacks_before = narf_drivers_fs_btrfs::stats::fsync_fallbacks();
+    for case in &all {
+        let what = format!("narf-{}", case.name);
+        let ran = narf_runs(&ctx, &what, case, false).and_then(|run| {
+            let verdict = judge(&ctx, &what, &run.crashed, &run.model)?;
+            let _ = std::fs::remove_file(&run.crashed);
+            Ok((verdict, run.cost))
+        });
+        match ran {
+            Ok((v, cost)) => {
+                logs += v.had_log as usize;
+                total.logged += cost.logged;
+                total.clean += cost.clean;
+                total.committed += cost.committed;
+                if case.name == "temp-fsync-rename-burst" {
+                    burst = Some(cost);
+                }
+                if args.verbose {
+                    println!(
+                        "  fsync-narf {}: ok ({} entries, {}; fsyncs: {} logged, {} committed, {} clean; {} superblock writes, {} commits)",
+                        case.name,
+                        v.entries,
+                        if v.had_log { "log replayed" } else { "no log on disk" },
+                        cost.logged,
+                        cost.committed,
+                        cost.clean,
+                        cost.superblocks,
+                        cost.commits
+                    );
+                }
+            }
+            Err(e) => {
+                std::fs::write(
+                    dir.join(format!("{}.script", case.name)),
+                    case.script.join("\n"),
+                )
+                .unwrap();
+                failures.push(e);
+                narf::reset();
+            }
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "{} of {} cases failed:\n{}",
+            failures.len(),
+            all.len(),
+            failures.join("\n")
+        ));
+    }
+    let why: Vec<String> = narf_drivers_fs_btrfs::stats::fsync_fallbacks()
+        .into_iter()
+        .map(|(reason, n)| {
+            let before = fallbacks_before
+                .iter()
+                .find(|(r, _)| *r == reason)
+                .map_or(0, |(_, n)| *n);
+            (reason, n - before)
+        })
+        .filter(|&(_, n)| n != 0)
+        .map(|(reason, n)| format!("{reason}: {n}"))
+        .collect();
+    if logs == 0 {
+        return Err("no case left a NARF-written log: nothing was verified".into());
+    }
+    if !args.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(format!(
+        "fsync-narf: PASS in {:.1?} — {} — {} scripts, {} left a NARF-written log; each replayed by Linux and by NARF to identical trees, btrfs check --check-data-csum clean after both\n  fsyncs: {} through the log, {} by full commit ({}), {} with nothing to do\n  temp+fsync+rename burst of 60: {}",
+        t0.elapsed(),
+        vm.describe(),
+        all.len(),
+        logs,
+        total.logged,
+        total.committed,
+        if why.is_empty() { "none".to_string() } else { why.join(", ") },
+        total.clean,
+        match burst {
+            Some(b) => format!(
+                "{} fsyncs logged, {} committed; {} superblock writes of which {} transaction commits",
+                b.logged, b.committed, b.superblocks, b.commits
+            ),
+            None => "not run".into(),
+        }
+    ))
+}
+
+// ── Crash-point sweep ──────────────────────────────────────────────
+
+/// The scripts the sweep cuts: short enough to cut at every write.
+fn sweep_cases() -> Vec<Case> {
+    let mut burst = String::new();
+    for i in 0..10 {
+        burst.push_str(&format!(
+            "write @home/cfg{i} 0 {} {}\n",
+            2000 + i * 37,
+            100 + i
+        ));
+    }
+    burst.push_str("sync\n");
+    for i in 0..10 {
+        burst.push_str(&format!(
+            "write @home/cfg{i}.tmp 0 {} {}\nfsync @home/cfg{i}.tmp\nrename @home/cfg{i}.tmp @home/cfg{i}\n",
+            3000 + i * 53,
+            200 + i
+        ));
+    }
+    burst.push_str("crash\n");
+    vec![
+        case("sweep-burst", &burst),
+        case(
+            "sweep-mixed",
+            "write @/a 0 50000 1
+             write @/t 0 300000 2
+             write @/o 0 200000 3
+             sync
+             write @/a 50000 30000 4
+             fsync @/a
+             truncate @/t 100001
+             fsync @/t
+             write @/o 8192 20000 5
+             fdatasync @/o
+             mkdir @/nd
+             mkdir @/nd/deep
+             write @/nd/deep/f 0 9000 6
+             fsync @/nd/deep/f
+             write @home/h 0 70000 7
+             fsync @home/h
+             write @/a 0 100 8
+             fsync @/a
+             write @/unsynced 0 5000 9
+             crash",
+        ),
+        case(
+            "sweep-commit-boundaries",
+            "write @/c1 0 40000 1
+             fsync @/c1
+             sync
+             write @/c1 40000 40000 2
+             write @/c2 0 40000 3
+             fsync @/c2
+             rename @/c2 @/c3
+             fsync @/c3
+             write @/c1 0 100 4
+             fsync @/c1
+             mkdir @/dd
+             write @/dd/x 0 5000 5
+             fsyncdir @/dd
+             write @/dd/x 5000 5000 6
+             fsync @/dd/x
+             crash",
+        ),
+    ]
+}
+
+/// Scenario `fsync-sweep`.
+pub fn run_sweep(args: &crate::Args) -> Result<String, String> {
+    use std::os::unix::fs::FileExt;
+    let t0 = std::time::Instant::now();
+    let vm = locate_vm(args, "fsync-sweep (the Linux-replay sample)")?;
+    let dir = args.workdir.join("fsync-sweep");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (pristine, fsid, nodesize) = make_pristine(&dir)?;
+    // Without a guest only NARF's replay of each cut is checked.
+    let (mut cuts_run, mut linux_run, mut with_log) = (0usize, 0usize, 0usize);
+    let mut failures: Vec<String> = Vec::new();
+    for case in sweep_cases() {
+        let ctx = Ctx {
+            vm: vm.as_ref(),
+            dir: dir.clone(),
+            pristine: pristine.clone(),
+            fsid,
+            nodesize,
+        };
+        let what = case.name.clone();
+        let run = narf_runs(&ctx, &what, &case, true)?;
+        let _ = std::fs::remove_file(&run.crashed);
+        let (events, marks) = (run.events, run.marks);
+        // The model after each completed line.
+        let mut models: Vec<ScriptModel> = Vec::new();
+        let lines: Vec<&String> = case.script.iter().filter(|l| *l != "crash").collect();
+        for upto in 0..=lines.len() {
+            let mut m = ScriptModel::new();
+            for line in &lines[..upto] {
+                m.apply(line);
+            }
+            models.push(m);
+        }
+        // Cut points: every write when few, an even spread otherwise.
+        let limit = if args.exhaustive {
+            usize::MAX
+        } else {
+            args.cuts.max(1) * 4
+        };
+        let step = events.len().div_ceil(limit).max(1);
+        let durable = dir.join(format!("{what}.durable.img"));
+        linux::clone_file(&pristine, &durable);
+        let dfile = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&durable)
+            .unwrap();
+        let mut applied = 0usize;
+        let mut cut = 0usize;
+        while cut <= events.len() {
+            // Bring the durable image up to `cut` events.
+            for ev in &events[applied..cut] {
+                if let dev::Ev::Write { off, data, .. } = ev {
+                    dfile.write_all_at(data, *off).unwrap();
+                }
+            }
+            applied = cut;
+            // Lines whose every write is in the prefix have returned.
+            let done = marks.iter().take_while(|&&m| m <= cut).count();
+            for drop_unflushed in [false, true] {
+                let img = dir.join(format!("{what}.cut{cut}.{}.img", drop_unflushed as u8));
+                linux::clone_file(&durable, &img);
+                if drop_unflushed {
+                    // A volatile write cache: everything since the last
+                    // flush that was not written FUA is lost. Rebuild from
+                    // the pristine image with only the durable writes.
+                    let last_flush = events[..cut]
+                        .iter()
+                        .rposition(|e| matches!(e, dev::Ev::Flush))
+                        .unwrap_or(0);
+                    if events[last_flush..cut]
+                        .iter()
+                        .all(|e| !matches!(e, dev::Ev::Write { fua: false, .. }))
+                    {
+                        let _ = std::fs::remove_file(&img);
+                        continue; // identical to the other variant
+                    }
+                    linux::clone_file(&pristine, &img);
+                    let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+                    for (i, ev) in events[..cut].iter().enumerate() {
+                        if let dev::Ev::Write { off, data, fua } = ev {
+                            if i < last_flush || *fua {
+                                f.write_all_at(data, *off).unwrap();
+                            }
+                        }
+                    }
+                }
+                cuts_run += 1;
+                with_log += (log_root_of(&img) != 0) as usize;
+                let name = format!(
+                    "{what} cut {cut}/{} ({})",
+                    events.len(),
+                    if drop_unflushed {
+                        "unflushed writes lost"
+                    } else {
+                        "all writes kept"
+                    }
+                );
+                // With unflushed writes lost, an fsync counts as returned
+                // only if its last write (the FUA superblock) survived,
+                // which the `done` count already reflects: every line's
+                // writes end with a flush or FUA write when it promised
+                // durability.
+                let sample_linux = vm.is_some() && !drop_unflushed && (cut / step) % 8 == 0;
+                match sweep_one(
+                    &ctx,
+                    &name,
+                    &img,
+                    &models[done],
+                    models.get(done + 1),
+                    sample_linux,
+                ) {
+                    Ok(()) => {
+                        linux_run += sample_linux as usize;
+                        let _ = std::fs::remove_file(&img);
+                    }
+                    Err(e) => {
+                        failures.push(e);
+                        narf::reset();
+                    }
+                }
+                if failures.len() >= 5 {
+                    return Err(format!(
+                        "fsync-sweep: stopping after 5 failures:\n{}",
+                        failures.join("\n")
+                    ));
+                }
+            }
+            if cut == events.len() {
+                break;
+            }
+            cut = (cut + step).min(events.len());
+        }
+        let _ = std::fs::remove_file(&durable);
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("\n"));
+    }
+    if with_log == 0 {
+        return Err("no cut image carried a log: the sweep proved nothing".into());
+    }
+    if !args.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(format!(
+        "fsync-sweep: PASS in {:.1?} — {} crash images ({} carrying a log): each replayed by NARF keeping every fsync that had returned, btrfs check --check-data-csum clean after replay; {}",
+        t0.elapsed(),
+        cuts_run,
+        with_log,
+        match &vm {
+            Some(vm) => format!(
+                "{linux_run} of them also replayed by {} to the identical tree",
+                vm.describe()
+            ),
+            None => "Linux replay of the sample UNVERIFIED (no guest)".into(),
+        }
+    ))
+}
+
+/// One cut image: NARF replays it; the fsyncs that had returned hold;
+/// `btrfs check` is clean; optionally Linux replays a second copy to the
+/// same tree.
+fn sweep_one(
+    ctx: &Ctx,
+    what: &str,
+    img: &Path,
+    model: &ScriptModel,
+    next: Option<&ScriptModel>,
+    with_linux: bool,
+) -> Result<(), String> {
+    if with_linux {
+        let slug: String = what
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        // The line in flight may have become durable through a commit it
+        // forced; then the tree matches the model after it.
+        return match judge(ctx, &slug, img, model) {
+            Ok(_) => Ok(()),
+            Err(first) => match next {
+                Some(next) => judge(ctx, &slug, img, next).map(|_| ()).map_err(|_| first),
+                None => Err(first),
+            },
+        };
+    }
+    let by_narf = img.with_extension("replayed.img");
+    linux::clone_file(img, &by_narf);
+    let mounted = Mounted::mount(&by_narf, ctx.fsid, ctx.nodesize).map_err(|e| {
+        format!(
+            "{what}: NARF mount (replay): {e}\nklog:\n{}",
+            crate::host::klog_take_filtered()
+        )
+    })?;
+    let listing = mounted.listing();
+    mounted.unmount()?;
+    let listing = listing.map_err(|e| format!("{what}: NARF after replay: {e}"))?;
+    if log_root_of(&by_narf) != 0 {
+        return Err(format!("{what}: log_root still set after NARF's mount"));
+    }
+    linux::check(&by_narf, true).map_err(|e| format!("{what}: after NARF replay: {e}"))?;
+    let broken = model.check("NARF replay", &listing);
+    if !broken.is_empty() {
+        let also = next.map(|n| n.check("NARF replay", &listing));
+        if also.is_none_or(|b| !b.is_empty()) {
+            return Err(format!(
+                "{what}: fsync promises broken:\n  {}",
+                broken.join("\n  ")
+            ));
+        }
+    }
+    let _ = std::fs::remove_file(&by_narf);
+    Ok(())
 }

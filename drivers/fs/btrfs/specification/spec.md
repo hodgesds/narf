@@ -304,6 +304,124 @@ orphan item (the writer's orphan reclaim handles files only); files get the
 orphan item and are reclaimed by `recover_orphans` after the replay commits.
 Qgroup counts are not maintained by replay.
 
+**Tree-log writer** (`write/tree_log.rs`; Linux `btrfs_sync_file` →
+`btrfs_log_dentry_safe` → `btrfs_log_inode`, then `btrfs_sync_log`).
+`tree_log::fsync_inode` logs one regular file and makes the log durable
+without committing the transaction. It is reached from `FileOps::fsync` /
+`DirOps::fsync` and is switched off by default
+(`write::set_fsync_via_log(false)`: every fsync still commits) until the
+switch is removed.
+
+NARF writes a file's data extents when `write` returns and stages the
+fs-tree edits into the open transaction, whose tree blocks are on the device
+but named by no superblock. What an fsync has to make durable is therefore
+the difference between the subvolume tree at the last commit
+(`SubvolBatch::base_root`) and the live tree, for one inode. The writer
+computes exactly that from the two trees at every fsync; it keeps no
+per-inode logging state (Linux's `logged_trans`, `last_unlink_trans`,
+`BTRFS_INODE_NEEDS_FULL_SYNC`, modified-extent lists), so no mutation path
+has to maintain any. The log of an inode is:
+
+| logged | as Linux logs it in |
+|---|---|
+| its `INODE_ITEM`, as in the live tree | `fill_inode_item` (`LOG_INODE_ALL`) |
+| every `INODE_REF` item | `copy_items` |
+| every `XATTR_ITEM` (replay deletes the ones not logged) | `btrfs_log_all_xattrs` |
+| every `EXTENT_DATA` item that is not byte-identical to the committed item of the same key; and every item reaching past the sector-aligned size, changed or not, because replay truncates to the size first | `btrfs_log_changed_extents` / `copy_items`; `btrfs_log_prealloc_extents` |
+| with `NO_HOLES`, an explicit hole item over each range that has no item now and held data at the commit | `btrfs_log_holes` |
+| one `EXTENT_CSUM` item (`-10`, in the subvolume's log tree) per logged data extent born in this transaction, from the checksums the transaction holds for its commit; extents the commit already has keep their committed checksums and replay only takes a reference | `log_extent_csums` → `log_csums` |
+| for a file the last commit does not have: every directory above it that the commit does not have either, as `INODE_ITEM` + `INODE_REF` + xattrs and none of its entries | `btrfs_log_inode_parent` → `log_all_new_ancestors` (`LOG_INODE_EXISTS`) |
+
+A file created since the commit thus comes back by name: replay's
+`add_inode_ref` links each logged `INODE_REF` into its directory. A file
+the commit has keeps its committed names, which is why its names must be
+unchanged (below).
+
+Writing (`log_inode`). The transaction's logs live in memory as item sets
+per inode (`LogState`); a sync rebuilds the fsynced subvolume's log tree
+from them and the log root tree's one leaf (`ROOT_ITEM`
+`(-6, ROOT_ITEM, subvolume)`, laid out as `btrfs_add_log_tree` leaves it),
+in blocks owned by `BTRFS_TREE_LOG_OBJECTID` at the transaction's
+generation. The blocks come from the transaction's own allocator, as
+Linux's come from `btrfs_alloc_tree_block`, and only while the free
+metadata left still covers the reservation of the operations the
+transaction has accepted (`ReserveGeometry::ordinary_need`). They, and the
+logged data extents no committed tree accounts for, are withheld from every
+allocator (`LogCore::pin`) until a commit's superblock has replaced the
+log's, as Linux pins them until `btrfs_free_log` and the end of the commit
+— including blocks a later sync of the same transaction superseded, and
+data extents the file has since dropped: the log on the device may still
+name them. Then `btrfs_sync_log`: the last committed superblock with
+`log_root` / `log_root_level` set goes through `write_all_supers`, whose
+pre-flush of every device makes the data and the log blocks durable before
+the FUA superblock names them. If a commit's superblock is still staged it
+is written first (the log's blocks carry `super.generation + 1`). Every
+commit clears `log_root` (`on_commit`); a transaction that commits after a
+log sync needs no log, and the next one starts a new log.
+
+An fsync that finds nothing of the inode newer than the last commit issues
+a flush and returns. Everything else commits the transaction instead
+(`Fallback`, counted per reason in `stats::fsync_fallbacks`) — always
+correct, as in Linux (`BTRFS_LOG_FORCE_COMMIT`, `btrfs_set_log_full_commit`):
+
+- **a directory** (`DirOps::fsync`), a symlink or a special file — Linux
+  logs directories (`log_directory_changes`); this writer does not;
+- **names changed since the commit**: the file was renamed, linked or lost
+  one of several links (Linux: `btrfs_log_new_name`, `last_unlink_trans` →
+  `btrfs_log_all_parents`); also a new parent directory whose own name
+  changed;
+- **a name of a new file collides**: the name, or its directory index, was
+  held by any inode at the commit (replay would unlink that inode's entry:
+  Linux resolves it with `log_conflicting_inodes`), or is claimed by another
+  inode already in this log;
+- **inode number reused**: the number, or a parent's, belonged to a
+  different inode at the commit, or to a different inode already in the log
+  (creation time or type differ);
+- **unlinked inode** (no link left, still open) — Linux skips it;
+- **extended refs**: a name of the inode lives in an `INODE_EXTREF`;
+- **unsupported items**: any item type other than inode item, refs, xattrs
+  and file extents (verity, …), a single item larger than a leaf, a logged
+  extent whose length disagrees with the transaction's record, overlapping
+  checksum ranges;
+- **size**: more than 2048 logged items for the inode, a log tree past 16
+  leaves, more than 1024 log blocks in the transaction, more
+  logged subvolumes than one leaf of log root items holds;
+- **space**: the log blocks do not fit beside the transaction's
+  reservation;
+- **quotas enabled** (replay does not maintain qgroup counts), **no
+  free-space tree** (nothing to withhold log blocks with), **read-only or
+  aborted filesystem**, and **a failed earlier log write** of the same
+  transaction.
+
+Snapshot and subvolume creation, chunk allocation and every other
+non-batched transaction commit and so end the log before they run.
+
+Differences from Linux, and why they are sound:
+
+- *The log is a diff against the commit, recomputed per fsync*, where Linux
+  accumulates per-inode state. Same items on disk for the supported cases;
+  nothing to keep in step with every mutation path.
+- *A sync rewrites the subvolume's log tree* where Linux COWs the paths it
+  changed. The tree on disk is an ordinary log tree either way; the size
+  limits above bound the cost, and superseded blocks stay pinned as Linux's
+  COWed-away log blocks do.
+- *Every superblock copy is written* on a log sync, where Linux writes only
+  the primary (`write_all_supers(fs_info, 1)`): NARF keeps all copies in
+  lockstep, and a mount picks the highest generation among them.
+- *Operations after an fsync do not touch the log.* Linux updates it on
+  rename and unlink (`btrfs_log_new_name`, `btrfs_del_inode_ref_in_log`); here
+  the log keeps the inode as it was fsynced, and the name checks above send
+  any later fsync that would contradict it to a commit. After a crash the
+  file is under the name it was fsynced under, with the content it was
+  fsynced with — the state at the fsync, which is what fsync promises.
+
+Durability: when `fsync` returns, the file's data, size, mode, xattrs and —
+for a new file — its name in its directory, with any new directories above
+it, survive a crash; later unsynced changes to it do not come back. Write a
+temporary file, fsync it, rename it over the real one: after a crash at any
+point the real name holds the old file or the new, whole (the temporary may
+still exist under its own name).
+
 Verification: `smoke_btrfs_replays_a_linux_written_log` replays
 `testdata/fixture-linuxlog.img.sparse` (a log a real kernel wrote; regenerate
 with `narf-btrfs-host --emit-linux-log-fixture`) to the tree Linux's own
@@ -312,8 +430,25 @@ kernel (the host's, under QEMU, no root needed) write logs with scripted and
 random workloads, kills it, and replays each crashed image with that kernel
 and with NARF: the trees must be identical, both must pass
 `btrfs check --check-data-csum`, and the NARF-replayed image must mount on
-Linux unchanged. Without a bootable kernel the scenario reports itself
-unverified, never passed.
+Linux unchanged. `--scenario fsync-narf` runs the same scripts through NARF
+with the log path on and copies the image at the crash point: a real Linux
+kernel replays every NARF-written log, NARF replays a second copy, and the
+same comparison and checks apply; it reports how many fsyncs were logged
+and why the others committed. `--scenario fsync-sweep` records the device
+writes of three scripts and rebuilds the image as a power cut after each
+write would leave it, with and without the writes no flush had covered:
+every image must replay under NARF to a state that keeps each fsync that
+had returned, pass `btrfs check --check-data-csum`, and a spread of them is
+also replayed by Linux to the identical tree. In the kernel,
+`smoke_btrfs_fsync_goes_through_the_log` (new file, overwrite, append,
+truncate, new directories, unsynced writes after the fsync; five fsyncs
+cost five superblock writes and no commit),
+`smoke_btrfs_fsync_burst_does_not_commit_per_fsync` (sixty
+write-temp + fsync + rename), `smoke_btrfs_fsync_log_across_a_commit`,
+`smoke_btrfs_fsync_falls_back_to_a_commit` and
+`smoke_btrfs_own_log_replay_survives_a_crash_at_any_write` remount a copy of
+the device taken at the crash point through replay. Without a bootable
+kernel the Linux scenarios report themselves unverified, never passed.
 
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.

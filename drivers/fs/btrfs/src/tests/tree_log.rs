@@ -274,3 +274,523 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_log_replay_survives_a_crash_at_any_write
 );
+
+// ── The fsync log writer ───────────────────────────────────────────
+
+type TestVol = Arc<BtrfsVolume<narf_block::SyncBlock>>;
+
+/// The device as a power cut right now would leave it: a copy nothing the
+/// mounted volume does afterwards (its unmount commit included) can reach.
+fn crash_copy(dev: &Arc<WritableSparseDevice>) -> Arc<WritableSparseDevice> {
+    Arc::new(WritableSparseDevice {
+        runs: dev.runs.clone(),
+        total: dev.total,
+        lba_size: dev.lba_size,
+        reads: core::sync::atomic::AtomicUsize::new(0),
+        overlay: narf_lib::sync::IrqSafeSpinLock::new(dev.overlay.lock().clone()),
+    })
+}
+
+/// `len` bytes that differ for every `seed` and position.
+fn pattern(seed: u64, len: usize) -> Vec<u8> {
+    (0..len as u64)
+        .map(|i| {
+            let x =
+                (i ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+            (x >> 29) as u8
+        })
+        .collect()
+}
+
+/// The whole content of the file `name` in `dir`, or `None` if it is not
+/// there or cannot be read back (a checksum mismatch is a read error).
+fn content(dir: &Arc<dyn DirOps>, name: &str) -> Option<Vec<u8>> {
+    let f = poll_once(dir.lookup_async(name))?.ok()?;
+    let size = poll_once(f.stat_async())?.ok()?.size as usize;
+    let mut data = alloc::vec![0u8; size];
+    let mut done = 0usize;
+    while done < size {
+        match poll_once(f.read(done as u64, &mut data[done..]))? {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(_) => return None,
+        }
+    }
+    (done == size).then_some(data)
+}
+
+fn put(dir: &Arc<dyn DirOps>, name: &str, offset: u64, data: &[u8]) -> bool {
+    let f = match poll_once(dir.lookup_async(name)) {
+        Some(Ok(f)) => f,
+        _ => match poll_once(dir.create(name)) {
+            Some(Ok(f)) => f,
+            _ => return false,
+        },
+    };
+    matches!(poll_once(f.write(offset, data)), Some(Ok(n)) if n == data.len())
+}
+
+fn fsync_file(dir: &Arc<dyn DirOps>, name: &str, data_only: bool) -> bool {
+    match poll_once(dir.lookup_async(name)) {
+        Some(Ok(f)) => matches!(poll_once(f.fsync(data_only)), Some(Ok(()))),
+        _ => false,
+    }
+}
+
+/// Turns the fsync log path on for one test (it is off by default while it
+/// is being proven) and off again when the test ends.
+struct LogPathOn;
+
+impl LogPathOn {
+    fn new() -> Self {
+        crate::write::tree_log::set_fsync_via_log(true);
+        LogPathOn
+    }
+}
+
+impl Drop for LogPathOn {
+    fn drop(&mut self) {
+        crate::write::tree_log::set_fsync_via_log(false);
+    }
+}
+
+/// A fresh writable filesystem with the log path on, and its device.
+fn log_fixture() -> Option<(Arc<WritableSparseDevice>, TestVol, LogPathOn)> {
+    let on = LogPathOn::new();
+    let device = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = mount_writable(device.clone()).ok()?;
+    Some((device, vol, on))
+}
+
+/// Mount what a crash at this instant leaves on `device` — replaying the
+/// log if it carries one — and return the copy and the mount.
+fn after_crash(device: &Arc<WritableSparseDevice>) -> Option<(Arc<WritableSparseDevice>, TestVol)> {
+    let copy = crash_copy(device);
+    let vol = mount_writable(copy.clone()).ok()?;
+    (log_root_on(&copy) == 0 && vol.superblock().log_root == 0).then_some((copy, vol))
+}
+
+/// An fsync writes the inode to the tree log and one superblock; it does
+/// not commit the transaction. After a crash, replay brings back exactly
+/// what each fsync covered: a new file by name with its data, an
+/// overwrite, an append, a truncation, a file in directories that did not
+/// exist at the last commit — and nothing written after the fsync.
+fn smoke_btrfs_fsync_goes_through_the_log() -> TestResult {
+    let Some((device, vol, _log)) = log_fixture() else {
+        return TestResult::Fail("fixture failed to mount");
+    };
+    let root = vol.root();
+    let base = pattern(1, 200_000);
+    let long = pattern(2, 300_000);
+    if !put(&root, "over", 0, &base)
+        || !put(&root, "trunc", 0, &long)
+        || !put(&root, "app", 0, &base[..5000])
+        || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+    {
+        return TestResult::Fail("setup failed");
+    }
+    let before = vol.commit_stats().snapshot();
+    let (logged_before, _, committed_before) = crate::stats::fsync_counts();
+
+    // A new file.
+    let fresh = pattern(3, 70_000);
+    if !put(&root, "new", 0, &fresh) || !fsync_file(&root, "new", false) {
+        return TestResult::Fail("fsync of a new file failed");
+    }
+    if log_root_on(&device) == 0 {
+        return TestResult::Fail("fsync left no log on the device");
+    }
+    // An overwrite in the middle, an append, a truncation.
+    let patch = pattern(4, 8192);
+    let tail = pattern(5, 3000);
+    let mut over = base.clone();
+    over[4096..4096 + 8192].copy_from_slice(&patch);
+    let mut app = base[..5000].to_vec();
+    app.extend_from_slice(&tail);
+    let Some(Ok(trunc)) = poll_once(root.lookup_async("trunc")) else {
+        return TestResult::Fail("trunc missing");
+    };
+    if !put(&root, "over", 4096, &patch)
+        || !fsync_file(&root, "over", false)
+        || !put(&root, "app", 5000, &tail)
+        || !fsync_file(&root, "app", true)
+        || !matches!(poll_once(trunc.truncate(100_001)), Some(Ok(())))
+        || !matches!(poll_once(trunc.fsync(false)), Some(Ok(())))
+    {
+        return TestResult::Fail("overwrite/append/truncate + fsync failed");
+    }
+    // A file under two directories created in this transaction.
+    let deep = pattern(6, 9000);
+    let made = poll_once(root.mkdir("d1"))
+        .and_then(|d| d.ok())
+        .and_then(|d1| {
+            let d2 = poll_once(d1.mkdir("d2"))?.ok()?;
+            (put(&d2, "deep", 0, &deep) && fsync_file(&d2, "deep", false)).then_some(())
+        });
+    if made.is_none() {
+        return TestResult::Fail("fsync under new directories failed");
+    }
+    // Written after its fsync, and never synced: must not come back.
+    if !put(&root, "new", 0, &pattern(7, 20_000)) || !put(&root, "unsynced", 0, &pattern(8, 5000)) {
+        return TestResult::Fail("unsynced writes failed");
+    }
+
+    let cost = vol.commit_stats().snapshot().since(&before);
+    let (logged, _, committed) = crate::stats::fsync_counts();
+    if logged - logged_before != 5 || committed != committed_before {
+        return TestResult::Fail("an fsync did not go through the log");
+    }
+    if cost.commits != 0 {
+        return TestResult::Fail("an fsync committed the transaction");
+    }
+    if cost.super_writes != 5 {
+        return TestResult::Fail("five fsyncs did not cost exactly five superblock writes");
+    }
+
+    let Some((_copy, crashed)) = after_crash(&device) else {
+        return TestResult::Fail("mount after the crash failed or left the log");
+    };
+    let r = crashed.root();
+    if content(&r, "new").as_deref() != Some(&fresh[..]) {
+        return TestResult::Fail("fsynced new file not back as fsynced");
+    }
+    if content(&r, "over").as_deref() != Some(&over[..]) {
+        return TestResult::Fail("fsynced overwrite not back");
+    }
+    if content(&r, "app").as_deref() != Some(&app[..]) {
+        return TestResult::Fail("fdatasynced append not back");
+    }
+    if content(&r, "trunc").as_deref() != Some(&long[..100_001]) {
+        return TestResult::Fail("fsynced truncation not back");
+    }
+    let found = poll_once(r.lookup_dir_async("d1"))
+        .and_then(|d| d.ok())
+        .and_then(|d1| poll_once(d1.lookup_dir_async("d2"))?.ok())
+        .and_then(|d2| content(&d2, "deep"));
+    if found.as_deref() != Some(&deep[..]) {
+        return TestResult::Fail("file under new directories not back");
+    }
+    if poll_once(r.lookup_async("unsynced")).is_some_and(|f| f.is_ok()) {
+        return TestResult::Fail("a file nobody fsynced came back");
+    }
+    // The replayed filesystem commits and remounts like any other.
+    if !put(&r, "later", 0, &tail) || !matches!(poll_once(crashed.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("write after replay failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fsync_goes_through_the_log);
+
+/// The desktop pattern: write a temporary file, fsync it, rename it over the
+/// real one — sixty times. It costs sixty log syncs (one superblock write
+/// each) and no transaction commit, where it used to cost sixty commits; and
+/// after a crash at the end every real file is whole, old or new.
+fn smoke_btrfs_fsync_burst_does_not_commit_per_fsync() -> TestResult {
+    let Some((device, vol, _log)) = log_fixture() else {
+        return TestResult::Fail("fixture failed to mount");
+    };
+    let root = vol.root();
+    const FILES: usize = 60;
+    for i in 0..FILES {
+        if !put(
+            &root,
+            &alloc::format!("cfg{i}"),
+            0,
+            &pattern(i as u64, 2000 + i * 37),
+        ) {
+            return TestResult::Fail("setup write failed");
+        }
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("setup sync failed");
+    }
+    let before = vol.commit_stats().snapshot();
+    let (logged_before, _, committed_before) = crate::stats::fsync_counts();
+    for i in 0..FILES {
+        let tmp = alloc::format!("cfg{i}.tmp");
+        if !put(&root, &tmp, 0, &pattern(1000 + i as u64, 3000 + i * 53))
+            || !fsync_file(&root, &tmp, false)
+            || !matches!(
+                poll_once(root.rename(&tmp, &alloc::format!("cfg{i}"))),
+                Some(Ok(()))
+            )
+        {
+            return TestResult::Fail("temp + fsync + rename failed");
+        }
+    }
+    let cost = vol.commit_stats().snapshot().since(&before);
+    let (logged, _, committed) = crate::stats::fsync_counts();
+    let (logged, committed) = (logged - logged_before, committed - committed_before);
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs: burst of {FILES} temp+fsync+rename: {logged} fsyncs logged, {committed} committed; {} superblock writes, {} transaction commits (one commit and superblock per fsync before the tree log)",
+            cost.super_writes, cost.commits
+        );
+    }
+    if logged + committed != FILES as u64 {
+        return TestResult::Fail("fsync count does not add up");
+    }
+    // Space pressure may make the odd fsync commit; the burst as a whole
+    // must not.
+    if committed > 3 || cost.commits > 3 {
+        return TestResult::Fail("the burst committed the transaction per fsync");
+    }
+    if cost.super_writes > FILES as u64 + 3 {
+        return TestResult::Fail("the burst wrote more superblocks than fsyncs");
+    }
+
+    let Some((_copy, crashed)) = after_crash(&device) else {
+        return TestResult::Fail("mount after the crash failed or left the log");
+    };
+    let r = crashed.root();
+    for i in 0..FILES {
+        let old = pattern(i as u64, 2000 + i * 37);
+        let new = pattern(1000 + i as u64, 3000 + i * 53);
+        match content(&r, &alloc::format!("cfg{i}")) {
+            Some(data) if data == old || data == new => {}
+            _ => return TestResult::Fail("a replaced file is neither old nor new after the crash"),
+        }
+        // The fsynced temporary either made it to its final name or is
+        // still there under its own, whole.
+        let tmp = content(&r, &alloc::format!("cfg{i}.tmp"));
+        let renamed = content(&r, &alloc::format!("cfg{i}"));
+        if tmp.as_deref() != Some(&new[..]) && renamed.as_deref() != Some(&new[..]) {
+            return TestResult::Fail("an fsynced temporary file was lost");
+        }
+    }
+    // And without a crash, a commit makes the renames durable.
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) || log_root_on(&device) != 0 {
+        return TestResult::Fail("the commit after the burst did not clear the log");
+    }
+    drop(root);
+    drop(vol);
+    let Ok(clean) = mount_writable(device) else {
+        return TestResult::Fail("remount after the committed burst failed");
+    };
+    let r = clean.root();
+    for i in 0..FILES {
+        if content(&r, &alloc::format!("cfg{i}")).as_deref()
+            != Some(&pattern(1000 + i as u64, 3000 + i * 53)[..])
+        {
+            return TestResult::Fail("committed rename lost");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_fsync_burst_does_not_commit_per_fsync
+);
+
+/// A commit ends the log it follows: the committed superblock names no log,
+/// the log's blocks return to the allocator, and an fsync in the next
+/// transaction starts a new log on top of the commit.
+fn smoke_btrfs_fsync_log_across_a_commit() -> TestResult {
+    let Some((device, vol, _log)) = log_fixture() else {
+        return TestResult::Fail("fixture failed to mount");
+    };
+    let root = vol.root();
+    let one = pattern(11, 40_000);
+    let two = pattern(12, 40_000);
+    let three = pattern(13, 40_000);
+    if !put(&root, "seed", 0, &one) || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("setup failed");
+    }
+    if !put(&root, "c1", 0, &one) || !fsync_file(&root, "c1", false) || log_root_on(&device) == 0 {
+        return TestResult::Fail("first fsync left no log");
+    }
+    // A full commit: the log is gone from the superblock on the device.
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) || log_root_on(&device) != 0 {
+        return TestResult::Fail("commit did not clear log_root");
+    }
+    // The next transaction: change c1 without syncing it, fsync a new file.
+    if !put(&root, "c1", 40_000, &two)
+        || !put(&root, "c2", 0, &three)
+        || !fsync_file(&root, "c2", false)
+        || log_root_on(&device) == 0
+    {
+        return TestResult::Fail("fsync after the commit left no log");
+    }
+    let Some((_copy, crashed)) = after_crash(&device) else {
+        return TestResult::Fail("mount after the crash failed or left the log");
+    };
+    let r = crashed.root();
+    if content(&r, "c1").as_deref() != Some(&one[..]) {
+        return TestResult::Fail("committed file not as committed after replay");
+    }
+    if content(&r, "c2").as_deref() != Some(&three[..]) {
+        return TestResult::Fail("file fsynced after the commit not back");
+    }
+    // Many log generations in a row reuse the space commits release.
+    for round in 0..12u64 {
+        let data = pattern(100 + round, 30_000);
+        if !put(&root, "churn", 0, &data)
+            || !fsync_file(&root, "churn", false)
+            || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+        {
+            return TestResult::Fail("fsync + commit round failed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fsync_log_across_a_commit);
+
+/// What the log cannot express exactly commits instead, and is just as
+/// durable: an fsync of a directory, of a file renamed since the last
+/// commit, and of a new file under a name another inode held at the last
+/// commit.
+fn smoke_btrfs_fsync_falls_back_to_a_commit() -> TestResult {
+    let Some((device, vol, _log)) = log_fixture() else {
+        return TestResult::Fail("fixture failed to mount");
+    };
+    let root = vol.root();
+    let a = pattern(21, 12_000);
+    let b = pattern(22, 30_000);
+    if !put(&root, "old-name", 0, &a)
+        || !put(&root, "taken", 0, &a)
+        || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+    {
+        return TestResult::Fail("setup failed");
+    }
+    let fallbacks = |reason: &str| {
+        crate::stats::fsync_fallbacks()
+            .into_iter()
+            .find(|(r, _)| *r == reason)
+            .map_or(0, |(_, n)| n)
+    };
+    use crate::write::tree_log::Fallback;
+
+    // A directory after a create and a rename in it.
+    let dirs = fallbacks(Fallback::NotRegularFile.name());
+    let Some(Ok(dir)) = poll_once(root.mkdir("dir")) else {
+        return TestResult::Fail("mkdir failed");
+    };
+    if !put(&dir, "x", 0, &b)
+        || !matches!(poll_once(dir.rename("x", "y")), Some(Ok(())))
+        || !matches!(poll_once(dir.fsync(false)), Some(Ok(())))
+        || fallbacks(Fallback::NotRegularFile.name()) != dirs + 1
+        || log_root_on(&device) != 0
+    {
+        return TestResult::Fail("directory fsync did not commit");
+    }
+    let Some((_c, crashed)) = after_crash(&device) else {
+        return TestResult::Fail("mount after the directory fsync failed");
+    };
+    let entry = poll_once(crashed.root().lookup_dir_async("dir"))
+        .and_then(|d| d.ok())
+        .and_then(|d| content(&d, "y"));
+    if entry.as_deref() != Some(&b[..]) {
+        return TestResult::Fail("directory fsync lost the renamed entry");
+    }
+    drop(crashed);
+
+    // A file renamed since the last commit.
+    let renamed = fallbacks(Fallback::NamesChanged.name());
+    if !matches!(poll_once(root.rename("old-name", "new-name")), Some(Ok(())))
+        || !put(&root, "new-name", 0, &b)
+        || !fsync_file(&root, "new-name", false)
+        || fallbacks(Fallback::NamesChanged.name()) != renamed + 1
+    {
+        return TestResult::Fail("fsync of a renamed file did not commit");
+    }
+    // A new file under a name another inode held at the last commit.
+    let collided = fallbacks(Fallback::NameCollision.name());
+    if !matches!(poll_once(root.unlink("taken")), Some(Ok(())))
+        || !put(&root, "taken", 0, &b)
+        || !fsync_file(&root, "taken", false)
+        || fallbacks(Fallback::NameCollision.name()) != collided + 1
+    {
+        return TestResult::Fail("fsync under a reused name did not commit");
+    }
+    let Some((_c, crashed)) = after_crash(&device) else {
+        return TestResult::Fail("mount after the fallback fsyncs failed");
+    };
+    let r = crashed.root();
+    if content(&r, "new-name").as_deref() != Some(&b[..])
+        || content(&r, "taken").as_deref() != Some(&b[..])
+        || poll_once(r.lookup_async("old-name")).is_some_and(|f| f.is_ok())
+    {
+        return TestResult::Fail("a committed fsync was not durable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fsync_falls_back_to_a_commit);
+
+/// A log NARF wrote survives a crash in the middle of its own replay: cut
+/// the device at every write of the replay (a spread when there are many)
+/// and the next mount still ends at what the uninterrupted replay gives.
+fn smoke_btrfs_own_log_replay_survives_a_crash_at_any_write() -> TestResult {
+    let Some((device, vol, _log)) = log_fixture() else {
+        return TestResult::Fail("fixture failed to mount");
+    };
+    let root = vol.root();
+    if !put(&root, "o", 0, &pattern(31, 150_000))
+        || !put(&root, "t", 0, &pattern(32, 90_000))
+        || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+    {
+        return TestResult::Fail("setup failed");
+    }
+    let Some(Ok(t)) = poll_once(root.lookup_async("t")) else {
+        return TestResult::Fail("t missing");
+    };
+    let made = poll_once(root.mkdir("nd"))
+        .and_then(|d| d.ok())
+        .is_some_and(|nd| put(&nd, "f", 0, &pattern(33, 20_000)) && fsync_file(&nd, "f", false));
+    if !made
+        || !put(&root, "o", 8192, &pattern(34, 30_000))
+        || !fsync_file(&root, "o", false)
+        || !matches!(poll_once(t.truncate(10_001)), Some(Ok(())))
+        || !matches!(poll_once(t.fsync(false)), Some(Ok(())))
+        || !put(&root, "n", 0, &pattern(35, 300))
+        || !fsync_file(&root, "n", false)
+    {
+        return TestResult::Fail("logging failed");
+    }
+    let image = crash_copy(&device);
+    if log_root_on(&image) == 0 {
+        return TestResult::Fail("no log to replay");
+    }
+    // The uninterrupted replay is the reference.
+    let reference = {
+        let copy = crash_copy(&image);
+        let Ok(v) = mount_writable(copy) else {
+            return TestResult::Fail("reference replay failed");
+        };
+        match walk(v.root()) {
+            Ok(tree) => tree,
+            Err(why) => return TestResult::Fail(why),
+        }
+    };
+    let total = mount_cut(&crash_copy(&image), i64::MAX);
+    let step = (total / 40).max(1);
+    let mut cut = 0u64;
+    let mut log_kept = 0u32;
+    while cut <= total {
+        let copy = crash_copy(&image);
+        mount_cut(&copy, cut as i64);
+        if log_root_on(&copy) != 0 {
+            log_kept += 1;
+        }
+        let Ok(v) = mount_writable(copy.clone()) else {
+            return TestResult::Fail("mount after an interrupted replay failed");
+        };
+        if log_root_on(&copy) != 0 {
+            return TestResult::Fail("log_root set after the second replay");
+        }
+        match walk(v.root()) {
+            Ok(tree) if tree == reference => {}
+            _ => return TestResult::Fail("an interrupted replay ended somewhere else"),
+        }
+        cut += step;
+    }
+    if log_kept == 0 {
+        return TestResult::Fail("no cut left the log in place: the sweep proved nothing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_own_log_replay_survives_a_crash_at_any_write
+);

@@ -335,7 +335,12 @@ accounting and checksums, in one transaction whose superblock clears the
 log. The specification lists the Linux function behind each step and how it
 is verified against a real kernel. A read-only mount leaves a log alone.
 `write::write_log` builds a log from hand-made items for the in-kernel
-tests.
+tests. `write/tree_log.rs` is the fsync log writer — an inode's changes
+since the last commit, its new extents' checksums, and for a new file its
+name and new parent directories, written as a log tree a Linux kernel
+replays — with a full commit as the fallback for everything it does not log
+(the specification lists each case). It is off by default
+(`write::set_fsync_via_log`).
 
 Bound (fails loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels. Trees
 taller than two levels are exercised in-kernel (`smoke_btrfs_tall_tree` writes and

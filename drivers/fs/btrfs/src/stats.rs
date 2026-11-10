@@ -22,6 +22,46 @@ pub fn max_reserve_overrun() -> u64 {
 }
 
 /// Offset of the `owner` field in a tree-node header.
+static FSYNC_LOGGED: AtomicU64 = AtomicU64::new(0);
+static FSYNC_CLEAN: AtomicU64 = AtomicU64::new(0);
+static FSYNC_COMMITTED: [AtomicU64; crate::write::tree_log::Fallback::ALL.len()] =
+    [const { AtomicU64::new(0) }; crate::write::tree_log::Fallback::ALL.len()];
+
+pub(crate) fn note_fsync_logged() {
+    FSYNC_LOGGED.fetch_add(1, Relaxed);
+}
+
+pub(crate) fn note_fsync_clean() {
+    FSYNC_CLEAN.fetch_add(1, Relaxed);
+}
+
+pub(crate) fn note_fsync_committed(why: usize) {
+    if let Some(count) = FSYNC_COMMITTED.get(why) {
+        count.fetch_add(1, Relaxed);
+    }
+}
+
+/// How every `fsync`/`fdatasync` since boot was served, filesystem-wide:
+/// `(through the tree log, nothing to make durable, by a full commit)`.
+pub fn fsync_counts() -> (u64, u64, u64) {
+    (
+        FSYNC_LOGGED.load(Relaxed),
+        FSYNC_CLEAN.load(Relaxed),
+        FSYNC_COMMITTED.iter().map(|c| c.load(Relaxed)).sum(),
+    )
+}
+
+/// Why fsyncs committed instead of logging: `(reason, count)` for every
+/// reason that occurred.
+pub fn fsync_fallbacks() -> alloc::vec::Vec<(&'static str, u64)> {
+    crate::write::tree_log::Fallback::ALL
+        .iter()
+        .zip(&FSYNC_COMMITTED)
+        .map(|(why, count)| (why.name(), count.load(Relaxed)))
+        .filter(|&(_, count)| count != 0)
+        .collect()
+}
+
 const HDR_OWNER: usize = 88;
 
 /// Node counts split by the tree the node belongs to (its header's owner).
