@@ -1702,7 +1702,8 @@ impl<I: Io> Engine<I> {
     async fn wait_fence(&mut self, i: usize, slot: usize, seq: u32) -> Result<(), Error> {
         let instance = self.vcn[i].as_ref().ok_or(Error::Invalid)?;
         let (map, engine) = (instance.memory.mapping(), instance.engine);
-        self.hw
+        let result = self
+            .hw
             .poll(engine, FENCE_TIMEOUT_MS, |io, l| {
                 invalidate(io, l);
                 let value = io.read_memory(map, FENCE[slot]);
@@ -1712,7 +1713,74 @@ impl<I: Io> Engine<I> {
                 }
                 Ok(fence::signaled(value, seq).then_some(()))
             })
-            .await
+            .await;
+        if result == Err(Error::Timeout) {
+            self.report_ib_timeout(i, slot, seq);
+        }
+        result
+    }
+    /// One bounded snapshot after an IB-test deadline, never in the poll
+    /// path. A consumed ring with an unchanged fence needs a different
+    /// investigation from a ring whose commands were never fetched.
+    fn report_ib_timeout(&mut self, i: usize, slot: usize, seq: u32) {
+        use core::fmt::Write;
+        let Some(instance) = self.vcn[i].as_ref() else {
+            return;
+        };
+        let (ring, rptr, wptr) = if slot == 0 {
+            (&instance.dec, RBC_RB_RPTR, RBC_RB_WPTR)
+        } else {
+            let j = slot - 1;
+            (&instance.enc[j], RB_RPTR[j], RB_WPTR[j])
+        };
+        let map = instance.memory.mapping();
+        let regs = [
+            ("RPTR", rptr),
+            ("WPTR", wptr),
+            ("STATUS", STATUS),
+            ("POWER_STATUS", POWER_STATUS),
+            ("PGFSM_STATUS", PGFSM_STATUS),
+            ("DPG_PAUSE", DPG_PAUSE),
+            ("RB_ARB_CTRL", RB_ARB_CTRL),
+            ("SCRATCH2", SCRATCH2),
+            ("SCRATCH9", SCRATCH9),
+            ("MASTINT_EN", MASTINT_EN),
+        ];
+        let mut values = [0u32; 10];
+        let mut observed = 0;
+        let mut shadow = 0;
+        let read = self.hw.access(|io, l| {
+            for (value, (_, reg)) in values.iter_mut().zip(regs) {
+                *value = io.read(l.reg(i, reg));
+            }
+            invalidate(io, l);
+            observed = io.read_memory(map, FENCE[slot]);
+            shadow = io.read_memory(map, ring.shadow);
+            Ok(())
+        });
+        let mut w = narf_console::Writer;
+        let _ = write!(
+            w,
+            "amdgpu: VCN{i} IB fence timeout ({:?}): slot={slot} ring={:?} base={:#x} doorbell={:#x} submitted_wptr={:#x} fence={:#x} expected={seq:#x}",
+            self.mode,
+            ring.kind,
+            instance.address(ring.base),
+            ring.doorbell,
+            ring.wptr,
+            instance.address(FENCE[slot]),
+        );
+        match read {
+            Ok(()) => {
+                let _ = write!(w, " observed={observed:#x} shadow_wptr={shadow:#x}");
+                for ((name, _), value) in regs.iter().zip(values) {
+                    let _ = write!(w, " {name}={value:#x}");
+                }
+            }
+            Err(error) => {
+                let _ = write!(w, " snapshot_refused={error:?}");
+            }
+        }
+        let _ = writeln!(w);
     }
     /// `amdgpu_vcn_dec_ring_test_ib`: create then destroy session 1, each a
     /// direct submission (`amdgpu_ib_schedule`: insert_start, IB, fence,

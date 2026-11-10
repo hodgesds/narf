@@ -11508,7 +11508,13 @@ all-ones reads still fail rather than proving readiness.
 `jpeg_v3_0_start` plus the JPEG pitch ring test. `test_ib()` runs the decoder
 create/destroy message pair and the encoder session initialize/close pair on
 every started ring and waits (1 s) for the fences; register waits are bounded
-by 100 ms. `unsafe stop()` runs `vcn_v3_0_stop` (DPG or static) and
+by 100 ms. An IB-test fence timeout emits one bounded, capability-checked
+snapshot identifying the instance/ring, expected and observed fence, submitted
+and shadow write pointers, hardware read/write pointers, status, power and DPG
+state. The polling path does no logging. A timeout does not release the IB,
+session or fence storage: they share the instance's published reservation,
+which remains excluded from reuse even if the failed owner is dropped.
+`unsafe stop()` runs `vcn_v3_0_stop` (DPG or static) and
 `jpeg_v3_0_stop` without re-enabling static power gating. Each operation has one predecessor state;
 failure, cancellation, revocation and device loss are terminal and retain
 published memory. `status()` returns `Status { state, jpeg, proof }`.
