@@ -615,3 +615,82 @@ fn smoke_vmxnet3_published_iface() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_published_iface);
+
+// ── Completion sampling order ───────────────────────────────────────
+
+/// Run `sample` against a slot holding `old` that the device overwrites
+/// with the WHOLE of `new` after each possible number of host loads.
+/// `sample(dword)` returns the sampled dwords when it reports the entry
+/// ready. Whatever the interleaving, a ready sample must be `new` in
+/// full; a slot that is not ready must not be read past its gen dword.
+fn comp_sample_never_mixes(
+    old: [u32; 4],
+    new: [u32; 4],
+    sample: impl Fn(&mut dyn FnMut(usize) -> u32) -> Option<[u32; 4]>,
+) -> Result<(), &'static str> {
+    for post_after in 0..=4usize {
+        let slot = core::cell::Cell::new(old);
+        let loads = core::cell::Cell::new(0usize);
+        let sampled = sample(&mut |dword| {
+            if loads.get() == post_after {
+                slot.set(new);
+            }
+            loads.set(loads.get() + 1);
+            slot.get()[dword]
+        });
+        let Some(got) = sampled else {
+            // Not written yet: the driver polls again.
+            if post_after == 0 {
+                return Err("a completion posted before the sample read as stale");
+            }
+            if loads.get() != 1 {
+                return Err("an unwritten slot was read past its gen dword");
+            }
+            continue;
+        };
+        if loads.get() != 4 {
+            return Err("a ready sample is not exactly four dword loads");
+        }
+        if got != new {
+            return Err("current gen sampled with the previous occupant's fields");
+        }
+    }
+    Ok(())
+}
+
+fn smoke_vmxnet3_tx_comp_sample_never_mixes_occupants() -> TestResult {
+    // A slot of a wrapped TX completion ring still holds the previous
+    // pass's completion (other gen, older `txdIdx`) when the device
+    // posts the next one. With the old `txdIdx` under the current gen
+    // the driver credits the wrong TX slot.
+    let old = [0x005, 0x1111_1111, 0x2222_2222, 0]; // gen 0
+    let new = [0x0AB, 0x3333_3333, 0x4444_4444, 1 << 31]; // gen 1
+    match comp_sample_never_mixes(old, new, |dword| {
+        shared::Vmxnet3TxCompDesc::sample(1, dword).map(|c| [c.dword0, c.ext2, c.ext3, c.dword3])
+    }) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/net/vmxnet3",
+    smoke_vmxnet3_tx_comp_sample_never_mixes_occupants
+);
+
+fn smoke_vmxnet3_rx_comp_sample_never_mixes_occupants() -> TestResult {
+    // Same for the RX completion ring: the previous pass's `rxdIdx` and
+    // `len` under the current gen deliver the wrong buffer or length.
+    let old = [0x005 | (3 << 14), 0x1111_1111, 60, 0]; // gen 0
+    let new = [0x0AB | (3 << 14), 0x3333_3333, 1514, 1 << 31]; // gen 1
+    match comp_sample_never_mixes(old, new, |dword| {
+        shared::Vmxnet3RxCompDesc::sample(1, dword)
+            .map(|c| [c.dword0, c.rssHash, c.dword2, c.dword3])
+    }) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/net/vmxnet3",
+    smoke_vmxnet3_rx_comp_sample_never_mixes_occupants
+);
