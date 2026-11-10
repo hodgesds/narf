@@ -37,9 +37,11 @@
 //! Not this step (remainders, listed in the PR body): the IMR reload
 //! (`_rtl92d_phy_reload_imr_setting`, RF IMR tables), the RF setting
 //! switch (`_rtl92d_phy_switch_rf_setting`, curve-index tables),
-//! and the LCK in-progress wait — all calibration-table work owned
-//! by later lanes. The IQK reload ([`super::calib`]) runs here, at
-//! the end of [`switch_channel`], as in Linux's step machine.
+//! — all calibration-table work owned by later lanes. The IQK reload
+//! ([`super::calib`]) runs here, at the end of [`switch_channel`],
+//! as in Linux's step machine. The LCK in-progress wait lives in
+//! [`super::lck::wait_lck_clear`] and is enforced by
+//! [`switch_channel`].
 //!
 //! [`switch_channel`] takes the caller's [`super::calib::IqkMatrix`]
 //! (reset by `rtl92de_hw_init` before any switch) and reloads the
@@ -565,6 +567,8 @@ pub struct SwitchOutcome {
 /// bandwidth changes and LCK calibration, as Linux's
 /// `sw_chnl_inprogress` / `set_bwmode_inprogress` / `lck_inprogress`
 /// guards do; the band/channel consistency guards are enforced here.
+/// The LCK wait is enforced here (`lck_inprogress`, via
+/// [`super::lck::wait_lck_clear`]).
 /// The IMR reload and RF setting switch are remainders; the IQK
 /// reload runs at the end, once the RF writes land.
 #[allow(clippy::too_many_arguments)]
@@ -582,7 +586,9 @@ pub async fn switch_channel(
     bw40: bool,
     chnlval: &mut [u32; 2],
     iqk: &mut IqkMatrix,
+    lck_inprogress: bool,
 ) -> Result<SwitchOutcome, Error> {
+    super::lck::wait_lck_clear(io, lck_inprogress).await?;
     let mut rf3c = None;
     if mode == MacPhyMode::SingleMacSinglePhy && *bandset == BandSet::OnBoth {
         let rfparam = phy::get_bb(io, phy::RFPGA0_XAB_RFPARAMETER, phy::MASKDWORD)?;
@@ -660,6 +666,9 @@ pub async fn switch_channel(
 
 /// `switch_channel` at the wide channel then `set_bw_mode` (the
 /// `rtl_op_config` station path: `act_scanning` false).
+/// `lck_inprogress` is the [`super::lck::Lck::in_progress`] snapshot
+/// the caller owns; a set snapshot waits out the full Linux bound
+/// before the switch (see [`super::lck::wait_lck_clear`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn configure(
     io: &impl Io,
@@ -674,6 +683,7 @@ pub async fn configure(
     op: &Operating,
     chnlval: &mut [u32; 2],
     iqk: &mut IqkMatrix,
+    lck_inprogress: bool,
 ) -> Result<SwitchOutcome, Error> {
     let outcome = switch_channel(
         io,
@@ -689,6 +699,7 @@ pub async fn configure(
         op.bw40,
         chnlval,
         iqk,
+        lck_inprogress,
     )
     .await?;
     if outcome.switched {

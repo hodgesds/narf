@@ -61,6 +61,8 @@
 //! - [`phy`] — BB/RF register access, the RF 3-wire serial path, the
 //!   DBI cross-function path, and the factory power-group table.
 //! - [`txpower`] — TX-power levels from the EFUSE factory map.
+//! - [`lck`] — LC calibration (`rtl92d_phy_lc_calibrate`), the LCK
+//!   reload, the `targetchnl` tables, and the channel-switch LCK wait.
 //! - [`lifecycle`] — `init_sw_vars` / `deinit_sw_vars` / ASPM state.
 //! - [`dm`] — DM init (`rtl92d_dm_init`): DIG table, dynamic TX
 //!   power, EDCA turbo, rate-adaptive mask, TX-power tracking.
@@ -78,6 +80,7 @@ pub mod fw;
 pub mod h2c;
 pub mod ht;
 pub mod init;
+pub mod lck;
 pub mod lifecycle;
 pub mod llt;
 pub mod mac;
