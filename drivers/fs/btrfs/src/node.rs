@@ -131,8 +131,13 @@ macro_rules! autogrow {
         if !$vol.admits_writes() {
             return Err(FsError::ReadOnly);
         }
-        $vol.reap_orphans().await?;
-        let mut r = $op;
+        // Reclaiming an orphan allocates like any other operation, so its
+        // `NoSpace` takes the same ladder as the operation's own: it is part
+        // of what is retried, not a way out before the retry starts.
+        let mut r = match $vol.reap_orphans().await {
+            Ok(()) => $op,
+            Err(error) => Err(error),
+        };
         let mut tries = 0u32;
         // Under `narf.disks=root-rw` the whole-tree-repacking growth path is
         // never used on a production root; a chunk is allocated the way
@@ -147,7 +152,10 @@ macro_rules! autogrow {
                 crate::write::grow_add_chunk(&$vol).await?;
             }
             tries += 1;
-            r = $op;
+            r = match $vol.reap_orphans().await {
+                Ok(()) => $op,
+                Err(error) => Err(error),
+            };
         }
         r
     }};

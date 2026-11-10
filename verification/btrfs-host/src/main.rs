@@ -11,6 +11,7 @@
 
 mod crash;
 mod dev;
+mod enospc;
 mod fixture;
 mod fst;
 mod host;
@@ -44,7 +45,8 @@ USAGE: narf-btrfs-host [OPTIONS]
                     others scale from it; 0 disables the crash pass)
   --exhaustive      crash-test every flush boundary plus two random cuts per
                     flush window (slow)
-  --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate,fst
+  --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate,fst,
+                    enospc
                     (default all)
   --jobs N          concurrent `btrfs check` processes in the crash pass
                     (default 3)
@@ -54,7 +56,15 @@ USAGE: narf-btrfs-host [OPTIONS]
 ";
 
 /// The default selection (`regress` = every `regress-*` case).
-pub const SCENARIOS: [&str; 6] = ["regress", "root", "snapshots", "lba4k", "gate", "fst"];
+pub const SCENARIOS: [&str; 7] = [
+    "regress",
+    "root",
+    "snapshots",
+    "lba4k",
+    "gate",
+    "fst",
+    "enospc",
+];
 /// Names `--scenario` also accepts.
 const REGRESS: [&str; 3] = [
     "regress-zstd-tail",
@@ -693,12 +703,17 @@ fn main() {
             }
             continue;
         }
-        if name == "fst" {
-            match fst::run(&args) {
+        if name == "fst" || name == "enospc" {
+            let run = if name == "fst" {
+                fst::run(&args)
+            } else {
+                enospc::run(&args)
+            };
+            match run {
                 Ok(s) => println!("{s}"),
                 Err(e) => {
                     failed += 1;
-                    println!("fst: FAIL\n{e}");
+                    println!("{name}: FAIL\n{e}\nklog:\n{}", host::klog_take());
                     narf::reset();
                 }
             }
@@ -726,9 +741,10 @@ fn main() {
         }
     }
     println!(
-        "btrfs-host-rw: {} in {:.1?}",
+        "btrfs-host-rw: {} in {:.1?} (most any batch commit allocated beyond its reservation: {} blocks)",
         if failed == 0 { "PASS" } else { "FAIL" },
-        t0.elapsed()
+        t0.elapsed(),
+        narf_drivers_fs_btrfs::stats::max_reserve_overrun()
     );
     std::process::exit(if failed == 0 { 0 } else { 1 });
 }

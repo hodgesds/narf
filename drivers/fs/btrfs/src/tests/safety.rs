@@ -1185,6 +1185,114 @@ fn smoke_btrfs_root_rw_metadata_reserve() -> TestResult {
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_root_rw_metadata_reserve);
 
+/// Metadata filled with acknowledged operations on a device with nothing
+/// left to allocate: the operation whose reservation no longer fits gets
+/// `ENOSPC` itself, before anything of it is staged; everything accepted
+/// before it commits; nothing aborts; and the full filesystem can still
+/// unlink (borrowing the global reserve) and then takes writes again.
+fn smoke_btrfs_root_rw_metadata_enospc_never_aborts() -> TestResult {
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("bgt fixture did not mount writable"),
+    };
+    narf_block::disk_policy::__set_policy_for_test(Some(
+        narf_block::disk_policy::DiskPolicy::RootRw,
+    ));
+    let name = |i: u32| alloc::format!("e{i:06}-{}", "n".repeat(180));
+    let result = (|| {
+        // Hand every unallocated byte to DATA chunks: metadata cannot grow.
+        let mut chunks = 0u32;
+        loop {
+            match poll_once(crate::write::alloc_chunk(&vol, format::BLOCK_GROUP_DATA)) {
+                Some(Ok(())) => chunks += 1,
+                Some(Err(FsError::NoSpace)) => break,
+                _ => return Err("data chunk allocation failed"),
+            }
+            if chunks > 64 {
+                return Err("the device never filled");
+            }
+        }
+        let refusals = vol.commit_stats().snapshot().reserve_refusals;
+        let body: Vec<u8> = alloc::vec![0x65; 1500];
+        let mut made = 0u32;
+        loop {
+            let file = match poll_once(vol.root().create(&name(made))) {
+                Some(Ok(file)) => file,
+                Some(Err(FsError::NoSpace)) => break,
+                _ => return Err("create failed with something other than ENOSPC (aborted?)"),
+            };
+            match poll_once(file.write(0, &body)) {
+                Some(Ok(n)) if n == body.len() => {}
+                Some(Err(FsError::NoSpace)) => break,
+                _ => return Err("write failed with something other than ENOSPC (aborted?)"),
+            }
+            made += 1;
+            if made > 400_000 {
+                return Err("metadata never filled");
+            }
+        }
+        if made < 100 {
+            return Err("ENOSPC before the metadata was anywhere near full");
+        }
+        if vol.commit_stats().snapshot().reserve_refusals == refusals {
+            return Err("ENOSPC did not come from the reservation");
+        }
+        if vol.transaction_aborted() || !vol.admits_writes() {
+            return Err("ENOSPC aborted the transaction");
+        }
+        // Everything acknowledged commits.
+        if !matches!(poll_once(vol.sync_to_disk_exclusive()), Some(Ok(()))) {
+            return Err("the commit after ENOSPC failed");
+        }
+        // A full filesystem can still delete...
+        for i in 0..made / 4 {
+            if !matches!(poll_once(vol.root().unlink(&name(i))), Some(Ok(()))) {
+                return Err("unlink on a full filesystem failed");
+            }
+        }
+        if !matches!(poll_once(vol.sync_to_disk_exclusive()), Some(Ok(()))) {
+            return Err("the commit after unlinking failed");
+        }
+        // ...and then has room again.
+        match poll_once(vol.root().create("after-enospc")) {
+            Some(Ok(file)) if matches!(poll_once(file.write(0, &body)), Some(Ok(_))) => {}
+            _ => return Err("no room after unlinking"),
+        }
+        if !matches!(poll_once(vol.sync_to_disk_exclusive()), Some(Ok(()))) {
+            return Err("the final commit failed");
+        }
+        if vol.transaction_aborted() {
+            return Err("the transaction aborted");
+        }
+        // No commit needed more than its batch reserved plus the global
+        // reserve's floor.
+        if vol.commit_stats().snapshot().max_reserve_overrun
+            > crate::write::reserve::GLOBAL_FLOOR_BLOCKS
+        {
+            return Err("a commit outran the global reserve");
+        }
+        Ok(())
+    })();
+    narf_block::disk_policy::__set_policy_for_test(None);
+    if let Err(why) = result {
+        return TestResult::Fail(why);
+    }
+    match chunk_accounting(&vol) {
+        Ok((ext, used, _, _)) if ext == used => {}
+        Ok(_) => return TestResult::Fail("chunk accounting inconsistent"),
+        Err(why) => return TestResult::Fail(why),
+    }
+    match super::snapshots::check_ref_counts(&vol) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_root_rw_metadata_enospc_never_aborts
+);
+
 /// A new chunk copies the profile of its type only when every existing chunk
 /// of that type agrees on SINGLE or DUP, and metadata chunks are 1 GiB above
 /// 50 GiB as on Linux.

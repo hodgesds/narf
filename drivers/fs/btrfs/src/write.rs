@@ -11,6 +11,12 @@
 //! from the same base until the block set stabilises (bounded; a commit that
 //! does not settle fails without writing a superblock).
 //!
+//! The metadata a commit needs is reserved before each operation is accepted
+//! ([`reserve`]): an operation whose reservation does not fit is refused
+//! before it is staged, and reclaim — committing the open batch, then
+//! allocating a chunk — runs for that operation, outside any commit; only if
+//! that fails does it return `ENOSPC`. A commit never allocates a chunk.
+//!
 //! Scope: a regular file in the mounted writable subvolume with any number of
 //! existing extents (exclusive, shared, partial, hole or inline). A write closes
 //! its sector-aligned window over intersected file extents, applies the new bytes
@@ -75,6 +81,7 @@ mod free_space_edit_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "write/free_space_tests.rs"]
 mod free_space_tests;
+pub(crate) mod reserve;
 use crate::block_group::{self, BgHome};
 use crate::btree::{
     self, internal_blockptr, internal_child_slot, internal_key, leaf_item_data, leaf_item_key,
@@ -888,7 +895,7 @@ pub(crate) async fn flush_if_full<B: BlockDevice + 'static>(
         .lock()
         .await
         .as_ref()
-        .is_some_and(|batch| batch.ops >= MAX_BATCH_OPS);
+        .is_some_and(|batch| batch.is_full());
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
     }
@@ -1192,7 +1199,7 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     edits.push(Edit::Upsert(inode_key, new_inode));
 
     batch_stage_refs(vol, batch, &edits, dropped_data, converted.added, new_data).await?;
-    let full = batch.ops >= MAX_BATCH_OPS && !vol.commits_held();
+    let full = batch.is_full() && !vol.commits_held();
     drop(guard);
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
@@ -1229,7 +1236,7 @@ fn fs_commit_from(out: CowOut, gen: u64, csum_type: u16) -> Result<FsCommit, FsE
 ///
 /// Linux bounds a transaction by time and space pressure, and `fsync` covers
 /// whoever cannot wait. All three exist here ([`spawn_commit_timer`],
-/// [`commit_meta_reserve`], [`BtrfsVolume::sync_to_disk`]), so this is only a
+/// [`reserve`], [`BtrfsVolume::sync_to_disk`]), so this is only a
 /// cap on what one commit must process, and a low one is not free: a commit
 /// on a real root takes hundreds of milliseconds and every writer queues behind
 /// it, and at a commit per eight operations a desktop session starting up ran
@@ -1297,12 +1304,28 @@ pub(crate) struct FsBatch {
     /// operation starts, so every failure path is covered without any of them
     /// having to remember, including the ones that return before staging.
     op_reserved: BTreeMap<u64, u64>,
+    /// The shape of the trees this transaction's commit rewrites, from which
+    /// each operation's metadata reservation is sized ([`reserve`]).
+    geometry: reserve::ReserveGeometry,
+    /// The operation about to be staged only releases space (unlink, rmdir,
+    /// eviction) and may borrow the global reserve. Consumed by staging.
+    op_reclaims: bool,
+    /// An operation borrowed the global reserve: commit before accepting
+    /// anything else.
+    force_commit: bool,
 }
 
 impl FsBatch {
     /// Whether any operation has been staged into this transaction.
     pub(crate) fn has_ops(&self) -> bool {
         self.ops > 0
+    }
+
+    /// Whether the transaction must commit before it takes another
+    /// operation: it holds [`MAX_BATCH_OPS`], or one of them borrowed the
+    /// global reserve.
+    pub(crate) fn is_full(&self) -> bool {
+        self.ops >= MAX_BATCH_OPS || self.force_commit
     }
 
     /// A representative subvolume tree this batch COWs.
@@ -1340,10 +1363,16 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             .generation
             .checked_add(1)
             .ok_or(FsError::InvalidData)?;
+        let alloc = Allocator::build(vol).await?;
+        let (groups, metadata_bytes) = alloc.group_shape();
+        let geometry = reserve::ReserveGeometry::sample(vol, groups, metadata_bytes).await?;
         *guard = Some(FsBatch {
             gen,
             trees: BTreeMap::new(),
-            alloc: Allocator::build(vol).await?,
+            alloc,
+            geometry,
+            op_reclaims: false,
+            force_commit: false,
             dropped_data: Vec::new(),
             added_data: Vec::new(),
             new_data: Vec::new(),
@@ -1510,7 +1539,12 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     // (a fresh root with no METADATA_ITEM yet, a closed batch), so it waits
     // for the operation to finish (`op_lock`).
     let _op = vol.op_lock().lock().await;
-    vol.reap_orphans().await?;
+    // An orphan that cannot be reclaimed for lack of space must not keep
+    // the transaction from ageing out: committing is what releases space.
+    match vol.reap_orphans().await {
+        Ok(()) | Err(FsError::NoSpace) => {}
+        Err(error) => return Err(error),
+    }
     let stale = {
         let guard = vol.fs_batch().lock().await;
         match guard.as_ref() {
@@ -1628,12 +1662,20 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
     // allocator cannot be handled that way — `apply_edits` needs it by mutable
     // reference and carves from it in place — so those paths do put it back.
     let tree_id = vol.fs_tree_id();
-    let other_tree_changes: usize = batch
-        .trees
-        .iter()
-        .filter(|(&id, _)| id != tree_id)
-        .map(|(_, t)| t.cow.pending.len() + t.cow.freed.len())
-        .sum();
+    // What the batch's other subvolume trees add to its commit: new blocks,
+    // freed blocks, and snapshot-COW reference items.
+    let ref_items = |cow: &CowState| cow.shared.as_ref().map_or(0, |s| s.refs.item_count());
+    let other_trees = batch.trees.iter().filter(|(&id, _)| id != tree_id).fold(
+        (0usize, 0usize, 0usize),
+        |sum, (_, t)| {
+            (
+                sum.0 + t.cow.pending.len(),
+                sum.1 + t.cow.freed.len(),
+                sum.2 + ref_items(&t.cow),
+            )
+        },
+    );
+    let reclaiming = core::mem::take(&mut batch.op_reclaims);
     let snapshot_alloc = batch.alloc.clone();
     let subvol = batch.trees.get_mut(&tree_id).ok_or(FsError::InvalidData)?;
     let snapshot_cow = subvol.cow.clone();
@@ -1657,26 +1699,42 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
     // nothing is lost — and the space retry commits accumulated work or grows
     // the filesystem instead. This applies to every write profile: a small
     // mixed-group fixture can exhaust commit space well before MAX_BATCH_OPS.
+    //
+    // The need is a bound on what the commit of the batch *with this
+    // operation in it* allocates for its own edits, doubled, over the global
+    // reserve ([`reserve`]). An operation that only releases space may
+    // borrow the global reserve, and the batch then commits at once.
     {
-        let changes = batch.new_data.len()
-            + batch.dropped_data.len()
-            + batch.added_data.len()
-            + new_data.len()
-            + dropped_data.len()
-            + added_data.len()
-            + other_tree_changes
-            + state.pending.len()
-            + state.freed.len();
+        let load = reserve::CommitLoad {
+            new_data: (batch.new_data.len() + new_data.len()) as u64,
+            dropped_data: (batch.dropped_data.len() + dropped_data.len()) as u64,
+            added_data: (batch.added_data.len() + added_data.len()) as u64,
+            new_meta: (other_trees.0 + state.pending.len()) as u64,
+            freed_meta: (other_trees.1 + state.freed.len()) as u64,
+            ref_items: (other_trees.2 + ref_items(&state)) as u64,
+        };
+        let nodesize = vol.nodesize() as u64;
         let free = batch.alloc.free_bytes(format::BLOCK_GROUP_METADATA);
-        let need = commit_meta_reserve(vol, changes);
+        let need = batch.geometry.ordinary_need(&load).saturating_mul(nodesize);
         if free < need {
-            batch.alloc = snapshot_alloc;
-            if crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw {
-                META_RESERVE_REFUSAL.store(true, core::sync::atomic::Ordering::Relaxed);
-                META_RESERVE_FREE.store(free, core::sync::atomic::Ordering::Relaxed);
-                META_RESERVE_NEED.store(need, core::sync::atomic::Ordering::Relaxed);
+            let borrowed = batch
+                .geometry
+                .reclaiming_need(&load)
+                .saturating_mul(nodesize);
+            if reclaiming && free >= borrowed {
+                batch.force_commit = true;
+            } else {
+                batch.alloc = snapshot_alloc;
+                vol.commit_stats()
+                    .reserve_refusals
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw {
+                    META_RESERVE_REFUSAL.store(true, core::sync::atomic::Ordering::Relaxed);
+                    META_RESERVE_FREE.store(free, core::sync::atomic::Ordering::Relaxed);
+                    META_RESERVE_NEED.store(need, core::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(FsError::NoSpace);
             }
-            return Err(FsError::NoSpace);
         }
     }
     for (addr, mut buf, _lvl) in dirty {
@@ -1736,6 +1794,9 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
         *slot = slot.saturating_add(bytes);
     }
     batch.ops += 1;
+    // Whatever refusal preceded this, the operation found its space: a later
+    // growth must not act on it.
+    META_RESERVE_REFUSAL.store(false, core::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -1761,24 +1822,6 @@ pub(crate) async fn touch_key_absent<B: BlockDevice + 'static>(
             Err(FsError::InvalidData)
         }
     }
-}
-
-/// Metadata bytes a batch commit with `changes` reference/block changes is
-/// allowed to need, and so must find free: a fixed floor for the trees every
-/// commit path-COWs (root, extent, csum, free-space, block-group: a few
-/// root-to-leaf paths each, and the repacked free-space tree), plus one block
-/// per four changes for the extent/csum leaves they land in. An estimate,
-/// not a bound: a commit that still runs out aborts the filesystem
-/// read-only, which loses the batch but never writes an inconsistent tree.
-pub(crate) fn commit_meta_reserve<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-    changes: usize,
-) -> u64 {
-    const FLOOR_BLOCKS: u64 = 256;
-    // Changes cluster: a run of new data extents or freed blocks lands in
-    // adjacent extent/csum items, a couple of hundred to a leaf. One fresh
-    // leaf per four changes still covers changes scattered four to a leaf.
-    (vol.nodesize() as u64).saturating_mul(FLOOR_BLOCKS.saturating_add(changes as u64 / 4))
 }
 
 /// Set when batch staging refused an operation for the commit reserve, so the
@@ -1924,6 +1967,24 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
         .trees
         .remove(&primary_id)
         .ok_or(FsError::InvalidData)?;
+    // What this batch reserved for its commit's own blocks, so the commit
+    // can report how its real allocation compares ([`reserve`]).
+    {
+        let trees = core::iter::once(&primary).chain(batch.trees.values());
+        let mut load = reserve::CommitLoad {
+            new_data: batch.new_data.len() as u64,
+            dropped_data: batch.dropped_data.len() as u64,
+            added_data: batch.added_data.len() as u64,
+            ..Default::default()
+        };
+        for tree in trees {
+            load.new_meta += tree.cow.pending.len() as u64;
+            load.freed_meta += tree.cow.freed.len() as u64;
+            load.ref_items += tree.cow.shared.as_ref().map_or(0, |s| s.refs.item_count()) as u64;
+        }
+        vol.commit_stats()
+            .expect_commit(batch.geometry.first_order(&load).saturating_mul(2));
+    }
     let out = primary.cow.into_cow_out();
     let mut extra_trees = Vec::new();
     for (tree_id, subvol) in batch.trees {
@@ -2027,7 +2088,23 @@ async fn commit_fs_edits<B: BlockDevice + 'static>(
     new_data: Vec<DataRef>,
 ) -> Result<(), FsError> {
     with_space_retry(vol, || {
-        commit_fs_edits_once(vol, edits, dropped_data.clone(), new_data.clone())
+        commit_fs_edits_once(vol, edits, dropped_data.clone(), new_data.clone(), false)
+    })
+    .await
+}
+
+/// [`commit_fs_edits`] for an operation that only releases space — unlink,
+/// rmdir, the final eviction of an orphan. When its reservation does not
+/// fit it may borrow the global reserve instead of failing (Linux
+/// `btrfs_start_transaction_fallback_global_rsv`, `evict_refill_and_join`):
+/// a full filesystem must still be able to delete.
+async fn commit_fs_edits_reclaiming<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    edits: &[Edit],
+    dropped_data: Vec<DataRefId>,
+) -> Result<(), FsError> {
+    with_space_retry(vol, || {
+        commit_fs_edits_once(vol, edits, dropped_data.clone(), Vec::new(), true)
     })
     .await
 }
@@ -2037,6 +2114,7 @@ async fn commit_fs_edits_once<B: BlockDevice + 'static>(
     edits: &[Edit],
     dropped_data: Vec<DataRefId>,
     new_data: Vec<DataRef>,
+    reclaiming: bool,
 ) -> Result<(), FsError> {
     let full = {
         let mut guard = batch_begin(vol).await?;
@@ -2044,8 +2122,9 @@ async fn commit_fs_edits_once<B: BlockDevice + 'static>(
         // Before staging, so a refusal leaves the transaction untouched.
         qgroup_begin_op(batch);
         qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), edits.len()).await?;
+        batch.op_reclaims = reclaiming;
         batch_stage(vol, batch, edits, dropped_data, new_data).await?;
-        batch.ops >= MAX_BATCH_OPS && !vol.commits_held()
+        batch.is_full() && !vol.commits_held()
     };
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
@@ -5439,6 +5518,9 @@ fn commit_txn<'a, B: BlockDevice + 'static>(
             // Whatever the failed commit left behind, the next allocator
             // starts from the free-space tree on disk, not from memory.
             vol.set_free_view(None);
+            vol.commit_stats()
+                .pending_reservation
+                .store(0, core::sync::atomic::Ordering::Relaxed);
             let phase = match COMMIT_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
                 1 => "resolving references",
                 2 => "fixed point: csum tree",
@@ -6070,6 +6152,13 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         FsError::NoSpace
     })?;
     commit_phase(6);
+    // What the commit allocated for its own trees, against what its batch
+    // reserved for them (the root tree's re-pack is the global reserve's).
+    vol.commit_stats().note_commit_blocks(
+        (new_meta.len() as u64)
+            .saturating_sub(fs_new_meta.len() as u64)
+            .saturating_sub(root_addrs.len() as u64),
+    );
 
     // ── Root tree: repoint each COWed tree's ROOT_ITEM, then pack it. ───
     // A tree whose root did not move (a csum-tree COW with nothing to edit,
@@ -6410,7 +6499,7 @@ async fn set_inode_attrs_once<B: BlockDevice + 'static>(
             Vec::new(),
         )
         .await?;
-        batch.ops >= MAX_BATCH_OPS && !vol.commits_held()
+        batch.is_full() && !vol.commits_held()
     };
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
@@ -7792,7 +7881,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     } else {
         edits.push(Edit::Upsert(ref_key, ref_remaining));
     }
-    commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
+    commit_fs_edits_reclaiming(vol, &edits, Vec::new()).await?;
     if last_link {
         vol.note_orphan(vol.fs_tree_id(), child_ino);
     }
@@ -7848,7 +7937,7 @@ pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
         edits.push(Edit::Delete(key));
         cursor.advance().await?;
     }
-    commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
+    commit_fs_edits_reclaiming(vol, &edits, dropped_data).await?;
     vol.bump_cache_generation(vol.fs_tree_id(), ino);
     Ok(())
 }
@@ -8114,7 +8203,7 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
     ];
     edits.extend(xattr_keys.into_iter().map(Edit::Delete));
 
-    commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
+    commit_fs_edits_reclaiming(vol, &edits, Vec::new()).await?;
     Ok(())
 }
 
@@ -9606,9 +9695,14 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
 
 /// `root-rw` growth for an operation that failed with `NoSpace`: allocate the
 /// chunk type that ran short. METADATA when staging refused the operation for
-/// the commit reserve ([`commit_meta_reserve`]) or free metadata is below
-/// twice its floor, else DATA, falling back to METADATA. `NoSpace` when the
-/// device has no room for the chunk.
+/// its metadata reservation ([`reserve`]) or free metadata is below twice
+/// the global reserve, else DATA, falling back to METADATA. `NoSpace` when
+/// the device has no room for the chunk.
+///
+/// This runs at reservation time, for the operation that could not reserve
+/// and before it is accepted — never inside a commit (Linux `flush_space`
+/// `ALLOC_CHUNK`, called from `btrfs_reserve_metadata_bytes` /
+/// `btrfs_reserve_data_bytes`).
 pub(crate) fn root_rw_grow<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
 ) -> BoxFut<'a, ()> {
@@ -9618,21 +9712,51 @@ pub(crate) fn root_rw_grow<'a, B: BlockDevice + 'static>(
         let meta_short = refused
             || match Allocator::build(vol).await {
                 Ok(a) => {
-                    a.free_bytes(format::BLOCK_GROUP_METADATA)
-                        < commit_meta_reserve(vol, 0).saturating_mul(2)
+                    let (groups, metadata_bytes) = a.group_shape();
+                    match reserve::ReserveGeometry::sample(vol, groups, metadata_bytes).await {
+                        Ok(geometry) => {
+                            a.free_bytes(format::BLOCK_GROUP_METADATA)
+                                < geometry
+                                    .global()
+                                    .saturating_mul(2)
+                                    .saturating_mul(vol.nodesize() as u64)
+                        }
+                        Err(_) => false,
+                    }
                 }
                 Err(_) => false,
             };
         if meta_short {
             let grown = alloc_chunk(vol, format::BLOCK_GROUP_METADATA).await;
-            if refused && grown.is_ok() {
+            if refused {
                 use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "btrfs: grew METADATA: {} KiB were free, a commit may need {} KiB",
+                static ENOSPC_REPORTS: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                let (free, need) = (
                     META_RESERVE_FREE.load(Ordering::Relaxed) >> 10,
-                    META_RESERVE_NEED.load(Ordering::Relaxed) >> 10
+                    META_RESERVE_NEED.load(Ordering::Relaxed) >> 10,
                 );
+                match &grown {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "btrfs: grew METADATA: {free} KiB were free, a commit may need {need} KiB"
+                        );
+                    }
+                    // Say why the caller is about to see ENOSPC, at the 1st,
+                    // 10th, 100th... time: a full filesystem is retried a lot.
+                    Err(FsError::NoSpace)
+                        if crate::volume::refusal_is_reported(
+                            ENOSPC_REPORTS.fetch_add(1, Ordering::Relaxed) + 1,
+                        ) =>
+                    {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "btrfs: ENOSPC: {free} KiB of metadata are free, the operation's commit may need {need} KiB, and the device has no room for a METADATA chunk"
+                        );
+                    }
+                    Err(_) => {}
+                }
             }
             return grown;
         }

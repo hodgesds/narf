@@ -742,6 +742,23 @@ impl Allocator {
         }
     }
 
+    /// How many block groups the filesystem has, and the bytes in those that
+    /// hold metadata — `(u64::MAX, u64::MAX)` for the bump allocator, which
+    /// does not know.
+    pub(crate) fn group_shape(&self) -> (u64, u64) {
+        match self {
+            Allocator::Reclaim { view, .. } => (
+                view.groups.len() as u64,
+                view.groups
+                    .iter()
+                    .filter(|&&(_, _, flags)| flags & format::BLOCK_GROUP_METADATA != 0)
+                    .map(|&(_, len, _)| len)
+                    .sum(),
+            ),
+            Allocator::Bump { .. } => (u64::MAX, u64::MAX),
+        }
+    }
+
     /// Snapshot the allocator's free state so the commit's metadata fixed point
     /// can re-hand-out the same addresses each round ([`Allocator::restore`]).
     pub fn snapshot(&self) -> Allocator {

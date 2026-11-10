@@ -2667,8 +2667,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// between another CPU's tree reads and its staging.
     pub async fn sync_to_disk_exclusive(&self) -> Result<(), FsError> {
         let _op = self.op_lock().lock().await;
-        self.reap_orphans().await?;
-        self.sync_to_disk().await
+        // Reclaiming orphans is housekeeping this call does on the way; what
+        // it owes its caller is the commit. An orphan that cannot be
+        // reclaimed for lack of space must not cost the sync — the commit
+        // releases pinned space, after which the reclaim is tried once more,
+        // and an orphan still left keeps its on-disk record for later.
+        let reaped = self.reap_orphans().await;
+        self.sync_to_disk().await?;
+        match reaped {
+            Err(FsError::NoSpace) => match self.reap_orphans().await {
+                Ok(()) => self.sync_to_disk().await,
+                Err(FsError::NoSpace) => Ok(()),
+                Err(error) => Err(error),
+            },
+            other => other,
+        }
     }
 
     /// `syncfs`: [`Self::sync_to_disk_exclusive`] plus a trailing device

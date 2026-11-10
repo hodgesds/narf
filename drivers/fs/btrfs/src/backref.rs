@@ -304,6 +304,11 @@ pub(crate) struct RefOverlay {
 }
 
 impl RefOverlay {
+    /// Extent-tree items this overlay rewrites, inserts or deletes.
+    pub(crate) fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
     /// Fold `other` (another tree's overlay from the same transaction) in.
     /// Two trees of one transaction touching the same extent would each have
     /// decided from a view without the other's changes, so that is refused

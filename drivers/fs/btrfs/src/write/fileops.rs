@@ -22,7 +22,7 @@ use narf_filesystem::FsError;
 use super::{
     align_up, batch_begin, batch_gen, batch_stage_refs, cow_write_file_once, ensure_private_subvol,
     flush_batch_from, flush_if_full, qgroup_begin_op, qgroup_reserve, qgroup_reserve_meta,
-    with_space_retry, DataRef, DataRefId, Edit, FlushOrigin, MAX_BATCH_OPS,
+    with_space_retry, DataRef, DataRefId, Edit, FlushOrigin,
 };
 use crate::btree;
 use crate::format::{self, le64, BtrfsKey};
@@ -454,7 +454,7 @@ async fn stage<B: BlockDevice + 'static>(
             batch.alloc = snapshot;
             return Err(err);
         }
-        batch.ops >= MAX_BATCH_OPS && !vol.commits_held()
+        batch.is_full() && !vol.commits_held()
     };
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
