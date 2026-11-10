@@ -39,6 +39,8 @@
 //! - RSC coalescing counts (RSCCNT) are NOT surfaced: `gro_segs`
 //!   stays 0; the driver never enables RSC.
 
+use core::sync::atomic::{compiler_fence, Ordering};
+
 /// Advanced RX descriptor status bits (write-back `status_error`,
 /// low 20 bits). Linux `ixgbe_type.h:2380-2400`.
 pub const ADV_RXD_STAT_DD: u32 = 0x01;
@@ -109,6 +111,41 @@ const _: () = assert!(core::mem::size_of::<AdvRxDescWb>() == 16);
 const _: () = assert!(core::mem::align_of::<AdvRxDescWb>() == 16);
 
 impl AdvRxDescWb {
+    /// Sample an RX ring slot hardware may be completing right now.
+    /// `word(i)` reads little-endian qword `i` of the 16-byte slot.
+    ///
+    /// Hardware writes the descriptor back while the host polls it, so a
+    /// sample must never pair a fresh DD with fields of the slot's
+    /// previous contents. Qword 1 carries status/error (with DD), the
+    /// packet length and the VLAN tag: it is taken first and as ONE
+    /// load, so a set DD always comes with the length written with it.
+    /// Qword 0 (RSS / packet-type dwords) is loaded only after DD was
+    /// seen. `None` means "not completed": nothing else of the slot was
+    /// read. Linux `ixgbe_clean_rx_irq` does the same: it tests
+    /// `wb.upper.length`, then `dma_rmb()`, then reads the rest.
+    ///
+    /// A whole-struct `read_volatile` gives no such order: the compiler
+    /// lowers it to separate field loads in an order of its choosing,
+    /// and loading `length` before `status_error` shows the armed
+    /// slot's zero length under a DD posted between the two loads.
+    #[inline]
+    pub fn sample(mut word: impl FnMut(usize) -> u64) -> Option<Self> {
+        let upper = word(1);
+        if upper as u32 & ADV_RXD_STAT_DD == 0 {
+            return None;
+        }
+        // Pair hardware's DD write with the loads that follow it.
+        compiler_fence(Ordering::SeqCst);
+        let lower = word(0);
+        Some(Self {
+            lo: lower as u32,
+            hi: (lower >> 32) as u32,
+            status_error: upper as u32,
+            length: (upper >> 32) as u16,
+            vlan: (upper >> 48) as u16,
+        })
+    }
+
     /// Descriptor Done: hardware has completed this descriptor.
     pub const fn is_done(&self) -> bool {
         self.status_error & ADV_RXD_STAT_DD != 0

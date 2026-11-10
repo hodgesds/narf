@@ -546,6 +546,24 @@ pub(crate) struct RxQueueState {
     pub(crate) rx_head: IrqSafeSpinLock<u32>,
 }
 
+impl RxQueueState {
+    /// The completed write-back of RX slot `slot`, or `None` while
+    /// hardware still owns it. DD-first, see [`AdvRxDescWb::sample`].
+    fn completed_desc(&self, slot: usize) -> Option<AdvRxDescWb> {
+        AdvRxDescWb::sample(|word| {
+            // SAFETY: coherent RX ring mapped for the queue's lifetime;
+            // `slot < ring_len` at every caller and `word` is 0 or 1, so
+            // the aligned qword lies inside descriptor `slot`.
+            u64::from_le(unsafe {
+                core::ptr::read_volatile(
+                    self.rx_ring
+                        .cpu_ptr_at::<u64>((slot * 16 + word * 8) as u64),
+                )
+            })
+        })
+    }
+}
+
 impl core::fmt::Debug for RxQueueState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RxQueueState")
@@ -1338,15 +1356,9 @@ impl Ixgbe {
         let head = (*head_g) as usize;
         let ring_phys = queue.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
-        // SAFETY: identity-mapped DMA ring.
-        let desc = unsafe {
-            core::ptr::read_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<AdvRxDescWb>(),
-            )
-        };
-        if !desc.is_done() {
+        let Some(desc) = queue.completed_desc(head) else {
             return 0;
-        }
+        };
         let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
         let buf_phys = queue.rx_slots.lock()[head].dma_addr().raw();
         for (i, b) in out[..len].iter_mut().enumerate() {
@@ -1408,15 +1420,7 @@ impl Ixgbe {
         let head = (*head_g) as usize;
         let ring_phys = queue.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
-        // SAFETY: identity-mapped DMA ring.
-        let desc = unsafe {
-            core::ptr::read_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<AdvRxDescWb>(),
-            )
-        };
-        if !desc.is_done() {
-            return None;
-        }
+        let desc = queue.completed_desc(head)?;
         let len = (desc.length as usize).min(RX_BUF_LEN);
         let meta = desc.rx_meta();
         // Refill before handing the filled buffer up, so the device never sees
