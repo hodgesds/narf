@@ -6,8 +6,12 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-struct Fake {
-    edid: Vec<u8>,
+/// Fake AUX/DDC transport for the Navi48 detector. `pub(crate)`
+/// so the #1983 end-to-end test in `amdgpu.rs` can drive the real
+/// detector through `Probe::scan_with` (same precedent as
+/// `amdgpu_dcn30_ddc::tests::Fake` for #1786).
+pub(crate) struct Fake {
+    pub(crate) edid: Vec<u8>,
     dpcd: [u8; 16],
     extended: [u8; 16],
     segment: usize,
@@ -28,7 +32,7 @@ struct Fake {
 fn checksum(block: &mut [u8]) {
     block[127] = 0u8.wrapping_sub(block[..127].iter().fold(0u8, |s, b| s.wrapping_add(*b)));
 }
-fn fake(blocks: usize) -> Fake {
+pub(crate) fn fake(blocks: usize) -> Fake {
     let mut edid = vec![0; blocks * 128];
     edid[..8].copy_from_slice(&[0, 255, 255, 255, 255, 255, 255, 0]);
     edid[18] = 1;
@@ -319,12 +323,27 @@ kernel_test_in!(
     navi48_display_refuses_ambiguous_or_unroutable_board_paths
 );
 
-struct FakeHdmi {
+/// Fake native-DDC HDMI transport. `pub(crate)` for the #1983
+/// end-to-end test; construct with `fake_hdmi` and swap `result`
+/// between scan phases.
+pub(crate) struct FakeHdmi {
     mccs: ddc::mccs::tests::Monitor,
     mccs_channels: Vec<(u8, u64)>,
-    result: Result<Vec<u8>, ddc::Error>,
+    pub(crate) result: Result<Vec<u8>, ddc::Error>,
     channels: Vec<u8>,
     stall: bool,
+}
+
+/// A fake HDMI transport returning `result` on every EDID read,
+/// with no MCCS negotiation.
+pub(crate) fn fake_hdmi(result: Result<Vec<u8>, ddc::Error>) -> FakeHdmi {
+    FakeHdmi {
+        mccs: Default::default(),
+        mccs_channels: Vec::new(),
+        result,
+        channels: Vec::new(),
+        stall: false,
+    }
 }
 impl Hdmi for FakeHdmi {
     async fn mccs(

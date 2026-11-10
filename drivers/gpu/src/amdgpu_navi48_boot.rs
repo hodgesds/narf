@@ -4400,6 +4400,15 @@ impl ColdBoot {
             .scan(&mut self.sequence.backend.dmub, self.ddc.as_mut().ok())
             .await
             .map_err(Error::Display)?;
+        // Feed each live EDID into the KMS audio caps (#1983), by
+        // ATOM device tag, so the caps land on the connector the
+        // blob was read from. A sink that can no longer be read
+        // clears its caps back to unknown instead of going stale.
+        // This is the detect choke point: every production rescan
+        // (modeset, platform, runtime PM) funnels through here.
+        for port in &ports {
+            feed_port_audio(&self.sequence.backend.gpu, port);
+        }
         self.scanned_sinks = ports
             .iter()
             .filter_map(|p| {
@@ -4456,6 +4465,25 @@ impl ColdBoot {
             return Err(Error::Busy);
         }
         Ok(&mut self.sequence.backend.dmub)
+    }
+}
+
+/// Feed one scan port's EDID into the KMS audio caps (#1983): the
+/// live DDC/AUX read's blob reaches `feed_connector_edid` through
+/// the device-tag crosswalk, so the caps land on the connector the
+/// blob was read from. A connected sink feeds; a sink that cannot
+/// be read (or is gone) clears the caps so they read unknown,
+/// never stale caps from a previous sink. Not an error when the
+/// tag has no KMS connector or the blob carries no CEA block —
+/// the feed's own contract covers both — so the result is dropped.
+pub(crate) fn feed_port_audio(gpu: &crate::amdgpu::AmdGpu, port: &display::Port) {
+    match &port.sink {
+        Ok(sink) => {
+            let _ = gpu.feed_connector_edid_for_device(port.path.device_tag, &sink.edid);
+        }
+        Err(_) => {
+            let _ = gpu.clear_connector_audio_caps_for_device(port.path.device_tag);
+        }
     }
 }
 

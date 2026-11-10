@@ -91,7 +91,7 @@ pub struct Port {
     pub sink: Result<Sink, Error>,
 }
 
-trait Aux {
+pub(crate) trait Aux {
     fn amd_vsdb(
         &mut self,
         _edid: &[u8],
@@ -108,7 +108,7 @@ trait Aux {
     ) -> impl Future<Output = Result<(), dmub::Error>> + Send;
     fn delay(&mut self) -> impl Future<Output = ()> + Send;
 }
-trait Hdmi {
+pub(crate) trait Hdmi {
     fn mccs(
         &mut self,
         _channel: u8,
@@ -349,7 +349,10 @@ impl Probe {
     ) -> Result<Vec<Port>, Error> {
         self.scan_with(dmub, ddc).await
     }
-    async fn scan_with(
+    /// Scan every board path in inventory order. `pub(crate)` so
+    /// the #1983 end-to-end test can drive the detector with fake
+    /// transports; production callers go through `Probe::scan`.
+    pub(crate) async fn scan_with(
         &mut self,
         io: &mut impl Aux,
         mut ddc: Option<&mut impl Hdmi>,
@@ -427,4 +430,4 @@ impl Probe {
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_display_tests.rs"]
-mod tests;
+pub(crate) mod tests;
