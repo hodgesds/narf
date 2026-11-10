@@ -8,27 +8,6 @@ pub(super) type Event = [u32; 4];
 pub(super) const QUEUE_DEPTH: usize = 64;
 pub(super) const DRAIN_BUDGET: usize = 32;
 
-/// Deadline class of one wait. Commands and control-transfer stages get
-/// Linux's bounds — `XHCI_CMD_DEFAULT_TIMEOUT` and `USB_CTRL_GET_TIMEOUT` /
-/// `USB_CTRL_SET_TIMEOUT`, 5000 ms each (USB 2.0 §9.2.6.1 caps any request
-/// at 5 s; a device may legally NAK a control stage far longer than
-/// 250 ms). The compatibility one-shot bulk/isoch waits are short internal
-/// polls whose callers re-arm them; they keep 250 ms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Wait {
-    Command,
-    ControlStage,
-    Transfer,
-}
-impl Wait {
-    pub const fn timeout_ms(self) -> u64 {
-        match self {
-            Self::Command | Self::ControlStage => 5000,
-            Self::Transfer => 250,
-        }
-    }
-}
-
 /// Returns true if an unrelated oldest event had to be discarded.
 pub(super) fn enqueue(queue: &mut VecDeque<Event>, event: Event) -> bool {
     let overflow = queue.len() >= QUEUE_DEPTH;

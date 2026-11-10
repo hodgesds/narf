@@ -53,10 +53,6 @@ impl Latch {
     pub fn conflicted(&self) -> bool {
         self.conflict
     }
-    /// The latched event, without consuming it (diagnostics only).
-    pub fn peek(&self) -> Option<Event> {
-        self.event
-    }
     pub fn consumed(&self) -> bool {
         self.consumed && !self.conflict
     }
