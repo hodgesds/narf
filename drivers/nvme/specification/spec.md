@@ -207,7 +207,23 @@ multipath / fabrics (defer).
   controller instead). MSI-X entry 0 stays the admin queue's (Linux
   `nvme_create_cq`: `vector = num_vecs == 1 ? 0 : qid`); I/O queues
   use entries `1..=granted` with `IV = qid`, `IEN = 1`, one IDT
-  vector + installed handler each. Production submissions
+  vector + installed handler each. Every entry is steered at one CPU —
+  scheduler CPU 0, resolved to a real APIC ID with
+  `narf_interrupts::apic_id_of_cpu` (the bring-up CPU if firmware lists
+  no APIC ID 0; a literal 0 only when the topology is unknown) — since
+  completions are consumed by whichever CPU is waiting. An entry that
+  cannot be programmed is never advertised as a vector: a failed admin
+  entry leaves the admin queue vector-less (so a single I/O queue that
+  would share entry 0 is created with IEN=0); a failed single-I/O-queue
+  entry (programming or the global enable, which that path sets itself)
+  creates that queue polled (IV=0, IEN=0);
+  a failed multi-queue entry reports `Msix` (polled fallback). Each is
+  logged. The admin queue's vector is tracked on its own
+  (`Controller::admin_irq_vector()`; the public `irq_vector` field is
+  repointed at the first I/O queue's vector by the multi-queue setup):
+  it is the vector the AER supervisor parks on, and
+  `disable_after_failure` releases it together with every I/O vector,
+  each exactly once. Production submissions
   (`nvm_io_dma`, `nvm_io_multipage`, hence every block-layer read /
   write) route through `submit_sqe_irq` — IRQ-driven wait on the
   queue's vector `fire_count` with a CQE-phase fallback, 30 s budget
@@ -266,8 +282,18 @@ multipath / fabrics (defer).
 
 - PRP / SGL lists validated against the DMA buffer's bounds.
 - No DMA buffer a command may still reference is freed: I/O uses persistent
-  scratch and PRP-list pages, a timed-out I/O marks the controller dead, and a
-  timed-out admin passthrough leaks its pages.
+  scratch and PRP-list pages, a timed-out I/O marks the controller dead, a
+  timed-out admin passthrough leaks its pages, and a timed-out Identify /
+  Security Send / Security Receive parks its data buffer in `in_flight_dma`
+  until `disable_after_failure` confirms the controller stopped.
+- An admin command timeout (5 s) fails that command only: it does not mark
+  the controller dead and is never replayed. (Linux resets on an admin
+  timeout, but after 60 s; at 5 s a slow Format NVM or vendor passthrough
+  would reset the controller under the root filesystem.) Its late completion
+  cannot be mistaken for another command's (CID match) and cannot block AER
+  delivery: `drain_aer_events` drops a head entry that is not an outstanding
+  AER's completion as a stray — admin commands are synchronous under the
+  gate, so such an entry has no waiter.
 - A caller-owned data buffer (`NvmeBlockDevice::submit`'s cap-resolved
   `DmaBuffer`) is not released under a command that may still be live: a
   request that fails with a timeout returns only after the controller was
@@ -462,8 +488,10 @@ head:
 - `Controller::drain_aer` consumes only CQEs whose CID is an
   outstanding AER (tracked per admin queue in `aer_cids`),
   drains the `stray_aer` stash first, and reposts one AER per
-  drained completion. A head entry carrying another CID is a
-  normal admin command's completion and is left for its waiter.
+  drained completion. A head entry carrying another CID is the
+  late completion of a timed-out admin command (no admin command
+  can be mid-wait while the drain runs): it is consumed, counted
+  and logged as a stray, so it cannot block the AERs behind it.
 - `Controller::submit_io_irq` / `submit_io_irq_async` drain
   through `try_take_io_cqe`: only the CQE carrying the
   submitted CID is accepted; strays are consumed and dropped
