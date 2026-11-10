@@ -1468,6 +1468,7 @@ where
     match op().await {
         Err(FsError::NoSpace) => {
             vol.sync_to_disk().await?;
+            alloc_metadata_ahead(vol).await?;
             op().await
         }
         Err(FsError::QuotaExceeded) if batch_owns_fs_tree(vol).await => {
@@ -1475,6 +1476,56 @@ where
             op().await
         }
         other => other,
+    }
+}
+
+/// After the commit a refused metadata reservation forced: allocate a
+/// METADATA chunk if the space is past Linux's threshold ([`reserve`],
+/// "Growing metadata ahead of need"). Without this the commit alone makes
+/// the operation fit again, the chunk allocation further down the ladder is
+/// never reached, and the filesystem runs on short batches.
+///
+/// `root-rw` only (the other profile grows by a different path), and only
+/// for a refusal that came from the reservation. A device with no room for
+/// the chunk is left for the retry to judge.
+async fn alloc_metadata_ahead<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    use core::sync::atomic::Ordering;
+    if crate::rw_gate::active_profile() != crate::rw_gate::Profile::RootRw
+        || !META_RESERVE_REFUSAL.load(Ordering::Relaxed)
+    {
+        return Ok(());
+    }
+    let alloc = Allocator::build(vol).await?;
+    let (groups, total) = alloc.group_shape();
+    if total == u64::MAX {
+        return Ok(());
+    }
+    let geometry = reserve::ReserveGeometry::sample(vol, groups, total).await?;
+    let free = alloc.free_bytes(format::BLOCK_GROUP_METADATA);
+    let reserve = geometry.global().saturating_mul(vol.nodesize() as u64);
+    let used = total.saturating_sub(free).saturating_add(reserve);
+    if !reserve::should_alloc_chunk(used, total) {
+        return Ok(());
+    }
+    match alloc_chunk(vol, format::BLOCK_GROUP_METADATA).await {
+        Ok(()) => {
+            use core::fmt::Write as _;
+            vol.commit_stats()
+                .early_metadata_chunks
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: grew METADATA ahead of need: {} of {} KiB in use, {} KiB of that the global reserve",
+                used >> 10,
+                total >> 10,
+                reserve >> 10
+            );
+            Ok(())
+        }
+        Err(FsError::NoSpace) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

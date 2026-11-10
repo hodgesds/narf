@@ -192,7 +192,12 @@ METADATA or DATA chunk is allocated in a transaction of its own and it is
 retried again (`autogrow!` → `root_rw_grow`, Linux `ALLOC_CHUNK`); only then
 does it return `ENOSPC`. (Linux tries the chunk before the commit; here the
 batch has to close before a chunk can be allocated, so the commit comes
-first.) A chunk is never allocated inside `commit_txn`. Reclaiming orphans is
+first.) After that commit, a METADATA chunk is allocated at once if the
+metadata space, global reserve included, is within 2 MiB of 80% in use
+(`alloc_metadata_ahead`, Linux `should_alloc_chunk`); otherwise a filesystem
+whose free metadata barely exceeds the reserve would never reach the chunk
+allocation and would run on short batches. A chunk is never allocated inside
+`commit_txn`. Reclaiming orphans is
 part of what is retried, so its `NoSpace` takes the same ladder, and it never
 fails a sync or keeps the transaction timer from committing. `unlink`,
 `rmdir` and the final eviction of an orphan may borrow the global reserve

@@ -49,6 +49,9 @@ pub(crate) struct CommitStats {
     /// Operations refused before staging because their metadata reservation
     /// did not fit (each is then retried after reclaim, or gets `ENOSPC`).
     pub(crate) reserve_refusals: AtomicU64,
+    /// METADATA chunks allocated ahead of need, because a refused
+    /// reservation found the metadata space past Linux's 80% threshold.
+    pub(crate) early_metadata_chunks: AtomicU64,
     /// Metadata blocks the last commit allocated for itself (csum, extent,
     /// block-group, free-space and root trees), and the first-order
     /// reservation its batch held for them; the most any commit exceeded its
@@ -75,6 +78,7 @@ pub(crate) struct CommitStatsSnapshot {
     pub(crate) alloc_build_cycles: u64,
     pub(crate) super_writes: u64,
     pub(crate) reserve_refusals: u64,
+    pub(crate) early_metadata_chunks: u64,
     pub(crate) max_reserve_overrun: u64,
 }
 
@@ -95,6 +99,7 @@ impl CommitStatsSnapshot {
             alloc_build_cycles: self.alloc_build_cycles - earlier.alloc_build_cycles,
             super_writes: self.super_writes - earlier.super_writes,
             reserve_refusals: self.reserve_refusals - earlier.reserve_refusals,
+            early_metadata_chunks: self.early_metadata_chunks - earlier.early_metadata_chunks,
             max_reserve_overrun: self.max_reserve_overrun,
         }
     }
@@ -115,6 +120,7 @@ impl CommitStats {
             alloc_build_cycles: self.alloc_build_cycles.load(Relaxed),
             super_writes: self.super_writes.load(Relaxed),
             reserve_refusals: self.reserve_refusals.load(Relaxed),
+            early_metadata_chunks: self.early_metadata_chunks.load(Relaxed),
             max_reserve_overrun: self.max_reserve_overrun.load(Relaxed),
         }
     }

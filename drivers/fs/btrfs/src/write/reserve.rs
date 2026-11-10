@@ -78,6 +78,20 @@
 //! finds no space fails without writing a superblock and the transaction
 //! aborts — the last-resort net, unchanged.
 //!
+//! # Growing metadata ahead of need
+//!
+//! Committing the open batch always makes a refused operation fit again
+//! while the global reserve itself fits, so a filesystem whose free metadata
+//! is only a little more than the reserve would never reach the chunk
+//! allocation: it would run on short batches and commit constantly. Linux
+//! flushes `ALLOC_CHUNK` before `COMMIT_TRANS` and allocates when the space
+//! is past 80% in use, reserve included ([`should_alloc_chunk`]). A batch
+//! here must close before a chunk can be allocated, so the order is the
+//! other way round, but the rule is the same: after the commit a refusal
+//! forced, a METADATA chunk is allocated if the space is past that
+//! threshold, and only then is the operation retried. A device with no room
+//! for the chunk is not an error at this point; the retry decides.
+//!
 //! # Unlink
 //!
 //! An operation that only releases space must not be refused for lack of it,
@@ -101,6 +115,14 @@ pub(crate) const GLOBAL_FLOOR_BLOCKS: u64 = 256;
 /// `SZ_512M`: the most the global reserve holds
 /// (`btrfs_update_global_block_rsv`).
 const GLOBAL_MAX_BYTES: u64 = 512 << 20;
+
+/// Linux `should_alloc_chunk` (`CHUNK_ALLOC_NO_FORCE`): a space is due
+/// another chunk once what it has in use — here the allocated metadata plus
+/// the global reserve, which Linux counts through `bytes_may_use` — comes
+/// within 2 MiB of 80% of its size.
+pub(crate) fn should_alloc_chunk(used: u64, total: u64) -> bool {
+    used.saturating_add(2 << 20) >= total / 100 * 80 + total % 100 * 80 / 100
+}
 
 /// What a batch's commit has to record, counted from the batch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
