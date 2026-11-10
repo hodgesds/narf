@@ -1643,9 +1643,10 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
     // abort, and then every operation the batch already reported successful
     // is lost. So an operation that would leave less than the commit's
     // estimated need fails here with `NoSpace` — before it is staged, so
-    // nothing is lost — and `autogrow!` allocates a METADATA chunk (or the
-    // caller gets ENOSPC on a full device) instead.
-    if crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw {
+    // nothing is lost — and the space retry commits accumulated work or grows
+    // the filesystem instead. This applies to every write profile: a small
+    // mixed-group fixture can exhaust commit space well before MAX_BATCH_OPS.
+    {
         let changes = batch.new_data.len()
             + batch.dropped_data.len()
             + batch.added_data.len()
@@ -1659,9 +1660,11 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
         let need = commit_meta_reserve(vol, changes);
         if free < need {
             batch.alloc = snapshot_alloc;
-            META_RESERVE_REFUSAL.store(true, core::sync::atomic::Ordering::Relaxed);
-            META_RESERVE_FREE.store(free, core::sync::atomic::Ordering::Relaxed);
-            META_RESERVE_NEED.store(need, core::sync::atomic::Ordering::Relaxed);
+            if crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw {
+                META_RESERVE_REFUSAL.store(true, core::sync::atomic::Ordering::Relaxed);
+                META_RESERVE_FREE.store(free, core::sync::atomic::Ordering::Relaxed);
+                META_RESERVE_NEED.store(need, core::sync::atomic::Ordering::Relaxed);
+            }
             return Err(FsError::NoSpace);
         }
     }

@@ -1393,19 +1393,56 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.orphans.lock().pop()
     }
 
+    /// Caller holds `inode_update_lock`. Failed releases stay queued so
+    /// a later sync can retry rather than silently leaking their allocation.
+    async fn drain_orphans_locked(&self) -> Result<(), FsError> {
+        while let Some(inode_no) = self.pop_orphan() {
+            if let Err(error) = self.release_orphan(inode_no).await {
+                self.queue_orphan(inode_no);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Directory metadata is write-through. Complete deferred inode teardown
+    /// before flushing the device, and preserve a failed flush as an error.
+    pub(crate) async fn sync_metadata(&self) -> Result<(), FsError> {
+        if self.read_only {
+            return Ok(());
+        }
+        let _update = self.inode_update_lock.lock().await;
+        self.drain_orphans_locked().await?;
+        self.device.flush_result().await.map_err(FsError::Io)
+    }
+
+    /// `sync_filesystem`: dirty mmap pages belong to every live inode, not
+    /// just the inode used to obtain the syncfs descriptor. Never keep the
+    /// icache spinlock across I/O or nest the inode-update mutex.
+    pub(crate) async fn sync_filesystem(&self) -> Result<(), FsError> {
+        if self.read_only {
+            return Ok(());
+        }
+        let nodes: Vec<_> = self
+            .icache
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for node in nodes {
+            node.write_back_dirty(0, u64::MAX).await?;
+        }
+        self.sync_metadata().await
+    }
+
     /// Take `inode_update_lock`, releasing any orphaned inodes first. Every
     /// whole-inode update goes through here, so an inode unlinked while open
     /// is released at the first update after its last reference drops.
     pub(crate) async fn lock_inode_updates(&self) -> narf_lib::mutex::MutexGuard<'_, ()> {
         let guard = self.inode_update_lock.lock().await;
-        while let Some(inode_no) = self.pop_orphan() {
-            if self.release_orphan(inode_no).await.is_err() {
-                // Keep it for the next update rather than leak it; the update
-                // the caller is about to make is unrelated and goes ahead.
-                self.queue_orphan(inode_no);
-                break;
-            }
-        }
+        // An unrelated mutation can proceed if orphan cleanup fails. Sync
+        // instead calls the fallible drain directly and reports the failure.
+        let _ = self.drain_orphans_locked().await;
         guard
     }
 

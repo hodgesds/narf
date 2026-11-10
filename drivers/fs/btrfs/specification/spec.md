@@ -58,6 +58,12 @@ pub mod harness {                                               // test-workload
 BtrfsVolume::sync_fs(&self) -> Result<(), FsError>  // syncfs: commit + superblock + flush
 ```
 
+All write profiles apply the commit metadata reserve check before staging
+another operation. Space pressure may commit a batch before `MAX_BATCH_OPS`;
+the operation cap is an upper bound, not a promised transaction size. Explicit
+sync commits the final partial batch. Tests inspecting committed tree roots
+must sync successfully before checking their height.
+
 Every node for one `(filesystem core, fs-tree id, inode)` retains shared inode
 metadata, size, and mapping identity. Creation acquires that reference before
 releasing the operation mutex. Mutators hold the mutex from their first tree
@@ -94,6 +100,19 @@ File-content reads seek to the extent at or before the requested offset and
 walk only the requested window. A small read must not collect the inode's
 entire extent list. Reader epochs, checksum verification, the compressed-extent
 cache and zero filling of holes still cover these reads.
+
+Uncompressed reads covered entirely by valid data checksums retain windows up to
+128 KiB in the shared 32 MiB extent cache. Keys include shared-core identity,
+logical byte range, compression tag and file-extent generation. Reads never
+widen their requested window to fill the cache. Logical writes invalidate
+overlapping entries before and after I/O, and a fill crossing a write epoch
+is not retained. Verification-disabled views and larger windows bypass this
+uncompressed cache. The maximum cached disk span also bounds invalidation's
+backward scan; it is enforced at insertion for both entry kinds.
+Missing-checksum sectors (including pending writes before commit) remain
+readable through the existing policy but never populate verified windows.
+An 8,192-entry ceiling bounds bookkeeping for tiny ranges as well as payload
+bytes.
 
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private

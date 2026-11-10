@@ -664,6 +664,7 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_root_rw_never_grows);
 fn smoke_btrfs_growth_capped_at_device_total_bytes() -> TestResult {
     let base = writable_sparse(FIXTURE_MIRROR_SPARSE);
     let dev = Arc::new(WritableSparseDevice {
+        reads: core::sync::atomic::AtomicUsize::new(0),
         runs: base.runs.clone(),
         total: base.total + (64 << 20),
         lba_size: base.lba_size,

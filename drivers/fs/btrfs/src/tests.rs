@@ -17,6 +17,8 @@ use crate::chunk::ChunkMap;
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
+mod batch_commit;
+mod data_cache;
 mod extent_window;
 mod safety;
 mod snapshots;
@@ -305,6 +307,7 @@ struct WritableSparseDevice {
     runs: Vec<(u64, Vec<u8>)>,
     total: u64,
     lba_size: u32,
+    reads: core::sync::atomic::AtomicUsize,
     overlay: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
@@ -321,6 +324,8 @@ impl narf_block::BlockDeviceSync for WritableSparseDevice {
         n_blocks: u16,
         out: &mut [u8],
     ) -> Result<(), narf_block::BlockIoError> {
+        self.reads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let bs = u64::from(self.lba_size);
         let start = lba * bs;
         let len = u64::from(n_blocks) * bs;
@@ -389,6 +394,7 @@ fn writable_sparse(sparse: &[u8]) -> Arc<WritableSparseDevice> {
         runs,
         total,
         lba_size: 512,
+        reads: core::sync::atomic::AtomicUsize::new(0),
         overlay: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
     })
 }
@@ -398,6 +404,7 @@ fn blank_writable(total: u64) -> Arc<WritableSparseDevice> {
         runs: Vec::new(),
         total,
         lba_size: 512,
+        reads: core::sync::atomic::AtomicUsize::new(0),
         overlay: narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new()),
     })
 }
@@ -6688,6 +6695,11 @@ fn smoke_btrfs_multileaf_trees() -> TestResult {
         }
     }
 
+    // The committed ROOT_ITEMs below change only at commit, even though the
+    // live fs tree already exposes the staged files.
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("multi-leaf workload sync failed");
+    }
     // Both the extent and csum trees must have outgrown a single leaf.
     if tree_level(&vol, format::EXTENT_TREE_OBJECTID) != Some(1) {
         return TestResult::Fail("extent tree did not become multi-leaf");
@@ -6780,6 +6792,10 @@ fn smoke_btrfs_tall_tree() -> TestResult {
         }
     }
 
+    // Read the committed root only after the staged symlinks are durable.
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("tall-tree workload sync failed");
+    }
     // The fs tree must have grown past two levels (root level 2).
     match tree_level(&vol, format::FS_TREE_OBJECTID) {
         Some(2) => {}
@@ -9939,13 +9955,14 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_laptop_image);
 
 // ── Batched transactions ───────────────────────────────────────────
 
-/// Many operations commit as ONE transaction.
+/// Many operations batch while metadata pressure may force an early commit.
 ///
 /// This is the property the batch exists for. The superblock generation is
 /// bumped once per *transaction* by `commit_roots`, so counting generations
-/// across a run of operations counts transactions directly: eight creates that
-/// each commit advance it eight times, eight creates that accumulate advance it
-/// once. The saving is everything a commit does — the extent-tree fixed point
+/// across a run of operations counts transactions directly. A small fixture
+/// need not fit MAX_BATCH_OPS in one transaction: that is a cap, and space
+/// reclaim may commit earlier. The saving is everything a commit does — the
+/// extent-tree fixed point
 /// and the writeout of the extent, csum, root and free-space trees — which is
 /// per transaction and not per operation.
 ///
@@ -9953,21 +9970,25 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_laptop_image);
 /// that may still commit on its own: `ensure_private_subvol` runs against the
 /// committed tree and can rewrite it, which is a transaction of its own that
 /// says nothing about batching.
-fn smoke_btrfs_batch_commits_once_for_many_ops() -> TestResult {
+fn smoke_btrfs_batch_commits_many_ops_with_space_reclaim() -> TestResult {
     use alloc::format;
+    use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
 
-    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
-        Ok(v) => v,
-        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("fst fixture failed to mount"),
     };
     let root = vol.root();
     // Warm-up: get any private-subvolume rewrite out of the way, and leave no
     // batch open, so the count below sees only the batching behaviour.
-    if poll_once(root.create("batch-warmup.txt")).is_none() {
+    if !matches!(poll_once(root.create("batch-warmup.txt")), Some(Ok(_))) {
         return TestResult::Fail("warm-up create failed");
     }
-    let _ = poll_once(vol.sync_to_disk());
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("warm-up sync failed");
+    }
 
     let before = vol.superblock().generation;
     for i in 0..crate::write::MAX_BATCH_OPS {
@@ -9978,15 +9999,22 @@ fn smoke_btrfs_batch_commits_once_for_many_ops() -> TestResult {
             return TestResult::Fail("a batched create failed");
         }
     }
-    // A batch's worth of operations, and the last fills it and commits it:
-    // exactly one transaction. Without accumulation this would be one each.
+    // Include a final partial batch after any pressure-triggered commits.
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("batched creates failed to sync");
+    }
     let after = vol.superblock().generation;
-    if after != before + 1 {
-        return TestResult::Fail("a full batch did not commit as one transaction");
+    if after <= before || after >= before + crate::write::MAX_BATCH_OPS as u64 {
+        return TestResult::Fail("creates did not amortize commits");
     }
 
-    // And the batch is not a cache trick: every one of them is really there.
-    let names = dir_names(&vol.root());
+    // A fresh device/core reads only the image committed by the last sync.
+    let snapshot = RamBlockDevice::from_image(512, device.snapshot());
+    let fresh = match poll_once(BtrfsVolume::mount(snapshot, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("batched creates did not remount"),
+    };
+    let names = dir_names(&fresh.root());
     for i in 0..crate::write::MAX_BATCH_OPS {
         if !names.iter().any(|n| n == &format!("batch-{i}.txt")) {
             return TestResult::Fail("a batched create was lost");
@@ -9997,7 +10025,7 @@ fn smoke_btrfs_batch_commits_once_for_many_ops() -> TestResult {
 
 kernel_test_in!(
     "drivers/fs/btrfs",
-    smoke_btrfs_batch_commits_once_for_many_ops
+    smoke_btrfs_batch_commits_many_ops_with_space_reclaim
 );
 
 /// A read taken between two operations of one batch sees the earlier one.
@@ -10234,7 +10262,11 @@ fn smoke_btrfs_quota_volume_batches() -> TestResult {
     use narf_filesystem::FsInstance;
 
     let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
-    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+    let vol = match poll_once(BtrfsVolume::mount_opts(
+        device.clone(),
+        DomainId::DRIVER_0,
+        true,
+    )) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("quota fixture failed to mount"),
     };
@@ -10245,10 +10277,12 @@ fn smoke_btrfs_quota_volume_batches() -> TestResult {
     }
     let root = vol.root();
     // Warm-up, so any private-subvolume rewrite is not counted below.
-    if poll_once(root.create("q-warmup.txt")).is_none() {
+    if !matches!(poll_once(root.create("q-warmup.txt")), Some(Ok(_))) {
         return TestResult::Fail("warm-up create failed");
     }
-    let _ = poll_once(vol.sync_to_disk());
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("quota warm-up sync failed");
+    }
 
     let before = vol.superblock().generation;
     for i in 0..crate::write::MAX_BATCH_OPS {
@@ -10256,20 +10290,28 @@ fn smoke_btrfs_quota_volume_batches() -> TestResult {
             return TestResult::Fail("a batched create on a quota volume failed");
         }
     }
-    if vol.superblock().generation != before + 1 {
-        return TestResult::Fail("a quota volume did not batch a full batch into one commit");
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("quota batched creates failed to sync");
     }
-    let names = dir_names(&vol.root());
+    let after = vol.superblock().generation;
+    if after <= before || after >= before + crate::write::MAX_BATCH_OPS as u64 {
+        return TestResult::Fail("quota creates did not amortize commits");
+    }
+    let snapshot = RamBlockDevice::from_image(512, device.snapshot());
+    let fresh = match poll_once(BtrfsVolume::mount(snapshot, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota batched creates did not remount"),
+    };
+    let names = dir_names(&fresh.root());
     for i in 0..crate::write::MAX_BATCH_OPS {
         if !names.iter().any(|n| n == &format!("q-{i}.txt")) {
             return TestResult::Fail("a batched create on a quota volume was lost");
         }
     }
     // And the accounting still lands, once, when the transaction commits.
-    let _ = poll_once(vol.sync_to_disk());
     let info =
-        qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).unwrap_or_default();
-    if format::le64(&info, 0).ok() != Some(vol.superblock().generation) {
+        qgroup_item(&fresh, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).unwrap_or_default();
+    if format::le64(&info, 0).ok() != Some(fresh.superblock().generation) {
         return TestResult::Fail("qgroup accounting did not follow the batched commit");
     }
     TestResult::Pass

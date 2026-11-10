@@ -66,8 +66,22 @@ pub async fn read_checked<B: BlockDevice + 'static>(
     logical: u64,
     len: usize,
 ) -> Result<Vec<u8>, FsError> {
+    read_checked_for_cache(vol, csum_root, logical, len)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+/// The ordinary checked read, also reporting whether every sector actually
+/// had a checksum. Missing checksums are valid for nodatasum or newly staged
+/// data, but those bytes must not populate a cache of verified windows.
+pub(crate) async fn read_checked_for_cache<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    csum_root: u64,
+    logical: u64,
+    len: usize,
+) -> Result<(Vec<u8>, bool), FsError> {
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
     let sectorsize = u64::from(vol.sectorsize());
     let start = logical / sectorsize * sectorsize;
@@ -79,6 +93,7 @@ pub async fn read_checked<B: BlockDevice + 'static>(
         .ok_or(FsError::InvalidData)?;
     let total = usize::try_from(end - start).map_err(|_| FsError::InvalidData)?;
     let mut checked = Vec::with_capacity(total);
+    let mut fully_verified = true;
     let mut sector = start;
     while sector < end {
         let bytes = match find_csum(vol, csum_root, sector, sectorsize).await? {
@@ -86,13 +101,16 @@ pub async fn read_checked<B: BlockDevice + 'static>(
                 vol.read_logical_checked(sector, sectorsize as usize, &stored)
                     .await?
             }
-            None => vol.read_logical(sector, sectorsize as usize).await?,
+            None => {
+                fully_verified = false;
+                vol.read_logical(sector, sectorsize as usize).await?
+            }
         };
         checked.extend_from_slice(&bytes);
         sector += sectorsize;
     }
     let offset = usize::try_from(logical - start).map_err(|_| FsError::InvalidData)?;
-    Ok(checked[offset..offset + len].to_vec())
+    Ok((checked[offset..offset + len].to_vec(), fully_verified))
 }
 
 /// Verify that every physical `sectorsize` block of a file's regular extents

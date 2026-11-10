@@ -807,9 +807,12 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
             // `ext4_sync_file`: write back this inode's dirty pages, then
             // flush the device's volatile cache so the data is durable.
             self.write_back_dirty(0, u64::MAX).await?;
-            self.volume.device.flush().await;
-            Ok(())
+            self.volume.sync_metadata().await
         })
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(self.volume.sync_filesystem())
     }
 
     /// FITRIM (`fstrim`) on this file — the first discard caller
@@ -1324,6 +1327,14 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
             state.stat = stat;
             Ok(())
         })
+    }
+
+    fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+        Box::pin(self.volume.sync_metadata())
+    }
+
+    fn syncfs<'a>(&'a self) -> FsFuture<'a, ()> {
+        Box::pin(self.volume.sync_filesystem())
     }
 
     // Directory-mutation surface — wired through to the
