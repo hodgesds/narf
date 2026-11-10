@@ -67,7 +67,7 @@
 //!   owner; this worker delivers in arrival order.
 //! - A-MSDU deaggregation and RX fragment reassembly: torn
 //!   A-MSDU cuts are dropped; reassembly is a separate lane.
-//! - 6 GHz admission, MLO multi-link, legacy-mode admission,
+//! - MLO multi-link, legacy-mode admission,
 //!   the full `pwr_on_func` tail / `mac_pre_init` owner (now
 //!   `mac_pre_init_8922a`), `cid` retention (now
 //!   `mac_pre_init_8922a::HalChipVer`), AX-path 8922A refusals
@@ -75,6 +75,10 @@
 //!   `packet_format`, `packet_core`, `efuse`, `factory`,
 //!   `fifo`, `bdram`, `command_queue`, `download_dma`,
 //!   `irq::Mask::config`, `station_control::Controller::new`).
+//!   (6 GHz admission is done: `station_8922a` TPE + power
+//!   program, 20 MHz only; the register-level
+//!   `rtw8922a_set_txpwr` program and wide-6 GHz TPE are the
+//!   follow-ups.)
 
 use alloc::vec::Vec;
 

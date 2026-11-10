@@ -11,7 +11,7 @@ use super::mac_pre_init_8922a::{Cid, HalChipVer};
 use super::prepared::{self, Files};
 use super::prepared_8922a::*;
 use super::ra_mask::{EhtCaps, StationCaps};
-use super::station_8922a::{Band, Error as StationError, Request};
+use super::station_8922a::{Band, Error as StationError, Request, SixGhzAdmission};
 use super::tx_8922a::{PrepareArgs, DATA_RING_DEPTH};
 use super::txrx_be::{encode_txwd_be, fill_txwd_info_v2, TxwdBeInfo, TxwdInfoV2};
 use alloc::collections::BTreeMap;
@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use narf_bus::{BusDevice, BusDeviceCap, BusKind};
 use narf_capabilities::{Cap, Write};
 use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_wireless::reg::PowerType6Ghz;
 
 /// Fixture register bank implementing [`Regs`] (same shape as the
 /// `dma_8922a` fixture: reads default to 0, so the DMA-idle
@@ -141,6 +142,7 @@ fn base_req() -> Request<'static> {
         has_he: true,
         mgq_rpt_en: false,
         p2p: false,
+        six_ghz: None,
     }
 }
 
@@ -442,11 +444,26 @@ fn smoke_rtw89_prepared_8922a_refusals() -> TestResult {
     if owner.prepare_h2c(&mut bd, 0x30000, 64).is_ok() {
         return TestResult::Fail("prepare_h2c before program_rings accepted");
     }
-    // 6 GHz and 320 MHz admission are refused (later steps).
+    // 6 GHz without a power program is refused; with one (20 MHz
+    // LPI) it admits through the Prepared owner. 320 MHz admission
+    // is refused (later steps).
     let mut six_ghz = base_req();
     six_ghz.band = Band::Ghz6;
     if owner.admit_station(&six_ghz) != Err(Error::Station(StationError::SixGhzPowerMissing)) {
         return TestResult::Fail("6 GHz admission not refused");
+    }
+    six_ghz.width_mhz = 20;
+    six_ghz.primary = 5;
+    six_ghz.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Lpi,
+        tpe_dbm: None,
+    });
+    let macid = match owner.admit_station(&six_ghz) {
+        Ok(macid) => macid,
+        Err(_) => return TestResult::Fail("6 GHz LPI admission refused"),
+    };
+    if owner.station(macid).is_none_or(|st| st.six_ghz().is_none()) {
+        return TestResult::Fail("6 GHz station records no power program");
     }
     let mut wide = base_req();
     wide.width_mhz = 320;
