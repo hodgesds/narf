@@ -25,7 +25,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use narf_capabilities::{Cap, CapError, Write};
 use narf_memory::PhysAddr;
 
-use crate::bar::{map_bar_control, BarError};
+use crate::bar::{map_bar_control, BarError, MmioRegion};
 use crate::device::{BusDevice, BusKind};
 use crate::registry::BusDeviceCap;
 
@@ -124,6 +124,11 @@ pub struct MsixTable {
     /// uses this in `enable` to flip the Message-Control "MSI-X
     /// enable" bit (bit 15 at cap_ptr + 2).
     cap_offset: u64,
+    /// Mapping of the table BAR, kept from the first `program_vector`.
+    /// Resolving it again would re-size the BAR, and sizing clears the
+    /// function's memory decoding for the duration: on a running device
+    /// every concurrent register access in that window is lost.
+    region: Option<MmioRegion>,
 }
 
 impl MsixTable {
@@ -151,6 +156,42 @@ impl MsixTable {
     #[inline]
     pub const fn cfg_phys(&self) -> PhysAddr {
         self.cfg_phys
+    }
+
+    /// `true` once the table BAR mapping is retained, i.e. later table
+    /// accesses no longer touch the function's Command register.
+    #[inline]
+    pub const fn table_mapped(&self) -> bool {
+        self.region.is_some()
+    }
+
+    /// The table BAR mapping, resolved at most once per table.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR and config space for the call.
+    unsafe fn table_region(&mut self) -> Result<MmioRegion, MsixError> {
+        if let Some(region) = self.region {
+            return Ok(region);
+        }
+        // SAFETY: forwarded ownership. map_bar_control does the
+        // size-detection write/restore against cfg-space.
+        let region = unsafe { map_bar_control(&self.device, self.bir)? };
+        self.region = Some(region);
+        Ok(region)
+    }
+
+    /// As `table_region` for `&self` callers: reuses the retained mapping
+    /// and only falls back to resolving the BAR before the first
+    /// `program_vector`.
+    ///
+    /// # Safety
+    /// Same as `table_region`.
+    unsafe fn table_region_shared(&self) -> Result<MmioRegion, MsixError> {
+        match self.region {
+            Some(region) => Ok(region),
+            // SAFETY: forwarded ownership.
+            None => Ok(unsafe { map_bar_control(&self.device, self.bir)? }),
+        }
     }
 
     /// Reserve the next free vector slot.
@@ -231,10 +272,8 @@ impl MsixTable {
             return Err(MsixError::VectorOutOfRange);
         }
 
-        // SAFETY: caller holds the device exclusively. map_bar_control
-        // does the size-detection write/restore against cfg-space.
-        // SAFETY: Valid memory or trusted environment
-        let region = unsafe { map_bar_control(&self.device, self.bir)? };
+        // SAFETY: caller holds the device exclusively.
+        let region = unsafe { self.table_region()? };
 
         // VMD remap interposition (issue #933 item 4): a child
         // behind a VMD bridge is programmed with the bridge-entry
@@ -297,6 +336,14 @@ impl MsixTable {
                 its::map_event(device_id, event_id, lpi, collection)
                     .map_err(|_| MsixError::Unsupported)?;
             }
+        }
+
+        // Without interrupt remapping an xAPIC MSI address carries an
+        // 8-bit destination; a wider APIC ID would silently alias another
+        // CPU instead of reaching its target.
+        #[cfg(target_arch = "x86_64")]
+        if target_apic_id > 0xFF {
+            return Err(MsixError::Unsupported);
         }
 
         let (msg_addr, msg_data) = msi_message(target_apic_id, irq_vector);
@@ -369,7 +416,7 @@ impl MsixTable {
             return Err(MsixError::VectorOutOfRange);
         }
         // SAFETY: caller-owned device; the Device mapping is reused.
-        let region = unsafe { map_bar_control(&self.device, self.bir)? };
+        let region = unsafe { self.table_region_shared()? };
         let entry_off = self.table_offset as u64 + (idx as u64) * 16;
         // SAFETY: entry_off + 16 <= bar.size by spec (MsixTable was
         // built from the spec-mandated table size).
@@ -389,7 +436,7 @@ impl MsixTable {
             return Err(MsixError::VectorOutOfRange);
         }
         // SAFETY: caller-owned device.
-        let region = unsafe { map_bar_control(&self.device, self.bir)? };
+        let region = unsafe { self.table_region_shared()? };
         let entry_off = self.table_offset as u64 + (idx as u64) * 16;
         // SAFETY: same.
         unsafe {
@@ -506,6 +553,7 @@ pub fn enable_msix(
         cfg_phys,
         device: *device,
         cap_offset: cap_ptr,
+        region: None,
     })
 }
 
@@ -539,6 +587,7 @@ pub fn __synth_msix_table(size: u16) -> MsixTable {
             },
         },
         cap_offset: 0,
+        region: None,
     }
 }
 
