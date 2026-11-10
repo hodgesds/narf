@@ -413,12 +413,14 @@ also consult upstream Linux GPL sources.
   event is latched by the EP0 owner — never the lossy shared queue — and ends
   whichever stage is being awaited as `CmdFailed(code)`; a halting code
   (Babble 3, Transaction Error 4, Stall 6) then runs `Xhci::reset_endpoint`
-  for DCI 1 before the error is returned. Each stage wait is bounded at
-  5000 ms (Linux `USB_CTRL_GET_TIMEOUT` / `USB_CTRL_SET_TIMEOUT`); command
-  waits (Enable/Disable Slot, Address Device, Configure/Evaluate, Stop/Reset
-  Endpoint, Set TR Dequeue) are bounded at 5000 ms (Linux
-  `XHCI_CMD_DEFAULT_TIMEOUT`). The compatibility one-shot bulk/isoch waits
-  keep their 250 ms poll bound.
+  for DCI 1 before the error is returned. Each stage wait, each command
+  wait (Enable/Disable Slot, Address Device, Configure/Evaluate, Stop/Reset
+  Endpoint, Set TR Dequeue) and each compatibility one-shot bulk/isoch wait
+  is bounded at 250 ms. Linux allows commands and control stages 5000 ms
+  (`XHCI_CMD_DEFAULT_TIMEOUT`, `USB_CTRL_GET_TIMEOUT`), but these waits
+  re-poll on every executor round instead of sleeping, and a 5000 ms bound
+  let one silent device stall a physical boot. The longer bounds return
+  once the wait can block.
 - A control stage timeout (`CmdTimeout`) cancels the still-published TD
   before it is reported: under the slot's configuration claim the EP0 owner
   quarantines every DCI 1 Transfer Event for the slot, then Stop Endpoint
@@ -624,8 +626,8 @@ also consult upstream Linux GPL sources.
   the hardware operations' individual deadlines. It does not cancel an
   in-flight owner at a whole-port deadline. A failed attempt during which a
   command or control stage timed out is charged half of the port's 8-attempt
-  retry budget (two such attempts exhaust it); the 5000 ms per-operation
-  deadline is not shortened to bound a dead device's cost. Pending enumeration and hub-status
+  retry budget (two such attempts exhaust it), which bounds how long a dead device
+  keeps the supervisor busy. Pending enumeration and hub-status
   waits service existing nonblocking report pumps, with bound suspended ports
   resumed before the first pump in each supervisor cycle.
 - Terminal enumeration failures and device detach share slot cleanup. They
