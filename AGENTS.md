@@ -331,6 +331,16 @@ implementer points them here.)
 Do not invent interfaces without updating the spec. Do not claim perf
 numbers without the statistical protocol. Do not merge your own PRs.
 
+## Firmware and binary data
+
+Do not commit firmware or other externally published binary data: device
+firmware, microcode, the wireless regulatory database. They are imported
+at build time (`cargo xtask import-firmware`, `pack-firmware`,
+`--initramfs-firmware`) and never live in git.
+
+Trust roots — the public keys and certificates used to verify such data —
+are source. Commit them, with provenance, under normal review.
+
 ## Commit message preference
 
 Do not include the originating user prompt in commit messages.
