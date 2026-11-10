@@ -12,19 +12,20 @@
 //! fill programs is one Linux sets on the same path.
 //!
 //! The fill covers the single-buffer, non-early-mode path of
-//! `rtl92de_tx_fill_desc` for a first+last segment frame. Early-mode
-//! AMPDU headers, multi-segment frames, AMPDU aggregation beyond the
-//! descriptor's own agg flag, RDG + HTC for QoS data, LPS hardware
-//! sequence numbers (beyond the `hwseq_en`/`pkt_id` rule below),
-//! encryption `sectype` selection from key state, TX-report requests
-//! and multi-station rate-id / MAC-id are remainders for the station
-//! owner. Ring-slot allocation, descriptor-ring base programming, the
-//! doorbell and OWN publication stay with the caller: this module
-//! fills a caller-provided [`TxDesc`] (OWN left clear, as Linux's
-//! data path leaves it for the ring owner — only the command path
-//! publishes OWN itself, and this module leaves that to the caller
-//! too) and the future `Prepared::Chip::Rtl8192de` packet path owns
-//! the rings.
+//! `rtl92de_tx_fill_desc` for a first+last segment frame, including
+//! the AMPDU flag + density, RDG + HTC for QoS data (behind
+//! `rdg_en`, which upstream never sets — see [`super::h2c`]),
+//! the LPS hardware-sequence rule, the TX-report request
+//! (`spe_rpt` / `sw_define`), and rate-id / MAC-id. Early-mode
+//! AMPDU headers, multi-segment frames and AMPDU aggregation beyond
+//! the descriptor's own agg flag are remainders for the station
+//! owner. Ring-slot allocation, descriptor-ring base programming,
+//! the doorbell and OWN publication stay with the caller: this
+//! module fills a caller-provided [`TxDesc`] (OWN left clear, as
+//! Linux's data path leaves it for the ring owner — only the
+//! command path publishes OWN itself, and this module leaves that
+//! to the caller too) and the future `Prepared::Chip::Rtl8192de`
+//! packet path owns the rings.
 
 /// `TX_DESC_SIZE`.
 pub const TX_DESC_SIZE: usize = 64;
@@ -148,6 +149,16 @@ pub struct TxParams {
     pub fwctrl_lps: bool,
     /// `mac->rdg_en` (QoS data only).
     pub rdg_en: bool,
+    /// `rtl_is_tx_report_skb` (EAPOL or nullfunc): the firmware
+    /// reports this frame's TX status — `SET_TX_DESC_SPE_RPT`
+    /// (dword 2 bit 19).
+    pub spe_rpt: bool,
+    /// Driver TX-report sequence for `SET_TX_DESC_SW_DEFINE`
+    /// (dword 6 bits 11:0): `(sn & 0x3f) << 2` (bits 7:2 driver
+    /// sequence; bits 11:8 reserved, bits 1:0 firmware). Bit 11 is
+    /// shared with `max_agg_num`, but a report frame is never an
+    /// AMPDU frame, so the two writes never meet.
+    pub sw_define: u16,
 }
 
 impl TxDesc {
@@ -230,6 +241,10 @@ impl TxDesc {
             put(&mut dw[3], u32::from(LPS_PKT_ID), 28, 4);
         }
         put(&mut dw[2], 0, 17, 1);
+        if p.spe_rpt {
+            put(&mut dw[2], 1, 19, 1);
+            put(&mut dw[6], u32::from(p.sw_define), 0, 12);
+        }
         // No `bmc` write: unlike its 92C siblings, the 92D fill path has
         // no `bmc` setter in `trx_common.h` and never programs the bit.
         d

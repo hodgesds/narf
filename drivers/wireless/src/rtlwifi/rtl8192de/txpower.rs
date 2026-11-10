@@ -254,8 +254,8 @@ pub struct Efuse {
 impl Efuse {
     /// `_rtl92d_read_txpower_info(hw, autoload_fail, hwinfo)`.
     /// `d_or_e_cut` is the EFUSE chip-version cut (D/E cuts read
-    /// `internal_pa_5g` from the TSSI 5G bytes' BIT(6)); the cut decode
-    /// itself belongs to the EFUSE lane.
+    /// `internal_pa_5g` from the TSSI 5G bytes' BIT(6)); the cut
+    /// decode is [`super::version::read_cut`].
     pub fn from_hwinfo(hw: &[u8], autoload_fail: bool, d_or_e_cut: bool) -> Result<Self, Error> {
         let pwrinfo = TxPowerInfo::from_prom(hw, autoload_fail)?;
         let mut out = Self {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Exact linked PCI descriptor/FIFO prerequisite for the retained rtlwifi
-//! profiles (RTL8188EE, RTL8821AE, RTL8192CE, RTL8723BE). Linux
-//! rtl8188ee/, rtl8821ae/, rtl8192ce/ and rtl8723be/ hw.c/trx.h.
+//! profiles (RTL8188EE, RTL8821AE, RTL8192CE, RTL8723BE, RTL8192DE). Linux
+//! rtl8188ee/, rtl8821ae/, rtl8192ce/, rtl8723be/ and rtl8192de/ hw.c/trx.h.
 //! Ordinary DMA/MAC remain closed; this is below RF and station admission.
 use super::firmware_transport::{Error as AccessError, Io};
 use alloc::vec::Vec;
@@ -98,6 +98,11 @@ pub enum Chip {
     /// the 88EE IMR map (`REG_HIMR` 0xb0 / `REG_HIMRE` 0xb8) and the
     /// `REG_PCIE_CTRL_REG + 1` (0x301) DMA stop.
     Rtl8723be,
+    /// RTL8192DE linked rings (`rtl8192de/trx.h`): 88EE ring geometry
+    /// with the next link at dword 10 (byte 40),
+    /// `_rtl92de_llt_table_init` (mode-dependent boundary/RQPN) and the
+    /// DE IMR map (`REG_HIMR` 0x120 / `REG_HIMRE` 0x128).
+    Rtl8192de,
 }
 impl Chip {
     pub const fn from_device(did: u16) -> Option<Self> {
@@ -107,6 +112,7 @@ impl Chip {
             super::regs::RTL_DEV_8192EE => Some(Self::Rtl8192ee),
             did if super::rtl8192ce::is_8192ce(did) => Some(Self::Rtl8192ce),
             super::regs::RTL_DEV_8723BE => Some(Self::Rtl8723be),
+            super::regs::RTL_DEV_8192DE => Some(Self::Rtl8192de),
             _ => None,
         }
     }
@@ -120,6 +126,7 @@ impl Chip {
             // TX_DESC_NEXT_DESC_OFFSET.
             Self::Rtl8192ce => Some(super::rtl8192ce::trx::TX_DESC_NEXT_DESC_OFFSET),
             Self::Rtl8723be => Some(super::rtl8723be::trx::NEXT_DESC_BYTE),
+            Self::Rtl8192de => Some(super::rtl8192de::trx::NEXT_DESC_BYTE),
             Self::Rtl8192ee => None,
         }
     }
@@ -185,6 +192,15 @@ pub struct Prepared<I: Io, M: Memory> {
     /// RTL8723BE coexistence owner (`rtl8723be/coex.rs`), bound before
     /// [`Self::prepare`] (`rtl_pci_start` → `btc_init_variables`).
     rtl8723be_coex: Option<alloc::boxed::Box<super::rtl8723be::coex::Owner>>,
+    /// RTL8192DE factory identity, configured radio, factory TX-power
+    /// data and channel bandset (`rtl8192de/radio_owner.rs`).
+    rtl8192de: Option<alloc::boxed::Box<de92_radio::De92Radio>>,
+    /// Admitted `N92D` operating point (`rtl8192de/envelope.rs`).
+    rtl8192de_power: Option<super::rtl8192de::envelope::Permission>,
+    /// RTL8192DE MAC/PHY mode bound before [`Self::prepare`] (the LLT
+    /// is mode-dependent); [`Self::configure_rtl8192de`] re-derives it
+    /// from the PROM and refuses a mismatch.
+    rtl8192de_mode: Option<super::rtl8192de::MacPhyMode>,
     permission: Option<super::channel_power::Permission>,
     packet: packet::State<M>,
     station: station::State,
@@ -295,6 +311,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8192ce_power: None,
             rtl8723be: None,
             rtl8723be_coex: None,
+            rtl8192de: None,
+            rtl8192de_power: None,
+            rtl8192de_mode: None,
             permission: None,
             packet: packet::State::new(),
             station: station::State::new(),
@@ -558,7 +577,12 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         if self.io.read8(0x100)? & 0xcf != 0 {
             return Err(Error::Readback);
         }
-        let imr = if ce {
+        let imr = if self.chip == Chip::Rtl8192de {
+            [
+                super::rtl8192de::mac::REG_HIMR,
+                super::rtl8192de::mac::REG_HIMRE,
+            ]
+        } else if ce {
             [
                 super::rtl8192ce::mac::REG_HIMR,
                 super::rtl8192ce::mac::REG_HIMRE,
@@ -620,6 +644,16 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 e => Error::Access(e),
             });
         }
+        if self.chip == Chip::Rtl8192de {
+            // Exact rtl8192de/hw.c::_rtl92de_llt_table_init, over the
+            // retained Io (the DE LLT needs no register adapter): the
+            // mode was bound before `prepare` and is refused when absent.
+            let mode = self.rtl8192de_mode.ok_or(Error::State)?;
+            return super::rtl8192de::llt::init(&self.io, mode).map_err(|e| match e {
+                AccessError::Deadline => Error::LltTimeout,
+                e => Error::Access(e),
+            });
+        }
         // Exact _rtl88ee_llt_table_init: TX0..170 ends atff; 171..175
         // forms the reserved ring. This is 0xab/0xaf, not 0xe0/0xff.
         self.io.write8(0x214, 1)?;
@@ -676,6 +710,8 @@ impl<I: Io, M: Memory> Drop for Prepared<I, M> {
 mod be8723_radio;
 #[path = "rtl8192ce/radio_owner.rs"]
 mod ce92_radio;
+#[path = "rtl8192de/radio_owner.rs"]
+mod de92_radio;
 #[path = "packet.rs"]
 pub mod packet;
 #[path = "station.rs"]

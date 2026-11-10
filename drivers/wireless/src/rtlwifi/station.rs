@@ -1219,6 +1219,16 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             domain,
         )
     }
+    pub(crate) fn stage_rtl8192de_calibration(
+        &mut self,
+        calibration: super::super::rtl8192de::envelope::Calibration,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        self.stage_station_base(
+            super::super::station_power::Base::Rtl8192de(Arc::new(calibration)),
+            domain,
+        )
+    }
     fn stage_station_base(
         &mut self,
         base: super::super::station_power::Base,
@@ -1249,6 +1259,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::Chip::Rtl8192ce => self
                 .rtl8192ce_power
                 .map(super::super::station_power::Grant::Rtl8192ce),
+            super::Chip::Rtl8192de => self
+                .rtl8192de_power
+                .map(super::super::station_power::Grant::Rtl8192de),
             // Not admitted: no RTL8723BE channel grant exists yet.
             super::Chip::Rtl8723be => None,
         }
