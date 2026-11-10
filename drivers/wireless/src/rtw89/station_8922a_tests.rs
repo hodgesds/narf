@@ -398,7 +398,7 @@ fn smoke_rtw89_8922a_admit_6ghz_tpe_power_program() -> TestResult {
         None => return TestResult::Fail("6GHz station records no power program"),
     };
     if program.power != PowerType6Ghz::Lpi
-        || program.tpe_dbm != None
+        || program.tpe_dbm.is_some()
         || program.tpe_mac != 63
         || program.reg_6ghz_power() != 1
         || st.band != Band::Ghz6
