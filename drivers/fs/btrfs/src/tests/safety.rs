@@ -1293,6 +1293,80 @@ kernel_test_in!(
     smoke_btrfs_root_rw_metadata_enospc_never_aborts
 );
 
+/// Linux's 80% rule, and its use: a `root-rw` filesystem with room on the
+/// device allocates a METADATA chunk when a refused reservation finds the
+/// metadata space past the threshold, instead of running on ever shorter
+/// batches, and no operation sees `ENOSPC` on the way.
+fn smoke_btrfs_root_rw_metadata_grows_ahead_of_need() -> TestResult {
+    use crate::write::reserve::should_alloc_chunk;
+    let gib = 1u64 << 30;
+    // The real root: 6 GiB of metadata, 4.98 used, 512 MiB reserved.
+    if !should_alloc_chunk(5 * gib + gib / 2, 6 * gib)
+        || should_alloc_chunk(4 * gib, 6 * gib)
+        || !should_alloc_chunk(80 * gib - (2 << 20), 100 * gib)
+        || should_alloc_chunk(80 * gib - (2 << 20) - 1, 100 * gib)
+    {
+        return TestResult::Fail("the threshold differs from Linux's should_alloc_chunk");
+    }
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("bgt fixture did not mount writable"),
+    };
+    narf_block::disk_policy::__set_policy_for_test(Some(
+        narf_block::disk_policy::DiskPolicy::RootRw,
+    ));
+    let name = |i: u32| alloc::format!("g{i:06}-{}", "n".repeat(180));
+    let result = (|| {
+        let before = vol.commit_stats().snapshot();
+        let body: Vec<u8> = alloc::vec![0x67; 1500];
+        let mut made = 0u32;
+        while vol
+            .commit_stats()
+            .snapshot()
+            .since(&before)
+            .early_metadata_chunks
+            == 0
+        {
+            let file = match poll_once(vol.root().create(&name(made))) {
+                Some(Ok(file)) => file,
+                _ => return Err("create failed although the device has room"),
+            };
+            if !matches!(poll_once(file.write(0, &body)), Some(Ok(n)) if n == body.len()) {
+                return Err("write failed although the device has room");
+            }
+            made += 1;
+            if made > 400_000 {
+                return Err("metadata was never grown ahead of need");
+            }
+        }
+        if vol.transaction_aborted() || !vol.admits_writes() {
+            return Err("growing metadata aborted the transaction");
+        }
+        if !matches!(poll_once(vol.sync_to_disk_exclusive()), Some(Ok(()))) {
+            return Err("the commit after growing failed");
+        }
+        Ok(())
+    })();
+    narf_block::disk_policy::__set_policy_for_test(None);
+    if let Err(why) = result {
+        return TestResult::Fail(why);
+    }
+    match chunk_accounting(&vol) {
+        Ok((ext, used, _, _)) if ext == used => {}
+        Ok(_) => return TestResult::Fail("chunk accounting inconsistent"),
+        Err(why) => return TestResult::Fail(why),
+    }
+    match super::snapshots::check_ref_counts(&vol) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_root_rw_metadata_grows_ahead_of_need
+);
+
 /// A new chunk copies the profile of its type only when every existing chunk
 /// of that type agrees on SINGLE or DUP, and metadata chunks are 1 GiB above
 /// 50 GiB as on Linux.
