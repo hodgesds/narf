@@ -851,6 +851,48 @@ pub fn dispatch_for(
     arg: usize,
     vm: Option<&crate::amdgpu_vm::VmState>,
 ) -> Result<u64, FsError> {
+    let result = dispatch_query(cmd, arg, vm);
+    if result == Err(FsError::InvalidData) {
+        note_refused_query(arg);
+    }
+    result
+}
+
+/// Bring-up visibility for an `AMDGPU_INFO` query answered EINVAL: the
+/// ioctl trace names only the command (nr 0x45), which every query
+/// shares. Log the query and its first argument word (the firmware type,
+/// IP type or video-caps kind) once per pair. Refusals only.
+fn note_refused_query(arg: usize) {
+    static SEEN: narf_lib::sync::IrqSafeSpinLock<Vec<(u32, u32)>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    // SAFETY: the same guarded copy of the ioctl argument `dispatch_query`
+    // made; `copy_in` bounds-checks the length.
+    let Ok(bytes) = (unsafe {
+        crate::drm_ioctl_bridge::copy_in(arg, core::mem::size_of::<uapi::DrmAmdgpuInfo>())
+    }) else {
+        return;
+    };
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let (size, query, first) = (word(8), word(12), word(16));
+    {
+        let mut seen = SEEN.lock();
+        if seen.len() >= 32 || seen.contains(&(query, first)) {
+            return;
+        }
+        seen.push((query, first));
+    }
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  drm: amdgpu INFO query {query:#x} arg {first:#x} size {size} EINVAL"
+    );
+}
+
+fn dispatch_query(
+    cmd: u32,
+    arg: usize,
+    vm: Option<&crate::amdgpu_vm::VmState>,
+) -> Result<u64, FsError> {
     let nr = drm_uapi::ioc_nr(cmd);
     if nr != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_INFO {
         return Err(FsError::Unsupported);
