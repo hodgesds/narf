@@ -50,15 +50,6 @@ impl NativeIo {
         }
         self.checked(0x1f3fc, 4, |_, _| ())
     }
-    /// RTL8852A: the same AX PHY offset, but `rf_base_addr` is
-    /// {0xc000, 0xd000} (rtw8852a.c `rtw8852a_chip_info`), so path-B's
-    /// last direct RF dword is 0x1d3fc (0x10000 + 0xd000 + 0x3fc).
-    pub(super) fn a_phy_window(&self) -> Result<(), Error> {
-        if self.chip != ChipId::Rtl8852A {
-            return Err(Error::Unsupported);
-        }
-        self.checked(0x1d3fc, 4, |_, _| ())
-    }
     /// RTL8852C: the same AX PHY offset and `rf_base_addr` {0xe000,
     /// 0xf000} as B (rtw8852c.c `rtw8852c_chip_info`), so the same last
     /// direct RF dword bounds the window.
