@@ -14,8 +14,10 @@ mod dev;
 mod enospc;
 mod fixture;
 mod fst;
+mod fsynclog;
 mod host;
 mod linux;
+mod linuxvm;
 mod model;
 mod narf;
 mod scale;
@@ -47,8 +49,16 @@ USAGE: narf-btrfs-host [OPTIONS]
   --exhaustive      crash-test every flush boundary plus two random cuts per
                     flush window (slow)
   --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate,fst,
-                    enospc,scale
+                    enospc,scale,fsync-linux
                     (default all)
+  --fsync-cases N   random scripts in each tree-log scenario besides the fixed
+                    ones (default: four per seed)
+  --case NAME       run only this tree-log case (`new-file`, `random-7`, ...)
+  --require-linux   fail, instead of reporting UNVERIFIED, when no Linux
+                    kernel can be booted for the tree-log scenarios
+  --emit-linux-log-fixture PATH
+                    regenerate drivers/fs/btrfs/testdata/fixture-linuxlog.img.sparse
+                    and print what Linux's replay of it yields
   --jobs N          concurrent `btrfs check` processes in the crash pass
                     (default 3)
   --workdir DIR     scratch directory (default target/btrfs-host)
@@ -57,7 +67,7 @@ USAGE: narf-btrfs-host [OPTIONS]
 ";
 
 /// The default selection (`regress` = every `regress-*` case).
-pub const SCENARIOS: [&str; 8] = [
+pub const SCENARIOS: [&str; 9] = [
     "regress",
     "root",
     "snapshots",
@@ -66,6 +76,7 @@ pub const SCENARIOS: [&str; 8] = [
     "fst",
     "enospc",
     "scale",
+    "fsync-linux",
 ];
 /// Names `--scenario` also accepts.
 const REGRESS: [&str; 3] = [
@@ -86,6 +97,16 @@ struct Args {
     workdir: PathBuf,
     keep: bool,
     verbose: bool,
+    /// Fail, instead of reporting "unverified", when no Linux kernel can be
+    /// booted for the tree-log scenarios.
+    require_linux: bool,
+    /// Random scripts per tree-log scenario (0: four per seed).
+    fsync_cases: u64,
+    /// Run only the tree-log case of this name.
+    only_case: Option<String>,
+    /// Regenerate the kernel tests' Linux-written-log fixture to this path
+    /// instead of running scenarios.
+    emit_fixture: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -100,6 +121,10 @@ fn parse_args() -> Result<Args, String> {
         workdir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/btrfs-host"),
         keep: false,
         verbose: false,
+        require_linux: false,
+        fsync_cases: 0,
+        only_case: None,
+        emit_fixture: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -115,6 +140,12 @@ fn parse_args() -> Result<Args, String> {
             "--jobs" => a.jobs = num(val("--jobs")?)?.max(1) as usize,
             "--workdir" => a.workdir = PathBuf::from(val("--workdir")?),
             "--keep" => a.keep = true,
+            "--require-linux" => a.require_linux = true,
+            "--fsync-cases" => a.fsync_cases = num(val("--fsync-cases")?)?,
+            "--case" => a.only_case = Some(val("--case")?),
+            "--emit-linux-log-fixture" => {
+                a.emit_fixture = Some(PathBuf::from(val("--emit-linux-log-fixture")?))
+            }
             "-v" | "--verbose" => a.verbose = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -632,6 +663,18 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(out) = &args.emit_fixture {
+        match fsynclog::emit_fixture(&args, out) {
+            Ok(report) => {
+                println!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("emit-linux-log-fixture: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     host::init();
     // Every commit re-reads the free-space tree it wrote and compares it
     // with the in-memory view the driver advanced; a difference fails the
@@ -694,6 +737,9 @@ fn main() {
         },
     ];
     let mut failed = 0;
+    // Scenarios that could not check what they exist to check (no Linux
+    // kernel to boot): reported, and never counted as passed.
+    let mut unverified: Vec<String> = Vec::new();
     for name in &args.scenarios {
         if name == "gate" {
             match run_gate(&args) {
@@ -705,14 +751,20 @@ fn main() {
             }
             continue;
         }
-        if name == "fst" || name == "enospc" || name == "scale" {
+        if ["fst", "enospc", "scale", "fsync-linux"].contains(&name.as_str()) {
             let run = match name.as_str() {
                 "fst" => fst::run(&args),
                 "enospc" => enospc::run(&args),
-                _ => scale::run(&args),
+                "scale" => scale::run(&args),
+                _ => fsynclog::run_linux(&args),
             };
             match run {
-                Ok(s) => println!("{s}"),
+                Ok(s) => {
+                    if s.contains("UNVERIFIED") {
+                        unverified.push(name.clone());
+                    }
+                    println!("{s}")
+                }
                 Err(e) => {
                     failed += 1;
                     println!("{name}: FAIL\n{e}\nklog:\n{}", host::klog_take());
@@ -742,9 +794,17 @@ fn main() {
             }
         }
     }
+    let verdict = match (failed, unverified.is_empty()) {
+        (0, true) => "PASS".to_string(),
+        (0, false) => format!(
+            "PASS for what ran; UNVERIFIED (not run, not passed): {}",
+            unverified.join(", ")
+        ),
+        _ => "FAIL".to_string(),
+    };
     println!(
         "btrfs-host-rw: {} in {:.1?} (most any batch commit allocated beyond its reservation: {} blocks)",
-        if failed == 0 { "PASS" } else { "FAIL" },
+        verdict,
         t0.elapsed(),
         narf_drivers_fs_btrfs::stats::max_reserve_overrun()
     );

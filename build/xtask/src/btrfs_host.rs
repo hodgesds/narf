@@ -30,9 +30,16 @@ pub struct Args {
     #[arg(long)]
     pub exhaustive: bool,
     /// Comma-separated scenarios
-    /// (regress,root,snapshots,lba4k,gate,fst,enospc,scale).
+    /// (regress,root,snapshots,lba4k,gate,fst,enospc,scale,fsync-linux).
     #[arg(long)]
     pub scenario: Option<String>,
+    /// Random scripts per tree-log scenario besides the fixed cases.
+    #[arg(long)]
+    pub fsync_cases: Option<u64>,
+    /// Fail when no Linux kernel can be booted for the tree-log scenarios
+    /// (by default they report themselves unverified).
+    #[arg(long)]
+    pub require_linux: bool,
     /// Concurrent `btrfs check` processes in the crash pass.
     #[arg(long)]
     pub jobs: Option<u64>,
@@ -58,12 +65,16 @@ pub fn harness_args(args: &Args) -> Vec<String> {
     num("--ops", args.ops);
     num("--cuts", args.cuts);
     num("--jobs", args.jobs);
+    num("--fsync-cases", args.fsync_cases);
     if let Some(s) = &args.scenario {
         v.push("--scenario".into());
         v.push(s.clone());
     }
     if args.exhaustive {
         v.push("--exhaustive".into());
+    }
+    if args.require_linux {
+        v.push("--require-linux".into());
     }
     if args.keep {
         v.push("--keep".into());
