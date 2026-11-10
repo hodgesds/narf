@@ -70,6 +70,7 @@
 //! `fw_current_inpsmode` starts false, as Linux sets them before
 //! the tail; both live with the station owner, not here.
 
+use super::calib::IqkMatrix;
 use super::channel::{self, Bbrf};
 use super::phy::{self, OriginalValues, PgStore};
 use super::txpower::{self, Efuse, PowerLevels};
@@ -126,6 +127,9 @@ pub struct Radio {
     pub rf_type: RfType,
     /// `rtlphy->rfreg_chnlval` (both paths).
     pub chnlval: [u32; 2],
+    /// `rtlphy->iqk_matrix` (stored IQK calibration, reloaded on
+    /// channel switch; reset by `rtl92de_hw_init` before any switch).
+    pub iqk: IqkMatrix,
     /// Trimmed receive config (`RCR & ~(RCR_ACRC32 | RCR_AICV)`).
     pub receive_config: u32,
     /// Whether the CCK path runs at high power.
@@ -239,6 +243,7 @@ pub async fn configure(io: &impl Io, params: &Params) -> Result<Radio, Error> {
         band: params.band,
         rf_type: params.rf_type,
         chnlval,
+        iqk: IqkMatrix::new(),
         receive_config,
         cck_high_power: bb.cck_high_power,
         initialgain,

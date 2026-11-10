@@ -587,6 +587,34 @@ impl Calibration {
         #[cfg(not(any(test, feature = "kernel-test")))]
         Err(Error::Authority)
     }
+
+    /// Run `operation` inside the signed envelope's current firmware-asset
+    /// authority (the RTL8192DE `N92D` envelope): a revoked or replaced
+    /// calibration never reaches the hardware operation.
+    pub(crate) fn with_current<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, crate::rtlwifi::prepare::Error>,
+    ) -> Result<T, crate::rtlwifi::prepare::Error> {
+        use narf_capabilities::{CapError, CapOp};
+        struct Invoke<F>(F);
+        impl<T, F: FnOnce() -> Result<T, crate::rtlwifi::prepare::Error>> CapOp<FirmwareBlob, Read>
+            for Invoke<F>
+        {
+            type Output = Result<T, crate::rtlwifi::prepare::Error>;
+            fn execute(self, _: &Cap<FirmwareBlob, Read>) -> Result<Self::Output, CapError> {
+                Ok((self.0)())
+            }
+        }
+        if let Some(cap) = &self.authority {
+            return cap
+                .invoke(Invoke(operation))
+                .map_err(|_| crate::rtlwifi::prepare::Error::Power(Error::Authority))?;
+        }
+        #[cfg(any(test, feature = "kernel-test"))]
+        return operation();
+        #[cfg(not(any(test, feature = "kernel-test")))]
+        Err(crate::rtlwifi::prepare::Error::Power(Error::Authority))
+    }
 }
 
 /// `regd.c` EIRP caps (quarter dBm) for a span fully inside one

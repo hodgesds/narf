@@ -60,8 +60,6 @@ pub const H2C_SETPWRMODE: u8 = 1;
 /// `enum rtl_h2c_cmd` (`wifi.h`).
 pub const H2C_JOINBSSRPT: u8 = 2;
 /// `enum rtl_h2c_cmd` (`wifi.h`).
-pub const H2C_RSVDPAGE: u8 = 3;
-/// `enum rtl_h2c_cmd` (`wifi.h`).
 pub const H2C_RSSI_REPORT: u8 = 5;
 /// `enum rtl_h2c_cmd` (`wifi.h`).
 pub const H2C_RA_MASK: u8 = 6;

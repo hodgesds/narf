@@ -766,7 +766,7 @@ pub async fn rf_config(
         table: radioa,
         target: BbTarget::Local,
     }; 2];
-    let mut count = 0usize;
+    let count: usize;
     let mut powerdown: Option<bool> = None;
     if mode == MacPhyMode::DualMacDualPhy && !band_5g && interface_index == 0 {
         if enable_anotherphy(io, true).await? {

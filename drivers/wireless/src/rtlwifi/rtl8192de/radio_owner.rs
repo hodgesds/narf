@@ -167,6 +167,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             single_phy,
             &op,
             &mut state.radio.chnlval,
+            &mut state.radio.iqk,
         )
         .await?;
         state.bandset = outcome.bandset;

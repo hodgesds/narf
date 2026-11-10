@@ -488,6 +488,8 @@ fn smoke_rtl8192de_trx_fill() -> TestResult {
         dual_mac_dual_phy: true,
         fwctrl_lps: false,
         rdg_en: true,
+        spe_rpt: false,
+        sw_define: 0,
     };
     let d = trx::TxDesc::fill(&base);
     if d.own()
@@ -1127,7 +1129,7 @@ fn smoke_rtl8192de_packet_admission_and_fill() -> TestResult {
         short: false,
         rts: None,
         next_desc: 0x4000_0000,
-        mode: WirelessMode::N24g,
+        mode: rate::WirelessMode::N24g,
         cipher: KeyCipher::None,
         ampdu_density: None,
         adaptive: false,
@@ -4135,7 +4137,7 @@ fn smoke_rtl8192de_rate_id_macid() -> TestResult {
             },
         )
         .is_err()
-        || (slot.dw[1] >> 16) & 0xf != RATR_INX_WIRELESS_MC
+        || (slot.dw[1] >> 16) & 0xf != u32::from(RATR_INX_WIRELESS_MC)
         || slot.macid() != 0
         || slot.dw[4] & (1 << 8) == 0
     {
@@ -4171,7 +4173,7 @@ fn smoke_rtl8192de_rate_id_macid() -> TestResult {
         )
         .is_err()
         || slot.dw[4] & (1 << 7) == 0
-        || (slot.dw[3] >> 28) & 0xf != trx::LPS_PKT_ID
+        || (slot.dw[3] >> 28) & 0xf != u32::from(trx::LPS_PKT_ID)
     {
         return TestResult::Fail("8192DE rate-id LPS hwseq");
     }
