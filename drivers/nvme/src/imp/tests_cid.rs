@@ -404,3 +404,154 @@ fn smoke_nvme_peek_cqe_decodes_spec_layout() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_peek_cqe_decodes_spec_layout);
+
+/// Stage one CQE (base spec §4.6 layout, phase tag 1, status 0) into slot
+/// `slot` of a fake CQ page.
+///
+/// # Safety
+/// `cq` is a live 4 KiB coherent page and `slot` is inside it.
+unsafe fn stage_cqe(cq: *const u8, slot: usize, cid: u16, sq_id: u16, cmd_specific: u32) {
+    // SAFETY: per this function's contract.
+    unsafe {
+        core::ptr::write_volatile(
+            cq.add(slot * 16) as *mut Cqe,
+            Cqe {
+                cmd_specific,
+                _resv: 0,
+                sq_head: 0,
+                sq_id,
+                cid,
+                status: 1,
+            },
+        );
+    }
+}
+
+fn smoke_nvme_stray_drop_is_counted() -> TestResult {
+    // A stray completion is never dropped silently: both matchers — the
+    // polled `submit_raw_ms` loop and the IRQ path's `try_take_io_cqe` —
+    // count it (and report the 1st, 10th, 100th ...), while a stray AER on
+    // the admin queue, which is stashed rather than dropped, is not counted.
+    use super::log_due_decade;
+    for (n, due) in [
+        (1u64, true),
+        (2, false),
+        (9, false),
+        (10, true),
+        (11, false),
+        (99, false),
+        (100, true),
+        (101, false),
+        (1000, true),
+        (u64::MAX, false),
+    ] {
+        if log_due_decade(n) != due {
+            return TestResult::Fail("stray log rate limit is not 1st/10th/100th");
+        }
+    }
+    let Some(mut fake) = fake_cid_controller() else {
+        return TestResult::Fail("fake CID controller setup failed");
+    };
+    let ctrl = &mut fake.ctrl;
+
+    // Polled matcher: stray (CID 9) ahead of ours (CID 0).
+    // SAFETY: `cq_io` is a live 4 KiB coherent page; slots 0..1.
+    unsafe {
+        stage_cqe(fake.cq_io, 0, 9, 1, IO_STRAY_SENTINEL);
+        stage_cqe(fake.cq_io, 1, 0, 1, OWN_SENTINEL);
+    }
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = IoOpcode::Read as u32;
+    sqe.nsid = 1;
+    sqe.prp1 = fake.id_dma;
+    let before = super::stray_cqe_drops();
+    {
+        let (Some(io), Some(bar0)) = (ctrl.io_queues.first_mut(), ctrl.bar0_region.as_ref()) else {
+            return TestResult::Fail("fake controller has no I/O queue / BAR0");
+        };
+        // SAFETY: fake I/O queue + RAM-backed BAR; the staged CQEs
+        // complete the wait synchronously.
+        if unsafe { io.submit_raw(bar0, sqe) }.is_err() {
+            return TestResult::Fail("polled submit failed with a stray ahead");
+        }
+    }
+    if super::stray_cqe_drops() != before + 1 {
+        return TestResult::Fail("polled matcher did not count the dropped stray");
+    }
+
+    // IRQ-path matcher: a stray (CID 0x77) at the head while CID 1 is
+    // awaited is consumed, counted, and reported as "not ours".
+    // SAFETY: slot 2 of the same page.
+    unsafe { stage_cqe(fake.cq_io, 2, 0x77, 1, IO_STRAY_SENTINEL) };
+    match ctrl.try_take_io_cqe(0, 1, IoOpcode::Read as u8) {
+        Ok(false) => {}
+        _ => return TestResult::Fail("IRQ-path matcher accepted or failed on a stray"),
+    }
+    if super::stray_cqe_drops() != before + 2 {
+        return TestResult::Fail("IRQ-path matcher did not count the dropped stray");
+    }
+    if ctrl.io_queues.first().map(|q| q.cq_head) != Some(3) {
+        return TestResult::Fail("the stray was not consumed from the CQ");
+    }
+
+    // Admin queue: an outstanding AER's completion ahead of ours is
+    // stashed, not dropped — it must not count as a stray.
+    if ctrl.post_aer_commands(1).is_err() {
+        return TestResult::Fail("post_aer_commands failed");
+    }
+    // SAFETY: `cq_admin` is a live 4 KiB coherent page; slots 0..1.
+    unsafe {
+        stage_cqe(fake.cq_admin, 0, 0, 0, AER_EVENT);
+        stage_cqe(fake.cq_admin, 1, 1, 0, OWN_SENTINEL);
+    }
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = OPC_IDENTIFY as u32;
+    sqe.prp1 = fake.id_dma;
+    sqe.cdw10 = CNS_CONTROLLER as u32;
+    {
+        let (Some(admin), Some(bar0)) = (ctrl.admin.as_mut(), ctrl.bar0_region.as_ref()) else {
+            return TestResult::Fail("fake controller has no admin queue / BAR0");
+        };
+        // SAFETY: fake admin queue + RAM-backed BAR; staged CQEs.
+        if unsafe { admin.submit_raw(bar0, sqe) }.is_err() {
+            return TestResult::Fail("admin submit failed with a stray AER ahead");
+        }
+    }
+    if super::stray_cqe_drops() != before + 2 {
+        return TestResult::Fail("a stashed AER completion was counted as a dropped stray");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_stray_drop_is_counted);
+
+fn smoke_nvme_timeout_is_counted() -> TestResult {
+    // A command whose completion never arrives is reported where the
+    // timeout is declared (opcode, CID, queue, CQ head, CSTS, vector,
+    // interrupt state, elapsed) and counted. Nothing is staged, so the
+    // real wait loop runs out its (short) budget against a silent CQ.
+    let Some(mut fake) = fake_cid_controller() else {
+        return TestResult::Fail("fake CID controller setup failed");
+    };
+    let ctrl = &mut fake.ctrl;
+    let mut sqe = Sqe::zero();
+    sqe.cdw0 = IoOpcode::Read as u32;
+    sqe.nsid = 1;
+    sqe.prp1 = fake.id_dma;
+    let before = super::command_timeouts();
+    let (Some(io), Some(bar0)) = (ctrl.io_queues.first_mut(), ctrl.bar0_region.as_ref()) else {
+        return TestResult::Fail("fake controller has no I/O queue / BAR0");
+    };
+    // SAFETY: fake I/O queue + RAM-backed BAR; no device is involved.
+    let r = unsafe { io.submit_raw_ms(bar0, sqe, 20, None) };
+    if !matches!(r, Err(super::NvmeError::CompletionTimeout)) {
+        return TestResult::Fail("a silent CQ did not time the command out");
+    }
+    if super::command_timeouts() != before + 1 {
+        return TestResult::Fail("the timeout was not counted exactly once");
+    }
+    if io.cq_head != 0 {
+        return TestResult::Fail("a timeout consumed a CQ entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_timeout_is_counted);
