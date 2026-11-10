@@ -273,6 +273,29 @@ pub fn apic_id_at(cpu: usize) -> Option<u32> {
     narf_acpi::apic_id_at(cpu)
 }
 
+/// APIC ID of scheduler CPU `cpu`, for steering an interrupt at the CPU a
+/// task is pinned to.
+///
+/// Scheduler CPU ids are APIC IDs (the AP trampoline derives its id from
+/// CPUID), whereas [`apic_id_at`] indexes the MADT in the order firmware
+/// lists it. Passing a CPU id to `apic_id_at` therefore targets the wrong
+/// CPU on any board whose MADT is not in ascending APIC-ID order. `None`
+/// when firmware does not list an enabled CPU with that APIC ID.
+#[cfg(target_arch = "x86_64")]
+pub fn apic_id_of_cpu(cpu: usize) -> Option<u32> {
+    let wanted = u32::try_from(cpu).ok()?;
+    (0..256)
+        .map_while(narf_acpi::apic_id_at)
+        .find(|apic| *apic == wanted)
+}
+
+/// aarch64 stub: no APIC.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn apic_id_of_cpu(_cpu: usize) -> Option<u32> {
+    None
+}
+
 /// aarch64 stub: GIC affinity routing isn't wired to logical CPU indices
 /// yet, so per-CPU MSI steering is unavailable (callers fall back to a
 /// single target).
