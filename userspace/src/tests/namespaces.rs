@@ -40,6 +40,7 @@ kernel_test_in!(
 );
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // Bootstrap: allocate config page in the caller's AS, write a
     // header into it (magic / version / task_id), return user
@@ -233,7 +234,11 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_userspace_bootstrap_returns_config_page);
+#[cfg(feature = "native-ring")]
+kernel_test_in!(
+    "userspace/authority",
+    smoke_userspace_bootstrap_returns_config_page
+);
 
 fn smoke_userspace_hostname_round_trip() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and

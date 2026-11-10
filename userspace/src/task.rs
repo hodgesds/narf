@@ -47,6 +47,16 @@ pub struct Task {
     /// monotonicity is the ABA-safety anchor for every tid-keyed
     /// table; do not introduce tid recycling.
     pub tid: u64,
+    /// The same task-owned authority installed in its scheduler slot.
+    #[cfg(feature = "native-ring")]
+    pub(crate) authority: Arc<narf_scheduler::CallerAuthority>,
+    #[cfg(feature = "native-ring")]
+    pub(crate) authority_control: narf_scheduler::AuthorityControl,
+    /// Only this task's serialized Bootstrap/exec continuation replaces it.
+    /// Observers/dispatchers retain separate session owners.
+    #[cfg(feature = "native-ring")]
+    pub(crate) native_session: crate::handlers::NativeSessionSlot,
+
     /// POSIX pid (thread-group id). PIDs ARE reused after the cyclic
     /// allocator wraps, so pid-keyed state must be cleaned at reap.
     pub pid: AtomicU64,
@@ -168,6 +178,32 @@ pub struct Task {
         narf_lib::sync::IrqSafeSpinLock<Option<crate::select::SelectParkSnapshot>>,
 }
 
+#[cfg(feature = "native-ring")]
+impl Drop for Task {
+    fn drop(&mut self) {
+        narf_scheduler::release_caller_authority(&self.authority_control);
+    }
+}
+
+/// Roll back registration for a child that never became runnable. Avoid the
+/// reap path's higher-level identity lock: clone preparation may hold it.
+pub(crate) fn abort_prepared_registration(owner: &Arc<Task>) {
+    #[cfg(feature = "native-ring")]
+    narf_scheduler::release_caller_authority(&owner.authority_control);
+    let removed = {
+        let mut tasks = task_registry_shard(owner.tid).tasks.lock();
+        if tasks
+            .get(&owner.tid)
+            .is_some_and(|task| Arc::ptr_eq(task, owner))
+        {
+            tasks.remove(&owner.tid)
+        } else {
+            None
+        }
+    };
+    drop(removed);
+}
+
 /// One entry of [`Task::poll_files`]: the resolved file, the offset it had at
 /// poll entry, and the poll interest (`events`) mask. `None` when the fd named
 /// no open file. The events mask lets the park's authoritative re-check
@@ -182,8 +218,18 @@ impl Task {
     /// itself from its very first syscall.
     pub fn new_registered(tid: u64, pid: u64) -> Arc<Task> {
         let limits = crate::handlers::rlimit_for_new_task(tid, pid);
+        #[cfg(feature = "native-ring")]
+        let (authority, authority_control) =
+            narf_scheduler::create_user_authority(narf_scheduler::TaskId(tid))
+                .expect("new TaskId must have unique authority");
         let t = Arc::new(Task {
             tid,
+            #[cfg(feature = "native-ring")]
+            authority,
+            #[cfg(feature = "native-ring")]
+            authority_control,
+            #[cfg(feature = "native-ring")]
+            native_session: crate::handlers::NativeSessionSlot::new(),
             pid: AtomicU64::new(pid),
             effective_ids: AtomicU64::new(0),
             process_group_id: AtomicU64::new(tid),
@@ -1368,6 +1414,8 @@ pub(crate) fn current_next_fork_sequence(current_cpu: u32) -> Option<(u32, u64)>
 pub fn mark_zombie(tid: u64) -> bool {
     match task_get_local(tid) {
         Some(t) => {
+            #[cfg(feature = "native-ring")]
+            t.authority_control.retire();
             t.state.store(TASK_ZOMBIE, Ordering::Release);
             true
         }

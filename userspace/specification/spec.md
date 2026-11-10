@@ -25,6 +25,33 @@ applications above NARF.
 
 ## 3. Public interface
 
+The `native-ring` Cargo feature is off by default. Enabling it registers
+`Bootstrap` (0x4001) and `RingKick` (0x4003), compiles native session/dispatcher
+support, and forwards the feature to `narf-abi` and `narf-scheduler`.
+Without it these syscall numbers remain reserved and return `InvalidOp`
+through the existing native syscall return convention; Tasks contain no
+native session or caller-authority fields.
+The Linux-compatible syscall surface and kernel IPC rings are independent.
+
+Native Bootstrap installs a kernel-owned session in the executing Task. It
+retains the submitting task's scheduler authority, execution generation,
+explicit SQ/CQ page pins, address-space ownership and a terminal close flag.
+Pins outlive munmap and keep kernel ring aliases valid until session release. The
+wire header cannot choose its owner. RingKick borrows this session and owner
+for its synchronous stack lifetime, without global bootstrap/task lookup or
+per-operation Arc traffic. Bootstrap replacement closes the previous session;
+successful exec replaces the authority image and closes old sessions before
+entering the new image. Exit revokes admission before zombie publication.
+Unspawned `PendingUserProcess` destruction retires and unregisters preparation.
+Kernel ring endpoints are taken exactly once.
+
+Async dispatch binds its originating session once and keeps that context
+through admission to the backend. The native FD/MM bridge verifies that the
+executing task owns the supplied authority; foreign-worker operations return
+`Unsupported` until an explicit owner-aware backend exists. It never resolves
+FDs or user addresses using a worker's ambient context. This kernel-only
+context is not part of the frozen user ABI.
+
 Sync-file FILE_INFO preserves native `DrmFence::status` errors for each leaf.
 Poll and count-only FILE_INFO remain pending until all leaves terminate;
 terminal errors then make the aggregate readable. Detailed FILE_INFO follows
@@ -1426,12 +1453,9 @@ architectural slots remain advertised through `possible` without appearing as
 phantom nodes to Linux perf's directory-based topology reader. Membership is a
 Linux-compatible `nodeN/memoryM -> ../../memory/memoryM` symlink.
 
-Bootstrap: every new process receives two ring pairs (submit + complete)
-for the kernel ABI plus a read-only config page with capability
-handles to its parent-granted services. Additional ring pairs for
-inter-service communication are obtained by presenting `Cap<RingPair,
-Alloc>` to the kernel's ring-pair allocator. The bootstrap config page
-includes one `Cap<RingPair, Alloc>` as a pre-granted capability.
+With `native-ring`, an explicit Bootstrap call allocates the calling task's
+submit/completion ring pairs and read-only config page. Fork/clone do not
+implicitly establish a native session or grant native capabilities.
 
 **Maximum ring pairs per process: 64 (default; system-wide tunable).**
 Exhaustion fails subsequent allocations with `Err(RingPairBudget)`.

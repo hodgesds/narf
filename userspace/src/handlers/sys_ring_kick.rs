@@ -2,52 +2,68 @@
 use super::*;
 
 pub(crate) fn sys_ring_kick(ctx: &mut dyn TrapContext) {
-    use narf_abi::{FileOpArgs, FileOpKind, NarfStatus, OpCode, SharedConsumer, SharedProducer};
-
-    type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
-    type CqRing = SharedRing<Completion, BOOTSTRAP_SHARED_RING_DEPTH>;
-
-    let task = current_task_id();
-    let pair = match shared_rings_for(task) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+    if crate::user_task::with_current_task_owner(|owner| {
+        // SAFETY: only the current owner can replace its session, and no
+        // Bootstrap/exec operation is supported recursively within RingKick.
+        match unsafe { owner.native_session.get() } {
+            Some(session) => ring_kick_session(ctx, session),
+            None => ctx.set_return(SyscallReturn::invalid_op()),
+        }
+    })
+    .is_some()
+    {
+        return;
+    }
+    #[cfg(feature = "kernel-test")]
+    {
+        // Explicit synthetic fixture fallback; never compiled into user boots.
+        let session = BOOTSTRAP_TABLE
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&current_task_id()))
+            .map(|e| e.session.clone());
+        if let Some(session) = session {
+            ring_kick_session(ctx, &session);
             return;
         }
-    };
+    }
+    ctx.set_return(SyscallReturn::invalid_op());
+}
 
-    // SAFETY: per-task BOOTSTRAP_TABLE owns the phys backings; only
+fn ring_kick_session(ctx: &mut dyn TrapContext, session: &NativeSession) {
+    use narf_abi::{FileOpArgs, FileOpKind, NarfStatus, OpCode, SharedConsumer, SharedProducer};
+    type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
+    type CqRing = SharedRing<Completion, BOOTSTRAP_SHARED_RING_DEPTH>;
+    let pair = session.shared;
+    let subject = session.context();
+    // SAFETY: the retained session owns the phys backings; only
     // one ring-kick can run at a time per task because it executes
     // synchronously inside this task's syscall trap.
     // SAFETY: Valid memory or trusted environment
     let mut sq = unsafe {
         SharedConsumer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.sq_phys.kernel_mut_ptr::<SqRing>()
+            pair.sq_phys.kernel_mut_ptr::<SqRing>(),
         )
     };
-    // SAFETY: `pair.cq_phys` is the CQ frame this task owns in BOOTSTRAP_TABLE,
+    // SAFETY: `pair.cq_phys` is the CQ frame this session owns,
     // initialized as a CqRing by `mint_shared_ring_pair`; identity-mapped and
     // accessed only from this synchronous trap, so the producer has exclusive use.
     // SAFETY: Valid memory or trusted environment
     let mut cq = unsafe {
         SharedProducer::<Completion, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.cq_phys.kernel_mut_ptr::<CqRing>()
+            pair.cq_phys.kernel_mut_ptr::<CqRing>(),
         )
     };
 
     let mut processed: u64 = 0;
     while let Ok(sub) = sq.try_recv() {
         let tag = sub.tag();
-        // Cap gate (#1363 wiring): the same check
-        // `Dispatcher::dispatch_one` runs — every presented cap
-        // resolves against the submitting task's own table
-        // (capabilities/ §8 steps 1–4). A failure completes with
-        // the cap status and the op never runs. This trap runs in
-        // the submitter's own context, so the owner is the current
-        // task id.
-        if let Err(status) =
-            narf_abi::validate_submission_caps(Some(narf_scheduler::TaskId(task)), &sub.caps)
-        {
+        let admission = if session.closed.load(Ordering::Acquire) {
+            Err(NarfStatus::CapRevoked)
+        } else {
+            subject.validate(&sub)
+        };
+        if let Err(status) = admission {
             let _ = cq.try_send(Completion::with(tag, status, [0; 6]));
             processed = processed.saturating_add(1);
             continue;
@@ -77,7 +93,12 @@ pub(crate) fn sys_ring_kick(ctx: &mut dyn TrapContext) {
                     a4: sub.inline[4],
                     a5: sub.inline[5],
                 };
-                let r = abi_file_op_bridge(kind, &args, &narf_abi::CancelCtx::detached());
+                let r = abi_file_op_bridge(
+                    Some(subject),
+                    kind,
+                    &args,
+                    &narf_abi::CancelCtx::detached(),
+                );
                 let status = if r.status == 0 {
                     NarfStatus::Ok
                 } else {
@@ -94,12 +115,14 @@ pub(crate) fn sys_ring_kick(ctx: &mut dyn TrapContext) {
                 // transfer, `inline[0]` the target task id;
                 // `result[0]` is the receiver's fresh slot number.
                 let target = narf_scheduler::TaskId(sub.inline[0]);
-                match narf_scheduler::transfer_task_cap(
-                    narf_scheduler::TaskId(task),
-                    target,
-                    sub.caps[0],
-                    sub.caps[1],
-                ) {
+                let result = narf_scheduler::task_authority(target)
+                    .ok_or(narf_capabilities::CapError::Revoked)
+                    .and_then(|target| {
+                        session
+                            .authority
+                            .transfer_to(&target, sub.caps[0], sub.caps[1])
+                    });
+                match result {
                     Ok(slot) => {
                         let mut result = [0u64; 6];
                         result[0] = u64::from(slot);

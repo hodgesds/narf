@@ -22,6 +22,12 @@ and CI compiler-cache integration.
 
 ## 3. Public interface
 
+`cargo xtask build --features native-ring` opts into the native userspace ring
+ABI. The feature is forwarded from `narf-frame` to userspace, ABI, and scheduler;
+it is absent from defaults and is not enabled implicitly by `kernel-test`.
+The default kernel retains the Linux-compatible syscall surface and generic
+kernel IPC. CI checks both native-ring feature configurations.
+
 - `cargo xtask efi-image [--arch=x86_64] [--run | --smoke]` builds a
   self-contained PE/COFF application embedding the kernel, CPIO initramfs, and
   command line. Defaults to `boot-init` and `narf.disks=boot-only`; smoke mode

@@ -5862,6 +5862,50 @@ kernel_test_in!(
 
 // ── per-task capability tables (#1363 wiring) ───────────────────────
 
+fn smoke_scheduler_logical_domain_survives_suspension() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use narf_lib::id::DomainId;
+    static OK: AtomicBool = AtomicBool::new(false);
+    for own_stack in [false, true] {
+        crate::__reset_queues_for_test();
+        OK.store(false, Ordering::Relaxed);
+        let future = async {
+            let initial = narf_arch::current_domain_byte() == DomainId::USERSPACE_K.raw();
+            let previous = crate::enter_domain_scope(DomainId::BPF.raw());
+            crate::yield_now().await;
+            let resumed = narf_arch::current_domain_byte() == DomainId::BPF.raw();
+            crate::exit_domain_scope(previous);
+            let exited = narf_arch::current_domain_byte() == DomainId::USERSPACE_K.raw();
+            OK.store(initial && resumed && exited, Ordering::Relaxed);
+        };
+        if own_stack {
+            crate::spawn_stackful_with_options(
+                future,
+                crate::StackfulOptions {
+                    domain: DomainId::USERSPACE_K,
+                    ..Default::default()
+                },
+            );
+        } else {
+            crate::spawn_with_spec_in_domain(
+                future,
+                crate::TaskSpec::default(),
+                DomainId::USERSPACE_K,
+            );
+        }
+        crate::run_until_empty();
+        if !OK.load(Ordering::Relaxed) {
+            return TestResult::Fail("logical domain lost across suspension");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_logical_domain_survives_suspension
+);
+
+#[cfg(feature = "native-ring")]
 fn smoke_scheduler_task_cap_table_bootstrap_and_lookup() -> TestResult {
     // Spawn installs an empty table; the creator installs bootstrap
     // caps (slots 0..16); dispatch-side lookup resolves against the
@@ -5937,11 +5981,13 @@ fn smoke_scheduler_task_cap_table_bootstrap_and_lookup() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!(
     "scheduler",
     smoke_scheduler_task_cap_table_bootstrap_and_lookup
 );
 
+#[cfg(feature = "native-ring")]
 fn smoke_scheduler_task_cap_transfer_between_tasks() -> TestResult {
     // `transfer_task_cap` moves a resolved entry from the sender's
     // table to the receiver's fresh general-region slot (>= 16);
@@ -6021,4 +6067,5 @@ fn smoke_scheduler_task_cap_transfer_between_tasks() -> TestResult {
     crate::run_until_empty();
     TestResult::Pass
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("scheduler", smoke_scheduler_task_cap_transfer_between_tasks);

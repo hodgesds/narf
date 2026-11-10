@@ -59,7 +59,61 @@ fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_syscall_table_roundtrip);
 
+fn smoke_userspace_native_ring_feature_registration() -> TestResult {
+    let mut table = crate::SyscallTable::new();
+    crate::install_core_syscalls(&mut table);
+    for call in [crate::Syscall::Bootstrap, crate::Syscall::RingKick] {
+        if table.name_of(call).is_some() != cfg!(feature = "native-ring") {
+            return TestResult::Fail("native ring registration disagrees with feature");
+        }
+        #[cfg(not(feature = "native-ring"))]
+        {
+            struct Probe(crate::SyscallArgs, crate::SyscallReturn);
+            impl crate::TrapContext for Probe {
+                fn args(&self) -> &crate::SyscallArgs {
+                    &self.0
+                }
+                fn set_return(&mut self, ret: crate::SyscallReturn) {
+                    self.1 = ret;
+                }
+                fn user_rsp(&self) -> u64 {
+                    0
+                }
+                fn rip(&self) -> u64 {
+                    0
+                }
+                fn set_rip(&mut self, _: u64) {}
+                fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+                    false
+                }
+            }
+            let mut probe = Probe(crate::SyscallArgs::default(), crate::SyscallReturn::ok(0));
+            table.dispatch(call, &mut probe);
+            if probe.1.status != narf_abi::NarfStatus::InvalidOp || probe.1.value != (-38i64) as u64
+            {
+                return TestResult::Fail("disabled native ring call did not return ENOSYS");
+            }
+        }
+    }
+    for call in [
+        crate::Syscall::Read,
+        crate::Syscall::Write,
+        crate::Syscall::Mmap,
+        crate::Syscall::GetPid,
+    ] {
+        if table.name_of(call).is_none() {
+            return TestResult::Fail("Linux-compatible syscall missing");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/authority",
+    smoke_userspace_native_ring_feature_registration
+);
+
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     // Bootstrap mints a SharedRing pair + maps it into the user
     // AS. Drive it via the kernel-identity-mapped phys (which
@@ -155,6 +209,16 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     type CqRing = narf_abi::Completion;
     type CqRingT = SharedRing<CqRing, BOOTSTRAP_SHARED_RING_DEPTH>;
 
+    // §8 step 5 (#1547): FAKE_TASK never goes through a spawn path,
+    // so the scheduler has no domain tag for it — label it a user
+    // task (USERSPACE_K) so the Noop passes the domain leg, exactly
+    // as a real user task's submission would.
+    #[cfg(feature = "kernel-test")]
+    narf_scheduler::__set_task_active_domain_for_test(
+        narf_scheduler::TaskId(FAKE_TASK),
+        narf_lib::id::DomainId::USERSPACE_K,
+    );
+
     // SAFETY: `pair.sq_phys` is the identity-mapped phys base of the SQ ring the
     // Bootstrap syscall just allocated with `BOOTSTRAP_SHARED_RING_DEPTH`, so it is
     // a valid, uniquely-owned `SqRing` for this producer to wrap.
@@ -210,6 +274,38 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
         return TestResult::Fail("comp status not Ok");
     }
 
+    // §8 step 5, negative leg (#1547): re-label the task into a
+    // driver domain and kick a second Noop — the op must not run
+    // and the completion must be Forbidden (DomainMismatch).
+    #[cfg(feature = "kernel-test")]
+    narf_scheduler::__set_task_active_domain_for_test(
+        narf_scheduler::TaskId(FAKE_TASK),
+        narf_lib::id::DomainId::DRIVER_0,
+    );
+    let sub2 = Submission::noop(Tag::new(0xFEED2));
+    if sq_prod.try_send(sub2).is_err() {
+        return TestResult::Fail("shared SQ try_send (wrong-domain)");
+    }
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::RingKick.raw(), &mut ctx2);
+    let processed2 = match ctx2.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => return TestResult::Fail("RingKick (wrong-domain) non-Ok"),
+    };
+    if processed2 != 1 {
+        return TestResult::Fail("RingKick (wrong-domain) processed != 1");
+    }
+    let comp2 = match cq_cons.try_recv() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("shared CQ try_recv (wrong-domain)"),
+    };
+    if comp2.tag != 0xFEED2 || comp2.status != NarfStatus::Forbidden {
+        return TestResult::Fail("wrong-domain completion was not Forbidden");
+    }
+
     *USER_AS_SR.lock() = None;
     crate::fd::__test_reset();
     crate::handlers::__test_bootstrap_reset();
@@ -217,9 +313,14 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     TestResult::Pass
 }
 #[cfg(all(target_arch = "x86_64", not(feature = "user-mode-e2e")))]
-kernel_test_in!("userspace", smoke_userspace_shared_ring_kick_round_trip);
+#[cfg(feature = "native-ring")]
+kernel_test_in!(
+    "userspace/authority",
+    smoke_userspace_shared_ring_kick_round_trip
+);
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     // Full Bootstrap path: mint config page + ring pair, spawn
     // an `abi::Dispatcher` task on the kernel-side ends, and
@@ -359,7 +460,11 @@ fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_userspace_bootstrap_rings_round_trip);
+#[cfg(feature = "native-ring")]
+kernel_test_in!(
+    "userspace/authority",
+    smoke_userspace_bootstrap_rings_round_trip
+);
 
 fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
@@ -3382,6 +3487,7 @@ kernel_test_in!("userspace", smoke_userspace_setsid_makes_session_leader);
 // ── relocated from verification ──
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -3619,9 +3725,11 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_abi_dispatcher_serves_file_ops);
+#[cfg(feature = "native-ring")]
+kernel_test_in!("userspace/authority", smoke_abi_dispatcher_serves_file_ops);
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     // Same shape as smoke_abi_dispatcher_serves_file_ops, but
     // exercises the Mmap/Munmap ring path. Submit `OpCode::Mmap`
@@ -3778,7 +3886,8 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_abi_dispatcher_serves_mmap);
+#[cfg(feature = "native-ring")]
+kernel_test_in!("userspace/authority", smoke_abi_dispatcher_serves_mmap);
 
 fn smoke_syscall_versioning_dispatch() -> TestResult {
     // Build a private SyscallTable with a v0 + v1 handler for the

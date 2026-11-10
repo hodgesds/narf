@@ -7,7 +7,108 @@
 
 extern crate alloc;
 
+#[cfg(feature = "kernel-test")]
+#[cfg(feature = "native-ring")]
+mod authority_lifecycle {
+    use super::*;
+    use crate::{completion_channel, submission_channel, Completion, Dispatcher, Submission, Tag};
+    use alloc::{sync::Arc, task::Wake};
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Waker},
+    };
+
+    struct CountWake(AtomicUsize);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn owner(id: u64) -> Arc<narf_scheduler::CallerAuthority> {
+        let id = narf_scheduler::TaskId(id);
+        let owner = narf_scheduler::prepare_user_authority(id);
+        narf_scheduler::__set_task_active_domain_for_test(id, narf_lib::id::DomainId::USERSPACE_K);
+        owner
+    }
+
+    fn smoke_abi_retirement_wakes_empty_submission_queue() -> TestResult {
+        let owner = owner(0xfa02_0001);
+        let (_producer, receiver) = submission_channel::<2>();
+        let (completions, _consumer) = completion_channel::<2>();
+        let mut dispatcher = Dispatcher::for_authority(receiver, completions, owner.clone(), None);
+        let count = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut running = core::pin::pin!(dispatcher.run());
+        if running.as_mut().poll(&mut cx) != Poll::Pending {
+            return TestResult::Fail("empty SQ did not wait");
+        }
+        owner.__retire_for_test();
+        if count.0.load(Ordering::Relaxed) == 0 {
+            return TestResult::Fail("retirement did not wake SQ waiter");
+        }
+        if running.as_mut().poll(&mut cx) != Poll::Ready(()) {
+            return TestResult::Fail("retired dispatcher remained blocked");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "abi/authority",
+        smoke_abi_retirement_wakes_empty_submission_queue
+    );
+
+    fn smoke_abi_exec_wakes_full_completion_queue() -> TestResult {
+        let owner = owner(0xfa02_0002);
+        let (mut producer, receiver) = submission_channel::<2>();
+        let (mut completions, _consumer) = completion_channel::<2>();
+        completions.try_send(Completion::ok(Tag::new(1))).unwrap();
+        completions.try_send(Completion::ok(Tag::new(2))).unwrap();
+        producer.try_send(Submission::noop(Tag::new(3))).unwrap();
+        let mut dispatcher = Dispatcher::for_authority(receiver, completions, owner.clone(), None);
+        let count = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut running = core::pin::pin!(dispatcher.run());
+        if running.as_mut().poll(&mut cx) != Poll::Pending {
+            return TestResult::Fail("full CQ did not wait");
+        }
+        owner.__replace_image_for_test();
+        if count.0.load(Ordering::Relaxed) == 0 {
+            return TestResult::Fail("exec did not wake CQ waiter");
+        }
+        if running.as_mut().poll(&mut cx) != Poll::Ready(()) {
+            return TestResult::Fail("old image dispatcher remained blocked");
+        }
+        owner.__retire_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("abi/authority", smoke_abi_exec_wakes_full_completion_queue);
+}
+
+#[cfg(feature = "native-ring")]
+use core::future::Future;
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// Spawn a fixture owner task in the user domain (`USERSPACE_K`).
+/// Fixture owners play the role of a submitting user task, so they
+/// run on their own stack with `StackfulOptions::domain` stamped —
+/// task-owned caller authority starts in `USERSPACE_K` for
+/// them at spawn and the §8 step-5 leg passes. A plain `spawn`ed
+/// owner would be recorded as `FRAME` and every submission would
+/// complete `Forbidden`.
+#[cfg(feature = "native-ring")]
+fn spawn_owner<F>(f: F) -> narf_scheduler::TaskId
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    narf_scheduler::spawn_stackful_with_options(
+        f,
+        narf_scheduler::StackfulOptions {
+            domain: narf_lib::id::DomainId::USERSPACE_K,
+            ..Default::default()
+        },
+    )
+}
 
 // ── layout / wire-format pins ──────────────────────────────────────
 
@@ -119,6 +220,7 @@ fn smoke_abi_ring_roundtrip() -> TestResult {
 }
 kernel_test_in!("abi", smoke_abi_ring_roundtrip);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_roundtrip() -> TestResult {
     use crate::{
         completion_channel, submission_channel, Dispatcher, NarfStatus, OpCode, Submission, Tag,
@@ -178,10 +280,12 @@ fn smoke_abi_dispatcher_roundtrip() -> TestResult {
         _ => TestResult::Fail("Dispatcher never completed roundtrip"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatcher_roundtrip);
 
 // ── cancel protocol ────────────────────────────────────────────────
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cancel_before_target_marks_cancelled() -> TestResult {
     // §3.1 protocol: a Cancel submitted *before* its target is drained
     // must complete the target with `Cancelled` (when CANCELLABLE is
@@ -241,8 +345,10 @@ fn smoke_abi_cancel_before_target_marks_cancelled() -> TestResult {
         _ => TestResult::Fail("cancel protocol round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cancel_before_target_marks_cancelled);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
     // §3.1: a target without CANCELLABLE completes with
     // `CancelRequested` so the caller knows the op ran to completion.
@@ -290,8 +396,10 @@ fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
         _ => TestResult::Fail("dispatcher did not run the protocol"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cancel_non_cancellable_marks_request);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_latency_accumulates() -> TestResult {
     // The Dispatcher wraps each dispatch_one in a FnTime::scope guard,
     // so after N successful submissions the public ABI_DISPATCH_LATENCY
@@ -348,8 +456,10 @@ fn smoke_abi_dispatch_latency_accumulates() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_latency_accumulates);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
     // §3.1 "Linked submissions": cancelling any member of a LINKED
     // chain auto-cancels the rest of the chain. Here the producer
@@ -437,8 +547,10 @@ fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
         _ => TestResult::Fail("linked chain roundtrip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_linked_chain_cancels_forward);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
     // §3.1: the cancel op is non-blocking and always succeeds even
     // when the target tag never shows up. A subsequent unrelated
@@ -494,6 +606,7 @@ fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
         _ => TestResult::Fail("dispatcher never drained"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cancel_stale_tag_is_noop);
 
 // ── extended abi coverage ──────────────────────────────────────────
@@ -760,6 +873,7 @@ fn smoke_abi_tag_round_trip_and_default() -> TestResult {
 }
 kernel_test_in!("abi", smoke_abi_tag_round_trip_and_default);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_handles_multiple_back_to_back() -> TestResult {
     // The existing dispatcher smoke runs two submissions. This one
     // runs eight in a row and asserts strict in-order completion.
@@ -810,8 +924,10 @@ fn smoke_abi_dispatcher_handles_multiple_back_to_back() -> TestResult {
         _ => TestResult::Fail("dispatcher never finished 8 ops"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatcher_handles_multiple_back_to_back);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op() -> TestResult {
     // A submission with an OpCode the dispatcher doesn't recognise
     // (e.g. RingSend without a wired ring) must complete with
@@ -863,6 +979,7 @@ fn smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op() -> TestResult {
         _ => TestResult::Fail("dispatcher never drained"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!(
     "abi",
     smoke_abi_dispatcher_invalid_opcode_surfaces_invalid_op
@@ -1050,6 +1167,7 @@ fn smoke_abi_cancel_ctx_from_token_observes_flag() -> TestResult {
 }
 kernel_test_in!("abi", smoke_abi_cancel_ctx_from_token_observes_flag);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
     // Install a file-op bridge that flips a parallel cancel via the
     // dispatcher's `request_inflight_cancel` hook from inside itself
@@ -1070,7 +1188,12 @@ fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
     static CALLED: AtomicU8 = AtomicU8::new(0);
 
-    fn bridge(_k: FileOpKind, args: &FileOpArgs, cx: &CancelCtx<'_>) -> FileOpReturn {
+    fn bridge(
+        _subject: Option<crate::DispatchContext<'_>>,
+        _k: FileOpKind,
+        args: &FileOpArgs,
+        cx: &CancelCtx<'_>,
+    ) -> FileOpReturn {
         CALLED.fetch_add(1, Ordering::Relaxed);
         // Simulate "midway through a multi-step op": flip the cancel
         // via the dispatcher hook, then poll between meaningful steps.
@@ -1158,8 +1281,10 @@ fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
         _ => TestResult::Fail("producer did not drain a completion"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatcher_inflight_cancel_during_bridge);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestResult {
     // Mid-op cancel against a non-CANCELLABLE submission must surface
     // `CancelRequested` per spec §3.1.
@@ -1172,7 +1297,12 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
     static DISPATCHER_PTR: AtomicU64 = AtomicU64::new(0);
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
-    fn bridge(_k: FileOpKind, args: &FileOpArgs, cx: &CancelCtx<'_>) -> FileOpReturn {
+    fn bridge(
+        _subject: Option<crate::DispatchContext<'_>>,
+        _k: FileOpKind,
+        args: &FileOpArgs,
+        cx: &CancelCtx<'_>,
+    ) -> FileOpReturn {
         let raw = DISPATCHER_PTR.load(Ordering::Relaxed);
         if raw != 0 {
             // SAFETY: `raw` is the address of the leaked `Box<Dispatcher<4>>`
@@ -1253,11 +1383,13 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
         _ => TestResult::Fail("producer never saw a completion"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!(
     "abi",
     smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request
 );
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cancel_after_target_completes_is_noop() -> TestResult {
     // Cancel arriving *after* its target already completed must be a
     // benign no-op: the cancel op completes Ok; no later submission
@@ -1318,8 +1450,10 @@ fn smoke_abi_cancel_after_target_completes_is_noop() -> TestResult {
         _ => TestResult::Fail("dispatcher round-trip aborted"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cancel_after_target_completes_is_noop);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_request_inflight_cancel_miss_returns_false() -> TestResult {
     // The diagnostic hook returns false when no inflight token
     // matches — i.e. a cancel for a never-submitted tag against a
@@ -1333,6 +1467,7 @@ fn smoke_abi_request_inflight_cancel_miss_returns_false() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_request_inflight_cancel_miss_returns_false);
 
 // ── per-task cap-table dispatch (#1363 wiring) ──────────────────────
@@ -1345,6 +1480,7 @@ kernel_test_in!("abi", smoke_abi_request_inflight_cancel_miss_returns_false);
 // task runs. No fixture reads a value back out of the table it is
 // testing and feeds it in as the expectation.
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_validates_caps_against_owner_table() -> TestResult {
     // The §8 gate: a bound dispatcher resolves every presented cap
     // against the submitting task's OWN table before the op runs.
@@ -1377,7 +1513,7 @@ fn smoke_abi_dispatch_validates_caps_against_owner_table() -> TestResult {
     let forged = CapSlot::new(g.generation, 0, g.rights, CapKind::Domain as u32);
     let empty_pos = CapSlot::new(g.generation, 5, g.rights, g.type_tag);
 
-    let owner = narf_scheduler::spawn(async move {
+    let owner = spawn_owner(async move {
         // 1. Own valid cap.
         let mut s1 = Submission::noop(Tag::new(0xC001));
         s1.caps[0] = grant_presented;
@@ -1446,8 +1582,10 @@ fn smoke_abi_dispatch_validates_caps_against_owner_table() -> TestResult {
         _ => TestResult::Fail("cap-gate round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_validates_caps_against_owner_table);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_cross_task_caps_fail() -> TestResult {
     // A wire slot copied across tasks resolves only against the
     // submitter's own table: B presenting A's bytes hits B's OWN
@@ -1483,7 +1621,7 @@ fn smoke_abi_dispatch_cross_task_caps_fail() -> TestResult {
     // A's ring: control — A presents its own cap, expects Ok.
     let (mut sq_a, sq_rx_a) = submission_channel::<4>();
     let (cq_a, mut cq_rx_a) = completion_channel::<4>();
-    let id_a = narf_scheduler::spawn(async move {
+    let id_a = spawn_owner(async move {
         let mut s = Submission::noop(Tag::new(0xA001));
         s.caps[0] = a_presented;
         sq_a.send(s).await.unwrap();
@@ -1507,7 +1645,7 @@ fn smoke_abi_dispatch_cross_task_caps_fail() -> TestResult {
     // B's Domain cap) -> Forbidden; then an empty position -> Revoked.
     let (mut sq_b, sq_rx_b) = submission_channel::<4>();
     let (cq_b, mut cq_rx_b) = completion_channel::<4>();
-    let id_b = narf_scheduler::spawn(async move {
+    let id_b = spawn_owner(async move {
         let mut s1 = Submission::noop(Tag::new(0xB001));
         s1.caps[0] = a_presented;
         sq_b.send(s1).await.unwrap();
@@ -1545,8 +1683,10 @@ fn smoke_abi_dispatch_cross_task_caps_fail() -> TestResult {
         _ => TestResult::Fail("cross-task round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_cross_task_caps_fail);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_dispatch_unbound_rejects_presented_caps() -> TestResult {
     // The un-wired fallback fails closed: a legacy unbound
     // dispatcher has no table, so any presented cap is Forbidden,
@@ -1595,8 +1735,10 @@ fn smoke_abi_dispatch_unbound_rejects_presented_caps() -> TestResult {
         _ => TestResult::Fail("unbound round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_dispatch_unbound_rejects_presented_caps);
 
+#[cfg(feature = "native-ring")]
 fn smoke_abi_cap_transfer_end_to_end() -> TestResult {
     // §9.1 through the ABI: A transfers a Read cap to B with
     // `OpCode::CapTransfer`; B then spends the received slot through
@@ -1629,7 +1771,7 @@ fn smoke_abi_cap_transfer_end_to_end() -> TestResult {
     let (mut sq_b, sq_rx_b) = submission_channel::<4>();
     let (cq_b, mut cq_rx_b) = completion_channel::<4>();
     let read_slot = r;
-    let id_b = narf_scheduler::spawn(async move {
+    let id_b = spawn_owner(async move {
         // Bounded wait: if A never lands the transfer (e.g. its
         // negative case failed first), give up instead of spinning
         // `run_until_empty` forever — a spinning task never parks,
@@ -1677,7 +1819,7 @@ fn smoke_abi_cap_transfer_end_to_end() -> TestResult {
     let (mut sq_a, sq_rx_a) = submission_channel::<4>();
     let (cq_a, mut cq_rx_a) = completion_channel::<4>();
     let target_b = id_b.0;
-    let id_a = narf_scheduler::spawn(async move {
+    let id_a = spawn_owner(async move {
         // 1. Non-Grant cap as the grant: Forbidden.
         let mut bad = Submission::noop(Tag::new(0xE000));
         bad.op = OpCode::CapTransfer;
@@ -1729,4 +1871,198 @@ fn smoke_abi_cap_transfer_end_to_end() -> TestResult {
         _ => TestResult::Fail("transfer round-trip did not run"),
     }
 }
+#[cfg(feature = "native-ring")]
 kernel_test_in!("abi", smoke_abi_cap_transfer_end_to_end);
+
+// ── §8 step 5 domain-tag check (#1547) ───────────────────────────
+
+fn smoke_abi_domain_table_pins() -> TestResult {
+    // The per-op required-domain table (`OpCode::required_domain`):
+    // every user-submittable op requires USERSPACE_K (security-model/
+    // §4.1: dispatch is kernel-side handling of a user task's own
+    // ring submissions); the domain-transition ops carry no static
+    // requirement — their target domain is dynamic (caps[0]).
+    use crate::OpCode;
+    use narf_lib::id::DomainId;
+
+    let user_ops: &[OpCode] = &[
+        OpCode::Noop,
+        OpCode::Cancel,
+        OpCode::RingSend,
+        OpCode::RingRecv,
+        OpCode::Yield,
+        OpCode::CapTransfer,
+        OpCode::OpenFile,
+        OpCode::Read,
+        OpCode::Write,
+        OpCode::Close,
+        OpCode::Mmap,
+        OpCode::Munmap,
+        OpCode::CpuTopology,
+        OpCode::CpuPerfState,
+        OpCode::RaplEnergy,
+        OpCode::CpuIdleLatencyHint,
+        OpCode::CpuIdleRelease,
+        OpCode::CpuSetFreqRange,
+        OpCode::CpuSetEpp,
+        OpCode::CpuSetGovernor,
+        OpCode::CpuSetEnergyBudget,
+        OpCode::CpuClearEnergyBudget,
+    ];
+    for op in user_ops {
+        if op.required_domain() != Some(DomainId::USERSPACE_K) {
+            return TestResult::Fail("user op does not require USERSPACE_K");
+        }
+    }
+    if OpCode::DomainEnter.required_domain().is_some()
+        || OpCode::DomainExit.required_domain().is_some()
+    {
+        return TestResult::Fail("domain-transition op carries a static requirement");
+    }
+    // The pure comparison: match passes, mismatch is DomainMismatch,
+    // a domain-agnostic op passes from any domain.
+    use narf_capabilities::CapError;
+    if crate::check_submission_domain(OpCode::Noop, DomainId::USERSPACE_K).is_err() {
+        return TestResult::Fail("right-domain submission did not pass");
+    }
+    if crate::check_submission_domain(OpCode::Noop, DomainId::FRAME)
+        != Err(CapError::DomainMismatch)
+    {
+        return TestResult::Fail("wrong-domain submission did not report DomainMismatch");
+    }
+    if crate::check_submission_domain(OpCode::DomainEnter, DomainId::DRIVER_0).is_err() {
+        return TestResult::Fail("domain-agnostic op did not pass from any domain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("abi", smoke_abi_domain_table_pins);
+
+#[cfg(feature = "native-ring")]
+fn smoke_abi_dispatch_wrong_domain_forbidden() -> TestResult {
+    // §8 step 5 end-to-end (negative): an owner task active in FRAME
+    // submits a cap-less Noop through its bound dispatcher; the op
+    // never runs and the completion is Forbidden (DomainMismatch at
+    // the ABI surface). The owner is a plain `spawn`ed kernel task,
+    // so its recorded active domain is FRAME.
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::__reset_queues_for_test();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    let owner = narf_scheduler::spawn(async move {
+        let s = Submission::noop(Tag::new(0xD001));
+        sq_tx.send(s).await.unwrap();
+        let c = cq_rx.recv().await.unwrap();
+        if c.status != NarfStatus::Forbidden {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::for_task(sq_rx, cq_tx, owner);
+        d.run().await;
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("wrong-domain submission did not complete Forbidden"),
+        _ => TestResult::Fail("wrong-domain round-trip did not run"),
+    }
+}
+#[cfg(feature = "native-ring")]
+kernel_test_in!("abi", smoke_abi_dispatch_wrong_domain_forbidden);
+
+#[cfg(feature = "native-ring")]
+fn smoke_abi_dispatch_right_domain_ok() -> TestResult {
+    // §8 step 5 end-to-end (positive): the same submission from an
+    // owner active in USERSPACE_K completes Ok — the domain leg
+    // passes and the op runs. Control case for the negative test
+    // above; the two together pin the step-5 behaviour.
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::__reset_queues_for_test();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    let owner = spawn_owner(async move {
+        let s = Submission::noop(Tag::new(0xD002));
+        sq_tx.send(s).await.unwrap();
+        let c = cq_rx.recv().await.unwrap();
+        if c.status != NarfStatus::Ok {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::for_task(sq_rx, cq_tx, owner);
+        d.run().await;
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("right-domain submission did not complete Ok"),
+        _ => TestResult::Fail("right-domain round-trip did not run"),
+    }
+}
+#[cfg(feature = "native-ring")]
+kernel_test_in!("abi", smoke_abi_dispatch_right_domain_ok);
+
+#[cfg(feature = "native-ring")]
+fn smoke_abi_dispatch_unknown_owner_revoked() -> TestResult {
+    // §8 step 5 fail-closed: a dispatcher bound to a task id the
+    // scheduler has never registered completes the submission with
+    // CapRevoked — the same "no such task" treatment as the cap
+    // gate's unknown-task path — and the op never runs.
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::__reset_queues_for_test();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    // A live submitting task, but the dispatcher is bound to an id
+    // that was never spawned — so no cap table and no domain tag.
+    let unknown = narf_scheduler::TaskId(0xFFFF_FFFE);
+    narf_scheduler::spawn(async move {
+        let s = Submission::noop(Tag::new(0xD003));
+        sq_tx.send(s).await.unwrap();
+        let c = cq_rx.recv().await.unwrap();
+        if c.status != NarfStatus::CapRevoked {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::for_task(sq_rx, cq_tx, unknown);
+        d.run().await;
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("unknown-owner submission did not complete CapRevoked"),
+        _ => TestResult::Fail("unknown-owner round-trip did not run"),
+    }
+}
+#[cfg(feature = "native-ring")]
+kernel_test_in!("abi", smoke_abi_dispatch_unknown_owner_revoked);

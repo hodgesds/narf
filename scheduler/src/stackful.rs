@@ -53,9 +53,7 @@ use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
-use core::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 #[cfg(target_arch = "aarch64")]
@@ -767,6 +765,25 @@ pub fn handle_user_fpu_unavailable() -> bool {
     // SAFETY: CURRENT names the in-flight task and keeps its owner future (and
     // therefore its aligned FPU area) alive until this trap returns.
     materialize_user_fpu(cpu, unsafe { &*task })
+}
+
+#[cfg(feature = "native-ring")]
+pub(crate) fn update_current_authority_domain(domain: u8) -> bool {
+    let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+    if p.is_null() {
+        return false;
+    }
+    // SAFETY: called with preemption pinned from the current domain scope.
+    let task = unsafe { &*p };
+    if let Some(owner) = task.authority.as_ref() {
+        if owner.task_id() != crate::current_task_id() {
+            return false;
+        }
+    } else if crate::current_task_id() != crate::TaskId::NONE {
+        return false;
+    }
+    task.domain_byte.store(domain, Ordering::Release);
+    true
 }
 
 /// Publish an owner-defined context pointer on the CURRENT stackful task.
@@ -1913,7 +1930,12 @@ pub struct KernelTask {
     /// that domain for whatever runs next — which picks the wrong
     /// `domain_heap` window and misfires `block::encrypted`'s assertion,
     /// silently in both cases.
-    domain_byte: AtomicU8,
+    #[cfg(feature = "native-ring")]
+    domain_byte: Arc<crate::authority::DomainState>,
+    #[cfg(not(feature = "native-ring"))]
+    domain_byte: core::sync::atomic::AtomicU8,
+    #[cfg(feature = "native-ring")]
+    authority: Option<Arc<crate::CallerAuthority>>,
     /// Pointer to the executor's `KernelContext`. The executor
     /// stores its own ctx address here before switching in; the
     /// task reads it back to know where to switch when yielding.
@@ -2150,7 +2172,15 @@ impl KernelTask {
             // provably unreferenced and thus safe to recycle.
             recyclable_stack: AtomicBool::new(false),
             // A fresh task has no scope open, so it reports FRAME.
-            domain_byte: AtomicU8::new(narf_lib::id::DomainId::FRAME.raw()),
+            #[cfg(feature = "native-ring")]
+            domain_byte: Arc::new(crate::authority::DomainState::new(
+                narf_lib::id::DomainId::FRAME,
+                true,
+            )),
+            #[cfg(not(feature = "native-ring"))]
+            domain_byte: core::sync::atomic::AtomicU8::new(narf_lib::id::DomainId::FRAME.raw()),
+            #[cfg(feature = "native-ring")]
+            authority: None,
             // `KernelContext::default()` is a real register struct on x86_64
             // and a unit struct elsewhere; the allow covers the unit-struct
             // arches where clippy would otherwise flag the constructor.
@@ -2280,6 +2310,14 @@ impl KernelTask {
         exec_ctx: &mut KernelContext,
         waker: &Waker,
     ) -> Poll<()> {
+        #[cfg(feature = "native-ring")]
+        if self.authority.is_none() {
+            if let Some(owner) = crate::authority::clone_poll_owner() {
+                self.domain_byte = owner.domain.clone();
+                self.authority = Some(owner);
+            }
+        }
+
         // A completed task's saved `ctx` is a CONSUMED continuation — its
         // final switch-out already ran (`exit_current_stackful` additionally
         // poisons `ctx.rip`). Never switch into it: report Ready so the
@@ -2598,6 +2636,14 @@ impl KernelTask {
         exec_ctx: &mut KernelContext,
         waker: &Waker,
     ) -> Poll<()> {
+        #[cfg(feature = "native-ring")]
+        if self.authority.is_none() {
+            if let Some(owner) = crate::authority::clone_poll_owner() {
+                self.domain_byte = owner.domain.clone();
+                self.authority = Some(owner);
+            }
+        }
+
         if self.completed.load(Ordering::Acquire) {
             return Poll::Ready(());
         }
@@ -2715,6 +2761,17 @@ impl KernelTask {
     /// that hold hardware locks across an `.await`-free region.
     pub fn set_no_preempt(&self, v: bool) {
         self.no_preempt.store(v, Ordering::Release);
+    }
+
+    /// Set the domain this task reports (`current_domain()`) while it
+    /// runs. Spawn-time only in practice: `StackfulOptions::domain`
+    /// stamps it at construction (`spawn_user` → `USERSPACE_K`);
+    /// after that the byte is owned by the switch save/restore and
+    /// by domain-scope entry/exit. Only ever set before the task's
+    /// first poll — changing it under a running task would desync
+    /// the byte from the task's shared caller-authority state.
+    pub fn set_active_domain(&self, domain: narf_lib::id::DomainId) {
+        self.domain_byte.store(domain.raw(), Ordering::Release);
     }
 
     /// Enable or disable own-stack CPL3 timer preemption independently of
@@ -4493,6 +4550,7 @@ impl StackfulAdapter {
         me.inner.set_instruction_limit(opts.instruction_limit);
         me.inner.set_no_preempt(opts.no_preempt);
         me.inner.set_user_preempt(opts.user_preempt);
+        me.inner.set_active_domain(opts.domain);
         me
     }
 
@@ -6548,6 +6606,7 @@ pub mod tests {
             no_preempt: true,
             user_preempt: true,
             stack_bytes: 32 * 1024,
+            domain: narf_lib::id::DomainId::FRAME,
         };
         let adapter = StackfulAdapter::with_options(NoopPending, opts);
         if adapter.inner.slice_cycles.load(Ordering::Acquire) != 42_000_000 {

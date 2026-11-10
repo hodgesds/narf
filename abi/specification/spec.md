@@ -23,6 +23,12 @@ per-driver), nor the in-kernel ring implementation (that's `ipc/`).
 
 ## 3. Public interface
 
+The `native-ring` Cargo feature enables the native ring dispatcher and its
+caller-authority bindings. It is off by default and forwarded by `narf-frame`
+through `narf-userspace`. Without it, wire types and generic `narf-ipc` rings
+remain available, but userspace Bootstrap/RingKick handlers are absent.
+Linux-compatible syscalls do not pass through native ring admission.
+
 Sketch: the ABI is defined by a pair of rings per task — a submission
 ring and a completion ring, plus a capability-table handle namespace.
 No `int 0x80` / `svc` syscalls on the fast path.
@@ -46,23 +52,39 @@ No `int 0x80` / `svc` syscalls on the fast path.
 - `OpCode` enumerates every user-callable operation, grouped by
   subsystem (memory, ipc, scheduler, drivers).
 - `CapSlot` is a tagged index into the task's capability table.
-- **Dispatch cap gate (#1363).** Before any op body runs, the
-  dispatcher resolves every non-empty `Submission::caps` entry
-  against the *submitting task's own* table
-  (`CapTable::lookup`, capabilities/ §8 steps 1–4) — never the
-  global object table. The resolved object comes from the table,
-  never from the presented bytes, so a wire slot copied across
-  tasks resolves at most to the submitter's own entry at that
-  position. A failed lookup short-circuits the op: `Revoked` →
-  `NarfStatus::CapRevoked` (authoritative, do NOT retry),
-  `TypeMismatch` / `RightsTooWeak` / `DomainMismatch` /
-  `ObjectMismatch` → `NarfStatus::Forbidden`. A dispatcher with
-  no bound task (legacy `Dispatcher::new`) has no table to check
-  against, so any presented cap fails closed as `Forbidden`;
-  cap-less submissions still dispatch. The synchronous
-  `sys_ring_kick` path enforces the same gate. §8 step 5
-  (domain-tag match) is a remainder: no per-op required-domain
-  table exists yet.
+- **Bound caller authority.** `DispatchContext<'a>` borrows the submitting
+  task's `CallerAuthority` and its execution-image generation. Native RingKick
+  borrows it from the running task's kernel-owned session on the stack;
+  `Dispatcher::for_authority` retains one owner at binding. `for_task` is a
+  cold compatibility constructor that resolves its id once. No admission step
+  searches a task/domain registry or clones an Arc per operation. Production
+  `Dispatcher::new` is unbound and fails closed; empty-cap unbound dispatch
+  exists only in kernel-test fixtures.
+- **Dispatch cap gate (#1363).** Every nonempty `Submission::caps` entry
+  resolves through the submitting task's own `CapTable::lookup`, preserving
+  capabilities/ §8 steps 1–4. A nonempty array takes one owner-local lock;
+  an empty array takes none. Object epochs remain checked against current
+  stable indexed metadata. `Revoked` completes `CapRevoked`; type, rights,
+  domain and object mismatch complete `Forbidden`. Copied wire slots never
+  select a foreign owner's table.
+- **Dispatch domain gate (#1547, capabilities/ §8 step 5).** After cap
+  validation and before cancellation bookkeeping, the same live image's
+  logical domain is compared with `OpCode::required_domain`. Every ordinary
+  user op requires `USERSPACE_K`; mismatch completes `Forbidden`. An unknown,
+  unpublished, retired, replaced-image or closed-session subject cannot admit
+  work. Logical scope entry/exit and task switches preserve this state;
+  temporary FRAME trap handling does not replace the submitting domain.
+  `DomainEnter`/`DomainExit` still complete `InvalidOp`: their dynamic target
+  cap and dispatch implementation remain unimplemented.
+- **Lifecycle and backend context.** Retirement or image replacement wakes
+  dispatchers blocked on an empty SQ or full CQ. Session closure uses the
+  same notification and cannot be undone by retaining its Arc. Admission
+  already completed before revocation follows the existing completion and
+  cancellation contract. `FileOpBridge` receives
+  `Option<DispatchContext<'_>>` before its existing arguments. The userspace
+  bridge only executes ambient FD/MM operations in that exact current owner;
+  a foreign worker returns `Unsupported` until an explicit owner backend
+  exists. Production callers always supply the bound context.
 - **`OpCode::CapTransfer` (0x0007)** is the ABI surface for
   Grant-gated cross-task transfer (capabilities/ §9.1):
   `caps[0]` is the sender's Grant cap, `caps[1]` the cap to

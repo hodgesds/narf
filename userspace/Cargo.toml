@@ -50,6 +50,9 @@ narf-modules      = { path = "../modules" }
 narf-power        = { path = "../power" }
 
 [features]
+# Native Bootstrap/RingKick ABI and per-task sessions. Off by default.
+native-ring = ["narf-abi/native-ring", "narf-scheduler/native-ring"]
+
 # Default-on so the workspace's `cargo xtask kernel-test` driver
 # (which doesn't enable any per-crate features explicitly) still
 # builds the Linux-shaped surface into the kernel. Strip with
@@ -77,7 +80,7 @@ unix-latency-trace = []
 # `handlers::with_kernel_buffers` — the narrowly-scoped opt-in that lets a
 # test hand a kernel-half pointer to a syscall handler. Off (and therefore
 # a no-op, with no bypass code compiled at all) in every production build.
-kernel-test = ["narf-scheduler/kernel-test", "dep:narf-ipc"]
+kernel-test = ["narf-scheduler/kernel-test", "narf-abi/kernel-test", "dep:narf-ipc"]
 
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
 # don't trip the unexpected_cfgs lint. The frame crate's

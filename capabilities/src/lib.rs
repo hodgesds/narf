@@ -12,10 +12,8 @@ extern crate alloc;
 mod tests;
 
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::vec::Vec;
-use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Rights ──────────────────────────────────────────────────────────
 
@@ -324,20 +322,20 @@ impl<T, R: Rights> Cap<T, R> {
     ///    `RightsTooWeak`.
     ///
     /// Steps 1–2 run as a single object-table read
-    /// (`epoch_and_kind`): exactly one table lock acquisition per
-    /// `invoke`, the same as the old epoch-only path — the kind
-    /// lookup adds no lock, per the #1282 perf bar (a second
-    /// acquisition would have failed it). Steps 3–4 are same-slot
+    /// (`epoch_and_kind`): one stable indexed metadata read per
+    /// `invoke`; immutable kind publication adds no lock. Steps 3–4 are same-slot
     /// integer compares, no lock, no table touch.
     ///
     /// What this does NOT check: the caller's domain (spec §8
     /// step 5). Neither the cap nor the object-table entry records
-    /// a domain, and no per-op required-domain table exists yet
-    /// (the #1363 wiring's stated remainder) — so there is nothing
-    /// authoritative for `invoke` to compare against. That check
-    /// belongs at dispatch, where the calling task's domain is
-    /// known; tracked as a follow-up issue (see spec §9.9).
-    /// `DomainMismatch` therefore remains unproduced by this path.
+    /// a domain, and no per-op required-domain table exists here —
+    /// so there is nothing authoritative for `invoke` to compare
+    /// against. That check belongs at dispatch, where the calling
+    /// task's domain is known, and it is implemented there:
+    /// `OpCode::required_domain` (`abi/`) is the per-op table and
+    /// `DispatchContext::validate` enforces it in `Dispatcher::dispatch_one`
+    /// and `sys_ring_kick` (#1547). `DomainMismatch` therefore
+    /// remains unproduced by this path, but is produced by dispatch.
     pub fn invoke<O: CapOp<T, R>>(&self, op: O) -> Result<O::Output, CapError>
     where
         T: CapType,
@@ -463,7 +461,7 @@ impl<T: CapType, R: Rights> Cap<T, R> {
         if creator.slot().rights & Create::BITS == 0 {
             return Err(CapError::RightsTooWeak);
         }
-        let (index, generation) = object_table::register(T::KIND);
+        let (index, generation) = object_table::try_register(T::KIND)?;
         let slot = CapSlot::new(generation, index, R::BITS, T::KIND as u32);
         // SAFETY: the slot was just registered on the TCB-authorised
         // creator-gated path and its type_tag/rights match T and R.
@@ -503,62 +501,7 @@ impl<T, R: Rights> CapOp<T, R> for NoopOp {
 
 // ── object_table ────────────────────────────────────────────────────
 
-pub mod object_table {
-    use super::{AtomicU32, CapKind, IrqSafeSpinLock, Ordering, Vec};
-
-    struct Entry {
-        epoch: AtomicU32,
-        kind: CapKind,
-    }
-
-    static TABLE: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
-
-    pub fn register(kind: CapKind) -> (u32, u32) {
-        let mut t = TABLE.lock();
-        let index = t.len() as u32;
-        t.push(Entry {
-            epoch: AtomicU32::new(1),
-            kind,
-        });
-        (index, 1)
-    }
-
-    pub fn current_epoch(index: u32) -> Option<u32> {
-        let t = TABLE.lock();
-        t.get(index as usize)
-            .map(|e| e.epoch.load(Ordering::Acquire))
-    }
-
-    /// One locked read of an entry's epoch AND kind (SEC-B2,
-    /// #1282). `Cap::invoke` needs both facts for the same index,
-    /// and taking them under one lock hold keeps `invoke` at exactly
-    /// one object-table lock acquisition — the same as the old
-    /// epoch-only path. Two separate calls (`current_epoch` then
-    /// `kind_at`) would have added a second acquisition, which the
-    /// #1282 perf bar fails outright. `None` iff `index` names no
-    /// entry; the caller maps a stale epoch to `Revoked` and a
-    /// wrong kind to `TypeMismatch`.
-    pub fn epoch_and_kind(index: u32) -> Option<(u32, CapKind)> {
-        let t = TABLE.lock();
-        t.get(index as usize)
-            .map(|e| (e.epoch.load(Ordering::Acquire), e.kind))
-    }
-
-    pub fn bump_epoch(index: u32) -> Option<u32> {
-        let t = TABLE.lock();
-        t.get(index as usize)
-            .map(|e| e.epoch.fetch_add(1, Ordering::AcqRel) + 1)
-    }
-
-    pub fn kind_at(index: u32) -> Option<CapKind> {
-        let t = TABLE.lock();
-        t.get(index as usize).map(|e| e.kind)
-    }
-
-    pub fn len() -> usize {
-        TABLE.lock().len()
-    }
-}
+pub mod object_table;
 
 // ── CapTable: per-task capability tables ────────────────────────────
 //

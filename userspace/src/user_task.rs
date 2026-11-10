@@ -935,6 +935,40 @@ fn current_task_owner_ptr() -> *const crate::task::Task {
     narf_scheduler::stackful::current_user_context().cast()
 }
 
+/// Borrow the current task on its pinned kernel continuation. Unlike
+/// current_task_owner this performs no Arc increment/decrement. The borrow
+/// cannot escape the callback or be used to create a reference with static
+/// lifetime. Current-user-context publication follows direct resume/migration.
+#[cfg(feature = "native-ring")]
+pub(crate) fn with_current_task_owner<R>(
+    f: impl for<'a> FnOnce(&'a crate::task::Task) -> R,
+) -> Option<R> {
+    // Snapshot CPU-local identity with IRQs masked. The callback itself runs
+    // with the caller's IRQ state restored. No shared preemption counter or
+    // refcount is touched on this path.
+    let ptr = narf_lib::sync::without_interrupts(|| {
+        let ptr = current_task_owner_ptr();
+        if ptr.is_null() {
+            return ptr;
+        }
+        // SAFETY: IRQ masking prevents a task switch/migration while resolving
+        // the current KernelTask and checking its owner against scheduler id.
+        if unsafe { (*ptr).tid } == narf_scheduler::current_task_id().raw() {
+            ptr
+        } else {
+            core::ptr::null()
+        }
+    });
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the current KernelTask's future pins Arc<Task> until this
+    // continuation returns. After the snapshot, preemption/migration resumes
+    // this same continuation with its owner retained. HRTB prevents escape.
+    let task = unsafe { &*ptr };
+    Some(f(task))
+}
+
 /// Clone the CURRENT stackful user task's owner without consulting the global
 /// task registry. The future-held Arc proves the raw pointer remains live while
 /// the scheduler publishes this task as current.
@@ -3510,6 +3544,8 @@ impl core::future::Future for UserTaskFuture {
                 // longjmp'ing here; we're the sole consumer.
                 // SAFETY: Valid memory or trusted environment
                 let req = unsafe { alloc::boxed::Box::from_raw(req_ptr) };
+                #[cfg(feature = "native-ring")]
+                crate::handlers::native_exec_commit(&this.task);
                 this.process.address_space = req.new_as;
                 this.process.entry = crate::EntryPoint(narf_memory::VirtAddr::new(req.entry));
                 this.process.stack_top = narf_memory::VirtAddr::new(req.stack_top);
@@ -4061,7 +4097,8 @@ pub fn install_user_task_hooks() {}
 /// no child table and spuriously returns `ENOENT`.
 pub struct PendingUserProcess {
     id: narf_scheduler::TaskId,
-    future: UserTaskFuture,
+    future: Option<UserTaskFuture>,
+    owner: alloc::sync::Arc<crate::task::Task>,
     spec: narf_scheduler::TaskSpec,
     addr_space: alloc::sync::Arc<narf_memory::AddressSpace>,
 }
@@ -4084,12 +4121,24 @@ impl PendingUserProcess {
     /// Arm the one-shot CLONE_CHILD_SETTID write before publishing this task.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn set_child_tid(&mut self, uaddr: u64) {
-        self.future.set_child_tid(uaddr);
+        self.future
+            .as_mut()
+            .expect("pending future")
+            .set_child_tid(uaddr);
     }
 
     /// Publish this fully initialized task to the scheduler.
-    pub fn spawn(self) -> narf_scheduler::TaskId {
-        narf_scheduler::spawn_user(self.id, self.future, self.spec, self.addr_space)
+    pub fn spawn(mut self) -> narf_scheduler::TaskId {
+        let future = self.future.take().expect("pending future");
+        narf_scheduler::spawn_user(self.id, future, self.spec, self.addr_space.clone())
+    }
+}
+
+impl Drop for PendingUserProcess {
+    fn drop(&mut self) {
+        if self.future.is_some() {
+            crate::task::abort_prepared_registration(&self.owner);
+        }
     }
 }
 
@@ -4103,7 +4152,8 @@ fn prepare_user_process(
     let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
     PendingUserProcess {
         id,
-        future: future(process, task),
+        future: Some(future(process, task.clone())),
+        owner: task,
         spec,
         addr_space,
     }
