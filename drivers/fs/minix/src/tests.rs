@@ -1857,6 +1857,7 @@ fn smoke_minix_cross_open_write_visible() -> TestResult {
 kernel_test_in!("drivers/fs/minix", smoke_minix_cross_open_write_visible);
 
 // ── Block-level read-modify-write races (#1998) ────────────────────
+// ── Shared-scratch-buffer race (#1979) ─────────────────────────────
 
 /// Test-only block device that models real DMA timing: the transfer
 /// into/out of the request buffer happens when the device first
@@ -1864,12 +1865,13 @@ kernel_test_in!("drivers/fs/minix", smoke_minix_cross_open_write_visible);
 /// completion is signalled only on a later poll.
 ///
 /// `RamBlockDevice` instead transfers synchronously inside
-/// `submit()` and completes on the first poll, so two block-level
-/// sequences can never interleave at the `.await` point and a
+/// `submit()` and completes on the first poll, so two sector ops
+/// (and two block-level read → patch → write sequences) can never
+/// interleave at the `.await` point and a shared scratch-buffer /
 /// read → patch → write race is invisible against it. This device
-/// makes the interleave observable: poll op A (transfer A lands,
-/// A pends), poll op B (transfer B lands, B pends), poll A again
-/// (A copies out).
+/// makes the interleave observable: poll op A (transfer A lands in
+/// the scratch buffer, A pends), poll op B (transfer B lands in the
+/// same scratch buffer, B pends), poll A again (A copies out).
 ///
 /// Deviation from the `BlockDevice::submit` contract, documented
 /// here rather than hidden: a pending submit never wakes its waker
@@ -1893,6 +1895,10 @@ impl DeferredDmaDevice {
             logical_block_size: lbs,
             capacity_blocks,
         })
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.storage.lock().clone()
     }
 
     /// Perform the DMA transfer for `req`: reads copy storage into
@@ -2018,9 +2024,18 @@ impl core::future::Future for DeferredSubmit<'_> {
     }
 }
 
-/// Mount the V3 fixture image on a [`DeferredDmaDevice`] (512-byte
-/// LBS). Returns the device (for post-write snapshots) and the
-/// mounted volume.
+/// Two otherwise-unused 512-byte device sectors in the 32-block
+/// fixture image (blocks 30/31 — mount reads only the superblock
+/// and the inode table), filled with distinct patterns by
+/// `mount_deferred_volume` so a sector op returning the other
+/// sector's bytes is observable.
+const RACE_LBA_A: u64 = 60;
+const RACE_LBA_B: u64 = 62;
+
+/// Mount a V3 image on a [`DeferredDmaDevice`] with the two race
+/// sectors filled with distinct patterns (`0xA5` at `RACE_LBA_A`,
+/// `0x5A` at `RACE_LBA_B`). Returns the device (for post-write
+/// snapshots) and the mounted volume.
 fn mount_deferred_volume() -> Option<(
     alloc::sync::Arc<DeferredDmaDevice>,
     alloc::sync::Arc<super::volume::MinixVolume<DeferredDmaDevice>>,
@@ -2029,7 +2044,9 @@ fn mount_deferred_volume() -> Option<(
 
     use super::volume::MinixVolume;
 
-    let img = build_minix3_image(b"hello minix\n");
+    let mut img = build_minix3_image(b"hello minix\n");
+    img[(RACE_LBA_A as usize) * 512..(RACE_LBA_A as usize + 1) * 512].fill(0xA5);
+    img[(RACE_LBA_B as usize) * 512..(RACE_LBA_B as usize + 1) * 512].fill(0x5A);
     let device = DeferredDmaDevice::from_image(512, img);
     let volume = drive(MinixVolume::mount(device.clone(), DomainId::DRIVER_0))?.ok()?;
     Some((device, volume))
@@ -2251,3 +2268,220 @@ kernel_test_in!(
     "drivers/fs/minix",
     smoke_minix_concurrent_write_file_same_zone_both_halves_survive
 );
+/// Two `read_sector` calls for different LBAs, interleaved at the
+/// submit await point, must each return their own sector's bytes.
+/// Before #1979 the second submit overwrote the shared DMA scratch
+/// buffer before the first op copied out, so the first op returned
+/// the second sector's bytes.
+fn smoke_minix_concurrent_read_sector_returns_own_bytes() -> TestResult {
+    let (_device, volume) = match mount_deferred_volume() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on deferred device failed"),
+    };
+    let mut dst_a = vec![0u8; 512];
+    let mut dst_b = vec![0u8; 512];
+    let fut_a = volume.read_sector(RACE_LBA_A, &mut dst_a);
+    let fut_b = volume.read_sector(RACE_LBA_B, &mut dst_b);
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    match (ra, rb) {
+        (Some(Ok(())), Some(Ok(()))) => {}
+        _ => return TestResult::Fail("concurrent read_sector did not complete"),
+    }
+    if dst_a.iter().any(|b| *b != 0xA5) {
+        return TestResult::Fail("read_sector A returned another sector's bytes");
+    }
+    if dst_b.iter().any(|b| *b != 0x5A) {
+        return TestResult::Fail("read_sector B returned another sector's bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_concurrent_read_sector_returns_own_bytes
+);
+
+/// A `read_sector` racing a `write_sector` must return the sector's
+/// on-disk bytes, not the bytes the write just staged into the
+/// shared scratch buffer. The read is polled first: before #1979
+/// its submit landed the sector's bytes in the scratch buffer, then
+/// the write's stage-in overwrote them before the read copied out.
+fn smoke_minix_read_sector_racing_write_sector() -> TestResult {
+    let (device, volume) = match mount_deferred_volume() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on deferred device failed"),
+    };
+    let mut dst = vec![0u8; 512];
+    let staged = vec![0x3C; 512];
+    let fut_r = volume.read_sector(RACE_LBA_B, &mut dst);
+    let fut_w = volume.write_sector(RACE_LBA_A, &staged);
+    let (rr, rw) = poll_two(fut_r, fut_w);
+    match (rr, rw) {
+        (Some(Ok(())), Some(Ok(()))) => {}
+        _ => return TestResult::Fail("racing read/write_sector did not complete"),
+    }
+    if dst.iter().any(|b| *b != 0x5A) {
+        return TestResult::Fail("read_sector racing write_sector returned staged write bytes");
+    }
+    let stored = device.snapshot();
+    if stored[(RACE_LBA_A as usize) * 512..(RACE_LBA_A as usize + 1) * 512]
+        .iter()
+        .any(|b| *b != 0x3C)
+    {
+        return TestResult::Fail("write_sector racing a read did not land");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_read_sector_racing_write_sector
+);
+
+// ── Sub-LBS read-modify-write race (#1989) ─────────────────────────
+
+/// Mount the V3 fixture image on a [`DeferredDmaDevice`] with a
+/// 4 KiB logical block size, so MINIX blocks (1 KiB) are smaller
+/// than one device sector and `write_block` takes its
+/// read-modify-write branch. The image is 32 KiB, a multiple of
+/// 4096, so it mounts unchanged.
+fn mount_deferred_volume_lbs4096() -> Option<(
+    alloc::sync::Arc<DeferredDmaDevice>,
+    alloc::sync::Arc<super::volume::MinixVolume<DeferredDmaDevice>>,
+)> {
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    let img = build_minix3_image(b"hello minix\n");
+    let device = DeferredDmaDevice::from_image(4096, img);
+    let volume = drive(MinixVolume::mount(device.clone(), DomainId::DRIVER_0))?.ok()?;
+    Some((device, volume))
+}
+
+/// Two concurrent `write_block`s on different MINIX blocks in one
+/// device sector must both survive: each patch lands in its own
+/// slice of the shared sector, and the blocks neither write keep
+/// their bytes.
+///
+/// Harness limitation, stated plainly: on top of #1987 this test
+/// cannot fail pre-fix under single-threaded cooperative polling —
+/// the `io` mutex makes the read → patch → write span poll-atomic
+/// there (the span holds no pended await between the read
+/// completing and the write submitting, and the barging `Mutex`
+/// lets the releasing task re-acquire `io` in the same poll, so
+/// no other task can run inside the span; post-#1987 the race is
+/// an SMP race, two CPUs genuinely overlapping the sequences).
+/// The deterministic FAIL-pre-fix / PASS-post-fix evidence for
+/// the race itself is the host simulation (see the PR body), which
+/// models the two-CPU overlap with barriers. What this fixture
+/// does pin down in CI: the fix's end-state invariant through the
+/// real `write_block` path, and liveness of the chosen design —
+/// the tempting alternative (hold `io` across the sequence)
+/// nests the same mutex and parks forever, so `poll_two` would
+/// return `None` here and the test would fail instead of hang
+/// the suite.
+fn smoke_minix_concurrent_sub_lbs_write_block_both_patches_survive() -> TestResult {
+    let (device, volume) = match mount_deferred_volume_lbs4096() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on 4096-LBS deferred device failed"),
+    };
+    if volume.sb.block_size != 1024 {
+        return TestResult::Fail("fixture image is not 1 KiB blocks");
+    }
+    // First sector-aligned data block and its neighbour share one
+    // 4 KiB device sector (blocks 8 and 9 in the fixture image:
+    // data starts at block 5, blocks 5/6 are the root dir and
+    // hi.txt, blocks 8/9 are free).
+    let base = (volume.sb.first_data_zone + 3) & !3;
+    let blk_a = base;
+    let blk_b = base + 1;
+    if blk_b >= volume.sb.nzones {
+        return TestResult::Fail("fixture image too small for two blocks in one sector");
+    }
+    let sec_a = blk_a as u64 * 1024 / 4096;
+    let sec_b = blk_b as u64 * 1024 / 4096;
+    if sec_a != sec_b {
+        return TestResult::Fail("fixture blocks do not share one device sector");
+    }
+    let data_a = vec![0xA1u8; 1024];
+    let data_b = vec![0xB2u8; 1024];
+    let fut_a = volume.write_block(blk_a, &data_a);
+    let fut_b = volume.write_block(blk_b, &data_b);
+    let (ra, rb) = poll_two(fut_a, fut_b);
+    match (ra, rb) {
+        (Some(Ok(())), Some(Ok(()))) => {}
+        _ => return TestResult::Fail("concurrent sub-LBS write_block did not complete"),
+    }
+    let mut back_a = vec![0u8; 1024];
+    let mut back_b = vec![0u8; 1024];
+    match drive(volume.read_block(blk_a, &mut back_a)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("read-back of block A did not complete"),
+    }
+    match drive(volume.read_block(blk_b, &mut back_b)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("read-back of block B did not complete"),
+    }
+    if back_a.iter().any(|b| *b != 0xA1) {
+        return TestResult::Fail("block A patch lost to the concurrent write");
+    }
+    if back_b.iter().any(|b| *b != 0xB2) {
+        return TestResult::Fail("block B patch lost to the concurrent write");
+    }
+    let stored = device.snapshot();
+    let sec = (sec_a as usize) * 4096;
+    if stored[sec..sec + 1024].iter().any(|b| *b != 0xA1) {
+        return TestResult::Fail("device sector does not hold block A patch");
+    }
+    if stored[sec + 1024..sec + 2048].iter().any(|b| *b != 0xB2) {
+        return TestResult::Fail("device sector does not hold block B patch");
+    }
+    if stored[sec + 2048..sec + 4096].iter().any(|b| *b != 0) {
+        return TestResult::Fail("untouched blocks in the shared sector changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/minix",
+    smoke_minix_concurrent_sub_lbs_write_block_both_patches_survive
+);
+
+/// A single sub-LBS `write_block` still lands exactly its own
+/// slice of the enclosing sector and leaves the neighbouring
+/// blocks in that sector untouched.
+fn smoke_minix_single_sub_lbs_write_block() -> TestResult {
+    let (device, volume) = match mount_deferred_volume_lbs4096() {
+        Some(v) => v,
+        None => return TestResult::Fail("mount on 4096-LBS deferred device failed"),
+    };
+    if volume.sb.block_size != 1024 {
+        return TestResult::Fail("fixture image is not 1 KiB blocks");
+    }
+    let base = (volume.sb.first_data_zone + 3) & !3;
+    let blk = base + 1;
+    if blk >= volume.sb.nzones {
+        return TestResult::Fail("fixture image too small for the sub-LBS block");
+    }
+    let data = vec![0xC3u8; 1024];
+    match drive(volume.write_block(blk, &data)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("single sub-LBS write_block did not complete"),
+    }
+    let mut back = vec![0u8; 1024];
+    match drive(volume.read_block(blk, &mut back)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("read-back of the written block did not complete"),
+    }
+    if back.iter().any(|b| *b != 0xC3) {
+        return TestResult::Fail("single sub-LBS write_block read back wrong bytes");
+    }
+    let stored = device.snapshot();
+    let sec = (blk as usize) * 1024 / 4096 * 4096;
+    if stored[sec..sec + 1024].iter().any(|b| *b != 0) {
+        return TestResult::Fail("preceding block in the shared sector changed");
+    }
+    if stored[sec + 2048..sec + 4096].iter().any(|b| *b != 0) {
+        return TestResult::Fail("following blocks in the shared sector changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_single_sub_lbs_write_block);

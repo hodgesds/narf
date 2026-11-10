@@ -72,10 +72,26 @@ pub struct MinixVolume<B: BlockDevice> {
     pub sb: Superblock,
     pub domain: DomainId,
     pub self_weak: Weak<MinixVolume<B>>,
-    /// Per-volume scratch buffer + cap. Same lock discipline as the
-    /// FAT driver — held synchronously during the copy span only,
-    /// never across an `await`.
-    io: IrqSafeSpinLock<VolumeIo>,
+    /// Per-volume scratch buffer + cap. Serialised by an async
+    /// mutex held across the whole submit + copy window in
+    /// `read_sector` / `write_sector` (#1979): the buffer is shared
+    /// by every sector op on the volume, so the submit and the copy
+    /// must be one critical section — a concurrent op's submit would
+    /// otherwise overwrite the bytes this op is about to copy out
+    /// (or the bytes it just staged in). `narf_lib::mutex::Mutex`
+    /// parks waiters on the scheduler waker instead of disabling
+    /// IRQs, so holding it across `.await` is safe; the
+    /// `IrqSafeSpinLock` this replaces could only ever be held for
+    /// the synchronous copy span, which left the window between
+    /// submit and copy unserialised. No higher-level serialiser
+    /// covers the window: `MinixNode::read` takes no lock
+    /// (`node.rs`), the VFS dispatches `FileOps::read` with no
+    /// volume lock, and `BlockDevice::submit` carries no
+    /// serialisation contract. Callers that only need `lbs`
+    /// (`read_block` / `write_block`) take the lock briefly and
+    /// release it before any await. Same shape as squashfs
+    /// `read_exact_from`.
+    io: Mutex<VolumeIo>,
     /// Serialises block-level read-modify-write sequences per volume
     /// (#1998): `write_inode`, `alloc_bitmap_bit`, `free_bitmap_bit`,
     /// and `write_file`'s per-zone span each read a MINIX block,
@@ -114,6 +130,34 @@ pub struct MinixVolume<B: BlockDevice> {
     /// order `block_rmw` → `rmw` → `io` stays total and neither can
     /// ever be held while acquiring `block_rmw`.
     block_rmw: Mutex<()>,
+    /// Serialises the sub-LBS read-modify-write sequence in
+    /// `write_block` (#1989): a MINIX block smaller than LBS is
+    /// written by reading the enclosing sector, patching one
+    /// block-sized slice, and writing the sector back, and two
+    /// such sequences for different blocks in one sector can
+    /// interleave — both read the pre-write sector, both patch
+    /// different offsets, the second write-back clobbers the
+    /// first's patch. The `io` mutex does NOT cover this: it is
+    /// held across the submit + copy window *inside* each sector
+    /// op, so it serialises sector ops but not the read → patch
+    /// → write sequence spanning two of them. A separate mutex
+    /// (rather than holding `io` across the sequence) because
+    /// the inner sector ops take `io` themselves — holding `io`
+    /// across the sequence would nest the same mutex and park
+    /// forever on itself. Lock order is total, RMW before `io`:
+    /// the RMW lock is only ever taken in `write_block`'s
+    /// sub-LBS branch, which then takes `io` inside
+    /// `read_sector` / `write_sector`; `io` is never held while
+    /// acquiring the RMW lock (the `lbs` read in `write_block`
+    /// releases `io` before the RMW lock is taken, and the
+    /// sector ops never take the RMW lock), so no cycle can
+    /// form. Per-volume, not per-sector: sub-LBS writes only
+    /// occur on unusual volumes (e.g. 1 KiB blocks on a 4 KiB
+    /// sector device), the lock is taken only in that branch —
+    /// never on the `bs >= lbs` fast path — and a per-sector
+    /// map would buy nothing on a rare path for unbounded
+    /// growth and a second lock-ordering pair.
+    rmw: Mutex<()>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
     /// The root directory's inode, read at mount (Linux `minix_fill_super`
@@ -308,8 +352,9 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             sb,
             domain,
             self_weak: self_weak.clone(),
-            io: IrqSafeSpinLock::new(io),
+            io: Mutex::new(io),
             block_rmw: Mutex::new(()),
+            rmw: Mutex::new(()),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
             root_inode: IrqSafeSpinLock::new(None),
             cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
@@ -417,12 +462,22 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
 
     /// Read one device sector (LBS bytes) into `dst`. `dst.len()`
     /// must equal LBS.
+    ///
+    /// The async mutex is held across the whole submit + copy
+    /// window (#1979): the scratch buffer is shared by every sector
+    /// op on the volume, so the submit and the copy-out must be one
+    /// critical section. Holding an `IrqSafeSpinLock` across the
+    /// await instead would deadlock the executor (IRQs disabled
+    /// while the wake the await waits on cannot fire); the async
+    /// mutex parks waiters on the scheduler waker, so it is safe
+    /// here.
     pub async fn read_sector(&self, lba: u64, dst: &mut [u8]) -> Result<(), FsError> {
-        let lbs = self.io.lock().lbs;
+        let io = self.io.lock().await;
+        let lbs = io.lbs;
         if dst.len() != lbs {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
-        let cap = { self.io.lock().cap };
+        let cap = io.cap;
         let req = BlockRequest {
             op: BlockOp::Read,
             lba,
@@ -436,13 +491,13 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         let completion = self.device.submit(req).await;
         completion.result.map_err(FsError::Io)?;
 
-        let buf = self
-            .io
-            .lock()
+        let buf = io
             .buffer()
             .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-        // SAFETY: registry holds the only `Arc<DmaBuffer>` outside this
-        // clone; MINIX serialises sector ops via the outer spinlock.
+        // SAFETY: the mutex is held across submit + copy, so no
+        // other sector op can stage through the shared scratch
+        // buffer while this copy runs; the registry holds the only
+        // `Arc<DmaBuffer>` outside this clone.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
         dst.copy_from_slice(src);
@@ -451,26 +506,28 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
 
     /// Write one device sector (LBS bytes) from `src`. Inverse of
     /// `read_sector`. `src.len()` must equal LBS.
+    ///
+    /// Same window as `read_sector`, mirrored: the stage-in and the
+    /// submit must be one critical section under the async mutex, or
+    /// a concurrent read's submit overwrites the staged bytes before
+    /// this op's DMA runs (#1979).
     pub async fn write_sector(&self, lba: u64, src: &[u8]) -> Result<(), FsError> {
-        let lbs = self.io.lock().lbs;
+        let io = self.io.lock().await;
+        let lbs = io.lbs;
         if src.len() != lbs {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
         // Stage the bytes into the DMA scratch buffer first.
-        {
-            let buf = self
-                .io
-                .lock()
-                .buffer()
-                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-            // SAFETY: see `read_sector`. The cap → registry resolve
-            // guarantees the buffer is alive; the spinlock serialises
-            // ops, so no concurrent user.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
-            dst.copy_from_slice(src);
-        }
-        let cap = { self.io.lock().cap };
+        let buf = io
+            .buffer()
+            .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+        // SAFETY: see `read_sector`. The cap → registry resolve
+        // guarantees the buffer is alive; the mutex serialises
+        // ops, so no concurrent user.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
+        dst.copy_from_slice(src);
+        let cap = io.cap;
         let req = BlockRequest {
             op: BlockOp::Write { fua: false },
             lba,
@@ -492,7 +549,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         if src.len() != bs {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
-        let lbs = self.io.lock().lbs;
+        let lbs = self.io.lock().await.lbs;
         let start_lba = block_no as u64 * bs as u64 / lbs as u64;
         if bs >= lbs {
             let n = bs / lbs;
@@ -503,7 +560,20 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             }
         } else {
             // MINIX block smaller than LBS — read-modify-write the
-            // enclosing device sector.
+            // enclosing device sector. The whole sequence is
+            // serialised by the RMW mutex (#1989): without it two
+            // concurrent writes to different blocks in one sector
+            // both read the pre-write sector and the second
+            // write-back clobbers the first's patch. The mutex is
+            // separate from `io` — the inner sector ops take `io`
+            // themselves, so holding `io` here would deadlock on
+            // nesting (see the field comment for the lock-order
+            // argument). `read_block`'s sub-LBS branch needs no
+            // such lock: it only reads the enclosing sector, so it
+            // cannot clobber another writer's patch; a read racing
+            // a write observes either the pre- or the post-write
+            // sector, both valid linearisable snapshots.
+            let _rmw = self.rmw.lock().await;
             let mut sector = vec![0u8; lbs];
             self.read_sector(start_lba, &mut sector).await?;
             let off_in_sector = (block_no as usize * bs) % lbs;
@@ -539,7 +609,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         if dst.len() != bs {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
-        let lbs = self.io.lock().lbs;
+        let lbs = self.io.lock().await.lbs;
         let start_lba = block_no as u64 * bs as u64 / lbs as u64;
         if bs >= lbs {
             // MINIX block is a multiple of LBS: read N sectors.
