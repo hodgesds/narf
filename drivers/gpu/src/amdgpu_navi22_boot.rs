@@ -2702,6 +2702,44 @@ impl ColdBoot {
         }
         .map_err(Error::Modeset)
     }
+    /// Program a running stream's CRTC color (group member or single),
+    /// without retiring it.
+    pub async fn set_display_color(
+        &mut self,
+        group_stream: Option<usize>,
+        program: Option<alloc::sync::Arc<crate::amdgpu_dcn30_color::ColorProgram>>,
+    ) -> Result<(), Error> {
+        let h = &mut self.sequence.backend;
+        match group_stream {
+            Some(k) => {
+                h.group
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .set_color(k, program)
+                    .await
+            }
+            None => {
+                h.modeset
+                    .as_mut()
+                    .ok_or(Error::Invalid)?
+                    .set_color(program)
+                    .await
+            }
+        }
+        .map_err(Error::Modeset)
+    }
+    /// The CRTC color program a running stream last programmed (None:
+    /// bypass, or no stream).
+    pub fn display_color(
+        &self,
+        group_stream: Option<usize>,
+    ) -> Option<alloc::sync::Arc<crate::amdgpu_dcn30_color::ColorProgram>> {
+        let h = &self.sequence.backend;
+        match group_stream {
+            Some(k) => h.group.as_ref()?.color(k),
+            None => h.modeset.as_ref()?.color(),
+        }
+    }
     /// Immutable board/PHY ceilings for DRM's side-effect-free checks.
     pub fn display_hdmi_limits(
         &self,

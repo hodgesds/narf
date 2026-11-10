@@ -463,10 +463,12 @@ pub(crate) struct PropertyBlob {
 /// initialize the legacy store with 256 entries, independently of native LUT size.
 pub const LEGACY_GAMMA_SIZE: usize = 256;
 
-/// A CRTC's color management as amdgpu_dm attaches it on DCN 4.0.1
+/// A CRTC's color management as amdgpu_dm attaches it: on DCN 4.0.1
 /// (`drm_crtc_enable_color_mgmt(crtc, 0, true, MAX_COLOR_LUT_ENTRIES)`:
-/// CTM, GAMMA_LUT and GAMMA_LUT_SIZE, no degamma) with the blobs DRM last
-/// committed (0 for none) and the legacy gamma store GETGAMMA reads.
+/// CTM, GAMMA_LUT and GAMMA_LUT_SIZE, no degamma) and on DCN 3.0
+/// (`drm_crtc_enable_color_mgmt(crtc, 4096, true, 4096)`: a DEGAMMA_LUT
+/// and DEGAMMA_LUT_SIZE too), with the blobs DRM last committed (0 for
+/// none) and the legacy gamma store GETGAMMA reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrtcColor {
     pub crtc: u32,
@@ -474,6 +476,9 @@ pub struct CrtcColor {
     pub gamma_lut: u32,
     /// Intel's 129-entry pre-CSC LUT (absent on the AMD profile).
     pub degamma_lut: u32,
+    /// The DEGAMMA_LUT's entry count (4096 on DCN 3.0); 0 where the CRTC
+    /// publishes no DEGAMMA_LUT property at all.
+    pub degamma_size: u16,
     /// `drm_crtc::gamma_store`: `LEGACY_GAMMA_SIZE` red, then green, then
     /// blue entries, initialised to the identity ramp (`i << 8`).
     pub gamma_store: Vec<u16>,
@@ -486,6 +491,7 @@ impl CrtcColor {
             ctm: 0,
             gamma_lut: 0,
             degamma_lut: 0,
+            degamma_size: 0,
             gamma_store: ramp.clone().chain(ramp.clone()).chain(ramp).collect(),
         }
     }

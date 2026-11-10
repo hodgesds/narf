@@ -211,6 +211,45 @@ fn dcn_color_lut_linearity() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/dcn-color", dcn_color_lut_linearity);
 
+/// mod_color_calculate_degamma_params for a GAMMA_CUSTOM ramp on a
+/// linear base: the 9-region, 256-point GAMCOR PWL of a 4096-entry LUT,
+/// and nothing for any other size.
+fn dcn_color_degamma_pwl() -> TestResult {
+    let linear = lut(4096, 0, 0);
+    let Some(pwl) = degamma_pwl(&linear) else {
+        return TestResult::Fail("linear degamma refused");
+    };
+    if pwl.hw_points_num != 256
+        || pwl.red_reg.len() != 256
+        || pwl.green_reg.len() != 256
+        || pwl.blue_reg.len() != 256
+    {
+        return TestResult::Fail("degamma layout");
+    }
+    // A linear ramp through the linear curve stays the linear curve:
+    // non-decreasing, and every word inside LUT_DATA's 18 bits.
+    let words = [&pwl.red_reg, &pwl.green_reg, &pwl.blue_reg];
+    if words
+        .iter()
+        .any(|w| w.iter().any(|&x| x > 0x3ffff) || w.windows(2).any(|p| p[1] < p[0]))
+        || pwl.red_reg[0] == pwl.red_reg[255]
+    {
+        return TestResult::Fail("linear degamma curve");
+    }
+    // The quadratic ramp's degamma is non-decreasing too, and differs.
+    let Some(curved) = degamma_pwl(&lut(4096, 6, 0)) else {
+        return TestResult::Fail("curved degamma refused");
+    };
+    if curved.red_reg.windows(2).any(|p| p[1] < p[0]) || curved.red_reg == pwl.red_reg {
+        return TestResult::Fail("curved degamma curve");
+    }
+    if degamma_pwl(&lut(256, 0, 0)).is_some() || degamma_pwl(&lut(4096, 0, 0)[..1024]).is_some() {
+        return TestResult::Fail("degamma of another size accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn-color", dcn_color_degamma_pwl);
+
 /// Fixed31_32 corner cases, by Linux's definitions.
 fn dcn_color_fixpt_matches_linux() -> TestResult {
     let f = Fixed31_32::from_fraction;

@@ -1234,6 +1234,19 @@ pub fn bt709_degamma_pwl() -> Option<Box<Pwl>> {
     translate_curve_to_degamma_hw_format(&bt709_degamma_tf())
 }
 
+/// The GAMCOR PWL dcn30_set_input_transfer_func programs for a CRTC
+/// DEGAMMA_LUT: mod_color_calculate_degamma_params for a DISTRIBUTED_POINTS
+/// transfer function with tf LINEAR and a GAMMA_CUSTOM ramp (the linear
+/// curve, clamped, through the ramp: `linear_custom`), then
+/// translate_curve_to_degamma_hw_format. `None` for any other size
+/// (amdgpu_dm_verify_lut_sizes: exactly MAX_COLOR_LUT_ENTRIES).
+pub fn degamma_pwl(lut: &[DrmColorLut]) -> Option<Box<Pwl>> {
+    if lut.len() != MAX_COLOR_LUT_ENTRIES {
+        return None;
+    }
+    translate_curve_to_degamma_hw_format(&linear_custom(&dc_gamma(lut, false)))
+}
+
 /// A GAMMA_LUT's MPC OGAM curve, as amdgpu_dm and dcn401_set_output_transfer_func
 /// compute it: regamma_tf, then translate_curve_to_hw_format.
 pub fn regamma_pwl(lut: &[DrmColorLut]) -> Option<Box<Pwl>> {

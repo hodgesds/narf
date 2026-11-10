@@ -1831,6 +1831,47 @@ async fn update_hdmi_metadata(boot: &mut boot::ColdBoot) {
     }
 }
 
+/// Converge each lit CRTC's committed color onto its running stream: the
+/// display monitor programs what DRM asked for when it differs from what
+/// the pipe last programmed (a fresh light starts in bypass and converges
+/// here, within one monitor step). A newer request arriving during the
+/// await remains pending: the pipe records only the captured program, so
+/// the next pass converges the newer one. A failed program requests the
+/// usual bounded relight.
+async fn converge_crtc_color(boot: &mut boot::ColdBoot) {
+    use crate::amdgpu_dcn30_color::same_program;
+    use crate::amdgpu_navi22_kms::{KMS, MAX_CRTCS};
+    let updates: alloc::vec::Vec<_> = {
+        let kms = KMS.lock();
+        (0..MAX_CRTCS)
+            .filter_map(|d| {
+                let crtc = kms.crtc_at(d)?;
+                crtc.shown.as_ref()?;
+                let n = crtc.route?;
+                let c = kms.connectors.get(n)?;
+                (crtc.active && !c.color_relight).then_some((d, n, c.port, crtc.color.clone()))
+            })
+            .collect()
+    };
+    for (d, n, port, want) in updates {
+        let group_stream = GROUP_CRTCS.lock().iter().position(|&crtc| crtc == d);
+        if group_stream.is_none() && d != 0 {
+            continue;
+        }
+        if same_program(&boot.display_color(group_stream), &want) {
+            continue;
+        }
+        if boot.set_display_color(group_stream, want).await.is_err() {
+            let mut kms = KMS.lock();
+            if let Some(c) = kms.connectors.get_mut(n).filter(|c| c.port == port) {
+                c.color_relight = true;
+                kms.attempted = None;
+                kms.attempted_group = None;
+            }
+        }
+    }
+}
+
 /// Linux's long-pulse path (`handle_hpd_irq` → `dc_link_detect` → a
 /// zero-stream commit) and short-pulse path (`handle_hpd_rx_irq` →
 /// `dp_handle_link_loss`) for the single lit pipe, before KMS convergence.
@@ -2028,6 +2069,7 @@ async unsafe fn monitor_pass() {
     }
     update_hdmi_metadata(boot).await;
     converge_hdmi_vrr(boot).await;
+    converge_crtc_color(boot).await;
     converge_dp_vrr(boot).await;
     // The monitor pass is the per-VUPDATE BTR service on Navi22 (50 ms
     // steps): a missed VUPDATE only resets the BTR cycle, it never

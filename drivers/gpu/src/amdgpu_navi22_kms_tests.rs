@@ -964,3 +964,136 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22",
     navi22_kms_dp_connector_output_properties
 );
+
+/// DCN 3.0 publishes CTM, GAMMA_LUT and GAMMA_LUT_SIZE with a 4096-entry
+/// DEGAMMA_LUT (`drm_crtc_enable_color_mgmt(crtc, 4096, true, 4096)` in
+/// amdgpu_dm_crtc.c), the legacy 256-entry gamma included; committed blobs
+/// survive republication.
+fn navi22_kms_publishes_crtc_color_with_degamma() -> TestResult {
+    let mut card = Card::new("amdgpu", "DCN30 color fixture", (3, 60, 0));
+    let crtcs: [Option<crate::amdgpu_navi48_kms::Sink>; 2] = [None, None];
+    let connectors = [crate::amdgpu_navi48_kms::RoutedConnector {
+        index: 0,
+        kind: ConnectorType::HdmiA,
+        edid: None,
+        offered: &[],
+        crtc: None,
+        possible_crtcs: 1,
+    }];
+    apply_card(&mut card, &crtcs, &connectors);
+    if card.crtc_color.len() != 2 {
+        return TestResult::Fail("CRTC color count");
+    }
+    for (k, color) in card.crtc_color.iter().enumerate() {
+        if color.crtc != crate::amdgpu_navi48_kms::crtc_id(k)
+            || color.ctm != 0
+            || color.gamma_lut != 0
+            || color.degamma_lut != 0
+            || color.degamma_size != 4096
+            || color.gamma_store.len() != 3 * crate::drm::card::LEGACY_GAMMA_SIZE
+        {
+            return TestResult::Fail("CRTC color published");
+        }
+    }
+    // Committed blobs survive republication.
+    card.crtc_color[0].ctm = 7;
+    card.crtc_color[0].gamma_lut = 9;
+    card.crtc_color[0].degamma_lut = 11;
+    apply_card(&mut card, &crtcs, &connectors);
+    let kept = &card.crtc_color[0];
+    if kept.ctm != 7 || kept.gamma_lut != 9 || kept.degamma_lut != 11 || kept.degamma_size != 4096 {
+        return TestResult::Fail("committed color blobs lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_publishes_crtc_color_with_degamma
+);
+
+/// A CRTC color commit is stored as the DCN30 program for the monitor to
+/// converge; an identical commit changes nothing, and clearing every blob
+/// returns the CRTC to bypass.
+fn navi22_kms_crtc_color_request_is_recorded() -> TestResult {
+    use crate::amdgpu_native_kms::CrtcColorRequest;
+    let inverse4096: Vec<u8> = (0..4096)
+        .flat_map(|i| {
+            let v = (0xffff - i * 0xffff / 4095) as u16;
+            [v, v, v, 0].into_iter().flat_map(u16::to_le_bytes)
+        })
+        .collect();
+    let mut identity = [0u8; 72];
+    for k in [0, 4, 8] {
+        identity[k * 8..k * 8 + 8].copy_from_slice(&(1u64 << 32).to_le_bytes());
+    }
+    let request = CrtcColorRequest {
+        ctm: Some(identity.to_vec()),
+        gamma_lut: Some(inverse4096),
+        degamma_lut: None,
+    };
+    request_crtc_color(0, request.clone());
+    let stored = KMS.lock().crtc_at(0).and_then(|c| c.color.clone());
+    let Some(program) = stored else {
+        return TestResult::Fail("color request not stored");
+    };
+    if program.gamut.is_none() || program.ogam.is_none() || program.degamma.is_some() {
+        return TestResult::Fail("stored program");
+    }
+    // An identical commit changes nothing.
+    request_crtc_color(0, request);
+    if !KMS
+        .lock()
+        .crtc_at(0)
+        .is_some_and(|c| c.color.as_ref().is_some_and(|p| Arc::ptr_eq(p, &program)))
+    {
+        return TestResult::Fail("identical commit replaced the program");
+    }
+    // Clearing every blob returns the CRTC to bypass.
+    request_crtc_color(0, CrtcColorRequest::default());
+    if KMS.lock().crtc_at(0).is_some_and(|c| c.color.is_some()) {
+        return TestResult::Fail("cleared color still stored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_crtc_color_request_is_recorded
+);
+
+/// HDR on HDMI, end to end at the KMS layer: a new colorspace or HDR
+/// on/off relights the stream (a modeset), while new metadata alone goes
+/// to the running stream at once.
+fn navi22_kms_hdmi_hdr_metadata_is_live_but_colorspace_relights() -> TestResult {
+    use crate::amdgpu_hdr::{ColorFormat, DRM_MODE_COLORIMETRY_BT2020_RGB};
+    use crate::amdgpu_native_kms::ConnectorColorRequest;
+    let mut k = Kms::new();
+    k.reconcile(&reports(true, 1), admitted);
+    let hdmi = crate::amdgpu_navi48_kms::connector_id(3);
+    let before = k.connectors[3].output;
+    let mut color = ConnectorColorRequest {
+        connector: hdmi,
+        color_format: ColorFormat::Auto,
+        colorspace: DRM_MODE_COLORIMETRY_BT2020_RGB,
+        hdr_output_metadata: Some(vec![0; 32]),
+    };
+    if !k.set_color(&color) || !k.connectors[3].output.needs_modeset(before) {
+        return TestResult::Fail("BT2020 with HDR metadata must relight");
+    }
+    // New metadata alone, HDR staying on, is a live update.
+    let applied = k.connectors[3].output;
+    color.hdr_output_metadata.as_mut().unwrap()[26] = 1;
+    if !k.set_color(&color) || k.connectors[3].output.needs_modeset(applied) {
+        return TestResult::Fail("HDMI metadata-only update needs a modeset");
+    }
+    // Leaving HDR (metadata gone) is a modeset again.
+    let applied = k.connectors[3].output;
+    color.hdr_output_metadata = None;
+    if !k.set_color(&color) || !k.connectors[3].output.needs_modeset(applied) {
+        return TestResult::Fail("leaving HDR must relight");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22",
+    navi22_kms_hdmi_hdr_metadata_is_live_but_colorspace_relights
+);

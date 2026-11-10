@@ -16,12 +16,14 @@
 //! what the hardware shows; `amdgpu_navi22_platform`'s display monitor
 //! converges the hardware to it. All state changes here are short and
 //! synchronous: DRM ioctls never wait for the display owner.
+use crate::amdgpu_dcn30_color::ColorProgram;
 use crate::amdgpu_dcn30_hdmi::{Limits, OutputSettings};
 use crate::amdgpu_dml::Timing;
 use crate::amdgpu_navi22_display::{Connector as Port, Detection, Report, Signal};
 use crate::amdgpu_navi22_power_policy::DisplayAdmission;
 use crate::drm::card::{Card, ConnectorType};
 use crate::drm::ioctl::DrmModeModeInfo;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -85,6 +87,8 @@ pub struct CrtcState {
     /// DRM chose the route; automatic routing leaves it.
     pub explicit: bool,
     pub vrr_enabled: bool,
+    /// The CRTC color program DRM last committed (None: bypass).
+    pub color: Option<Arc<ColorProgram>>,
 }
 impl CrtcState {
     pub const fn new() -> Self {
@@ -95,6 +99,7 @@ impl CrtcState {
             route: None,
             explicit: false,
             vrr_enabled: false,
+            color: None,
         }
     }
 }
@@ -622,6 +627,22 @@ fn apply_card_vrr(
                 .unwrap_or_else(crate::amdgpu_navi48_boot::max_bpc),
         );
     }
+    // DCN 3.0 publishes CTM, GAMMA_LUT and GAMMA_LUT_SIZE with a
+    // 4096-entry DEGAMMA_LUT (`drm_crtc_enable_color_mgmt(crtc, 4096,
+    // true, 4096)`), the legacy 256-entry gamma included. Committed
+    // values survive republication.
+    let crtcs = &crtcs[..crtcs.len().min(crate::amdgpu_navi48_kms::crtc_count())];
+    card.crtc_color = (0..crtcs.len())
+        .map(|k| {
+            let id = crate::amdgpu_navi48_kms::crtc_id(k);
+            let mut color = card
+                .crtc_color(id)
+                .cloned()
+                .unwrap_or_else(|| crate::drm::card::CrtcColor::new(id));
+            color.degamma_size = 4096;
+            color
+        })
+        .collect();
     card.collect_blobs();
     card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
@@ -859,4 +880,44 @@ pub fn request_vrr_enabled(display: u8, enabled: bool) {
         c.vrr_enabled = enabled;
         true
     });
+}
+
+/// Record DRM's CRTC color commit for `display`: the committed blobs as
+/// the DCN30 program (None for bypass), for the display monitor to
+/// converge onto the running stream.
+pub fn request_crtc_color(display: u8, request: crate::amdgpu_native_kms::CrtcColorRequest) {
+    let program = color_program(&request).map(Arc::new);
+    requested(|kms| {
+        let Some(c) = kms.crtc_at_mut(usize::from(display)) else {
+            return false;
+        };
+        if crate::amdgpu_dcn30_color::same_program(&c.color, &program) {
+            return false;
+        }
+        c.color = program;
+        true
+    });
+}
+
+/// amdgpu_dm_update_crtc_color_mgmt and amdgpu_dm_update_plane_color_mgmt
+/// for a CRTC whose plane has no color of its own, on DCN 3.0:
+/// - a non-linear 4096-entry DEGAMMA_LUT is the plane's in_transfer_func
+///   (map_crtc_degamma_to_dc_plane's cm_has_degamma), a linear one like
+///   none bypasses the GAMCOR;
+/// - a 256-entry GAMMA_LUT is legacy gamma (__set_legacy_tf: sRGB-based
+///   regamma) whose input the PRE_DEGAM sRGB ROM linearizes
+///   (cm_is_degamma_srgb) when no explicit degamma replaces it;
+/// - a 4096-entry one that is not linear (__is_lut_linear) becomes the
+///   distributed-points regamma of amdgpu_dm_set_atomic_regamma; a linear
+///   one, like none, bypasses the OGAM;
+/// - a CTM is the stream's gamut remap (__drm_ctm_to_dc_matrix).
+///
+/// None when everything is bypass.
+fn color_program(request: &crate::amdgpu_native_kms::CrtcColorRequest) -> Option<ColorProgram> {
+    let program = ColorProgram::from_crtc(
+        request.ctm.as_deref(),
+        request.degamma_lut.as_deref(),
+        request.gamma_lut.as_deref(),
+    )?;
+    (program != ColorProgram::default()).then_some(program)
 }

@@ -855,6 +855,25 @@ impl Group {
             .update_hdmi_metadata(settings)
             .await
     }
+    /// Program one stream's CRTC color without retiring the context.
+    pub async fn set_color(
+        &mut self,
+        stream: usize,
+        program: Option<alloc::sync::Arc<crate::amdgpu_dcn30_color::ColorProgram>>,
+    ) -> Result<(), Error> {
+        self.members
+            .get_mut(stream)
+            .ok_or(Error::Invalid)?
+            .set_color(program)
+            .await
+    }
+    /// The CRTC color program one stream last programmed.
+    pub fn color(
+        &self,
+        stream: usize,
+    ) -> Option<alloc::sync::Arc<crate::amdgpu_dcn30_color::ColorProgram>> {
+        self.members.get(stream).and_then(|m| m.color())
+    }
     /// # Safety
     /// As [`Pipeline::new`], for the whole display engine; `requests` name
     /// distinct sinks on the board's connectors.

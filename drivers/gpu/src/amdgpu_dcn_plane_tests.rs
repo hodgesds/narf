@@ -1,5 +1,6 @@
 use super::*;
 use alloc::{vec, vec::Vec};
+use core::future::Future;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 struct Fake {
@@ -688,3 +689,322 @@ fn plane_mpc_blend_modes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dcn-plane", plane_mpc_blend_modes);
+
+// ── DCN30 CRTC color ──────────────────────────────────────────────────
+
+/// The OGAM block of MPCC `p`, the GAMCOR block of DPP `p`.
+fn ogam(p: u8, r: u64) -> u64 {
+    r + u64::from(p) * OGAM_STRIDE
+}
+fn gamcor(p: u8, r: u64) -> u64 {
+    r + u64::from(p) * DPP_STRIDE
+}
+/// Every write `e` made at `at`, in order.
+fn writes_at(e: &Block<Fake>, at: u64) -> Vec<u32> {
+    e.io.writes
+        .iter()
+        .filter(|&&(a, _)| a == at)
+        .map(|&(_, v)| v)
+        .collect()
+}
+/// The written position of the first write to `at`.
+fn first(e: &Block<Fake>, at: u64) -> Option<usize> {
+    e.io.writes.iter().position(|&(a, _)| a == at)
+}
+fn run<T>(f: impl Future<Output = T>) -> T {
+    narf_scheduler::block_on_spin(f)
+}
+
+/// A PWL whose words name their own register so misplaced writes show.
+fn color_pwl(equal: bool, n: usize) -> OgamProgram {
+    let lut = |c: u32| -> Vec<u32> {
+        (0..n as u32)
+            .map(|i| i << 4 | if equal { 0 } else { c })
+            .collect()
+    };
+    OgamProgram {
+        start: [0x1_0001, 0x1_0002, 0x1_0003],
+        start_slope: [0x2_0001, 0x2_0002, 0x2_0003],
+        end_base: [0x3_0001, 0x3_0002, 0x3_0003],
+        end: [0x4_0001, 0x4_0002, 0x4_0003],
+        regions: core::array::from_fn(|i| 0x5_0000 | i as u32),
+        lut: [lut(1), lut(2), lut(3)],
+    }
+}
+
+/// mpc3_set_output_gamma: RAM A from bypass, B while A is current, A while
+/// B is current; the bank's own registers in cm_helper_program_gamcor_xfer_func
+/// order, then the LUT and finally SELECT.
+fn plane_dcn30_ogam_ping_pongs_banks_like_mpc3() -> TestResult {
+    for p in 0..4u8 {
+        let program = color_pwl(true, 195);
+        for (current, next, ram) in [
+            (0u32, 0u32, 0x0104u64),
+            (2 << 7, 1, 0x0127),
+            (2 << 7 | 1 << 9, 0, 0x0104),
+            (1 << 7 | 1 << 9, 0, 0x0104), // ROM/other mode: not RAM, so A
+        ] {
+            let mut mpc = block(p, 0x0680);
+            mpc.profile = Profile::Navi22;
+            mpc.io.values[ogam(p, MPCC_OGAM_CONTROL) as usize] = current;
+            let Ok(Some(bank)) = run(mpc.mpc_program_ogam(Some(&program))) else {
+                return TestResult::Fail("ogam programming");
+            };
+            if u32::from(bank) != next {
+                return TestResult::Fail("bank choice");
+            }
+            // MODE = RAM, then the next bank's selection at the end.
+            let control = writes_at(&mpc, ogam(p, MPCC_OGAM_CONTROL));
+            if control.first().map(|v| v & 0xf) != Some(2)
+                || control.last().map(|v| v & 0xf) != Some(2 | next << 2)
+            {
+                return TestResult::Fail("OGAM_CONTROL");
+            }
+            // mpc3_power_on_ogam_lut, then all channels to the host bank.
+            if mpc.io.values[(MPCC_MEM_PWR_CTRL + u64::from(p) * MPCC_STRIDE) as usize] & 4 == 0
+                || writes_at(&mpc, ogam(p, OGAM_LUT_CONTROL))
+                    .first()
+                    .map(|v| v & 0x47)
+                    != Some(7 | next << 6)
+            {
+                return TestResult::Fail("LUT power/host select");
+            }
+            let order: Vec<u64> = (0..3)
+                .chain(3..6)
+                .chain([9, 0xb, 0xd])
+                .chain([0xa, 0xc, 0xe])
+                .chain(0x12..0x23)
+                .map(|r| ram + r)
+                .collect();
+            let mut at = 0;
+            for (i, &r) in order.iter().enumerate() {
+                let want = match i {
+                    0..=2 => program.start[i],
+                    3..=5 => program.start_slope[i - 3],
+                    6..=8 => program.end_base[i - 6],
+                    9..=11 => program.end[i - 9],
+                    _ => program.regions[i - 12],
+                };
+                let Some(pos) = first(&mpc, ogam(p, r)) else {
+                    return TestResult::Fail("bank register missing");
+                };
+                if pos < at || writes_at(&mpc, ogam(p, r)) != [want] {
+                    return TestResult::Fail("bank register order/value");
+                }
+                at = pos;
+            }
+            // The other bank is untouched.
+            let other = if ram == 0x0104 { 0x0127 } else { 0x0104 };
+            if (other..other + 0x23).any(|r| first(&mpc, ogam(p, r)).is_some()) {
+                return TestResult::Fail("other bank written");
+            }
+            // Equal channels: one pass of hw_points_num words.
+            if writes_at(&mpc, ogam(p, OGAM_LUT_DATA)) != program.lut[0] {
+                return TestResult::Fail("LUT data");
+            }
+            if first(&mpc, ogam(p, OGAM_LUT_DATA)) < Some(at) {
+                return TestResult::Fail("LUT before the bank registers");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_dcn30_ogam_ping_pongs_banks_like_mpc3
+);
+
+/// mpc3_program_ogam_pwl with differing channels: red, green, blue under
+/// write masks 4, 2, 1, the index reset before green and blue.
+fn plane_dcn30_ogam_writes_channels_separately() -> TestResult {
+    let program = color_pwl(false, 195);
+    let mut mpc = block(2, 0x0680);
+    mpc.profile = Profile::Navi22;
+    if run(mpc.mpc_program_ogam(Some(&program))) != Ok(Some(0)) {
+        return TestResult::Fail("program");
+    }
+    let (data, index, control) = (
+        ogam(2, OGAM_LUT_DATA),
+        ogam(2, OGAM_LUT_INDEX),
+        ogam(2, OGAM_LUT_CONTROL),
+    );
+    let mut events = Vec::new();
+    for &(at, v) in &mpc.io.writes {
+        if at == control {
+            events.push(("mask", v & 7));
+        } else if at == index {
+            events.push(("index", v));
+        }
+    }
+    if events
+        != [
+            ("mask", 7),
+            ("index", 0),
+            ("mask", 4),
+            ("index", 0),
+            ("mask", 2),
+            ("index", 0),
+            ("mask", 1),
+        ]
+    {
+        return TestResult::Fail("mask/index sequence");
+    }
+    let words = writes_at(&mpc, data);
+    let n = program.lut[0].len();
+    if words.len() != 3 * n
+        || words[..n] != program.lut[0][..]
+        || words[n..2 * n] != program.lut[1][..]
+        || words[2 * n..] != program.lut[2][..]
+    {
+        return TestResult::Fail("per-channel data");
+    }
+    // Each channel's words follow its own mask write.
+    let masks: Vec<usize> = mpc
+        .io
+        .writes
+        .iter()
+        .enumerate()
+        .filter(|(_, &(at, _))| at == control)
+        .map(|(i, _)| i)
+        .collect();
+    let first_word = |c: usize| {
+        mpc.io
+            .writes
+            .iter()
+            .position(|&w| w == (data, program.lut[c][0]))
+            .unwrap_or(0)
+    };
+    if masks.len() != 4 || (0..3).any(|c| first_word(c) < masks[c + 1]) {
+        return TestResult::Fail("channel before its mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_dcn30_ogam_writes_channels_separately
+);
+
+/// mpc3_set_gamut_remap: set A unless A is current; coefficients, mode,
+/// then format; bypass is mode 0.
+fn plane_dcn30_gamut_remap_alternates_sets() -> TestResult {
+    let gamut = GamutProgram {
+        coef: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+        s3_12: true,
+    };
+    for (current, set, base) in [
+        (0u32, 1u8, 0x014cu64),
+        (1 << 7, 2, 0x0152),
+        (2 << 7, 1, 0x014c),
+    ] {
+        let mut mpc = block(1, 0x0680);
+        mpc.profile = Profile::Navi22;
+        mpc.io.values[ogam(1, MPCC_GAMUT_REMAP_MODE) as usize] = current;
+        if mpc.mpc_program_gamut(Some(&gamut)) != Ok(Some((set, true))) {
+            return TestResult::Fail("gamut set");
+        }
+        for (i, &c) in gamut.coef.iter().enumerate() {
+            if writes_at(&mpc, ogam(1, base + i as u64)) != [c] {
+                return TestResult::Fail("coefficients");
+            }
+        }
+        let other = if base == 0x014c { 0x0152 } else { 0x014c };
+        if (other..other + 6).any(|r| first(&mpc, ogam(1, r)).is_some()) {
+            return TestResult::Fail("other set written");
+        }
+        if mpc.io.values[ogam(1, MPCC_GAMUT_REMAP_MODE) as usize] & 3 != u32::from(set)
+            || mpc.io.values[ogam(1, GAMUT_COEF_FORMAT) as usize] & 1 != 1
+            || first(&mpc, ogam(1, MPCC_GAMUT_REMAP_MODE)) > first(&mpc, ogam(1, GAMUT_COEF_FORMAT))
+            || first(&mpc, ogam(1, base)) > first(&mpc, ogam(1, MPCC_GAMUT_REMAP_MODE))
+        {
+            return TestResult::Fail("mode/format order");
+        }
+    }
+    let mut mpc = block(3, 0x0680);
+    mpc.profile = Profile::Navi22;
+    mpc.io.values[ogam(3, MPCC_GAMUT_REMAP_MODE) as usize] = 1 | 1 << 7;
+    if mpc.mpc_program_gamut(None) != Ok(None)
+        || mpc.io.values[ogam(3, MPCC_GAMUT_REMAP_MODE) as usize] & 3 != 0
+    {
+        return TestResult::Fail("bypass");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_dcn30_gamut_remap_alternates_sets
+);
+
+/// dpp3_set_pre_degam's sRGB ROM under legacy gamma (mode 1, select 0) or
+/// bypass, the GAMCOR bypassed; a DEGAMMA_LUT bypasses the ROM and selects
+/// the GAMCOR RAM it was loaded into (B from bypass, A while B is
+/// current), its words written once more at the end; CM enabled throughout.
+fn plane_dcn30_input_tf_programs_the_gamcor() -> TestResult {
+    for (pre_degam, degamma, word, mode, bank) in [
+        (PreDegam::Srgb, None, 1, 0, None),
+        (PreDegam::Bypass, None, 0, 0, None),
+    ] {
+        let mut dpp = block(0, DPP_LAST_REG);
+        dpp.profile = Profile::Navi22;
+        dpp.io.values[gamcor(0, PRE_DEGAM) as usize] = 0x52;
+        dpp.io.values[gamcor(0, GAMCOR_CONTROL) as usize] = 0xa;
+        dpp.io.values[gamcor(0, CM_CONTROL) as usize] = 1;
+        if dpp.dpp_program_input_tf(pre_degam, degamma) != Ok(bank)
+            || dpp.io.values[gamcor(0, PRE_DEGAM) as usize] & 0x73 != word
+            || dpp.io.values[gamcor(0, GAMCOR_CONTROL) as usize] & 0xf != mode
+            || dpp.io.values[gamcor(0, CM_CONTROL) as usize] & 1 != 0
+        {
+            return TestResult::Fail("input transfer function");
+        }
+    }
+    // A DEGAMMA_LUT: the 9-region PWL into the GAMCOR RAM not in use, its
+    // 256 words plus the last one again, then that bank selected.
+    for (current, next, ram) in [(0u32, 1u8, 0x0d64u64), (2 << 4 | 1 << 6, 0, 0x0d41)] {
+        let program = color_pwl(true, 256);
+        let mut dpp = block(0, DPP_LAST_REG);
+        dpp.profile = Profile::Navi22;
+        dpp.io.values[gamcor(0, GAMCOR_CONTROL) as usize] = current;
+        if dpp.dpp_program_input_tf(PreDegam::Bypass, Some(&program)) != Ok(Some(next)) {
+            return TestResult::Fail("gamcor programming");
+        }
+        if dpp.io.values[gamcor(0, PRE_DEGAM) as usize] & 0x73 != 0
+            || dpp.io.values[gamcor(0, CM_CONTROL) as usize] & 1 != 0
+            || dpp.io.values[gamcor(0, CM_MEM_PWR_CTRL) as usize] & 7 != 0
+        {
+            return TestResult::Fail("gamcor pre_degam/cm/power");
+        }
+        let control = writes_at(&dpp, gamcor(0, GAMCOR_CONTROL));
+        if control.first().map(|v| v & 0xf) != Some(2)
+            || control.last().map(|v| v & 0xf) != Some(2 | u32::from(next) << 2)
+        {
+            return TestResult::Fail("GAMCOR_CONTROL");
+        }
+        let mut want: Vec<u32> = program.lut[0].clone();
+        want.push(*program.lut[0].last().unwrap());
+        if writes_at(&dpp, gamcor(0, GAMCOR_LUT_DATA)) != want {
+            return TestResult::Fail("GAMCOR LUT data");
+        }
+        let other = if ram == 0x0d41 { 0x0d64 } else { 0x0d41 };
+        if (other..other + 0x23).any(|r| first(&dpp, gamcor(0, r)).is_some()) {
+            return TestResult::Fail("other GAMCOR bank written");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_dcn30_input_tf_programs_the_gamcor
+);
+
+/// The color blocks are DCN3.0's: DCN3.1.4 refuses them.
+fn plane_dcn30_color_is_dcn30_only() -> TestResult {
+    let mut dpp = block(0, DPP_LAST_REG);
+    let mut mpc = block(0, 0x0680);
+    if dpp.dpp_program_input_tf(PreDegam::Srgb, None) != Err(Error::Unsupported)
+        || mpc.mpc_program_gamut(None) != Err(Error::Unsupported)
+        || run(mpc.mpc_program_ogam(None)) != Err(Error::Unsupported)
+    {
+        return TestResult::Fail("DCN3.1.4 color accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn-plane", plane_dcn30_color_is_dcn30_only);
