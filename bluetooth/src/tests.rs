@@ -4622,6 +4622,9 @@ fn smoke_btusb_quirks_identification() -> TestResult {
     if identify(0x10ab, 0x9309) != Some(Quirk::QualcommWcn6855) {
         return TestResult::Fail("USI WCN6855 (10ab:9309) not matched");
     }
+    if identify(0x0e8d, 0x0616) != Some(Quirk::MediaTek) {
+        return TestResult::Fail("MediaTek MT7922 USB alias skipped firmware setup");
+    }
     if identify(0x0e8d, 0x7922) != Some(Quirk::MediaTek) {
         return TestResult::Fail("MediaTek MT7922 not matched");
     }

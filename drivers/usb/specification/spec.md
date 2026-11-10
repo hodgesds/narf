@@ -843,7 +843,14 @@ also consult upstream Linux GPL sources.
   0xFC09 → Intel Reset boot 0xFC01 → best-effort `.ddc` over 0xFC8B), and
   for MediaTek-quirk IDs the btmtk 79xx WMT RAM-code download (WMT
   PATCH_DWNLD over 0xFC6F, section-map probe + ≤250-byte flagged chunks,
-  status from the 0xE4 WMT event); for Realtek-quirk IDs the btrtl
+  status from the 0xE4 WMT event). USB alias `0e8d:0616` enters the
+  MediaTek path; setup verifies the chip register and selects the exact ROM
+  revision/flavor firmware name before download. WMT length counts the flag
+  plus data, raw patch flags 0/1/2 mean undone/progress/done, and events are
+  polled through vendor EP0 request IN 1/value48 with the Linux 500us gap for
+  empty replies. After download, endpoint reset options and WMT FUNC_CTRL
+  protocol enable must succeed before generic HCI Reset. Transfers retain
+  the original xHCI slot generation. For Realtek-quirk IDs the btrtl
   sequence (ROM version over 0xFC6D → security key id over 0xFC61 →
   epatch v1/v2 parse with the patch selected by ROM version + 1 and
   the file's project id verified against the product id's chip
@@ -1064,7 +1071,7 @@ also consult upstream Linux GPL sources.
 | `138a:0011` | Validity VFS5011 fingerprint reader | Explicit Validity match (single authority table, #918), vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Validity enrol/match protocol; silicon validation on a VFS5011-fitted machine |
 | `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, full mandatory HCI bring-up, ready-controller registration, and `hci<N>` sysfs publication | Production-sign the imported firmware and validate the full sequence on silicon |
 | `8087:0032` | Intel AX210 Bluetooth (Renoir target) | Explicit Intel quirk match, version-TLV + boot-params read, `.sfi` secure-send download + Intel Reset boot + `.ddc` config, full mandatory HCI bring-up, ready-controller registration, `hci<N>` sysfs publication, HCI pump | Stage the `intel/ibt-*` blobs and validate the full sequence on silicon |
-| `0e8d:7922` | MediaTek MT7922 Bluetooth (Phoenix target) | Explicit MediaTek quirk match, WMT 79xx RAM-code download (section probe + flagged chunks), full mandatory HCI bring-up, ready-controller registration, `hci<N>` sysfs publication, HCI pump | Stage the `mediatek/BT_RAM_CODE_MT7922_*` blob and validate the full sequence on silicon |
+| `0e8d:0616`, `0e8d:7922` | MediaTek MT7922 Bluetooth (Phoenix target) | Explicit MediaTek quirk match, WMT 79xx RAM-code download (section probe + flagged chunks), full mandatory HCI bring-up, ready-controller registration, `hci<N>` sysfs publication, HCI pump | Stage the `mediatek/BT_RAM_CODE_MT7922_*` blob and validate the full sequence on silicon |
 | `30c9:00cd` | Luxvisions integrated camera | Generic UVC bind, `/dev/video<N>` registration, PROBE/COMMIT negotiation, streaming-alternate selection, USB 2.0 high-bandwidth xHCI programming, and frame delivery | Validate negotiation and end-to-end isochronous video capture on silicon |
 
 The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by
