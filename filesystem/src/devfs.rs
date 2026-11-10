@@ -712,7 +712,11 @@ static DRI_DIR: IrqSafeSpinLock<Option<Arc<dyn DirOps>>> = IrqSafeSpinLock::new(
 ///
 /// Linux ref: `drm_dev_register` (drivers/gpu/drm/drm_drv.c).
 pub fn register_dri_dir(dir: Arc<dyn DirOps>) {
-    *DRI_DIR.lock() = Some(dir);
+    // udev manages `/dev/dri/by-path` itself; see `devfs/delegate.rs`.
+    *DRI_DIR.lock() = Some(Arc::new(delegate::DelegateDir {
+        inner: dir,
+        overlay: &delegate::DRI_DYNAMIC,
+    }));
 }
 
 // ── /dev/snd/ delegate ────────────────────────────────────────────────
@@ -728,7 +732,11 @@ static SND_DIR: IrqSafeSpinLock<Option<Arc<dyn DirOps>>> = IrqSafeSpinLock::new(
 /// Called once from `narf_drivers_sound::sound_fs_initcall()` after the
 /// first card is probed.  Idempotent.
 pub fn register_snd_dir(dir: Arc<dyn DirOps>) {
-    *SND_DIR.lock() = Some(dir);
+    // udev manages `/dev/snd/by-path` itself; see `devfs/delegate.rs`.
+    *SND_DIR.lock() = Some(Arc::new(delegate::DelegateDir {
+        inner: dir,
+        overlay: &delegate::SND_DYNAMIC,
+    }));
 }
 
 /// `/dev/fb0` — proxy to the installed FB FileOps.
@@ -2061,6 +2069,7 @@ impl DirOps for DynamicDirectory {
 
 // A static node has one descriptor for lookup, visibility, type and readdir.
 // Device-family extensions live in the provider registry.
+mod delegate;
 mod entries;
 
 fn static_entry_type(name: &str) -> Option<FileType> {
