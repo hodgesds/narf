@@ -484,6 +484,546 @@ fn smoke_rtw89_8922a_macid_pool() -> TestResult {
     TestResult::Pass
 }
 
+const MLD_ADDR: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+fn link1_req() -> Request<'static> {
+    Request {
+        peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBC],
+        band: Band::Ghz2,
+        width_mhz: 40,
+        primary: 6,
+        nss: 2,
+        aid: 7,
+        port: 0,
+        ap_mode: false,
+        station_mode: true,
+        eht_support: true,
+        punctured: 0,
+        peer_ies: &[],
+        has_he: true,
+        mgq_rpt_en: false,
+        p2p: false,
+        // 2.4 GHz link: no 6 GHz admission (production refuses
+        // `Some` on non-6 GHz bands with `SixGhzContextUnexpected`).
+        six_ghz: None,
+    }
+}
+
+fn two_links() -> [LinkRequest<'static>; 2] {
+    [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 1,
+            req: link1_req(),
+        },
+    ]
+}
+
+fn smoke_rtw89_8922a_mld_admit_two_links() -> TestResult {
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    let mut pool = MacIdPool::new();
+    let links = two_links();
+    let mld = match admit_mld(&f, facet, &mut pool, MLD_ADDR, &links) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("valid two-link MLD admission refused"),
+    };
+    if mld.mld_addr != MLD_ADDR
+        || mld.base_macid != 0
+        || mld.aid != 7
+        || mld.port != 0
+        || mld.link_count() != 2
+        || mld.is_empty()
+    {
+        return TestResult::Fail("MLD station record mismatch");
+    }
+    // Strided per-link MACIDs: link 0 -> base 0, link 1 -> base + 16.
+    let l0 = match mld.link(0) {
+        Some(v) => v,
+        None => return TestResult::Fail("link 0 missing"),
+    };
+    let l1 = match mld.link(1) {
+        Some(v) => v,
+        None => return TestResult::Fail("link 1 missing"),
+    };
+    if l0.macid() != 0
+        || l0.mac_idx() != 0
+        || l0.index != 0
+        || l1.macid() != 16
+        || l1.mac_idx() != 1
+        || l1.index != 1
+    {
+        return TestResult::Fail("per-link MACID/index mismatch");
+    }
+    if !pool.is_used(0) || !pool.is_used(16) || pool.is_used(1) || pool.is_used(17) {
+        return TestResult::Fail("MLD pool reservation mismatch");
+    }
+    // Designated link is the first added (link 0).
+    if mld.designated_link().map(|link| link.link_id) != Some(0) {
+        return TestResult::Fail("designated link must be link 0");
+    }
+    // Per-link CCTL composition: link 0's tables are the
+    // single-link golden (macid 0, 5 GHz OFDM6); link 1's
+    // differ exactly where the link differs — c0 carries
+    // macid 16, w1 carries the 2.4 GHz CCK1 lowest rate
+    // (value 0), while the shared AID-7 + station-mode w6
+    // and the HE BSR w8 agree.
+    if l0.station.default_cctl != super::cctl_g7::build_default(0, false).unwrap()
+        || l0.station.assoc_cctl.c0 != 0x80
+        || l0.station.assoc_cctl.w[1] != 0x4000_0000
+    {
+        return TestResult::Fail("link 0 CCTL mismatch");
+    }
+    if l1.station.default_cctl != super::cctl_g7::build_default(16, false).unwrap() {
+        return TestResult::Fail("link 1 default CCTL mismatch");
+    }
+    let a1 = &l1.station.assoc_cctl;
+    if a1.c0 != 0x90
+        || a1.w[0] != 0x0600_0000
+        || a1.w[1] != 0
+        || a1.m[1] != 0xF000_0000
+        || a1.w[4] != 0xFFFF_0000
+        || a1.m[4] != 0xFFFF_0007
+        || a1.w[6] != 0x8000_0007
+        || a1.m[6] != 0x8000_0FFF
+        || a1.w[8] != 2
+        || a1.m[8] != 2
+    {
+        return TestResult::Fail("link 1 assoc CCTL golden mismatch");
+    }
+    // Facet TXWD EHT fields are per link and agree (zero
+    // overrides off on both).
+    if mld.txwd_info_eht(0) != Some((0, 0)) || mld.txwd_info_eht(1) != Some((0, 0)) {
+        return TestResult::Fail("per-link TXWD EHT fields mismatch");
+    }
+    if mld.txwd_info_eht(9).is_some() {
+        return TestResult::Fail("unknown link must have no TXWD fields");
+    }
+    // A one-link MLD admits too (single negotiated link):
+    // base 0, one link, still an MLD (BA-CAM MLD_EN set).
+    let mut pool1 = MacIdPool::new();
+    let one = [LinkRequest {
+        link_id: 0,
+        req: base_req(),
+    }];
+    let mut single = match admit_mld(&f, facet, &mut pool1, MLD_ADDR, &one) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("one-link MLD admission refused"),
+    };
+    if single.link_count() != 1 || single.base_macid != 0 {
+        return TestResult::Fail("one-link MLD record mismatch");
+    }
+    let idx = match single.acquire_bacam(0) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("one-link BA-CAM acquire failed"),
+    };
+    let h2c = match single.ba_h2c(0, 0, 0, idx as u32) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("one-link BA-CAM H2C failed"),
+    };
+    if h2c.w0 != 0x3 || h2c.w1 != 0x0800_0500 {
+        return TestResult::Fail("one-link BA-CAM H2C golden mismatch");
+    }
+    // Tear the fixtures down through the MLD path and check
+    // the pool is fully reusable afterwards.
+    mld.release_all(&mut pool);
+    if pool.is_used(0) || pool.is_used(16) {
+        return TestResult::Fail("MLD release_all leaked MACIDs");
+    }
+    single.release_all(&mut pool1);
+    if pool1.is_used(0) || pool1.is_used(16) {
+        return TestResult::Fail("one-link release_all leaked MACIDs");
+    }
+    TestResult::Pass
+}
+
+fn smoke_rtw89_8922a_mld_ba_cam() -> TestResult {
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    let mut pool = MacIdPool::new();
+    let links = two_links();
+    let mut mld = match admit_mld(&f, facet, &mut pool, MLD_ADDR, &links) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("valid two-link MLD admission refused"),
+    };
+    // Designated link 0 (macid 0, mac_idx 0): MLD_EN set,
+    // BAND_SEL clear, entry index = bitmap 0 + 8 dynamic.
+    let idx = match mld.acquire_bacam(0) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("designated BA-CAM acquire failed"),
+    };
+    if idx != 0 {
+        return TestResult::Fail("designated BA-CAM first slot must be 0");
+    }
+    let h2c = match mld.ba_h2c(0, 0, 0, idx as u32) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("designated BA-CAM H2C failed"),
+    };
+    if h2c.w0 != 0x3 || h2c.w1 != 0x0800_0500 {
+        return TestResult::Fail("MLD BA-CAM H2C golden mismatch");
+    }
+    match mld.release_bacam(idx) {
+        Ok(_) => {}
+        Err(_) => return TestResult::Fail("designated BA-CAM release failed"),
+    };
+    // Remove the designated link: link 1 (macid 16,
+    // mac_idx 1) becomes designated, so the next H2C
+    // carries its MACID and BAND_SEL set.
+    let removed = match mld.remove_link(&mut pool, 0) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("designated link removal failed"),
+    };
+    if removed.macid() != 0 || mld.designated_link().map(|link| link.link_id) != Some(1) {
+        return TestResult::Fail("designated link must move to link 1");
+    }
+    let idx = match mld.acquire_bacam(0) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("link 1 BA-CAM acquire failed"),
+    };
+    let h2c = match mld.ba_h2c(0, 0, 0, idx as u32) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("link 1 BA-CAM H2C failed"),
+    };
+    if h2c.w0 != 0x1003 || h2c.w1 != 0x0800_0700 {
+        return TestResult::Fail("link 1 BA-CAM H2C golden mismatch");
+    }
+    match mld.release_bacam(idx) {
+        Ok(_) => {}
+        Err(_) => return TestResult::Fail("link 1 BA-CAM release failed"),
+    };
+    mld.release_all(&mut pool);
+    TestResult::Pass
+}
+
+fn smoke_rtw89_8922a_mld_teardown_and_fallback() -> TestResult {
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    let mut pool = MacIdPool::new();
+    let links = two_links();
+    let mut mld = match admit_mld(&f, facet, &mut pool, MLD_ADDR, &links) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("valid two-link MLD admission refused"),
+    };
+    // Adding a third link to a full MLD is refused; removing
+    // an unknown link is refused; neither disturbs the MLD.
+    let third = LinkRequest {
+        link_id: 2,
+        req: Request {
+            peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBD],
+            band: Band::Ghz5,
+            width_mhz: 80,
+            primary: 44,
+            ..base_req()
+        },
+    };
+    if mld.add_link(&f, facet, &third) != Err(Error::TooManyLinks) {
+        return TestResult::Fail("full MLD must refuse a third link");
+    }
+    if mld.remove_link(&mut pool, 9) != Err(Error::LinkNotFound) {
+        return TestResult::Fail("unknown link removal must refuse");
+    }
+    if mld.link_count() != 2 {
+        return TestResult::Fail("refused add/remove disturbed the MLD");
+    }
+    // Per-link teardown: drop link 1, the MLD survives on
+    // link 0 (single-link operation of the MLD).
+    let removed = match mld.remove_link(&mut pool, 1) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("link 1 removal failed"),
+    };
+    if removed.macid() != 16
+        || mld.link_count() != 1
+        || mld.designated_link().map(|link| link.link_id) != Some(0)
+        || !pool.is_used(0)
+        || pool.is_used(16)
+    {
+        return TestResult::Fail("link 1 teardown state mismatch");
+    }
+    // Re-add link 1 on a new channel: it retakes instance
+    // index 1 and MACID 16 (lowest free instance slot).
+    let rejoin = LinkRequest {
+        link_id: 1,
+        req: Request {
+            peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBC],
+            band: Band::Ghz5,
+            width_mhz: 80,
+            primary: 44,
+            ..base_req()
+        },
+    };
+    let macid = match mld.add_link(&f, facet, &rejoin) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("link 1 re-add failed"),
+    };
+    if macid != 16 || mld.link_count() != 2 || !pool.is_used(16) {
+        return TestResult::Fail("link 1 re-add state mismatch");
+    }
+    // Drop link 0: link 1 becomes designated. Drop link 1:
+    // the MLD is empty and the pool is fully free.
+    match mld.remove_link(&mut pool, 0) {
+        Ok(_) => {}
+        Err(_) => return TestResult::Fail("link 0 removal failed"),
+    };
+    if mld.designated_link().map(|link| link.link_id) != Some(1) || pool.is_used(0) {
+        return TestResult::Fail("link 0 teardown state mismatch");
+    }
+    match mld.remove_link(&mut pool, 1) {
+        Ok(_) => {}
+        Err(_) => return TestResult::Fail("final link removal failed"),
+    };
+    if !mld.is_empty() || pool.is_used(0) || pool.is_used(16) {
+        return TestResult::Fail("empty MLD state mismatch");
+    }
+    // Single-link fallback: the plain single-link path
+    // reuses the freed pool (MACID 0) exactly as before.
+    let st = match admit(&f, facet, &mut pool, &base_req()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("single-link fallback admission refused"),
+    };
+    if st.macid != 0 {
+        return TestResult::Fail("single-link fallback must reuse MACID 0");
+    }
+    st.release_macid(&mut pool);
+    TestResult::Pass
+}
+
+fn smoke_rtw89_8922a_mld_refusals() -> TestResult {
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    let mut pool = MacIdPool::new();
+    let links = two_links();
+    // Zero links, three links, bad link ID.
+    if admit_mld(&f, facet, &mut pool, MLD_ADDR, &[]) != Err(Error::NoLinks) {
+        return TestResult::Fail("zero-link MLD must refuse");
+    }
+    let three = [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 1,
+            req: link1_req(),
+        },
+        LinkRequest {
+            link_id: 2,
+            req: Request {
+                peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBD],
+                band: Band::Ghz5,
+                width_mhz: 80,
+                primary: 44,
+                ..base_req()
+            },
+        },
+    ];
+    if admit_mld(&f, facet, &mut pool, MLD_ADDR, &three) != Err(Error::TooManyLinks) {
+        return TestResult::Fail("three-link MLD must refuse");
+    }
+    let bad_id = [LinkRequest {
+        link_id: 15,
+        req: base_req(),
+    }];
+    if admit_mld(&f, facet, &mut pool, MLD_ADDR, &bad_id) != Err(Error::LinkIdOutOfRange) {
+        return TestResult::Fail("link ID 15 must refuse");
+    }
+    // Cross-link refusals, one per case.
+    let dup_id = [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 0,
+            req: link1_req(),
+        },
+    ];
+    let dup_addr = [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 1,
+            req: Request {
+                peer: base_req().peer,
+                ..link1_req()
+            },
+        },
+    ];
+    let dup_chan = [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 1,
+            req: Request {
+                peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBC],
+                band: Band::Ghz5,
+                width_mhz: 80,
+                primary: 36,
+                ..base_req()
+            },
+        },
+    ];
+    let aid_mismatch = [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 1,
+            req: Request {
+                aid: 8,
+                ..link1_req()
+            },
+        },
+    ];
+    let port_mismatch = [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 1,
+            req: Request {
+                port: 1,
+                ..link1_req()
+            },
+        },
+    ];
+    let six_ghz = [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 1,
+            req: Request {
+                band: Band::Ghz6,
+                primary: 5,
+                ..link1_req()
+            },
+        },
+    ];
+    let cases: [(&[LinkRequest], Error); 6] = [
+        (&dup_id, Error::DuplicateLinkId),
+        (&dup_addr, Error::DuplicateLinkAddr),
+        (&dup_chan, Error::DuplicateChannel),
+        (&aid_mismatch, Error::AidMismatch),
+        (&port_mismatch, Error::PortMismatch),
+        (&six_ghz, Error::SixGhzPowerMissing),
+    ];
+    for (case, want) in cases.iter() {
+        match admit_mld(&f, facet, &mut pool, MLD_ADDR, case) {
+            Err(got) if got == *want => {}
+            _ => return TestResult::Fail("MLD refusal case mismatch"),
+        }
+    }
+    // Refusals must not consume MACIDs.
+    let next = match pool.alloc() {
+        Ok(next) => next,
+        Err(_) => return TestResult::Fail("pool drained by MLD refusals"),
+    };
+    if next != 0 {
+        return TestResult::Fail("refused MLD consumed a MACID");
+    }
+    pool.free(0);
+    // Base exhaustion: a full pool has no free strided pair.
+    let mut full = MacIdPool::new();
+    for _ in 0..32 {
+        match full.alloc() {
+            Ok(_) => {}
+            Err(_) => return TestResult::Fail("pool fill failed"),
+        };
+    }
+    if admit_mld(&f, facet, &mut full, MLD_ADDR, &links) != Err(Error::NoMacId) {
+        return TestResult::Fail("full pool must refuse an MLD");
+    }
+    TestResult::Pass
+}
+
+fn smoke_rtw89_8922a_mld_base_interleave() -> TestResult {
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    // A single-link station holding slot 0 pushes the first
+    // MLD base to 1: links take MACIDs 1 and 17.
+    let mut pool = MacIdPool::new();
+    let single = match admit(&f, facet, &mut pool, &base_req()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("single-link admission refused"),
+    };
+    if single.macid != 0 {
+        return TestResult::Fail("single-link setup mismatch");
+    }
+    let links = two_links();
+    let mld = match admit_mld(&f, facet, &mut pool, MLD_ADDR, &links) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("interleaved MLD admission refused"),
+    };
+    if mld.base_macid != 1
+        || mld.link(0).map(|link| link.macid()) != Some(1)
+        || mld.link(1).map(|link| link.macid()) != Some(17)
+    {
+        return TestResult::Fail("interleaved MLD base mismatch");
+    }
+    mld.release_all(&mut pool);
+    if pool.is_used(1) || pool.is_used(17) || !pool.is_used(0) {
+        return TestResult::Fail("interleaved release state mismatch");
+    }
+    single.release_macid(&mut pool);
+    // Slots 0..17 held: base 0 is blocked by slot 0, base 1
+    // by slot 17, so the first MLD base is 2 (MACIDs 2, 18).
+    let mut crowded = MacIdPool::new();
+    for _ in 0..18 {
+        match crowded.alloc() {
+            Ok(_) => {}
+            Err(_) => return TestResult::Fail("crowded pool fill failed"),
+        };
+    }
+    let mld2 = match admit_mld(&f, facet, &mut crowded, MLD_ADDR, &links) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("crowded MLD admission refused"),
+    };
+    if mld2.base_macid != 2
+        || mld2.link(0).map(|link| link.macid()) != Some(2)
+        || mld2.link(1).map(|link| link.macid()) != Some(18)
+    {
+        return TestResult::Fail("crowded MLD base mismatch");
+    }
+    // Sixteen MLDs exhaust the pool exactly (16 bases x 2
+    // strided slots); the seventeenth has no pair left.
+    let mut fleet = MacIdPool::new();
+    for _ in 0..16 {
+        let _ = match admit_mld(&f, facet, &mut fleet, MLD_ADDR, &links) {
+            Ok(v) => v,
+            Err(_) => return TestResult::Fail("fleet MLD admission refused"),
+        };
+    }
+    if admit_mld(&f, facet, &mut fleet, MLD_ADDR, &links) != Err(Error::NoMacId) {
+        return TestResult::Fail("16-MLD fleet must exhaust the pool");
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_admit_eht_golden);
 kernel_test_in!(
     "drivers/wireless/rtw89",
@@ -995,3 +1535,17 @@ fn smoke_rtw89_8922a_mixed_mode_coexistence() -> TestResult {
     }
     TestResult::Pass
 }
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_mld_admit_two_links
+);
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_mld_ba_cam);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_mld_teardown_and_fallback
+);
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_mld_refusals);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_mld_base_interleave
+);
