@@ -1806,6 +1806,24 @@ impl FlushOrigin {
     }
 }
 
+/// `btrfs.fatal_errors=panic` on the kernel command line: panic when a
+/// transaction is aborted instead of continuing read-only, as Linux's
+/// `fatal_errors=panic` mount option does. An aborted root filesystem
+/// otherwise leaves a machine that looks hung, with the reason only on a
+/// console nobody is watching; a panic puts it on the screen.
+fn fatal_errors_panic() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0);
+    match CACHED.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let on = narf_boot::args().value("btrfs.fatal_errors") == Some("panic");
+    CACHED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
 /// Commit one closed batch as a single transaction.
 async fn commit_batch<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
@@ -1848,6 +1866,24 @@ async fn commit_batch<B: BlockDevice + 'static>(
             // accurate report and not a loss. That is the path a quota hard
             // limit takes.
             vol.abort_transaction();
+            // Say it so it cannot be missed. From here every write on this
+            // filesystem fails, and the logs kept on it stop: this console
+            // output is the only record a person will find.
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: ================================================================\n\
+                 btrfs: FILESYSTEM IS NOW READ-ONLY\n\
+                 btrfs:   a transaction commit failed: {error:?}\n\
+                 btrfs:   {silent_losses} operation(s) already reported as successful are lost\n\
+                 btrfs:   every later write returns EROFS until the next mount\n\
+                 btrfs:   boot with btrfs.fatal_errors=panic to stop here instead\n\
+                 btrfs: ================================================================"
+            );
+            if fatal_errors_panic() {
+                panic!(
+                    "btrfs: transaction commit failed ({error:?}), {silent_losses} operation(s) lost; btrfs.fatal_errors=panic"
+                );
+            }
         }
         // Put the in-memory root back where the last successful commit left
         // it. Staging advanced it so that reads within the batch could see the

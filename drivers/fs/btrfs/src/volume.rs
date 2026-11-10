@@ -720,6 +720,8 @@ pub struct VolCore<B: BlockDevice> {
     /// Set when a transaction was lost after its operations had already
     /// reported success. See [`Self::abort_transaction`].
     aborted: core::sync::atomic::AtomicBool,
+    /// Operations turned away since the abort. See [`Self::note_refused`].
+    refused_after_abort: core::sync::atomic::AtomicU64,
     /// `BTRFS_FS_QUOTA_OVERRIDE` — see [`Self::quota_override`].
     quota_override: core::sync::atomic::AtomicBool,
     /// Operations accumulated into the transaction that has not committed yet.
@@ -832,6 +834,23 @@ fn format_fsid(fsid: &[u8; 16]) -> alloc::string::String {
     out
 }
 
+/// Whether the `count`-th refused operation is one to report: 1, 10, 100, ...
+pub(crate) const fn refusal_is_reported(count: u64) -> bool {
+    let mut power = 1u64;
+    loop {
+        if count == power {
+            return true;
+        }
+        if count < power {
+            return false;
+        }
+        match power.checked_mul(10) {
+            Some(next) => power = next,
+            None => return false,
+        }
+    }
+}
+
 impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     // ── Geometry accessors (lock-free) ─────────────────────────────
 
@@ -874,7 +893,30 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// an operation passes before it starts. The write funnels keep using
     /// `supports_writes`, so the draining commit itself can still land.
     pub(crate) fn admits_writes(&self) -> bool {
-        self.supports_writes() && !self.frozen.load(core::sync::atomic::Ordering::Acquire)
+        let admitted =
+            self.supports_writes() && !self.frozen.load(core::sync::atomic::Ordering::Acquire);
+        if !admitted && self.aborted.load(core::sync::atomic::Ordering::Acquire) {
+            self.note_refused();
+        }
+        admitted
+    }
+
+    /// Keep an aborted filesystem audible. The abort itself is reported
+    /// once, and a caller that only sees `EROFS` minutes later has no way
+    /// to connect it to that line — while the on-disk logs that would have
+    /// carried it stopped with the filesystem. Repeat the fact at the 1st,
+    /// 10th, 100th, ... refused operation: frequent while the failure is
+    /// fresh, bounded however long userspace keeps retrying.
+    fn note_refused(&self) {
+        use core::sync::atomic::Ordering;
+        let count = self.refused_after_abort.fetch_add(1, Ordering::Relaxed) + 1;
+        if refusal_is_reported(count) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: READ-ONLY after a failed commit: {count} write operation(s) refused since (see the 'transaction commit failed' line)"
+            );
+        }
     }
 
     /// The gate for administrative writers that may legitimately run on a
@@ -2038,6 +2080,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             evictions: core::sync::atomic::AtomicU64::new(0),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
             aborted: core::sync::atomic::AtomicBool::new(false),
+            refused_after_abort: core::sync::atomic::AtomicU64::new(0),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
             last_view_dropped: commit_on_last_drop::<B>,
