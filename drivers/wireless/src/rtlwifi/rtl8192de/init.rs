@@ -4,8 +4,8 @@
 //! The post-download tail of `rtl92de_hw_init`, from the `0x605`
 //! write through the RF-ready poll. Linux's head —
 //! `rtl92d_phy_reset_iqk_result` (software-only, no state to reset
-//! here), `_rtl92de_init_mac` (the power-on prefix + LLT + MAC init
-//! + ring DESA bases) and `rtl92d_download_fw` — runs elsewhere in
+//! here), `_rtl92de_init_mac` (the power-on prefix, LLT, MAC init
+//! and ring DESA bases) and `rtl92d_download_fw` — runs elsewhere in
 //! NARF: the firmware download is `firmware_transport::run_8192de`
 //! (step 2), the LLT + ring bases are `Prepared::prepare` (this
 //! lane), and the power-on prefix + MAC init are the first two steps

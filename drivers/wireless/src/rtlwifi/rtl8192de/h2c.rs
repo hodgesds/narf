@@ -221,11 +221,32 @@ pub struct RateMask {
     pub mac_id: u8,
 }
 
-/// `rtl92de_update_hal_rate_mask` payload for `peer` on `band`
-/// with `rf_type`, `bw40` (`curtxbw_40mhz`; on a station Linux
-/// takes `mac->bw_40`, not the peer's bandwidth) and `rssi_level`.
-/// `update_bw` is unused by Linux on this chip.
-pub fn rate_mask(peer: &Peer, rf_type: RfType, band: Band, bw40: bool, rssi_level: u8) -> RateMask {
+/// The rate-selection inputs `rtl92de_update_hal_rate_mask` reads:
+/// the peer, the RF type, the band, `bw40` (`curtxbw_40mhz`; on a
+/// station Linux takes `mac->bw_40`, not the peer's bandwidth) and
+/// the RSSI level. Bundled so `rate_mask` and
+/// `update_hal_rate_mask` share one call shape — the five values
+/// travel together everywhere the mask is computed, and named
+/// fields keep them from being misordered at a call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateSelection<'a> {
+    pub peer: &'a Peer,
+    pub rf_type: RfType,
+    pub band: Band,
+    pub bw40: bool,
+    pub rssi_level: u8,
+}
+
+/// `rtl92de_update_hal_rate_mask` payload for `selection` (see
+/// [`RateSelection`]). `update_bw` is unused by Linux on this chip.
+pub fn rate_mask(selection: &RateSelection<'_>) -> RateMask {
+    let RateSelection {
+        peer,
+        rf_type,
+        band,
+        bw40,
+        rssi_level,
+    } = *selection;
     let mut bitmap = match band {
         Band::On5Ghz => peer.supp_rates[1] << 4,
         Band::On2Ghz => peer.supp_rates[0],
@@ -317,15 +338,11 @@ pub fn rate_mask(peer: &Peer, rf_type: RfType, band: Band, bw40: bool, rssi_leve
 pub async fn update_hal_rate_mask(
     mailbox: &mut Mailbox,
     io: &impl Io,
-    peer: &Peer,
-    rf_type: RfType,
-    band: Band,
-    bw40: bool,
-    rssi_level: u8,
+    selection: &RateSelection<'_>,
     admitted: u32,
     rf_on: bool,
 ) -> Result<RateMask, Error> {
-    let mask = rate_mask(peer, rf_type, band, bw40, rssi_level);
+    let mask = rate_mask(selection);
     let rates = u32::from_le_bytes([
         mask.payload[0],
         mask.payload[1],

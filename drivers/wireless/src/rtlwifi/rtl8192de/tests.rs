@@ -1205,8 +1205,13 @@ struct DeMacModel {
     apsd_reads: u32,
     /// Physical EFUSE bytes (`REG_EFUSE_CTRL` protocol model: the
     /// address latched by `CTRL+1`/`CTRL+2` reads back the byte at
-    /// that address with `VALID` set).
-    efuse: [u8; 512],
+    /// that address with `VALID` set). The address space is 10-bit
+    /// (`0x000`–`0x3FF` — Linux's `read_efuse_byte` writes
+    /// `(address >> 8) & 0x03` into `CTRL+2`), so this is 1024
+    /// bytes even though the logical content length
+    /// (`EFUSE_REAL_CONTENT_LEN`) is 512: the chip-version word
+    /// lives at the top of the physical space (`0x3FE`/`0x3FF`).
+    efuse: [u8; 1024],
     efuse_addr: u16,
 }
 
@@ -1299,7 +1304,7 @@ fn de_mac_fake() -> DeMacFake {
         poip_reads: 0,
         apsd_set_after: 2,
         apsd_reads: 0,
-        efuse: [0xffu8; 512],
+        efuse: [0xffu8; 1024],
         efuse_addr: 0,
     })))
 }
@@ -3709,7 +3714,13 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         aid: 0,
     };
     // B: 0xfff & 0x0d (CCK bit 2 set), index B (6), station MAC id 0.
-    let mask = rate_mask(&base, RfType::TwoT2R, Band::On2Ghz, false, 3);
+    let mask = rate_mask(&RateSelection {
+        peer: &base,
+        rf_type: RfType::TwoT2R,
+        band: Band::On2Ghz,
+        bw40: false,
+        rssi_level: 3,
+    });
     if mask.payload != [0x0d, 0x00, 0x00, 0x60, 0x80]
         || mask.ratr_index != RATR_INX_WIRELESS_B
         || mask.mac_id != 0
@@ -3721,7 +3732,13 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         mode: WirelessMode::G,
         ..base
     };
-    let mask = rate_mask(&g, RfType::TwoT2R, Band::On2Ghz, false, 1);
+    let mask = rate_mask(&RateSelection {
+        peer: &g,
+        rf_type: RfType::TwoT2R,
+        band: Band::On2Ghz,
+        bw40: false,
+        rssi_level: 1,
+    });
     if mask.payload != [0x00, 0x0f, 0x00, 0x40, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_GB {
         return TestResult::Fail("8192DE rate mask G rssi1");
     }
@@ -3731,7 +3748,13 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         supp_rates: [0, 0xfff],
         ..base
     };
-    let mask = rate_mask(&a, RfType::TwoT2R, Band::On5Ghz, false, 3);
+    let mask = rate_mask(&RateSelection {
+        peer: &a,
+        rf_type: RfType::TwoT2R,
+        band: Band::On5Ghz,
+        bw40: false,
+        rssi_level: 3,
+    });
     if mask.payload != [0xf0, 0x0f, 0x00, 0x50, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_G {
         return TestResult::Fail("8192DE rate mask A");
     }
@@ -3744,7 +3767,13 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         sgi40: true,
         ..base
     };
-    let mask = rate_mask(&n, RfType::TwoT2R, Band::On2Ghz, true, 3);
+    let mask = rate_mask(&RateSelection {
+        peer: &n,
+        rf_type: RfType::TwoT2R,
+        band: Band::On2Ghz,
+        bw40: true,
+        rssi_level: 3,
+    });
     if mask.payload != [0x15, 0xf0, 0x0f, 0x0f, 0xa0]
         || mask.ratr_index != RATR_INX_WIRELESS_NGB
         || mask.mac_id != 0
@@ -3756,7 +3785,13 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         mimo_ps_static: true,
         ..n
     };
-    let mask = rate_mask(&smps, RfType::TwoT2R, Band::On2Ghz, true, 2);
+    let mask = rate_mask(&RateSelection {
+        peer: &smps,
+        rf_type: RfType::TwoT2R,
+        band: Band::On2Ghz,
+        bw40: true,
+        rssi_level: 2,
+    });
     if mask.payload != [0x00, 0xf0, 0x07, 0x00, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_NGB {
         return TestResult::Fail("8192DE rate mask N SMPS static");
     }
@@ -3767,7 +3802,13 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         rx_mask: [0xff, 0xff],
         ..base
     };
-    let mask = rate_mask(&n5, RfType::OneT1R, Band::On5Ghz, false, 1);
+    let mask = rate_mask(&RateSelection {
+        peer: &n5,
+        rf_type: RfType::OneT1R,
+        band: Band::On5Ghz,
+        bw40: false,
+        rssi_level: 1,
+    });
     if mask.payload != [0x00, 0x00, 0x0f, 0x10, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_NG {
         return TestResult::Fail("8192DE rate mask N5 1T 20M");
     }
@@ -3777,7 +3818,13 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         aid: 2,
         ..n
     };
-    let mask = rate_mask(&ap, RfType::TwoT2R, Band::On2Ghz, true, 3);
+    let mask = rate_mask(&RateSelection {
+        peer: &ap,
+        rf_type: RfType::TwoT2R,
+        band: Band::On2Ghz,
+        bw40: true,
+        rssi_level: 3,
+    });
     if mask.payload[4] != 0x83 || mask.mac_id != 3 {
         return TestResult::Fail("8192DE rate mask AP macid");
     }
@@ -3786,7 +3833,13 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         mode: WirelessMode::Unknown,
         ..n
     };
-    let mask = rate_mask(&unknown, RfType::TwoT2R, Band::On2Ghz, true, 3);
+    let mask = rate_mask(&RateSelection {
+        peer: &unknown,
+        rf_type: RfType::TwoT2R,
+        band: Band::On2Ghz,
+        bw40: true,
+        rssi_level: 3,
+    });
     if mask.payload != [0xff, 0xf0, 0x0f, 0x0f, 0xa0] || mask.ratr_index != RATR_INX_WIRELESS_NGB {
         return TestResult::Fail("8192DE rate mask unknown");
     }
@@ -3825,11 +3878,13 @@ fn smoke_rtl8192de_rate_mask_send() -> TestResult {
     match narf_scheduler::block_on(update_hal_rate_mask(
         &mut mailbox,
         &io,
-        &empty,
-        RfType::TwoT2R,
-        Band::On2Ghz,
-        true,
-        3,
+        &RateSelection {
+            peer: &empty,
+            rf_type: RfType::TwoT2R,
+            band: Band::On2Ghz,
+            bw40: true,
+            rssi_level: 3,
+        },
         0x0fff_ffff,
         true,
     )) {
@@ -3842,11 +3897,13 @@ fn smoke_rtl8192de_rate_mask_send() -> TestResult {
     match narf_scheduler::block_on(update_hal_rate_mask(
         &mut mailbox,
         &io,
-        &peer,
-        RfType::TwoT2R,
-        Band::On2Ghz,
-        true,
-        3,
+        &RateSelection {
+            peer: &peer,
+            rf_type: RfType::TwoT2R,
+            band: Band::On2Ghz,
+            bw40: true,
+            rssi_level: 3,
+        },
         0x0000_0fff,
         true,
     )) {
@@ -3860,11 +3917,13 @@ fn smoke_rtl8192de_rate_mask_send() -> TestResult {
     let mask = match narf_scheduler::block_on(update_hal_rate_mask(
         &mut mailbox,
         &io,
-        &peer,
-        RfType::TwoT2R,
-        Band::On2Ghz,
-        true,
-        3,
+        &RateSelection {
+            peer: &peer,
+            rf_type: RfType::TwoT2R,
+            band: Band::On2Ghz,
+            bw40: true,
+            rssi_level: 3,
+        },
         0x0fff_ffff,
         true,
     )) {
@@ -3888,11 +3947,13 @@ fn smoke_rtl8192de_rate_mask_send() -> TestResult {
     if narf_scheduler::block_on(update_hal_rate_mask(
         &mut mailbox,
         &io,
-        &peer,
-        RfType::TwoT2R,
-        Band::On2Ghz,
-        true,
-        3,
+        &RateSelection {
+            peer: &peer,
+            rf_type: RfType::TwoT2R,
+            band: Band::On2Ghz,
+            bw40: true,
+            rssi_level: 3,
+        },
         0x0fff_ffff,
         false,
     ))
@@ -4071,7 +4132,13 @@ fn smoke_rtl8192de_rate_id_macid() -> TestResult {
         ap_or_adhoc: true,
         aid: 2,
     };
-    let mask = rate_mask(&peer, RfType::TwoT2R, Band::On2Ghz, false, 3);
+    let mask = rate_mask(&RateSelection {
+        peer: &peer,
+        rf_type: RfType::TwoT2R,
+        band: Band::On2Ghz,
+        bw40: false,
+        rssi_level: 3,
+    });
     owner.install_rate_mask(mask, WirelessMode::N24g, 5, false);
     let Some(link) = owner.link() else {
         return TestResult::Fail("8192DE rate-id link missing");
