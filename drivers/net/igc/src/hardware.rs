@@ -517,10 +517,77 @@ pub(crate) fn activate_queues(
             poll(r, base + offset, 1 << 25, 1 << 25)?;
         }
     }
+    // Linux igc_configure runs igc_rx_fifo_flush_base after queue setup
+    // and before making any RX buffers available to the controller.
+    flush_receive_fifo(r)?;
     for (q, count) in rx_counts.iter().enumerate() {
         r.write(0xc018 + q as u64 * 0x40, *count as u32 - 1);
     }
     r.flush();
+    Ok(())
+}
+
+/// Linux igc_rx_fifo_flush_base: apply the IPv6 parser erratum and remove
+/// inherited management traffic from the RX/DMA FIFOs before publishing RDT.
+/// This runs only with prepared rings whose heads/tails are still empty.
+pub(crate) fn flush_receive_fifo(r: &impl Registers) -> Result<(), IgcError> {
+    const ENABLE: u32 = 1 << 25;
+    const IPV6_EX_DIS: u32 = 0x10000;
+    const LEF: u32 = 0x40000;
+    let rfctl = r.read(0x5008) | IPV6_EX_DIS;
+    r.write(0x5008, rfctl);
+    r.flush();
+    poll(r, 0x5008, IPV6_EX_DIS, IPV6_EX_DIS)?;
+    let manc = r.read(0x5820);
+    if manc == u32::MAX {
+        return Err(IgcError::Other("management state unavailable"));
+    }
+    if manc & 0x20000 == 0 {
+        return Ok(());
+    }
+
+    let queues: [u32; 4] = core::array::from_fn(|q| r.read(0xc028 + q as u64 * 0x40));
+    for (q, control) in queues.iter().enumerate() {
+        r.write(0xc028 + q as u64 * 0x40, control & !ENABLE);
+    }
+    r.flush();
+    if !r.wait(10_000, || {
+        (0..4).all(|q| {
+            let value = r.read(0xc028 + q * 0x40);
+            value != u32::MAX && value & ENABLE == 0
+        })
+    }) {
+        // No receive buffers have been published. The lifecycle caller
+        // must still drain/reset before reclaiming these retained rings.
+        return Err(IgcError::Other("management RX queues did not stop"));
+    }
+
+    r.write(0x5008, rfctl & !LEF);
+    let max_length = r.read(0x5004);
+    r.write(0x5004, 0);
+    let rctl = r.read(0x100);
+    let reject = (rctl & !(2 | 4)) | 0x20; // EN/SBP clear, LPE set
+    r.write(0x100, reject);
+    r.write(0x100, reject | 2);
+    r.flush();
+    r.delay(2_000);
+
+    for (q, control) in queues.iter().enumerate() {
+        let register = 0xc028 + q as u64 * 0x40;
+        r.write(register, *control);
+        poll(r, register, ENABLE, control & ENABLE)?;
+    }
+    r.write(0x100, rctl);
+    r.flush();
+    r.write(0x5004, max_length);
+    r.write(0x5008, rfctl);
+    r.flush();
+    // The temporary reject policy intentionally causes these errors.
+    // Do not expose them as failures of subsequently admitted packets.
+    for register in [0x40ac, 0x40a0, 0x4010] {
+        // ROC, RNBC, MPC
+        let _ = r.read(register);
+    }
     Ok(())
 }
 
