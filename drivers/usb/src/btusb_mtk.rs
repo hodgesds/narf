@@ -27,25 +27,21 @@
 //! 1. Send the section-map tail as one WMT PATCH_DWNLD command
 //!    (flag 0): payload = `[0x00] ++ section_map[12..64]` (the 0
 //!    selects legacy download mode). The WMT event's flag byte
-//!    answers the patch state: 1 UNDONE → proceed, 2 PROGRESS →
-//!    wait 100 ms and ask again (≤ 20 retries), 3 DONE → the
+//!    answers the raw patch state: 0 UNDONE → proceed, 1 PROGRESS →
+//!    wait 100 ms and ask again (≤ 20 attempts), 2 DONE → the
 //!    section is already applied, skip it; anything else fails.
 //! 2. Send the section body from `image[secoffset..+dlsize]` in
 //!    ≤ 250-byte WMT PATCH_DWNLD chunks: flag 1 on the first chunk,
 //!    2 on middle chunks, 3 on the last.
 //!
 //! WMT framing: HCI command parameters are
-//! `[dir=0x01, op, dlen u16 LE (= 5 + data len), flag, data...]`;
-//! the answer is HCI event 0xE4 whose parameters carry the same
-//! 5-byte WMT header with `dir = 0x02` and the status in its flag
-//! byte (`btmtk_hci_wmt_evt`).
-//!
-//! Deliberate simplification vs Linux: `btusb`'s pre-download
-//! subsystem reset for MT7922 (register pokes via WMT REGISTER) is
-//! not reproduced. On a cold boot the ROM patch state is UNDONE and
-//! the download proceeds; the state machine above still converges
-//! if a previous attempt left a section PROGRESS or DONE, so the
-//! reset is a recovery accelerator, not a correctness requirement.
+//! `[dir=0x01, op, dlen u16 LE (= 1 + data len), flag, data...]`.
+//! USB WMT replies use the vendor control pipe (IN request 1, value 48),
+//! not the ordinary interrupt endpoint. Raw patch flags 0/1/2 mean
+//! UNDONE/PROGRESS/DONE. After patch download, reset the USB endpoint
+//! options and enable the Bluetooth protocol with WMT FUNC_CTRL before
+//! generic HCI commands. Chip and ROM identity come from vendor register
+//! reads, rather than being inferred solely from a USB product alias.
 //!
 //! The pure helpers (`parse_ram_code`, `section_chunks`,
 //! `wmt_params`, `parse_wmt_event`, `patch_action`) carry the
@@ -57,7 +53,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use narf_bluetooth::btusb_quirks::{self, Quirk};
+use core::future::Future;
+use narf_bluetooth::hci::{Command, Event};
 
 use crate::btusb::{self, BtUsbError};
 use crate::xhci::Xhci;
@@ -88,9 +85,9 @@ const PROBE_RETRIES: usize = 20;
 
 /// Patch states reported in the WMT event flag byte
 /// (`btmtk.h` BTMTK_WMT_PATCH_*).
-const PATCH_UNDONE: u8 = 1;
-const PATCH_PROGRESS: u8 = 2;
-const PATCH_DONE: u8 = 3;
+const PATCH_UNDONE: u8 = 0;
+const PATCH_PROGRESS: u8 = 1;
+const PATCH_DONE: u8 = 2;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MtkError {
@@ -223,7 +220,7 @@ pub(crate) fn section_chunks<'a>(image: &'a [u8], section: &MtkSection) -> Vec<(
 
 /// Build the HCI command parameters for one WMT command.
 pub(crate) fn wmt_params(op: u8, flag: u8, data: &[u8]) -> Vec<u8> {
-    let dlen = (5 + data.len()) as u16;
+    let dlen = (1 + data.len()) as u16;
     let mut out = Vec::with_capacity(5 + data.len());
     out.push(WMT_DIR_COMMAND);
     out.push(op);
@@ -235,65 +232,232 @@ pub(crate) fn wmt_params(op: u8, flag: u8, data: &[u8]) -> Vec<u8> {
 
 /// Parse a WMT event's parameters into `(op, flag)`.
 pub(crate) fn parse_wmt_event(params: &[u8]) -> Option<(u8, u8)> {
-    if params.len() < 5 || params[0] != WMT_DIR_EVENT {
+    if params.len() < 5
+        || params[0] != WMT_DIR_EVENT
+        || usize::from(u16::from_le_bytes([params[2], params[3]])) + 4 != params.len()
+    {
         return None;
     }
     Some((params[1], params[4]))
 }
 
-/// Send one WMT command and return the answering event's flag byte.
-async fn wmt_sync(
-    xhci: &Xhci,
-    slot_id: u8,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UsbRequest {
+    pub rt: u8,
+    pub request: u8,
+    pub value: u16,
+    pub index: u16,
+}
+const WMT_REPLY: UsbRequest = UsbRequest {
+    rt: 0xc0,
+    request: 1,
+    value: 48,
+    index: 0,
+};
+const HCI_COMMAND: UsbRequest = UsbRequest {
+    rt: 0x20,
+    request: 0,
+    value: 0,
+    index: 0,
+};
+const WMT_FUNC_CTRL: u8 = 6;
+const EP_RST_OPT: u32 = 0x74011890;
+
+/// Native transfers and the conversation fixture run the same setup protocol.
+pub(crate) trait MtkUsb: Sync {
+    fn control_in<'a>(
+        &'a self,
+        request: UsbRequest,
+        out: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, MtkError>> + Send + 'a;
+    fn control_out<'a>(
+        &'a self,
+        request: UsbRequest,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<usize, MtkError>> + Send + 'a;
+    fn delay_us(&self, us: u64) -> impl Future<Output = ()> + Send;
+}
+struct NativeUsb<'a> {
+    xhci: &'a Xhci,
+    slot: u8,
+    generation: u64,
     interface: u8,
-    event_dci: u8,
-    op: u8,
-    flag: u8,
-    data: &[u8],
-) -> Result<u8, MtkError> {
-    let event = btusb::send_command_and_await_event(
-        xhci,
-        slot_id,
-        interface,
-        event_dci,
-        OP_WMT,
-        &wmt_params(op, flag, data),
-        EVT_WMT,
-    )
-    .await?;
-    let (ev_op, ev_flag) = parse_wmt_event(&event.params).ok_or(MtkError::WmtEvent)?;
-    if ev_op != op {
+}
+impl MtkUsb for NativeUsb<'_> {
+    async fn control_in<'a>(
+        &'a self,
+        request: UsbRequest,
+        out: &'a mut [u8],
+    ) -> Result<usize, MtkError> {
+        self.xhci
+            .control_in_generation(
+                self.slot,
+                self.generation,
+                request.rt,
+                request.request,
+                request.value,
+                request.index,
+                out,
+            )
+            .await
+            .map_err(|_| MtkError::Transport(BtUsbError::CommandTransfer))
+    }
+    async fn control_out<'a>(
+        &'a self,
+        mut request: UsbRequest,
+        data: &'a [u8],
+    ) -> Result<usize, MtkError> {
+        if request == HCI_COMMAND {
+            request.index = u16::from(self.interface);
+        }
+        self.xhci
+            .control_out_generation(
+                self.slot,
+                self.generation,
+                request.rt,
+                request.request,
+                request.value,
+                request.index,
+                data,
+            )
+            .await
+            .map_err(|_| MtkError::Transport(BtUsbError::CommandTransfer))
+    }
+    async fn delay_us(&self, us: u64) {
+        let deadline = narf_time::Deadline::after_us(us);
+        while !deadline.expired() {
+            narf_scheduler::yield_now().await;
+        }
+    }
+}
+
+/// USB WMT replies arrive over EP0. Empty replies are normal while the ROM
+/// prepares an event; Linux waits 500us before resubmitting this request.
+async fn wmt_sync(io: &impl MtkUsb, op: u8, flag: u8, data: &[u8]) -> Result<u8, MtkError> {
+    if data.len() > CHUNK_MAX {
         return Err(MtkError::WmtEvent);
     }
-    Ok(ev_flag)
-}
-
-async fn cooperative_delay_ms(ms: u64) {
-    let deadline = narf_time::Deadline::after_ms(ms);
-    while !deadline.expired() {
-        narf_scheduler::yield_now().await;
+    let command = Command::with_params(OP_WMT, &wmt_params(op, flag, data)).encode();
+    if io.control_out(HCI_COMMAND, &command).await? != command.len() {
+        return Err(MtkError::Transport(BtUsbError::CommandTransfer));
+    }
+    let deadline = narf_time::Deadline::after_ms(5_500);
+    loop {
+        let mut raw = [0u8; 64];
+        let len = io.control_in(WMT_REPLY, &mut raw).await?;
+        if len > raw.len() {
+            return Err(MtkError::WmtEvent);
+        }
+        if len != 0 {
+            let event = Event::decode(&raw[..len]).ok_or(MtkError::WmtEvent)?;
+            if event.code != EVT_WMT {
+                return Err(MtkError::WmtEvent);
+            }
+            let (event_op, event_flag) =
+                parse_wmt_event(&event.params).ok_or(MtkError::WmtEvent)?;
+            if event_op != op {
+                return Err(MtkError::WmtEvent);
+            }
+            return Ok(event_flag);
+        }
+        if deadline.expired() {
+            return Err(MtkError::Transport(BtUsbError::EventTimeout));
+        }
+        io.delay_us(500).await;
     }
 }
 
-/// Map a USB product ID to the chip's device ID used for firmware
-/// naming (the Lite-On 13d3:3563 module carries an MT7922).
 fn device_id(product_id: u16) -> Option<u16> {
     match product_id {
         0x7961 => Some(0x7961),
-        0x7922 | 0x3563 => Some(0x7922),
+        0x0616 | 0x7922 | 0x3563 => Some(0x7922),
         _ => None,
     }
 }
+fn read_request(reg: u32) -> UsbRequest {
+    UsbRequest {
+        rt: 0xc0,
+        request: 0x63,
+        value: (reg >> 16) as u16,
+        index: reg as u16,
+    }
+}
+async fn read_register(io: &impl MtkUsb, reg: u32) -> Result<u32, MtkError> {
+    let mut bytes = [0u8; 4];
+    if io.control_in(read_request(reg), &mut bytes).await? != 4 {
+        return Err(MtkError::WmtEvent);
+    }
+    Ok(u32::from_le_bytes(bytes))
+}
+pub(crate) fn firmware_name(chip: u32, version: u32, flavor: u32) -> Result<String, MtkError> {
+    if !matches!(chip, 0x7922 | 0x7961) {
+        return Err(MtkError::UnsupportedDevice);
+    }
+    Ok(format!(
+        "mediatek/BT_RAM_CODE_MT{chip:04x}_{}_{:x}_hdr.bin",
+        if chip == 0x7961 && flavor & 0x80 != 0 {
+            "1a"
+        } else {
+            "1"
+        },
+        (version & 0xff) + 1
+    ))
+}
+pub(crate) async fn read_identity(io: &impl MtkUsb, product: u16) -> Result<String, MtkError> {
+    let expected = u32::from(device_id(product).ok_or(MtkError::UnsupportedDevice)?);
+    let chip = read_register(io, 0x70010200).await?;
+    if chip != expected {
+        return Err(MtkError::UnsupportedDevice);
+    }
+    let version = read_register(io, 0x80021004).await?;
+    let flavor = read_register(io, 0x70010020).await?;
+    firmware_name(chip, version, flavor)
+}
 
-/// The provisioned RAM-code name for a device ID, from the quirk
-/// table's MediaTek entries under the `mediatek/` prefix.
-fn firmware_name(dev_id: u16) -> Option<String> {
-    let needle = if dev_id == 0x7961 { "MT7961" } else { "MT7922" };
-    btusb_quirks::firmware_paths(Quirk::MediaTek)
-        .into_iter()
-        .map(|(name, _)| name)
-        .find(|name| name.contains(needle))
-        .map(|name| format!("mediatek/{name}"))
+pub(crate) async fn download_and_enable(io: &impl MtkUsb, image: &[u8]) -> Result<(), MtkError> {
+    let parsed = parse_ram_code(image)?;
+    for section in &parsed.sections {
+        if section.dl_size == 0 {
+            continue;
+        }
+        let mut tries = PROBE_RETRIES;
+        let download = loop {
+            let status = wmt_sync(io, WMT_PATCH_DWNLD, 0, &section.probe).await?;
+            match patch_action(status) {
+                PatchAction::Download => break true,
+                PatchAction::Skip => break false,
+                PatchAction::Retry => {
+                    tries -= 1;
+                    if tries == 0 {
+                        return Err(MtkError::PatchStatus(status));
+                    }
+                    io.delay_us(100_000).await;
+                }
+                PatchAction::Fail => return Err(MtkError::PatchStatus(status)),
+            }
+        };
+        if !download {
+            continue;
+        }
+        for (flag, chunk) in section_chunks(image, section) {
+            wmt_sync(io, WMT_PATCH_DWNLD, flag, chunk).await?;
+        }
+    }
+    let request = UsbRequest {
+        rt: 0x5e,
+        request: 2,
+        value: (EP_RST_OPT >> 16) as u16,
+        index: EP_RST_OPT as u16,
+    };
+    if io
+        .control_out(request, &0x00010001u32.to_le_bytes())
+        .await?
+        != 4
+    {
+        return Err(MtkError::Transport(BtUsbError::CommandTransfer));
+    }
+    wmt_sync(io, WMT_FUNC_CTRL, 0, &[1]).await?;
+    Ok(())
 }
 
 /// Run the MediaTek firmware setup for a just-configured USB
@@ -306,67 +470,27 @@ pub(crate) async fn setup_mediatek(
     event_dci: u8,
     product_id: u16,
 ) -> Result<(), MtkError> {
-    let dev_id = device_id(product_id).ok_or(MtkError::UnsupportedDevice)?;
-    let name = firmware_name(dev_id).ok_or(MtkError::FirmwareUnavailable)?;
+    let generation = xhci
+        .device_generation(slot_id)
+        .ok_or(MtkError::Transport(BtUsbError::CommandTransfer))?;
+    let io = NativeUsb {
+        xhci,
+        slot: slot_id,
+        generation,
+        interface,
+    };
+    let name = read_identity(&io, product_id).await?;
     let cap = btusb::firmware_cap(&name).ok_or(MtkError::FirmwareUnavailable)?;
     let view = narf_firmware::view_of(&cap).map_err(|_| MtkError::FirmwareUnavailable)?;
-    let image = view.bytes;
-    let parsed = parse_ram_code(image)?;
-
-    for section in &parsed.sections {
-        if section.dl_size == 0 {
-            continue;
-        }
-        // Probe: ask the ROM for this section's patch state.
-        let mut retries = 0;
-        let download = loop {
-            let status = wmt_sync(
-                xhci,
-                slot_id,
-                interface,
-                event_dci,
-                WMT_PATCH_DWNLD,
-                0,
-                &section.probe,
-            )
-            .await?;
-            match patch_action(status) {
-                PatchAction::Download => break true,
-                PatchAction::Skip => break false,
-                PatchAction::Retry => {
-                    retries += 1;
-                    if retries > PROBE_RETRIES {
-                        return Err(MtkError::PatchStatus(status));
-                    }
-                    cooperative_delay_ms(100).await;
-                }
-                PatchAction::Fail => return Err(MtkError::PatchStatus(status)),
-            }
-        };
-        if !download {
-            continue;
-        }
-        for (flag, chunk) in section_chunks(image, section) {
-            wmt_sync(
-                xhci,
-                slot_id,
-                interface,
-                event_dci,
-                WMT_PATCH_DWNLD,
-                flag,
-                chunk,
-            )
-            .await?;
-        }
-    }
-
-    // Firmware activation takes a few moments (Linux sleeps
-    // 100-120 ms); then drain any asynchronous WMT chatter so the
-    // generic bring-up's first Command Complete is the next event.
-    cooperative_delay_ms(100).await;
+    download_and_enable(&io, view.bytes).await?;
+    // WMT status/complete events may also be queued on the ordinary event
+    // endpoint. Consume them before the generic HCI Reset conversation.
     btusb::drain_pending_events(xhci, slot_id, event_dci, 50).await;
     Ok(())
 }
+
+#[path = "btusb_mtk_tests.rs"]
+mod conversations;
 
 #[cfg(test)]
 mod unit {
@@ -427,9 +551,9 @@ mod unit {
         let params = wmt_params(WMT_PATCH_DWNLD, 3, &[0xAA; 10]);
         assert_eq!(params[0], 0x01);
         assert_eq!(params[1], WMT_PATCH_DWNLD);
-        assert_eq!(u16::from_le_bytes([params[2], params[3]]), 15);
+        assert_eq!(u16::from_le_bytes([params[2], params[3]]), 11);
         assert_eq!(params[4], 3);
-        let event_params = [0x02, WMT_PATCH_DWNLD, 0x05, 0x00, PATCH_PROGRESS];
+        let event_params = [0x02, WMT_PATCH_DWNLD, 0x01, 0x00, PATCH_PROGRESS];
         assert_eq!(
             parse_wmt_event(&event_params),
             Some((WMT_PATCH_DWNLD, PATCH_PROGRESS))
