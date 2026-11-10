@@ -371,6 +371,44 @@ reading list), and `research/summaries/` (distilled primary sources).
 
 ---
 
+## Contributing
+
+Pull requests are welcome. NARF is designed to be modular and
+composable: subsystems are crates behind trait interfaces, so multiple
+implementations can coexist — a new driver, filesystem, scheduler
+policy, or domain backend can land as its own crate implementing the
+existing traits, without rewriting the core. If you are adding an
+alternative implementation, keep the trait surface stable and put the
+new code behind it.
+
+The contribution flow is defined in
+[`process/specification/spec.md`](process/specification/spec.md), which
+is binding on humans and AI agents alike. In short:
+
+1. Open an issue describing the problem or feature, classified by
+   change class (trivial, standard, interface, TCB, security-critical).
+2. Work on a short-lived topic branch off `main`.
+3. Open a pull request stating the change class, the subsystems and
+   spec sections touched, the security impact, and the tests run.
+4. Review bars follow the change class: TCB changes need two
+   maintainers including a security reviewer, and interface changes
+   must carry the spec update in the same PR.
+
+AI agents contribute through identifiable, auditable accounts and never
+merge. Maintainers merge; see the process spec for the merge gates.
+
+---
+
+## Donate
+
+This project does not take donations. NARF shares its name with the
+**Native American Rights Fund**, a nonprofit that fights to protect
+Native American rights, resources, and lifeways through litigation,
+legal advocacy, and legal expertise. If you would like to donate,
+please donate to them: [https://narf.org/](https://narf.org/).
+
+---
+
 ## License
 
 GPL-2.0-or-later as of 2026-05-20. Code that landed before the
