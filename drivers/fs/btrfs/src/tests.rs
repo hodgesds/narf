@@ -14199,3 +14199,26 @@ kernel_test_in!(
     "drivers/fs/btrfs/special_mode",
     smoke_btrfs_special_modes_survive_stat_and_remount
 );
+
+fn smoke_btrfs_abort_refusals_stay_audible() -> TestResult {
+    // An aborted root filesystem looks like a hung machine: the abort is
+    // logged once and the logs kept on that filesystem stop with it. The
+    // reminder must repeat while userspace keeps hitting EROFS, densely at
+    // first and never as a flood.
+    use crate::volume::refusal_is_reported;
+    for reported in [1, 10, 100, 1_000, 1_000_000] {
+        if !refusal_is_reported(reported) {
+            return TestResult::Fail("a decade boundary was not reported");
+        }
+    }
+    for silent in [0, 2, 9, 11, 99, 101, 999_999, u64::MAX] {
+        if refusal_is_reported(silent) {
+            return TestResult::Fail("a refusal between decade boundaries was reported");
+        }
+    }
+    if (1..=100_000u64).filter(|n| refusal_is_reported(*n)).count() != 6 {
+        return TestResult::Fail("reminders are not bounded to one per decade");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_abort_refusals_stay_audible);
