@@ -1331,7 +1331,8 @@ impl TxPermission {
         center160: Option<u8>,
     ) -> Option<Self> {
         use narf_wireless::reg::RegFlags;
-        if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+        if domain.country_code != *b"00" && !domain.country_code.iter().all(u8::is_ascii_uppercase)
+        {
             return None;
         }
         let primary = super::channel::frequency(channel)?;

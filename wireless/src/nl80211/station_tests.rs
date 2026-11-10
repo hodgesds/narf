@@ -14,6 +14,81 @@ const NAME: &str = "wlan-ext";
 const MAC: [u8; 6] = [2, 0x0e, 0x0e, 0x0e, 0x0e, 0x01];
 const AP: [u8; 6] = [2, 0xa1, 0xa1, 0xa1, 0xa1, 0xa1];
 
+fn smoke_nl80211_country_hint_requires_global_authority_and_validated_country() -> TestResult {
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 33, b"US\0");
+    let called = core::cell::Cell::new(false);
+    if request_regulatory_country(&attrs, &ctx(0), |alpha2| {
+        called.set(alpha2 == *b"US");
+        Ok(())
+    })
+    .is_err()
+        || !called.get()
+    {
+        return TestResult::Fail("valid globally authorized country hint refused");
+    }
+    let mut binary = Vec::new();
+    push_attr(&mut binary, 33, b"US");
+    if request_regulatory_country(&binary, &ctx(0), |alpha2| {
+        if alpha2 == *b"US" {
+            Ok(())
+        } else {
+            Err(crate::reg::policy::Error::Format("unexpected country"))
+        }
+    })
+    .is_err()
+    {
+        return TestResult::Fail("Linux two-byte binary country hint refused");
+    }
+    for context in [
+        RequestContext::default(),
+        RequestContext {
+            net_admin: true,
+            capable: true,
+            ..RequestContext::default()
+        },
+        RequestContext {
+            net_ns_id: 1,
+            ..ctx(0)
+        },
+    ] {
+        if request_regulatory_country(&attrs, &context, |_| Ok(())) != Err(EPERM) {
+            return TestResult::Fail("interface/child-namespace authority changed global rules");
+        }
+    }
+    for alpha2 in [
+        &b"us\0"[..],
+        &b"U"[..],
+        &b"US\0\0"[..],
+        &b"USx"[..],
+        &b"0A\0"[..],
+    ] {
+        let mut invalid = Vec::new();
+        push_attr(&mut invalid, 33, alpha2);
+        if request_regulatory_country(&invalid, &ctx(0), |_| Ok(())) != Err(EINVAL) {
+            return TestResult::Fail("malformed country hint accepted");
+        }
+    }
+    let mut unsupported = attrs.clone();
+    push_attr(&mut unsupported, 154, &2u32.to_ne_bytes());
+    if request_regulatory_country(&unsupported, &ctx(0), |_| Ok(())) != Err(EOPNOTSUPP)
+        || request_regulatory_country(&attrs, &ctx(0), |_| {
+            Err(crate::reg::policy::Error::Authority)
+        }) != Err(EPERM)
+    {
+        return TestResult::Fail("indoor hint or deployment override bypassed country bounds");
+    }
+    let op = OPERATIONS.iter().find(|op| op.command == 27);
+    if !op.is_some_and(|op| op.flags & ADMIN != 0 && op.flags & UNS == 0) {
+        return TestResult::Fail("REQ_SET_REG lacks Linux GENL_ADMIN_PERM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211/regulatory",
+    smoke_nl80211_country_hint_requires_global_authority_and_validated_country
+);
+
 fn smoke_nl80211_host_regulatory_flags_preserve_no_ir() -> TestResult {
     use crate::reg::RegFlags;
     // Literal NRGD -> nl80211.h flag values, without global policy mutation.
@@ -945,7 +1020,7 @@ fn smoke_nl80211_ext_power_reg_interface_station() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!(
-    "wireless/nl80211",
+    "wireless/nl80211/regulatory",
     smoke_nl80211_ext_power_reg_interface_station
 );
 

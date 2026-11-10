@@ -3289,6 +3289,44 @@ kernel_test_in!(
     mt76_tx_policy_requires_full_channel_and_keeps_open_tx_unprotected
 );
 
+fn mt76_world_country_keeps_regulatory_channel_bounds() -> TestResult {
+    use crate::mt7921::association::TxPermission;
+    use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
+    let mut domain = RegulatoryDomain {
+        country_code: *b"00",
+        rules: vec![RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 40,
+            max_power_dbm: 20,
+            flags: RegFlags::empty(),
+        }],
+    };
+    if TxPermission::from_domain(&domain, 6).is_none_or(|p| p.country != *b"00")
+        || TxPermission::from_domain(&domain, 14).is_some()
+    {
+        return TestResult::Fail("world country rejected or unavailable channel enabled");
+    }
+    for flag in [RegFlags::NO_IR, RegFlags::DFS, RegFlags::INDOOR_ONLY] {
+        domain.rules[0].flags = flag;
+        if TxPermission::from_domain(&domain, 6).is_some() {
+            return TestResult::Fail("world exception bypassed a TX restriction");
+        }
+    }
+    domain.rules[0].flags = RegFlags::empty();
+    for invalid in [*b"0A", *b"us", *b"\0\0"] {
+        domain.country_code = invalid;
+        if TxPermission::from_domain(&domain, 6).is_some() {
+            return TestResult::Fail("world exception accepted invalid country");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/transport/regulatory",
+    mt76_world_country_keeps_regulatory_channel_bounds
+);
+
 fn mt76_retained_key_work_survives_waiter_drop_and_sync_poll_progresses() -> TestResult {
     let mut session = secure_model();
     let State::Associated { info, peer, .. } = session.state else {

@@ -1,4 +1,4 @@
-//! Signed deployment-policy bootstrap shared by independently booted drivers.
+//! Authenticated regulatory bootstrap shared by independently booted drivers.
 use super::{parse_policy, RegulatoryDomain};
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError, FirmwareRegistry};
@@ -48,15 +48,33 @@ fn load_from(
     blob.invoke(ReadPolicy).map_err(|_| Error::Authority)?
 }
 
-/// Read the exact staged NRGD policy through current firmware capability
-/// invocation. Signer metadata is mandatory even in unsigned development
-/// builds. Parsing succeeds before any caller can install the result.
-/// No country, calibration or transmit permission is synthesized here.
-pub fn load() -> Result<RegulatoryDomain, Error> {
+pub(super) fn load_bootstrap() -> Result<(RegulatoryDomain, super::db::Source), Error> {
     let authority = narf_firmware::trusted_loader_authority()
         .and_then(|cap| cap.derive::<Read>().ok())
         .ok_or(Error::Authority)?;
-    load_from(&authority, NAME)
+    bootstrap_from(&authority, NAME, narf_firmware::linux_regulatory_database())
+}
+
+fn bootstrap_from(
+    authority: &Cap<FirmwareRegistry, Read>,
+    name: &str,
+    linux: &[u8],
+) -> Result<(RegulatoryDomain, super::db::Source), Error> {
+    match load_from(authority, name) {
+        Ok(domain) => Ok((domain, super::db::Source::Deployment)),
+        Err(Error::Firmware(FirmwareError::NotFound)) => {
+            let (domain, dfs) = super::linux::country(linux, *b"00").map_err(Error::Format)?;
+            Ok((domain, super::db::Source::Linux(dfs)))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Prefer an explicitly staged signed NRGD policy. Only its absence selects
+/// world 00 from the unmodified Linux database authenticated at image build.
+/// A malformed, unsigned or inaccessible explicit policy never falls back.
+pub fn load() -> Result<RegulatoryDomain, Error> {
+    load_bootstrap().map(|(domain, _)| domain)
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

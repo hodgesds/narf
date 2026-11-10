@@ -1,6 +1,8 @@
 use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
+#[path = "reg/linux.rs"]
+pub(crate) mod linux;
 #[path = "reg/policy.rs"]
 pub mod policy;
 #[path = "reg/witness.rs"]
@@ -300,6 +302,13 @@ pub mod db {
     pub(super) struct State {
         pub(super) domain: Option<Arc<RegulatoryDomain>>,
         pub(super) revision: u64,
+        source: Source,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Source {
+        Caller,
+        Deployment,
+        Linux(u8),
     }
     impl Default for Database {
         fn default() -> Self {
@@ -312,6 +321,7 @@ pub mod db {
                 state: IrqSafeSpinLock::new(State {
                     domain: None,
                     revision: 0,
+                    source: Source::Caller,
                 }),
             }
         }
@@ -320,6 +330,7 @@ pub mod db {
             let retired = {
                 let mut state = self.state.lock();
                 state.revision = state.revision.saturating_add(1);
+                state.source = Source::Caller;
                 state.domain.replace(domain)
             };
             // Free the retired rule storage outside the IRQ-safe DB lock.
@@ -329,6 +340,7 @@ pub mod db {
             let retired = {
                 let mut state = self.state.lock();
                 state.revision = state.revision.saturating_add(1);
+                state.source = Source::Caller;
                 state.domain.take()
             };
             drop(retired);
@@ -364,12 +376,73 @@ pub mod db {
     }
 
     pub fn ensure_snapshot() -> Result<Arc<RegulatoryDomain>, policy::Error> {
-        ensure_with(&ACTIVE_DOMAIN, policy::load)
+        ensure_source_with(&ACTIVE_DOMAIN, policy::load_bootstrap)
     }
 
+    pub(crate) fn ensure_with_info() -> Result<(Arc<RegulatoryDomain>, u8), policy::Error> {
+        ensure_snapshot()?;
+        let state = ACTIVE_DOMAIN.state.lock();
+        let domain = state.domain.clone().ok_or(policy::Error::Authority)?;
+        let dfs = match state.source {
+            Source::Linux(dfs) => dfs,
+            _ => 0,
+        };
+        Ok((domain, dfs))
+    }
+
+    /// Country hints may replace only the Linux database installation. A
+    /// signed deployment override or trusted caller policy keeps its bounds.
+    pub(crate) fn select_linux_country(alpha2: [u8; 2]) -> Result<(), policy::Error> {
+        ensure_snapshot()?;
+        select_linux_with(&ACTIVE_DOMAIN, || {
+            super::linux::country(narf_firmware::linux_regulatory_database(), alpha2)
+                .map_err(policy::Error::Format)
+        })
+    }
+
+    pub(super) fn select_linux_with(
+        database: &Database,
+        load: impl FnOnce() -> Result<(RegulatoryDomain, u8), policy::Error>,
+    ) -> Result<(), policy::Error> {
+        let revision = {
+            let state = database.state.lock();
+            if !matches!(state.source, Source::Linux(_)) || state.domain.is_none() {
+                return Err(policy::Error::Authority);
+            }
+            state.revision
+        };
+        let (domain, dfs) = load()?;
+        let domain = Arc::new(domain);
+        let retired = {
+            let mut state = database.state.lock();
+            if !matches!(state.source, Source::Linux(_))
+                || state.revision != revision
+                || state.revision == u64::MAX
+                || state.domain.is_none()
+            {
+                return Err(policy::Error::Authority);
+            }
+            state.revision += 1;
+            state.source = Source::Linux(dfs);
+            state.domain.replace(domain)
+        };
+        drop(retired);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn ensure_with(
         database: &Database,
         load: impl FnOnce() -> Result<RegulatoryDomain, policy::Error>,
+    ) -> Result<Arc<RegulatoryDomain>, policy::Error> {
+        ensure_source_with(database, || {
+            load().map(|domain| (domain, Source::Deployment))
+        })
+    }
+
+    pub(super) fn ensure_source_with(
+        database: &Database,
+        load: impl FnOnce() -> Result<(RegulatoryDomain, Source), policy::Error>,
     ) -> Result<Arc<RegulatoryDomain>, policy::Error> {
         let revision = {
             let state = database.state.lock();
@@ -384,7 +457,8 @@ pub mod db {
         };
         // Firmware lookup/invocation and decoding must happen without the
         // database's IRQ-disabling lock. Failed loads publish no partial state.
-        let loaded = Arc::new(load()?);
+        let (loaded, source) = load()?;
+        let loaded = Arc::new(loaded);
         let mut guard = database.state.lock();
         // A concurrently installed caller policy wins over this bootstrap.
         let selected = if let Some(domain) = &guard.domain {
@@ -394,6 +468,7 @@ pub mod db {
             Err(policy::Error::Authority)
         } else {
             guard.revision += 1;
+            guard.source = source;
             guard.domain = Some(loaded.clone());
             Ok(loaded.clone())
         };
