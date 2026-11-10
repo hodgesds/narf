@@ -715,6 +715,195 @@ kernel_test_in!(
     navi22_recovery_and_tdr_require_a_completed_recoverable_boot
 );
 
+/// A trained Navi22 owner is recoverable and survives the recovery rebuild
+/// (#1796): `into_recovery` retains its finished trainer, marks the
+/// rebuilt owner for replay, and the rebuilt owner's MemoryTraining stage
+/// replays the cache (`PSP_MEM_TRAIN_RESUME`) after the mode1 reset and
+/// before SOS loads. A trainer that never finished keeps the owner
+/// unrecoverable, and a failed or cancelled replay wedges the trainer so
+/// no later rebuild can trust it.
+fn navi22_trained_owner_survives_recovery_rebuild() -> TestResult {
+    let addr = narf_bus::PcieAddr::new(0, 3, 0, 0);
+    let device = narf_bus::BusDevice {
+        addr: narf_bus::BusAddr::Pcie(addr),
+        kind: narf_bus::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+        id: narf_bus::DeviceId {
+            vendor: 0x1002,
+            device: 0x73df,
+            class: 0x030000,
+            subsystem_vendor: 0x1462,
+            subsystem_id: 0x3985,
+        },
+    };
+    // Back the fixture GPU's registers with zeroes, as the PSP tests do:
+    // `Psp::new_rdna2` reads the FB_LOCATION registers while validating
+    // the pool, and the unmapped fixture addresses would fault. The pool
+    // is the consistent aperture for those zeroed registers (GPU address
+    // 0, BAR physical 0x9000_0000), and the BAR is wide enough for the
+    // 32 MiB training preimage the shared fixture GPU cannot fit.
+    let mut regs = vec![0u32; 0x80000 / 4];
+    let mut trained_gpu = gpu();
+    trained_gpu.regs = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0xa000_0000),
+        virt: regs.as_mut_ptr() as u64,
+        len: regs.len() as u64 * 4,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    trained_gpu.fb_bar = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0x9000_0000),
+        virt: 0,
+        len: 256 << 20,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    trained_gpu.vram.base = 0x9000_0000;
+    trained_gpu.vram.visible_size = 256 << 20;
+    let exchange = crate::amdgpu_vram_boot::Training {
+        c2p: (12 << 30) - (9 << 20),
+        p2c: (12 << 30) - 0x8000,
+        size: 4096,
+    };
+    // SAFETY: bookkeeping-only pool; its GPU addresses are consistent
+    // with the backed register mapping above.
+    let pool = unsafe {
+        Pool::from_owned_range(
+            narf_bus::MmioRegion {
+                phys: narf_memory::PhysAddr::new(0x9000_0000),
+                virt: 0,
+                len: 64 << 20,
+                kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+            },
+            0,
+        )
+    }
+    .unwrap();
+    let authority = Cap::bootstrap();
+    let mut unfinished_firmware = firmware();
+    unfinished_firmware.power = Some(crate::amdgpu_power_navi22::tests::prepared());
+    let mut boot_firmware = firmware();
+    boot_firmware.power = Some(crate::amdgpu_power_navi22::tests::prepared());
+    // SAFETY: constructors perform no I/O; the trainer only allocates its
+    // preimage/cache, and every step below refuses before touching the
+    // device. No queue, display or service ever starts, so the missing
+    // `quiesce_for_reset` cannot be observed: the rebuilt owner is never
+    // run.
+    let mut unfinished = unsafe {
+        ColdBoot::new_with_training(
+            &trained_gpu,
+            authority,
+            &pool,
+            unfinished_firmware,
+            exchange,
+        )
+    }
+    .unwrap();
+    // SAFETY: same constructor as `unfinished` above: no I/O, the trainer
+    // only allocates its preimage/cache, and every step below refuses
+    // before touching the device.
+    let mut boot = unsafe {
+        ColdBoot::new_with_training(&trained_gpu, authority, &pool, boot_firmware, exchange)
+    }
+    .unwrap();
+    // A cold-path control: its finished trainer must cold-train (`run`),
+    // not replay, when its owner has no reset to replay after.
+    // SAFETY: same constructor as `unfinished` above: no I/O, the trainer
+    // only allocates its preimage/cache, and every step below refuses
+    // before touching the device.
+    let mut cold = unsafe {
+        ColdBoot::new_with_training(&trained_gpu, authority, &pool, firmware(), exchange)
+    }
+    .unwrap();
+    for owner in [&mut unfinished, &mut boot] {
+        // SAFETY: register reads are backed by the zeroed fixture regs and
+        // the pool is the consistent aperture for them; each owner
+        // exclusively owns its fixture-GPU snapshot, authority and pool
+        // slice, and no other PSP owner exists in this test.
+        let psp =
+            unsafe { psp::Psp::new_rdna2(&owner.sequence.backend.gpu, authority, &pool) }.unwrap();
+        owner.sequence.backend.psp = Some(psp);
+        // SAFETY: forwarded whole-GPU/pool/PCI ownership from the owner;
+        // no I/O or interrupt routing occurs during construction, and no
+        // other IH owner exists in this test.
+        let ih = unsafe {
+            crate::amdgpu_ih_navi22::Ih::new_rdna2(
+                &owner.sequence.backend.gpu,
+                authority,
+                &pool,
+                device,
+            )
+        }
+        .unwrap();
+        owner.sequence.backend.ih = Some(ih);
+        owner.sequence.state = State::FirmwareReady(report());
+    }
+    // A trainer that never finished cannot be replayed: the owner stays
+    // unrecoverable and the rebuild is refused before any I/O.
+    if unfinished.training_replayable() || unfinished.recoverable() {
+        return TestResult::Fail("unfinished GDDR6 trainer left the owner recoverable");
+    }
+    // SAFETY: refused before any constructor or I/O runs.
+    if unsafe { unfinished.into_recovery(device) }.err() != Some(Error::Busy) {
+        return TestResult::Fail("rebuilt an owner with an unfinished GDDR6 trainer");
+    }
+    // The finished trainer makes the trained owner recoverable.
+    boot.sequence
+        .backend
+        .training
+        .as_mut()
+        .unwrap()
+        .mark_finished_for_test();
+    cold.sequence
+        .backend
+        .training
+        .as_mut()
+        .unwrap()
+        .mark_finished_for_test();
+    if !boot.training_replayable()
+        || !boot.recoverable()
+        || boot.training_state() != Some(gddr6::State::Ready)
+    {
+        return TestResult::Fail("finished GDDR6 trainer left the owner unrecoverable");
+    }
+    // SAFETY: as above; the rebuilt owner is never run.
+    let mut rebuilt = unsafe { boot.into_recovery(device) }.unwrap();
+    if rebuilt.training_state() != Some(gddr6::State::Ready)
+        || !rebuilt.sequence.backend.training_resume
+        || !rebuilt.training_replayable()
+    {
+        return TestResult::Fail("recovery rebuild dropped the finished GDDR6 trainer");
+    }
+    // The replay runs at MemoryTraining, after the reset and before SOS:
+    // revoke the trainer's authority so the probe fails at the cap invoke,
+    // before any MMIO, and distinguishes replay (Revoked) from cold
+    // training (Busy on a finished trainer).
+    authority.revoke();
+    if run(rebuilt.sequence.backend.step(Stage::MemoryTraining))
+        != Err(Error::Training(gddr6::Error::Revoked))
+    {
+        return TestResult::Fail("rebuilt owner cold-trained instead of replaying its cache");
+    }
+    if run(cold.sequence.backend.step(Stage::MemoryTraining))
+        != Err(Error::Training(gddr6::Error::Busy))
+    {
+        return TestResult::Fail("cold owner replayed instead of cold-training");
+    }
+    // A failed or cancelled replay wedges the trainer: it can no longer be
+    // replayed, so the owner stays unrecoverable rather than rebuilding
+    // onto untrained memory. The refused cold path wedges nothing.
+    if rebuilt.training_replayable() || !cold.training_replayable() {
+        return TestResult::Fail("failed GDDR6 replay left the trainer replayable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_trained_owner_survives_recovery_rebuild
+);
+
 /// Linux ordering the firmware path must keep: PSP TMR reservation and SMC
 /// precede everything else (SETUP_TMR itself is inside `Smc`, after PMFW),
 /// GC golden settings precede SDMA, and DMUB starts only after every queue
@@ -729,6 +918,12 @@ fn navi22_stage_order_matches_linux_firmware_path() -> TestResult {
         || at(Stage::DmubStart) <= at(Stage::FenceInterrupts)
         || at(Stage::DmubStart) >= at(Stage::Media)
         || at(Stage::DmubQuiesce) >= at(Stage::Graphics)
+        // GDDR6 replay order (#1796): the mode1 reset, then the training
+        // replay, then SOS loads — a replay before the reset would train
+        // state the reset discards, and after SOS would train under a
+        // running bootloader.
+        || at(Stage::ResetOnInit) + 1 != at(Stage::MemoryTraining)
+        || at(Stage::MemoryTraining) + 1 != at(Stage::Sos)
     {
         return TestResult::Fail("firmware stage order diverges from Linux");
     }

@@ -380,4 +380,4 @@ fn prepare_for<'a>(
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_power_navi22_tests.rs"]
-mod tests;
+pub(crate) mod tests;

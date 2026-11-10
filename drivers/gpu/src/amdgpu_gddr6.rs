@@ -600,6 +600,14 @@ impl Trainer {
     pub fn state(&self) -> State {
         self.engine.state
     }
+    /// Test-only: record the trainer as finished (as a successful `run`
+    /// would), so boot-level fixtures can exercise retention and replay
+    /// without device I/O. The cache stays empty: `training_data` is
+    /// `None` until a real run fills it.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn mark_finished_for_test(&mut self) {
+        self.engine.state = State::Ready;
+    }
     pub async fn run(&mut self) -> Result<(), Error> {
         self.engine.run().await
     }

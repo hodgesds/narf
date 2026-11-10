@@ -15,6 +15,12 @@ fn identity() -> Identity {
         subsystem_device: 0x0b36,
     }
 }
+/// A prepared power table for boot-level fixtures: the synthetic VBIOS
+/// powerplay table (id 0, VBIOS source) from this module's own fixtures.
+pub(crate) fn prepared() -> Prepared {
+    prepare(&bios(0), None, identity()).unwrap()
+}
+
 fn table() -> Vec<u8> {
     let mut bytes = vec![0xa5; TABLE_BYTES];
     put16(&mut bytes, 0, TABLE_BYTES as u16);
