@@ -204,8 +204,6 @@ const MAX_NEW_ANCESTORS: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Fallback {
-    /// The log path is switched off ([`set_fsync_via_log`]).
-    Disabled,
     /// An earlier log write of this transaction failed part-way.
     LogAborted,
     /// A directory, symlink or special file.
@@ -243,8 +241,7 @@ pub enum Fallback {
 }
 
 impl Fallback {
-    pub const ALL: [Fallback; 15] = [
-        Fallback::Disabled,
+    pub const ALL: [Fallback; 14] = [
         Fallback::LogAborted,
         Fallback::NotRegularFile,
         Fallback::Unlinked,
@@ -263,7 +260,6 @@ impl Fallback {
 
     pub fn name(self) -> &'static str {
         match self {
-            Fallback::Disabled => "log disabled",
             Fallback::LogAborted => "earlier log write failed",
             Fallback::NotRegularFile => "not a regular file",
             Fallback::Unlinked => "unlinked inode",
@@ -331,14 +327,6 @@ enum Outcome {
     Commit(Fallback),
 }
 
-static FSYNC_VIA_LOG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Route `fsync`/`fdatasync` through the tree log (`true`) or a full commit
-/// (`false`, the default while the log path is being proven).
-pub fn set_fsync_via_log(on: bool) {
-    FSYNC_VIA_LOG.store(on, Ordering::Release);
-}
-
 // `struct btrfs_inode_item` offsets.
 const II_SIZE: usize = 16;
 const II_NLINK: usize = 40;
@@ -370,9 +358,7 @@ pub(crate) async fn fsync_inode<B: BlockDevice + 'static>(
     is_dir: bool,
 ) -> Result<(), FsError> {
     let _op = vol.op_lock().lock().await;
-    let outcome = if !FSYNC_VIA_LOG.load(Ordering::Acquire) {
-        Outcome::Commit(Fallback::Disabled)
-    } else if is_dir {
+    let outcome = if is_dir {
         Outcome::Commit(Fallback::NotRegularFile)
     } else if !vol.admits_writes() {
         Outcome::Commit(Fallback::ReadOnly)

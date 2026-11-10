@@ -724,13 +724,13 @@ fn smoke_btrfs_crash_before_super_preserves_committed_tree() -> TestResult {
         Some(Ok(n)) if n == payload.len() => {}
         _ => return TestResult::Fail("committed write failed"),
     }
-    // Commits are batched, so "committed" means fsynced — a write that has
-    // only staged its superblock is not yet the tree a crash falls back to.
-    // This is what makes the snapshot below the durable tree rather than an
-    // in-memory one.
-    match poll_once(survivor.fsync(false)) {
+    // Commits are batched, so "committed" means synced — a write that has
+    // only been staged is not yet the tree a crash falls back to. (An fsync
+    // would log the file, not commit the tree.) This is what makes the
+    // snapshot below the durable tree rather than an in-memory one.
+    match poll_once(vol.sync_to_disk()) {
         Some(Ok(())) => {}
-        _ => return TestResult::Fail("fsync of the committed write failed"),
+        _ => return TestResult::Fail("commit of the write failed"),
     }
 
     // Snapshot every block the now-durable fs tree occupies.
@@ -12607,8 +12607,16 @@ fn super_lbas(offset: u64) -> (u64, u64) {
 /// A commit follows Linux `write_all_supers`: every tree/data block of the
 /// transaction is written first, then a device flush, then the primary
 /// superblock with FUA, then the mirror (plain write), with nothing else
-/// after the flush but `fsync`'s closing barrier.
+/// after the flush but the sync's closing barrier. An fsync's log sync
+/// (`btrfs_sync_log`) follows the same order with the log's blocks.
 fn smoke_btrfs_commit_flush_fua_order() -> TestResult {
+    match flush_fua_order(false) {
+        TestResult::Pass => flush_fua_order(true),
+        failed => failed,
+    }
+}
+
+fn flush_fua_order(by_fsync: bool) -> TestResult {
     use narf_filesystem::FsInstance;
 
     let dev = recording(FIXTURE_MIRROR_SPARSE);
@@ -12624,8 +12632,13 @@ fn smoke_btrfs_commit_flush_fua_order() -> TestResult {
         return TestResult::Fail("write failed");
     }
     dev.log.lock().clear();
-    if !matches!(poll_once(f.fsync(false)), Some(Ok(()))) {
-        return TestResult::Fail("fsync failed");
+    let synced = if by_fsync {
+        poll_once(f.fsync(false))
+    } else {
+        poll_once(vol.sync_to_disk_exclusive())
+    };
+    if !matches!(synced, Some(Ok(()))) {
+        return TestResult::Fail("sync failed");
     }
     let log = dev.log.lock().clone();
     let (p0, p1) = super_lbas(format::SUPERBLOCK_OFFSET);

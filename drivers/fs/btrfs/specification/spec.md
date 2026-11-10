@@ -247,13 +247,17 @@ when their reservation does not fit (Linux
 `btrfs_start_transaction_fallback_global_rsv`, `evict_refill_and_join`), so a
 full filesystem can still be emptied; the batch then commits at once.
 
-`fsync` and `fdatasync`, on a file or a directory, both commit the open
-transaction and write its superblock (`sync_to_disk_exclusive`). `fdatasync`
-is not weaker: the size and extent items a write's data is read back through
-live in the open batch until it commits, so a device flush alone makes
-nothing of that write durable (`smoke_btrfs_fdatasync_survives_a_later_crash`;
-Linux `btrfs_sync_file` ignores `datasync` too). Neither goes through a tree
-log; `write::write_log` (hand-built items, for tests) is the only writer.
+`fsync` and `fdatasync` of a regular file write the inode's changes since
+the last commit to the tree log and one superblock naming it
+(`tree_log::fsync_inode`, "Tree-log writer" below); they do not commit the
+transaction. An fsync the log cannot express exactly — a directory's
+always, and the cases listed below — commits the open transaction and
+writes its superblock instead (`sync_to_disk_op_locked`), as every fsync
+did before. `fdatasync` is not weaker: the size and extent items a write's
+data is read back through live in the open batch until it commits or is
+logged, so a device flush alone makes nothing of that write durable
+(`smoke_btrfs_fdatasync_survives_a_later_crash`; Linux `btrfs_sync_file`
+ignores `datasync` too). `syncfs`, `sync` and unmount commit.
 
 **Tree-log replay** (`write/log_replay.rs`, `write/tree_log.rs`). A
 read-write mount of a filesystem whose superblock names a log
@@ -307,10 +311,8 @@ Qgroup counts are not maintained by replay.
 **Tree-log writer** (`write/tree_log.rs`; Linux `btrfs_sync_file` →
 `btrfs_log_dentry_safe` → `btrfs_log_inode`, then `btrfs_sync_log`).
 `tree_log::fsync_inode` logs one regular file and makes the log durable
-without committing the transaction. It is reached from `FileOps::fsync` /
-`DirOps::fsync` and is switched off by default
-(`write::set_fsync_via_log(false)`: every fsync still commits) until the
-switch is removed.
+without committing the transaction. `FileOps::fsync` and `DirOps::fsync`
+both go through it.
 
 NARF writes a file's data extents when `write` returns and stages the
 fs-tree edits into the open transaction, whose tree blocks are on the device
@@ -368,8 +370,8 @@ correct, as in Linux (`BTRFS_LOG_FORCE_COMMIT`, `btrfs_set_log_full_commit`):
   logs directories (`log_directory_changes`); this writer does not;
 - **names changed since the commit**: the file was renamed, linked or lost
   one of several links (Linux: `btrfs_log_new_name`, `last_unlink_trans` →
-  `btrfs_log_all_parents`); also a new parent directory whose own name
-  changed;
+  `btrfs_log_all_parents`); also when the directory a new file is in, or a
+  new directory above it, was itself renamed;
 - **a name of a new file collides**: the name, or its directory index, was
   held by any inode at the commit (replay would unlink that inode's entry:
   Linux resolves it with `log_conflicting_inodes`), or is claimed by another
@@ -431,7 +433,7 @@ random workloads, kills it, and replays each crashed image with that kernel
 and with NARF: the trees must be identical, both must pass
 `btrfs check --check-data-csum`, and the NARF-replayed image must mount on
 Linux unchanged. `--scenario fsync-narf` runs the same scripts through NARF
-with the log path on and copies the image at the crash point: a real Linux
+and copies the image at the crash point: a real Linux
 kernel replays every NARF-written log, NARF replays a second copy, and the
 same comparison and checks apply; it reports how many fsyncs were logged
 and why the others committed. `--scenario fsync-sweep` records the device
@@ -447,8 +449,13 @@ cost five superblock writes and no commit),
 write-temp + fsync + rename), `smoke_btrfs_fsync_log_across_a_commit`,
 `smoke_btrfs_fsync_falls_back_to_a_commit` and
 `smoke_btrfs_own_log_replay_survives_a_crash_at_any_write` remount a copy of
-the device taken at the crash point through replay. Without a bootable
-kernel the Linux scenarios report themselves unverified, never passed.
+the device taken at the crash point through replay. The seeded workloads of
+`root`, `snapshots` and `lba4k` fsync through the log as well; their crash
+pass holds a cut image whose superblock names a log to the last commit with
+exactly the logged inodes replayed over it. `cargo xtask btrfs-crash-smoke`
+kills QEMU right after an fsync and verifies the file on the next boot.
+Without a bootable kernel the Linux scenarios report themselves unverified,
+never passed.
 
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.

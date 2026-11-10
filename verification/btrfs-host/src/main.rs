@@ -449,11 +449,12 @@ fn run_scenario(sc: &Scenario, seed: u64, args: &Args) -> Result<String, String>
             ));
         }
         crash_line = format!(
-            "crash: {} cuts over {} events / {} flushes, {} distinct generations, {} torn + {} dropped volatile writes",
+            "crash: {} cuts over {} events / {} flushes, {} distinct generations, {} cut images with a tree log replayed, {} torn + {} dropped volatile writes",
             rep.cuts,
             log.len(),
             rep.flush_boundaries,
             rep.gens_seen.len(),
+            rep.with_log,
             rep.torn,
             rep.dropped
         );
@@ -463,12 +464,13 @@ fn run_scenario(sc: &Scenario, seed: u64, args: &Args) -> Result<String, String>
     }
     let ops: Vec<String> = stats.ops.iter().map(|(k, v)| format!("{k}:{v}")).collect();
     Ok(format!(
-        "{} seed {seed}: OK in {:.1?}\n    @ {} | @home {}\n    {} commits, {:.1} MiB written by ops, device {writes} writes / {flushes} flushes; chunks data {}->{} metadata {}->{}; {} snapshots unchanged\n    ops {}\n    {crash_line}",
+        "{} seed {seed}: OK in {:.1?}\n    @ {} | @home {}\n    {} commits, {} tree-log syncs, {:.1} MiB written by ops, device {writes} writes / {flushes} flushes; chunks data {}->{} metadata {}->{}; {} snapshots unchanged\n    ops {}\n    {crash_line}",
         sc.name,
         t0.elapsed(),
         summarize(&final_state[0]),
         summarize(&final_state[1]),
         stats.commits,
+        stats.log_syncs,
         stats.bytes_written as f64 / 1048576.0,
         chunks_before.0,
         chunks_after.0,

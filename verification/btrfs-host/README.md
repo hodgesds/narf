@@ -67,8 +67,8 @@ twice from copies, by Linux and by NARF, and the two trees must be
 identical, pass `btrfs check --check-data-csum`, keep what the script's
 fsyncs promised, and the NARF-replayed image must mount on Linux unchanged.
 
-`fsync-narf` is the other direction: NARF runs the scripts with its log
-writer on, the image is copied at `crash`, and the same two replays and
+`fsync-narf` is the other direction: NARF runs the scripts, the image is
+copied at `crash`, and the same two replays and
 checks follow — a real kernel replaying logs NARF wrote. It prints how the
 fsyncs were served (logged, committed and why, nothing to do) and what the
 sixty-file write-temp + fsync + rename burst cost in superblock writes and
@@ -80,6 +80,12 @@ once keeping every write and once dropping the ones no flush had covered,
 and requires each resulting image to replay under NARF with every returned
 fsync intact and to pass `btrfs check`; every eighth cut is also replayed by
 Linux and compared.
+
+The seeded workloads fsync through the log too. `workload` keeps, beside
+the model, the inodes logged since the last commit as they were when
+fsynced; a crash image whose superblock names a log must replay to the
+last commit with exactly those inodes (and the new directories logged with
+them) on top.
 
 When no kernel can be booted (no readable `/boot/vmlinuz*`, btrfs built as a
 module, no QEMU, no static libc) the scenario prints

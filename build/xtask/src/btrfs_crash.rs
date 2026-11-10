@@ -4,16 +4,19 @@
 //! Boot 1 (`narf.btrfs_crash=write`) writes and `fsync`s a patterned file on
 //! a disposable btrfs NVMe image, prints `NARF-BTRFS-CRASH: COMMITTED`, and
 //! keeps writing uncommitted noise. The host SIGKILLs QEMU the moment that
-//! line arrives, so the stop lands mid-transaction with I/O in flight. Boot
-//! 2 (`narf.btrfs_crash=verify`) mounts the same image read-only and must
-//! find the fsynced file intact. Then host `btrfs check --readonly` must pass.
+//! line arrives, so the stop lands mid-transaction with I/O in flight. Host
+//! `btrfs check --readonly` must accept the killed image as it is (tree log
+//! included). Boot 2 (`narf.btrfs_crash=verify`) mounts the same image
+//! read-write, which replays the log the fsync wrote, and must find the
+//! fsynced file intact. Then host `btrfs check --readonly
+//! --check-data-csum` must pass on the replayed image.
 //! The guest half is `drivers/fs/btrfs/src/crash_check.rs`.
 //!
 //! The kill happens at the QEMU process, so data that QEMU had handed to the
 //! host page cache survives. What the test proves is that everything `fsync`
-//! promised had left the guest (its trees, the pre-flush, and the FUA
-//! superblock) when `fsync` returned, and that the uncommitted transaction
-//! open at kill time leaves a consistent image behind.
+//! promised had left the guest (its data, the log's blocks, the pre-flush,
+//! and the FUA superblock) when `fsync` returned, and that the uncommitted
+//! transaction open at kill time leaves a consistent image behind.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -158,7 +161,39 @@ pub fn run(args: &Args) -> Result<()> {
         None => bail!("btrfs-crash-smoke: write boot never reported {COMMITTED}"),
     }
 
-    println!("xtask btrfs-crash-smoke: boot 2 (verify after the kill)");
+    // The killed image, before anything replays its log.
+    let killed = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&image)
+        .output()
+        .context("run host `btrfs check` on the killed image")?;
+    let killed_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&killed.stdout),
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    if !killed.status.success() || !killed_text.contains("no error found") {
+        println!("{killed_text}");
+        bail!("btrfs-crash-smoke: host `btrfs check` failed on the killed image (before replay)");
+    }
+    let super_dump = Command::new("btrfs")
+        .args(["inspect-internal", "dump-super"])
+        .arg(&image)
+        .output()
+        .context("run `btrfs inspect-internal dump-super`")?;
+    let has_log = String::from_utf8_lossy(&super_dump.stdout)
+        .lines()
+        .any(|l| l.starts_with("log_root\t") && !l.trim_end().ends_with("\t0"));
+    println!(
+        "xtask btrfs-crash-smoke: killed image is check-clean and {}",
+        if has_log {
+            "carries a tree log (the fsync did not commit)"
+        } else {
+            "carries no tree log (a commit landed before the kill)"
+        }
+    );
+
+    println!("xtask btrfs-crash-smoke: boot 2 (mount read-write, replay, verify)");
     match boot_until(
         &args.build,
         &kernel,

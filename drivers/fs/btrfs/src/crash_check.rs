@@ -4,9 +4,11 @@
 //! `write` mounts the first btrfs device, writes a patterned file, `fsync`s
 //! it, prints [`COMMITTED`], and then keeps writing uncommitted noise until
 //! the host kills QEMU. `verify` (the next boot of the same image) mounts it
-//! read-only and checks that the fsynced file is intact. Together they show
-//! that a returned `fsync` (a flushed and FUA-written commit) survives an
-//! abrupt stop with I/O in flight.
+//! read-write — the mount that replays the tree log the fsync wrote, as the
+//! next writable boot of a real root does — and checks that the fsynced
+//! file is intact. Together they show that a returned `fsync` (log blocks,
+//! pre-flush and a FUA superblock naming the log) survives an abrupt stop
+//! with I/O in flight.
 //!
 //! Test scaffolding that writes to a disk. It runs only when the command line
 //! asks for it, and xtask passes that flag only with its own disposable image.
@@ -91,8 +93,13 @@ pub fn register() {
             }
             "verify" => {
                 let verdict = narf_scheduler::block_on(async {
+                    // Read-write: a read-only mount leaves a tree log alone
+                    // (and would not see what the fsync logged).
                     let vol: Arc<crate::volume::BtrfsVolume<narf_block::SyncBlock>> =
-                        crate::registry::mount(&dev, members, subvol.clone(), true).await?;
+                        crate::registry::mount(&dev, members, subvol.clone(), false).await?;
+                    if vol.is_read_only() {
+                        return Err(FsError::ReadOnly);
+                    }
                     let file = vol.root().lookup_async(FILE).await?;
                     let mut buf = alloc::vec![0u8; LEN + 16];
                     let n = file.read(0, &mut buf).await?;

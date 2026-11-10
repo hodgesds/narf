@@ -325,8 +325,11 @@ therefore writable without leaving superblock copies out of sync. On a
 multi-device commit the same common transaction state is written to every
 member while each member retains its own embedded devid, size and UUID fields.
 
-**fsync / tree-log.** `fsync` and `fdatasync` commit the open transaction
-and write its superblock. A tree log — which Linux writes on fsync, and which
+**fsync / tree-log.** `fsync` and `fdatasync` of a regular file write its
+changes since the last commit to a tree log and one superblock, as Linux
+does, instead of committing the transaction; what the log does not cover (a
+directory, a renamed file, the cases the specification lists) commits. A
+tree log — NARF's or Linux's, which
 a crash before the next commit leaves named by `super.log_root` — is replayed
 at a read-write mount exactly as Linux `btrfs_recover_log_trees` replays it
 (`write/log_replay.rs`): inode items, names, link counts, xattr and directory
@@ -339,8 +342,7 @@ tests. `write/tree_log.rs` is the fsync log writer — an inode's changes
 since the last commit, its new extents' checksums, and for a new file its
 name and new parent directories, written as a log tree a Linux kernel
 replays — with a full commit as the fallback for everything it does not log
-(the specification lists each case). It is off by default
-(`write::set_fsync_via_log`).
+(the specification lists each case).
 
 Bound (fails loudly): trees grow to at most `BTRFS_MAX_LEVEL` (8) levels. Trees
 taller than two levels are exercised in-kernel (`smoke_btrfs_tall_tree` writes and

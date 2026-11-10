@@ -232,7 +232,9 @@ fn smoke_btrfs_plain_cache_does_not_trust_missing_checksums() -> TestResult {
     if crate::decompress_cache::cached_bytes_for(&cache_handle(&vol)) != 0 {
         return TestResult::Fail("unchecked pending bytes entered the verified cache");
     }
-    if poll_once(file.fsync(false)) != Some(Ok(())) {
+    // A commit, which is what puts the checksum in the csum tree (an fsync
+    // only logs it).
+    if poll_once(vol.sync_to_disk()) != Some(Ok(())) {
         return TestResult::Fail("pending checksum commit failed");
     }
     if poll_once(file.read(0, &mut bytes)) != Some(Err(FsError::InvalidData)) {

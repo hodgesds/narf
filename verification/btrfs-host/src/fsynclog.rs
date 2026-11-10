@@ -20,7 +20,8 @@
 //! as some fsync left it, never empty or torn.
 //!
 //! `fsync-linux`: Linux writes the log (the guest is killed at `crash`).
-//! `fsync-narf`: NARF writes it — the scripts run through NARF's VFS and the
+//! `fsync-narf`: NARF writes it — the scripts run through NARF's VFS (whose
+//! fsync logs whatever it can and commits the rest) and the
 //! image is copied at `crash`, before anything else can reach it — and the
 //! run reports how many fsyncs went through the log and how many had to
 //! commit, with the superblock writes and commits a sixty-file
@@ -1615,9 +1616,6 @@ fn narf_runs(ctx: &Ctx, what: &str, case: &Case, record: bool) -> Result<NarfRun
     let work = ctx.dir.join(format!("{what}.work.img"));
     let crashed = ctx.dir.join(format!("{what}.crashed.img"));
     linux::clone_file(&ctx.pristine, &work);
-    // The log path is off by default until it replaces the commit path;
-    // these scenarios are what proves it, so they run with it on.
-    narf_drivers_fs_btrfs::write::set_fsync_via_log(true);
     let mounted = Mounted::mount(&work, ctx.fsid, ctx.nodesize)?;
     let mut model = ScriptModel::new();
     let mut base = fsync_cost_now(&mounted.dev);
@@ -1653,7 +1651,6 @@ fn narf_runs(ctx: &Ctx, what: &str, case: &Case, record: bool) -> Result<NarfRun
     linux::clone_file(&work, &crashed);
     mounted.dev.set_recording(false);
     mounted.unmount()?;
-    narf_drivers_fs_btrfs::write::set_fsync_via_log(false);
     let _ = std::fs::remove_file(&work);
     Ok(NarfRun {
         crashed,

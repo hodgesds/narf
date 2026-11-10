@@ -337,29 +337,11 @@ fn fsync_file(dir: &Arc<dyn DirOps>, name: &str, data_only: bool) -> bool {
     }
 }
 
-/// Turns the fsync log path on for one test (it is off by default while it
-/// is being proven) and off again when the test ends.
-struct LogPathOn;
-
-impl LogPathOn {
-    fn new() -> Self {
-        crate::write::tree_log::set_fsync_via_log(true);
-        LogPathOn
-    }
-}
-
-impl Drop for LogPathOn {
-    fn drop(&mut self) {
-        crate::write::tree_log::set_fsync_via_log(false);
-    }
-}
-
-/// A fresh writable filesystem with the log path on, and its device.
-fn log_fixture() -> Option<(Arc<WritableSparseDevice>, TestVol, LogPathOn)> {
-    let on = LogPathOn::new();
+/// A fresh writable filesystem and its device.
+fn log_fixture() -> Option<(Arc<WritableSparseDevice>, TestVol)> {
     let device = writable_sparse(FIXTURE_BGT_SPARSE);
     let vol = mount_writable(device.clone()).ok()?;
-    Some((device, vol, on))
+    Some((device, vol))
 }
 
 /// Mount what a crash at this instant leaves on `device` — replaying the
@@ -376,7 +358,7 @@ fn after_crash(device: &Arc<WritableSparseDevice>) -> Option<(Arc<WritableSparse
 /// overwrite, an append, a truncation, a file in directories that did not
 /// exist at the last commit — and nothing written after the fsync.
 fn smoke_btrfs_fsync_goes_through_the_log() -> TestResult {
-    let Some((device, vol, _log)) = log_fixture() else {
+    let Some((device, vol)) = log_fixture() else {
         return TestResult::Fail("fixture failed to mount");
     };
     let root = vol.root();
@@ -486,7 +468,7 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fsync_goes_through_the_log);
 /// each) and no transaction commit, where it used to cost sixty commits; and
 /// after a crash at the end every real file is whole, old or new.
 fn smoke_btrfs_fsync_burst_does_not_commit_per_fsync() -> TestResult {
-    let Some((device, vol, _log)) = log_fixture() else {
+    let Some((device, vol)) = log_fixture() else {
         return TestResult::Fail("fixture failed to mount");
     };
     let root = vol.root();
@@ -588,7 +570,7 @@ kernel_test_in!(
 /// the log's blocks return to the allocator, and an fsync in the next
 /// transaction starts a new log on top of the commit.
 fn smoke_btrfs_fsync_log_across_a_commit() -> TestResult {
-    let Some((device, vol, _log)) = log_fixture() else {
+    let Some((device, vol)) = log_fixture() else {
         return TestResult::Fail("fixture failed to mount");
     };
     let root = vol.root();
@@ -642,7 +624,7 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fsync_log_across_a_commit);
 /// commit, and of a new file under a name another inode held at the last
 /// commit.
 fn smoke_btrfs_fsync_falls_back_to_a_commit() -> TestResult {
-    let Some((device, vol, _log)) = log_fixture() else {
+    let Some((device, vol)) = log_fixture() else {
         return TestResult::Fail("fixture failed to mount");
     };
     let root = vol.root();
@@ -722,7 +704,7 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fsync_falls_back_to_a_commit);
 /// the device at every write of the replay (a spread when there are many)
 /// and the next mount still ends at what the uninterrupted replay gives.
 fn smoke_btrfs_own_log_replay_survives_a_crash_at_any_write() -> TestResult {
-    let Some((device, vol, _log)) = log_fixture() else {
+    let Some((device, vol)) = log_fixture() else {
         return TestResult::Fail("fixture failed to mount");
     };
     let root = vol.root();

@@ -262,7 +262,10 @@ fn desktop(
     block_on(dir.fsync(false)).map_err(err("fsync"))?;
     // KDE's `QSaveFile`: a temporary file, written, fsynced, renamed over
     // one of a few names. The rename (which drops the file it replaces)
-    // commits with the next save.
+    // commits with the next save. The fsync itself goes to the tree log; the
+    // commit this scenario measures is asked for after it (a directory
+    // fsync commits), so each step still records one commit of its own
+    // operations.
     let sizes = [1400usize, 6000, 20_000, 150_000, 700, 4096, 40_000, 9000];
     for i in 0..rounds * 8 {
         let body = noise(i as u64 ^ 0x5a5a, sizes[i % sizes.len()]);
@@ -272,7 +275,8 @@ fn desktop(
             block_on(async {
                 let file = dir.create(&tmp).await.map_err(err("create"))?;
                 write_all(&file, 0, &body).await?;
-                file.fsync(false).await.map_err(err("fsync"))
+                file.fsync(false).await.map_err(err("fsync"))?;
+                dir.fsync(false).await.map_err(err("commit"))
             })
         })?;
         block_on(dir.rename(&tmp, &name)).map_err(err("rename"))?;
@@ -287,7 +291,8 @@ fn desktop(
         commit_with(&mut rec.append, &mut rec.irregular, || {
             block_on(async {
                 write_all(&log, log_body.len() as u64, &line).await?;
-                log.fsync(false).await.map_err(err("fsync"))
+                log.fsync(false).await.map_err(err("fsync"))?;
+                dir.fsync(false).await.map_err(err("commit"))
             })
         })?;
         log_body.extend_from_slice(&line);

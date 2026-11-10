@@ -1086,8 +1086,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     /// `btrfs_sync_file` makes no distinction either: its `datasync`
     /// argument is only traced, and both calls log the same inode state.
     ///
-    /// Both go through [`crate::write::tree_log::fsync_inode`], which logs
-    /// the inode or, for whatever the log cannot express, commits.
+    /// Both go through [`crate::write::tree_log::fsync_inode`]: the inode's
+    /// changes since the last commit are written to the tree log and one
+    /// superblock, without committing the transaction; whatever the log
+    /// cannot express exactly commits instead.
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let vol = self.volume()?;

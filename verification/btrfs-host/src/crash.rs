@@ -52,6 +52,8 @@ pub struct Report {
     pub torn: usize,
     pub dropped: usize,
     pub gens_seen: BTreeMap<u64, usize>,
+    /// Cut images whose superblock named a tree log (replayed at mount).
+    pub with_log: usize,
     pub failures: Vec<String>,
 }
 
@@ -131,15 +133,17 @@ pub fn run(inp: &Input, opts: &Opts) -> Report {
         .unwrap();
     let mut applied = 0usize;
 
-    // gen → acceptable per-subvolume states.
-    let mut states: BTreeMap<u64, Vec<Vec<FlatTree>>> = BTreeMap::new();
+    // (generation, log_root) of a superblock → acceptable per-subvolume
+    // states after mounting it: a commit's own, or, for a superblock naming
+    // a tree log, that commit with the log replayed.
+    let mut states: BTreeMap<(u64, u64), Vec<Vec<FlatTree>>> = BTreeMap::new();
     states
-        .entry(inp.base_gen)
+        .entry((inp.base_gen, 0))
         .or_default()
         .push(inp.base_state.clone());
     for c in inp.commits {
         states
-            .entry(c.gen)
+            .entry((c.gen, c.log_root))
             .or_default()
             .extend(c.candidates.iter().cloned());
     }
@@ -176,6 +180,7 @@ pub fn run(inp: &Input, opts: &Opts) -> Report {
         linux::clone_file(&durable, &img);
         let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
         let mut expect_gen = inp.base_gen;
+        let mut expect_log = 0u64;
         for ev in &inp.log[..k] {
             if let Ev::Write {
                 off,
@@ -185,6 +190,7 @@ pub fn run(inp: &Input, opts: &Opts) -> Report {
             {
                 if *off == SB_OFFSETS[0] && data.len() as u64 == SB_LEN {
                     expect_gen = sb_generation(data);
+                    expect_log = crate::dev::sb_log_root(data);
                 }
             }
         }
@@ -217,9 +223,11 @@ pub fn run(inp: &Input, opts: &Opts) -> Report {
         }
         drop(f);
         let what = format!(
-            "cut {n} (event {k}/{}, {variant:?}, gen {expect_gen})",
-            inp.log.len()
+            "cut {n} (event {k}/{}, {variant:?}, gen {expect_gen}{})",
+            inp.log.len(),
+            if expect_log != 0 { ", tree log" } else { "" }
         );
+        rep.with_log += (expect_log != 0) as usize;
         rep.cuts += 1;
         *rep.gens_seen.entry(expect_gen).or_default() += 1;
 
@@ -228,10 +236,11 @@ pub fn run(inp: &Input, opts: &Opts) -> Report {
             .unwrap()
             .read_exact_at(&mut sb, SB_OFFSETS[0])
             .unwrap();
-        if sb_generation(&sb) != expect_gen {
+        if sb_generation(&sb) != expect_gen || crate::dev::sb_log_root(&sb) != expect_log {
             rep.failures.push(format!(
-                "{what}: primary superblock generation {}",
-                sb_generation(&sb)
+                "{what}: primary superblock generation {} log_root {:#x}",
+                sb_generation(&sb),
+                crate::dev::sb_log_root(&sb)
             ));
             continue;
         }
@@ -242,9 +251,9 @@ pub fn run(inp: &Input, opts: &Opts) -> Report {
         reap(&mut checks, &mut rep, false);
         checks.push((linux::spawn_check(&img, false), img, what.clone()));
 
-        let Some(want) = states.get(&expect_gen) else {
+        let Some(want) = states.get(&(expect_gen, expect_log)) else {
             rep.failures.push(format!(
-                "{what}: no modelled state for generation {expect_gen}"
+                "{what}: no modelled state for generation {expect_gen} log_root {expect_log:#x}"
             ));
             continue;
         };
@@ -308,7 +317,7 @@ fn narf_verify(
     }
     if let Some(d) = best {
         return Err(format!(
-            "NARF remount differs from every state committed at that generation ({} candidates):\n  {}",
+            "NARF remount differs from every state that superblock may hold ({} candidates):\n  {}",
             want.len(),
             d.join("\n  ")
         ));

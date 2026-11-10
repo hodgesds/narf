@@ -8,7 +8,7 @@ use narf_filesystem::{DirOps, FileOps, FsError};
 
 use crate::dev::RecDev;
 use crate::host::block_on;
-use crate::model::{FlatTree, Inode, Kind, Model, ROOT};
+use crate::model::{FlatTree, Ino, Inode, Kind, Model, ROOT};
 use crate::narf::{dir_at, file_at, split};
 
 /// SplitMix64: tiny, seedable, good enough for workload choices.
@@ -94,6 +94,10 @@ pub struct Sub {
 #[derive(Clone, Debug)]
 pub struct CommitRec {
     pub gen: u64,
+    /// `log_root` of that superblock: zero for a transaction commit; for a
+    /// tree-log sync, the log whose replay over the last commit the
+    /// candidates describe.
+    pub log_root: u64,
     /// Per candidate: one flattened tree per subvolume, in `subs` order.
     pub candidates: Vec<Vec<FlatTree>>,
 }
@@ -114,6 +118,58 @@ pub struct Stats {
     pub ops: BTreeMap<&'static str, usize>,
     pub bytes_written: u64,
     pub commits: usize,
+    /// Superblocks written to name a tree log (fsyncs that did not commit).
+    pub log_syncs: usize,
+}
+
+/// One inode an fsync put in the tree log, as the model had it then: what
+/// replaying the log over the last commit must bring back.
+#[derive(Clone, Debug)]
+struct LogRec {
+    sub: usize,
+    ino: Ino,
+    inode: Inode,
+    /// Its names then: `(directory, name)`.
+    names: Vec<(Ino, String)>,
+}
+
+/// A directory logged because a new file under it was fsynced and the last
+/// commit does not have it: `(subvolume, directory, its inode without
+/// entries, its parent, its name)`. It stays in the log until the next
+/// commit, whatever happens to the file.
+type LoggedDir = (usize, Ino, Inode, Ino, String);
+
+/// `base` (one model per subvolume) with the log replayed over it: the
+/// logged new directories exist (empty but for what the log puts in them),
+/// a logged inode the commit has is updated in place under its committed
+/// names, one it lacks is created under the names it was logged with — and
+/// nothing else of the transaction is there.
+fn replayed(base: &[Model], dirs: &[LoggedDir], overlay: &[LogRec]) -> Vec<Model> {
+    let mut models = base.to_vec();
+    for (sub, dir, inode, parent, name) in dirs {
+        let m = &mut models[*sub];
+        if !m.inodes.contains_key(dir) {
+            m.inodes.insert(*dir, inode.clone());
+            m.entries_mut(*parent).insert(name.clone(), *dir);
+        }
+    }
+    for rec in overlay {
+        let m = &mut models[rec.sub];
+        match m.inodes.get_mut(&rec.ino) {
+            Some(existing) => *existing = rec.inode.clone(),
+            None => {
+                m.inodes.insert(rec.ino, rec.inode.clone());
+                for (dir, name) in &rec.names {
+                    m.entries_mut(*dir).insert(name.clone(), rec.ino);
+                }
+            }
+        }
+    }
+    models
+}
+
+fn flatten_all(models: &[Model]) -> Vec<FlatTree> {
+    models.iter().map(Model::flatten).collect()
 }
 
 pub struct Workload<'a> {
@@ -123,6 +179,13 @@ pub struct Workload<'a> {
     pub stats: Stats,
     pub commits: Vec<CommitRec>,
     seen_sb: usize,
+    /// The states the last transaction commit may hold (one model per
+    /// subvolume each): what a tree log written since is replayed over.
+    bases: Vec<Vec<Model>>,
+    /// The inodes logged since that commit, in fsync order.
+    overlay: Vec<LogRec>,
+    /// The new directories logged since that commit, outermost first.
+    logged_dirs: Vec<LoggedDir>,
     queue: Vec<Op>,
     name_seq: u64,
     pub trace: Vec<String>,
@@ -274,6 +337,9 @@ impl<'a> Workload<'a> {
     pub fn new(subs: Vec<Sub>, dev: &'a RecDev, seed: u64) -> Self {
         let seen_sb = dev.sb_count();
         Workload {
+            bases: vec![subs.iter().map(|s| s.model.clone()).collect()],
+            overlay: Vec::new(),
+            logged_dirs: Vec::new(),
             subs,
             dev,
             rng: Rng::new(seed),
@@ -286,30 +352,117 @@ impl<'a> Workload<'a> {
         }
     }
 
-    fn flats(&self) -> Vec<FlatTree> {
-        self.subs.iter().map(|s| s.model.flatten()).collect()
+    fn models(&self) -> Vec<Model> {
+        self.subs.iter().map(|s| s.model.clone()).collect()
     }
 
-    /// Attribute commits the device saw since the last call to the states
-    /// `before` (and the current one).
-    pub fn note_commits(&mut self, before: Option<Vec<FlatTree>>) {
+    /// What an fsync of `path` logs, from the model as it is now: the inode,
+    /// and the directories above its names, outermost first.
+    fn log_rec(&self, sub: usize, path: &str) -> (LogRec, Vec<(Ino, Inode, Ino, String)>) {
+        let m = &self.subs[sub].model;
+        let ino = m.lookup(path).unwrap();
+        // Every directory entry, as child → (parent, name).
+        let mut parent_of: BTreeMap<Ino, (Ino, String)> = BTreeMap::new();
+        let mut names = Vec::new();
+        for (&dir, inode) in &m.inodes {
+            if let Kind::Dir(entries) = &inode.kind {
+                for (name, &child) in entries {
+                    if child == ino {
+                        names.push((dir, name.clone()));
+                    } else if matches!(m.get(child).kind, Kind::Dir(_)) {
+                        parent_of.insert(child, (dir, name.clone()));
+                    }
+                }
+            }
+        }
+        let mut ancestors: Vec<(Ino, Inode, Ino, String)> = Vec::new();
+        for (dir, _) in &names {
+            let mut chain = Vec::new();
+            let mut at = *dir;
+            while let Some((parent, name)) = parent_of.get(&at) {
+                let mut inode = m.get(at).clone();
+                inode.kind = Kind::Dir(BTreeMap::new());
+                chain.push((at, inode, *parent, name.clone()));
+                at = *parent;
+            }
+            chain.reverse();
+            for link in chain {
+                if !ancestors.iter().any(|a| a.0 == link.0) {
+                    ancestors.push(link);
+                }
+            }
+        }
+        (
+            LogRec {
+                sub,
+                ino,
+                inode: m.get(ino).clone(),
+                names,
+            },
+            ancestors,
+        )
+    }
+
+    /// Attribute the superblocks the device saw since the last call. A
+    /// transaction commit holds the state `before` the operation or the
+    /// current one. A tree-log sync (`fsynced` names the file whose fsync
+    /// wrote it) holds the last commit with every inode logged since
+    /// replayed over it.
+    pub fn note_commits(&mut self, before: Option<Vec<Model>>, fsynced: Option<(usize, String)>) {
         let gens = self.dev.sb_gens();
         if gens.len() == self.seen_sb {
             return;
         }
-        let now = self.flats();
-        let mut candidates = vec![now.clone()];
-        if let Some(b) = before {
-            if b != now {
-                candidates.push(b);
+        let log_roots = self.dev.sb_log_roots();
+        let now = self.models();
+        let mut fsynced = fsynced;
+        for at in self.seen_sb..gens.len() {
+            let (gen, log_root) = (gens[at], log_roots[at]);
+            if log_root == 0 {
+                let mut bases = vec![now.clone()];
+                if let Some(b) = &before {
+                    if flatten_all(b) != flatten_all(&now) {
+                        bases.push(b.clone());
+                    }
+                }
+                self.commits.push(CommitRec {
+                    gen,
+                    log_root: 0,
+                    candidates: bases.iter().map(|b| flatten_all(b)).collect(),
+                });
+                self.bases = bases;
+                self.overlay.clear();
+                self.logged_dirs.clear();
+                self.stats.commits += 1;
+            } else {
+                if let Some((sub, path)) = fsynced.take() {
+                    let (rec, chain) = self.log_rec(sub, &path);
+                    // Only a file the commit lacks has its new parent
+                    // directories logged with it (`log_all_new_ancestors`).
+                    let committed = &self.bases[0][sub].inodes;
+                    if !committed.contains_key(&rec.ino) {
+                        for (dir, inode, parent, name) in chain {
+                            if !committed.contains_key(&dir) {
+                                self.logged_dirs.retain(|d| (d.0, d.1) != (sub, dir));
+                                self.logged_dirs.push((sub, dir, inode, parent, name));
+                            }
+                        }
+                    }
+                    self.overlay
+                        .retain(|r| (r.sub, r.ino) != (rec.sub, rec.ino));
+                    self.overlay.push(rec);
+                }
+                self.commits.push(CommitRec {
+                    gen,
+                    log_root,
+                    candidates: self
+                        .bases
+                        .iter()
+                        .map(|base| flatten_all(&replayed(base, &self.logged_dirs, &self.overlay)))
+                        .collect(),
+                });
+                self.stats.log_syncs += 1;
             }
-        }
-        for &gen in &gens[self.seen_sb..] {
-            self.commits.push(CommitRec {
-                gen,
-                candidates: candidates.clone(),
-            });
-            self.stats.commits += 1;
         }
         self.seen_sb = gens.len();
     }
@@ -775,11 +928,15 @@ impl<'a> Workload<'a> {
         let before = if op.is_sync() {
             None
         } else {
-            Some(self.flats())
+            Some(self.models())
+        };
+        let fsynced = match &op {
+            Op::Fsync { sub, path } => Some((*sub, path.clone())),
+            _ => None,
         };
         *self.stats.ops.entry(op.kind()).or_default() += 1;
         let r = self.apply_inner(op);
-        self.note_commits(before);
+        self.note_commits(before, fsynced);
         r.map_err(|e| {
             format!(
                 "op #{} {short} failed: {e}\nklog tail:\n{}",
