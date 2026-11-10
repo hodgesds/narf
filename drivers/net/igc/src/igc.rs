@@ -430,6 +430,7 @@ pub struct Igc {
     removed: AtomicBool,
     admin_up: AtomicBool,
     recovery_requested: AtomicBool,
+    completion_autopsy_pending: AtomicBool,
     pub(crate) irq_routes: Vec<IrqRoute>,
     state: AtomicU8,
     active: AtomicUsize,
@@ -581,6 +582,7 @@ impl Igc {
             removed: AtomicBool::new(false),
             admin_up: AtomicBool::new(true),
             recovery_requested: AtomicBool::new(false),
+            completion_autopsy_pending: AtomicBool::new(false),
             irq_routes,
             state: AtomicU8::new(STOPPED),
             active: AtomicUsize::new(0),
@@ -755,7 +757,7 @@ impl Igc {
             (c.mac, c.mtu)
         };
         // Packet-buffer allocation/filter/RSS configuration precedes queue
-        // enable; global RX/TX stays disabled until every queue acknowledges.
+        // activation. Preparation leaves queue enables and RX/TX tails empty.
         hardware::configure(&self.hw, mac, mtu, &self.settings.lock().rss);
         self.apply_filters();
         // Prepare every ring before globally enabling receive/transmit.
@@ -810,20 +812,39 @@ impl Igc {
         if self.removed.load(Ordering::Acquire) {
             return Err(IgcError::Other("device removed"));
         }
-        // All ring bases, handlers and retained allocations are current
-        // before any DMA request or MSI write is permitted on the bus.
-        narf_bus::pci::set_command(&self.hw.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
-            .map_err(|_| IgcError::BarMapFailed)?;
-        let command = narf_bus::pci::read_command(&self.hw.cap, &self.device)
-            .map_err(|_| IgcError::BarMapFailed)?;
-        use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
-        if command == u16::MAX
-            || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
-                != BUS_MASTER | MEM_SPACE | INTX_DISABLE
-        {
-            return Err(IgcError::Other("PCI DMA enable rejected"));
+        let queues = self.queues();
+        let mut rx_counts = [0; 4];
+        for (q, queue) in queues.iter().enumerate() {
+            rx_counts[q] = queue.counts().1;
         }
-        hardware::enable_data(&self.hw)?;
+        // All ring bases, handlers and retained allocations precede BME.
+        // Global engines must run before QUEUE_ENABLE can acknowledge.
+        let activation = hardware::activate_queues(&self.hw, &rx_counts[..queues.len()], || {
+            narf_bus::pci::set_command(&self.hw.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
+                .map_err(|_| IgcError::BarMapFailed)?;
+            let command = narf_bus::pci::read_command(&self.hw.cap, &self.device)
+                .map_err(|_| IgcError::BarMapFailed)?;
+            use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+            if command == u16::MAX
+                || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+                    != BUS_MASTER | MEM_SPACE | INTX_DISABLE
+            {
+                return Err(IgcError::Other("PCI DMA enable rejected"));
+            }
+            Ok(())
+        });
+        if let Err(error) = activation {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] queue activation failed {error:?}: pci={:x?} status={:#x} rctl={:#x} tctl={:#x}",
+                narf_bus::pci::read_command(&self.hw.cap, &self.device),
+                self.hw.read(8),
+                self.hw.read(0x100),
+                self.hw.read(0x400),
+            );
+            return Err(error);
+        }
         self.mtu.store(mtu, Ordering::Release);
         self.state.store(RUNNING, Ordering::Release);
         Ok(())
@@ -1015,6 +1036,26 @@ impl Igc {
                 .filter(|(_, q)| q.xsk().is_some_and(|s| s.is_closed()))
                 .map(|(q, _)| q)
                 .collect::<Vec<_>>();
+            if self.completion_autopsy_pending.load(Ordering::Acquire) {
+                let queues = self.queues();
+                // A parked PCI Command is not the DMA fence. Require the
+                // hardware drain before reading payloads, even if recovery
+                // entered from FAILED and bypassed the normal stop() path.
+                hardware::quiesce(&self.hw, queues.len())?;
+                self.completion_autopsy_pending
+                    .store(false, Ordering::Release);
+                for (q, queue) in queues.iter().enumerate() {
+                    // SAFETY: lifecycle excludes packet operations; the DMA
+                    // drain succeeded, and reset/start has not run yet.
+                    let evidence = unsafe { queue.quiesced_writeback_snapshot() };
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "[igc] q{q} after DMA drain, before reset: {evidence:x?} sw={:x?}",
+                        queue.statistics(),
+                    );
+                }
+            }
             hardware::reset_queues(&self.hw, self.queues().as_slice())?;
             for q in closed {
                 narf_net::bypass::classifier::release_native(self.name(), q as u32);
@@ -1233,6 +1274,12 @@ impl Igc {
                 self.hw.read(0xc028 + offset),
                 self.hw.read(0xc00c + offset),
                 self.hw.read(0xc014 + offset),
+            );
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] q{q} CPU mappings: TX={:x?} RX={:x?}",
+                snapshot.tx_mapping,
+                snapshot.rx_mapping,
             );
         }
     }
@@ -1919,6 +1966,9 @@ fn spawn_pumps(
                     stats.tx_timeouts == 1
                 };
                 if first {
+                    device
+                        .completion_autopsy_pending
+                        .store(true, Ordering::Release);
                     device.dump_completion_state();
                 }
                 let _ = device.recover();

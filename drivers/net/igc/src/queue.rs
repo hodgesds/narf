@@ -130,6 +130,81 @@ pub(crate) struct CompletionSnapshot {
     pub rx_cpu: usize,
     pub rx_head: usize,
     pub rx_words: [u32; 4],
+    pub tx_mapping: Option<CpuMappingSnapshot>,
+    pub rx_mapping: Option<CpuMappingSnapshot>,
+}
+
+#[derive(Debug)]
+pub(crate) struct QuiescedWritebackSnapshot {
+    pub tx_dd: usize,
+    pub rx_dd: usize,
+    pub rx_nonzero_prefixes: usize,
+    pub rx_leased_skipped: usize,
+    pub first_changed_rx: Option<usize>,
+    pub first_rx_words: [u32; 8],
+}
+
+/// Read-only evidence of the CPU mapping, not a DMA-completion fence.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug)]
+pub(crate) struct CpuMappingSnapshot {
+    pub physical: u64,
+    pub translated: Option<u64>,
+    pub end_translated: Option<u64>,
+    pub pages_match: bool,
+    pub root: u64,
+    pub leaf_flags: Option<u64>,
+    pub leaf_bytes: Option<u64>,
+    pub pat: u64,
+    pub pat_type: Option<u8>,
+    pub mtrr_default: Option<u64>,
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) type CpuMappingSnapshot = ();
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn cpu_mapping_snapshot(buffer: &DmaBuffer) -> Option<CpuMappingSnapshot> {
+    use narf_memory::{x86_64::paging, VirtAddr};
+    let cpu = buffer.cpu_ptr::<u8>() as u64;
+    let physical = buffer.phys_addr().raw();
+    // SAFETY: CPL0, current live address space. The owned buffer pins its
+    // RAM; the permanent direct map/page tables remain live during this walk.
+    let root = unsafe { paging::read_cr3() };
+    let translate = |offset| {
+        // SAFETY: same live root and stable direct-map pages, read-only walk.
+        unsafe { paging::translate(root, VirtAddr::new(cpu + offset)) }.map(|p| p.raw())
+    };
+    // SAFETY: same current root, only reading its mapping of the owned buffer.
+    let leaf = unsafe { paging::leaf_flags_at(root, VirtAddr::new(cpu)) };
+    let pat = narf_arch::x86_64::pat::read();
+    let pat_type = leaf.map(|(flags, size)| {
+        let flags = flags.bits();
+        let pat_bit = if size == 4096 { 7 } else { 12 };
+        let index = ((flags >> 3) & 3) | (((flags >> pat_bit) & 1) << 2);
+        ((pat >> (index * 8)) & 0xff) as u8
+    });
+    let last = buffer.len() as u64 - 1;
+    Some(CpuMappingSnapshot {
+        physical,
+        translated: translate(0),
+        end_translated: translate(last),
+        pages_match: (0..buffer.len())
+            .step_by(4096)
+            .all(|offset| translate(offset as u64) == Some(physical + offset as u64))
+            && translate(last) == Some(physical + last),
+        root: root.raw(),
+        leaf_flags: leaf.map(|(flags, _)| flags.bits()),
+        leaf_bytes: leaf.map(|(_, size)| size),
+        pat,
+        pat_type,
+        mtrr_default: narf_arch::x86_64::msr::rdmsr_or_gp(0x2ff).ok(),
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn cpu_mapping_snapshot(_: &DmaBuffer) -> Option<CpuMappingSnapshot> {
+    None
 }
 
 fn allocate(bytes: usize) -> Result<DmaBuffer, IgcError> {
@@ -220,15 +295,18 @@ impl Queue {
             });
             (tx.next, tx.clean, end, words)
         };
-        let rx = self.rx.lock();
-        // SAFETY: the RX lock pins the in-bounds next-to-clean slot. This
-        // observes words without claiming DD, reading payload or rearming it.
-        let rx_words = core::array::from_fn(|i| unsafe {
-            ptr::read_volatile(
-                self.rx_ring
-                    .cpu_ptr_at::<u32>((rx.head * 16 + i * 4) as u64),
-            )
-        });
+        let (rx_head, rx_words) = {
+            let rx = self.rx.lock();
+            // SAFETY: lock pins the next-to-clean slot. Observing words does
+            // not claim DD, read payload, rearm or change DMA ownership.
+            let words = core::array::from_fn(|i| unsafe {
+                ptr::read_volatile(
+                    self.rx_ring
+                        .cpu_ptr_at::<u32>((rx.head * 16 + i * 4) as u64),
+                )
+            });
+            (rx.head, words)
+        };
         CompletionSnapshot {
             tx_dma: self.tx_ring.dma_addr().raw(),
             tx_cpu: self.tx_ring.cpu_ptr::<u8>() as usize,
@@ -238,9 +316,62 @@ impl Queue {
             tx_words,
             rx_dma: self.rx_ring.dma_addr().raw(),
             rx_cpu: self.rx_ring.cpu_ptr::<u8>() as usize,
-            rx_head: rx.head,
+            rx_head,
             rx_words,
+            tx_mapping: cpu_mapping_snapshot(&self.tx_ring),
+            rx_mapping: cpu_mapping_snapshot(&self.rx_ring),
         }
+    }
+
+    /// Inspect retained payloads only after the device-wide DMA drain, before
+    /// reset clears the rings. No flush, cache invalidation or ownership change.
+    ///
+    /// # Safety
+    /// All packet operations have stopped and hardware::quiesce acknowledged
+    /// the controller's complete DMA drain. DMA must remain stopped throughout.
+    pub(crate) unsafe fn quiesced_writeback_snapshot(&self) -> QuiescedWritebackSnapshot {
+        let rx = self.rx.lock();
+        let mut result = QuiescedWritebackSnapshot {
+            tx_dd: 0,
+            rx_dd: 0,
+            rx_nonzero_prefixes: 0,
+            rx_leased_skipped: 0,
+            first_changed_rx: None,
+            first_rx_words: [0; 8],
+        };
+        for slot in 0..self.tx_count {
+            // SAFETY: slot is bounded; caller proved no device writer remains.
+            let status = unsafe {
+                ptr::read_volatile(self.tx_ring.cpu_ptr_at::<u32>((slot * 16 + 12) as u64))
+            };
+            result.tx_dd += usize::from(status & 1 != 0);
+        }
+        for slot in 0..self.rx_count {
+            // SAFETY: same quiescence proof and bounded descriptor index.
+            let status = unsafe {
+                ptr::read_volatile(self.rx_ring.cpu_ptr_at::<u32>((slot * 16 + 8) as u64))
+            };
+            result.rx_dd += usize::from(status & 1 != 0);
+            if rx.leases[slot].is_some() {
+                result.rx_leased_skipped += 1;
+                continue;
+            }
+            // Read the retained allocation, never an address from a descriptor
+            // that the NIC may have replaced with writeback metadata. Sample
+            // a bounded prefix; reused buffers can contain earlier traffic.
+            let words: [u32; 8] = core::array::from_fn(|word| {
+                // SAFETY: retained RX buffers are >= 2048 bytes; DMA drained.
+                unsafe { ptr::read_volatile(rx.buffers[slot].cpu_ptr_at::<u32>((word * 4) as u64)) }
+            });
+            if words != [0; 8] {
+                result.rx_nonzero_prefixes += 1;
+                if result.first_changed_rx.is_none() {
+                    result.first_changed_rx = Some(slot);
+                    result.first_rx_words = words;
+                }
+            }
+        }
+        result
     }
 
     /// # Safety
