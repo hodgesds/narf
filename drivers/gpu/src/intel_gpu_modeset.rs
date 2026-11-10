@@ -61,6 +61,9 @@ use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_pipes::Pipe;
 use crate::intel_gpu_pll::{combo_coeffs, decode_refclk_family, encode_cfgcr0, LinkRate, DSSM};
 
+#[path = "intel_gpu_dp_training.rs"]
+pub(crate) mod training;
+
 // ── Power Well control register block (Tiger Lake PRM Vol. 11
 // §"Power Wells"; Linux i915 `intel_display_regs.h`) ─────────────
 //
@@ -125,13 +128,8 @@ const fn dpll_enable_off(dpll_idx: u32) -> u64 {
     }
 }
 
-/// The DPLL a modeset on `ddi` programs and routes: Combo PHY
-/// DDIs A/B/C own DPLL 0/1/2 respectively (the DPCLKA default
-/// assignment i915 programs). Type-C DDIs (D–H) keep the
-/// historical DPLL 0 selection — TC PHY PLL programming (MG /
-/// TBT PLLs) has no model in this driver yet, so a TC modeset
-/// behaves exactly as it did before multi-pipe support; see
-/// specification §16's open items (#1017).
+/// Combo PHY DDIs A/B/C use DPLL 0/1/2. Type-C dispatches through
+/// intel_gpu_gen12_tc before any combo-PLL programming or routing.
 const fn dpll_index_for(ddi: Ddi) -> u32 {
     match ddi {
         Ddi::A => 0,
@@ -379,6 +377,7 @@ pub struct Modeset<'a, M: MmioWindow + ?Sized> {
     /// pre-boot single-pipe programming.
     dbuf_share: Option<(u16, u16)>,
     gen12_family: Option<crate::intel_gpu_gt::Gen12Platform>,
+    tc_width: u8,
 }
 
 impl<'a, M: MmioWindow + ?Sized> core::fmt::Debug for Modeset<'a, M> {
@@ -407,11 +406,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             pipe,
             dbuf_share: None,
             gen12_family: mmio.gen12_display_family(),
+            tc_width: 4,
         }
     }
 
     pub(crate) fn set_gen12_family(&mut self, family: crate::intel_gpu_gt::Gen12Platform) {
         self.gen12_family = Some(family);
+    }
+
+    pub(crate) fn set_typec_width(&mut self, width: u8) {
+        self.tc_width = width;
     }
 
     /// The pipe this run programs.
@@ -621,6 +625,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         scrambling: bool,
         high_tmds_char_rate: bool,
     ) -> Result<Mode, ModesetError> {
+        if self.ddi as u8 >= Ddi::D as u8 {
+            return Err(ModesetError::UnsupportedGeneration);
+        }
         validate_framebuffer_mode(primary_fb, mode)?;
         let coeffs = match crate::intel_gpu_pll::hdmi_wrpll_coeffs(
             mode.pixel_clock_khz,
@@ -636,7 +643,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.disable_pipeline();
         self.program_dpll_coeffs(&coeffs)?;
         self.program_cdclk_floor(mode);
-        self.program_dpclka_routing();
+        self.program_dpclka_routing()?;
         self.enable_pipe_power_well(self.pipe)?;
         self.program_transcoder(mode);
         self.program_pipe(mode);
@@ -695,6 +702,16 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             LinkStep::Trained(t) => Some(t),
             _ => None,
         };
+        if self.ddi as u8 >= Ddi::D as u8 {
+            let lanes = plan
+                .map(|plan| plan.lanes)
+                .or_else(|| already_trained.map(|link| link.lanes))
+                .unwrap_or(self.tc_width);
+            if lanes > self.tc_width {
+                return Err(ModesetError::PhyBusFailure);
+            }
+            self.tc_width = lanes;
+        }
 
         // Step 1: sessions and resume supply an exact mode. Only legacy
         // discovery reads EDID and optionally falls back to the caller.
@@ -763,7 +780,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // an MST secondary stream: routing is per-DDI and the
         // primary stream's run already latched it.
         if already_trained.is_none() {
-            self.program_dpclka_routing();
+            self.program_dpclka_routing()?;
         }
 
         // Step 5: enable the per-pipe power well for this run's
@@ -854,10 +871,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
                 let start_rate = plan
                     .map(|p| to_pll_rate(p.rate))
                     .unwrap_or(LinkRate::DpHbr2);
-                self.load_buf_trans(start_rate);
+                self.load_buf_trans(start_rate)?;
                 let (pll, trained) = self.train_dp_link(plan)?;
                 if pll != start_rate {
-                    self.load_buf_trans(pll);
+                    self.load_buf_trans(pll)?;
                 }
                 (pll, trained)
             }
@@ -876,6 +893,18 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             if t.rate != p.rate || t.lanes != p.lanes {
                 self.program_mn_link(&mode, t.rate, t.lanes);
                 self.program_trans_ddi_func_ctl_mode(t.lanes, ddi_mode);
+            }
+        }
+
+        if self.ddi as u8 >= Ddi::D as u8 {
+            if let Some(trained) = trained_link {
+                let mut levels = [(0, 0); 4];
+                for (level, trained) in levels.iter_mut().zip(trained.vswing_pe.lanes) {
+                    *level = (trained.swing, trained.pre_emph);
+                }
+                let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
+                port.configure_lanes(self.mmio, trained.lanes)?;
+                port.signal_levels(self.mmio, trained_pll, &levels)?;
             }
         }
 
@@ -1105,6 +1134,10 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         if self.mmio.read32(ddi_off) & DDI_BUF_CTL_ENABLE != 0 {
             return Err(ModesetError::PipelineStopUnavailable);
         }
+        if self.ddi as u8 >= Ddi::D as u8 {
+            crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?
+                .stop_transport(self.mmio, self.transcoder())?;
+        }
         Ok(())
     }
 
@@ -1133,6 +1166,14 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// (the negotiated rate on the plan path, #1092) instead of
     /// the pixel-clock-derived floor `program_dpll` picks.
     fn program_dpll_with_rate(&mut self, mode: &Mode, rate: LinkRate) -> Result<(), ModesetError> {
+        if self.ddi as u8 >= Ddi::D as u8 {
+            let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
+            return port.enable(
+                self.mmio,
+                rate,
+                crate::intel_gpu_pll::refclk_khz(self.mmio.read32(DSSM)),
+            );
+        }
         // Reference-clock family from the DSSM strap (Q6,
         // #1024): a 24 MHz-strapped part programmed with the
         // 19.2 MHz rows gets a DCO 26% off target.
@@ -1154,8 +1195,8 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         coeffs: &crate::intel_gpu_pll::DpllCoeffs,
     ) -> Result<(), ModesetError> {
         // Combo PHY DDIs A/B/C program DPLL 0/1/2 respectively
-        // (the DPCLKA default assignment); Type-C DDIs keep the
-        // historical DPLL 0 selection (see `dpll_index_for`).
+        // (the DPCLKA default assignment). Type-C has already dispatched
+        // to its per-port Dekel PLL; this path is combo-only.
         let dpll_idx: u32 = dpll_index_for(self.ddi);
         let dpll_enable = dpll_enable_off(dpll_idx);
 
@@ -1340,7 +1381,41 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             Some(p) => (p.rate, p.lanes),
             None => (TrainRate::Hbr2, 4),
         };
-        match train_link(&mut aux, initial_rate, lanes, |_us| core::hint::spin_loop()) {
+        let result = if self.ddi as u8 >= Ddi::D as u8 {
+            let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
+            port.start_training(
+                self.mmio,
+                self.transcoder(),
+                to_pll_rate(initial_rate),
+                lanes,
+                false,
+            )?;
+            let mut failure = None;
+            let mut aux = training::TrainingAux::new(
+                aux,
+                training::State::new(to_pll_rate(initial_rate), lanes),
+                |state: &training::State, change| {
+                    port.training_update(self.mmio, self.transcoder(), state, change)
+                        .map_err(|error| {
+                            failure = Some(error);
+                            AuxError::Nacked
+                        })
+                },
+            );
+            let result = train_link(&mut aux, initial_rate, lanes, |us| {
+                let _ = narf_scheduler::responsive_spin_until(
+                    || false,
+                    narf_time::Deadline::after_ns(u64::from(us) * 1000),
+                );
+            });
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            result
+        } else {
+            train_link(&mut aux, initial_rate, lanes, |_us| core::hint::spin_loop())
+        };
+        match result {
             Ok(trained) => {
                 let pll = to_pll_rate(trained.rate);
                 // The legacy path historically discarded the
@@ -1362,15 +1437,20 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// into this DDI's translation registers (two dwords per
     /// entry at DDI base + 0x10 + n*8). Before lane 1 the tables
     /// in `intel_gpu_ddi` had zero writers tree-wide.
-    fn load_buf_trans(&mut self, rate: LinkRate) {
+    fn load_buf_trans(&mut self, rate: LinkRate) -> Result<(), ModesetError> {
+        if self.ddi as u8 >= Ddi::D as u8 {
+            let port = crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?;
+            port.configure_lanes(self.mmio, self.tc_width)?;
+            return port.signal_levels(self.mmio, rate, &[(0, 0); 4]);
+        }
         use crate::intel_gpu_ddi::{dp_buf_trans_table, DDI_BUF_TRANS_BASE_OFFSET};
         let bw = match rate.dpcd_link_bw_set() {
             Some(b) => b,
-            None => return,
+            None => return Err(ModesetError::PhyBusFailure),
         };
         let table = match dp_buf_trans_table(bw) {
             Some(t) => t,
-            None => return,
+            None => return Err(ModesetError::PhyBusFailure),
         };
         for (i, entry) in table.iter().enumerate() {
             let off = self.ddi.base() + DDI_BUF_TRANS_BASE_OFFSET + (i as u64) * 8;
@@ -1378,6 +1458,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
             self.mmio.write32(off + 4, entry.hi);
         }
         compiler_fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Program DPCLKA_CFGCR0 routing: this DDI's DPLL
@@ -1385,7 +1466,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// writes (select with the clock off, then clear the off
     /// bit). For DDI A / DPLL 0 this is byte-identical to the
     /// pre-multi-pipe programming.
-    fn program_dpclka_routing(&mut self) {
+    fn program_dpclka_routing(&mut self) -> Result<(), ModesetError> {
+        if self.ddi as u8 >= Ddi::D as u8 {
+            return crate::intel_gpu_gen12_tc::DklPort::new(self.mmio, self.ddi)?
+                .route_clock(self.mmio);
+        }
         use crate::intel_gpu_pll::{
             dpclka_clk_off, dpclka_clk_sel, dpclka_clk_sel_mask, DPCLKA_CFGCR0,
         };
@@ -1399,6 +1484,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         self.mmio
             .write32(DPCLKA_CFGCR0, selected & !dpclka_clk_off(phy));
         compiler_fence(Ordering::SeqCst);
+        Ok(())
     }
 
     /// Raise CDCLK to the floor for `mode`'s pixel clock.
@@ -2830,7 +2916,7 @@ pub mod tests {
         // DPCLKA routing: two writes, first with clock-off set
         // (select phase), second with it clear (clock on).
         let mut ms2 = Modeset::new(&mmio, Ddi::A);
-        ms2.program_dpclka_routing();
+        ms2.program_dpclka_routing().unwrap();
         let dpclka = mmio.writes_to(crate::intel_gpu_pll::DPCLKA_CFGCR0);
         if dpclka.len() != 2 {
             return TestResult::Fail("DPCLKA routing must be two writes");
@@ -2849,7 +2935,8 @@ pub mod tests {
         use crate::intel_gpu_ddi::{DDI_BUF_TRANS_BASE_OFFSET, HBR2_BUF_TRANS};
         let mmio = FakeMmio::new();
         let mut ms = Modeset::new(&mmio, Ddi::A);
-        ms.load_buf_trans(crate::intel_gpu_pll::LinkRate::DpHbr2);
+        ms.load_buf_trans(crate::intel_gpu_pll::LinkRate::DpHbr2)
+            .unwrap();
         for (i, e) in HBR2_BUF_TRANS.iter().enumerate() {
             let off = Ddi::A.base() + DDI_BUF_TRANS_BASE_OFFSET + (i as u64) * 8;
             if mmio.writes_to(off) != alloc::vec![e.lo]

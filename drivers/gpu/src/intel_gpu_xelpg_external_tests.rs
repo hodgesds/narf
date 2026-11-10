@@ -315,6 +315,7 @@ pub struct ExtFake {
     confs: [Cell<u32>; 4],
     /// No TRANSCONF ever acknowledges a disable.
     pub pipeconf_stuck: Cell<bool>,
+    pub act_stuck: Cell<bool>,
     frames: [Cell<u32>; 4],
     /// `narf_arch::interrupts_enabled()` at every `PIPEDSL` sample and
     /// primary `PLANE_SURF` write: (register, enabled).
@@ -363,6 +364,7 @@ impl ExtFake {
             cdclk_pll: Cell::new(0),
             confs: Default::default(),
             pipeconf_stuck: Cell::new(false),
+            act_stuck: Cell::new(false),
             frames: Default::default(),
             irq_log: RefCell::new(Vec::new()),
             sink: RefCell::new(sink),
@@ -424,6 +426,9 @@ impl ExtFake {
         Some(mode)
     }
     fn w1c(&self, off: u64) -> u32 {
+        if (0..4).any(|p| off == 0x60544 + p * 0x1000) {
+            return 1 << 24;
+        }
         if off == PICA_IIR || off == SDE_IIR {
             return u32::MAX;
         }
@@ -444,6 +449,30 @@ impl ExtFake {
             wire[i * 4..i * 4 + 4].copy_from_slice(&d.to_be_bytes());
         }
         let n = ((ctl & AUX_CTL_MSGSIZE_MASK) >> AUX_CTL_MSGSIZE_SHIFT) as usize;
+        let address =
+            (u32::from(wire[0] & 15) << 16) | (u32::from(wire[1]) << 8) | u32::from(wire[2]);
+        if wire[0] >> 4 == 8 && address == 0x102 {
+            // BSpec DP_TP_CTL patterns must reach the source before the
+            // corresponding DPCD write. A sink-only trainer cannot lock.
+            let expected = match wire[4] & 7 {
+                0 => 3,
+                1 => 0,
+                2 => 1,
+                3 => 4,
+                7 => 5,
+                _ => 7,
+            };
+            let correct = (0..4).any(|pipe| {
+                let source = self.phy.read32(0x60540 + pipe * 0x1000);
+                source & (1 << 31) != 0 && (source >> 8) & 7 == expected
+            });
+            if !correct {
+                self.aux_done
+                    .set(AUX_CTL_DONE | (1 << AUX_CTL_MSGSIZE_SHIFT));
+                *self.aux_reply.borrow_mut() = alloc::vec![0x10];
+                return;
+            }
+        }
         let reply = self.sink.borrow_mut().transact(&wire[..n.clamp(3, 20)]);
         self.aux_done
             .set(AUX_CTL_DONE | ((reply.len() as u32) << AUX_CTL_MSGSIZE_SHIFT));
@@ -458,6 +487,13 @@ impl MmioWindow for ExtFake {
     fn read32(&self, off: u64) -> u32 {
         if !self.access.get() {
             return u32::MAX;
+        }
+        if (0..4).any(|p| off == 0x60544 + p * 0x1000) {
+            let mut value = self.phy.read32(off);
+            if self.phy.read32(off - 4) & (7 << 8) == 2 << 8 {
+                value |= 1 << 25;
+            }
+            return value;
         }
         if off == PWR_WELL_CTL2 {
             let s = self.phy.read32(off);
@@ -549,6 +585,15 @@ impl MmioWindow for ExtFake {
             return;
         }
         self.writes.borrow_mut().push((off, value));
+        if (0..4).any(|p| off == 0x60400 + p * 0x1000)
+            && (self.phy.read32(off) ^ value) & (1 << 8) != 0
+            && !self.act_stuck.get()
+        {
+            let master = (value >> 10) & 3;
+            let status = 0x60544 + u64::from(master) * 0x1000;
+            self.phy
+                .write32(status, self.phy.read32(status) | (1 << 24));
+        }
         if is_gmbus(off) {
             self.ddc.write32(off, value);
             return;
@@ -846,8 +891,9 @@ fn smoke_mtl_external_lane_fallback_retries_at_trained_width() -> TestResult {
     if route.trained.lanes != 2 || route.trained.rate != TrainRate::Rbr {
         return TestResult::Fail("fallback must settle at RBR x2");
     }
-    // Full retry: PLL zeroed by the local stop, then re-enabled.
-    if io.phy.writes_to(0x6_4530) != [162_000, 0, 162_000] {
+    // Retune the source at the fallback width during CR, then restage
+    // the stream through a full stop/retry at the trained configuration.
+    if io.phy.writes_to(0x6_4530) != [162_000, 0, 162_000, 0, 162_000] {
         return TestResult::Fail("retry must stop and re-enable the PLL");
     }
     let want = crate::intel_gpu_pipes::build_trans_ddi_func_ctl(
@@ -896,23 +942,32 @@ fn smoke_mtl_external_refusals_before_mmio_and_tbt() -> TestResult {
     }
     let io = ExtFake::new(XeLpgPort::Tc4, Sink::new(0x14, edid_1024()));
     io.pica_isr.set(pica_tbt_hotplug(3));
-    if probe_sink(&io, Generation::MeteorLake, XeLpgPort::Tc4, false).err()
-        != Some(ExternalError::Tc(TcError::TbtAltUnsupported))
-        || !io.writes.borrow().is_empty()
-    {
-        return TestResult::Fail("TBT-alt sink must refuse without writes");
-    }
     let mut service = MtlExternalService::new();
     let event = MtlHpdEvent {
         pin: MtlHpdPin::Tc4,
         kind: MtlHpdKind::Connected(LiveMode::TbtAlt),
     };
-    match service.handle(&NoAccess, event, &mut fb_for) {
-        ServiceOutcome::Refused {
-            error: RouteError::Dp(ExternalError::Tc(TcError::TbtAltUnsupported)),
-            ..
-        } => {}
-        _ => return TestResult::Fail("TBT connect event must be refused without MMIO"),
+    let outcome = service.handle(&io, event, &mut fb_for);
+    if !matches!(outcome, ServiceOutcome::Activated { .. }) {
+        use core::fmt::Write as _;
+        let _ = writeln!(narf_console::Writer, "TBT activation: {outcome:?}");
+        return TestResult::Fail("live TBT route must activate through the fabric clock");
+    }
+    let port = XeLpgPort::Tc4;
+    if io.phy.writes.borrow().iter().any(|(off, _)| {
+        (*off >= port.msgbus_ctl_ln0() && *off < port.msgbus_ctl_ln0() + 0x20)
+            || *off == port.buf_ctl2()
+    }) || io.phy.read32(port.buf_ctl1()) & TC_PHY_OWNERSHIP != 0
+        || !io
+            .aux_ctl_writes
+            .borrow()
+            .iter()
+            .any(|v| v & AUX_CTL_TBT_IO != 0)
+    {
+        return TestResult::Fail("TBT must select tunnelled AUX and leave the C20 PHY alone");
+    }
+    if !service.teardown(&io) {
+        return TestResult::Fail("TBT route must stop before releasing AUX");
     }
     if service_mtl_external(
         &NoAccess,
@@ -1365,7 +1420,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
             XeLpgPort::Tc3,
             p.decl(XeLpgPort::Tc3),
             TbtAlt,
-            RoutePlan::Refuse,
+            RoutePlan::Dp,
         ),
         (
             XeLpgPort::A,
@@ -1389,6 +1444,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
         (
             XeLpgPort::Tc1,
             MtlPortDecl {
+                lane_reversal: false,
                 dp: true,
                 hdmi: true,
                 legacy: true,
@@ -1414,6 +1470,7 @@ fn smoke_mtl_external_route_plan_policy_decisions() -> TestResult {
     }
     // intel_ddi_init: non-legacy + HDMI without DP is legacy.
     let hdmi_only = MtlPortDecl {
+        lane_reversal: false,
         dp: false,
         hdmi: true,
         legacy: false,
@@ -1693,6 +1750,7 @@ fn smoke_mtl_external_service_legacy_tc_hdmi_on_tc_ddc_pin() -> TestResult {
     // read); its DDC is gmbus_pins_mtp "tc2" = GMBUS_PIN_10_TC2_ICP.
     let mut policy = MtlPortPolicy::NO_VBT;
     policy.tc[1] = MtlPortDecl::LEGACY_HDMI;
+    policy.tc[1].lane_reversal = true;
     let edid_720p = edid_for(74_250, 1280, 370, 110, 40, 720, 30, 5, 5);
     let mut sink = Sink::new(0x14, Vec::new());
     sink.nack_all = true;
@@ -1718,6 +1776,7 @@ fn smoke_mtl_external_service_legacy_tc_hdmi_on_tc_ddc_pin() -> TestResult {
     }
     let buf = io.read32(XeLpgPort::Tc2.buf_ctl1());
     if buf & (TCSS_POWER_REQUEST | TC_PHY_OWNERSHIP) != TCSS_POWER_REQUEST | TC_PHY_OWNERSHIP
+        || buf & crate::intel_gpu_xelpg::PORT_BUF_REVERSAL == 0
         || io.ddc.writes_to(crate::intel_gpu_gmbus::GMBUS0).first() != Some(&10)
         || io.read32(TRANS_CLK_SEL_B) != 0x7000_0000
         || io.aux_power.get()
@@ -1802,6 +1861,7 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
     let policy = MtlPortPolicy::from_vbt(&vbt);
     let want = MtlPortPolicy {
         ddi_b: MtlPortDecl {
+            lane_reversal: false,
             dp: true,
             hdmi: true,
             legacy: false,
@@ -1810,12 +1870,14 @@ fn smoke_mtl_vbt_policy_from_reference_board() -> TestResult {
         tc: [
             MtlPortDecl::USB_C,
             MtlPortDecl {
+                lane_reversal: false,
                 dp: false,
                 hdmi: true,
                 legacy: true,
                 ddc_pin: Some(PinPair::Pin10Tc2),
             },
             MtlPortDecl {
+                lane_reversal: false,
                 dp: true,
                 hdmi: true,
                 legacy: false,
@@ -1889,13 +1951,13 @@ fn smoke_mtl_vbt_policy_fails_closed_on_undrivable_ports() -> TestResult {
         .unwrap();
         MtlPortPolicy::from_vbt(&vbt)
     };
-    // Lane reversal on DDI B: the route never programs PORT_REVERSAL.
+    // Board lane reversal is retained for the Cx0 PLL/clock/TX sequence.
     let p = policy(
         250,
         &[Child::new(DP_DUAL_MODE, dvo_port::DPB).lane_reversal()],
     );
-    if p.ddi_b != MtlPortDecl::NONE {
-        return TestResult::Fail("a lane-reversed port must not be driven unreversed");
+    if !p.ddi_b.dp || !p.ddi_b.lane_reversal {
+        return TestResult::Fail("a lane-reversed port must retain its wiring");
     }
     // TC1 on TC2's AUX channel (unclaimed): AUX is keyed by port here.
     let p = policy(250, &[Child::new(DP, dvo_port::DPF).aux(dp_aux::G).typec()]);

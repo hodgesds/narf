@@ -1,5 +1,25 @@
 # NARF status
 
+**2026-11-10 — Intel USB-C display transports:** Meteor/Arrow Lake now
+support two-lane DP-alt pin D while preserving USB's PHY lane, native/legacy
+board lane reversal, live Thunderbolt/USB4 DP-IN AUX and fabric clocks, and
+Display-14 MST with downstream EDID, PBN/slot admission and independent
+Pipe B-D surfaces. The existing USB4 connection manager or firmware provisions
+tunnels. MST shares one primary transport, requires fresh source/sink ACT
+completion, and stops secondaries first. Boot-console publication selects
+the first stream; compositor/KMS expansion remains separate.
+
+Tiger Lake and Alder Lake-P Type-C sessions use their banked Dekel PLL,
+platform clock routing and TX settings. Source CR/EQ patterns and drive
+levels precede matching sink writes; fallback stops the buffer before
+retuning. USB-PD detach stops and releases the session, with failed stop
+retaining its pipe, scanout and TC-cold/AUX/PHY references for retry. The
+older bridge requires native TC numbering, exposes TC1..TC5 (TC1..TC4 on
+ADL-P), and refuses ADL-S/N; arbitrary UCSI numbering and TGL TC6 need more
+routing/interface work. Intel silicon, cable orientation and dock/Mesa
+interoperability remain hardware acceptance work. See the
+[GPU transport contract](drivers/gpu/specification/spec.md#intel-usb-c-display-transports).
+
 **2026-10-31 — I225/I226 wired Ethernet software expansion:** the built-in
 IGC driver now implements independent MSI-X queue routing and CPU-pinned RX
 workers, configurable rings/channels/RSS/coalescing, ethtool controls and

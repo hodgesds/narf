@@ -16,29 +16,21 @@
 //!
 //! - **Owned by this file**: USB-C → DDI mapping, MMIO window
 //!   adapter for the BAR0 `MmioRegion`, dispatch into AUX + Modeset.
-//! - **Multi-pipe (#1017)**: a bridge session claims a pipe from
-//!   `intel_gpu_multipipe` (re-entrant per connector — the trait
-//!   has no exit hook, so the claim is held for the session's
-//!   lifetime and released only when a modeset attempt fails),
-//!   allocates a real GGTT scanout in that pipe's window, and
-//!   runs the orchestrator bound to the claimed pipe. Before
-//!   #1017 this path funnelled into the Pipe-A-only
-//!   orchestrator with a placeholder framebuffer address.
-//! - **Named remainder**: Type-C PHY PLL programming (MG / TBT
-//!   PLLs) has no model in the modeset yet — a TC modeset keeps
-//!   the orchestrator's historical DPLL 0 selection (see
-//!   `intel_gpu_modeset::dpll_index_for`).
+//! - A session retains its pipe, scanout and TC-cold/AUX/PHY ownership.
+//!   Detach stops the pipe, DDI transport and Dekel PLL before release;
+//!   uncertain stop retains the session and vetoes display power retirement.
+//! - Tiger Lake and Alder Lake-P use their own banked Dekel PLL, clock
+//!   routing and TX presets. Negotiation respects the PD lane limit and
+//!   source training patterns/levels track the shared sink algorithm.
 //!
 //! ## USB-C connector → DDI mapping
 //!
-//! On Tiger Lake / Alder Lake the Type-C ports are DDIs D, E, F, G,
-//! H — i.e. TC1..TC5 in the PRM nomenclature. The platform firmware
-//! (VBT) describes the *actual* wiring (some boards leave TC5
-//! depopulated, etc.); without VBT parsing we use the canonical
-//! "connector index N → DDI D+N" mapping. The board may not have a
-//! USB-C jack physically attached at every DDI, but if Alt Mode
-//! reached Active on connector N then there *is* one on the wire,
-//! so the mapping is observed-correct.
+//! This bridge exposes TC1..TC5 as DDIs D..H and requires native TC
+//! numbering from its TCPM connector registration. Tiger Lake also has
+//! TC6, which the current Ddi enum does not expose; Alder Lake-P has
+//! four TC PHYs. A successful PD negotiation alone does not establish
+//! board wiring. Arbitrary firmware/UCSI connector numbering needs a
+//! board routing map before it can use this bridge.
 
 extern crate alloc;
 
@@ -56,14 +48,33 @@ use crate::dp_edid::read_panel_edid;
 use crate::intel_gpu;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_ddi::Ddi;
+use crate::intel_gpu_gen12_tc::DklPort;
 use crate::intel_gpu_gtt::ContiguousScanout;
 use crate::intel_gpu_modeset::{Framebuffer, Mode, Modeset, ModesetError, PixelFormat};
 use crate::intel_gpu_multipipe::{self, PipeOwner, PipeUse};
+use crate::intel_gpu_pipes::Pipe;
+
+#[derive(Copy, Clone, Debug)]
+struct BridgeSession {
+    port: DklPort,
+    bar: u64,
+    pipe: Option<Pipe>,
+}
+static SESSIONS: narf_lib::mutex::Mutex<[Option<BridgeSession>; 8]> =
+    narf_lib::mutex::Mutex::new([None; 8]);
+
+/// System/display power transitions must not retire a function behind an
+/// attached or quarantined Type-C owner. A racing attach also vetoes.
+pub(crate) fn sessions_stopped(bar: u64) -> bool {
+    SESSIONS
+        .try_lock()
+        .is_some_and(|sessions| sessions.iter().flatten().all(|session| session.bar != bar))
+}
 
 /// Map a USB-C [`ConnectorId`] to the Gen12 Type-C DDI it's wired
 /// to. Returns `None` if the index is outside the documented TC1..5
-/// range (Tiger Lake / Alder Lake top out at 5 TC ports — anything
-/// higher is a board with extra hubs the GPU doesn't see directly).
+/// range exposed by this bridge. DklPort separately checks the family's
+/// physical TC count; TC6 needs an expanded Ddi representation.
 ///
 /// PRM Vol. 12 §"Display DDI Port Index":
 ///   TC1 = Ddi::D, TC2 = Ddi::E, TC3 = Ddi::F, TC4 = Ddi::G, TC5 = Ddi::H.
@@ -158,8 +169,32 @@ impl DpAltModeGpuBridge for IntelDpBridge {
         let mut outcome = Err(DpBridgeError::NotReady);
         intel_gpu::with_display_info(|gpu| {
             outcome = self.bind_and_modeset(gpu, ddi, cfg);
+            if outcome.is_err() {
+                let _ = stop_session(gpu, ddi);
+            }
         });
         outcome
+    }
+
+    fn exit_dp_mode(&self, connector: ConnectorId) -> Result<(), DpBridgeError> {
+        let Some(ddi) = connector_to_ddi(connector) else {
+            return Ok(());
+        };
+        if SESSIONS.try_lock().ok_or(DpBridgeError::NotReady)?[ddi as usize].is_none() {
+            return Ok(());
+        }
+        let display =
+            intel_gpu::with_controller(|gpu| crate::intel_gpu_kms::display_for_bar(&gpu.gtt_mmadr))
+                .flatten();
+        let mut guard = match display.as_ref() {
+            Some(display) => Some(display.legacy().map_err(|_| DpBridgeError::NotReady)?),
+            None => None,
+        };
+        if let Some(guard) = guard.as_mut() {
+            guard.suspend();
+        }
+        intel_gpu::with_display_info(|gpu| stop_session(gpu, ddi))
+            .unwrap_or(Err(DpBridgeError::NotReady))
     }
 }
 
@@ -189,6 +224,23 @@ impl IntelDpBridge {
         );
 
         let mmio = MmioRegionWindow::new(&gpu.gtt_mmadr, family);
+        if !matches!(cfg.lanes, 2 | 4) {
+            return Err(DpBridgeError::ModesetFailed);
+        }
+        let port = DklPort::new(&mmio, ddi).map_err(|_| DpBridgeError::NoSuchConnector)?;
+        {
+            let mut sessions = SESSIONS.try_lock().ok_or(DpBridgeError::NotReady)?;
+            if sessions[ddi as usize].is_some() {
+                return Err(DpBridgeError::NotReady);
+            }
+            sessions[ddi as usize] = Some(BridgeSession {
+                port,
+                bar: gpu.gtt_mmadr.phys.raw(),
+                pipe: None,
+            });
+        }
+        port.connect(&mmio, gpu.gtt_mmadr.phys.raw(), cfg.lanes)
+            .map_err(|_| DpBridgeError::NotReady)?;
 
         // Try an EDID readback over AUX. AUX may not yet be reachable
         // (DPRX side could still be waking up); a failure here isn't
@@ -196,9 +248,8 @@ impl IntelDpBridge {
         let preferred_mode = read_preferred_mode_via_aux(&mmio, ddi);
 
         // Claim a pipe for this connector (#1017). claim_for is
-        // keyed by DDI, so a re-entry on the same connector (the
-        // bridge trait has no exit hook) reuses its pipe instead
-        // of consuming a second one. No free pipe is a real
+        // keyed by DDI. The retained session rejects a concurrent
+        // re-entry; successful detach releases its claim. No free pipe is a real
         // refusal: every pipe is scanning out something else.
         let owner = PipeOwner {
             ddi,
@@ -212,6 +263,10 @@ impl IntelDpBridge {
             );
             return Err(DpBridgeError::NotReady);
         };
+        SESSIONS.try_lock().ok_or(DpBridgeError::NotReady)?[ddi as usize]
+            .as_mut()
+            .ok_or(DpBridgeError::NotReady)?
+            .pipe = Some(pipe);
 
         // A real scanout in the claimed pipe's GGTT window,
         // sized for the sink's preferred mode when known and
@@ -237,7 +292,6 @@ impl IntelDpBridge {
                     ddi,
                     e,
                 );
-                intel_gpu_multipipe::release_pipe(pipe, ddi);
                 return Err(DpBridgeError::ModesetFailed);
             }
         };
@@ -253,13 +307,42 @@ impl IntelDpBridge {
         // machine, the pipe gets its DBUF share and the pipes
         // already live are reprogrammed to theirs.
         let mut modeset = Modeset::for_pipe(&mmio, ddi, pipe);
+        modeset.set_typec_width(cfg.lanes);
         let active = intel_gpu_multipipe::active_pipes();
         if active.len() >= 2 {
             if let Some((start, end)) = intel_gpu_multipipe::share_for(&active, pipe) {
                 modeset.set_dbuf_share(start, end);
             }
         }
-        let outcome = modeset.modeset(&fb, preferred_mode.as_ref());
+        let outcome = match preferred_mode {
+            Some(mode) => {
+                let mut aux = IntelAux::new(&mmio, ddi);
+                crate::dp_link_training::read_caps(&mut aux)
+                    .map_err(|_| ModesetError::EdidUnavailable)
+                    .and_then(|caps| {
+                        let source = crate::dp_link_training::SourceCaps {
+                            max_rate: crate::dp_link_training::LinkRate::Hbr3,
+                            max_lanes: cfg.lanes,
+                        };
+                        let plan = crate::dp_link_training::negotiate(
+                            &source,
+                            &caps,
+                            crate::dp_link_training::stream_demand_kbps(mode.pixel_clock_khz, 24),
+                        );
+                        modeset
+                            .modeset_with_plan(
+                                &fb,
+                                &mode,
+                                crate::intel_gpu_modeset::LinkPlan {
+                                    rate: plan.rate,
+                                    lanes: plan.lanes,
+                                },
+                            )
+                            .map(|(mode, _)| mode)
+                    })
+            }
+            None => Err(ModesetError::EdidUnavailable),
+        };
         match outcome {
             Ok(mode) => {
                 intel_gpu_multipipe::reprogram_active_dbuf_shares(&mmio);
@@ -319,7 +402,6 @@ impl IntelDpBridge {
                     "  intel-gpu/dp: EDID unavailable on DDI {:?} — no sink mode known yet",
                     ddi,
                 );
-                intel_gpu_multipipe::release_pipe(pipe, ddi);
                 Err(DpBridgeError::EdidUnavailable)
             }
             Err(e) => {
@@ -330,21 +412,51 @@ impl IntelDpBridge {
                     pipe,
                     e,
                 );
-                intel_gpu_multipipe::release_pipe(pipe, ddi);
                 Err(DpBridgeError::ModesetFailed)
             }
         }
     }
 }
 
-/// Scanout allocations retained per Type-C DDI. The bridge is
-/// stateless and the trait has no exit hook, so — like the DP
-/// session's retained allocation in `intel_gpu` — a bridge
-/// surface is kept for the session's lifetime; a re-entry on
-/// the same DDI frees the previous block before replacing it
-/// (its pipe is being re-modeset by that same call).
+/// Scanouts stay retained until the owning session proves a local stop.
+/// Failed stop never frees backing or recycles its pipe for another user.
 static BRIDGE_SCANOUTS: IrqSafeSpinLock<[Option<ContiguousScanout>; 8]> =
     IrqSafeSpinLock::new([None; 8]);
+
+fn stop_session(gpu: &intel_gpu::DisplayInfo, ddi: Ddi) -> Result<(), DpBridgeError> {
+    let mut sessions = SESSIONS.try_lock().ok_or(DpBridgeError::NotReady)?;
+    let Some(session) = sessions[ddi as usize] else {
+        return Ok(());
+    };
+    if session.bar != gpu.gtt_mmadr.phys.raw() {
+        return Err(DpBridgeError::NotReady);
+    }
+    let family =
+        crate::intel_gpu_modeset::gen12_family_for_chip(gpu.chip).ok_or(DpBridgeError::NotReady)?;
+    let io = MmioRegionWindow::new(&gpu.gtt_mmadr, family);
+    if let Some(pipe) = session.pipe {
+        Modeset::for_pipe(&io, ddi, pipe)
+            .try_teardown()
+            .map_err(|_| DpBridgeError::ModesetFailed)?;
+    }
+    session
+        .port
+        .disable(&io)
+        .map_err(|_| DpBridgeError::ModesetFailed)?;
+    session
+        .port
+        .disconnect(&io, session.bar)
+        .map_err(|_| DpBridgeError::ModesetFailed)?;
+    if let Some(pipe) = session.pipe {
+        intel_gpu_multipipe::release_pipe(pipe, ddi);
+    }
+    let allocation = BRIDGE_SCANOUTS.lock()[ddi as usize].take();
+    if let Some(allocation) = allocation {
+        crate::intel_gpu_gtt::free_contiguous_scanout(&allocation);
+    }
+    sessions[ddi as usize] = None;
+    Ok(())
+}
 
 fn retain_bridge_scanout(ddi: Ddi, alloc: ContiguousScanout) {
     let mut slots = BRIDGE_SCANOUTS.lock();

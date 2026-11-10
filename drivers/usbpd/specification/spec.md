@@ -15,6 +15,15 @@ exists to avoid competing with firmware for the same controller.
 
 ## 3. Public interface
 
+- `dp_gpu_bridge::DpAltModeGpuBridge::exit_dp_mode(ConnectorId)` stops a
+  retained GPU session on detach; the default is a no-op for bridges without
+  a retained owner. `notify_dp_exited` snapshots the registry, invokes every
+  bridge without the registry lock, and reports failure after delivering
+  all exits. Each bridge releases only its own connector session. TCPM DP
+  discovery retries a refused stop while detached and resets discovery and
+  per-attach dispatch only after exit succeeds; reattach can then configure
+  a fresh session. Contract renegotiation alone does not tear down DP.
+
 - `ucsi::Transport` supplies bounded version, CCI, control and message accesses.
 - `ucsi::Ppm<T>` owns and serializes async reset, initialization, polling and
   mode selection. Known UCSI versions 1.0/1.1/1.2/2.0/2.1/3.0 are accepted.

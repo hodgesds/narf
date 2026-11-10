@@ -84,7 +84,7 @@ use crate::intel_gpu_xelpg::{
     disable_d2d, disable_port_pll_complete, enable_d2d, enable_port_pll_state, port_width,
     set_signal_levels_hdmi, wait_port_buf_active, wait_port_buf_idle, C10PllState, C20PllState,
     C20Vdr, Cx0Error, Cx0Phy, Cx0PllState, PhyKind, PllRequest, XeLpgPort, PORT_BUF_PHY_IDLE,
-    PORT_BUF_REVERSAL, PORT_WIDTH_MASK,
+    PORT_WIDTH_MASK,
 };
 use crate::intel_gpu_xelpg_external::{
     external_pipe, preflight, request_pipe_wells, reserve_pipe, trans_clk_sel, trans_clk_sel_port,
@@ -350,6 +350,7 @@ pub fn hdmi_pll_request(
         }
     };
     Ok(PllRequest {
+        lanes: crate::intel_gpu_xelpg::PhyLaneConfig::NATIVE,
         state,
         port_clock_khz: clock_khz,
         lane_count: HDMI_LANES,
@@ -664,12 +665,12 @@ fn program_hdmi<M: MmioWindow + ?Sized>(io: &M, route: &mut MtlHdmiRoute) -> Res
         }
     }
     enable_d2d(io, port).map_err(phy_err)?;
-    set_signal_levels_hdmi(&Cx0Phy::new(io, port)).map_err(phy_err)?;
+    set_signal_levels_hdmi(&Cx0Phy::with_lanes(io, port, pll.lanes)).map_err(phy_err)?;
     let buf = rd(io, port.buf_ctl1())?;
     wr(
         io,
         port.buf_ctl1(),
-        (buf & !(PORT_WIDTH_MASK | PORT_BUF_REVERSAL)) | port_width(HDMI_LANES),
+        (buf & !PORT_WIDTH_MASK) | port_width(HDMI_LANES),
     )?;
     wr(
         io,

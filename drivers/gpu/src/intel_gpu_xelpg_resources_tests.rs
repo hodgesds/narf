@@ -1275,6 +1275,12 @@ fn smoke_xelpg_resources_bigjoiner_and_panel_fitter_allocation() -> TestResult {
     if let Some(p) = request.pipes[0].as_mut() {
         p.src_w = Some(1280);
         p.src_h = Some(720);
+        // A fitted 1280x720 source needs a matching fetched plane; the
+        // original 1920x1080 plane exceeds the source rectangle.
+        if let Some(plane) = p.planes[0].as_mut() {
+            plane.width = 1280;
+            plane.height = 720;
+        }
     }
     let fit_state = match compute(&request, &latency()) {
         Ok(s) => s,
