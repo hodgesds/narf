@@ -357,16 +357,34 @@ impl State {
 }
 
 /// Serialize the shared EP0 scratch page. An error or dropped operation does
-/// not call complete, so the claim remains terminally busy.
+/// not call complete, so the claim remains terminally busy until one of the
+/// two recovery coordinators (halt recovery, timeout cancellation) proves
+/// the hardware side dead and calls `force_reset`.
+///
+/// A control TD retains up to three receipts. `expected` holds the Data
+/// and Status Stage TRBs, whose IOC events must both be consumed before
+/// the claim completes. `setup` names the Setup Stage TRB: it requests no
+/// event of its own, so a Transfer Event against it is always an error
+/// (the xHC reports a failed SETUP transaction, or a stall, at the TRB it
+/// was executing). Retaining it keeps that event out of the lossy shared
+/// queue so the waiter can end the TD on it, as Linux `process_ctrl_td`
+/// does for an error on any TRB of the TD.
 #[derive(Debug)]
 pub(super) struct ControlState {
     busy: bool,
+    /// Timeout cancellation in progress: every EP0 Transfer Event for the
+    /// slot is quarantined (Stop Endpoint may force one at any TRB) and
+    /// no waiter may take a retained event.
+    cancelling: bool,
+    setup: Option<(u64, super::completion::Latch)>,
     expected: [Option<(u64, super::completion::Latch)>; 2],
 }
 impl ControlState {
     pub const fn new() -> Self {
         Self {
             busy: false,
+            cancelling: false,
+            setup: None,
             expected: [None, None],
         }
     }
@@ -374,16 +392,21 @@ impl ControlState {
         self.busy
     }
     /// Drop the EP0 claim without a terminal completion. Only the
-    /// halt-recovery coordinator may call this, after the Reset
-    /// Endpoint command for DCI 1 completed successfully and the
-    /// endpoint's output context read back Stopped: at that point the
-    /// retained TD is hardware-dead, and any waiter on its latches
-    /// times out instead of completing against a reset pipe. This is
-    /// the one sanctioned exception to the "an error does not call
-    /// complete" rule above — the hardware state it guards no longer
-    /// exists.
+    /// recovery coordinators may call this: halt recovery after the
+    /// Reset Endpoint command for DCI 1 completed successfully, or
+    /// timeout cancellation after Stop Endpoint (or Reset Endpoint,
+    /// when the pipe had halted) completed — and in both cases only
+    /// after Set TR Dequeue Pointer moved the dequeue past the TD and
+    /// the endpoint's output context read back Stopped at that
+    /// pointer. At that point the retained TD is hardware-dead, and
+    /// any waiter on its latches times out instead of completing
+    /// against a reset pipe. This is the one sanctioned exception to
+    /// the "an error does not call complete" rule above — the
+    /// hardware state it guards no longer exists.
     pub fn force_reset(&mut self) {
         self.busy = false;
+        self.cancelling = false;
+        self.setup = None;
         self.expected = [None, None];
     }
     pub fn begin(&mut self, actual: u64, expected: u64) -> Result<(), Error> {
@@ -394,7 +417,21 @@ impl ControlState {
             return Err(Error::Busy);
         }
         self.busy = true;
+        self.cancelling = false;
+        self.setup = None;
         self.expected = [None, None];
+        Ok(())
+    }
+    /// Retain the Setup Stage TRB of the claimed TD. Its receipt is
+    /// error-only: `complete` never requires it to be consumed.
+    pub fn expect_setup(&mut self, pointer: u64) -> Result<(), Error> {
+        if !self.busy {
+            return Err(Error::Stale);
+        }
+        if self.setup.is_some() {
+            return Err(Error::Busy);
+        }
+        self.setup = Some((pointer, super::completion::Latch::new()));
         Ok(())
     }
     pub fn expect(&mut self, pointer: u64) -> Result<(), Error> {
@@ -409,8 +446,33 @@ impl ControlState {
         *empty = Some((pointer, super::completion::Latch::new()));
         Ok(())
     }
+    /// Begin timeout cancellation of the retained TD. From here until
+    /// `force_reset`, `record` quarantines every EP0 Transfer Event
+    /// for the slot and `take_matching` yields nothing. An idle pipe
+    /// has nothing to cancel.
+    pub fn begin_cancel(&mut self, actual: u64, expected: u64) -> Result<(), Error> {
+        if actual == 0 || actual != expected || !self.busy {
+            return Err(Error::Stale);
+        }
+        if self.cancelling {
+            return Err(Error::Busy);
+        }
+        self.cancelling = true;
+        Ok(())
+    }
     pub fn record(&mut self, slot: u8, event: super::event_wait::Event) -> bool {
-        for (pointer, completion) in self.expected.iter_mut().flatten() {
+        if self.cancelling {
+            // Stop Endpoint can force an event at any TRB of the TD or
+            // at its successor. None may enter the lossy global queue.
+            return event[3] & (0x3f << 10) == 32 << 10
+                && event[3] >> 24 == u32::from(slot)
+                && event[3] & (0x1f << 16) == 1 << 16;
+        }
+        for (pointer, completion) in self
+            .setup
+            .iter_mut()
+            .chain(self.expected.iter_mut().flatten())
+        {
             if super::completion::transfer_matches(&event, slot, 1, *pointer) {
                 completion.record(event);
                 return true;
@@ -422,7 +484,14 @@ impl ControlState {
         &mut self,
         predicate: &mut dyn FnMut(&super::event_wait::Event) -> bool,
     ) -> Result<Option<super::event_wait::Event>, Error> {
-        for (_, completion) in self.expected.iter_mut().flatten() {
+        if self.cancelling {
+            return Ok(None);
+        }
+        for (_, completion) in self
+            .setup
+            .iter_mut()
+            .chain(self.expected.iter_mut().flatten())
+        {
             if let Some(event) = completion
                 .take_matching(predicate)
                 .map_err(|_| Error::Malformed)?
@@ -436,17 +505,32 @@ impl ControlState {
         if actual == 0 || actual != expected || !self.busy {
             return Err(Error::Stale);
         }
-        if !self
-            .expected
-            .iter()
-            .flatten()
-            .all(|(_, completion)| completion.consumed())
+        if self.cancelling
+            || !self
+                .expected
+                .iter()
+                .flatten()
+                .all(|(_, completion)| completion.consumed())
         {
             return Err(Error::Busy);
         }
         self.busy = false;
+        self.setup = None;
         self.expected = [None, None];
         Ok(())
+    }
+    /// Cold-path diagnostics: the retained receipts as
+    /// `(TRB pointer, latched event)` — Setup first, then Data/Status in
+    /// publication order. Does not consume anything.
+    pub fn receipts(&self) -> [Option<(u64, Option<super::event_wait::Event>)>; 3] {
+        let mut out = [None; 3];
+        for (entry, (pointer, completion)) in out
+            .iter_mut()
+            .zip(self.setup.iter().chain(self.expected.iter().flatten()))
+        {
+            *entry = Some((*pointer, completion.peek()));
+        }
+        out
     }
 }
 

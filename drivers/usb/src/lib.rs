@@ -603,6 +603,7 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                 }
                 SUPERVISOR_PHASE.store(5, core::sync::atomic::Ordering::Relaxed);
                 SUPERVISOR_ATTACHING_PORT.store(p, core::sync::atomic::Ordering::Relaxed);
+                let timeouts_before = c.timeout_count();
                 let outcome = enumeration_wait::run(attach::try_attach_root(c, p), || {
                     pump_bound_devices(c);
                 })
@@ -632,14 +633,22 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                         root_fail_count[pi] = 0;
                     }
                     AttachOutcome::UnknownClass => {
-                        root_fail_count[pi] = root_fail_count[pi].saturating_add(1);
-                        if root_fail_count[pi] == MAX_PER_PORT_RETRIES {
+                        let before = root_fail_count[pi];
+                        root_fail_count[pi] = enumeration_wait::charge_failure(
+                            before,
+                            MAX_PER_PORT_RETRIES,
+                            c.timeout_count() != timeouts_before,
+                        );
+                        if before < MAX_PER_PORT_RETRIES
+                            && root_fail_count[pi] >= MAX_PER_PORT_RETRIES
+                        {
                             use core::fmt::Write as _;
                             let _ = writeln!(
                                 narf_console::Writer,
-                                "  usb-supervisor: root port {} gave up after {} attempts (portsc={:?})",
+                                "  usb-supervisor: root port {} gave up, retry budget {} spent (a timed-out attempt costs {}) (portsc={:?})",
                                 p,
                                 MAX_PER_PORT_RETRIES,
+                                MAX_PER_PORT_RETRIES / enumeration_wait::TIMEOUT_ATTEMPTS,
                                 c.portsc(p)
                             );
                         }
@@ -746,6 +755,7 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                     {
                         continue;
                     }
+                    let timeouts_before = c.timeout_count();
                     let outcome = enumeration_wait::run(
                         attach::try_attach_via_hub(c, &hub_copy, *route, *tier, *root_port, dp),
                         || pump_bound_devices(c),
@@ -776,16 +786,22 @@ fn supervisor(controller: alloc::sync::Arc<xhci::Xhci>) -> Supervisor {
                         }
                         AttachOutcome::UnknownClass => {
                             let fails = hub_fail_count.entry((*hub_slot, dp)).or_insert(0);
-                            *fails = fails.saturating_add(1);
-                            if *fails == MAX_PER_PORT_RETRIES {
+                            let before = *fails;
+                            *fails = enumeration_wait::charge_failure(
+                                before,
+                                MAX_PER_PORT_RETRIES,
+                                c.timeout_count() != timeouts_before,
+                            );
+                            if before < MAX_PER_PORT_RETRIES && *fails >= MAX_PER_PORT_RETRIES {
                                 use core::fmt::Write as _;
                                 let _ = writeln!(
                                     narf_console::Writer,
-                                    "  usb-supervisor: xhci{} hub slot {} port {} gave up after {} attempts",
+                                    "  usb-supervisor: xhci{} hub slot {} port {} gave up, retry budget {} spent (a timed-out attempt costs {})",
                                     c.id(),
                                     hub_slot,
                                     dp,
-                                    MAX_PER_PORT_RETRIES
+                                    MAX_PER_PORT_RETRIES,
+                                    MAX_PER_PORT_RETRIES / enumeration_wait::TIMEOUT_ATTEMPTS
                                 );
                             }
                         }
