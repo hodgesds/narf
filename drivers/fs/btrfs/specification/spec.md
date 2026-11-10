@@ -58,6 +58,12 @@ pub mod harness {                                               // test-workload
 BtrfsVolume::sync_fs(&self) -> Result<(), FsError>  // syncfs: commit + superblock + flush
 ```
 
+All write profiles apply the commit metadata reserve check before staging
+another operation. Space pressure may commit a batch before `MAX_BATCH_OPS`;
+the operation cap is an upper bound, not a promised transaction size. Explicit
+sync commits the final partial batch. Tests inspecting committed tree roots
+must sync successfully before checking their height.
+
 Every node for one `(filesystem core, fs-tree id, inode)` retains shared inode
 metadata, size, and mapping identity. Creation acquires that reference before
 releasing the operation mutex. Mutators hold the mutex from their first tree
