@@ -167,6 +167,39 @@ view and withheld by each allocator, so the pinning rule is unchanged. With
 `verification/btrfs-host`) every commit re-reads the tree and fails on any
 difference from the view.
 
+Metadata space is reserved before an operation is accepted, never inside a
+commit (`write/reserve.rs`, Linux `btrfs_start_transaction` /
+`btrfs_block_rsv_add`). An operation is staged only while the free metadata
+space, after the operation's own fs-tree blocks, covers (a) twice the
+*first-order* need of the batch with that operation in it — a bound on the
+blocks the commit's own csum, extent, block-group and free-space edits can
+allocate, `2 × height` per inserted item and `height` per modified one, with
+the heights sampled when the batch opens — and (b) the global reserve: the
+recorded size of the extent, csum, block-group and free-space trees, at least
+256 blocks, at most 512 MiB and an eighth of the metadata space
+(`btrfs_update_global_block_rsv`). The first-order share is a bound; the
+doubling (for recording the commit's own blocks) and the global reserve are
+sized, not proven, as in Linux, and a commit that still finds no space aborts
+the transaction as before. Each commit reports the blocks it allocated beyond
+its batch's reservation (`stats::max_reserve_overrun`).
+
+An operation whose reservation does not fit is refused with `NoSpace` before
+anything of it is staged, and reclaim runs for that operation, outside any
+commit: the open batch is committed and its superblock written, which unpins
+what earlier transactions freed, and the operation is retried
+(`with_space_retry`, Linux `COMMIT_TRANS`); if it still does not fit, a
+METADATA or DATA chunk is allocated in a transaction of its own and it is
+retried again (`autogrow!` → `root_rw_grow`, Linux `ALLOC_CHUNK`); only then
+does it return `ENOSPC`. (Linux tries the chunk before the commit; here the
+batch has to close before a chunk can be allocated, so the commit comes
+first.) A chunk is never allocated inside `commit_txn`. Reclaiming orphans is
+part of what is retried, so its `NoSpace` takes the same ladder, and it never
+fails a sync or keeps the transaction timer from committing. `unlink`,
+`rmdir` and the final eviction of an orphan may borrow the global reserve
+when their reservation does not fit (Linux
+`btrfs_start_transaction_fallback_global_rsv`, `evict_refill_and_join`), so a
+full filesystem can still be emptied; the batch then commits at once.
+
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.
 Device ownership remains pinned by the returned filesystem instance.

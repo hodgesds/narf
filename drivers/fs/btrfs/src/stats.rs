@@ -9,6 +9,18 @@ use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use crate::format;
 
+/// The most blocks any batch commit on any filesystem allocated beyond its
+/// batch's reservation, i.e. took from the global reserve
+/// ([`max_reserve_overrun`]).
+static MAX_RESERVE_OVERRUN: AtomicU64 = AtomicU64::new(0);
+
+/// The most tree blocks any batch commit (on any mounted btrfs since boot)
+/// allocated beyond the reservation its batch held — what it drew from the
+/// global reserve. For harnesses that judge the reservation's sizing.
+pub fn max_reserve_overrun() -> u64 {
+    MAX_RESERVE_OVERRUN.load(Relaxed)
+}
+
 /// Offset of the `owner` field in a tree-node header.
 const HDR_OWNER: usize = 88;
 
@@ -34,6 +46,19 @@ pub(crate) struct CommitStats {
     pub(crate) alloc_build_cycles: AtomicU64,
     /// Superblock images written to the device.
     pub(crate) super_writes: AtomicU64,
+    /// Operations refused before staging because their metadata reservation
+    /// did not fit (each is then retried after reclaim, or gets `ENOSPC`).
+    pub(crate) reserve_refusals: AtomicU64,
+    /// Metadata blocks the last commit allocated for itself (csum, extent,
+    /// block-group, free-space and root trees), and the first-order
+    /// reservation its batch held for them; the most any commit exceeded its
+    /// reservation by (what it took from the global reserve).
+    pub(crate) last_commit_blocks: AtomicU64,
+    pub(crate) last_commit_reserved: AtomicU64,
+    pub(crate) max_reserve_overrun: AtomicU64,
+    /// The reservation of the batch about to commit, plus one (0: the next
+    /// commit is not a batch's). Set by the batch, taken by its commit.
+    pub(crate) pending_reservation: AtomicU64,
 }
 
 /// A point-in-time copy of [`CommitStats`].
@@ -49,6 +74,8 @@ pub(crate) struct CommitStatsSnapshot {
     pub(crate) alloc_disk_builds: u64,
     pub(crate) alloc_build_cycles: u64,
     pub(crate) super_writes: u64,
+    pub(crate) reserve_refusals: u64,
+    pub(crate) max_reserve_overrun: u64,
 }
 
 impl CommitStatsSnapshot {
@@ -67,6 +94,8 @@ impl CommitStatsSnapshot {
             alloc_disk_builds: self.alloc_disk_builds - earlier.alloc_disk_builds,
             alloc_build_cycles: self.alloc_build_cycles - earlier.alloc_build_cycles,
             super_writes: self.super_writes - earlier.super_writes,
+            reserve_refusals: self.reserve_refusals - earlier.reserve_refusals,
+            max_reserve_overrun: self.max_reserve_overrun,
         }
     }
 }
@@ -85,6 +114,8 @@ impl CommitStats {
             alloc_disk_builds: self.alloc_disk_builds.load(Relaxed),
             alloc_build_cycles: self.alloc_build_cycles.load(Relaxed),
             super_writes: self.super_writes.load(Relaxed),
+            reserve_refusals: self.reserve_refusals.load(Relaxed),
+            max_reserve_overrun: self.max_reserve_overrun.load(Relaxed),
         }
     }
 
@@ -108,6 +139,25 @@ impl CommitStats {
         self.commits.fetch_add(1, Relaxed);
         self.rounds.fetch_add(rounds, Relaxed);
         self.last_rounds.store(rounds, Relaxed);
+    }
+
+    /// A batch holding a reservation of `blocks` is about to commit.
+    pub(crate) fn expect_commit(&self, blocks: u64) {
+        self.pending_reservation
+            .store(blocks.saturating_add(1), Relaxed);
+    }
+
+    /// The commit that just settled allocated `blocks` for its own trees
+    /// (the root tree's re-pack aside). Returns how far that went past the
+    /// committing batch's reservation, if it was a batch's commit.
+    pub(crate) fn note_commit_blocks(&self, blocks: u64) -> Option<u64> {
+        let reserved = self.pending_reservation.swap(0, Relaxed).checked_sub(1)?;
+        self.last_commit_blocks.store(blocks, Relaxed);
+        self.last_commit_reserved.store(reserved, Relaxed);
+        let overrun = blocks.saturating_sub(reserved);
+        self.max_reserve_overrun.fetch_max(overrun, Relaxed);
+        MAX_RESERVE_OVERRUN.fetch_max(overrun, Relaxed);
+        Some(overrun)
     }
 
     /// Count one allocator build that took `cycles`.
