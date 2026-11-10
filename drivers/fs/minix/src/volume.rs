@@ -108,11 +108,11 @@ pub struct MinixVolume<B: BlockDevice> {
     /// Lock order is total, `block_rmw` before `io`: `block_rmw` is
     /// only ever acquired when no other volume lock is held (each
     /// site takes it as its first lock action), and while it is held
-    /// the only other lock acquired is `io`, taken synchronously
-    /// inside `read_sector` / `write_sector` for the copy span and
-    /// never across an `await` — `io` is never held while acquiring
-    /// `block_rmw` (every `io` acquisition is a take-and-release
-    /// around a synchronous operation). No site calls another
+    /// the only other lock acquired is `io`, taken inside
+    /// `read_sector` / `write_sector` (across the submit+copy await
+    /// span since #1987 turned `io` into an async mutex) — `io` is
+    /// never held while acquiring `block_rmw` (every `io`
+    /// acquisition is released when its sector op returns). No site calls another
     /// `block_rmw` taker while holding the guard: `write_inode`,
     /// `alloc_bitmap_bit` and `free_bitmap_bit` call only
     /// `read_block` / `write_block` inside the span, and
@@ -122,13 +122,13 @@ pub struct MinixVolume<B: BlockDevice> {
     /// would nest the mutex and park forever. The `root_inode` /
     /// `inode_cells` spinlocks are taken only after the guard is
     /// dropped. No other code takes `block_rmw`, so no cycle can
-    /// form. Forward order against the sibling lanes (not yet on
-    /// main): #1994's `rmw` is taken *inside* `write_block`'s
-    /// sub-LBS branch, and #1987 turns `io` into an async mutex
-    /// taken inside the sector ops — both are acquired strictly
-    /// inside calls made while `block_rmw` is already held, so the
-    /// order `block_rmw` → `rmw` → `io` stays total and neither can
-    /// ever be held while acquiring `block_rmw`.
+    /// form. Forward order against the sibling locks: #1994's `rmw`
+    /// is taken *inside* `write_block`'s sub-LBS branch, and `io`
+    /// (an async mutex since #1987) is taken inside the sector ops
+    /// — both are acquired strictly inside calls made while
+    /// `block_rmw` is already held, so the order `block_rmw` →
+    /// `rmw` → `io` stays total and neither can ever be held while
+    /// acquiring `block_rmw`.
     block_rmw: Mutex<()>,
     /// Serialises the sub-LBS read-modify-write sequence in
     /// `write_block` (#1989): a MINIX block smaller than LBS is
