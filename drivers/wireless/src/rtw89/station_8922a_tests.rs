@@ -186,7 +186,7 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
         power: PowerType6Ghz::Lpi,
         tpe_dbm: None,
     };
-    let cases: [(Request, Error); 13] = [
+    let cases: [(Request, Error); 12] = [
         (
             Request {
                 band: Band::Ghz6,
@@ -253,13 +253,11 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
         (Request { primary: 0, ..req }, Error::BadPrimary),
         (Request { aid: 0x1000, ..req }, Error::AidOutOfRange),
         (Request { port: 8, ..req }, Error::PortOutOfRange),
-        (
-            Request {
-                pads: [4, 0, 0, 0, 0],
-                ..req
-            },
-            Error::PadsOutOfRange,
-        ),
+        // No pads refusal case: production parses the Assoc PPE pads
+        // from `peer_ies` (infallible, always five 2-bit values), so
+        // there is no `pads` request field and no `PadsOutOfRange`
+        // refusal anymore; pads coverage lives in
+        // `smoke_rtw89_8922a_admit_ppe_from_peer_ies`.
     ];
     for (case, want) in cases.iter() {
         match admit(&f, facet, &mut pool, case) {
@@ -533,6 +531,9 @@ fn legacy_req() -> Request<'static> {
         has_he: false,
         mgq_rpt_en: false,
         p2p: false,
+        // 2.4 GHz legacy request: no 6 GHz power program, and
+        // production refuses `Some` on any non-6 GHz band.
+        six_ghz: None,
     }
 }
 
