@@ -190,6 +190,25 @@ pub const fn bridge_forwarding_command(command: u16) -> Option<u16> {
 static BRIDGE_COMMAND: narf_lib::sync::IrqSafeSpinLock<()> =
     narf_lib::sync::IrqSafeSpinLock::new(());
 
+/// The Command register of every bridge above `device`, nearest first.
+/// Read-only: for drivers reporting why DMA or MSI did not arrive.
+pub fn upstream_bridge_commands(device: &BusDevice) -> alloc::vec::Vec<(crate::PcieAddr, u16)> {
+    let mut out = alloc::vec::Vec::new();
+    let mut current = *device;
+    for _ in 0..256 {
+        let Some(bridge) = upstream_bridge(&current) else {
+            break;
+        };
+        if let BusKind::Pcie { addr, cfg_phys } = bridge.kind {
+            // SAFETY: the Command register is inside the bridge's registered
+            // config window; this is a read.
+            out.push((addr, unsafe { cfg_read16(cfg_phys, COMMAND_OFFSET) }));
+        }
+        current = bridge;
+    }
+    out
+}
+
 /// Linux `pci_enable_bridge`: before a function may master the bus, every
 /// bridge between it and the root must decode memory and forward upstream
 /// requests. Firmware is not required to leave that enabled on ports it
@@ -685,6 +704,12 @@ pub fn restore_config(
         // INTx-disable in a single atomic-ish write, matching the
         // state the driver was running in before suspend.
         cfg_write16(cfg, 0x04, saved.command);
+    }
+    // A restored function that masters the bus needs its bridges forwarding
+    // again, exactly as on the first grant: a port can come back from a low
+    // power state with Bus Master Enable clear.
+    if saved.command != u16::MAX && saved.command & cmd::BUS_MASTER != 0 {
+        enable_upstream_bridges(device);
     }
     Ok(())
 }
