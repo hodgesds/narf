@@ -45,7 +45,9 @@ pub(crate) fn quiesce(r: &impl Registers, queues: usize) -> Result<(), IgcError>
     r.write(0x150c, u32::MAX);
     r.write(0x1528, u32::MAX);
     r.write(0x100, 0);
-    r.write(0x400, 8);
+    // TCTL contains nonzero reserved reset values. Stop TX without clearing
+    // those fields (I225 SUM §8.11.1; Linux also preserves them).
+    r.write(0x400, r.read(0x400) & !2);
     for q in 0..queues {
         r.write(0xc028 + q as u64 * 0x40, 0);
         r.write(0xe028 + q as u64 * 0x40, 0);
@@ -459,11 +461,66 @@ pub(crate) fn queue_sized(
     if r.read(0xc00c + offset) != 0x82000402 {
         return Err(IgcError::Other("RX descriptor format readback failed"));
     }
-    r.write(0xe028 + offset, 8 | (1 << 8) | (16 << 16) | (1 << 25));
-    poll(r, 0xe028 + offset, 1 << 25, 1 << 25)?;
-    r.write(0xc028 + offset, 8 | (8 << 8) | (4 << 16) | (1 << 25));
-    poll(r, 0xc028 + offset, 1 << 25, 1 << 25)?;
-    r.write(0xc018 + offset, rx_count as u32 - 1);
+    // Preparation must not wait for QUEUE_ENABLE while PCI mastering and
+    // TCTL/RCTL are still off. Keep both tails empty until activation.
+    // Completion must progress with one packet and no interrupt timer.
+    // TX WTHRESH=0 honors the EOP descriptor's RS immediately; RX WTHRESH=1
+    // flushes each completed descriptor (RX zero is not immediate mode).
+    // Linux's 16/4 batching relies on a configured EITR timer, which the
+    // polled fallback does not have. Descriptor posting remains batched.
+    r.write(0xe028 + offset, 8 | (1 << 8));
+    r.write(0xc028 + offset, 8 | (8 << 8) | (1 << 16));
+    r.flush();
+    Ok(())
+}
+
+/// Activate already prepared, retained rings and installed interrupt routes.
+/// The callback grants and verifies PCI bus mastering under current authority.
+/// Linux igc_configure enables TCTL/RCTL before configuring live queues. Do
+/// the same after all ring addresses are checked, and publish RX tails only
+/// after every queue acknowledges. An error is never permission to free DMA.
+pub(crate) fn activate_queues(
+    r: &impl Registers,
+    rx_counts: &[usize],
+    enable_master: impl FnOnce() -> Result<(), IgcError>,
+) -> Result<(), IgcError> {
+    if rx_counts.is_empty()
+        || rx_counts.len() > 4
+        || rx_counts
+            .iter()
+            .any(|count| !(64..=4096).contains(count) || count % 8 != 0)
+    {
+        return Err(IgcError::Other("invalid DMA queue activation"));
+    }
+    for (q, count) in rx_counts.iter().enumerate() {
+        let offset = q as u64 * 0x40;
+        let tx_length = r.read(0xe008 + offset);
+        if !(1024..=65536).contains(&tx_length)
+            || tx_length % 128 != 0
+            || r.read(0xc008 + offset) != (*count * 16) as u32
+            || [0xc010, 0xc018, 0xe010, 0xe018]
+                .into_iter()
+                .any(|base| r.read(base + offset) != 0)
+            || [0xc028, 0xe028]
+                .into_iter()
+                .any(|base| r.read(base + offset) & (1 << 25) != 0)
+        {
+            return Err(IgcError::Other("DMA queues not prepared for activation"));
+        }
+    }
+    enable_master()?;
+    enable_data(r)?;
+    for q in 0..rx_counts.len() {
+        let offset = q as u64 * 0x40;
+        for base in [0xe028, 0xc028] {
+            r.write(base + offset, r.read(base + offset) | (1 << 25));
+            poll(r, base + offset, 1 << 25, 1 << 25)?;
+        }
+    }
+    for (q, count) in rx_counts.iter().enumerate() {
+        r.write(0xc018 + q as u64 * 0x40, *count as u32 - 1);
+    }
+    r.flush();
     Ok(())
 }
 
@@ -523,7 +580,11 @@ pub(crate) fn configure_tables(
     // Multicast accept supports IPv6 and joined groups. Unicast promiscuity
     // is enabled only through the explicit receive-mode control.
     r.write(0x100, (1 << 4) | (1 << 5) | (1 << 15) | (1 << 26));
-    r.write(0x400, 8 | (15 << 4) | (63 << 12) | (1 << 24));
+    // Preserve reserved fields, notably reset bits 31:28=0xa and 27:26=1.
+    // Replacing the whole word with legacy policy bits erased 0xa4000000
+    // on physical I225. Prepare TX disabled and clear the SWXOFF command.
+    let tctl = r.read(0x400) & !(2 | 0xff0 | 0x003ff000 | (1 << 22));
+    r.write(0x400, tctl | 8 | (15 << 4) | (63 << 12) | (1 << 24));
     r.flush();
 }
 

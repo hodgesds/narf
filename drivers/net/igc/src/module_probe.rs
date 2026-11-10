@@ -276,12 +276,15 @@ fn init_dma_rings(state: &DeviceState, dev: u64, bar: u64) -> Result<(), i32> {
         RX_RING_LEN,
     )
     .map_err(|_| -5)?;
-    // SAFETY: every hardware-visible address now belongs to this retained
-    // context; no inherited DMA state can run before this point.
-    if unsafe { narf_pci_enable(dev, PCI_CMD_BUS_MASTER) } != 0 {
-        return Err(-5);
-    }
-    super::hardware::enable_data(&regs).map_err(|_| -5)?;
+    super::hardware::activate_queues(&regs, &[RX_RING_LEN], || {
+        // SAFETY: all programmed rings and buffers belong to this retained
+        // context. The ABI verifies the Command readback before activation.
+        if unsafe { narf_pci_enable(dev, PCI_CMD_BUS_MASTER) } != 0 {
+            return Err(super::protocol::IgcError::Other("PCI DMA enable rejected"));
+        }
+        Ok(())
+    })
+    .map_err(|_| -5)?;
     state.tx_ring.store(tx_ring, Ordering::Relaxed);
     state.rx_ring.store(rx_ring, Ordering::Relaxed);
     state.tx_tail.store(0, Ordering::Relaxed);

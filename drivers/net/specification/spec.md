@@ -182,13 +182,42 @@ Initial built-in and module IGC probes park inherited mastering/decode and
 verify D0 before BAR sizing. Control MMIO is mapped before memory decode is
 enabled; BME remains off through reset, allocation and ring programming.
 Recovery/resume restores PCI state with BME masked before reset/reinitialization.
-Only retained, programmed DMA rings precede the final BME grant. A failed
-probe parks the function; failed quiescence still retains uncertain DMA.
+Only retained, programmed DMA rings precede the final BME grant. Activation
+then enables global TCTL/RCTL before requesting individual TXDCTL/RXDCTL
+queue enables, matching Linux's `igc_configure` ordering. Ring preparation
+leaves heads/tails empty and never waits for an enable acknowledgement while
+the engines are parked. Every active ring's length and empty indices are
+checked before BME; receive tails are published only after all queues
+acknowledge. Built-in probe, recovery/resume and the module share activation.
+A failed probe parks the function; failed quiescence still retains uncertain DMA.
+Queue preparation, activation and shutdown preserve TCTL reserved reset fields
+through read-modify-write; preparing transmit clears the enable and SWXOFF
+command bits while setting collision/padding policy. This applies to built-in
+and module initialization and their recovery paths.
 Shared queue initialization rejects invalid ring geometry or failed base,
 length, SRRCTL and TX writeback-mode readbacks before queue enable. TX head
 writeback is disabled: terminal descriptor DD remains the completion authority.
 Advanced one-buffer RX programs a 2048-byte packet buffer, 256-byte header
 size and SRRCTL drop enable at bit31, with reserved bit28 clear.
+
+IGC completion writeback must progress for a single packet with hardware
+interrupt timers unavailable. TX uses WTHRESH`0` with RS on each packet's
+terminal descriptor; RX uses WTHRESH`1` (zero is not an immediate-writeback
+mode). Software descriptor publication and receive draining remain batched.
+This applies to built-in, module, reset/recovery and resume through shared
+queue preparation. EITR still controls interrupt moderation. The first TX
+timeout also records a read-only CPU page-table walk for both rings, the
+physical and translated addresses, PAT selection and MTRR default register.
+These are diagnostic evidence, never completion or safe-reuse authority.
+The selected PAT entry alone does not establish the effective memory type
+when variable MTRRs override it. No live cache flush or alternate RAM alias
+is introduced. Hardware acceptance and throughput measurements remain open.
+If that timeout enters recovery, a second snapshot counts descriptor DD bits
+and samples retained RX-buffer prefixes after the existing device-wide DMA
+drain succeeds, before reset clears the rings. UMEM leases are skipped. No
+payload is read if the drain fails. Nonzero prefixes can include earlier
+traffic in reused buffers; the paired software counters and pre-stop sample
+are needed to interpret them. Neither snapshot authorizes buffer reuse.
 
 Before enabling queues, the built-in driver clears PCIe Device Control's
 No Snoop Enable bit and verifies the readback, including after recovery or
