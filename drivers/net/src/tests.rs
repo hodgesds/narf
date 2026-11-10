@@ -417,6 +417,22 @@ fn smoke_igc_msix_constants_match_linux() -> TestResult {
     if igc::IMS_DEFAULT & igc::IMS_LSC == 0 {
         return TestResult::Fail("default mask must include LSC");
     }
+    // Multi-vector MSI-X (Linux igc_irq_enable): only link, DMA-out-of-sync
+    // and reset causes belong to the administrative vector. Physical I225
+    // capture: IMS 0xd5 raised it for ordinary traffic, and EIMS stayed
+    // 0x1e because nothing re-armed the auto-masked vector 0.
+    if igc::IMS_MSIX_OTHER != 0x5000_0004 {
+        return TestResult::Fail("MSI-X other-cause mask differs from Linux");
+    }
+    if igc::IMS_MSIX_OTHER & (igc::IMS_TXDW | igc::IMS_RXT0 | igc::IMS_RXDMT0 | igc::IMS_RXO) != 0 {
+        return TestResult::Fail("queue causes routed to the administrative vector");
+    }
+    if igc::isr_rearm_mask(0) != 1 {
+        return TestResult::Fail("administrative vector is not re-armed by its handler");
+    }
+    if (1..5).any(|index| igc::isr_rearm_mask(index) != 0) {
+        return TestResult::Fail("queue vectors must stay masked until their pump polls");
+    }
     if igc::GPIE_NSICR != 1 << 0 {
         return TestResult::Fail("GPIE.NSICR bit drift");
     }
