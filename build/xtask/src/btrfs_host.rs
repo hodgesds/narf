@@ -29,7 +29,7 @@ pub struct Args {
     /// Crash-test every flush boundary plus two random cuts per window.
     #[arg(long)]
     pub exhaustive: bool,
-    /// Comma-separated scenarios (regress,root,snapshots,lba4k,gate).
+    /// Comma-separated scenarios (regress,root,snapshots,lba4k,gate,fst).
     #[arg(long)]
     pub scenario: Option<String>,
     /// Concurrent `btrfs check` processes in the crash pass.

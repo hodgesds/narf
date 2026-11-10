@@ -478,6 +478,27 @@ impl<B: BlockDevice> VolCore<B> {
         &self.fs_batch
     }
 
+    /// Transaction cost counters ([`crate::stats::CommitStats`]).
+    pub(crate) fn commit_stats(&self) -> &crate::stats::CommitStats {
+        &self.stats
+    }
+
+    /// The cached in-memory free-space view, if any.
+    pub(crate) fn free_view(&self) -> Option<Arc<crate::allocator::FreeView>> {
+        self.free_view.lock().clone()
+    }
+
+    /// Replace the cached free-space view; `None` drops it, so the next
+    /// allocator reads the free-space tree from disk.
+    pub(crate) fn set_free_view(&self, view: Option<Arc<crate::allocator::FreeView>>) {
+        *self.free_view.lock() = view;
+    }
+
+    /// Take the cached free-space view out, leaving none behind.
+    pub(crate) fn take_free_view(&self) -> Option<Arc<crate::allocator::FreeView>> {
+        self.free_view.lock().take()
+    }
+
     /// No mount of this filesystem may write (mounted or remounted ro).
     pub(crate) fn is_core_read_only(&self) -> bool {
         self.read_only.load(core::sync::atomic::Ordering::Acquire)
@@ -729,6 +750,12 @@ pub struct VolCore<B: BlockDevice> {
     /// tree reads and node writes, which is also what serialises the shared
     /// allocator inside it.
     fs_batch: Mutex<Option<crate::write::FsBatch>>,
+    /// What transactions have cost so far ([`crate::stats::CommitStats`]).
+    stats: crate::stats::CommitStats,
+    /// The committed free-space tree, in memory, once something has needed
+    /// it ([`crate::allocator::FreeView`]). `None` until then, and again
+    /// whenever it may no longer match the tree.
+    free_view: IrqSafeSpinLock<Option<Arc<crate::allocator::FreeView>>>,
     /// Run when the last mount (view) of this core drops: commits whatever a
     /// writable core still holds (see [`commit_on_last_drop`]). A function
     /// pointer because `Drop` cannot carry the `'static` bound committing
@@ -1611,7 +1638,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let mut last = FsError::InvalidData;
         for _ in 0..3 {
             match self.read_node_attempt(logical).await {
-                Ok(node) => return Ok(node),
+                Ok(node) => {
+                    self.stats.note_read(&node);
+                    return Ok(node);
+                }
                 Err(error) => last = error,
             }
         }
@@ -2083,6 +2113,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             refused_after_abort: core::sync::atomic::AtomicU64::new(0),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
+            stats: crate::stats::CommitStats::default(),
+            free_view: IrqSafeSpinLock::new(None),
             last_view_dropped: commit_on_last_drop::<B>,
             drop_commit_tried: core::sync::atomic::AtomicBool::new(false),
             state: IrqSafeSpinLock::new(VolState {
@@ -2813,6 +2845,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if !self.supports_writes() {
             return Err(FsError::ReadOnly);
         }
+        self.stats.note_write(buf);
         let epoch = self.write_logical_unchecked(logical, buf).await?;
         self.cache_written_node(logical, buf, epoch);
         Ok(())
@@ -2832,6 +2865,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         {
             return Err(FsError::ReadOnly);
         }
+        self.stats.note_write(buf);
         let epoch = self.write_logical_unchecked(logical, buf).await?;
         self.cache_written_node(logical, buf, epoch);
         Ok(())
@@ -3048,6 +3082,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         }
         let devid = primary_ok.ok_or(FsError::NotFound)?;
         self.state.lock().superblock_source = (devid, format::SUPERBLOCK_OFFSET);
+        self.stats
+            .super_writes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
