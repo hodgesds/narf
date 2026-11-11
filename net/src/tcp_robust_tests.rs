@@ -1301,7 +1301,7 @@ fn smoke_send_buffer_expands_with_congestion_window() -> TestResult {
             if limit != DEFAULT_SND_BUF {
                 return TestResult::Fail("autotuning resized a send buffer the application locked");
             }
-        } else if limit < 2 << 20 || limit > 4_194_304 {
+        } else if !(2 << 20..=4_194_304).contains(&limit) {
             return TestResult::Fail(
                 "a full send buffer did not expand to twice the congestion window",
             );
