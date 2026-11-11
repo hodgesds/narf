@@ -2418,10 +2418,11 @@ impl KernelTask {
     pub fn check_stack_canary(&self) {
         if let Some((i, got)) = self.stack_canary_clobbered() {
             let base = self.stack.as_ptr() as u64;
+            let cpu = this_cpu();
             panic!(
                 "KERNEL TASK STACK OVERFLOW: canary word {} at {:#x} clobbered \
                  ({:#018x} != {:#018x}) — stack [{:#x},{:#x}) ({} KiB) overran its \
-                 bottom into the heap below",
+                 bottom into the heap below; task {} on cpu {}; {}",
                 i,
                 base + (i as u64) * 8,
                 got,
@@ -2429,8 +2430,21 @@ impl KernelTask {
                 base,
                 base + self.stack.len() as u64,
                 self.stack.len() / 1024,
+                crate::current_task_id_on(cpu).raw(),
+                cpu,
+                OverflowEvidence { task: self },
             );
         }
+    }
+
+    /// The stack word at byte offset `at`, if it lies inside the stack.
+    fn stack_word(&self, at: u64) -> Option<u64> {
+        let base = self.stack.as_ptr() as u64;
+        let off = at.checked_sub(base)? as usize;
+        let bytes = self.stack.get(off..off.checked_add(8)?)?;
+        let mut w = [0u8; 8];
+        w.copy_from_slice(bytes);
+        Some(u64::from_ne_bytes(w))
     }
 
     /// First clobbered canary word at the low end of the stack, as
@@ -3045,6 +3059,53 @@ impl KernelTask {
                 Ordering::Relaxed,
             );
         }
+    }
+}
+
+/// What a task whose stack overflowed still has to say for itself, for the
+/// overflow panic — reporting only, read from the task's own stack:
+///
+/// * where it last switched out (saved `rip`/`rsp`/`rbp`), and the chain of
+///   return addresses from that `rbp`, followed only while each frame lies
+///   inside the stack (meaningful where frame pointers are kept);
+/// * the words just above the canary: the deepest frames the overflow left
+///   behind are still there after the task unwound. Symbolise both against
+///   `nm -n` of the kernel image.
+struct OverflowEvidence<'a> {
+    task: &'a KernelTask,
+}
+
+impl core::fmt::Display for OverflowEvidence<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let task = self.task;
+        let ctx = &task.ctx;
+        #[cfg(target_arch = "x86_64")]
+        let (rip, rsp, rbp) = (ctx.rip, ctx.rsp, ctx.rbp);
+        #[cfg(not(target_arch = "x86_64"))]
+        let (rip, rsp, rbp) = (0u64, 0u64, 0u64);
+        let _ = ctx;
+        write!(f, "saved rip={rip:#x} rsp={rsp:#x} rbp={rbp:#x}; frames:")?;
+        let mut frame = rbp;
+        for _ in 0..16 {
+            let (Some(next), Some(ret)) = (task.stack_word(frame), task.stack_word(frame + 8))
+            else {
+                break;
+            };
+            write!(f, " {ret:#x}")?;
+            if next <= frame {
+                break;
+            }
+            frame = next;
+        }
+        let deepest = task.stack.as_ptr() as u64 + (STACK_CANARY_WORDS as u64) * 8;
+        write!(f, "; words above the canary:")?;
+        for i in 0..32u64 {
+            match task.stack_word(deepest + i * 8) {
+                Some(word) => write!(f, " {word:#x}")?,
+                None => break,
+            }
+        }
+        Ok(())
     }
 }
 
