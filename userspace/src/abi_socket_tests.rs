@@ -3939,6 +3939,87 @@ kernel_test_in!(
     smoke_abi_socket_notify_survives_recursive_bind_root_swap
 );
 
+/// `connect(2)` on an AF_UNIX pathname walks the path like any other lookup
+/// (`unix_find_bsd` -> `kern_path(..., LOOKUP_FOLLOW, ...)`), so a symlinked
+/// DIRECTORY on the way is followed even when its target is on another
+/// mount. This is `/var/run/dbus/system_bus_socket` on every systemd
+/// distribution: `/var/run -> ../run`, `/run` a tmpfs. zbus defaults to that
+/// spelling, and on NARF the connect returned -ENOENT (kameleon's helper:
+/// "Connection(Os { code: 2 ... /var/run/dbus/system_bus_socket"), while
+/// clients naming `/run/dbus/system_bus_socket` worked.
+fn smoke_abi_socket_connect_through_symlinked_parent_dir() -> TestResult {
+    with_setup(|| {
+        const VAR_MOUNT: &str = "/abi-unix-symvar";
+        const RUN_MOUNT: &str = "/abi-unix-symrun";
+        const LISTEN_PATH: &[u8] = b"/abi-unix-symrun/bus\0";
+        const VIA_LINK_PATH: &[u8] = b"/abi-unix-symvar/run/bus\0";
+        const AT_FDCWD: u64 = (-100i64) as u64;
+
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let var = registry()
+            .mount_arc(
+                &auth,
+                VAR_MOUNT,
+                alloc::sync::Arc::new(MemFs::with_seeds("unix-symvar", &[])),
+            )
+            .map_err(|_| "var mount setup failed")?;
+        let run = registry()
+            .mount_arc(
+                &auth,
+                RUN_MOUNT,
+                alloc::sync::Arc::new(MemFs::with_seeds("unix-symrun", &[])),
+            )
+            .map_err(|_| "run mount setup failed")?;
+
+        let result = (|| {
+            // /abi-unix-symvar/run -> ../abi-unix-symrun, as /var/run -> ../run.
+            let target = b"../abi-unix-symrun\0";
+            let link = b"/abi-unix-symvar/run\0";
+            if call(
+                Syscall::Symlinkat.raw(),
+                a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("symlinkat setup failed");
+            }
+            let srv = open_unix_stream()?;
+            let (addr, alen) = unix_sockaddr(LISTEN_PATH);
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(srv, addr.as_ptr() as u64, alen),
+            ) != Some(0)
+            {
+                return Err("bind of the listener failed");
+            }
+            if call(Syscall::SocketListen.raw(), a1(srv, 16)) != Some(0) {
+                return Err("listen failed");
+            }
+            let cli = open_unix_stream()?;
+            let (via, vlen) = unix_sockaddr(VIA_LINK_PATH);
+            let r = call(
+                Syscall::SocketConnect.raw(),
+                a2(cli, via.as_ptr() as u64, vlen),
+            );
+            let _ = call(Syscall::Close.raw(), a0(cli));
+            let _ = call(Syscall::Close.raw(), a0(srv));
+            match r {
+                Some(0) => Ok(()),
+                Some(v) if v == ENOENT => {
+                    Err("connect through a symlinked parent directory returned ENOENT")
+                }
+                _ => Err("connect through a symlinked parent directory did not return 0"),
+            }
+        })();
+        let _ = registry().unmount(&run, RUN_MOUNT);
+        let _ = registry().unmount(&var, VAR_MOUNT);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connect_through_symlinked_parent_dir
+);
+
 /// systemd's `PrivateMounts=yes` setup may overmount the directory that holds
 /// `$NOTIFY_SOCKET`, then bind the notify *file* back into the service view.
 /// The target spelling is therefore under a different parent mount even though

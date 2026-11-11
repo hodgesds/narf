@@ -4249,6 +4249,36 @@ fn resolve_final_symlink_target(path_ref: &str) -> Option<alloc::string::String>
     .flatten()
 }
 
+/// Expand symlinks in the DIRECTORY part of an AF_UNIX pathname through the
+/// task's mount table, leaving the final component alone.
+///
+/// `unix_find_bsd` / `unix_bind_bsd` resolve the name with `kern_path` /
+/// `kern_path_create`: an ordinary path walk, so a symlink in any
+/// intermediate component is followed, across mounts. The key computation
+/// below hands the whole path to the single filesystem that covers it
+/// lexically, and that filesystem resolves a link target inside itself. For
+/// `/var/run/dbus/system_bus_socket` — `/var/run -> ../run`, with `/run` a
+/// separate tmpfs — that looked for `run/dbus/...` in the ROOT filesystem's
+/// own empty `/run` directory and reported -ENOENT, so every client using
+/// the legacy `/var/run` spelling of the system bus (zbus's default) could
+/// not connect. The final component keeps its own handling: bind names the
+/// literal leaf, connect follows it in the callers below.
+fn unix_expand_parent_symlinks(abs: alloc::string::String) -> alloc::string::String {
+    let trimmed = abs.trim_end_matches('/');
+    let Some((parent, leaf)) = trimmed.rsplit_once('/') else {
+        return abs;
+    };
+    if parent.is_empty() || leaf.is_empty() {
+        return abs;
+    }
+    match resolve_vfs_symlink_path(parent, true) {
+        Some(resolved) if resolved != parent => {
+            alloc::format!("{}/{leaf}", resolved.trim_end_matches('/'))
+        }
+        _ => abs,
+    }
+}
+
 fn unix_socket_path_key_depth(
     path: &str,
     follow_final: bool,
@@ -4263,6 +4293,7 @@ fn unix_socket_path_key_depth(
         return None;
     }
     let abs = resolve_cwd_path(current_task_id(), path);
+    let abs = unix_expand_parent_symlinks(abs);
     let path_ref = abs.trim_end_matches('/');
     // CONNECT (follow_final) follows a FINAL symlink at the GLOBAL namespace
     // level so a symlinked socket alias keys by the TARGET listener's identity.
@@ -4354,6 +4385,7 @@ fn unix_path_final_node_exists_depth(path: &str, depth: usize) -> bool {
         return false;
     }
     let abs = resolve_cwd_path(current_task_id(), path);
+    let abs = unix_expand_parent_symlinks(abs);
     let path_ref = abs.trim_end_matches('/');
     // Follow a final symlink (LOOKUP_FOLLOW) exactly as the key computation
     // does, so a symlinked socket alias resolves to its target's existence.
