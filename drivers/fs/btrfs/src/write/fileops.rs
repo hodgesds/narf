@@ -138,6 +138,40 @@ pub(crate) async fn file_items<B: BlockDevice + 'static>(
         .collect()
 }
 
+/// The file items of `ino` that overlap `[a, b)`, in key order: the item at
+/// or before `a` when it reaches past `a`, then every item starting below
+/// `b` — Linux `btrfs_lookup_file_extent` and the forward walk of
+/// `btrfs_drop_extents`. Reads the leaves holding those items, not the
+/// inode's whole extent list.
+pub(crate) async fn file_items_in<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    fs_root: u64,
+    ino: u64,
+    a: u64,
+    b: u64,
+) -> Result<Vec<FileItem>, FsError> {
+    let mine = |key: &BtrfsKey| key.objectid == ino && key.item_type == format::EXTENT_DATA_KEY;
+    let ceiling = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, a.saturating_add(1));
+    let from = match btree::last_before(vol, fs_root, &ceiling).await? {
+        Some((key, _)) if mine(&key) => key.offset,
+        _ => a,
+    };
+    let start = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, from);
+    let mut cursor = btree::Cursor::seek(vol, fs_root, &start).await?;
+    let mut out = Vec::new();
+    while let Some((key, body)) = cursor.current()? {
+        if !mine(&key) || key.offset >= b {
+            break;
+        }
+        let item = FileItem::decode(key, body.to_vec())?;
+        if item.end > a {
+            out.push(item);
+        }
+        cursor.advance().await?;
+    }
+    Ok(out)
+}
+
 /// The result of carving a file range out of its items.
 #[derive(Default)]
 pub(super) struct Carve {
@@ -304,15 +338,18 @@ async fn compressed_in<B: BlockDevice + 'static>(
     from: u64,
     to: u64,
 ) -> Result<bool, FsError> {
-    Ok(file_items(vol, fs_root, ino).await?.iter().any(|item| {
-        item.start < to
-            && item.end > from
-            && !matches!(item.kind, Kind::Hole | Kind::Disk { prealloc: true })
-            && item
-                .body
-                .get(FE_COMPRESSION)
-                .is_some_and(|&c| c != format::COMPRESS_NONE)
-    }))
+    Ok(file_items_in(vol, fs_root, ino, from, to)
+        .await?
+        .iter()
+        .any(|item| {
+            item.start < to
+                && item.end > from
+                && !matches!(item.kind, Kind::Hole | Kind::Disk { prealloc: true })
+                && item
+                    .body
+                    .get(FE_COMPRESSION)
+                    .is_some_and(|&c| c != format::COMPRESS_NONE)
+        }))
 }
 
 /// Linux `btrfs_cont_expand` → `btrfs_truncate_block(inode, oldsize, 0, 0)`

@@ -105,6 +105,23 @@ walk only the requested window. A small read must not collect the inode's
 entire extent list. Reader epochs, checksum verification, the compressed-extent
 cache and zero filling of holes still cover these reads.
 
+A write does the same (`write::window_extents`, Linux `btrfs_drop_extents`
+from a `btrfs_lookup_file_extent` at the range's start): it looks up the
+extent item at or before its first sector and walks forward to its last, so
+what it reads is the leaves holding the items it replaces, whatever the
+number of extent items the file has. Of the old contents it reads only the
+partial sectors at its edges — nothing when it covers whole sectors (Linux
+`prepare_one_folio`). An overwrite of one page of a file with one extent per
+page therefore costs what an overwrite of any page costs
+(`smoke_btrfs_overwrite_cost_tracks_range_not_extent_count`, and the
+`overwrite` scenario of `cargo xtask btrfs-host-rw`); before, each write
+read every extent item of the file, so N page-sized writes into a file of N
+single-page extents read N² items. Every write is still its own
+synchronous operation — data written, items staged and the path's tree
+blocks rewritten before it returns; there is no delayed allocation.
+`truncate`, `fallocate` and hole punching still read all of the inode's
+extent items.
+
 Uncompressed reads covered entirely by valid data checksums retain windows up to
 128 KiB in the shared 32 MiB extent cache. Keys include shared-core identity,
 logical byte range, compression tag and file-extent generation. Reads never
@@ -329,7 +346,12 @@ extents spread over them, three-level free-space and extent trees —
 runs a desktop-like workload in small transactions (save-file
 loop, log appends with fsync, bursts of creates and unlinks), and reports per
 commit the nodes visited and written per tree, the recording passes, the
-blocks allocated beyond the reservation and the wall time.
+blocks allocated beyond the reservation and the wall time. The `overwrite`
+scenario builds files of 1,000 to 16,000 single-page extents (one written
+in a shuffled page order), overwrites pages at random and in file order,
+and fails if the fs-tree nodes visited, the nodes read from the device or
+(loosely) the time per overwrite grow with the file's extent count; it also
+reports sequential-write throughput in 128 KiB and 4 KiB calls.
 
 `cargo xtask btrfs-cycles [--cycles 50] [--seed N] [--jobs N]` runs the
 in-kernel driver through many mount lifetimes in one boot per guest
