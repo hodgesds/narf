@@ -11,6 +11,7 @@
 //! chunk map via [`BtrfsVolume::read_node`]. It is read-only; the COW write path
 //! builds on the same decoders in `write.rs`.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_block::BlockDevice;
@@ -123,7 +124,22 @@ pub async fn read_child<B: BlockDevice + 'static>(
     parent: &[u8],
     slot: usize,
 ) -> Result<Vec<u8>, FsError> {
-    let child = vol.read_node(internal_blockptr(parent, slot)?).await?;
+    read_child_shared(vol, parent, slot)
+        .await
+        .map(|child| (*child).clone())
+}
+
+/// [`read_child`] without copying the node out of the cache: every walker
+/// here only reads the nodes on its path, and a copy per node visited was a
+/// `nodesize` allocation and memcpy for each level of each lookup.
+pub(crate) async fn read_child_shared<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    parent: &[u8],
+    slot: usize,
+) -> Result<Arc<Vec<u8>>, FsError> {
+    let child = vol
+        .read_node_shared(internal_blockptr(parent, slot)?)
+        .await?;
     verify_child(parent, slot, &child)?;
     Ok(child)
 }
@@ -163,15 +179,16 @@ pub fn internal_child_slot(buf: &[u8], n: usize, target: &BtrfsKey) -> Result<us
 /// The `(key, body)` items of one leaf, in key order.
 pub(crate) type LeafItems = Vec<(BtrfsKey, Vec<u8>)>;
 
-/// Ordered read cursor over one B-tree. Owns the node buffers along the current
-/// root-to-leaf path so iteration survives across `await` points.
+/// Ordered read cursor over one B-tree. Holds the nodes along the current
+/// root-to-leaf path (shared with the node cache, never copied) so iteration
+/// survives across `await` points.
 #[derive(Debug)]
 pub struct Cursor<'v, B: BlockDevice + 'static> {
     vol: &'v BtrfsVolume<B>,
-    /// `(node_buffer, slot)` from root (index 0) to the current leaf (last).
+    /// `(node, slot)` from root (index 0) to the current leaf (last).
     /// Internal entries' `slot` is the descended child index; the leaf entry's
     /// `slot` is the current item index.
-    path: Vec<(Vec<u8>, usize)>,
+    path: Vec<(Arc<Vec<u8>>, usize)>,
 }
 
 impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
@@ -182,10 +199,9 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
         root: u64,
         target: &BtrfsKey,
     ) -> Result<Cursor<'v, B>, FsError> {
-        let mut path: Vec<(Vec<u8>, usize)> = Vec::new();
-        let mut next = vol.read_node(root).await?;
+        let mut path: Vec<(Arc<Vec<u8>>, usize)> = Vec::new();
+        let mut buf = vol.read_node_shared(root).await?;
         for _ in 0..=MAX_LEVEL {
-            let buf = core::mem::take(&mut next);
             let n = nritems(&buf)? as usize;
             if level(&buf)? == 0 {
                 let slot = leaf_lower_bound(&buf, n, target)?;
@@ -200,8 +216,9 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
                 return Err(FsError::InvalidData);
             }
             let slot = internal_child_slot(&buf, n, target)?;
-            next = read_child(vol, &buf, slot).await?;
+            let next = read_child_shared(vol, &buf, slot).await?;
             path.push((buf, slot));
+            buf = next;
         }
         Err(FsError::InvalidData)
     }
@@ -273,7 +290,7 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
             }
             let mut cbuf = {
                 let (buf, _) = &self.path[idx - 1];
-                read_child(self.vol, buf, slot + 1).await?
+                read_child_shared(self.vol, buf, slot + 1).await?
             };
             self.path[idx - 1].1 = slot + 1;
             // Descend to the leftmost leaf of the sibling subtree.
@@ -285,7 +302,7 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
                 if nritems(&cbuf)? == 0 {
                     return Err(FsError::InvalidData);
                 }
-                let next = read_child(self.vol, &cbuf, 0).await?;
+                let next = read_child_shared(self.vol, &cbuf, 0).await?;
                 self.path.push((cbuf, 0));
                 cbuf = next;
             }
@@ -348,10 +365,9 @@ pub async fn last_before<B: BlockDevice + 'static>(
     ceiling: &BtrfsKey,
 ) -> Result<Option<(BtrfsKey, Vec<u8>)>, FsError> {
     // Descend, remembering each internal node and the child slot taken.
-    let mut path: Vec<(Vec<u8>, usize)> = Vec::new();
-    let mut next = vol.read_node(root).await?;
+    let mut path: Vec<(Arc<Vec<u8>>, usize)> = Vec::new();
+    let mut buf = vol.read_node_shared(root).await?;
     let leaf = loop {
-        let buf = core::mem::take(&mut next);
         if level(&buf)? == 0 {
             break buf;
         }
@@ -360,8 +376,9 @@ pub async fn last_before<B: BlockDevice + 'static>(
             return Err(FsError::InvalidData);
         }
         let slot = internal_child_slot(&buf, n, ceiling)?;
-        next = read_child(vol, &buf, slot).await?;
+        let next = read_child_shared(vol, &buf, slot).await?;
         path.push((buf, slot));
+        buf = next;
     };
     // The last slot in this leaf with key < ceiling, if any.
     let n = nritems(&leaf)? as usize;
@@ -379,7 +396,7 @@ pub async fn last_before<B: BlockDevice + 'static>(
         if slot == 0 {
             continue;
         }
-        let mut cbuf = read_child(vol, &buf, slot - 1).await?;
+        let mut cbuf = read_child_shared(vol, &buf, slot - 1).await?;
         let last_leaf = loop {
             let cn = nritems(&cbuf)? as usize;
             if cn == 0 {
@@ -388,7 +405,7 @@ pub async fn last_before<B: BlockDevice + 'static>(
             if level(&cbuf)? == 0 {
                 break cbuf;
             }
-            cbuf = read_child(vol, &cbuf, cn - 1).await?;
+            cbuf = read_child_shared(vol, &cbuf, cn - 1).await?;
         };
         let cn = nritems(&last_leaf)? as usize;
         return Ok(Some((
