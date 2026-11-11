@@ -4086,7 +4086,7 @@ fn pump_send_queued_once(
             unsend(&mut t, &marked);
             refusals += 1;
             t.tx_refused_in_row = t.tx_refused_in_row.saturating_add(1);
-            if t.tx_refused_in_row.is_multiple_of(TX_REFUSALS_REPORT) {
+            if t.tx_refused_in_row % TX_REFUSALS_REPORT == 0 {
                 crate::txq::stats::REOFFER_STORMS.fetch_add(1, Ordering::Relaxed);
                 report_tx_stuck(&t, "refusals in a row", u64::from(t.tx_refused_in_row));
             }
