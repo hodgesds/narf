@@ -977,16 +977,32 @@ impl Igc {
         self.submit_frame(owned, frame.tx_meta())
     }
     pub fn submit_frame(&self, frame: Frame, meta: TxMeta) -> Result<(), IgcError> {
+        self.submit_frame_on(frame, meta, None)
+    }
+    /// `queue` is the stack's choice for a backpressure-aware sender (Linux
+    /// `skb->queue_mapping`); such a frame is refused with
+    /// [`IgcError::TxBusy`] instead of using the stopped queue's reserve.
+    fn submit_frame_on(
+        &self,
+        frame: Frame,
+        meta: TxMeta,
+        queue: Option<usize>,
+    ) -> Result<(), IgcError> {
         let _operation = self.operation()?;
         let timing = frame.tx_timing();
-        let q = timing.queue.map_or_else(
-            || self.settings.lock().rss.rx_queue(frame.payload()),
-            usize::from,
-        );
+        let q = queue.unwrap_or_else(|| {
+            timing.queue.map_or_else(
+                || self.settings.lock().rss.rx_queue(frame.payload()),
+                usize::from,
+            )
+        });
         if q >= self.num_queues() {
             return Err(IgcError::QueueTooSmall);
         }
-        let mut options = crate::queue::TxOptions::default();
+        let mut options = crate::queue::TxOptions {
+            backpressure: queue.is_some(),
+            ..Default::default()
+        };
         if let Some(time) = timing.launch_time_ns {
             let now = {
                 let _clock = self.ptp.lock();
@@ -1004,7 +1020,7 @@ impl Igc {
         if result.is_err() && timing.timestamp_cookie.is_some() {
             self.ptp.lock().pending[q] = None;
         }
-        if result.is_err() {
+        if result.is_err() && result != Err(IgcError::TxBusy) {
             self.stats.lock().tx_rejected += 1;
         }
         result
@@ -1226,6 +1242,9 @@ impl Igc {
         for (q, queue) in self.queues().iter().enumerate() {
             queue.flush(&self.hw, q);
             queue.reclaim();
+            // The periodic wake pass: covers a completion reclaimed by a
+            // sender, which cannot resume other connections itself.
+            queue.txq().run_wakeups();
         }
         self.sample_counters();
         {
@@ -1503,6 +1522,47 @@ impl narf_net::iface::DeviceControl for Igc {
     }
 }
 
+/// The transmit-queue contract (`narf_net::txq`): four rings whose geometry
+/// each `Queue` reports, flows mapped by the RSS function the receive side
+/// uses, and frames offered with `TxBusy` instead of a drop.
+impl narf_net::txq::TxBackpressure for Igc {
+    fn tx_queue_count(&self) -> u16 {
+        self.num_queues() as u16
+    }
+    fn tx_queue(&self, q: u16) -> Option<Arc<narf_net::txq::TxQueue>> {
+        self.queues()
+            .get(usize::from(q))
+            .map(|queue| queue.txq().clone())
+    }
+    fn tx_select_queue(&self, frame: &[u8]) -> u16 {
+        self.settings.lock().rss.rx_queue(frame) as u16
+    }
+    fn tx_link_speed_mbps(&self) -> u32 {
+        self.link_sample().speed_mbps.unwrap_or(0)
+    }
+    fn try_xmit(&self, q: u16, frame: Frame, meta: TxMeta) -> Result<(), narf_net::txq::TxRefusal> {
+        self.submit_frame_on(frame, meta, Some(usize::from(q)))
+            .map_err(|e| match e {
+                IgcError::TxBusy => narf_net::txq::TxRefusal::Busy,
+                _ => narf_net::txq::TxRefusal::Dropped,
+            })
+    }
+    fn try_xmit_copy(
+        &self,
+        q: u16,
+        bytes: &[u8],
+        meta: TxMeta,
+    ) -> Result<(), narf_net::txq::TxRefusal> {
+        if bytes.len() < 14 || bytes.len() > MAX_TSO {
+            return Err(narf_net::txq::TxRefusal::Dropped);
+        }
+        let mut buffer = alloc_coherent(bytes.len(), DomainId::DRIVER_0)
+            .map_err(|_| narf_net::txq::TxRefusal::Dropped)?;
+        buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        self.try_xmit(q, Frame::new(buffer, bytes.len() as u32), meta)
+    }
+}
+
 impl narf_power::device_pm::DevicePmOps for Igc {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
         let _control = self
@@ -1653,6 +1713,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         true,
     );
     enable_receive_coalescing(&name);
+    narf_net::iface::set_tx_backpressure(&name, controller.clone());
     controller.ifname.set(name);
     let clock = narf_time::phc::register(Arc::new(control::PhcDevice(Arc::downgrade(&controller))));
     controller.phc_index.store(clock as i32, Ordering::Release);
@@ -1947,6 +2008,13 @@ fn spawn_pumps(
                             let timestamp = frame.rx_meta().timestamp_ns;
                             native_redirect(name, frame.payload_mut(), action, timestamp);
                         }
+                    }
+                    // The wake pass, once per poll: this poll reclaimed the
+                    // queue's transmit completions (`poll_xsk`), so resume
+                    // the connections that were waiting for them. No queue
+                    // lock is held here.
+                    if let Some(queue) = rx.queues().get(q) {
+                        queue.txq().run_wakeups();
                     }
                     let pending = if let Ok(_op) = rx.operation() {
                         if let Some(r) = route {

@@ -205,6 +205,65 @@ Built-in IGC registration opts the interface into the stack's software GRO
 to one CPU and flushes that CPU's held flows when its ring is empty and its
 vector re-armed, the `napi_complete_done` point.
 
+### Transmit-queue contract (`narf_net::txq`)
+
+A multi-queue driver that wants the stack to wait for transmit room, instead
+of dropping what a full ring cannot take, implements
+`narf_net::txq::TxBackpressure` and installs it with
+`narf_net::iface::set_tx_backpressure(name, driver)`. A driver that does not
+keeps today's behaviour: every frame goes through its send hook and a full
+ring drops. The contract is per transmit queue; no device-wide or global
+state is involved.
+
+The driver supplies, per device:
+
+| Method | Meaning |
+| --- | --- |
+| `tx_queue_count()` | number of transmit queues |
+| `tx_queue(q)` | that queue's `Arc<TxQueue>` |
+| `tx_select_queue(frame)` | the queue a flow maps to (`ndo_select_queue`); a pure function of the flow |
+| `tx_link_speed_mbps()` | negotiated speed, 0 if unknown |
+| `try_xmit(q, frame, meta)` / `try_xmit_copy(q, bytes, meta)` | offer a frame to queue `q`; `Err(Busy)` while the queue is stopped or the frame does not fit, `Err(Dropped)` if it can never be sent |
+
+and creates one `TxQueue::new(TxQueueGeometry { ring_len, max_frame_descs })`
+per ring, from the ring's real length and the most descriptors one frame can
+consume on that device (Linux `DESC_NEEDED`). The stop threshold is
+`max_frame_descs` free descriptors and the wake threshold twice that
+(`netif_txq_maybe_stop` / `netif_txq_completed_wake`, igc
+`igc_maybe_stop_tx` / `TX_WAKE_THRESHOLD`), both bounded by `ring_len - 1`.
+Nothing is sized for a particular link speed.
+
+The driver then calls, on that `TxQueue`:
+
+| Call | When | Linux |
+| --- | --- | --- |
+| `sent(bytes, free)` | after posting any frame; `free` re-reads the free descriptors | `netdev_tx_sent_queue` + `netif_txq_maybe_stop` |
+| `refused()` | a `try_xmit` frame that fits an empty ring found no room; return `Busy` | `NETDEV_TX_BUSY` |
+| `completed(pkts, bytes, free)` | once per reclaim batch | `netif_txq_completed_wake` |
+| `run_wakeups()` | from the completion context after a reclaim batch and from a periodic task, holding no queue lock | `__netif_schedule` / `tcp_tsq_handler` |
+| `reset()` | after a ring reset discarded its frames | `netdev_tx_reset_queue` |
+
+A frame larger than an empty ring (`!fits_empty_ring(descs)`) must be an
+error, never `Busy`. A frame sent through the ordinary send hook is accepted
+while descriptors remain: the descriptors below the stop threshold are the
+room pure ACKs, SYN/FIN/RST, retransmissions and non-TCP traffic use while
+bulk data waits. An owned `Frame` may carry a connection's byte charge; it is
+released when the `Frame` is destroyed, so a driver must keep a posted frame
+alive until its descriptors complete and must drop the frames of a reset
+ring.
+
+IGC is the first implementation: `MAX_FRAME_DESCS` is 20 (a 64 KiB frame
+split at 4 KiB boundaries, one context descriptor, two for the launch-time
+workaround), each `Queue` owns its `TxQueue`, reclaim reports once per batch
+under the queue's transmit lock, the per-queue receive task runs the wake
+pass after each poll and the 10 ms maintenance task runs it as well.
+`tx_queue_N_restart` counts wakes. `IgcError::TxBusy` is never counted in
+`tx_rejected`.
+
+Not implemented: the adaptive per-queue byte limit of
+`lib/dynamic_queue_limits.c` (BQL). `sent`/`completed` already carry the
+bytes and packets it needs.
+
 TX watchdogs (igc, igb, ixgbe, e1000, forcedeth, r8169) compare ages as
 Linux `time_after` does: a frame stamped after the watchdog sampled the clock
 has age zero. The sample is taken before the queue lock, so a concurrent

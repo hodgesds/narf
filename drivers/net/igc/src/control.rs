@@ -255,7 +255,8 @@ impl NicControl for Igc {
             linux_queues.push([
                 values[1],
                 values[2],
-                0,
+                // Linux `tx_stats.restart_queue`: wakes of a stopped queue.
+                queues.get(q).map_or(0, |q| q.txq().restarts()),
                 values[5],
                 values[6],
                 hw_drops[q],

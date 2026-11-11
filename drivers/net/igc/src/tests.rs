@@ -2940,3 +2940,163 @@ fn smoke_igc_ethtool_queue_statistics_shape() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_queue_statistics_shape);
+
+fn complete_tx(q: &Queue, slot: usize) {
+    // SAFETY: the test is the only DMA model writing this queue's ring.
+    unsafe {
+        ptr::write_volatile(q.tx_ring.cpu_mut_ptr_at::<u32>((slot * 16 + 12) as u64), 1);
+    }
+}
+
+fn smoke_igc_tx_backpressure_follows_ring_geometry() -> TestResult {
+    // Linux igc_maybe_stop_tx(ring, DESC_NEEDED) / TX_WAKE_THRESHOLD on a
+    // 64-descriptor ring: stop below one worst-case frame (20), wake at 40.
+    let q = Queue::new_sized(64, 64).unwrap();
+    let m = Model::new();
+    check!(
+        q.txq().geometry().ring_len == 64 && q.txq().thresholds() == (20, 40),
+        "stop/wake thresholds are not derived from the ring"
+    );
+    let aware = crate::queue::TxOptions {
+        backpressure: true,
+        ..Default::default()
+    };
+    let offer =
+        |options| q.post_options(&m, 0, dma_frame(&tcp4(0)), TxMeta::plain(), 1500, options);
+    let mut posted = 0usize;
+    loop {
+        match offer(aware) {
+            Ok(()) => posted += 1,
+            Err(IgcError::TxBusy) => break,
+            Err(_) => return TestResult::Fail("a frame that fits the ring was rejected"),
+        }
+        check!(posted < 64, "the queue never pushed back");
+    }
+    // One descriptor per frame, 63 usable: 44 posted leaves 19 free.
+    check!(
+        posted == 44 && q.txq().is_stopped(),
+        "the queue did not stop one worst-case frame short of full"
+    );
+    check!(
+        q.statistics()[3] == 0,
+        "a frame refused as busy was counted as rejected"
+    );
+    // The descriptors kept free are for frames that cannot wait.
+    check!(
+        offer(Default::default()).is_ok(),
+        "a control frame was refused while descriptors remained"
+    );
+    for slot in 0..20 {
+        complete_tx(&q, slot);
+    }
+    check!(
+        q.reclaim() == 20 && q.txq().is_stopped() && offer(aware) == Err(IgcError::TxBusy),
+        "woke below the wake threshold"
+    );
+    for slot in 20..22 {
+        complete_tx(&q, slot);
+    }
+    check!(
+        q.reclaim() == 2 && !q.txq().is_stopped() && q.txq().restarts() == 1,
+        "did not wake once at the wake threshold"
+    );
+    check!(
+        offer(aware).is_ok() && q.statistics()[3] == 0,
+        "refused after the wake"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_tx_backpressure_follows_ring_geometry
+);
+
+fn smoke_igc_tx_charges_return_on_completion_refusal_and_reset() -> TestResult {
+    let q = Queue::new_sized(64, 64).unwrap();
+    let m = Model::new();
+    let account = narf_net::txq::TxAccount::new(0xfff1_0001, q.txq().clone());
+    let aware = crate::queue::TxOptions {
+        backpressure: true,
+        ..Default::default()
+    };
+    // TSO super-frames: a context and two data descriptors each. Returns how
+    // many were taken and the bytes charged for them.
+    let fill = || -> Option<(usize, u32)> {
+        let (mut posted, mut charged) = (0usize, 0u32);
+        loop {
+            let mut frame = dma_frame(&tcp4(8000));
+            let len = frame.len();
+            frame.set_tx_charge(account.charge(len));
+            match q.post_options(&m, 0, frame, TxMeta::with_tso(1460), 1500, aware) {
+                Ok(()) => {
+                    posted += 1;
+                    charged += len;
+                }
+                Err(IgcError::TxBusy) => return Some((posted, charged)),
+                Err(_) => return None,
+            }
+            if posted > 64 {
+                return None;
+            }
+        }
+    };
+    let Some((posted, charged)) = fill() else {
+        return TestResult::Fail("a super-frame that fits the ring was rejected");
+    };
+    // 45 descriptors used leaves 18: less than one more worst-case frame.
+    check!(
+        posted == 15 && q.txq().is_stopped(),
+        "super-frames did not stop the queue at the ring's threshold"
+    );
+    check!(
+        account.queued() == charged,
+        "the refused frame kept its connection's charge"
+    );
+    // An idle ring holds any frame: completing everything must wake it.
+    for frame in 0..posted {
+        complete_tx(&q, frame * 3 + 2);
+    }
+    check!(
+        q.reclaim() == posted && !q.txq().is_stopped(),
+        "a drained ring stayed stopped"
+    );
+    check!(
+        account.queued() == 0,
+        "completion did not return the connection's charges"
+    );
+    // Stopped again, then the watchdog resets the ring with frames in it.
+    check!(
+        fill().is_some() && q.txq().is_stopped() && account.queued() != 0,
+        "the queue did not stop a second time"
+    );
+    // SAFETY: no device is attached to this queue.
+    unsafe {
+        q.reset_after_quiesce();
+    }
+    check!(
+        !q.txq().is_stopped(),
+        "a reset left the transmit queue stopped"
+    );
+    check!(
+        account.queued() == 0,
+        "frames discarded by the reset kept their connection's charges"
+    );
+    check!(
+        q.post_options(
+            &m,
+            0,
+            dma_frame(&tcp4(8000)),
+            TxMeta::with_tso(1460),
+            1500,
+            aware
+        )
+        .is_ok()
+            && q.statistics()[3] == 0,
+        "the queue refused a frame after the reset"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_tx_charges_return_on_completion_refusal_and_reset
+);

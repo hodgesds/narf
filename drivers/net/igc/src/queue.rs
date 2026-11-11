@@ -43,6 +43,10 @@ struct Completed {
 }
 
 pub(crate) const COUNT: usize = 256;
+/// Most descriptors one frame can take (Linux igc `DESC_NEEDED`): the
+/// largest frame split at every 4 KiB boundary it can straddle, one context
+/// descriptor, and the two descriptors of the launch-time workaround.
+pub(crate) const MAX_FRAME_DESCS: u32 = (crate::packet::MAX_TSO + 4095).div_ceil(4096) as u32 + 3;
 const BUFFER: usize = 2048;
 
 #[repr(C, align(16))]
@@ -111,6 +115,9 @@ pub(crate) struct Queue {
     gate_closed: core::sync::atomic::AtomicBool,
     owner: IrqSafeSpinLock<&'static str>,
     tx: IrqSafeSpinLock<Tx>,
+    /// Stop/wake state and waiters shared with the stack. Its thresholds
+    /// come from this ring's length, whatever `ethtool -G` made it.
+    txq: Arc<narf_net::txq::TxQueue>,
     merge_events: core::sync::atomic::AtomicU8,
     rx: IrqSafeSpinLock<Rx>,
 }
@@ -235,6 +242,10 @@ impl Queue {
             gate_closed: core::sync::atomic::AtomicBool::new(false),
             owner: IrqSafeSpinLock::new(""),
             tx: IrqSafeSpinLock::new(Tx::default()),
+            txq: narf_net::txq::TxQueue::new(narf_net::txq::TxQueueGeometry {
+                ring_len: tx_count as u32,
+                max_frame_descs: MAX_FRAME_DESCS,
+            }),
             merge_events: core::sync::atomic::AtomicU8::new(0),
             rx: IrqSafeSpinLock::new(Rx {
                 head: 0,
@@ -259,6 +270,9 @@ impl Queue {
         Ok(q)
     }
 
+    pub(crate) fn txq(&self) -> &Arc<narf_net::txq::TxQueue> {
+        &self.txq
+    }
     pub(crate) fn set_owner(&self, name: &'static str) {
         *self.owner.lock() = name;
     }
@@ -391,6 +405,10 @@ impl Queue {
         tx.last_launch_cycle = None;
         tx.last_tx_cycle = None;
         drop(tx);
+        // Linux `netdev_tx_reset_queue`: the ring is empty again. Frames it
+        // held were dropped above (returning their connections' charges);
+        // whoever waited for room is released by the next wake pass.
+        self.txq.reset();
         let mut rx = self.rx.lock();
         rx.head = 0;
         rx.partial = None;
@@ -520,6 +538,7 @@ impl Queue {
 
     fn reclaim_locked(&self, tx: &mut Tx) -> usize {
         let mut reclaimed = 0;
+        let mut bytes = 0u64;
         while tx.pending.front().is_some_and(|p| self.done(p.end)) {
             let p = tx.pending.pop_front().unwrap();
             if p.smd == 1 {
@@ -527,6 +546,7 @@ impl Queue {
             }
             tx.completed += 1;
             tx.bytes += u64::from(p.frame.len());
+            bytes += u64::from(p.frame.len());
             tx.clean = (p.end + 1) % self.tx_count;
             // Owned Frames may come from the stack's DMA pool; return them
             // using its existing release hook after completion.
@@ -543,6 +563,12 @@ impl Queue {
             reclaimed += 1;
         }
         Self::drain_completions(tx);
+        if reclaimed != 0 {
+            // Linux `igc_clean_tx_irq`: one report per cleaned batch, which
+            // wakes the queue once `TX_WAKE_THRESHOLD` descriptors are free.
+            let free = (tx.clean + self.tx_count - tx.next - 1) % self.tx_count;
+            self.txq.completed(reclaimed as u32, bytes, free as u32);
+        }
         reclaimed
     }
 
@@ -629,6 +655,19 @@ impl Queue {
                 .is_some_and(|l| tx.last_tx_cycle != Some(l.cycle));
         let needed = data_count + usize::from(plan.context.is_some()) + if empty { 2 } else { 0 };
         let free = (tx.clean + self.tx_count - tx.next - 1) % self.tx_count;
+        // A caller that honours backpressure is refused while the queue is
+        // stopped and when its frame does not fit, as `igc_xmit_frame_ring`
+        // returns NETDEV_TX_BUSY: the frame is not posted and not counted
+        // as rejected. A frame no empty ring could hold is an error instead,
+        // or its owner would wait for room that never comes.
+        if options.backpressure
+            && (self.txq.is_stopped() || (needed > free && self.txq.fits_empty_ring(needed as u32)))
+        {
+            self.txq.refused();
+            fence(Ordering::Release);
+            r.write(0xe018 + q as u64 * 0x40, tx.next as u32);
+            return Err(IgcError::TxBusy);
+        }
         if needed > free {
             tx.rejects += 1;
             fence(Ordering::Release);
@@ -722,6 +761,12 @@ impl Queue {
         if !meta.more || free - needed < 20 {
             r.write(0xe018 + q as u64 * 0x40, slot as u32);
         }
+        // Linux `igc_maybe_stop_tx(tx_ring, DESC_NEEDED)` after every frame,
+        // whoever sent it: stop while fewer descriptors remain than one more
+        // worst-case frame needs. Completions run under this lock, so the
+        // free count cannot change behind the check.
+        let free_after = (free - needed) as u32;
+        self.txq.sent(length as u32, || free_after);
         Ok(())
     }
 
@@ -1101,4 +1146,7 @@ pub(crate) struct TxOptions {
     pub info: u32,
     pub command: u32,
     pub launch: Option<super::traffic::Launch>,
+    /// The caller honours [`IgcError::TxBusy`]: refuse instead of using the
+    /// descriptors kept free below the stop threshold.
+    pub backpressure: bool,
 }
