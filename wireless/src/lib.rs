@@ -646,6 +646,14 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// The PMK-offload owner also runs WPA2-Personal with AKM PSK-SHA256
+    /// (00-0F-AC:6: AES-128-CMAC EAPOL MIC, SHA-256 KDF). wpa_supplicant
+    /// selects it whenever the AP offers it, so without it such an AP gets
+    /// a refused CONNECT.
+    fn supports_psk_sha256_offload(&self) -> bool {
+        false
+    }
+
     /// The firmware PSK owner accepts an explicit optional-PMF policy and
     /// verifies the admitted native request/response before opening its port.
     /// This does not follow from cipher or required-PMF support alone.

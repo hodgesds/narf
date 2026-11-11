@@ -635,8 +635,34 @@ pub enum SmeRsna {
     Open,
     /// WPA2-PSK without management-frame protection.
     Wpa2Psk,
+    /// WPA2-Personal as the owner negotiates it: AKM `akm` (PSK 2 or
+    /// PSK-SHA256 6) and the RSN Capabilities MFPC/MFPR bits `mfp` of the
+    /// station RSNE (`Wpa2Psk` is `{ akm: 2, mfp: 0 }`).
+    Wpa2 {
+        akm: u8,
+        mfp: u16,
+    },
     /// WPA3-Personal: SAE, CCMP-128, PMF required.
     Wpa3Sae,
+}
+
+/// The RSN element wpa_supplicant puts in a WPA2-Personal request
+/// (`wpa_gen_wpa_ie_rsn`): CCMP-128 group and pairwise, the one selected
+/// AKM, exactly the MFPC/MFPR bits the owner negotiates, no PMKID, and —
+/// under PMF only — the default BIP-CMAC-128 group management cipher,
+/// spelled out or omitted. Replay-counter bits are already cleared.
+fn sme_wpa2_rsne(rsn: &RsnIe, akm: u8, mfp: u16) -> bool {
+    let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
+    matches!(akm, rsn::AKM_PSK | rsn::AKM_PSK_SHA256)
+        && rsn.version == 1
+        && rsn.group_cipher == ccmp
+        && rsn.pairwise_ciphers == [ccmp]
+        && rsn.akms == [Suite::standard(akm)]
+        && rsn.rsn_capabilities == mfp
+        && rsn.pmkids.is_empty()
+        && rsn
+            .group_management_cipher
+            .is_none_or(|cipher| mfp != 0 && cipher == Suite::standard(rsn::CIPHER_BIP_CMAC_128))
 }
 
 /// The RSN element wpa_supplicant puts in an SAE request with
@@ -697,6 +723,7 @@ pub fn validate_sme_ies_for(bytes: &[u8], rsna: SmeRsna) -> Result<(), Error> {
             let admitted = match rsna {
                 SmeRsna::Open => false,
                 SmeRsna::Wpa2Psk => rsn == RsnIe::wpa2_psk_ccmp(),
+                SmeRsna::Wpa2 { akm, mfp } => sme_wpa2_rsne(&rsn, akm, mfp),
                 SmeRsna::Wpa3Sae => sme_sae_rsne(&rsn),
             };
             if !admitted {
@@ -785,7 +812,12 @@ impl JoinPlan {
         }
         let rsna = match self.security {
             SecurityMode::Open => SmeRsna::Open,
-            SecurityMode::Wpa2Psk => SmeRsna::Wpa2Psk,
+            // The profile negotiated with the AP: the supplicant's RSNE must
+            // name the same AKM and MFPC/MFPR bits the owner will send.
+            SecurityMode::Wpa2Psk => SmeRsna::Wpa2 {
+                akm: self.wpa2.akm,
+                mfp: self.wpa2.mfp,
+            },
             SecurityMode::Wpa3Sae { .. } => SmeRsna::Wpa3Sae,
         };
         validate_sme_ies_for(bytes, rsna)?;

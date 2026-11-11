@@ -650,3 +650,41 @@ kernel_test_in!(
     "drivers/wireless/mt7921/networkmanager",
     mt7922_admits_wpa_supplicant_sae_association_elements
 );
+
+/// NetworkManager WPA-PSK with `pmf` optional or required: the MT7922
+/// wiphy offers the PMF handshake offload (and MFP_OPTIONAL) and PSK-SHA256,
+/// and admits the RSNE wpa_supplicant then sends for both AKMs.
+fn mt7922_admits_wpa_supplicant_wpa2_pmf_association_elements() -> TestResult {
+    let Ok(iface) = Mt76Iface::new(String::from("wlan-wpas"), mt7922()) else {
+        return TestResult::Fail("radio identity");
+    };
+    if !iface.supports_wpa2_mfp_offload()
+        || !iface.supports_optional_mfp()
+        || !iface.supports_psk_sha256_offload()
+    {
+        return TestResult::Fail("MT7921 station does not offer its WPA2 PMF owner");
+    }
+    for (akm, caps) in [(2u8, 0x8cu8), (2, 0xcc), (6, 0x8c), (6, 0xcc)] {
+        let mut ie = alloc::vec![
+            48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac,
+            akm, caps, 0x00, 0, 0, 0x00, 0x0f, 0xac, 6,
+        ];
+        ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+        let request = AssociateRequest {
+            bssid: [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x40],
+            ssid: b"narf-pmf".to_vec(),
+            frequency_mhz: 5200,
+            channel: 40,
+            security: narf_wireless::SecurityConfig::Wpa2 { psk: [0x5a; 32] },
+            ie,
+        };
+        if iface.validate_join(&request) != Ok(false) {
+            return TestResult::Fail("wpa_supplicant's WPA2 PMF association elements refused");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/networkmanager",
+    mt7922_admits_wpa_supplicant_wpa2_pmf_association_elements
+);

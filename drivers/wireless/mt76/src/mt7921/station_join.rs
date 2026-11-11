@@ -2227,12 +2227,13 @@ impl<B: Backend> Session<B> {
                 }
                 Security::Wpa2Psk { .. }
                 | Security::Wpa2PskPmf { .. }
+                | Security::Wpa2PskSelected { .. }
                 | Security::Wpa3Sae { .. } => {
                     self.stage(Stage::EapolHandshake);
                     let pmk = match security {
-                        Security::Wpa2Psk { psk } | Security::Wpa2PskPmf { psk, .. } => {
-                            Zeroizing::new(psk)
-                        }
+                        Security::Wpa2Psk { psk }
+                        | Security::Wpa2PskPmf { psk, .. }
+                        | Security::Wpa2PskSelected { psk, .. } => Zeroizing::new(psk),
                         _ => sae_pmk.take().ok_or(Error::MalformedEvent)?,
                     };
                     let mut security = StationSecurity::new(bss, &plan, own, &pmk)?;

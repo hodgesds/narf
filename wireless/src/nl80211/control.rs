@@ -702,7 +702,7 @@ fn crypto_suites(attrs: &[(u16, &[u8])], suites: &[u32], cipher_limit: usize) ->
 /// its own RSN element (CCMP, PSK, explicitly optional/required PMF), so the requested
 /// RSN element must describe that admitted suite. Required PMF needs an
 /// explicit complete RSNE; it is never inferred from a cipher advertisement.
-fn psk_association_ies(ie: &[u8], mfp: u32) -> Result<(), i32> {
+fn psk_association_ies(ie: &[u8], mfp: u32, akm: u8) -> Result<(), i32> {
     if ie.len() > 2048 {
         return Err(EINVAL);
     }
@@ -714,11 +714,16 @@ fn psk_association_ies(ie: &[u8], mfp: u32) -> Result<(), i32> {
     if rsn.next().is_some() {
         return Err(EOPNOTSUPP);
     }
-    let rsn = crate::rsn::RsnIe::decode_body(body).ok_or(EINVAL)?;
+    let mut rsn = crate::rsn::RsnIe::decode_body(body).ok_or(EINVAL)?;
+    // The PTKSA/GTKSA replay-counter counts describe the sender's receive
+    // counters, not the suite: wpa_supplicant sets sixteen PTKSA counters
+    // (0x000c) toward every WMM AP (`rsn_supp_capab`).
+    rsn.rsn_capabilities &= !(crate::rsn::RSN_CAP_PTKSA_REPLAY_COUNTER_MASK
+        | crate::rsn::RSN_CAP_GTKSA_REPLAY_COUNTER_MASK);
     let ccmp = crate::rsn::Suite::standard(crate::rsn::CIPHER_CCMP_128);
     if rsn.group_cipher != ccmp
         || rsn.pairwise_ciphers != [ccmp]
-        || rsn.akms != [crate::rsn::Suite::standard(crate::rsn::AKM_PSK)]
+        || rsn.akms != [crate::rsn::Suite::standard(akm)]
         || mfp == 0
             && rsn.rsn_capabilities
                 & (crate::rsn::RSN_CAP_MFP_REQUIRED | crate::rsn::RSN_CAP_MFP_CAPABLE)
@@ -849,6 +854,8 @@ struct ConnectCaps {
     control_port_over_nl80211: bool,
     cipher_suites: &'static [u32],
     scan_random_mac: bool,
+    /// The PSK owner also runs PSK-SHA256 (AKM 6) from the PMK.
+    psk_sha256: bool,
     connected: bool,
     /// The driver implements reassociation (`supports_roam`).
     roam: bool,
@@ -869,6 +876,7 @@ impl ConnectCaps {
                 || iface.supports_ap_authenticator(),
             cipher_suites: iface.cipher_suites(),
             scan_random_mac: iface.supports_scan_random_mac(),
+            psk_sha256: iface.supports_psk_sha256_offload(),
             connected: iface.connected_bssid().is_some(),
             roam: iface.supports_roam(),
             max_scan_ssids: iface.max_scan_ssids(),
@@ -897,6 +905,7 @@ fn parse_operation(
             control_port_over_nl80211: false,
             cipher_suites: &[],
             scan_random_mac: false,
+            psk_sha256: false,
             connected: false,
             roam: false,
             max_scan_ssids: 16,
@@ -1082,18 +1091,25 @@ fn parse_operation_caps(
                 }
                 Credential::Sae(Zeroizing::new(password.to_vec()))
             } else if let Some(pmk) = attr(attrs, 254) {
-                // WPA2-PSK offload: OPEN auth, AKM PSK and CCMP. Required
-                // PMF needs the driver's complete firmware-offload contract.
+                // WPA2-PSK offload: OPEN auth, AKM PSK (or PSK-SHA256 when
+                // the owner runs it) and CCMP. Required PMF needs the
+                // driver's complete firmware-offload contract.
+                // wpa_pick_key_mgmt prefers PSK-SHA256 whenever the AP and
+                // the profile allow it; an owner without it refuses AKM 6.
+                let akm = match primary_akm(attrs) {
+                    Some(0x000fac02) => crate::rsn::AKM_PSK,
+                    Some(0x000fac06) if caps.psk_sha256 => crate::rsn::AKM_PSK_SHA256,
+                    _ => return Err(EOPNOTSUPP),
+                };
                 if !psk_offload
                     || auth != 0
                     || mfp == 1 && !caps.psk_mfp_offload
                     || !ccmp
                     || u32_attr(attrs, 75)? != Some(2)
-                    || primary_akm(attrs) != Some(0x000fac02)
                 {
                     return Err(EOPNOTSUPP);
                 }
-                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp)?;
+                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp, akm)?;
                 Credential::Psk(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
             } else if caps.external
                 && (attr(attrs, 70).is_some()

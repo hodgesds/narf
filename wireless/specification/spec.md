@@ -1690,7 +1690,14 @@ auth type SAE, `USE_MFP` required, AKM SAE, CCMP, and `WPA_VERSIONS` 2 or 3
 `association::validate_sme_ies_for(.., SmeRsna::Wpa3Sae)`. BSS selection for
 an SAE CONNECT also finds a WPA3-Personal transition BSS: a WPA2-classified
 result whose RSNE offers AKM 8 or 24 (`select_bss_with_ies`). For the PMK
-path the RSN element in `NL80211_ATTR_IE` must describe CCMP/PSK. Required
+path the RSN element in `NL80211_ATTR_IE` must describe CCMP and the AKM of
+`NL80211_ATTR_AKM_SUITES`: PSK, or PSK-SHA256 when the default-false
+`WirelessNetIface::supports_psk_sha256_offload()` says the owner runs it.
+The RSNE's PTKSA/GTKSA replay-counter bits are masked before its
+capabilities are compared, as wpa_supplicant sets sixteen PTKSA counters
+toward every WMM AP. `JoinPlan::append_sme_ies` admits a supplicant RSNE
+only when it names the AKM and MFPC/MFPR the plan negotiated
+(`SmeRsna::Wpa2 { akm, mfp }`). Required
 PMF additionally needs the explicit default-false
 `WirelessNetIface::supports_wpa2_mfp_offload() -> bool` and `USE_MFP=1`;
 cipher advertisement alone cannot grant this association capability. The
