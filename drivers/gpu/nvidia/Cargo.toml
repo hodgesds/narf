@@ -19,7 +19,9 @@ narf-drivers         = { path = "../.." }
 narf-bus             = { path = "../../../bus" }
 narf-memory          = { path = "../../../memory" }
 narf-init            = { path = "../../../init" }
+narf-interrupts      = { path = "../../../interrupts" }
 narf-crypto          = { path = "../../../crypto" }
+narf-scheduler       = { path = "../../../scheduler" }
 
 [features]
 kernel-test = []

@@ -241,6 +241,20 @@ kernel_test_in!(
 );
 
 fn smoke_pmc_intr_source_bits_unique_and_set() -> TestResult {
+    // Grounded (G4/G13) on the Nouveau MC intr tables
+    // (`gp100_mc_intr[]` / `gk104` / `gf100`): PMU is bit 24, and
+    // SEC2 + GSP have NO top-level `PMC_INTR_0` bit (bit 0) — they
+    // route via the intr-vector tree / GIN instead. Every source
+    // that HAS a top-level bit must have a nonzero, unique bit.
+    if IntrSource::Pmu.intr0_bit() != 1 << 24 {
+        return TestResult::Fail("PMU top-level bit must be 1<<24 (gp100_mc_intr[])");
+    }
+    if IntrSource::Sec.intr0_bit() != 0 {
+        return TestResult::Fail("SEC2 must have no top-level PMC_INTR_0 bit");
+    }
+    if IntrSource::Gsp.intr0_bit() != 0 {
+        return TestResult::Fail("GSP must have no top-level PMC_INTR_0 bit");
+    }
     let sources = [
         IntrSource::Fifo,
         IntrSource::Graphics,
@@ -248,9 +262,7 @@ fn smoke_pmc_intr_source_bits_unique_and_set() -> TestResult {
         IntrSource::CopyEngine1,
         IntrSource::CopyEngine2,
         IntrSource::Display,
-        IntrSource::Sec,
         IntrSource::Pmu,
-        IntrSource::Gsp,
     ];
     let mut union = 0u32;
     for s in sources.iter().copied() {
@@ -2746,6 +2758,14 @@ fn smoke_mc_intr_all_sources_cover_every_top_level_bit() -> TestResult {
     let mut union = 0u32;
     for s in all.iter().copied() {
         let bit = s.intr0_bit();
+        // Sec + Gsp have no top-level bit (G4/G13); the walker
+        // skips them. Every other source must have a unique bit.
+        if matches!(s, IntrSource::Sec | IntrSource::Gsp) {
+            if bit != 0 {
+                return TestResult::Fail("Sec/Gsp must have no top-level bit");
+            }
+            continue;
+        }
         if bit == 0 {
             return TestResult::Fail("each source must have a bit");
         }
@@ -2809,6 +2829,158 @@ fn smoke_mc_walk_intr0_produces_one_cookie_per_bit() -> TestResult {
 kernel_test_in!(
     "drivers/nvidia/mc",
     smoke_mc_walk_intr0_produces_one_cookie_per_bit
+);
+
+// ────────────────────────────────────────────────────────────────
+// IRQ top half / drain (G4) — hermetic: `MmioRegion` is real-only,
+// so the pure consume step (`IrqState::observe` / `take_pending`)
+// is tested over synthetic `PMC_INTR_0` words, following the
+// `walk_intr0` precedent. The thin MMIO wrappers
+// (`handle_top_half` / `drain_pending`) apply exactly the mask the
+// pure step returns, via the already-tested `mask/unmask_intr_source`.
+// ────────────────────────────────────────────────────────────────
+
+use crate::irq::{IrqMode, IrqState};
+
+fn smoke_irq_walk_includes_corrected_pmu_bit() -> TestResult {
+    // Synthetic PMC_INTR_0 with the corrected PMU bit (1<<24) +
+    // DISP set: the walker must produce a PMU cookie, and must NOT
+    // produce a SEC cookie (SEC2 has no top-level bit).
+    let intr0 = IntrSource::Pmu.intr0_bit() | IntrSource::Display.intr0_bit();
+    let cookies = walk_intr0(intr0, |src| match src {
+        IntrSource::Pmu => 0xA0A0,
+        IntrSource::Display => 0xDEAD,
+        _ => 0,
+    });
+    if cookies.len() != 2 {
+        return TestResult::Fail("expected 2 cookies for DISP + PMU bits");
+    }
+    if cookies.iter().any(|c| c.source == IntrSource::Sec) {
+        return TestResult::Fail("SEC2 must never appear in a top-level walk");
+    }
+    let Some(pmu) = cookies.iter().find(|c| c.source == IntrSource::Pmu) else {
+        return TestResult::Fail("PMU cookie missing for bit 1<<24");
+    };
+    if pmu.intr0_bit != 1 << 24 || pmu.engine_status != 0xA0A0 {
+        return TestResult::Fail("PMU cookie must carry bit 1<<24 + engine status");
+    }
+    // The old, wrong PMU bit (1<<21) is GPIO/I2C in the Nouveau
+    // tables: asserting it alone must produce no PMU cookie.
+    let gpio_only = walk_intr0(1 << 21, |_| 0);
+    if gpio_only.iter().any(|c| c.source == IntrSource::Pmu) {
+        return TestResult::Fail("bit 1<<21 must not decode as PMU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/irq",
+    smoke_irq_walk_includes_corrected_pmu_bit
+);
+
+fn smoke_irq_observe_consumes_live_intr() -> TestResult {
+    let state = IrqState::new();
+    if state.mode() != IrqMode::Polling {
+        return TestResult::Fail("fresh IrqState must start in polling mode");
+    }
+    // Live INTR: DISP + FIFO + PMU asserted, distinct engine status.
+    let top = IntrSource::Display.intr0_bit()
+        | IntrSource::Fifo.intr0_bit()
+        | IntrSource::Pmu.intr0_bit();
+    let mask = state.observe(top, |src| match src {
+        IntrSource::Display => 0xDEAD,
+        IntrSource::Fifo => 0xBEEF,
+        IntrSource::Pmu => 0xA0A0,
+        _ => 0,
+    });
+    if mask != top {
+        return TestResult::Fail("observe must return exactly the asserted known bits to mask");
+    }
+    if state.pending_bits() != top {
+        return TestResult::Fail("pending mask must hold the consumed sources for the drain");
+    }
+    if state.handled() != 1 || state.fired() != 1 || state.spurious() != 0 {
+        return TestResult::Fail("counters must record one handled delivery");
+    }
+    if state.last_intr0() != top {
+        return TestResult::Fail("last_intr0 must record the live sample");
+    }
+    if state.count(IntrSource::Display) != 1
+        || state.count(IntrSource::Fifo) != 1
+        || state.count(IntrSource::Pmu) != 1
+    {
+        return TestResult::Fail("per-source counts must bump once each");
+    }
+    if state.last_engine_status(IntrSource::Display) != 0xDEAD
+        || state.last_engine_status(IntrSource::Fifo) != 0xBEEF
+        || state.last_engine_status(IntrSource::Pmu) != 0xA0A0
+    {
+        return TestResult::Fail("per-source engine status must be recorded");
+    }
+    // Second identical sample: counts accumulate, pending stays set.
+    let mask2 = state.observe(top, |_| 0);
+    if mask2 != top || state.count(IntrSource::Display) != 2 {
+        return TestResult::Fail("repeat delivery must re-consume and accumulate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/irq", smoke_irq_observe_consumes_live_intr);
+
+fn smoke_irq_observe_spurious_and_unknown_bits() -> TestResult {
+    let state = IrqState::new();
+    // Zero status word: spurious, nothing consumed, nothing masked.
+    if state.observe(0, |_| 0xFFFF) != 0 {
+        return TestResult::Fail("zero status must mask nothing");
+    }
+    if state.spurious() != 1 || state.handled() != 0 || state.pending_bits() != 0 {
+        return TestResult::Fail("zero status must count as spurious only");
+    }
+    // FAULT bit (1<<9, `gp100_mc_intr[]`) has no IntrSource variant
+    // yet: counted as unrecognized, never masked, never pended.
+    if state.observe(1 << 9, |_| 0xFFFF) != 0 {
+        return TestResult::Fail("unknown bits must never be masked");
+    }
+    if state.unrecognized() != 1 || state.handled() != 0 || state.pending_bits() != 0 {
+        return TestResult::Fail("unknown bits must count as unrecognized only");
+    }
+    // Mixed: one known bit + one unknown bit — only the known bit
+    // is consumed.
+    let mixed = IntrSource::Fifo.intr0_bit() | (1 << 9);
+    if state.observe(mixed, |_| 0xBEEF) != IntrSource::Fifo.intr0_bit() {
+        return TestResult::Fail("mixed sample must mask only the known bit");
+    }
+    if state.pending_bits() != IntrSource::Fifo.intr0_bit() {
+        return TestResult::Fail("mixed sample must pend only the known source");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/irq",
+    smoke_irq_observe_spurious_and_unknown_bits
+);
+
+fn smoke_irq_take_pending_clears_for_drain() -> TestResult {
+    let state = IrqState::new();
+    let top = IntrSource::Display.intr0_bit() | IntrSource::Graphics.intr0_bit();
+    let _ = state.observe(top, |_| 0);
+    // The drain takes exactly the consumed mask (the G11 seam: the
+    // Display bit in the returned mask is what the flip consumer
+    // will use), and the pending mask clears so a second take is
+    // empty — the drain re-arms exactly once per consumption.
+    if state.take_pending() != top {
+        return TestResult::Fail("take_pending must return the consumed mask");
+    }
+    if state.pending_bits() != 0 || state.take_pending() != 0 {
+        return TestResult::Fail("take_pending must clear the pending mask");
+    }
+    // Counts survive the take: the drain does not erase history.
+    if state.count(IntrSource::Display) != 1 || state.count(IntrSource::Graphics) != 1 {
+        return TestResult::Fail("take_pending must not clear per-source counts");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/irq",
+    smoke_irq_take_pending_clears_for_drain
 );
 
 fn smoke_mc_engine_status_offsets_match_dev_refs() -> TestResult {

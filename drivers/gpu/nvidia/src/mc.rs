@@ -189,10 +189,56 @@ impl Boot0 {
 
 // ── Top-level interrupt mask vectors ─────────────────────────────
 //
-// `dev_pmc.ref.txt` top-level INTR bits (stable Maxwell→Ada).
+// Top-level `PMC_INTR_0` bits, grounded on Nouveau's per-chip MC
+// intr tables — NOT `dev_pmc.ref.txt`, which does not exist in
+// open-gpu-doc (see §5 of the programme record). The tables agree
+// where they overlap:
 //
-// We model the canonical interrupt-source bits as a typed enum so
-// the routing code can be exhaustive.
+// - `gp100_mc_intr[]` (`nvkm/subdev/mc/gp100.c`, Pascal — the target
+//   family): DISP `0x04000000`, FIFO `0x00000100`, FAULT `0x00000200`,
+//   IBUS `0x40000000`, BUS `0x10000000`, FB `0x08000000`, LTC
+//   `0x02000000`, **PMU `0x01000000` (bit 24)**, GPIO/I2C
+//   `0x00200000` (bit 21), TIMER `0x00100000`, THERM `0x00040000`,
+//   FB `0x00002000`.
+// - `gk104_mc_intr[]` (`nvkm/subdev/mc/gk104.c`) and
+//   `gf100_mc_intr[]` (`nvkm/subdev/mc/gf100.c`) agree on PMU
+//   `0x01000000`; `gf100` additionally lists GR `0x00001000` (bit
+//   12) and CE0/CE1/CE2 `0x20/0x40/0x80` (bits 5/6/7).
+//
+// Corrections this implies (G4 lane, G13 item):
+//
+// - `Pmu` is bit **24** (`0x01000000`), not bit 21. The old value
+//   was wrong; bit 21 is GPIO/I2C in all three tables, so the
+//   "Pmu/Sec swapped" reading is refuted — there is no swap, the PMU
+//   bit was simply wrong and SEC has no top-level bit at all.
+// - `Sec` (SEC2) has **no** `PMC_INTR_0` bit in any Nouveau MC table:
+//   SEC2 registers its interrupt through the `nvkm_intr` vector tree
+//   (`nvkm/engine/sec2/base.c::nvkm_sec2_oneinit`, via the
+//   `intr_vector` hook — e.g. `ga102_sec2_intr_vector` reads the TOP
+//   vector from `0x8403e0`), not through the PMC map. Its
+//   `intr0_bit` is therefore `0`, and the walker skips it.
+// - `Gsp` likewise has no PMC bit (GSP is Turing+; its interrupts
+//   route via GIN/TOP, not `PMC_INTR_0` — see the Nova core
+//   interrupts doc, `Documentation/gpu/nova/core/interrupts.rst`).
+//   Bit 28 (`0x10000000`) in the tables is BUS, not GSP.
+// - `Graphics` bit 12 is grounded on `gf100_mc_intr[]` (GR
+//   `0x00001000`); the Pascal table omits engines (they route via
+//   the intr tree in the modern model), but the hardware bit is the
+//   same register.
+// - `CopyEngine0/1/2` bits 13/14/15 are **UNVERIFIED**: they collide
+//   with the tables (bit 13 is FB `0x00002000`, bit 15 is MSVLD
+//   `0x00008000` in `gf100`), while `gf100` puts CE0/CE1/CE2 at bits
+//   5/6/7. Do NOT "fix" them to 5/6/7 without a Pascal-era engine-bit
+//   source — the Fermi table may not apply to Pascal engine routing.
+//   G13 remainder; the handler never masks unknown bits.
+// - `NVKM_SUBDEV_FAULT` (`0x00000200`, bit 9, `gp100`) has no
+//   `IntrSource` variant yet; the handler counts it as unrecognized.
+//   G13 remainder.
+//
+// We model the interrupt-source bits as a typed enum so the routing
+// code can be exhaustive. A bit of `0` means "no top-level
+// `PMC_INTR_0` bit" — the walker skips such sources, and
+// mask/unmask with bit `0` is a no-op.
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IntrSource {
@@ -208,20 +254,28 @@ pub enum IntrSource {
 }
 
 impl IntrSource {
-    /// Bit mask in `PMC_INTR_0`. Bit positions cited from
-    /// `dev_pmc.ref.txt::NV_PMC_INTR_0` (Turing manual) — these are
-    /// the host-group bits.
+    /// Bit mask in `PMC_INTR_0`, or `0` when the source has no
+    /// top-level `PMC_INTR_0` bit (`Sec`, `Gsp` — see the table
+    /// comment above). Grounded per source on the Nouveau MC intr
+    /// tables (`gp100`/`gk104`/`gf100`); the `dev_pmc.ref.txt`
+    /// citation this previously carried does not exist.
     pub const fn intr0_bit(self) -> u32 {
         match self {
             IntrSource::Fifo => 1 << 8,
             IntrSource::Graphics => 1 << 12,
+            // UNVERIFIED (see the table comment): collides with the
+            // `gf100` table, which puts CE0/CE1/CE2 at bits 5/6/7.
             IntrSource::CopyEngine0 => 1 << 13,
             IntrSource::CopyEngine1 => 1 << 14,
             IntrSource::CopyEngine2 => 1 << 15,
             IntrSource::Display => 1 << 26,
-            IntrSource::Sec => 1 << 24,
-            IntrSource::Pmu => 1 << 21,
-            IntrSource::Gsp => 1 << 28,
+            // No top-level bit: SEC2 routes via the intr-vector tree.
+            IntrSource::Sec => 0,
+            // `gp100_mc_intr[]` / `gk104` / `gf100`: PMU 0x01000000.
+            IntrSource::Pmu => 1 << 24,
+            // No top-level bit: GSP routes via GIN/TOP (Turing+).
+            // Bit 28 in the tables is BUS, not GSP.
+            IntrSource::Gsp => 0,
         }
     }
 
@@ -345,6 +399,19 @@ pub unsafe fn read_live_intr0(
             None => 0,
         }
     })
+}
+
+/// Read the raw `PMC_INTR_0` status word. Non-allocating single MMIO
+/// read, for the hard-IRQ top half (`irq::IrqState::handle_top_half`),
+/// which cannot allocate — cf. [`read_live_intr0`], which allocates
+/// a cookie vector and is reserved for the bottom half.
+///
+/// # Safety
+/// `bar0` is the kernel-mapped BAR0 view of the card. Caller has
+/// exclusive access (typically an IRQ top-half).
+pub unsafe fn read_intr0_status(bar0: &narf_driver_runtime::MmioRegion) -> u32 {
+    // SAFETY: caller's responsibility.
+    unsafe { bar0.read32(PMC_INTR_0) }
 }
 
 /// Mask a single interrupt source at the top level. Cite
