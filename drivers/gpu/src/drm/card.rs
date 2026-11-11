@@ -2924,12 +2924,15 @@ impl Card {
                 .any(|p| p.primary_of.is_none() && p.fb_id == Some(fb_id))
     }
     /// Free closed framebuffers (CLOSEFB'd while shown) nothing scans any
-    /// more. Returns dumb backings to buddy-free.
+    /// more: drm_mode_closefb drops the file's reference and the plane's
+    /// goes when it shows something else, whatever the framebuffer is made
+    /// of (a GEM buffer, a card-table dumb buffer or an import). Returns
+    /// dumb backings to buddy-free.
     pub fn collect_closed_fbs(&mut self) -> Vec<(u64, u8)> {
         let closed: Vec<u32> = self
             .framebuffers
             .iter()
-            .filter(|fb| fb.bo.as_ref().is_some_and(|bo| bo.owner == CLOSED_FB_OWNER))
+            .filter(|fb| fb.owner() == Some(CLOSED_FB_OWNER))
             .map(|fb| fb.id)
             .filter(|&id| !self.fb_shown(id))
             .collect();
@@ -3140,6 +3143,63 @@ pub mod tests {
     kernel_test_in!(
         "drivers/gpu/drm/card",
         smoke_dumb_backing_frees_when_unmapped
+    );
+
+    /// drm_mode_closefb on a framebuffer of a card-table dumb buffer (one
+    /// made through the generic ADDFB path, which has no per-open GEM
+    /// buffer): while a plane scans it, it stays, owned by no file; once
+    /// the plane has moved on, it and its backing go, as the framebuffer's
+    /// last reference drops in drm_framebuffer_put.
+    fn closed_dumb_framebuffer_goes_once_off_screen() -> TestResult {
+        narf_memory::rmap::__reset_for_test();
+        const OPEN: u64 = 7;
+        let mut card = Card::new("test", "test", (1, 0, 0));
+        card.crtcs.push(Crtc {
+            id: 11,
+            mode: Some(crate::Mode {
+                width: 64,
+                height: 16,
+                refresh_hz: 60,
+                bpp: 32,
+            }),
+            enabled: true,
+            primary_fb: None,
+            x: 0,
+            y: 0,
+        });
+        let phys = 0x60_000u64;
+        let Ok(handle) = card.register_dumb_backing(phys, 4096, 0) else {
+            return TestResult::Fail("register_dumb_backing failed");
+        };
+        let Ok(fb) = card.addfb2(64, 16, 0x3432_5258, 256, handle) else {
+            return TestResult::Fail("ADDFB2 of a dumb buffer failed");
+        };
+        card.set_fb_creator(fb, OPEN);
+        card.crtcs[0].primary_fb = Some(fb);
+        // GEM_CLOSE: the framebuffer keeps the buffer.
+        if card.remove_dumb_backing(handle).is_some() {
+            return TestResult::Fail("GEM_CLOSE freed a buffer its framebuffer holds");
+        }
+        if card.closefb(fb, OPEN) != Ok(None) || card.framebuffer(fb).is_err() {
+            return TestResult::Fail("CLOSEFB of a shown framebuffer removed it");
+        }
+        if !card.collect_closed_fbs().is_empty() || card.framebuffer(fb).is_err() {
+            return TestResult::Fail("a closed framebuffer went while still on screen");
+        }
+        // The plane shows something else: nothing scans the closed one.
+        card.crtcs[0].primary_fb = None;
+        let freed = card.collect_closed_fbs();
+        if card.framebuffer(fb).is_ok() {
+            return TestResult::Fail("a closed dumb framebuffer stayed after leaving the screen");
+        }
+        if freed != [(phys, 0)] || card.dumb_backing(handle).is_some() {
+            return TestResult::Fail("a closed dumb framebuffer's backing was not returned");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm/card",
+        closed_dumb_framebuffer_goes_once_off_screen
     );
 
     /// ADDFB2 of an Intel GEM handle follows drm's framebuffer_check and
