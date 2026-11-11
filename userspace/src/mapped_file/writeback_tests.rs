@@ -1116,8 +1116,14 @@ kernel_test_in!("userspace/writeback", smoke_flusher_yields_between_batches);
 
 /// The same for a flush running in its caller — `fsync`, `sync`, `msync` —
 /// on that task's own kernel stack. Nothing there returns `Pending`, so the
-/// task has to give the CPU up itself; a sibling on its CPU runs between
-/// every two batches.
+/// task has to give the CPU up itself: between every two batches it must
+/// reach a scheduling point that can yield (`cond_resched` on its own
+/// stack), and a sibling on its CPU must get to run during the flush.
+///
+/// Which runnable peer `sched_yield` hands the CPU to is the scheduler's
+/// choice. In a full suite another task on this CPU may take a given gap, so
+/// the test does not demand the sibling in every gap — that made it fail on
+/// a busier tree while the yields were all there.
 fn smoke_fsync_yields_between_batches() -> TestResult {
     const BATCHES: usize = 3;
     let mut fixture = Fixture::new(BATCHES * BATCH_PAGES);
@@ -1125,13 +1131,19 @@ fn smoke_fsync_yields_between_batches() -> TestResult {
         return TestResult::Fail("could not map the test file");
     }
     static FSYNC_OK: AtomicBool = AtomicBool::new(false);
+    static YIELD_POINTS: AtomicU64 = AtomicU64::new(0);
     FSYNC_OK.store(false, Ordering::Release);
     let ops = Arc::clone(fixture.ops());
     narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(sibling());
     narf_scheduler::spawn_stackful(async move {
+        let before = SYSCALL_YIELD_POINTS.load(Ordering::Relaxed);
         FSYNC_OK.store(
             super::super::flush_current_file(&ops).is_ok(),
+            Ordering::Release,
+        );
+        YIELD_POINTS.store(
+            SYSCALL_YIELD_POINTS.load(Ordering::Relaxed) - before,
             Ordering::Release,
         );
         FLUSH_DONE.store(true, Ordering::Release);
@@ -1140,7 +1152,15 @@ fn smoke_fsync_yields_between_batches() -> TestResult {
     if !FLUSH_DONE.load(Ordering::Acquire) || !FSYNC_OK.load(Ordering::Acquire) {
         return TestResult::Fail("the in-caller flush did not complete");
     }
-    if !sibling_ran_between_every_batch(BATCHES) {
+    if WRITES_SEEN.load(Ordering::Acquire) != BATCHES {
+        return TestResult::Fail("the flush was not one filesystem write per batch");
+    }
+    if YIELD_POINTS.load(Ordering::Acquire) < (BATCHES - 1) as u64 {
+        return TestResult::Fail("fsync ran batches back to back with no scheduling point");
+    }
+    let first = TICKS_AT_WRITE[0].load(Ordering::Acquire);
+    let last = TICKS_AT_WRITE[BATCHES - 1].load(Ordering::Acquire);
+    if last <= first {
         return TestResult::Fail("fsync ran its whole flush without letting a sibling task run");
     }
     TestResult::Pass
