@@ -36,9 +36,10 @@ use crate::fb::{ram_type_for_family, FbConfig, RamType};
 use crate::fifo::{channel_cap_for, pb_header, PbType, USERD_GP_GET, USERD_GP_PUT, USERD_SIZE};
 use crate::gr::{compute_class_for, graphics_class_for, AMPERE_A, MAXWELL_A, PASCAL_A};
 use crate::mc::{
-    Boot0, IntrSource, PMC_BOOT_0, PMC_BOOT_0_ARCH0_SHIFT, PMC_BOOT_0_ARCH1_MASK,
-    PMC_BOOT_0_IMPL_SHIFT, PMC_ENABLE, PMC_ENABLE_ALL, PMC_ENABLE_PDISP, PMC_ENABLE_PFIFO,
-    PMC_INTR_0, PMC_INTR_EN_0,
+    disable_engine, enable_all_engines, enable_engine, engines_enabled, Boot0, IntrSource,
+    PMC_BOOT_0, PMC_BOOT_0_ARCH0_SHIFT, PMC_BOOT_0_ARCH1_MASK, PMC_BOOT_0_IMPL_SHIFT, PMC_ENABLE,
+    PMC_ENABLE_ALL, PMC_ENABLE_CORE_MASK, PMC_ENABLE_PDISP, PMC_ENABLE_PFIFO, PMC_ENABLE_PGRAPH,
+    PMC_ENABLE_PMU, PMC_INTR_0, PMC_INTR_EN_0,
 };
 use crate::mmu::{
     pde_encode_pt, pte_encode_4k, Aperture, PageSize, PTE_RO, PTE_VALID, PTE_VOLATILE,
@@ -216,8 +217,13 @@ kernel_test_in!(
     smoke_pmc_boot0_unknown_arch_preserves_raw
 );
 
-fn smoke_pmc_register_offsets_match_open_gpu_doc() -> TestResult {
-    // Stable cross-generation offsets per dev_pmc.ref.txt.
+fn smoke_pmc_register_offsets_match_nouveau() -> TestResult {
+    // Stable cross-generation offsets per Nouveau
+    // (`nvkm/subdev/mc/base.c` + `nv04.c`: PMC_ENABLE @ 0x200;
+    // `nvkm/subdev/mc/gp100.c` intr tables) and the envytools PMC
+    // register list (`hw/bus/pmc.html`: 0x0 ID, 0x100 INTR_HOST,
+    // 0x140 INTR_ENABLE_HOST, 0x200 ENABLE). The old test cited
+    // `dev_pmc.ref.txt`, which does not exist in open-gpu-doc.
     if PMC_BOOT_0 != 0x0000_0000 {
         return TestResult::Fail("PMC_BOOT_0 must be 0x000000");
     }
@@ -237,7 +243,7 @@ fn smoke_pmc_register_offsets_match_open_gpu_doc() -> TestResult {
 }
 kernel_test_in!(
     "drivers/nvidia/mc",
-    smoke_pmc_register_offsets_match_open_gpu_doc
+    smoke_pmc_register_offsets_match_nouveau
 );
 
 fn smoke_pmc_intr_source_bits_unique_and_set() -> TestResult {
@@ -283,6 +289,149 @@ fn smoke_pmc_intr_source_bits_unique_and_set() -> TestResult {
 kernel_test_in!(
     "drivers/nvidia/mc",
     smoke_pmc_intr_source_bits_unique_and_set
+);
+
+fn smoke_pmc_intr_bits_match_nouveau_envytools() -> TestResult {
+    // INTR_0 bits per source, grounded on `gp100_mc_intrs[]` /
+    // `gk104_mc_intrs[]` (DISP 0x04000000, FIFO 0x100, PMU
+    // 0x01000000) + `nv50_mc_intrs[]` (GR 0x1000). The pre-G3
+    // table had Pmu=21 (the GPIO/I2C line) — corrected to 24
+    // here. Only the grounded bits are pinned: the copy-engine
+    // bits (13/14/15) are UNVERIFIED per G4 (the `gf100` table
+    // puts them at 5/6/7, but the Fermi table may not apply to
+    // Pascal routing), and SEC2 has no top-level bit (0, G4), so
+    // neither is asserted by this test. (Rebase note: G3 as
+    // authored pinned CE0/1/2=5/6/7 and Sec=15; G4 on main
+    // overruled both, so those rows were dropped here.)
+    let want = [
+        (IntrSource::Fifo, 0x0000_0100u32),
+        (IntrSource::Graphics, 0x0000_1000u32),
+        (IntrSource::Display, 0x0400_0000u32),
+        (IntrSource::Pmu, 0x0100_0000u32),
+    ];
+    for (src, bit) in want {
+        if src.intr0_bit() != bit {
+            return TestResult::Fail("INTR_0 bit mismatch for a source");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_pmc_intr_bits_match_nouveau_envytools
+);
+
+// ── PMC_ENABLE writer (G3) ────────────────────────────────────────
+//
+// Fake BAR0: heap-backed RAM stood in for the register window,
+// following the in-tree backlight-test idiom (boxed `[u8]`
+// buffer, leaked; `MmioRegion` built literally over it).
+// Only the PMC block (0x0..0x400) is exercised, so 4 KiB is
+// ample.
+
+fn fake_pmc_bar0() -> (narf_driver_runtime::MmioRegion, *mut u8) {
+    use alloc::boxed::Box;
+    use narf_memory::PhysAddr;
+    let buf: Box<[u8]> = alloc::vec![0u8; 0x1000].into_boxed_slice();
+    let raw = Box::leak(buf);
+    let phys = PhysAddr::new(raw.as_ptr() as u64);
+    let bar0 = narf_driver_runtime::MmioRegion {
+        phys,
+        virt: phys.raw(),
+        len: raw.len() as u64,
+        kind: narf_driver_runtime::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    (bar0, raw.as_mut_ptr())
+}
+
+fn smoke_pmc_enable_all_writes_all_ones() -> TestResult {
+    let (bar0, raw) = fake_pmc_bar0();
+    // The write itself: the word at BAR0+0x200 must become
+    // all-ones — the `nv50_mc_init` "everything on" write.
+    // SAFETY: fake BAR0, offset 0x200 in range.
+    let readback = unsafe { enable_all_engines(&bar0) };
+    // SAFETY: `raw` is the leaked 4 KiB fake BAR0; offset 0x200
+    // is in range and 4-byte aligned.
+    let written =
+        unsafe { core::ptr::read_volatile((raw as *const u32).add((PMC_ENABLE / 4) as usize)) };
+    if written != 0xFFFF_FFFF {
+        return TestResult::Fail("PMC_ENABLE write must be 0xffffffff");
+    }
+    if readback != 0xFFFF_FFFF {
+        return TestResult::Fail("PMC_ENABLE readback must be 0xffffffff");
+    }
+    if !engines_enabled(readback, PMC_ENABLE_CORE_MASK) {
+        return TestResult::Fail("PFIFO|PMU must read back set after enable-all");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvidia/mc", smoke_pmc_enable_all_writes_all_ones);
+
+fn smoke_pmc_enable_disable_engine_mask_semantics() -> TestResult {
+    let (bar0, raw) = fake_pmc_bar0();
+    // SAFETY: `raw` is the leaked 4 KiB fake BAR0; offset 0x200
+    // is in range and 4-byte aligned.
+    let word = |raw: *mut u8| unsafe {
+        core::ptr::read_volatile((raw as *const u32).add((PMC_ENABLE / 4) as usize))
+    };
+    // Seed: PFIFO on, everything else off.
+    // SAFETY: same fake-BAR0 bounds as above.
+    unsafe {
+        core::ptr::write_volatile(
+            (raw as *mut u32).add((PMC_ENABLE / 4) as usize),
+            PMC_ENABLE_PFIFO,
+        );
+    }
+    // Enable PGRAPH: only the masked bit is added.
+    // SAFETY: fake BAR0, offset 0x200 in range.
+    unsafe { enable_engine(&bar0, PMC_ENABLE_PGRAPH) };
+    if word(raw) != PMC_ENABLE_PFIFO | PMC_ENABLE_PGRAPH {
+        return TestResult::Fail("enable_engine must set only the masked bits");
+    }
+    // Disable PFIFO: only the masked bit is cleared.
+    // SAFETY: fake BAR0, offset 0x200 in range.
+    unsafe { disable_engine(&bar0, PMC_ENABLE_PFIFO) };
+    if word(raw) != PMC_ENABLE_PGRAPH {
+        return TestResult::Fail("disable_engine must clear only the masked bits");
+    }
+    // Disabling an already-clear bit leaves the rest alone.
+    // SAFETY: fake BAR0, offset 0x200 in range.
+    unsafe { disable_engine(&bar0, PMC_ENABLE_PMU) };
+    if word(raw) != PMC_ENABLE_PGRAPH {
+        return TestResult::Fail("disable of a clear bit must not touch other bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_pmc_enable_disable_engine_mask_semantics
+);
+
+fn smoke_pmc_engines_enabled_readback_check() -> TestResult {
+    // Full house: every core bit set.
+    if !engines_enabled(0xFFFF_FFFF, PMC_ENABLE_CORE_MASK) {
+        return TestResult::Fail("all-ones readback must satisfy the core mask");
+    }
+    // PMU missing: the core mask is not satisfied.
+    if engines_enabled(PMC_ENABLE_PFIFO, PMC_ENABLE_CORE_MASK) {
+        return TestResult::Fail("readback without PMU must not satisfy the core mask");
+    }
+    // Nothing set satisfies nothing.
+    if engines_enabled(0, PMC_ENABLE_PFIFO) {
+        return TestResult::Fail("zero readback must not satisfy any mask");
+    }
+    // A zero mask never counts (mirrors nvkm_mc_enabled's
+    // `pmc_enable != 0` guard).
+    if engines_enabled(0xFFFF_FFFF, 0) {
+        return TestResult::Fail("zero mask must never count as enabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_pmc_engines_enabled_readback_check
 );
 
 // ────────────────────────────────────────────────────────────────
@@ -386,12 +535,35 @@ fn smoke_pmu_enable_bit_matches_nouveau() -> TestResult {
     // true }`), the reset map `gp100_mc` uses, tested by
     // `nv04_mc_device_enabled` against BAR0+0x200. It must not
     // collide with any other engine bit in the crate's table.
+    //
+    // The rest of the table is asserted here too, against the
+    // envytools GF100+ ENABLE list cross-checked with Nouveau's
+    // reset tables (`nv04_mc_reset[]`: GR 0x1000, FIFO 0x100):
+    // PFIFO 8, PGRAPH 12, PSEC 14, PVDEC/PMSPDEC 15, PVENC/PMSENC
+    // 18, PCOPY[0]/PCE0 6, PDISP 30. Two pre-G3 values were wrong:
+    // PMSPDEC was 17 (the Fermi MSPDEC bit; on GM107+ 17 is the
+    // decoder's interrupt line) and PCE0 was 15 (the GM107+
+    // PVDEC enable bit).
     use crate::mc::{
         PMC_ENABLE_PCE0, PMC_ENABLE_PDISP, PMC_ENABLE_PFIFO, PMC_ENABLE_PGRAPH, PMC_ENABLE_PMSENC,
         PMC_ENABLE_PMSPDEC, PMC_ENABLE_PMU, PMC_ENABLE_PSEC,
     };
     if PMC_ENABLE_PMU != 0x2000 {
         return TestResult::Fail("PMC_ENABLE_PMU should be 0x2000 per gk104_mc_reset");
+    }
+    let table = [
+        (PMC_ENABLE_PFIFO, 0x0100u32),
+        (PMC_ENABLE_PGRAPH, 0x1000u32),
+        (PMC_ENABLE_PSEC, 0x4000u32),
+        (PMC_ENABLE_PCE0, 0x0040u32),
+        (PMC_ENABLE_PMSPDEC, 0x8000u32),
+        (PMC_ENABLE_PMSENC, 0x0004_0000u32),
+        (PMC_ENABLE_PDISP, 0x4000_0000u32),
+    ];
+    for (got, want) in table {
+        if got != want {
+            return TestResult::Fail("PMC_ENABLE engine bit mismatch");
+        }
     }
     let others = [
         PMC_ENABLE_PFIFO,
