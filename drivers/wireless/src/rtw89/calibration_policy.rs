@@ -5,9 +5,11 @@
 //! RTL8852C has its own format (magic `N5CB` v1, `rtw8852c-cal-v1-<mac>.bin`)
 //! over its own identity ([`Board::new_c`]); a B record never admits C and
 //! vice versa. RTL8851B likewise has `N51B` v1 (`rtw8851b-cal-v1-<mac>.bin`)
-//! over [`Board::new_51`]. All admit only the cold channel-1/20MHz span
-//! 2402..2422.
-use super::{factory::Factory, mac::ChipId, radio_assets::Assets};
+//! over [`Board::new_51`]. RTL8922A likewise has `N22A` v1
+//! (`rtw8922a-cal-v1-<mac>.bin`, NARF-local record magic, not a Linux
+//! constant) over [`Board::new_be`]. All admit only the cold
+//! channel-1/20MHz span 2402..2422.
+use super::{efuse_be::BeFactory, factory::Factory, mac::ChipId, radio_assets::Assets};
 use alloc::format;
 use narf_capabilities::{Cap, CapError, CapOp, Read};
 use narf_firmware::{FirmwareBlob, FirmwareError};
@@ -38,6 +40,17 @@ const C_COEX_RECIPE: &[u8] = b"rtw89_btc_ntfy_init WL-only: rtw8852c_btc_set_rfe
 /// only). As for C, every table byte comes from the bound firmware
 /// container (`Assets::bind`) and the bound factory.
 const N51_RECIPE: &[u8] = b"rtw89_mac_init(8851B) then phy.c rtw89_phy_dm_init: rtw89_phy_init_bb_reg, rtw8851b_init_txpwr_unit, rtw8851b_bb_reset (S0 HW-SI only), rtw89_phy_init_rf_reg {radioa}, rtw8851b_bb_sethw (rtw8851b_bb_gpio_init path A), physts/dig(cckpd every cut)/cfo(hw comp)/edcca init, no antdiv RFE, rtw89_phy_init_rf_nctl (no P1 reset, no second IOQ write) + rtw8851b_nctl_post_defs, rtw8851b_rfk_init (lck_init, dpk_init by_rate_dpd, aack, _rck A, _dac_cal, rx_dck), rtw8851b_set_txpwr_ctrl, rtw8851b_power_trim (path A), rtw8851b_bb_cfg_txrx_path(RF_A)";
+/// RTL8922A cold calibration recipe (Linux `rtw89_phy_dm_init` call
+/// chain, `phy.c:8254`, restricted to the steps this identity binds).
+/// NARF has no static rtw8922a_table.c copy: every table byte the recipe
+/// programs comes from the bound firmware container (`Assets::bind`)
+/// and the bound BE factory. The steps after the NCTL table —
+/// `rtw8922a_bb_sethw`, the PHYSTS/DIG/CFO/EDCCA DM sub-inits,
+/// `rtw8922a_rfk_init`, `rtw8922a_bb_cfg_txrx_path` — are NOT bound by
+/// this identity (no BE DM owner exists yet), and neither is coexistence:
+/// NARF has no BE BTC protocol row, so `rtw8922a_btc_set_rfe` /
+/// `btc_init_cfg` is not covered here.
+const BE_RECIPE: &[u8] = b"rtw89_mac_init(8922A) then phy.c rtw89_phy_dm_init: rtw89_phy_init_bb_reg (BB table; init_txpwr_unit NULL; BB-gain table; bb_reset empty), rtw89_phy_init_rf_reg {radioa idx0, radiob idx1}, rtw89_phy_init_rf_nctl (P1 reset, no second IOQ write; nctl_post_table NULL), rtw8922a_set_txpwr_ctrl (txpwr_ref OFDM/CCK zero), rtw8922a_power_trim (PA-bias then pad-bias RR_BIASA V1)";
 /// RTL8851B WLAN-only coexistence recipe the native owner runs at core.c
 /// `rtw89_btc_ntfy_init` (rtw8851b.c `rtw8851b_btc_set_rfe` +
 /// `rtw8851b_btc_init_cfg`, single WL RF path S0).
@@ -181,11 +194,56 @@ impl Board {
             chip: ChipId::Rtl8851B,
         })
     }
+    /// RTL8922A cold channel-1 calibration identity (Linux `rtw8922ae.c`
+    /// `rtw89_8922ae_id_table`: 10ec:8922; NARF `mac.rs` also admits
+    /// 10ec:892b): the BE factory identity (MAC, RFE, crystal cap,
+    /// 0x38-byte PHY-cap window, cut) and the bound container tables
+    /// (BB/GAIN/RADIO_A idx0/RADIO_B idx1/NCTL) under the BE recipe.
+    /// `BeFactory::read` already fails malformed maps, so the gates
+    /// here are the AX mirrors: RFE 255 refused, and a missing cut
+    /// (`cv` None) refused — there is no cut to bind the tables
+    /// against. No BE coexistence row exists in NARF, so unlike
+    /// `new_c` this binds no BTC ABI (see `BE_RECIPE`).
+    pub fn new_be(
+        factory: &BeFactory,
+        device: narf_bus::DeviceId,
+        assets: &Assets,
+    ) -> Result<Self, Error> {
+        if device.vendor != 0x10ec
+            || !matches!(device.device, 0x8922 | 0x892b)
+            || assets.chip() != ChipId::Rtl8922A
+            || factory.rfe_type == 255
+        {
+            return Err(Error::Identity);
+        }
+        let cut = factory.cv.ok_or(Error::Identity)?;
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        hash.update(b"NARF RTL8922A cold ch1 20MHz awake WLAN-only calibration v1;RF paths A+B");
+        hash.update(b"CMAC TXEN=0; NCTL RCK DACK RXDCK; no ordinary packet/response grant");
+        hash.update(BE_RECIPE);
+        hash.update(&device.vendor.to_le_bytes());
+        hash.update(&device.device.to_le_bytes());
+        hash.update(&device.subsystem_vendor.to_le_bytes());
+        hash.update(&device.subsystem_id.to_le_bytes());
+        hash.update(&factory.phycap);
+        hash.update(&factory.mac);
+        hash.update(&[cut, factory.rfe_type, factory.xtal_cap]);
+        assets
+            .bind(&mut hash, factory.rfe_type, cut)
+            .map_err(|_| Error::Identity)?;
+        Ok(Self {
+            identity: hash.finalize(),
+            mac: factory.mac,
+            device: device.device,
+            chip: ChipId::Rtl8922A,
+        })
+    }
     /// Record magic and firmware-name chip of this board's family.
     fn family(self) -> (&'static [u8; 4], &'static str) {
         match self.chip {
             ChipId::Rtl8852C => (b"N5CB", "8852c"),
             ChipId::Rtl8851B => (b"N51B", "8851b"),
+            ChipId::Rtl8922A => (b"N22A", "8922a"),
             _ => (b"N52B", "8852b"),
         }
     }
