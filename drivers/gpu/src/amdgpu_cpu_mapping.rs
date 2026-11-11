@@ -126,6 +126,8 @@ pub(crate) fn backing(
     // The placement lock excludes relocation commits, so this generation and
     // its frame snapshots stay current until the owner is registered.
     let placement = object.placement.lock();
+    // The mapping exposes this generation's frames: an address lease.
+    object.leases.fetch_add(1, Ordering::AcqRel);
     let whole = placement.frames(0, object.byte_len as usize)?;
     let frames = placement.frames(offset, len)?;
     let mut index = BACKINGS.lock();

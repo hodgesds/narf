@@ -574,6 +574,10 @@ pub struct GemObject {
     /// `tbo.pin_count`: live [`ScanoutPin`]s. A pinned buffer never moves
     /// (no eviction, demotion or suspend eviction) until the last unpin.
     pin_count: AtomicU32,
+    /// Address leases ever taken ([`GemObject::placement`], a pin, a CPU
+    /// mapping): [`GemObject::relocate`] refuses to publish a copy made
+    /// while one was taken.
+    leases: AtomicU64,
     stats: Option<Arc<stats::CardStats>>,
 }
 
@@ -799,6 +803,7 @@ impl GemObject {
         // Under the placement lock: no move can start between the check and
         // the count, and the pin's lease alone already stops one.
         self.pin_count.fetch_add(1, Ordering::AcqRel);
+        self.leases.fetch_add(1, Ordering::AcqRel);
         Ok(ScanoutPin {
             object: Arc::clone(self),
             placement: Arc::clone(&placement),
@@ -807,8 +812,12 @@ impl GemObject {
         })
     }
     /// Acquire an address lease before exposing physical frames or PTEs.
+    /// Every lease is counted, so a synchronous move copying the buffer
+    /// with the lock free sees one taken (and dropped) meanwhile.
     pub fn placement(&self) -> Arc<GemPlacement> {
-        Arc::clone(&self.placement.lock())
+        let placement = self.placement.lock();
+        self.leases.fetch_add(1, Ordering::AcqRel);
+        Arc::clone(&placement)
     }
 
     pub fn mapping(self: &Arc<Self>) -> Arc<GemMapping> {
@@ -818,40 +827,81 @@ impl GemObject {
         })
     }
 
+    /// ttm_bo_move_memcpy of an idle buffer nothing maps: copy it into the
+    /// other domain and publish the copy. The placement lock is an IRQ-safe
+    /// spinlock every user of the buffer's address takes, so the copy does
+    /// not run under it (Linux copies under the buffer's reservation, a
+    /// sleeping lock, with interrupts on): the source is leased, copied with
+    /// the lock free, and the new placement published only if no address
+    /// lease was taken meanwhile (`leases`) and the buffer is still
+    /// eligible. `Busy` otherwise; the unused copy is returned.
     pub(crate) fn relocate(&self, to_vram: bool) -> Result<(), FsError> {
         let target = if to_vram {
             u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
         } else {
             u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT | uapi::AMDGPU_GEM_DOMAIN_CPU)
         };
-        let mut placement = self.placement.lock();
         // A CPU copy would move a GFX12 DCC buffer's compressed bytes
         // without decompressing them (`moves_by_engine`).
-        if self.allowed_domains.load(Ordering::Acquire) & target == 0
-            || self.pinned()
-            || moves_by_engine(self)
-            || matches!(
-                placement.backing,
-                Backing::User(_) | Backing::Foreign { .. }
-            )
-        {
-            return Err(FsError::Busy);
-        }
-        let backing = Arc::get_mut(&mut placement).ok_or(FsError::Busy)?;
-        if !self
-            .dma_buf
-            .resv
-            .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep)
-            .is_empty()
-        {
-            return Err(FsError::Busy);
-        }
-        let before = backing.system;
-        backing.relocate(to_vram, self.card, self.alignment, self.flags)?;
-        if before != backing.system {
-            self.record_move();
-        }
+        let eligible = |placement: &Arc<GemPlacement>| {
+            self.allowed_domains.load(Ordering::Acquire) & target != 0
+                && !self.pinned()
+                && !moves_by_engine(self)
+                && !matches!(
+                    placement.backing,
+                    Backing::User(_) | Backing::Foreign { .. }
+                )
+        };
+        let idle = || {
+            self.dma_buf
+                .resv
+                .fences(narf_filesystem::dma_buf::DmaResvUsage::Bookkeep)
+                .is_empty()
+        };
+        let (source, leases) = {
+            let placement = self.placement.lock();
+            if !eligible(&placement)
+                || Arc::strong_count(&placement) != 1
+                || Arc::weak_count(&placement) != 0
+                || !idle()
+            {
+                return Err(FsError::Busy);
+            }
+            if placement.system != to_vram {
+                return Ok(());
+            }
+            (Arc::clone(&placement), self.leases.load(Ordering::Acquire))
+        };
+        #[cfg(feature = "kernel-test")]
+        relocate_copy_hook();
+        let destination =
+            Arc::new(source.copy_to(to_vram, self.card, self.alignment, self.flags)?);
+        let replaced = {
+            let mut placement = self.placement.lock();
+            // Ours and the object's are the only leases, and nobody took
+            // (and dropped) another while the bytes were copied.
+            if !Arc::ptr_eq(&placement, &source)
+                || Arc::strong_count(&source) != 2
+                || Arc::weak_count(&source) != 0
+                || self.leases.load(Ordering::Acquire) != leases
+                || !eligible(&placement)
+                || !idle()
+            {
+                return Err(FsError::Busy);
+            }
+            core::mem::replace(&mut *placement, destination)
+        };
+        self.record_move();
+        // The old backing returns to its allocator with the lock free.
+        drop(replaced);
+        drop(source);
         Ok(())
+    }
+
+    /// The current placement's metadata, read without taking an address
+    /// lease (nothing of its backing is retained or dereferenced).
+    fn peek<R>(&self, read: impl FnOnce(&GemPlacement) -> R) -> R {
+        read(&self.placement.lock())
     }
 
     pub fn phys(&self) -> u64 {
@@ -861,7 +911,7 @@ impl GemObject {
         self.placement().gpu
     }
     pub fn system(&self) -> bool {
-        self.placement().system
+        self.peek(|p| p.system)
     }
     pub fn gpu_at(&self, offset: u64) -> Option<u64> {
         self.placement().gpu_at(offset)
@@ -873,21 +923,21 @@ impl GemObject {
         self.placement().store_u64(offset, value)
     }
     pub fn cpu_visible(&self) -> bool {
-        self.placement().cpu_visible()
+        self.peek(GemPlacement::cpu_visible)
     }
     /// Imported from another device's dma-buf (drm_gem_is_imported).
     pub fn is_foreign(&self) -> bool {
-        matches!(self.placement().backing, Backing::Foreign { .. })
+        self.peek(|p| matches!(p.backing, Backing::Foreign { .. }))
     }
     /// Created by `GEM_USERPTR` (amdgpu_ttm_tt_get_usermm).
     pub fn is_userptr(&self) -> bool {
-        matches!(self.placement().backing, Backing::User(_))
+        self.peek(|p| matches!(p.backing, Backing::User(_)))
     }
     pub fn frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         self.placement().frames(offset, len)
     }
     pub fn domain(&self) -> u32 {
-        self.placement().domain()
+        self.peek(GemPlacement::domain)
     }
 
     /// The DRM card whose open created the buffer.
@@ -1008,17 +1058,17 @@ impl GemPlacement {
         core::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }
-    /// Copy a uniquely leased backing; publish only after the copy succeeds.
-    fn relocate(
-        &mut self,
+    /// This backing's bytes copied into a new placement in the other
+    /// domain: visible VRAM for a system backing (`to_vram`), system pages
+    /// for a visible-VRAM one. The caller holds a lease on `self` and
+    /// publishes the result; dropping it returns its memory.
+    fn copy_to(
+        &self,
         to_vram: bool,
         card: Option<u32>,
         alignment: u64,
         flags: u64,
-    ) -> Result<(), FsError> {
-        if self.system != to_vram {
-            return Ok(());
-        }
+    ) -> Result<GemPlacement, FsError> {
         if to_vram {
             let Backing::System(chunks) = &self.backing else {
                 return Err(FsError::Unsupported);
@@ -1041,8 +1091,9 @@ impl GemPlacement {
             let mut offset = 0;
             for &(phys, order) in chunks {
                 let bytes = PAGE_SIZE << order;
-                // SAFETY: exclusive BO and new reservation, disjoint mappings;
-                // chunks exactly cover byte_len and reservation bounds it.
+                // SAFETY: the caller's lease keeps the source chunks, which
+                // exactly cover byte_len; the new reservation is this
+                // copy's alone and bounds it. The mappings are disjoint.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
@@ -1053,33 +1104,28 @@ impl GemPlacement {
                 offset += bytes;
             }
             core::sync::atomic::fence(Ordering::SeqCst);
-            let old = core::mem::replace(&mut self.backing, Backing::Vram { _held: reservation });
-            self.phys = map.phys.raw();
-            self.gpu = gpu;
-            self.system = false;
-            if let Backing::System(chunks) = old {
-                free_chunks(&chunks);
-                GTT_USED.fetch_sub(self.byte_len, Ordering::Relaxed);
-            }
+            Ok(GemPlacement {
+                phys: map.phys.raw(),
+                gpu,
+                system: false,
+                byte_len: self.byte_len,
+                backing: Backing::Vram { _held: reservation },
+            })
         } else {
             let Backing::Vram { _held } = &self.backing else {
                 return Err(FsError::Unsupported);
             };
             let source = _held.mapping();
-            let chunks = alloc_system(self.byte_len / PAGE_SIZE)?;
-            if chunks.iter().any(|&(phys, order)| {
-                crate::amdgpu_vm::make_pte(phys + (PAGE_SIZE << order) - PAGE_SIZE, 0).is_err()
-            }) {
-                free_chunks(&chunks);
-                GTT_USED.fetch_sub(self.byte_len, Ordering::Relaxed);
+            let destination = GemPlacement::new_system(self.byte_len)?;
+            let Backing::System(chunks) = &destination.backing else {
                 return Err(FsError::InvalidData);
-            }
-            let phys = chunks[0].0;
+            };
             let mut offset = 0;
-            for &(at, order) in &chunks {
+            for &(at, order) in chunks {
                 let bytes = PAGE_SIZE << order;
-                // SAFETY: exclusive BO and newly allocated system chunks;
-                // source and destination cover precisely this BO's bytes.
+                // SAFETY: the caller's lease keeps the source reservation,
+                // whose BAR window covers byte_len; the new system chunks
+                // are this copy's alone and cover exactly byte_len.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         (source.virt + offset) as *const u8,
@@ -1090,13 +1136,8 @@ impl GemPlacement {
                 offset += bytes;
             }
             core::sync::atomic::fence(Ordering::SeqCst);
-            let old = core::mem::replace(&mut self.backing, Backing::System(chunks));
-            self.phys = phys;
-            self.gpu = phys;
-            self.system = true;
-            drop(old);
+            Ok(destination)
         }
-        Ok(())
     }
     /// The physical address of byte `offset` (inside the buffer) and how
     /// many bytes from there lie in the same contiguous chunk.
@@ -1957,6 +1998,7 @@ impl GemState {
             card: self.card,
             dma_buf,
             pin_count: AtomicU32::new(0),
+            leases: AtomicU64::new(0),
             stats: None,
         })
     }
@@ -2099,6 +2141,7 @@ impl GemState {
             card: self.card,
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
+            leases: AtomicU64::new(0),
             stats: None,
         })?;
         Ok((handle, pitch, byte_len))
@@ -2125,6 +2168,7 @@ impl GemState {
             card: self.card,
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
+            leases: AtomicU64::new(0),
             stats: None,
         };
         let handle = self.insert(object)?;
@@ -2401,6 +2445,7 @@ fn create_locked(
             card: state.card,
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
+            leases: AtomicU64::new(0),
             stats: None,
         };
         object
@@ -2452,6 +2497,7 @@ fn create_locked(
                 card: state.card,
                 dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
                 pin_count: AtomicU32::new(0),
+                leases: AtomicU64::new(0),
                 stats: None,
             }
         }
@@ -2483,6 +2529,7 @@ fn create_locked(
                 card: state.card,
                 dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
                 pin_count: AtomicU32::new(0),
+                leases: AtomicU64::new(0),
                 stats: None,
             }
         }
@@ -2573,6 +2620,7 @@ fn userptr(state: &GemState, arg: usize) -> Result<u64, FsError> {
         card: state.card,
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
         pin_count: AtomicU32::new(0),
+        leases: AtomicU64::new(0),
         stats: None,
     };
     let handle = state.insert(object)?;
@@ -2783,6 +2831,18 @@ mod eviction_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_placement_liveness_tests.rs"]
 mod placement_liveness_tests;
+
+/// Test probe run where a synchronous relocation copies a buffer's bytes.
+#[cfg(feature = "kernel-test")]
+pub(crate) static RELOCATE_COPY_HOOK: IrqSafeSpinLock<Option<Arc<dyn Fn() + Send + Sync>>> =
+    IrqSafeSpinLock::new(None);
+#[cfg(feature = "kernel-test")]
+fn relocate_copy_hook() {
+    let hook = RELOCATE_COPY_HOOK.lock().clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_gem_pressure_tests.rs"]
