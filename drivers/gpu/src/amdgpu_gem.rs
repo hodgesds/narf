@@ -1474,12 +1474,7 @@ pub fn set_lru_eviction(card: u32, on: bool) {
 /// its opens' handle tables hold.
 fn eviction_candidates(card: u32) -> Vec<Arc<GemObject>> {
     if LRU_CARDS.lock().contains(&card) {
-        return CARD_OBJECTS
-            .lock()
-            .iter()
-            .filter(|(c, _)| *c == card)
-            .filter_map(|(_, o)| o.upgrade())
-            .collect();
+        return card_objects(card);
     }
     let tables: Vec<_> = GEM_TABLES
         .lock()
@@ -1487,14 +1482,54 @@ fn eviction_candidates(card: u32) -> Vec<Arc<GemObject>> {
         .filter(|(c, _)| *c == card)
         .filter_map(|(_, table)| table.upgrade())
         .collect();
+    table_objects(&tables)
+}
+
+/// Every live buffer created on card `card`, oldest first. The registry's
+/// IRQ-safe lock is held only to upgrade its entries into storage reserved
+/// beforehand: nothing is allocated, compared or dropped under it.
+fn card_objects(card: u32) -> Vec<Arc<GemObject>> {
+    let mut objects: Vec<Arc<GemObject>> = Vec::new();
+    loop {
+        let wanted = CARD_OBJECTS.lock().len();
+        objects.reserve(wanted);
+        let all = CARD_OBJECTS.lock();
+        if all.len() > objects.capacity() {
+            // It grew between the two looks: make room again.
+            continue;
+        }
+        objects.extend(
+            all.iter()
+                .filter(|(c, _)| *c == card)
+                .filter_map(|(_, o)| o.upgrade()),
+        );
+        return objects;
+    }
+}
+
+/// The buffers `tables` hold, each once, in table then handle order (a
+/// table's handles are in creation order). A handle table's lock is an
+/// IRQ-safe spinlock every lookup of that open takes, so it is held only
+/// to clone the references into storage reserved beforehand; a buffer under
+/// several handles or in several opens is dropped afterwards, outside
+/// every lock, in O(n log n).
+fn table_objects(tables: &[Arc<GemTable>]) -> Vec<Arc<GemObject>> {
     let mut objects: Vec<Arc<GemObject>> = Vec::new();
     for table in tables {
-        for object in table.lock().values() {
-            if !objects.iter().any(|o| Arc::ptr_eq(o, object)) {
-                objects.push(object.clone());
+        loop {
+            let wanted = table.lock().len();
+            objects.reserve(wanted);
+            let handles = table.lock();
+            if handles.len() > objects.capacity() - objects.len() {
+                // It grew between the two looks: make room again.
+                continue;
             }
+            objects.extend(handles.values().cloned());
+            break;
         }
     }
+    let mut seen = alloc::collections::BTreeSet::new();
+    objects.retain(|object| seen.insert(Arc::as_ptr(object) as usize));
     objects
 }
 

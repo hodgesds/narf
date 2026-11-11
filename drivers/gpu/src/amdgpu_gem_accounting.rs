@@ -67,11 +67,23 @@ pub(crate) struct OpenUsage {
     pub buffers: usize,
 }
 
-fn open_usage(table: &GemTable) -> OpenUsage {
-    let mut objects: Vec<Arc<GemObject>> = Vec::new();
-    for object in table.lock().values() {
-        if !objects.iter().any(|o| Arc::ptr_eq(o, object)) {
-            objects.push(object.clone());
+/// Test probe run between a walk's snapshot of an open's handles and its
+/// accounting of them.
+#[cfg(feature = "kernel-test")]
+pub(crate) static WALK_PROBE: IrqSafeSpinLock<Option<Arc<dyn Fn() + Send + Sync>>> =
+    IrqSafeSpinLock::new(None);
+
+/// One open's usage. The open's handle table is locked only for
+/// `table_objects`' snapshot; everything counted here is counted with it
+/// free, so a reader of fdinfo or a failure report never holds up the
+/// open's own handle lookups.
+fn open_usage(table: &Arc<GemTable>) -> OpenUsage {
+    let objects = table_objects(core::slice::from_ref(table));
+    #[cfg(feature = "kernel-test")]
+    {
+        let probe = WALK_PROBE.lock().clone();
+        if let Some(probe) = probe {
+            probe();
         }
     }
     let mut usage = OpenUsage {
@@ -116,7 +128,7 @@ pub(crate) fn opens(card: u32) -> Vec<OpenUsage> {
         .filter(|(c, _)| *c == card)
         .filter_map(|(_, table)| table.upgrade())
         .collect();
-    let mut opens: Vec<OpenUsage> = tables.iter().map(|t| open_usage(t)).collect();
+    let mut opens: Vec<OpenUsage> = tables.iter().map(open_usage).collect();
     opens.sort_by_key(|o| core::cmp::Reverse(o.vram + o.system));
     opens
 }
@@ -142,12 +154,7 @@ pub(crate) struct CardUsage {
 
 pub(crate) fn card_usage(card: u32) -> CardUsage {
     let heap = vram_heap(card);
-    let objects: Vec<Arc<GemObject>> = CARD_OBJECTS
-        .lock()
-        .iter()
-        .filter(|(c, _)| *c == card)
-        .filter_map(|(_, o)| o.upgrade())
-        .collect();
+    let objects = card_objects(card);
     let mut usage = CardUsage {
         visible: heap.as_ref().map_or((0, 0, 0), |h| {
             let size = h.pool.size();

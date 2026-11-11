@@ -227,3 +227,79 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/gem-accounting",
     full_heap_falls_back_to_system_pages_or_is_refused_and_counted
 );
+
+/// A handle table's lock is an IRQ-safe spinlock every lookup of that open
+/// takes. A walk (fdinfo, a failure report, an eviction) holds it only to
+/// copy the references out: the table is free again while the buffers are
+/// counted, a buffer under several handles counts once, and the buffers
+/// come out in handle order.
+fn a_walk_copies_the_handles_out_and_counts_with_the_table_free() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering as O};
+    const CARD: u32 = 0xe1c5;
+    struct Probe;
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            *WALK_PROBE.lock() = None;
+        }
+    }
+    let Some(_heap) = Heap::new(CARD, 16) else {
+        return TestResult::Fail("heap");
+    };
+    let vram = uapi::AMDGPU_GEM_DOMAIN_VRAM;
+    let state = GemState::for_card(CARD);
+    let (Ok(first), Ok(second), Ok(third)) = (
+        create(&state, 1, vram, 0),
+        create(&state, 2, vram, 0),
+        create(&state, 4, vram, 0),
+    ) else {
+        return TestResult::Fail("buffers");
+    };
+    // The same buffers again under further handles (GETFB2 hands these
+    // out), out of order.
+    if state.handle_create(&third).is_err()
+        || state.handle_create(&first).is_err()
+        || state.handle_create(&third).is_err()
+    {
+        return TestResult::Fail("duplicate handles");
+    }
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    static LOCKED: AtomicU32 = AtomicU32::new(0);
+    RAN.store(0, O::Release);
+    LOCKED.store(0, O::Release);
+    let table = state.table();
+    let _probe = Probe;
+    *WALK_PROBE.lock() = Some(Arc::new(move || {
+        RAN.fetch_add(1, O::AcqRel);
+        if table.try_lock().is_none() {
+            LOCKED.fetch_add(1, O::AcqRel);
+        }
+    }));
+    let opens = opens(CARD);
+    let mut text = String::new();
+    fdinfo(&state, None, &mut text);
+    if RAN.load(O::Acquire) != 2 {
+        return TestResult::Fail("the walks did not run");
+    }
+    if LOCKED.load(O::Acquire) != 0 {
+        return TestResult::Fail("buffers were counted under the open's handle-table lock");
+    }
+    if opens.len() != 1
+        || (opens[0].vram, opens[0].buffers) != (7 * PAGE, 3)
+        || !text.contains("drm-memory-vram:\t28 KiB\n")
+    {
+        return TestResult::Fail("a buffer under several handles was counted more than once");
+    }
+    let candidates = eviction_candidates(CARD);
+    if candidates.len() != 3
+        || !Arc::ptr_eq(&candidates[0], &first)
+        || !Arc::ptr_eq(&candidates[1], &second)
+        || !Arc::ptr_eq(&candidates[2], &third)
+    {
+        return TestResult::Fail("eviction candidates are not each buffer once, oldest first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gem-accounting",
+    a_walk_copies_the_handles_out_and_counts_with_the_table_free
+);
