@@ -1230,10 +1230,10 @@ kernel_test_in!(
 // ── shared bt_coexistence mechanism trees (`dm.rs`) ────────────────────
 
 /// Reconstruct H2C fills from a `FwFake` write log. Each fill is
-/// `(command id, payload bytes)`: the box content bytes after the id,
-/// followed by the extension bytes written immediately before the box
-/// content (empty for payloads of three bytes or fewer; short payloads
-/// pad the content to three bytes with zeros, matching the box image).
+/// `(command id, payload bytes)` in command order: for a BIT(7) id the
+/// two extension bytes written immediately before the box, then the box
+/// content bytes after the id (short payloads pad the content to three
+/// bytes with zeros, matching the box image).
 /// Box rotation is irrelevant: fills are detected by box-base writes.
 fn dm_h2c_fills(writes: &[(u16, u32, u8)]) -> Vec<(u8, Vec<u8>)> {
     let mut fills = Vec::new();
@@ -1241,30 +1241,25 @@ fn dm_h2c_fills(writes: &[(u16, u32, u8)]) -> Vec<(u8, Vec<u8>)> {
     while i < writes.len() {
         let (reg, value, _) = writes[i];
         if (0x01d0..0x01e0).contains(&reg) && (reg - 0x01d0) % 4 == 0 {
-            let boxnum = usize::from(reg - 0x01d0) / 4;
-            let ext_base = 0x01f0u16 + (boxnum as u16) * 4;
-            // Extension bytes sit consecutively immediately before the
-            // box content; collect them backward, then reverse.
-            let mut ext_rev = Vec::new();
-            let mut j = i;
-            while j > 0 {
-                let (preg, pvalue, _) = writes[j - 1];
-                if (ext_base..ext_base + 4).contains(&preg) {
-                    ext_rev.push(pvalue as u8);
-                    j -= 1;
-                } else {
-                    break;
+            // `_rtl8723e_fill_h2c_command`: BIT(7) marks a 4/5-byte
+            // command whose first two bytes were written to the two-byte
+            // extension register `0x88 + 2 * box` just before the box.
+            let boxnum = (reg - 0x01d0) / 4;
+            let ext_base = 0x0088u16 + boxnum * 2;
+            let mut payload = Vec::new();
+            if value & 0x80 != 0 && i >= 2 {
+                for (preg, pvalue, _) in &writes[i - 2..i] {
+                    if (ext_base..ext_base + 2).contains(preg) {
+                        payload.push(*pvalue as u8);
+                    }
                 }
             }
-            ext_rev.reverse();
-            let mut payload = Vec::new();
             for t in 1..4 {
                 if i + t < writes.len() {
                     payload.push(writes[i + t].1 as u8);
                 }
             }
-            payload.extend_from_slice(&ext_rev);
-            fills.push((value as u8, payload));
+            fills.push(((value & 0x7f) as u8, payload));
             i += 4;
         } else {
             i += 1;

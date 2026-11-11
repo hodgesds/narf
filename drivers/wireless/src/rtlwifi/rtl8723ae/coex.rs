@@ -108,8 +108,9 @@ pub const H2C_BALANCE: u8 = 0x0c;
 pub const REG_HMETFR: u16 = 0x01cc;
 /// First H2C box register.
 pub const REG_HMEBOX_0: u16 = 0x01d0;
-/// First H2C box-extension register.
-pub const REG_HMEBOX_EXT_0: u16 = 0x01f0;
+/// First H2C box-extension register (`rtl8723ae/reg.h`: `REG_HMEBOX_EXT_0..3`
+/// at `0x88`, `0x8a`, `0x8c`, `0x8e`, two bytes each).
+pub const REG_HMEBOX_EXT_0: u16 = 0x0088;
 /// HMETFR free-box poll bound, mirroring `rtl8723be/h2c.rs`.
 const HMETFR_CHECKS: u32 = 100;
 
@@ -618,7 +619,8 @@ impl Owner {
         id: u8,
         payload: &[u8],
     ) -> Result<(), Error> {
-        if payload.is_empty() || payload.len() > 7 {
+        // `_rtl8723e_fill_h2c_command` handles 1..=5 command bytes.
+        if payload.is_empty() || payload.len() > 5 {
             return Err(Error::State);
         }
         let boxnum = self.h2c_next;
@@ -640,17 +642,21 @@ impl Owner {
             return Err(Error::CommandTimeout);
         }
         let base = REG_HMEBOX_0 + u16::from(boxnum) * 4;
+        // `rtl8723ae/fw.c::_rtl8723e_fill_h2c_command`: up to three bytes
+        // go in the box with BIT(7) clear; four or five bytes set BIT(7),
+        // put the first two in the two-byte extension register (written
+        // first) and the rest in the box.
         let mut content = [0u8; 4];
         content[0] = id;
         if payload.len() > 3 {
-            let ext_base = REG_HMEBOX_EXT_0 + u16::from(boxnum) * 4;
-            let mut ext = [0u8; 4];
-            ext[..payload.len() - 3].copy_from_slice(&payload[3..]);
-            for (i, b) in ext.iter().enumerate() {
+            content[0] |= 1 << 7;
+            let ext_base = REG_HMEBOX_EXT_0 + u16::from(boxnum) * 2;
+            for (i, b) in payload[..2].iter().enumerate() {
                 io.write8(ext_base + i as u16, *b)?;
             }
-            content[1..4].copy_from_slice(&payload[..3]);
+            content[1..1 + payload.len() - 2].copy_from_slice(&payload[2..]);
         } else {
+            content[0] &= !(1 << 7);
             content[1..1 + payload.len()].copy_from_slice(payload);
         }
         for (i, b) in content.iter().enumerate() {

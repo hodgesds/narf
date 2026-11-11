@@ -3436,7 +3436,12 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   corner (`rtl8723e_dm_bt_set_sw_rf_rx_lpf_corner`) writes RF `0x1e =
   0xf0ff7` on shrink and restores the captured origin on resume.
   Deliberate deviation: resume before the first init (Linux would write
-  the zero-initialised origin) is skipped. Tests
+  the zero-initialised origin) is skipped. The owner's H2C mailbox
+  (`Owner::h2c_fill`) is `_rtl8723e_fill_h2c_command`: 1–3-byte commands
+  in the box with id BIT(7) clear; 4–5-byte commands (the `0x3a` PS-TDMA
+  row) set BIT(7) and write their first two bytes to the two-byte
+  `REG_HMEBOX_EXT_n` (`0x88 + 2n`) before the box (the earlier port used
+  the 8821AE `0x1f0` four-byte layout). Tests
   `smoke_rtl8723ae_coex_dm_registers`, `smoke_rtl8723ae_dm_mech_init_and_query`,
   `smoke_rtl8723ae_dm_all_off_sequences` (written, unexecuted). The
   1-ant path is a Linux stub, ported as a no-op. The coex owner is still
