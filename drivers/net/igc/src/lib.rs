@@ -24,6 +24,8 @@ mod counters;
 #[cfg_attr(feature = "module", allow(dead_code))]
 mod hardware;
 #[cfg(feature = "builtin")]
+mod irq_tests;
+#[cfg(feature = "builtin")]
 mod merge;
 #[cfg(feature = "builtin")]
 mod packet;
@@ -33,8 +35,6 @@ mod protocol;
 mod ptp;
 #[cfg(feature = "builtin")]
 mod queue;
-#[cfg(feature = "builtin")]
-mod irq_tests;
 #[cfg(feature = "builtin")]
 mod tests;
 #[cfg(feature = "builtin")]
