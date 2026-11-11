@@ -437,7 +437,7 @@ fn smoke_nl80211_wpa_supplicant_connect_while_connected_is_ealready() -> TestRes
     // Malformed requests keep their own errno ahead of the state check.
     let mut bad = wire.clone();
     push_attr(&mut bad, 66, &3u32.to_ne_bytes()); // USE_MFP out of range
-    if parse(&bad, connected) != Err(ERANGE) {
+    if parse(&bad, connected).err() != Some(ERANGE) {
         return TestResult::Fail("connected state masked an invalid CONNECT");
     }
     TestResult::Pass
