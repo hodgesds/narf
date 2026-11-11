@@ -1186,11 +1186,22 @@ fn display_planes(
     // A tiled or 4:2:0 primary always goes to DC as a placed plane (its
     // surface is its whole framebuffer); a linear client one shown whole
     // is the full-frame primary still.
+    // On DCN 3.0 (Navi22) a primary alone is the bottom plane, blended
+    // over the black background: "pixel blend mode" None leaves its pixels
+    // as Pre-multiplied does (dcn20_update_mpcc), so an ARGB8888 primary
+    // with None is the same full-frame primary, not a placed plane with
+    // an identity placement and a DML plan of its own at every check.
+    let opaque = Blend {
+        per_pixel_alpha: false,
+        ..Blend::default_for(format)
+    };
+    let plain_blend = g.blend == Blend::default_for(format)
+        || (is_dcn30(card) && overlays.is_empty() && g.blend == opaque);
     let full = !PlaneGeometry { client: false, ..g }.whole_framebuffer(format)
         && (g.src_x, g.src_y, g.width, g.height) == (0, 0, mode.0, mode.1)
         && g.dst == Rect::new(0, 0, mode.0 as i32, mode.1 as i32)
         && g.rotation == Rotation::R0
-        && g.blend == Blend::default_for(format);
+        && plain_blend;
     // What should_reset_plane compares, with each plane's normalized zpos.
     let drm = |p: &PlaneState| -> Result<DrmPlaneState, FsError> {
         let fb = card
@@ -3184,6 +3195,61 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/drm",
         drm_native_planes_fb_shown_follows_the_planes
+    );
+
+    /// A full-screen ARGB8888 primary with "pixel blend mode" None is the
+    /// plain full-frame primary on DCN 3.0, as with Pre-multiplied: alone
+    /// on its CRTC it is the bottom plane over the black background, where
+    /// both leave its pixels as they are (dcn20_update_mpcc). It takes no
+    /// placement, so the display plans nothing for it and its frames take
+    /// the full-frame present path. Coverage is a placed plane still (the
+    /// display refuses it), and DCN 4.0.1 keeps None as a placed plane:
+    /// its display programs that blend.
+    fn drm_native_planes_dcn30_opaque_argb_primary_is_full_frame() -> TestResult {
+        let (mut card, _) = dcn30_card();
+        let argb = {
+            let handle = card.gem.alloc(0x3800_0000, 1920 * 1080 * 4).unwrap();
+            card.addfb2(1920, 1080, AR24, 1920 * 4, handle).unwrap()
+        };
+        let request = |card: &Card, zpos: u8, blend: u8| {
+            let mut p = on(
+                PRIMARY_PLANE_ID_BASE,
+                argb,
+                (1920, 1080),
+                (0, 0, 1920, 1080),
+            );
+            p.props = Some(PlaneProps {
+                blend,
+                ..PlaneProps::new(zpos)
+            });
+            let mut state = AtomicState::default();
+            state.planes.push(p);
+            check(card, &state, dcn30_mode)
+        };
+        for blend in [PlaneProps::PREMULTI, PlaneProps::PIXEL_NONE] {
+            match request(&card, DCN30_PRIMARY_ZPOS, blend) {
+                Ok(out)
+                    if out.len() == 1
+                        && out[0].setup.is_full_frame()
+                        && out[0].primary_placement().is_none() => {}
+                _ => return TestResult::Fail("opaque ARGB primary is not the full-frame primary"),
+            }
+        }
+        match request(&card, DCN30_PRIMARY_ZPOS, PlaneProps::COVERAGE) {
+            Ok(out) if out.len() == 1 && out[0].setup.primary.is_some() => {}
+            _ => return TestResult::Fail("Coverage primary not handed over as a placed plane"),
+        }
+        // The same request on DCN 4.0.1's planes.
+        card.native_planes = planes_for(&[], &[1, 2]);
+        match request(&card, PRIMARY_ZPOS, PlaneProps::PIXEL_NONE) {
+            Ok(out) if out.len() == 1 && out[0].setup.primary.is_some() => {}
+            _ => return TestResult::Fail("DCN401 lost the None-blended primary's placement"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_dcn30_opaque_argb_primary_is_full_frame
     );
 
     /// Commit/displays round-trip on DCN30: every enabled CRTC's display
