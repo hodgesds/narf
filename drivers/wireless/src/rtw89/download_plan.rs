@@ -39,7 +39,11 @@ pub struct DownloadPlan {
     secure: bool,
     header: Vec<u8>,
     sections: Vec<Section>,
+    part_size: usize,
 }
+/// Largest BE part size a CH12 packet can carry: the 24-byte FWCMD
+/// descriptor's 14-bit `RPKT_LEN` (`fwcmd_8922a::fwcmd_txdesc`).
+const BE_MAX_PART_SIZE: usize = 0x3fff;
 impl DownloadPlan {
     pub fn new(
         image: PreparedFirmware,
@@ -51,6 +55,26 @@ impl DownloadPlan {
         }
         let version = image.header().version;
         let base = if version == 0 { 32 } else { 48 };
+        // fw.c:465 `rtw89_fw_hdr_parser_v1`: AX always segments by
+        // FWDL_SECTION_PER_PKT_LEN; BE takes FW_HDR_V1_W7_PART_SIZE
+        // (GENMASK(15, 0)) from the image header. BE images are v1.
+        let part_size = if image.chip() == ChipId::Rtl8922A {
+            if version != 1 {
+                return Err(Error::SectionGeometry);
+            }
+            let w7 = u32::from_le_bytes(
+                image.image()[28..32]
+                    .try_into()
+                    .map_err(|_| Error::SectionGeometry)?,
+            );
+            let part = (w7 & 0xffff) as usize;
+            if part == 0 || part > BE_MAX_PART_SIZE {
+                return Err(Error::SectionGeometry);
+            }
+            part
+        } else {
+            FWDL_SECTION_PER_PKT_LEN
+        };
         let mut header = Vec::new();
         header
             .try_reserve_exact(base + 16 * image.sections().len())
@@ -104,7 +128,7 @@ impl DownloadPlan {
                 continue;
             }
             if let Some(range) = &signature {
-                if len > FWDL_SECTION_PER_PKT_LEN || len < range.len() {
+                if len > part_size || len < range.len() {
                     return Err(Error::SectionGeometry);
                 }
             }
@@ -141,12 +165,15 @@ impl DownloadPlan {
                 .try_into()
                 .map_err(|_| Error::SectionGeometry)?,
         );
-        header[28..32].copy_from_slice(&((part & !0xffff) | 2020).to_le_bytes());
+        // `__rtw89_fw_download_tweak_hdr_v{0,1}` writes `part_size`
+        // back (a no-op on BE, where it came from this field).
+        header[28..32].copy_from_slice(&((part & !0xffff) | part_size as u32).to_le_bytes());
         Ok(Self {
             image,
             secure: fuses.enabled(),
             header,
             sections,
+            part_size,
         })
     }
     pub fn chip(&self) -> ChipId {
@@ -162,6 +189,11 @@ impl DownloadPlan {
     pub fn idmem_share_mode(&self) -> u8 {
         let word = u32::from_le_bytes(self.header[28..32].try_into().unwrap());
         ((word >> 18) & 15) as u8
+    }
+    /// Bytes per section packet: 2020 on AX, the header's
+    /// `FW_HDR_V1_W7_PART_SIZE` on BE.
+    pub fn part_size(&self) -> usize {
+        self.part_size
     }
     pub fn section_count(&self) -> usize {
         self.sections.len()
@@ -185,14 +217,14 @@ impl DownloadPlan {
         output.extend_from_slice(&self.header);
         Ok(output)
     }
-    /// Copy one raw2020-byte-aligned section chunk. Security replacement is
+    /// Copy one raw `part_size`-aligned section chunk. Security replacement is
     /// applied only to owned output; the verified image is never mutated.
     pub fn chunk(&self, index: usize, offset: usize) -> Result<Vec<u8>, Error> {
         let section = self.sections.get(index).ok_or(Error::SectionGeometry)?;
-        if offset >= section.len || offset % FWDL_SECTION_PER_PKT_LEN != 0 {
+        if offset >= section.len || offset % self.part_size != 0 {
             return Err(Error::SectionGeometry);
         }
-        let end = core::cmp::min(offset + FWDL_SECTION_PER_PKT_LEN, section.len);
+        let end = core::cmp::min(offset + self.part_size, section.len);
         let mut output = Vec::new();
         output
             .try_reserve_exact(end - offset)

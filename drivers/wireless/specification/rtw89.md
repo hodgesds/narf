@@ -180,13 +180,20 @@ TXBD order; consumed FWDL header/section buffers (`pci::submit_be_fwdl`,
 RPKT type H2C for FWHDR_DL, FWDL for sections — no ack exists for them) are
 freed beyond the 8-deep `RTW89_PCI_MULTITAG` window; ack-held H2C buffers
 stay with `release_h2c_by_ack`; `program_rings` (the `rtw89_pci_ops_reset`
-point) resets the CH12 host index and releases everything. Still open for
-the download itself: the BE header `part_size` (`FW_HDR_V1_W7_PART_SIZE`;
-the plan assumes 2020), the BBMCU0 suit, and a production owner that runs
-the sequence from `pci::bring_up`.
+point) resets the CH12 host index and releases everything. The BE plan
+segments by the header's `FW_HDR_V1_W7_PART_SIZE` (`fw.c:465`; AX keeps
+2020; zero or a part the 14-bit FWCMD `RPKT_LEN` cannot carry is refused,
+and a secure single-packet section must fit it), and the BBMCU0 suit is
+the firmware element id 0 behind the MFW images
+(`PreparedFirmware::bbmcu` / `fwdl::find_bbmcu`, `fw.c:1542` +
+`__rtw89_fw_recognize_from_elm`: first element with `cv` <= cut, no AID
+filter, contents after the 32-byte header). Still open for the download
+itself: the sequence and a production owner that runs it from
+`pci::bring_up`.
 
 The plan couples v1 ignored-security descriptor compaction/count with the
-same payload selection, strips host dynamic bytes and sets part_size2020.
+same payload selection, strips host dynamic bytes and sets part_size 2020
+(AX) or keeps the header's part size (BE).
 B's secure v0 length960 override changes both descriptor and payload; ambiguous
 checksum-bearing overrides and v0 ignored-descriptor cases fail explicitly.
 Signatures replace bytes only in owned output, preserving the verified image.
