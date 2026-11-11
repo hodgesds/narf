@@ -313,10 +313,11 @@ pub(super) fn transmit_profile(
 /// `txwd_body_size` = sizeof(`rtw89_txwd_body`), the RTL8852B v0 layout,
 /// and rtw8852ae.c `rtw89_pci_fill_txaddr_info`): management, non-QoS and
 /// (under the signed RTL8852A programs) QoS data at a fixed rate or firmware
-/// RA, with HE +HTC and `DATA_ER`; no A-MSDU (no RTL8852A A-MSDU program)
-/// and no fragments. Originator A-MPDU stays refused upstream
-/// (`packet_core` admits no A aggregate program yet), so `agg` is only
-/// ever `None` here until that program lands.
+/// RA, with HE +HTC, `DATA_ER` and originator A-MPDU. A-MSDU subframes take
+/// the B v0 path (mac80211 builds the aggregate; `rtw89_core_fill_txdesc`
+/// writes no A-MSDU-specific TXWD field) under A's own `limit`, which never
+/// exceeds `rtw8852a_chip_info.max_amsdu_limit` 3500 (rtw8852a.c:2356).
+/// No fragments.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn transmit_a(
     frame: &[u8],
@@ -327,8 +328,9 @@ pub(super) fn transmit_a(
     report: bool,
     rate: u8,
     agg: Option<Agg>,
+    limit: Option<usize>,
 ) -> Result<(Vec<u8>, Queue), Error> {
-    if amsdu(frame) {
+    if limit.is_some_and(|body| body > super::tx_amsdu::MAX_BODY_A) {
         return Err(Error::Frame);
     }
     transmit_profile_inner(Tx {
@@ -341,7 +343,7 @@ pub(super) fn transmit_a(
         report,
         rate,
         agg,
-        limit: None,
+        limit,
         fragments: false,
     })
 }
@@ -498,8 +500,9 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
         ChipId::Rtl8852C if !fragments && limit.is_none() => true,
         // RTL8852A: the AX v0 body (`txwd_body_size`/`txwd_info_size` as
         // RTL8852B, `rtw8852a.c:2473..2474` @ 05441d6, pci.c
-        // `rtw89_pci_fill_txaddr_info`); no A-MSDU or fragment program.
-        ChipId::Rtl8852A if !fragments && limit.is_none() => false,
+        // `rtw89_pci_fill_txaddr_info`), A-MSDU to its 3500 ceiling
+        // (`transmit_a`); no fragment program.
+        ChipId::Rtl8852A if !fragments => false,
         // RTL8851B: the AX v0 body (`txwd_body_size`/`txwd_info_size` as
         // RTL8852B, pci.c `rtw89_pci_fill_txaddr_info`); no A-MSDU or
         // fragment program.

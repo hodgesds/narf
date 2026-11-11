@@ -334,7 +334,10 @@ pub fn prepare_header(
     prepare_header_profile(chip, info, sequence, frame_dma, frame, false, false)
 }
 /// TX A-MSDU formatting only. The caller must prove the distinct actual
-/// native RF/peer/key/size program; no other chip or +HTC form is admitted.
+/// native RF/peer/key/size program. RTL8852B and RTL8852A share the v0
+/// TXWD (rtw8852a.c/rtw8852b.c `txwd_body_size`); A's body ceiling is its
+/// own `max_amsdu_limit` (rtw8852a.c:2356), enforced by the caller. No
+/// other chip or +HTC form is admitted.
 pub(super) fn prepare_header_amsdu(
     chip: ChipId,
     info: TxwdInfo,
@@ -342,7 +345,7 @@ pub(super) fn prepare_header_amsdu(
     frame_dma: u64,
     frame: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    if chip != ChipId::Rtl8852B
+    if !matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852A)
         || frame.first() != Some(&0x88)
         || frame.get(24).is_none_or(|q| q & 0x80 == 0)
         || frame.get(1).is_some_and(|fc| fc & 0x80 != 0)
@@ -394,8 +397,8 @@ fn prepare_header_profile(
     // 8852A retained ordinary station paths admit already encrypted host
     // CCMP (no TXWD SEC fields: `sec_en` stays false, so neither the v0
     // nor the v1 body or `rtw89_build_txwd_info2_v1` FORCE_KEY_EN carries
-    // a key). RTL8852A takes the C/8851B arm: QoS data only without
-    // A-MSDU (no A A-MSDU program yet) and the same frame-shape checks.
+    // a key). RTL8852A takes B's arm, A-MSDU included (v0 TXWD); C and
+    // 8851B carry QoS data only without A-MSDU.
     if !matches!(
         fc & 0x00fc,
         0x0000
@@ -430,10 +433,10 @@ fn prepare_header_profile(
     }
     let header_length = if fc & 0xfc == 0x88 {
         // TID0..7, normal ack policy; EOSP belongs to the HE +HTC form.
-        // RTL8852A/C and RTL8851B carry QoS data only without A-MSDU (WMM
-        // program).
-        if !(chip == ChipId::Rtl8852B
-            || matches!(chip, ChipId::Rtl8852A | ChipId::Rtl8852C | ChipId::Rtl8851B) && !amsdu)
+        // RTL8852C and RTL8851B carry QoS data only without A-MSDU (WMM
+        // program); RTL8852A A-MSDU shares B's v0 path.
+        if !(matches!(chip, ChipId::Rtl8852B | ChipId::Rtl8852A)
+            || matches!(chip, ChipId::Rtl8852C | ChipId::Rtl8851B) && !amsdu)
             || frame.get(24).is_none_or(|control| {
                 control & if amsdu { 0x68 } else { 0xe8 } != 0
                     || (control & 0x10 != 0) != (fc & 0x8000 != 0)

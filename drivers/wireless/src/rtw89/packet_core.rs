@@ -500,12 +500,9 @@ impl Core {
         if self.phase != Phase::Prepared
             || self.rx < RxPhy::Ht
             || !self.aggregate
-            // No A, C or RTL8851B A-MSDU path (`transmit_a`/`transmit_c`/
-            // `transmit_51` refuse A-MSDU subframes).
-            || matches!(
-                self.chip,
-                ChipId::Rtl8852A | ChipId::Rtl8852C | ChipId::Rtl8851B
-            )
+            // No C or RTL8851B A-MSDU path (`transmit_c`/`transmit_51`
+            // refuse A-MSDU subframes); A takes B's v0 path (`transmit_a`).
+            || matches!(self.chip, ChipId::Rtl8852C | ChipId::Rtl8851B)
             || limit == 0
             || limit > ceiling
         {
@@ -697,6 +694,7 @@ impl Core {
                         radio_report,
                         rate,
                         agg,
+                        self.amsdu,
                     )?
                 } else if self.chip == ChipId::Rtl8851B {
                     format::transmit_51(
