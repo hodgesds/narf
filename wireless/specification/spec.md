@@ -2195,6 +2195,12 @@ local-teardown notifications themselves through
 Deauthentication / Disassociation), so the control bridge does not emit a
 second local-disconnect event.
 
+`rate.rs` holds cfg80211's `rate_info` bitrates in 100 kb/s
+(`ht_bitrate_100kbps`, `vht_bitrate_100kbps`, `he_bitrate_100kbps`, after
+`cfg80211_calculate_bitrate_ht/_vht/_he`). Every MCS, NSS, width, GI and RU
+index is bounds-checked and returns `None` outside the tables. ath11k and
+mt76 share them for `StationInfo` rates. Test: `wireless/rate`.
+
 ### 3.4.1 CCMP packet helpers (`ccmp.rs`)
 
 `build_aad` authenticates the three addresses, fragment number and optional

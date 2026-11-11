@@ -87,6 +87,9 @@ pub struct Mt76Iface {
     rx_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
     tx_cons: IrqSafeSpinLock<Option<Consumer<Frame, TX_RING_N>>>,
     associated_bssid: IrqSafeSpinLock<Option<[u8; 6]>>,
+    /// The station link's statistics from the latest packet step, for
+    /// NL80211_CMD_GET_STATION (`station_info`); cleared with the link.
+    link_stats: IrqSafeSpinLock<Option<crate::mt7921::link_stats::LinkStats>>,
     pending_tx: IrqSafeSpinLock<Option<Frame>>,
     control: narf_lib::mutex::Mutex<()>,
     teardown_needed: AtomicBool,
@@ -134,6 +137,7 @@ impl Mt76Iface {
             rx_prod: IrqSafeSpinLock::new(None),
             tx_cons: IrqSafeSpinLock::new(None),
             associated_bssid: IrqSafeSpinLock::new(None),
+            link_stats: IrqSafeSpinLock::new(None),
             pending_tx: IrqSafeSpinLock::new(None),
             control: narf_lib::mutex::Mutex::new(()),
             teardown_needed: AtomicBool::new(false),
@@ -366,6 +370,9 @@ impl Mt76Iface {
             }
         };
         self.refresh_receive_epoch()?;
+        if let Some(link) = step.link {
+            *self.link_stats.lock() = Some(link);
+        }
         let progress = step.transmitted || !step.received.is_empty();
         deliver_received_batch(
             step,
@@ -462,6 +469,7 @@ impl Mt76Iface {
         self.close_monitor();
         self.receive_epoch.store(0, Ordering::Release);
         *self.associated_bssid.lock() = None;
+        *self.link_stats.lock() = None;
         if !ap {
             publish_link(&self.name, false);
         }
@@ -768,6 +776,25 @@ fn note_failure(stage: &str, error: &dyn core::fmt::Debug) {
     {
         use core::fmt::Write;
         let _ = writeln!(narf_console::Writer, "mt76: {stage} failed: {error:?}");
+    }
+}
+
+/// GET_STATION's view of `link` and the netdev counters.
+fn station_info_from(
+    link: &crate::mt7921::link_stats::LinkStats,
+    counters: Option<&narf_net::iface::IfaceCounterSnapshot>,
+) -> narf_wireless::StationInfo {
+    let mut chain_signal_dbm = [None; 8];
+    chain_signal_dbm[..2].copy_from_slice(&link.chain_signal_dbm);
+    let clamp = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    narf_wireless::StationInfo {
+        signal_dbm: link.signal_dbm,
+        signal_avg_dbm: link.signal_avg_dbm(),
+        chain_signal_dbm,
+        rx_bitrate: link.rx_rate,
+        rx_packets: counters.map(|c| clamp(c.rx_packets)),
+        tx_packets: counters.map(|c| clamp(c.tx_packets)),
+        ..Default::default()
     }
 }
 
@@ -1322,6 +1349,18 @@ impl WirelessNetIface for Mt76Iface {
 
     fn supports_handshake_offload(&self) -> bool {
         true
+    }
+
+    /// mac80211 `sta_set_sinfo` for the AP: last and averaged signal and
+    /// per-chain signal of its frames, the last data-frame receive rate,
+    /// and the netdev's packet counters (the station's only traffic).
+    fn station_info(&self) -> Option<narf_wireless::StationInfo> {
+        if !self.station_role() || !self.link_up() {
+            return None;
+        }
+        let link = (*self.link_stats.lock())?;
+        let counters = narf_net::iface::lookup(&self.name).map(|iface| iface.stats);
+        Some(station_info_from(&link, counters.as_ref()))
     }
 
     /// The native owner runs WPA2-PSK with required or optional PMF (BIP
