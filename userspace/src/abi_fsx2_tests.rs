@@ -1607,9 +1607,11 @@ fn smoke_abi_fsx2_fsconfig_tmpfs_option_rejected() -> TestResult {
             Some(v) if v >= 0 => v as u64,
             _ => return Err("fsopen setup failed"),
         };
+        // `shmem_parse_one` runs inside the SET call: the unsupported policy
+        // is -EINVAL there, before any CMD_CREATE.
         let key = b"huge\0";
         let val = b"always\0";
-        if call(
+        match call(
             Syscall::Fsconfig.raw(),
             SyscallArgs {
                 arg0: fd,
@@ -1618,24 +1620,69 @@ fn smoke_abi_fsx2_fsconfig_tmpfs_option_rejected() -> TestResult {
                 arg3: val.as_ptr() as u64,
                 ..Default::default()
             },
-        ) != Some(0)
-        {
-            return Err("fsconfig(SET_STRING) setup failed");
-        }
-        match call(
-            Syscall::Fsconfig.raw(),
-            SyscallArgs {
-                arg0: fd,
-                arg1: FSCONFIG_CMD_CREATE,
-                ..Default::default()
-            },
         ) {
             Some(v) if v == EINVAL => Ok(()),
-            _ => Err("tmpfs must reject an unsupported huge policy at CMD_CREATE"),
+            _ => Err("tmpfs must reject an unsupported huge policy when it is set"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_tmpfs_option_rejected);
+
+/// systemd's `mount_option_supported("tmpfs", "usrquota", NULL)`, call for
+/// call (src/basic/mountpoint-util.c): a nonsense key must fail with
+/// -EINVAL under both FSCONFIG_SET_FD and FSCONFIG_SET_FLAG — Linux parses
+/// each parameter as it is set (`vfs_parse_fs_param` -> `shmem_parse_one`
+/// -> -ENOPARAM -> "Unknown parameter") — and only then is the real key
+/// tried, where 0 means "supported". NARF stored every key and returned 0,
+/// so systemd logged "Unable to determine whether tmpfs supports 'usrquota'
+/// mount option, assuming not: Resource temporarily unavailable".
+fn smoke_abi_fsx2_fsconfig_tmpfs_unknown_param_einval() -> TestResult {
+    with_setup(|| {
+        const FSCONFIG_SET_FLAG: u64 = 0;
+        const FSCONFIG_SET_FD: u64 = 5;
+        let fsname = b"tmpfs\0";
+        let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsopen setup failed"),
+        };
+        let bogus = b"adefinitelynotexistingmountoption\0";
+        let set = |cmd: u64, key: &[u8], aux: u64| {
+            call(
+                Syscall::Fsconfig.raw(),
+                SyscallArgs {
+                    arg0: fd,
+                    arg1: cmd,
+                    arg2: key.as_ptr() as u64,
+                    arg3: 0,
+                    arg4: aux,
+                    ..Default::default()
+                },
+            )
+        };
+        let result = (|| {
+            if set(FSCONFIG_SET_FD, bogus, fd) != Some(EINVAL) {
+                return Err("fsconfig(SET_FD) of an unknown tmpfs parameter must be EINVAL");
+            }
+            if set(FSCONFIG_SET_FLAG, bogus, 0) != Some(EINVAL) {
+                return Err("fsconfig(SET_FLAG) of an unknown tmpfs parameter must be EINVAL");
+            }
+            if set(FSCONFIG_SET_FLAG, b"usrquota\0", 0) != Some(0) {
+                return Err("fsconfig(SET_FLAG, \"usrquota\") on tmpfs must succeed");
+            }
+            // A known key with a missing value is a bad value, not a flag.
+            if set(FSCONFIG_SET_FLAG, b"size\0", 0) != Some(EINVAL) {
+                return Err("fsconfig(SET_FLAG, \"size\") without a value must be EINVAL");
+            }
+            Ok(())
+        })();
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_fsconfig_tmpfs_unknown_param_einval
+);
 
 // ── move_mount: a relative target resolves against to_dfd ─────────────
 //
