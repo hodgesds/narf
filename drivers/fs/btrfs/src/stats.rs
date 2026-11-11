@@ -345,3 +345,26 @@ impl CommitStats {
         }
     }
 }
+
+/// Where each step but the last of the most recent stepped truncate left
+/// off ([`take_step_marks`]).
+static STEP_MARKS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u64>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// A stepped operation starts: forget the marks of the one before.
+pub(crate) fn begin_step_marks() {
+    STEP_MARKS.lock().clear();
+}
+
+/// A step that is not the operation's last is staged, leaving off at `at`:
+/// for a truncate, the size it wrote.
+pub(crate) fn note_step_mark(at: u64) {
+    STEP_MARKS.lock().push(at);
+}
+
+/// The marks of the most recent stepped operation, in the order its steps
+/// were staged: the states a crash can leave between two of its steps, for
+/// a harness's crash model. Empty for an operation that took one step.
+pub fn take_step_marks() -> alloc::vec::Vec<u64> {
+    core::mem::take(&mut *STEP_MARKS.lock())
+}

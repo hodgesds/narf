@@ -499,8 +499,6 @@ fn crash_case(
         .map(|&gen| CommitRec {
             gen,
             candidates: states.clone(),
-            // Every state a step can leave is listed above, exactly.
-            shrinking: None,
         })
         .collect();
     let rep = crash::run(

@@ -533,10 +533,13 @@ pub async fn truncate_file<B: BlockDevice + 'static>(
     new_size: u64,
 ) -> Result<(), FsError> {
     let ss = u64::from(vol.sectorsize());
-    for (size, drop_from) in truncate_steps(vol, ino, new_size)
-        .await?
+    crate::stats::begin_step_marks();
+    let steps = truncate_steps(vol, ino, new_size).await?;
+    let last = steps.len();
+    for (index, (size, drop_from)) in steps
         .into_iter()
         .chain([(new_size, align_up(new_size, ss))])
+        .enumerate()
     {
         let r = {
             let _hold = vol.hold_commits();
@@ -544,6 +547,9 @@ pub async fn truncate_file<B: BlockDevice + 'static>(
         };
         flush_if_full(vol).await?;
         r?;
+        if index < last {
+            crate::stats::note_step_mark(size);
+        }
         super::dealloc_step_done(vol).await?;
     }
     Ok(())
