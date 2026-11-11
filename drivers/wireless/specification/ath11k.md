@@ -2178,6 +2178,29 @@ the status ring filter (`MONITOR_MODE_STATUS_FILTER`; reset restores
 `ath11k_mac_mon_status_filter_default`). `mon_status_default_msgs_for`
 configures the calling pdev's status rings (the pdev-0-only variant
 remains for single-pdev callers).
+Monitor vdev and interface: `MacConfig::supports_monitor` mirrors
+`hw_params.supports_monitor` (IPQ8074, IPQ6018, QCN9074). With iftype
+`NL80211_IFTYPE_MONITOR` (6) the netdev switches its link layer to radiotap
+(`narf_net::iface::set_link_layer`), accepts only the default monitor flags
+and a receive-only channel while down (`set_monitor_channel` →
+`Mac::monitor_chandef`, `cfg80211_chandef_usable(.., DISABLED)`), and
+refuses scans. Admin-UP runs `Mac::add_monitor_interface`
+(`ath11k_mac_op_add_interface` for the WANT_MONITOR_VIF virtual monitor:
+VDEV_CREATE type MONITOR, encap/decap, NSS, RTS, DP attach; then
+`assign_vif_chanctx` → `ath11k_mac_monitor_start` →
+`ath11k_mac_monitor_vdev_start`: VDEV_START synchronized on its response,
+VDEV_UP aid 0 with the radio address, a failed UP stops the vdev, then
+`DataPort::monitor_mode(true)`). The runtime's `Port::monitor_mode` sets
+the pdev's `ATH11K_FLAG_MONITOR_STARTED`, routes that pdev's `MonRxFrame`s
+to the vdev (`Rt::monitor_vdevs`, `VdevRuntime::monitor_rx`) and sends
+`monitor_mode_ring_config_msgs`. The netdev's service pass encodes each
+frame with `narf_wireless::monitor::encode` (the frame's channel, else the
+monitor channel = `ar->rx_channel`) and publishes it through the
+generation-bound `narf_net::iface::begin_monitor_rx` /
+`on_monitor_frame_from` token. Admin-DOWN closes the token, then
+`remove_interface` runs `ath11k_mac_monitor_stop` (VDEV_STOP synchronized,
+VDEV_DOWN, `monitor_mode(false)`) before VDEV_DELETE. Smoke:
+`smoke_ath11k_mac_monitor_vdev_sequence` (written, unexecuted).
 Fixture smokes: `dp_mon_tests.rs` (written, unexecuted).
 
 ## 4. Invariants
