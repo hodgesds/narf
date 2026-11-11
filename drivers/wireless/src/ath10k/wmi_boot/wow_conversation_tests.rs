@@ -8,7 +8,7 @@ use core::future::Future;
 use narf_wireless::{WowlanConfig, WowlanPattern};
 
 fn harness(wow: bool) -> Harness {
-    Harness::new_on_firmware(
+    let h = Harness::new_on_firmware(
         4,
         Dialect::Tlv,
         true,
@@ -29,7 +29,12 @@ fn harness(wow: bool) -> Harness {
             hardware_keys: true,
             nlo: false,
         },
-    )
+    );
+    // `hardware_keys` is Linux `cryptmode=0`: the station installs its
+    // PTK/GTK with WMI_VDEV_INSTALL_KEY (mac.c ath10k_install_key), so the
+    // model firmware keeps the hardware key cache that answers it.
+    h.model(|m| m.data.as_mut().unwrap().hw = Some(Box::new(HwKeyCache::default())));
+    h
 }
 /// Poll the holder task and the caller's future with one noop waker, as the
 /// executor would interleave them.
