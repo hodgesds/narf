@@ -2316,7 +2316,12 @@ struct SchedulerTelemetry {
     staged_tick_pass: AtomicU64,
     /// Staged wakes this CPU pulled from other CPUs as an idle thief.
     staged_pulls: AtomicU64,
-    _pad: [u8; 16],
+    /// Back-off state of this CPU's idle-balance kick during one stall: the
+    /// number of entries staged at the last stalled tick in the high half,
+    /// stalled ticks since that number last changed in the low half (see
+    /// [`staged_kick_backoff`]). Owner-only, written from its tick.
+    staged_kick: AtomicU64,
+    _pad: [u8; 8],
 }
 
 impl SchedulerTelemetry {
@@ -2328,7 +2333,8 @@ impl SchedulerTelemetry {
             sched_passes: AtomicU64::new(0),
             staged_tick_pass: AtomicU64::new(0),
             staged_pulls: AtomicU64::new(0),
-            _pad: [0; 16],
+            staged_kick: AtomicU64::new(0),
+            _pad: [0; 8],
         }
     }
 }
@@ -2512,16 +2518,39 @@ pub(crate) fn resched_remote_force(target_cpu: u32) {
 /// halted CPU with nothing queued may not run one for a long time. So the CPU
 /// that is holding the wakes speaks up: when its tick finds wakes staged and
 /// its executor has passed no scheduling point since the previous tick that
-/// found the same, it sends one reschedule kick to a halted online CPU. The
-/// kick carries no task; the woken CPU's ordinary steal pass decides what, if
-/// anything, it may take. A CPU making progress (its pass counter moves
-/// between ticks) drains its own inbox and never kicks.
+/// found the same, it sends one reschedule kick to a halted CPU that could run
+/// one of them. The kick carries no task; the woken CPU's ordinary steal pass
+/// decides what, if anything, it may take. A CPU making progress (its pass
+/// counter moves between ticks) drains its own inbox and never kicks.
 ///
-/// Runs in the tick's hard-IRQ context on the busy CPU, so it only loads this
-/// CPU's own inbox gauges and pass counter until it has decided to kick; then
-/// it reads other CPUs' halted flags. No lock is taken. A CPU with interrupts
-/// masked takes no tick and sends no kick; idle CPUs' own periodic passes are
-/// the only cover for that case.
+/// The kick is aimed and rationed, as Linux's is (`find_new_ilb` picks from
+/// the idle housekeeping CPUs, and `NOHZ_BALANCE_KICK` keeps a pending kick
+/// from being repeated):
+///
+/// - The target must be allowed to run at least one of the staged tasks
+///   ([`staged_pull_mask`]); if no other CPU is, nothing is sent. Wakes pinned
+///   to this CPU, and nodes whose task has gone back to sleep, kick nobody.
+/// - The target must be schedulable: online, halted, and `Active`/`Idle`. A
+///   logically offlined CPU also publishes itself halted and stays in the
+///   online bitmap, but it parks without running a steal pass.
+/// - A target whose `NEED_RESCHED` is still set has a kick (or a wake) on its
+///   way that it has not consumed yet; it is not kicked again.
+/// - Within one stall the kick backs off ([`staged_kick_backoff`]): stalled
+///   ticks 1, 2, 4, 8, … send, and a change in the number of staged entries
+///   starts over. A thief that came and could take nothing (the task was
+///   cache-hot, throttled, or refused by the steal strategy) is therefore not
+///   woken again every tick for as long as the stall lasts.
+///
+/// A kicked CPU consumes `NEED_RESCHED` at its next halt commit, so one kick
+/// gives it two looks at the staged work: one on waking and one before it
+/// halts again.
+///
+/// Runs in the tick's hard-IRQ context on the busy CPU. Until a kick is due it
+/// loads only this CPU's own gauges and counters. A due kick reads this CPU's
+/// staged entries under `try_lock`s — the tick cannot have interrupted a
+/// holder on its own CPU, since those locks mask interrupts — and then other
+/// CPUs' halted flags and states. A CPU with interrupts masked takes no tick
+/// and sends no kick; idle CPUs' own periodic passes cover that case.
 pub(crate) fn kick_idle_balance_from_tick() {
     let cpu = narf_lib::percpu::current_cpu();
     if cpu >= narf_lib::percpu::MAX_CPUS || !wake_list_pending(cpu) {
@@ -2529,15 +2558,109 @@ pub(crate) fn kick_idle_balance_from_tick() {
     }
     let telemetry = &SCHEDULER_TELEMETRY[cpu];
     let passes = telemetry.sched_passes.load(Ordering::Relaxed);
-    if !staged_wakes_stalled(&telemetry.staged_tick_pass, passes)
-        || !STEAL_ENABLED.load(Ordering::Acquire)
-    {
+    if !staged_wakes_stalled(&telemetry.staged_tick_pass, passes) {
+        // First sighting at this pass count: if a stall follows, it is new.
+        telemetry.staged_kick.store(0, Ordering::Relaxed);
         return;
     }
-    let halted = |target: usize| CPU_HALTED[target].load(Ordering::Relaxed);
-    if let Some(target) = idle_balance_kick_target(cpu, narf_lib::smp::online_bitmap(), halted) {
+    if !STEAL_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let staged = WAKE_INBOX_LEN[cpu]
+        .load(Ordering::Relaxed)
+        .saturating_add(PARKED_WAKE_INBOX[cpu].len.load(Ordering::Relaxed));
+    let (state, due) = staged_kick_backoff(
+        telemetry.staged_kick.load(Ordering::Relaxed),
+        staged.min(u32::MAX as usize) as u32,
+    );
+    telemetry.staged_kick.store(state, Ordering::Relaxed);
+    if !due {
+        return;
+    }
+    let candidates = staged_pull_mask(cpu) & narf_lib::smp::online_bitmap();
+    if candidates == 0 {
+        return;
+    }
+    let ready = |target: usize| {
+        CPU_HALTED[target].load(Ordering::Relaxed)
+            && !NEED_RESCHED[target].load(Ordering::Relaxed)
+            && matches!(
+                policy::cpu_state(CpuId(target as u32)),
+                CpuState::Active | CpuState::Idle
+            )
+    };
+    if let Some(target) = idle_balance_kick_target(cpu, candidates, ready) {
         resched_remote(target);
     }
+}
+
+/// Advance the kick's back-off for one more stalled tick that found `staged`
+/// entries, and say whether this tick sends.
+///
+/// `state` packs the entry count seen at the previous stalled tick (high half)
+/// and the stalled ticks since it last changed (low half); zero is a fresh
+/// stall. Ticks 1, 2, 4, 8, … of an unchanged count send. A changed count —
+/// something new was staged, or a thief took something — restarts at 1, so new
+/// work is advertised at once while a set nobody could take is advertised
+/// only logarithmically often.
+#[inline]
+fn staged_kick_backoff(state: u64, staged: u32) -> (u64, bool) {
+    let seen = (state >> 32) as u32;
+    let ticks = state as u32;
+    let ticks = if seen == staged {
+        ticks.saturating_add(1)
+    } else {
+        1
+    };
+    (
+        (u64::from(staged) << 32) | u64::from(ticks),
+        ticks.is_power_of_two(),
+    )
+}
+
+/// CPUs other than `cpu` that may run at least one of the wakes staged on
+/// `cpu`: the union of the hard affinity masks of its staged, runnable tasks,
+/// looking at up to [`STAGED_STEAL_SCAN`] entries in each holding place.
+///
+/// For the tick-side kick on `cpu` itself, so everything is `try_lock`: a lock
+/// that another CPU holds this instant just contributes nothing this tick.
+/// User tasks count only when they may run off their boot CPU, mirroring
+/// `StealStrategy::allow_steal`. Cache-hot and throttled tasks are not
+/// filtered here; the thief judges those, and the back-off absorbs a kick
+/// that finds nothing to take. Under the gate this only reads: the token, the
+/// parked slot it names, and that slot's flags and mask.
+fn staged_pull_mask(cpu: usize) -> u64 {
+    let user_smp = user_task_smp_enabled();
+    let mut mask = 0u64;
+    let mut consider = |slot: &TaskSlot| {
+        if slot.awake.executor_runnable() && (user_smp || slot.addr_space.is_none()) {
+            mask |= slot.spec.affinity.allowed.bits();
+        }
+    };
+    if let Some(inbox) = WAKE_INBOX[cpu].try_lock() {
+        for (slot, _) in inbox.iter().take(STAGED_STEAL_SCAN) {
+            consider(slot);
+        }
+    }
+    if let Some(parked) = PARKED[cpu].try_lock() {
+        let inbox = &PARKED_WAKE_INBOX[cpu];
+        if let (Some(slots), Some(_gate)) = (parked.as_ref(), inbox.gate.try_lock()) {
+            let mut node = inbox.head.load(Ordering::Relaxed);
+            for _ in 0..STAGED_STEAL_SCAN {
+                if node.is_null() {
+                    break;
+                }
+                // SAFETY: linked under the gate, hence kept alive by the
+                // inbox's reference; links change only under the gate.
+                let cell = unsafe { &*node };
+                if let Some((_, entry)) = slots.for_cell(cpu, cell) {
+                    consider(&entry.slot);
+                }
+                node = cell.wake_next.load(Ordering::Relaxed);
+            }
+        }
+    }
+    mask & !(1u64 << cpu)
 }
 
 /// Whether a tick that found wakes staged has seen this scheduling-pass count
