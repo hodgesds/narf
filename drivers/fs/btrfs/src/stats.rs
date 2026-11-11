@@ -346,8 +346,8 @@ impl CommitStats {
     }
 }
 
-/// Where each step but the last of the most recent stepped truncate left
-/// off ([`take_step_marks`]).
+/// Where each step but the last of the most recent stepped truncate or
+/// `fallocate` left off ([`take_step_marks`]).
 static STEP_MARKS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u64>> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
@@ -357,7 +357,8 @@ pub(crate) fn begin_step_marks() {
 }
 
 /// A step that is not the operation's last is staged, leaving off at `at`:
-/// for a truncate, the size it wrote.
+/// for a truncate the size it wrote, for a punch or a zero-range the end of
+/// what is punched, for a preallocation the end of what is allocated.
 pub(crate) fn note_step_mark(at: u64) {
     STEP_MARKS.lock().push(at);
 }

@@ -351,8 +351,35 @@ directory is still open, is evicted the same way
 checks the image with `btrfs check` before and after). An orphan that still
 has a name or directory entries is refused (`InvalidData`).
 
-Hole punching and `fallocate` still stage their whole range as one
-operation.
+`fallocate` steps the same way, from the front of its range (Linux
+`btrfs_punch_hole` → `btrfs_replace_file_extents`, which ends and restarts
+its transaction whenever `btrfs_drop_extents` runs out of its one-item
+reserve; `btrfs_fallocate` → `btrfs_prealloc_file_range`, one extent a
+transaction). A punch drops at most 16 extent items a step, puts a hole item
+in their place where the filesystem has no `NO_HOLES` (growing the one the
+step before left) and takes their bytes off `nbytes`; the partial sectors at
+either edge are zeroed with the first step. A preallocation lays down at
+most 16 PREALLOC extents a step over what nothing covers and, without
+`FALLOC_FL_KEEP_SIZE`, moves the size up to where the step reached
+(`__btrfs_prealloc_file_range` writes `i_size` forward after each extent).
+Its data space is checked against the free DATA space before the first step
+(Linux reserves it up front, `btrfs_alloc_data_chunk_ondemand`), so a request
+that cannot fit fails before anything changes, through the usual commit, grow
+and retry. A zero-range punches a step's stretch (at most 16 items and 128
+MiB) and preallocates the same stretch before the step ends, as
+`btrfs_replace_file_extents` inserts the replacement for what it dropped
+before it ends a transaction; it never returns success while a stretch it
+punched is still a hole (an allocation that fails ends the call with the
+error, and the retry after the filesystem grows starts over). So a crash in the middle leaves a punch or a zero-range done up
+to a step boundary — zeros from the start of the range to there, the old data
+after, the size untouched — and a preallocation done up to one, never
+anything outside the requested bytes changed; an operation of one step is one
+transaction. Each step but the last records where it left off
+(`stats::take_step_marks`), which is how the harness's crash model knows the
+states a step boundary may leave: only for an operation that took more than
+one step, only those. `write::set_dealloc_step_sync` commits every step on
+its own, for the crash tests of the `release` scenario
+(`smoke_btrfs_fallocate_reserves_in_steps`).
 
 An `ORPHAN_ITEM` whose inode still has links, or no longer exists, marks
 no inode to reclaim. Recovery does with it what Linux `btrfs_orphan_cleanup`

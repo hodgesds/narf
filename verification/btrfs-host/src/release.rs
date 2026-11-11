@@ -40,6 +40,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use narf_drivers_fs_btrfs::stats;
+use narf_drivers_fs_btrfs::write::{
+    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE,
+};
 use narf_filesystem::{DirOps, FileOps, FsError, FsInstance};
 
 use crate::dev::RecDev;
@@ -144,22 +147,78 @@ struct Row {
     /// The most tree blocks one staged operation reserved for its extents.
     reserved: u64,
     seconds: f64,
+    /// Steps the operation takes (extent items over the step size).
+    steps: u64,
+    /// Device writes, tree nodes written and commits, the closing fsync's
+    /// commit included.
+    device_writes: u64,
+    tree_written: u64,
+    commits: u64,
 }
 
 /// Run `op` (which ends by committing), recording what it did to the
-/// filesystem's METADATA chunks and what its steps reserved.
-fn measure(img: &Path, what: String, op: impl FnOnce() -> Result<(), FsError>) -> Row {
+/// filesystem's METADATA chunks, what its steps reserved and what it wrote.
+fn measure(
+    img: &Path,
+    dev: &RecDev,
+    what: String,
+    items: usize,
+    op: impl FnOnce() -> Result<(), FsError>,
+) -> Row {
     let before = linux::chunk_counts(img).1;
     stats::reset_max_op_reservation();
+    let (totals, writes) = (stats::totals(), dev.writes());
     let started = Instant::now();
     let result = op();
+    let seconds = started.elapsed().as_secs_f64();
+    let cost = stats::totals().since(&totals);
     Row {
         what,
         result,
         chunks: (before, linux::chunk_counts(img).1),
         reserved: stats::max_op_reservation(),
-        seconds: started.elapsed().as_secs_f64(),
+        seconds,
+        steps: items.div_ceil(STEP).max(1) as u64,
+        device_writes: dev.writes() - writes,
+        tree_written: cost.written.total(),
+        commits: cost.commits,
     }
+}
+
+/// Create `name` from `count` page-sized writes a page apart: `count`
+/// extents with a hole after each.
+fn build_strided(
+    dir: &Arc<dyn DirOps>,
+    name: &str,
+    count: usize,
+) -> Result<Arc<dyn FileOps>, String> {
+    block_on(async {
+        let file = dir.create(name).await.map_err(err("create"))?;
+        for i in 0..count {
+            let body = noise(0x5eed ^ (i as u64) << 20 ^ count as u64, PAGE);
+            write_all(&file, (2 * i * PAGE) as u64, &body).await?;
+        }
+        file.fsync(false).await.map_err(err("fsync"))?;
+        Ok(file)
+    })
+}
+
+/// Whether `[at, at + len)` of `file` reads as zeros, checked a page at a
+/// time with a stride (the whole of a large file would take long).
+fn reads_zero(file: &Arc<dyn FileOps>, at: u64, len: u64) -> Result<bool, String> {
+    block_on(async {
+        let mut page = vec![0u8; PAGE];
+        let stride = (len / 2048).max(PAGE as u64) / PAGE as u64 * PAGE as u64;
+        let mut off = at;
+        while off < at + len {
+            let n = file.read(off, &mut page).await.map_err(err("read"))?;
+            if page[..n].iter().any(|&b| b != 0) {
+                return Ok(false);
+            }
+            off += stride;
+        }
+        Ok(true)
+    })
 }
 
 /// `ORPHAN_ITEM`s in subvolume tree `id`.
@@ -181,15 +240,19 @@ fn orphan_items(img: &Path, id: u64) -> Result<usize, String> {
         .count())
 }
 
+/// What a file must hold after an `fallocate` row: (row, file, offset and
+/// length of a range that must read as zeros, the size it must have).
+type RangeCheck = (usize, Arc<dyn FileOps>, u64, u64, u64);
+
 /// The reservation half; returns its report lines.
 fn reservation(args: &Args) -> Result<String, String> {
     let dir = args.workdir.join("release");
     let img = mkfs(&dir, 6 << 30, 1, FEATURES)?;
     let (fsid, nodesize, _) = dev::image_identity(&img);
-    let mount = || -> Result<Arc<dyn FsInstance>, String> {
+    let mount = || -> Result<(Arc<RecDev>, Arc<dyn FsInstance>), String> {
         let dev = Arc::new(RecDev::open(&img, 512, fsid, nodesize));
-        narf::register_root(dev, &fsid)?;
-        Ok(narf::mount_root_rw(&fsid, "@", &[])?.remove(0))
+        narf::register_root(dev.clone(), &fsid)?;
+        Ok((dev, narf::mount_root_rw(&fsid, "@", &[])?.remove(0)))
     };
     let scale = args.ops.clamp(300, 3000);
     // (label, writes, bytes per write, truncated?, unlinked?): the three
@@ -221,7 +284,7 @@ fn reservation(args: &Args) -> Result<String, String> {
         ),
     ];
 
-    let fs = mount()?;
+    let (dev, fs) = mount()?;
     let top = block_on(fs.root().mkdir("release")).map_err(err("mkdir"))?;
     let mut rows = Vec::new();
     // A failure to build the next files (after an operation above went
@@ -247,30 +310,143 @@ fn reservation(args: &Args) -> Result<String, String> {
                 break;
             }
         };
+        // Extent items the file holds.
+        let items = count * len.div_ceil(128 << 10);
         if let Some(cut) = cut {
-            rows.push(measure(&img, format!("truncate to 0, {label}"), || {
-                block_on(async {
-                    cut.truncate(0).await?;
-                    cut.fsync(false).await
-                })
-            }));
+            rows.push(measure(
+                &img,
+                &dev,
+                format!("truncate to 0, {label}"),
+                items,
+                || {
+                    block_on(async {
+                        cut.truncate(0).await?;
+                        cut.fsync(false).await
+                    })
+                },
+            ));
         }
         // The last reference goes with the handle; the inode is reclaimed
         // by the next operation, and the fsync commits it.
         if gone.is_some() {
             drop(gone);
             let poke = format!("after-{index}");
-            rows.push(measure(&img, format!("unlink, {label}"), || {
-                block_on(async {
-                    top.unlink(&gone_name).await?;
-                    top.create(&poke).await?;
-                    top.fsync(false).await
-                })
-            }));
+            rows.push(measure(
+                &img,
+                &dev,
+                format!("unlink, {label}"),
+                items,
+                || {
+                    block_on(async {
+                        top.unlink(&gone_name).await?;
+                        top.create(&poke).await?;
+                        top.fsync(false).await
+                    })
+                },
+            ));
         }
     }
+    // fallocate: a punch over files of 1,000 and of 100,000 single-page
+    // extents, a preallocation of as many holes, a zero-range over as many
+    // extents (Linux `btrfs_punch_hole` / `btrfs_replace_file_extents`,
+    // `btrfs_prealloc_file_range`, `btrfs_zero_range`).
+    let falloc_first = rows.len();
+    // (row, file, offset, length, size it must keep, what the range must read)
+    let mut checks: Vec<RangeCheck> = Vec::new();
+    for (index, count) in [1000usize, 100_000 * scale / 3000].into_iter().enumerate() {
+        if build_error.is_some() {
+            break;
+        }
+        let made = (|| -> Result<_, String> {
+            let punched = build(&top, &format!("punch-{index}"), count, PAGE)?;
+            let filled = build_strided(&top, &format!("prealloc-{index}"), count)?;
+            let zeroed = build(&top, &format!("zero-{index}"), count, PAGE)?;
+            block_on(top.fsync(false)).map_err(err("fsync"))?;
+            Ok((punched, filled, zeroed))
+        })();
+        let (punched, filled, zeroed) = match made {
+            Ok(files) => files,
+            Err(e) => {
+                build_error = Some(format!("building the fallocate files of {count}: {e}"));
+                break;
+            }
+        };
+        let size = (count * PAGE) as u64;
+        let mode = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+        rows.push(measure(
+            &img,
+            &dev,
+            format!("punch, {count} extents"),
+            count,
+            || {
+                block_on(async {
+                    punched.fallocate(mode, 0, size).await?;
+                    punched.fsync(false).await
+                })
+            },
+        ));
+        checks.push((rows.len() - 1, punched, 0, size, size));
+        // `count` holes between `count` extents, and one more page past EOF.
+        let span = (2 * count * PAGE) as u64;
+        rows.push(measure(
+            &img,
+            &dev,
+            format!("preallocate, {count} holes"),
+            count,
+            || {
+                block_on(async {
+                    filled.fallocate(0, 0, span).await?;
+                    filled.fsync(false).await
+                })
+            },
+        ));
+        checks.push((
+            rows.len() - 1,
+            filled,
+            span - PAGE as u64,
+            PAGE as u64,
+            span,
+        ));
+        rows.push(measure(
+            &img,
+            &dev,
+            format!("zero range, {count} extents"),
+            count,
+            || {
+                block_on(async {
+                    zeroed.fallocate(FALLOC_FL_ZERO_RANGE, 0, size).await?;
+                    zeroed.fsync(false).await
+                })
+            },
+        ));
+        checks.push((rows.len() - 1, zeroed, 0, size, size));
+    }
+    // What each file must hold now.
+    let mut content_error = None;
+    for (row, file, at, len, size) in &checks {
+        if rows[*row].result.is_err() {
+            continue;
+        }
+        let stat = block_on(file.stat_async()).map_err(err("stat"))?;
+        if stat.size != *size {
+            content_error = Some(format!(
+                "{}: the file is {} bytes, not {size}",
+                rows[*row].what, stat.size
+            ));
+            break;
+        }
+        if !reads_zero(file, *at, *len)? {
+            content_error = Some(format!(
+                "{}: the range does not read as zeros",
+                rows[*row].what
+            ));
+            break;
+        }
+    }
+    drop(checks);
     drop(top);
     drop(fs);
+    drop(dev);
     narf::reset();
 
     let node_mib = f64::from(nodesize) / 1048576.0;
@@ -278,7 +454,7 @@ fn reservation(args: &Args) -> Result<String, String> {
         .iter()
         .map(|r| {
             format!(
-                "    {}: {}; METADATA chunks {} -> {}; most one step reserved {} tree blocks ({:.1} MiB); {:.2} s",
+                "    {}: {}; METADATA chunks {} -> {}; most one step reserved {} tree blocks ({:.1} MiB); {:.2} s; {} steps, per step {:.1} device writes, {:.1} tree nodes written; {} commits",
                 r.what,
                 match &r.result {
                     Ok(()) => "ok".to_string(),
@@ -288,12 +464,16 @@ fn reservation(args: &Args) -> Result<String, String> {
                 r.chunks.1,
                 r.reserved,
                 r.reserved as f64 * node_mib,
-                r.seconds
+                r.seconds,
+                r.steps,
+                r.device_writes as f64 / r.steps as f64,
+                r.tree_written as f64 / r.steps as f64,
+                r.commits,
             )
         })
         .collect();
     let report = lines.join("\n");
-    if let Some(e) = build_error {
+    if let Some(e) = build_error.or(content_error) {
         return Err(format!("{report}\n{e}"));
     }
     for r in &rows {
@@ -323,6 +503,16 @@ fn reservation(args: &Args) -> Result<String, String> {
             "{report}\nthe reservation of a step depends on the size of the file"
         ));
     }
+    // The same for each fallocate mode: 1,000 extents, then 100,000.
+    for kind in 0..3 {
+        let (small, large) = (&rows[falloc_first + kind], &rows[falloc_first + 3 + kind]);
+        if large.reserved > 2 * small.reserved.max(1) {
+            return Err(format!(
+                "{report}\n{}: the reservation of a step depends on the size of the range",
+                large.what
+            ));
+        }
+    }
 
     linux::check(&img, false)?;
     linux::check(&img, true)?;
@@ -332,7 +522,7 @@ fn reservation(args: &Args) -> Result<String, String> {
     if orphans != 0 {
         return Err(format!("{report}\n{orphans} orphan item(s) left behind"));
     }
-    let fs = mount()?;
+    let (_dev, fs) = mount()?;
     let top = block_on(fs.root().lookup_dir_async("release")).map_err(err("remount: lookup"))?;
     for (index, (_, _, _, truncated, _)) in shapes.iter().enumerate() {
         if *truncated {
@@ -363,28 +553,73 @@ enum Cut {
     /// Truncate to this many bytes.
     Truncate(u64),
     Unlink,
+    /// `fallocate(mode, off, len)`.
+    Falloc {
+        mode: u32,
+        off: u64,
+        len: u64,
+    },
 }
 
-/// One crash case: a file of `pages` single-page extents followed by `big`
-/// 128 KiB extents, cut as `cut` says with every step committed, and the
-/// write stream replayed with crashes. `single` says the operation must
-/// commit exactly once.
-fn crash_case(
-    args: &Args,
-    name: &str,
-    (pages, big): (usize, usize),
+/// The file a crash case starts from.
+#[derive(Clone, Copy)]
+struct Shape {
+    /// Single-page extents, from offset 0 — a page apart when `strided`, a
+    /// hole after each.
+    pages: usize,
+    /// 128 KiB extents after them.
+    big: usize,
+    strided: bool,
+}
+
+const fn shape(pages: usize, big: usize) -> Shape {
+    Shape {
+        pages,
+        big,
+        strided: false,
+    }
+}
+
+/// One crash case.
+struct Case {
+    name: &'static str,
+    shape: Shape,
     cut: Cut,
+    /// The operation must commit exactly once.
     single: bool,
-    features: &str,
-) -> Result<String, String> {
+    /// For an `fallocate`: where each step but the last leaves off, worked
+    /// out from the file's layout (punch and zero-range: the start of every
+    /// 17th extent item from the range's first whole sector; preallocation:
+    /// the end of every 16th extent laid down). The driver must report the
+    /// same marks, and the states they make are the ones allowed.
+    marks: Vec<u64>,
+    /// Whether `marks` must match exactly. Where free space decides how
+    /// many extents a step can lay down, the driver's marks are taken
+    /// instead, as long as they rise through the range.
+    exact_marks: bool,
+    features: &'static str,
+    image: u64,
+}
+
+/// One crash case: the file `shape` describes, cut as `cut` says with every
+/// step committed, and the write stream replayed with crashes.
+fn crash_case(args: &Args, case: &Case) -> Result<String, String> {
+    let Case {
+        name,
+        shape,
+        cut,
+        single,
+        ..
+    } = *case;
+    let (pages, big) = (shape.pages, shape.big);
     let dir = args
         .workdir
         .join(format!("release-crash-{}", name.replace([' ', ','], "-")));
     let img = mkfs(
         &dir,
-        512 << 20,
+        case.image,
         0x100 + name.len() as u64 * 7 + pages as u64,
-        features,
+        case.features,
     )?;
     let (fsid, nodesize, _) = dev::image_identity(&img);
     let open = |recording: bool| -> Result<(Arc<RecDev>, Arc<dyn FsInstance>), String> {
@@ -397,7 +632,11 @@ fn crash_case(
     {
         let (_dev, fs) = open(false)?;
         let top = block_on(fs.root().mkdir("crash")).map_err(err("mkdir"))?;
-        let file = build(&top, "victim", pages, PAGE)?;
+        let file = if shape.strided {
+            build_strided(&top, "victim", pages)?
+        } else {
+            build(&top, "victim", pages, PAGE)?
+        };
         block_on(async {
             for i in 0..big {
                 let body = noise(0xb16 + i as u64, 128 << 10);
@@ -431,10 +670,32 @@ fn crash_case(
                 top.create("poke").await?;
                 top.fsync(false).await
             }
+            Cut::Falloc { mode, off, len } => {
+                let file = top.lookup_async("victim").await?;
+                let _ = stats::take_step_marks();
+                file.fallocate(mode, off, len).await?;
+                file.fsync(false).await
+            }
         }
     });
     narf_drivers_fs_btrfs::write::set_dealloc_step_sync(false);
     done.map_err(err("the operation"))?;
+    let mut marks = case.marks.clone();
+    if let Cut::Falloc { off, len, .. } = cut {
+        let reported = stats::take_step_marks();
+        let rises = reported.windows(2).all(|w| w[0] < w[1])
+            && reported.iter().all(|&m| m > off && m < off + len);
+        if case.exact_marks && reported != case.marks {
+            return Err(format!(
+                "{name}: the steps left off at {reported:?}, not at {:?}",
+                case.marks
+            ));
+        }
+        if !case.exact_marks && (reported.is_empty() || !rises) {
+            return Err(format!("{name}: the steps left off at {reported:?}"));
+        }
+        marks = reported;
+    }
     let after = narf::walk(&root)?.0;
     drop(top);
     drop(root);
@@ -455,7 +716,7 @@ fn crash_case(
             gens.len()
         ));
     }
-    if !single && gens.len() < 3 {
+    if !single && gens.len() < 2 {
         return Err(format!(
             "{name}: only {} commits; the steps were not committed one by one",
             gens.len()
@@ -492,6 +753,36 @@ fn crash_case(
             let mut state = before.clone();
             state.remove("crash/victim");
             states.push(vec![state]);
+        }
+        Cut::Falloc { mode, off, len } => {
+            let Some(Flat::File { data, .. }) = before.get("crash/victim") else {
+                return Err(format!("{name}: no victim in the model"));
+            };
+            let old = data.clone();
+            let end = off + len;
+            for &mark in &marks {
+                let mut bytes = (*old).clone();
+                if mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0 {
+                    // Zero up to the mark, and the partial sector at the end
+                    // of the range, which the first step zeroes.
+                    let n = bytes.len();
+                    let clip = |x: u64| (x as usize).min(n);
+                    let (a, b) = (clip(off), clip(mark.min(end)));
+                    bytes[a..b.max(a)].fill(0);
+                    let (c, d) = (clip((end - end % PAGE as u64).max(off)), clip(end));
+                    bytes[c..d.max(c)].fill(0);
+                } else if mode & FALLOC_FL_KEEP_SIZE == 0 {
+                    let size = mark.min(end) as usize;
+                    if size > bytes.len() {
+                        bytes.resize(size, 0);
+                    }
+                }
+                let mut state = before.clone();
+                if let Some(Flat::File { data, .. }) = state.get_mut("crash/victim") {
+                    *data = Arc::new(bytes);
+                }
+                states.push(vec![state]);
+            }
         }
     }
     let commits: Vec<CommitRec> = gens
@@ -547,7 +838,7 @@ fn crash_case(
 /// after a crash: the inode unlinked under an ORPHAN_ITEM
 /// (`write::set_rmdir_leaves_orphan`). Linux must check the image clean with
 /// the orphan in it; the next NARF mount must evict it, and Linux must then
-/// check the image clean with no orphan item left.
+/// check the image clean with no orphan item and nothing of the directory.
 fn dir_orphan(args: &Args) -> Result<String, String> {
     let dir = args.workdir.join("release-dir-orphan");
     let img = mkfs(&dir, 512 << 20, 0x0d1, FEATURES)?;
@@ -607,46 +898,183 @@ pub fn run(args: &Args) -> Result<String, String> {
     let t0 = Instant::now();
     let mut lines = vec![reservation(args)?];
     let page = PAGE as u64;
-    for (name, shape, cut, single) in [
+    let step = STEP as u64;
+    let case = |name, shape, cut, single| Case {
+        name,
+        shape,
+        cut,
+        single,
+        marks: Vec::new(),
+        exact_marks: true,
+        features: FEATURES,
+        image: 512 << 20,
+    };
+    let punch = FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE;
+    // A punch or zero-range of `[10 pages + 100, 100 pages)` over single-page
+    // extents: whole sectors from page 11, a step every 16 extent items.
+    let (cut_from, cut_len) = (10 * page + 100, 90 * page - 100);
+    let cut_marks: Vec<u64> = (1..)
+        .map(|k| 11 * page + k * step * page)
+        .take_while(|&mark| mark < 100 * page)
+        .collect();
+    let cases = [
         // Large: many steps, each its own commit.
-        ("truncate to nothing", (120, 4), Cut::Truncate(0), false),
-        (
+        case(
+            "truncate to nothing",
+            shape(120, 4),
+            Cut::Truncate(0),
+            false,
+        ),
+        case(
             "truncate to an extent boundary",
-            (120, 4),
+            shape(120, 4),
             Cut::Truncate(40 * page),
             false,
         ),
-        (
+        case(
             "truncate into an extent",
-            (120, 4),
+            shape(120, 4),
             Cut::Truncate(40 * page + 1234),
             false,
         ),
-        ("unlink", (120, 4), Cut::Unlink, false),
-        // Without `no-holes`: an eviction from the end of the file leaves no
-        // gap `btrfs check` would want a hole item for.
-        ("unlink, explicit hole items", (120, 4), Cut::Unlink, false),
+        case("unlink", shape(120, 4), Cut::Unlink, false),
+        Case {
+            features: FEATURES_HOLE_ITEMS,
+            ..case(
+                "unlink, explicit hole items",
+                shape(120, 4),
+                Cut::Unlink,
+                false,
+            )
+        },
+        Case {
+            marks: cut_marks.clone(),
+            ..case(
+                "punch",
+                shape(120, 0),
+                Cut::Falloc {
+                    mode: punch,
+                    off: cut_from,
+                    len: cut_len,
+                },
+                false,
+            )
+        },
+        Case {
+            marks: cut_marks.clone(),
+            features: FEATURES_HOLE_ITEMS,
+            ..case(
+                "punch, explicit hole items",
+                shape(120, 0),
+                Cut::Falloc {
+                    mode: punch,
+                    off: cut_from,
+                    len: cut_len,
+                },
+                false,
+            )
+        },
+        Case {
+            marks: cut_marks,
+            ..case(
+                "zero range",
+                shape(120, 0),
+                Cut::Falloc {
+                    mode: FALLOC_FL_ZERO_RANGE,
+                    off: cut_from,
+                    len: cut_len,
+                },
+                false,
+            )
+        },
+        // 40 holes a page each, and one page past EOF: the 16th and 32nd
+        // holes end where a step does.
+        Case {
+            marks: vec![32 * page, 64 * page],
+            ..case(
+                "preallocate holes",
+                Shape {
+                    pages: 40,
+                    big: 0,
+                    strided: true,
+                },
+                Cut::Falloc {
+                    mode: 0,
+                    off: 0,
+                    len: 80 * page,
+                },
+                false,
+            )
+        },
+        // 17 extents of 8 MiB past EOF (more where free space is in
+        // pieces): the size moves with every step but the last.
+        Case {
+            marks: vec![8 * page + 128 * (1 << 20)],
+            exact_marks: false,
+            image: 2 << 30,
+            ..case(
+                "preallocate past EOF",
+                shape(8, 0),
+                Cut::Falloc {
+                    mode: 0,
+                    off: 8 * page,
+                    len: 136 << 20,
+                },
+                false,
+            )
+        },
         // Within a step: one transaction, whatever the cut.
-        ("small truncate to nothing", (12, 0), Cut::Truncate(0), true),
-        (
+        case(
+            "small truncate to nothing",
+            shape(12, 0),
+            Cut::Truncate(0),
+            true,
+        ),
+        case(
             "small truncate into an extent",
-            (12, 0),
+            shape(12, 0),
             Cut::Truncate(5 * page + 700),
             true,
         ),
-        (
+        case(
             "shrinking the last extent",
-            (0, 2),
+            shape(0, 2),
             Cut::Truncate(200_000),
             true,
         ),
-    ] {
-        let features = if name.contains("explicit hole items") {
-            FEATURES_HOLE_ITEMS
-        } else {
-            FEATURES
-        };
-        lines.push(crash_case(args, name, shape, cut, single, features)?);
+        case(
+            "small punch",
+            shape(12, 0),
+            Cut::Falloc {
+                mode: punch,
+                off: 2 * page + 5,
+                len: 6 * page,
+            },
+            true,
+        ),
+        case(
+            "small zero range",
+            shape(12, 0),
+            Cut::Falloc {
+                mode: FALLOC_FL_ZERO_RANGE,
+                off: 2 * page + 5,
+                len: 6 * page,
+            },
+            true,
+        ),
+        case(
+            "small preallocation",
+            shape(4, 0),
+            Cut::Falloc {
+                mode: FALLOC_FL_KEEP_SIZE,
+                off: 4 * page,
+                len: 10 * page,
+            },
+            true,
+        ),
+    ];
+    for case in &cases {
+        lines.push(crash_case(args, case)?);
     }
     lines.push(dir_orphan(args)?);
     Ok(format!(
