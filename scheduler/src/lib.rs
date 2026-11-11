@@ -4046,48 +4046,65 @@ fn drain_parked_wakes(cpu: usize) {
     while !batch.is_null() {
         // SAFETY: the detached node owns exactly one inbox Arc reference.
         let cell = unsafe { Arc::from_raw(batch) };
-        // Read next BEFORE releasing the claim: another CPU may immediately
-        // requeue this node and overwrite wake_next after the release.
-        batch = cell.wake_next.load(Ordering::Relaxed);
-        PARKED_WAKE_INBOX[cpu].len.fetch_sub(1, Ordering::Release);
-        cell.activation_queued.store(false, Ordering::SeqCst);
-        let token = cell.parked_location.load(Ordering::SeqCst);
-        if token == NOT_PARKED {
-            continue;
-        }
-        let home = token % narf_lib::percpu::MAX_CPUS;
-        if home != cpu {
-            // A queued activation can outlive a migration and a subsequent
-            // sleep. Route the pinned node to its current parked owner.
-            parked_wake_push(&cell);
-            resched_remote(cell.cpu.load(Ordering::Acquire));
-            continue;
-        }
-        let id = TaskId(cell.task);
-        let index = token / narf_lib::percpu::MAX_CPUS;
-        let parked = {
-            let mut parked = PARKED[cpu].lock();
-            parked.as_mut().and_then(|slots| {
-                let task = slots.slots.get(index)?.task.as_ref()?;
-                // A stale id cannot claim a reused index, and an in-flight
-                // direct transfer keeps ownership until its release path
-                // re-stages any wake that arrived while it was claimed.
-                if task.slot.id != id
-                    || !task.slot.awake.flag.load(Ordering::SeqCst)
-                    || task.slot.awake.direct_claimed.load(Ordering::SeqCst)
-                {
-                    return None;
-                }
-                slots.take(index, id)
-            })
-        };
-        let Some(parked) = parked else {
-            // A running/migrated task has already left parked ownership, or
-            // a stale token names a task which has since gone back to sleep.
-            continue;
-        };
-        enqueue_on(cpu, parked.slot, parked.reason);
+        batch = release_drained_wake(cpu, &cell);
+        activate_drained_wake(cpu, &cell);
     }
+}
+
+/// First half of draining one detached node: give up its claim and return the
+/// next node of the batch. From here on a wake of the task can claim the cell
+/// and link it again — on this CPU's public list, if the task is still parked
+/// here — so [`activate_drained_wake`] must not assume the cell is unlinked.
+#[inline]
+fn release_drained_wake(cpu: usize, cell: &WakeCell) -> *mut WakeCell {
+    // Read next BEFORE releasing the claim: another CPU may immediately
+    // requeue this node and overwrite wake_next after the release.
+    let next = cell.wake_next.load(Ordering::Relaxed);
+    PARKED_WAKE_INBOX[cpu].len.fetch_sub(1, Ordering::Release);
+    cell.activation_queued.store(false, Ordering::SeqCst);
+    next
+}
+
+/// Second half: activate the task the released node named, if it is parked on
+/// `cpu` and has been woken; forward the node if the task now sleeps elsewhere.
+#[inline]
+fn activate_drained_wake(cpu: usize, cell: &WakeCell) {
+    let token = cell.parked_location.load(Ordering::SeqCst);
+    if token == NOT_PARKED {
+        return;
+    }
+    let home = token % narf_lib::percpu::MAX_CPUS;
+    if home != cpu {
+        // A queued activation can outlive a migration and a subsequent
+        // sleep. Route the pinned node to its current parked owner.
+        parked_wake_push(cell);
+        resched_remote(cell.cpu.load(Ordering::Acquire));
+        return;
+    }
+    let id = TaskId(cell.task);
+    let index = token / narf_lib::percpu::MAX_CPUS;
+    let parked = {
+        let mut parked = PARKED[cpu].lock();
+        parked.as_mut().and_then(|slots| {
+            let task = slots.slots.get(index)?.task.as_ref()?;
+            // A stale id cannot claim a reused index, and an in-flight
+            // direct transfer keeps ownership until its release path
+            // re-stages any wake that arrived while it was claimed.
+            if task.slot.id != id
+                || !task.slot.awake.flag.load(Ordering::SeqCst)
+                || task.slot.awake.direct_claimed.load(Ordering::SeqCst)
+            {
+                return None;
+            }
+            slots.take(index, id)
+        })
+    };
+    let Some(parked) = parked else {
+        // A running/migrated task has already left parked ownership, or
+        // a stale token names a task which has since gone back to sleep.
+        return;
+    };
+    enqueue_on(cpu, parked.slot, parked.reason);
 }
 
 /// Publish parked ownership, then recheck the wake after the SeqCst token
