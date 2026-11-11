@@ -803,11 +803,23 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         };
         let bw40 = self.packet.width.is_some();
         let prime_sc = permission.operating().channel().map_or(0, |c| c.prime_sc);
-        let (queue, _, selector) = queue(
-            frame,
-            self.packet.local.ok_or(Error::State)?,
-            self.packet.qos,
-        )?;
+        let local = self.packet.local.ok_or(Error::State)?;
+        // A non-QoS Null DATA frame (header only, To-DS; PM / Retry /
+        // MoreData free) rides BE like the station's other non-QoS DATA
+        // (mac80211 priority 0); the shared `queue` admits only DATA with a
+        // body.
+        let fc = frame
+            .get(..2)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+        let (queue, _, selector) = if frame.len() == 24
+            && fc & 0xc7ff == 0x0148
+            && frame[10..16] == local
+            && frame[22] & 15 == 0
+        {
+            (4, 1u16 << 1, 0u8)
+        } else {
+            queue(frame, local, self.packet.qos)?
+        };
         let index = INDEX[queue].ok_or(Error::Packet)?;
         let id = self.packet.serial.checked_add(1).ok_or(Error::State)?;
         let slot = self.packet.next[queue];
