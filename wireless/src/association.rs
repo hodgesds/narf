@@ -628,7 +628,52 @@ fn observe_inner(
         basic_rates: rates.basic,
     })
 }
+/// The RSNA a native owner will negotiate itself for a request whose extra
+/// elements came from a supplicant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmeRsna {
+    Open,
+    /// WPA2-PSK without management-frame protection.
+    Wpa2Psk,
+    /// WPA3-Personal: SAE, CCMP-128, PMF required.
+    Wpa3Sae,
+}
+
+/// The RSN element wpa_supplicant puts in an SAE request with
+/// `ieee80211w=2` (`wpa_gen_wpa_ie_rsn`): CCMP-128 group and pairwise, one
+/// SAE AKM (8, or 24 for SAE-EXT-KEY), MFPC|MFPR, no PMKID, and the
+/// BIP-CMAC-128 group management cipher either spelled out or left to its
+/// default. Replay-counter bits are already cleared by the caller.
+fn sme_sae_rsne(rsn: &RsnIe) -> bool {
+    let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
+    rsn.version == 1
+        && rsn.group_cipher == ccmp
+        && rsn.pairwise_ciphers == [ccmp]
+        && (rsn.akms == [Suite::standard(rsn::AKM_SAE)]
+            || rsn.akms == [Suite::standard(rsn::AKM_SAE_EXT_KEY)])
+        && rsn.rsn_capabilities == rsn::RSN_CAP_MFP_CAPABLE | rsn::RSN_CAP_MFP_REQUIRED
+        && rsn.pmkids.is_empty()
+        && rsn
+            .group_management_cipher
+            .is_none_or(|cipher| cipher == Suite::standard(rsn::CIPHER_BIP_CMAC_128))
+}
+
 pub fn validate_sme_ies(bytes: &[u8], protected: bool) -> Result<(), Error> {
+    validate_sme_ies_for(
+        bytes,
+        if protected {
+            SmeRsna::Wpa2Psk
+        } else {
+            SmeRsna::Open
+        },
+    )
+}
+
+/// [`validate_sme_ies`] for the RSNA the owner will negotiate. For SAE the
+/// supplicant's RSN element must describe WPA3-Personal with PMF required,
+/// and its RSNXE may only be the one-octet SAE hash-to-element capability
+/// (`wpa_gen_rsnxe`); the owner sends its own RSNE and RSNXE in their place.
+pub fn validate_sme_ies_for(bytes: &[u8], rsna: SmeRsna) -> Result<(), Error> {
     if bytes.len() > 2048 {
         return Err(Error::InvalidBss);
     }
@@ -649,11 +694,17 @@ pub fn validate_sme_ies(bytes: &[u8], protected: bool) -> Result<(), Error> {
             // first transmission, so only its selection is compared.
             rsn.rsn_capabilities &=
                 !(rsn::RSN_CAP_PTKSA_REPLAY_COUNTER_MASK | rsn::RSN_CAP_GTKSA_REPLAY_COUNTER_MASK);
-            if !protected || rsn != RsnIe::wpa2_psk_ccmp() {
+            let admitted = match rsna {
+                SmeRsna::Open => false,
+                SmeRsna::Wpa2Psk => rsn == RsnIe::wpa2_psk_ccmp(),
+                SmeRsna::Wpa3Sae => sme_sae_rsne(&rsn),
+            };
+            if !admitted {
                 return Err(Error::UnsupportedSecurity);
             }
             Ok(())
         }
+        244 if rsna == SmeRsna::Wpa3Sae && body == [rsn::RSNX_CAP_SAE_H2E] => Ok(()),
         54..=56 | 244 => Err(Error::UnsupportedSecurity),
         45 | 191 => Err(Error::UnsupportedRates),
         255 if body.is_empty() => Err(Error::InvalidBss),
@@ -732,7 +783,12 @@ impl JoinPlan {
         if self.assoc.len().saturating_add(bytes.len()) > 4096 {
             return Err(Error::InvalidBss);
         }
-        validate_sme_ies(bytes, self.security.is_wpa2())?;
+        let rsna = match self.security {
+            SecurityMode::Open => SmeRsna::Open,
+            SecurityMode::Wpa2Psk => SmeRsna::Wpa2Psk,
+            SecurityMode::Wpa3Sae { .. } => SmeRsna::Wpa3Sae,
+        };
+        validate_sme_ies_for(bytes, rsna)?;
         if self.cck14 {
             ies(bytes, |id, body| {
                 if forbidden_cck14_phy(id, body) {
@@ -770,8 +826,11 @@ impl JoinPlan {
                 }
             })?;
         }
+        // The negotiated RSNE is already in the request; under SAE so is
+        // the owner's RSNXE (`SaeJoin::station_rsnxe`).
+        let own_rsnxe = rsna == SmeRsna::Wpa3Sae;
         ies(bytes, |id, body| {
-            if id != 48 {
+            if id != 48 && !(own_rsnxe && id == 244) {
                 self.assoc.extend_from_slice(&[id, body.len() as u8]);
                 self.assoc.extend_from_slice(body);
             }

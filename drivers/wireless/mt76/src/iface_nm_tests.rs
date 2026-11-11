@@ -251,6 +251,8 @@ struct DeviceInfo {
     freqs: Vec<u32>,
     ciphers: Vec<u32>,
     raw_band_types: Vec<u16>,
+    /// NL80211_ATTR_EXT_FEATURES, one bit per `enum nl80211_ext_feature_index`.
+    ext_features: Vec<u8>,
 }
 fn wiphy_info(message: &[u8], info: &mut DeviceInfo) {
     let top = attrs(&message[20..]);
@@ -290,6 +292,9 @@ fn wiphy_info(message: &[u8], info: &mut DeviceInfo) {
                 }
             }
         }
+    }
+    if let Some(features) = find(&top, 217) {
+        info.ext_features = features.to_vec();
     }
     if let Some(suites) = find(&top, 57) {
         info.ciphers
@@ -415,6 +420,20 @@ fn networkmanager_creates_a_wifi_device(absent_family_lookup: bool) -> Result<()
     // ("Band 32769:" when NLA_F_NESTED leaks into it).
     if info.raw_band_types != [0, 1, 3] {
         return Err("band attribute types are not enum nl80211_band values");
+    }
+    // What wpa_supplicant keys the offloaded connection on: with
+    // 4WAY_HANDSHAKE_STA_PSK (15) it hands over the PMK, with SAE_OFFLOAD
+    // (38) it keeps SAE in its AKM selection and hands over the password.
+    let ext_feature = |bit: usize| {
+        info.ext_features
+            .get(bit / 8)
+            .is_some_and(|byte| byte & (1 << (bit % 8)) != 0)
+    };
+    if !ext_feature(15) {
+        return Err("wiphy does not advertise 4WAY_HANDSHAKE_STA_PSK");
+    }
+    if !ext_feature(38) {
+        return Err("wiphy does not advertise SAE_OFFLOAD: wpa_supplicant drops SAE");
     }
 
     if absent_family_lookup {
@@ -584,4 +603,50 @@ fn mt7922_us_domain_permits_non_radar_5ghz() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/networkmanager",
     mt7922_us_domain_permits_non_radar_5ghz
+);
+
+/// The elements wpa_supplicant 2.12 hands an SAE-offload CONNECT for a
+/// NetworkManager `key-mgmt=sae` profile (`ieee80211w=2`): the RSN element
+/// with AKM SAE, MFPC | MFPR and sixteen PTKSA replay counters (0x00cc), a
+/// zero PMKID count and BIP-CMAC-128, then Supported Operating Classes,
+/// Extended Capabilities and the RSNXE with the hash-to-element bit. The
+/// native SAE owner sends its own RSNE and RSNXE; it must admit this request
+/// for the 5200 MHz BSS, and must not take it for a WPA2-PSK one.
+fn mt7922_admits_wpa_supplicant_sae_association_elements() -> TestResult {
+    let Ok(iface) = Mt76Iface::new(String::from("wlan-wpas"), mt7922()) else {
+        return TestResult::Fail("radio identity");
+    };
+    if !iface.supports_sae_offload() {
+        return TestResult::Fail("MT7921 station does not offer its SAE owner to nl80211");
+    }
+    let mut ie = alloc::vec![
+        48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 8,
+        0xcc, 0x00, 0, 0, 0x00, 0x0f, 0xac, 6,
+    ];
+    ie.extend_from_slice(&[59, 4, 115, 115, 116, 117]);
+    ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+    ie.extend_from_slice(&[244, 1, 0x20]);
+    let request = |security| AssociateRequest {
+        bssid: [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x40],
+        ssid: b"narf-transition".to_vec(),
+        frequency_mhz: 5200,
+        channel: 40,
+        security,
+        ie: ie.clone(),
+    };
+    let sae = request(narf_wireless::SecurityConfig::Wpa3 {
+        password: b"correct horse battery".to_vec(),
+    });
+    if iface.validate_join(&sae) != Ok(false) {
+        return TestResult::Fail("wpa_supplicant's SAE association elements refused");
+    }
+    let psk = request(narf_wireless::SecurityConfig::Wpa2 { psk: [0x5a; 32] });
+    if iface.validate_join(&psk) != Err(WirelessError::NotSupported) {
+        return TestResult::Fail("SAE association elements admitted for a WPA2-PSK join");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/networkmanager",
+    mt7922_admits_wpa_supplicant_sae_association_elements
 );

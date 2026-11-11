@@ -562,18 +562,19 @@ impl Mt76Iface {
         {
             return Err(WirelessError::InvalidArgs);
         }
-        let protected = match &req.security {
-            narf_wireless::SecurityConfig::Open => false,
-            narf_wireless::SecurityConfig::Wpa2 { .. }
-            | narf_wireless::SecurityConfig::Wpa3 { .. } => true,
+        use narf_wireless::association::SmeRsna;
+        let rsna = match &req.security {
+            narf_wireless::SecurityConfig::Open => SmeRsna::Open,
+            narf_wireless::SecurityConfig::Wpa2 { .. } => SmeRsna::Wpa2Psk,
+            narf_wireless::SecurityConfig::Wpa3 { .. } => SmeRsna::Wpa3Sae,
             _ => return Err(WirelessError::NotSupported),
         };
-        crate::mt7921::association::validate_sme_ies(&req.ie, protected).map_err(|error| {
-            match error {
+        narf_wireless::association::validate_sme_ies_for(&req.ie, rsna).map_err(
+            |error| match error {
                 crate::mt7921::association::Error::InvalidBss => WirelessError::InvalidArgs,
                 _ => WirelessError::NotSupported,
-            }
-        })?;
+            },
+        )?;
         Ok(six)
     }
 
@@ -1261,6 +1262,15 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     fn supports_handshake_offload(&self) -> bool {
+        true
+    }
+
+    /// The native station owner runs SAE (hunting-and-pecking and
+    /// hash-to-element), the 4-way handshake and management-frame protection
+    /// from a password (`Security::Wpa3Sae`), which is what
+    /// NL80211_EXT_FEATURE_SAE_OFFLOAD promises: wpa_supplicant then keeps
+    /// SAE for this wiphy and passes NL80211_ATTR_SAE_PASSWORD in CONNECT.
+    fn supports_sae_offload(&self) -> bool {
         true
     }
 
@@ -2060,7 +2070,7 @@ mod tests {
             || iface.supports_external_supplicant()
             || iface.supports_userspace_mlme()
             || !info.modes.contains(WirelessModes::AP)
-            || iface.supports_sae_offload()
+            || !iface.supports_sae_offload()
             || iface.max_scan_ssids() != 4
             || iface.max_scan_ie_len() != 600
             || !iface.supports_scan_random_mac()
