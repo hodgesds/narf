@@ -481,15 +481,21 @@ fn smoke_ixgbe_multi_instance_cookie_dispatch() -> TestResult {
     if alloc::sync::Arc::as_ptr(&after) != alloc::sync::Arc::as_ptr(&ctrl) {
         return TestResult::Fail("re-probe replaced controller(0)");
     }
-    let ring_ptr = narf_net::registry().with_interface(name, |i| i.rx_ring() as *const _ as usize);
-    if ring_ptr != Some(&ctrl.rx_ipc_ring as *const _ as usize) {
+    // The adapter's rx_ring is the NIC's own ring object: compare
+    // reference identity with `core::ptr::eq` rather than casting the
+    // ring address to a usize, which the dma_addr source guard flags
+    // (a device address must never reach a pointer cast).
+    let ring_matches = narf_net::registry()
+        .with_interface(name, |i| core::ptr::eq(i.rx_ring(), &ctrl.rx_ipc_ring));
+    if ring_matches != Some(true) {
         return TestResult::Fail("adapter rx_ring is not the NIC's own ring");
     }
     if ctrl.rx_ipc_ring.lock().is_none() {
         return TestResult::Fail("attach took the NIC's RX ring");
     }
-    let tx_ptr = narf_net::registry().with_interface(name, |i| i.tx_ring() as *const _ as usize);
-    if tx_ptr != Some(&ctrl.tx_ipc_ring as *const _ as usize) {
+    let tx_matches = narf_net::registry()
+        .with_interface(name, |i| core::ptr::eq(i.tx_ring(), &ctrl.tx_ipc_ring));
+    if tx_matches != Some(true) {
         return TestResult::Fail("adapter tx_ring is not the NIC's own ring");
     }
     if ctrl.tx_ipc_ring.lock().is_none() {

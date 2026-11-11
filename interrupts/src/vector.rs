@@ -43,7 +43,14 @@ pub const fn allocatable(vector: u8) -> bool {
     if vector == SYSCALL_VECTOR {
         return false;
     }
-    vector >= ALLOC_BASE && vector <= ALLOC_MAX
+    // On aarch64 ALLOC_BASE is 0 (the u8 minimum), so the lower bound is
+    // vacuous there — keep it x86-only instead of comparing against the
+    // type minimum, which clippy rightly flags as always true.
+    #[cfg(target_arch = "x86_64")]
+    if vector < ALLOC_BASE {
+        return false;
+    }
+    vector <= ALLOC_MAX
 }
 
 /// Why an alloc failed.
