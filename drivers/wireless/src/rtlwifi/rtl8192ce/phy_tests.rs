@@ -184,8 +184,16 @@ fn smoke_rtl8192ce_bb_rf_config_per_rf_type() -> TestResult {
         if !serial {
             return TestResult::Fail("rtl92c_phy_mac_config serial byte");
         }
-        let b_writes = g.rf_writes.iter().filter(|w| w.0 == 1).count();
-        if (b_writes == 0) == v.is_92c_serial() {
+        // The 1T PHY_REG table itself writes the path-B LSSI word once
+        // (0x844 = 0, table.c PHY_REG_1TARRAY), which the fake records as
+        // RF (1, 0x00, 0); the path-B radio table is walked only for 2T2R.
+        let b_writes: Vec<_> = g.rf_writes.iter().filter(|w| w.0 == 1).collect();
+        let ok = if v.is_92c_serial() {
+            b_writes.len() > 1
+        } else {
+            b_writes == [&(1, 0, 0)]
+        };
+        if !ok {
             return TestResult::Fail("RF path B walked iff 2T2R");
         }
         let has = |addr: u8, data: u32| g.rf_writes.contains(&(0, addr, data));
