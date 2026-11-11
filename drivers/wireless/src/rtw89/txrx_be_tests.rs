@@ -29,10 +29,12 @@ fn smoke_rtw89_be_txwd_encode() -> TestResult {
         return TestResult::Fail("BE TXWD dword1 must be zeroed");
     }
     // dword2 = TXPKTSIZE (13..0) | QSEL_V1 (20..15) | MACID_V1 (31..22).
-    // With all-ones fields this must be all-ones: a wrong _V1 shift
-    // (e.g. the AX QSEL 22..17 / MACID 31..24 positions) breaks it.
+    // With all-ones fields every field bit is set and only AGG_EN
+    // (bit 14) and TID_IND_V1 (bit 21) stay clear (`txrx.h`
+    // BE_TXD_BODY2_*): a wrong _V1 shift (e.g. the AX QSEL 22..17 /
+    // MACID 31..24 positions) breaks it.
     let dw2 = u32::from_le_bytes([out[8], out[9], out[10], out[11]]);
-    if dw2 != 0xFFFF_FFFF {
+    if dw2 != 0xFFDF_BFFF {
         return TestResult::Fail("BE TXWD dword2 _V1 fields wrong");
     }
     if out[12..32] != [0; 20] {

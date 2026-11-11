@@ -215,7 +215,7 @@ fn smoke_rtw89_8922a_secure_download_plan() -> TestResult {
     // overlaps `key_sign_len` (bytes 60..62) in fw.h's section
     // union, and 0x8000100 is the magnitude whose overlap reads as
     // a 512-byte signature length (0x0800 >> 2); 0xC000180 would
-    // parse as 48-byte signatures.
+    // parse as 768-byte signatures.
     let mut bytes = be_part(firmware(1, 1, true), 0x1000);
     bytes[1040 + 32] = 0;
     bytes[1040 + 32 + 51] = 0x10;
@@ -241,8 +241,11 @@ fn smoke_rtw89_8922a_secure_download_plan() -> TestResult {
     }
     // A foreign magnitude ignores the section: secure hardware with
     // no matching signature is refused, never downloaded unsigned.
+    // 0x8000180 keeps the overlapping `key_sign_len` half (0x0800 ->
+    // 512-byte signatures) so the image still parses; 0xC000180 would
+    // read 0x0C00 >> 2 = 768-byte signatures and overrun the pool.
     let mut foreign = bytes.clone();
-    foreign[80 + 58..80 + 62].copy_from_slice(&0xC000180u32.to_le_bytes());
+    foreign[80 + 58..80 + 62].copy_from_slice(&0x8000180u32.to_le_bytes());
     if !matches!(
         DownloadPlan::new(
             prepare(foreign, ChipId::Rtl8922A),

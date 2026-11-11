@@ -857,8 +857,10 @@ fn smoke_rtw89_completion_8922a_rxq_ppdu() -> TestResult {
         Err(why) => return TestResult::Fail(why),
     };
     // PPDU status, phy report present (phy_rpt_sz 1): the 8-byte
-    // report follows the RXD and carries RSSI 0x123 in dword0.
-    let report = [0x12u8, 0x34, 0x56, 0x78, 0, 0, 0, 0];
+    // report follows the RXD and carries RSSI 0x123 in dword0
+    // bits 11:0 (`BE_RXD_PHY_RSSI`, txrx.h); the bits above the
+    // field must be masked off.
+    let report = [0x23u8, 0xF1, 0x56, 0x78, 0, 0, 0, 0];
     let body: Vec<u8> = (0..16u8).collect();
     let mut content = rxd(1, 16, 0, 0, 0, 1, 3, 0, 0, 0, 0, false);
     content.extend_from_slice(&report);
