@@ -563,7 +563,10 @@ wrap), as `/proc/<pid>/mem` addresses kernel-half virtual addresses.
 `/proc/<pid>/task/<tid>/` serves `comm`, `mem`, `stat`, `syscall` and
 `wchan`; the last two describe that thread, from the `syscall` frame and
 `wchan` name the thread-stat hook's `ThreadStat` carries. `wchan` has no
-trailing newline, as Linux `proc_pid_wchan`.
+trailing newline, as Linux `proc_pid_wchan`. It also serves the `fd` and
+`fdinfo` directories (`tid_base_stuff`), which are the process's — a thread's
+descriptor table is its process's — so `/proc/thread-self/fd/<n>` is the link
+`/proc/self/fd/<n>` is.
 `/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem` are 0600 nodes whose
 `open_instance_checked` calls the hook installed by
 `procfs::install_proc_mem_hook(fn(pid) -> Result<Arc<dyn ProcMemAccess>, FsError>)`
