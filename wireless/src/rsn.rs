@@ -69,6 +69,7 @@ pub const CIPHER_GCMP_256: u8 = 0x09;
 pub const CIPHER_CCMP_256: u8 = 0x0A;
 pub const CIPHER_BIP_GMAC_128: u8 = 0x0B;
 pub const CIPHER_BIP_GMAC_256: u8 = 0x0C;
+pub const CIPHER_BIP_CMAC_256: u8 = 0x0D;
 
 // ── AKM types ─────────────────────────────────────────────────────
 pub const AKM_DOT1X: u8 = 0x01;
@@ -131,6 +132,98 @@ impl Suite {
             oui: [buf[0], buf[1], buf[2]],
             suite_type: buf[3],
         })
+    }
+}
+
+/// `wpa_cipher_key_len` for the data ciphers an RSNA may use: CCMP-128 and
+/// GCMP-128 take 16-octet temporal keys, CCMP-256 and GCMP-256 32.
+pub const fn data_cipher_key_len(suite_type: u8) -> Option<usize> {
+    match suite_type {
+        CIPHER_CCMP_128 | CIPHER_GCMP_128 => Some(16),
+        CIPHER_CCMP_256 | CIPHER_GCMP_256 => Some(32),
+        _ => None,
+    }
+}
+
+/// `wpa_cipher_key_len` for the group management (BIP) ciphers.
+pub const fn mgmt_cipher_key_len(suite_type: u8) -> Option<usize> {
+    match suite_type {
+        CIPHER_BIP_CMAC_128 | CIPHER_BIP_GMAC_128 => Some(16),
+        CIPHER_BIP_CMAC_256 | CIPHER_BIP_GMAC_256 => Some(32),
+        _ => None,
+    }
+}
+
+/// The cipher suites one RSNA uses (`sm->pairwise_cipher`,
+/// `sm->group_cipher`, `sm->mgmt_group_cipher`), as standard suite types.
+/// `group_mgmt` matters only when PMF is negotiated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ciphers {
+    pub pairwise: u8,
+    pub group: u8,
+    pub group_mgmt: u8,
+}
+impl Ciphers {
+    /// CCMP-128 pairwise and group, BIP-CMAC-128 (the defaults).
+    pub const LEGACY: Self = Self {
+        pairwise: CIPHER_CCMP_128,
+        group: CIPHER_CCMP_128,
+        group_mgmt: CIPHER_BIP_CMAC_128,
+    };
+    /// Every suite is a known data/BIP cipher.
+    pub const fn valid(self) -> bool {
+        data_cipher_key_len(self.pairwise).is_some()
+            && data_cipher_key_len(self.group).is_some()
+            && mgmt_cipher_key_len(self.group_mgmt).is_some()
+    }
+    pub const fn pairwise_key_len(self) -> usize {
+        match data_cipher_key_len(self.pairwise) {
+            Some(len) => len,
+            None => 16,
+        }
+    }
+    pub const fn group_key_len(self) -> usize {
+        match data_cipher_key_len(self.group) {
+            Some(len) => len,
+            None => 16,
+        }
+    }
+    pub const fn mgmt_key_len(self) -> usize {
+        match mgmt_cipher_key_len(self.group_mgmt) {
+            Some(len) => len,
+            None => 16,
+        }
+    }
+    /// The ciphers a station RSNE names: its one pairwise cipher, the
+    /// group cipher, and the group management cipher (BIP-CMAC-128 when
+    /// omitted, IEEE 802.11-2020 9.4.2.24.1).
+    pub fn of_station(rsn: &RsnIe) -> Option<Self> {
+        let [pairwise] = rsn.pairwise_ciphers.as_slice() else {
+            return None;
+        };
+        let standard = |suite: Suite| (suite.oui == RSN_OUI).then_some(suite.suite_type);
+        let ciphers = Self {
+            pairwise: standard(*pairwise)?,
+            group: standard(rsn.group_cipher)?,
+            group_mgmt: match rsn.group_management_cipher {
+                Some(suite) => standard(suite)?,
+                None => CIPHER_BIP_CMAC_128,
+            },
+        };
+        ciphers.valid().then_some(ciphers)
+    }
+    /// The AP's RSNE offers these: its group cipher, this pairwise cipher
+    /// among its list, and (under PMF) this group management cipher.
+    pub fn offered_by(self, ap: &RsnIe, pmf: bool) -> bool {
+        ap.group_cipher == Suite::standard(self.group)
+            && ap
+                .pairwise_ciphers
+                .contains(&Suite::standard(self.pairwise))
+            && (!pmf
+                || ap
+                    .group_management_cipher
+                    .unwrap_or(Suite::standard(CIPHER_BIP_CMAC_128))
+                    == Suite::standard(self.group_mgmt))
     }
 }
 

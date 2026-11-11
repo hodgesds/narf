@@ -75,6 +75,7 @@ enum Auth {
 #[derive(Clone, Debug)]
 pub struct SaeJoin {
     akm: KeyMgmt,
+    ciphers: rsn::Ciphers,
     h2e: bool,
     advertise_h2e: bool,
     auth: Auth,
@@ -93,7 +94,9 @@ impl SaeJoin {
         rsnxe: Option<&[u8]>,
         h2e_required: bool,
         akms: super::AkmSet,
+        ciphers: Option<rsn::Ciphers>,
     ) -> Result<Self, Error> {
+        let ciphers = ciphers.unwrap_or(rsn::Ciphers::LEGACY);
         if let Some(b) = rsnxe {
             // Extended RSN Capabilities: bits0..3 are the field length - 1.
             if b.is_empty() || usize::from(b[0] & 15) + 1 != b.len() {
@@ -105,16 +108,13 @@ impl SaeJoin {
             // An H2E-only BSS must advertise H2E in its RSNXE.
             return Err(Error::InvalidBss);
         }
-        let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
         if capability & 0x10 == 0
-            || ap.group_cipher != ccmp
-            || !ap.pairwise_ciphers.contains(&ccmp)
+            || !ciphers.valid()
+            // The selected group, pairwise and management ciphers.
+            || !ciphers.offered_by(ap, true)
             || ap.rsn_capabilities & rsn::RSN_CAP_NO_PAIRWISE != 0
             // ieee80211w=2: "PMF required but AP not MFP capable".
             || ap.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE == 0
-            || ap
-                .group_management_cipher
-                .is_some_and(|c| c != Suite::standard(rsn::CIPHER_BIP_CMAC_128))
         {
             return Err(Error::UnsupportedSecurity);
         }
@@ -146,6 +146,7 @@ impl SaeJoin {
         };
         Ok(Self {
             akm,
+            ciphers,
             h2e,
             advertise_h2e: pwe != SaePwe::HuntAndPeck,
             auth: Auth::Idle,
@@ -170,18 +171,24 @@ impl SaeJoin {
     pub fn pmkid(&self) -> Option<[u8; 16]> {
         self.pmkid
     }
-    /// The station RSNE body: CCMP-128, the negotiated AKM, MFPC|MFPR,
-    /// optional PMKID, default BIP-CMAC-128 group management cipher
-    /// (omitted, as `wpa_gen_wpa_ie_rsn` omits the default).
+    /// The negotiated cipher suites.
+    pub fn ciphers(&self) -> rsn::Ciphers {
+        self.ciphers
+    }
+    /// The station RSNE body: the selected group and pairwise ciphers, the
+    /// negotiated AKM, MFPC|MFPR, optional PMKID, and the group management
+    /// cipher (the default BIP-CMAC-128 omitted, as `wpa_gen_wpa_ie_rsn`
+    /// omits it).
     pub fn station_rsne(&self, pmkid: Option<[u8; 16]>) -> Vec<u8> {
         RsnIe {
             version: 1,
-            group_cipher: Suite::standard(rsn::CIPHER_CCMP_128),
-            pairwise_ciphers: vec![Suite::standard(rsn::CIPHER_CCMP_128)],
+            group_cipher: Suite::standard(self.ciphers.group),
+            pairwise_ciphers: vec![Suite::standard(self.ciphers.pairwise)],
             akms: vec![Suite::standard(self.akm.suite_type())],
             rsn_capabilities: rsn::RSN_CAP_MFP_REQUIRED | rsn::RSN_CAP_MFP_CAPABLE,
             pmkids: pmkid.into_iter().collect(),
-            group_management_cipher: None,
+            group_management_cipher: (self.ciphers.group_mgmt != rsn::CIPHER_BIP_CMAC_128)
+                .then_some(Suite::standard(self.ciphers.group_mgmt)),
         }
         .encode_body()
     }

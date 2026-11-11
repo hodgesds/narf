@@ -404,7 +404,18 @@ for `SecurityMode::Wpa2Psk`:
 - `Required` advertises MFPC|MFPR and refuses an AP without MFPC.
 
 PMF is in force when both RSNEs set MFPC; the AP's group management cipher
-must then be the default BIP-CMAC-128. With `AkmSet::PSK_SHA256` the plan
+must then be the selected one (default BIP-CMAC-128).
+`JoinOptions::ciphers: Option<rsn::Ciphers>` is the supplicant's selection
+of pairwise, group and group management cipher (`None`: CCMP-128 and
+BIP-CMAC-128). The AP's RSNE must offer them, the station RSNE names them
+(a non-default management cipher explicitly), `SaeJoin` does the same, and
+`JoinPlan::ciphers()` reports them. `rsn::Ciphers` gives the
+`wpa_cipher_key_len` of each suite (16 for CCMP-128/GCMP-128/BIP-*-128, 32
+for the 256-bit suites). `validate_sme_ies_for` accepts a supplicant RSNE
+with any of CCMP-128/256 and GCMP-128/256. `mfp::{BipKey, BipKeyStore,
+bip_protect, bip_verify}` implement BIP-CMAC-128/256 and BIP-GMAC-128/256
+(MMIE with an 8- or 16-octet MIC; BIP-GMAC nonce A2 || IPN), alongside the
+CMAC-128-only `MfpKeyStore`. With `AkmSet::PSK_SHA256` the plan
 also negotiates AKM 6 (PSK-SHA256), so PMF-required WPA2 APs that offer only
 AKM 6 can be joined as Linux does. `JoinPlan::akm() -> Option<KeyMgmt>` and
 `JoinPlan::pmf() -> bool` (always true for SAE) report the outcome.

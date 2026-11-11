@@ -27,6 +27,10 @@ use narf_crypto::bip_cmac::{
     ELEMENT_ID_MMIE, MMIE_LEN_CMAC_128,
 };
 
+#[path = "mfp_bip.rs"]
+mod bip;
+pub use bip::{bip_protect, bip_verify, BipKey, BipKeyStore};
+
 /// Errors surfaced to the MLME / supplicant layer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MfpError {
