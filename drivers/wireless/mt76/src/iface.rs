@@ -22,6 +22,9 @@ mod ap;
 pub(crate) mod ap_tests;
 #[path = "iface_monitor.rs"]
 mod monitor;
+#[cfg(any(test, feature = "builtin"))]
+#[path = "iface_nm_tests.rs"]
+mod nm_tests;
 #[path = "iface_p2p.rs"]
 pub(crate) mod p2p;
 #[path = "iface_p2p_go.rs"]
