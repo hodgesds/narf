@@ -333,6 +333,10 @@ static FRAME_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
 struct FrameCacheDrain {
     lock: IrqSafeSpinLock<()>,
     bypass: AtomicBool,
+    /// CPU holding `lock`, plus one; 0 when free. Lets a re-entrant drain on
+    /// the same CPU be caught instead of spinning forever with interrupts
+    /// off (the lock is IRQ-safe and not re-entrant).
+    owner: AtomicUsize,
 }
 
 impl FrameCacheDrain {
@@ -340,7 +344,45 @@ impl FrameCacheDrain {
         Self {
             lock: IrqSafeSpinLock::new(()),
             bypass: AtomicBool::new(false),
+            owner: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether the calling CPU holds this drain lock. Exact while it does:
+    /// the lock masks interrupts, so the holder cannot migrate.
+    fn held_by_this_cpu(&self) -> bool {
+        self.owner.load(Ordering::Relaxed) == narf_lib::percpu::current_cpu() + 1
+    }
+
+    /// Take the drain lock. Lock order: drain -> per-CPU cache -> zone. A
+    /// drain is never nested inside another drain of the same node: code
+    /// running under one (the closure of `with_node_cache_bypassed`) sees the
+    /// node's `bypass` set and must not start a second (see
+    /// `with_node_frame_caches_drained`).
+    fn lock(&self) -> FrameCacheDrainGuard<'_> {
+        assert!(
+            !self.held_by_this_cpu(),
+            "re-entrant frame-cache drain on one node would self-deadlock"
+        );
+        let guard = self.lock.lock();
+        self.owner
+            .store(narf_lib::percpu::current_cpu() + 1, Ordering::Relaxed);
+        FrameCacheDrainGuard {
+            drain: self,
+            _guard: guard,
+        }
+    }
+}
+
+struct FrameCacheDrainGuard<'a> {
+    drain: &'a FrameCacheDrain,
+    _guard: narf_lib::sync::IrqSafeSpinLockGuard<'a, ()>,
+}
+
+impl Drop for FrameCacheDrainGuard<'_> {
+    fn drop(&mut self) {
+        // Cleared before the lock guard field drops and releases the lock.
+        self.drain.owner.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1584,10 +1626,22 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
 /// Drain every CPU's cache for one node and run `f` while new cache entries
 /// are bypassed. Lock order is drain -> per-CPU cache -> zone; ordinary paths
 /// take at most one per-CPU cache before the zone and never take a drain lock.
+///
+/// When this CPU already holds the node's drain lock — inside the closure of
+/// [`with_node_cache_bypassed`], which keeps the lock while that closure
+/// allocates — the caches have just been emptied and, bypassed, receive
+/// nothing new, so there is nothing to drain: `f` runs on the zone directly.
+/// Taking the drain lock again there would spin forever with interrupts off
+/// on a node whose zone cannot satisfy the allocation. A drain held by
+/// another CPU is waited for as before.
 fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone) -> R) -> R {
     let node = node.min(MAX_NUMA_NODES - 1);
     let drain = &FRAME_CACHE_DRAIN[node];
-    let _drain_guard = drain.lock.lock();
+    if drain.held_by_this_cpu() {
+        debug_assert!(drain.bypass.load(Ordering::Acquire));
+        return f(&mut ZONES[node].0.lock());
+    }
+    let _drain_guard = drain.lock();
     drain.bypass.store(true, Ordering::Release);
     for cpu_cache in &FRAME_CACHES {
         let mut cache = cpu_cache.0.lock();
@@ -1611,7 +1665,7 @@ fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone)
 pub fn with_node_cache_bypassed<R>(node: usize, f: impl FnOnce() -> R) -> R {
     let node = node.min(MAX_NUMA_NODES - 1);
     let drain = &FRAME_CACHE_DRAIN[node];
-    let _drain_guard = drain.lock.lock();
+    let _drain_guard = drain.lock();
     drain.bypass.store(true, Ordering::Release);
     for cpu_cache in &FRAME_CACHES {
         let mut cache = cpu_cache.0.lock();
@@ -4335,6 +4389,46 @@ fn smoke_order1_frame_cache_spill_and_drain() -> narf_kernel_test::TestResult {
 }
 #[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_order1_frame_cache_spill_and_drain);
+
+/// A higher-order allocation made inside `with_node_cache_bypassed` on a node
+/// whose zone has no block of that order must return — from another node or
+/// as `Exhausted` — instead of re-taking the node's drain lock its caller
+/// holds. That re-entry spun forever with interrupts off whenever NUMA node 0
+/// started with no free frames (the kernel-test VM's kernel image can cover
+/// all of node 0). A node with no memory at all is the zone that is sure to
+/// have no block.
+#[cfg(feature = "kernel-test")]
+fn smoke_bypassed_node_high_order_alloc_returns() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    if !ALLOC.numa_aware.load(Ordering::Acquire) {
+        return TestResult::Skip("allocator is not NUMA-aware; every node maps to zone 0");
+    }
+    let Some(empty) = (0..MAX_NUMA_NODES)
+        .rev()
+        .find(|&node| node_total(node) == 0)
+    else {
+        return TestResult::Skip("every NUMA slot has memory");
+    };
+    let free_before: usize = (0..MAX_NUMA_NODES).map(node_free).sum();
+    for order in [1u8, 4, MAX_ORDER] {
+        let result = with_node_cache_bypassed(empty, || alloc_pages_on(empty, order));
+        if let Ok(block) = result {
+            if phys_to_node(block.start_address().raw()) == empty {
+                free_pages(block, order);
+                return TestResult::Fail("a node with no memory supplied a block");
+            }
+            free_pages(block, order);
+        }
+    }
+    let free_after: usize = (0..MAX_NUMA_NODES).map(node_free).sum();
+    if free_after != free_before {
+        return TestResult::Fail("bypassed allocation changed free-page accounting");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("memory/frame", smoke_bypassed_node_high_order_alloc_returns);
 
 #[cfg(feature = "kernel-test")]
 fn smoke_order0_frame_cache_batch_free_is_bounded() -> narf_kernel_test::TestResult {
