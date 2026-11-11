@@ -484,3 +484,106 @@ kernel_test_in!(
     "drivers/wireless/mt7921/pmf",
     mt76_pmf_teardown_sends_protected_deauth_before_key_retirement
 );
+
+/// wpa_supplicant's WPA2-Personal RSNE with `ieee80211w` = 1 or 2 toward a
+/// WMM AP: AKM `akm`, MFPC (|MFPR), sixteen PTKSA replay counters, zero
+/// PMKIDs, BIP-CMAC-128; then Extended Capabilities.
+fn wpa_supplicant_wpa2_ies(akm: u8, required: bool) -> Vec<u8> {
+    let caps: u8 = if required { 0xcc } else { 0x8c };
+    let mut ie = vec![
+        48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, akm,
+        caps, 0x00, 0, 0, 0x00, 0x0f, 0xac, 6,
+    ];
+    ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+    ie
+}
+
+/// The PMK-offload CONNECT of a NetworkManager WPA-PSK profile with PMF
+/// optional or required, as nl80211 hands it to the MT7922 owner: the
+/// supplicant's RSNE selects the owner profile (`wpa2_from_supplicant`),
+/// and the owner joins the FakeAp with exactly that AKM (PSK or
+/// PSK-SHA256), negotiates PMF, completes the 4-way handshake and installs
+/// the BIP IGTK.
+fn mt7922_wpa2_pmf_and_psk_sha256_from_the_supplicants_selection() -> TestResult {
+    use narf_wireless::association::Pmf;
+    use narf_wireless::eapol::KeyMgmt;
+    let cases = [
+        (2u8, true, KeyMgmt::Psk, pmf_ap()),
+        (
+            6,
+            false,
+            KeyMgmt::PskSha256,
+            FakeAp::wpa2(
+                super::wmm_tests::NETWORK,
+                b"narf",
+                6,
+                42,
+                [0x55; 32],
+                [0xaa; 32],
+            )
+            .and_then(|ap| ap.with_pmf(ApPmf::Optional))
+            .and_then(|ap| ap.with_akms(&[2, 6]))
+            .and_then(|ap| ap.with_igtk(IGTK, 4, 7))
+            .unwrap(),
+        ),
+    ];
+    for (akm, required, expected, ap) in cases {
+        let ies = wpa_supplicant_wpa2_ies(akm, required);
+        let Some(security) = Security::wpa2_from_supplicant([0x55; 32], &ies) else {
+            return TestResult::Fail("supplicant WPA2 PMF selection not mapped");
+        };
+        let want_pmf = if required {
+            Pmf::Required
+        } else {
+            Pmf::Optional
+        };
+        if !matches!(security, Security::Wpa2PskSelected { akm: a, pmf, .. }
+            if a == akm && pmf == want_pmf)
+        {
+            return TestResult::Fail("supplicant selection mapped to a different owner profile");
+        }
+        let (mut session, bss) = prepared(ap);
+        let aid = run(Box::pin(session.associate_station(
+            &bss,
+            b"narf",
+            security,
+            test_permission(),
+            &ies,
+        )));
+        if aid != Ok(42) {
+            return TestResult::Fail("WPA2 PMF join with the supplicant's elements failed");
+        }
+        let ap = session.backend.access_point.as_ref().unwrap();
+        if ap.phase() != ApPhase::Authorized || ap.akm() != Some(expected) || !ap.pmf() {
+            return TestResult::Fail("AP did not authorize the selected AKM with PMF");
+        }
+        if igtk_record(&session).is_none_or(|r| r[48..64] != IGTK) {
+            return TestResult::Fail("no BIP IGTK after the WPA2 PMF join");
+        }
+    }
+    // Legacy and malformed selections.
+    let legacy = [
+        48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2,
+        0x0c, 0x00,
+    ];
+    let mut mfpr_only = wpa_supplicant_wpa2_ies(2, true);
+    mfpr_only[20] = 0x4c;
+    let mut sae = wpa_supplicant_wpa2_ies(2, true);
+    sae[19] = 8;
+    if !matches!(
+        Security::wpa2_from_supplicant([0x55; 32], &legacy),
+        Some(Security::Wpa2Psk { .. })
+    ) || !matches!(
+        Security::wpa2_from_supplicant([0x55; 32], &[]),
+        Some(Security::Wpa2Psk { .. })
+    ) || Security::wpa2_from_supplicant([0x55; 32], &mfpr_only).is_some()
+        || Security::wpa2_from_supplicant([0x55; 32], &sae).is_some()
+    {
+        return TestResult::Fail("legacy / malformed WPA2 selection mapping");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/pmf",
+    mt7922_wpa2_pmf_and_psk_sha256_from_the_supplicants_selection
+);

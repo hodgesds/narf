@@ -575,7 +575,31 @@ impl Mt76Iface {
         use narf_wireless::association::SmeRsna;
         let rsna = match &req.security {
             narf_wireless::SecurityConfig::Open => SmeRsna::Open,
-            narf_wireless::SecurityConfig::Wpa2 { .. } => SmeRsna::Wpa2Psk,
+            // The supplicant's own AKM and PMF selection (PSK-SHA256,
+            // ieee80211w=1/2) is what the owner will negotiate.
+            narf_wireless::SecurityConfig::Wpa2 { psk } => {
+                match crate::mt7921::association::Security::wpa2_from_supplicant(*psk, &req.ie) {
+                    Some(crate::mt7921::association::Security::Wpa2PskSelected {
+                        akm,
+                        pmf,
+                        ..
+                    }) => SmeRsna::Wpa2 {
+                        akm,
+                        mfp: match pmf {
+                            narf_wireless::association::Pmf::Disabled => 0,
+                            narf_wireless::association::Pmf::Optional => {
+                                narf_wireless::rsn::RSN_CAP_MFP_CAPABLE
+                            }
+                            narf_wireless::association::Pmf::Required => {
+                                narf_wireless::rsn::RSN_CAP_MFP_CAPABLE
+                                    | narf_wireless::rsn::RSN_CAP_MFP_REQUIRED
+                            }
+                        },
+                    },
+                    Some(_) => SmeRsna::Wpa2Psk,
+                    None => return Err(WirelessError::NotSupported),
+                }
+            }
             narf_wireless::SecurityConfig::Wpa3 { .. } => SmeRsna::Wpa3Sae,
             _ => return Err(WirelessError::NotSupported),
         };
@@ -604,7 +628,8 @@ impl Mt76Iface {
         let security = match security {
             narf_wireless::SecurityConfig::Open => crate::mt7921::association::Security::Open,
             narf_wireless::SecurityConfig::Wpa2 { psk } => {
-                crate::mt7921::association::Security::Wpa2Psk { psk }
+                crate::mt7921::association::Security::wpa2_from_supplicant(psk, &req.ie)
+                    .ok_or(WirelessError::NotSupported)?
             }
             // WPA3-Personal: the driver runs SAE (sae_pwe=2) and PMF itself.
             narf_wireless::SecurityConfig::Wpa3 { password } => {
@@ -1243,16 +1268,16 @@ impl WirelessNetIface for Mt76Iface {
                 heard_beacon,
             )
             .await
-                .map_err(|error| {
-                    note_failure("associate: firmware join/handshake", &error);
-                    match error {
-                        Error::Bounds => WirelessError::InvalidArgs,
-                        Error::Busy => WirelessError::Busy,
-                        Error::Timeout => WirelessError::Timeout,
-                        Error::Authority => WirelessError::Denied,
-                        _ => WirelessError::HardwareError,
-                    }
-                })?;
+            .map_err(|error| {
+                note_failure("associate: firmware join/handshake", &error);
+                match error {
+                    Error::Bounds => WirelessError::InvalidArgs,
+                    Error::Busy => WirelessError::Busy,
+                    Error::Timeout => WirelessError::Timeout,
+                    Error::Authority => WirelessError::Denied,
+                    _ => WirelessError::HardwareError,
+                }
+            })?;
             let _ = aid;
             let (tx_prod, tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
             let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
@@ -1296,6 +1321,22 @@ impl WirelessNetIface for Mt76Iface {
     }
 
     fn supports_handshake_offload(&self) -> bool {
+        true
+    }
+
+    /// The native owner runs WPA2-PSK with required or optional PMF (BIP
+    /// IGTK, protected robust management frames, SA Query) from the PMK
+    /// (`Security::Wpa2PskSelected`), so CONNECT may carry
+    /// NL80211_MFP_REQUIRED or _OPTIONAL with the matching RSNE.
+    fn supports_wpa2_mfp_offload(&self) -> bool {
+        true
+    }
+    fn supports_optional_mfp(&self) -> bool {
+        true
+    }
+    /// PSK-SHA256 (AKM 6) runs through the same owner (AES-128-CMAC EAPOL
+    /// MIC, SHA-256 KDF in the shared supplicant).
+    fn supports_psk_sha256_offload(&self) -> bool {
         true
     }
 

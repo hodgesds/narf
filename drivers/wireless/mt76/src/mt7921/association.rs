@@ -82,6 +82,15 @@ pub enum Security {
         psk: [u8; 32],
         required: bool,
     },
+    /// WPA2-Personal exactly as a supplicant selected it for the owner to
+    /// run: AKM `akm` (PSK 2 or PSK-SHA256 6) under `ieee80211w` = `pmf`.
+    /// The plan offers only that AKM, so the owner's RSNE repeats the
+    /// supplicant's choice.
+    Wpa2PskSelected {
+        psk: [u8; 32],
+        akm: u8,
+        pmf: narf_wireless::association::Pmf,
+    },
     /// WPA3-Personal: SAE authentication (sae_pwe=2), PMF required.
     Wpa3Sae {
         password: SaePassword,
@@ -93,6 +102,7 @@ impl core::fmt::Debug for Security {
             Self::Open => "Open",
             Self::Wpa2Psk { .. } => "Wpa2Psk { .. }",
             Self::Wpa2PskPmf { .. } => "Wpa2PskPmf { .. }",
+            Self::Wpa2PskSelected { .. } => "Wpa2PskSelected { .. }",
             Self::Wpa3Sae { .. } => "Wpa3Sae { .. }",
         })
     }
@@ -108,7 +118,9 @@ impl Security {
     pub fn mode(&self) -> SecurityMode {
         match self {
             Self::Open => SecurityMode::Open,
-            Self::Wpa2Psk { .. } | Self::Wpa2PskPmf { .. } => SecurityMode::Wpa2Psk,
+            Self::Wpa2Psk { .. } | Self::Wpa2PskPmf { .. } | Self::Wpa2PskSelected { .. } => {
+                SecurityMode::Wpa2Psk
+            }
             Self::Wpa3Sae { .. } => SecurityMode::Wpa3Sae {
                 pwe: narf_wireless::association::SaePwe::Both,
             },
@@ -128,8 +140,62 @@ impl Security {
                 } else {
                     Pmf::Optional
                 }),
+            Self::Wpa2PskSelected { akm, pmf, .. } => JoinOptions::default()
+                .with_akms(if *akm == narf_wireless::rsn::AKM_PSK_SHA256 {
+                    AkmSet::PSK_SHA256
+                } else {
+                    AkmSet::PSK
+                })
+                .with_pmf(*pmf),
             Self::Wpa3Sae { .. } => JoinOptions::default().with_akms(AkmSet::ALL),
         }
+    }
+    /// The owner profile for a supplicant's WPA2-Personal request: its
+    /// RSNE's one AKM and MFPC/MFPR bits. Without an RSNE, or for plain
+    /// PSK without MFPC, the legacy profile.
+    pub fn wpa2_from_supplicant(psk: [u8; 32], ie: &[u8]) -> Option<Self> {
+        use narf_wireless::association::Pmf;
+        use narf_wireless::rsn;
+        let mut rest = ie;
+        let mut found = None;
+        while let [id, len, tail @ ..] = rest {
+            let len = usize::from(*len);
+            let body = tail.get(..len)?;
+            if *id == 48 {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(rsn::RsnIe::decode_body(body)?);
+            }
+            rest = &tail[len..];
+        }
+        let Some(rsne) = found else {
+            return Some(Self::Wpa2Psk { psk });
+        };
+        let [akm] = rsne.akms.as_slice() else {
+            return None;
+        };
+        if akm.oui != rsn::RSN_OUI || !matches!(akm.suite_type, rsn::AKM_PSK | rsn::AKM_PSK_SHA256)
+        {
+            return None;
+        }
+        let mfpc = rsne.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE != 0;
+        let mfpr = rsne.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED != 0;
+        let pmf = match (mfpc, mfpr) {
+            (false, false) => Pmf::Disabled,
+            (true, false) => Pmf::Optional,
+            (true, true) => Pmf::Required,
+            (false, true) => return None,
+        };
+        Some(if akm.suite_type == rsn::AKM_PSK && pmf == Pmf::Disabled {
+            Self::Wpa2Psk { psk }
+        } else {
+            Self::Wpa2PskSelected {
+                psk,
+                akm: akm.suite_type,
+                pmf,
+            }
+        })
     }
 }
 /// One accepted SAE Authentication receipt.

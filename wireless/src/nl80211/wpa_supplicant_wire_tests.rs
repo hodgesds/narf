@@ -446,3 +446,131 @@ kernel_test_in!(
     "wireless/nl80211/wpa_supplicant",
     smoke_nl80211_wpa_supplicant_connect_while_connected_is_ealready
 );
+
+// ── WPA2-Personal with PMF / PSK-SHA256 on a PMF-offloading owner ──────
+//
+// What wpa_supplicant 2.12 sends for a NetworkManager WPA-PSK profile with
+// `pmf` optional (`ieee80211w=1`) or required (`=2`) once the wiphy offers
+// the PMF handshake offload and NL80211_EXT_FEATURE_MFP_OPTIONAL: the RSNE
+// with MFPC (|MFPR), sixteen PTKSA replay counters toward a WMM AP, a zero
+// PMKID count and BIP-CMAC-128, and NL80211_ATTR_USE_MFP _OPTIONAL (2) or
+// _REQUIRED (1). With PSK-SHA256 offered by the AP, wpa_pick_key_mgmt
+// selects AKM 6 in both the RSNE and NL80211_ATTR_AKM_SUITES.
+
+fn pmf_rsne(akm: u8, caps: u16) -> Vec<u8> {
+    let mut ie = alloc::vec![
+        48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, akm,
+    ];
+    ie.extend_from_slice(&caps.to_le_bytes());
+    ie.extend_from_slice(&[0, 0, 0x00, 0x0f, 0xac, 6]);
+    ie
+}
+
+fn pmf_connect(akm: u32, rsne: &[u8], mfp: u32) -> Vec<u8> {
+    let mut a = Vec::new();
+    push_attr(&mut a, 3, &7u32.to_ne_bytes());
+    push_attr(&mut a, 204, &[]);
+    push_attr(&mut a, 6, &BSSID);
+    push_attr(&mut a, 38, &5200u32.to_ne_bytes());
+    push_attr(&mut a, 52, SSID);
+    let mut ie = rsne.to_vec();
+    ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+    push_attr(&mut a, 42, &ie);
+    push_attr(&mut a, 75, &2u32.to_ne_bytes());
+    push_attr(&mut a, 73, &CCMP.to_ne_bytes());
+    push_attr(&mut a, 74, &CCMP.to_ne_bytes());
+    push_attr(&mut a, 76, &akm_list(&[akm]));
+    push_attr(&mut a, 254, &PMK);
+    push_attr(&mut a, 68, &[]);
+    push_attr(&mut a, 102, &0x888eu16.to_ne_bytes());
+    push_attr(&mut a, 66, &mfp.to_ne_bytes()); // USE_MFP
+    push_attr(&mut a, 53, &0u32.to_ne_bytes());
+    a
+}
+
+/// A wiphy like the MT7921 one after the PMF offload: PSK and PSK-SHA256
+/// from the PMK, required and optional PMF.
+fn pmf_wiphy() -> ConnectCaps {
+    ConnectCaps {
+        psk_mfp_offload: true,
+        optional_mfp: true,
+        psk_sha256: true,
+        ..offload_wiphy()
+    }
+}
+
+fn check_pmf() -> Result<(), &'static str> {
+    use crate::association::{validate_sme_ies_for, SmeRsna};
+    const MFPC: u16 = 0x80;
+    const MFPR: u16 = 0x40;
+    let psk = |o: Result<Operation, i32>| matches!(o, Ok(Operation::Connect { cred: Credential::Psk(ref p), .. }) if **p == PMK);
+    // (AKM attribute, RSNE AKM, RSNE capabilities incl. replay counters,
+    // USE_MFP): optional and required PMF with PSK and PSK-SHA256.
+    for (akm, rsne_akm, caps, mfp) in [
+        (AKM_PSK, 2u8, MFPC | 0x0c, 2u32),
+        (AKM_PSK, 2, MFPC | MFPR | 0x0c, 1),
+        (AKM_PSK_SHA256, 6, MFPC | 0x0c, 2),
+        (AKM_PSK_SHA256, 6, MFPC | MFPR | 0x0c, 1),
+    ] {
+        let rsne = pmf_rsne(rsne_akm, caps);
+        if !psk(parse(&pmf_connect(akm, &rsne, mfp), pmf_wiphy())) {
+            return Err("wpa_supplicant's WPA2 PMF / PSK-SHA256 CONNECT refused");
+        }
+        // The native owner's admission against the profile it negotiates.
+        if validate_sme_ies_for(
+            &rsne,
+            SmeRsna::Wpa2 {
+                akm: rsne_akm,
+                mfp: caps & (MFPC | MFPR),
+            },
+        )
+        .is_err()
+        {
+            return Err("owner refused the supplicant's WPA2 PMF RSNE");
+        }
+        if validate_sme_ies_for(&rsne, SmeRsna::Wpa2Psk).is_ok() {
+            return Err("a PMF / PSK-SHA256 RSNE passed as legacy WPA2-PSK");
+        }
+    }
+    // An owner without PSK-SHA256 refuses AKM 6; the RSNE must name the
+    // AKM of NL80211_ATTR_AKM_SUITES.
+    let sha = pmf_rsne(6, MFPC | 0x0c);
+    let no_sha = ConnectCaps {
+        psk_sha256: false,
+        ..pmf_wiphy()
+    };
+    if parse(&pmf_connect(AKM_PSK_SHA256, &sha, 2), no_sha).err() != Some(EOPNOTSUPP)
+        || parse(&pmf_connect(AKM_PSK, &sha, 2), pmf_wiphy()).err() != Some(EOPNOTSUPP)
+    {
+        return Err("PSK-SHA256 admitted without the owner, or AKM/RSNE mismatch");
+    }
+    // USE_MFP must match the RSNE: no MFPC for _OPTIONAL is refused.
+    if parse(&pmf_connect(AKM_PSK, &pmf_rsne(2, 0x0c), 2), pmf_wiphy()).is_ok() {
+        return Err("USE_MFP optional with an RSNE without MFPC");
+    }
+    // Owner side: the AKM and MFP bits must equal what it negotiated.
+    if validate_sme_ies_for(&pmf_rsne(2, MFPC), SmeRsna::Wpa2 { akm: 6, mfp: MFPC }).is_ok()
+        || validate_sme_ies_for(
+            &pmf_rsne(2, MFPC),
+            SmeRsna::Wpa2 {
+                akm: 2,
+                mfp: MFPC | MFPR,
+            },
+        )
+        .is_ok()
+    {
+        return Err("owner admitted a different AKM / PMF selection");
+    }
+    Ok(())
+}
+
+fn smoke_nl80211_wpa_supplicant_2_12_wpa2_pmf_and_psk_sha256_offload() -> TestResult {
+    match check_pmf() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "wireless/nl80211/wpa_supplicant",
+    smoke_nl80211_wpa_supplicant_2_12_wpa2_pmf_and_psk_sha256_offload
+);

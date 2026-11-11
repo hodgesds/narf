@@ -1076,6 +1076,7 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
         // cipher_suites (-EINVAL otherwise), so the wiphy advertises CCMP.
         cipher_suites: &[crate::CIPHER_SUITE_CCMP],
         scan_random_mac: false,
+        psk_sha256: false,
         connected: false,
         roam: false,
         max_scan_ssids: 0,
