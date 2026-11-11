@@ -3784,7 +3784,16 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
                     channels: ch.clone(),
                 })
                 .collect(),
-            modes: WirelessModes::STATION | WirelessModes::AP | WirelessModes::P2P,
+            // NL80211_IFTYPE_MONITOR only where `hw_params.supports_monitor`
+            // (Linux removes it from the wiphy otherwise).
+            modes: WirelessModes::STATION
+                | WirelessModes::AP
+                | WirelessModes::P2P
+                | if self.radio.monitor {
+                    WirelessModes::MONITOR
+                } else {
+                    WirelessModes::empty()
+                },
             hw_caps: HwCaps {
                 ht_supported: self.radio.ht,
                 vht_supported: self.radio.vht,

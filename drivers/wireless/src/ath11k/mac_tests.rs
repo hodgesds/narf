@@ -1370,6 +1370,16 @@ fn smoke_ath11k_mac_config_per_hw_rev() -> TestResult {
                 }
             }
         }
+        // hw_params.supports_monitor: only IPQ8074, IPQ6018 and QCN9074.
+        for &rev in client.iter().chain(ap.iter()) {
+            let want = matches!(
+                rev,
+                HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Qcn9074Hw10
+            );
+            if MacConfig::for_hw(rev, 1, false).supports_monitor != want {
+                return Err("supports_monitor differs from ath11k_hw_params");
+            }
+        }
         if MacConfig::wcn6855() != MacConfig::for_hw(HwRev::Wcn6855Hw20, 2, true) {
             return Err("wcn6855() is not the WCN6855 table entry");
         }
