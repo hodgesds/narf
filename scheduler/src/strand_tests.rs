@@ -126,6 +126,12 @@ impl StuckCpu {
         Some(Self(cpu))
     }
 
+    /// The same CPU between polls: still not draining, but running no task.
+    fn set_running(&self, running: bool) {
+        let task = if running { u64::MAX } else { 0 };
+        crate::CURRENT_TASK[self.0].store(task, Ordering::Release);
+    }
+
     fn release(self) {
         crate::CURRENT_TASK[self.0].store(0, Ordering::Release);
         crate::__test_clear_need_resched(self.0);
@@ -484,3 +490,405 @@ kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_stranded_wakes_run_on_another_cpu
 );
+
+/// The surplus rule covers staged wakes: a CPU that is running nothing keeps
+/// a single staged wake (it was kicked and will take it), gives one up when it
+/// holds two, and gives its only one up while it is running a task.
+fn smoke_scheduler_staged_pull_leaves_idle_cpu_its_only_wake() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    stuck.set_running(false);
+    let parked = [
+        park_probe_on(0, 1, stuck.0, None),
+        park_probe_on(1, 1, stuck.0, None),
+    ];
+    if parked.iter().any(Option::is_none) {
+        stuck.release();
+        return TestResult::Fail("could not park the probes on the stuck CPU");
+    }
+    let_cool();
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    let took_only_wake = pull(stuck.0, me);
+    if let Some(waker) = take_waker(1) {
+        waker.wake();
+    }
+    let took_one_of_two = pull(stuck.0, me);
+    let took_last = pull(stuck.0, me);
+    stuck.set_running(true);
+    let took_from_running = pull(stuck.0, me);
+    crate::poll_one_round();
+    let ran = polls(0) + polls(1);
+    stuck.release();
+    if took_only_wake {
+        return TestResult::Fail("an idle CPU's only staged wake was pulled from under it");
+    }
+    if !took_one_of_two || took_last {
+        return TestResult::Fail("an idle CPU with two staged wakes did not give up exactly one");
+    }
+    if !took_from_running || ran != 4 {
+        return TestResult::Fail("a busy CPU's only staged wake was not pulled and run");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_staged_pull_leaves_idle_cpu_its_only_wake
+);
+
+/// A parked task under a direct-handoff claim is being run by another task
+/// on its home CPU. The pull must not take it; once the claim is released it
+/// may.
+fn smoke_scheduler_staged_pull_skips_direct_claimed_task() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let Some((id, cell)) = park_probe_on(0, 1, stuck.0, None) else {
+        stuck.release();
+        return TestResult::Fail("could not park the probe on the stuck CPU");
+    };
+    let_cool();
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    cell.direct_claimed.store(true, Ordering::SeqCst);
+    let took_claimed = pull(stuck.0, me);
+    let still_parked = parked_on(stuck.0, id);
+    cell.direct_claimed.store(false, Ordering::SeqCst);
+    let took_released = pull(stuck.0, me);
+    crate::poll_one_round();
+    let ran = polls(0);
+    stuck.release();
+    if took_claimed || !still_parked {
+        return TestResult::Fail("a task under a direct-handoff claim was pulled");
+    }
+    if !took_released || ran != 2 {
+        return TestResult::Fail("the task was not pulled once its claim was released");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_staged_pull_skips_direct_claimed_task
+);
+
+/// The cache-hot window applies to staged wakes as it does to queued ones: a
+/// task that ran within the migration cost stays, and may go once it cools.
+fn smoke_scheduler_staged_pull_respects_cache_hot_window() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let Some((_id, cell)) = park_probe_on(0, 1, stuck.0, None) else {
+        stuck.release();
+        return TestResult::Fail("could not park the probe on the stuck CPU");
+    };
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    // Ran "just now", whatever the time the steps above took.
+    cell.last_run_cycles
+        .store(narf_time::now_cycles(), Ordering::Release);
+    let took_hot = pull(stuck.0, me);
+    let_cool();
+    let took_cold = pull(stuck.0, me);
+    stuck.release();
+    if took_hot {
+        return TestResult::Fail("a cache-hot staged wake was pulled");
+    }
+    if !took_cold {
+        return TestResult::Fail("a staged wake was not pulled after it cooled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_staged_pull_respects_cache_hot_window
+);
+
+/// A pulled task that sleeps again on its new CPU is woken there directly:
+/// nothing of it is left on the CPU it was pulled from.
+fn smoke_scheduler_pulled_task_sleeps_and_wakes_on_new_cpu() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let Some((id, _cell)) = park_probe_on(0, 2, stuck.0, None) else {
+        stuck.release();
+        return TestResult::Fail("could not park the probe on the stuck CPU");
+    };
+    let_cool();
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    let pulled = pull(stuck.0, me);
+    crate::poll_one_round();
+    let reparked_here = parked_on(me, id);
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    let staged_here = staged_parked_wakes(me);
+    crate::poll_one_round();
+    let ran = polls(0);
+    stuck.release();
+    if !pulled || !reparked_here {
+        return TestResult::Fail("pulled task did not run and sleep on the idle CPU");
+    }
+    if staged_here != 1 || ran != 3 {
+        return TestResult::Fail("re-wake of a pulled task was not staged on its new CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_pulled_task_sleeps_and_wakes_on_new_cpu
+);
+
+/// `set_task_affinity` moves a parked task off a CPU its new mask excludes.
+/// If the task had already been woken, the activation node goes with it.
+fn smoke_scheduler_affinity_move_takes_staged_wake_along() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let Some((id, _cell)) = park_probe_on(0, 2, stuck.0, None) else {
+        stuck.release();
+        return TestResult::Fail("could not park the probe on the stuck CPU");
+    };
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    let staged = staged_parked_wakes(stuck.0);
+    let moved = crate::set_task_affinity(id, CpuSet::single(CpuId(me as u32))).is_ok();
+    let left = staged_parked_wakes(stuck.0);
+    crate::poll_one_round();
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    crate::poll_one_round();
+    let ran = polls(0);
+    stuck.release();
+    if staged != 1 || !moved {
+        return TestResult::Fail("could not move a woken parked task by affinity");
+    }
+    if left != 0 {
+        return TestResult::Fail("affinity move left the task's activation node behind");
+    }
+    if ran != 3 {
+        return TestResult::Fail("re-wake after an affinity move waited on the old CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_affinity_move_takes_staged_wake_along
+);
+
+/// The tick-side kick fires only when a tick with wakes staged has seen the
+/// same scheduling-pass count before, and aims at the nearest halted online
+/// CPU above the caller, wrapping.
+fn smoke_scheduler_idle_balance_kick_decision() -> TestResult {
+    use core::sync::atomic::AtomicU64;
+    let seen = AtomicU64::new(0);
+    if crate::staged_wakes_stalled(&seen, 0) {
+        return TestResult::Fail("first tick with staged wakes kicked immediately");
+    }
+    if !crate::staged_wakes_stalled(&seen, 0) || !crate::staged_wakes_stalled(&seen, 0) {
+        return TestResult::Fail("a tick period without a scheduling point did not kick");
+    }
+    if crate::staged_wakes_stalled(&seen, 1) {
+        return TestResult::Fail("a CPU that passed a scheduling point still kicked");
+    }
+    if !crate::staged_wakes_stalled(&seen, 1) {
+        return TestResult::Fail("a second stall was not noticed");
+    }
+
+    let online = 0b1011_0111u64;
+    let all = |_: usize| true;
+    if crate::idle_balance_kick_target(2, online, all) != Some(4) {
+        return TestResult::Fail("kick did not go to the next online CPU");
+    }
+    if crate::idle_balance_kick_target(7, online, all) != Some(0) {
+        return TestResult::Fail("kick did not wrap past the highest CPU");
+    }
+    if crate::idle_balance_kick_target(2, online, |cpu| cpu == 1) != Some(1) {
+        return TestResult::Fail("kick did not skip CPUs that are not halted");
+    }
+    if crate::idle_balance_kick_target(2, online, |cpu| cpu == 2 || cpu == 3).is_some() {
+        return TestResult::Fail("kick aimed at the caller or an offline CPU");
+    }
+    if crate::idle_balance_kick_target(63, (1u64 << 63) | 1, all) != Some(0) {
+        return TestResult::Fail("kick from the last CPU index did not wrap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_idle_balance_kick_decision
+);
+
+const STRESS_FREE: usize = 20;
+const STRESS_PINNED: usize = 4;
+const STRESS_TASKS: usize = STRESS_FREE + STRESS_PINNED;
+const STRESS_ROUNDS: usize = 60;
+const STRESS_LIMIT_NS: u64 = 20_000_000_000;
+
+static STRESS_WAKER: [IrqSafeSpinLock<Option<Waker>>; STRESS_TASKS] =
+    [const { IrqSafeSpinLock::new(None) }; STRESS_TASKS];
+static STRESS_IN_POLL: [AtomicBool; STRESS_TASKS] =
+    [const { AtomicBool::new(false) }; STRESS_TASKS];
+static STRESS_POLLS: [AtomicUsize; STRESS_TASKS] = [const { AtomicUsize::new(0) }; STRESS_TASKS];
+static STRESS_DONE: AtomicUsize = AtomicUsize::new(0);
+static STRESS_OVERLAP: AtomicUsize = AtomicUsize::new(0);
+static STRESS_OFF_MASK: AtomicUsize = AtomicUsize::new(0);
+static STRESS_MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sleeps `STRESS_ROUNDS` times. Every poll checks that no other CPU is
+/// polling the same task and that the CPU is one the task may run on, and
+/// every few polls it holds its CPU without yielding so the wakes aimed there
+/// pile up behind it.
+struct StressTask {
+    index: usize,
+    left: usize,
+    pin: Option<usize>,
+    last_cpu: usize,
+}
+
+impl Future for StressTask {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let cpu = narf_lib::percpu::current_cpu();
+        if STRESS_IN_POLL[this.index].swap(true, Ordering::SeqCst) {
+            STRESS_OVERLAP.fetch_add(1, Ordering::Relaxed);
+        }
+        if this.pin.is_some_and(|pin| pin != cpu) {
+            STRESS_OFF_MASK.fetch_add(1, Ordering::Relaxed);
+        }
+        if this.last_cpu != NO_CPU && this.last_cpu != cpu {
+            STRESS_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        this.last_cpu = cpu;
+        let polled = STRESS_POLLS[this.index].fetch_add(1, Ordering::Relaxed);
+        if polled % 4 == this.index % 4 {
+            narf_time::busy_wait_cycles(narf_time::ns_to_cycles(1_500_000));
+        }
+        let finished = this.left == 0;
+        if !finished {
+            this.left -= 1;
+            *STRESS_WAKER[this.index].lock() = Some(cx.waker().clone());
+        }
+        STRESS_IN_POLL[this.index].store(false, Ordering::SeqCst);
+        if finished {
+            STRESS_DONE.fetch_add(1, Ordering::Relaxed);
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+}
+
+/// Real CPUs, stealing on: tasks sleep and are woken from the boot CPU while
+/// the CPUs they sleep on are regularly held in non-yielding polls, so wakes
+/// are staged, drained by owners, pulled by idle CPUs and re-staged
+/// concurrently. No wake may be lost, no task may be polled on two CPUs at
+/// once, and a pinned task may only ever run on its CPU.
+fn smoke_scheduler_staged_wake_stress() -> TestResult {
+    reset_probes();
+    let me = narf_lib::percpu::current_cpu();
+    let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
+    let mut aps = [0usize; MAX_CPUS];
+    let mut ap_count = 0;
+    for cpu in 0..MAX_CPUS {
+        if cpu != me && live & (1u64 << cpu) != 0 {
+            aps[ap_count] = cpu;
+            ap_count += 1;
+        }
+    }
+    if ap_count < 2 {
+        return TestResult::Skip("needs two APs that really came up");
+    }
+    // Crowd the tasks onto a few CPUs so that idle ones exist to pull.
+    let homes = &aps[..ap_count.min(3)];
+    for index in 0..STRESS_TASKS {
+        *STRESS_WAKER[index].lock() = None;
+        STRESS_IN_POLL[index].store(false, Ordering::Release);
+        STRESS_POLLS[index].store(0, Ordering::Release);
+    }
+    STRESS_DONE.store(0, Ordering::Release);
+    STRESS_OVERLAP.store(0, Ordering::Release);
+    STRESS_OFF_MASK.store(0, Ordering::Release);
+    STRESS_MIGRATIONS.store(0, Ordering::Release);
+    let pulls_before = crate::__test_staged_pulls();
+
+    crate::enable_work_stealing();
+    for index in 0..STRESS_TASKS {
+        let home = homes[index % homes.len()];
+        let pin = (index >= STRESS_FREE).then_some(home);
+        let spec = match pin {
+            Some(cpu) => TaskSpec {
+                affinity: Affinity::pinned(CpuId(cpu as u32)),
+                ..TaskSpec::kernel_any()
+            },
+            None => any_cpu_preferring(home),
+        };
+        crate::spawn_with_spec(
+            StressTask {
+                index,
+                left: STRESS_ROUNDS,
+                pin,
+                last_cpu: NO_CPU,
+            },
+            spec,
+        );
+    }
+
+    // The boot CPU only wakes; it runs none of the tasks.
+    let finished = wait_for(STRESS_LIMIT_NS, || {
+        for waker in STRESS_WAKER.iter() {
+            let waker = waker.lock().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(200_000));
+        STRESS_DONE.load(Ordering::Acquire) == STRESS_TASKS
+    });
+    crate::disable_work_stealing();
+    let short = (0..STRESS_TASKS)
+        .any(|index| STRESS_POLLS[index].load(Ordering::Acquire) != STRESS_ROUNDS + 1);
+    let overlap = STRESS_OVERLAP.load(Ordering::Acquire);
+    let off_mask = STRESS_OFF_MASK.load(Ordering::Acquire);
+    let migrations = STRESS_MIGRATIONS.load(Ordering::Acquire);
+    let pulls = crate::__test_staged_pulls().wrapping_sub(pulls_before);
+    reset_probes();
+
+    if !finished {
+        return TestResult::Fail("a wake was lost: not every task finished its rounds");
+    }
+    if short {
+        return TestResult::Fail("a task was polled a number of times its wakes do not explain");
+    }
+    if overlap != 0 {
+        return TestResult::Fail("a task was polled on two CPUs at once");
+    }
+    if off_mask != 0 {
+        return TestResult::Fail("a pinned task ran outside its affinity mask");
+    }
+    if migrations == 0 {
+        return TestResult::Fail("no task ever moved CPU: the stress did not exercise migration");
+    }
+    if pulls == 0 {
+        return TestResult::Fail("no staged wake was ever pulled: the stress missed the new path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler/strand", smoke_scheduler_staged_wake_stress);
