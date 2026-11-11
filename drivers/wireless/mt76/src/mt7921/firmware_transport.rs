@@ -645,6 +645,12 @@ pub(crate) fn boot_receive_publish(epoch: u64, publish: impl FnOnce()) -> Result
 pub(crate) static BOOT_FRAG_THRESHOLD: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
+/// cfg80211 `wdev->ps` for the home station (`NL80211_CMD_SET_POWER_SAVE`):
+/// on by default as with `CONFIG_CFG80211_DEFAULT_PS`. The boot owner
+/// samples it before each packet step and applies it to an associated BSS.
+pub(crate) static BOOT_POWER_SAVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
 pub fn step_boot_network(tx: Option<&[u8]>) -> Result<PacketStep, Error> {
     prepare_boot_keys()?;
     let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
@@ -1698,6 +1704,11 @@ struct StationLink {
     /// Signal and receive rate of the frames from this link's AP, for
     /// NL80211_CMD_GET_STATION; reset with each association.
     link_stats: crate::mt7921::link_stats::LinkStats,
+    /// cfg80211 `wdev->ps` as the owner should apply it, and the power
+    /// state the firmware BSS last took (`UNI_BSS_INFO_PS`; awake after
+    /// each association).
+    ps_wanted: bool,
+    ps_applied: bool,
     bss: Option<ScanBss>,
     /// This link's group role captured at join; retained for the exact
     /// disconnect record of that association (Linux `vif->p2p` is fixed per
@@ -1754,6 +1765,8 @@ impl StationLink {
             tx_restart: None,
             peer_lost: false,
             link_stats: crate::mt7921::link_stats::LinkStats::default(),
+            ps_wanted: false,
+            ps_applied: false,
             bss: None,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
             permission: None,

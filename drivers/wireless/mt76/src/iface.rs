@@ -1351,6 +1351,20 @@ impl WirelessNetIface for Mt76Iface {
         true
     }
 
+    /// mac80211 `SUPPORTS_PS | SUPPORTS_DYNAMIC_PS` (mt792x_init_wiphy)
+    /// with `WIPHY_FLAG_PS_ON_BY_DEFAULT`: power save starts on.
+    fn power_save_default(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    /// `ieee80211_set_power_mgmt` -> `BSS_CHANGED_PS` ->
+    /// `mt7921_mcu_uni_bss_ps`: the owner applies it to the associated BSS
+    /// on its next packet step, and to every later association.
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        crate::mt7921::firmware_transport::BOOT_POWER_SAVE.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// mac80211 `sta_set_sinfo` for the AP: last and averaged signal and
     /// per-chain signal of its frames, the last data-frame receive rate,
     /// and the netdev's packet counters (the station's only traffic).

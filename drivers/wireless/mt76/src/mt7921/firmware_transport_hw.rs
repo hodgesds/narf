@@ -2113,6 +2113,8 @@ impl Transport {
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
         self.session.frag_threshold =
             super::BOOT_FRAG_THRESHOLD.load(core::sync::atomic::Ordering::Relaxed);
+        self.session.station.ps_wanted =
+            super::BOOT_POWER_SAVE.load(core::sync::atomic::Ordering::Relaxed);
         self.session.step_network(tx)
     }
     pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {
