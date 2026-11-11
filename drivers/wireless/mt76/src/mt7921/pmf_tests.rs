@@ -25,7 +25,7 @@ fn sae_ap(pwe: ApSaePwe) -> FakeAp {
     .unwrap()
 }
 
-fn pmf_ap() -> FakeAp {
+pub(super) fn pmf_ap() -> FakeAp {
     FakeAp::wpa2(
         super::wmm_tests::NETWORK,
         b"narf",
@@ -40,7 +40,7 @@ fn pmf_ap() -> FakeAp {
 }
 
 /// A boxed, radio-ready session whose model peer is `ap`.
-fn prepared(ap: FakeAp) -> (Box<Session<Model>>, ScanBss) {
+pub(super) fn prepared(ap: FakeAp) -> (Box<Session<Model>>, ScanBss) {
     let mut model = Model::new();
     let beacon = ap.beacon();
     let bss = ScanBss {

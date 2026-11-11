@@ -79,6 +79,9 @@ pub struct Mt76Iface {
     p2p_go: IrqSafeSpinLock<Option<Arc<p2p_go::P2pGoIface>>>,
     vif_slots: IrqSafeSpinLock<crate::mt7921::vif_slots::Slots>,
     scan_cache: IrqSafeSpinLock<Vec<ScanBss>>,
+    /// `(bssid, channel)` of the cached results whose Beacon the latest
+    /// scan received (`ScanReport::beaconed`), replaced with the cache.
+    scan_beaconed: IrqSafeSpinLock<Vec<([u8; 6], u8)>>,
     rx_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     rx_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
@@ -125,6 +128,7 @@ impl Mt76Iface {
             p2p_go: IrqSafeSpinLock::new(None),
             vif_slots: IrqSafeSpinLock::new(crate::mt7921::vif_slots::Slots::default()),
             scan_cache: IrqSafeSpinLock::new(Vec::new()),
+            scan_beaconed: IrqSafeSpinLock::new(Vec::new()),
             rx_ring: IrqSafeSpinLock::new(None),
             tx_ring: IrqSafeSpinLock::new(None),
             rx_prod: IrqSafeSpinLock::new(None),
@@ -179,6 +183,12 @@ impl Mt76Iface {
             });
         }
         bands
+    }
+
+    /// Forget the cached scan results and which of them were beaconed.
+    pub(crate) fn clear_scan_cache(&self) {
+        self.scan_cache.lock().clear();
+        self.scan_beaconed.lock().clear();
     }
 
     /// STATION or P2P_CLIENT: mac80211 runs both as a STATION vif
@@ -509,7 +519,7 @@ impl Mt76Iface {
             .store(now.saturating_add(delay), Ordering::Release);
         self.lose_link();
         self.teardown_needed.store(true, Ordering::Release);
-        self.scan_cache.lock().clear();
+        self.clear_scan_cache();
         crate::mt7921::firmware_transport::recover_boot_radio(self.mac())
             .await
             .map_err(|_| WirelessError::HardwareError)?;
@@ -580,12 +590,17 @@ impl Mt76Iface {
 
     /// Resolve the cached scan target and the native security owner, and
     /// require a current transmit permission for it.
+    ///
+    /// `follow_heard_ap` (the infrastructure station only) admits a radar or
+    /// NO_IR channel when the latest scan received the BSS's own Beacon;
+    /// the returned flag says whether the grant depends on that.
     pub(super) fn resolve_join(
         &self,
         req: &AssociateRequest,
         security: narf_wireless::SecurityConfig,
         six: bool,
-    ) -> Result<(ScanBss, crate::mt7921::association::Security), WirelessError> {
+        follow_heard_ap: bool,
+    ) -> Result<(ScanBss, crate::mt7921::association::Security, bool), WirelessError> {
         let security = match security {
             narf_wireless::SecurityConfig::Open => crate::mt7921::association::Security::Open,
             narf_wireless::SecurityConfig::Wpa2 { psk } => {
@@ -616,14 +631,22 @@ impl Mt76Iface {
             .ok_or(WirelessError::InvalidArgs)?;
 
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| WirelessError::Denied)?;
-        if six {
+        let heard = follow_heard_ap
+            && !six
+            && self
+                .scan_beaconed
+                .lock()
+                .contains(&(bss.bssid, bss.channel));
+        let grant = if six {
             crate::mt7921::association::TxPermission::from_ap(&domain, self.radio, &bss)
+        } else if heard {
+            crate::mt7921::association::TxPermission::from_heard_ap(&domain, bss.channel)
         } else {
             crate::mt7921::association::TxPermission::from_domain(&domain, bss.channel)
         }
         .ok_or(WirelessError::Denied)?;
 
-        Ok((bss, security))
+        Ok((bss, security, grant.follows_heard_ap()))
     }
 
     fn enqueue(&self, bytes: &[u8]) -> Result<(), ()> {
@@ -1111,6 +1134,7 @@ impl WirelessNetIface for Mt76Iface {
                 }
             };
             let mut found = Vec::new();
+            let mut beaconed = Vec::new();
             if !channels.is_empty() {
                 let report = scan_boot_with_options(
                     &channels,
@@ -1123,6 +1147,7 @@ impl WirelessNetIface for Mt76Iface {
                 .await
                 .map_err(map_error)?;
                 found = report.bss;
+                beaconed = report.beaconed;
             }
             let six_ids = six_ghz_scan_ids(&req, &requested_6ghz, &found);
             if !six_ids.is_empty() {
@@ -1138,6 +1163,7 @@ impl WirelessNetIface for Mt76Iface {
                 .await
                 .map_err(map_error)?;
                 found.extend(report.bss);
+                beaconed.extend(report.beaconed);
             }
             let results = found
                 .iter()
@@ -1151,6 +1177,7 @@ impl WirelessNetIface for Mt76Iface {
                 })
                 .collect();
             *self.scan_cache.lock() = found;
+            *self.scan_beaconed.lock() = beaconed;
             Ok(results)
         }
         .await;
@@ -1200,15 +1227,22 @@ impl WirelessNetIface for Mt76Iface {
             return Err(WirelessError::Busy);
         }
         let security = core::mem::replace(&mut req.security, narf_wireless::SecurityConfig::Open);
-        let (bss, security) = self
-            .resolve_join(&req, security, six)
+        let (bss, security, heard_beacon) = self
+            .resolve_join(&req, security, six, true)
             .inspect_err(|error| note_failure("associate: BSS/security resolution", error))?;
         {
             use crate::mt7921::firmware_transport::{associate_boot_station_as, Error};
             // Stable under `control`: SET_INTERFACE also takes that lock.
             let p2p_client = self.current_iftype() == 8;
-            let aid = associate_boot_station_as(&bss, &req.ssid, security, &req.ie, p2p_client)
-                .await
+            let aid = associate_boot_station_as(
+                &bss,
+                &req.ssid,
+                security,
+                &req.ie,
+                p2p_client,
+                heard_beacon,
+            )
+            .await
                 .map_err(|error| {
                     note_failure("associate: firmware join/handshake", &error);
                     match error {
@@ -1587,7 +1621,7 @@ pub(crate) fn remove_scan_iface() {
     iface.withdraw_p2p_group();
     iface.withdraw_p2p_go();
     iface.withdraw_p2p_metadata();
-    iface.scan_cache.lock().clear();
+    iface.clear_scan_cache();
     narf_wireless::registry::unregister(&iface.name);
     if let Some(cap) = iface.registration_cap.lock().take() {
         narf_net::registry().unregister_for_handle(&cap);

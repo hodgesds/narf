@@ -502,16 +502,19 @@ pub async fn associate_boot_station(
     security: crate::mt7921::association::Security,
     extra_ies: &[u8],
 ) -> Result<u16, Error> {
-    associate_boot_station_as(bss, ssid, security, extra_ies, false).await
+    associate_boot_station_as(bss, ssid, security, extra_ies, false, false).await
 }
 
 /// Station or P2P-client (`p2p_client`) join on the retained boot owner.
+/// `heard_beacon`: the latest scan received the BSS's own Beacon, which lets
+/// an infrastructure station follow it onto a radar/NO_IR channel.
 pub(crate) async fn associate_boot_station_as(
     bss: &ScanBss,
     ssid: &[u8],
     security: crate::mt7921::association::Security,
     extra_ies: &[u8],
     p2p_client: bool,
+    heard_beacon: bool,
 ) -> Result<u16, Error> {
     finish_boot_keys().await?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
@@ -525,7 +528,14 @@ pub(crate) async fn associate_boot_station_as(
     owner
         .as_mut()
         .ok_or(Error::DeviceGone)?
-        .associate_station_as(bss, ssid, security, extra_ies, network)
+        .associate_station_as(
+            bss,
+            ssid,
+            security,
+            extra_ies,
+            network,
+            heard_beacon && !p2p_client,
+        )
         .await
 }
 

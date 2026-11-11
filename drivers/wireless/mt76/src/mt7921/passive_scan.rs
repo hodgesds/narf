@@ -57,9 +57,32 @@ pub fn validate_scan_probe_ies(mut bytes: &[u8]) -> Result<(), Error> {
 #[derive(Clone, Debug)]
 pub struct ScanReport {
     pub bss: Vec<ScanBss>,
+    /// `(bssid, channel)` of every result whose own Beacon (not only a
+    /// Probe Response) this scan received. Only such a BSS may be followed
+    /// onto a radar/NO_IR channel (`TxPermission::from_heard_ap`).
+    pub beaconed: Vec<([u8; 6], u8)>,
     pub received: u32,
     pub ignored: u32,
     pub truncated: bool,
+}
+
+impl ScanReport {
+    /// Record `bss` as beaconed when `packet` is its Beacon frame.
+    pub(super) fn note_beacon(&mut self, packet: &[u8], bss: &ScanBss) {
+        let key = (bss.bssid, bss.channel);
+        if bss.band.is_none()
+            && is_beacon(packet)
+            && !self.beaconed.contains(&key)
+            && self.beaconed.len() < 64
+        {
+            self.beaconed.push(key);
+        }
+    }
+}
+
+/// A native management RX packet carrying a Beacon (subtype 8).
+pub(super) fn is_beacon(packet: &[u8]) -> bool {
+    rx_frame(packet).is_some_and(|frame| frame.first() == Some(&0x80))
 }
 
 fn word(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -797,6 +820,7 @@ impl<B: Backend> Session<B> {
             .await?;
             let mut report = ScanReport {
                 bss: Vec::new(),
+                beaconed: Vec::new(),
                 received: 0,
                 ignored: 0,
                 truncated: false,
@@ -830,6 +854,7 @@ impl<B: Backend> Session<B> {
                         if scan_id(&bss).is_none_or(|id| !channels.contains(&id)) {
                             continue;
                         }
+                        report.note_beacon(&packet, &bss);
                         if let Some(old) = report.bss.iter_mut().find(|old| {
                             old.bssid == bss.bssid
                                 && old.channel == bss.channel
