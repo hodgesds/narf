@@ -81,33 +81,68 @@ pub const PMC_ENABLE_ALL: u32 = 0xFFFF_FFFF;
 
 // ── PMC_BOOT_0 field layout ──────────────────────────────────────
 //
-// Bits[24:20] — architecture version (Maxwell=0x04, Pascal=0x05,
-// Volta=0x06, Turing=0x07, Ampere=0x08, Ada=0x09).
+// The architecture is a 6-bit field SPLIT across the register:
 //
-// Layout from
-// `drivers/gpu/drm/nouveau/include/nvkm/core/device.h` cited
-// `NVKM_DEVICE_PMC_BOOT_0` and `nvkm/subdev/mc/g84.c::g84_mc`.
-// Field positions verified against `open-gpu-doc/manuals/*` PMC
-// register files.
+//   bits[3:0]    minor revision
+//   bits[7:4]    major revision
+//   bit  8       architecture_1 — MSB of the architecture
+//   bits[23:20]  implementation (chip variant within an arch)
+//   bits[28:24]  architecture_0 — low 5 bits of the architecture
+//
+//   architecture = ((raw >> 8) & 1) << 5 | ((raw >> 24) & 0x1F)
+//
+// Grounded against the upstream Linux Nova driver
+// (`drivers/gpu/nova-core/regs.rs`, commit
+// 1b155edcab0832a887387dd77e209e37beb7b49c — the commit that
+// converted the open-gpu-doc register macros into Nova's
+// register definitions; NVIDIA-authored, derived from
+// open-gpu-doc/manuals):
+//
+//   NV_PMC_BOOT_0: minor 3:0, major 7:4, architecture_1 bit 8
+//     ("MSB of the architecture"), implementation 23:20,
+//     architecture_0 bits 28:24 ("Lower bits of the architecture")
+//
+// Nova's `Architecture` enum pins the resulting values:
+// GF100 = 0x0c, Turing = 0x16, Ampere = 0x17, Ada = 0x19.
+// The remaining family values in `chip::ChipFamily` follow the
+// same rule from the NVxx codes (arch = NV-code >> 4).
+//
+// Two earlier readings of this register were wrong and are
+// corrected here: (1) treating bits[28:20] as one 9-bit
+// architecture tag folds the implementation nibble into the tag
+// (a Turing TU102 with implementation 0x2 decodes as 0x162,
+// not 0x160); (2) treating bits[19:8] as a 12-bit implementation
+// field overlaps architecture_1. Both the gpu copy's
+// `nvidia_gpu_pmc::Boot0` and this crate's previous decoder
+// made those mistakes (self-consistent fixtures masked them —
+// see the crate-split step-3 PR body). The cited
+// `dev_pmc.ref.txt` does not exist in open-gpu-doc/manuals
+// (tu102/ and ga102/ carry only `dev_display_withoffset.ref.txt`),
+// so the Nova register definitions are the authority here.
 
 /// Mask for `PMC_BOOT_0[3:0]` — minor revision.
 pub const PMC_BOOT_0_MINOR_MASK: u32 = 0x0000_000F;
 /// Mask for `PMC_BOOT_0[7:4]` — major revision.
 pub const PMC_BOOT_0_MAJOR_MASK: u32 = 0x0000_00F0;
-/// Mask for `PMC_BOOT_0[19:8]` — implementation (chip variant).
-pub const PMC_BOOT_0_IMPL_MASK: u32 = 0x000F_FF00;
-/// Mask for `PMC_BOOT_0[24:20]` — architecture version (Maxwell=4,
-/// Pascal=5, etc.). Bits[24:20] is what `chip::ChipFamily` decodes.
-pub const PMC_BOOT_0_ARCH_MASK: u32 = 0x01F0_0000;
-/// Shift to recover the architecture nibble.
-pub const PMC_BOOT_0_ARCH_SHIFT: u32 = 20;
+/// Mask for `PMC_BOOT_0[23:20]` — implementation (chip variant).
+pub const PMC_BOOT_0_IMPL_MASK: u32 = 0x00F0_0000;
+/// Shift to recover the implementation nibble.
+pub const PMC_BOOT_0_IMPL_SHIFT: u32 = 20;
+/// Mask for `PMC_BOOT_0[28:24]` — architecture_0, the low 5 bits
+/// of the architecture value.
+pub const PMC_BOOT_0_ARCH0_MASK: u32 = 0x1F00_0000;
+/// Shift to recover architecture_0.
+pub const PMC_BOOT_0_ARCH0_SHIFT: u32 = 24;
+/// Mask for `PMC_BOOT_0[8]` — architecture_1, the MSB of the
+/// architecture value.
+pub const PMC_BOOT_0_ARCH1_MASK: u32 = 0x0000_0100;
 
 /// Decoded `PMC_BOOT_0`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Boot0 {
     pub family: ChipFamily,
-    /// Implementation (chip variant). For GA102 = 0x02, GA104 =
-    /// 0x04, …
+    /// Implementation (chip variant within an architecture) — the
+    /// 4-bit nibble at bits[23:20].
     pub implementation: u16,
     pub major_rev: u8,
     pub minor_rev: u8,
@@ -126,12 +161,11 @@ impl Boot0 {
     pub const fn decode(raw: u32) -> Self {
         let minor_rev = (raw & PMC_BOOT_0_MINOR_MASK) as u8;
         let major_rev = ((raw & PMC_BOOT_0_MAJOR_MASK) >> 4) as u8;
-        let implementation = ((raw & PMC_BOOT_0_IMPL_MASK) >> 8) as u16;
-        let arch_field = ((raw & PMC_BOOT_0_ARCH_MASK) >> PMC_BOOT_0_ARCH_SHIFT) as u8;
-        // Encode the arch nibble back to the high-byte tag the
-        // ChipFamily decoder consumes ("0x40" style).
-        let arch_tag = arch_field << 4;
-        let family = ChipFamily::from_arch_version(arch_tag);
+        let implementation = ((raw & PMC_BOOT_0_IMPL_MASK) >> PMC_BOOT_0_IMPL_SHIFT) as u16;
+        let arch0 = ((raw & PMC_BOOT_0_ARCH0_MASK) >> PMC_BOOT_0_ARCH0_SHIFT) as u8;
+        let arch1 = ((raw & PMC_BOOT_0_ARCH1_MASK) >> 8) as u8;
+        let arch = (arch1 << 5) | arch0;
+        let family = ChipFamily::from_arch_version(arch);
         Self {
             family,
             implementation,

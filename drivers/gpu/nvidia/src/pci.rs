@@ -58,8 +58,9 @@ pub enum ProbeError {
     BarMapFailed,
     /// `PMC_BOOT_0` read as all-ones / zero — device gone.
     DeviceGone,
-    /// `PMC_BOOT_0[24:20]` doesn't match a family the driver
-    /// supports (we target Maxwell+; pre-Maxwell rejected here).
+    /// `PMC_BOOT_0`'s architecture field doesn't match a family
+    /// the driver supports (we target Maxwell+; pre-Maxwell
+    /// rejected here). Carries the raw 6-bit architecture value.
     UnsupportedFamily(u8),
 }
 

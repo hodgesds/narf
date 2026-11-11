@@ -931,12 +931,6 @@ pub mod intel_gpu_xelpg_scaler;
 pub mod intel_gpu_xelpg_tc;
 #[cfg(feature = "intel")]
 pub(crate) mod intel_gpu_xelpg_wm;
-pub mod nvidia_gpu;
-pub mod nvidia_gpu_disp;
-pub mod nvidia_gpu_falcon;
-pub mod nvidia_gpu_fifo;
-pub mod nvidia_gpu_gsp;
-pub mod nvidia_gpu_pmc;
 pub mod qxl;
 pub mod scanout_access;
 pub mod vmware_svga;

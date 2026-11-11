@@ -18,8 +18,9 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::bar::{bar0_window_target, PBUS_BAR0_WINDOW, PRAMIN_WINDOW_BASE};
 use crate::ce::{ce_class_for, ce_instance_count, CE_LAUNCH_DMA};
 use crate::chip::{
-    chip_info_for_pci_id, ChipFamily, AD102_RTX_4090, AD104_RTX_4070, GA102_RTX_3090,
-    GM200_GTX_TITAN_X, GP104_GTX_1080, KNOWN_DEVICES, NVIDIA_VENDOR, TU106_RTX_2060,
+    chip_info_for_pci_id, ChipFamily, AD102_RTX_4090, AD104_RTX_4070, AD106M_RTX_4070_MOBILE,
+    AD106_RTX_4060, AD107_RTX_4060, GA102_RTX_3090, GM200_GTX_TITAN_X, GP104_GTX_1080,
+    KNOWN_DEVICES, NVIDIA_VENDOR, TU106_RTX_2060,
 };
 use crate::disp::nv50::{
     aux_header, enc_head_display, enc_head_sync_end, enc_head_sync_start, enc_head_total,
@@ -34,8 +35,9 @@ use crate::fb::{ram_type_for_family, FbConfig, RamType};
 use crate::fifo::{channel_cap_for, pb_header, PbType, USERD_GP_GET, USERD_GP_PUT, USERD_SIZE};
 use crate::gr::{compute_class_for, graphics_class_for, AMPERE_A, MAXWELL_A, PASCAL_A};
 use crate::mc::{
-    Boot0, IntrSource, PMC_BOOT_0, PMC_BOOT_0_ARCH_SHIFT, PMC_ENABLE, PMC_ENABLE_ALL,
-    PMC_ENABLE_PDISP, PMC_ENABLE_PFIFO, PMC_INTR_0, PMC_INTR_EN_0,
+    Boot0, IntrSource, PMC_BOOT_0, PMC_BOOT_0_ARCH0_SHIFT, PMC_BOOT_0_ARCH1_MASK,
+    PMC_BOOT_0_IMPL_SHIFT, PMC_ENABLE, PMC_ENABLE_ALL, PMC_ENABLE_PDISP, PMC_ENABLE_PFIFO,
+    PMC_INTR_0, PMC_INTR_EN_0,
 };
 use crate::mmu::{
     pde_encode_pt, pte_encode_4k, Aperture, PageSize, PTE_RO, PTE_VALID, PTE_VOLATILE,
@@ -93,7 +95,10 @@ kernel_test_in!(
 );
 
 fn smoke_nvidia_chip_known_pci_ids_per_family() -> TestResult {
-    // Spot-check one well-known board per family.
+    // Spot-check one well-known board per family, plus the
+    // step-3 Ada corrections (pci.ids 2026.10.27): 0x2808 is
+    // AD106 [GeForce RTX 4060] and 0x2820 is AD106M
+    // [GeForce RTX 4070 Max-Q / Mobile].
     let cases = [
         (GM200_GTX_TITAN_X, ChipFamily::Maxwell, "gm200"),
         (GP104_GTX_1080, ChipFamily::Pascal, "gp104"),
@@ -101,6 +106,9 @@ fn smoke_nvidia_chip_known_pci_ids_per_family() -> TestResult {
         (GA102_RTX_3090, ChipFamily::Ampere, "ga102"),
         (AD102_RTX_4090, ChipFamily::Ada, "ad102"),
         (AD104_RTX_4070, ChipFamily::Ada, "ad104"),
+        (AD106_RTX_4060, ChipFamily::Ada, "ad106"),
+        (AD106M_RTX_4070_MOBILE, ChipFamily::Ada, "ad106m"),
+        (AD107_RTX_4060, ChipFamily::Ada, "ad107"),
     ];
     for (did, fam, asic) in cases.iter().copied() {
         let ci = match chip_info_for_pci_id(NVIDIA_VENDOR, did) {
@@ -126,33 +134,42 @@ kernel_test_in!(
 // ────────────────────────────────────────────────────────────────
 
 fn smoke_pmc_boot0_arch_tag_decode_per_family() -> TestResult {
-    // Construct synthetic PMC_BOOT_0 values where bits[24:20] hold
-    // the architecture nibble, and verify Boot0::decode classifies
-    // them correctly. Tags are the documented values from
-    // open-gpu-doc / nvkm/include/nvkm/core/device.h:
-    //   Maxwell=0x04 Pascal=0x05 Volta=0x06 Turing=0x07
-    //   Ampere=0x08 Ada=0x09
+    // Construct synthetic PMC_BOOT_0 values and verify
+    // Boot0::decode classifies them correctly. The architecture
+    // is a 6-bit field split across the register (low 5 bits at
+    // bits[28:24], MSB at bit 8) — grounded against the upstream
+    // Linux Nova driver (`drivers/gpu/nova-core/regs.rs`,
+    // commit 1b155edcab0832a887387dd77e209e37beb7b49c):
+    //   Maxwell=0x11 Pascal=0x13 Volta=0x14 Turing=0x16
+    //   Ampere=0x17 Ada=0x19
+    // (Nova pins GF100=0x0c, Turing=0x16, Ampere=0x17,
+    // Ada=0x19; the rest follow arch = NV-code >> 4.)
     let cases = [
-        (0x04u32, ChipFamily::Maxwell),
-        (0x05u32, ChipFamily::Pascal),
-        (0x06u32, ChipFamily::Volta),
-        (0x07u32, ChipFamily::Turing),
-        (0x08u32, ChipFamily::Ampere),
-        (0x09u32, ChipFamily::Ada),
+        (0x11u32, ChipFamily::Maxwell),
+        (0x13u32, ChipFamily::Pascal),
+        (0x14u32, ChipFamily::Volta),
+        (0x16u32, ChipFamily::Turing),
+        (0x17u32, ChipFamily::Ampere),
+        (0x19u32, ChipFamily::Ada),
     ];
-    for (arch_nibble, fam) in cases.iter().copied() {
+    for (arch, fam) in cases.iter().copied() {
         // Assemble a PMC_BOOT_0 with that arch field + some
-        // implementation / revision noise: impl=0x123 (bits[19:8]),
+        // implementation / revision noise: impl=0x5 (bits[23:20]),
         // major=0xA (bits[7:4]), minor=0x5 (bits[3:0]).
-        let raw = ((arch_nibble & 0x1F) << PMC_BOOT_0_ARCH_SHIFT) | (0x123 << 8) | (0xA << 4) | 0x5;
+        // arch1 (bit 8) is the MSB of the 6-bit arch value.
+        let raw = (((arch >> 5) & 0x1) << 8)
+            | ((arch & 0x1F) << PMC_BOOT_0_ARCH0_SHIFT)
+            | (0x5 << PMC_BOOT_0_IMPL_SHIFT)
+            | (0xA << 4)
+            | 0x5;
         let b = Boot0::decode(raw);
         if b.family != fam {
-            return TestResult::Fail("arch nibble misclassified by Boot0::decode");
+            return TestResult::Fail("arch value misclassified by Boot0::decode");
         }
         if b.minor_rev != 0x5 || b.major_rev != 0xA {
             return TestResult::Fail("major/minor rev decoded wrong");
         }
-        if b.implementation != 0x123 {
+        if b.implementation != 0x5 {
             return TestResult::Fail("implementation field decode wrong");
         }
     }
@@ -172,6 +189,26 @@ fn smoke_pmc_boot0_arch_tag_decode_per_family() -> TestResult {
 kernel_test_in!(
     "drivers/nvidia/mc",
     smoke_pmc_boot0_arch_tag_decode_per_family
+);
+
+fn smoke_pmc_boot0_unknown_arch_preserves_raw() -> TestResult {
+    // An architecture value the driver doesn't recognise must
+    // survive decode intact in `ChipFamily::Unknown`, so a future
+    // maintainer doesn't lose the silicon-reported value.
+    // Arch 0x2A: arch0 = 0x0A (bits[28:24]), arch1 = 1 (bit 8).
+    let raw = (0x0Au32 << PMC_BOOT_0_ARCH0_SHIFT) | PMC_BOOT_0_ARCH1_MASK | (0xA << 4) | 0x5;
+    let b = Boot0::decode(raw);
+    if b.family != ChipFamily::Unknown(0x2A) {
+        return TestResult::Fail("unknown arch must decode to Unknown(0x2A)");
+    }
+    if b.family.arch_version() != 0x2A {
+        return TestResult::Fail("Unknown arch_version must round-trip the raw value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_pmc_boot0_unknown_arch_preserves_raw
 );
 
 fn smoke_pmc_register_offsets_match_open_gpu_doc() -> TestResult {
@@ -305,6 +342,12 @@ fn smoke_falcon_cpuctl_bits_have_canonical_positions() -> TestResult {
     }
     if IMEMC_AINCR_WRITE != 1 << 24 {
         return TestResult::Fail("IMEMC.AINCR_WRITE should be bit 24");
+    }
+    if IMEMC_AINCR_READ != 1 << 25 {
+        return TestResult::Fail("IMEMC.AINCR_READ should be bit 25");
+    }
+    if IMEMC_SECURE != 1 << 28 {
+        return TestResult::Fail("IMEMC.SECURE should be bit 28");
     }
     if DMEMC_AINCR_WRITE != 1 << 24 {
         return TestResult::Fail("DMEMC.AINCR_WRITE should be bit 24");
@@ -3883,15 +3926,17 @@ kernel_test_in!(
 // ── Single Nvidia PCI probe owner (crate-split step 1) ──────────
 
 fn smoke_nvidia_single_pci_probe_owner() -> TestResult {
-    // Step 1 of the Nvidia crate split: `drivers/nvidia` is the
-    // single PCI probe owner for Nvidia hardware. The
+    // Step 1 of the Nvidia crate split: `drivers/gpu/nvidia` is
+    // the single PCI probe owner for Nvidia hardware. The
     // `narf-drivers-gpu` copy's `nvidia-gpu-pci` registration is
-    // deleted, so no match whose probe is not this crate's
-    // `pci::probe` may carry an Nvidia name. This guards the
-    // probe race: both crates registered the same 13 PCI IDs, and
-    // the gpu copy's probe was the only claimant for its
-    // gpu-only 0x2820 — a card this crate does not register —
-    // so the less-complete driver owned that card outright.
+    // deleted (step 3 deleted the gpu codec files outright), so
+    // no match whose probe is not this crate's `pci::probe` may
+    // carry an Nvidia name. This guards the probe race: both
+    // crates registered the same 13 PCI IDs, and the gpu copy's
+    // probe was the only claimant for its gpu-only 0x2820 —
+    // step 3 folded that ID (AD106M RTX 4070 Max-Q / Mobile,
+    // pci.ids 2026.10.27) into this crate's table, so the
+    // foreign-claimant case it guarded is gone too.
     //
     // The fixture (re-)registers the crate's own matches first so
     // it does not depend on initcall ordering in the harness:
