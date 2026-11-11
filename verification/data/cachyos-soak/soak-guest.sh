@@ -773,14 +773,15 @@ HEAVY_END=$((SECONDS + SOAK_HEAVY_SECS))
 stamp
 say "SOAK-PHASE heavy up=$UP"
 NATIVE_SECS=$((SOAK_SECS > 60 ? SOAK_SECS - 25 : SOAK_SECS))
-# SOAK_SHARED_MAPS=0 leaves out the workers that dirty shared file mappings
-# and die with them, to see what the rest of the load does on its own.
+# SOAK_SHARED_MAPS=0 leaves out the workers that map files shared (dirtying
+# them and dying with them, or faulting a large one in), to see what the
+# rest of the load does on its own.
 if [ "$SOAK_SHARED_MAPS" = 1 ]; then
   worker shared-tmp "$NATIVE" shared "$NATIVE_SECS" 3 12 "$W/shared" "$HB/shared-tmp"
   worker shared-home "$NATIVE" shared "$NATIVE_SECS" 2 16 /home/narf/soak-shared "$HB/shared-home"
   worker killstorm "$NATIVE" killstorm "$NATIVE_SECS" 10 "$W/big.bin" "$TREE" "$W/scratch" "$HB/killstorm"
+  worker mmapfault "$NATIVE" mmapfault "$NATIVE_SECS" 4 "$W/big.bin" "$HB/mmapfault"
 fi
-worker mmapfault "$NATIVE" mmapfault "$NATIVE_SECS" 4 "$W/big.bin" "$HB/mmapfault"
 worker readtree "$NATIVE" readtree "$NATIVE_SECS" 4 "$TREE" "$HB/readtree"
 worker lookups "$NATIVE" lookups "$NATIVE_SECS" 6 "$TREE" "$HB/lookups"
 if [ "$SOAK_DIRTYEXIT" = 1 ]; then
