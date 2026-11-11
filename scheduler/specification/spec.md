@@ -855,8 +855,17 @@ pub struct TaskSpec {
   the victim's runnable work above, and when the ready queue offers a thief
   nothing it may pull one of them under the same rules — dispatchable, inside
   `allowed`, permitted by the steal strategy, not cache-hot, and leaving the
-  victim one runnable or running task (Linux `sched_balance_newidle`). A CPU
-  that is idle with a single staged wake keeps it. One pull inspects at most
+  victim one runnable or running task (Linux `sched_balance_newidle`). A
+  healthy CPU that is idle with a single staged wake keeps it. "Running" is
+  not the only way to be unreachable: the executor has no current task while
+  it runs deferred destructors, the slab drain, the sleep pumps or the timer
+  wheel, and a CPU stuck there looks idle. So the floor is also lifted for a
+  stalled victim, one that thieves have found holding staged wakes on every
+  visit for 1 ms while its scheduling-pass counter did not move. The record of
+  that is written by thieves only (per victim: the pass count at first sight
+  and when), dropped when a visit finds nothing staged and restarted when the
+  count has moved; the victim's scheduling paths do not touch it, and it does
+  not depend on the victim taking interrupts. One pull inspects at most
   the 32 newest staged entries per holding place; entries it may not take
   count against that bound. For woken sleepers the thief pins those nodes
   under the inbox gate, releases it, and only then judges and takes a slot
