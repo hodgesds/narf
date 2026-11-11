@@ -3425,7 +3425,7 @@ fn smoke_bt_sco_connect_send_recv() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_bt_sco_connect_send_recv);
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_connect_send_recv);
 
 /// SCO error paths: send/recv/getpeername/SCO_OPTIONS without a
 /// link, connect with no pump, double connect, MSG_OOB send,
@@ -3551,7 +3551,7 @@ fn smoke_bt_sco_connect_errors() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_bt_sco_connect_errors);
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_connect_errors);
 
 /// SCO recv is SEQPACKET: a short buffer truncates one frame
 /// (ReceivedTruncated) and MSG_PEEK leaves the frame queued.
@@ -3618,7 +3618,7 @@ fn smoke_bt_sco_recv_truncation_and_peek() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_bt_sco_recv_truncation_and_peek);
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_recv_truncation_and_peek);
 
 /// Drop teardown: dropping a connected SCO socket disconnects its
 /// link, and dropping one mid-setup cancels the pending setup.
@@ -3674,4 +3674,4 @@ fn smoke_bt_sco_drop_teardown() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_bt_sco_drop_teardown);
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_drop_teardown);

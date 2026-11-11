@@ -6625,7 +6625,11 @@ impl SocketFile {
                 }
                 // Re-entering connect() while a setup is in flight
                 // polls it — the park/re-execute loop needs the
-                // outcome, not a fresh refusal.
+                // outcome, not a fresh refusal. The poll records its
+                // outcome under the state lock, so release it first:
+                // holding it here spun this CPU on its own lock, with
+                // interrupts off, as soon as the setup had resolved.
+                drop(state);
                 return self.bt_sco_poll_pending(dev, peer);
             }
             (bound.clone(), sco.voice_setting)
