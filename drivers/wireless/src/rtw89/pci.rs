@@ -388,6 +388,10 @@ unsafe fn bring_up_registers(
         // SAFETY: caller's exclusive BAR/function contract; the rings
         // were just allocated, nothing else uses them yet.
         let outcome = unsafe { device.boot_8922a() };
+        if outcome.is_err() {
+            // Inert device: revoke the DMA authority the boot enabled.
+            let _ = crate::rtw88::pci_park::park(&device.device, &device.cap);
+        }
         if let Some(owner) = device.be_8922a.as_ref() {
             owner.lock().record_firmware(outcome);
         }
@@ -400,6 +404,8 @@ unsafe fn bring_up_registers(
 pub(super) enum Boot8922aError {
     /// Not an 8922A probe.
     NoOwner,
+    /// PCI bus mastering could not be enabled / read back.
+    BusMaster,
     /// `partial_init` / download sequence failure.
     Fwdl(super::fwdl_be::Error),
     /// DMA pre-init / ring programming failure.
@@ -438,6 +444,12 @@ impl Rtw89Device {
         use super::fwdl_be::{self, CheckType, Suit};
         let owner_lock = self.be_8922a.as_ref().ok_or(Boot8922aError::NoOwner)?;
         let cv = self.chip_version;
+        // `map_bar_control` left BME off (parked). Linux sets it in
+        // `rtw89_pci_claim_device` (`pci.c`) before any chip access;
+        // CH12 FWDL and the RX rings need it. The caller parks again
+        // when this boot fails.
+        crate::rtw88::pci_park::master(&self.device, &self.cap)
+            .map_err(|_| Boot8922aError::BusMaster)?;
         let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
         fwdl_be::mac_func_en(regs);
         fwdl_be::partial_init(regs).map_err(Boot8922aError::Fwdl)?;

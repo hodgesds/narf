@@ -72,6 +72,11 @@ requested decoding fails before BAR mapping. Bus mastering remains disabled
 on success and every later error; identity and ring allocation do not authorize
 DMA. A repeat probe of the retained bus address returns without configuration access; a distinct additional singleton match parks only its own PCI function. Re-enabling
 BME requires the composed owned cold/firmware-download and packet/ring/reset owners.
+The one such owner today is the RTL8922A boot: `Rtw89Device::boot_8922a` sets
+`BUS_MASTER` through `rtw88::pci_park::master` (readback must show BME +
+MEM + INTx-off; Linux `rtw89_pci_claim_device` -> `pci_set_master`) before
+its ring programming and CH12 firmware download, and `bring_up_registers`
+re-parks the function (`pci_park::park`) when that boot fails.
 The complete diagnostic mapping/power/identity operation runs within actual
 capability invocation. It retains unpublished storage, with no ring base/index
 publication, enabled MSI-X delivery, RX pump or network-interface registration.

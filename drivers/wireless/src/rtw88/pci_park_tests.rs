@@ -1,6 +1,6 @@
 //! No global bus mutation: exercise the exact policy used by all three PCI
 //! family entry points against inherited command state and config failures.
-use super::pci_park::{park_with, Error};
+use super::pci_park::{master_with, park_with, Error};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
@@ -265,4 +265,37 @@ fn smoke_realtek_revocation_prevents_bar_sizing_and_decode_changes() -> TestResu
 kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_realtek_revocation_prevents_bar_sizing_and_decode_changes
+);
+
+fn smoke_realtek_pci_master_requires_bme_readback() -> TestResult {
+    let all = BUS_MASTER | MEM_SPACE | INTX_DISABLE;
+    let set = RefCell::new(0u16);
+    let ok = master_with(
+        |bits| {
+            *set.borrow_mut() = bits;
+            Ok(all)
+        },
+        || Ok(all),
+    );
+    if ok != Ok(()) || *set.borrow() != BUS_MASTER {
+        return TestResult::Fail("BME enable did not set exactly BUS_MASTER");
+    }
+    for readback in [
+        MEM_SPACE | INTX_DISABLE,
+        BUS_MASTER | INTX_DISABLE,
+        0xffff,
+        0,
+    ] {
+        if master_with(|_| Ok(0), || Ok(readback)) != Err(Error::NotMastering) {
+            return TestResult::Fail("BME enable accepted a readback without BME+MEM+INTx-off");
+        }
+    }
+    if master_with(|_| Err(()), || Ok(all)) != Err(Error::Access) {
+        return TestResult::Fail("BME enable ignored a config-write failure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_realtek_pci_master_requires_bme_readback
 );

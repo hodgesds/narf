@@ -1,8 +1,11 @@
 //! Shared parked-DMA command policy for diagnostic Realtek PCI probes.
 //!
-//! No current rtw88/rtw89/rtlwifi runtime owns the complete firmware/DMA/reset
-//! lifecycle. Revoke inherited bus mastering before BAR/power access; never
-//! turn it back on merely because identity or software ring allocation passed.
+//! Revoke inherited bus mastering before BAR/power access; never turn it back
+//! on merely because identity or software ring allocation passed. The one
+//! owner that re-enables it is the RTL8922A boot (`rtw89::pci::boot_8922a`),
+//! which owns the programmed rings and the firmware download over CH12
+//! (Linux `rtw89_pci_claim_device` -> `pci_set_master`, `pci.c`); it parks
+//! again ([`park`]) when the boot fails.
 use narf_bus::{BarError, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
@@ -10,6 +13,7 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 pub(crate) enum Error {
     Access,
     NotParked,
+    NotMastering,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +52,29 @@ pub(crate) fn park_with(
 pub(crate) fn park(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Result<(), Error> {
     park_with(
         |bits| narf_bus::pci::clear_command(cap, device, bits).map_err(|_| ()),
+        |bits| narf_bus::pci::set_command(cap, device, bits).map_err(|_| ()),
+        || narf_bus::pci::read_command(cap, device).map_err(|_| ()),
+    )
+}
+
+/// Turn bus mastering on for an owner that has programmed its rings, and
+/// require the readback to show BME + memory decode + INTx disabled.
+pub(crate) fn master_with(
+    set: impl FnOnce(u16) -> Result<u16, ()>,
+    read: impl FnOnce() -> Result<u16, ()>,
+) -> Result<(), Error> {
+    use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+    let policy = BUS_MASTER | MEM_SPACE | INTX_DISABLE;
+    set(BUS_MASTER).map_err(|_| Error::Access)?;
+    let command = read().map_err(|_| Error::Access)?;
+    if command == u16::MAX || command & policy != policy {
+        return Err(Error::NotMastering);
+    }
+    Ok(())
+}
+
+pub(crate) fn master(device: &BusDevice, cap: &Cap<BusDeviceCap, Write>) -> Result<(), Error> {
+    master_with(
         |bits| narf_bus::pci::set_command(cap, device, bits).map_err(|_| ()),
         || narf_bus::pci::read_command(cap, device).map_err(|_| ()),
     )
