@@ -208,6 +208,9 @@ fn smoke_ath11k_dp_mon_dest_rxdma1_deliver() -> TestResult {
 
     let s = r.status.consume(&io).expect("status buffer");
     write_status(buf_addr_get(s[0], s[1]).0, 7, Some(40));
+    // `ath11k_hal_srng_src_peek` reaches a status buffer only once the
+    // device has moved past it.
+    r.status.consume(&io).expect("next status buffer");
     let mpdu = raw_mpdu(1700);
     let desc = ipq8074_desc(7, decap::RAW as u32, (5180 << 16) | 36);
     let (link, nbufs) = lay_mpdu(&io, &mut r, &desc, &mpdu);
@@ -258,6 +261,7 @@ fn smoke_ath11k_dp_mon_dest_gating() -> TestResult {
     let mut r = mon_rings(&msgs);
     let s = r.status.consume(&io).unwrap();
     write_status(buf_addr_get(s[0], s[1]).0, 3, None);
+    let s2 = r.status.consume(&io).unwrap();
     let desc = ipq8074_desc(3, decap::RAW as u32, 36);
     let (link, _) = lay_mpdu(&io, &mut r, &desc, &raw_mpdu(64));
     kt_assert!(r.dst.produce(&io, &dst_entry(link)));
@@ -268,8 +272,8 @@ fn smoke_ath11k_dp_mon_dest_gating() -> TestResult {
 
     // Started, but the status PPDU (2) is behind the MPDU's (3).
     kt_assert!(dp.set_monitor_started(0, true));
-    let s = r.status.consume(&io).unwrap();
-    write_status(buf_addr_get(s[0], s[1]).0, 2, None);
+    write_status(buf_addr_get(s2[0], s2[1]).0, 2, None);
+    r.status.consume(&io).unwrap();
     let mut budget = 8;
     dp.process_mon_rings_for(&mut hal, &io, 0, 0, &mut budget);
     kt_assert!(dp.take_mon_rx().is_empty());
@@ -299,4 +303,165 @@ fn smoke_ath11k_dp_mon_status_parse_and_freq() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_dp_mon_status_parse_and_freq
+);
+
+/// A `struct hal_rx_desc_qcn9074` with the monitor fields (as
+/// [`ipq8074_desc`]).
+fn qcn9074_desc(ppdu_id: u16, decap: u32, meta: u32) -> Vec<u8> {
+    use super::qcn9074::{HalRxDescQcn9074, RxMpduStartQcn9074, RxMsduStartQcn9074};
+    let mut b = vec![0u8; HalRxDescQcn9074::SIZE];
+    let put = |b: &mut [u8], off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
+    put(
+        &mut b,
+        offset_of!(HalRxDescQcn9074, mpdu_start_tag),
+        &tlv_hdr(status_tag::RX_MPDU_START, 0).to_le_bytes(),
+    );
+    let mpdu = offset_of!(HalRxDescQcn9074, mpdu_start);
+    put(
+        &mut b,
+        mpdu + offset_of!(RxMpduStartQcn9074, phy_ppdu_id),
+        &ppdu_id.to_le_bytes(),
+    );
+    let msdu = offset_of!(HalRxDescQcn9074, msdu_start);
+    put(
+        &mut b,
+        msdu + offset_of!(RxMsduStartQcn9074, info2),
+        &field_prep(RX_MSDU_START_INFO2_DECAP_FORMAT, decap).to_le_bytes(),
+    );
+    put(
+        &mut b,
+        msdu + offset_of!(RxMsduStartQcn9074, phy_meta_data),
+        &meta.to_le_bytes(),
+    );
+    b
+}
+
+/// A `struct hal_sw_monitor_ring` entry.
+fn sw_mon_entry(link: [u32; 2], status: [u32; 2], end_of_ppdu: bool, ppdu_id: u32) -> [u32; 8] {
+    let mut e = [0u32; 8];
+    e[0] = link[0];
+    e[1] = link[1];
+    e[2] = field_prep(RX_MPDU_DESC_INFO0_MSDU_COUNT, (!end_of_ppdu) as u32);
+    e[4] = status[0];
+    e[5] = status[1];
+    e[6] = field_prep(
+        HAL_SW_MON_RING_INFO0_RXDMA_PUSH_REASON,
+        reo::PUSH_REASON_ROUTING_INSTRUCTION,
+    ) | field_prep(HAL_SW_MON_RING_INFO0_STATUS_BUF_CNT, 1)
+        | if end_of_ppdu {
+            HAL_SW_MON_RING_INFO0_END_OF_PPDU
+        } else {
+            0
+        };
+    e[7] = field_prep(HAL_SW_MON_RING_INFO1_PHY_PPDU_ID, ppdu_id);
+    e
+}
+
+/// QCN9074 full monitor: the MPDU entries of a PPDU collect until the
+/// END_OF_PPDU entry, which holds the destination ring on its status
+/// buffer; the status reap MATCHes that buffer and delivers the PPDU's
+/// MPDUs. A PPDU whose status buffer is ahead (LEAD) is dropped.
+fn smoke_ath11k_dp_full_mon_qcn9074() -> TestResult {
+    let Rig {
+        mut hal,
+        io,
+        mut dp,
+        msgs,
+    } = rig_for_rev(SIZES, HwRev::Qcn9074Hw10);
+    kt_assert!(dp.monitor_capable() && dp.cfg.full_monitor_mode);
+    let mut r = mon_rings(&msgs);
+    kt_assert!(dp.set_monitor_started(0, true));
+    let s = r.status.consume(&io).unwrap();
+    let status_pa = buf_addr_get(s[0], s[1]).0;
+    write_status(status_pa, 9, Some(30));
+    r.status.consume(&io).unwrap();
+    let mpdu = raw_mpdu(100);
+    let desc = qcn9074_desc(9, decap::RAW as u32, 6);
+    let (link, _) = lay_mpdu(&io, &mut r, &desc, &mpdu);
+    kt_assert!(r.dst.produce(&io, &sw_mon_entry(link, [0, 0], false, 9)));
+    kt_assert!(r
+        .dst
+        .produce(&io, &sw_mon_entry([0, 0], [s[0], s[1]], true, 9)));
+    let mut budget = 8;
+    dp.process_mon_rings_for(&mut hal, &io, 0, 0, &mut budget);
+    let frames = dp.take_mon_rx();
+    kt_assert_eq!(frames.len(), 1);
+    kt_assert_eq!(
+        frames[0].frame,
+        mpdu[..mpdu.len() - HAL_RX_FCS_LEN].to_vec()
+    );
+    kt_assert_eq!(frames[0].freq_mhz, Some(2437));
+    kt_assert_eq!(frames[0].signal_dbm, Some(-65));
+    let pdev = dp.pdev.as_ref().unwrap();
+    kt_assert!(!pdev.mon.hold_mon_dst_ring);
+    kt_assert_eq!(pdev.mon.stats.dest_ppdu_done, 1);
+    kt_assert_eq!(pdev.mon.stats.dest_mpdu_done, 1);
+    kt_assert_eq!(r.dst.pending(&io), 0);
+
+    // A status buffer for PPDU 12 while the destination PPDU is 10:
+    // LEAD → the held MPDU is dropped.
+    let s = r.status.consume(&io).unwrap();
+    write_status(buf_addr_get(s[0], s[1]).0, 12, None);
+    r.status.consume(&io).unwrap();
+    let (link, _) = lay_mpdu(&io, &mut r, &qcn9074_desc(10, 0, 6), &raw_mpdu(80));
+    kt_assert!(r.dst.produce(&io, &sw_mon_entry(link, [0, 0], false, 10)));
+    let other = buf_addr_words(0x1000, 0, 0);
+    kt_assert!(r.dst.produce(&io, &sw_mon_entry([0, 0], other, true, 10)));
+    let mut budget = 8;
+    dp.process_mon_rings_for(&mut hal, &io, 0, 0, &mut budget);
+    kt_assert!(dp.take_mon_rx().is_empty());
+    let pdev = dp.pdev.as_ref().unwrap();
+    kt_assert!(!pdev.mon.hold_mon_dst_ring && pdev.mon.full_mon_mpdus.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_dp_full_mon_qcn9074);
+
+/// `ath11k_dp_tx_htt_monitor_mode_ring_config` on QCN9074: the full
+/// monitor mode config first, then the monitor buffer ring and status
+/// ring filters; reset restores the default status filter.
+fn smoke_ath11k_dp_mon_ring_config_msgs() -> TestResult {
+    let Rig { hal, dp, .. } = rig_for_rev(SIZES, HwRev::Qcn9074Hw10);
+    let word = |m: &[u8], i: usize| u32::from_le_bytes(m[4 * i..4 * i + 4].try_into().unwrap());
+    let on = dp.monitor_mode_ring_config_msgs(&hal, 0, false).unwrap();
+    kt_assert_eq!(on.len(), 3);
+    kt_assert_eq!(word(&on[0], 0), 0x17);
+    kt_assert_eq!(word(&on[0], 1), 1 | (2 << 3) | (1 << 1) | (1 << 2));
+    let f = super::htt::MONITOR_MODE_BUF_FILTER;
+    kt_assert_eq!(word(&on[1], 0) & 0xff, 0xc);
+    kt_assert_eq!(word(&on[1], 1) & 0xffff, DP_RXDMA_REFILL_RING_SIZE);
+    kt_assert_eq!(
+        [
+            word(&on[1], 2),
+            word(&on[1], 3),
+            word(&on[1], 4),
+            word(&on[1], 5),
+            word(&on[1], 6)
+        ],
+        [
+            f.pkt_filter_flags0,
+            f.pkt_filter_flags1,
+            f.pkt_filter_flags2,
+            f.pkt_filter_flags3,
+            f.rx_filter
+        ]
+    );
+    // HTT_RX_MON_MO_MGMT_PKT_FILTER_TLV_FLAGS0_BEACON / _RESERVED_7.
+    kt_assert!(f.pkt_filter_flags0 & (1 << 26) != 0 && f.pkt_filter_flags0 & (1 << 23) != 0);
+    kt_assert_eq!(
+        word(&on[2], 6),
+        super::htt::HTT_RX_MON_FILTER_TLV_FLAGS_MON_STATUS_RING
+    );
+    let off = dp.monitor_mode_ring_config_msgs(&hal, 0, true).unwrap();
+    kt_assert_eq!(word(&off[0], 1), 1 | (2 << 3));
+    kt_assert_eq!(word(&off[1], 2) | word(&off[1], 6), 0);
+    kt_assert_eq!(
+        word(&off[2], 6),
+        super::htt::MON_STATUS_FILTER_DEFAULT.rx_filter
+    );
+    kt_assert!(dp.monitor_mode_ring_config_msgs(&hal, 1, false).is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_dp_mon_ring_config_msgs
 );

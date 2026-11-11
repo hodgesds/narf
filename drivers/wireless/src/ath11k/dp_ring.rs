@@ -2295,10 +2295,22 @@ impl Dp {
         hal: &Hal,
         enable: bool,
     ) -> Result<Vec<Vec<u8>>, TransportError> {
-        let pdev = self
-            .pdev
-            .as_ref()
-            .ok_or(dp_err(step::NOT_SET_UP, 2, errno::EINVAL))?;
+        self.mon_status_default_msgs_for(hal, 0, enable)
+    }
+
+    /// [`Self::mon_status_default_msgs`] for pdev `mac_id` (each `ar`
+    /// configures its own monitor status rings).
+    pub fn mon_status_default_msgs_for(
+        &self,
+        hal: &Hal,
+        mac_id: u32,
+        enable: bool,
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let pdev = self.pdevs().find(|p| p.mac_id == mac_id).ok_or(dp_err(
+            step::NOT_SET_UP,
+            2,
+            errno::EINVAL,
+        ))?;
         let filter = if enable {
             htt::MON_STATUS_FILTER_DEFAULT
         } else {

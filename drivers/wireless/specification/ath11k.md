@@ -2159,6 +2159,25 @@ instead of `RX_FLAG_AMSDU_MORE` skbs; FCS-failed MPDUs are dropped (no
 `hal_desc_sz`); a stuck destination entry is retried at most ring-size
 times per pass instead of Linux's unbounded `continue`. A not-DONE status
 buffer whose successor is DONE is now freed unparsed, as Linux does.
+QCN9074 (`full_monitor_mode`) instead runs `Dp::full_mon_process_rx_on`
+(`ath11k_dp_full_mon_process_rx`): `full_mon_mpdu_pop` reads the SW monitor
+ring entry (`ath11k_hal_rx_sw_mon_ring_buf_paddr_get`) and collects the
+PPDU's MPDUs (`dp_full_mon_mpdu_list`, kept per pdev) until END_OF_PPDU,
+which holds the destination ring on the entry's status buffer;
+`process_full_mon_status_ring_on` reaps status buffers one at a time
+(`ath11k_dp_rx_mon_update_status_buf_state` LAG / LEAD by the second TLV's
+PPDU id, MATCH by status-buffer address) and delivers the held MPDUs on
+MATCH or drops them on LEAD. Linux quirks kept: the destination loop keeps
+popping after it holds the ring; the full-monitor mode config sets ENABLE
+in both directions. `Dp::monitor_mode_ring_config_msgs`
+(`ath11k_dp_tx_htt_monitor_mode_ring_config`) builds the full-monitor
+config (`htt::rx_full_mon_setup_msg`, H2T 0x17), the monitor buffer ring
+filter (`htt::MONITOR_MODE_BUF_FILTER`: FP + MO of every management /
+control / data subtype, `HTT_RX_MON_FILTER_TLV_FLAGS_MON_BUF_RING`) and
+the status ring filter (`MONITOR_MODE_STATUS_FILTER`; reset restores
+`ath11k_mac_mon_status_filter_default`). `mon_status_default_msgs_for`
+configures the calling pdev's status rings (the pdev-0-only variant
+remains for single-pdev callers).
 Fixture smokes: `dp_mon_tests.rs` (written, unexecuted).
 
 ## 4. Invariants

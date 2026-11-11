@@ -40,7 +40,9 @@ use alloc::vec::Vec;
 
 use super::dp::*;
 use super::dp_ring::*;
-use super::hal::{field_get, genmask, DmaMem, Hal};
+use super::hal::{field_get, genmask, DmaMem, Hal, HalRingType, TransportError};
+use super::htt::{self, RxRingTlvFilter};
+use super::hw::rbm;
 use super::power::ChipIo;
 use super::rx_descriptor::RxDescriptor;
 
@@ -485,6 +487,75 @@ impl Dp {
         found
     }
 
+    /// Linux `ath11k_dp_tx_htt_monitor_mode_ring_config(ar, reset)` for
+    /// pdev `mac_id`, as the H2T messages in Linux's order: the
+    /// full-monitor mode config (`full_monitor_mode` parts), the monitor
+    /// buffer ring's RX_RING_SELECTION_CFG (FP + MO of every frame type, or
+    /// all-zero on reset) and one per monitor status ring (the monitor
+    /// TLVs, or `ath11k_mac_mon_status_filter_default` on reset). Linux
+    /// passes `DP_RXDMA_REFILL_RING_SIZE` as the buffer size of both.
+    pub fn monitor_mode_ring_config_msgs(
+        &self,
+        hal: &Hal,
+        mac_id: u32,
+        reset: bool,
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let pdev = self
+            .pdevs()
+            .find(|p| p.mac_id == mac_id)
+            .ok_or(TransportError::new(
+                step::NOT_SET_UP,
+                3,
+                super::hal::errno::EINVAL,
+            ))?;
+        let rmb = self.cfg.rx_mac_buf_ring;
+        let mut out = Vec::new();
+        if self.cfg.full_monitor_mode {
+            out.push(htt::rx_full_mon_setup_msg(mac_id, !reset).to_vec());
+        }
+        // Without rxdma1 Linux programs the rx_mac_buf rings in monitor
+        // mode only; no such part has `supports_monitor`.
+        if let Some(buf) = pdev.rxdma_mon_buf_ring.as_ref() {
+            let filter = if reset {
+                RxRingTlvFilter::default()
+            } else {
+                htt::MONITOR_MODE_BUF_FILTER
+            };
+            out.push(
+                htt::rx_filter_setup_msg(
+                    hal,
+                    rmb,
+                    buf.refill_buf_ring.ring_id,
+                    mac_id,
+                    HalRingType::RxdmaMonitorBuf,
+                    DP_RXDMA_REFILL_RING_SIZE,
+                    &filter,
+                )?
+                .to_vec(),
+            );
+        }
+        let filter = if reset {
+            htt::MON_STATUS_FILTER_DEFAULT
+        } else {
+            htt::MONITOR_MODE_STATUS_FILTER
+        };
+        for (i, r) in pdev.rx_mon_status_refill_ring.iter().enumerate() {
+            out.push(
+                htt::rx_filter_setup_msg(
+                    hal,
+                    rmb,
+                    r.refill_buf_ring.ring_id,
+                    mac_id + i as u32,
+                    HalRingType::RxdmaMonitorStatus,
+                    DP_RXDMA_REFILL_RING_SIZE,
+                    &filter,
+                )?
+                .to_vec(),
+            );
+        }
+        Ok(out)
+    }
+
     /// Monitor counters of pdev `mac_id`.
     pub fn mon_stats_for(&self, mac_id: u32) -> Option<&MonStats> {
         self.pdevs()
@@ -509,7 +580,11 @@ impl Dp {
         budget: &mut u32,
     ) -> u32 {
         self.with_pdev(mac_id, |dp, pdev| {
-            dp.process_mon_status_on(pdev, hal, io, rxdma_idx, budget)
+            if pdev.mon.started && dp.cfg.full_monitor_mode {
+                dp.full_mon_process_rx_on(pdev, hal, io, rxdma_idx, budget)
+            } else {
+                dp.process_mon_status_on(pdev, hal, io, rxdma_idx, budget)
+            }
         })
         .unwrap_or(0)
     }
@@ -878,6 +953,241 @@ impl Dp {
                 freq_mhz,
                 signal_dbm,
             });
+        }
+    }
+
+    /// `ath11k_hal_rx_sw_mon_ring_buf_paddr_get`: a full-monitor
+    /// destination entry (`struct hal_sw_monitor_ring`, 8 words).
+    pub fn sw_mon_entries(ent: &[u32; 8]) -> SwMonEntries {
+        let (mon_dst_paddr, mon_dst_sw_cookie, _) = buf_addr_get(ent[0], ent[1]);
+        let (mon_status_paddr, mon_status_sw_cookie, _) = buf_addr_get(ent[4], ent[5]);
+        SwMonEntries {
+            mon_dst_paddr,
+            mon_status_paddr,
+            mon_dst_sw_cookie,
+            mon_status_sw_cookie,
+            dst_buf_addr_info: [ent[0], ent[1]],
+            status_buf_count: field_get(HAL_SW_MON_RING_INFO0_STATUS_BUF_CNT, ent[6]),
+            ppdu_id: field_get(HAL_SW_MON_RING_INFO1_PHY_PPDU_ID, ent[7]),
+            msdu_cnt: field_get(RX_MPDU_DESC_INFO0_MSDU_COUNT, ent[2]),
+            end_of_ppdu: false,
+            drop_ppdu: false,
+        }
+    }
+
+    /// Linux `ath11k_dp_rx_full_mon_mpdu_pop`: as [`Self::mon_mpdu_pop`]
+    /// for a SW monitor ring entry, without the PPDU-id comparison (the
+    /// entry carries its status buffer instead). An END_OF_PPDU entry
+    /// pops nothing.
+    pub fn full_mon_mpdu_pop(
+        &mut self,
+        pdev: &mut PdevDp,
+        hal: &mut Hal,
+        io: &impl ChipIo,
+        ent: &[u32; 8],
+        chain: &mut Option<Vec<MonMsdu>>,
+    ) -> u32 {
+        let desc_sz = self.cfg.hal_desc_sz;
+        let rev = self.cfg.hw.hw_rev;
+        pdev.mon.sw = Self::sw_mon_entries(ent);
+        let mut sw_cookie = pdev.mon.sw.mon_dst_sw_cookie;
+        let mut last_buf_addr = pdev.mon.sw.dst_buf_addr_info;
+        let mut msdu_cnt = pdev.mon.sw.msdu_cnt;
+        let mut rx_bufs_used = 0u32;
+        pdev.mon.sw.end_of_ppdu = ent[6] & HAL_SW_MON_RING_INFO0_END_OF_PPDU != 0;
+        if pdev.mon.sw.end_of_ppdu {
+            return rx_bufs_used;
+        }
+        let mut drop_mpdu = false;
+        if field_get(HAL_SW_MON_RING_INFO0_RXDMA_PUSH_REASON, ent[6])
+            == reo::PUSH_REASON_ERR_DETECTED
+        {
+            let code = field_get(HAL_SW_MON_RING_INFO0_RXDMA_ERROR_CODE, ent[6]);
+            if matches!(
+                code,
+                RXDMA_ECODE_FLUSH_REQUEST_ERR | RXDMA_ECODE_MPDU_LEN_ERR | RXDMA_ECODE_OVERFLOW_ERR
+            ) {
+                pdev.mon.stats.dest_mpdu_drop += 1;
+                drop_mpdu = true;
+            }
+        }
+        let mut is_frag = false;
+        let mut is_first_msdu = true;
+        let (mut total_len, mut frag_len) = (0u32, 0u32);
+        let mut head: Vec<MonMsdu> = Vec::new();
+        let mut tail = false;
+        loop {
+            let paddr = pdev.mon.sw.mon_dst_paddr;
+            let Some(link) = mon_link_read(&pdev.mon_link_desc_banks, sw_cookie, paddr) else {
+                pdev.mon.stats.link_desc_lookup_fail += 1;
+                return rx_bufs_used;
+            };
+            for &(cookie, msdu_flags) in &link.msdus {
+                let buf_id = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, cookie);
+                let Some(ring) = pdev.rxdma_mon_buf_ring.as_mut() else {
+                    return rx_bufs_used;
+                };
+                'next: {
+                    // idr_find + idr_remove up front.
+                    let Some(buf) = ring.bufs.remove(buf_id) else {
+                        self.stats.rx_invalid_cookie += 1;
+                        tail = false;
+                        break 'next;
+                    };
+                    if drop_mpdu {
+                        // Linux frees the skb but leaves `msdu` set.
+                        msdu_cnt = msdu_cnt.wrapping_sub(1);
+                        tail = true;
+                        break 'next;
+                    }
+                    let mut desc_bytes = alloc::vec![0u8; desc_sz.min(buf.mem.len())];
+                    buf.mem.read_bytes(0, &mut desc_bytes);
+                    let Some(rxd) = RxDescriptor::decode(rev, &desc_bytes) else {
+                        tail = false;
+                        break 'next;
+                    };
+                    let l2 = rxd.l3_pad_bytes() as usize;
+                    if is_first_msdu {
+                        if rxd.mpdu_start_tag() != status_tag::RX_MPDU_START {
+                            drop_mpdu = true;
+                            tail = false;
+                            break 'next;
+                        }
+                        is_first_msdu = false;
+                    }
+                    get_buf_len(
+                        desc_sz,
+                        msdu_flags,
+                        &mut is_frag,
+                        &mut total_len,
+                        &mut frag_len,
+                        &mut msdu_cnt,
+                    );
+                    let size = (desc_sz + l2 + frag_len as usize).min(buf.mem.len());
+                    let mut data = alloc::vec![0u8; size];
+                    buf.mem.read_bytes(0, &mut data);
+                    head.push(MonMsdu {
+                        data,
+                        continuation: msdu_flags & RX_MSDU_DESC_INFO0_MSDU_CONTINUATION != 0,
+                    });
+                    tail = true;
+                }
+                rx_bufs_used += 1;
+            }
+            let (next_paddr, next_cookie, _) = buf_addr_get(link.next[0], link.next[1]);
+            pdev.mon.sw.mon_dst_paddr = next_paddr;
+            pdev.mon.sw.mon_dst_sw_cookie = next_cookie;
+            sw_cookie = next_cookie;
+            self.mon_link_desc_return(pdev, hal, io, last_buf_addr);
+            last_buf_addr = link.next;
+            if next_paddr == 0 || msdu_cnt == 0 {
+                break;
+            }
+        }
+        if tail && !head.is_empty() {
+            *chain = Some(head);
+        }
+        rx_bufs_used
+    }
+
+    /// Linux `ath11k_dp_full_mon_process_rx`: unless a PPDU is held for
+    /// its status buffers, pop the destination ring's MPDUs into the
+    /// PPDU list until an END_OF_PPDU entry, which holds the ring and
+    /// records the status buffer to match; then reap the status ring
+    /// ([`Self::process_full_mon_status_ring_on`]).
+    pub fn full_mon_process_rx_on(
+        &mut self,
+        pdev: &mut PdevDp,
+        hal: &mut Hal,
+        io: &impl ChipIo,
+        rxdma_idx: u32,
+        budget: &mut u32,
+    ) -> u32 {
+        if !pdev.mon.hold_mon_dst_ring {
+            if let Some(dst) = pdev.rxdma_mon_dst_ring {
+                let id = dst.ring_id;
+                let mut rx_bufs_used = 0u32;
+                hal.access_begin(id);
+                while let Some(off) = hal.dst_peek(id) {
+                    let ent: [u32; 8] = core::array::from_fn(|i| hal.desc_rd(id, off, i as u32));
+                    let mut chain = None;
+                    rx_bufs_used += self.full_mon_mpdu_pop(pdev, hal, io, &ent, &mut chain);
+                    let mut break_dst_ring = false;
+                    if !pdev.mon.sw.end_of_ppdu {
+                        if let Some(c) = chain {
+                            pdev.mon.full_mon_mpdus.push(c);
+                        }
+                    } else if pdev.mon.sw.ppdu_id == 0 && pdev.mon.sw.mon_status_paddr == 0 {
+                        break_dst_ring = true;
+                    } else {
+                        pdev.mon.stats.dest_ppdu_done += 1;
+                        pdev.mon.ppdu_done = false;
+                        pdev.mon.buf_state = MonBufState::Lag;
+                        pdev.mon.mon_status_paddr = pdev.mon.sw.mon_status_paddr;
+                        pdev.mon.hold_mon_dst_ring = true;
+                    }
+                    hal.dst_get_next_entry(id);
+                    if break_dst_ring {
+                        break;
+                    }
+                }
+                hal.access_end(io, id);
+                if rx_bufs_used != 0 {
+                    let mac_id = pdev.mac_id;
+                    if let Some(ring) = pdev.rxdma_mon_buf_ring.as_mut() {
+                        self.rxbufs_replenish(hal, io, mac_id, ring, rx_bufs_used, rbm::SW3_BM);
+                    }
+                }
+            }
+        }
+        self.process_full_mon_status_ring_on(pdev, hal, io, rxdma_idx, budget)
+    }
+
+    /// Linux `ath11k_dp_rx_process_full_mon_status_ring`: while the
+    /// destination ring is held, reap status buffers one at a time; on a
+    /// MATCH reap the PPDU's remaining status buffers and deliver its
+    /// MPDUs, on a LEAD (or no status buffer) drop them.
+    pub fn process_full_mon_status_ring_on(
+        &mut self,
+        pdev: &mut PdevDp,
+        hal: &mut Hal,
+        io: &impl ChipIo,
+        rxdma_idx: u32,
+        _budget: &mut u32,
+    ) -> u32 {
+        let mut work = 0u32;
+        while pdev.mon.hold_mon_dst_ring {
+            let mut one = 1u32;
+            let mut quota = self.process_mon_status_on(pdev, hal, io, rxdma_idx, &mut one);
+            if pdev.mon.buf_state == MonBufState::Match {
+                let count = pdev.mon.sw.status_buf_count;
+                if count > 1 {
+                    let mut c = count;
+                    quota += self.process_mon_status_on(pdev, hal, io, rxdma_idx, &mut c);
+                }
+                self.full_mon_deliver_ppdu(pdev);
+                pdev.mon.hold_mon_dst_ring = false;
+            } else if pdev.mon.mon_status_paddr == 0 || pdev.mon.buf_state == MonBufState::Lead {
+                pdev.mon.sw.drop_ppdu = true;
+                pdev.mon.hold_mon_dst_ring = false;
+            }
+            if quota == 0 {
+                break;
+            }
+            work += quota;
+        }
+        if pdev.mon.sw.drop_ppdu {
+            // ath11k_dp_rx_full_mon_drop_ppdu
+            pdev.mon.full_mon_mpdus.clear();
+        }
+        work
+    }
+
+    /// Linux `ath11k_dp_rx_full_mon_deliver_ppdu`.
+    fn full_mon_deliver_ppdu(&mut self, pdev: &mut PdevDp) {
+        for chain in core::mem::take(&mut pdev.mon.full_mon_mpdus) {
+            self.mon_deliver(pdev, chain);
+            pdev.mon.stats.dest_mpdu_done += 1;
         }
     }
 }

@@ -303,6 +303,87 @@ pub const MON_STATUS_FILTER_DEFAULT: RxRingTlvFilter = RxRingTlvFilter {
     pkt_filter_flags3: HTT_RX_FP_DATA_FILTER_FLASG3 | HTT_RX_FP_CTRL_FILTER_FLASG3,
 };
 
+/// The extra FP bits of the monitor-mode filters (`HTT_RX_MON_FP_*`):
+/// FLAGS0 `RESERVED_7`, FLAGS1 `RESERVED_15`, and the FLAGS2 control
+/// subtypes 0b0000–0b0110 (`RESERVED_1`, `RESERVED_2`, `TRIGGER`,
+/// `RESERVED_4`, `BF_REP_POLL`, `VHT_NDP`, `FRAME_EXT`).
+pub mod fp_mon {
+    pub const MGMT0_RESERVED_7: u32 = 1 << 21;
+    pub const MGMT1_RESERVED_15: u32 = 1 << 15;
+    pub const CTRL2_LOW: u32 =
+        (1 << 0) | (1 << 3) | (1 << 6) | (1 << 9) | (1 << 12) | (1 << 15) | (1 << 18);
+}
+
+/// `HTT_RX_MON_FP_*` | `HTT_RX_MON_MO_*`: every Monitor-Other bit sits two
+/// above its Filter-Pass bit (`htt_rx_*_pkt_filter_tlv_flags*`).
+const fn fp_mo(fp: u32) -> u32 {
+    fp | (fp << 2)
+}
+
+/// `HTT_RX_MON_FILTER_TLV_FLAGS_MON_BUF_RING`.
+pub const HTT_RX_MON_FILTER_TLV_FLAGS_MON_BUF_RING: u32 = rx_tlv::MPDU_START
+    | rx_tlv::MSDU_START
+    | rx_tlv::RX_PACKET
+    | rx_tlv::MSDU_END
+    | rx_tlv::MPDU_END
+    | rx_tlv::PACKET_HEADER
+    | rx_tlv::PER_MSDU_HEADER
+    | rx_tlv::ATTENTION;
+/// `HTT_RX_MON_FILTER_TLV_FLAGS_MON_STATUS_RING`.
+pub const HTT_RX_MON_FILTER_TLV_FLAGS_MON_STATUS_RING: u32 = rx_tlv::MPDU_START
+    | rx_tlv::PPDU_START
+    | rx_tlv::PPDU_END
+    | rx_tlv::PPDU_END_USER_STATS
+    | rx_tlv::PPDU_END_USER_STATS_EXT
+    | rx_tlv::PPDU_END_STATUS_DONE;
+
+/// The packet filter `ath11k_dp_tx_htt_monitor_mode_ring_config(ar,
+/// false)` programs (FP and MO for every management, control and data
+/// subtype), with the monitor buffer ring's TLVs.
+pub const MONITOR_MODE_BUF_FILTER: RxRingTlvFilter = RxRingTlvFilter {
+    rx_filter: HTT_RX_MON_FILTER_TLV_FLAGS_MON_BUF_RING,
+    pkt_filter_flags0: fp_mo(HTT_RX_FP_MGMT_FILTER_FLAGS0 | fp_mon::MGMT0_RESERVED_7),
+    pkt_filter_flags1: fp_mo(HTT_RX_FP_MGMT_FILTER_FLAGS1 | fp_mon::MGMT1_RESERVED_15),
+    pkt_filter_flags2: fp_mo(HTT_RX_FP_CTRL_FILTER_FLASG2 | fp_mon::CTRL2_LOW),
+    pkt_filter_flags3: fp_mo(HTT_RX_FP_CTRL_FILTER_FLASG3 | HTT_RX_FP_DATA_FILTER_FLASG3),
+};
+/// The same packet filter with the monitor status ring's TLVs.
+pub const MONITOR_MODE_STATUS_FILTER: RxRingTlvFilter = RxRingTlvFilter {
+    rx_filter: HTT_RX_MON_FILTER_TLV_FLAGS_MON_STATUS_RING,
+    ..MONITOR_MODE_BUF_FILTER
+};
+
+/// `HTT_RX_FULL_MON_MODE_CFG_CMD_*`.
+pub const HTT_RX_FULL_MON_MODE_CFG_CMD_INFO0_MSG_TYPE: u32 = genmask(7, 0);
+pub const HTT_RX_FULL_MON_MODE_CFG_CMD_INFO0_PDEV_ID: u32 = genmask(15, 8);
+pub const HTT_RX_FULL_MON_MODE_CFG_CMD_CFG_ENABLE: u32 = 1 << 0;
+pub const HTT_RX_FULL_MON_MODE_CFG_CMD_CFG_ZERO_MPDUS_END: u32 = 1 << 1;
+pub const HTT_RX_FULL_MON_MODE_CFG_CMD_CFG_NON_ZERO_MPDUS_END: u32 = 1 << 2;
+pub const HTT_RX_FULL_MON_MODE_CFG_CMD_CFG_RELEASE_RING: u32 = genmask(10, 3);
+/// `enum htt_rx_full_mon_release_ring`: `HTT_RX_MON_RING_SW`.
+pub const HTT_RX_MON_RING_SW: u32 = 2;
+
+/// Linux `ath11k_dp_tx_htt_rx_full_mon_setup(ab, mac_id, config)`:
+/// `struct htt_rx_full_monitor_mode_cfg_cmd`. Linux sets ENABLE and the
+/// SW release ring in both directions; only the end-of-PPDU bits follow
+/// `config`.
+pub fn rx_full_mon_setup_msg(mac_id: u32, config: bool) -> [u8; 8] {
+    let info0 = field_prep(
+        HTT_RX_FULL_MON_MODE_CFG_CMD_INFO0_MSG_TYPE,
+        h2t::RX_FULL_MONITOR_MODE,
+    ) | field_prep(HTT_RX_FULL_MON_MODE_CFG_CMD_INFO0_PDEV_ID, mac_id);
+    let mut cfg = HTT_RX_FULL_MON_MODE_CFG_CMD_CFG_ENABLE
+        | field_prep(
+            HTT_RX_FULL_MON_MODE_CFG_CMD_CFG_RELEASE_RING,
+            HTT_RX_MON_RING_SW,
+        );
+    if config {
+        cfg |= HTT_RX_FULL_MON_MODE_CFG_CMD_CFG_ZERO_MPDUS_END
+            | HTT_RX_FULL_MON_MODE_CFG_CMD_CFG_NON_ZERO_MPDUS_END;
+    }
+    le_words(&[info0, cfg])
+}
+
 pub const HTT_T2H_MSG_TYPE: u32 = genmask(7, 0);
 pub const HTT_T2H_VERSION_CONF_MINOR: u32 = genmask(15, 8);
 pub const HTT_T2H_VERSION_CONF_MAJOR: u32 = genmask(23, 16);
