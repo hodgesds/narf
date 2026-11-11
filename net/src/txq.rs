@@ -80,8 +80,17 @@ pub trait TxBackpressure: core::fmt::Debug + Send + Sync {
     /// Offer an owned frame to queue `q`. Refused with [`TxRefusal::Busy`]
     /// while the queue is stopped.
     fn try_xmit(&self, q: u16, frame: crate::Frame, meta: crate::TxMeta) -> Result<(), TxRefusal>;
-    /// As [`Self::try_xmit`] for a frame the driver must copy.
-    fn try_xmit_copy(&self, q: u16, frame: &[u8], meta: crate::TxMeta) -> Result<(), TxRefusal>;
+    /// As [`Self::try_xmit`] for a frame the driver must copy. `charge` is
+    /// the sending connection's byte charge: the driver attaches it to the
+    /// frame it builds ([`crate::Frame::set_tx_charge`]) so it is returned
+    /// when that frame completes, exactly as for an owned frame.
+    fn try_xmit_copy(
+        &self,
+        q: u16,
+        frame: &[u8],
+        meta: crate::TxMeta,
+        charge: Option<TxCharge>,
+    ) -> Result<(), TxRefusal>;
 }
 
 #[derive(Debug, Default)]

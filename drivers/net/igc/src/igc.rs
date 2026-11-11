@@ -1552,6 +1552,7 @@ impl narf_net::txq::TxBackpressure for Igc {
         q: u16,
         bytes: &[u8],
         meta: TxMeta,
+        charge: Option<narf_net::txq::TxCharge>,
     ) -> Result<(), narf_net::txq::TxRefusal> {
         if bytes.len() < 14 || bytes.len() > MAX_TSO {
             return Err(narf_net::txq::TxRefusal::Dropped);
@@ -1559,7 +1560,11 @@ impl narf_net::txq::TxBackpressure for Igc {
         let mut buffer = alloc_coherent(bytes.len(), DomainId::DRIVER_0)
             .map_err(|_| narf_net::txq::TxRefusal::Dropped)?;
         buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        self.try_xmit(q, Frame::new(buffer, bytes.len() as u32), meta)
+        let mut frame = Frame::new(buffer, bytes.len() as u32);
+        if let Some(charge) = charge {
+            frame.set_tx_charge(charge);
+        }
+        self.try_xmit(q, frame, meta)
     }
 }
 

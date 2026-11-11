@@ -1593,12 +1593,13 @@ impl NetIfaceSnapshot {
         q: u16,
         frame: &[u8],
         meta: crate::TxMeta,
+        charge: Option<crate::txq::TxCharge>,
     ) -> Result<(), crate::txq::TxRefusal> {
         if self.link_layer != LinkLayer::Ethernet {
             return Err(crate::txq::TxRefusal::Dropped);
         }
         crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
-        let result = driver.try_xmit_copy(q, frame, meta);
+        let result = driver.try_xmit_copy(q, frame, meta, charge);
         if result != Err(crate::txq::TxRefusal::Busy) {
             record_tx_result(&self.name, frame.len(), result.is_ok());
         }

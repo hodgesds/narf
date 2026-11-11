@@ -666,6 +666,14 @@ impl Queue {
             self.txq.refused();
             fence(Ordering::Release);
             r.write(0xe018 + q as u64 * 0x40, tx.next as u32);
+            // The frame was not posted, so its buffer goes back where a
+            // completed frame's does. Dropping it instead freed the pages
+            // and shrank the queue's eight-buffer zero-copy pool by one per
+            // refusal, for good: after eight, every frame on the queue was
+            // built in a `Vec`, copied into a fresh 64 KiB allocation, and
+            // carried no charge. `into_parts` returns the charge.
+            let pool = frame.queue();
+            narf_net::iface::tx_release_on(*self.owner.lock(), pool, frame.into_parts().0);
             return Err(IgcError::TxBusy);
         }
         if needed > free {

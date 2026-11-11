@@ -557,7 +557,11 @@ fn emit_tcb_frame_on(
             dev.try_xmit_frame(driver, bind.queue, f, meta)
         }
         (TxFrame::Owned(v), Some((driver, bind))) => {
-            dev.try_xmit_copy(driver, bind.queue, &v, meta)
+            // A frame the driver copies occupies the device queue just as
+            // an owned one does. Uncharged, a connection whose pool was
+            // empty escaped the per-connection limit altogether.
+            let charge = charge.then(|| bind.account.charge(v.len() as u32));
+            dev.try_xmit_copy(driver, bind.queue, &v, meta, charge)
         }
         (TxFrame::Owned(v), None) => dev.xmit_meta(&v, meta).map_err(|()| TxRefusal::Dropped),
         (TxFrame::Dma(f), None) => dev.xmit_frame(f, meta).map_err(|()| TxRefusal::Dropped),

@@ -1337,6 +1337,8 @@ fn refusable_send(frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
 struct FakeRing {
     /// Posted, not yet transmitted.
     held: VecDeque<Vec<u8>>,
+    /// The charge that came with each held frame, released with it.
+    charges: VecDeque<Option<crate::txq::TxCharge>>,
     /// Transmitted, in order.
     wire: Vec<Vec<u8>>,
 }
@@ -1404,7 +1406,7 @@ impl FakeNic {
         *self.replacement.lock() = Some(queue.clone());
         queue
     }
-    fn post(&self, frame: &[u8]) -> Result<(), TxRefusal> {
+    fn post(&self, frame: &[u8], charge: Option<crate::txq::TxCharge>) -> Result<(), TxRefusal> {
         self.offers
             .fetch_add(1, ::core::sync::atomic::Ordering::SeqCst);
         if self
@@ -1439,6 +1441,7 @@ impl FakeNic {
                 return Err(TxRefusal::Busy);
             }
             ring.held.push_back(frame.to_vec());
+            ring.charges.push_back(charge);
             let free = Self::free(&ring);
             queue.sent(frame.len() as u32, || free);
         }
@@ -1459,6 +1462,7 @@ impl FakeNic {
             };
             bytes += frame.len() as u64;
             ring.wire.push(frame);
+            ring.charges.pop_front();
             done += 1;
         }
         let free = Self::free(&ring);
@@ -1469,6 +1473,7 @@ impl FakeNic {
         let mut ring = self.ring.lock();
         let lost = ring.held.len();
         ring.held.clear();
+        ring.charges.clear();
         self.queue.reset();
         lost
     }
@@ -1499,10 +1504,16 @@ impl TxBackpressure for FakeNic {
         frame: crate::Frame,
         _meta: crate::TxMeta,
     ) -> Result<(), TxRefusal> {
-        self.post(frame.payload())
+        self.post(frame.payload(), None)
     }
-    fn try_xmit_copy(&self, _q: u16, frame: &[u8], _meta: crate::TxMeta) -> Result<(), TxRefusal> {
-        self.post(frame)
+    fn try_xmit_copy(
+        &self,
+        _q: u16,
+        frame: &[u8],
+        _meta: crate::TxMeta,
+        charge: Option<crate::txq::TxCharge>,
+    ) -> Result<(), TxRefusal> {
+        self.post(frame, charge)
     }
 }
 
@@ -2140,6 +2151,60 @@ fn smoke_tx_sender_never_spins_on_a_busy_queue_that_is_not_stopped() -> TestResu
 kernel_test_in!(
     "net/tcp/robust",
     smoke_tx_sender_never_spins_on_a_busy_queue_that_is_not_stopped
+);
+
+/// Frames the driver copies are charged like owned ones, so the
+/// per-connection limit holds for them: the connection stops at the limit
+/// with ring to spare, and its own completions resume it.
+fn smoke_tx_copied_frames_are_charged_and_throttled() -> TestResult {
+    use ::core::sync::atomic::Ordering;
+    let (nic, id, _) = backpressure_conn("txbp11", [10, 105, 0, 1], 7_932);
+    narf_lib::sysctl::ipv4::TCP_LIMIT_OUTPUT_BYTES.store(4000, Ordering::Relaxed);
+    let sent = send(id, &pattern(60_000));
+    narf_lib::sysctl::ipv4::TCP_LIMIT_OUTPUT_BYTES.store(4 << 20, Ordering::Relaxed);
+    if sent != Ok(60_000) {
+        return TestResult::Fail("the send buffer did not take the data");
+    }
+    let held = nic.held();
+    let in_device: usize = held.iter().map(Vec::len).sum();
+    let Some((queued, parked)) = __with_tcb(id, |t| {
+        (
+            t.tx_bind.as_ref().map_or(0, |bind| bind.account.queued()),
+            t.tx_wait_since_cycles != 0,
+        )
+    }) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if queued as usize != in_device || in_device == 0 {
+        return TestResult::Fail("copied frames are not charged to their connection");
+    }
+    if nic.queue.is_stopped() || held.len() >= 14 || in_device <= 4000 || !parked {
+        return TestResult::Fail("the per-connection limit did not stop the sender first");
+    }
+    // Its own completions return the charge and schedule the resume.
+    nic.complete(held.len());
+    if __with_tcb(id, |t| {
+        t.tx_bind.as_ref().map_or(1, |bind| bind.account.queued())
+    }) != Some(0)
+    {
+        return TestResult::Fail("completion did not return the charges");
+    }
+    if nic.queue.run_wakeups() != 1 || nic.held().is_empty() {
+        return TestResult::Fail("completions did not resume the throttled connection");
+    }
+    // A reset returns what the ring held as well.
+    let _ = nic.reset();
+    if __with_tcb(id, |t| {
+        t.tx_bind.as_ref().map_or(1, |bind| bind.account.queued())
+    }) != Some(0)
+    {
+        return TestResult::Fail("a reset kept the charges of the frames it discarded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_copied_frames_are_charged_and_throttled
 );
 
 // ── Receive batches (`iface::rx_batch`) ─────────────────────────────────
