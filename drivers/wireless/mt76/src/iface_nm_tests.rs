@@ -517,3 +517,71 @@ kernel_test_in!(
     "drivers/wireless/mt7921/networkmanager",
     mt7922_admits_wpa_supplicant_wpa2_association_elements
 );
+
+/// The 2.4/5 GHz rules of wireless-regdb's `country US: DFS-FCC`, as
+/// `iw reg set US` installs them (`iw reg get` on Linux prints the same
+/// rows): U-NII-1 and U-NII-3 carry AUTO-BW, U-NII-2 DFS.
+fn us_domain() -> narf_wireless::reg::RegulatoryDomain {
+    use narf_wireless::reg::{RegFlags, RegRule};
+    let rule = |start, end, bandwidth, power, flags| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: bandwidth,
+        max_power_dbm: power,
+        flags,
+    };
+    narf_wireless::reg::RegulatoryDomain {
+        country_code: *b"US",
+        rules: alloc::vec![
+            rule(2400, 2472, 40, 30, RegFlags::empty()),
+            rule(5150, 5250, 80, 23, RegFlags::AUTO_BW),
+            rule(5250, 5350, 80, 24, RegFlags::DFS | RegFlags::AUTO_BW),
+            rule(5470, 5730, 160, 24, RegFlags::DFS),
+            rule(5730, 5850, 80, 30, RegFlags::AUTO_BW),
+        ],
+    }
+}
+
+/// A station may transmit on the non-radar 5 GHz channels of the US domain.
+/// AUTO-BW (cfg80211 NL80211_RRF_AUTO_BW) lets a wide channel span adjacent
+/// rules; it is on every U-NII-1/U-NII-3 rule and is not a restriction.
+/// Reading it as one left an active scan without a single 5 GHz channel and
+/// refused the join to a BSS on 5200 MHz with `Denied`.
+fn mt7922_us_domain_permits_non_radar_5ghz() -> TestResult {
+    use crate::mt7921::association::TxPermission;
+    use narf_wireless::reg::RegFlags;
+    let us = us_domain();
+    for channel in [1u8, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161, 165] {
+        if TxPermission::from_domain(&us, channel).is_none() {
+            return TestResult::Fail("US domain refused a non-radar channel");
+        }
+    }
+    // The 80 MHz block of channel 40 lies inside the one U-NII-1 rule.
+    if TxPermission::from_domain80(&us, 40, 42).is_none() {
+        return TestResult::Fail("US domain refused 80 MHz on channel 40");
+    }
+    // Radar channels stay closed to host-initiated transmission.
+    for channel in [52u8, 64, 100, 144] {
+        if TxPermission::from_domain(&us, channel).is_some() {
+            return TestResult::Fail("DFS channel opened without radar detection");
+        }
+    }
+    // World 00 keeps U-NII-1 passive: NO_IR beside AUTO-BW still refuses.
+    let mut world = us_domain();
+    world.country_code = *b"00";
+    world.rules[1].flags |= RegFlags::NO_IR;
+    if TxPermission::from_domain(&world, 40).is_some() {
+        return TestResult::Fail("NO_IR channel opened");
+    }
+    // NO_160MHZ closes 160 MHz only.
+    let mut capped = us_domain();
+    capped.rules[1].flags |= RegFlags::NO_160MHZ;
+    if TxPermission::from_domain(&capped, 40).is_none() {
+        return TestResult::Fail("NO_160MHZ closed a 20 MHz channel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/networkmanager",
+    mt7922_us_domain_permits_non_radar_5ghz
+);
