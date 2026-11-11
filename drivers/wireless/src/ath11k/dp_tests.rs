@@ -154,6 +154,12 @@ impl DevRing {
         (self.host(io) + self.size - self.idx) % self.size / self.esz
     }
 
+    /// DST ring: entries the device produced that the host has not
+    /// consumed (HP − TP; [`Self::pending`] is the SRC-ring direction).
+    pub(super) fn unread(&self, io: &RecIo) -> u32 {
+        (self.idx + self.size - self.host(io)) % self.size / self.esz
+    }
+
     pub(super) fn entry(&self, i: u32) -> Vec<u32> {
         (0..self.esz)
             .map(|k| phys_rd32(self.base + ((i * self.esz + k) as u64) * 4))

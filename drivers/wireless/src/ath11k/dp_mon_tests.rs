@@ -232,7 +232,7 @@ fn smoke_ath11k_dp_mon_dest_rxdma1_deliver() -> TestResult {
     kt_assert_eq!(st.dest_ppdu_done, 1);
     kt_assert_eq!(r.desc.pending(&io), desc_posted, "link descriptor returned");
     kt_assert_eq!(r.buf.pending(&io), buf_posted, "both buffers replenished");
-    kt_assert_eq!(r.dst.pending(&io), 0, "destination entry consumed");
+    kt_assert_eq!(r.dst.unread(&io), 0, "destination entry consumed");
     let rt = narf_wireless::monitor::encode(
         &f.frame,
         narf_wireless::monitor::Metadata {
@@ -268,7 +268,7 @@ fn smoke_ath11k_dp_mon_dest_gating() -> TestResult {
     let mut budget = 8;
     dp.process_mon_rings_for(&mut hal, &io, 0, 0, &mut budget);
     kt_assert!(dp.take_mon_rx().is_empty());
-    kt_assert_eq!(r.dst.pending(&io), 1, "dst untouched while stopped");
+    kt_assert_eq!(r.dst.unread(&io), 1, "dst untouched while stopped");
 
     // Started, but the status PPDU (2) is behind the MPDU's (3).
     kt_assert!(dp.set_monitor_started(0, true));
@@ -277,7 +277,7 @@ fn smoke_ath11k_dp_mon_dest_gating() -> TestResult {
     let mut budget = 8;
     dp.process_mon_rings_for(&mut hal, &io, 0, 0, &mut budget);
     kt_assert!(dp.take_mon_rx().is_empty());
-    kt_assert_eq!(r.dst.pending(&io), 1, "entry held for its PPDU");
+    kt_assert_eq!(r.dst.unread(&io), 1, "entry held for its PPDU");
     kt_assert_eq!(dp.mon_stats_for(0).unwrap().dest_mpdu_done, 0);
     TestResult::Pass
 }
@@ -396,7 +396,7 @@ fn smoke_ath11k_dp_full_mon_qcn9074() -> TestResult {
     kt_assert!(!pdev.mon.hold_mon_dst_ring);
     kt_assert_eq!(pdev.mon.stats.dest_ppdu_done, 1);
     kt_assert_eq!(pdev.mon.stats.dest_mpdu_done, 1);
-    kt_assert_eq!(r.dst.pending(&io), 0);
+    kt_assert_eq!(r.dst.unread(&io), 0);
 
     // A status buffer for PPDU 12 while the destination PPDU is 10:
     // LEAD → the held MPDU is dropped.
