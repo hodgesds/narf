@@ -500,7 +500,13 @@ identity and complete firmware/protocol enable before generic HCI commands.
   btintel-pcie firmware load as `btintel-pcie`, which resolves the
   HCI index lazily by transport identity — the index only exists
   once `bring_up_all` has run the mandatory HCI bring-up over the
-  transport); `pm::park_autosuspend` /
+  transport); per H5/UART controller by the `bt-h5=<name>` bind as
+  `h5-<uart-name>` (#1580 item 3: suspend parks the pump and sends
+  SLEEP (§9.3); resume runs WAKEUP→WOKEN when the peer kept power,
+  and otherwise discards the stale link state and re-establishes
+  it with SYNC/CONFIG, staying parked if that fails — no
+  `SuspendStateHook`, because the link state is in-RAM and stale
+  after a peer power cut, so it is re-established, not sealed); `pm::park_autosuspend` /
   `pm::unpark_autosuspend` are the hub idle-suspend park and the
   wake-watch / TX-demand unpark. `mgmt::is_powered` is truthful:
   the `POWERED` setting bit AND NOT parked-for-power (mgmt off or
