@@ -589,6 +589,11 @@ fn fragmented_handshake() -> Result<(), &'static str> {
                 return Err("fragmented handshake derived wrong actual key");
             }
         } else {
+            // The pending association owns the retained station (the
+            // `Lifecycle` mutex) until it completes or is dropped, so the
+            // M4 hold flag is read through a pre-cloned handle, as the
+            // other held-M4 composition cases do.
+            let controls = h.model(|io| io.packets.controls.clone());
             let mut association = begin_fragment_association(&h);
             let mut held = false;
             for _ in 0..10_000 {
@@ -599,7 +604,7 @@ fn fragmented_handshake() -> Result<(), &'static str> {
                 {
                     return Err("fragmented handshake opened port before held M4 terminal");
                 }
-                if h.model(|io| io.packets.controls.held.load(Ordering::Acquire)) {
+                if controls.held.load(Ordering::Acquire) {
                     held = true;
                     break;
                 }
