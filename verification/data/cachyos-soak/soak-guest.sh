@@ -37,12 +37,15 @@ D=/run/narf-soak
 : "${SOAK_TLS_PORT:=42443}" "${SOAK_UDP_PORT:=42053}" "${SOAK_LISTEN_PORT:=5201}"
 : "${SOAK_VIRTIO_NET:=10.0.2}" "${SOAK_E1000_NET:=10.0.3}" "${SOAK_POWEROFF:=1}"
 : "${SOAK_DROP_SECS:=30}" "${SOAK_BIG_MB:=0}" "${SOAK_XFER_MB:=100}"
-: "${SOAK_DIRECTED:=1}" "${SOAK_DIRTYEXIT:=0}" "${SOAK_SHARED_MAPS:=1}"
+: "${SOAK_DIRECTED:=1}" "${SOAK_DIRTYEXIT:=0}" "${SOAK_SHARED_MAPS:=1}" "${SOAK_DURABLE:=0}"
 # <MiB>:<exit|kill> rounds of a process that dies with dirty shared pages.
 : "${SOAK_EXITWB:=8:exit 32:exit 32:kill}"
 # <window seconds>:<dirty MiB>:<forks per second> rounds of the forking parent.
 # A fourth field `clean` makes the mapping read-only-touched (nothing dirty).
-: "${SOAK_FORKFLUSH:=10:1:1 5:8:1 3:16:1}"
+: "${SOAK_FORKFLUSH:=10:1:1 10:16:1 3:48:1}"
+# Files the host checks after the run live in @ itself, outside the soak's
+# scratch directories (which are removed at the end).
+DATA=/narf-soak-data
 W=/var/tmp/narf-soak
 TREE=/home/narf/src/narf
 HB=$D/hb
@@ -584,12 +587,70 @@ journal_fill() { # MiB
   journalctl --disk-usage --no-pager
 }
 
+# Shell `>` redirections onto tmpfs (each one an open with O_TRUNC), timed,
+# while a mapper churns in the background.
+redirect_storm() { # secs mib
+  local i t0 t worst=0 slow=0 n=0
+  "$NATIVE" mapchurn "$1" "$2" "$W/ep/churn.bin" &
+  local churn=$!
+  local end=$((SECONDS + $1))
+  while ((SECONDS < end)); do
+    t0=${EPOCHREALTIME/./}
+    printf 'x%s\n' "$n" > "/tmp/soak-redir-$((n % 8))"
+    t=$(((${EPOCHREALTIME/./} - t0) / 1000))
+    ((t > worst)) && worst=$t
+    ((t > 100)) && slow=$((slow + 1))
+    n=$((n + 1))
+  done
+  wait "$churn"
+  echo "redirect-storm: redirections=$n slower_than_100ms=$slow worst_ms=$worst"
+}
+
+# The durability check: data written through shared mappings and left
+# behind in different ways, then a hard stop the host performs on
+# SOAK-HARDSTOP. The host reads the files back from the image.
+durable_run() {
+  mkdir -p "$DATA/dur"
+  rm -f "$DATA/dur"/*
+  sync
+  local line
+  for spec in exit:A:101 kill:B:102; do
+    IFS=: read -r mode name seed <<< "$spec"
+    line=$("$NATIVE" durable "$DATA/dur/$name.bin" 32 "$mode" "$seed" 2>&1)
+    stamp
+    say "SOAK-DURABLE up=$UP $line"
+  done
+  stamp
+  say "SOAK-DURABLE up=$UP waiting 40 s with the guest idle for the flusher"
+  nap 40
+  for spec in nosync:E:105 msync:C:103 fsync:D:104; do
+    IFS=: read -r mode name seed <<< "$spec"
+    line=$("$NATIVE" durable "$DATA/dur/$name.bin" 32 "$mode" "$seed" 2>&1)
+    stamp
+    say "SOAK-DURABLE up=$UP $line"
+  done
+  stamp
+  say "SOAK-HARDSTOP up=$UP"
+  while :; do nap 60; done
+}
+
+w_integrity() {
+  "$NATIVE" integrity "$1" "$DATA/integ" 4 "$HB/integrity" 2>&1 |
+    while read -r line; do say "SOAK-INTEG $line"; done
+}
+
 directed() {
   local spec window mib rate kind
   mkdir -p "$W/ep"
   # The operations that leave nothing behind come first. An exit with dirty
   # shared pages can keep a CPU and the filesystem busy for minutes after
   # it, and whatever ran next would be measuring that instead of itself.
+  # One large munmap of a dirty shared mapping, the first touch of a clean
+  # one, and truncating opens on tmpfs while another process maps, dirties
+  # and unmaps 256 MiB over and over.
+  episode munmap-128m "$NATIVE" munmapbig 128 "$W/ep/munmap.bin"
+  episode firsttouch-256m "$NATIVE" firsttouch 256 "$W/ep/touch.bin"
+  episode redirect-storm redirect_storm 30 256
   # (c) long system calls that touch no mapping.
   episode write-256x1m $PY bigwrite "$W/ep/w1" 1 256 nofsync
   episode write-4x64m $PY bigwrite "$W/ep/w2" 64 4 nofsync
@@ -603,6 +664,8 @@ directed() {
   episode rg-tree rg -c unsafe "$TREE"
   episode truncate-256m truncate -s 0 "$W/ep/w3"
   episode unlink-256m rm -f "$W/ep/w1"
+  episode write-1x1024m $PY bigwrite "$W/ep/w5" 1024 1 nofsync
+  episode unlink-1024m rm -f "$W/ep/w5"
   episode rm-rest rm -rf "$W/ep"
   # (d) what an ordinary boot does: readers of journald's mapped journal.
   episode journal-fill journal_fill 4
@@ -769,6 +832,11 @@ KEEP+="$! "
 taskset -cp "$LAST_CPU" $! > /dev/null 2>&1
 
 survey_shared boot
+if [ "$SOAK_DURABLE" = 1 ]; then
+  stamp
+  say "SOAK-PHASE durable up=$UP"
+  durable_run
+fi
 if [ "$SOAK_DIRECTED" = 1 ]; then
   stamp
   say "SOAK-PHASE directed up=$UP"
@@ -801,6 +869,7 @@ if [ "$SOAK_DIRTYEXIT" = 1 ]; then
   worker dirtyexit3 w_dirtyexit 3 exit
 fi
 worker trees w_trees
+worker integrity w_integrity "$NATIVE_SECS"
 worker fsio1 $PY fsio "$HB/fsio1" "$W/fsio1" "$SOAK_SECS"
 worker fsio2 $PY fsio "$HB/fsio2" /home/narf/soak-fsio "$SOAK_SECS"
 worker journal w_journal
