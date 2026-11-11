@@ -505,3 +505,124 @@ fn smoke_btrfs_directory_orphan_is_evicted() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_directory_orphan_is_evicted);
+
+/// `fallocate` punches, preallocates and zeroes a bounded number of extents
+/// per step (Linux `btrfs_replace_file_extents`, `btrfs_prealloc_file_range`),
+/// so what one step reserves does not follow the range, and the file reads
+/// as it must afterwards: a punch over 1,000
+/// and 6,000 single-page extents, a preallocation of as many holes, a
+/// zero-range over as many extents.
+fn smoke_btrfs_fallocate_reserves_in_steps() -> TestResult {
+    use crate::write::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
+    let vol = match mount_writable(writable_sparse(FIXTURE_TALL_SPARSE)) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fallocate fixture did not mount"),
+    };
+    if poll_once(vol.switch_to_subvol(&crate::volume::Subvol::Name("@".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol @ did not resolve");
+    }
+    for kind in [
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_DATA,
+        format::BLOCK_GROUP_METADATA,
+        format::BLOCK_GROUP_METADATA,
+    ] {
+        if !matches!(
+            poll_once(crate::write::alloc_chunk(&vol, kind)),
+            Some(Ok(()))
+        ) {
+            return TestResult::Fail("fallocate: chunk allocation failed");
+        }
+    }
+    let dir = match poll_once(vol.root().mkdir("falloc")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("fallocate: mkdir failed"),
+    };
+    let mut reserved: Vec<u64> = Vec::new();
+    for pages in [1000usize, 6000] {
+        let size = (pages * PAGE) as u64;
+        let (Some(punched), Some(zeroed)) = (
+            build_pages(&vol, &dir, &alloc::format!("punch-{pages}"), pages),
+            build_pages(&vol, &dir, &alloc::format!("zero-{pages}"), pages),
+        ) else {
+            return TestResult::Fail("fallocate: building the files failed");
+        };
+        // Strided: a page written, a page left a hole.
+        let Some(filled) =
+            poll_once(dir.create(&alloc::format!("fill-{pages}"))).and_then(|r| r.ok())
+        else {
+            return TestResult::Fail("fallocate: create failed");
+        };
+        let page = [0x6bu8; PAGE];
+        for index in 0..pages {
+            if !matches!(
+                poll_once(filled.write((2 * index * PAGE) as u64, &page)),
+                Some(Ok(PAGE))
+            ) {
+                return TestResult::Fail("fallocate: write failed");
+            }
+        }
+        if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+            return TestResult::Fail("fallocate: sync failed");
+        }
+        let span = (2 * pages * PAGE) as u64;
+        let ops: [(&Arc<dyn narf_filesystem::FileOps>, u32, u64); 3] = [
+            (&punched, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, size),
+            (&filled, 0, span),
+            (&zeroed, FALLOC_FL_ZERO_RANGE, size),
+        ];
+        for (file, mode, len) in ops {
+            // Chunks are not judged here: this fixture's 16 MiB chunks fill
+            // with the metadata of some 40,000 extents whatever the
+            // reservation does. The `release` scenario judges them on a
+            // filesystem with room.
+            match measure(&vol, || {
+                matches!(poll_once(file.fallocate(mode, 0, len)), Some(Ok(())))
+            }) {
+                Ok((_, r)) if r > 1024 => {
+                    return TestResult::Fail(
+                        "fallocate: one step reserved more than a step's worth",
+                    )
+                }
+                Ok((_, r)) => reserved.push(r),
+                Err(e) => return TestResult::Fail(e),
+            }
+        }
+        // Sizes kept or grown as asked, and the ranges read as zeros.
+        let mut got = [0xffu8; PAGE];
+        for (file, at, want_size) in [
+            (&punched, size / 2, size),
+            (&zeroed, size - PAGE as u64, size),
+            (&filled, span - PAGE as u64, span),
+        ] {
+            let stat = poll_once(file.stat_async()).and_then(|r| r.ok());
+            if stat.map(|s| s.size) != Some(want_size) {
+                return TestResult::Fail("fallocate: a file has the wrong size");
+            }
+            if !matches!(poll_once(file.read(at, &mut got)), Some(Ok(PAGE)))
+                || got.iter().any(|&b| b != 0)
+            {
+                return TestResult::Fail("fallocate: a range does not read as zeros");
+            }
+        }
+        // The data the preallocation went around is still there.
+        if !matches!(poll_once(filled.read(0, &mut got)), Some(Ok(PAGE))) || got != page {
+            return TestResult::Fail("fallocate: preallocation changed data");
+        }
+    }
+    // 6,000 against 1,000: no more than a level of the trees more.
+    for kind in 0..3 {
+        if reserved[3 + kind] > 2 * reserved[kind].max(1) {
+            return TestResult::Fail("fallocate: what a step reserves depends on the range");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fallocate_reserves_in_steps);

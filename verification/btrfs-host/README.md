@@ -29,7 +29,12 @@ take longer as the file's extent count grows; then sequential writes in
 truncated to nothing and unlinked: each must succeed, allocate no METADATA
 chunk, and reserve no more per step than a step's worth; then truncates and
 an unlink with every step committed and the write stream cut at every
-flush, each crashed image checked and remounted). Every commit is audited against the
+flush, each crashed image checked and remounted; the same for a punch, a
+zero-range and a preallocation over 1,000 and 100,000 extents, with the
+device writes and tree nodes each step writes reported, and their crash
+cuts with the states each step boundary leaves, on filesystems with and
+without `no-holes`; and a directory orphan as Linux `rmdir` leaves one,
+evicted by the next mount). Every commit is audited against the
 on-disk free-space tree (in `scale`, every commit of its second workload
 pass), and the run reports the most any commit allocated beyond its batch's
 reservation. `scale` takes a few minutes and about 2 GiB of disk at the
