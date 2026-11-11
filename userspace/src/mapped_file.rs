@@ -2935,6 +2935,7 @@ pub(crate) fn publish_shared_file_pages(
     candidates: Vec<PhysAddr>,
     expected_generation: Option<u64>,
 ) -> (Vec<PhysAddr>, SharedFilePublication) {
+    writeback::register_shrinker();
     // Snapshot candidate contents before entering the IRQ-safe cache lock.
     // A candidate selected as canonical consumes its image; a losing
     // candidate drops the unused Vec outside the critical section.
