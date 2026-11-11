@@ -177,6 +177,21 @@ pub const GP106_GTX_1060_6G: u16 = 0x1C03;
 pub const GP106_GTX_1060_3G: u16 = 0x1C02;
 pub const GP102_GTX_1080_TI: u16 = 0x1B06;
 pub const GP107_GTX_1050_TI: u16 = 0x1C82;
+// GP107 family, pci.ids 2026.10.27 (vendor 0x10DE section).
+// 0x1C81 is the plain desktop GTX 1050 (G1: Daniel's card).
+// 0x1C8E is a bare "GP107M" with no product name — left out.
+// `_R2` suffixes mark the two product names pci.ids repeats for
+// two DIDs (GTX 1050 Mobile: 0x1C8D/0x1C92; MX350: 0x1C94/0x1C96).
+pub const GP107_GTX_1050: u16 = 0x1C81;
+pub const GP107_GTX_1050_3G: u16 = 0x1C83;
+pub const GP107M_GTX_1050_TI_MOBILE: u16 = 0x1C8C;
+pub const GP107M_GTX_1050_MOBILE: u16 = 0x1C8D;
+pub const GP107M_GTX_1050_TI_MAXQ: u16 = 0x1C8F;
+pub const GP107M_MX150: u16 = 0x1C90;
+pub const GP107M_GTX_1050_3G_MAXQ: u16 = 0x1C91;
+pub const GP107M_GTX_1050_MOBILE_R2: u16 = 0x1C92;
+pub const GP107M_MX350: u16 = 0x1C94;
+pub const GP107M_MX350_R2: u16 = 0x1C96;
 
 // Volta (GV10x) — Titan V only; Quadro GV100 etc.
 pub const GV100_TITAN_V: u16 = 0x1D81;
@@ -223,7 +238,15 @@ pub fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         GP102_GTX_1080_TI => (ChipFamily::Pascal, "gp102"),
         GP104_GTX_1080 | GP104_GTX_1070 => (ChipFamily::Pascal, "gp104"),
         GP106_GTX_1060_6G | GP106_GTX_1060_3G => (ChipFamily::Pascal, "gp106"),
-        GP107_GTX_1050_TI => (ChipFamily::Pascal, "gp107"),
+        GP107_GTX_1050_TI | GP107_GTX_1050 | GP107_GTX_1050_3G => (ChipFamily::Pascal, "gp107"),
+        GP107M_GTX_1050_TI_MOBILE
+        | GP107M_GTX_1050_MOBILE
+        | GP107M_GTX_1050_TI_MAXQ
+        | GP107M_MX150
+        | GP107M_GTX_1050_3G_MAXQ
+        | GP107M_GTX_1050_MOBILE_R2
+        | GP107M_MX350
+        | GP107M_MX350_R2 => (ChipFamily::Pascal, "gp107m"),
         // Volta.
         GV100_TITAN_V => (ChipFamily::Volta, "gv100"),
         // Turing.
@@ -263,6 +286,12 @@ pub fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
 /// 0x2882 is AD107 [GeForce RTX 4060]; 0x2820 is AD106M
 /// [GeForce RTX 4070 Max-Q / Mobile]; AD106 desktop parts are
 /// 0x2803 (4060 Ti), 0x2805 (4060 Ti 16GB), 0x2808 (4060).
+/// G1 GP107 additions against the same snapshot: 0x1C81 is GP107
+/// [GeForce GTX 1050]; 0x1C83 GP107 [GeForce GTX 1050 3GB];
+/// mobile GP107M: 0x1C8C (1050 Ti Mobile), 0x1C8D (1050 Mobile),
+/// 0x1C8F (1050 Ti Max-Q), 0x1C90 (MX150), 0x1C91 (1050 3 GB
+/// Max-Q), 0x1C92 (1050 Mobile), 0x1C94/0x1C96 (MX350).
+/// 0x1C8E is a bare "GP107M" with no product name — not registered.
 pub const KNOWN_DEVICES: &[(&str, u16)] = &[
     // Maxwell.
     ("nvidia-gm107-gtx750ti", GM107_GTX_750_TI),
@@ -278,6 +307,16 @@ pub const KNOWN_DEVICES: &[(&str, u16)] = &[
     ("nvidia-gp106-gtx1060-6g", GP106_GTX_1060_6G),
     ("nvidia-gp106-gtx1060-3g", GP106_GTX_1060_3G),
     ("nvidia-gp107-gtx1050ti", GP107_GTX_1050_TI),
+    ("nvidia-gp107-gtx1050", GP107_GTX_1050),
+    ("nvidia-gp107-gtx1050-3g", GP107_GTX_1050_3G),
+    ("nvidia-gp107m-gtx1050ti-mobile", GP107M_GTX_1050_TI_MOBILE),
+    ("nvidia-gp107m-gtx1050-mobile", GP107M_GTX_1050_MOBILE),
+    ("nvidia-gp107m-gtx1050ti-maxq", GP107M_GTX_1050_TI_MAXQ),
+    ("nvidia-gp107m-mx150", GP107M_MX150),
+    ("nvidia-gp107m-gtx1050-3g-maxq", GP107M_GTX_1050_3G_MAXQ),
+    ("nvidia-gp107m-gtx1050-mobile-r2", GP107M_GTX_1050_MOBILE_R2),
+    ("nvidia-gp107m-mx350", GP107M_MX350),
+    ("nvidia-gp107m-mx350-r2", GP107M_MX350_R2),
     // Volta.
     ("nvidia-gv100-titanv", GV100_TITAN_V),
     // Turing.

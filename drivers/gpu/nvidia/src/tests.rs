@@ -20,7 +20,8 @@ use crate::ce::{ce_class_for, ce_instance_count, CE_LAUNCH_DMA};
 use crate::chip::{
     chip_info_for_pci_id, ChipFamily, AD102_RTX_4090, AD104_RTX_4070, AD106M_RTX_4070_MOBILE,
     AD106_RTX_4060, AD107_RTX_4060, GA102_RTX_3090, GM200_GTX_TITAN_X, GP104_GTX_1080,
-    KNOWN_DEVICES, NVIDIA_VENDOR, TU106_RTX_2060,
+    GP107M_GTX_1050_MOBILE, GP107M_MX350, GP107_GTX_1050, KNOWN_DEVICES, NVIDIA_VENDOR,
+    TU106_RTX_2060,
 };
 use crate::disp::nv50::{
     aux_header, enc_head_display, enc_head_sync_end, enc_head_sync_start, enc_head_total,
@@ -98,10 +99,15 @@ fn smoke_nvidia_chip_known_pci_ids_per_family() -> TestResult {
     // Spot-check one well-known board per family, plus the
     // step-3 Ada corrections (pci.ids 2026.10.27): 0x2808 is
     // AD106 [GeForce RTX 4060] and 0x2820 is AD106M
-    // [GeForce RTX 4070 Max-Q / Mobile].
+    // [GeForce RTX 4070 Max-Q / Mobile]; and the G1 GP107
+    // additions (same snapshot): 0x1C81 is the plain desktop
+    // GTX 1050 ("gp107"), the mobile parts are "gp107m".
     let cases = [
         (GM200_GTX_TITAN_X, ChipFamily::Maxwell, "gm200"),
         (GP104_GTX_1080, ChipFamily::Pascal, "gp104"),
+        (GP107_GTX_1050, ChipFamily::Pascal, "gp107"),
+        (GP107M_GTX_1050_MOBILE, ChipFamily::Pascal, "gp107m"),
+        (GP107M_MX350, ChipFamily::Pascal, "gp107m"),
         (TU106_RTX_2060, ChipFamily::Turing, "tu106"),
         (GA102_RTX_3090, ChipFamily::Ampere, "ga102"),
         (AD102_RTX_4090, ChipFamily::Ada, "ad102"),
