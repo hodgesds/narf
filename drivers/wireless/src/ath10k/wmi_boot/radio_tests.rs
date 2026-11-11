@@ -491,7 +491,16 @@ impl Hif for RadioModel {
         if self.teardown.is_some() {
             return teardown_tests::send(self, bytes).await;
         }
-        if self.data.as_ref().is_some_and(|d| d.automatic) && self.phase >= 3 {
+        // A second START_SCAN before the association began (a fresh
+        // scan after an earlier one on the same harness) is another
+        // scan of the script, not the association's first command.
+        let rescan = self.station.is_none()
+            && bytes.len() >= 12
+            && matches!(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                0x3001 | 0x9000
+            );
+        if self.data.as_ref().is_some_and(|d| d.automatic) && self.phase >= 3 && !rescan {
             if self.station.is_none() {
                 self.station = Some(StationFixture::new());
             }
