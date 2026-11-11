@@ -254,6 +254,26 @@ const _: () = assert!(NUM_MIGRATE_TYPES <= 1 << (STATE_NODE_SHIFT - STATE_MT_SHI
 const _: () =
     assert!(crate::frame::MAX_NUMA_NODES <= 1 << (STATE_PAYLOAD_SHIFT - STATE_NODE_SHIFT));
 
+/// End-of-list marker for a per-CPU cache's frame list.
+pub(crate) const NO_FRAME: u64 = u64::MAX;
+
+/// State word of a frame resident in a per-CPU cache whose list continues at
+/// `next` (`NO_FRAME` for the last frame).
+#[inline]
+pub(crate) const fn cached_state(next: u64) -> u64 {
+    STATE_KIND_CACHED | (next.wrapping_add(1) << STATE_PAYLOAD_SHIFT)
+}
+
+/// The next frame on a cache list, or `None` when `state` is not a cached
+/// frame's word at all — the list has been corrupted.
+#[inline]
+pub(crate) const fn cached_next(state: u64) -> Option<u64> {
+    if state & STATE_KIND_MASK != STATE_KIND_CACHED {
+        return None;
+    }
+    Some((state >> STATE_PAYLOAD_SHIFT).wrapping_sub(1))
+}
+
 type StateSection = &'static [AtomicU64];
 type StateTable = &'static [OnceLock<StateSection>];
 
@@ -2077,4 +2097,40 @@ mod index_tests {
         "memory/buddy",
         smoke_buddy_index_uncovered_frames_fall_back_to_the_scan
     );
+
+    /// A cache link round-trips, and is neither an empty word nor any zone's
+    /// block word; a frame carrying one is refused by a zone like any other
+    /// frame that is already free.
+    fn smoke_buddy_index_cached_words_are_distinct() -> TestResult {
+        const FIRST: u64 = 0x10_8800;
+        kt_assert_eq!(cached_next(cached_state(NO_FRAME)), Some(NO_FRAME));
+        kt_assert_eq!(cached_next(cached_state(0)), Some(0));
+        kt_assert_eq!(
+            cached_next(cached_state(0xF_FFFF_FFFF)),
+            Some(0xF_FFFF_FFFF)
+        );
+        kt_assert_eq!(cached_next(0), None);
+        if !cover(FIRST, 16) {
+            return OUT_OF_MEMORY;
+        }
+        let mut zone = indexed_zone(5);
+        kt_assert_eq!(
+            cached_next(zone.block_state(1, MAX_ORDER as usize, 7)),
+            None
+        );
+        kt_assert!(zone.own_block(cached_state(3)).is_none());
+        zone.donate(FIRST, 16);
+        let Some(frame) = zone.alloc(0) else {
+            return TestResult::Fail("synthetic zone could not supply a frame");
+        };
+        let Some(word) = zone.slot(frame) else {
+            return TestResult::Fail("covered frame has no state word");
+        };
+        word.store(cached_state(NO_FRAME), Ordering::Relaxed);
+        kt_assert!(!zone.try_free_mt(frame, 0, MigrateType::Unmovable));
+        word.store(0, Ordering::Relaxed);
+        kt_assert!(zone.try_free_mt(frame, 0, MigrateType::Unmovable));
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/buddy", smoke_buddy_index_cached_words_are_distinct);
 }

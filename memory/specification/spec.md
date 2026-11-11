@@ -255,6 +255,10 @@ pub fn firmware_node_count() -> u32;
 /// Free-block counts by buddy order, including cached base pages and pairs
 /// in orders 0 and 1 respectively.
 pub fn node_free_blocks(node: usize) -> [usize; BUDDY_ORDER_COUNT];
+/// Frees the buddy allocator has refused since boot because the frame's
+/// free-state word showed it was already free (a double free). 0 in a
+/// correct kernel.
+pub fn frame::double_frees_refused() -> u64;
 
 /// Free-memory pressure band and the physical-page deficit to high.
 pub fn watermark_min() -> u64;
@@ -1551,11 +1555,37 @@ x86_64 is rejected at runtime.
 - `PhysFrame` is `!Copy`; dropping it returns to the allocator (Rust
   ownership = leak safety for physical memory).
 - Buddy allocator free lists and their IRQ-safe locks are per-NUMA-node and
-  cache-line isolated. Order-0 allocation/free is fronted by a bounded,
-  cache-line-aligned per-CPU/per-node cache; refill and spill batch eight pages
-  under one zone-lock acquisition. Kernel/UNMOVABLE order-1 blocks have a
-  separate eight-pair cache per CPU/node, populated only by complete returned
-  blocks and spilling four pairs at a time. User/MOVABLE blocks bypass it.
+  cache-line isolated. Every managed frame has a free-state word (8 bytes per
+  frame, in 128 MiB sections taken from the buddy: installed for boot RAM at
+  slab promotion, and for a hot-plugged range before it is donated). The word
+  records where the frame is while free — head of a free block (node,
+  migratetype, order, list position) or resident in a per-CPU cache (next
+  frame) — and is 0 otherwise. A word is written only by the holder of the
+  frame's free state: the listing zone under its lock, or the holding cache
+  under its lock. Zones mirror their free lists into the words from slab
+  promotion on, so finding and unlinking a block's buddy is one load and one
+  swap-remove: a free costs O(orders) however many blocks are listed, and an
+  exact-range removal costs O(blocks in the range × orders). A frame with no
+  word (no section covers it) keeps the list-scanning path and is never
+  cached. A free of a frame whose word is non-zero is a double free: it is
+  refused, counted (`double_frees_refused`), and leaves lists and free-page
+  totals untouched.
+  Order-0 allocation/free is fronted by a cache-line-aligned
+  per-CPU/per-node cache whose frames are linked through those words, so the
+  cache has no fixed capacity. Its sizing is derived per node, never constant:
+  the exchange unit `batch` from the node's size (Linux `zone_batchsize`; 63
+  for 1 GiB or more), and a ceiling `high` that floats between the node's low
+  watermark and one eighth of the node, each divided by the CPUs sharing the
+  node (Linux `zone_highsize`, `nr_pcp_alloc`, `nr_pcp_high`) — raised by
+  consecutive refills and by free streaks that did not fit, lowered while the
+  node is below its high watermark, and held to four batches while it is below
+  its low watermark. The sizing is re-derived when the node's size, its low
+  watermark or the CPU count changes. A refill takes `batch << k` frames
+  (k ≤ 5, at most 2016) under one zone-lock acquisition; a trim, spill or
+  drain returns at most 64 blocks per zone-lock acquisition and releases the
+  zone lock between acquisitions. Kernel/UNMOVABLE order-1 blocks ride the
+  same cache on a second list, populated only by complete returned blocks and
+  counted in the same page total. User/MOVABLE blocks bypass it.
   Cached pages remain included in free-page totals and in their corresponding
   order's block statistics. Each successful ownership handoff updates
   one per-node atomic free-page total after removing a frame from the free pool
@@ -1569,10 +1599,15 @@ x86_64 is rejected at runtime.
   or folio allocation holds only one zone lock at a time; nearest-node fallback
   releases the failed zone before trying the next, so unrelated NUMA nodes do
   not serialize on a global frame lock. Coordinated draining bypasses new cache
-  insertion and drains both cache classes before high-order retry or explicit
-  compaction; runtime-hotplug nodes bypass both cache classes so
-  exact-range offline admission continues to observe every free frame in the
-  buddy. Aggregate snapshots visit only nodes in the published online mask;
+  insertion and drains both cache lists before high-order retry or explicit
+  compaction, after a best-effort pass that empties the caches in bounded
+  slices with every lock released in between. An order-0 allocation that finds
+  its node's zone empty performs the same drain before reporting the node
+  exhausted, so memory held in other CPUs' caches is never an allocation
+  failure. Runtime-hotplug nodes bypass the cache, and it is drained when that
+  bypass is published, so exact-range offline admission continues to observe
+  every free frame in the buddy. Aggregate snapshots visit only nodes in the
+  published online mask;
   node counters are initialized before their bit is set and their bit is
   cleared only after the final range has left the allocator.
 - The installed `FrameAlloc` remains an authoritative cap-gated fat pointer,
@@ -1601,7 +1636,11 @@ x86_64 is rejected at runtime.
   force-charged.
 - Runtime memory online is transactional: overlapping/unmapped ranges are
   rejected before donation, and allocator metadata may not grow while the
-  frame lock is held. Offline succeeds only for an exact registered range
+  frame lock is held. The free-state words for the new range are installed
+  first, before the hot-plug registry or any zone is locked; if they cannot be
+  allocated the range is refused with `MetadataCapacity`. Sections are never
+  removed, so an offlined range keeps its (all-zero) words.
+  Offline succeeds only for an exact registered range
   whose complete buddy extent is free; a failed removal leaves every free
   list and node counter unchanged.
 - **A `PhysFrame` returned by `alloc_frame()` is always tagged to

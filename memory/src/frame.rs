@@ -10,8 +10,10 @@
 //!   data is available.
 //! - `alloc_frame()` consults the current CPU's NUMA node first
 //!   (looked up via the weak-link `narf_cpu_to_node` hook), then falls back
-//!   nearest-node-first. Order-0 traffic is batched through a bounded
-//!   per-CPU/per-node cache after buddy metadata capacity is frozen.
+//!   nearest-node-first. Order-0 traffic is batched through per-CPU/per-node
+//!   caches sized from the node and its CPUs (see "Per-CPU frame caches"),
+//!   published once buddy metadata capacity is frozen and every boot frame
+//!   has a free-state word.
 //! - `alloc_frame_on(node)` is the explicit-node entry point.
 //! - `free_frame(f)` uses `narf_phys_to_node` to return the frame
 //!   to its rightful node bin.
@@ -341,14 +343,14 @@ static ZONE_HOLD_STATS: [ZoneHoldStats; MAX_NUMA_NODES] = [const {
 }; MAX_NUMA_NODES];
 
 /// Per-frame free-state words for every frame the allocator manages: the
-/// buddy zones mirror their free lists into it. See "Per-frame free state"
-/// in `buddy.rs`.
+/// buddy zones mirror their free lists into it, and the per-CPU frame caches
+/// link their frames through it. See "Per-frame free state" in `buddy.rs`.
 static FRAME_INDEX: buddy::FrameStateIndex = buddy::FrameStateIndex::new();
 
 /// Frees refused because the frame's state word said it was already free (the
-/// head of a free buddy block): a double free. The second free is dropped —
-/// accepting it would hand the same frame to two owners. Stays 0 in a correct
-/// kernel.
+/// head of a free buddy block, or resident in a per-CPU cache): a double free.
+/// The second free is dropped — accepting it would hand the same frame to two
+/// owners, or loop a cache's list back on itself. Stays 0 in a correct kernel.
 static DOUBLE_FREES_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Number of frees the allocator has refused as double frees since boot.
@@ -361,10 +363,85 @@ fn note_double_free() {
     DOUBLE_FREES_REFUSED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Order-0 frames one per-CPU cache refill or spill moves, from the size of
+// ── Per-CPU frame caches ────────────────────────────────────────────────
+//
+// Each CPU keeps, per NUMA node, a list of free order-0 frames and a list of
+// free UNMOVABLE order-1 blocks in front of that node's buddy zone, so the
+// common allocation and free touch only the CPU's own lock. The shape is
+// Linux's per-CPU pagesets (`struct per_cpu_pages`, mm/page_alloc.c):
+//
+// * The lists are intrusive — each cached frame's state word links to the
+//   next — so a cache has no capacity of its own; how much it may hold is a
+//   number (`high`), not an array size.
+// * `batch`, the unit of every exchange with the zone, comes from the zone's
+//   size (`zone_cache_batch`, Linux `zone_batchsize`).
+// * `high`, the page count at which a cache starts giving frames back, floats
+//   between `high_min` (the node's low watermark shared out over its CPUs)
+//   and `high_max` (an eighth of the node shared out the same way) — Linux
+//   `zone_highsize` and the `pcp->high` auto-tuning in `nr_pcp_alloc` /
+//   `nr_pcp_high`: it grows while a CPU keeps refilling or keeps freeing more
+//   than it holds, and shrinks back while the node is short of memory.
+// * A refill takes `batch << alloc_factor` frames under ONE zone-lock hold,
+//   the factor doubling per consecutive refill up to `CACHE_BATCH_SCALE_MAX`
+//   (Linux `nr_pcp_alloc`, `rmqueue_bulk`). A trim returns up to
+//   `free_count` frames, `batch` per zone-lock hold (Linux `nr_pcp_free`,
+//   `free_pcppages_bulk`).
+//
+// So under fork/exit churn a CPU takes the zone lock about once per `batch`
+// frames it moves through the zone, and not at all for churn that fits under
+// `high`. The cache this replaces held 16 frames and refilled 8 at a time on
+// every machine, which is one zone-lock acquisition per 8 frames from every
+// CPU — on a one-node machine, all through one lock.
+//
+// Interrupts-off bounds. The zone, cache and drain locks all mask
+// interrupts, so each bound below is also a bound on one interrupts-off
+// section of the allocator's own making, in frames, every frame O(orders):
+//
+// * a zone-lock hold that frees: at most `FRAME_RETURN_CHUNK` (64) blocks;
+// * a zone-lock hold that refills: at most `batch << CACHE_BATCH_SCALE_MAX`
+//   frames (63 << 5 = 2016 at most);
+// * a cache-lock hold on a free: one chunk linked (64 frames) plus one trim,
+//   which returns at most `free_count` frames — again `batch <<
+//   CACHE_BATCH_SCALE_MAX` plus a chunk — across several zone-lock holds;
+// * a coordinated drain (`with_node_frame_caches_drained`,
+//   `with_node_cache_bypassed`): the drain lock is held from the first cache
+//   to the last, so its section covers whatever the node's caches still hold.
+//   `predrain_node_caches` empties them first in slices with every lock
+//   dropped in between, which leaves the coordinated pass only what was
+//   freed in the meantime; the ceiling on that, if every CPU refilled its
+//   cache to `high` in the gap, is the caches' whole budget (an eighth of
+//   the node).
+//
+// A caller that frees a large region while holding its own interrupts-off
+// lock is outside these bounds: the allocator releases every lock of its own
+// between batches, but cannot unmask interrupts on the caller's behalf.
+//
+// Not taken from Linux: per-migratetype lists (NARF's order-0 frames are all
+// served from the UNMOVABLE partition, as before), orders 2-3 and THP on the
+// lists, trimming from the cold end (the lists are singly linked, so a trim
+// takes the most recently cached frames that are not the ones just freed),
+// and the periodic `decay_pcp_high` — nothing in this crate runs on a timer.
+// Frames an idle CPU leaves in its cache stay counted as free and are
+// recovered by the drain a failed allocation performs (`alloc_order0_on`,
+// `alloc_pages_on_inner`).
+
+/// Refill and trim batches scale up to `batch << CACHE_BATCH_SCALE_MAX`
+/// (Linux `CONFIG_PCP_BATCH_SCALE_MAX`, default 5). It is the knob that
+/// bounds the work of one refill's zone-lock hold.
+const CACHE_BATCH_SCALE_MAX: u32 = 5;
+/// A node's caches may together hold at most this fraction of the node
+/// (Linux `MIN_PERCPU_PAGELIST_HIGH_FRACTION`).
+const CACHE_HIGH_FRACTION: usize = 8;
+/// Maximum final-owner returns published during one cache/zone transaction,
+/// and the most blocks one zone-lock hold gives back to the buddy.
+/// The fixed bound keeps IRQ-masked work finite and permits stack-backed spill
+/// storage: freeing memory must not allocate memory after ownership reaches 0.
+const FRAME_RETURN_CHUNK: usize = 64;
+
+/// Order-0 frames one per-CPU cache refill or trim moves, from the size of
 /// the zone it fronts: about 0.025% of the zone, at most 256 KiB, clamped to a
-/// `2^n - 1` value (Linux `zone_batchsize`). 63 for any zone of 1 GiB or more.
-#[cfg(feature = "kernel-test")]
+/// `2^n - 1` value (Linux `zone_batchsize`). 63 for any zone of 1 GiB or more;
+/// 1 — no caching to speak of — for a zone under 32 MiB.
 fn zone_cache_batch(managed_frames: usize) -> usize {
     let batch = (managed_frames >> 12).min((256usize << 10) / PAGE_SIZE as usize);
     if batch <= 1 {
@@ -374,42 +451,213 @@ fn zone_cache_batch(managed_frames: usize) -> usize {
     (1usize << (usize::BITS - 1 - scaled.leading_zeros())) - 1
 }
 
-const FRAME_CACHE_CAPACITY: usize = 16;
-const FRAME_CACHE_BATCH: usize = 8;
-// Small kernel buffers above the slab's 4 KiB limit repeatedly allocate and
-// free order-1 blocks. Keep a bounded set of complete pairs per CPU/node.
-const PAIR_CACHE_CAPACITY: usize = 8;
-const PAIR_CACHE_BATCH: usize = 4;
-/// Maximum final-owner returns published during one cache/zone transaction.
-/// The fixed bound keeps IRQ-masked work finite and permits stack-backed spill
-/// storage: freeing memory must not allocate memory after ownership reaches 0.
-const FRAME_RETURN_CHUNK: usize = 64;
-
-#[derive(Copy, Clone)]
-struct NodeFrameCache<const CAPACITY: usize = FRAME_CACHE_CAPACITY> {
-    frames: [u64; CAPACITY],
-    len: usize,
+/// Page count at which one CPU's cache starts returning frames, when
+/// `pool_frames` is the amount the node's caches may hold between them and
+/// `cpus` CPUs share it; never less than four batches (Linux `zone_highsize`).
+fn zone_cache_high(pool_frames: usize, cpus: usize, batch: usize) -> usize {
+    (pool_frames / cpus.max(1)).max(batch << 2)
 }
 
-impl<const CAPACITY: usize> NodeFrameCache<CAPACITY> {
+/// One node's cache sizing, shared by every CPU's cache for that node.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct CacheTuning {
+    batch: usize,
+    high_min: usize,
+    high_max: usize,
+}
+
+/// A node's published [`CacheTuning`] with the inputs it was derived from, so
+/// a slow path notices when the node's size, its low watermark or the CPU
+/// count has changed and derives it again. Linux recomputes at the events
+/// themselves (`zone_pcp_update` on memory and CPU hotplug, on watermark
+/// changes); this crate is not told about CPU bring-up, so it compares.
+struct NodeCacheTuning {
+    batch: AtomicUsize,
+    high_min: AtomicUsize,
+    high_max: AtomicUsize,
+    managed: AtomicUsize,
+    low_watermark: AtomicUsize,
+    cpus: AtomicUsize,
+}
+
+impl NodeCacheTuning {
     const fn new() -> Self {
         Self {
-            frames: [0; CAPACITY],
-            len: 0,
+            batch: AtomicUsize::new(0),
+            high_min: AtomicUsize::new(0),
+            high_max: AtomicUsize::new(0),
+            managed: AtomicUsize::new(usize::MAX),
+            low_watermark: AtomicUsize::new(0),
+            cpus: AtomicUsize::new(0),
         }
     }
 }
 
+static FRAME_CACHE_TUNING: [NodeCacheTuning; MAX_NUMA_NODES] =
+    [const { NodeCacheTuning::new() }; MAX_NUMA_NODES];
+
+/// CPUs that share `node`'s cache budget: the CPUs on the node, or every CPU
+/// when the node has none of its own (Linux `zone_highsize`'s
+/// `nr_split_cpus`).
+fn node_cache_cpus(node: usize, cpus: usize) -> usize {
+    let local = (0..cpus as u32)
+        .filter(|&cpu| {
+            // SAFETY: narf-frame provides the `#[no_mangle]` definition.
+            unsafe { narf_cpu_to_node(cpu) as usize == node }
+        })
+        .count();
+    if local == 0 {
+        cpus.max(1)
+    } else {
+        local
+    }
+}
+
+/// Pure sizing: the tuning for a node of `managed` frames whose share of the
+/// low watermark is `low_watermark` pages, split over `cpus` CPUs.
+fn derive_cache_tuning(managed: usize, low_watermark: usize, cpus: usize) -> CacheTuning {
+    let batch = zone_cache_batch(managed);
+    let high_min = zone_cache_high(low_watermark, cpus, batch);
+    let high_max = zone_cache_high(managed / CACHE_HIGH_FRACTION, cpus, batch).max(high_min);
+    CacheTuning {
+        batch,
+        high_min,
+        high_max,
+    }
+}
+
+/// `node`'s current cache sizing. Called on the slow paths only (a refill or
+/// a trim, which are about to take the zone lock anyway); a few loads when
+/// nothing has changed. Two CPUs re-deriving at once store the same values.
+fn cache_tuning(node: usize) -> CacheTuning {
+    let published = &FRAME_CACHE_TUNING[node];
+    let managed = ALLOC.node_total_frames[node].load(Ordering::Relaxed);
+    let low_watermark = crate::reclaim::watermark_low_node(node) as usize;
+    let cpus = narf_lib::smp::cpu_count().max(1) as usize;
+    if published.managed.load(Ordering::Relaxed) != managed
+        || published.low_watermark.load(Ordering::Relaxed) != low_watermark
+        || published.cpus.load(Ordering::Relaxed) != cpus
+    {
+        let tuning = derive_cache_tuning(managed, low_watermark, node_cache_cpus(node, cpus));
+        published.batch.store(tuning.batch, Ordering::Relaxed);
+        published.high_min.store(tuning.high_min, Ordering::Relaxed);
+        published.high_max.store(tuning.high_max, Ordering::Relaxed);
+        published.managed.store(managed, Ordering::Relaxed);
+        published
+            .low_watermark
+            .store(low_watermark, Ordering::Relaxed);
+        published.cpus.store(cpus, Ordering::Relaxed);
+        return tuning;
+    }
+    // A reader racing a re-derivation may combine fields of two tunings.
+    // Every use clamps (`high` into `[high_min, high_max]`, batches to at
+    // least 1), so a mixed triple costs at most one oddly sized batch.
+    let batch = published.batch.load(Ordering::Relaxed).max(1);
+    let high_min = published.high_min.load(Ordering::Relaxed);
+    CacheTuning {
+        batch,
+        high_min,
+        high_max: published.high_max.load(Ordering::Relaxed).max(high_min),
+    }
+}
+
+/// One CPU's cache of one node's free frames (Linux `struct per_cpu_pages`).
+/// Guarded by the owning CPU's `FRAME_CACHES` lock.
+#[derive(Copy, Clone)]
+struct NodeFrameCache {
+    /// Order-0 frames, most recently freed first, each frame's state word
+    /// naming the next (`buddy::cached_state`).
+    frames: u64,
+    /// Complete UNMOVABLE order-1 blocks, linked the same way through each
+    /// block's first frame. Small kernel buffers above the slab's 4 KiB limit
+    /// repeatedly allocate and free these.
+    pairs: u64,
+    /// Blocks on `pairs`.
+    pair_count: usize,
+    /// Base pages on both lists: frames plus two per pair (`pcp->count`).
+    count: usize,
+    /// Auto-tuned ceiling for `count` (`pcp->high`); clamped into the node's
+    /// `[high_min, high_max]` on every slow path.
+    high: usize,
+    /// `count` at which the next free takes the slow path: `high`, or less
+    /// while the node is short of memory. 0 until the first free computes it.
+    trim_at: usize,
+    /// Pages freed in the current streak — halved by every allocation, and
+    /// no longer counted up once it reaches `free_cap` (`pcp->free_count`).
+    /// It is the number of pages a trim returns.
+    free_count: usize,
+    /// `batch << CACHE_BATCH_SCALE_MAX` as of the last slow path, kept here so
+    /// the fast path need not read the node's sizing.
+    free_cap: usize,
+    /// log2 of the refill multiplier; grows per refill, halves per free
+    /// (`pcp->alloc_factor`).
+    alloc_factor: u8,
+}
+
+impl NodeFrameCache {
+    const fn new() -> Self {
+        Self {
+            frames: buddy::NO_FRAME,
+            pairs: buddy::NO_FRAME,
+            pair_count: 0,
+            count: 0,
+            high: 0,
+            trim_at: 0,
+            free_count: 0,
+            free_cap: 0,
+            alloc_factor: 0,
+        }
+    }
+
+    /// Order-0 frames on the `frames` list.
+    #[inline]
+    fn frame_count(&self) -> usize {
+        self.count - 2 * self.pair_count
+    }
+}
+
+/// Link `frame` onto a cache list through its state word. `false`, leaving
+/// the list untouched, when the word is not 0: the frame is already free.
+#[inline]
+fn cache_list_push(head: &mut u64, frame: u64, word: &AtomicU64) -> bool {
+    if word.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    word.store(buddy::cached_state(*head), Ordering::Relaxed);
+    *head = frame;
+    true
+}
+
+/// Unlink and return the first frame of a cache list, clearing its state
+/// word (the frame is about to be owned by a caller, or handed to the zone).
+#[inline]
+fn cache_list_pop(head: &mut u64) -> Option<u64> {
+    let frame = *head;
+    if frame == buddy::NO_FRAME {
+        return None;
+    }
+    // A frame only gets onto a list through `cache_list_push`, which needs
+    // its state word, and words are never removed. Anything else in the word
+    // means allocator metadata was overwritten; following the link would hand
+    // out an arbitrary frame.
+    let word = FRAME_INDEX.slot(frame);
+    let next = word.and_then(|word| buddy::cached_next(word.load(Ordering::Relaxed)));
+    let (Some(word), Some(next)) = (word, next) else {
+        panic!("frame cache list corrupted at frame {frame:#x}");
+    };
+    word.store(0, Ordering::Relaxed);
+    *head = next;
+    Some(frame)
+}
+
 struct CpuFrameCache {
     nodes: [NodeFrameCache; MAX_NUMA_NODES],
-    pairs: [NodeFrameCache<PAIR_CACHE_CAPACITY>; MAX_NUMA_NODES],
 }
 
 impl CpuFrameCache {
     const fn new() -> Self {
         Self {
             nodes: [NodeFrameCache::new(); MAX_NUMA_NODES],
-            pairs: [NodeFrameCache::<PAIR_CACHE_CAPACITY>::new(); MAX_NUMA_NODES],
         }
     }
 }
@@ -425,6 +673,8 @@ impl CpuFrameCacheLock {
 
 static FRAME_CACHES: [CpuFrameCacheLock; narf_lib::percpu::MAX_CPUS] =
     [const { CpuFrameCacheLock::new() }; narf_lib::percpu::MAX_CPUS];
+// Order-0 frames held in per-CPU caches, per node. The ordinary per-node
+// free-page totals already include them.
 static FRAME_CACHE_FREE: [AtomicUsize; MAX_NUMA_NODES] =
     [const { AtomicUsize::new(0) }; MAX_NUMA_NODES];
 // Counts free order-1 blocks, not base pages. The ordinary per-node free-page
@@ -839,8 +1089,9 @@ pub fn reserve_for_slab_promotion() {
     for (node, zone) in ZONES.iter().enumerate() {
         zone.0.lock().enable_index(&FRAME_INDEX, node);
     }
-    // Free-list Vecs can no longer grow recursively through the slab. This is
-    // the safe publication point for order-0 caches even on UMA machines that
+    // Free-list Vecs can no longer grow recursively through the slab, and
+    // cached frames have state words to be linked through. This is the safe
+    // publication point for the per-CPU caches even on UMA machines that
     // never publish `numa_aware`.
     FRAME_CACHE_ENABLED.store(true, Ordering::Release);
 }
@@ -1158,9 +1409,11 @@ pub unsafe fn online_memory_range(
     // Runtime ranges must remain wholly visible to `remove_free_range`.
     // Disable page caching on this node before the new frames are donated;
     // an in-flight cache operation that began earlier can only see pre-existing
-    // boot frames because the range is not in the buddy yet.
+    // boot frames because the range is not in the buddy yet. The node's
+    // caches are emptied in the same pass: with caching off, frames left in
+    // them would never be allocated again.
     FRAME_CACHE_HOTPLUG_BYPASS[node].store(true, Ordering::Release);
-    synchronize_frame_cache_bypass();
+    drain_bypassed_node_caches(node);
 
     if !ALLOC.initialised.load(Ordering::Acquire) {
         if reused {
@@ -1619,16 +1872,65 @@ fn frame_cache_bypassed(node: usize) -> bool {
         || FRAME_CACHE_HOTPLUG_BYPASS[node].load(Ordering::Acquire)
 }
 
-/// Order-0 allocator front-end. Once buddy metadata capacity is stable, each
-/// CPU keeps a small cache per node and refills it under one zone-lock
-/// acquisition. The per-CPU lock also masks local IRQs, preventing same-CPU
-/// re-entry from duplicating a frame.
+/// Take one order-0 frame straight from `node`'s zone: the path while the
+/// caches are unpublished or bypassed for the node.
+fn alloc_order0_from_zone(node: usize) -> Option<PhysFrame> {
+    let frame = alloc_below_ceiling(&mut lock_zone(node))?;
+    account_allocated_frames(node, 1);
+    Some(frame)
+}
+
+/// `node` is below its share of the high watermark (Linux `ZONE_BELOW_HIGH`):
+/// its caches stop growing and start handing their ceiling back.
+#[inline]
+fn node_below_high(node: usize) -> bool {
+    crate::reclaim::reclaim_goal_node(node) != 0
+}
+
+/// `node` is below its share of the low watermark, where its reclaimer runs
+/// (the condition Linux tracks as `ZONE_RECLAIM_ACTIVE`): its caches keep
+/// only a few batches.
+#[inline]
+fn node_reclaiming(node: usize) -> bool {
+    crate::reclaim::under_low_watermark_node(node)
+}
+
+/// Frames to take from the zone to refill an empty cache, the one the caller
+/// is waiting for included (Linux `nr_pcp_alloc`). Each consecutive refill
+/// doubles the batch, up to `batch << CACHE_BATCH_SCALE_MAX` and never past
+/// what fits under `high`; `high` itself grows by the batch, since a larger
+/// cache would have saved this trip to the zone — unless the node is short.
+fn cache_refill_count(local: &mut NodeFrameCache, tuning: CacheTuning, node: usize) -> usize {
+    local.high = local.high.clamp(tuning.high_min, tuning.high_max);
+    // The node's sizing may have shrunk since the last free computed its
+    // trigger (a CPU count learned later in boot, memory taken offline).
+    local.trim_at = local.trim_at.min(local.high);
+    if local.high < tuning.batch {
+        return 1;
+    }
+    let batch = tuning.batch << local.alloc_factor;
+    if tuning.high_min != tuning.high_max && !node_below_high(node) {
+        local.high = (local.high + batch).min(tuning.high_max);
+    }
+    let room = local
+        .high
+        .saturating_sub(local.count)
+        .saturating_sub(tuning.batch)
+        .max(tuning.batch);
+    if batch <= room && u32::from(local.alloc_factor) < CACHE_BATCH_SCALE_MAX {
+        local.alloc_factor += 1;
+    }
+    batch.min(room)
+}
+
+/// Order-0 allocator front-end. Once the frame-state index is live, each CPU
+/// keeps a list of free frames per node and refills it with a whole batch
+/// under one zone-lock acquisition. The per-CPU lock also masks local IRQs,
+/// preventing same-CPU re-entry from duplicating a frame.
 fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
     let node = node.min(MAX_NUMA_NODES - 1);
     if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
-        let frame = alloc_below_ceiling(&mut lock_zone(node))?;
-        account_allocated_frames(node, 1);
-        return Some(frame);
+        return alloc_order0_from_zone(node);
     }
 
     let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
@@ -1638,14 +1940,13 @@ fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
     // newly cached frame.
     if frame_cache_bypassed(node) {
         drop(cache);
-        let frame = alloc_below_ceiling(&mut lock_zone(node))?;
-        account_allocated_frames(node, 1);
-        return Some(frame);
+        return alloc_order0_from_zone(node);
     }
     let local = &mut cache.nodes[node];
-    if local.len != 0 {
-        local.len -= 1;
-        let frame = local.frames[local.len];
+    // An allocation interrupts a streak of frees (Linux `rmqueue_pcplist`).
+    local.free_count >>= 1;
+    if let Some(frame) = cache_list_pop(&mut local.frames) {
+        local.count -= 1;
         FRAME_CACHE_FREE[node].fetch_sub(1, Ordering::Relaxed);
         account_allocated_frames(node, 1);
         #[cfg(feature = "kernel-test")]
@@ -1656,53 +1957,244 @@ fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
 
     #[cfg(feature = "kernel-test")]
     FRAME_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    let want = cache_refill_count(local, cache_tuning(node), node);
     let mut zone = lock_zone(node);
-    let first = alloc_below_ceiling(&mut zone)?;
-    for _ in 1..FRAME_CACHE_BATCH {
+    let Some(first) = alloc_below_ceiling(&mut zone) else {
+        drop(zone);
+        drop(cache);
+        return alloc_order0_after_drain(node);
+    };
+    let mut refilled = 0usize;
+    for _ in 1..want {
         let Some(extra) = alloc_below_ceiling(&mut zone) else {
             break;
         };
         let frame = buddy::frame_no(extra);
+        let linked = FRAME_INDEX
+            .slot(frame)
+            .is_some_and(|word| cache_list_push(&mut local.frames, frame, word));
+        if !linked {
+            // No state word to link it through (no index section covers the
+            // frame), so it cannot be cached: hand it straight back and
+            // settle for what the refill has.
+            zone.free(frame, 0);
+            break;
+        }
         buddy::audit_cached_free(frame);
-        local.frames[local.len] = frame;
-        local.len += 1;
-        FRAME_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
+        refilled += 1;
     }
+    drop(zone);
+    local.count += refilled;
+    FRAME_CACHE_FREE[node].fetch_add(refilled, Ordering::Relaxed);
     #[cfg(feature = "kernel-test")]
     FRAME_CACHE_REFILLS.fetch_add(1, Ordering::Relaxed);
     account_allocated_frames(node, 1);
     Some(first)
 }
 
-/// Cache an order-0 free. Returns `false` when caching is disabled or a
-/// coordinated drain is active; the caller then returns the frame directly to
-/// the node buddy.
-fn free_order0_to_cache(node: usize, frame: u64) -> bool {
+/// `node`'s zone has no order-0 frame. Before the node is reported exhausted,
+/// return to the zone whatever its per-CPU caches hold — every CPU's, an idle
+/// CPU's included — and try once more. Linux drains the per-CPU lists the same
+/// way before an allocation fails (`drain_all_pages` on the direct-reclaim
+/// retry). Without this, memory parked in other CPUs' caches would turn into
+/// allocation failures while still being counted free.
+///
+/// The caller holds no allocator lock. Skipped, with no lock taken, when the
+/// node's caches are empty.
+#[cold]
+fn alloc_order0_after_drain(node: usize) -> Option<PhysFrame> {
+    if FRAME_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+        && PAIR_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+    {
+        return None;
+    }
+    let frame = with_node_frame_caches_drained(node, alloc_below_ceiling)?;
+    account_allocated_frames(node, 1);
+    Some(frame)
+}
+
+/// What became of a block offered to the calling CPU's cache.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CacheFree {
+    /// The cache holds it now.
+    Cached,
+    /// Not cacheable — caching is off for the node, or the frame has no
+    /// state word. The caller returns it directly to the node's zone.
+    Declined,
+    /// The frame is already free: a double free, dropped and counted.
+    AlreadyFree,
+}
+
+/// The page count at or above which `local` must give frames back right now,
+/// after adjusting its ceiling (Linux `nr_pcp_high`); `held` is what the cache
+/// will hold once the frames being freed are linked. Also sets `trim_at`, the
+/// count at which a later free re-evaluates.
+fn cache_high_mark(
+    local: &mut NodeFrameCache,
+    tuning: CacheTuning,
+    node: usize,
+    held: usize,
+) -> usize {
+    local.high = local.high.clamp(tuning.high_min, tuning.high_max);
+    let high = local.high;
+    let streak = local.free_count.max(tuning.batch);
+    if node_reclaiming(node) {
+        // The node's reclaimer is running: keep only a few batches here.
+        local.high = high.saturating_sub(streak).max(tuning.high_min);
+        local.trim_at = (tuning.batch << 2).min(local.high);
+        return local.trim_at;
+    }
+    if tuning.high_min == tuning.high_max {
+        local.trim_at = high;
+        return high;
+    }
+    if node_below_high(node) {
+        // Short of memory but not reclaiming yet: lower the ceiling a streak
+        // at a time and trim down towards the floor.
+        local.high = high.saturating_sub(streak).max(tuning.high_min);
+        local.trim_at = tuning.high_min;
+        return held.max(tuning.high_min);
+    }
+    if held >= high {
+        // The streak being freed did not fit; make room for the next one.
+        let need = local.free_count + tuning.batch;
+        if local.high < need {
+            local.high = need.clamp(tuning.high_min, tuning.high_max);
+        }
+    }
+    local.trim_at = local.high;
+    high
+}
+
+/// Book `incoming` base pages about to be linked onto `local`, trimming the
+/// cache first if they would take it to its mark. Caller holds the CPU's
+/// cache lock and links the frames afterwards.
+///
+/// The trim comes BEFORE the link so that what a free just put in the cache
+/// is still there for the next allocation — the lists are singly linked and a
+/// trim takes from the front. (Linux links first and trims from the back;
+/// either way the frames just freed are the ones that stay.)
+#[inline]
+fn cache_make_room(local: &mut NodeFrameCache, node: usize, incoming: usize, pairs_first: bool) {
+    // A free interrupts a run of refills (Linux `free_frozen_page_commit`).
+    local.alloc_factor >>= 1;
+    if local.free_count < local.free_cap {
+        local.free_count += incoming;
+    }
+    if local.count + incoming >= local.trim_at {
+        cache_trim(local, node, incoming, pairs_first);
+    }
+}
+
+/// Slow half of [`cache_make_room`]: re-read the node's sizing and its memory
+/// pressure, and if the cache would be over its mark return a streak's worth
+/// of pages — between one batch and all but one batch (Linux `nr_pcp_free`).
+fn cache_trim(local: &mut NodeFrameCache, node: usize, incoming: usize, pairs_first: bool) {
+    let tuning = cache_tuning(node);
+    local.free_cap = tuning.batch << CACHE_BATCH_SCALE_MAX;
+    let held = local.count + incoming;
+    let high = cache_high_mark(local, tuning, node, held);
+    if held < high {
+        return;
+    }
+    let pages = if high < tuning.batch {
+        1
+    } else {
+        local
+            .free_count
+            .clamp(tuning.batch, (high - tuning.batch).max(tuning.batch))
+    };
+    cache_spill(local, node, pages, tuning.batch, pairs_first);
+}
+
+/// Return up to `pages` base pages from `local` to `node`'s zone, at most
+/// `batch` pages — and never more than `FRAME_RETURN_CHUNK` blocks — per
+/// zone-lock hold (Linux `free_pcppages_bulk`, called once per batch).
+/// `pairs_first` picks the list to start on; the other is used once it is
+/// empty.
+///
+/// Caller holds the CPU's cache lock and keeps it until this returns, so a
+/// frame taken off a list is in the zone before any drainer can look: the
+/// drain/hot-remove protocol relies on a free frame never being in neither
+/// place. The zone lock, though, is released between batches, so other CPUs
+/// get a turn at it however much is being returned.
+fn cache_spill(
+    local: &mut NodeFrameCache,
+    node: usize,
+    pages: usize,
+    batch: usize,
+    pairs_first: bool,
+) {
+    let per_hold = batch.clamp(1, FRAME_RETURN_CHUNK);
+    let mut left = pages.min(local.count);
+    while left != 0 {
+        let mut zone = lock_zone(node);
+        let mut budget = per_hold.min(left);
+        let mut frames = 0usize;
+        let mut pairs = 0usize;
+        while budget != 0 {
+            if local.pair_count != 0 && (pairs_first || local.frame_count() == 0) {
+                let Some(block) = cache_list_pop(&mut local.pairs) else {
+                    break;
+                };
+                local.pair_count -= 1;
+                local.count -= 2;
+                zone.free_cached(block, 1);
+                pairs += 1;
+                budget = budget.saturating_sub(2);
+            } else {
+                let Some(frame) = cache_list_pop(&mut local.frames) else {
+                    break;
+                };
+                local.count -= 1;
+                zone.free_cached(frame, 0);
+                frames += 1;
+                budget -= 1;
+            }
+        }
+        drop(zone);
+        FRAME_CACHE_FREE[node].fetch_sub(frames, Ordering::Relaxed);
+        PAIR_CACHE_FREE[node].fetch_sub(pairs, Ordering::Relaxed);
+        #[cfg(feature = "kernel-test")]
+        FRAME_CACHE_SPILLS.fetch_add(1, Ordering::Relaxed);
+        let moved = frames + 2 * pairs;
+        if moved == 0 {
+            break;
+        }
+        left = left.saturating_sub(moved);
+    }
+}
+
+/// Cache an order-0 free on the calling CPU.
+fn free_order0_to_cache(node: usize, frame: u64) -> CacheFree {
     let node = node.min(MAX_NUMA_NODES - 1);
     if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
-        return false;
+        return CacheFree::Declined;
     }
+    let Some(word) = FRAME_INDEX.slot(frame) else {
+        return CacheFree::Declined;
+    };
     let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
     let mut cache = FRAME_CACHES[cpu].0.lock();
     if frame_cache_bypassed(node) {
-        return false;
+        return CacheFree::Declined;
     }
     let local = &mut cache.nodes[node];
+    // The audit (when compiled in) names a double free at its source before
+    // the refusal below can hide it.
     buddy::audit_cached_free(frame);
-    if local.len == FRAME_CACHE_CAPACITY {
-        let mut zone = lock_zone(node);
-        for _ in 0..FRAME_CACHE_BATCH {
-            local.len -= 1;
-            zone.free_cached(local.frames[local.len], 0);
-        }
-        FRAME_CACHE_FREE[node].fetch_sub(FRAME_CACHE_BATCH, Ordering::Relaxed);
-        #[cfg(feature = "kernel-test")]
-        FRAME_CACHE_SPILLS.fetch_add(1, Ordering::Relaxed);
+    // Checked before any trim: a trim could move the earlier copy of a
+    // doubly-freed frame out of this cache and make it unrecognisable.
+    if word.load(Ordering::Relaxed) != 0 {
+        note_double_free();
+        return CacheFree::AlreadyFree;
     }
-    local.frames[local.len] = frame;
-    local.len += 1;
+    cache_make_room(local, node, 1, false);
+    let linked = cache_list_push(&mut local.frames, frame, word);
+    debug_assert!(linked);
+    local.count += 1;
     FRAME_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
-    true
+    CacheFree::Cached
 }
 
 /// Claim a complete UNMOVABLE order-1 block. Misses retain the ordinary buddy
@@ -1716,12 +2208,11 @@ fn alloc_cached_pair(node: usize) -> Option<PhysFrame> {
     if frame_cache_bypassed(node) {
         return None;
     }
-    let local = &mut cache.pairs[node];
-    if local.len == 0 {
-        return None;
-    }
-    local.len -= 1;
-    let frame = local.frames[local.len];
+    let local = &mut cache.nodes[node];
+    let frame = cache_list_pop(&mut local.pairs)?;
+    local.pair_count -= 1;
+    local.count -= 2;
+    local.free_count >>= 1;
     PAIR_CACHE_FREE[node].fetch_sub(1, Ordering::Relaxed);
     account_allocated_frames(node, 2);
     buddy::audit_cached_alloc(frame);
@@ -1731,56 +2222,51 @@ fn alloc_cached_pair(node: usize) -> Option<PhysFrame> {
     Some(buddy::frame_from_no(frame))
 }
 
-/// Return a complete UNMOVABLE order-1 block. Keep the CPU cache locked until
-/// every spilled pair is visible in the buddy, matching the base-page drain
-/// and hot-remove exclusion protocol. No allocation occurs after owner release.
-fn free_pair_to_cache(node: usize, frame: u64) -> bool {
+/// Return a complete UNMOVABLE order-1 block. The CPU cache stays locked
+/// until every pair a trim displaces is visible in the buddy, matching the
+/// base-page drain and hot-remove exclusion protocol. No allocation occurs
+/// after owner release.
+fn free_pair_to_cache(node: usize, frame: u64) -> CacheFree {
     if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
-        return false;
+        return CacheFree::Declined;
     }
+    let (Some(word), Some(second)) = (FRAME_INDEX.slot(frame), FRAME_INDEX.slot(frame + 1)) else {
+        return CacheFree::Declined;
+    };
     let cpu = current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
     let mut cache = FRAME_CACHES[cpu].0.lock();
     if frame_cache_bypassed(node) {
-        return false;
+        return CacheFree::Declined;
     }
-    let local = &mut cache.pairs[node];
+    let local = &mut cache.nodes[node];
     buddy::audit_cached_free(frame);
     buddy::audit_cached_free(frame + 1);
-    if local.len == PAIR_CACHE_CAPACITY {
-        let mut zone = lock_zone(node);
-        for _ in 0..PAIR_CACHE_BATCH {
-            local.len -= 1;
-            zone.free_cached(local.frames[local.len], 1);
-        }
-        PAIR_CACHE_FREE[node].fetch_sub(PAIR_CACHE_BATCH, Ordering::Relaxed);
+    // The block is linked through its first frame; its second frame must not
+    // be free on its own either. Checked before any trim, as for a base page.
+    if word.load(Ordering::Relaxed) != 0 || second.load(Ordering::Relaxed) != 0 {
+        note_double_free();
+        return CacheFree::AlreadyFree;
     }
-    local.frames[local.len] = frame;
-    local.len += 1;
+    cache_make_room(local, node, 2, true);
+    let linked = cache_list_push(&mut local.pairs, frame, word);
+    debug_assert!(linked);
+    local.pair_count += 1;
+    local.count += 2;
     PAIR_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
-    true
+    CacheFree::Cached
 }
 
 /// Caller holds this CPU's cache lock, with the node's bypass already
-/// published. Both cache classes share the cache -> zone publication order.
+/// published. Both lists go back to the zone, cache -> zone as always, in
+/// zone-lock holds of at most `FRAME_RETURN_CHUNK` blocks.
 fn drain_cpu_node_cache(cache: &mut CpuFrameCache, node: usize) {
-    if cache.nodes[node].len == 0 && cache.pairs[node].len == 0 {
+    let local = &mut cache.nodes[node];
+    if local.count == 0 {
         return;
     }
-    let mut zone = lock_zone(node);
-    let local = &mut cache.nodes[node];
-    let drained = local.len;
-    while local.len != 0 {
-        local.len -= 1;
-        zone.free_cached(local.frames[local.len], 0);
-    }
-    FRAME_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
-    let local = &mut cache.pairs[node];
-    let drained = local.len;
-    while local.len != 0 {
-        local.len -= 1;
-        zone.free_cached(local.frames[local.len], 1);
-    }
-    PAIR_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
+    cache_spill(local, node, usize::MAX, FRAME_RETURN_CHUNK, false);
+    local.free_count = 0;
+    local.alloc_factor = 0;
 }
 
 /// One zone-lock hold returning up to `FRAME_RETURN_CHUNK` final-owner
@@ -1802,14 +2288,18 @@ fn free_order0_chunk_direct(node: usize, frames: &[u64]) -> usize {
     freed
 }
 
-/// Publish a bounded set of final-owner order-0 frames for one NUMA node.
+/// Publish a bounded set of final-owner order-0 frames for one NUMA node, and
+/// return how many were taken (a frame that is already free is dropped).
 ///
 /// No allocation is permitted here: callers have already removed the final
 /// ownership reference, so allocator progress must not depend on obtaining a
-/// fresh frame. Cached spills remain covered by the cache lock until they are
-/// installed in the buddy zone. That cache -> zone lock coupling is required
-/// so a concurrent drain/hot-remove transaction cannot observe the frames in
-/// neither location.
+/// fresh frame. The frames are linked onto the calling CPU's cache in one
+/// cache-lock transaction; if they would take the cache to its mark, a trim
+/// makes room first in the same transaction, a batch per zone-lock hold, and
+/// the cache lock is kept until the displaced frames are installed in the
+/// buddy zone. That cache -> zone lock coupling is required so a concurrent
+/// drain/hot-remove transaction cannot observe the frames in neither
+/// location.
 fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) -> usize {
     debug_assert!(frames.len() <= FRAME_RETURN_CHUNK);
     if frames.is_empty() {
@@ -1832,35 +2322,63 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) -> usize {
     }
 
     let local = &mut cache.nodes[node];
-    let mut spills = [0u64; FRAME_RETURN_CHUNK];
-    let mut spill_len = 0usize;
+    // Room for the whole chunk first (see `cache_make_room`); a chunk that
+    // turns out to hold uncacheable frames merely trimmed a little early.
+    cache_make_room(local, node, frames.len(), false);
+    // Frames no index section covers cannot be linked; they go to the zone.
+    let mut direct = [0u64; FRAME_RETURN_CHUNK];
+    let mut direct_len = 0usize;
+    let mut cached = 0usize;
     for &frame in frames {
+        let Some(word) = FRAME_INDEX.slot(frame) else {
+            direct[direct_len] = frame;
+            direct_len += 1;
+            continue;
+        };
         buddy::audit_cached_free(frame);
-        if local.len == FRAME_CACHE_CAPACITY {
-            debug_assert!(spill_len + FRAME_CACHE_BATCH <= spills.len());
-            for _ in 0..FRAME_CACHE_BATCH {
-                local.len -= 1;
-                spills[spill_len] = local.frames[local.len];
-                spill_len += 1;
-            }
-            FRAME_CACHE_FREE[node].fetch_sub(FRAME_CACHE_BATCH, Ordering::Relaxed);
-            #[cfg(feature = "kernel-test")]
-            FRAME_CACHE_SPILLS.fetch_add(1, Ordering::Relaxed);
+        if cache_list_push(&mut local.frames, frame, word) {
+            cached += 1;
+        } else {
+            note_double_free();
         }
-        local.frames[local.len] = frame;
-        local.len += 1;
-        FRAME_CACHE_FREE[node].fetch_add(1, Ordering::Relaxed);
     }
+    local.count += cached;
+    FRAME_CACHE_FREE[node].fetch_add(cached, Ordering::Relaxed);
+    drop(cache);
+    cached + free_order0_chunk_direct(node, &direct[..direct_len])
+}
 
-    if spill_len != 0 {
-        // Keep `cache` held until every removed cached frame is visible in the
-        // zone. See the drain/hot-remove exclusion argument above.
-        let mut zone = lock_zone(node);
-        for &frame in &spills[..spill_len] {
-            zone.free_cached(frame, 0);
+/// Best-effort first pass of a coordinated drain: move what `node`'s caches
+/// hold into the zone in bounded slices, with every lock dropped between
+/// slices. The coordinated drain proper runs with interrupts off from its
+/// first lock to its last (the drain lock is IRQ-safe and held throughout),
+/// so the work it has to do there should be what was cached since this pass
+/// rather than everything the caches could hold.
+///
+/// Takes no drain lock and publishes no bypass: it is an ordinary cache ->
+/// zone trim performed on each CPU's cache in turn, which any CPU may do.
+/// Frames freed concurrently simply stay for the coordinated pass.
+fn predrain_node_caches(node: usize) {
+    if FRAME_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+        && PAIR_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+    {
+        return;
+    }
+    let tuning = cache_tuning(node);
+    let slice = tuning.batch << CACHE_BATCH_SCALE_MAX;
+    // Enough slices to empty a cache at its ceiling; a CPU refilling its cache
+    // faster than that is left to the coordinated pass.
+    let passes = tuning.high_max / slice + 2;
+    for cpu_cache in &FRAME_CACHES {
+        for _ in 0..passes {
+            let mut cache = cpu_cache.0.lock();
+            let local = &mut cache.nodes[node];
+            if local.count == 0 {
+                break;
+            }
+            cache_spill(local, node, slice, FRAME_RETURN_CHUNK, false);
         }
     }
-    frames.len()
 }
 
 /// Drain every CPU's cache for one node and run `f` while new cache entries
@@ -1881,6 +2399,7 @@ fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone)
         debug_assert!(drain.bypass.load(Ordering::Acquire));
         return f(&mut lock_zone(node));
     }
+    predrain_node_caches(node);
     let _drain_guard = drain.lock();
     drain.bypass.store(true, Ordering::Release);
     for cpu_cache in &FRAME_CACHES {
@@ -1904,6 +2423,7 @@ fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone)
 /// duration; keep `f` bounded.
 pub fn with_node_cache_bypassed<R>(node: usize, f: impl FnOnce() -> R) -> R {
     let node = node.min(MAX_NUMA_NODES - 1);
+    predrain_node_caches(node);
     let drain = &FRAME_CACHE_DRAIN[node];
     let _drain_guard = drain.lock();
     drain.bypass.store(true, Ordering::Release);
@@ -1917,12 +2437,18 @@ pub fn with_node_cache_bypassed<R>(node: usize, f: impl FnOnce() -> R) -> R {
     result
 }
 
-/// Wait for every cache operation that may have observed the old bypass value.
-/// The caller publishes a persistent bypass first, then calls this before
-/// making newly hot-plugged frames visible in the buddy.
-fn synchronize_frame_cache_bypass() {
+/// Second half of publishing a PERSISTENT (hot-plug) bypass for `node`: wait
+/// for every cache operation that may have observed the old bypass value, and
+/// return what the node's caches hold to the zone. With caching off for the
+/// node nothing would ever take those frames out again, so leaving them would
+/// strand up to a cache's `high` per CPU for as long as the node has a
+/// hot-plugged range online. The caller publishes the bypass first, then
+/// calls this before making newly hot-plugged frames visible in the buddy.
+fn drain_bypassed_node_caches(node: usize) {
+    debug_assert!(frame_cache_bypassed(node));
     for cpu_cache in &FRAME_CACHES {
-        drop(cpu_cache.0.lock());
+        let mut cache = cpu_cache.0.lock();
+        drain_cpu_node_cache(&mut cache, node);
     }
 }
 
@@ -2394,18 +2920,22 @@ fn free_block(frame: PhysFrame, order: u8, mt: buddy::MigrateType) {
         0
     };
     let frame_no = buddy::frame_no(frame);
-    if order == 0 && free_order0_to_cache(zone_idx, frame_no) {
-        account_freed_frames(zone_idx, 1);
-        return;
-    }
-    if order == 1 && mt == buddy::MigrateType::Unmovable && free_pair_to_cache(zone_idx, frame_no) {
-        account_freed_frames(zone_idx, 2);
-        return;
-    }
-    if lock_zone(zone_idx).try_free_mt(frame_no, order, mt) {
-        account_freed_frames(zone_idx, 1usize << order);
-    } else {
-        note_double_free();
+    let cached = match order {
+        0 => free_order0_to_cache(zone_idx, frame_no),
+        1 if mt == buddy::MigrateType::Unmovable => free_pair_to_cache(zone_idx, frame_no),
+        _ => CacheFree::Declined,
+    };
+    match cached {
+        CacheFree::Cached => account_freed_frames(zone_idx, 1usize << order),
+        // Dropped and counted by the cache.
+        CacheFree::AlreadyFree => {}
+        CacheFree::Declined => {
+            if lock_zone(zone_idx).try_free_mt(frame_no, order, mt) {
+                account_freed_frames(zone_idx, 1usize << order);
+            } else {
+                note_double_free();
+            }
+        }
     }
 }
 
@@ -2590,12 +3120,17 @@ fn buddy_return_unreferenced_frame(f: PhysFrame) {
     let Some((zone_idx, frame_no)) = buddy_unreferenced_route(f) else {
         return;
     };
-    let taken = free_order0_to_cache(zone_idx, frame_no)
-        || lock_zone(zone_idx).try_free_mt(frame_no, 0, buddy::MigrateType::Unmovable);
-    if taken {
-        account_freed_frames(zone_idx, 1);
-    } else {
-        note_double_free();
+    match free_order0_to_cache(zone_idx, frame_no) {
+        CacheFree::Cached => account_freed_frames(zone_idx, 1),
+        // Dropped and counted by the cache.
+        CacheFree::AlreadyFree => {}
+        CacheFree::Declined => {
+            if lock_zone(zone_idx).try_free_mt(frame_no, 0, buddy::MigrateType::Unmovable) {
+                account_freed_frames(zone_idx, 1);
+            } else {
+                note_double_free();
+            }
+        }
     }
 }
 
@@ -2730,18 +3265,27 @@ fn free_released_window(released: &[PhysAddr]) {
         return;
     }
 
-    let numa_aware = ALLOC.numa_aware.load(Ordering::Acquire);
-    let node_count = if numa_aware { MAX_NUMA_NODES } else { 1 };
-    for node in 0..node_count {
+    // Resolve each frame's node once (this used to be redone for every one of
+    // the `MAX_NUMA_NODES` passes), and visit only the nodes that occur: a
+    // window nearly always belongs to a single node.
+    const _: () = assert!(MAX_NUMA_NODES <= u64::BITS as usize);
+    let mut nodes = [0u8; FREE_BATCH_WINDOW];
+    let mut present = 1u64;
+    if ALLOC.numa_aware.load(Ordering::Acquire) {
+        present = 0;
+        for (slot, phys) in nodes.iter_mut().zip(released) {
+            let node = phys_to_node(phys.raw());
+            *slot = node as u8;
+            present |= 1u64 << node;
+        }
+    }
+    while present != 0 {
+        let node = present.trailing_zeros() as usize;
+        present &= present - 1;
         let mut chunk = [0u64; FRAME_RETURN_CHUNK];
         let mut chunk_len = 0usize;
-        for &phys in released {
-            let zone_idx = if numa_aware {
-                phys_to_node(phys.raw())
-            } else {
-                0
-            };
-            if zone_idx != node {
+        for (&phys, &frame_node) in released.iter().zip(&nodes) {
+            if usize::from(frame_node) != node {
                 continue;
             }
             chunk[chunk_len] = buddy::frame_no(PhysFrame::new(phys));
@@ -4624,25 +5168,30 @@ fn smoke_order1_frame_cache_spill_and_drain() -> narf_kernel_test::TestResult {
         if frame_cache_bypassed(node) {
             return TestResult::Skip("frame cache bypass is active");
         }
-        let before = node_free(node);
-        let mut held = [0u64; PAIR_CACHE_CAPACITY * 2 + 1];
-        let mut count = 0;
-        for slot in &mut held {
-            let frame = match alloc_pages_on(node, 1) {
-                Ok(frame) => frame,
-                Err(_) => break,
-            };
-            *slot = frame.start_address().raw();
-            count += 1;
+        // Enough pairs that freeing them all must take this CPU's cache past
+        // its ceiling, wherever `high` has floated to.
+        let tuning = cache_tuning(node);
+        let wanted = tuning.high_max / 2 + 2 * tuning.batch + 1;
+        let mut held: Vec<u64> = Vec::new();
+        if node_free(node) / 4 < 2 * wanted || held.try_reserve_exact(wanted).is_err() {
+            return TestResult::Skip("not enough free memory to overfill the pair cache");
         }
-        for &physical in &held[..count] {
+        let before = node_free(node);
+        for _ in 0..wanted {
+            match alloc_pages_on(node, 1) {
+                Ok(frame) => held.push(frame.start_address().raw()),
+                Err(_) => break,
+            }
+        }
+        for &physical in &held {
             free_pages(PhysFrame::new(PhysAddr::new(physical)), 1);
         }
-        if count != held.len() {
+        if held.len() != wanted {
             return TestResult::Fail("cannot allocate enough pairs to exercise spill");
         }
         let cpu = current_cpu();
-        let bounded = FRAME_CACHES[cpu].0.lock().pairs[node].len <= PAIR_CACHE_CAPACITY;
+        let cached_pages = FRAME_CACHES[cpu].0.lock().nodes[node].count;
+        let bounded = cached_pages <= tuning.high_max && cached_pages < 2 * wanted;
         let cached_before = PAIR_CACHE_FREE[node].load(Ordering::Relaxed);
         let drained = with_node_frame_caches_drained(node, |zone| {
             PAIR_CACHE_FREE[node].load(Ordering::Relaxed) == 0
@@ -5305,6 +5854,237 @@ mod scale_tests {
         scale_cached_frames_drain_back_to_a_high_order_block
     );
 
+    /// The cache sizing is a function of the zone, its low watermark and the
+    /// CPUs sharing it — Linux's `zone_batchsize` / `zone_highsize` numbers —
+    /// and the live tuning is that function of the live machine.
+    fn scale_frame_cache_sizing_follows_the_zone_and_cpu_count() -> TestResult {
+        use narf_kernel_test::kt_assert;
+        let tuning = |batch, high_min, high_max| CacheTuning {
+            batch,
+            high_min,
+            high_max,
+        };
+        // The 4 GiB / 12-CPU soak guest: batch 63, 428..10922 pages per CPU.
+        kt_assert!(derive_cache_tuning(1 << 20, 5144, 12) == tuning(63, 428, 10922));
+        // A 512 MiB node shared by 8 CPUs.
+        kt_assert!(derive_cache_tuning(1 << 17, 1280, 8) == tuning(31, 160, 2048));
+        // More CPUs on the same node: the floor becomes four batches.
+        kt_assert!(derive_cache_tuning(1 << 20, 5144, 64) == tuning(63, 252, 2048));
+        // A 16 MiB zone does not batch at all.
+        kt_assert!(derive_cache_tuning(4096, 64, 4) == tuning(1, 16, 128));
+        // The ceiling never drops below the floor, whatever the watermark.
+        kt_assert!(derive_cache_tuning(1 << 20, 1 << 19, 1) == tuning(63, 1 << 19, 1 << 19));
+        kt_assert!(zone_cache_batch(usize::MAX) == 63 && zone_cache_batch(0) == 1);
+
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let cpus = narf_lib::smp::cpu_count().max(1) as usize;
+        let expected = derive_cache_tuning(
+            node_total(node),
+            crate::reclaim::watermark_low_node(node) as usize,
+            node_cache_cpus(node, cpus),
+        );
+        let live = cache_tuning(node);
+        if live != expected {
+            return fail(format!(
+                "node {node} cache tuning {live:?} is not {expected:?} ({} frames, {cpus} CPUs)",
+                node_total(node),
+            ));
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/frame/scale",
+        scale_frame_cache_sizing_follows_the_zone_and_cpu_count
+    );
+
+    /// A frame's state word follows it: empty while allocated, a cache link
+    /// while a per-CPU cache holds it, never a cache link once the cache has
+    /// been drained — and every zone's words agree with its free lists.
+    fn scale_free_state_words_follow_the_frame() -> TestResult {
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let lists_agree = || {
+            ZONES
+                .iter()
+                .all(|zone| zone.0.lock().validate_index().is_ok())
+        };
+        if !lists_agree() {
+            return TestResult::Fail("a zone's state words disagree with its free lists");
+        }
+        let Ok(frame) = alloc_pages_on(node, 0) else {
+            return TestResult::Skip("no order-0 frame available");
+        };
+        let Some(word) = FRAME_INDEX.slot(buddy::frame_no(frame)) else {
+            free_pages(frame, 0);
+            return TestResult::Fail("a boot-RAM frame has no state word");
+        };
+        let allocated = word.load(Ordering::Relaxed);
+        if ALLOC.numa_aware.load(Ordering::Acquire)
+            && phys_to_node(frame.start_address().raw()) != node
+        {
+            free_pages(frame, 0);
+            return TestResult::Skip("allocation fell back to another NUMA node");
+        }
+        // Interrupts off so the CPU, and with it the cache, cannot change
+        // between the free and the look at the word.
+        let (freed, bypassed) = narf_lib::sync::without_interrupts(|| {
+            free_pages(frame, 0);
+            (word.load(Ordering::Relaxed), frame_cache_bypassed(node))
+        });
+        drain(node);
+        let drained = word.load(Ordering::Relaxed);
+        if allocated != 0 {
+            return TestResult::Fail("an allocated frame's state word is not empty");
+        }
+        if bypassed {
+            return TestResult::Skip("a drain bypassed the frame cache during the test");
+        }
+        if buddy::cached_next(freed).is_none() {
+            return TestResult::Fail("a frame freed into the per-CPU cache is not marked cached");
+        }
+        if buddy::cached_next(drained).is_some() {
+            return TestResult::Fail("a frame is still marked cached after the cache was drained");
+        }
+        if !lists_agree() {
+            return TestResult::Fail("state words disagree with the free lists after a drain");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/frame/scale",
+        scale_free_state_words_follow_the_frame
+    );
+
+    /// The step an order-0 allocation takes when its zone has nothing left:
+    /// the node's per-CPU caches are drained into the zone and the allocation
+    /// is retried there, so memory parked in caches cannot turn into an
+    /// allocation failure. Emptying a zone for real would starve the rest of
+    /// the suite, so the step is driven directly.
+    fn scale_empty_zone_allocation_reaches_cached_frames() -> TestResult {
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let Some(frames) = take_frames(node, FRAME_RETURN_CHUNK) else {
+            return TestResult::Skip("not enough free order-0 frames on this node");
+        };
+        // Read once the vector holding the frames exists, so its own backing
+        // allocation is not mistaken for a leak.
+        let free_before = node_free(node) + frames.len();
+        let outcome = narf_lib::sync::without_interrupts(|| {
+            release(&frames);
+            let cpu = current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+            let parked = FRAME_CACHES[cpu].0.lock().nodes[node].count;
+            let frame = alloc_order0_after_drain(node);
+            let left = FRAME_CACHES[cpu].0.lock().nodes[node].count;
+            (parked, frame, left)
+        });
+        let (parked, frame, left) = outcome;
+        if let Some(frame) = frame {
+            free_pages(frame, 0);
+        }
+        if parked == 0 {
+            return TestResult::Skip("freed frames did not stay in the per-CPU cache");
+        }
+        if frame.is_none() {
+            return TestResult::Fail("no frame although the per-CPU cache held some");
+        }
+        if left != 0 {
+            return TestResult::Fail("the drain left frames in the calling CPU's cache");
+        }
+        if node_free(node) != free_before {
+            return TestResult::Fail("drain-and-retry changed free-page accounting");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/frame/scale",
+        scale_empty_zone_allocation_reaches_cached_frames
+    );
+
+    /// A frame that is already free must not be accepted again, whether a
+    /// per-CPU cache or a buddy free list holds it: the second free is dropped
+    /// and counted, and free-page accounting does not move. (With
+    /// `frame-alloc-audit` the audit panics at the offending free instead, so
+    /// the refusal is not reachable there.)
+    #[cfg(not(feature = "frame-alloc-audit"))]
+    fn scale_double_free_is_refused_and_counted() -> TestResult {
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let numa = ALLOC.numa_aware.load(Ordering::Acquire);
+        let free_before = node_free(node);
+        let Ok(frame) = alloc_pages_on(node, 0) else {
+            return TestResult::Skip("no order-0 frame available");
+        };
+        if numa && phys_to_node(frame.start_address().raw()) != node {
+            free_pages(frame, 0);
+            return TestResult::Skip("allocation fell back to another NUMA node");
+        }
+        let number = buddy::frame_no(frame);
+        free_pages(frame, 0);
+        // A per-CPU cache holds it now, unless a drain on another CPU got in
+        // between — then it is in the buddy, possibly coalesced beyond
+        // recognition, and offering it again would be a real double free.
+        let held = FRAME_INDEX
+            .slot(number)
+            .is_some_and(|word| buddy::cached_next(word.load(Ordering::Relaxed)).is_some());
+        if !held {
+            return TestResult::Skip("the freed frame did not stay in a per-CPU cache");
+        }
+        // Offer it again, both ways a second free could arrive.
+        let refused = double_frees_refused();
+        if free_order0_to_cache(node, number) != CacheFree::AlreadyFree
+            || double_frees_refused() != refused + 1
+        {
+            return TestResult::Fail("the per-CPU cache accepted a frame it already held");
+        }
+        if lock_zone(node).try_free_mt(number, 0, buddy::MigrateType::Unmovable) {
+            return TestResult::Fail("the zone accepted a frame a per-CPU cache holds");
+        }
+
+        // A frame on a buddy free list. Free the first half of an order-1
+        // block with the cache bypassed: its buddy is still held, so it stays
+        // the head of an order-0 block until the second half follows.
+        let Ok(pair) = alloc_pages_on(node, 1) else {
+            return TestResult::Skip("no order-1 block available on this node");
+        };
+        let base = pair.start_address();
+        if numa && phys_to_node(base.raw()) != node {
+            free_pages(pair, 1);
+            return TestResult::Skip("order-1 allocation fell back to another NUMA node");
+        }
+        let second = PhysFrame::new(PhysAddr::new(base.raw() + PAGE_SIZE));
+        let accepted_again = with_node_cache_bypassed(node, || {
+            free_pages(pair, 0);
+            let accepted = lock_zone(node).try_free_mt(
+                buddy::frame_no(pair),
+                0,
+                buddy::MigrateType::Unmovable,
+            );
+            free_pages(second, 0);
+            accepted
+        });
+        if accepted_again {
+            return TestResult::Fail("the zone accepted a frame already on its free list");
+        }
+        if node_free(node) != free_before {
+            return TestResult::Fail("a refused double free changed free-page accounting");
+        }
+        TestResult::Pass
+    }
+    #[cfg(not(feature = "frame-alloc-audit"))]
+    kernel_test_in!(
+        "memory/frame/scale",
+        scale_double_free_is_refused_and_counted
+    );
+
     /// Print the counters the tests above assert on. Always a `Skip`: it
     /// asserts nothing, and a reason string is the only way a test in this
     /// crate can put numbers in the harness log.
@@ -5313,10 +6093,14 @@ mod scale_tests {
             Ok(node) => node,
             Err(skip) => return skip,
         };
+        let tuning = cache_tuning(node);
         let mut report = format!(
-            "harness counters, node {node} ({} frames, batch {}):",
+            "harness counters, node {node} ({} frames, {} CPUs, batch {}, high {}..{}):",
             node_total(node),
-            zone_cache_batch(node_total(node)),
+            narf_lib::smp::cpu_count(),
+            tuning.batch,
+            tuning.high_min,
+            tuning.high_max,
         );
         if let Some(steps) = list_steps(node) {
             report.push_str(&format!(
