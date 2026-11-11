@@ -910,6 +910,14 @@ that cannot fit returns `EINVAL`; a first copy fault returns `EFAULT`; after any
 complete record, a later size, allocation, or copy failure returns the completed
 byte prefix and advances the directory cursor only through that prefix. The
 unsigned `count` argument is truncated to its native 32-bit ABI width.
+`d_ino` is `DirOps::entry_ino` of the entry where the directory answers it
+(devpts), otherwise a cursor placeholder.
+`ioctl(master, TIOCGPTPEER, flags)` returns a slave descriptor that has a
+path like one from `open(2)`, as `ptm_open_peer` opens the devpts dentry:
+`<mnt>/<N>` when the master was opened on that devpts mount's own `ptmx`,
+else `<dir>/pts/<N>` for a `c 5:2` node in `<dir>`. `/proc/<pid>/fd/<n>`
+therefore reads `/dev/pts/<N>`, which glibc `ttyname` (and sshd's
+`pty_allocate`) requires of an `openpty` slave.
 System V semaphore operations use Linux's default 500-operation `SEMOPM`
 boundary and validation order: `E2BIG`/zero-count validation precedes sembuf
 import, import faults are `EFAULT`, and `semtimedop(2)` imports its timeout

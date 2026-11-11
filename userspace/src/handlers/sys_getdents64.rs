@@ -144,7 +144,13 @@ pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
             break;
         }
         record.resize(reclen, 0);
-        record[..8].copy_from_slice(&(next_cursor as u64).to_ne_bytes());
+        // `filldir64`: `d_ino` is the entry's inode number. A directory that
+        // cannot name it without a lookup keeps the cursor placeholder.
+        let d_ino = core::str::from_utf8(name)
+            .ok()
+            .and_then(|name| dir.entry_ino(name))
+            .unwrap_or(next_cursor as u64);
+        record[..8].copy_from_slice(&d_ino.to_ne_bytes());
         record[8..16].copy_from_slice(&(next_cursor as u64).to_ne_bytes());
         record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
         if legacy {

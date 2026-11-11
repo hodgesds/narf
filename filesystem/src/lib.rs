@@ -2456,6 +2456,19 @@ pub trait DirOps: Send + Sync {
         None
     }
 
+    /// Inode number of the entry `name`, as `getdents` reports it in
+    /// `d_ino` — the same number `stat` of that entry gives in `st_ino`
+    /// (Linux `dir_emit(ctx, name, len, ino, type)`). It must not open or
+    /// otherwise touch the entry: a readdir is not a lookup.
+    ///
+    /// `None` (the default) means the directory cannot name the inode
+    /// without a lookup; the readdir handler then reports a placeholder.
+    /// glibc's `ttyname` falls back to matching `d_ino` in `/dev/pts`
+    /// against `fstat` of the terminal, so devpts answers this.
+    fn entry_ino(&self, _name: &str) -> Option<u64> {
+        None
+    }
+
     /// Iterate this directory. Stage 3 returns a boxed iterator so the
     /// trait stays object-safe; an `impl Iterator` shape would force
     /// a GAT. Names are `&'static str` per `DirEntry`'s comment.
