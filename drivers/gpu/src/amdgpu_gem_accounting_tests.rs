@@ -303,3 +303,80 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/gem-accounting",
     a_walk_copies_the_handles_out_and_counts_with_the_table_free
 );
+
+/// The failure report walks the card's buffers and opens and writes the
+/// log. Every job, VA edit and commit of the card waits on its placement
+/// gate, and a full heap is exactly when the report runs, so each failing
+/// path lets the gate go before it reports: GEM_CREATE (synchronous and
+/// from a user open), CREATE_DUMB (both), and prepare_fb's pin.
+fn a_failure_is_reported_with_the_placement_gate_released() -> TestResult {
+    const CARD: u32 = 0xe1c6;
+    let Some(_heap) = Heap::new(CARD, 2) else {
+        return TestResult::Fail("heap");
+    };
+    let vram = uapi::AMDGPU_GEM_DOMAIN_VRAM;
+    let strict = uapi::AMDGPU_GEM_CREATE_DISCARDABLE;
+    let state = GemState::for_card(CARD);
+    // A heap full of buffers that cannot leave it, and one that fell back
+    // to system pages.
+    let mut pins = Vec::new();
+    for _ in 0..2 {
+        match create(&state, 1, vram, 0).and_then(|object| object.pin_scanout()) {
+            Ok(pin) => pins.push(pin),
+            Err(_) => return TestResult::Fail("fill"),
+        }
+    }
+    let Ok(outside) = create(&state, 1, vram, 0) else {
+        return TestResult::Fail("fallback buffer");
+    };
+    if !outside.system() {
+        return TestResult::Fail("the heap is not full");
+    }
+    let (before, held) = (failures(CARD), REPORTS_UNDER_GATE.load(Ordering::Relaxed));
+    // GEM_CREATE, in-kernel path.
+    if create(&state, 1, vram, strict).err() != Some(FsError::NoSpace) {
+        return TestResult::Fail("synchronous GEM_CREATE was not refused");
+    }
+    // GEM_CREATE from a user open.
+    let mut request = [0u8; 32];
+    request[..8].copy_from_slice(&PAGE.to_le_bytes());
+    request[16..24].copy_from_slice(&u64::from(vram).to_le_bytes());
+    request[24..32].copy_from_slice(&u64::from(strict).to_le_bytes());
+    if narf_scheduler::block_on_spin(dispatch_async(
+        0xc020_6440,
+        request.as_mut_ptr() as usize,
+        &state,
+    )) != Some(Err(FsError::NoSpace))
+    {
+        return TestResult::Fail("GEM_CREATE from a user open was not refused");
+    }
+    // CREATE_DUMB, both paths: one page of 64x4 at 32 bpp.
+    if state.create_dumb(64, 4, 32).err() != Some(FsError::NoSpace)
+        || narf_scheduler::block_on_spin(create_dumb_async(&state, 64, 4, 32)).err()
+            != Some(FsError::NoSpace)
+    {
+        return TestResult::Fail("CREATE_DUMB was not refused");
+    }
+    // prepare_fb: the buffer in system pages cannot be brought into VRAM.
+    if !matches!(
+        narf_scheduler::block_on_spin(prepare_scanout(CARD, alloc::vec![outside.clone()])),
+        Err(FsError::OutOfMemory)
+    ) {
+        return TestResult::Fail("the scanout pin was not refused");
+    }
+    if failures(CARD) != before + 5 {
+        return TestResult::Fail("a refused allocation was not counted");
+    }
+    if REPORTS_UNDER_GATE.load(Ordering::Relaxed) != held {
+        return TestResult::Fail("a failure was reported with the placement gate held");
+    }
+    if try_placement(CARD).is_none() || !outside.system() || outside.pinned() {
+        return TestResult::Fail("a refused path kept the gate, or moved or pinned the buffer");
+    }
+    drop(pins);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gem-accounting",
+    a_failure_is_reported_with_the_placement_gate_released
+);
