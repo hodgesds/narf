@@ -1,5 +1,21 @@
 # NARF status
 
+**2026-11-10 — Intel display ARM stack regression:** native 4K60 HDMI and
+external HDMI beside a lit panel exhausted AArch64's 64 KiB bootstrap stack
+while nested route planning and layout proofs copied large resource
+snapshots. Pipe owners now retain heap-owned state, and proof helpers return
+heap-owned temporary snapshots or update the running clock in place. Failed
+transitions retain the previous state; cloned owners keep independent
+snapshots. A native fixture bounds inline DP/HDMI routes and pipe owners.
+
+Validation: **493 native tests pass on aarch64**, with zero failures or skips,
+including both previously hanging cases and shared KMS/cursor/Display 20/30
+resource proofs. Targeted host Clippy and workspace formatting pass. These
+runs select kernel tests; production-init boot, filesystem postflights and
+Intel hardware acceptance are separate.
+Logs and commands are under
+`target/host-narf/intel-arm-hdmi-stack-20261110/`.
+
 **2026-11-10 — Intel USB-C display transports:** Meteor/Arrow Lake now
 support two-lane DP-alt pin D while preserving USB's PHY lane, native/legacy
 board lane reversal, live Thunderbolt/USB4 DP-IN AUX and fabric clocks, and

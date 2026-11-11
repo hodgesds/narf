@@ -53,6 +53,7 @@ use crate::intel_gpu_xelpg_resources::{
     self as res, checked, read, PipeRequest, PlaneRequest, ResourceError, State, PLANES,
 };
 use crate::intel_gpu_xelpg_wm::Tiling;
+use alloc::boxed::Box;
 
 /// `PIPE_FRMCOUNT_G4X` relative to the pipe block.
 const FRMCOUNT_OFFSET: u64 = 0x40;
@@ -287,7 +288,9 @@ fn panel_tiling(io: &(impl MmioWindow + ?Sized)) -> Result<Tiling, PipeEnableErr
 /// removals. `lit` tracks the pipes this owner treats as lit.
 #[derive(Clone, Debug)]
 pub(crate) struct Pipes {
-    state: Option<State>,
+    // Keep route, choice and cloned-owner values small while nested planners
+    // use their scratch space on the 64 KiB ARM bootstrap stack.
+    state: Option<Box<State>>,
     lit: u8,
     reserved: [Option<ExternalPipe>; 4],
 }
@@ -298,7 +301,7 @@ impl Pipes {
     /// off): the next reservation is the all-off commit.
     pub(crate) fn adopt(state: Option<State>, lit: u8) -> Self {
         Self {
-            state,
+            state: state.map(Box::new),
             lit,
             reserved: [None; 4],
         }
@@ -338,9 +341,10 @@ impl Pipes {
     fn publish(&self) {
         let layout = self
             .state
+            .as_deref()
             .filter(|s| s.requests[1..].iter().any(Option::is_some));
         *LAYOUT.lock() = layout.map(|state| Layout {
-            state,
+            state: *state,
             surfaces: core::array::from_fn(|p| self.reserved[p].map(|ext| ext.surface)),
         });
     }
@@ -352,7 +356,7 @@ impl Pipes {
     /// its share of the layout (its planes are off), as a reserved pipe that
     /// is not yet enabled does.
     fn sync_panel(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), PipeEnableError> {
-        if self.state.is_none_or(|s| s.requests[0].is_none()) {
+        if self.state.as_ref().is_none_or(|s| s.requests[0].is_none()) {
             return Ok(());
         }
         let conf = read(io, Pipe::A.base() + PIPECONF_OFFSET)?;
@@ -369,7 +373,7 @@ impl Pipes {
     /// flipped it to, so the programmed state is retiled to that tiling
     /// (only its primary watermarks change; see [`State::retile`]).
     fn refresh_panel(&mut self, io: &(impl MmioWindow + ?Sized)) -> Result<(), PipeEnableError> {
-        let Some(state) = self.state else {
+        let Some(state) = self.state.as_deref() else {
             return Ok(());
         };
         if self.lit & 1 == 0 || state.requests[0].is_none() {
@@ -378,14 +382,14 @@ impl Pipes {
         let tiling = panel_tiling(io)?;
         let latency =
             crate::intel_gpu_xelpg_wm::Latency::read(io).map_err(|_| PipeEnableError::NoDevice)?;
-        self.state = Some(state.retile(0, tiling, &latency)?);
+        self.state = Some(Box::new((*state).retile(0, tiling, &latency)?));
         Ok(())
     }
 
     /// The programmed state (`None`: nothing a lit pipe depends on).
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn state(&self) -> Option<&State> {
-        self.state.as_ref()
+        self.state.as_deref()
     }
 
     fn transition(
@@ -393,6 +397,9 @@ impl Pipes {
         io: &(impl MmioWindow + ?Sized),
         new: State,
     ) -> Result<(), PipeEnableError> {
+        // Allocate before programming; an uncertain transaction keeps the old
+        // snapshot, and successful ownership transfer needs no later allocation.
+        let new = Box::new(new);
         match (&self.state, self.lit) {
             (Some(old), lit) if lit != 0 => {
                 crate::intel_gpu_xelpg_live::commit_live(io, old, &new, lit)?
@@ -405,7 +412,7 @@ impl Pipes {
 
     fn request_with(&self, change: impl FnOnce(&mut res::Request)) -> res::Request {
         let mut request = res::Request {
-            pipes: self.state.map_or([None; 4], |s| s.requests),
+            pipes: self.state.as_deref().map_or([None; 4], |s| s.requests),
             min_cdclk_khz: 0,
         };
         change(&mut request);
@@ -451,7 +458,9 @@ impl Pipes {
         {
             return Err(PipeEnableError::Unsupported);
         }
-        if self.reserved[p].is_some() || self.state.is_some_and(|s| s.requests[p].is_some()) {
+        if self.reserved[p].is_some()
+            || self.state.as_ref().is_some_and(|s| s.requests[p].is_some())
+        {
             return Err(PipeEnableError::NotReserved);
         }
         let mut fresh = self.clone();

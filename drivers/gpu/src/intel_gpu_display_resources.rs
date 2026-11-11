@@ -43,6 +43,7 @@ use crate::{
     intel_gpu_xelpg_resources::{self as res, ResourceError},
     intel_gpu_xelpg_wm::{self as wm, Latency, PlaneWm, Tiling},
 };
+use alloc::boxed::Box;
 use narf_filesystem::FsError;
 
 const REQUEST0: u64 = 0x45230;
@@ -250,7 +251,7 @@ impl Profile {
         tiling: Tiling,
         min_cdclk_khz: u32,
         dsc: Option<DscTerm>,
-    ) -> Result<(Self, res::State), FsError> {
+    ) -> Result<(Self, Box<res::State>), FsError> {
         Self::valid_mode(mode)?;
         let latency = Latency::read(io)?;
         // Display 30 always scans out through the VRR timing generator:
@@ -261,13 +262,17 @@ impl Profile {
                 .map_err(|_| FsError::Unsupported)?;
             vblank_start[0] = Some(mode.v_total - guardband);
         }
-        let state = res::compute_ip_vblank(
-            ip,
-            &request_dsc(mode, tiling, min_cdclk_khz, dsc),
-            &latency,
-            vblank_start,
-        )
-        .map_err(|_| FsError::Unsupported)?;
+        // Proofs nest inside external modesets on the ARM bootstrap stack.
+        // Keep their large snapshots out of intermediate result values.
+        let state = Box::new(
+            res::compute_ip_vblank(
+                ip,
+                &request_dsc(mode, tiling, min_cdclk_khz, dsc),
+                &latency,
+                vblank_start,
+            )
+            .map_err(|_| FsError::Unsupported)?,
+        );
         let profile = Self::share(mode, &latency, &state, dsc)?;
         // The fixed owner's single-pipe layout is the joined one, with the
         // whole DBUF behind Pipe A.
@@ -290,7 +295,7 @@ impl Profile {
         layout: &Layout,
         latency: &Latency,
         dsc: Option<DscTerm>,
-    ) -> Result<res::State, FsError> {
+    ) -> Result<Box<res::State>, FsError> {
         Self::valid_mode(mode)?;
         let panel = request_dsc(mode, Tiling::Linear, 0, dsc).pipes[0];
         let mut held = layout.state.requests[0];
@@ -303,6 +308,7 @@ impl Profile {
         layout
             .state
             .retile(0, tiling, latency)
+            .map(Box::new)
             .map_err(|_| FsError::Unsupported)
     }
     /// Pipe A's share for `tiling` in the single (`None`) or multi-pipe
@@ -429,7 +435,7 @@ impl Profile {
         io: &(impl MmioWindow + ?Sized),
         mode: &Mode,
         dsc: Option<DscTerm>,
-    ) -> Result<(Self, Option<Layout>, DisplayIp), FsError> {
+    ) -> Result<(Self, Option<Box<Layout>>, DisplayIp), FsError> {
         let ip = display_ip(io)?.ok_or(FsError::Unsupported)?;
         match Self::capture_single(io, ip, mode, dsc) {
             Ok(profile) => return Ok((profile, None, ip)),
@@ -444,7 +450,7 @@ impl Profile {
             crate::intel_gpu_xelpg_pipes::published_layout().ok_or(FsError::Unsupported)?;
         Ok((
             Self::capture_multi(io, mode, &layout, dsc)?,
-            Some(layout),
+            Some(Box::new(layout)),
             ip,
         ))
     }
@@ -454,8 +460,8 @@ impl Profile {
     /// known rung; it must cover the computed one. Display 14 is unchanged.
     fn running_clock(
         io: &(impl MmioWindow + ?Sized),
-        mut state: res::State,
-    ) -> Result<res::State, FsError> {
+        state: &mut res::State,
+    ) -> Result<(), FsError> {
         if state.ip.xe2_plus() {
             let current = crate::intel_gpu_xelpg_cdclk::Current::read_ip(io, state.ip)
                 .map_err(|_| FsError::NoDevice)?;
@@ -465,7 +471,7 @@ impl Profile {
             }
             state.cdclk = rung;
         }
-        Ok(state)
+        Ok(())
     }
     /// The PM demand, MBUS/DBOX, IPC and DBUF slice proof shared by both
     /// layouts, against `state`.
@@ -528,8 +534,8 @@ impl Profile {
                 return Err(FsError::Unsupported);
             }
         }
-        let (profile, state) = Self::compute_state(io, ip, mode, Tiling::Linear, 0, dsc)?;
-        let state = Self::running_clock(io, state)?;
+        let (profile, mut state) = Self::compute_state(io, ip, mode, Tiling::Linear, 0, dsc)?;
+        Self::running_clock(io, &mut state)?;
         // mbus_ctl_join_update selects the joined pipe when it stays lit
         // without a modeset (intel_mbus_joined_pipe) and NONE otherwise: the
         // owned modeset joins with NONE, while a live repartition that
@@ -619,7 +625,7 @@ impl Profile {
             _ => return Err(FsError::Unsupported),
         };
         if let Some(tiling) = tiling {
-            let share = Self::compute_for_layout(io, ip, mode, tiling, layout.as_ref(), dsc)?;
+            let share = Self::compute_for_layout(io, ip, mode, tiling, layout.as_deref(), dsc)?;
             profile.primary = share.primary;
             profile.wm_level_disabled = share.wm_level_disabled;
         }
@@ -764,7 +770,7 @@ impl Primary {
             return Err(FsError::Unsupported);
         }
         let tile4 =
-            Profile::compute_for_layout(io, ip, &self.mode, Tiling::Tile4, layout.as_ref(), dsc)?;
+            Profile::compute_for_layout(io, ip, &self.mode, Tiling::Tile4, layout.as_deref(), dsc)?;
         Ok([linear, tile4])
     }
     /// `wm_level_disabled` of the linear/X (`false`) or Tile4 image.
