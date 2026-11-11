@@ -11,7 +11,7 @@
 //!   512, beacon 2), both 256-byte aligned; one RX ring of 512 16-byte
 //!   buffer descriptors prepared with `HW_DESC_RX_PREPARE` over 9100-byte
 //!   buffers (`rxbuffersize`). DMA32 (`dma64` is false). The owner's `tx`
-//!   holds the seven BD rings (`prepare::TX_BASES` order: BCN, MGQ, VO, VI,
+//!   holds the seven BD rings (`TX_BASES` order: BCN, MGQ, VO, VI,
 //!   BE, BK, HQ) followed by the seven descriptor rings in the same order.
 //! - Publication (`rtl92ee_hw_init` → `_rtl92ee_init_mac`): the
 //!   `_rtl8192ee_check_pcie_dma_hang` probe of `REG_BACKDOOR_DBI_DATA + 3`
@@ -51,9 +51,25 @@
 use super::super::super::rtl8192ee::{c2h, dm, h2c, mac, rsvd_page, station as hw, trx};
 use super::{
     extent, queue, Delivery, Error, Io, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep,
-    RX_BASE, RX_BUFFER, TX_BASES,
+    RX_BUFFER,
 };
 use alloc::vec::Vec;
+
+/// The 92E `REG_*_DESA` map (`rtl8192ee/reg.h`: BCNQ 0x308, MGQ 0x310,
+/// VOQ 0x318, VIQ 0x320, BEQ 0x328, BKQ 0x330, HQ0 0x340) in the owner's
+/// queue order (BCN, MGQ, VO, VI, BE, BK, HQ). It differs from the 8188EE
+/// linked-ring map `prepare::TX_BASES` uses (HQ 0x310, RX 0x340).
+const TX_BASES: [u16; 7] = [
+    mac::REG_BCNQ_DESA,
+    mac::REG_MGQ_DESA,
+    mac::REG_VOQ_DESA,
+    mac::REG_VIQ_DESA,
+    mac::REG_BEQ_DESA,
+    mac::REG_BKQ_DESA,
+    mac::REG_HQ0_DESA,
+];
+/// `rtl8192ee/reg.h` `REG_RX_DESA`.
+const RX_BASE: u16 = mac::REG_RX_DESA;
 
 /// `TX_DESC_NUM_92E` / `RTL_PCI_MAX_RX_COUNT`: the BD counts `init_mac`
 /// programs and `calc_fifo_space` wraps at.
