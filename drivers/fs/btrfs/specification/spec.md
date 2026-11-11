@@ -330,11 +330,22 @@ the one asked for and with its old contents up to there, and nothing past
 its end; Linux leaves the same, and has added no orphan item for a truncate
 since v4.18. A truncate that drops no more than one step's worth of items
 is a single operation in a single transaction: the file is at its old size
-or its new one. A crash between two steps of an eviction leaves an orphan
-that the next writable mount goes on reclaiming. `write::set_dealloc_step_sync`
-commits every step on its own, for the crash tests of the `release`
-scenario. Hole punching and `fallocate` still stage their whole range as
-one operation.
+or its new one. An eviction walks the inode's items from its highest key
+down, as `btrfs_truncate_inode_items(new_size = 0)` does for
+`btrfs_evict_inode`, so its extents go from the end of the file first; a
+crash between two steps leaves an orphan that the next writable mount goes
+on reclaiming. The inode's `nbytes` follows the extents left and saturates
+at zero (Linux `inode_sub_bytes`): an orphan whose count was already too low
+is still evicted (`smoke_btrfs_eviction_survives_low_nbytes`) — eviction
+runs ahead of every write, so failing it would fail them all. A directory
+orphan, which Linux `btrfs_rmdir` leaves behind a crash while the removed
+directory is still open, is evicted the same way
+(`smoke_btrfs_directory_orphan_is_evicted`, and the `release` scenario
+checks the image with `btrfs check` before and after). An orphan that still
+has a name or directory entries is refused (`InvalidData`).
+
+Hole punching and `fallocate` still stage their whole range as one
+operation.
 
 An `ORPHAN_ITEM` whose inode still has links, or no longer exists, marks
 no inode to reclaim. Recovery does with it what Linux `btrfs_orphan_cleanup`
@@ -347,8 +358,9 @@ v4.18 left one behind every truncate. Answering it with an error failed
 every writable mount of the subvolume
 (`smoke_btrfs_stale_orphan_item_is_deleted`). fs-verity itself is not
 implemented: a filesystem with the `VERITY` compat-ro bit is not mounted
-read-write, and an unlinked inode that has fs-verity items is not reclaimed
-(`Unsupported`).
+read-write. An unlinked inode's fs-verity items go with the rest of its items
+when it is evicted, as `btrfs_truncate_inode_items` removes every item of the
+inode.
 
 `fsync` and `fdatasync`, on a file or a directory, both commit the open
 transaction and write its superblock (`sync_to_disk_exclusive`). `fdatasync`
@@ -483,3 +495,7 @@ Stage 4: persistent filesystem compatibility.
 
 The named mount path retains the implementation's existing format and option
 limits; registration does not add support for further on-disk features.
+
+Directories cannot carry xattrs through the VFS yet: `DirOps::set_xattr` is
+the trait's default (`Unsupported`), so a directory's `user.*`, ACL or
+security xattrs cannot be set or removed through it.

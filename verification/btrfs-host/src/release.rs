@@ -108,7 +108,12 @@ fn build(
     })
 }
 
-fn mkfs(dir: &Path, size: u64, tag: u64) -> Result<PathBuf, String> {
+/// Features of the scenario's filesystems: `no-holes`, as `mkfs.btrfs`
+/// makes them now, unless a case wants explicit hole items.
+const FEATURES: &str = "block-group-tree,free-space-tree,no-holes";
+const FEATURES_HOLE_ITEMS: &str = "block-group-tree,free-space-tree";
+
+fn mkfs(dir: &Path, size: u64, tag: u64, features: &str) -> Result<PathBuf, String> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
     let rootdir = dir.join("rootdir");
@@ -124,7 +129,7 @@ fn mkfs(dir: &Path, size: u64, tag: u64) -> Result<PathBuf, String> {
             size,
             nodesize: 16384,
             csum: "crc32c",
-            features: "block-group-tree,free-space-tree,no-holes",
+            features,
         },
     )?;
     Ok(img)
@@ -179,7 +184,7 @@ fn orphan_items(img: &Path, id: u64) -> Result<usize, String> {
 /// The reservation half; returns its report lines.
 fn reservation(args: &Args) -> Result<String, String> {
     let dir = args.workdir.join("release");
-    let img = mkfs(&dir, 6 << 30, 1)?;
+    let img = mkfs(&dir, 6 << 30, 1, FEATURES)?;
     let (fsid, nodesize, _) = dev::image_identity(&img);
     let mount = || -> Result<Arc<dyn FsInstance>, String> {
         let dev = Arc::new(RecDev::open(&img, 512, fsid, nodesize));
@@ -370,14 +375,16 @@ fn crash_case(
     (pages, big): (usize, usize),
     cut: Cut,
     single: bool,
+    features: &str,
 ) -> Result<String, String> {
     let dir = args
         .workdir
-        .join(format!("release-crash-{}", name.replace(' ', "-")));
+        .join(format!("release-crash-{}", name.replace([' ', ','], "-")));
     let img = mkfs(
         &dir,
         512 << 20,
         0x100 + name.len() as u64 * 7 + pages as u64,
+        features,
     )?;
     let (fsid, nodesize, _) = dev::image_identity(&img);
     let open = |recording: bool| -> Result<(Arc<RecDev>, Arc<dyn FsInstance>), String> {
@@ -538,6 +545,66 @@ fn crash_case(
     ))
 }
 
+/// A directory removed while still open, as Linux `btrfs_rmdir` leaves it
+/// after a crash: the inode unlinked under an ORPHAN_ITEM
+/// (`write::set_rmdir_leaves_orphan`). Linux must check the image clean with
+/// the orphan in it; the next NARF mount must evict it, and Linux must then
+/// check the image clean with no orphan item left.
+fn dir_orphan(args: &Args) -> Result<String, String> {
+    let dir = args.workdir.join("release-dir-orphan");
+    let img = mkfs(&dir, 512 << 20, 0x0d1, FEATURES)?;
+    let (fsid, nodesize, _) = dev::image_identity(&img);
+    let mount = || -> Result<Arc<dyn FsInstance>, String> {
+        let dev = Arc::new(RecDev::open(&img, 512, fsid, nodesize));
+        narf::register_root(dev, &fsid)?;
+        Ok(narf::mount_root_rw(&fsid, "@", &[])?.remove(0))
+    };
+    {
+        let fs = mount()?;
+        let root = fs.root();
+        block_on(async {
+            drop(root.mkdir("gone").await?);
+            narf_drivers_fs_btrfs::write::set_rmdir_leaves_orphan(true);
+            let removed = root.rmdir("gone").await;
+            narf_drivers_fs_btrfs::write::set_rmdir_leaves_orphan(false);
+            removed?;
+            root.fsync(false).await
+        })
+        .map_err(err("rmdir"))?;
+        drop(root);
+        drop(fs);
+        narf::reset();
+    }
+    linux::check(&img, false).map_err(|e| format!("directory orphan, before recovery: {e}"))?;
+    let subvols = linux::subvolumes(&img)?;
+    let at = linux::subvol_id(&subvols, "@").ok_or("no @ subvolume")?;
+    if orphan_items(&img, at)? != 1 {
+        return Err("directory orphan: rmdir did not leave one orphan item".into());
+    }
+    {
+        let fs = mount()?;
+        if block_on(fs.root().lookup_dir_async("gone")).is_ok() {
+            return Err("directory orphan: the directory is back".into());
+        }
+        block_on(async {
+            fs.root().create("after").await?;
+            fs.root().fsync(false).await
+        })
+        .map_err(err("write after recovery"))?;
+        drop(fs);
+        narf::reset();
+    }
+    linux::check(&img, false).map_err(|e| format!("directory orphan, after recovery: {e}"))?;
+    let left = orphan_items(&img, at)?;
+    if left != 0 {
+        return Err(format!("directory orphan: {left} orphan item(s) left"));
+    }
+    if !args.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok("    directory orphan (Linux rmdir of an open directory): btrfs check clean before and after, evicted by the next mount".into())
+}
+
 pub fn run(args: &Args) -> Result<String, String> {
     let t0 = Instant::now();
     let mut lines = vec![reservation(args)?];
@@ -558,6 +625,9 @@ pub fn run(args: &Args) -> Result<String, String> {
             false,
         ),
         ("unlink", (120, 4), Cut::Unlink, false),
+        // Without `no-holes`: an eviction from the end of the file leaves no
+        // gap `btrfs check` would want a hole item for.
+        ("unlink, explicit hole items", (120, 4), Cut::Unlink, false),
         // Within a step: one transaction, whatever the cut.
         ("small truncate to nothing", (12, 0), Cut::Truncate(0), true),
         (
@@ -573,8 +643,14 @@ pub fn run(args: &Args) -> Result<String, String> {
             true,
         ),
     ] {
-        lines.push(crash_case(args, name, shape, cut, single)?);
+        let features = if name.contains("explicit hole items") {
+            FEATURES_HOLE_ITEMS
+        } else {
+            FEATURES
+        };
+        lines.push(crash_case(args, name, shape, cut, single, features)?);
     }
+    lines.push(dir_orphan(args)?);
     Ok(format!(
         "release: OK\n{}\n    btrfs check clean (also --check-data-csum), no orphan item left, files empty or gone after a remount; {:.0?}",
         lines.join("\n"),

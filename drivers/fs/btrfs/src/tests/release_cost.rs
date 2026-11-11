@@ -365,3 +365,143 @@ fn smoke_btrfs_stale_orphan_item_is_deleted() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_stale_orphan_item_is_deleted);
+
+/// The eviction of an unlinked inode whose `nbytes` is below what its extents
+/// hold — an earlier accounting error — completes, and the filesystem goes on
+/// writing: the count saturates at zero, as Linux `inode_sub_bytes` does.
+/// Eviction runs at the start of every write operation, so failing it would
+/// fail every later write. The file has more extents than one step drops, so
+/// a step that keeps the inode has to recount it.
+fn smoke_btrfs_eviction_survives_low_nbytes() -> TestResult {
+    use crate::write::Edit;
+    let vol = match mount_writable(writable_sparse(FIXTURE_TALL_SPARSE)) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("nbytes fixture did not mount"),
+    };
+    if poll_once(vol.switch_to_subvol(&crate::volume::Subvol::Name("@".into())))
+        .is_none_or(|r| r.is_err())
+    {
+        return TestResult::Fail("subvol @ did not resolve");
+    }
+    let dir = match poll_once(vol.root().mkdir("nbytes")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("nbytes: mkdir failed"),
+    };
+    let Some(file) = build_pages(&vol, &dir, "low", 40) else {
+        return TestResult::Fail("nbytes: building the file failed");
+    };
+    let ino = file.ino();
+    // Unlinked while open: an orphan nothing reclaims yet.
+    if !matches!(poll_once(dir.unlink("low")), Some(Ok(()))) {
+        return TestResult::Fail("nbytes: unlink failed");
+    }
+    let (root, _) = vol.fs_tree_root();
+    let key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
+    let Some(Ok(Some(mut item))) = poll_once(btree::find_item(&*vol, root, &key)) else {
+        return TestResult::Fail("nbytes: no inode item");
+    };
+    item[24..32].copy_from_slice(&(PAGE as u64).to_le_bytes());
+    if !matches!(
+        poll_once(crate::write::__test_stage_fs_edits(
+            &vol,
+            &[Edit::Upsert(key, item)]
+        )),
+        Some(Ok(()))
+    ) || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+    {
+        return TestResult::Fail("nbytes: could not lower nbytes");
+    }
+    drop(file);
+    // The next operation reclaims the orphan, and itself succeeds.
+    if !matches!(poll_once(dir.create("after")), Some(Ok(_)))
+        || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+    {
+        return TestResult::Fail("nbytes: the filesystem stopped writing");
+    }
+    let (root, _) = vol.fs_tree_root();
+    let orphan = poll_once(btree::find_item(&*vol, root, &crate::orphans::key(ino)));
+    let extents = poll_once(btree::collect_for(
+        &*vol,
+        root,
+        ino,
+        format::EXTENT_DATA_KEY,
+    ));
+    if !matches!(orphan, Some(Ok(None))) || !matches!(&extents, Some(Ok(items)) if items.is_empty())
+    {
+        return TestResult::Fail("nbytes: the orphan was not reclaimed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_eviction_survives_low_nbytes);
+
+/// A directory removed while it was still open leaves, after a crash, its
+/// inode unlinked under an ORPHAN_ITEM (Linux `btrfs_rmdir`:
+/// `btrfs_orphan_add`, then `btrfs_unlink_inode`). The next writable mount
+/// evicts it — its inode item and the orphan item — as Linux
+/// `btrfs_orphan_cleanup` does, instead of failing the mount.
+fn smoke_btrfs_directory_orphan_is_evicted() -> TestResult {
+    let dev = writable_sparse(FIXTURE_TALL_SPARSE);
+    let vol = match mount_writable(dev.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("dir orphan fixture did not mount"),
+    };
+    let at = crate::volume::Subvol::Name("@".into());
+    if poll_once(vol.switch_to_subvol(&at)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("subvol @ did not resolve");
+    }
+    let gone = match poll_once(vol.root().mkdir("gone")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("dir orphan: mkdir failed"),
+    };
+    let ino = gone.ino();
+    drop(gone);
+    crate::write::set_rmdir_leaves_orphan(true);
+    let removed = poll_once(vol.root().rmdir("gone"));
+    crate::write::set_rmdir_leaves_orphan(false);
+    if !matches!(removed, Some(Ok(()))) || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return TestResult::Fail("dir orphan: rmdir failed");
+    }
+    let (root, _) = vol.fs_tree_root();
+    if !matches!(
+        poll_once(btree::find_item(&*vol, root, &crate::orphans::key(ino))),
+        Some(Ok(Some(_)))
+    ) {
+        return TestResult::Fail("dir orphan: no orphan item was left to recover");
+    }
+    drop(vol);
+    let vol = match mount_writable(dev) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("dir orphan: the filesystem did not mount again"),
+    };
+    if poll_once(vol.switch_to_subvol(&at)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("subvol @ did not resolve again");
+    }
+    if !matches!(poll_once(vol.recover_orphans()), Some(Ok(()))) {
+        return TestResult::Fail("dir orphan: recovery failed on a directory orphan");
+    }
+    let (root, _) = vol.fs_tree_root();
+    let first = BtrfsKey::new(ino, 0, 0);
+    let left = match poll_once(btree::Cursor::seek(&*vol, root, &first)) {
+        Some(Ok(cursor)) => {
+            matches!(cursor.current(), Ok(Some((key, _))) if key.objectid == ino)
+        }
+        _ => true,
+    };
+    if left
+        || !matches!(
+            poll_once(btree::find_item(&*vol, root, &crate::orphans::key(ino))),
+            Some(Ok(None))
+        )
+    {
+        return TestResult::Fail("dir orphan: something of the directory is left");
+    }
+    if !matches!(poll_once(vol.root().mkdir("gone")), Some(Ok(_)))
+        || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+    {
+        return TestResult::Fail("dir orphan: the filesystem stopped writing");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_directory_orphan_is_evicted);
