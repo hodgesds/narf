@@ -138,6 +138,10 @@ impl Port for &Model {
             // AR_CR_RXD stops both receive queues.
             CR if value & CR_RXD != 0 => self.set(CR, 0),
             CR => self.set(CR, if value == 0 { CR_RXE } else { value }),
+            // `AR_INTR_SYNC_CAUSE` is write-one-to-clear: the
+            // `ath9k_hw_init_interrupt_masks` all-ones write and
+            // `ar9003_hw_get_isr`'s write-back clear causes, never set them.
+            0x4028 => self.set(register, self.reg(register) & !value),
             _ => self.set(register, value),
         }
         Ok(())
