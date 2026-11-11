@@ -4067,14 +4067,13 @@ Former blockers, verified against the tree:
    `smoke_rtw8821cu_phy_usb_interface_rows_match_linux_references` (USB
    replays the frozen Linux callback hashes).
 
-RTL8822BU needs the 8822B chip runtime over USB. The PCI `rtw88 |
-rtl8822be` station core now exists (see "RTL8822BE retained native B22
-owner" onward), but its owner, calibration/power records and programs are
-bound to the PCI transport (`10ec:b822` headers, PCI packet gate), so the
-RTL8822BU row stays blocked on a USB B22 owner, not on the chip tables. RTL8821CU alone would satisfy the
-`rtl8xxxu` `five_ghz_operation`/`vht` rows only once the C21 5 GHz/VHT80
-programs (`band5.rs`, N2xV) run over this transport. Today they run only
-through the PCI owner.
+RTL8822BU is the retained RTL8822BE B22 runtime over this USB transport
+(see "RTL8822BU: the B22 die over the USB transport" below: the
+`usb_driver.rs` `rtw8822bu` class driver over `usb::RTL8822BU_IDS` and
+`efuse::read_factory8822b_usb`). The C21 5 GHz/VHT80 programs
+(`channel_policy::program5`, `vht::program`, N2xV) run over this transport
+through the USB station retune (`usb_firmware.rs` `station_retune_*`), under
+the same signed host-keyed records as PCI (see the retune paragraph above).
 
 Written, unexecuted: `smoke_rtw88_usb_endpoints_and_qsel_map`,
 `smoke_rtw88_usb_queue_tables_and_tx_qsel`,

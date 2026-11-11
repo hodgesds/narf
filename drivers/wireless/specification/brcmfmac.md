@@ -1631,7 +1631,7 @@ without a write; the next writer drops those bits. A primary AP stop
 restores the firmware mask it saved at start as the primary need, so
 bits that were live then stay set until the next station write.
 
-#### P2P firmware owners (groundwork)
+#### P2P firmware owners
 
 `brcmfmac::p2p_wire` holds the `p2p.c`/`fwil_types.h` encodings:
 `brcmf_p2p_disc_st_le` (`p2p_state`, packed 5 bytes), `brcmf_fil_p2p_if_le`

@@ -27,12 +27,16 @@
 //! - [`c2h`] — the firmware-event mailbox (`rtl_8723e_c2h_command_handle`):
 //!   header/close-byte protocol over `REG_C2HEVT_MSG_NORMAL`, BT info
 //!   parse, RSSI / operation-mode / unknown ids consumed without effect.
-//!   Production caller: [`packet::Owner::service_c2h`], which schedules
-//!   `c2h::drain` when `irq::IsrStatus::c2h_pending` is set.
+//!   Caller: [`packet::Owner::service_c2h`], which schedules `c2h::drain`
+//!   when `irq::IsrStatus::c2h_pending` is set. It has no production
+//!   caller yet (only fixture tests): the chip is not admitted, so no IRQ
+//!   path reaches it.
 //! - [`coex`] — the 8723AE Bluetooth-coexistence owner (pass 1): board
 //!   binding, `BtInfo` ingestion, the periodical decision, and the DM
-//!   primitives (`hal_bt_coexist.c`). The full 1-ant / 2-ant mechanism
-//!   trees are a follow-up lane.
+//!   primitives (`hal_bt_coexist.c`, including the RF halves through the
+//!   `rtl8723com` LSSI writer).
+//! - [`dm`] — the 1-ant / 2-ant mechanism trees (`hal_btc.c`) over the
+//!   coex owner.
 //! - [`envelope`] — signed per-board NAPC power envelopes (2.4 GHz
 //!   only), minting the [`envelope::Permission`] the packet owner
 //!   transmits under.
