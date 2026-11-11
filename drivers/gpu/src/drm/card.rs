@@ -3001,6 +3001,15 @@ impl Card {
         }
         self.primary_placements
             .retain(|(id, _)| !disabled.contains(id));
+        // A native primary's rectangles end with its framebuffer too: the
+        // CRTC's next primary is not shown where the removed one sat.
+        for p in self
+            .native_planes
+            .iter_mut()
+            .filter(|p| p.primary_of.is_some_and(|c| disabled.contains(&c)))
+        {
+            p.placed = false;
+        }
         for crtc in disabled {
             self.set_committed_mode(crtc, None);
         }

@@ -265,3 +265,159 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/navi22-plane",
     navi22_plane_two_plane_refusals
 );
+
+/// A plane's SRC rectangle in its framebuffer, then its CRTC rectangle.
+type Rects = ((u32, u32, u32, u32), (i32, i32, u32, u32));
+
+/// One CRTC's planes as `drm_native_planes::check` hands them to the
+/// display: an XRGB8888 primary of a `fb` (width, height) GEM framebuffer
+/// showing `src` in `dst`, None for the full-frame unscaled primary.
+fn drm_planes(fb: (u32, u32), placed: Option<Rects>) -> crate::drm_native_planes::DisplayPlanes {
+    use crate::amdgpu_dcn401_otg::{Blend, PlaneSurface, SurfaceFormat, MAX_OVERLAYS};
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    use crate::amdgpu_navi48_boot::{PlaneGeometry, PlaneSetup};
+    let primary = placed.map(|(src, dst)| PlaneGeometry {
+        src_x: src.0,
+        src_y: src.1,
+        width: src.2,
+        height: src.3,
+        dst: Rect::new(dst.0, dst.1, dst.2 as i32, dst.3 as i32),
+        rotation: Rotation::R0,
+        blend: Blend::default_for(SurfaceFormat::Xrgb8888),
+        surface: PlaneSurface::LINEAR,
+        fb_size: fb,
+        client: true,
+    });
+    crate::drm_native_planes::DisplayPlanes {
+        crtc_id: 1,
+        setup: PlaneSetup {
+            primary,
+            ..PlaneSetup::NONE
+        },
+        primary_format: SurfaceFormat::Xrgb8888.fourcc(),
+        overlays: [None; MAX_OVERLAYS],
+        // A GEM framebuffer's LINEAR pitch is a multiple of 256 bytes
+        // (amdgpu_display_verify_plane).
+        pitches: [fb.0.next_multiple_of(64) * 4, 0, 0, 0],
+    }
+}
+
+/// `admit` is dc_validate_global_state for one CRTC's DRM planes on the
+/// lit stream: the full-frame primary and a placement the pipe plans are
+/// admitted; a placement DC refuses names why; a mode other than the lit
+/// one, or no lit stream, leaves the placement to the modeset.
+fn navi22_plane_admits_what_the_presenter_programs() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{Blend, SurfaceFormat};
+    let t = timing(148_500, (1920, 2200, 88, 44), (1080, 1125, 4, 5));
+    let basis = Basis {
+        timing: t,
+        vco_khz: 3_650_000,
+        soc: soc(),
+        lit: lit(&t),
+        odm: false,
+    };
+    let lit_mode = Some((1920, 1080));
+    if admit(Some(&basis), lit_mode, &drm_planes((1920, 1080), None)) != Ok(()) {
+        return TestResult::Fail("full-frame primary refused");
+    }
+    // KWin's pointer image on the primary at the pointer position.
+    let pointer = drm_planes((41, 40), Some(((0, 0, 41, 40), (1490, 1000, 41, 40))));
+    if admit(Some(&basis), lit_mode, &pointer) != Ok(())
+        || admit(Some(&basis), None, &pointer) != Ok(())
+    {
+        return TestResult::Fail("positioned primary refused");
+    }
+    // The SRC the synthesized primary used to invent for it: the pointer
+    // position as a framebuffer offset.
+    let outside = drm_planes(
+        (41, 40),
+        Some(((1490, 1000, 1920, 1080), (0, 0, 1920, 1080))),
+    );
+    if admit(Some(&basis), lit_mode, &outside) != Err(why::MALFORMED) {
+        return TestResult::Fail("SRC outside the framebuffer admitted");
+    }
+    // Validated by the modeset that lights it.
+    if admit(Some(&basis), Some((2560, 1440)), &outside) != Ok(())
+        || admit(None, lit_mode, &outside) != Ok(())
+    {
+        return TestResult::Fail("placement refused against a stream it will not show on");
+    }
+    // 3:1 down needs more DPPCLK than the lit stream runs at.
+    let down = drm_planes((5760, 3240), Some(((0, 0, 5760, 3240), (0, 0, 1920, 1080))));
+    if admit(Some(&basis), lit_mode, &down) != Err(why::CLOCK) {
+        return TestResult::Fail("over-clock placement admitted");
+    }
+    let odm = Basis { odm: true, ..basis };
+    if admit(Some(&odm), lit_mode, &pointer) != Err(why::ODM) {
+        return TestResult::Fail("placement on an ODM stream admitted");
+    }
+    // What the presenter does not program is refused whatever the stream.
+    let mut turned = pointer;
+    turned.setup.primary.as_mut().unwrap().rotation = crate::amdgpu_dcn401_spl::Rotation::R180;
+    let mut coverage = pointer;
+    coverage.primary_format = SurfaceFormat::Argb8888.fourcc();
+    coverage.setup.primary.as_mut().unwrap().blend = Blend {
+        per_pixel_alpha: true,
+        premultiplied: false,
+        global_alpha: None,
+    };
+    let mut deep = pointer;
+    deep.primary_format = SurfaceFormat::Xrgb2101010.fourcc();
+    if admit(None, None, &turned) != Err(why::ROTATION)
+        || admit(None, None, &coverage) != Err(why::COVERAGE)
+        || admit(None, None, &deep) != Err(why::FORMAT)
+    {
+        return TestResult::Fail("unprogrammed primary state admitted");
+    }
+    // ARGB8888 with "pixel blend mode" None is the bottom plane as it is.
+    let mut none = coverage;
+    none.setup.primary.as_mut().unwrap().blend = Blend {
+        per_pixel_alpha: false,
+        premultiplied: true,
+        global_alpha: None,
+    };
+    if admit(Some(&basis), lit_mode, &none) != Ok(()) {
+        return TestResult::Fail("opaque ARGB primary refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-plane",
+    navi22_plane_admits_what_the_presenter_programs
+);
+
+/// An enabled overlay is refused at the check while the presenter lights
+/// no slave pipe from a commit: the compositor composites instead.
+fn navi22_plane_refuses_overlays_it_does_not_light() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{Blend, PlaneSurface, SurfaceFormat};
+    use crate::amdgpu_dcn401_spl::{Rect, Rotation};
+    use crate::amdgpu_navi48_boot::{OverlayPlane, PlaneGeometry};
+    let mut planes = drm_planes((1920, 1080), None);
+    planes.setup.overlays[0] = Some(OverlayPlane {
+        geometry: PlaneGeometry {
+            src_x: 0,
+            src_y: 0,
+            width: 480,
+            height: 270,
+            dst: Rect::new(720, 405, 960, 540),
+            rotation: Rotation::R0,
+            blend: Blend::default_for(SurfaceFormat::Argb8888),
+            surface: PlaneSurface::LINEAR,
+            fb_size: (480, 270),
+            client: true,
+        },
+        format: SurfaceFormat::Argb8888,
+        underlay: false,
+        plane: 0x44,
+    });
+    planes.overlays[0] = Some(0x44);
+    planes.pitches[1] = 480 * 4;
+    if admit(None, None, &planes) != Err(why::OVERLAY) {
+        return TestResult::Fail("overlay admitted though nothing lights it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi22-plane",
+    navi22_plane_refuses_overlays_it_does_not_light
+);

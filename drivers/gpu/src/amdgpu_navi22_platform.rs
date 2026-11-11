@@ -2654,6 +2654,23 @@ pub(crate) fn placement_admitted(
     basis.plan(&request).is_ok()
 }
 
+/// `dc_validate_global_state` for display `display`'s planes after a DRM
+/// commit ([`crate::amdgpu_navi22_plane::admit`]) at `mode` (the commit's,
+/// None: the current one). Only CRTC 0 presents, so only its lit stream is
+/// a basis; another CRTC's placement has no stream to plan on here.
+pub(crate) fn planes_admitted(
+    display: u8,
+    mode: Option<(u32, u32)>,
+    planes: &crate::drm_native_planes::DisplayPlanes,
+) -> Result<(), &'static str> {
+    let basis = if display == 0 {
+        *PLANE_BASIS.lock()
+    } else {
+        None
+    };
+    crate::amdgpu_navi22_plane::admit(basis.as_ref(), mode, planes)
+}
+
 /// The plane update `request` needs on the lit pipe: None when the pipe
 /// already shows that placement (an address-only flip).
 fn plane_update(

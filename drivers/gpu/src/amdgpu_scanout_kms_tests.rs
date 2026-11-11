@@ -1134,17 +1134,15 @@ kernel_test_in!(
     kms_sync_allocation_reclaims_visible_vram_with_borrowed_admission
 );
 
-/// Navi22 as it publishes itself since the DCN30 overlays: synthesized
-/// primaries (plane 0x40 + n, the CRTC's `primary_fb`) under two native
-/// overlays and a cursor plane per CRTC. The primary is still the
-/// synthesized one, so an atomic commit's primary framebuffer is still a
-/// prepare_fb target (amdgpu_dm_plane_helper_prepare_fb pins every
-/// plane's buffer), and a positioned primary keeps its SRC and CRTC
-/// rectangles to the presenter (amdgpu_dm_plane_fill_dc_scaling_info).
-/// The request is KWin's on a screen showing only the pointer: the pointer
-/// image on the primary at the pointer position, overlays and cursor
-/// plane off.
-fn kms_synthesized_primary_under_overlays_keeps_target_and_placement() -> TestResult {
+/// Navi22 as it publishes itself: a native linear 8888 primary per CRTC
+/// under two native overlays, and a cursor plane per CRTC. An atomic
+/// commit's primary framebuffer is a prepare_fb target
+/// (amdgpu_dm_plane_helper_prepare_fb pins every plane's buffer), and a
+/// positioned primary's SRC and CRTC rectangles reach the presenter with
+/// its frame (amdgpu_dm_plane_fill_dc_scaling_info). The request is KWin's
+/// on a screen showing only the pointer: the pointer image on the primary
+/// at the pointer position, overlays and cursor plane off.
+fn kms_linear_native_primary_keeps_target_and_placement() -> TestResult {
     let Ok(f) = Fixture::new(4) else {
         return TestResult::Fail("fixture");
     };
@@ -1152,11 +1150,11 @@ fn kms_synthesized_primary_under_overlays_keeps_target_and_placement() -> TestRe
         let mut c = f.mode.lock();
         c.driver_name = "amdgpu";
         c.gfx12_modifiers = false;
-        c.native_planes = crate::drm_native_planes::overlay_cursor_planes_for(&[], &[CRTC]);
+        c.native_planes = crate::drm_native_planes::dcn30_planes_for(&[], &[CRTC]);
         c.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
         c.plane_formats = Some(&[DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888]);
-        if !c.has_native_kms_planes() {
-            return TestResult::Fail("fixture publishes no native overlay");
+        if synthesized_primaries(&c) || !crate::drm_native_planes::is_dcn30(&c) {
+            return TestResult::Fail("fixture publishes no native DCN30 primary");
         }
     }
     let Ok(object) = f.object() else {
@@ -1215,10 +1213,10 @@ fn kms_synthesized_primary_under_overlays_keeps_target_and_placement() -> TestRe
         &values,
     );
     if !one_target(&request, &f.mode.lock(), &object) {
-        return TestResult::Fail("synthesized primary's framebuffer is no prepare_fb target");
+        return TestResult::Fail("primary's framebuffer is no prepare_fb target");
     }
     if request.validate(f.index, &f.mode, MASTER, None).is_err() {
-        return TestResult::Fail("positioned synthesized primary refused");
+        return TestResult::Fail("positioned primary refused");
     }
     let mut state = crate::drm::atomic::AtomicState::default();
     state.planes.push(crate::drm::atomic::PlaneState {
@@ -1235,27 +1233,38 @@ fn kms_synthesized_primary_under_overlays_keeps_target_and_placement() -> TestRe
         src_h: 12,
         ..Default::default()
     });
-    let placed = synthesized_primary_placement(&f.mode.lock(), &state, CRTC, fb);
-    if placed
+    let mode = f.mode.lock().crtcs[0].mode;
+    let mode_of = move |_: u32| mode;
+    let frame = |state: &crate::drm::atomic::AtomicState| {
+        let card = f.mode.lock();
+        let planes = crate::drm_native_planes::check(&card, state, mode_of).ok()?;
+        let frame = crate::drm_ioctl_bridge::scanout_frame(&card, card.framebuffer(fb).ok()?)?;
+        Some(placed_primary_frame(&card, frame, planes.first()?))
+    };
+    let Some(placed) = frame(&state) else {
+        return TestResult::Fail("positioned primary has no frame");
+    };
+    if placed.placement
         != Some(crate::drm::card::Placement {
             src: (0, 0, 32, 12),
             dst: (16, 0, 32, 12),
         })
     {
-        return TestResult::Fail("positioned synthesized primary lost its placement");
+        return TestResult::Fail("positioned primary lost its placement");
     }
+    drop(placed);
     // The full screen unscaled is no placement.
     state.planes[0].crtc_x = 0;
     state.planes[0].crtc_w = 64;
     state.planes[0].src_w = 64;
-    if synthesized_primary_placement(&f.mode.lock(), &state, CRTC, fb).is_some() {
+    if frame(&state).is_none_or(|f| f.placement.is_some()) {
         return TestResult::Fail("full-screen primary reported a placement");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
-    kms_synthesized_primary_under_overlays_keeps_target_and_placement
+    kms_linear_native_primary_keeps_target_and_placement
 );
 
 /// A commit the check accepts is one the presenter shows

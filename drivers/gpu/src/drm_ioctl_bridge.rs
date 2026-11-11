@@ -6376,23 +6376,17 @@ fn atomic_commit(
                     .map(|(_, w)| w);
                 let hdmi = native_output_on_crtc(&card, dp.crtc_id, connector)
                     .is_some_and(|n| n.color_format.is_some());
+                let mut why = crate::amdgpu_native_kms::PLANES_REFUSED;
                 if !planes_admitted(
                     hdmi,
                     crate::amdgpu_native_kms::output_search_admits_planes(),
                     || {
-                        crate::amdgpu_native_kms::display_admits_planes(
-                            d,
-                            connector,
-                            wire,
-                            dp.primary_format,
-                            &dp.setup,
-                        )
+                        crate::amdgpu_native_kms::display_admits_planes(d, connector, wire, dp)
+                            .map_err(|refusal| why = refusal)
+                            .is_ok()
                     },
                 ) {
-                    return Err(invalid_why(
-                        line!(),
-                        "DC refuses the CRTC's primary and overlay planes together (dc_validate_global_state)",
-                    ));
+                    return Err(invalid_why(line!(), why));
                 }
             }
             for plane in &state.planes {
@@ -6449,10 +6443,15 @@ fn atomic_commit(
                         native_output_on_crtc(&card, *id, None)
                             .is_some_and(|current| current.connector == n.connector)
                     })
-                    || native_displays.iter().any(|d| {
-                        native_output_on_crtc(&card, d.crtc_id, None)
-                            .is_some_and(|current| current.connector == n.connector)
-                    })
+                    // A plane change only reaches the format search where
+                    // the search plans the planes (Navi48). Navi22's
+                    // validates the stream alone, which no plane changes,
+                    // and its display admitted the planes above.
+                    || (crate::amdgpu_native_kms::output_search_admits_planes()
+                        && native_displays.iter().any(|d| {
+                            native_output_on_crtc(&card, d.crtc_id, None)
+                                .is_some_and(|current| current.connector == n.connector)
+                        }))
             });
         #[cfg(feature = "amdgpu")]
         if hdmi_touched && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
@@ -6803,7 +6802,8 @@ fn atomic_commit(
                         .native_planes
                         .iter()
                         .find(|p| p.primary_of == Some(dp.crtc_id))
-                        .and_then(|p| native_frame(&card, p.id));
+                        .and_then(|p| native_frame(&card, p.id))
+                        .map(|f| placed_primary_frame(&card, f, dp));
                     let overlays = dp
                         .overlays
                         .map(|id| id.and_then(|id| native_frame(&card, id)));
@@ -7750,15 +7750,9 @@ fn planes_admitted(hdmi: bool, search_admits_planes: bool, display: impl FnOnce(
 
 /// Whether the card's primary planes are the bridge's synthesized ones
 /// (each CRTC's `primary_fb` behind plane 0x40 + n) rather than native
-/// planes: a card without native planes, one with cursor planes alone, or
-/// Navi22 on DCN 3.0, whose two native overlays sit over synthesized
-/// primaries. `Card::has_native_kms_planes` is true for the last (an
-/// overlay is a native non-cursor plane), so it does not answer this.
+/// planes: a card without native planes, or one with cursor planes alone.
+/// Both native amdgpu cards (Navi48 and Navi22) publish native primaries.
 pub(crate) fn synthesized_primaries(card: &crate::drm::card::Card) -> bool {
-    #[cfg(feature = "amdgpu")]
-    if crate::drm_native_planes::has_synthesized_primaries(card) {
-        return true;
-    }
     !card.has_native_kms_planes()
 }
 
@@ -7987,14 +7981,13 @@ fn handle_setcrtc_decoded(
                     }
                 } else if let Some(planes) = placed {
                     let planes = planes?;
-                    if !crate::amdgpu_native_kms::display_admits_planes(
+                    if let Err(why) = crate::amdgpu_native_kms::display_admits_planes(
                         d,
                         native_connector,
                         native_wire.as_ref(),
-                        format as u32,
-                        &planes.setup,
+                        &planes,
                     ) {
-                        return Err(invalid_at(line!()));
+                        return Err(invalid_why(line!(), why));
                     }
                 } else if !crate::amdgpu_native_kms::display_admits_format(
                     d,
@@ -8333,6 +8326,12 @@ fn handle_page_flip_decoded(
             Some(false) => return Err(FsError::NoSpace),
             None => check_native_plane(&card, req.fb_id, mode, (x, y), None)?,
         }
+        // The flipped frame shows where the primary was placed: a native
+        // DCN 3.0 primary's committed rectangles (Navi22's presenter takes
+        // the placement with the frame), else the synthesized primary's.
+        #[cfg(feature = "amdgpu")]
+        let placement =
+            crate::drm_native_planes::committed_primary_placement(&card, req.crtc_id).or(placement);
         let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::NotFound)?;
         src_w = fb.width;
         src_h = fb.height;
@@ -8641,14 +8640,10 @@ fn handle_setplane_decoded_native(
                 if let Some(d) =
                     crate::amdgpu_native_kms::crtc_display(dp.crtc_id).filter(|_| amdgpu)
                 {
-                    if !crate::amdgpu_native_kms::display_admits_planes(
-                        d,
-                        None,
-                        None,
-                        dp.primary_format,
-                        &dp.setup,
-                    ) {
-                        return Err(invalid_at(line!()));
+                    if let Err(why) =
+                        crate::amdgpu_native_kms::display_admits_planes(d, None, None, dp)
+                    {
+                        return Err(invalid_why(line!(), why));
                     }
                 }
             }
@@ -8672,7 +8667,8 @@ fn handle_setplane_decoded_native(
                 let primary = (card.native_plane(plane_id).and_then(|p| p.primary_of)
                     == Some(dp.crtc_id))
                 .then(|| native_plane_frame(&card, &state.planes[0], &prepared))
-                .flatten();
+                .flatten()
+                .map(|f| placed_primary_frame(&card, f, dp));
                 if let Some(f) = &primary {
                     crate::amdgpu_native_kms::request_display_format(display, f.format);
                 }
@@ -8756,6 +8752,28 @@ fn native_plane_frame(
     prepared: &PreparedFbs,
 ) -> Option<crate::drm::card::PlaneFrame> {
     prepared_frame(card, card.framebuffer(plane.fb_id?).ok()?, prepared)
+}
+
+/// A native primary's frame as its card's presenter takes it. Navi22's
+/// (DCN 3.0) takes the plane's placement with the frame: the SRC and CRTC
+/// rectangles its display's planes give it
+/// (amdgpu_dm_plane_fill_dc_scaling_info hands DC every plane's
+/// rectangles), None for the full-frame unscaled primary. Navi48's holds
+/// the placement in the plane setup its display was lit with, and its
+/// frame is left as it is.
+#[cfg(feature = "amdgpu")]
+fn placed_primary_frame(
+    card: &crate::drm::card::Card,
+    frame: crate::drm::card::PlaneFrame,
+    planes: &crate::drm_native_planes::DisplayPlanes,
+) -> crate::drm::card::PlaneFrame {
+    if !crate::drm_native_planes::is_dcn30(card) {
+        return frame;
+    }
+    crate::drm::card::PlaneFrame {
+        placement: planes.primary_placement(),
+        ..frame
+    }
 }
 
 /// Framebuffer `fb` as the presenter shows it: a dumb buffer's backing, or

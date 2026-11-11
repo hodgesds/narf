@@ -187,17 +187,29 @@ fn navi22_kms_publishes_dcn30_overlays_not_rdna4_planes() -> TestResult {
         possible_crtcs: 1,
     }];
     apply_card(&mut card, &crtcs, &connectors);
-    // DCN 3.0 publishes two shared overlays (dc caps' max_slave_planes =
-    // 2) with the 19-format list, and one cursor plane per CRTC after
-    // them; the primaries stay synthesized. GFX12 tiling stays out.
+    // DCN 3.0 publishes a native primary per CRTC (immutable zpos 2 =
+    // dc caps' max_slave_planes), two shared overlays with the 19-format
+    // list, and one cursor plane per CRTC after them. GFX12 tiling stays
+    // out.
     let overlays = crate::drm_native_planes::overlay_ids(&card);
+    let primaries: alloc::vec::Vec<_> = card
+        .native_planes
+        .iter()
+        .filter(|p| p.primary_of.is_some())
+        .collect();
     if card.gfx12_modifiers
         || card.overlay_formats != Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS[..])
         || overlays != [0x44, 0x45]
-        || card.native_planes.iter().any(|p| p.primary_of.is_some())
-        || card.native_planes.len() != overlays.len() + card.crtcs.len()
+        || primaries.len() != card.crtcs.len()
+        || primaries.iter().enumerate().any(|(k, p)| {
+            p.id != 0x40 + k as u32
+                || p.primary_of != Some(card.crtcs[k].id)
+                || p.props.zpos != crate::drm_native_planes::DCN30_PRIMARY_ZPOS
+        })
+        || !crate::drm_native_planes::is_dcn30(&card)
+        || card.native_planes.len() != overlays.len() + 2 * card.crtcs.len()
     {
-        return TestResult::Fail("DCN30 overlay publication missing or wrong");
+        return TestResult::Fail("DCN30 plane publication missing or wrong");
     }
     for (k, &id) in overlays.iter().enumerate() {
         let Some(p) = card.native_plane(id) else {

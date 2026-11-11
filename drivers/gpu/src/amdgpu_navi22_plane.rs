@@ -298,6 +298,121 @@ pub fn plan_two(
     })
 }
 
+/// The refusal texts of [`admit`], in the atomic refusal trace's
+/// `why="<plane/property>: <rule> (<Linux function>)"` style.
+pub mod why {
+    pub const FORMAT: &str =
+        "primary plane FB_ID: not a linear 8888 framebuffer (LINUX-GAP: Navi22 presents XRGB8888/ARGB8888 primaries only)";
+    pub const ROTATION: &str =
+        "plane 'rotation': Navi22 scans out unrotated planes only (LINUX-GAP: hubp2_program_rotation)";
+    pub const COVERAGE: &str =
+        "primary plane 'pixel blend mode': Coverage on the bottom plane is not programmed (LINUX-GAP: dcn20_update_mpcc)";
+    pub const TILED: &str =
+        "plane FB_ID: framebuffer modifier is not LINEAR (DCN30 scans out linear surfaces only)";
+    pub const MALFORMED: &str =
+        "primary plane placement: DC refuses it on the lit stream (dc_validate_global_state): SRC outside the framebuffer or a pitch the HUBP cannot hold";
+    pub const GEOMETRY: &str =
+        "primary plane placement: DC refuses it on the lit stream (dc_validate_global_state): resource_build_scaling_params";
+    pub const MODE: &str =
+        "primary plane placement: DC refuses it on the lit stream (dc_validate_global_state): dcn30_validate_bandwidth";
+    pub const CLOCK: &str =
+        "primary plane placement: DC refuses it on the lit stream (dc_validate_global_state): needs more DISPCLK/DPPCLK than the stream runs at (LINUX-GAP: dcn3_update_clocks)";
+    pub const ODM: &str =
+        "primary plane placement: DC refuses it on the lit stream (dc_validate_global_state): the stream is split across ODM pipes (LINUX-GAP)";
+    pub const OVERLAY: &str =
+        "overlay plane: Navi22 does not light a slave pipe from a DRM commit yet (LINUX-GAP: dc_validate_global_state admits it)";
+}
+
+/// The text for a placement [`Refusal`].
+pub const fn refusal_why(refusal: Refusal) -> &'static str {
+    match refusal {
+        Refusal::Invalid => why::MALFORMED,
+        Refusal::Geometry(_) => why::GEOMETRY,
+        Refusal::Mode(_) => why::MODE,
+        Refusal::Clock => why::CLOCK,
+        Refusal::Odm => why::ODM,
+        Refusal::Overlay => why::OVERLAY,
+    }
+}
+
+/// `dc_validate_global_state` for one CRTC's planes after a DRM commit
+/// (`planes`, as `drm_native_planes::check` built them) on the lit stream
+/// `basis`, at `mode` (width, height) when the commit sets one: exactly
+/// what the presenter programs is admitted, so a refused request never
+/// reaches it and the compositor falls back at TEST_ONLY.
+///
+/// The primary is a linear 8888 framebuffer, unrotated, blended as the
+/// bottom plane (opaque and pre-multiplied are the same over the black
+/// background; Coverage is not), and a positioned or scaled one must plan
+/// on the lit pipe ([`Basis::plan`]: `resource_build_scaling_params`, then
+/// `dcn30_validate_bandwidth`). With no lit stream, or a mode other than
+/// the lit one (a modeset in the same commit), the placement is validated
+/// by the modeset that lights it.
+///
+/// An enabled overlay is refused: the presenter does not lease and program
+/// the slave pipe from a commit ([`plan_two`] and
+/// `Pipeline::program_two_planes` exist; the frame path does not use them).
+pub fn admit(
+    basis: Option<&Basis>,
+    mode: Option<(u32, u32)>,
+    planes: &crate::drm_native_planes::DisplayPlanes,
+) -> Result<(), &'static str> {
+    use crate::amdgpu_dcn401_otg::{Blend, SurfaceFormat, Tiling};
+    use crate::amdgpu_dcn401_spl::Rotation;
+    let format = match SurfaceFormat::from_fourcc(planes.primary_format) {
+        Some(f @ (SurfaceFormat::Xrgb8888 | SurfaceFormat::Argb8888)) => f,
+        _ => return Err(why::FORMAT),
+    };
+    // No DCN30 surface is tiled here: ADDFB2 lets none onto the linear
+    // card, and one that got this far is never handed to a HUBP.
+    let surfaces = planes
+        .setup
+        .primary
+        .iter()
+        .chain(planes.setup.overlays.iter().flatten().map(|o| &o.geometry));
+    if surfaces
+        .into_iter()
+        .any(|g| g.surface.tiling != Tiling::LINEAR)
+    {
+        return Err(why::TILED);
+    }
+    if planes.setup.overlay_count() > 0 {
+        return Err(why::OVERLAY);
+    }
+    let Some(g) = planes.setup.primary else {
+        return Ok(());
+    };
+    if g.rotation != Rotation::R0 {
+        return Err(why::ROTATION);
+    }
+    // amdgpu_dm_plane_fill_blending_from_plane_state: None and
+    // Pre-multiplied leave the bottom plane's pixels as they are.
+    let opaque = Blend {
+        per_pixel_alpha: false,
+        ..Blend::default_for(format)
+    };
+    if g.blend != Blend::default_for(format) && g.blend != opaque {
+        return Err(why::COVERAGE);
+    }
+    let Some(basis) = basis else {
+        return Ok(());
+    };
+    if mode.is_some_and(|m| m != (basis.timing.h_active, basis.timing.v_active)) {
+        return Ok(());
+    }
+    let (Ok(w), Ok(h)) = (u32::try_from(g.dst.width), u32::try_from(g.dst.height)) else {
+        return Err(why::MALFORMED);
+    };
+    let request = Request {
+        pitch: planes.pitches[0] / 4,
+        width: g.fb_size.0,
+        height: g.fb_size.1,
+        src: (g.src_x, g.src_y, g.width, g.height),
+        dst: (g.dst.x, g.dst.y, w, h),
+    };
+    basis.plan(&request).map(|_| ()).map_err(refusal_why)
+}
+
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi22_plane_tests.rs"]
 mod tests;
