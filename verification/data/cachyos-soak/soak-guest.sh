@@ -280,6 +280,20 @@ sampler() {
     done
     say "$line"
     if ((n % 6 == 1)); then
+      # What the memory cgroups are charged with, against what is in use.
+      line="SOAK-CGROUP n=$n"
+      for k in system.slice system.slice/narf-soak.service system.slice/ananicy-cpp.service \
+        user.slice init.scope; do
+        v=-
+        [ -r "/sys/fs/cgroup/$k/memory.current" ] && read -r v < "/sys/fs/cgroup/$k/memory.current"
+        line+=" ${k##*/}=$v"
+      done
+      for k in /sys/fs/cgroup/system.slice/ananicy-cpp.service/memory.events \
+        /sys/fs/cgroup/system.slice/narf-soak.service/memory.events; do
+        [ -r "$k" ] || continue
+        while read -r a b; do [ "$a" = max ] && line+=" ${k%/memory.events}:max_events=$b"; done < "$k"
+      done
+      say "${line//\/sys\/fs\/cgroup\//}"
       while read -r line; do
         case $line in *eth* | *lo:*) say "SOAK-NETDEV n=$n $line" ;; esac
       done < /proc/net/dev
