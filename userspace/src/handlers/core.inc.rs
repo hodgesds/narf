@@ -10190,7 +10190,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         let outcome = if is_write {
             // SAFETY: import_rw_iovecs validated this source range; the
             // guarded copy still catches a protection change racing it.
-            let payload = match unsafe { copy_from_user_vec(iovec.base, iovec.len) } {
+            let mut payload = match unsafe { copy_from_user_vec(iovec.base, iovec.len) } {
                 Ok(payload) => payload,
                 Err(errno) => {
                     if total == 0 {
@@ -10200,8 +10200,14 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                     break;
                 }
             };
-            let outcome = poll_blocking(endpoint.ops.write(off, &payload))
-                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+            // `generic_perform_write`: killable, see `killable_wait::write`.
+            let outcome = match crate::killable_wait::write(&endpoint.ops, off, &mut payload) {
+                Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+                Err(crate::killable_wait::Killed) => {
+                    ctx.set_return(errno_ret(EINTR));
+                    return;
+                }
+            };
             // Keep any live generic-fallback MAP_SHARED page of this file
             // coherent with the write (mapped_file::note_file_written).
             if let Ok(n) = &outcome {
@@ -10212,10 +10218,16 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             outcome
         } else {
             let mut staging = alloc::vec![0u8; iovec.len];
-            let read = poll_blocking(endpoint.ops.read_with_options(
-                off, &mut staging, endpoint.read_options(),
-            ))
-                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+            // `filemap_read`: killable, see `killable_wait::read`.
+            let read = match crate::killable_wait::read(
+                &endpoint.ops, off, &mut staging, iovec.len, endpoint.read_options(),
+            ) {
+                Ok(read) => read.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+                Err(crate::killable_wait::Killed) => {
+                    ctx.set_return(errno_ret(EINTR));
+                    return;
+                }
+            };
             match read {
                 Ok(n) if n <= staging.len() => {
                     // SAFETY: validated destination; guarded against a racing

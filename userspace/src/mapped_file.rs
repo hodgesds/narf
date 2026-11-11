@@ -1508,7 +1508,13 @@ fn demand_frame_inner(
         // this task's executor waker registered on its cache fill. The common
         // synchronous bridge parks the faulting own-stack task until that
         // waker fires; it does not spin on a folio owned by another task.
-        return crate::handlers::poll_io_to_completion(ops.mmap_fault_async(offset))
+        //
+        // `__folio_lock_or_retry` under `FAULT_FLAG_KILLABLE`: a fatal signal
+        // ends the park. The fill goes on without this task; the trap
+        // handler finds the fatal signal pending when this fault fails and
+        // delivers it instead of a SIGBUS.
+        return crate::killable_wait::mmap_fault(&ops, offset)
+            .map_err(|_: crate::killable_wait::Killed| FileFaultError::Bus)?
             .ok_or(FileFaultError::Bus)?
             .map_err(fault_error)
             .map(|phys| (phys, None));

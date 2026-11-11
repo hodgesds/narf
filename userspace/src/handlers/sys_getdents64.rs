@@ -25,7 +25,12 @@ fn enumerate_batch(
     cursor: usize,
     batch_max: usize,
 ) -> Result<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>, i64> {
-    match poll_blocking(dir.enumerate_async(cursor, batch_max)) {
+    // `iterate_dir` takes the directory with `down_read_killable`.
+    let batch = match crate::killable_wait::enumerate(dir, cursor, batch_max) {
+        Ok(batch) => batch,
+        Err(crate::killable_wait::Killed) => return Err(EINTR),
+    };
+    match batch {
         Some(Ok(entries)) => Ok(entries),
         Some(Err(narf_filesystem::FsError::Unsupported)) => {
             let mut entries = alloc::vec::Vec::new();

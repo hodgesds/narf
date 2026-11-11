@@ -205,7 +205,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         } else {
             // SAFETY: the complete original range passed validate_rw_user_range;
             // each bounded guarded copy still catches a racing unmap.
-            let payload = match unsafe { copy_from_user_vec(user_ptr + total as u64, want) } {
+            let mut payload = match unsafe { copy_from_user_vec(user_ptr + total as u64, want) } {
                 Ok(payload) => payload,
                 Err(errno) if total == 0 => {
                     ctx.set_return(errno_ret(errno as i64));
@@ -216,8 +216,15 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             if endpoint.append() {
                 offset = endpoint.ops.stat().size;
             }
-            let outcome = poll_blocking(endpoint.ops.write(offset, &payload))
-                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+            // `generic_perform_write`: a fatal signal ends the wait; the
+            // write lands whole without this task.
+            let outcome = match crate::killable_wait::write(&endpoint.ops, offset, &mut payload) {
+                Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+                Err(crate::killable_wait::Killed) => {
+                    ctx.set_return(errno_ret(EINTR));
+                    return;
+                }
+            };
             // Keep any live generic-fallback MAP_SHARED page of this file
             // coherent with the write (mapped_file::note_file_written).
             if let Ok(written) = &outcome {

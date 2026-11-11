@@ -162,8 +162,14 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
         if endpoint.append() {
             offset = endpoint.ops.stat().size;
         }
-        let outcome = poll_blocking(endpoint.ops.write(offset, &payload))
-            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+        // `generic_perform_write`: killable, see `killable_wait::write`.
+        let outcome = match crate::killable_wait::write(&endpoint.ops, offset, &mut payload) {
+            Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+            Err(crate::killable_wait::Killed) => {
+                ctx.set_return(errno_ret(EINTR));
+                return;
+            }
+        };
         match outcome {
             Ok(0) if endpoint.ops.write_should_block() && total == 0 => {
                 if endpoint.nonblocking() {

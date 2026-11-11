@@ -57,6 +57,7 @@ pub mod init;
 pub mod interp;
 pub mod io_mux;
 pub mod keyring;
+mod killable_wait;
 pub mod landlock;
 pub mod loader;
 pub mod lsm;

@@ -2006,6 +2006,34 @@ executable, signal, instruction/stack pointers and diagnostic registers even
 when `RLIMIT_CORE` disables the file. Ordinary traps and syscalls do not emit
 that record.
 
+**Killable filesystem waits** (`killable_wait`). A task parked on a
+filesystem future is ended by a fatal signal (SIGKILL pending; no other
+signal) in the classes Linux sleeps in `TASK_KILLABLE`:
+`read`/`pread64`/`readv`/`preadv*` (`filemap_read`) and
+`write`/`pwrite64`/`writev`/`pwritev*` (`generic_perform_write` and the
+reservation and dirty-throttle sleeps under it) of stored file data (a
+regular file whose `FileOps::can_poll` is false, i.e. one with no `->poll`),
+`getdents*` (`iterate_dir`'s `down_read_killable`), file page faults
+(`__folio_lock_or_retry` under `FAULT_FLAG_KILLABLE`), and the core writer's
+writes (`dump_interrupted`). The handler returns `-EINTR`
+(a fault fails and the trap handler delivers the pending signal) and the task
+dies on its way out. The operation itself is never dropped: a polled
+filesystem future may hold a device's shared DMA buffer with a request in
+flight, the filesystem's operation lock or a half-staged transaction, so it
+owns everything it touches and is handed to the scheduler to reach its own
+completion — a killed write lands whole. A pipe, socket, FIFO, device node
+or event descriptor is not waited for this way (a read finishing after its
+reader died would consume the next reader's bytes or event); those block
+through their readiness parks, which signals already end. Every other
+filesystem wait stays uninterruptible, as on Linux:
+`fsync`/`fdatasync`/`sync`/`syncfs` (a transaction commit), namespace changes
+(`create`, `unlink`, `rename`, `mkdir`, `link`, `symlink`, ...), `truncate`
+and `fallocate`, attribute and xattr changes, path lookup, and `execve`'s
+image reads. Not yet Linux: `copy_file_range`, `sendfile` and `splice` wait
+uninterruptibly for their file side, and `munmap`/exit write a shared
+mapping's dirty fallback pages back synchronously and uninterruptibly, where
+Linux leaves them to writeback.
+
 AF_BLUETOOTH L2CAP/RFCOMM sockets (issue #814) support the server side:
 bind stores the local sockaddr (L2CAP psm + bdaddr + cid + address type;
 RFCOMM bdaddr + server channel), listen registers the PSM with the pump's
