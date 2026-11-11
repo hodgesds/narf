@@ -254,7 +254,20 @@ A frame larger than an empty ring (`!fits_empty_ring(descs)`) must be an
 error, never `Busy`. A frame sent through the ordinary send hook is accepted
 while descriptors remain: the descriptors below the stop threshold are the
 room pure ACKs, SYN/FIN/RST, retransmissions and non-TCP traffic use while
-bulk data waits. An owned `Frame` may carry a connection's byte charge; it is
+bulk data waits. That room is not a guaranteed reserve — a queue stops after
+a post that leaves fewer than `max_frame_descs` free, so it is anywhere from
+nothing to one descriptor short of a worst-case frame — and because the
+ordinary hook ignores the stopped flag, traffic through it at or above the
+link's rate can hold the ring below the wake threshold and keep waiting TCP
+data out. A refused frame's buffer must be returned the way a completed
+frame's is, not freed. `try_xmit_copy` carries the connection's charge for
+the frame the driver builds.
+
+`TxQueue::stopped_too_long(now, threshold)` lets the driver's periodic task
+report a queue that stays stopped; igc logs one rate-limited line after a
+second and exports `tx_queue_N_busy`, `tx_queue_N_stopped_long`,
+`tcp_tx_refusal_storms`, `tcp_tx_long_waits` and `tcp_tx_pool_empty` in
+`ethtool -S`. An owned `Frame` may carry a connection's byte charge; it is
 released when the `Frame` is destroyed, so a driver must keep a posted frame
 alive until its descriptors complete and must drop the frames of a reset
 ring.

@@ -1245,6 +1245,32 @@ impl Igc {
             // The periodic wake pass: covers a completion reclaimed by a
             // sender, which cannot resume other connections itself.
             queue.txq().run_wakeups();
+            // A queue stopped for a second has frames that do not
+            // complete: say so once a second, long before the 5 s watchdog
+            // (which also needs carrier) would.
+            let second = narf_time::ns_to_cycles(1_000_000_000);
+            if let Some(cycles) = queue
+                .txq()
+                .stopped_too_long(narf_time::now_cycles(), second)
+            {
+                if narf_net::txq::report_allowed() {
+                    let pending = queue.statistics()[4];
+                    let _ = core::fmt::write(
+                        &mut narf_console::Writer,
+                        format_args!(
+                            "[igc] {} q{} TX queue stopped {} ms: pending={} busy={} restarts={} waiters={} carrier={}\n",
+                            self.name(),
+                            q,
+                            narf_time::cycles_to_ns(cycles) / 1_000_000,
+                            pending,
+                            queue.txq().busy(),
+                            queue.txq().restarts(),
+                            queue.txq().waiters(),
+                            self.link_up()
+                        ),
+                    );
+                }
+            }
         }
         self.sample_counters();
         {

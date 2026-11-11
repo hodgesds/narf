@@ -2333,6 +2333,57 @@ kernel_test_in!(
     smoke_tx_rto_does_not_advance_over_a_sender_that_ran_meanwhile
 );
 
+/// A connection that cannot get its data into the device is counted: every
+/// 64 refusals in a row, and every second spent waiting. Sending again
+/// clears both.
+fn smoke_tx_stuck_sender_is_counted_and_cleared() -> TestResult {
+    use crate::txq::stats::{LONG_WAITS, REOFFER_STORMS};
+    use ::core::sync::atomic::Ordering;
+    let (nic, id, _) = backpressure_conn("txbp14", [10, 108, 0, 1], 7_935);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if send(id, &pattern(1000)) != Ok(1000) {
+        return TestResult::Fail("the first segment was not sent");
+    }
+    nic.busy_unstopped.store(true, Ordering::SeqCst);
+    let storms = REOFFER_STORMS.load(Ordering::Relaxed);
+    if send(id, &pattern(30_000)) != Ok(30_000) {
+        return TestResult::Fail("the send buffer did not take the data");
+    }
+    for _ in 0..40 {
+        let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+        tick_retransmit(&arc);
+    }
+    if REOFFER_STORMS.load(Ordering::Relaxed) == storms {
+        return TestResult::Fail("82 refusals in a row were not counted as a storm");
+    }
+    // The wait began more than a second ago: counted once, then the second
+    // starts over.
+    let waits = LONG_WAITS.load(Ordering::Relaxed);
+    let _ = __with_tcb_mut(id, |t| {
+        t.tx_wait_start_cycles = 1;
+        t.tx_wait_since_cycles = 1;
+    });
+    tick_retransmit(&arc);
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    if LONG_WAITS.load(Ordering::Relaxed) != waits + 1 {
+        return TestResult::Fail("a second of waiting was not counted exactly once");
+    }
+    nic.busy_unstopped.store(false, Ordering::SeqCst);
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    if __with_tcb(id, |t| (t.tx_refused_in_row, t.tx_wait_start_cycles)) != Some((0, 0)) {
+        return TestResult::Fail("sending again did not clear the stuck-sender state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_stuck_sender_is_counted_and_cleared
+);
+
 // ── Receive batches (`iface::rx_batch`) ─────────────────────────────────
 
 /// An Ethernet ARP request from `peer` for `target`.

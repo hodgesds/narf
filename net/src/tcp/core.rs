@@ -255,6 +255,11 @@ pub struct Tcb {
     /// Counts RTO rewinds of `snd_nxt` to `snd_una` (go-back-N). A refused
     /// segment is only un-sent if none happened since it was marked.
     pub rewind_epoch: u32,
+    /// Refusals since the connection last got a segment into its device.
+    pub tx_refused_in_row: u32,
+    /// When the current wait for the device began (cycles); 0 when not
+    /// waiting. Unlike `tx_wait_since_cycles` the probe does not restart it.
+    pub tx_wait_start_cycles: u64,
 
     // ── Retransmit ──
     pub rtt: RttEstimator,
@@ -560,6 +565,19 @@ fn emit_tcb_frame_on(
             // A frame the driver copies occupies the device queue just as
             // an owned one does. Uncharged, a connection whose pool was
             // empty escaped the per-connection limit altogether.
+            if dev.zero_copy_tx() {
+                // Built in a `Vec` although the device has a zero-copy
+                // pool: the pool had no buffer.
+                let empties = crate::txq::stats::POOL_EMPTY.fetch_add(1, Ordering::Relaxed) + 1;
+                if crate::txq::report_allowed() {
+                    narf_console::klog!(
+                        "[tcp] {}: transmit pool empty, {} byte frame copied (pool_empty={})",
+                        dev.name,
+                        v.len(),
+                        empties
+                    );
+                }
+            }
             let charge = charge.then(|| bind.account.charge(v.len() as u32));
             dev.try_xmit_copy(driver, bind.queue, &v, meta, charge)
         }
@@ -661,6 +679,8 @@ impl Tcb {
             xmit_again: false,
             tx_wait_since_cycles: 0,
             rewind_epoch: 0,
+            tx_refused_in_row: 0,
+            tx_wait_start_cycles: 0,
             rtt: RttEstimator::new(),
             retx_queue: VecDeque::new(),
             retx_deadline_cycles: 0,
@@ -4065,6 +4085,11 @@ fn pump_send_queued_once(
             let mut t = arc.lock();
             unsend(&mut t, &marked);
             refusals += 1;
+            t.tx_refused_in_row = t.tx_refused_in_row.saturating_add(1);
+            if t.tx_refused_in_row.is_multiple_of(TX_REFUSALS_REPORT) {
+                crate::txq::stats::REOFFER_STORMS.fetch_add(1, Ordering::Relaxed);
+                report_tx_stuck(&t, "refusals in a row", u64::from(t.tx_refused_in_row));
+            }
             // The queue the driver refused on is not the one this
             // connection is bound to (replaced by a resize): drop the
             // binding, so the next offer selects a queue again, and park.
@@ -4107,9 +4132,47 @@ fn pump_send_queued_once(
 /// The sender stops for its device queue: the wake pass resumes it, or
 /// `tick_tx_wait` after the probe interval.
 fn tx_park(t: &mut Tcb) {
+    let now = narf_scheduler::narf_time::now_cycles().max(1);
     if t.tx_wait_since_cycles == 0 {
-        t.tx_wait_since_cycles = narf_scheduler::narf_time::now_cycles().max(1);
+        t.tx_wait_since_cycles = now;
     }
+    if t.tx_wait_start_cycles == 0 {
+        t.tx_wait_start_cycles = now;
+    }
+}
+
+/// Refusals in a row that are counted and reported as one storm.
+const TX_REFUSALS_REPORT: u32 = 64;
+/// How long a connection waits for its queue before that is reported.
+const TX_WAIT_REPORT_NS: u64 = 1_000_000_000;
+
+/// One rate-limited line describing a connection that is not getting its
+/// data into the device, with what is needed to tell why.
+fn report_tx_stuck(t: &Tcb, what: &str, amount: u64) {
+    if !crate::txq::report_allowed() {
+        return;
+    }
+    let (queue, stopped, queued) = t.tx_bind.as_ref().map_or((-1, false, 0), |bind| {
+        (
+            i32::from(bind.queue),
+            bind.account.queue().is_stopped(),
+            bind.account.queued(),
+        )
+    });
+    narf_console::klog!(
+        "[tcp] conn {} port {}: {} {}; txq={} stopped={} queued={} unsent={} inflight={} storms={} long_waits={}",
+        t.id,
+        t.local_port,
+        what,
+        amount,
+        queue,
+        stopped,
+        queued,
+        t.send_buf.unsent_len(),
+        t.snd_nxt.wrapping_sub(t.snd_una),
+        crate::txq::stats::REOFFER_STORMS.load(Ordering::Relaxed),
+        crate::txq::stats::LONG_WAITS.load(Ordering::Relaxed)
+    );
 }
 
 /// Whether `bind` still names the queue object the driver uses for that
@@ -4250,6 +4313,8 @@ fn send_data_queued(
     // Taken, or dropped by a device that cannot send at all: either way it
     // is in flight as far as loss recovery is concerned.
     t.tx_wait_since_cycles = 0;
+    t.tx_wait_start_cycles = 0;
+    t.tx_refused_in_row = 0;
     let mut seq_len = payload.len() as u32;
     if extra_flags & FLAG_FIN != 0 {
         seq_len = seq_len.saturating_add(1);
@@ -4284,6 +4349,18 @@ fn tick_tx_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 >= narf_scheduler::narf_time::ns_to_cycles(TX_WAIT_PROBE_NS);
         if due {
             t.tx_wait_since_cycles = now.max(1);
+            let waited = now.saturating_sub(t.tx_wait_start_cycles);
+            if t.tx_wait_start_cycles != 0
+                && waited >= narf_scheduler::narf_time::ns_to_cycles(TX_WAIT_REPORT_NS)
+            {
+                t.tx_wait_start_cycles = now.max(1);
+                crate::txq::stats::LONG_WAITS.fetch_add(1, Ordering::Relaxed);
+                report_tx_stuck(
+                    &t,
+                    "ms waiting for its transmit queue",
+                    narf_scheduler::narf_time::cycles_to_ns(waited) / 1_000_000,
+                );
+            }
         }
         due
     };
