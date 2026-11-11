@@ -1113,10 +1113,16 @@ enum Caller {
 /// instead ([`crate::handlers::cond_resched`]) and continues once the
 /// tasks queued behind it have run. A task returns to the executor, which
 /// requeues it behind its peers.
+/// In-syscall scheduling points where the caller really was a task on its
+/// own stack (`cond_resched` could yield). Kernel tests read it.
+pub(super) static SYSCALL_YIELD_POINTS: AtomicU64 = AtomicU64::new(0);
+
 async fn scheduling_point(caller: Caller) {
     match caller {
         Caller::Syscall => {
-            crate::handlers::cond_resched();
+            if crate::handlers::cond_resched() {
+                SYSCALL_YIELD_POINTS.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Caller::Task => narf_scheduler::yield_now().await,
     }
