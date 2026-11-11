@@ -3788,14 +3788,22 @@ static WAKE_INBOX_LEN: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
 /// wakes coalesce. Running tasks have no parked token; poll return observes
 /// their wake bit and enqueues them directly.
 ///
-/// A linked node belongs to a task parked on this CPU, or to one that was
-/// reaped from here and will never be woken again: whoever takes a woken task
-/// out of `PARKED[cpu]` to run it elsewhere, other than the owner's drain
-/// (which has detached the node already), unlinks it first with
-/// `unlink_parked_wake`. Otherwise the node's claim would swallow the task's
-/// next wake until this CPU drained. The list is singly linked and every link
-/// changes under `gate`, which is what lets that path, and an idle thief
-/// looking for candidates, walk it.
+/// A node on this public list belongs to a task parked on this CPU, or to one
+/// that was reaped from here and will never be woken again: whoever takes a
+/// task out of `PARKED[cpu]` to run it calls `unlink_parked_wake` before
+/// enqueueing it. That includes the owner's drain. The drain has detached the
+/// node it is processing, but it releases that node's claim before it takes
+/// the slot, and a wake in between links the cell here again. Otherwise the
+/// node's claim would swallow the task's next wake until this CPU drained.
+///
+/// What a taker cannot unlink is a node sitting in the owner's detached,
+/// private batch. The owner's drain is already running and releases or
+/// forwards it (`activate_drained_wake`), so that state ends without anyone
+/// reaching a scheduling point.
+///
+/// The list is singly linked and every link changes under `gate`, which is
+/// what lets `unlink_parked_wake`, and an idle thief looking for candidates,
+/// walk it.
 #[repr(align(64))]
 struct ParkedWakeHead {
     head: AtomicPtr<WakeCell>,
@@ -4194,6 +4202,10 @@ fn activate_drained_wake(cpu: usize, cell: &WakeCell) -> usize {
         // a stale token names a task which has since gone back to sleep.
         return 0;
     };
+    // The claim was released before the slot was taken, so a wake in between
+    // may have linked this cell on the public list again. One load when it
+    // did not.
+    unlink_parked_wake(cpu, &parked.slot.awake);
     enqueue_on(cpu, parked.slot, parked.reason);
     1
 }
