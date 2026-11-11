@@ -264,15 +264,19 @@ fn kms_linear_card_with_overlays_takes_gem_nv12() -> TestResult {
     let Ok(object) = f.object() else {
         return TestResult::Fail("linear BO");
     };
-    // One BO for both planes (amdgpu_dm's one-BO rule): 64x12 luma at
-    // offset 0, 32x6 chroma at offset 768, both at pitch 64.
+    // One BO for both planes (amdgpu_dm's one-BO rule): 64x8 luma at
+    // offset 0, 32x4 chroma at offset 2048. amdgpu_display_verify_sizes
+    // gives a LINEAR plane 256-byte blocks (block_width = 256 / cpp,
+    // block_size_log2 = 8), so amdgpu_display_verify_plane takes only a
+    // pitch and an offset that are multiples of 256: 8 luma rows and 4
+    // chroma rows of 256 bytes are 3072 bytes of the 4096-byte BO.
     let cmd = crate::amdgpu_dm_modifiers::FbCmd {
         width: 64,
-        height: 12,
+        height: 8,
         pixel_format: crate::amdgpu_dm_modifiers::NV12,
         handles: [1, 1, 0, 0],
-        pitches: [64, 64, 0, 0],
-        offsets: [0, 768, 0, 0],
+        pitches: [256, 256, 0, 0],
+        offsets: [0, 2048, 0, 0],
         ..Default::default()
     };
     let before = f.mode.lock().framebuffers.len();
@@ -287,8 +291,20 @@ fn kms_linear_card_with_overlays_takes_gem_nv12() -> TestResult {
         let record = c.framebuffer(fb).unwrap();
         (record.offsets, record.chroma_pitch, record.modifier)
     };
-    if offsets != [0, 768] || chroma_pitch != 64 || modifier != 0 {
+    if offsets != [0, 2048] || chroma_pitch != 256 || modifier != 0 {
         return TestResult::Fail("GEM NV12 planes not recorded");
+    }
+    // The pitch a 64-byte luma row would fit is no multiple of the block
+    // pitch: Linux refuses it (amdgpu_display_verify_plane, -EINVAL).
+    let mut narrow = cmd;
+    narrow.pitches = [64, 64, 0, 0];
+    narrow.offsets = [0, 768, 0, 0];
+    if f.mode
+        .lock()
+        .addfb2_bo(&narrow, object.clone(), MASTER)
+        .is_ok()
+    {
+        return TestResult::Fail("linear NV12 pitch below the 256-byte block accepted");
     }
     // A tiled modifier is still refused on the linear card.
     let mut tiled = cmd;
