@@ -13,9 +13,12 @@
 //! - **stop**: SMP2P `stop` request, `PAS_SHUTDOWN`, unprepare.
 //!
 //! Proxy resources Linux votes around start — the RPMh `xo` clock and the
-//! `cx`/`mx` power domains via `qcom,qmp` load-state — are the caller's
-//! responsibility; NARF has no RPMh/AOSS-QMP driver yet (recorded as a
-//! WCN6750 blocker in the wireless ledger).
+//! `cx`/`mx` power domains, then the `qcom,qmp` load-state message — are
+//! the caller's responsibility. The drivers exist (`cmd_db`, `rpmh`,
+//! `aoss`, composed by `wpss::WpssPower`), but `ath11k::ahb_live::LiveAhb`
+//! does not call them yet: that needs the RSC window, cmd-db
+//! reserved-memory and AOSS msgram/mailbox DT parsing (open WCN6750
+//! bring-up item in the wireless ledger).
 
 use crate::io::Delay;
 use crate::mdt::{Mdt, SegmentSource};
