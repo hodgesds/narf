@@ -560,6 +560,31 @@ fn snapshot_ctrl_state(cg: &Cgroup, name: &'static str) -> Option<Arc<dyn Contro
     cg.ctrl_state.lock().get(name).cloned()
 }
 
+/// Member pids of the cgroup whose `memory` state is `state`, and of every
+/// cgroup below it: the processes a memory-cgroup OOM may choose from.
+/// `None` when no live cgroup carries `state` (it has gone offline).
+#[cfg(feature = "cgroup-memory")]
+pub(super) fn memcg_member_pids(state: &Arc<dyn ControllerState>) -> Option<Vec<u64>> {
+    fn find(cg: &Arc<Cgroup>, state: &Arc<dyn ControllerState>) -> Option<Arc<Cgroup>> {
+        if snapshot_ctrl_state(cg, "memory").is_some_and(|s| Arc::ptr_eq(&s, state)) {
+            return Some(cg.clone());
+        }
+        let children: Vec<Arc<Cgroup>> = cg.children.lock().values().cloned().collect();
+        children.iter().find_map(|child| find(child, state))
+    }
+    fn collect(cg: &Arc<Cgroup>, out: &mut Vec<u64>) {
+        out.extend(cg.members.lock().iter().copied());
+        let children: Vec<Arc<Cgroup>> = cg.children.lock().values().cloned().collect();
+        for child in &children {
+            collect(child, out);
+        }
+    }
+    let cg = find(&root(), state)?;
+    let mut pids = Vec::new();
+    collect(&cg, &mut pids);
+    Some(pids)
+}
+
 fn root() -> Arc<Cgroup> {
     let root = CGROUP_ROOT.get_or_init(Cgroup::new_root).clone();
 
@@ -1607,7 +1632,15 @@ fn store_subtree_control(cg: &Arc<Cgroup>, text: &str) -> Result<(), FsError> {
             }
         } else if !enable && enabled.remove(name) {
             for child in children.values() {
-                mutate_ctrl_state(child, |states| states.remove(name));
+                let removed = mutate_ctrl_state(child, |states| states.remove(name));
+                // Pages still charged to the child's memory cgroup keep
+                // uncharging it (and its ancestors) until they are freed.
+                #[cfg(feature = "cgroup-memory")]
+                if let Some(state) = removed.filter(|_| name == "memory") {
+                    memory::offline_memcg(&state);
+                }
+                #[cfg(not(feature = "cgroup-memory"))]
+                drop(removed);
             }
         }
     }
@@ -2136,6 +2169,12 @@ impl DirOps for CgroupDir {
                 return Err(FsError::Busy);
             }
             self.cg.children.lock().remove(name);
+            // The removed cgroup's memory state goes offline; pages charged
+            // to it keep uncharging it until the last one is freed.
+            #[cfg(feature = "cgroup-memory")]
+            if let Some(state) = snapshot_ctrl_state(&child, "memory") {
+                memory::offline_memcg(&state);
+            }
             Ok(())
         })
     }

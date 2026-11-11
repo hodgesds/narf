@@ -1121,13 +1121,127 @@ pub fn alloc_frame_on_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame, F
 
 /// Reserve-respecting variant of [`alloc_frame_anywhere`].
 pub fn alloc_frame_anywhere_ctx(ctx: AllocContext) -> Result<PhysFrame, FrameAllocError> {
-    reserve_permits(ctx, current_cpu_node())?;
-    alloc_frame_anywhere()
+    let node = current_cpu_node();
+    reserve_permits(ctx, node)?;
+    let charge = charge_user_alloc(ctx, node, PAGE_SIZE)?;
+    let r = with_installed(|a| a.alloc_frame_anywhere());
+    commit_user_charge(charge, &r, PAGE_SIZE);
+    r
 }
 
-/// `User`-context strict per-node allocation for a bound mempolicy.
+/// `User`-context strict per-node allocation of a page-migration destination.
+///
+/// Not charged to any memory cgroup: the page being migrated already is, and
+/// the caller moves that charge to the new frame with
+/// [`transfer_frame_memcg`] (Linux `mem_cgroup_migrate`). Charging the
+/// destination to whoever runs the migration — compaction, NUMA balancing,
+/// `move_pages` — would bill a cgroup for a page it does not own.
 pub fn alloc_user_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocError> {
-    alloc_frame_on_strict_for_ctx(node, node, AllocContext::User)
+    alloc_frame_on_strict_inner(node, node, AllocContext::User, false)
+}
+
+/// Move the memory-cgroup charge of a migrating page from `old` to `new`.
+/// Call once the destination exists; the old frame's final free then
+/// uncharges nothing, and the new frame's uncharges the original cgroup.
+/// No-op without the `cgroup` feature.
+pub fn transfer_frame_memcg(old: PhysAddr, new: PhysAddr) {
+    #[cfg(feature = "cgroup")]
+    cow::transfer_frame_memcg(old, new);
+    #[cfg(not(feature = "cgroup"))]
+    let _ = (old, new);
+}
+
+/// A memory-cgroup charge taken for an allocation that has not happened yet;
+/// the charged cgroup, 0 for nothing charged.
+#[derive(Copy, Clone)]
+#[cfg_attr(not(feature = "cgroup"), allow(dead_code))]
+struct UserCharge(u32);
+
+/// Charge a user allocation of `bytes` to the current task's memory cgroup
+/// before it is made (Linux charges at fault time, `mem_cgroup_charge`).
+/// Kernel allocations are never charged — Linux charges kernel memory only
+/// for `__GFP_ACCOUNT` allocations, and nothing here asks for that — so no
+/// kernel allocation, the heap's included, can be refused by a cgroup.
+///
+/// A refused user charge queues an OOM kill inside the cgroup that hit its
+/// `memory.max` (run by the OOM reaper, with no lock held) and returns
+/// `ReservePressure`, so a faulting task waits for a reclaim cycle and
+/// retries instead of taking SIGSEGV. A copy-on-write break (`UserReserve`)
+/// is force-charged past the limit, as Linux does for allocations that must
+/// not fail.
+#[cfg(feature = "cgroup")]
+fn charge_user_alloc(
+    ctx: AllocContext,
+    node: usize,
+    bytes: u64,
+) -> Result<UserCharge, FrameAllocError> {
+    if ctx == AllocContext::Kernel {
+        return Ok(UserCharge(0));
+    }
+    let force = ctx == AllocContext::UserReserve;
+    match crate::cgroup_charge::charge_current(bytes, force) {
+        Ok((id, _)) => Ok(UserCharge(id)),
+        Err((id, pid)) => {
+            crate::cgroup_charge::request_memcg_oom(id, pid);
+            let node = node.min(MAX_NUMA_NODES - 1);
+            Err(crate::reclaim::request_reclaim_ticket(node, 1, false)
+                .map_or(FrameAllocError::Exhausted, FrameAllocError::ReservePressure))
+        }
+    }
+}
+
+#[cfg(not(feature = "cgroup"))]
+#[inline]
+fn charge_user_alloc(
+    _ctx: AllocContext,
+    _node: usize,
+    _bytes: u64,
+) -> Result<UserCharge, FrameAllocError> {
+    Ok(UserCharge(0))
+}
+
+/// Finish a charge taken by [`charge_user_alloc`]: record it on the block's
+/// head frame when the allocation succeeded, refund it when it failed.
+#[inline]
+fn commit_user_charge(charge: UserCharge, result: &Result<PhysFrame, FrameAllocError>, bytes: u64) {
+    #[cfg(feature = "cgroup")]
+    match result {
+        Ok(frame) => cow::set_frame_memcg(frame.start_address(), charge.0),
+        Err(_) => crate::cgroup_charge::uncharge_memcg(charge.0, bytes),
+    }
+    #[cfg(not(feature = "cgroup"))]
+    let _ = (charge, result, bytes);
+}
+
+/// Charge a `1 << order` block the caller has just allocated with kernel
+/// context to the current task's memory cgroup, as user memory: a page-cache
+/// folio a task reads or faults in, a shmem/tmpfs page (Linux
+/// `mem_cgroup_charge` on the new folio). On `Err` nothing was charged and
+/// the caller must free the block and fail its operation (ENOMEM); a refusal
+/// also queues an OOM kill inside the cgroup at its limit. The block's final
+/// free (`free_frame` / `free_pages`) uncharges the same cgroup. A task with
+/// no memory cgroup, and kernel threads, charge nothing. No-op without the
+/// `cgroup` feature.
+pub fn charge_frame_to_current(frame: PhysFrame, order: u8) -> Result<(), FrameAllocError> {
+    #[cfg(feature = "cgroup")]
+    {
+        let bytes = PAGE_SIZE << order;
+        let charge = charge_user_alloc(AllocContext::User, current_cpu_node(), bytes)?;
+        cow::set_frame_memcg(frame.start_address(), charge.0);
+    }
+    #[cfg(not(feature = "cgroup"))]
+    let _ = (frame, order);
+    Ok(())
+}
+
+/// Return the memory-cgroup charge recorded on `head` for a `bytes` block
+/// that is being freed. Allocation-free.
+#[inline]
+fn uncharge_freed_block(head: PhysAddr, bytes: u64) {
+    #[cfg(feature = "cgroup")]
+    crate::cgroup_charge::uncharge_memcg(cow::take_frame_memcg(head), bytes);
+    #[cfg(not(feature = "cgroup"))]
+    let _ = (head, bytes);
 }
 
 /// Phys-address ceiling for early boot. While set, alloc_frame*
@@ -1552,16 +1666,23 @@ pub(crate) fn alloc_frame_on_strict_for_ctx(
     preferred: usize,
     ctx: AllocContext,
 ) -> Result<PhysFrame, FrameAllocError> {
+    alloc_frame_on_strict_inner(node, preferred, ctx, true)
+}
+
+/// [`alloc_frame_on_strict_for_ctx`], with the memory-cgroup charge of a user
+/// allocation made only when `charge` is set (a migration destination
+/// inherits its source's charge instead).
+fn alloc_frame_on_strict_inner(
+    node: usize,
+    preferred: usize,
+    ctx: AllocContext,
+    charge: bool,
+) -> Result<PhysFrame, FrameAllocError> {
     reserve_permits(ctx, node)?;
-    #[cfg(feature = "cgroup")]
-    if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
-        return Err(FrameAllocError::Exhausted);
-    }
+    let charge_ctx = if charge { ctx } else { AllocContext::Kernel };
+    let charged = charge_user_alloc(charge_ctx, node, PAGE_SIZE)?;
     let r = buddy_alloc_frame_on_strict(node, preferred);
-    #[cfg(feature = "cgroup")]
-    if r.is_err() {
-        crate::cgroup_charge::uncharge(PAGE_SIZE);
-    }
+    commit_user_charge(charged, &r, PAGE_SIZE);
     if r.is_err() {
         // A strict-node miss may be local fragmentation rather than global
         // exhaustion, so request a background pass without arming OOM.
@@ -1611,16 +1732,11 @@ const SLAB_DIRECT_RECLAIM_PAGES: usize = 512;
 /// watermark reserve; `Kernel` allocations may consume it.
 fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame, FrameAllocError> {
     reserve_permits(ctx, node)?;
-    // cgroup memory accounting: charge one page to the current task's
-    // cgroup chain *before* the allocation commits. A `false` return
-    // means a `memory.max` would be exceeded, so the allocation is
-    // denied (enforced). This is the order-0 user-facing entry point
-    // (`alloc_frame` delegates here), so the charge happens exactly once
-    // per page handed out.
-    #[cfg(feature = "cgroup")]
-    if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
-        return Err(FrameAllocError::Exhausted);
-    }
+    // Memory-cgroup accounting: a user page is charged to the current task's
+    // cgroup before the allocation commits, and the charge is recorded on
+    // the frame so its final free uncharges the same cgroup. Kernel
+    // allocations (`alloc_frame`, the heap) are not charged.
+    let charge = charge_user_alloc(ctx, node, PAGE_SIZE)?;
     let mut r = with_installed(|a| a.alloc_frame_on(node));
     if r.is_err() {
         // The slab grows one size-class at a time and parks emptied frames in
@@ -1637,12 +1753,7 @@ fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame,
             r = with_installed(|a| a.alloc_frame_on(node));
         }
     }
-    #[cfg(feature = "cgroup")]
-    if r.is_err() {
-        // Allocation failed after charging — refund so accounting stays
-        // balanced with the actual page population.
-        crate::cgroup_charge::uncharge(PAGE_SIZE);
-    }
+    commit_user_charge(charge, &r, PAGE_SIZE);
     if r.is_err() {
         if ctx == AllocContext::Kernel {
             // A generic kernel allocation can be fallible (`try_reserve`, zram
@@ -1668,16 +1779,8 @@ fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame,
 /// that don't care about locality. Dispatches through the installed
 /// `FrameAlloc` impl.
 pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
-    #[cfg(feature = "cgroup")]
-    if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
-        return Err(FrameAllocError::Exhausted);
-    }
-    let r = with_installed(|a| a.alloc_frame_anywhere());
-    #[cfg(feature = "cgroup")]
-    if r.is_err() {
-        crate::cgroup_charge::uncharge(PAGE_SIZE);
-    }
-    r
+    // Kernel memory: not charged to any cgroup.
+    with_installed(|a| a.alloc_frame_anywhere())
 }
 
 /// Buddy-backed implementation of `alloc_frame_on`. The default
@@ -1753,14 +1856,11 @@ pub fn alloc_pages_on_ctx(
     if order > MAX_ORDER {
         return Err(FrameAllocError::Exhausted);
     }
-    // cgroup memory accounting: charge the whole `1 << order` block up
-    // front (enforced — deny if over `memory.max`), refund on failure.
-    #[cfg(feature = "cgroup")]
+    // Memory-cgroup accounting: a user block is charged whole before it is
+    // allocated and the charge is recorded on its head frame; a kernel block
+    // is not charged.
     let charge_bytes = PAGE_SIZE << order;
-    #[cfg(feature = "cgroup")]
-    if !crate::cgroup_charge::try_charge(charge_bytes) {
-        return Err(FrameAllocError::Exhausted);
-    }
+    let charge = charge_user_alloc(ctx, node, charge_bytes)?;
     let r = alloc_pages_on_inner(node, order, ctx.migrate_type());
     // Return empty slab frames to the buddy before trying anything more
     // expensive: the slab hoards emptied frames per size-class rather than
@@ -1783,10 +1883,7 @@ pub fn alloc_pages_on_ctx(
     // fall through to their caller's non-contiguous/failure path rather than
     // recursively entering migration while that metadata is locked.
     let r = retry_after_direct_compaction(r, node, order, ctx.migrate_type());
-    #[cfg(feature = "cgroup")]
-    if r.is_err() {
-        crate::cgroup_charge::uncharge(charge_bytes);
-    }
+    commit_user_charge(charge, &r, charge_bytes);
     r
 }
 
@@ -1931,12 +2028,7 @@ pub fn alloc_pages_below(order: u8, limit_phys: u64) -> Result<PhysFrame, FrameA
     if ceil == 0 {
         return Err(FrameAllocError::Exhausted);
     }
-    #[cfg(feature = "cgroup")]
-    let charge_bytes = PAGE_SIZE << order;
-    #[cfg(feature = "cgroup")]
-    if !crate::cgroup_charge::try_charge(charge_bytes) {
-        return Err(FrameAllocError::Exhausted);
-    }
+    // Kernel (DMA) memory: not charged to any cgroup.
     let preferred = current_cpu_node().min(MAX_NUMA_NODES - 1);
     let mt = AllocContext::Kernel.migrate_type();
     let try_alloc = |z: &mut BuddyZone| z.alloc_below_mt(order, ceil, mt);
@@ -1957,8 +2049,6 @@ pub fn alloc_pages_below(order: u8, limit_phys: u64) -> Result<PhysFrame, FrameA
             return Ok(buddy::frame_from_no(no));
         }
     }
-    #[cfg(feature = "cgroup")]
-    crate::cgroup_charge::uncharge(charge_bytes);
     Err(FrameAllocError::Exhausted)
 }
 
@@ -1979,10 +2069,12 @@ pub fn free_pages_ctx(frame: PhysFrame, order: u8, ctx: AllocContext) {
     if order > MAX_ORDER {
         return;
     }
-    // cgroup memory uncharge: mirror the `alloc_pages_on` charge.
-    #[cfg(feature = "cgroup")]
-    crate::cgroup_charge::uncharge(PAGE_SIZE << order);
     let phys = frame.start_address().raw();
+    if phys >= LOW_RESERVED_BYTES {
+        // Return whatever memory-cgroup charge the block's allocation
+        // recorded (none for kernel memory) to the cgroup it was charged to.
+        uncharge_freed_block(frame.start_address(), PAGE_SIZE << order);
+    }
     if phys < LOW_RESERVED_BYTES {
         // Refusing the free is safer than corrupting the buddy by
         // pushing a frame that was never legitimately donated.
@@ -2069,6 +2161,11 @@ pub fn free_movable_range(base: PhysAddr, count: u64) {
     }
     let node = node_for_phys(base.raw());
     let first_frame = base.raw() >> 12;
+    // A frame leaving here must not keep a memory-cgroup record: the next
+    // owner would otherwise uncharge a cgroup it was never charged to.
+    for i in 0..count {
+        uncharge_freed_block(PhysAddr::new(base.raw() + i * PAGE_SIZE), PAGE_SIZE);
+    }
     let mut zone = ZONES[node].0.lock();
     for i in 0..count {
         zone.free_mt(first_frame + i, 0, buddy::MigrateType::Movable);
@@ -2250,14 +2347,15 @@ fn buddy_prepare_unreferenced_frame(phys: PhysAddr) {
             );
         }
     }
-    // cgroup memory uncharge: only here, where the frame is genuinely
+    // Memory-cgroup uncharge: only here, where the frame is genuinely
     // returned to the buddy — i.e. the COW refcount has reached 0 — does
-    // it balance the single charge taken at `alloc_frame_on`. The
+    // it balance the single charge taken when the page was allocated. The
     // intermediate `dec_ref > 0` frees above (fork-shared pages) take no
     // uncharge, matching the fact that `clone_for_fork` `inc_ref`s
-    // rather than re-allocating (no second charge was ever taken).
-    #[cfg(feature = "cgroup")]
-    crate::cgroup_charge::uncharge(PAGE_SIZE);
+    // rather than re-allocating (no second charge was ever taken). The
+    // charge goes back to the cgroup recorded on the frame, whichever task
+    // is running now; a kernel frame recorded none.
+    uncharge_freed_block(phys, PAGE_SIZE);
     // Optional scrub of the frame's contents on its way back to the
     // buddy. The frame's COW refcount just hit 0 and it is NOT yet on
     // any free list, so we hold exclusive access — no lock needed and
@@ -2923,6 +3021,111 @@ pub mod cow {
     static FLAT_FRAMES: AtomicUsize = AtomicUsize::new(0);
     static FLAT_EPOCH: AtomicU32 = AtomicU32::new(0);
 
+    // ── Charged memory cgroup per frame (Linux `folio->memcg_data`) ────────
+    //
+    // One `MemcgId` word per boot-managed frame, beside the flat COW table and
+    // published with it: the memory cgroup a user page was charged to, so its
+    // final free uncharges that cgroup rather than whoever is running then.
+    // 0 = not charged (kernel memory, or no memory cgroup). Frames outside
+    // the flat range (hot-plugged RAM) use the sharded `SPILL_MEMCG` maps.
+    // A word is written when its frame is charged, right after allocation and
+    // before the frame is published to anyone else, and cleared by the single
+    // final free; both are plain atomic swaps.
+    #[cfg(feature = "cgroup")]
+    static MEMCG_WORDS: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
+    #[cfg(feature = "cgroup")]
+    static MEMCG_FRAMES: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "cgroup")]
+    type MemcgMap = alloc::collections::BTreeMap<u64, u32>;
+    #[cfg(feature = "cgroup")]
+    static SPILL_MEMCG: [IrqSafeSpinLock<Option<MemcgMap>>; REFCOUNT_SHARDS] =
+        [const { IrqSafeSpinLock::new(None) }; REFCOUNT_SHARDS];
+
+    #[cfg(feature = "cgroup")]
+    fn memcg_word(key: u64) -> Option<&'static AtomicU32> {
+        let ptr = MEMCG_WORDS.load(Ordering::Acquire);
+        let index = (key >> super::PAGE_SHIFT) as usize;
+        if ptr.is_null() || index >= MEMCG_FRAMES.load(Ordering::Relaxed) {
+            return None;
+        }
+        // SAFETY: the published array is permanent and holds `MEMCG_FRAMES`
+        // initialized words; `index` is bounds-checked above.
+        Some(unsafe { &*ptr.add(index) })
+    }
+
+    /// Record that `phys` (the head of a charged block) was charged to memory
+    /// cgroup `id`. The frame must be freshly allocated and not yet visible to
+    /// any other owner.
+    #[cfg(feature = "cgroup")]
+    pub(crate) fn set_frame_memcg(phys: PhysAddr, id: u32) {
+        if id == 0 {
+            return;
+        }
+        if let Some(word) = memcg_word(phys.raw()) {
+            word.store(id, Ordering::Release);
+            return;
+        }
+        SPILL_MEMCG[ref_shard(phys.raw())]
+            .lock()
+            .get_or_insert_with(MemcgMap::new)
+            .insert(phys.raw(), id);
+    }
+
+    /// Take (and clear) the memory cgroup `phys` was charged to; 0 if none.
+    /// Allocation-free.
+    #[cfg(feature = "cgroup")]
+    pub(crate) fn take_frame_memcg(phys: PhysAddr) -> u32 {
+        if let Some(word) = memcg_word(phys.raw()) {
+            return word.swap(0, Ordering::AcqRel);
+        }
+        SPILL_MEMCG[ref_shard(phys.raw())]
+            .lock()
+            .as_mut()
+            .and_then(|map| map.remove(&phys.raw()))
+            .unwrap_or(0)
+    }
+
+    /// The memory cgroup `phys` is charged to, without changing it; 0 if none.
+    #[cfg(feature = "cgroup")]
+    pub fn frame_memcg(phys: PhysAddr) -> u32 {
+        if let Some(word) = memcg_word(phys.raw()) {
+            return word.load(Ordering::Acquire);
+        }
+        SPILL_MEMCG[ref_shard(phys.raw())]
+            .lock()
+            .as_ref()
+            .and_then(|map| map.get(&phys.raw()).copied())
+            .unwrap_or(0)
+    }
+
+    /// Move a charge from `old` to `new` (page migration: Linux
+    /// `mem_cgroup_migrate`). The new frame inherits the old one's cgroup and
+    /// the old frame's final free then uncharges nothing.
+    #[cfg(feature = "cgroup")]
+    pub(crate) fn transfer_frame_memcg(old: PhysAddr, new: PhysAddr) {
+        let id = take_frame_memcg(old);
+        set_frame_memcg(new, id);
+    }
+
+    /// Allocate the per-frame memcg words for `frames` boot frames. Same
+    /// timing contract as [`init_flat_table`]: before any user page exists.
+    #[cfg(feature = "cgroup")]
+    fn init_memcg_words(frames: usize) {
+        if !MEMCG_WORDS.load(Ordering::Acquire).is_null() {
+            return;
+        }
+        let bytes = frames * core::mem::size_of::<AtomicU32>();
+        let Some(ptr) = crate::vmalloc::valloc(bytes) else {
+            return;
+        };
+        // SAFETY: `valloc` returned `bytes` of exclusively owned, mapped
+        // kernel memory; zero it before publication (all-zero is a valid
+        // `AtomicU32`).
+        unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, bytes) };
+        MEMCG_FRAMES.store(frames, Ordering::Relaxed);
+        MEMCG_WORDS.store(ptr.as_ptr() as *mut AtomicU32, Ordering::Release);
+    }
+
     const FLAT_COUNT_MASK: u64 = 0xFFFF_FFFF;
 
     type PinMap = alloc::collections::BTreeMap<u64, u32>;
@@ -3150,6 +3353,8 @@ pub mod cow {
                 }
             }
         }
+        #[cfg(feature = "cgroup")]
+        init_memcg_words(frames);
         FLAT_FRAMES.store(frames, Ordering::Relaxed);
         FLAT.store(base, Ordering::Release);
     }

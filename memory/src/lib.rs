@@ -117,6 +117,7 @@ pub use domain_state::{restore_domain_state, save_domain_state, DomainSavedState
 #[cfg(feature = "cgroup")]
 pub use cgroup_charge::{
     __charge_pid_for_test, install_cgroup_charge_hook, install_cgroup_pid_provider,
+    install_page_charge_hooks, memcg_oom_requests, MemcgId,
 };
 
 /// Per-arch offset that maps a physical RAM address to its

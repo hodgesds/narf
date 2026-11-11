@@ -1659,6 +1659,12 @@ impl FilePage {
         // must wait for reclaim (`VM_FAULT_OOM`), not die of SIGBUS as it
         // would for a full mount.
         let frame = narf_memory::frame::alloc_frame().map_err(|_| FsError::OutOfMemory)?;
+        // A tmpfs/shmem page is user memory, charged to the memory cgroup of
+        // the task that creates it (Linux `shmem_alloc_and_add_folio`).
+        if narf_memory::frame::charge_frame_to_current(frame, 0).is_err() {
+            narf_memory::frame::free_frame(frame);
+            return Err(FsError::OutOfMemory);
+        }
         let page = Self {
             frame,
             mapped: false,

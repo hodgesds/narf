@@ -13921,6 +13921,10 @@ impl AddressSpace {
         let new_frame = crate::frame::alloc_user_frame_on_strict(target_node)
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         let new_phys = new_frame.start_address();
+        // The destination takes over the source's memory-cgroup charge
+        // (Linux `mem_cgroup_migrate`); the source's final free then
+        // uncharges nothing, and a failed move frees the destination with it.
+        crate::frame::transfer_frame_memcg(old_phys, new_phys);
         let perms = region.perms;
         // Invalidate-everywhere → copy → install, via the shared relocation
         // core (see `relocate_leaf` for why the order is load-bearing).
@@ -14195,6 +14199,10 @@ impl AddressSpace {
                 (Some(frame), phys)
             }
         };
+        // The destination takes over the source's memory-cgroup charge
+        // (Linux `mem_cgroup_migrate`); the source's final free then
+        // uncharges nothing, and a failed move frees the destination with it.
+        crate::frame::transfer_frame_memcg(old_phys, new_phys);
         // SAFETY: live root; page_va maps old_phys; new_phys is a live frame.
         if unsafe { self.relocate_leaf(page_va, perms, old_phys, new_phys) }.is_err() {
             // Free only a frame WE allocated; a caller-provided `dst` is left for
