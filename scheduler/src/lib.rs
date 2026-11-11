@@ -7854,7 +7854,14 @@ impl StagedWatch {
 /// evaluated, so the gate stays a leaf held for pointer work alone. Whatever
 /// happened to a node in between, the parked set is the authority — a node
 /// whose task has left, gone back to sleep or been claimed selects nothing.
-/// Every lock on the victim is `try_lock` except that leaf.
+///
+/// An idle CPU never waits on a victim: the wake inbox, the gate (to pin) and
+/// the parked set are all only tried, and a contended one ends the attempt.
+/// The single exception comes after the decision. Once the thief has taken a
+/// parked slot it must unlink that task's node before the task runs anywhere,
+/// and for that it waits for the gate — a leaf whose holders link, unlink or
+/// pin and release without taking another lock or calling out — holding no
+/// other lock of the victim while it does.
 ///
 /// The wake-inbox case has to judge slots in place, so the eligibility checks
 /// (budget view, steal strategy) run under the inbox lock, as the ready-queue
@@ -7948,7 +7955,12 @@ fn try_steal_staged(
     let start = staged_window_start(&watch.parked_skip, woken, STAGED_PARKED_REACH);
     {
         let inbox = &PARKED_WAKE_INBOX[victim];
-        let _gate = inbox.gate.lock();
+        // Like every other lock on the victim, the gate is only tried: a
+        // waker or another thief is at this inbox right now, and an idle CPU
+        // never spins on a victim.
+        let Some(_gate) = inbox.gate.try_lock() else {
+            return false;
+        };
         let mut node = inbox.head.load(Ordering::Relaxed).cast_const();
         // Walk to the window. `woken` was read before the gate, so the list
         // may have become shorter; then the window is empty and the cursor
@@ -7986,9 +7998,20 @@ fn try_steal_staged(
             }
             let id = entry.slot.id;
             let slot = slots.take(index, id)?.slot;
-            unlink_parked_wake(victim, cell);
-            Some(slot)
+            Some((slot, *node))
         })
+    });
+    // The slot is the thief's now and its parked token is clear, so nothing
+    // can link the node again; take it off the victim's list before the task
+    // goes anywhere. This is the one acquisition on the victim that waits. By
+    // now it cannot be skipped — the task must not run with its node left
+    // behind — and what it waits for is a leaf: whoever holds the gate links
+    // or unlinks a node, or pins a window, and lets go without taking another
+    // lock or calling out. `PARKED[victim]` is no longer held while it waits.
+    let taken = taken.map(|(slot, node)| {
+        // SAFETY: still pinned; the pins are dropped just below.
+        unlink_parked_wake(victim, unsafe { &*node });
+        slot
     });
     // Outside every lock: a pin can be the last reference to a cell whose
     // task exited after the gate was released.
