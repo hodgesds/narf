@@ -156,3 +156,85 @@ kernel_test_in!(
     "drivers/wireless/mt7921/power",
     mt7922_power_save_follows_set_power_save_on_the_associated_bss
 );
+
+fn domain_2g(country: &[u8; 2], power: i8) -> narf_wireless::reg::RegulatoryDomain {
+    narf_wireless::reg::RegulatoryDomain {
+        country_code: *country,
+        rules: vec![narf_wireless::reg::RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: power,
+            flags: narf_wireless::reg::RegFlags::empty(),
+        }],
+    }
+}
+
+/// cfg80211's `reg_notifier` reaching an associated MT7922 station: a new
+/// country with a lower 2.4 GHz ceiling re-admits the same BSS, programs
+/// the channel domain and power limits again and keeps the link; the same
+/// rules reinstalled are no change; a policy without the operating
+/// channel ends the link.
+fn mt7922_regulatory_change_reprograms_or_leaves_the_channel() -> TestResult {
+    let policy = Arc::new(CurrentPolicy {
+        database: narf_wireless::reg::db::Database::new(),
+        hold_bss_ack: core::sync::atomic::AtomicBool::new(false),
+    });
+    policy.database.install(domain_2g(b"US", 17));
+    let (mut session, bss) = super::pmf_tests::prepared(super::pmf_tests::pmf_ap());
+    session.backend.tx_policy = Some(policy.clone());
+    let joined = run(Box::pin(session.associate_station(
+        &bss,
+        b"narf",
+        crate::mt7921::association::Security::Wpa2PskPmf {
+            psk: [0x55; 32],
+            required: false,
+        },
+        test_permission(),
+        &[],
+    )));
+    if joined != Ok(42) || session.keys_pending() {
+        return TestResult::Fail("association, or control work before a policy change");
+    }
+    // Identical rules reinstalled: no change.
+    policy.database.install(domain_2g(b"US", 17));
+    if session.keys_pending() {
+        return TestResult::Fail("reinstalled identical policy scheduled a refresh");
+    }
+    let sku = |session: &Session<Model>, from: usize| {
+        session.backend.frames[from..]
+            .iter()
+            .filter(|(_, f)| f.get(36) == Some(&0x5d))
+            .count()
+    };
+    policy.database.install(domain_2g(b"DE", 14));
+    if !session.keys_pending() {
+        return TestResult::Fail("policy change not scheduled");
+    }
+    let before = session.backend.frames.len();
+    if run(Box::pin(session.service_keys())).is_err()
+        || sku(&session, before) != 1
+        || !matches!(session.state, State::Associated { .. })
+        || session
+            .station
+            .permission
+            .is_none_or(|p| p.power_dbm != 14 || p.country != *b"DE")
+        || session.keys_pending()
+    {
+        return TestResult::Fail("new country not re-programmed with the link kept");
+    }
+    // A policy without 2.4 GHz: the operating channel is no longer allowed.
+    let mut five = domain_2g(b"JP", 20);
+    five.rules[0].freq_start_mhz = 5170;
+    five.rules[0].freq_end_mhz = 5330;
+    policy.database.install(five);
+    let _ = run(Box::pin(session.service_keys()));
+    if matches!(session.state, State::Associated { .. }) && session.station.permission.is_some() {
+        return TestResult::Fail("station kept a channel the new policy forbids");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/regulatory",
+    mt7922_regulatory_change_reprograms_or_leaves_the_channel
+);

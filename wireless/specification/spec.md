@@ -2646,6 +2646,26 @@ fixtures use explicit injected material and do not depend on target entropy.
 
 ### 3.5 Authenticated regulatory policy
 
+**Hints, initiators and REG_CHANGE.** A Linux-database country records its
+initiator (`reg::db::Hint`): Core (boot/world), User (`REQ_SET_REG`), or
+CountryIe { previous }.
+
+- `db::hint_country_ie(alpha2)` is cfg80211 `regulatory_hint_country_ie`.
+  nl80211 calls it after a successful CONNECT with the connected BSS's
+  Country element (7). It selects that country's Linux-database rules. It
+  does nothing for a user-chosen country, a signed deployment or caller
+  policy, the world/custom markers, or a malformed alpha2.
+- `db::restore_after_disconnect()` is `regulatory_hint_disconnect`. A
+  country taken from an AP reverts to the one it replaced. nl80211 calls it
+  for DISCONNECT and for every driver-reported disconnect.
+- Each change is `NL80211_CMD_REG_CHANGE` on the "regulatory" group, with
+  `REG_ALPHA2`, `REG_INITIATOR` (CORE 0, USER 1, COUNTRY_IE 3) and
+  `REG_TYPE`.
+- `db::revision()` moves with every installation. Drivers compare the
+  domain by value (`RegulatoryDomain: PartialEq`) to re-program firmware
+  (cfg80211's `reg_notifier`).
+- Test: `wireless/regulatory`.
+
 `reg::parse_policy` decodes an NRGD v1 policy; parsing alone conveys no
 authority. `reg::policy::load()` opens the exact `wireless-regulatory.bin`
 through trusted firmware-registry authority, invokes the blob's current
