@@ -285,12 +285,24 @@ kernel_test_in!(
 /// shape row and a REGD element {alpha2, rule_2g, rule_5g, rule_6g, fmap}.
 fn six_set(regd: bool) -> Vec<Element> {
     let mut set = base(0, 10);
-    set.push(elm(
+    // The band-2 by-rate row joins the base BYRATE element: `select`
+    // keeps one element per ID (a second default-RFE element would
+    // replace the 2.4/5GHz rows, as the fw.c element loader does).
+    set[0] = elm(
         ID_BYRATE,
         0,
         9,
-        &[&byr(2, 0, RS_OFDM, 0, &[16, 18, 20, 22])],
-    ));
+        &[
+            &byr(0, 0, RS_CCK, 0, &[10, 2, 4, 6]),
+            &byr(1, 0, RS_CCK, 0, &[99, 99, 99, 99]),
+            &byr(0, 0, RS_OFDM, 4, &[-3, 8, 10, 12]),
+            &byr(1, 0, RS_OFDM, 0, &[20, 22, 24, 26]),
+            &byr(1, 1, RS_MCS, 8, &[30, 32, 34, 36]),
+            &byr(1, 1, RS_HEDCM, 0, &[40, 42]),
+            &byr(1, 0, RS_OFFSET, 0, &[-2, 2, 4, 6]),
+            &byr(2, 0, RS_OFDM, 0, &[16, 18, 20, 22]),
+        ],
+    );
     set.push(elm(
         ID_LMT_6GHZ,
         0,

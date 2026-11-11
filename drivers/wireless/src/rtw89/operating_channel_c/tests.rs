@@ -239,7 +239,9 @@ fn smoke_rtw89_c_operating_channel_320mhz_matches_linux() -> TestResult {
         (37, 31, 6105, 0x82, 9, 2),
         (61, 31, 6105, 0x8e, 15, 2),
         (65, 95, 6425, 0x90, 0, 3),
-        (95, 95, 6425, 0x9f, 7, 3),
+        // 6GHz primaries are 1 + 4k: 95 is the 320MHz center, not a
+        // primary; 93 is subchannel 7 of the 65..125 block.
+        (93, 95, 6425, 0x9e, 7, 3),
         (125, 95, 6425, 0xae, 15, 3),
         (129, 159, 6745, 0xb0, 0, 3),
         (189, 159, 6745, 0xce, 15, 3),

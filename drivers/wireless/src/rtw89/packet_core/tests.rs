@@ -164,6 +164,16 @@ impl Model {
                 .unwrap(),
         )
     }
+    /// Fixture-side 16-bit register view (no access window: the
+    /// guarded `power::Io` path refuses reads outside a programmed
+    /// window, which a post-program check is).
+    pub(in crate::rtw89) fn half(&self, address: u32) -> u16 {
+        u16::from_le_bytes(
+            self.registers[address as usize..address as usize + 2]
+                .try_into()
+                .unwrap(),
+        )
+    }
     fn put(&mut self, address: u32, value: u32) {
         self.registers[address as usize..address as usize + 4]
             .copy_from_slice(&value.to_le_bytes());
@@ -1056,15 +1066,20 @@ fn smoke_rtw89_c_packet_he_only_aggregates_with_zero_density() -> TestResult {
         num: 63,
         density: 0,
     };
-    if core
-        .submit_agg(
-            &mut model,
-            &qos_frame(1),
-            false,
-            format::FIRMWARE_RA,
-            Some(agg),
-        )
-        .is_err()
+    // The fixture `Model` decodes only the AX v0 TXWD (64-byte header,
+    // `doorbell`), so the C v1 descriptor is checked at the encoder that
+    // `submit_agg` uses for RTL8852C.
+    if format::transmit_c(
+        &qos_frame(1),
+        OWN,
+        0,
+        0,
+        0x1000,
+        false,
+        format::FIRMWARE_RA,
+        Some(agg),
+    )
+    .is_err()
     {
         return TestResult::Fail("HE-only aggregated frame with density 0 refused");
     }
@@ -1155,10 +1170,7 @@ fn smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs() -> TestR
         (0x1240, 0x1028, 0x1120),
         (0x1248, 0x102a, 0x1128),
     ] {
-        if model.word(desa) == 0
-            || power::Io::read16(&mut model, num).unwrap() != format::DEPTH
-            || model.word(base) != 0
-        {
+        if model.word(desa) == 0 || model.half(num) != format::DEPTH || model.word(base) != 0 {
             return TestResult::Fail("C ACH1..3 bases did not follow the V1 address set");
         }
     }
@@ -1171,7 +1183,7 @@ fn smoke_rtw8852c_packet_rings_use_v1_desa_and_refuse_b_only_programs() -> TestR
     }
     // rtw89_pci_ch_dma_addr_set_v1: ACH0 0x1230/0x1234, CH8 0x1270/0x1274
     // with the shared NUM registers; the baseline DESA stays untouched.
-    let half = |model: &mut Model, a: u32| power::Io::read16(model, a).unwrap();
+    let half = |model: &mut Model, a: u32| model.half(a);
     if model.word(0x1230) == 0
         || model.word(0x1270) == 0
         || half(&mut model, 0x1024) != format::DEPTH
@@ -1257,7 +1269,7 @@ fn smoke_rtw8852a_packet_rings_use_ax_desa() -> TestResult {
     }
     // rtw89_pci_ch_dma_addr_set: ACH0 0x1110/0x1114, CH8 0x1150/0x1154
     // with the shared NUM registers; the V1 DESA stays untouched.
-    let half = |model: &mut Model, a: u32| power::Io::read16(model, a).unwrap();
+    let half = |model: &mut Model, a: u32| model.half(a);
     if model.word(0x1110) == 0
         || model.word(0x1150) == 0
         || half(&mut model, 0x1024) != format::DEPTH
@@ -1353,6 +1365,9 @@ fn smoke_rtw89_a_packet_station_amsdu_aggregate_ap() -> TestResult {
     // DESA stays untouched), one unicast data frame, retired once.
     let mut model = Model::new();
     model.chip = ChipId::Rtl8852A;
+    // The fixture's idle DMA_STOP1 covers ACH0..3/CH8 only; the AP role's
+    // HIQ ring (CH9, `B_AX_STOP_CH9`) must also start stopped.
+    model.put(0x1010, model.word(0x1010) | 1 << 17);
     let Ok(mut ap) = Core::prepare_ap(&mut model, OWN, false, RxPhy::Legacy) else {
         return TestResult::Fail("A AP rings refused");
     };

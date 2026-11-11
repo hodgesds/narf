@@ -429,8 +429,11 @@ fn smoke_rtw89_owned_firmware_and_fallback() -> TestResult {
         responses: vec![Ok(image(0, 1, 0))],
         names: Vec::new(),
     };
-    if prepared::load(&mut files, ChipId::Rtl8922A, 0).is_ok() || !files.names.is_empty() {
-        return TestResult::Fail("BE admitted through AX loader");
+    // RTL8922A shares the multi-firmware loader (`prepared::filenames`
+    // lists `rtw8922a_fw-*.bin`); BE-only geometry (v1 header, W7 part
+    // size) is enforced by `DownloadPlan::new`, not here.
+    if prepared::load(&mut files, ChipId::Rtl8922A, 0).is_err() || files.names.len() != 1 {
+        return TestResult::Fail("BE image not loaded through the shared loader");
     }
     TestResult::Pass
 }

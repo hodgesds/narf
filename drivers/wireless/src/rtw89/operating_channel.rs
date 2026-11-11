@@ -704,7 +704,8 @@ mod tests {
             (40, Width::Mhz80, false, 42, 2, 2, 10, TSSI_EXTRA | 5),
             (44, Width::Mhz80, false, 42, 1, 1, 9, TSSI_EXTRA | 5),
             (48, Width::Mhz80, false, 42, 3, 3, 9, TSSI_EXTRA | 5),
-            (144, Width::Mhz80, false, 138, 3, 3, 9, 13),
+            // Center 138 is a `_tssi_get_ofdm_group` extra (137..=139).
+            (144, Width::Mhz80, false, 138, 3, 3, 9, TSSI_EXTRA | 13),
             (177, Width::Mhz80, false, 171, 3, 3, 9, TSSI_EXTRA | 17),
         ];
         for (primary, width, above, center, pri, txsc20, txsc40, ofdm) in ROWS {
