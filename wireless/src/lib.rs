@@ -13,6 +13,7 @@ pub mod ap_control;
 pub mod association;
 pub mod caps;
 pub mod ccmp;
+pub mod cqm;
 pub mod eapol;
 pub mod iface;
 pub mod mfp;

@@ -1006,9 +1006,10 @@ impl<B: Backend> Session<B> {
             // contributes its signal; data frames also their rate.
             if native.frame.get(10..16) == Some(&peer[..]) {
                 let data = native.frame.first().is_some_and(|fc| fc & 0x0c == 0x08);
+                let beacon = native.frame.first() == Some(&0x80);
                 self.station
                     .link_stats
-                    .observe(native.rcpi, native.phy, data);
+                    .observe(native.rcpi, native.phy, data, beacon);
             }
             // PMF management admission before any MLME/BA consumer: mac80211
             // `ieee80211_drop_unencrypted_mgmt` plus the CCMP (hardware) and

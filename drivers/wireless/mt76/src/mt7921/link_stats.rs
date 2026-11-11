@@ -41,12 +41,16 @@ pub(crate) struct LinkStats {
     avg: Ewma,
     /// `NL80211_STA_INFO_RX_BITRATE`: the last data frame's rate.
     pub rx_rate: Option<RateInfo>,
+    /// Beacons from the AP with a signal sample, and the last one's signal:
+    /// the input of mac80211's software CQM (`ieee80211_rx_bss_info`).
+    pub beacons: u32,
+    pub beacon_signal_dbm: Option<i8>,
 }
 
 impl LinkStats {
     /// One received frame from the AP: its RCPI word (group 3 or group 5)
     /// and, for a data frame, its P-RXV DW0.
-    pub fn observe(&mut self, rcpi: Option<u32>, rxv: Option<u32>, data: bool) {
+    pub fn observe(&mut self, rcpi: Option<u32>, rxv: Option<u32>, data: bool, beacon: bool) {
         if let Some(rcpi) = rcpi {
             let mut chains = [None; 2];
             for (chain, slot) in chains.iter_mut().enumerate() {
@@ -61,6 +65,10 @@ impl LinkStats {
                 self.chain_signal_dbm = chains;
                 self.signal_dbm = Some(strongest);
                 self.avg.add(u64::from(strongest.unsigned_abs()));
+                if beacon {
+                    self.beacons = self.beacons.wrapping_add(1);
+                    self.beacon_signal_dbm = Some(strongest);
+                }
             }
         }
         if data {

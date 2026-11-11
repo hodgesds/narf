@@ -70,7 +70,7 @@ fn mt7922_link_signal_and_average_follow_rcpi() -> TestResult {
         return TestResult::Fail("signal without a frame");
     }
     // RCPI 120 = -50 dBm on chain 0, 110 = -55 dBm on chain 1.
-    stats.observe(Some(120 | 110 << 8), Some(prxv(4, 9, 1, 2, 1)), false);
+    stats.observe(Some(120 | 110 << 8), Some(prxv(4, 9, 1, 2, 1)), false, true);
     if stats.signal_dbm != Some(-50)
         || stats.chain_signal_dbm != [Some(-50), Some(-55)]
         || stats.signal_avg_dbm() != Some(-50)
@@ -81,19 +81,21 @@ fn mt7922_link_signal_and_average_follow_rcpi() -> TestResult {
     // Eight -70 dBm frames pull the average most of the way, as
     // DECLARE_EWMA(signal, 10, 8) does.
     for _ in 0..8 {
-        stats.observe(Some(80), Some(prxv(4, 9, 1, 2, 1)), true);
+        stats.observe(Some(80), Some(prxv(4, 9, 1, 2, 1)), true, false);
     }
     let avg = stats.signal_avg_dbm().unwrap_or(0);
     if stats.signal_dbm != Some(-70)
         || stats.chain_signal_dbm != [Some(-70), None]
         || !(-66..=-62).contains(&avg)
         || stats.rx_rate.map(|r| r.bitrate_100kbps) != Some(8667)
+        || stats.beacons != 1
+        || stats.beacon_signal_dbm != Some(-50)
     {
         return TestResult::Fail("EWMA signal average or data rate");
     }
     // No valid chain: nothing changes.
     let before = stats;
-    stats.observe(Some(230 << 8), None, true);
+    stats.observe(Some(230 << 8), None, true, true);
     if stats != before {
         return TestResult::Fail("invalid RCPI changed the statistics");
     }

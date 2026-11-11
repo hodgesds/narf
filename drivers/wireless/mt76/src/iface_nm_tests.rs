@@ -693,3 +693,64 @@ kernel_test_in!(
     "drivers/wireless/mt7921/networkmanager",
     mt7922_admits_wpa_supplicant_wpa2_pmf_association_elements
 );
+
+/// wpa_supplicant's bgscan / NetworkManager's roaming threshold on an
+/// MT7922: the wiphy takes NL80211_CMD_SET_CQM (one threshold and a list),
+/// and the AP's Beacon signal from the receive path drives mac80211's
+/// software monitor to one LOW crossing, after four Beacons, at the
+/// averaged level. A new association restarts the average.
+fn mt7922_cqm_rssi_from_the_aps_beacons() -> TestResult {
+    let Ok(iface) = Mt76Iface::new(String::from("wlan-cqm"), mt7922()) else {
+        return TestResult::Fail("radio identity");
+    };
+    let config = narf_wireless::CqmRssiConfig {
+        thresholds_dbm: alloc::vec![-70],
+        hysteresis_db: 4,
+    };
+    if !iface.supports_cqm_rssi()
+        || !iface.supports_cqm_rssi_list()
+        || iface.set_cqm_rssi(Some(config)).is_err()
+    {
+        return TestResult::Fail("MT7922 does not take NL80211_CMD_SET_CQM");
+    }
+    let mut link = crate::mt7921::link_stats::LinkStats::default();
+    let mut events = Vec::new();
+    // Beacons at -80 dBm (RCPI 60), one per packet step.
+    for _ in 0..6 {
+        link.observe(Some(60), None, false, true);
+        events.extend(iface.cqm.lock().beacons(&link));
+    }
+    if events != [(false, -80)] {
+        return TestResult::Fail("not one LOW crossing at the averaged Beacon signal");
+    }
+    // Data frames are not Beacons; a step without new Beacons feeds nothing.
+    link.observe(Some(200), None, true, false);
+    if !iface.cqm.lock().beacons(&link).is_empty() {
+        return TestResult::Fail("a data frame fed the Beacon monitor");
+    }
+    // Several Beacons in one step are all counted.
+    iface.cqm.lock().restart();
+    let mut burst = crate::mt7921::link_stats::LinkStats::default();
+    for _ in 0..4 {
+        burst.observe(Some(60), None, false, true);
+    }
+    if iface.cqm.lock().beacons(&burst) != [(false, -80)] {
+        return TestResult::Fail("Beacons within one step not all counted");
+    }
+    if iface.set_cqm_rssi(None).is_err() {
+        return TestResult::Fail("disabling CQM");
+    }
+    iface.cqm.lock().restart();
+    let mut quiet = crate::mt7921::link_stats::LinkStats::default();
+    for _ in 0..6 {
+        quiet.observe(Some(60), None, false, true);
+    }
+    if !iface.cqm.lock().beacons(&quiet).is_empty() {
+        return TestResult::Fail("CQM event after it was disabled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/networkmanager",
+    mt7922_cqm_rssi_from_the_aps_beacons
+);
