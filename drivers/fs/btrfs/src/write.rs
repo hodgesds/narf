@@ -8075,8 +8075,37 @@ pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
         if btree::find_item(vol, root, &orphan).await?.is_none() {
             return Err(FsError::InvalidData);
         }
-        let inode = vol.load_inode_in(root, ino).await?;
-        if inode.nlink != 0 || inode.is_dir() {
+        let inode = match vol.load_inode_in(root, ino).await {
+            Ok(inode) if inode.nlink == 0 => inode,
+            // An orphan item for an inode that still has links, or for one
+            // that no longer exists, marks no inode to reclaim. Linux
+            // `btrfs_orphan_cleanup` (`if (!inode || inode->vfs_inode.i_nlink)`)
+            // says what it can be: the guard of an fs-verity enable that
+            // never finished, whose half-written items it drops
+            // (`btrfs_drop_verity_items`); the item kernels before v4.18
+            // left behind a truncate; or one that should have been deleted
+            // and was not. It then deletes the item, and so does this, in
+            // that order; refusing the item failed every writable mount of
+            // the filesystem.
+            found @ (Ok(_) | Err(FsError::NotFound)) => {
+                use core::fmt::Write as _;
+                let state = match found {
+                    Ok(inode) => {
+                        let dropped = drop_verity_items(vol, ino).await?;
+                        alloc::format!("{} links, {dropped} fs-verity items dropped", inode.nlink)
+                    }
+                    Err(_) => alloc::string::String::from("no such inode"),
+                };
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "btrfs: deleting the stale orphan item of inode {ino} ({state})"
+                );
+                commit_fs_edits_reclaiming(vol, &[Edit::Delete(orphan)], Vec::new()).await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if inode.is_dir() {
             return Err(FsError::InvalidData);
         }
         // The inode's own items, and the first extents: one step's worth.
@@ -8149,6 +8178,57 @@ pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
         vol.bump_cache_generation(vol.fs_tree_id(), ino);
         return Ok(());
     }
+}
+
+/// Remove the fs-verity items of `ino` — its descriptor and Merkle tree
+/// items — and return how many there were (Linux `btrfs_drop_verity_items`).
+/// Linux writes them between adding an orphan item to the inode and deleting
+/// it again, so an enable that never finished leaves them behind an orphan
+/// item on an inode that has links; nothing else in this driver reads or
+/// writes them. A bounded number go per operation, and the orphan item stays
+/// until the caller deletes it, so a crash in between is taken up again by
+/// the next recovery.
+async fn drop_verity_items<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+) -> Result<usize, FsError> {
+    let mut dropped = 0usize;
+    loop {
+        let (root, _) = vol.fs_tree_root();
+        let mut edits: Vec<Edit> = Vec::new();
+        {
+            let first = BtrfsKey::new(ino, format::VERITY_DESC_ITEM_KEY, 0);
+            let mut cursor = btree::Cursor::seek(vol, root, &first).await?;
+            while let Some((key, _)) = cursor.current()? {
+                if key.objectid != ino
+                    || !matches!(
+                        key.item_type,
+                        format::VERITY_DESC_ITEM_KEY | format::VERITY_MERKLE_ITEM_KEY
+                    )
+                    || edits.len() == DEALLOC_STEP_EXTENTS
+                {
+                    break;
+                }
+                edits.push(Edit::Delete(key));
+                cursor.advance().await?;
+            }
+        }
+        if edits.is_empty() {
+            return Ok(dropped);
+        }
+        dropped += edits.len();
+        commit_fs_edits_reclaiming(vol, &edits, Vec::new()).await?;
+    }
+}
+
+/// Test-only: stage `edits` to the mounted subvolume's tree as one
+/// operation, to build on-disk states no operation of this driver leaves.
+#[cfg(feature = "kernel-test")]
+pub(crate) async fn __test_stage_fs_edits<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    edits: &[Edit],
+) -> Result<(), FsError> {
+    commit_fs_edits(vol, edits, Vec::new(), Vec::new()).await
 }
 
 /// On-disk teardown prepared for an existing rename destination.

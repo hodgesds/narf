@@ -324,6 +324,20 @@ commits every step on its own, for the crash tests of the `release`
 scenario. Hole punching and `fallocate` still stage their whole range as
 one operation.
 
+An `ORPHAN_ITEM` whose inode still has links, or no longer exists, marks
+no inode to reclaim. Recovery does with it what Linux `btrfs_orphan_cleanup`
+does (`if (!inode || inode->vfs_inode.i_nlink)`): for an inode that has
+links it first drops the inode's fs-verity items — Linux guards an fs-verity
+enable with an orphan item, and one that never finished leaves a partial
+descriptor and Merkle tree behind it (`btrfs_drop_verity_items`) — a bounded
+number per operation, and then it deletes the orphan item. Kernels before
+v4.18 left one behind every truncate. Answering it with an error failed
+every writable mount of the subvolume
+(`smoke_btrfs_stale_orphan_item_is_deleted`). fs-verity itself is not
+implemented: a filesystem with the `VERITY` compat-ro bit is not mounted
+read-write, and an unlinked inode that has fs-verity items is not reclaimed
+(`Unsupported`).
+
 `fsync` and `fdatasync`, on a file or a directory, both commit the open
 transaction and write its superblock (`sync_to_disk_exclusive`). `fdatasync`
 is not weaker: the size and extent items a write's data is read back through
