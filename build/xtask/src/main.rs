@@ -2537,8 +2537,13 @@ fn qemu_virt_dtb_path() -> PathBuf {
 }
 
 fn ahci_image_path() -> PathBuf {
+    // `NARF_SATA_IMG` puts the SATA disk somewhere else, so that two QEMUs in
+    // one worktree do not both open (and lock) the same file. Created like
+    // the default when absent.
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
-    let path = root.join("target").join("narf-sata.img");
+    let path = std::env::var_os("NARF_SATA_IMG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target").join("narf-sata.img"));
     if !path.exists() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);

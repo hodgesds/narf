@@ -13,6 +13,13 @@
 //! afterwards, so the run also proves that root-ro wrote nothing. `--rw` boots
 //! `narf.disks=root-rw` on a scratch copy of the image instead.
 //!
+//! `NARF_CACHYOS_RW_IMAGE=<path>` puts that scratch copy somewhere else, so
+//! that two runs in one worktree do not share it; with
+//! `NARF_CACHYOS_RW_PREPARED=1` the file at that path is booted as it is (the
+//! caller made the copy, and may have changed it), instead of being replaced
+//! by a fresh copy. `NARF_CACHYOS_DECOY_IMAGE=<path>` moves the decoy disk the
+//! same way.
+//!
 //! `--disk <image>` boots an existing installed CachyOS disk instead (for
 //! example a desktop VM image with plymouth and plasmalogin). The image is
 //! only ever a read-only qcow2 backing file: the guest's NVMe is a fresh
@@ -43,6 +50,22 @@ const IMAGE: &str = "target/narf-cachyos-root.img";
 const RW_IMAGE: &str = "target/narf-cachyos-root-rw.img";
 /// Decoy disk for the first NVMe controller.
 const DECOY_IMAGE: &str = "target/narf-cachyos-decoy.img";
+/// The scratch copy a `--rw` boot writes to: `NARF_CACHYOS_RW_IMAGE`, or
+/// [`RW_IMAGE`] under the workspace.
+fn rw_image_path(root: &Path) -> PathBuf {
+    std::env::var_os("NARF_CACHYOS_RW_IMAGE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(RW_IMAGE))
+}
+
+/// The decoy disk: `NARF_CACHYOS_DECOY_IMAGE`, or [`DECOY_IMAGE`] under the
+/// workspace.
+fn decoy_image_path(root: &Path) -> PathBuf {
+    std::env::var_os("NARF_CACHYOS_DECOY_IMAGE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(DECOY_IMAGE))
+}
+
 /// Copy-on-write overlay over a `--disk` image.
 const DISK_OVERLAY: &str = "target/narf-cachyos-disk-overlay.qcow2";
 const SCRIPT: &str = "verification/data/cachyos-root/REGEN_cachyos_root_image.sh";
@@ -945,16 +968,26 @@ pub fn run(args: &Args) -> Result<()> {
     }
     let image = ensure_image(&root, args.rebuild_image)?;
     let disk = if args.rw {
-        let copy = root.join(RW_IMAGE);
-        let _ = std::fs::remove_file(&copy);
-        let status = Command::new("cp")
-            .args(["--reflink=auto", "--sparse=always"])
-            .arg(&image)
-            .arg(&copy)
-            .status()
-            .context("copy the image for the root-rw boot")?;
-        if !status.success() {
-            bail!("xtask cachyos-root-smoke: copying the image failed");
+        let copy = rw_image_path(&root);
+        let prepared = std::env::var("NARF_CACHYOS_RW_PREPARED").as_deref() == Ok("1");
+        if prepared {
+            if !copy.is_file() {
+                bail!(
+                    "xtask cachyos-root-smoke: NARF_CACHYOS_RW_PREPARED=1 but {} does not exist",
+                    copy.display()
+                );
+            }
+        } else {
+            let _ = std::fs::remove_file(&copy);
+            let status = Command::new("cp")
+                .args(["--reflink=auto", "--sparse=always"])
+                .arg(&image)
+                .arg(&copy)
+                .status()
+                .context("copy the image for the root-rw boot")?;
+            if !status.success() {
+                bail!("xtask cachyos-root-smoke: copying the image failed");
+            }
         }
         copy
     } else {
@@ -965,7 +998,7 @@ pub fn run(args: &Args) -> Result<()> {
     // decoy disk on the first, so root=UUID= has to find the root by identity
     // rather than by position. The decoy must come out unchanged in both
     // modes.
-    let decoy = root.join(DECOY_IMAGE);
+    let decoy = decoy_image_path(&root);
     write_decoy(&decoy)?;
     let decoy_before = sha256_file(&decoy)?;
 
@@ -1037,7 +1070,7 @@ fn run_disk(args: &Args, root: &Path, base: &Path) -> Result<()> {
             (uuid, (fs == "btrfs").then_some("subvol=/@"))
         }
     };
-    let decoy = root.join(DECOY_IMAGE);
+    let decoy = decoy_image_path(root);
     write_decoy(&decoy)?;
     let decoy_before = sha256_file(&decoy)?;
     let cmdline = root_cmdline(&uuid, rootflags, args.rw, &args.cmdline);
