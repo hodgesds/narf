@@ -24,6 +24,12 @@ That lives in `frame/`, `memory/`, `interrupts/`.
 
 ## 3. Public interface
 
+`x86_64::cache_topology::current_llc_id() -> Option<u64>` returns an opaque
+CPUID-derived last-data-cache identity for cold per-CPU topology discovery.
+It uses extended APIC IDs and cache-sharing geometry (including early Zen's
+CCX rule). Unsupported or untrustworthy topology returns `None`; callers must
+not substitute a NUMA node and report it as an LLC.
+
 `access_user_u64_guarded(address, write)` performs one aligned atomic user
 qword access: `None` loads with acquire ordering, `Some(value)` stores with
 release ordering and returns that value. The unsafe caller validates the

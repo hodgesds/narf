@@ -108,3 +108,63 @@ pub fn levels<F: FnMut(CacheLevel)>(mut f: F) {
         } // architectural soft cap
     }
 }
+
+/// Opaque identity of this CPU's last data/unified cache, for boot-time
+/// topology publication. Equal identities mean a shared cache; None means
+/// the platform does not describe one reliably. Never infer LLC from NUMA.
+pub fn current_llc_id() -> Option<u64> {
+    if !leaf_supported() {
+        return None;
+    }
+    let ident = ident::read();
+    if !matches!(ident.vendor, Vendor::Intel | Vendor::Amd)
+        || (ident.vendor == Vendor::Amd && ident.family < 0x17)
+    {
+        return None;
+    }
+    let mut last: Option<CacheLevel> = None;
+    levels(|cache| {
+        if cache.kind != CacheKind::Instruction
+            && last.is_none_or(|previous| cache.level > previous.level)
+        {
+            last = Some(cache);
+        }
+    });
+    let last = last?;
+    // Prefer an extended APIC ID. Legacy leaf 1 is only an eight-bit fallback.
+    // SAFETY: CPUID leaf 0 and the maximum-extended-leaf query are unconditional.
+    let (max_basic, _, _, _) = unsafe { cpuid(0, 0) };
+    // SAFETY: the maximum-extended-leaf query is unconditional.
+    let (max_ext, _, _, _) = unsafe { cpuid(0x8000_0000, 0) };
+    let mut apic = None;
+    for leaf in [0x1f, 0x0b] {
+        if max_basic >= leaf {
+            // SAFETY: the maximum basic leaf covers this topology leaf.
+            let (_, logical, _, id) = unsafe { cpuid(leaf, 0) };
+            if logical != 0 {
+                apic = Some(id);
+                break;
+            }
+        }
+    }
+    if apic.is_none() && ident.vendor == Vendor::Amd && max_ext >= 0x8000_001e {
+        // SAFETY: AMD topology extensions were checked by leaf_supported.
+        apic = Some(unsafe { cpuid(0x8000_001e, 0) }.0);
+    }
+    let apic = apic.unwrap_or_else(|| {
+        // SAFETY: leaf 1 exists on supported Intel/AMD CPUs.
+        unsafe { cpuid(1, 0) }.1 >> 24
+    });
+    // Linux cacheinfo uses ceil(log2(threads sharing)). Early Zen has the
+    // documented four-core CCX topology regardless of the generic sharing field.
+    let shift = if last.level == 3
+        && ident.vendor == Vendor::Amd
+        && ident.family == 0x17
+        && ident.model <= 0x1f
+    {
+        3
+    } else {
+        u16::BITS - last.apic_ids_sharing.saturating_sub(1).leading_zeros()
+    };
+    Some((u64::from(last.level) << 56) | (u64::from(shift) << 48) | u64::from(apic >> shift))
+}

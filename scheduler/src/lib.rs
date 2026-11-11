@@ -143,8 +143,8 @@ pub use policy::{
 pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
 pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
 pub use steal::{
-    current_steal_strategy_name, install_steal_strategy, NumaAwareSteal, RandomSteal, Steal,
-    StealError, StealStrategy,
+    current_steal_strategy_name, install_steal_strategy, set_default_steal_policy, LlcAwareSteal,
+    NumaAwareSteal, Pick2Steal, RandomSteal, Steal, StealError, StealStrategy,
 };
 pub use user_policy::{
     alloc_user_task_id, inherit_user_scheduling, release_user_scheduling, set_user_scheduling,
@@ -2868,6 +2868,7 @@ pub fn init() {
         // call `__reset_queues_for_test` explicitly.
         panic!("narf_scheduler::init() called twice — would wipe spawned tasks; use __reset_queues_for_test in tests");
     }
+    steal::register_current_cpu();
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();
     for (cpu, q) in READY.iter().enumerate() {
@@ -2891,8 +2892,8 @@ pub fn init() {
     // pre-Wave-E hardcoded behaviour byte-for-byte. Idempotent for the
     // same reason `policy::install_default_if_unset` is.
     donation::install_default_if_unset();
-    // Wave F: wire the default `NumaAwareSteal` so `try_steal_one`'s
-    // policy-driven victim-ordering and per-task allow_steal checks
+    // Wave F: wire the staged boot steal policy (normally `NumaAwareSteal`)
+    // so policy-driven victim ordering and per-task allow_steal checks
     // return the pre-Wave-F two-phase same-node-first behaviour
     // byte-for-byte. Idempotent for the same reason the wave D/E
     // installs are.
@@ -7296,27 +7297,47 @@ fn try_steal_one(cpu: usize) -> bool {
         None => return false,
     };
 
-    // Build the online-minus-thief set the strategy will permute.
     let max = narf_lib::percpu::MAX_CPUS;
-    let mut online: alloc::vec::Vec<crate::affinity::CpuId> = alloc::vec::Vec::with_capacity(max);
-    for v in 0..max {
-        if v == cpu {
-            continue;
-        }
-        if !narf_lib::smp::is_online(v as u32) {
-            continue;
-        }
-        online.push(crate::affinity::CpuId(v as u32));
-    }
+    let online = narf_lib::smp::online_bitmap() & !(1u64 << cpu);
 
     let thief = crate::affinity::CpuId(cpu as u32);
-    let victims = strategy.order_victims(thief, &online);
-    for v in victims {
-        if try_steal_from(v.0 as usize, cpu, strategy.as_ref()) {
-            return true;
+    let idle = |id| policy::cpu_state(id) == CpuState::Idle;
+    let runnable = |id: CpuId| {
+        RUNNABLE_STATE
+            .get(id.0 as usize)
+            .is_some_and(|state| state.peer.load(Ordering::Acquire))
+    };
+    let node = |id: CpuId| narf_acpi::cpu_node(id.0);
+    let queued = |id: CpuId| {
+        // Two-choice policies sample only their candidates. No global scan or
+        // new enqueue counter; locks are released before the policy visits.
+        READY
+            .get(id.0 as usize)?
+            .try_lock()?
+            .as_ref()
+            .map(|q| q.len())
+    };
+    let context = steal::StealContext::new(
+        online,
+        &idle,
+        &runnable,
+        &steal::llc_id,
+        &node,
+        &queued,
+        &narf_time::now_cycles,
+    );
+    let mut moved = false;
+    strategy.visit_victims(thief, &context, &mut |victim| {
+        if !moved
+            && (victim.0 as usize) < max
+            && victim != thief
+            && narf_lib::smp::is_online(victim.0)
+        {
+            moved = try_steal_from(victim.0 as usize, cpu, strategy.as_ref());
         }
-    }
-    false
+        moved
+    });
+    moved
 }
 
 /// Whether an idle thief may take one dispatchable slot without emptying the
@@ -7510,6 +7531,7 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
 }
 
 pub fn run_forever() -> ! {
+    steal::register_current_cpu();
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();
     let cpu = narf_lib::percpu::current_cpu();

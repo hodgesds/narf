@@ -23,6 +23,11 @@ those subsystems the hooks they need.
 
 ## 3. Public interface
 
+Production boot forwards `steal_policy=full|numa|llc|pick2` to the scheduler's staged
+steal-policy selector before queue initialization. Absent or unknown values
+retain the existing NUMA-aware default; runtime policy installation remains
+capability-gated by the scheduler.
+
 ```rust
 pub struct CpuLocal {
     id: CpuId,

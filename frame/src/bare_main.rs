@@ -2716,6 +2716,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // Initialise per-CPU scheduler queues *before* AP
                 // bring-up — APs jump straight into the scheduler
                 // run loop and need their own queue ready.
+                if let Some(name) = narf_boot::args().value("steal_policy") {
+                    if narf_scheduler::set_default_steal_policy(name) {
+                        let _ = writeln!(console::Writer, "  steal_policy: {name}");
+                    }
+                }
                 narf_scheduler::init();
                 // Explicit boot delegation: Linux RT syscalls spend these
                 // bounded per-CPU grants; they never mint runtime authority.
@@ -3096,6 +3101,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // Initialise per-CPU scheduler queues *before* AP
                 // bring-up — APs jump straight into the scheduler
                 // run loop and need their own queue ready.
+                if let Some(name) = narf_boot::args().value("steal_policy") {
+                    if narf_scheduler::set_default_steal_policy(name) {
+                        let _ = writeln!(console::Writer, "  steal_policy: {name}");
+                    }
+                }
                 narf_scheduler::init();
                 // Explicit boot delegation: Linux RT syscalls spend these
                 // bounded per-CPU grants; they never mint runtime authority.

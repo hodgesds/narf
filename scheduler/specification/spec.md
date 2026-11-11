@@ -27,6 +27,47 @@ those — it is the glue, not the signal source.
 
 ## 3. Public interface
 
+`StealStrategy::visit_victims(thief, &StealContext, visitor)` is an object-safe
+search hook that permits allocation-free policies. Its default adapts the existing
+`order_victims` method, preserving custom implementations. Only that adapter builds
+the full online CPU list. The core supplies an O(1) online-bitmap snapshot.
+The context exposes read-only online, idle, runnable-peer, LLC, NUMA, clock, and
+nonblocking per-CPU queued-load facts; hints are advisory and may be stale.
+The core supplies the context and a visitor that revalidates the real queue and
+moves at most one task. Policy retains candidate selection, locality preference,
+and search admission; the core retains ownership and eligibility enforcement.
+
+The optional `LlcAwareSteal` skips idle CPUs and CPUs without a runnable-peer hint, tries LLC
+peers before same-NUMA and remote donors, and bounds concurrent searches within
+a described LLC by idle demand and possible local donors (one searcher for a
+remote-only search). Its permit spans actual queue probes and releases on return.
+No search permit is touched when there are no possible donors. Cache geometry
+is discovered once on each x86 CPU during startup and cached; other architectures
+and unsupported CPUs report unknown LLC topology and retain NUMA fallback.
+Hotplug/wake snapshots affect search effort only, never task ownership or wakeups.
+`NumaAwareSteal` remains the default full-scan policy, explicitly selectable as
+`steal_policy=full` (`numa` is an alias). It is the latency-oriented comparison
+policy; actual latency depends on workload and platform.
+`set_default_steal_policy("full" | "numa" | "llc" | "pick2")` stages the choice
+before init.
+Runtime replacement retains `install_steal_strategy` and its existing capability
+check. The LLC policy is a workload choice, not a change to idle timers or task slices.
+
+`Pick2Steal` caches LLC / remaining same-NUMA / remote peer masks per thief,
+refreshing on online-mask changes or cold per-CPU topology publication. Each
+search samples two distinct peers per tier using private per-CPU random state,
+then tries the larger nonblocking queued-load sample first. Queue length is only
+a ranking hint; the core still checks runnable surplus, affinity, budgets and
+migration age. Candidate selection uses bounded word operations, not CPU-list
+enumeration. Queue eligibility checks retain their existing cost.
+After four unsuccessful searches, it attempts rotating full coverage of online
+peers, ignoring advisory hints so sparse or misreported work cannot be hidden
+indefinitely. Empty searches back off exponentially from 1 us to at most 1 ms;
+observed queued work or a successful steal clears that backoff. These are initial
+experimental defaults. Backoff delays only future stealing, not local dispatch,
+reschedule IPIs, timers, or the core halt handshake. No policy-state lock spans
+queue sampling or migration. There are no new per-enqueue publication writes.
+
 ### Caller authority and lifetime
 
 Caller-authority APIs and state described here require `native-ring`, off
