@@ -850,6 +850,8 @@ struct ConnectCaps {
     cipher_suites: &'static [u32],
     scan_random_mac: bool,
     connected: bool,
+    /// The driver implements reassociation (`supports_roam`).
+    roam: bool,
     max_scan_ssids: u8,
     max_scan_ie_len: u16,
     scan_random_sn: bool,
@@ -868,6 +870,7 @@ impl ConnectCaps {
             cipher_suites: iface.cipher_suites(),
             scan_random_mac: iface.supports_scan_random_mac(),
             connected: iface.connected_bssid().is_some(),
+            roam: iface.supports_roam(),
             max_scan_ssids: iface.max_scan_ssids(),
             max_scan_ie_len: iface.max_scan_ie_len(),
             scan_random_sn: iface.supports_scan_random_sn(),
@@ -895,6 +898,7 @@ fn parse_operation(
             cipher_suites: &[],
             scan_random_mac: false,
             connected: false,
+            roam: false,
             max_scan_ssids: 16,
             max_scan_ie_len: 512,
             scan_random_sn: false,
@@ -1132,6 +1136,13 @@ fn parse_operation_caps(
             };
             if let Some(ie) = attr(attrs, 42) {
                 elements(ie)?;
+            }
+            // cfg80211_connect: a connected station takes a new CONNECT only
+            // as a reassociation. A driver that cannot roam answers
+            // -EALREADY here, and wpa_supplicant disconnects and retries,
+            // instead of a failed CONNECT event while the old link stays up.
+            if caps.connected && !caps.roam {
+                return Err(EALREADY);
             }
             Ok(Operation::Connect {
                 ssid: ssid.to_vec(),

@@ -2375,6 +2375,10 @@ impl WirelessNetIface for Device {
         })
     }
 
+    fn supports_roam(&self) -> bool {
+        true
+    }
+
     async fn roam(&self, request: AssociateRequest) -> Result<(), WirelessError> {
         if self.current_iftype() != 2 {
             return Err(WirelessError::Busy);

@@ -721,9 +721,17 @@ pub trait WirelessNetIface: Interface {
         None
     }
 
+    /// The driver implements [`roam`](Self::roam). Without it a CONNECT on a
+    /// connected interface is refused with -EALREADY before any driver work,
+    /// as `cfg80211_connect` does; wpa_supplicant then disconnects and
+    /// connects again (`wpa_driver_nl80211_connect`).
+    fn supports_roam(&self) -> bool {
+        false
+    }
+
     /// Reassociate (roam) to a new BSS of the current ESS, preserving the
     /// interface. Defaults to unsupported; drivers that can reassociate
-    /// override this.
+    /// override this and [`supports_roam`](Self::supports_roam).
     async fn roam(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
     }
