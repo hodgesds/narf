@@ -67,13 +67,18 @@
 //!   could over-permit power on the other subchannels.
 //!   The admitted [`Station`] records the program as
 //!   [`SixGhzProgram`], including the phy.c TPE constraint in
-//!   MAC units the future `rtw8922a_set_txpwr` limit program
-//!   consumes. The register-level program itself (by-rate /
-//!   limit / limit-RU pages on BE registers, shape, diff, ref,
-//!   SAR-diff) is a follow-up: it needs the firmware TXPWR
-//!   elements container this owner does not hold. The program
-//!   applies per link: each link of an MLD request carries its
-//!   own admission, validated by [`validate`].
+//!   MAC units the `rtw8922a_set_txpwr` limit program
+//!   consumes. [`Station::txpwr_plan`] builds that
+//!   register-level program (by-rate / limit / limit-RU pages
+//!   on BE registers, shape, diff, ref, SAR-diff, in
+//!   `radio_power_be::Plan`) from the admitted program plus
+//!   the caller-supplied firmware TXPWR elements container,
+//!   RFE type, host regulatory country and channel center —
+//!   none of which this owner holds — and
+//!   `prepared_8922a::Prepared8922a::set_txpwr` applies it.
+//!   The program applies per link: each link of an MLD
+//!   request carries its own admission, validated by
+//!   [`validate`].
 //! - 320 MHz refused (`WidthNotAdvertised`): the width is
 //!   programmed by the EHT lane but deliberately NOT advertised
 //!   (chip bandwidths top at 160 MHz, `rtw8922a.c:3263..3266`).
@@ -187,9 +192,13 @@ use super::{
     chip_8922a,
     efuse_be::BeFactory,
     eht::EhtStation,
+    operating_channel_c::Band as CoreBand,
     ppe,
     ra_mask::{self, HeCaps, HtCaps, VhtCaps},
-    radio_power_c::tpe_mac,
+    radio_assets::Element,
+    radio_power_be::{Bw, Channel, Plan},
+    radio_power_c::{tpe_mac, SixGhzPower},
+    rfk,
 };
 use narf_wireless::association::six_ghz::SixGhzChannel;
 use narf_wireless::reg::PowerType6Ghz;
@@ -254,9 +263,9 @@ pub(super) struct SixGhzAdmission {
 /// `radio_power_c::tpe_mac`): 63 when no TPE constrains the
 /// link, so the limit pages are capped by the regulatory
 /// tables alone. This is the program's admission-level
-/// artifact; the register writes are the follow-up
-/// `rtw8922a_set_txpwr` lane's (Linux `rtw8922a.c`
-/// `rtw8922a_set_txpwr`: generic
+/// artifact; [`Station::txpwr_plan`] consumes it into the
+/// register-level `rtw8922a_set_txpwr` program (Linux
+/// `rtw8922a.c` `rtw8922a_set_txpwr`: generic
 /// `rtw89_phy_set_txpwr_{byrate,offset,limit,limit_ru}` plus
 /// the 8922A `set_tx_shape` / `set_txpwr_diff` /
 /// `set_txpwr_ref` / `set_txpwr_sar_diff` steps).
@@ -386,6 +395,11 @@ pub(super) enum Error {
     /// A 6 GHz width above 20 MHz (the TPE rearrange is
     /// validated for the primary 20 MHz subchannel only).
     SixGhzWidthUnsupported,
+    /// TX-power program build failure for this station's
+    /// channel (missing firmware TXPWR elements, a refused
+    /// 6 GHz regulatory context, or an unprogrammable
+    /// channel geometry).
+    Txpwr(rfk::Error),
     /// Width outside 20/40/80/160 (includes 320 MHz).
     WidthNotAdvertised,
     /// NSS zero or above the chip's 2-stream cap.
@@ -570,6 +584,68 @@ impl Station {
     /// constraint (dBm, STD only) and its MAC-unit form.
     pub(super) fn six_ghz(&self) -> Option<SixGhzProgram> {
         self.six_ghz
+    }
+
+    /// Build the BE TX-power program for this station's
+    /// channel (`rtw8922a_set_txpwr`, PHY_0), consuming the
+    /// admitted program: on 6 GHz the regd.c context comes
+    /// from [`SixGhzPower::new`] over the container's REGD
+    /// element and the host regulatory country, and the
+    /// admitted TPE constraint (dBm, Standard Power only)
+    /// caps the limit/RU pages via
+    /// [`Plan::from_elements_6ghz`]; on 2.4/5 GHz the
+    /// program is the WW-default [`Plan::from_elements`].
+    /// `elements` is the container's firmware TXPWR
+    /// elements (BYRATE id 9, LMT/LMT_RU per band,
+    /// TX_SHAPE_LMT id 16, REGD id 20) — this owner holds
+    /// no container — `rfe` is the efuse RFE type,
+    /// `country` the host regulatory alpha2, and `center`
+    /// the `rtw89_chan.channel` (20 MHz: the primary;
+    /// wider: the channel plan's center). Fail-closed: a
+    /// refused context, missing elements, or an
+    /// unprogrammable channel geometry (including a 20 MHz
+    /// center that is not the primary) reports
+    /// [`Error::Txpwr`] and builds no program. The caller
+    /// applies the program (see
+    /// `prepared_8922a::Prepared8922a::set_txpwr`); this
+    /// method writes no register.
+    pub(super) fn txpwr_plan(
+        &self,
+        elements: &[Element],
+        rfe: u8,
+        country: [u8; 2],
+        center: u8,
+    ) -> Result<Plan, Error> {
+        let band = match self.band {
+            Band::Ghz2 => CoreBand::Ghz2,
+            Band::Ghz5 => CoreBand::Ghz5,
+            Band::Ghz6 => CoreBand::Ghz6,
+        };
+        let bw = match self.width_mhz {
+            20 => Bw::Mhz20,
+            40 => Bw::Mhz40,
+            80 => Bw::Mhz80,
+            160 => Bw::Mhz160,
+            _ => return Err(Error::Txpwr(rfk::Error::Policy)),
+        };
+        // 20 MHz: the center channel is the primary
+        // (`rtw89_chan.channel == primary_channel`); a
+        // caller-supplied center anywhere else would fill
+        // the limit pages for the wrong channel.
+        if self.width_mhz == 20 && center != self.primary {
+            return Err(Error::Txpwr(rfk::Error::Policy));
+        }
+        let channel =
+            Channel::new(band, self.primary, center, bw).ok_or(Error::Txpwr(rfk::Error::Policy))?;
+        match self.six_ghz {
+            Some(program) => {
+                let power = SixGhzPower::new(elements, country, Some(program.power))
+                    .map_err(Error::Txpwr)?;
+                Plan::from_elements_6ghz(elements, rfe, channel, power, program.tpe_dbm)
+                    .map_err(Error::Txpwr)
+            }
+            None => Plan::from_elements(elements, rfe, channel).map_err(Error::Txpwr),
+        }
     }
 
     /// EHT contribution to the BE TXWD_INFO block for this

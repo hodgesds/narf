@@ -74,11 +74,12 @@
 //! already touches.
 #![allow(dead_code)]
 
-// The BE policy board / prepared wiring that will consume `Plan`
-// (`Board::new_be`, channel qualification) is a follow-up of #1878,
-// so this module is currently test-driven only; the allow above is
-// the same standing convention as `dma.rs` / `fwdl.rs` until that
-// consumer lands.
+// The consumer is `prepared_8922a::Prepared8922a::set_txpwr`,
+// which builds the plan per admitted station
+// (`station_8922a::Station::txpwr_plan`) and emits it over the
+// BAR2 register port; the BE policy board (`Board::new_be`,
+// channel qualification) remains a follow-up of #1878, and the
+// allow above stays until that board lands.
 
 use super::operating_channel_c::Band;
 use super::radio_assets::{Assets, Element};

@@ -11,6 +11,11 @@ use super::mac_pre_init_8922a::{Cid, HalChipVer};
 use super::prepared::{self, Files};
 use super::prepared_8922a::*;
 use super::ra_mask::{EhtCaps, StationCaps};
+use super::radio_assets::Element;
+use super::radio_power_c::{
+    ID_BYRATE, ID_LMT_2GHZ, ID_LMT_5GHZ, ID_LMT_6GHZ, ID_LMT_RU_2GHZ, ID_LMT_RU_5GHZ,
+    ID_LMT_RU_6GHZ, ID_REGD, ID_TX_SHAPE_LMT, RS_CCK, RS_HEDCM, RS_MCS, RS_OFDM, RS_OFFSET, WW,
+};
 use super::station_8922a::{Band, Error as StationError, LinkRequest, Request, SixGhzAdmission};
 use super::tx_8922a::{PrepareArgs, DATA_RING_DEPTH};
 use super::txrx_be::{encode_txwd_be, fill_txwd_info_v2, TxwdBeInfo, TxwdInfoV2};
@@ -1262,7 +1267,304 @@ fn smoke_rtw89_prepared_8922a_vif_ports() -> TestResult {
     owner.remove_vif(9);
     TestResult::Pass
 }
+
+/// Firmware TXPWR element builder (the `radio_power_be`
+/// tests' fixture, extended): one element per ID, header
+/// `[0, 0, rfe, size]` + LE32 count, rows padded to `size`.
+/// Duplicated from `station_8922a_tests` (this tree's
+/// per-module fixture pattern): the prepared owner builds
+/// its program from the same elements.
+fn elm(id: u32, rfe: u8, size: u8, entries: &[&[u8]]) -> Element {
+    let mut bytes = vec![0, 0, rfe, size];
+    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        let mut row = e.to_vec();
+        row.resize(usize::from(size), 0);
+        bytes.extend_from_slice(&row);
+    }
+    Element {
+        id,
+        version: [0; 4],
+        bytes,
+    }
+}
+
+/// By-rate entry {band, nss, rs, shf, len, data[4], bw, ofdma}
+/// (11-byte shipped layout).
+fn byr(band: u8, nss: u8, rs: u8, shf: u8, data: &[i8], bw: u8, ofdma: u8) -> Vec<u8> {
+    let mut e = vec![band, nss, rs, shf, data.len() as u8, 0, 0, 0, 0, bw, ofdma];
+    for (i, &v) in data.iter().enumerate() {
+        e[5 + i] = v as u8;
+    }
+    e
+}
+
+/// The `radio_power_be` `base` + `six_set` elements (rfe 0,
+/// tag 10) plus the REGD map (`radio_power_c` `six_set`):
+/// US FCC, GB UK/ETSI, BO not-applicable. Additions over the
+/// BE fixture: an FCC/STD OFDM limit (50) and RU limit (40)
+/// so a US Standard-Power TPE bites, and 6 GHz shape rows
+/// (OFDM 1 FCC/STD, 2 ETSI/STD, 0 FCC/LPI).
+fn txpwr_elements() -> Vec<Element> {
+    vec![
+        elm(
+            ID_BYRATE,
+            0,
+            11,
+            &[
+                &byr(0, 0, RS_CCK, 0, &[10, 2, 4, 6], 0, 0),
+                &byr(1, 0, RS_CCK, 0, &[99, 99, 99, 99], 0, 0),
+                &byr(0, 0, RS_OFDM, 4, &[-3, 8, 10, 12], 0, 0),
+                &byr(0, 0, RS_MCS, 14, &[30, 32], 0, 0),
+                &byr(0, 0, RS_MCS, 14, &[34, 36], 0, 1),
+                &byr(0, 0, RS_MCS, 0, &[20, 22, 24, 26], 0, 0),
+                &byr(0, 0, RS_HEDCM, 0, &[40, 42], 0, 0),
+                &byr(0, 1, RS_MCS, 8, &[30, 32, 34, 36], 0, 0),
+                &byr(0, 1, RS_HEDCM, 0, &[40, 42], 0, 0),
+                &byr(0, 0, RS_OFDM, 0, &[8, 10, 12, 14], 1, 0),
+                &byr(0, 0, RS_OFDM, 0, &[16, 18, 20, 22], 2, 0),
+                &byr(1, 0, RS_OFDM, 0, &[20, 22, 24, 26], 0, 0),
+                &byr(1, 1, RS_MCS, 8, &[30, 32, 34, 36], 0, 0),
+                &byr(1, 1, RS_HEDCM, 0, &[40, 42], 0, 0),
+                &byr(1, 0, RS_OFFSET, 0, &[-2, 2, 4, 6], 0, 0),
+                &byr(1, 0, RS_OFFSET, 4, &[8, 10, 12, 14], 0, 0),
+                // nss 2 is invalid for MCS: skipped, never an error.
+                &byr(1, 2, RS_MCS, 0, &[77], 0, 0),
+                // 6 GHz OFDM by-rate row (band 2).
+                &byr(2, 0, RS_OFDM, 0, &[16, 18, 20, 22], 0, 0),
+            ],
+        ),
+        elm(
+            ID_LMT_2GHZ,
+            0,
+            7,
+            &[
+                // bw, nt, rs, bf, regd, ch_idx, v
+                &[0, 0, RS_CCK, 0, WW, 5, 40],
+                &[0, 0, RS_OFDM, 1, WW, 5, 36],
+                &[0, 1, RS_MCS, 0, WW, 5, 30],
+                // non-WW regd is not read (regd = WW, no country).
+                &[0, 0, RS_OFDM, 1, 2, 5, 2],
+                // last entry wins.
+                &[0, 1, RS_MCS, 0, WW, 5, -6i8 as u8],
+            ],
+        ),
+        elm(
+            ID_LMT_5GHZ,
+            0,
+            7,
+            &[
+                // 80MHz center 42: mcs_20m at 36/40/44/48 (idx 0/2/4/6).
+                &[0, 0, RS_MCS, 0, WW, 0, 50],
+                &[0, 0, RS_MCS, 0, WW, 6, 52],
+                &[1, 0, RS_MCS, 0, WW, 1, 44],
+                &[1, 0, RS_MCS, 0, WW, 5, 40],
+                &[2, 0, RS_MCS, 1, WW, 3, 34],
+                // ofdm at primary 36.
+                &[0, 1, RS_OFDM, 0, WW, 0, 28],
+                // bw 4 is out of the 5GHz range: skipped.
+                &[4, 0, RS_MCS, 0, WW, 3, 1],
+            ],
+        ),
+        elm(
+            ID_LMT_RU_2GHZ,
+            0,
+            5,
+            &[&[0, 0, WW, 5, 20], &[2, 1, WW, 5, 18]],
+        ),
+        elm(
+            ID_LMT_RU_5GHZ,
+            0,
+            5,
+            &[&[1, 0, WW, 2, 24], &[2, 1, WW, 6, 26]],
+        ),
+        elm(
+            ID_TX_SHAPE_LMT,
+            0,
+            5,
+            &[
+                // [band, rs, regd, value, reg6]
+                &[0, 0, WW, 1],
+                &[1, 1, WW, 3],
+                &[1, 1, 3, 3],
+                &[2, 1, 2, 1, 2],
+                &[2, 1, 1, 2, 2],
+                &[2, 1, 2, 0, 1],
+            ],
+        ),
+        elm(
+            ID_LMT_6GHZ,
+            0,
+            8,
+            &[
+                // ch37 = 6G idx 17. FCC (2) LPI (1) OFDM: own value.
+                &[0, 0, RS_OFDM, 0, 2, 1, 17, 30],
+                // MCS: no FCC/LPI value, so [WW][DFLT] is read.
+                &[0, 0, RS_MCS, 0, WW, 0, 17, 24],
+                // ETSI (1) STD (2) OFDM for the GB/UK case.
+                &[0, 0, RS_OFDM, 0, 1, 2, 17, 40],
+                // reg6 3 is out of range: skipped.
+                &[0, 0, RS_OFDM, 0, 2, 3, 17, 2],
+                // FCC (2) STD (2) OFDM: the US SP own value.
+                &[0, 0, RS_OFDM, 0, 2, 2, 17, 50],
+            ],
+        ),
+        elm(
+            ID_LMT_RU_6GHZ,
+            0,
+            6,
+            &[
+                &[0, 0, 2, 1, 17, 22],
+                &[1, 0, WW, 0, 17, 20],
+                &[0, 0, 2, 2, 17, 40],
+            ],
+        ),
+        elm(
+            ID_REGD,
+            0,
+            9,
+            &[
+                &[b'U', b'S', 2, 2, 2],
+                &[b'G', b'B', 14, 14, 14],
+                // `RTW89_NA` (4): not applicable.
+                &[b'B', b'O', 2, 2, 4],
+            ],
+        ),
+    ]
+}
+
+fn smoke_rtw89_prepared_8922a_set_txpwr_writes_program() -> TestResult {
+    let elements = txpwr_elements();
+    // 6 GHz SP ch37, TPE 5 dBm, US: FCC/STD.
+    let mut req = base_req();
+    req.band = Band::Ghz6;
+    req.width_mhz = 20;
+    req.primary = 37;
+    req.six_ghz = Some(SixGhzAdmission {
+        power: PowerType6Ghz::Sp,
+        tpe_dbm: Some(5),
+    });
+    // Non-CAV cut (chip_version 1): the diff step leaves the
+    // TXAGC reference at 0 with TSSI_K 0x12.
+    let mut owner = match Prepared8922a::new(factory(), 1) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let macid = match owner.admit_station(&req) {
+        Ok(macid) => macid,
+        Err(_) => return TestResult::Fail("6GHz SP admission refused"),
+    };
+    let mut regs = Model::new();
+    if owner
+        .set_txpwr(macid, &elements, *b"US", 37, &mut regs)
+        .is_err()
+    {
+        return TestResult::Fail("set_txpwr refused");
+    }
+    // 197 writes over 194 distinct registers (the TXAGC
+    // address is written twice per path, OFDM then CCK).
+    if regs.regs32.len() != 194 {
+        return TestResult::Fail("set_txpwr did not land on 194 registers");
+    }
+    // By-rate head (CCK [5,1,2,3], then 6G OFDM [8,9,10,11]),
+    // zero rate offsets (no band-2 offset rows), the OFDM
+    // shape bit, the TPE-capped limit word (OFDM 10, MCS20
+    // 10 at page offset 4) and RU word (ru26 10), and the
+    // zeroed reference fields.
+    if regs.regs32.get(&0x11E00) != Some(&0x0302_0105)
+        || regs.regs32.get(&0x11E04) != Some(&0x0B0A_0908)
+        || regs.regs32.get(&0x11A30) != Some(&0)
+        || regs.regs32.get(&(0x20000 + 0x6C04)) != Some(&1)
+        || regs.regs32.get(&0x11FB0) != Some(&0x000A_000A)
+        || regs.regs32.get(&0x12048) != Some(&0x0000_000A)
+        || regs.regs32.get(&0x11A20) != Some(&0)
+    {
+        return TestResult::Fail("set_txpwr register values differ from rtw8922a_set_txpwr");
+    }
+    // Partial-mask writes merge into existing register
+    // contents (read-modify-write), they do not clobber
+    // neighbouring fields: ref fields cleared, shape bit
+    // set, TXAGC reference 0, TSSI_K 0x12, SAR 126.
+    let mut seeded = Model::new()
+        .with32(0x11A20, u32::MAX)
+        .with32(0x20000 + 0x6C04, u32::MAX)
+        .with32(0x20000 + 0xE628, u32::MAX)
+        .with32(0x20000 + 0xE6A0, u32::MAX)
+        .with32(0x20000 + 0xE728, u32::MAX)
+        .with32(0x20000 + 0xE7A0, u32::MAX)
+        .with32(0x20000 + 0xE61C, u32::MAX)
+        .with32(0x20000 + 0xE71C, u32::MAX);
+    if owner
+        .set_txpwr(macid, &elements, *b"US", 37, &mut seeded)
+        .is_err()
+    {
+        return TestResult::Fail("seeded set_txpwr refused");
+    }
+    if seeded.regs32.get(&0x11A20) != Some(&0xFFF8_0001)
+        || seeded.regs32.get(&(0x20000 + 0x6C04)) != Some(&0xFFFF_FFFD)
+        || seeded.regs32.get(&(0x20000 + 0xE628)) != Some(&0xFFFC_0000)
+        || seeded.regs32.get(&(0x20000 + 0xE6A0)) != Some(&0xC12F_FFFF)
+        || seeded.regs32.get(&(0x20000 + 0xE728)) != Some(&0xFFFC_0000)
+        || seeded.regs32.get(&(0x20000 + 0xE7A0)) != Some(&0xC12F_FFFF)
+        || seeded.regs32.get(&(0x20000 + 0xE61C)) != Some(&0xFFE7_EFFF)
+        || seeded.regs32.get(&(0x20000 + 0xE71C)) != Some(&0xFFE7_EFFF)
+    {
+        return TestResult::Fail("set_txpwr partial-mask merge differs");
+    }
+    // CAV cut (chip_version 0): the diff step raises the
+    // TXAGC reference to 16 RF units (64 in the field's BB
+    // units) on both paths.
+    let mut cav = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let cav_macid = match cav.admit_station(&req) {
+        Ok(macid) => macid,
+        Err(_) => return TestResult::Fail("6GHz SP admission refused (CAV)"),
+    };
+    let mut regs = Model::new()
+        .with32(0x20000 + 0xE628, u32::MAX)
+        .with32(0x20000 + 0xE728, u32::MAX);
+    if cav
+        .set_txpwr(cav_macid, &elements, *b"US", 37, &mut regs)
+        .is_err()
+    {
+        return TestResult::Fail("CAV set_txpwr refused");
+    }
+    if regs.regs32.get(&(0x20000 + 0xE628)) != Some(&0xFFFC_8040)
+        || regs.regs32.get(&(0x20000 + 0xE728)) != Some(&0xFFFC_8040)
+    {
+        return TestResult::Fail("CAV TXAGC reference differs from rtw8922a_set_txpwr_diff");
+    }
+    // Refusals write nothing: an unknown MACID, and a
+    // container without the BYRATE element.
+    let mut regs = Model::new();
+    if owner.set_txpwr(9, &elements, *b"US", 37, &mut regs) != Err(Error::NoStation)
+        || !regs.regs32.is_empty()
+    {
+        return TestResult::Fail("set_txpwr for an unknown MACID did not refuse cleanly");
+    }
+    let no_byrate: Vec<Element> = txpwr_elements()
+        .into_iter()
+        .filter(|e| e.id != ID_BYRATE)
+        .collect();
+    let mut regs = Model::new();
+    if owner.set_txpwr(macid, &no_byrate, *b"US", 37, &mut regs)
+        != Err(Error::Station(StationError::Txpwr(
+            super::rfk::Error::Table,
+        )))
+        || !regs.regs32.is_empty()
+    {
+        return TestResult::Fail("set_txpwr without BYRATE did not refuse cleanly");
+    }
+    TestResult::Pass
+}
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_prepared_8922a_vif_ports
+);
+
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_set_txpwr_writes_program
 );
