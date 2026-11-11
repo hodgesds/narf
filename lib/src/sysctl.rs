@@ -111,6 +111,18 @@ pub mod ipv4 {
     /// `net.ipv4.tcp_sack`. Linux default 1.
     pub static TCP_SACK: AtomicU32 = AtomicU32::new(1);
 
+    /// `net.ipv4.tcp_rmem[2]`: the most receive-buffer autotuning may give
+    /// one connection (`tcp_rcvbuf_grow`). Linux default 6 MiB.
+    pub static TCP_RMEM_MAX: AtomicU32 = AtomicU32::new(6_291_456);
+
+    /// `net.ipv4.tcp_wmem[2]`: the most send-buffer autotuning may give one
+    /// connection (`tcp_sndbuf_expand`). Linux default 4 MiB.
+    pub static TCP_WMEM_MAX: AtomicU32 = AtomicU32::new(4_194_304);
+
+    /// `net.ipv4.tcp_moderate_rcvbuf`. Linux default 1: grow the receive
+    /// buffer to match what the application reads per round trip.
+    pub static TCP_MODERATE_RCVBUF: AtomicU32 = AtomicU32::new(1);
+
     /// The three TCP option knobs, as `(window_scaling, timestamps, sack)`.
     ///
     /// They gate both directions, as in Linux. On a SYN we send, each option
@@ -278,6 +290,9 @@ pub mod ipv4 {
         TCP_WINDOW_SCALING.store(1, Ordering::Relaxed);
         TCP_TIMESTAMPS.store(1, Ordering::Relaxed);
         TCP_SACK.store(1, Ordering::Relaxed);
+        TCP_RMEM_MAX.store(6_291_456, Ordering::Relaxed);
+        TCP_WMEM_MAX.store(4_194_304, Ordering::Relaxed);
+        TCP_MODERATE_RCVBUF.store(1, Ordering::Relaxed);
         SEND_REDIRECTS_ALL.store(1, Ordering::Relaxed);
         SEND_REDIRECTS_DEFAULT.store(1, Ordering::Relaxed);
         DEV_CONF.lock().clear();

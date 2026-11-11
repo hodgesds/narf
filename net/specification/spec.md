@@ -1146,6 +1146,17 @@ layout are eligible. A timestamped merge retains the first sequence number
 and newest ACK, window, flags, TSval, and TSecr; other option layouts and all
 control, urgent, fragmented, out-of-order, or non-IPv4 traffic bypass GRO.
 
+TCP socket buffers start at 256 KiB and autotune as Linux does. Receive:
+`tcp_rcv_space_adjust`/`tcp_rcvbuf_grow` run on every read; once per receiver
+round trip (estimated by `tcp_rcv_rtt_measure_ts` and `tcp_rcv_rtt_measure`)
+a reader that consumed more than in the previous round has its window limit
+raised to twice that amount plus slow-start headroom, up to half of
+`net.ipv4.tcp_rmem[2]` and the negotiated window scale. Send:
+`tcp_sndbuf_expand` raises a full send buffer to twice the congestion window,
+up to `net.ipv4.tcp_wmem[2]`. `SO_RCVBUF`/`SO_SNDBUF` lock the respective
+buffer, and `net.ipv4.tcp_moderate_rcvbuf=0` disables receive growth. Buffers
+never shrink. `tcp_info.rcv_space` reports the current receive limit.
+
 IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,
 socket buffers, and errno path. Family-specific connected and listener
 indexes retain full-width addresses and include the network-namespace ID.

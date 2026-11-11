@@ -283,6 +283,17 @@ impl RecvBuf {
                 .sum::<usize>()
     }
 
+    /// How far past `rcv_nxt` the out-of-order queue reaches (Linux
+    /// `ooo_last_skb->end_seq - rcv_nxt`), 0 with no hole outstanding.
+    pub fn ooo_span(&self, rcv_nxt: u32) -> u32 {
+        self.out_of_order
+            .iter()
+            .map(|s| s.end_seq().wrapping_sub(rcv_nxt))
+            .filter(|&span| (span as i32) > 0)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// In-order bytes the user can read now.
     pub fn in_order_len(&self) -> usize {
         self.in_order.len()

@@ -231,6 +231,12 @@ pub struct Tcb {
     // ── Send / receive buffers ──
     pub send_buf: SendBuf,
     pub recv_buf: RecvBuf,
+    /// Receive-buffer autotuning (`tcp_rcv_space_adjust`) and the user's
+    /// `SO_RCVBUF` lock.
+    pub rcv_space: super::autotune::RcvSpace,
+    /// `SOCK_SNDBUF_LOCK`: the application set `SO_SNDBUF`, so
+    /// `tcp_sndbuf_expand` leaves the send buffer alone.
+    pub sndbuf_locked: bool,
 
     // ── Retransmit ──
     pub rtt: RttEstimator,
@@ -576,6 +582,8 @@ impl Tcb {
             snd_wl2: 0,
             send_buf: SendBuf::new(DEFAULT_SND_BUF, iss.wrapping_add(1)),
             recv_buf: RecvBuf::new(DEFAULT_RCV_BUF),
+            rcv_space: super::autotune::RcvSpace::default(),
+            sndbuf_locked: false,
             rtt: RttEstimator::new(),
             retx_queue: VecDeque::new(),
             retx_deadline_cycles: 0,
@@ -2067,6 +2075,9 @@ pub fn recv(id: u32, buf: &mut [u8]) -> Result<usize, ()> {
     let (n, window_update) = {
         let mut t = arc.lock();
         let n = t.recv_buf.read(buf);
+        if n > 0 {
+            rcv_space_adjust(&mut t, n);
+        }
         (n, n > 0 && receive_window_update_due(&t))
     };
     if window_update {
@@ -2189,6 +2200,7 @@ fn recv_errno_flags(id: u32, buf: &mut [u8], peek: bool) -> Result<usize, i32> {
     }
     let n = if peek { 0 } else { t.recv_buf.read(buf) };
     if n > 0 {
+        rcv_space_adjust(&mut t, n);
         let window_update = receive_window_update_due(&t);
         drop(t);
         if window_update {
@@ -2442,11 +2454,15 @@ pub fn set_buffer_limits(id: u32, snd: Option<u32>, rcv: Option<u32>) -> Result<
     let notify = {
         let mut t = arc.lock();
         let before = t.user_can_write();
+        // `sock_setsockopt` sets SOCK_SNDBUF_LOCK / SOCK_RCVBUF_LOCK with
+        // the size: autotuning never overrides an explicit request.
         if let Some(snd) = snd {
             t.send_buf.limit = (snd as usize).max(1);
+            t.sndbuf_locked = true;
         }
         if let Some(rcv) = rcv {
             t.recv_buf.limit = ((rcv / 2) as usize).max(1);
+            t.rcv_space.locked = true;
         }
         !before && t.user_can_write()
     };
@@ -3087,6 +3103,56 @@ pub(crate) fn receive_window_update_due(t: &Tcb) -> bool {
     let current = t.recv_buf.window();
     let threshold = u32::from(t.opts.peer_mss.max(MIN_MSS));
     current > t.rcv_wnd && (t.rcv_wnd == 0 || current >= t.rcv_wnd.saturating_add(threshold))
+}
+
+/// Microsecond clock for receive-buffer autotuning (`tp->tcp_mstamp`).
+fn mstamp_us() -> u64 {
+    narf_scheduler::narf_time::monotonic_ns() / 1000
+}
+
+/// Linux `tcp_rcv_space_adjust`, called as `tcp_recvmsg_locked` does: every
+/// time `copied` bytes were handed to the application. A reader that takes
+/// more per round trip than the round before gets a larger receive window,
+/// up to `tcp_rmem[2]`, so the sender's rate is bounded by the path rather
+/// than by `DEFAULT_RCV_BUF / RTT`. The new limit is advertised by the
+/// window update the caller already sends when the window opened by an MSS.
+fn rcv_space_adjust(t: &mut Tcb, copied: usize) {
+    t.rcv_space.copied = t.rcv_space.copied.wrapping_add(copied as u32);
+    let inq = t.recv_buf.in_order_len().min(u32::MAX as usize) as u32;
+    let ooo_span = t.recv_buf.ooo_span(t.rcv_nxt);
+    let advmss = u32::from(t.opts.our_mss.max(MIN_MSS));
+    let limit = t.recv_buf.limit.min(u32::MAX as usize) as u32;
+    let Some(grown) = t
+        .rcv_space
+        .adjust(mstamp_us(), inq, ooo_span, advmss, limit)
+    else {
+        return;
+    };
+    // A window the negotiated scale cannot express is never advertised.
+    let representable = if t.opts.wscale_active {
+        (u16::MAX as u32) << t.opts.our_wscale
+    } else {
+        u16::MAX as u32
+    };
+    let grown = grown.min(representable);
+    if grown > limit {
+        t.recv_buf.limit = grown as usize;
+    }
+}
+
+/// Feed the receiver's round-trip estimate from an arriving data segment:
+/// `tcp_rcv_rtt_measure_ts` from the echoed timestamp, before the segment is
+/// queued.
+fn rcv_rtt_measure_ts(t: &mut Tcb, tsecr: u32, segment_len: usize) {
+    let queue_empty = t.recv_buf.in_order_len() == 0;
+    let mss = rcv_mss(t);
+    t.rcv_space.measure_ts(
+        tsecr,
+        tsval_now(),
+        segment_len.min(u32::MAX as usize) as u32,
+        mss,
+        queue_empty,
+    );
 }
 
 fn tsval_now() -> u32 {
@@ -4219,7 +4285,7 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
     let win = rcv_window(arc);
     let mut advanced = false;
     if !payload.is_empty() {
-        advanced = enqueue_recv(arc, hdr.sequence, payload);
+        advanced = enqueue_recv(arc, hdr.sequence, payload, None);
     }
     if hdr.flags & FLAG_FIN != 0 {
         process_fin(arc, hdr, payload.len());
@@ -4381,7 +4447,12 @@ fn handle_in_established(
     let mut advanced = false;
     if !payload.is_empty() {
         rxtx_note_rx();
-        advanced = enqueue_recv(arc, hdr.sequence, payload);
+        advanced = enqueue_recv(
+            arc,
+            hdr.sequence,
+            payload,
+            parsed.timestamps.map(|(_, tsecr)| tsecr),
+        );
     }
     if !payload.is_empty() {
         complete_deferred_accept(arc);
@@ -4446,7 +4517,12 @@ fn handle_in_fin_wait1(
     };
     let mut advanced = false;
     if !payload.is_empty() {
-        advanced = enqueue_recv(arc, hdr.sequence, payload);
+        advanced = enqueue_recv(
+            arc,
+            hdr.sequence,
+            payload,
+            parsed.timestamps.map(|(_, tsecr)| tsecr),
+        );
     }
     let their_fin = hdr.flags & FLAG_FIN != 0 && process_fin(arc, hdr, payload.len());
     let mut t = arc.lock();
@@ -4490,7 +4566,12 @@ fn handle_in_fin_wait2(
     handle_ack(arc, hdr, parsed, payload.len());
     let mut advanced = false;
     if !payload.is_empty() {
-        advanced = enqueue_recv(arc, hdr.sequence, payload);
+        advanced = enqueue_recv(
+            arc,
+            hdr.sequence,
+            payload,
+            parsed.timestamps.map(|(_, tsecr)| tsecr),
+        );
     }
     if hdr.flags & FLAG_FIN != 0 && process_fin(arc, hdr, payload.len()) {
         let mut t = arc.lock();
@@ -4568,6 +4649,8 @@ fn handle_ack(
     let mut t = arc.lock();
     let id = t.id;
     let writable_before = t.user_can_write();
+    // Linux SOCK_NOSPACE: the writer has filled the send buffer.
+    let sndbuf_full = t.send_buf.len() >= t.send_buf.limit;
     // RFC 5681 §2 "DUPLICATE ACKNOWLEDGMENT": only a segment that carries no
     // data, no SYN/FIN, and leaves the advertised window unchanged counts.
     // Without the payload / window conditions, reverse-direction data (which
@@ -4662,6 +4745,23 @@ fn handle_ack(
             tcb.cc.on_ack(&mut tcb.cong, bytes_acked, now);
         }
         t.cong.clear_recovery_if_passed(ack);
+        // `tcp_check_space` → `tcp_new_space`: a writer that ran out of
+        // buffer gets room for twice the congestion window
+        // (`tcp_sndbuf_expand`), unless it pinned SO_SNDBUF or the window is
+        // still full (`tcp_should_expand_sndbuf`; Linux tests that after
+        // the ACK released new data, here it is before `pump_send`). A fixed
+        // 256 KiB buffer otherwise bounds the flight, and so the rate, at
+        // 256 KiB per RTT.
+        if sndbuf_full
+            && !t.sndbuf_locked
+            && t.snd_nxt.wrapping_sub(t.snd_una) < t.cong.effective_cwnd()
+        {
+            let mss = send_mss(&t);
+            let cwnd = t.cong.effective_cwnd();
+            if let Some(limit) = super::autotune::sndbuf_for(cwnd, mss, t.send_buf.limit) {
+                t.send_buf.limit = limit;
+            }
+        }
         t.rto_count = 0;
         t.keepalive_probes_sent = 0;
         t.last_progress_cycles = now;
@@ -4778,8 +4878,16 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 
 /// Queue an arrived payload. Returns `true` if it advanced `rcv_nxt`
 /// (in-order new data); `false` for out-of-order or duplicate data.
-fn enqueue_recv(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, payload: &[u8]) -> bool {
+fn enqueue_recv(
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    seq: u32,
+    payload: &[u8],
+    tsecr: Option<u32>,
+) -> bool {
     let mut t = arc.lock();
+    if let Some(tsecr) = tsecr.filter(|_| t.opts.timestamps_active) {
+        rcv_rtt_measure_ts(&mut t, tsecr, payload.len());
+    }
     let before = t.rcv_nxt;
     let rcv = t.rcv_nxt;
     let new_rcv = t.recv_buf.accept(seq, payload, rcv);
@@ -4787,6 +4895,10 @@ fn enqueue_recv(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, payload: &[u8]) -> bo
         // Contiguous bytes advanced — clear SACK ranges fully
         // covered.
         t.sack_book.prune_to(new_rcv);
+        // `tcp_event_data_recv` → `tcp_rcv_rtt_measure`: one advertised
+        // window of in-sequence data takes at least a round trip to arrive.
+        let wnd = t.rcv_wnd;
+        t.rcv_space.measure_window(new_rcv, wnd, mstamp_us());
     } else if !payload.is_empty() {
         // Out-of-order segment — record SACK range.
         t.sack_book

@@ -1162,3 +1162,155 @@ fn smoke_half_closed_receive_wakes_reader() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/tcp/robust", smoke_half_closed_receive_wakes_reader);
+
+/// Deliver `segments` in-order 1400-byte data segments and read them all.
+fn stream_and_read(id: u32, local: [u8; 4], peer: [u8; 4], port: u16, segments: usize) -> usize {
+    let payload = [0x5a; 1400];
+    for _ in 0..segments {
+        let seq = __with_tcb(id, |t| t.rcv_nxt).unwrap_or(0);
+        inject(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: port,
+            seq,
+            ack: 0x10000,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &payload,
+        });
+    }
+    let mut buf = vec![0u8; segments * payload.len()];
+    recv_errno(id, &mut buf).unwrap_or(0)
+}
+
+/// Physical I225, browser download at a third of line rate: every
+/// connection advertised the fixed 256 KiB receive buffer for its whole
+/// life, which bounds a sender at 256 KiB per round trip. Linux
+/// `tcp_rcv_space_adjust` grows the buffer while the reader keeps pace, and
+/// leaves a buffer the application sized with `SO_RCVBUF` alone.
+fn smoke_receive_buffer_autotunes_past_default() -> TestResult {
+    use crate::tcp::socket_buf::DEFAULT_RCV_BUF;
+    let local = [10, 91, 0, 1];
+    let peer = reset("rcvtune0", local);
+    let id = established(local, 7_901, peer, 80);
+    let _ = __with_tcb_mut(id, |t| {
+        t.opts.wscale_active = true;
+        t.opts.our_wscale = 7;
+    });
+    // Less than one advertised window: no receiver RTT sample yet, so the
+    // buffer must not move however much was read.
+    if stream_and_read(id, local, peer, 7_901, 100) != 140_000 {
+        return TestResult::Fail("in-order data was not readable");
+    }
+    if __with_tcb(id, |t| t.recv_buf.limit) != Some(DEFAULT_RCV_BUF) {
+        return TestResult::Fail("receive buffer changed before any RTT sample");
+    }
+    // A full advertised window has now arrived: that is the RTT sample, and
+    // the reader took all of it within the round.
+    let _ = drain();
+    if stream_and_read(id, local, peer, 7_901, 100) != 140_000 {
+        return TestResult::Fail("in-order data was not readable");
+    }
+    let (limit, sampled) =
+        __with_tcb(id, |t| (t.recv_buf.limit, t.rcv_space.rtt_us8 != 0)).unwrap_or((0, false));
+    if !sampled {
+        return TestResult::Fail("a full window of data produced no receiver RTT sample");
+    }
+    if limit <= DEFAULT_RCV_BUF {
+        return TestResult::Fail("receive buffer did not grow for a reader that kept pace");
+    }
+    if limit > 6_291_456 / 2 {
+        return TestResult::Fail("receive buffer grew past tcp_rmem[2]");
+    }
+    // The larger window must reach the peer: the read's window update
+    // advertises it (scaled by 2^7).
+    let advertised = drain()
+        .iter()
+        .filter(|f| ethertype(f) == 0x0800 && f.len() >= TCP_OFF + 20)
+        .map(|f| u32::from(u16::from_be_bytes([f[TCP_OFF + 14], f[TCP_OFF + 15]])) << 7)
+        .max()
+        .unwrap_or(0);
+    if advertised <= DEFAULT_RCV_BUF as u32 {
+        return TestResult::Fail("the grown receive window was never advertised");
+    }
+
+    // SO_RCVBUF (SOCK_RCVBUF_LOCK) pins the buffer through the same traffic.
+    let locked = established(local, 7_902, peer, 80);
+    if core::set_buffer_limits(locked, None, Some(2 * DEFAULT_RCV_BUF as u32)).is_err() {
+        return TestResult::Fail("SO_RCVBUF was rejected");
+    }
+    for _ in 0..2 {
+        let _ = stream_and_read(locked, local, peer, 7_902, 100);
+    }
+    let (limit, measured) =
+        __with_tcb(locked, |t| (t.recv_buf.limit, t.rcv_space.space)).unwrap_or((0, 0));
+    if limit != DEFAULT_RCV_BUF {
+        return TestResult::Fail("autotuning resized a buffer the application locked");
+    }
+    if measured == 0 {
+        return TestResult::Fail("a locked buffer stopped the consumption measurement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_receive_buffer_autotunes_past_default
+);
+
+/// The upload half of the same defect: the 256 KiB send buffer bounds the
+/// flight whatever the congestion window. Linux `tcp_sndbuf_expand` gives a
+/// writer that filled its buffer room for twice the window, up to
+/// `tcp_wmem[2]`, unless `SO_SNDBUF` fixed the size.
+fn smoke_send_buffer_expands_with_congestion_window() -> TestResult {
+    use crate::tcp::socket_buf::DEFAULT_SND_BUF;
+    let local = [10, 92, 0, 1];
+    let peer = reset("sndtune0", local);
+    let data = vec![0x33u8; DEFAULT_SND_BUF + 4096];
+    for (port, lock) in [(7_911u16, false), (7_912, true)] {
+        let id = established(local, port, peer, 80);
+        if lock && core::set_buffer_limits(id, Some(DEFAULT_SND_BUF as u32), None).is_err() {
+            return TestResult::Fail("SO_SNDBUF was rejected");
+        }
+        let _ = __with_tcb_mut(id, |t| {
+            t.opts.peer_wscale = 7;
+            t.snd_wnd = 65_535 << 7;
+            t.cong.cwnd = 1 << 20;
+        });
+        if send(id, &data) != Ok(DEFAULT_SND_BUF) {
+            return TestResult::Fail("the writer did not fill the default send buffer");
+        }
+        let _ = drain();
+        // The peer acknowledges part of the flight with its window open.
+        let rcv_nxt = __with_tcb(id, |t| t.rcv_nxt).unwrap_or(0);
+        inject(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: port,
+            seq: rcv_nxt,
+            ack: 0x10000 + 100_000,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[],
+        });
+        let limit = __with_tcb(id, |t| t.send_buf.limit).unwrap_or(0);
+        if lock {
+            if limit != DEFAULT_SND_BUF {
+                return TestResult::Fail("autotuning resized a send buffer the application locked");
+            }
+        } else if limit < 2 << 20 || limit > 4_194_304 {
+            return TestResult::Fail(
+                "a full send buffer did not expand to twice the congestion window",
+            );
+        }
+        let _ = drain();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_send_buffer_expands_with_congestion_window
+);
