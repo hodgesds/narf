@@ -1191,6 +1191,14 @@ On such an egress `tcp::core::pump_send` sends one segment at a time:
 - `TxQueue::run_wakeups` resumes waiters once per wake (`tcp::core::tx_resume`).
   A connection that has waited `TX_WAIT_PROBE_NS` (10 ms) without a wake
   offers its segment again from the TCP timer tick.
+- The sender never re-offers in a loop: the queue's stopped flag is read
+  before a segment is marked or a frame built, one immediate re-offer is
+  allowed after a refusal (for a wake that raced it), and after that the
+  connection parks whatever the flag says. A binding whose queue object the
+  driver has replaced is dropped and made again from the next frame.
+- `txq::stats` counts, and one line per second at most reports, a connection
+  refused 64 times in a row, a connection waiting a second for its queue, a
+  queue stopped for a second, and a frame copied because its pool was empty.
 
 Traffic that is not new TCP data uses the interface's ordinary send hook
 whether or not the queue is stopped. If the device refuses it there: a pure
