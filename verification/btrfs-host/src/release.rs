@@ -804,6 +804,7 @@ fn crash_case(args: &Args, case: &Case) -> Result<String, String> {
             nodesize,
             root_subvol: "@",
             others: &[],
+            default_profile: false,
         },
         &crash::Opts {
             cuts: 0,
@@ -892,6 +893,147 @@ fn dir_orphan(args: &Args) -> Result<String, String> {
         let _ = std::fs::remove_dir_all(&dir);
     }
     Ok("    directory orphan (Linux rmdir of an open directory): btrfs check clean before and after, evicted by the next mount".into())
+}
+
+/// A read-only snapshot NARF takes and never touches, judged by Linux.
+///
+/// Snapshot creation is refused under `narf.disks=root-rw`, so this runs on
+/// a host image mounted under the default profile
+/// ([`narf::mount_default`]). With every commit's writes recorded, the
+/// stream is cut at every flush around the snapshot's transaction: each
+/// image must pass `btrfs check` (which reads the snapshot's tree through
+/// its ROOT_ITEM) and remount at the state before or after. Then the final
+/// image: `btrfs check`, also `--check-data-csum`, and `btrfs restore` of
+/// the snapshot alone, whose files must be the source's at the time of the
+/// snapshot, byte for byte, though the source changed afterwards.
+fn readonly_snapshot(args: &Args) -> Result<String, String> {
+    let dir = args.workdir.join("release-snapshot");
+    let img = mkfs(&dir, 512 << 20, 0x5a9, FEATURES)?;
+    let (fsid, nodesize, _) = dev::image_identity(&img);
+    // Files to snapshot, committed; the image the replay starts from.
+    {
+        let dev = Arc::new(RecDev::open(&img, 512, fsid, nodesize));
+        let fs = narf::mount_default(dev, &fsid, "@")?;
+        let top = block_on(fs.root().mkdir("data")).map_err(err("mkdir"))?;
+        drop(build(&top, "pages", 60, PAGE)?);
+        drop(build(&top, "big", 3, 128 << 10)?);
+        block_on(fs.root().fsync(false)).map_err(err("fsync"))?;
+        drop(top);
+        drop(fs);
+        narf::reset();
+    }
+    let base = dir.join("base.img");
+    linux::clone_file(&img, &base);
+    let base_gen = dev::image_identity(&base).2;
+
+    let dev = Arc::new(RecDev::open(&img, 512, fsid, nodesize));
+    dev.set_recording(true);
+    let fs = narf::mount_default(dev.clone(), &fsid, "@")?;
+    let root = fs.root();
+    let before = narf::walk(&root)?.0;
+    block_on(async {
+        root.snapshot_async(root.clone(), "ro-snap", true).await?;
+        root.fsync(false).await
+    })
+    .map_err(err("snapshot"))?;
+    let after = narf::walk(&root)?.0;
+    let snap_gens: Vec<u64> = dev
+        .sb_gens()
+        .into_iter()
+        .filter(|&g| g > base_gen)
+        .collect();
+    dev.set_recording(false);
+    let log = dev.take_log();
+    // Change the source afterwards: the snapshot must not follow.
+    let data = block_on(root.lookup_dir_async("data")).map_err(err("lookup"))?;
+    let pages = block_on(data.lookup_async("pages")).map_err(err("lookup"))?;
+    block_on(async {
+        pages.write(0, &vec![0xeeu8; 3 * PAGE]).await?;
+        pages.truncate((30 * PAGE) as u64).await?;
+        data.unlink("big").await?;
+        root.fsync(false).await
+    })
+    .map_err(err("changing the source"))?;
+    drop(pages);
+    drop(data);
+    drop(root);
+    drop(fs);
+    narf::reset();
+
+    let commits: Vec<CommitRec> = snap_gens
+        .iter()
+        .map(|&gen| CommitRec {
+            gen,
+            candidates: vec![vec![before.clone()], vec![after.clone()]],
+        })
+        .collect();
+    let rep = crash::run(
+        &crash::Input {
+            base: &base,
+            log: &log,
+            commits: &commits,
+            base_gen,
+            base_state: vec![before.clone()],
+            lba: 512,
+            fsid,
+            nodesize,
+            root_subvol: "@",
+            others: &[],
+            default_profile: true,
+        },
+        &crash::Opts {
+            cuts: 0,
+            exhaustive: true,
+            seed: args.seed,
+            jobs: args.jobs,
+            workdir: dir.join("cuts"),
+        },
+    );
+    if !rep.failures.is_empty() {
+        return Err(format!(
+            "read-only snapshot: {} of {} crash cuts failed:\n{}",
+            rep.failures.len(),
+            rep.cuts,
+            rep.failures.join("\n")
+        ));
+    }
+    linux::check(&img, false).map_err(|e| format!("read-only snapshot: {e}"))?;
+    linux::check(&img, true).map_err(|e| format!("read-only snapshot: {e}"))?;
+    // Linux reads the snapshot: restore it and compare with the source as
+    // it was when the snapshot was taken.
+    let subvols = linux::subvolumes(&img)?;
+    let snap_id = subvols
+        .iter()
+        .find(|sub| sub.name == "ro-snap")
+        .map(|sub| sub.id)
+        .ok_or("read-only snapshot: no subvolume ro-snap")?;
+    let restored = linux::restore(&img, snap_id, &dir.join("restored"))
+        .map_err(|e| format!("read-only snapshot: btrfs restore of the snapshot: {e}"))?;
+    let mut compared = 0usize;
+    for (path, entry) in &before {
+        let Flat::File { data, .. } = entry else {
+            continue;
+        };
+        match restored.get(path) {
+            Some(Flat::File { data: got, .. }) if got == data => compared += 1,
+            _ => return Err(format!(
+                "read-only snapshot: {path} as restored differs from the source at snapshot time"
+            )),
+        }
+    }
+    if compared < 3 {
+        return Err(format!(
+            "read-only snapshot: only {compared} files compared"
+        ));
+    }
+    if !args.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(format!(
+        "    read-only snapshot (default profile): {} commits, {} cuts, every image checks clean and remounts before or after; btrfs check (also --check-data-csum) clean, btrfs restore of the snapshot matches the source at snapshot time ({compared} files) after the source changed",
+        snap_gens.len(),
+        rep.cuts
+    ))
 }
 
 pub fn run(args: &Args) -> Result<String, String> {
@@ -1077,6 +1219,7 @@ pub fn run(args: &Args) -> Result<String, String> {
         lines.push(crash_case(args, case)?);
     }
     lines.push(dir_orphan(args)?);
+    lines.push(readonly_snapshot(args)?);
     Ok(format!(
         "release: OK\n{}\n    btrfs check clean (also --check-data-csum), no orphan item left, files empty or gone after a remount; {:.0?}",
         lines.join("\n"),

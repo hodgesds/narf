@@ -401,6 +401,7 @@ fn run_scenario(sc: &Scenario, seed: u64, args: &Args) -> Result<String, String>
             nodesize,
             root_subvol: "@",
             others: &others,
+            default_profile: false,
         };
         let opts = crash::Opts {
             cuts: sc.cuts,
