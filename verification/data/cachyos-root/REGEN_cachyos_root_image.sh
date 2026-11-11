@@ -29,6 +29,13 @@
 #   CACHYOS_ROOT_BGT=0           build btrfs without block-group-tree
 #   CACHYOS_ROOT_COMPRESS=no     store file data uncompressed (default zstd:1)
 #   CACHYOS_ROOT_PACKAGES="..."  extra packages to install
+#   CACHYOS_ROOT_BTRFS_MIB=<n>   size of the btrfs partition (default 4096)
+#   CACHYOS_ROOT_SYNC=1          refresh the image's private copy of the sync
+#                                databases first: the host's copy can name a
+#                                package version the mirrors no longer carry
+#   CACHYOS_ROOT_HOOK=<script>   run as the image's root with the rootfs path
+#                                as $1, after the configuration and before
+#                                the subvolume split (users, units, files)
 set -euo pipefail
 
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -110,12 +117,18 @@ if [ "${CACHYOS_ROOT_REBUILD:-0}" = 1 ] || [ ! -x "$R/usr/lib/systemd/systemd" ]
   fi
   mkdir -p "$R/var/lib/pacman/sync" "$R/etc/pacman.d/hooks"
   make_pacman_conf
-  cp -f /var/lib/pacman/sync/*.db "$R/var/lib/pacman/sync/"
-  cp -f /var/lib/pacman/sync/*.db.sig "$R/var/lib/pacman/sync/" 2>/dev/null || true
+  if [ "${CACHYOS_ROOT_SYNC:-0}" = 1 ]; then
+    # Fresh databases and their signatures, both from the mirrors.
+    SYNC_OP=-Sy
+  else
+    SYNC_OP=-S
+    cp -f /var/lib/pacman/sync/*.db "$R/var/lib/pacman/sync/"
+    cp -f /var/lib/pacman/sync/*.db.sig "$R/var/lib/pacman/sync/" 2>/dev/null || true
+  fi
   # shellcheck disable=SC2086
   in_ns /bin/bash -c '
     set -euo pipefail
-    R="$1"; CONF="$2"; shift 2
+    R="$1"; CONF="$2"; SYNC="$3"; shift 3
     mkdir -p "$R/dev" "$R/proc" "$R/sys" "$R/tmp" "$R/run"
     mount --rbind /dev "$R/dev"
     mount --make-rslave "$R/dev"
@@ -125,8 +138,8 @@ if [ "${CACHYOS_ROOT_REBUILD:-0}" = 1 ] || [ ! -x "$R/usr/lib/systemd/systemd" ]
     mount -t tmpfs tmpfs "$R/tmp"
     mount -t tmpfs tmpfs "$R/run"
     pacman --config "$CONF" --root "$R" --dbpath "$R/var/lib/pacman" \
-      --noconfirm --needed --noprogressbar -S "$@"
-  ' -- "$R" "$WORK/pacman.conf" $PACKAGES
+      --noconfirm --needed --noprogressbar "$SYNC" "$@"
+  ' -- "$R" "$WORK/pacman.conf" "$SYNC_OP" $PACKAGES
   printf '%s' "$PACKAGES" > "$STAMP"
 fi
 
@@ -177,6 +190,9 @@ EOF
   mkdir -p "$R/etc/systemd/system/getty.target.wants"
   ln -sfn /usr/lib/systemd/system/getty@.service \
     "$R/etc/systemd/system/getty.target.wants/getty@tty1.service"
+  if [ -n "$5" ]; then
+    /bin/bash "$5" "$R"
+  fi
   # CachyOS subvolumes: the mount points stay as empty directories in @,
   # their contents move into the matching subvolume.
   for pair in home:@home root:@root srv:@srv var/cache:@cache var/tmp:@tmp var/log:@log; do
@@ -199,7 +215,7 @@ EOF
   mkdir -p "$R/boot/efi"
   # The pacman package cache is a separate directory, never inside @cache.
   rm -rf "$STAGE/@cache/pacman/pkg"/* 2>/dev/null || true
-' -- "$R" "$STAGE" "$BTRFS_UUID" "$ESP_UUID"
+' -- "$R" "$STAGE" "$BTRFS_UUID" "$ESP_UUID" "${CACHYOS_ROOT_HOOK:-}"
 
 # --------------------------------------------------------------- disks ---
 echo "cachyos-root: building filesystems"
