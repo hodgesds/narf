@@ -487,7 +487,15 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         Arc::new(crate::mapped_file::MappingProvenance {
             device: ops.inode_attrs().dev,
             inode: ops.ino(),
-            pathname: crate::mqueue::fd_path(current_task_id(), fd as u32)
+            // `d_path`, as it reads when the mapping is made.
+            pathname: crate::mqueue::fd_name(current_task_id(), fd as u32)
+                .map(|name| {
+                    if name.deleted {
+                        alloc::format!("{} (deleted)", name.path)
+                    } else {
+                        alloc::string::String::from(&*name.path)
+                    }
+                })
                 .or_else(|| internal_file_path(&**ops)),
         })
     });

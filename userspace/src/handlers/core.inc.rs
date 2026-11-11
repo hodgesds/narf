@@ -1814,7 +1814,10 @@ fn open_impl_reserved(
                         status_flags: open_status_flags,
                     });
                 match new_fd {
-                    Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+                    Some(n) => {
+                        crate::mqueue::register_fd_tmpfile(task, n, path, current_mount_id_at(path));
+                        ctx.set_return(SyscallReturn::ok(n as u64));
+                    }
                     None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
                 }
             }
@@ -2648,6 +2651,10 @@ fn open_fifo(
         }
     };
 
+    // The file is open on `_path` from here on, whether or not this open
+    // goes on to wait for a peer.
+    crate::mqueue::register_fd_path(task, new_fd, _path, current_mount_id_at(_path));
+
     // Opening either direction changes the FIFO peer condition. Blocking
     // openers use the normal deduplicated I/O-waker registry below; publish
     // the transition only after the handle/open-count is visible. The shared
@@ -2660,7 +2667,6 @@ fn open_fifo(
         || (can_read && shared.writer_count() > 0)
         || (can_write && shared.reader_count() > 0);
     if peer_ready {
-        crate::mqueue::register_fd_path(task, new_fd, _path, current_mount_id_at(_path));
         ctx.set_return(SyscallReturn::ok(new_fd as u64));
         return;
     }
@@ -12439,7 +12445,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     } else {
         crate::fd::fork(parent_pid, child_tid.raw());
     }
-    crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
 
     // CLONE_PIDFD: publish the already-reserved descriptor only after the
     // child's fd-table copy. A non-CLONE_FILES child therefore cannot inherit
@@ -14998,7 +15003,6 @@ fn release_task_tables(tid: u64) {
     fs_release(tid);
     task_map_remove(&PERSONALITY_TABLE, tid);
     remove_mount_namespace(tid);
-    crate::mqueue::release_task_fd_paths(tid);
 
     // Memory policy. `MBIND_TABLE` is deliberately NOT retired here: range
     // policies are keyed by address space and die with it
@@ -15446,7 +15450,6 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
             .is_some_and(|m| m.contains_key(&tid)),
         1 << 11,
     );
-    r |= has(crate::mqueue::task_has_fd_paths(tid), 1 << 12);
     r
 }
 

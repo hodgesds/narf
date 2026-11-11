@@ -115,6 +115,8 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str, last: LastC
     match outcome {
         Some((_, Some(Ok(())))) => {
             crate::mqueue::notify_delete(path, false);
+            // `d_delete`: a file still open under this name reads `(deleted)`.
+            crate::fd::names::unlinked(&open_file_name(path));
             ctx.set_return(SyscallReturn::ok(0));
         }
         // The address was freed even if no filesystem node backed the path

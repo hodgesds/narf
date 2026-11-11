@@ -3068,7 +3068,7 @@ fn smoke_abi_proc_fdinfo_read_no_deadlock() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc_fdinfo_read_no_deadlock);
+kernel_test_in!("syscall_abi/procfd", smoke_abi_proc_fdinfo_read_no_deadlock);
 
 // ── seccomp(2): compatibility query/error subset ───────────────────
 //
