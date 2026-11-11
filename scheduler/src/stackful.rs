@@ -378,6 +378,148 @@ fn preempt_enabled() -> bool {
     preempt_count() == 0
 }
 
+/// A stackful continuation gave up its CPU while holding state that belongs
+/// to that CPU.
+///
+/// Two kinds of state are counted per CPU and released on whichever CPU the
+/// holder happens to be running on: QSBR read guards (`narf_rcu::pin`) and
+/// preempt-disable depth ([`preempt_disable`]). A continuation that parks or
+/// yields with either held leaves its CPU pinned or unpreemptible while other
+/// tasks run there, and, once an idle CPU takes the sleeping task, releases
+/// on the wrong CPU. `ReadGuard` and [`PreemptGuard`] are `!Send`, which
+/// protects `async fn` state machines; a stackful continuation is switched as
+/// a stack and is never checked by the compiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParkViolation {
+    /// Task that gave up the CPU.
+    pub task: u64,
+    /// CPU it gave up.
+    pub cpu: u32,
+    /// QSBR read guards live on that CPU at that moment.
+    pub rcu_readers: usize,
+    /// Preempt-disable depth of that CPU at that moment.
+    pub preempt_depth: u32,
+    /// Source location that requested the park or yield.
+    pub site: &'static core::panic::Location<'static>,
+}
+
+/// `[nr, arg0..arg5, user_sp, user_pc]` of the system call `task` is in, if
+/// the installer can tell; the frame `/proc/<pid>/syscall` prints.
+pub type ParkSyscallHook = fn(task: u64, syscall: &mut [u64; 9]) -> bool;
+
+static PARK_SYSCALL_HOOK: AtomicUsize = AtomicUsize::new(0);
+static PARK_VIOLATION_HOOK: AtomicUsize = AtomicUsize::new(0);
+static PARK_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+/// Park sites already reported, by `Location` address: a hot path that
+/// violates the rule says so once, not once per park.
+#[cfg(not(feature = "kernel-test"))]
+static PARK_VIOLATION_SITES: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+#[cfg(feature = "kernel-test")]
+static PARK_VIOLATION_EXPECTED: AtomicBool = AtomicBool::new(false);
+
+/// Let the park-violation report name the system call the task is in.
+pub fn set_park_syscall_hook(hook: ParkSyscallHook) {
+    PARK_SYSCALL_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Replace the built-in one-line report with `hook`. It runs on the parking
+/// task's own stack, before the switch, once per park site.
+pub fn set_park_violation_hook(hook: fn(&ParkViolation)) {
+    PARK_VIOLATION_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Parks and yields seen so far with CPU-local state held.
+pub fn park_violation_count() -> u64 {
+    PARK_VIOLATIONS.load(Ordering::Relaxed)
+}
+
+/// Under `kernel-test` a violation is a hard failure. A test that provokes
+/// one on purpose arms this first; it is then only counted.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __test_expect_park_violation(expected: bool) {
+    PARK_VIOLATION_EXPECTED.store(expected, Ordering::Release);
+}
+
+/// What `cpu` holds that a continuation leaving it must not take along:
+/// `(QSBR read guards, preempt-disable depth)`, or `None` when it holds
+/// neither. Two loads of this CPU's own counters.
+///
+/// A nested executor round (`poll_one_round_nested`) runs inside another
+/// kernel frame, and whatever that frame holds is counted on this CPU too
+/// without belonging to the task parking inside the round. It stays on this
+/// CPU with its frame, so there is nothing to report and no way to tell the
+/// two apart; nested rounds are skipped.
+#[inline]
+fn cpu_local_state_held(cpu: usize) -> Option<(usize, u32)> {
+    let rcu_readers = narf_rcu::reader_nesting();
+    let preempt_depth = PREEMPT_DEPTH[cpu].load(Ordering::Relaxed);
+    if (rcu_readers == 0 && preempt_depth == 0) || crate::in_nested_round(cpu) {
+        return None;
+    }
+    Some((rcu_readers, preempt_depth))
+}
+
+#[cold]
+#[inline(never)]
+fn report_park_violation(violation: ParkViolation) {
+    PARK_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "kernel-test")]
+    {
+        if PARK_VIOLATION_EXPECTED.load(Ordering::Acquire) {
+            return;
+        }
+        panic!(
+            "task {} gave up cpu {} holding CPU-local state: {} QSBR read guard(s), \
+             preempt-disable depth {} (requested at {})",
+            violation.task,
+            violation.cpu,
+            violation.rcu_readers,
+            violation.preempt_depth,
+            violation.site
+        );
+    }
+    #[cfg(not(feature = "kernel-test"))]
+    {
+        let site = core::ptr::from_ref(violation.site) as usize;
+        for seen in &PARK_VIOLATION_SITES {
+            match seen.compare_exchange(0, site, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(recorded) if recorded == site => return,
+                Err(_) => {}
+            }
+        }
+        let hook = PARK_VIOLATION_HOOK.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: only `set_park_violation_hook` stores here, from a
+            // `fn(&ParkViolation)`.
+            let hook = unsafe { core::mem::transmute::<usize, fn(&ParkViolation)>(hook) };
+            hook(&violation);
+            return;
+        }
+        let mut syscall = [0u64; 9];
+        let hook = PARK_SYSCALL_HOOK.load(Ordering::Acquire);
+        let named = hook != 0 && {
+            // SAFETY: only `set_park_syscall_hook` stores here, from a
+            // `ParkSyscallHook`.
+            let hook = unsafe { core::mem::transmute::<usize, ParkSyscallHook>(hook) };
+            hook(violation.task, &mut syscall)
+        };
+        narf_console::klog!(
+            "BUG: scheduler: task {} gave up cpu {} holding CPU-local state: {} QSBR read \
+             guard(s), preempt-disable depth {}; requested at {}; syscall nr={} user_pc={:#x}{}",
+            violation.task,
+            violation.cpu,
+            violation.rcu_readers,
+            violation.preempt_depth,
+            violation.site,
+            syscall[0],
+            syscall[8],
+            if named { "" } else { " (syscall not known)" }
+        );
+    }
+}
+
 /// Read-and-clear this CPU's "last poll_to_yield returned via preemption" flag.
 /// Returns `true` iff the most recent stackful poll on this CPU yielded because
 /// it was involuntarily preempted (not a cooperative `.await`). The executor
@@ -3872,6 +4014,7 @@ pub fn current_slice_elapsed_ns() -> u64 {
 /// Called from a syscall handler running in kernel mode on the current task's
 /// own kernel stack, with a stackful task current on this CPU.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
 pub unsafe fn yield_current_stackful() {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -3898,6 +4041,7 @@ pub unsafe fn yield_current_stackful() {
 /// `p` must be the live `CURRENT_STACKFUL_TASK` for `cpu`, and the caller must
 /// execute on that CPU in kernel mode on the task's own stack.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
 unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yield_peer: bool) {
     #[cfg(target_arch = "x86_64")]
     debug_assert!(
@@ -3913,6 +4057,18 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yie
     let exec_ctx = unsafe { (*p).exec_ctx.load(Ordering::Acquire) };
     if exec_ctx.is_null() {
         return;
+    }
+    // Every voluntary switch-out comes through here, and the sleeping task
+    // may be resumed by any allowed CPU. It must not take this CPU's read
+    // guards or preempt-disable depth with it (see `ParkViolation`).
+    if let Some((rcu_readers, preempt_depth)) = cpu_local_state_held(cpu) {
+        report_park_violation(ParkViolation {
+            task: crate::current_task_id_on(cpu).raw(),
+            cpu: cpu as u32,
+            rcu_readers,
+            preempt_depth,
+            site: core::panic::Location::caller(),
+        });
     }
     let masked_trap_park = !narf_arch::interrupts_enabled();
     if masked_trap_park {
@@ -4012,6 +4168,7 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask, select_yie
 /// switch-out as `maybe_resched_syscall_exit` / the own-stack park paths — the
 /// well-tested cooperative path, NOT `no_preempt`.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
 pub fn cooperative_yield() -> bool {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
@@ -4042,6 +4199,7 @@ pub fn cooperative_yield() -> bool {
 /// context switch when the conservative runnable-work probe finds no peer and
 /// using the bounded direct-transfer path for an eligible local peer.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[track_caller]
 pub fn sched_yield_current() -> bool {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);

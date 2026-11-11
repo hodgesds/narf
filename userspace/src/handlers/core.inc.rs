@@ -16240,6 +16240,22 @@ pub fn pid_to_task_raw(pid_raw: u64) -> Option<u64> {
 /// Translate a scheduler TaskId to the user-visible ProcessId registered
 /// at fork/spawn time. Returns `None` when the task has no registered
 /// ProcessId (kernel-only tasks, test stubs).
+/// The system call a stackful task is parked in, for the scheduler's
+/// park-with-CPU-local-state report (`set_park_syscall_hook`): fills
+/// `syscall` with `[nr, arg0..arg5, user_sp, user_pc]` and returns true, or
+/// returns false when the task is not a user task in a system call or its
+/// registry shard is contended.
+///
+/// Runs on the parking task's own stack just before it switches out, so the
+/// registry is only `try_lock`ed, no reference is cloned and nothing
+/// allocates.
+pub fn park_syscall_frame(task_raw: u64, syscall: &mut [u64; 9]) -> bool {
+    crate::task::try_with_task(task_raw, |task| task.uctx.blocked_syscall_frame())
+        .flatten()
+        .map(|frame| *syscall = frame)
+        .is_some()
+}
+
 pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
     if let Some((pid, _uid, _gid)) = crate::task::current_cached_identity(task_raw) {
         return Some(pid);

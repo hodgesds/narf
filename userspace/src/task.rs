@@ -408,6 +408,19 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
     task_registry_shard(tid).tasks.lock().get(&tid).cloned()
 }
 
+/// Apply `f` to a registered task without waiting for the registry and
+/// without taking a reference. `None` if the task is gone or its shard is
+/// locked.
+///
+/// For diagnostics that run on a path that must not wait for the registry
+/// (the registry may be held by the very task being described) and must not
+/// hold the last reference to a task. `f` runs under the shard lock, so it
+/// must be short and must not take another task-registry lock.
+pub fn try_with_task<R>(tid: u64, f: impl FnOnce(&Task) -> R) -> Option<R> {
+    let tasks = task_registry_shard(tid).tasks.try_lock()?;
+    tasks.get(&tid).map(|task| f(task))
+}
+
 /// Resolve `tid`, using the stackful task's cached owner when it names the
 /// caller. Cross-task lookups retain the authoritative registry path.
 pub fn task_get_local(tid: u64) -> Option<Arc<Task>> {

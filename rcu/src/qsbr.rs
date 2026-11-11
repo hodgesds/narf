@@ -131,6 +131,19 @@ pub(crate) fn reader_unpin() {
     this_cpu().active_readers.fetch_sub(1, Ordering::Release);
 }
 
+/// Live read guards on the current CPU.
+///
+/// Pin and unpin both index by the CPU they run on. A continuation that
+/// leaves its CPU inside a read section and resumes on another unpins there:
+/// the CPU it left never becomes quiescent again and the CPU it reached
+/// counts below zero. `ReadGuard: !Send` stops an `async fn` from doing that,
+/// but a stackful continuation is switched as a stack and is never checked.
+/// The scheduler reads this where a continuation is about to leave its CPU.
+#[inline]
+pub(crate) fn reader_nesting() -> usize {
+    this_cpu().active_readers.load(Ordering::Relaxed)
+}
+
 // ── Quiescence reporting ───────────────────────────────────────────
 
 /// Declare a quiescent state on the current CPU. Stores the current
