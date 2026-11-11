@@ -871,6 +871,12 @@ fn wiphy_attrs(
     push_attr(&mut attrs, NL80211_ATTR_WIPHY_RETRY_SHORT, &[7]);
     push_attr(&mut attrs, NL80211_ATTR_WIPHY_RETRY_LONG, &[4]);
     push_attr(&mut attrs, NL80211_ATTR_WIPHY_COVERAGE_CLASS, &[0]);
+    // `nl80211_send_wiphy` / `nl80211_send_band_rateinfo` open every level of
+    // this subtree with `nla_nest_start_noflag`: the band, channel and rate
+    // attribute types are plain indices (`enum nl80211_band` for a band).
+    // Userspace reads them raw — `iw phy` printed "Band 32769:" for the
+    // 2.4 GHz band while the flag was set — so NLA_F_NESTED must not leak
+    // into them.
     let mut bands = Vec::new();
     for band in &info.bands {
         let band_id = match band.freq_mhz {
@@ -894,10 +900,10 @@ fn wiphy_attrs(
             };
             let mut entry = Vec::new();
             push_attr(&mut entry, 1, &frequency.to_ne_bytes());
-            push_attr(&mut frequencies, i as u16 | NLA_F_NESTED, &entry);
+            push_attr(&mut frequencies, i as u16, &entry);
         }
         let mut body = Vec::new();
-        push_attr(&mut body, 1 | NLA_F_NESTED, &frequencies);
+        push_attr(&mut body, 1, &frequencies);
         let rates: &[u32] = match band_id {
             0 => &[10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540],
             // Linux ath11k uses ath11k_a_rates for both 5 and 6 GHz
@@ -910,9 +916,9 @@ fn wiphy_attrs(
         for (i, rate) in rates.iter().enumerate() {
             let mut entry = Vec::new();
             push_attr(&mut entry, 1, &rate.to_ne_bytes());
-            push_attr(&mut bitrates, i as u16 | NLA_F_NESTED, &entry);
+            push_attr(&mut bitrates, i as u16, &entry);
         }
-        push_attr(&mut body, 2 | NLA_F_NESTED, &bitrates);
+        push_attr(&mut body, 2, &bitrates);
         if let Some(caps) = iface.and_then(|iface| iface.phy_capabilities(band.freq_mhz)) {
             push_attr(&mut body, 3, &caps.ht[3..19]); // HT MCS set
             push_attr(
@@ -931,9 +937,9 @@ fn wiphy_attrs(
                 );
             }
         }
-        push_attr(&mut bands, band_id | NLA_F_NESTED, &body);
+        push_attr(&mut bands, band_id, &body);
     }
-    push_attr(&mut attrs, 22 | NLA_F_NESTED, &bands);
+    push_attr(&mut attrs, 22, &bands);
     push_attr(
         &mut attrs,
         43,

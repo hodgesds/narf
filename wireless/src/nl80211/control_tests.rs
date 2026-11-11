@@ -442,9 +442,9 @@ fn smoke_nl80211_band_ht_vht_attributes() -> TestResult {
         },
     ];
     let attrs = wiphy_attrs(7, &info, Some(&iface));
-    let bands = find_attr(&attrs, 22 | NLA_F_NESTED).unwrap();
+    let bands = find_attr(&attrs, 22).unwrap();
     for band_id in 0..=1 {
-        let band = find_attr(bands, band_id | NLA_F_NESTED).unwrap();
+        let band = find_attr(bands, band_id).unwrap();
         if find_attr(band, 3).is_none_or(|mcs| mcs.len() != 16 || mcs[..2] != [0xff; 2])
             || find_attr(band, 4) != Some(&0x6eu16.to_ne_bytes()[..])
             || find_attr(band, 5) != Some(&[3][..])
