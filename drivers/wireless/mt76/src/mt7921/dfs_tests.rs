@@ -1,8 +1,8 @@
 //! Radar (DFS) and NO_IR channels: a station follows an AP it heard there,
-//! scans stay passive, and a Channel Switch Announcement from the AP takes
-//! the station off the channel.
+//! scans stay passive, and the station follows the AP's Channel Switch
+//! Announcement in place (or leaves when it cannot).
 use super::*;
-use crate::mt7921::association::{announces_channel_switch, TxPermission};
+use crate::mt7921::association::{channel_switch, ChannelSwitch, TxPermission};
 use alloc::boxed::Box;
 use narf_wireless::reg::{RegFlags, RegRule, RegulatoryDomain};
 
@@ -142,58 +142,182 @@ kernel_test_in!(
     mt7922_scan_records_beacons_not_probe_responses
 );
 
-/// The AP announces a channel switch (CSA, or extended CSA) in its Beacon:
-/// the associated station leaves the channel at once — its receive path
-/// reports the link gone — instead of transmitting until the AP is gone.
-fn mt7922_station_leaves_the_channel_on_the_aps_channel_switch() -> TestResult {
-    if !announces_channel_switch(&[0, 1, b'x', 37, 3, 1, 100, 5])
-        || !announces_channel_switch(&[60, 4, 1, 121, 100, 5])
-        || announces_channel_switch(&[0, 1, b'x', 37, 2, 1, 100])
-        || announces_channel_switch(&[37, 3, 1])
-    {
-        return TestResult::Fail("CSA element recognition");
+/// `frame` as a CONNAC2 RX packet received on 2.4 GHz `channel`.
+fn on_channel(frame: &[u8], channel: u8) -> Vec<u8> {
+    let mut packet = super::descriptor(frame);
+    let r3 = u32::from_le_bytes(packet[12..16].try_into().unwrap());
+    let r3 = (r3 & !0xff00) | u32::from(channel) << 8;
+    packet[12..16].copy_from_slice(&r3.to_le_bytes());
+    packet
+}
+
+fn us_2ghz_policy() -> Arc<CurrentPolicy> {
+    let policy = Arc::new(CurrentPolicy {
+        database: narf_wireless::reg::db::Database::new(),
+        hold_bss_ack: core::sync::atomic::AtomicBool::new(false),
+    });
+    // Channels 1..11 at 20 MHz; 12 and 13 fall outside the rule.
+    policy.database.install(RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![RegRule {
+            freq_start_mhz: 2402,
+            freq_end_mhz: 2472,
+            max_bandwidth_mhz: 20,
+            max_power_dbm: 17,
+            flags: RegFlags::empty(),
+        }],
+    });
+    policy
+}
+
+/// An MT7922 station associated (WPA2 + PMF) on channel 6 under a US
+/// 2.4 GHz policy, with the fixture AP's Beacon.
+fn associated_on_6() -> Option<(Box<Session<Model>>, Vec<u8>)> {
+    let (mut session, bss) = super::pmf_tests::prepared(super::pmf_tests::pmf_ap());
+    session.backend.tx_policy = Some(us_2ghz_policy());
+    let joined = run(Box::pin(session.associate_station(
+        &bss,
+        b"narf",
+        crate::mt7921::association::Security::Wpa2PskPmf {
+            psk: [0x55; 32],
+            required: false,
+        },
+        test_permission(),
+        &[],
+    )));
+    if joined != Ok(42) {
+        return None;
     }
-    for element in [&[37u8, 3, 1, 100, 5][..], &[60, 4, 1, 121, 100, 5]] {
-        let (mut session, bss) = super::pmf_tests::prepared(super::pmf_tests::pmf_ap());
-        let joined = run(Box::pin(session.associate_station(
-            &bss,
-            b"narf",
-            crate::mt7921::association::Security::Wpa2PskPmf {
-                psk: [0x55; 32],
-                required: false,
-            },
-            test_permission(),
-            &[],
-        )));
-        if joined != Ok(42) {
-            return TestResult::Fail("WPA2 association for the CSA test");
+    let beacon = session.backend.access_point.as_ref()?.beacon();
+    Some((session, beacon))
+}
+
+fn with_element(beacon: &[u8], element: &[u8]) -> Vec<u8> {
+    let mut frame = beacon.to_vec();
+    frame.extend_from_slice(element);
+    frame
+}
+
+fn mt7922_channel_switch_elements_parse() -> TestResult {
+    if channel_switch(&[0, 1, b'x', 37, 3, 1, 100, 5])
+        != Some(ChannelSwitch {
+            block_tx: true,
+            channel: 100,
+            count: 5,
+            operating_class: None,
+        })
+        || channel_switch(&[60, 4, 0, 121, 100, 5])
+            != Some(ChannelSwitch {
+                block_tx: false,
+                channel: 100,
+                count: 5,
+                operating_class: Some(121),
+            })
+        || channel_switch(&[0, 1, b'x', 37, 2, 1, 100]).is_some()
+        || channel_switch(&[37, 3, 1]).is_some()
+    {
+        return TestResult::Fail("CSA / ECSA element parsing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/dfs",
+    mt7922_channel_switch_elements_parse
+);
+
+/// The AP announces a switch to channel 11 in two Beacon intervals with
+/// Channel Switch Mode 1 (mac80211 `ieee80211_sta_process_chanswitch`): the
+/// station stops data at once but keeps the link; at the switch time it
+/// retunes (channel domain, power limits, CHANNEL_SWITCH to channel 11)
+/// under the current policy, keeps the association and resumes on the new
+/// channel, where the AP's Beacons keep the link up.
+fn mt7922_station_follows_the_aps_channel_switch_in_place() -> TestResult {
+    let Some((mut session, beacon)) = associated_on_6() else {
+        return TestResult::Fail("association on channel 6");
+    };
+    let announced = with_element(&beacon, &[37, 3, 1, 11, 2]);
+    session.backend.packets.push_back(on_channel(&announced, 6));
+    if session.receive_ethernet().is_err() || session.station.peer_lost {
+        return TestResult::Fail("CSA ended the link instead of being followed");
+    }
+    if !session.station.csa_block_tx || session.station.csa.is_none() {
+        return TestResult::Fail("Channel Switch Mode 1 not recorded");
+    }
+    let mut eth = vec![0xff; 60];
+    eth[6..12].copy_from_slice(&[2, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    eth[12..14].copy_from_slice(&[8, 0]);
+    if session.start_ethernet(&eth) != Err(Error::Busy) {
+        return TestResult::Fail("data sent during Channel Switch Mode 1");
+    }
+    // Two beacon intervals later the switch is due.
+    let now = session.backend.ticks.get();
+    session.backend.ticks.set(now + 1_000_000_000);
+    if !session.keys_pending() {
+        return TestResult::Fail("due channel switch not scheduled");
+    }
+    let before = session.backend.frames.len();
+    if run(Box::pin(session.service_keys())).is_err() {
+        return TestResult::Fail("channel switch service failed");
+    }
+    // MCU TXD: cid 0xed (extended) at 36, ext_cid at 41.
+    let switched = session.backend.frames[before..].iter().any(|(_, f)| {
+        f.get(36) == Some(&0xed)
+            && f.get(41) == Some(&crate::mt7921::regs::MCU_EXT_CMD_CHANNEL_SWITCH)
+    });
+    if !switched
+        || !matches!(
+            session.state,
+            State::Associated {
+                channel: 11,
+                aid: 42,
+                ..
+            }
+        )
+        || !session.station.permission.is_some_and(|p| p.permits(11))
+        || session.station.csa.is_some()
+        || session.station.csa_block_tx
+        || session.station.security.is_none()
+    {
+        return TestResult::Fail("station did not retune to channel 11 with its association");
+    }
+    // The AP's Beacon on the new channel keeps the link.
+    session.backend.station_channel = 11;
+    session.backend.packets.push_back(on_channel(&beacon, 11));
+    if session.receive_ethernet().is_err() || session.station.peer_lost {
+        return TestResult::Fail("Beacon on the new channel dropped the link");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/dfs",
+    mt7922_station_follows_the_aps_channel_switch_in_place
+);
+
+/// A switch the station cannot follow ends the link (mac80211
+/// `ieee80211_sta_connection_lost`): a channel the policy forbids
+/// (channel 13 outside the US 2.4 GHz rule), and another band.
+fn mt7922_station_leaves_on_a_channel_switch_it_cannot_follow() -> TestResult {
+    for (target, reason) in [
+        (13u8, "switch to a forbidden channel was followed"),
+        (36, "switch to another band was followed"),
+    ] {
+        let Some((mut session, beacon)) = associated_on_6() else {
+            return TestResult::Fail("association on channel 6");
+        };
+        let announced = with_element(&beacon, &[37, 3, 0, target, 0]);
+        session.backend.packets.push_back(on_channel(&announced, 6));
+        let _ = session.receive_ethernet();
+        if session.station.csa_block_tx || !session.keys_pending() {
+            return TestResult::Fail("immediate Mode 0 switch not scheduled");
         }
-        let beacon = session.backend.access_point.as_ref().unwrap().beacon();
-        // The AP's unchanged Beacon keeps the link.
-        session
-            .backend
-            .packets
-            .push_back(super::descriptor(&beacon));
-        if session
-            .receive_ethernet()
-            .is_err_and(|error| error == Error::DeviceGone)
-            || session.station.peer_lost
-        {
-            return TestResult::Fail("unchanged Beacon dropped the link");
-        }
-        let mut announced = beacon.clone();
-        announced.extend_from_slice(element);
-        session
-            .backend
-            .packets
-            .push_back(super::descriptor(&announced));
-        if session.receive_ethernet() != Err(Error::DeviceGone) || !session.station.peer_lost {
-            return TestResult::Fail("station stayed on the channel after the AP's CSA");
+        let _ = run(Box::pin(session.service_keys()));
+        if matches!(session.state, State::Associated { .. }) && !session.station.peer_lost {
+            return TestResult::Fail(reason);
         }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/mt7921/dfs",
-    mt7922_station_leaves_the_channel_on_the_aps_channel_switch
+    mt7922_station_leaves_on_a_channel_switch_it_cannot_follow
 );

@@ -743,6 +743,9 @@ impl<B: Backend> Session<B> {
             && matches!(state, State::Associated { .. })
             && self.data_pending.is_empty()
             && (station.wmm_pending.is_some()
+                || station
+                    .csa
+                    .is_some_and(|(_, at)| self.backend.now_ns() >= at)
                 || self.policy_changed(station)
                 || station.ps_wanted != station.ps_applied
                 || !station.control_pending.is_empty()
@@ -1182,12 +1185,12 @@ impl<B: Backend> Session<B> {
                 }
             }
             // The AP announces it is leaving this channel (Channel Switch
-            // Announcement, element 37, or Extended CSA, element 60) — on a
-            // radar channel because it detected radar. This owner does not
-            // follow a switch, so it leaves the channel now, before the AP
-            // does: no further transmission here, and the link loss reaches
-            // userspace as a disconnect (mac80211's outcome when a switch
-            // cannot be followed, `ieee80211_sta_connection_lost`).
+            // Announcement, element 37, or Extended CSA, element 60), on a
+            // radar channel because it detected radar. mac80211
+            // (`ieee80211_sta_process_chanswitch`) records the target and the
+            // switch time (count x beacon interval), stops data at once for
+            // Channel Switch Mode 1, and follows the AP at that time
+            // (`service_channel_switch`).
             if native.ccmp.is_none()
                 && matches!(header[0], 0x80 | 0x50)
                 && header[1] & 0xc7 == 0
@@ -1195,15 +1198,21 @@ impl<B: Backend> Session<B> {
                 && (header[4..10] == own || header[4..10] == [0xff; 6])
                 && header[10..16] == peer
                 && header[16..22] == peer
-                && frame
-                    .get(36..)
-                    .is_some_and(crate::mt7921::association::announces_channel_switch)
+                && self.station.csa.is_none()
             {
-                self.station.peer_lost = true;
-                self.station.rx_ba.fence();
-                self.station.tx_ba.fence();
-                self.clear_aggregate_receive();
-                return Err(Error::DeviceGone);
+                if let Some(switch) = frame
+                    .get(36..)
+                    .and_then(crate::mt7921::association::channel_switch)
+                {
+                    let interval_ns =
+                        u64::from(u16::from_le_bytes([frame[32], frame[33]]).max(1)) * 1_024_000;
+                    let at = self
+                        .backend
+                        .now_ns()
+                        .saturating_add(u64::from(switch.count) * interval_ns);
+                    self.station.csa = Some((switch, at));
+                    self.station.csa_block_tx = switch.block_tx;
+                }
             }
             if let Some(parameters) = self.station.wmm_pending.or(self.station.wmm) {
                 if native.ccmp.is_none()
@@ -1521,6 +1530,10 @@ impl<B: Backend> Session<B> {
         if self.station.peer_lost {
             return Err(Error::DeviceGone);
         }
+        // Channel Switch Mode 1: no data until the switch.
+        if self.station.csa_block_tx {
+            return Err(Error::Busy);
+        }
         let State::Associated { info, .. } = self.state else {
             return Err(Error::Busy);
         };
@@ -1756,7 +1769,7 @@ impl<B: Backend> Session<B> {
             return Err(Error::DeviceGone);
         }
         let epoch = self.receive_epoch;
-        let ready = !self.p2p_rf_busy() && self.poll_data_tx()?;
+        let ready = !self.p2p_rf_busy() && !self.station.csa_block_tx && self.poll_data_tx()?;
         let transmitted = if let Some(frame) = tx.filter(|_| ready) {
             self.start_ethernet(frame)?;
             true
@@ -2710,7 +2723,17 @@ impl<B: Backend> Session<B> {
     /// Advance recipient BA and declined requests under the retained control
     /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control_in(&mut self, associated: State, restore: State) -> Result<(), Error> {
-        if self.station.wmm_pending.is_none()
+        let switch_due = self
+            .station
+            .csa
+            .is_some_and(|(_, at)| self.backend.now_ns() >= at);
+        // While Channel Switch Mode 1 holds data, other control work waits
+        // for the switch: nothing may be sent on the old channel.
+        if self.station.csa_block_tx && !switch_due {
+            return Ok(());
+        }
+        if !switch_due
+            && self.station.wmm_pending.is_none()
             && !self.policy_changed(&self.station)
             && self.station.ps_wanted == self.station.ps_applied
             && self.station.control_pending.is_empty()
@@ -2735,6 +2758,9 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::StaRecord);
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            if switch_due {
+                self.service_channel_switch(info).await?;
+            }
             self.service_regulatory(info).await?;
             self.service_wmm_update().await?;
             self.service_power_save().await?;
@@ -2806,6 +2832,73 @@ impl<B: Backend> Session<B> {
 
     /// Every association/key/port publication earns fresh authority after
     /// the preceding wait. Cleanup deliberately uses plain exchange instead.
+    /// Follow the AP's announced channel switch in place (mac80211
+    /// `ieee80211_chswitch_work` for a driver without its own switch op): the
+    /// same BSS on the new channel is admitted under the current policy
+    /// (the AP operates there, so a radar/NO_IR channel is allowed as for a
+    /// heard AP), the radio retunes (channel domain, power limits, channel
+    /// switch) and the association, keys and BA sessions carry over.
+    /// The width is 20 MHz: the HT/VHT/HE operation negotiated for the old
+    /// channel no longer describes the new one, so those profiles and the
+    /// per-beacon checks built on them are dropped. A switch the policy or
+    /// the band does not allow ends the link, as mac80211 does when it
+    /// cannot follow (`ieee80211_sta_connection_lost`).
+    async fn service_channel_switch(&mut self, info: super::RadioInfo) -> Result<(), Error> {
+        let Some((switch, _)) = self.station.csa.take() else {
+            return Ok(());
+        };
+        self.station.csa_block_tx = false;
+        let State::Associated {
+            peer, channel, aid, ..
+        } = self.state
+        else {
+            return Err(Error::Busy);
+        };
+        let (Some(old), Some(mut bss)) = (self.station.permission, self.station.bss.clone()) else {
+            return Err(Error::Authority);
+        };
+        let leave = |session: &mut Self| -> Result<(), Error> {
+            session.station.peer_lost = true;
+            session.station.rx_ba.fence();
+            session.station.tx_ba.fence();
+            Err(Error::Authority)
+        };
+        let same_band = crate::mt7921::channel::band(switch.channel).is_some()
+            && crate::mt7921::channel::band(switch.channel) == old.band()
+            && !crate::mt7921::association::is_six_ghz(&bss);
+        if !same_band || switch.channel == channel {
+            return if switch.channel == channel {
+                Ok(())
+            } else {
+                leave(self)
+            };
+        }
+        let domain = self.backend.regulatory_domain()?;
+        let Some(new) =
+            crate::mt7921::association::TxPermission::from_heard_ap(&domain, switch.channel)
+        else {
+            return leave(self);
+        };
+        bss.channel = switch.channel;
+        self.station.permission = Some(new);
+        self.station.bss = Some(bss);
+        self.station.ht20_profile = None;
+        self.station.vht_profile = None;
+        self.station.he_profile = None;
+        self.station.ap_phy = None;
+        self.station.ht20_rx = None;
+        self.clear_aggregate_receive();
+        self.reconfigure_station_channel(info, switch.channel, new, 1)
+            .await?;
+        self.state = State::Associated {
+            info,
+            peer,
+            channel: switch.channel,
+            aid,
+        };
+        Ok(())
+    }
+
     /// The installed regulatory policy is no longer the one this station's
     /// grant and firmware limits were programmed from.
     pub(super) fn policy_changed(&self, station: &super::StationLink) -> bool {

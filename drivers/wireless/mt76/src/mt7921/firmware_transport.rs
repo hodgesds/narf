@@ -1763,6 +1763,11 @@ struct StationLink {
     /// The AP this link is roaming away from: the next join sends a
     /// Reassociation Request naming it (consumed by that join).
     reassociate_from: Option<[u8; 6]>,
+    /// The AP's announced channel switch and when it takes effect
+    /// (mac80211 `csa` state of the managed interface).
+    csa: Option<(crate::mt7921::association::ChannelSwitch, u64)>,
+    /// Channel Switch Mode 1 is in force: no data until the switch.
+    csa_block_tx: bool,
     bss: Option<ScanBss>,
     /// This link's group role captured at join; retained for the exact
     /// disconnect record of that association (Linux `vif->p2p` is fixed per
@@ -1823,6 +1828,8 @@ impl StationLink {
             ps_applied: false,
             applied_policy: None,
             reassociate_from: None,
+            csa: None,
+            csa_block_tx: false,
             bss: None,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
             permission: None,

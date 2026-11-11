@@ -1104,21 +1104,46 @@ fn follows_heard_ap(flags: narf_wireless::reg::RegFlags) -> narf_wireless::reg::
     flags.difference(RegFlags::DFS | RegFlags::NO_IR)
 }
 
-/// Beacon / Probe Response elements carrying a Channel Switch Announcement
-/// (element 37) or an Extended Channel Switch Announcement (element 60).
-/// A truncated element list counts only the complete elements before it.
-pub(crate) fn announces_channel_switch(mut ies: &[u8]) -> bool {
+/// A Channel Switch Announcement (37) or Extended CSA (60) from the AP
+/// (mac80211 `ieee80211_parse_ch_switch_ie`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChannelSwitch {
+    /// Channel Switch Mode 1: no transmission until the switch.
+    pub block_tx: bool,
+    pub channel: u8,
+    /// Target Beacon Transmission Times until the switch (0: any time).
+    pub count: u8,
+    /// The ECSA's operating class, when the AP sent one.
+    pub operating_class: Option<u8>,
+}
+
+/// The first complete CSA or ECSA among `ies`.
+pub(crate) fn channel_switch(mut ies: &[u8]) -> Option<ChannelSwitch> {
     while let [id, len, rest @ ..] = ies {
         let len = usize::from(*len);
-        if rest.len() < len {
-            return false;
-        }
-        if (*id == 37 && len == 3) || (*id == 60 && len == 4) {
-            return true;
+        let body = rest.get(..len)?;
+        match (*id, body) {
+            (37, [mode, channel, count]) => {
+                return Some(ChannelSwitch {
+                    block_tx: *mode == 1,
+                    channel: *channel,
+                    count: *count,
+                    operating_class: None,
+                })
+            }
+            (60, [mode, class, channel, count]) => {
+                return Some(ChannelSwitch {
+                    block_tx: *mode == 1,
+                    channel: *channel,
+                    count: *count,
+                    operating_class: Some(*class),
+                })
+            }
+            _ => {}
         }
         ies = &rest[len..];
     }
-    false
+    None
 }
 
 /// True for a BSS carrying the explicit 6 GHz band identity.
