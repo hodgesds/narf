@@ -3113,8 +3113,7 @@ fn smoke_igc_refused_frame_returns_its_buffer_to_the_pool() -> TestResult {
     check!(name == NAME, "the test interface was renamed");
     let pool = alloc::sync::Arc::new(narf_io::pool::DmaPool::new(2048, DomainId::DRIVER_0, 8));
     check!(pool.prefill(8) == 8, "pool prefill failed");
-    let _ =
-        narf_net::iface::enable_zero_copy_tx_context(NAME, 0, owned, vec![pool.clone()], 0, true);
+    narf_net::iface::enable_zero_copy_tx_context(NAME, 0, owned, vec![pool.clone()], 0, true);
     let q = Queue::new_sized(64, 64).unwrap();
     q.set_owner(NAME);
     let m = Model::new();
