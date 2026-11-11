@@ -1326,6 +1326,61 @@ fn smoke_ath11k_mac_start_sequence() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_start_sequence);
 
+/// `MacConfig::for_hw` is the mac-layer slice of Linux core.c
+/// `ath11k_hw_params[]`: `idle_ps`, `supports_sta_ps`,
+/// `vdev_start_delay` and `current_cc_support` are true on the client
+/// parts and false on IPQ8074 / IPQ6018 / IPQ5018 / QCN9074 (each value
+/// read off that chip's table entry).
+fn smoke_ath11k_mac_config_per_hw_rev() -> TestResult {
+    use super::hw::HwRev;
+    run(|| {
+        let client = [
+            HwRev::Qca6390Hw20,
+            HwRev::Wcn6855Hw20,
+            HwRev::Wcn6855Hw21,
+            HwRev::Qca2066Hw21,
+            HwRev::Qca6698aqHw21,
+            HwRev::Wcn6750Hw10,
+        ];
+        let ap = [
+            HwRev::Ipq8074,
+            HwRev::Ipq6018Hw10,
+            HwRev::Ipq5018Hw10,
+            HwRev::Qcn9074Hw10,
+        ];
+        for (revs, want) in [(&client[..], true), (&ap[..], false)] {
+            for &rev in revs {
+                let c = MacConfig::for_hw(rev, 1, false);
+                if c.idle_ps != want
+                    || c.supports_sta_ps != want
+                    || c.vdev_start_delay != want
+                    || c.current_cc_support != want
+                {
+                    return Err("per-hw policy flags differ from ath11k_hw_params");
+                }
+                if c.num_rxdma_per_pdev != 1 || c.single_pdev_only || c.vdev_id != 0 {
+                    return Err("DP fields not taken from the caller");
+                }
+            }
+        }
+        if MacConfig::wcn6855() != MacConfig::for_hw(HwRev::Wcn6855Hw20, 2, true) {
+            return Err("wcn6855() is not the WCN6855 table entry");
+        }
+        if MacConfig::for_hw(HwRev::Ipq8074, 1, false)
+            .with_vdev(2)
+            .vdev_id
+            != 2
+        {
+            return Err("with_vdev");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mac_config_per_hw_rev
+);
+
 /// A WMI port that fails one `PDEV_SET_PARAM` id with `-ESHUTDOWN`.
 struct Failing(Shared, u32);
 

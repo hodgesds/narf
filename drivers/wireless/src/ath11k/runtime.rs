@@ -4613,8 +4613,13 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     // One MAC + netdev per allocated pdev (`ath11k_mac_register` per
     // `ar`), in allocation order, each on its own global vdev slot.
     // The single-pdev path is exactly the old one: pdev 0, vdev slot 0,
-    // `wcn6855()` config, and a caps failure strands the runtime.
-    let num_rxdma = rt.dp.cfg.num_rxdma_per_pdev;
+    // and a caps failure strands the runtime. Each MAC takes the chip's
+    // own `ath11k_hw_params` policy ([`super::mac::MacConfig::for_hw`]).
+    let hw_cfg = super::mac::MacConfig::for_hw(
+        rt.dp.cfg.hw.hw_rev,
+        rt.dp.cfg.num_rxdma_per_pdev,
+        rt.dp.cfg.single_pdev_only,
+    );
     let (single, radios) = match rt.pdev_radios() {
         Ok(r) => r,
         Err(e) => {
@@ -4634,11 +4639,7 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     let shared = Shared::new(rt, secure_random);
     for (slot, (mac_id, caps)) in radios.iter().enumerate() {
         let slot = slot as u32;
-        let cfg = if single {
-            super::mac::MacConfig::wcn6855()
-        } else {
-            super::mac::MacConfig::for_radio(num_rxdma).with_vdev(slot)
-        };
+        let cfg = hw_cfg.with_vdev(if single { 0 } else { slot });
         let mac = super::mac::Mac::new(
             Port(shared.clone(), slot, *mac_id),
             Port(shared.clone(), slot, *mac_id),
@@ -4681,10 +4682,10 @@ pub type AhbStart<Io, Irq, Q> = (
 /// one MAC + netdev per allocated pdev ([`Rt::pdev_radios`]), each
 /// registered by [`super::iface::register_ahb`] on its own vdev slot.
 /// IPQ8074 (three radios) and IPQ6018 / IPQ5018 (two) therefore get one
-/// `wlan%d` per radio with [`super::mac::MacConfig::for_radio`]; a
-/// single-pdev core (WCN6750) keeps one netdev on slot 0 with the
-/// WCN6855-shaped policy, its own `num_rxdma_per_pdev` and
-/// `single_pdev_only` from the DP hw params (Linux `ath11k_hw_params`).
+/// `wlan%d` per radio; a single-pdev core (WCN6750) keeps one netdev on
+/// slot 0. Every MAC takes its chip's `ath11k_hw_params` policy from
+/// [`super::mac::MacConfig::for_hw`] (the IPQ parts run with idle PS,
+/// station PS, the vdev-start delay and current-CC support off).
 /// On a single-pdev `device_caps` failure, or when no radio registers,
 /// the runtime is still returned unregistered — the caller keeps it
 /// alive (see `AHB_RUNTIME`) because the firmware owns the core's
@@ -4695,8 +4696,11 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     dp: Dp,
 ) -> AhbStart<Io, Irq, Q> {
     let rt = Rt::new(core, dp);
-    let num_rxdma = rt.dp.cfg.num_rxdma_per_pdev;
-    let single_pdev_only = rt.dp.cfg.single_pdev_only;
+    let hw_cfg = super::mac::MacConfig::for_hw(
+        rt.dp.cfg.hw.hw_rev,
+        rt.dp.cfg.num_rxdma_per_pdev,
+        rt.dp.cfg.single_pdev_only,
+    );
     let (single, radios) = match rt.pdev_radios() {
         Ok(r) => r,
         Err(e) => {
@@ -4718,15 +4722,7 @@ pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     let mut macs = Vec::with_capacity(radios.len());
     for (slot, (mac_id, caps)) in radios.iter().enumerate() {
         let slot = slot as u32;
-        let cfg = if single {
-            super::mac::MacConfig {
-                num_rxdma_per_pdev: num_rxdma,
-                single_pdev_only,
-                ..super::mac::MacConfig::wcn6855()
-            }
-        } else {
-            super::mac::MacConfig::for_radio(num_rxdma).with_vdev(slot)
-        };
+        let cfg = hw_cfg.with_vdev(if single { 0 } else { slot });
         let mac = super::mac::Mac::new(
             Port(shared.clone(), slot, *mac_id),
             Port(shared.clone(), slot, *mac_id),

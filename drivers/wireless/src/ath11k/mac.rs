@@ -595,19 +595,7 @@ pub struct MacConfig {
 impl MacConfig {
     /// WCN6855 hw2.0 / hw2.1 (`ath11k_hw_params[]`).
     pub const fn wcn6855() -> Self {
-        MacConfig {
-            vdev_id: 0,
-            idle_ps: true,
-            supports_sta_ps: true,
-            current_cc_support: true,
-            single_pdev_only: true,
-            vdev_start_delay: true,
-            num_rxdma_per_pdev: 2,
-            listen_interval: 5,
-            powersave: true,
-            frame_mode_ethernet: false,
-            raw_mode: false,
-        }
+        Self::for_hw(super::hw::HwRev::Wcn6855Hw20, 2, true)
     }
 
     /// Bind a per-netdev MAC instance to a previously reserved firmware
@@ -618,20 +606,32 @@ impl MacConfig {
         self
     }
 
-    /// Per-radio config for a multi-pdev part: the WCN6855 policy
-    /// defaults (idle PS, station PS, current-CC, vdev-start delay,
-    /// listen interval, powersave) with `single_pdev_only` cleared and
-    /// the chip's own `num_rxdma_per_pdev`. These are mac-layer policy
-    /// knobs, not chip register values, so one shared default per radio
-    /// is honest; the vdev slot still comes from [`Self::with_vdev`].
-    pub const fn for_radio(num_rxdma_per_pdev: u32) -> Self {
+    /// The mac-layer fields of the chip's `ath11k_hw_params[]` entry
+    /// (Linux core.c). `idle_ps`, `supports_sta_ps`, `vdev_start_delay`
+    /// and `current_cc_support` are `true` on the client parts (QCA6390,
+    /// WCN6855 hw2.0/2.1, QCA2066, QCA6698AQ, WCN6750) and `false` on the
+    /// AP-class parts (IPQ8074, IPQ6018, IPQ5018, QCN9074). The two
+    /// data-path fields come from the same table through the DP config
+    /// (`Dp::cfg`), so callers pass them rather than this restating them.
+    /// [`HwRev::Unknown`](super::hw::HwRev::Unknown) keeps the client
+    /// policy (no unknown revision reaches a runtime).
+    pub const fn for_hw(
+        rev: super::hw::HwRev,
+        num_rxdma_per_pdev: u32,
+        single_pdev_only: bool,
+    ) -> Self {
+        use super::hw::HwRev;
+        let client = !matches!(
+            rev,
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Qcn9074Hw10
+        );
         MacConfig {
             vdev_id: 0,
-            idle_ps: true,
-            supports_sta_ps: true,
-            current_cc_support: true,
-            single_pdev_only: false,
-            vdev_start_delay: true,
+            idle_ps: client,
+            supports_sta_ps: client,
+            current_cc_support: client,
+            single_pdev_only,
+            vdev_start_delay: client,
             num_rxdma_per_pdev,
             listen_interval: 5,
             powersave: true,
