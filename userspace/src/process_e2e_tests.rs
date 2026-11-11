@@ -5783,6 +5783,31 @@ fn smoke_process_coredump_e2e() -> TestResult {
         return TestResult::Fail("could not raise RLIMIT_CORE");
     }
 
+    // 5c. SECOND NEGATIVE CONTROL, with the limit raised: a pipe
+    // `core_pattern` (systemd-coredump's) sends the dump to a helper and
+    // `fs/coredump.c` creates no file in the working directory. This kernel
+    // ignored the pattern and wrote `<cwd>/core` regardless — `/core` on
+    // the root filesystem for every crashing system service.
+    {
+        let piped = narf_filesystem::procfs::sys_kernel::set_core_pattern(
+            "|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h %d %F",
+        );
+        // SAFETY: the child task is not enqueued-running in this stubbed
+        // test context, so no other CPU touches its uctx.
+        let state = unsafe { &*child_task.uctx.state.get() };
+        crate::coredump::write_coredump(child_task_raw, 11, state);
+        let restored = narf_filesystem::procfs::sys_kernel::set_core_pattern("core");
+        let probe = crate::handlers::resolve_cwd_path(PARENT, "core");
+        let wrote = crate::handlers::resolve_parent_dir_async(&probe)
+            .is_some_and(|(dir, leaf)| dir.lookup(&leaf).is_some());
+        if piped.is_err() || restored.is_err() || wrote {
+            crate::task::release_task(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("core file written to cwd under a pipe core_pattern");
+        }
+    }
+
     // 6. Force termination with core_dumped = true
     crate::user_task::install_current(
         &child_task.uctx as *const crate::user_task::UserTaskCtx

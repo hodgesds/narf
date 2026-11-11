@@ -293,6 +293,10 @@ pub trait NicControl: core::fmt::Debug + Send + Sync {
     fn clock_index(&self) -> i32 {
         -1
     }
+    /// Timestamp modes actually implemented by this device's frame path.
+    fn timestamp_info(&self) -> (u32, u32, u32) {
+        ((1 << 1) | (1 << 3) | (1 << 4), 1, 1)
+    }
     fn timestamp_config(&self) -> Result<TimestampConfig> {
         Err(95)
     }
@@ -353,7 +357,13 @@ pub trait NicControl: core::fmt::Debug + Send + Sync {
 }
 
 pub fn with_control<T>(name: &str, f: impl FnOnce(&dyn NicControl) -> Result<T>) -> Result<T> {
-    let control = crate::iface::device_control(name).ok_or(19)?;
+    let control = crate::iface::device_control(name).ok_or_else(|| {
+        if crate::iface::lookup(name).is_some() {
+            95
+        } else {
+            19
+        }
+    })?;
     f(control.nic().ok_or(95)?)
 }
 
@@ -505,7 +515,7 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("net", smoke_ethtool_control_roundtrip_and_rejection);
+    kernel_test_in!("net/ethtool", smoke_ethtool_control_roundtrip_and_rejection);
     fn smoke_ethtool_set_eeprom_routes_to_driver() -> TestResult {
         // SETEEPROM (0x0c) must size like GETEEPROM (0x0b) and reach the
         // driver's set_nvm op; the test Model leaves the default, so the
@@ -525,7 +535,7 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("net", smoke_ethtool_set_eeprom_routes_to_driver);
+    kernel_test_in!("net/ethtool", smoke_ethtool_set_eeprom_routes_to_driver);
     fn smoke_ethtool_rxnfc_gap14_and_gpermaddr() -> TestResult {
         // GPERMADDR (0x20): 8-byte header, the size word, then the
         // address. A buffer smaller than the address is -ETOOSMALL.
@@ -709,7 +719,7 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("net", smoke_ethtool_rxnfc_gap14_and_gpermaddr);
+    kernel_test_in!("net/ethtool", smoke_ethtool_rxnfc_gap14_and_gpermaddr);
     fn smoke_ethtool_variable_requests_are_bounded() -> TestResult {
         for (cmd, size, offset) in [
             (4, 12, 8),
@@ -734,7 +744,7 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("net", smoke_ethtool_variable_requests_are_bounded);
+    kernel_test_in!("net/ethtool", smoke_ethtool_variable_requests_are_bounded);
     fn smoke_ethtool_igc_surface_roundtrip() -> TestResult {
         let (name, m) = setup();
         // The test Model keeps the NicControl defaults: msglevel, priv
@@ -807,11 +817,11 @@ mod tests {
         if crate::ethtool::execute(&name.0, &mut ch).is_err() || m.0.lock().channels != 2 {
             return TestResult::Fail("SCHANNELS with other_count 1 rejected");
         }
-        // TS info: i225 reports TX_SOFTWARE as well as TX/RX_HARDWARE.
+        // A generic device must not inherit I225 hardware timestamp claims.
         let mut ts = alloc::vec![0; 44];
         put(&mut ts, 0, 0x41);
-        if crate::ethtool::execute(&name.0, &mut ts).is_err() || get(&ts, 4) != 0x47 {
-            return TestResult::Fail("GET_TS_INFO missing TX_SOFTWARE");
+        if crate::ethtool::execute(&name.0, &mut ts).is_err() || get(&ts, 4) != 0x1a {
+            return TestResult::Fail("GET_TS_INFO invented hardware timestamp support");
         }
         // Coalesce: non-usecs fields are ignored (Linux), not -EOPNOTSUPP.
         let mut coal = alloc::vec![0; 92];
@@ -824,7 +834,7 @@ mod tests {
             return TestResult::Fail("SET_COALESCE rejected non-usecs fields");
         }
         // GSSET_INFO mask bit 2 reports the priv-flag count (0 here).
-        let mut info = alloc::vec![0; 28];
+        let mut info = alloc::vec![0; 24];
         put(&mut info, 0, 0x37);
         put(&mut info, 8, 6);
         if crate::ethtool::execute(&name.0, &mut info).is_err()
@@ -842,13 +852,14 @@ mod tests {
             return TestResult::Fail("GSTRINGS priv-flag count wrong");
         }
         // Link ksettings: a too-small mask reports the required 2 words in
-        // the nwords byte; a set with the wrong count is -EINVAL.
+        // the signed nwords byte; a set with the wrong count is -EINVAL.
         let mut link = alloc::vec![0; 48];
         put(&mut link, 0, 0x4c);
-        if crate::ethtool::execute(&name.0, &mut link).is_err() || link[15] != 2 {
+        if crate::ethtool::execute(&name.0, &mut link).is_err() || link[15] as i8 != -2 {
             return TestResult::Fail("GLINKSETTINGS did not report 2 mask words");
         }
         link[15] = 2;
+        link.resize(72, 0);
         if crate::ethtool::execute(&name.0, &mut link).is_err()
             || get(&link, 48) & (1 << 7) == 0
             || get(&link, 56) & 0xc0 != 0xc0
@@ -862,7 +873,7 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("net", smoke_ethtool_igc_surface_roundtrip);
+    kernel_test_in!("net/ethtool", smoke_ethtool_igc_surface_roundtrip);
     fn smoke_umem_dma_lease_revocation_and_duplicates() -> TestResult {
         let umem = crate::bypass::umem::Umem::register(4096, 2048).unwrap();
         let read = umem.frame_bytes(0).unwrap();
@@ -885,4 +896,239 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("net", smoke_umem_dma_lease_revocation_and_duplicates);
+    fn smoke_ethtool_features_track_packet_policy() -> TestResult {
+        let name = Interface(crate::iface::register(
+            "feature-test%d",
+            [2, 3, 4, 5, 6, 7],
+            send,
+        ));
+        let caps = crate::OffloadCapabilities {
+            tx_checksum: true,
+            rx_checksum: true,
+            max_tso_bytes: 65536,
+            vlan_insert: true,
+        };
+        crate::iface::set_offloads(&name.0, caps);
+        let mut b = alloc::vec![0;40];
+        put(&mut b, 0, 0x3a);
+        put(&mut b, 4, 2);
+        if crate::ethtool::execute(&name.0, &mut b).is_err()
+            || get(&b, 8) & 8 == 0
+            || get(&b, 24) & (1 << 8) == 0
+        {
+            return TestResult::Fail("features unavailable without a native control hook");
+        }
+        let mut set = alloc::vec![0;24];
+        put(&mut set, 0, 0x3b);
+        put(&mut set, 4, 2);
+        put(&mut set, 8, 8);
+        if crate::ethtool::execute_with_result(&name.0, &mut set) != Ok(2) {
+            return TestResult::Fail("checksum/TSO dependency did not report WISH");
+        }
+        crate::iface::set_offloads(&name.0, caps); // reset must preserve policy
+        let e = crate::iface::lookup(&name.0).unwrap();
+        if e.offloads.tx_checksum || e.offloads.max_tso_bytes != 0 || !e.offloads.rx_checksum {
+            return TestResult::Fail("feature request did not change stack packet policy");
+        }
+        put(&mut set, 12, 8);
+        if crate::ethtool::execute_with_result(&name.0, &mut set) != Ok(0)
+            || crate::iface::lookup(&name.0).unwrap().offloads != caps
+        {
+            return TestResult::Fail("offload reenable lost hardware capabilities");
+        }
+        put(&mut set, 8, 1);
+        put(&mut set, 12, 1);
+        if crate::ethtool::execute_with_result(&name.0, &mut set) != Ok(1) {
+            return TestResult::Fail("unsupported feature was silently accepted");
+        }
+        let mut flags = [0; 8];
+        put(&mut flags, 0, 0x26);
+        if crate::ethtool::execute(&name.0, &mut flags).is_err()
+            || crate::iface::lookup(&name.0).unwrap().offloads.vlan_insert
+        {
+            return TestResult::Fail("SFLAGS did not disable VLAN insertion policy");
+        }
+        let mut link = [0; 44];
+        put(&mut link, 0, 1);
+        if crate::ethtool::execute(&name.0, &mut link) != Err(95)
+            || crate::ethtool::execute("missing-ethtool-device", &mut link) != Err(19)
+        {
+            return TestResult::Fail("unsupported and absent device errors conflated");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/ethtool", smoke_ethtool_features_track_packet_policy);
+
+    fn smoke_ethtool_independent_string_counts() -> TestResult {
+        #[derive(Debug)]
+        struct Counts;
+        impl NicControl for Counts {}
+        impl crate::iface::DeviceControl for Counts {
+            fn configure(&self, _: &crate::iface::DeviceConfig) -> Result<()> {
+                Err(95)
+            }
+            fn nic(&self) -> Option<&dyn NicControl> {
+                Some(self)
+            }
+        }
+        let name = Interface(crate::iface::register(
+            "count-test%d",
+            [2, 3, 4, 5, 6, 8],
+            send,
+        ));
+        crate::iface::set_device_control(&name.0, Arc::new(Counts));
+        let mut b = [0; 24];
+        put(&mut b, 0, 0x37);
+        b[8] = 0x14;
+        if crate::ethtool::execute(&name.0, &mut b).is_err()
+            || b[8] != 0x14
+            || get(&b, 16) != 0
+            || get(&b, 20) != 64
+        {
+            return TestResult::Fail("priv/feature counts unnecessarily require statistics");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/ethtool", smoke_ethtool_independent_string_counts);
+
+    fn nla(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
+        out.extend_from_slice(&((4 + payload.len()) as u16).to_ne_bytes());
+        out.extend_from_slice(&kind.to_ne_bytes());
+        out.extend_from_slice(payload);
+        out.resize((out.len() + 3) & !3, 0);
+    }
+    fn eth_request(name: &str) -> Vec<u8> {
+        let mut h = Vec::new();
+        let mut text = name.as_bytes().to_vec();
+        text.push(0);
+        nla(&mut h, 2, &text);
+        let mut req = Vec::new();
+        nla(&mut req, 0x8001, &h);
+        req
+    }
+    fn eth_context(admin: bool, ns: u64) -> crate::netlink_generic::RequestContext<'static> {
+        crate::netlink_generic::RequestContext {
+            net_ns_id: ns,
+            admin: None,
+            init_net_admin: admin,
+            net_admin: admin,
+            capable: admin,
+            portid: 0,
+            ack_cookie: None,
+        }
+    }
+    fn smoke_ethtool_netlink_native_roundtrip() -> TestResult {
+        let (name, m) = setup();
+        let req = eth_request(&name.0);
+        for (cmd, reply) in [
+            (2, 2),
+            (4, 4),
+            (6, 6),
+            (11, 11),
+            (15, 16),
+            (17, 18),
+            (19, 20),
+            (21, 22),
+            (25, 26),
+        ] {
+            let Ok(r) = crate::ethtool::handle_genl(cmd, &req, false, eth_context(false, 0)) else {
+                return TestResult::Fail("native GET unavailable over netlink");
+            };
+            if r.len() != 1 || r[0].command != reply {
+                return TestResult::Fail("wrong netlink reply command");
+            }
+        }
+        let mut set = req.clone();
+        nla(&mut set, 2, &200u32.to_ne_bytes());
+        nla(&mut set, 6, &200u32.to_ne_bytes());
+        if crate::ethtool::handle_genl(20, &set, false, eth_context(false, 0)).err() != Some(1)
+            || m.0.lock().coalesce_us != 166
+        {
+            return TestResult::Fail("netlink SET bypassed admin authority");
+        }
+        if crate::ethtool::handle_genl(20, &set, false, eth_context(true, 0)).is_err()
+            || m.0.lock().coalesce_us != 200
+        {
+            return TestResult::Fail("netlink coalesce SET did not reach native control");
+        }
+        nla(&mut set, 31, &[1]);
+        if crate::ethtool::handle_genl(20, &set, false, eth_context(true, 0)).err() != Some(22)
+            || m.0.lock().coalesce_us != 200
+        {
+            return TestResult::Fail("unknown attribute accepted or mutated native state");
+        }
+        if crate::ethtool::handle_genl(6, &req, false, eth_context(false, 91234)).err() != Some(19)
+        {
+            return TestResult::Fail("netlink GET escaped its network namespace");
+        }
+        if crate::ethtool::ETHTOOL_MSG_MM_GET != 42
+            || crate::ethtool::ETHTOOL_MSG_MM_SET != 43
+            || crate::ethtool::ETHTOOL_MSG_MM_GET_REPLY != 42
+        {
+            return TestResult::Fail("MAC Merge command IDs disagree with Linux UAPI");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/ethtool", smoke_ethtool_netlink_native_roundtrip);
+    fn smoke_ethtool_netlink_features_bitsets() -> TestResult {
+        let (name, _) = setup();
+        crate::iface::set_offloads(
+            &name.0,
+            crate::OffloadCapabilities {
+                tx_checksum: true,
+                ..Default::default()
+            },
+        );
+        for compact in [false, true] {
+            let mut req = eth_request(&name.0);
+            let mut bits = Vec::new();
+            nla(&mut bits, 2, &64u32.to_ne_bytes());
+            if compact {
+                nla(&mut bits, 4, &0u64.to_ne_bytes());
+                nla(&mut bits, 5, &8u64.to_ne_bytes());
+            } else {
+                let mut bit = Vec::new();
+                nla(&mut bit, 2, b"tx-checksum-ip-generic\0");
+                let mut entries = Vec::new();
+                nla(&mut entries, 0x8001, &bit);
+                nla(&mut bits, 0x8003, &entries);
+            }
+            nla(&mut req, 0x8003, &bits);
+            let Ok(result) = crate::ethtool::handle_genl(12, &req, false, eth_context(true, 0))
+            else {
+                return TestResult::Fail("feature bitset SET rejected");
+            };
+            if result.len() != 1
+                || result[0].command != 12
+                || crate::iface::lookup(&name.0).unwrap().offloads.tx_checksum
+            {
+                return TestResult::Fail("feature netlink SET did not update active policy");
+            }
+            crate::iface::with_features(&name.0, |e| {
+                e.feature_wanted = None;
+                crate::ethtool::features::apply(e);
+            })
+            .unwrap();
+            req.pop();
+            req.pop();
+            req.pop();
+            req.pop();
+            if crate::ethtool::handle_genl(12, &req, false, eth_context(true, 0)).err() != Some(22)
+                || !crate::iface::lookup(&name.0).unwrap().offloads.tx_checksum
+            {
+                return TestResult::Fail("truncated feature SET changed policy");
+            }
+        }
+        let mut global = Vec::new();
+        let mut set = Vec::new();
+        nla(&mut set, 1, &4u32.to_ne_bytes());
+        let mut sets = Vec::new();
+        nla(&mut sets, 0x8001, &set);
+        nla(&mut global, 0x8002, &sets);
+        if crate::ethtool::handle_genl(1, &global, false, eth_context(false, 0)).is_err() {
+            return TestResult::Fail("global feature string set requires a NIC");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/ethtool", smoke_ethtool_netlink_features_bitsets);
 }

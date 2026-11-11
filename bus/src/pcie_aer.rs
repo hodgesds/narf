@@ -590,6 +590,11 @@ pub fn aer_isr() {
             Some(o) => o as u64,
             None => continue,
         };
+        // The capability walk above resolves the mapped ECAM window
+        // itself; the register accesses below must do the same. ECAM is
+        // not identity-mapped, so the raw physical address faults on the
+        // first AER-capable function (every real root port).
+        let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
         // Read Root Error Status (offset 0x30 within the AER
         // cap). Only root ports + switch upstream ports
         // implement this; endpoints will read zero here, which
@@ -674,6 +679,9 @@ pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
             Some(o) => o as u64,
             None => continue,
         };
+        // As in `aer_isr`: every access below goes through the mapped
+        // ECAM window, not the raw physical address.
+        let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
         // SAFETY: AER block is 0x40 bytes inside the same page.
         let root_sts_raw = unsafe {
             core::ptr::read_volatile(

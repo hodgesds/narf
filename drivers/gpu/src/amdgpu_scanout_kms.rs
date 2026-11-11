@@ -381,7 +381,26 @@ impl Request {
             atomic_commit(card, mode, request, None, None, Some(&admission)).map(|_| ())
         };
         match self {
-            Self::Atomic(a) => test(a.request()),
+            Self::Atomic(a) => {
+                let result = test(a.request());
+                // A real commit refused by its checks: name the request as
+                // a refused TEST_ONLY probe is named (`commit`), with the
+                // flags userspace sent. A compositor commits requests it
+                // never probed (KWin's commit thread sends partial updates).
+                if let Err(error) = &result {
+                    let request = a.request();
+                    note_atomic_rejection(
+                        mode,
+                        request.flags,
+                        error,
+                        request.objects,
+                        request.prop_counts,
+                        request.props,
+                        request.values,
+                    );
+                }
+                result
+            }
             Self::SetCrtc(r, c) => {
                 handle_setcrtc_decoded(card, mode, *r, *c, Some(&admission), true).map(|_| ())
             }
@@ -506,7 +525,7 @@ fn atomic_fbs(card: &crate::drm::card::Card, req: AtomicRequest<'_>) -> Result<V
             .filter(|n| *n <= req.props.len() && *n <= req.values.len())
             .ok_or(FsError::InvalidData)?;
         let primary = || {
-            if card.has_native_kms_planes() {
+            if !synthesized_primaries(card) {
                 return None;
             }
             let index = object.checked_sub(crate::drm_native_planes::PRIMARY_PLANE_ID_BASE)?;
@@ -578,6 +597,10 @@ pub(super) struct CommitAdmission<'a> {
     _uninhabited: (core::convert::Infallible, core::marker::PhantomData<&'a ()>),
 }
 impl CommitAdmission<'_> {
+    /// The open (DRM master) the commit is admitted for.
+    pub(super) fn open(&self) -> u64 {
+        self.open
+    }
     pub(super) fn check(&self, card: &crate::drm::card::Card) -> Result<(), FsError> {
         if !card.is_master(self.open) {
             return Err(FsError::PermissionDenied);
@@ -672,12 +695,13 @@ pub(crate) async fn dispatch(
 
 /// Bring-up visibility: name the step of an amdgpu KMS request (real
 /// commit, not a TEST_ONLY probe) that refused it, once per (ioctl, step,
-/// error), with the last [`invalid_at`] line. Returns the error unchanged.
+/// error, rule), with the rule [`refused`] named and the last
+/// [`invalid_at`] line. Returns the error unchanged.
 #[cfg(feature = "amdgpu")]
 fn note_kms_step(nr: u32, step: &'static str, error: FsError) -> FsError {
     static SEEN: narf_lib::sync::IrqSafeSpinLock<Vec<(u32, &'static str, alloc::string::String)>> =
         narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
-    let text = alloc::format!("{error:?}");
+    let text = alloc::format!("{error:?} why=\"{}\"", last_refusal().unwrap_or(""));
     {
         let mut seen = SEEN.lock();
         if seen.len() >= 32

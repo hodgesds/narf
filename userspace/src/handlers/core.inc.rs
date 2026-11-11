@@ -4350,6 +4350,36 @@ fn resolve_final_symlink_target(path_ref: &str) -> Option<alloc::string::String>
     .flatten()
 }
 
+/// Expand symlinks in the DIRECTORY part of an AF_UNIX pathname through the
+/// task's mount table, leaving the final component alone.
+///
+/// `unix_find_bsd` / `unix_bind_bsd` resolve the name with `kern_path` /
+/// `kern_path_create`: an ordinary path walk, so a symlink in any
+/// intermediate component is followed, across mounts. The key computation
+/// below hands the whole path to the single filesystem that covers it
+/// lexically, and that filesystem resolves a link target inside itself. For
+/// `/var/run/dbus/system_bus_socket` — `/var/run -> ../run`, with `/run` a
+/// separate tmpfs — that looked for `run/dbus/...` in the ROOT filesystem's
+/// own empty `/run` directory and reported -ENOENT, so every client using
+/// the legacy `/var/run` spelling of the system bus (zbus's default) could
+/// not connect. The final component keeps its own handling: bind names the
+/// literal leaf, connect follows it in the callers below.
+fn unix_expand_parent_symlinks(abs: alloc::string::String) -> alloc::string::String {
+    let trimmed = abs.trim_end_matches('/');
+    let Some((parent, leaf)) = trimmed.rsplit_once('/') else {
+        return abs;
+    };
+    if parent.is_empty() || leaf.is_empty() {
+        return abs;
+    }
+    match resolve_vfs_symlink_path(parent, true) {
+        Some(resolved) if resolved != parent => {
+            alloc::format!("{}/{leaf}", resolved.trim_end_matches('/'))
+        }
+        _ => abs,
+    }
+}
+
 fn unix_socket_path_key_depth(
     path: &str,
     follow_final: bool,
@@ -4364,6 +4394,7 @@ fn unix_socket_path_key_depth(
         return None;
     }
     let abs = resolve_cwd_path(current_task_id(), path);
+    let abs = unix_expand_parent_symlinks(abs);
     let path_ref = abs.trim_end_matches('/');
     // CONNECT (follow_final) follows a FINAL symlink at the GLOBAL namespace
     // level so a symlinked socket alias keys by the TARGET listener's identity.
@@ -4455,6 +4486,7 @@ fn unix_path_final_node_exists_depth(path: &str, depth: usize) -> bool {
         return false;
     }
     let abs = resolve_cwd_path(current_task_id(), path);
+    let abs = unix_expand_parent_symlinks(abs);
     let path_ref = abs.trim_end_matches('/');
     // Follow a final symlink (LOOKUP_FOLLOW) exactly as the key computation
     // does, so a symlinked socket alias resolves to its target's existence.
@@ -10291,7 +10323,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         let outcome = if is_write {
             // SAFETY: import_rw_iovecs validated this source range; the
             // guarded copy still catches a protection change racing it.
-            let payload = match unsafe { copy_from_user_vec(iovec.base, iovec.len) } {
+            let mut payload = match unsafe { copy_from_user_vec(iovec.base, iovec.len) } {
                 Ok(payload) => payload,
                 Err(errno) => {
                     if total == 0 {
@@ -10301,8 +10333,14 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                     break;
                 }
             };
-            let outcome = poll_blocking(endpoint.ops.write(off, &payload))
-                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+            // `generic_perform_write`: killable, see `killable_wait::write`.
+            let outcome = match crate::killable_wait::write(&endpoint.ops, off, &mut payload) {
+                Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+                Err(crate::killable_wait::Killed) => {
+                    ctx.set_return(errno_ret(EINTR));
+                    return;
+                }
+            };
             // Keep any live generic-fallback MAP_SHARED page of this file
             // coherent with the write (mapped_file::note_file_written).
             if let Ok(n) = &outcome {
@@ -10313,10 +10351,16 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             outcome
         } else {
             let mut staging = alloc::vec![0u8; iovec.len];
-            let read = poll_blocking(endpoint.ops.read_with_options(
-                off, &mut staging, endpoint.read_options(),
-            ))
-                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+            // `filemap_read`: killable, see `killable_wait::read`.
+            let read = match crate::killable_wait::read(
+                &endpoint.ops, off, &mut staging, iovec.len, endpoint.read_options(),
+            ) {
+                Ok(read) => read.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+                Err(crate::killable_wait::Killed) => {
+                    ctx.set_return(errno_ret(EINTR));
+                    return;
+                }
+            };
             match read {
                 Ok(n) if n <= staging.len() => {
                     // SAFETY: validated destination; guarded against a racing
@@ -18189,6 +18233,29 @@ fn fsize_check_resize(task: u64, current_size: u64, new_size: u64) -> Result<(),
 /// core file a fatal signal may write.
 pub(crate) fn coredump_limit(task: u64) -> u64 {
     read_rlimit(task, RLIMIT_CORE).map_or(RLIM_INFINITY, |p| p.cur)
+}
+
+/// What `fs/coredump.c` takes from the dying task's credentials and mm.
+pub(crate) struct CoredumpIdentity {
+    /// `cred->uid` / `cred->gid`, the `%u` / `%g` of a core file name.
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// `current_fsuid()` / `current_fsgid()`, the owner of the core file.
+    pub(crate) fsuid: u32,
+    pub(crate) fsgid: u32,
+    /// `__get_dumpable(mm->flags) != SUID_DUMP_DISABLE`.
+    pub(crate) dumpable: bool,
+}
+
+pub(crate) fn coredump_identity(task: u64) -> CoredumpIdentity {
+    let ids = read_uidgid(task);
+    CoredumpIdentity {
+        uid: ids.uid,
+        gid: ids.gid,
+        fsuid: ids.fsuid,
+        fsgid: ids.fsgid,
+        dumpable: read_prctl(task).dumpable,
+    }
 }
 
 /// `SIGXCPU` — the soft-limit warning. Its default action terminates, so a

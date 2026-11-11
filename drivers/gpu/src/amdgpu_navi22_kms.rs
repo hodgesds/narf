@@ -605,6 +605,7 @@ fn apply_card_vrr(
     // Preserve committed blob ids through hotplug/republication. Attaching
     // connector controls must not import DCN401 CRTC/plane capabilities.
     let previous = card.native.clone();
+    let previous_planes = card.native_planes.clone();
     crate::amdgpu_navi48_kms::apply_routed_vrr(card, crtcs, connectors, vrr);
     // amdgpu_dm_connector_init_helper: "max bpc" on every non-MST
     // connector (Navi22 publishes no MST ones), Colorspace and
@@ -646,18 +647,18 @@ fn apply_card_vrr(
     card.collect_blobs();
     card.vblank_source = Some(crate::amdgpu_navi22_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
-    // Share connector/CRTC bookkeeping, not DCN401's plane capabilities.
-    // This presenter shows one linear 8888 primary per CRTC, and the
-    // primaries stay the synthesized ones; GFX12 tiling has no
-    // implementation here. DCN 3.0 publishes two shared overlays, though
-    // (dc caps' max_slave_planes = 2), with the 19-format list and one
-    // cursor plane per CRTC after them. The DRM layer publishes them
-    // (#1950); the display side that programs them is #1951, and
-    // present_planes still refuses overlays until then — this lands with
-    // #1951, never alone.
+    // Share connector/CRTC bookkeeping, not DCN401's plane capabilities:
+    // DCN 3.0's planes are built from what this card published before
+    // (`previous_planes`), never from the DCN401 set the shared helper
+    // just left, whose overlays default to another zpos and whose third
+    // overlay sits on the first cursor's id. amdgpu_dm_initialize_drm_device
+    // on DCN 3.0: a primary per CRTC (linear 8888 here; GFX12 tiling has
+    // no implementation), dc caps' max_slave_planes = 2 shared overlays
+    // with the DCN-universal format list, and a cursor plane per CRTC
+    // after them. What the display lights of them is its own admission
+    // (`amdgpu_native_kms::display_admits_planes`).
     let crtc_ids: alloc::vec::Vec<u32> = card.crtcs.iter().map(|c| c.id).collect();
-    card.native_planes =
-        crate::drm_native_planes::overlay_cursor_planes_for(&card.native_planes, &crtc_ids);
+    card.native_planes = crate::drm_native_planes::dcn30_planes_for(&previous_planes, &crtc_ids);
     card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
     card.gfx12_modifiers = false;
 }

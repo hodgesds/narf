@@ -25,23 +25,24 @@
 //! (amdgpu_dm_commit_cursors, a FAST update: nothing relights).
 //!
 //! Navi22 on DCN 3.0 publishes the same shape with two shared overlays
-//! (dc caps' max_slave_planes = 2, Linux v6.12 `dcn30_resource.c`) and its
-//! primaries still synthesized (their CRTC's `primary_fb`): the primary's
-//! immutable zpos is 2, an overlay's defaults to 7 + its DRM plane index,
-//! and the cursors follow the overlays at 0x46+. `check()`'s
-//! synthesized-primary mode validates those overlays against the
-//! synthesized primary (format, DCN30 scaling/viewport/rotation, the
-//! primary required through `crtc.primary_fb`) and returns a setup only
-//! for CRTCs with an overlay; a primary-only CRTC stays on the synthesized
-//! path. Every DCN30 surface is linear: a tiled modifier never reaches
-//! the setup. The display side that programs the overlays is a later lane
-//! (#1951); until it and the admission wiring land, the bridge refuses
-//! overlay commits at admission, so nothing is silently dropped.
+//! (dc caps' max_slave_planes = 2, `dcn30_resource_construct`): a native
+//! primary per CRTC whose immutable zpos is 2 (amdgpu_dm_plane_init's
+//! `primary_zpos = dc->caps.max_slave_planes`), overlays defaulting to
+//! 2 + 1 + their DRM plane index, and the cursors after them at 0x46+.
+//! The primaries are native planes like Navi48's: their SRC/CRTC
+//! rectangles are tracked plane state (`NativePlane::placed`), so
+//! GETPROPERTIES reads back what was committed and a request that leaves
+//! the primary out is checked against its committed state, as
+//! drm_atomic_get_plane_state gives amdgpu_dm. Every DCN30 surface is
+//! linear (ADDFB2 takes no tiled modifier on the linear card). What the
+//! Navi22 display can light of a CRTC's planes is its own admission
+//! (`amdgpu_native_kms::display_admits_planes`, dc_validate_global_state).
 use crate::amdgpu_dcn401_otg::{Blend, SurfaceFormat, Swizzle, MAX_OVERLAYS};
 use crate::amdgpu_dcn401_spl::{Rect, Rotation};
 use crate::amdgpu_navi48_boot::{DrmPlaneState, OverlayPlane, PlaneGeometry, PlaneSetup};
 use crate::drm::atomic::{AtomicState, PlaneState};
 use crate::drm::card::{Card, NativePlane, PlaneProps};
+use crate::drm_ioctl_bridge::refused;
 use alloc::vec::Vec;
 use narf_filesystem::FsError;
 
@@ -97,6 +98,10 @@ pub const COLOR_RANGE_PROP_ID: u32 = 0x71;
 /// own property, and these differ from the other planes'.
 pub const CURSOR_ZPOS_PROP_ID: u32 = 0x72;
 pub const CURSOR_BLEND_PROP_ID: u32 = 0x73;
+/// A DCN 3.0 primary's "zpos": immutable at 2 where DCN 4.0.1's is
+/// immutable at 3, so it is another property object (each plane's zpos is
+/// its own on Linux; the range is what GETPROPERTY reports).
+pub const DCN30_PRIMARY_ZPOS_PROP_ID: u32 = 0x75;
 /// Stable IN_FORMATS (and IN_FORMATS_ASYNC) blob ids, one per plane,
 /// regenerated on GETPROPBLOB.
 const IN_FORMATS_BLOB: u32 = 0x2000;
@@ -128,12 +133,6 @@ fn formats_of(card: &Card, id: u32) -> Option<&'static [u32]> {
         let index = id.checked_sub(PRIMARY_PLANE_ID_BASE)?;
         return card.crtcs.get(index as usize).and(card.plane_formats);
     }
-    // A synthesized primary on a card with overlays (Navi22) lists the
-    // card's primary formats under its bridge id, as the linear card's
-    // primaries do above; its IN_FORMATS blob stays LINEAR-only.
-    if synth_primary_index(card, id).is_some() {
-        return card.plane_formats;
-    }
     let p = card.native_plane(id)?;
     if p.is_cursor() {
         Some(&CURSOR_FORMATS)
@@ -143,21 +142,13 @@ fn formats_of(card: &Card, id: u32) -> Option<&'static [u32]> {
         card.overlay_formats
     }
 }
-/// Whether the card's primaries stay synthesized while its overlays are
-/// native planes (Navi22 on DCN 3.0): overlays published, no native
-/// primary.
-pub fn has_synthesized_primaries(card: &Card) -> bool {
-    card.native_planes.iter().any(NativePlane::is_overlay)
-        && !card.native_planes.iter().any(|p| p.primary_of.is_some())
-}
-/// The synthesized primary's CRTC index behind bridge id `id` (0x40 + n),
-/// on a card with synthesized primaries.
-fn synth_primary_index(card: &Card, id: u32) -> Option<usize> {
-    if !has_synthesized_primaries(card) {
-        return None;
-    }
-    let index = id.checked_sub(PRIMARY_PLANE_ID_BASE)? as usize;
-    (index < card.crtcs.len()).then_some(index)
+/// Whether the card's planes are DCN 3.0's (Navi22): its primaries carry
+/// DCN30's immutable zpos (amdgpu_dm_plane_init's `primary_zpos =
+/// dc->caps.max_slave_planes`, 2 there and 3 on DCN 4.0.1).
+pub fn is_dcn30(card: &Card) -> bool {
+    card.native_planes
+        .iter()
+        .any(|p| p.primary_of.is_some() && p.props.zpos == DCN30_PRIMARY_ZPOS)
 }
 /// Whether plane `id` lists a YCbCr format, so carries "COLOR_ENCODING" and
 /// "COLOR_RANGE" (amdgpu_dm attaches them when the plane caps take NV12 or
@@ -251,12 +242,11 @@ pub fn planes_for(old: &[NativePlane], crtcs: &[u32]) -> Vec<NativePlane> {
     planes_for_params(old, crtcs, PRIMARY_ZPOS, MAX_OVERLAYS, true)
 }
 
-/// DCN 3.0's planes for its CRTCs `crtcs`: the two shared overlays and
-/// each CRTC's cursor plane, keeping the committed state of every plane
-/// that remains. No primaries are built: they stay synthesized (their
-/// CRTC's `primary_fb`).
-pub fn overlay_cursor_planes_for(old: &[NativePlane], crtcs: &[u32]) -> Vec<NativePlane> {
-    planes_for_params(old, crtcs, DCN30_PRIMARY_ZPOS, DCN30_MAX_OVERLAYS, false)
+/// DCN 3.0's planes for its CRTCs `crtcs` (Navi22): each CRTC's primary,
+/// the two shared overlays and each CRTC's cursor plane, keeping the
+/// committed state of every plane that remains.
+pub fn dcn30_planes_for(old: &[NativePlane], crtcs: &[u32]) -> Vec<NativePlane> {
+    planes_for_params(old, crtcs, DCN30_PRIMARY_ZPOS, DCN30_MAX_OVERLAYS, true)
 }
 
 fn planes_for_params(
@@ -266,8 +256,15 @@ fn planes_for_params(
     overlay_count: usize,
     with_primaries: bool,
 ) -> Vec<NativePlane> {
-    let keep =
-        |id: u32, fresh: NativePlane| old.iter().copied().find(|p| p.id == id).unwrap_or(fresh);
+    // A plane keeps its committed state only as the kind of plane it was:
+    // an id that was another generation's overlay is not this one's cursor.
+    let kind = |p: &NativePlane| (p.primary_of.is_some(), p.cursor_of.is_some());
+    let keep = |id: u32, fresh: NativePlane| {
+        old.iter()
+            .copied()
+            .find(|p| p.id == id && kind(p) == kind(&fresh))
+            .unwrap_or(fresh)
+    };
     let blank = |id, primary_of, zpos| NativePlane {
         id,
         primary_of,
@@ -286,7 +283,12 @@ fn planes_for_params(
         out.extend(crtcs.iter().enumerate().map(|(k, &crtc)| {
             let id = PRIMARY_PLANE_ID_BASE + k as u32;
             let mut p = keep(id, blank(id, Some(crtc), primary_zpos));
-            p.primary_of = Some(crtc);
+            // A primary left on another CRTC id at this index starts over.
+            if p.primary_of != Some(crtc) {
+                p = blank(id, Some(crtc), primary_zpos);
+            }
+            // Its zpos is immutable, and this display core's.
+            p.props.zpos = primary_zpos;
             p
         }));
     }
@@ -324,20 +326,18 @@ fn planes_for_params(
 
 /// A cursor plane per CRTC alone (amdgpu_dm_crtc_init's
 /// DRM_PLANE_TYPE_CURSOR planes), for a card whose primaries stay
-/// synthesized (Navi22): `overlay_cursor_planes_for`'s cursor planes,
-/// at 0x46+ after the two overlays.
+/// synthesized: DCN 3.0's cursor planes, at 0x46+ after its two overlays.
 pub fn cursor_planes_for(old: &[NativePlane], crtcs: &[u32]) -> Vec<NativePlane> {
-    overlay_cursor_planes_for(old, crtcs)
+    planes_for_params(old, crtcs, DCN30_PRIMARY_ZPOS, DCN30_MAX_OVERLAYS, false)
         .into_iter()
         .filter(NativePlane::is_cursor)
         .collect()
 }
 
 /// dc caps max_cursor_size of `card`'s display core: 256 on DCN 3.0
-/// (Navi22, whose primaries stay synthesized), 64 on DCN 4.0.1 (whose
-/// primaries are native planes).
+/// (Navi22, and a card with cursor planes alone), 64 on DCN 4.0.1.
 pub fn max_cursor_size(card: &Card) -> u32 {
-    if card.native_planes.iter().any(|p| p.primary_of.is_some()) {
+    if card.native_planes.iter().any(|p| p.primary_of.is_some()) && !is_dcn30(card) {
         MAX_CURSOR_SIZE
     } else {
         crate::amdgpu_dcn30_cursor::CURSOR_MAX
@@ -446,11 +446,13 @@ pub fn set_property(
         match prop {
             CURSOR_BLEND_PROP_ID => {
                 if !CURSOR_BLEND_ENUMS.iter().any(|&(v, _)| v == value) {
-                    return Err(FsError::InvalidData);
+                    return Err(refused(
+                        "cursor plane 'pixel blend mode': not one of its enum values",
+                    ));
                 }
                 props.blend = value as u8;
             }
-            CURSOR_ZPOS_PROP_ID => return Err(FsError::InvalidData),
+            CURSOR_ZPOS_PROP_ID => return Err(refused("cursor plane 'zpos' is immutable")),
             _ => return Ok(false),
         }
         return Ok(true);
@@ -460,39 +462,48 @@ pub fn set_property(
     let props = plane.props.get_or_insert(props_of);
     match prop {
         ALPHA_PROP_ID if overlay => {
-            props.alpha = u16::try_from(value).map_err(|_| FsError::InvalidData)?;
+            props.alpha =
+                u16::try_from(value).map_err(|_| refused("plane 'alpha' above 0xffff"))?;
         }
         BLEND_PROP_ID => {
             if !BLEND_ENUMS.iter().any(|&(v, _)| v == value) {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "plane 'pixel blend mode': not one of its enum values",
+                ));
             }
             props.blend = value as u8;
         }
         ZPOS_PROP_ID if overlay => {
             if value > 254 {
-                return Err(FsError::InvalidData);
+                return Err(refused("overlay plane 'zpos' above 254"));
             }
             props.zpos = value as u8;
         }
         // The primary's zpos is immutable: never settable.
-        PRIMARY_ZPOS_PROP_ID if !overlay => return Err(FsError::InvalidData),
+        PRIMARY_ZPOS_PROP_ID | DCN30_PRIMARY_ZPOS_PROP_ID if !overlay => {
+            return Err(refused("primary plane 'zpos' is immutable"))
+        }
         ROTATION_PROP_ID => {
             // The bitmask's valid bits, then exactly one rotation
             // (drm_atomic_plane_set_property).
             if value & !0xf != 0 || !(value & 0xf).is_power_of_two() {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "plane 'rotation': unknown bits or not exactly one rotation",
+                ));
             }
             props.rotation = value as u8;
         }
         COLOR_ENCODING_PROP_ID if yuv => {
             if !COLOR_ENCODING_ENUMS.iter().any(|&(v, _)| v == value) {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "plane 'COLOR_ENCODING': not one of its enum values",
+                ));
             }
             props.color_encoding = value as u8;
         }
         COLOR_RANGE_PROP_ID if yuv => {
             if !COLOR_RANGE_ENUMS.iter().any(|&(v, _)| v == value) {
-                return Err(FsError::InvalidData);
+                return Err(refused("plane 'COLOR_RANGE': not one of its enum values"));
             }
             props.color_range = value as u8;
         }
@@ -537,6 +548,8 @@ pub fn object_properties(card: &Card, id: u32) -> Option<(Vec<u32>, Vec<u64>)> {
     values.push(u64::from(props.blend));
     if p.primary_of.is_none() {
         ids.push(ZPOS_PROP_ID);
+    } else if props.zpos == DCN30_PRIMARY_ZPOS {
+        ids.push(DCN30_PRIMARY_ZPOS_PROP_ID);
     } else {
         ids.push(PRIMARY_ZPOS_PROP_ID);
     }
@@ -572,6 +585,11 @@ pub fn range_property(prop: u32) -> Option<(&'static [u8], bool, [u64; 2])> {
             true,
             [u64::from(PRIMARY_ZPOS), u64::from(PRIMARY_ZPOS)],
         )),
+        DCN30_PRIMARY_ZPOS_PROP_ID => Some((
+            b"zpos",
+            true,
+            [u64::from(DCN30_PRIMARY_ZPOS), u64::from(DCN30_PRIMARY_ZPOS)],
+        )),
         CURSOR_ZPOS_PROP_ID => Some((
             b"zpos",
             true,
@@ -606,11 +624,14 @@ pub fn plane_surface(
         crate::drm::card::PixelFormat::Nv12 | crate::drm::card::PixelFormat::P010
     );
     Ok(PlaneSurface {
-        tiling: Tiling::from_modifier(fb.modifier).ok_or(FsError::InvalidData)?,
+        tiling: Tiling::from_modifier(fb.modifier).ok_or_else(|| {
+            refused("plane FB_ID: framebuffer modifier is not a tiling DC scans out")
+        })?,
         // The DRM color properties only affect YCbCr formats.
         color: if yuv {
-            YuvColor::from_props(props.color_encoding, props.color_range)
-                .ok_or(FsError::InvalidData)?
+            YuvColor::from_props(props.color_encoding, props.color_range).ok_or_else(|| {
+                refused("plane COLOR_ENCODING/COLOR_RANGE: no DC color space for the pair")
+            })?
         } else {
             YuvColor::default()
         },
@@ -665,7 +686,7 @@ pub fn check_plane(p: &PlaneState, mode: (u32, u32)) -> Result<(), FsError> {
         vh = mh - y;
     }
     if vw < 0 || vh < 0 || vw < MIN_VIEWPORT * 2 || vh < MIN_VIEWPORT {
-        return Err(FsError::InvalidData);
+        return Err(refused("plane CRTC_X/Y/W/H: less than 24x12 visible on the CRTC (amdgpu_dm_plane_helper_check_state)"));
     }
     // drm_rect_calc_hscale/vscale in DRM's 16.16 src/dst convention:
     // min_scale = 1.0 / max_upscale, max_scale = 1.0 / min_downscale.
@@ -681,19 +702,21 @@ pub fn check_plane(p: &PlaneState, mode: (u32, u32)) -> Result<(), FsError> {
     for (src, dst) in [(sw << 16, w), (sh << 16, h)] {
         let scale = calc_scale(src, dst);
         if dst != 0 && !(min_scale..=max_scale).contains(&scale) {
-            return Err(FsError::InvalidData);
+            return Err(refused("plane SRC/CRTC size: scaling outside the plane's limits (drm_atomic_helper_check_plane_state)"));
         }
     }
     // amdgpu_dm_plane_fill_dc_scaling_info (DC's dst/src, 1000 == 1.0).
     if p.src_w == 0 || p.src_h == 0 || p.crtc_w == 0 || p.crtc_h == 0 {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "plane SRC_W/SRC_H/CRTC_W/CRTC_H: zero (amdgpu_dm_plane_fill_dc_scaling_info)",
+        ));
     }
     let scale_w = w * 1000 / i64::from(p.src_w);
     let scale_h = h * 1000 / i64::from(p.src_h);
     if !(MIN_DOWNSCALE..=MAX_UPSCALE).contains(&scale_w)
         || !(MIN_DOWNSCALE..=MAX_UPSCALE).contains(&scale_h)
     {
-        return Err(FsError::InvalidData);
+        return Err(refused("plane SRC/CRTC size: scaling outside DC's limits (amdgpu_dm_plane_fill_dc_scaling_info)"));
     }
     Ok(())
 }
@@ -707,6 +730,27 @@ pub struct DisplayPlanes {
     pub setup: PlaneSetup,
     pub primary_format: u32,
     pub overlays: [Option<u32>; MAX_OVERLAYS],
+    /// The byte pitch of the primary's framebuffer, then of each overlay's
+    /// in the setup's order (0 for none): what DC's plane_size carries
+    /// beside the rectangles (amdgpu_dm_plane_fill_plane_buffer_attributes).
+    pub pitches: [u32; 1 + MAX_OVERLAYS],
+}
+impl DisplayPlanes {
+    /// The primary's SRC and CRTC rectangles when it is not the full-frame
+    /// unscaled primary (amdgpu_dm_plane_fill_dc_scaling_info), for a
+    /// presenter that takes its placement with each frame (Navi22).
+    pub fn primary_placement(&self) -> Option<crate::drm::card::Placement> {
+        let g = self.setup.primary?;
+        Some(crate::drm::card::Placement {
+            src: (g.src_x, g.src_y, g.width, g.height),
+            dst: (
+                g.dst.x,
+                g.dst.y,
+                u32::try_from(g.dst.width).ok()?,
+                u32::try_from(g.dst.height).ok()?,
+            ),
+        })
+    }
 }
 
 /// Plane `id` as the request leaves it: its requested state, else its
@@ -718,88 +762,6 @@ fn final_state(card: &Card, state: &AtomicState, id: u32) -> Option<PlaneState> 
         .find(|p| p.id == id)
         .cloned()
         .or_else(|| plane_state(card, id))
-}
-
-/// The synthesized primary's framebuffer after `state` on CRTC `crtc_id`:
-/// the request's primary plane state for it, else the CRTC's committed
-/// `primary_fb` (a request entry that disables it wins over the commit).
-fn synthesized_primary_fb(card: &Card, state: &AtomicState, crtc_id: u32) -> Option<u32> {
-    let index = card.crtcs.iter().position(|c| c.id == crtc_id)?;
-    let id = PRIMARY_PLANE_ID_BASE + index as u32;
-    match state.planes.iter().find(|p| p.id == id) {
-        Some(p) => p.fb_id,
-        None => card.crtcs[index].primary_fb,
-    }
-}
-
-/// The synthesized primary of CRTC `crtc_id` after `state`: the request's
-/// primary plane state for it, else the committed framebuffer shown whole
-/// at `mode` (drm_atomic_helper_set_config), with DCN30's primary zpos.
-/// None when the CRTC has no primary framebuffer.
-fn synthesized_primary(
-    card: &Card,
-    state: &AtomicState,
-    crtc_id: u32,
-    mode: (u32, u32),
-) -> Option<PlaneState> {
-    let index = card.crtcs.iter().position(|c| c.id == crtc_id)?;
-    let id = PRIMARY_PLANE_ID_BASE + index as u32;
-    let crtc = &card.crtcs[index];
-    let mut p = match state.planes.iter().find(|p| p.id == id) {
-        Some(p) => p.clone(),
-        None => {
-            let fb = crtc.primary_fb?;
-            // The framebuffer exists (it was validated when committed).
-            card.framebuffer(fb).ok()?;
-            PlaneState {
-                id,
-                crtc_id: Some(crtc_id),
-                fb_id: Some(fb),
-                crtc_x: 0,
-                crtc_y: 0,
-                crtc_w: mode.0,
-                crtc_h: mode.1,
-                src_x: crtc.x,
-                src_y: crtc.y,
-                src_w: mode.0,
-                src_h: mode.1,
-                in_fence_fd: None,
-                props: None,
-            }
-        }
-    };
-    if p.props.is_none() {
-        p.props = Some(PlaneProps::new(DCN30_PRIMARY_ZPOS));
-    }
-    Some(p)
-}
-
-/// A DCN30 plane's surface is linear: ADDFB2 takes no tiled modifier on
-/// the linear card, so a non-LINEAR one never reaches the setup (lane 2
-/// programs HUBP for linear surfaces only).
-fn check_dcn30_linear(card: &Card, p: &PlaneState) -> Result<(), FsError> {
-    let Some(fb_id) = p.fb_id else {
-        return Ok(());
-    };
-    let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
-    if fb.modifier != crate::amdgpu_dm_modifiers::LINEAR {
-        return Err(FsError::InvalidData);
-    }
-    Ok(())
-}
-
-/// A plane's destination rectangle on the CRTC: (x, y, width, height).
-type DstRect = (i32, i32, u32, u32);
-/// A plane's source rectangle in the framebuffer: (x, y, width, height).
-type SrcRect = (u32, u32, u32, u32);
-
-/// Whether `p` is placed (not the full-frame primary at the mode), as the
-/// bridge's `placement_of` reads it: the positioned/scaled rectangles,
-/// destination first.
-fn placed_rects(p: &PlaneState, mode: (u32, u32)) -> Option<(DstRect, SrcRect)> {
-    let dst = (p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h);
-    let src = (p.src_x, p.src_y, p.src_w, p.src_h);
-    (dst != (0, 0, mode.0, mode.1) || src != (0, 0, mode.0, mode.1)).then_some((dst, src))
 }
 
 /// amdgpu_dm's checks of every native plane in `state` and every CRTC the
@@ -820,16 +782,13 @@ pub fn check(
             };
             let old = plane_state(card, p.id).and_then(|s| s.crtc_id);
             if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
-                return Err(FsError::InvalidData);
+                return Err(refused(
+                    "cursor plane CRTC_ID: moved straight to another CRTC (drm_atomic_plane_check)",
+                ));
             }
             check_cursor_plane(card, native, p)?;
         }
         return Ok(Vec::new());
-    }
-    // Navi22 on DCN 3.0: the primaries stay synthesized while the overlays
-    // are native planes.
-    if has_synthesized_primaries(card) {
-        return check_synthesized(card, state, mode_of);
     }
     let mut crtcs: Vec<u32> = state.crtcs.iter().map(|c| c.id).collect();
     // The CRTCs only a cursor plane brings in.
@@ -842,10 +801,14 @@ pub fn check(
         // drm_atomic_plane_check: no direct move between CRTCs, and a
         // primary only on its own CRTC.
         if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
-            return Err(FsError::InvalidData);
+            return Err(refused(
+                "plane CRTC_ID: moved straight to another CRTC (drm_atomic_plane_check)",
+            ));
         }
         if native.primary_of.is_some() && p.crtc_id.is_some() && p.crtc_id != native.primary_of {
-            return Err(FsError::InvalidData);
+            return Err(refused(
+                "primary plane CRTC_ID: not its own CRTC (possible_crtcs)",
+            ));
         }
         if native.is_cursor() {
             check_cursor_plane(card, native, p)?;
@@ -860,7 +823,7 @@ pub fn check(
                 card.overlay_formats.unwrap_or(&[])
             };
             if !formats.contains(&format) {
-                return Err(FsError::InvalidData);
+                return Err(refused("plane FB_ID: framebuffer format not in the plane's format list (drm_atomic_plane_check)"));
             }
         }
         crtcs.extend(old.into_iter().chain(p.crtc_id));
@@ -888,7 +851,7 @@ pub fn check(
             .find(|p| p.primary_of == Some(crtc_id))
             .and_then(|p| final_state(card, state, p.id));
         if enabled && primary.is_none_or(|p| p.fb_id.is_none()) {
-            return Err(FsError::InvalidData);
+            return Err(refused("cursor plane on an enabled CRTC without its primary plane (dm_crtc_helper_atomic_check)"));
         }
     }
     let mut out = Vec::new();
@@ -920,9 +883,10 @@ pub fn check(
         }
         // dm_crtc_helper_atomic_check: an enabled CRTC needs its primary.
         let Some(primary) = primary else {
-            return Err(FsError::InvalidData);
+            return Err(refused("enabled CRTC without a framebuffer on its primary plane (dm_crtc_helper_atomic_check)"));
         };
-        let mode = mode_of(crtc_id).ok_or(FsError::InvalidData)?;
+        let mode =
+            mode_of(crtc_id).ok_or_else(|| refused("enabled CRTC has no mode after the commit"))?;
         for p in core::iter::once(&primary).chain(&overlays) {
             check_plane(p, (mode.width, mode.height))?;
         }
@@ -933,138 +897,6 @@ pub fn check(
             &overlays,
             (mode.width, mode.height),
         )?);
-    }
-    Ok(out)
-}
-
-/// `check()` for a card with synthesized primaries (Navi22 on DCN 3.0):
-/// amdgpu_dm's checks with the primary read from its CRTC's `primary_fb`
-/// (dm_crtc_helper_atomic_check's primary requirement), the overlays
-/// checked against it (the CRTC-switch rule, their formats, DCN30's
-/// scaling/viewport/rotation limits, linear surfaces only). Every enabled
-/// touched CRTC's primary is validated — a positioned or scaled one keeps
-/// the DML30 admission the synthesized path gave it
-/// (`primary_placement_admitted`; the joint two-plane admission is lane
-/// 3's `display_admits_planes`) — but only a CRTC with an enabled overlay
-/// returns a setup: a primary-only CRTC stays on the synthesized path, so
-/// its commits never reach the overlay admission that is still false on
-/// Navi22.
-fn check_synthesized(
-    card: &Card,
-    state: &AtomicState,
-    mode_of: impl Fn(u32) -> Option<crate::Mode>,
-) -> Result<Vec<DisplayPlanes>, FsError> {
-    let mut crtcs: Vec<u32> = state.crtcs.iter().map(|c| c.id).collect();
-    // The CRTCs only a cursor plane brings in.
-    let mut cursor_crtcs: Vec<u32> = Vec::new();
-    for p in &state.planes {
-        if let Some(native) = card.native_plane(p.id) {
-            let old = plane_state(card, p.id).and_then(|s| s.crtc_id);
-            // drm_atomic_plane_check: no direct move between CRTCs.
-            if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
-                return Err(FsError::InvalidData);
-            }
-            if native.is_cursor() {
-                check_cursor_plane(card, native, p)?;
-                cursor_crtcs.extend(old.into_iter().chain(p.crtc_id));
-                continue;
-            }
-            if let Some(fb) = p.fb_id {
-                let format = card.framebuffer(fb).map_err(|_| FsError::NotFound)?.format as u32;
-                if !card.overlay_formats.unwrap_or(&[]).contains(&format) {
-                    return Err(FsError::InvalidData);
-                }
-            }
-            crtcs.extend(old.into_iter().chain(p.crtc_id));
-            continue;
-        }
-        let Some(index) = synth_primary_index(card, p.id) else {
-            continue;
-        };
-        let own = card.crtcs[index].id;
-        let old = card.crtcs[index].primary_fb.map(|_| own);
-        if old.is_some() && p.crtc_id.is_some() && old != p.crtc_id {
-            return Err(FsError::InvalidData);
-        }
-        // A primary only on its own CRTC.
-        if p.crtc_id.is_some() && p.crtc_id != Some(own) {
-            return Err(FsError::InvalidData);
-        }
-        if let Some(fb) = p.fb_id {
-            let format = card.framebuffer(fb).map_err(|_| FsError::NotFound)?.format as u32;
-            if !card.plane_formats.unwrap_or(&[]).contains(&format) {
-                return Err(FsError::InvalidData);
-            }
-        }
-        crtcs.extend(old.into_iter().chain(p.crtc_id));
-    }
-    crtcs.sort_unstable();
-    crtcs.dedup();
-    // A CRTC a cursor plane brings in gets dm_crtc_helper_atomic_check
-    // (its synthesized primary whenever it is enabled).
-    for crtc_id in cursor_crtcs {
-        if crtcs.contains(&crtc_id) {
-            continue;
-        }
-        let Ok(crtc) = card.crtc(crtc_id) else {
-            continue;
-        };
-        let enabled = state
-            .crtcs
-            .iter()
-            .find(|c| c.id == crtc_id)
-            .map_or(crtc.enabled, |c| c.enable);
-        if enabled && synthesized_primary_fb(card, state, crtc_id).is_none() {
-            return Err(FsError::InvalidData);
-        }
-    }
-    let mut out = Vec::new();
-    for crtc_id in crtcs {
-        let Ok(crtc) = card.crtc(crtc_id) else {
-            continue;
-        };
-        let enabled = state
-            .crtcs
-            .iter()
-            .find(|c| c.id == crtc_id)
-            .map_or(crtc.enabled, |c| c.enable);
-        if !enabled {
-            continue;
-        }
-        let mode = mode_of(crtc_id).ok_or(FsError::InvalidData)?;
-        let mode = (mode.width, mode.height);
-        // dm_crtc_helper_atomic_check: an enabled CRTC needs its primary.
-        let Some(primary) =
-            synthesized_primary(card, state, crtc_id, mode).filter(|p| p.fb_id.is_some())
-        else {
-            return Err(FsError::InvalidData);
-        };
-        let overlays: Vec<PlaneState> = overlay_ids(card)
-            .into_iter()
-            .filter_map(|id| final_state(card, state, id))
-            .filter(|p| p.crtc_id == Some(crtc_id) && p.fb_id.is_some())
-            .collect();
-        for p in core::iter::once(&primary).chain(&overlays) {
-            check_dcn30_linear(card, p)?;
-            check_plane(p, mode)?;
-        }
-        if let Some((dst, src)) = placed_rects(&primary, mode) {
-            let fb = card
-                .framebuffer(primary.fb_id.ok_or(FsError::InvalidData)?)
-                .map_err(|_| FsError::NotFound)?;
-            if !crate::amdgpu_native_kms::primary_placement_admitted(
-                (fb.pitch, fb.width, fb.height),
-                mode,
-                src,
-                dst,
-            ) {
-                return Err(FsError::InvalidData);
-            }
-        }
-        if overlays.is_empty() {
-            continue;
-        }
-        out.push(display_planes(card, crtc_id, &primary, &overlays, mode)?);
     }
     Ok(out)
 }
@@ -1102,26 +934,36 @@ pub fn check_cursor_max(
 ) -> Result<(), FsError> {
     let (src_x, src_y, src_w, src_h) = src;
     if src_x != 0 || src_y != 0 {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane SRC_X/SRC_Y: not 0 (amdgpu_dm_check_native_cursor_state)",
+        ));
     }
     if fb.width > max || fb.height > max {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane FB_ID: framebuffer larger than max_cursor_size (dm_check_cursor_fb)",
+        ));
     }
     if u64::from(src_w) != u64::from(fb.width) << 16
         || u64::from(src_h) != u64::from(fb.height) << 16
     {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane SRC_W/SRC_H: not the whole framebuffer (dm_check_cursor_fb)",
+        ));
     }
     // Pitch in pixels (ARGB8888's cpp is 4).
     let pitch = fb.pitch / 4;
     if fb.width != pitch || !matches!(pitch, 64 | 128 | 256) {
-        return Err(FsError::InvalidData);
+        return Err(refused("cursor plane FB_ID: pitch is not the width, or not 64, 128 or 256 pixels (dm_check_cursor_fb)"));
     }
     if !fb.linear {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane FB_ID: framebuffer is not linear (dm_check_cursor_fb)",
+        ));
     }
     if src_w >> 16 != crtc.0 || src_h >> 16 != crtc.1 {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane CRTC_W/CRTC_H: scaled (amdgpu_dm_check_native_cursor_state)",
+        ));
     }
     Ok(())
 }
@@ -1133,7 +975,9 @@ pub fn check_cursor_max(
 /// values would).
 fn check_cursor_plane(card: &Card, native: &NativePlane, p: &PlaneState) -> Result<(), FsError> {
     if p.crtc_id.is_some() && p.crtc_id != native.cursor_of {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane CRTC_ID: not its own CRTC (possible_crtcs)",
+        ));
     }
     let (Some(_), Some(fb_id)) = (p.crtc_id, p.fb_id) else {
         return Ok(());
@@ -1141,7 +985,9 @@ fn check_cursor_plane(card: &Card, native: &NativePlane, p: &PlaneState) -> Resu
     let fb = card.framebuffer(fb_id).map_err(|_| FsError::NotFound)?;
     let linear = fb.modifier == crate::amdgpu_dm_modifiers::LINEAR;
     if !CURSOR_FORMATS.contains(&(fb.format as u32)) || !linear {
-        return Err(FsError::InvalidData);
+        return Err(refused(
+            "cursor plane FB_ID: not a linear ARGB8888 framebuffer (drm_atomic_plane_check)",
+        ));
     }
     let fb = CursorFb {
         width: fb.width,
@@ -1294,15 +1140,16 @@ fn display_planes(
     mode: (u32, u32),
 ) -> Result<DisplayPlanes, FsError> {
     let fourcc = |p: &PlaneState| -> Result<u32, FsError> {
-        let fb = p.fb_id.ok_or(FsError::InvalidData)?;
+        let fb = p.fb_id.ok_or_else(|| refused("plane has no framebuffer"))?;
         Ok(card.framebuffer(fb).map_err(|_| FsError::NotFound)?.format as u32)
     };
     let format_of = |p: &PlaneState| -> Result<SurfaceFormat, FsError> {
-        SurfaceFormat::from_fourcc(fourcc(p)?).ok_or(FsError::InvalidData)
+        SurfaceFormat::from_fourcc(fourcc(p)?)
+            .ok_or_else(|| refused("plane FB_ID: framebuffer format DC has no surface format for"))
     };
     let geometry = |p: &PlaneState, format: SurfaceFormat, overlay: bool| {
         let fb = card
-            .framebuffer(p.fb_id.ok_or(FsError::InvalidData)?)
+            .framebuffer(p.fb_id.ok_or_else(|| refused("plane has no framebuffer"))?)
             .map_err(|_| FsError::NotFound)?;
         let props = p.props.unwrap_or(PlaneProps::new(0));
         let surface = plane_surface(fb, props)?;
@@ -1311,7 +1158,7 @@ fn display_planes(
         // be scanned vertically, so dc_validate_global_state refuses a
         // linear plane rotated 90 or 270 whatever the mode.
         if rotation.orthogonal() && surface.tiling.swizzle == Swizzle::Linear {
-            return Err(FsError::InvalidData);
+            return Err(refused("plane 'rotation': a linear surface cannot be rotated 90 or 270 (dc_validate_global_state)"));
         }
         Ok::<_, FsError>(PlaneGeometry {
             src_x: p.src_x,
@@ -1333,21 +1180,32 @@ fn display_planes(
     let primary_at = order
         .iter()
         .position(|p| p.id == primary.id)
-        .ok_or(FsError::InvalidData)?;
+        .ok_or_else(|| refused("primary plane missing from the CRTC's plane order"))?;
     let format = format_of(primary)?;
     let g = geometry(primary, format, false)?;
     // A tiled or 4:2:0 primary always goes to DC as a placed plane (its
     // surface is its whole framebuffer); a linear client one shown whole
     // is the full-frame primary still.
+    // On DCN 3.0 (Navi22) a primary alone is the bottom plane, blended
+    // over the black background: "pixel blend mode" None leaves its pixels
+    // as Pre-multiplied does (dcn20_update_mpcc), so an ARGB8888 primary
+    // with None is the same full-frame primary, not a placed plane with
+    // an identity placement and a DML plan of its own at every check.
+    let opaque = Blend {
+        per_pixel_alpha: false,
+        ..Blend::default_for(format)
+    };
+    let plain_blend = g.blend == Blend::default_for(format)
+        || (is_dcn30(card) && overlays.is_empty() && g.blend == opaque);
     let full = !PlaneGeometry { client: false, ..g }.whole_framebuffer(format)
         && (g.src_x, g.src_y, g.width, g.height) == (0, 0, mode.0, mode.1)
         && g.dst == Rect::new(0, 0, mode.0 as i32, mode.1 as i32)
         && g.rotation == Rotation::R0
-        && g.blend == Blend::default_for(format);
+        && plain_blend;
     // What should_reset_plane compares, with each plane's normalized zpos.
     let drm = |p: &PlaneState| -> Result<DrmPlaneState, FsError> {
         let fb = card
-            .framebuffer(p.fb_id.ok_or(FsError::InvalidData)?)
+            .framebuffer(p.fb_id.ok_or_else(|| refused("plane has no framebuffer"))?)
             .map_err(|_| FsError::NotFound)?;
         let props = p.props.unwrap_or(PlaneProps::new(0));
         Ok(DrmPlaneState {
@@ -1366,7 +1224,8 @@ fn display_planes(
             normalized_zpos: order
                 .iter()
                 .position(|q| q.id == p.id)
-                .ok_or(FsError::InvalidData)? as u8,
+                .ok_or_else(|| refused("plane missing from the CRTC's plane order"))?
+                as u8,
         })
     };
     let mut setup = PlaneSetup {
@@ -1375,10 +1234,18 @@ fn display_planes(
         drm: [None; 1 + MAX_OVERLAYS],
     };
     setup.drm[0] = Some(drm(primary)?);
+    let pitch = |p: &PlaneState| -> Result<u32, FsError> {
+        let fb = p.fb_id.ok_or_else(|| refused("plane has no framebuffer"))?;
+        Ok(card.framebuffer(fb).map_err(|_| FsError::NotFound)?.pitch)
+    };
+    let mut pitches = [0; 1 + MAX_OVERLAYS];
+    pitches[0] = pitch(primary)?;
     let mut ids = [None; MAX_OVERLAYS];
     for (k, p) in order.iter().filter(|p| p.id != primary.id).enumerate() {
         if k >= MAX_OVERLAYS {
-            return Err(FsError::InvalidData);
+            return Err(refused(
+                "more overlay planes on the CRTC than DC has slave planes",
+            ));
         }
         let format = format_of(p)?;
         setup.overlays[k] = Some(OverlayPlane {
@@ -1392,12 +1259,14 @@ fn display_planes(
         });
         setup.drm[k + 1] = Some(drm(p)?);
         ids[k] = Some(p.id);
+        pitches[k + 1] = pitch(p)?;
     }
     Ok(DisplayPlanes {
         crtc_id,
         setup,
         primary_format: fourcc(primary)?,
         overlays: ids,
+        pitches,
     })
 }
 
@@ -1405,6 +1274,8 @@ fn display_planes(
 /// framebuffer (an overlay's; a primary's is its CRTC's), rectangles and
 /// properties.
 pub fn commit(card: &mut Card, state: &AtomicState) {
+    // The CRTCs whose primary this commit switches off.
+    let mut off: Vec<u32> = Vec::new();
     for p in &state.planes {
         let Some(native) = card.native_planes.iter_mut().find(|n| n.id == p.id) else {
             continue;
@@ -1414,18 +1285,34 @@ pub fn commit(card: &mut Card, state: &AtomicState) {
             // (the bridge marks a new one again).
             native.internal_fb = false;
         }
-        if native.primary_of.is_none() {
-            native.crtc_id = p.crtc_id;
-            native.fb_id = p.fb_id;
-        } else {
-            native.crtc_id = p.crtc_id;
-            native.fb_id = p.fb_id;
-            native.placed = true;
-        }
+        native.crtc_id = p.crtc_id;
+        native.fb_id = p.fb_id;
         native.src = (p.src_x, p.src_y, p.src_w, p.src_h);
         native.dst = (p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h);
+        if let Some(crtc) = native.primary_of {
+            // drm_atomic_helper_disable_plane: a disabled plane has no
+            // framebuffer, no CRTC and no rectangles. A compositor
+            // switches off the other CRTCs' primaries in its modeset; one
+            // left "placed" with zero rectangles would be judged on them
+            // by the next commit that does not name it.
+            native.placed = p.crtc_id.is_some() && p.fb_id.is_some();
+            if !native.placed {
+                native.crtc_id = None;
+                native.fb_id = None;
+                native.src = (0, 0, 0, 0);
+                native.dst = (0, 0, 0, 0);
+                off.push(crtc);
+            }
+        }
         if let Some(props) = p.props {
             native.props = props;
+        }
+    }
+    // The primary's framebuffer is its CRTC's `primary_fb`
+    // (`plane_state`): a primary switched off shows none.
+    for crtc in off {
+        if let Ok(c) = card.crtc_mut(crtc) {
+            c.primary_fb = None;
         }
     }
 }
@@ -1440,6 +1327,33 @@ pub fn reset_primary(card: &mut Card, crtc_id: u32) {
     {
         p.placed = false;
     }
+}
+
+/// CRTC `crtc_id`'s committed primary placement on a DCN 3.0 card (Navi22),
+/// whose presenter takes it with each frame: its tracked SRC and CRTC
+/// rectangles when they are not the full mode unscaled. A legacy PAGE_FLIP
+/// changes the framebuffer alone (drm_atomic_helper_page_flip), so its
+/// frame shows where the plane was placed. None on DCN 4.0.1, whose
+/// display holds the placement it was lit with.
+pub fn committed_primary_placement(
+    card: &Card,
+    crtc_id: u32,
+) -> Option<crate::drm::card::Placement> {
+    if !is_dcn30(card) {
+        return None;
+    }
+    let p = card
+        .native_planes
+        .iter()
+        .find(|p| p.primary_of == Some(crtc_id) && p.placed)?;
+    let mode = card.crtc(crtc_id).ok()?.mode?;
+    let full = (0, 0, mode.width, mode.height);
+    (p.src != full || p.dst != (0, 0, mode.width, mode.height)).then_some(
+        crate::drm::card::Placement {
+            src: p.src,
+            dst: p.dst,
+        },
+    )
 }
 
 /// A PAGE_FLIP keeps the primary's placement: on a placed primary the new
@@ -1470,9 +1384,6 @@ pub fn setcrtc_planes(
     (x, y): (u32, u32),
     mode: (u32, u32),
 ) -> Option<Result<DisplayPlanes, FsError>> {
-    if has_synthesized_primaries(card) {
-        return setcrtc_planes_synthesized(card, crtc_id, fb_id, (x, y), mode);
-    }
     let fb = card.framebuffer(fb_id).ok()?;
     let format = SurfaceFormat::from_fourcc(fb.format as u32)?;
     if !format.is_video() && fb.modifier == crate::amdgpu_dm_modifiers::LINEAR {
@@ -1508,59 +1419,9 @@ pub fn setcrtc_planes(
     )
 }
 
-/// `setcrtc_planes` for a card with synthesized primaries (Navi22): the
-/// primary is the SETCRTC framebuffer shown whole at the mode, the
-/// committed overlays kept. None for a linear RGB framebuffer with no
-/// overlay (its display takes the format check), as on the native card;
-/// a tiled framebuffer is refused outright — no DCN30 surface is tiled.
-fn setcrtc_planes_synthesized(
-    card: &Card,
-    crtc_id: u32,
-    fb_id: u32,
-    (x, y): (u32, u32),
-    mode: (u32, u32),
-) -> Option<Result<DisplayPlanes, FsError>> {
-    let fb = card.framebuffer(fb_id).ok()?;
-    let format = SurfaceFormat::from_fourcc(fb.format as u32)?;
-    let linear = fb.modifier == crate::amdgpu_dm_modifiers::LINEAR;
-    let overlays: Vec<PlaneState> = overlay_ids(card)
-        .into_iter()
-        .filter_map(|id| plane_state(card, id))
-        .filter(|p| p.crtc_id == Some(crtc_id) && p.fb_id.is_some())
-        .collect();
-    if overlays.is_empty() && !format.is_video() && linear {
-        return None;
-    }
-    let index = card.crtcs.iter().position(|c| c.id == crtc_id)?;
-    let state = PlaneState {
-        id: PRIMARY_PLANE_ID_BASE + index as u32,
-        crtc_id: Some(crtc_id),
-        fb_id: Some(fb_id),
-        crtc_x: 0,
-        crtc_y: 0,
-        crtc_w: mode.0,
-        crtc_h: mode.1,
-        src_x: x,
-        src_y: y,
-        src_w: mode.0,
-        src_h: mode.1,
-        in_fence_fd: None,
-        props: Some(PlaneProps::new(DCN30_PRIMARY_ZPOS)),
-    };
-    Some(check_plane(&state, mode).and_then(|()| {
-        if !linear {
-            return Err(FsError::InvalidData);
-        }
-        display_planes(card, crtc_id, &state, &overlays, mode)
-    }))
-}
-
 /// Each enabled CRTC's planes as the card now holds them (after a commit,
 /// a framebuffer removal or a SETCRTC), for the displays to light with.
 pub fn displays(card: &Card) -> Vec<DisplayPlanes> {
-    if has_synthesized_primaries(card) {
-        return displays_synthesized(card);
-    }
     let empty = AtomicState::default();
     card.crtcs
         .iter()
@@ -1579,37 +1440,6 @@ pub fn displays(card: &Card) -> Vec<DisplayPlanes> {
                 .filter(|p| p.crtc_id == Some(c.id) && p.fb_id.is_some())
                 .collect();
             display_planes(card, c.id, &primary, &overlays, (mode.width, mode.height)).ok()
-        })
-        .collect()
-}
-
-/// `displays()` for a card with synthesized primaries (Navi22): the
-/// primary from its CRTC's `primary_fb`, the committed overlays on it —
-/// only for CRTCs with an enabled overlay, as in `check_synthesized`, so
-/// a primary-only CRTC keeps the synthesized path's (empty) answer.
-fn displays_synthesized(card: &Card) -> Vec<DisplayPlanes> {
-    let empty = AtomicState::default();
-    card.crtcs
-        .iter()
-        .filter(|c| c.enabled)
-        .filter_map(|c| {
-            let mode = c.mode?;
-            let mode = (mode.width, mode.height);
-            let primary =
-                synthesized_primary(card, &empty, c.id, mode).filter(|p| p.fb_id.is_some())?;
-            let overlays: Vec<PlaneState> = overlay_ids(card)
-                .into_iter()
-                .filter_map(|id| plane_state(card, id))
-                .filter(|p| p.crtc_id == Some(c.id) && p.fb_id.is_some())
-                .collect();
-            if overlays.is_empty()
-                || core::iter::once(&primary)
-                    .chain(&overlays)
-                    .any(|p| check_dcn30_linear(card, p).is_err())
-            {
-                return None;
-            }
-            display_planes(card, c.id, &primary, &overlays, mode).ok()
         })
         .collect()
 }
@@ -2634,7 +2464,7 @@ mod tests {
     /// fixture: a list no NV12 framebuffer is on.
     const DCN30_NARROW_FORMATS: [u32; 1] = [XR24];
 
-    /// A DCN 3.0 card (Navi22): two enabled CRTCs with linear 8888
+    /// A DCN 3.0 card (Navi22): two enabled CRTCs with native linear 8888
     /// primaries, two shared overlays and a cursor plane per CRTC.
     fn dcn30_card() -> (Card, [u32; 3]) {
         use crate::amdgpu_dm_modifiers::{FbCmd, NV12};
@@ -2656,7 +2486,7 @@ mod tests {
         }
         card.plane_formats = Some(&DCN30_PRIMARY_FORMATS);
         card.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
-        card.native_planes = overlay_cursor_planes_for(&[], &[1, 2]);
+        card.native_planes = dcn30_planes_for(&[], &[1, 2]);
         card.native_atomic = true;
         let mut fb = |w: u32, h: u32, format: u32| {
             let handle = card.gem.alloc(0x1000_0000, (w * h * 4) as usize).unwrap();
@@ -2703,23 +2533,64 @@ mod tests {
         })
     }
 
-    /// DCN 3.0 publishes two shared overlays (dc caps' max_slave_planes =
-    /// 2) at 0x44/0x45 with zpos 7/8, the cursors at 0x46+ with a 256
-    /// cursor cap, and no native primary; re-publication keeps an
-    /// overlay's committed state and drops one left on a CRTC that is
-    /// gone. The synthesized primaries list the 2-format primary list.
+    /// DCN 3.0 publishes a native primary per CRTC with the immutable zpos
+    /// 2 (its own property, range [2, 2]), two shared overlays (dc caps'
+    /// max_slave_planes = 2) at 0x44/0x45 with zpos 7/8, and the cursors at
+    /// 0x46+ with a 256 cursor cap; re-publication keeps an overlay's
+    /// committed state and drops one left on a CRTC that is gone. The
+    /// primaries list the 2-format primary list. Published over the
+    /// DCN 4.0.1 set the shared connector helper leaves, the planes are
+    /// still DCN 3.0's: an id keeps its state only as the kind of plane it
+    /// was.
     fn drm_native_planes_dcn30_publishes_two_overlays() -> TestResult {
         let (mut card, _) = dcn30_card();
-        if !has_synthesized_primaries(&card)
+        let primaries: Vec<u32> = card
+            .native_planes
+            .iter()
+            .filter(|p| p.primary_of.is_some())
+            .map(|p| p.id)
+            .collect();
+        if !is_dcn30(&card)
+            || primaries != [PRIMARY_PLANE_ID_BASE, PRIMARY_PLANE_ID_BASE + 1]
             || overlay_ids(&card) != [OVERLAY_PLANE_ID_BASE, OVERLAY_PLANE_ID_BASE + 1]
             || cursor_ids(&card) != [DCN30_CURSOR_PLANE_ID_BASE, DCN30_CURSOR_PLANE_ID_BASE + 1]
-            || card.native_planes.iter().any(|p| p.primary_of.is_some())
             || max_cursor_size(&card) != 256
             || formats_of(&card, PRIMARY_PLANE_ID_BASE).is_none_or(|f| f != DCN30_PRIMARY_FORMATS)
             || formats_of(&card, OVERLAY_PLANE_ID_BASE)
                 .is_none_or(|f| f != crate::amdgpu_navi48_kms::PLANE_FORMATS)
         {
             return TestResult::Fail("DCN30 publication");
+        }
+        let Some((ids, values)) = object_properties(&card, PRIMARY_PLANE_ID_BASE) else {
+            return TestResult::Fail("DCN30 primary has no properties");
+        };
+        let zpos = ids.iter().position(|&p| p == DCN30_PRIMARY_ZPOS_PROP_ID);
+        if zpos.map(|i| values[i]) != Some(2)
+            || ids.contains(&PRIMARY_ZPOS_PROP_ID)
+            || ids.contains(&ALPHA_PROP_ID)
+            || range_property(DCN30_PRIMARY_ZPOS_PROP_ID) != Some((&b"zpos"[..], true, [2, 2]))
+        {
+            return TestResult::Fail("DCN30 primary zpos is not immutable 2");
+        }
+        let mut state = on(
+            PRIMARY_PLANE_ID_BASE,
+            card.crtcs[0].primary_fb.unwrap(),
+            (1920, 1080),
+            (0, 0, 1920, 1080),
+        );
+        if set_property(&card, &mut state, DCN30_PRIMARY_ZPOS_PROP_ID, 2).is_ok() {
+            return TestResult::Fail("DCN30 primary zpos was settable");
+        }
+        // Over the DCN 4.0.1 planes: 0x46 was an overlay there (zpos 10),
+        // 0x47 the first CRTC's cursor, and the primaries' zpos 3.
+        let dcn401 = planes_for(&[], &[1, 2]);
+        let over = dcn30_planes_for(&dcn401, &[1, 2]);
+        let same = |id: u32| over.iter().find(|p| p.id == id) == card.native_plane(id);
+        if !same(PRIMARY_PLANE_ID_BASE)
+            || !same(DCN30_CURSOR_PLANE_ID_BASE)
+            || !same(DCN30_CURSOR_PLANE_ID_BASE + 1)
+        {
+            return TestResult::Fail("DCN30 planes kept another generation's state");
         }
         for (k, id) in overlay_ids(&card).into_iter().enumerate() {
             if card.native_plane(id).unwrap().props.zpos != dcn30_overlay_zpos(k) {
@@ -2737,7 +2608,7 @@ mod tests {
             .unwrap()
             .crtc_id = Some(2);
         let old = card.native_planes.clone();
-        card.native_planes = overlay_cursor_planes_for(&old, &[1]);
+        card.native_planes = dcn30_planes_for(&old, &[1]);
         if overlay_ids(&card) != [OVERLAY_PLANE_ID_BASE, OVERLAY_PLANE_ID_BASE + 1]
             || card
                 .native_plane(OVERLAY_PLANE_ID_BASE)
@@ -2758,14 +2629,16 @@ mod tests {
         drm_native_planes_dcn30_publishes_two_overlays
     );
 
-    /// `check()` with synthesized primaries (Navi22): an NV12 overlay
-    /// over the committed primary is accepted, and a primary-only
-    /// request returns no setup; refused are a narrowed overlay list,
-    /// an NV12 primary, a plane moved straight to another CRTC, an
-    /// enabled CRTC without its primary, a 17x upscale, a 23-wide
-    /// viewport, a 90-degree turn of a linear plane, and a non-LINEAR
-    /// modifier.
-    fn drm_native_planes_dcn30_synthesized_check() -> TestResult {
+    /// `check()` on DCN30's native planes (Navi22): amdgpu_dm's rules pass
+    /// an NV12 overlay over the committed primary (what the display then
+    /// lights is its own admission), and a primary-only request returns
+    /// the full-frame setup; refused are a narrowed overlay list, an NV12
+    /// primary, a plane moved straight to another CRTC, an enabled CRTC
+    /// without its primary, a 17x upscale, a 23-wide viewport and a
+    /// 90-degree turn of a linear plane. A non-LINEAR modifier (which
+    /// ADDFB2 never lets onto the linear card) is refused by the display's
+    /// admission.
+    fn drm_native_planes_dcn30_check() -> TestResult {
         use crate::amdgpu_dcn401_otg::{Swizzle, Tiling};
         let (card, fbs) = dcn30_card();
         let [primary, _primary2, video] = fbs;
@@ -2783,7 +2656,8 @@ mod tests {
         if out.len() != 1 || out[0].setup.overlays[0].is_none() {
             return TestResult::Fail("DCN30 check setup");
         }
-        // A primary-only request returns no setup (the synthesized path).
+        // A primary-only request returns the full-frame setup, with the
+        // framebuffer's pitch for the display's admission.
         let mut state = AtomicState::default();
         state.planes.push(on(
             PRIMARY_PLANE_ID_BASE,
@@ -2792,7 +2666,11 @@ mod tests {
             (0, 0, 1920, 1080),
         ));
         match check(&card, &state, dcn30_mode) {
-            Ok(out) if out.is_empty() => {}
+            Ok(out)
+                if out.len() == 1
+                    && out[0].setup.is_full_frame()
+                    && out[0].primary_placement().is_none()
+                    && out[0].pitches == [1920 * 4, 0, 0, 0] => {}
             _ => return TestResult::Fail("DCN30 primary-only check"),
         }
         // Refusals that need no card change: an NV12 primary (the
@@ -2892,20 +2770,499 @@ mod tests {
             (1280, 720),
             (0, 0, 1280, 720),
         ));
-        if check(&card, &state, dcn30_mode) != Err(FsError::InvalidData) {
-            return TestResult::Fail("DCN30 tiled overlay accepted");
+        let Ok(out) = check(&card, &state, dcn30_mode) else {
+            return TestResult::Fail("DCN30 tiled overlay refused before the display");
+        };
+        if crate::amdgpu_navi22_plane::admit(None, None, &out[0])
+            != Err(crate::amdgpu_navi22_plane::why::TILED)
+        {
+            return TestResult::Fail("DCN30 tiled overlay admitted");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu/drm", drm_native_planes_dcn30_synthesized_check);
+    kernel_test_in!("drivers/gpu/drm", drm_native_planes_dcn30_check);
 
-    /// Commit/displays round-trip on DCN30: no overlay, no display; an
-    /// overlay on, the CRTC's display carries it; the overlay off, the
-    /// CRTC drops out of the displays again.
+    /// KWin's probe on a screen showing only the pointer, as an RX 6750 XT
+    /// logged it (TEST_ONLY | NONBLOCK): both overlays and the cursor
+    /// plane off, the 41x40 pointer image on the primary at the pointer
+    /// position of a 3840x2160 mode. With the pointer at the bottom edge
+    /// (CRTC_Y 2156) only 4 rows stay on the CRTC, and
+    /// amdgpu_dm_plane_helper_check_state refuses a non-cursor plane with
+    /// less than MIN_VIEWPORT_SIZE (12) rows or 2 * MIN_VIEWPORT_SIZE
+    /// columns visible; KWin then composites. The same image wholly on the
+    /// CRTC, or with exactly 12 rows or 24 columns left, is accepted. The
+    /// refusal names its rule.
+    fn drm_native_planes_dcn30_kwin_pointer_on_primary() -> TestResult {
+        let (mut card, _) = dcn30_card();
+        let pointer = {
+            let handle = card.gem.alloc(0x3000_0000, 41 * 40 * 4).unwrap();
+            card.addfb2(41, 40, AR24, 41 * 4, handle).unwrap()
+        };
+        let uhd = |_: u32| {
+            Some(crate::Mode {
+                width: 3840,
+                height: 2160,
+                refresh_hz: 60,
+                bpp: 32,
+            })
+        };
+        let request = |x: i32, y: i32| {
+            let mut state = AtomicState::default();
+            for id in [
+                OVERLAY_PLANE_ID_BASE + 1,
+                OVERLAY_PLANE_ID_BASE,
+                DCN30_CURSOR_PLANE_ID_BASE,
+            ] {
+                let mut off = plane_state(&card, id).unwrap();
+                off.fb_id = None;
+                off.crtc_id = None;
+                state.planes.push(off);
+            }
+            state
+                .planes
+                .push(on(PRIMARY_PLANE_ID_BASE, pointer, (41, 40), (x, y, 41, 40)));
+            check(&card, &state, uhd)
+        };
+        // The logged request.
+        if request(1490, 2156) != Err(FsError::InvalidData) {
+            return TestResult::Fail("4 visible rows accepted");
+        }
+        if crate::drm_ioctl_bridge::last_refusal().is_none_or(|why| !why.contains("24x12 visible"))
+        {
+            return TestResult::Fail("refusal does not name the viewport rule");
+        }
+        // 11 rows or 23 columns left are refused, 12 and 24 accepted.
+        if request(1490, 2149) != Err(FsError::InvalidData)
+            || request(3817, 1000) != Err(FsError::InvalidData)
+        {
+            return TestResult::Fail("less than the minimum viewport accepted");
+        }
+        for (x, y) in [(1490, 1000), (1490, 2148), (3816, 1000), (-17, 1000)] {
+            let placed = crate::drm::card::Placement {
+                src: (0, 0, 41, 40),
+                dst: (x, y, 41, 40),
+            };
+            match request(x, y) {
+                Ok(out) if out.len() == 1 && out[0].primary_placement() == Some(placed) => {}
+                _ => return TestResult::Fail("positioned pointer primary refused"),
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_dcn30_kwin_pointer_on_primary
+    );
+
+    /// The two commits an RX 6750 XT's second KWin made 4.4 s apart on a
+    /// 3840x2160 screen showing only the pointer. First the 41x40 pointer
+    /// image on the primary at (1912, 1077): `plane64 crtc1 fb51 41x40
+    /// src=(0,0,41,40) crtc=(1912,1077,41,40)`. Then, flags PAGE_FLIP_EVENT
+    /// | NONBLOCK, `obj70{IN_FENCE_FD=-1 FB_ID=0 CRTC_ID=0} obj1{CTM=0
+    /// GAMMA_LUT=5 VRR_ENABLED=0}`: the cursor plane off and a gamma ramp,
+    /// the primary not named. drm_atomic_get_plane_state duplicates a
+    /// plane's committed state, so the primary amdgpu_dm_atomic_check adds
+    /// for the colour change (drm_atomic_add_affected_planes) and hands
+    /// dc_validate_global_state is the one the first commit validated, and
+    /// the second commit is accepted. Read back as the framebuffer whole at
+    /// the mode from the CRTC's x/y, the source rectangle lies outside the
+    /// 41x40 framebuffer, which Navi22's planner refuses
+    /// (`amdgpu_navi22_plane::stream_for`) — the EINVAL KWin logged as
+    /// "Atomic commit failed". The legacy x/y are the source origin
+    /// (drm_atomic_helper_update_legacy_modeset_state), and a legacy
+    /// SETCRTC or the framebuffer's removal ends the carried rectangles.
+    ///
+    /// The primary is a native plane, so the rectangles are the plane's own
+    /// state (`NativePlane::placed`, not the card's record for a
+    /// synthesized primary): GETPROPERTIES reads them back, the display is
+    /// asked about them with the framebuffer's pitch, and a legacy
+    /// PAGE_FLIP's frame carries them to the presenter.
+    fn drm_native_planes_dcn30_untouched_primary_keeps_its_rectangles() -> TestResult {
+        let (mut card, fbs) = dcn30_card();
+        let uhd_mode = crate::Mode {
+            width: 3840,
+            height: 2160,
+            refresh_hz: 60,
+            bpp: 32,
+        };
+        card.crtcs[0].mode = Some(uhd_mode);
+        let pointer = {
+            let handle = card.gem.alloc(0x3000_0000, 41 * 40 * 4).unwrap();
+            card.addfb2(41, 40, AR24, 41 * 4, handle).unwrap()
+        };
+        let uhd = |_: u32| Some(uhd_mode);
+        let mut first = AtomicState::default();
+        first.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            pointer,
+            (41, 40),
+            (1912, 1077, 41, 40),
+        ));
+        if check(&card, &first, uhd).is_err() {
+            return TestResult::Fail("positioned pointer primary refused");
+        }
+        first.checked = true;
+        if first.core_commit(&mut card).is_err() {
+            return TestResult::Fail("positioned pointer primary not committed");
+        }
+        commit(&mut card, &first);
+        if (card.crtcs[0].x, card.crtcs[0].y) != (0, 0) {
+            return TestResult::Fail("legacy x/y are not the primary's source origin");
+        }
+        // A native primary's rectangles live in the plane, nowhere else.
+        if card.primary_placement(1).is_some() {
+            return TestResult::Fail("native primary recorded as a synthesized one");
+        }
+        // The cursor plane off and a colour change on the CRTC.
+        let mut second = AtomicState::default();
+        let mut off = plane_state(&card, DCN30_CURSOR_PLANE_ID_BASE).unwrap();
+        off.fb_id = None;
+        off.crtc_id = None;
+        second.planes.push(off);
+        second.crtcs.push(crate::drm::atomic::CrtcState {
+            id: 1,
+            enable: true,
+            active: true,
+            mode: Some(uhd_mode),
+            ..Default::default()
+        });
+        // The primary as the request leaves it (and, for a request that
+        // names nothing, as GETPROPERTIES reads it back).
+        let rects = |card: &Card, state: &AtomicState| {
+            final_state(card, state, PRIMARY_PLANE_ID_BASE).map(|p| {
+                (
+                    p.fb_id,
+                    (p.src_x, p.src_y, p.src_w, p.src_h),
+                    (p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h),
+                )
+            })
+        };
+        let empty = AtomicState::default();
+        let carried = Some((Some(pointer), (0, 0, 41, 40), (1912, 1077, 41, 40)));
+        if rects(&card, &second) != carried || rects(&card, &empty) != carried {
+            return TestResult::Fail("untouched primary lost its committed rectangles");
+        }
+        // What DC is asked about: the committed placement, at the
+        // framebuffer's pitch.
+        let placed = crate::drm::card::Placement {
+            src: (0, 0, 41, 40),
+            dst: (1912, 1077, 41, 40),
+        };
+        match check(&card, &second, uhd) {
+            Ok(out)
+                if out.len() == 1
+                    && out[0].primary_placement() == Some(placed)
+                    && out[0].pitches[0] == 41 * 4 => {}
+            _ => return TestResult::Fail("cursor/colour commit refused over a positioned primary"),
+        }
+        // drm_atomic_helper_page_flip changes the framebuffer alone: the
+        // flipped frame shows where the plane was placed.
+        if committed_primary_placement(&card, 1) != Some(placed)
+            || committed_primary_placement(&card, 2).is_some()
+        {
+            return TestResult::Fail("PAGE_FLIP frame lost the primary's placement");
+        }
+        // A request naming the primary still decides its own rectangles.
+        let mut third = AtomicState::default();
+        third.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            pointer,
+            (41, 40),
+            (100, 200, 41, 40),
+        ));
+        if rects(&card, &third) != Some((Some(pointer), (0, 0, 41, 40), (100, 200, 41, 40))) {
+            return TestResult::Fail("requested primary rectangles not used");
+        }
+        // drm_atomic_helper_set_config: the framebuffer whole at the mode.
+        reset_primary(&mut card, 1);
+        card.crtcs[0].primary_fb = Some(fbs[0]);
+        if rects(&card, &empty) != Some((Some(fbs[0]), (0, 0, 3840, 2160), (0, 0, 3840, 2160)))
+            || committed_primary_placement(&card, 1).is_some()
+        {
+            return TestResult::Fail("legacy primary is not the framebuffer whole at the mode");
+        }
+        // A positioned primary whose framebuffer is removed leaves nothing
+        // to carry to the CRTC's next primary.
+        if first.core_commit(&mut card).is_err() {
+            return TestResult::Fail("positioned primary not committed again");
+        }
+        commit(&mut card, &first);
+        if committed_primary_placement(&card, 1) != Some(placed) {
+            return TestResult::Fail("positioned primary not recorded");
+        }
+        let placed_still = |card: &Card| {
+            card.native_plane(PRIMARY_PLANE_ID_BASE)
+                .is_some_and(|p| p.placed)
+        };
+        if card.rmfb(pointer).is_err() || placed_still(&card) {
+            return TestResult::Fail("removed framebuffer left a primary placement");
+        }
+        card.crtcs[0].primary_fb = Some(fbs[0]);
+        if placed_still(&card)
+            || rects(&card, &empty).is_none_or(|(fb, src, dst)| {
+                fb != Some(fbs[0]) || src == (0, 0, 41, 40) || dst == (1912, 1077, 41, 40)
+            })
+        {
+            return TestResult::Fail("stale placement on the CRTC's next primary");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_dcn30_untouched_primary_keeps_its_rectangles
+    );
+
+    /// A primary without a framebuffer has no plane state
+    /// (drm_atomic_helper_disable_plane, __drm_atomic_helper_plane_reset):
+    /// the other CRTC's primary KWin switches off in its modeset is not
+    /// left "placed" with zero rectangles, its CRTC shows no framebuffer,
+    /// and the console that takes a CRTC over shows its framebuffer whole
+    /// at the mode (drm_client_modeset_commit) wherever the last atomic
+    /// commit had put the primary.
+    fn drm_native_planes_disabled_primary_has_no_state() -> TestResult {
+        let (mut card, fbs) = dcn30_card();
+        let pointer = {
+            let handle = card.gem.alloc(0x3000_0000, 41 * 40 * 4).unwrap();
+            card.addfb2(41, 40, AR24, 41 * 4, handle).unwrap()
+        };
+        // KWin's modeset: the pointer image on CRTC 1's primary, CRTC 2 and
+        // its primary off.
+        let mut modeset = AtomicState::default();
+        modeset.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            pointer,
+            (41, 40),
+            (1000, 500, 41, 40),
+        ));
+        let mut other = plane_state(&card, PRIMARY_PLANE_ID_BASE + 1).unwrap();
+        other.crtc_id = None;
+        other.fb_id = None;
+        modeset.planes.push(other);
+        modeset.crtcs.push(crate::drm::atomic::CrtcState {
+            id: 2,
+            enable: false,
+            active: false,
+            mode: None,
+            ..Default::default()
+        });
+        if check(&card, &modeset, dcn30_mode).is_err() {
+            return TestResult::Fail("modeset refused");
+        }
+        modeset.checked = true;
+        if modeset.core_commit(&mut card).is_err() {
+            return TestResult::Fail("modeset not committed");
+        }
+        commit(&mut card, &modeset);
+        let off = *card.native_plane(PRIMARY_PLANE_ID_BASE + 1).unwrap();
+        if off.placed
+            || off.crtc_id.is_some()
+            || off.fb_id.is_some()
+            || (off.src, off.dst) != ((0, 0, 0, 0), (0, 0, 0, 0))
+            || card.crtcs[1].primary_fb.is_some()
+        {
+            return TestResult::Fail("disabled primary kept plane state");
+        }
+        let read = plane_state(&card, PRIMARY_PLANE_ID_BASE + 1).unwrap();
+        if read.fb_id.is_some() || read.crtc_id.is_some() {
+            return TestResult::Fail("disabled primary reads back a framebuffer");
+        }
+        // A later commit that names neither primary is judged on CRTC 1's
+        // committed rectangles and on nothing of CRTC 2's.
+        let mut later = AtomicState::default();
+        let mut cursor = plane_state(&card, DCN30_CURSOR_PLANE_ID_BASE).unwrap();
+        cursor.fb_id = None;
+        cursor.crtc_id = None;
+        later.planes.push(cursor);
+        later.crtcs.push(crate::drm::atomic::CrtcState {
+            id: 1,
+            enable: true,
+            active: true,
+            mode: dcn30_mode(1),
+            ..Default::default()
+        });
+        match check(&card, &later, dcn30_mode) {
+            Ok(out) if out.len() == 1 && out[0].crtc_id == 1 => {}
+            _ => return TestResult::Fail("commit after the modeset refused"),
+        }
+        // The CRTC loses its primary without a plane commit (its sink went,
+        // or the client closed), and the console takes it over.
+        card.crtcs[0].primary_fb = None;
+        card.show_console(1);
+        let console = card.crtcs[0].primary_fb;
+        let read = plane_state(&card, PRIMARY_PLANE_ID_BASE).unwrap();
+        if console.is_none()
+            || console == Some(pointer)
+            || read.fb_id != console
+            || (read.src_x, read.src_y, read.src_w, read.src_h) != (0, 0, 1920, 1080)
+            || (read.crtc_x, read.crtc_y, read.crtc_w, read.crtc_h) != (0, 0, 1920, 1080)
+            || card
+                .native_plane(PRIMARY_PLANE_ID_BASE)
+                .is_none_or(|p| p.placed)
+        {
+            return TestResult::Fail("console shown where the pointer image was placed");
+        }
+        // Switching a primary off through the plane switches it off on its
+        // CRTC as well.
+        let mut disable = AtomicState::default();
+        let mut primary = plane_state(&card, PRIMARY_PLANE_ID_BASE).unwrap();
+        primary.crtc_id = None;
+        primary.fb_id = None;
+        disable.planes.push(primary);
+        commit(&mut card, &disable);
+        if card.crtcs[0].primary_fb.is_some() || card.framebuffer(fbs[0]).is_err() {
+            return TestResult::Fail("disabled primary still shows a framebuffer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_disabled_primary_has_no_state
+    );
+
+    /// A framebuffer stops being shown when its plane shows another one,
+    /// whichever ioctl made the change (drm_mode_closefb keeps a closed
+    /// framebuffer only while a plane scans it). A primary's framebuffer
+    /// is its CRTC's, which the core commit, SETCRTC and PAGE_FLIP all
+    /// write: the native primary's own record of the last atomic commit
+    /// must not keep the old one "shown" until `drm_native_planes::commit`
+    /// runs, or for ever under a client that only uses the legacy ioctls.
+    /// An overlay's framebuffer is shown until the overlay lets go of it.
+    fn drm_native_planes_fb_shown_follows_the_planes() -> TestResult {
+        let (mut card, fbs) = dcn30_card();
+        let [primary, _primary2, video] = fbs;
+        let pointer = {
+            let handle = card.gem.alloc(0x3000_0000, 41 * 40 * 4).unwrap();
+            card.addfb2(41, 40, AR24, 41 * 4, handle).unwrap()
+        };
+        let mut first = AtomicState::default();
+        first.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            pointer,
+            (41, 40),
+            (100, 100, 41, 40),
+        ));
+        first.planes.push(on(
+            OVERLAY_PLANE_ID_BASE,
+            video,
+            (1280, 720),
+            (0, 0, 1280, 720),
+        ));
+        first.checked = true;
+        if first.core_commit(&mut card).is_err() {
+            return TestResult::Fail("first commit");
+        }
+        commit(&mut card, &first);
+        if !card.fb_shown(pointer) || !card.fb_shown(video) || card.fb_shown(primary) {
+            return TestResult::Fail("committed framebuffers not shown");
+        }
+        // An atomic commit to another primary framebuffer: the old one is
+        // off screen as soon as the core state is committed.
+        let mut second = AtomicState::default();
+        second.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            primary,
+            (1920, 1080),
+            (0, 0, 1920, 1080),
+        ));
+        second.checked = true;
+        if second.core_commit(&mut card).is_err() {
+            return TestResult::Fail("second commit");
+        }
+        if card.fb_shown(pointer) || !card.fb_shown(primary) {
+            return TestResult::Fail("flipped-away primary framebuffer still shown");
+        }
+        commit(&mut card, &second);
+        // A legacy PAGE_FLIP writes the CRTC's framebuffer alone.
+        card.crtcs[0].primary_fb = Some(pointer);
+        if card.fb_shown(primary) || !card.fb_shown(pointer) {
+            return TestResult::Fail("legacy flip left the old framebuffer shown");
+        }
+        // The overlay keeps its framebuffer until it is switched off.
+        let mut off = on(OVERLAY_PLANE_ID_BASE, video, (1280, 720), (0, 0, 1280, 720));
+        off.crtc_id = None;
+        off.fb_id = None;
+        let mut third = AtomicState::default();
+        third.planes.push(off);
+        if !card.fb_shown(video) {
+            return TestResult::Fail("overlay framebuffer not shown");
+        }
+        commit(&mut card, &third);
+        if card.fb_shown(video) {
+            return TestResult::Fail("disabled overlay's framebuffer still shown");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_fb_shown_follows_the_planes
+    );
+
+    /// A full-screen ARGB8888 primary with "pixel blend mode" None is the
+    /// plain full-frame primary on DCN 3.0, as with Pre-multiplied: alone
+    /// on its CRTC it is the bottom plane over the black background, where
+    /// both leave its pixels as they are (dcn20_update_mpcc). It takes no
+    /// placement, so the display plans nothing for it and its frames take
+    /// the full-frame present path. Coverage is a placed plane still (the
+    /// display refuses it), and DCN 4.0.1 keeps None as a placed plane:
+    /// its display programs that blend.
+    fn drm_native_planes_dcn30_opaque_argb_primary_is_full_frame() -> TestResult {
+        let (mut card, _) = dcn30_card();
+        let argb = {
+            let handle = card.gem.alloc(0x3800_0000, 1920 * 1080 * 4).unwrap();
+            card.addfb2(1920, 1080, AR24, 1920 * 4, handle).unwrap()
+        };
+        let request = |card: &Card, zpos: u8, blend: u8| {
+            let mut p = on(
+                PRIMARY_PLANE_ID_BASE,
+                argb,
+                (1920, 1080),
+                (0, 0, 1920, 1080),
+            );
+            p.props = Some(PlaneProps {
+                blend,
+                ..PlaneProps::new(zpos)
+            });
+            let mut state = AtomicState::default();
+            state.planes.push(p);
+            check(card, &state, dcn30_mode)
+        };
+        for blend in [PlaneProps::PREMULTI, PlaneProps::PIXEL_NONE] {
+            match request(&card, DCN30_PRIMARY_ZPOS, blend) {
+                Ok(out)
+                    if out.len() == 1
+                        && out[0].setup.is_full_frame()
+                        && out[0].primary_placement().is_none() => {}
+                _ => return TestResult::Fail("opaque ARGB primary is not the full-frame primary"),
+            }
+        }
+        match request(&card, DCN30_PRIMARY_ZPOS, PlaneProps::COVERAGE) {
+            Ok(out) if out.len() == 1 && out[0].setup.primary.is_some() => {}
+            _ => return TestResult::Fail("Coverage primary not handed over as a placed plane"),
+        }
+        // The same request on DCN 4.0.1's planes.
+        card.native_planes = planes_for(&[], &[1, 2]);
+        match request(&card, PRIMARY_ZPOS, PlaneProps::PIXEL_NONE) {
+            Ok(out) if out.len() == 1 && out[0].setup.primary.is_some() => {}
+            _ => return TestResult::Fail("DCN401 lost the None-blended primary's placement"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_dcn30_opaque_argb_primary_is_full_frame
+    );
+
+    /// Commit/displays round-trip on DCN30: every enabled CRTC's display
+    /// is its full-frame primary; an overlay on, its CRTC's display
+    /// carries it; the overlay off, it is the full-frame primary again.
     fn drm_native_planes_dcn30_commit_and_displays_round_trip() -> TestResult {
         let (mut card, fbs) = dcn30_card();
         let video = fbs[2];
-        if !displays(&card).is_empty() {
+        let plain = |card: &Card| {
+            let d = displays(card);
+            d.len() == 2 && d.iter().all(|d| d.setup.is_full_frame())
+        };
+        if !plain(&card) {
             return TestResult::Fail("DCN30 displays without an overlay");
         }
         let mut state = AtomicState::default();
@@ -2923,7 +3280,13 @@ mod tests {
         }
         commit(&mut card, &state);
         let shown = displays(&card);
-        if shown.len() != 1 || shown[0].setup.overlays[0].is_none() {
+        if shown.len() != 2
+            || shown[0].crtc_id != 1
+            || shown[0].setup.overlays[0].is_none()
+            || shown[0].overlays[0] != Some(OVERLAY_PLANE_ID_BASE)
+            || shown[0].pitches[1] != 1280
+            || !shown[1].setup.is_full_frame()
+        {
             return TestResult::Fail("DCN30 displays after commit");
         }
         let mut off = on(OVERLAY_PLANE_ID_BASE, video, (1280, 720), (0, 0, 1280, 720));
@@ -2932,7 +3295,7 @@ mod tests {
         let mut state = AtomicState::default();
         state.planes.push(off);
         commit(&mut card, &state);
-        if !displays(&card).is_empty() {
+        if !plain(&card) {
             return TestResult::Fail("DCN30 displays after the overlay goes off");
         }
         TestResult::Pass
@@ -2942,9 +3305,10 @@ mod tests {
         drm_native_planes_dcn30_commit_and_displays_round_trip
     );
 
-    /// `setcrtc_planes` with synthesized primaries (Navi22): None for a
-    /// linear RGB framebuffer with no overlay; the setup carrying the
-    /// committed overlay once one is on; a tiled primary refused.
+    /// `setcrtc_planes` on DCN30 (Navi22), as on DCN401: None for a linear
+    /// RGB framebuffer (its display takes the format check and keeps the
+    /// committed overlays); a tiled primary is a placed plane, which the
+    /// Navi22 display's admission refuses.
     fn drm_native_planes_dcn30_setcrtc_planes() -> TestResult {
         use crate::amdgpu_dcn401_otg::{Swizzle, Tiling};
         let (mut card, fbs) = dcn30_card();
@@ -2960,11 +3324,8 @@ mod tests {
             (0, 0, 1280, 720),
         ));
         commit(&mut card, &state);
-        let Some(Ok(setup)) = setcrtc_planes(&card, 1, primary, (0, 0), (1920, 1080)) else {
-            return TestResult::Fail("DCN30 setcrtc with an overlay");
-        };
-        if setup.overlays[0].is_none() {
-            return TestResult::Fail("DCN30 setcrtc setup lost the overlay");
+        if setcrtc_planes(&card, 1, primary, (0, 0), (1920, 1080)).is_some() {
+            return TestResult::Fail("DCN30 setcrtc of a linear framebuffer placed it");
         }
         card.framebuffers
             .iter_mut()
@@ -2975,10 +3336,13 @@ mod tests {
             dcc: None,
         }
         .modifier();
-        if setcrtc_planes(&card, 1, primary, (0, 0), (1920, 1080))
-            != Some(Err(FsError::InvalidData))
+        let Some(Ok(planes)) = setcrtc_planes(&card, 1, primary, (0, 0), (1920, 1080)) else {
+            return TestResult::Fail("DCN30 setcrtc tiled primary is no placed plane");
+        };
+        if crate::amdgpu_navi22_plane::admit(None, None, &planes)
+            != Err(crate::amdgpu_navi22_plane::why::TILED)
         {
-            return TestResult::Fail("DCN30 setcrtc tiled primary accepted");
+            return TestResult::Fail("DCN30 setcrtc tiled primary admitted");
         }
         TestResult::Pass
     }

@@ -276,6 +276,9 @@ pub struct NetIfaceEntry {
     /// checksum/TSO offload via [`crate::TxMeta`] instead of doing the work
     /// in software.
     pub offloads: crate::OffloadCapabilities,
+    pub(crate) offload_hardware: crate::OffloadCapabilities,
+    pub(crate) feature_wanted: Option<u64>,
+    pub(crate) gro_supported: bool,
     /// Whether this interface opts into the kernel stack's software GRO stage.
     /// This is deliberately per-interface: one GRO-capable driver must not
     /// change receive semantics for another driver's poll loop.
@@ -285,6 +288,9 @@ pub struct NetIfaceEntry {
     /// directly into a buffer from `tx_pools` and hands ownership here instead
     /// of copying a slice through [`send`]. `None` ⇒ the classic copy path.
     pub send_frame: Option<SendFrameFn>,
+    /// The driver's transmit-queue contract ([`crate::txq::TxBackpressure`]).
+    /// `None` ⇒ every transmit uses the plain hooks and a full ring drops.
+    pub tx_backpressure: Option<Arc<dyn crate::txq::TxBackpressure>>,
     send_frame_context: Option<(u64, SendFrameCtxFn)>,
     /// Queue-local recycling pools backing zero-copy TX (`Some` iff
     /// `send_frame` is). The stack chooses a pool once in [`tx_acquire`] and
@@ -368,7 +374,8 @@ pub fn set_offloads(name: &str, offloads: crate::OffloadCapabilities) {
         .as_mut()
         .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
     {
-        entry.offloads = offloads;
+        entry.offload_hardware = offloads;
+        crate::ethtool::features::apply(entry);
     }
 }
 
@@ -400,8 +407,28 @@ pub fn set_software_gro(name: &str, enabled: bool) -> bool {
     else {
         return false;
     };
+    entry.gro_supported |= enabled;
     entry.software_gro = enabled;
+    if let Some(wanted) = &mut entry.feature_wanted {
+        if enabled {
+            *wanted |= 1 << 14;
+        } else {
+            *wanted &= !(1 << 14);
+        }
+    }
     true
+}
+
+pub(crate) fn with_features<T>(
+    name: &str,
+    f: impl FnOnce(&mut NetIfaceEntry) -> T,
+) -> Result<T, i32> {
+    let mut g = IFACES.lock();
+    let entry = g
+        .as_mut()
+        .and_then(|entries| entries.iter_mut().find(|e| e.name == name))
+        .ok_or(19)?;
+    Ok(f(entry))
 }
 
 /// Opt an interface into zero-copy TX (P-F) with an iface-owned recycling pool
@@ -953,12 +980,20 @@ fn register_inner(
         offloads: old
             .as_ref()
             .map_or_else(Default::default, |old| old.offloads),
+        offload_hardware: old
+            .as_ref()
+            .map_or_else(Default::default, |old| old.offload_hardware),
+        feature_wanted: old.as_ref().and_then(|old| old.feature_wanted),
+        gro_supported: old.as_ref().is_some_and(|old| old.gro_supported),
         software_gro: old.as_ref().is_some_and(|old| old.software_gro),
         // A re-probe preserves any zero-copy TX opt-in (hook + pool + headroom)
         // so the stack keeps the same recycling pool across a driver reset.
         send_frame: old.as_ref().and_then(|old| old.send_frame),
         send_frame_context: old.as_ref().and_then(|old| old.send_frame_context),
         tx_pools: old.as_ref().and_then(|old| old.tx_pools.clone()),
+        // The contract object belongs to one driver instance; a re-probe
+        // installs its own.
+        tx_backpressure: None,
         tx_headroom: old.as_ref().map_or(0, |old| old.tx_headroom),
     });
     drop(g);
@@ -1514,9 +1549,62 @@ pub struct NetIfaceSnapshot {
     /// without re-entering the global interface registry lock per packet.
     tx_pools: Option<Arc<TxPoolSet>>,
     tx_headroom: usize,
+    tx_backpressure: Option<Arc<dyn crate::txq::TxBackpressure>>,
 }
 
 impl NetIfaceSnapshot {
+    /// The driver's transmit-queue contract, if it implements one.
+    pub fn tx_backpressure(&self) -> Option<&Arc<dyn crate::txq::TxBackpressure>> {
+        self.tx_backpressure.as_ref()
+    }
+
+    /// Offer an owned frame to queue `q` of a backpressure-aware driver.
+    /// Taps see it first, as in `dev_hard_start_xmit`; a frame refused as
+    /// busy is offered again later and is tapped again, as Linux's requeue
+    /// is. Only an accepted or dropped frame is counted.
+    pub(crate) fn try_xmit_frame(
+        &self,
+        driver: &dyn crate::txq::TxBackpressure,
+        q: u16,
+        frame: crate::Frame,
+        meta: crate::TxMeta,
+    ) -> Result<(), crate::txq::TxRefusal> {
+        if self.link_layer != LinkLayer::Ethernet {
+            return Err(crate::txq::TxRefusal::Dropped);
+        }
+        let len = frame.len() as usize;
+        crate::raw_sock::dev_queue_xmit_nit(
+            self,
+            frame.payload(),
+            crate::raw_sock::tx_protocol(frame.payload()),
+            None,
+        );
+        let result = driver.try_xmit(q, frame, meta);
+        if result != Err(crate::txq::TxRefusal::Busy) {
+            record_tx_result(&self.name, len, result.is_ok());
+        }
+        result
+    }
+
+    /// As [`Self::try_xmit_frame`] for a frame the driver copies.
+    pub(crate) fn try_xmit_copy(
+        &self,
+        driver: &dyn crate::txq::TxBackpressure,
+        q: u16,
+        frame: &[u8],
+        meta: crate::TxMeta,
+    ) -> Result<(), crate::txq::TxRefusal> {
+        if self.link_layer != LinkLayer::Ethernet {
+            return Err(crate::txq::TxRefusal::Dropped);
+        }
+        crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
+        let result = driver.try_xmit_copy(q, frame, meta);
+        if result != Err(crate::txq::TxRefusal::Busy) {
+            record_tx_result(&self.name, frame.len(), result.is_ok());
+        }
+        result
+    }
+
     /// Whether this interface accepts zero-copy (owned-`Frame`) transmits. When
     /// false the stack builds into a `Vec` and uses [`Self::xmit_meta`].
     pub fn zero_copy_tx(&self) -> bool {
@@ -1715,6 +1803,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         send_frame_context: entry.send_frame_context,
         tx_pools: entry.tx_pools.clone(),
         tx_headroom: entry.tx_headroom,
+        tx_backpressure: entry.tx_backpressure.clone(),
     }
 }
 
@@ -1736,6 +1825,21 @@ fn with_dev<R>(net_ns_id: u64, ifindex: u32, f: impl FnOnce(&mut NetIfaceEntry) 
         .iter_mut()
         .find(|entry| entry.net_ns_id == net_ns_id && entry.ifindex == ifindex)?;
     Some(f(entry))
+}
+
+/// Install a driver's transmit-queue contract after registration. From then
+/// on TCP offers its data through [`crate::txq::TxBackpressure::try_xmit`]
+/// and waits when a queue is stopped instead of losing the segment.
+pub fn set_tx_backpressure(name: &str, driver: Arc<dyn crate::txq::TxBackpressure>) -> bool {
+    let mut g = IFACES.lock();
+    let Some(e) = g
+        .as_mut()
+        .and_then(|v| v.iter_mut().find(|e| e.name == name))
+    else {
+        return false;
+    };
+    e.tx_backpressure = Some(driver);
+    true
 }
 
 /// Install a driver's MTU, MAC and receive-filter control after registration.
@@ -2459,6 +2563,94 @@ pub fn install_rx_handler(h: RxHandler) {
 static NATIVE_RX_HANDLER: AtomicUsize = AtomicUsize::new(0);
 pub fn install_native_rx_handler(h: fn(&str, &mut [u8], Option<u64>)) {
     NATIVE_RX_HANDLER.store(h as usize, Ordering::Release);
+}
+
+/// The native handler for a frame whose ingress device is already resolved.
+static NATIVE_RX_RESOLVED_HANDLER: AtomicUsize = AtomicUsize::new(0);
+type ResolvedRxHandler = fn(&NetIfaceSnapshot, &mut [u8], Option<u64>);
+pub fn install_native_rx_resolved_handler(h: ResolvedRxHandler) {
+    NATIVE_RX_RESOLVED_HANDLER.store(h as usize, Ordering::Release);
+}
+
+/// Interface lookups made by [`rx_batch`]; lets a test show that a poll
+/// resolves its device once, not once per frame.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) static RX_BATCH_LOOKUPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// One receive poll's view of its interface. Linux resolves `skb->dev` once,
+/// from the NAPI instance, and counts into per-ring statistics that are
+/// folded in later; the by-name path instead took the interface registry
+/// lock twice per frame and cloned a heap-backed snapshot each time.
+///
+/// [`rx_batch`] looks the device up once. [`RxBatch::receive`] then delivers
+/// each frame without touching the registry, and the packet, byte and
+/// multicast counts are added to the interface under one lock acquisition
+/// when the batch is dropped.
+#[derive(Debug)]
+pub struct RxBatch {
+    dev: Option<NetIfaceSnapshot>,
+    /// Set when the name is not registered: frames then take the by-name
+    /// path, as before.
+    unknown: Option<String>,
+    packets: u64,
+    bytes: u64,
+    multicast: u64,
+}
+
+/// Start a receive batch for `name`: one registry lookup per poll.
+pub fn rx_batch(name: &str) -> RxBatch {
+    #[cfg(any(test, feature = "kernel-test"))]
+    RX_BATCH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    let dev = lookup(name);
+    RxBatch {
+        unknown: dev.is_none().then(|| String::from(name)),
+        dev,
+        packets: 0,
+        bytes: 0,
+        multicast: 0,
+    }
+}
+
+impl RxBatch {
+    /// Deliver one frame whose native XDP action was PASS.
+    pub fn receive(&mut self, frame: &mut [u8], timestamp: Option<u64>) {
+        let handler = NATIVE_RX_RESOLVED_HANDLER.load(Ordering::Acquire);
+        let Some(dev) = self.dev.as_ref().filter(|_| handler != 0) else {
+            let name = match (&self.dev, &self.unknown) {
+                (Some(dev), _) => dev.name.as_str(),
+                (None, Some(name)) => name.as_str(),
+                (None, None) => return,
+            };
+            return on_native_rx_timestamped(name, frame, timestamp);
+        };
+        self.packets += 1;
+        self.bytes += frame.len() as u64;
+        // Linux's multicast counter excludes the all-ones broadcast address.
+        if frame.len() >= 6 && frame[0] & 1 != 0 && frame[..6] != [0xff; 6] {
+            self.multicast += 1;
+        }
+        // SAFETY: the pointer was installed with the ResolvedRxHandler signature.
+        let handler: ResolvedRxHandler = unsafe { core::mem::transmute(handler) };
+        handler(dev, frame, timestamp);
+    }
+}
+
+impl Drop for RxBatch {
+    fn drop(&mut self) {
+        let Some(dev) = self.dev.as_ref() else {
+            return;
+        };
+        if self.packets == 0 {
+            return;
+        }
+        let (packets, bytes, multicast) = (self.packets, self.bytes, self.multicast);
+        with_stats_mut(&dev.name, |stats| {
+            stats.rx_packets = stats.rx_packets.saturating_add(packets);
+            stats.rx_bytes = stats.rx_bytes.saturating_add(bytes);
+            stats.rx_multicast = stats.rx_multicast.saturating_add(multicast);
+        });
+    }
 }
 /// Deliver a packet whose native XDP action was PASS. The native handler
 /// performs software claims and protocol dispatch without executing XDP twice.

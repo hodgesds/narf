@@ -1022,7 +1022,7 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                     context.phase,
                     CtxPhase::CreateParams | CtxPhase::ReconfParams
                 ) {
-                    return Some(false);
+                    return Some(Err(EBUSY));
                 }
                 // `vfs_parse_fs_param` offers every key to
                 // `vfs_parse_sb_flag` first: `ro`/`rw`/`sync`/... are
@@ -1034,14 +1034,35 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                         context.sb_mask |= set | clear;
                     }
                     None => {
+                        // `vfs_parse_fs_param` then offers the key to the
+                        // filesystem's own `parse_param`, and what that
+                        // refuses is refused HERE: an unknown parameter
+                        // (`-ENOPARAM` -> "Unknown parameter") or a bad
+                        // value is -EINVAL from this fsconfig call, not
+                        // from a later CMD_CREATE. `source` is the one key
+                        // the VFS takes itself when the filesystem does not
+                        // (`vfs_parse_fs_param_source`). systemd's
+                        // `mount_option_supported` depends on it: it first
+                        // sets a nonsense key and, if that is accepted,
+                        // gives up on probing ("Unable to determine whether
+                        // tmpfs supports 'usrquota'").
+                        //
+                        // LINUX-GAP: only tmpfs validates at set time; the
+                        // other filesystems still defer to CMD_CREATE.
+                        if context.fsname == "tmpfs"
+                            && key != "source"
+                            && narf_filesystem::tmpfs_parse_param(&key, value.as_deref()).is_err()
+                        {
+                            return Some(Err(EINVAL));
+                        }
                         context.options.insert(key, value);
                     }
                 }
-                Some(true)
+                Some(Ok(()))
             });
             ctx.set_return(match r {
-                Some(true) => ok(0),
-                Some(false) => err(EBUSY),
+                Some(Ok(())) => ok(0),
+                Some(Err(errno)) => err(errno),
                 None => err(EBADF),
             });
         }

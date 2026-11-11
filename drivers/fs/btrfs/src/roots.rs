@@ -62,6 +62,28 @@ pub async fn find_root_with_flags<B: BlockDevice + 'static>(
     }
 }
 
+/// `btrfs_root_item.bytes_used`: the bytes of tree blocks the tree occupies,
+/// as last recorded (Linux `btrfs_root_used`).
+const ROOT_ITEM_BYTES_USED: usize = 192;
+
+/// The `(level, bytes_used)` of tree `objectid`'s root item. Returns
+/// `NotFound` if absent.
+pub(crate) async fn find_root_usage<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root_tree: u64,
+    objectid: u64,
+) -> Result<(u8, u64), FsError> {
+    let start = BtrfsKey::new(objectid, format::ROOT_ITEM_KEY, 0);
+    let cursor = btree::Cursor::seek(vol, root_tree, &start).await?;
+    match cursor.current()? {
+        Some((key, body)) if key.objectid == objectid && key.item_type == format::ROOT_ITEM_KEY => {
+            let (_, level) = decode_root_item(body)?;
+            Ok((level, le64(body, ROOT_ITEM_BYTES_USED)?))
+        }
+        _ => Err(FsError::NotFound),
+    }
+}
+
 /// Find the tree root `(logical, level)` for `objectid` in the root tree rooted
 /// at logical `root_tree`. Returns `NotFound` if absent.
 pub async fn find_root<B: BlockDevice + 'static>(

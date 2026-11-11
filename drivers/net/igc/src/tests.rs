@@ -25,15 +25,20 @@ struct Model {
     phy: RefCell<BTreeMap<u8, u16>>,
     mmd: RefCell<BTreeMap<(u16, u16), u16>>,
     writes: RefCell<Vec<(u64, u32)>>,
+    delays: RefCell<Vec<(u64, bool)>>,
     /// Shadow-RAM words landed by SRWR writes, backing later EERD reads.
     shadow: RefCell<BTreeMap<u16, u16>>,
     mmd_dev: Cell<u16>,
     mmd_reg: Cell<u16>,
     stuck_master: Cell<bool>,
     stuck_queue: Cell<bool>,
+    stuck_rx_disable: Cell<bool>,
+    require_start_prerequisites: Cell<bool>,
+    pci_master: Cell<bool>,
     stuck_nvm: Cell<bool>,
     mdic_error: Cell<bool>,
     bad_echo: Cell<bool>,
+    rejected_register: Cell<Option<u64>>,
 }
 impl Model {
     fn new() -> Self {
@@ -79,6 +84,9 @@ impl Registers for Model {
     }
     fn write(&self, reg: u64, mut value: u32) {
         self.writes.borrow_mut().push((reg, value));
+        if self.rejected_register.get() == Some(reg) {
+            return;
+        }
         if reg == 0 && value & (1 << 26) != 0 {
             value &= !(1 << 26);
             self.regs
@@ -91,6 +99,21 @@ impl Registers for Model {
                 .insert(8, if self.stuck_master.get() { 0x80000 } else { 0 });
         }
         if reg & 0x3f == 0x28 && self.stuck_queue.get() {
+            value &= !(1 << 25);
+        }
+        if self.stuck_rx_disable.get()
+            && (0xc028..=0xc0e8).contains(&reg)
+            && reg & 0x3f == 0x28
+            && self.value(reg) & (1 << 25) != 0
+            && value & (1 << 25) == 0
+        {
+            value |= 1 << 25;
+        }
+        if self.require_start_prerequisites.get()
+            && ((0xe028..=0xe0e8).contains(&reg) || (0xc028..=0xc0e8).contains(&reg))
+            && reg & 0x3f == 0x28
+            && (!self.pci_master.get() || self.value(0x400) & 2 == 0 || self.value(0x100) & 2 == 0)
+        {
             value &= !(1 << 25);
         }
         if reg == 0x12014 && !self.stuck_nvm.get() {
@@ -152,7 +175,13 @@ impl Registers for Model {
         }
         false
     }
-    fn delay(&self, _: u64) {}
+    fn delay(&self, us: u64) {
+        let rejecting = self.value(0x5004) == 0
+            && self.value(0x5008) & 0x50000 == 0x10000
+            && self.value(0x100) & (2 | 4 | 0x20) == 2 | 0x20
+            && (0..4).all(|q| self.value(0xc028 + q * 0x40) & (1 << 25) == 0);
+        self.delays.borrow_mut().push((us, rejecting));
+    }
 }
 
 macro_rules! check {
@@ -162,6 +191,132 @@ macro_rules! check {
         }
     };
 }
+
+struct PcieConfigModel {
+    value: Cell<u32>,
+    writes: RefCell<Vec<(u16, u32)>>,
+    stuck: Cell<bool>,
+    gone_after_write: Cell<bool>,
+}
+impl PcieConfigModel {
+    fn new(value: u32) -> Self {
+        Self {
+            value: Cell::new(value),
+            writes: RefCell::new(Vec::new()),
+            stuck: Cell::new(false),
+            gone_after_write: Cell::new(false),
+        }
+    }
+}
+impl crate::igc::PcieConfig for PcieConfigModel {
+    fn read(&self, offset: u16) -> Result<u32, IgcError> {
+        assert_eq!(offset, 0x78);
+        Ok(self.value.get())
+    }
+    fn write(&self, offset: u16, value: u32) -> Result<(), IgcError> {
+        assert_eq!(offset, 0x78);
+        self.writes.borrow_mut().push((offset, value));
+        if self.gone_after_write.get() {
+            self.value.set(u32::MAX);
+        } else if !self.stuck.get() {
+            // Device Status RW1C above Device Control: zero preserves it.
+            let status = (self.value.get() & 0xffff_0000) & !(value & 0xffff_0000);
+            self.value.set(status | (value & 0xffff));
+        }
+        Ok(())
+    }
+}
+
+fn smoke_igc_dma_snooping_preserves_control_and_status() -> TestResult {
+    let config = PcieConfigModel::new(0x001f_2810);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70) == Ok((0x2810, 0x2010)),
+        "No Snoop was not disabled with readback"
+    );
+    check!(
+        config.value.get() == 0x001f_2010 && config.writes.borrow().as_slice() == [(0x78, 0x2010)],
+        "unrelated controls changed or RW1C status was acknowledged"
+    );
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70) == Ok((0x2010, 0x2010))
+            && config.writes.borrow().len() == 1,
+        "already-snooping endpoint was written unnecessarily"
+    );
+    // A later PCI state restore must not reintroduce non-snooping DMA.
+    config.value.set(0x001f_38b0);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70) == Ok((0x38b0, 0x30b0))
+            && config.value.get() == 0x001f_30b0,
+        "restored PCI controls were not preserved while disabling No Snoop"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dma_snooping_preserves_control_and_status
+);
+
+fn smoke_igc_dma_snooping_rejects_unavailable_config() -> TestResult {
+    let config = PcieConfigModel::new(0x001f_2810);
+    for offset in [0, 0x3c, 0x71, 0xfc, u64::MAX] {
+        check!(
+            crate::igc::require_dma_snooping(&config, offset).is_err()
+                && config.writes.borrow().is_empty(),
+            "malformed PCIe capability was accessed"
+        );
+    }
+    config.value.set(u32::MAX);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70).is_err()
+            && config.writes.borrow().is_empty(),
+        "removed endpoint accepted or written"
+    );
+    config.value.set(0x001f_2810);
+    config.stuck.set(true);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70).is_err(),
+        "No Snoop write refusal accepted"
+    );
+    config.gone_after_write.set(true);
+    check!(
+        crate::igc::require_dma_snooping(&config, 0x70).is_err(),
+        "endpoint removal during readback accepted"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dma_snooping_rejects_unavailable_config
+);
+
+fn smoke_igc_dma_snooping_revoked_before_ecam() -> TestResult {
+    let cap = narf_capabilities::Cap::bootstrap(); // Isolated test authority.
+    cap.revoke();
+    let addr = narf_bus::PcieAddr::new(0, 0, 0, 0);
+    let device = narf_bus::BusDevice {
+        addr: narf_bus::BusAddr::Pcie(addr),
+        id: narf_bus::DeviceId {
+            vendor: 0x8086,
+            device: 0x15f3,
+            class: 0x020000,
+            subsystem_vendor: 0,
+            subsystem_id: 0,
+        },
+        kind: narf_bus::BusKind::Pcie {
+            addr,
+            cfg_phys: narf_memory::PhysAddr::new(0),
+        },
+    };
+    check!(
+        crate::igc::configure_dma_snooping(&cap, &device).is_err(),
+        "revoked configuration authority accepted"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dma_snooping_revoked_before_ecam
+);
 
 fn smoke_igc_wait_does_not_repeat_acquisition() -> TestResult {
     let acquisitions = Cell::new(0);
@@ -364,8 +519,47 @@ fn smoke_igc_reset_requires_dma_and_nvm_ack() -> TestResult {
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_reset_requires_dma_and_nvm_ack);
 
+fn smoke_igc_tctl_reserved_defaults_survive_prepare_and_stop() -> TestResult {
+    let m = Model::new();
+    // Real working Linux capture: TCTL=a503f0fa. Seed reserved reset values
+    // plus stale collision/XOFF/enable state; every write must retain them.
+    const RESERVED: u32 = 0xa4000000;
+    m.regs
+        .borrow_mut()
+        .insert(0x400, RESERVED | 2 | (1 << 22) | 0x003ffff0);
+    hardware::quiesce(&m, 1).unwrap();
+    let rss = narf_net::rss::RssConfig::standard(1, 128);
+    hardware::configure(&m, [2, 1, 2, 3, 4, 5], 1500, &rss);
+    check!(
+        m.value(0x400) == 0xa503f0f8,
+        "preparation erased reserved defaults or retained XOFF/enable/collision state"
+    );
+    hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+    hardware::activate_queues(&m, &[256], || Ok(())).unwrap();
+    check!(
+        m.value(0x400) == 0xa503f0fa,
+        "activation changed TCTL defaults"
+    );
+    hardware::quiesce(&m, 1).unwrap();
+    check!(
+        m.value(0x400) == 0xa503f0f8
+            && m.writes
+                .borrow()
+                .iter()
+                .filter(|(reg, _)| *reg == 0x400)
+                .all(|(_, value)| value & RESERVED == RESERVED),
+        "shutdown or an intermediate write erased TCTL reserved defaults"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_tctl_reserved_defaults_survive_prepare_and_stop
+);
+
 fn smoke_igc_queue_enable_and_rss() -> TestResult {
     let m = Model::new();
+    m.regs.borrow_mut().extend([(0xe0f8, 1), (0xe0fc, 0xdead)]);
     check!(
         hardware::queue(&m, 3, 0x112233440000, 0x556677880000, 256).is_ok(),
         "queue setup failed"
@@ -375,22 +569,27 @@ fn smoke_igc_queue_enable_and_rss() -> TestResult {
         "TX ring DMA address/length wrong"
     );
     check!(
-        m.value(0xc0d8) == 255 && m.value(0xc0cc) == 0x12000002,
-        "RX tail/type/size wrong"
+        m.value(0xc0d8) == 0 && m.value(0xc0cc) == 0x82000402,
+        "RX descriptors published before activation or format wrong"
+    );
+    check!(
+        m.value(0xe0f8) == 0 && m.value(0xe0fc) == 0,
+        "inherited TX head writeback still suppresses descriptor DD"
     );
     let rss = narf_net::rss::RssConfig::standard(4, 128);
     hardware::configure(&m, [2, 1, 2, 3, 4, 5], 9216, &rss);
     check!(
         m.value(0x100) & 2 == 0 && m.value(0x400) & 2 == 0,
-        "global DMA enabled before queue acknowledgements"
+        "global DMA enabled during ring preparation"
     );
     check!(
         m.value(0x5000) == 0x2b00 && m.value(0xa000) == 0,
         "RX checksum/UTA configuration wrong"
     );
     check!(
-        hardware::enable_data(&m).is_ok(),
-        "global DMA enable not acknowledged"
+        (0..3).all(|q| hardware::queue(&m, q, 0x1000, 0x2000, 256).is_ok())
+            && hardware::activate_queues(&m, &[256; 4], || Ok(())).is_ok(),
+        "queue activation not acknowledged"
     );
     check!(
         m.value(0x100) & 2 != 0 && m.value(0x400) & 2 != 0,
@@ -408,12 +607,273 @@ fn smoke_igc_queue_enable_and_rss() -> TestResult {
     }
     m.stuck_queue.set(true);
     check!(
-        hardware::queue(&m, 0, 0x1000, 0x2000, 256).is_err(),
+        hardware::queue(&m, 0, 0x1000, 0x2000, 256).is_ok()
+            && hardware::activate_queues(&m, &[256], || Ok(())).is_err(),
         "missing QUEUE_ENABLE accepted"
     );
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_queue_enable_and_rss);
+
+fn smoke_igc_activation_requires_live_engines_before_queue_ack() -> TestResult {
+    let m = Model::new();
+    m.require_start_prerequisites.set(true);
+    for q in 0..4 {
+        check!(
+            hardware::queue(&m, q, 0x1000, 0x2000, 256).is_ok(),
+            "ring preparation waited for a dormant queue"
+        );
+    }
+    // Reproduce the physical 0xe028 timeout with mastering/global engines
+    // parked: thresholds latch as 0x100108 while QUEUE_ENABLE stays clear.
+    m.write(0xe028, 0x02100108);
+    check!(m.value(0xe028) == 0x00100108, "dormant queue acknowledged");
+    check!(
+        hardware::poll(&m, 0xe028, 1 << 25, 1 << 25).is_err(),
+        "old startup ordering did not reproduce its timeout"
+    );
+    hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+    check!(
+        hardware::activate_queues(&m, &[256; 4], || {
+            // The real callback grants BME only after retained ring bases and
+            // interrupt routes are installed. Engines/queues are still off.
+            if m.value(0x400) & 2 != 0 || m.value(0xc018) != 0 {
+                return Err(IgcError::Other("DMA started before mastering grant"));
+            }
+            m.pci_master.set(true);
+            Ok(())
+        })
+        .is_ok(),
+        "production activation still waits for queues before engine enable"
+    );
+    for q in 0..4 {
+        let offset = q * 0x40;
+        check!(
+            m.value(0xe028 + offset) == 0x02000108
+                && m.value(0xc028 + offset) == 0x02010808
+                && m.value(0xc018 + offset) == 255,
+            "activation lost queue thresholds, enable or RX descriptors"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_activation_requires_live_engines_before_queue_ack
+);
+
+fn smoke_igc_activation_refusal_never_posts_receive_buffers() -> TestResult {
+    for rejected in [None, Some(0x100), Some(0x400), Some(0xe068)] {
+        let m = Model::new();
+        for q in 0..2 {
+            hardware::queue(&m, q, 0x1000, 0x2000, 256).unwrap();
+        }
+        m.rejected_register.set(rejected);
+        check!(
+            hardware::activate_queues(&m, &[256; 2], || {
+                if rejected.is_none() {
+                    Err(IgcError::Other("PCI DMA enable rejected"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err(),
+            "mastering, global engine or queue refusal was accepted"
+        );
+        check!(
+            m.value(0xc018) == 0 && m.value(0xc058) == 0,
+            "partial activation published receive descriptors"
+        );
+    }
+    let m = Model::new();
+    let granted = Cell::new(false);
+    check!(
+        hardware::activate_queues(&m, &[256], || {
+            granted.set(true);
+            Ok(())
+        })
+        .is_err()
+            && !granted.get(),
+        "unprepared rings were granted mastering"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_activation_refusal_never_posts_receive_buffers
+);
+
+fn smoke_igc_rx_erratum_precedes_buffer_publication() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().insert(0x5008, 0x40020);
+    hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+    hardware::activate_queues(&m, &[256], || Ok(())).unwrap();
+    check!(
+        m.value(0x5008) == 0x50020,
+        "IPv6 erratum or unrelated RFCTL bits lost"
+    );
+    let writes = m.writes.borrow();
+    let erratum = writes
+        .iter()
+        .position(|&(reg, v)| reg == 0x5008 && v & 0x10000 != 0)
+        .unwrap();
+    let publish = writes
+        .iter()
+        .position(|&(reg, v)| reg == 0xc018 && v != 0)
+        .unwrap();
+    check!(
+        erratum < publish,
+        "RX buffers published before parser erratum"
+    );
+    check!(
+        !writes.iter().any(|&(reg, _)| reg == 0x5004) && m.delays.borrow().is_empty(),
+        "management flush ran without management receive enabled"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc/init",
+    smoke_igc_rx_erratum_precedes_buffer_publication
+);
+
+fn smoke_igc_management_fifo_flush_restores_queue_policy() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().extend([
+        (0x5820, 0x20000),
+        (0x5008, 0x40020),
+        (0x5004, 1522),
+        (0x100, 0x04008024),
+    ]);
+    for q in 0..2 {
+        hardware::queue(&m, q, 0x1000, 0x2000, 256).unwrap();
+    }
+    hardware::activate_queues(&m, &[256; 2], || Ok(())).unwrap();
+    check!(
+        m.delays.borrow().as_slice() == [(2000, true)],
+        "FIFO flush did not reject all traffic for the bounded delay"
+    );
+    check!(
+        m.value(0x5004) == 1522
+            && m.value(0x5008) == 0x50020
+            && m.value(0x100) == 0x04008026
+            && (0..2)
+                .all(|q| m.value(0xc028 + q * 0x40) == 0x02010808
+                    && m.value(0xc018 + q * 0x40) == 255)
+            && (2..4).all(|q| m.value(0xc028 + q * 0x40) == 0),
+        "FIFO flush lost active queue configuration or enabled an unused queue"
+    );
+    let writes = m.writes.borrow();
+    let restore = writes
+        .iter()
+        .rposition(|&(r, v)| r == 0x5008 && v == 0x50020)
+        .unwrap();
+    let publish = writes
+        .iter()
+        .position(|&(r, v)| r == 0xc018 && v != 0)
+        .unwrap();
+    check!(
+        restore < publish,
+        "RX tails posted during temporary FIFO rejection"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc/init",
+    smoke_igc_management_fifo_flush_restores_queue_policy
+);
+
+fn smoke_igc_fifo_refusal_never_publishes_receive_buffers() -> TestResult {
+    let m = Model::new();
+    m.regs.borrow_mut().insert(0x5820, 0x20000);
+    hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+    m.rejected_register.set(Some(0x5008));
+    check!(
+        hardware::activate_queues(&m, &[256], || Ok(())).is_err(),
+        "FIFO prerequisite refusal was accepted"
+    );
+    check!(
+        (0..4).all(|q| m.value(0xc018 + q * 0x40) == 0)
+            && !m.writes.borrow().iter().any(|&(r, _)| r == 0x5004),
+        "FIFO refusal published buffers or changed length before queue drain"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc/init",
+    smoke_igc_fifo_refusal_never_publishes_receive_buffers
+);
+
+fn smoke_igc_fifo_flush_tolerates_late_queue_disable() -> TestResult {
+    // Linux igc_rx_fifo_flush_base logs "Queue disable timed out after
+    // 10ms" and still flushes. Refusing instead would leave the interface
+    // unregistered on a controller that is merely slow to acknowledge.
+    let m = Model::new();
+    m.regs
+        .borrow_mut()
+        .extend([(0x5820, 0x20000), (0x5004, 1522)]);
+    hardware::queue(&m, 0, 0x1000, 0x2000, 256).unwrap();
+    m.stuck_rx_disable.set(true);
+    check!(
+        hardware::activate_queues(&m, &[256], || Ok(())).is_ok(),
+        "a late RX queue disable aborted activation"
+    );
+    // The model's flag also requires the queues to read disabled, which
+    // is exactly what this controller has not yet acknowledged.
+    check!(
+        matches!(m.delays.borrow().as_slice(), [(2000, _)]),
+        "the reject window was skipped after a late queue disable"
+    );
+    check!(
+        m.value(0x5004) == 1522 && m.value(0xc018) == 255,
+        "receive length was not restored or RX buffers were not published"
+    );
+    let writes = m.writes.borrow();
+    let restored = writes.iter().rposition(|&(r, _)| r == 0x5004).unwrap();
+    let published = writes
+        .iter()
+        .position(|&(r, v)| r == 0xc018 && v != 0)
+        .unwrap();
+    check!(
+        restored < published,
+        "RX tails posted while the reject policy was still in force"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc/init",
+    smoke_igc_fifo_flush_tolerates_late_queue_disable
+);
+
+fn smoke_igc_queue_rejected_configuration_never_enables_dma() -> TestResult {
+    // Each hardware refusal must stop before either queue is enabled.
+    for rejected in [
+        0xc000, 0xc004, 0xc008, 0xe000, 0xe004, 0xe008, 0xe038, 0xc00c,
+    ] {
+        let m = Model::new();
+        m.regs.borrow_mut().insert(rejected, 0xdead_beef);
+        m.rejected_register.set(Some(rejected));
+        check!(
+            hardware::queue(&m, 0, 0x112233440000, 0x556677880000, 256).is_err(),
+            "rejected ring or completion format accepted"
+        );
+        check!(
+            m.value(0xc028) & (1 << 25) == 0 && m.value(0xe028) & (1 << 25) == 0,
+            "DMA queue enabled after configuration rejection"
+        );
+    }
+    for (q, tx, count) in [(4, 0x1000, 256), (0, 0x1001, 256), (0, 0x1000, 65)] {
+        let m = Model::new();
+        check!(
+            hardware::queue(&m, q, tx, 0x2000, count).is_err() && m.writes.borrow().is_empty(),
+            "invalid ring geometry reached hardware"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_queue_rejected_configuration_never_enables_dma
+);
 
 fn smoke_igc_negotiated_link_metadata() -> TestResult {
     for (status, speed) in [(3, 10), (0x43, 100), (0x83, 1000), (0x400083, 2500)] {
@@ -659,6 +1119,21 @@ fn smoke_igc_tx_owned_until_final_completion() -> TestResult {
         covered == 8054 && q.reclaim() == 0,
         "uncompleted frame reclaimed"
     );
+    let before = q.statistics();
+    let snapshot = q.completion_snapshot();
+    check!(
+        snapshot.tx_end == Some(end - 1)
+            && snapshot.tx_next == end
+            && snapshot.tx_clean == 0
+            && snapshot.tx_dma == q.tx_ring.dma_addr().raw()
+            && snapshot.tx_cpu == q.tx_ring.cpu_ptr::<u8>() as usize
+            && snapshot.tx_words[2] & 0x09000000 == 0x09000000
+            && snapshot.tx_words[3] & 1 == 0
+            && snapshot.rx_head == 0
+            && snapshot.rx_words[2..] == [0, 0]
+            && q.statistics() == before,
+        "stalled descriptor snapshot changed ownership or selected the wrong slot"
+    );
     // Completing a context/intermediate slot is insufficient.
     // SAFETY: the test is the sole DMA model writer of this queue.
     unsafe {
@@ -674,12 +1149,53 @@ fn smoke_igc_tx_owned_until_final_completion() -> TestResult {
         );
     }
     check!(
+        q.completion_snapshot().tx_words[3] & 1 != 0 && q.statistics()[4] == 1,
+        "snapshot did not observe DD without reclaiming it"
+    );
+    check!(
         q.reclaim() == 1 && q.reclaim() == 0,
         "final completion ownership not reclaimed exactly once"
     );
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_tx_owned_until_final_completion);
+
+fn smoke_igc_tx_watchdog_ignores_frames_posted_after_its_clock_sample() -> TestResult {
+    // Physical I225 under load: q0 held one two-descriptor frame whose DD was
+    // already set, head == tail, yet the watchdog declared a 5 s stall and
+    // reset the controller. Its clock sample predated the frame's timestamp.
+    let q = Queue::new().unwrap();
+    let m = Model::new();
+    let before = narf_time::now_cycles();
+    check!(
+        q.post(&m, 0, dma_frame(&tcp4(0)), TxMeta::plain(), 1500)
+            .is_ok(),
+        "TX enqueue failed"
+    );
+    let timeout = narf_time::ns_to_cycles(5_000_000_000);
+    check!(
+        !q.stalled(before, timeout) && !q.stalled(0, timeout),
+        "a frame posted after the watchdog's clock sample was reported stalled"
+    );
+    check!(
+        !q.stalled(narf_time::now_cycles(), timeout),
+        "a fresh frame was reported stalled"
+    );
+    check!(
+        q.stalled(
+            narf_time::now_cycles()
+                .saturating_add(timeout)
+                .saturating_add(1),
+            timeout
+        ),
+        "a frame pending past the timeout was not reported stalled"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_tx_watchdog_ignores_frames_posted_after_its_clock_sample
+);
 
 fn smoke_igc_tx_ring_full_and_wrap() -> TestResult {
     let q = Queue::new().unwrap();
@@ -744,6 +1260,159 @@ fn inject(q: &Queue, slot: usize, bytes: &[u8], status: u32, hash: u32, vlan: u1
         );
     }
 }
+
+fn smoke_igc_single_packet_completes_without_interrupt_timer() -> TestResult {
+    for old_batching in [true, false] {
+        let q = Queue::new().unwrap();
+        let m = Model::new();
+        hardware::queue(
+            &m,
+            0,
+            q.tx_ring.dma_addr().raw(),
+            q.rx_ring.dma_addr().raw(),
+            256,
+        )
+        .unwrap();
+        if old_batching {
+            m.write(0xe028, 0x00100108);
+            m.write(0xc028, 0x00040808);
+        }
+        hardware::activate_queues(&m, &[256], || Ok(())).unwrap();
+        let packet = tcp4(0);
+        q.post(&m, 0, dma_frame(&packet), TxMeta::plain(), 1500)
+            .unwrap();
+        check!(
+            m.value(0xe018) == 1,
+            "unexpected plain-frame descriptor count"
+        );
+        // Device model: fetching a descriptor advances head independently
+        // of writeback. With no EITR timer, TX writes RS immediately only at
+        // WTHRESH=0; otherwise it waits for a complete threshold batch. RX
+        // zero is not an immediate mode; a single completion needs WTHRESH=1.
+        // These independent literal rules follow the Intel/FreeBSD protocol.
+        m.regs.borrow_mut().extend([(0xe010, 1), (0xc010, 1)]);
+        let tx_threshold = (m.value(0xe028) >> 16) & 31;
+        let rx_threshold = (m.value(0xc028) >> 16) & 31;
+        // SAFETY: this queue is used only by this test's DMA model.
+        let descriptor =
+            unsafe { ptr::read_volatile(q.tx_ring.cpu_ptr::<crate::igc::AdvTxDataDesc>()) };
+        check!(
+            descriptor.cmd_type_len & 0x09000000 == 0x09000000,
+            "EOP/RS missing"
+        );
+        if tx_threshold == 0 || tx_threshold == 1 {
+            // SAFETY: model writes only the completed EOP's DD.
+            unsafe {
+                ptr::write_volatile(
+                    q.tx_ring.cpu_mut_ptr_at::<u32>(12),
+                    descriptor.olinfo_status | 1,
+                );
+            }
+        }
+        if rx_threshold == 1 {
+            inject(&q, 0, &packet, 3, 0, 0);
+        }
+        let reclaimed = q.reclaim();
+        let (received, drops) = q.receive(&m, 0, 1500, 1);
+        if old_batching {
+            check!(
+                reclaimed == 0 && received.is_empty() && q.statistics()[4] == 1,
+                "advanced hardware heads were mistaken for DMA ownership release"
+            );
+        } else {
+            check!(
+                reclaimed == 1
+                    && received.len() == 1
+                    && drops == 0
+                    && received[0].payload() == packet,
+                "single packet still needs another packet or an interrupt timer to complete"
+            );
+        }
+        hardware::quiesce(&m, 1).unwrap();
+        // SAFETY: the device model acknowledged complete DMA quiescence.
+        unsafe {
+            q.reset_after_quiesce();
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_single_packet_completes_without_interrupt_timer
+);
+
+fn smoke_igc_quiesced_evidence_distinguishes_payload_from_descriptor_writes() -> TestResult {
+    let q = Queue::new().unwrap();
+    let m = Model::new();
+    q.post(&m, 0, dma_frame(&tcp4(0)), TxMeta::plain(), 1500)
+        .unwrap();
+    // Model payload DMA reaching a retained RX buffer with descriptor DD
+    // withheld. A head advance alone must not make reclaim infer completion.
+    // SAFETY: model exclusively owns this in-bounds unexposed RX slot.
+    let descriptor =
+        unsafe { ptr::read_volatile(q.rx_ring.cpu_ptr_at::<crate::queue::RxRead>(17 * 16)) };
+    let payload = narf_memory::PhysAddr::new(descriptor.address).kernel_mut_ptr::<u32>();
+    // SAFETY: model's programmed address names its retained RX allocation.
+    unsafe {
+        ptr::write_volatile(payload, 0x44332211);
+    }
+    m.regs.borrow_mut().extend([(0xe010, 1), (0xc010, 18)]);
+    hardware::quiesce(&m, 1).unwrap();
+    let before = q.statistics();
+    // SAFETY: model acknowledged complete device-wide DMA drain above.
+    let evidence = unsafe { q.quiesced_writeback_snapshot() };
+    check!(
+        evidence.tx_dd == 0
+            && evidence.rx_dd == 0
+            && evidence.rx_nonzero_prefixes == 1
+            && evidence.rx_leased_skipped == 0
+            && evidence.first_changed_rx == Some(17)
+            && evidence.first_rx_words[0] == 0x44332211
+            && q.statistics() == before
+            && q.reclaim() == 0,
+        "payload evidence was lost, mutated DMA, or inferred completion from hardware heads"
+    );
+    // SAFETY: same complete quiescence proof; no model DMA has resumed.
+    unsafe {
+        q.reset_after_quiesce();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_quiesced_evidence_distinguishes_payload_from_descriptor_writes
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_igc_dma_cpu_mapping_walk_matches_owned_pages() -> TestResult {
+    let buffer = alloc_coherent(8192, DomainId::DRIVER_0).unwrap();
+    let before = buffer.as_slice().to_vec();
+    let snapshot = crate::queue::cpu_mapping_snapshot(&buffer).unwrap();
+    let physical = buffer.phys_addr().raw();
+    check!(
+        snapshot.physical == physical
+            && snapshot.translated == Some(physical)
+            && snapshot.end_translated == Some(physical + 8191)
+            && snapshot.pages_match,
+        "CPU page-table walk disagrees with coherent buffer physical ownership"
+    );
+    check!(
+        snapshot.root != 0
+            && snapshot.leaf_flags.is_some()
+            && snapshot.leaf_bytes.is_some()
+            && snapshot.pat != 0
+            && snapshot.pat_type == Some(6)
+            && snapshot.mtrr_default.is_some()
+            && buffer.as_slice() == before,
+        "read-only DMA mapping audit lost WB/PAT evidence or changed memory"
+    );
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_dma_cpu_mapping_walk_matches_owned_pages
+);
 
 fn smoke_igc_rx_scatter_vlan_and_metadata() -> TestResult {
     let q = Queue::new().unwrap();
@@ -941,7 +1610,7 @@ fn smoke_igc_rings_independent_geometry() -> TestResult {
     )
     .unwrap();
     check!(
-        m.value(0xe0c8) == 1024 && m.value(0xc0c8) == 2048 && m.value(0xc0d8) == 127,
+        m.value(0xe0c8) == 1024 && m.value(0xc0c8) == 2048 && m.value(0xc0d8) == 0,
         "independent ring lengths lost"
     );
     check!(
@@ -2033,6 +2702,8 @@ fn smoke_igc_ethtool_regs_dump_layout() -> TestResult {
         (0x5404, 0xb0),
         (0x5404 + 4 * 8, 0xb4),
         (0xe000, 0xc0),
+        (0xe0c0, 0xc3),
+        (0xe004, 0xface),
         (0x55b0, 0x55),
         (0x5ccc, 0xe7),
     ]);
@@ -2044,6 +2715,7 @@ fn smoke_igc_ethtool_regs_dump_layout() -> TestResult {
     m.regs.borrow_mut().insert(0x4100, 0x77);
     let dump = crate::igc::control::regs_dump(&m, &counters);
     check!(dump.len() == 740, "register dump is not 740 words");
+    check!(dump[152] == 0xface, "TDBAH0 overwritten by TDBAL3");
     check!(
         dump[0] == 0x1111_1111
             && dump[1] == 0x2222_2222
@@ -2268,3 +2940,163 @@ fn smoke_igc_ethtool_queue_statistics_shape() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_ethtool_queue_statistics_shape);
+
+fn complete_tx(q: &Queue, slot: usize) {
+    // SAFETY: the test is the only DMA model writing this queue's ring.
+    unsafe {
+        ptr::write_volatile(q.tx_ring.cpu_mut_ptr_at::<u32>((slot * 16 + 12) as u64), 1);
+    }
+}
+
+fn smoke_igc_tx_backpressure_follows_ring_geometry() -> TestResult {
+    // Linux igc_maybe_stop_tx(ring, DESC_NEEDED) / TX_WAKE_THRESHOLD on a
+    // 64-descriptor ring: stop below one worst-case frame (20), wake at 40.
+    let q = Queue::new_sized(64, 64).unwrap();
+    let m = Model::new();
+    check!(
+        q.txq().geometry().ring_len == 64 && q.txq().thresholds() == (20, 40),
+        "stop/wake thresholds are not derived from the ring"
+    );
+    let aware = crate::queue::TxOptions {
+        backpressure: true,
+        ..Default::default()
+    };
+    let offer =
+        |options| q.post_options(&m, 0, dma_frame(&tcp4(0)), TxMeta::plain(), 1500, options);
+    let mut posted = 0usize;
+    loop {
+        match offer(aware) {
+            Ok(()) => posted += 1,
+            Err(IgcError::TxBusy) => break,
+            Err(_) => return TestResult::Fail("a frame that fits the ring was rejected"),
+        }
+        check!(posted < 64, "the queue never pushed back");
+    }
+    // One descriptor per frame, 63 usable: 44 posted leaves 19 free.
+    check!(
+        posted == 44 && q.txq().is_stopped(),
+        "the queue did not stop one worst-case frame short of full"
+    );
+    check!(
+        q.statistics()[3] == 0,
+        "a frame refused as busy was counted as rejected"
+    );
+    // The descriptors kept free are for frames that cannot wait.
+    check!(
+        offer(Default::default()).is_ok(),
+        "a control frame was refused while descriptors remained"
+    );
+    for slot in 0..20 {
+        complete_tx(&q, slot);
+    }
+    check!(
+        q.reclaim() == 20 && q.txq().is_stopped() && offer(aware) == Err(IgcError::TxBusy),
+        "woke below the wake threshold"
+    );
+    for slot in 20..22 {
+        complete_tx(&q, slot);
+    }
+    check!(
+        q.reclaim() == 2 && !q.txq().is_stopped() && q.txq().restarts() == 1,
+        "did not wake once at the wake threshold"
+    );
+    check!(
+        offer(aware).is_ok() && q.statistics()[3] == 0,
+        "refused after the wake"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_tx_backpressure_follows_ring_geometry
+);
+
+fn smoke_igc_tx_charges_return_on_completion_refusal_and_reset() -> TestResult {
+    let q = Queue::new_sized(64, 64).unwrap();
+    let m = Model::new();
+    let account = narf_net::txq::TxAccount::new(0xfff1_0001, q.txq().clone());
+    let aware = crate::queue::TxOptions {
+        backpressure: true,
+        ..Default::default()
+    };
+    // TSO super-frames: a context and two data descriptors each. Returns how
+    // many were taken and the bytes charged for them.
+    let fill = || -> Option<(usize, u32)> {
+        let (mut posted, mut charged) = (0usize, 0u32);
+        loop {
+            let mut frame = dma_frame(&tcp4(8000));
+            let len = frame.len();
+            frame.set_tx_charge(account.charge(len));
+            match q.post_options(&m, 0, frame, TxMeta::with_tso(1460), 1500, aware) {
+                Ok(()) => {
+                    posted += 1;
+                    charged += len;
+                }
+                Err(IgcError::TxBusy) => return Some((posted, charged)),
+                Err(_) => return None,
+            }
+            if posted > 64 {
+                return None;
+            }
+        }
+    };
+    let Some((posted, charged)) = fill() else {
+        return TestResult::Fail("a super-frame that fits the ring was rejected");
+    };
+    // 45 descriptors used leaves 18: less than one more worst-case frame.
+    check!(
+        posted == 15 && q.txq().is_stopped(),
+        "super-frames did not stop the queue at the ring's threshold"
+    );
+    check!(
+        account.queued() == charged,
+        "the refused frame kept its connection's charge"
+    );
+    // An idle ring holds any frame: completing everything must wake it.
+    for frame in 0..posted {
+        complete_tx(&q, frame * 3 + 2);
+    }
+    check!(
+        q.reclaim() == posted && !q.txq().is_stopped(),
+        "a drained ring stayed stopped"
+    );
+    check!(
+        account.queued() == 0,
+        "completion did not return the connection's charges"
+    );
+    // Stopped again, then the watchdog resets the ring with frames in it.
+    check!(
+        fill().is_some() && q.txq().is_stopped() && account.queued() != 0,
+        "the queue did not stop a second time"
+    );
+    // SAFETY: no device is attached to this queue.
+    unsafe {
+        q.reset_after_quiesce();
+    }
+    check!(
+        !q.txq().is_stopped(),
+        "a reset left the transmit queue stopped"
+    );
+    check!(
+        account.queued() == 0,
+        "frames discarded by the reset kept their connection's charges"
+    );
+    check!(
+        q.post_options(
+            &m,
+            0,
+            dma_frame(&tcp4(8000)),
+            TxMeta::with_tso(1460),
+            1500,
+            aware
+        )
+        .is_ok()
+            && q.statistics()[3] == 0,
+        "the queue refused a frame after the reset"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_tx_charges_return_on_completion_refusal_and_reset
+);

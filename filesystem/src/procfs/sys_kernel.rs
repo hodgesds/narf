@@ -41,6 +41,9 @@ static DOMAINNAME: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new())
 static PRINTK_DEVKMSG: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
 static CORE_PATTERN: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
 
+static CORE_USES_PID: AtomicI32 = AtomicI32::new(0);
+static CORE_PIPE_LIMIT: AtomicU32 = AtomicU32::new(0);
+
 static PID_MAX: AtomicU32 = AtomicU32::new(32768);
 static THREADS_MAX: AtomicU32 = AtomicU32::new(65536);
 static RANDOMIZE_VA_SPACE: AtomicU32 = AtomicU32::new(2);
@@ -604,6 +607,21 @@ fn read_cap_last_cap() -> String {
     String::from("40\n")
 }
 
+/// `kernel/overflowuid` and `kernel/overflowgid` (`kernel/sys.c`): the id a
+/// process sees for a uid/gid that has no mapping in its user namespace —
+/// `DEFAULT_OVERFLOWUID` / `DEFAULT_OVERFLOWGID`, 65534. NARF's id-map
+/// translation (`narf_userspace::namespaces::OVERFLOW_ID`) uses the same
+/// fixed value.
+///
+/// bubblewrap reads both before anything else and exits if either is
+/// missing ("Can't read /proc/sys/kernel/overflowuid"), which is how every
+/// glycin image-loader sandbox — and so every GTK app decoding an SVG —
+/// failed. LINUX-GAP: Linux lets root retune these (0..65535); here the
+/// value is fixed, so the files do not accept writes.
+fn read_overflow_id() -> String {
+    String::from("65534\n")
+}
+
 fn read_core_pattern() -> String {
     ensure_defaults();
     format!("{}\n", CORE_PATTERN.lock().as_str())
@@ -613,6 +631,51 @@ fn write_core_pattern(v: &str) -> Result<(), FsError> {
         return Err(FsError::InvalidData);
     }
     *CORE_PATTERN.lock() = v.to_string();
+    Ok(())
+}
+
+/// Set `kernel.core_pattern`, as a write to the sysctl file does.
+pub fn set_core_pattern(pattern: &str) -> Result<(), FsError> {
+    write_core_pattern(pattern)
+}
+
+/// The live `kernel.core_pattern` (`fs/coredump.c::core_pattern`), as the
+/// core dumper reads it: a file name template, or `|program args` /
+/// `@socket` for a dump that never touches the crashing task's directory.
+pub fn core_pattern() -> String {
+    ensure_defaults();
+    let pattern = CORE_PATTERN.lock();
+    String::from(pattern.trim_end_matches('\n'))
+}
+
+/// `kernel.core_uses_pid`: append `.<pid>` to a core file name whose
+/// pattern has no `%p`.
+pub fn core_uses_pid() -> bool {
+    CORE_USES_PID.load(Ordering::Relaxed) != 0
+}
+
+/// `kernel.core_pipe_limit`: how many crashes may dump to a pipe helper at
+/// once; 0 is unlimited.
+pub fn core_pipe_limit() -> u32 {
+    CORE_PIPE_LIMIT.load(Ordering::Relaxed)
+}
+
+// `fs/coredump.c::coredump_sysctls`: core_uses_pid is a 0644
+// `proc_dointvec`, core_pipe_limit a 0644 `proc_douintvec`.
+fn read_core_uses_pid() -> String {
+    format!("{}\n", CORE_USES_PID.load(Ordering::Relaxed))
+}
+fn write_core_uses_pid(v: &str) -> Result<(), FsError> {
+    let n = parse_dointvec_minmax(v, i64::from(i32::MIN), i64::from(i32::MAX))?;
+    CORE_USES_PID.store(n as i32, Ordering::Relaxed);
+    Ok(())
+}
+fn read_core_pipe_limit() -> String {
+    format!("{}\n", core_pipe_limit())
+}
+fn write_core_pipe_limit(v: &str) -> Result<(), FsError> {
+    let n = parse_dointvec_minmax(v, 0, i64::from(u32::MAX))?;
+    CORE_PIPE_LIMIT.store(n as u32, Ordering::Relaxed);
     Ok(())
 }
 
@@ -790,6 +853,18 @@ pub fn register_all() {
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
+        path: "kernel/overflowuid",
+        read: read_overflow_id,
+        write: None,
+        perms: 0o444,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/overflowgid",
+        read: read_overflow_id,
+        write: None,
+        perms: 0o444,
+    });
+    register_sysctl(SysctlEntry {
         path: "kernel/cap_last_cap",
         read: read_cap_last_cap,
         write: None,
@@ -799,6 +874,18 @@ pub fn register_all() {
         path: "kernel/core_pattern",
         read: read_core_pattern,
         write: Some(write_core_pattern),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/core_uses_pid",
+        read: read_core_uses_pid,
+        write: Some(write_core_uses_pid),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/core_pipe_limit",
+        read: read_core_pipe_limit,
+        write: Some(write_core_pipe_limit),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
@@ -1314,6 +1401,21 @@ fn smoke_kernel_cap_last_cap() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_cap_last_cap);
 
+/// `cat /proc/sys/kernel/overflow{uid,gid}` on Linux: `65534`. bubblewrap's
+/// `read_overflowids` loads both and dies on ENOENT or a value of 0.
+fn smoke_kernel_overflow_ids() -> TestResult {
+    register_all();
+    for key in ["kernel/overflowuid", "kernel/overflowgid"] {
+        match read_sys(key) {
+            Some(s) if s == "65534\n" => {}
+            Some(_) => return TestResult::Fail("kernel/overflow{uid,gid} is not 65534"),
+            None => return TestResult::Fail("kernel/overflow{uid,gid} is missing"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_overflow_ids);
+
 fn smoke_kernel_core_pattern_rw() -> TestResult {
     register_all();
     let f = match lookup_sys("kernel/core_pattern") {
@@ -1323,9 +1425,50 @@ fn smoke_kernel_core_pattern_rw() -> TestResult {
     if f.write(b"core.%p\n").is_err() {
         return TestResult::Fail("write core_pattern failed");
     }
-    match read_sys("kernel/core_pattern") {
+    let read_back = read_sys("kernel/core_pattern");
+    let parsed = core_pattern();
+    // The pattern is live state the core dumper acts on: put the default
+    // back so a later test's crash still dumps to `core`.
+    let _ = f.write(b"core\n");
+    if parsed != "core.%p" {
+        return TestResult::Fail("core_pattern() does not report the written pattern");
+    }
+    match read_back {
         Some(s) if s == "core.%p\n" => TestResult::Pass,
         _ => TestResult::Fail("core_pattern readback mismatch"),
     }
 }
 kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_core_pattern_rw);
+
+/// systemd-sysctl writes both at boot (`50-coredump.conf`); a missing file
+/// is a logged failure on every boot.
+fn smoke_kernel_core_uses_pid_and_pipe_limit_rw() -> TestResult {
+    register_all();
+    let (Some(uses_pid), Some(pipe_limit)) = (
+        lookup_sys("kernel/core_uses_pid"),
+        lookup_sys("kernel/core_pipe_limit"),
+    ) else {
+        return TestResult::Fail("core_uses_pid / core_pipe_limit sysctl not found");
+    };
+    if uses_pid.write(b"1\n").is_err() || pipe_limit.write(b"16\n").is_err() {
+        return TestResult::Fail("write of core_uses_pid / core_pipe_limit failed");
+    }
+    let read_back = read_sys("kernel/core_uses_pid").as_deref() == Some("1\n")
+        && read_sys("kernel/core_pipe_limit").as_deref() == Some("16\n")
+        && core_uses_pid()
+        && core_pipe_limit() == 16;
+    let rejects_negative = pipe_limit.write(b"-1\n").is_err();
+    let _ = uses_pid.write(b"0\n");
+    let _ = pipe_limit.write(b"0\n");
+    if !read_back {
+        return TestResult::Fail("core_uses_pid / core_pipe_limit readback mismatch");
+    }
+    if !rejects_negative {
+        return TestResult::Fail("core_pipe_limit accepted a negative value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_core_uses_pid_and_pipe_limit_rw
+);

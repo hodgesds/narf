@@ -1162,3 +1162,875 @@ fn smoke_half_closed_receive_wakes_reader() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/tcp/robust", smoke_half_closed_receive_wakes_reader);
+
+/// Deliver `segments` in-order 1400-byte data segments and read them all.
+fn stream_and_read(id: u32, local: [u8; 4], peer: [u8; 4], port: u16, segments: usize) -> usize {
+    let payload = [0x5a; 1400];
+    for _ in 0..segments {
+        let seq = __with_tcb(id, |t| t.rcv_nxt).unwrap_or(0);
+        inject(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: port,
+            seq,
+            ack: 0x10000,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &payload,
+        });
+    }
+    let mut buf = vec![0u8; segments * payload.len()];
+    recv_errno(id, &mut buf).unwrap_or(0)
+}
+
+/// Physical I225, browser download at a third of line rate: every
+/// connection advertised the fixed 256 KiB receive buffer for its whole
+/// life, which bounds a sender at 256 KiB per round trip. Linux
+/// `tcp_rcv_space_adjust` grows the buffer while the reader keeps pace, and
+/// leaves a buffer the application sized with `SO_RCVBUF` alone.
+fn smoke_receive_buffer_autotunes_past_default() -> TestResult {
+    use crate::tcp::socket_buf::DEFAULT_RCV_BUF;
+    let local = [10, 91, 0, 1];
+    let peer = reset("rcvtune0", local);
+    let id = established(local, 7_901, peer, 80);
+    let _ = __with_tcb_mut(id, |t| {
+        t.opts.wscale_active = true;
+        t.opts.our_wscale = 7;
+    });
+    // Less than one advertised window: no receiver RTT sample yet, so the
+    // buffer must not move however much was read.
+    if stream_and_read(id, local, peer, 7_901, 100) != 140_000 {
+        return TestResult::Fail("in-order data was not readable");
+    }
+    if __with_tcb(id, |t| t.recv_buf.limit) != Some(DEFAULT_RCV_BUF) {
+        return TestResult::Fail("receive buffer changed before any RTT sample");
+    }
+    // A full advertised window has now arrived: that is the RTT sample, and
+    // the reader took all of it within the round.
+    let _ = drain();
+    if stream_and_read(id, local, peer, 7_901, 100) != 140_000 {
+        return TestResult::Fail("in-order data was not readable");
+    }
+    let (limit, sampled) =
+        __with_tcb(id, |t| (t.recv_buf.limit, t.rcv_space.rtt_us8 != 0)).unwrap_or((0, false));
+    if !sampled {
+        return TestResult::Fail("a full window of data produced no receiver RTT sample");
+    }
+    if limit <= DEFAULT_RCV_BUF {
+        return TestResult::Fail("receive buffer did not grow for a reader that kept pace");
+    }
+    if limit > 6_291_456 / 2 {
+        return TestResult::Fail("receive buffer grew past tcp_rmem[2]");
+    }
+    // The larger window must reach the peer: the read's window update
+    // advertises it (scaled by 2^7).
+    let advertised = drain()
+        .iter()
+        .filter(|f| ethertype(f) == 0x0800 && f.len() >= TCP_OFF + 20)
+        .map(|f| u32::from(u16::from_be_bytes([f[TCP_OFF + 14], f[TCP_OFF + 15]])) << 7)
+        .max()
+        .unwrap_or(0);
+    if advertised <= DEFAULT_RCV_BUF as u32 {
+        return TestResult::Fail("the grown receive window was never advertised");
+    }
+
+    // SO_RCVBUF (SOCK_RCVBUF_LOCK) pins the buffer through the same traffic.
+    let locked = established(local, 7_902, peer, 80);
+    if core::set_buffer_limits(locked, None, Some(2 * DEFAULT_RCV_BUF as u32)).is_err() {
+        return TestResult::Fail("SO_RCVBUF was rejected");
+    }
+    for _ in 0..2 {
+        let _ = stream_and_read(locked, local, peer, 7_902, 100);
+    }
+    let (limit, measured) =
+        __with_tcb(locked, |t| (t.recv_buf.limit, t.rcv_space.space)).unwrap_or((0, 0));
+    if limit != DEFAULT_RCV_BUF {
+        return TestResult::Fail("autotuning resized a buffer the application locked");
+    }
+    if measured == 0 {
+        return TestResult::Fail("a locked buffer stopped the consumption measurement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_receive_buffer_autotunes_past_default
+);
+
+/// The upload half of the same defect: the 256 KiB send buffer bounds the
+/// flight whatever the congestion window. Linux `tcp_sndbuf_expand` gives a
+/// writer that filled its buffer room for twice the window, up to
+/// `tcp_wmem[2]`, unless `SO_SNDBUF` fixed the size.
+fn smoke_send_buffer_expands_with_congestion_window() -> TestResult {
+    use crate::tcp::socket_buf::DEFAULT_SND_BUF;
+    let local = [10, 92, 0, 1];
+    let peer = reset("sndtune0", local);
+    let data = vec![0x33u8; DEFAULT_SND_BUF + 4096];
+    for (port, lock) in [(7_911u16, false), (7_912, true)] {
+        let id = established(local, port, peer, 80);
+        if lock && core::set_buffer_limits(id, Some(DEFAULT_SND_BUF as u32), None).is_err() {
+            return TestResult::Fail("SO_SNDBUF was rejected");
+        }
+        let _ = __with_tcb_mut(id, |t| {
+            t.opts.peer_wscale = 7;
+            t.snd_wnd = 65_535 << 7;
+            t.cong.cwnd = 1 << 20;
+        });
+        if send(id, &data) != Ok(DEFAULT_SND_BUF) {
+            return TestResult::Fail("the writer did not fill the default send buffer");
+        }
+        let _ = drain();
+        // The peer acknowledges part of the flight with its window open.
+        let rcv_nxt = __with_tcb(id, |t| t.rcv_nxt).unwrap_or(0);
+        inject(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: port,
+            seq: rcv_nxt,
+            ack: 0x10000 + 100_000,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[],
+        });
+        let limit = __with_tcb(id, |t| t.send_buf.limit).unwrap_or(0);
+        if lock {
+            if limit != DEFAULT_SND_BUF {
+                return TestResult::Fail("autotuning resized a send buffer the application locked");
+            }
+        } else if !(2 << 20..=4_194_304).contains(&limit) {
+            return TestResult::Fail(
+                "a full send buffer did not expand to twice the congestion window",
+            );
+        }
+        let _ = drain();
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_send_buffer_expands_with_congestion_window
+);
+
+// ── Transmit backpressure (`crate::txq`) ────────────────────────────────
+
+use crate::txq::{TxBackpressure, TxQueue, TxQueueGeometry, TxRefusal};
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+
+/// Makes the ordinary transmit hook refuse, as a device with no descriptor
+/// left does.
+static CAPTURE_REFUSES: ::core::sync::atomic::AtomicBool =
+    ::core::sync::atomic::AtomicBool::new(false);
+
+fn refusable_send(frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
+    if CAPTURE_REFUSES.load(::core::sync::atomic::Ordering::SeqCst) {
+        return Err(());
+    }
+    capture_send(frame, meta)
+}
+
+#[derive(Debug, Default)]
+struct FakeRing {
+    /// Posted, not yet transmitted.
+    held: VecDeque<Vec<u8>>,
+    /// Transmitted, in order.
+    wire: Vec<Vec<u8>>,
+}
+
+const FAKE_RING_LEN: u32 = 16;
+
+/// A TCP segment and the addresses it travels between: `(src, dst, bytes)`.
+type PeerSegment = ([u8; 4], [u8; 4], Vec<u8>);
+
+/// A one-queue device with a 16-descriptor ring that speaks the transmit
+/// driver contract: one descriptor per frame, stop below 2 free, wake at 4.
+#[derive(Debug)]
+struct FakeNic {
+    queue: Arc<TxQueue>,
+    ring: IrqSafeSpinLock<FakeRing>,
+    /// A connection to resume from inside the next transmit, the way an
+    /// acknowledgement processed during the send re-enters the sender.
+    reenter: ::core::sync::atomic::AtomicU32,
+    /// Refuse, once, the frame that starts at this sequence number.
+    refuse_seq: ::core::sync::atomic::AtomicU32,
+    /// A segment `(src, dst, bytes)` the peer delivers during that refusal:
+    /// after the device said no, before the sender takes its lock again.
+    on_refuse: IrqSafeSpinLock<Option<PeerSegment>>,
+}
+
+impl FakeNic {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: TxQueue::new(TxQueueGeometry {
+                ring_len: FAKE_RING_LEN,
+                max_frame_descs: 2,
+            }),
+            ring: IrqSafeSpinLock::new(FakeRing::default()),
+            reenter: ::core::sync::atomic::AtomicU32::new(0),
+            refuse_seq: ::core::sync::atomic::AtomicU32::new(0),
+            on_refuse: IrqSafeSpinLock::new(None),
+        })
+    }
+    fn free(ring: &FakeRing) -> u32 {
+        FAKE_RING_LEN - 1 - ring.held.len() as u32
+    }
+    fn post(&self, frame: &[u8]) -> Result<(), TxRefusal> {
+        let seq = tcp_parts(frame).0;
+        if self
+            .refuse_seq
+            .compare_exchange(
+                seq,
+                0,
+                ::core::sync::atomic::Ordering::SeqCst,
+                ::core::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.queue.refused();
+            let delivered = self.on_refuse.lock().take();
+            if let Some((src, dst, segment)) = delivered {
+                handle_segment(src, dst, &segment);
+            }
+            return Err(TxRefusal::Busy);
+        }
+        {
+            let mut ring = self.ring.lock();
+            if self.queue.is_stopped() || Self::free(&ring) == 0 {
+                self.queue.refused();
+                return Err(TxRefusal::Busy);
+            }
+            ring.held.push_back(frame.to_vec());
+            let free = Self::free(&ring);
+            self.queue.sent(frame.len() as u32, || free);
+        }
+        let id = self.reenter.swap(0, ::core::sync::atomic::Ordering::SeqCst);
+        if id != 0 {
+            core::tx_resume(id);
+        }
+        Ok(())
+    }
+    /// The device transmitted up to `n` frames: one reclaim batch.
+    fn complete(&self, n: usize) {
+        let mut ring = self.ring.lock();
+        let mut bytes = 0u64;
+        let mut done = 0u32;
+        while (done as usize) < n {
+            let Some(frame) = ring.held.pop_front() else {
+                break;
+            };
+            bytes += frame.len() as u64;
+            ring.wire.push(frame);
+            done += 1;
+        }
+        let free = Self::free(&ring);
+        self.queue.completed(done, bytes, free);
+    }
+    /// A watchdog reset: whatever the ring held is discarded.
+    fn reset(&self) -> usize {
+        let mut ring = self.ring.lock();
+        let lost = ring.held.len();
+        ring.held.clear();
+        self.queue.reset();
+        lost
+    }
+    fn held(&self) -> Vec<Vec<u8>> {
+        self.ring.lock().held.iter().cloned().collect()
+    }
+    fn wire(&self) -> Vec<Vec<u8>> {
+        self.ring.lock().wire.clone()
+    }
+}
+
+impl TxBackpressure for FakeNic {
+    fn tx_queue_count(&self) -> u16 {
+        1
+    }
+    fn tx_queue(&self, q: u16) -> Option<Arc<TxQueue>> {
+        (q == 0).then(|| self.queue.clone())
+    }
+    fn tx_select_queue(&self, _frame: &[u8]) -> u16 {
+        0
+    }
+    fn tx_link_speed_mbps(&self) -> u32 {
+        0
+    }
+    fn try_xmit(
+        &self,
+        _q: u16,
+        frame: crate::Frame,
+        _meta: crate::TxMeta,
+    ) -> Result<(), TxRefusal> {
+        self.post(frame.payload())
+    }
+    fn try_xmit_copy(&self, _q: u16, frame: &[u8], _meta: crate::TxMeta) -> Result<(), TxRefusal> {
+        self.post(frame)
+    }
+}
+
+/// An established connection whose egress is a [`FakeNic`], with windows
+/// wide enough that only the device limits it.
+fn backpressure_conn(
+    name: &'static str,
+    local: [u8; 4],
+    port: u16,
+) -> (Arc<FakeNic>, u32, [u8; 4]) {
+    CAPTURE_REFUSES.store(false, ::core::sync::atomic::Ordering::SeqCst);
+    core::__reset_for_test();
+    route::__reset_for_test();
+    arp_cache::__reset_for_test();
+    crate::ifaddr::__reset_for_test();
+    CAPTURE.lock().clear();
+    iface::register(name, [0x02, 0, 0, 0, 0, 0x32], refusable_send);
+    iface::set_default_ipv4(local, local);
+    iface::add_addr(name, local, 24);
+    let peer = [local[0], local[1], local[2], 2];
+    let peer_mac = [0x52, 0x54, 0, 0, 0, 1];
+    crate::tcp_stack::__arp_insert_legacy(peer, peer_mac);
+    arp_cache::insert(name, peer, peer_mac);
+    let nic = FakeNic::new();
+    let _ = iface::set_tx_backpressure(name, nic.clone());
+    let id = established(local, port, peer, 80);
+    let _ = __with_tcb_mut(id, |t| {
+        t.opts.peer_wscale = 7;
+        t.snd_wnd = 65_535 << 7;
+        t.cong.cwnd = 1 << 20;
+        t.nagle_enabled = false;
+    });
+    (nic, id, peer)
+}
+
+/// `(sequence, flags, payload)` of a TCP frame.
+fn tcp_parts(f: &[u8]) -> (u32, u8, &[u8]) {
+    let seq = u32::from_be_bytes([
+        f[TCP_OFF + 4],
+        f[TCP_OFF + 5],
+        f[TCP_OFF + 6],
+        f[TCP_OFF + 7],
+    ]);
+    let hdr = ((f[TCP_OFF + 12] >> 4) as usize) * 4;
+    let len = frame_payload_len(f);
+    (seq, frame_flags(f), &f[TCP_OFF + hdr..TCP_OFF + hdr + len])
+}
+
+/// The byte stream `frames` carry from `first_seq`, or `None` if a byte is
+/// missing, repeated or out of order.
+fn stream_of(frames: &[Vec<u8>], first_seq: u32) -> Option<Vec<u8>> {
+    let mut next = first_seq;
+    let mut out = Vec::new();
+    for f in frames {
+        let (seq, _, payload) = tcp_parts(f);
+        if payload.is_empty() {
+            continue;
+        }
+        if seq != next {
+            return None;
+        }
+        out.extend_from_slice(payload);
+        next = next.wrapping_add(payload.len() as u32);
+    }
+    Some(out)
+}
+
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Complete five frames and run the wake pass until `want` payload bytes are
+/// on the wire. False if the connection stalls.
+fn drive_to_wire(nic: &FakeNic, want: usize) -> bool {
+    for _ in 0..2000 {
+        let on_wire: usize = nic.wire().iter().map(|f| frame_payload_len(f)).sum();
+        if on_wire >= want {
+            return true;
+        }
+        nic.complete(5);
+        nic.queue.run_wakeups();
+    }
+    false
+}
+
+/// The defect: a burst larger than the ring. Every segment the device
+/// refuses must stay unsent — not in `snd_nxt`, not in the retransmit queue
+/// — and go out, in order, once completions wake the queue.
+fn smoke_tx_burst_larger_than_ring_waits_and_arrives_in_order() -> TestResult {
+    let (nic, id, _) = backpressure_conn("txbp0", [10, 94, 0, 1], 7_921);
+    let data = pattern(120_000);
+    if send(id, &data) != Ok(data.len()) {
+        return TestResult::Fail("the send buffer did not take the burst");
+    }
+    let held = nic.held();
+    // Stop threshold 2 of 15 usable descriptors: 14 frames, one kept free.
+    if held.len() != 14 || !nic.queue.is_stopped() {
+        return TestResult::Fail("the ring did not stop one worst-case frame short of full");
+    }
+    let taken: usize = held.iter().map(|f| frame_payload_len(f)).sum();
+    let Some((snd_nxt, retx, waiting)) = __with_tcb(id, |t| {
+        (t.snd_nxt, t.retx_queue.len(), t.tx_wait_since_cycles != 0)
+    }) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if snd_nxt != 0x10000u32.wrapping_add(taken as u32) {
+        return TestResult::Fail("a segment the device refused was accounted as sent");
+    }
+    if retx != held.len() {
+        return TestResult::Fail("a refused segment was put in the retransmit queue");
+    }
+    if !waiting {
+        return TestResult::Fail("the connection is not marked as waiting for its queue");
+    }
+    // A wake pass with nothing completed resumes nobody.
+    nic.queue.run_wakeups();
+    if nic.held().len() != held.len() {
+        return TestResult::Fail("sent into a stopped queue");
+    }
+    if !drive_to_wire(&nic, data.len()) {
+        return TestResult::Fail("the connection did not resume after completions");
+    }
+    if stream_of(&nic.wire(), 0x10000).as_deref() != Some(data.as_slice()) {
+        return TestResult::Fail("bytes were lost, repeated or reordered across the wait");
+    }
+    if drain().iter().any(|f| frame_payload_len(f) != 0) {
+        return TestResult::Fail("data bypassed the queue through the dropping hook");
+    }
+    if nic.queue.busy() == 0 || nic.queue.restarts() == 0 {
+        return TestResult::Fail("the ring never pushed back");
+    }
+    if __with_tcb(id, |t| t.tx_wait_since_cycles) != Some(0) {
+        return TestResult::Fail("still marked waiting after everything was sent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_burst_larger_than_ring_waits_and_arrives_in_order
+);
+
+/// The wake pass never runs (a lost wake): the probe timer must resume the
+/// connection on its own.
+fn smoke_tx_wait_probe_recovers_a_lost_wake() -> TestResult {
+    let (nic, id, _) = backpressure_conn("txbp1", [10, 95, 0, 1], 7_922);
+    let data = pattern(120_000);
+    if send(id, &data) != Ok(data.len()) {
+        return TestResult::Fail("the send buffer did not take the burst");
+    }
+    let stopped_with = nic.held().len();
+    // Room again, but nobody runs the wake pass.
+    nic.complete(stopped_with);
+    if !nic.held().is_empty() {
+        return TestResult::Fail("completion alone transmitted");
+    }
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    // The wait began longer ago than the probe interval.
+    let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
+    tick_retransmit(&arc);
+    if nic.held().is_empty() {
+        return TestResult::Fail("a lost wake stalled the connection for good");
+    }
+    if !drive_to_wire(&nic, data.len()) || stream_of(&nic.wire(), 0x10000) != Some(data) {
+        return TestResult::Fail("the stream was not completed in order after the probe");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp/robust", smoke_tx_wait_probe_recovers_a_lost_wake);
+
+/// The review's interleaving. After an RTO the sender is in go-back-N and
+/// `H` is the highest byte ever sent. It marks a segment `[s, e)` with
+/// `s < H < e`, the device refuses it, and before the sender takes its lock
+/// again the peer's ACK for `H` is processed: the retransmit queue empties
+/// and its timer stops. `[H, e)` is then marked sent, was never
+/// transmitted, and nothing covers it. Un-sending must hand it back.
+fn smoke_tx_refusal_with_ack_inside_segment_unsends_the_rest() -> TestResult {
+    let local = [10, 100, 0, 1];
+    let (nic, id, peer) = backpressure_conn("txbp6", local, 7_927);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    let mss = __with_tcb(id, core::send_mss).unwrap_or(0) as usize;
+    if mss < 200 {
+        return TestResult::Fail("unexpected MSS");
+    }
+    let iss = 0x10000u32;
+    // Two and a half segments go out: H is not on a segment boundary.
+    let first = 2 * mss + mss / 2;
+    let data = pattern(first + 3 * mss);
+    if send(id, &data[..first]) != Ok(first) || nic.held().len() != 3 {
+        return TestResult::Fail("the first two and a half segments were not sent");
+    }
+    let high = iss.wrapping_add(first as u32);
+    // RTO: rewind to snd_una and resend the head; snd_nxt = iss + mss < H.
+    let _ = __with_tcb_mut(id, |t| t.retx_deadline_cycles = 1);
+    tick_retransmit(&arc);
+    if __with_tcb(id, |t| (t.snd_nxt, t.snd_high)) != Some((iss.wrapping_add(mss as u32), high)) {
+        return TestResult::Fail("the RTO did not leave the sender in go-back-N below H");
+    }
+    // The RTO collapsed cwnd to one segment, all of it in flight. Recovery
+    // reopens it as ACKs arrive; start from that point, with room to send.
+    let _ = __with_tcb_mut(id, |t| t.cong.cwnd = 1 << 20);
+    // The device will refuse the segment that straddles H, and the peer's
+    // ACK for H arrives during that refusal.
+    nic.refuse_seq.store(
+        iss.wrapping_add(2 * mss as u32),
+        ::core::sync::atomic::Ordering::SeqCst,
+    );
+    *nic.on_refuse.lock() = Some((
+        peer,
+        local,
+        tcp_bytes(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: 7_927,
+            seq: 0x20000,
+            ack: high,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[],
+        }),
+    ));
+    if send(id, &data[first..]) != Ok(3 * mss) {
+        return TestResult::Fail("the send buffer did not take the rest");
+    }
+    if nic.refuse_seq.load(::core::sync::atomic::Ordering::SeqCst) != 0 {
+        return TestResult::Fail("the straddling segment was never offered");
+    }
+    let Some((snd_una, snd_nxt, snd_high, unsent)) = __with_tcb(id, |t| {
+        (t.snd_una, t.snd_nxt, t.snd_high, t.send_buf.unsent_len())
+    }) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if snd_una != high {
+        return TestResult::Fail("the ACK for H was not processed during the refusal");
+    }
+    if snd_nxt != high || unsent != 3 * mss {
+        return TestResult::Fail("bytes past H stayed marked sent though the device refused them");
+    }
+    if snd_high != high {
+        return TestResult::Fail("snd_high still covers bytes that were never transmitted");
+    }
+    // The wake sends them, in order from H, with a timer behind them.
+    nic.complete(FAKE_RING_LEN as usize);
+    nic.queue.run_wakeups();
+    nic.complete(FAKE_RING_LEN as usize);
+    let mut covered = vec![false; data.len()];
+    for f in nic.wire() {
+        let (seq, _, payload) = tcp_parts(&f);
+        let at = seq.wrapping_sub(iss) as usize;
+        for (i, byte) in payload.iter().enumerate() {
+            if data.get(at + i) != Some(byte) {
+                return TestResult::Fail("a transmitted byte does not match the stream");
+            }
+            covered[at + i] = true;
+        }
+    }
+    if covered.iter().any(|sent| !sent) {
+        return TestResult::Fail("part of the stream was never transmitted");
+    }
+    if __with_tcb(id, |t| {
+        t.retx_queue.is_empty() || t.retx_deadline_cycles == 0
+    }) != Some(false)
+    {
+        return TestResult::Fail("the re-sent bytes are covered by no retransmit timer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_refusal_with_ack_inside_segment_unsends_the_rest
+);
+
+/// A watchdog reset empties the ring while a connection waits on it. The
+/// waiter must be released, and the discarded frames must still be owed:
+/// they were sent, so they stay in the retransmit queue for loss recovery.
+fn smoke_tx_reset_releases_waiter_and_keeps_lost_frames_owed() -> TestResult {
+    let (nic, id, _) = backpressure_conn("txbp2", [10, 96, 0, 1], 7_923);
+    if send(id, &pattern(120_000)) != Ok(120_000) {
+        return TestResult::Fail("the send buffer did not take the burst");
+    }
+    let snd_nxt = __with_tcb(id, |t| t.snd_nxt).unwrap_or(0);
+    let lost = nic.reset();
+    if lost == 0 || nic.queue.is_stopped() {
+        return TestResult::Fail("reset left the queue stopped");
+    }
+    if nic.queue.run_wakeups() != 1 {
+        return TestResult::Fail("reset did not release the waiting connection");
+    }
+    let resumed = nic.held();
+    if resumed.is_empty() {
+        return TestResult::Fail("the connection did not resume after the reset");
+    }
+    if tcp_parts(&resumed[0]).0 != snd_nxt {
+        return TestResult::Fail("transmission did not resume at the first unsent byte");
+    }
+    if __with_tcb(id, |t| t.retx_queue.len()) != Some(lost + resumed.len()) {
+        return TestResult::Fail("frames lost in the reset are no longer owed for retransmission");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_reset_releases_waiter_and_keeps_lost_frames_owed
+);
+
+/// A connection torn down while it waits: the wake pass finds no connection
+/// and sends nothing.
+fn smoke_tx_wake_skips_a_connection_closed_while_waiting() -> TestResult {
+    let (nic, id, _) = backpressure_conn("txbp3", [10, 97, 0, 1], 7_924);
+    if send(id, &pattern(120_000)) != Ok(120_000) {
+        return TestResult::Fail("the send buffer did not take the burst");
+    }
+    core::remove_tcb(id);
+    nic.complete(nic.held().len());
+    if nic.queue.run_wakeups() != 1 {
+        return TestResult::Fail("the closed connection was not on the wake list");
+    }
+    if !nic.held().is_empty() {
+        return TestResult::Fail("a closed connection transmitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_wake_skips_a_connection_closed_while_waiting
+);
+
+/// Three things at once: the sender is re-entered from inside the device's
+/// transmit (one pumper at a time, or the stream reorders), a pure ACK is
+/// owed while the data queue is stopped (it must not wait behind the data),
+/// and the FIN attaches to a final segment that is refused and re-offered.
+fn smoke_tx_backpressure_keeps_order_acks_flowing_and_one_fin() -> TestResult {
+    let local = [10, 98, 0, 1];
+    let (nic, id, peer) = backpressure_conn("txbp4", local, 7_925);
+    let data = pattern(60_000);
+    nic.reenter
+        .store(id, ::core::sync::atomic::Ordering::SeqCst);
+    if send(id, &data) != Ok(data.len()) {
+        return TestResult::Fail("the send buffer did not take the burst");
+    }
+    if !nic.queue.is_stopped() {
+        return TestResult::Fail("the ring did not stop");
+    }
+    // Two full segments from the peer call for an immediate ACK.
+    let _ = drain();
+    for i in 0..2u32 {
+        inject(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: 7_925,
+            seq: 0x20000 + i * 1000,
+            ack: 0x10000,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[0x41; 1000],
+        });
+    }
+    if !drain()
+        .iter()
+        .any(|f| frame_payload_len(f) == 0 && frame_flags(f) & FLAG_ACK != 0)
+    {
+        return TestResult::Fail("a pure ACK waited behind the stopped data queue");
+    }
+    // Unread data would turn the close into a reset.
+    let mut sink = vec![0u8; 4096];
+    let _ = recv_errno(id, &mut sink);
+    if close(id).is_err() {
+        return TestResult::Fail("close failed");
+    }
+    if !drive_to_wire(&nic, data.len()) {
+        return TestResult::Fail("the connection did not finish sending");
+    }
+    nic.complete(FAKE_RING_LEN as usize);
+    let wire = nic.wire();
+    if stream_of(&wire, 0x10000) != Some(data) {
+        return TestResult::Fail("re-entrant or re-offered segments broke the stream");
+    }
+    let fins = wire
+        .iter()
+        .filter(|f| frame_flags(f) & FLAG_FIN != 0)
+        .count();
+    let last_has_fin = wire.last().is_some_and(|f| frame_flags(f) & FLAG_FIN != 0);
+    if fins != 1 || !last_has_fin {
+        return TestResult::Fail("the FIN was not sent exactly once, after the data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_backpressure_keeps_order_acks_flowing_and_one_fin
+);
+
+/// A pure ACK the device has no descriptor for is not forgotten: it stays
+/// owed and the delayed-ACK timer sends it (`__tcp_send_ack`'s fallback).
+fn smoke_tx_refused_ack_is_retried_from_delayed_ack_timer() -> TestResult {
+    let local = [10, 99, 0, 1];
+    let (_nic, id, peer) = backpressure_conn("txbp5", local, 7_926);
+    CAPTURE_REFUSES.store(true, ::core::sync::atomic::Ordering::SeqCst);
+    for i in 0..2u32 {
+        inject(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: 7_926,
+            seq: 0x20000 + i * 1000,
+            ack: 0x10000,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[0x42; 1000],
+        });
+    }
+    CAPTURE_REFUSES.store(false, ::core::sync::atomic::Ordering::SeqCst);
+    if __with_tcb(id, |t| t.delayed_ack_deadline_cycles) == Some(0) {
+        return TestResult::Fail("a refused ACK was dropped with no retry armed");
+    }
+    let _ = drain();
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    let _ = __with_tcb_mut(id, |t| t.delayed_ack_deadline_cycles = 1);
+    tick_retransmit(&arc);
+    let acked = drain().iter().any(|f| {
+        frame_payload_len(f) == 0
+            && frame_flags(f) & FLAG_ACK != 0
+            && f[TCP_OFF + 8..TCP_OFF + 12] == (0x20000u32 + 2000).to_be_bytes()
+    });
+    if !acked {
+        return TestResult::Fail("the owed ACK was not sent by the delayed-ACK timer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_refused_ack_is_retried_from_delayed_ack_timer
+);
+
+/// A device that takes nothing — stalled, link down, being reset — refuses
+/// every RTO retransmission. Linux retries those every
+/// TCP_RESOURCE_PROBE_INTERVAL without counting them (`tcp_retransmit_timer`
+/// leaves before `icsk_backoff++`). Counting them reset the connection after
+/// eight probes, 3.5 s into the stall.
+fn smoke_tx_refused_rto_retransmission_is_not_an_attempt() -> TestResult {
+    let (_nic, id, _) = backpressure_conn("txbp7", [10, 101, 0, 1], 7_928);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if send(id, &pattern(1000)) != Ok(1000) {
+        return TestResult::Fail("the segment was not sent");
+    }
+    let before = __with_tcb(id, |t| (t.rtt.rto_ns, t.rtt.backoff_count)).unwrap_or((0, 9));
+    CAPTURE_REFUSES.store(true, ::core::sync::atomic::Ordering::SeqCst);
+    for _ in 0..20 {
+        let _ = __with_tcb_mut(id, |t| t.retx_deadline_cycles = 1);
+        tick_retransmit(&arc);
+    }
+    CAPTURE_REFUSES.store(false, ::core::sync::atomic::Ordering::SeqCst);
+    let now = narf_scheduler::narf_time::now_cycles();
+    let Some((state, estimator, deadline)) = __with_tcb(id, |t| {
+        (
+            t.state,
+            (t.rtt.rto_ns, t.rtt.backoff_count),
+            t.retx_deadline_cycles,
+        )
+    }) else {
+        return TestResult::Fail("refused retransmissions reset the connection");
+    };
+    if state != TcpState::Established {
+        return TestResult::Fail("refused retransmissions closed the connection");
+    }
+    if estimator != before {
+        return TestResult::Fail("a refused retransmission backed the RTO off or was counted");
+    }
+    let probe = narf_scheduler::narf_time::ns_to_cycles(500_000_000);
+    if deadline == 0 || deadline.saturating_sub(now) > probe {
+        return TestResult::Fail("the next probe is not within TCP_RESOURCE_PROBE_INTERVAL");
+    }
+    // Once the device takes it, the retransmission goes out and is counted.
+    let _ = drain();
+    let _ = __with_tcb_mut(id, |t| t.retx_deadline_cycles = 1);
+    tick_retransmit(&arc);
+    if !drain().iter().any(|f| frame_payload_len(f) == 1000) {
+        return TestResult::Fail("the retransmission was not sent once the device took it");
+    }
+    if __with_tcb(id, |t| t.rtt.backoff_count) != Some(before.1 + 1) {
+        return TestResult::Fail("an accepted retransmission was not counted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_refused_rto_retransmission_is_not_an_attempt
+);
+
+// ── Receive batches (`iface::rx_batch`) ─────────────────────────────────
+
+/// An Ethernet ARP request from `peer` for `target`.
+fn arp_request(peer: [u8; 4], target: [u8; 4]) -> Vec<u8> {
+    let mac = [0x52, 0x54, 0, 0, 0, 1];
+    let mut f = vec![0u8; 60];
+    f[..6].fill(0xff);
+    f[6..12].copy_from_slice(&mac);
+    f[12..14].copy_from_slice(&[0x08, 0x06]);
+    f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    f[22..28].copy_from_slice(&mac);
+    f[28..32].copy_from_slice(&peer);
+    f[38..42].copy_from_slice(&target);
+    f
+}
+
+/// A receive poll resolves its interface once: every frame of the batch
+/// reaches the stack with the right device, with one registry lookup, and
+/// the interface counters are folded in when the batch ends.
+fn smoke_rx_batch_resolves_device_once_per_poll() -> TestResult {
+    use ::core::sync::atomic::Ordering;
+    const FRAMES: u64 = 32;
+    let local = [10, 93, 0, 1];
+    let peer = reset("rxbatch0", local);
+    iface::install_native_rx_handler(crate::tcp_stack::rx_handler_native);
+    iface::install_native_rx_resolved_handler(crate::tcp_stack::rx_handler_native_resolved);
+    let counters = || {
+        iface::lookup("rxbatch0").map_or((0, 0), |dev| (dev.stats.rx_packets, dev.stats.rx_bytes))
+    };
+    let before = counters();
+    let lookups = iface::RX_BATCH_LOOKUPS.load(Ordering::Relaxed);
+    {
+        let mut batch = iface::rx_batch("rxbatch0");
+        for _ in 0..FRAMES {
+            batch.receive(&mut arp_request(peer, local), None);
+        }
+        if counters() != before {
+            return TestResult::Fail("interface counters were taken under the lock per frame");
+        }
+    }
+    if iface::RX_BATCH_LOOKUPS.load(Ordering::Relaxed) != lookups + 1 {
+        return TestResult::Fail("the batch looked its interface up more than once");
+    }
+    if counters() != (before.0 + FRAMES, before.1 + FRAMES * 60) {
+        return TestResult::Fail("the batch's frames and bytes were not counted when it ended");
+    }
+    // Each request was answered from this interface: the stack saw the
+    // frames with their ingress device.
+    let replies = drain()
+        .iter()
+        .filter(|f| ethertype(f) == 0x0806 && f[20..22] == [0, 2] && f[28..32] == local)
+        .count();
+    if replies as u64 != FRAMES {
+        return TestResult::Fail("a frame of the batch did not reach the stack with its device");
+    }
+    // An unregistered name still takes the by-name path and counts nothing.
+    let mut unknown = iface::rx_batch("rxbatch-missing");
+    unknown.receive(&mut arp_request(peer, local), None);
+    drop(unknown);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_rx_batch_resolves_device_once_per_poll
+);

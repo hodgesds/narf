@@ -159,11 +159,35 @@ fn smoke_firmware_signed_install_and_tamper() -> TestResult {
     if !matches!(view_of(&cap), Ok(view) if view.bytes == b"abc") {
         return TestResult::Fail("rejected replacement changed the loaded payload");
     }
+    // Invalid staged deployment policy must remain distinguishable from
+    // absence, even though generic discovery skips rejected firmware blobs.
+    const POLICY: &str = "wireless-regulatory.bin";
+    if install(POLICY, b"malformed", &write) != Err(FirmwareError::BadFormat)
+        || !matches!(open(POLICY, &read), Err(FirmwareError::SignatureInvalid))
+    {
+        __reset_for_test();
+        return TestResult::Fail("rejected explicit policy became absent");
+    }
+    if cfg!(feature = "firmware-allow-unsigned")
+        && (install(POLICY, &build_unsigned_blob(b"abc", None), &write).is_err()
+            || !matches!(open(POLICY, &read), Err(FirmwareError::SignatureInvalid)))
+    {
+        __reset_for_test();
+        return TestResult::Fail("unsigned policy cleared signed-policy rejection");
+    }
+    if install(POLICY, &blob, &write).is_err() || open(POLICY, &read).is_err() {
+        __reset_for_test();
+        return TestResult::Fail("valid signed replacement did not clear policy rejection");
+    }
+    __reset_for_test();
     crate::signature::__reset_trusted_signers();
     crate::signature::install_build_trusted_signers();
     TestResult::Pass
 }
-kernel_test_in!("firmware", smoke_firmware_signed_install_and_tamper);
+kernel_test_in!(
+    "firmware/regulatory",
+    smoke_firmware_signed_install_and_tamper
+);
 
 fn smoke_firmware_register_in_tree_lands_in_in_tree_tier() -> TestResult {
     if !cfg!(feature = "firmware-allow-unsigned") {

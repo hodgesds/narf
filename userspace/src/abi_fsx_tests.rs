@@ -4046,7 +4046,7 @@ fn smoke_abi_fsx_fsconfig_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx_fsconfig_pos);
+kernel_test_in!("syscall_abi/mount_api", smoke_abi_fsx_fsconfig_pos);
 
 fn smoke_abi_fsx_fsconfig_reconfigure_vfs_flags_pos() -> TestResult {
     with_setup(|| {
@@ -4112,7 +4112,7 @@ fn smoke_abi_fsx_fsconfig_reconfigure_vfs_flags_pos() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/mount_api",
     smoke_abi_fsx_fsconfig_reconfigure_vfs_flags_pos
 );
 
@@ -4130,7 +4130,7 @@ fn smoke_abi_fsx_fsconfig_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx_fsconfig_neg);
+kernel_test_in!("syscall_abi/mount_api", smoke_abi_fsx_fsconfig_neg);
 
 fn smoke_abi_fsx_fsmount_pos() -> TestResult {
     with_setup(|| {

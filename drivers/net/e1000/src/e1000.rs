@@ -901,7 +901,7 @@ impl TxRingCursor {
     fn stalled(&self, now: u64, timeout: u64) -> bool {
         self.posted_at
             .iter()
-            .any(|&posted| posted != 0 && now.wrapping_sub(posted) > timeout)
+            .any(|&posted| posted != 0 && now.saturating_sub(posted) > timeout)
     }
 
     fn ticket_was_reused(&self, ticket: TxTicket) -> bool {
@@ -974,6 +974,45 @@ pub struct RxDesc {
 }
 
 const _: () = assert!(core::mem::size_of::<RxDesc>() == 16);
+
+impl RxDesc {
+    /// Sample an RX ring slot the device may be completing right now.
+    /// `word(i)` reads little-endian qword `i` of the 16-byte slot.
+    ///
+    /// The device writes the descriptor back while the host polls it, so a
+    /// sample must never pair a fresh DD with fields of the slot's previous
+    /// contents. Qword 1 carries length, checksum, status (with DD), errors
+    /// and the VLAN tag: it is taken first and as ONE load, so a set DD
+    /// always comes with the length and error bits written with it. Qword 0
+    /// (the buffer address) is loaded only after DD was seen. `None` means
+    /// "not completed": nothing else of the slot was read. Linux
+    /// `e1000_clean_rx_irq` does the same: it tests `rx_desc->status`, then
+    /// `dma_rmb()`, then reads the length.
+    ///
+    /// A whole-struct `read_volatile` gives no such order: the compiler
+    /// lowers it to separate field loads in an order of its choosing, and
+    /// `length` sits before `status`, so a DD posted between the two loads
+    /// showed the re-armed slot's zero length under it.
+    #[inline]
+    fn sample(mut word: impl FnMut(usize) -> u64) -> Option<Self> {
+        let upper = word(1);
+        let status = (upper >> 32) as u8;
+        if status & RXD_STAT_DD == 0 {
+            return None;
+        }
+        // Pair the device's DD write with the loads that follow it.
+        compiler_fence(Ordering::SeqCst);
+        let addr = word(0);
+        Some(Self {
+            addr,
+            length: upper as u16,
+            csum: (upper >> 16) as u16,
+            status,
+            errors: (upper >> 40) as u8,
+            special: (upper >> 48) as u16,
+        })
+    }
+}
 
 // ── Descriptor offload helpers ───────────────────────────────────────
 
@@ -3310,13 +3349,7 @@ impl E1000 {
         let mut dropped = 0usize;
         loop {
             let desc_addr = ring_phys + (head * 16) as u64;
-            // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
-            let desc = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>(),
-                )
-            };
-            if desc.status & RXD_STAT_DD == 0 {
+            let Some(desc) = self.rx_completed_desc(head) else {
                 // Ring empty. If drops were consumed above, hand those
                 // descriptors back before returning; otherwise RDT is
                 // already at the last freed slot.
@@ -3330,7 +3363,7 @@ impl E1000 {
                     *head_g = head as u32;
                 }
                 return 0;
-            }
+            };
             if let Some(reason) = rx_drop_reason(&desc) {
                 count_rx_drop(self.ifname(), reason);
                 // Rearm the dropped descriptor: clear status, leave
@@ -3435,15 +3468,9 @@ impl E1000 {
         let limit = budget.min(RX_RING_LEN);
         while drained < limit {
             let desc_addr = ring_phys + (head * 16) as u64;
-            // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
-            let desc = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>(),
-                )
-            };
-            if desc.status & RXD_STAT_DD == 0 {
+            let Some(desc) = self.rx_completed_desc(head) else {
                 break;
-            }
+            };
             // Verdict gate: dropped frames are re-armed and counted
             // below exactly like delivered ones (so `drained` still
             // counts consumed descriptors and the single RDT doorbell
@@ -3535,6 +3562,23 @@ impl E1000 {
     /// consumed (a frame delivered to `f`, or a verdict-dropped frame).
     pub fn rx_recv_in_place<F: FnMut(&mut [u8])>(&self, f: F) -> bool {
         self.rx_drain_in_place(1, f) != 0
+    }
+
+    /// The completed write-back of RX slot `slot`, or `None` while the
+    /// device still owns it. DD-first, see [`RxDesc::sample`].
+    fn rx_completed_desc(&self, slot: usize) -> Option<RxDesc> {
+        debug_assert!(slot < RX_RING_LEN);
+        RxDesc::sample(|word| {
+            // SAFETY: coherent RX ring mapped for the controller's lifetime;
+            // `slot < RX_RING_LEN` at every caller and `word` is 0 or 1, so
+            // the aligned qword lies inside descriptor `slot`.
+            u64::from_le(unsafe {
+                core::ptr::read_volatile(
+                    self.rx_ring
+                        .cpu_ptr_at::<u64>((slot * 16 + word * 8) as u64),
+                )
+            })
+        })
     }
 
     /// `true` if at least one RX descriptor has its DD bit set.
@@ -6511,4 +6555,65 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/e1000", smoke_rctl_bsize_lpe_follows_mtu);
+
+    fn smoke_e1000_rx_desc_sample_never_mixes_occupants() -> TestResult {
+        // A re-armed RX slot holds its buffer address with length, status
+        // and errors zeroed until the device writes the descriptor back,
+        // and the host may be sampling the slot at that moment. Model the
+        // device posting the WHOLE write-back after each possible number of
+        // host loads. Whatever the interleaving, a sample that reports DD
+        // must be the write-back in full: with the re-armed slot's fields
+        // under a fresh DD the driver delivers a zero-length frame.
+        const ARMED_ADDR: u64 = 0x0000_0001_2345_6000;
+        const NEW_ADDR: u64 = 0x0000_0001_2345_7000;
+        // SDM §3.2.3 legacy RX descriptor qword 1: length at bytes 8..9,
+        // checksum 10..11, status 12 (DD bit 0, EOP bit 1), errors 13,
+        // special (VLAN tag) 14..15.
+        let old = [ARMED_ADDR, 0u64];
+        let new = [
+            NEW_ADDR,
+            0x05EAu64 | (0xC5C5 << 16) | (0x03 << 32) | (0x20 << 40) | (0x0123 << 48),
+        ];
+
+        for post_after in 0..=2usize {
+            let slot = core::cell::Cell::new(old);
+            let loads = core::cell::Cell::new(0usize);
+            let sampled = RxDesc::sample(|word| {
+                if loads.get() == post_after {
+                    slot.set(new);
+                }
+                loads.set(loads.get() + 1);
+                slot.get()[word]
+            });
+            let Some(desc) = sampled else {
+                // Not completed yet: the driver polls again.
+                if post_after == 0 {
+                    return TestResult::Fail("a write-back posted before the sample read as armed");
+                }
+                if loads.get() != 1 {
+                    return TestResult::Fail("an incomplete slot was read past its status word");
+                }
+                continue;
+            };
+            if loads.get() != 2 {
+                return TestResult::Fail("a completed sample is not exactly two qword loads");
+            }
+            if desc.length != 0x05EA
+                || desc.csum != 0xC5C5
+                || desc.status != 0x03
+                || desc.errors != 0x20
+                || desc.special != 0x0123
+            {
+                return TestResult::Fail("fresh DD sampled with a stale length or error field");
+            }
+            if desc.addr != NEW_ADDR {
+                return TestResult::Fail("fresh DD sampled with the re-armed slot's qword 0");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000",
+        smoke_e1000_rx_desc_sample_never_mixes_occupants
+    );
 }

@@ -96,7 +96,8 @@ pub fn request_display_format(display: u8, format: u32) -> bool {
 }
 /// Whether display `display` can scan out a `format` plane in `mode` (its
 /// current one when None) on its routed connector, or `connector`.
-/// Navi22 has nothing to admit beyond its plane formats.
+/// Navi22 has nothing to admit beyond its plane formats (which
+/// [`display_admits_planes`] checks for every CRTC a commit touches).
 pub fn display_admits_format(
     display: u8,
     connector: Option<u32>,
@@ -144,25 +145,53 @@ pub fn present_damaged(
         )
     }
 }
-/// DRM's planes on display `display`'s CRTC (Navi48 only: Navi22 exposes
-/// no overlays or plane placement).
+/// DRM's planes on display `display`'s CRTC. Navi48 relights the display
+/// with them (DC's full update); Navi22's presenter takes each plane's
+/// placement with its frame, so there is nothing to stage and the request
+/// is accepted as it is.
 pub fn request_display_planes(display: u8, setup: crate::amdgpu_navi48_boot::PlaneSetup) -> bool {
-    !navi22() && crate::amdgpu_navi48_platform::request_display_planes(display, setup)
+    navi22() || crate::amdgpu_navi48_platform::request_display_planes(display, setup)
 }
-/// Whether display `display` can light the planes `setup` with its
-/// primary in `fourcc` (see `amdgpu_navi48_platform::display_admits_planes`).
+/// The refusal text for a plane configuration Navi48's DML refuses.
+pub const PLANES_REFUSED: &str =
+    "DC refuses the CRTC's primary and overlay planes together (dc_validate_global_state)";
+/// Whether display `display` can light `planes` (its primary in
+/// `planes.primary_format`, see
+/// `amdgpu_navi48_platform::display_admits_planes` and
+/// `amdgpu_navi22_plane::admit`): dc_validate_global_state for one CRTC.
+/// The error is the refusal trace's `why=` text.
+///
+/// `mode` is the timing the request itself sets on the CRTC, if any
+/// (Navi48 plans the planes on it); `active` is the CRTC's active size
+/// after the request — that timing's, else the committed mode's — which
+/// Navi22 compares with its lit stream: a plane placed for a mode the
+/// display is not showing yet is validated by the modeset that lights it,
+/// whether or not this request is the one carrying the MODE_ID.
 pub fn display_admits_planes(
     display: u8,
     connector: Option<u32>,
     mode: Option<&DrmModeModeInfo>,
-    fourcc: u32,
-    setup: &crate::amdgpu_navi48_boot::PlaneSetup,
-) -> bool {
+    active: Option<(u32, u32)>,
+    planes: &crate::drm_native_planes::DisplayPlanes,
+) -> Result<(), &'static str> {
+    if navi22() {
+        return crate::amdgpu_navi22_platform::planes_admitted(display, active, planes);
+    }
+    crate::amdgpu_navi48_platform::display_admits_planes(
+        display,
+        connector,
+        mode,
+        planes.primary_format,
+        &planes.setup,
+    )
+    .map_err(|_| PLANES_REFUSED)
+}
+/// Whether the HDMI output format search ([`output_formats_supported`])
+/// also admits the output's planes, so a CRTC driving HDMI needs no
+/// separate [`display_admits_planes`]. Navi48's search plans the planes
+/// with each candidate format; Navi22's validates the stream alone.
+pub fn output_search_admits_planes() -> bool {
     !navi22()
-        && crate::amdgpu_navi48_platform::display_admits_planes(
-            display, connector, mode, fourcc, setup,
-        )
-        .is_ok()
 }
 /// DC's validation of a positioned or scaled primary of an `fb` (pitch in
 /// bytes, width, height) on a CRTC of `mode` (Navi22's lit stream; other
@@ -175,7 +204,10 @@ pub fn primary_placement_admitted(
 ) -> bool {
     !navi22() || crate::amdgpu_navi22_platform::placement_admitted(fb, mode, src, dst)
 }
-/// Present an atomic commit's planes on display `display` (Navi48).
+/// Present an atomic commit's planes on display `display`. Navi22 shows
+/// its primary (with the frame's placement); an overlay frame is never
+/// admitted there ([`display_admits_planes`]), and one that arrives
+/// anyway completes its event without being shown.
 pub fn present_planes(
     display: u8,
     primary: Option<crate::amdgpu_navi48_platform::PlaneFrame>,

@@ -178,6 +178,10 @@ vendor-quirk paths also consult explicitly cited upstream Linux GPL sources.
 
 ## Public interface
 
+`btusb_quirks::identify` includes the MT7922 USB alias `0e8d:0616`.
+Selecting the MediaTek family requires USB setup to verify runtime chip/ROM
+identity and complete firmware/protocol enable before generic HCI commands.
+
 - `controller::bring_up_all(cap)` runs the mandatory synchronous HCI sequence
   for transports registered before the Stage::Late bring-up initcall.
 - `h5_transport::H5Transport` implements `HciTransport` over a

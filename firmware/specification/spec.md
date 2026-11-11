@@ -94,6 +94,29 @@ firmware files cannot add trust roots. These are public keys only.
 `target/firmware/NAME`. Omitting both signing arguments retains the unsigned
 developer format. Signing/private-key custody happens outside xtask.
 
+Linux wireless regulatory data uses its existing upstream signature rather
+than this Ed25519 firmware format. The build requires the OpenSSL CLI and
+verifies the bundled unmodified `regdb/regulatory.db` against its detached
+PKCS#7 `regulatory.db.p7s`, using only the bundled Linux `sforshee` and `wens`
+public certificates. Input signature certificates cannot introduce trust
+roots. `NARF_WIRELESS_REGDB` may name an absolute directory containing a
+replacement database/signature pair; missing, oversized, malformed or
+untrusted input fails the build without fallback. Verification snapshots
+the bytes before checking them, and those exact bytes are embedded in the
+kernel. This check remains mandatory with `firmware-allow-unsigned`.
+No private key, re-signing, network fetch or host-country inference occurs.
+Database updates require a rebuild; runtime PKCS#7/rootfs updates are not
+implemented. Wireless owns decoding, conservative rule projection, country
+selection and current-policy enforcement.
+
+Discovery/install rejection of the exact `wireless-regulatory.bin` name is
+remembered: subsequent opens return `SignatureInvalid`, rather than absence
+that would enable a default-policy fallback. Only a later successful signed
+installation clears this rejection; unsigned developer blobs cannot clear it.
+This does not revoke previously issued blob capabilities or automatically
+replace an already active wireless policy; its trusted owner must clear or
+replace that live installation under the existing wireless lifecycle rules.
+
 1. **Caps in, bytes out.** A driver requests `Cap<FirmwareBlob,
    Read>` by canonical name; the registry returns either the
    cap or `NotFound`. The driver never sees a path, never
@@ -132,6 +155,11 @@ developer format. Signing/private-key custody happens outside xtask.
    `narf_drivers::record_bound`-style inventory hooks.
 
 ## 4. Public API surface
+
+`linux_regulatory_database() -> &'static [u8]` exposes the immutable,
+build-authenticated Linux wireless-regdb v20 database. It does not grant
+transmit permission or register a mutable firmware blob. Runtime files and
+firmware-registry writes cannot replace this kernel asset or its trust roots.
 
 ```rust
 /// A loaded firmware blob, addressable by canonical name. Holds a

@@ -264,15 +264,19 @@ fn kms_linear_card_with_overlays_takes_gem_nv12() -> TestResult {
     let Ok(object) = f.object() else {
         return TestResult::Fail("linear BO");
     };
-    // One BO for both planes (amdgpu_dm's one-BO rule): 64x12 luma at
-    // offset 0, 32x6 chroma at offset 768, both at pitch 64.
+    // One BO for both planes (amdgpu_dm's one-BO rule): 64x8 luma at
+    // offset 0, 32x4 chroma at offset 2048. amdgpu_display_verify_sizes
+    // gives a LINEAR plane 256-byte blocks (block_width = 256 / cpp,
+    // block_size_log2 = 8), so amdgpu_display_verify_plane takes only a
+    // pitch and an offset that are multiples of 256: 8 luma rows and 4
+    // chroma rows of 256 bytes are 3072 bytes of the 4096-byte BO.
     let cmd = crate::amdgpu_dm_modifiers::FbCmd {
         width: 64,
-        height: 12,
+        height: 8,
         pixel_format: crate::amdgpu_dm_modifiers::NV12,
         handles: [1, 1, 0, 0],
-        pitches: [64, 64, 0, 0],
-        offsets: [0, 768, 0, 0],
+        pitches: [256, 256, 0, 0],
+        offsets: [0, 2048, 0, 0],
         ..Default::default()
     };
     let before = f.mode.lock().framebuffers.len();
@@ -287,8 +291,20 @@ fn kms_linear_card_with_overlays_takes_gem_nv12() -> TestResult {
         let record = c.framebuffer(fb).unwrap();
         (record.offsets, record.chroma_pitch, record.modifier)
     };
-    if offsets != [0, 768] || chroma_pitch != 64 || modifier != 0 {
+    if offsets != [0, 2048] || chroma_pitch != 256 || modifier != 0 {
         return TestResult::Fail("GEM NV12 planes not recorded");
+    }
+    // The pitch a 64-byte luma row would fit is no multiple of the block
+    // pitch: Linux refuses it (amdgpu_display_verify_plane, -EINVAL).
+    let mut narrow = cmd;
+    narrow.pitches = [64, 64, 0, 0];
+    narrow.offsets = [0, 768, 0, 0];
+    if f.mode
+        .lock()
+        .addfb2_bo(&narrow, object.clone(), MASTER)
+        .is_ok()
+    {
+        return TestResult::Fail("linear NV12 pitch below the 256-byte block accepted");
     }
     // A tiled modifier is still refused on the linear card.
     let mut tiled = cmd;
@@ -1116,4 +1132,221 @@ fn kms_sync_allocation_reclaims_visible_vram_with_borrowed_admission() -> TestRe
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     kms_sync_allocation_reclaims_visible_vram_with_borrowed_admission
+);
+
+/// Navi22 as it publishes itself: a native linear 8888 primary per CRTC
+/// under two native overlays, and a cursor plane per CRTC. An atomic
+/// commit's primary framebuffer is a prepare_fb target
+/// (amdgpu_dm_plane_helper_prepare_fb pins every plane's buffer), and a
+/// positioned primary's SRC and CRTC rectangles reach the presenter with
+/// its frame (amdgpu_dm_plane_fill_dc_scaling_info). The request is KWin's
+/// on a screen showing only the pointer: the pointer image on the primary
+/// at the pointer position, overlays and cursor plane off.
+fn kms_linear_native_primary_keeps_target_and_placement() -> TestResult {
+    let Ok(f) = Fixture::new(4) else {
+        return TestResult::Fail("fixture");
+    };
+    {
+        let mut c = f.mode.lock();
+        c.driver_name = "amdgpu";
+        c.gfx12_modifiers = false;
+        c.native_planes = crate::drm_native_planes::dcn30_planes_for(&[], &[CRTC]);
+        c.overlay_formats = Some(&crate::amdgpu_navi48_kms::PLANE_FORMATS);
+        c.plane_formats = Some(&[DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888]);
+        if synthesized_primaries(&c) || !crate::drm_native_planes::is_dcn30(&c) {
+            return TestResult::Fail("fixture publishes no native DCN30 primary");
+        }
+    }
+    let Ok(object) = f.object() else {
+        return TestResult::Fail("BO");
+    };
+    let Ok(fb) = f.fb(object.clone(), MASTER, false) else {
+        return TestResult::Fail("ADDFB2");
+    };
+    let overlays = crate::drm_native_planes::overlay_ids(&f.mode.lock());
+    let cursor = crate::drm_native_planes::cursor_ids(&f.mode.lock())[0];
+    // obj69{IN_FENCE_FD=-1 FB_ID=0 CRTC_ID=0} obj68{..} obj70{..}
+    // obj64{CRTC_H CRTC_W CRTC_Y CRTC_X SRC_H SRC_W SRC_Y SRC_X
+    // IN_FENCE_FD FB_ID CRTC_ID}: a 32x12 view at CRTC (16, 0) of the
+    // 64x12 mode.
+    let off = [
+        PLANE_IN_FENCE_FD_PROP_ID,
+        PLANE_FB_ID_PROP_ID,
+        PLANE_CRTC_ID_PROP_ID,
+    ];
+    let mut props: Vec<u32> = Vec::new();
+    let mut values: Vec<u64> = Vec::new();
+    for _ in 0..3 {
+        props.extend_from_slice(&off);
+        values.extend_from_slice(&[u64::MAX, 0, 0]);
+    }
+    props.extend_from_slice(&[
+        PLANE_CRTC_H_PROP_ID,
+        PLANE_CRTC_W_PROP_ID,
+        PLANE_CRTC_Y_PROP_ID,
+        PLANE_CRTC_X_PROP_ID,
+        PLANE_SRC_H_PROP_ID,
+        PLANE_SRC_W_PROP_ID,
+        PLANE_SRC_Y_PROP_ID,
+        PLANE_SRC_X_PROP_ID,
+        PLANE_IN_FENCE_FD_PROP_ID,
+        PLANE_FB_ID_PROP_ID,
+        PLANE_CRTC_ID_PROP_ID,
+    ]);
+    values.extend_from_slice(&[
+        12,
+        32,
+        0,
+        16,
+        12 << 16,
+        32 << 16,
+        0,
+        0,
+        u64::MAX,
+        u64::from(fb),
+        u64::from(CRTC),
+    ]);
+    let request = atomic(
+        &[overlays[1], overlays[0], cursor, PRIMARY],
+        &[3, 3, 3, 11],
+        &props,
+        &values,
+    );
+    if !one_target(&request, &f.mode.lock(), &object) {
+        return TestResult::Fail("primary's framebuffer is no prepare_fb target");
+    }
+    if request.validate(f.index, &f.mode, MASTER, None).is_err() {
+        return TestResult::Fail("positioned primary refused");
+    }
+    let mut state = crate::drm::atomic::AtomicState::default();
+    state.planes.push(crate::drm::atomic::PlaneState {
+        id: PRIMARY,
+        crtc_id: Some(CRTC),
+        fb_id: Some(fb),
+        crtc_x: 16,
+        crtc_y: 0,
+        crtc_w: 32,
+        crtc_h: 12,
+        src_x: 0,
+        src_y: 0,
+        src_w: 32,
+        src_h: 12,
+        ..Default::default()
+    });
+    let mode = f.mode.lock().crtcs[0].mode;
+    let mode_of = move |_: u32| mode;
+    let frame = |state: &crate::drm::atomic::AtomicState| {
+        let card = f.mode.lock();
+        let planes = crate::drm_native_planes::check(&card, state, mode_of).ok()?;
+        let frame = crate::drm_ioctl_bridge::scanout_frame(&card, card.framebuffer(fb).ok()?)?;
+        Some(placed_primary_frame(&card, frame, planes.first()?))
+    };
+    let Some(placed) = frame(&state) else {
+        return TestResult::Fail("positioned primary has no frame");
+    };
+    if placed.placement
+        != Some(crate::drm::card::Placement {
+            src: (0, 0, 32, 12),
+            dst: (16, 0, 32, 12),
+        })
+    {
+        return TestResult::Fail("positioned primary lost its placement");
+    }
+    drop(placed);
+    // The full screen unscaled is no placement.
+    state.planes[0].crtc_x = 0;
+    state.planes[0].crtc_w = 64;
+    state.planes[0].src_w = 64;
+    if frame(&state).is_none_or(|f| f.placement.is_some()) {
+        return TestResult::Fail("full-screen primary reported a placement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    kms_linear_native_primary_keeps_target_and_placement
+);
+
+/// The display's plane admission is asked about the CRTC's active size
+/// after the request, whether or not the request carries the MODE_ID:
+/// Navi22 plans a positioned primary only against the stream it has lit,
+/// and after a modeset to another size (KScreen's saved resolution, say)
+/// the compositor's next commits — the pointer image on the primary, the
+/// cursor plane off with a GAMMA_LUT — name no mode at all while the
+/// display still shows the old one. Judged against the old stream, their
+/// placement would be refused ("Atomic commit failed" in KWin) although
+/// the modeset that lights the new mode is what validates it.
+fn kms_plane_admission_sees_the_committed_mode() -> TestResult {
+    let Ok(f) = Fixture::new(4) else {
+        return TestResult::Fail("fixture");
+    };
+    let card = f.mode.lock();
+    // The request does not name the CRTC: its committed 64x12 mode.
+    let mut state = crate::drm::atomic::AtomicState::default();
+    if crtc_size_after(&card, &state, CRTC) != Some((64, 12)) {
+        return TestResult::Fail("committed mode not used for an untouched CRTC");
+    }
+    // The request sets another mode: that one.
+    state.crtcs.push(crate::drm::atomic::CrtcState {
+        id: CRTC,
+        enable: true,
+        active: true,
+        mode: Some(crate::Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            bpp: 32,
+        }),
+        ..Default::default()
+    });
+    if crtc_size_after(&card, &state, CRTC) != Some((1920, 1080)) {
+        return TestResult::Fail("the request's mode not used");
+    }
+    // The request switches the CRTC off, or names no CRTC of the card.
+    state.crtcs[0].mode = None;
+    if crtc_size_after(&card, &state, CRTC).is_some()
+        || crtc_size_after(&card, &state, CRTC + 1).is_some()
+    {
+        return TestResult::Fail("a CRTC without a mode has an active size");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    kms_plane_admission_sees_the_committed_mode
+);
+
+/// A commit the check accepts is one the presenter shows
+/// (dc_validate_global_state admits what dc_commit_streams programs): an
+/// overlay on a CRTC driving HDMI skips the display's own admission only
+/// where the HDMI format search plans the planes itself (Navi48). Navi22's
+/// search validates the stream alone and its presenter shows no overlay
+/// yet, so its display is still asked and the overlay is refused, on HDMI
+/// as on DisplayPort; the compositor then composites onto the primary.
+fn kms_hdmi_planes_admitted_by_whoever_plans_them() -> TestResult {
+    // Navi22 on HDMI: the display decides, and refuses.
+    if planes_admitted(true, false, || false) {
+        return TestResult::Fail("HDMI overlay admitted with no plane admission at all");
+    }
+    if !planes_admitted(true, false, || true) {
+        return TestResult::Fail("HDMI overlay refused though its display admits it");
+    }
+    // Navi48 on HDMI: the format search decides; the display is not asked.
+    let mut asked = false;
+    if !planes_admitted(true, true, || {
+        asked = true;
+        false
+    }) || asked
+    {
+        return TestResult::Fail("HDMI format search did not decide the planes");
+    }
+    // Any other output: the display decides.
+    if planes_admitted(false, true, || false) || !planes_admitted(false, false, || true) {
+        return TestResult::Fail("non-HDMI planes not decided by their display");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    kms_hdmi_planes_admitted_by_whoever_plans_them
 );

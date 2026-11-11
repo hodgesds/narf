@@ -371,15 +371,15 @@ fn smoke_abi_remount_new_api_libmount_sequence_pos() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/mount_api",
     smoke_abi_remount_new_api_libmount_sequence_pos
 );
 
 /// `reconfigure_super`'s `if (fc->sb_flags_mask & ~MS_RMT_MASK) return
 /// -EINVAL;` — `dirsync` is a superblock key `vfs_parse_sb_flag` accepts at
-/// SET time, but a reconfiguration may not change it — and a parameter the
-/// filesystem does not know fails the reconfigure too. The superblock stays
-/// read-write in both cases.
+/// SET time, but a reconfiguration may not change it — and a parameter
+/// tmpfs does not know is refused when it is set, before any reconfigure.
+/// The superblock stays read-write in both cases.
 fn smoke_abi_remount_new_api_rejects_neg() -> TestResult {
     with_setup(|| {
         let target = b"/abi-remount-api-neg\0";
@@ -420,19 +420,22 @@ fn smoke_abi_remount_new_api_rejects_neg() -> TestResult {
             _ => return finish(Err("second fspick(path) failed"), &fds),
         };
         fds.push(second);
-        if fsconfig(second, FSCONFIG_SET_FLAG, Some(b"ro\0"), None) != Some(0)
-            || fsconfig(
-                second,
-                FSCONFIG_SET_STRING,
-                Some(b"bogus_option\0"),
-                Some(b"1\0"),
-            ) != Some(0)
-        {
-            return finish(Err("fsconfig SET_FLAG/SET_STRING setup failed"), &fds);
+        if fsconfig(second, FSCONFIG_SET_FLAG, Some(b"ro\0"), None) != Some(0) {
+            return finish(Err("fsconfig SET_FLAG ro must be accepted"), &fds);
         }
-        if fsconfig(second, FSCONFIG_CMD_RECONFIGURE, None, None) != Some(EINVAL) {
+        // tmpfs parses each parameter as it is set (`vfs_parse_fs_param` ->
+        // `shmem_parse_one`), in the reconfigure phase as in the create
+        // phase: the unknown key is -EINVAL from the SET call itself, and no
+        // reconfigure is issued for it.
+        if fsconfig(
+            second,
+            FSCONFIG_SET_STRING,
+            Some(b"bogus_option\0"),
+            Some(b"1\0"),
+        ) != Some(EINVAL)
+        {
             return finish(
-                Err("an unknown tmpfs parameter must fail the reconfigure"),
+                Err("an unknown tmpfs parameter must be -EINVAL when it is set"),
                 &fds,
             );
         }
@@ -455,4 +458,7 @@ fn smoke_abi_remount_new_api_rejects_neg() -> TestResult {
         finish(Ok(()), &fds)
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_remount_new_api_rejects_neg);
+kernel_test_in!(
+    "syscall_abi/mount_api",
+    smoke_abi_remount_new_api_rejects_neg
+);

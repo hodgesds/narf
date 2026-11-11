@@ -124,6 +124,7 @@ unsafe extern "C" {
         probe: usize,
     ) -> i32;
     fn narf_printk(ptr: *const u8, len: usize) -> i32;
+    fn narf_pci_prepare_probe(dev: u64) -> i32;
     fn narf_pci_enable(dev: u64, cmd_bits: u16) -> i32;
     fn narf_bar_map(dev: u64, bar_idx: u8) -> u64;
     fn narf_mmio_read32(dev: u64, bar: u64, off: u64, out: *mut u32) -> i32;
@@ -275,7 +276,15 @@ fn init_dma_rings(state: &DeviceState, dev: u64, bar: u64) -> Result<(), i32> {
         RX_RING_LEN,
     )
     .map_err(|_| -5)?;
-    super::hardware::enable_data(&regs).map_err(|_| -5)?;
+    super::hardware::activate_queues(&regs, &[RX_RING_LEN], || {
+        // SAFETY: all programmed rings and buffers belong to this retained
+        // context. The ABI verifies the Command readback before activation.
+        if unsafe { narf_pci_enable(dev, PCI_CMD_BUS_MASTER) } != 0 {
+            return Err(super::protocol::IgcError::Other("PCI DMA enable rejected"));
+        }
+        Ok(())
+    })
+    .map_err(|_| -5)?;
     state.tx_ring.store(tx_ring, Ordering::Relaxed);
     state.rx_ring.store(rx_ring, Ordering::Relaxed);
     state.tx_tail.store(0, Ordering::Relaxed);
@@ -369,6 +378,20 @@ fn poll_receive(state: &DeviceState, dev: u64, bar: u64) -> i32 {
     let frame_ptr = frame.as_mut_ptr().cast::<u8>();
     for _ in 0..RX_RING_LEN {
         let head = state.rx_head.load(Ordering::Relaxed) as usize % RX_RING_LEN;
+        // DD first, as one byte load. The 16-byte copy below is a `memcpy`
+        // whose load order is unspecified; taken while the device may still
+        // be completing the slot it can pair a fresh DD with the armed
+        // slot's length. Copy the descriptor only once DD says it is whole
+        // (Linux: DD test, `dma_rmb()`, then the rest).
+        let mut status = 0u8;
+        // SAFETY: byte 8 of the descriptor slot is inside the retained
+        // ring; `status` is one writable byte.
+        if unsafe { narf_dma_read(dev, ring, (head * DESC_LEN + 8) as u64, &mut status, 1) } != 0 {
+            return -5;
+        }
+        if status & RXD_STAT_DD == 0 {
+            break;
+        }
         let mut desc = [0u8; DESC_LEN];
         // SAFETY: descriptor slot is inside the retained ring.
         if unsafe {
@@ -456,13 +479,17 @@ fn probe_device(dev_token: u64, gigabit: bool) -> i32 {
     };
     // SAFETY: C-ABI kernel export; `dev_token` is the call-gated handle this
     // probe was invoked with.
-    if unsafe { narf_pci_enable(dev_token, PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER) } != 0 {
-        return -5; // -EIO
+    if unsafe { narf_pci_prepare_probe(dev_token) } != 0 {
+        return -5;
     }
     // SAFETY: C-ABI kernel export; BAR 0 belongs to `dev_token`.
     let bar0 = unsafe { narf_bar_map(dev_token, 0) };
     if bar0 == 0 {
         return -5;
+    }
+    // SAFETY: BAR sizing/mapping completed with decode and mastering parked.
+    if unsafe { narf_pci_enable(dev_token, PCI_CMD_MEM_SPACE) } != 0 {
+        return -5; // -EIO
     }
 
     let regs = ModuleRegisters {
@@ -663,6 +690,11 @@ struct ModuleRegisters {
     bar: u64,
 }
 impl super::hardware::Registers for ModuleRegisters {
+    fn note(&self, message: &'static str) {
+        log("igc(.ko): ");
+        log(message);
+        log("\n");
+    }
     fn read(&self, reg: u64) -> u32 {
         mmio_read(self.dev, self.bar, reg).unwrap_or(u32::MAX)
     }

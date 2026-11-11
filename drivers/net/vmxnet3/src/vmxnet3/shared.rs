@@ -424,6 +424,39 @@ pub struct Vmxnet3TxCompDesc {
 const _: () = assert!(core::mem::size_of::<Vmxnet3TxCompDesc>() == 16);
 
 impl Vmxnet3TxCompDesc {
+    /// Sample a completion-ring slot the device may be writing right
+    /// now. `dword(i)` reads raw (little-endian, unconverted) dword `i`
+    /// of the 16-byte slot.
+    ///
+    /// The device posts a completion while the driver polls the slot,
+    /// so a sample must never pair the current generation bit with
+    /// fields of the slot's previous occupant. Dword 3 carries `gen`:
+    /// it is taken first and as ONE load; the other dwords are loaded
+    /// only after `gen` matched `expected_gen`, when the whole entry is
+    /// in place. `None` means "not written yet": nothing else of the
+    /// slot was read. Linux `vmxnet3_tq_tx_complete` does the same: it compares
+    /// `gen`, then `dma_rmb()`, then reads the rest.
+    ///
+    /// A whole-struct `read_volatile` gives no such order: the compiler
+    /// lowers it to separate field loads in an order of its choosing,
+    /// and loading `dword0` before `dword3` shows the previous pass's
+    /// `txdIdx` under a generation bit posted between the two loads.
+    #[inline]
+    pub fn sample(expected_gen: u32, mut dword: impl FnMut(usize) -> u32) -> Option<Self> {
+        let dword3 = dword(3);
+        if (u32::from_le(dword3) >> super::regs::TCD_GEN_SHIFT) & 1 != expected_gen & 1 {
+            return None;
+        }
+        // Pair the device's completion write with the loads that follow.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        Some(Self {
+            dword0: dword(0),
+            ext2: dword(1),
+            ext3: dword(2),
+            dword3,
+        })
+    }
+
     /// Index of the EOP TX descriptor this completion frees
     /// (`vmxnet3_defs.h`: `txdIdx:12` at dword0 bits[11:0]).
     pub const fn txd_idx(self) -> u32 {
@@ -459,6 +492,39 @@ pub struct Vmxnet3RxCompDesc {
 const _: () = assert!(core::mem::size_of::<Vmxnet3RxCompDesc>() == 16);
 
 impl Vmxnet3RxCompDesc {
+    /// Sample a completion-ring slot the device may be writing right
+    /// now. `dword(i)` reads raw (little-endian, unconverted) dword `i`
+    /// of the 16-byte slot.
+    ///
+    /// The device posts a completion while the driver polls the slot,
+    /// so a sample must never pair the current generation bit with
+    /// fields of the slot's previous occupant. Dword 3 carries `gen`:
+    /// it is taken first and as ONE load; the other dwords are loaded
+    /// only after `gen` matched `expected_gen`, when the whole entry is
+    /// in place. `None` means "not written yet": nothing else of the
+    /// slot was read. Linux `vmxnet3_rq_rx_complete` does the same: it compares
+    /// `gen`, then `dma_rmb()`, then reads the rest.
+    ///
+    /// A whole-struct `read_volatile` gives no such order: the compiler
+    /// lowers it to separate field loads in an order of its choosing,
+    /// and loading `dword0` before `dword3` shows the previous pass's
+    /// `rxdIdx` / `len` under a generation bit posted between the two loads.
+    #[inline]
+    pub fn sample(expected_gen: u32, mut dword: impl FnMut(usize) -> u32) -> Option<Self> {
+        let dword3 = dword(3);
+        if (u32::from_le(dword3) >> super::regs::RCD_GEN_SHIFT) & 1 != expected_gen & 1 {
+            return None;
+        }
+        // Pair the device's completion write with the loads that follow.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        Some(Self {
+            dword0: dword(0),
+            rssHash: dword(1),
+            dword2: dword(2),
+            dword3,
+        })
+    }
+
     /// Index of the RX descriptor holding the received bytes
     /// (`vmxnet3_defs.h`: `rxdIdx:12` at dword0 bits[11:0]).
     pub const fn rxd_idx(self) -> u32 {

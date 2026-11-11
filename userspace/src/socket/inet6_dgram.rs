@@ -188,6 +188,7 @@ fn enqueue6_local(target: &SocketFile, pkt: DgramPacket6, gso: Option<u16>) {
                 traffic_class: pkt.traffic_class,
                 payload: chunk.to_vec(),
                 gso_size: 0,
+                tstamp_ns: pkt.tstamp_ns,
             },
         );
     }
@@ -524,6 +525,9 @@ impl SocketFile {
                 ip_ttl: options.ip_ttl.min(255) as u8,
                 ip_tos: options.ip_tos.min(255) as u8,
                 ip_pmtudisc: options.ext.ip_pmtudisc,
+                // A v4-mapped bind pins the IPv4 source just as AF_INET
+                // does. Wildcard binds still use the route's primary.
+                ip_src_override: mapped_v4(&local).filter(|source| *source != [0; 4]),
                 sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
                 // `udp_sendmsg` checks `sk_no_check_tx` (SO_NO_CHECK), not
                 // UDP_NO_CHECK6_TX, for a v4-mapped destination.
@@ -651,6 +655,7 @@ impl SocketFile {
                     traffic_class: options.ext.ipv6_tclass as u8,
                     payload: buf.to_vec(),
                     gso_size: 0,
+                    tstamp_ns: super::rx_tstamp_now_ns(),
                 },
                 gso,
             );
@@ -718,6 +723,7 @@ impl SocketFile {
                         traffic_class: options.ext.ipv6_tclass as u8,
                         payload: buf.to_vec(),
                         gso_size: 0,
+                        tstamp_ns: super::rx_tstamp_now_ns(),
                     },
                     gso,
                 );
@@ -789,6 +795,7 @@ impl SocketFile {
                     hop_limit: packet.hop_limit,
                     traffic_class: packet.traffic_class,
                     gso_size: packet.gso_size,
+                    tstamp_ns: packet.tstamp_ns,
                 });
                 if !peek {
                     inbox.pop_front();
@@ -866,6 +873,7 @@ pub(super) fn deliver_wire(
                     traffic_class: meta.tos,
                     payload: payload.to_vec(),
                     gso_size: 0,
+                    tstamp_ns: super::rx_tstamp_now_ns(),
                 },
             );
         }
@@ -899,6 +907,7 @@ pub(super) fn deliver_wire(
         traffic_class: meta.tos,
         payload: payload.to_vec(),
         gso_size: 0,
+        tstamp_ns: super::rx_tstamp_now_ns(),
     });
     *rmem += charge;
     target.dgram_readiness.set(narf_filesystem::POLL_IN, 0);

@@ -22,6 +22,9 @@ mod ap;
 pub(crate) mod ap_tests;
 #[path = "iface_monitor.rs"]
 mod monitor;
+#[cfg(any(test, feature = "builtin"))]
+#[path = "iface_nm_tests.rs"]
+mod nm_tests;
 #[path = "iface_p2p.rs"]
 pub(crate) mod p2p;
 #[path = "iface_p2p_go.rs"]
@@ -698,6 +701,27 @@ pub async fn system_resume() -> Result<(), WirelessError> {
     }
 }
 
+/// Kernel-log lines [`note_failure`] may still print this boot.
+static FAILURE_NOTES: AtomicU32 = AtomicU32::new(24);
+
+/// Name the stage and native error behind a failed scan or association.
+/// cfg80211 reports only NL80211_CMD_SCAN_ABORTED or a CONNECT status code to
+/// userspace, and the `WirelessError` this driver returns folds every
+/// firmware/transport error into a handful of classes, so without this line
+/// a hardware boot cannot tell a regulatory refusal from an MCU timeout.
+/// Operator-driven and bounded for the boot.
+fn note_failure(stage: &str, error: &dyn core::fmt::Debug) {
+    if FAILURE_NOTES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+    {
+        use core::fmt::Write;
+        let _ = writeln!(narf_console::Writer, "mt76: {stage} failed: {error:?}");
+    }
+}
+
 fn transmit_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())
         && bytes[6..12] == local
@@ -1075,12 +1099,15 @@ impl WirelessNetIface for Mt76Iface {
         }
         let result = async {
             use crate::mt7921::firmware_transport::{scan_boot_with_options, Error, ScanOptions};
-            let map_error = |error| match error {
-                Error::Bounds => WirelessError::InvalidArgs,
-                Error::Busy => WirelessError::Busy,
-                Error::Timeout => WirelessError::Timeout,
-                Error::Authority => WirelessError::Denied,
-                _ => WirelessError::HardwareError,
+            let map_error = |error: Error| {
+                note_failure("scan", &error);
+                match error {
+                    Error::Bounds => WirelessError::InvalidArgs,
+                    Error::Busy => WirelessError::Busy,
+                    Error::Timeout => WirelessError::Timeout,
+                    Error::Authority => WirelessError::Denied,
+                    _ => WirelessError::HardwareError,
+                }
             };
             let mut found = Vec::new();
             if !channels.is_empty() {
@@ -1162,25 +1189,34 @@ impl WirelessNetIface for Mt76Iface {
         if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
-        let six = self.validate_join(&req)?;
-        self.finish_teardown(true).await?;
+        let six = self
+            .validate_join(&req)
+            .inspect_err(|error| note_failure("associate: join validation", error))?;
+        self.finish_teardown(true)
+            .await
+            .inspect_err(|error| note_failure("associate: previous-link teardown", error))?;
         if self.link_up() {
             return Err(WirelessError::Busy);
         }
         let security = core::mem::replace(&mut req.security, narf_wireless::SecurityConfig::Open);
-        let (bss, security) = self.resolve_join(&req, security, six)?;
+        let (bss, security) = self
+            .resolve_join(&req, security, six)
+            .inspect_err(|error| note_failure("associate: BSS/security resolution", error))?;
         {
             use crate::mt7921::firmware_transport::{associate_boot_station_as, Error};
             // Stable under `control`: SET_INTERFACE also takes that lock.
             let p2p_client = self.current_iftype() == 8;
             let aid = associate_boot_station_as(&bss, &req.ssid, security, &req.ie, p2p_client)
                 .await
-                .map_err(|error| match error {
-                    Error::Bounds => WirelessError::InvalidArgs,
-                    Error::Busy => WirelessError::Busy,
-                    Error::Timeout => WirelessError::Timeout,
-                    Error::Authority => WirelessError::Denied,
-                    _ => WirelessError::HardwareError,
+                .map_err(|error| {
+                    note_failure("associate: firmware join/handshake", &error);
+                    match error {
+                        Error::Bounds => WirelessError::InvalidArgs,
+                        Error::Busy => WirelessError::Busy,
+                        Error::Timeout => WirelessError::Timeout,
+                        Error::Authority => WirelessError::Denied,
+                        _ => WirelessError::HardwareError,
+                    }
                 })?;
             let _ = aid;
             let (tx_prod, tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
@@ -1494,6 +1530,19 @@ pub(crate) fn register_scan_iface_profile(
     };
     *iface.registration_cap.lock() = Some(cap);
     *ACTIVE.lock() = Some(iface.clone());
+    narf_net::iface::set_device_control(
+        &iface.name,
+        Arc::new(EthtoolControl(Arc::downgrade(&iface))),
+    );
+    let version = info.firmware.version;
+    let end = version
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(version.len());
+    narf_net::iface::set_driver_fw_version(
+        &iface.name,
+        String::from_utf8_lossy(&version[..end]).into_owned(),
+    );
     narf_wireless::registry::register(iface.clone());
     narf_net::iface::install_rx_drain(drain_network);
     let worker = iface.clone();
@@ -1551,6 +1600,56 @@ fn send_frame(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
 fn drain_network() -> bool {
     let iface = ACTIVE.lock().clone();
     iface.is_some_and(|iface| iface.drain_network().unwrap_or(false))
+}
+
+/// Read-only diagnostics retain the exact radio publication, never a name
+/// that could be reused by a reprobed device. No MCU command runs here.
+#[derive(Debug)]
+struct EthtoolControl(alloc::sync::Weak<Mt76Iface>);
+impl EthtoolControl {
+    fn with_live<T>(
+        &self,
+        f: impl FnOnce(&Mt76Iface) -> narf_net::nic::Result<T>,
+    ) -> narf_net::nic::Result<T> {
+        let iface = self.0.upgrade().ok_or(19)?;
+        let active = ACTIVE.lock();
+        if !active.as_ref().is_some_and(|a| Arc::ptr_eq(a, &iface)) {
+            return Err(19);
+        }
+        f(&iface)
+    }
+}
+impl narf_net::iface::DeviceControl for EthtoolControl {
+    fn configure(&self, _: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        Err(95)
+    }
+    fn nic(&self) -> Option<&dyn narf_net::nic::NicControl> {
+        Some(self)
+    }
+}
+impl narf_net::nic::NicControl for EthtoolControl {
+    fn permanent_mac(&self) -> narf_net::nic::Result<[u8; 6]> {
+        self.with_live(|iface| Ok(iface.radio.capabilities.mac))
+    }
+    fn statistics(&self) -> narf_net::nic::Result<Vec<narf_net::nic::Statistic>> {
+        self.with_live(|iface| {
+            let stats = narf_net::iface::lookup(&iface.name).ok_or(19)?.stats;
+            Ok([
+                ("rx_packets", stats.rx_packets),
+                ("rx_bytes", stats.rx_bytes),
+                ("rx_dropped", stats.rx_drop),
+                ("tx_packets", stats.tx_packets),
+                ("tx_bytes", stats.tx_bytes),
+                ("tx_dropped", stats.tx_drop),
+            ]
+            .into_iter()
+            .map(|(name, value)| narf_net::nic::Statistic {
+                name: String::from(name),
+                value,
+            })
+            .collect())
+        })
+    }
 }
 
 struct RegisteredIface(Arc<Mt76Iface>);
@@ -1701,6 +1800,55 @@ mod tests {
             narf_net::iface::unregister(&self.name);
         }
     }
+    fn mt76_ethtool_uses_current_radio_publication() -> TestResult {
+        use narf_net::nic::NicControl;
+        if ACTIVE.lock().is_some() {
+            return TestResult::Skip("live MT76 interface owns registration slot");
+        }
+        let info = radio();
+        let name = narf_net::iface::register("mt76-ethtool%d", info.capabilities.mac, reject);
+        let iface = Arc::new(Mt76Iface::new(name.clone(), info).unwrap());
+        let _fixture = RepeatedRegistration {
+            iface: iface.clone(),
+            name: name.clone(),
+        };
+        let control = EthtoolControl(Arc::downgrade(&iface));
+        {
+            let mut active = ACTIVE.lock();
+            if active.is_some() {
+                return TestResult::Skip("live MT76 interface owns registration slot");
+            }
+            *active = Some(iface.clone());
+        }
+        narf_net::iface::set_device_control(
+            &name,
+            Arc::new(EthtoolControl(Arc::downgrade(&iface))),
+        );
+        let mut perm = [0u8; 14];
+        perm[..4].copy_from_slice(&0x20u32.to_ne_bytes());
+        perm[4..8].copy_from_slice(&6u32.to_ne_bytes());
+        if narf_net::ethtool::execute(&name, &mut perm).is_err()
+            || perm[8..] != info.capabilities.mac
+        {
+            return TestResult::Fail("MT76 ethtool permanent MAC not wired");
+        }
+        if control.statistics().is_err()
+            || control.settings() != Err(95)
+            || control.timestamp_info() != (0x1a, 1, 1)
+        {
+            return TestResult::Fail("MT76 diagnostics unavailable or invented wired capabilities");
+        }
+        *ACTIVE.lock() = None;
+        if control.permanent_mac() != Err(19) || control.statistics().err() != Some(19) {
+            return TestResult::Fail("removed MT76 radio still accepted ethtool diagnostics");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/mt7921/ethtool",
+        mt76_ethtool_uses_current_radio_publication
+    );
+
     fn mt76_repeat_scan_registration_preserves_same_associated_owner_and_admin() -> TestResult {
         if ACTIVE.lock().is_some() {
             return TestResult::Skip("live MT76 interface owns registration slot");

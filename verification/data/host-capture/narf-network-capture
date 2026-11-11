@@ -1,0 +1,123 @@
+#!/usr/bin/bash
+# Read-only native network evidence, independent of the graphical capture.
+# --once is also useful for collecting a Linux baseline before rebooting.
+umask 077
+export LC_ALL=C
+case "${1-}" in
+    '') samples=13 ;;
+    --once) samples=1 ;;
+    *) printf 'usage: %s [--once]\n' "$0" >&2; exit 2 ;;
+esac
+
+# Alternate roots allow the host regression to model an unbound radio without
+# querying the host's real interfaces. Installed collection uses /sys and /proc.
+sysroot=${NARF_CAPTURE_SYSFS_ROOT:-/sys}
+procroot=${NARF_CAPTURE_PROCFS_ROOT:-/proc}
+
+query() {
+    local result
+    printf '\nquery:'
+    printf ' %q' "$@"
+    printf '\n'
+    timeout --kill-after=1s 3s "$@"
+    result=$?
+    printf 'query-exit: %d\n' "$result"
+    # Unsupported ioctls and stuck netlink/D-Bus queries must not prevent
+    # later counters or NetworkManager evidence from being collected.
+    return 0
+}
+
+snapshot() {
+    local round=$1 device iface field path class
+    printf '\n===== network sample %d =====\n' "$round"
+    printf 'uptime: %s\n' "$(<"$procroot/uptime")"
+    for field in dev route arp packet udp; do
+        path=$procroot/net/$field
+        [ -r "$path" ] || continue
+        printf '\n%s:\n%s\n' "$path" "$(<"$path")"
+    done
+    if ((round == 0)); then
+        query lspci -tv
+        # Resolve the same family and discovery operations NetworkManager
+        # uses before creating a Wi-Fi device. None of these requests starts
+        # a scan, changes the radio, or installs regulatory policy.
+        query genl ctrl get name nl80211
+        query iw dev
+        query iw phy
+        query iw reg get
+    fi
+    # Include bridges: forwarding/command state belongs to the DMA path too.
+    # Record endpoints even when a probe failed before netdev publication.
+    for device in "$sysroot"/bus/pci/devices/*; do
+        [ -r "$device/class" ] || continue
+        class=$(<"$device/class")
+        case "$class" in 0x02*|0x0604*) ;; *) continue ;; esac
+        printf '\npci: %s\n' "${device##*/}"
+        for field in vendor device revision power_state current_link_speed current_link_width; do
+            path=$device/$field
+            [ -r "$path" ] && printf '%s: %s\n' "$field" "$(<"$path")"
+        done
+        if [ -L "$device/driver" ]; then
+            printf 'driver: %s\n' "$(readlink "$device/driver")"
+        else
+            printf 'driver: unbound\n'
+        fi
+        if ((round == 0)); then
+            query lspci -vvxxx -s "${device##*/}"
+        fi
+    done
+    for device in "$sysroot"/class/net/*; do
+        [ -d "$device" ] || continue
+        iface=${device##*/}
+        printf '\ninterface: %s\n' "$iface"
+        printf 'device: %s\n' "$(readlink -f "$device/device" 2>/dev/null)"
+        for field in ifindex address type uevent flags operstate carrier mtu speed duplex; do
+            path=$device/$field
+            [ -r "$path" ] && printf '%s: %s\n' "$field" "$(<"$path")"
+        done
+        for path in "$device"/statistics/*; do
+            [ -r "$path" ] && printf '%s: %s\n' "${path##*/}" "$(<"$path")"
+        done
+        [ "$iface" = lo ] && continue
+        # NARF supports the legacy SIOCETHTOOL ABI; use it directly instead
+        # of depending on newer ethtool generic-netlink negotiation.
+        query ethtool --disable-netlink "$iface"
+        if [ "${seen[$iface]-}" != 1 ]; then
+            if [ -e "$device/phy80211" ] || [ -d "$device/wireless" ] \
+                || [[ "$(cat "$device/uevent" 2>/dev/null)" == *'DEVTYPE=wlan'* ]]; then
+                printf 'phy80211: %s\n' "$(readlink -f "$device/phy80211" 2>/dev/null)"
+                for field in index name macaddress; do
+                    path=$device/phy80211/$field
+                    [ -r "$path" ] && printf 'phy-%s: %s\n' "$field" "$(<"$path")"
+                done
+                query iw dev "$iface" info
+            fi
+            query ethtool --disable-netlink -i "$iface"
+            query ethtool --disable-netlink -l "$iface"
+            query ethtool --disable-netlink -g "$iface"
+            query ethtool --disable-netlink -x "$iface"
+            query ethtool --disable-netlink -k "$iface"
+            seen[$iface]=1
+        fi
+        query ethtool --disable-netlink -S "$iface"
+        # Includes hardware ring heads/tails and accumulated counters. Never
+        # request self-tests, renegotiation, EEPROM writes or link changes.
+        if ((round % 4 == 0)); then
+            query ethtool --disable-netlink -d "$iface"
+        fi
+    done
+    query ip -br address
+    query ip -4 route show
+    query ip neigh show
+    query nmcli -t -f DEVICE,TYPE,STATE device status
+    query journalctl -b --no-pager -o short-monotonic -n 100 \
+        -u NetworkManager.service -u wpa_supplicant.service
+}
+
+declare -A seen=()
+started=$SECONDS
+for ((round=0; round<samples; round++)); do
+    snapshot "$round" 2>&1
+    ((round + 1 < samples && SECONDS - started < 180)) || break
+    sleep 15
+done

@@ -1331,7 +1331,8 @@ impl TxPermission {
         center160: Option<u8>,
     ) -> Option<Self> {
         use narf_wireless::reg::RegFlags;
-        if !domain.country_code.iter().all(u8::is_ascii_uppercase) {
+        if domain.country_code != *b"00" && !domain.country_code.iter().all(u8::is_ascii_uppercase)
+        {
             return None;
         }
         let primary = super::channel::frequency(channel)?;
@@ -1373,9 +1374,18 @@ impl TxPermission {
         // A permissive wide rule cannot erase a restrictive overlapping rule.
         if domain.rules.iter().filter(overlaps).any(|rule| {
             // WMM_ETSI is a constraint this owner applies to EDCA
-            // (`wmm_rule`), not a transmit prohibition.
-            rule.flags.bits() & !(RegFlags::NO_P2P | RegFlags::WMM_ETSI).bits() != 0
+            // (`wmm_rule`), not a transmit prohibition. AUTO_BW and
+            // NO_160MHZ only shape the usable bandwidth (cfg80211
+            // `reg_get_max_bandwidth`): AUTO_BW could widen a channel across
+            // a rule boundary, which this owner never does — the block must
+            // fit one rule's own bandwidth below — and NO_160MHZ closes
+            // 160 MHz alone. Neither forbids transmitting: every U-NII-1 and
+            // U-NII-3 rule of the US domain carries AUTO-BW.
+            let shaping =
+                RegFlags::NO_P2P | RegFlags::WMM_ETSI | RegFlags::AUTO_BW | RegFlags::NO_160MHZ;
+            rule.flags.bits() & !shaping.bits() != 0
                 || rule.max_bandwidth_mhz < width
+                || width == 160 && rule.flags.contains(RegFlags::NO_160MHZ)
         }) {
             return None;
         }

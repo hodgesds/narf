@@ -847,6 +847,14 @@ pub trait WirelessDriver: Driver {
 
 ## 3. Queue Management (Access Categories)
 
+MT76's registered station installs a read-only `DeviceControl::nic()` adapter.
+Ettool can read its permanent MAC and the existing netdev packet/byte/drop
+counters; GDRVINFO includes the firmware version actually returned by the MCU.
+The adapter retains a weak reference to the exact active radio publication and
+refuses stale/removal generations. Wired controls, register/EEPROM writes and
+self-tests without a native implementation return EOPNOTSUPP.
+
+
 802.11 traffic is prioritized into four Access Categories (AC). Drivers must map these to hardware rings:
 
 | Access Category | Description | Priority |

@@ -1,6 +1,8 @@
 //! Linux ethtool ioctl wire codec. All user access and CAP_NET_ADMIN checks
 //! remain in userspace/; this bounded codec calls native device controls.
 use crate::nic::{self, LinkSettings, Pause};
+pub(crate) mod features;
+mod genl;
 
 fn get(b: &[u8], at: usize) -> u32 {
     u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
@@ -17,14 +19,14 @@ pub fn header_size(cmd: u32) -> Option<usize> {
         0x01 | 0x02 => 44,
         0x05 | 0x06 => 20,
         0x04 => 12,
-        0x07 | 0x08 | 0x27 | 0x28 => 8,
+        0x07 | 0x08 | 0x25..=0x28 | 0x3a | 0x3b => 8,
         0x20 => 8,
         0x0b | 0x0c => 16,
         0x09 => 4,
         0x0e | 0x0f => 92,
         0x10 | 0x11 | 0x3c | 0x3d => 36,
         0x12 | 0x13 => 16,
-        0x14 | 0x16 | 0x18 | 0x1e | 0x23 | 0x2b | 0x2d => 8,
+        0x14..=0x19 | 0x1e | 0x1f | 0x21..=0x24 | 0x2b..=0x2d => 8,
         0x1b => 12,
         0x1d => 8,
         0x1a => 16,
@@ -64,9 +66,9 @@ pub fn request_size(header: &[u8]) -> nic::Result<usize> {
         0x1b => (get(header, 8) as usize).checked_mul(32).ok_or(22)?,
         0x1d => (get(header, 4) as usize).checked_mul(8).ok_or(22)?,
         0x1a => (get(header, 12) as usize).checked_mul(8).ok_or(22)?,
-        0x37 => {
-            (u64::from_ne_bytes(header[8..16].try_into().unwrap()) & 7).count_ones() as usize * 4
-        }
+        0x37 => u64::from_ne_bytes(header[8..16].try_into().unwrap()).count_ones() as usize * 4,
+        0x3a => (get(header, 4) as usize).checked_mul(16).ok_or(22)?,
+        0x3b => (get(header, 4) as usize).checked_mul(8).ok_or(22)?,
         0x38 | 0x39 => {
             let size = get(header, 4) as usize;
             if size > 128 {
@@ -110,6 +112,84 @@ fn native_modes(bits: u32) -> u32 {
 }
 
 pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
+    execute_with_result(name, b).map(|_| ())
+}
+
+/// Linux SFEATURES returns a nonnegative status bitmap, not just zero.
+pub fn execute_with_result(name: &str, b: &mut [u8]) -> nic::Result<u32> {
+    if request_size(b)? != b.len() {
+        return Err(22);
+    }
+    if let Some(result) = features::legacy(name, b)? {
+        return Ok(result);
+    }
+    match get(b, 0) {
+        0x37 => {
+            let mask = u64::from_ne_bytes(b[8..16].try_into().unwrap());
+            let mut supported = 0u64;
+            let mut at = 16;
+            for id in 0..64 {
+                if mask & (1u64 << id) == 0 {
+                    continue;
+                }
+                match strings(Some(name), id) {
+                    Ok(names) => {
+                        supported |= 1u64 << id;
+                        put(b, at, names.len() as u32);
+                        at += 4;
+                    }
+                    Err(95) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            put64(b, 8, supported);
+            return Ok(0);
+        }
+        0x1b => {
+            let names = strings(Some(name), get(b, 4))?;
+            let requested = get(b, 8) as usize;
+            if requested != 0 && requested < names.len() {
+                return Err(22);
+            }
+            put(b, 8, names.len() as u32);
+            b[12..].fill(0);
+            for (i, name) in names.iter().take(requested).enumerate() {
+                let text = name.as_bytes();
+                let n = text.len().min(31);
+                b[12 + i * 32..12 + i * 32 + n].copy_from_slice(&text[..n]);
+            }
+            return Ok(0);
+        }
+        _ => {}
+    }
+    execute_device(name, b).map(|_| 0)
+}
+
+fn strings(name: Option<&str>, id: u32) -> nic::Result<alloc::vec::Vec<alloc::string::String>> {
+    use alloc::string::String;
+    if id == 4 {
+        return Ok(features::NAMES.iter().map(|s| String::from(*s)).collect());
+    }
+    if let Some(names) = genl::global_strings(id) {
+        return Ok(names.iter().map(|s| String::from(*s)).collect());
+    }
+    nic::with_control(name.ok_or(95)?, |d| match id {
+        0 => Ok(d
+            .diagnostics(false)?
+            .into_iter()
+            .map(|t| String::from(t.name))
+            .collect()),
+        1 => Ok(d.statistics()?.into_iter().map(|s| s.name).collect()),
+        2 => Ok(d
+            .priv_flag_names()
+            .iter()
+            .map(|s| String::from(*s))
+            .collect()),
+        _ => Err(95),
+    })
+}
+
+fn execute_device(name: &str, b: &mut [u8]) -> nic::Result<()> {
     let size = request_size(b)?;
     if b.len() != size {
         return Err(22);
@@ -238,73 +318,15 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                 return Ok(());
             }
             0x09 => return driver.restart_link(),
-            0x1b | 0x1d | 0x37 => {
-                if cmd == 0x1b && get(b, 4) == 0 {
-                    let diagnostics = driver.diagnostics(false)?;
-                    let requested = get(b, 8) as usize;
-                    if requested != 0 && requested < diagnostics.len() {
-                        return Err(22);
-                    }
-                    put(b, 8, diagnostics.len() as u32);
-                    for (i, d) in diagnostics.iter().take(requested).enumerate() {
-                        let name = d.name.as_bytes();
-                        let n = name.len().min(31);
-                        b[12 + i * 32..12 + i * 32 + n].copy_from_slice(&name[..n]);
-                    }
-                    return Ok(());
-                }
-                if cmd == 0x1b && get(b, 4) == 2 {
-                    let names = driver.priv_flag_names();
-                    let requested = get(b, 8) as usize;
-                    if requested != 0 && requested < names.len() {
-                        return Err(22);
-                    }
-                    put(b, 8, names.len() as u32);
-                    for (i, name) in names.iter().take(requested).enumerate() {
-                        let text = name.as_bytes();
-                        let n = text.len().min(31);
-                        b[12 + i * 32..12 + i * 32 + n].copy_from_slice(&text[..n]);
-                    }
-                    return Ok(());
-                }
+            0x1d => {
                 let stats = driver.statistics()?;
-                let count = stats.len() as u32;
-                if cmd == 0x37 {
-                    let mask = u64::from_ne_bytes(b[8..16].try_into().unwrap());
-                    put64(b, 8, mask & 7);
-                    let mut at = 16;
-                    if mask & 1 != 0 {
-                        put(b, at, driver.diagnostics(false)?.len() as u32);
-                        at += 4;
-                    }
-                    if mask & 2 != 0 {
-                        put(b, at, count);
-                        at += 4;
-                    }
-                    if mask & 4 != 0 {
-                        put(b, at, driver.priv_flag_names().len() as u32);
-                    }
-                    return Ok(());
-                }
-                let requested = get(b, if cmd == 0x1b { 8 } else { 4 });
-                if requested != 0 && requested < count {
+                let requested = get(b, 4) as usize;
+                if requested != 0 && requested < stats.len() {
                     return Err(22);
                 }
-                if cmd == 0x1b {
-                    if get(b, 4) != 1 {
-                        return Err(95);
-                    }
-                    put(b, 8, count);
-                    for (i, s) in stats.iter().take(requested as usize).enumerate() {
-                        let text = s.name.as_bytes();
-                        let n = text.len().min(31);
-                        b[12 + i * 32..12 + i * 32 + n].copy_from_slice(&text[..n]);
-                    }
-                } else {
-                    put(b, 4, count);
-                    for (i, s) in stats.iter().take(requested as usize).enumerate() {
-                        put64(b, 8 + i * 8, s.value);
-                    }
+                put(b, 4, stats.len() as u32);
+                for (i, s) in stats.iter().take(requested).enumerate() {
+                    put64(b, 8 + i * 8, s.value);
                 }
                 return Ok(());
             }
@@ -322,25 +344,15 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
             }
             0x41 => {
                 b[4..].fill(0);
-                // i225: TX_SOFTWARE | TX_HARDWARE | RX_HARDWARE | RAW_HARDWARE
-                // (Linux igc_ethtool_get_ts_info).
-                put(b, 4, (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6));
+                let (timestamping, tx_types, rx_filters) = driver.timestamp_info();
+                put(b, 4, timestamping);
                 put(b, 8, driver.clock_index() as u32);
-                put(b, 12, 3);
-                put(b, 28, 3);
+                put(b, 12, tx_types);
+                put(b, 28, rx_filters);
                 return Ok(());
             }
-            0x14 | 0x16 | 0x18 | 0x1e | 0x23 | 0x2b | 0x2d => {
-                let iface = crate::iface::lookup(name).ok_or(19)?;
-                let value = match cmd {
-                    0x14 => u32::from(iface.offloads.rx_checksum),
-                    0x16 => u32::from(iface.offloads.tx_checksum),
-                    0x1e | 0x23 => u32::from(iface.offloads.max_tso_bytes > 0),
-                    0x2b => u32::from(iface.software_gro),
-                    0x2d => u32::from(driver.settings()?.channels),
-                    _ => 1,
-                };
-                put(b, 4, value);
+            0x2d => {
+                put(b, 4, u32::from(driver.settings()?.channels));
                 return Ok(());
             }
             _ => {}
@@ -533,11 +545,11 @@ pub fn execute(name: &str, b: &mut [u8]) -> nic::Result<()> {
                     if cmd == 0x4d {
                         return Err(22);
                     }
-                    // Linux returns -E2BIG with the required word count when
-                    // the caller's mask buffer is too small; this codec can
-                    // only carry the count back on success, so report 2
-                    // words and let the caller retry.
-                    b[15] = 2;
+                    // Linux returns a cleared base header and the required
+                    // bitmap word count as a negative s8, with success.
+                    b.fill(0);
+                    put(b, 0, cmd);
+                    b[15] = (-2i8) as u8;
                     return Ok(());
                 }
                 if cmd == 0x4c {
@@ -779,9 +791,9 @@ pub const GENL_ID_ETHTOOL: u16 = 0x14;
 pub const ETHTOOL_GENL_NAME: &str = "ethtool";
 pub const ETHTOOL_GENL_VERSION: u8 = 1;
 
-pub const ETHTOOL_MSG_MM_GET: u8 = 35;
-pub const ETHTOOL_MSG_MM_SET: u8 = 36;
-pub const ETHTOOL_MSG_MM_GET_REPLY: u8 = 44;
+pub const ETHTOOL_MSG_MM_GET: u8 = 42;
+pub const ETHTOOL_MSG_MM_SET: u8 = 43;
+pub const ETHTOOL_MSG_MM_GET_REPLY: u8 = 42;
 
 pub const ETHTOOL_A_HEADER_DEV_INDEX: u16 = 1;
 pub const ETHTOOL_A_HEADER_DEV_NAME: u16 = 2;
@@ -816,16 +828,7 @@ pub const ETHTOOL_MM_VERIFY_STATUS_DISABLED: u8 = 4;
 const NLA_F_NESTED: u16 = 1 << 15;
 const NLA_TYPE_MASK: u16 = !(3 << 14);
 
-static ETHTOOL_GENL_OPS: &[crate::netlink_generic::GenlOperation] = &[
-    crate::netlink_generic::GenlOperation {
-        command: ETHTOOL_MSG_MM_GET,
-        flags: 0x02 | 0x04, // GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP
-    },
-    crate::netlink_generic::GenlOperation {
-        command: ETHTOOL_MSG_MM_SET,
-        flags: 0x02 | crate::netlink_generic::GENL_UNS_ADMIN_PERM,
-    },
-];
+static ETHTOOL_GENL_OPS: &[crate::netlink_generic::GenlOperation] = genl::OPS;
 
 fn unsupported_genl(
     _: u8,
@@ -1050,12 +1053,15 @@ fn encode_mm_reply(
     }
 }
 
-fn handle_genl(
+pub(crate) fn handle_genl(
     command: u8,
     attrs: &[u8],
     dump: bool,
     context: crate::netlink_generic::RequestContext<'_>,
 ) -> Result<alloc::vec::Vec<crate::netlink_generic::GenlReply>, i32> {
+    if command < ETHTOOL_MSG_MM_GET {
+        return genl::handle(command, attrs, dump, context);
+    }
     match command {
         ETHTOOL_MSG_MM_GET => {
             let mut header_raw: Option<&[u8]> = None;

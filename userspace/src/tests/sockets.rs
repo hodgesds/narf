@@ -1678,6 +1678,81 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_inet_dgram_reaches_the_wire);
 
+fn udp_bound_source_wire(mapped: bool) -> TestResult {
+    use crate::socket::{SocketFile, SocketOp, SocketOpResult, AF_INET, AF_INET6, SOCK_DGRAM};
+    const IFACE: &str = "udp-source-test0";
+    const PRIMARY: [u8; 4] = [198, 18, 197, 2];
+    const BOUND: [u8; 4] = [198, 18, 197, 3];
+    const PEER: [u8; 4] = [198, 18, 197, 9];
+    let address = |ip: [u8; 4], port| {
+        if mapped {
+            let mut v6 = [0; 16];
+            v6[10..12].copy_from_slice(&[0xff, 0xff]);
+            v6[12..].copy_from_slice(&ip);
+            crate::socket::make_sockaddr_in6(v6, port)
+        } else {
+            build_sockaddr_in(u32::from_be_bytes(ip), port)
+        }
+    };
+    narf_net::iface::register(IFACE, [2, 0, 0, 0, 0xc5, 2], udp_capture_send);
+    narf_net::iface::add_addr(IFACE, PRIMARY, 24);
+    narf_net::iface::add_addr(IFACE, BOUND, 24);
+    narf_net::iface::set_link_state(IFACE, true);
+    narf_net::arp_cache::insert(IFACE, PEER, [2, 0, 0, 0, 0xc5, 9]);
+    narf_net::tcp_stack::__arp_insert_legacy(PEER, [2, 0, 0, 0, 0xc5, 9]);
+    UDP_TX_CAPTURE.lock().clear();
+    let sock = SocketFile::new(if mapped { AF_INET6 } else { AF_INET }, SOCK_DGRAM);
+    let result = (|| -> Result<(), &'static str> {
+        if !matches!(
+            sock.dispatch_op(SocketOp::Bind {
+                addr: address(BOUND, 56767)
+            }),
+            SocketOpResult::Ok(0)
+        ) {
+            return Err("binding UDP to a local secondary address failed");
+        }
+        if !matches!(
+            sock.dispatch_op(SocketOp::Send {
+                buf: b"bound-source",
+                flags: 0,
+                addr: Some(address(PEER, 56768)),
+            }),
+            SocketOpResult::Ok(12)
+        ) {
+            return Err("bound-source UDP send failed");
+        }
+        let frames = UDP_TX_CAPTURE.lock();
+        let frame = frames.last().ok_or("bound-source UDP emitted no frame")?;
+        if frame.len() < 42 || frame[26..30] != BOUND || frame[30..34] != PEER {
+            return Err("wire IPv4 source ignored bind and used the interface primary address");
+        }
+        Ok(())
+    })();
+    sock.unregister();
+    narf_net::iface::unregister(IFACE);
+    UDP_TX_CAPTURE.lock().clear();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(error) => TestResult::Fail(error),
+    }
+}
+
+fn smoke_socket_udp_bound_source_reaches_wire() -> TestResult {
+    udp_bound_source_wire(false)
+}
+kernel_test_in!(
+    "userspace/socket_source",
+    smoke_socket_udp_bound_source_reaches_wire
+);
+
+fn smoke_socket_udp_mapped_bound_source_reaches_wire() -> TestResult {
+    udp_bound_source_wire(true)
+}
+kernel_test_in!(
+    "userspace/socket_source",
+    smoke_socket_udp_mapped_bound_source_reaches_wire
+);
+
 /// SO_BINDTODEVICE is enforced on RECEIVE, not just stored.
 ///
 /// `compute_score` (`net/ipv4/udp.c:400`) drops a socket from consideration
@@ -3350,7 +3425,7 @@ fn smoke_bt_sco_connect_send_recv() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_bt_sco_connect_send_recv);
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_connect_send_recv);
 
 /// SCO error paths: send/recv/getpeername/SCO_OPTIONS without a
 /// link, connect with no pump, double connect, MSG_OOB send,
@@ -3476,7 +3551,7 @@ fn smoke_bt_sco_connect_errors() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_bt_sco_connect_errors);
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_connect_errors);
 
 /// SCO recv is SEQPACKET: a short buffer truncates one frame
 /// (ReceivedTruncated) and MSG_PEEK leaves the frame queued.
@@ -3543,7 +3618,7 @@ fn smoke_bt_sco_recv_truncation_and_peek() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_bt_sco_recv_truncation_and_peek);
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_recv_truncation_and_peek);
 
 /// Drop teardown: dropping a connected SCO socket disconnects its
 /// link, and dropping one mid-setup cancels the pending setup.
@@ -3599,4 +3674,4 @@ fn smoke_bt_sco_drop_teardown() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace", smoke_bt_sco_drop_teardown);
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_drop_teardown);

@@ -131,7 +131,7 @@ struct NodeCache {
 
 /// Cached nodes. At a 16 KiB nodesize this bounds the cache at 4 MiB in
 /// kernel-test and 64 MiB in production, comfortably holding the working set a
-/// commit's fixed point revisits while staying a fixed, predictable cost.
+/// commit revisits while staying a fixed, predictable cost.
 const NODE_CACHE_MAX: usize = if cfg!(feature = "kernel-test") {
     256
 } else {
@@ -478,6 +478,54 @@ impl<B: BlockDevice> VolCore<B> {
         &self.fs_batch
     }
 
+    /// Transaction cost counters ([`crate::stats::CommitStats`]).
+    pub(crate) fn commit_stats(&self) -> &crate::stats::CommitStats {
+        &self.stats
+    }
+
+    /// The cached in-memory free-space view, if any.
+    pub(crate) fn free_view(&self) -> Option<Arc<crate::allocator::FreeView>> {
+        self.free_view.lock().clone()
+    }
+
+    /// Replace the cached free-space view; `None` drops it, so the next
+    /// allocator reads the free-space tree from disk.
+    pub(crate) fn set_free_view(&self, view: Option<Arc<crate::allocator::FreeView>>) {
+        *self.free_view.lock() = view;
+    }
+
+    /// Take the cached free-space view out, leaving none behind.
+    pub(crate) fn take_free_view(&self) -> Option<Arc<crate::allocator::FreeView>> {
+        self.free_view.lock().take()
+    }
+
+    /// Where the last tree block was allocated (its end), for the next
+    /// allocator to carry on from ([`crate::allocator::Allocator`]).
+    pub(crate) fn node_cursor(&self) -> u64 {
+        self.node_cursor.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Remember where the last tree block was allocated.
+    pub(crate) fn set_node_cursor(&self, cursor: u64) {
+        self.node_cursor
+            .store(cursor, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a commit of this mount has already written a superblock
+    /// `bytes_used` it summed from the block groups, so later commits may
+    /// move it by their own changes instead of summing again.
+    pub(crate) fn bytes_used_summed(&self) -> bool {
+        self.bytes_used_summed
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record (or, with `false`, forget) that the superblock's `bytes_used`
+    /// is the sum of the block groups.
+    pub(crate) fn set_bytes_used_summed(&self, summed: bool) {
+        self.bytes_used_summed
+            .store(summed, core::sync::atomic::Ordering::Release);
+    }
+
     /// No mount of this filesystem may write (mounted or remounted ro).
     pub(crate) fn is_core_read_only(&self) -> bool {
         self.read_only.load(core::sync::atomic::Ordering::Acquire)
@@ -710,16 +758,17 @@ pub struct VolCore<B: BlockDevice> {
     evictions: core::sync::atomic::AtomicU64,
     /// Metadata node cache, keyed by logical address.
     ///
-    /// A commit path-COWs the extent tree once per fixed-point round, and a
-    /// round re-reads the same nodes the previous one did — measured at 724
-    /// rounds across 152 commits in the boot write smoke, with that re-reading
-    /// the single largest cost in the whole commit. Every miss costs an
-    /// (emulated) device read plus a full-node checksum verification, and both
-    /// are pure repetition for a block nothing has written since.
+    /// Consecutive commits path-COW the same upper levels of the extent,
+    /// csum and free-space trees, and every operation descends the fs tree
+    /// from its root. Every miss costs an (emulated) device read plus a
+    /// full-node checksum verification, and both are pure repetition for a
+    /// block nothing has written since.
     nodes: IrqSafeSpinLock<NodeCache>,
     /// Set when a transaction was lost after its operations had already
     /// reported success. See [`Self::abort_transaction`].
     aborted: core::sync::atomic::AtomicBool,
+    /// Operations turned away since the abort. See [`Self::note_refused`].
+    refused_after_abort: core::sync::atomic::AtomicU64,
     /// `BTRFS_FS_QUOTA_OVERRIDE` — see [`Self::quota_override`].
     quota_override: core::sync::atomic::AtomicBool,
     /// Operations accumulated into the transaction that has not committed yet.
@@ -727,6 +776,17 @@ pub struct VolCore<B: BlockDevice> {
     /// tree reads and node writes, which is also what serialises the shared
     /// allocator inside it.
     fs_batch: Mutex<Option<crate::write::FsBatch>>,
+    /// What transactions have cost so far ([`crate::stats::CommitStats`]).
+    stats: crate::stats::CommitStats,
+    /// The committed free-space tree, in memory, once something has needed
+    /// it ([`crate::allocator::FreeView`]). `None` until then, and again
+    /// whenever it may no longer match the tree.
+    free_view: IrqSafeSpinLock<Option<Arc<crate::allocator::FreeView>>>,
+    /// End of the last tree block allocated (0: none yet). A hint only.
+    node_cursor: core::sync::atomic::AtomicU64,
+    /// A commit of this mount summed the block groups into the superblock's
+    /// `bytes_used` ([`Self::bytes_used_summed`]).
+    bytes_used_summed: core::sync::atomic::AtomicBool,
     /// Run when the last mount (view) of this core drops: commits whatever a
     /// writable core still holds (see [`commit_on_last_drop`]). A function
     /// pointer because `Drop` cannot carry the `'static` bound committing
@@ -832,6 +892,23 @@ fn format_fsid(fsid: &[u8; 16]) -> alloc::string::String {
     out
 }
 
+/// Whether the `count`-th refused operation is one to report: 1, 10, 100, ...
+pub(crate) const fn refusal_is_reported(count: u64) -> bool {
+    let mut power = 1u64;
+    loop {
+        if count == power {
+            return true;
+        }
+        if count < power {
+            return false;
+        }
+        match power.checked_mul(10) {
+            Some(next) => power = next,
+            None => return false,
+        }
+    }
+}
+
 impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     // ── Geometry accessors (lock-free) ─────────────────────────────
 
@@ -874,7 +951,30 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// an operation passes before it starts. The write funnels keep using
     /// `supports_writes`, so the draining commit itself can still land.
     pub(crate) fn admits_writes(&self) -> bool {
-        self.supports_writes() && !self.frozen.load(core::sync::atomic::Ordering::Acquire)
+        let admitted =
+            self.supports_writes() && !self.frozen.load(core::sync::atomic::Ordering::Acquire);
+        if !admitted && self.aborted.load(core::sync::atomic::Ordering::Acquire) {
+            self.note_refused();
+        }
+        admitted
+    }
+
+    /// Keep an aborted filesystem audible. The abort itself is reported
+    /// once, and a caller that only sees `EROFS` minutes later has no way
+    /// to connect it to that line — while the on-disk logs that would have
+    /// carried it stopped with the filesystem. Repeat the fact at the 1st,
+    /// 10th, 100th, ... refused operation: frequent while the failure is
+    /// fresh, bounded however long userspace keeps retrying.
+    fn note_refused(&self) {
+        use core::sync::atomic::Ordering;
+        let count = self.refused_after_abort.fetch_add(1, Ordering::Relaxed) + 1;
+        if refusal_is_reported(count) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: READ-ONLY after a failed commit: {count} write operation(s) refused since (see the 'transaction commit failed' line)"
+            );
+        }
     }
 
     /// The gate for administrative writers that may legitimately run on a
@@ -1353,6 +1453,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.state.lock().chunk_map.chunk_remaining(logical)
     }
 
+    /// `(start, length)` of the chunk — and so of the block group — that
+    /// contains `logical`.
+    pub(crate) fn logical_chunk_bounds(&self, logical: u64) -> Result<(u64, u64), FsError> {
+        self.state.lock().chunk_map.chunk_bounds(logical)
+    }
+
     /// Resolve every direct copy of a logical byte, preserving device ids.
     pub fn map_logical_stripes(
         &self,
@@ -1555,9 +1661,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     ///
     /// A cache hit here is an `Arc` bump rather than a `nodesize` memcpy. That
     /// matters because the commit path's hottest reader — the extent tree's
-    /// path COW, re-run once per fixed-point round — descends the same
-    /// internal nodes for every edit, and each descent used to copy 16 KiB per
-    /// level. Callers that need to mutate a node still take `read_node` and
+    /// path COW — descends the same internal nodes for every edit, and each
+    /// descent used to copy 16 KiB per level. Callers that need to mutate a node still take `read_node` and
     /// get their own copy.
     pub async fn read_node_shared(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
         // A block of the running batch is rewritten in place at the same
@@ -1569,7 +1674,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let mut last = FsError::InvalidData;
         for _ in 0..3 {
             match self.read_node_attempt(logical).await {
-                Ok(node) => return Ok(node),
+                Ok(node) => {
+                    self.stats.note_read(&node);
+                    return Ok(node);
+                }
                 Err(error) => last = error,
             }
         }
@@ -1612,6 +1720,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             {
                 continue;
             }
+            crate::stats::note_device_read();
             let shared = Arc::new(core::mem::take(&mut buf));
             // Only cache a node that passed BOTH checks above — a copy that
             // failed one is retried from another mirror, and caching it would
@@ -2038,8 +2147,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             evictions: core::sync::atomic::AtomicU64::new(0),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
             aborted: core::sync::atomic::AtomicBool::new(false),
+            refused_after_abort: core::sync::atomic::AtomicU64::new(0),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
+            stats: crate::stats::CommitStats::default(),
+            free_view: IrqSafeSpinLock::new(None),
+            node_cursor: core::sync::atomic::AtomicU64::new(0),
+            bytes_used_summed: core::sync::atomic::AtomicBool::new(false),
             last_view_dropped: commit_on_last_drop::<B>,
             drop_commit_tried: core::sync::atomic::AtomicBool::new(false),
             state: IrqSafeSpinLock::new(VolState {
@@ -2592,8 +2706,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// between another CPU's tree reads and its staging.
     pub async fn sync_to_disk_exclusive(&self) -> Result<(), FsError> {
         let _op = self.op_lock().lock().await;
-        self.reap_orphans().await?;
-        self.sync_to_disk().await
+        // Reclaiming orphans is housekeeping this call does on the way; what
+        // it owes its caller is the commit. An orphan that cannot be
+        // reclaimed for lack of space must not cost the sync — the commit
+        // releases pinned space, after which the reclaim is tried once more,
+        // and an orphan still left keeps its on-disk record for later.
+        let reaped = self.reap_orphans().await;
+        self.sync_to_disk().await?;
+        match reaped {
+            Err(FsError::NoSpace) => match self.reap_orphans().await {
+                Ok(()) => self.sync_to_disk().await,
+                Err(FsError::NoSpace) => Ok(()),
+                Err(error) => Err(error),
+            },
+            other => other,
+        }
     }
 
     /// `syncfs`: [`Self::sync_to_disk_exclusive`] plus a trailing device
@@ -2765,11 +2892,24 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         cache.entries.insert(logical, Arc::new(buf.to_vec()));
     }
 
+    /// Drop the cached copy of a tree block nothing references any more: one
+    /// a commit replaced, or one a batch wrote and then replaced again.
+    ///
+    /// The cache is bounded by emptying it when it fills, so every dead
+    /// block left in it brings the next emptying — and the re-reading of
+    /// every live node — closer. A reader still walking a tree that holds
+    /// the block reads it back from the device, where it stays intact until
+    /// its space is unpinned.
+    pub(crate) fn forget_node(&self, logical: u64) {
+        self.nodes.lock().entries.remove(&logical);
+    }
+
     /// Write one metadata node and keep it cached.
     pub async fn write_node(&self, logical: u64, buf: &[u8]) -> Result<(), FsError> {
         if !self.supports_writes() {
             return Err(FsError::ReadOnly);
         }
+        self.stats.note_write(buf);
         let epoch = self.write_logical_unchecked(logical, buf).await?;
         self.cache_written_node(logical, buf, epoch);
         Ok(())
@@ -2789,6 +2929,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         {
             return Err(FsError::ReadOnly);
         }
+        self.stats.note_write(buf);
         let epoch = self.write_logical_unchecked(logical, buf).await?;
         self.cache_written_node(logical, buf, epoch);
         Ok(())
@@ -3005,6 +3146,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         }
         let devid = primary_ok.ok_or(FsError::NotFound)?;
         self.state.lock().superblock_source = (devid, format::SUPERBLOCK_OFFSET);
+        self.stats
+            .super_writes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

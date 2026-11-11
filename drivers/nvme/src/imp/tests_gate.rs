@@ -40,9 +40,11 @@ fn smoke_nvme_gate_yields_to_descheduled_holder() -> TestResult {
         drop(guard);
     });
     let mut waiter = KernelTask::new(async move {
-        let guard = acquire(slot);
-        waiter_done.store(true, Ordering::Release);
-        drop(guard);
+        // Only a waiter that really got the gate counts as done.
+        if let Ok(guard) = acquire(slot) {
+            waiter_done.store(true, Ordering::Release);
+            drop(guard);
+        }
     });
     // Only explicit cooperative switches may advance this test. A timer
     // preemption must not accidentally rescue a non-yielding gate waiter.
@@ -149,4 +151,109 @@ fn smoke_nvme_gate_services_masked_work() -> TestResult {
 kernel_test_in!(
     "drivers/nvme/req_gate/masked",
     smoke_nvme_gate_services_masked_work
+);
+
+/// Shortened stall bounds for the smoke below, restored on every exit.
+struct StallBounds;
+
+impl StallBounds {
+    fn set(warn_ms: u64, fail_ms: u64) -> Self {
+        super::GATE_STALL_WARN_MS_FOR_TEST.store(warn_ms, Ordering::Release);
+        super::GATE_STALL_FAIL_MS_FOR_TEST.store(fail_ms, Ordering::Release);
+        StallBounds
+    }
+}
+
+impl Drop for StallBounds {
+    fn drop(&mut self) {
+        super::GATE_STALL_WARN_MS_FOR_TEST.store(0, Ordering::Release);
+        super::GATE_STALL_FAIL_MS_FOR_TEST.store(0, Ordering::Release);
+    }
+}
+
+/// A gate whose holder never releases it is neither silent nor forever:
+/// the gate records who took it, a waiter reports the holder once it has
+/// waited the warn bound, and once the holder has shown no progress for
+/// the fail bound the waiter gets `GateTimeout` — without having taken,
+/// released or otherwise disturbed the gate. A progress mark from the
+/// holder restarts the fail bound. Short test-only bounds; the production
+/// bounds are only compared against.
+fn smoke_nvme_gate_stall_is_reported_and_bounded() -> TestResult {
+    use super::NvmeError;
+    if super::GATE_STALL_WARN_MS != 2_000 || super::GATE_STALL_FAIL_MS != 60_000 {
+        return TestResult::Fail("gate stall bounds are not 2 s / 60 s");
+    }
+    let slot = leak_slot(u32::MAX, None, Controller::new(0));
+    let Ok(held) = acquire(slot) else {
+        return TestResult::Fail("an uncontended gate was not acquired");
+    };
+    // The holder is on record: this CPU, this task, a timestamp.
+    let owner = slot.gate_owner.load(Ordering::Relaxed);
+    if owner >> super::GATE_OWNER_TASK_BITS != narf_lib::percpu::current_cpu() as u64
+        || owner & ((1 << super::GATE_OWNER_TASK_BITS) - 1)
+            != narf_scheduler::current_task_id().raw() & ((1 << super::GATE_OWNER_TASK_BITS) - 1)
+        || slot.gate_since.load(Ordering::Relaxed) == 0
+    {
+        return TestResult::Fail("the gate did not record its holder's CPU / task / time");
+    }
+
+    const WARN_MS: u64 = 20;
+    const FAIL_MS: u64 = 120;
+    let bounds = StallBounds::set(WARN_MS, FAIL_MS);
+    let reports0 = super::gate_stall_reports();
+    let timeouts0 = super::gate_timeouts();
+    let t0 = narf_time::now_cycles();
+    let outcome = acquire(slot);
+    let waited_ms = narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(t0)) / 1_000_000;
+    match outcome {
+        Err(NvmeError::GateTimeout) => {}
+        Err(_) => return TestResult::Fail("a stalled gate failed with the wrong error"),
+        Ok(_) => return TestResult::Fail("a second guard was handed out for a held gate"),
+    }
+    // At least the warn-bound report and the failing one.
+    if super::gate_stall_reports() < reports0 + 2 {
+        return TestResult::Fail("the waiter did not report the holder before failing");
+    }
+    if super::gate_timeouts() != timeouts0 + 1 {
+        return TestResult::Fail("the gate timeout was not counted exactly once");
+    }
+    if !(FAIL_MS..30_000).contains(&waited_ms) {
+        return TestResult::Fail("the waiter did not fail at its bound");
+    }
+    if !slot.req_gate.load(Ordering::Acquire) {
+        return TestResult::Fail("a failed waiter released a gate it never held");
+    }
+
+    // A holder that marks progress is not stalled: with the mark placed
+    // FAIL_MS/2 into the future the waiter must outlast one whole bound
+    // from *that* point, not from its own arrival.
+    let half = narf_time::wall::ns_to_cycles(FAIL_MS / 2 * 1_000_000);
+    slot.gate_progress
+        .store(narf_time::now_cycles() + half, Ordering::Relaxed);
+    let t0 = narf_time::now_cycles();
+    let outcome = acquire(slot);
+    let waited_ms = narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(t0)) / 1_000_000;
+    drop(bounds);
+    if !matches!(outcome, Err(NvmeError::GateTimeout)) {
+        return TestResult::Fail("the waiter did not fail after the holder's progress mark aged");
+    }
+    if waited_ms < FAIL_MS + FAIL_MS / 4 {
+        return TestResult::Fail("a holder's progress mark did not restart the fail bound");
+    }
+
+    // Released: the next acquisition is immediate and silent.
+    drop(held);
+    let reports1 = super::gate_stall_reports();
+    match acquire(slot) {
+        Ok(guard) => drop(guard),
+        Err(_) => return TestResult::Fail("the gate was not acquirable after its release"),
+    }
+    if super::gate_stall_reports() != reports1 || slot.req_gate.load(Ordering::Acquire) {
+        return TestResult::Fail("an uncontended acquisition reported a stall or leaked the gate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/req_gate/stall",
+    smoke_nvme_gate_stall_is_reported_and_bounded
 );

@@ -4,7 +4,12 @@ use crate::handlers::{poll_blocking, resolve_cwd_path, resolve_parent_dir_async}
 #[cfg(target_arch = "x86_64")]
 use crate::user_task::with_user_task_ctx;
 use crate::user_task::UserState;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use narf_filesystem::{FileOps, FsError};
 use narf_memory::PhysAddr;
 
@@ -120,6 +125,82 @@ unsafe fn slice_from_ref<T>(val: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DumpWriteError {
+    Killed,
+    Filesystem(FsError),
+    Unavailable,
+}
+
+type OwnedDumpWrite = Pin<Box<dyn Future<Output = Result<usize, FsError>> + Send>>;
+
+fn dump_interrupted(task: u64) -> bool {
+    // Linux fs/coredump.c::dump_interrupted: SIGKILL aborts a core dump.
+    crate::handlers::task_fatal_signal_pending(task)
+}
+
+fn drain_dump_write(write: OwnedDumpWrite) {
+    // A pending filesystem write may own DMA or transaction resources. Keep
+    // its owned file and buffer alive until terminal completion; this task
+    // never refers to the dying process's address space or borrowed memory.
+    narf_scheduler::spawn(async move {
+        let _ = write.await;
+    });
+}
+
+/// One already-authorized file write, with a SIGKILL wake independent of
+/// filesystem progress. At most this one operation survives cancellation.
+struct DumpWrite {
+    task: u64,
+    write: Option<OwnedDumpWrite>,
+    started: bool,
+    drain: fn(OwnedDumpWrite),
+}
+
+impl Future for DumpWrite {
+    type Output = Result<usize, DumpWriteError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        // Register before checking SIGKILL or polling I/O. A never-waking
+        // filesystem future must not strand the process during shutdown.
+        crate::handlers::register_signal_waker(this.task, cx.waker().clone());
+        if dump_interrupted(this.task) {
+            return Poll::Ready(Err(DumpWriteError::Killed));
+        }
+        this.started = true;
+        match this
+            .write
+            .as_mut()
+            .expect("live core write")
+            .as_mut()
+            .poll(cx)
+        {
+            Poll::Ready(result) => {
+                this.write = None;
+                Poll::Ready(result.map_err(DumpWriteError::Filesystem))
+            }
+            Poll::Pending if dump_interrupted(this.task) => {
+                Poll::Ready(Err(DumpWriteError::Killed))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for DumpWrite {
+    fn drop(&mut self) {
+        crate::handlers::drop_signal_waker(self.task);
+        if let Some(write) = self.write.take() {
+            if self.started {
+                // Called after poll returns, without a registry/driver lock.
+                // Re-polling in the drain task installs its own I/O waker.
+                (self.drain)(write);
+            }
+        }
+    }
+}
+
 /// Emit `buf` at `offset`, clipped to the RLIMIT_CORE ceiling.
 ///
 /// `fs/coredump.c::__dump_emit` stops writing once `cprm->written + nr`
@@ -128,7 +209,13 @@ unsafe fn slice_from_ref<T>(val: &T) -> &[u8] {
 /// which is the whole reason to set a non-zero limit instead of zero. This
 /// writer addresses the file by absolute offset rather than sequentially,
 /// so the equivalent test is on the end of the range.
-fn write_at(file: &dyn FileOps, limit: u64, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+fn write_at(
+    task: u64,
+    file: Arc<dyn FileOps>,
+    limit: u64,
+    offset: u64,
+    buf: &[u8],
+) -> Result<(), DumpWriteError> {
     if offset >= limit {
         return Ok(());
     }
@@ -136,14 +223,27 @@ fn write_at(file: &dyn FileOps, limit: u64, offset: u64, buf: &[u8]) -> Result<(
     let buf = if buf.len() > room { &buf[..room] } else { buf };
     let mut written = 0;
     while written < buf.len() {
-        let chunk = &buf[written..];
-        let n = match poll_blocking(file.write(offset + written as u64, chunk)) {
-            Some(Ok(x)) => x,
-            Some(Err(e)) => return Err(e),
-            None => return Err(FsError::InvalidData),
+        if dump_interrupted(task) {
+            return Err(DumpWriteError::Killed);
+        }
+        // Bound even the metadata operation. Payload is copied before the
+        // async write so cancellation can release the process's RAM safely.
+        let chunk = &buf[written..buf.len().min(written + 64 * 1024)];
+        let bytes = chunk.to_vec();
+        let target = file.clone();
+        let at = offset + written as u64;
+        let write = DumpWrite {
+            task,
+            write: Some(Box::pin(async move { target.write(at, &bytes).await })),
+            started: false,
+            drain: drain_dump_write,
+        };
+        let n = match poll_blocking(write) {
+            Some(result) => result?,
+            None => return Err(DumpWriteError::Unavailable),
         };
         if n == 0 || n > chunk.len() {
-            return Err(FsError::InvalidData);
+            return Err(DumpWriteError::Filesystem(FsError::InvalidData));
         }
         written += n;
     }
@@ -151,12 +251,13 @@ fn write_at(file: &dyn FileOps, limit: u64, offset: u64, buf: &[u8]) -> Result<(
 }
 
 fn write_metadata(
-    file: &dyn FileOps,
+    task: u64,
+    file: Arc<dyn FileOps>,
     limit: u64,
     ehdr: &Elf64_Ehdr,
     phdrs: &[Elf64_Phdr],
     notes: &[u8],
-) -> Result<(), FsError> {
+) -> Result<(), DumpWriteError> {
     let stride = core::mem::size_of::<Elf64_Phdr>();
     let end = ehdr.e_phoff as usize + core::mem::size_of_val(phdrs);
     let mut bytes = alloc::vec![0; end];
@@ -170,9 +271,9 @@ fn write_metadata(
         // SAFETY: same initialized ELF record layout.
         bytes[start..start + stride].copy_from_slice(unsafe { slice_from_ref(phdr) });
     }
-    // One sequential write rather than a small filesystem write per VMA.
+    // Sequential bounded writes rather than a small write per VMA.
     // A short/interrupted write retains the notes before the large table.
-    write_at(file, limit, 0, &bytes)
+    write_at(task, file, limit, 0, &bytes)
 }
 
 /// `struct elf_prpsinfo` — the note that tells a debugger *which* process this
@@ -420,6 +521,167 @@ fn dump_len(r: &narf_memory::address_space::Region) -> u64 {
     }
 }
 
+/// Where `kernel.core_pattern` sends a dump (`fs/coredump.c` `core_type`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CoreTarget {
+    /// `COREDUMP_FILE`: the expanded file name, relative to the crashing
+    /// task's working directory unless it starts with `/`.
+    File(String),
+    /// `COREDUMP_PIPE`: `|program args` — the dump goes to a helper's stdin
+    /// and nothing is written to any directory.
+    Pipe,
+    /// `COREDUMP_SOCK`: `@path` — the dump goes to an `AF_UNIX` socket.
+    Socket,
+}
+
+/// What `coredump_parse` substitutes into a core file name.
+pub(crate) struct CoreNameArgs<'a> {
+    /// Thread-group id (`%p`, `%P`).
+    pub(crate) tgid: u64,
+    /// The dumping thread's id (`%i`, `%I`).
+    pub(crate) tid: u64,
+    /// Real uid and gid (`%u`, `%g`).
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// `__get_dumpable()` (`%d`).
+    pub(crate) dumpable: u32,
+    pub(crate) signal: u32,
+    /// `ktime_get_real_seconds()` (`%t`).
+    pub(crate) time: i64,
+    pub(crate) hostname: &'a str,
+    pub(crate) comm: &'a str,
+    /// The executable's path, when it is known (`%f`, `%E`).
+    pub(crate) exe: Option<&'a str>,
+    /// `rlimit(RLIMIT_CORE)` (`%c`).
+    pub(crate) limit: u64,
+    pub(crate) cpu: u32,
+}
+
+/// `cn_esc_printf`: a substituted string must not add path components.
+fn push_escaped(name: &mut String, text: &str) {
+    name.extend(text.chars().map(|c| if c == '/' { '!' } else { c }));
+}
+
+/// `fs/coredump.c::coredump_parse` for the pattern `pattern`.
+///
+/// A pattern starting with `|` or `@` names a helper or a socket; its
+/// arguments are not expanded here because nothing consumes them. Anything
+/// else is a file name template: `%%` is a percent sign, an unknown
+/// specifier and a lone trailing `%` are dropped, `%e`/`%h`/`%E` have every
+/// `/` replaced by `!`, and with `core_uses_pid` set a name whose pattern
+/// had no `%p` gets `.<tgid>` appended.
+pub(crate) fn core_target(pattern: &str, uses_pid: bool, args: &CoreNameArgs<'_>) -> CoreTarget {
+    use core::fmt::Write;
+    match pattern.as_bytes().first() {
+        Some(b'|') => return CoreTarget::Pipe,
+        Some(b'@') => return CoreTarget::Socket,
+        _ => {}
+    }
+    let mut name = String::new();
+    let mut pid_in_pattern = false;
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            name.push(c);
+            continue;
+        }
+        // A single `%` at the end is dropped.
+        let Some(specifier) = chars.next() else {
+            break;
+        };
+        let _ = match specifier {
+            '%' => {
+                name.push('%');
+                Ok(())
+            }
+            'p' => {
+                pid_in_pattern = true;
+                write!(name, "{}", args.tgid)
+            }
+            'P' => write!(name, "{}", args.tgid),
+            'i' | 'I' => write!(name, "{}", args.tid),
+            'u' => write!(name, "{}", args.uid),
+            'g' => write!(name, "{}", args.gid),
+            'd' => write!(name, "{}", args.dumpable),
+            's' => write!(name, "{}", args.signal),
+            't' => write!(name, "{}", args.time),
+            'h' => {
+                push_escaped(&mut name, args.hostname);
+                Ok(())
+            }
+            'e' => {
+                push_escaped(&mut name, args.comm);
+                Ok(())
+            }
+            // `cn_print_exe_file(cn, true)`: the executable's file name.
+            'f' => {
+                match args.exe {
+                    Some(exe) => name.push_str(exe.rsplit('/').next().unwrap_or(exe)),
+                    None => {
+                        push_escaped(&mut name, args.comm);
+                        name.push_str(" (path unknown)");
+                    }
+                }
+                Ok(())
+            }
+            // `cn_print_exe_file(cn, false)`: its whole path, escaped.
+            'E' => {
+                match args.exe {
+                    Some(exe) => push_escaped(&mut name, exe),
+                    None => {
+                        push_escaped(&mut name, args.comm);
+                        name.push_str(" (path unknown)");
+                    }
+                }
+                Ok(())
+            }
+            'c' => write!(name, "{}", args.limit),
+            'C' => write!(name, "{}", args.cpu),
+            // `%F` (a pidfd for the helper) means nothing for a file, and an
+            // unknown specifier is dropped.
+            _ => Ok(()),
+        };
+    }
+    if uses_pid && !pid_in_pattern {
+        let _ = write!(name, ".{}", args.tgid);
+    }
+    CoreTarget::File(name)
+}
+
+/// Remove an old core file, ended by SIGKILL (`dump_interrupted`).
+///
+/// The directory and the name are owned by the operation, which runs to its
+/// own completion if this task is killed first: an unlink abandoned half-way
+/// would leave the filesystem's operation lock and its open batch in
+/// whatever state that moment had. Its outcome is not reported: "If it
+/// doesn't exist, that's fine. If there's some other problem, we'll catch it
+/// at the filp_open()."
+fn dump_unlink(parent: &Arc<dyn narf_filesystem::DirOps>, leaf: &str) {
+    let parent = parent.clone();
+    let leaf = String::from(leaf);
+    let _ = crate::killable_wait::wait(Box::pin(async move { parent.unlink(&leaf).await }));
+}
+
+/// Create the core file `0600`, owned by `uid:gid` — `filp_open(O_CREAT |
+/// O_EXCL, 0600)` under the crashing task's fsuid/fsgid. Ended by SIGKILL
+/// and owned like [`dump_unlink`].
+fn dump_create(
+    parent: &Arc<dyn narf_filesystem::DirOps>,
+    leaf: &str,
+    uid: u32,
+    gid: u32,
+) -> Option<Arc<dyn FileOps>> {
+    let parent = parent.clone();
+    let leaf = String::from(leaf);
+    let created = crate::killable_wait::wait(Box::pin(async move {
+        parent.create_with_attrs(&leaf, 0o600, uid, gid).await
+    }));
+    match created {
+        Ok(Some(Ok(file))) => Some(file),
+        _ => None,
+    }
+}
+
 pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
     // Fatal path only: publish the cause before any optional dump-file I/O
     // can fail or stall. This also covers RLIMIT_CORE=0. Do not put this
@@ -454,7 +716,61 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
     // from an earlier crash on its way to writing nothing.
     const ELF_MIN_COREDUMP: u64 = 4096;
     let limit = crate::handlers::coredump_limit(task);
-    if limit < ELF_MIN_COREDUMP {
+    let identity = crate::handlers::coredump_identity(task);
+    // `vfs_coredump`: `if (!coredump_parse(..)) return; if (!__get_dumpable(
+    // cprm.mm_flags)) return;` — a process that is not dumpable (a set-uid
+    // image, `PR_SET_DUMPABLE(0)`) leaves no core anywhere.
+    if !identity.dumpable {
+        return;
+    }
+    // `kernel.core_pattern` decides where the dump goes. This used to write
+    // `<cwd>/core` whatever the pattern said, so on a system whose pattern is
+    // systemd-coredump's `|/usr/lib/systemd/systemd-coredump ...` every
+    // crashing service wrote a core file into its working directory — `/`
+    // for a system service — where Linux writes none.
+    let comm = crate::handlers::proc_comm_of(pid).unwrap_or_default();
+    let hostname = crate::handlers::uts_hostname_for_current();
+    let target = core_target(
+        &narf_filesystem::procfs::sys_kernel::core_pattern(),
+        narf_filesystem::procfs::sys_kernel::core_uses_pid(),
+        &CoreNameArgs {
+            tgid: pid,
+            tid: crate::handlers::linux_tid_for_task(task),
+            uid: identity.uid,
+            gid: identity.gid,
+            dumpable: 1,
+            signal: signum,
+            time: narf_scheduler::narf_time::now_wall().secs,
+            hostname: &hostname,
+            comm: &comm,
+            exe: exe.as_deref(),
+            limit,
+            cpu: narf_lib::percpu::current_cpu() as u32,
+        },
+    );
+    let name = match target {
+        CoreTarget::File(name) => name,
+        CoreTarget::Pipe | CoreTarget::Socket => {
+            // `coredump_pipe` runs the helper with `call_usermodehelper_exec`
+            // and `coredump_sock` connects to a coredump server. NARF can do
+            // neither yet, which is Linux's "helper could not be started"
+            // case: report it and write no core. `cprm.limit == 1` is the
+            // recursion guard there and stays silent here too.
+            if limit != 1 {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "coredump: pid={pid} core_pattern names a helper or socket, which this kernel cannot run; skipping core dump"
+                );
+            }
+            return;
+        }
+    };
+    // `coredump_file`: `if (cprm->limit < binfmt->min_coredump) return false;`
+    // An empty name has nothing to create.
+    if limit < ELF_MIN_COREDUMP || name.is_empty() {
+        return;
+    }
+    if dump_interrupted(task) {
         return;
     }
 
@@ -465,21 +781,36 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
     };
     let regions = as_ref.regions_snapshot();
 
-    // Core file path: core
-    let path = resolve_cwd_path(task, "core");
+    let path = resolve_cwd_path(task, &name);
 
     // Open/Create core file
     let (parent, leaf) = match resolve_parent_dir_async(&path) {
         Some(x) => x,
         None => return,
     };
+    if dump_interrupted(task) {
+        return;
+    }
 
-    // Try unlinking first to clear any old core dump file
-    let _ = poll_blocking(parent.unlink(&leaf));
-
-    let file = match poll_blocking(parent.create(&leaf)) {
-        Some(Ok(f)) => f,
-        _ => return,
+    // `filename_unlinkat` and `filp_open(O_CREAT | O_EXCL, 0600)` run with
+    // the crashing task's credentials: without write permission on the
+    // directory there is no core, and nothing of anyone else's is removed
+    // from it.
+    if let Some((victim_uid, victim_gid)) = crate::handlers::entry_owner(&*parent, &leaf) {
+        if crate::handlers::may_delete_in(&*parent, victim_uid, victim_gid, task).is_err() {
+            return;
+        }
+        // Clear an old core dump file.
+        dump_unlink(&parent, &leaf);
+        if dump_interrupted(task) {
+            return;
+        }
+    }
+    if crate::handlers::may_create_in(&*parent, task).is_err() {
+        return;
+    }
+    let Some(file) = dump_create(&parent, &leaf, identity.fsuid, identity.fsgid) else {
+        return;
     };
 
     // Get register state
@@ -640,7 +971,7 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
         current_offset = align_up(current_offset + dump_len(r));
     }
 
-    if let Err(error) = write_metadata(file.as_ref(), limit, &ehdr, &phdrs, &note_buf) {
+    if let Err(error) = write_metadata(task, file.clone(), limit, &ehdr, &phdrs, &note_buf) {
         let _ = writeln!(
             narf_console::Writer,
             "coredump: pid={pid} metadata write failed: {error:?}"
@@ -673,12 +1004,20 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
                 let ptr = phys.kernel_ptr::<u8>();
                 // SAFETY: reading chunk_len <= 4096 from page is safe.
                 let slice = unsafe { core::slice::from_raw_parts(ptr, chunk_len as usize) };
-                if write_at(file.as_ref(), limit, offset, slice).is_err() {
+                if write_at(task, file.clone(), limit, offset, slice).is_err() {
                     return;
                 }
             } else {
                 let zeros = [0u8; 4096];
-                if write_at(file.as_ref(), limit, offset, &zeros[..chunk_len as usize]).is_err() {
+                if write_at(
+                    task,
+                    file.clone(),
+                    limit,
+                    offset,
+                    &zeros[..chunk_len as usize],
+                )
+                .is_err()
+                {
                     return;
                 }
             }

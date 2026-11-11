@@ -178,6 +178,124 @@ PHY ownership and acknowledged advanced queue enable. Blank-NVM IDs match,
 but an invalid factory MAC fails probe; NVM programming is unsupported.
 I220/I221 omit 2500 Mbps. Carrier, speed and duplex come from hardware.
 
+Initial built-in and module IGC probes park inherited mastering/decode and
+verify D0 before BAR sizing. Control MMIO is mapped before memory decode is
+enabled; BME remains off through reset, allocation and ring programming.
+Recovery/resume restores PCI state with BME masked before reset/reinitialization.
+Only retained, programmed DMA rings precede the final BME grant. Activation
+then enables global TCTL/RCTL before requesting individual TXDCTL/RXDCTL
+queue enables, matching Linux's `igc_configure` ordering. Ring preparation
+leaves heads/tails empty and never waits for an enable acknowledgement while
+the engines are parked. Every active ring's length and empty indices are
+checked before BME; receive tails are published only after all queues
+acknowledge. Built-in probe, recovery/resume and the module share activation.
+A failed probe parks the function; failed quiescence still retains uncertain DMA.
+Queue preparation, activation and shutdown preserve TCTL reserved reset fields
+through read-modify-write; preparing transmit clears the enable and SWXOFF
+command bits while setting collision/padding policy. This applies to built-in
+and module initialization and their recovery paths.
+Shared queue initialization rejects invalid ring geometry or failed base,
+length, SRRCTL and TX writeback-mode readbacks before queue enable. TX head
+writeback is disabled: terminal descriptor DD remains the completion authority.
+Advanced one-buffer RX programs a 2048-byte packet buffer, 256-byte header
+size and SRRCTL drop enable at bit31, with reserved bit28 clear.
+
+Built-in IGC registration opts the interface into the stack's software GRO
+(Linux `NETIF_F_GRO`, `napi_gro_receive`). Each queue's receive task is pinned
+to one CPU and flushes that CPU's held flows when its ring is empty and its
+vector re-armed, the `napi_complete_done` point.
+
+### Transmit-queue contract (`narf_net::txq`)
+
+A multi-queue driver that wants the stack to wait for transmit room, instead
+of dropping what a full ring cannot take, implements
+`narf_net::txq::TxBackpressure` and installs it with
+`narf_net::iface::set_tx_backpressure(name, driver)`. A driver that does not
+keeps today's behaviour: every frame goes through its send hook and a full
+ring drops. The contract is per transmit queue; no device-wide or global
+state is involved.
+
+The driver supplies, per device:
+
+| Method | Meaning |
+| --- | --- |
+| `tx_queue_count()` | number of transmit queues |
+| `tx_queue(q)` | that queue's `Arc<TxQueue>` |
+| `tx_select_queue(frame)` | the queue a flow maps to (`ndo_select_queue`); a pure function of the flow |
+| `tx_link_speed_mbps()` | negotiated speed, 0 if unknown |
+| `try_xmit(q, frame, meta)` / `try_xmit_copy(q, bytes, meta)` | offer a frame to queue `q`; `Err(Busy)` while the queue is stopped or the frame does not fit, `Err(Dropped)` if it can never be sent |
+
+and creates one `TxQueue::new(TxQueueGeometry { ring_len, max_frame_descs })`
+per ring, from the ring's real length and the most descriptors one frame can
+consume on that device (Linux `DESC_NEEDED`). The stop threshold is
+`max_frame_descs` free descriptors and the wake threshold twice that
+(`netif_txq_maybe_stop` / `netif_txq_completed_wake`, igc
+`igc_maybe_stop_tx` / `TX_WAKE_THRESHOLD`), both bounded by `ring_len - 1`.
+Nothing is sized for a particular link speed.
+
+The driver then calls, on that `TxQueue`:
+
+| Call | When | Linux |
+| --- | --- | --- |
+| `sent(bytes, free)` | after posting any frame; `free` re-reads the free descriptors | `netdev_tx_sent_queue` + `netif_txq_maybe_stop` |
+| `refused()` | a `try_xmit` frame that fits an empty ring found no room; return `Busy` | `NETDEV_TX_BUSY` |
+| `completed(pkts, bytes, free)` | once per reclaim batch | `netif_txq_completed_wake` |
+| `run_wakeups()` | from the completion context after a reclaim batch and from a periodic task, holding no queue lock | `__netif_schedule` / `tcp_tsq_handler` |
+| `reset()` | after a ring reset discarded its frames | `netdev_tx_reset_queue` |
+
+A frame larger than an empty ring (`!fits_empty_ring(descs)`) must be an
+error, never `Busy`. A frame sent through the ordinary send hook is accepted
+while descriptors remain: the descriptors below the stop threshold are the
+room pure ACKs, SYN/FIN/RST, retransmissions and non-TCP traffic use while
+bulk data waits. An owned `Frame` may carry a connection's byte charge; it is
+released when the `Frame` is destroyed, so a driver must keep a posted frame
+alive until its descriptors complete and must drop the frames of a reset
+ring.
+
+IGC is the first implementation: `MAX_FRAME_DESCS` is 20 (a 64 KiB frame
+split at 4 KiB boundaries, one context descriptor, two for the launch-time
+workaround), each `Queue` owns its `TxQueue`, reclaim reports once per batch
+under the queue's transmit lock, the per-queue receive task runs the wake
+pass after each poll and the 10 ms maintenance task runs it as well.
+`tx_queue_N_restart` counts wakes. `IgcError::TxBusy` is never counted in
+`tx_rejected`.
+
+Not implemented: the adaptive per-queue byte limit of
+`lib/dynamic_queue_limits.c` (BQL). `sent`/`completed` already carry the
+bytes and packets it needs.
+
+TX watchdogs (igc, igb, ixgbe, e1000, forcedeth, r8169) compare ages as
+Linux `time_after` does: a frame stamped after the watchdog sampled the clock
+has age zero. The sample is taken before the queue lock, so a concurrent
+sender's stamp can be the later of the two.
+
+IGC completion writeback must progress for a single packet with hardware
+interrupt timers unavailable. TX uses WTHRESH`0` with RS on each packet's
+terminal descriptor; RX uses WTHRESH`1` (zero is not an immediate-writeback
+mode). Software descriptor publication and receive draining remain batched.
+This applies to built-in, module, reset/recovery and resume through shared
+queue preparation. EITR still controls interrupt moderation. The first TX
+timeout also records a read-only CPU page-table walk for both rings, the
+physical and translated addresses, PAT selection and MTRR default register.
+These are diagnostic evidence, never completion or safe-reuse authority.
+The selected PAT entry alone does not establish the effective memory type
+when variable MTRRs override it. No live cache flush or alternate RAM alias
+is introduced. Hardware acceptance and throughput measurements remain open.
+If that timeout enters recovery, a second snapshot counts descriptor DD bits
+and samples retained RX-buffer prefixes after the existing device-wide DMA
+drain succeeds, before reset clears the rings. UMEM leases are skipped. No
+payload is read if the drain fails. Nonzero prefixes can include earlier
+traffic in reused buffers; the paired software counters and pre-stop sample
+are needed to interpret them. Neither snapshot authorizes buffer reuse.
+
+Before enabling queues, the built-in driver clears PCIe Device Control's
+No Snoop Enable bit and verifies the readback, including after recovery or
+resume restores PCI state. Its cached coherent rings require snooped DMA.
+Other Device Control fields are preserved; Device Status RW1C bits are not
+acknowledged by this write. Missing/unresponsive configuration or a failed
+readback prevents queue enable. This does not establish coherence for an
+otherwise non-coherent platform interconnect.
+
 Each function supports 1–4 queue pairs, initially bounded by online CPUs, with
 independent 64–4096-entry TX/RX rings (multiples of eight). The initial size is
 256 entries. MSI-X entry 0 handles other causes and entries 1–4 route queue

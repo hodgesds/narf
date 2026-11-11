@@ -398,6 +398,17 @@ impl OpenFileDescription {
         }
     }
 
+    /// The path this description was opened on, when it was opened by path:
+    /// Linux `file->f_path`, as far as `d_path` for `/proc/<pid>/fd/<n>`
+    /// needs it. Every alias of the description names the same file, also
+    /// one installed in another task by SCM_RIGHTS.
+    pub(crate) fn opened_path(&self) -> Option<String> {
+        self.close_notify
+            .lock()
+            .as_ref()
+            .map(|(path, _)| path.clone())
+    }
+
     pub(crate) fn fasync_waiter_id(&self) -> u64 {
         self.fasync_waiter_id
     }

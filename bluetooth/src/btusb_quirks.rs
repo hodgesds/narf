@@ -139,7 +139,13 @@ pub const QUIRK_TABLE: &[QuirkMatch] = &[
         product: 0x9309,
         quirk: Quirk::QualcommWcn6855,
     }, // USI WCN6855 2.1 bring-up target
-    // MediaTek MT7921 / MT7922 (Phoenix HawkPoint1 default).
+    // MediaTek MT7921 / MT7922. Linux matches vendor 0e8d with the
+    // Bluetooth interface triple; its USB PID need not equal the chip ID.
+    QuirkMatch {
+        vendor: 0x0e8d,
+        product: 0x0616,
+        quirk: Quirk::MediaTek,
+    }, // MT7922 USB alias; native setup verifies the chip register.
     QuirkMatch {
         vendor: 0x0e8d,
         product: 0x7961,

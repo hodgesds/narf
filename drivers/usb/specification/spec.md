@@ -407,6 +407,38 @@ also consult upstream Linux GPL sources.
 - `Xhci::control_in` and `Xhci::control_out` identify Data and Status Stage
   completion events by their originating control-ring TRB and drain both before
   returning. A queued Status completion may never satisfy the next control TD.
+  The Setup Stage TRB is retained as a third, error-only receipt: it requests
+  no event, so a Transfer Event that names it is a failure (Linux
+  `process_ctrl_td` ends the TD on an error against any of its TRBs). Such an
+  event is latched by the EP0 owner — never the lossy shared queue — and ends
+  whichever stage is being awaited as `CmdFailed(code)`; a halting code
+  (Babble 3, Transaction Error 4, Stall 6) then runs `Xhci::reset_endpoint`
+  for DCI 1 before the error is returned. Each stage wait, each command
+  wait (Enable/Disable Slot, Address Device, Configure/Evaluate, Stop/Reset
+  Endpoint, Set TR Dequeue) and each compatibility one-shot bulk/isoch wait
+  is bounded at 250 ms. Linux allows commands and control stages 5000 ms
+  (`XHCI_CMD_DEFAULT_TIMEOUT`, `USB_CTRL_GET_TIMEOUT`), but these waits
+  re-poll on every executor round instead of sleeping, and a 5000 ms bound
+  let one silent device stall a physical boot. The longer bounds return
+  once the wait can block.
+- A control stage timeout (`CmdTimeout`) cancels the still-published TD
+  before it is reported: under the slot's configuration claim the EP0 owner
+  quarantines every DCI 1 Transfer Event for the slot, then Stop Endpoint
+  (skipped when the output context already reads Stopped; a Halted context,
+  or a Context State Error from Stop followed by a Halted readback, takes
+  Reset Endpoint instead) and Set TR Dequeue Pointer at the canonical
+  Link-boundary enqueue cursor. Readback must show Stopped at exactly that
+  dequeue; only then are EP0's queued events purged and the claim released,
+  so the next control transfer on the device is accepted. Any failure after
+  the claim leaves EP0 terminally busy, as for `reset_endpoint`. This mirrors
+  Linux `usb_kill_urb` → `xhci_urb_dequeue` → `xhci_handle_cmd_stop_ep`. The
+  first 16 timeouts per controller also log the EP0 output-context state and
+  dequeue, USBSTS, PORTSC, the TD's receipts and any unmatched Transfer
+  Events for the slot. A timed-out *command* is still only retired
+  (tombstoned); Command Abort (CRCR.CA) is not issued.
+- Root-port reset waits 50 ms (TRSTRCY 10 ms + 40 ms, Linux `hub_port_reset`,
+  same as the hub-class reset) before the first SETUP, and Address Device
+  waits 10 ms after its successful completion (Linux `hub_port_init`).
 - `USBDevice::{begin_bulk_in,begin_bulk_out}` submit one 1..4096-byte TD
   and return a `BulkToken`; `poll_bulk_in(token, out)` / `poll_bulk_out(token)`
   return `None` while the same TD remains active. A receive buffer must cover
@@ -592,7 +624,10 @@ also consult upstream Linux GPL sources.
   data toggles restart together; EP0 skips the CLEAR_FEATURE step.
 - The supervisor drives root and hub enumeration to a terminal result using
   the hardware operations' individual deadlines. It does not cancel an
-  in-flight owner at a whole-port deadline. Pending enumeration and hub-status
+  in-flight owner at a whole-port deadline. A failed attempt during which a
+  command or control stage timed out is charged half of the port's 8-attempt
+  retry budget (two such attempts exhaust it), which bounds how long a dead device
+  keeps the supervisor busy. Pending enumeration and hub-status
   waits service existing nonblocking report pumps, with bound suspended ports
   resumed before the first pump in each supervisor cycle.
 - Terminal enumeration failures and device detach share slot cleanup. They
@@ -843,7 +878,14 @@ also consult upstream Linux GPL sources.
   0xFC09 → Intel Reset boot 0xFC01 → best-effort `.ddc` over 0xFC8B), and
   for MediaTek-quirk IDs the btmtk 79xx WMT RAM-code download (WMT
   PATCH_DWNLD over 0xFC6F, section-map probe + ≤250-byte flagged chunks,
-  status from the 0xE4 WMT event); for Realtek-quirk IDs the btrtl
+  status from the 0xE4 WMT event). USB alias `0e8d:0616` enters the
+  MediaTek path; setup verifies the chip register and selects the exact ROM
+  revision/flavor firmware name before download. WMT length counts the flag
+  plus data, raw patch flags 0/1/2 mean undone/progress/done, and events are
+  polled through vendor EP0 request IN 1/value48 with the Linux 500us gap for
+  empty replies. After download, endpoint reset options and WMT FUNC_CTRL
+  protocol enable must succeed before generic HCI Reset. Transfers retain
+  the original xHCI slot generation. For Realtek-quirk IDs the btrtl
   sequence (ROM version over 0xFC6D → security key id over 0xFC61 →
   epatch v1/v2 parse with the patch selected by ROM version + 1 and
   the file's project id verified against the product id's chip
@@ -1064,7 +1106,7 @@ also consult upstream Linux GPL sources.
 | `138a:0011` | Validity VFS5011 fingerprint reader | Explicit Validity match (single authority table, #918), vendor-class bulk-IN/bulk-OUT transport, `/dev/fp0` handoff | Userspace Validity enrol/match protocol; silicon validation on a VFS5011-fitted machine |
 | `10ab:9309` | USI/Qualcomm WCN6855 Bluetooth | Explicit WCN6855 quirk match, runtime version/status query, rampatch + board-NVM USB download, full mandatory HCI bring-up, ready-controller registration, and `hci<N>` sysfs publication | Production-sign the imported firmware and validate the full sequence on silicon |
 | `8087:0032` | Intel AX210 Bluetooth (Renoir target) | Explicit Intel quirk match, version-TLV + boot-params read, `.sfi` secure-send download + Intel Reset boot + `.ddc` config, full mandatory HCI bring-up, ready-controller registration, `hci<N>` sysfs publication, HCI pump | Stage the `intel/ibt-*` blobs and validate the full sequence on silicon |
-| `0e8d:7922` | MediaTek MT7922 Bluetooth (Phoenix target) | Explicit MediaTek quirk match, WMT 79xx RAM-code download (section probe + flagged chunks), full mandatory HCI bring-up, ready-controller registration, `hci<N>` sysfs publication, HCI pump | Stage the `mediatek/BT_RAM_CODE_MT7922_*` blob and validate the full sequence on silicon |
+| `0e8d:0616`, `0e8d:7922` | MediaTek MT7922 Bluetooth (Phoenix target) | Explicit MediaTek quirk match, WMT 79xx RAM-code download (section probe + flagged chunks), full mandatory HCI bring-up, ready-controller registration, `hci<N>` sysfs publication, HCI pump | Stage the `mediatek/BT_RAM_CODE_MT7922_*` blob and validate the full sequence on silicon |
 | `30c9:00cd` | Luxvisions integrated camera | Generic UVC bind, `/dev/video<N>` registration, PROBE/COMMIT negotiation, streaming-alternate selection, USB 2.0 high-bandwidth xHCI programming, and frame delivery | Validate negotiation and end-to-end isochronous video capture on silicon |
 
 The `1d6b:0002` and `1d6b:0003` entries are synthetic root hubs exposed by

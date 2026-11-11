@@ -45,6 +45,7 @@ pub mod node;
 pub mod registry;
 pub mod roots;
 pub mod rw_gate;
+pub mod stats;
 pub mod volume;
 pub mod write;
 

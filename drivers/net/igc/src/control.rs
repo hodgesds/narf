@@ -255,7 +255,8 @@ impl NicControl for Igc {
             linux_queues.push([
                 values[1],
                 values[2],
-                0,
+                // Linux `tx_stats.restart_queue`: wakes of a stopped queue.
+                queues.get(q).map_or(0, |q| q.txq().restarts()),
                 values[5],
                 values[6],
                 hw_drops[q],
@@ -410,6 +411,9 @@ impl NicControl for Igc {
     }
     fn restart_link(&self) -> Result<(), i32> {
         self.recover().map_err(|_| 5)
+    }
+    fn timestamp_info(&self) -> (u32, u32, u32) {
+        (0x47, 3, 3)
     }
     fn clock_index(&self) -> i32 {
         self.phc_index.load(Ordering::Acquire)
@@ -900,11 +904,15 @@ pub(crate) fn regs_dump(
     }
     for q in 0..4 {
         out[149 + q] = r.read(0xe000 + q as u64 * 0x40);
-        out[152 + q] = r.read(0xe004 + q as u64 * 0x40);
         out[156 + q] = r.read(0xe008 + q as u64 * 0x40);
         out[160 + q] = r.read(0xe010 + q as u64 * 0x40);
         out[164 + q] = r.read(0xe018 + q as u64 * 0x40);
         out[168 + q] = r.read(0xe028 + q as u64 * 0x40);
+    }
+    // Linux writes all TDBAL words before TDBAH: their legacy dump
+    // slots overlap at 152 (queue 3 low / queue 0 high).
+    for q in 0..4 {
+        out[152 + q] = r.read(0xe004 + q as u64 * 0x40);
     }
     // Second RAL/RAH copies preserve the ABI after the overlap above.
     for i in 0..16 {

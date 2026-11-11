@@ -15,6 +15,7 @@
 //! The crate-root re-exports the public API from `core` so call
 //! sites use `narf_net::tcp_stack::send` etc. unchanged.
 
+pub mod autotune;
 pub mod congestion;
 pub mod core;
 pub mod options;

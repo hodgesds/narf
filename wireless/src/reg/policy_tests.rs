@@ -6,6 +6,77 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 include!("policy_fixture.rs");
 include!("indoor_fixture.rs");
 
+fn smoke_linux_regulatory_bootstrap_only_on_absence_and_country_source_guard() -> TestResult {
+    use super::super::db::{ensure_source_with, select_linux_with, Source};
+    let authority = registry();
+    let db = narf_firmware::linux_regulatory_database();
+    let Ok((world, Source::Linux(0))) = bootstrap_from(&authority, "test/absent-linux-policy", db)
+    else {
+        return TestResult::Fail("missing NRGD did not select authenticated Linux world");
+    };
+    if world.country_code != *b"00" || world.rule_for(2412).is_none() {
+        return TestResult::Fail("Linux bootstrap did not retain world country/rules");
+    }
+    match bootstrap_from(&authority, "test/wireless-policy-signed", db) {
+        Ok((domain, Source::Deployment)) if exact(&domain) => {}
+        _ => return TestResult::Fail("Linux default displaced signed deployment policy"),
+    }
+    let database = Database::new();
+    ensure_source_with(&database, || Ok((world.clone(), Source::Linux(0)))).unwrap();
+    let linux_country = || super::super::linux::country(db, *b"US").map_err(Error::Format);
+    if select_linux_with(&database, linux_country).is_err()
+        || database.snapshot().unwrap().country_code != *b"US"
+    {
+        return TestResult::Fail("authenticated Linux country could not replace Linux world");
+    }
+    for deployment in [false, true] {
+        database.clear();
+        if deployment {
+            ensure_source_with(&database, || Ok((world.clone(), Source::Deployment))).unwrap();
+        } else {
+            database.install(world.clone());
+        }
+        let called = core::cell::Cell::new(false);
+        if select_linux_with(&database, || {
+            called.set(true);
+            linux_country()
+        }) != Err(Error::Authority)
+            || called.get()
+        {
+            return TestResult::Fail("country hint relaxed deployment/caller bounds");
+        }
+    }
+    database.clear();
+    ensure_source_with(&database, || Ok((world.clone(), Source::Linux(0)))).unwrap();
+    if select_linux_with(&database, || {
+        database.install(world.clone());
+        linux_country()
+    }) != Err(Error::Authority)
+        || database.snapshot().unwrap().country_code != *b"00"
+    {
+        return TestResult::Fail("country lookup overwrote racing caller installation");
+    }
+    database.clear();
+    ensure_source_with(&database, || Ok((world, Source::Linux(0)))).unwrap();
+    if select_linux_with(&database, || {
+        database.clear();
+        linux_country()
+    }) != Err(Error::Authority)
+        || database.snapshot().is_some()
+    {
+        return TestResult::Fail("country lookup undid racing policy clear");
+    }
+    authority.revoke();
+    if bootstrap_from(&authority, "test/absent-linux-policy", db).is_ok() {
+        return TestResult::Fail("revoked lookup authority silently became Linux default");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/regulatory",
+    smoke_linux_regulatory_bootstrap_only_on_absence_and_country_source_guard
+);
+
 fn smoke_signed_indoor_installation_requires_real_signature_and_current_blob() -> TestResult {
     let (write, read) = narf_firmware::bootstrap_authority();
     narf_firmware::register_trusted_signer(FINGERPRINT, PUBLIC);

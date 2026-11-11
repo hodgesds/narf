@@ -423,13 +423,21 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         let options = endpoint.read_options();
         let poll_once_only = endpoint.ops.nonblock_read_eagain()
             || (options.nonblocking && endpoint.ops.is_stream());
-        let read_fut = endpoint
-            .ops
-            .read_with_options(offset, &mut staging, options);
         let outcome = if poll_once_only {
+            let read_fut = endpoint
+                .ops
+                .read_with_options(offset, &mut staging, options);
             poll_once(read_fut).unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
         } else {
-            poll_blocking(read_fut).unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+            // `filemap_read`: a fatal signal ends the wait for the file's
+            // data; the read itself finishes without this task.
+            match crate::killable_wait::read(&endpoint.ops, offset, &mut staging, want, options) {
+                Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+                Err(crate::killable_wait::Killed) => {
+                    ctx.set_return(errno_ret(EINTR));
+                    return;
+                }
+            }
         };
         match outcome {
             Ok(0) => break,

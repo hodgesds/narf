@@ -955,6 +955,25 @@ mod tests {
     kernel_test_in!("syscall_abi", smoke_drm_sync_file_merge_unwrap_rules);
 }
 
+/// Path of the slave `TIOCGPTPEER` opens for the master at `master_fd` —
+/// `fs/devpts/inode.c::devpts_mntget` followed by the slave's dentry: the
+/// devpts mount the master was opened on if it is the pty's instance
+/// (`<mnt>/ptmx` → `<mnt>/<N>`), otherwise the devpts mounted at `pts`
+/// beside the ptmx node (`devpts_ptmx_path`: `/dev/ptmx` → `/dev/pts/<N>`).
+/// `None` when the master has no recorded path or neither directory is the
+/// pty's devpts.
+fn pty_peer_path(task: u64, master_fd: u32, pty_id: u32) -> Option<alloc::string::String> {
+    let master = crate::mqueue::fd_path(task, master_fd)?;
+    let (dir, _) = master.rsplit_once('/')?;
+    let under = |root: &str| -> Option<alloc::string::String> {
+        let pts = resolve_dir_absolute(if root.is_empty() { "/" } else { root })?;
+        let index = narf_filesystem::devfs_pty::pts_index_under(pts.as_ref(), pty_id)?;
+        Some(alloc::format!("{root}/{index}"))
+    };
+    let own = under(dir);
+    own.or_else(|| under(&alloc::format!("{dir}/pts")))
+}
+
 // `drivers/tty/pty.c::ptm_open_peer` ends in `FD_ADD`, which is
 // `FD_PREPARE` + `fd_publish` over `get_unused_fd_flags`: a descriptor table
 // at RLIMIT_NOFILE is -EMFILE (the shared `errno::EMFILE`). These arms only
@@ -1569,7 +1588,19 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             },
         );
         match new_fd {
-            Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
+            Some(f) => {
+                // `ptm_open_peer` opens `{devpts_mntget(master), slave
+                // dentry}`, so the new file has a path like any open(2)
+                // result and `/proc/<pid>/fd/<n>` reads `/dev/pts/<N>`. glibc
+                // `openpty` gets its slave this way and `ttyname` resolves it
+                // through that link; without a path sshd dies with "openpty
+                // returns device for which ttyname fails".
+                if let Some(path) = pty_peer_path(task, fd, idx) {
+                    let mount_id = current_mount_id_at(&path);
+                    crate::mqueue::register_fd_path_owned(task, f, path, mount_id);
+                }
+                ctx.set_return(SyscallReturn::ok(f as u64));
+            }
             None => ctx.set_return(errno_ret(EMFILE)),
         }
         return;

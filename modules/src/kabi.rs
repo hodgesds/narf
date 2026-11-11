@@ -281,6 +281,16 @@ kernel_abi! {
     // device authority. `dev` is the `dev_token` the `ModuleProbeFn` was called
     // with.
 
+    /// Park inherited PCI decoding/mastering and enter D0 before initial
+    /// BAR/DMA setup. Refused once this module context has live resources.
+    ///
+    /// # Safety
+    /// `dev` is the caller's fresh probe token; no concurrent setup may run.
+    fn narf_pci_prepare_probe(dev: u64) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_pci_prepare_probe(owner, dev)
+    }
+
     /// Enable PCI command bits (e.g. `MEM_SPACE | BUS_MASTER`) on the module's
     /// device so its BARs respond. Returns 0, or `-ENODEV`/`-EIO`.
     ///

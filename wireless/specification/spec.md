@@ -2594,15 +2594,33 @@ state unchanged; transmitters use the fallible APIs. Deterministic seed and
 scalar/mask constructors exist only in test or `kernel-test` builds. Protocol
 fixtures use explicit injected material and do not depend on target entropy.
 
-### 3.5 Deployment regulatory policy
+### 3.5 Authenticated regulatory policy
 
 `reg::parse_policy` decodes an NRGD v1 policy; parsing alone conveys no
 authority. `reg::policy::load()` opens the exact `wireless-regulatory.bin`
 through trusted firmware-registry authority, invokes the blob's current
 capability, requires verified signer metadata and returns a fully decoded
 owned domain. Unsigned policies are rejected even in unsigned-firmware builds.
+Only `FirmwareError::NotFound` for that exact name selects the Linux
+wireless-regdb world domain (`00`) from
+`narf_firmware::linux_regulatory_database()`. Its unchanged `regulatory.db`
+bytes were authenticated at build time against the upstream public
+certificates; no private deployment key or runtime PKCS#7 implementation is
+required. Malformed, unsigned, revoked or rejected-present deployment assets
+do not select that fallback. Database updates require rebuilding the image.
+
+The strict v20 reader checks big-endian RGDB/version20, bounded and ordered
+country pointers, collection/rule extents, known flags and optional fields.
+It rounds frequency boundaries inward from kHz to MHz and floors bandwidth
+and unsigned mBm EIRP to the existing driver units. It retains NO_IR, DFS,
+NO_OUTDOOR as INDOOR_ONLY, AUTO_BW and the exact ETSI WMM floor. Unknown flags,
+extensions, nonzero CAC overrides or unsupported WMM parameters refuse the
+selected country. NO_OFDM rules are omitted conservatively until drivers
+can enforce their modulation restriction: world/JP channel14 is unavailable.
+No indoor installation assertion is inferred from a database rule.
+
 `reg::db::ensure_domain()` preserves an existing caller-installed domain,
-otherwise performs that signed bootstrap without holding the database lock.
+otherwise performs that authenticated bootstrap without holding the database lock.
 Only successful loads install state; a caller policy installed during lookup
 wins the race. A clear during lookup invalidates that in-flight bootstrap;
 a later explicit bootstrap may load afresh. Saturated revisions reject bootstrap
@@ -2616,6 +2634,21 @@ owned-value APIs. Lookup, decoding, rule cloning and retired-snapshot destructio
 happen outside the database's IRQ-disabling lock. This cache does not authenticate
 arbitrary caller-installed domains or automatically observe firmware-blob
 capability revocation: a trusted installer/source must replace or clear policy.
+
+`NL80211_CMD_GET_REG` reports that same shared installation and its Linux DFS
+region; a failed explicit policy does not produce an unrelated world response.
+`NL80211_CMD_REQ_SET_REG` (27) accepts a two-byte uppercase alpha2 or exact
+`00`, optionally followed by NUL, looks it up in the authenticated embedded database and publishes
+REG_CHANGE. Linux `GENL_ADMIN_PERM` and an initial-network-namespace check
+protect this global change; an interface delegation or child-namespace admin
+cannot change it. Cellular/indoor hints and caller-provided rules are refused.
+Only a Linux-sourced installation accepts country selection: signed NRGD and
+trusted caller overrides retain their bounds. Installation/clear racing the
+lookup wins via the revision check. Existing live drivers close or restrict
+their admission on replacement; a country hint does not guarantee that a
+previously initialized hardware envelope can broaden without reattachment.
+MT7921 ordinary-channel permission accepts exact `00`; other drivers that
+require alphabetic countries continue to refuse world-domain TX.
 
 Native CYW43439/BCM43602 attachment observes the live shared installation through
 `Station::initialize_live` and a `PolicySource`; explicit `Station::initialize`
@@ -2635,18 +2668,19 @@ policy-observation contracts.
 Intel probe, MT76 publication/TX admission, ath10k station-control entry points
 and the common CYW/Broadcom FullMAC attachment use this bootstrap. A standalone
 driver no longer requires another wireless driver to populate the database.
-FullMAC attachment and TX admission fail when policy is missing/invalid;
+FullMAC attachment and TX admission fail when authenticated policy is unavailable/invalid;
 Intel/MT76 diagnostic/passive receive paths retain their existing closed-TX
-behavior. No calibration, country or default transmit authority is inferred.
-RTL8188EU uses `policy::load()` directly on every attach, preserving its
-fresh-signed-artifact requirement independently of the shared domain cache.
-Deployment public keys are baked into the image with
+behavior. No calibration or deployment country is inferred.
+RTL8188EU uses `policy::load()` directly on every attach, preserving a fresh
+authenticated lookup independently of the shared domain cache. Its country
+guards continue to refuse world-domain TX until that driver supports `00`.
+Optional deployment public keys are baked into the image with
 `NARF_FIRMWARE_TRUSTED_KEYS`; the firmware packer accepts a verified
 detached signature. No deployment country or signing key is chosen by
-the driver. The policy must be supplied by the image builder.
-Without a configured policy the interface may scan passively but cannot
-associate. This is a deployment-selected policy, not a bundled global
-regulatory database or a country inferred from AP advertisements.
+the driver. Without that override, the authenticated bundled Linux database
+supplies world `00`; each driver's existing factory and admission restrictions
+still apply. A deployment country is selected only by an authorized explicit
+hint or signed override, not inferred from AP advertisements.
 
 The byte format is `NRGD[4]`, version `u16=1`, uppercase country `[u8;2]`,
 rule count `u16`, reserved `u16=0`, followed by 1–64 rules of 16 bytes:

@@ -15,7 +15,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_capabilities::{Cap, Write};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_memory::PhysAddr;
 
 use crate::device::{BusDevice, BusKind};
@@ -57,6 +57,8 @@ pub enum PciError {
     CapNotPresent,
     /// Config-space offset was misaligned or outside the 4 KiB window.
     BadOffset,
+    /// A function disappeared or did not latch the required parked/D0 state.
+    NotReady,
 }
 
 impl From<narf_capabilities::CapError> for PciError {
@@ -161,7 +163,78 @@ pub fn set_command(
     unsafe {
         cfg_write16(cfg, COMMAND_OFFSET, new);
     }
+    if bits & cmd::BUS_MASTER != 0 {
+        enable_upstream_bridges(device);
+    }
     Ok(new)
+}
+
+/// The Command value a bridge needs to forward its secondary side's
+/// traffic, or `None` when it already does (or the bridge is gone).
+///
+/// A type-1 function with Bus Master Enable clear handles memory requests
+/// arriving on its secondary side as Unsupported Requests, which silently
+/// drops the downstream device's DMA writes and MSI/MSI-X messages while
+/// its register accesses keep working.
+pub const fn bridge_forwarding_command(command: u16) -> Option<u16> {
+    let wanted = command | cmd::MEM_SPACE | cmd::BUS_MASTER;
+    if command == u16::MAX || wanted == command {
+        None
+    } else {
+        Some(wanted)
+    }
+}
+
+/// Serializes Command updates on bridges, which several downstream
+/// drivers share and none of them owns.
+static BRIDGE_COMMAND: narf_lib::sync::IrqSafeSpinLock<()> =
+    narf_lib::sync::IrqSafeSpinLock::new(());
+
+/// The Command register of every bridge above `device`, nearest first.
+/// Read-only: for drivers reporting why DMA or MSI did not arrive.
+pub fn upstream_bridge_commands(device: &BusDevice) -> alloc::vec::Vec<(crate::PcieAddr, u16)> {
+    let mut out = alloc::vec::Vec::new();
+    let mut current = *device;
+    for _ in 0..256 {
+        let Some(bridge) = upstream_bridge(&current) else {
+            break;
+        };
+        if let BusKind::Pcie { addr, cfg_phys } = bridge.kind {
+            // SAFETY: the Command register is inside the bridge's registered
+            // config window; this is a read.
+            out.push((addr, unsafe { cfg_read16(cfg_phys, COMMAND_OFFSET) }));
+        }
+        current = bridge;
+    }
+    out
+}
+
+/// Linux `pci_enable_bridge`: before a function may master the bus, every
+/// bridge between it and the root must decode memory and forward upstream
+/// requests. Firmware is not required to leave that enabled on ports it
+/// did not boot from. Returns how many bridges had to be changed.
+pub fn enable_upstream_bridges(device: &BusDevice) -> usize {
+    let mut changed = 0;
+    let mut current = *device;
+    // A segment has at most 256 buses, which bounds any acyclic chain.
+    for _ in 0..256 {
+        let Some(bridge) = upstream_bridge(&current) else {
+            break;
+        };
+        if let Ok(cfg) = pcie_cfg_phys(&bridge) {
+            let _guard = BRIDGE_COMMAND.lock();
+            // SAFETY: the Command register is inside the bridge's registered
+            // config window; the lock excludes other bridge Command writers.
+            unsafe {
+                if let Some(command) = bridge_forwarding_command(cfg_read16(cfg, COMMAND_OFFSET)) {
+                    cfg_write16(cfg, COMMAND_OFFSET, command);
+                    changed += 1;
+                }
+            }
+        }
+        current = bridge;
+    }
+    changed
 }
 
 /// Mask `bits` out of the device's Command register, leaving every
@@ -334,6 +407,78 @@ pub fn set_power_state(
         );
     }
     Ok(())
+}
+
+/// Park inherited mastering and memory decoding, enter D0, and restore BARs
+/// lost on D3hot exit before a driver sizes/maps them. Leaves INTx disabled
+/// and MEM_SPACE/BUS_MASTER clear; the driver enables memory only after its
+/// control mapping exists, and mastering only after owning its DMA rings.
+///
+/// Use for initial probe or after the caller has stopped its live owner.
+/// Parking alone is not proof that outstanding DMA completed.
+pub fn prepare_memory_probe(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<Option<PciPowerState>, PciError> {
+    struct Prepare<'a>(&'a BusDevice);
+    impl CapOp<BusDeviceCap, Write> for Prepare<'_> {
+        type Output = Result<Option<PciPowerState>, PciError>;
+        fn execute(self, cap: &Cap<BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+            Ok(prepare_memory_probe_current(cap, self.0))
+        }
+    }
+    cap.invoke(Prepare(device)).map_err(PciError::from)?
+}
+
+fn prepare_memory_probe_current(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<Option<PciPowerState>, PciError> {
+    let park = || {
+        if read_command(cap, device)? == u16::MAX {
+            return Err(PciError::NotReady);
+        }
+        clear_command(cap, device, cmd::BUS_MASTER | cmd::MEM_SPACE)?;
+        set_command(cap, device, cmd::INTX_DISABLE)?;
+        if read_command(cap, device)? & (cmd::BUS_MASTER | cmd::MEM_SPACE | cmd::INTX_DISABLE)
+            != cmd::INTX_DISABLE
+        {
+            return Err(PciError::NotReady);
+        }
+        Ok(())
+    };
+    park()?;
+    let previous = match power_state(cap, device) {
+        Ok(Some(state)) => state,
+        Err(PciError::CapNotPresent) => return Ok(None),
+        Ok(None) => return Err(PciError::NotReady),
+        Err(error) => return Err(error),
+    };
+    if previous != PciPowerState::D0 {
+        const OFFSETS: [u16; 7] = [0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x30];
+        let mut bars = [0u32; 7];
+        for (i, offset) in OFFSETS.iter().enumerate() {
+            bars[i] = read_config32(cap, device, *offset)?;
+        }
+        set_power_state(cap, device, PciPowerState::D0)?;
+        narf_scheduler::responsive_spin_until(
+            || false,
+            narf_time::Deadline::after_ms(PM_D3HOT_DELAY_MS),
+        );
+        if power_state(cap, device)? != Some(PciPowerState::D0) {
+            return Err(PciError::NotReady);
+        }
+        // A soft reset on D3hot exit can also clear Command. Re-park before
+        // restoring any address decoder; never restore inherited BME.
+        park()?;
+        for (offset, value) in OFFSETS.into_iter().zip(bars) {
+            write_config32(cap, device, offset, value)?;
+            if read_config32(cap, device, offset)? != value {
+                return Err(PciError::NotReady);
+            }
+        }
+    }
+    Ok(Some(previous))
 }
 
 /// A type-1 (bridge) header's secondary and subordinate bus numbers
@@ -559,6 +704,12 @@ pub fn restore_config(
         // INTx-disable in a single atomic-ish write, matching the
         // state the driver was running in before suspend.
         cfg_write16(cfg, 0x04, saved.command);
+    }
+    // A restored function that masters the bus needs its bridges forwarding
+    // again, exactly as on the first grant: a port can come back from a low
+    // power state with Bus Master Enable clear.
+    if saved.command != u16::MAX && saved.command & cmd::BUS_MASTER != 0 {
+        enable_upstream_bridges(device);
     }
     Ok(())
 }

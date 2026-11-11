@@ -141,6 +141,7 @@ pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
 };
+pub use memfs::tmpfs_parse_param;
 pub use memfs::{
     new_anon_file as new_anon_memfile, new_file_with_perms_owner as new_memfile_with_perms_owner,
     MemFs, RamFs, RamFsOptions, TmpFs, TmpFsOptions,
@@ -2452,6 +2453,19 @@ pub trait DirOps: Send + Sync {
     /// default returns `None`; the initramfs nests via `/`-in-name
     /// (CPIO encodes paths whole), not via subdirectory entries.
     fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
+        None
+    }
+
+    /// Inode number of the entry `name`, as `getdents` reports it in
+    /// `d_ino` — the same number `stat` of that entry gives in `st_ino`
+    /// (Linux `dir_emit(ctx, name, len, ino, type)`). It must not open or
+    /// otherwise touch the entry: a readdir is not a lookup.
+    ///
+    /// `None` (the default) means the directory cannot name the inode
+    /// without a lookup; the readdir handler then reports a placeholder.
+    /// glibc's `ttyname` falls back to matching `d_ino` in `/dev/pts`
+    /// against `fstat` of the terminal, so devpts answers this.
+    fn entry_ino(&self, _name: &str) -> Option<u64> {
         None
     }
 

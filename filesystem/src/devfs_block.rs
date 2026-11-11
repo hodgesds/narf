@@ -520,9 +520,9 @@ pub fn __reset_disk_links_for_test() {
     BY_PATH_LINKS.lock().clear();
 }
 
-/// Create a udev symlink in a by-* overlay. `generated_exists` guards against
-/// shadowing/duplicating a synthesised (partition-derived) entry, which
-/// `symlink(2)` reports as `EEXIST` just like a re-create of an overlay entry.
+/// Create a udev symlink in a by-* overlay. A generated entry already exists
+/// for symlink(2), just like an overlay entry; either reports EEXIST. Atomic
+/// replacement uses a temporary overlay name followed by rename(2).
 fn disk_symlink<'a>(
     overlay: &'static IrqSafeSpinLock<crate::devfs::DynamicMap>,
     generated_exists: bool,
@@ -545,7 +545,10 @@ fn disk_enumerate(
     cursor: usize,
     max: usize,
 ) -> Vec<(String, FileType)> {
-    generated.extend(crate::devfs::dynamic_enumerate(overlay));
+    for entry in crate::devfs::dynamic_enumerate(overlay) {
+        generated.retain(|(name, _)| name != &entry.0);
+        generated.push(entry);
+    }
     generated.into_iter().skip(cursor).take(max).collect()
 }
 
@@ -630,6 +633,9 @@ impl DirOps for DevDiskByLabel {
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        if let Some(file) = crate::devfs::dynamic_lookup_file(&BY_LABEL_LINKS, name) {
+            return Some(file);
+        }
         narf_block::block_devices()
             .into_iter()
             .find(|r| {
@@ -639,8 +645,6 @@ impl DirOps for DevDiskByLabel {
                     .unwrap_or(false)
             })
             .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
-            // Then any udev-created label alias.
-            .or_else(|| crate::devfs::dynamic_lookup_file(&BY_LABEL_LINKS, name))
     }
 
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -650,6 +654,11 @@ impl DirOps for DevDiskByLabel {
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         let result = crate::devfs::dynamic_unlink(&BY_LABEL_LINKS, name);
+        Box::pin(async move { result })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_rename(&BY_LABEL_LINKS, old_name, new_name);
         Box::pin(async move { result })
     }
 
@@ -717,6 +726,9 @@ impl DirOps for DevDiskByUuid {
         12
     }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        if let Some(file) = crate::devfs::dynamic_lookup_file(&BY_UUID_LINKS, name) {
+            return Some(file);
+        }
         narf_block::block_devices()
             .into_iter()
             .find(|r| {
@@ -726,8 +738,6 @@ impl DirOps for DevDiskByUuid {
                     .unwrap_or(false)
             })
             .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
-            // Then any udev-created uuid alias.
-            .or_else(|| crate::devfs::dynamic_lookup_file(&BY_UUID_LINKS, name))
     }
 
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -737,6 +747,11 @@ impl DirOps for DevDiskByUuid {
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         let result = crate::devfs::dynamic_unlink(&BY_UUID_LINKS, name);
+        Box::pin(async move { result })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_rename(&BY_UUID_LINKS, old_name, new_name);
         Box::pin(async move { result })
     }
 
@@ -800,6 +815,9 @@ impl DirOps for DevDiskByPartUuid {
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        if let Some(file) = crate::devfs::dynamic_lookup_file(&BY_PARTUUID_LINKS, name) {
+            return Some(file);
+        }
         narf_block::block_devices()
             .into_iter()
             .find(|r| {
@@ -809,8 +827,6 @@ impl DirOps for DevDiskByPartUuid {
                     .unwrap_or(false)
             })
             .map(|r| crate::devfs::symlink_file(name, alloc::format!("../../{}", r.name)))
-            // Then any udev-created partuuid alias.
-            .or_else(|| crate::devfs::dynamic_lookup_file(&BY_PARTUUID_LINKS, name))
     }
 
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -820,6 +836,11 @@ impl DirOps for DevDiskByPartUuid {
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         let result = crate::devfs::dynamic_unlink(&BY_PARTUUID_LINKS, name);
+        Box::pin(async move { result })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_rename(&BY_PARTUUID_LINKS, old_name, new_name);
         Box::pin(async move { result })
     }
 
@@ -935,11 +956,13 @@ impl DirOps for DevDiskByIdentity {
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        if let Some(file) = crate::devfs::dynamic_lookup_file(self.overlay, name) {
+            return Some(file);
+        }
         self.generated()
             .into_iter()
             .find(|(link, _)| link == name)
             .map(|(_, dev)| crate::devfs::symlink_file(name, alloc::format!("../../{dev}")))
-            .or_else(|| crate::devfs::dynamic_lookup_file(self.overlay, name))
     }
 
     fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -949,6 +972,11 @@ impl DirOps for DevDiskByIdentity {
 
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         let result = crate::devfs::dynamic_unlink(self.overlay, name);
+        Box::pin(async move { result })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        let result = crate::devfs::dynamic_rename(self.overlay, old_name, new_name);
         Box::pin(async move { result })
     }
 

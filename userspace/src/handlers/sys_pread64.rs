@@ -82,12 +82,20 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
     let mut staging = alloc::vec![0u8; core::cmp::min(CHUNK, count)];
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        let outcome = poll_blocking(endpoint.ops.read_with_options(
+        // `filemap_read`: killable, see `killable_wait::read`.
+        let outcome = match crate::killable_wait::read(
+            &endpoint.ops,
             offset,
-            &mut staging[..want],
+            &mut staging,
+            want,
             endpoint.read_options(),
-        ))
-        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+        ) {
+            Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+            Err(crate::killable_wait::Killed) => {
+                ctx.set_return(errno_ret(EINTR));
+                return;
+            }
+        };
         let read = match outcome {
             Ok(0) => break,
             Ok(n) if n <= want => n,

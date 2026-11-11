@@ -237,15 +237,23 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         let want = core::cmp::min(CHUNK, count - total);
         let mut staging = alloc::vec![0u8; want];
         let options = endpoint.read_options();
-        let future = endpoint
-            .ops
-            .read_with_options(offset, &mut staging, options);
         let outcome = if endpoint.ops.nonblock_read_eagain()
             || (options.nonblocking && endpoint.ops.is_stream())
         {
-            poll_once(future)
+            poll_once(
+                endpoint
+                    .ops
+                    .read_with_options(offset, &mut staging, options),
+            )
         } else {
-            poll_blocking(future)
+            // `filemap_read`: killable, see `killable_wait::read`.
+            match crate::killable_wait::read(&endpoint.ops, offset, &mut staging, want, options) {
+                Ok(outcome) => outcome,
+                Err(crate::killable_wait::Killed) => {
+                    ctx.set_return(errno_ret(EINTR));
+                    return;
+                }
+            }
         }
         .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
         let read = match outcome {

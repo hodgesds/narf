@@ -85,8 +85,8 @@ fn smoke_coredump_interrupted_metadata_preserves_notes() -> TestResult {
     // The physical greeter's dump stopped after 822 of 853 headers, before
     // any registers or identity were saved. Simulate an even earlier stop.
     let (ehdr, phdrs, notes) = fixture(853);
-    let file = Capture::new(4096, usize::MAX);
-    if write_metadata(&file, u64::MAX, &ehdr, &phdrs, &notes).is_ok() {
+    let file = Arc::new(Capture::new(4096, usize::MAX));
+    if write_metadata(0, file.clone(), u64::MAX, &ehdr, &phdrs, &notes).is_ok() {
         return TestResult::Fail("injected metadata write interruption was hidden");
     }
     let bytes = file.bytes.lock();
@@ -103,14 +103,14 @@ kernel_test_in!(
 
 fn smoke_coredump_metadata_batches_writes_and_retries_short_writes() -> TestResult {
     let (ehdr, phdrs, notes) = fixture(853);
-    let full = Capture::new(usize::MAX, usize::MAX);
-    if write_metadata(&full, u64::MAX, &ehdr, &phdrs, &notes).is_err()
+    let full = Arc::new(Capture::new(usize::MAX, usize::MAX));
+    if write_metadata(0, full.clone(), u64::MAX, &ehdr, &phdrs, &notes).is_err()
         || full.calls.load(Ordering::Relaxed) != 1
     {
         return TestResult::Fail("core metadata still needs a write per mapping");
     }
-    let short = Capture::new(usize::MAX, 317);
-    if write_metadata(&short, u64::MAX, &ehdr, &phdrs, &notes).is_err()
+    let short = Arc::new(Capture::new(usize::MAX, 317));
+    if write_metadata(0, short.clone(), u64::MAX, &ehdr, &phdrs, &notes).is_err()
         || *full.bytes.lock() != *short.bytes.lock()
     {
         return TestResult::Fail("short metadata writes did not preserve every byte");
@@ -123,8 +123,8 @@ kernel_test_in!(
 );
 
 fn smoke_coredump_zero_write_is_an_error() -> TestResult {
-    let file = Capture::new(4096, 0);
-    if write_at(&file, u64::MAX, 0, b"core").is_ok() {
+    let file = Arc::new(Capture::new(4096, 0));
+    if write_at(0, file.clone(), u64::MAX, 0, b"core").is_ok() {
         return TestResult::Fail("a zero-length write reported a completed core");
     }
     TestResult::Pass
@@ -211,4 +211,239 @@ fn smoke_coredump_sparse_anonymous_trimmed() -> TestResult {
 kernel_test_in!(
     "userspace/coredump",
     smoke_coredump_sparse_anonymous_trimmed
+);
+
+static DUMP_WAKES: AtomicUsize = AtomicUsize::new(0);
+static RETAINED_WRITE: IrqSafeSpinLock<Option<OwnedDumpWrite>> = IrqSafeSpinLock::new(None);
+
+fn retain_fixture_write(write: OwnedDumpWrite) {
+    *RETAINED_WRITE.lock() = Some(write);
+}
+
+struct SignalFixture(u64);
+impl SignalFixture {
+    fn new(task: u64) -> Self {
+        crate::handlers::__test_signal_reset();
+        crate::handlers::signal_waker_init();
+        Self(task)
+    }
+}
+impl Drop for SignalFixture {
+    fn drop(&mut self) {
+        crate::handlers::clear_signal_pending(self.0, 9);
+        crate::handlers::drop_signal_waker(self.0);
+        RETAINED_WRITE.lock().take();
+    }
+}
+
+struct WaitingWrite {
+    ready: Arc<core::sync::atomic::AtomicBool>,
+    drops: Arc<AtomicUsize>,
+}
+impl Future for WaitingWrite {
+    type Output = Result<usize, FsError>;
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.ready.load(Ordering::Acquire) {
+            Poll::Ready(Ok(4))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+impl Drop for WaitingWrite {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+fn fixture_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    unsafe fn wake(_: *const ()) {
+        DUMP_WAKES.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe fn drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
+    // SAFETY: the vtable touches only a static atomic and ignores the pointer.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+}
+
+fn smoke_coredump_sigkill_wakes_pending_owned_write() -> TestResult {
+    const TASK: u64 = 0x0c0d_e519;
+    let _signals = SignalFixture::new(TASK);
+    DUMP_WAKES.store(0, Ordering::Relaxed);
+    let ready = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let waker = fixture_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut write = DumpWrite {
+        task: TASK,
+        write: Some(Box::pin(WaitingWrite {
+            ready: ready.clone(),
+            drops: drops.clone(),
+        })),
+        started: false,
+        drain: retain_fixture_write,
+    };
+    if Pin::new(&mut write).poll(&mut cx) != Poll::Pending
+        || !crate::handlers::dbg_has_signal_waker(TASK)
+    {
+        return TestResult::Fail("pending core write did not arm a signal wake");
+    }
+    // The I/O future never wakes itself. Only the fatal signal wakes this
+    // same executor waker, so poll_blocking can resume and observe the kill.
+    crate::handlers::raise_signal_pending(TASK, 9);
+    if DUMP_WAKES.load(Ordering::Relaxed) != 1
+        || Pin::new(&mut write).poll(&mut cx) != Poll::Ready(Err(DumpWriteError::Killed))
+    {
+        return TestResult::Fail("SIGKILL did not interrupt a never-waking core write");
+    }
+    drop(write);
+    if drops.load(Ordering::Relaxed) != 0 || crate::handlers::dbg_has_signal_waker(TASK) {
+        return TestResult::Fail("cancel dropped in-flight ownership or left a stale signal waker");
+    }
+    let Some(mut retained) = RETAINED_WRITE.lock().take() else {
+        return TestResult::Fail("pending write was not retained for terminal completion");
+    };
+    if retained.as_mut().poll(&mut cx) != Poll::Pending {
+        return TestResult::Fail("retained write invented completion");
+    }
+    ready.store(true, Ordering::Release);
+    if retained.as_mut().poll(&mut cx) != Poll::Ready(Ok(4)) {
+        return TestResult::Fail("retained write could not finish");
+    }
+    drop(retained);
+    if drops.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail(
+            "core I/O ownership not released exactly once at terminal completion",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_sigkill_wakes_pending_owned_write
+);
+
+fn smoke_coredump_cancel_before_first_poll_posts_no_io() -> TestResult {
+    const TASK: u64 = 0x0c0d_e520;
+    let _signals = SignalFixture::new(TASK);
+    crate::handlers::raise_signal_pending(TASK, 9);
+    let ready = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let waker = fixture_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut write = DumpWrite {
+        task: TASK,
+        write: Some(Box::pin(WaitingWrite {
+            ready,
+            drops: drops.clone(),
+        })),
+        started: false,
+        drain: retain_fixture_write,
+    };
+    let result = Pin::new(&mut write).poll(&mut cx);
+    drop(write);
+    if result != Poll::Ready(Err(DumpWriteError::Killed))
+        || drops.load(Ordering::Relaxed) != 1
+        || RETAINED_WRITE.lock().is_some()
+    {
+        return TestResult::Fail("preexisting kill posted I/O or falsely completed the dump");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_cancel_before_first_poll_posts_no_io
+);
+
+fn smoke_coredump_large_metadata_uses_bounded_writes() -> TestResult {
+    let (ehdr, phdrs, notes) = fixture(3000);
+    let file = Arc::new(Capture::new(usize::MAX, usize::MAX));
+    if write_metadata(0, file.clone(), u64::MAX, &ehdr, &phdrs, &notes).is_err()
+        || file.calls.load(Ordering::Relaxed) != 3
+    {
+        return TestResult::Fail("large core metadata was not split into bounded writes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_large_metadata_uses_bounded_writes
+);
+
+fn name_args<'a>(comm: &'a str, exe: Option<&'a str>) -> CoreNameArgs<'a> {
+    CoreNameArgs {
+        tgid: 454,
+        tid: 584,
+        uid: 1000,
+        gid: 100,
+        dumpable: 1,
+        signal: 6,
+        time: 1_700_000_000,
+        hostname: "host/name",
+        comm,
+        exe,
+        limit: u64::MAX,
+        cpu: 3,
+    }
+}
+
+/// systemd-coredump's pattern is a pipe: Linux hands the dump to the helper
+/// and writes no file anywhere. Treating every pattern as the file name
+/// `core` is what put a `/core` on a root filesystem.
+fn smoke_coredump_pipe_and_socket_patterns_name_no_file() -> TestResult {
+    let args = name_args("systemd-localed", Some("/usr/lib/systemd/systemd-localed"));
+    let pipe = "|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h %d %F";
+    if core_target(pipe, false, &args) != CoreTarget::Pipe
+        || core_target(pipe, true, &args) != CoreTarget::Pipe
+    {
+        return TestResult::Fail("a pipe core_pattern was treated as a file name");
+    }
+    if core_target("@/run/coredump.sock", false, &args) != CoreTarget::Socket {
+        return TestResult::Fail("a socket core_pattern was treated as a file name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_pipe_and_socket_patterns_name_no_file
+);
+
+/// `coredump_parse`'s template expansion, specifier by specifier.
+fn smoke_coredump_file_pattern_expands_like_linux() -> TestResult {
+    let args = name_args("my/comm", Some("/usr/bin/tool"));
+    let cases: [(&str, bool, &str); 9] = [
+        ("core", false, "core"),
+        // core_uses_pid appends .<tgid> only when the pattern has no %p.
+        ("core", true, "core.454"),
+        ("core.%p", true, "core.454"),
+        (
+            "/var/crash/%e.%s.%u.%g.%t",
+            false,
+            "/var/crash/my!comm.6.1000.100.1700000000",
+        ),
+        ("%h-%f-%E", false, "host!name-tool-!usr!bin!tool"),
+        ("%P.%i.%I.%d.%C", false, "454.584.584.1.3"),
+        ("%c", false, "18446744073709551615"),
+        // %% is a percent; an unknown specifier, %F and a trailing % vanish.
+        ("a%%b%Zc%F", false, "a%bc"),
+        ("core%", false, "core"),
+    ];
+    for (pattern, uses_pid, expected) in cases {
+        match core_target(pattern, uses_pid, &args) {
+            CoreTarget::File(name) if name == expected => {}
+            _ => return TestResult::Fail("a core file pattern did not expand as Linux expands it"),
+        }
+    }
+    match core_target("%f|%E", false, &name_args("comm", None)) {
+        CoreTarget::File(name) if name == "comm (path unknown)|comm (path unknown)" => {}
+        _ => return TestResult::Fail("an unknown executable path was not reported as such"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_file_pattern_expands_like_linux
 );

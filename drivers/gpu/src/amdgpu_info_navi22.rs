@@ -431,14 +431,20 @@ fn hw_ip_info(
         info.ib_size_alignment = size;
         info.available_rings = available_rings(&snap.navi22, submission, ip);
     }
-    Ok(as_bytes(&info))
+    Ok(crate::amdgpu_info::hw_ip_bytes(&info))
 }
 
 /// `AMDGPU_INFO_HW_IP_COUNT`: `count` for an existing block, gated by the
-/// same switch as its rings.
+/// same switch as its rings. amdgpu_info_ioctl answers -EINVAL for an IP
+/// type whose block the ASIC does not have (`!ip_block ||
+/// !ip_block->status.valid`): UVD, VCE, UVD_ENC and VPE here, all four of
+/// which a starting KWin session asked about on an RX 6750 XT. The refusal
+/// names itself so the ioctl trace does not read as a missing query.
 fn hw_ip_count(snap: &Snapshot, submission: Submission, ip: u32) -> Result<Vec<u8>, FsError> {
     if block(snap, ip).is_none() {
-        return Err(FsError::InvalidData);
+        return Err(crate::drm_ioctl_bridge::refused(
+            "AMDGPU_INFO_HW_IP_COUNT: no such IP block on this ASIC, EINVAL on Linux too (amdgpu_info_ioctl)",
+        ));
     }
     let count = if available_rings(&snap.navi22, submission, ip) == 0 {
         0

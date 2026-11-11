@@ -44,6 +44,12 @@ pub const IMS_RXO: u32 = 1 << 6;
 pub const IMS_RXDMT0: u32 = 1 << 4;
 pub const IMS_RXT0: u32 = 1 << 7;
 pub const IMS_DEFAULT: u32 = IMS_TXDW | IMS_LSC | IMS_RXO | IMS_RXDMT0 | IMS_RXT0;
+pub const IMS_DOUTSYNC: u32 = 1 << 28;
+pub const IMS_DRSTA: u32 = 1 << 30;
+/// Causes for the MSI-X "other" vector (Linux `igc_irq_enable`). Queue
+/// causes are routed through IVAR; leaving them in IMS as well would
+/// raise the administrative vector for ordinary traffic.
+pub const IMS_MSIX_OTHER: u32 = IMS_LSC | IMS_DOUTSYNC | IMS_DRSTA;
 pub const GPIE_NSICR: u32 = 1 << 0;
 pub const GPIE_MULTIPLE_MSIX: u32 = 1 << 4;
 pub const GPIE_EIAME: u32 = 1 << 30;
@@ -161,7 +167,7 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
+use narf_bus::{enable_msix, map_bar_control, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 use narf_io::alloc_coherent;
 use narf_ipc::{channel, Consumer, Producer};
@@ -194,6 +200,21 @@ impl CapOp<BusDeviceCap, Write> for Check {
     }
 }
 
+fn pci_current<T>(
+    cap: &Cap<BusDeviceCap, Write>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, IgcError> {
+    struct Access<F>(F);
+    impl<T, F: FnOnce() -> T> CapOp<BusDeviceCap, Write> for Access<F> {
+        type Output = T;
+        fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+            Ok(self.0())
+        }
+    }
+    cap.invoke(Access(operation))
+        .map_err(|_| IgcError::BarMapFailed)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Hardware {
     mmio: MmioRegion,
@@ -204,6 +225,108 @@ struct RegisterAccess<'a> {
     reg: u64,
     value: Option<u32>,
 }
+struct PcieStatusAccess<'a>(&'a BusDevice);
+impl CapOp<BusDeviceCap, Write> for PcieStatusAccess<'_> {
+    type Output = Result<narf_bus::pci_express::PcieStatus, narf_bus::pci_express::PcieCapError>;
+    fn execute(self, cap: &Cap<BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+        // Retain the current PCI invocation across the capability-list walk
+        // and reads; read_status alone checks only a previously live grant.
+        Ok(narf_bus::pci_express::read_status(&cap.derive()?, self.0))
+    }
+}
+
+struct DmaSnoopingAccess<'a>(&'a BusDevice);
+pub(crate) trait PcieConfig {
+    fn read(&self, offset: u16) -> Result<u32, IgcError>;
+    fn write(&self, offset: u16, value: u32) -> Result<(), IgcError>;
+}
+struct DeviceConfig<'a> {
+    cap: &'a Cap<BusDeviceCap, Write>,
+    device: &'a BusDevice,
+}
+impl PcieConfig for DeviceConfig<'_> {
+    fn read(&self, offset: u16) -> Result<u32, IgcError> {
+        narf_bus::pci::read_config32(self.cap, self.device, offset)
+            .map_err(|_| IgcError::BarMapFailed)
+    }
+    fn write(&self, offset: u16, value: u32) -> Result<(), IgcError> {
+        narf_bus::pci::write_config32(self.cap, self.device, offset, value)
+            .map_err(|_| IgcError::BarMapFailed)
+    }
+}
+
+pub(crate) fn require_dma_snooping(
+    config: &impl PcieConfig,
+    express_offset: u64,
+) -> Result<(u16, u16), IgcError> {
+    if !(0x40..=0xf4).contains(&express_offset) || express_offset % 4 != 0 {
+        return Err(IgcError::Other("PCIe Device Control unavailable"));
+    }
+    let offset = (express_offset + 8) as u16;
+    let before = config.read(offset)?;
+    if before == u32::MAX {
+        return Err(IgcError::Other("PCIe device unavailable"));
+    }
+    // alloc_coherent supplies cached memory. Do not allow this endpoint to
+    // opt out of interconnect cache snooping. Preserve all other controls.
+    const NO_SNOOP_ENABLE: u16 = 0x0800;
+    let control = before as u16;
+    let wanted = control & !NO_SNOOP_ENABLE;
+    if wanted != control {
+        // The upper half is Device Status (RW1C): write zeros there rather
+        // than acknowledging errors observed in `before`.
+        config.write(offset, u32::from(wanted))?;
+    }
+    let after = config.read(offset)?;
+    if after == u32::MAX || after as u16 != wanted {
+        return Err(IgcError::Other("PCIe DMA snooping readback failed"));
+    }
+    Ok((control, after as u16))
+}
+
+impl CapOp<BusDeviceCap, Write> for DmaSnoopingAccess<'_> {
+    type Output = Result<(u16, u16), IgcError>;
+    fn execute(self, cap: &Cap<BusDeviceCap, Write>) -> Result<Self::Output, CapError> {
+        let configure = || {
+            // SAFETY: the live device invocation encloses the bounded
+            // capability walk and every subsequent configuration access.
+            let offset =
+                unsafe { narf_bus::pci_cap::find_cap(self.0, narf_bus::pci_express::PCIE_CAP_ID) }
+                    .map_err(|_| IgcError::BarMapFailed)?
+                    .ok_or(IgcError::Other("PCIe Device Control unavailable"))?;
+            require_dma_snooping(
+                &DeviceConfig {
+                    cap,
+                    device: self.0,
+                },
+                offset,
+            )
+        };
+        Ok(configure())
+    }
+}
+
+pub(crate) fn configure_dma_snooping(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<(u16, u16), IgcError> {
+    // read/write_config32 check a prior grant only; invoke must enclose
+    // the complete read/modify/write/readback operation.
+    cap.invoke(DmaSnoopingAccess(device))
+        .map_err(|_| IgcError::BarMapFailed)?
+}
+
+fn verify_memory_only(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<(), IgcError> {
+    use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+    let command = narf_bus::pci::read_command(cap, device).map_err(|_| IgcError::BarMapFailed)?;
+    if command == u16::MAX
+        || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE) != MEM_SPACE | INTX_DISABLE
+    {
+        return Err(IgcError::Other("PCI memory-only setup rejected"));
+    }
+    Ok(())
+}
+
 impl CapOp<BusDeviceCap, Write> for RegisterAccess<'_> {
     type Output = u32;
     fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<u32, CapError> {
@@ -243,6 +366,10 @@ impl Registers for Hardware {
     fn delay(&self, us: u64) {
         let deadline = narf_time::Deadline::after_us(us);
         narf_scheduler::responsive_spin_until(|| deadline.expired(), deadline);
+    }
+    fn note(&self, message: &'static str) {
+        use core::fmt::Write;
+        let _ = writeln!(narf_console::Writer, "[igc] {message}");
     }
 }
 
@@ -313,6 +440,7 @@ pub struct Igc {
     removed: AtomicBool,
     admin_up: AtomicBool,
     recovery_requested: AtomicBool,
+    completion_autopsy_pending: AtomicBool,
     pub(crate) irq_routes: Vec<IrqRoute>,
     state: AtomicU8,
     active: AtomicUsize,
@@ -351,12 +479,34 @@ pub(crate) struct IrqRoute {
     cpu: u32,
     index: u8,
 }
-static ISR_HW: [IrqSafeSpinLock<Option<Hardware>>; 256] =
+/// Hardware bound to each kernel vector, with the EIMS bits its handler
+/// must restore. EIAM auto-masks every MSI-X vector when it fires: queue
+/// vectors are re-armed by their pump after polling, while nothing else
+/// services the administrative vector, so its handler re-arms it itself
+/// (Linux `igc_msix_other`).
+static ISR_HW: [IrqSafeSpinLock<Option<(Hardware, u32)>>; 256] =
     [const { IrqSafeSpinLock::new(None) }; 256];
+/// EIMS bits the handler for MSI-X entry `index` re-arms on its own.
+pub const fn isr_rearm_mask(index: u8) -> u32 {
+    if index == 0 {
+        1
+    } else {
+        0
+    }
+}
+/// Acknowledge one MSI-X vector: clear the legacy causes (ICR is
+/// clear-on-read under GPIE.NSICR), then restore the EIMS bits this
+/// handler owns.
+pub(crate) fn service_vector(r: &impl Registers, rearm: u32) {
+    let _ = r.read(0x1500);
+    if rearm != 0 {
+        r.write(0x1524, rearm);
+    }
+}
 fn igc_isr(cookie: u64) -> narf_interrupts::dispatch::IrqStatus {
-    let hw = *ISR_HW[cookie as usize & 255].lock();
-    if let Some(hw) = hw {
-        let _ = hw.read(0x1500);
+    let bound = *ISR_HW[cookie as usize & 255].lock();
+    if let Some((hw, rearm)) = bound {
+        service_vector(&hw, rearm);
     }
     narf_interrupts::dispatch::IrqStatus::Handled
 }
@@ -377,11 +527,26 @@ impl Igc {
         device: &BusDevice,
         cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Arc<Self>, IgcError> {
+        pci_current(cap, || Self::bring_up_current(device, cap))?
+    }
+
+    fn bring_up_current(
+        device: &BusDevice,
+        cap: &Cap<BusDeviceCap, Write>,
+    ) -> Result<Arc<Self>, IgcError> {
+        narf_bus::pci::prepare_memory_probe(cap, device).map_err(|_| IgcError::BarMapFailed)?;
         // SAFETY: caller's exclusive ownership contract.
-        let mmio = unsafe { map_bar(device, 0) }.map_err(|_| IgcError::BarMapFailed)?;
+        let mmio = unsafe { map_bar_control(device, 0) }.map_err(|_| IgcError::BarMapFailed)?;
         if mmio.len < 0x20000 {
             return Err(IgcError::BarMapFailed);
         }
+        narf_bus::pci::set_command(
+            cap,
+            device,
+            narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
+        )
+        .map_err(|_| IgcError::BarMapFailed)?;
+        verify_memory_only(cap, device)?;
         let hw = Hardware { mmio, cap: *cap };
         hardware::reset(&hw, 4)?;
         let mac = hardware::read_mac(&hw)?;
@@ -449,6 +614,7 @@ impl Igc {
             removed: AtomicBool::new(false),
             admin_up: AtomicBool::new(true),
             recovery_requested: AtomicBool::new(false),
+            completion_autopsy_pending: AtomicBool::new(false),
             irq_routes,
             state: AtomicU8::new(STOPPED),
             active: AtomicUsize::new(0),
@@ -465,7 +631,8 @@ impl Igc {
         // Retain before any ring DMA address reaches the device.
         RETAINED.lock().push(controller.clone());
         for route in &controller.irq_routes {
-            *ISR_HW[route.vector as usize].lock() = Some(controller.hw);
+            *ISR_HW[route.vector as usize].lock() =
+                Some((controller.hw, isr_rearm_mask(route.index)));
             narf_interrupts::dispatch::install_handler_named(
                 route.vector,
                 "igc",
@@ -584,6 +751,10 @@ impl Igc {
     }
 
     fn start(&self) -> Result<(), IgcError> {
+        pci_current(&self.hw.cap, || self.start_current())?
+    }
+
+    fn start_current(&self) -> Result<(), IgcError> {
         self.apply_pci_quirks()?;
         if self.removed.load(Ordering::Acquire) {
             return Err(IgcError::Other("device removed"));
@@ -591,14 +762,15 @@ impl Igc {
         if let Some(table) = self.msix.lock().as_mut() {
             for route in &self.irq_routes {
                 #[cfg(target_arch = "x86_64")]
-                let target = narf_interrupts::apic_id_at(route.cpu as usize)
+                let target = narf_interrupts::apic_id_of_cpu(route.cpu as usize)
                     .ok_or(IgcError::BarMapFailed)?;
                 #[cfg(target_arch = "aarch64")]
                 let target = 0;
                 // SAFETY: device and allocated MSI-X entries are exclusively owned.
                 unsafe { table.program_vector(u16::from(route.index), target, route.vector) }
                     .map_err(|_| IgcError::BarMapFailed)?;
-                *ISR_HW[route.vector as usize].lock() = Some(self.hw);
+                *ISR_HW[route.vector as usize].lock() =
+                    Some((self.hw, isr_rearm_mask(route.index)));
             }
             // SAFETY: all reserved entries have valid routes.
             unsafe { table.enable() }.map_err(|_| IgcError::BarMapFailed)?;
@@ -619,7 +791,7 @@ impl Igc {
             (c.mac, c.mtu)
         };
         // Packet-buffer allocation/filter/RSS configuration precedes queue
-        // enable; global RX/TX stays disabled until every queue acknowledges.
+        // activation. Preparation leaves queue enables and RX/TX tails empty.
         hardware::configure(&self.hw, mac, mtu, &self.settings.lock().rss);
         self.apply_filters();
         // Prepare every ring before globally enabling receive/transmit.
@@ -674,7 +846,52 @@ impl Igc {
         if self.removed.load(Ordering::Acquire) {
             return Err(IgcError::Other("device removed"));
         }
-        hardware::enable_data(&self.hw)?;
+        let queues = self.queues();
+        let mut rx_counts = [0; 4];
+        for (q, queue) in queues.iter().enumerate() {
+            rx_counts[q] = queue.counts().1;
+        }
+        // All ring bases, handlers and retained allocations precede BME.
+        // Global engines must run before QUEUE_ENABLE can acknowledge.
+        let activation = hardware::activate_queues(&self.hw, &rx_counts[..queues.len()], || {
+            // set_command repeats this walk; doing it here first reports
+            // when firmware left a port above the NIC unable to forward its
+            // DMA and MSI-X (the physical I225 completion stall).
+            let enabled = narf_bus::pci::enable_upstream_bridges(&self.device);
+            if enabled != 0 {
+                use core::fmt::Write;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "[igc] {} enabled forwarding on {enabled} upstream bridge(s): {:x?}",
+                    self.name(),
+                    narf_bus::pci::upstream_bridge_commands(&self.device)
+                );
+            }
+            narf_bus::pci::set_command(&self.hw.cap, &self.device, narf_bus::pci::cmd::BUS_MASTER)
+                .map_err(|_| IgcError::BarMapFailed)?;
+            let command = narf_bus::pci::read_command(&self.hw.cap, &self.device)
+                .map_err(|_| IgcError::BarMapFailed)?;
+            use narf_bus::pci::cmd::{BUS_MASTER, INTX_DISABLE, MEM_SPACE};
+            if command == u16::MAX
+                || command & (BUS_MASTER | MEM_SPACE | INTX_DISABLE)
+                    != BUS_MASTER | MEM_SPACE | INTX_DISABLE
+            {
+                return Err(IgcError::Other("PCI DMA enable rejected"));
+            }
+            Ok(())
+        });
+        if let Err(error) = activation {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] queue activation failed {error:?}: pci={:x?} status={:#x} rctl={:#x} tctl={:#x}",
+                narf_bus::pci::read_command(&self.hw.cap, &self.device),
+                self.hw.read(8),
+                self.hw.read(0x100),
+                self.hw.read(0x400),
+            );
+            return Err(error);
+        }
         self.mtu.store(mtu, Ordering::Release);
         self.state.store(RUNNING, Ordering::Release);
         Ok(())
@@ -710,7 +927,7 @@ impl Igc {
         self.hw.write(0x152c, mask);
         self.hw.write(0x1530, mask);
         self.hw.write(0x1524, mask);
-        self.hw.write(0x1508, IMS_DEFAULT);
+        self.hw.write(0x1508, IMS_MSIX_OTHER);
     }
     pub fn mac(&self) -> [u8; 6] {
         self.config.lock().mac
@@ -760,16 +977,32 @@ impl Igc {
         self.submit_frame(owned, frame.tx_meta())
     }
     pub fn submit_frame(&self, frame: Frame, meta: TxMeta) -> Result<(), IgcError> {
+        self.submit_frame_on(frame, meta, None)
+    }
+    /// `queue` is the stack's choice for a backpressure-aware sender (Linux
+    /// `skb->queue_mapping`); such a frame is refused with
+    /// [`IgcError::TxBusy`] instead of using the stopped queue's reserve.
+    fn submit_frame_on(
+        &self,
+        frame: Frame,
+        meta: TxMeta,
+        queue: Option<usize>,
+    ) -> Result<(), IgcError> {
         let _operation = self.operation()?;
         let timing = frame.tx_timing();
-        let q = timing.queue.map_or_else(
-            || self.settings.lock().rss.rx_queue(frame.payload()),
-            usize::from,
-        );
+        let q = queue.unwrap_or_else(|| {
+            timing.queue.map_or_else(
+                || self.settings.lock().rss.rx_queue(frame.payload()),
+                usize::from,
+            )
+        });
         if q >= self.num_queues() {
             return Err(IgcError::QueueTooSmall);
         }
-        let mut options = crate::queue::TxOptions::default();
+        let mut options = crate::queue::TxOptions {
+            backpressure: queue.is_some(),
+            ..Default::default()
+        };
         if let Some(time) = timing.launch_time_ns {
             let now = {
                 let _clock = self.ptp.lock();
@@ -787,7 +1020,7 @@ impl Igc {
         if result.is_err() && timing.timestamp_cookie.is_some() {
             self.ptp.lock().pending[q] = None;
         }
-        if result.is_err() {
+        if result.is_err() && result != Err(IgcError::TxBusy) {
             self.stats.lock().tx_rejected += 1;
         }
         result
@@ -849,18 +1082,16 @@ impl Igc {
     }
     fn reset_and_start(&self) -> Result<(), IgcError> {
         self.cancel_timestamps(125);
-        let result = (|| {
-            narf_bus::pci::restore_config(&self.hw.cap, &self.device, &self.saved_pci)
+        let result = pci_current(&self.hw.cap, || {
+            narf_bus::pci::prepare_memory_probe(&self.hw.cap, &self.device)
                 .map_err(|_| IgcError::BarMapFailed)?;
-            // Restore PCI memory/master decoding after system sleep.
-            narf_bus::pci::set_command(
-                &self.hw.cap,
-                &self.device,
-                narf_bus::pci::cmd::MEM_SPACE
-                    | narf_bus::pci::cmd::BUS_MASTER
-                    | narf_bus::pci::cmd::INTX_DISABLE,
-            )
-            .map_err(|_| IgcError::BarMapFailed)?;
+            let mut saved = self.saved_pci;
+            saved.command = (saved.command & !narf_bus::pci::cmd::BUS_MASTER)
+                | narf_bus::pci::cmd::MEM_SPACE
+                | narf_bus::pci::cmd::INTX_DISABLE;
+            narf_bus::pci::restore_config(&self.hw.cap, &self.device, &saved)
+                .map_err(|_| IgcError::BarMapFailed)?;
+            verify_memory_only(&self.hw.cap, &self.device)?;
             let closed = self
                 .queues()
                 .iter()
@@ -868,13 +1099,34 @@ impl Igc {
                 .filter(|(_, q)| q.xsk().is_some_and(|s| s.is_closed()))
                 .map(|(q, _)| q)
                 .collect::<Vec<_>>();
+            if self.completion_autopsy_pending.load(Ordering::Acquire) {
+                let queues = self.queues();
+                // A parked PCI Command is not the DMA fence. Require the
+                // hardware drain before reading payloads, even if recovery
+                // entered from FAILED and bypassed the normal stop() path.
+                hardware::quiesce(&self.hw, queues.len())?;
+                self.completion_autopsy_pending
+                    .store(false, Ordering::Release);
+                for (q, queue) in queues.iter().enumerate() {
+                    // SAFETY: lifecycle excludes packet operations; the DMA
+                    // drain succeeded, and reset/start has not run yet.
+                    let evidence = unsafe { queue.quiesced_writeback_snapshot() };
+                    use core::fmt::Write;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "[igc] q{q} after DMA drain, before reset: {evidence:x?} sw={:x?}",
+                        queue.statistics(),
+                    );
+                }
+            }
             hardware::reset_queues(&self.hw, self.queues().as_slice())?;
             for q in closed {
                 narf_net::bypass::classifier::release_native(self.name(), q as u32);
             }
             self.stats.lock().resets += 1;
             self.start()
-        })();
+        })
+        .and_then(|result| result);
         if result.is_err() {
             let _ = hardware::quiesce(&self.hw, self.queues().len());
             self.state.store(FAILED, Ordering::Release);
@@ -990,6 +1242,9 @@ impl Igc {
         for (q, queue) in self.queues().iter().enumerate() {
             queue.flush(&self.hw, q);
             queue.reclaim();
+            // The periodic wake pass: covers a completion reclaimed by a
+            // sender, which cannot resume other connections itself.
+            queue.txq().run_wakeups();
         }
         self.sample_counters();
         {
@@ -1032,6 +1287,85 @@ impl Igc {
         stats.tx_bytes = counters.value(0x4090);
     }
 
+    /// Capture the first stalled completion before recovery destroys it.
+    /// No added packet/IRQ logging or cache maintenance on live DMA buffers.
+    fn dump_completion_state(&self) {
+        use core::fmt::Write;
+        let Ok(_operation) = self.operation() else {
+            return;
+        };
+        let _ = writeln!(
+            narf_console::Writer,
+            "[igc] {} first TX timeout: ctrl={:#x} status={:#x}",
+            self.name(),
+            self.hw.read(0),
+            self.hw.read(8),
+        );
+        if let Ok(Ok(status)) = self.hw.cap.invoke(PcieStatusAccess(&self.device)) {
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] PCIe device_control={:#x} device_status={:#x}",
+                status.device_control,
+                status.device_status,
+            );
+        }
+        // Whether the path to the root forwards this NIC's writes, and
+        // whether any of its MSI-X messages ever reached a CPU.
+        let _ = writeln!(
+            narf_console::Writer,
+            "[igc] upstream bridge commands: {:x?}",
+            narf_bus::pci::upstream_bridge_commands(&self.device)
+        );
+        for route in &self.irq_routes {
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] msix entry {} vector {} fired {}",
+                route.index,
+                route.vector,
+                narf_interrupts::dispatch::fire_count(route.vector)
+            );
+        }
+        for (q, queue) in self.queues().iter().enumerate() {
+            let snapshot = queue.completion_snapshot();
+            let offset = q as u64 * 0x40;
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] q{q} TX dma={:#x} cpu={:#x} next={} clean={} end={:?} words={:08x?} hw_head={} hw_tail={} ctl={:#x} wb_addr={:#x}:{:08x} dma_ctl={:#x}",
+                snapshot.tx_dma,
+                snapshot.tx_cpu,
+                snapshot.tx_next,
+                snapshot.tx_clean,
+                snapshot.tx_end,
+                snapshot.tx_words,
+                self.hw.read(0xe010 + offset),
+                self.hw.read(0xe018 + offset),
+                self.hw.read(0xe028 + offset),
+                self.hw.read(0xe03c + offset),
+                self.hw.read(0xe038 + offset),
+                self.hw.read(0xe014 + offset),
+            );
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] q{q} RX dma={:#x} cpu={:#x} head={} words={:08x?} hw_head={} hw_tail={} ctl={:#x} srrctl={:#x} dma_ctl={:#x}",
+                snapshot.rx_dma,
+                snapshot.rx_cpu,
+                snapshot.rx_head,
+                snapshot.rx_words,
+                self.hw.read(0xc010 + offset),
+                self.hw.read(0xc018 + offset),
+                self.hw.read(0xc028 + offset),
+                self.hw.read(0xc00c + offset),
+                self.hw.read(0xc014 + offset),
+            );
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] q{q} CPU mappings: TX={:x?} RX={:x?}",
+                snapshot.tx_mapping,
+                snapshot.rx_mapping,
+            );
+        }
+    }
+
     fn set_pme(&self, enabled: bool) -> Result<(), IgcError> {
         self.hw
             .cap
@@ -1058,6 +1392,17 @@ impl Igc {
         Ok(())
     }
     fn apply_pci_quirks(&self) -> Result<(), IgcError> {
+        // start() runs before queue enable, including recovery/resume after
+        // PCI state restoration. Fail closed if coherent DMA cannot be set.
+        let (before, after) = configure_dma_snooping(&self.hw.cap, &self.device)?;
+        if before != after {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "[igc] {} PCIe DMA snooping: device_control={before:#06x}->{after:#06x}",
+                self.name(),
+            );
+        }
         self.set_pme(false)?;
         if matches!(
             self.device.id.device,
@@ -1177,6 +1522,47 @@ impl narf_net::iface::DeviceControl for Igc {
     }
 }
 
+/// The transmit-queue contract (`narf_net::txq`): four rings whose geometry
+/// each `Queue` reports, flows mapped by the RSS function the receive side
+/// uses, and frames offered with `TxBusy` instead of a drop.
+impl narf_net::txq::TxBackpressure for Igc {
+    fn tx_queue_count(&self) -> u16 {
+        self.num_queues() as u16
+    }
+    fn tx_queue(&self, q: u16) -> Option<Arc<narf_net::txq::TxQueue>> {
+        self.queues()
+            .get(usize::from(q))
+            .map(|queue| queue.txq().clone())
+    }
+    fn tx_select_queue(&self, frame: &[u8]) -> u16 {
+        self.settings.lock().rss.rx_queue(frame) as u16
+    }
+    fn tx_link_speed_mbps(&self) -> u32 {
+        self.link_sample().speed_mbps.unwrap_or(0)
+    }
+    fn try_xmit(&self, q: u16, frame: Frame, meta: TxMeta) -> Result<(), narf_net::txq::TxRefusal> {
+        self.submit_frame_on(frame, meta, Some(usize::from(q)))
+            .map_err(|e| match e {
+                IgcError::TxBusy => narf_net::txq::TxRefusal::Busy,
+                _ => narf_net::txq::TxRefusal::Dropped,
+            })
+    }
+    fn try_xmit_copy(
+        &self,
+        q: u16,
+        bytes: &[u8],
+        meta: TxMeta,
+    ) -> Result<(), narf_net::txq::TxRefusal> {
+        if bytes.len() < 14 || bytes.len() > MAX_TSO {
+            return Err(narf_net::txq::TxRefusal::Dropped);
+        }
+        let mut buffer = alloc_coherent(bytes.len(), DomainId::DRIVER_0)
+            .map_err(|_| narf_net::txq::TxRefusal::Dropped)?;
+        buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        self.try_xmit(q, Frame::new(buffer, bytes.len() as u32), meta)
+    }
+}
+
 impl narf_power::device_pm::DevicePmOps for Igc {
     fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
         let _control = self
@@ -1205,17 +1591,6 @@ impl narf_power::device_pm::DevicePmOps for Igc {
         self.state
             .compare_exchange(SUSPENDED, CHANGING, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| narf_power::device_pm::DevicePmError::Busy)?;
-        if narf_bus::pci::set_power_state(
-            &self.hw.cap,
-            &self.device,
-            narf_bus::pci::PciPowerState::D0,
-        )
-        .is_err()
-        {
-            self.state.store(FAILED, Ordering::Release);
-            return Err(narf_power::device_pm::DevicePmError::DriverError);
-        }
-        self.hw.delay(10_000);
         self.reset_and_start()
             .map_err(|_| narf_power::device_pm::DevicePmError::DriverError)?;
         if !self.admin_up.load(Ordering::Acquire) {
@@ -1295,18 +1670,17 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    narf_bus::pci::set_command(
-        &cap,
-        &device,
-        narf_bus::pci::cmd::MEM_SPACE
-            | narf_bus::pci::cmd::BUS_MASTER
-            | narf_bus::pci::cmd::INTX_DISABLE,
-    )
-    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: PCI match framework grants exclusive function ownership.
     let controller = match unsafe { Igc::bring_up(&device, &cap) } {
         Ok(controller) => controller,
         Err(error) => {
+            let _ = pci_current(&cap, || {
+                narf_bus::pci::clear_command(
+                    &cap,
+                    &device,
+                    narf_bus::pci::cmd::BUS_MASTER | narf_bus::pci::cmd::MEM_SPACE,
+                )
+            });
             let _ = core::fmt::write(
                 &mut narf_console::Writer,
                 format_args!(
@@ -1338,6 +1712,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         0,
         true,
     );
+    enable_receive_coalescing(&name);
+    narf_net::iface::set_tx_backpressure(&name, controller.clone());
     controller.ifname.set(name);
     let clock = narf_time::phc::register(Arc::new(control::PhcDevice(Arc::downgrade(&controller))));
     controller.phc_index.store(clock as i32, Ordering::Release);
@@ -1547,6 +1923,14 @@ impl narf_net::Interface for IgcInterface {
         &self.0.tx_ipc_ring
     }
 }
+/// Linux `igc_probe` leaves `NETIF_F_GRO` set in `netdev->features` and
+/// `igc_clean_rx_irq` hands every frame to `napi_gro_receive`. Each queue's
+/// pump is pinned to one CPU and flushes that CPU's coalescer when its ring
+/// drains, so in-order TCP segments reach the stack as one large segment
+/// instead of one protocol pass, one ACK decision and one reader wake each.
+pub(crate) fn enable_receive_coalescing(name: &str) -> bool {
+    narf_net::iface::set_software_gro(name, true)
+}
 fn admin_hook(name: &str, up: bool) {
     let c = RETAINED
         .lock()
@@ -1604,26 +1988,51 @@ fn spawn_pumps(
                     } else {
                         Vec::new()
                     };
-                    for mut frame in frames {
-                        let name = rx.name();
-                        crate::publish::mirror_rx(
-                            &frame,
-                            crate::publish::rx_mirror_attached(name),
-                            |f| {
-                                let _ = producer.lock().try_send(f);
-                            },
-                        );
-                        let (action, len) =
-                            narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
-                        frame.truncate(len as u32);
-                        if action == narf_net::bypass::classifier::XdpAction::Tx {
-                            if rx.submit_frame(frame, TxMeta::plain()).is_err() {
-                                narf_net::bypass::classifier::count_xdp_tx_drop();
+                    {
+                        // One interface lookup for the whole poll; its frame and
+                        // byte counts are folded in when the batch ends.
+                        let mut batch =
+                            (!frames.is_empty()).then(|| narf_net::iface::rx_batch(rx.name()));
+                        for mut frame in frames {
+                            let name = rx.name();
+                            crate::publish::mirror_rx(
+                                &frame,
+                                crate::publish::rx_mirror_attached(name),
+                                |f| {
+                                    let _ = producer.lock().try_send(f);
+                                },
+                            );
+                            let (action, len) =
+                                narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
+                            frame.truncate(len as u32);
+                            if action == narf_net::bypass::classifier::XdpAction::Tx {
+                                if rx.submit_frame(frame, TxMeta::plain()).is_err() {
+                                    narf_net::bypass::classifier::count_xdp_tx_drop();
+                                }
+                            } else {
+                                let timestamp = frame.rx_meta().timestamp_ns;
+                                use narf_net::bypass::classifier::XdpAction;
+                                match (action, batch.as_mut()) {
+                                    (
+                                        XdpAction::Pass | XdpAction::RedirectCpu { .. },
+                                        Some(batch),
+                                    ) => batch.receive(frame.payload_mut(), timestamp),
+                                    _ => native_redirect(
+                                        name,
+                                        frame.payload_mut(),
+                                        action,
+                                        timestamp,
+                                    ),
+                                }
                             }
-                        } else {
-                            let timestamp = frame.rx_meta().timestamp_ns;
-                            native_redirect(name, frame.payload_mut(), action, timestamp);
                         }
+                    }
+                    // The wake pass, once per poll: this poll reclaimed the
+                    // queue's transmit completions (`poll_xsk`), so resume
+                    // the connections that were waiting for them. No queue
+                    // lock is held here.
+                    if let Some(queue) = rx.queues().get(q) {
+                        queue.txq().run_wakeups();
                     }
                     let pending = if let Ok(_op) = rx.operation() {
                         if let Some(r) = route {
@@ -1637,6 +2046,11 @@ fn spawn_pumps(
                         narf_scheduler::yield_now().await;
                         continue;
                     }
+                    // The ring is empty and the vector re-armed: Linux
+                    // `napi_complete_done` flushes GRO here, so a coalesced
+                    // burst is never held waiting for a segment that may not
+                    // come. A no-op when this CPU holds no flows.
+                    narf_net::tcp_stack::gro_flush();
                     match waiter {
                         Some(w) => {
                             let _ = w.await;
@@ -1709,7 +2123,17 @@ fn spawn_pumps(
                     .iter()
                     .any(|q| q.stalled(narf_time::now_cycles(), timeout))
             {
-                device.stats.lock().tx_timeouts += 1;
+                let first = {
+                    let mut stats = device.stats.lock();
+                    stats.tx_timeouts += 1;
+                    stats.tx_timeouts == 1
+                };
+                if first {
+                    device
+                        .completion_autopsy_pending
+                        .store(true, Ordering::Release);
+                    device.dump_completion_state();
+                }
                 let _ = device.recover();
             }
             narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;

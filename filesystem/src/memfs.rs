@@ -118,6 +118,29 @@ impl TmpFsOptions {
     }
 }
 
+/// `mm/shmem.c::shmem_parse_one` for one `fsconfig(2)` parameter: whether
+/// tmpfs knows `key` and accepts `value` for it. Linux parses each parameter
+/// as it is set — `vfs_parse_fs_param` hands it to the filesystem's
+/// `parse_param`, and an unknown key (`-ENOPARAM`) or a bad value is
+/// reported by that very `fsconfig` call as -EINVAL — rather than when the
+/// superblock is created.
+pub fn tmpfs_parse_param(key: &str, value: Option<&str>) -> Result<(), FsError> {
+    // A parameter is one key: the option-string separators cannot be part
+    // of it, and no tmpfs value contains a comma.
+    if key.is_empty() || key.contains([',', '=']) || value.is_some_and(|v| v.contains(',')) {
+        return Err(FsError::InvalidData);
+    }
+    // Percent sizes are validated against a RAM total; which total does not
+    // change whether the parameter parses.
+    const PROBE_TOTAL_PAGES: u64 = 1 << 20;
+    let mut scratch = TmpFsOptions::defaults(PROBE_TOTAL_PAGES, 0, 0);
+    let option = match value {
+        Some(value) => alloc::format!("{key}={value}"),
+        None => alloc::string::String::from(key),
+    };
+    apply_tmpfs_options(&mut scratch, &option, PROBE_TOTAL_PAGES)
+}
+
 /// Linux ramfs accepts `mode=` and historically ignores every other mount
 /// option. It has no block or inode limits and cannot be resized.
 #[derive(Clone, Debug, PartialEq, Eq)]

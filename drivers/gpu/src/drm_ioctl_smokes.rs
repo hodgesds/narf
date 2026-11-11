@@ -1474,6 +1474,73 @@ fn smoke_drm_ioctl_crtc_color_blobs() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_crtc_color_blobs);
 
+/// The refusal trace names the check that refused a request: a check that
+/// passes records nothing. An accepted atomic commit carrying a GAMMA_LUT
+/// blob (the lookup `blob_value` makes) leaves no line behind, so a later
+/// refusal by a rule outside the bridge is not blamed on the blob lookup;
+/// a refused one records its own check, and `refused` its rule in words.
+fn smoke_drm_ioctl_refusal_trace_names_only_refusals() -> TestResult {
+    let Some(idx) = color_card() else {
+        return TestResult::Fail("no mode state");
+    };
+    // 256 entries of struct drm_color_lut (four u16): the legacy size.
+    let lut = color_blob(idx, &[0u8; 256 * 8]);
+    if lut == 0 {
+        return TestResult::Fail("CREATEPROPBLOB");
+    }
+    let atomic = |value: u64| {
+        let objects = [11u32];
+        let counts = [1u32];
+        let props = [0x65u32];
+        let values = [value];
+        let mut req = DrmModeAtomicUapi {
+            flags: 0x100,
+            count_objs: 1,
+            objs_ptr: objects.as_ptr() as u64,
+            count_props_ptr: counts.as_ptr() as u64,
+            props_ptr: props.as_ptr() as u64,
+            prop_values_ptr: values.as_ptr() as u64,
+            ..Default::default()
+        };
+        crate::drm_ioctl_bridge::reset_invalid_line();
+        dispatch_card(
+            idx,
+            DRM_IOCTL_MODE_ATOMIC,
+            &mut req as *mut _ as usize,
+            false,
+        )
+    };
+    if atomic(u64::from(lut)) != Ok(0) {
+        return TestResult::Fail("GAMMA_LUT probe refused");
+    }
+    if crate::drm_ioctl_bridge::last_invalid_line() != 0
+        || crate::drm_ioctl_bridge::last_refusal().is_some()
+    {
+        return TestResult::Fail("an accepted request recorded a refusing check");
+    }
+    // A blob that does not exist is refused by the lookup itself.
+    if atomic(u64::from(lut) + 1000) != Err(FsError::InvalidData)
+        || crate::drm_ioctl_bridge::last_invalid_line() == 0
+    {
+        return TestResult::Fail("a refused request recorded no check");
+    }
+    crate::drm_ioctl_bridge::reset_invalid_line();
+    if crate::drm_ioctl_bridge::refused("rule") != FsError::InvalidData
+        || crate::drm_ioctl_bridge::last_refusal() != Some("rule")
+    {
+        return TestResult::Fail("refused() did not record its rule");
+    }
+    crate::drm_ioctl_bridge::reset_invalid_line();
+    if crate::drm_ioctl_bridge::last_refusal().is_some() {
+        return TestResult::Fail("reset kept the rule");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_refusal_trace_names_only_refusals
+);
+
 /// DRM_IOCTL_MODE_SETGAMMA / GETGAMMA on a color-managed CRTC: the gamma
 /// store, then drm_crtc_legacy_gamma_set's 256-entry GAMMA_LUT with the
 /// CTM reset; size, CRTC, master and render-node checks.

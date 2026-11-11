@@ -43,6 +43,10 @@ struct Completed {
 }
 
 pub(crate) const COUNT: usize = 256;
+/// Most descriptors one frame can take (Linux igc `DESC_NEEDED`): the
+/// largest frame split at every 4 KiB boundary it can straddle, one context
+/// descriptor, and the two descriptors of the launch-time workaround.
+pub(crate) const MAX_FRAME_DESCS: u32 = (crate::packet::MAX_TSO + 4095).div_ceil(4096) as u32 + 3;
 const BUFFER: usize = 2048;
 
 #[repr(C, align(16))]
@@ -111,8 +115,103 @@ pub(crate) struct Queue {
     gate_closed: core::sync::atomic::AtomicBool,
     owner: IrqSafeSpinLock<&'static str>,
     tx: IrqSafeSpinLock<Tx>,
+    /// Stop/wake state and waiters shared with the stack. Its thresholds
+    /// come from this ring's length, whatever `ethtool -G` made it.
+    txq: Arc<narf_net::txq::TxQueue>,
     merge_events: core::sync::atomic::AtomicU8,
     rx: IrqSafeSpinLock<Rx>,
+}
+
+/// Read-only evidence for a failed completion path, collected before reset.
+/// Each descriptor word is sampled independently while DMA may still run;
+/// this snapshot is never proof that the device released a buffer.
+#[derive(Debug)]
+pub(crate) struct CompletionSnapshot {
+    pub tx_dma: u64,
+    pub tx_cpu: usize,
+    pub tx_next: usize,
+    pub tx_clean: usize,
+    pub tx_end: Option<usize>,
+    pub tx_words: [u32; 4],
+    pub rx_dma: u64,
+    pub rx_cpu: usize,
+    pub rx_head: usize,
+    pub rx_words: [u32; 4],
+    pub tx_mapping: Option<CpuMappingSnapshot>,
+    pub rx_mapping: Option<CpuMappingSnapshot>,
+}
+
+#[derive(Debug)]
+pub(crate) struct QuiescedWritebackSnapshot {
+    pub tx_dd: usize,
+    pub rx_dd: usize,
+    pub rx_nonzero_prefixes: usize,
+    pub rx_leased_skipped: usize,
+    pub first_changed_rx: Option<usize>,
+    pub first_rx_words: [u32; 8],
+}
+
+/// Read-only evidence of the CPU mapping, not a DMA-completion fence.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug)]
+pub(crate) struct CpuMappingSnapshot {
+    pub physical: u64,
+    pub translated: Option<u64>,
+    pub end_translated: Option<u64>,
+    pub pages_match: bool,
+    pub root: u64,
+    pub leaf_flags: Option<u64>,
+    pub leaf_bytes: Option<u64>,
+    pub pat: u64,
+    pub pat_type: Option<u8>,
+    pub mtrr_default: Option<u64>,
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) type CpuMappingSnapshot = ();
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn cpu_mapping_snapshot(buffer: &DmaBuffer) -> Option<CpuMappingSnapshot> {
+    use narf_memory::{x86_64::paging, VirtAddr};
+    let cpu = buffer.cpu_ptr::<u8>() as u64;
+    let physical = buffer.phys_addr().raw();
+    // SAFETY: CPL0, current live address space. The owned buffer pins its
+    // RAM; the permanent direct map/page tables remain live during this walk.
+    let root = unsafe { paging::read_cr3() };
+    let translate = |offset| {
+        // SAFETY: same live root and stable direct-map pages, read-only walk.
+        unsafe { paging::translate(root, VirtAddr::new(cpu + offset)) }.map(|p| p.raw())
+    };
+    // SAFETY: same current root, only reading its mapping of the owned buffer.
+    let leaf = unsafe { paging::leaf_flags_at(root, VirtAddr::new(cpu)) };
+    let pat = narf_arch::x86_64::pat::read();
+    let pat_type = leaf.map(|(flags, size)| {
+        let flags = flags.bits();
+        let pat_bit = if size == 4096 { 7 } else { 12 };
+        let index = ((flags >> 3) & 3) | (((flags >> pat_bit) & 1) << 2);
+        ((pat >> (index * 8)) & 0xff) as u8
+    });
+    let last = buffer.len() as u64 - 1;
+    Some(CpuMappingSnapshot {
+        physical,
+        translated: translate(0),
+        end_translated: translate(last),
+        pages_match: (0..buffer.len())
+            .step_by(4096)
+            .all(|offset| translate(offset as u64) == Some(physical + offset as u64))
+            && translate(last) == Some(physical + last),
+        root: root.raw(),
+        leaf_flags: leaf.map(|(flags, _)| flags.bits()),
+        leaf_bytes: leaf.map(|(_, size)| size),
+        pat,
+        pat_type,
+        mtrr_default: narf_arch::x86_64::msr::rdmsr_or_gp(0x2ff).ok(),
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn cpu_mapping_snapshot(_: &DmaBuffer) -> Option<CpuMappingSnapshot> {
+    None
 }
 
 fn allocate(bytes: usize) -> Result<DmaBuffer, IgcError> {
@@ -143,6 +242,10 @@ impl Queue {
             gate_closed: core::sync::atomic::AtomicBool::new(false),
             owner: IrqSafeSpinLock::new(""),
             tx: IrqSafeSpinLock::new(Tx::default()),
+            txq: narf_net::txq::TxQueue::new(narf_net::txq::TxQueueGeometry {
+                ring_len: tx_count as u32,
+                max_frame_descs: MAX_FRAME_DESCS,
+            }),
             merge_events: core::sync::atomic::AtomicU8::new(0),
             rx: IrqSafeSpinLock::new(Rx {
                 head: 0,
@@ -167,6 +270,9 @@ impl Queue {
         Ok(q)
     }
 
+    pub(crate) fn txq(&self) -> &Arc<narf_net::txq::TxQueue> {
+        &self.txq
+    }
     pub(crate) fn set_owner(&self, name: &'static str) {
         *self.owner.lock() = name;
     }
@@ -191,6 +297,97 @@ impl Queue {
         ]
     }
 
+    pub(crate) fn completion_snapshot(&self) -> CompletionSnapshot {
+        let (tx_next, tx_clean, tx_end, tx_words) = {
+            let tx = self.tx.lock();
+            let end = tx.pending.front().map(|packet| packet.end);
+            let slot = end.unwrap_or(tx.clean);
+            // SAFETY: the TX lock pins this in-bounds descriptor slot. Read
+            // individual words as in done(); do not reclaim or modify DMA.
+            let words = core::array::from_fn(|i| unsafe {
+                ptr::read_volatile(self.tx_ring.cpu_ptr_at::<u32>((slot * 16 + i * 4) as u64))
+            });
+            (tx.next, tx.clean, end, words)
+        };
+        let (rx_head, rx_words) = {
+            let rx = self.rx.lock();
+            // SAFETY: lock pins the next-to-clean slot. Observing words does
+            // not claim DD, read payload, rearm or change DMA ownership.
+            let words = core::array::from_fn(|i| unsafe {
+                ptr::read_volatile(
+                    self.rx_ring
+                        .cpu_ptr_at::<u32>((rx.head * 16 + i * 4) as u64),
+                )
+            });
+            (rx.head, words)
+        };
+        CompletionSnapshot {
+            tx_dma: self.tx_ring.dma_addr().raw(),
+            tx_cpu: self.tx_ring.cpu_ptr::<u8>() as usize,
+            tx_next,
+            tx_clean,
+            tx_end,
+            tx_words,
+            rx_dma: self.rx_ring.dma_addr().raw(),
+            rx_cpu: self.rx_ring.cpu_ptr::<u8>() as usize,
+            rx_head,
+            rx_words,
+            tx_mapping: cpu_mapping_snapshot(&self.tx_ring),
+            rx_mapping: cpu_mapping_snapshot(&self.rx_ring),
+        }
+    }
+
+    /// Inspect retained payloads only after the device-wide DMA drain, before
+    /// reset clears the rings. No flush, cache invalidation or ownership change.
+    ///
+    /// # Safety
+    /// All packet operations have stopped and hardware::quiesce acknowledged
+    /// the controller's complete DMA drain. DMA must remain stopped throughout.
+    pub(crate) unsafe fn quiesced_writeback_snapshot(&self) -> QuiescedWritebackSnapshot {
+        let rx = self.rx.lock();
+        let mut result = QuiescedWritebackSnapshot {
+            tx_dd: 0,
+            rx_dd: 0,
+            rx_nonzero_prefixes: 0,
+            rx_leased_skipped: 0,
+            first_changed_rx: None,
+            first_rx_words: [0; 8],
+        };
+        for slot in 0..self.tx_count {
+            // SAFETY: slot is bounded; caller proved no device writer remains.
+            let status = unsafe {
+                ptr::read_volatile(self.tx_ring.cpu_ptr_at::<u32>((slot * 16 + 12) as u64))
+            };
+            result.tx_dd += usize::from(status & 1 != 0);
+        }
+        for slot in 0..self.rx_count {
+            // SAFETY: same quiescence proof and bounded descriptor index.
+            let status = unsafe {
+                ptr::read_volatile(self.rx_ring.cpu_ptr_at::<u32>((slot * 16 + 8) as u64))
+            };
+            result.rx_dd += usize::from(status & 1 != 0);
+            if rx.leases[slot].is_some() {
+                result.rx_leased_skipped += 1;
+                continue;
+            }
+            // Read the retained allocation, never an address from a descriptor
+            // that the NIC may have replaced with writeback metadata. Sample
+            // a bounded prefix; reused buffers can contain earlier traffic.
+            let words: [u32; 8] = core::array::from_fn(|word| {
+                // SAFETY: retained RX buffers are >= 2048 bytes; DMA drained.
+                unsafe { ptr::read_volatile(rx.buffers[slot].cpu_ptr_at::<u32>((word * 4) as u64)) }
+            });
+            if words != [0; 8] {
+                result.rx_nonzero_prefixes += 1;
+                if result.first_changed_rx.is_none() {
+                    result.first_changed_rx = Some(slot);
+                    result.first_rx_words = words;
+                }
+            }
+        }
+        result
+    }
+
     /// # Safety
     /// The device must have acknowledged that DMA is quiescent, or these
     /// queues must never have been exposed to hardware.
@@ -208,6 +405,10 @@ impl Queue {
         tx.last_launch_cycle = None;
         tx.last_tx_cycle = None;
         drop(tx);
+        // Linux `netdev_tx_reset_queue`: the ring is empty again. Frames it
+        // held were dropped above (returning their connections' charges);
+        // whoever waited for room is released by the next wake pass.
+        self.txq.reset();
         let mut rx = self.rx.lock();
         rx.head = 0;
         rx.partial = None;
@@ -337,6 +538,7 @@ impl Queue {
 
     fn reclaim_locked(&self, tx: &mut Tx) -> usize {
         let mut reclaimed = 0;
+        let mut bytes = 0u64;
         while tx.pending.front().is_some_and(|p| self.done(p.end)) {
             let p = tx.pending.pop_front().unwrap();
             if p.smd == 1 {
@@ -344,6 +546,7 @@ impl Queue {
             }
             tx.completed += 1;
             tx.bytes += u64::from(p.frame.len());
+            bytes += u64::from(p.frame.len());
             tx.clean = (p.end + 1) % self.tx_count;
             // Owned Frames may come from the stack's DMA pool; return them
             // using its existing release hook after completion.
@@ -360,6 +563,12 @@ impl Queue {
             reclaimed += 1;
         }
         Self::drain_completions(tx);
+        if reclaimed != 0 {
+            // Linux `igc_clean_tx_irq`: one report per cleaned batch, which
+            // wakes the queue once `TX_WAKE_THRESHOLD` descriptors are free.
+            let free = (tx.clean + self.tx_count - tx.next - 1) % self.tx_count;
+            self.txq.completed(reclaimed as u32, bytes, free as u32);
+        }
         reclaimed
     }
 
@@ -367,12 +576,18 @@ impl Queue {
         self.reclaim_locked(&mut self.tx.lock())
     }
 
+    /// Linux `dev_watchdog`: `time_after(jiffies, trans_start + timeout)` is a
+    /// signed comparison, so a transmit stamped after the watchdog sampled the
+    /// clock is young, not stalled. `now` is read before this takes the TX
+    /// lock; a sender that held the lock meanwhile stamps its frame later than
+    /// `now`, and an unsigned difference turned that into a 2^64-cycle stall
+    /// and a full controller reset in the middle of a busy transmit.
     pub(crate) fn stalled(&self, now: u64, timeout: u64) -> bool {
         self.tx
             .lock()
             .pending
             .front()
-            .is_some_and(|p| now.wrapping_sub(p.since) > timeout)
+            .is_some_and(|p| now.saturating_sub(p.since) > timeout)
     }
 
     pub(crate) fn flush(&self, r: &impl Registers, q: usize) {
@@ -440,6 +655,19 @@ impl Queue {
                 .is_some_and(|l| tx.last_tx_cycle != Some(l.cycle));
         let needed = data_count + usize::from(plan.context.is_some()) + if empty { 2 } else { 0 };
         let free = (tx.clean + self.tx_count - tx.next - 1) % self.tx_count;
+        // A caller that honours backpressure is refused while the queue is
+        // stopped and when its frame does not fit, as `igc_xmit_frame_ring`
+        // returns NETDEV_TX_BUSY: the frame is not posted and not counted
+        // as rejected. A frame no empty ring could hold is an error instead,
+        // or its owner would wait for room that never comes.
+        if options.backpressure
+            && (self.txq.is_stopped() || (needed > free && self.txq.fits_empty_ring(needed as u32)))
+        {
+            self.txq.refused();
+            fence(Ordering::Release);
+            r.write(0xe018 + q as u64 * 0x40, tx.next as u32);
+            return Err(IgcError::TxBusy);
+        }
         if needed > free {
             tx.rejects += 1;
             fence(Ordering::Release);
@@ -533,6 +761,12 @@ impl Queue {
         if !meta.more || free - needed < 20 {
             r.write(0xe018 + q as u64 * 0x40, slot as u32);
         }
+        // Linux `igc_maybe_stop_tx(tx_ring, DESC_NEEDED)` after every frame,
+        // whoever sent it: stop while fewer descriptors remain than one more
+        // worst-case frame needs. Completions run under this lock, so the
+        // free count cannot change behind the check.
+        let free_after = (free - needed) as u32;
+        self.txq.sent(length as u32, || free_after);
         Ok(())
     }
 
@@ -912,4 +1146,7 @@ pub(crate) struct TxOptions {
     pub info: u32,
     pub command: u32,
     pub launch: Option<super::traffic::Launch>,
+    /// The caller honours [`IgcError::TxBusy`]: refuse instead of using the
+    /// descriptors kept free below the stop threshold.
+    pub backpressure: bool,
 }

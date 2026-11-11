@@ -1564,6 +1564,10 @@ enum SocketState {
         rx: Arc<RingBuf>,
         peer_addr: u32,
         peer_port: u16,
+        /// `inet_rcv_saddr` / `inet_sport`: this end's own name, which
+        /// `getsockname` reports and the other end sees as its peer.
+        local_addr: u32,
+        local_port: u16,
     },
     /// AF_INET SOCK_STREAM connection routed through the
     /// kernel-side TCP-over-NIC stack. `tcb_id` indexes
@@ -1629,6 +1633,9 @@ enum SocketState {
         rx: Arc<RingBuf>,
         peer_addr: [u8; 16],
         peer_port: u16,
+        /// `sk_v6_rcv_saddr` / `inet_sport`, as for `InetConnected`.
+        local_addr: [u8; 16],
+        local_port: u16,
     },
     Inet6Wired {
         tcb_id: u32,
@@ -1823,6 +1830,19 @@ pub(crate) struct Inet4RxInfo {
     /// `SKB_GSO_UDP_L4`); 0 for an ordinary datagram. `udp_cmsg_recv`
     /// reports it as the `UDP_GRO` control message.
     pub gso_size: u16,
+    /// CLOCK_REALTIME nanoseconds at which the datagram was queued to the
+    /// socket — `skb->tstamp`, which `__sock_recv_timestamp` reports as
+    /// `SCM_TIMESTAMP{,NS}` to a socket with `SO_TIMESTAMP{,NS}` set.
+    pub tstamp_ns: i64,
+}
+
+/// `ktime_get_real()` for a datagram being queued to a socket: what Linux's
+/// `net_timestamp_set` stores in `skb->tstamp` on receive.
+pub(crate) fn rx_tstamp_now_ns() -> i64 {
+    let now = narf_time::now_wall();
+    now.secs
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(now.nanos))
 }
 
 /// Which IPv4 receive control messages a socket asked for.
@@ -1898,6 +1918,8 @@ struct DgramPacket6 {
     /// `UDP_GRO` segment size of a coalesced loopback GSO datagram; 0
     /// otherwise (see [`Inet4RxInfo::gso_size`]).
     gso_size: u16,
+    /// Arrival time (see [`Inet4RxInfo::tstamp_ns`]).
+    tstamp_ns: i64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1908,6 +1930,8 @@ pub(crate) struct Inet6RecvAncillary {
     pub traffic_class: u8,
     /// The `UDP_GRO` cmsg's segment size, or 0 for no cmsg.
     pub gso_size: u16,
+    /// Arrival time, as [`Inet4RxInfo::tstamp_ns`].
+    pub tstamp_ns: i64,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -2398,7 +2422,8 @@ impl SocketFile {
             ETHTOOL_GLINK => {
                 // `ethtool_get_link`: netif_running && the driver's carrier;
                 // `lo` is always on.
-                let link = u32::from(name == "lo" || iface.is_some_and(|nic| nic.link_up));
+                let link =
+                    u32::from(name == "lo" || iface.is_some_and(|nic| nic.link_up && nic.carrier));
                 let mut value = [0u8; 8];
                 value[0..4].copy_from_slice(&ETHTOOL_GLINK.to_ne_bytes());
                 value[4..8].copy_from_slice(&link.to_ne_bytes());
@@ -2421,12 +2446,12 @@ impl SocketFile {
                 // SAFETY: codec bounds every variable-length request to 64 KiB.
                 unsafe { crate::handlers::copy_from_user(&mut request, data) }
                     .map_err(|_| FsError::BadAddress)?;
-                narf_net::ethtool::execute(name, &mut request)
+                let result = narf_net::ethtool::execute_with_result(name, &mut request)
                     .map_err(|e| map_admin_ioctl_error(narf_net::AdminError::DeviceError(e)))?;
                 // SAFETY: output occupies the same bounded user buffer.
                 unsafe { crate::handlers::copy_to_user(data, &request) }
                     .map_err(|_| FsError::BadAddress)?;
-                Ok(0)
+                Ok(u64::from(result))
             }
         }
     }
@@ -3420,21 +3445,17 @@ impl SocketFile {
             SocketState::Fresh if self.domain == AF_INET6 => Some(make_sockaddr_in6([0u8; 16], 0)),
             SocketState::InetListener { addr, port, .. } => Some(make_sockaddr_in(*addr, *port)),
             SocketState::InetConnected {
-                peer_addr,
-                peer_port,
+                local_addr,
+                local_port,
                 ..
-            } => {
-                let _ = (peer_addr, peer_port);
-                Some(make_sockaddr_in(0, 0))
-            }
-            SocketState::InetWired {
-                peer_addr,
-                peer_port,
-                ..
-            } => {
-                let _ = (peer_addr, peer_port);
-                Some(make_sockaddr_in(0, 0))
-            }
+            } => Some(make_sockaddr_in(*local_addr, *local_port)),
+            // `inet_getname`: `inet_rcv_saddr` / `inet_sport`, which live in
+            // the TCB. A connection that is gone reports the unbound name.
+            SocketState::InetWired { tcb_id, .. } => Some(
+                narf_net::tcp_stack::endpoints(*tcb_id)
+                    .map(|(local, port, _, _)| make_sockaddr_in(u32::from_be_bytes(local), port))
+                    .unwrap_or_else(|| make_sockaddr_in(0, 0)),
+            ),
             SocketState::InetDgram {
                 local_addr,
                 local_port,
@@ -3471,13 +3492,10 @@ impl SocketFile {
             }),
             SocketState::Inet6Listener { addr, port, .. } => Some(make_sockaddr_in6(*addr, *port)),
             SocketState::Inet6Connected {
-                peer_addr,
-                peer_port,
+                local_addr,
+                local_port,
                 ..
-            } => {
-                let _ = (peer_addr, peer_port);
-                Some(make_sockaddr_in6([0u8; 16], 0))
-            }
+            } => Some(make_sockaddr_in6(*local_addr, *local_port)),
             SocketState::Inet6Wired { tcb_id, .. } => narf_net::tcp_stack::endpoints6(*tcb_id)
                 .map(|(local, port, _, _)| make_sockaddr_in6(local, port)),
             _ => None,
@@ -3553,28 +3571,45 @@ impl SocketFile {
     /// the hot path: only a bound or listening socket can strand a name, and
     /// those are a vanishing fraction of the sockets a system closes.
     pub fn has_registration(&self) -> bool {
-        matches!(
-            &*self.state.lock(),
+        let loopback_v6 = match &*self.state.lock() {
             SocketState::UnixBound { .. }
-                | SocketState::UnixListener { .. }
-                | SocketState::UnixConnected {
-                    local_addr: Some(_),
-                    ..
-                }
-                | SocketState::InetListener { .. }
-                | SocketState::Inet6Listener { .. }
-                | SocketState::UnixDgram { addr: Some(_), .. }
-                | SocketState::InetDgram { .. }
-                | SocketState::Inet6Dgram { .. }
-                | SocketState::InetWired { .. }
-                | SocketState::Inet6Wired { .. }
-        )
+            | SocketState::UnixListener { .. }
+            | SocketState::UnixConnected {
+                local_addr: Some(_),
+                ..
+            }
+            | SocketState::InetListener { .. }
+            | SocketState::Inet6Listener { .. }
+            | SocketState::UnixDgram { addr: Some(_), .. }
+            | SocketState::InetDgram { .. }
+            | SocketState::Inet6Dgram { .. }
+            | SocketState::InetWired { .. }
+            | SocketState::Inet6Wired { .. } => return true,
+            SocketState::InetConnected { .. } => false,
+            SocketState::Inet6Connected { .. } => true,
+            _ => return false,
+        };
+        // A loopback connection registers only the local port its connecting
+        // end holds; the accepted end shares the listener's and owns none.
+        let me: *const SocketFile = self;
+        if loopback_v6 {
+            INET6_TCP_BINDS
+                .lock()
+                .iter()
+                .any(|b| Weak::as_ptr(&b.owner) == me)
+        } else {
+            INET_TCP_BINDS
+                .lock()
+                .iter()
+                .any(|b| Weak::as_ptr(&b.owner) == me)
+        }
     }
 
     /// Tear down listener / dgram-bound registry entries owned by
     /// this socket. Called from sys_close so the path / port is
-    /// reusable on the next bind. Idempotent — Fresh / Connected
-    /// sockets are no-ops.
+    /// reusable on the next bind. Idempotent — Fresh and unnamed connected
+    /// sockets are no-ops; a loopback TCP connection gives back the local
+    /// port it holds.
     pub fn unregister(&self) {
         enum Reg {
             Unix(UnixPathKey),
@@ -3656,6 +3691,16 @@ impl SocketFile {
                 } => Reg::Inet6Dgram(*local_port, *port_locked),
                 SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
                     Reg::Tcb(*tcb_id)
+                }
+                // `tcp_close` → `inet_put_port`: the last descriptor of a
+                // loopback connection gives its local port back.
+                SocketState::InetConnected { .. } => {
+                    self.inet_tcp_release_port();
+                    Reg::None
+                }
+                SocketState::Inet6Connected { .. } => {
+                    self.inet6_release_port();
+                    Reg::None
                 }
                 _ => Reg::None,
             }
@@ -6624,7 +6669,11 @@ impl SocketFile {
                 }
                 // Re-entering connect() while a setup is in flight
                 // polls it — the park/re-execute loop needs the
-                // outcome, not a fresh refusal.
+                // outcome, not a fresh refusal. The poll records its
+                // outcome under the state lock, so release it first:
+                // holding it here spun this CPU on its own lock, with
+                // interrupts off, as soon as the setup had resolved.
+                drop(state);
                 return self.bt_sco_poll_pending(dev, peer);
             }
             (bound.clone(), sco.voice_setting)
@@ -9262,6 +9311,7 @@ impl SocketFile {
                 traffic_class: 0,
                 payload: buf.to_vec(),
                 gso_size: 0,
+                tstamp_ns: rx_tstamp_now_ns(),
             });
             return SocketOpResult::Ok(buf.len() as u64);
         }
@@ -9935,12 +9985,19 @@ impl SocketFile {
                         if let Some(namespace) = self.net_namespace.lock().clone() {
                             child.set_net_namespace(namespace);
                         }
+                        // `inet_csk_accept` hands back the child sock whose
+                        // `inet_daddr` / `inet_dport` the handshake filled in
+                        // from the SYN; `inet_getname(peer)` and accept(2)'s
+                        // address report them.
+                        let (peer_addr, peer_port) = narf_net::tcp_stack::endpoints(child_id)
+                            .map(|(_, _, remote, port)| (u32::from_be_bytes(remote), port))
+                            .unwrap_or((0, 0));
                         {
                             let mut cs = child.state.lock();
                             *cs = SocketState::InetWired {
                                 tcb_id: child_id,
-                                peer_addr: 0,
-                                peer_port: 0,
+                                peer_addr,
+                                peer_port,
                             };
                         }
                         // The accepting task owns this connection — targeted
@@ -10092,6 +10149,15 @@ impl SocketFile {
                         hook(&listener);
                     }
                 }
+                // `tcp_v4_connect`: `ip_route_connect` turns INADDR_ANY into
+                // loopback and picks the source address; `inet_hash_connect`
+                // keeps a bound port or draws an ephemeral one. The accepted
+                // child is the mirror image of that four-tuple.
+                let dst_ip = if ip == 0 { INADDR_LOOPBACK } else { ip };
+                let (src_ip, src_port, claimed) = match self.inet_loopback_source(dst_ip) {
+                    Ok(source) => source,
+                    Err(e) => return SocketOpResult::Err(e),
+                };
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
                 let server_end = SocketFile::new(AF_INET, SOCK_STREAM);
@@ -10100,8 +10166,10 @@ impl SocketFile {
                     *srv_state = SocketState::InetConnected {
                         tx: b_to_a.clone(),
                         rx: a_to_b.clone(),
-                        peer_addr: ip,
-                        peer_port: port,
+                        peer_addr: src_ip,
+                        peer_port: src_port,
+                        local_addr: dst_ip,
+                        local_port: port,
                     };
                 }
                 {
@@ -10118,24 +10186,30 @@ impl SocketFile {
                         // Linux wait-queue: fire on every event even at the same level.
                         listener.listener_readiness.notify(narf_filesystem::POLL_IN);
                     } else {
+                        if claimed {
+                            self.inet_tcp_release_port();
+                        }
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
                 }
                 let mut state = self.state.lock();
                 if Self::inet_stream_connectable(&state) {
+                    // The connection owns its local port until the socket is
+                    // released (`inet_put_port` from `tcp_close`); see `Drop`.
                     *state = SocketState::InetConnected {
                         tx: a_to_b,
                         rx: b_to_a,
-                        peer_addr: ip,
+                        peer_addr: dst_ip,
                         peer_port: port,
+                        local_addr: src_ip,
+                        local_port: src_port,
                     };
-                    drop(state);
-                    // The loopback connected state does not model a local
-                    // port, so a client that bound first gives its port back
-                    // rather than leaking the reservation.
-                    self.inet_tcp_release_port();
                     SocketOpResult::Ok(0)
                 } else {
+                    drop(state);
+                    if claimed {
+                        self.inet_tcp_release_port();
+                    }
                     SocketOpResult::Err(SockError::AlreadyConnected)
                 }
             }
@@ -10338,6 +10412,9 @@ impl SocketFile {
                 rx.close();
                 *state = SocketState::Fresh;
                 drop(state);
+                // The socket is unbound again, so its port goes back.
+                self.inet_tcp_release_port();
+                self.inet6_release_port();
                 narf_net::readiness::notify(0);
             }
             SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
@@ -10441,7 +10518,21 @@ impl SocketFile {
         };
         let listeners = INET_LISTENERS.lock();
         let mut binds = INET_TCP_BINDS.lock();
-        binds.retain(|b| b.owner.strong_count() != 0);
+        // A socket whose last reference is gone but whose `Drop` has not
+        // reached `inet_tcp_release_port` yet: its ephemeral port goes back
+        // to the pool here, or pruning the record would leak the number.
+        binds.retain(|b| {
+            let live = b.owner.strong_count() != 0;
+            if !live && b.ephemeral {
+                crate::ephemeral_port::free(
+                    AF_INET,
+                    0,
+                    crate::ephemeral_port::SocketProto::Tcp,
+                    b.port,
+                );
+            }
+            live
+        });
         let me = Arc::as_ptr(self);
         let conflicts = |binds: &Vec<InetTcpBind>, port: u16| {
             binds.iter().any(|b| {
@@ -10500,17 +10591,52 @@ impl SocketFile {
         Ok(port)
     }
 
-    /// Drop this socket's TCP port reservation (close, or connect from a
-    /// bound state in the loopback model).
+    /// The local name a loopback connect to `dst` gets — `tcp_v4_connect`:
+    /// a specific bound address and a bound port are kept; otherwise the
+    /// route's preferred source (127.0.0.1 for 127/8, the address itself for
+    /// any other local address) and a fresh ephemeral port
+    /// (`inet_hash_connect`, EADDRNOTAVAIL when the range is exhausted). The
+    /// flag says a port was claimed here, for the caller to give back if the
+    /// connect then fails.
+    fn inet_loopback_source(self: &Arc<Self>, dst: u32) -> Result<(u32, u16, bool), SockError> {
+        let bound = match &*self.state.lock() {
+            SocketState::InetListener {
+                listening: false,
+                addr,
+                port,
+                ..
+            } => Some((*addr, *port)),
+            _ => None,
+        };
+        let route_src = if (dst >> 24) == 127 {
+            INADDR_LOOPBACK
+        } else {
+            dst
+        };
+        match bound {
+            Some((addr, port)) if port != 0 => {
+                Ok((if addr == 0 { route_src } else { addr }, port, false))
+            }
+            _ => {
+                let port = self
+                    .inet_tcp_claim_port(route_src, 0)
+                    .map_err(|_| SockError::AddrNotAvail)?;
+                Ok((route_src, port, true))
+            }
+        }
+    }
+
+    /// Drop this socket's TCP port reservation (close, disconnect, or a
+    /// connect that failed after claiming one).
     fn inet_tcp_release_port(&self) {
         let me: *const SocketFile = self;
         let mut freed = Vec::new();
         INET_TCP_BINDS.lock().retain(|b| {
-            let mine = Weak::as_ptr(&b.owner) == me;
-            if mine && b.ephemeral {
+            let gone = Weak::as_ptr(&b.owner) == me || b.owner.strong_count() == 0;
+            if gone && b.ephemeral {
                 freed.push(b.port);
             }
-            !mine && b.owner.strong_count() != 0
+            !gone
         });
         for p in freed {
             crate::ephemeral_port::free(AF_INET, 0, crate::ephemeral_port::SocketProto::Tcp, p);
@@ -11194,6 +11320,19 @@ impl SocketFile {
                         hook(&listener);
                     }
                 }
+                // `tcp_v6_connect`: an unspecified destination means
+                // loopback (`if (ipv6_addr_any(&usin->sin6_addr)) ... =
+                // in6addr_loopback`); the source address and port are chosen
+                // as for IPv4, and the accepted child mirrors the four-tuple.
+                let dst_ip = if ip == [0u8; 16] {
+                    IN6ADDR_LOOPBACK
+                } else {
+                    ip
+                };
+                let (src_ip, src_port, claimed) = match self.inet6_loopback_source(dst_ip) {
+                    Ok(source) => source,
+                    Err(e) => return SocketOpResult::Err(e),
+                };
                 let a_to_b = Arc::new(RingBuf::new());
                 let b_to_a = Arc::new(RingBuf::new());
                 let server_end = SocketFile::new(AF_INET6, SOCK_STREAM);
@@ -11202,8 +11341,10 @@ impl SocketFile {
                     *srv_state = SocketState::Inet6Connected {
                         tx: b_to_a.clone(),
                         rx: a_to_b.clone(),
-                        peer_addr: ip,
-                        peer_port: port,
+                        peer_addr: src_ip,
+                        peer_port: src_port,
+                        local_addr: dst_ip,
+                        local_port: port,
                     };
                 }
                 {
@@ -11220,23 +11361,29 @@ impl SocketFile {
                         // Linux wait-queue: fire on every event even at the same level.
                         listener.listener_readiness.notify(narf_filesystem::POLL_IN);
                     } else {
+                        if claimed {
+                            self.inet6_release_port();
+                        }
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
                 }
                 let mut state = self.state.lock();
                 if Self::inet_stream_connectable(&state) {
+                    // The connection owns its local port until release.
                     *state = SocketState::Inet6Connected {
                         tx: a_to_b,
                         rx: b_to_a,
-                        peer_addr: ip,
+                        peer_addr: dst_ip,
                         peer_port: port,
+                        local_addr: src_ip,
+                        local_port: src_port,
                     };
-                    drop(state);
-                    // The loopback connected state models no local port: a
-                    // client that bound first gives its reservation back.
-                    self.inet6_release_port();
                     SocketOpResult::Ok(0)
                 } else {
+                    drop(state);
+                    if claimed {
+                        self.inet6_release_port();
+                    }
                     SocketOpResult::Err(SockError::AlreadyConnected)
                 }
             }
@@ -11312,7 +11459,20 @@ impl SocketFile {
         let reuseport = self.options.lock().reuseport;
         let net_ns_id = self.net_ns_id();
         let mut binds = INET6_TCP_BINDS.lock();
-        binds.retain(|b| b.owner.strong_count() != 0);
+        // As in `inet_tcp_claim_port`: a dead owner's ephemeral port is
+        // returned, not dropped with its record.
+        binds.retain(|b| {
+            let live = b.owner.strong_count() != 0;
+            if !live && b.ephemeral {
+                crate::ephemeral_port::free(
+                    AF_INET6,
+                    0,
+                    crate::ephemeral_port::SocketProto::Tcp,
+                    b.port,
+                );
+            }
+            live
+        });
         let (port, ephemeral) = if port == 0 {
             let p =
                 crate::ephemeral_port::alloc(AF_INET6, 0, crate::ephemeral_port::SocketProto::Tcp)
@@ -11343,16 +11503,45 @@ impl SocketFile {
         Ok(port)
     }
 
+    /// IPv6 counterpart of [`Self::inet_loopback_source`]: a loopback
+    /// connect's source is the destination address itself (`::1`, or the
+    /// local address connected to) unless the socket bound a specific one.
+    fn inet6_loopback_source(
+        self: &Arc<Self>,
+        dst: [u8; 16],
+    ) -> Result<([u8; 16], u16, bool), SockError> {
+        let bound = match &*self.state.lock() {
+            SocketState::Inet6Listener {
+                listening: false,
+                addr,
+                port,
+                ..
+            } => Some((*addr, *port)),
+            _ => None,
+        };
+        match bound {
+            Some((addr, port)) if port != 0 => {
+                Ok((if addr == [0u8; 16] { dst } else { addr }, port, false))
+            }
+            _ => {
+                let port = self
+                    .inet6_claim_port(dst, 0)
+                    .map_err(|_| SockError::AddrNotAvail)?;
+                Ok((dst, port, true))
+            }
+        }
+    }
+
     /// Drop this socket's AF_INET6 port reservation.
     fn inet6_release_port(&self) {
         let me: *const SocketFile = self;
         let mut freed = Vec::new();
         INET6_TCP_BINDS.lock().retain(|b| {
-            let mine = Weak::as_ptr(&b.owner) == me;
-            if mine && b.ephemeral {
+            let gone = Weak::as_ptr(&b.owner) == me || b.owner.strong_count() == 0;
+            if gone && b.ephemeral {
                 freed.push(b.port);
             }
-            !mine && b.owner.strong_count() != 0
+            !gone
         });
         for p in freed {
             crate::ephemeral_port::free(AF_INET6, 0, crate::ephemeral_port::SocketProto::Tcp, p);
@@ -11723,6 +11912,18 @@ impl Drop for SocketFile {
                 || self.protocol == BTPROTO_SCO)
         {
             self.bt_teardown();
+        }
+        // `tcp_close` → `inet_put_port`: a loopback connection holds its
+        // local port for as long as any descriptor refers to the socket.
+        let connected = match &*self.state.lock() {
+            SocketState::InetConnected { .. } => Some(false),
+            SocketState::Inet6Connected { .. } => Some(true),
+            _ => None,
+        };
+        match connected {
+            Some(false) => self.inet_tcp_release_port(),
+            Some(true) => self.inet6_release_port(),
+            None => {}
         }
         let bypass_state = match &*self.state.lock() {
             SocketState::Bypass { state } => Some(state.clone()),
@@ -12671,6 +12872,11 @@ static INET_LISTENERS: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::new(
 #[cfg(feature = "kernel-test")]
 static INET_CONNECT_PRE_ENQUEUE_HOOK: IrqSafeSpinLock<Option<fn(&SocketFile)>> =
     IrqSafeSpinLock::new(None);
+
+/// `INADDR_LOOPBACK`, 127.0.0.1.
+const INADDR_LOOPBACK: u32 = 0x7F00_0001;
+/// `in6addr_loopback`, `::1`.
+const IN6ADDR_LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 /// One AF_INET stream port reservation (the `inet_bind_bucket` owner list),
 /// held from bind(2) (or listen(2) autobind) until close whether or not the
@@ -13889,6 +14095,71 @@ fn smoke_wired_tcp_drop_closes_tcb() -> TestResult {
 }
 kernel_test_in!("userspace/socket", smoke_wired_tcp_drop_closes_tcb);
 
+/// A connection accepted off the NIC (sshd's): the child's names are the
+/// TCB's four-tuple — `inet_getname` reads `inet_daddr`/`inet_dport` for the
+/// peer and `inet_rcv_saddr`/`inet_sport` locally. sshd logged every such
+/// login as "from 0.0.0.0 port 0".
+fn smoke_wired_tcp_accept_reports_tcb_names() -> TestResult {
+    use narf_net::tcp::core::{__install_test_tcb, __with_tcb_mut, remove_tcb};
+    use narf_net::tcp_stack::{listen, release, TcpState};
+
+    const LOCAL: [u8; 4] = [10, 0, 2, 15];
+    const REMOTE: [u8; 4] = [10, 0, 2, 2];
+    let Ok(listen_id) = listen([0, 0, 0, 0], 31_126, 4) else {
+        return TestResult::Fail("setup: kernel-stack listen failed");
+    };
+    let child_id = __install_test_tcb(LOCAL, 31_126, REMOTE, 51_234, TcpState::Established);
+    let _ = __with_tcb_mut(listen_id, |t| t.accept_queue.push_back(child_id));
+    let listener = SocketFile::new(AF_INET, SOCK_STREAM);
+    *listener.state.lock() = SocketState::InetListener {
+        addr: 0,
+        port: 31_126,
+        backlog: 4,
+        pending: VecDeque::new(),
+        listen_id: Some(listen_id),
+        listening: true,
+    };
+
+    let result = match listener.dispatch_op(SocketOp::Accept) {
+        SocketOpResult::Accepted { socket, peer } => {
+            let want_peer = make_sockaddr_in(u32::from_be_bytes(REMOTE), 51_234);
+            let want_local = make_sockaddr_in(u32::from_be_bytes(LOCAL), 31_126);
+            let same = |a: Option<SockAddr>, b: &SockAddr| {
+                a.is_some_and(|a| a.family == b.family && a.body == b.body)
+            };
+            // What accept(2) copies out: `peer.or_else(|| socket.peer_addr())`.
+            let accepted = peer.or_else(|| socket.peer_addr());
+            let outcome = if !same(accepted, &want_peer) {
+                Err("accept() of a wired connection did not report the TCB's remote name")
+            } else if !same(socket.peer_addr(), &want_peer) {
+                Err("getpeername of a wired accepted socket is not the TCB's remote name")
+            } else if !same(socket.local_addr(), &want_local) {
+                Err("getsockname of a wired accepted socket is not the TCB's local name")
+            } else {
+                Ok(())
+            };
+            drop(socket);
+            outcome
+        }
+        _ => Err("setup: wired listener did not accept its queued connection"),
+    };
+
+    *listener.state.lock() = SocketState::Fresh;
+    crate::handlers::clear_tcb_owner(child_id);
+    remove_tcb(child_id);
+    release(child_id);
+    remove_tcb(listen_id);
+    release(listen_id);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "userspace/socket_names",
+    smoke_wired_tcp_accept_reports_tcb_names
+);
+
 /// The durable-wake migration: a group-2 broadcast must fire the subscriber's
 /// ARMED `uevent_readiness` cell directly (Readiness::set -> wake_by_ref), not
 /// merely advance a token the herd `notify(0)` happens to re-check. This is the
@@ -14309,6 +14580,7 @@ fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {
         hop_limit: 37,
         traffic_class: 0x2e,
         gso_size: 0,
+        tstamp_ns: 0,
     };
     socket.stash_inet6_recv_ancillary(ancillary);
     if pktinfo

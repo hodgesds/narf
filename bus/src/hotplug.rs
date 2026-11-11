@@ -511,12 +511,8 @@ pub fn hotplug_isr() {
         if sts & slot_bits::PRESENCE_DETECT_CHANGED != 0 {
             HOTPLUG_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
             // SAFETY: same.
-            let pd_state = unsafe {
-                core::ptr::read_volatile(
-                    (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_STATUS as u64) as *const u16,
-                )
-            } & (1 << 6)
-                != 0;
+            // Through the mapped ECAM window; the raw address faults.
+            let pd_state = unsafe { slot_presence_detected(cfg_phys, pcie_off) };
             if pd_state {
                 dispatch_event(HotplugEvent::Attach {
                     addr: d.addr,

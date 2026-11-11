@@ -265,7 +265,7 @@ pub mod amd_vi {
 ```
 
 - **Opt-in only.** `init` keeps selecting `Identity` and never touches
-  IOMMU hardware unless the kernel command line carries
+  IOMMU hardware configuration unless the kernel command line carries
   `iommu.passthrough=0` (Linux's switch for DMA-translated default
   domains). Then, on an AMD-Vi platform where no DMA address has yet been
   handed out (`alloc_with` / `alloc_coherent_for` set a gate), `init`
@@ -274,6 +274,13 @@ pub mod amd_vi {
   `init` after the initcall stages have probed drivers, so the opt-in
   reports `DmaAlreadyHandedOut` until `frame/` calls `init` before the
   initcalls (a TCB change, pending maintainer review).
+  Without opt-in it logs inherited AMD-Vi control and device-table-base
+  registers for each IVRS unit without writes or firmware-table dereferences.
+  Each diagnostic window uses the backend's checked Device mapping; it must
+  not derive MMIO pointers from the RAM direct-map offset. An unavailable
+  diagnostic mapping is logged and skipped without preventing normal boot.
+  The software `Identity` mode alone does not prove firmware translation was
+  disabled or programmed as passthrough.
 - **IVRS.** Linux `get_highest_supported_ivhd_type`: only IVHD blocks of
   the highest supported type are used. Device entries 01h/02h/03h/04h/
   42h/43h/46h/47h/48h(IOAPIC, HPET)/F0h give the requester-ID → unit

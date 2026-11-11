@@ -160,6 +160,9 @@ pub fn internal_child_slot(buf: &[u8], n: usize, target: &BtrfsKey) -> Result<us
 
 // ── Cursor ─────────────────────────────────────────────────────────
 
+/// The `(key, body)` items of one leaf, in key order.
+pub(crate) type LeafItems = Vec<(BtrfsKey, Vec<u8>)>;
+
 /// Ordered read cursor over one B-tree. Owns the node buffers along the current
 /// root-to-leaf path so iteration survives across `await` points.
 #[derive(Debug)]
@@ -216,6 +219,28 @@ impl<'v, B: BlockDevice + 'static> Cursor<'v, B> {
             leaf_item_key(buf, *slot)?,
             leaf_item_data(buf, *slot)?,
         )))
+    }
+
+    /// Every `(key, body)` of the leaf the cursor is in, and the cursor's
+    /// slot in it; `None` if exhausted. For callers that work a leaf at a
+    /// time ([`Self::next_leaf`]).
+    pub(crate) fn leaf(&self) -> Result<Option<(LeafItems, usize)>, FsError> {
+        let Some((buf, slot)) = self.path.last() else {
+            return Ok(None);
+        };
+        let n = nritems(buf)? as usize;
+        let items = (0..n)
+            .map(|i| Ok((leaf_item_key(buf, i)?, leaf_item_data(buf, i)?.to_vec())))
+            .collect::<Result<_, FsError>>()?;
+        Ok(Some((items, *slot)))
+    }
+
+    /// Move to the first item of the next leaf (exhausted if there is none).
+    pub(crate) async fn next_leaf(&mut self) -> Result<(), FsError> {
+        if self.path.is_empty() {
+            return Ok(());
+        }
+        self.advance_to_next_leaf().await
     }
 
     /// Advance to the next item in key order.
@@ -282,6 +307,33 @@ pub async fn find_item<B: BlockDevice + 'static>(
         Some((k, data)) if k == *key => Ok(Some(data.to_vec())),
         _ => Ok(None),
     }
+}
+
+/// Whether the tree rooted at `root` holds an item with exactly `key`:
+/// [`find_item`] without copying a node or the item out of the cache.
+pub(crate) async fn contains_key<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root: u64,
+    key: &BtrfsKey,
+) -> Result<bool, FsError> {
+    let mut node = vol.read_node_shared(root).await?;
+    for _ in 0..=MAX_LEVEL {
+        let n = nritems(&node)? as usize;
+        if level(&node)? == 0 {
+            let slot = leaf_lower_bound(&node, n, key)?;
+            return Ok(slot < n && leaf_item_key(&node, slot)? == *key);
+        }
+        if n == 0 {
+            return Err(FsError::InvalidData);
+        }
+        let slot = internal_child_slot(&node, n, key)?;
+        let child = vol
+            .read_node_shared(internal_blockptr(&node, slot)?)
+            .await?;
+        verify_child(&node, slot, &child)?;
+        node = child;
+    }
+    Err(FsError::InvalidData)
 }
 
 /// The `(key, body)` of the greatest item whose key is strictly less than

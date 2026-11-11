@@ -51,7 +51,8 @@ multipath / fabrics (defer).
 - New `NvmeError` variants: `UnsupportedPageSize` (CAP.MPSMIN > 4 KiB, bring-up
   refused as Linux `nvme_enable_ctrl` does), `BadTransfer`,
   `ExceedsMaxTransfer`, `ControllerDead` (an I/O command timed out; later I/O
-  refused), `NamespaceUnusable`.
+  refused), `NamespaceUnusable`, `GateTimeout` (the controller's request gate
+  never came free; see the gate paragraph below).
 - `NvmeBlockSync` / `NvmeBlockDevice` split a request into commands of at
   most `min(max_transfer, 128 KiB scratch)` / `max_transfer` bytes, in units of
   the namespace's LBA size.
@@ -74,6 +75,25 @@ multipath / fabrics (defer).
   gate. IRQ/masked and non-stackful callers service pending TLB-shootdown
   and membarrier acknowledgements while waiting; they never re-enable IRQs
   or invoke framebuffer/device pumps from the gate wait.
+  **The gate wait is attributed and bounded.** Every acquisition records
+  the holder (CPU, scheduler task id) and the TSC time alongside the gate
+  — two relaxed atomic stores, nothing on release, nothing else on the
+  uncontended path. A waiter that has waited `GATE_STALL_WARN_MS` (2 s)
+  logs who holds the gate and for how long, the holder's last progress
+  mark, and who is waiting (CPU, task, interrupt state, and whether the
+  holder is on the waiter's own CPU), repeating every
+  `GATE_STALL_REPORT_EVERY_MS` (10 s). Once the holder has shown no
+  progress for `GATE_STALL_FAIL_MS` (60 s) of the waiter's wait, the
+  waiter logs an error and fails with `NvmeError::GateTimeout`: block I/O
+  returns `BlockIoError::DriverError` / `BlockError::IOError`,
+  `with_controller*` / `admin_passthrough*` return `None`, the AER
+  supervisor skips the round, `remove_controller` returns `Some(false)`
+  without touching the controller. It is an error, not a panic: a waiter
+  nested on its holder's stack (a wait loop that pumps the scheduler into
+  a task wanting the same controller) releases the holder by returning.
+  The reset + replay path marks progress after each reset, so a holder
+  working through a timeout is not mistaken for a stalled one.
+  `gate_stall_reports()` / `gate_timeouts()` count both events.
 - **Reset / recovery + hot-remove** (Linux `nvme_reset_work` / `remove`).
   `Controller::reset_recover(cap) -> Result<RecoveryReport, NvmeError>`:
   snapshot identity (IDENTIFY + namespace set), `disable_after_failure`,
@@ -82,11 +102,37 @@ multipath / fabrics (defer).
   not identity); a mismatch stops the foreign device again and returns
   `NvmeError::IdentityChanged`, and a changed namespace set on the same
   controller is reported as `RecoveryReport::namespaces_changed` for
-  re-publication. The block entry points recover lazily: the first
-  submit / flush that finds the controller dead runs the recovery
-  under the slot's request gate before proceeding (the timed-out
-  request itself is never replayed). A controller that cannot be shown
-  stopped stays dead and I/O keeps failing. `remove_controller` is also
+  re-publication. A controller that cannot be shown stopped stays dead
+  and I/O keeps failing; the first submit / flush that finds a
+  controller dead tries the recovery again before proceeding.
+- **Command timeout → reset → replay** (Linux `nvme_timeout`,
+  `nvme_reset_work`, `nvme_retry_req`). Every I/O-queue command — Read,
+  Write, Flush, Dataset Management, Write Zeroes — has `IO_TIMEOUT_MS` =
+  30 s (Linux `nvme_io_timeout`); admin commands keep 5 s and are never
+  replayed, so a broken controller still fails its probe in seconds.
+  When the budget runs out the CQ is looked at once more before the
+  command is declared lost (Linux `nvme_poll_irqdisable`, "timeout,
+  completion polled"; counted by `late_completions()`). A lost command
+  marks the controller dead, and the sync block entry points
+  (`NvmeBlockSync` / `NvmeNamespaceBlock` read / write / write_fua /
+  flush / trim, `NvmeBlockDevice` submit / flush / discard) then
+  **reset the controller at the timeout site and replay the request**
+  (`run_with_replay`), under the request gate held from the first
+  attempt through the reset to the last replay, so no other command can
+  run in between. The replay budget is `IO_MAX_RETRIES` = 5 (Linux
+  `nvme_max_retries`) *consecutive timeouts on the controller* — reset
+  by any completed command — so one request is attempted at most six
+  times, and a controller that stopped answering altogether costs later
+  requests one attempt each. The request fails (`CompletionTimeout` →
+  `BlockIoError::DriverError` / `BlockError::IOError`) when the budget
+  is spent, the reset fails, the namespace set changed across the reset
+  (re-published, not replayed: the request's geometry is stale), or the
+  final shutdown has begun (no reset then). Each replay restarts the
+  request at its first block and re-stages every chunk from the caller's
+  data; all five request kinds are idempotent under repetition with
+  nothing in between. Deviation from Linux: no Abort command is sent
+  first — the first expiry resets. `io_replays()` counts replays.
+  `remove_controller` is also
   the driver's bus remove hook (bus §9.5): a `Detach` event for its
   function withdraws its block devices and node and disables it.
 - **Namespace scan** (`imp::ns`, Linux `nvme_scan_work`): Active Namespace List
@@ -109,8 +155,9 @@ multipath / fabrics (defer).
   UUID / PARTUUID or `DiskIdentity`.
 - **Flush / FUA / shutdown** (`imp::shutdown`). `IdentifyController::{vwc,
   rtd3e}`; `Controller::has_volatile_write_cache()`, `flush_nsid(nsid)` (I/O
-  opcode 0x00 when VWC bit 0 is set, else a no-op success; 30 s budget, a
-  timeout marks the controller dead), FUA = Write CDW12 bit 30 (native;
+  opcode 0x00 when VWC bit 0 is set, else a no-op success; the 30 s I/O
+  budget, a timeout marks the controller dead and the block entry points
+  reset + replay), FUA = Write CDW12 bit 30 (native;
   `capabilities().fua = true`), `Controller::shutdown()` (flush every
   namespace, then CC.SHN = normal and wait for CSTS.SHST = complete within
   `clamp(RTD3E, 5 s, 60 s)`, Linux `nvme_disable_ctrl(shutdown)`; I/O refused
@@ -160,16 +207,45 @@ multipath / fabrics (defer).
   controller instead). MSI-X entry 0 stays the admin queue's (Linux
   `nvme_create_cq`: `vector = num_vecs == 1 ? 0 : qid`); I/O queues
   use entries `1..=granted` with `IV = qid`, `IEN = 1`, one IDT
-  vector + installed handler each. Production submissions
+  vector + installed handler each. Every entry is steered at one CPU —
+  scheduler CPU 0, resolved to a real APIC ID with
+  `narf_interrupts::apic_id_of_cpu` (the bring-up CPU if firmware lists
+  no APIC ID 0; a literal 0 only when the topology is unknown) — since
+  completions are consumed by whichever CPU is waiting. An entry that
+  cannot be programmed is never advertised as a vector: a failed admin
+  entry leaves the admin queue vector-less (so a single I/O queue that
+  would share entry 0 is created with IEN=0); a failed single-I/O-queue
+  entry (programming or the global enable, which that path sets itself)
+  creates that queue polled (IV=0, IEN=0);
+  a failed multi-queue entry reports `Msix` (polled fallback). Each is
+  logged. The admin queue's vector is tracked on its own
+  (`Controller::admin_irq_vector()`; the public `irq_vector` field is
+  repointed at the first I/O queue's vector by the multi-queue setup):
+  it is the vector the AER supervisor parks on, and
+  `disable_after_failure` releases it together with every I/O vector,
+  each exactly once. Production submissions
   (`nvm_io_dma`, `nvm_io_multipage`, hence every block-layer read /
   write) route through `submit_sqe_irq` — IRQ-driven wait on the
-  queue's vector `fire_count` with a CQE-phase fallback, 5 s budget,
-  CID-matched drain — whenever the picked queue has a vector; the polled
+  queue's vector `fire_count` with a CQE-phase fallback, 30 s budget
+  (`IO_TIMEOUT_MS`), CID-matched drain, one last CQ look at expiry —
+  whenever the picked queue has a vector; the polled
   `Queue::submit` stays the fallback for vector-less boots.
-  `submit_io_irq_async` is the async form, composed from
-  `submit_io_begin` (SQE + doorbell, wait future constructed
-  pre-doorbell) + await + `submit_io_finish` (CID-aware CQE drain);
-  the split
+  `submit_io_irq_async` is the async form: `submit_io_begin(opcode,
+  lba, n_blocks, buf) -> Result<IoInFlight, NvmeError>` (SQE +
+  doorbell), then the loop "arm `IoInFlight::wait()`, check
+  `submit_io_poll(&IoInFlight) -> Result<bool, NvmeError>`, await the
+  wait" until the poll reports the command finished. A wake is only a
+  reason to look at the CQ: `Ok(false)` — not yet — for a wake that
+  was not this command's completion (another queue on a shared vector,
+  the late MSI of an earlier polled Flush on the same queue), never a
+  lost completion. Each wait is bounded by `ASYNC_CQ_POLL_MS` (250 ms)
+  as well as the command's deadline (`IO_TIMEOUT_MS`, shared by all its
+  waits), so a completion whose interrupt never arrives is found by the
+  next check; only when the deadline has passed and a last look at the
+  CQ finds nothing does the poll return `CompletionTimeout` and mark
+  the controller dead. Waits are armed before the CQ check they follow,
+  which is what closes the lost-wakeup window. (`submit_io_finish`, the
+  former single-shot drain, is gone.) The split
   lets a caller release the slot gate across the await — no
   `IrqSafeSpinLock` is ever held across a suspension point and no
   `block_on` appears on this path. The composed async form still
@@ -206,8 +282,32 @@ multipath / fabrics (defer).
 
 - PRP / SGL lists validated against the DMA buffer's bounds.
 - No DMA buffer a command may still reference is freed: I/O uses persistent
-  scratch and PRP-list pages, a timed-out I/O marks the controller dead, and a
-  timed-out admin passthrough leaks its pages.
+  scratch and PRP-list pages, a timed-out I/O marks the controller dead, a
+  timed-out admin passthrough leaks its pages, and a timed-out Identify /
+  Security Send / Security Receive parks its data buffer in `in_flight_dma`
+  until `disable_after_failure` confirms the controller stopped.
+- An admin command timeout (5 s) fails that command only: it does not mark
+  the controller dead and is never replayed. (Linux resets on an admin
+  timeout, but after 60 s; at 5 s a slow Format NVM or vendor passthrough
+  would reset the controller under the root filesystem.) Its late completion
+  cannot be mistaken for another command's (CID match) and cannot block AER
+  delivery: `drain_aer_events` drops a head entry that is not an outstanding
+  AER's completion as a stray — admin commands are synchronous under the
+  gate, so such an entry has no waiter.
+- A caller-owned data buffer (`NvmeBlockDevice::submit`'s cap-resolved
+  `DmaBuffer`) is not released under a command that may still be live: a
+  request that fails with a timeout returns only after the controller was
+  reset at the timeout site, and if the controller is still dead without a
+  confirmed stop (`Controller::may_still_dma()`: CSTS.RDY never dropped, the
+  final shutdown had begun, or the gate could not be taken to find out) one
+  reference to the buffer is leaked (`retained_io_buffers()`), as
+  `disable_after_failure` leaks the queues.
+- A timed-out request is replayed only after the controller was confirmed
+  stopped (CC.EN=0, CSTS.RDY=0) and its queues rebuilt, with the request gate
+  held throughout, and only if the namespace set is unchanged. Replays are
+  bounded (`IO_MAX_RETRIES` consecutive timeouts per controller); nothing but
+  the idempotent block requests (read, write, flush, deallocate, write zeroes)
+  is ever replayed — no admin command, no passthrough.
 - A completion cannot be processed before its submission entry is valid
   (paired ordering).
 - The admin queue is never used on the I/O fast path.
@@ -388,29 +488,50 @@ head:
 - `Controller::drain_aer` consumes only CQEs whose CID is an
   outstanding AER (tracked per admin queue in `aer_cids`),
   drains the `stray_aer` stash first, and reposts one AER per
-  drained completion. A head entry carrying another CID is a
-  normal admin command's completion and is left for its waiter.
+  drained completion. A head entry carrying another CID is the
+  late completion of a timed-out admin command (no admin command
+  can be mid-wait while the drain runs): it is consumed, counted
+  and logged as a stray, so it cannot block the AERs behind it.
 - `Controller::submit_io_irq` / `submit_io_irq_async` drain
   through `try_take_io_cqe`: only the CQE carrying the
   submitted CID is accepted; strays are consumed and dropped
   and the wait repeats within the command deadline. The sync
-  path loops inside `submit_sqe_irq` (5 s budget); the async
-  form is `submit_io_begin` (which returns the CID) + await +
-  `submit_io_finish`, whose CID-aware drain re-checks the head
-  after the await — the lost-wakeup window the old single-shot
-  form's pre-doorbell construction handled is closed by the
-  pre-doorbell future construction plus that re-check.
+  path loops inside `submit_sqe_irq` (30 s budget, then
+  `reap_io_cqe`: one non-blocking drain of up to `depth` head
+  entries before the command is declared lost); the async
+  form is `submit_io_begin` + a loop of `IoInFlight::wait` /
+  `submit_io_poll` (the same `reap_io_cqe` drain on every wake,
+  fatal only at the command's deadline) — see §3.
 - Diagnostics: `Controller::aer_outstanding()` (AER CIDs still
   tracked on the admin queue — a completion stashed by
   `submit_raw_ms` untracks its CID, so the count drops until
   `drain_aer` reposts) and `Controller::stray_aer_len()`.
+- No stray is dropped silently. Every dropped stray (both
+  matchers; a stashed AER completion is not a drop) is counted —
+  `stray_cqe_drops()` — and the 1st, 10th, 100th, ... is logged
+  with the queue, CQ head index and phase, the expected CID and
+  the seen CQE's CID / SQ id / SQ head / status / result (Linux
+  `nvme_handle_cqe`: "invalid id %d completed on queue %d").
+- Every completion timeout is logged where it is declared and
+  counted — `command_timeouts()`: opcode, CID, queue, elapsed
+  time, CQ head index + phase and the head CQE (marked FRESH
+  when its phase tag says a completion is sitting there
+  unconsumed), SQ tail, CSTS, the queue's interrupt vector with
+  its `fire_count` and the number of times it fired since the
+  command was submitted, and whether this CPU has interrupts
+  enabled / is in an interrupt handler (Linux `nvme_timeout`:
+  "I/O tag %d (%04x) opcode %#x QID %d timeout"). The async
+  finish path reports the same line without the elapsed time.
 
 **Fixture:** `imp/tests_cid.rs` drives the real
 `submit_raw_ms` loop against a RAM-backed fake controller
 with spec-laid-out pre-posted CQEs (§4.6): a stray AER error
 completion at the admin head is skipped (event word stashed,
 then drained + reposted) and the submit returns its own CQE;
-an I/O-queue stray is dropped, never stashed. A live AER
+an I/O-queue stray is dropped, never stashed — and counted
+by both matchers (`smoke_nvme_stray_drop_is_counted`); a
+command against a silent CQ times out, is counted once and
+consumes nothing (`smoke_nvme_timeout_is_counted`). A live AER
 event cannot be synthesised on QEMU from the harness (no QMP
 hot-attach), so the live event half is silicon-only — the
 same carve-out as the AER supervisor.

@@ -64,10 +64,36 @@ a live clear-on-read register), and `statistics()` appends the Linux
 global, net and per-queue statistic names after the driver's own names.
 Link ksettings use 2-word masks; advertising carries TP always and
 speeds / Pause / Asym_Pause only while autoneg is on, and a set must
-advertise a subset of supported modes. `GPERMADDR`, NVM writes
-(`SEEEPROM`), full RXNFC rule fields, MM set rounding and the shared
-codec's 32-rule flow cap remain unimplemented (see the igc ethtool
-surface-gaps issue).
+advertise a subset of supported modes. The initial `GLINKSETTINGS` negotiation
+returns a negative required word count and success. `GSSET_INFO` queries each
+requested set independently; feature strings also work without driver controls.
+`GPERMADDR`, NVM writes and full RXNFC fields use native hooks.
+
+Both ioctl and Generic Netlink expose feature names and HW/wanted/active
+bitmaps. `GFEATURES` / `SFEATURES` use 32-bit blocks and preserve Linux's
+nonnegative UNSUPPORTED/WISH result flags. `GFLAGS` / `SFLAGS` expose the VLAN
+insertion policy. Feature changes select the kernel stack's checksum, VLAN and
+TSO requests through `iface::offloads`; they preserve the hardware capabilities
+and wanted policy across reinitialization. They do not reprogram the silicon
+or override an explicit native frame's `TxMeta`. TSO requires TX checksum and
+the contract's coupled IPv4/IPv6 TSO capability. Software GRO can only be enabled
+on interfaces whose driver has already opted into the poll-completion flush
+contract. Unsupported features remain unavailable; SG/software GSO are not
+invented from the hardware TSO capability.
+
+Generic Netlink supports string sets, link information/modes/state, debug, WOL,
+features, private flags, rings, channels, coalescing, pause, EEE and timestamp
+information, plus MAC Merge (Linux command IDs 42/43, reply 42). Compact and
+verbose bitsets share the ioctl/native state. Mutations validate attributes
+before applying changes and require namespace administration or a matching
+delegated interface handle. Dumps filter by the socket's network namespace.
+Linux standardized `STATS_GET` groups and hardware operations without a native
+implementation return EOPNOTSUPP; vendor counters remain available via GSTATS.
+Live interfaces without a device hook return EOPNOTSUPP, absent interfaces
+return ENODEV. Timestamp capability claims come from `NicControl::timestamp_info`;
+a generic control defaults to software timestamping and never inherits I225 PHC
+capabilities. Link queries require both administrative up and physical carrier.
+
 
 `enable_zero_copy_tx_context` preserves an owned-frame device cookie alongside
 queue-local recycling. `Frame::tx_timing` carries an optional hardware timestamp
@@ -1119,6 +1145,61 @@ Plain 20-byte TCP headers and Linux's established-flow NOP/NOP/timestamp
 layout are eligible. A timestamped merge retains the first sequence number
 and newest ACK, window, flags, TSval, and TSecr; other option layouts and all
 control, urgent, fragmented, out-of-order, or non-IPv4 traffic bypass GRO.
+
+TCP socket buffers start at 256 KiB and autotune as Linux does. Receive:
+`tcp_rcv_space_adjust`/`tcp_rcvbuf_grow` run on every read; once per receiver
+round trip (estimated by `tcp_rcv_rtt_measure_ts` and `tcp_rcv_rtt_measure`)
+a reader that consumed more than in the previous round has its window limit
+raised to twice that amount plus slow-start headroom, up to half of
+`net.ipv4.tcp_rmem[2]` and the negotiated window scale. Send:
+`tcp_sndbuf_expand` raises a full send buffer to twice the congestion window,
+up to `net.ipv4.tcp_wmem[2]`. `SO_RCVBUF`/`SO_SNDBUF` lock the respective
+buffer, and `net.ipv4.tcp_moderate_rcvbuf=0` disables receive growth. Buffers
+never shrink. `tcp_info.rcv_space` reports the current receive limit.
+
+### Transmit backpressure (`txq`)
+
+`txq::TxBackpressure` is the driver contract (documented in
+`drivers/net/specification/spec.md` §3); `iface::set_tx_backpressure`
+installs it and `NetIfaceSnapshot::tx_backpressure` exposes it to the stack.
+On such an egress `tcp::core::pump_send` sends one segment at a time:
+
+- One caller owns a connection's transmit (`Tcb::xmit_owner`); a concurrent
+  or nested caller sets `xmit_again` and the owner runs once more.
+- Before a data segment is taken, `tcp_small_queue_check` is applied:
+  the connection's bytes still in the device (`txq::TxAccount`, charged to
+  each owned frame and returned when the frame is destroyed) may not exceed
+  `txq::tsq_limit` — the larger of two segments and about 1 ms at the pacing
+  rate (`cwnd / srtt`, 200% in slow start, 120% after), capped by
+  `net.ipv4.tcp_limit_output_bytes` (4 MiB) — unless at most one segment is
+  outstanding.
+- The segment is marked sent and offered with `try_xmit`. `Err(Busy)` undoes
+  the mark: `snd_nxt`, the send-buffer offset and `snd_high` return to the
+  segment's start, nothing enters the retransmit queue, no timer is armed and
+  the acknowledgement it carried stays owed. The connection registers on its
+  queue (`TxQueue::wait`) and stops. `Err(Dropped)` is treated as sent and
+  lost, as on an egress without the contract.
+- `TxQueue::run_wakeups` resumes waiters once per wake (`tcp::core::tx_resume`).
+  A connection that has waited `TX_WAIT_PROBE_NS` (10 ms) without a wake
+  offers its segment again from the TCP timer tick.
+
+Traffic that is not new TCP data uses the interface's ordinary send hook
+whether or not the queue is stopped. If the device refuses it there: a pure
+ACK stays owed and is retried from the delayed-ACK timer (`__tcp_send_ack`'s
+fallback); an RTO retransmission is retried after
+`min(RTO, TCP_RESOURCE_PROBE_INTERVAL)`; SYN, FIN and fast retransmissions
+are covered by their retransmission timers; RST and non-TCP frames are
+dropped and counted. Linux holds all of these in the qdisc instead; there is
+no qdisc here.
+
+### Receive batches
+
+`iface::rx_batch(name)` resolves the ingress device once per receive poll and
+returns an `RxBatch`; `RxBatch::receive(frame, timestamp)` delivers a frame
+whose native XDP action was PASS without touching the interface registry,
+and the batch's packet, byte and multicast counts are added to the interface
+when it is dropped. `iface::on_native_rx_timestamped` remains for callers
+that deliver single frames by name.
 
 IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,
 socket buffers, and errno path. Family-specific connected and listener

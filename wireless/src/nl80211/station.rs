@@ -1393,59 +1393,28 @@ pub(super) fn regulatory_rule_flags(flags: crate::reg::RegFlags) -> u32 {
         | u32::from(flags.contains(crate::reg::RegFlags::NO_6GHZ_AFC_CLIENT)) << 23
 }
 
-/// The global regulatory domain (`cfg80211_regdomain`): the deployment
-/// policy NARF installed ([`crate::reg::db`]), else cfg80211's
-/// `world_regdom`.
-pub(super) fn global_regdom() -> crate::RegDomainInfo {
-    if let Some(d) = crate::reg::db::get_domain() {
-        return crate::RegDomainInfo {
-            alpha2: d.country_code,
-            dfs_region: 0,
-            self_managed: false,
-            rules: d
-                .rules
-                .iter()
-                .map(|r| crate::RegRuleInfo {
-                    flags: regulatory_rule_flags(r.flags),
-                    start_khz: r.freq_start_mhz * 1000,
-                    end_khz: r.freq_end_mhz * 1000,
-                    max_bw_khz: r.max_bandwidth_mhz * 1000,
-                    max_antenna_gain_mbi: 0,
-                    max_eirp_mbm: (r.max_power_dbm.max(0) as u32) * 100,
-                    dfs_cac_ms: 0,
-                })
-                .collect(),
-        };
-    }
-    // REG_RULE(start, end, bw, gain, eirp, flags) of world_regdom.
-    const NO_IR: u32 = 1 << 7;
-    const AUTO_BW: u32 = 1 << 11;
-    const NO_OFDM: u32 = 1 << 0;
-    const DFS: u32 = 1 << 4;
-    let r = |s: u32, e: u32, bw: u32, gain: u32, eirp: u32, flags: u32| crate::RegRuleInfo {
-        flags,
-        start_khz: s * 1000,
-        end_khz: e * 1000,
-        max_bw_khz: bw * 1000,
-        max_antenna_gain_mbi: gain * 100,
-        max_eirp_mbm: eirp * 100,
-        dfs_cac_ms: 0,
-    };
-    crate::RegDomainInfo {
-        alpha2: *b"00",
-        dfs_region: 0,
+/// The same authenticated installation the drivers consult, including the
+/// Linux world domain when no deployment policy was staged.
+pub(super) fn global_regdom() -> Result<crate::RegDomainInfo, i32> {
+    let (d, dfs_region) = crate::reg::db::ensure_with_info().map_err(|_| 5)?;
+    Ok(crate::RegDomainInfo {
+        alpha2: d.country_code,
+        dfs_region,
         self_managed: false,
-        rules: alloc::vec![
-            r(2412 - 10, 2462 + 10, 40, 6, 20, 0),
-            r(2467 - 10, 2472 + 10, 20, 6, 20, NO_IR | AUTO_BW),
-            r(2484 - 10, 2484 + 10, 20, 6, 20, NO_IR | NO_OFDM),
-            r(5180 - 10, 5240 + 10, 80, 6, 20, NO_IR | AUTO_BW),
-            r(5260 - 10, 5320 + 10, 80, 6, 20, NO_IR | AUTO_BW | DFS),
-            r(5500 - 10, 5720 + 10, 160, 6, 20, NO_IR | DFS),
-            r(5745 - 10, 5825 + 10, 80, 6, 20, NO_IR),
-            r(56160 + 2160 - 1080, 56160 + 2160 * 3 + 1080, 2160, 0, 0, 0),
-        ],
-    }
+        rules: d
+            .rules
+            .iter()
+            .map(|r| crate::RegRuleInfo {
+                flags: regulatory_rule_flags(r.flags),
+                start_khz: r.freq_start_mhz * 1000,
+                end_khz: r.freq_end_mhz * 1000,
+                max_bw_khz: r.max_bandwidth_mhz * 1000,
+                max_antenna_gain_mbi: 0,
+                max_eirp_mbm: (r.max_power_dbm.max(0) as u32) * 100,
+                dfs_cac_ms: 0,
+            })
+            .collect(),
+    })
 }
 
 /// `nl80211_put_regdom`.
@@ -1481,7 +1450,7 @@ pub(super) fn get_reg(attrs: &[u8], dump: bool, namespace: u64) -> Result<Vec<Ge
     if dump {
         let mut out = Vec::new();
         let mut global = Vec::new();
-        put_regdom(&mut global, &global_regdom());
+        put_regdom(&mut global, &global_regdom()?);
         out.push(GenlReply {
             command: GET_REG,
             attrs: global,
@@ -1525,7 +1494,10 @@ pub(super) fn get_reg(attrs: &[u8], dump: bool, namespace: u64) -> Result<Vec<Ge
             push_attr(&mut a, 1, &(wiphy as u32).to_ne_bytes());
         }
     }
-    let d = regdom.unwrap_or_else(global_regdom);
+    let d = match regdom {
+        Some(domain) => domain,
+        None => global_regdom()?,
+    };
     put_regdom(&mut a, &d);
     Ok(alloc::vec![GenlReply {
         command: GET_REG,

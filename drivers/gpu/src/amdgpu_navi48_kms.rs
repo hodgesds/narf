@@ -216,6 +216,8 @@ pub fn apply_routed_vrr(
                 x: 0,
                 y: 0,
             });
+            // A CRTC published anew has no primary: none placed either.
+            card.set_primary_placement(crtc_id(k), None);
         }
         for (n, c) in connectors.iter().enumerate() {
             card.encoders.push(Encoder {
@@ -261,6 +263,10 @@ pub fn apply_routed_vrr(
             if mode.is_none() {
                 crtc.primary_fb = None;
             }
+        }
+        if mode.is_none() {
+            // Its primary went with the sink; so do its rectangles.
+            card.set_primary_placement(crtc_id(k), None);
         }
         card.set_committed_mode(crtc_id(k), shown.map(|t| (t, None)));
         // No master: the console owns the lit CRTC (fbdev's framebuffer).

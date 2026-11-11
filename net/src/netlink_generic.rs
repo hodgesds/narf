@@ -224,6 +224,7 @@ pub fn publish_event(id: u16, group: u32, net_ns_id: u64, reply: GenlReply) {
     if !family.groups.iter().any(|g| g.id == group) {
         return;
     }
+    note_first_event(&family, reply.command, group);
     let sink = *EVENT_SINK.lock();
     if let Some(sink) = sink {
         let mut body = vec![reply.command, family.version, 0, 0];
@@ -377,6 +378,75 @@ const CONTROL_FAMILY: GenlFamily = GenlFamily {
     handler: unsupported_control,
 };
 
+/// The distinct `(family, command, dump, errno)` refusals already reported
+/// by [`note_refusal`] this boot.
+static REFUSALS_SEEN: IrqSafeSpinLock<Vec<(u16, u8, bool, i32)>> = IrqSafeSpinLock::new(Vec::new());
+/// Upper bound on the lines [`note_refusal`] prints in one boot.
+const REFUSALS_REPORTED: usize = 128;
+
+/// Name each distinct request a family refused, once. NetworkManager
+/// reports a refused nl80211 probe at debug level or not at all, so
+/// without this line neither the journal nor the kernel log can say which
+/// command stopped a bring-up: a command missing from
+/// the op table (-EOPNOTSUPP), a failed permission check (-EPERM) or the
+/// family's own errno. One line per `(family, command, do/dump, errno)`,
+/// bounded for the boot, and printed outside the bookkeeping lock.
+fn note_refusal(family: &GenlFamily, command: u8, dump: bool, portid: u32, errno: i32) {
+    let key = (family.id, command, dump, errno);
+    let first = {
+        let mut seen = REFUSALS_SEEN.lock();
+        if seen.len() >= REFUSALS_REPORTED || seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    };
+    if first {
+        narf_console::klog!(
+            "  genl: {} cmd={} {} from portid {:#x} refused with errno {} (reported once)",
+            family.name,
+            command,
+            if dump { "dump" } else { "do" },
+            portid,
+            errno
+        );
+    }
+}
+
+/// The distinct `(family, event command)` notifications already reported by
+/// [`note_first_event`] this boot.
+static EVENTS_SEEN: IrqSafeSpinLock<Vec<(u16, u8)>> = IrqSafeSpinLock::new(Vec::new());
+/// Upper bound on the lines [`note_first_event`] prints in one boot.
+const EVENTS_REPORTED: usize = 64;
+
+/// Name the first notification of each kind a family multicasts. For nl80211
+/// this is a record of how far a bring-up got — NEW_SCAN_RESULTS (34) or
+/// SCAN_ABORTED (35), CONNECT (46), PORT_AUTHORIZED (125), DISCONNECT (48),
+/// REG_CHANGE (36) — independent of whether any daemon was listening. One
+/// line per `(family, command)`, bounded for the boot, printed outside the
+/// bookkeeping lock.
+fn note_first_event(family: &GenlFamily, command: u8, group: u32) {
+    let key = (family.id, command);
+    let first = {
+        let mut seen = EVENTS_SEEN.lock();
+        if seen.len() >= EVENTS_REPORTED || seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    };
+    if first {
+        narf_console::klog!(
+            "  genl: {} first event cmd={} on group {}",
+            family.name,
+            command,
+            group
+        );
+    }
+}
+
 fn requested_attr(request: &[u8], requested_kind: u16) -> Option<&[u8]> {
     let mut off = NLMSG_HDRLEN + 4;
     while off + 4 <= request.len() {
@@ -437,6 +507,7 @@ fn build_one(
             .find(|op| op.command == command && op.flags & wanted != 0)
             .copied()
         else {
+            note_refusal(&family, command, dump, context.portid, EOPNOTSUPP);
             return Ok(vec![error(EOPNOTSUPP, seq, request)]);
         };
         // Then the op's permission flags, before any attribute is parsed or
@@ -447,6 +518,7 @@ fn build_one(
         // object (`RequestContext::capable` tells it which applied).
         let capable = context.capable_for(op.flags);
         if !capable && context.admin.is_none() {
+            note_refusal(&family, command, dump, context.portid, EPERM);
             return Ok(vec![error(EPERM, seq, request)]);
         }
         let cookie = core::cell::Cell::new(None);
@@ -468,6 +540,9 @@ fn build_one(
         } else {
             (family.handler)(command, &request[NLMSG_HDRLEN + 4..], dump)
         };
+        if let Err(errno) = &result {
+            note_refusal(&family, command, dump, context.portid, *errno);
+        }
         if let Some(job) = deferred.as_ref().and_then(DeferredRequest::take) {
             if matches!(&result, Ok(replies) if replies.is_empty()) {
                 deferred::spawn_ack(
@@ -503,7 +578,12 @@ fn build_one(
         {
             out.push(frame(NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ne_bytes()));
         }
+        // `genl_family_rcv_msg_dumpit` returns `__netlink_dump_start`'s
+        // -EINTR ("we successfully started a dump, signal not to send ACK
+        // even if it was requested") and `netlink_rcv_skb` then skips
+        // `netlink_ack`: NLMSG_DONE is the only terminator a dump has.
         if flags & NLM_F_ACK != 0
+            && !dump
             && !out
                 .iter()
                 .any(|message| message.get(4..6) == Some(&NLMSG_ERROR.to_ne_bytes()))
@@ -563,7 +643,9 @@ fn build_one(
             out.push(error(ENOENT, seq, request));
         }
     }
+    // `ctrl_dumpfamily` is a dump like any other: never acknowledged.
     if flags & NLM_F_ACK != 0
+        && !dump
         && !out
             .iter()
             .any(|message| message.get(4..6) == Some(&NLMSG_ERROR.to_ne_bytes()))
@@ -1235,6 +1317,78 @@ mod tests {
         narf_kernel_test::TestResult::Pass
     }
     narf_kernel_test::kernel_test_in!("net/netlink_generic", dump_terminates);
+
+    /// Linux never acknowledges a dump that started: `genl_family_rcv_msg`
+    /// returns `__netlink_dump_start`'s -EINTR and `netlink_rcv_skb` skips
+    /// `netlink_ack` even when the request carried NLM_F_ACK. libnl-style
+    /// clients (NetworkManager's `nl_send_auto`) set NLM_F_ACK on every
+    /// request and advance their expected sequence number at NLMSG_DONE, so
+    /// a trailing ACK is left queued under the old sequence number and makes
+    /// the socket's *next* exchange fail with a sequence mismatch.
+    fn dump_is_never_acknowledged() -> narf_kernel_test::TestResult {
+        fn handler(_: u8, _: &[u8], _: bool) -> Result<Vec<GenlReply>, i32> {
+            Ok(vec![GenlReply {
+                command: 6,
+                attrs: vec![8, 0, 1, 0, 42, 0, 0, 0],
+            }])
+        }
+        // Distinct from every other test family id (0x30, 0x3b..=0x3e).
+        const DUMP_FAMILY: u16 = 0x3a;
+        static OPS: &[GenlOperation] = &[
+            GenlOperation {
+                command: 5,
+                flags: GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP,
+            },
+            GenlOperation {
+                command: 8,
+                flags: GENL_CMD_CAP_DO,
+            },
+        ];
+        let _ = register_family(GenlFamily {
+            id: DUMP_FAMILY,
+            name: "narf-dump-ack",
+            version: 1,
+            max_attr: 1,
+            operations: OPS,
+            groups: &[],
+            handler,
+        });
+        let kind = |m: &Vec<u8>| u16::from_ne_bytes([m[4], m[5]]);
+        let seq = |m: &Vec<u8>| u32::from_ne_bytes(m[8..12].try_into().unwrap());
+
+        // nlctrl's own dump, as NetworkManager's platform requests it.
+        let replies = build_replies(&request(None, 1 | NLM_F_ACK | NLM_F_DUMP)).unwrap();
+        narf_kernel_test::kt_assert_eq!(kind(replies.last().unwrap()), NLMSG_DONE);
+        narf_kernel_test::kt_assert!(replies.iter().all(|m| kind(m) != NLMSG_ERROR));
+        narf_kernel_test::kt_assert!(replies.iter().all(|m| seq(m) == 77));
+
+        // A registered family's dumpit.
+        let dump = frame(DUMP_FAMILY, 1 | NLM_F_ACK | NLM_F_DUMP, 404, &[5, 1, 0, 0]);
+        let replies = build_replies(&dump).unwrap();
+        narf_kernel_test::kt_assert_eq!(replies.len(), 2);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[0]), DUMP_FAMILY);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[1]), NLMSG_DONE);
+
+        // A dump request for a command without a dumpit never starts a dump:
+        // its -EOPNOTSUPP is the one message (`netlink_ack` with the error).
+        let no_dumpit = frame(DUMP_FAMILY, 1 | NLM_F_ACK | NLM_F_DUMP, 405, &[8, 1, 0, 0]);
+        let replies = build_replies(&no_dumpit).unwrap();
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[0]), NLMSG_ERROR);
+
+        // A doit keeps its reply followed by the requested ACK.
+        let doit = frame(DUMP_FAMILY, 1 | NLM_F_ACK, 406, &[5, 1, 0, 0]);
+        let replies = build_replies(&doit).unwrap();
+        narf_kernel_test::kt_assert_eq!(replies.len(), 2);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[0]), DUMP_FAMILY);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[1]), NLMSG_ERROR);
+        narf_kernel_test::kt_assert_eq!(
+            i32::from_ne_bytes(replies[1][16..20].try_into().unwrap()),
+            0
+        );
+        narf_kernel_test::TestResult::Pass
+    }
+    narf_kernel_test::kernel_test_in!("net/netlink_generic", dump_is_never_acknowledged);
 
     fn batched_requests_preserve_sequences() -> narf_kernel_test::TestResult {
         let mut first = request(Some(b"nlctrl\0"), 1);

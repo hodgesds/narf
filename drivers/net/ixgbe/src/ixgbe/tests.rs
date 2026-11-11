@@ -6115,3 +6115,58 @@ fn smoke_ixgbe_links_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_links_decode);
+
+fn smoke_ixgbe_rx_wb_sample_never_mixes_occupants() -> TestResult {
+    // An armed RX slot holds the read view (packet buffer address, zero
+    // header address) until hardware overwrites it with the write-back,
+    // and the host may be sampling the slot at that moment. Model
+    // hardware posting the WHOLE write-back after each possible number of
+    // host loads. Whatever the interleaving, a sample that reports DD
+    // must be the write-back in full: with the armed slot's fields under
+    // a fresh DD the driver delivers a frame of the wrong length.
+    const ARMED_ADDR: u64 = 0x0000_0001_2345_6000;
+    // Datasheet Table 7.16: RSS/packet-type dwords at bytes 0..8,
+    // status+error at 8..12 (DD bit 0, EOP bit 1), length at 12..14,
+    // VLAN tag at 14..16.
+    let old = [ARMED_ADDR, 0u64];
+    let new = [
+        0x5EED_CAFE_0000_0321u64,
+        0x3u64 | (0x05EA << 32) | (0x0123 << 48),
+    ];
+
+    for post_after in 0..=2usize {
+        let slot = core::cell::Cell::new(old);
+        let loads = core::cell::Cell::new(0usize);
+        let sampled = AdvRxDescWb::sample(|word| {
+            if loads.get() == post_after {
+                slot.set(new);
+            }
+            loads.set(loads.get() + 1);
+            slot.get()[word]
+        });
+        let Some(desc) = sampled else {
+            // Not completed yet: the driver polls again.
+            if post_after == 0 {
+                return TestResult::Fail("a write-back posted before the sample read as armed");
+            }
+            if loads.get() != 1 {
+                return TestResult::Fail("an incomplete slot was read past its DD word");
+            }
+            continue;
+        };
+        if loads.get() != 2 {
+            return TestResult::Fail("a completed sample is not exactly two qword loads");
+        }
+        if desc.status_error != 0x3 || desc.length != 0x05EA || desc.vlan != 0x0123 {
+            return TestResult::Fail("fresh DD sampled with a stale length or VLAN tag");
+        }
+        if desc.lo != 0x0000_0321 || desc.hi != 0x5EED_CAFE {
+            return TestResult::Fail("fresh DD sampled with the armed slot's qword 0");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/ixgbe",
+    smoke_ixgbe_rx_wb_sample_never_mixes_occupants
+);

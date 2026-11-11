@@ -145,24 +145,17 @@ pub(crate) fn load_file_demand_page(
         core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
     }
     let want = (file_size - offset).min(4096) as usize;
-    // SAFETY: `want <= 4096` and the fresh frame remains exclusively owned.
-    let dst = unsafe { core::slice::from_raw_parts_mut(frame.kernel_mut_ptr::<u8>(), want) };
-    let mut done = 0usize;
-    while done < want {
-        match poll_io_to_completion(ops.read(offset + done as u64, &mut dst[done..])) {
-            Some(Ok(0)) => break,
-            Some(Ok(n)) => done += n,
-            Some(Err(error)) => {
-                narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
-                return Err(error);
-            }
-            None => {
-                narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
-                return Err(narf_filesystem::FsError::Io(narf_block::BlockError::IOError));
-            }
+    // The fill owns the frame from here: it is handed back on success and
+    // freed on every other outcome. `filemap_fault` sleeps killably
+    // (`__folio_lock_or_retry` under `FAULT_FLAG_KILLABLE`), so a fatal
+    // signal ends this park; the read finishes without the task, and the
+    // trap handler delivers the pending signal when this fault fails.
+    match crate::killable_wait::fill_frame(ops, offset, frame, want) {
+        Ok(Some(filled)) => filled,
+        Ok(None) | Err(crate::killable_wait::Killed) => {
+            Err(narf_filesystem::FsError::Io(narf_block::BlockError::IOError))
         }
     }
-    Ok(frame)
 }
 
 /// Read `len` bytes of an fd starting at `offset` into a fresh buffer,

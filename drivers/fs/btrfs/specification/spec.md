@@ -21,6 +21,10 @@ Directory ownership and mode updates through `DirOps` use the same persistent
 inode update path as `FileOps`. In particular, the ownership and mode assigned
 by `mkdir(2)` are visible through both views and survive remounting; directory
 setters propagate write errors instead of silently accepting an update.
+`FileOps::stat`/`stat_async`, `statx_async` and `DirOps::dir_mode` preserve
+all twelve inode permission bits (`0o7777`), including setuid, setgid and
+sticky bits. Ownership is reported independently. Exec and namespace policy
+still decide whether those bits confer privilege or restrict mutations.
 
 Write safety (`rw_gate`):
 
@@ -126,11 +130,131 @@ accepted changes durable, leaving any unreaped orphan record for recovery.
 
 ## 4. Invariants
 
-Free-space bitmap edits accumulate only in a private logical leaf. Each
-changed block group's free-run count is recomputed after all allocations and
-releases for that fixed-point round, before packing or publishing any node.
-Bitmap ranges are found by their ordered keys, with coverage and body bounds
-checked across every bitmap boundary. The on-disk format is unchanged.
+A commit maintains the free-space tree incrementally (`write/free_space.rs`,
+Linux `btrfs_add_to_free_space_tree` / `btrfs_remove_from_free_space_tree`
+run from the delayed refs): it reads only the leaves holding the items its
+allocations and frees reach (the block group's `FREE_SPACE_INFO`, the
+`FREE_SPACE_EXTENT` or `FREE_SPACE_BITMAP` items around each range), edits a
+private copy of those items, and path-COWs the result, so the blocks read and
+written are bounded by tree height × touched leaves, independent of the size
+of the tree (`smoke_btrfs_commit_cost_tracks_change_not_tree_size`). Each block group
+keeps the form its `FREE_SPACE_INFO.flags` selects; none is converted.
+Extent-form frees merge with an adjacent free extent on either side, never
+across a block-group boundary. Bitmap ranges are found by their ordered keys,
+with coverage and body bounds checked across every bitmap boundary, and
+`extent_count` moves by the delta the bits on either side of the range give
+(Linux `modify_free_space_bitmap`). An allocation of space the tree does not
+hold free, or a free of space it already does, fails the commit before
+anything is written. The free-space tree's own new and replaced blocks are
+metadata allocations and frees that edit it again, as the extent and
+block-group trees' are. A commit records them the way Linux runs its delayed
+refs (`btrfs_run_delayed_refs` under `commit_cowonly_roots`): the three path
+COWs stay open, each pass records the blocks no earlier pass recorded — into
+leaves that, once COWed, are edited in place — and the commit is complete
+when a pass leaves none. A committed block is replaced at most once and no
+address is handed out twice, so the passes end; a guard of 1024 passes fails
+the commit before anything is written. (The earlier fixed point, which
+recomputed all three trees from the committed ones every round until two
+rounds agreed, did not settle within its 64 rounds on a filesystem of 320
+block groups with three-level trees; `cargo xtask btrfs-host-rw --scenario
+scale` reproduces that shape.) What the trees hold afterwards is a function
+of the final block lists alone. Each new block's `METADATA_ITEM` key is
+checked absent from the committed extent tree before it is inserted. Extent
+and free-space leaves are kept dense: an overflowing leaf is split evenly
+(or left full when everything added sorts after what it held), and a sparse
+committed leaf an edit reaches absorbs its right sibling; the sparser those
+trees, the more leaves the records of one commit's blocks reach. The on-disk
+format is unchanged.
+
+The allocator carves from one in-memory copy of the committed free-space tree
+per filesystem (`allocator::FreeView`, Linux's per-block-group free-space
+cache), read from disk on first use and advanced by each commit with exactly
+the ranges that commit marked used and free in the tree. It is tied to the
+tree root (address + generation) it mirrors and is re-read from disk whenever
+that does not match: at mount, after a failed or aborted commit, after a
+chunk allocation or any other transaction that changes block groups, and
+after any path that writes the tree outside `commit_txn`. Pinned extents,
+roots held by lock-free readers and superblock mirror stripes are free in the
+view and withheld by each allocator, so the pinning rule is unchanged. With
+`allocator::set_view_audit` (on in kernel-test builds and in
+`verification/btrfs-host`) every commit re-reads the tree and fails on any
+difference from the view.
+
+Data extents are carved first-fit from the lowest address. Tree blocks are
+carved next-fit: each from the lowest free space at or after the end of the
+last one, across transactions, starting again from the bottom only when
+nothing above fits (Linux allocates metadata from a cluster it works through,
+`find_free_extent` with `meta_alloc_cluster`). The blocks one commit writes
+then sit side by side, their `METADATA_ITEM`s share an extent-tree leaf, and
+so do the items of the blocks the next commit replaces; filling the lowest
+holes instead scatters both over as many leaves, each of which the commit has
+to replace as well. The placement is a preference only: every address handed
+out is free space of the right block-group type, as before.
+
+A commit looks up only the block groups it allocates from or frees into, by
+the key the chunk map gives (a block group is its chunk), and fails if the
+tree does not hold exactly that item. The first commit of a mount writes the
+superblock's `bytes_used` as the sum of every block group's `used`; later
+commits move it by the net of the groups they changed (Linux
+`btrfs_update_block_group`), and a failed commit makes the next one sum
+again. With the audit on, every commit sums all block groups and fails if
+moving the value does not give the same.
+So what a small commit reads and writes follows the transaction: the leaves
+of the extent, block-group, csum and free-space trees its records reach, each
+once, and the (small, whole-repacked) root tree — not the number of block
+groups, the size of those trees, or the number of recording passes
+(`smoke_btrfs_commit_cost_tracks_change_not_tree_size`).
+
+Tree blocks nothing references any more — replaced by a commit, or written
+and replaced again inside one batch — are dropped from the node cache, which
+is bounded by emptying it when it fills.
+
+Metadata space is reserved before an operation is accepted, never inside a
+commit (`write/reserve.rs`, Linux `btrfs_start_transaction` /
+`btrfs_block_rsv_add`). An operation is staged only while the free metadata
+space, after the operation's own fs-tree blocks, covers (a) twice the
+*first-order* need of the batch with that operation in it — a bound on the
+blocks the commit's own csum, extent, block-group and free-space edits can
+allocate, `2 × height` per inserted item and `height` per modified one, with
+the heights sampled when the batch opens — and (b) the global reserve: the
+recorded size of the extent, csum, block-group and free-space trees, at least
+256 blocks, at most 512 MiB and an eighth of the metadata space
+(`btrfs_update_global_block_rsv`). The first-order share is a bound; the
+doubling (for recording the commit's own blocks) and the global reserve are
+sized, not proven, as in Linux, and a commit that still finds no space aborts
+the transaction as before. Each commit reports the blocks it allocated beyond
+its batch's reservation (`stats::max_reserve_overrun`).
+
+An operation whose reservation does not fit is refused with `NoSpace` before
+anything of it is staged, and reclaim runs for that operation, outside any
+commit: the open batch is committed and its superblock written, which unpins
+what earlier transactions freed, and the operation is retried
+(`with_space_retry`, Linux `COMMIT_TRANS`); if it still does not fit, a
+METADATA or DATA chunk is allocated in a transaction of its own and it is
+retried again (`autogrow!` → `root_rw_grow`, Linux `ALLOC_CHUNK`); only then
+does it return `ENOSPC`. (Linux tries the chunk before the commit; here the
+batch has to close before a chunk can be allocated, so the commit comes
+first.) After that commit, a METADATA chunk is allocated at once if the
+metadata space, global reserve included, is within 2 MiB of 80% in use
+(`alloc_metadata_ahead`, Linux `should_alloc_chunk`); otherwise a filesystem
+whose free metadata barely exceeds the reserve would never reach the chunk
+allocation and would run on short batches. A chunk is never allocated inside
+`commit_txn`. Reclaiming orphans is
+part of what is retried, so its `NoSpace` takes the same ladder, and it never
+fails a sync or keeps the transaction timer from committing. `unlink`,
+`rmdir` and the final eviction of an orphan may borrow the global reserve
+when their reservation does not fit (Linux
+`btrfs_start_transaction_fallback_global_rsv`, `evict_refill_and_join`), so a
+full filesystem can still be emptied; the batch then commits at once.
+
+`fsync` and `fdatasync`, on a file or a directory, both commit the open
+transaction and write its superblock (`sync_to_disk_exclusive`). `fdatasync`
+is not weaker: the size and extent items a write's data is read back through
+live in the open batch until it commits, so a device flush alone makes
+nothing of that write durable (`smoke_btrfs_fdatasync_survives_a_later_crash`;
+Linux `btrfs_sync_file` ignores `datasync` too). Neither goes through a tree
+log: the driver replays a log at mount and can write one (`write_log`), but
+`fsync` does not use it.
 
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.
@@ -198,7 +322,14 @@ against a model through NARF, `btrfs check` (with data csums) and
 write/flush/FUA stream is replayed at bounded cut points (`--exhaustive`:
 every flush) with volatile writes dropped or torn, and each crashed image
 must pass `btrfs check` and remount with exactly a committed state. The
-`regress-*` scenarios are minimal reproductions of bugs it found.
+`regress-*` scenarios are minimal reproductions of bugs it found. The `scale`
+scenario builds the shape of an installed root on a sparse image — 320
+mostly-full 1 GiB DATA block groups with some 370,000 single-sector free
+extents spread over them, three-level free-space and extent trees —
+runs a desktop-like workload in small transactions (save-file
+loop, log appends with fsync, bursts of creates and unlinks), and reports per
+commit the nodes visited and written per tree, the recording passes, the
+blocks allocated beyond the reservation and the wall time.
 
 `cargo xtask btrfs-cycles [--cycles 50] [--seed N] [--jobs N]` runs the
 in-kernel driver through many mount lifetimes in one boot per guest

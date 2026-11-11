@@ -1895,6 +1895,8 @@ impl Arch {
                 let virtio = matches!(profile, HwProfile::Full | HwProfile::VirtioOnly);
                 let legacy = matches!(profile, HwProfile::Full | HwProfile::LegacyOnly);
 
+                args.extend(idle_bridge_fixture_qemu_args(Arch::X86_64.qemu_bin()));
+
                 if legacy {
                     args.extend_from_slice(&[
                         "-drive".into(),
@@ -2961,6 +2963,27 @@ fn nvme_image_path() -> PathBuf {
 /// `NARF_NVME2_IMG` attaches the named image as that second controller on any
 /// run (`cachyos-root-smoke` puts the root there, behind a decoy on the
 /// first, like the host's two NVMe disks).
+/// Kernel-test fixture: one endpoint no driver binds (`edu`), alone behind
+/// a PCIe root port. Every other test device sits on the root bus, so
+/// without it nothing exercises the bridge half of bus-master enabling
+/// (`smoke_pci_bus_master_enables_upstream_bridge`) — the path whose
+/// absence left a physical NIC's DMA and MSI-X blocked at its switch port.
+/// Omitted outside kernel tests and on QEMU builds lacking either model.
+fn idle_bridge_fixture_qemu_args(qemu: &str) -> Vec<String> {
+    if !KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed)
+        || !qemu_supports_device(qemu, "\"pcie-root-port\"")
+        || !qemu_supports_device(qemu, "\"edu\"")
+    {
+        return Vec::new();
+    }
+    vec![
+        "-device".into(),
+        "pcie-root-port,id=narf_idle_rp,chassis=31,slot=31".into(),
+        "-device".into(),
+        "edu,bus=narf_idle_rp".into(),
+    ]
+}
+
 fn second_nvme_qemu_args() -> Vec<String> {
     let path = match std::env::var_os("NARF_NVME2_IMG") {
         Some(path) => PathBuf::from(path),

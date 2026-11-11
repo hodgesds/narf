@@ -29,8 +29,16 @@
 - `summaries/smoltcp-rs.md` — Smoltcp, zero-allocation design, event-driven processing
 - `summaries/fuchsia-netstack3.md` — Netstack3, capability-based networking, async task integration
 
+## Scaling
+
+- `scaling-roadmap.md` — what stands between the stack and 100–400 Gb/s:
+  per-packet cost model, gap analysis against Linux, sizing from the card,
+  architecture options, staged plan, and the `net/scale` harness.
+
 ## Open research questions
 
+- In-kernel stack or userspace daemon as the stated architecture: the code
+  and the specification disagree (`scaling-roadmap.md` §2, §8).
 - smoltcp vs. Netstack3 vs. custom as the reference userspace stack.
 - How to wire XDP-equivalent declarative filters without introducing
   a probe-site VM (same concern as `tracing/`).

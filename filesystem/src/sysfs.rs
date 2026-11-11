@@ -1097,10 +1097,14 @@ pub fn populate_block_class() {
         // `/sys/devices/virtual/block/<name>` node below.
         let class_kobj = class_device_register(class_block.clone(), name);
         let kobj = get_or_create_child(&virtual_block, name);
+        // `size` is in 512-byte sectors whatever the logical block size:
+        // `part_size_show` prints `bdev_nr_sectors()`. lsblk, udisks and
+        // blkid multiply it by 512.
+        let sectors = capacity.saturating_mul(u64::from(lba_size)) / 512;
+        let is_partition = dev.partition.is_some();
         for node in [&class_kobj, &kobj] {
-            kobject_add_attr(node, "size", move || {
-                format!("{}\n", capacity * (lba_size as u64))
-            });
+            kobject_add_attr(node, "size", move || format!("{sectors}\n"));
+            add_block_stacking_dirs(node, is_partition);
             kobject_add_attr(node, "removable", || "0\n".to_string());
             kobject_add_attr(node, "queue/scheduler", || "none\n".to_string());
             let dev_str = format!("{}:{}\n", BLOCK_EXT_MAJOR, minor);
@@ -1130,9 +1134,8 @@ pub fn populate_block_class() {
 
         // /sys/block/<name>/ — flat view
         let flat = get_or_create_child(&sys_block, name);
-        kobject_add_attr(&flat, "size", move || {
-            format!("{}\n", capacity * (lba_size as u64))
-        });
+        kobject_add_attr(&flat, "size", move || format!("{sectors}\n"));
+        add_block_stacking_dirs(&flat, is_partition);
         kobject_add_attr(&flat, "removable", || "0\n".to_string());
 
         // Hardware identity of a whole disk (NVMe namespace): the
@@ -1145,6 +1148,21 @@ pub fn populate_block_class() {
                 add_identity_attrs(node, id);
             }
         }
+    }
+}
+
+/// The stacking directories of a block device. `holders/` lists the devices
+/// stacked on top of this one (device-mapper, md, bcache) and exists on
+/// every disk and partition (`bd_holder_dir`, created in `add_disk` /
+/// `add_partition`); `slaves/` lists what a disk is itself stacked on and
+/// exists on whole disks only (`disk->slave_dir`). NARF has no stacking
+/// block drivers in sysfs, so both are empty — but they must exist:
+/// multipath's `sysfs_is_multipathed` and lsblk scan `holders/` on every
+/// device and report an error when the directory cannot be opened.
+fn add_block_stacking_dirs(node: &Arc<Kobject>, is_partition: bool) {
+    let _ = get_or_create_child(node, "holders");
+    if !is_partition {
+        let _ = get_or_create_child(node, "slaves");
     }
 }
 

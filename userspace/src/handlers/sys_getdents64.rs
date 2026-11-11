@@ -25,7 +25,12 @@ fn enumerate_batch(
     cursor: usize,
     batch_max: usize,
 ) -> Result<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>, i64> {
-    match poll_blocking(dir.enumerate_async(cursor, batch_max)) {
+    // `iterate_dir` takes the directory with `down_read_killable`.
+    let batch = match crate::killable_wait::enumerate(dir, cursor, batch_max) {
+        Ok(batch) => batch,
+        Err(crate::killable_wait::Killed) => return Err(EINTR),
+    };
+    match batch {
         Some(Ok(entries)) => Ok(entries),
         Some(Err(narf_filesystem::FsError::Unsupported)) => {
             let mut entries = alloc::vec::Vec::new();
@@ -139,7 +144,13 @@ pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
             break;
         }
         record.resize(reclen, 0);
-        record[..8].copy_from_slice(&(next_cursor as u64).to_ne_bytes());
+        // `filldir64`: `d_ino` is the entry's inode number. A directory that
+        // cannot name it without a lookup keeps the cursor placeholder.
+        let d_ino = core::str::from_utf8(name)
+            .ok()
+            .and_then(|name| dir.entry_ino(name))
+            .unwrap_or(next_cursor as u64);
+        record[..8].copy_from_slice(&d_ino.to_ne_bytes());
         record[8..16].copy_from_slice(&(next_cursor as u64).to_ne_bytes());
         record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
         if legacy {

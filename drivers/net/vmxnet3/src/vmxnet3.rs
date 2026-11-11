@@ -729,26 +729,38 @@ impl Vmxnet3Nic {
         }
     }
 
-    /// Volatile read of one TX completion descriptor.
-    fn read_tx_comp(&self, idx: u32) -> Vmxnet3TxCompDesc {
-        // SAFETY: TX comp ring page; `idx < TX_COMP_RING_LEN` at every
-        // caller.
-        unsafe {
-            core::ptr::read_volatile(self.tx_comp_ring.cpu_ptr_at::<Vmxnet3TxCompDesc>(
-                (idx as usize * core::mem::size_of::<Vmxnet3TxCompDesc>()) as u64,
-            ))
-        }
+    /// The TX completion at `idx` if the device has written it for
+    /// generation `gen`, else `None`. Gen-first, see
+    /// [`Vmxnet3TxCompDesc::sample`].
+    fn read_tx_comp(&self, idx: u32, gen: u32) -> Option<Vmxnet3TxCompDesc> {
+        Vmxnet3TxCompDesc::sample(gen, |dword| {
+            // SAFETY: TX comp ring page; `idx < TX_COMP_RING_LEN` at every
+            // caller and `dword < 4`, so the aligned dword lies inside the
+            // 16-byte descriptor `idx`.
+            unsafe {
+                core::ptr::read_volatile(
+                    self.tx_comp_ring
+                        .cpu_ptr_at::<u32>((idx as usize * 16 + dword * 4) as u64),
+                )
+            }
+        })
     }
 
-    /// Volatile read of one RX completion descriptor.
-    fn read_rx_comp(&self, idx: u32) -> Vmxnet3RxCompDesc {
-        // SAFETY: RX comp ring page; `idx < RX_COMP_RING_LEN` at every
-        // caller.
-        unsafe {
-            core::ptr::read_volatile(self.rx_comp_ring.cpu_ptr_at::<Vmxnet3RxCompDesc>(
-                (idx as usize * core::mem::size_of::<Vmxnet3RxCompDesc>()) as u64,
-            ))
-        }
+    /// The RX completion at `idx` if the device has written it for
+    /// generation `gen`, else `None`. Gen-first, see
+    /// [`Vmxnet3RxCompDesc::sample`].
+    fn read_rx_comp(&self, idx: u32, gen: u32) -> Option<Vmxnet3RxCompDesc> {
+        Vmxnet3RxCompDesc::sample(gen, |dword| {
+            // SAFETY: RX comp ring page; `idx < RX_COMP_RING_LEN` at every
+            // caller and `dword < 4`, so the aligned dword lies inside the
+            // 16-byte descriptor `idx`.
+            unsafe {
+                core::ptr::read_volatile(
+                    self.rx_comp_ring
+                        .cpu_ptr_at::<u32>((idx as usize * 16 + dword * 4) as u64),
+                )
+            }
+        })
     }
 
     /// Reclaim TX slots whose completions the device has written.
@@ -761,10 +773,9 @@ impl Vmxnet3Nic {
         let mut state = self.tx_state.lock();
         let mut reclaimed = 0;
         while reclaimed < TX_COMP_RING_LEN as u32 {
-            let comp = self.read_tx_comp(state.comp_head);
-            if !comp.is_ready(state.comp_gen) {
+            let Some(comp) = self.read_tx_comp(state.comp_head, state.comp_gen) else {
                 break;
-            }
+            };
             // Pair the device's completion write with the CPU's later
             // buffer reuse.
             compiler_fence(Ordering::SeqCst);
@@ -912,10 +923,9 @@ impl Vmxnet3Nic {
         let mut delivered = 0;
         let mut state = self.rx_state.lock();
         while delivered < budget {
-            let comp = self.read_rx_comp(state.comp_head);
-            if !comp.is_ready(state.comp_gen) {
+            let Some(comp) = self.read_rx_comp(state.comp_head, state.comp_gen) else {
                 break;
-            }
+            };
             // Pair the device's completion write with the CPU's later
             // buffer reads (Linux: `dma_rmb()` after reading gen).
             compiler_fence(Ordering::SeqCst);

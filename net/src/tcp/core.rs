@@ -55,6 +55,7 @@ use crate::pkt::{
 use crate::pkt_tcp::{
     ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_PSH, FLAG_RST, FLAG_SYN, TCP_HDR_MIN,
 };
+use crate::txq::TxRefusal;
 
 use super::congestion::{
     default_cc, install as install_cc, seq_geq, seq_gt, seq_leq, seq_lt, Cc, CcError, CcState,
@@ -231,6 +232,29 @@ pub struct Tcb {
     // ── Send / receive buffers ──
     pub send_buf: SendBuf,
     pub recv_buf: RecvBuf,
+    /// Receive-buffer autotuning (`tcp_rcv_space_adjust`) and the user's
+    /// `SO_RCVBUF` lock.
+    pub rcv_space: super::autotune::RcvSpace,
+    /// `SOCK_SNDBUF_LOCK`: the application set `SO_SNDBUF`, so
+    /// `tcp_sndbuf_expand` leaves the send buffer alone.
+    pub sndbuf_locked: bool,
+    /// The device transmit queue this connection's flow maps to and its
+    /// bytes there (TCP Small Queues). `None` until the first data segment
+    /// on an egress whose driver implements `txq::TxBackpressure`.
+    pub tx_bind: Option<TxBinding>,
+    /// `pump_send` is running for this connection on a backpressure-aware
+    /// egress. A refused segment is un-sent by rewinding `snd_nxt`, which is
+    /// only sound with one pumper; a second caller sets `xmit_again` and
+    /// the owner goes round once more (Linux: the socket lock, with
+    /// `TCP_TSQ_DEFERRED` for a wake that finds it held).
+    pub xmit_owner: bool,
+    pub xmit_again: bool,
+    /// When `pump_send` stopped for the device (queue stopped or TSQ limit);
+    /// 0 when it is not waiting. Drives the lost-wake probe.
+    pub tx_wait_since_cycles: u64,
+    /// Counts RTO rewinds of `snd_nxt` to `snd_una` (go-back-N). A refused
+    /// segment is only un-sent if none happened since it was marked.
+    pub rewind_epoch: u32,
 
     // ── Retransmit ──
     pub rtt: RttEstimator,
@@ -396,6 +420,23 @@ fn cached_egress_for_tcb(arc: &Arc<IrqSafeSpinLock<Tcb>>) -> Option<CachedEgress
     Some(t.egress.get_or_insert(resolved).clone())
 }
 
+/// A connection's place in its egress device: the queue its flow hashes to
+/// and the account its queued bytes are charged to.
+#[derive(Clone, Debug)]
+pub struct TxBinding {
+    pub queue: u16,
+    pub account: Arc<crate::txq::TxAccount>,
+}
+
+/// How long a connection waits for a transmit wake before it probes the
+/// device itself. A liveness bound for a wake that never arrives, not a
+/// rate: a waiting connection costs one refused offer per interval.
+const TX_WAIT_PROBE_NS: u64 = 10_000_000;
+
+/// Linux `TCP_RESOURCE_PROBE_INTERVAL` (HZ/2): how soon a retransmission
+/// the local device refused is tried again.
+const TCP_RESOURCE_PROBE_INTERVAL_NS: u64 = 500_000_000;
+
 /// An egress frame the stack built, either as a plain `Vec` (classic copy TX)
 /// or directly in a DMA buffer from the iface's TX pool (zero-copy TX, P-F).
 /// `emit_tcb_frame` dispatches each to the matching driver hand-off.
@@ -412,6 +453,13 @@ impl TxFrame {
         }
     }
 
+    fn bytes(&self) -> &[u8] {
+        match self {
+            TxFrame::Owned(v) => v.as_slice(),
+            TxFrame::Dma(f) => f.payload(),
+        }
+    }
+
     /// Mutable view of the frame bytes — the TX netfilter hook rewrites these
     /// in place for both buffer kinds.
     fn bytes_mut(&mut self) -> &mut [u8] {
@@ -425,16 +473,37 @@ impl TxFrame {
 fn emit_tcb_frame(
     arc: &Arc<IrqSafeSpinLock<Tcb>>,
     dev: &iface::NetIfaceSnapshot,
-    mut frame: TxFrame,
+    frame: TxFrame,
     meta: crate::TxMeta,
 ) {
+    let _ = emit_tcb_frame_on(arc, dev, frame, meta, None, false);
+}
+
+/// Emit one frame and report what the device did with it.
+///
+/// With `queued` the frame is offered to that transmit queue through the
+/// driver's backpressure contract and may come back [`TxRefusal::Busy`]:
+/// nothing was transmitted and the caller must not account it as sent.
+/// `charge` attaches the connection's TSQ charge to an owned frame.
+/// Without `queued` the interface's ordinary hook is used: the driver takes
+/// the frame while it has descriptors and otherwise drops it, reported as
+/// [`TxRefusal::Dropped`]. A frame a netfilter rule discarded or the
+/// neighbour layer queued counts as taken.
+fn emit_tcb_frame_on(
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    dev: &iface::NetIfaceSnapshot,
+    mut frame: TxFrame,
+    meta: crate::TxMeta,
+    queued: Option<(&dyn crate::txq::TxBackpressure, &TxBinding)>,
+    charge: bool,
+) -> Result<(), TxRefusal> {
     let iface_name = dev.name.as_str();
     let (net_ns_id, is_ipv6) = {
         let tcb = arc.lock();
         (tcb.net_ns_id, tcb.is_ipv6)
     };
     if frame.len() < crate::pkt::ETH_HDR_LEN {
-        return;
+        return Ok(());
     }
     let accepted = is_ipv6
         || crate::tcp_stack::nf_tx_filter_in(
@@ -443,7 +512,7 @@ fn emit_tcb_frame(
             &mut frame.bytes_mut()[crate::pkt::ETH_HDR_LEN..],
         ) == crate::netfilter::Verdict::Accept;
     if !accepted {
-        return;
+        return Ok(());
     }
     // `ip_finish_output2` → `neigh_output`: an unresolved next hop queues the
     // frame on the neighbour instead of waiting for it.
@@ -478,15 +547,20 @@ fn emit_tcb_frame(
                 None => neigh_failed(&tcb, &v),
             }),
         );
-        return;
+        return Ok(());
     }
-    match frame {
-        TxFrame::Owned(v) => {
-            let _ = dev.xmit_meta(&v, meta);
+    match (frame, queued) {
+        (TxFrame::Dma(mut f), Some((driver, bind))) => {
+            if charge {
+                f.set_tx_charge(bind.account.charge(f.len()));
+            }
+            dev.try_xmit_frame(driver, bind.queue, f, meta)
         }
-        TxFrame::Dma(f) => {
-            let _ = dev.xmit_frame(f, meta);
+        (TxFrame::Owned(v), Some((driver, bind))) => {
+            dev.try_xmit_copy(driver, bind.queue, &v, meta)
         }
+        (TxFrame::Owned(v), None) => dev.xmit_meta(&v, meta).map_err(|()| TxRefusal::Dropped),
+        (TxFrame::Dma(f), None) => dev.xmit_frame(f, meta).map_err(|()| TxRefusal::Dropped),
     }
 }
 
@@ -576,6 +650,13 @@ impl Tcb {
             snd_wl2: 0,
             send_buf: SendBuf::new(DEFAULT_SND_BUF, iss.wrapping_add(1)),
             recv_buf: RecvBuf::new(DEFAULT_RCV_BUF),
+            rcv_space: super::autotune::RcvSpace::default(),
+            sndbuf_locked: false,
+            tx_bind: None,
+            xmit_owner: false,
+            xmit_again: false,
+            tx_wait_since_cycles: 0,
+            rewind_epoch: 0,
             rtt: RttEstimator::new(),
             retx_queue: VecDeque::new(),
             retx_deadline_cycles: 0,
@@ -1108,6 +1189,21 @@ pub fn lookup_tcb(id: u32) -> Option<Arc<IrqSafeSpinLock<Tcb>>> {
     g.as_ref().and_then(|m| m.get(&id).cloned())
 }
 
+/// `(local addr, local port, remote addr, remote port)` of an IPv4 TCB —
+/// what `inet_getname` reads out of `inet_rcv_saddr`/`inet_sport` and
+/// `inet_daddr`/`inet_dport`. `None` for an IPv6 TCB or one that is gone.
+pub fn endpoints(id: u32) -> Option<([u8; 4], u16, [u8; 4], u16)> {
+    let tcb = lookup_tcb(id)?;
+    let tcb = tcb.lock();
+    (!tcb.is_ipv6).then_some((
+        tcb.local_addr,
+        tcb.local_port,
+        tcb.remote_addr,
+        tcb.remote_port,
+    ))
+}
+
+/// IPv6 counterpart of [`endpoints`].
 pub fn endpoints6(id: u32) -> Option<([u8; 16], u16, [u8; 16], u16)> {
     let tcb = lookup_tcb(id)?;
     let tcb = tcb.lock();
@@ -2067,6 +2163,9 @@ pub fn recv(id: u32, buf: &mut [u8]) -> Result<usize, ()> {
     let (n, window_update) = {
         let mut t = arc.lock();
         let n = t.recv_buf.read(buf);
+        if n > 0 {
+            rcv_space_adjust(&mut t, n);
+        }
         (n, n > 0 && receive_window_update_due(&t))
     };
     if window_update {
@@ -2189,6 +2288,7 @@ fn recv_errno_flags(id: u32, buf: &mut [u8], peek: bool) -> Result<usize, i32> {
     }
     let n = if peek { 0 } else { t.recv_buf.read(buf) };
     if n > 0 {
+        rcv_space_adjust(&mut t, n);
         let window_update = receive_window_update_due(&t);
         drop(t);
         if window_update {
@@ -2442,11 +2542,15 @@ pub fn set_buffer_limits(id: u32, snd: Option<u32>, rcv: Option<u32>) -> Result<
     let notify = {
         let mut t = arc.lock();
         let before = t.user_can_write();
+        // `sock_setsockopt` sets SOCK_SNDBUF_LOCK / SOCK_RCVBUF_LOCK with
+        // the size: autotuning never overrides an explicit request.
         if let Some(snd) = snd {
             t.send_buf.limit = (snd as usize).max(1);
+            t.sndbuf_locked = true;
         }
         if let Some(rcv) = rcv {
             t.recv_buf.limit = ((rcv / 2) as usize).max(1);
+            t.rcv_space.locked = true;
         }
         !before && t.user_can_write()
     };
@@ -2961,7 +3065,26 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
+    let refused = emit_tcb_frame_on(
+        arc,
+        &iface,
+        frame,
+        offload_meta(&iface, None, false),
+        None,
+        false,
+    )
+    .is_err();
+    if refused && iface.tx_backpressure().is_some() {
+        // Linux queues an ACK behind a stopped device queue in the qdisc;
+        // there is none here, so do what `__tcp_send_ack` does when it
+        // cannot send: leave the ACK owed and let the delayed-ACK timer
+        // retry it.
+        let mut t = arc.lock();
+        if t.delayed_ack_deadline_cycles == 0 {
+            t.delayed_ack_deadline_cycles = narf_scheduler::narf_time::now_cycles()
+                .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(DELAYED_ACK_NS));
+        }
+    }
 }
 
 fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool) {
@@ -3089,6 +3212,56 @@ pub(crate) fn receive_window_update_due(t: &Tcb) -> bool {
     current > t.rcv_wnd && (t.rcv_wnd == 0 || current >= t.rcv_wnd.saturating_add(threshold))
 }
 
+/// Microsecond clock for receive-buffer autotuning (`tp->tcp_mstamp`).
+fn mstamp_us() -> u64 {
+    narf_scheduler::narf_time::monotonic_ns() / 1000
+}
+
+/// Linux `tcp_rcv_space_adjust`, called as `tcp_recvmsg_locked` does: every
+/// time `copied` bytes were handed to the application. A reader that takes
+/// more per round trip than the round before gets a larger receive window,
+/// up to `tcp_rmem[2]`, so the sender's rate is bounded by the path rather
+/// than by `DEFAULT_RCV_BUF / RTT`. The new limit is advertised by the
+/// window update the caller already sends when the window opened by an MSS.
+fn rcv_space_adjust(t: &mut Tcb, copied: usize) {
+    t.rcv_space.copied = t.rcv_space.copied.wrapping_add(copied as u32);
+    let inq = t.recv_buf.in_order_len().min(u32::MAX as usize) as u32;
+    let ooo_span = t.recv_buf.ooo_span(t.rcv_nxt);
+    let advmss = u32::from(t.opts.our_mss.max(MIN_MSS));
+    let limit = t.recv_buf.limit.min(u32::MAX as usize) as u32;
+    let Some(grown) = t
+        .rcv_space
+        .adjust(mstamp_us(), inq, ooo_span, advmss, limit)
+    else {
+        return;
+    };
+    // A window the negotiated scale cannot express is never advertised.
+    let representable = if t.opts.wscale_active {
+        (u16::MAX as u32) << t.opts.our_wscale
+    } else {
+        u16::MAX as u32
+    };
+    let grown = grown.min(representable);
+    if grown > limit {
+        t.recv_buf.limit = grown as usize;
+    }
+}
+
+/// Feed the receiver's round-trip estimate from an arriving data segment:
+/// `tcp_rcv_rtt_measure_ts` from the echoed timestamp, before the segment is
+/// queued.
+fn rcv_rtt_measure_ts(t: &mut Tcb, tsecr: u32, segment_len: usize) {
+    let queue_empty = t.recv_buf.in_order_len() == 0;
+    let mss = rcv_mss(t);
+    t.rcv_space.measure_ts(
+        tsecr,
+        tsval_now(),
+        segment_len.min(u32::MAX as usize) as u32,
+        mss,
+        queue_empty,
+    );
+}
+
 fn tsval_now() -> u32 {
     // 1 ms resolution, wrapping at 32 bits.
     (narf_scheduler::narf_time::monotonic_ns() / 1_000_000) as u32
@@ -3191,6 +3364,9 @@ pub fn tick_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     if do_fire {
         fire_retransmit(arc);
     }
+    // A connection still waiting on its device after the probe interval
+    // tries again by itself.
+    tick_tx_wait(arc);
     // Also pump delayed ACKs that timed out.
     tick_delayed_ack(arc);
     // Persist timer for zero-window probing.
@@ -3210,8 +3386,9 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     let Some(seg) = oldest else { return };
 
     // Back-off; tear down if exceeded.
-    let backoff_ok = {
+    let (backoff_ok, before_backoff) = {
         let mut t = arc.lock();
+        let before_backoff = (t.rtt.rto_ns, t.rtt.backoff_count);
         let limit = if matches!(t.state, TcpState::SynSent | TcpState::SynReceived) {
             t.syn_retries as u32
         } else {
@@ -3240,8 +3417,9 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // Reset the sender to retransmit from snd_una.
             t.send_buf.rewind_for_retransmit();
             t.snd_nxt = t.snd_una;
+            t.rewind_epoch = t.rewind_epoch.wrapping_add(1);
         }
-        ok
+        (ok, before_backoff)
     };
     if !backoff_ok {
         // Linux `tcp_write_err`: the soft (ICMP) error if one was seen,
@@ -3300,7 +3478,16 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &payload,
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
+    let refused = emit_tcb_frame_on(
+        arc,
+        &iface,
+        frame,
+        offload_meta(&iface, None, false),
+        None,
+        false,
+    )
+    .is_err()
+        && iface.tx_backpressure().is_some();
     {
         let mut t = arc.lock();
         // The buffer was rewound to snd_una: advance past what we resent so
@@ -3312,6 +3499,21 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         note_sent(&mut t);
         t.total_retrans = t.total_retrans.saturating_add(1);
         arm_retransmit_timer(&mut t);
+        if refused && t.retx_deadline_cycles != 0 {
+            // `tcp_retransmit_timer`: "Retransmission failed because of
+            // local congestion, let senders fight for local resources
+            // conservatively" — retry after TCP_RESOURCE_PROBE_INTERVAL,
+            // or the RTO if that is sooner. Linux leaves before
+            // `icsk_backoff++`: the peer never saw this attempt, so it
+            // neither doubles the RTO nor counts toward giving up. Counting
+            // it reset a healthy connection after eight probes — 3.5 s of a
+            // stalled or down device.
+            t.rtt.undo_back_off(before_backoff);
+            t.rto_count = t.rto_count.saturating_sub(1);
+            let probe = t.rtt.current_rto().min(TCP_RESOURCE_PROBE_INTERVAL_NS);
+            t.retx_deadline_cycles = narf_scheduler::narf_time::now_cycles()
+                .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(probe));
+        }
     }
 }
 
@@ -3476,7 +3678,19 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // Cache the selected interface before segment sizing below. Otherwise the
     // first call to `send_data` resolves it only after this loop chose MSS
     // chunks, delaying TSO until a later ACK-driven pump.
-    if cached_egress_for_tcb(arc).is_none() {
+    let Some(egress) = cached_egress_for_tcb(arc) else {
+        return;
+    };
+    // A driver that implements the transmit-queue contract can refuse a
+    // segment; that needs the one-segment-at-a-time sender below. Every
+    // other egress keeps the batch sender, whose device drops what it
+    // cannot take.
+    if let Some(driver) = egress.dev.tx_backpressure() {
+        pump_send_queued(arc, &egress, driver.as_ref());
+        let writable_after = arc.lock().user_can_write();
+        if !writable_before && writable_after {
+            crate::readiness::notify(id as u64);
+        }
         return;
     }
     loop {
@@ -3616,6 +3830,365 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     let writable_after = arc.lock().user_can_write();
     if !writable_before && writable_after {
         crate::readiness::notify(id as u64);
+    }
+}
+
+// ── Sending through a transmit queue that can push back ─────────────
+
+/// One segment `pump_send_queued` marked as sent and is about to offer.
+struct Marked {
+    seq: u32,
+    payload: Vec<u8>,
+    fin: bool,
+    tso: Option<u16>,
+    /// `snd_high` before this segment raised it.
+    prev_high: u32,
+    /// Added to `total_retrans` for this segment.
+    resent: u32,
+    /// `rewind_epoch` when the segment was marked.
+    epoch: u32,
+}
+
+/// `tcp_write_xmit` for an egress with transmit backpressure.
+///
+/// One caller owns the transmit at a time. It takes one segment per lock
+/// hold, applies the TSQ limit (`tcp_small_queue_check`), marks the segment
+/// sent and offers it to the device queue. If the queue refuses, the mark is
+/// undone — the segment was never sent, so it is in no retransmit queue and
+/// no timer covers it — and the connection waits for the queue's wake. The
+/// send order on the wire is the order in the send buffer.
+fn pump_send_queued(
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    egress: &CachedEgress,
+    driver: &dyn crate::txq::TxBackpressure,
+) {
+    {
+        let mut t = arc.lock();
+        if t.xmit_owner {
+            t.xmit_again = true;
+            return;
+        }
+        t.xmit_owner = true;
+    }
+    loop {
+        pump_send_queued_once(arc, egress, driver);
+        let mut t = arc.lock();
+        if t.xmit_again {
+            t.xmit_again = false;
+            continue;
+        }
+        t.xmit_owner = false;
+        break;
+    }
+}
+
+fn pump_send_queued_once(
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    egress: &CachedEgress,
+    driver: &dyn crate::txq::TxBackpressure,
+) {
+    loop {
+        let marked = {
+            let mut t = arc.lock();
+            let usable = t.usable_send_window();
+            let mss = send_mss(&t);
+            let tso_max = if t.is_ipv6 {
+                0
+            } else {
+                egress.dev.offloads.max_tso_bytes
+            };
+            let seg_cap = if tso_max > 0 {
+                tso_max.saturating_sub(128).max(mss)
+            } else {
+                mss
+            };
+            if usable == 0 {
+                // Same rule as the batch sender: persist only for a closed
+                // receive window.
+                if t.snd_wnd == 0 && t.persist_deadline_cycles == 0 && !t.send_buf.is_empty() {
+                    t.persist_backoff_ns = PERSIST_INITIAL_NS;
+                    t.persist_deadline_cycles = narf_scheduler::narf_time::now_cycles()
+                        .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(PERSIST_INITIAL_NS));
+                }
+                return;
+            }
+            let unsent = t.send_buf.unsent_len() as u32;
+            let in_flight = t.snd_nxt.wrapping_sub(t.snd_una);
+            if (t.nagle_enabled || t.cork_enabled) && unsent < mss && in_flight > 0 {
+                return;
+            }
+            let fin_only = unsent == 0;
+            if fin_only && !(t.fin_sent && t.snd_nxt == t.fin_seq) {
+                return;
+            }
+            let take = unsent.min(usable).min(seg_cap);
+            if !fin_only {
+                let throttled = t.tx_bind.as_ref().is_some_and(|bind| {
+                    let limit = crate::txq::tsq_limit(
+                        take,
+                        t.cong.effective_cwnd(),
+                        t.cong.ssthresh,
+                        t.rtt.srtt_ns / 1000,
+                        narf_lib::sysctl::ipv4::TCP_LIMIT_OUTPUT_BYTES.load(Ordering::Relaxed),
+                    );
+                    // "Always send skb if rtx queue is empty or has one
+                    // skb": never wait for completions that may be late
+                    // when little is outstanding.
+                    t.retx_queue.len() > 1 && bind.account.throttle(limit)
+                });
+                if throttled {
+                    if t.tx_wait_since_cycles == 0 {
+                        t.tx_wait_since_cycles = narf_scheduler::narf_time::now_cycles().max(1);
+                    }
+                    return;
+                }
+            }
+            let (seq, payload) = if fin_only {
+                (t.fin_seq, Vec::new())
+            } else {
+                let seq = t.send_buf.seq_at_sent_offset();
+                let (a, b) = t.send_buf.unsent_slices(take as usize);
+                let mut payload = Vec::with_capacity(take as usize);
+                payload.extend_from_slice(a);
+                payload.extend_from_slice(b);
+                if payload.is_empty() {
+                    return;
+                }
+                t.send_buf.mark_sent(payload.len());
+                (seq, payload)
+            };
+            let len = payload.len() as u32;
+            let prev_high = t.snd_high;
+            // Below `snd_high` this is the go-back-N resend after an RTO.
+            let resent = if seq_lt(seq, t.snd_high) {
+                len.div_ceil(mss).max(1)
+            } else {
+                0
+            };
+            t.total_retrans = t.total_retrans.saturating_add(resent);
+            t.snd_nxt = t.snd_nxt.wrapping_add(len);
+            let fin =
+                fin_only || (t.send_buf.unsent_len() == 0 && t.fin_sent && t.snd_nxt == t.fin_seq);
+            if fin {
+                t.snd_nxt = t.snd_nxt.wrapping_add(1);
+            }
+            note_sent(&mut t);
+            Marked {
+                seq,
+                payload,
+                fin,
+                tso: (tso_max > 0 && len > mss).then_some(mss as u16),
+                prev_high,
+                resent,
+                epoch: t.rewind_epoch,
+            }
+        };
+        let flags = match (marked.payload.is_empty(), marked.fin) {
+            (true, _) => FLAG_FIN,
+            (false, true) => FLAG_FIN | FLAG_PSH,
+            (false, false) => FLAG_PSH,
+        };
+        let sent = send_data_queued(
+            arc,
+            egress,
+            driver,
+            marked.seq,
+            &marked.payload,
+            flags,
+            marked.tso,
+        );
+        if sent == Err(TxRefusal::Busy) {
+            let mut t = arc.lock();
+            unsend(&mut t, &marked);
+            // Listed on the queue before its stopped flag is read: a wake
+            // that ran in between shows here as "not stopped" and the
+            // segment is simply offered again.
+            let still_stopped = t
+                .tx_bind
+                .as_ref()
+                .is_none_or(|bind| bind.account.queue().wait(&bind.account));
+            if still_stopped {
+                if t.tx_wait_since_cycles == 0 {
+                    t.tx_wait_since_cycles = narf_scheduler::narf_time::now_cycles().max(1);
+                }
+                return;
+            }
+            continue;
+        }
+        if marked.fin {
+            return;
+        }
+    }
+}
+
+/// Undo `pump_send_queued_once`'s mark for a segment the device refused.
+///
+/// Not after an RTO rewound `snd_nxt` since the mark: go-back-N resends from
+/// `snd_una` and covers the segment. Otherwise everything of the segment the
+/// peer has not acknowledged becomes unsent again. That is the whole segment
+/// unless an ACK arrived while it was being offered: during go-back-N the
+/// segment's head was transmitted before the RTO, so the peer can
+/// acknowledge into its middle. The acknowledged part is gone from the send
+/// buffer; the rest — marked sent, never transmitted, and with the
+/// retransmit queue just emptied by that ACK covered by no timer — starts at
+/// `snd_una`. Leaving it marked hung the upload, or the close when the
+/// segment carried the FIN.
+fn unsend(t: &mut Tcb, marked: &Marked) {
+    let len = marked.payload.len() as u32;
+    let data_end = marked.seq.wrapping_add(len);
+    let end = data_end.wrapping_add(u32::from(marked.fin));
+    if t.rewind_epoch != marked.epoch || t.snd_nxt != end {
+        return;
+    }
+    let start = if seq_lt(marked.seq, t.snd_una) {
+        t.snd_una
+    } else {
+        marked.seq
+    };
+    if !seq_lt(start, end) {
+        return;
+    }
+    t.snd_nxt = start;
+    if seq_lt(start, data_end) {
+        t.send_buf
+            .unmark_sent(data_end.wrapping_sub(start) as usize);
+    }
+    if t.snd_high == end && seq_lt(marked.prev_high, end) {
+        t.snd_high = if seq_lt(marked.prev_high, start) {
+            start
+        } else {
+            marked.prev_high
+        };
+    }
+    t.total_retrans = t.total_retrans.saturating_sub(marked.resent);
+}
+
+/// The connection's transmit-queue binding, made from the first frame it
+/// sends: the driver maps the flow to a queue once (`ndo_select_queue`) and
+/// the connection keeps it, so its waits and its byte account are on the
+/// queue its frames actually use.
+fn tx_binding(
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    driver: &dyn crate::txq::TxBackpressure,
+    frame: &[u8],
+) -> Option<TxBinding> {
+    if let Some(bind) = arc.lock().tx_bind.clone() {
+        return Some(bind);
+    }
+    let queue = driver.tx_select_queue(frame);
+    let state = driver.tx_queue(queue)?;
+    let mut t = arc.lock();
+    let id = t.id;
+    Some(
+        t.tx_bind
+            .get_or_insert_with(|| TxBinding {
+                queue,
+                account: crate::txq::TxAccount::new(id, state),
+            })
+            .clone(),
+    )
+}
+
+/// `send_data` through the driver's backpressure contract. On
+/// [`TxRefusal::Busy`] nothing was sent: no retransmit record, no timer,
+/// and the acknowledgement the segment would have carried is still owed.
+fn send_data_queued(
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    egress: &CachedEgress,
+    driver: &dyn crate::txq::TxBackpressure,
+    seq: u32,
+    payload: &[u8],
+    extra_flags: u8,
+    tso_mss: Option<u16>,
+) -> Result<(), TxRefusal> {
+    if !payload.is_empty() {
+        rxtx_note_tx();
+    }
+    let (ack, window, opt_bytes, owed) = {
+        let mut t = arc.lock();
+        let owed = (t.rcv_wnd, t.rcv_wup, t.delayed_ack_deadline_cycles);
+        let window = effective_advertised_window(&mut t);
+        let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
+        let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
+        t.delayed_ack_deadline_cycles = 0;
+        (t.rcv_nxt, window, opts, owed)
+    };
+    let tso = tso_mss.filter(|_| egress.dev.offloads.max_tso_bytes > 0);
+    let csum_off = tso.is_some() || egress.dev.offloads.tx_checksum;
+    let frame = build_tcb_frame(
+        &egress.dev,
+        &arc.lock(),
+        egress.mac,
+        seq,
+        ack,
+        FLAG_ACK | extra_flags,
+        window,
+        opt_bytes,
+        payload,
+        csum_off,
+    );
+    let bind = tx_binding(arc, driver, frame.bytes());
+    let result = emit_tcb_frame_on(
+        arc,
+        &egress.dev,
+        frame,
+        offload_meta(&egress.dev, tso, false),
+        bind.as_ref().map(|bind| (driver, bind)),
+        !payload.is_empty(),
+    );
+    let mut t = arc.lock();
+    if result == Err(TxRefusal::Busy) {
+        if t.rcv_wup == ack {
+            t.rcv_wnd = owed.0;
+            t.rcv_wup = owed.1;
+        }
+        if t.delayed_ack_deadline_cycles == 0 {
+            t.delayed_ack_deadline_cycles = owed.2;
+        }
+        return result;
+    }
+    // Taken, or dropped by a device that cannot send at all: either way it
+    // is in flight as far as loss recovery is concerned.
+    t.tx_wait_since_cycles = 0;
+    let mut seq_len = payload.len() as u32;
+    if extra_flags & FLAG_FIN != 0 {
+        seq_len = seq_len.saturating_add(1);
+    }
+    queue_retransmit(&mut t, seq, seq_len, FLAG_ACK | extra_flags);
+    arm_retransmit_timer(&mut t);
+    Ok(())
+}
+
+/// The wake pass resumes a connection: its queue has room again or its own
+/// bytes completed (`tcp_tsq_handler`). A connection that has gone is
+/// skipped.
+pub(crate) fn tx_resume(id: u32) {
+    let Some(arc) = lookup_tcb(id) else {
+        return;
+    };
+    if let Some(bind) = arc.lock().tx_bind.as_ref() {
+        bind.account.resumed();
+    }
+    pump_send(&arc);
+}
+
+/// The bound on a lost wake: a connection that has waited a full probe
+/// interval offers its next segment again. If the queue is still stopped it
+/// is refused and keeps waiting; if the wake was lost it resumes.
+fn tick_tx_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+    let now = narf_scheduler::narf_time::now_cycles();
+    let due = {
+        let mut t = arc.lock();
+        let due = t.tx_wait_since_cycles != 0
+            && now.saturating_sub(t.tx_wait_since_cycles)
+                >= narf_scheduler::narf_time::ns_to_cycles(TX_WAIT_PROBE_NS);
+        if due {
+            t.tx_wait_since_cycles = now.max(1);
+        }
+        due
+    };
+    if due {
+        pump_send(arc);
     }
 }
 
@@ -4219,7 +4792,7 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
     let win = rcv_window(arc);
     let mut advanced = false;
     if !payload.is_empty() {
-        advanced = enqueue_recv(arc, hdr.sequence, payload);
+        advanced = enqueue_recv(arc, hdr.sequence, payload, None);
     }
     if hdr.flags & FLAG_FIN != 0 {
         process_fin(arc, hdr, payload.len());
@@ -4381,7 +4954,12 @@ fn handle_in_established(
     let mut advanced = false;
     if !payload.is_empty() {
         rxtx_note_rx();
-        advanced = enqueue_recv(arc, hdr.sequence, payload);
+        advanced = enqueue_recv(
+            arc,
+            hdr.sequence,
+            payload,
+            parsed.timestamps.map(|(_, tsecr)| tsecr),
+        );
     }
     if !payload.is_empty() {
         complete_deferred_accept(arc);
@@ -4429,6 +5007,7 @@ fn enter_time_wait(t: &mut Tcb) {
         t.recv_buf = RecvBuf::new(t.recv_buf.limit);
     }
     t.egress = None;
+    t.tx_bind = None;
 }
 
 fn handle_in_fin_wait1(
@@ -4446,7 +5025,12 @@ fn handle_in_fin_wait1(
     };
     let mut advanced = false;
     if !payload.is_empty() {
-        advanced = enqueue_recv(arc, hdr.sequence, payload);
+        advanced = enqueue_recv(
+            arc,
+            hdr.sequence,
+            payload,
+            parsed.timestamps.map(|(_, tsecr)| tsecr),
+        );
     }
     let their_fin = hdr.flags & FLAG_FIN != 0 && process_fin(arc, hdr, payload.len());
     let mut t = arc.lock();
@@ -4490,7 +5074,12 @@ fn handle_in_fin_wait2(
     handle_ack(arc, hdr, parsed, payload.len());
     let mut advanced = false;
     if !payload.is_empty() {
-        advanced = enqueue_recv(arc, hdr.sequence, payload);
+        advanced = enqueue_recv(
+            arc,
+            hdr.sequence,
+            payload,
+            parsed.timestamps.map(|(_, tsecr)| tsecr),
+        );
     }
     if hdr.flags & FLAG_FIN != 0 && process_fin(arc, hdr, payload.len()) {
         let mut t = arc.lock();
@@ -4568,6 +5157,8 @@ fn handle_ack(
     let mut t = arc.lock();
     let id = t.id;
     let writable_before = t.user_can_write();
+    // Linux SOCK_NOSPACE: the writer has filled the send buffer.
+    let sndbuf_full = t.send_buf.len() >= t.send_buf.limit;
     // RFC 5681 §2 "DUPLICATE ACKNOWLEDGMENT": only a segment that carries no
     // data, no SYN/FIN, and leaves the advertised window unchanged counts.
     // Without the payload / window conditions, reverse-direction data (which
@@ -4662,6 +5253,23 @@ fn handle_ack(
             tcb.cc.on_ack(&mut tcb.cong, bytes_acked, now);
         }
         t.cong.clear_recovery_if_passed(ack);
+        // `tcp_check_space` → `tcp_new_space`: a writer that ran out of
+        // buffer gets room for twice the congestion window
+        // (`tcp_sndbuf_expand`), unless it pinned SO_SNDBUF or the window is
+        // still full (`tcp_should_expand_sndbuf`; Linux tests that after
+        // the ACK released new data, here it is before `pump_send`). A fixed
+        // 256 KiB buffer otherwise bounds the flight, and so the rate, at
+        // 256 KiB per RTT.
+        if sndbuf_full
+            && !t.sndbuf_locked
+            && t.snd_nxt.wrapping_sub(t.snd_una) < t.cong.effective_cwnd()
+        {
+            let mss = send_mss(&t);
+            let cwnd = t.cong.effective_cwnd();
+            if let Some(limit) = super::autotune::sndbuf_for(cwnd, mss, t.send_buf.limit) {
+                t.send_buf.limit = limit;
+            }
+        }
         t.rto_count = 0;
         t.keepalive_probes_sent = 0;
         t.last_progress_cycles = now;
@@ -4778,8 +5386,16 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 
 /// Queue an arrived payload. Returns `true` if it advanced `rcv_nxt`
 /// (in-order new data); `false` for out-of-order or duplicate data.
-fn enqueue_recv(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, payload: &[u8]) -> bool {
+fn enqueue_recv(
+    arc: &Arc<IrqSafeSpinLock<Tcb>>,
+    seq: u32,
+    payload: &[u8],
+    tsecr: Option<u32>,
+) -> bool {
     let mut t = arc.lock();
+    if let Some(tsecr) = tsecr.filter(|_| t.opts.timestamps_active) {
+        rcv_rtt_measure_ts(&mut t, tsecr, payload.len());
+    }
     let before = t.rcv_nxt;
     let rcv = t.rcv_nxt;
     let new_rcv = t.recv_buf.accept(seq, payload, rcv);
@@ -4787,6 +5403,10 @@ fn enqueue_recv(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, payload: &[u8]) -> bo
         // Contiguous bytes advanced — clear SACK ranges fully
         // covered.
         t.sack_book.prune_to(new_rcv);
+        // `tcp_event_data_recv` → `tcp_rcv_rtt_measure`: one advertised
+        // window of in-sequence data takes at least a round trip to arrive.
+        let wnd = t.rcv_wnd;
+        t.rcv_space.measure_window(new_rcv, wnd, mstamp_us());
     } else if !payload.is_empty() {
         // Out-of-order segment — record SACK range.
         t.sack_book

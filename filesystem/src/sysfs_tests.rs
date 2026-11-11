@@ -1234,7 +1234,58 @@ fn smoke_sysfs_block_class_auto_populate() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-kernel_test_in!("filesystem", smoke_sysfs_block_class_auto_populate);
+kernel_test_in!("filesystem/sysfs", smoke_sysfs_block_class_auto_populate);
+
+// ── Test 8a: `size` is in 512-byte sectors; `holders/` and `slaves/` exist ──
+//
+// Linux `part_size_show` prints `bdev_nr_sectors()` — 512-byte units even on
+// a 4096-byte-LBA disk — and `add_disk` creates the (normally empty)
+// `holders` and `slaves` directories. NARF printed bytes, which every
+// consumer (lsblk, udisks, blkid) multiplies by 512 again, and had neither
+// directory, which multipath's `sysfs_is_multipathed` reports as "error
+// scanning /sys/block/nvme0n1/holders" on every disk.
+
+fn smoke_sysfs_block_size_sectors_and_stacking_dirs() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    let snap = narf_block::registry::__snapshot_for_test();
+    // 8 blocks of 4096 bytes = 32768 bytes = 64 sectors.
+    narf_block::registry::register_block_device("smoke-secblk0", FakeBlock::new(4096, 8));
+    crate::sysfs::populate_block_class();
+
+    let result = (|| -> TestResult {
+        let root = crate::sysfs::sysfs_root();
+        let views = [
+            root.get_child("block"),
+            root.get_child("class").and_then(|c| c.get_child("block")),
+            root.get_child("devices")
+                .and_then(|d| d.get_child("virtual"))
+                .and_then(|v| v.get_child("block")),
+        ];
+        for view in views {
+            let Some(dev) = view.and_then(|v| v.get_child("smoke-secblk0")) else {
+                return TestResult::Fail("block device missing from a sysfs view");
+            };
+            if dev.attr_show("size").as_deref() != Some("64\n") {
+                return TestResult::Fail("block `size` is not in 512-byte sectors");
+            }
+            if dev.get_child("holders").is_none() {
+                return TestResult::Fail("block device has no holders/ directory");
+            }
+            if dev.get_child("slaves").is_none() {
+                return TestResult::Fail("whole disk has no slaves/ directory");
+            }
+        }
+        TestResult::Pass
+    })();
+
+    narf_block::registry::__restore_for_test(snap);
+    result
+}
+kernel_test_in!(
+    "filesystem/sysfs",
+    smoke_sysfs_block_size_sectors_and_stacking_dirs
+);
 
 // ── Test 8b: a block device's canonical sysfs `uevent` is readable + carries ──
 // SUBSYSTEM/MAJOR/MINOR, which is what `udevadm info` reads to create the
@@ -1302,7 +1353,7 @@ fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-kernel_test_in!("filesystem", smoke_sysfs_block_uevent_file_readable);
+kernel_test_in!("filesystem/sysfs", smoke_sysfs_block_uevent_file_readable);
 
 /// EFI boot queues block ADDs before PID 1 so the daemon can replay the ESP
 /// event even if the early udev trigger service is unavailable.  The queued
@@ -1337,7 +1388,10 @@ fn smoke_sysfs_block_add_events_are_canonical() -> TestResult {
         _ => TestResult::Fail("EFI block ADD was not emitted from canonical /sys/devices path"),
     }
 }
-kernel_test_in!("filesystem", smoke_sysfs_block_add_events_are_canonical);
+kernel_test_in!(
+    "filesystem/sysfs",
+    smoke_sysfs_block_add_events_are_canonical
+);
 
 // A registered partition must not masquerade as a whole disk. udev only runs
 // its filesystem-identification rules (and thus creates UUID device links)
@@ -1398,7 +1452,7 @@ fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
     }
 }
 kernel_test_in!(
-    "filesystem",
+    "filesystem/sysfs",
     smoke_sysfs_block_partition_uevent_marks_partition
 );
 

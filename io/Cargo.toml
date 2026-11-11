@@ -18,6 +18,7 @@ narf-capabilities = { path = "../capabilities" }
 narf-acpi         = { path = "../acpi" }
 narf-boot         = { path = "../boot" }
 narf-time         = { path = "../time" }
+narf-console      = { path = "../console" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]

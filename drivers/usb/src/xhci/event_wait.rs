@@ -8,6 +8,32 @@ pub(super) type Event = [u32; 4];
 pub(super) const QUEUE_DEPTH: usize = 64;
 pub(super) const DRAIN_BUDGET: usize = 32;
 
+/// Deadline class of one wait.
+///
+/// Linux allows commands and control-transfer stages 5000 ms
+/// (`XHCI_CMD_DEFAULT_TIMEOUT`, `USB_CTRL_GET_TIMEOUT`), and USB 2.0
+/// §9.2.6.1 lets a device take that long. This driver cannot yet afford
+/// it: `Xhci::await_event` waits by re-polling on every executor round
+/// instead of sleeping, so a silent device keeps the USB supervisor
+/// runnable for the whole deadline. With 5000 ms, one unresponsive
+/// high-speed device on a physical host held it for tens of seconds and
+/// the boot never reached the display manager. Every class therefore
+/// keeps the 250 ms bound until that wait can block; the classes stay
+/// distinct so the longer bounds can return without touching callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Wait {
+    Command,
+    ControlStage,
+    Transfer,
+}
+impl Wait {
+    pub const fn timeout_ms(self) -> u64 {
+        match self {
+            Self::Command | Self::ControlStage | Self::Transfer => 250,
+        }
+    }
+}
+
 /// Returns true if an unrelated oldest event had to be discarded.
 pub(super) fn enqueue(queue: &mut VecDeque<Event>, event: Event) -> bool {
     let overflow = queue.len() >= QUEUE_DEPTH;

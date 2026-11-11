@@ -289,6 +289,64 @@ fn attributes(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>, i32> {
     Ok(result)
 }
 
+/// The attributes of one request message, as Linux `__nla_parse` builds its
+/// table: `tb[type] = nla`, so an attribute that occurs again replaces the
+/// earlier occurrence instead of failing the request. wpa_supplicant's
+/// CONNECT carries NL80211_ATTR_SOCKET_OWNER twice — `nl80211_connect_common`
+/// puts it under its old name NL80211_ATTR_IFACE_SOCKET_OWNER and
+/// `wpa_driver_nl80211_try_connect` puts it again. Malformed lengths and an
+/// unbounded walk are still refused. Nested lists keep [`attributes`].
+fn message_attributes(bytes: &[u8]) -> Result<Vec<(u16, &[u8])>, i32> {
+    let mut result: Vec<(u16, &[u8])> = Vec::new();
+    let mut rest = bytes;
+    let mut walked = 0usize;
+    while !rest.is_empty() {
+        if rest.len() < 4 || walked == 256 {
+            return Err(EINVAL);
+        }
+        walked += 1;
+        let length = u16::from_ne_bytes(rest[..2].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes(rest[2..4].try_into().unwrap()) & 0x3fff;
+        if length < 4 || length > rest.len() {
+            return Err(EINVAL);
+        }
+        let value = &rest[4..length];
+        match result.iter_mut().find(|(seen, _)| *seen == kind) {
+            Some(entry) => entry.1 = value,
+            None => {
+                if result.len() == 128 {
+                    return Err(EINVAL);
+                }
+                result.push((kind, value));
+            }
+        }
+        let next = align(length);
+        if next > rest.len() {
+            if length != rest.len() {
+                return Err(EINVAL);
+            }
+            break;
+        }
+        rest = &rest[next..];
+    }
+    Ok(result)
+}
+
+/// The AKM wpa_supplicant selected for a CONNECT: the first entry of
+/// NL80211_ATTR_AKM_SUITES. `nl80211_connect_common` appends the AKMs the
+/// driver may additionally use (`wpas_update_allowed_key_mgmt`, up to
+/// NL80211_MAX_NR_AKM_SUITES in total) — for a "WPA-PSK WPA-PSK-SHA256"
+/// profile the list is PSK, PSK-SHA256. NARF's offloading owners never
+/// change AKM on their own, so only the first entry selects the credential;
+/// `crypto_suites` has already bounded the list.
+fn primary_akm(attrs: &[(u16, &[u8])]) -> Option<u32> {
+    attr(attrs, 76)?
+        .get(..4)?
+        .try_into()
+        .ok()
+        .map(u32::from_ne_bytes)
+}
+
 fn attr<'a>(attrs: &[(u16, &'a [u8])], kind: u16) -> Option<&'a [u8]> {
     attrs
         .iter()
@@ -786,6 +844,9 @@ struct ConnectCaps {
     optional_mfp: bool,
     sae_offload: bool,
     external: bool,
+    /// The wiphy advertises `NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211`
+    /// (the same condition as GET_WIPHY's ext-feature bit).
+    control_port_over_nl80211: bool,
     cipher_suites: &'static [u32],
     scan_random_mac: bool,
     connected: bool,
@@ -802,6 +863,8 @@ impl ConnectCaps {
             optional_mfp: iface.supports_optional_mfp() && !iface.supports_userspace_mlme(),
             sae_offload: iface.supports_sae_offload(),
             external: iface.supports_external_supplicant(),
+            control_port_over_nl80211: iface.supports_external_supplicant()
+                || iface.supports_ap_authenticator(),
             cipher_suites: iface.cipher_suites(),
             scan_random_mac: iface.supports_scan_random_mac(),
             connected: iface.connected_bssid().is_some(),
@@ -828,6 +891,7 @@ fn parse_operation(
             optional_mfp: false,
             sae_offload,
             external: false,
+            control_port_over_nl80211: false,
             cipher_suites: &[],
             scan_random_mac: false,
             connected: false,
@@ -932,7 +996,12 @@ fn parse_operation_caps(
         }
         CONNECT => {
             connect_side_attrs(attrs)?;
-            let port = control_port(attrs, caps.external)?;
+            // `validate_pae_over_nl80211` asks only whether the wiphy has
+            // the ext feature. wpa_supplicant requests it on every CONNECT
+            // to such a wiphy (`nl80211_put_control_port`), also when the
+            // driver then runs the handshake itself and no EAPOL frame ever
+            // reaches the control port.
+            let port = control_port(attrs, caps.external || caps.control_port_over_nl80211)?;
             let ssid = attr(attrs, 52).ok_or(EINVAL)?;
             if ssid.is_empty() || ssid.len() > 32 {
                 return Err(EINVAL);
@@ -995,7 +1064,7 @@ fn parse_operation_caps(
                     || mfp != 1
                     || !ccmp
                     || u32_attr(attrs, 75)? != Some(2)
-                    || u32_attr(attrs, 76)? != Some(0x000fac08)
+                    || primary_akm(attrs) != Some(0x000fac08)
                     || attr(attrs, 254).is_some()
                 {
                     return Err(EOPNOTSUPP);
@@ -1012,7 +1081,7 @@ fn parse_operation_caps(
                     || mfp == 1 && !caps.psk_mfp_offload
                     || !ccmp
                     || u32_attr(attrs, 75)? != Some(2)
-                    || u32_attr(attrs, 76)? != Some(0x000fac02)
+                    || primary_akm(attrs) != Some(0x000fac02)
                 {
                     return Err(EOPNOTSUPP);
                 }
@@ -1177,6 +1246,19 @@ fn route(
     if command == station::GET_REG {
         return station::get_reg(bytes, dump, context.net_ns_id);
     }
+    if command == 27 {
+        request_regulatory_country(bytes, &context, crate::reg::db::select_linux_country)?;
+        let domain = station::global_regdom()?;
+        let mut attrs = Vec::new();
+        let mut alpha2 = domain.alpha2.to_vec();
+        alpha2.push(0);
+        push_attr(&mut attrs, 33, &alpha2);
+        // NL80211_REGDOM_SET_BY_USER, NL80211_REGDOM_TYPE_COUNTRY.
+        push_attr(&mut attrs, 48, &[1]);
+        push_attr(&mut attrs, 49, &[u8::from(domain.alpha2 == *b"00")]);
+        publish_event(NL80211_FAMILY_ID, 20, 0, GenlReply { command: 36, attrs });
+        return Ok(Vec::new());
+    }
     if matches!(
         command,
         START_AP
@@ -1200,7 +1282,7 @@ fn route(
     if !matches!(command, SCAN | GET_SCAN | CONNECT | DISCONNECT) {
         return super::handle_in(command, bytes, dump, context.net_ns_id);
     }
-    let mut attrs = attributes(bytes)?;
+    let mut attrs = message_attributes(bytes)?;
     // `nl80211_trigger_scan` / `nl80211_dump_scan` take their wdev from
     // NL80211_ATTR_WDEV as well as from a netdev IFINDEX. An actual
     // control-only WDEV (P2P_DEVICE) has its own source-bound path; a netdev
@@ -1278,6 +1360,39 @@ fn route(
         execute(iface, admin, namespace, index, operation).await;
     });
     Ok(Vec::new()) // generic netlink emits the requested ACK
+}
+
+/// A country hint selects authenticated database data; it cannot supply rules,
+/// installation facts or an interface delegation in place of global authority.
+fn request_regulatory_country(
+    bytes: &[u8],
+    context: &RequestContext<'_>,
+    select: impl FnOnce([u8; 2]) -> Result<(), crate::reg::policy::Error>,
+) -> Result<(), i32> {
+    if !context.init_net_admin || context.net_ns_id != 0 {
+        return Err(EPERM);
+    }
+    let attrs = attributes(bytes)?;
+    if attrs.iter().any(|(kind, _)| !matches!(kind, 33 | 154)) {
+        return Err(EINVAL);
+    }
+    if u32_attr(&attrs, 154)?.unwrap_or(0) != 0 {
+        // Cellular/indoor hints have additional authority and lifetime
+        // semantics and are not implemented by this country selector.
+        return Err(EOPNOTSUPP);
+    }
+    let country = attr(&attrs, 33).ok_or(EINVAL)?;
+    if !matches!(country.len(), 2 | 3) || country.len() == 3 && country[2] != 0 {
+        return Err(EINVAL);
+    }
+    let alpha2 = [country[0], country[1]];
+    if !crate::reg::linux::valid_alpha2(alpha2) {
+        return Err(EINVAL);
+    }
+    select(alpha2).map_err(|error| match error {
+        crate::reg::policy::Error::Authority => EPERM,
+        _ => EINVAL,
+    })
 }
 
 /// `NL80211_CMD_SET_SAR_SPECS` → `set_sar_specs`. The wiphy advertises its

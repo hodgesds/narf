@@ -1185,25 +1185,187 @@ fn smoke_btrfs_root_rw_metadata_reserve() -> TestResult {
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_root_rw_metadata_reserve);
 
-/// The free-space tree's leaf count is made monotone late in the commit fixed
-/// point by padding its tiling: the padded groups still cover every item, in
-/// order, with no empty leaf, and a tiling of single items cannot be padded.
-fn smoke_btrfs_fst_pad_groups() -> TestResult {
-    let mut g = alloc::vec![(0usize, 7usize), (7, 9), (9, 30)];
-    crate::write::pad_groups(&mut g, 6);
-    let contiguous = g.windows(2).all(|w| w[0].1 == w[1].0);
-    if g.len() != 6 || g[0].0 != 0 || g[5].1 != 30 || !contiguous || g.iter().any(|&(s, e)| e <= s)
-    {
-        return TestResult::Fail("padded tiling is not a cover of the items");
+/// Metadata filled with acknowledged operations on a device with nothing
+/// left to allocate: the operation whose reservation no longer fits gets
+/// `ENOSPC` itself, before anything of it is staged; everything accepted
+/// before it commits; nothing aborts; and the full filesystem can still
+/// unlink (borrowing the global reserve) and then takes writes again.
+fn smoke_btrfs_root_rw_metadata_enospc_never_aborts() -> TestResult {
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("bgt fixture did not mount writable"),
+    };
+    narf_block::disk_policy::__set_policy_for_test(Some(
+        narf_block::disk_policy::DiskPolicy::RootRw,
+    ));
+    let name = |i: u32| alloc::format!("e{i:06}-{}", "n".repeat(180));
+    let result = (|| {
+        // Hand every unallocated byte to DATA chunks: metadata cannot grow.
+        let mut chunks = 0u32;
+        loop {
+            match poll_once(crate::write::alloc_chunk(&vol, format::BLOCK_GROUP_DATA)) {
+                Some(Ok(())) => chunks += 1,
+                Some(Err(FsError::NoSpace)) => break,
+                _ => return Err("data chunk allocation failed"),
+            }
+            if chunks > 64 {
+                return Err("the device never filled");
+            }
+        }
+        let refusals = vol.commit_stats().snapshot().reserve_refusals;
+        let body: Vec<u8> = alloc::vec![0x65; 1500];
+        let mut made = 0u32;
+        loop {
+            let file = match poll_once(vol.root().create(&name(made))) {
+                Some(Ok(file)) => file,
+                Some(Err(FsError::NoSpace)) => break,
+                _ => return Err("create failed with something other than ENOSPC (aborted?)"),
+            };
+            match poll_once(file.write(0, &body)) {
+                Some(Ok(n)) if n == body.len() => {}
+                Some(Err(FsError::NoSpace)) => break,
+                _ => return Err("write failed with something other than ENOSPC (aborted?)"),
+            }
+            made += 1;
+            if made > 400_000 {
+                return Err("metadata never filled");
+            }
+        }
+        if made < 100 {
+            return Err("ENOSPC before the metadata was anywhere near full");
+        }
+        if vol.commit_stats().snapshot().reserve_refusals == refusals {
+            return Err("ENOSPC did not come from the reservation");
+        }
+        if vol.transaction_aborted() || !vol.admits_writes() {
+            return Err("ENOSPC aborted the transaction");
+        }
+        // Everything acknowledged commits.
+        if !matches!(poll_once(vol.sync_to_disk_exclusive()), Some(Ok(()))) {
+            return Err("the commit after ENOSPC failed");
+        }
+        // A full filesystem can still delete...
+        for i in 0..made / 4 {
+            if !matches!(poll_once(vol.root().unlink(&name(i))), Some(Ok(()))) {
+                return Err("unlink on a full filesystem failed");
+            }
+        }
+        if !matches!(poll_once(vol.sync_to_disk_exclusive()), Some(Ok(()))) {
+            return Err("the commit after unlinking failed");
+        }
+        // ...and then has room again.
+        match poll_once(vol.root().create("after-enospc")) {
+            Some(Ok(file)) if matches!(poll_once(file.write(0, &body)), Some(Ok(_))) => {}
+            _ => return Err("no room after unlinking"),
+        }
+        if !matches!(poll_once(vol.sync_to_disk_exclusive()), Some(Ok(()))) {
+            return Err("the final commit failed");
+        }
+        if vol.transaction_aborted() {
+            return Err("the transaction aborted");
+        }
+        // No commit needed more than its batch reserved plus the global
+        // reserve's floor.
+        if vol.commit_stats().snapshot().max_reserve_overrun
+            > crate::write::reserve::GLOBAL_FLOOR_BLOCKS
+        {
+            return Err("a commit outran the global reserve");
+        }
+        Ok(())
+    })();
+    narf_block::disk_policy::__set_policy_for_test(None);
+    if let Err(why) = result {
+        return TestResult::Fail(why);
     }
-    let mut ones = alloc::vec![(0usize, 1usize), (1, 2)];
-    crate::write::pad_groups(&mut ones, 5);
-    if ones != [(0, 1), (1, 2)] {
-        return TestResult::Fail("single-item groups were split");
+    match chunk_accounting(&vol) {
+        Ok((ext, used, _, _)) if ext == used => {}
+        Ok(_) => return TestResult::Fail("chunk accounting inconsistent"),
+        Err(why) => return TestResult::Fail(why),
     }
-    TestResult::Pass
+    match super::snapshots::check_ref_counts(&vol) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
 }
-kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fst_pad_groups);
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_root_rw_metadata_enospc_never_aborts
+);
+
+/// Linux's 80% rule, and its use: a `root-rw` filesystem with room on the
+/// device allocates a METADATA chunk when a refused reservation finds the
+/// metadata space past the threshold, instead of running on ever shorter
+/// batches, and no operation sees `ENOSPC` on the way.
+fn smoke_btrfs_root_rw_metadata_grows_ahead_of_need() -> TestResult {
+    use crate::write::reserve::should_alloc_chunk;
+    let gib = 1u64 << 30;
+    // The real root: 6 GiB of metadata, 4.98 used, 512 MiB reserved.
+    if !should_alloc_chunk(5 * gib + gib / 2, 6 * gib)
+        || should_alloc_chunk(4 * gib, 6 * gib)
+        || !should_alloc_chunk(80 * gib - (2 << 20), 100 * gib)
+        || should_alloc_chunk(80 * gib - (2 << 20) - 1, 100 * gib)
+    {
+        return TestResult::Fail("the threshold differs from Linux's should_alloc_chunk");
+    }
+    let dev = writable_sparse(FIXTURE_BGT_SPARSE);
+    let vol = match mount_writable(dev) {
+        Ok(v) if v.supports_writes() => v,
+        _ => return TestResult::Fail("bgt fixture did not mount writable"),
+    };
+    narf_block::disk_policy::__set_policy_for_test(Some(
+        narf_block::disk_policy::DiskPolicy::RootRw,
+    ));
+    let name = |i: u32| alloc::format!("g{i:06}-{}", "n".repeat(180));
+    let result = (|| {
+        let before = vol.commit_stats().snapshot();
+        let body: Vec<u8> = alloc::vec![0x67; 1500];
+        let mut made = 0u32;
+        while vol
+            .commit_stats()
+            .snapshot()
+            .since(&before)
+            .early_metadata_chunks
+            == 0
+        {
+            let file = match poll_once(vol.root().create(&name(made))) {
+                Some(Ok(file)) => file,
+                _ => return Err("create failed although the device has room"),
+            };
+            if !matches!(poll_once(file.write(0, &body)), Some(Ok(n)) if n == body.len()) {
+                return Err("write failed although the device has room");
+            }
+            made += 1;
+            if made > 400_000 {
+                return Err("metadata was never grown ahead of need");
+            }
+        }
+        if vol.transaction_aborted() || !vol.admits_writes() {
+            return Err("growing metadata aborted the transaction");
+        }
+        if !matches!(poll_once(vol.sync_to_disk_exclusive()), Some(Ok(()))) {
+            return Err("the commit after growing failed");
+        }
+        Ok(())
+    })();
+    narf_block::disk_policy::__set_policy_for_test(None);
+    if let Err(why) = result {
+        return TestResult::Fail(why);
+    }
+    match chunk_accounting(&vol) {
+        Ok((ext, used, _, _)) if ext == used => {}
+        Ok(_) => return TestResult::Fail("chunk accounting inconsistent"),
+        Err(why) => return TestResult::Fail(why),
+    }
+    match super::snapshots::check_ref_counts(&vol) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_root_rw_metadata_grows_ahead_of_need
+);
 
 /// A new chunk copies the profile of its type only when every existing chunk
 /// of that type agrees on SINGLE or DUP, and metadata chunks are 1 GiB above
@@ -1238,9 +1400,9 @@ fn smoke_btrfs_chunk_profile_and_size() -> TestResult {
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_chunk_profile_and_size);
 
-/// The fixed point's leaf "touch" deletes a METADATA_ITEM key only after
-/// confirming it is absent from the committed extent tree: a live block's
-/// key is refused, a free address's accepted.
+/// A commit inserts (and may delete again) a new block's METADATA_ITEM key
+/// only after confirming it is absent from the committed extent tree: a live
+/// block's key is refused, a free address's accepted.
 fn smoke_btrfs_touch_key_must_be_absent() -> TestResult {
     let dev = writable_sparse(FIXTURE_BGT_SPARSE);
     let Ok(vol) = mount_writable(dev) else {
@@ -1256,14 +1418,14 @@ fn smoke_btrfs_touch_key_must_be_absent() -> TestResult {
     };
     let live = BtrfsKey::new(ext_root, format::METADATA_ITEM_KEY, u64::from(ext_level));
     if !matches!(
-        poll_once(crate::write::touch_key_absent(&*vol, ext_root, &live)),
+        poll_once(crate::write::extent_key_absent(&*vol, ext_root, &live)),
         Some(Err(FsError::InvalidData))
     ) {
         return TestResult::Fail("a live block's extent key was accepted as absent");
     }
     let free = BtrfsKey::new(u64::MAX - 0xffff, format::METADATA_ITEM_KEY, 0);
     if !matches!(
-        poll_once(crate::write::touch_key_absent(&*vol, ext_root, &free)),
+        poll_once(crate::write::extent_key_absent(&*vol, ext_root, &free)),
         Some(Ok(()))
     ) {
         return TestResult::Fail("an absent key was refused");

@@ -155,6 +155,16 @@ live entries, with duplicate names suppressed. Static names precede providers,
 then the block registry, then udev-created runtime nodes. Existing USB serial,
 video and RFCOMM installation wrappers adapt to this provider API.
 
+The existing `/dev/disk/by-*` and `/dev/input/by-*` writable symlink
+overlays support same-directory atomic rename, including replacement of an
+alias, so udev can publish a staged symlink. An overlay takes precedence over
+a generated alias of the same name and enumeration lists that name once.
+Protected static root paths cannot be replaced: renaming a staged symlink to
+a static symlink with the same destination only consumes the staged entry,
+preserving the static inode and target. `/dev/rtc0` ownership and permissions
+persist across lookups so authorized udev metadata updates survive closing
+the original fd; device identity and RTC operations remain fixed.
+
 `sysfs::register_provider(SysfsProvider)` registers a named boot population
 callback. `populate_all()` snapshots callbacks and invokes them without its
 lock. Providers support explicit refresh after probes and use the existing
@@ -767,6 +777,14 @@ the identity of the node it was opened through. A pty is identified
 system-wide by `tty_id()` / `as_pty_master_id()` (`pty_by_id`, `pty_index`),
 since indices repeat across instances. Boot mounts one instance at
 `/dev/pts` with systemd's `mode=620,gid=5` (`boot_devpts`).
+`DirOps::entry_ino(name)` is the inode number readdir reports for an entry
+(`d_ino`), equal to that entry's `st_ino`; it must not open the entry, and
+the default `None` leaves the readdir handler's placeholder. A devpts root
+answers it (`ptmx` 2, a live pty `index + 3`) because glibc `ttyname` falls
+back to matching `/dev/pts` `d_ino` against `fstat` of the terminal.
+`pts_index_under(dir, pty_id)` is the pty's index when `dir` is the root of
+the instance it lives on (`devpts_mntget`'s superblock test), which is how
+the syscall layer names a `TIOCGPTPEER` slave.
 The Linux open path treats `/dev/tty` as the caller's controlling-terminal
 multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
 path-node identity, and reports `ENXIO` for a detached session. `O_PATH`
@@ -1156,6 +1174,7 @@ pub trait Filesystem: Send + Sync {
 }
 
 pub trait DirOps: Send + Sync {
+    fn entry_ino(&self, name: &str) -> Option<u64>;
     fn dir_owners(&self) -> (u32, u32);
     fn set_dir_owners(&self, uid: u32, gid: u32);
     async fn set_dir_owners_async(&self, uid: u32, gid: u32) -> Result<(), FsError>;

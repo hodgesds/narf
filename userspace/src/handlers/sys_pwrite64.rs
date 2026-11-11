@@ -69,7 +69,7 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         let want = core::cmp::min(CHUNK, count - total);
         // SAFETY: the complete source range passed validate_rw_user_range;
         // each bounded guarded copy still catches a racing unmap.
-        let payload = match unsafe { copy_from_user_vec(ptr + total as u64, want) } {
+        let mut payload = match unsafe { copy_from_user_vec(ptr + total as u64, want) } {
             Ok(bytes) => bytes,
             Err(errno) => {
                 if total == 0 {
@@ -79,8 +79,14 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
                 break;
             }
         };
-        let outcome = poll_blocking(endpoint.ops.write(offset, &payload))
-            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+        // `generic_perform_write`: killable, see `killable_wait::write`.
+        let outcome = match crate::killable_wait::write(&endpoint.ops, offset, &mut payload) {
+            Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
+            Err(crate::killable_wait::Killed) => {
+                ctx.set_return(errno_ret(EINTR));
+                return;
+            }
+        };
         let written = match outcome {
             Ok(0) => break,
             Ok(n) if n <= payload.len() => n,

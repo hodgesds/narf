@@ -49,6 +49,14 @@ pub use signature::{
     register_trusted_signer, trusted_signer_count, BlobTrailer, BLOB_TRAILER_MAGIC,
 };
 
+/// Unchanged Linux wireless-regdb v20 bytes, authenticated during the build
+/// against the upstream regdb public certificates. Runtime firmware cannot
+/// replace this read-only kernel asset or add a signer. Wireless owns country
+/// selection and conservative translation into its live regulatory policy.
+pub fn linux_regulatory_database() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/linux-regulatory.db"))
+}
+
 /// Cap-type marker for a loaded firmware blob.
 ///
 /// `Cap<FirmwareBlob, Read>` lets the holder borrow the blob's

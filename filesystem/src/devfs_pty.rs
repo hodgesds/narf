@@ -1872,6 +1872,16 @@ pub fn pts_open_peer(id: u32) -> Option<Result<Arc<PtySlave>, ()>> {
     Some(Ok(Arc::new(PtySlave::new(pty))))
 }
 
+/// The pts index of pty `id` if `dir` is the root of the devpts instance it
+/// lives on — `devpts_mntget`'s `DEVPTS_SB(path.mnt->mnt_sb) == fsi` test.
+/// `ptm_open_peer` opens the slave as that mount's `<index>` entry, which is
+/// the name `d_path` then gives `/proc/<pid>/fd/<n>`.
+pub fn pts_index_under(dir: &dyn DirOps, id: u32) -> Option<u32> {
+    let devpts = dir.as_any()?.downcast_ref::<DevPts>()?;
+    let pty = pty_by_id(id)?;
+    Arc::ptr_eq(&devpts.fsi, &pty.fsi).then_some(pty.index)
+}
+
 // ── User-pointer helpers ──────────────────────────────────────────────────────
 //
 // Raw memcpy across user/kernel — mirrors `drivers/gpu/src/drm_ioctl_bridge`
@@ -3606,6 +3616,18 @@ impl DirOps for DevPts {
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         Box::new(core::iter::empty())
+    }
+
+    /// `dcache_readdir` emits each dentry's `d_inode->i_ino`: 2 for the
+    /// `ptmx` node (`mknod_ptmx`) and `index + 3` for a pty
+    /// (`devpts_pty_new`) — the numbers [`DevPtmx::ino`] and
+    /// [`PtySlave::ino`] report through `stat`.
+    fn entry_ino(&self, name: &str) -> Option<u64> {
+        if name == "ptmx" {
+            return Some(2);
+        }
+        let index: u32 = name.parse().ok()?;
+        self.fsi.lookup(index).map(|_| u64::from(index) + 3)
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {

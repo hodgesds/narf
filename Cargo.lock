@@ -3008,6 +3008,7 @@ dependencies = [
  "narf-acpi",
  "narf-boot",
  "narf-capabilities",
+ "narf-console",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
@@ -3091,6 +3092,7 @@ dependencies = [
  "narf-ipc",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
  "narf-scheduler",
  "zeroize",
 ]

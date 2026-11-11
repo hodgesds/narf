@@ -112,6 +112,25 @@ parent, no PCIe capability or an all-ones unavailable register; a revoked
 child capability fails before config access. This read-only relationship
 query grants no bridge capability and cannot change either end's ASPM policy.
 
+`pci::prepare_memory_probe(write_cap, device) -> Result<Option<PciPowerState>,
+PciError>` encloses initial command parking and D0 entry in one current
+invocation. It verifies BME and memory decode are clear with INTx disabled,
+waits at least 10 ms after leaving a lower power state, and restores/readbacks
+BARs and the ROM BAR before mapping. It returns the prior power state (`None`
+for a function without PM). A missing function or failed state/readback returns
+`PciError::NotReady`. It never enables mastering or memory decode, and is not
+a completion fence for previously published DMA.
+
+`module_pci_prepare_probe(owner, token)` exposes that initial preparation to
+the caller's fresh module context; existing BAR/DMA/MSI-X/poller/interface
+resources return `-EBUSY`. The module serializes initial setup. Waiting for
+D0 holds no global context spinlock. `narf_pci_prepare_probe` is the C-ABI
+wrapper; see `modules/DATAPATH_ABI_DESIGN.md`. It additionally clears and
+readbacks PCIe No Snoop Enable for the module's cached coherent allocations,
+preserving other controls without acknowledging Device Status RW1C bits.
+`module_pci_enable` verifies that requested Command bits latched before
+reporting success; absent configuration or rejected bits return `-EIO`.
+
 ### 3.1 Device descriptor
 
 ```rust

@@ -225,6 +225,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                             rx,
                             sock.inet4_cmsg_options(),
                             sock.udp_gro_enabled(),
+                            sock.rcv_timestamp_mode(),
                         )
                     }
                 } else if sock.domain == crate::socket::AF_INET6 {
@@ -236,6 +237,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                         hoplimit,
                         tclass,
                         sock.udp_gro_enabled(),
+                        sock.rcv_timestamp_mode(),
                     )
                 } else {
                     install_recv_ancillary(msg_ptr, recv_fds, cred, flags & MSG_CMSG_CLOEXEC != 0)

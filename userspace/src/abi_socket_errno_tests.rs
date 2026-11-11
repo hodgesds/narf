@@ -1359,6 +1359,185 @@ kernel_test_in!(
     smoke_abi_socket_errno_getname_inet6_length
 );
 
+/// `(address, port)` of a 16-byte `sockaddr_in` reported by get_name/accept.
+fn sin_parts(r: Option<i64>, len: i32, out: &[u8]) -> Result<(u32, u16), &'static str> {
+    if r != Some(0) || len != 16 {
+        return Err("an AF_INET name was not reported as a 16-byte sockaddr_in");
+    }
+    if u16::from_ne_bytes([out[0], out[1]]) != AF_INET as u16 {
+        return Err("an AF_INET name did not carry sin_family AF_INET");
+    }
+    Ok((
+        u32::from_be_bytes([out[4], out[5], out[6], out[7]]),
+        u16::from_be_bytes([out[2], out[3]]),
+    ))
+}
+
+/// accept(2) with a peer-address buffer: the new fd and the reported name.
+fn accept_named(listener: u64) -> Result<(u64, (u32, u16)), &'static str> {
+    let mut out = [0u8; 128];
+    let mut len = 128i32.to_ne_bytes();
+    let fd = match sys(
+        Syscall::SocketAccept,
+        a2(listener, out.as_mut_ptr() as u64, len.as_mut_ptr() as u64),
+    ) {
+        Some(fd) if fd >= 0 => fd as u64,
+        _ => return Err("accept() of a completed loopback connection failed"),
+    };
+    let peer = sin_parts(Some(0), i32::from_ne_bytes(len), &out)?;
+    Ok((fd, peer))
+}
+
+/// The four names of one loopback TCP connection, as sshd reads them
+/// (`get_peer_ipaddr`/`get_local_ipaddr`): `tcp_v4_connect` gives the client
+/// a source address and an ephemeral port, and the accepted child carries
+/// the mirror image — `inet_getname` reports `inet_rcv_saddr`/`inet_sport`
+/// locally and `inet_daddr`/`inet_dport` for the peer, and `accept` returns
+/// the child's peer. None of them is 0.0.0.0:0.
+fn smoke_abi_socket_names_tcp_loopback_accept() -> TestResult {
+    with_setup(|| {
+        const PORT: u16 = 42_622;
+        let listener = tcp_listener(PORT)?;
+        let client = open(AF_INET, SOCK_STREAM, 0)?;
+        if connect(client, &sin(AF_INET, LOOPBACK, PORT)) != Some(0) {
+            return Err("loopback TCP connect failed");
+        }
+        let (server, accepted_peer) = accept_named(listener)?;
+        let (r, len, out) = get_name(client, false);
+        let client_local = sin_parts(r, len, &out)?;
+        let (r, len, out) = get_name(client, true);
+        let client_peer = sin_parts(r, len, &out)?;
+        let (r, len, out) = get_name(server, false);
+        let server_local = sin_parts(r, len, &out)?;
+        let (r, len, out) = get_name(server, true);
+        let server_peer = sin_parts(r, len, &out)?;
+        close(server);
+        close(client);
+        close(listener);
+        if client_peer != (LOOPBACK, PORT) {
+            return Err("client getpeername is not the address it connected to");
+        }
+        if client_local.0 != LOOPBACK || client_local.1 == 0 {
+            return Err("client getsockname is not 127.0.0.1 with an ephemeral port");
+        }
+        if server_local != (LOOPBACK, PORT) {
+            return Err("accepted socket getsockname is not the listening address");
+        }
+        if server_peer != client_local {
+            return Err("accepted socket getpeername is not the client's local name");
+        }
+        if accepted_peer != client_local {
+            return Err("accept() did not report the client's local name");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_names",
+    smoke_abi_socket_names_tcp_loopback_accept
+);
+
+/// A client that binds before connecting keeps that name (`inet_sport` is
+/// the bound port), and it is what the server's accept/getpeername report.
+/// The port stays reserved while the connection lives and is free after it.
+fn smoke_abi_socket_names_tcp_loopback_bound_client() -> TestResult {
+    with_setup(|| {
+        const PORT: u16 = 42_623;
+        const CLIENT_PORT: u16 = 42_624;
+        let listener = tcp_listener(PORT)?;
+        let client = open(AF_INET, SOCK_STREAM, 0)?;
+        if bind(client, &sin(AF_INET, LOOPBACK, CLIENT_PORT)) != Some(0) {
+            return Err("client bind failed");
+        }
+        if connect(client, &sin(AF_INET, LOOPBACK, PORT)) != Some(0) {
+            return Err("loopback TCP connect from a bound socket failed");
+        }
+        let (server, accepted_peer) = accept_named(listener)?;
+        let (r, len, out) = get_name(client, false);
+        let client_local = sin_parts(r, len, &out)?;
+        let (r, len, out) = get_name(server, true);
+        let server_peer = sin_parts(r, len, &out)?;
+        // `inet_csk_get_port`: the connected socket still owns its port.
+        let other = open(AF_INET, SOCK_STREAM, 0)?;
+        let busy = bind(other, &sin(AF_INET, LOOPBACK, CLIENT_PORT));
+        close(server);
+        close(client);
+        let free = bind(other, &sin(AF_INET, LOOPBACK, CLIENT_PORT));
+        close(other);
+        close(listener);
+        if client_local != (LOOPBACK, CLIENT_PORT) {
+            return Err("a bound client's getsockname lost its name on connect");
+        }
+        if server_peer != (LOOPBACK, CLIENT_PORT) || accepted_peer != (LOOPBACK, CLIENT_PORT) {
+            return Err("the server does not see the client's bound name as its peer");
+        }
+        if busy != Some(EADDRINUSE_ERR) {
+            return Err("a connected socket's local port must stay reserved (EADDRINUSE)");
+        }
+        if free != Some(0) {
+            return Err("the client's port was not released when it closed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_names",
+    smoke_abi_socket_names_tcp_loopback_bound_client
+);
+
+/// The IPv6 loopback four-tuple, as for IPv4: `tcp_v6_connect` sources the
+/// connection from `::1` with an ephemeral port and `inet6_getname` reports
+/// it from both ends.
+fn smoke_abi_socket_names_tcp6_loopback_accept() -> TestResult {
+    with_setup(|| {
+        const PORT: u16 = 42_625;
+        let name6 = |fd: u64, peer: bool| -> Result<([u8; 16], u16), &'static str> {
+            let (r, len, out) = get_name(fd, peer);
+            if r != Some(0) || len != 28 {
+                return Err("an AF_INET6 name was not reported as a 28-byte sockaddr_in6");
+            }
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&out[8..24]);
+            Ok((addr, u16::from_be_bytes([out[2], out[3]])))
+        };
+        let mut loopback = [0u8; 16];
+        loopback[15] = 1;
+        let listener = open(AF_INET6, SOCK_STREAM, 0)?;
+        if bind(listener, &sin6(AF_INET6, PORT, false)) != Some(0) || listen(listener) != Some(0) {
+            return Err("IPv6 loopback listener setup failed");
+        }
+        let client = open(AF_INET6, SOCK_STREAM, 0)?;
+        if connect(client, &sin6(AF_INET6, PORT, false)) != Some(0) {
+            return Err("IPv6 loopback TCP connect failed");
+        }
+        let server = match sys(Syscall::SocketAccept, a2(listener, 0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("accept() of a completed IPv6 loopback connection failed"),
+        };
+        let client_local = name6(client, false)?;
+        let client_peer = name6(client, true)?;
+        let server_local = name6(server, false)?;
+        let server_peer = name6(server, true)?;
+        close(server);
+        close(client);
+        close(listener);
+        if client_peer != (loopback, PORT) || server_local != (loopback, PORT) {
+            return Err("the listening end of an IPv6 loopback connection is not [::1]:port");
+        }
+        if client_local.0 != loopback || client_local.1 == 0 {
+            return Err("IPv6 client getsockname is not ::1 with an ephemeral port");
+        }
+        if server_peer != client_local {
+            return Err("IPv6 accepted socket getpeername is not the client's local name");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_names",
+    smoke_abi_socket_names_tcp6_loopback_accept
+);
+
 // ──────────────────────── getsockopt / setsockopt ────────────────────────
 
 /// INET getsockopt levels: `do_ip_getsockopt` / `do_tcp_getsockopt` default

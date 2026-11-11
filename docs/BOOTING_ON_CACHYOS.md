@@ -172,335 +172,36 @@ does not copy or convert the installed CachyOS system. ext4 is the default
 because it is the most exercised persistent-root path. Use this only after the
 non-partitioned ISO has established that the machine reaches NARF at all.
 
-## RX 6750 XT bring-up boot
+## Boot image with persistent logging
 
-Recipe for the Navi22 (RX 6750 XT, `03:00.0`) bring-up on the Gigabyte B650I
-AORUS ULTRA (BIOS F41). The console lives on the Raphael iGPU (`12:00.0`); the
-6750 XT is a secondary GPU whose cold boot cannot take the screen away. The
-stick saves the NARF kernel log to itself, so a failed boot can be read back
-under CachyOS. The stick boots with `narf.disks=boot-only`, which keeps the
-internal disks read-only; see
-[Internal-disk safety](#internal-disk-safety-narfdisksboot-only) for exactly
-what that guarantees.
-
-**Build** (no device access; the importer copies only the Navi22 blobs):
+A USB image can retain the kernel log for inspection after returning to
+CachyOS. Build it with the firmware required by the target machine; see
+[Firmware for a hardware-specific test image](#firmware-for-a-hardware-specific-test-image).
+No particular CPU, GPU, network adapter or PCI address is required by this
+workflow.
 
 ```sh
-cargo xtask import-firmware --source /usr/lib/firmware \
-  --vendor amdgpu/navy_flounder --skip-existing
-cargo xtask usb-image --initramfs-firmware "amdgpu/navy_flounder*"
+cargo xtask usb-image
+# Add --initramfs-firmware "<device-firmware-pattern>" for each needed family.
 ```
 
-This writes `target/narf-x86_64-usb.img`: an MBR disk with one FAT32 ESP
-(label `NARFBOOT`) holding Limine, the kernel, an initramfs with the
-`navy_flounder` firmware (the Navi22 initcall runs before any root mount) and
-`/NARFLOG.ID`. The kernel command line gets `narf.disks=boot-only
-narf.bootlog=<random token> log_buf_len=8M` and no `quiet`. Add arguments with `--cmdline <arg>`
-(repeatable); build without the log with `--no-bootlog`. Adding `--qemu` also
-boots a copy of the image under OVMF as QEMU USB storage and prints the logs
-it wrote; those boots also attach decoy internal disks (an NVMe with a GPT
-ESP, an ext4 marked `needs_recovery` and a btrfs, plus a whole-disk ext4 on
-SATA) and fail unless their SHA-256 is unchanged afterwards.
+The output is `target/narf-x86_64-usb.img`. It contains the loader, kernel,
+initramfs and `/NARFLOG.ID`. The generated command line includes
+`narf.disks=boot-only`, a random `narf.bootlog` token and `log_buf_len=8M`.
+The kernel writes its log only to the matching removable log partition.
+`--no-bootlog` disables this; `--qemu` rehearses the image with disposable
+internal-disk decoys. These checks establish software behavior rather than
+physical driver coverage.
 
-**BIOS settings:**
-
-- *Settings → IO Ports → Initial Display Output*: **IGD Video**, so the UEFI
-  GOP, Limine and the NARF console are on the motherboard HDMI.
-- *Settings → IO Ports → Integrated Graphics*: **Enabled** (Auto can disable
-  the iGPU while a discrete card is installed).
-- *Boot → CSM Support*: **Disabled** (the stick is UEFI-only).
-- *Boot → Secure Boot*: **disabled** for this test, because the stick is
-  unsigned (see [UEFI Secure Boot](SECURE_BOOT.md)). This host currently
-  reports it disabled: `od -An -t u1
-  /sys/firmware/efi/efivars/SecureBoot-*` ends in `0`.
-- Choose the stick once from the boot menu (F12) instead of changing the boot
-  order, so CachyOS stays the default.
-
-**Cabling:** connect the monitor to the **motherboard HDMI**. A second cable
-from the monitor to the 6750 XT's HDMI is optional and matters only once
-native modeset lands. Attach a USB keyboard for the NARF shell.
-
-If Limine reports `Could not find viable load address for executable` before
-NARF starts, check the ELF's full `PT_LOAD` memory spans with `readelf -lW`.
-This board reserves physical `[0x099ff000, 0x0a000000)`. The production image
-outgrew its former 32 MiB load placement and its final segment, including
-`.bss`, overlapped that reservation. The x86_64 linker now starts the image
-at 256 MiB. Rebuild old kernels when testing this board; changing a menu's
-file path alone does not change an executable's load addresses.
-
-For a KDE boot, a successful PCI probe and the presence of `/dev/dri/card0`
-do not establish acceleration readiness. Check the later
-`amdgpu: navi22 preflight refused:` line before diagnosing KWin or Qt plugin
-errors. This MSI RX 6750 XT's VBIOS `113-MSITV398MH.310` supplies a version-6
-PowerPlay payload; the generic Navy Flounder firmware SKU supplies version 1.
-Both use the same 2470-byte table and 1668-byte SMC layout. NARF accepts both
-versions while retaining board-source selection and power/thermal checks.
-Native graphics initialization and the graphical login still require a
-successful hardware boot; a VM smoke does not exercise those paths.
-
-On this board, discovery reports two distinct engines as `SDMA0:0` and
-`SDMA1:0`. Queue preparation normalizes the hardware ID and its local instance
-before checking for duplicate engines. The connector GPIO LUT also identifies
-DDC pairs through DATA bit 8; that selects the same AUX/I2C channel as CLOCK
-bit 0. Rejecting either valid encoding previously stopped queue preparation
-with `Queues(Unsupported)` and display routing with `Inventory(Unsupported)`.
-
-The subsequent hardware boot completed nine of the 31 cold-boot checkpoints,
-then stopped at `Graphics`: PSP returned DMCUB type 51 entry `0x82fee00100`,
-outside the newly allocated TMR `[0x8002300000, 0x8002d00000)`. Linux preserves
-PSP's separate secure CW0/CW1 windows. NARF now carries their pre-allocation
-inventory through boot and recovery: DMCUB may use the exact reserved CW0,
-and startup validates each complete secure window against its corresponding
-reservation or TMR without changing those registers. VCN still requires TMR.
-This correction requires another native hardware test before claiming progress
-beyond `Graphics` or a working graphical login.
-
-After synchronizing the kernel selected by the host's Limine entry, the
-2026-10-22 boot passed `Graphics`, `RlcBoot`, GFX/SDMA queues and IB tests:
-26 of 28 reported checkpoints completed. `DmubStart` degraded with `Invalid`,
-then `Media(DeviceGone)` stopped startup and quarantined the framebuffer.
-The DMCUB and VCN payloads in that boot's firmware initramfs match the host
-Linux Navy Flounder files byte for byte. The next corrections retain the
-PSP-reported executable extent, reserve complete freshly programmed secure
-windows, and power VCN tiles before reading their gated status register.
-Their register-model tests do not establish a working hardware display.
-
-In the same boot, root mounting took 4314 ms and GPU startup took 52899 ms.
-At uptime 54 s the capture still showed journal flush, Plymouth's writable-root
-notification and userdb credential loading running, with `sysinit.target`,
-`basic.target` and PlasmaLogin waiting. That snapshot does not establish
-Btrfs as the cause of the later userspace wait; no graphical-login success
-has been recorded.
-
-The next capture (`plasma-8aeb8863-b279-479e-b112-feca3ff5cc50`) confirms
-that the new diagnostic kernel ran but still stopped at 26/28 checkpoints.
-DMCUB CW0 read as entirely zero. VCN's first all-ones read was at BAR5 byte
-offset `0x1fd58`: discovery base `0x7e00` plus `UVD_VCPU_CNTL` dword `0x156`,
-not UVD_STATUS. Linux uses a masked read/modify/write for this control word
-without rejecting that value. NARF now preserves the unselected bits and
-checks independent GC/NBIO presence before accepting an all-ones VCPU control
-read; status and wait registers still reject all ones. Regression cases cover
-both control updates on a live GPU and disappearance before the write.
-This correction still requires hardware validation. The DMCUB zero-window
-failure remains unresolved; its diagnostic now includes the PSP image extent
-and inherited secure reservations, without changing secure window registers.
-
-That capture also shows journal flush completing around uptime 62.7 s,
-system tmpfiles completing around 69.5 s, and the journal catalog completing
-around 75 s. The linker-cache rebuild was still running at the end of the
-readable kernel capture; it contains no PlasmaLogin start. The earlier
-journal/userdb/Plymouth snapshot therefore does not establish a permanent
-sysinit deadlock.
-
-The working-Linux comparison after that boot found DMCUB enabled, out of reset,
-and ready (`DMCUB_SCRATCH0 = 3`) while all eight CW0/CW1 registers also read
-zero. `UVD_VCPU_CNTL` and the gated GC `GB_ADDR_CONFIG` both read all ones.
-NARF therefore cannot use either observation alone as evidence of failure.
-The corrected DMUB path accepts wholly zero secure readback only with this
-PSP session's authenticated full image, matching upload size and retained
-memory ownership, then still requires a fresh ready publication and mailbox
-proof. Readable and partially readable windows retain their bounds checks.
-VCN presence uses NBIO's memory-size and aperture registers instead of GC.
-The captured root was `btrfs / ... rw`, and diagnostic files were persisted;
-the service snapshot still had PlasmaLogin waiting. These corrections have
-not yet established a working hardware graphical login.
-
-The next capture (`plasma-cbd60c86-9b79-479e-a512-fe4a80eb0ea2`)
-completed `DmubStart`, including firmware version and feature-capability
-mailbox replies. Startup reached 30/31 checkpoints, exposed the framebuffer,
-and read a 256-byte HDMI EDID with a preferred 3840x2160 mode. VCN degraded
-with `BootFailed(0)` but no longer quarantined display startup. Native HDMI
-then failed at `Clocks` with `Block(Rejected(255))`; a working native mode
-and graphical login are still unverified.
-
-The DAL clock preparation now follows Linux's `dcn3_update_clocks`: it omits
-the separate SOC/FCLK floors and unused DF C-state command, retains strict
-DCF/UCLK/PIX/DISP floor validation, and tolerates firmware rejection of the
-optional display-count and deep-sleep hints. Transport failures still abort.
-Each rejected command logs its message, argument and response so another
-clock failure identifies the exact request rather than only `Rejected(255)`.
-The captured error predates that diagnostic and does not identify which
-of the old requests was refused. Register-model tests cover the corrected
-request sequence and refused optional notifications; they do not establish
-native hardware modesetting success.
-
-The subsequent clock-request audit covers the Navi22 DAL and GFX PPSMC
-mailboxes plus the native display's PLL, DPP/DP and audio DTO paths against
-Linux `ecd997b0189a`. It does not cover other GPU families. The checks include
-message/register IDs, clock IDs, units and packing, request ordering, board
-bounds, response handling and cancellation ownership:
-
-| Request or path | Linux comparison and result |
-| --- | --- |
-| DAL startup `0x2/0x3/0x4/0xb` | `dcn3_init_clocks`: versions and scalar MHz levels; header/interface and level-query refusals are tolerated; usable ranges remain required for admission. NARF does not query unused DTBCLK. |
-| DAL display floors `0x9`, hints `0xd/0xe` | `dcn3_update_clocks`: DCF/UCLK/PIX/DISP, ceil(kHz/1000), clock ID shifted by 16. Required floors remain strict; notifications tolerate refusal. Joint setup now reports all admitted streams instead of always one. |
-| DP PHYCLK floor | `dcn30_notify_link_rate_change`: link code × 27000 kHz, no lower than the board minimum, covering all links. NARF conservatively retains the highest successful link request until GPU restart. Requests above the board maximum now fail before writing. |
-| Runtime clock operations | PHY and optional memory floors, watermark messages and audio PME now retain in-flight ownership across cancellation, including when firmware replies after the future is dropped. |
-| GFX PPSMC range/control | `smu_v11_0`: GFXCLK ID 0, UCLK ID 2; min/max queries in MHz; SoftMax then SoftMin, `0xffff/0` for automatic mode. Separate GFX and DAL mailbox registers/message spaces match Linux. |
-| Display DPM and power saving | `sienna_cichlid` feature IDs and board masks match; required protections stay enabled. Current display admission refuses FCLK switching, deep sleep and hub power gating. Their optional paths are not evidence of hardware readiness. |
-| HDMI PHY PLL | `dcn3_program_pix_clk` → `dce112_program_pix_clk` → `set_pixel_clock_v7`: target in 100 Hz, combo PLL/CRTC/encoder IDs, XTALIN 0 and deep-colour ratio 0 match. DCN's resource builder leaves `SUPPORT_YCBCR420` unset; the generic helper's YUV420 flag is therefore not added. |
-| DENTIST and DPP DTO | `dcn20_update_clocks_update_dentist` / `dccg2_update_dpp_dto`: divider IDs, completion bits, bounded waits, phase = ceil(255 × requested/reference), modulo 255. NARF retires consumers before changing dividers. |
-| DP pixel DTO | `dcn3_program_pix_clk`: 730 MHz DPREFCLK, optimized-rate entries, otherwise pixel Hz/reference Hz; no VBIOS PLL request for DP. |
-| HDMI/DP audio DTO | `dce110_populate_audio_dto_parameters` / `dce_aud_wall_dto_setup`: HDMI's lowest active OTG drives DTO0; DP uses DPREFCLK/DTO1. HDMI audio now uses the 4:2:0-halved requested clock without deep-colour PLL scaling. |
-| PMFW watermarks and audio wake | DAL `0x5/0x6/0x8` carries the retained watermark address/table 1; `0x11` is optional audio PME. Watermark failure refuses dependent power-saving admission; it does not prove a display-clock failure. |
-
-The Rust kernel regressions cover every required display-floor rejection,
-frequencies outside board bounds before writes, stream counts, interrupted
-runtime operations and HDMI audio clock selection. Linux source annotations
-retain the comparison's provenance; they are not an executable validation
-language. Hardware acceptance of these requests, native modesetting and the
-KDE login remain unverified by this source audit.
-
-The discrete GPU handoff also establishes the x86_64 TSC duration scale before
-firmware startup. Its Late initcall precedes the normal HPET/timer-IRQ setup;
-using the identity scale there shortens hardware waits and inflates reported
-milliseconds on a >1 GHz TSC. A missing calibration source now refuses the
-handoff with `Clock` before GPU writes. For older captures, retain the raw
-`cyc` total and the later calibrated Hz when interpreting elapsed time: the
-79,755,617,363-cycle RX 6750 XT capture at 4.7 GHz represents about 17 seconds,
-although its pre-calibration warning says 79,755 ms. That capture continued
-into systemd but does not establish a working physical display or KDE login.
-
-The modeset-to-power-saving audit checks the RX 6750 XT's live Linux discovery
-bases against the HDP, MMHUB, ATHUB, OSSSYS, SMUIO and GC addressing, and the
-register fields against Linux's headers. Its sequence follows Linux's IP order
-(common, GMC, IH, GFX, SDMA), with RLC safe mode around GC gating. The native
-modeset's one-frame settling delay and two-frame underflow watch also require
-the calibrated scale; the old waits ended within a fraction of one frame on
-this host. An immediate SCDC read is diagnostic, not proof of a physical image.
-
-A gating failure can leave earlier IP writes applied; the owner then refuses
-further gating transitions. It returns before the subsequent GFXOFF/deep-sleep
-feature enables and memory/fabric floor reductions. The new all-ones diagnostic
-includes the BAR5 address and preceding register-write count, distinguishing
-failure before any gating writes from a partial transition. The older
-`Gating(DeviceGone)` capture lacks that information, so its exact failure and
-the physical black screen remain unresolved by this source audit.
-
-The October 23 `plasma-25ea18c1-b779-479e-b312-fe4af7f58481` capture confirms
-early 4.7 GHz calibration and a reported native HDMI mode. It gets past the
-journal/Plymouth read-write jobs and attempts `kwin_wayland` at 172 seconds.
-The gating failure is `RLC_CGTT_MGCG_OVERRIDE`, BAR5 byte offset `0x3b120`,
-after ten writes; that register address matches the Linux GC 10.3 header.
-These observations do not establish a visible image or successful greeter.
-
-For that boot, the useful additional artifact was `/var/lib/plasmalogin/core`;
-there were no greeter text logs under its home. Its executable mappings match
-`/usr/lib/plasma-login-greeter`. The 46,096-byte file ends after 822 of 853
-program headers, before its notes, so it contains no saved fault registers or
-process-identity note. The core writer now places notes immediately after the
-ELF header, batches metadata into one sequential write, and emits a
-`coredump: fatal ...` kernel record before file I/O. This improves the next
-capture; it does not fix or identify the underlying greeter fault. Preserve
-the core's timestamp and collect the new record before planning another fix.
-
-The next capture, `plasma-3d4989b5-b779-479e-b312-fe4a7b24ccbb`, fails earlier:
-the journal records eight `SIGBUS` page faults in `timeout` and
-`systemd-executor`. Their instruction bytes match the installed dynamic
-loader at offset `0x1d778`, reading the first bytes of `/etc/ld.so.cache`.
-The mapping is readable/private, starts at `0x409000002000`, and covers
-`0x2e000` bytes; the loader's file-size operand is 187,287 bytes. `/core`
-now retains its notes and identifies another `systemd-executor` instance
-at that same loader offset. D-Bus startup times out; no Plasma start was
-saved for this boot. This is a file-backed demand-page refusal, not an
-unsupported instruction. The capture does not retain the backing filesystem
-error or inode, so its precise cause must not be inferred from SIGBUS alone.
-
-Two local checks expose relevant replacement defects. First, the VFS dentry
-table has 2,048 buckets but the old mutation guard records only 64 bits:
-high-bucket shifts panic in checked builds and miss the correct active-writer
-counter/generation in release builds. A lookup started before replacement
-can therefore publish a stale inode afterwards. Mutation tracking must span
-the full table. Second, the Btrfs retained-handle experiment reads a fresh
-replacement successfully but gets `NotFound` reading the replaced file
-through an existing handle, both before and after `syncfs`. At audit time,
-last-link replacement reclaimed the old inode immediately. Linux retains an
-unlinked inode and its data until its final open/mapping reference is gone.
-Correcting the dentry mask does not implement that missing Btrfs lifetime.
-The subsequent upstream Btrfs cache-generation change invalidates retained
-generic shared-cache pages; it does not preserve an unlinked inode. The
-failing loader mapping is private and enters the private demand-read branch,
-so that upstream change alone does not establish a fix for this refusal.
-
-The production Limine VM smoke validates built-in login/shell startup. It
-does not boot this installed KDE root or race `ldconfig` against process
-startup. The recent full CachyOS fixture attempts instead stop at a PID 1
-invalid-opcode fault because its loader uses AVX-512 absent from the TCG CPU.
-Neither result establishes working cache replacement. A representative gate
-must cover open/map/close, replacement before first touch, old and new
-contents through their respective handles, concurrent lookup publication,
-and a real dynamic executable after cache rebuild on writable Btrfs.
-The root smoke's `ldconfig | head | sed` command is a diagnostic report:
-it does not assert `ldconfig`'s exit status or concurrent loader correctness.
-
-The Btrfs file-loading fix retains shared inode metadata and a lifetime anchor
-for every node, including nodes held only by mappings. A separate open sees
-size changes immediately; async stat refreshes attributes from the tree.
-Replacement and unlink persist `nlink=0` with an `ORPHAN_ITEM`, leaving old
-handles and unfaulted mapping pages attached to their original data. Explicit
-sync, later operations and the commit timer reclaim an orphan after its final
-reference; a writable mount recovers persisted orphan items after a crash.
-Drop flushes accepted changes without starting an additional cleanup transaction.
-
-The regression tests cover old/new contents, writes through an unlinked open
-file, cross-open size changes, ordinary loader-style symlinks, and crash
-recovery on the CachyOS-shaped Btrfs fixture. The syscall-level QEMU case uses
-a small writable Btrfs fixture and exercises private mmap, fd close,
-replacement, first touch, new-file mapping and final-unmap reclamation. These
-checks address the file-loading defects; physical HDMI output and a completed
-KDE session still require native verification.
-
-**Write the stick.** Identify it first. It must show `TRAN usb`:
+Identify a dedicated USB device before writing it:
 
 ```sh
 lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINTS
-cargo xtask disk-write --iso target/narf-x86_64-usb.img \
-  --device /dev/sdX --fast-wipe
+cargo xtask disk-write --iso target/narf-x86_64-usb.img --device /dev/sdX
 ```
 
-`disk-write` refuses non-USB targets, asks for confirmation, and verifies the
-written bytes after a replug. On this host the internal disks are the two
-NVMe drives (the Sabrent data disk at `04:00.0` and the WD SN770 CachyOS disk
-at `07:00.0`; Linux names them `nvme0n1` / `nvme1n1` in either order, varying
-per boot) and the SATA disk `sda`. None of them is ever a valid `--device`.
-
-**What to expect on screen.** While the card boots, every Navi22 stage prints
-`start`, then `complete` or `failed <error>`. The cold boot ends with
-`amdgpu: navi22 stage summary (N/M ok):` followed by one line per
-stage, then the connector (EDID/HPD), media and thermal notes. If the screen stops changing, photograph it; the last `start` line
-names the stage that hung. Shortly after the shell appears, the console shows
-`bootlog: saving the kernel log to usb-msc0p1:/narf-boot-<n>.log`. To finish,
-log in (`root` / `narf`) and type `reboot` (or `poweroff`) in the NARF
-shell, which flushes the log one last time.
-Otherwise wait at least five seconds after the last line before powering off.
-
-**Retrieve the log** after booting back into CachyOS:
-
-```sh
-lsblk -o NAME,SIZE,TRAN,LABEL      # the NARFBOOT partition, e.g. sdX1
-udisksctl mount -b /dev/sdX1
-cp /run/media/$USER/NARFBOOT/narf-boot-*.log .
-udisksctl unmount -b /dev/sdX1
-```
-
-Each boot creates the next `narf-boot-<n>.log`, up to 32 files of at most
-4 MiB each; delete old ones to continue. Each line is prefixed with seconds
-since boot, as in `dmesg`. The kernel writes only to a USB FAT volume whose
-`/NARFLOG.ID` matches the token on its command line. To keep the stick
-read-only for one boot, press `e` in the Limine menu and change the argument
-to `narf.bootlog=off`.
-
-An unexpected power-off during bring-up is most likely the Navi22 thermal
-protection (SMU CTF or software-shutdown temperature), which calls the ACPI S5
-power-off on purpose. That path runs the same final flush as `reboot`, so the
-log should end with the `amdgpu: navi22 thermal ...` or `EMERGENCY` line that
-caused it, followed by `[bootlog: final flush before reboot/power-off]`.
-
-Limits: the stick becomes writable only once the USB stack runs, which is
-after the last boot initcall, including the 6750 XT cold boot. Lines logged
-before then are saved retroactively, but a hang *before* that point leaves
-only the screen. A kernel panic is appended in a final flush bounded at 3 s.
-A fatal CPU exception is not saved.
+After the attempt, inspect the saved log under CachyOS. Keep boot-specific
+logs and hardware inventories outside the general boot instructions.
 
 ### Internal-disk safety (`narf.disks=boot-only`)
 
@@ -527,8 +228,8 @@ A fatal CPU exception is not saved.
     `BootOnly` (`/` comes from the initramfs);
   - `efi-system-partition-mount`, which therefore never mounts the CachyOS ESP
     at `/boot`;
-  - `mnt-mount-ext2`, which never mounts an internal ext4 (such as the
-    Sabrent `nvme0n1p2`) at `/mnt`.
+  - `mnt-mount-ext2`, which never mounts an internal ext4 data partition
+    at `/mnt`.
 
   The btrfs member discovery skips unidentified disks too. The btrfs disk
   smokes additionally need `narf.btrfs_smoke`, which only xtask's own test
@@ -575,13 +276,10 @@ Limits. Exactly what this does and does not cover:
   identified stick sets only the VFS read-only flag. ext's mount-time
   superblock repair would still run there. On every other disk the device
   itself is read-only, so this does not arise.
-- **Current hardware coverage on this host.**
-  - NVMe: NARF drives every NVMe controller, numbered in PCI order: on this
-    host `nvme0` is `04:00.0` (Sabrent data disk) and `nvme1` is `07:00.0`
-    (WD SN770, the CachyOS disk). Every active namespace is registered as
-    `nvme<C>n<N>` and partition-scanned, so `nvme0n1p1`, `nvme0n1p2` (ext4
-    data), `nvme1n1p1` (the ESP) and `nvme1n1p2` (btrfs root) are all
-    registered, read-only.
+- **Device enumeration.**
+  - NVMe controllers are numbered in PCI order. Every active namespace is
+    registered as `nvme<C>n<N>` and partition-scanned. Under `boot-only`,
+    internal namespaces and partitions remain read-only.
   - **Names are not identity.** A controller that fails to probe, a moved
     drive or a firmware that enumerates differently shifts every later name.
     Identify disks by filesystem UUID or PARTUUID (`/dev/disk/by-uuid`,
@@ -615,8 +313,7 @@ by a device name:
 ```sh
 # Read-only root, writable tmpfs overlay (nothing on any disk is written):
 cargo xtask grub-image --arch=x86_64 \
-  --initramfs-firmware "amdgpu/navy_flounder*" \
-  --root-policy root-ro --root-uuid 653602c3-cd42-420e-95ef-4c4033d17b56 \
+  --root-policy root-ro --root-uuid <ROOT_UUID> \
   --rootflags subvol=/@ --bootlog-token <token> \
   --cmdline-extra "systemd.unit=multi-user.target fsck.mode=skip"
 # Real read-write to the btrfs root ONLY: the same, with --root-policy root-rw.
@@ -637,8 +334,9 @@ device NARF does not have), then
   without them boots NARF's own userspace and ignores `systemd_pid1`. Passing
   them explicitly with `--features boot-init,cgroup-all,container,firmware-allow-unsigned`
   is equivalent.
-- `--initramfs-firmware "amdgpu/navy_flounder*"` puts the RX 6700 XT's
-  firmware in the initramfs, so the display comes up before the root mounts.
+- Add `--initramfs-firmware "<device-firmware-pattern>"` when an installed
+  device needs firmware before the root mounts. Repeat it for other devices;
+  the boot procedure does not require a particular GPU or network adapter.
 - `--bootlog-token <token>` adds `narf.bootlog=<token>` (8-64 characters of
   `[A-Za-z0-9_-]`) for the persistent boot log described below.
 - `--cmdline-extra` (repeatable) appends arguments. For the first trials use
@@ -665,8 +363,8 @@ device NARF does not have), then
   writable`.
 - **`root-rw` writes exactly one partition.** Only the designated root
   partition's block-layer guard passes writes. Every other disk and
-  partition is refused: the SN770's whole-disk device and its ESP
-  (`6D89-28C5`, which may be mounted read-only), the Sabrent, `sda`, and the
+  partition is refused, including the root partition's containing disk,
+  the ESP, other data disks, and the
   `/dev/nvme<C>` passthrough nodes. vfat filesystems also report themselves
   read-only to the VFS under both root policies, so they mount `ro`.
 - **The boot-log stick is the one exception, under both policies.** With
@@ -714,7 +412,7 @@ device NARF does not have), then
   shows a pending log tree (an unclean Linux shutdown), an error flag, or a
   running balance or replace. Compare with the real superblock using `sudo
   btrfs inspect-internal dump-super
-  /dev/disk/by-uuid/653602c3-cd42-420e-95ef-4c4033d17b56`.
+  /dev/disk/by-uuid/<ROOT_UUID>`.
 - **What the writer does to a CachyOS volume.**
   - New data is written uncompressed, which is valid under
     `compress=zstd:1`.
@@ -855,6 +553,70 @@ policy and logs each unsigned handout. A distribution build must instead sign
 the wrapped payloads and embed the authorized public keys as described in the
 [firmware specification](../firmware/specification/spec.md). Never treat a
 blob's presence in CachyOS as proof that the matching NARF driver is complete.
+
+#### Linux wireless regulatory database
+
+NARF includes the standard upstream `wireless-regdb` database and verifies
+its `regulatory.db.p7s` signature during the build against the public
+certificates shipped by Linux. Install the OpenSSL CLI on the build host.
+No private key, separate NARF policy signing setup or extra initramfs
+firmware selection is needed for the default database.
+
+Boot starts with the database's world (`00`) rules. `iw reg get` reports the
+active shared policy. A privileged `iw reg set CC` selects an actual country
+from the authenticated database; use the country where the device operates.
+The driver still applies its hardware, calibration, power and channel limits.
+Policy changes may require a driver restart under its existing safety rules.
+Unsupported rule features are conservatively excluded or rejected; this
+does not establish complete Linux radio compatibility.
+
+To use an updated upstream-signed database from the installed Linux package,
+set the directory when building:
+
+```sh
+NARF_WIRELESS_REGDB=/usr/lib/firmware \
+  cargo xtask image --arch=x86_64
+```
+
+Keep the device's required vendor-firmware selections. The directory must
+contain both `regulatory.db` and `regulatory.db.p7s`; a missing or invalid
+signature fails the build. Trust comes from the fixed upstream public
+certificates, never a certificate supplied inside the signature. Rebuild
+to incorporate database updates; runtime loading of replacement Linux
+databases is not implemented. See [asset provenance and update rules](../firmware/regdb/README.md).
+
+An explicit signed deployment policy can still override the Linux default.
+Its country and channel/power rules use [NRGD format](../wireless/specification/spec.md#35-deployment-regulatory-policy),
+with a detached Ed25519 signature over `BLAKE3(payload)` (64 raw bytes) and
+a raw 32-byte public key. Package that policy using:
+
+```sh
+cargo xtask pack-firmware \
+  --name wireless-regulatory.bin \
+  --payload /absolute/path/deployment/policy.nrgd \
+  --signature /absolute/path/deployment/policy.sig \
+  --public-key /absolute/path/deployment/signer.pub
+```
+
+For this optional override, the kernel must also trust that public key. Set
+`NARF_FIRMWARE_TRUSTED_KEYS` to an absolute path to a text file containing
+one 64-digit hexadecimal Ed25519 public key per line; this is separate from
+the raw public-key file used by `pack-firmware`. An unconfigured build trusts
+no firmware signers. Include the policy in the early firmware selection:
+
+```sh
+NARF_FIRMWARE_TRUSTED_KEYS=/absolute/path/deployment/trusted-keys.txt \
+  cargo xtask image --arch=x86_64 \
+  --initramfs-firmware wireless-regulatory.bin
+```
+
+Signing is external to the image builder; it does not need the private key.
+The unsigned vendor-firmware allowance does not permit an unsigned deployment
+override. A rejected explicit policy prevents boot fallback to the world
+domain; a country hint cannot relax an active deployment override. Runtime
+policy staging does not revoke an already active snapshot: its trusted owner
+must clear or replace the shared installation under the driver's existing
+policy-change rules.
 
 #### QCNFA765 / WCN6855 (`17cb:1103`) first radio pass
 
@@ -1086,9 +848,9 @@ cargo xtask cachyos-gate --real-root /mnt/sabrent/narf-gatec/cachyos-root-copy.i
 
 | Piece | Gate | Host |
 | --- | --- | --- |
-| Machine | QEMU q35, OVMF (split CODE + a private VARS copy, so OVMF never writes `\NvVars` to an ESP), 4 vCPUs, 4 GiB, KVM when `/dev/kvm` is usable | B650I, UEFI |
-| NVMe controller 1 (`00:04.0`) | Decoy GPT disk: vfat p1 (1 MiB) + ext4 p2 (64 MiB, one file), like the Sabrent | Sabrent Rocket 4.0 (`04:00.0`) |
-| NVMe controller 2 (`00:07.0`) | Root disk: GPT vfat ESP p1 + btrfs p2, `boot` device | WD SN770 (`07:00.0`) |
+| Machine | QEMU q35, OVMF (split CODE + a private VARS copy, so OVMF never writes `\NvVars` to an ESP), 4 vCPUs, 4 GiB, KVM when `/dev/kvm` is usable | A supported UEFI machine |
+| NVMe controller 1 (`00:04.0`) | Decoy GPT disk: vfat p1 (1 MiB) + ext4 p2 (64 MiB, one file), separate from the root | An additional data disk |
+| NVMe controller 2 (`00:07.0`) | Root disk: GPT vfat ESP p1 + btrfs p2, `boot` device | The selected root disk |
 | USB stick | MBR FAT32 with `/NARFLOG.ID` for `narf.bootlog=` | The bring-up stick |
 | Boot chain | OVMF -> GRUB -> the bundle's `grub.cfg` stanza -> Limine (`/EFI/NARF/BOOTX64.EFI`) -> NARF | CachyOS GRUB -> the same stanza |
 
@@ -1202,7 +964,7 @@ a real copy of the host root (Gate C).
 ### Gate C: a real copy of the host root
 
 Gate C runs the same matrix against a byte-level copy of the host's own `@`
-(and optionally `@home`). Build the copy once, on the Sabrent's ext4 data
+(and optionally `@home`). Build the copy once, on a separate ext4 data
 partition (`/mnt/sabrent`, about 519 GB free). These are the only commands
 in this workflow that need `sudo`. They read the live root through read-only
 snapshots and write only the image file through a loop device. The copy gets
@@ -1214,8 +976,8 @@ set -eu
 SAB=/mnt/sabrent
 DIR=$SAB/narf-gatec
 IMG=$DIR/cachyos-root-copy.img
-HOST_FSID=653602c3-cd42-420e-95ef-4c4033d17b56   # live root; never reused
-HOST_ESP=6D89-28C5
+HOST_FSID=<ROOT_UUID>   # live root; never reused
+HOST_ESP=<ESP_UUID>
 sudo mkdir -p "$DIR" && sudo chown "$USER": "$DIR"
 
 # 1. A sparse GPT disk: 512 MiB ESP + btrfs sized for the root's data + 40 GiB.
@@ -1254,7 +1016,7 @@ sudo btrfs subvolume delete /mnt/narf-gatec/@narf-gatec-root
 sudo btrfs subvolume delete /mnt/narf-gatec/@narf-gatec-home 2>/dev/null || true
 
 # 5. Inside the COPY only: fstab names the copy's UUIDs; every other UUID line
-#    (the Sabrent, other disks) is commented out. Gate login root/narf.
+#    (other data disks) is commented out. Gate login root/narf.
 F=/mnt/narf-gatec/@/etc/fstab
 sudo sed -i -e "s/$HOST_FSID/$NEW_FSID/g" -e "s/$HOST_ESP/$NEW_ESP/g" "$F"
 sudo awk -v a="UUID=$NEW_FSID" -v b="UUID=$NEW_ESP" \
@@ -1291,24 +1053,31 @@ gets in the way of the serial login, run `sudo ln -sfn
 
 ## Booting the installed CachyOS root
 
-NARF can boot the CachyOS installation on the WD SN770 (`07:00.0`, btrfs root
-`653602c3-cd42-420e-95ef-4c4033d17b56`) with the installed systemd as PID 1,
+NARF can boot a supported installed CachyOS root, selected by its filesystem
+UUID, with the installed systemd as PID 1,
 mount its fstab, and reach a getty login on `tty1`. GRUB's default entry stays
 CachyOS. NARF is a one-shot entry chosen from the boot menu, so rolling back
 means rebooting and taking the default entry.
 
 ### Command lines
 
+Find the current machine's values with `findmnt -no UUID /`,
+`findmnt -no UUID /boot/efi` (or the actual ESP mount point), and
+`findmnt -no FSROOT /`. Replace `<ROOT_UUID>` and `<ESP_UUID>` below.
+The `subvol=/@` examples apply to a Btrfs `@` root; adapt or omit
+`rootflags` for the actual layout. Firmware selections are optional and
+must match the installed devices.
+
 First trial, read-only:
 
 ```text
-narf.disks=root-ro root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
+narf.disks=root-ro root=UUID=<ROOT_UUID> rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
 Read-write, after the root-ro trial worked:
 
 ```text
-narf.disks=root-rw root=UUID=653602c3-cd42-420e-95ef-4c4033d17b56 rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
+narf.disks=root-rw root=UUID=<ROOT_UUID> rootflags=subvol=/@ systemd_pid1 systemd.zram=0 systemd.unit=multi-user.target fsck.mode=skip
 ```
 
 `cargo xtask grub-image --root-policy root-ro|root-rw --root-uuid <uuid>
@@ -1343,7 +1112,7 @@ mounted writable unless the command line says `ro`.
     writable mount of a read-only disk with `EROFS`, so `mount(8)` retries
     read-only, as for a write-protected disk on Linux. Under `root-rw` they
     are writable views of one shared btrfs instance.
-  - `/boot/efi`: the ESP (`6D89-28C5`) is checked by `fsck.vfat` and
+  - `/boot/efi`: the ESP (`<ESP_UUID>`) is checked by `fsck.vfat` and
     mounted read-only. NARF never writes it, under either policy.
   - `/tmp` is tmpfs.
 - **udev.** udev sees the NVMe partitions, their filesystem UUIDs, input and
@@ -1360,7 +1129,7 @@ mounted writable unless the command line says `ro`.
 
 The maintained collector lives in `verification/data/host-capture/`. It runs
 only with `narf.disks=root-rw` and preserves independent kernel, journal,
-service, seat and process streams under `/narf-diagnostics/plasma-<boot-id>`.
+service, seat, process and network streams under `/narf-diagnostics/plasma-<boot-id>`.
 Build its userspace stream helper on the target distribution:
 
 ```sh
@@ -1369,15 +1138,18 @@ cc -O2 -std=c11 -Wall -Wextra -Werror \
   verification/data/host-capture/narf-capture-stream.c \
   -o target/host-capture/narf-capture-stream
 python3 verification/data/host-capture/test_batch_stream.py
+python3 verification/data/host-capture/test_network_capture.py
 bash -n verification/data/host-capture/narf-plasma-capture
+bash -n verification/data/host-capture/narf-network-capture
 ```
 
 For a host that already has `narf-plasma-capture.service` enabled, update
-both executables together; `install -b` retains the previous files:
+all three files together; `install -b` retains the previous files:
 
 ```sh
 sudo install -b -m 0755 target/host-capture/narf-capture-stream \
-  verification/data/host-capture/narf-plasma-capture /usr/local/libexec/
+  verification/data/host-capture/narf-plasma-capture \
+  verification/data/host-capture/narf-network-capture /usr/local/libexec/
 ```
 
 For a first installation, also install and enable the service:
@@ -1389,7 +1161,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable narf-plasma-capture.service
 ```
 
-Version `10-buffered-stream-helper` corrects a diagnostic observer effect.
+Version `12-network-pci-init-audit` extends the independent `network.log` for the
+first few minutes. It records PCI network devices even when driver probe
+failed, bridge identity and first-sample PCI configuration/topology, interface counters, packet/UDP socket and routing state,
+NetworkManager/WPA logs, and read-only ethtool link, queue, offload,
+statistics and register queries. Each query has a timeout and records its
+exit status; a stuck network tool cannot block the other capture streams.
+The queries use the legacy ethtool ioctl ABI for NARF compatibility. The
+register dump contains queue heads/tails for diagnosing a carrier-up NIC
+that cannot complete DHCP. It requests no self-tests or configuration
+changes. To collect a Linux baseline without starting the boot collector:
+
+```sh
+bash verification/data/host-capture/narf-network-capture --once \
+  > target/host-capture/network-linux.log 2>&1
+```
+
+Version `10-buffered-stream-helper` corrected a diagnostic observer effect.
 The previous shell stream reader issued roughly one read per byte, and
 shell `printf` split buffered samples into many small writes. The helper
 batches both reads and writes in 16 KiB blocks, flushes partial blocks after
@@ -1404,8 +1192,31 @@ performance measurements or physical Plasma acceptance.
 
 This collector update does not require a kernel rebuild. Keep the kernel
 revision and collector version separately recorded when assessing a boot.
+The IGC driver also prints a descriptor snapshot on its first TX watchdog
+timeout, before recovery resets the queues. That driver diagnostic requires
+the updated kernel. The `[igc]` lines include CPU/DMA ring addresses, the
+oldest pending TX descriptor, the next software RX descriptor, hardware
+heads/tails, writeback controls and PCIe device control/status. These are
+read-only samples of live DMA state, not completion or quiescence proofs.
 An abrupt reset can lose the last buffered fragment and unsynced filesystem
 data; retained logs alone do not establish exactly when the machine stopped.
+
+### Investigating network and permission failures
+
+Use the collected `network.log` and kernel stream to distinguish PCI probe,
+interface registration, link, address configuration and packet-delivery
+failures. The collector records PCI topology, legacy ethtool status/counters
+and NetworkManager state, including endpoints with no published interface.
+Firmware readiness and physical carrier alone do not prove packet delivery.
+
+Keep per-boot logs, machine identifiers, image hashes and investigation notes
+in local ignored artifacts such as `target/host-narf/`. The boot procedure
+uses the current machine's root UUID, ESP and selected device firmware.
+
+For a sudo permission error, collect `stat /usr/bin/sudo` and
+`findmnt --target /usr/bin/sudo` under both kernels. Compare the reported
+owner/mode and mount policy before changing the installed file: a filesystem
+metadata or exec-credential bug can hide an existing setuid bit.
 
 ### What fails, and why that is harmless
 
@@ -1449,7 +1260,7 @@ GRUB's default entry is CachyOS, so a reboot without touching the menu goes
 back to Linux. After a `root-ro` boot nothing needs undoing. After a
 `root-rw` boot, a `btrfs subvolume snapshot` taken before is the rollback
 point. NARF writes nothing outside the root partition: not the ESP, the
-Sabrent or `sda`.
+other data disks.
 
 ### QEMU rehearsal (no root needed, no host disk touched)
 

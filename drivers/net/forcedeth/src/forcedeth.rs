@@ -563,7 +563,7 @@ const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
 fn tx_stalled(posted_at: &[u64; RING_LEN], now: u64, timeout: u64) -> bool {
     posted_at
         .iter()
-        .any(|&posted| posted != 0 && now.wrapping_sub(posted) > timeout)
+        .any(|&posted| posted != 0 && now.saturating_sub(posted) > timeout)
 }
 
 /// Clear a slot's post time only if it still holds the stamp this

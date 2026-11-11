@@ -33,6 +33,7 @@
 //! `/sys/class/rtc/rtc0/`.
 
 use alloc::boxed::Box;
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
@@ -41,6 +42,22 @@ use crate::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 pub const RTC_MAJOR: u32 = 254;
 /// Minor number for `rtc0`.
 pub const RTC_MINOR: u32 = 0;
+
+// Ownership belongs to the devtmpfs inode, not a particular open. Each
+// lookup constructs a fresh DevRtc, so udev's changes must be shared.
+#[derive(Clone, Copy)]
+struct RtcNodeMetadata {
+    uid: u32,
+    gid: u32,
+    perms: u16,
+}
+
+static RTC_NODE_METADATA: IrqSafeSpinLock<RtcNodeMetadata> =
+    IrqSafeSpinLock::new(RtcNodeMetadata {
+        uid: 0,
+        gid: 0,
+        perms: 0o644,
+    });
 
 // ── `struct rtc_time` (uapi/linux/rtc.h) ──────────────────────────────
 //
@@ -266,10 +283,27 @@ impl FileOps for DevRtc {
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: 0o644,
+                perms: RTC_NODE_METADATA.lock().perms,
             },
             mtime_cycles: 0,
         }
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        let metadata = RTC_NODE_METADATA.lock();
+        (metadata.uid, metadata.gid)
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        let mut metadata = RTC_NODE_METADATA.lock();
+        metadata.uid = uid;
+        metadata.gid = gid;
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        RTC_NODE_METADATA.lock().perms = perms & 0o7777;
+        Box::pin(async { Ok(()) })
     }
 
     fn rdev(&self) -> u64 {
@@ -342,7 +376,38 @@ pub fn sysfs_since_epoch_string() -> alloc::string::String {
 
 mod tests {
     use super::*;
+    use crate::FsInstance;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn rtc_udev_metadata_survives_lookup() -> TestResult {
+        let before = *RTC_NODE_METADATA.lock();
+        let first = crate::devfs::DevFs::new().root().lookup("rtc0");
+        let result = (|| {
+            let Some(first) = first else {
+                return TestResult::Fail("rtc0 lookup failed");
+            };
+            if narf_scheduler::block_on(first.set_owners(0, 994)).is_err()
+                || narf_scheduler::block_on(first.set_perms(0o20660)).is_err()
+            {
+                return TestResult::Fail("udev RTC metadata update failed");
+            }
+            let Some(next) = crate::devfs::DevFs::new().root().lookup("rtc0") else {
+                return TestResult::Fail("RTC metadata update removed rtc0");
+            };
+            if next.owners() != (0, 994)
+                || next.stat().mode.perms != 0o660
+                || next.stat().mode.file_type != FileType::Special
+                || next.ino() != first.ino()
+                || next.rdev() != first.rdev()
+            {
+                return TestResult::Fail("RTC inode metadata did not persist across lookup");
+            }
+            TestResult::Pass
+        })();
+        *RTC_NODE_METADATA.lock() = before;
+        result
+    }
+    kernel_test_in!("filesystem/devfs_rtc", rtc_udev_metadata_survives_lookup);
 
     /// 2026-07-19 12:34:56 UTC = 1_784_464_496. Exercises the 0-based
     /// month, since-1900 year, and a Sunday wday.

@@ -109,6 +109,40 @@ pub fn is_hw_owned(cqe: &[u8; CQE_LEN]) -> bool {
     cqe[CQE_OFF_QP_OP_OWN + 3] & CQE_OWNER_BIT != 0
 }
 
+/// Sample a CQ slot the HCA may be writing right now. `byte(i)` reads
+/// byte `i` of the 64-byte entry.
+///
+/// The HCA posts an entry while the host polls the slot, so a sample must
+/// never pair a software-owned owner bit with bytes of the slot's
+/// previous occupant. The owner byte (`0x3F`) is taken first and as ONE
+/// load; the other 63 bytes are loaded only after it showed the entry
+/// handed to software, when the whole entry is in place. `None` means
+/// "still hardware-owned": nothing else of the slot was read. Linux does
+/// the same: `mlx5_cqwq_get_cqe` tests
+/// `op_own` ownership, then `dma_rmb()`, before the CQE is decoded.
+///
+/// Copying the entry in ascending byte order loaded the owner byte LAST,
+/// so an entry posted during the copy showed the previous occupant's
+/// byte count, status and WQE counter under the fresh owner bit.
+#[inline]
+pub fn sample(mut byte: impl FnMut(usize) -> u8) -> Option<[u8; CQE_LEN]> {
+    let owner = byte(CQE_OFF_QP_OP_OWN + 3);
+    if owner & CQE_OWNER_BIT != 0 {
+        return None;
+    }
+    // Pair the HCA's owner-bit write with the loads that follow it.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    let mut entry = [0u8; CQE_LEN];
+    for (i, b) in entry.iter_mut().enumerate() {
+        *b = if i == CQE_OFF_QP_OP_OWN + 3 {
+            owner
+        } else {
+            byte(i)
+        };
+    }
+    Some(entry)
+}
+
 /// Decode the Stage-10 committed subset of a CQE.
 pub fn decode_cqe(cqe: &[u8; CQE_LEN]) -> CqeView {
     let byte_count = u32::from_be_bytes([

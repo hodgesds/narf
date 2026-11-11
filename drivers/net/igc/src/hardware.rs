@@ -19,8 +19,13 @@ pub(crate) trait Registers {
     fn flush(&self) {
         let _ = self.read(8);
     }
+    /// Report a tolerated hardware irregularity. Silent by default.
+    fn note(&self, _message: &'static str) {}
 }
 
+// Keep the timeout construction at the caller: outlining its enum copy can
+// introduce an unavailable memcpy relocation in the standalone ARM module.
+#[inline(always)]
 pub(crate) fn poll(r: &impl Registers, reg: u64, mask: u32, value: u32) -> Result<(), IgcError> {
     if r.wait(100_000, || {
         let observed = r.read(reg);
@@ -42,7 +47,9 @@ pub(crate) fn quiesce(r: &impl Registers, queues: usize) -> Result<(), IgcError>
     r.write(0x150c, u32::MAX);
     r.write(0x1528, u32::MAX);
     r.write(0x100, 0);
-    r.write(0x400, 8);
+    // TCTL contains nonzero reserved reset values. Stop TX without clearing
+    // those fields (I225 SUM §8.11.1; Linux also preserves them).
+    r.write(0x400, r.read(0x400) & !2);
     for q in 0..queues {
         r.write(0xc028 + q as u64 * 0x40, 0);
         r.write(0xe028 + q as u64 * 0x40, 0);
@@ -400,6 +407,15 @@ pub(crate) fn queue_sized(
     tx_count: usize,
     rx_count: usize,
 ) -> Result<(), IgcError> {
+    if q >= 4
+        || tx & 127 != 0
+        || rx & 127 != 0
+        || [tx_count, rx_count]
+            .into_iter()
+            .any(|count| !(64..=4096).contains(&count) || count % 8 != 0)
+    {
+        return Err(IgcError::Other("invalid DMA ring geometry"));
+    }
     let offset = q as u64 * 0x40;
     for base in [0xc000, 0xe000] {
         r.write(base + offset + 0x28, 0);
@@ -408,21 +424,176 @@ pub(crate) fn queue_sized(
         let addr = if base == 0xc000 { rx } else { tx };
         r.write(base + offset, addr as u32);
         r.write(base + offset + 4, (addr >> 32) as u32);
-        r.write(
-            base + offset + 8,
-            (if base == 0xc000 { rx_count } else { tx_count } * 16) as u32,
-        );
+        let count = if base == 0xc000 { rx_count } else { tx_count };
+        r.write(base + offset + 8, (count * 16) as u32);
         r.write(base + offset + 0x10, 0);
         r.write(base + offset + 0x18, 0);
+        // A previous owner may have selected head writeback instead of DD.
+        // Never publish an address for that mode or infer completion from TDH.
+        if base == 0xe000 {
+            r.write(base + offset + 0x38, 0);
+            r.write(base + offset + 0x3c, 0);
+        }
+        r.flush();
+        for (register, expected) in [
+            (base + offset, addr as u32),
+            (base + offset + 4, (addr >> 32) as u32),
+            (base + offset + 8, (count * 16) as u32),
+        ] {
+            if r.read(register) != expected {
+                return Err(IgcError::Other("DMA ring address/length readback failed"));
+            }
+        }
+        if base == 0xe000
+            && (r.read(base + offset + 0x38) != 0 || r.read(base + offset + 0x3c) != 0)
+        {
+            return Err(IgcError::Other("descriptor writeback mode rejected"));
+        }
     }
     // Advanced one-buffer RX, 2048 bytes, drop on exhausted queue so a
     // congested RSS queue cannot stall every other queue (no flow control).
-    r.write(0xc00c + q as u64 * 0x40, 2 | (1 << 25) | (1 << 28));
-    r.write(0xe028 + offset, 8 | (1 << 8) | (16 << 16) | (1 << 25));
-    poll(r, 0xe028 + offset, 1 << 25, 1 << 25)?;
-    r.write(0xc028 + offset, 8 | (8 << 8) | (4 << 16) | (1 << 25));
-    poll(r, 0xc028 + offset, 1 << 25, 1 << 25)?;
-    r.write(0xc018 + offset, rx_count as u32 - 1);
+    // igc_base.h: BSIZEHDR is in 64-byte units; Linux uses 256 bytes even
+    // in advanced one-buffer mode. I225 SRRCTL.Drop_En is bit 31, not the
+    // reserved bit 28 (Intel SUM §8.9.6).
+    r.write(
+        0xc00c + q as u64 * 0x40,
+        2 | (4 << 8) | (1 << 25) | (1 << 31),
+    );
+    r.flush();
+    if r.read(0xc00c + offset) != 0x82000402 {
+        return Err(IgcError::Other("RX descriptor format readback failed"));
+    }
+    // Preparation must not wait for QUEUE_ENABLE while PCI mastering and
+    // TCTL/RCTL are still off. Keep both tails empty until activation.
+    // Completion must progress with one packet and no interrupt timer.
+    // TX WTHRESH=0 honors the EOP descriptor's RS immediately; RX WTHRESH=1
+    // flushes each completed descriptor (RX zero is not immediate mode).
+    // Linux's 16/4 batching relies on a configured EITR timer, which the
+    // polled fallback does not have. Descriptor posting remains batched.
+    r.write(0xe028 + offset, 8 | (1 << 8));
+    r.write(0xc028 + offset, 8 | (8 << 8) | (1 << 16));
+    r.flush();
+    Ok(())
+}
+
+/// Activate already prepared, retained rings and installed interrupt routes.
+/// The callback grants and verifies PCI bus mastering under current authority.
+/// Linux igc_configure enables TCTL/RCTL before configuring live queues. Do
+/// the same after all ring addresses are checked, and publish RX tails only
+/// after every queue acknowledges. An error is never permission to free DMA.
+pub(crate) fn activate_queues(
+    r: &impl Registers,
+    rx_counts: &[usize],
+    enable_master: impl FnOnce() -> Result<(), IgcError>,
+) -> Result<(), IgcError> {
+    if rx_counts.is_empty()
+        || rx_counts.len() > 4
+        || rx_counts
+            .iter()
+            .any(|count| !(64..=4096).contains(count) || count % 8 != 0)
+    {
+        return Err(IgcError::Other("invalid DMA queue activation"));
+    }
+    for (q, count) in rx_counts.iter().enumerate() {
+        let offset = q as u64 * 0x40;
+        let tx_length = r.read(0xe008 + offset);
+        if !(1024..=65536).contains(&tx_length)
+            || tx_length % 128 != 0
+            || r.read(0xc008 + offset) != (*count * 16) as u32
+            || [0xc010, 0xc018, 0xe010, 0xe018]
+                .into_iter()
+                .any(|base| r.read(base + offset) != 0)
+            || [0xc028, 0xe028]
+                .into_iter()
+                .any(|base| r.read(base + offset) & (1 << 25) != 0)
+        {
+            return Err(IgcError::Other("DMA queues not prepared for activation"));
+        }
+    }
+    enable_master()?;
+    enable_data(r)?;
+    for q in 0..rx_counts.len() {
+        let offset = q as u64 * 0x40;
+        for base in [0xe028, 0xc028] {
+            r.write(base + offset, r.read(base + offset) | (1 << 25));
+            poll(r, base + offset, 1 << 25, 1 << 25)?;
+        }
+    }
+    // Linux igc_configure runs igc_rx_fifo_flush_base after queue setup
+    // and before making any RX buffers available to the controller.
+    flush_receive_fifo(r)?;
+    for (q, count) in rx_counts.iter().enumerate() {
+        r.write(0xc018 + q as u64 * 0x40, *count as u32 - 1);
+    }
+    r.flush();
+    Ok(())
+}
+
+/// Linux igc_rx_fifo_flush_base: apply the IPv6 parser erratum and remove
+/// inherited management traffic from the RX/DMA FIFOs before publishing RDT.
+/// This runs only with prepared rings whose heads/tails are still empty.
+pub(crate) fn flush_receive_fifo(r: &impl Registers) -> Result<(), IgcError> {
+    const ENABLE: u32 = 1 << 25;
+    const IPV6_EX_DIS: u32 = 0x10000;
+    const LEF: u32 = 0x40000;
+    let rfctl = r.read(0x5008) | IPV6_EX_DIS;
+    r.write(0x5008, rfctl);
+    r.flush();
+    poll(r, 0x5008, IPV6_EX_DIS, IPV6_EX_DIS)?;
+    let manc = r.read(0x5820);
+    if manc == u32::MAX {
+        return Err(IgcError::Other("management state unavailable"));
+    }
+    if manc & 0x20000 == 0 {
+        return Ok(());
+    }
+
+    let queues: [u32; 4] = core::array::from_fn(|q| r.read(0xc028 + q as u64 * 0x40));
+    for (q, control) in queues.iter().enumerate() {
+        r.write(0xc028 + q as u64 * 0x40, control & !ENABLE);
+    }
+    r.flush();
+    if !r.wait(10_000, || {
+        (0..4).all(|q| {
+            let value = r.read(0xc028 + q * 0x40);
+            value != u32::MAX && value & ENABLE == 0
+        })
+    }) {
+        if (0..4).any(|q| r.read(0xc028 + q * 0x40) == u32::MAX) {
+            return Err(IgcError::Other("RX queue state unavailable"));
+        }
+        // Linux igc_rx_fifo_flush_base only reports this and flushes
+        // anyway. Nothing can be written meanwhile: the rings are still
+        // empty, and the reject policy below drops every frame.
+        r.note("RX queue disable timed out after 10 ms; flushing anyway");
+    }
+
+    r.write(0x5008, rfctl & !LEF);
+    let max_length = r.read(0x5004);
+    r.write(0x5004, 0);
+    let rctl = r.read(0x100);
+    let reject = (rctl & !(2 | 4)) | 0x20; // EN/SBP clear, LPE set
+    r.write(0x100, reject);
+    r.write(0x100, reject | 2);
+    r.flush();
+    r.delay(2_000);
+
+    for (q, control) in queues.iter().enumerate() {
+        let register = 0xc028 + q as u64 * 0x40;
+        r.write(register, *control);
+        poll(r, register, ENABLE, control & ENABLE)?;
+    }
+    r.write(0x100, rctl);
+    r.flush();
+    r.write(0x5004, max_length);
+    r.write(0x5008, rfctl);
+    r.flush();
+    // The temporary reject policy intentionally causes these errors.
+    // Do not expose them as failures of subsequently admitted packets.
+    for register in [0x40ac, 0x40a0, 0x4010] {
+        // ROC, RNBC, MPC
+        let _ = r.read(register);
+    }
     Ok(())
 }
 
@@ -482,7 +653,11 @@ pub(crate) fn configure_tables(
     // Multicast accept supports IPv6 and joined groups. Unicast promiscuity
     // is enabled only through the explicit receive-mode control.
     r.write(0x100, (1 << 4) | (1 << 5) | (1 << 15) | (1 << 26));
-    r.write(0x400, 8 | (15 << 4) | (63 << 12) | (1 << 24));
+    // Preserve reserved fields, notably reset bits 31:28=0xa and 27:26=1.
+    // Replacing the whole word with legacy policy bits erased 0xa4000000
+    // on physical I225. Prepare TX disabled and clear the SWXOFF command.
+    let tctl = r.read(0x400) & !(2 | 0xff0 | 0x003ff000 | (1 << 22));
+    r.write(0x400, tctl | 8 | (15 << 4) | (63 << 12) | (1 << 24));
     r.flush();
 }
 

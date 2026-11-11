@@ -1004,7 +1004,7 @@ kernel_test_in!("interrupts", smoke_vector_alloc_then_free_reuse);
 fn smoke_vector_free_out_of_range() -> TestResult {
     // free(v < ALLOC_BASE) and free(v > ALLOC_MAX) both return
     // OutOfRange. On x86_64 ALLOC_BASE = 48 so vector 10 is below;
-    // vector 250 is above ALLOC_MAX (240) on every arch.
+    // vector 250 is above ALLOC_MAX on every arch.
     use crate::vector::{free, VectorError};
     #[cfg(target_arch = "x86_64")]
     {
@@ -1022,6 +1022,70 @@ fn smoke_vector_free_out_of_range() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("interrupts", smoke_vector_free_out_of_range);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vector_never_hands_out_fixed_vectors() -> TestResult {
+    // Vector 128 is the `int 0x80` gate: the trap path runs a syscall and
+    // returns before interrupt dispatch or EOI. 0xF0 and up are the
+    // TLB-shootdown / resched / membarrier IPIs. A device must never be
+    // given any of them.
+    use crate::vector::{allocatable, free, reserve, VectorError, ALLOC_MAX, SYSCALL_VECTOR};
+    if SYSCALL_VECTOR != 128 || ALLOC_MAX >= crate::VECTOR_TLB_SHOOTDOWN {
+        return TestResult::Fail("allocator range overlaps a fixed vector");
+    }
+    for fixed in [
+        SYSCALL_VECTOR,
+        crate::VECTOR_TLB_SHOOTDOWN,
+        crate::VECTOR_RESCHED,
+        crate::VECTOR_MEMBARRIER,
+    ] {
+        if allocatable(fixed) {
+            return TestResult::Fail("fixed vector reported allocatable");
+        }
+        if reserve(fixed) != Err(VectorError::OutOfRange) {
+            return TestResult::Fail("fixed vector could be reserved");
+        }
+        if free(fixed) != Err(VectorError::OutOfRange) {
+            return TestResult::Fail("fixed vector could be freed");
+        }
+    }
+    if !allocatable(127) || !allocatable(129) || !allocatable(ALLOC_MAX) {
+        return TestResult::Fail("ordinary vector excluded");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts", smoke_vector_never_hands_out_fixed_vectors);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_apic_id_of_cpu_is_by_identity_not_madt_order() -> TestResult {
+    // Scheduler CPU ids are APIC IDs. Steering an MSI by MADT position
+    // instead reaches the wrong CPU whenever firmware lists CPUs out of
+    // APIC-ID order, so the lookup must be by value.
+    let mut listed = 0usize;
+    while let Some(apic) = narf_acpi::apic_id_at(listed) {
+        if crate::apic_id_of_cpu(apic as usize) != Some(apic) {
+            return TestResult::Fail("listed APIC ID not resolved to itself");
+        }
+        listed += 1;
+    }
+    if listed == 0 {
+        return TestResult::Skip("no MADT processor entries");
+    }
+    let absent =
+        (0..=255usize).find(|id| (0..listed).all(|i| narf_acpi::apic_id_at(i) != Some(*id as u32)));
+    if let Some(absent) = absent {
+        if crate::apic_id_of_cpu(absent).is_some() {
+            return TestResult::Fail("APIC ID absent from the MADT was accepted");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts",
+    smoke_apic_id_of_cpu_is_by_identity_not_madt_order
+);
 
 fn smoke_vector_alloc_block_zero_rejected() -> TestResult {
     // alloc_block(0) is meaningless; it must surface OutOfRange

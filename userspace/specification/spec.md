@@ -69,6 +69,10 @@ writes do not pass through the byte-copy helpers.
 Network device ioctls bridge bounded native NIC controls to Linux ethtool:
 link settings, rings/channels/RSS/coalescing, pause/EEE/WoL, counters/names,
 register/NVM reads, diagnostics, link restart and supported L2 flow rules.
+Feature ioctl/netlink queries share the actual interface offload policy.
+SFEATURES preserves Linux's positive status bitmap through the ioctl return;
+GLINK requires administrative up and carrier. Generic Netlink exposes the
+implemented native controls and both compact and verbose feature bitsets.
 Existing network namespace checks and `CAP_NET_ADMIN` policy precede mutations.
 `SIOCSHWTSTAMP`/`SIOCGHWTSTAMP` report the effective ALL/NONE RX and ON/OFF TX
 configuration. AF_PACKET `SO_TIMESTAMPING` reports raw hardware RX times and
@@ -826,7 +830,11 @@ file position and mutable status flags. `dup*`, `F_DUPFD`, fork inheritance,
 and `SCM_RIGHTS` alias that object, while `FD_CLOEXEC` remains per descriptor;
 independent opens create independent descriptions. Consequently `lseek`,
 sequential I/O, readiness-at-offset, `/proc/*/fdinfo`, and `F_GETFL/F_SETFL`
-observe changes made through any alias. Stdin is `O_RDONLY`, stdout/stderr are
+observe changes made through any alias. The description also carries the path
+it was opened on (`OpenFileDescription::opened_path`, Linux `file->f_path`):
+a descriptor installed by `SCM_RIGHTS` in another task reads the sender's
+path through `/proc/<pid>/fd/<n>`, and a pathless one starts with none.
+Stdin is `O_RDONLY`, stdout/stderr are
 `O_WRONLY`, and sockets/socketpairs are `O_RDWR`; constructors do not rely on
 type-based access-mode exceptions. Sequential transfer syscalls pin these
 descriptions, lock distinct implicit positions in stable address order (or an
@@ -933,6 +941,14 @@ that cannot fit returns `EINVAL`; a first copy fault returns `EFAULT`; after any
 complete record, a later size, allocation, or copy failure returns the completed
 byte prefix and advances the directory cursor only through that prefix. The
 unsigned `count` argument is truncated to its native 32-bit ABI width.
+`d_ino` is `DirOps::entry_ino` of the entry where the directory answers it
+(devpts), otherwise a cursor placeholder.
+`ioctl(master, TIOCGPTPEER, flags)` returns a slave descriptor that has a
+path like one from `open(2)`, as `ptm_open_peer` opens the devpts dentry:
+`<mnt>/<N>` when the master was opened on that devpts mount's own `ptmx`,
+else `<dir>/pts/<N>` for a `c 5:2` node in `<dir>`. `/proc/<pid>/fd/<n>`
+therefore reads `/dev/pts/<N>`, which glibc `ttyname` (and sshd's
+`pty_allocate`) requires of an `openpty` slave.
 System V semaphore operations use Linux's default 500-operation `SEMOPM`
 boundary and validation order: `E2BIG`/zero-count validation precedes sembuf
 import, import faults are `EFAULT`, and `semtimedop(2)` imports its timeout
@@ -1790,6 +1806,16 @@ reference closes. Per-namespace IPv4 loopback TCP/UDP delivery uses
 namespace-keyed endpoint tables, so identical loopback endpoints coexist and
 cannot exchange traffic across namespaces.
 
+A connected TCP socket has both names (`inet_getname`/`inet6_getname`).
+For a connection on the kernel TCP stack `getsockname`, `getpeername` and
+the address `accept(2)` returns are the TCB's four-tuple
+(`tcp_stack::endpoints`/`endpoints6`). A loopback connect keeps a bound
+address and port, otherwise takes the route's source (127.0.0.1 for 127/8,
+else the local destination itself; an unspecified destination is loopback)
+and an ephemeral port (`EADDRNOTAVAIL` when none is free); the accepted
+socket carries the mirror image. The local port stays reserved until the
+socket is released or disconnected with `connect(AF_UNSPEC)`.
+
 A followed pathname permission probe of `/proc/<pid>/ns/<flavour>` resolves
 the retained nsfs object, rather than treating its rendered
 `<flavour>:[inode]` text as an ordinary symlink target. `AT_SYMLINK_NOFOLLOW`
@@ -1937,8 +1963,9 @@ through `AdminError::DeviceError`.
 `IFNAMSIZ-1` and at an alias colon (`ENODEV`; every namespace has `lo`); an
 `ETHTOOL_PERQUEUE` sub-command (`EFAULT`); `CAP_NET_ADMIN` for any
 (sub-)command outside `__dev_ethtool`'s unprivileged list (`EPERM`). A device
-without driver information (`lo`) and every other command return
-`EOPNOTSUPP`. `GDRVINFO` reports the driver's name, its version or else the
+without driver information (`lo`) returns `EOPNOTSUPP` for GDRVINFO;
+remaining commands use the bounded native codec described above, returning
+`EOPNOTSUPP` for controls without an implementation. `GDRVINFO` reports the driver's name, its version or else the
 kernel release, and its bus name (`e1000`: PCI name; `virtio_net` `1.0.0`:
 `virtio_bus_name()`); `GLINK` reports `netif_running` and carrier.
 
@@ -2007,9 +2034,16 @@ keeps `p_memsz` with `p_filesz = 0`. A page whose frame is not System RAM is
 written as zeros, never read through the direct map. Core dumps emit ELF64
 metadata with
 `PT_NOTE` data immediately after the ELF header, before the VMA program-header
-table. Metadata is written as one sequential buffer (retrying short writes),
-so a partial dump preserves process identity and raw register notes before a
-large table or memory payload. A nonempty write returning zero is a failure.
+table. Metadata is prepared as one sequential buffer and emitted in at most 64-KiB
+operations (retrying short writes), so a partial dump preserves process identity
+and raw register notes before a large table or memory payload. A nonempty write
+returning zero is a failure. Pending SIGKILL interrupts emission, including an
+I/O wait whose filesystem never wakes: the core writer registers its own signal
+waker before checking pending signals. Only its current operation may survive
+cancellation. That operation owns its resolved file and copied buffer and drains
+in executor context to terminal completion; it never borrows the dying process
+or reports the unfinished dump as complete. A permanently stalled backend can
+retain that one operation indefinitely rather than freeing possibly active I/O.
 `NT_PRSTATUS` currently contains the architecture's raw `user_regs_struct`,
 not Linux's full `elf_prstatus`; `NT_PRPSINFO` and optional `NT_AUXV` accompany
 it. Full Linux `NT_PRSTATUS`, `NT_SIGINFO`, and `NT_FILE` remain unsupported.
@@ -2017,6 +2051,50 @@ Before optional core-file I/O, a fatal-path kernel record reports pid/tid,
 executable, signal, instruction/stack pointers and diagnostic registers even
 when `RLIMIT_CORE` disables the file. Ordinary traps and syscalls do not emit
 that record.
+
+Where a core goes is `kernel.core_pattern`, parsed as `fs/coredump.c`
+`coredump_parse` parses it. A pattern starting with `|` (a helper, e.g.
+systemd-coredump's) or `@` (a coredump socket) never creates a file; NARF
+cannot yet run a usermode helper or serve a coredump socket, so such a dump is
+reported on the console and skipped, as Linux skips one whose helper cannot be
+started. Any other pattern is a file name template (`%%`, `%p`, `%P`, `%i`,
+`%I`, `%u`, `%g`, `%d`, `%s`, `%t`, `%h`, `%e`, `%f`, `%E`, `%c`, `%C`;
+substituted names have `/` replaced by `!`), relative to the crashing task's
+working directory, with `.<tgid>` appended when `kernel.core_uses_pid` is set
+and the pattern has no `%p`. A process that is not dumpable writes no core.
+The old file is unlinked and the new one created `0600`, owned by the task's
+fsuid/fsgid, only where the task itself may delete and create in that
+directory. `kernel.core_uses_pid` and `kernel.core_pipe_limit` are published
+(0644). Still not Linux: the wait status carries `WCOREDUMP` for every
+core-dumping signal, whether or not a core was written.
+
+**Killable filesystem waits** (`killable_wait`). A task parked on a
+filesystem future is ended by a fatal signal (SIGKILL pending; no other
+signal) in the classes Linux sleeps in `TASK_KILLABLE`:
+`read`/`pread64`/`readv`/`preadv*` (`filemap_read`) and
+`write`/`pwrite64`/`writev`/`pwritev*` (`generic_perform_write` and the
+reservation and dirty-throttle sleeps under it) of stored file data (a
+regular file whose `FileOps::can_poll` is false, i.e. one with no `->poll`),
+`getdents*` (`iterate_dir`'s `down_read_killable`), file page faults
+(`__folio_lock_or_retry` under `FAULT_FLAG_KILLABLE`), and the core writer's
+unlink, create and writes (`dump_interrupted`). The handler returns `-EINTR`
+(a fault fails and the trap handler delivers the pending signal) and the task
+dies on its way out. The operation itself is never dropped: a polled
+filesystem future may hold a device's shared DMA buffer with a request in
+flight, the filesystem's operation lock or a half-staged transaction, so it
+owns everything it touches and is handed to the scheduler to reach its own
+completion — a killed write lands whole. A pipe, socket, FIFO, device node
+or event descriptor is not waited for this way (a read finishing after its
+reader died would consume the next reader's bytes or event); those block
+through their readiness parks, which signals already end. Every other
+filesystem wait stays uninterruptible, as on Linux:
+`fsync`/`fdatasync`/`sync`/`syncfs` (a transaction commit), namespace changes
+(`create`, `unlink`, `rename`, `mkdir`, `link`, `symlink`, ...), `truncate`
+and `fallocate`, attribute and xattr changes, path lookup, and `execve`'s
+image reads. Not yet Linux: `copy_file_range`, `sendfile` and `splice` wait
+uninterruptibly for their file side, and `munmap`/exit write a shared
+mapping's dirty fallback pages back synchronously and uninterruptibly, where
+Linux leaves them to writeback.
 
 AF_BLUETOOTH L2CAP/RFCOMM sockets (issue #814) support the server side:
 bind stores the local sockaddr (L2CAP psm + bdaddr + cid + address type;

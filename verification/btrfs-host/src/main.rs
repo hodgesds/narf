@@ -11,11 +11,14 @@
 
 mod crash;
 mod dev;
+mod enospc;
 mod fixture;
+mod fst;
 mod host;
 mod linux;
 mod model;
 mod narf;
+mod scale;
 mod workload;
 
 #[cfg(test)]
@@ -43,7 +46,8 @@ USAGE: narf-btrfs-host [OPTIONS]
                     others scale from it; 0 disables the crash pass)
   --exhaustive      crash-test every flush boundary plus two random cuts per
                     flush window (slow)
-  --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate
+  --scenario LIST   comma-separated subset of: regress,root,snapshots,lba4k,gate,fst,
+                    enospc,scale
                     (default all)
   --jobs N          concurrent `btrfs check` processes in the crash pass
                     (default 3)
@@ -53,7 +57,16 @@ USAGE: narf-btrfs-host [OPTIONS]
 ";
 
 /// The default selection (`regress` = every `regress-*` case).
-pub const SCENARIOS: [&str; 5] = ["regress", "root", "snapshots", "lba4k", "gate"];
+pub const SCENARIOS: [&str; 8] = [
+    "regress",
+    "root",
+    "snapshots",
+    "lba4k",
+    "gate",
+    "fst",
+    "enospc",
+    "scale",
+];
 /// Names `--scenario` also accepts.
 const REGRESS: [&str; 3] = [
     "regress-zstd-tail",
@@ -620,6 +633,10 @@ fn main() {
         }
     };
     host::init();
+    // Every commit re-reads the free-space tree it wrote and compares it
+    // with the in-memory view the driver advanced; a difference fails the
+    // commit (and so the workload).
+    narf_drivers_fs_btrfs::allocator::set_view_audit(true);
     let t0 = Instant::now();
     let scenarios = [
         regress("regress-zstd-tail", regress_zstd_tail),
@@ -688,6 +705,22 @@ fn main() {
             }
             continue;
         }
+        if name == "fst" || name == "enospc" || name == "scale" {
+            let run = match name.as_str() {
+                "fst" => fst::run(&args),
+                "enospc" => enospc::run(&args),
+                _ => scale::run(&args),
+            };
+            match run {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    failed += 1;
+                    println!("{name}: FAIL\n{e}\nklog:\n{}", host::klog_take());
+                    narf::reset();
+                }
+            }
+            continue;
+        }
         let picked: Vec<&Scenario> = scenarios
             .iter()
             .filter(|s| s.name == name || (name == "regress" && s.name.starts_with("regress-")))
@@ -710,9 +743,10 @@ fn main() {
         }
     }
     println!(
-        "btrfs-host-rw: {} in {:.1?}",
+        "btrfs-host-rw: {} in {:.1?} (most any batch commit allocated beyond its reservation: {} blocks)",
         if failed == 0 { "PASS" } else { "FAIL" },
-        t0.elapsed()
+        t0.elapsed(),
+        narf_drivers_fs_btrfs::stats::max_reserve_overrun()
     );
     std::process::exit(if failed == 0 { 0 } else { 1 });
 }

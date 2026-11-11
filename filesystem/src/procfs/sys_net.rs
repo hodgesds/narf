@@ -110,11 +110,15 @@ static TCP_MTU_PROBING: AtomicU32 = AtomicU32::new(0);
 // tcp_rmem: min / default / max (bytes)
 static TCP_RMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 static TCP_RMEM_DEFAULT: AtomicU32 = AtomicU32::new(131072);
-static TCP_RMEM_MAX: AtomicU32 = AtomicU32::new(6291456);
+// The maxima bound the TCP stack's buffer autotuning, so they live where
+// `narf-net` can read them.
+pub use narf_lib::sysctl::ipv4::TCP_LIMIT_OUTPUT_BYTES;
+pub use narf_lib::sysctl::ipv4::TCP_MODERATE_RCVBUF;
+pub use narf_lib::sysctl::ipv4::TCP_RMEM_MAX;
+pub use narf_lib::sysctl::ipv4::TCP_WMEM_MAX;
 // tcp_wmem: min / default / max (bytes)
 static TCP_WMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 static TCP_WMEM_DEFAULT: AtomicU32 = AtomicU32::new(16384);
-static TCP_WMEM_MAX: AtomicU32 = AtomicU32::new(4194304);
 // udp socket minimums
 static UDP_RMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 static UDP_WMEM_MIN: AtomicU32 = AtomicU32::new(4096);
@@ -524,6 +528,18 @@ pub fn register_all() {
         path: "net/ipv4/tcp_mtu_probing",
         read: || read_atomic(&TCP_MTU_PROBING),
         write: Some(|s| write_atomic(&TCP_MTU_PROBING, s)),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/tcp_limit_output_bytes",
+        read: || read_atomic(&TCP_LIMIT_OUTPUT_BYTES),
+        write: Some(|s| write_atomic(&TCP_LIMIT_OUTPUT_BYTES, s)),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/tcp_moderate_rcvbuf",
+        read: || read_atomic(&TCP_MODERATE_RCVBUF),
+        write: Some(|s| write_atomic(&TCP_MODERATE_RCVBUF, s)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
