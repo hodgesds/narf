@@ -73,7 +73,7 @@ narf-input-driver    = { path = "../drivers/input" }
 narf-graphics        = { path = "../graphics" }
 narf-graphics-driver = { path = "../drivers/graphics" }
 narf-drivers-gpu     = { path = "../drivers/gpu" }
-narf-drivers-nvidia  = { path = "../drivers/nvidia" }
+narf-drivers-nvidia  = { path = "../drivers/gpu/nvidia" }
 narf-drivers-psp     = { path = "../drivers/psp" }
 narf-drivers-crypto  = { path = "../drivers/crypto" }
 narf-init            = { path = "../init" }

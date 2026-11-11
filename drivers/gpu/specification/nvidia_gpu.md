@@ -12,7 +12,7 @@
 >
 > **Probe ownership (crate-split step 1):** PCI probe
 > registration for NVIDIA hardware lives in
-> `narf-drivers-nvidia` (`drivers/nvidia/src/pci.rs`), which is
+> `narf-drivers-nvidia` (`drivers/gpu/nvidia/src/pci.rs`), which is
 > the single probe owner. This crate's `nvidia_gpu::probe` and
 > its ID table (§5) remain as codec / test coverage only — they
 > are not registered with the bus match table. The codec files'

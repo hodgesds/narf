@@ -32,7 +32,7 @@ sequence.
 
 The crate is `no_std` with `alloc`, and depends on `narf-lib` and
 `narf-drivers`. It is consumed by the display drivers in
-`drivers/graphics`, the GPU driver in `drivers/nvidia`, and the
+`drivers/graphics`, the GPU driver in `drivers/gpu/nvidia`, and the
 framebuffer abstraction in `fb`, all of which build their
 device-specific scanout and modeset logic on these primitives.
 
