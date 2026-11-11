@@ -461,6 +461,20 @@ pub fn audit_note_alloc_caller(loc: &'static core::panic::Location<'static>) {
     let _ = loc;
 }
 
+/// Per-zone operation counters for the allocator scale tests. Plain fields
+/// behind the zone lock, so a caller holding the lock reads an exact delta for
+/// its own hold. Compiled only into the kernel-test build.
+#[cfg(feature = "kernel-test")]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ZoneOpStats {
+    /// Blocks returned to the zone (one per `free`/`free_mt`/`free_cached`).
+    pub frees: u64,
+    /// Blocks handed out by the zone.
+    pub allocs: u64,
+    /// Free-list entries examined while looking for a block's buddy.
+    pub find_steps: u64,
+}
+
 /// Per-NUMA-node buddy zone. Stores 11 free lists (orders 0..=MAX_ORDER)
 /// of frame numbers (block heads).
 ///
@@ -487,6 +501,8 @@ pub struct BuddyZone {
     /// false-positive as double-alloc/double-free.
     #[cfg(feature = "frame-alloc-audit")]
     audit: bool,
+    #[cfg(feature = "kernel-test")]
+    op_stats: ZoneOpStats,
 }
 
 impl BuddyZone {
@@ -497,9 +513,22 @@ impl BuddyZone {
             free_lists: [NEW_ORDERS; NUM_MIGRATE_TYPES],
             #[cfg(feature = "frame-alloc-audit")]
             audit: false,
+            #[cfg(feature = "kernel-test")]
+            op_stats: ZoneOpStats {
+                frees: 0,
+                allocs: 0,
+                find_steps: 0,
+            },
             total_frames: 0,
             free_frames: 0,
         }
+    }
+
+    /// Snapshot of this zone's operation counters (scale tests only).
+    #[cfg(feature = "kernel-test")]
+    #[inline]
+    pub(crate) fn op_stats(&self) -> ZoneOpStats {
+        self.op_stats
     }
 
     /// Opt this zone into `frame-alloc-audit`. Called only on the live
@@ -829,6 +858,10 @@ impl BuddyZone {
         }
         self.free_frames -= order_frames(order) as usize;
         self.note_alloc(frame, order);
+        #[cfg(feature = "kernel-test")]
+        {
+            self.op_stats.allocs += 1;
+        }
         Some(frame)
     }
 
@@ -861,6 +894,10 @@ impl BuddyZone {
                 let frame = self.free_lists[src_mt.index()][order as usize].swap_remove(idx);
                 self.free_frames -= need as usize;
                 self.note_alloc(frame, order);
+                #[cfg(feature = "kernel-test")]
+                {
+                    self.op_stats.allocs += 1;
+                }
                 return Some(frame);
             }
             // Fallback: walk higher orders for a block whose lower half
@@ -877,6 +914,10 @@ impl BuddyZone {
                     }
                     self.free_frames -= need as usize;
                     self.note_alloc(frame, order);
+                    #[cfg(feature = "kernel-test")]
+                    {
+                        self.op_stats.allocs += 1;
+                    }
                     return Some(frame);
                 }
             }
@@ -925,6 +966,10 @@ impl BuddyZone {
 
     fn free_inner(&mut self, frame: u64, order: u8, mt: MigrateType) {
         self.free_frames += order_frames(order) as usize;
+        #[cfg(feature = "kernel-test")]
+        {
+            self.op_stats.frees += 1;
+        }
         let mt = mt.index();
         let mut cur_order = order;
         let mut cur_frame = frame;
@@ -933,10 +978,16 @@ impl BuddyZone {
             // Look for buddy in the same-order free list of the SAME
             // migratetype partition. A buddy of a different migratetype is
             // deliberately not merged.
-            if let Some(idx) = self.free_lists[mt][cur_order as usize]
+            let found = self.free_lists[mt][cur_order as usize]
                 .iter()
-                .position(|&f| f == buddy)
+                .position(|&f| f == buddy);
+            #[cfg(feature = "kernel-test")]
             {
+                let examined =
+                    found.map_or(self.free_lists[mt][cur_order as usize].len(), |idx| idx + 1);
+                self.op_stats.find_steps += examined as u64;
+            }
+            if let Some(idx) = found {
                 self.free_lists[mt][cur_order as usize].swap_remove(idx);
                 // Coalesced block starts at min(cur_frame, buddy).
                 cur_frame = cur_frame.min(buddy);
