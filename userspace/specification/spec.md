@@ -2006,6 +2006,22 @@ executable, signal, instruction/stack pointers and diagnostic registers even
 when `RLIMIT_CORE` disables the file. Ordinary traps and syscalls do not emit
 that record.
 
+Where a core goes is `kernel.core_pattern`, parsed as `fs/coredump.c`
+`coredump_parse` parses it. A pattern starting with `|` (a helper, e.g.
+systemd-coredump's) or `@` (a coredump socket) never creates a file; NARF
+cannot yet run a usermode helper or serve a coredump socket, so such a dump is
+reported on the console and skipped, as Linux skips one whose helper cannot be
+started. Any other pattern is a file name template (`%%`, `%p`, `%P`, `%i`,
+`%I`, `%u`, `%g`, `%d`, `%s`, `%t`, `%h`, `%e`, `%f`, `%E`, `%c`, `%C`;
+substituted names have `/` replaced by `!`), relative to the crashing task's
+working directory, with `.<tgid>` appended when `kernel.core_uses_pid` is set
+and the pattern has no `%p`. A process that is not dumpable writes no core.
+The old file is unlinked and the new one created `0600`, owned by the task's
+fsuid/fsgid, only where the task itself may delete and create in that
+directory. `kernel.core_uses_pid` and `kernel.core_pipe_limit` are published
+(0644). Still not Linux: the wait status carries `WCOREDUMP` for every
+core-dumping signal, whether or not a core was written.
+
 **Killable filesystem waits** (`killable_wait`). A task parked on a
 filesystem future is ended by a fatal signal (SIGKILL pending; no other
 signal) in the classes Linux sleeps in `TASK_KILLABLE`:
@@ -2015,7 +2031,7 @@ reservation and dirty-throttle sleeps under it) of stored file data (a
 regular file whose `FileOps::can_poll` is false, i.e. one with no `->poll`),
 `getdents*` (`iterate_dir`'s `down_read_killable`), file page faults
 (`__folio_lock_or_retry` under `FAULT_FLAG_KILLABLE`), and the core writer's
-writes (`dump_interrupted`). The handler returns `-EINTR`
+unlink, create and writes (`dump_interrupted`). The handler returns `-EINTR`
 (a fault fails and the trap handler delivers the pending signal) and the task
 dies on its way out. The operation itself is never dropped: a polled
 filesystem future may hold a device's shared DMA buffer with a request in

@@ -372,3 +372,78 @@ kernel_test_in!(
     "userspace/coredump",
     smoke_coredump_large_metadata_uses_bounded_writes
 );
+
+fn name_args<'a>(comm: &'a str, exe: Option<&'a str>) -> CoreNameArgs<'a> {
+    CoreNameArgs {
+        tgid: 454,
+        tid: 584,
+        uid: 1000,
+        gid: 100,
+        dumpable: 1,
+        signal: 6,
+        time: 1_700_000_000,
+        hostname: "host/name",
+        comm,
+        exe,
+        limit: u64::MAX,
+        cpu: 3,
+    }
+}
+
+/// systemd-coredump's pattern is a pipe: Linux hands the dump to the helper
+/// and writes no file anywhere. Treating every pattern as the file name
+/// `core` is what put a `/core` on a root filesystem.
+fn smoke_coredump_pipe_and_socket_patterns_name_no_file() -> TestResult {
+    let args = name_args("systemd-localed", Some("/usr/lib/systemd/systemd-localed"));
+    let pipe = "|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h %d %F";
+    if core_target(pipe, false, &args) != CoreTarget::Pipe
+        || core_target(pipe, true, &args) != CoreTarget::Pipe
+    {
+        return TestResult::Fail("a pipe core_pattern was treated as a file name");
+    }
+    if core_target("@/run/coredump.sock", false, &args) != CoreTarget::Socket {
+        return TestResult::Fail("a socket core_pattern was treated as a file name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_pipe_and_socket_patterns_name_no_file
+);
+
+/// `coredump_parse`'s template expansion, specifier by specifier.
+fn smoke_coredump_file_pattern_expands_like_linux() -> TestResult {
+    let args = name_args("my/comm", Some("/usr/bin/tool"));
+    let cases: [(&str, bool, &str); 9] = [
+        ("core", false, "core"),
+        // core_uses_pid appends .<tgid> only when the pattern has no %p.
+        ("core", true, "core.454"),
+        ("core.%p", true, "core.454"),
+        (
+            "/var/crash/%e.%s.%u.%g.%t",
+            false,
+            "/var/crash/my!comm.6.1000.100.1700000000",
+        ),
+        ("%h-%f-%E", false, "host!name-tool-!usr!bin!tool"),
+        ("%P.%i.%I.%d.%C", false, "454.584.584.1.3"),
+        ("%c", false, "18446744073709551615"),
+        // %% is a percent; an unknown specifier, %F and a trailing % vanish.
+        ("a%%b%Zc%F", false, "a%bc"),
+        ("core%", false, "core"),
+    ];
+    for (pattern, uses_pid, expected) in cases {
+        match core_target(pattern, uses_pid, &args) {
+            CoreTarget::File(name) if name == expected => {}
+            _ => return TestResult::Fail("a core file pattern did not expand as Linux expands it"),
+        }
+    }
+    match core_target("%f|%E", false, &name_args("comm", None)) {
+        CoreTarget::File(name) if name == "comm (path unknown)|comm (path unknown)" => {}
+        _ => return TestResult::Fail("an unknown executable path was not reported as such"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/coredump",
+    smoke_coredump_file_pattern_expands_like_linux
+);

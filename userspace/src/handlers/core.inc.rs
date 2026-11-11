@@ -18099,6 +18099,29 @@ pub(crate) fn coredump_limit(task: u64) -> u64 {
     read_rlimit(task, RLIMIT_CORE).map_or(RLIM_INFINITY, |p| p.cur)
 }
 
+/// What `fs/coredump.c` takes from the dying task's credentials and mm.
+pub(crate) struct CoredumpIdentity {
+    /// `cred->uid` / `cred->gid`, the `%u` / `%g` of a core file name.
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// `current_fsuid()` / `current_fsgid()`, the owner of the core file.
+    pub(crate) fsuid: u32,
+    pub(crate) fsgid: u32,
+    /// `__get_dumpable(mm->flags) != SUID_DUMP_DISABLE`.
+    pub(crate) dumpable: bool,
+}
+
+pub(crate) fn coredump_identity(task: u64) -> CoredumpIdentity {
+    let ids = read_uidgid(task);
+    CoredumpIdentity {
+        uid: ids.uid,
+        gid: ids.gid,
+        fsuid: ids.fsuid,
+        fsgid: ids.fsgid,
+        dumpable: read_prctl(task).dumpable,
+    }
+}
+
 /// `SIGXCPU` — the soft-limit warning. Its default action terminates, so a
 /// process that wants the warning has to handle or block it.
 const SIGXCPU: u32 = 24;

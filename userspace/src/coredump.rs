@@ -4,7 +4,7 @@ use crate::handlers::{poll_blocking, resolve_cwd_path, resolve_parent_dir_async}
 #[cfg(target_arch = "x86_64")]
 use crate::user_task::with_user_task_ctx;
 use crate::user_task::UserState;
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{
     future::Future,
     pin::Pin,
@@ -521,6 +521,167 @@ fn dump_len(r: &narf_memory::address_space::Region) -> u64 {
     }
 }
 
+/// Where `kernel.core_pattern` sends a dump (`fs/coredump.c` `core_type`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CoreTarget {
+    /// `COREDUMP_FILE`: the expanded file name, relative to the crashing
+    /// task's working directory unless it starts with `/`.
+    File(String),
+    /// `COREDUMP_PIPE`: `|program args` — the dump goes to a helper's stdin
+    /// and nothing is written to any directory.
+    Pipe,
+    /// `COREDUMP_SOCK`: `@path` — the dump goes to an `AF_UNIX` socket.
+    Socket,
+}
+
+/// What `coredump_parse` substitutes into a core file name.
+pub(crate) struct CoreNameArgs<'a> {
+    /// Thread-group id (`%p`, `%P`).
+    pub(crate) tgid: u64,
+    /// The dumping thread's id (`%i`, `%I`).
+    pub(crate) tid: u64,
+    /// Real uid and gid (`%u`, `%g`).
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// `__get_dumpable()` (`%d`).
+    pub(crate) dumpable: u32,
+    pub(crate) signal: u32,
+    /// `ktime_get_real_seconds()` (`%t`).
+    pub(crate) time: i64,
+    pub(crate) hostname: &'a str,
+    pub(crate) comm: &'a str,
+    /// The executable's path, when it is known (`%f`, `%E`).
+    pub(crate) exe: Option<&'a str>,
+    /// `rlimit(RLIMIT_CORE)` (`%c`).
+    pub(crate) limit: u64,
+    pub(crate) cpu: u32,
+}
+
+/// `cn_esc_printf`: a substituted string must not add path components.
+fn push_escaped(name: &mut String, text: &str) {
+    name.extend(text.chars().map(|c| if c == '/' { '!' } else { c }));
+}
+
+/// `fs/coredump.c::coredump_parse` for the pattern `pattern`.
+///
+/// A pattern starting with `|` or `@` names a helper or a socket; its
+/// arguments are not expanded here because nothing consumes them. Anything
+/// else is a file name template: `%%` is a percent sign, an unknown
+/// specifier and a lone trailing `%` are dropped, `%e`/`%h`/`%E` have every
+/// `/` replaced by `!`, and with `core_uses_pid` set a name whose pattern
+/// had no `%p` gets `.<tgid>` appended.
+pub(crate) fn core_target(pattern: &str, uses_pid: bool, args: &CoreNameArgs<'_>) -> CoreTarget {
+    use core::fmt::Write;
+    match pattern.as_bytes().first() {
+        Some(b'|') => return CoreTarget::Pipe,
+        Some(b'@') => return CoreTarget::Socket,
+        _ => {}
+    }
+    let mut name = String::new();
+    let mut pid_in_pattern = false;
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            name.push(c);
+            continue;
+        }
+        // A single `%` at the end is dropped.
+        let Some(specifier) = chars.next() else {
+            break;
+        };
+        let _ = match specifier {
+            '%' => {
+                name.push('%');
+                Ok(())
+            }
+            'p' => {
+                pid_in_pattern = true;
+                write!(name, "{}", args.tgid)
+            }
+            'P' => write!(name, "{}", args.tgid),
+            'i' | 'I' => write!(name, "{}", args.tid),
+            'u' => write!(name, "{}", args.uid),
+            'g' => write!(name, "{}", args.gid),
+            'd' => write!(name, "{}", args.dumpable),
+            's' => write!(name, "{}", args.signal),
+            't' => write!(name, "{}", args.time),
+            'h' => {
+                push_escaped(&mut name, args.hostname);
+                Ok(())
+            }
+            'e' => {
+                push_escaped(&mut name, args.comm);
+                Ok(())
+            }
+            // `cn_print_exe_file(cn, true)`: the executable's file name.
+            'f' => {
+                match args.exe {
+                    Some(exe) => name.push_str(exe.rsplit('/').next().unwrap_or(exe)),
+                    None => {
+                        push_escaped(&mut name, args.comm);
+                        name.push_str(" (path unknown)");
+                    }
+                }
+                Ok(())
+            }
+            // `cn_print_exe_file(cn, false)`: its whole path, escaped.
+            'E' => {
+                match args.exe {
+                    Some(exe) => push_escaped(&mut name, exe),
+                    None => {
+                        push_escaped(&mut name, args.comm);
+                        name.push_str(" (path unknown)");
+                    }
+                }
+                Ok(())
+            }
+            'c' => write!(name, "{}", args.limit),
+            'C' => write!(name, "{}", args.cpu),
+            // `%F` (a pidfd for the helper) means nothing for a file, and an
+            // unknown specifier is dropped.
+            _ => Ok(()),
+        };
+    }
+    if uses_pid && !pid_in_pattern {
+        let _ = write!(name, ".{}", args.tgid);
+    }
+    CoreTarget::File(name)
+}
+
+/// Remove an old core file, ended by SIGKILL (`dump_interrupted`).
+///
+/// The directory and the name are owned by the operation, which runs to its
+/// own completion if this task is killed first: an unlink abandoned half-way
+/// would leave the filesystem's operation lock and its open batch in
+/// whatever state that moment had. Its outcome is not reported: "If it
+/// doesn't exist, that's fine. If there's some other problem, we'll catch it
+/// at the filp_open()."
+fn dump_unlink(parent: &Arc<dyn narf_filesystem::DirOps>, leaf: &str) {
+    let parent = parent.clone();
+    let leaf = String::from(leaf);
+    let _ = crate::killable_wait::wait(Box::pin(async move { parent.unlink(&leaf).await }));
+}
+
+/// Create the core file `0600`, owned by `uid:gid` — `filp_open(O_CREAT |
+/// O_EXCL, 0600)` under the crashing task's fsuid/fsgid. Ended by SIGKILL
+/// and owned like [`dump_unlink`].
+fn dump_create(
+    parent: &Arc<dyn narf_filesystem::DirOps>,
+    leaf: &str,
+    uid: u32,
+    gid: u32,
+) -> Option<Arc<dyn FileOps>> {
+    let parent = parent.clone();
+    let leaf = String::from(leaf);
+    let created = crate::killable_wait::wait(Box::pin(async move {
+        parent.create_with_attrs(&leaf, 0o600, uid, gid).await
+    }));
+    match created {
+        Ok(Some(Ok(file))) => Some(file),
+        _ => None,
+    }
+}
+
 pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
     // Fatal path only: publish the cause before any optional dump-file I/O
     // can fail or stall. This also covers RLIMIT_CORE=0. Do not put this
@@ -555,7 +716,58 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
     // from an earlier crash on its way to writing nothing.
     const ELF_MIN_COREDUMP: u64 = 4096;
     let limit = crate::handlers::coredump_limit(task);
-    if limit < ELF_MIN_COREDUMP {
+    let identity = crate::handlers::coredump_identity(task);
+    // `vfs_coredump`: `if (!coredump_parse(..)) return; if (!__get_dumpable(
+    // cprm.mm_flags)) return;` — a process that is not dumpable (a set-uid
+    // image, `PR_SET_DUMPABLE(0)`) leaves no core anywhere.
+    if !identity.dumpable {
+        return;
+    }
+    // `kernel.core_pattern` decides where the dump goes. This used to write
+    // `<cwd>/core` whatever the pattern said, so on a system whose pattern is
+    // systemd-coredump's `|/usr/lib/systemd/systemd-coredump ...` every
+    // crashing service wrote a core file into its working directory — `/`
+    // for a system service — where Linux writes none.
+    let comm = crate::handlers::proc_comm_of(pid).unwrap_or_default();
+    let hostname = crate::handlers::uts_hostname_for_current();
+    let target = core_target(
+        &narf_filesystem::procfs::sys_kernel::core_pattern(),
+        narf_filesystem::procfs::sys_kernel::core_uses_pid(),
+        &CoreNameArgs {
+            tgid: pid,
+            tid: crate::handlers::linux_tid_for_task(task),
+            uid: identity.uid,
+            gid: identity.gid,
+            dumpable: 1,
+            signal: signum,
+            time: narf_scheduler::narf_time::now_wall().secs,
+            hostname: &hostname,
+            comm: &comm,
+            exe: exe.as_deref(),
+            limit,
+            cpu: narf_lib::percpu::current_cpu() as u32,
+        },
+    );
+    let name = match target {
+        CoreTarget::File(name) => name,
+        CoreTarget::Pipe | CoreTarget::Socket => {
+            // `coredump_pipe` runs the helper with `call_usermodehelper_exec`
+            // and `coredump_sock` connects to a coredump server. NARF can do
+            // neither yet, which is Linux's "helper could not be started"
+            // case: report it and write no core. `cprm.limit == 1` is the
+            // recursion guard there and stays silent here too.
+            if limit != 1 {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "coredump: pid={pid} core_pattern names a helper or socket, which this kernel cannot run; skipping core dump"
+                );
+            }
+            return;
+        }
+    };
+    // `coredump_file`: `if (cprm->limit < binfmt->min_coredump) return false;`
+    // An empty name has nothing to create.
+    if limit < ELF_MIN_COREDUMP || name.is_empty() {
         return;
     }
     if dump_interrupted(task) {
@@ -569,8 +781,7 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
     };
     let regions = as_ref.regions_snapshot();
 
-    // Core file path: core
-    let path = resolve_cwd_path(task, "core");
+    let path = resolve_cwd_path(task, &name);
 
     // Open/Create core file
     let (parent, leaf) = match resolve_parent_dir_async(&path) {
@@ -581,15 +792,25 @@ pub fn write_coredump(task: u64, signum: u32, state: &UserState) {
         return;
     }
 
-    // Try unlinking first to clear any old core dump file
-    let _ = poll_blocking(parent.unlink(&leaf));
-    if dump_interrupted(task) {
+    // `filename_unlinkat` and `filp_open(O_CREAT | O_EXCL, 0600)` run with
+    // the crashing task's credentials: without write permission on the
+    // directory there is no core, and nothing of anyone else's is removed
+    // from it.
+    if let Some((victim_uid, victim_gid)) = crate::handlers::entry_owner(&*parent, &leaf) {
+        if crate::handlers::may_delete_in(&*parent, victim_uid, victim_gid, task).is_err() {
+            return;
+        }
+        // Clear an old core dump file.
+        dump_unlink(&parent, &leaf);
+        if dump_interrupted(task) {
+            return;
+        }
+    }
+    if crate::handlers::may_create_in(&*parent, task).is_err() {
         return;
     }
-
-    let file = match poll_blocking(parent.create(&leaf)) {
-        Some(Ok(f)) => f,
-        _ => return,
+    let Some(file) = dump_create(&parent, &leaf, identity.fsuid, identity.fsgid) else {
+        return;
     };
 
     // Get register state
