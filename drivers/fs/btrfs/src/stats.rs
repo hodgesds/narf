@@ -159,6 +159,28 @@ pub(crate) fn note_alloc_ranges(examined: u64) {
     TOTAL_ALLOC_RANGES.fetch_add(examined, Relaxed);
 }
 
+/// The largest first-order reservation any one operation's own data
+/// references called for since [`reset_max_op_reservation`], in tree blocks.
+static MAX_OP_RESERVATION: AtomicU64 = AtomicU64::new(0);
+
+/// The most tree blocks any single operation reserved for its own data
+/// references (new, dropped and added extents) since the last
+/// [`reset_max_op_reservation`]: what a harness checks to see that freeing a
+/// large file is reserved for in bounded steps, not all at once.
+pub fn max_op_reservation() -> u64 {
+    MAX_OP_RESERVATION.load(Relaxed)
+}
+
+/// Start [`max_op_reservation`] again from zero.
+pub fn reset_max_op_reservation() {
+    MAX_OP_RESERVATION.store(0, Relaxed);
+}
+
+/// Note what one operation's own data references reserve.
+pub(crate) fn note_op_reservation(blocks: u64) {
+    MAX_OP_RESERVATION.fetch_max(blocks, Relaxed);
+}
+
 /// Count one node read from the device (a node-cache miss).
 pub(crate) fn note_device_read() {
     TOTAL_DEVICE_READS.fetch_add(1, Relaxed);

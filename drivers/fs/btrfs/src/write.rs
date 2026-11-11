@@ -1756,6 +1756,12 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
     // edited, so the error paths below have nothing to restore for it. The
     // allocator cannot be handled that way — `apply_edits` needs it by mutable
     // reference and carves from it in place — so those paths do put it back.
+    crate::stats::note_op_reservation(batch.geometry.first_order(&reserve::CommitLoad {
+        new_data: new_data.len() as u64,
+        dropped_data: dropped_data.len() as u64,
+        added_data: added_data.len() as u64,
+        ..Default::default()
+    }));
     let tree_id = vol.fs_tree_id();
     // What the batch's other subvolume trees add to its commit: new blocks,
     // freed blocks, and snapshot-COW reference items.
@@ -8007,58 +8013,142 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     Ok(())
 }
 
+/// Whether every step of freeing a file's data is committed on its own
+/// ([`set_dealloc_step_sync`]).
+static DEALLOC_STEP_SYNC: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// For crash tests: commit (and write the superblock) after every step of a
+/// truncate or of an unlinked inode's eviction, instead of when the batch's
+/// reservation runs out, so that a test can cut the device's write stream
+/// between any two steps. Never set on a production mount.
+pub fn set_dealloc_step_sync(on: bool) {
+    DEALLOC_STEP_SYNC.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// Commit now if [`set_dealloc_step_sync`] asks for it.
+pub(crate) async fn dealloc_step_done<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    if DEALLOC_STEP_SYNC.load(core::sync::atomic::Ordering::Acquire) {
+        vol.sync_to_disk().await?;
+    }
+    Ok(())
+}
+
+/// Extent items one step of freeing a file's data removes: the most a
+/// truncate or the eviction of an unlinked inode drops in one staged
+/// operation.
+///
+/// Every dropped extent is reserved for at its worst case — a path of the
+/// csum, extent and free-space trees each, nothing shared ([`reserve`]) —
+/// so an operation that dropped a whole file's extents at once asked for
+/// tens of tree blocks per extent: gigabytes for a 256 MiB file, which no
+/// filesystem had free, and the chunk allocation that a refused reservation
+/// leads to then turned unallocated space into METADATA chunks until the
+/// operation gave up with `ENOSPC`. Linux never reserves for the whole file:
+/// `btrfs_truncate` and `btrfs_evict_inode` hold a reservation of a single
+/// item's worth, `btrfs_truncate_inode_items` returns `-EAGAIN` when the
+/// delayed-refs reserve needs refilling, and the caller ends the transaction
+/// and starts the next (`evict_refill_and_join`). Here a step is this many
+/// extents; each step is one staged operation, reserved for like any other,
+/// and the batch commits between steps whenever its reservation runs out.
+pub(crate) const DEALLOC_STEP_EXTENTS: usize = 16;
+
 /// Reclaim an orphan after the final node/mapping reference. Caller holds
-/// op_lock; the inode and its ORPHAN_ITEM disappear in the same COW edit.
+/// op_lock.
+///
+/// The inode's extents go [`DEALLOC_STEP_EXTENTS`] at a time (Linux
+/// `btrfs_evict_inode`: `btrfs_truncate_inode_items` in a loop, a new
+/// transaction handle per step). Until the last step the inode and its
+/// ORPHAN_ITEM stay, with `nbytes` following the extents left, so a crash in
+/// between leaves an orphan that the next writable mount goes on reclaiming;
+/// the last step removes what remains of the extents, the inode, its xattrs
+/// and the ORPHAN_ITEM in one COW edit.
 pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
 ) -> Result<(), FsError> {
-    let (root, _) = vol.fs_tree_root();
-    let orphan = crate::orphans::key(ino);
-    if btree::find_item(vol, root, &orphan).await?.is_none() {
-        return Err(FsError::InvalidData);
-    }
-    let inode = vol.load_inode_in(root, ino).await?;
-    if inode.nlink != 0 || inode.is_dir() {
-        return Err(FsError::InvalidData);
-    }
-    let mut edits = alloc::vec![Edit::Delete(orphan)];
-    let mut dropped_data = Vec::new();
-    let mut cursor = btree::Cursor::seek(vol, root, &BtrfsKey::new(ino, 0, 0)).await?;
-    while let Some((key, body)) = cursor.current()? {
-        if key.objectid != ino {
-            break;
+    loop {
+        let (root, _) = vol.fs_tree_root();
+        let orphan = crate::orphans::key(ino);
+        if btree::find_item(vol, root, &orphan).await?.is_none() {
+            return Err(FsError::InvalidData);
         }
-        match key.item_type {
-            format::INODE_ITEM_KEY | format::XATTR_ITEM_KEY => {}
-            format::EXTENT_DATA_KEY => {
-                if body.len() < 21 {
-                    return Err(FsError::InvalidData);
-                }
-                if body[20] != format::FILE_EXTENT_INLINE {
-                    let bytenr = le64(body, 21)?;
-                    if bytenr != 0 {
-                        dropped_data.push(DataRefId {
-                            bytenr,
-                            len: le64(body, 29)?,
-                            ref_root: vol.fs_tree_id(),
-                            objectid: ino,
-                            offset: key
-                                .offset
-                                .checked_sub(le64(body, 37)?)
-                                .ok_or(FsError::InvalidData)?,
-                        });
-                    }
-                }
+        let inode = vol.load_inode_in(root, ino).await?;
+        if inode.nlink != 0 || inode.is_dir() {
+            return Err(FsError::InvalidData);
+        }
+        // The inode's own items, and the first extents: one step's worth.
+        let mut others: Vec<BtrfsKey> = Vec::new();
+        let mut extents: Vec<BtrfsKey> = Vec::new();
+        let mut dropped_data = Vec::new();
+        let mut removed_nbytes = 0u64;
+        let mut more = false;
+        let mut cursor = btree::Cursor::seek(vol, root, &BtrfsKey::new(ino, 0, 0)).await?;
+        while let Some((key, body)) = cursor.current()? {
+            if key.objectid != ino {
+                break;
             }
-            _ => return Err(FsError::Unsupported),
+            match key.item_type {
+                format::INODE_ITEM_KEY | format::XATTR_ITEM_KEY => others.push(key),
+                format::EXTENT_DATA_KEY => {
+                    if extents.len() == DEALLOC_STEP_EXTENTS {
+                        more = true;
+                        break;
+                    }
+                    if body.len() < 21 {
+                        return Err(FsError::InvalidData);
+                    }
+                    if body[20] == format::FILE_EXTENT_INLINE {
+                        removed_nbytes = removed_nbytes.saturating_add(le64(body, 8)?);
+                    } else {
+                        let bytenr = le64(body, 21)?;
+                        if bytenr != 0 {
+                            dropped_data.push(DataRefId {
+                                bytenr,
+                                len: le64(body, 29)?,
+                                ref_root: vol.fs_tree_id(),
+                                objectid: ino,
+                                offset: key
+                                    .offset
+                                    .checked_sub(le64(body, 37)?)
+                                    .ok_or(FsError::InvalidData)?,
+                            });
+                            removed_nbytes = removed_nbytes.saturating_add(le64(body, 45)?);
+                        }
+                    }
+                    extents.push(key);
+                }
+                _ => return Err(FsError::Unsupported),
+            }
+            cursor.advance().await?;
         }
-        edits.push(Edit::Delete(key));
-        cursor.advance().await?;
+        let mut edits: Vec<Edit> = Vec::new();
+        if more {
+            // Not the last step: the inode stays, counting what is left.
+            let inode_key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
+            let mut item = btree::find_item(vol, root, &inode_key)
+                .await?
+                .ok_or(FsError::NotFound)?;
+            let gen = batch_gen(vol).await?;
+            let nbytes = le64(&item, 24)?
+                .checked_sub(removed_nbytes)
+                .ok_or(FsError::InvalidData)?;
+            item[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
+            item[24..32].copy_from_slice(&nbytes.to_le_bytes());
+            edits.extend(extents.into_iter().map(Edit::Delete));
+            edits.push(Edit::Upsert(inode_key, item));
+            commit_fs_edits_reclaiming(vol, &edits, dropped_data).await?;
+            dealloc_step_done(vol).await?;
+            continue;
+        }
+        edits.push(Edit::Delete(orphan));
+        edits.extend(others.into_iter().chain(extents).map(Edit::Delete));
+        commit_fs_edits_reclaiming(vol, &edits, dropped_data).await?;
+        vol.bump_cache_generation(vol.fs_tree_id(), ino);
+        return Ok(());
     }
-    commit_fs_edits_reclaiming(vol, &edits, dropped_data).await?;
-    vol.bump_cache_generation(vol.fs_tree_id(), ino);
-    Ok(())
 }
 
 /// On-disk teardown prepared for an existing rename destination.

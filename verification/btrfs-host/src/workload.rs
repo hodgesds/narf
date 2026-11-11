@@ -96,6 +96,13 @@ pub struct CommitRec {
     pub gen: u64,
     /// Per candidate: one flattened tree per subvolume, in `subs` order.
     pub candidates: Vec<Vec<FlatTree>>,
+    /// The commit happened during a truncate of `(subvolume, path)` to this
+    /// length. A truncate that drops many extents drops them from the end of
+    /// the file in steps and may commit between two of them (as Linux
+    /// `btrfs_truncate` does), so the file may also be found at any length
+    /// from the new one up to the one a candidate gives it, with that
+    /// candidate's bytes up to there.
+    pub shrinking: Option<(usize, String, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -292,7 +299,11 @@ impl<'a> Workload<'a> {
 
     /// Attribute commits the device saw since the last call to the states
     /// `before` (and the current one).
-    pub fn note_commits(&mut self, before: Option<Vec<FlatTree>>) {
+    pub fn note_commits(
+        &mut self,
+        before: Option<Vec<FlatTree>>,
+        shrinking: Option<(usize, String, usize)>,
+    ) {
         let gens = self.dev.sb_gens();
         if gens.len() == self.seen_sb {
             return;
@@ -308,6 +319,7 @@ impl<'a> Workload<'a> {
             self.commits.push(CommitRec {
                 gen,
                 candidates: candidates.clone(),
+                shrinking: shrinking.clone(),
             });
             self.stats.commits += 1;
         }
@@ -778,8 +790,12 @@ impl<'a> Workload<'a> {
             Some(self.flats())
         };
         *self.stats.ops.entry(op.kind()).or_default() += 1;
+        let shrinking = match &op {
+            Op::Truncate { sub, path, len } => Some((*sub, path.clone(), *len as usize)),
+            _ => None,
+        };
         let r = self.apply_inner(op);
-        self.note_commits(before);
+        self.note_commits(before, shrinking);
         r.map_err(|e| {
             format!(
                 "op #{} {short} failed: {e}\nklog tail:\n{}",
