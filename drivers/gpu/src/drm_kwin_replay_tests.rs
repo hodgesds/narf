@@ -549,3 +549,69 @@ kernel_test_in!(
     "drivers/gpu/drm/kwin_replay",
     kwin_frames_and_probes_return_every_buffer_pin_and_framebuffer
 );
+
+/// drm_show_fdinfo on the device files themselves: each open reports its
+/// own client id and the memory its handles hold, a buffer shared between
+/// two opens in both, and system pages apart from VRAM.
+fn device_files_report_their_memory_in_fdinfo() -> TestResult {
+    let Some(f) = Fixture::new(8) else {
+        return TestResult::Fail("fixture");
+    };
+    let (Some(kms), Some(client)) = (DriCardFile::new(f.index), DriCardFile::new(f.index)) else {
+        return TestResult::Fail("opens");
+    };
+    let vram = crate::amdgpu_uapi::AMDGPU_GEM_DOMAIN_VRAM;
+    let gtt = crate::amdgpu_uapi::AMDGPU_GEM_DOMAIN_GTT;
+    let (Ok(shared), Ok(_private), Ok(_system)) = (
+        create(&client, vram),
+        create(&client, vram),
+        create(&client, gtt),
+    ) else {
+        return TestResult::Fail("client buffers");
+    };
+    let Ok(dmabuf) = client.drm_prime_export_file(shared) else {
+        return TestResult::Fail("export");
+    };
+    if kms.drm_prime_import_file(&dmabuf).is_err() {
+        return TestResult::Fail("import");
+    }
+    let text = |file: &DriCardFile| {
+        let mut out = alloc::string::String::new();
+        file.show_fdinfo(&mut out);
+        out
+    };
+    let (of_client, of_kms) = (text(&client), text(&kms));
+    let id = |text: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix("drm-client-id:\t"))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    if !of_client.starts_with("drm-driver:\tamdgpu\ndrm-client-id:\t")
+        || !of_client.contains("drm-memory-vram:\t8 KiB\n")
+        || !of_client.contains("drm-memory-gtt: \t4 KiB\n")
+        || !of_client.contains("amd-requested-vram:\t8 KiB\n")
+        || !of_client.contains("amd-requested-gtt:\t4 KiB\n")
+    {
+        return TestResult::Fail("the client's fdinfo");
+    }
+    if !of_kms.contains("drm-memory-vram:\t4 KiB\n")
+        || !of_kms.contains("drm-memory-gtt: \t0 KiB\n")
+        || id(&of_kms).is_none()
+        || id(&of_kms) == id(&of_client)
+    {
+        return TestResult::Fail("the importer's fdinfo");
+    }
+    // The same figures as the card's mem_info_* attributes read them.
+    use crate::amdgpu_gem::accounting::{mem_info, MemInfo};
+    if mem_info(f.index, MemInfo::VramTotal) != 8 * PAGE
+        || mem_info(f.index, MemInfo::VisVramUsed) != 2 * PAGE
+        || mem_info(f.index, MemInfo::GttUsed) < PAGE
+    {
+        return TestResult::Fail("mem_info");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/kwin_replay",
+    device_files_report_their_memory_in_fdinfo
+);

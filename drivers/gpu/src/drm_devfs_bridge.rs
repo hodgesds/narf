@@ -193,6 +193,29 @@ fn device_closed(index: u32) {
     }
 }
 
+/// `drm_show_fdinfo` for an open of amdgpu card `index`: the driver, the
+/// open's client id and the card's PCI address, then amdgpu_show_fdinfo's
+/// memory keys (`amdgpu_gem::accounting::fdinfo`). Nothing for another
+/// driver's card.
+#[cfg(feature = "amdgpu")]
+fn drm_show_fdinfo(index: u32, gem: &crate::amdgpu_gem::GemState, out: &mut String) {
+    if crate::drm_registry::driver_name(index) != Some("amdgpu") {
+        return;
+    }
+    let pdev = crate::drm_registry::card(index)
+        .and_then(|card| crate::drm_sysfs_bridge::pci_addr_for_card(card.as_ref(), index))
+        .map(|a| {
+            alloc::format!(
+                "{:04x}:{:02x}:{:02x}.{}",
+                a.segment,
+                a.bus,
+                a.device,
+                a.function
+            )
+        });
+    crate::amdgpu_gem::accounting::fdinfo(gem, pdev.as_deref(), out);
+}
+
 /// Monotonically-increasing source of per-open DRM master ids. Starts at 1 so
 /// 0 is reserved as a "no such open" sentinel (render nodes pass 0 — they never
 /// participate in master arbitration).
@@ -518,6 +541,14 @@ impl FileOps for DriCardFile {
     fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         let r = drm_node_remove_xattr(&self.metadata, name);
         Box::pin(async move { r })
+    }
+
+    /// drm_show_fdinfo.
+    fn show_fdinfo(&self, out: &mut String) {
+        #[cfg(feature = "amdgpu")]
+        drm_show_fdinfo(self.index, &self.amdgpu_gem, out);
+        #[cfg(not(feature = "amdgpu"))]
+        let _ = out;
     }
 
     /// DRM_IOCTL_* dispatch for `/dev/dri/card<N>`. Primary-node fd
@@ -1593,6 +1624,13 @@ impl Drop for DriRenderFile {
 }
 
 impl FileOps for DriRenderFile {
+    /// drm_show_fdinfo.
+    fn show_fdinfo(&self, out: &mut String) {
+        #[cfg(feature = "amdgpu")]
+        drm_show_fdinfo(self.index, &self.amdgpu_gem, out);
+        #[cfg(not(feature = "amdgpu"))]
+        let _ = out;
+    }
     fn mmap_backing(
         &self,
         offset: u64,

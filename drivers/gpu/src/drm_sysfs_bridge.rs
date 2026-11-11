@@ -394,6 +394,16 @@ fn populate_card_node(
     // Linux tools (`/sys/class/drm/card<N>/device/pp_features`) look.
     add_power_controls(&kobj, &card);
     add_power_controls(&dev_kobj, &card);
+    // amdgpu_vram_mgr's and amdgpu_gtt_mgr's mem_info_* on the PCI device,
+    // read at each open of the attribute.
+    #[cfg(feature = "amdgpu")]
+    if driver == "amdgpu" {
+        for (which, name) in crate::amdgpu_gem::accounting::MemInfo::ALL {
+            kobject_add_attr(&dev_kobj, name, move || {
+                format!("{}\n", crate::amdgpu_gem::accounting::mem_info(idx, which))
+            });
+        }
+    }
     #[cfg(feature = "intel")]
     crate::intel_gpu_power_controls::runtime::populate_card(idx, &dev_kobj);
 
