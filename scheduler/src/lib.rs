@@ -1179,6 +1179,13 @@ pub(crate) struct WakeCell {
     /// activation_queued; the consumer reads next before releasing that claim.
     activation_queued: AtomicBool,
     wake_next: AtomicPtr<WakeCell>,
+    /// Which public inbox list this node is on: [`ParkedWakeHead::stamp`] of
+    /// the list at the moment it was linked, or 0. Written under that list's
+    /// gate when the node is linked and when it is unlinked. A detach does not
+    /// touch the nodes; it moves the list's generation on, so every detached
+    /// node's stamp stops matching. Read under a list's gate, it says whether
+    /// the node is on that list without walking it.
+    wake_list: AtomicU64,
     /// The owning task's id, so the raw waker can name it as its CPU's
     /// wake-next buddy (see [`record_wake_next`]). Immutable after creation.
     task: u64,
@@ -1492,6 +1499,7 @@ fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
         parked_location: AtomicUsize::new(NOT_PARKED),
         activation_queued: AtomicBool::new(false),
         wake_next: AtomicPtr::new(core::ptr::null_mut()),
+        wake_list: AtomicU64::new(0),
         task: id.raw(),
         wake_cyc: AtomicU64::new(0),
         wake_halt_gen: AtomicU64::new(0),
@@ -3859,6 +3867,8 @@ static WAKE_INBOX_LEN: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
 struct ParkedWakeHead {
     head: AtomicPtr<WakeCell>,
     len: AtomicUsize,
+    /// Counts detaches of the public list. Changed only under `gate`.
+    generation: AtomicU64,
     /// Leaf lock: publish/detach only, never held over a parked/run-queue lock,
     /// policy callback, allocation, or task teardown.
     gate: IrqSafeSpinLock<()>,
@@ -3867,10 +3877,24 @@ static PARKED_WAKE_INBOX: [ParkedWakeHead; narf_lib::percpu::MAX_CPUS] = [const 
     ParkedWakeHead {
         head: AtomicPtr::new(core::ptr::null_mut()),
         len: AtomicUsize::new(0),
+        generation: AtomicU64::new(0),
         gate: IrqSafeSpinLock::new(()),
     }
 };
     narf_lib::percpu::MAX_CPUS];
+
+impl ParkedWakeHead {
+    /// Identifies `cpu`'s public list as it stands: its CPU and how many
+    /// times it has been detached, never 0. Call with the gate held. A node
+    /// carries the stamp of the list it was linked on
+    /// ([`WakeCell::wake_list`]); the two agree exactly while the node is
+    /// still on that list.
+    #[inline]
+    fn stamp(&self, cpu: usize) -> u64 {
+        const _: () = assert!(narf_lib::percpu::MAX_CPUS <= 256);
+        ((self.generation.load(Ordering::Relaxed) + 1) << 8) | cpu as u64
+    }
+}
 fn parked_wake_push(cell: &WakeCell) {
     'retry: loop {
         if cell.parked_location.load(Ordering::SeqCst) == NOT_PARKED
@@ -3911,6 +3935,7 @@ fn parked_wake_push(cell: &WakeCell) {
                 unsafe { Arc::increment_strong_count(ptr) };
                 cell.wake_next
                     .store(inbox.head.load(Ordering::Relaxed), Ordering::Relaxed);
+                cell.wake_list.store(inbox.stamp(cpu), Ordering::Relaxed);
                 inbox.len.fetch_add(1, Ordering::Release);
                 inbox.head.store(ptr, Ordering::Release);
             }
@@ -3994,6 +4019,12 @@ fn take_parked_wake_batch(cpu: usize) -> *mut WakeCell {
     let mut batch = {
         let inbox = &PARKED_WAKE_INBOX[cpu];
         let _gate = inbox.gate.lock();
+        // The nodes leave the public list together: one store retires the
+        // stamp they all carry.
+        let generation = inbox.generation.load(Ordering::Relaxed);
+        inbox
+            .generation
+            .store(generation.wrapping_add(1), Ordering::Relaxed);
         inbox.head.swap(core::ptr::null_mut(), Ordering::Acquire)
     };
     let mut ordered = core::ptr::null_mut();
@@ -4025,6 +4056,14 @@ fn take_parked_wake_batch(cpu: usize) -> *mut WakeCell {
 /// releases it. Links change only under the gate, and a linked node is pinned
 /// by the inbox's reference, so the walk reads live nodes. The caller's slot
 /// holds its own reference: the one dropped here is never the last.
+///
+/// The list is walked only when the node is on it. A claim can be set while
+/// the node is somewhere else — in the owner's detached batch, or claimed by
+/// a producer that has not linked it yet — and callers hold `PARKED[cpu]`
+/// (some also the ready queue and the policy slot) with interrupts masked, so
+/// walking a long list to find nothing there is not acceptable. The node's
+/// stamp settles it in one comparison under the gate. When the node is on the
+/// list the walk stops at it; freshly staged nodes are at the front.
 fn unlink_parked_wake(cpu: usize, cell: &WakeCell) {
     // No claim, no node: the task was asleep and unwoken, or already drained.
     if !cell.activation_queued.load(Ordering::SeqCst) {
@@ -4034,6 +4073,9 @@ fn unlink_parked_wake(cpu: usize, cell: &WakeCell) {
     let inbox = &PARKED_WAKE_INBOX[cpu];
     {
         let _gate = inbox.gate.lock();
+        if cell.wake_list.load(Ordering::Relaxed) != inbox.stamp(cpu) {
+            return;
+        }
         let mut prev: *mut WakeCell = core::ptr::null_mut();
         let mut node = inbox.head.load(Ordering::Relaxed);
         while !node.is_null() && node != target {
@@ -4042,6 +4084,9 @@ fn unlink_parked_wake(cpu: usize, cell: &WakeCell) {
             node = unsafe { (*node).wake_next.load(Ordering::Relaxed) };
         }
         if node.is_null() {
+            // The stamp said the node is here; a list that disagrees is
+            // corrupt. Leave it as found rather than guess.
+            debug_assert!(false, "activation node stamped for a list it is not on");
             return;
         }
         let next = cell.wake_next.load(Ordering::Relaxed);
@@ -4051,6 +4096,7 @@ fn unlink_parked_wake(cpu: usize, cell: &WakeCell) {
             // SAFETY: `prev` is a linked node, pinned as above.
             unsafe { (*prev).wake_next.store(next, Ordering::Relaxed) };
         }
+        cell.wake_list.store(0, Ordering::Relaxed);
         inbox.len.fetch_sub(1, Ordering::Release);
     }
     cell.activation_queued.store(false, Ordering::SeqCst);
@@ -8610,6 +8656,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         parked_location: AtomicUsize::new(NOT_PARKED),
         activation_queued: AtomicBool::new(false),
         wake_next: AtomicPtr::new(core::ptr::null_mut()),
+        wake_list: AtomicU64::new(0),
         // Nested block_on future: not a ready-queue slot, so no wake-next id.
         task: 0,
         wake_cyc: AtomicU64::new(0),

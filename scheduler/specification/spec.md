@@ -666,6 +666,14 @@ The one node a taker cannot unlink is one in the owner's detached batch; the
 drain that detached it is already running and releases or forwards it. The
 lock order is parked set, then gate; the gate remains a leaf.
 
+Each node carries the stamp — CPU and detach generation — of the public list
+it was last linked on, written under that list's gate at link and cleared at
+unlink; a detach moves the list's generation on instead of touching its
+nodes. Under a list's gate the stamp therefore says whether a node is on that
+list, and a taker walks the list only then. A claim that is set while the
+node is in the owner's batch, or not linked yet, costs one comparison rather
+than a walk of everything staged there with ownership locks held.
+
 Home publication precedes the SeqCst parked-token store. The subsequent
 SeqCst awake-bit recheck pairs with the waker's SeqCst flag swap followed by
 token load: both sides cannot miss the transition. Node-claim release and
