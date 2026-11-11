@@ -2186,17 +2186,23 @@ fn smoke_cgroup_cpuset_mems_and_inherit() -> TestResult {
         if eff_cpus.trim().is_empty() || eff_mems.trim().is_empty() {
             return TestResult::Fail("effective set empty despite parent inheritance");
         }
-        // Requesting node 0 (always populated) round-trips and yields a
-        // non-empty effective mems set including node 0.
-        if write_attr(cg, "cpuset.mems", b"0").is_err() {
-            return TestResult::Fail("set cpuset.mems=0 failed");
+        // Requesting one memory node — the first one the parent offers, which
+        // need not be node 0 — round-trips and yields exactly that node.
+        let node = eff_mems
+            .trim()
+            .split([',', '-'])
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if node.is_empty() || write_attr(cg, "cpuset.mems", node.as_bytes()).is_err() {
+            return TestResult::Fail("set cpuset.mems to a memory node failed");
         }
-        if read_attr(cg, "cpuset.mems").unwrap_or_default().trim() != "0" {
+        if read_attr(cg, "cpuset.mems").unwrap_or_default().trim() != node {
             return TestResult::Fail("cpuset.mems did not round-trip");
         }
         let eff_after = read_attr(cg, "cpuset.mems.effective").unwrap_or_default();
-        if !eff_after.contains('0') {
-            return TestResult::Fail("cpuset.mems.effective missing requested node 0");
+        if eff_after.trim() != node {
+            return TestResult::Fail("cpuset.mems.effective is not the requested node");
         }
         // Malformed cpulists are rejected, leaving requested state intact.
         if write_attr(cg, "cpuset.cpus", b"0-").is_ok() {

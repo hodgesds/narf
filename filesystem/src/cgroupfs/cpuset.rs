@@ -91,12 +91,25 @@ fn all_online_mask() -> u64 {
     1
 }
 
-/// Memory nodes backed by a populated allocator zone.
+/// Memory nodes that have RAM (Linux `node_states[N_MEMORY]`, which the
+/// root cpuset's `cpuset.mems.effective` reports): every node with an online
+/// memory block. Whether the node has free memory right now does not matter —
+/// a node whose RAM is all in use, or all taken by the kernel image, is still
+/// a memory node, and a task may be bound to it.
 fn all_memory_mask() -> u64 {
     let mut mask = 0u64;
-    for node in 0..narf_memory::FRAME_MAX_NUMA_NODES {
-        if narf_memory::node_free(node) != 0 {
-            mask |= 1u64 << node;
+    for block in narf_memory::memory_blocks() {
+        if block.online && block.node < 64 {
+            mask |= 1u64 << block.node;
+        }
+    }
+    if mask == 0 {
+        // No block registry (no boot RAM recorded): fall back to the nodes
+        // the allocator manages pages on.
+        for node in 0..narf_memory::FRAME_MAX_NUMA_NODES {
+            if narf_memory::node_total(node) != 0 {
+                mask |= 1u64 << node;
+            }
         }
     }
     if mask == 0 {
@@ -410,16 +423,19 @@ fn smoke_cpuset_mems_propagates_to_task() -> narf_kernel_test::TestResult {
 
     const TASK: u64 = 0x4350_5553_4554;
     let state = CpuSetController.new_state(None);
+    // Any memory node will do; node 0 need not be one.
+    let node = all_memory_mask().trailing_zeros();
+    let node_text = alloc::format!("{node}");
     if state.files().contains(&"cpuset.memory_migrate")
         || state.write("cpuset.memory_migrate", b"1").is_ok()
     {
         return TestResult::Fail("legacy cpuset.memory_migrate leaked into cgroup2");
     }
-    if state.write("cpuset.mems", b"0").is_err() {
-        return TestResult::Fail("cpuset.mems rejected online node 0");
+    if state.write("cpuset.mems", node_text.as_bytes()).is_err() {
+        return TestResult::Fail("cpuset.mems rejected a memory node");
     }
     state.on_attach(TASK);
-    if narf_scheduler::task_mems_allowed(TASK) != 1 {
+    if narf_scheduler::task_mems_allowed(TASK) != 1u64 << node {
         state.on_detach(TASK);
         return TestResult::Fail("cpuset.mems did not reach scheduler task policy");
     }
