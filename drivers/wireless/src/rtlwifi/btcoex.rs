@@ -81,6 +81,11 @@ pub const fn pattern_for(wifi: WifiState, bt: BtState) -> TdmaPattern {
         (WifiState::Connected, BtState::Idle) => TdmaPattern::WifiOnly,
         (WifiState::Connected, BtState::Streaming) => TdmaPattern::Shared,
         (WifiState::Connected, BtState::Inquiry) => TdmaPattern::Shared,
+        // BT idle never shares the antenna: btc8821a2ant_is_common_action
+        // turns PS-TDMA off both for a non-connected Wi-Fi and for
+        // connected Wi-Fi with BT non-connected-idle
+        // (btcoexist/halbtc8821a2ant.c:1573).
+        (WifiState::Scanning, BtState::Idle) => TdmaPattern::WifiOnly,
         (WifiState::Scanning, _) => TdmaPattern::Shared,
     }
 }
