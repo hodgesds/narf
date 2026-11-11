@@ -474,6 +474,19 @@ impl MacIdPool {
         self.used.get(macid as usize).copied().unwrap_or(false)
     }
 
+    /// Claim one specific MACID (an MLD re-adding a link at
+    /// a slot it returned). Refuses with [`Error::NoMacId`]
+    /// when the slot is taken or out of range.
+    pub(super) fn claim(&mut self, macid: u8) -> Result<(), Error> {
+        match self.used.get_mut(macid as usize) {
+            Some(slot) if !*slot => {
+                *slot = true;
+                Ok(())
+            }
+            _ => Err(Error::NoMacId),
+        }
+    }
+
     /// Allocate an MLD base MACID: the lowest base `b` in
     /// `0..MLD_MACID_STRIDE` whose whole strided pair
     /// (`b`, `b + MLD_MACID_STRIDE`) is free. Both slots are
@@ -1010,7 +1023,9 @@ impl MldLink {
 /// each link's CCTL bodies over H2C. Removing the last link
 /// leaves an empty MLD; the caller then drops it (its
 /// [`MldStation::release_all`] is a no-op once empty, and
-/// every removed link already freed its own MACID).
+/// every removed link already freed its own MACID). A
+/// one-link MLD's [`MldStation::release_all`] also returns
+/// the reserved second-link MACID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MldStation {
     /// Peer MLD address (shared by all links).
@@ -1024,6 +1039,12 @@ pub(super) struct MldStation {
     pub(super) port: u8,
     /// Admitted links by instance index; `None` = free.
     pub(super) links: [Option<MldLink>; chip_8922a::SUPPORT_LINK_NUM],
+    /// Instance slots whose pool MACID this MLD still holds.
+    /// [`MacIdPool::alloc_mld_base`] reserves both strided
+    /// slots, so a one-link MLD holds the second link's MACID
+    /// without a link in it; [`Self::remove_link`] returns a
+    /// slot and [`Self::add_link`] re-claims it.
+    pub(super) held: [bool; chip_8922a::SUPPORT_LINK_NUM],
 }
 
 impl MldStation {
@@ -1123,6 +1144,7 @@ impl MldStation {
         &mut self,
         factory: &BeFactory,
         facet: EhtStation,
+        pool: &mut MacIdPool,
         link: &LinkRequest<'_>,
     ) -> Result<u8, Error> {
         if link.link_id > MAX_LINK_ID {
@@ -1153,6 +1175,10 @@ impl MldStation {
             .ok_or(Error::TooManyLinks)?;
         let macid = self.base_macid + (index * MLD_MACID_STRIDE) as u8;
         let station = build_station(factory, facet, &link.req, macid, six_ghz)?;
+        if !self.held[index] {
+            pool.claim(macid)?;
+            self.held[index] = true;
+        }
         self.links[index] = Some(MldLink {
             link_id: link.link_id,
             index,
@@ -1183,6 +1209,7 @@ impl MldStation {
             .ok_or(Error::LinkNotFound)?;
         let link = self.links[index].take().expect("slot held a link");
         pool.free(link.macid());
+        self.held[index] = false;
         Ok(link)
     }
 
@@ -1191,8 +1218,10 @@ impl MldStation {
     /// record itself is then dead; the caller must not send
     /// further H2C for it. A no-op when already empty.
     pub(super) fn release_all(&self, pool: &mut MacIdPool) {
-        for link in self.links.iter().flatten() {
-            pool.free(link.macid());
+        for (index, held) in self.held.iter().enumerate() {
+            if *held {
+                pool.free(self.base_macid + (index * MLD_MACID_STRIDE) as u8);
+            }
         }
     }
 }
@@ -1276,5 +1305,6 @@ pub(super) fn admit_mld(
         aid,
         port,
         links: slots,
+        held: [true; chip_8922a::SUPPORT_LINK_NUM],
     })
 }

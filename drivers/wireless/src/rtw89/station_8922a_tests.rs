@@ -728,7 +728,7 @@ fn smoke_rtw89_8922a_mld_teardown_and_fallback() -> TestResult {
             ..base_req()
         },
     };
-    if mld.add_link(&f, facet, &third) != Err(Error::TooManyLinks) {
+    if mld.add_link(&f, facet, &mut pool, &third) != Err(Error::TooManyLinks) {
         return TestResult::Fail("full MLD must refuse a third link");
     }
     if mld.remove_link(&mut pool, 9) != Err(Error::LinkNotFound) {
@@ -763,7 +763,7 @@ fn smoke_rtw89_8922a_mld_teardown_and_fallback() -> TestResult {
             ..base_req()
         },
     };
-    let macid = match mld.add_link(&f, facet, &rejoin) {
+    let macid = match mld.add_link(&f, facet, &mut pool, &rejoin) {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("link 1 re-add failed"),
     };
@@ -990,7 +990,7 @@ fn smoke_rtw89_8922a_mld_base_interleave() -> TestResult {
         return TestResult::Fail("interleaved release state mismatch");
     }
     single.release_macid(&mut pool);
-    // Slots 0..17 held: base 0 is blocked by slot 0, base 1
+    // Slots 0 and 17 held: base 0 is blocked by slot 0, base 1
     // by slot 17, so the first MLD base is 2 (MACIDs 2, 18).
     let mut crowded = MacIdPool::new();
     for _ in 0..18 {
@@ -998,6 +998,10 @@ fn smoke_rtw89_8922a_mld_base_interleave() -> TestResult {
             Ok(_) => {}
             Err(_) => return TestResult::Fail("crowded pool fill failed"),
         };
+    }
+    // Keep only slots 0 and 17 held.
+    for macid in 1..17 {
+        crowded.free(macid);
     }
     let mld2 = match admit_mld(&f, facet, &mut crowded, MLD_ADDR, &links) {
         Ok(v) => v,
