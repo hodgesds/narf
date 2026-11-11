@@ -81,6 +81,7 @@ mod completion_8922a;
 mod completion_8922a_tests;
 pub mod datapath;
 mod ddv;
+mod dig_a;
 pub mod dma;
 mod dma_8922a;
 #[cfg(any(test, feature = "kernel-test"))]
@@ -173,6 +174,7 @@ mod radio_power_c;
 mod radio_shutdown;
 mod radio_stop;
 mod radio_table;
+mod radio_tables_a;
 mod radio_tables_b;
 mod radio_trim;
 mod rf_access;

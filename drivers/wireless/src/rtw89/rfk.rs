@@ -515,6 +515,9 @@ impl ChannelRxDck {
     }
 }
 
+/// RTL8852A `rtw8852a_rfk_init` (RCK/DACK/RX DCK).
+#[path = "rfk/a.rs"]
+pub(super) mod a;
 /// RTL8922A channel RFK (`rtw8922a_rfk_channel`, `rtw8922a_rfk_band_changed`)
 /// and periodic track (`rtw89_core_rfk_track` / `rtw8922a_rfk_track`).
 #[path = "rfk/be_channel.rs"]

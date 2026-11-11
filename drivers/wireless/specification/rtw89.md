@@ -483,6 +483,12 @@ analog/direct, zero/A5 inherited fields and full/sparse masks. Tests cover each
 access failure and cancellation point, all busy/done deadlines, invalid paths,
 the actual native aperture and revoked authority. `radio_tables_b` retains the
 actual B BB1,013, gain66, RF-A8,295, RF-B8,392 and NCTL1,320 pair entries.
+`radio_tables_a` retains the actual A BB1,267, RF-A28,869, RF-B29,126 and
+NCTL1,036 pair entries; A has no gain table (`rtw8852a_chip_info.bb_gain_table`
+is NULL), so the same selector runs 11 frozen A cases (full selected-stream
+counts and order-sensitive digests, including the two rejected unknown-RFE RF
+packages) with no GAIN index. `radio_assets::Assets` admits A with the static
+A fallback for BB/RF_A/RF_B/NCTL and a firmware GAIN element only when present.
 `radio_table::program` validates/selects the entire immutable program before
 its first device write, preserving exact/wildcard/max-cut headline ordering
 and conditional branch selection.160 frozen selector reference cases
@@ -559,7 +565,12 @@ sequences are not reused. No adaptive simultaneous-BT or PM mode is claimed.
 The same retained owner then applies B's exact bb_sethw/MACID-limit prefix,
 retains actual post-BB RPL offset/RSSI bases, initializes the selected NCTL
 program, and executes initial RCK A/B, DRCK/ADCCK/DACK A/B and RXDCK A/B.
-`rfk::Rfk` retains all measured I/Q MSBK, ADC/DAC offsets/bias and actual DPD
+RTL8852A has the same initial shape through `rfk::a::Init` (RCK A/B,
+table-driven ADDCK/DACK A/B, AFE RX DCK A/B) with A-only differences: no DRCK
+and no PHYREG_SET write, `RR_MOD` 0x30001 then 0x40001, and the ADDCK/DACK def
+tables from `rtw8852a_rfk_table.c`; the AFE RX DCK restores the full saved
+RXCK word, and channel RX DCK is the same AFE flow through
+`rfk::a::ChannelRxDck`. `rfk::Rfk` retains all measured I/Q MSBK, ADC/DAC offsets/bias and actual DPD
 backoff decision; no fabricated measurement establishes completion. Source
 polls are bounded and warning-only Linux timeouts instead fail closed. DACK and
 RXDCK boundaries maintain the actual WLAN-only/scoreboard owner. RXDCK pauses

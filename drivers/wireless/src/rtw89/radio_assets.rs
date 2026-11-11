@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Immutable B/C PHY tables retained from the same verified firmware container.
+//! Immutable A/B/C PHY tables retained from the same verified firmware container.
 //!
 //! RTL8852B keeps its static rtw8852b_table.c fallback. RTL8852C mirrors
 //! `rtw8852c_chip_info.rf_table = {radiob, radioa}`: the firmware RADIO_A
@@ -11,6 +11,14 @@
 //! the shipped `rtw8851b_fw-1.bin` carries BB, GAIN, RADIO_A idx 0 and NCTL;
 //! a RADIO_B element is refused and, with no static rtw8851b_table.c copy, a
 //! container missing any of the four is refused (`Error::Element`).
+//!
+//! RTL8852A mirrors `rtw8852a_chip_info` (`.bb_table`, `.rf_table =
+//! {radioa, radiob}`, `.nctl_table`, `.dig_table`): the static
+//! `rtw8852a_table.c` copy is the fallback for BB/RF_A/RF_B/NCTL, with the
+//! idx == path slot order (RADIO_A idx 0, RADIO_B idx 1). Linux's
+//! `.bb_gain_table` is NULL, so there is no static gain fallback: a
+//! firmware GAIN element programs index 1 when present, and `bind` skips
+//! it otherwise.
 //!
 //! RTL8922A mirrors `rtw8922a_chip_info.rf_table = {}` (and
 //! `bb_table` / `bb_gain_table` / `nctl_table` / `dflt_parms` all NULL,
@@ -28,7 +36,9 @@
 //! element entirely — a documented narrowing, not a silent default:
 //! a BE container whose PHY tables all carry a nonzero aid is refused
 //! for missing tables rather than matched against an unknown aid.
-use super::{mac::ChipId, prepared::PreparedFirmware, radio_table::Pair, radio_tables_b};
+use super::{
+    mac::ChipId, prepared::PreparedFirmware, radio_table::Pair, radio_tables_a, radio_tables_b,
+};
 use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -71,7 +81,11 @@ impl Assets {
     pub fn from_prepared(image: &PreparedFirmware) -> Result<Self, Error> {
         if !matches!(
             image.chip(),
-            ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B | ChipId::Rtl8922A
+            ChipId::Rtl8852A
+                | ChipId::Rtl8852B
+                | ChipId::Rtl8852C
+                | ChipId::Rtl8851B
+                | ChipId::Rtl8922A
         ) {
             return Err(Error::Unsupported);
         }
@@ -222,6 +236,11 @@ impl Assets {
                 // One RF path: no RADIO_B program exists to bind.
                 continue;
             }
+            if i == 1 && self.chip == ChipId::Rtl8852A && self.table(1).is_none() {
+                // No static A gain table and no firmware GAIN element:
+                // nothing to bind for index 1.
+                continue;
+            }
             let program =
                 super::radio_table::program(self.table(i).ok_or(Error::Element)?, rfe, cut)
                     .map_err(|_| Error::Element)?;
@@ -237,8 +256,9 @@ impl Assets {
         self.chip
     }
     /// Index 0 BB, 1 BB gain, 2 RF path A, 3 RF path B, 4 NCTL. RTL8851B
-    /// has no path B table (index 3 is `None`). RTL8922A returns the
-    /// firmware tables (no static fallback).
+    /// has no path B table (index 3 is `None`). RTL8852A has no static
+    /// gain table (index 1 is `None` unless a firmware GAIN element is
+    /// present). RTL8922A returns the firmware tables (no static fallback).
     pub fn table(&self, index: usize) -> Option<&[Pair]> {
         if matches!(
             self.chip,
@@ -246,13 +266,28 @@ impl Assets {
         ) {
             return self.tables.get(index)?.as_deref();
         }
-        let defaults = [
-            radio_tables_b::BB,
-            radio_tables_b::GAIN,
-            radio_tables_b::RF_A,
-            radio_tables_b::RF_B,
-            radio_tables_b::NCTL,
-        ];
+        if self.chip == ChipId::Rtl8852A && index == 1 {
+            // Linux `rtw8852a_chip_info.bb_gain_table` is NULL: no static
+            // gain table exists; only a firmware GAIN element programs it.
+            return self.tables.get(1)?.as_deref();
+        }
+        let defaults = if self.chip == ChipId::Rtl8852A {
+            [
+                radio_tables_a::BB,
+                &[][..],
+                radio_tables_a::RF_A,
+                radio_tables_a::RF_B,
+                radio_tables_a::NCTL,
+            ]
+        } else {
+            [
+                radio_tables_b::BB,
+                radio_tables_b::GAIN,
+                radio_tables_b::RF_A,
+                radio_tables_b::RF_B,
+                radio_tables_b::NCTL,
+            ]
+        };
         Some(
             self.tables
                 .get(index)?
@@ -498,5 +533,62 @@ mod tests {
     kernel_test_in!(
         "drivers/wireless/rtw89",
         smoke_rtw89_be_radio_assets_follow_linux_empty_rf_table
+    );
+    fn smoke_rtw89_a_radio_assets_follow_linux_static_tables_and_optional_gain() -> TestResult {
+        let pair = |a: u32| [a.to_le_bytes(), 0x12345u32.to_le_bytes()].concat();
+        // Legacy single-image firmware: the static rtw8852a_table.c copy
+        // is the fallback for BB/RF_A/RF_B/NCTL; there is no static gain
+        // table (`rtw8852a_chip_info.bb_gain_table` is NULL).
+        let Ok(assets) = Assets::parse_for(ChipId::Rtl8852A, &[0u8; 64]) else {
+            return TestResult::Fail("legacy RTL8852A image refused");
+        };
+        if assets.table(0) != Some(radio_tables_a::BB)
+            || assets.table(1).is_some()
+            || assets.table(2) != Some(radio_tables_a::RF_A)
+            || assets.table(3) != Some(radio_tables_a::RF_B)
+            || assets.table(4) != Some(radio_tables_a::NCTL)
+            || assets.chip() != ChipId::Rtl8852A
+        {
+            return TestResult::Fail("RTL8852A static table fallback differs");
+        }
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        if assets.bind(&mut hash, 1, 1).is_err() {
+            return TestResult::Fail("RTL8852A static table set did not bind without gain");
+        }
+        // A firmware GAIN element programs index 1 and binds with it.
+        let mut bytes = container();
+        add(&mut bytes, 3, 0, 0, &pair(0x103));
+        let Ok(assets) = Assets::parse_for(ChipId::Rtl8852A, &bytes) else {
+            return TestResult::Fail("RTL8852A firmware GAIN container refused");
+        };
+        if assets.table(1) != Some(&[Pair(0x103, 0x12345)][..])
+            || assets.table(0) != Some(radio_tables_a::BB)
+        {
+            return TestResult::Fail("RTL8852A firmware GAIN did not land in index 1");
+        }
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        if assets.bind(&mut hash, 1, 1).is_err() {
+            return TestResult::Fail("RTL8852A table set with firmware gain did not bind");
+        }
+        // The C `{radiob, radioa}` slot order is refused for A; a
+        // firmware RADIO_B at idx 1 is accepted as an override.
+        let mut bytes = container();
+        add(&mut bytes, 4, 0, 1, &pair(0x104));
+        if Assets::parse_for(ChipId::Rtl8852A, &bytes).is_ok() {
+            return TestResult::Fail("RTL8852A accepted the C radio slot order");
+        }
+        let mut bytes = container();
+        add(&mut bytes, 5, 0, 1, &pair(0x105));
+        let Ok(assets) = Assets::parse_for(ChipId::Rtl8852A, &bytes) else {
+            return TestResult::Fail("RTL8852A firmware RADIO_B idx1 container refused");
+        };
+        if assets.table(3) != Some(&[Pair(0x105, 0x12345)][..]) {
+            return TestResult::Fail("RTL8852A firmware RADIO_B did not land in index 3");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/rtw89",
+        smoke_rtw89_a_radio_assets_follow_linux_static_tables_and_optional_gain
     );
 }
