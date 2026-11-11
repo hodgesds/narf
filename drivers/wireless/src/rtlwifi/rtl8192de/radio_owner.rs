@@ -31,6 +31,11 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         self.rtl8192de.as_deref().map(|state| &state.radio)
     }
 
+    /// The MAC/PHY mode bound before [`Self::prepare`], if any.
+    pub(crate) fn rtl8192de_mode(&self) -> Option<MacPhyMode> {
+        self.rtl8192de_mode
+    }
+
     /// Allocated → Allocated: bind the MAC/PHY mode the PROM read
     /// derives, so [`Self::prepare`] can run the mode-dependent LLT
     /// before the radio is configured. [`Self::configure_rtl8192de`]

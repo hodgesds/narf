@@ -21,14 +21,12 @@
 //! `rtl92de_hw_init` early-mode / ASPM back-door / hardware-security
 //! steps ([`mac`]), the IQK reload ([`calib`], wired into the
 //! channel switch), and the 5 GHz native-admission gate
-//! ([`native_channel`], the `prepare_native::prepare_rtl8192de` channel
-//! gate). The `Prepared` integration and the `rtl92de_hw_init`
-//! orchestrator ([`init::configure`], which now runs early mode, the
-//! hardware-security step, the ASPM back door, DM init and LC calibration
-//! in Linux order) exist. It is not admitted yet (probe keeps it
-//! diagnostic): the shared station composition has no 92DE arm (the
-//! station power `wait` dispatch, the descriptor/join paths), so admitting
-//! it would publish a station that cannot transmit.
+//! ([`native_channel`]), the `prepare_native::prepare_rtl8192de` channel
+//! gate (also called by `admit_rtl8192de`). The `Prepared` integration and
+//! the `rtl92de_hw_init` orchestrator ([`init::configure`], which now runs
+//! early mode, the hardware-security step, the ASPM back door, DM init and
+//! LC calibration in Linux order) exist. The packet owner is still the
+//! 2.4 GHz legacy one (`packet_owner.rs` has no 5 GHz arm).
 //!
 //! Per-function EFUSE identity already lives in-tree: `efuse.rs` maps
 //! function 0 / 1 to MAC offsets `0x55` / `0x5b` (497 physical bytes, 256
@@ -292,8 +290,9 @@ pub fn sw_consequences(mode: MacPhyMode, current_band: Band) -> SwConsequences {
 /// ([`mode_info`]). A dual-dual MAC0 function (5 GHz bandset) admits
 /// the 5 GHz plan and no 2.4 GHz channel; a dual-dual MAC1 function
 /// admits 2.4 GHz channels 1–11 and no 5 GHz channel; single and
-/// dual-single functions admit both bands. `prepare_native::prepare_rtl8192de`
-/// calls it, mirroring `prepare_rtl8821ae`'s `station_channel` check.
+/// dual-single functions admit both bands. This is the gate
+/// `prepare_rtl8192de` (and `admit_rtl8192de`) calls, mirroring
+/// `prepare_rtl8821ae`'s `station_channel` check.
 pub fn native_channel(channel: u8, mode: MacPhyMode, interface_index: u8) -> bool {
     if !envelope::station_channel(channel) {
         return false;
