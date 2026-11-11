@@ -1119,9 +1119,10 @@ impl WirelessNetIface for Mt76Iface {
         self.native_wowlan_support()
     }
     /// mt7921 `wiphy->max_sched_scan_*`: the network-list offload request
-    /// (one plan, MT76_CONNAC_MAX_SCHED_SCAN_SSID probe SSIDs).
+    /// (one plan, MT76_CONNAC_MAX_SCHED_SCAN_SSID probe SSIDs,
+    /// MT76_CONNAC_MAX_SCAN_MATCH match sets).
     fn sched_scan_support(&self) -> Option<narf_wireless::SchedScanSupport> {
-        Some(crate::mt7921::wowlan_nlo::LIMITS)
+        Some(crate::mt7921::wowlan_nlo::SCHED_LIMITS)
     }
     fn async_sched_scan_control(&self) -> bool {
         true

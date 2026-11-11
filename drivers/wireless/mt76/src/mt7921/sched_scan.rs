@@ -54,7 +54,7 @@ impl<B: Backend> Session<B> {
             State::ScanReady(info) => (info, false),
             _ => return Err(Error::Busy),
         };
-        let plan = nlo::Plan::prepare(&self.backend, info, config, None)?;
+        let plan = nlo::Plan::prepare(&self.backend, info, config, wowlan_nlo::SCHED_LIMITS, None)?;
         // A cycle completion of an earlier request is not this one's.
         self.events
             .retain(|event| event.get(28) != Some(&SCHED_SCAN_DONE));
