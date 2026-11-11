@@ -55,6 +55,7 @@ pub mod core;
 pub mod dp;
 pub mod dp_frag;
 pub mod dp_group_pn;
+pub mod dp_mon;
 pub mod dp_peer;
 pub mod dp_ring;
 mod future_heap;
@@ -108,6 +109,8 @@ pub fn register() {
 pub mod ce_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod core_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod dp_mon_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod dp_peer_tests;
 #[cfg(any(test, feature = "kernel-test"))]

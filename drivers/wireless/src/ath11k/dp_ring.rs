@@ -43,14 +43,16 @@
 //! `REO_DEST_RING_ERROR_CODE_DESC_ADDR_ZERO`, which Linux and NARF both
 //! deliver.
 //!
-//! The generic ath11k monitor / full-monitor rings are deliberately absent:
-//! WCN6855's Linux `hw_params` has `supports_monitor = false`, so mac80211
-//! removes monitor iftype after registration.  Remaining omissions are the
-//! WBM idle-list scatter setup (it needs > 2 MiB of idle entries; WCN6855
-//! needs only 256 KiB). The non-monitor status rings decode the peer RSSI,
-//! per-chain RSSI, and RX duration statistics mac80211 normally receives;
-//! only full-monitor frame delivery is absent. Ring teardown (`ath11k_dp_free`)
-//! is implemented.
+//! WCN6855's Linux `hw_params` has `supports_monitor = false` (mac80211
+//! removes monitor iftype after registration), so it has no monitor
+//! destination path. The rxdma1 parts (`rxdma1_enable && supports_monitor`:
+//! IPQ8074 / IPQ6018 / QCN9074) reap their monitor destination ring from
+//! the status ring service ([`Dp::process_mon_rings_for`], in
+//! [`super::dp_mon`]). Remaining omissions are the WBM idle-list scatter
+//! setup (it needs > 2 MiB of idle entries; WCN6855 needs only 256 KiB).
+//! The status rings also decode the peer RSSI, per-chain RSSI, and RX
+//! duration statistics mac80211 normally receives. Ring teardown
+//! (`ath11k_dp_free`) is implemented.
 
 #![allow(dead_code)]
 
@@ -318,6 +320,9 @@ pub mod status_tag {
     /// `HAL_RX_PPDU_END`; its advertised length covers following PHY TLVs,
     /// so only its four-byte classification overview is skipped.
     pub const RX_PPDU_END: u32 = 0x0ce;
+    /// `HAL_RX_PPDU_START`: carries the PPDU id the monitor destination
+    /// ring is matched against (`ath11k_hal_rx_parse_mon_status_tlv`).
+    pub const RX_PPDU_START: u32 = 0x0cd;
     /// `HAL_RX_MPDU_START` (WCN6855 peer id is at data byte 32).
     pub const RX_MPDU_START: u32 = 0x0cf;
     pub const REO_UPDATE_RX_REO_QUEUE_STATUS: u32 = 0x99;
@@ -802,6 +807,9 @@ pub struct PdevDp {
     /// the link descriptors posted to `rxdma_mon_desc_ring`.
     pub mon_link_desc_banks: Vec<LinkDescBank>,
     pub mon_link_desc_posted: u32,
+    /// `mon_data` (`ath11k_dp_rx_pdev_mon_attach`): the monitor
+    /// destination / full-monitor state ([`super::dp_mon`]).
+    pub mon: super::dp_mon::MonData,
     /// `num_tx_pending`.
     pub num_tx_pending: u32,
 }
@@ -1136,6 +1144,9 @@ pub struct Dp {
     rx_ppdu_stats: VecDeque<RxPpduStats>,
     /// Michael MIC failures awaiting route to a vdev's cfg80211 notifier.
     mic_failures: VecDeque<MichaelMicFailure>,
+    /// Monitor-mode MPDUs (`ath11k_dp_rx_mon_deliver`) awaiting the
+    /// runtime's route to the pdev's monitor interface ([`super::dp_mon`]).
+    pub(super) mon_rx: VecDeque<super::dp_mon::MonRxFrame>,
     /// Receive replay counters of the installed group keys (mac80211's
     /// per-key state; ath11k leaves group PN checking to the host).
     group_rx_keys: Vec<super::dp_group_pn::GroupRxKey>,
@@ -1872,6 +1883,7 @@ impl Dp {
             ppdu_stats_completed: VecDeque::new(),
             rx_ppdu_stats: VecDeque::new(),
             mic_failures: VecDeque::new(),
+            mon_rx: VecDeque::new(),
             group_rx_keys: Vec::new(),
             crash_flush: false,
             stats: DpStats::default(),
@@ -2263,6 +2275,7 @@ impl Dp {
             rxdma_mon_desc_ring: mon_desc,
             mon_link_desc_banks,
             mon_link_desc_posted,
+            mon: super::dp_mon::MonData::new(),
             num_tx_pending: 0,
         };
         if mac_id == 0 {
@@ -3835,7 +3848,15 @@ impl Dp {
             };
             (Some(idx), self.extra_pdevs.remove(idx))
         };
-        let reaped = self.reap_mon_status_on(&mut pdev, hal, io, pdev_mac_id, rxdma_idx, budget);
+        let reaped = self.reap_mon_status_on(
+            &mut pdev,
+            hal,
+            io,
+            pdev_mac_id,
+            rxdma_idx,
+            budget,
+            &mut Vec::new(),
+        );
         match slot {
             None => self.pdev = Some(pdev),
             Some(idx) => self.extra_pdevs.insert(idx, pdev),
@@ -3844,8 +3865,15 @@ impl Dp {
     }
 
     /// The monitor-status reap over one pdev's ring (see
-    /// [`Self::reap_mon_status_for`]).
-    fn reap_mon_status_on(
+    /// [`Self::reap_mon_status_for`]). While the pdev's monitor is started
+    /// each DONE status buffer's monitor view (PPDU id / done / combined
+    /// RSSI, `ath11k_hal_rx_parse_mon_status`) is appended to `mon`, in
+    /// ring order, for `ath11k_dp_rx_process_mon_status`
+    /// ([`super::dp_mon`]); a full-monitor part also tracks `buf_state`
+    /// (`ath11k_dp_rx_mon_update_status_buf_state` + the `paddr ==
+    /// mon_status_paddr` MATCH).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn reap_mon_status_on(
         &mut self,
         pdev: &mut PdevDp,
         hal: &mut Hal,
@@ -3853,7 +3881,9 @@ impl Dp {
         pdev_mac_id: u32,
         rxdma_idx: u32,
         budget: &mut u32,
+        mon: &mut Vec<super::dp_mon::MonStatusBuf>,
     ) -> u32 {
+        use super::dp_mon::MonBufState;
         let mgr = self.cfg.hal_params.rx_buf_rbm;
         let mut reaped = 0;
         if let Some(ring) = pdev.rx_mon_status_refill_ring.get_mut(rxdma_idx as usize) {
@@ -3862,6 +3892,7 @@ impl Dp {
             while *budget > 0 {
                 *budget -= 1;
                 let Some(off) = hal.src_peek(id) else {
+                    pdev.mon.buf_state = MonBufState::Replenish;
                     break;
                 };
                 let (paddr, cookie, _) =
@@ -3873,6 +3904,7 @@ impl Dp {
                     match ring.bufs.find(buf_id) {
                         None => {
                             self.stats.rx_invalid_cookie += 1;
+                            pdev.mon.buf_state = MonBufState::Replenish;
                         }
                         Some(b) => {
                             let tag = field_get(HAL_TLV_HDR_TAG, b.mem.rd32(0));
@@ -3882,10 +3914,22 @@ impl Dp {
                                 if !Self::mon_buf_done(hal, ring, id) {
                                     continue;
                                 }
+                                // HP + 2 is DONE: Linux frees this buffer
+                                // unparsed and replenishes its slot.
+                                pdev.mon.buf_state = MonBufState::Replenish;
                             } else {
                                 self.stats.mon_status_reaped += 1;
+                                parsed = Self::parse_mon_status(&b.mem);
+                                if self.cfg.full_monitor_mode {
+                                    super::dp_mon::update_status_buf_state(&mut pdev.mon, &b.mem);
+                                    if paddr == pdev.mon.mon_status_paddr {
+                                        pdev.mon.buf_state = MonBufState::Match;
+                                    }
+                                }
+                                if pdev.mon.started {
+                                    mon.push(super::dp_mon::parse_mon_ppdu(&b.mem));
+                                }
                             }
-                            parsed = Self::parse_mon_status(&b.mem);
                             remove = true;
                         }
                     }
@@ -3903,6 +3947,8 @@ impl Dp {
                         }
                         self.rx_ppdu_stats.push_back(stats);
                     }
+                } else {
+                    pdev.mon.buf_state = MonBufState::Replenish;
                 }
                 // move_next: a fresh buffer in the same slot.
                 let mem =
@@ -4099,8 +4145,10 @@ impl Dp {
             for mac_id in &pdevs {
                 for j in 0..self.cfg.num_rxdma_per_pdev {
                     if mask.rx_mon_status[grp_id] & (1 << j) != 0 {
+                        // ath11k_dp_rx_process_mon_rings: the status reap
+                        // plus, while monitoring, the destination ring.
                         let mut b = budget as u32;
-                        let n = self.reap_mon_status_for(hal, io, *mac_id, j, &mut b);
+                        let n = self.process_mon_rings_for(hal, io, *mac_id, j, &mut b);
                         account!(n);
                     }
                 }

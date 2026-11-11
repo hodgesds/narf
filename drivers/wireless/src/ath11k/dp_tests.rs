@@ -40,14 +40,14 @@ macro_rules! check {
 
 // ── physical memory (the device side of DMA) ──────────────────────
 
-fn phys_rd32(pa: u64) -> u32 {
+pub(super) fn phys_rd32(pa: u64) -> u32 {
     // SAFETY: `pa` lies inside a live DMA32 coherent buffer the DP / HAL
     // under test allocated and owns (ring, pointer area or posted buffer);
     // the kernel direct map covers it and it is 4-byte aligned.
     unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(pa).kernel_ptr::<u32>()) }
 }
 
-fn phys_wr32(pa: u64, v: u32) {
+pub(super) fn phys_wr32(pa: u64, v: u32) {
     // SAFETY: as `phys_rd32`; the model only writes words the hardware
     // owns (ring entries it produces, its pointer, posted buffers).
     unsafe { core::ptr::write_volatile(narf_memory::PhysAddr::new(pa).kernel_mut_ptr::<u32>(), v) }
@@ -65,7 +65,7 @@ fn phys_read(pa: u64, out: &mut [u8]) {
     }
 }
 
-fn phys_write(pa: u64, src: &[u8]) {
+pub(super) fn phys_write(pa: u64, src: &[u8]) {
     // SAFETY: `pa` is a posted RX buffer (2048 bytes, callers write at
     // most that) or a link descriptor the model took from the idle list.
     unsafe {
@@ -99,7 +99,7 @@ enum HostPtr {
 /// One ring as the hardware sees it. `idx` is the device's pointer
 /// (TP of a SRC ring, HP of a DST ring), in words.
 #[derive(Copy, Clone, Debug)]
-struct DevRing {
+pub(super) struct DevRing {
     base: u64,
     size: u32,
     esz: u32,
@@ -123,7 +123,7 @@ impl DevRing {
     }
 
     /// DST ring: write one entry (fails when the ring is full).
-    fn produce(&mut self, io: &RecIo, w: &[u32]) -> bool {
+    pub(super) fn produce(&mut self, io: &RecIo, w: &[u32]) -> bool {
         let tp = self.host(io);
         if (self.idx + self.esz) % self.size == tp {
             return false;
@@ -137,7 +137,7 @@ impl DevRing {
     }
 
     /// SRC ring: take one entry the host posted.
-    fn consume(&mut self, io: &RecIo) -> Option<Vec<u32>> {
+    pub(super) fn consume(&mut self, io: &RecIo) -> Option<Vec<u32>> {
         if self.idx == self.host(io) {
             return None;
         }
@@ -150,11 +150,11 @@ impl DevRing {
     }
 
     /// Entries the host posted that the device has not consumed.
-    fn pending(&self, io: &RecIo) -> u32 {
+    pub(super) fn pending(&self, io: &RecIo) -> u32 {
         (self.host(io) + self.size - self.idx) % self.size / self.esz
     }
 
-    fn entry(&self, i: u32) -> Vec<u32> {
+    pub(super) fn entry(&self, i: u32) -> Vec<u32> {
         (0..self.esz)
             .map(|k| phys_rd32(self.base + ((i * self.esz + k) as u64) * 4))
             .collect()
@@ -198,7 +198,7 @@ fn msg_word(m: &[u8], i: usize) -> u32 {
 /// An LMAC ring from its HTT SRING_SETUP message: SW→HW rings have the
 /// host HP at `ring_head_off32_remote_addr`, HW→SW rings the host TP at
 /// `ring_tail_off32_remote_addr`.
-fn lmac(m: &[u8]) -> DevRing {
+pub(super) fn lmac(m: &[u8]) -> DevRing {
     let info0 = msg_word(m, 0);
     let info1 = msg_word(m, 3);
     let hp = msg_word(m, 4) as u64 | ((msg_word(m, 5) as u64) << 32);
@@ -267,17 +267,17 @@ pub(super) const SMALL: DpRingSizes = DpRingSizes {
     n_link_desc: Some(64),
 };
 
-struct Rig {
-    hal: Hal,
-    io: RecIo,
-    dp: Dp,
-    msgs: Vec<Vec<u8>>,
+pub(super) struct Rig {
+    pub(super) hal: Hal,
+    pub(super) io: RecIo,
+    pub(super) dp: Dp,
+    pub(super) msgs: Vec<Vec<u8>>,
 }
 
 fn rig(sizes: DpRingSizes) -> Rig {
     rig_for_rev(sizes, HwRev::Wcn6855Hw21)
 }
-fn rig_for_rev(sizes: DpRingSizes, rev: HwRev) -> Rig {
+pub(super) fn rig_for_rev(sizes: DpRingSizes, rev: HwRev) -> Rig {
     let cfg = DpHwParams::for_rev(rev).expect("complete DP params");
     let mut hal = Hal::new(&cfg.hw).expect("hal");
     let io = RecIo::default();

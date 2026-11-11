@@ -578,6 +578,10 @@ impl HalRxDescWcn6855 {
     pub fn mpdu_start_tag(&self) -> u32 {
         field_get(HAL_TLV_HDR_TAG, self.mpdu_start_tag)
     }
+    /// `ath11k_hw_wcn6855_rx_desc_get_mpdu_ppdu_id`.
+    pub fn mpdu_ppdu_id(&self) -> u16 {
+        self.mpdu_start.phy_ppdu_id
+    }
     /// `ath11k_dp_rx_h_attn_msdu_done` on the WCN6855 attention TLV.
     pub fn msdu_done(&self) -> bool {
         let v = self.attention.info2;

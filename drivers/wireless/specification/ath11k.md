@@ -2134,6 +2134,33 @@ messages (after RXDMA_DST, before MONITOR_STATUS, as
 desc ring (`ath11k_dp_rx_pdev_mon_attach`); `pdev_free` releases every
 pdev. `DpRingSizes` gains `rxdma_mon_{buf,dst,desc}` (4096 / 2048 / 4096).
 
+**Monitor receive (`dp_mon.rs`, `dp_rx.c` monitor half).** On the rxdma1
+parts with `supports_monitor` (IPQ8074, IPQ6018, QCN9074; not IPQ5018,
+WCN6750 or the WCN6855 family) each pdev carries `PdevDp::mon`
+(`struct ath11k_mon_data`). The status-ring service of `service_srng` is
+`Dp::process_mon_rings_for` (`ath11k_dp_rx_process_mon_rings`): the
+status reap (`reap_mon_status_on`) also returns, while the pdev's
+`ATH11K_FLAG_MONITOR_STARTED` is set, each DONE buffer's PPDU id / done
+state / combined RSSI (`parse_mon_ppdu`, the monitor half of
+`ath11k_hal_rx_parse_mon_status`); a PPDU-done buffer in state START runs
+`Dp::mon_dest_process` (`ath11k_dp_rx_mon_dest_process`): `mon_mpdu_pop`
+(`ath11k_dp_rx_mon_mpdu_pop`: REO-entrance push-reason drops, duplicate
+link-descriptor / buffer-cookie checks, `comp_ppduid` wrap window,
+`get_buf_len` continuation sizing, the link descriptor returned to the
+pdev's monitor desc ring) and `mon_deliver` (`ath11k_dp_rx_mon_merg_msdus`
+RAW / native-Wi-Fi, `ath11k_dp_rx_h_ppdu` channel from `phy_meta_data`,
+`ath11k_update_radiotap` signal `rssi_comb - 95`), then the used buffers
+are replenished on `rxdma_mon_buf_ring`. Frames queue as `MonRxFrame`
+(`Dp::take_mon_rx`, bounded at 256). Deviations (no mac80211 behind the
+driver): continuation buffers and RAW MSDUs are joined into one frame
+instead of `RX_FLAG_AMSDU_MORE` skbs; FCS-failed MPDUs are dropped (no
+`MONITOR_FLAG_FCSFAIL`); payload offsets use `hal_desc_sz` throughout
+(Linux sizes with the WCN6855 union `sizeof(struct hal_rx_desc)` but strips
+`hal_desc_sz`); a stuck destination entry is retried at most ring-size
+times per pass instead of Linux's unbounded `continue`. A not-DONE status
+buffer whose successor is DONE is now freed unparsed, as Linux does.
+Fixture smokes: `dp_mon_tests.rs` (written, unexecuted).
+
 ## 4. Invariants
 
 - Failure-step codes (`wifi: <stage> FAILED step=N` on the panel) are
@@ -2437,9 +2464,8 @@ A SYS_ERR during bring-up still fails the bring-up (Linux's `reset_work`
   invalid or unkeyed set is dropped; the pairwise-key fragment flush
   (`ath11k_peer_frags_flush`) is a
   queued sync op applied at the install command's runtime lock;
-  monitor-status buffers are recycled unparsed (no RSSI or full-PPDU
-  statistics; the fast RX descriptor's per-MSDU PHY rate is retained for
-  STA_INFO); `Dp` keeps the peer table HTT maps
+  monitor-status buffers feed the peer RSSI / duration statistics (the
+  fast RX descriptor's per-MSDU PHY rate is retained for STA_INFO); `Dp` keeps the peer table HTT maps
   (`ath11k_peer_map_event`) itself. NARF-stricter: truncated HTT T2H
   messages, link descriptors outside every bank, an L3 pad that runs
   past the RX buffer, TX frames shorter than their header.
