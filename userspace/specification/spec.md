@@ -1903,7 +1903,14 @@ whoever's job that is.
   the descriptor's device), an unmount and the pre-shutdown sync write every
   file's, including files nothing has open any more. The flusher is an
   ordinary task that may run on any CPU; it exists from the first writable
-  shared file mapping until the last user task is gone.
+  shared file mapping until no user task is left and nothing unmapped is
+  waiting for writeback, and teardown restarts it when pages were left.
+  Oldest unwritten store with no sync: an unmapped page is written by the
+  next pass (at most 5 s); a still-mapped page by the first pass after it
+  has been seen dirty for 30 s (about 40 s from the store, Linux about 35 s,
+  because the clock starts when a pass first sees the page, not at the
+  store), longer when more writable mapped pages exist than one pass's
+  16,384-page sweep covers.
 - *One batch.* Every writer runs the same engine. Per batch it takes the
   file's writeback lock; pins up to 256 pages (1 MiB) under the cache lock
   without comparing or copying anything; with the cache lock released
@@ -1927,7 +1934,12 @@ whoever's job that is.
   dirty or not, and the tail of the page the EOF falls in is zeroed;
   `PUNCH_HOLE`/`ZERO_RANGE` zero the range in the cache; `COLLAPSE_RANGE`/
   `INSERT_RANGE` write the file's dirty pages out first and drop the unmapped
-  ones from the offset on. A batch therefore completes before a size change
+  ones from the offset on. Bytes a mapping stored past EOF in the last page
+  never become file data: writeback writes that page only up to EOF and
+  clears the tail (`folio_zero_segment`), and a `write(2)` starting past EOF,
+  `ftruncate` up and `fallocate` first clear what a mapping stored between
+  the old EOF and the new end (`pagecache_isize_extended`); bytes a
+  `write(2)` put there are kept. A batch therefore completes before a size change
   starts or begins after its invalidation, and can neither write a page the
   truncate discarded nor extend the file again. Bytes past the EOF the
   filesystem reports are never written; an unmapped page that owes only such
@@ -1992,12 +2004,6 @@ whoever's job that is.
   or a hole punch of the very pages one of them maps can leave such a page
   holding the loser's bytes while it counts as clean. The fix is the write
   path taking the per-file lock, as the size changes do.
-- Bytes a mapping stores past EOF in the file's last page are not zeroed at
-  writeback (`block_write_full_folio` zeroes them on every call) or when the
-  file is extended (`pagecache_isize_extended`); if the file later grows
-  over them they are written. Zeroing them needs the old size sampled
-  atomically with the size change, which the per-file lock cannot give
-  while `write(2)` does not take it.
 - An unmount writes every file's dirty pages, not only that mount's: entries
   are grouped by device number, which names a filesystem and not a mount.
 

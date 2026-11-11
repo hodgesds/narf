@@ -299,6 +299,16 @@ fn finish_killed_write((result, payload, file, offset, stamp): WriteDone) {
 ///
 /// Anything but stored file data ([`stores_file_data`]) is written as before.
 pub(crate) fn write(ops: &Arc<dyn FileOps>, offset: u64, payload: &mut Vec<u8>) -> Waited<usize> {
+    // A write that starts past EOF extends the file over bytes a mapping
+    // may have stored past the old EOF: those must read as zeros
+    // (`pagecache_isize_extended`). A write that starts at or below EOF
+    // overwrites them itself.
+    if !ops.is_stream() {
+        let size = ops.stat().size;
+        if offset > size {
+            crate::mapped_file::discard_stores_past_eof(ops.as_ref(), size, offset);
+        }
+    }
     if !stores_file_data(ops.as_ref()) {
         return Ok(crate::handlers::poll_blocking(ops.write(offset, payload)));
     }

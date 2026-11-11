@@ -3956,9 +3956,9 @@ pub(crate) fn note_file_written(
 
 mod writeback;
 pub(crate) use writeback::{
-    fallocate_serialized, flush_file_for_read, overlay_dirty, settle_unverified,
-    size_change_serialized, sync_all_files, throttle_dirtier, unmapped, writable_mapping,
-    write_stamp, WriteStamp, BATCH_PAGES as WRITEBACK_BATCH_PAGES,
+    discard_stores_past_eof, fallocate_serialized, flush_file_for_read, overlay_dirty,
+    settle_unverified, size_change_serialized, sync_all_files, throttle_dirtier, unmapped,
+    writable_mapping, write_stamp, WriteStamp, BATCH_PAGES as WRITEBACK_BATCH_PAGES,
 };
 
 #[cfg(feature = "kernel-test")]
