@@ -45,7 +45,8 @@ use crate::pkt_dhcpv6::{MT_INFORMATION_REQUEST, MT_SOLICIT};
 use crate::pkt_ipv6::{
     pseudo_checksum, router_advertisement, Ipv6Header, ICMPV6_NEIGHBOR_SOLICITATION,
     ICMPV6_ROUTER_SOLICITATION, IPV6_HDR_LEN, NA_FLAG_OVERRIDE, NA_FLAG_SOLICITED,
-    NEXT_HEADER_ICMPV6, NEXT_HEADER_UDP, RA_FLAG_MANAGED, RA_FLAG_OTHER_CONFIG,
+    NEXT_HEADER_FRAGMENT, NEXT_HEADER_ICMPV6, NEXT_HEADER_UDP, RA_FLAG_MANAGED,
+    RA_FLAG_OTHER_CONFIG,
 };
 use crate::resolv_conf;
 
@@ -76,6 +77,7 @@ fn reset_v6(iface_name: &'static str, mac: [u8; 6]) {
     addrs::__reset_for_test();
     crate::ipv6::route::__reset_for_test();
     ipv6_stack::__reset_for_test();
+    crate::udp_sock::__reset_user_deliver_hook_for_test();
     resolv_conf::install(resolv_conf::ResolvConfig::new());
     IPV6_TX.lock().clear();
 
@@ -2223,3 +2225,397 @@ fn smoke_v6_icmp6_tx_error_rate_limit() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_tx_error_rate_limit);
+
+// ── #1727: RX-triggered ICMPv6 errors ────────────────────────────────
+//
+// (a) UDP RX with no listener → Destination Unreachable code 4
+// (Linux `__udp6_lib_rcv`); (c) Time Exceeded code 1 on fragment
+// reassembly timeout (Linux `ip6_expire_frag_queue`); (d) RFC 4443
+// §2.4(e.4)/(e.5) link-layer multicast/broadcast suppression via the
+// threaded L2 destination. (b) Packet Too Big is not applicable:
+// there is no IPv6 forwarding path in this tree.
+
+/// Build a full Ethernet + IPv6 + UDP frame (valid checksum), or
+/// `None` if the segment cannot be built.
+fn build_udp6_frame(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let udp = ipv6_stack::build_udp_segment(src_ip, dst_ip, src_port, dst_port, payload).ok()?;
+    let total = ETH_HDR_LEN + IPV6_HDR_LEN + udp.len();
+    let mut frame = vec![0u8; total];
+    write_eth_header(&mut frame, dst_mac, src_mac, ETHERTYPE_IPV6);
+    let ip = Ipv6Header {
+        version: 6,
+        payload_length: udp.len() as u16,
+        next_header: NEXT_HEADER_UDP,
+        hop_limit: 64,
+        src_ip,
+        dst_ip,
+        ..Default::default()
+    };
+    frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN].copy_from_slice(&ip.encode());
+    frame[ETH_HDR_LEN + IPV6_HDR_LEN..].copy_from_slice(&udp);
+    Some(frame)
+}
+
+/// Build one IPv6 packet carrying a Fragment header (no Ethernet):
+/// IPv6 header (next header 44) + 8-byte Fragment header + payload.
+fn build_frag6_packet(
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    id: u32,
+    offset_bytes: u16,
+    more: bool,
+    frag_payload: &[u8],
+) -> Vec<u8> {
+    let mut frag_hdr = [0u8; 8];
+    frag_hdr[0] = NEXT_HEADER_UDP;
+    let word = (offset_bytes & 0xFFF8) | u16::from(more);
+    frag_hdr[2..4].copy_from_slice(&word.to_be_bytes());
+    frag_hdr[4..8].copy_from_slice(&id.to_be_bytes());
+    let mut p = Vec::new();
+    let ip = Ipv6Header {
+        version: 6,
+        payload_length: (8 + frag_payload.len()) as u16,
+        next_header: NEXT_HEADER_FRAGMENT,
+        hop_limit: 64,
+        src_ip,
+        dst_ip,
+        ..Default::default()
+    };
+    p.extend_from_slice(&ip.encode());
+    p.extend_from_slice(&frag_hdr);
+    p.extend_from_slice(frag_payload);
+    p
+}
+
+/// Wrap a raw IPv6 packet in an Ethernet header.
+fn wrap_eth(src_mac: [u8; 6], dst_mac: [u8; 6], packet: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0u8; ETH_HDR_LEN + packet.len()];
+    write_eth_header(&mut frame, dst_mac, src_mac, ETHERTYPE_IPV6);
+    frame[ETH_HDR_LEN..].copy_from_slice(packet);
+    frame
+}
+
+/// Stub userspace delivery hook that consumes every datagram: the "a
+/// socket owns this port" case for the DU suppression smoke.
+fn consume_all_udp6(
+    _net_ns_id: u64,
+    _src_ip: &[u8],
+    _src_port: u16,
+    _dst_ip: &[u8],
+    _dst_port: u16,
+    _payload: &[u8],
+    _in_ifindex: u32,
+    _meta: crate::udp_sock::RxIpMeta,
+) -> bool {
+    true
+}
+
+fn smoke_v6_icmp6_rx_udp_no_listener_sends_du() -> TestResult {
+    const IFACE: &str = "v6e2e-1727a";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    // UDP to a closed port (0x5678): no hook installed, so no
+    // listener owns it.
+    let frame = match build_udp6_frame(PEER_MAC, MAC, PEER_IP, ll, 0x1234, 0x5678, b"narf") {
+        Some(f) => f,
+        None => return TestResult::Fail("UDP segment build failed"),
+    };
+    ipv6_stack::rx_frame(IFACE, &frame[ETH_HDR_LEN..]);
+
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one DU frame for a closed UDP port");
+    }
+    let (dst_mac, _, ip6, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("DU frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC {
+        return TestResult::Fail("DU eth dst != peer MAC");
+    }
+    if ip6.src_ip != ll || ip6.dst_ip != PEER_IP {
+        return TestResult::Fail("DU IPv6 src/dst wrong (want our ll -> invoking source)");
+    }
+    if ip6.hop_limit != 64 || ip6.next_header != NEXT_HEADER_ICMPV6 {
+        return TestResult::Fail("DU hop limit / next-header wrong");
+    }
+    if body.len() < 8 || body[0] != 1 || body[1] != 4 {
+        return TestResult::Fail("DU type/code != 1/4 (port unreachable)");
+    }
+    if body[8..] != frame[ETH_HDR_LEN..] {
+        return TestResult::Fail("DU quoted invoking packet differs");
+    }
+    if !icmp6_checksum_ok(ip6.src_ip, ip6.dst_ip, &body) {
+        return TestResult::Fail("DU checksum does not verify");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_rx_udp_no_listener_sends_du);
+
+fn smoke_v6_icmp6_rx_udp_listener_suppresses_du() -> TestResult {
+    const IFACE: &str = "v6e2e-1727b";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+    // A socket owns the port: the hook consumes the datagram.
+    crate::udp_sock::install_user_deliver_hook(consume_all_udp6);
+
+    let frame = match build_udp6_frame(PEER_MAC, MAC, PEER_IP, ll, 0x1234, 0x5678, b"narf") {
+        Some(f) => f,
+        None => return TestResult::Fail("UDP segment build failed"),
+    };
+    ipv6_stack::rx_frame(IFACE, &frame[ETH_HDR_LEN..]);
+    crate::udp_sock::__reset_user_deliver_hook_for_test();
+
+    if !drain_v6().is_empty() {
+        return TestResult::Fail("DU sent although a listener consumed the datagram");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_rx_udp_listener_suppresses_du);
+
+fn smoke_v6_icmp6_rx_udp_multicast_l2_suppresses_du() -> TestResult {
+    const IFACE: &str = "v6e2e-1727c";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+    // Link-layer multicast destination (I/G bit set).
+    const MCAST_MAC: [u8; 6] = [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01];
+
+    // The classifier itself: multicast and broadcast are Multicast,
+    // a unicast MAC is Unicast.
+    if ipv6_stack::L2Dst::from_mac(MCAST_MAC) != ipv6_stack::L2Dst::Multicast
+        || ipv6_stack::L2Dst::from_mac([0xff; 6]) != ipv6_stack::L2Dst::Multicast
+        || ipv6_stack::L2Dst::from_mac(MAC) != ipv6_stack::L2Dst::Unicast
+    {
+        return TestResult::Fail("L2Dst::from_mac misclassifies a destination MAC");
+    }
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    // Unicast-IP UDP to a closed port, but the frame arrived on a
+    // link-layer multicast destination: §2.4(e.4) suppresses the DU.
+    let frame = match build_udp6_frame(PEER_MAC, MCAST_MAC, PEER_IP, ll, 0x1234, 0x5678, b"narf") {
+        Some(f) => f,
+        None => return TestResult::Fail("UDP segment build failed"),
+    };
+    ipv6_stack::rx_frame_l2(
+        IFACE,
+        &frame[ETH_HDR_LEN..],
+        ipv6_stack::L2Dst::from_mac(MCAST_MAC),
+    );
+
+    if !drain_v6().is_empty() {
+        return TestResult::Fail("DU sent for a link-layer multicast frame (RFC 4443 §2.4(e.4))");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/ipv6_e2e",
+    smoke_v6_icmp6_rx_udp_multicast_l2_suppresses_du
+);
+
+fn smoke_v6_icmp6_rx_udp_multicast_dst_suppresses_du() -> TestResult {
+    const IFACE: &str = "v6e2e-1727d";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    // UDP to a multicast IP (ff02::1) on a closed port: §2.4(e.3)
+    // suppresses the DU even though the L2 destination is unknown
+    // through `rx_frame`.
+    let frame = match build_udp6_frame(
+        PEER_MAC,
+        multicast_mac(&ALL_NODES),
+        PEER_IP,
+        ALL_NODES,
+        0x1234,
+        0x5678,
+        b"narf",
+    ) {
+        Some(f) => f,
+        None => return TestResult::Fail("UDP segment build failed"),
+    };
+    ipv6_stack::rx_frame(IFACE, &frame[ETH_HDR_LEN..]);
+
+    if !drain_v6().is_empty() {
+        return TestResult::Fail("DU sent for a multicast-destined packet (RFC 4443 §2.4(e.3))");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/ipv6_e2e",
+    smoke_v6_icmp6_rx_udp_multicast_dst_suppresses_du
+);
+
+fn smoke_v6_icmp6_rx_frag_timeout_sends_te() -> TestResult {
+    const IFACE: &str = "v6e2e-1727e";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+    const FRAG_ID: u32 = 0x1234_5678;
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    // First fragment (offset 0, M=1) of a UDP datagram to a closed
+    // port; the rest never arrives.
+    let udp = match ipv6_stack::build_udp_segment(PEER_IP, ll, 0x1234, 0x5678, b"narf-frag") {
+        Ok(u) => u,
+        Err(_) => return TestResult::Fail("UDP segment build failed"),
+    };
+    let frag1_packet = build_frag6_packet(PEER_IP, ll, FRAG_ID, 0, true, &udp[..8]);
+    let frag1_frame = wrap_eth(PEER_MAC, MAC, &frag1_packet);
+    let t0 = 1_000_000_000u64;
+    ipv6_stack::rx_frame_l2_at(
+        IFACE,
+        &frag1_frame[ETH_HDR_LEN..],
+        ipv6_stack::L2Dst::Unicast,
+        t0,
+    );
+    if !drain_v6().is_empty() {
+        return TestResult::Fail("frames emitted for an incomplete first fragment");
+    }
+
+    // An unrelated fragment past the 60 s window expires the first
+    // reassembly: Time Exceeded code 1, quoting the first fragment.
+    let frag2_packet = build_frag6_packet(PEER_IP, ll, FRAG_ID + 1, 0, true, &udp[..8]);
+    let frag2_frame = wrap_eth(PEER_MAC, MAC, &frag2_packet);
+    ipv6_stack::rx_frame_l2_at(
+        IFACE,
+        &frag2_frame[ETH_HDR_LEN..],
+        ipv6_stack::L2Dst::Unicast,
+        t0 + ipv6_stack::FRAG_REASSEMBLY_TIMEOUT_NS + 1,
+    );
+
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one Time Exceeded frame on reassembly timeout");
+    }
+    let (dst_mac, _, ip6, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("TE frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC {
+        return TestResult::Fail("TE eth dst != peer MAC");
+    }
+    if ip6.src_ip != ll || ip6.dst_ip != PEER_IP {
+        return TestResult::Fail("TE IPv6 src/dst wrong (want our ll -> invoking source)");
+    }
+    if ip6.hop_limit != 64 || ip6.next_header != NEXT_HEADER_ICMPV6 {
+        return TestResult::Fail("TE hop limit / next-header wrong");
+    }
+    if body.len() < 8 || body[0] != 3 || body[1] != 1 {
+        return TestResult::Fail("TE type/code != 3/1 (fragment reassembly time exceeded)");
+    }
+    if body[8..] != frag1_packet[..] {
+        return TestResult::Fail("TE quoted invoking packet differs from the first fragment");
+    }
+    if !icmp6_checksum_ok(ip6.src_ip, ip6.dst_ip, &body) {
+        return TestResult::Fail("TE checksum does not verify");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_rx_frag_timeout_sends_te);
+
+fn smoke_v6_icmp6_rx_frag_timeout_needs_first_segment() -> TestResult {
+    use ipv6_stack::{process_fragment_at, FRAG_REASSEMBLY_TIMEOUT_NS};
+    // Linux `ip6_expire_frag_queue`: no error if the first segment
+    // did not arrive. A reassembly that only ever saw a middle
+    // fragment expires silently.
+    let (s, d) = (
+        [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+    );
+    let t0 = 1_000_000_000u64;
+    ipv6_stack::__reset_for_test();
+    let mut frag_hdr = [0u8; 8];
+    frag_hdr[0] = NEXT_HEADER_UDP;
+    frag_hdr[2..4].copy_from_slice(&((16u16 & 0xFFF8) | 1u16).to_be_bytes());
+    frag_hdr[4..8].copy_from_slice(&0x1111_2222u32.to_be_bytes());
+    let _ = process_fragment_at(t0, s, d, &frag_hdr, &[1u8; 8], &[]);
+    let (_, expired) = process_fragment_at(
+        t0 + FRAG_REASSEMBLY_TIMEOUT_NS + 1,
+        s,
+        d,
+        &frag_hdr,
+        &[2u8; 8],
+        &[],
+    );
+    if !expired.is_empty() {
+        return TestResult::Fail(
+            "timeout reported for a reassembly whose first segment never arrived",
+        );
+    }
+
+    // Control: with the first segment present, the same expiry IS
+    // reported, with the invoking packet that was supplied.
+    ipv6_stack::__reset_for_test();
+    let invoking = build_frag6_packet(s, d, 0x3333_4444, 0, true, &[3u8; 8]);
+    let mut first_hdr = [0u8; 8];
+    first_hdr[0] = NEXT_HEADER_UDP;
+    first_hdr[2..4].copy_from_slice(&1u16.to_be_bytes());
+    first_hdr[4..8].copy_from_slice(&0x3333_4444u32.to_be_bytes());
+    let _ = process_fragment_at(t0, s, d, &first_hdr, &[3u8; 8], &invoking);
+    let (_, expired) = process_fragment_at(
+        t0 + FRAG_REASSEMBLY_TIMEOUT_NS + 1,
+        s,
+        d,
+        &first_hdr,
+        &[4u8; 8],
+        &[],
+    );
+    if expired.len() != 1 {
+        return TestResult::Fail("timeout without a first segment was not reported exactly once");
+    }
+    if expired[0].src != s || expired[0].dst != d || expired[0].invoking != invoking {
+        return TestResult::Fail("expired reassembly does not carry its first fragment's packet");
+    }
+    ipv6_stack::__reset_for_test();
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/ipv6_e2e",
+    smoke_v6_icmp6_rx_frag_timeout_needs_first_segment
+);
