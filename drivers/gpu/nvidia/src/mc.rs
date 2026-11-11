@@ -72,6 +72,18 @@ pub const PMC_ENABLE_PMSENC: u32 = 1 << 18;
 pub const PMC_ENABLE_PSEC: u32 = 1 << 14;
 /// `NV_PMC_ENABLE.PCE0` — copy engine 0.
 pub const PMC_ENABLE_PCE0: u32 = 1 << 15;
+/// `NV_PMC_ENABLE.PMU` — power-management microcontroller.
+///
+/// Grounded against upstream Nouveau, NOT `dev_pmc.ref.txt` (which
+/// does not exist — see the `PMC_ENABLE` note above): the PMU's
+/// reset mask is `0x00002000` in `nvkm/subdev/mc/gk104.c`
+/// (`gk104_mc_reset[]`: `{ 0x00002000, NVKM_SUBDEV_PMU, 0, true }`),
+/// the reset map `gp100_mc` uses (`.reset = gk104_mc_reset` in
+/// `nvkm/subdev/mc/gp100.c`), and `nvkm_mc_enabled` tests it via
+/// `nv04_mc_device_enabled`, which reads `PMC_ENABLE` (BAR0+0x200)
+/// and checks `(value & mask) == mask`
+/// (`nvkm/subdev/mc/nv04.c`). Bit set = PMU engine out of reset.
+pub const PMC_ENABLE_PMU: u32 = 1 << 13;
 /// `NV_PMC_ENABLE.PDISP` — display engine.
 pub const PMC_ENABLE_PDISP: u32 = 1 << 30;
 
