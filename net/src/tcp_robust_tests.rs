@@ -1326,9 +1326,17 @@ use alloc::sync::Arc;
 static CAPTURE_REFUSES: ::core::sync::atomic::AtomicBool =
     ::core::sync::atomic::AtomicBool::new(false);
 
+/// A connection to resume from inside the ordinary transmit hook: a sender
+/// running between an RTO's rewind and the end of `fire_retransmit`.
+static PLAIN_REENTER: ::core::sync::atomic::AtomicU32 = ::core::sync::atomic::AtomicU32::new(0);
+
 fn refusable_send(frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
     if CAPTURE_REFUSES.load(::core::sync::atomic::Ordering::SeqCst) {
         return Err(());
+    }
+    let id = PLAIN_REENTER.swap(0, ::core::sync::atomic::Ordering::SeqCst);
+    if id != 0 {
+        core::tx_resume(id);
     }
     capture_send(frame, meta)
 }
@@ -1364,6 +1372,9 @@ struct FakeNic {
     /// Answer `Busy` without stopping the queue: a driver breaking the
     /// contract, which must still not make the sender spin.
     busy_unstopped: ::core::sync::atomic::AtomicBool,
+    /// A segment the peer delivers right after the next accepted frame:
+    /// its ACK overtakes the sender's own bookkeeping for that frame.
+    on_accept: IrqSafeSpinLock<Option<PeerSegment>>,
     /// Refuse, once, the frame that starts at this sequence number.
     refuse_seq: ::core::sync::atomic::AtomicU32,
     /// A segment `(src, dst, bytes)` the peer delivers during that refusal:
@@ -1383,6 +1394,7 @@ impl FakeNic {
             replacement: IrqSafeSpinLock::new(None),
             offers: ::core::sync::atomic::AtomicU32::new(0),
             busy_unstopped: ::core::sync::atomic::AtomicBool::new(false),
+            on_accept: IrqSafeSpinLock::new(None),
             refuse_seq: ::core::sync::atomic::AtomicU32::new(0),
             on_refuse: IrqSafeSpinLock::new(None),
         })
@@ -1444,6 +1456,10 @@ impl FakeNic {
             ring.charges.push_back(charge);
             let free = Self::free(&ring);
             queue.sent(frame.len() as u32, || free);
+        }
+        let delivered = self.on_accept.lock().take();
+        if let Some((src, dst, segment)) = delivered {
+            handle_segment(src, dst, &segment);
         }
         let id = self.reenter.swap(0, ::core::sync::atomic::Ordering::SeqCst);
         if id != 0 {
@@ -2205,6 +2221,116 @@ fn smoke_tx_copied_frames_are_charged_and_throttled() -> TestResult {
 kernel_test_in!(
     "net/tcp/robust",
     smoke_tx_copied_frames_are_charged_and_throttled
+);
+
+/// The ACK for a segment can be processed before the sender records the
+/// segment for retransmission (the record is made after the device took the
+/// frame). That record was then never released: on an idle connection its
+/// timer fired with nothing to resend, did not re-arm, fired again on every
+/// tick, and the eighth firing reset the connection.
+fn smoke_tx_ack_before_record_leaves_no_stale_retransmit_timer() -> TestResult {
+    let local = [10, 106, 0, 1];
+    let (nic, id, peer) = backpressure_conn("txbp12", local, 7_933);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    *nic.on_accept.lock() = Some((
+        peer,
+        local,
+        tcp_bytes(Seg {
+            src: peer,
+            dst: local,
+            sport: 80,
+            dport: 7_933,
+            seq: 0x20000,
+            ack: 0x10000 + 300,
+            flags: FLAG_ACK,
+            window: 65535,
+            options: Vec::new(),
+            payload: &[],
+        }),
+    ));
+    if send(id, &pattern(300)) != Ok(300) {
+        return TestResult::Fail("the segment was not sent");
+    }
+    if __with_tcb(id, |t| {
+        (t.snd_una, t.retx_queue.len(), t.retx_deadline_cycles)
+    }) != Some((0x10000 + 300, 0, 0))
+    {
+        return TestResult::Fail("a segment already acknowledged was recorded for retransmission");
+    }
+    // A stale record that exists anyway must be discarded, not counted.
+    let before = __with_tcb(id, |t| t.rtt.backoff_count).unwrap_or(9);
+    let _ = __with_tcb_mut(id, |t| {
+        t.retx_queue.push_back(crate::tcp::retransmit::OutSeg {
+            seq: 0x10000,
+            len: 300,
+            sent_at_cycles: 1,
+            retransmitted: false,
+            flags: FLAG_ACK,
+        });
+    });
+    for _ in 0..20 {
+        let _ = __with_tcb_mut(id, |t| {
+            if !t.retx_queue.is_empty() {
+                t.retx_deadline_cycles = 1;
+            }
+        });
+        tick_retransmit(&arc);
+    }
+    if __with_tcb(id, |t| {
+        (
+            t.state,
+            t.retx_queue.len(),
+            t.retx_deadline_cycles,
+            t.rtt.backoff_count,
+        )
+    }) != Some((TcpState::Established, 0, 0, before))
+    {
+        return TestResult::Fail("a stale retransmit record kept firing or reset the connection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_ack_before_record_leaves_no_stale_retransmit_timer
+);
+
+/// `fire_retransmit` releases the lock between rewinding to `snd_una` and
+/// advancing past the head it resent. A sender that runs in between has
+/// already advanced; advancing again left the send-buffer offset ahead of
+/// `snd_nxt`, a range marked sent that nothing ever transmits.
+fn smoke_tx_rto_does_not_advance_over_a_sender_that_ran_meanwhile() -> TestResult {
+    let (_nic, id, _) = backpressure_conn("txbp13", [10, 107, 0, 1], 7_934);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if send(id, &pattern(6000)) != Ok(6000) {
+        return TestResult::Fail("the data was not sent");
+    }
+    // The sender runs from inside the RTO's own retransmission.
+    PLAIN_REENTER.store(id, ::core::sync::atomic::Ordering::SeqCst);
+    let _ = __with_tcb_mut(id, |t| t.retx_deadline_cycles = 1);
+    tick_retransmit(&arc);
+    if PLAIN_REENTER.load(::core::sync::atomic::Ordering::SeqCst) != 0 {
+        return TestResult::Fail("the RTO did not retransmit through the ordinary hook");
+    }
+    let Some((marked, in_flight)) = __with_tcb(id, |t| {
+        (
+            t.send_buf.inflight_bytes() as u32,
+            t.snd_nxt.wrapping_sub(t.snd_una),
+        )
+    }) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if marked != in_flight || in_flight == 0 {
+        return TestResult::Fail("the send-buffer offset and snd_nxt disagree after the RTO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_rto_does_not_advance_over_a_sender_that_ran_meanwhile
 );
 
 // ── Receive batches (`iface::rx_batch`) ─────────────────────────────────

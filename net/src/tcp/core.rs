@@ -3274,6 +3274,14 @@ fn tsval_now() -> u32 {
 // ── Retransmit queue ────────────────────────────────────────────────
 
 fn queue_retransmit(t: &mut Tcb, seq: u32, seq_len: u32, flags: u8) {
+    // The record is made after the frame was handed to the device, without
+    // the connection lock. An ACK that got in first has already released
+    // everything it covers; a record added now would never be released,
+    // and with nothing left to acknowledge its timer would fire with
+    // nothing to resend.
+    if seq_leq(seq.wrapping_add(seq_len), t.snd_una) {
+        return;
+    }
     let now = narf_scheduler::narf_time::now_cycles();
     let seg = OutSeg {
         seq,
@@ -3464,6 +3472,20 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         (seq, payload, fin, t.rcv_nxt, window, opts)
     };
     if payload.is_empty() && fin == 0 {
+        // Nothing is outstanding, so the record that fired is stale.
+        // Returning here left the deadline in the past: the timer fired
+        // again on every tick, each firing counted as a retransmission, and
+        // the eighth reset an idle, fully acknowledged connection.
+        let mut t = arc.lock();
+        let una = t.snd_una;
+        t.retx_queue.retain(|f| !seq_leq(f.end_seq(), una));
+        t.flightsize = t
+            .retx_queue
+            .iter()
+            .fold(0u32, |sum, f| sum.saturating_add(f.len));
+        t.rtt.undo_back_off(before_backoff);
+        t.rto_count = t.rto_count.saturating_sub(1);
+        arm_retransmit_timer(&mut t);
         return;
     }
     let iface = match iface_for_tcb(&arc.lock()) {
@@ -3495,12 +3517,19 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     {
         let mut t = arc.lock();
         // The buffer was rewound to snd_una: advance past what we resent so
-        // pump_send continues after it rather than double-sending.
-        t.send_buf.mark_sent(payload.len());
-        t.snd_nxt = seq
-            .wrapping_add(payload.len() as u32)
-            .wrapping_add((fin != 0) as u32);
-        note_sent(&mut t);
+        // pump_send continues after it rather than double-sending. The lock
+        // was released since the rewind, though. If a sender or an ACK moved
+        // `snd_nxt` meanwhile, it also kept the send-buffer offset in step;
+        // marking and setting `snd_nxt` here regardless left the two apart
+        // (a range marked sent and never transmitted) or `snd_nxt` below
+        // `snd_una`. What was resent is then just a duplicate.
+        if t.snd_nxt == seq {
+            t.send_buf.mark_sent(payload.len());
+            t.snd_nxt = seq
+                .wrapping_add(payload.len() as u32)
+                .wrapping_add((fin != 0) as u32);
+            note_sent(&mut t);
+        }
         t.total_retrans = t.total_retrans.saturating_add(1);
         arm_retransmit_timer(&mut t);
         if refused && t.retx_deadline_cycles != 0 {
