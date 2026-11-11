@@ -1375,3 +1375,68 @@ kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_staged_pull_floor_ignores_stale_nodes
 );
+
+/// One search by this CPU under `strategy`, with the stuck CPU as the only
+/// victim it may look at.
+fn policy_search(strategy: &dyn crate::steal::StealStrategy, stuck: &StuckCpu) -> bool {
+    let me = narf_lib::percpu::current_cpu();
+    let victim = stuck.0 as u32;
+    crate::try_steal_among(me, strategy, 1u64 << victim, |cpu| cpu == victim)
+}
+
+/// The opt-in steal policies choose victims from advisory hints: LLC-aware
+/// search skips CPUs that report `Idle` or no runnable peer, and two-choice
+/// sampling skips those and CPUs whose ready queue is empty. A CPU stuck in
+/// executor maintenance reports `Idle` and has an empty ready queue while its
+/// staged wakes wait for it. Each policy must still find it — on its own
+/// sampling pass, not only on a two-choice full-coverage round — and pull the
+/// wake once the CPU has been seen stalled.
+fn smoke_scheduler_steal_policies_see_staged_wakes() -> TestResult {
+    let llc = crate::steal::LlcAwareSteal::new();
+    let pick2 = crate::steal::Pick2Steal::new();
+    let policies: [(&dyn crate::steal::StealStrategy, &str); 2] = [
+        (
+            &llc,
+            "LLC-aware search never pulled a stalled CPU's staged wake",
+        ),
+        (
+            &pick2,
+            "two-choice search never pulled a stalled CPU's staged wake",
+        ),
+    ];
+    for (strategy, failure) in policies {
+        reset_probes();
+        let Some(stuck) = StuckCpu::claim() else {
+            return TestResult::Skip("every CPU index has been online");
+        };
+        stuck.set_running(false);
+        crate::policy::__test_set_cpu_state(CpuId(stuck.0 as u32), CpuState::Idle);
+        let Some((id, _cell)) = park_probe_on(0, 1, stuck.0, None) else {
+            stuck.release();
+            return TestResult::Fail("could not park the probe on the stuck CPU");
+        };
+        let_cool();
+        let Some(waker) = take_waker(0) else {
+            stuck.release();
+            return TestResult::Fail("probe published no waker");
+        };
+        waker.wake();
+        // The first visit records the sighting; the CPU passes no scheduling
+        // point, so a visit after the stall threshold may take its last wake.
+        let early = policy_search(strategy, &stuck);
+        narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+        let pulled = early || policy_search(strategy, &stuck);
+        crate::poll_one_round();
+        let ran = polls(0);
+        let left_behind = parked_on(stuck.0, id);
+        stuck.release();
+        if !pulled || left_behind || ran != 2 {
+            return TestResult::Fail(failure);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_steal_policies_see_staged_wakes
+);

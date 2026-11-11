@@ -7575,9 +7575,21 @@ fn try_steal_one(cpu: usize) -> bool {
         None => return false,
     };
 
-    let max = narf_lib::percpu::MAX_CPUS;
     let online = narf_lib::smp::online_bitmap() & !(1u64 << cpu);
+    try_steal_among(cpu, strategy.as_ref(), online, narf_lib::smp::is_online)
+}
 
+/// One steal search by `cpu` under `strategy` over the victims in `online`,
+/// each re-checked with `still_online` just before it is probed. The body of
+/// [`try_steal_one`], separate so the strand smokes can aim a policy at a CPU
+/// index that is not really online.
+fn try_steal_among(
+    cpu: usize,
+    strategy: &dyn crate::steal::StealStrategy,
+    online: u64,
+    still_online: impl Fn(u32) -> bool,
+) -> bool {
+    let max = narf_lib::percpu::MAX_CPUS;
     let thief = crate::affinity::CpuId(cpu as u32);
     let idle = |id| policy::cpu_state(id) == CpuState::Idle;
     let runnable = |id: CpuId| {
@@ -7606,12 +7618,8 @@ fn try_steal_one(cpu: usize) -> bool {
     );
     let mut moved = false;
     strategy.visit_victims(thief, &context, &mut |victim| {
-        if !moved
-            && (victim.0 as usize) < max
-            && victim != thief
-            && narf_lib::smp::is_online(victim.0)
-        {
-            moved = try_steal_from(victim.0 as usize, cpu, strategy.as_ref());
+        if !moved && (victim.0 as usize) < max && victim != thief && still_online(victim.0) {
+            moved = try_steal_from(victim.0 as usize, cpu, strategy);
         }
         moved
     });
