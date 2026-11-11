@@ -34,6 +34,29 @@
 //       and how many children are outstanding. With FORKPARENT_CLEAN=1 in
 //       the environment the mapping is only read: every page is cached and
 //       mapped, none is dirty.
+//   soak-native munmapbig <mib> <file>
+//       Map <mib> MiB of <file> shared, dirty every page and time munmap.
+//   soak-native firsttouch <mib> <file>
+//       Write <mib> MiB to <file>, drop it from the cache, map it shared and
+//       read-only, and time the first touch of every page.
+//   soak-native mapchurn <secs> <mib> <file>
+//       Map <mib> MiB shared, dirty it, munmap, over and over.
+//   soak-native durable <file> <mib> <exit|kill|msync|fsync|nosync> <seed>
+//       Fill <mib> MiB of <file> with the pattern of <seed> through a shared
+//       mapping and then: exit (munmap and exit, no sync), kill (SIGKILL with
+//       the mapping still dirty), msync (msync MS_SYNC), fsync (munmap, then
+//       fsync the descriptor), nosync (munmap and exit, like exit; used just
+//       before a hard stop). Prints "durable: <file> <mode> done" when the
+//       process has finished (for kill, the parent prints it once reaped).
+//   soak-native verify <file> <mib> <seed>
+//       Check the pattern through read(2) and through a fresh mapping.
+//   soak-native integrity <secs> <dir> <files> <hbfile>
+//       Keep a shadow of each of <files> files in <dir> and change them at
+//       random through shared mappings and write(2), with msync, ftruncate
+//       and re-mapping interleaved; verify ranges through read(2) and through
+//       a fresh mapping. Any mismatch prints INTEGRITY-MISMATCH with file,
+//       offset and both bytes. At the end each file is fsynced and its
+//       length and FNV-1a hash printed as INTEGRITY-FINAL, for the host.
 //   soak-native lookups <secs> <threads> <tree> <hbfile>
 //       <threads> threads resolve paths under <tree> (stat, open, and a
 //       fork+exec every 256 lookups); the heartbeat carries the slowest
@@ -928,6 +951,348 @@ static int forkparent(uint64_t secs, size_t mib, double rate, const char *file, 
     _exit(0);
 }
 
+// ── durability and integrity ────────────────────────────────────────
+
+// The pattern word at byte offset `off` of a file written with `seed`.
+static uint64_t pattern_word(uint64_t seed, uint64_t off) {
+    uint64_t x = seed * 0x9E3779B97F4A7C15ull ^ off;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+static int munmapbig(size_t mib, const char *file) {
+    size_t len = mib << 20;
+    int fd = open(file, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0 || ftruncate(fd, (off_t)len) < 0)
+        return 2;
+    unsigned char *map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED)
+        return 3;
+    uint64_t t0 = now_ns();
+    for (size_t off = 0; off < len; off += 4096)
+        memcpy(map + off, &off, sizeof off);
+    uint64_t t1 = now_ns();
+    munmap(map, len);
+    uint64_t t2 = now_ns();
+    close(fd);
+    uint64_t t3 = now_ns();
+    printf("munmapbig: mib=%zu dirty_ms=%llu munmap_ms=%llu close_ms=%llu\n", mib, MS(t1 - t0),
+           MS(t2 - t1), MS(t3 - t2));
+    return 0;
+}
+
+static int firsttouch(size_t mib, const char *file) {
+    size_t len = mib << 20;
+    char *buf = malloc(1 << 20);
+    memset(buf, 'f', 1 << 20);
+    int fd = open(file, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0)
+        return 2;
+    for (size_t i = 0; i < mib; i++)
+        if (write(fd, buf, 1 << 20) != 1 << 20)
+            return 3;
+    fsync(fd);
+    posix_fadvise(fd, 0, (off_t)len, POSIX_FADV_DONTNEED);
+    unsigned char *map = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED)
+        return 4;
+    uint64_t t0 = now_ns(), worst = 0;
+    for (size_t off = 0; off < len; off += 4096) {
+        uint64_t t = now_ns();
+        g_sink += map[off];
+        t = now_ns() - t;
+        if (t > worst)
+            worst = t;
+    }
+    uint64_t t1 = now_ns();
+    munmap(map, len);
+    close(fd);
+    unlink(file);
+    printf("firsttouch: mib=%zu pages=%zu total_ms=%llu per_page_us=%llu worst_ms=%llu\n", mib,
+           len / 4096, MS(t1 - t0), (unsigned long long)((t1 - t0) / 1000 / (len / 4096)),
+           MS(worst));
+    return 0;
+}
+
+static int mapchurn(uint64_t secs, size_t mib, const char *file) {
+    size_t len = mib << 20;
+    uint64_t end = now_ns() + secs * 1000000000ull, rounds = 0, worst_map = 0, worst_unmap = 0;
+    int fd = open(file, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0 || ftruncate(fd, (off_t)len) < 0)
+        return 2;
+    while (now_ns() < end) {
+        uint64_t t = now_ns();
+        unsigned char *map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        t = now_ns() - t;
+        if (t > worst_map)
+            worst_map = t;
+        if (map == MAP_FAILED)
+            return 3;
+        for (size_t off = 0; off < len; off += 4096)
+            map[off] = (unsigned char)rounds;
+        t = now_ns();
+        munmap(map, len);
+        t = now_ns() - t;
+        if (t > worst_unmap)
+            worst_unmap = t;
+        rounds++;
+    }
+    close(fd);
+    unlink(file);
+    printf("mapchurn: mib=%zu rounds=%llu worst_mmap_ms=%llu worst_munmap_ms=%llu\n", mib,
+           (unsigned long long)rounds, MS(worst_map), MS(worst_unmap));
+    return 0;
+}
+
+static int durable(const char *file, size_t mib, const char *mode, uint64_t seed) {
+    size_t len = mib << 20;
+    int kill_it = strcmp(mode, "kill") == 0;
+    int pfd[2];
+    if (pipe(pfd) < 0)
+        return 2;
+    pid_t pid = fork();
+    if (pid == 0) {
+        int fd = open(file, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd < 0 || ftruncate(fd, (off_t)len) < 0)
+            _exit(2);
+        uint64_t *map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED)
+            _exit(3);
+        for (size_t i = 0; i < len / 8; i++)
+            map[i] = pattern_word(seed, i * 8);
+        if (strcmp(mode, "msync") == 0) {
+            if (msync(map, len, MS_SYNC) != 0)
+                _exit(4);
+        }
+        if (kill_it) {
+            if (write(pfd[1], "d", 1) != 1)
+                _exit(5);
+            for (;;)
+                pause();
+        }
+        if (strcmp(mode, "msync") != 0)
+            munmap(map, len);
+        if (strcmp(mode, "fsync") == 0 && fsync(fd) != 0)
+            _exit(6);
+        _exit(0);
+    }
+    close(pfd[1]);
+    if (kill_it) {
+        char byte;
+        if (read(pfd[0], &byte, 1) != 1)
+            return 7;
+        kill(pid, SIGKILL);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (!kill_it && !(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+        printf("durable: %s %s FAILED status=%#x\n", file, mode, status);
+        return 1;
+    }
+    printf("durable: %s %s done seed=%llu mib=%zu\n", file, mode, (unsigned long long)seed, mib);
+    return 0;
+}
+
+static int verify(const char *file, size_t mib, uint64_t seed) {
+    size_t len = mib << 20, bad_read = 0, bad_map = 0, first = (size_t)-1;
+    int fd = open(file, O_RDONLY);
+    if (fd < 0) {
+        printf("verify: %s cannot open\n", file);
+        return 1;
+    }
+    uint64_t *buf = malloc(1 << 20);
+    for (size_t off = 0; off < len; off += 1 << 20) {
+        ssize_t n = pread(fd, buf, 1 << 20, (off_t)off);
+        for (ssize_t i = 0; i < n / 8; i++)
+            if (buf[i] != pattern_word(seed, off + (size_t)i * 8)) {
+                if (first == (size_t)-1)
+                    first = off + (size_t)i * 8;
+                bad_read++;
+            }
+        if (n < (1 << 20))
+            bad_read += (size_t)((1 << 20) - (n < 0 ? 0 : n)) / 8;
+    }
+    uint64_t *map = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (map != MAP_FAILED) {
+        for (size_t i = 0; i < len / 8; i++)
+            if (map[i] != pattern_word(seed, i * 8))
+                bad_map++;
+        munmap(map, len);
+    }
+    close(fd);
+    printf("verify: %s mib=%zu bad_words_read=%zu bad_words_map=%zu first_bad=%lld\n", file, mib,
+           bad_read, bad_map, first == (size_t)-1 ? -1ll : (long long)first);
+    return bad_read || bad_map;
+}
+
+#define INTEG_MAX (4u << 20)
+
+struct integ_file {
+    char path[512];
+    unsigned char *shadow;
+    size_t len;
+    int fd;
+};
+
+static uint64_t fnv1a(const unsigned char *p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static uint64_t g_integ_mismatch, g_integ_ops, g_slow_map, g_slow_unmap, g_worst_map, g_worst_unmap;
+
+static void integ_check(struct integ_file *f, const unsigned char *got, size_t off, size_t n,
+                        const char *how) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char want = off + i < f->len ? f->shadow[off + i] : 0;
+        if (got[i] != want) {
+            g_integ_mismatch++;
+            if (g_integ_mismatch <= 20)
+                fprintf(stderr,
+                        "INTEGRITY-MISMATCH %s via %s offset %zu expected %#x got %#x (len %zu)\n",
+                        f->path, how, off + i, want, got[i], f->len);
+            return;
+        }
+    }
+}
+
+static void integ_note_time(uint64_t t, int unmap) {
+    uint64_t *worst = unmap ? &g_worst_unmap : &g_worst_map;
+    if (t > *worst)
+        *worst = t;
+    if (t > 100000000ull)
+        (*(unmap ? &g_slow_unmap : &g_slow_map))++;
+}
+
+static int integrity(uint64_t secs, const char *dir, int nfiles, const char *hb) {
+    struct integ_file *files = calloc((size_t)nfiles, sizeof *files);
+    unsigned char *tmp = malloc(INTEG_MAX);
+    char line[256];
+    mkdir(dir, 0755);
+    for (int i = 0; i < nfiles; i++) {
+        struct integ_file *f = &files[i];
+        snprintf(f->path, sizeof f->path, "%s/i%d.dat", dir, i);
+        f->shadow = calloc(1, INTEG_MAX);
+        f->fd = open(f->path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (f->fd < 0)
+            return 2;
+        f->len = 0;
+    }
+    uint64_t end = now_ns() + secs * 1000000000ull, next_hb = 0;
+    while (now_ns() < end) {
+        struct integ_file *f = &files[rnd() % (uint64_t)nfiles];
+        unsigned op = (unsigned)(rnd() % 10);
+        size_t off = (size_t)(rnd() % INTEG_MAX) & ~7ull;
+        size_t n = 1 + (size_t)(rnd() % (256 << 10));
+        if (off + n > INTEG_MAX)
+            n = INTEG_MAX - off;
+        unsigned char val = (unsigned char)(rnd() | 1);
+        g_integ_ops++;
+        if (op < 3) {
+            // Store through a shared mapping of the page range, growing the
+            // file first if needed.
+            if (off + n > f->len) {
+                if (ftruncate(f->fd, (off_t)(off + n)) != 0)
+                    continue;
+                f->len = off + n;
+            }
+            size_t base = off & ~4095ull, mlen = ((off + n + 4095) & ~4095ull) - base;
+            if (base + mlen > ((f->len + 4095) & ~4095ull))
+                mlen = ((f->len + 4095) & ~4095ull) - base;
+            uint64_t t = now_ns();
+            unsigned char *map = mmap(NULL, mlen, PROT_READ | PROT_WRITE, MAP_SHARED, f->fd,
+                                      (off_t)base);
+            integ_note_time(now_ns() - t, 0);
+            if (map == MAP_FAILED)
+                continue;
+            memset(map + (off - base), val, n);
+            memset(f->shadow + off, val, n);
+            if (op == 0)
+                msync(map, mlen, (rnd() & 1) ? MS_SYNC : MS_ASYNC);
+            t = now_ns();
+            munmap(map, mlen);
+            integ_note_time(now_ns() - t, 1);
+        } else if (op < 5) {
+            memset(tmp, val, n);
+            if (pwrite(f->fd, tmp, n, (off_t)off) != (ssize_t)n)
+                continue;
+            memcpy(f->shadow + off, tmp, n);
+            if (off + n > f->len)
+                f->len = off + n;
+        } else if (op == 5) {
+            size_t nl = (size_t)(rnd() % INTEG_MAX);
+            if (ftruncate(f->fd, (off_t)nl) != 0)
+                continue;
+            if (nl < f->len)
+                memset(f->shadow + nl, 0, f->len - nl);
+            f->len = nl;
+        } else if (op == 6) {
+            fdatasync(f->fd);
+        } else if (op < 9) {
+            if (off >= f->len)
+                continue;
+            if (off + n > f->len)
+                n = f->len - off;
+            ssize_t got = pread(f->fd, tmp, n, (off_t)off);
+            if (got != (ssize_t)n) {
+                g_integ_mismatch++;
+                fprintf(stderr, "INTEGRITY-MISMATCH %s via read short %zd of %zu at %zu (len %zu)\n",
+                        f->path, got, n, off, f->len);
+                continue;
+            }
+            integ_check(f, tmp, off, n, "read");
+        } else {
+            if (f->len == 0)
+                continue;
+            size_t mlen = (f->len + 4095) & ~4095ull;
+            unsigned char *map = mmap(NULL, mlen, PROT_READ, MAP_SHARED, f->fd, 0);
+            if (map == MAP_FAILED)
+                continue;
+            integ_check(f, map, 0, f->len, "fresh-map");
+            munmap(map, mlen);
+        }
+        if (now_ns() >= next_hb) {
+            next_hb = now_ns() + 1000000000ull;
+            snprintf(line, sizeof line,
+                     "ops=%llu mismatch=%llu slow_mmap=%llu slow_munmap=%llu worst_mmap_ms=%llu "
+                     "worst_munmap_ms=%llu\n",
+                     (unsigned long long)g_integ_ops, (unsigned long long)g_integ_mismatch,
+                     (unsigned long long)g_slow_map, (unsigned long long)g_slow_unmap,
+                     MS(g_worst_map), MS(g_worst_unmap));
+            write_hb(hb, line);
+        }
+    }
+    for (int i = 0; i < nfiles; i++) {
+        struct integ_file *f = &files[i];
+        fsync(f->fd);
+        ssize_t got = pread(f->fd, tmp, f->len, 0);
+        if (got != (ssize_t)f->len) {
+            g_integ_mismatch++;
+            fprintf(stderr, "INTEGRITY-MISMATCH %s via final-read short %zd of %zu\n", f->path,
+                    got, f->len);
+        } else {
+            integ_check(f, tmp, 0, f->len, "final-read");
+        }
+        printf("INTEGRITY-FINAL %s len=%zu fnv=%016llx\n", f->path, f->len,
+               (unsigned long long)fnv1a(f->shadow, f->len));
+        close(f->fd);
+    }
+    printf("integrity: ops=%llu mismatch=%llu slow_mmap=%llu slow_munmap=%llu worst_mmap_ms=%llu "
+           "worst_munmap_ms=%llu\n",
+           (unsigned long long)g_integ_ops, (unsigned long long)g_integ_mismatch,
+           (unsigned long long)g_slow_map, (unsigned long long)g_slow_unmap, MS(g_worst_map),
+           MS(g_worst_unmap));
+    return g_integ_mismatch ? 1 : 0;
+}
+
 // ── killstorm ───────────────────────────────────────────────────────
 
 struct slot {
@@ -1080,6 +1445,18 @@ int main(int argc, char **argv) {
     if (argc == 7 && strcmp(argv[1], "forkparent") == 0)
         return forkparent(strtoull(argv[2], NULL, 10), strtoull(argv[3], NULL, 10),
                           atof(argv[4]), argv[5], argv[6]);
+    if (argc == 4 && strcmp(argv[1], "munmapbig") == 0)
+        return munmapbig(strtoull(argv[2], NULL, 10), argv[3]);
+    if (argc == 4 && strcmp(argv[1], "firsttouch") == 0)
+        return firsttouch(strtoull(argv[2], NULL, 10), argv[3]);
+    if (argc == 5 && strcmp(argv[1], "mapchurn") == 0)
+        return mapchurn(strtoull(argv[2], NULL, 10), strtoull(argv[3], NULL, 10), argv[4]);
+    if (argc == 6 && strcmp(argv[1], "durable") == 0)
+        return durable(argv[2], strtoull(argv[3], NULL, 10), argv[4], strtoull(argv[5], NULL, 10));
+    if (argc == 5 && strcmp(argv[1], "verify") == 0)
+        return verify(argv[2], strtoull(argv[3], NULL, 10), strtoull(argv[4], NULL, 10));
+    if (argc == 6 && strcmp(argv[1], "integrity") == 0)
+        return integrity(strtoull(argv[2], NULL, 10), argv[3], atoi(argv[4]), argv[5]);
     if (argc == 6 && strcmp(argv[1], "lookups") == 0) {
         g_tree = argv[4];
         collect_tree();
@@ -1099,6 +1476,12 @@ int main(int argc, char **argv) {
             "       soak-native shared <secs> <procs> <threads> <dir> <hbfile>\n"
             "       soak-native dirtyexit <mib> <file> <exit|kill> <tree>\n"
             "       soak-native forkparent <secs> <dirty-mib> <forks-per-sec> <file> <hbfile>\n"
+            "       soak-native munmapbig <mib> <file>\n"
+            "       soak-native firsttouch <mib> <file>\n"
+            "       soak-native mapchurn <secs> <mib> <file>\n"
+            "       soak-native durable <file> <mib> <exit|kill|msync|fsync|nosync> <seed>\n"
+            "       soak-native verify <file> <mib> <seed>\n"
+            "       soak-native integrity <secs> <dir> <files> <hbfile>\n"
             "       soak-native lookups <secs> <threads> <tree> <hbfile>\n"
             "       soak-native mmapfault <secs> <threads> <bigfile> <hbfile>\n"
             "       soak-native readtree <secs> <threads> <tree> <hbfile>\n");
