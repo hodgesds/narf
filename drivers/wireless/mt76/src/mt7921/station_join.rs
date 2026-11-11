@@ -774,6 +774,7 @@ impl<B: Backend> Session<B> {
                 || station
                     .csa
                     .is_some_and(|(_, at)| self.backend.now_ns() >= at)
+                || station.bw_change.is_some()
                 || self.policy_changed(station)
                 || station.ps_wanted != station.ps_applied
                 || !station.control_pending.is_empty()
@@ -1173,14 +1174,26 @@ impl<B: Backend> Session<B> {
                     && f[10..16] == peer
                     && f[16..22] == peer
                     && (f[4..10] == own || f[4..10] == [255; 6])
-                    && !narf_wireless::association::phy::ApElements::parse(&f[36..])
-                        .is_ok_and(|current| crate::mt7921::ht20::same_ap_phy(&ap, &current))
                 {
-                    self.station.peer_lost = true;
-                    self.station.rx_ba.fence();
-                    self.station.tx_ba.fence();
-                    self.clear_aggregate_receive();
-                    return Err(Error::DeviceGone);
+                    match crate::mt7921::csa::beacon_phy(&ap, &f[36..]) {
+                        // The latest Beacon wins over a change not yet followed.
+                        crate::mt7921::csa::BeaconPhy::Same => self.station.bw_change = None,
+                        // mac80211 `ieee80211_config_bw`: the station follows
+                        // a new width of the unchanged PHY (control work),
+                        // unless an announced switch will rebind it first.
+                        crate::mt7921::csa::BeaconPhy::Width(current) => {
+                            if self.station.csa.is_none() {
+                                self.station.bw_change = Some(*current);
+                            }
+                        }
+                        crate::mt7921::csa::BeaconPhy::Changed => {
+                            self.station.peer_lost = true;
+                            self.station.rx_ba.fence();
+                            self.station.tx_ba.fence();
+                            self.clear_aggregate_receive();
+                            return Err(Error::DeviceGone);
+                        }
+                    }
                 }
             }
             if native.amsdu != 0 {
@@ -2033,6 +2046,11 @@ impl<B: Backend> Session<B> {
         self.station.received_msdu.clear();
         self.station.demuxed.clear();
         self.station.tx_credit.clear();
+        // A channel switch or width change of an earlier association is
+        // not this one's.
+        self.station.csa = None;
+        self.station.csa_block_tx = false;
+        self.station.bw_change = None;
         self.boot_started = Some(self.backend.now_ns());
         self.station.security = None;
         self.station.wmm = None;
@@ -2792,6 +2810,11 @@ impl<B: Backend> Session<B> {
                 .station
                 .csa
                 .is_some_and(|(_, at)| self.backend.now_ns() >= at);
+        // A width change in the AP's Beacons is followed the same way; an
+        // announced switch rebinds the AP's elements itself.
+        let width_due = matches!(restore, State::Associated { .. })
+            && self.station.bw_change.is_some()
+            && self.station.csa.is_none();
         let mut restore = restore;
         // While Channel Switch Mode 1 holds data, other control work waits
         // for the switch: nothing may be sent on the old channel.
@@ -2799,6 +2822,7 @@ impl<B: Backend> Session<B> {
             return Ok(());
         }
         if !switch_due
+            && !width_due
             && self.station.wmm_pending.is_none()
             && !self.policy_changed(&self.station)
             && self.station.ps_wanted == self.station.ps_applied
@@ -2840,6 +2864,9 @@ impl<B: Backend> Session<B> {
                         };
                     }
                 }
+            }
+            if width_due {
+                self.service_width_change(info, associated).await?;
             }
             self.service_regulatory(info).await?;
             self.service_wmm_update().await?;
@@ -2910,19 +2937,17 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    /// Every association/key/port publication earns fresh authority after
-    /// the preceding wait. Cleanup deliberately uses plain exchange instead.
     /// Follow the AP's announced channel switch in place (mac80211
-    /// `ieee80211_chswitch_work` for a driver without its own switch op): the
-    /// same BSS on the new channel is admitted under the current policy
-    /// (the AP operates there, so a radar/NO_IR channel is allowed as for a
-    /// heard AP), the radio retunes (channel domain, power limits, channel
-    /// switch) and the association, keys and BA sessions carry over.
-    /// The width is 20 MHz: the HT/VHT/HE operation negotiated for the old
-    /// channel no longer describes the new one, so those profiles and the
-    /// per-beacon checks built on them are dropped. A switch the policy or
-    /// the band does not allow ends the link, as mac80211 does when it
-    /// cannot follow (`ieee80211_sta_connection_lost`).
+    /// `ieee80211_sta_process_chanswitch` / `ieee80211_chswitch_work`;
+    /// `mt7921_csa_work` sends the new channel context's RLM): the same BSS
+    /// on the new channel, at the width the CSA, Secondary Channel Offset,
+    /// Wide Bandwidth Channel Switch element or ECSA operating class names
+    /// (`ieee80211_parse_ch_switch_ie`), no wider than the connection's
+    /// limit, narrowed to what the policy allows ([`Self::follow_ap`]). The
+    /// association, keys, BA sessions and PHY profiles carry over. A switch
+    /// it cannot follow ends the link (`ieee80211_sta_connection_lost`):
+    /// another band, 6 GHz, inconsistent channel data, or a channel the
+    /// policy forbids at any width. Returns the new primary channel.
     async fn service_channel_switch(
         &mut self,
         info: super::RadioInfo,
@@ -2932,48 +2957,178 @@ impl<B: Backend> Session<B> {
             return Ok(None);
         };
         self.station.csa_block_tx = false;
-        let State::Associated { channel, .. } = associated else {
+        self.station.bw_change = None;
+        let State::Associated { .. } = associated else {
             return Err(Error::Busy);
         };
-        let (Some(old), Some(mut bss)) = (self.station.permission, self.station.bss.clone()) else {
+        let (Some(old), Some(bss)) = (self.station.permission, self.station.bss.as_ref()) else {
             return Err(Error::Authority);
         };
-        let leave = |session: &mut Self| -> Result<Option<u8>, Error> {
-            session.station.peer_lost = true;
-            session.station.rx_ba.fence();
-            session.station.tx_ba.fence();
-            Err(Error::Authority)
+        let target = (!crate::mt7921::association::is_six_ghz(bss)
+            && crate::mt7921::csa::switch_band(&switch) == old.band())
+        .then(|| {
+            crate::mt7921::csa::switch_target(
+                &switch,
+                self.width_limit(),
+                self.station.vht_profile.is_some(),
+            )
+        })
+        .flatten();
+        let Some((ap, used)) = target else {
+            return Err(self.leave_ap());
         };
-        let same_band = crate::mt7921::channel::band(switch.channel).is_some()
-            && crate::mt7921::channel::band(switch.channel) == old.band()
-            && !crate::mt7921::association::is_six_ghz(&bss);
-        if !same_band || switch.channel == channel {
-            return if switch.channel == channel {
-                Ok(None)
-            } else {
-                leave(self)
-            };
+        // mac80211 ignores a switch to the channel it already uses.
+        if used == old.chandef() {
+            return Ok(None);
         }
-        let domain = self.backend.regulatory_domain()?;
-        let Some(new) =
-            crate::mt7921::association::TxPermission::from_heard_ap(&domain, switch.channel)
-        else {
-            return leave(self);
-        };
-        bss.channel = switch.channel;
-        self.station.permission = Some(new);
-        self.station.bss = Some(bss);
-        self.station.ht20_profile = None;
-        self.station.vht_profile = None;
-        self.station.he_profile = None;
-        self.station.ap_phy = None;
-        self.station.ht20_rx = None;
-        self.clear_aggregate_receive();
-        self.reconfigure_station_channel(info, switch.channel, new, 1)
-            .await?;
+        self.follow_ap(info, ap, None).await?;
         Ok(Some(switch.channel))
     }
 
+    /// mac80211 `ieee80211_config_bw` for a Beacon whose PHY changed only in
+    /// its width (`csa::beacon_phy`): the AP's new channel, at most the
+    /// connection's limit and narrowed to what the policy allows. A
+    /// Beacon whose operation elements are inconsistent ends the link.
+    async fn service_width_change(
+        &mut self,
+        info: super::RadioInfo,
+        associated: State,
+    ) -> Result<(), Error> {
+        let Some(elements) = self.station.bw_change.take() else {
+            return Ok(());
+        };
+        let State::Associated { channel, .. } = associated else {
+            return Err(Error::Busy);
+        };
+        let Some(ap) = crate::mt7921::csa::ap_chandef(&elements, channel) else {
+            return Err(self.leave_ap());
+        };
+        self.follow_ap(info, ap, Some(elements)).await
+    }
+
+    /// The connection's channel width limit (mac80211 `conn->bw_limit`):
+    /// 160 or 80 MHz for VHT, 40 MHz for HT when both sides support it,
+    /// else 20 MHz.
+    fn width_limit(&self) -> u8 {
+        match (self.station.vht_profile, self.station.ht20_profile) {
+            (Some(vht), _) if vht.wide160() => cmd::CH_BW_160,
+            (Some(_), _) => cmd::CH_BW_80,
+            (None, Some(ht)) if ht.forty() => cmd::CH_BW_40,
+            _ => cmd::CH_BW_20,
+        }
+    }
+
+    /// End the link: the AP moved somewhere this station cannot follow.
+    fn leave_ap(&mut self) -> Error {
+        self.station.peer_lost = true;
+        self.station.rx_ba.fence();
+        self.station.tx_ba.fence();
+        Error::Authority
+    }
+
+    /// Move the association to the AP's channel `ap`: the station uses it
+    /// at most at the connection's width limit and, while the policy does
+    /// not allow that width, one step narrower (`ieee80211_chandef_downgrade`;
+    /// mac80211 would disconnect where cfg80211 refuses the AP's width, but
+    /// this owner's grant is stricter than `cfg80211_chandef_usable`, so it
+    /// keeps the link at a width it may use). The BSS's elements are
+    /// rewritten for `ap` and the tracked AP elements become `elements` (a
+    /// Beacon's) or those rewritten ones. The HT/VHT/HE profiles follow the
+    /// used width; the radio retunes (channel domain, power limits,
+    /// CHANNEL_SWITCH) and the BSS RLM record carries the new channel
+    /// context (`mt76_connac_mcu_uni_set_chctx`). The STA record is not
+    /// resent: Linux mt7921 has no `sta_rc_update`.
+    async fn follow_ap(
+        &mut self,
+        info: super::RadioInfo,
+        ap: crate::mt7921::csa::Chandef,
+        elements: Option<narf_wireless::association::phy::ApElements>,
+    ) -> Result<(), Error> {
+        let (Some(old), Some(mut bss)) = (self.station.permission, self.station.bss.clone()) else {
+            return Err(Error::Authority);
+        };
+        bss.information_elements =
+            crate::mt7921::csa::describe(&bss.information_elements, ap).ok_or(Error::Bounds)?;
+        bss.channel = ap.primary;
+        let elements = match (self.station.ap_phy, elements) {
+            (_, Some(elements)) => Some(elements),
+            (Some(_), None) => Some(
+                narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
+                    .map_err(|_| Error::Bounds)?,
+            ),
+            (None, None) => None,
+        };
+        let vht = self.station.vht_profile.is_some();
+        let domain = self.backend.regulatory_domain()?;
+        let mut used = ap.limited(self.width_limit());
+        let grant = loop {
+            if let Some(grant) =
+                crate::mt7921::association::TxPermission::following_ap(&domain, used, vht)
+            {
+                break grant;
+            }
+            if used.width == cmd::CH_BW_20 {
+                return Err(self.leave_ap());
+            }
+            used = used.downgrade();
+        };
+        let moved = grant.chandef() != old.chandef();
+        // The radio's channel is shared with the other live station owner
+        // or the GO; mac80211 cannot reserve a channel context for the move
+        // and disconnects.
+        if moved && (self.other_station_permission().is_some() || self.go_plan().is_some()) {
+            return Err(self.leave_ap());
+        }
+        let operation = elements
+            .and_then(|elements| elements.ht_operation())
+            .or_else(|| {
+                narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
+                    .ok()
+                    .and_then(|elements| elements.ht_operation())
+            });
+        if let (Some(profile), Some(operation)) = (self.station.ht20_profile, operation) {
+            self.station.ht20_profile = Some(profile.retuned(operation, used.secondary()));
+        }
+        if let (Some(profile), Some(elements)) = (self.station.vht_profile, elements) {
+            self.station.vht_profile = Some(profile.retuned(used.width, used.center, elements));
+        }
+        if let Some(profile) = self.station.he_profile {
+            self.station.he_profile = Some(profile.retuned(used.width));
+        }
+        self.station.ap_phy = elements;
+        if let Some(receiver) = &mut self.station.ht20_rx {
+            receiver.retune(ap.primary);
+        }
+        self.station.bss = Some(bss);
+        self.station.permission = Some(if moved { grant } else { old });
+        self.clear_aggregate_receive();
+        if !moved {
+            return Ok(());
+        }
+        let tx_streams = self.station.vht_profile.map_or_else(
+            || {
+                self.station
+                    .ht20_profile
+                    .map_or(1, crate::mt7921::ht20::Profile::transmit_streams)
+            },
+            crate::mt7921::vht::Profile::transmit_streams,
+        );
+        self.reconfigure_station_channel(info, used.primary, grant, tx_streams)
+            .await?;
+        let chains = (1 << info.capabilities.phy.spatial_streams.min(2)) - 1;
+        self.exchange_station(
+            Command::Unified { id: 2 },
+            &crate::mt7921::vif_slots::on_bss(
+                self.station.link.vif(),
+                crate::mt7921::csa::rlm(used, tx_streams, chains),
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Every association/key/port publication earns fresh authority after
+    /// the preceding wait. Cleanup deliberately uses plain exchange instead.
     /// The installed regulatory policy is no longer the one this station's
     /// grant and firmware limits were programmed from.
     pub(super) fn policy_changed(&self, station: &super::StationLink) -> bool {

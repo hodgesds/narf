@@ -218,6 +218,11 @@ pub(crate) struct Profile {
     rx_greenfield: bool,
     /// Peer VHT Maximum MPDU Length field (bits 0..1).
     peer_mpdu: u8,
+    /// The advertised local and the peer VHT capability both support
+    /// 160 MHz: the connection's width limit (mac80211 `conn->bw_limit`).
+    wide160: bool,
+    /// Short GI at 160 MHz negotiated for transmission.
+    sgi160: bool,
 }
 impl Profile {
     pub(crate) fn negotiated(
@@ -292,7 +297,30 @@ impl Profile {
             rx_stbc: vht.rx_stbc(),
             rx_greenfield: n.ht().rx_greenfield(),
             peer_mpdu: (vht.peer_capability() & 3) as u8,
+            wide160: u32::from_le_bytes(vht.local_capability()[..4].try_into().unwrap()) & 12 != 0
+                && (vht.peer_capability() & 12 != 0 || vht.peer_capability() >> 30 != 0),
+            sgi160: vht.tx_sgi160(),
         })
+    }
+    /// The connection may run at 160 MHz.
+    pub(crate) fn wide160(self) -> bool {
+        self.wide160
+    }
+    /// The profile after the AP moved to the channel `ap` describes and the
+    /// station to `width` around `center`. The STA record is not resent
+    /// (Linux mt7921 has no `sta_rc_update`), so only the receive width, the
+    /// RLM geometry and the tracked AP elements change; the 160 MHz
+    /// capability bits follow the width as [`negotiated`](Self::negotiated)
+    /// sets them.
+    pub(crate) fn retuned(mut self, width: u8, center: u8, ap: ApElements) -> Self {
+        self.width = width;
+        self.center = center;
+        self.ap = ap;
+        self.capability &= !(4 | (1 << 6));
+        if width == 3 {
+            self.capability |= 4 | (u32::from(self.sgi160) << 6);
+        }
+        self
     }
     pub(crate) fn width(self) -> u8 {
         self.width
@@ -311,8 +339,10 @@ impl Profile {
     pub(crate) fn ampdu_factor(self) -> u8 {
         ((self.capability >> 23) & 7) as u8
     }
+    /// The AP's PHY facts are unchanged, or changed only in the channel
+    /// width the station follows (`csa::beacon_phy`).
     pub(crate) fn matches(self, ies: &[u8]) -> bool {
-        ApElements::parse(ies).is_ok_and(|ap| super::ht20::same_ap_phy(&self.ap, &ap))
+        super::csa::beacon_phy(&self.ap, ies) != super::csa::BeaconPhy::Changed
     }
     pub(crate) fn state(self) -> u8 {
         self.width | ((self.tx_streams - 1) << 4)

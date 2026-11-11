@@ -232,6 +232,17 @@ impl Profile {
     pub(crate) fn width(self) -> u8 {
         self.width
     }
+    /// The profile at the station's new channel `width` after it followed
+    /// the AP (`csa`); 160 MHz needs both sides' 160 MHz support.
+    pub(crate) fn retuned(mut self, width: u8) -> Self {
+        self.width = if width == 3 && self.rx160 == 0xffff {
+            2
+        } else {
+            width
+        };
+        self.bw160 = self.width == 3;
+        self
+    }
     pub(crate) fn five(self) -> bool {
         self.five
     }
