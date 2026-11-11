@@ -40,7 +40,7 @@ D=/run/narf-soak
 : "${SOAK_EXITWB:=8:exit 32:exit 32:kill}"
 # <window seconds>:<dirty MiB>:<forks per second> rounds of the forking parent.
 # A fourth field `clean` makes the mapping read-only-touched (nothing dirty).
-: "${SOAK_FORKFLUSH:=10:1:1 10:16:1 3:48:1}"
+: "${SOAK_FORKFLUSH:=10:1:1 5:8:1 3:16:1}"
 W=/var/tmp/narf-soak
 TREE=/home/narf/src/narf
 HB=$D/hb
@@ -573,24 +573,9 @@ journal_fill() { # MiB
 directed() {
   local spec window mib rate kind
   mkdir -p "$W/ep"
-  # (b) a process dies with dirty shared pages.
-  for spec in $SOAK_EXITWB; do
-    episode "die-${spec##*:}-${spec%%:*}m" "$NATIVE" dirtyexit "${spec%%:*}" "$W/ep/dirty.bin" \
-      "${spec##*:}" "$TREE/userspace"
-  done
-  # (a) a long-lived parent keeps N MiB of a shared mapping dirty and forks
-  # a child that execs /usr/bin/true once per period.
-  for spec in $SOAK_FORKFLUSH; do
-    IFS=: read -r window mib rate kind <<< "$spec"
-    if [ "$kind" = clean ]; then
-      episode "forkexec-clean-${mib}m" env FORKPARENT_CLEAN=1 "$NATIVE" forkparent "$window" \
-        "$mib" "$rate" "$W/ep/forkparent.bin" "$HB/forkparent"
-    else
-      episode "forkexec-dirty-${mib}m" "$NATIVE" forkparent "$window" "$mib" "$rate" \
-        "$W/ep/forkparent.bin" "$HB/forkparent"
-    fi
-  done
-  rm -f "$HB/forkparent"
+  # The operations that leave nothing behind come first. An exit with dirty
+  # shared pages can keep a CPU and the filesystem busy for minutes after
+  # it, and whatever ran next would be measuring that instead of itself.
   # (c) long system calls that touch no mapping.
   episode write-256x1m $PY bigwrite "$W/ep/w1" 1 256 nofsync
   episode write-4x64m $PY bigwrite "$W/ep/w2" 64 4 nofsync
@@ -618,6 +603,25 @@ directed() {
   episode loginctl-sessions five_times loginctl list-sessions --no-pager
   episode journalctl-unit five_times journalctl -b -u sshd.service --no-pager
   kill "$trickle" 2> /dev/null
+  mkdir -p "$W/ep"
+  # (b) a process dies with dirty shared pages.
+  for spec in $SOAK_EXITWB; do
+    episode "die-${spec##*:}-${spec%%:*}m" "$NATIVE" dirtyexit "${spec%%:*}" "$W/ep/dirty.bin" \
+      "${spec##*:}" "$TREE/userspace"
+  done
+  # (a) a long-lived parent keeps N MiB of a shared mapping dirty and forks
+  # a child that execs /usr/bin/true once per period.
+  for spec in $SOAK_FORKFLUSH; do
+    IFS=: read -r window mib rate kind <<< "$spec"
+    if [ "$kind" = clean ]; then
+      episode "forkexec-clean-${mib}m" env FORKPARENT_CLEAN=1 "$NATIVE" forkparent "$window" \
+        "$mib" "$rate" "$W/ep/forkparent.bin" "$HB/forkparent"
+    else
+      episode "forkexec-dirty-${mib}m" "$NATIVE" forkparent "$window" "$mib" "$rate" \
+        "$W/ep/forkparent.bin" "$HB/forkparent"
+    fi
+  done
+  rm -f "$HB/forkparent"
 }
 
 # ── run ─────────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@
 //       One process maps <file> MAP_SHARED, dirties <mib> MiB of it and
 //       exits without msync (or is SIGKILLed). Reports how long the exit
 //       took to reap, for how long afterwards some CPU stayed 90% or more
-//       busy (or took no timer tick at all), and the worst
+//       busy, and the worst
 //       stat() and fork+exec latency another thread saw meanwhile.
 //   soak-native forkparent <secs> <dirty-mib> <forks-per-sec> <file> <hbfile>
 //       One long-lived process keeps <dirty-mib> MiB of a MAP_SHARED mapping
@@ -717,23 +717,26 @@ static int dirtyexit(size_t mib, const char *file, int kill_it) {
     uint64_t t_end = now_ns();
     waitpid(pid, NULL, 0);
     uint64_t t_reaped = now_ns(), last_bound = 0;
-    int max_bound = 0, frozen_seen = 0;
+    int max_bound = 0;
     for (;;) {
-        usleep(200000);
+        // One-second samples: a burst of short processes on one CPU fills a
+        // fifth of a second and is not a capture.
+        usleep(1000000);
         uint64_t now = now_ns();
         int bound = 0;
         if (read_cpu_times(sys1, tot1) != ncpu)
             break;
         for (int c = 0; c < ncpu; c++) {
             uint64_t dt = tot1[c] - tot0[c], ds = sys1[c] - sys0[c];
-            if (dt == 0) {
+            // A CPU whose counters stood still says nothing: an idle CPU
+            // without a tick looks exactly like that.
+            if (dt >= 50 && ds * 100 >= dt * 90)
                 bound++;
-                frozen_seen = 1;
-            } else if (ds * 100 >= dt * 90 && dt >= 10) {
-                bound++;
+            // Keep the baseline until enough ticks have accumulated.
+            if (dt >= 50) {
+                sys0[c] = sys1[c];
+                tot0[c] = tot1[c];
             }
-            sys0[c] = sys1[c];
-            tot0[c] = tot1[c];
         }
         if (bound) {
             last_bound = now;
@@ -747,11 +750,10 @@ static int dirtyexit(size_t mib, const char *file, int kill_it) {
     lat.stop = 1;
     pthread_join(prober, NULL);
     printf("dirtyexit: mib=%zu mode=%s dirty_ms=%llu reap_ms=%llu cpu_bound_ms=%llu "
-           "cpus_bound_max=%d%s stat_max_ms=%llu exec_max_ms=%llu (stat n=%llu exec n=%llu)\n",
+           "cpus_bound_max=%d stat_max_ms=%llu exec_max_ms=%llu (stat n=%llu exec n=%llu)\n",
            mib, kill_it ? "kill" : "exit", (unsigned long long)((t_dirty - t0) / 1000000),
            (unsigned long long)((t_reaped - t_end) / 1000000),
            (unsigned long long)(last_bound > t_end ? (last_bound - t_end) / 1000000 : 0), max_bound,
-           frozen_seen ? " (a CPU took no tick)" : "",
            (unsigned long long)(lat.stat_max_ns / 1000000),
            (unsigned long long)(lat.exec_max_ns / 1000000), (unsigned long long)lat.stat_n,
            (unsigned long long)lat.exec_n);
