@@ -70,15 +70,18 @@ pub fn register_initcalls() {
     // table load. The i2c-HID bind pump composes the async
     // `HidRmiSession` (mode-set + PDT walk + F$11/F$12 ATTN
     // decode) when it classifies a device as RMI4; the USB-HID
-    // side still needs a `HidIo` backend over xHCI before
-    // `RMI_DEVICE_TABLE` / `match_device()` have a caller there.
+    // side is served by `drivers/usb/src/hid/rmi_elan.rs`
+    // (`UsbHidIo` implements `HidIo`, `classify()` is the
+    // `RMI_DEVICE_TABLE` / `match_device()` caller, bound from
+    // the attach cascade — issue #1681, PR #1721).
     hid_rmi::register_initcalls();
 
     // hid-elan — banner + device-id table load. The i2c-HID bind
     // pump composes the Elan vendor decode (absolute-mode probe
     // + 0x5D report decode) when it classifies a device as Elan;
-    // the USB-HID side is the same `HidIo`-backend remainder as
-    // hid-rmi.
+    // the USB-HID side is served by the same `rmi_elan` backend
+    // (`UsbHidIo` implements `ElanHidIo`, USB-bus rows of
+    // `ELAN_DEVICE_TABLE` only — issue #1681, PR #1721).
     hid_elan::register_initcalls();
 
     // RMI4-over-SMBus transport probe (issue #765) — runs once
