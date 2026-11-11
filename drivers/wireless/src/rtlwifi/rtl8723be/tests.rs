@@ -527,7 +527,9 @@ fn smoke_rtl8723be_tx_rx_descriptor_layout() -> TestResult {
                 && s.macid == 3
                 && s.ampdu
                 && s.c2h
-                && s.rate == 0x0c
+                // rtl8723be/trx.h:292-299: RXMCS is dw3[6:0] and RXHT is
+                // dw3 BIT(6), so the HT bit is also rate bit 6.
+                && s.rate == 0x4c
                 && s.is_ht
                 && s.bw == 1
                 && s.short_preamble
@@ -1165,7 +1167,15 @@ fn smoke_rtl8723be_erfon_block_and_channel_grant() -> TestResult {
         {
             return TestResult::Fail("8723BE bt_hw_init order / dispatch");
         }
-        if !(mac < path && path < lck && lck < nav && nav < rx)
+        // `_rtl8723be_init_mac` already clears RXDMA_CONTROL BIT2
+        // (rtl8723be/hw.c:924-925), so the ERFON "Release Rx DMA if
+        // needed" step after NAV_UPPER (hw.c:1430-1434) writes nothing.
+        let last_rx = g
+            .writes
+            .iter()
+            .rposition(|x| x.0 == init::REG_RXDMA_CONTROL);
+        if !(rx < mac && mac < path && path < lck && lck < nav)
+            || last_rx != Some(rx)
             || iqk_at.is_some() != iqk
             || iqk_at.is_some_and(|i| !(path < i && i < lck))
             || radio.iqk.is_some() != iqk
@@ -1304,7 +1314,9 @@ fn smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm() -> TestResult {
     {
         let g = io.0.lock();
         let w: Vec<_> = g.writes.iter().map(|w| (w.0, w.1)).collect();
-        if w[..4] != [(0x1f4, 0), (0x1f5, 0x40), (0x1f6, 0), (0x1f7, 0)]
+        // 7-byte SETPWRMODE: cmd[0..3] in the box, cmd[3..7] = [0, 0, 0x40,
+        // 0] in the extension (rtl8723be/fw.c:154 _rtl8723be_fill_h2c_command).
+        if w[..4] != [(0x1f4, 0), (0x1f5, 0), (0x1f6, 0x40), (0x1f7, 0)]
             || w[4..8] != [(0x1d4, 0x20), (0x1d5, 1), (0x1d6, 0x21), (0x1d7, 2)]
             || w[8] != (0x361, 0x80)
             || w.len() != 9
@@ -1989,13 +2001,14 @@ fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
     }
     // Golden bytes, hand-computed from `trx::TxDesc::fill`:
     // dw0 = offset 40<<16 | len 100 | firstseg<<27 | lastseg<<26
-    // (OWN clear); dw3 = seq<<12 | use_driver_rate<<8; dw4 = rate 12 |
+    // (OWN clear); dw3 = use_driver_rate<<8 (the sequence lives only in
+    // dw9[23:12], rtl8723be/trx.h:202); dw4 = rate 12 |
     // 0x1f<<8 | 0xf<<13 (= 0x1ff0c); dw7 = len; dw9 = seq<<12;
     // dw10 = buffer.
     if slot.dw[0] != 0x0c28_0064
         || slot.dw[1] != 0
         || slot.dw[2] != 0
-        || slot.dw[3] != 0x0012_3100
+        || slot.dw[3] != 0x0000_0100
         || slot.dw[4] != 0x0001_ff0c
         || slot.dw[5] != 0
         || slot.dw[6] != 0
@@ -2210,8 +2223,11 @@ fn smoke_rtl8723be_station_registers_and_rsvd_page() -> TestResult {
     {
         let g = io.0.lock();
         let r = |a: u16| g.regs[usize::from(a)];
-        if r(station::REG_RRSR) != 0x15
-            || r(station::REG_INIRTS_RATE_SEL) != 4
+        // HW_VAR_BASIC_RATE takes the peer's supported rates
+        // (rtlwifi/core.c:1314): (0xfff & 0x15f) | 1 = 0x15f, highest bit 8.
+        if r(station::REG_RRSR) != 0x5f
+            || r(station::REG_RRSR + 1) != 0x01
+            || r(station::REG_INIRTS_RATE_SEL) != 8
             || r(station::REG_SLOT) != 9
             || r(station::REG_SIFS_CTX + 1) != 0x0a
             || r(station::REG_SIFS_TRX + 1) != 0x0a
