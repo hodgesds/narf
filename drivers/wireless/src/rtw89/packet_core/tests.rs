@@ -375,7 +375,10 @@ impl Model {
                     && word(24) & !(1 << 15) == 0
                     && word(28) & !(0x1ff << 16 | 0xff | 1 << 14) == 0
                     && (word(28) >> 16) & 0x1ff <= 11)
-            || kind == format::Queue::Management && word(24) & (0x1ff << 16) != 0
+            // Management goes at the band floor (core.c
+            // `rtw89_core_get_mgmt_rate`): CCK1 on 2.4GHz, OFDM6 on 5GHz.
+            || kind == format::Queue::Management
+                && !matches!((word(24) >> 16) & 0x1ff, 0 | 4)
             // A-MPDU fields only together on firmware-RA QoS DATA.
             || word(12) & !(0xfff | 1 << 12 | 1 << 13) != 0
             || (word(12) & (1 << 13) != 0) != (a_ctrl != previous_a_ctrl)
