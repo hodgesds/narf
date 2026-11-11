@@ -892,3 +892,78 @@ fn smoke_scheduler_staged_wake_stress() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler/strand", smoke_scheduler_staged_wake_stress);
+
+/// The owner's drain gives up a node's claim before it takes the slot. A wake
+/// that lands in between claims the cell and links it on the public list
+/// again, and the drain then takes the slot out from under it. The node must
+/// not stay behind: once the task has moved on and sleeps on another CPU, its
+/// next wake would coalesce into a claim only the old home can release.
+fn smoke_scheduler_owner_drain_takes_relinked_node_along() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let Some((id, cell)) = park_probe_on(0, 2, stuck.0, None) else {
+        stuck.release();
+        return TestResult::Fail("could not park the probe on the stuck CPU");
+    };
+    // A wake stages the node. A local direct handoff then runs the task and
+    // puts it back to sleep without the owner draining: the wake is consumed
+    // (`claim_direct_handoff_slot` clears the flag) and the node stays linked
+    // (`release_direct_handoff_target` leaves it).
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    cell.flag.store(false, Ordering::SeqCst);
+
+    // The owner's drain, stopped between its two halves.
+    let batch = crate::take_parked_wake_batch(stuck.0);
+    if batch.is_null() {
+        stuck.release();
+        return TestResult::Fail("wake of a parked task staged no node");
+    }
+    // SAFETY: a detached node carries the inbox's reference, which this takes
+    // over exactly as `drain_parked_wakes` does.
+    let node = unsafe { Arc::from_raw(batch.cast_const()) };
+    let rest = crate::release_drained_wake(stuck.0, &node);
+    // Another CPU wakes the task in that window. The claim is free and the
+    // token still names the stuck CPU, so the cell goes back on its list.
+    crate::make_waker(cell.clone()).wake_by_ref();
+    let relinked = staged_parked_wakes(stuck.0);
+    crate::activate_drained_wake(stuck.0, &node);
+    drop(node);
+    let taken = !parked_on(stuck.0, id);
+    let left_linked = staged_parked_wakes(stuck.0);
+    let claim_left = cell.activation_queued.load(Ordering::SeqCst);
+
+    // The task is now runnable on the stuck CPU. An idle CPU takes it and
+    // runs it, it sleeps there, and it is woken there.
+    let_cool();
+    let pulled = pull(stuck.0, me);
+    crate::poll_one_round();
+    let reparked_here = parked_on(me, id);
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    crate::poll_one_round();
+    let ran = polls(0);
+    stuck.release();
+    if !rest.is_null() || relinked != 1 || !taken {
+        return TestResult::Fail("could not stage a wake between the drain's release and its take");
+    }
+    if left_linked != 0 || claim_left {
+        return TestResult::Fail("owner's drain took the slot and left its relinked node behind");
+    }
+    if !pulled || !reparked_here {
+        return TestResult::Fail("activated task did not run and sleep on the idle CPU");
+    }
+    if ran != 3 {
+        return TestResult::Fail("re-wake was swallowed by a node left on the task's old home");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_owner_drain_takes_relinked_node_along
+);
