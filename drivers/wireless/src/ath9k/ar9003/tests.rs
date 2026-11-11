@@ -272,7 +272,16 @@ impl Chip9300 {
 impl RegisterIo for Chip9300 {
     fn read32(&mut self, offset: u64) -> u32 {
         self.ops.push(Op::Read(offset));
-        if (0x2000..0x2000 + 4 * 8192).contains(&offset) {
+        // The EEPROM window (`AR5416_EEPROM_OFFSET + word * 4`, 8192
+        // words for `AR9300_EEPROM_SIZE`) spans 0x2000..0xa000, which
+        // also holds real registers (`AR_WA` 0x4004, `AR_SREV` 0x4020,
+        // `AR_EEPROM_STATUS_DATA` 0x4084, the RTC block, `AR_STA_ID1`,
+        // `AR_PHY_CHIP_ID`). A read of any other window word selects it; a
+        // modelled register answers with its own value.
+        if (0x2000..0x2000 + 4 * 8192).contains(&offset)
+            && offset != 0x4084
+            && !self.regs.contains_key(&offset)
+        {
             self.selected_word = ((offset - 0x2000) / 4) as usize;
             return 0;
         }
