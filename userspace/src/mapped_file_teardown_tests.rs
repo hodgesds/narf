@@ -137,7 +137,9 @@ fn map_page(space: u64, ops: &Arc<dyn FileOps>, offset: u64) -> Option<PhysAddr>
     let (canonical, publication) =
         publish_shared_file_pages(ops, offset, alloc::vec![frame], Some(1));
     let phys = canonical[0];
-    let _ = retain_shared_file_page(phys.raw());
+    // As a shared mapping of a descriptor open for writing holds it: the
+    // only kind of mapping whose pages writeback has to look at.
+    let _ = retain_shared_file_page_writable(phys.raw());
     publication.commit();
     register(
         space,
@@ -251,6 +253,8 @@ fn smoke_fork_child_teardown_writes_nothing_inline() -> TestResult {
         // inherits the owner row and maps the same frame.
         dirty(phys);
         fork_address_space(PARENT, CHILD);
+        // The fork's own reference: the memory hook's plain retain. The
+        // page already records that a writable mapping holds it.
         let _ = retain_shared_file_page(phys.raw());
         // The child execs: its pre-exec address space is dropped.
         teardown(CHILD, &[phys]);
