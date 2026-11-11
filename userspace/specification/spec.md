@@ -836,7 +836,7 @@ The description also carries what the file names (`fd::names::FileName`, Linux
 `file->f_path`): the host-absolute, symlink-free path the open resolved, the
 mount it was opened through, and whether that name has since been removed.
 Every descriptor of the file — a `dup`, another `CLONE_FILES` thread, a forked
-child, an `SCM_RIGHTS` receiver — therefore reads one name,
+child, an `SCM_RIGHTS` or `pidfd_getfd` receiver — therefore reads one name,
 whichever task asks, and closing the last one retires it; no per-task or
 per-descriptor-number record exists. `rename`, `renameat2(RENAME_EXCHANGE)`,
 `unlink` and `rmdir` report the names they change (`names::renamed`,

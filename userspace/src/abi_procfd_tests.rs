@@ -530,6 +530,44 @@ kernel_test_in!(
     smoke_abi_procfd_fork_child_and_other_readers
 );
 
+/// `pidfd_getfd` is `fget_task` + `receive_fd`: the caller holds the target's
+/// open file, so it reads the same name and shares the file position.
+fn smoke_abi_procfd_pidfd_getfd_is_the_same_open_file() -> TestResult {
+    with_fs(|| {
+        const SEEK_SET: u64 = 0;
+        const SEEK_CUR: u64 = 1;
+        let fd = open("/pf/d/f", O_RDWR, "open failed")?;
+        let pidfd = new_fd(
+            call(Syscall::PidfdOpen.raw(), a1(FAKE_TASK, 0)),
+            "pidfd_open failed",
+        );
+        let got = pidfd.and_then(|pidfd| {
+            new_fd(
+                call(Syscall::PidfdGetfd.raw(), a3(pidfd, fd, 0, 0)),
+                "pidfd_getfd failed",
+            )
+        });
+        let link = got.and_then(link_of);
+        let moved = call(Syscall::Lseek.raw(), a2(fd, 3, SEEK_SET));
+        let seen = got.map(|got| call(Syscall::Lseek.raw(), a2(got, 0, SEEK_CUR)));
+        for fd in [pidfd, got].into_iter().flatten() {
+            close(fd);
+        }
+        close(fd);
+        if link? != "/pf/d/f" {
+            return Err("a pidfd_getfd descriptor does not read the file's name");
+        }
+        if moved != Some(3) || seen? != Some(3) {
+            return Err("a pidfd_getfd descriptor does not share the file position");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_procfd_pidfd_getfd_is_the_same_open_file
+);
+
 // ─────────────────────── the name follows the file ───────────────────────
 
 /// `d_move`: after `rename(2)` of the file, of its directory, or into another

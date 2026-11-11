@@ -1313,7 +1313,7 @@ fn smoke_abi_proc_pidfd_getfd_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_getfd_neg);
+kernel_test_in!("syscall_abi/procfd", smoke_abi_proc_pidfd_getfd_neg);
 
 fn smoke_abi_proc_pidfd_getfd_badfd() -> TestResult {
     with_setup(|| {
@@ -1324,7 +1324,7 @@ fn smoke_abi_proc_pidfd_getfd_badfd() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_getfd_badfd);
+kernel_test_in!("syscall_abi/procfd", smoke_abi_proc_pidfd_getfd_badfd);
 
 fn smoke_abi_proc_pidfd_getfd_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hello")], || {
@@ -1358,7 +1358,7 @@ fn smoke_abi_proc_pidfd_getfd_pos() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_getfd_pos);
+kernel_test_in!("syscall_abi/procfd", smoke_abi_proc_pidfd_getfd_pos);
 
 fn smoke_abi_proc_pidfd_getfd_eperm() -> TestResult {
     with_setup(|| {
@@ -1418,7 +1418,7 @@ fn smoke_abi_proc_pidfd_getfd_eperm() -> TestResult {
         result
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_getfd_eperm);
+kernel_test_in!("syscall_abi/procfd", smoke_abi_proc_pidfd_getfd_eperm);
 
 // ── wait4(2) — non-blocking reap paths ──
 

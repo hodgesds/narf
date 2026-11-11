@@ -40,18 +40,21 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EPERM));
         return;
     }
-    let entry = fd::with_table(target_tid, |t| t.get(targetfd).cloned()).flatten();
-    let mut entry = match entry {
-        Some(e) => e,
-        None => {
-            ctx.set_return(errno_ret(EBADF));
-            return;
-        }
+    // `fget_task` + `receive_fd(file, NULL, O_CLOEXEC)`: the caller gets the
+    // target's open file itself — one file position, one set of status
+    // flags, one name in `/proc/<pid>/fd` — at a descriptor that is always
+    // allocated with close-on-exec set.
+    let Some((ops, description, status_flags)) =
+        fd::with_table(target_tid, |t| t.export_description(targetfd)).flatten()
+    else {
+        ctx.set_return(errno_ret(EBADF));
+        return;
     };
-    // Linux `receive_fd(file, NULL, O_CLOEXEC)`: the descriptor in the
-    // calling process is always allocated with close-on-exec set.
-    entry.flags |= crate::fd::FD_CLOEXEC;
-    match fd::install(task, entry) {
+    let installed = fd::with_table_alloc(task, |t| {
+        t.open_transferred(ops, Some(description), status_flags, crate::fd::FD_CLOEXEC)
+    })
+    .flatten();
+    match installed {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         None => {
             // `kernel/pid.c::SYSCALL_DEFINE3(pidfd_getfd)` ends in
