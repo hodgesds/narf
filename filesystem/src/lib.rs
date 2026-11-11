@@ -1321,6 +1321,12 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// Extra `/proc/<pid>/fdinfo/<fd>` lines for this open file — Linux
+    /// `file_operations::show_fdinfo`, which DRM device files use for
+    /// their `drm-*` usage keys. Every line ends in a newline. Default:
+    /// none.
+    fn show_fdinfo(&self, _out: &mut alloc::string::String) {}
+
     /// Asynchronous stat — required for disk-backed or remote FS.
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move { Ok(self.stat()) })

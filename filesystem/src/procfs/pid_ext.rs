@@ -30,7 +30,7 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
     hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
-    hook_fd_info, hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice,
+    hook_fd_file, hook_fd_info, hook_fd_list, hook_fd_path, hook_fd_pidfd_pid, hook_nice,
     hook_ns_mountinfo_generation, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits,
     hook_root_path, pid_entry_ino, proc_pid_ino, slice_read, task_info, ProcDirMarker,
 };
@@ -1064,6 +1064,10 @@ impl FileOps for ProcFdInfoFile {
             if let Some(target) = hook_fd_pidfd_pid(pid, fd) {
                 let _ = writeln!(s, "Pid:\t{}", target);
                 let _ = writeln!(s, "NSpid:\t{}", target);
+            }
+            // file_operations::show_fdinfo (seq_show_fdinfo calls it last).
+            if let Some(file) = hook_fd_file(pid, fd) {
+                file.show_fdinfo(&mut s);
             }
             if let Some(path) = hook_fd_path(pid, fd) {
                 let _ = writeln!(s, "# backing: {}", path);
