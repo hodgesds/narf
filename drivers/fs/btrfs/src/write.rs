@@ -2543,8 +2543,40 @@ pub(crate) fn cow_leaf_apply(
     edits: &[Edit],
     nodesize: usize,
 ) -> Result<Vec<Vec<u8>>, FsError> {
-    let items = leaf_apply_edits(leaf_items(leaf)?, edits);
-    regroup_leaves(leaf, &items, nodesize)
+    retile_leaf(leaf, leaf_items(leaf)?, edits, nodesize)
+}
+
+/// Apply `edits` to a leaf's `items` and re-tile the result into as many
+/// leaves as it needs.
+///
+/// A leaf that overflows is split evenly (Linux `split_leaf` splits at the
+/// middle), unless everything added sorts after what the leaf held: then it
+/// is left full and the additions start the next leaf, which is where Linux
+/// ends up for an appending workload after `push_leaf_left`. Always filling
+/// the first leaf and spilling a remainder — whatever the position of the
+/// new items — left a full leaf and a nearly empty one after every insert
+/// into the middle of a full leaf, and the next insert there did it again:
+/// a file whose pages were first written in a scattered order (a mapped file
+/// written back) ended up with five extent items to a 16 KiB leaf instead of
+/// two hundred.
+fn retile_leaf(
+    header: &[u8],
+    items: Vec<(BtrfsKey, Vec<u8>)>,
+    edits: &[Edit],
+    nodesize: usize,
+) -> Result<Vec<Vec<u8>>, FsError> {
+    let appends = items.last().is_none_or(|(last, _)| {
+        edits.iter().all(|edit| match edit {
+            Edit::Upsert(key, _) => key > last,
+            Edit::Delete(_) => true,
+        })
+    });
+    let items = leaf_apply_edits(items, edits);
+    if appends {
+        regroup_leaves(header, &items, nodesize)
+    } else {
+        regroup_leaves_even(header, &items, nodesize)
+    }
 }
 
 /// Bytes a leaf's items occupy (item headers plus bodies).
@@ -2791,14 +2823,12 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
 
     /// [`Self::new`] for a tree whose items come and go all over its key
     /// space (the extent and free-space trees), which plain path COW would
-    /// leave ever sparser: a leaf only ever split full-then-remainder, and
-    /// never rejoined once deletions thinned it. With this, a leaf that
-    /// overflows is split evenly — unless everything added sorts after what
-    /// it held, which leaves it full and starts the next (Linux
-    /// `push_leaf_left` before `split_leaf`) — and a committed leaf that is
-    /// under a third full when an edit reaches it takes in its right sibling
-    /// when the two fit in three quarters of a leaf (Linux pushes and merges
-    /// on delete, `btrfs_del_items`).
+    /// leave ever sparser: a leaf is never rejoined once deletions have
+    /// thinned it. With this, a committed leaf that is under a third full
+    /// when an edit reaches it takes in its right sibling when the two fit
+    /// in three quarters of a leaf (Linux pushes and merges on delete,
+    /// `btrfs_del_items`). (How an overflowing leaf is split is the same for
+    /// every tree: [`retile_leaf`].)
     ///
     /// Density is what keeps a commit small. Every block a commit replaces
     /// has an extent item to delete and free space to return, in leaves the
@@ -3202,18 +3232,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                     }
                 }
             }
-            let appends = items.last().is_none_or(|(last, _)| {
-                group.iter().all(|edit| match edit {
-                    Edit::Upsert(key, _) => key > last,
-                    Edit::Delete(_) => true,
-                })
-            });
-            let items = leaf_apply_edits(items, group);
-            if appends {
-                regroup_leaves(&leaf, &items, self.nodesize)?
-            } else {
-                regroup_leaves_even(&leaf, &items, self.nodesize)?
-            }
+            retile_leaf(&leaf, items, group, self.nodesize)?
         } else {
             cow_leaf_apply(&leaf, group, self.nodesize)?
         };
