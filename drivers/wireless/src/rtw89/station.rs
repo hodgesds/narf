@@ -1427,9 +1427,11 @@ impl State {
     }
     /// mac80211 `ieee80211_sta_wmm_params` on a bound peer beacon/probe
     /// response. An unchanged parameter-set count (and U-APSD bit) is
-    /// ignored. A new count on an established peer queues an EDCA update
-    /// that the async owner applies; loss of WMM, an inadmissible set or a
-    /// change before the link is open still closes the station.
+    /// ignored, and so is a beacon without a valid WMM Parameter element
+    /// (`_ieee80211_sta_wmm_params` returns before touching the set). A new
+    /// count on an established peer queues an EDCA update that the async
+    /// owner applies; an inadmissible set or a change before the link is
+    /// open still closes the station.
     /// `association::observe` on the tuned channel, band-qualified: a 6GHz
     /// tuning observes with `band = Ghz6` (`observe_6ghz`).
     fn observe_tuned(
@@ -1458,8 +1460,10 @@ impl State {
         let offered = narf_wireless::wmm::Parameters::parse(&candidate.bss.information_elements)
             .ok()
             .flatten();
+        // `_ieee80211_sta_wmm_params` (mac80211 mlme.c): a beacon without a
+        // (valid) WMM Parameter element leaves the current EDCA set as is.
         let Some(offered) = offered else {
-            return Err(Error::PeerLost);
+            return Ok(());
         };
         let base = self.edca_pending.unwrap_or(current);
         if offered == base
