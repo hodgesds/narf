@@ -10642,14 +10642,14 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
         let ext_addrs = take_nodes(
             &mut nc,
             new_limit,
-            ext_leaves + usize::from(ext_leaves > 1),
+            tree_block_count(ext_leaves, ns),
             nodesize,
         )?;
         let root_addrs = take_nodes(&mut nc, new_limit, root_nc, nodesize)?;
         let fst_addrs = take_nodes(
             &mut nc,
             new_limit,
-            fst_leaves + usize::from(fst_leaves > 1),
+            tree_block_count(fst_leaves, ns),
             nodesize,
         )?;
         let bgt_addrs = take_nodes(&mut nc, new_limit, bgt_nc, nodesize)?;

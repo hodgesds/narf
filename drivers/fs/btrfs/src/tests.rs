@@ -21,6 +21,7 @@ mod batch_commit;
 mod commit_scale;
 mod data_cache;
 mod extent_window;
+mod grow_tall;
 mod overwrite_cost;
 mod release_cost;
 mod safety;
