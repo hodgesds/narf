@@ -1788,6 +1788,14 @@ impl<B: Backend> Session<B> {
         if !self.receive_current(epoch)? {
             received.clear();
         }
+        // The home station's sampled TX status (rate, failures).
+        if let Some(report) = self
+            .backend
+            .tx_rate_report()
+            .filter(|report| report.wcid == u16::from(self.station.link.peer()))
+        {
+            self.station.link_stats.observe_txs(report);
+        }
         Ok(super::PacketStep {
             transmitted,
             received,
@@ -2417,7 +2425,10 @@ impl<B: Backend> Session<B> {
             Ok(aid) => {
                 self.boot_started = None;
                 self.station.peer_lost = false;
-                self.station.link_stats = Default::default();
+                // A report from before this association is not its own.
+                self.station.link_stats = crate::mt7921::link_stats::LinkStats::starting_after(
+                    self.backend.tx_rate_report().map(|report| report.sequence),
+                );
                 self.station.ps_applied = false;
                 self.station.applied_policy = self.backend.regulatory_domain().ok();
                 if let (Some(binding), Some((pmkid, pmk))) = (credentials, new_pmksa.take()) {

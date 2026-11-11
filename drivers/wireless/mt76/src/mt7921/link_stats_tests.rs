@@ -105,3 +105,53 @@ kernel_test_in!(
     "drivers/wireless/mt7921/station",
     mt7922_link_signal_and_average_follow_rcpi
 );
+
+/// `mt76_connac2_mac_fill_txs`: the TXS0 rate word as `rate_info` (NSS
+/// halved under STBC, HE DCM), and each TX status report taken once into
+/// TX_BITRATE / TX_FAILED.
+fn mt7922_tx_status_rate_words_and_reports() -> TestResult {
+    let word = |mode: u16, idx: u16, nss: u16| mode << 6 | idx | (nss - 1) << 10;
+    // VHT MCS9 2 SS 80 MHz, long GI: 780 Mb/s.
+    if tx_rate(word(4, 9, 2), 2).map(|r| (r.bitrate_100kbps, r.vht_mcs))
+        != Some((7800, Some((9, 2))))
+    {
+        return TestResult::Fail("VHT TX rate word");
+    }
+    // STBC with NSTS 4 is 2 spatial streams.
+    if tx_rate(word(4, 9, 4) | 1 << 13, 2).map(|r| r.vht_mcs) != Some(Some((9, 2))) {
+        return TestResult::Fail("STBC halves NSS");
+    }
+    // HE-SU MCS11 2 SS 80 MHz 0.8 us: 1200.9 Mb/s; DCM halves it.
+    if tx_rate(word(8, 11, 2), 2).map(|r| r.bitrate_100kbps) != Some(12009)
+        || tx_rate(word(8, 3, 1) | 1 << 4, 0).map(|r| (r.he_dcm, r.bitrate_100kbps))
+            != tx_rate(word(8, 3, 1), 0).map(|r| (true, r.bitrate_100kbps / 2))
+    {
+        return TestResult::Fail("HE TX rate word");
+    }
+    if tx_rate(word(4, 10, 1), 0).is_some() || tx_rate(word(5, 0, 1), 0).is_some() {
+        return TestResult::Fail("reserved TX rate word decoded");
+    }
+    let mut stats = LinkStats::default();
+    let report = crate::mt7921::tx_sequence::RateReport {
+        wcid: 1,
+        tx_rate: word(4, 9, 2),
+        bw: 2,
+        failures: 3,
+        sequence: 7,
+    };
+    stats.observe_txs(report);
+    if stats.tx_rate.map(|r| r.bitrate_100kbps) != Some(7800) || stats.tx_failed != Some(3) {
+        return TestResult::Fail("TX status report not taken");
+    }
+    // The same report again changes nothing.
+    stats.tx_failed = Some(0);
+    stats.observe_txs(report);
+    if stats.tx_failed != Some(0) {
+        return TestResult::Fail("TX status report taken twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/station",
+    mt7922_tx_status_rate_words_and_reports
+);

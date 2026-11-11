@@ -45,6 +45,12 @@ pub(crate) struct LinkStats {
     /// the input of mac80211's software CQM (`ieee80211_rx_bss_info`).
     pub beacons: u32,
     pub beacon_signal_dbm: Option<i8>,
+    /// `NL80211_STA_INFO_TX_BITRATE` from the latest sampled TX status.
+    pub tx_rate: Option<RateInfo>,
+    /// `NL80211_STA_INFO_TX_FAILED`: sampled frames that failed.
+    pub tx_failed: Option<u32>,
+    /// The TX status report already taken (`RateReport::sequence`).
+    pub txs_sequence: Option<u32>,
 }
 
 impl LinkStats {
@@ -77,12 +83,46 @@ impl LinkStats {
             }
         }
     }
+    /// Statistics for a new association: TX status reports up to
+    /// `txs_sequence` belong to an earlier one.
+    pub fn starting_after(txs_sequence: Option<u32>) -> Self {
+        Self {
+            txs_sequence,
+            ..Self::default()
+        }
+    }
+
+    /// A sampled TX status (`mt76_connac2_mac_fill_txs`), taken once.
+    pub fn observe_txs(&mut self, report: crate::mt7921::tx_sequence::RateReport) {
+        if self.txs_sequence == Some(report.sequence) {
+            return;
+        }
+        self.txs_sequence = Some(report.sequence);
+        if let Some(rate) = tx_rate(report.tx_rate, report.bw) {
+            self.tx_rate = Some(rate);
+        }
+        self.tx_failed = Some(report.failures);
+    }
+
     /// `NL80211_STA_INFO_SIGNAL_AVG`.
     pub fn signal_avg_dbm(&self) -> Option<i8> {
         self.avg
             .read()
             .and_then(|negated| i8::try_from(-(negated as i64)).ok())
     }
+}
+
+/// `mt76_connac2_mac_fill_txs` over the TXS0 rate word: MCS (`IDX`),
+/// `MODE`, `NSS` (halved under STBC) and HE `DCM`; the GI is not reported.
+pub(crate) fn tx_rate(word: u16, bw: u8) -> Option<RateInfo> {
+    let idx = (word & 0x3f) as u8;
+    let mode = ((word >> 6) & 15) as u8;
+    let mut nss = ((word >> 10) & 7) as u8 + 1;
+    if word & (1 << 13) != 0 && nss > 1 {
+        nss >>= 1;
+    }
+    let dcm = mode >= PHY_HE_SU && word & (1 << 4) != 0;
+    rate(mode, idx, nss, bw, 0, dcm)
 }
 
 /// `mt76_connac2_mac_fill_rx_rate` over P-RXV DW0.
