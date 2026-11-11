@@ -102,64 +102,56 @@ Test surface: `pstate::__reset_for_test()`.
 
 ## 2. C-states (idle)
 
-### 2.1 Detection
+### 2.1 Firmware and CPU validation
 
-| primitive   | gate                         |
-|-------------|------------------------------|
-| MONITOR/MWAIT | CPUID(1).ECX[3] = 1        |
-| MWAIT extensions | CPUID(5).ECX[0] = 1     |
-| MWAIT bit 1 (interrupt break) | CPUID(5).ECX[1] = 1 |
+Boot evaluates each enabled processor's `_CST` through strict bounded AML.
+Processor ProcID and ACPI0007 `_UID` map through MADT; namespace order and
+logical CPU numbers are not hardware identifiers. Generic Register descriptors
+retain the firmware's exact FFH MWAIT hint or SystemIO port. Multiple C3-type
+entries retain separate IDs. Unknown spaces, truncated buffers, malformed
+packages, out-of-range integers, and unsupported entry methods are rejected.
+Target residency is twice the firmware entry/exit latency.
 
-CPUID leaf 5 also reports the depth supported (number of
-sub-C-states for each MWAIT C-state ECX value).
+MONITOR/MWAIT requires CPUID(1).ECX[3], leaf 5 extension and interrupt-break
+support. Hint `(h >> 4)` selects CPUID(5).EDX nibble `(h >> 4) + 1`; the low
+hint nibble must be below that state's substate count. An ACPI C-state number
+is never treated as an architectural MWAIT hint. Capabilities are checked on
+the CPU that will enter the state, including its actual APIC identity.
 
-### 2.2 MWAIT encoding
+Deep entry requires an invariant TSC and an always-running local APIC timer;
+there is no deep-state timer broadcast fallback here. Intel uses CPUID ARAT;
+AMD family 12h and later provide the always-running APIC behavior. Native FFH
+requests requiring bus-master status handling are rejected. SystemIO C2/C3 is
+supported on AMD Zen (family 17h and later), whose C3 is cache coherent and
+requires neither cache flushing nor a post-entry PM-timer read. Other I/O
+platforms retain shallow idle until their required handling is implemented.
 
-`MWAIT EAX` carries `(C-state-hint << 4) | sub-state`:
+### 2.2 Policy and entry
 
-| EAX byte | meaning                             |
-|----------|-------------------------------------|
-| 0x00     | C1                                  |
-| 0x01     | C1E (Intel) — sub-state 1           |
-| 0x10     | C2                                  |
-| 0x20     | C3                                  |
-| 0x30     | C4 / no-OS-control                  |
-| 0x40     | C6                                  |
-| 0x50     | C7                                  |
+The executor imports `IdleHints` and the installed power governor. The default
+MenuGovernor selects using actual deadlines, per-CPU residency history and
+latency constraints. The core validates its result against the CPU's state
+table. A governor can retain the periodic tick with `IdleDecision::stop_tick`.
+Tickless idle is otherwise enabled where the clockevent supports it; `nohz=off`
+retains periodic ticks. Unsupported backends keep their existing timer behavior.
 
-`MWAIT ECX` bit 0 = "interrupts can break out" (always set in
-NARF — we want IPI / timer to wake).
+After the final IRQ-masked wake check, C1 uses `sti; hlt; cli` on x86. MWAIT
+monitors a permanent per-CPU aligned line and sets ECX bit 0 so pending
+interrupts break sleep with IF=0. SystemIO performs the validated byte port
+read with IRQs masked. All paths return masked; the executor clears its halted
+publication before restoring IRQs. No lock or policy callback spans sleep.
 
-### 2.3 Idle-loop wiring
+### 2.3 Public surface
 
-`idle::halt()` is the universal entrypoint called from the
-kernel's per-CPU idle task. Behaviour:
+The typed governor, hints, decisions, state registry and residency API are
+specified in [power §3.1](spec.md#31-idle). `power::idle::caps()` retains complete
+current-CPU CPUID data on every call. Legacy raw `mwait(depth)` requires caller
+validation of the firmware state/deadline and the same masked-IRQ wake contract;
+production entry uses the exact firmware hint in `IdlePlan`. Its `idle()` helper
+also selects through the installed governor.
 
-  1. If `mwait_supported()` and the current C-state policy
-     allows depth `d`: arm MONITOR on a per-CPU dummy address,
-     then `MWAIT EAX = encode(d)`.
-  2. Else: `STI; HLT`.
-  3. Wake: any IRQ.
-
-Default policy at boot: deepest C-state offered by CPUID 5
-(QEMU TCG advertises C1 only; Intel hosts up to C7 / C10).
-
-### 2.4 API shape
-
-```rust
-pub struct MwaitCaps {
-    pub supported:       bool,
-    pub interrupt_break: bool,
-    /// Sub-state count per C-state (4-bit nibbles) from CPUID(5).EDX.
-    pub sub_states:      u32,
-    /// Number of architectural C-states the CPU supports.
-    pub max_cstate:      u8,
-}
-
-pub fn caps() -> MwaitCaps;
-pub unsafe fn enter_cstate(depth: u8);
-pub unsafe fn idle();   // policy-driven; the canonical entry
-```
+Bare-metal residency requires physical-hardware validation; KVM validates the
+shallow fallback and wake/timer protocols, not actual package power savings.
 
 ## 3. RAPL energy telemetry
 
@@ -265,7 +257,7 @@ Smokes (kernel-test):
 - Per-package vs per-core HWP request differentiation.
 - HWP autonomous activity-window tuning.
 - Intel HFI / Thread Director (separate spec).
-- ACPI _PSS / _CST evaluation (no AML).
+- ACPI _PSS evaluation; `_CST` support is described above.
 - AMD CPB (Core Performance Boost) toggle.
 - Suspend-to-RAM lifecycle (S3); covered by `power/spec.md` §4.
 - RAPL package power limits (write to MSR 0x610); read-only in v0.1.

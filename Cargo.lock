@@ -3150,9 +3150,21 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power-core",
  "narf-scheduler",
  "narf-time",
  "zeroize",
+]
+
+[[package]]
+name = "narf-power-core"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-time",
 ]
 
 [[package]]
@@ -3188,6 +3200,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power-core",
  "narf-rcu",
  "narf-time",
 ]

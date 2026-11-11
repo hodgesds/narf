@@ -1,5 +1,7 @@
 # acpi — ACPI Table Discovery and Platform Device Models
 
+CPU power consumers use the [processor identity contract](specification/processor-identity.md).
+
 `narf-acpi` is the kernel's entry point into the Advanced Configuration
 and Power Interface (ACPI). Firmware publishes a set of in-memory tables
 describing the machine's topology, interrupt routing, and power

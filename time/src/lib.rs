@@ -118,13 +118,11 @@ pub fn periodic_tick_wanted(cpu: usize) -> bool {
     cpu >= TICK_MAX_CPUS || PERIODIC_TICK_WANTED[cpu].load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Global NO_HZ_IDLE opt-in (boot parameter `nohz_idle`, default OFF). When off,
-/// the scheduler never suppresses the periodic tick, so behaviour is unchanged
-/// — the tickless idle path is dead code. Set once at boot.
+/// Boot policy for tickless idle. The local clockevent must also support it.
 static NOHZ_IDLE_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Enable tickless idle (called at boot when the `nohz_idle` cmdline flag is set).
+/// Enable tickless idle on supported local clockevents.
 #[inline]
 pub fn set_nohz_idle_enabled(on: bool) {
     NOHZ_IDLE_ENABLED.store(on, core::sync::atomic::Ordering::Relaxed);

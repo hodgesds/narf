@@ -143,8 +143,8 @@ pub use policy::{
 pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
 pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
 pub use steal::{
-    current_steal_strategy_name, install_steal_strategy, NumaAwareSteal, RandomSteal, Steal,
-    StealError, StealStrategy,
+    current_steal_strategy_name, install_steal_strategy, set_default_steal_policy, LlcAwareSteal,
+    NumaAwareSteal, Pick2Steal, RandomSteal, Steal, StealError, StealStrategy,
 };
 pub use user_policy::{
     alloc_user_task_id, inherit_user_scheduling, release_user_scheduling, set_user_scheduling,
@@ -2209,16 +2209,11 @@ pub fn set_resched_ipi_hook(f: fn(u32)) {
 }
 
 /// Hook to arm a one-shot architecture clockevent at the given cycle value
-/// (x86 boot wires `apic::arm_tsc_deadline_if_earlier`). Used for periodic
-/// budget boundaries and by the idle path as a LOST-WAKEUP BACKSTOP: an AP
-/// that HLTs with no wheel deadline otherwise
-/// relies entirely on an external wake (cross-core IPI / device IRQ) plus
-/// the periodic tick. The stall watchdog caught a runnable task stranded
-/// on a HALTED AP — a wake that was neither observed nor IPI-delivered.
-/// Arming a short fallback before every idle HLT guarantees the AP
-/// re-scans within a bounded time, so a lost/late wake self-heals (a
-/// permanent wedge becomes a sub-tick latency blip) regardless of any
-/// subtle wake-delivery race. `0` = not installed (single-CPU / pre-boot).
+/// (x86 boot wires `apic::arm_tsc_deadline_if_earlier`). Used for execution
+/// budget boundaries, budget replenishment, and restarting the periodic
+/// tick on leaving tickless idle. Idle does not arm a recovery deadline;
+/// wake delivery relies on the halted-publish/recheck handshake below.
+/// `0` = not installed (single-CPU / pre-boot).
 static IDLE_BACKSTOP_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Wire the scheduler deadline arm (boot installs the LAPIC TSC-deadline
@@ -2299,12 +2294,6 @@ fn arm_scheduler_deadline(deadline: u64) {
     // SAFETY: `p` was set by `set_idle_backstop_hook` from a `fn(u64)`.
     let f: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(p) };
     f(deadline);
-}
-
-/// Arm the idle backstop ~`ms` milliseconds out, if a hook is installed.
-fn arm_idle_backstop_ms(ms: u64) {
-    let deadline = narf_time::now_cycles().wrapping_add(narf_time::ns_to_cycles(ms * 1_000_000));
-    arm_scheduler_deadline(deadline);
 }
 
 /// Cache-line-isolated read-only telemetry written by the executing CPU.
@@ -2868,6 +2857,7 @@ pub fn init() {
         // call `__reset_queues_for_test` explicitly.
         panic!("narf_scheduler::init() called twice — would wipe spawned tasks; use __reset_queues_for_test in tests");
     }
+    steal::register_current_cpu();
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();
     for (cpu, q) in READY.iter().enumerate() {
@@ -2891,8 +2881,8 @@ pub fn init() {
     // pre-Wave-E hardcoded behaviour byte-for-byte. Idempotent for the
     // same reason `policy::install_default_if_unset` is.
     donation::install_default_if_unset();
-    // Wave F: wire the default `NumaAwareSteal` so `try_steal_one`'s
-    // policy-driven victim-ordering and per-task allow_steal checks
+    // Wave F: wire the staged boot steal policy (normally `NumaAwareSteal`)
+    // so policy-driven victim ordering and per-task allow_steal checks
     // return the pre-Wave-F two-phase same-node-first behaviour
     // byte-for-byte. Idempotent for the same reason the wave D/E
     // installs are.
@@ -4133,6 +4123,7 @@ fn notify_cpu_idle(cpu: usize) {
 
 #[inline]
 fn notify_cpu_active(cpu: usize) {
+    narf_time::clockevent::restart_local_tick();
     policy::notify_cpu_executor_state(CpuId(cpu as u32), CpuState::Active, None);
 }
 
@@ -5769,6 +5760,7 @@ pub fn poll_one_round() -> usize {
             continue;
         }
         slot.awake.blocking_wake.store(false, Ordering::Release);
+        notify_cpu_active(cpu);
         // Running on this CPU now — aim future wakes' reschedule IPI here
         // (the slot may have been work-stolen since it was enqueued).
         slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
@@ -6206,13 +6198,6 @@ pub fn run_until_empty() {
     // so the all-parked branch pumps every cycle and this never trips.
     let pump_interval_cycles = narf_time::ns_to_cycles(1_000_000); // ~1 ms
     let mut last_pump_cycles = narf_time::now_cycles();
-    // Adaptive halt-poll window (cycles), per the KVM `halt_poll_ns`
-    // model. Grows when an idle spin catches a quick wake (a busy
-    // request/response workload), shrinks toward 0 when spins miss (a
-    // genuinely idle CPU), so latency-sensitive load gets the spin win
-    // while a truly idle CPU still HLTs and preserves power. Persists
-    // across rounds as an executor-local — no static, no layout churn.
-    let mut halt_poll_cycles: u64 = 0;
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let mut address_space_handoff = AddressSpaceHandoff::default();
 
@@ -6326,16 +6311,6 @@ pub fn run_until_empty() {
             // merely receiving an IRQ or running maintenance does not make a
             // CPU active from a scheduling-policy perspective.
             notify_cpu_active(cpu);
-            // NO_HZ_IDLE (boot opt-in): resuming execution after a tickless idle
-            // — re-enable the periodic preemption tick and re-arm it a slice out,
-            // so a CPU-bound task is still preempted (a cooperative task yields
-            // long before it fires). Only on the idle→run transition, so a busy
-            // run of dispatches doesn't re-arm every round.
-            if narf_time::nohz_idle_enabled() && !narf_time::periodic_tick_wanted(cpu) {
-                narf_time::set_periodic_tick_wanted(cpu, true);
-                let period = narf_time::ns_to_cycles(1_000_000); // 1 ms
-                arm_scheduler_deadline(narf_time::now_cycles().wrapping_add(period));
-            }
             // Running on this CPU now — aim future wakes' reschedule IPI
             // here (the slot may have been work-stolen since enqueue).
             slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
@@ -6767,70 +6742,6 @@ pub fn run_until_empty() {
                 unsafe {
                     narf_arch::enable_interrupts();
                 }
-                // Adaptive halt-poll (KVM `halt_poll_ns` analogue). Before
-                // paying the HLT VM-exit + host-vcpu-deschedule wakeup cost,
-                // spin a short bounded window re-checking for a wake. A virtio
-                // RX IRQ that lands during the spin keeps the vcpu hot and is
-                // serviced here in µs instead of after the next 1 ms timer tick
-                // — measured to cut redis off-box PING p50 from ~300-400µs to
-                // ~200µs. Spins ONLY when otherwise fully idle and bails to the
-                // HLT below once the budget expires, so a truly idle system
-                // still halts (Phase A power behaviour preserved). Gated on a
-                // reliable tick (KVM / TSC-deadline); the InitialCount fallback
-                // already busy-spins inside `idle_wait`.
-                if narf_time::tick_reliable() {
-                    // Window bounds: cap at 60µs (the measured PING-wake
-                    // sweet spot), seed a grown window at 8µs.
-                    let max_poll = narf_time::ns_to_cycles(60_000);
-                    let grow_start = narf_time::ns_to_cycles(8_000);
-                    let mut woke = false;
-                    if halt_poll_cycles > 0 {
-                        let spin_start = narf_time::now_cycles();
-                        while narf_time::now_cycles().wrapping_sub(spin_start) < halt_poll_cycles {
-                            // A wake arrives either as an IRQ-deferred waker or
-                            // as a directly-set awake flag on a ready slot.
-                            if narf_lib::deferred_wake::drain_and_wake() > 0 {
-                                woke = true;
-                                break;
-                            }
-                            let any = {
-                                let now = narf_time::now_cycles();
-                                let q = READY[cpu].lock();
-                                q.as_ref()
-                                    .map(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
-                                    .unwrap_or(false)
-                            };
-                            // A cross-core wake staged on the wake list is real
-                            // work too; count it as a hit so the spin bails to
-                            // the top-of-loop drain instead of stalling up to
-                            // the full window (and mis-scoring it as a miss,
-                            // which would shrink the adaptive poll budget).
-                            if any || wake_list_pending(cpu) {
-                                woke = true;
-                                break;
-                            }
-                            core::hint::spin_loop();
-                        }
-                    } else {
-                        // Window collapsed (idle CPU): one cheap probe before
-                        // committing to the spin-grow cycle, so a lone wake
-                        // that already landed skips the HLT.
-                        woke =
-                            narf_lib::deferred_wake::drain_and_wake() > 0 || wake_list_pending(cpu);
-                    }
-                    if woke {
-                        // Hit: grow the window (seed if collapsed, else ×2).
-                        halt_poll_cycles = if halt_poll_cycles == 0 {
-                            grow_start
-                        } else {
-                            halt_poll_cycles.saturating_mul(2).min(max_poll)
-                        };
-                        continue;
-                    }
-                    // Miss: shrink toward 0 so a genuinely idle CPU stops
-                    // spinning and just HLTs.
-                    halt_poll_cycles /= 2;
-                }
             }
             let now = narf_time::now_cycles();
             let wheel_deadline = narf_time::timer_wheel::next_deadline_cycles();
@@ -6841,18 +6752,11 @@ pub fn run_until_empty() {
                 (None, Some(b)) => Some(b),
                 (None, None) => None,
             };
-            if let Some(deadline) = budget_deadline {
-                arm_scheduler_deadline(deadline);
-            }
-            // NO_HZ_IDLE (boot opt-in): committing to an idle HLT — stop the
-            // periodic tick so `on_timer_tick` stops re-anchoring the TSC
-            // deadline to it. This CPU then HLTs until a real event: a device
-            // IRQ, a reschedule IPI (both reliable, Dekker/CPU_HALTED handshake),
-            // or the wheel/budget deadline just armed above. At most one residual
-            // periodic tick fires (the one already armed) before it goes tickless.
-            if narf_time::nohz_idle_enabled() {
-                narf_time::set_periodic_tick_wanted(cpu, false);
-            }
+            let idle_plan = narf_power_core::executor::prepare_idle(narf_power_core::IdleHints {
+                cpu,
+                now_cycles: now,
+                next_deadline_cycles: next_deadline,
+            });
             // We are between task polls and hold no RCU read guard. This halt
             // can be indefinite when the queue contains only parked slots, so
             // remove this CPU from the active QSBR census before publishing
@@ -6900,6 +6804,9 @@ pub fn run_until_empty() {
                     narf_arch::disable_interrupts();
                 }
             }
+            if race_free_halt {
+                narf_time::clockevent::set_idle_tick(idle_plan.stop_tick(), budget_deadline);
+            }
             narf_memory::tlb_shootdown::mark_idle(cpu as u32);
             CPU_HALTED[cpu].store(true, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
@@ -6914,8 +6821,8 @@ pub fn run_until_empty() {
                 // An IRQ that landed since this round's last `drain_and_wake` may
                 // have stashed a waker in THIS CPU's deferred queue; without
                 // re-checking it under the halted-publish fence the CPU halts
-                // over its own undrained wake (recovered only by the periodic
-                // tick / 2ms backstop). Per-CPU (see `has_pending_local`): the
+                // over its own undrained wake until an unrelated IRQ arrives.
+                // Per-CPU (see `has_pending_local`): the
                 // global counter here would make every CPU refuse to halt while
                 // any peer has an undrained waker.
                 || narf_lib::deferred_wake::has_pending_local()
@@ -6945,28 +6852,17 @@ pub fn run_until_empty() {
                 // resched/shootdown IPI (or the armed TSC-deadline timer, or
                 // any device IRQ) wakes us, INCLUDING one that raced into the
                 // commit-to-halt window above. Returns with IRQs masked.
-                let deadline_passed = next_deadline
-                    .map(|d| narf_time::now_cycles() >= d)
-                    .unwrap_or(false);
-                if !deadline_passed {
-                    // LOST-WAKEUP BACKSTOP: arm a ~2 ms fallback so this AP
-                    // re-scans soon even if a cross-core wake is lost and
-                    // the periodic tick stalls (see `IDLE_BACKSTOP_HOOK`).
-                    // The watchdog observed a runnable task stranded on a
-                    // halted AP; this bounds the strand to ~2 ms. Armed with
-                    // IRQs masked so it can't fire-and-be-consumed before
-                    // the sti;hlt below.
-                    arm_idle_backstop_ms(2);
-                    let idle_t0 = narf_time::now_cycles();
-                    // SAFETY: CPL=0, IF=0 on entry (we masked above); the
-                    // arch primitive is the Linux safe_halt sti;hlt;cli.
-                    unsafe {
-                        narf_arch::idle_halt_then_disable();
-                    }
+                let idle_t0 = narf_time::now_cycles();
+                let deadline_passed = next_deadline.is_some_and(|deadline| idle_t0 >= deadline);
+                let entered = if deadline_passed {
+                    false
+                } else {
+                    // SAFETY: IRQs are masked and the final wake check passed.
+                    unsafe { narf_power_core::executor::enter_idle(idle_plan) }
+                };
+                let elapsed = narf_time::now_cycles().wrapping_sub(idle_t0);
+                if entered {
                     credit_idle_since(cpu, idle_t0);
-                    // Instrument: a real HLT just completed on this CPU. A
-                    // wake→dispatch that spans this bump ran despite the CPU
-                    // idling = lost-wakeup (vs pure round-robin ordering).
                     if WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
                         HALT_GEN[cpu].fetch_add(1, Ordering::Relaxed);
                     }
@@ -6977,6 +6873,9 @@ pub fn run_until_empty() {
                 // enabled state (it was enabled before we masked it).
                 unsafe {
                     narf_arch::enable_interrupts();
+                }
+                if entered {
+                    narf_power_core::executor::reflect_idle(cpu, idle_plan, elapsed);
                 }
             } else {
                 // Unreliable-tick (InitialCount) bounded-spin or the
@@ -7296,27 +7195,47 @@ fn try_steal_one(cpu: usize) -> bool {
         None => return false,
     };
 
-    // Build the online-minus-thief set the strategy will permute.
     let max = narf_lib::percpu::MAX_CPUS;
-    let mut online: alloc::vec::Vec<crate::affinity::CpuId> = alloc::vec::Vec::with_capacity(max);
-    for v in 0..max {
-        if v == cpu {
-            continue;
-        }
-        if !narf_lib::smp::is_online(v as u32) {
-            continue;
-        }
-        online.push(crate::affinity::CpuId(v as u32));
-    }
+    let online = narf_lib::smp::online_bitmap() & !(1u64 << cpu);
 
     let thief = crate::affinity::CpuId(cpu as u32);
-    let victims = strategy.order_victims(thief, &online);
-    for v in victims {
-        if try_steal_from(v.0 as usize, cpu, strategy.as_ref()) {
-            return true;
+    let idle = |id| policy::cpu_state(id) == CpuState::Idle;
+    let runnable = |id: CpuId| {
+        RUNNABLE_STATE
+            .get(id.0 as usize)
+            .is_some_and(|state| state.peer.load(Ordering::Acquire))
+    };
+    let node = |id: CpuId| narf_acpi::cpu_node(id.0);
+    let queued = |id: CpuId| {
+        // Two-choice policies sample only their candidates. No global scan or
+        // new enqueue counter; locks are released before the policy visits.
+        READY
+            .get(id.0 as usize)?
+            .try_lock()?
+            .as_ref()
+            .map(|q| q.len())
+    };
+    let context = steal::StealContext::new(
+        online,
+        &idle,
+        &runnable,
+        &steal::llc_id,
+        &node,
+        &queued,
+        &narf_time::now_cycles,
+    );
+    let mut moved = false;
+    strategy.visit_victims(thief, &context, &mut |victim| {
+        if !moved
+            && (victim.0 as usize) < max
+            && victim != thief
+            && narf_lib::smp::is_online(victim.0)
+        {
+            moved = try_steal_from(victim.0 as usize, cpu, strategy.as_ref());
         }
-    }
-    false
+        moved
+    });
+    moved
 }
 
 /// Whether an idle thief may take one dispatchable slot without emptying the
@@ -7510,6 +7429,7 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
 }
 
 pub fn run_forever() -> ! {
+    steal::register_current_cpu();
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();
     let cpu = narf_lib::percpu::current_cpu();
@@ -7561,9 +7481,14 @@ pub fn run_forever() -> ! {
         // `halt_until_irq` race). Publish HALTED, fence, RE-CHECK the
         // queue + pending deferred wakes, and commit with the atomic
         // `sti;hlt;cli` — the same handshake as run_until_empty's idle
-        // path, minus the wheel/backstop machinery (an empty CPU has no
-        // sleepers to serve; the periodic tick still bounds any residual
-        // miss).
+        // path, minus wheel/budget deadline handling (an empty CPU has no
+        // queued sleepers or budget replenishments to serve).
+        let next_deadline = narf_time::timer_wheel::next_deadline_cycles();
+        let idle_plan = narf_power_core::executor::prepare_idle(narf_power_core::IdleHints {
+            cpu,
+            now_cycles: narf_time::now_cycles(),
+            next_deadline_cycles: next_deadline,
+        });
         let race_free_halt = narf_time::tick_reliable() && narf_arch::interrupts_enabled();
         if race_free_halt {
             // SAFETY: re-enabled below (or by the sti;hlt;cli halt).
@@ -7572,6 +7497,9 @@ pub fn run_forever() -> ! {
             unsafe {
                 narf_arch::disable_interrupts();
             }
+        }
+        if race_free_halt {
+            narf_time::clockevent::set_idle_tick(idle_plan.stop_tick(), None);
         }
         narf_memory::tlb_shootdown::mark_idle(cpu as u32);
         CPU_HALTED[cpu].store(true, Ordering::SeqCst);
@@ -7611,18 +7539,27 @@ pub fn run_forever() -> ! {
         }
         if race_free_halt {
             let idle_t0 = narf_time::now_cycles();
-            // SAFETY: CPL=0, IF=0 on entry (masked above); the arch
-            // primitive is the Linux safe_halt sti;hlt;cli, so an IPI (or
-            // any IRQ) that raced into the commit window still wakes it.
-            unsafe {
-                narf_arch::idle_halt_then_disable();
+            let entered = if next_deadline.is_some_and(|deadline| idle_t0 >= deadline) {
+                false
+            } else {
+                // SAFETY: IRQs are masked and the final wake check passed.
+                unsafe { narf_power_core::executor::enter_idle(idle_plan) }
+            };
+            let elapsed = narf_time::now_cycles().wrapping_sub(idle_t0);
+            if entered {
+                credit_idle_since(cpu, idle_t0);
             }
-            credit_idle_since(cpu, idle_t0);
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             // SAFETY: restore the enabled state this idle path runs with.
             unsafe {
                 narf_arch::enable_interrupts();
+            }
+            if entered {
+                narf_power_core::executor::reflect_idle(cpu, idle_plan, elapsed);
+            }
+            if next_deadline.is_some() {
+                narf_time::timer_wheel::fire_due(narf_time::now_cycles());
             }
         } else {
             // Unreliable-tick / IF=0 contexts (kernel-test, InitialCount

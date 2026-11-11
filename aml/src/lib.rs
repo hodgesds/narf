@@ -235,6 +235,8 @@ pub enum NameValue {
 pub struct AmlNode {
     pub path: String,
     pub kind: NodeKind,
+    /// Legacy Processor() ProcID, matched to the MADT ACPI processor UID.
+    pub processor_id: Option<u8>,
     /// `Some` only when `kind == Name` and the body is a flat
     /// constant we managed to decode.
     pub value: Option<NameValue>,
@@ -1468,6 +1470,7 @@ fn parse_term_list_inner(
                 push_node(AmlNode {
                     path: path.clone(),
                     kind: NodeKind::Scope,
+                    processor_id: None,
                     value: None,
                     method_body: (0, 0),
                     method_flags: 0,
@@ -1554,6 +1557,7 @@ fn parse_term_list_inner(
                 push_node(AmlNode {
                     path,
                     kind: NodeKind::Name,
+                    processor_id: None,
                     value: v,
                     method_body: (0, 0),
                     method_flags: 0,
@@ -1575,6 +1579,7 @@ fn parse_term_list_inner(
                 push_node(AmlNode {
                     path,
                     kind: NodeKind::Method,
+                    processor_id: None,
                     value: None,
                     method_body: (body_off, body_len),
                     method_flags: flags,
@@ -1596,6 +1601,7 @@ fn parse_term_list_inner(
                         push_node(AmlNode {
                             path: path.clone(),
                             kind: NodeKind::Device,
+                            processor_id: None,
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -1614,10 +1620,15 @@ fn parse_term_list_inner(
                         let name = read_name_string(p, parent)?;
                         let path = full_path(name, parent);
                         // ProcID(1) + PblkAddr(4) + PblkLen(1) = 6 bytes.
-                        p.skip(6)?;
+                        if pkg_end.saturating_sub(p.pos) < 6 {
+                            return Err(AmlError::Truncated);
+                        }
+                        let processor_id = p.read_u8()?;
+                        p.skip(5)?;
                         push_node(AmlNode {
                             path: path.clone(),
                             kind: NodeKind::Processor,
+                            processor_id: Some(processor_id),
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -1640,6 +1651,7 @@ fn parse_term_list_inner(
                         push_node(AmlNode {
                             path: path.clone(),
                             kind: NodeKind::PowerResource,
+                            processor_id: None,
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -1660,6 +1672,7 @@ fn parse_term_list_inner(
                         push_node(AmlNode {
                             path: path.clone(),
                             kind: NodeKind::ThermalZone,
+                            processor_id: None,
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -1679,6 +1692,7 @@ fn parse_term_list_inner(
                         push_node(AmlNode {
                             path,
                             kind: NodeKind::Mutex,
+                            processor_id: None,
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -1692,6 +1706,7 @@ fn parse_term_list_inner(
                         push_node(AmlNode {
                             path,
                             kind: NodeKind::Event,
+                            processor_id: None,
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -1706,6 +1721,7 @@ fn parse_term_list_inner(
                         push_node(AmlNode {
                             path: path.clone(),
                             kind: NodeKind::OpRegion,
+                            processor_id: None,
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -1748,6 +1764,7 @@ fn parse_term_list_inner(
                         push_node(AmlNode {
                             path: full_path(String::new(), parent),
                             kind: NodeKind::Field,
+                            processor_id: None,
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -1764,6 +1781,7 @@ fn parse_term_list_inner(
                         push_node(AmlNode {
                             path: full_path(String::new(), parent),
                             kind: NodeKind::Field,
+                            processor_id: None,
                             value: None,
                             method_body: (0, 0),
                             method_flags: 0,
@@ -2213,6 +2231,7 @@ pub(crate) fn push_field_node(path: String) {
     push_node(AmlNode {
         path,
         kind: NodeKind::Field,
+        processor_id: None,
         value: None,
         method_body: (0, 0),
         method_flags: 0,
@@ -2237,6 +2256,7 @@ pub fn register_buffer_field(path: &str, source_path: &str, bit_offset: u64, bit
     push_node(AmlNode {
         path: alloc::string::String::from(path),
         kind: NodeKind::BufferField,
+        processor_id: None,
         value: None,
         method_body: (0, 0),
         method_flags: 0,

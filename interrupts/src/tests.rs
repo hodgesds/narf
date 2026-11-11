@@ -1976,7 +1976,66 @@ kernel_test_in!(
     smoke_ipi_shootdown_handler_invpcid_path_taken
 );
 
+#[cfg(target_arch = "x86_64")]
+fn idle_budget_survives_earlier_timer() -> TestResult {
+    use crate::x86_64::apic::{next_arm_target, pending_scheduler_deadline};
+    let budget = 500_000;
+    let pending = pending_scheduler_deadline(100_000, budget);
+    if next_arm_target(100_000, pending, Some(200_000), 10_000) != 200_000 {
+        return TestResult::Fail("earlier wheel did not win");
+    }
+    let pending = pending_scheduler_deadline(200_000, pending);
+    if next_arm_target(200_000, pending, None, 10_000) != budget {
+        return TestResult::Fail("wheel IRQ discarded future budget");
+    }
+    let pending = pending_scheduler_deadline(budget, pending);
+    if next_arm_target(budget, pending, None, 10_000) != u64::MAX {
+        return TestResult::Fail("expired budget kept idle CPU ticking");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/timer", idle_budget_survives_earlier_timer);
+
 // --- one-shot multiplex: next_arm_target pure-logic smokes ------------
+
+#[cfg(target_arch = "aarch64")]
+fn idle_wfi_keeps_pending_irq_masked() -> TestResult {
+    use narf_arch::aarch64::sysreg;
+    let enabled = narf_arch::interrupts_enabled();
+    let (saved_ctl, saved_cval): (u64, u64);
+    // SAFETY: serialized kernel test owns this CPU's timer and IRQ state.
+    unsafe {
+        narf_arch::disable_interrupts();
+        core::arch::asm!("mrs {ctl}, cntp_ctl_el0", "mrs {cval}, cntp_cval_el0",
+            ctl = out(reg) saved_ctl, cval = out(reg) saved_cval, options(nostack));
+        sysreg::write_cntp_tval_el0(0);
+        sysreg::write_cntp_ctl_el0(1);
+        core::arch::asm!("isb", options(nostack));
+    }
+    let cpu = narf_lib::percpu::current_cpu() as u32;
+    let before = crate::aarch64::timer::timer_ticks_for(cpu);
+    // SAFETY: a timer IRQ is pending at the GIC, with DAIF.I masked.
+    unsafe { narf_arch::idle_halt_then_disable() };
+    let masked = !narf_arch::interrupts_enabled();
+    let after = crate::aarch64::timer::timer_ticks_for(cpu);
+    // SAFETY: restore the exact timer deadline/control and incoming IRQ state.
+    unsafe {
+        core::arch::asm!("msr cntp_cval_el0, {value}", value = in(reg) saved_cval, options(nostack));
+        sysreg::write_cntp_ctl_el0(saved_ctl);
+        core::arch::asm!("isb", options(nostack));
+        if enabled {
+            narf_arch::enable_interrupts();
+        }
+    }
+    if masked && before == after {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("WFI consumed the pending IRQ before returning masked")
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("interrupts/timer", idle_wfi_keeps_pending_irq_masked);
 //
 // Exercise the pure min+floor selection used by the LAPIC TSC-deadline
 // one-shot (`on_timer_tick` / `arm_tsc_deadline_if_earlier`). Pure

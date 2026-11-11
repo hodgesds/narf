@@ -398,6 +398,44 @@ pub static LVT_TIMER_READBACK: core::sync::atomic::AtomicU32 =
 pub struct LapicClockEvent;
 
 impl narf_time::clockevent::ClockEvent for LapicClockEvent {
+    fn set_idle_tick(&self, stop_tick: bool, budget_deadline: Option<u64>) -> bool {
+        let enabled = narf_arch::interrupts_enabled();
+        // SAFETY: serialize the local deadline registers with the timer ISR.
+        unsafe { narf_arch::disable_interrupts() };
+        let cpu = tsc_cpu();
+        let period = TSC_DEADLINE_PERIOD_CYCLES[cpu].load(Ordering::Relaxed);
+        if period != 0 {
+            let now = narf_time::now_cycles();
+            let was_stopped = !narf_time::periodic_tick_wanted(cpu);
+            narf_time::set_periodic_tick_wanted(cpu, !stop_tick);
+            if !stop_tick && was_stopped {
+                TSC_DEADLINE_NEXT[cpu].store(now.saturating_add(period), Ordering::Relaxed);
+            }
+            TSC_SCHED_DEADLINE[cpu].store(budget_deadline.unwrap_or(u64::MAX), Ordering::Relaxed);
+            let periodic = if stop_tick {
+                u64::MAX
+            } else {
+                TSC_DEADLINE_NEXT[cpu].load(Ordering::Relaxed)
+            };
+            let wheel = if TSC_WHEEL_OWNER.load(Ordering::Acquire) == cpu {
+                narf_time::timer_wheel::next_deadline_cycles_try()
+            } else {
+                None
+            };
+            let target = next_arm_target(
+                now,
+                periodic.min(budget_deadline.unwrap_or(u64::MAX)),
+                wheel,
+                MIN_DELTA_CYCLES,
+            );
+            program_tsc_deadline(cpu, target);
+        }
+        if enabled {
+            // SAFETY: restore the caller's IRQ state.
+            unsafe { narf_arch::enable_interrupts() };
+        }
+        period != 0
+    }
     fn name(&self) -> &'static str {
         "lapic"
     }
@@ -591,6 +629,7 @@ pub static LAPIC_CLOCKEVENT: LapicClockEvent = LapicClockEvent;
 /// # Safety
 /// `init_bsp` must have run.
 pub unsafe fn stop_timer() {
+    TSC_DEADLINE_PERIOD_CYCLES[tsc_cpu()].store(0, Ordering::Relaxed);
     if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         // SAFETY: APIC is enabled.
         unsafe {
@@ -1069,7 +1108,27 @@ pub fn on_timer_tick() {
     } else {
         None
     };
-    let target = next_arm_target(now, periodic_anchor, wheel_earliest, MIN_DELTA_CYCLES);
+    let scheduler =
+        pending_scheduler_deadline(now, TSC_SCHED_DEADLINE[cpu].load(Ordering::Relaxed));
+    TSC_SCHED_DEADLINE[cpu].store(scheduler, Ordering::Relaxed);
+    let target = next_arm_target(
+        now,
+        periodic_anchor.min(scheduler),
+        wheel_earliest,
+        MIN_DELTA_CYCLES,
+    );
+    program_tsc_deadline(cpu, target);
+}
+
+pub(crate) const fn pending_scheduler_deadline(now: u64, deadline: u64) -> u64 {
+    if deadline <= now {
+        u64::MAX
+    } else {
+        deadline
+    }
+}
+
+fn program_tsc_deadline(cpu: usize, target: u64) {
     TSC_ARMED[cpu].store(target, Ordering::Relaxed);
     // SAFETY: TSC-deadline MSR is unconditionally writable when the
     // LVT_TIMER is configured for deadline mode, which is the gate that
@@ -1083,7 +1142,10 @@ pub fn on_timer_tick() {
     // chips.
     unsafe {
         core::arch::asm!("mfence", options(nostack, preserves_flags));
-        wrmsr(IA32_TSC_DEADLINE, target);
+        wrmsr(
+            IA32_TSC_DEADLINE,
+            if target == u64::MAX { 0 } else { target },
+        );
     }
     // We deliberately do NOT call timer_wheel::fire_due here.
     //
@@ -1154,6 +1216,8 @@ static TSC_DEADLINE_NEXT: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC
 /// deadline appears (mirrors Linux hrtimer_reprogram's `expires >=
 /// expires_next` guard) — now against THIS CPU's armed value, not a global.
 static TSC_ARMED: [AtomicU64; MAXC] = [const { AtomicU64::new(u64::MAX) }; MAXC];
+// Budget expiry/replenishment survives an earlier wheel or periodic interrupt.
+static TSC_SCHED_DEADLINE: [AtomicU64; MAXC] = [const { AtomicU64::new(u64::MAX) }; MAXC];
 
 /// Logical CPU whose local APIC currently represents the global timer-wheel
 /// minimum.  The owner is replaced whenever the wheel publishes an earlier
@@ -1259,6 +1323,11 @@ fn arm_tsc_deadline(deadline_cycles: u64, claim_wheel: bool) {
     // value as "earlier" suppresses the future backstop and lets a CPU HLT
     // forever with an awake task queued.
     let armed = TSC_ARMED[cpu].load(Ordering::Relaxed);
+    if !claim_wheel {
+        let pending =
+            pending_scheduler_deadline(now, TSC_SCHED_DEADLINE[cpu].load(Ordering::Relaxed));
+        TSC_SCHED_DEADLINE[cpu].store(pending.min(deadline_cycles), Ordering::Relaxed);
+    }
     if should_rearm_tsc_deadline(now, armed, target, COALESCE_SLACK_CYCLES) {
         TSC_ARMED[cpu].store(target, Ordering::Relaxed);
         // SAFETY: TSC-deadline MSR writable (period != 0 gate above);
@@ -1320,6 +1389,9 @@ pub unsafe fn start_timer_tsc_deadline(timer_vector: u8, period_cycles: u64) {
     let first = now.wrapping_add(period_cycles);
     TSC_DEADLINE_NEXT[cpu].store(first, Ordering::Release);
     TSC_ARMED[cpu].store(first, Ordering::Release);
+    TSC_SCHED_DEADLINE[cpu].store(u64::MAX, Ordering::Relaxed);
+    narf_time::set_periodic_tick_wanted(cpu, true);
+    narf_time::clockevent::register_local(&LAPIC_CLOCKEVENT);
     let lvt = LVT_TIMER_TSC_DEADLINE | (timer_vector as u64);
     // SAFETY: APIC live; TSC-deadline support implied by caller.
     unsafe {

@@ -57,52 +57,78 @@ failure returns; synthetic callbacks cannot replace later hardware-test state.
 
 ### 3.1 Idle
 
-```rust
-pub fn idle_enter() -> !;                   // called by scheduler at empty runq
-pub fn register_cstate(info: CstateInfo);   // arch backend populates at boot
+`narf_power_core` owns the idle governor, CPU state tables and hardware entry;
+`narf_power` re-exports its public policy types and performs ACPI discovery.
 
+```rust
+pub struct IdleHints {
+    pub cpu: usize,
+    pub now_cycles: u64,
+    pub next_deadline_cycles: Option<u64>,
+}
+pub struct IdleContext {
+    pub cpu: usize,
+    pub deadline_us: u64,
+    pub predicted_idle_us: u64,
+    pub latency_limit_us: u64,
+}
+pub struct IdleDecision { pub state: CStateIdx, pub stop_tick: bool }
 pub trait IdleGovernor: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn select_idle_state(&self, latency_budget_us: u64,
                          predicted_idle_us: u64) -> CStateIdx;
+    fn select(&self, context: &IdleContext, states: &[IdleState]) -> IdleDecision;
+    fn reflect(&self, cpu: usize, state: CStateIdx, residency_us: u64);
 }
-pub fn install_idle_governor<G: IdleGovernor>(
-    cap: &Cap<IdleGov, Grant>, g: G) -> Result<(), PowerError>;
-pub fn install_idle_governor_struct_ops<M: CapType>(
-    cap: &Cap<M, Grant>, generation: u64,
-    g: Arc<dyn IdleGovernor>) -> Result<(), PowerError>;
-pub fn detach_idle_governor_struct_ops(generation: u64) -> bool;
-
-pub struct CstateInfo {
-    pub depth:         u8,                  // 0 = C0 (running); higher = deeper
-    pub exit_latency:  Duration,            // worst-case
-    pub target_residency: Duration,
-    pub power_uw:      u32,                 // typical
-    pub enter:         fn(),                // arch-specific instruction sequence
-}
+// narf_power_core::executor
+pub fn prepare_idle(hints: IdleHints) -> IdlePlan;
+pub unsafe fn enter_idle(plan: IdlePlan) -> bool;
+pub fn reflect_idle(cpu: usize, plan: IdlePlan, elapsed_cycles: u64);
+pub fn idle_stats(cpu: usize) -> Option<IdleStats>;
+pub fn set_idle_latency_limit(cap: &Cap<Power, Grant>, cpu: usize,
+                              limit_us: u64) -> Result<(), PowerError>;
+pub fn register_firmware_states(cap: &Cap<Power, Grant>, apic_id: u32,
+                                states: &[IdleState]) -> Result<(), PowerError>;
 ```
 
-Default governor: **predictive**, picking the deepest C-state whose
-`target_residency` is less than the predicted idle time (EWMA over
-recent idle durations + upcoming hrtimer deadline from `time/`).
+Boot installs `MenuGovernor`. Selection combines the next real wheel/budget
+deadline, per-CPU EWMA residency (weight 1/8), and a caller-supplied latency
+limit. Limits default to unconstrained; history and telemetry are per CPU.
+The C1 fallback prevents a short prediction from causing perpetual busy polling.
+An explicit zero latency limit or custom C0 recommendation may select polling.
 
-**`time/` `next_deadline()` contract.** `idle_enter` queries
-`time::next_deadline()` to bound the C-state choice. That call is
-required to be O(1) with bounded worst-case latency strictly less
-than the shortest C-state's `enter` cost; the spec is enforced in
-`time/` §3.2 via a per-CPU "next deadline" cache updated on every
-`timer_oneshot` / `timer_cancel`. A regression in that contract
-flips us into spending more time picking a C-state than we save by
-entering one.
+`IdleState` contains `id`, `exit_latency_us`, `target_residency_us`, and a typed
+`IdleEntry` (`Poll`, `Halt`, exact `Mwait { hint }`, `SystemIo { port, acpi_type }`,
+or a registered callback). `IdlePlan` exposes read-only `state()` and
+`stop_tick()` accessors. The core revalidates recommendations against this CPU's
+supported table, latency and residency constraints. An invalid recommendation
+falls back to C1 if allowed, then C0. Registry changes invalidate prepared plans.
 
-The live idle-governor slot is Arc-backed. Selection clones the active Arc
-under the slot lock and invokes it after releasing that lock; install and
-detach drop displaced implementations after releasing it. Struct-ops installs
-carry a generation, and detach succeeds only for the currently live generation.
-After any native or BPF policy returns, `select_idle_state` rechecks the live
-state's exit latency and target residency against the supplied budgets and
-falls back to a valid C0. Policy output is therefore a recommendation rather
-than authority to enter a stale or unsafe state.
+`enter_idle` requires the preparing CPU, masked IRQs, no task poll or RCU read
+section, no held lock, armed deadlines, and the executor's completed
+halted-publish/fence/wake recheck. It returns with IRQs masked. No registry lock
+or governor callback spans hardware idle. Residency reflection runs after IRQs
+are restored. Governor methods must be bounded, nonblocking and non-reentrant.
+
+`register_cstate(&Cap<Power, Grant>, CState)` remains available. Its callback
+must accept and return with IRQs masked and preserve pending interrupt wakeups.
+Legacy `select_idle_state()` retains its fixed 1 ms compatibility budget; the
+executor uses typed hints. Existing idle-governor install and generation-based
+struct-ops detach APIs retain their capability checks. The legacy trait method
+is the default adapter for older/BPF governors; core validation still applies.
+
+The active governor is Arc-backed. Per-CPU caches clone it only when a cold
+policy generation changes; steady idle selection takes neither a global slot
+lock nor a shared Arc reference-count update. Displaced implementations are
+dropped after releasing registry locks. State tables hold at most 16 entries.
+
+`cpu_idle::discover(&Cap<Power, Grant>)` evaluates bounded strict AML `_CST`,
+matching Processor ProcID or ACPI0007 `_UID` through MADT to hardware APIC ID.
+It honors the FADT CST control handshake. Malformed/unsupported firmware leaves
+C1 available. Notify 0x81 withdraws the old table and schedules re-evaluation;
+stale queued refreshes cannot overwrite newer notifications. Coupled `_CSD`
+domains are not entered until a coordination implementation exists. Exact
+hardware admission rules are in [CPU power §2](cpu-power.md#2-c-states-idle).
 
 ### 3.2 DVFS
 
