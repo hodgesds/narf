@@ -36,10 +36,12 @@
 //! from DT (`qcom,tcs-offset`) and is a constructor argument — it is
 //! NOT guessed here. Each TCS holds up to 16 commands.
 //!
-//! Single-TCS assumption: this module programs TCS 0, the first ACTIVE
-//! TCS. Linux picks a free TCS from the ACTIVE group per request; the
-//! proxy-vote path is the only RSC user in this scope, so TCS 0 is
-//! always free. A second RSC user must add allocation first.
+//! Single-TCS assumption: this module programs the first ACTIVE TCS
+//! (TCS 0 unless [`Rsc::with_active_tcs`] names the DT-derived index).
+//! Linux picks a free TCS from the ACTIVE group per request; the
+//! proxy-vote path is the only RSC user in this scope, so the first
+//! ACTIVE TCS is always free. A second RSC user must add allocation
+//! first.
 //!
 //! Nothing here has run on Qualcomm silicon. All constants below are
 //! transcribed from the Linux sources named above.
@@ -140,6 +142,8 @@ pub struct Rsc<R: RegIo> {
     table: &'static RscRegs,
     /// DT `qcom,tcs-offset`: base of the TCS region within the DRV.
     tcs_base: u32,
+    /// Index of the first ACTIVE TCS (`drv->tcs[ACTIVE_TCS].offset`).
+    active_tcs: u32,
 }
 
 impl<R: RegIo> Rsc<R> {
@@ -154,7 +158,16 @@ impl<R: RegIo> Rsc<R> {
             regs,
             table,
             tcs_base,
+            active_tcs: 0,
         }
+    }
+
+    /// Select the first ACTIVE TCS from DT `qcom,tcs-config`
+    /// ([`crate::platform::RscDt::active_tcs`]), as
+    /// `rpmh_probe_tcs_config` numbers the groups in DT order.
+    pub fn with_active_tcs(mut self, tcs: u32) -> Self {
+        self.active_tcs = tcs;
+        self
     }
 
     fn tcs_reg(&self, tcs: u32, reg: u32) -> u32 {
@@ -196,7 +209,7 @@ impl<R: RegIo> Rsc<R> {
         if cmds.len() > MAX_CMDS_PER_TCS {
             return Err(RscError::TooManyCmds);
         }
-        let tcs = 0;
+        let tcs = self.active_tcs;
         let msgid = MSGID_LEN | MSGID_WRITE | if wait { MSGID_RESP_REQ } else { 0 };
         for (i, (addr, data)) in cmds.iter().enumerate() {
             let i = i as u32;
@@ -241,8 +254,39 @@ pub enum VoteError {
     UnknownResource,
     /// The rail name does not fit the 8-byte cmd-db id (`<rail>.lvl`).
     BadRail,
+    /// The rail's cmd-db aux level map is empty or longer than
+    /// `RPMH_ARC_MAX_LEVELS` (`rpmhpd_update_level_mapping` -EINVAL).
+    BadLevels,
     /// The RSC transfer failed.
     Rsc(RscError),
+}
+
+/// `RPMH_ARC_MAX_LEVELS`.
+const ARC_MAX_LEVELS: usize = 32;
+/// `RPMH_REGULATOR_LEVEL_RETENTION` (dt-bindings `qcom,rpmhpd.h`).
+const LEVEL_RETENTION: u16 = 16;
+
+/// `rpmhpd_update_level_mapping` + `rpmhpd_set_performance_state(INT_MAX)`:
+/// the aux data is one little-endian u16 vlvl per hlvl; trailing zero
+/// entries after hlvl 0 end the map (a retention entry is skipped, not
+/// treated as padding). An INT_MAX request is above every vlvl, so the
+/// corner is `level_count - 1`. `None` for an empty or oversized map.
+pub fn arc_max_corner(aux: &[u8]) -> Option<u32> {
+    let mut count = aux.len() / 2;
+    if count == 0 || count > ARC_MAX_LEVELS {
+        return None;
+    }
+    for i in 0..count {
+        let v = u16::from_le_bytes([aux[2 * i], aux[2 * i + 1]]);
+        if v == LEVEL_RETENTION {
+            continue;
+        }
+        if i > 0 && v == 0 {
+            count = i;
+            break;
+        }
+    }
+    Some(count as u32 - 1)
 }
 
 /// The RPMh vote layer: cmd-db address lookup + RSC ACTIVE_ONLY writes.
@@ -300,6 +344,26 @@ impl<'a, R: RegIo> Rpmh<'a, R> {
         // lookup, matching Linux's `strtomem_pad`.
         let id = core::str::from_utf8(&id[..rb.len() + 4]).map_err(|_| VoteError::BadRail)?;
         self.vote(delay, id, level).await
+    }
+
+    /// The highest ARC corner (hlvl) of `<rail>.lvl`: what
+    /// `dev_pm_genpd_set_performance_state(pd, INT_MAX)` selects in
+    /// `rpmhpd_set_performance_state` (`qcom_pas_pds_enable`), from
+    /// the cmd-db aux level map ([`arc_max_corner`]).
+    pub fn rail_max_corner(&self, rail: &str) -> Result<u32, VoteError> {
+        let mut id = [0u8; 8];
+        let rb = rail.as_bytes();
+        if rb.len() + 4 > 8 {
+            return Err(VoteError::BadRail);
+        }
+        id[..rb.len()].copy_from_slice(rb);
+        id[rb.len()..rb.len() + 4].copy_from_slice(b".lvl");
+        let id = core::str::from_utf8(&id[..rb.len() + 4]).map_err(|_| VoteError::BadRail)?;
+        let aux = self
+            .db
+            .read_aux_data(id)
+            .ok_or(VoteError::UnknownResource)?;
+        arc_max_corner(aux).ok_or(VoteError::BadLevels)
     }
 
     /// The `xo` clock vote (`clk-rpmh.c` ARC shape): `xo.lvl` with

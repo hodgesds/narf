@@ -35,8 +35,8 @@ use core::task::{Context, Poll, Waker};
 
 use narf_drivers_qcom_soc::fixtures::{
     build_mdt, build_smem_v12_sized, glink_cmd, glink_data, glink_remote_open, glink_smem_edge,
-    ipq6018_wifi_dt, remote_item, run, sc7280_wifi_dt, CountingKick, FakeAlloc, FakeDelay,
-    FakeRegs, FakeSmc, GlinkRemote, Seg,
+    ipq6018_wifi_dt, qmp_messages, remote_item, run, sc7280_wifi_dt, CountingKick, FakeAlloc,
+    FakeDelay, FakeRegs, FakeSmc, GlinkRemote, Seg, FAKE_CX_ADDR, FAKE_MX_ADDR, FAKE_XO_ADDR,
 };
 use narf_drivers_qcom_soc::glink::{
     GLINK_CMD_INTENT, GLINK_CMD_OPEN, GLINK_CMD_OPEN_ACK, GLINK_CMD_RX_DONE,
@@ -298,6 +298,15 @@ fn env_for(p: &AhbPlatform, ready_bits: u32, ack_bits: u32) -> Box<Env> {
     let mut maps = BTreeMap::new();
     maps.insert(s.region, smem_regs);
     maps.insert(s.hwlock_base, lock_regs);
+    // PAS proxy power (WCN6750): passive cmd-db / RSC / AOSS fakes.
+    if let Some(pw) = &p.remote.platform.power {
+        let f = narf_drivers_qcom_soc::fixtures::pas_power_fakes(pw);
+        maps.insert(pw.cmd_db, f.cmd_db);
+        maps.insert(pw.rsc.drv, f.rsc);
+        if let Some(q) = &pw.qmp {
+            maps.insert(q.msgram, f.msgram);
+        }
+    }
     let mut env = Box::new(Env {
         maps,
         smem: smem_regs,
@@ -413,9 +422,91 @@ fn smoke_ath11k_ahb_live_wcn6750_pas() -> TestResult {
     kt_assert_eq!(live.env.stop_seen.load(Ordering::Relaxed), 1);
     kt_assert_eq!(live.rproc_state(), Some(RprocState::Offline));
     kt_assert_eq!(live.set_wlan_smp2p(0x0001_0002), Some(()), "wlan-smp2p-out");
+    // qcom_pas_start proxy power: load-state on, cx/mx at their highest
+    // corner, xo on; `handover` arrived with `ready`, so the votes were
+    // released right after start (xo off, cx 0, mx 0); the stop sent
+    // load-state off and cast no further vote.
+    let pw = p.remote.platform.power.as_ref().unwrap();
+    let rsc = live.env.maps.get(&pw.rsc.drv).copied().unwrap();
+    let msgram = live
+        .env
+        .maps
+        .get(&pw.qmp.as_ref().unwrap().msgram)
+        .copied()
+        .unwrap();
+    let (addr, data) = proxy_votes(rsc, pw.rsc.tcs_offset);
+    kt_assert_eq!(
+        addr,
+        alloc::vec![
+            FAKE_CX_ADDR,
+            FAKE_MX_ADDR,
+            FAKE_XO_ADDR,
+            FAKE_XO_ADDR,
+            FAKE_CX_ADDR,
+            FAKE_MX_ADDR
+        ]
+    );
+    kt_assert_eq!(data, alloc::vec![5, 4, 3, 0, 0, 0]);
+    kt_assert_eq!(
+        qmp_messages(msgram),
+        alloc::vec![
+            b"{class: image, res: load_state, name: wpss, val: on}".to_vec(),
+            b"{class: image, res: load_state, name: wpss, val: off}".to_vec(),
+        ]
+    );
+    kt_assert!(!live.proxy_held(), "handover released the proxy votes");
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_live_wcn6750_pas);
+
+/// The CMD_ADDR / CMD_DATA writes of the first ACTIVE TCS (TCS 0 on
+/// SC7280, `rpmh_rsc_reg_offset_ver_2_7` slot 0).
+fn proxy_votes(rsc: &FakeRegs, tcs_offset: u32) -> (Vec<u32>, Vec<u32>) {
+    (
+        rsc.writes_to(tcs_offset + 0x34),
+        rsc.writes_to(tcs_offset + 0x38),
+    )
+}
+
+/// WCN6750 without an early `handover`: the proxy votes stay cast after
+/// start and `qcom_pas_stop` releases them (load-state off, then
+/// `qcom_pas_handover` because `qcom_q6v5_unprepare` reports it never
+/// came).
+fn smoke_ath11k_ahb_live_wcn6750_proxy_released_at_stop() -> TestResult {
+    let blob: &'static [u8] = Box::leak(sc7280_wifi_dt().into_boxed_slice());
+    let node = find_ahb_devices(blob)[0].0.clone();
+    let p = Box::new(AhbPlatform::probe(blob, &node).unwrap());
+    // ready only (bit 1); stop-ack 3, shutdown-ack 7.
+    let env = env_for(&p, 1 << 1, (1 << 3) | (1 << 7));
+    let mut live = Box::new(LiveAhb::new(*env, blob));
+    let r = run(bring_up(&p, &mut *live));
+    kt_assert!(
+        matches!(r, Some(Err((BringUpStep::QmiReady, AhbError::Failed(_))))),
+        "fails at qmi_ready"
+    );
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Offline));
+    let pw = p.remote.platform.power.as_ref().unwrap();
+    let rsc = live.env.maps.get(&pw.rsc.drv).copied().unwrap();
+    let (addr, data) = proxy_votes(rsc, pw.rsc.tcs_offset);
+    kt_assert_eq!(
+        addr,
+        alloc::vec![
+            FAKE_CX_ADDR,
+            FAKE_MX_ADDR,
+            FAKE_XO_ADDR,
+            FAKE_XO_ADDR,
+            FAKE_CX_ADDR,
+            FAKE_MX_ADDR
+        ]
+    );
+    kt_assert_eq!(data, alloc::vec![5, 4, 3, 0, 0, 0]);
+    kt_assert!(!live.proxy_held(), "stop released the proxy votes");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_wcn6750_proxy_released_at_stop
+);
 
 // ── fake WLFW server over GLINK ──────────────────────────────────
 

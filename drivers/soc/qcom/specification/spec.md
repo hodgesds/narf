@@ -70,11 +70,26 @@ pub fn platform::q6_platform(blob, rproc_phandle) -> Result<Q6Platform, DtError>
 pub fn platform::smp2p_edge(blob, path) -> Result<Smp2pDt, DtError>;
 pub fn platform::smp2p_entry(blob, phandle) -> Option<(edge_path, entry_name)>;
 pub fn platform::smem(blob) -> Result<SmemDt, DtError>;
+pub fn platform::pas_power(blob, &PlatformDevice) -> Result<PasPowerDt, DtError>;
+pub struct PasPowerDt { rsc: RscDt, cmd_db: (u64, u64), rails: Vec<&'static str>, qmp: Option<QmpDt> }
+pub struct RscDt { drv: (u64, u64), drv_id: u32, tcs_offset: u32, active_tcs: u32 }
+pub struct QmpDt { msgram: (u64, u64), kick: KickDt }
 ```
 `Q6Platform` carries kind (`Wcss` | `Pas { pas_id }`), firmware name,
 crash-reason item, carve-out, `qdsp6`/`rmb`/halt-regs windows, resolved
 GCC resets, each interrupt as `Gic(hwirq)` or `Smp2p { edge, entry, bit }`,
-the outbound `stop` bit, the SMP2P edges (config, kick, IPC irq) and SMEM.
+the outbound `stop` bit, the SMP2P edges (config, kick, IPC irq), SMEM
+and, for PAS, `power: Some(PasPowerDt)`. `pas_power` resolves
+`power-domains`/`power-domain-names` (SC7280 rpmhpd index 0 → `cx`,
+4 → `mx`; other SoCs' tables are not transcribed and are refused), all
+under one `qcom,rpmh-rsc` whose `drv-<qcom,drv-id>` window,
+`qcom,tcs-offset` and first ACTIVE TCS (`qcom,tcs-config` in DT order,
+CONTROL taking no index, `rpmh_probe_tcs_config`) it records; the `xo`
+clock must be `RPMH_CXO_CLK` (0) on the `*-rpmh-clk` child of that RSC;
+`qcom,cmd-db` is the reserved-memory node; `qcom,qmp` (optional, as
+`qcom_q6v5_init`) gives the AOSS message RAM and its `mboxes` kick.
+Missing proxy domains or `xo` fail resolution, as `qcom_q6v5_pas.c`
+fails probe.
 
 ### 3.3 SCM (`scm`)
 ```rust
@@ -190,26 +205,30 @@ the start / stop futures `Send`, so a spawned task can boot the remote.
 
 ### 3.10 RPMh votes and AOSS QMP (`cmd_db`, `rpmh`, `aoss`, `wpss`)
 ```rust
-pub struct CmdDb<'a>;  impl CmdDb { parse(data) -> Result<Self, CmdDbError>, read_addr(id) -> Option<u32> }
+pub struct CmdDb<'a>;  impl CmdDb { parse(data) -> Result<Self, CmdDbError>, read_addr(id) -> Option<u32>,
+                                   read_aux_data(id) -> Option<&'a [u8]> }
 pub enum CmdDbError { Truncated, BadMagic }
-pub struct Rsc<R>;  impl Rsc { probe(regs, tcs_base) -> Self,
+pub struct Rsc<R>;  impl Rsc { probe(regs, tcs_base) -> Self, with_active_tcs(self, tcs) -> Self,
                                write_active(delay, cmds: &[(u32, u32)], wait) -> Result<(), RscError> }
 pub enum RscError { Empty, TooManyCmds, Timeout }
 pub struct Rpmh<'a, R>;  impl Rpmh { new(db, rsc), vote(delay, id, value),
-                                     vote_rail(delay, rail, level), vote_xo(delay, on) }
-pub enum VoteError { UnknownResource, BadRail, Rsc(RscError) }
+                                     vote_rail(delay, rail, level), vote_xo(delay, on),
+                                     rail_max_corner(rail) -> Result<u32, VoteError> }
+pub fn rpmh::arc_max_corner(aux: &[u8]) -> Option<u32>;
+pub enum VoteError { UnknownResource, BadRail, BadLevels, Rsc(RscError) }
 pub struct Qmp<R, K>;  impl Qmp { open(msgram, kick, delay) -> Result<Self, QmpError>,
                                  close(&self), send(delay, msg), load_state(delay, name, on),
                                  mbox_size(&self) -> u32 }
 pub enum QmpError { BadMagic, BadVersion, BadMbox, Timeout, TooLong }
-pub struct WpssPower<'a, R1, R2, K>;  impl WpssPower { new(rpmh, qmp),
-    prepare(delay, cx_level, mx_level), unprepare(delay) }
+pub struct WpssPower<'a, R1, R2, K>;  impl WpssPower { new(rpmh, qmp: Option<Qmp>, rails),
+    start(delay), load_state(delay, on), proxy_enable(delay), proxy_disable(delay) }
 pub enum WpssPowerError { Vote(VoteError), Qmp(QmpError) }
 ```
 `CmdDb::read_addr` is `cmd_db_read_addr` (magic `0xdb 0x30 0x03 0x0c`,
 8-byte NUL-padded ids, scan stops at the first zero `slv_id`).
-`Rsc::write_active` programs TCS 0 only (the proxy-vote path is the
-sole RSC user; a second user must add TCS allocation first) with
+`Rsc::write_active` programs the first ACTIVE TCS only (TCS 0 unless
+`with_active_tcs` names the DT-derived index; the proxy-vote path is
+the sole RSC user; a second user must add TCS allocation first) with
 `CMD_MSGID = 8 | WRITE | RESP_REQ`, the slot mask in `CMD_ENABLE`,
 and the AMC ENABLE then ENABLE|TRIGGER sequence; completion polls
 `IRQ_STATUS` through `Delay` (Linux waits on the TCS IRQ) and the
@@ -217,7 +236,10 @@ teardown mirrors `tcs_tx_done`. The register table follows the DRV ID
 register (major >= 3 selects the 3.0 table, else 2.7); the TCS region
 base is the DT `qcom,tcs-offset`, never guessed. Votes are ACTIVE_ONLY
 only — wake/sleep peer aggregation is rpmhpd policy, out of scope.
-Rail levels are caller-supplied (per-SoC DT `qcom,level` tables);
+`rail_max_corner` is the corner `rpmhpd_set_performance_state(INT_MAX)`
+selects: `level_count - 1` of the cmd-db aux level map (u16 vlvl per
+hlvl; trailing zeros after hlvl 0 end it, a retention entry does not;
+more than 32 levels is refused, `rpmhpd_update_level_mapping`).
 `xo.lvl` enables with data `0x3` (`clk-rpmh.c` ARC `res_on_val`).
 `Qmp::open` runs the `qcom_aoss.c` link/channel handshake over the
 msgram descriptor (`MAIL` magic, version 1, MCORE mailbox fields)
@@ -225,9 +247,14 @@ with the `Kick` trait as the mailbox doorbell; `send` writes the
 64-byte zero-padded message at mbox+4, the length word at mbox, and
 waits for AOSS to clear it. `load_state` is the `qcom_q6v5.c` image
 message (`{class: image, res: load_state, name: %s, val: %s}`).
-`WpssPower::prepare` votes `cx`, `mx`, `xo` on, then load-state `on`
-for `wpss`; `unprepare` sends load-state `off` only, leaving the
-votes cast, as `qcom_q6v5_unprepare` does.
+`WpssPower` follows `qcom_q6v5_pas.c`: `start` sends load-state `on`
+for `wpss` (`qcom_q6v5_prepare`), then `proxy_enable` votes each rail
+at `rail_max_corner` and `xo` on (`qcom_pas_pds_enable` +
+`clk_prepare_enable`); a vote failure returns the voted rails to corner
+0 and sends load-state `off`. `proxy_disable` is `qcom_pas_handover`
+(`xo` off, then each rail to 0); `load_state(false)` is
+`qcom_q6v5_unprepare`. Without `qcom,qmp` the load-state message is
+skipped. The ath11k AHB bring-up drives these around `PasRproc`.
 
 ## 4. Invariants
 - No busy waits on hardware registers: every poll sleeps via `Delay`.
@@ -265,12 +292,9 @@ Tests: `cargo xtask test --subsystem drivers/soc/qcom --kernel-tests-only`.
   DT property (callers pass intent groups explicitly) and the glink
   chrdev/`rpmsg_ctrl` are not implemented. The edge interrupt is
   delivered by the caller (`Glink::process_rx` on each SPI).
-- **RPMh / AOSS QMP** proxy votes (WPSS `xo`, `cx`/`mx`, `load_state`) are
-  implemented (`cmd_db`, `rpmh`, `aoss`, `wpss`, §3.10) but NOT wired
-  into the live bring-up: that needs the host DT nodes for the RSC
-  window, the cmd-db reserved-memory region, and the AOSS msgram +
-  mailbox, which no in-tree fixture DT carries yet. `PasRproc` still
-  assumes firmware already holds the votes until that wiring lands.
+- **RPMh** proxy votes are ACTIVE_ONLY: `rpmhpd_aggregate_corner` also
+  writes the WAKE_ONLY and SLEEP_ONLY sets and aggregates with the
+  `*_ao` peer; neither is done here. Nothing has run on SC7280 silicon.
 - **IPQ8074 AON reset:** mainline has no `GCC_WCSSAON_RESET` for IPQ8074
   and no WCSS DT node; IPQ8074 boards need a binding decision.
 - **IPQ5018 WCSS** has no upstream DT node or Linux match data; the GCC

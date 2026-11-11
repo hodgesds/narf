@@ -35,6 +35,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use narf_drivers_qcom_soc::aoss::Qmp;
+use narf_drivers_qcom_soc::cmd_db::CmdDb;
 use narf_drivers_qcom_soc::gcc::Gcc;
 use narf_drivers_qcom_soc::glink::{Glink, GlinkSmem, GLINK_FEATURE_INTENT_REUSE};
 use narf_drivers_qcom_soc::hwlock::TcsrMutex;
@@ -43,13 +45,15 @@ use narf_drivers_qcom_soc::ipc::{ApcsIpc, DtKick, Ipcc};
 use narf_drivers_qcom_soc::irq::Q6Irqs;
 use narf_drivers_qcom_soc::mdt::SegmentSource;
 use narf_drivers_qcom_soc::pas::PasRproc;
-use narf_drivers_qcom_soc::platform::{self, GlinkEdgeDt, KickDt, RprocKind};
+use narf_drivers_qcom_soc::platform::{self, GlinkEdgeDt, KickDt, PasPowerDt, RprocKind};
 use narf_drivers_qcom_soc::q6v5::{Crash, Q6v5};
+use narf_drivers_qcom_soc::rpmh::{Rpmh, Rsc};
 use narf_drivers_qcom_soc::rproc::{Carveout, RprocError, StopState};
 use narf_drivers_qcom_soc::scm::{Scm, ScmAlloc, SmcConduit};
 use narf_drivers_qcom_soc::smem::Smem;
 use narf_drivers_qcom_soc::smp2p::{InHandle, OutHandle, Smp2p};
 use narf_drivers_qcom_soc::wcss::{Q6Wcss, WcssRegs, WcssResets};
+use narf_drivers_qcom_soc::wpss::WpssPower;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::ahb::{AhbError, AhbIo};
@@ -136,6 +140,14 @@ where
 pub type AhbQrtr<E> = GlinkQrtr<
     GlinkSmem<&'static <E as AhbEnv>::Regs, DtKick<&'static <E as AhbEnv>::Regs>>,
     <E as AhbEnv>::Bus,
+>;
+/// The PAS proxy power (`qcom_q6v5_pas.c` load-state + RPMh votes)
+/// over the mapped RSC DRV, cmd-db copy and AOSS message RAM.
+type AhbWpss<E> = WpssPower<
+    'static,
+    &'static <E as AhbEnv>::Regs,
+    &'static <E as AhbEnv>::Regs,
+    DtKick<&'static <E as AhbEnv>::Regs>,
 >;
 /// The TCSR hardware mutex over the SMEM lock window.
 type AhbLock<E> = TcsrMutex<&'static <E as AhbEnv>::Regs, &'static <E as AhbEnv>::Delay>;
@@ -234,6 +246,12 @@ pub struct LiveAhb<E: AhbEnv> {
     lock: Option<AhbLock<E>>,
     edges: IrqSafeSpinLock<Vec<LiveEdge<E::Regs>>>,
     rproc: Option<Rproc<E>>,
+    /// PAS proxy power, built with the remoteproc IRQs (the cmd-db,
+    /// RPMh and AOSS drivers probe before the remoteproc in Linux).
+    wpss: Option<AhbWpss<E>>,
+    /// The proxy votes are cast and the remote has not signalled
+    /// `handover` yet (`qcom_pas_handover` still owed).
+    proxy_held: bool,
     qrtr: Option<AhbQrtr<E>>,
     irq: Option<AhbIrq>,
     pub outcome: Option<LiveOutcome<E>>,
@@ -267,6 +285,8 @@ impl<E: AhbEnv> LiveAhb<E> {
             lock: None,
             edges: IrqSafeSpinLock::new(Vec::new()),
             rproc: None,
+            wpss: None,
+            proxy_held: false,
             qrtr: None,
             irq: None,
             outcome: None,
@@ -391,6 +411,58 @@ impl<E: AhbEnv> LiveAhb<E> {
         self.glink_start(p).await?;
         self.qmi_init_service(p)?;
         self.wlfw_ready(p).await
+    }
+
+    /// `cmd_db_dev_probe` (the `qcom,cmd-db` region, copied once and
+    /// kept for the device lifetime), `rpmh_rsc_probe` on the DRV, and
+    /// `qmp_probe`/`qmp_open` on the AOSS message RAM.
+    async fn wpss_power(&mut self, pw: &PasPowerDt) -> Result<AhbWpss<E>, AhbError> {
+        let delay = self.env.delay();
+        let db_regs = self.env.map(pw.cmd_db.0, pw.cmd_db.1)?;
+        let len = usize::try_from(pw.cmd_db.1).map_err(|_| failed(EINVAL))?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| failed(ENOMEM))?;
+        bytes.resize(len, 0);
+        narf_drivers_qcom_soc::io::read_bytes(db_regs, 0, &mut bytes);
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let db = CmdDb::parse(bytes).map_err(|_| failed(ENODEV))?;
+        let drv = self.env.map(pw.rsc.drv.0, pw.rsc.drv.1)?;
+        let rsc = Rsc::probe(drv, pw.rsc.tcs_offset).with_active_tcs(pw.rsc.active_tcs);
+        let qmp = match &pw.qmp {
+            Some(q) => {
+                let kick = self.kick(&q.kick)?;
+                let msgram = self.env.map(q.msgram.0, q.msgram.1)?;
+                Some(
+                    Qmp::open(msgram, kick, delay)
+                        .await
+                        .map_err(|_| failed(ENODEV))?,
+                )
+            }
+            None => None,
+        };
+        let rails: &'static [&'static str] = Box::leak(pw.rails.clone().into_boxed_slice());
+        Ok(WpssPower::new(Rpmh::new(db, rsc), qmp, rails))
+    }
+
+    /// `qcom_pas_handover` once the remote raised `handover` after a
+    /// start that left the proxy votes cast (the crash monitor runs this
+    /// every pass; Linux runs it from the handover interrupt).
+    pub async fn service_handover(&mut self) {
+        if !self.proxy_held {
+            return;
+        }
+        let handed = matches!(&self.rproc, Some(Rproc::Pas { p, .. }) if p.q6.handover_issued());
+        if handed {
+            if let Some(w) = &self.wpss {
+                let _ = w.proxy_disable(self.env.delay()).await;
+            }
+            self.proxy_held = false;
+        }
+    }
+
+    /// Whether the PAS proxy votes are still held for the remote.
+    pub fn proxy_held(&self) -> bool {
+        self.proxy_held
     }
 
     fn kick(&mut self, k: &KickDt) -> Result<DtKick<&'static E::Regs>, AhbError> {
@@ -628,6 +700,9 @@ impl<E: AhbEnv> AhbBringUp for LiveAhb<E> {
                 }
             }
         };
+        if let (Some(pw), true) = (&plat.power, self.wpss.is_none()) {
+            self.wpss = Some(self.wpss_power(pw).await?);
+        }
         let q6 = match &rproc {
             Rproc::Wcss { w, .. } => w.q6,
             Rproc::Pas { p, .. } => p.q6,
@@ -655,6 +730,8 @@ impl<E: AhbEnv> AhbBringUp for LiveAhb<E> {
             edges,
             smem,
             rproc,
+            wpss,
+            proxy_held,
             ..
         } = self;
         let (env, edges) = (&*env, &*edges);
@@ -691,17 +768,43 @@ impl<E: AhbEnv> AhbBringUp for LiveAhb<E> {
                 w.start(rs, delay, &mut pump).await
             }
             Rproc::Pas { p: pas, scm, alloc } => {
-                pas.start(
-                    scm,
-                    alloc,
-                    plat.firmware,
-                    &mdt,
-                    &segs,
-                    &mut co,
-                    delay,
-                    &mut pump,
-                )
-                .await
+                // qcom_pas_start: load-state on, proxy domains at their
+                // highest corner, xo; then the PAS load/auth/reset.
+                if let Some(w) = wpss.as_ref() {
+                    w.start(delay).await.map_err(|_| failed(EIO))?;
+                }
+                let r = pas
+                    .start(
+                        scm,
+                        alloc,
+                        plat.firmware,
+                        &mdt,
+                        &segs,
+                        &mut co,
+                        delay,
+                        &mut pump,
+                    )
+                    .await;
+                if let Some(w) = wpss.as_ref() {
+                    let handed = pas.q6.handover_issued();
+                    match &r {
+                        // disable_proxy_pds (unless handover already
+                        // released them) + disable_irqs (load-state off).
+                        Err(_) => {
+                            if !handed {
+                                let _ = w.proxy_disable(delay).await;
+                            }
+                            let _ = w.load_state(delay, false).await;
+                            *proxy_held = false;
+                        }
+                        Ok(()) if handed => {
+                            let _ = w.proxy_disable(delay).await;
+                            *proxy_held = false;
+                        }
+                        Ok(()) => *proxy_held = true,
+                    }
+                }
+                r
             }
         };
         r.map_err(|e| rproc_errno(&e))
@@ -741,6 +844,8 @@ impl<E: AhbEnv> AhbBringUp for LiveAhb<E> {
             edges,
             smem,
             rproc,
+            wpss,
+            proxy_held,
             ..
         } = self;
         let (env, edges) = (&*env, &*edges);
@@ -776,6 +881,15 @@ impl<E: AhbEnv> AhbBringUp for LiveAhb<E> {
             }
             Rproc::Pas { p: pas, scm, .. } => {
                 let _ = pas.stop(scm, &stop, delay, &mut pump).await;
+                // qcom_pas_stop: qcom_q6v5_unprepare (load-state off),
+                // then the handover release if it never came.
+                if let Some(w) = wpss.as_ref() {
+                    let _ = w.load_state(delay, false).await;
+                    if *proxy_held {
+                        let _ = w.proxy_disable(delay).await;
+                    }
+                }
+                *proxy_held = false;
             }
         }
     }
@@ -965,7 +1079,9 @@ async fn crash_monitor_task(
     shared: Arc<NarfAhbShared>,
 ) {
     loop {
-        if let Some(crash) = live.monitor_tick(&p) {
+        let crash = live.monitor_tick(&p);
+        live.service_handover().await;
+        if let Some(crash) = crash {
             log(format_args!(
                 "{}: remote crashed: {:?}",
                 p.res.node.path, crash
