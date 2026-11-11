@@ -103,7 +103,8 @@ forgets the entry instead of inserting one. Every generation is a fresh tick
 from one never-repeating source, so a forgotten inode's next generation
 differs from every value a page was retained under; a reopened or recycled
 inode misses, never aliases. (The anchor table used to be pruned only at
-power-of-two sizes and the generation table never.) Shrinking truncate publishes EOF and
+power-of-two sizes and the generation table never;
+`smoke_btrfs_inode_tables_track_open_files`.) Shrinking truncate publishes EOF and
 revokes mappings under the operation lock before retiring extents, and revokes
 again afterwards (`truncate_pagecache`), since a fault past its EOF check is
 excluded by no lock; a failed revoke restores the cached inode there.
@@ -155,7 +156,9 @@ host harness). An 8,192-entry ceiling also bounds the least-recently-used
 eviction scan. The cache registers the `btrfs-extent-data` shrinker
 (`narf_memory::reclaim::register_shrinker`) on its first fill; under memory
 pressure kswapd's `try_to_free` evicts least recently used entries up to its
-page share, as Linux page reclaim drops clean page-cache folios.
+page share, as Linux page reclaim drops clean page-cache folios
+(`smoke_btrfs_extent_data_cache_bytes_and_shrink`,
+`smoke_btrfs_cache_budgets_follow_ram`).
 
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
@@ -243,7 +246,8 @@ the young one, and when the young one would outgrow half the budget the old
 one is dropped and the young one takes its place. Every filesystem's node cache is registered
 with one `btrfs-nodes` shrinker at mount; under pressure it drops the old
 generation first and then young nodes, up to its page share, as Linux page
-reclaim releases the btree inode's extent buffers (`btree_release_folio`). A node in
+reclaim releases the btree inode's extent buffers (`btree_release_folio`;
+`smoke_btrfs_node_cache_bytes_and_shrink`, `smoke_btrfs_node_cache_reclaimable`). A node in
 use survives any number of other fills
 (`smoke_btrfs_node_cache_keeps_what_is_used`). It used to be emptied
 outright when it filled, so one walk over more nodes than the bound left

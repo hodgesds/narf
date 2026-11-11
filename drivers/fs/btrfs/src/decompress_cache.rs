@@ -351,6 +351,20 @@ pub fn stats() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// Heap charged for every entry, and the entry count (tests).
+#[cfg(feature = "kernel-test")]
+pub fn cached_total() -> (usize, usize) {
+    let cache = CACHE.lock();
+    (cache.bytes, cache.entries.len())
+}
+
+/// Drive the shrinker as kswapd would: `(pages counted, pages freed)`
+/// (tests).
+#[cfg(feature = "kernel-test")]
+pub fn __test_shrinker(nr: usize) -> (usize, usize) {
+    (shrinker_count(), shrinker_scan(nr))
+}
+
 /// Cached bytes for `vol` (tests).
 #[cfg(feature = "kernel-test")]
 pub fn cached_bytes_for(vol: &VolumeRef) -> usize {

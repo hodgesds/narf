@@ -395,6 +395,72 @@ pub(crate) fn __test_node_cache_keeps_what_is_used() -> bool {
     NodeCache::__test_keeps_what_is_used()
 }
 
+/// Test-only: fill a node cache with a 16-node budget far past it and
+/// report whether it stayed within the budget in bytes, then whether a
+/// shrink releases no more than asked, the old generation before the young
+/// one, and everything when asked for everything.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_node_cache_bytes_and_shrink() -> Result<(), &'static str> {
+    const NODESIZE: usize = 16 * 1024;
+    let charge = NODESIZE + NODE_ENTRY_OVERHEAD;
+    let budget = 16 * charge;
+    let mut cache = NodeCache::new(budget);
+    for logical in 0..1000u64 {
+        let _ = cache.insert(logical * NODESIZE as u64, Arc::new(vec![0u8; NODESIZE]));
+        if cache.bytes() > budget {
+            return Err("node cache outgrew its byte budget");
+        }
+    }
+    let (old, young) = (cache.old_bytes, cache.young_bytes);
+    if old == 0 || young == 0 {
+        return Err("node cache did not keep two generations");
+    }
+    if cache.shrink(charge - 1) != 0 {
+        return Err("shrink released more than it was asked for");
+    }
+    if cache.shrink(charge) != charge || cache.old_bytes != old - charge {
+        return Err("shrink did not release the old generation first");
+    }
+    let rest = cache.bytes();
+    if cache.shrink(usize::MAX) != rest || cache.bytes() != 0 {
+        return Err("a full shrink left nodes behind");
+    }
+    if !cache.young.is_empty() || !cache.old.is_empty() {
+        return Err("byte count and maps disagree after a shrink");
+    }
+    Ok(())
+}
+
+/// Test-only: the reclaim shrinker sees this filesystem's node cache, and
+/// `(bytes cached, budget)` of it.
+#[cfg(feature = "kernel-test")]
+impl<B: BlockDevice> VolCore<B> {
+    pub(crate) fn __test_node_cache_bytes(&self) -> (usize, usize) {
+        let cache = self.nodes.lock();
+        (cache.bytes(), cache.budget)
+    }
+
+    pub(crate) fn __test_node_cache_registered(&self) -> bool {
+        NODE_CACHES
+            .lock()
+            .iter()
+            .any(|cache| core::ptr::eq(cache.as_ptr(), Arc::as_ptr(&self.nodes)))
+    }
+
+    /// Entries in the anchor and generation tables.
+    pub(crate) fn __test_inode_table_sizes(&self) -> (usize, usize) {
+        let tables = self.inode_tables.lock();
+        (tables.anchors.len(), tables.generations.values.len())
+    }
+}
+
+/// Test-only: drive the node-cache shrinker as kswapd would.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_node_shrinker(nr: usize) -> (usize, usize) {
+    let count = node_shrinker_count();
+    (count, node_shrinker_scan(nr))
+}
+
 /// Mutable volume metadata guarded by one lock (never held across I/O).
 #[derive(Debug)]
 struct VolState {
