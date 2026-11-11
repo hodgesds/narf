@@ -27,6 +27,7 @@ pub mod allocator;
 pub(crate) mod backref;
 pub(crate) mod block_group;
 pub mod btree;
+pub(crate) mod cache_budget;
 pub mod checksum;
 pub mod chunk;
 pub mod crash_check;

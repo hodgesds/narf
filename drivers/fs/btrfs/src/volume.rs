@@ -124,18 +124,26 @@ impl Drop for VolumeIo {
 /// happened since, so a racing write costs a skipped fill rather than a wrong
 /// answer.
 ///
-/// The cache is bounded in two generations. Every fill and every hit lands
-/// in `young`; when `young` holds half the bound, `old` is dropped and
-/// `young` takes its place. A node used since the last turn-over therefore
-/// survives the next one, and only nodes nothing has touched for a whole
-/// generation go. (It used to be one map emptied when it reached the bound,
-/// so a walk over more nodes than the bound — every extent item of a large
-/// fragmented file, say — left nothing behind for the next one, which read
-/// it all from the device again, upper levels included.)
-#[derive(Debug, Default)]
+/// The cache is bounded in bytes, in two generations. Every fill and every
+/// hit lands in `young`; when `young` would grow past half the budget, `old`
+/// is dropped and `young` takes its place. A node used since the last
+/// turn-over therefore survives the next one, and only nodes nothing has
+/// touched for a whole generation go. (It used to be one map emptied when it
+/// reached the bound, so a walk over more nodes than the bound — every extent
+/// item of a large fragmented file, say — left nothing behind for the next
+/// one, which read it all from the device again, upper levels included.)
+///
+/// The budget is [`crate::cache_budget::NODE_CACHE`] of RAM; it used to be a
+/// fixed 4,096 nodes, 64 MiB at 16 KiB whatever the machine.
+#[derive(Debug)]
 struct NodeCache {
     young: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
     old: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
+    /// Bytes charged for `young` and `old` ([`node_charge`]).
+    young_bytes: usize,
+    old_bytes: usize,
+    /// Most bytes both generations may hold together.
+    budget: usize,
     epoch: u64,
 }
 
@@ -144,14 +152,26 @@ struct NodeCache {
 /// the cache's nodes.
 type RetiredNodes = BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>;
 
-/// Cached nodes. At a 16 KiB nodesize this bounds the cache at 4 MiB in
-/// kernel-test and 64 MiB in production, comfortably holding the working set a
-/// commit revisits while staying a fixed, predictable cost.
-const NODE_CACHE_MAX: usize = if cfg!(feature = "kernel-test") {
-    256
-} else {
-    4096
-};
+/// Bookkeeping a cached node costs on top of its bytes: the `Arc` header and
+/// `Vec` triple, and its share of the map's B-tree node.
+const NODE_ENTRY_OVERHEAD: usize = 64;
+
+/// What caching `node` costs the heap.
+fn node_charge(node: &Arc<alloc::vec::Vec<u8>>) -> usize {
+    node.capacity() + NODE_ENTRY_OVERHEAD
+}
+
+/// The node cache budget of a filesystem mounted now. Kernel tests keep the
+/// 4 MiB they always had, so a test still turns the cache over and the
+/// many fixtures a run mounts stay small.
+fn node_cache_budget() -> usize {
+    let budget = crate::cache_budget::NODE_CACHE.of(crate::cache_budget::total_ram_bytes());
+    if cfg!(feature = "kernel-test") {
+        budget.min(4 * crate::cache_budget::MIB)
+    } else {
+        budget
+    }
+}
 
 /// Commits allowed to stage before the superblock is forced out.
 ///
@@ -175,6 +195,23 @@ const NODE_CACHE_MAX: usize = if cfg!(feature = "kernel-test") {
 const MAX_STAGED_COMMITS: usize = 1;
 
 impl NodeCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            young: BTreeMap::new(),
+            old: BTreeMap::new(),
+            young_bytes: 0,
+            old_bytes: 0,
+            budget,
+            epoch: 0,
+        }
+    }
+
+    /// Bytes both generations hold.
+    #[cfg(feature = "kernel-test")]
+    fn bytes(&self) -> usize {
+        self.young_bytes + self.old_bytes
+    }
+
     /// Drop `logical` and advance the epoch, so any fill already in flight for
     /// it (or for anything else) declines to publish.
     fn invalidate(&mut self, logical: u64) {
@@ -188,6 +225,7 @@ impl NodeCache {
             return Some((hit.clone(), None));
         }
         let hit = self.old.remove(&logical)?;
+        self.old_bytes -= node_charge(&hit);
         let retired = self.insert(logical, hit.clone());
         Some((hit, retired))
     }
@@ -195,18 +233,36 @@ impl NodeCache {
     /// Cache `node` at `logical`. Returns the generation this retired, if
     /// it turned the cache over.
     fn insert(&mut self, logical: u64, node: Arc<alloc::vec::Vec<u8>>) -> Option<RetiredNodes> {
-        self.old.remove(&logical);
-        let retired = (self.young.len() >= NODE_CACHE_MAX / 2
-            && !self.young.contains_key(&logical))
-        .then(|| core::mem::replace(&mut self.old, core::mem::take(&mut self.young)));
+        if let Some(stale) = self.old.remove(&logical) {
+            self.old_bytes -= node_charge(&stale);
+        }
+        let charge = node_charge(&node);
+        if let Some(slot) = self.young.get_mut(&logical) {
+            let replaced = core::mem::replace(slot, node);
+            self.young_bytes = self.young_bytes - node_charge(&replaced) + charge;
+            return None;
+        }
+        // Turn over before the young generation outgrows half the budget, so
+        // the two together never exceed it (a node bigger than half the
+        // budget, which no floor allows, would still be kept alone).
+        let retired =
+            (!self.young.is_empty() && self.young_bytes + charge > self.budget / 2).then(|| {
+                self.old_bytes = core::mem::take(&mut self.young_bytes);
+                core::mem::replace(&mut self.old, core::mem::take(&mut self.young))
+            });
         self.young.insert(logical, node);
+        self.young_bytes += charge;
         retired
     }
 
     /// Drop the node cached at `logical`, if any.
     fn remove(&mut self, logical: u64) {
-        self.young.remove(&logical);
-        self.old.remove(&logical);
+        if let Some(node) = self.young.remove(&logical) {
+            self.young_bytes -= node_charge(&node);
+        }
+        if let Some(node) = self.old.remove(&logical) {
+            self.old_bytes -= node_charge(&node);
+        }
     }
 
     /// Addresses of the cached nodes in `[from, end)`.
@@ -219,22 +275,26 @@ impl NodeCache {
     }
 
     /// Test-only: whether a node read once per insert survives twice the
-    /// bound of other inserts, and whether the cache stays within its bound.
+    /// budget of other inserts, and whether the cache stays within its
+    /// budget in bytes.
     #[cfg(feature = "kernel-test")]
     fn __test_keeps_what_is_used() -> bool {
-        let mut cache = NodeCache::default();
-        let node = || Arc::new(alloc::vec::Vec::new());
+        const NODESIZE: usize = 16 * 1024;
+        const NODES: usize = 64;
+        let budget = NODES * (NODESIZE + NODE_ENTRY_OVERHEAD);
+        let mut cache = NodeCache::new(budget);
+        let node = || Arc::new(alloc::vec![0u8; NODESIZE]);
         let hot = 7u64;
         let _ = cache.insert(hot, node());
-        for cold in 0..2 * NODE_CACHE_MAX as u64 {
+        for cold in 0..2 * NODES as u64 {
             let _ = cache.insert(1000 + cold, node());
-            if cache.get(hot).is_none() || cache.young.len() + cache.old.len() > NODE_CACHE_MAX {
+            if cache.get(hot).is_none() || cache.bytes() > budget {
                 return false;
             }
         }
         // What nothing used for a generation is gone; what was just put in
         // is not.
-        let last = 1000 + 2 * NODE_CACHE_MAX as u64 - 1;
+        let last = 1000 + 2 * NODES as u64 - 1;
         cache.get(1000).is_none() && cache.get(last).is_some() && {
             cache.remove(last);
             cache.invalidate(hot);
@@ -2230,7 +2290,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             reader_roots: IrqSafeSpinLock::new(BTreeMap::new()),
             reader_epochs: IrqSafeSpinLock::new(ReaderEpochs::default()),
             evictions: core::sync::atomic::AtomicU64::new(0),
-            nodes: IrqSafeSpinLock::new(NodeCache::default()),
+            nodes: IrqSafeSpinLock::new(NodeCache::new(node_cache_budget())),
             aborted: core::sync::atomic::AtomicBool::new(false),
             refused_after_abort: core::sync::atomic::AtomicU64::new(0),
             quota_override: core::sync::atomic::AtomicBool::new(false),

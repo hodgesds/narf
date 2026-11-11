@@ -130,7 +130,7 @@ instead of decoding and re-tiling its items (`write::patch_leaf`,
 `smoke_btrfs_patch_leaf_matches_retile`).
 
 Uncompressed reads covered entirely by valid data checksums retain windows up to
-128 KiB in the shared 32 MiB extent cache. Keys include shared-core identity,
+128 KiB in the shared extent cache. Keys include shared-core identity,
 logical byte range, compression tag and file-extent generation. Reads never
 widen their requested window to fill the cache. Logical writes invalidate
 overlapping entries before and after I/O, and a fill crossing a write epoch
@@ -139,8 +139,12 @@ uncompressed cache. The maximum cached disk span also bounds invalidation's
 backward scan; it is enforced at insertion for both entry kinds.
 Missing-checksum sectors (including pending writes before commit) remain
 readable through the existing policy but never populate verified windows.
-An 8,192-entry ceiling bounds bookkeeping for tiny ranges as well as payload
-bytes.
+The cache is bounded in bytes of heap — each entry's buffer capacity plus
+128 bytes of bookkeeping — at 1/128 of RAM, never under 4 MiB nor over
+128 MiB (`cache_budget::DATA_CACHE`: 32 MiB at 4 GiB of RAM, 128 MiB from
+16 GiB up; 4 GiB is assumed where no frame allocator reports RAM, as in the
+host harness). An 8,192-entry ceiling also bounds the least-recently-used
+eviction scan.
 
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
@@ -218,9 +222,14 @@ trees, the more leaves the records of one commit's blocks reach), since
 rejoining leaves of a subvolume tree means COWing a sibling that a snapshot
 may share. The on-disk format is unchanged.
 
-The node cache (4,096 nodes, 64 MiB at 16 KiB) is bounded in two
-generations: fills and hits go to the young one, and when it holds half the
-bound the old one is dropped and the young one takes its place. A node in
+The node cache of each mounted filesystem is bounded in bytes of heap — a
+node's buffer plus 64 bytes of bookkeeping — at 1/128 of RAM, never under
+4 MiB nor over 256 MiB (`cache_budget::NODE_CACHE`: 32 MiB, 2,048 16 KiB
+nodes, at 4 GiB of RAM; 256 MiB, 16,384 nodes, from 32 GiB up; kernel tests
+cap it at 4 MiB). It used to be a fixed 4,096 nodes, 64 MiB at 16 KiB,
+whatever the machine. It is kept in two generations: fills and hits go to
+the young one, and when the young one would outgrow half the budget the old
+one is dropped and the young one takes its place. A node in
 use survives any number of other fills
 (`smoke_btrfs_node_cache_keeps_what_is_used`). It used to be emptied
 outright when it filled, so one walk over more nodes than the bound left
