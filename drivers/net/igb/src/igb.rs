@@ -1594,7 +1594,7 @@ impl TxRingCursor {
     fn stalled(&self, now: u64, timeout: u64) -> bool {
         self.posted_at
             .iter()
-            .any(|&posted| posted != 0 && now.wrapping_sub(posted) > timeout)
+            .any(|&posted| posted != 0 && now.saturating_sub(posted) > timeout)
     }
 
     fn ticket_was_reused(&self, ticket: TxTicket) -> bool {

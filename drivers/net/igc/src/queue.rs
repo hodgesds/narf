@@ -550,12 +550,18 @@ impl Queue {
         self.reclaim_locked(&mut self.tx.lock())
     }
 
+    /// Linux `dev_watchdog`: `time_after(jiffies, trans_start + timeout)` is a
+    /// signed comparison, so a transmit stamped after the watchdog sampled the
+    /// clock is young, not stalled. `now` is read before this takes the TX
+    /// lock; a sender that held the lock meanwhile stamps its frame later than
+    /// `now`, and an unsigned difference turned that into a 2^64-cycle stall
+    /// and a full controller reset in the middle of a busy transmit.
     pub(crate) fn stalled(&self, now: u64, timeout: u64) -> bool {
         self.tx
             .lock()
             .pending
             .front()
-            .is_some_and(|p| now.wrapping_sub(p.since) > timeout)
+            .is_some_and(|p| now.saturating_sub(p.since) > timeout)
     }
 
     pub(crate) fn flush(&self, r: &impl Registers, q: usize) {

@@ -1160,6 +1160,43 @@ fn smoke_igc_tx_owned_until_final_completion() -> TestResult {
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_tx_owned_until_final_completion);
 
+fn smoke_igc_tx_watchdog_ignores_frames_posted_after_its_clock_sample() -> TestResult {
+    // Physical I225 under load: q0 held one two-descriptor frame whose DD was
+    // already set, head == tail, yet the watchdog declared a 5 s stall and
+    // reset the controller. Its clock sample predated the frame's timestamp.
+    let q = Queue::new().unwrap();
+    let m = Model::new();
+    let before = narf_time::now_cycles();
+    check!(
+        q.post(&m, 0, dma_frame(&tcp4(0)), TxMeta::plain(), 1500)
+            .is_ok(),
+        "TX enqueue failed"
+    );
+    let timeout = narf_time::ns_to_cycles(5_000_000_000);
+    check!(
+        !q.stalled(before, timeout) && !q.stalled(0, timeout),
+        "a frame posted after the watchdog's clock sample was reported stalled"
+    );
+    check!(
+        !q.stalled(narf_time::now_cycles(), timeout),
+        "a fresh frame was reported stalled"
+    );
+    check!(
+        q.stalled(
+            narf_time::now_cycles()
+                .saturating_add(timeout)
+                .saturating_add(1),
+            timeout
+        ),
+        "a frame pending past the timeout was not reported stalled"
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_tx_watchdog_ignores_frames_posted_after_its_clock_sample
+);
+
 fn smoke_igc_tx_ring_full_and_wrap() -> TestResult {
     let q = Queue::new().unwrap();
     let m = Model::new();

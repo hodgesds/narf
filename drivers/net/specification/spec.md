@@ -200,6 +200,11 @@ writeback is disabled: terminal descriptor DD remains the completion authority.
 Advanced one-buffer RX programs a 2048-byte packet buffer, 256-byte header
 size and SRRCTL drop enable at bit31, with reserved bit28 clear.
 
+TX watchdogs (igc, igb, ixgbe, e1000, forcedeth, r8169) compare ages as
+Linux `time_after` does: a frame stamped after the watchdog sampled the clock
+has age zero. The sample is taken before the queue lock, so a concurrent
+sender's stamp can be the later of the two.
+
 IGC completion writeback must progress for a single packet with hardware
 interrupt timers unavailable. TX uses WTHRESH`0` with RS on each packet's
 terminal descriptor; RX uses WTHRESH`1` (zero is not an immediate-writeback
