@@ -34,6 +34,9 @@ pub struct Input<'a> {
     pub nodesize: u32,
     pub root_subvol: &'a str,
     pub others: &'a [&'a str],
+    /// Remount each image under the default profile
+    /// ([`crate::narf::mount_default`]) instead of the `root-rw` root path.
+    pub default_profile: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -280,8 +283,16 @@ fn narf_verify(
     write_after: bool,
 ) -> Result<(), String> {
     let dev = Arc::new(RecDev::open(img, inp.lba, inp.fsid, inp.nodesize));
-    crate::narf::register_root(dev.clone(), &inp.fsid)?;
-    let views = crate::narf::mount_root_rw(&inp.fsid, inp.root_subvol, inp.others)?;
+    let views = if inp.default_profile {
+        vec![crate::narf::mount_default(
+            dev.clone(),
+            &inp.fsid,
+            inp.root_subvol,
+        )?]
+    } else {
+        crate::narf::register_root(dev.clone(), &inp.fsid)?;
+        crate::narf::mount_root_rw(&inp.fsid, inp.root_subvol, inp.others)?
+    };
     let mut got = Vec::new();
     for v in &views {
         got.push(crate::narf::walk(&v.root())?.0);
