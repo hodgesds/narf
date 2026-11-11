@@ -271,6 +271,20 @@ impl FakeAp {
         Ok(self)
     }
 
+    /// Turn a `wpa3_sae` AP into a WPA3-Personal transition-mode one
+    /// (hostapd `wpa_key_mgmt=WPA-PSK SAE`, `ieee80211w=1`): the RSNE lists
+    /// PSK then SAE, MFPC without MFPR. Only an SAE station is served; it
+    /// still has to negotiate PMF (MFPC on both sides).
+    pub fn with_sae_transition(mut self) -> Result<Self, ApError> {
+        let profile = self.rsn.as_mut().ok_or(ApError::Configuration)?;
+        if self.phase != ApPhase::Authentication || profile.sae.is_none() {
+            return Err(ApError::Configuration);
+        }
+        profile.akms = vec![narf_wireless::rsn::AKM_PSK, narf_wireless::rsn::AKM_SAE];
+        profile.caps = narf_wireless::rsn::RSN_CAP_MFP_CAPABLE;
+        Ok(self)
+    }
+
     /// Select the IGTK, its key ID (4 or 5) and the IPN message 3 reports.
     pub fn with_igtk(mut self, igtk: [u8; 16], key_id: u16, ipn: u64) -> Result<Self, ApError> {
         if self.mld.is_some() && self.phase != ApPhase::Authentication {
