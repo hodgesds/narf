@@ -258,6 +258,101 @@ impl BuddyZoneLock {
 static ZONES: [BuddyZoneLock; MAX_NUMA_NODES] = [const { BuddyZoneLock::new() }; MAX_NUMA_NODES];
 static REBALANCE_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
+/// One hold of a node's zone lock on an allocation or free path.
+///
+/// In the kernel-test build the guard measures what its hold did — blocks
+/// freed, blocks allocated and buddy-lookup steps, read from the zone's own
+/// counters under the lock — and folds that into per-node maxima on release, so
+/// the scale tests can state how much work one interrupts-off section of the
+/// allocator is allowed to do. Everywhere else it is the bare lock guard.
+struct ZoneGuard {
+    zone: narf_lib::sync::IrqSafeSpinLockGuard<'static, BuddyZone>,
+    #[cfg(feature = "kernel-test")]
+    node: usize,
+    #[cfg(feature = "kernel-test")]
+    entry: buddy::ZoneOpStats,
+}
+
+impl core::ops::Deref for ZoneGuard {
+    type Target = BuddyZone;
+    #[inline]
+    fn deref(&self) -> &BuddyZone {
+        &self.zone
+    }
+}
+
+impl core::ops::DerefMut for ZoneGuard {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut BuddyZone {
+        &mut self.zone
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+impl Drop for ZoneGuard {
+    fn drop(&mut self) {
+        // Runs before the field drop that releases the lock, so the deltas
+        // belong to this hold alone.
+        let now = self.zone.op_stats();
+        let stats = &ZONE_HOLD_STATS[self.node];
+        stats.acquisitions.fetch_add(1, Ordering::Relaxed);
+        stats
+            .max_frees
+            .fetch_max(now.frees - self.entry.frees, Ordering::Relaxed);
+        stats
+            .max_allocs
+            .fetch_max(now.allocs - self.entry.allocs, Ordering::Relaxed);
+        stats
+            .max_find_steps
+            .fetch_max(now.find_steps - self.entry.find_steps, Ordering::Relaxed);
+    }
+}
+
+/// Take `node`'s zone lock for an allocation or free.
+#[inline]
+fn lock_zone(node: usize) -> ZoneGuard {
+    let zone = ZONES[node].0.lock();
+    ZoneGuard {
+        #[cfg(feature = "kernel-test")]
+        entry: zone.op_stats(),
+        #[cfg(feature = "kernel-test")]
+        node,
+        zone,
+    }
+}
+
+/// Per-node record of zone-lock holds taken through [`lock_zone`].
+#[cfg(feature = "kernel-test")]
+struct ZoneHoldStats {
+    acquisitions: AtomicU64,
+    max_frees: AtomicU64,
+    max_allocs: AtomicU64,
+    max_find_steps: AtomicU64,
+}
+
+#[cfg(feature = "kernel-test")]
+static ZONE_HOLD_STATS: [ZoneHoldStats; MAX_NUMA_NODES] = [const {
+    ZoneHoldStats {
+        acquisitions: AtomicU64::new(0),
+        max_frees: AtomicU64::new(0),
+        max_allocs: AtomicU64::new(0),
+        max_find_steps: AtomicU64::new(0),
+    }
+}; MAX_NUMA_NODES];
+
+/// Order-0 frames one per-CPU cache refill or spill moves, from the size of
+/// the zone it fronts: about 0.025% of the zone, at most 256 KiB, clamped to a
+/// `2^n - 1` value (Linux `zone_batchsize`). 63 for any zone of 1 GiB or more.
+#[cfg(feature = "kernel-test")]
+fn zone_cache_batch(managed_frames: usize) -> usize {
+    let batch = (managed_frames >> 12).min((256usize << 10) / PAGE_SIZE as usize);
+    if batch <= 1 {
+        return 1;
+    }
+    let scaled = batch + batch / 2;
+    (1usize << (usize::BITS - 1 - scaled.leading_zeros())) - 1
+}
+
 const FRAME_CACHE_CAPACITY: usize = 16;
 const FRAME_CACHE_BATCH: usize = 8;
 // Small kernel buffers above the slab's 4 KiB limit repeatedly allocate and
@@ -1398,7 +1493,7 @@ fn frame_cache_bypassed(node: usize) -> bool {
 fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
     let node = node.min(MAX_NUMA_NODES - 1);
     if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
-        let frame = alloc_below_ceiling(&mut ZONES[node].0.lock())?;
+        let frame = alloc_below_ceiling(&mut lock_zone(node))?;
         account_allocated_frames(node, 1);
         return Some(frame);
     }
@@ -1410,7 +1505,7 @@ fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
     // newly cached frame.
     if frame_cache_bypassed(node) {
         drop(cache);
-        let frame = alloc_below_ceiling(&mut ZONES[node].0.lock())?;
+        let frame = alloc_below_ceiling(&mut lock_zone(node))?;
         account_allocated_frames(node, 1);
         return Some(frame);
     }
@@ -1428,7 +1523,7 @@ fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
 
     #[cfg(feature = "kernel-test")]
     FRAME_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-    let mut zone = ZONES[node].0.lock();
+    let mut zone = lock_zone(node);
     let first = alloc_below_ceiling(&mut zone)?;
     for _ in 1..FRAME_CACHE_BATCH {
         let Some(extra) = alloc_below_ceiling(&mut zone) else {
@@ -1462,7 +1557,7 @@ fn free_order0_to_cache(node: usize, frame: u64) -> bool {
     let local = &mut cache.nodes[node];
     buddy::audit_cached_free(frame);
     if local.len == FRAME_CACHE_CAPACITY {
-        let mut zone = ZONES[node].0.lock();
+        let mut zone = lock_zone(node);
         for _ in 0..FRAME_CACHE_BATCH {
             local.len -= 1;
             zone.free_cached(local.frames[local.len], 0);
@@ -1519,7 +1614,7 @@ fn free_pair_to_cache(node: usize, frame: u64) -> bool {
     buddy::audit_cached_free(frame);
     buddy::audit_cached_free(frame + 1);
     if local.len == PAIR_CACHE_CAPACITY {
-        let mut zone = ZONES[node].0.lock();
+        let mut zone = lock_zone(node);
         for _ in 0..PAIR_CACHE_BATCH {
             local.len -= 1;
             zone.free_cached(local.frames[local.len], 1);
@@ -1538,7 +1633,7 @@ fn drain_cpu_node_cache(cache: &mut CpuFrameCache, node: usize) {
     if cache.nodes[node].len == 0 && cache.pairs[node].len == 0 {
         return;
     }
-    let mut zone = ZONES[node].0.lock();
+    let mut zone = lock_zone(node);
     let local = &mut cache.nodes[node];
     let drained = local.len;
     while local.len != 0 {
@@ -1570,7 +1665,7 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
     }
     let node = node.min(MAX_NUMA_NODES - 1);
     if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
-        let mut zone = ZONES[node].0.lock();
+        let mut zone = lock_zone(node);
         for &frame in frames {
             zone.free(frame, 0);
         }
@@ -1585,7 +1680,7 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
     // check. Match the scalar path by publishing directly to the zone.
     if frame_cache_bypassed(node) {
         drop(cache);
-        let mut zone = ZONES[node].0.lock();
+        let mut zone = lock_zone(node);
         for &frame in frames {
             zone.free(frame, 0);
         }
@@ -1616,7 +1711,7 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
     if spill_len != 0 {
         // Keep `cache` held until every removed cached frame is visible in the
         // zone. See the drain/hot-remove exclusion argument above.
-        let mut zone = ZONES[node].0.lock();
+        let mut zone = lock_zone(node);
         for &frame in &spills[..spill_len] {
             zone.free_cached(frame, 0);
         }
@@ -1639,7 +1734,7 @@ fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone)
     let drain = &FRAME_CACHE_DRAIN[node];
     if drain.held_by_this_cpu() {
         debug_assert!(drain.bypass.load(Ordering::Acquire));
-        return f(&mut ZONES[node].0.lock());
+        return f(&mut lock_zone(node));
     }
     let _drain_guard = drain.lock();
     drain.bypass.store(true, Ordering::Release);
@@ -1647,7 +1742,7 @@ fn with_node_frame_caches_drained<R>(node: usize, f: impl FnOnce(&mut BuddyZone)
         let mut cache = cpu_cache.0.lock();
         drain_cpu_node_cache(&mut cache, node);
     }
-    let result = f(&mut ZONES[node].0.lock());
+    let result = f(&mut lock_zone(node));
     drain.bypass.store(false, Ordering::Release);
     result
 }
@@ -2015,7 +2110,7 @@ fn alloc_pages_on_inner(
         }
     }
     let first_try = {
-        let mut zone = ZONES[zone_idx].0.lock();
+        let mut zone = lock_zone(zone_idx);
         try_alloc(&mut zone)
     };
     if let Some(no) =
@@ -2039,7 +2134,7 @@ fn alloc_pages_on_inner(
             }
         }
         let first_try = {
-            let mut zone = ZONES[i].0.lock();
+            let mut zone = lock_zone(i);
             try_alloc(&mut zone)
         };
         if let Some(no) =
@@ -2094,7 +2189,7 @@ pub fn alloc_pages_below(order: u8, limit_phys: u64) -> Result<PhysFrame, FrameA
         if node >= MAX_NUMA_NODES {
             break;
         }
-        let first_try = try_alloc(&mut ZONES[node].0.lock());
+        let first_try = try_alloc(&mut lock_zone(node));
         if let Some(no) =
             first_try.or_else(|| with_node_frame_caches_drained(node, |zone| try_alloc(zone)))
         {
@@ -2154,10 +2249,7 @@ pub fn free_pages_ctx(frame: PhysFrame, order: u8, ctx: AllocContext) {
         account_freed_frames(zone_idx, 2);
         return;
     }
-    ZONES[zone_idx]
-        .0
-        .lock()
-        .free_mt(frame_no, order, ctx.migrate_type());
+    lock_zone(zone_idx).free_mt(frame_no, order, ctx.migrate_type());
     account_freed_frames(zone_idx, 1usize << order);
 }
 
@@ -2190,7 +2282,7 @@ pub fn reserve_frame_range(base: PhysAddr, count: u64) -> bool {
     }
     let node = node_for_phys(base.raw());
     let first_frame = base.raw() >> 12;
-    let removed = ZONES[node].0.lock().remove_free_range(first_frame, count);
+    let removed = lock_zone(node).remove_free_range(first_frame, count);
     if removed {
         // Exact-range reservation claims free pages just like allocation.
         // Compaction may publish them as live migration destinations; leaving
@@ -2220,7 +2312,7 @@ pub fn free_movable_range(base: PhysAddr, count: u64) {
     for i in 0..count {
         uncharge_freed_block(PhysAddr::new(base.raw() + i * PAGE_SIZE), PAGE_SIZE);
     }
-    let mut zone = ZONES[node].0.lock();
+    let mut zone = lock_zone(node);
     for i in 0..count {
         zone.free_mt(first_frame + i, 0, buddy::MigrateType::Movable);
     }
@@ -2330,7 +2422,7 @@ fn buddy_return_unreferenced_frame(f: PhysFrame) {
         return;
     };
     if !free_order0_to_cache(zone_idx, frame_no) {
-        ZONES[zone_idx].0.lock().free(frame_no, 0);
+        lock_zone(zone_idx).free(frame_no, 0);
     }
     account_freed_frames(zone_idx, 1);
 }
@@ -4624,6 +4716,464 @@ narf_kernel_test::kernel_test_in!(
     "memory/frame",
     smoke_free_unique_phys_batch_spans_windows_without_leak
 );
+
+/// Scale tests: how much zone-lock traffic and how much work per zone-lock hold
+/// the allocator costs as the machine and the workload grow.
+///
+/// Everything here is a counter read from the allocator's own bookkeeping
+/// (`ZoneOpStats`, `ZONE_HOLD_STATS`), never a clock: the tests assert shapes —
+/// constant work per frame, a bounded hold, one lock acquisition per batch —
+/// that hold on any host speed. A failure carries the measured counters in its
+/// reason, and `scale_counter_report` prints the same counters when the
+/// assertions pass (the memory crate has no console of its own; a harness
+/// reason string is the only output channel a test here has).
+#[cfg(feature = "kernel-test")]
+mod scale_tests {
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::format;
+    use alloc::string::String;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// A zone-lock hold may return at most this many blocks to the buddy.
+    const HOLD_FREE_LIMIT: u64 = FRAME_RETURN_CHUNK as u64;
+    /// Buddy-lookup steps one freed block may cost: one probe per order it can
+    /// coalesce through, with a factor of two of slack.
+    const STEPS_PER_FREE_LIMIT: u64 = 2 * (MAX_ORDER as u64 + 1);
+    /// Buddy-lookup steps one zone-lock hold may cost.
+    const HOLD_STEP_LIMIT: u64 = HOLD_FREE_LIMIT * (MAX_ORDER as u64 + 1);
+
+    const UNMEASURED: u64 = u64::MAX;
+    static LIST_STEPS: [AtomicU64; 2] = [const { AtomicU64::new(UNMEASURED) }; 2];
+    static LARGE_FREE: [[AtomicU64; 4]; 4] =
+        [const { [const { AtomicU64::new(UNMEASURED) }; 4] }; 4];
+    static CHURN: [AtomicU64; 3] = [const { AtomicU64::new(UNMEASURED) }; 3];
+
+    fn fail(reason: String) -> TestResult {
+        TestResult::Fail(Box::leak(reason.into_boxed_str()))
+    }
+
+    /// The node the calling CPU allocates from, provided its frame cache is in
+    /// use (a drain or a hot-plugged range turns caching off for a node).
+    fn scale_node() -> Result<usize, TestResult> {
+        if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
+            return Err(TestResult::Skip("frame caches not published"));
+        }
+        let node = if ALLOC.numa_aware.load(Ordering::Acquire) {
+            current_cpu_node().min(MAX_NUMA_NODES - 1)
+        } else {
+            0
+        };
+        if frame_cache_bypassed(node) {
+            return Err(TestResult::Skip("frame cache bypass is active"));
+        }
+        Ok(node)
+    }
+
+    fn release(frames: &[PhysAddr]) {
+        free_phys_batch(frames);
+    }
+
+    /// Take `count` order-0 frames that all belong to `node`. `None` (with
+    /// everything handed back) when the node cannot supply them.
+    fn take_frames(node: usize, count: usize) -> Option<Vec<PhysAddr>> {
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(count).ok()?;
+        let numa = ALLOC.numa_aware.load(Ordering::Acquire);
+        for _ in 0..count {
+            let Ok(frame) = alloc_pages_on(node, 0) else {
+                release(&frames);
+                return None;
+            };
+            let phys = frame.start_address();
+            if numa && phys_to_node(phys.raw()) != node {
+                free_pages(frame, 0);
+                release(&frames);
+                return None;
+            }
+            frames.push(phys);
+        }
+        Some(frames)
+    }
+
+    /// Leave a quarter of the node's free memory alone: the suite shares it.
+    fn affordable(node: usize, count: usize) -> bool {
+        node_free(node) / 4 >= count
+    }
+
+    fn drain(node: usize) {
+        with_node_frame_caches_drained(node, |_| ());
+    }
+
+    fn op_stats(node: usize) -> buddy::ZoneOpStats {
+        ZONES[node].0.lock().op_stats()
+    }
+
+    fn reset_holds(node: usize) {
+        let stats = &ZONE_HOLD_STATS[node];
+        stats.acquisitions.store(0, Ordering::Relaxed);
+        stats.max_frees.store(0, Ordering::Relaxed);
+        stats.max_allocs.store(0, Ordering::Relaxed);
+        stats.max_find_steps.store(0, Ordering::Relaxed);
+    }
+
+    /// Deterministic Fisher-Yates over a xorshift stream.
+    fn shuffle(frames: &mut [PhysAddr]) {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for i in (1..frames.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            frames.swap(i, (state % (i as u64 + 1)) as usize);
+        }
+    }
+
+    /// Buddy-lookup steps per freed frame with `count / 2` order-0 blocks
+    /// already on the free list: free one frame of every buddy pair (its
+    /// partner is still held, so it cannot coalesce and stays listed), then
+    /// free the partners and count what finding each buddy cost.
+    fn measure_list_steps(node: usize, count: usize) -> Option<u64> {
+        let mut frames = take_frames(node, count)?;
+        frames.sort_unstable();
+        for phys in frames
+            .iter()
+            .filter(|phys| (phys.raw() >> PAGE_SHIFT) & 1 == 0)
+        {
+            free_pages(PhysFrame::new(*phys), 0);
+        }
+        drain(node);
+        let before = op_stats(node);
+        for phys in frames
+            .iter()
+            .filter(|phys| (phys.raw() >> PAGE_SHIFT) & 1 == 1)
+        {
+            free_pages(PhysFrame::new(*phys), 0);
+        }
+        drain(node);
+        let after = op_stats(node);
+        let frees = (after.frees - before.frees).max(1);
+        Some((after.find_steps - before.find_steps) / frees)
+    }
+
+    const LIST_SIZES: [usize; 2] = [4096, 16384];
+
+    fn list_steps(node: usize) -> Option<[u64; 2]> {
+        let mut out = [0u64; 2];
+        for (index, &count) in LIST_SIZES.iter().enumerate() {
+            let cached = LIST_STEPS[index].load(Ordering::Relaxed);
+            out[index] = if cached != UNMEASURED {
+                cached
+            } else {
+                if !affordable(node, count) {
+                    return None;
+                }
+                let steps = measure_list_steps(node, count)?;
+                LIST_STEPS[index].store(steps, Ordering::Relaxed);
+                steps
+            };
+        }
+        Some(out)
+    }
+
+    /// Returning a block to the buddy must cost the same however long the
+    /// free lists are. The soak's interrupts-off lockups sat in
+    /// `BuddyZone::free_inner`, not spinning on a lock: every free searched its
+    /// order's free list for the buddy, so a large free was quadratic.
+    fn scale_buddy_free_cost_is_independent_of_list_length() -> TestResult {
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let Some(steps) = list_steps(node) else {
+            return TestResult::Skip("not enough free order-0 frames on this node");
+        };
+        if steps
+            .iter()
+            .any(|&per_free| per_free > STEPS_PER_FREE_LIMIT)
+        {
+            return fail(format!(
+                "buddy lookup steps per freed frame: {} with {} order-0 blocks listed, {} with {} \
+                 (limit {STEPS_PER_FREE_LIMIT})",
+                steps[0],
+                LIST_SIZES[0] / 2,
+                steps[1],
+                LIST_SIZES[1] / 2,
+            ));
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/frame/scale",
+        scale_buddy_free_cost_is_independent_of_list_length
+    );
+
+    /// `(frames, max blocks freed in one zone-lock hold, max lookup steps in
+    /// one hold, lookup steps per freed block)` for one batched free of `count`
+    /// order-0 frames, in address order or shuffled.
+    fn measure_large_free(node: usize, count: usize, shuffled: bool) -> Option<[u64; 4]> {
+        let mut frames = take_frames(node, count)?;
+        frames.sort_unstable();
+        if shuffled {
+            shuffle(&mut frames);
+        }
+        // Whatever the allocations above left in the caches goes back first,
+        // so the holds measured below are this free's own.
+        drain(node);
+        reset_holds(node);
+        let before = op_stats(node);
+        release(&frames);
+        drain(node);
+        let after = op_stats(node);
+        let holds = &ZONE_HOLD_STATS[node];
+        let frees = (after.frees - before.frees).max(1);
+        Some([
+            count as u64,
+            holds.max_frees.load(Ordering::Relaxed),
+            holds.max_find_steps.load(Ordering::Relaxed),
+            (after.find_steps - before.find_steps) / frees,
+        ])
+    }
+
+    /// 64 MiB, and 1 GiB or as much of it as a quarter of the node's free
+    /// memory allows, each in address order and shuffled.
+    const LARGE_FREE_LABELS: [&str; 4] = [
+        "64 MiB ascending",
+        "64 MiB shuffled",
+        "large ascending",
+        "large shuffled",
+    ];
+
+    fn large_free(node: usize) -> Option<[[u64; 4]; 4]> {
+        const SMALL: usize = (64 << 20) >> PAGE_SHIFT;
+        const LARGE: usize = (1 << 30) >> PAGE_SHIFT;
+        let mut out = [[0u64; 4]; 4];
+        for (index, row) in out.iter_mut().enumerate() {
+            if LARGE_FREE[index][0].load(Ordering::Relaxed) != UNMEASURED {
+                for (slot, cached) in row.iter_mut().zip(&LARGE_FREE[index]) {
+                    *slot = cached.load(Ordering::Relaxed);
+                }
+                continue;
+            }
+            let count = if index < 2 {
+                SMALL
+            } else {
+                LARGE.min(node_free(node) / 4)
+            };
+            if !affordable(node, count) {
+                return None;
+            }
+            *row = measure_large_free(node, count, index % 2 == 1)?;
+            for (cached, value) in LARGE_FREE[index].iter().zip(row.iter()) {
+                cached.store(*value, Ordering::Relaxed);
+            }
+        }
+        Some(out)
+    }
+
+    /// A large region freed in one call — what `munmap` and exit hand to
+    /// `free_phys_batch` — must reach the buddy in bounded pieces: each
+    /// zone-lock hold (interrupts off) returns a bounded number of blocks and
+    /// costs a bounded number of buddy-lookup steps, in either address order.
+    fn scale_large_free_is_bounded_per_zone_lock_hold() -> TestResult {
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let Some(rows) = large_free(node) else {
+            return TestResult::Skip("not enough free order-0 frames on this node");
+        };
+        for (label, row) in LARGE_FREE_LABELS.iter().zip(rows.iter()) {
+            let [frames, max_frees, max_steps, steps_per_free] = *row;
+            if max_frees > HOLD_FREE_LIMIT
+                || max_steps > HOLD_STEP_LIMIT
+                || steps_per_free > STEPS_PER_FREE_LIMIT
+            {
+                return fail(format!(
+                    "{label} free of {frames} frames: one zone-lock hold freed up to {max_frees} \
+                     blocks (limit {HOLD_FREE_LIMIT}) in up to {max_steps} lookup steps (limit \
+                     {HOLD_STEP_LIMIT}); {steps_per_free} steps per freed block (limit \
+                     {STEPS_PER_FREE_LIMIT})"
+                ));
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/frame/scale",
+        scale_large_free_is_bounded_per_zone_lock_hold
+    );
+
+    const CHURN_FRAMES: usize = 1024;
+    const CHURN_ROUNDS: usize = 64;
+
+    /// `(frame operations, zone-lock acquisitions, largest refill)` for a
+    /// fork+exit shaped churn: a process's worth of frames taken one at a time
+    /// and handed back, half the rounds as one batch (exit) and half one frame
+    /// at a time (COW breaks, page-table frees).
+    fn measure_churn(node: usize) -> Option<[u64; 3]> {
+        if CHURN[0].load(Ordering::Relaxed) != UNMEASURED {
+            return Some([
+                CHURN[0].load(Ordering::Relaxed),
+                CHURN[1].load(Ordering::Relaxed),
+                CHURN[2].load(Ordering::Relaxed),
+            ]);
+        }
+        if !affordable(node, CHURN_FRAMES) {
+            return None;
+        }
+        drain(node);
+        reset_holds(node);
+        for round in 0..CHURN_ROUNDS {
+            let frames = take_frames(node, CHURN_FRAMES)?;
+            if round % 2 == 0 {
+                release(&frames);
+            } else {
+                for phys in &frames {
+                    free_pages(PhysFrame::new(*phys), 0);
+                }
+            }
+        }
+        let holds = &ZONE_HOLD_STATS[node];
+        let out = [
+            (2 * CHURN_FRAMES * CHURN_ROUNDS) as u64,
+            holds.acquisitions.load(Ordering::Relaxed),
+            holds.max_allocs.load(Ordering::Relaxed),
+        ];
+        for (cached, value) in CHURN.iter().zip(out.iter()) {
+            cached.store(*value, Ordering::Relaxed);
+        }
+        Some(out)
+    }
+
+    /// Under fork/exit churn a CPU may take its node's zone lock at most once
+    /// per batch of frames, where the batch is sized from the zone the way
+    /// Linux sizes `pcp->batch`. The soak spent 65% of its vCPU samples
+    /// spinning for this lock: a 16-frame cache refilled 8 at a time takes it
+    /// every 8 frames whatever the machine.
+    fn scale_zone_lock_traffic_follows_the_zone_batch() -> TestResult {
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let batch = zone_cache_batch(node_total(node)) as u64;
+        let Some([operations, acquisitions, max_refill]) = measure_churn(node) else {
+            return TestResult::Skip("not enough free order-0 frames on this node");
+        };
+        let limit = operations / batch;
+        if acquisitions > limit {
+            return fail(format!(
+                "{acquisitions} zone-lock acquisitions for {operations} frame allocations and \
+                 frees ({} per 1000); the zone's batch is {batch}, so the limit is {limit} ({} \
+                 per 1000); largest refill {max_refill} frames",
+                acquisitions * 1000 / operations,
+                limit * 1000 / operations,
+            ));
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/frame/scale",
+        scale_zone_lock_traffic_follows_the_zone_batch
+    );
+
+    /// Frames parked in per-CPU caches must stay reachable for a higher-order
+    /// allocation: a drain has to put every one of them back in the buddy,
+    /// coalesced. Split an order-10 block into its 1024 frames, free them one
+    /// at a time (which parks them in the cache), then require the whole block
+    /// to be free in the buddy once the node's caches are bypassed — the same
+    /// step a failed higher-order allocation takes before it retries.
+    fn scale_cached_frames_drain_back_to_a_high_order_block() -> TestResult {
+        const ORDER: u8 = 10;
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let free_before = node_free(node);
+        let Ok(block) = alloc_pages_on(node, ORDER) else {
+            return TestResult::Skip("no order-10 block available");
+        };
+        let base = block.start_address();
+        if ALLOC.numa_aware.load(Ordering::Acquire) && phys_to_node(base.raw()) != node {
+            free_pages(block, ORDER);
+            return TestResult::Skip("order-10 allocation fell back to another node");
+        }
+        let frames = 1u64 << ORDER;
+        for index in 0..frames {
+            free_pages(
+                PhysFrame::new(PhysAddr::new(base.raw() + index * PAGE_SIZE)),
+                0,
+            );
+        }
+        if node_free(node) != free_before {
+            return TestResult::Fail("freeing a split block changed free-page accounting");
+        }
+        let whole = with_node_cache_bypassed(node, || {
+            let reserved = reserve_frame_range(base, frames);
+            if reserved {
+                free_movable_range(base, frames);
+            }
+            reserved
+        });
+        if !whole {
+            return TestResult::Fail(
+                "frames freed into the per-CPU cache did not all return to the buddy on drain",
+            );
+        }
+        if node_free(node) != free_before {
+            return TestResult::Fail("drain and reserve changed free-page accounting");
+        }
+        match alloc_pages_on(node, ORDER) {
+            Ok(again) => free_pages(again, ORDER),
+            Err(_) => return TestResult::Fail("order-10 allocation failed after the drain"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/frame/scale",
+        scale_cached_frames_drain_back_to_a_high_order_block
+    );
+
+    /// Print the counters the tests above assert on. Always a `Skip`: it
+    /// asserts nothing, and a reason string is the only way a test in this
+    /// crate can put numbers in the harness log.
+    fn scale_counter_report() -> TestResult {
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let mut report = format!(
+            "harness counters, node {node} ({} frames, batch {}):",
+            node_total(node),
+            zone_cache_batch(node_total(node)),
+        );
+        if let Some(steps) = list_steps(node) {
+            report.push_str(&format!(
+                " lookup steps/free {} @{} listed, {} @{} listed;",
+                steps[0],
+                LIST_SIZES[0] / 2,
+                steps[1],
+                LIST_SIZES[1] / 2,
+            ));
+        }
+        if let Some(rows) = large_free(node) {
+            for (label, row) in LARGE_FREE_LABELS.iter().zip(rows.iter()) {
+                report.push_str(&format!(
+                    " {label} {} frames: max {} frees/hold, max {} steps/hold, {} steps/free;",
+                    row[0], row[1], row[2], row[3],
+                ));
+            }
+        }
+        if let Some([operations, acquisitions, max_refill]) = measure_churn(node) {
+            report.push_str(&format!(
+                " churn {operations} frame ops: {acquisitions} zone-lock acquisitions ({} per \
+                 1000), largest refill {max_refill}",
+                acquisitions * 1000 / operations,
+            ));
+        }
+        TestResult::Skip(Box::leak(report.into_boxed_str()))
+    }
+    kernel_test_in!("memory/frame/scale", scale_counter_report);
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct FrameStats {
