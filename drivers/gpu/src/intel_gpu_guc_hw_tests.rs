@@ -1801,15 +1801,30 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         // below only if the ring changed it. Other
                         // context-saved registers are not modeled.
                         let rcc_before = d.regs.get(&u64::from(first)).copied();
+                        // User-context submits carry the `job_timeout::prefix`
+                        // prologue ahead of the 0x04000001 ring start (8 words
+                        // on render/compute, 4 on simple-ring engines);
+                        // kernel rings have no prefix, so `off == 1` there
+                        // and every index below is unchanged for them.
+                        let prefix_len = if ring[0] == 0x12480002 {
+                            if ring.len() > 4 && ring[4] == 0x10400002 {
+                                8
+                            } else {
+                                4
+                            }
+                        } else {
+                            0
+                        };
+                        let off = prefix_len + 1;
                         let (svg, used) =
-                            crate::intel_gpu_context::tests::execute(&ring[1..], &mut d.regs);
+                            crate::intel_gpu_context::tests::execute(&ring[off..], &mut d.regs);
                         // A privileged OA configuration job: LRI groups to
                         // source OA/NOA registers, then the owned breadcrumb.
                         let gmd = d.regs.get(&0xd8c).copied().unwrap_or(0);
-                        let oa = ring[1] & 0xff00_0000 == 0x1100_0000
+                        let oa = ring[off] & 0xff00_0000 == 0x1100_0000
                             && crate::intel_gpu_oa::valid_register(
                                 ((gmd >> 22) * 100 + ((gmd >> 14) & 255)) as u16,
-                                ring[2],
+                                ring[off + 1],
                             );
                         // A per-context OA job is likewise LRI-only: its
                         // three pairs name OACTXCONTROL, OAR/OAC_OACONTROL
@@ -1817,8 +1832,9 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                         // 0x1100_0005 (MI_LOAD_REGISTER_IMM for 3 registers)
                         // and the third pair's address is `first` — so it
                         // carries no state commands either.
-                        let per_context =
-                            ring.len() > 6 && ring[1] == 0x1100_0005 && ring[6] == first;
+                        let per_context = ring.len() > off + 5
+                            && ring[off] == 0x1100_0005
+                            && ring[off + 5] == first;
                         if oa || per_context {
                             assert!(svg.is_empty(), "OA jobs carry no state commands");
                         } else if gen12 || ptl {
@@ -1836,8 +1852,8 @@ fn service_contexts(w: &Window, registered: &mut BTreeMap<u32, u32>, execute: bo
                                 }
                             );
                         }
-                        assert_eq!(ring[0], 0x04000001);
-                        assert_eq!(ring[used + 1] & 0xfffffdff, 0x7a000004);
+                        assert_eq!(ring[off - 1], 0x04000001);
+                        assert_eq!(ring[off + used] & 0xfffffdff, 0x7a000004);
                         // Context-save: the ring ran on this context, so a
                         // RING_CONTEXT_CONTROL write it made reaches the
                         // image's value slot (image word 1027), which
