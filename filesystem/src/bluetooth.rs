@@ -670,6 +670,10 @@ pub type BtDrainScoHandler = fn(dev: u16, handle: u16) -> Option<Vec<Vec<u8>>>;
 pub type BtScoRxPendingHandler = fn(dev: u16, handle: u16) -> bool;
 pub type BtDisconnectScoHandler = fn(dev: u16, handle: u16) -> bool;
 pub type BtScoCancelConnectHandler = fn(dev: u16, peer: [u8; 6]);
+/// Claim the oldest unclaimed SCO link on `dev` for a listening
+/// socket's accept: (SCO handle, peer bdaddr, MTU, peer class).
+pub type BtTakePendingScoHandler = fn(dev: u16) -> Option<(u16, [u8; 6], u16, [u8; 3])>;
+pub type BtPendingScoHandler = fn(dev: u16) -> bool;
 
 static BT_SCO_CONNECT: AtomicUsize = AtomicUsize::new(0);
 static BT_SCO_CONNECT_STATUS: AtomicUsize = AtomicUsize::new(0);
@@ -678,6 +682,8 @@ static BT_DRAIN_SCO: AtomicUsize = AtomicUsize::new(0);
 static BT_SCO_RX_PENDING: AtomicUsize = AtomicUsize::new(0);
 static BT_DISCONNECT_SCO: AtomicUsize = AtomicUsize::new(0);
 static BT_SCO_CANCEL_CONNECT: AtomicUsize = AtomicUsize::new(0);
+static BT_TAKE_PENDING_SCO: AtomicUsize = AtomicUsize::new(0);
+static BT_PENDING_SCO: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the SCO socket handlers (narf_bluetooth::pump).
 #[allow(clippy::too_many_arguments)]
@@ -689,6 +695,8 @@ pub fn install_bt_sco_handlers(
     rx_pending: BtScoRxPendingHandler,
     disconnect: BtDisconnectScoHandler,
     cancel: BtScoCancelConnectHandler,
+    take_pending: BtTakePendingScoHandler,
+    pending: BtPendingScoHandler,
 ) {
     BT_SCO_CONNECT.store(connect as usize, Ordering::Release);
     BT_SCO_CONNECT_STATUS.store(status as usize, Ordering::Release);
@@ -697,6 +705,8 @@ pub fn install_bt_sco_handlers(
     BT_SCO_RX_PENDING.store(rx_pending as usize, Ordering::Release);
     BT_DISCONNECT_SCO.store(disconnect as usize, Ordering::Release);
     BT_SCO_CANCEL_CONNECT.store(cancel as usize, Ordering::Release);
+    BT_TAKE_PENDING_SCO.store(take_pending as usize, Ordering::Release);
+    BT_PENDING_SCO.store(pending as usize, Ordering::Release);
 }
 
 /// Start an outbound SCO setup to `peer` on controller `dev`
@@ -800,6 +810,34 @@ pub fn bt_sco_cancel_connect(dev: u16, peer: [u8; 6]) {
     let f: BtScoCancelConnectHandler =
         unsafe { core::mem::transmute::<usize, BtScoCancelConnectHandler>(h) };
     f(dev, peer)
+}
+
+/// Claim the oldest unclaimed SCO link on controller `dev` for a
+/// listening socket's accept (see `BtTakePendingScoHandler`):
+/// (SCO handle, peer bdaddr, MTU, peer class). `None` when nothing
+/// is pending or no stack is installed.
+pub fn bt_take_pending_sco(dev: u16) -> Option<(u16, [u8; 6], u16, [u8; 3])> {
+    let h = BT_TAKE_PENDING_SCO.load(Ordering::Acquire);
+    if h == 0 {
+        return None;
+    }
+    // SAFETY: only ever stored as `BtTakePendingScoHandler as usize`.
+    let f: BtTakePendingScoHandler =
+        unsafe { core::mem::transmute::<usize, BtTakePendingScoHandler>(h) };
+    f(dev)
+}
+
+/// Whether an accept-claimable SCO link is pending on controller
+/// `dev` — non-consuming peek for poll/accept readiness. `false`
+/// when no stack is installed.
+pub fn bt_pending_sco(dev: u16) -> bool {
+    let h = BT_PENDING_SCO.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `BtPendingScoHandler as usize`.
+    let f: BtPendingScoHandler = unsafe { core::mem::transmute::<usize, BtPendingScoHandler>(h) };
+    f(dev)
 }
 
 /// Channel-event wake sink. The pump publishes whenever a peer opens
