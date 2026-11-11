@@ -72,6 +72,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::amdgpu_uapi as uapi;
 use crate::drm_ioctl_bridge::{copy_in, copy_out};
 use crate::drm_uapi;
+#[path = "amdgpu_gem_accounting.rs"]
+pub(crate) mod accounting;
 #[path = "amdgpu_cpu_mapping.rs"]
 pub(crate) mod cpu_mapping;
 #[path = "amdgpu_gem_stats.rs"]
@@ -675,7 +677,9 @@ impl GemObject {
     }
     fn record_eviction(&self) {
         if let Some(stats) = &self.stats {
-            stats.evicted();
+            if stats.evicted() {
+                accounting::note_first_eviction(self.card, self.byte_len);
+            }
         }
     }
     /// Refuse CPU/deferred/unregistered leases before asynchronous copying,
@@ -1307,7 +1311,18 @@ impl Drop for GemPlacement {
     }
 }
 
-type GemTable = IrqSafeSpinLock<BTreeMap<u32, Arc<GemObject>>>;
+/// One open's GEM handles, and the open's identity for accounting.
+#[derive(Debug)]
+struct GemTable {
+    handles: IrqSafeSpinLock<BTreeMap<u32, Arc<GemObject>>>,
+    client: accounting::Client,
+}
+impl core::ops::Deref for GemTable {
+    type Target = IrqSafeSpinLock<BTreeMap<u32, Arc<GemObject>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.handles
+    }
+}
 static GEM_TABLES: IrqSafeSpinLock<Vec<(u32, Weak<GemTable>)>> = IrqSafeSpinLock::new(Vec::new());
 
 // DRM registration is append-only. One permanent cell per card makes a
@@ -1647,7 +1662,42 @@ pub async fn dispatch_async(
     if drm_uapi::ioc_nr(cmd) != drm_uapi::DRM_COMMAND_BASE + uapi::DRM_AMDGPU_GEM_CREATE {
         return None;
     }
-    Some(create_async(state, arg).await)
+    let result = create_async(state, arg).await;
+    note_create_failure(state, arg, &result);
+    Some(result)
+}
+
+/// Report a GEM_CREATE refused for lack of memory. Its request is read
+/// again only then (a failed create leaves the input union as it was).
+fn note_create_failure(state: &GemState, arg: usize, result: &Result<u64, FsError>) {
+    let Err(error @ (FsError::NoSpace | FsError::OutOfMemory)) = result else {
+        return;
+    };
+    let Ok(req) = parse_create(arg) else {
+        return;
+    };
+    accounting::note_failure(
+        state.card,
+        "GEM_CREATE",
+        req.byte_len,
+        req.domains,
+        req.flags,
+        *error,
+    );
+}
+
+/// Report a dumb buffer refused for lack of VRAM.
+fn note_dumb_failure<T>(card: u32, bytes: u64, result: &Result<T, FsError>) {
+    if let Err(error) = result {
+        accounting::note_failure(
+            Some(card),
+            "CREATE_DUMB",
+            bytes,
+            DUMB_DOMAIN,
+            DUMB_CREATE_FLAGS,
+            *error,
+        );
+    }
 }
 
 /// GEM_CREATE with placement admission held only for what needs it: the
@@ -1731,9 +1781,13 @@ pub async fn create_dumb_async(
     let Some(heap) = vram_heap(card) else {
         return result;
     };
-    if reclaim_vram_locked(&gate, &heap, size, PAGE_SIZE, DUMB_CREATE_FLAGS, &[]).await {
-        return state.create_dumb_locked(width, height, bpp, &gate);
-    }
+    let result = if reclaim_vram_locked(&gate, &heap, size, PAGE_SIZE, DUMB_CREATE_FLAGS, &[]).await
+    {
+        state.create_dumb_locked(width, height, bpp, &gate)
+    } else {
+        result
+    };
+    note_dumb_failure(card, size, &result);
     result
 }
 
@@ -1795,7 +1849,17 @@ pub(crate) async fn prepare_scanout_locked(
         // one created for GTT alone is still moved to VRAM (visible VRAM
         // unless NO_CPU_ACCESS) for scanout. The allowed domains keep
         // governing every other move, so they are widened for this move only.
-        pin_relocate(&gate, object, &unique).await?;
+        if let Err(error) = pin_relocate(&gate, object, &unique).await {
+            accounting::note_failure(
+                Some(card),
+                "scanout pin (prepare_fb)",
+                object.byte_len,
+                u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM),
+                object.flags,
+                error,
+            );
+            return Err(error);
+        }
     }
     Ok(ScanoutPreparation { _gate: gate })
 }
@@ -1931,7 +1995,10 @@ impl GemState {
                 next.checked_add(1)
             })
             .map_err(|_| FsError::NoSpace)?;
-        self.table().lock().insert(handle, object);
+        let table = self.table();
+        // drm_file_update_pid: the process using the open now.
+        table.client.touch();
+        table.lock().insert(handle, object);
         Ok(handle)
     }
 
@@ -2021,7 +2088,10 @@ impl GemState {
     fn table(&self) -> Arc<GemTable> {
         let mut table = self.objects.lock();
         Arc::clone(table.get_or_insert_with(|| {
-            let table = Arc::new(IrqSafeSpinLock::new(BTreeMap::new()));
+            let table = Arc::new(GemTable {
+                handles: IrqSafeSpinLock::new(BTreeMap::new()),
+                client: accounting::Client::new(),
+            });
             if let Some(card) = self.card {
                 let mut tables = GEM_TABLES.lock();
                 tables.retain(|(_, t)| t.strong_count() != 0);
@@ -2099,7 +2169,10 @@ impl GemState {
     ) -> Result<(u32, u32, u64), FsError> {
         let card = self.card.ok_or(FsError::NoDevice)?;
         let gate = try_placement_live(card)?.ok_or(FsError::Busy)?;
-        self.create_dumb_locked(width, height, bpp, &gate)
+        let result = self.create_dumb_locked(width, height, bpp, &gate);
+        let bytes = dumb_layout(width, height, bpp).map_or(0, |layout| layout.1);
+        note_dumb_failure(card, bytes, &result);
+        result
     }
 
     fn create_dumb_locked(
@@ -2363,7 +2436,9 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         Some(card) => Some(try_placement_live(card)?.ok_or(FsError::Busy)?),
         None => None,
     };
-    create_locked(state, arg, gate.as_ref())
+    let result = create_locked(state, arg, gate.as_ref());
+    note_create_failure(state, arg, &result);
+    result
 }
 
 /// `drm_amdgpu_gem_create_in` after amdgpu_gem_create_ioctl's checks.
