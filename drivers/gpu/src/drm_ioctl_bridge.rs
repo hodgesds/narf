@@ -2094,6 +2094,18 @@ pub fn dispatch_card(
 /// [`refused`] last named. The driver dispatchers run
 /// before [`dispatch_card_for_file`], so its own trace misses them.
 pub(crate) fn note_drm_fd_einval(cmd: u32, result: &Result<u64, FsError>) {
+    if let Err(
+        error @ (FsError::NoSpace
+        | FsError::OutOfMemory
+        | FsError::NoDevice
+        | FsError::QuotaExceeded
+        | FsError::BadAddress
+        | FsError::Io(_)),
+    ) = result
+    {
+        note_drm_fd_resource_failure(cmd, *error);
+        return;
+    }
     if !matches!(result, Err(FsError::InvalidData)) {
         return;
     }
@@ -2114,6 +2126,42 @@ pub(crate) fn note_drm_fd_einval(cmd: u32, result: &Result<u64, FsError>) {
         "  drm: fd ioctl {cmd:#010x} (nr {:#x}) EINVAL (last bridge line {line}, why=\"{why}\")",
         drm_uapi::ioc_nr(cmd),
     );
+}
+
+/// The ioctl numbers whose first resource failure has been logged.
+static FD_FAILURE_SEEN: [core::sync::atomic::AtomicU64; 4] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A DRM fd ioctl failed for lack of something (memory, space, the device,
+/// a readable argument) rather than for what it asked: name it in the log,
+/// once per ioctl number, with the caller. A client usually reports such a
+/// failure without detail (a compositor's "failed to allocate a graphics
+/// buffer"), and nothing else says which ioctl refused and with what.
+/// Lock-free: one atomic on a failing ioctl, nothing on one that succeeds.
+fn note_drm_fd_resource_failure(cmd: u32, error: FsError) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let nr = drm_uapi::ioc_nr(cmd) & 0xff;
+    let (word, bit) = ((nr / 64) as usize, 1u64 << (nr % 64));
+    if FD_FAILURE_SEEN[word].load(Relaxed) & bit != 0
+        || FD_FAILURE_SEEN[word].fetch_or(bit, Relaxed) & bit != 0
+    {
+        return;
+    }
+    let pid = narf_filesystem::procfs::current_process_id();
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  drm: fd ioctl {cmd:#010x} (nr {nr:#x}) failed {error:?} for pid {pid} ({}); logged once per ioctl",
+        narf_filesystem::procfs::process_comm(pid).as_deref().unwrap_or("?"),
+    );
+}
+
+/// Whether ioctl number `nr`'s first resource failure has been logged.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn drm_fd_failure_noted(nr: u32) -> bool {
+    FD_FAILURE_SEEN[((nr & 0xff) / 64) as usize].load(core::sync::atomic::Ordering::Relaxed)
+        & (1u64 << (nr % 64))
+        != 0
 }
 
 /// Clear the recorded [`invalid_at`] line before an fd ioctl runs, so a
