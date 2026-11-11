@@ -1652,6 +1652,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         0,
         true,
     );
+    enable_receive_coalescing(&name);
     controller.ifname.set(name);
     let clock = narf_time::phc::register(Arc::new(control::PhcDevice(Arc::downgrade(&controller))));
     controller.phc_index.store(clock as i32, Ordering::Release);
@@ -1861,6 +1862,14 @@ impl narf_net::Interface for IgcInterface {
         &self.0.tx_ipc_ring
     }
 }
+/// Linux `igc_probe` leaves `NETIF_F_GRO` set in `netdev->features` and
+/// `igc_clean_rx_irq` hands every frame to `napi_gro_receive`. Each queue's
+/// pump is pinned to one CPU and flushes that CPU's coalescer when its ring
+/// drains, so in-order TCP segments reach the stack as one large segment
+/// instead of one protocol pass, one ACK decision and one reader wake each.
+pub(crate) fn enable_receive_coalescing(name: &str) -> bool {
+    narf_net::iface::set_software_gro(name, true)
+}
 fn admin_hook(name: &str, up: bool) {
     let c = RETAINED
         .lock()
@@ -1951,6 +1960,11 @@ fn spawn_pumps(
                         narf_scheduler::yield_now().await;
                         continue;
                     }
+                    // The ring is empty and the vector re-armed: Linux
+                    // `napi_complete_done` flushes GRO here, so a coalesced
+                    // burst is never held waiting for a segment that may not
+                    // come. A no-op when this CPU holds no flows.
+                    narf_net::tcp_stack::gro_flush();
                     match waiter {
                         Some(w) => {
                             let _ = w.await;

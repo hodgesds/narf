@@ -46,3 +46,31 @@ fn smoke_igc_admin_vector_rearms_itself() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_admin_vector_rearms_itself);
+
+fn smoke_igc_receive_coalescing_is_enabled_at_probe() -> TestResult {
+    // Linux igc reports `generic-receive-offload: on` and feeds
+    // napi_gro_receive; the physical I225 boot reported `off [fixed]` and
+    // ran one full TCP pass per 1500-byte segment.
+    fn sink(_: &[u8], _: narf_net::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    let name = narf_net::iface::register("igc-gro-selftest", [2, 0, 0, 0, 0, 9], sink);
+    let before = narf_net::iface::lookup(&name).is_some_and(|iface| iface.software_gro);
+    let accepted = crate::igc::enable_receive_coalescing(&name);
+    let after = narf_net::iface::lookup(&name).is_some_and(|iface| iface.software_gro);
+    let _ = narf_net::iface::unregister(&name);
+    if before {
+        return TestResult::Fail("software GRO was already on for a fresh interface");
+    }
+    if !accepted || !after {
+        return TestResult::Fail("igc probe hook did not enable software GRO");
+    }
+    if crate::igc::enable_receive_coalescing("igc-gro-missing") {
+        return TestResult::Fail("coalescing accepted an unregistered interface");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/igc",
+    smoke_igc_receive_coalescing_is_enabled_at_probe
+);

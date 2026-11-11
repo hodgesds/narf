@@ -200,6 +200,11 @@ writeback is disabled: terminal descriptor DD remains the completion authority.
 Advanced one-buffer RX programs a 2048-byte packet buffer, 256-byte header
 size and SRRCTL drop enable at bit31, with reserved bit28 clear.
 
+Built-in IGC registration opts the interface into the stack's software GRO
+(Linux `NETIF_F_GRO`, `napi_gro_receive`). Each queue's receive task is pinned
+to one CPU and flushes that CPU's held flows when its ring is empty and its
+vector re-armed, the `napi_complete_done` point.
+
 TX watchdogs (igc, igb, ixgbe, e1000, forcedeth, r8169) compare ages as
 Linux `time_after` does: a frame stamped after the watchdog sampled the clock
 has age zero. The sample is taken before the queue lock, so a concurrent
