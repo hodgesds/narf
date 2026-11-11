@@ -723,17 +723,29 @@ fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
 /// `dispatch_for` sets it from the open's card (`available_rings`). Linux
 /// returns success with a zero mask for an IP that exists but has no ring,
 /// so userspace reads that as "present, unusable" rather than as an error.
-fn hw_ip_info(snap: &Snapshot, ip_type: u32) -> Result<Vec<u8>, FsError> {
-    let hw_id = hw_id_for_ip_type(ip_type).ok_or(FsError::InvalidData)?;
+///
+/// amdgpu_hw_ip_info refuses only an instance past
+/// AMDGPU_HW_IP_INSTANCE_MAX_COUNT and a type past AMDGPU_HW_IP_VPE. A
+/// type whose block the ASIC does not have (UVD, VCE and UVD_ENC on every
+/// VCN part, VPE on a discrete card) is success with an all-zero reply,
+/// and VCN_DEC is the VCN block with no ring on a unified-queue VCN.
+fn hw_ip_info(snap: &Snapshot, ip_type: u32, ip_instance: u32) -> Result<Vec<u8>, FsError> {
+    if ip_instance >= uapi::AMDGPU_HW_IP_INSTANCE_MAX_COUNT || ip_type >= uapi::AMDGPU_HW_IP_NUM {
+        return Err(FsError::InvalidData);
+    }
     let mut info = uapi::DrmAmdgpuInfoHwIp::default();
-    if let Some(block) = amdgpu_discovery::find_ip(&snap.ip_blocks, hw_id, 0) {
+    if let Some(block) = hw_id_for_ip_type(ip_type)
+        .and_then(|hw_id| amdgpu_discovery::find_ip(&snap.ip_blocks, hw_id, 0))
+    {
         info.hw_ip_version_major = u32::from(block.major);
         info.hw_ip_version_minor = u32::from(block.minor);
-        // amdgpu_hw_ip_info: unified VCN encode and SDMA use 256/4, JPEG
-        // 256/64; graphics/compute use 32/32.
+        // amdgpu_hw_ip_info: VCN encode, VPE and SDMA use 256/4, VCN
+        // decode and JPEG 256/64; graphics/compute use 32/32.
         (info.ib_start_alignment, info.ib_size_alignment) = match ip_type {
-            uapi::AMDGPU_HW_IP_DMA | uapi::AMDGPU_HW_IP_VCN_ENC => (256, 4),
-            uapi::AMDGPU_HW_IP_VCN_JPEG => (256, 64),
+            uapi::AMDGPU_HW_IP_DMA | uapi::AMDGPU_HW_IP_VCN_ENC | uapi::AMDGPU_HW_IP_VPE => {
+                (256, 4)
+            }
+            uapi::AMDGPU_HW_IP_VCN_DEC | uapi::AMDGPU_HW_IP_VCN_JPEG => (256, 64),
             _ => (32, 32),
         };
         // `available_rings` is the open's card's (`dispatch_for`).
@@ -752,23 +764,38 @@ pub fn available_rings(card: Option<u32>, ip_type: u32, ip_instance: u32) -> u32
         .map_or(0, |_| 1)
 }
 
-/// `AMDGPU_HW_IP_*` → the discovery table's `HW_ID_*`.
+/// `AMDGPU_HW_IP_*` → the discovery table's `HW_ID_*`
+/// (amdgpu_ip_get_block_type). UVD, VCE and UVD_ENC have none: this driver
+/// binds discovery parts only, whose video block is VCN (UVD_HWID names
+/// the VCN block there, and no UVD or VCE IP block is registered).
 fn hw_id_for_ip_type(ip_type: u32) -> Option<u16> {
     match ip_type {
         uapi::AMDGPU_HW_IP_GFX | uapi::AMDGPU_HW_IP_COMPUTE => Some(amdgpu_discovery::HW_ID_GC),
         uapi::AMDGPU_HW_IP_DMA => Some(amdgpu_discovery::HW_ID_SDMA0),
         // JPEG_HWIP is enumerated under the VCN discovery entry.
-        uapi::AMDGPU_HW_IP_VCN_ENC | uapi::AMDGPU_HW_IP_VCN_JPEG => {
+        uapi::AMDGPU_HW_IP_VCN_DEC | uapi::AMDGPU_HW_IP_VCN_ENC | uapi::AMDGPU_HW_IP_VCN_JPEG => {
             Some(amdgpu_discovery::HW_ID_VCN)
         }
+        uapi::AMDGPU_HW_IP_VPE => Some(amdgpu_discovery::HW_ID_VPE),
         _ => None,
     }
 }
 
 /// `AMDGPU_INFO_HW_IP_COUNT` → how many instances of this IP exist.
+/// amdgpu_info_ioctl answers -EINVAL for a type whose IP block the ASIC
+/// does not have (`!ip_block || !ip_block->status.valid`), and the
+/// instance count for the rest — VCN decode included
+/// (`adev->vcn.num_vcn_inst`). The refusal names itself so the ioctl
+/// trace does not read as a missing query.
 fn hw_ip_count(snap: &Snapshot, ip_type: u32) -> Result<Vec<u8>, FsError> {
-    let hw_id = hw_id_for_ip_type(ip_type).ok_or(FsError::InvalidData)?;
-    let n = snap.ip_blocks.iter().filter(|b| b.hw_id == hw_id).count() as u32;
+    let n = hw_id_for_ip_type(ip_type).map_or(0, |hw_id| {
+        snap.ip_blocks.iter().filter(|b| b.hw_id == hw_id).count() as u32
+    });
+    if n == 0 {
+        return Err(crate::drm_ioctl_bridge::refused(
+            "AMDGPU_INFO_HW_IP_COUNT: no such IP block on this ASIC, EINVAL on Linux too (amdgpu_info_ioctl)",
+        ));
+    }
     Ok(n.to_le_bytes().to_vec())
 }
 
@@ -808,7 +835,7 @@ pub fn query_against(snap: &Snapshot, query: u32, payload: [u32; 4]) -> Result<V
         uapi::AMDGPU_INFO_VRAM_GTT => Ok(vram_gtt(snap)),
         uapi::AMDGPU_INFO_GTT_USAGE => Ok(crate::amdgpu_gem::gtt_used().to_le_bytes().to_vec()),
         // `query_hw_ip { type, ip_instance }` — type is word 0.
-        uapi::AMDGPU_INFO_HW_IP_INFO => hw_ip_info(snap, payload[0]),
+        uapi::AMDGPU_INFO_HW_IP_INFO => hw_ip_info(snap, payload[0], payload[1]),
         uapi::AMDGPU_INFO_HW_IP_COUNT => hw_ip_count(snap, payload[0]),
         // `read_mmr_reg { dword_offset, count, instance, flags }`.
         uapi::AMDGPU_INFO_READ_MMR_REG => read_mmr_reg(snap, *NAVI48_TOPOLOGY.lock(), payload),
@@ -881,10 +908,13 @@ fn note_refused_query(arg: usize) {
         }
         seen.push((query, first));
     }
+    // A refusal that named its rule (`drm_ioctl_bridge::refused`) says
+    // whether Linux refuses the query as well.
+    let why = crate::drm_ioctl_bridge::last_refusal().unwrap_or("");
     use core::fmt::Write;
     let _ = writeln!(
         narf_console::Writer,
-        "  drm: amdgpu INFO query {query:#x} arg {first:#x} size {size} EINVAL"
+        "  drm: amdgpu INFO query {query:#x} arg {first:#x} size {size} EINVAL why=\"{why}\""
     );
 }
 
@@ -1062,7 +1092,7 @@ mod topology_tests {
     fn gfx12_unified_media_ip_reports_linux_alignment_without_codec_claims() -> TestResult {
         let gpu = crate::amdgpu_navi48_firmware::tests::gpu();
         let snap = Snapshot::from_gpu(&gpu);
-        let info = hw_ip_info(&snap, uapi::AMDGPU_HW_IP_VCN_ENC).unwrap();
+        let info = hw_ip_info(&snap, uapi::AMDGPU_HW_IP_VCN_ENC, 0).unwrap();
         let word = |at| u32::from_le_bytes(info[at..at + 4].try_into().unwrap());
         assert_eq!(word(0), 5);
         assert_eq!(word(4), 0);
@@ -1073,7 +1103,7 @@ mod topology_tests {
             hw_ip_count(&snap, uapi::AMDGPU_HW_IP_VCN_ENC).unwrap(),
             1u32.to_le_bytes()
         );
-        let info = hw_ip_info(&snap, uapi::AMDGPU_HW_IP_VCN_JPEG).unwrap();
+        let info = hw_ip_info(&snap, uapi::AMDGPU_HW_IP_VCN_JPEG, 0).unwrap();
         let word = |at| u32::from_le_bytes(info[at..at + 4].try_into().unwrap());
         assert_eq!(
             (word(0), word(4), word(16), word(20), word(24)),
@@ -1098,6 +1128,68 @@ mod topology_tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu_info",
         gfx12_unified_media_ip_reports_linux_alignment_without_codec_claims
+    );
+    /// HW_IP_INFO and HW_IP_COUNT for every AMDGPU_HW_IP_* type (a
+    /// starting graphics session asks for each; an RX 6750 XT logged the
+    /// COUNT of all ten), as amdgpu_info_ioctl answers them on a GC 12
+    /// card. INFO: the VCN block for VCN_DEC (256/64, no ring on a
+    /// unified-queue VCN), success with an all-zero reply for the types
+    /// whose block the card lacks (UVD, VCE, UVD_ENC, VPE), EINVAL only
+    /// for a type past AMDGPU_HW_IP_VPE or an instance past 0. COUNT:
+    /// `num_vcn_inst` for VCN_DEC, EINVAL for an absent block.
+    fn gfx12_hw_ip_queries_answer_every_ip_type_as_linux() -> TestResult {
+        let gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+        let snap = Snapshot::from_gpu(&gpu);
+        let info =
+            |ip, instance| query_against(&snap, uapi::AMDGPU_INFO_HW_IP_INFO, [ip, instance, 0, 0]);
+        let count = |ip| query_against(&snap, uapi::AMDGPU_INFO_HW_IP_COUNT, [ip, 0, 0, 0]);
+        let Ok(dec) = info(uapi::AMDGPU_HW_IP_VCN_DEC, 0) else {
+            return TestResult::Fail("HW_IP_INFO(VCN_DEC) refused");
+        };
+        let word = |at| u32::from_le_bytes(dec[at..at + 4].try_into().unwrap());
+        if (word(0), word(4), word(16), word(20), word(24)) != (5, 0, 256, 64, 0) {
+            return TestResult::Fail("HW_IP_INFO(VCN_DEC) is not the VCN block at 256/64");
+        }
+        if count(uapi::AMDGPU_HW_IP_VCN_DEC) != Ok(1u32.to_le_bytes().to_vec()) {
+            return TestResult::Fail("HW_IP_COUNT(VCN_DEC) is not num_vcn_inst");
+        }
+        for ip in [
+            uapi::AMDGPU_HW_IP_UVD,
+            uapi::AMDGPU_HW_IP_VCE,
+            uapi::AMDGPU_HW_IP_UVD_ENC,
+            uapi::AMDGPU_HW_IP_VPE,
+        ] {
+            match info(ip, 0) {
+                Ok(reply)
+                    if reply.len() == core::mem::size_of::<uapi::DrmAmdgpuInfoHwIp>()
+                        && reply.iter().all(|&b| b == 0) => {}
+                _ => {
+                    return TestResult::Fail("HW_IP_INFO of an absent block is not zeroed success")
+                }
+            }
+            if count(ip) != Err(FsError::InvalidData) {
+                return TestResult::Fail("HW_IP_COUNT of an absent block is not EINVAL");
+            }
+            if crate::drm_ioctl_bridge::last_refusal()
+                .is_none_or(|why| !why.contains("HW_IP_COUNT"))
+            {
+                return TestResult::Fail("HW_IP_COUNT refusal does not name its rule");
+            }
+        }
+        if info(uapi::AMDGPU_HW_IP_NUM, 0) != Err(FsError::InvalidData)
+            || count(uapi::AMDGPU_HW_IP_NUM) != Err(FsError::InvalidData)
+            || info(
+                uapi::AMDGPU_HW_IP_GFX,
+                uapi::AMDGPU_HW_IP_INSTANCE_MAX_COUNT,
+            ) != Err(FsError::InvalidData)
+        {
+            return TestResult::Fail("HW_IP type or instance out of range accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu_info",
+        gfx12_hw_ip_queries_answer_every_ip_type_as_linux
     );
     fn gfx12_dev_info_uses_harvesting_without_claiming_acceleration() -> TestResult {
         let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
