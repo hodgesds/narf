@@ -1360,6 +1360,7 @@ fn userptr_backing_follows_pins_and_refuses_mmap_export_and_moves() -> TestResul
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
         pin_count: AtomicU32::new(0),
         leases: AtomicU64::new(0),
+        retry_ns: AtomicU64::new(0),
         stats: None,
     });
     assert!(object.is_userptr());

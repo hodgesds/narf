@@ -479,7 +479,13 @@ limit (half of RAM, TTM's default page limit).
 - **A synchronous move** (`GemObject::relocate`: eviction for an
   allocation, promotion on lookup, the final step of an asynchronous move)
   copies the buffer with the object's placement lock free and publishes
-  the copy only if no address lease was taken meanwhile.
+  the copy only if no address lease was taken meanwhile. A lease taken
+  during the copy refuses that copy, not the move: the buffer is copied
+  once more, and only a second refusal is `Busy` (a lookup then leaves the
+  buffer where it is for 100 ms). A buffer that gained a CPU mapping
+  meanwhile moves as a mapped one. A move that must happen (prepare_fb's
+  into VRAM, suspend's out of it) asks once more 1 ms after a `Busy`, so a
+  client mapping the buffer at that moment does not fail the commit.
 
 Accounting is read-only walks, never hot-path counters
 (`amdgpu_gem::accounting`):

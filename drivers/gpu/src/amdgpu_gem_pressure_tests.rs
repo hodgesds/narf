@@ -224,6 +224,208 @@ kernel_test_in!(
     relocation_copies_outside_the_placement_lock
 );
 
+/// A VM owner for the mapped move that has no address spaces to revoke:
+/// it commits at once. The previous owner comes back when it drops.
+struct CommitAtOnce(Option<narf_filesystem::mmap_relocation::RelocationHook>);
+impl CommitAtOnce {
+    fn install() -> Self {
+        fn commit_at_once(
+            _old: &[u64],
+            _new: &[u64],
+            _aliases: fn(u64) -> usize,
+            commit: &mut dyn FnMut() -> Result<(), FsError>,
+        ) -> Result<(), FsError> {
+            commit()
+        }
+        Self(narf_filesystem::mmap_relocation::replace(Some(
+            commit_at_once,
+        )))
+    }
+}
+impl Drop for CommitAtOnce {
+    fn drop(&mut self) {
+        narf_filesystem::mmap_relocation::replace(self.0.take());
+    }
+}
+
+/// A lease taken while a buffer's bytes are copied refuses that copy, not
+/// the move. A passing reader or writer of the address is gone again, so
+/// the buffer is copied once more and published; one that keeps coming
+/// is `Busy`, and the lookup path then leaves the buffer alone for a
+/// while instead of copying it on every lookup; a CPU mapping that
+/// appeared meanwhile makes it a mapped buffer, which moves as one.
+fn a_move_survives_a_lease_taken_while_it_copies() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering as O};
+    const CARD: u32 = 0xe1c7;
+    let Some(heap) = Heap::new(CARD, 16) else {
+        return TestResult::Fail("heap");
+    };
+    let state = GemState::for_card(CARD);
+    let Some(object) = vram_object(&state, 2 * PAGE_SIZE) else {
+        return TestResult::Fail("VRAM object");
+    };
+    // The open's first handle.
+    if !state
+        .get(HANDLE_BASE)
+        .is_some_and(|o| Arc::ptr_eq(&o, &object))
+    {
+        return TestResult::Fail("handle");
+    }
+    let (in_vram, in_gtt) = (heap.used(), gtt_used());
+    if object.relocate(false).is_err() || !object.system() {
+        return TestResult::Fail("eviction");
+    }
+    static COPIES: AtomicU32 = AtomicU32::new(0);
+
+    // 1: a writer during the first copy only.
+    COPIES.store(0, O::Release);
+    let writer = object.clone();
+    *RELOCATE_COPY_HOOK.lock() = Some(Arc::new(move || {
+        if COPIES.fetch_add(1, O::AcqRel) == 0 {
+            let _ = writer.store_u64(8, 0x6e61_7266_000a);
+        }
+    }));
+    let moved = object.relocate(true);
+    *RELOCATE_COPY_HOOK.lock() = None;
+    if moved.is_err()
+        || COPIES.load(O::Acquire) != 2
+        || object.system()
+        || object.load_u64(8) != Some(0x6e61_7266_000a)
+        || heap.used() != in_vram
+        || gtt_used() != in_gtt
+    {
+        return TestResult::Fail("a move raced once was not made again, or lost the write");
+    }
+
+    // 2: a writer during every copy: Busy after the second, and a lookup
+    // does not copy the buffer a third time straight away.
+    if object.relocate(false).is_err() {
+        return TestResult::Fail("second eviction");
+    }
+    COPIES.store(0, O::Release);
+    let writer = object.clone();
+    *RELOCATE_COPY_HOOK.lock() = Some(Arc::new(move || {
+        COPIES.fetch_add(1, O::AcqRel);
+        let _ = writer.store_u64(8, 0x6e61_7266_000b);
+    }));
+    let refused = object.relocate(true);
+    *RELOCATE_COPY_HOOK.lock() = Some(Arc::new(|| {
+        COPIES.fetch_add(1, O::AcqRel);
+    }));
+    let looked_up = state.object(HANDLE_BASE).is_some();
+    if refused != Err(FsError::Busy) || COPIES.load(O::Acquire) != 2 {
+        return TestResult::Fail("a move raced every time was not given up after two copies");
+    }
+    if !looked_up || !object.system() {
+        return TestResult::Fail("a lookup copied the buffer again right after a refused move");
+    }
+    // A move asked for by name is not deferred.
+    let moved = object.relocate(true);
+    *RELOCATE_COPY_HOOK.lock() = None;
+    if moved.is_err()
+        || COPIES.load(O::Acquire) != 3
+        || object.system()
+        || object.load_u64(8) != Some(0x6e61_7266_000b)
+    {
+        return TestResult::Fail("an explicit move after a refused one");
+    }
+
+    // 3: a client maps the buffer while its bytes are copied. The unmapped
+    // move is refused; the buffer, mapped now, moves through the mapped
+    // path instead of failing the caller.
+    if object.relocate(false).is_err() {
+        return TestResult::Fail("third eviction");
+    }
+    let _vm = CommitAtOnce::install();
+    let mapping: Arc<IrqSafeSpinLock<Option<narf_filesystem::MmapBacking>>> =
+        Arc::new(IrqSafeSpinLock::new(None));
+    COPIES.store(0, O::Release);
+    let (mapper, slot) = (object.clone(), mapping.clone());
+    *RELOCATE_COPY_HOOK.lock() = Some(Arc::new(move || {
+        if COPIES.fetch_add(1, O::AcqRel) != 0 {
+            return;
+        }
+        if let Ok(map) = cpu_mapping::backing(mapper.clone(), 0, 2 * PAGE_SIZE as usize) {
+            cpu_mapping::published(map.lifetime.as_ref());
+            *slot.lock() = Some(map);
+        }
+    }));
+    let moved = cpu_mapping::relocate(&object, true);
+    *RELOCATE_COPY_HOOK.lock() = None;
+    let mapped = mapping.lock().take();
+    if mapped.is_none() {
+        return TestResult::Fail("the client's mapping was not taken during the copy");
+    }
+    if moved.is_err()
+        || COPIES.load(O::Acquire) != 1
+        || object.system()
+        || object.load_u64(8) != Some(0x6e61_7266_000b)
+        || object.load_u64(4096 + 8) != Some(0)
+    {
+        return TestResult::Fail("a buffer mapped during its move did not move as a mapped one");
+    }
+    drop(mapped);
+    if heap.used() != in_vram || gtt_used() != in_gtt {
+        return TestResult::Fail("a refused copy was not returned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gem-pressure",
+    a_move_survives_a_lease_taken_while_it_copies
+);
+
+/// prepare_fb must bring a framebuffer into VRAM even when a client is in
+/// the middle of mapping it: the mapping exists but is not yet published
+/// into the address space, which refuses the mapped move. The commit tries
+/// once more a moment later (Linux's fault path waits on the buffer's
+/// reservation while it moves) instead of failing with EBUSY after its
+/// TEST_ONLY passed.
+fn a_commit_waits_out_a_mapping_that_is_being_published() -> TestResult {
+    use core::future::Future;
+    use core::task::{Context, Waker};
+    const CARD: u32 = 0xe1c8;
+    let Some(_heap) = Heap::new(CARD, 16) else {
+        return TestResult::Fail("heap");
+    };
+    let state = GemState::for_card(CARD);
+    let Some(object) = vram_object(&state, 2 * PAGE_SIZE) else {
+        return TestResult::Fail("VRAM object");
+    };
+    if object.store_u64(8, 0x6e61_7266_000c).is_none()
+        || object.relocate(false).is_err()
+        || !object.system()
+    {
+        return TestResult::Fail("a framebuffer in system pages");
+    }
+    let _vm = CommitAtOnce::install();
+    let Ok(map) = cpu_mapping::backing(object.clone(), 0, 2 * PAGE_SIZE as usize) else {
+        return TestResult::Fail("the client's mapping");
+    };
+    let mut commit = alloc::boxed::Box::pin(prepare_scanout(CARD, alloc::vec![object.clone()]));
+    let mut cx = Context::from_waker(Waker::noop());
+    if !commit.as_mut().poll(&mut cx).is_pending() {
+        return TestResult::Fail("the commit did not wait for the mapping to be published");
+    }
+    if !object.system() {
+        return TestResult::Fail("the buffer moved under an unpublished mapping");
+    }
+    cpu_mapping::published(map.lifetime.as_ref());
+    let Ok(prepared) = narf_scheduler::block_on_spin(commit) else {
+        return TestResult::Fail("the commit failed for a mapping that was being published");
+    };
+    if object.system() || object.load_u64(8) != Some(0x6e61_7266_000c) {
+        return TestResult::Fail("the framebuffer did not reach VRAM whole");
+    }
+    drop(prepared);
+    drop(map);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gem-pressure",
+    a_commit_waits_out_a_mapping_that_is_being_published
+);
+
 /// ttm_tt_populate allocates a buffer's pages under the buffer's own
 /// reservation, never under a device-wide lock. The card's placement gate
 /// is taken by every job, VA edit and KMS commit, so a user open's

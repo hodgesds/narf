@@ -580,6 +580,9 @@ pub struct GemObject {
     /// mapping): [`GemObject::relocate`] refuses to publish a copy made
     /// while one was taken.
     leases: AtomicU64,
+    /// monotonic_ns before which a lookup does not try to move the buffer
+    /// again (0: no such time): set when a move was refused at publication.
+    retry_ns: AtomicU64,
     stats: Option<Arc<stats::CardStats>>,
 }
 
@@ -838,8 +841,42 @@ impl GemObject {
     /// sleeping lock, with interrupts on): the source is leased, copied with
     /// the lock free, and the new placement published only if no address
     /// lease was taken meanwhile (`leases`) and the buffer is still
-    /// eligible. `Busy` otherwise; the unused copy is returned.
+    /// eligible. A copy refused for a lease is returned and made once more
+    /// (`RELOCATE_ATTEMPTS`); `Busy` when that one is refused too, or when
+    /// the buffer cannot move at all (pinned, leased, busy, not allowed
+    /// the domain).
     pub(crate) fn relocate(&self, to_vram: bool) -> Result<(), FsError> {
+        // A lease taken while the bytes were copied refuses that copy, not
+        // the move: the taker is usually gone again (a read of the address,
+        // a fence write), so the move is made once more. A lease still held
+        // then is `Busy` for the caller to deal with.
+        for _ in 0..RELOCATE_ATTEMPTS {
+            if self.relocate_once(to_vram)? {
+                self.retry_ns.store(0, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        // Refused at publication every time: something keeps taking the
+        // buffer's address. The opportunistic move on lookup
+        // (`GemState::validated`) stands back before copying it again.
+        self.retry_ns.store(
+            narf_time::monotonic_ns().saturating_add(RELOCATE_BACKOFF_NS),
+            Ordering::Relaxed,
+        );
+        Err(FsError::Busy)
+    }
+
+    /// Whether a move was refused at publication so recently that a lookup
+    /// should not copy the buffer again yet.
+    fn move_deferred(&self) -> bool {
+        let until = self.retry_ns.load(Ordering::Relaxed);
+        until != 0 && narf_time::monotonic_ns() < until
+    }
+
+    /// One attempt of [`GemObject::relocate`]. False when the copy was
+    /// made and then refused at publication because an address lease was
+    /// taken while it ran; the copy has been returned.
+    fn relocate_once(&self, to_vram: bool) -> Result<bool, FsError> {
         let target = if to_vram {
             u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM)
         } else {
@@ -872,7 +909,7 @@ impl GemObject {
                 return Err(FsError::Busy);
             }
             if placement.system != to_vram {
-                return Ok(());
+                return Ok(true);
             }
             (Arc::clone(&placement), self.leases.load(Ordering::Acquire))
         };
@@ -882,16 +919,17 @@ impl GemObject {
             Arc::new(source.copy_to(to_vram, self.card, self.alignment, self.flags)?);
         let replaced = {
             let mut placement = self.placement.lock();
-            // Ours and the object's are the only leases, and nobody took
-            // (and dropped) another while the bytes were copied.
-            if !Arc::ptr_eq(&placement, &source)
-                || Arc::strong_count(&source) != 2
+            if !Arc::ptr_eq(&placement, &source) || !eligible(&placement) || !idle() {
+                return Err(FsError::Busy);
+            }
+            // Ours and the object's must be the only leases, and nobody
+            // may have taken (and dropped) another while the bytes were
+            // copied.
+            if Arc::strong_count(&source) != 2
                 || Arc::weak_count(&source) != 0
                 || self.leases.load(Ordering::Acquire) != leases
-                || !eligible(&placement)
-                || !idle()
             {
-                return Err(FsError::Busy);
+                return Ok(false);
             }
             core::mem::replace(&mut *placement, destination)
         };
@@ -899,7 +937,7 @@ impl GemObject {
         // The old backing returns to its allocator with the lock free.
         drop(replaced);
         drop(source);
-        Ok(())
+        Ok(true)
     }
 
     /// The current placement's metadata, read without taking an address
@@ -1573,7 +1611,7 @@ pub(crate) async fn evict_all(
             .allowed_domains
             .fetch_or(u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT), Ordering::AcqRel);
         touched.push((object.clone(), original));
-        if let Err(error) = crate::amdgpu_vm::relocate(gate, &object, false).await {
+        if let Err(error) = relocate_settled(gate, &object, false).await {
             return (touched, Err(error));
         }
         object.record_eviction();
@@ -1926,13 +1964,47 @@ async fn pin_relocate(
     result
 }
 
+/// How many times [`GemObject::relocate`] copies a buffer before it gives
+/// a move up as raced: the copy, and one more.
+const RELOCATE_ATTEMPTS: usize = 2;
+/// How long a lookup leaves a buffer where it is after a move of it was
+/// refused at publication.
+const RELOCATE_BACKOFF_NS: u64 = 100_000_000;
+/// How long a move that must happen waits before its second try.
+const RELOCATE_SETTLE_US: u64 = 1_000;
+
+/// `amdgpu_vm::relocate` for a move that must happen (a framebuffer into
+/// VRAM for prepare_fb, a buffer out of it for suspend): tried once more,
+/// a moment later, when it is refused `Busy`. A client that maps the
+/// buffer while its bytes are copied refuses that copy, and a mapping not
+/// yet published refuses the mapped move; both are over in microseconds,
+/// and neither a commit nor a suspend may fail for them (Linux's fault
+/// path waits on the buffer's reservation while it moves). A buffer busy
+/// for a lasting reason is refused again; a pinned one, and one whose
+/// jobs or fences did not finish within the move's own wait
+/// (`amdgpu_vm::RELOCATE_WAIT_NS`), is not asked a second time.
+async fn relocate_settled(
+    gate: &PlacementGuard,
+    object: &Arc<GemObject>,
+    to_vram: bool,
+) -> Result<(), FsError> {
+    let waited_out = narf_time::monotonic_ns().saturating_add(crate::amdgpu_vm::RELOCATE_WAIT_NS);
+    match crate::amdgpu_vm::relocate(gate, object, to_vram).await {
+        Err(FsError::Busy) if !object.pinned() && narf_time::monotonic_ns() < waited_out => {
+            narf_time::sleep_us(RELOCATE_SETTLE_US).await;
+            crate::amdgpu_vm::relocate(gate, object, to_vram).await
+        }
+        result => result,
+    }
+}
+
 async fn relocate_for_scanout(
     gate: &PlacementGuard,
     object: &Arc<GemObject>,
     unique: &[Arc<GemObject>],
 ) -> Result<(), FsError> {
     let card = gate.card();
-    match crate::amdgpu_vm::relocate(gate, object, true).await {
+    match relocate_settled(gate, object, true).await {
         Ok(()) => {}
         Err(FsError::NoSpace | FsError::OutOfMemory) => {
             let heap = vram_heap(card).ok_or(FsError::NoDevice)?;
@@ -1948,7 +2020,7 @@ async fn relocate_for_scanout(
             {
                 return Err(FsError::OutOfMemory);
             }
-            crate::amdgpu_vm::relocate(gate, object, true).await?;
+            relocate_settled(gate, object, true).await?;
         }
         Err(error) => return Err(error),
     }
@@ -2120,6 +2192,7 @@ impl GemState {
             dma_buf,
             pin_count: AtomicU32::new(0),
             leases: AtomicU64::new(0),
+            retry_ns: AtomicU64::new(0),
             stats: None,
         })
     }
@@ -2145,7 +2218,7 @@ impl GemState {
     fn validated(&self, handle: u32) -> Option<Arc<GemObject>> {
         let object = self.get(handle)?;
         let target_vram = object.preferred_domains() & u64::from(uapi::AMDGPU_GEM_DOMAIN_VRAM) != 0;
-        if target_vram == object.system() {
+        if target_vram == object.system() && !object.move_deferred() {
             // Lookup's opportunistic promotion must not publish VRAM while
             // reset/suspend owns placement admission. An already-admitted
             // VM/CS caller keeps the current placement and coordinates its
@@ -2270,6 +2343,7 @@ impl GemState {
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
             leases: AtomicU64::new(0),
+            retry_ns: AtomicU64::new(0),
             stats: None,
         })?;
         Ok((handle, pitch, byte_len))
@@ -2297,6 +2371,7 @@ impl GemState {
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
             leases: AtomicU64::new(0),
+            retry_ns: AtomicU64::new(0),
             stats: None,
         };
         let handle = self.insert(object)?;
@@ -2509,6 +2584,7 @@ impl CreateRequest {
             dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
             pin_count: AtomicU32::new(0),
             leases: AtomicU64::new(0),
+            retry_ns: AtomicU64::new(0),
             stats: None,
         }
     }
@@ -2774,6 +2850,7 @@ fn userptr(state: &GemState, arg: usize) -> Result<u64, FsError> {
         dma_buf: Arc::new(narf_filesystem::dma_buf::DmaBufObject::default()),
         pin_count: AtomicU32::new(0),
         leases: AtomicU64::new(0),
+        retry_ns: AtomicU64::new(0),
         stats: None,
     };
     let handle = state.insert(object)?;
