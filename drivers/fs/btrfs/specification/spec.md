@@ -95,7 +95,15 @@ at all. Three rules replace the mutex on that side:
 Content generations advance after acquiring that mutex and before changing
 bytes or length, and again when the mutation ends. A fill runs beside the
 mutation, so a generation sampled in between may tag old bytes; the second
-advance keeps them from staying current. Shrinking truncate publishes EOF and
+advance keeps them from staying current. The per-inode anchor and generation
+tables (`InodeTables`) hold only inodes some lookup or mapping holds: an
+`MmapAnchor` removes its entry and its inode's generation when its last
+reference drops, and a generation bump of an inode with no live anchor
+forgets the entry instead of inserting one. Every generation is a fresh tick
+from one never-repeating source, so a forgotten inode's next generation
+differs from every value a page was retained under; a reopened or recycled
+inode misses, never aliases. (The anchor table used to be pruned only at
+power-of-two sizes and the generation table never.) Shrinking truncate publishes EOF and
 revokes mappings under the operation lock before retiring extents, and revokes
 again afterwards (`truncate_pagecache`), since a fault past its EOF check is
 excluded by no lock; a failed revoke restores the cached inode there.

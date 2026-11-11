@@ -602,7 +602,8 @@ impl<B: BlockDevice> VolCore<B> {
     /// gives a pre-existing, never-mutated file an instance-unique
     /// value before any page can be retained under it.
     pub(crate) fn cache_generation(&self, tree: u64, ino: u64) -> u64 {
-        let mut generations = self.cache_generations.lock();
+        let mut tables = self.inode_tables.lock();
+        let generations = &mut tables.generations;
         match generations.values.get(&(tree, ino)) {
             Some(&generation) => generation,
             None => {
@@ -625,10 +626,26 @@ impl<B: BlockDevice> VolCore<B> {
     /// `mapping->invalidate_lock`/`filemap_invalidate_lock` fill exclusion).
     /// An allocating operation may retry after ENOSPC; each attempt gets
     /// its own epochs, including attempts that end in partial errors.
+    ///
+    /// With no live anchor for the inode (it is not open: an unlink of a
+    /// closed file, a create before its node exists) the entry is removed
+    /// instead: the next [`Self::cache_generation`] then issues a fresh
+    /// tick, newer than every value issued before, which is all a bump
+    /// promises — and nothing is left behind for an inode nobody holds.
+    /// Checked under the same lock that publishes anchors, so an anchor
+    /// cannot appear between the check and the update.
     pub(crate) fn bump_cache_generation(&self, tree: u64, ino: u64) {
-        let mut generations = self.cache_generations.lock();
-        let generation = generations.fresh_tick();
-        generations.values.insert((tree, ino), generation);
+        let mut tables = self.inode_tables.lock();
+        let open = tables
+            .anchors
+            .get(&(tree, ino))
+            .is_some_and(|anchor| anchor.strong_count() != 0);
+        if open {
+            let generation = tables.generations.fresh_tick();
+            tables.generations.values.insert((tree, ino), generation);
+        } else {
+            tables.generations.values.remove(&(tree, ino));
+        }
     }
 
     /// Forget every generation issued for fs tree `tree` (subvolume
@@ -639,38 +656,42 @@ impl<B: BlockDevice> VolCore<B> {
     /// from the same never-repeating tick source, so a recycled tree
     /// id starts from values no page was ever retained under.
     pub(crate) fn prune_cache_generations(&self, tree: u64) {
-        self.cache_generations
+        self.inode_tables
             .lock()
+            .generations
             .values
             .retain(|&(t, _), _| t != tree);
         self.orphans.lock().retain(|&(t, _)| t != tree);
     }
 
     /// The live [`MmapAnchor`] of inode `ino` in fs tree `tree`, created on
-    /// first use. Dead entries are pruned as the table grows.
+    /// first use. An anchor removes its own entry when its last holder
+    /// drops it ([`MmapAnchor`]'s `Drop`).
     pub(crate) fn mmap_anchor(&self, tree: u64, ino: u64, inode: InodeItem) -> Arc<MmapAnchor> {
-        let mut anchors = self.mmap_anchors.lock();
-        if let Some(anchor) = anchors.get(&(tree, ino)).and_then(Weak::upgrade) {
+        let mut tables = self.inode_tables.lock();
+        if let Some(anchor) = tables.anchors.get(&(tree, ino)).and_then(Weak::upgrade) {
             return anchor;
         }
-        if anchors.len() >= 256 && anchors.len().is_power_of_two() {
-            anchors.retain(|_, anchor| anchor.strong_count() != 0);
-        }
         let anchor = Arc::new(MmapAnchor {
-            _tree: tree,
-            _ino: ino,
+            tables: Arc::downgrade(&self.inode_tables),
+            tree,
+            ino,
             inode: IrqSafeSpinLock::new(inode),
             live_size: core::sync::atomic::AtomicU64::new(inode.size),
             update_seq: core::sync::atomic::AtomicU64::new(0),
             content_lock: Mutex::new(()),
         });
-        anchors.insert((tree, ino), Arc::downgrade(&anchor));
+        // Replaces at most a dead entry whose anchor's `Drop` has not run
+        // yet; that `Drop` then finds this anchor in place and leaves both
+        // it and the generation alone.
+        tables.anchors.insert((tree, ino), Arc::downgrade(&anchor));
         anchor
     }
 
     pub(crate) fn inode_is_open(&self, tree: u64, ino: u64) -> bool {
-        self.mmap_anchors
+        self.inode_tables
             .lock()
+            .anchors
             .get(&(tree, ino))
             .is_some_and(|inode| inode.strong_count() != 0)
     }
@@ -678,8 +699,9 @@ impl<B: BlockDevice> VolCore<B> {
     pub(crate) fn note_orphan(&self, tree: u64, ino: u64) {
         self.orphans.lock().insert((tree, ino));
         let anchor = self
-            .mmap_anchors
+            .inode_tables
             .lock()
+            .anchors
             .get(&(tree, ino))
             .and_then(Weak::upgrade);
         if let Some(anchor) = anchor {
@@ -788,8 +810,10 @@ impl<B: BlockDevice> VolCore<B> {
 /// inode holds it, so it cannot be reused while any mapping exists.
 #[derive(Debug)]
 pub(crate) struct MmapAnchor {
-    _tree: u64,
-    _ino: u64,
+    /// The table this anchor is published in, for its `Drop`.
+    tables: Weak<IrqSafeSpinLock<InodeTables>>,
+    tree: u64,
+    ino: u64,
     pub(crate) inode: IrqSafeSpinLock<InodeItem>,
     pub(crate) live_size: core::sync::atomic::AtomicU64,
     /// Sequence of the owning side's updates to `inode`/`live_size`, written
@@ -804,6 +828,50 @@ pub(crate) struct MmapAnchor {
     /// run between its steps; this keeps every other content change of the
     /// same inode out until it is done.
     pub(crate) content_lock: Mutex<()>,
+}
+
+impl Drop for MmapAnchor {
+    /// The inode's last lookup or mapping is gone: forget its anchor entry
+    /// and its content generation, so neither table grows with every file
+    /// ever opened. The generation may go because nothing can match it any
+    /// more: a page retained under it is keyed by this anchor's address,
+    /// which no later open is promised to get, and the inode's next
+    /// generation is a fresh tick no page was ever retained under (see
+    /// [`CacheGenerations`]). Linux likewise frees `btrfs_inode` (and its
+    /// `i_version`) when the last reference to an inode goes.
+    ///
+    /// Leaves both alone if a newer anchor of the inode has already taken
+    /// the slot (it was published after this one's last reference went but
+    /// before this ran): that anchor carries the inode's generation on.
+    fn drop(&mut self) {
+        let Some(tables) = self.tables.upgrade() else {
+            return;
+        };
+        let mut tables = tables.lock();
+        let key = (self.tree, self.ino);
+        let mine = tables
+            .anchors
+            .get(&key)
+            .is_some_and(|anchor| core::ptr::eq(anchor.as_ptr(), self));
+        if mine {
+            tables.anchors.remove(&key);
+            tables.generations.values.remove(&key);
+        }
+    }
+}
+
+/// Per-inode tables of one filesystem instance, keyed by
+/// `(fs tree id, inode number)`, under one lock so an anchor's publication,
+/// its removal and the generation updates that depend on whether it is live
+/// are atomic with respect to each other. The generation domain is exactly
+/// the identity domain, so both live on the shared core, not a mount view.
+#[derive(Debug)]
+pub(crate) struct InodeTables {
+    /// Live [`MmapAnchor`]s. An entry outlives its anchor only between the
+    /// anchor's last reference and its `Drop`.
+    anchors: BTreeMap<(u64, u64), Weak<MmapAnchor>>,
+    /// Content generations of open inodes ([`CacheGenerations`]).
+    generations: CacheGenerations,
 }
 
 /// Content-generation counters for one filesystem instance, backing
@@ -824,6 +892,16 @@ pub(crate) struct MmapAnchor {
 /// it. That uniqueness is what makes the generation half of the
 /// page cache's (identity, generation) guard sound even when an
 /// identity anchor's address is recycled.
+///
+/// It is also what makes forgetting an entry safe: a forgotten key
+/// is reissued from the same tick source, so its next value differs
+/// from every value any page was ever retained under, and a
+/// recycled inode (or a reopened one) can only miss, never alias an
+/// old instance. Entries are kept only for inodes with a live
+/// [`MmapAnchor`]: the anchor's `Drop` forgets its inode's entry,
+/// and a bump of an inode without one forgets instead of
+/// inserting, so the map tracks the files open now rather than
+/// every file ever touched.
 #[derive(Debug)]
 pub(crate) struct CacheGenerations {
     values: BTreeMap<(u64, u64), u64>,
@@ -855,17 +933,14 @@ impl CacheGenerations {
 /// allocator, pinned extents, and the commit timer.
 #[derive(Debug)]
 pub struct VolCore<B: BlockDevice> {
-    /// Live [`MmapAnchor`]s by `(fs tree id, inode number)`.
-    mmap_anchors: IrqSafeSpinLock<BTreeMap<(u64, u64), Weak<MmapAnchor>>>,
+    /// Live [`MmapAnchor`]s and the content generations backing
+    /// `FileOps::mmap_cache_generation` ([`InodeTables`]), by
+    /// `(fs tree id, inode number)`. Shared with the anchors, which remove
+    /// themselves when dropped.
+    inode_tables: Arc<IrqSafeSpinLock<InodeTables>>,
     /// Unlinked inode items are persisted with Linux ORPHAN_ITEM records.
     /// Cleanup waits for every lookup/mapping anchor, then runs under op_lock.
     orphans: IrqSafeSpinLock<BTreeSet<(u64, u64)>>,
-    /// Per-inode content generations backing
-    /// `FileOps::mmap_cache_generation`, keyed by the same
-    /// `(fs tree id, inode number)` pair as `mmap_anchors`: the
-    /// generation domain must be exactly the identity domain, so
-    /// both live here on the shared core, not on a mount view.
-    cache_generations: IrqSafeSpinLock<CacheGenerations>,
     /// Source device passed first at mount. Retained for compatibility with
     /// single-device callers and tests; logical I/O routes through `devices`.
     pub device: Arc<B>,
@@ -2349,9 +2424,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let node_cache = Arc::new(IrqSafeSpinLock::new(NodeCache::new(node_cache_budget())));
         register_node_cache(&node_cache);
         let core = Arc::new(VolCore {
-            mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
+            inode_tables: Arc::new(IrqSafeSpinLock::new(InodeTables {
+                anchors: BTreeMap::new(),
+                generations: CacheGenerations::new(),
+            })),
             orphans: IrqSafeSpinLock::new(BTreeSet::new()),
-            cache_generations: IrqSafeSpinLock::new(CacheGenerations::new()),
             device: source_device,
             magic: superblock.magic,
             nodesize: superblock.nodesize,
