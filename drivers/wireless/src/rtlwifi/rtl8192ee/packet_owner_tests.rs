@@ -284,9 +284,19 @@ pub(crate) fn smoke_rtl8192ee_txbd_doorbell_completion_and_rx_ack() -> TestResul
         || !bus.traced((16, 0x100, 0x2ff))
         || !bus.traced((16, 0x300, 0x8000))
         || !master
-        || owner.enable_interrupts() != Err(Error::State)
     {
         return TestResult::Fail("REG_CR / REG_PCIE_CTRL_REG release");
+    }
+    // rtl92ee_enable_interrupt (c2c8ae88b): HIMR / HIMRE masks, once.
+    {
+        use super::super::super::super::rtl8192ee::h2c;
+        if owner.enable_interrupts().is_err()
+            || !bus.traced((32, h2c::REG_HIMR, h2c::IRQ_MASK0))
+            || !bus.traced((32, h2c::REG_HIMRE, h2c::IRQ_MASK1))
+            || owner.enable_interrupts() != Err(Error::State)
+        {
+            return TestResult::Fail("8192EE interrupt masks after start");
+        }
     }
     // Non-QoS to-DS DATA on BE.
     let mut frame = vec![0u8; 40];
@@ -429,6 +439,13 @@ pub(crate) fn smoke_rtl8192ee_rsvd_page_download_through_beacon_bd() -> TestResu
     let mut owner = running(&bus, local);
     bus.0.lock().regs[0x422] = 0x40;
     bus.0.lock().regs[0x6a9] = 0xc0;
+    // Only the join's own writes are ordered below (start_packets wrote
+    // 0x422/0x550 already).
+    bus.0.lock().trace.clear();
+    // `_rtl92ee_download_rsvd_page` (rtl8192ee/hw.c:366-374) writes
+    // `REG_MGQ_TXBD_NUM + 3 = txbc | BIT(4)` from what it read; init_mac
+    // left the RX_RXBD_NUM high byte there.
+    let txbc = bus.0.lock().regs[0x383];
     let policy = |_: &Prepared<Bus, Block>| Ok(());
     if narf_scheduler::block_on(owner.ee92_join_report(bssid, 0, None, &policy))
         != Err(Error::Packet)
@@ -480,7 +497,7 @@ pub(crate) fn smoke_rtl8192ee_rsvd_page_download_through_beacon_bd() -> TestResu
         (8, 0x422, 0x00),
         (8, 0x20a, 0x01),
         (8, 0x1d0, 0x00),
-        (8, 0x383, 0x10),
+        (8, 0x383, u32::from(txbc | 0x10)),
         (8, 0x20a, 0x01),
         (8, 0x550, 0x1d),
         (8, 0x550, 0x0d),

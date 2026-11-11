@@ -76,7 +76,14 @@ fn smoke_rtl8192ee_init_mac_prefix_and_enable_flow() -> TestResult {
     if g.1[1] != (0x7c, 0xc3) || g.1.iter().any(|w| w.0 == 0x16) {
         return TestResult::Fail("SYS_CFG1[24] must select 0x7c=0xc3 without 0x16");
     }
-    if RTL8192EE_PWR_ON.as_ptr() != pwrseq::RTL8192E_CARD_ENABLE_FLOW.as_ptr() {
+    // Row-for-row identity (a `static` initialised from another static's
+    // slice need not share its address once relocated).
+    let rows = |f: &[WlanPwrCfg]| -> Vec<(u16, u8, u8, u8, u8, u8)> {
+        f.iter()
+            .map(|r| (r.offset, r.cut_msk, r.fab_intf, r.base_cmd, r.msk, r.value))
+            .collect()
+    };
+    if rows(RTL8192EE_PWR_ON) != rows(pwrseq::RTL8192E_CARD_ENABLE_FLOW) {
         return TestResult::Fail("8192EE power table is not the generated enable flow");
     }
     TestResult::Pass
@@ -821,10 +828,12 @@ pub(crate) fn smoke_rtl8192ee_tables_and_check_condition_walk() -> TestResult {
     }
     // A discarded branch without `else`: Linux re-examines the DEAD row as a
     // condition and discards forward from it; the last row is then data.
+    // Branch rows need `v1 >= 0xcdcdcdcd` (rtl8192ee/phy.c:682); board 5,
+    // any interface (0x07), any platform (0x0f).
     let quirk = [
-        [0x000f_0705, 0xabcd],
+        [0xff0f_0705, 0xabcd],
         [0x800, 1],
-        [0x000f_0705, 0xdead],
+        [0xff0f_0705, 0xdead],
         [0x804, 2],
         [0x808, 3],
     ];
