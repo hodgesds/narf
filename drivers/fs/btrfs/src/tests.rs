@@ -26,6 +26,7 @@ mod overwrite_cost;
 mod release_cost;
 mod root_collapse;
 mod safety;
+mod snapshot_gen;
 mod snapshots;
 mod write_buffers;
 
@@ -2866,18 +2867,22 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
         _ => return TestResult::Fail("simple snapshot failed to mount"),
     };
     let snapshot_id = snapshot.fs_tree_id();
+    // Its root is a copy of the source's (`btrfs_copy_root`): one new node
+    // the snapshot owns, which simple quotas charge to it; nothing else.
     if qgroup_item(&snapshot, format::QGROUP_INFO_KEY, snapshot_id)
         .and_then(|body| format::le64(&body, 8).ok())
         .unwrap_or(u64::MAX)
-        != 0
+        != snapshot.nodesize() as u64
         || !qgroup_relation_present(&snapshot, snapshot_id, PARENT)
     {
-        return TestResult::Fail("shared snapshot was charged or missed auto-inheritance");
+        return TestResult::Fail(
+            "snapshot was charged other than its root copy, or missed auto-inheritance",
+        );
     }
 
-    // The source qgroup cannot disappear while the shared root still contains
-    // metadata permanently owned by it. Once the snapshot COWs that final
-    // holder, the debit must still find the orphaned qgroup.
+    // The snapshot holds nothing the source owns (it copied the source's
+    // only block, its root leaf), so deleting the source debits all of the
+    // source's usage at once.
     // Batched commits: durable only once synced, as a real unmount would
     // flush. Without it this would assert UNSYNCED data survives.
     let _ = poll_once(snapshot.sync_to_disk());
@@ -2899,8 +2904,8 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     let orphan_usage = qgroup_item(&top_for_delete, format::QGROUP_INFO_KEY, child_id)
         .and_then(|body| format::le64(&body, 8).ok())
         .unwrap_or(0);
-    if orphan_usage != child_usage {
-        return TestResult::Fail("simple source qgroup was dropped before its final debit");
+    if orphan_usage != 0 {
+        return TestResult::Fail("simple source qgroup kept usage its deletion freed");
     }
     // Batched commits: sync before reading the volume back from disk.
     let _ = poll_once(top_for_delete.sync_to_disk());
@@ -2933,7 +2938,7 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     }
     let debited_orphan = qgroup_item(&snapshot, format::QGROUP_INFO_KEY, child_id)
         .and_then(|body| format::le64(&body, 8).ok());
-    if debited_orphan != Some(0) {
+    if debited_orphan.is_some_and(|usage| usage != 0) {
         return TestResult::Fail("simple orphan qgroup missed its final owner debit");
     }
 
@@ -8676,6 +8681,7 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
     let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
     let source_big_extent;
     let pre_snapshot_root;
+    let pre_snapshot_node;
     {
         let vol = match poll_once(BtrfsVolume::mount_opts(
             device.clone(),
@@ -8695,6 +8701,12 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             None => return TestResult::Fail("source big.dat extent missing"),
         };
         pre_snapshot_root = vol.fs_tree_root();
+        // The source's root as the snapshot copies it: the block itself is
+        // freed by the source's own COW in the same transaction.
+        pre_snapshot_node = match poll_once(vol.read_node_shared(pre_snapshot_root.0)) {
+            Some(Ok(node)) => node,
+            _ => return TestResult::Fail("source root did not read"),
+        };
         if !matches!(
             poll_once(root.snapshot_async(root.clone(), "snap", false)),
             Some(Ok(()))
@@ -8728,8 +8740,17 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             return TestResult::Fail("writable snapshot remounted read-only");
         }
         snapshot_id = snap.fs_tree_id();
-        if snap.fs_tree_root() != pre_snapshot_root {
-            return TestResult::Fail("snapshot did not retain the source point-in-time root");
+        let pre_node = &pre_snapshot_node;
+        let Some(Ok(snap_node)) = poll_once(snap.read_node_shared(snap.fs_tree_root().0)) else {
+            return TestResult::Fail("snapshot root block did not read");
+        };
+        if snap.fs_tree_root() == pre_snapshot_root
+            || snap.fs_tree_root().1 != pre_snapshot_root.1
+            || pre_node.get(HEADER_SIZE..) != snap_node.get(HEADER_SIZE..)
+        {
+            return TestResult::Fail(
+                "snapshot root is not a copy of the source's point-in-time root",
+            );
         }
         let extent_root = match poll_once(crate::roots::find_root(
             &*snap,
@@ -8751,6 +8772,9 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             Some(Ok(Some(body))) => body,
             _ => return TestResult::Fail("shared snapshot extent item missing"),
         };
+        // The snapshot's copy of the source's root leaf holds the extent
+        // through a data reference of its own (`btrfs_inc_ref`), beside the
+        // source's.
         if format::le64(&extent_item, 0).ok() != Some(2) {
             return TestResult::Fail("shared extent aggregate refcount is not two");
         }
@@ -8765,8 +8789,11 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
             counts.push(format::le32(&extent_item, pos + 25).unwrap_or(0));
             pos += 29;
         }
-        if roots.as_slice() != [format::FS_TREE_OBJECTID] || counts.as_slice() != [2] {
-            return TestResult::Fail("implicit snapshot data reference was not retained");
+        let mut pairs: Vec<(u64, u32)> =
+            roots.iter().copied().zip(counts.iter().copied()).collect();
+        pairs.sort_unstable();
+        if pairs.as_slice() != [(format::FS_TREE_OBJECTID, 1), (snapshot_id, 1)] {
+            return TestResult::Fail("snapshot data reference was not its own");
         }
         let hello = match poll_once(snap.root().lookup_async("hello.txt")) {
             Some(Ok(f)) => f,
@@ -8998,8 +9025,26 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
     };
     let shared_id = shared.fs_tree_id();
     let shared_root = shared.fs_tree_root();
-    if origin.fs_tree_root() != shared_root {
-        return TestResult::Fail("snapshot did not share the origin metadata root");
+    let origin_root = origin.fs_tree_root();
+    // Linux `btrfs_copy_root`: the snapshot's root is a block of its own,
+    // owned by it, with the origin root's level and contents; the two trees
+    // share what is below it.
+    if origin_root == shared_root {
+        return TestResult::Fail("snapshot shares the origin's root block");
+    }
+    let (Some(Ok(origin_node)), Some(Ok(shared_node))) = (
+        poll_once(shared.read_node_shared(origin_root.0)),
+        poll_once(shared.read_node_shared(shared_root.0)),
+    ) else {
+        return TestResult::Fail("snapshot root blocks did not read");
+    };
+    if origin_root.1 != shared_root.1
+        || origin_node.get(HEADER_SIZE..) != shared_node.get(HEADER_SIZE..)
+        || format::le64(&shared_node, 88).ok() != Some(shared_id)
+    {
+        return TestResult::Fail(
+            "snapshot root is not a copy of the origin's owned by the snapshot",
+        );
     }
     let extent_root = match poll_once(crate::roots::find_root(
         &*shared,
@@ -9019,22 +9064,13 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
         ),
     )) {
         Some(Ok(Some(body))) => body,
-        _ => return TestResult::Fail("shared metadata extent item missing"),
+        _ => return TestResult::Fail("snapshot root metadata extent item missing"),
     };
-    if format::le64(&metadata, 0).ok() != Some(2) {
-        return TestResult::Fail("shared metadata root refcount was not two");
-    }
-    let mut root_refs = Vec::new();
-    let mut pos = 24usize;
-    while pos < metadata.len() {
-        if metadata[pos] != 176 || pos + 9 > metadata.len() {
-            return TestResult::Fail("shared metadata inline refs were malformed");
-        }
-        root_refs.push(format::le64(&metadata, pos + 1).unwrap_or(0));
-        pos += 9;
-    }
-    if !root_refs.contains(&origin_id) || !root_refs.contains(&shared_id) {
-        return TestResult::Fail("shared metadata did not name both subvolume roots");
+    if format::le64(&metadata, 0).ok() != Some(1)
+        || metadata.get(24) != Some(&176)
+        || format::le64(&metadata, 25).ok() != Some(shared_id)
+    {
+        return TestResult::Fail("snapshot root block is not held by the snapshot alone");
     }
 
     // The first origin mutation must materialise it privately while the snapshot
@@ -9042,8 +9078,8 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
     if !matches!(poll_once(origin.root().create("origin-only")), Some(Ok(_))) {
         return TestResult::Fail("shared origin first mutation failed");
     }
-    if origin.fs_tree_root() == shared_root {
-        return TestResult::Fail("shared origin was not materialised before mutation");
+    if origin.fs_tree_root() == origin_root {
+        return TestResult::Fail("shared origin was not COWed by its mutation");
     }
     // Batched commits: durable only once synced, as a real unmount would
     // flush. Without it this would assert UNSYNCED data survives.
@@ -9064,8 +9100,8 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
         return TestResult::Fail("origin mutation leaked into shared snapshot");
     }
 
-    // The snapshot is now the final holder of the old root. Deleting it must
-    // reclaim that tree while leaving the materialised origin mountable.
+    // Deleting the snapshot must reclaim its tree while leaving the origin
+    // mountable.
     // Batched commits: durable only once synced, as a real unmount would
     // flush. Without it this would assert UNSYNCED data survives.
     let _ = poll_once(shared_after.sync_to_disk());

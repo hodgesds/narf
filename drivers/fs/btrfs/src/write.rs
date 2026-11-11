@@ -2962,6 +2962,22 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         Ok(cow)
     }
 
+    /// Count `refs` before any COW decides on them: references another tree
+    /// takes in this same transaction (a snapshot's on the children of the
+    /// root it copies, Linux `btrfs_inc_ref`).
+    pub(crate) async fn add_refs(
+        &mut self,
+        refs: &[(crate::backref::Target, crate::backref::RefKind)],
+    ) -> Result<(), FsError> {
+        let vol = self.vol;
+        let shared = self.state.shared.as_mut().ok_or(FsError::InvalidData)?;
+        let ext = shared.extent_root;
+        for &(target, kind) in refs {
+            shared.refs.add(vol, ext, target, kind).await?;
+        }
+        Ok(())
+    }
+
     /// Linux `update_ref_for_cow` + `btrfs_free_tree_block` for the
     /// committed block `addr` (contents `buf`) this tree is about to COW,
     /// decided before the descent reaches its children so their reference
@@ -7186,75 +7202,28 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
             di,
         ),
     ];
-    let snapshotting_parent = source_id == vol.fs_tree_id();
-    let (parent_commit, parent_added_data, added_meta, dropped_meta) = if snapshotting_parent {
-        // The namespace insertion COWs the mounted source itself. Repack that
-        // source privately and transfer its old root reference to the snapshot;
-        // otherwise PathCow would reclaim blocks the new snapshot names.
-        let (mut logical, _) = read_fs_oversized(vol, fs_root).await?;
-        let parent_added_data = collect_data_refs(&logical, source_id)?;
-        for edit in &parent_edits {
-            match edit {
-                Edit::Upsert(key, body) => match leaf_find(&logical, key)? {
-                    Some(slot) => leaf_replace_inplace(&mut logical, slot, body)?,
-                    None => leaf_insert_sorted(&mut logical, key, body)?,
-                },
-                Edit::Delete(key) => {
-                    let slot = leaf_find(&logical, key)?.ok_or(FsError::NotFound)?;
-                    leaf_delete(&mut logical, slot)?;
-                }
-            }
-        }
-        logical[HDR_OWNER..HDR_OWNER + 8].copy_from_slice(&source_id.to_le_bytes());
-        let groups = group_items(vol, &logical)?;
-        let addrs = alloc_nodes(
-            &mut alloc,
-            vol,
-            tree_block_count(groups.len(), vol.nodesize()),
-        )?;
-        let (nodes, root, root_level) = pack_tree_at(vol, &logical, &groups, &addrs, gen)?;
-        let mut blocks = Vec::new();
-        collect_tree_meta(&addrs, groups.len(), vol.nodesize(), source_id, &mut blocks);
-        (
-            FsCommit {
-                nodes,
-                new_blocks: blocks
-                    .into_iter()
-                    .map(|(addr, _owner, level)| (addr, level))
-                    .collect(),
-                freed: Vec::new(),
-                root,
-                level: root_level,
-                refs: Default::default(),
-            },
-            parent_added_data,
-            alloc::vec![MetaRefId {
-                bytenr: source_root,
-                level: source_level,
-                ref_root: new_id,
-            }],
-            alloc::vec![MetaRefId {
-                bytenr: source_root,
-                level: source_level,
-                ref_root: source_id,
-            }],
-        )
-    } else {
-        let parent_out = PathCow::new_shared(vol, gen, fs_root, fs_level, vol.fs_tree_id())
-            .await?
-            .apply(&mut alloc, &parent_edits)
-            .await?;
-        (
-            fs_commit_from(parent_out, gen, vol.csum_type())?,
-            Vec::new(),
-            alloc::vec![MetaRefId {
-                bytenr: source_root,
-                level: source_level,
-                ref_root: new_id,
-            }],
-            Vec::new(),
-        )
-    };
+    // The snapshot's root is a copy of the source's, written in this
+    // transaction and owned by the snapshot, which takes a reference of its
+    // own on every child (a tree ref per child block, a data ref per file
+    // extent of a leaf) — Linux `create_pending_snapshot` → `btrfs_copy_root`
+    // + `btrfs_inc_ref`. Naming the source's root block instead shared a root
+    // between two trees and left the snapshot's ROOT_ITEM, stamped with this
+    // transaction's generation, over a block of an older one, which Linux
+    // refuses to read ("parent transid verify failed") until something
+    // rewrites it — and a read-only snapshot never is.
+    let copy_addr = alloc.alloc_node(vol)?;
+    let mut copy = source_node.clone();
+    normalize_cow_header(&mut copy, new_id);
+    stamp_node(&mut copy, copy_addr, gen, vol.csum_type())?;
+    let snapshot_refs = crate::backref::child_refs(&source_node, copy_addr, new_id, false)?;
+    // The namespace insertion COWs the parent tree with the snapshot's
+    // references already counted, so a block both trees now hold is shared
+    // there (`update_ref_for_cow`), not reclaimed — also when the parent is
+    // the source itself, whose old root then has no holder left and goes.
+    let mut parent_cow = PathCow::new_shared(vol, gen, fs_root, fs_level, vol.fs_tree_id()).await?;
+    parent_cow.add_refs(&snapshot_refs).await?;
+    let parent_out = parent_cow.apply(&mut alloc, &parent_edits).await?;
+    let parent_commit = fs_commit_from(parent_out, gen, vol.csum_type())?;
 
     let source_key = BtrfsKey::new(source_id, format::ROOT_ITEM_KEY, 0);
     let source_cursor = btree::Cursor::seek(vol, root_tree, &source_key).await?;
@@ -7276,13 +7245,7 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
     };
     let tree_bytes = le64(&source_item, 192)?;
     let mut root_item = subvol_root_item(
-        gen,
-        source_root,
-        tree_bytes,
-        flags,
-        &uuid,
-        ptime_sec,
-        ptime_nsec,
+        gen, copy_addr, tree_bytes, flags, &uuid, ptime_sec, ptime_nsec,
     );
     root_item[238] = source_level;
     if source_item.len() >= 160 {
@@ -7304,7 +7267,17 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
         ),
     ];
 
-    let mut extra_trees = Vec::new();
+    let mut extra_trees = alloc::vec![ExtraTree {
+        owner: new_id,
+        commit: FsCommit {
+            nodes: alloc::vec![(copy_addr, copy)],
+            new_blocks: alloc::vec![(copy_addr, source_level)],
+            freed: Vec::new(),
+            root: copy_addr,
+            level: source_level,
+            refs: Default::default(),
+        },
+    }];
     if let Ok((uuid_root, uuid_level)) =
         roots::find_root(vol, root_tree, format::UUID_TREE_OBJECTID).await
     {
@@ -7334,9 +7307,9 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
             chunk_alloc: None,
             fs: parent_commit,
             dropped_data: Vec::new(),
-            added_data: parent_added_data,
-            added_meta,
-            dropped_meta,
+            added_data: Vec::new(),
+            added_meta: Vec::new(),
+            dropped_meta: Vec::new(),
             new_data: Vec::new(),
             root_flags: None,
             extra_trees,
