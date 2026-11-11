@@ -381,6 +381,20 @@ one step, only those. `write::set_dealloc_step_sync` commits every step on
 its own, for the crash tests of the `release` scenario
 (`smoke_btrfs_fallocate_reserves_in_steps`).
 
+A truncate or fallocate holds its inode's own lock (`MmapAnchor::content_lock`,
+Linux `inode_lock`) from start to end, and takes the volume's operation lock
+one step at a time (`write::locked_step`, with the orphan reaping and the
+grow-and-retry `autogrow!` gives a whole operation), yielding between steps
+(`write::step_break`, Linux ending its transaction and
+`btrfs_btree_balance_dirty`). Other operations of the filesystem run between
+two steps (`smoke_btrfs_truncate_steps_let_others_run`); writes, truncates,
+fallocates and attribute changes of the same inode take the inode lock too and
+wait (`smoke_btrfs_truncates_of_one_file_serialize`). Each truncate step works
+out its range from the tree as it is. An orphan's eviction takes at most 64
+steps per operation (`orphans::REAP_STEP_BUDGET`); the rest goes on in the
+operations, fsyncs and commit-timer passes that follow, and a mount evicts its
+recovered orphans whole.
+
 An `ORPHAN_ITEM` whose inode still has links, or no longer exists, marks
 no inode to reclaim. Recovery does with it what Linux `btrfs_orphan_cleanup`
 does (`if (!inode || inode->vfs_inode.i_nlink)`): for an inode that has

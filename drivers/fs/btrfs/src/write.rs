@@ -8023,6 +8023,56 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     Ok(())
 }
 
+/// One step of a long operation — a truncate, a fallocate — under the
+/// volume's operation lock, as `autogrow!` runs a whole operation: refused
+/// on a filesystem that no longer takes writes, preceded by orphan reaping,
+/// and retried after growing the filesystem by a chunk when it runs out of
+/// space. The lock is released when the step is done, so other operations
+/// run between two steps; the caller holds the inode's own lock
+/// (`MmapAnchor::content_lock`, Linux `inode_lock`) across all of them, and
+/// yields between steps ([`step_break`]). Linux likewise ends and restarts
+/// its transaction between steps and calls `btrfs_btree_balance_dirty`,
+/// which may sleep.
+pub(crate) async fn locked_step<B, F, Fut, T>(vol: &BtrfsVolume<B>, mut op: F) -> Result<T, FsError>
+where
+    B: BlockDevice + 'static,
+    F: FnMut() -> Fut,
+    Fut: core::future::Future<Output = Result<T, FsError>>,
+{
+    if !vol.admits_writes() {
+        return Err(FsError::ReadOnly);
+    }
+    let _op = vol.op_lock().lock().await;
+    if !vol.admits_writes() {
+        return Err(FsError::ReadOnly);
+    }
+    let mut r = match vol.reap_orphans().await {
+        Ok(()) => op().await,
+        Err(error) => Err(error),
+    };
+    let root_rw = crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw;
+    let mut tries = 0u32;
+    while tries < 4 && matches!(r, Err(FsError::NoSpace)) {
+        if root_rw {
+            root_rw_grow(vol).await?;
+        } else {
+            grow_add_chunk(vol).await?;
+        }
+        tries += 1;
+        r = match vol.reap_orphans().await {
+            Ok(()) => op().await,
+            Err(error) => Err(error),
+        };
+    }
+    r
+}
+
+/// Between two steps of a long operation: let the scheduler run other
+/// work (`cond_resched`).
+pub(crate) async fn step_break() {
+    narf_scheduler::yield_now().await;
+}
+
 /// Whether every step of freeing a file's data is committed on its own
 /// ([`set_dealloc_step_sync`]).
 static DEALLOC_STEP_SYNC: core::sync::atomic::AtomicBool =
@@ -8077,11 +8127,25 @@ pub(crate) const DEALLOC_STEP_EXTENTS: usize = 16;
 /// leaves an orphan that the next writable mount goes on reclaiming; the
 /// last step removes what remains, the inode item and the ORPHAN_ITEM in one
 /// COW edit. A directory orphan (an emptied directory removed while open)
-/// is reclaimed the same way.
+/// is reclaimed the same way. (Operations go through
+/// [`reclaim_orphan_steps`] with a step budget; this whole-orphan form is
+/// for tests.)
+#[cfg(feature = "kernel-test")]
 pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
 ) -> Result<(), FsError> {
+    reclaim_orphan_steps(vol, ino, usize::MAX).await.map(|_| ())
+}
+
+/// [`reclaim_orphan`], taking at most `budget` steps that keep the inode.
+/// `Ok(true)` once the orphan is gone, `Ok(false)` if steps remain.
+pub(crate) async fn reclaim_orphan_steps<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    budget: usize,
+) -> Result<bool, FsError> {
+    let mut steps = 0usize;
     loop {
         let (root, _) = vol.fs_tree_root();
         let orphan = crate::orphans::key(ino);
@@ -8114,7 +8178,7 @@ pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
                     "btrfs: deleting the stale orphan item of inode {ino} ({state})"
                 );
                 commit_fs_edits_reclaiming(vol, &[Edit::Delete(orphan)], Vec::new()).await?;
-                return Ok(());
+                return Ok(true);
             }
             Err(error) => return Err(error),
         };
@@ -8205,13 +8269,17 @@ pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
             edits.push(Edit::Upsert(inode_key, item));
             commit_fs_edits_reclaiming(vol, &edits, dropped_data).await?;
             dealloc_step_done(vol).await?;
+            steps += 1;
+            if steps >= budget {
+                return Ok(false);
+            }
             continue;
         }
         edits.push(Edit::Delete(inode_key));
         edits.push(Edit::Delete(orphan));
         commit_fs_edits_reclaiming(vol, &edits, dropped_data).await?;
         vol.bump_cache_generation(vol.fs_tree_id(), ino);
-        return Ok(());
+        return Ok(true);
     }
 }
 

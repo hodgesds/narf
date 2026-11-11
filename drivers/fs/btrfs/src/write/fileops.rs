@@ -603,60 +603,70 @@ pub async fn truncate_file<B: BlockDevice + 'static>(
 ) -> Result<(), FsError> {
     let ss = u64::from(vol.sectorsize());
     crate::stats::begin_step_marks();
-    let steps = truncate_steps(vol, ino, new_size).await?;
-    let last = steps.len();
-    for (index, (size, drop_from)) in steps
-        .into_iter()
-        .chain([(new_size, align_up(new_size, ss))])
-        .enumerate()
-    {
-        let r = {
-            let _hold = vol.hold_commits();
-            with_space_retry(vol, || truncate_once(vol, ino, size, drop_from)).await
-        };
-        flush_if_full(vol).await?;
-        r?;
-        if index < last {
-            crate::stats::note_step_mark(size);
+    loop {
+        // Each step works out its own range from the tree as it is, under
+        // the operation lock; the caller's inode lock keeps every other
+        // change of this file out in between.
+        let last = super::locked_step(vol, move || async move {
+            let next = next_truncate_step(vol, ino, new_size).await?;
+            let (size, drop_from) = next.unwrap_or((new_size, align_up(new_size, ss)));
+            let r = {
+                let _hold = vol.hold_commits();
+                with_space_retry(vol, || truncate_once(vol, ino, size, drop_from)).await
+            };
+            flush_if_full(vol).await?;
+            r?;
+            if next.is_some() {
+                crate::stats::note_step_mark(size);
+            }
+            super::dealloc_step_done(vol).await?;
+            Ok(next.is_none())
+        })
+        .await?;
+        if last {
+            return Ok(());
         }
-        super::dealloc_step_done(vol).await?;
+        super::step_break().await;
     }
-    Ok(())
 }
 
-/// The steps a shrinking (or same-size) truncate to `new_size` takes before
-/// its last: `(size, drop_from)` pairs, highest first, each dropping the
-/// extent items from `drop_from` on — at most
-/// [`super::DEALLOC_STEP_EXTENTS`] of them — and leaving the file `size`
-/// long (its own size where the items dropped are preallocation past EOF).
-async fn truncate_steps<B: BlockDevice + 'static>(
+/// The next step of a shrinking (or same-size) truncate to `new_size`
+/// before its last: `(size, drop_from)`, dropping the
+/// [`super::DEALLOC_STEP_EXTENTS`] highest extent items from `drop_from` on
+/// and leaving the file `size` long (its own size where the items dropped
+/// are preallocation past EOF). `None` when what is left is the last step's
+/// worth. Reads only the items it drops, from the end down.
+async fn next_truncate_step<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
     new_size: u64,
-) -> Result<Vec<(u64, u64)>, FsError> {
+) -> Result<Option<(u64, u64)>, FsError> {
     let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
     if !inode.is_regular() || new_size > inode.size {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let cut = align_up(new_size, u64::from(vol.sectorsize()));
     let (fs_root, _) = vol.fs_tree_root();
-    let first = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, cut);
-    let mut cursor = btree::Cursor::seek(vol, fs_root, &first).await?;
+    let mut ceiling = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, u64::MAX);
     let mut starts: Vec<u64> = Vec::new();
-    while let Some((key, _)) = cursor.current()? {
-        if key.objectid != ino || key.item_type != format::EXTENT_DATA_KEY {
-            break;
+    while starts.len() <= super::DEALLOC_STEP_EXTENTS {
+        match btree::last_before(vol, fs_root, &ceiling).await? {
+            Some((key, _))
+                if key.objectid == ino
+                    && key.item_type == format::EXTENT_DATA_KEY
+                    && key.offset >= cut =>
+            {
+                starts.push(key.offset);
+                ceiling = key;
+            }
+            _ => break,
         }
-        starts.push(key.offset);
-        cursor.advance().await?;
     }
-    let mut steps = Vec::new();
-    let mut left = starts.len();
-    while left > super::DEALLOC_STEP_EXTENTS {
-        left -= super::DEALLOC_STEP_EXTENTS;
-        steps.push((starts[left].min(inode.size).max(new_size), starts[left]));
+    if starts.len() <= super::DEALLOC_STEP_EXTENTS {
+        return Ok(None);
     }
-    Ok(steps)
+    let drop_from = starts[super::DEALLOC_STEP_EXTENTS - 1];
+    Ok(Some((drop_from.min(inode.size).max(new_size), drop_from)))
 }
 
 /// Truncate to `new_size`, dropping the extent items from `drop_from` on
@@ -796,67 +806,86 @@ pub async fn fallocate_file<B: BlockDevice + 'static>(
     }
     crate::stats::begin_step_marks();
     if !punch {
-        with_space_retry(vol, || prealloc_fits(vol, ino, offset, end, zero)).await?;
+        super::locked_step(vol, move || {
+            with_space_retry(vol, move || prealloc_fits(vol, ino, offset, end, zero))
+        })
+        .await?;
     }
     let ss = u64::from(vol.sectorsize());
     // Where the next punching step starts (after the first), where the next
     // preallocating step starts, and the end preallocation may run to now:
     // none while a zero-range has punched no further than it has filled.
-    let mut punching = punch || zero;
-    let mut punch_from: Option<u64> = None;
-    let mut fill_from: Option<u64> = None;
-    let mut fill_to: Option<u64> = (!punching).then_some(end);
+    // Shared with the step, which is run again after the filesystem grew and
+    // then sees what the first try already staged. Atomics, as the future
+    // must be `Send`; `NONE` stands for `None`.
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    const NONE: u64 = u64::MAX;
+    let get = |cell: &AtomicU64| Some(cell.load(Relaxed)).filter(|&v| v != NONE);
+    let put = |cell: &AtomicU64, value: Option<u64>| cell.store(value.unwrap_or(NONE), Relaxed);
+    let punching = AtomicBool::new(punch || zero);
+    let punch_from = AtomicU64::new(NONE);
+    let fill_from = AtomicU64::new(NONE);
+    let fill_to = AtomicU64::new(if punch || zero { NONE } else { end });
+    let (punching, punch_from, fill_from, fill_to) = (&punching, &punch_from, &fill_from, &fill_to);
     loop {
-        // Edge zeroing, uninlining, a step's punch and its allocation are
-        // separate stages; keep them in one transaction.
-        let step: Result<bool, FsError> = async {
-            let _hold = vol.hold_commits();
-            if fill_to.is_none() {
-                let from = punch_from;
-                match with_space_retry(vol, || punch_step(vol, ino, offset, end, from, zero))
+        let done = super::locked_step(vol, move || async move {
+            // Edge zeroing, uninlining, a step's punch and its allocation
+            // are separate stages; keep them in one transaction.
+            let step: Result<bool, FsError> = async {
+                let _hold = vol.hold_commits();
+                if get(fill_to).is_none() {
+                    let from = get(punch_from);
+                    match with_space_retry(vol, || punch_step(vol, ino, offset, end, from, zero))
+                        .await?
+                    {
+                        Some(next) => {
+                            put(punch_from, Some(next));
+                            put(fill_to, zero.then_some(next));
+                            crate::stats::note_step_mark(next);
+                        }
+                        None => {
+                            punching.store(false, Relaxed);
+                            put(fill_to, zero.then_some(end));
+                        }
+                    }
+                }
+                let Some(target) = get(fill_to) else {
+                    // A punch is done with its last step.
+                    return Ok(!punching.load(Relaxed));
+                };
+                let from = get(fill_from);
+                match with_space_retry(vol, || prealloc_step(vol, ino, offset, target, keep, from))
                     .await?
                 {
                     Some(next) => {
-                        punch_from = Some(next);
-                        fill_to = zero.then_some(next);
-                        crate::stats::note_step_mark(next);
+                        put(fill_from, Some(next));
+                        if !zero {
+                            crate::stats::note_step_mark(next);
+                        }
+                        Ok(false)
                     }
+                    // Filled as far as it was punched: a zero-range goes on
+                    // punching, or is done.
                     None => {
-                        punching = false;
-                        fill_to = zero.then_some(end);
+                        put(fill_from, Some(align_up(target, ss)));
+                        put(fill_to, None);
+                        Ok(!punching.load(Relaxed))
                     }
                 }
             }
-            let Some(target) = fill_to else {
-                // A punch is done with its last step.
-                return Ok(!punching);
-            };
-            let from = fill_from;
-            match with_space_retry(vol, || prealloc_step(vol, ino, offset, target, keep, from))
-                .await?
-            {
-                Some(next) => {
-                    fill_from = Some(next);
-                    if !zero {
-                        crate::stats::note_step_mark(next);
-                    }
-                    Ok(false)
-                }
-                // Filled as far as it was punched: a zero-range goes on
-                // punching, or is done.
-                None => {
-                    fill_from = Some(align_up(target, ss));
-                    fill_to = None;
-                    Ok(!punching)
-                }
+            .await;
+            flush_if_full(vol).await?;
+            let done = step?;
+            if !done {
+                super::dealloc_step_done(vol).await?;
             }
-        }
-        .await;
-        flush_if_full(vol).await?;
-        if step? {
+            Ok(done)
+        })
+        .await?;
+        if done {
             return Ok(());
         }
-        super::dealloc_step_done(vol).await?;
+        super::step_break().await;
     }
 }
 

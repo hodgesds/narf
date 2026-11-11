@@ -398,6 +398,8 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
             return Err(FsError::ReadOnly);
         }
         let vol = self.volume()?;
+        // Linux `inode_lock` around `setattr`.
+        let _inode = self.anchor.content_lock.lock().await;
         autogrow!(
             vol,
             async {
@@ -966,6 +968,8 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
+            // Linux `inode_lock` around a buffered write.
+            let _inode = self.anchor.content_lock.lock().await;
             autogrow!(
                 vol,
                 async {
@@ -995,40 +999,40 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::Unsupported);
             }
             let vol = self.volume()?;
-            autogrow!(
-                vol,
-                async {
-                    // The epoch, visible EOF and PTE revoke all belong to
-                    // this serialized mutation, before retiring its extents.
-                    let update = self.begin_content_update(&vol);
-                    let old_size = self
-                        .anchor
-                        .live_size
-                        .load(core::sync::atomic::Ordering::Relaxed);
-                    let shrinks = len < old_size;
-                    if shrinks {
-                        self.anchor
-                            .live_size
-                            .store(len, core::sync::atomic::Ordering::Relaxed);
-                        if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
-                            self.cache_inode(vol.load_inode(self.ino).await?);
-                            return Err(error);
-                        }
-                    }
-                    let result = crate::write::truncate_file(&vol, self.ino, len).await;
+            if !vol.admits_writes() {
+                return Err(FsError::ReadOnly);
+            }
+            // Linux `inode_lock`: the whole truncate, whose steps take the
+            // volume's operation lock one at a time (`write::locked_step`).
+            let _inode = self.anchor.content_lock.lock().await;
+            // The epoch, visible EOF and PTE revoke all belong to this
+            // serialized mutation, before retiring its extents.
+            let update = self.begin_content_update(&vol);
+            let old_size = self
+                .anchor
+                .live_size
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let shrinks = len < old_size;
+            if shrinks {
+                self.anchor
+                    .live_size
+                    .store(len, core::sync::atomic::Ordering::Relaxed);
+                if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
                     self.cache_inode(vol.load_inode(self.ino).await?);
-                    drop(update);
-                    // Twice, as `truncate_pagecache` unmaps twice: a fault
-                    // that passed its EOF check before the store above is
-                    // not excluded by any lock and may have installed a
-                    // retired page since the first pass.
-                    if shrinks {
-                        narf_filesystem::unmap_mapping_range(self, len)?;
-                    }
-                    result
+                    return Err(error);
                 }
-                .await
-            )
+            }
+            let result = crate::write::truncate_file(&vol, self.ino, len).await;
+            self.cache_inode(vol.load_inode(self.ino).await?);
+            drop(update);
+            // Twice, as `truncate_pagecache` unmaps twice: a fault that
+            // passed its EOF check before the store above is not excluded by
+            // any lock and may have installed a retired page since the first
+            // pass.
+            if shrinks {
+                narf_filesystem::unmap_mapping_range(self, len)?;
+            }
+            result
         })
     }
 
@@ -1042,20 +1046,22 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::Unsupported);
             }
             let vol = self.volume()?;
-            autogrow!(
-                vol,
-                async {
-                    // Epochs as for write. A staged fallocate can change
-                    // bytes before returning an error, so invalidate before
-                    // its first stage.
-                    let _update = self.begin_content_update(&vol);
-                    let result =
-                        crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await;
-                    self.cache_inode(vol.load_inode(self.ino).await?);
-                    result
-                }
-                .await
-            )?;
+            if !vol.admits_writes() {
+                return Err(FsError::ReadOnly);
+            }
+            // Linux `inode_lock`, as for truncate: its steps take the
+            // operation lock one at a time.
+            let inode_lock = self.anchor.content_lock.lock().await;
+            {
+                // Epochs as for write. A staged fallocate can change bytes
+                // before returning an error, so invalidate before its first
+                // stage.
+                let _update = self.begin_content_update(&vol);
+                let result = crate::write::fallocate_file(&vol, self.ino, mode, offset, len).await;
+                self.cache_inode(vol.load_inode(self.ino).await?);
+                result?;
+            }
+            drop(inode_lock);
             if mode & (crate::write::FALLOC_FL_PUNCH_HOLE | crate::write::FALLOC_FL_ZERO_RANGE) != 0
             {
                 // The range's extents were deallocated or converted to
@@ -1259,6 +1265,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
+            let _inode = self.anchor.content_lock.lock().await;
             autogrow!(
                 vol,
                 crate::write::set_xattr_item(&vol, self.ino, name, value, flags).await
@@ -1272,6 +1279,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
+            let _inode = self.anchor.content_lock.lock().await;
             autogrow!(
                 vol,
                 crate::write::remove_xattr_item(&vol, self.ino, name).await
