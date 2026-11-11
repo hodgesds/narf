@@ -902,6 +902,90 @@ pub(crate) async fn flush_if_full<B: BlockDevice + 'static>(
     Ok(())
 }
 
+/// The extent items of `ino` overlapping the sector-aligned window
+/// `[*start, *end)` that a write replaces, and for each whether the write
+/// absorbs it whole; the window is widened over the absorbed ones.
+///
+/// Linux `btrfs_drop_extents`: `btrfs_lookup_file_extent` searches for
+/// `(ino, EXTENT_DATA, start)`, steps back one item when the one before
+/// belongs to the inode (it may reach into the range), and walks forward
+/// until an item starts at or past the end. Only the leaves holding those
+/// items are read. Collecting every extent item of the inode instead made
+/// each write of a file cost its whole extent list: N page-sized writes into
+/// a file of N single-page extents read N² items, a leaf at a time.
+///
+/// An item the window cuts through is absorbed whole and the window grows to
+/// its sector-aligned bounds, so the write never leaves two file references
+/// to one backing extent (which would require multi-ref delayed-ref
+/// handling); growing the end can meet the next item, which the walk then
+/// reaches. PREALLOC items are returned but not absorbed: the write carves
+/// its sectors out of them (write-to-convert, Linux
+/// `btrfs_mark_extent_written`), leaving the rest preallocated, so a small
+/// write into a large preallocation costs only its own sectors.
+#[allow(clippy::type_complexity)]
+async fn window_extents<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    fs_root: u64,
+    ino: u64,
+    start: &mut u64,
+    end: &mut u64,
+) -> Result<(Vec<(BtrfsKey, Vec<u8>)>, Vec<bool>), FsError> {
+    let sectorsize = u64::from(vol.sectorsize());
+    let is_file_extent =
+        |key: &BtrfsKey| key.objectid == ino && key.item_type == format::EXTENT_DATA_KEY;
+    // The last item keyed at or below the window's first byte is the only
+    // one starting before the window that can reach into it.
+    let ceiling = BtrfsKey::new(
+        ino,
+        format::EXTENT_DATA_KEY,
+        start.checked_add(1).ok_or(FsError::InvalidData)?,
+    );
+    let from = match btree::last_before(vol, fs_root, &ceiling).await? {
+        Some((key, _)) if is_file_extent(&key) => key.offset,
+        _ => *start,
+    };
+    let mut cursor = btree::Cursor::seek(
+        vol,
+        fs_root,
+        &BtrfsKey::new(ino, format::EXTENT_DATA_KEY, from),
+    )
+    .await?;
+    let mut extents = Vec::new();
+    let mut affected = Vec::new();
+    while let Some((key, body)) = cursor.current()? {
+        if !is_file_extent(&key) || key.offset >= *end {
+            break;
+        }
+        if body.len() < 21 {
+            return Err(FsError::InvalidData);
+        }
+        let (file_len, prealloc) = match body[20] {
+            format::FILE_EXTENT_INLINE => (le64(body, 8)?, false),
+            kind @ (format::FILE_EXTENT_REG | format::FILE_EXTENT_PREALLOC) => {
+                if body.len() < 53 {
+                    return Err(FsError::InvalidData);
+                }
+                (
+                    le64(body, 45)?,
+                    kind == format::FILE_EXTENT_PREALLOC && le64(body, 21)? != 0,
+                )
+            }
+            _ => return Err(FsError::InvalidData),
+        };
+        let finish = key.offset.saturating_add(file_len);
+        if finish > *start {
+            if !prealloc {
+                *start = (*start).min(key.offset & !(sectorsize - 1));
+                *end = (*end).max(align_up(finish, sectorsize));
+            }
+            extents.push((key, body.to_vec()));
+            affected.push(!prealloc);
+        }
+        cursor.advance().await?;
+    }
+    Ok((extents, affected))
+}
+
 async fn cow_write_file_once<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
@@ -942,60 +1026,12 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     let new_size = old_size.max(end);
     let sectorsize = u64::from(vol.sectorsize());
 
-    // Start with the sectors touched by the write. If that cuts through an
-    // existing extent, absorb that entire extent; repeat because widening the
-    // window can meet another item. This avoids creating two file references to
-    // one backing extent (which would require multi-ref delayed-ref handling).
+    // Start with the sectors touched by the write, and look up only the
+    // extent items that window reaches ([`window_extents`]).
     let mut rewrite_start = offset & !(sectorsize - 1);
     let mut rewrite_end = align_up(end, sectorsize);
-    let extents = btree::collect_for(vol, fs_root, ino, format::EXTENT_DATA_KEY).await?;
-    let mut file_ranges: Vec<(u64, u64)> = Vec::with_capacity(extents.len());
-    for (key, body) in &extents {
-        if body.len() < 21 {
-            return Err(FsError::InvalidData);
-        }
-        let file_len = match body[20] {
-            format::FILE_EXTENT_INLINE => le64(body, 8)?,
-            format::FILE_EXTENT_REG | format::FILE_EXTENT_PREALLOC => {
-                if body.len() < 53 {
-                    return Err(FsError::InvalidData);
-                }
-                le64(body, 45)?
-            }
-            _ => return Err(FsError::InvalidData),
-        };
-        file_ranges.push((key.offset, key.offset.saturating_add(file_len)));
-    }
-
-    // PREALLOC items are not absorbed: the write carves its sectors out of
-    // them (write-to-convert, Linux `btrfs_mark_extent_written`), leaving the
-    // rest preallocated, so a small write into a large preallocation costs
-    // only its own sectors.
-    let is_prealloc = |body: &[u8]| {
-        body[20] == format::FILE_EXTENT_PREALLOC && le64(body, 21).is_ok_and(|b| b != 0)
-    };
-    let mut affected = alloc::vec![false; extents.len()];
-    loop {
-        let mut widened = false;
-        for (i, &(start, finish)) in file_ranges.iter().enumerate() {
-            if affected[i]
-                || start >= rewrite_end
-                || finish <= rewrite_start
-                || is_prealloc(&extents[i].1)
-            {
-                continue;
-            }
-            affected[i] = true;
-            let new_start = rewrite_start.min(start & !(sectorsize - 1));
-            let new_end = rewrite_end.max(align_up(finish, sectorsize));
-            widened |= new_start != rewrite_start || new_end != rewrite_end;
-            rewrite_start = new_start;
-            rewrite_end = new_end;
-        }
-        if !widened {
-            break;
-        }
-    }
+    let (extents, affected) =
+        window_extents(vol, fs_root, ino, &mut rewrite_start, &mut rewrite_end).await?;
 
     // Classify only the intersected extents. Non-overlapping shared/partial
     // extents are deliberately left alone.
@@ -1057,26 +1093,31 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // windows fall back to ordinary extents.
     let emit_zlib = saw_zlib && zlib_only && !nodatasum;
 
-    // Read-modify-write only the closed-over window. Bytes past the old EOF and
-    // implicit/explicit holes remain zero-filled.
+    // Read-modify-write only the closed-over window, and of it only what the
+    // write does not cover: the bytes before `offset` and after `end` (Linux
+    // `prepare_one_folio` reads a folio only when the write covers it
+    // partly). A write of whole sectors over whole extents reads no old data
+    // at all. Bytes past the old EOF and implicit/explicit holes remain
+    // zero-filled.
     let rewrite_len = rewrite_end
         .checked_sub(rewrite_start)
         .ok_or(FsError::InvalidData)?;
     let rewrite_len_usize = usize::try_from(rewrite_len).map_err(|_| FsError::InvalidData)?;
     let mut buf = alloc::vec![0u8; rewrite_len_usize];
-    if rewrite_start < old_size {
-        let old_window_end = rewrite_end.min(old_size);
-        let old_window_len =
-            usize::try_from(old_window_end - rewrite_start).map_err(|_| FsError::InvalidData)?;
-        crate::extent::read_file(
-            vol,
-            fs_root,
-            ino,
-            old_size,
-            rewrite_start,
-            &mut buf[..old_window_len],
-        )
-        .await?;
+    let old_window_end = rewrite_end.min(old_size);
+    let head_end = offset.min(old_window_end);
+    let (from, to) = match (rewrite_start < head_end, end < old_window_end) {
+        // Old bytes on both sides: one read (and, for a compressed extent,
+        // one decompression) covers them.
+        (true, true) => (rewrite_start, old_window_end),
+        (true, false) => (rewrite_start, head_end),
+        (false, true) => (end, old_window_end),
+        (false, false) => (0, 0),
+    };
+    if from < to {
+        let at = usize::try_from(from - rewrite_start).map_err(|_| FsError::InvalidData)?;
+        let len = usize::try_from(to - from).map_err(|_| FsError::InvalidData)?;
+        crate::extent::read_file(vol, fs_root, ino, old_size, from, &mut buf[at..at + len]).await?;
     }
     let o = usize::try_from(offset - rewrite_start).map_err(|_| FsError::InvalidData)?;
     buf[o..o + data.len()].copy_from_slice(data);
@@ -1182,10 +1223,10 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     for (key, body) in &new_eds {
         edits.push(Edit::Upsert(*key, body.clone()));
     }
+    // The inode item read at the top is still the tree's: nothing has been
+    // staged since, and the operation lock keeps every other mutator out.
     let inode_key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
-    let mut new_inode = btree::find_item(vol, fs_root, &inode_key)
-        .await?
-        .ok_or(FsError::NotFound)?;
+    let mut new_inode = fresh;
     new_inode[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
     new_inode[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
     new_inode[16..24].copy_from_slice(&new_size.to_le_bytes()); // size
