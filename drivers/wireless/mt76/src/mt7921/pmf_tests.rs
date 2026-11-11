@@ -604,6 +604,7 @@ fn auth_frames(session: &Session<Model>, from: usize, algorithm: u8) -> usize {
 /// entry; other credentials never use the entry; FLUSH_PMKSA empties it.
 fn mt7922_sae_pmksa_cache_skips_sae_on_reconnect_and_falls_back() -> TestResult {
     let (mut session, bss) = prepared(sae_ap(ApSaePwe::HashToElement));
+    session.backend.keep_access_point = true;
     if join(&mut session, &bss, sae()) != Ok(42) || session.pmksa.len() != 1 {
         return TestResult::Fail("first SAE join did not cache its PMKSA");
     }
@@ -667,4 +668,53 @@ fn mt7922_sae_pmksa_cache_skips_sae_on_reconnect_and_falls_back() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/mt7921/pmf",
     mt7922_sae_pmksa_cache_skips_sae_on_reconnect_and_falls_back
+);
+
+/// Roaming within the ESS (cfg80211 CONNECT with PREV_BSSID, mac80211
+/// reassociation): after leaving the current AP the owner's next join sends
+/// a Reassociation Request naming that AP, accepts the Reassociation
+/// Response and completes the RSNA (here from the cached SAE PMKSA); the
+/// reassociation is consumed by that one join.
+fn mt7922_roam_sends_a_reassociation_request_naming_the_current_ap() -> TestResult {
+    let (mut session, bss) = prepared(sae_ap(ApSaePwe::HashToElement));
+    session.backend.keep_access_point = true;
+    if join(&mut session, &bss, sae()) != Ok(42)
+        || run(Box::pin(session.disassociate_station())).is_err()
+        || session
+            .backend
+            .access_point
+            .as_mut()
+            .unwrap()
+            .restart_keeping_pmksa()
+            .is_err()
+    {
+        return TestResult::Fail("first association or teardown");
+    }
+    session.station.reassociate_from = Some(AP);
+    let before = session.backend.frames.len();
+    if join(&mut session, &bss, sae()) != Ok(42) {
+        return TestResult::Fail("reassociation failed");
+    }
+    let requests: Vec<_> = session.backend.frames[before..]
+        .iter()
+        .map(|(_, f)| f)
+        .filter(|f| f.len() > 34 && f[0] & 0xfc == 0x20)
+        .collect();
+    let ap = session.backend.access_point.as_ref().unwrap();
+    if requests.len() != 1
+        || requests[0][28..34] != AP
+        || ap.phase() != ApPhase::Authorized
+        || session.station.reassociate_from.is_some()
+    {
+        return TestResult::Fail("no single Reassociation Request naming the current AP");
+    }
+    // Without a roam the request is a plain Association Request.
+    if narf_wireless::association::reassociation_request(&requests[0][..], AP).is_some() {
+        return TestResult::Fail("a Reassociation Request was converted again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/pmf",
+    mt7922_roam_sends_a_reassociation_request_naming_the_current_ap
 );

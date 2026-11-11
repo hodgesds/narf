@@ -1989,6 +1989,8 @@ impl<B: Backend> Session<B> {
         });
         // The PMKSA a full SAE exchange produced, recorded on success.
         let mut new_pmksa: Option<([u8; 16], Zeroizing<[u8; 32]>)> = None;
+        // Roaming: this join is a reassociation away from that AP.
+        let reassociate_from = self.station.reassociate_from.take();
         let result = async {
             if setup {
                 self.stage(Stage::ScanSetup);
@@ -2104,7 +2106,18 @@ impl<B: Backend> Session<B> {
                         }
                     };
 
-                    // 5. Send Association Request:
+                    // 5. Send Association Request (a Reassociation Request
+                    // when roaming within the ESS):
+                    let assoc_req = match reassociate_from {
+                        Some(current_ap) => {
+                            plan.expect_reassociation();
+                            narf_wireless::association::reassociation_request(
+                                &assoc_req, current_ap,
+                            )
+                            .ok_or(Error::Bounds)?
+                        }
+                        None => assoc_req,
+                    };
                     self.stage(Stage::Associate);
                     self.send_management(&assoc_req, u16::from(self.station.link.peer()))
                         .await?;

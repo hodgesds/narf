@@ -2111,6 +2111,10 @@ impl Transport {
         self.session.receive_ethernet()
     }
 
+    /// The next join is a reassociation away from `current_ap`.
+    pub(super) fn set_reassociation(&mut self, current_ap: [u8; 6]) {
+        self.session.station.reassociate_from = Some(current_ap);
+    }
     pub(super) fn step_network(&mut self, tx: Option<&[u8]>) -> Result<super::PacketStep, Error> {
         self.session.frag_threshold =
             super::BOOT_FRAG_THRESHOLD.load(core::sync::atomic::Ordering::Relaxed);

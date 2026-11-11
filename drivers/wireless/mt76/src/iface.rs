@@ -1397,6 +1397,60 @@ impl WirelessNetIface for Mt76Iface {
         true
     }
 
+    /// cfg80211 CONNECT on a connected station with PREV_BSSID: mac80211
+    /// reassociates. The netdev stays up through the move; the new
+    /// association completes with its own SAE/4-way handshake.
+    fn supports_roam(&self) -> bool {
+        true
+    }
+
+    async fn roam(&self, mut req: AssociateRequest) -> Result<(), WirelessError> {
+        let _control = self.control.lock().await;
+        if !self.station_role() {
+            return Err(WirelessError::NotSupported);
+        }
+        let current = (*self.associated_bssid.lock()).ok_or(WirelessError::InvalidArgs)?;
+        let six = self
+            .validate_join(&req)
+            .inspect_err(|error| note_failure("roam: join validation", error))?;
+        let security = core::mem::replace(&mut req.security, narf_wireless::SecurityConfig::Open);
+        let (bss, security, heard_beacon) = self
+            .resolve_join(&req, security, six, true)
+            .inspect_err(|error| note_failure("roam: BSS/security resolution", error))?;
+        let result = crate::mt7921::firmware_transport::reassociate_boot_station(
+            &bss,
+            &req.ssid,
+            security,
+            &req.ie,
+            heard_beacon,
+            current,
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                *self.associated_bssid.lock() = Some(req.bssid);
+                *self.link_stats.lock() = None;
+                self.cqm.lock().restart();
+                Ok(())
+            }
+            Err(error) => {
+                note_failure("roam: reassociation", &error);
+                // The old association is gone too: a failed roam is a
+                // link loss (cfg80211 reports it as a failed CONNECT).
+                self.teardown_needed.store(true, Ordering::Release);
+                self.clear_link();
+                use crate::mt7921::firmware_transport::Error;
+                Err(match error {
+                    Error::Bounds => WirelessError::InvalidArgs,
+                    Error::Busy => WirelessError::Busy,
+                    Error::Timeout => WirelessError::Timeout,
+                    Error::Authority => WirelessError::Denied,
+                    _ => WirelessError::HardwareError,
+                })
+            }
+        }
+    }
+
     /// The owner caches the SAE PMKSA itself (as a full-offload firmware
     /// does), so userspace can delete or flush it but supplies none:
     /// SET_PMKSA stays -EOPNOTSUPP.
