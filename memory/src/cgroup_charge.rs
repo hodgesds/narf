@@ -104,7 +104,25 @@ pub fn try_charge(bytes: u64) -> bool {
     let Some(pid) = current_charge_pid() else {
         return true;
     };
-    invoke(pid, bytes as i64)
+    let charged = invoke(pid, bytes as i64);
+    if !charged {
+        DENIALS.fetch_add(1, Ordering::Relaxed);
+        LAST_DENIED_PID.store(pid as usize, Ordering::Relaxed);
+    }
+    charged
+}
+
+static DENIALS: AtomicUsize = AtomicUsize::new(0);
+static LAST_DENIED_PID: AtomicUsize = AtomicUsize::new(0);
+
+/// `(charges refused since boot, pid of the last refused charge)`. An
+/// allocation refused here fails although the frame allocator has memory, so
+/// the allocation-failure report prints it.
+pub fn denials() -> (usize, usize) {
+    (
+        DENIALS.load(Ordering::Relaxed),
+        LAST_DENIED_PID.load(Ordering::Relaxed),
+    )
 }
 
 /// Uncharge `bytes` from the current task's cgroup chain on free. Best
@@ -184,7 +202,11 @@ pub(crate) fn charge_current(bytes: u64, force: bool) -> Result<(MemcgId, u64), 
     let f: fn(u64, u64, bool) -> Result<MemcgId, MemcgId> = unsafe { core::mem::transmute(ptr) };
     match f(pid, bytes, force) {
         Ok(id) => Ok((id, pid)),
-        Err(id) => Err((id, pid)),
+        Err(id) => {
+            DENIALS.fetch_add(1, Ordering::Relaxed);
+            LAST_DENIED_PID.store(pid as usize, Ordering::Relaxed);
+            Err((id, pid))
+        }
     }
 }
 

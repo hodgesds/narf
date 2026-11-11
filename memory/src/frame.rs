@@ -381,11 +381,26 @@ impl fmt::Write for ReportBuf {
 /// so it is safe from any context, including one that already holds a zone
 /// lock (that zone is then reported as busy). Allocates nothing.
 pub fn write_free_state(out: &mut impl fmt::Write) -> fmt::Result {
+    let (denials, denied_pid) = crate::cgroup_charge::denials();
     write!(
         out,
-        "frame: free state, double frees refused {}",
-        double_frees_refused()
+        "frame: free state, double frees refused {}, cgroup charges refused {denials} \
+         (last pid {denied_pid}), early ceiling {:#x}",
+        double_frees_refused(),
+        EARLY_PHYS_CEILING.load(Ordering::Relaxed),
     )?;
+    let last = LAST_BLOCK_FAILURE.load(Ordering::Relaxed);
+    if last != 0 {
+        let reason = match last >> 8 {
+            BLOCK_FAIL_CHARGE => "cgroup charge refused",
+            _ => "no block in any zone",
+        };
+        write!(
+            out,
+            "\nframe: last block allocation failure: order {}, {reason}",
+            last & 0xff
+        )?;
+    }
     let mut nodes = online_node_mask() | 1;
     while nodes != 0 {
         let node = nodes.trailing_zeros() as usize;
@@ -2781,7 +2796,13 @@ pub fn alloc_pages_on_ctx(
     // allocated and the charge is recorded on its head frame; a kernel block
     // is not charged.
     let charge_bytes = PAGE_SIZE << order;
-    let charge = charge_user_alloc(ctx, node, charge_bytes)?;
+    let charge = match charge_user_alloc(ctx, node, charge_bytes) {
+        Ok(charge) => charge,
+        Err(error) => {
+            note_block_failure(order, BLOCK_FAIL_CHARGE);
+            return Err(error);
+        }
+    };
     let r = alloc_pages_on_inner(node, order, ctx.migrate_type());
     // Return empty slab frames to the buddy before trying anything more
     // expensive: the slab hoards emptied frames per size-class rather than
@@ -2804,8 +2825,23 @@ pub fn alloc_pages_on_ctx(
     // fall through to their caller's non-contiguous/failure path rather than
     // recursively entering migration while that metadata is locked.
     let r = retry_after_direct_compaction(r, node, order, ctx.migrate_type());
+    if r.is_err() {
+        note_block_failure(order, BLOCK_FAIL_BUDDY);
+    }
     commit_user_charge(charge, &r, charge_bytes);
     r
+}
+
+/// Why the most recent `alloc_pages_on_ctx` failed: the cgroup charge was
+/// refused, or no zone had a block after drain, slab reclaim and compaction.
+const BLOCK_FAIL_CHARGE: u64 = 1;
+const BLOCK_FAIL_BUDDY: u64 = 2;
+/// `reason << 8 | order` of the last failed block allocation; 0 = none yet.
+static LAST_BLOCK_FAILURE: AtomicU64 = AtomicU64::new(0);
+
+#[cold]
+fn note_block_failure(order: u8, reason: u64) {
+    LAST_BLOCK_FAILURE.store(reason << 8 | u64::from(order), Ordering::Relaxed);
 }
 
 /// If a higher-order allocation failed, run synchronous direct compaction on
