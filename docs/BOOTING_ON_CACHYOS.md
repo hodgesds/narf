@@ -1331,7 +1331,17 @@ vCPU's registers through QMP before it ends the run.
 `verification/data/cachyos-soak/soak-report.py target/soak/<name>` prints
 memory over time, the probe latencies, each lockup report with its
 symbolized stack, and the tasks the detector found stranded behind a busy
-CPU; `--stranded` prints the detector's own lines for those.
+CPU; `--stranded` prints the detector's own lines for those. While a guest
+is running, `verification/data/cachyos-soak/soak-stack.py target/soak/<name>`
+prints the kernel stack of every busy vCPU through QMP, to the stack's end
+(the detector's backtrace stops after twenty frames).
+
+`SOAK_KERNEL=<elf>` boots a saved kernel instead of building the tree, which
+is how two commits are compared; `SOAK_ENV="SOAK_DIRECTED=0"` skips the
+single-operation episodes that otherwise run first on the idle guest (exits
+and fork+execs with dirty shared pages, long single system calls, journal
+readers), and `SOAK_ENV="SOAK_SHARED_MAPS=0"` leaves the shared-mapping
+workers out of the mixed load.
 
 Nothing on the host is touched: the disks are files under `target/`, and
 every listener and port forward is on 127.0.0.1.
