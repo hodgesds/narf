@@ -137,6 +137,11 @@ impl Receiver {
     pub(super) fn clear(&mut self) {
         self.pending = None;
     }
+    /// The association followed its AP to `channel` (a channel switch).
+    pub(super) fn retune(&mut self, channel: u8) {
+        self.info.channel = channel;
+        self.pending = None;
+    }
     pub(super) fn matches(&self, own: [u8; 6], peer: [u8; 6], channel: u8) -> bool {
         self.active && self.own == own && self.info.peer == peer && self.info.channel == channel
     }

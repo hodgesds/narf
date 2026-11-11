@@ -1806,6 +1806,10 @@ struct StationLink {
     csa: Option<(crate::mt7921::association::ChannelSwitch, u64)>,
     /// Channel Switch Mode 1 is in force: no data until the switch.
     csa_block_tx: bool,
+    /// The AP's Beacon names a new channel width for its unchanged PHY
+    /// (mac80211 `ieee80211_config_bw`): its elements, followed by the
+    /// control work.
+    bw_change: Option<narf_wireless::association::phy::ApElements>,
     bss: Option<ScanBss>,
     /// This link's group role captured at join; retained for the exact
     /// disconnect record of that association (Linux `vif->p2p` is fixed per
@@ -1868,6 +1872,7 @@ impl StationLink {
             reassociate_from: None,
             csa: None,
             csa_block_tx: false,
+            bw_change: None,
             bss: None,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
             permission: None,

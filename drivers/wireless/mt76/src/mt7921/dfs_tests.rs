@@ -447,3 +447,276 @@ kernel_test_in!(
     "drivers/wireless/mt7921/dfs",
     mt7922_channel_switch_width_follows_mac80211
 );
+
+/// A policy for the VHT fixture: 5 GHz up to `wide` MHz, with 100..144 at
+/// most `upper` MHz wide.
+fn vht_policy(wide: u32, upper: u32) -> Arc<CurrentPolicy> {
+    let policy = Arc::new(CurrentPolicy {
+        database: narf_wireless::reg::db::Database::new(),
+        hold_bss_ack: core::sync::atomic::AtomicBool::new(false),
+    });
+    let rule = |start, end, bandwidth| RegRule {
+        freq_start_mhz: start,
+        freq_end_mhz: end,
+        max_bandwidth_mhz: bandwidth,
+        max_power_dbm: 17,
+        flags: RegFlags::empty(),
+    };
+    policy.database.install(RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![
+            rule(5170, 5330, wide),
+            rule(5490, 5730, upper),
+            rule(5735, 5895, wide),
+        ],
+    });
+    policy
+}
+
+/// An MT7922 VHT station associated (WPA2) at `width` on channel 36 under
+/// `policy`, and the AP's address.
+fn vht_associated(width: u8, policy: Arc<CurrentPolicy>) -> Option<(NativeSession, [u8; 6])> {
+    let (mut session, bss, _) = super::vht_tests::prepared(width, true);
+    session.backend.tx_policy = Some(policy.clone());
+    let domain = policy.database.snapshot()?;
+    let State::RadioReady(info) = session.state else {
+        return None;
+    };
+    let grant = TxPermission::from_ap(&domain, info, &bss)?;
+    if super::vht_tests::join(&mut session, &bss, grant, true) != Ok(42)
+        || session
+            .station
+            .vht_profile
+            .is_none_or(|v| v.width() != width)
+    {
+        return None;
+    }
+    Some((session, bss.bssid))
+}
+
+/// The AP's Beacon on `channel` at `width` (the VHT fixture's HT and VHT
+/// Operation), followed by `extra` elements.
+fn vht_beacon(ap: [u8; 6], channel: u8, width: u8, extra: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0; 36];
+    frame[0] = 0x80;
+    frame[4..10].fill(0xff);
+    frame[10..16].copy_from_slice(&ap);
+    frame[16..22].copy_from_slice(&ap);
+    frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+    frame.extend_from_slice(&super::wmm_tests::PARAMETERS);
+    let (ht, vht) = super::vht_tests::elements(width, channel);
+    frame.extend_from_slice(&ht);
+    frame.extend_from_slice(&vht);
+    frame.extend_from_slice(extra);
+    let mut packet = descriptor(&frame);
+    packet[12..16].copy_from_slice(&(u32::from(channel) << 8).to_le_bytes());
+    packet
+}
+
+/// The last CHANNEL_SWITCH (primary, centre, width) and BSS RLM record
+/// (control channel, centre, width, SCO) the station sent after `from`.
+fn retune_records(session: &NativeSession, from: usize) -> Option<([u8; 3], [u8; 4])> {
+    let frames = &session.backend.frames[from..];
+    let switch = frames
+        .iter()
+        .rev()
+        .find(|(_, f)| f.len() >= 140 && f[36] == 0xed && f[41] == 8)?;
+    let rlm = frames
+        .iter()
+        .rev()
+        .find(|(_, f)| f.len() == 68 && f[34..36] == [2, 0] && f[52..56] == [2, 0, 16, 0])?;
+    Some((
+        [switch.1[64], switch.1[65], switch.1[66]],
+        [rlm.1[56], rlm.1[57], rlm.1[59], rlm.1[64]],
+    ))
+}
+
+/// Deliver `packet`, then run the control work it made due.
+fn deliver_and_service(session: &mut NativeSession, packet: Vec<u8>) -> Result<(), &'static str> {
+    session.backend.packets.push_back(packet);
+    if session.receive_ethernet().is_err() || session.station.peer_lost {
+        return Err("AP frame ended the link");
+    }
+    let now = session.backend.ticks.get();
+    session.backend.ticks.set(now + 1_000_000_000);
+    if session.keys_pending() && run(Box::pin(session.service_keys())).is_err() {
+        return Err("control work failed");
+    }
+    Ok(())
+}
+
+/// The station's grant, VHT profile and HT secondary at `primary`,
+/// `width`, `center`, with the radio and BSS RLM retuned to it after
+/// frame `from`.
+fn at_width(
+    session: &NativeSession,
+    from: usize,
+    primary: u8,
+    width: u8,
+    center: u8,
+) -> Result<(), &'static str> {
+    let sco = match width {
+        0 => 0,
+        _ if primary < center => 1,
+        _ => 3,
+    };
+    let expected = crate::mt7921::csa::Chandef {
+        primary,
+        width,
+        center,
+    };
+    if !matches!(session.state, State::Associated { channel, aid: 42, .. } if channel == primary)
+        || session
+            .station
+            .permission
+            .is_none_or(|p| p.chandef() != expected)
+        || session
+            .station
+            .vht_profile
+            .is_none_or(|v| v.width() != width || v.center() != center)
+        || session
+            .station
+            .ht20_profile
+            .is_none_or(|h| h.negotiated_secondary().is_some() != (width != 0))
+        || session.station.security.is_none()
+    {
+        return Err("association not at the expected channel and width");
+    }
+    if retune_records(session, from)
+        != Some(([primary, center, width], [primary, center, width, sco]))
+    {
+        return Err("radio and BSS RLM not retuned to the width");
+    }
+    Ok(())
+}
+
+/// An 80 MHz home AP moved by radar detection: the station follows each
+/// switch at the width it names (80 -> 40 with only a Secondary Channel
+/// Offset, 40 -> 20 without one), keeps the association and its VHT
+/// profile, retunes the radio and the BSS RLM record (`mt7921_csa_work` ->
+/// `mt76_connac_mcu_uni_set_chctx`), and the AP's Beacons on each new
+/// channel keep the link.
+fn eighty_forty_twenty() -> Result<(), &'static str> {
+    let (mut session, ap) = vht_associated(2, vht_policy(80, 80)).ok_or("80 MHz association")?;
+    let from = session.backend.frames.len();
+    deliver_and_service(
+        &mut session,
+        vht_beacon(ap, 36, 2, &[37, 3, 1, 100, 1, 62, 1, 1]),
+    )?;
+    at_width(&session, from, 100, 1, 102)?;
+    deliver_and_service(&mut session, vht_beacon(ap, 100, 1, &[]))?;
+    let from = session.backend.frames.len();
+    deliver_and_service(&mut session, vht_beacon(ap, 100, 1, &[37, 3, 0, 149, 1]))?;
+    at_width(&session, from, 149, 0, 149)?;
+    // A Beacon whose VHT Operation encodes the same 20 MHz differently only
+    // rebinds the AP's elements.
+    let from = session.backend.frames.len();
+    deliver_and_service(&mut session, vht_beacon(ap, 149, 0, &[]))?;
+    if session.backend.frames.len() != from
+        || session.station.bw_change.is_some()
+        || session
+            .station
+            .permission
+            .is_none_or(|p| p.native_width() != 0)
+    {
+        return Err("same-width Beacon retuned the radio");
+    }
+    Ok(())
+}
+
+/// A VHT connection that associated at 20 MHz follows a switch to 80 MHz:
+/// mac80211's limit is the connection's capability, not the width at
+/// association.
+fn twenty_eighty() -> Result<(), &'static str> {
+    let (mut session, ap) = vht_associated(0, vht_policy(80, 80)).ok_or("20 MHz association")?;
+    let from = session.backend.frames.len();
+    let switch = [37, 3, 1, 100, 1, 62, 1, 1, 196, 5, 194, 3, 1, 106, 0];
+    deliver_and_service(&mut session, vht_beacon(ap, 36, 0, &switch))?;
+    at_width(&session, from, 100, 2, 106)?;
+    deliver_and_service(&mut session, vht_beacon(ap, 100, 2, &[]))?;
+    if session.station.bw_change.is_some() {
+        return Err("80 MHz Beacon after the switch");
+    }
+    Ok(())
+}
+
+/// The policy allows 100..144 only at 40 MHz: an 80 MHz switch there is
+/// followed at 40 MHz (`ieee80211_chandef_downgrade`), and the AP's 80 MHz
+/// Beacons keep the link without widening it.
+fn policy_downgrade() -> Result<(), &'static str> {
+    let (mut session, ap) = vht_associated(2, vht_policy(80, 40)).ok_or("80 MHz association")?;
+    let from = session.backend.frames.len();
+    let switch = [37, 3, 1, 100, 1, 62, 1, 1, 196, 5, 194, 3, 1, 106, 0];
+    deliver_and_service(&mut session, vht_beacon(ap, 36, 2, &switch))?;
+    at_width(&session, from, 100, 1, 102)?;
+    let from = session.backend.frames.len();
+    deliver_and_service(&mut session, vht_beacon(ap, 100, 2, &[]))?;
+    if session.backend.frames.len() != from
+        || session
+            .station
+            .permission
+            .is_none_or(|p| p.native_width() != 1)
+    {
+        return Err("80 MHz Beacon widened past the policy");
+    }
+    Ok(())
+}
+
+/// The first Beacon after a switch names a different width than the
+/// announcement: the station follows the Beacon (`ieee80211_config_bw`),
+/// and later width changes in ordinary Beacons the same way. A Beacon whose
+/// operation elements are inconsistent ends the link.
+fn beacon_disagrees() -> Result<(), &'static str> {
+    let (mut session, ap) = vht_associated(2, vht_policy(80, 80)).ok_or("80 MHz association")?;
+    let from = session.backend.frames.len();
+    let switch = [37, 3, 1, 100, 1, 62, 1, 1, 196, 5, 194, 3, 1, 106, 0];
+    deliver_and_service(&mut session, vht_beacon(ap, 36, 2, &switch))?;
+    at_width(&session, from, 100, 2, 106)?;
+    let from = session.backend.frames.len();
+    session
+        .backend
+        .packets
+        .push_back(vht_beacon(ap, 100, 1, &[]));
+    if session.receive_ethernet().is_err() || session.station.bw_change.is_none() {
+        return Err("narrower Beacon not recorded as a width change");
+    }
+    if !session.keys_pending() || run(Box::pin(session.service_keys())).is_err() {
+        return Err("width change service");
+    }
+    at_width(&session, from, 100, 1, 102)?;
+    let from = session.backend.frames.len();
+    deliver_and_service(&mut session, vht_beacon(ap, 100, 2, &[]))?;
+    at_width(&session, from, 100, 2, 106)?;
+    // HT Operation names the secondary below the primary while the VHT
+    // Operation's 80 MHz puts it above.
+    let mut bad = vht_beacon(ap, 100, 2, &[]);
+    let at = bad.len() - 21 - 21;
+    bad[at] = 7;
+    session.backend.packets.push_back(bad);
+    let _ = session.receive_ethernet();
+    if session.keys_pending() {
+        let _ = run(Box::pin(session.service_keys()));
+    }
+    if !session.station.peer_lost {
+        return Err("inconsistent Beacon operation kept the link");
+    }
+    Ok(())
+}
+
+fn mt7922_station_follows_a_channel_switch_at_the_announced_width() -> TestResult {
+    for case in [
+        eighty_forty_twenty as fn() -> Result<(), &'static str>,
+        twenty_eighty,
+        policy_downgrade,
+        beacon_disagrees,
+    ] {
+        if let Err(reason) = case() {
+            return TestResult::Fail(reason);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/dfs",
+    mt7922_station_follows_a_channel_switch_at_the_announced_width
+);

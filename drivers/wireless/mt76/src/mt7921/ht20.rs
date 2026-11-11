@@ -44,6 +44,14 @@ pub(crate) struct Profile {
     tx_greenfield: bool,
     /// Peer HT Capabilities Maximum A-MSDU Length (7935 instead of 3839).
     peer_amsdu_7935: bool,
+    /// Both the advertised local and the peer HT capability support 40 MHz:
+    /// the connection's width limit (mac80211 `conn->bw_limit`).
+    forty: bool,
+    /// Short GI at 40 MHz negotiated for transmission.
+    sgi40: bool,
+    /// From the shared typed negotiation: `capability` is the negotiated
+    /// peer capability, whose 40 MHz bits follow the width.
+    typed: bool,
 }
 
 /// One RX/TX stream, HT20 with optional short GI, no LDPC/STBC/greenfield, 3839-byte
@@ -113,6 +121,9 @@ impl Profile {
             rx_greenfield: n.rx_greenfield(),
             tx_greenfield: n.tx_greenfield(),
             peer_amsdu_7935: n.peer_capability() & 0x0800 != 0,
+            forty: n.local_capability()[0] & 2 != 0 && n.peer_capability() & 2 != 0,
+            sgi40: n.tx_sgi40(),
+            typed: true,
         }
     }
     pub(crate) fn prepare(info: RadioInfo, bss: &ScanBss) -> Result<Self, Error> {
@@ -186,6 +197,9 @@ impl Profile {
             rx_greenfield: false,
             tx_greenfield: false,
             peer_amsdu_7935: cap & 0x0800 != 0,
+            forty: false,
+            sgi40: false,
+            typed: false,
         })
     }
     pub(crate) fn transmit_mcs_mask(self) -> [u8; 10] {
@@ -263,7 +277,27 @@ impl Profile {
             return Err(Error::UnsupportedFirmware);
         }
         self.secondary = secondary;
+        self.forty = secondary.is_some();
+        self.sgi40 = secondary.is_some() && self.capability[0] & 64 != 0;
         Ok(self)
+    }
+    /// The connection may run at 40 MHz.
+    pub(crate) fn forty(self) -> bool {
+        self.forty
+    }
+    /// The profile after the AP moved to `operation` (its new HT Operation)
+    /// and the station to `secondary`: a typed profile's 40 MHz capability
+    /// bits follow the width as [`from_shared`](Self::from_shared) sets them.
+    pub(crate) fn retuned(mut self, operation: [u8; 22], secondary: Option<u8>) -> Self {
+        self.operation = operation;
+        self.secondary = secondary.filter(|_| self.forty);
+        if self.typed {
+            self.capability[0] &= !(2 | 64);
+            if self.secondary.is_some() {
+                self.capability[0] |= 2 | if self.sgi40 { 64 } else { 0 };
+            }
+        }
+        self
     }
     pub(crate) fn negotiated_secondary(self) -> Option<u8> {
         self.secondary
