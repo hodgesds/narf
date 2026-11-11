@@ -459,6 +459,38 @@ impl AmdGpu {
 /// No saved level → both directions program nothing.
 ```
 
+### 7.1 GPU buffer memory: placement under pressure, and where to read it
+
+A client buffer (`amdgpu_gem`) is a reservation in the card's client VRAM
+heap or system pages from the buddy allocator, counted against the GTT
+limit (half of RAM, TTM's default page limit).
+
+- **A full heap** (amdgpu_bo_create): a VRAM-preferred buffer falls back
+  to system pages; only a VRAM-only `DISCARDABLE` buffer, a dumb buffer and
+  a framebuffer being pinned for scanout need VRAM, and for those idle
+  buffers are evicted first. What still does not fit is refused.
+- **System pages** are taken as `ttm_pool_alloc` takes them
+  (`alloc_blocks`): from the largest order that fits downwards, never
+  asking again for an order the page allocator refused, so one buffer
+  costs at most one failed attempt (reclaim plus compaction) per order.
+  A user open's GEM_CREATE allocates and zeroes them with the card's
+  placement gate released; the gate covers only VRAM placement and
+  publication.
+- **A synchronous move** (`GemObject::relocate`: eviction for an
+  allocation, promotion on lookup, the final step of an asynchronous move)
+  copies the buffer with the object's placement lock free and publishes
+  the copy only if no address lease was taken meanwhile.
+
+Accounting is read-only walks, never hot-path counters
+(`amdgpu_gem::accounting`):
+
+| Where | What |
+| --- | --- |
+| `/sys/class/drm/card<N>/device/mem_info_{vram,vis_vram,gtt}_{total,used}` | bytes; the VRAM totals are the client heap (what an allocation can be given), GTT the system-page limit and use |
+| `/proc/<pid>/fdinfo/<fd>` of a DRM fd | `drm-driver`, `drm-client-id`, `drm-pdev`, `drm-total-*`/`drm-resident-*`/`drm-memory-{vram,gtt,cpu}` and `amd-evicted-vram`, `amd-requested-{vram,gtt}` (drm_show_fdinfo, amdgpu_show_fdinfo); `drm-memory-gtt` is the system pages the open holds |
+| kernel log, `amdgpu: gem:` | on a failed allocation or scanout pin, at most one report per card per 5 s: the request and caller, the heap (used, free, largest free range, pinned, evictable), the system-page budget and free RAM, buffer and framebuffer counts (closed but still shown ones apart), and the largest opens with pid and comm. `amdgpu: gem: card<N> first eviction` once when VRAM pressure first moves a buffer |
+| kernel log, `drm: display <d> flip_done timed out` | once per incident, when a commit's flip-complete event is still pending 1 s after the commit (drm_atomic_helper_wait_for_flip_done's message), with the presenter's state; `completed after all` if it then arrives |
+
 ## 8. Out of scope (Stage 3+)
 
 - **GFX / SDMA ring submission** — needs the full doorbell
