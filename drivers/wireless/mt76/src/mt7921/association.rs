@@ -1013,6 +1013,37 @@ pub(crate) struct TxPermission {
     wmm_rule: Option<narf_wireless::reg::WmmRule>,
     /// A 6 GHz grant: `channel` is then a 6 GHz channel number.
     pub(crate) six: Option<SixGrant>,
+    /// Granted on a radar (DFS) or NO_IR channel only because this scan
+    /// received the target BSS's own Beacon: the station follows an AP that
+    /// already operates there, as cfg80211/mac80211 let a client do (only
+    /// IEEE80211_CHAN_DISABLED refuses a station chandef). The policy is
+    /// re-checked with the same relaxation (`current`). Nothing here permits
+    /// probing: scans keep these channels passive.
+    heard_ap: bool,
+}
+
+/// The regulatory flags a station that heard its AP's Beacon may operate
+/// under. INDOOR_ONLY, power, bandwidth and 6 GHz client rules still hold.
+fn follows_heard_ap(flags: narf_wireless::reg::RegFlags) -> narf_wireless::reg::RegFlags {
+    use narf_wireless::reg::RegFlags;
+    flags.difference(RegFlags::DFS | RegFlags::NO_IR)
+}
+
+/// Beacon / Probe Response elements carrying a Channel Switch Announcement
+/// (element 37) or an Extended Channel Switch Announcement (element 60).
+/// A truncated element list counts only the complete elements before it.
+pub(crate) fn announces_channel_switch(mut ies: &[u8]) -> bool {
+    while let [id, len, rest @ ..] = ies {
+        let len = usize::from(*len);
+        if rest.len() < len {
+            return false;
+        }
+        if (*id == 37 && len == 3) || (*id == 60 && len == 4) {
+            return true;
+        }
+        ies = &rest[len..];
+    }
+    false
 }
 
 /// True for a BSS carrying the explicit 6 GHz band identity.
@@ -1065,6 +1096,52 @@ fn six_width(width: narf_wireless::association::six_ghz::SixGhzWidth) -> Option<
 impl TxPermission {
     pub fn from_domain(domain: &narf_wireless::reg::RegulatoryDomain, channel: u8) -> Option<Self> {
         Self::occupied(domain, channel, None, None, None)
+    }
+    /// `domain` as a station that heard its AP's Beacon may use it.
+    fn heard_ap_domain(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> narf_wireless::reg::RegulatoryDomain {
+        let mut relaxed = domain.clone();
+        for rule in &mut relaxed.rules {
+            rule.flags = follows_heard_ap(rule.flags);
+        }
+        relaxed
+    }
+    /// [`from_domain`](Self::from_domain) for a 2.4/5 GHz BSS whose Beacon
+    /// this scan received: a radar or NO_IR channel the AP operates on is
+    /// granted to the station joining it (cfg80211 `cfg80211_chandef_usable`
+    /// with only IEEE80211_CHAN_DISABLED prohibited for a client).
+    pub(crate) fn from_heard_ap(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        channel: u8,
+    ) -> Option<Self> {
+        Self::from_domain(domain, channel).or_else(|| {
+            let mut grant = Self::from_domain(&Self::heard_ap_domain(domain), channel)?;
+            grant.heard_ap = true;
+            Some(grant)
+        })
+    }
+    /// [`from_ap`](Self::from_ap), relaxed to a radar/NO_IR channel only
+    /// when `heard` (this scan received the BSS's Beacon). 6 GHz grants are
+    /// never relaxed.
+    pub(crate) fn from_ap_heard(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        info: super::firmware_transport::RadioInfo,
+        bss: &ScanBss,
+        heard: bool,
+    ) -> Option<Self> {
+        Self::from_ap(domain, info, bss).or_else(|| {
+            if !heard || is_six_ghz(bss) {
+                return None;
+            }
+            let mut grant = Self::from_ap(&Self::heard_ap_domain(domain), info, bss)?;
+            grant.heard_ap = true;
+            Some(grant)
+        })
+    }
+    /// Granted on a radar/NO_IR channel because the AP's Beacon was heard.
+    pub(crate) fn follows_heard_ap(self) -> bool {
+        self.heard_ap
     }
     pub(crate) fn from_domain40(
         domain: &narf_wireless::reg::RegulatoryDomain,
@@ -1287,6 +1364,7 @@ impl TxPermission {
                 ],
                 rule_power: rule.max_power_dbm,
             }),
+            heard_ap: false,
         })
     }
     /// The occupied 6 GHz channel of a 6 GHz grant.
@@ -1417,6 +1495,7 @@ impl TxPermission {
             vht80_channel: None,
             wmm_rule: domain.wmm_rule_for(primary),
             six: None,
+            heard_ap: false,
         })
     }
 
@@ -1441,6 +1520,16 @@ impl TxPermission {
                 })
             });
         }
+        // A grant that followed a heard AP onto a radar/NO_IR channel stays
+        // current under the same relaxation; a rule that disappears, shrinks
+        // or loses power still revokes it.
+        let relaxed;
+        let domain = if self.heard_ap {
+            relaxed = Self::heard_ap_domain(domain);
+            &relaxed
+        } else {
+            domain
+        };
         self.vht80_channel
             .is_none_or(|primary| Self::from_domain80(domain, primary, primary + 6).is_some())
             && Self::occupied(

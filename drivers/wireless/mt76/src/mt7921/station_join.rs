@@ -1170,6 +1170,30 @@ impl<B: Backend> Session<B> {
                     return Err(Error::DeviceGone);
                 }
             }
+            // The AP announces it is leaving this channel (Channel Switch
+            // Announcement, element 37, or Extended CSA, element 60) — on a
+            // radar channel because it detected radar. This owner does not
+            // follow a switch, so it leaves the channel now, before the AP
+            // does: no further transmission here, and the link loss reaches
+            // userspace as a disconnect (mac80211's outcome when a switch
+            // cannot be followed, `ieee80211_sta_connection_lost`).
+            if native.ccmp.is_none()
+                && matches!(header[0], 0x80 | 0x50)
+                && header[1] & 0xc7 == 0
+                && header[22] & 15 == 0
+                && (header[4..10] == own || header[4..10] == [0xff; 6])
+                && header[10..16] == peer
+                && header[16..22] == peer
+                && frame
+                    .get(36..)
+                    .is_some_and(crate::mt7921::association::announces_channel_switch)
+            {
+                self.station.peer_lost = true;
+                self.station.rx_ba.fence();
+                self.station.tx_ba.fence();
+                self.clear_aggregate_receive();
+                return Err(Error::DeviceGone);
+            }
             if let Some(parameters) = self.station.wmm_pending.or(self.station.wmm) {
                 if native.ccmp.is_none()
                     && matches!(header[0], 0x80 | 0x50)

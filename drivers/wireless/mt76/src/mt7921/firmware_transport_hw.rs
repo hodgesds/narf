@@ -1944,6 +1944,7 @@ impl Transport {
             security,
             extra_ies,
             crate::mt7921::p2p_wire::Network::Infrastructure,
+            false,
         )
         .await
     }
@@ -1957,14 +1958,22 @@ impl Transport {
         security: crate::mt7921::association::Security,
         extra_ies: &[u8],
         network: crate::mt7921::p2p_wire::Network,
+        heard_beacon: bool,
     ) -> Result<u16, Error> {
         let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
         let info = match self.session.state {
             State::RadioReady(info) | State::ScanReady(info) => info,
             _ => return Err(Error::Busy),
         };
-        let permission = crate::mt7921::association::TxPermission::from_ap(&domain, info, bss)
-            .ok_or(Error::Authority)?;
+        // `heard_beacon`: the latest scan received this BSS's Beacon, so a
+        // radar/NO_IR channel it operates on may be joined (never probed).
+        let permission = crate::mt7921::association::TxPermission::from_ap_heard(
+            &domain,
+            info,
+            bss,
+            heard_beacon,
+        )
+        .ok_or(Error::Authority)?;
         let aid = self
             .session
             .associate_station_as(bss, ssid, security, permission, extra_ies, network)

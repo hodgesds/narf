@@ -578,7 +578,8 @@ impl WirelessNetIface for P2pGroupIface {
         }
         let security =
             core::mem::replace(&mut request.security, narf_wireless::SecurityConfig::Open);
-        let (bss, security) = parent.resolve_join(&request, security, six)?;
+        // A P2P client never follows its GO onto a radar/NO_IR channel.
+        let (bss, security, _) = parent.resolve_join(&request, security, six, false)?;
         let link = self.ensure_native().await?;
         transport::associate_boot_group(link, &bss, &request.ssid, security, &request.ie, true)
             .await

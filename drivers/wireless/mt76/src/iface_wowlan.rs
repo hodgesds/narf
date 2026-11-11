@@ -121,7 +121,7 @@ impl Mt76Iface {
         }
         self.sleeping.store(true, Ordering::Release);
         self.clear_link();
-        self.scan_cache.lock().clear();
+        self.clear_scan_cache();
         if connected {
             // The host association ends even though its firmware context
             // remains temporarily live for wake. Resume creates a fresh

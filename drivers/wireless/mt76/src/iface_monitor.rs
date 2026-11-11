@@ -58,7 +58,7 @@ impl Mt76Iface {
         }
         self.iftype.store(iftype, Ordering::Release);
         self.wowlan.lock().take();
-        self.scan_cache.lock().clear();
+        self.clear_scan_cache();
         Ok(())
     }
     pub(super) fn configure_monitor(

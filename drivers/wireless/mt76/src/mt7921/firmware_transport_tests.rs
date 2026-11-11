@@ -49,6 +49,8 @@ mod key_replace_tests;
 mod monitor_tests;
 #[path = "pmf_tests.rs"]
 mod pmf_tests;
+#[path = "dfs_tests.rs"]
+mod dfs_tests;
 #[path = "receive_epoch_tests.rs"]
 mod receive_epoch_tests;
 #[path = "rx_ba_tests.rs"]
