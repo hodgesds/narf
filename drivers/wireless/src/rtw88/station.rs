@@ -1750,7 +1750,18 @@ impl State {
                                 frame.rate >= 0x40 || v.rx >> (frame.rate - 0x2c) & 1 == 0
                             })
                         } else if frame.rate >= 12 {
-                            self.ht.is_none() || frame.rate >= 20
+                            // HT MCS0..15 only within the locally advertised
+                            // RX set (`rtw_init_ht_cap` rx_mask: MCS0..7, or
+                            // MCS0..15 for a two-stream N22H record),
+                            // independent of the peer's narrower RX set. A
+                            // profile without HT DATA keeps the one-stream set.
+                            let rx = match self.data_profile.rx_mcs {
+                                0 => 0xff,
+                                rx => rx,
+                            };
+                            self.ht.is_none()
+                                || frame.rate >= 28
+                                || rx >> (frame.rate - 12) & 1 == 0
                         } else {
                             self.data_profile.rates & (1 << frame.rate) == 0
                         })
