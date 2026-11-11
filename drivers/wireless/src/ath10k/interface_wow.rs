@@ -107,8 +107,11 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
     }
     /// mac80211 `ieee80211_suspend` with a WoWLAN configuration ->
     /// `ath10k_wow_op_suspend`. `Ok(None)`: no retained configuration, not a
-    /// station, or not currently associated (NARF, like iwlwifi without
-    /// net-detect, then takes the ordinary suspend). `Err`: Linux's
+    /// station, or not associated without a net-detect configuration
+    /// (NARF, like iwlwifi without net-detect, then takes the ordinary
+    /// suspend). An unassociated station with net-detect arms WoW on its
+    /// home vdev (Linux programs `ath10k_vif_wow_set_wakeups` on every STA
+    /// `arvif`, associated or not). `Err`: Linux's
     /// "return 1" fallback; the Radio is left failed for retirement.
     /// The returned holder future must be spawned by a caller with a
     /// concrete transport (its Send-ness is that transport's), then
@@ -123,11 +126,15 @@ impl<T: Hif + HostMemory + HttMemory + Send + 'static> Device<T> {
         if self.wow.support.is_none()
             || self.mode.load(Ordering::Acquire) != 2
             || self.closed.load(Ordering::Acquire)
-            || !self.link_up()
         {
             return Ok(None);
         }
         let program = wow::Program::new(&config, self.wow.decap, self.nlo_supported())?;
+        // Disconnected net-detect: only the NLO wake is meaningful without
+        // an association; anything else suspends ordinarily.
+        if !self.link_up() && program.nlo.is_none() {
+            return Ok(None);
+        }
         let arming = Arming {
             device: self.clone(),
             armed: Slot::new(),

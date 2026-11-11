@@ -38,6 +38,7 @@ fn harness(version: u32, dialect: Dialect) -> Harness {
                 | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
             htt: (3, 1),
             hardware_keys: true,
+            nlo: false,
         },
     );
     h.model(|m| {

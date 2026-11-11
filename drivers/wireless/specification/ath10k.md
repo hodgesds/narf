@@ -1940,12 +1940,18 @@ zero-initialised `new_pattern` and programs zero-length patterns, so NARF
 advertises zero patterns there instead of that no-op. `WMI_SERVICE_NLO`
 net-detect is implemented (`ath10k_wmi_tlv_op_gen_config_pno_start`):
 the TLV NLO start command (tag 144, 112-byte fixed command plus
-76-byte network records, command 0x18001) is armed on the
-associated-station WoW path and stopped on resume, and is advertised
-only when the firmware reports the NLO service (16 match sets, random
-MAC). Disconnected net-detect remains open: the driver has no
-disconnected WoW suspend path, so an unassociated station suspends
-ordinarily.
+76-byte network records, command 0x18001) is armed on the WoW path and
+stopped on resume, and is advertised only when the firmware reports the
+NLO service (16 match sets, random MAC). Disconnected net-detect is
+implemented: an unassociated station whose retained configuration carries
+net-detect arms WoW on its home station vdev (created at start-up, as
+`ath10k_add_interface` creates `arvif->vdev_id` before any
+association), because Linux `ath10k_vif_wow_set_wakeups` programs every
+STA `arvif` whether or not it is associated. It requires no peer, no
+station data owner and no scan or remain-on-channel in flight (mac80211
+cancels both before `drv_suspend`). An unassociated station without
+net-detect still suspends ordinarily, since its other wake triggers
+cannot fire without a link.
 
 **Wire (`wmi-tlv.c`).** GRP_WOW 0x13: ADD_WAKE_PATTERN 0x13001 (tag179
 command, ARRAY_STRUCT of the 148+148-byte bitmap tag180, empty IPv4/IPv6
@@ -1976,7 +1982,9 @@ fail-stop). Then `Hif::wow_suspend_hif` runs `ath10k_pci_suspend`'s
 readback) while CE/DMA, MSI and firmware stay live. Any failure leaves the
 owner failed and `pci::suspend` falls back to the ordinary retirement above,
 as Linux's "return 1" makes mac80211 stop the device. An unassociated
-station takes the ordinary path (as iwlwifi without net-detect).
+station takes the ordinary path unless it carries net-detect (see
+Admission); an NLOD wake resumes the same generation, still
+unassociated, and the PNO stop follows WOW_WAKEUP_HOST.
 
 **Resume (`ath10k_wow_op_resume`).** `pci::resume_async` (the async
 system-PM resume) signals the holder: `Hif::wow_resume_hif` performs
@@ -2001,7 +2009,14 @@ wake-event decode) and `wmi_boot/wow_conversation_tests.rs` (composed WPA2
 station with hardware keys: magic suspend→wake→resume with exact Linux
 command order and a post-resume CCMP uplink accepted by the FakeAp's
 PN/replay check, deauth wake requesting restart, no advertisement without
-the firmware feature) under `drivers/wireless/ath10k/wow`. No physical WoW
+the firmware feature) under `drivers/wireless/ath10k/wow`;
+`wmi_boot/nwifi_conversation_tests.rs` adds the native-WiFi conversation
+(`smoke_ath10k_nwifi_wow_pattern_suspend_resume_keeps_link`: one
+converted ADD_WAKE_PATTERN, PATTERN_MATCH wake, post-resume native-WiFi
+uplink accepted by the AP) and the disconnected net-detect conversation
+(`smoke_ath10k_wow_disconnected_net_detect_suspend_resume`: cleanup, NLO
+start, NLO_DETECTED only, ENABLE, HOSTWAKEUP, NLO stop on the home vdev,
+then a normal join). No physical WoW
 entry, wake latency, PME routing or power measurement is claimed.
 
 ### 3.7 Native-WiFi decap station (implementation; validation pending)

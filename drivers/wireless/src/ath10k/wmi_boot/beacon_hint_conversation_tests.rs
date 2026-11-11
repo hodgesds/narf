@@ -38,6 +38,7 @@ fn scoped(
                 features: (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
                 htt: (3, 1),
                 hardware_keys: false,
+                nlo: false,
             },
             Some(database.clone()),
         ),

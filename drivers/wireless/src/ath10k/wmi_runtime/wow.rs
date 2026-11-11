@@ -631,9 +631,13 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         }
         Ok(())
     }
-    /// `ath10k_wow_op_suspend` for the associated station's vdev
+    /// `ath10k_wow_op_suspend` for the station's vdev
     /// (`ath10k_wow_vif_cleanup`/`ath10k_vif_wow_set_wakeups` use
-    /// `arvif->vdev_id`). Any error
+    /// `arvif->vdev_id`): the associated peer's vdev, or, for a
+    /// disconnected net-detect suspend (no peer, a program with NLO, no
+    /// scan or remain-on-channel in flight, as mac80211 cancels both
+    /// before `drv_suspend`), the home station vdev that exists from
+    /// start-up (`ath10k_add_interface`). Any error
     /// leaves this owner failed; the caller falls back to the ordinary
     /// non-WoWLAN suspend exactly as Linux returns 1 to mac80211.
     pub(in crate::ath10k) async fn wow_suspend(
@@ -644,10 +648,18 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed || self.wow_armed || self.wowlan_support().is_none() {
             return Err(Error::Failed);
         }
-        if self.station_link().is_none() {
+        let vdev = if self.station_link().is_some() {
+            u32::from(self.station.peer.as_ref().ok_or(Error::Failed)?.vdev)
+        } else if program.nlo.is_some()
+            && self.station.peer.is_none()
+            && self.station.data.is_none()
+            && self.scan_pending.is_none()
+            && self.roc.is_none()
+        {
+            u32::from(self.station_vdev())
+        } else {
             return Err(Error::Failed);
-        }
-        let vdev = u32::from(self.station.peer.as_ref().ok_or(Error::Failed)?.vdev);
+        };
         // All commands are encoded before the first publication.
         let mut commands = Vec::new();
         let count = (EVENT_MAX + PATTERNS) as usize

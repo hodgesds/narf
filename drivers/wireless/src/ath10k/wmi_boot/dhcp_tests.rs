@@ -80,6 +80,8 @@ struct NativeFirmware {
     htt: (u8, u8),
     /// Linux `cryptmode=0`: the radio offloads station keys (`pci.rs`).
     hardware_keys: bool,
+    /// SERVICE_READY also carries `WMI_TLV_SERVICE_NLO` (net-detect).
+    nlo: bool,
 }
 struct Harness {
     device: Arc<ModelDevice>,
@@ -209,6 +211,7 @@ impl Harness {
                 features: (1 << 10) | (1 << 2) | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
                 htt: (3, 1),
                 hardware_keys: false,
+                nlo: false,
             },
         )
     }
@@ -260,6 +263,10 @@ impl Harness {
             // WMI_TLV_SERVICE_WOW (13): word 3, bit 1 (`ath10k_wow_init`).
             if let Some(caps) = radio.htt.wmi.caps.as_mut() {
                 caps.bitmap[12] |= 2;
+                if profile.nlo {
+                    // WMI_TLV_SERVICE_NLO (17): word 4, bit 1.
+                    caps.bitmap[16] |= 2;
+                }
             }
         }
         radio.htt.wmi.htc.transport.frequency = frequency;
