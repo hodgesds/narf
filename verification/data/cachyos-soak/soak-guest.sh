@@ -658,6 +658,9 @@ durable_run() {
 }
 
 w_integrity() {
+  mkdir -p "$DATA" || return 1
+  # The exit status is the tool's, not the pipe's last stage.
+  set -o pipefail
   "$NATIVE" integrity "$1" "$DATA/integ" 4 "$HB/integrity" 2>&1 |
     while read -r line; do say "SOAK-INTEG $line"; done
 }
