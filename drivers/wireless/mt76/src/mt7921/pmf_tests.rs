@@ -214,6 +214,110 @@ kernel_test_in!(
     mt76_wpa3_sae_h2e_and_hunt_and_peck_install_bip_igtk_and_admit_only_bip_deauth
 );
 
+/// The association elements wpa_supplicant 2.12 passes in an SAE-offload
+/// CONNECT for a NetworkManager `key-mgmt=sae` profile (`ieee80211w=2`):
+/// its RSNE (SAE, MFPC|MFPR, PTKSA replay counters, BIP-CMAC-128), Supported
+/// Operating Classes, Extended Capabilities and the RSNXE (H2E).
+fn wpa_supplicant_sae_ies() -> Vec<u8> {
+    let mut ie = vec![
+        48, 26, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 8,
+        0xcc, 0x00, 0, 0, 0x00, 0x0f, 0xac, 6,
+    ];
+    ie.extend_from_slice(&[59, 4, 115, 115, 116, 117]);
+    ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+    ie.extend_from_slice(&[244, 1, 0x20]);
+    ie
+}
+
+/// The (re)association request the station sent, if any.
+fn association_request(session: &Session<Model>) -> Option<Vec<u8>> {
+    session
+        .backend
+        .frames
+        .iter()
+        .map(|(_, f)| f)
+        .find(|f| f.len() > 28 && f[0] == 0x00 && f[4..10] == AP)
+        .cloned()
+}
+
+/// Count of element `id` in the association request body.
+fn element_count(request: &[u8], id: u8) -> usize {
+    let mut rest = &request[28..];
+    let mut count = 0;
+    while rest.len() >= 2 {
+        let len = 2 + usize::from(rest[1]);
+        if rest[0] == id {
+            count += 1;
+        }
+        rest = rest.get(len..).unwrap_or_default();
+    }
+    count
+}
+
+/// wpa_supplicant 2.12's SAE-offload connect, as nl80211 hands it to the
+/// MT7922 station owner (`Security::Wpa3Sae` + the supplicant's elements),
+/// against a WPA3-only AP (H2E and hunting-and-pecking) and a WPA3-Personal
+/// transition-mode AP. The owner must complete SAE, associate with exactly
+/// one RSNE and at most one RSNXE (its own, not the supplicant's), run the
+/// 4-way handshake to the AP's Authorized state — what nl80211 reports as
+/// PORT_AUTHORIZED — and negotiate PMF.
+fn mt7922_wpa_supplicant_sae_offload_connect_authorizes_wpa3_and_transition_aps() -> TestResult {
+    use core::fmt::Write;
+    let aps = [
+        ("WPA3-only H2E", sae_ap(ApSaePwe::HashToElement)),
+        (
+            "WPA3-only hunting-and-pecking",
+            sae_ap(ApSaePwe::HuntAndPeck),
+        ),
+        (
+            "WPA3 transition",
+            sae_ap(ApSaePwe::HashToElement)
+                .with_sae_transition()
+                .unwrap(),
+        ),
+    ];
+    for (name, ap) in aps {
+        let (mut session, bss) = prepared(ap);
+        let aid = run(Box::pin(session.associate_station(
+            &bss,
+            b"narf",
+            sae(),
+            test_permission(),
+            &wpa_supplicant_sae_ies(),
+        )));
+        if aid != Ok(42) {
+            let _ = writeln!(narf_console::Writer, "mt7922 SAE offload {name}: {aid:?}");
+            return TestResult::Fail("SAE-offload connect did not associate");
+        }
+        let ap = session.backend.access_point.as_ref().unwrap();
+        if ap.phase() != ApPhase::Authorized
+            || ap.akm() != Some(narf_wireless::eapol::KeyMgmt::Sae)
+            || !ap.pmf()
+        {
+            let _ = writeln!(narf_console::Writer, "mt7922 SAE offload {name}");
+            return TestResult::Fail("AP did not authorize the SAE/PMF station");
+        }
+        let Some(request) = association_request(&session) else {
+            return TestResult::Fail("no association request");
+        };
+        if element_count(&request, 48) != 1
+            || element_count(&request, 244) > 1
+            || element_count(&request, 59) != 1
+        {
+            let _ = writeln!(narf_console::Writer, "mt7922 SAE offload {name}");
+            return TestResult::Fail("association request elements are not one RSNE/RSNXE");
+        }
+        if igtk_record(&session).is_none_or(|r| r[48..64] != IGTK) {
+            return TestResult::Fail("no BIP IGTK installed after SAE-offload connect");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/pmf",
+    mt7922_wpa_supplicant_sae_offload_connect_authorizes_wpa3_and_transition_aps
+);
+
 fn mt76_wpa3_sae_wrong_password_and_pmf_policy_failures_install_no_keys() -> TestResult {
     let (mut session, bss) = prepared(sae_ap(ApSaePwe::HashToElement));
     let wrong = Security::Wpa3Sae {
