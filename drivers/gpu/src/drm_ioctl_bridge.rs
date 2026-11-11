@@ -6620,11 +6620,6 @@ fn atomic_commit(
                 req.flags,
                 &state,
             );
-            // A framebuffer CLOSEFB released while shown goes once this
-            // commit took its planes off it.
-            for (phys, order) in card.collect_closed_fbs() {
-                free_backing_pages(phys, order);
-            }
             // drm_crtc_state::mode / mode_blob: the full committed timing
             // and the blob naming it; a CRTC without a mode forgets both.
             for crtc in &state.crtcs {
@@ -6641,6 +6636,12 @@ fn atomic_commit(
             }
             #[cfg(feature = "amdgpu")]
             crate::drm_native_planes::commit(&mut card, &state);
+            // A framebuffer CLOSEFB released while shown goes once this
+            // commit took its planes off it: after every plane's state,
+            // the native overlays' and cursors' included, is the new one.
+            for (phys, order) in card.collect_closed_fbs() {
+                free_backing_pages(phys, order);
+            }
             #[cfg(feature = "amdgpu")]
             {
                 cursor_requests =
@@ -8068,6 +8069,11 @@ fn handle_setcrtc_decoded(
         }
         #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::reset_primary(&mut card, req.crtc_id);
+        // A framebuffer CLOSEFB released while shown goes once the CRTC
+        // shows another (or none), on this path as on an atomic commit.
+        for (phys, order) in card.collect_closed_fbs() {
+            free_backing_pages(phys, order);
+        }
         #[cfg(feature = "amdgpu")]
         if let Some(display) = native_display {
             let setup = crate::drm_native_planes::displays(&card)
@@ -8401,6 +8407,11 @@ fn handle_page_flip_decoded(
         card.crtc_mut(req.crtc_id)
             .map_err(|_| FsError::NotFound)?
             .primary_fb = Some(req.fb_id);
+        // The framebuffer flipped away from, if CLOSEFB released it while
+        // it was shown, goes now.
+        for (phys, order) in card.collect_closed_fbs() {
+            free_backing_pages(phys, order);
+        }
         // A framebuffer of another tiling changes the primary's surface
         // (DC's full update): the display relights with it, as for an
         // atomic commit.
@@ -8684,6 +8695,11 @@ fn handle_setplane_decoded_native(
                 return Err(invalid_at(line!()));
             }
             crate::drm_native_planes::commit(&mut card, &state);
+            // The framebuffer the plane left, if CLOSEFB released it while
+            // it was shown, goes now.
+            for (phys, order) in card.collect_closed_fbs() {
+                free_backing_pages(phys, order);
+            }
             let mut frames = Vec::new();
             for dp in &displays {
                 let Some(display) =

@@ -2909,10 +2909,19 @@ impl Card {
         }
         Ok(None)
     }
-    /// Whether a CRTC or native plane still scans framebuffer `fb_id`.
+    /// Whether a CRTC or native plane still scans framebuffer `fb_id`. A
+    /// primary's framebuffer is its CRTC's `primary_fb`, which every path
+    /// that changes it writes (atomic, SETCRTC, PAGE_FLIP); a native
+    /// primary's own `fb_id` only mirrors the last atomic commit and is
+    /// not consulted, or a framebuffer flipped away by a legacy ioctl
+    /// would count as shown until the next atomic commit. An overlay's or
+    /// a cursor plane's framebuffer is the plane's.
     pub fn fb_shown(&self, fb_id: u32) -> bool {
         self.crtcs.iter().any(|c| c.primary_fb == Some(fb_id))
-            || self.native_planes.iter().any(|p| p.fb_id == Some(fb_id))
+            || self
+                .native_planes
+                .iter()
+                .any(|p| p.primary_of.is_none() && p.fb_id == Some(fb_id))
     }
     /// Free closed framebuffers (CLOSEFB'd while shown) nothing scans any
     /// more. Returns dumb backings to buddy-free.

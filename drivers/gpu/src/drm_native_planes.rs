@@ -3108,6 +3108,84 @@ mod tests {
         drm_native_planes_disabled_primary_has_no_state
     );
 
+    /// A framebuffer stops being shown when its plane shows another one,
+    /// whichever ioctl made the change (drm_mode_closefb keeps a closed
+    /// framebuffer only while a plane scans it). A primary's framebuffer
+    /// is its CRTC's, which the core commit, SETCRTC and PAGE_FLIP all
+    /// write: the native primary's own record of the last atomic commit
+    /// must not keep the old one "shown" until `drm_native_planes::commit`
+    /// runs, or for ever under a client that only uses the legacy ioctls.
+    /// An overlay's framebuffer is shown until the overlay lets go of it.
+    fn drm_native_planes_fb_shown_follows_the_planes() -> TestResult {
+        let (mut card, fbs) = dcn30_card();
+        let [primary, _primary2, video] = fbs;
+        let pointer = {
+            let handle = card.gem.alloc(0x3000_0000, 41 * 40 * 4).unwrap();
+            card.addfb2(41, 40, AR24, 41 * 4, handle).unwrap()
+        };
+        let mut first = AtomicState::default();
+        first.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            pointer,
+            (41, 40),
+            (100, 100, 41, 40),
+        ));
+        first.planes.push(on(
+            OVERLAY_PLANE_ID_BASE,
+            video,
+            (1280, 720),
+            (0, 0, 1280, 720),
+        ));
+        first.checked = true;
+        if first.core_commit(&mut card).is_err() {
+            return TestResult::Fail("first commit");
+        }
+        commit(&mut card, &first);
+        if !card.fb_shown(pointer) || !card.fb_shown(video) || card.fb_shown(primary) {
+            return TestResult::Fail("committed framebuffers not shown");
+        }
+        // An atomic commit to another primary framebuffer: the old one is
+        // off screen as soon as the core state is committed.
+        let mut second = AtomicState::default();
+        second.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            primary,
+            (1920, 1080),
+            (0, 0, 1920, 1080),
+        ));
+        second.checked = true;
+        if second.core_commit(&mut card).is_err() {
+            return TestResult::Fail("second commit");
+        }
+        if card.fb_shown(pointer) || !card.fb_shown(primary) {
+            return TestResult::Fail("flipped-away primary framebuffer still shown");
+        }
+        commit(&mut card, &second);
+        // A legacy PAGE_FLIP writes the CRTC's framebuffer alone.
+        card.crtcs[0].primary_fb = Some(pointer);
+        if card.fb_shown(primary) || !card.fb_shown(pointer) {
+            return TestResult::Fail("legacy flip left the old framebuffer shown");
+        }
+        // The overlay keeps its framebuffer until it is switched off.
+        let mut off = on(OVERLAY_PLANE_ID_BASE, video, (1280, 720), (0, 0, 1280, 720));
+        off.crtc_id = None;
+        off.fb_id = None;
+        let mut third = AtomicState::default();
+        third.planes.push(off);
+        if !card.fb_shown(video) {
+            return TestResult::Fail("overlay framebuffer not shown");
+        }
+        commit(&mut card, &third);
+        if card.fb_shown(video) {
+            return TestResult::Fail("disabled overlay's framebuffer still shown");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_fb_shown_follows_the_planes
+    );
+
     /// Commit/displays round-trip on DCN30: every enabled CRTC's display
     /// is its full-frame primary; an overlay on, its CRTC's display
     /// carries it; the overlay off, it is the full-frame primary again.
