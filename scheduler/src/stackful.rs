@@ -1235,6 +1235,9 @@ unsafe fn try_direct_handoff(
         guard_switch_into("direct_handoff:target.ctx", &target_ref.ctx);
         #[cfg(any(test, feature = "kernel-test"))]
         DIRECT_HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+        // A task-to-task switch is a scheduling point even though it bypasses
+        // the executor loop.
+        crate::note_sched_pass(cpu);
         // SAFETY: source and target contexts are distinct, live save slots;
         // the target returns either to `root_exec` or directly to this exact
         // root continuation, never to a third task stack.
