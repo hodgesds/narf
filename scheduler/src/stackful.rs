@@ -460,6 +460,20 @@ fn cpu_local_state_held(cpu: usize) -> Option<(usize, u32)> {
     Some((rcu_readers, preempt_depth))
 }
 
+/// Whether preempting the interrupted continuation now would switch it out
+/// inside a QSBR read section.
+///
+/// A preempted task is requeued and may be stolen, so it can resume on another
+/// CPU and drop its guard there. Unlike a voluntary park this is nobody's bug:
+/// read sections do not disable preemption. The timer simply does not switch
+/// until the section ends, which is how Linux's non-preemptible RCU treats
+/// `rcu_read_lock()`; the reschedule request stays pending and the next tick
+/// acts on it. The preempt-disable depth is already checked on entry.
+#[inline]
+fn preempt_would_carry_rcu_readers() -> bool {
+    narf_rcu::reader_nesting() != 0
+}
+
 #[cold]
 #[inline(never)]
 fn report_park_violation(violation: ParkViolation) {
@@ -3469,6 +3483,9 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
         return false;
     }
+    if preempt_would_carry_rcu_readers() {
+        return false;
+    }
     // SAFETY: Same live-`KernelTask` invariant as above.
     let exec_ctx = unsafe { (*task_ptr).exec_ctx.load(Ordering::Acquire) };
     if exec_ctx.is_null() {
@@ -3692,6 +3709,9 @@ pub unsafe fn try_preempt_aarch64_irq(frame: &Aarch64TrapFrame, tick: bool) -> b
     let task = unsafe { &*task_ptr };
     let need_resched = crate::need_resched_pending(cpu) || rt_reconsider(task, cpu);
     if !crate::tick_preemption_required(current_id, now, slice_expired || need_resched) {
+        return false;
+    }
+    if preempt_would_carry_rcu_readers() {
         return false;
     }
     let exec_ctx = task.exec_ctx.load(Ordering::Acquire);

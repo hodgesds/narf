@@ -1198,6 +1198,10 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
     `__test_expect_park_violation`. A switch-out made inside a nested executor
     round is not judged: the enclosing frame's state is counted on the same
     CPU and stays there with it.
+  - Involuntary preemption of a kernel continuation is refused while the
+    reader nesting is non-zero (it is already refused while preemption is
+    disabled). The request stays pending and the next tick acts on it, as
+    with Linux's non-preemptible `rcu_read_lock()`.
 
 ## 5. Architecture notes
 

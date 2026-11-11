@@ -281,8 +281,9 @@ but a stackful continuation is suspended and resumed as a stack and is
 never subject to that check. If one leaves its CPU inside a read section
 and resumes elsewhere, the CPU it left stays pinned for ever and the CPU
 it reaches counts below zero. The scheduler therefore reads
-`reader_nesting()` where a stackful continuation gives up its CPU of its
-own accord, and reports a park or yield made with a non-zero count
+`reader_nesting()` at each point where a stackful continuation gives up
+its CPU: it refuses to preempt while the count is non-zero, and it
+reports a voluntary park or yield made with a non-zero count
 (`scheduler/` §4).
 
 **Reclamation worker.** Destructors are arbitrary `Drop` code — the
