@@ -375,9 +375,11 @@ fn net_detect_conversation() -> Result<(), &'static str> {
     {
         return Err("Linux wow.c net-detect command order");
     }
-    // Every command named the same (home) vdev.
+    // Every command named the same (home) vdev. The NLO config carries
+    // `flags` first and `vdev_id` second (`wmi_tlv_wow_nlo_config_cmd`).
     let vdev = word(&commands[0], 8);
-    if commands[..48].iter().any(|c| word(c, 8) != vdev) {
+    let vdev_of = |c: &Vec<u8>| word(c, if word(c, 0) == 0x18001 { 12 } else { 8 });
+    if commands[..48].iter().any(|c| vdev_of(c) != vdev) || vdev_of(&commands[50]) != vdev {
         return Err("net-detect commands on different vdevs");
     }
     h.join()
