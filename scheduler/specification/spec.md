@@ -865,7 +865,12 @@ pub struct TaskSpec {
   that is written by thieves only (per victim: the pass count at first sight
   and when), dropped when a visit finds nothing staged and restarted when the
   count has moved; the victim's scheduling paths do not touch it, and it does
-  not depend on the victim taking interrupts. One pull judges at most 32
+  not depend on the victim taking interrupts. The floor counts tasks, not
+  inbox nodes: a node can outlive its wake (its task ran under a direct
+  handoff and sleeps again, or is running that way now), so the thief judges
+  the woken sleepers in its window first and applies the floor to the ones
+  that are still runnable, before taking from either holding place. Nodes
+  outside the window are counted at face value. One pull judges at most 32
   staged entries per holding place. The wake inbox is a queue and is scanned
   oldest first; the parked-wake list is a stack and is scanned newest first.
   The window moves: a pull that judges a full window and takes nothing starts

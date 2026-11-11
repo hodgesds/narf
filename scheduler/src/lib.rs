@@ -7969,8 +7969,11 @@ impl StagedWatch {
 /// dispatchable, permitted by the strategy (hard affinity at least), outside
 /// the cache-hot window, and the victim must keep one runnable or running task
 /// — with staged wakes now counted as runnable, as `select_fork_cpu` already
-/// counts them. A CPU that is idle with a single staged wake is therefore left
-/// to take it itself; it has been kicked.
+/// counts them. A healthy CPU that is idle with a single staged wake is
+/// therefore left to take it itself; it has been kicked. The count is of
+/// tasks: the parked-wake gauge counts nodes, and a node can outlive its wake,
+/// so the woken sleepers are judged first and the floor is applied to what
+/// they turn out to be before anything is taken from either place.
 ///
 /// The parked case decides ownership under `PARKED[victim]`, the lock the
 /// owner's drain, a direct-handoff claim and wake-time placement all take, so
@@ -8007,22 +8010,38 @@ fn try_steal_staged(
     }
     let victim_id = crate::affinity::CpuId(victim as u32);
     let now = narf_time::now_cycles();
-    let runnable = ready_dispatchable
-        .saturating_add(enqueued)
-        .saturating_add(woken);
-    if !victim_has_stealable_surplus(cpu_running_task(victim_id), runnable) {
-        // Nothing is running there and this is its last runnable task. A
-        // healthy idle CPU keeps it. One that thieves have watched hold the
-        // wake without passing a scheduling point does not: `CURRENT_TASK` is
-        // clear in the executor's own maintenance too (deferred destructors,
-        // slab drain, sleep pumps, timer wheel), and a CPU stuck there is as
-        // unreachable as one stuck in a task.
-        let passes = SCHEDULER_TELEMETRY[victim]
-            .sched_passes
-            .load(Ordering::Relaxed);
-        if !watch.stalled(passes, now, narf_time::ns_to_cycles(STAGED_STALL_NS)) {
-            return false;
-        }
+    let running = cpu_running_task(victim_id);
+    // The floor: taking one task must leave the victim a runnable or running
+    // one. With `runnable` staged-or-queued tasks that holds when there are
+    // two, or one and the victim is busy. Busy is running a task, or — for
+    // its last task only, and only then is the record consulted — stalled: a
+    // healthy idle CPU keeps its last wake, one that thieves have watched
+    // hold it without passing a scheduling point does not. `CURRENT_TASK` is
+    // clear in the executor's own maintenance too (deferred destructors, slab
+    // drain, sleep pumps, timer wheel), and a CPU stuck there is as
+    // unreachable as one stuck in a task.
+    let floor_allows = |runnable: usize| {
+        runnable > 1
+            || (runnable == 1
+                && (running
+                    || watch.stalled(
+                        SCHEDULER_TELEMETRY[victim]
+                            .sched_passes
+                            .load(Ordering::Relaxed),
+                        now,
+                        narf_time::ns_to_cycles(STAGED_STALL_NS),
+                    )))
+    };
+    // First on the gauges, without a lock. They can only overcount — a node
+    // is counted whether or not its task is still runnable — so a refusal
+    // here is final, and an acceptance is checked again below against the
+    // tasks themselves.
+    if !floor_allows(
+        ready_dispatchable
+            .saturating_add(enqueued)
+            .saturating_add(woken),
+    ) {
+        return false;
     }
     let thief = crate::affinity::CpuId(cpu as u32);
     let migration_cost = narf_time::ns_to_cycles(MIGRATION_COST_NS);
@@ -8036,128 +8055,164 @@ fn try_steal_staged(
             && strategy.allow_steal(thief, &crate::policy::TaskMeta::from_slot_at(slot, now))
     };
 
-    // Cross-CPU enqueues. The victim has not admitted these yet (its policy
-    // sees them at drain), so there is no dequeue to report; the thief admits
-    // the task as the victim would have.
-    if enqueued != 0 {
-        let taken = WAKE_INBOX[victim].try_lock().and_then(|mut inbox| {
-            let len = inbox.len();
-            let start = staged_window_start(&watch.inbox_skip, len, usize::MAX);
-            let position = inbox
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(STAGED_STEAL_SCAN)
-                .find_map(|(position, (slot, _))| stealable(slot).then_some(position));
-            staged_window_advance(
-                &watch.inbox_skip,
-                start,
-                len,
-                usize::MAX,
-                position.is_some(),
-            );
-            let taken = inbox.remove(position?);
-            WAKE_INBOX_LEN[victim].store(inbox.len(), Ordering::Release);
-            taken
-        });
-        if let Some((slot, reason)) = taken {
-            let reason = match reason {
-                policy::TaskEnqueueReason::Admitted => policy::TaskEnqueueReason::Admitted,
-                _ => policy::TaskEnqueueReason::Migrated,
+    // Woken parked tasks first, found through their activation nodes: judging
+    // them is also what turns the node count into a task count, which the
+    // floor needs before anything is taken from either place.
+    if woken != 0 {
+        let mut pinned = [core::ptr::null::<WakeCell>(); STAGED_STEAL_SCAN];
+        let mut count = 0;
+        let start = staged_window_start(&watch.parked_skip, woken, STAGED_PARKED_REACH);
+        {
+            let inbox = &PARKED_WAKE_INBOX[victim];
+            // Like every other lock on the victim, the gate is only tried: a
+            // waker or another thief is at this inbox right now, and an idle
+            // CPU never spins on a victim.
+            let Some(_gate) = inbox.gate.try_lock() else {
+                return false;
             };
+            let mut node = inbox.head.load(Ordering::Relaxed).cast_const();
+            // Walk to the window. `woken` was read before the gate, so the
+            // list may have become shorter; then the window is empty and the
+            // cursor goes back to the front below.
+            for _ in 0..start {
+                if node.is_null() {
+                    break;
+                }
+                // SAFETY: linked under the gate, hence kept alive by the
+                // inbox's reference; links change only under the gate.
+                node = unsafe { (*node).wake_next.load(Ordering::Relaxed) };
+            }
+            while !node.is_null() && count < STAGED_STEAL_SCAN {
+                // SAFETY: a node linked under the gate is kept alive by the
+                // inbox's reference; this takes one more for the thief, so
+                // the cell outlives the gate whatever the owner's drain does
+                // next. Links change only under the gate.
+                unsafe {
+                    Arc::increment_strong_count(node);
+                    pinned[count] = node;
+                    node = (*node).wake_next.load(Ordering::Relaxed);
+                }
+                count += 1;
+            }
+        }
+        // `None`: the parked set is contended and nothing could be counted.
+        // Otherwise whether the floor allows a take, and the slot taken.
+        let judged = PARKED[victim].try_lock().map(|mut parked| {
+            let Some(slots) = parked.as_mut() else {
+                return (false, None);
+            };
+            let mut real = 0usize;
+            let mut candidate = None;
+            for node in &pinned[..count] {
+                // SAFETY: pinned above until the loop after this lock scope.
+                let cell = unsafe { &**node };
+                // `for_cell` matches the token, the task id and the cell
+                // itself, so a node whose task has left selects nothing.
+                let Some((index, entry)) = slots.for_cell(victim, cell) else {
+                    continue;
+                };
+                // A node can outlive its wake: the task ran under a direct
+                // handoff and sleeps again, or is being run that way now.
+                if !entry.slot.awake.executor_runnable() {
+                    continue;
+                }
+                real += 1;
+                if candidate.is_none() && stealable(&entry.slot) {
+                    candidate = Some((index, entry.slot.id, *node));
+                }
+            }
+            // Nodes outside this window are taken at face value.
+            let runnable = ready_dispatchable
+                .saturating_add(enqueued)
+                .saturating_add(real)
+                .saturating_add(woken.saturating_sub(count));
+            if !floor_allows(runnable) {
+                return (false, None);
+            }
+            let taken =
+                candidate.and_then(|(index, id, node)| Some((slots.take(index, id)?.slot, node)));
+            (true, taken)
+        });
+        // The slot is the thief's now and its parked token is clear, so
+        // nothing can link the node again; take it off the victim's list
+        // before the task goes anywhere. This is the one acquisition on the
+        // victim that waits. By now it cannot be skipped — the task must not
+        // run with its node left behind — and what it waits for is a leaf:
+        // whoever holds the gate links or unlinks a node, or pins a window,
+        // and lets go without taking another lock or calling out.
+        // `PARKED[victim]` is no longer held while it waits.
+        let judged = judged.map(|(allowed, taken)| {
+            let slot = taken.map(|(slot, node)| {
+                // SAFETY: still pinned; the pins are dropped just below.
+                unlink_parked_wake(victim, unsafe { &*node });
+                slot
+            });
+            (allowed, slot)
+        });
+        // Outside every lock: a pin can be the last reference to a cell whose
+        // task exited after the gate was released.
+        for node in &pinned[..count] {
+            // SAFETY: each entry holds the reference taken under the gate.
+            unsafe { Arc::decrement_strong_count(*node) };
+        }
+        let Some((allowed, taken)) = judged else {
+            return false;
+        };
+        if !allowed {
+            return false;
+        }
+        // An empty window means the list ended before it; count it as the end.
+        let seen_len = if count == 0 { 0 } else { woken };
+        staged_window_advance(
+            &watch.parked_skip,
+            start,
+            seen_len,
+            STAGED_PARKED_REACH,
+            taken.is_some(),
+        );
+        if let Some(slot) = taken {
             note_staged_pull();
-            enqueue_on(cpu, slot, reason);
+            enqueue_on(cpu, slot, policy::TaskEnqueueReason::Migrated);
             return true;
         }
     }
 
-    // Woken parked tasks, found through their activation nodes.
-    if woken == 0 {
+    // Cross-CPU enqueues. Every entry is a runnable task, so the gauge the
+    // floor was checked against is exact for this place. The victim has not
+    // admitted these yet (its policy sees them at drain), so there is no
+    // dequeue to report; the thief admits the task as the victim would have.
+    if enqueued == 0 {
         return false;
     }
-    let mut pinned = [core::ptr::null::<WakeCell>(); STAGED_STEAL_SCAN];
-    let mut count = 0;
-    let start = staged_window_start(&watch.parked_skip, woken, STAGED_PARKED_REACH);
-    {
-        let inbox = &PARKED_WAKE_INBOX[victim];
-        // Like every other lock on the victim, the gate is only tried: a
-        // waker or another thief is at this inbox right now, and an idle CPU
-        // never spins on a victim.
-        let Some(_gate) = inbox.gate.try_lock() else {
-            return false;
-        };
-        let mut node = inbox.head.load(Ordering::Relaxed).cast_const();
-        // Walk to the window. `woken` was read before the gate, so the list
-        // may have become shorter; then the window is empty and the cursor
-        // goes back to the front below.
-        for _ in 0..start {
-            if node.is_null() {
-                break;
-            }
-            // SAFETY: linked under the gate, hence kept alive by the inbox's
-            // reference; links change only under the gate.
-            node = unsafe { (*node).wake_next.load(Ordering::Relaxed) };
-        }
-        while !node.is_null() && count < STAGED_STEAL_SCAN {
-            // SAFETY: a node linked under the gate is kept alive by the
-            // inbox's reference; this takes one more for the thief, so the
-            // cell outlives the gate whatever the owner's drain does next.
-            // Links change only under the gate.
-            unsafe {
-                Arc::increment_strong_count(node);
-                pinned[count] = node;
-                node = (*node).wake_next.load(Ordering::Relaxed);
-            }
-            count += 1;
-        }
-    }
-    let taken = PARKED[victim].try_lock().and_then(|mut parked| {
-        let slots = parked.as_mut()?;
-        pinned[..count].iter().find_map(|node| {
-            // SAFETY: pinned above until the loop after this lock scope.
-            let cell = unsafe { &**node };
-            // `for_cell` matches the token, the task id and the cell itself.
-            let (index, entry) = slots.for_cell(victim, cell)?;
-            if !stealable(&entry.slot) {
-                return None;
-            }
-            let id = entry.slot.id;
-            let slot = slots.take(index, id)?.slot;
-            Some((slot, *node))
-        })
+    let taken = WAKE_INBOX[victim].try_lock().and_then(|mut inbox| {
+        let len = inbox.len();
+        let start = staged_window_start(&watch.inbox_skip, len, usize::MAX);
+        let position = inbox
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(STAGED_STEAL_SCAN)
+            .find_map(|(position, (slot, _))| stealable(slot).then_some(position));
+        staged_window_advance(
+            &watch.inbox_skip,
+            start,
+            len,
+            usize::MAX,
+            position.is_some(),
+        );
+        let taken = inbox.remove(position?);
+        WAKE_INBOX_LEN[victim].store(inbox.len(), Ordering::Release);
+        taken
     });
-    // The slot is the thief's now and its parked token is clear, so nothing
-    // can link the node again; take it off the victim's list before the task
-    // goes anywhere. This is the one acquisition on the victim that waits. By
-    // now it cannot be skipped — the task must not run with its node left
-    // behind — and what it waits for is a leaf: whoever holds the gate links
-    // or unlinks a node, or pins a window, and lets go without taking another
-    // lock or calling out. `PARKED[victim]` is no longer held while it waits.
-    let taken = taken.map(|(slot, node)| {
-        // SAFETY: still pinned; the pins are dropped just below.
-        unlink_parked_wake(victim, unsafe { &*node });
-        slot
-    });
-    // Outside every lock: a pin can be the last reference to a cell whose
-    // task exited after the gate was released.
-    for node in &pinned[..count] {
-        // SAFETY: each entry holds the reference taken under the gate.
-        unsafe { Arc::decrement_strong_count(*node) };
-    }
-    // An empty window means the list ended before it; count it as the end.
-    let seen_len = if count == 0 { 0 } else { woken };
-    staged_window_advance(
-        &watch.parked_skip,
-        start,
-        seen_len,
-        STAGED_PARKED_REACH,
-        taken.is_some(),
-    );
-    let Some(slot) = taken else {
+    let Some((slot, reason)) = taken else {
         return false;
     };
+    let reason = match reason {
+        policy::TaskEnqueueReason::Admitted => policy::TaskEnqueueReason::Admitted,
+        _ => policy::TaskEnqueueReason::Migrated,
+    };
     note_staged_pull();
-    enqueue_on(cpu, slot, policy::TaskEnqueueReason::Migrated);
+    enqueue_on(cpu, slot, reason);
     true
 }
 
