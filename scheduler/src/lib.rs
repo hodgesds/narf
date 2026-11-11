@@ -2333,7 +2333,11 @@ struct SchedulerTelemetry {
     resched_sent: AtomicU64,
     resched_skip: AtomicU64,
     forward_progress: AtomicU64,
-    _pad: [u8; 40],
+    /// Scheduling points this CPU's top-level executor has passed (a round
+    /// started, a polled task returned, a direct handoff). Written only by
+    /// the owning CPU (see [`note_sched_pass`]).
+    sched_passes: AtomicU64,
+    _pad: [u8; 32],
 }
 
 impl SchedulerTelemetry {
@@ -2342,7 +2346,8 @@ impl SchedulerTelemetry {
             resched_sent: AtomicU64::new(0),
             resched_skip: AtomicU64::new(0),
             forward_progress: AtomicU64::new(0),
-            _pad: [0; 40],
+            sched_passes: AtomicU64::new(0),
+            _pad: [0; 32],
         }
     }
 }
@@ -2373,6 +2378,20 @@ pub fn note_forward_progress() {
     local_scheduler_telemetry()
         .forward_progress
         .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one scheduling point on `cpu`: a dispatch round started, a polled
+/// task returned to the executor, or one task handed the CPU directly to
+/// another. Only the owning CPU writes the counter, so a plain load/store is
+/// enough and no locked instruction is issued.
+#[inline]
+pub(crate) fn note_sched_pass(cpu: usize) {
+    if let Some(telemetry) = SCHEDULER_TELEMETRY.get(cpu) {
+        let passes = telemetry.sched_passes.load(Ordering::Relaxed);
+        telemetry
+            .sched_passes
+            .store(passes.wrapping_add(1), Ordering::Relaxed);
+    }
 }
 
 /// Monotonic completed-work counter used by fatal-path watchdogs.
@@ -6327,6 +6346,9 @@ pub fn run_until_empty() {
     let mut address_space_handoff = AddressSpaceHandoff::default();
 
     loop {
+        // One owner-CPU store: this CPU's executor is still passing through
+        // its scheduling loop.
+        note_sched_pass(cpu);
         // Logical hot-unplug publishes Draining before inspecting/migrating
         // the queue. Stop dispatching new slots so the control CPU observes a
         // stable quiescent queue; an already-running slot makes the operation
@@ -6493,6 +6515,8 @@ pub fn run_until_empty() {
                 *active = slot.addr_space.take();
             }
             let poll_result = poll_with_domain(&mut slot, &mut ctx);
+            // The polled task returned to the executor: a scheduling point.
+            note_sched_pass(cpu);
             let borrowed = budget_dispatch.is_some_and(|view| {
                 clear_budget_window(cpu) || view.eligibility == BudgetEligibility::Borrowable
             });
