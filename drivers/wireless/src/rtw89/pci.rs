@@ -381,6 +381,51 @@ unsafe fn bring_up_registers(
     })
 }
 
+/// Production [`super::fwdl_be::Port`] for a probed 8922A device:
+/// BAR2 for the register program and `Rtw89Device::submit_be_fwdl`
+/// for CH12 packets.
+pub(super) struct FwdlPort<'a> {
+    device: &'a Rtw89Device,
+    regs: super::prepared_8922a::MmioRegs<'a>,
+}
+
+impl<'a> FwdlPort<'a> {
+    /// # Safety
+    /// Same contract as [`Rtw89Device::submit_be_fwdl`] for the
+    /// port's whole lifetime: rings programmed through the Prepared
+    /// owner, no reset/removal racing, caller owns BAR2.
+    pub(super) unsafe fn new(device: &'a Rtw89Device) -> Self {
+        Self {
+            device,
+            regs: super::prepared_8922a::MmioRegs(&device.mmio_bar2),
+        }
+    }
+}
+
+impl super::fwdl_be::Regs for FwdlPort<'_> {
+    fn read16(&mut self, address: u32) -> u16 {
+        super::fwdl_be::Regs::read16(&mut self.regs, address)
+    }
+    fn read32(&mut self, address: u32) -> u32 {
+        super::fwdl_be::Regs::read32(&mut self.regs, address)
+    }
+    fn write16(&mut self, address: u32, value: u16) {
+        super::fwdl_be::Regs::write16(&mut self.regs, address, value)
+    }
+    fn write32(&mut self, address: u32, value: u32) {
+        super::fwdl_be::Regs::write32(&mut self.regs, address, value)
+    }
+}
+
+impl super::fwdl_be::Port for FwdlPort<'_> {
+    fn submit(&mut self, buf: &[u8], fwdl: bool) -> Result<(), super::fwdl_be::Error> {
+        // SAFETY: `FwdlPort::new`'s contract covers this submit.
+        unsafe { self.device.submit_be_fwdl(buf, fwdl) }
+            .map(|_| ())
+            .map_err(|_| super::fwdl_be::Error::Transport)
+    }
+}
+
 /// What frees a CH12 buffer: an H2C with an ack identity is held
 /// until its C2H ack; FWDL header / section packets have no ack and
 /// are freed on TXBD consumption (`fwdl` picks the RPKT type).

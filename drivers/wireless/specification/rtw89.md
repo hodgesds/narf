@@ -187,9 +187,18 @@ and a secure single-packet section must fit it), and the BBMCU0 suit is
 the firmware element id 0 behind the MFW images
 (`PreparedFirmware::bbmcu` / `fwdl::find_bbmcu`, `fw.c:1542` +
 `__rtw89_fw_recognize_from_elm`: first element with `cv` <= cut, no AID
-filter, contents after the 32-byte header). Still open for the download
-itself: the sequence and a production owner that runs it from
-`pci::bring_up`.
+filter, contents after the 32-byte header). The sequence is
+`fwdl_be::download` / `download_once` / `download_suit` (`fw.c:1701..2025`
+`rtw89_fw_download` ×5 retries / `__rtw89_fw_download` /
+`rtw89_fw_download_suit`): disable CPU, WCPU enable in download mode with
+BBMCU0, per suit (NORMAL then BBMCU0) the 8922A `SECURE_BOOT_MALLOC_INFO`
+word (NORMAL only), H2C path ready, FWHDR_DL (seq 0, RPKT H2C), DLFW path
+ready, HALT H2C/C2H control clear, sections in part-size FWDL packets, the
+suit's WCPU/BB0 ready check, then `mdelay(5)` and FreeRTOS ready. The BE
+IDMEM share-mode write is skipped (`mac_be.c:3301` hook is NULL). It runs
+over a `fwdl_be::Port`; production is `pci::FwdlPort` (BAR2 +
+`submit_be_fwdl`). It is synchronous like Linux's process-context download.
+Still open: a production owner that runs it from `pci::bring_up`.
 
 The plan couples v1 ignored-security descriptor compaction/count with the
 same payload selection, strips host dynamic bytes and sets part_size 2020

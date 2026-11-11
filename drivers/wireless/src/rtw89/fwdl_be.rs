@@ -26,6 +26,12 @@
 //! 5. [`check_path_ready`], [`fwdl_status`], [`check_ready`] —
 //!    `rtw89_fwdl_check_path_ready_be`, `fwdl_get_status_be`,
 //!    `rtw89_fw_check_rdy` (`fw.c:106`).
+//! 6. [`download`] / [`download_once`] / [`download_suit`] —
+//!    `rtw89_fw_download` / `__rtw89_fw_download` /
+//!    `rtw89_fw_download_suit` (`fw.c:1701..2025`) over a CH12
+//!    [`Port`]. Synchronous like Linux's process-context download:
+//!    the polls are bounded read counts and the one `mdelay(5)` is a
+//!    responsive spin.
 //!
 //! Only the PCIe DLE/HFC tables are transcribed (`rtw8922a_dle_mem_pcie`
 //! / `rtw8922a_hfc_param_ini_pcie`, `rtw8922a.c:50/178`); the USB/SDIO
@@ -55,6 +61,8 @@
 use narf_scheduler::responsive_spin_until;
 use narf_time::Deadline;
 
+use super::download_plan::{self, DownloadPlan};
+
 /// Register port for the BE SYS/DMAC/BB-MCU block. 16-bit accesses are
 /// needed for `R_BE_BOOT_REASON` (`rtw89_write16_mask`). Production
 /// wiring supplies `prepared_8922a::MmioRegs`; fixtures supply a map.
@@ -76,6 +84,11 @@ pub(super) enum Error {
     DleSize,
     /// `rtw89_fw_check_rdy` saw a terminal firmware status.
     Firmware(FwdlStatus),
+    /// The download plan could not produce a header or chunk.
+    Plan(download_plan::Error),
+    /// The CH12 transport refused a packet (`rtw89_h2c_tx` error:
+    /// no free TXBD, DMA allocation, rings not programmed).
+    Transport,
 }
 
 // ── Registers (`reg.h`) ─────────────────────────────────────────────
@@ -817,4 +830,106 @@ pub(super) fn check_ready(regs: &mut impl Regs, check: CheckType) -> Result<(), 
         }
         _ => Err(Error::PollTimeout),
     }
+}
+
+// ── 6. Download sequence (`fw.c:1701..2025`) ────────────────────────
+
+/// CH12 transport for the download (`rtw89_h2c_tx`, `core.c:1336`)
+/// together with the register port the sequence polls. Production
+/// supplies `pci::FwdlPort` (the `Rtw89Device` CH12 submit +
+/// BAR2); fixtures record the packets.
+pub(super) trait Port: Regs {
+    /// Submit one FWHDR_DL command (`fwdl = false`, RPKT type H2C)
+    /// or one raw section packet (`fwdl = true`, RPKT type FWDL).
+    /// A refusal (no free CH12 TXBD, DMA allocation) aborts this
+    /// attempt, as `rtw89_h2c_tx` failing does in Linux.
+    fn submit(&mut self, buf: &[u8], fwdl: bool) -> Result<(), Error>;
+}
+
+/// One firmware suit to download: the fuse-selected plan and the
+/// ready check its download ends with
+/// (`rtw89_fw_get_fwdl_chk_type_from_suit`, `fw.c:1846`).
+pub(super) struct Suit<'a> {
+    pub(super) plan: &'a DownloadPlan,
+    pub(super) check: CheckType,
+    /// 8922A writes `SECURE_BOOT_MALLOC_INFO` before NORMAL and
+    /// WOWLAN suits only (`rtw89_fw_download_suit`, `fw.c:1943`).
+    pub(super) malloc_info: bool,
+}
+
+/// `rtw89_fw_download` retry count (`fw.c:2014`).
+pub(super) const DOWNLOAD_RETRIES: usize = 5;
+
+/// `rtw89_fw_download_suit` (`fw.c:1928`) on BE: the IDMEM
+/// share-mode write is AX-only (`mac_be.c:3301` sets the hook
+/// NULL), so it is skipped; then the 8922A malloc-info word, H2C
+/// path ready, the FWHDR_DL header (`rtw89_fw_download_hdr`), DLFW
+/// path ready, the HALT H2C/C2H control clear, every section in
+/// `part_size` packets (`__rtw89_fw_download_main`), and the
+/// suit's ready check (BE only, `rtw89_fw_download_main`).
+pub(super) fn download_suit(port: &mut impl Port, suit: &Suit<'_>) -> Result<(), Error> {
+    if suit.malloc_info {
+        port.write32(R_BE_SECURE_BOOT_MALLOC_INFO, SECURE_BOOT_MALLOC_INFO_8922A);
+    }
+    check_path_ready(port, true)?;
+    // `rtw89_h2c_pkt_set_hdr_fwdl` stamps `fw.h2c_seq`, which
+    // `__rtw89_fw_download` resets to 0 and nothing advances
+    // before the download completes.
+    let header = suit.plan.header_command(0).map_err(Error::Plan)?;
+    port.submit(&header, false)?;
+    check_path_ready(port, false)?;
+    port.write32(R_BE_HALT_H2C_CTRL, 0);
+    port.write32(R_BE_HALT_C2H_CTRL, 0);
+    let part = suit.plan.part_size();
+    for section in 0..suit.plan.section_count() {
+        let len = suit
+            .plan
+            .section_len(section)
+            .ok_or(Error::Plan(download_plan::Error::SectionGeometry))?;
+        let mut offset = 0;
+        while offset < len {
+            let chunk = suit.plan.chunk(section, offset).map_err(Error::Plan)?;
+            port.submit(&chunk, true)?;
+            offset += part;
+        }
+    }
+    check_ready(port, suit.check)
+}
+
+/// One `__rtw89_fw_download(type, include_bb)` attempt
+/// (`fw.c:1966`): CPU disable, WCPU enable in download mode
+/// (`boot_reason` 0, BB-MCU download enabled when BB suits
+/// follow), the normal suit, each BB-MCU suit, then `mdelay(5)`
+/// and the FreeRTOS ready check.
+pub(super) fn download_once(
+    port: &mut impl Port,
+    normal: &Suit<'_>,
+    bbmcu: &[Suit<'_>],
+) -> Result<BootResidue, Error> {
+    disable_cpu(port);
+    let residue = enable_wcpu(port, 0, !bbmcu.is_empty());
+    download_suit(port, normal)?;
+    for suit in bbmcu {
+        download_suit(port, suit)?;
+    }
+    let _ = responsive_spin_until(|| false, Deadline::after_ms(5));
+    check_ready(port, CheckType::FreeRtos)?;
+    Ok(residue)
+}
+
+/// `rtw89_fw_download` (`fw.c:2008`): up to five attempts of
+/// [`download_once`]; the last attempt's error is returned.
+pub(super) fn download(
+    port: &mut impl Port,
+    normal: &Suit<'_>,
+    bbmcu: &[Suit<'_>],
+) -> Result<BootResidue, Error> {
+    let mut last = Error::PollTimeout;
+    for _ in 0..DOWNLOAD_RETRIES {
+        match download_once(port, normal, bbmcu) {
+            Ok(residue) => return Ok(residue),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
 }

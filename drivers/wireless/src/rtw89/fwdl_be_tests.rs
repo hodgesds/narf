@@ -235,3 +235,157 @@ fn smoke_rtw89_8922a_fwdl_be_status() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_fwdl_be_status);
+
+// ── Download sequence (`fw.c:1701..2025`) ──────────────────────────
+
+struct Image(Vec<u8>);
+impl crate::rtw89::prepared::Files for Image {
+    fn load(&mut self, _: &'static str) -> Result<Vec<u8>, crate::rtw89::fw::FwError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// One-section v1 BE image (fw.h v1 layout: 48-byte base, 16-byte
+/// descriptor; W3 bits 31:24 version, W6 bits 15:8 section count,
+/// W7 bits 15:0 part size), secure boot off.
+fn plan(part: u16, len: usize, fill: u8) -> crate::rtw89::download_plan::DownloadPlan {
+    use crate::rtw89::efuse_be::SecureInfo;
+    use crate::rtw89::mac::ChipId;
+    use crate::rtw89::secure::{Blacklist, Fuses};
+    let mut image = alloc::vec![0u8; 64];
+    image[12..16].copy_from_slice(&(1u32 << 24).to_le_bytes());
+    image[24..28].copy_from_slice(&(1u32 << 8).to_le_bytes());
+    image[28..30].copy_from_slice(&part.to_le_bytes());
+    image[48..52].copy_from_slice(&0x0020_0000u32.to_le_bytes());
+    image[52..56].copy_from_slice(&(len as u32).to_le_bytes());
+    image.extend(core::iter::repeat_n(fill, len));
+    let prepared = crate::rtw89::prepared::load(&mut Image(image), ChipId::Rtl8922A, 1).unwrap();
+    crate::rtw89::download_plan::DownloadPlan::new(
+        prepared,
+        Fuses::from_be(ChipId::Rtl8922A, SecureInfo::disabled()),
+        Blacklist::upstream(ChipId::Rtl8922A),
+    )
+    .unwrap()
+}
+
+/// CH12 port fixture: the chip consumes instantly — both path-ready
+/// bits read set, every FWDL_EN bit reads cleared (download done),
+/// and the status field reads WCPU_FW_INIT_RDY (3) for FreeRTOS.
+struct PortModel {
+    m: Model,
+    submits: Vec<(usize, bool, u8)>,
+    refuse: bool,
+    attempts: usize,
+}
+
+impl Regs for PortModel {
+    fn read16(&mut self, address: u32) -> u16 {
+        self.m.read16(address)
+    }
+    fn read32(&mut self, address: u32) -> u32 {
+        let v = self.m.read32(address);
+        if address == 0x01E0 {
+            return (v & !((1 << 9) | (1 << 11)) & !(0xf << 26)) | 0b11 | (3 << 26);
+        }
+        v
+    }
+    fn write16(&mut self, address: u32, value: u16) {
+        self.m.write16(address, value);
+    }
+    fn write32(&mut self, address: u32, value: u32) {
+        self.m.write32(address, value);
+    }
+}
+
+impl Port for PortModel {
+    fn submit(&mut self, buf: &[u8], fwdl: bool) -> Result<(), Error> {
+        self.attempts += 1;
+        if self.refuse {
+            return Err(Error::Transport);
+        }
+        self.submits.push((buf.len(), fwdl, buf[buf.len() - 1]));
+        Ok(())
+    }
+}
+
+fn smoke_rtw89_8922a_fwdl_be_download_sequence() -> TestResult {
+    let normal = plan(128, 300, 0xA1);
+    let bb = plan(100, 150, 0xB2);
+    let mut port = PortModel {
+        m: Model::default(),
+        submits: Vec::new(),
+        refuse: false,
+        attempts: 0,
+    };
+    let normal_suit = Suit {
+        plan: &normal,
+        check: CheckType::Wcpu,
+        malloc_info: true,
+    };
+    let bb_suit = [Suit {
+        plan: &bb,
+        check: CheckType::Bb0,
+        malloc_info: false,
+    }];
+    if download(&mut port, &normal_suit, &bb_suit).is_err() {
+        return TestResult::Fail("download refused a ready chip");
+    }
+    // FWHDR_DL (8-byte FWCMD header + 48 + 16) as H2C, then the
+    // section in part-size packets as FWDL; then the BBMCU0 suit.
+    let want = [
+        (72usize, false, 0u8),
+        (128, true, 0xA1),
+        (128, true, 0xA1),
+        (44, true, 0xA1),
+        (72, false, 0),
+        (100, true, 0xB2),
+        (50, true, 0xB2),
+    ];
+    if port.submits.len() != want.len() {
+        return TestResult::Fail("wrong CH12 packet count");
+    }
+    for (got, want) in port.submits.iter().zip(want.iter()) {
+        if got.0 != want.0 || got.1 != want.1 || (want.1 && got.2 != want.2) {
+            return TestResult::Fail("CH12 packet order/type/length drift");
+        }
+    }
+    // 8922A NORMAL suit writes SECURE_BOOT_MALLOC_INFO (0x184) =
+    // 0x20248000 exactly once; BBMCU0 does not.
+    let malloc = port
+        .m
+        .writes
+        .iter()
+        .filter(|&&(a, v)| a == 0x0184 && v == 0x2024_8000)
+        .count();
+    if malloc != 1 {
+        return TestResult::Fail("SECURE_BOOT_MALLOC_INFO must be written once");
+    }
+    // enable_wcpu asked for the BB-MCU download too (bit 11 set
+    // in a WCPU_FW_CTRL write).
+    if !port
+        .m
+        .writes
+        .iter()
+        .any(|&(a, v)| a == 0x01E0 && v & (1 << 11) != 0)
+    {
+        return TestResult::Fail("BBMCU0_FWDL_EN not requested");
+    }
+    // A refusing transport is retried five times (fw.c:2014).
+    let mut port = PortModel {
+        m: Model::default(),
+        submits: Vec::new(),
+        refuse: true,
+        attempts: 0,
+    };
+    if download(&mut port, &normal_suit, &bb_suit) != Err(Error::Transport) {
+        return TestResult::Fail("transport refusal must surface");
+    }
+    if port.attempts != 5 {
+        return TestResult::Fail("download must retry exactly five times");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_fwdl_be_download_sequence
+);
