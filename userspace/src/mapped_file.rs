@@ -3566,6 +3566,10 @@ fn mark_page_clean(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr, bytes: &
     }
 }
 
+#[cfg(feature = "kernel-test")]
+#[path = "mapped_file_teardown_tests.rs"]
+mod teardown_tests;
+
 mod tests {
     use super::*;
     use alloc::boxed::Box;
