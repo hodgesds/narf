@@ -505,13 +505,15 @@ pub unsafe fn bring_up(
     // RTL8192EE, (qualified RF_1T1R / RF_2T2R version, provisioned map,
     // no BT coexistence) RTL8192CE / RTL8188CE and (qualified version,
     // provisioned map, path-A TX power; BT-coexist boards included: the
-    // coexistence owner runs) RTL8723BE. Every other matched chip stays
-    // diagnostic.
+    // coexistence owner runs) RTL8723BE and (non-test chip, autoloaded map,
+    // a PROM MAC/PHY mode whose function bandset holds 2.4 GHz) RTL8192DE.
+    // Every other matched chip stays diagnostic.
     let rtl8192ce = super::rtl8192ce::is_8192ce(did);
     let rtl8723be = did == RTL_DEV_8723BE;
+    let rtl8192de = did == RTL_DEV_8192DE;
     let retained = matches!(
         did,
-        RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE | RTL_DEV_8723BE
+        RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE | RTL_DEV_8723BE | RTL_DEV_8192DE
     ) || rtl8192ce;
     let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
@@ -649,6 +651,31 @@ pub unsafe fn bring_up(
                     )
                     .is_ok_and(|facts| facts.mac == factory.mac)
                 }) && txpower::Efuse::from_logical(&factory.logical).is_ok()
+            });
+
+        // RTL8192DE: the facts `configure_rtl8192de` / `prepare_rtl8192de`
+        // re-derive. `_rtl92de_read_chip_version` must not be a test chip
+        // (`REG_SYS_CFG` version bits), EFUSE autoload must have succeeded
+        // (`REG_9346CR` BIT(5): an autoload-failed board has no power-group
+        // store for the channel step) and the PROM mode
+        // (`rtl92d_read_eeprom_info` `EEPROM_MAC_FUNCTION`) must give this
+        // function a bandset holding the 2.4 GHz station plan (a dual-dual
+        // MAC0 is 5 GHz only; the composed station is 2.4 GHz legacy).
+        let admissible = admissible
+            && (!rtl8192de || {
+                use super::rtl8192de::{mode_from_prom, native_channel, version, Interface};
+                // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+                let (sys_cfg, cr9346) = unsafe {
+                    (
+                        registers.read32(u64::from(version::REG_SYS_CFG)),
+                        registers.read8(u64::from(version::REG_9346CR)),
+                    )
+                };
+                sys_cfg != u32::MAX
+                    && sys_cfg & version::SYS_CFG_VERSION_MASK != 0
+                    && cr9346 & version::CR9346_AUTOLOAD_OK != 0
+                    && mode_from_prom(Interface::Pci, &factory.logical)
+                        .is_some_and(|mode| native_channel(1, mode, function))
             });
 
         Ok((registers, (factory, admissible)))

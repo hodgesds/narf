@@ -3450,7 +3450,7 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   (`Owner::admit`, `admit_tx`) and the mailbox service entry
   (`service_c2h`). The chip is still not admitted (probe diagnostic).
 
-### RTL8192DE retained runtime (in progress, not admitted)
+### RTL8192DE retained runtime (2.4 GHz legacy station admitted)
 
 - `rtl8192de` — dual-MAC per-function ownership model (step 1; not
   admitted): `mode_from_prom` (PCI `EEPROM_MAC_FUNCTION` `0x08` bit 3,
@@ -3574,8 +3574,11 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   `smoke_rtl8192de_native_owner_start_descriptors_receipt_and_rx`,
   `smoke_rtl8192de_native_join_rsvd_page_ra_mask_and_leave` (written,
   unexecuted).
-  Still open: probe admission (`pci.rs` retained set for `0x8193`);
-  not composed: HT/40 MHz and 5 GHz on 92DE, DIG / dynamic TX power /
+  Probe admission: `pci.rs::bring_up` retains `0x8193` for a non-test
+  chip (`REG_SYS_CFG` version bits), an autoloaded map (`REG_9346CR`
+  BIT(5)) and a PROM mode whose function bandset holds 2.4 GHz (a
+  dual-dual MAC0 stays diagnostic); the signed `N92D` envelope still
+  gates the channel at `prepare_rtl8192de`. Not composed: HT/40 MHz and 5 GHz on 92DE, DIG / dynamic TX power /
   EDCA turbo watchdog steps, software LPS, RX RSSI, ASPM.
 
 ## 4. Invariants
