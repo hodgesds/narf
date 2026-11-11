@@ -3,6 +3,9 @@
 
   soak-report.py <run-dir>               the summary
   soak-report.py <run-dir> --addr X...   symbolize kernel addresses
+  soak-report.py <run-dir> --stranded    the detector's own lines for every
+                                         episode in which runnable tasks
+                                         waited behind a busy CPU
 
 Memory over time, busy CPUs, probe latencies, worker progress, every kernel
 line worth reading (watchdog:, nvme:, btrfs:, oom:, panics) and, when the
@@ -124,6 +127,47 @@ def lockup_reports(block, syms):
     return out
 
 
+def raw_stranding(lines):
+    """The detector's reports of runnable tasks nobody ran, verbatim: for
+    each stranding episode the first report and the one with the longest
+    wait, each with the per-CPU run-queue lines that followed it, and the
+    last lockup line printed before it."""
+    blocks, last_lockup = [], ""
+    i = 0
+    while i < len(lines):
+        if "lockup - CPU#" in lines[i]:
+            last_lockup = lines[i]
+        m = re.search(r"watchdog: (\d+) runnable task\(s\) are waiting for a CPU; longest wait ([0-9.]+)s",
+                      lines[i])
+        if m and int(m.group(1)) > 0:
+            j = i + 1
+            while j < len(lines) and re.search(r"watchdog:\s+(starved|cpu=)", lines[j]):
+                j += 1
+            cpus = frozenset(re.findall(r"starved \[[^\]]*\] cpu=(\d+)", "\n".join(lines[i:j])))
+            blocks.append((float(m.group(2)), cpus, lines[i:j], last_lockup))
+            i = j
+            continue
+        i += 1
+    groups = []
+    for block in blocks:
+        if groups and groups[-1][-1][1] == block[1] and block[0] >= groups[-1][-1][0] - 1:
+            groups[-1].append(block)
+        else:
+            groups.append([block])
+    for n, group in enumerate(groups, 1):
+        idle = sum(1 for l in group[-1][2] if re.search(r"cpu=\d+ idle", l))
+        print(f"== stranding episode {n}: CPU {'/'.join(sorted(group[0][1]))}, {len(group)} report(s), "
+              f"longest wait {group[-1][0]} s, {idle} CPUs idle in the last report")
+        for label, block in (("first report", group[0]), ("longest wait", group[-1])):
+            if label == "longest wait" and len(group) == 1:
+                break
+            print(f"-- {label}")
+            if block[3]:
+                print("   (preceding) " + block[3][block[3].index("watchdog:"):])
+            for line in block[2]:
+                print("   " + line[line.index("watchdog:"):])
+
+
 def episodes(lines, syms):
     """Per-episode table for the directed part of a run."""
     found, cur = [], None
@@ -197,6 +241,9 @@ def main():
             break
     elf = os.path.join(run, "narf-frame")
     syms = Symbols(elf, slide) if os.path.exists(elf) else None
+    if "--stranded" in sys.argv:
+        raw_stranding(lines)
+        return
     if "--addr" in sys.argv:
         for a in sys.argv[sys.argv.index("--addr") + 1:]:
             print(a, syms.name(int(a, 16)) if syms else "(no kernel ELF in the run directory)")
