@@ -1222,6 +1222,54 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         device_caps_for(&self.core, pdev_id)
     }
 
+    /// `ath11k_mac_allocate`'s radio list, shared by [`start_pci`] and
+    /// [`start_ahb`]: one `(mac_id, caps)` per allocated pdev, in
+    /// allocation order. A single-pdev core takes the legacy device-MAC
+    /// caps ([`Self::device_caps`]) and its failure is returned (the
+    /// caller strands the runtime). On a multi-pdev core a radio whose
+    /// caps fail is logged and skipped: its MAC address is unknowable
+    /// without the READY extra addresses, and the other radios still
+    /// come up. Returns `(single, radios)`.
+    ///
+    /// The DP `mac_id` is the pdev *index* (`ath11k_dp_pdev_alloc` /
+    /// `ath11k_mac_allocate` walk `ab->pdevs[i]` with `mac_id = i`), while
+    /// [`Self::device_caps_for`] selects by the firmware's `pdev_id`
+    /// (`ath11k_pull_mac_phy_cap_svc_ready_ext`: `pdev->pdev_id =
+    /// mac_phy_caps->pdev_id`, 1-based on multi-pdev firmware), so the
+    /// index is resolved through SERVICE_READY_EXT's pdev list first.
+    pub fn pdev_radios(&self) -> Result<(bool, Vec<(u32, DeviceCaps)>), TransportError> {
+        let pdevs = self.dp.pdev_mac_ids();
+        let single = pdevs.len() <= 1;
+        let mut radios = Vec::new();
+        for mac_id in pdevs {
+            if single {
+                radios.push((mac_id, self.device_caps()?));
+                continue;
+            }
+            let fw_pdev = self
+                .core
+                .svc_ext
+                .as_ref()
+                .and_then(|e| e.pdevs.get(mac_id as usize))
+                .map(|p| p.pdev_id);
+            let Some(fw_pdev) = fw_pdev else {
+                log(format_args!(
+                    "ath11k mac register: radio pdev {} skipped: no SERVICE_READY_EXT pdev",
+                    mac_id
+                ));
+                continue;
+            };
+            match self.device_caps_for(fw_pdev) {
+                Ok(c) => radios.push((mac_id, c)),
+                Err(e) => log(format_args!(
+                    "ath11k mac register: radio pdev {} skipped: step {} detail {:#x} (-{})",
+                    mac_id, e.step, e.detail, e.errno
+                )),
+            }
+        }
+        Ok((single, radios))
+    }
+
     fn apply(&mut self, op: SyncOp) {
         let now = self.now_ms();
         match op {
@@ -4566,34 +4614,15 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     // `ar`), in allocation order, each on its own global vdev slot.
     // The single-pdev path is exactly the old one: pdev 0, vdev slot 0,
     // `wcn6855()` config, and a caps failure strands the runtime.
-    let pdevs = rt.dp.pdev_mac_ids();
-    let single = pdevs.len() <= 1;
     let num_rxdma = rt.dp.cfg.num_rxdma_per_pdev;
-    let mut radios: Vec<(u32, DeviceCaps)> = Vec::new();
-    for mac_id in &pdevs {
-        let r = if single {
-            rt.device_caps()
-        } else {
-            rt.device_caps_for(*mac_id)
-        };
-        match r {
-            Ok(c) => radios.push((*mac_id, c)),
-            Err(e) => {
-                if single {
-                    e.report("ath11k mac register");
-                    *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
-                    return;
-                }
-                // A later radio's caps failure only skips that radio:
-                // its MAC address is unknowable without the READY extra
-                // addresses, and the other radios still come up.
-                log(format_args!(
-                    "ath11k mac register: radio pdev {} skipped: step {} detail {:#x} (-{})",
-                    mac_id, e.step, e.detail, e.errno
-                ));
-            }
+    let (single, radios) = match rt.pdev_radios() {
+        Ok(r) => r,
+        Err(e) => {
+            e.report("ath11k mac register");
+            *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
+            return;
         }
-    }
+    };
     if radios.is_empty() {
         // No radio registered (unreachable after a successful
         // `pdev_create`, which allocates at least pdev 0): park the
@@ -4638,47 +4667,82 @@ pub fn tx_ring_selector(rev: super::hw::HwRev, flow_hash: impl FnOnce() -> u32) 
     }
 }
 
-/// [`start_ahb`]'s result: the runtime and the MAC (or the
-/// `device_caps` failure).
-pub type AhbStart<Io, Irq, Q> = (Arc<Shared<Io, Irq, Q>>, Result<[u8; 6], TransportError>);
+/// [`start_ahb`]'s result: the runtime and the MAC of every registered
+/// radio, in pdev allocation order (or the single-pdev `device_caps`
+/// failure).
+pub type AhbStart<Io, Irq, Q> = (
+    Arc<Shared<Io, Irq, Q>>,
+    Result<Vec<[u8; 6]>, TransportError>,
+);
 
 /// The AHB counterpart of [`start_pci`], after
 /// `ath11k_core_qmi_firmware_ready`: the runtime over the ready core and
-/// its DP ([`Rt`] + [`Shared`]), the MAC `device_caps` reports, and the
-/// initial netdev registered by [`super::iface::register_ahb`]
-/// (`ath11k_mac_register`'s output). On a `device_caps` failure the
-/// runtime is still returned unregistered — the caller keeps it alive
-/// (see `AHB_RUNTIME`) because the firmware owns the core's memory
-/// until the device is torn down — mirroring `start_pci`'s
+/// its DP ([`Rt`] + [`Shared`]), then `ath11k_mac_register`'s output —
+/// one MAC + netdev per allocated pdev ([`Rt::pdev_radios`]), each
+/// registered by [`super::iface::register_ahb`] on its own vdev slot.
+/// IPQ8074 (three radios) and IPQ6018 / IPQ5018 (two) therefore get one
+/// `wlan%d` per radio with [`super::mac::MacConfig::for_radio`]; a
+/// single-pdev core (WCN6750) keeps one netdev on slot 0 with the
+/// WCN6855-shaped policy, its own `num_rxdma_per_pdev` and
+/// `single_pdev_only` from the DP hw params (Linux `ath11k_hw_params`).
+/// On a single-pdev `device_caps` failure, or when no radio registers,
+/// the runtime is still returned unregistered — the caller keeps it
+/// alive (see `AHB_RUNTIME`) because the firmware owns the core's
+/// memory until the device is torn down — mirroring `start_pci`'s
 /// `STRANDED_RT` handling.
 pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     core: Ath11kCore<CeHif<Io, Irq>, Q>,
     dp: Dp,
 ) -> AhbStart<Io, Irq, Q> {
     let rt = Rt::new(core, dp);
-    let caps = match rt.device_caps() {
-        Ok(c) => c,
+    let num_rxdma = rt.dp.cfg.num_rxdma_per_pdev;
+    let single_pdev_only = rt.dp.cfg.single_pdev_only;
+    let (single, radios) = match rt.pdev_radios() {
+        Ok(r) => r,
         Err(e) => {
             e.report("ath11k mac register");
             return (Shared::new(rt, secure_random), Err(e));
         }
     };
+    if radios.is_empty() {
+        // No pdev allocated or every multi-pdev radio skipped
+        // (unreachable after a successful `pdev_create` that reported
+        // the READY extra addresses): keep the runtime unregistered.
+        return (
+            Shared::new(rt, secure_random),
+            Err(TransportError::new(step::MAC_CAPS, 8, ENODEV)),
+        );
+    }
     let initial_reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, secure_random);
-    let mac = super::mac::Mac::new(
-        Port(shared.clone(), 0, 0),
-        Port(shared.clone(), 0, 0),
-        caps.clone(),
-        super::mac::MacConfig::wcn6855(),
-        initial_reg.as_deref(),
-    );
-    let m = caps.mac_addr;
-    let name = super::iface::register_ahb(shared.clone(), mac, m);
-    log(format_args!(
-        "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
-        name, m[0], m[1], m[2], m[3], m[4], m[5]
-    ));
-    (shared, Ok(m))
+    let mut macs = Vec::with_capacity(radios.len());
+    for (slot, (mac_id, caps)) in radios.iter().enumerate() {
+        let slot = slot as u32;
+        let cfg = if single {
+            super::mac::MacConfig {
+                num_rxdma_per_pdev: num_rxdma,
+                single_pdev_only,
+                ..super::mac::MacConfig::wcn6855()
+            }
+        } else {
+            super::mac::MacConfig::for_radio(num_rxdma).with_vdev(slot)
+        };
+        let mac = super::mac::Mac::new(
+            Port(shared.clone(), slot, *mac_id),
+            Port(shared.clone(), slot, *mac_id),
+            caps.clone(),
+            cfg,
+            initial_reg.as_deref(),
+        );
+        let m = caps.mac_addr;
+        let name = super::iface::register_ahb(shared.clone(), mac, m, slot);
+        log(format_args!(
+            "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
+            name, m[0], m[1], m[2], m[3], m[4], m[5]
+        ));
+        macs.push(m);
+    }
+    (shared, Ok(macs))
 }
 
 fn secure_random(out: &mut [u8]) -> Result<(), i32> {

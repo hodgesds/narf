@@ -12,6 +12,7 @@
 //! constants beyond the in-tree WMI band-cap bits (`wmi.rs`).
 
 use alloc::vec;
+use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, kt_assert, kt_assert_eq, TestResult};
 
@@ -164,16 +165,32 @@ fn ready_core() -> Result<Ath11kCore<CeHif<FakeIo, FakeIrq>, FakeQmi>, TestResul
     Ok(core)
 }
 
-/// An IPQ6018-shaped DP with no MSI, on the caller's `Hal`.
-fn ready_dp(hal: &mut Hal) -> Result<Dp, TestResult> {
+/// An IPQ6018-shaped DP with no MSI, on the caller's `Hal`, with
+/// `radios` pdevs allocated as `ath11k_core_pdev_create` ->
+/// `ath11k_dp_pdev_alloc` leaves them before `ath11k_mac_register`
+/// (the HTT SRING_SETUP messages are dropped: no firmware listens).
+fn ready_dp_with(hal: &mut Hal, radios: u32) -> Result<Dp, TestResult> {
     let cfg = match DpHwParams::for_rev(HwRev::Ipq6018Hw10) {
         Some(cfg) => cfg,
         None => return Err(TestResult::Fail("complete DP params")),
     };
-    match Dp::alloc(hal, &FakeIo, &cfg, SIZES, None) {
-        Ok(dp) => Ok(dp),
-        Err(_) => Err(TestResult::Fail("dp alloc")),
+    let mut dp = match Dp::alloc(hal, &FakeIo, &cfg, SIZES, None) {
+        Ok(dp) => dp,
+        Err(_) => return Err(TestResult::Fail("dp alloc")),
+    };
+    if dp.pdev_reo_setup(hal, &FakeIo).is_err() {
+        return Err(TestResult::Fail("dp reo setup"));
     }
+    for mac_id in 0..radios {
+        if dp.pdev_alloc(hal, &FakeIo, mac_id).is_err() {
+            return Err(TestResult::Fail("dp pdev alloc"));
+        }
+    }
+    Ok(dp)
+}
+
+fn ready_dp(hal: &mut Hal) -> Result<Dp, TestResult> {
+    ready_dp_with(hal, 1)
 }
 
 fn hal() -> Result<Hal, TestResult> {
@@ -201,11 +218,11 @@ fn smoke_ath11k_ahb_netdev_register() -> TestResult {
         Err(e) => return e,
     };
     let (_shared, mac) = super::super::runtime::start_ahb(core, dp);
-    let m = match mac {
+    let macs = match mac {
         Ok(m) => m,
         Err(_) => return TestResult::Fail("start_ahb device_caps"),
     };
-    kt_assert_eq!(m, TEST_MAC);
+    kt_assert_eq!(macs, vec![TEST_MAC]);
 
     // The wireless registry exposes the new radio under its MAC.
     let profile = narf_wireless::registry::list()
@@ -269,7 +286,7 @@ fn smoke_ath11k_ahb_netdev_dispatch() -> TestResult {
         Err(())
     );
 
-    let name = register_ahb(shared.clone(), mac, caps.mac_addr);
+    let name = register_ahb(shared.clone(), mac, caps.mac_addr, 0);
     kt_assert!(name.starts_with("wlan"));
 
     // The dispatch table now maps this cookie to this iface, and only
@@ -296,5 +313,85 @@ fn smoke_ath11k_ahb_netdev_dispatch() -> TestResult {
     TestResult::Pass
 }
 
+/// Two-radio IPQ6018 (`max_radios = 2`, Linux `ath11k_hw_params`): the
+/// firmware reports two pdevs and one READY extra MAC address per radio
+/// (`ath11k_mac_allocate` with `pdevs_macaddr_valid`). `start_ahb` must
+/// register one netdev per pdev, each with its own radio's MAC, on its
+/// own vdev slot (distinct dispatch cookies), not one `wcn6855()` MAC
+/// on `Port(shared, 0, 0)`. The firmware pdev ids (1, 2) differ from
+/// the DP mac ids (0, 1): caps are resolved by pdev index, as Linux
+/// walks `ab->pdevs[i]`.
+fn smoke_ath11k_ahb_multi_pdev_register() -> TestResult {
+    const RADIO_MACS: [[u8; 6]; 2] = [
+        [0x02, 0x00, 0x5e, 0x00, 0x53, 0x10],
+        [0x02, 0x00, 0x5e, 0x00, 0x53, 0x11],
+    ];
+    let mut h = match hal() {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
+    let dp = match ready_dp_with(&mut h, 2) {
+        Ok(dp) => dp,
+        Err(e) => return e,
+    };
+    kt_assert_eq!(dp.pdev_mac_ids(), vec![0, 1]);
+    let mut core = match ready_core() {
+        Ok(core) => core,
+        Err(e) => return e,
+    };
+    let pdev = |id: u32| PdevCap {
+        pdev_id: id,
+        supported_bands: WMI_HOST_WLAN_2G_CAP | WMI_HOST_WLAN_5G_CAP,
+        ..Default::default()
+    };
+    // Firmware pdev ids are 1-based on a multi-pdev part
+    // (`mac_phy_caps->pdev_id`); the DP mac ids are 0-based indices.
+    core.svc_ext = Some(ServiceReadyExt {
+        pdevs: vec![pdev(1), pdev(2)],
+        num_radios: 2,
+        ..Default::default()
+    });
+    core.ready = Some(Ready {
+        mac_addr: TEST_MAC,
+        num_extra_mac_addr: 2,
+        extra_mac_addrs: RADIO_MACS.to_vec(),
+        ..Default::default()
+    });
+    let (shared, r) = super::super::runtime::start_ahb(core, dp);
+    let macs = match r {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("start_ahb multi-pdev caps"),
+    };
+    kt_assert_eq!(macs, RADIO_MACS.to_vec());
+    let mut names = Vec::new();
+    for (slot, mac) in RADIO_MACS.iter().enumerate() {
+        let cookie = (shared.radio_id << 2) | slot as u64;
+        let entry = AHB_ACTIVE
+            .lock()
+            .iter()
+            .find(|dev| dev.cookie() == cookie)
+            .cloned();
+        kt_assert!(entry.is_some(), "radio netdev on its own vdev slot");
+        let name = alloc::string::String::from(entry.unwrap().dispatch_name());
+        let snap = narf_net::iface::lookup(&name);
+        kt_assert!(snap.is_some());
+        kt_assert_eq!(snap.unwrap().mac, *mac);
+        let profile = narf_wireless::registry::list()
+            .into_iter()
+            .find(|p| p.mac() == *mac);
+        kt_assert!(profile.is_some(), "radio in the wireless registry");
+        names.push(name);
+    }
+    kt_assert!(names[0] != names[1], "one netdev per radio");
+    // Nothing was registered on a third slot.
+    let third = (shared.radio_id << 2) | 2;
+    kt_assert!(!AHB_ACTIVE.lock().iter().any(|dev| dev.cookie() == third));
+    TestResult::Pass
+}
+
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_netdev_register);
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_multi_pdev_register
+);
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_netdev_dispatch);

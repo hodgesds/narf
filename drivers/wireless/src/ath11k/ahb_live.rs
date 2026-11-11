@@ -1037,10 +1037,14 @@ pub async fn bring_up_task(blob: &'static [u8], p: AhbPlatform) {
         (Ok(()), Some(LiveOutcome::Ready(core, dp))) => {
             let (shared, r) = super::runtime::start_ahb(*core, *dp);
             match r {
-                Ok(m) => log(format_args!(
-                    "{}: runtime up, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                    p.res.node.path, m[0], m[1], m[2], m[3], m[4], m[5]
-                )),
+                Ok(macs) => {
+                    for m in macs {
+                        log(format_args!(
+                            "{}: runtime up, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            p.res.node.path, m[0], m[1], m[2], m[3], m[4], m[5]
+                        ));
+                    }
+                }
                 Err(e) => e.report("ath11k_ahb mac register"),
             }
             AHB_RUNTIME.lock().push(shared.clone());

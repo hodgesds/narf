@@ -4418,9 +4418,12 @@ fn register_pci_netdev(
 
 /// `ieee80211_register_hw` + `ieee80211_if_add("wlan%d")` for an
 /// AHB-attached core: the counterpart of [`register_pci`], with the
-/// same lifecycle expectations — one initial netdev on vdev 0, station
-/// iftype, registered with `narf_net` + `narf_wireless`, down with no
-/// carrier until IFF_UP, and the autoconnect command-line handling.
+/// same lifecycle expectations — one netdev per radio on that radio's
+/// vdev slot (`vdev_id`, assigned by `runtime::start_ahb` in pdev
+/// allocation order), station iftype, registered with `narf_net` +
+/// `narf_wireless`, down with no carrier until IFF_UP, and the
+/// autoconnect command-line handling on the first radio (slot 0) only,
+/// so one `ath11k.ssid=` never races two radios to the same AP.
 /// Two deliberate non-goals, both named rather than smuggled in:
 /// no system-PM ownership (the `AsyncSystemPm` implementation is
 /// PCI-concrete and MHI-shaped; an AHB suspend path is follow-up
@@ -4431,6 +4434,7 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     shared: Arc<Shared<Io, Irq, Q>>,
     mac: RtMac<Io, Irq, Q>,
     mac_addr: [u8; 6],
+    vdev_id: u32,
 ) -> &'static str {
     use core::fmt::Write as _;
     let name = narf_net::iface::reserve_name("wlan%d");
@@ -4440,7 +4444,7 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         mac,
         mac_addr,
         netdev_sinks(),
-        0,
+        vdev_id,
         2,
         None,
     );
@@ -4454,6 +4458,9 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         ahb_send_context,
         ahb_drain,
     );
+    if vdev_id != 0 {
+        return name;
+    }
     // Bring-up aid: `ath11k.scan=1` / `ath11k.ssid=…` (autoconnect.rs).
     match super::autoconnect::parse(narf_boot::cmdline()) {
         Ok(Some(cfg)) => {
