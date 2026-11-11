@@ -157,6 +157,8 @@ pub(super) static STATE_GENERATION: AtomicU64 = AtomicU64::new(1);
 struct FirmwareStates {
     apic_id: u32,
     states: [IdleState; MAX_IDLE_STATES],
+    // Only the x86_64 candidate walk reads the firmware table back.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     len: usize,
 }
 static FIRMWARE: IrqSafeSpinLock<alloc::vec::Vec<FirmwareStates>> =
