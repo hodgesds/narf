@@ -13562,6 +13562,45 @@ fn push_udp_gro_cmsg(
     }
 }
 
+/// `net/socket.c::__sock_recv_timestamp` for a software receive timestamp:
+/// a socket with `SOCK_RCVTSTAMP` gets the datagram's arrival time
+/// (`skb->tstamp`, CLOCK_REALTIME) as one `SOL_SOCKET` record —
+/// `SCM_TIMESTAMPNS` (a timespec) under `SOCK_RCVTSTAMPNS`, `SCM_TIMESTAMP`
+/// (a timeval) otherwise, each in the `_OLD` or `_NEW` numbering the socket
+/// selected (`SOCK_TSTAMP_NEW`). On a 64-bit kernel all four carry two
+/// `long long`s. `timestamp_mode` is `(enabled, ns, new)`.
+///
+/// `udp_recvmsg` / `udpv6_recvmsg` call `sock_recv_cmsgs` first, so this
+/// record precedes the `UDP_GRO` and IP-level ones.
+fn push_rcv_timestamp_cmsg(
+    records: &mut alloc::vec::Vec<(i32, i32, alloc::vec::Vec<u8>)>,
+    timestamp_mode: (bool, bool, bool),
+    tstamp_ns: i64,
+) {
+    const SOL_SOCKET: i32 = 1;
+    const SCM_TIMESTAMP_OLD: i32 = 29;
+    const SCM_TIMESTAMPNS_OLD: i32 = 35;
+    const SCM_TIMESTAMP_NEW: i32 = 63;
+    const SCM_TIMESTAMPNS_NEW: i32 = 64;
+    let (enabled, nanos, new_abi) = timestamp_mode;
+    if !enabled {
+        return;
+    }
+    let secs = tstamp_ns.div_euclid(1_000_000_000);
+    let sub_ns = tstamp_ns.rem_euclid(1_000_000_000);
+    let fraction = if nanos { sub_ns } else { sub_ns / 1_000 };
+    let mut value = alloc::vec::Vec::with_capacity(16);
+    value.extend_from_slice(&secs.to_ne_bytes());
+    value.extend_from_slice(&fraction.to_ne_bytes());
+    let kind = match (nanos, new_abi) {
+        (false, false) => SCM_TIMESTAMP_OLD,
+        (true, false) => SCM_TIMESTAMPNS_OLD,
+        (false, true) => SCM_TIMESTAMP_NEW,
+        (true, true) => SCM_TIMESTAMPNS_NEW,
+    };
+    records.push((SOL_SOCKET, kind, value));
+}
+
 fn install_ipv6_ancillary(
     msg_ptr: u64,
     ancillary: Option<crate::socket::Inet6RecvAncillary>,
@@ -13569,6 +13608,7 @@ fn install_ipv6_ancillary(
     hoplimit: bool,
     tclass: bool,
     udp_gro: bool,
+    timestamp_mode: (bool, bool, bool),
 ) -> bool {
     const SOL_IPV6: i32 = 41;
     const IPV6_PKTINFO: i32 = 50;
@@ -13576,6 +13616,7 @@ fn install_ipv6_ancillary(
     const IPV6_TCLASS: i32 = 67;
     let mut records = alloc::vec::Vec::new();
     if let Some(ancillary) = ancillary {
+        push_rcv_timestamp_cmsg(&mut records, timestamp_mode, ancillary.tstamp_ns);
         push_udp_gro_cmsg(&mut records, udp_gro, ancillary.gso_size);
         // `ip6_datagram_recv_common_ctl` emits PKTINFO first, followed by
         // `ip6_datagram_recv_specific_ctl`'s HOPLIMIT and TCLASS records.
@@ -13656,6 +13697,7 @@ fn install_ipv4_ancillary(
     rx: Option<crate::socket::Inet4RxInfo>,
     opts: crate::socket::Inet4CmsgOptions,
     udp_gro: bool,
+    timestamp_mode: (bool, bool, bool),
 ) -> bool {
     const SOL_IP: i32 = 0;
     const IP_TOS: i32 = 1;
@@ -13664,6 +13706,7 @@ fn install_ipv4_ancillary(
     const IP_ORIGDSTADDR: i32 = 20;
     let mut records = alloc::vec::Vec::new();
     if let Some(rx) = rx {
+        push_rcv_timestamp_cmsg(&mut records, timestamp_mode, rx.tstamp_ns);
         push_udp_gro_cmsg(&mut records, udp_gro, rx.gso_size);
         if opts.pktinfo {
             let mut info = alloc::vec::Vec::with_capacity(12);

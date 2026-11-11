@@ -188,6 +188,7 @@ fn enqueue6_local(target: &SocketFile, pkt: DgramPacket6, gso: Option<u16>) {
                 traffic_class: pkt.traffic_class,
                 payload: chunk.to_vec(),
                 gso_size: 0,
+                tstamp_ns: pkt.tstamp_ns,
             },
         );
     }
@@ -654,6 +655,7 @@ impl SocketFile {
                     traffic_class: options.ext.ipv6_tclass as u8,
                     payload: buf.to_vec(),
                     gso_size: 0,
+                    tstamp_ns: super::rx_tstamp_now_ns(),
                 },
                 gso,
             );
@@ -721,6 +723,7 @@ impl SocketFile {
                         traffic_class: options.ext.ipv6_tclass as u8,
                         payload: buf.to_vec(),
                         gso_size: 0,
+                        tstamp_ns: super::rx_tstamp_now_ns(),
                     },
                     gso,
                 );
@@ -792,6 +795,7 @@ impl SocketFile {
                     hop_limit: packet.hop_limit,
                     traffic_class: packet.traffic_class,
                     gso_size: packet.gso_size,
+                    tstamp_ns: packet.tstamp_ns,
                 });
                 if !peek {
                     inbox.pop_front();
@@ -869,6 +873,7 @@ pub(super) fn deliver_wire(
                     traffic_class: meta.tos,
                     payload: payload.to_vec(),
                     gso_size: 0,
+                    tstamp_ns: super::rx_tstamp_now_ns(),
                 },
             );
         }
@@ -902,6 +907,7 @@ pub(super) fn deliver_wire(
         traffic_class: meta.tos,
         payload: payload.to_vec(),
         gso_size: 0,
+        tstamp_ns: super::rx_tstamp_now_ns(),
     });
     *rmem += charge;
     target.dgram_readiness.set(narf_filesystem::POLL_IN, 0);

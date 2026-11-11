@@ -1823,6 +1823,19 @@ pub(crate) struct Inet4RxInfo {
     /// `SKB_GSO_UDP_L4`); 0 for an ordinary datagram. `udp_cmsg_recv`
     /// reports it as the `UDP_GRO` control message.
     pub gso_size: u16,
+    /// CLOCK_REALTIME nanoseconds at which the datagram was queued to the
+    /// socket — `skb->tstamp`, which `__sock_recv_timestamp` reports as
+    /// `SCM_TIMESTAMP{,NS}` to a socket with `SO_TIMESTAMP{,NS}` set.
+    pub tstamp_ns: i64,
+}
+
+/// `ktime_get_real()` for a datagram being queued to a socket: what Linux's
+/// `net_timestamp_set` stores in `skb->tstamp` on receive.
+pub(crate) fn rx_tstamp_now_ns() -> i64 {
+    let now = narf_time::now_wall();
+    now.secs
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i64::from(now.nanos))
 }
 
 /// Which IPv4 receive control messages a socket asked for.
@@ -1898,6 +1911,8 @@ struct DgramPacket6 {
     /// `UDP_GRO` segment size of a coalesced loopback GSO datagram; 0
     /// otherwise (see [`Inet4RxInfo::gso_size`]).
     gso_size: u16,
+    /// Arrival time (see [`Inet4RxInfo::tstamp_ns`]).
+    tstamp_ns: i64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1908,6 +1923,8 @@ pub(crate) struct Inet6RecvAncillary {
     pub traffic_class: u8,
     /// The `UDP_GRO` cmsg's segment size, or 0 for no cmsg.
     pub gso_size: u16,
+    /// Arrival time, as [`Inet4RxInfo::tstamp_ns`].
+    pub tstamp_ns: i64,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -9267,6 +9284,7 @@ impl SocketFile {
                 traffic_class: 0,
                 payload: buf.to_vec(),
                 gso_size: 0,
+                tstamp_ns: rx_tstamp_now_ns(),
             });
             return SocketOpResult::Ok(buf.len() as u64);
         }
@@ -14314,6 +14332,7 @@ fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {
         hop_limit: 37,
         traffic_class: 0x2e,
         gso_size: 0,
+        tstamp_ns: 0,
     };
     socket.stash_inet6_recv_ancillary(ancillary);
     if pktinfo

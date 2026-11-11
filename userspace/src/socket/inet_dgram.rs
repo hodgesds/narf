@@ -568,6 +568,7 @@ pub(super) fn deliver_wire(
         ttl: meta.ttl,
         tos: meta.tos,
         gso_size: 0,
+        tstamp_ns: super::rx_tstamp_now_ns(),
     };
     if super::sockopt::is_multicast_v4(daddr) {
         // `ip_route_input_mc` accepts a group only when the arrival device
@@ -1049,6 +1050,7 @@ impl SocketFile {
                 ttl: ip_ttl.min(255) as u8,
                 tos: ip_tos.min(255) as u8,
                 gso_size: 0,
+                tstamp_ns: super::rx_tstamp_now_ns(),
             };
             // A broadcast route's output (`ip_mc_output`,
             // `net/ipv4/ip_output.c:413`) loops a clone back to this host,
@@ -1156,6 +1158,7 @@ impl SocketFile {
                     ttl: ip_ttl.min(255) as u8,
                     tos: ip_tos.min(255) as u8,
                     gso_size: 0,
+                    tstamp_ns: super::rx_tstamp_now_ns(),
                 };
                 enqueue_local(
                     &d,
@@ -1302,6 +1305,7 @@ impl SocketFile {
             ttl: mc_ttl.min(255) as u8,
             tos: ip_tos.min(255) as u8,
             gso_size: 0,
+            tstamp_ns: super::rx_tstamp_now_ns(),
         };
         if (via_lo || mc_loop) && super::sockopt::host_joined_v4(ns, egress, dest.0) {
             let targets = {

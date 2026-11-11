@@ -12689,6 +12689,192 @@ fn smoke_abi_inet_dgram_recvmsg_ip_cmsgs() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_inet_dgram_recvmsg_ip_cmsgs);
 
+/// `SO_TIMESTAMP` / `SO_TIMESTAMPNS` on a UDP socket: `udp_recvmsg` calls
+/// `sock_recv_cmsgs` -> `__sock_recv_timestamp` (net/socket.c), which puts
+/// one `SOL_SOCKET` record ahead of the IP-level ones — `SCM_TIMESTAMPNS`
+/// (a 16-byte `struct __kernel_old_timespec` of the packet's arrival in
+/// CLOCK_REALTIME) under `SOCK_RCVTSTAMPNS`, `SCM_TIMESTAMP` (a
+/// `__kernel_old_timeval`) otherwise. A socket that did not ask gets none.
+///
+/// systemd-timesyncd sets SO_TIMESTAMPNS on its NTP socket and drops every
+/// reply that arrives without the record ("Packet timestamp missing."), so
+/// on NARF — which stored the option and never emitted it — the clock was
+/// never synchronised.
+fn smoke_abi_inet_dgram_recvmsg_so_timestampns() -> TestResult {
+    const SOL_SOCKET_I: i32 = 1;
+    const SO_TIMESTAMP_OLD: u64 = 29;
+    const SO_TIMESTAMPNS_OLD: u64 = 35;
+    const SCM_TIMESTAMP_OLD: i32 = 29;
+    const SCM_TIMESTAMPNS_OLD: i32 = 35;
+    const SOL_IP: i32 = 0;
+    const MSG_DONTWAIT: u64 = 0x40;
+    type Cmsgs = alloc::vec::Vec<(i32, i32, alloc::vec::Vec<u8>)>;
+    fn sin(ip: [u8; 4], port: u16) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        buf[2..4].copy_from_slice(&port.to_be_bytes());
+        buf[4..8].copy_from_slice(&ip);
+        buf
+    }
+    fn udp_bound(port: u16) -> Result<u64, &'static str> {
+        let fd = match call(Syscall::SocketOpen.raw(), a2(AF_INET, SOCK_DGRAM, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_INET, SOCK_DGRAM) failed"),
+        };
+        let addr = sin([127, 0, 0, 1], port);
+        if call(Syscall::SocketBind.raw(), a2(fd, addr.as_ptr() as u64, 16)) != Some(0) {
+            return Err("bind() of a UDP socket failed");
+        }
+        Ok(fd)
+    }
+    fn send_to(fd: u64, payload: &[u8], port: u16) -> Result<(), &'static str> {
+        let to = sin([127, 0, 0, 1], port);
+        let sent = call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: to.as_ptr() as u64,
+                arg5: 16,
+                ..SyscallArgs::default()
+            },
+        );
+        if sent != Some(payload.len() as i64) {
+            return Err("sendto of a UDP datagram failed");
+        }
+        Ok(())
+    }
+    fn recv_cmsgs(fd: u64) -> Result<Cmsgs, &'static str> {
+        let mut data = [0u8; 64];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 256];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        match call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd, msg.as_ptr() as u64, MSG_DONTWAIT),
+        ) {
+            Some(n) if n >= 0 => {}
+            _ => return Err("recvmsg of the datagram failed"),
+        }
+        let controllen = u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize;
+        let mut out = alloc::vec::Vec::new();
+        let mut at = 0usize;
+        while at + 16 <= controllen {
+            let len = u64::from_ne_bytes(ctrl[at..at + 8].try_into().unwrap()) as usize;
+            let level = i32::from_ne_bytes(ctrl[at + 8..at + 12].try_into().unwrap());
+            let kind = i32::from_ne_bytes(ctrl[at + 12..at + 16].try_into().unwrap());
+            if len < 16 || at + len > controllen {
+                return Err("recvmsg returned a malformed cmsghdr");
+            }
+            out.push((level, kind, ctrl[at + 16..at + len].to_vec()));
+            at += (len + 7) & !7;
+        }
+        Ok(out)
+    }
+    /// The record must be `(secs, fraction)` of a CLOCK_REALTIME instant
+    /// between `before` and `after`, with `fraction` below `limit`.
+    fn check_stamp(
+        data: &[u8],
+        before: narf_time::WallInstant,
+        after: narf_time::WallInstant,
+        limit: i64,
+    ) -> Result<(), &'static str> {
+        if data.len() != 16 {
+            return Err("timestamp control message is not 16 bytes");
+        }
+        let secs = i64::from_ne_bytes(data[0..8].try_into().unwrap());
+        let fraction = i64::from_ne_bytes(data[8..16].try_into().unwrap());
+        if !(0..limit).contains(&fraction) {
+            return Err("timestamp fraction is out of range for its unit");
+        }
+        if secs < before.secs || secs > after.secs {
+            return Err("timestamp is not the datagram's CLOCK_REALTIME arrival");
+        }
+        Ok(())
+    }
+    with_setup(|| {
+        narf_net::iface::register_loopback_iface();
+        let rx = udp_bound(47341)?;
+        let tx = udp_bound(47342)?;
+        let result = (|| -> Result<(), &'static str> {
+            // Not requested: no SOL_SOCKET record.
+            send_to(tx, b"plain", 47341)?;
+            if !recv_cmsgs(rx)?.is_empty() {
+                return Err("recvmsg returned a timestamp nobody asked for");
+            }
+
+            // SO_TIMESTAMPNS: SCM_TIMESTAMPNS, nanosecond fraction.
+            if sockopt_set_int(rx, SOL_SOCKET, SO_TIMESTAMPNS_OLD, 1)? != 0 {
+                return Err("setsockopt(SO_TIMESTAMPNS) failed");
+            }
+            let before = narf_time::now_wall();
+            send_to(tx, b"ntp", 47341)?;
+            let after = narf_time::now_wall();
+            let got = recv_cmsgs(rx)?;
+            if got.len() != 1 || got[0].0 != SOL_SOCKET_I || got[0].1 != SCM_TIMESTAMPNS_OLD {
+                return Err("SO_TIMESTAMPNS did not yield exactly one SCM_TIMESTAMPNS record");
+            }
+            check_stamp(&got[0].2, before, after, 1_000_000_000)?;
+
+            // The timestamp precedes the IP-level records (`udp_recvmsg`
+            // runs `sock_recv_cmsgs` before `ip_cmsg_recv_offset`).
+            if sockopt_set_int(rx, so::IPPROTO_IP, so::IP_PKTINFO, 1)? != 0 {
+                return Err("setsockopt(IP_PKTINFO) failed");
+            }
+            send_to(tx, b"both", 47341)?;
+            let got = recv_cmsgs(rx)?;
+            if got.len() != 2
+                || (got[0].0, got[0].1) != (SOL_SOCKET_I, SCM_TIMESTAMPNS_OLD)
+                || (got[1].0, got[1].1) != (SOL_IP, so::IP_PKTINFO as i32)
+            {
+                return Err("SCM_TIMESTAMPNS must come first, then IP_PKTINFO");
+            }
+            if sockopt_set_int(rx, so::IPPROTO_IP, so::IP_PKTINFO, 0)? != 0 {
+                return Err("clearing IP_PKTINFO failed");
+            }
+
+            // SO_TIMESTAMP replaces the nanosecond form: SCM_TIMESTAMP with
+            // a microsecond fraction (`sock_set_timestamp` clears
+            // SOCK_RCVTSTAMPNS).
+            if sockopt_set_int(rx, SOL_SOCKET, SO_TIMESTAMP_OLD, 1)? != 0 {
+                return Err("setsockopt(SO_TIMESTAMP) failed");
+            }
+            let before = narf_time::now_wall();
+            send_to(tx, b"usec", 47341)?;
+            let after = narf_time::now_wall();
+            let got = recv_cmsgs(rx)?;
+            if got.len() != 1 || got[0].0 != SOL_SOCKET_I || got[0].1 != SCM_TIMESTAMP_OLD {
+                return Err("SO_TIMESTAMP did not yield exactly one SCM_TIMESTAMP record");
+            }
+            check_stamp(&got[0].2, before, after, 1_000_000)?;
+
+            // Switched off again: no record.
+            if sockopt_set_int(rx, SOL_SOCKET, SO_TIMESTAMP_OLD, 0)? != 0 {
+                return Err("clearing SO_TIMESTAMP failed");
+            }
+            send_to(tx, b"off", 47341)?;
+            if !recv_cmsgs(rx)?.is_empty() {
+                return Err("recvmsg still returned a timestamp after SO_TIMESTAMP=0");
+            }
+            Ok(())
+        })();
+        let _ = call(Syscall::Close.raw(), a0(rx));
+        let _ = call(Syscall::Close.raw(), a0(tx));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_inet_dgram_recvmsg_so_timestampns
+);
+
 /// IPv6 receive control messages follow `ip6_datagram_recv_{common,specific}_ctl`:
 /// `IPV6_RECVTCLASS` emits the received header's traffic class as an `int`
 /// `IPV6_TCLASS` cmsg, after any requested PKTINFO and HOPLIMIT records. Linux's
