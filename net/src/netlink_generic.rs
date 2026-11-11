@@ -503,7 +503,12 @@ fn build_one(
         {
             out.push(frame(NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_ne_bytes()));
         }
+        // `genl_family_rcv_msg_dumpit` returns `__netlink_dump_start`'s
+        // -EINTR ("we successfully started a dump, signal not to send ACK
+        // even if it was requested") and `netlink_rcv_skb` then skips
+        // `netlink_ack`: NLMSG_DONE is the only terminator a dump has.
         if flags & NLM_F_ACK != 0
+            && !dump
             && !out
                 .iter()
                 .any(|message| message.get(4..6) == Some(&NLMSG_ERROR.to_ne_bytes()))
@@ -563,7 +568,9 @@ fn build_one(
             out.push(error(ENOENT, seq, request));
         }
     }
+    // `ctrl_dumpfamily` is a dump like any other: never acknowledged.
     if flags & NLM_F_ACK != 0
+        && !dump
         && !out
             .iter()
             .any(|message| message.get(4..6) == Some(&NLMSG_ERROR.to_ne_bytes()))
@@ -1235,6 +1242,78 @@ mod tests {
         narf_kernel_test::TestResult::Pass
     }
     narf_kernel_test::kernel_test_in!("net/netlink_generic", dump_terminates);
+
+    /// Linux never acknowledges a dump that started: `genl_family_rcv_msg`
+    /// returns `__netlink_dump_start`'s -EINTR and `netlink_rcv_skb` skips
+    /// `netlink_ack` even when the request carried NLM_F_ACK. libnl-style
+    /// clients (NetworkManager's `nl_send_auto`) set NLM_F_ACK on every
+    /// request and advance their expected sequence number at NLMSG_DONE, so
+    /// a trailing ACK is left queued under the old sequence number and makes
+    /// the socket's *next* exchange fail with a sequence mismatch.
+    fn dump_is_never_acknowledged() -> narf_kernel_test::TestResult {
+        fn handler(_: u8, _: &[u8], _: bool) -> Result<Vec<GenlReply>, i32> {
+            Ok(vec![GenlReply {
+                command: 6,
+                attrs: vec![8, 0, 1, 0, 42, 0, 0, 0],
+            }])
+        }
+        // Distinct from every other test family id (0x30, 0x3b..=0x3e).
+        const DUMP_FAMILY: u16 = 0x3a;
+        static OPS: &[GenlOperation] = &[
+            GenlOperation {
+                command: 5,
+                flags: GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP,
+            },
+            GenlOperation {
+                command: 8,
+                flags: GENL_CMD_CAP_DO,
+            },
+        ];
+        let _ = register_family(GenlFamily {
+            id: DUMP_FAMILY,
+            name: "narf-dump-ack",
+            version: 1,
+            max_attr: 1,
+            operations: OPS,
+            groups: &[],
+            handler,
+        });
+        let kind = |m: &Vec<u8>| u16::from_ne_bytes([m[4], m[5]]);
+        let seq = |m: &Vec<u8>| u32::from_ne_bytes(m[8..12].try_into().unwrap());
+
+        // nlctrl's own dump, as NetworkManager's platform requests it.
+        let replies = build_replies(&request(None, 1 | NLM_F_ACK | NLM_F_DUMP)).unwrap();
+        narf_kernel_test::kt_assert_eq!(kind(replies.last().unwrap()), NLMSG_DONE);
+        narf_kernel_test::kt_assert!(replies.iter().all(|m| kind(m) != NLMSG_ERROR));
+        narf_kernel_test::kt_assert!(replies.iter().all(|m| seq(m) == 77));
+
+        // A registered family's dumpit.
+        let dump = frame(DUMP_FAMILY, 1 | NLM_F_ACK | NLM_F_DUMP, 404, &[5, 1, 0, 0]);
+        let replies = build_replies(&dump).unwrap();
+        narf_kernel_test::kt_assert_eq!(replies.len(), 2);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[0]), DUMP_FAMILY);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[1]), NLMSG_DONE);
+
+        // A dump request for a command without a dumpit never starts a dump:
+        // its -EOPNOTSUPP is the one message (`netlink_ack` with the error).
+        let no_dumpit = frame(DUMP_FAMILY, 1 | NLM_F_ACK | NLM_F_DUMP, 405, &[8, 1, 0, 0]);
+        let replies = build_replies(&no_dumpit).unwrap();
+        narf_kernel_test::kt_assert_eq!(replies.len(), 1);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[0]), NLMSG_ERROR);
+
+        // A doit keeps its reply followed by the requested ACK.
+        let doit = frame(DUMP_FAMILY, 1 | NLM_F_ACK, 406, &[5, 1, 0, 0]);
+        let replies = build_replies(&doit).unwrap();
+        narf_kernel_test::kt_assert_eq!(replies.len(), 2);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[0]), DUMP_FAMILY);
+        narf_kernel_test::kt_assert_eq!(kind(&replies[1]), NLMSG_ERROR);
+        narf_kernel_test::kt_assert_eq!(
+            i32::from_ne_bytes(replies[1][16..20].try_into().unwrap()),
+            0
+        );
+        narf_kernel_test::TestResult::Pass
+    }
+    narf_kernel_test::kernel_test_in!("net/netlink_generic", dump_is_never_acknowledged);
 
     fn batched_requests_preserve_sequences() -> narf_kernel_test::TestResult {
         let mut first = request(Some(b"nlctrl\0"), 1);
