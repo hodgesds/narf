@@ -16,6 +16,8 @@ mod pmf;
 mod supplicant_e2e;
 #[path = "wiphy_ops_tests.rs"]
 mod wiphy_ops;
+#[path = "wpa_supplicant_wire_tests.rs"]
+mod wpa_supplicant_wire;
 
 struct InterfaceStub {
     name: &'static str,

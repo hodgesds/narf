@@ -1071,6 +1071,7 @@ fn smoke_nl80211_ext_connect_owner_release() -> TestResult {
         optional_mfp: false,
         sae_offload: false,
         external: true,
+        control_port_over_nl80211: true,
         // nl80211_crypto_settings checks the ciphers against the wiphy's
         // cipher_suites (-EINVAL otherwise), so the wiphy advertises CCMP.
         cipher_suites: &[crate::CIPHER_SUITE_CCMP],
