@@ -1234,7 +1234,7 @@ fn smoke_sysfs_block_class_auto_populate() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-kernel_test_in!("filesystem", smoke_sysfs_block_class_auto_populate);
+kernel_test_in!("filesystem/sysfs", smoke_sysfs_block_class_auto_populate);
 
 // ── Test 8a: `size` is in 512-byte sectors; `holders/` and `slaves/` exist ──
 //
@@ -1283,7 +1283,7 @@ fn smoke_sysfs_block_size_sectors_and_stacking_dirs() -> TestResult {
     result
 }
 kernel_test_in!(
-    "filesystem",
+    "filesystem/sysfs",
     smoke_sysfs_block_size_sectors_and_stacking_dirs
 );
 
@@ -1353,7 +1353,7 @@ fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-kernel_test_in!("filesystem", smoke_sysfs_block_uevent_file_readable);
+kernel_test_in!("filesystem/sysfs", smoke_sysfs_block_uevent_file_readable);
 
 /// EFI boot queues block ADDs before PID 1 so the daemon can replay the ESP
 /// event even if the early udev trigger service is unavailable.  The queued
@@ -1388,7 +1388,10 @@ fn smoke_sysfs_block_add_events_are_canonical() -> TestResult {
         _ => TestResult::Fail("EFI block ADD was not emitted from canonical /sys/devices path"),
     }
 }
-kernel_test_in!("filesystem", smoke_sysfs_block_add_events_are_canonical);
+kernel_test_in!(
+    "filesystem/sysfs",
+    smoke_sysfs_block_add_events_are_canonical
+);
 
 // A registered partition must not masquerade as a whole disk. udev only runs
 // its filesystem-identification rules (and thus creates UUID device links)
@@ -1449,7 +1452,7 @@ fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
     }
 }
 kernel_test_in!(
-    "filesystem",
+    "filesystem/sysfs",
     smoke_sysfs_block_partition_uevent_marks_partition
 );
 

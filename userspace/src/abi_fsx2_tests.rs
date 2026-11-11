@@ -1023,7 +1023,7 @@ fn smoke_abi_fsx2_mount_bind_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_pos);
+kernel_test_in!("syscall_abi/mount", smoke_abi_fsx2_mount_bind_pos);
 
 fn smoke_abi_fsx2_mount_bind_subdir_pos() -> TestResult {
     with_setup(|| {
@@ -1059,7 +1059,7 @@ fn smoke_abi_fsx2_mount_bind_subdir_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_subdir_pos);
+kernel_test_in!("syscall_abi/mount", smoke_abi_fsx2_mount_bind_subdir_pos);
 
 // mount(2) looks its target up with `user_path_at(AT_FDCWD, ...)` and a bind
 // source with `kern_path`: relative names start at the working directory.
@@ -1133,7 +1133,10 @@ fn smoke_abi_fsx2_mount_bind_relative_to_cwd_pos() -> TestResult {
         result
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_relative_to_cwd_pos);
+kernel_test_in!(
+    "syscall_abi/mount",
+    smoke_abi_fsx2_mount_bind_relative_to_cwd_pos
+);
 
 // mount(2) resolves both source and target symlinks before attaching a bind
 // mount. Fedora's /var/mail -> spool/mail exercises this during the
@@ -1197,7 +1200,7 @@ fn smoke_abi_fsx2_mount_bind_symlink_directory_pos() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/mount",
     smoke_abi_fsx2_mount_bind_symlink_directory_pos
 );
 
@@ -1284,7 +1287,10 @@ fn smoke_abi_fsx2_mount_bind_file_to_self_pos() -> TestResult {
         },
     )
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_file_to_self_pos);
+kernel_test_in!(
+    "syscall_abi/mount",
+    smoke_abi_fsx2_mount_bind_file_to_self_pos
+);
 
 fn smoke_abi_fsx2_mount_bind_proc_file_alias_pos() -> TestResult {
     with_setup(|| {
@@ -1321,7 +1327,10 @@ fn smoke_abi_fsx2_mount_bind_proc_file_alias_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_proc_file_alias_pos);
+kernel_test_in!(
+    "syscall_abi/mount",
+    smoke_abi_fsx2_mount_bind_proc_file_alias_pos
+);
 
 fn smoke_abi_fsx2_mount_bind_remount_private_file_pos() -> TestResult {
     // The root and the staging mountpoint are the test's own: mount(2) of a
@@ -1423,7 +1432,7 @@ fn smoke_abi_fsx2_mount_bind_remount_private_file_pos() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/mount",
     smoke_abi_fsx2_mount_bind_remount_private_file_pos
 );
 
@@ -1520,7 +1529,7 @@ fn smoke_abi_fsx2_mount_bind_remount_null_source_pos() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/mount",
     smoke_abi_fsx2_mount_bind_remount_null_source_pos
 );
 
@@ -1587,7 +1596,7 @@ fn smoke_abi_fsx2_fsconfig_enodev_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_enodev_neg);
+kernel_test_in!("syscall_abi/mount_api", smoke_abi_fsx2_fsconfig_enodev_neg);
 
 // ── fsconfig: FSCONFIG_SET_STRING reaches tmpfs creation ──────────────
 //
@@ -1624,7 +1633,10 @@ fn smoke_abi_fsx2_fsconfig_set_string_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_set_string_pos);
+kernel_test_in!(
+    "syscall_abi/mount_api",
+    smoke_abi_fsx2_fsconfig_set_string_pos
+);
 
 // mount(8)'s new-mount-API path supplies `source=tmpfs` as a generic VFS
 // parameter before the filesystem-specific tmpfs options. Linux consumes
@@ -1670,7 +1682,7 @@ fn smoke_abi_fsx2_fsconfig_tmpfs_generic_source_pos() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/mount_api",
     smoke_abi_fsx2_fsconfig_tmpfs_generic_source_pos
 );
 
@@ -1700,7 +1712,10 @@ fn smoke_abi_fsx2_fsconfig_tmpfs_option_rejected() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_fsconfig_tmpfs_option_rejected);
+kernel_test_in!(
+    "syscall_abi/mount_api",
+    smoke_abi_fsx2_fsconfig_tmpfs_option_rejected
+);
 
 /// systemd's `mount_option_supported("tmpfs", "usrquota", NULL)`, call for
 /// call (src/basic/mountpoint-util.c): a nonsense key must fail with
@@ -1754,7 +1769,7 @@ fn smoke_abi_fsx2_fsconfig_tmpfs_unknown_param_einval() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/mount_api",
     smoke_abi_fsx2_fsconfig_tmpfs_unknown_param_einval
 );
 

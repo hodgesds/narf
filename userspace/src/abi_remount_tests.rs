@@ -371,7 +371,7 @@ fn smoke_abi_remount_new_api_libmount_sequence_pos() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/mount_api",
     smoke_abi_remount_new_api_libmount_sequence_pos
 );
 
@@ -458,4 +458,7 @@ fn smoke_abi_remount_new_api_rejects_neg() -> TestResult {
         finish(Ok(()), &fds)
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_remount_new_api_rejects_neg);
+kernel_test_in!(
+    "syscall_abi/mount_api",
+    smoke_abi_remount_new_api_rejects_neg
+);
