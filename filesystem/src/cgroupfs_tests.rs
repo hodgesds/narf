@@ -3237,3 +3237,331 @@ kernel_test_in!(
     "filesystem/cgroupfs",
     smoke_clone_thread_cgroup_domain_rules
 );
+
+// ── Per-page memory-cgroup charging (memcg ids) ──────────────────────
+//
+// The frame allocator charges user pages to the allocating task's memory
+// cgroup, records the cgroup on the frame, and uncharges that recorded cgroup
+// when the page is finally freed. Kernel memory is never charged. These tests
+// drive real allocations with a test pid provider that names the "current"
+// task, so the charge and the free can come from different tasks.
+
+#[cfg(feature = "cgroup-memory")]
+static MEMCG_TEST_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "cgroup-memory")]
+fn memcg_test_pid() -> Option<u64> {
+    match MEMCG_TEST_PID.load(core::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// Run `f` with the allocator attributing allocations to `MEMCG_TEST_PID`,
+/// then restore the scheduler's provider.
+#[cfg(feature = "cgroup-memory")]
+fn with_test_pid_provider<R>(f: impl FnOnce() -> R) -> R {
+    narf_memory::install_cgroup_pid_provider(memcg_test_pid);
+    let result = f();
+    MEMCG_TEST_PID.store(0, core::sync::atomic::Ordering::Release);
+    narf_scheduler::install_memory_pid_provider();
+    result
+}
+
+#[cfg(feature = "cgroup-memory")]
+fn set_test_pid(pid: u64) {
+    MEMCG_TEST_PID.store(pid, core::sync::atomic::Ordering::Release);
+}
+
+/// Kernel memory is not charged: with the current task's cgroup at its
+/// `memory.max`, heap allocations (small, page-sized and multi-page), kernel
+/// frames and kernel blocks all succeed, while a user page is refused with
+/// `ReservePressure` (a fault waits and retries) and a memcg OOM is queued.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_memcg_kernel_allocations_are_not_charged() -> TestResult {
+    use alloc::vec::Vec;
+
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    with_root_controller("memory", "t_memcg_kmem", |cg| {
+        let pid: u64 = 4_200_000_101;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        if write_attr(cg, "memory.max", b"0").is_err() {
+            task_exited(pid);
+            return TestResult::Fail("set memory.max failed");
+        }
+        let oom_before = narf_memory::memcg_oom_requests();
+        let outcome = with_test_pid_provider(|| {
+            set_test_pid(pid);
+            let mut small: Vec<u8> = Vec::new();
+            let mut large: Vec<u8> = Vec::new();
+            let heap =
+                small.try_reserve_exact(256).is_ok() && large.try_reserve_exact(1 << 20).is_ok();
+            drop(small);
+            drop(large);
+            let frame = narf_memory::frame::alloc_frame();
+            let block = narf_memory::frame::alloc_pages_on(narf_memory::frame::local_node(), 3);
+            let user = narf_memory::frame::alloc_user_frame();
+            if let Ok(frame) = frame {
+                narf_memory::frame::free_frame(frame);
+            }
+            if let Ok(block) = block {
+                narf_memory::frame::free_pages(block, 3);
+            }
+            let user_kind = match user {
+                Ok(frame) => {
+                    narf_memory::frame::free_frame(frame);
+                    0
+                }
+                Err(narf_memory::FrameAllocError::ReservePressure(_)) => 1,
+                Err(_) => 2,
+            };
+            (heap, frame.is_ok(), block.is_ok(), user_kind)
+        });
+        let current = read_current(cg);
+        let queued = narf_memory::memcg_oom_requests() > oom_before;
+        let _ = narf_memory::cgroup_charge::__run_memcg_oom_for_test();
+        let events = read_attr(cg, "memory.events").unwrap_or_default();
+        task_exited(pid);
+        let (heap, frame, block, user_kind) = outcome;
+        if !heap {
+            return TestResult::Fail("a heap allocation was refused by the cgroup limit");
+        }
+        if !frame || !block {
+            return TestResult::Fail("a kernel frame/block was refused by the cgroup limit");
+        }
+        if user_kind == 0 {
+            return TestResult::Fail("a user page was admitted past memory.max");
+        }
+        if user_kind != 1 {
+            return TestResult::Fail("a refused user charge was not ReservePressure");
+        }
+        if current != 0 {
+            return TestResult::Fail("kernel allocations were charged to the cgroup");
+        }
+        if !queued || !events.contains("oom 1") {
+            return TestResult::Fail("a refused user charge did not run a memcg OOM");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs/memcg",
+    smoke_memcg_kernel_allocations_are_not_charged
+);
+
+/// A page charged by task A (cgroup A) and freed while task B (cgroup B) is
+/// running uncharges A — the cgroup recorded on the frame — and leaves B
+/// alone. Repeated across both directions, neither count drifts.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_memcg_uncharge_follows_the_page() -> TestResult {
+    use alloc::vec::Vec;
+
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    let root = root_dir();
+    if write_attr(&root, "cgroup.subtree_control", b"+memory").is_err() {
+        return TestResult::Fail("enable memory on root failed");
+    }
+    let (a, b) = match (
+        poll_once(root.mkdir("t_memcg_a")),
+        poll_once(root.mkdir("t_memcg_b")),
+    ) {
+        (Some(Ok(a)), Some(Ok(b))) => (a, b),
+        _ => {
+            let _ = poll_once(root.rmdir("t_memcg_a"));
+            let _ = poll_once(root.rmdir("t_memcg_b"));
+            let _ = write_attr(&root, "cgroup.subtree_control", b"-memory");
+            return TestResult::Fail("mkdir test cgroups failed");
+        }
+    };
+    let (pid_a, pid_b): (u64, u64) = (4_200_000_102, 4_200_000_103);
+    let cleanup = || {
+        task_exited(pid_a);
+        task_exited(pid_b);
+        let _ = poll_once(root.rmdir("t_memcg_a"));
+        let _ = poll_once(root.rmdir("t_memcg_b"));
+        let _ = write_attr(&root, "cgroup.subtree_control", b"-memory");
+    };
+    if attach_pid(&a, pid_a).is_err() || attach_pid(&b, pid_b).is_err() {
+        cleanup();
+        return TestResult::Fail("attach test pids failed");
+    }
+    let (base_a, base_b) = (read_current(&a), read_current(&b));
+    const ROUNDS: usize = 32;
+    const PAGES: usize = 16;
+    let result = with_test_pid_provider(|| {
+        for round in 0..ROUNDS {
+            let (owner, other, owner_cg) = if round % 2 == 0 {
+                (pid_a, pid_b, &a)
+            } else {
+                (pid_b, pid_a, &b)
+            };
+            set_test_pid(owner);
+            let mut frames = Vec::new();
+            for _ in 0..PAGES {
+                match narf_memory::frame::alloc_user_frame() {
+                    Ok(frame) => frames.push(frame),
+                    Err(_) => return Err("user page allocation failed"),
+                }
+            }
+            // Each cgroup holds exactly the user pages its task allocated:
+            // the charge path's own heap use (and any other kernel memory)
+            // is in neither.
+            let (owner_base, other_cg, other_base) = if owner == pid_a {
+                (base_a, &b, base_b)
+            } else {
+                (base_b, &a, base_a)
+            };
+            let held = owner_base + (PAGES as u64) * 4096;
+            if read_current(owner_cg) != held || read_current(other_cg) != other_base {
+                return Err("memory.current is not the user pages the cgroup holds");
+            }
+            let stat = read_attr(owner_cg, "memory.stat").unwrap_or_default();
+            if !stat.contains(&alloc::format!("anon {held}\n")) {
+                return Err("memory.stat disagrees with memory.current");
+            }
+            // Free them as the other task, half one at a time, half batched.
+            set_test_pid(other);
+            let half = frames.len() / 2;
+            for frame in &frames[..half] {
+                narf_memory::frame::free_frame(*frame);
+            }
+            narf_memory::frame::free_frame_batch(&frames[half..]);
+            set_test_pid(0);
+            if read_current(&a) != base_a || read_current(&b) != base_b {
+                return Err("an uncharge went to the freeing task's cgroup");
+            }
+        }
+        Ok(())
+    });
+    cleanup();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs/memcg",
+    smoke_memcg_uncharge_follows_the_page
+);
+
+/// A cgroup removed while pages are still charged to it stays accountable:
+/// freeing those pages later returns the parent to its baseline, and the
+/// removed cgroup's id is released once nothing is charged to it.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_memcg_removed_cgroup_keeps_its_charges() -> TestResult {
+    use alloc::vec::Vec;
+
+    use crate::cgroupfs::{memory, with_chain_states};
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    with_root_controller("memory", "t_memcg_parent", |parent| {
+        if write_attr(parent, "cgroup.subtree_control", b"+memory").is_err() {
+            return TestResult::Fail("enable memory on parent failed");
+        }
+        let leaf = match poll_once(parent.mkdir("leaf")) {
+            Some(Ok(leaf)) => leaf,
+            _ => {
+                let _ = write_attr(parent, "cgroup.subtree_control", b"-memory");
+                return TestResult::Fail("mkdir leaf failed");
+            }
+        };
+        let pid: u64 = 4_200_000_104;
+        if attach_pid(&leaf, pid).is_err() {
+            let _ = poll_once(parent.rmdir("leaf"));
+            let _ = write_attr(parent, "cgroup.subtree_control", b"-memory");
+            return TestResult::Fail("attach pid failed");
+        }
+        let mut leaf_state = None;
+        with_chain_states(pid, "memory", |state| {
+            if leaf_state.is_none() {
+                leaf_state = Some(state.clone());
+            }
+        });
+        let base = read_current(parent);
+        let frames: Vec<_> = with_test_pid_provider(|| {
+            set_test_pid(pid);
+            (0..8)
+                .filter_map(|_| narf_memory::frame::alloc_user_frame().ok())
+                .collect()
+        });
+        let charged = read_current(parent);
+        // The task leaves and the cgroup is removed with its pages charged.
+        task_exited(pid);
+        let removed = poll_once(parent.rmdir("leaf"));
+        let id_while_charged = leaf_state
+            .as_ref()
+            .and_then(|s| s.as_any().downcast_ref::<memory::MemoryState>())
+            .map_or(0, memory::MemoryState::memcg_id);
+        for frame in &frames {
+            narf_memory::frame::free_frame(*frame);
+        }
+        let after = read_current(parent);
+        let id_after = leaf_state
+            .as_ref()
+            .and_then(|s| s.as_any().downcast_ref::<memory::MemoryState>())
+            .map_or(0, memory::MemoryState::memcg_id);
+        let _ = write_attr(parent, "cgroup.subtree_control", b"-memory");
+        if frames.len() != 8 || charged != base + 8 * 4096 {
+            return TestResult::Fail("leaf pages were not charged through the parent");
+        }
+        if !matches!(removed, Some(Ok(()))) {
+            return TestResult::Fail("rmdir of the emptied leaf failed");
+        }
+        if id_while_charged == 0 {
+            return TestResult::Fail("a removed cgroup with charged pages lost its id");
+        }
+        if after != base {
+            return TestResult::Fail("pages freed after rmdir did not uncharge the parent");
+        }
+        if id_after != 0 {
+            return TestResult::Fail("a drained removed cgroup kept its id");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs/memcg",
+    smoke_memcg_removed_cgroup_keeps_its_charges
+);
+
+/// Page-cache and shmem pages are user memory: charged to the task that
+/// brings them in, uncharged by their final free whoever frees them.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_memcg_page_cache_is_charged() -> TestResult {
+    use crate::cgroupfs::memory;
+    crate::cgroupfs::register_controller(Arc::new(memory::MemoryController));
+    with_root_controller("memory", "t_memcg_cache", |cg| {
+        let pid: u64 = 4_200_000_105;
+        if attach_pid(cg, pid).is_err() {
+            return TestResult::Fail("attach pid failed");
+        }
+        let base = read_current(cg);
+        let (folio_charged, after_drop) = with_test_pid_provider(|| {
+            set_test_pid(pid);
+            let folio = crate::page_cache::CacheFolio::alloc_zeroed();
+            let charged = read_current(cg);
+            set_test_pid(0);
+            drop(folio);
+            (charged, read_current(cg))
+        });
+        task_exited(pid);
+        if folio_charged != base + 4096 {
+            return TestResult::Fail("a page-cache folio was not charged to its task");
+        }
+        if after_drop != base {
+            return TestResult::Fail("dropping a page-cache folio did not uncharge it");
+        }
+        TestResult::Pass
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs/memcg",
+    smoke_memcg_page_cache_is_charged
+);
