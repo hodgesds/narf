@@ -86,6 +86,8 @@ pub mod mac;
 pub mod packet;
 pub mod phy;
 pub mod pwrseq;
+pub mod rsvd_page;
+pub mod station;
 pub mod tables;
 pub mod trx;
 pub mod txpower;

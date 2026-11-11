@@ -2160,3 +2160,83 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_packet_rx_c2h_and_notify
 );
+
+// ── station MAC registers / reserved page ─────────────────────────────────
+
+/// `rtl8723be_set_fw_rsvdpagepkt` body over the verbatim `fw.c` initializer,
+/// and the `rtl8723be_set_hw_reg` station rows: `HW_VAR_BASIC_RATE` (`| 1`,
+/// INIRTS index), `update_channel_access_setting` SIFS 0x0a0a without HT,
+/// `HW_VAR_ACK_PREAMBLE` at `REG_TRXPTCL_CTL + 2` BIT(1), and
+/// `_rtl8723be_set_media_status` / `set_check_bssid` for the linked station.
+fn smoke_rtl8723be_station_registers_and_rsvd_page() -> TestResult {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(&rsvd_page::TEMPLATE);
+    let digest = hash.finalize();
+    let hex: alloc::string::String = digest.iter().map(|b| alloc::format!("{b:02x}")).collect();
+    if hex != rsvd_page::TEMPLATE_SHA256 {
+        return TestResult::Fail("8723BE reserved_page_packet digest");
+    }
+    let own = [0x00, 0xe0, 0x4c, 1, 2, 3];
+    let bssid = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let Some(pages) = rsvd_page::pages(own, bssid, 5) else {
+        return TestResult::Fail("8723BE reserved pages refused");
+    };
+    let ps = rsvd_page::PSPOLL_PG * rsvd_page::PAGE;
+    if pages[10..16] != own
+        || pages[16..22] != bssid
+        || pages[ps + 2..ps + 4] != [5, 0xc0]
+        || pages[ps + 10..ps + 16] != own
+        || pages[rsvd_page::BT_QOS_NULL_PG * rsvd_page::PAGE + 4..][..6] != bssid
+        || rsvd_page::pages(own, bssid, 0).is_some()
+    {
+        return TestResult::Fail("8723BE reserved page substitutions");
+    }
+    let io = reg_log();
+    if station::basic_rate(0x15f) != (0x15f, 8) || station::basic_rate(0x002) != (0x003, 1) {
+        return TestResult::Fail("8723BE HW_VAR_BASIC_RATE");
+    }
+    io.0.lock().regs[usize::from(station::REG_TRXPTCL_CTL + 2)] = 0xff;
+    // ERP-less short-preamble, short-slot capability; legacy station.
+    if station::configure_rates(&io, 0xfff, 0x15, 0x420, None, false) != Ok((true, true)) {
+        return TestResult::Fail("8723BE configure_rates");
+    }
+    {
+        let g = io.0.lock();
+        let r = |a: u16| g.regs[usize::from(a)];
+        if r(station::REG_RRSR) != 0x15
+            || r(station::REG_INIRTS_RATE_SEL) != 4
+            || r(station::REG_SLOT) != 9
+            || r(station::REG_SIFS_CTX + 1) != 0x0a
+            || r(station::REG_SIFS_TRX + 1) != 0x0a
+            || r(station::REG_RESP_SIFS_OFDM) != 0x0e
+            || r(station::REG_RESP_SIFS_OFDM + 1) != 0x0e
+            || r(station::REG_TRXPTCL_CTL + 2) != 0xff
+            || !g.writes.contains(&(station::REG_EDCA_BK_PARAM, 0xa44f, 4))
+            || g.writes.iter().any(|w| w.0 == 0x0508)
+        {
+            return TestResult::Fail("8723BE station access/qos rows");
+        }
+    }
+    let mut receive = station::ReceiveConfig {
+        rcr: mac::RCR,
+        bcn_ctrl: 0x1f,
+    };
+    io.0.lock().regs[usize::from(station::MSR)] = 0x0c;
+    if station::network_type_station(&io, &mut receive, true).is_err() {
+        return TestResult::Fail("8723BE network type");
+    }
+    let g = io.0.lock();
+    if g.regs[usize::from(station::MSR)] != 0x0e
+        || g.regs[usize::from(station::REG_BCNTCFG + 1)] != 0x66
+        || receive.rcr != mac::RCR | station::RCR_CBSSID_DATA | station::RCR_CBSSID_BCN
+        || receive.bcn_ctrl != 0x1f & !(1 << 1) & !(1 << 4)
+        || g.regs[usize::from(h2c::REG_BCN_CTRL)] != receive.bcn_ctrl
+    {
+        return TestResult::Fail("8723BE media status / check BSSID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_station_registers_and_rsvd_page
+);

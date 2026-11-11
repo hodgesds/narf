@@ -192,6 +192,9 @@ pub struct Prepared<I: Io, M: Memory> {
     /// RTL8723BE coexistence owner (`rtl8723be/coex.rs`), bound before
     /// [`Self::prepare`] (`rtl_pci_start` → `btc_init_variables`).
     rtl8723be_coex: Option<alloc::boxed::Box<super::rtl8723be::coex::Owner>>,
+    /// Admitted `NAPC` operating point (`rtl8723be/envelope.rs`) whose
+    /// [`super::rtl8723be::channel::Grant`] programmed the channel.
+    rtl8723be_power: Option<super::rtl8723be::envelope::Permission>,
     /// RTL8192DE factory identity, configured radio, factory TX-power
     /// data and channel bandset (`rtl8192de/radio_owner.rs`).
     rtl8192de: Option<alloc::boxed::Box<de92_radio::De92Radio>>,
@@ -311,6 +314,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             rtl8192ce_power: None,
             rtl8723be: None,
             rtl8723be_coex: None,
+            rtl8723be_power: None,
             rtl8192de: None,
             rtl8192de_power: None,
             rtl8192de_mode: None,

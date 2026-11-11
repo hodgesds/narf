@@ -352,6 +352,11 @@ async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
         {
             super::super::station_power::wait_rtl8192ce(base, permission, environment, future).await
         }
+        (Base::Rtl8723be(base), Grant::Rtl8723be(permission))
+            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
+        {
+            super::super::station_power::wait_rtl8723be(base, permission, environment, future).await
+        }
         _ => Err(RadioError::State),
     }
 }
@@ -1229,6 +1234,17 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             domain,
         )
     }
+    /// The 8723BE `NAPC` envelope that minted this owner's channel grant.
+    pub(crate) fn stage_rtl8723be_calibration(
+        &mut self,
+        calibration: super::super::rtl8723be::envelope::Calibration,
+        domain: &narf_wireless::reg::RegulatoryDomain,
+    ) -> Result<(), Error> {
+        self.stage_station_base(
+            super::super::station_power::Base::Rtl8723be(Arc::new(calibration)),
+            domain,
+        )
+    }
     fn stage_station_base(
         &mut self,
         base: super::super::station_power::Base,
@@ -1262,8 +1278,9 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             super::Chip::Rtl8192de => self
                 .rtl8192de_power
                 .map(super::super::station_power::Grant::Rtl8192de),
-            // Not admitted: no RTL8723BE channel grant exists yet.
-            super::Chip::Rtl8723be => None,
+            super::Chip::Rtl8723be => self
+                .rtl8723be_power
+                .map(super::super::station_power::Grant::Rtl8723be),
         }
     }
     /// 88EE calibration for the 88EE-only HT/protection/tracking/antenna/
