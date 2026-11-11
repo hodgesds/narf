@@ -24,6 +24,11 @@ That lives in `frame/`, `memory/`, `interrupts/`.
 
 ## 3. Public interface
 
+`idle_halt_then_disable` requires and returns with IRQs masked. x86 uses
+`sti; hlt; cli`; aarch64 completes preceding stores with DSB and executes WFI
+while keeping DAIF.I set. A pending physical IRQ wakes WFI even when delivery
+is masked, preserving the caller's final wake check until it restores IRQs.
+
 `x86_64::cache_topology::current_llc_id() -> Option<u64>` returns an opaque
 CPUID-derived last-data-cache identity for cold per-CPU topology discovery.
 It uses extended APIC IDs and cache-sharing geometry (including early Zen's

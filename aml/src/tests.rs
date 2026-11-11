@@ -8,6 +8,34 @@ extern crate alloc;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[cfg(feature = "kernel-test")]
+fn processor_identity_retained() -> TestResult {
+    // SAFETY: the kernel test runner serializes namespace fixtures.
+    let _scope = unsafe { crate::__test_namespace_scope() };
+    let body = [0x5b, 0x83, 11, b'C', b'P', b'U', b'7', 42, 0, 0, 0, 0, 0];
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("Processor fixture parse");
+    }
+    let Some(node) = crate::find_node("\\CPU7") else {
+        return TestResult::Fail("Processor missing");
+    };
+    if node.processor_id != Some(42) || node.kind != crate::NodeKind::Processor {
+        return TestResult::Fail("Processor ProcID discarded");
+    }
+    let mut truncated = body;
+    truncated[2] = 5;
+    truncated[6] = b'8';
+    // Namespace parsing skips malformed objects without rejecting the table.
+    if !matches!(crate::__parse_body_for_test(&truncated, "\\"), Ok(0))
+        || crate::find_node("\\CPU8").is_some()
+    {
+        return TestResult::Fail("truncated Processor registered a namespace node");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!("aml/processor", processor_identity_retained);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_aml_namespace_built_at_boot() -> TestResult {
     // Boot built the namespace from DSDT + SSDTs. QEMU q35 ships a

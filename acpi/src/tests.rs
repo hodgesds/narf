@@ -25,6 +25,40 @@ kernel_test_in!(
     smoke_acpi_pm1_sleep_control_preserves_non_sleep_bits
 );
 
+fn processor_uid_is_not_apic_id() -> TestResult {
+    use core::sync::atomic::Ordering;
+    let old_count = crate::MADT_CPU_COUNT.load(Ordering::Acquire);
+    let old_ids = [
+        crate::APIC_IDS[0].load(Ordering::Acquire),
+        crate::APIC_IDS[1].load(Ordering::Acquire),
+    ];
+    let old_uids = [
+        crate::PROCESSOR_UIDS[0].load(Ordering::Acquire),
+        crate::PROCESSOR_UIDS[1].load(Ordering::Acquire),
+    ];
+    crate::MADT_CPU_COUNT.store(2, Ordering::Release);
+    crate::APIC_IDS[0].store(7, Ordering::Release);
+    crate::APIC_IDS[1].store(300, Ordering::Release);
+    crate::PROCESSOR_UIDS[0].store(42, Ordering::Release);
+    crate::PROCESSOR_UIDS[1].store(900, Ordering::Release);
+    let correct = crate::apic_id_for_processor_uid(42) == Some(7)
+        && crate::apic_id_for_processor_uid(900) == Some(300)
+        && crate::apic_id_for_processor_uid(7).is_none();
+    crate::PROCESSOR_UIDS[1].store(42, Ordering::Release);
+    let ambiguous = crate::apic_id_for_processor_uid(42).is_none();
+    for i in 0..2 {
+        crate::APIC_IDS[i].store(old_ids[i], Ordering::Release);
+        crate::PROCESSOR_UIDS[i].store(old_uids[i], Ordering::Release);
+    }
+    crate::MADT_CPU_COUNT.store(old_count, Ordering::Release);
+    if correct && ambiguous {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("processor UID/APIC identity mismatch")
+    }
+}
+kernel_test_in!("acpi", processor_uid_is_not_apic_id);
+
 fn smoke_acpi_pptt_synthetic_decode() -> TestResult {
     use crate::{PpttCache, PpttCacheKind, PpttCpu};
     use alloc::vec::Vec;

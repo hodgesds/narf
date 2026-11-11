@@ -14,6 +14,7 @@ members = [
     "memory",
     "time",
     "scheduler",
+    "power/core",
     "scheduler/policy-example",
     "capabilities",
     "security",

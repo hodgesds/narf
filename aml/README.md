@@ -1,5 +1,7 @@
 # aml — ACPI Machine Language Namespace Builder and Evaluator
 
+Legacy Processor identities follow the [namespace contract](specification/namespace.md).
+
 `narf-aml` reads the ACPI Machine Language (AML) bytecode carried in the
 DSDT and SSDT tables and turns it into a usable picture of the platform.
 AML is the language firmware uses to describe control-method devices,

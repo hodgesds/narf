@@ -12,6 +12,7 @@ name = "narf_power"
 path = "src/lib.rs"
 
 [dependencies]
+narf-power-core   = { path = "core" }
 narf-lib          = { path = "../lib" }
 narf-arch         = { path = "../arch" }
 narf-memory       = { path = "../memory" }
@@ -37,7 +38,7 @@ zeroize           = { version = "1", default-features = false, features = ["allo
 argon2            = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
 
 [features]
-kernel-test = ["narf-ctap2/fixture-token", "narf-drivers-tpm/fixture-tpm", "wake-test"]
+kernel-test = ["narf-power-core/kernel-test", "narf-ctap2/fixture-token", "narf-drivers-tpm/fixture-tpm", "wake-test"]
 wake-test = ["narf-acpi/kernel-test", "narf-aml/kernel-test", "narf-bus/kernel-test"]
 
 [lints]

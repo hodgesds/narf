@@ -6,10 +6,6 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU8, Ordering};
-
-use narf_arch::x86_64::cpuid::cpuid;
-
 #[derive(Copy, Clone, Debug, Default)]
 pub struct MwaitCaps {
     pub supported: bool,
@@ -21,53 +17,19 @@ pub struct MwaitCaps {
     pub max_cstate: u8,
 }
 
-fn probe() -> MwaitCaps {
-    // CPUID(1).ECX[3] = MONITOR/MWAIT.
-    // SAFETY: leaf 1 always defined.
-    let (_, _, ecx, _) = unsafe { cpuid(1, 0) };
-    if ecx & (1 << 3) == 0 {
-        return MwaitCaps::default();
-    }
-    // SAFETY: leaf 5 only defined when MONITOR/MWAIT is set; we
-    // just verified that.
-    // SAFETY: Valid memory or trusted environment
-    let (_, _, ecx5, edx5) = unsafe { cpuid(5, 0) };
-    let interrupt_break = ecx5 & (1 << 1) != 0;
-    // Count populated nibbles in EDX = max C-state with at least
-    // one sub-state.
-    let mut max_cstate = 0u8;
-    for i in 0..8 {
-        if (edx5 >> (i * 4)) & 0xF != 0 {
-            max_cstate = i as u8;
-        }
-    }
-    MwaitCaps {
-        supported: true,
-        interrupt_break,
-        sub_states: edx5,
-        max_cstate,
-    }
-}
-
-static CAPS_RAW: AtomicU8 = AtomicU8::new(0xFF);
-static MAX_DEPTH: AtomicU8 = AtomicU8::new(0);
-static SUPPORTED: AtomicU8 = AtomicU8::new(0);
-
-/// Probe + cache MWAIT capabilities.
+/// Probe the current CPU; capabilities are not shared across heterogeneous CPUs.
 pub fn caps() -> MwaitCaps {
-    if CAPS_RAW.load(Ordering::Acquire) != 0xFF {
-        return MwaitCaps {
-            supported: SUPPORTED.load(Ordering::Acquire) != 0,
-            interrupt_break: CAPS_RAW.load(Ordering::Acquire) & 1 != 0,
-            sub_states: 0, // Not cached; CPUID is fast enough.
-            max_cstate: MAX_DEPTH.load(Ordering::Acquire),
-        };
+    let caps = narf_power_core::x86::CpuIdleCaps::probe();
+    let max_cstate = (0..8)
+        .rev()
+        .find(|i| (caps.sub_states >> (i * 4)) & 0xf != 0)
+        .unwrap_or(0);
+    MwaitCaps {
+        supported: caps.mwait,
+        interrupt_break: caps.interrupt_break,
+        sub_states: caps.sub_states,
+        max_cstate: max_cstate as u8,
     }
-    let c = probe();
-    CAPS_RAW.store(c.interrupt_break as u8, Ordering::Release);
-    SUPPORTED.store(c.supported as u8, Ordering::Release);
-    MAX_DEPTH.store(c.max_cstate, Ordering::Release);
-    c
 }
 
 /// Encode a C-state depth as the `MWAIT EAX` hint per Intel's
@@ -86,58 +48,42 @@ pub const fn encode_cstate(depth: u8) -> u32 {
     }
 }
 
-/// Enter `MWAIT` at the requested C-state depth. Re-armed
-/// MONITOR/MWAIT on a per-CPU dummy address; any IRQ wakes.
+/// Enter a platform-approved legacy depth. New callers use the firmware's exact
+/// hint through `IdlePlan` instead of translating ACPI state numbers.
 ///
 /// # Safety
-/// CPL = 0; caps().supported is true.
+/// CPL=0, IRQs masked, final wake check complete, no locks held. The caller
+/// must have validated the firmware state and its latency against the deadline.
+/// Returns with IRQs masked.
 pub unsafe fn mwait(depth: u8) {
-    static IDLE_DUMMY: AtomicU8 = AtomicU8::new(0);
-    let addr = IDLE_DUMMY.as_ptr() as u64;
-    let hint = encode_cstate(depth);
-    let ext = caps().interrupt_break as u32;
-    // SAFETY: caller-asserted.
+    let entry = narf_power_core::IdleEntry::Mwait {
+        hint: encode_cstate(depth),
+    };
+    let caps = narf_power_core::x86::CpuIdleCaps::probe();
+    // SAFETY: caller supplies the firmware/deadline validation and wake handshake.
     unsafe {
-        core::arch::asm!(
-            "monitor",
-            in("rax") addr,
-            in("rcx") 0u32,
-            in("rdx") 0u32,
-            options(nomem, nostack),
-        );
-        core::arch::asm!(
-            "mwait",
-            in("rax") hint,
-            in("rcx") ext,
-            options(nomem, nostack),
-        );
+        if caps.supports(entry) {
+            narf_power_core::x86::enter(entry);
+        } else {
+            narf_arch::idle_halt_then_disable();
+        }
     }
 }
 
-/// Canonical kernel idle entry. Picks the deepest supported
-/// C-state when MWAIT is available; falls back to STI;HLT.
+/// Enter the installed governor's selected idle state.
 ///
 /// # Safety
-/// CPL = 0; called from the idle task's body with interrupts in
-/// the standard "ready to be enabled" state.
+/// CPL=0, IRQs masked, final wake check complete, no locks held, deadlines armed.
+/// Returns with IRQs masked.
 pub unsafe fn idle() {
-    let c = caps();
-    if c.supported && c.max_cstate > 0 {
-        // SAFETY: caller-asserted; caps() validated.
-        unsafe {
-            mwait(c.max_cstate);
-        }
-    } else {
-        // SAFETY: STI;HLT canonical idle pair.
-        unsafe {
-            core::arch::asm!("sti", "hlt", options(nomem, nostack));
-        }
-    }
+    let plan = narf_power_core::executor::prepare_idle(narf_power_core::IdleHints {
+        cpu: narf_lib::percpu::current_cpu(),
+        now_cycles: narf_time::now_cycles(),
+        next_deadline_cycles: narf_time::timer_wheel::next_deadline_cycles(),
+    });
+    // SAFETY: caller owns IRQ state and the wake handshake.
+    unsafe { narf_power_core::executor::enter_idle(plan) };
 }
 
 #[doc(hidden)]
-pub fn __reset_for_test() {
-    CAPS_RAW.store(0xFF, Ordering::Release);
-    SUPPORTED.store(0, Ordering::Release);
-    MAX_DEPTH.store(0, Ordering::Release);
-}
+pub fn __reset_for_test() {}

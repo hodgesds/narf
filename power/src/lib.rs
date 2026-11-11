@@ -13,20 +13,6 @@
 //! runtime-PM device returns `PowerError::AuthorityRevoked`. This mirrors
 //! the `narf-net` registration pattern (see `net/src/lib.rs::register`).
 //!
-//! # Non-goals (deferred to Stage 4 per `power/specification/spec.md` §7)
-//!
-//! - Suspend-to-RAM (S3 on x86_64 / `SYSTEM_SUSPEND` on aarch64).
-//! - Thermal zones + throttle actions.
-//! - `EnergyAware` governor coupled into `scheduler/`.
-//! - Hysteresis on `OnDemand` (current selector is bare-min: split at
-//!   load = 500 permille).
-//! - Real x86_64 MWAIT entry sequences + ACPI `_CST` parsing.
-//! - PSCI `CPU_SUSPEND` for deep aarch64 idle states.
-//! - Replacing `scheduler::halt_until_irq` with `idle_loop`. The hooks
-//!   exist so a Stage-4 scheduler can call `select_idle_state().entry`
-//!   instead of bare HLT/WFI; today the scheduler still drives the
-//!   halt path directly.
-
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
@@ -37,6 +23,10 @@ pub mod ac;
 pub mod acpi_thermal;
 pub mod battery;
 pub mod button;
+#[cfg(target_arch = "x86_64")]
+pub mod cpu_idle;
+#[cfg(target_arch = "x86_64")]
+mod cpu_idle_tests;
 pub mod device_pm;
 pub mod laptop_state;
 pub mod monitor;
@@ -172,6 +162,22 @@ extern "C" fn s3_resume_hook_entry() {
 
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::PostCore, "cpu-idle", || {
+        narf_power_core::init();
+        let authority = bootstrap_idle_governor_authority();
+        let _ = install_idle_governor(&authority, MenuGovernor);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let power = bootstrap_power_authority();
+            let count = cpu_idle::discover(&power).unwrap_or(0);
+            let _ = writeln!(
+                narf_console::Writer,
+                "  cpu-idle: menu governor, {} firmware CPU tables",
+                count
+            );
+        }
+        InitResult::Ok
+    });
     // Thermal registry bring-up (#907). `thermal::init()` creates the
     // generic zone registry and installs the default StepPolicy
     // governor. It must run BEFORE the Stage::Subsys producers that
@@ -418,62 +424,23 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
+use narf_capabilities::{Cap, CapKind, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
 
-// ── PowerError ──────────────────────────────────────────────────────
-
-/// Errors returned by the cap-gated entry points. `From<CapError>`
-/// collapses every cap failure to `AuthorityRevoked` because Stage-3
-/// only checks one thing on the authority cap (its epoch); a richer
-/// mapping lands when the registry grows additional cap-gated ops.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum PowerError {
-    /// The authority cap has been revoked (epoch mismatch).
-    AuthorityRevoked,
-    /// Tried to register a C-state with an `id` that already exists.
-    DuplicateCState,
-    /// `select_idle_state` could not find a state matching the deadline
-    /// constraint — should be impossible after `init()` registers C0.
-    NoMatchingState,
-    /// Asked for the active governor before any was installed. The
-    /// default `Performance` governor is set up at `init()`, so this
-    /// only fires if a caller jumps the gun.
-    GovernorMissing,
-}
-
-impl From<CapError> for PowerError {
-    fn from(_: CapError) -> Self {
-        PowerError::AuthorityRevoked
-    }
-}
+pub use narf_power_core::{
+    cstate_count, cstates, current_idle_governor_name, detach_idle_governor_struct_ops, idle_loop,
+    install_idle_governor, install_idle_governor_struct_ops, register_cstate, select_idle_state,
+    CState, CStateIdx, IdleContext, IdleDecision, IdleEntry, IdleGov, IdleGovernor, IdleHints,
+    IdlePlan, IdleState, LinearScan, MenuGovernor, Power, PowerError,
+};
 
 // ── Cap marker types ────────────────────────────────────────────────
-
-/// Authority to install governors / register C-states / register runtime
-/// PM devices. The actual rights split is `Grant`; see `install_governor`
-/// et al for the receivers.
-#[derive(Copy, Clone, Debug)]
-pub struct Power;
-impl CapType for Power {
-    const KIND: CapKind = CapKind::Power;
-}
 
 /// Authority to install a DVFS governor.
 #[derive(Copy, Clone, Debug)]
 pub struct Governor;
 impl CapType for Governor {
     const KIND: CapKind = CapKind::Governor;
-}
-
-/// Authority to install an idle governor (pluggable C-state selector).
-/// Separate from `Governor` so the DVFS-install cap and the idle-policy
-/// install cap can be granted independently. `Governor` already exists
-/// in this crate for DVFS — the `IdleGov` name disambiguates.
-#[derive(Copy, Clone, Debug)]
-pub struct IdleGov;
-impl CapType for IdleGov {
-    const KIND: CapKind = CapKind::IdleGovernor;
 }
 
 /// Authority to register a per-driver runtime-PM handler.
@@ -505,247 +472,6 @@ impl FreqHint {
     #[inline]
     pub const fn mhz(self) -> u32 {
         self.0
-    }
-}
-
-// ── C-state ─────────────────────────────────────────────────────────
-
-/// Description of one CPU idle state. `entry` is the arch-specific
-/// instruction sequence (`HLT`, `WFI`, MWAIT-with-hint, PSCI
-/// `CPU_SUSPEND`...). For Stage 3 the `entry` callbacks are stubs that
-/// log and return; the scheduler's existing `halt_until_irq` does the
-/// real waiting. Stage 4 wires `idle_loop` to call `entry` directly.
-#[derive(Copy, Clone)]
-pub struct CState {
-    /// 0 = C0 (running), 1+ = progressively deeper idle states.
-    pub id: u8,
-    /// Worst-case wake latency in microseconds. The idle governor uses
-    /// this against the next-tick deadline to bound its choice.
-    pub exit_latency_us: u32,
-    /// Typical power draw in milliwatts while parked in this state.
-    /// Lower is deeper. Stage-3 doesn't act on this beyond ordering;
-    /// `EnergyAware` (Stage 4) will.
-    pub power_draw_mw: u32,
-    /// Minimum residency (microseconds) for entering this state to
-    /// "pay back" the wake-up cost. The `MenuGovernor` refuses to
-    /// pick a state whose `target_residency_us` exceeds the predicted
-    /// idle duration. Stage-3 default `LinearScan` ignores this.
-    pub target_residency_us: u32,
-    /// Arch-specific entry sequence. Called by `idle_loop` (Stage 4).
-    /// The function MUST return only after a wake event (IRQ / SEV /
-    /// MWAIT-monitor write); `select_idle_state` never picks a state
-    /// whose `entry` would block longer than the next deadline.
-    pub entry: fn(),
-}
-
-impl core::fmt::Debug for CState {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CState")
-            .field("id", &self.id)
-            .field("exit_latency_us", &self.exit_latency_us)
-            .field("power_draw_mw", &self.power_draw_mw)
-            .field("target_residency_us", &self.target_residency_us)
-            .finish_non_exhaustive()
-    }
-}
-
-// ── C-state registry ────────────────────────────────────────────────
-
-static CSTATES: IrqSafeSpinLock<Vec<CState>> = IrqSafeSpinLock::new(Vec::new());
-
-/// Register a C-state with the global table. Cap-gated on
-/// `Cap<Power, Grant>`. Returns `Err(DuplicateCState)` if a state with
-/// the same `id` is already registered.
-pub fn register_cstate(cap: &Cap<Power, Grant>, state: CState) -> Result<(), PowerError> {
-    cap.check_live()?;
-    let mut t = CSTATES.lock();
-    if t.iter().any(|s| s.id == state.id) {
-        return Err(PowerError::DuplicateCState);
-    }
-    t.push(state);
-    // Keep ascending by id so `select_idle_state` can scan from the
-    // back to find the deepest fit in O(n).
-    t.sort_by_key(|s| s.id);
-    Ok(())
-}
-
-/// Number of registered C-states. Mostly for tests.
-pub fn cstate_count() -> usize {
-    CSTATES.lock().len()
-}
-
-/// Snapshot the registered C-state set. Returned vec is owned so the
-/// caller doesn't hold the lock across other power calls.
-pub fn cstates() -> Vec<CState> {
-    CSTATES.lock().clone()
-}
-
-// ── Default C-state entries ─────────────────────────────────────────
-
-/// C0: running. Entry is a no-op — the CPU is by definition awake.
-fn cstate_c0_entry() { /* never parked here */
-}
-
-/// C1: shallow idle. On x86_64 this is `HLT`; on aarch64 `WFI`. The
-/// arch wrapper picks correctly based on `cfg`.
-fn cstate_c1_entry() {
-    // Reuse the arch HAL halt — until Stage 4 we don't have a deeper
-    // path to call. This deliberately matches `scheduler::run_until_empty`
-    // so swapping the scheduler over to `idle_loop` is mechanical.
-    narf_arch::halt_until_irq();
-}
-
-/// Tick proxy — number of "cycles" we treat as the deadline horizon
-/// for the Stage-3 idle governor. Real value comes from
-/// `time::next_deadline()` once the per-CPU "next deadline" cache lands
-/// in `time/` §3.2 (Stage 4). Until then we use a fixed budget so the
-/// selector picks C1 over C0 in tests but would refuse a hypothetical
-/// deeper state with multi-millisecond exit latency.
-const STAGE3_DEADLINE_BUDGET_US: u32 = 1_000;
-
-/// Wrapper around a chosen C-state `id`. The pluggable `IdleGovernor`
-/// returns one of these; the free `select_idle_state` then resolves it
-/// against the live `CSTATES` table to hand back a full `CState`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CStateIdx(pub u8);
-
-/// Pluggable idle-state selection policy. Mirrors `GovernorPolicy`
-/// exactly — `name()` for tooling, `select_idle_state` for the hot
-/// path. The installed impl reads the live C-state registry; the free
-/// `select_idle_state` below dispatches through whatever is in the
-/// `IDLE_GOVERNOR` slot.
-///
-/// `latency_budget_us` bounds the worst-case wake latency the caller
-/// is willing to tolerate (e.g. next-tick deadline). `predicted_idle_us`
-/// is the caller's best guess at how long the CPU will actually idle
-/// before the next wake event — the `MenuGovernor` keys off this to
-/// refuse states whose `target_residency_us` exceeds it.
-pub trait IdleGovernor: Send + Sync + 'static {
-    fn name(&self) -> &'static str;
-    fn select_idle_state(&self, latency_budget_us: u64, predicted_idle_us: u64) -> CStateIdx;
-}
-
-/// Stage-3 default. Scan ascending-by-id, keep the deepest state whose
-/// `exit_latency_us` is <= the latency budget. Ignores predicted idle
-/// time; this is the algorithm the inline `select_idle_state` used
-/// before the trait was extracted.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct LinearScan;
-impl IdleGovernor for LinearScan {
-    fn name(&self) -> &'static str {
-        "linear-scan"
-    }
-    fn select_idle_state(&self, latency_budget_us: u64, _predicted_idle_us: u64) -> CStateIdx {
-        let t = CSTATES.lock();
-        let mut best: u8 = 0;
-        for s in t.iter() {
-            if (s.exit_latency_us as u64) <= latency_budget_us {
-                best = s.id;
-            }
-        }
-        CStateIdx(best)
-    }
-}
-
-/// Tiny Linux-`menu`-style heuristic. If the predicted idle time is
-/// shorter than the shallowest non-C0 state's `target_residency_us`,
-/// pick C0; otherwise pick the deepest state whose `exit_latency_us`
-/// fits the budget AND whose `target_residency_us` is still shorter
-/// than the prediction. Distinct from `LinearScan` because the
-/// `target_residency_us` filter rejects "too deep for too short an
-/// idle" picks, which is the whole point of the real menu governor.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct MenuGovernor;
-impl IdleGovernor for MenuGovernor {
-    fn name(&self) -> &'static str {
-        "menu"
-    }
-    fn select_idle_state(&self, latency_budget_us: u64, predicted_idle_us: u64) -> CStateIdx {
-        let t = CSTATES.lock();
-        // Find the shallowest non-C0 state (smallest id > 0). If
-        // predicted idle is shorter than its target residency, the
-        // wake-up cost won't be paid back; stay in C0.
-        let shallow_target = t
-            .iter()
-            .filter(|s| s.id != 0)
-            .map(|s| s.target_residency_us as u64)
-            .min();
-        if let Some(min_residency) = shallow_target {
-            if predicted_idle_us < min_residency {
-                return CStateIdx(0);
-            }
-        } else {
-            // Only C0 registered; nothing else to pick.
-            return CStateIdx(0);
-        }
-        // Deepest state that (a) fits the latency budget and (b) has
-        // a target residency shorter than the prediction.
-        let mut best: u8 = 0;
-        for s in t.iter() {
-            if (s.exit_latency_us as u64) < latency_budget_us
-                && (s.target_residency_us as u64) < predicted_idle_us
-            {
-                best = s.id;
-            }
-        }
-        CStateIdx(best)
-    }
-}
-
-struct IdleGovernorEntry {
-    generation: Option<u64>,
-    governor: Arc<dyn IdleGovernor>,
-}
-
-/// Arc-backed live slot. A query clones the active governor under this short
-/// lock and invokes it only after releasing the lock.
-static IDLE_GOVERNOR: IrqSafeSpinLock<Option<IdleGovernorEntry>> = IrqSafeSpinLock::new(None);
-
-/// Idle-governor selection. Asks the installed `IdleGovernor` for an
-/// index and resolves it against the live C-state table. C0 always
-/// satisfies the constraint (latency = 0) and is the fallback if the
-/// returned index doesn't match a registered state.
-pub fn select_idle_state() -> Result<CState, PowerError> {
-    let governor = {
-        let slot = IDLE_GOVERNOR.lock();
-        slot.as_ref()
-            .ok_or(PowerError::GovernorMissing)?
-            .governor
-            .clone()
-    };
-    let latency_budget_us = STAGE3_DEADLINE_BUDGET_US as u64;
-    let predicted_idle_us = STAGE3_DEADLINE_BUDGET_US as u64;
-    let idx = governor.select_idle_state(latency_budget_us, predicted_idle_us);
-    let t = CSTATES.lock();
-    t.iter()
-        .find(|state| {
-            state.id == idx.0
-                && u64::from(state.exit_latency_us) <= latency_budget_us
-                && u64::from(state.target_residency_us) <= predicted_idle_us
-        })
-        .or_else(|| {
-            t.iter().find(|state| {
-                state.id == 0
-                    && u64::from(state.exit_latency_us) <= latency_budget_us
-                    && u64::from(state.target_residency_us) <= predicted_idle_us
-            })
-        })
-        .copied()
-        .ok_or(PowerError::NoMatchingState)
-}
-
-/// Stage-4 successor to `scheduler::halt_until_irq`. Walks the C-state
-/// table, picks the deepest fit, calls its `entry`. Today the scheduler
-/// still calls `halt_until_irq` directly; this entry point exists so a
-/// Stage-4 scheduler can swap in here without touching `arch/`. Logged
-/// in the spec under "Stage-4 deferral".
-pub fn idle_loop() {
-    if let Ok(state) = select_idle_state() {
-        (state.entry)();
-    } else {
-        // Last-resort: registry was empty. Fall back to the arch halt
-        // primitive so we don't busy-spin the boot CPU.
-        narf_arch::halt_until_irq();
     }
 }
 
@@ -870,90 +596,6 @@ pub fn select_freq(load_permille: u16) -> Result<FreqHint, PowerError> {
     slot.as_ref()
         .map(|g| g.select_freq(load_permille))
         .ok_or(PowerError::GovernorMissing)
-}
-
-/// Install an idle governor. Cap-gated on `Cap<IdleGov, Grant>`.
-/// Replaces the previous active idle governor; the displaced `Arc` is dropped
-/// after releasing the live-slot lock. Mirrors `install_governor` exactly.
-pub fn install_idle_governor<G: IdleGovernor>(
-    cap: &Cap<IdleGov, Grant>,
-    g: G,
-) -> Result<(), PowerError> {
-    cap.check_live()?;
-    let next = IdleGovernorEntry {
-        generation: None,
-        governor: Arc::new(g),
-    };
-    let old = {
-        let mut slot = IDLE_GOVERNOR.lock();
-        slot.replace(next)
-    };
-    drop(old);
-    Ok(())
-}
-
-/// Commit an Arc-backed struct-ops idle governor generation.
-///
-/// This is the entry a `struct_ops!` committer uses. The committer is generic
-/// over the cap marker (the macro makes it so), so it cannot present the
-/// concrete `Cap<IdleGov, Grant>` that [`install_idle_governor`] wants; the
-/// struct_ops layer has already proved the cap's kind matches the trait's
-/// declared `CapKind::IdleGovernor` before the committer runs. The runtime
-/// kind re-check here is the same belt-and-braces validation the generated
-/// installer applies, so a caller reaching this directly still cannot install
-/// under the wrong authority.
-pub fn install_idle_governor_struct_ops<M: CapType>(
-    cap: &Cap<M, Grant>,
-    generation: u64,
-    governor: Arc<dyn IdleGovernor>,
-) -> Result<(), PowerError> {
-    if M::KIND != CapKind::IdleGovernor || generation == 0 {
-        return Err(PowerError::AuthorityRevoked);
-    }
-    cap.check_live()?;
-    let next = IdleGovernorEntry {
-        generation: Some(generation),
-        governor,
-    };
-    let old = {
-        let mut slot = IDLE_GOVERNOR.lock();
-        slot.replace(next)
-    };
-    drop(old);
-    Ok(())
-}
-
-/// Detach `generation` if it is still live and restore the native default.
-/// A displaced older generation is a no-op.
-#[must_use]
-pub fn detach_idle_governor_struct_ops(generation: u64) -> bool {
-    let fallback = IdleGovernorEntry {
-        generation: None,
-        governor: Arc::new(LinearScan),
-    };
-    let (detached, old) = {
-        let mut slot = IDLE_GOVERNOR.lock();
-        if slot
-            .as_ref()
-            .is_some_and(|entry| entry.generation == Some(generation))
-        {
-            (true, slot.replace(fallback))
-        } else {
-            (false, None)
-        }
-    };
-    drop(old);
-    detached
-}
-
-/// Snapshot the active idle governor's name. Returns `None` if `init()`
-/// hasn't run yet. Mirrors `current_governor_name`.
-pub fn current_idle_governor_name() -> Option<&'static str> {
-    let governor = IDLE_GOVERNOR
-        .lock()
-        .as_ref()
-        .map(|entry| entry.governor.clone());
-    governor.map(|governor| governor.name())
 }
 
 // ── D-states (PCIe Power Management Capability §7.5.2) ─────────────
@@ -1174,45 +816,9 @@ pub fn bootstrap_thermal_authority() -> Cap<Thermal, Grant> {
 /// C1 against a freshly-minted Power authority and installs the
 /// `Performance` governor as the default.
 pub fn init() {
-    // Reset the C-state table to the defaults this `init` installs.
-    // Production calls `init` once at boot (table already empty); the
-    // in-kernel test harness may have left states registered by an
-    // earlier test, and `register_cstate`'s dup-check would otherwise
-    // preserve them and skew governor selection. Keeps `init` truly
-    // "safe to call again" → a defined default set.
-    CSTATES.lock().clear();
-    // C-state defaults. `register_cstate`'s duplicate check makes the
-    // call safe to repeat; we mint a fresh authority so a previously-
-    // revoked one from a prior test doesn't poison init.
-    let power = bootstrap_power_authority();
-    let _ = register_cstate(
-        &power,
-        CState {
-            id: 0,
-            exit_latency_us: 0,
-            power_draw_mw: 50_000,
-            target_residency_us: 0,
-            entry: cstate_c0_entry,
-        },
-    );
-    let _ = register_cstate(
-        &power,
-        CState {
-            id: 1,
-            exit_latency_us: 1,
-            power_draw_mw: 5_000,
-            target_residency_us: 2,
-            entry: cstate_c1_entry,
-        },
-    );
-
+    narf_power_core::init();
     // Default governor: Performance. Mint a governor authority just
     // for this install; the cap is dropped at the end of `init()`.
     let g = bootstrap_governor_authority();
     let _ = install_governor(&g, Performance);
-
-    // Default idle governor: LinearScan — preserves Stage-3
-    // pre-trait-extraction behaviour.
-    let ig = bootstrap_idle_governor_authority();
-    let _ = install_idle_governor(&ig, LinearScan);
 }

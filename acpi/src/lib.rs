@@ -635,6 +635,7 @@ static MADT_CPU_COUNT: AtomicU32 = AtomicU32::new(0);
 /// than the order; ordered storage simplifies the deterministic
 /// list used by `start_aps`.
 static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+static PROCESSOR_UIDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
 
 /// Sticky flag: set once `parse_madt` has run successfully.
 static MADT_PARSED: AtomicBool = AtomicBool::new(false);
@@ -738,6 +739,9 @@ pub unsafe fn parse_madt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     let mut count = 0u32;
     let mut cpu_count = 0u32;
 
+    for slot in PROCESSOR_UIDS.iter() {
+        slot.store(u32::MAX, Ordering::Release);
+    }
     for slot in APIC_IDS.iter() {
         slot.store(u32::MAX, Ordering::Release);
     }
@@ -760,6 +764,8 @@ pub unsafe fn parse_madt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
                 let flags = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
                 let enabled = flags & 1 != 0;
                 if enabled && (cpu_count as usize) < MAX_CPUS {
+                    PROCESSOR_UIDS[cpu_count as usize]
+                        .store(u32::from(entry[2]), Ordering::Release);
                     APIC_IDS[cpu_count as usize].store(apic_id, Ordering::Release);
                     cpu_count += 1;
                     count += 1;
@@ -808,6 +814,8 @@ pub unsafe fn parse_madt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
                 let flags = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
                 let enabled = flags & 1 != 0;
                 if enabled && (cpu_count as usize) < MAX_CPUS {
+                    let uid = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
+                    PROCESSOR_UIDS[cpu_count as usize].store(uid, Ordering::Release);
                     APIC_IDS[cpu_count as usize].store(apic_id, Ordering::Release);
                     cpu_count += 1;
                     count += 1;
@@ -851,6 +859,21 @@ pub fn apic_id_at(i: usize) -> Option<u32> {
         None
     } else {
         Some(v)
+    }
+}
+
+/// Resolve firmware processor identity without assuming ACPI UID equals APIC ID.
+/// Duplicate UIDs are ambiguous and are rejected.
+pub fn apic_id_for_processor_uid(uid: u32) -> Option<u32> {
+    let count = cpu_count_from_madt() as usize;
+    let mut matches = (0..count.min(MAX_CPUS))
+        .filter(|&i| PROCESSOR_UIDS[i].load(Ordering::Acquire) == uid)
+        .filter_map(apic_id_at);
+    let id = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(id)
     }
 }
 
@@ -1605,6 +1628,9 @@ pub fn __reset_for_test() {
     SRAT_PARSED.store(false, Ordering::Release);
     SCI_VECTOR.store(0, Ordering::Release);
     NODE_COUNT.store(0, Ordering::Release);
+    for c in PROCESSOR_UIDS.iter() {
+        c.store(u32::MAX, Ordering::Release);
+    }
     for c in APIC_IDS.iter() {
         c.store(u32::MAX, Ordering::Release);
     }
@@ -1800,6 +1826,8 @@ pub struct FadtPm {
     pub smi_cmd: u32,
     pub acpi_enable: u8,
     pub acpi_disable: u8,
+    /// Byte written to SMI_CMD to claim OS control of _CST (zero = no handshake).
+    pub cst_control: u8,
     pub pm1a_evt: u64,
     pub pm1b_evt: u64,
     pub pm1a_cnt: u64,
@@ -1909,6 +1937,7 @@ pub unsafe fn parse_fadt_pm(rsdp_phys: PhysAddr) -> Result<FadtPm, AcpiError> {
         smi_cmd,
         acpi_enable,
         acpi_disable,
+        cst_control: body[95],
         pm1a_evt: pick(x_pm1a_evt, legacy_pm1a_evt),
         pm1b_evt: pick(x_pm1b_evt, legacy_pm1b_evt),
         pm1a_cnt: pick(x_pm1a_cnt, legacy_pm1a_cnt),
