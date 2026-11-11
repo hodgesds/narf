@@ -119,6 +119,11 @@ pub mod ipv4 {
     /// connection (`tcp_sndbuf_expand`). Linux default 4 MiB.
     pub static TCP_WMEM_MAX: AtomicU32 = AtomicU32::new(4_194_304);
 
+    /// `net.ipv4.tcp_limit_output_bytes`: the ceiling on what one
+    /// connection may leave in a device queue (TCP Small Queues). Linux
+    /// default 4 MiB.
+    pub static TCP_LIMIT_OUTPUT_BYTES: AtomicU32 = AtomicU32::new(4 << 20);
+
     /// `net.ipv4.tcp_moderate_rcvbuf`. Linux default 1: grow the receive
     /// buffer to match what the application reads per round trip.
     pub static TCP_MODERATE_RCVBUF: AtomicU32 = AtomicU32::new(1);
@@ -293,6 +298,7 @@ pub mod ipv4 {
         TCP_RMEM_MAX.store(6_291_456, Ordering::Relaxed);
         TCP_WMEM_MAX.store(4_194_304, Ordering::Relaxed);
         TCP_MODERATE_RCVBUF.store(1, Ordering::Relaxed);
+        TCP_LIMIT_OUTPUT_BYTES.store(4 << 20, Ordering::Relaxed);
         SEND_REDIRECTS_ALL.store(1, Ordering::Relaxed);
         SEND_REDIRECTS_DEFAULT.store(1, Ordering::Relaxed);
         DEV_CONF.lock().clear();

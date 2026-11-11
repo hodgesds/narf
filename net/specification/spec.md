@@ -1157,6 +1157,41 @@ up to `net.ipv4.tcp_wmem[2]`. `SO_RCVBUF`/`SO_SNDBUF` lock the respective
 buffer, and `net.ipv4.tcp_moderate_rcvbuf=0` disables receive growth. Buffers
 never shrink. `tcp_info.rcv_space` reports the current receive limit.
 
+### Transmit backpressure (`txq`)
+
+`txq::TxBackpressure` is the driver contract (documented in
+`drivers/net/specification/spec.md` §3); `iface::set_tx_backpressure`
+installs it and `NetIfaceSnapshot::tx_backpressure` exposes it to the stack.
+On such an egress `tcp::core::pump_send` sends one segment at a time:
+
+- One caller owns a connection's transmit (`Tcb::xmit_owner`); a concurrent
+  or nested caller sets `xmit_again` and the owner runs once more.
+- Before a data segment is taken, `tcp_small_queue_check` is applied:
+  the connection's bytes still in the device (`txq::TxAccount`, charged to
+  each owned frame and returned when the frame is destroyed) may not exceed
+  `txq::tsq_limit` — the larger of two segments and about 1 ms at the pacing
+  rate (`cwnd / srtt`, 200% in slow start, 120% after), capped by
+  `net.ipv4.tcp_limit_output_bytes` (4 MiB) — unless at most one segment is
+  outstanding.
+- The segment is marked sent and offered with `try_xmit`. `Err(Busy)` undoes
+  the mark: `snd_nxt`, the send-buffer offset and `snd_high` return to the
+  segment's start, nothing enters the retransmit queue, no timer is armed and
+  the acknowledgement it carried stays owed. The connection registers on its
+  queue (`TxQueue::wait`) and stops. `Err(Dropped)` is treated as sent and
+  lost, as on an egress without the contract.
+- `TxQueue::run_wakeups` resumes waiters once per wake (`tcp::core::tx_resume`).
+  A connection that has waited `TX_WAIT_PROBE_NS` (10 ms) without a wake
+  offers its segment again from the TCP timer tick.
+
+Traffic that is not new TCP data uses the interface's ordinary send hook
+whether or not the queue is stopped. If the device refuses it there: a pure
+ACK stays owed and is retried from the delayed-ACK timer (`__tcp_send_ack`'s
+fallback); an RTO retransmission is retried after
+`min(RTO, TCP_RESOURCE_PROBE_INTERVAL)`; SYN, FIN and fast retransmissions
+are covered by their retransmission timers; RST and non-TCP frames are
+dropped and counted. Linux holds all of these in the qdisc instead; there is
+no qdisc here.
+
 IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,
 socket buffers, and errno path. Family-specific connected and listener
 indexes retain full-width addresses and include the network-namespace ID.

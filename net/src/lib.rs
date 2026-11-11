@@ -134,6 +134,7 @@ pub mod tls;
 pub mod tls_client;
 pub mod tls_x25519;
 pub mod tls_x509;
+pub mod txq;
 pub mod udp_gso;
 pub mod udp_sock;
 pub mod wireguard;
@@ -226,6 +227,9 @@ pub struct Frame {
     queue: u16,
     tx_meta: TxMeta,
     rx_meta: RxMeta,
+    /// The sending connection's share of its device-queue bytes
+    /// (`skb->destructor = tcp_wfree`): returned when the frame is destroyed.
+    tx_charge: Option<txq::TxCharge>,
 }
 
 // `Frame` carries a `DmaBuffer` whose backing storage is referenced
@@ -258,6 +262,7 @@ impl Frame {
             timing: TxTiming::default(),
             tx_meta: TxMeta::plain(),
             rx_meta: RxMeta::default(),
+            tx_charge: None,
         }
     }
 
@@ -289,7 +294,14 @@ impl Frame {
             timing: TxTiming::default(),
             tx_meta: TxMeta::plain(),
             rx_meta: RxMeta::default(),
+            tx_charge: None,
         }
+    }
+
+    /// Attach the charge released when this frame is destroyed.
+    #[inline]
+    pub fn set_tx_charge(&mut self, charge: txq::TxCharge) {
+        self.tx_charge = Some(charge);
     }
 
     #[inline]

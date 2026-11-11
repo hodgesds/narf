@@ -288,6 +288,9 @@ pub struct NetIfaceEntry {
     /// directly into a buffer from `tx_pools` and hands ownership here instead
     /// of copying a slice through [`send`]. `None` ⇒ the classic copy path.
     pub send_frame: Option<SendFrameFn>,
+    /// The driver's transmit-queue contract ([`crate::txq::TxBackpressure`]).
+    /// `None` ⇒ every transmit uses the plain hooks and a full ring drops.
+    pub tx_backpressure: Option<Arc<dyn crate::txq::TxBackpressure>>,
     send_frame_context: Option<(u64, SendFrameCtxFn)>,
     /// Queue-local recycling pools backing zero-copy TX (`Some` iff
     /// `send_frame` is). The stack chooses a pool once in [`tx_acquire`] and
@@ -988,6 +991,9 @@ fn register_inner(
         send_frame: old.as_ref().and_then(|old| old.send_frame),
         send_frame_context: old.as_ref().and_then(|old| old.send_frame_context),
         tx_pools: old.as_ref().and_then(|old| old.tx_pools.clone()),
+        // The contract object belongs to one driver instance; a re-probe
+        // installs its own.
+        tx_backpressure: None,
         tx_headroom: old.as_ref().map_or(0, |old| old.tx_headroom),
     });
     drop(g);
@@ -1543,9 +1549,62 @@ pub struct NetIfaceSnapshot {
     /// without re-entering the global interface registry lock per packet.
     tx_pools: Option<Arc<TxPoolSet>>,
     tx_headroom: usize,
+    tx_backpressure: Option<Arc<dyn crate::txq::TxBackpressure>>,
 }
 
 impl NetIfaceSnapshot {
+    /// The driver's transmit-queue contract, if it implements one.
+    pub fn tx_backpressure(&self) -> Option<&Arc<dyn crate::txq::TxBackpressure>> {
+        self.tx_backpressure.as_ref()
+    }
+
+    /// Offer an owned frame to queue `q` of a backpressure-aware driver.
+    /// Taps see it first, as in `dev_hard_start_xmit`; a frame refused as
+    /// busy is offered again later and is tapped again, as Linux's requeue
+    /// is. Only an accepted or dropped frame is counted.
+    pub(crate) fn try_xmit_frame(
+        &self,
+        driver: &dyn crate::txq::TxBackpressure,
+        q: u16,
+        frame: crate::Frame,
+        meta: crate::TxMeta,
+    ) -> Result<(), crate::txq::TxRefusal> {
+        if self.link_layer != LinkLayer::Ethernet {
+            return Err(crate::txq::TxRefusal::Dropped);
+        }
+        let len = frame.len() as usize;
+        crate::raw_sock::dev_queue_xmit_nit(
+            self,
+            frame.payload(),
+            crate::raw_sock::tx_protocol(frame.payload()),
+            None,
+        );
+        let result = driver.try_xmit(q, frame, meta);
+        if result != Err(crate::txq::TxRefusal::Busy) {
+            record_tx_result(&self.name, len, result.is_ok());
+        }
+        result
+    }
+
+    /// As [`Self::try_xmit_frame`] for a frame the driver copies.
+    pub(crate) fn try_xmit_copy(
+        &self,
+        driver: &dyn crate::txq::TxBackpressure,
+        q: u16,
+        frame: &[u8],
+        meta: crate::TxMeta,
+    ) -> Result<(), crate::txq::TxRefusal> {
+        if self.link_layer != LinkLayer::Ethernet {
+            return Err(crate::txq::TxRefusal::Dropped);
+        }
+        crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
+        let result = driver.try_xmit_copy(q, frame, meta);
+        if result != Err(crate::txq::TxRefusal::Busy) {
+            record_tx_result(&self.name, frame.len(), result.is_ok());
+        }
+        result
+    }
+
     /// Whether this interface accepts zero-copy (owned-`Frame`) transmits. When
     /// false the stack builds into a `Vec` and uses [`Self::xmit_meta`].
     pub fn zero_copy_tx(&self) -> bool {
@@ -1744,6 +1803,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         send_frame_context: entry.send_frame_context,
         tx_pools: entry.tx_pools.clone(),
         tx_headroom: entry.tx_headroom,
+        tx_backpressure: entry.tx_backpressure.clone(),
     }
 }
 
@@ -1765,6 +1825,21 @@ fn with_dev<R>(net_ns_id: u64, ifindex: u32, f: impl FnOnce(&mut NetIfaceEntry) 
         .iter_mut()
         .find(|entry| entry.net_ns_id == net_ns_id && entry.ifindex == ifindex)?;
     Some(f(entry))
+}
+
+/// Install a driver's transmit-queue contract after registration. From then
+/// on TCP offers its data through [`crate::txq::TxBackpressure::try_xmit`]
+/// and waits when a queue is stopped instead of losing the segment.
+pub fn set_tx_backpressure(name: &str, driver: Arc<dyn crate::txq::TxBackpressure>) -> bool {
+    let mut g = IFACES.lock();
+    let Some(e) = g
+        .as_mut()
+        .and_then(|v| v.iter_mut().find(|e| e.name == name))
+    else {
+        return false;
+    };
+    e.tx_backpressure = Some(driver);
+    true
 }
 
 /// Install a driver's MTU, MAC and receive-filter control after registration.
@@ -2489,6 +2564,7 @@ static NATIVE_RX_HANDLER: AtomicUsize = AtomicUsize::new(0);
 pub fn install_native_rx_handler(h: fn(&str, &mut [u8], Option<u64>)) {
     NATIVE_RX_HANDLER.store(h as usize, Ordering::Release);
 }
+
 /// Deliver a packet whose native XDP action was PASS. The native handler
 /// performs software claims and protocol dispatch without executing XDP twice.
 pub fn on_native_rx_frame(name: &str, frame: &mut [u8]) {

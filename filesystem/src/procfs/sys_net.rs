@@ -112,6 +112,7 @@ static TCP_RMEM_MIN: AtomicU32 = AtomicU32::new(4096);
 static TCP_RMEM_DEFAULT: AtomicU32 = AtomicU32::new(131072);
 // The maxima bound the TCP stack's buffer autotuning, so they live where
 // `narf-net` can read them.
+pub use narf_lib::sysctl::ipv4::TCP_LIMIT_OUTPUT_BYTES;
 pub use narf_lib::sysctl::ipv4::TCP_MODERATE_RCVBUF;
 pub use narf_lib::sysctl::ipv4::TCP_RMEM_MAX;
 pub use narf_lib::sysctl::ipv4::TCP_WMEM_MAX;
@@ -527,6 +528,12 @@ pub fn register_all() {
         path: "net/ipv4/tcp_mtu_probing",
         read: || read_atomic(&TCP_MTU_PROBING),
         write: Some(|s| write_atomic(&TCP_MTU_PROBING, s)),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/ipv4/tcp_limit_output_bytes",
+        read: || read_atomic(&TCP_LIMIT_OUTPUT_BYTES),
+        write: Some(|s| write_atomic(&TCP_LIMIT_OUTPUT_BYTES, s)),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {

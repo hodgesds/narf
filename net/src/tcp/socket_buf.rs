@@ -158,6 +158,12 @@ impl SendBuf {
         self.sent_offset = (self.sent_offset + n).min(self.bytes.len());
     }
 
+    /// Take back `n` bytes just marked sent that the device refused: they
+    /// are unsent again and the next segment starts with them.
+    pub fn unmark_sent(&mut self, n: usize) {
+        self.sent_offset = self.sent_offset.saturating_sub(n);
+    }
+
     /// Process a cumulative ACK that ack'd through `ack_seq`.
     /// Releases ack'd bytes from the buffer and slides
     /// `unacked_head_seq` forward.
