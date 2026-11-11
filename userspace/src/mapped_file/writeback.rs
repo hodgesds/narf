@@ -190,10 +190,35 @@ const FILTER_BUCKETS: usize = 1024;
 /// the cache lock.
 static FILTER: [AtomicU32; FILTER_BUCKETS] = [const { AtomicU32::new(0) }; FILTER_BUCKETS];
 
-fn filter_bucket(identity: SharedFileIdentity) -> &'static AtomicU32 {
-    let mixed = (identity.anchor as u64 ^ identity.device.rotate_left(32))
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+/// Keyed on the backing anchor alone, so a caller can ask before computing
+/// the full identity: that needs `inode_attrs()`, which on btrfs takes the
+/// inode's lock and copies it — per `read(2)`, for every file read.
+fn anchor_bucket(anchor: usize) -> &'static AtomicU32 {
+    let mixed = (anchor as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     &FILTER[(mixed >> 54) as usize % FILTER_BUCKETS]
+}
+
+fn filter_bucket(identity: SharedFileIdentity) -> &'static AtomicU32 {
+    anchor_bucket(identity.anchor)
+}
+
+/// Calls of [`entry_identity`] that got past the lock-free checks and
+/// computed a file's full identity. Kernel tests read it.
+pub(super) static IDENTITY_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+
+/// `ops`'s identity, if its file may have a cache entry. For a file that
+/// has none — nearly every file — this is two atomic loads and a pointer
+/// read, and nothing else: no lock, no `inode_attrs()`, no allocation.
+fn entry_identity(ops: &dyn FileOps) -> Option<SharedFileIdentity> {
+    if FILE_ENTRIES.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    if anchor_bucket(ops.mmap_backing_identity()).load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    IDENTITY_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    let identity = shared_file_identity(ops);
+    may_have_entry(identity).then_some(identity)
 }
 
 /// Called with the cache lock held, when an entry is inserted.
@@ -219,7 +244,7 @@ pub(super) struct CachedFile {
     /// Held for one batch (pin → write → mark clean), and around a size
     /// change and the invalidation that follows it. Linux splits this
     /// between the folio lock, `PG_writeback` and `invalidate_lock`.
-    lock: narf_lib::mutex::Mutex<()>,
+    lock: FairLock,
     /// A background write failure nobody has been told about. Reported once,
     /// by the next `fsync`/`msync` of the file (Linux `errseq_t` in
     /// `address_space::wb_err`, without its per-open cursor: here the first
@@ -234,7 +259,7 @@ impl CachedFile {
     pub(super) fn new(identity: SharedFileIdentity) -> Arc<Self> {
         Arc::new(Self {
             identity,
-            lock: narf_lib::mutex::Mutex::new(()),
+            lock: FairLock::new(),
             error: IrqSafeSpinLock::new(None),
             failed_passes: AtomicU32::new(0),
             skip_passes: AtomicU32::new(0),
@@ -251,6 +276,148 @@ impl CachedFile {
 
     fn has_error(&self) -> bool {
         self.error.lock().is_some()
+    }
+}
+
+/// The per-file writeback lock: a mutex that hands itself to the waiter at
+/// the head of its queue on release, instead of freeing itself for whoever
+/// polls first (`narf_lib::mutex::Mutex` does the latter, and a woken
+/// waiter that loses the race goes to the back of the queue). With sixteen
+/// threads dirtying a mapping and writing the file, an `msync` that queues
+/// for each of its batches and an `ftruncate` that queues once were passed
+/// over again and again: a soak saw `msync` blocked for over 200 s. Here a
+/// waiter is served in arrival order, so a sync or a size change waits for
+/// at most the holders queued before it — Linux's `filemap_write_and_wait`
+/// likewise never waits on writers that arrive after it.
+pub(super) struct FairLock {
+    state: IrqSafeSpinLock<FairState>,
+}
+
+struct FairState {
+    held: bool,
+    /// Waiters in arrival order: ticket and the waker to call.
+    queue: alloc::collections::VecDeque<(u64, Option<Waker>)>,
+    /// Ticket the lock was handed to and not yet claimed, if any.
+    granted: Option<u64>,
+    next_ticket: u64,
+}
+
+impl FairLock {
+    fn new() -> Self {
+        Self {
+            state: IrqSafeSpinLock::new(FairState {
+                held: false,
+                queue: alloc::collections::VecDeque::new(),
+                granted: None,
+                next_ticket: 0,
+            }),
+        }
+    }
+
+    pub(super) fn lock(&self) -> FairLockFuture<'_> {
+        FairLockFuture {
+            lock: self,
+            ticket: None,
+        }
+    }
+
+    /// Only when free and nobody is queued: never jumps the queue.
+    #[cfg(feature = "kernel-test")]
+    pub(super) fn try_lock(&self) -> Option<FairGuard<'_>> {
+        let mut state = self.state.lock();
+        if state.held || !state.queue.is_empty() || state.granted.is_some() {
+            return None;
+        }
+        state.held = true;
+        Some(FairGuard { lock: self })
+    }
+
+    /// Hand the lock to the next waiter, or free it. Called with `state`
+    /// locked; returns the waker to call once it is released.
+    fn pass_on(state: &mut FairState) -> Option<Waker> {
+        match state.queue.pop_front() {
+            Some((ticket, waker)) => {
+                state.granted = Some(ticket);
+                waker
+            }
+            None => {
+                state.held = false;
+                None
+            }
+        }
+    }
+}
+
+pub(super) struct FairLockFuture<'a> {
+    lock: &'a FairLock,
+    ticket: Option<u64>,
+}
+
+impl<'a> Future for FairLockFuture<'a> {
+    type Output = FairGuard<'a>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<FairGuard<'a>> {
+        let this = self.get_mut();
+        let mut state = this.lock.state.lock();
+        match this.ticket {
+            None => {
+                if !state.held && state.queue.is_empty() && state.granted.is_none() {
+                    state.held = true;
+                    return Poll::Ready(FairGuard { lock: this.lock });
+                }
+                let ticket = state.next_ticket;
+                state.next_ticket += 1;
+                state.queue.push_back((ticket, Some(cx.waker().clone())));
+                this.ticket = Some(ticket);
+                Poll::Pending
+            }
+            Some(ticket) => {
+                if state.granted == Some(ticket) {
+                    state.granted = None;
+                    this.ticket = None;
+                    return Poll::Ready(FairGuard { lock: this.lock });
+                }
+                if let Some(entry) = state.queue.iter_mut().find(|(t, _)| *t == ticket) {
+                    entry.1 = Some(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for FairLockFuture<'_> {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket else {
+            return;
+        };
+        let wake = {
+            let mut state = self.lock.state.lock();
+            if state.granted == Some(ticket) {
+                // Handed to us and never claimed: pass it on.
+                state.granted = None;
+                FairLock::pass_on(&mut state)
+            } else {
+                state.queue.retain(|(t, _)| *t != ticket);
+                None
+            }
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+    }
+}
+
+pub(super) struct FairGuard<'a> {
+    lock: &'a FairLock,
+}
+
+impl Drop for FairGuard<'_> {
+    fn drop(&mut self) {
+        let wake = FairLock::pass_on(&mut self.lock.state.lock());
+        if let Some(waker) = wake {
+            waker.wake();
+        }
     }
 }
 
@@ -835,6 +1002,12 @@ struct Progress {
 /// Write the dirty cached pages of `file` in `[from, end)` that `select`
 /// takes, one batch at a time.
 ///
+/// One forward pass by file offset: every page in the range is looked at
+/// once and written at most once per call, so a call's work is bounded by
+/// the range, however fast other threads dirty it — a page stored to after
+/// the pass went by is left for the next writeback, as Linux's
+/// `tag_pages_for_writeback` leaves a folio redirtied after tagging.
+///
 /// `locked` says the caller already holds the file's writeback lock (a size
 /// change flushing before it shifts the file's contents); otherwise each
 /// batch takes and releases it. `budget` bounds the cache entries stepped
@@ -1008,21 +1181,18 @@ pub(crate) async fn write_and_note(
     offset: u64,
     bytes: Vec<u8>,
 ) -> (Result<usize, FsError>, Vec<u8>) {
-    let entry = if FILE_ENTRIES.load(Ordering::Acquire) != 0
-        && may_have_entry(shared_file_identity(ops.as_ref()))
-    {
-        lookup(shared_file_identity(ops.as_ref())).map(|(file, _)| file)
-    } else {
-        None
-    };
+    let entry = entry_identity(ops.as_ref())
+        .and_then(lookup)
+        .map(|(file, _)| file);
     let guard = match entry.as_ref() {
         Some(file) => Some(file.lock.lock().await),
         None => None,
     };
     // A write that starts past EOF extends the file over bytes a mapping
     // may have stored past the old EOF: those must read as zeros
-    // (`pagecache_isize_extended`).
-    if !ops.is_stream() {
+    // (`pagecache_isize_extended`). Only a file with cached pages can have
+    // such bytes.
+    if guard.is_some() && !ops.is_stream() {
         let size = ops.stat().size;
         if offset > size {
             discard_stores_past_eof(ops.as_ref(), size, offset);
@@ -1053,6 +1223,7 @@ pub(crate) async fn write_and_note(
 /// time, if any (a lazy mapping takes its pages one fault at a time, and
 /// the fault marks them): stores can reach them without another fault.
 pub(crate) fn writable_mapping(ops: &Arc<dyn FileOps>, pages: &[PhysAddr]) {
+    register_shrinker();
     if pages.iter().any(|phys| phys.raw() != 0) {
         let mut cache = SHARED_FILE_PAGES.lock();
         for phys in pages {
@@ -1081,10 +1252,9 @@ pub(super) fn sync_file(ops: &Arc<dyn FileOps>, from: u64, end: u64) -> Result<(
     if FILE_ENTRIES.load(Ordering::Acquire) == 0 {
         return Ok(());
     }
-    let identity = shared_file_identity(ops.as_ref());
-    if !may_have_entry(identity) {
+    let Some(identity) = entry_identity(ops.as_ref()) else {
         return Ok(());
-    }
+    };
     let Some((file, writer)) = lookup(identity) else {
         return Ok(());
     };
@@ -1125,39 +1295,92 @@ pub(super) fn sync_file(ops: &Arc<dyn FileOps>, from: u64, end: u64) -> Result<(
 /// writeback, and was last vouched for under an older generation of the
 /// file (or under none), run writeback over the range first.
 ///
-/// Such a page is one of two things, and only writeback can tell which
-/// without comparing its bytes here: holding a store that never reached
-/// the file — then it must be written, so the fresh read that follows
-/// includes it — or simply not looked at yet, and stale now that the file
-/// has changed behind it — then it must not be handed to the new mapping.
-/// Writeback settles both: it writes the first and marks the second clean,
-/// after which the generation rules for clean pages apply as ever. Without
-/// this the publication would adopt the page either way, as it rightly does
-/// for a page whose generation is current.
+/// Such a page is one of two things: holding a store that never reached
+/// the file — then it stays dirty and is adopted, its data winning over the
+/// file's as a dirty folio does on Linux — or simply not looked at yet, and
+/// stale now that the file has changed behind it — then it is marked clean
+/// here, and the generation rule for clean pages hands the new mapping a
+/// fresh read instead. Without this the publication would adopt the page
+/// either way, as it rightly does for a page whose generation is current.
 pub(crate) fn settle_unverified(ops: &Arc<dyn FileOps>, offset: u64, count: usize) {
     if IDLE_DIRTY_PAGES.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let identity = shared_file_identity(ops.as_ref());
-    if !may_have_entry(identity) {
+    let Some(identity) = entry_identity(ops.as_ref()) else {
         return;
-    }
+    };
     let generation = ops.mmap_cache_generation();
     let first = offset & !4095;
     let end = first.saturating_add(count as u64 * 4096);
-    let unsettled = {
-        let pages = SHARED_FILE_PAGES.lock();
-        pages
-            .idle_dirty
-            .range(key(identity, first)..)
-            .take_while(|listed| listed.file == identity && listed.offset < end)
-            .filter_map(|listed| pages.by_file.get(listed))
-            .filter_map(|phys| pages.by_phys.get(phys))
-            .any(|page| page.cache_generation.is_none() || page.cache_generation != generation)
-    };
-    if unsettled {
-        // A failure leaves the page listed, and it is adopted as before.
-        let _ = sync_file(ops, first, end);
+    // This runs on a page fault and in `mmap`: it compares, it never
+    // writes. A filesystem write from here would run the whole write path
+    // — on btrfs a copy-on-write extent update — on top of whatever the
+    // faulting task's stack already holds. Pin the stale pages, compare
+    // each with its clean image with no lock held, and settle the ones
+    // that turn out clean; a page that really holds a store stays dirty
+    // and is adopted, as before.
+    let mut pinned: Vec<(u64, Arc<Vec<u8>>)> = Vec::new();
+    {
+        let mut pages = SHARED_FILE_PAGES.lock();
+        let SharedFilePages {
+            by_phys,
+            by_file,
+            idle_dirty,
+            ..
+        } = &mut *pages;
+        for listed in idle_dirty.range(key(identity, first)..) {
+            if listed.file != identity || listed.offset >= end {
+                break;
+            }
+            let Some(page) = by_file.get(listed).and_then(|phys| by_phys.get_mut(phys)) else {
+                continue;
+            };
+            let stale = page.cache_generation.is_none() || page.cache_generation != generation;
+            if !stale || page.wb_pins != 0 || pinned.try_reserve(1).is_err() {
+                continue;
+            }
+            page.wb_pins += 1;
+            page.redirtied = false;
+            pinned.push((page.phys.raw(), Arc::clone(&page.clean)));
+        }
+    }
+    if pinned.is_empty() {
+        return;
+    }
+    let clean: Vec<bool> = pinned
+        .iter()
+        .map(|(phys, image)| {
+            PAGE_COMPARES.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: pinned until the release below; identity-mapped.
+            let live = unsafe {
+                core::slice::from_raw_parts(PhysAddr::new(*phys).kernel_ptr::<u8>(), 4096)
+            };
+            live == image.as_slice()
+        })
+        .collect();
+    let mut free: Vec<PhysAddr> = Vec::with_capacity(pinned.len());
+    {
+        let mut pages = SHARED_FILE_PAGES.lock();
+        let oldest_in_flight = IN_FLIGHT.lock().keys().next().copied();
+        for ((phys, _), clean) in pinned.iter().zip(&clean) {
+            let (cached, release) = pages.unpin(*phys);
+            free.extend(release);
+            if !cached || !clean {
+                continue;
+            }
+            let Some(page) = pages.by_phys.get_mut(phys) else {
+                continue;
+            };
+            let idle = page.mappings == 0 && page.pending == 0;
+            if idle && !page.redirtied && settle_allowed(oldest_in_flight, page.wb_seq) {
+                page.maybe_dirty = false;
+                pages.clear_idle_dirty(*phys);
+            }
+        }
+    }
+    drop(pinned);
+    for frame in free {
+        narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
     }
 }
 
@@ -1175,10 +1398,9 @@ pub(crate) fn flush_file_for_read(ops: &Arc<dyn FileOps>) {
     if FILE_ENTRIES.load(Ordering::Acquire) == 0 {
         return;
     }
-    let identity = shared_file_identity(ops.as_ref());
-    if !may_have_entry(identity) {
+    let Some(identity) = entry_identity(ops.as_ref()) else {
         return;
-    }
+    };
     let Some((file, writer)) = lookup(identity) else {
         return;
     };
@@ -1193,6 +1415,9 @@ pub(crate) fn flush_file_for_read(ops: &Arc<dyn FileOps>) {
         file.record_error(error);
     }
 }
+
+/// Cache-lock takes by [`overlay_dirty`]. Kernel tests read it.
+pub(super) static OVERLAY_LOCKS: AtomicU64 = AtomicU64::new(0);
 
 /// Make the bytes a kernel read just fetched from `ops` at `offset` agree
 /// with the file's cached pages: wherever a cached page differs from its
@@ -1214,16 +1439,16 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8],
     if buf.is_empty() || FILE_ENTRIES.load(Ordering::Acquire) == 0 {
         return;
     }
-    let identity = shared_file_identity(ops.as_ref());
-    if !may_have_entry(identity) {
+    let Some(identity) = entry_identity(ops.as_ref()) else {
         return;
-    }
+    };
     let end = offset.saturating_add(buf.len() as u64);
     let mut cursor = offset & !4095;
     // A few pages per hold of the cache lock; each is at most one 4 KiB
     // compare and a copy of the bytes that differ.
     const PAGES_PER_HOLD: usize = 4;
     loop {
+        OVERLAY_LOCKS.fetch_add(1, Ordering::Relaxed);
         let pages = SHARED_FILE_PAGES.lock();
         if !pages.files.contains_key(&identity) {
             return;
@@ -1288,7 +1513,9 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8],
 /// Returns where to continue.
 fn invalidate_step(identity: SharedFileIdentity, from: u64, end: u64) -> Option<u64> {
     let mut free: Vec<PhysAddr> = Vec::with_capacity(BATCH_PAGES);
-    let mut targets: [u64; BATCH_PAGES] = [0; BATCH_PAGES];
+    // On the heap: a 2 KiB array here sat in the frame of every truncate
+    // and size change, on top of the filesystem's own stack use.
+    let mut targets: Vec<u64> = Vec::with_capacity(BATCH_PAGES);
     let mut count = 0usize;
     let mut resume = None;
     {
@@ -1301,7 +1528,7 @@ fn invalidate_step(identity: SharedFileIdentity, from: u64, end: u64) -> Option<
                 resume = Some(cached.offset);
                 break;
             }
-            targets[count] = *phys;
+            targets.push(*phys);
             count += 1;
         }
         for phys in &targets[..count] {
@@ -1369,10 +1596,9 @@ pub(super) fn invalidate_beyond_eof(file: &dyn FileOps) {
     if FILE_ENTRIES.load(Ordering::Acquire) == 0 {
         return;
     }
-    let identity = shared_file_identity(file);
-    if !may_have_entry(identity) {
+    let Some(identity) = entry_identity(file) else {
         return;
-    }
+    };
     invalidate_past(identity, file.stat().size);
 }
 
@@ -1391,10 +1617,9 @@ pub(crate) fn discard_stores_past_eof(ops: &dyn FileOps, old_size: u64, new_end:
     if in_page == 0 || new_end <= old_size || FILE_ENTRIES.load(Ordering::Acquire) == 0 {
         return;
     }
-    let identity = shared_file_identity(ops);
-    if !may_have_entry(identity) {
+    let Some(identity) = entry_identity(ops) else {
         return;
-    }
+    };
     let end = (new_end - (old_size - in_page as u64)).min(4096) as usize;
     let mut pages = SHARED_FILE_PAGES.lock();
     let Some(phys) = pages
@@ -1506,6 +1731,12 @@ pub(super) fn slot_is_unused(slot: &FileSlot) -> bool {
 /// copied a page before the truncate could write it afterwards: the data
 /// would be back, and the file as long as before.
 pub(crate) fn size_change_serialized<R>(ops: &Arc<dyn FileOps>, change: impl FnOnce() -> R) -> R {
+    // A file with no cache entry has no page for writeback to write and none
+    // to drop: every `open(O_TRUNC)` of an unmapped file — every shell
+    // redirection — takes no lock and allocates nothing here.
+    if entry_identity(ops.as_ref()).is_none() {
+        return change();
+    }
     let (file, _) = acquire(ops);
     // `None` only where there is nothing to park on and the lock never
     // came free; the operation must still run.
@@ -1550,6 +1781,9 @@ pub(crate) fn fallocate_serialized<R>(
     change: impl FnOnce() -> R,
     succeeded: impl FnOnce(&R) -> bool,
 ) -> R {
+    if entry_identity(ops.as_ref()).is_none() {
+        return change();
+    }
     let (file, writer) = acquire(ops);
     let guard = drive(file.lock.lock());
     let shifts = mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE) != 0;
@@ -2103,14 +2337,76 @@ fn start_flusher() {
     narf_scheduler::spawn_with_spec(flusher_main(FlusherRunning), spec);
 }
 
+/// Pages of memory one cached page costs: its frame and its clean image.
+const PAGES_PER_CACHED_PAGE: usize = 2;
+
+/// The reclaimer's view of the cache: unmapped clean pages kept for reuse
+/// (frame plus clean image each). Dirty pages are not reclaimable — they
+/// are the only copy of their data — and the flusher is kicked instead.
+fn shrink_count() -> usize {
+    SHARED_FILE_PAGES
+        .try_lock()
+        .map_or(0, |pages| pages.idle_clean.len() * PAGES_PER_CACHED_PAGE)
+}
+
+/// Drop up to `nr_pages` pages' worth of unmapped clean pages, oldest
+/// listed first. Linux reclaims clean page cache the same way
+/// (`shrink_folio_list` on the inactive list). Never waits: a cache lock
+/// already held — reclaim run under it — frees nothing this time.
+fn shrink_scan(nr_pages: usize) -> usize {
+    if IDLE_DIRTY_PAGES.load(Ordering::Relaxed) != 0 {
+        kick();
+    }
+    let want = nr_pages / PAGES_PER_CACHED_PAGE;
+    if want == 0 {
+        return 0;
+    }
+    let mut freed = 0usize;
+    // One frame at a time, outside the lock: no allocation on this path.
+    while freed < want {
+        let frame = {
+            let Some(mut pages) = SHARED_FILE_PAGES.try_lock() else {
+                break;
+            };
+            let Some(victim) = pages.idle_clean.iter().next().copied() else {
+                break;
+            };
+            EVICTIONS.fetch_add(1, Ordering::Relaxed);
+            pages.retire_phys(victim)
+        };
+        // The clean image went with the page: freed whether or not the
+        // frame could be (a frame a batch still holds is freed by it).
+        freed += 1;
+        if let Some(frame) = frame {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
+        }
+    }
+    freed * PAGES_PER_CACHED_PAGE
+}
+
+/// Register the cache with the reclaimer, once.
+pub(crate) fn register_shrinker() {
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    if REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+        name: "shared-file-pages",
+        count: shrink_count,
+        scan: shrink_scan,
+    });
+}
+
 static DIRTY_LIMIT: AtomicUsize = AtomicUsize::new(0);
 
-/// Unmapped dirty pages allowed before a dirtier is made to wait: an eighth
-/// of memory (Linux `dirty_ratio` is a fifth of what it calls dirtyable).
+/// Unmapped dirty pages allowed before a dirtier is made to wait. Each one
+/// costs two pages — its frame and its 4 KiB clean image on the kernel heap
+/// — so the bound is a sixteenth of memory in pages, an eighth in bytes
+/// (Linux `dirty_ratio` is a fifth of what it calls dirtyable).
 fn dirty_limit() -> usize {
     match DIRTY_LIMIT.load(Ordering::Relaxed) {
         0 => {
-            let limit = (narf_memory::frame::stats().total / 8).max(256);
+            let limit = (narf_memory::frame::stats().total / 16).max(256);
             DIRTY_LIMIT.store(limit, Ordering::Relaxed);
             limit
         }

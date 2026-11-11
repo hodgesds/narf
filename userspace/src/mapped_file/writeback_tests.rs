@@ -1854,3 +1854,251 @@ kernel_test_in!(
     "userspace/writeback",
     smoke_syncfs_reports_and_unmount_forgets_the_device
 );
+
+/// What `read(2)` of a file with no cached page costs the cache: nothing
+/// past one lock-free check per call. A 64 MiB file is read in 1 MiB calls
+/// through the same helper `read`/`pread64`/`readv` use, while another file
+/// does have a cache entry (so the "no entries at all" shortcut does not
+/// apply). No call may take the cache lock or compute the file's full
+/// identity (`inode_attrs()`, an inode lock and copy on btrfs).
+/// A 64 MiB file that is the byte 0x5A throughout, held nowhere: the kernel
+/// heap has no room for 64 MiB in one piece.
+struct PatternFile;
+
+impl FileOps for PatternFile {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let left = (64u64 << 20).saturating_sub(offset) as usize;
+            let n = left.min(buf.len());
+            buf[..n].fill(0x5A);
+            Ok(n)
+        })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async { Err(FsError::ReadOnly) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 64 << 20,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+}
+
+fn smoke_read_of_an_unmapped_file_costs_the_cache_nothing() -> TestResult {
+    const LEN: usize = 64 << 20;
+    const CALL: usize = 1 << 20;
+    // Another file with a cache entry.
+    let mut mapped = Fixture::new(1);
+    if mapped.map(0, 1).is_none() {
+        return TestResult::Fail("could not map the other test file");
+    }
+    let file: Arc<dyn FileOps> = Arc::new(PatternFile);
+    if anchor_bucket(file.mmap_backing_identity()).load(Ordering::Acquire) != 0 {
+        // The lock-free filter is shared by hash; this file landed in a
+        // bucket another entry uses, which a later run will not repeat.
+        return TestResult::Skip("the unmapped file's filter bucket is in use");
+    }
+    let locks = OVERLAY_LOCKS.load(Ordering::Relaxed);
+    let lookups = IDENTITY_LOOKUPS.load(Ordering::Relaxed);
+    let mut staging = vec![0u8; CALL];
+    let mut offset = 0usize;
+    while offset < LEN {
+        match crate::killable_wait::read(
+            &file,
+            offset as u64,
+            &mut staging,
+            CALL,
+            narf_filesystem::ReadOptions::default(),
+        ) {
+            Ok(Some(Ok(n))) if n == CALL => offset += n,
+            _ => return TestResult::Fail("a 1 MiB read of the unmapped file failed"),
+        }
+    }
+    let locks = OVERLAY_LOCKS.load(Ordering::Relaxed) - locks;
+    let lookups = IDENTITY_LOOKUPS.load(Ordering::Relaxed) - lookups;
+    if staging.iter().any(|byte| *byte != 0x5A) {
+        return TestResult::Fail("the reads returned the wrong bytes");
+    }
+    if locks != 0 {
+        return TestResult::Fail("reading an unmapped file took the cache lock");
+    }
+    if lookups != 0 {
+        return TestResult::Fail("reading an unmapped file computed its full identity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_read_of_an_unmapped_file_costs_the_cache_nothing
+);
+
+static STORM_PAGES: IrqSafeSpinLock<Vec<PhysAddr>> = IrqSafeSpinLock::new(Vec::new());
+static STORM_STORES: AtomicU64 = AtomicU64::new(0);
+
+/// Other threads dirtying the mapping as fast as they can: every page gets a
+/// new store each time the filesystem is entered.
+fn storm() {
+    let round = STORM_STORES.fetch_add(1, Ordering::AcqRel) + 1;
+    for phys in STORM_PAGES.lock().iter() {
+        store_bytes(*phys, 1024, &round.to_le_bytes());
+    }
+}
+
+/// `msync(MS_SYNC)` while other threads keep dirtying every page of the
+/// mapping: it returns, having written each page at most once — never
+/// chasing pages redirtied behind it — and every byte stored before it
+/// started is on the file.
+fn smoke_msync_under_a_store_storm_returns() -> TestResult {
+    const PAGES: usize = 3 * BATCH_PAGES / 2;
+    let mut fixture = Fixture::new(PAGES);
+    let Some(pages) = fixture.map(0, PAGES) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    for (index, phys) in pages.iter().enumerate() {
+        store_bytes(*phys, 0, &(index as u64 + 1).to_le_bytes());
+    }
+    *STORM_PAGES.lock() = pages.clone();
+    fixture
+        .store
+        .on_write
+        .store(storm as usize, Ordering::Release);
+    let synced = super::super::flush_current_file(fixture.ops());
+    fixture.store.on_write.store(0, Ordering::Release);
+    STORM_PAGES.lock().clear();
+    if synced.is_err() {
+        return TestResult::Fail("msync under a store storm failed");
+    }
+    let written: usize = fixture.log().iter().map(|(_, len)| len / 4096).sum();
+    if written > PAGES {
+        return TestResult::Fail("msync wrote a page more than once, chasing redirtied pages");
+    }
+    for index in 0..PAGES {
+        if fixture.file_bytes(index * 4096, 8) != (index as u64 + 1).to_le_bytes() {
+            return TestResult::Fail("a store made before msync did not reach the file");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_msync_under_a_store_storm_returns
+);
+
+/// The per-file lock is handed over in arrival order: a waiter that queued
+/// first gets it when it is released, even if another caller polls first.
+/// With the old mutex the later caller won and the woken waiter went to the
+/// back of the queue, which starved `msync` and `ftruncate` behind a stream
+/// of writers.
+fn smoke_file_lock_serves_waiters_in_order() -> TestResult {
+    let lock = FairLock::new();
+    let mut cx = Context::from_waker(Waker::noop());
+    let Some(holder) = lock.try_lock() else {
+        return TestResult::Fail("a free lock could not be taken");
+    };
+    let mut first = core::pin::pin!(lock.lock());
+    if first.as_mut().poll(&mut cx).is_ready() {
+        return TestResult::Fail("a held lock was taken");
+    }
+    drop(holder);
+    // A newcomer polls before the queued waiter gets to run.
+    let mut newcomer = core::pin::pin!(lock.lock());
+    if newcomer.as_mut().poll(&mut cx).is_ready() || lock.try_lock().is_some() {
+        return TestResult::Fail("a newcomer jumped the queue");
+    }
+    let Poll::Ready(guard) = first.as_mut().poll(&mut cx) else {
+        return TestResult::Fail("the first waiter was not handed the lock");
+    };
+    drop(guard);
+    if newcomer.as_mut().poll(&mut cx).is_pending() {
+        return TestResult::Fail("the second waiter was not served next");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_file_lock_serves_waiters_in_order
+);
+
+/// Everything the cache holds for `identity`: (pages, file entry, pages
+/// listed idle-dirty).
+fn held_for(identity: SharedFileIdentity) -> (usize, bool, usize) {
+    let pages = SHARED_FILE_PAGES.lock();
+    let cached = pages
+        .by_file
+        .range(key(identity, 0)..)
+        .take_while(|(cached, _)| cached.file == identity)
+        .count();
+    let dirty = pages
+        .idle_dirty
+        .range(key(identity, 0)..)
+        .take_while(|listed| listed.file == identity)
+        .count();
+    (cached, pages.files.contains_key(&identity), dirty)
+}
+
+/// Many files mapped, stored to, unmapped and their processes gone: once
+/// the flusher has run, the cache holds nothing for them but clean pages
+/// kept for reuse — no entry, no file kept open, no frame or record left
+/// behind — and when reclaim asks, those go too. Each cached page costs its
+/// frame and one 4 KiB clean image on the kernel heap; reclaim gives both
+/// back.
+fn smoke_cache_returns_to_baseline_and_shrinks_on_reclaim() -> TestResult {
+    const FILES: usize = 8;
+    const PAGES: usize = 4;
+    let doomed = SHARED_FILE_PAGES.lock().doomed.len();
+    let mut fixtures = Vec::new();
+    for _ in 0..FILES {
+        let mut fixture = Fixture::new(PAGES);
+        let Some(pages) = fixture.map(0, PAGES) else {
+            return TestResult::Fail("could not map a test file");
+        };
+        for phys in &pages {
+            store_bytes(*phys, 0, b"cycle");
+        }
+        fixture.unmap(&pages);
+        // The process is gone: nothing but the cache holds the file.
+        fixture.ops = None;
+        fixtures.push(fixture);
+    }
+    drop_address_space(TEST_SPACE);
+    if run(background_pass()).is_none() {
+        return TestResult::Fail("the background pass did not complete");
+    }
+    super::super::release_deferred_slots();
+    for fixture in &fixtures {
+        let (_, entry, dirty) = held_for(fixture.identity);
+        if entry || dirty != 0 {
+            return TestResult::Fail("written-back files left an entry or a listed page behind");
+        }
+        if fixture.store.dropped.load(Ordering::Relaxed) != 1 {
+            return TestResult::Fail("the cache kept a written-back file open");
+        }
+        if fixture.file_bytes(0, 5) != *b"cycle" {
+            return TestResult::Fail("a store never reached its file");
+        }
+    }
+    if SHARED_FILE_PAGES.lock().doomed.len() != doomed {
+        return TestResult::Fail("frames were left waiting on a batch that had ended");
+    }
+    // Reclaim asks for everything it can get.
+    let counted = shrink_count();
+    let freed = shrink_scan(usize::MAX);
+    if freed < counted.min(FILES * PAGES * PAGES_PER_CACHED_PAGE) {
+        return TestResult::Fail("reclaim freed less than the cache said it could");
+    }
+    for fixture in &fixtures {
+        if held_for(fixture.identity).0 != 0 {
+            return TestResult::Fail("reclaim left a clean unmapped page cached");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_cache_returns_to_baseline_and_shrinks_on_reclaim
+);
