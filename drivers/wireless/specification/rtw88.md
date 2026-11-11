@@ -3139,10 +3139,11 @@ and unexecuted: `smoke_rtw88_ht40_record_pair_factory_and_regulatory_span`,
 `smoke_rtw88_ht40_descriptor_rate_id_and_profile`,
 `smoke_rtw88_ht40_linux_bw40_bb_mac_rf_programs`.
 
-### C21/C22 5GHz channel programs (`band5.rs`) — not admitted
+### C21/C22 5GHz channel programs (`band5.rs`)
 
-Step 1 of `five_ghz_operation`: Linux 7.3-rc4 5GHz primitives only; no
-5GHz channel is admitted, scanned or advertised yet.
+Step 1 of `five_ghz_operation`: the Linux 7.3-rc4 5GHz primitives below.
+5GHz primaries are admitted, scanned, joined and advertised only through
+signed per-channel N2xO records (station band handling below).
 
 - `band5::{band, group, primary, frequency}`: `IS_CH_5G_BAND_{1..4}`,
   `rtw_get_channel_group` 5GHz rows (unlisted numbers return None where
@@ -3216,12 +3217,30 @@ home-channel 5GHz scan. BSS cache and association require the band's base
 rate as basic (`base_rate_ok`: CCK1 on 2.4GHz; OFDM6 and no CCK on 5GHz).
 BssInfo, associate and rejoin map frequencies with `any_frequency`. ECSA
 follows the 20MHz global classes 81, 115, 118, 121, 124 and 125 only
-(IEEE 802.11 Annex E Table E-4). On 5GHz no
-continuation program (extension/WMM/HT/BA/...) is bound: they are all
-qualified over a CCK1 base, so the station runs the OFDM6 base profile;
+(IEEE 802.11 Annex E Table E-4). On 5GHz a continuation program
+(extension/WMM/HT/HT40/VHT80/...) binds only as that primary's own band-5
+record over its OFDM6 base (`channel_policy::scope_request`); without one the
+station runs the OFDM6 base profile;
 `Gate::allows_profile` refuses a profile whose band differs from the
 committed primary. PHY-status channel bytes are compared by number on both
 bands. Written, unexecuted: `smoke_rtw88_band5_station_scan_csa_and_probe`.
+
+5GHz wiphy capabilities (`Device::phy_capabilities(5000)`, `hw_caps`;
+main.c `rtw_set_supported_band` with `rtw_init_ht_cap`/`rtw_init_vht_cap`
+on the 5GHz sband) are retained at activate from
+`Owner::station_band5_capability` -> `Io::station_band5_capability` ->
+`vht::band5_capability` per admitted 5GHz primary, mirroring
+`Station::associate`: the gate `retune` installs there (`Gate::with_channel`
+over the base-only gate), the band-5 N2xL extension of exactly that primary
+with WMM and its N2xH HT program. The first primary whose join can offer
+VHT80 (`vht::hardware_allows`, every other constituent of its Annex E block
+admitted, a loadable N2xV record naming that primary and center) supplies
+the `ht::Grant::vht80_capability` HT (20/40, RX SGI40) and VHT bodies and
+sets `vht_supported`; otherwise the first HT20 offer
+(`ht::Grant::ht20_capability`) is reported with no VHT; a band whose joins
+all stay legacy reports no capabilities. 2.4GHz keeps the HT20
+`Facts::capability` body. Written, unexecuted:
+`smoke_rtw88_band5_wiphy_caps_follow_admitted_station_offer`.
 
 **DFS / NO_IR passive primaries.** Following rtw89 (rtw89.md "DFS / NO_IR
 passive scanning and client admission") through the shared
@@ -4350,8 +4369,8 @@ changes. None is a physical blocker unless stated.
 | `additional_operating_channels` | Source candidate (see "C21/C22 noninitial 2.4GHz/20MHz operating channels and retune"): Linux per-channel `rtw8822c_set_channel`/`rtw8821c_set_channel` programs, signed per-channel N2xO records bounded by factory channel-group power, native drain/TXPAUSE retune owner with epoch, multi-channel scan and association/rejoin on admitted primaries 1..=13, per-channel continuation records over the channel-scoped base (`scope_request`), Linux-level C22 IQK completion, and associated CSA/ECSA following mac80211 software CSA (base profile in place; bound continuations disconnect). No N2xO record is provisioned for any board, so hardware stays channel-1 only until measured; release/native and physical acceptance pending. |
 | `beamforming` | SU and MU beamformee source-complete on N2xV VHT80 associations (see "VHT SU and MU beamformee"): SU+MU advertisement, MU-preferred `rtw_bf_assoc`, `rtw_bf_phy_init`/`rtw_bf_enable_bfee_su`/`rtw_bf_enable_bfee_mu` with readback, VHT Group ID Management -> `rtw_bf_set_gid_table` while the role is MU, role-matched disassoc cleanup. Dynamic CSI rate (needs dm `min_rssi`, absent on 5GHz) and beamformer roles not ported. Three cases written, unexecuted; physical acceptance pending. |
 | `dpk_tracking` | Source-complete for C22 under N22D bit 7 (`dpk.rs`, §3 dm section): `rtw8822c_do_dpk` + `rtw8822c_dpk_track`. Five register-model cases are written, unexecuted; GAPK, a real signed N22D DPK measurement and physical acceptance remain external. |
-| `five_ghz_operation` | 2.4GHz noninitial retune now exists (N2xO), but 5GHz needs the `rtw8822c_set_channel_bb`/`_rf` 5GHz branches, 5GHz AGC/RF table selection (`rtw_phy_setup_phy_cond` band conditions), 5GHz efuse power groups and a measured 5GHz envelope; `scan.rs` admits 2.4GHz only. Needs 5 GHz RF/BB/AGC table selection and a measured 5 GHz envelope. |
-| `ht40` | `station.rs` refuses any offered/negotiated width other than `Width::Twenty`, and the radio programs only BW20. Needs `rtw8822c_set_channel_bb` BW40 and DSSS/CCK40 programming, plus SGI40 in the measured HT gate. |
+| `five_ghz_operation` | Source candidate (see "C21/C22 5GHz channel programs"): 5GHz `set_channel` BB/RF/MAC branches, 5GHz power groups, per-channel N2xO admission, scan/retune/join/CSA and DFS passive handling, band advertisement plus 5GHz HT/VHT wiphy capabilities of the admitted station offer. No 5GHz N2xO record is provisioned for any board; release/native and physical acceptance pending. |
+| `ht40` | Source candidate (see "C21/C22 2.4GHz HT40" and its 5GHz `KIND5` variant): N2xB-bound 2.4/5GHz BW40 `set_channel` programs, retune before authentication, HT40 offer and RA/descriptor width. No N2xB record is provisioned; release/native and physical acceptance pending. |
 | `multi_stream_ht` | Source-complete for actual2T2R RTL8822CE under separate N22H256v2: cumulative per-path factory ceilings, measured combined-chain envelope, native quiet/parked two-path gains/readbacks, original local RX16/peer TX negotiation and actual RA/TXWD/RXD MCS8..15. C21 is1TX-path hardware. Five native cases are written; release/native and physical acceptance remain pending. |
 | `operating_reset` | Source-complete for retained C21/C22 under original BDF/cap: old endpoint/callback/native DMA retirement produces a one-use power-reset precondition; forced source card-disable/enable and CR readbacks precede physical factory identity and fresh firmware shell/provisioning. Cancellation/hot removal quarantine the reservation; old cookies/keys/cleanup cannot alias the replacement. Six source cases are written; release/native and physical acceptance remain pending. |
 | `radio_coexistence` | Source-complete under separate N2xK (see "C21/C22 Bluetooth coexistence state machine"): `coex.c` init/notify/BT-info/run_coex/actions/works with per-chip tables and hooks, efuse-qualified modes, full backup/restore. Five register-model cases written, unexecuted; no signed N2xK record or BT-active physical pass. |
@@ -4363,5 +4382,5 @@ changes. None is a physical blocker unless stated.
 | `system_suspend` | Source-complete for actual C21/C22 identity-DMA PCI-PM D0 profiles: retained uncancelled native retirement/card-off/D3hot receipts, original-source C22 RFE6 DBI pad, D0/config restoration and fresh cold provisioning on the original netdev. Foreground cancellation rolls workers back; old keys/cookies never revive and fresh association stays explicit. Six native cases are written; release/native and physical S3 acceptance remain pending. |
 | `tx_amsdu_5ghz` | Source-complete on 5GHz HT/VHT associations (see "5GHz TX A-MSDU and A-MSDU in A-MPDU"): gated producer, peer/allocation/RA-report size bound, CCMP over the aggregate, ADDBA A-MSDU request bit and NO_AMSDU. Four cases written, unexecuted; physical acceptance pending. |
 | `tx_ba_all_tids` | Source-complete for admitted C21/C22 TIDs0..5 with distinct full-program N2xT v2, actual independent peer/SSN/dialog/key ownership and physical BE/BK/VI burst/CCX/prefix publication. v1 remains BE/TID0; Linux excludes VO/EAPOL. Sixteen native cases are written; release/native and physical acceptance remain pending. |
-| `vht` | The HT station builds `LocalPhy::ht20` only, and VHT80 needs ht40 channel/BW80 programming first; blocked on `ht40`. |
+| `vht` | Source candidate (see "5GHz VHT80 (`N2xV`, `vht.rs`)"): N2xV-bound BW80 program and `LocalPhy::vht80` join offer; the wiphy reports the same VHT body (`vht_supported`) once an admitted 5GHz join can offer it. No N2xV record is provisioned; release/native and physical acceptance pending. |
 | `wow` | Source layer only (see "RTL8822CE Wake-on-WLAN source layer"): authenticated `wow_fw_name` load, `rtw_wow_swap_fw` download hook, full `wow.c` suspend/resume sequence, pattern CAM, WoW H2Cs and wake-reason decode with five unexecuted fixture cases. WPA2 AOAC security-CAM PTK/GTK install + software-CCMP restore (`security_cam.rs`). Native `wow::Io` over the reserved-page swap window and reversible host-DMA halt; `set_wowlan`/`wowlan_config`/`wowlan_support` advertised for C22; `system_pm_native` WoW branch (D3hot without card-off, cold fallback on any failure; RFE6 stays cold). Unexecuted fixtures; no physical board run. |

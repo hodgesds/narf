@@ -623,6 +623,17 @@ pub(super) unsafe trait Io: Send {
     fn station_channel(&self) -> (u8, u64) {
         (1, 1)
     }
+    /// Wiphy 5GHz capability bodies the station offers on admitted 5GHz
+    /// primary `channel`: `(HT, Some(VHT))` when a loadable N2xV record
+    /// over that channel's scope (and its admitted 80MHz block) lets the
+    /// join offer VHT80, `(HT20, None)` when only the band-5 N2xL/N2xH
+    /// HT program loads, `None` when the join there stays legacy.
+    fn station_band5_capability(
+        &mut self,
+        _: u8,
+    ) -> Result<Option<super::vht::Band5Capability>, Error> {
+        Ok(None)
+    }
     /// Optional signed N2xO record admitting noninitial `channel` over the
     /// exact current base. None if unprovisioned or not admitted.
     fn station_channel_grant(
@@ -1153,6 +1164,22 @@ impl<I: Io> Owner<I> {
             }
         }
         mask
+    }
+    /// Wiphy 5GHz (HT, VHT) capability bodies over the admitted 5GHz
+    /// primaries (`Io::station_band5_capability`): the VHT80 offer of the
+    /// first primary whose join can offer VHT80, else the first HT20 offer.
+    /// `None` when every admitted 5GHz join stays legacy.
+    pub(super) fn station_band5_capability(&mut self) -> Option<super::vht::Band5Capability> {
+        self.station.as_ref()?;
+        let mut ht20 = None;
+        for channel in super::channel_policy::PRIMARIES5 {
+            match self.io.station_band5_capability(channel) {
+                Ok(Some((ht, Some(vht)))) => return Some((ht, Some(vht))),
+                Ok(Some(ht)) if ht20.is_none() => ht20 = Some(ht),
+                _ => {}
+            }
+        }
+        ht20
     }
     pub(super) fn station_channel(&self) -> u8 {
         self.station.as_deref().map_or(1, |s| s.channel())

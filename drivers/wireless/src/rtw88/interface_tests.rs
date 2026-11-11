@@ -266,3 +266,46 @@ kernel_test_in!(
     "drivers/wireless/rtw88/wow",
     smoke_rtw88_wow_interface_config_and_unlinked_suspend
 );
+
+/// 5GHz wiphy capabilities (main.c `rtw_init_ht_cap`/`rtw_init_vht_cap` on
+/// the 5GHz sband) carry exactly the qualified offer retained at activate:
+/// none for a legacy-only 5GHz join, HT20 alone, or HT20/40 + VHT80 when an
+/// admitted N2xV join exists. 2.4GHz keeps its own HT body and no VHT.
+fn smoke_rtw88_band5_wiphy_caps_follow_admitted_station_offer() -> TestResult {
+    let device = shell();
+    if device.phy_capabilities(5000).is_some()
+        || device.get_wireless_info().hw_caps.vht_supported
+        || device.get_wireless_info().hw_caps.ht_supported
+    {
+        return TestResult::Fail("unactivated shell advertised 5GHz HT/VHT");
+    }
+    let ht = [
+        0x2c, 0x01, 0x03, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let vht = [0x30, 0x11, 0x13, 0x03, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
+    *device.band5_capability.lock() = Some((ht, None));
+    match device.phy_capabilities(5000) {
+        Some(c) if c.ht == ht && c.vht.is_none() => {}
+        _ => return TestResult::Fail("admitted 5GHz HT20 offer not advertised"),
+    }
+    if device.get_wireless_info().hw_caps.vht_supported
+        || !device.get_wireless_info().hw_caps.ht_supported
+        || device.phy_capabilities(2400).is_some()
+    {
+        return TestResult::Fail("HT20-only 5GHz offer advertised VHT or leaked to 2.4GHz");
+    }
+    *device.band5_capability.lock() = Some((ht, Some(vht)));
+    match device.phy_capabilities(5000) {
+        Some(c) if c.ht == ht && c.vht == Some(vht) => {}
+        _ => return TestResult::Fail("admitted 5GHz VHT80 offer not advertised"),
+    }
+    if !device.get_wireless_info().hw_caps.vht_supported || device.phy_capabilities(6000).is_some()
+    {
+        return TestResult::Fail("VHT80 offer not reported or 6GHz advertised");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_band5_wiphy_caps_follow_admitted_station_offer
+);

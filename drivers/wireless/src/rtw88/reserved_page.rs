@@ -249,6 +249,12 @@ pub(super) unsafe trait Registers: Send {
     fn station_channel(&self) -> (u8, u64) {
         (1, 1)
     }
+    fn station_band5_capability(
+        &mut self,
+        _: u8,
+    ) -> Result<Option<super::vht::Band5Capability>, Error> {
+        Ok(None)
+    }
     fn station_channel_grant(
         &mut self,
         _: u8,
@@ -658,6 +664,12 @@ unsafe impl<R: Registers, M: Memory> firmware_transport::Io for Backend<R, M> {
     }
     fn station_channel(&self) -> (u8, u64) {
         self.io.station_channel()
+    }
+    fn station_band5_capability(
+        &mut self,
+        channel: u8,
+    ) -> Result<Option<super::vht::Band5Capability>, Error> {
+        self.io.station_band5_capability(channel)
     }
     fn station_channel_grant(
         &mut self,

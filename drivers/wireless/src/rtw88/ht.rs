@@ -563,6 +563,14 @@ impl Grant {
     /// `rtw_init_ht_cap` (20/40MHz, RX SGI40, no HT TX SGI40) plus
     /// `rtw_init_vht_cap` for a bound N2xV record (`LocalPhy::vht80`).
     pub(super) fn local_vht80(&self, coding: u8, record: &super::vht::Record) -> Option<LocalPhy> {
+        let (ht, vht) = self.vht80_parts(coding, record)?;
+        LocalPhy::vht80(ht, vht).ok()
+    }
+    fn vht80_parts(
+        &self,
+        coding: u8,
+        record: &super::vht::Record,
+    ) -> Option<(LocalHt, narf_wireless::association::phy::LocalVht)> {
         let ht = local_ht(
             self.mcs,
             self.rx_mask(),
@@ -573,7 +581,25 @@ impl Grant {
         )?;
         let streams = if self.two_streams() { 2 } else { 1 };
         let vht = super::vht::local(self.base.did(), streams, record)?;
-        LocalPhy::vht80(ht, vht).ok()
+        Some((ht, vht))
+    }
+    /// Wiphy HT Capabilities body of the uncoded HT20 station offer
+    /// ([`Self::local_coded`] with coding 0; `rtw_init_ht_cap` without a
+    /// bound N2xB/N2xC record).
+    pub(super) fn ht20_capability(&self) -> Option<[u8; 26]> {
+        local_ht(self.mcs, self.rx_mask(), self.sgi, self.base.did(), 0, None)
+            .map(|ht| ht.capability_body())
+    }
+    /// Wiphy (HT, VHT) Capabilities bodies of [`Self::local_vht80`] with
+    /// coding 0: the exact elements the station offers when it joins on
+    /// `record` (main.c `rtw_init_ht_cap` + `rtw_init_vht_cap`).
+    pub(super) fn vht80_capability(
+        &self,
+        record: &super::vht::Record,
+    ) -> Option<([u8; 26], [u8; 12])> {
+        let (ht, vht) = self.vht80_parts(0, record)?;
+        LocalPhy::vht80(ht, vht).ok()?;
+        Some((ht.capability_body(), vht.capability_body()))
     }
     /// The locally advertised VHT RX set (`VhtRates::rx`).
     pub(super) fn vht_rx(&self) -> u32 {

@@ -1258,6 +1258,14 @@ unsafe impl Registers for Native {
     fn station_channel(&self) -> (u8, u64) {
         (self.channel, self.channel_epoch)
     }
+    fn station_band5_capability(
+        &mut self,
+        channel: u8,
+    ) -> Result<Option<super::vht::Band5Capability>, Error> {
+        self.station_allowed()?;
+        let base = self.packet_gate.clone().ok_or(Error::State)?;
+        super::vht::band5_capability(&base, channel, |c| self.station_channel_grant(c))
+    }
     fn station_channel_grant(
         &mut self,
         channel: u8,

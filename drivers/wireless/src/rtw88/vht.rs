@@ -214,6 +214,83 @@ pub(super) fn local(
     })
 }
 
+/// Wiphy 5GHz (HT Capabilities, optional VHT Capabilities) bodies.
+pub(super) type Band5Capability = ([u8; 26], Option<[u8; 12]>);
+
+/// Wiphy 5GHz capability bodies (`firmware_transport::Io::
+/// station_band5_capability`) the station offers on admitted 5GHz primary
+/// `channel` over the current station gate `current`. `grant` is the
+/// backend's `station_channel_grant` (signed N2xO admission per primary).
+///
+/// Mirrors `Station::associate` exactly: the gate `retune` installs on the
+/// primary (`Gate::with_channel` over the base-only gate), the band-5 N2xL
+/// extension of exactly this primary with WMM, its N2xH HT program, and
+/// VHT80 only when the firmware bandwidth `hardware_allows` 80MHz, the
+/// primary's Annex E block has every other constituent admitted and a
+/// loadable N2xV record names this primary and block. Linux main.c
+/// `rtw_init_ht_cap`/`rtw_init_vht_cap` advertise the same elements on the
+/// 5GHz sband; NARF narrows them to the qualified station offer.
+pub(super) fn band5_capability(
+    current: &Gate,
+    channel: u8,
+    mut grant: impl FnMut(u8) -> Result<Option<alloc::sync::Arc<super::qualification::Grant>>, Error>,
+) -> Result<Option<Band5Capability>, Error> {
+    if !band5::primary(channel) {
+        return Ok(None);
+    }
+    let Some(record) = grant(channel)? else {
+        return Ok(None);
+    };
+    let gate = current.without_channel().with_channel(record)?;
+    let Some(extension) = gate
+        .extension_request()
+        .and_then(|_| {
+            super::station_profile::Source::Registered
+                .load(gate.clone())
+                .ok()
+        })
+        .filter(|g| g.band5() && g.channel() == channel && g.wmm())
+    else {
+        return Ok(None);
+    };
+    let Some(ht) = super::ht::Source::Registered.load(extension).ok() else {
+        return Ok(None);
+    };
+    let vht = match (
+        gate.ht_facts()
+            .is_some_and(|f| hardware_allows(f.hardware.bandwidth)),
+        band5::center80(channel),
+    ) {
+        (true, Some(center)) => {
+            let mut admitted = true;
+            for c in band5::constituents80(center) {
+                if c != channel && grant(c)?.is_none() {
+                    admitted = false;
+                    break;
+                }
+            }
+            if admitted {
+                super::qualification::Source::Registered
+                    .load(&KIND, &gate)
+                    .ok()
+                    .and_then(|g| {
+                        let r = Record::decode(gate.did(), g.payload())?;
+                        (g.matches(&gate) && r.primary == channel && r.center == center)
+                            .then_some(r)
+                    })
+                    .and_then(|r| ht.vht80_capability(&r))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    Ok(match vht {
+        Some((ht, vht)) => Some((ht, Some(vht))),
+        None => ht.ht20_capability().map(|ht| (ht, None)),
+    })
+}
+
 /// VHT Operation element (192) in `ies`: `(channel width, CCFS0, CCFS1)`.
 /// Channel width 1 with CCFS0 the 80MHz center is an 80MHz (or wider,
 /// CCFS1 nonzero) BSS. `None` if absent or malformed.
