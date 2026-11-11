@@ -575,21 +575,16 @@ fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
         // `interrupts/ipi` smokes hit under `-x2apic`) or, if a peer
         // happens to drain the bit by polling, lets execution continue
         // with a stale TLB entry live on another core.
-        let icr_hi = lapic_reg(0x310);
-        let icr_lo = lapic_reg(0x300);
         let mut m = cpu_mask;
         while m != 0 {
             let cpu = m.trailing_zeros();
             m &= m - 1;
             // SAFETY: LAPIC MMIO reached via `lapic_reg`; ICR writes are
-            // architectural. Serialising on Delivery Status keeps a
-            // second target's ICR_LO from overwriting an IPI still in
-            // flight (SDM Vol 3 §10.6.1).
-            unsafe {
-                wait_icr_idle(icr_lo);
-                core::ptr::write_volatile(icr_hi, (cpu & 0xFF) << 24);
-                core::ptr::write_volatile(icr_lo, u32::from(vector) | (1 << 14));
-            }
+            // architectural. `xapic_icr_send` serialises on Delivery
+            // Status, which keeps a second target's ICR_LO from overwriting
+            // an IPI still in flight (SDM Vol 3 §10.6.1), and masks
+            // interrupts across the register pair.
+            unsafe { xapic_icr_send((cpu & 0xFF) << 24, u32::from(vector) | (1 << 14)) };
         }
         return;
     }
@@ -700,13 +695,7 @@ pub unsafe fn self_ipi(vector: u8) {
         let icr_low: u32 = (vector as u32) | (1 << 14) | (1 << 18);
         // SAFETY: LAPIC MMIO reached via `lapic_reg`; high half irrelevant
         // for self-shorthand but Intel mandates writing it first.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let icr_hi_reg = lapic_reg(0x310);
-            let icr_lo_reg = lapic_reg(0x300);
-            core::ptr::write_volatile(icr_hi_reg, 0);
-            core::ptr::write_volatile(icr_lo_reg, icr_low);
-        }
+        unsafe { xapic_icr_send(0, icr_low) };
     }
 }
 
@@ -746,14 +735,70 @@ pub unsafe fn wrmsr_icr(icr: u64) {
         let icr_low = (icr & 0xFFFF_FFFF) as u32;
         // SAFETY: LAPIC MMIO reached via `lapic_reg`; spec mandates writing
         // ICR_HIGH before ICR_LOW (LOW write triggers send).
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let icr_hi_reg = lapic_reg(0x310);
-            let icr_lo_reg = lapic_reg(0x300);
-            core::ptr::write_volatile(icr_hi_reg, icr_high);
-            core::ptr::write_volatile(icr_lo_reg, icr_low);
-        }
+        unsafe { xapic_icr_send(icr_high, icr_low) };
     }
+}
+
+/// One step of an xAPIC ICR send, in the order the steps must happen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcrStep {
+    /// Wait for the previous IPI to leave the ICR (Delivery Status clear).
+    WaitIdle,
+    /// Write ICR_HI: the destination.
+    WriteHigh(u32),
+    /// Write ICR_LO: the command. This is the write that sends.
+    WriteLow(u32),
+}
+
+/// Perform the three steps of an xAPIC ICR send with interrupts masked from
+/// before the first to after the last, restoring the caller's interrupt state.
+///
+/// In xAPIC mode the ICR is two memory-mapped registers and the send is not
+/// atomic: the destination is latched by the ICR_HI write and the IPI goes out
+/// on the ICR_LO write. A sender interrupted between the two by a handler that
+/// sends an IPI of its own comes back to an ICR_HI holding the handler's
+/// destination, and its ICR_LO write then delivers its vector there. Handlers
+/// do send: the scheduler's tick sends reschedule and idle-balance kicks, the
+/// stall watchdog sends an NMI probe from the tick, and a wake from any interrupt
+/// can kick an idle CPU. A reschedule or TLB-shootdown IPI landing on the wrong
+/// CPU is a lost wakeup or an unacknowledged shootdown.
+///
+/// Linux masks interrupts across the same pair (`default_send_IPI_single` and
+/// the mask variants call `__default_send_IPI_dest_field` under
+/// `local_irq_save`) and waits for Delivery Status first.
+///
+/// An NMI is not masked by this. Code that can run in NMI context must not
+/// send through the xAPIC ICR.
+#[inline]
+pub(crate) fn icr_send_masked(icr_hi: u32, icr_lo: u32, mut step: impl FnMut(IcrStep)) {
+    narf_lib::sync::without_interrupts(|| {
+        step(IcrStep::WaitIdle);
+        step(IcrStep::WriteHigh(icr_hi));
+        step(IcrStep::WriteLow(icr_lo));
+    });
+}
+
+/// Send one IPI through the memory-mapped xAPIC ICR. Every xAPIC sender in
+/// this file goes through here; see [`icr_send_masked`] for why.
+///
+/// # Safety
+/// The LAPIC must be initialised and reachable through [`lapic_reg`], and
+/// x2APIC must not be the active mode.
+#[inline]
+unsafe fn xapic_icr_send(icr_hi: u32, icr_lo: u32) {
+    let hi_reg = lapic_reg(0x310);
+    let lo_reg = lapic_reg(0x300);
+    icr_send_masked(icr_hi, icr_lo, |step| {
+        // SAFETY: the caller guarantees both registers are mapped LAPIC MMIO;
+        // the writes are the architectural ICR programming sequence.
+        unsafe {
+            match step {
+                IcrStep::WaitIdle => wait_icr_idle(lo_reg),
+                IcrStep::WriteHigh(value) => core::ptr::write_volatile(hi_reg, value),
+                IcrStep::WriteLow(value) => core::ptr::write_volatile(lo_reg, value),
+            }
+        }
+    });
 }
 
 /// Read this CPU's APIC ID via x2APIC MSR 0x802.
@@ -902,13 +947,8 @@ pub unsafe fn send_init_ipi(target_apic_id: u32) {
         // xAPIC MMIO fallback. ICR_HI carries the destination
         // APIC ID in bits 24..31; ICR_LO carries the IPI fields.
         // Writing ICR_LO triggers the IPI, so write ICR_HI first.
-        let lapic_hi = lapic_reg(0x310);
-        let lapic_lo = lapic_reg(0x300);
         // SAFETY: LAPIC MMIO is reached via `lapic_reg`.
-        unsafe {
-            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
-            core::ptr::write_volatile(lapic_lo, icr_lo);
-        }
+        unsafe { xapic_icr_send((target_apic_id & 0xFF) << 24, icr_lo) };
     }
 }
 
@@ -931,14 +971,11 @@ pub unsafe fn send_nmi_ipi(target_apic_id: u32) {
             wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
         }
     } else {
-        let lapic_hi = lapic_reg(0x310);
-        let lapic_lo = lapic_reg(0x300);
-        // SAFETY: LAPIC MMIO is reached via `lapic_reg`. Write HI (dest)
-        // before LO (triggers the IPI).
-        unsafe {
-            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
-            core::ptr::write_volatile(lapic_lo, icr_lo);
-        }
+        // SAFETY: LAPIC MMIO is reached via `lapic_reg`. HI (dest) is
+        // written before LO (triggers the IPI), with interrupts masked: this
+        // one is sent from the timer tick, on top of whatever the tick
+        // interrupted.
+        unsafe { xapic_icr_send((target_apic_id & 0xFF) << 24, icr_lo) };
     }
 }
 
@@ -966,13 +1003,8 @@ pub unsafe fn send_startup_ipi(target_apic_id: u32, vector_page: u8) {
             wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
         }
     } else {
-        let lapic_hi = lapic_reg(0x310);
-        let lapic_lo = lapic_reg(0x300);
         // SAFETY: LAPIC MMIO is reached via `lapic_reg`.
-        unsafe {
-            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
-            core::ptr::write_volatile(lapic_lo, icr_lo);
-        }
+        unsafe { xapic_icr_send((target_apic_id & 0xFF) << 24, icr_lo) };
     }
 }
 
