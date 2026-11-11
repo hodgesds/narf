@@ -19,7 +19,9 @@
 #                and a directory listing; STUCK(<s>) while one has not come
 #                back
 #   SOAK-SAMPLE  every 5 s: meminfo, pressure, task states, what tasks are
-#                waiting in, the busiest and largest tasks, worker progress
+#                waiting in (SOAK-FSWAIT names the ones inside munmap, msync,
+#                fsync, truncate, rename, unlink or exit), the busiest and
+#                largest tasks, worker progress
 #
 # Before the load, SOAK_DIRECTED=1 runs single operations one at a time on
 # the quiet system, each bracketed by SOAK-EPISODE lines, so the samples and
@@ -214,7 +216,7 @@ sampler() {
     # One pass over every thread: state counts, what each is waiting in,
     # CPU time since the last pass and resident size.
     local -A states=() waits=() now_cpu=()
-    local odd="" nodd=0 total=0
+    local odd="" nodd=0 total=0 fswait="" nfs=0
     local -a f cpu_v=() cpu_l=() rss_v=() rss_l=()
     for task in /proc/[0-9]*/task/[0-9]*; do
       read -r stat 2> /dev/null < "$task/stat" || continue
@@ -243,6 +245,14 @@ sampler() {
         odd+=" $comm/$tid:$wchan:sys$key"
         nodd=$((nodd + 1))
       fi
+      # Who is inside the filesystem: the one in munmap, msync or exit is
+      # usually what the ones in openat and fsync are waiting for.
+      case $wchan in
+        munmap | msync | fsync | fdatasync | ftruncate | truncate | exit | exit_group | unlinkat | renameat | rename)
+          ((nfs < 16)) && fswait+=" ${comm// /_}/$tid:$wchan"
+          nfs=$((nfs + 1))
+          ;;
+      esac
     done
     prev_cpu=()
     for k in "${!now_cpu[@]}"; do prev_cpu[$k]=${now_cpu[$k]}; done
@@ -252,6 +262,7 @@ sampler() {
     for k in "${!waits[@]}"; do line+=" $k=${waits[$k]}"; done
     say "$line"
     [ -n "$odd" ] && say "SOAK-BLOCKED n=$n$odd"
+    [ -n "$fswait" ] && say "SOAK-FSWAIT n=$n count=$nfs$fswait"
     line="SOAK-TOP n=$n cpu_ticks:"
     for i in "${!cpu_v[@]}"; do line+=" ${cpu_l[i]// /_}=${cpu_v[i]}"; done
     line+=" rss_pages:"
