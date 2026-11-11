@@ -80,6 +80,72 @@ pub async fn extent_high_water<B: BlockDevice + 'static>(
     Ok(high)
 }
 
+/// Whether a block group of type `flags` takes an allocation of `kind`:
+/// data only into DATA groups, metadata only into METADATA ones (a mixed
+/// group is both), the chunk tree only into SYSTEM ones.
+fn bump_serves(flags: u64, kind: u64) -> bool {
+    flags & kind != 0
+        && (flags & format::BLOCK_GROUP_SYSTEM == 0) == (kind & format::BLOCK_GROUP_SYSTEM == 0)
+}
+
+/// The bump allocator's groups: every block group (from the extent or the
+/// block-group tree) with its type, and a cursor past the highest extent it
+/// holds, past the session's allocation floor where that lies inside it,
+/// and past every pinned or reader-held range in it — space freed by a
+/// commit that is not yet durable, which an append past the high water of
+/// what is left would otherwise reuse.
+async fn bump_groups<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root_tree: u64,
+    extent_tree: u64,
+) -> Result<Vec<(u64, u64, u64, u64)>, FsError> {
+    let bg_tree = match crate::block_group::bg_home(vol, root_tree).await? {
+        crate::block_group::BgHome::BlockGroupTree { root, .. } => root,
+        crate::block_group::BgHome::ExtentTree => extent_tree,
+    };
+    let mut groups: Vec<(u64, u64, u64, u64)> = crate::block_group::read_block_groups(vol, bg_tree)
+        .await?
+        .into_iter()
+        .map(|(start, len, body)| {
+            let flags = format::le64(&body, 16).unwrap_or(0);
+            (start, start.saturating_add(len), flags, start)
+        })
+        .collect();
+    let raise = |groups: &mut Vec<(u64, u64, u64, u64)>, start: u64, end: u64| {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|&&mut (s, e, _, _)| start >= s && start < e)
+        {
+            group.3 = group.3.max(end.min(group.1));
+        }
+    };
+    let nodesize = vol.nodesize() as u64;
+    let mut cursor = Cursor::seek(vol, extent_tree, &BtrfsKey::new(0, 0, 0)).await?;
+    while let Some((key, _)) = cursor.current()? {
+        let end = match key.item_type {
+            format::EXTENT_ITEM_KEY => key.objectid.saturating_add(key.offset),
+            format::METADATA_ITEM_KEY => key.objectid.saturating_add(nodesize),
+            _ => 0,
+        };
+        if end > 0 {
+            raise(&mut groups, key.objectid, end);
+        }
+        cursor.advance().await?;
+    }
+    let floor = vol.alloc_floor();
+    if floor > 0 {
+        raise(&mut groups, floor.saturating_sub(1), floor);
+    }
+    for (start, len) in vol
+        .pinned_ranges()
+        .into_iter()
+        .chain(vol.reader_root_ranges())
+    {
+        raise(&mut groups, start, start.saturating_add(len));
+    }
+    Ok(groups)
+}
+
 /// Read the free-space tree's free `(start, len)` ranges, from both the
 /// `FREE_SPACE_EXTENT` items of extent-mode block groups and the
 /// `FREE_SPACE_BITMAP` items of bitmap-mode ones (a set bit = one free sector).
@@ -563,7 +629,10 @@ pub enum Allocator {
     /// Append past the extent-tree high-water (no free-space tree present),
     /// stepping over `excluded` (superblock-covered) logical ranges.
     Bump {
-        next: u64,
+        /// One append cursor per block group: `(start, end, flags, next)`,
+        /// `next` past the highest extent the group holds (and past every
+        /// range this session allocated or pinned there).
+        groups: Vec<(u64, u64, u64, u64)>,
         excluded: Vec<(u64, u64)>,
     },
 }
@@ -578,9 +647,8 @@ impl Allocator {
             let ext = roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID)
                 .await?
                 .0;
-            let hw = extent_high_water(vol, ext).await?.max(vol.alloc_floor());
             return Ok(Allocator::Bump {
-                next: hw,
+                groups: bump_groups(vol, root_tree, ext).await?,
                 excluded: vol.super_stripe_exclusions(),
             });
         };
@@ -727,22 +795,27 @@ impl Allocator {
             // continuity is not required: the volume I/O layer splits RAID0/10/
             // 5/6 extents at stripe boundaries. An unmapped address (the cursor
             // ran past the last chunk) is out of space, not a lookup error.
-            Allocator::Bump { next, excluded } => {
-                let mut start = align_up(*next, align);
-                while let Some(&(s, l)) = excluded
-                    .iter()
-                    .find(|&&(s, l)| start < s + l && start + size > s)
-                {
-                    start = align_up(s + l, align);
+            // Only a group of the requested type (a mixed group serves
+            // both): metadata in a DATA group, or data in a METADATA one, is
+            // corruption Linux rejects.
+            Allocator::Bump { groups, excluded } => {
+                for (_, end, flags, next) in groups.iter_mut() {
+                    if !bump_serves(*flags, kind) {
+                        continue;
+                    }
+                    let mut start = align_up(*next, align);
+                    while let Some(&(s, l)) = excluded
+                        .iter()
+                        .find(|&&(s, l)| start < s + l && start + size > s)
+                    {
+                        start = align_up(s + l, align);
+                    }
+                    if start.checked_add(size).is_some_and(|e| e <= *end) {
+                        *next = start + size;
+                        return Ok(start);
+                    }
                 }
-                let remaining = vol
-                    .logical_chunk_remaining(start)
-                    .map_err(|_| FsError::NoSpace)?;
-                if size > remaining {
-                    return Err(FsError::NoSpace);
-                }
-                *next = start + size;
-                Ok(start)
+                Err(FsError::NoSpace)
             }
         }
     }
@@ -766,9 +839,12 @@ impl Allocator {
         self.alloc(vol, len, s, format::BLOCK_GROUP_DATA)
     }
 
-    /// Bytes still free in block groups of `kind`; `u64::MAX` for the bump
-    /// allocator, which does not know (it is never used under `root-rw`,
-    /// which requires a free-space tree).
+    /// Bytes still free in block groups of `kind`. For the bump allocator
+    /// (no free-space tree; never used under `root-rw`, which requires one)
+    /// the bytes past each matching group's cursor. It reported `u64::MAX`, so
+    /// a batch's reservation check (`write::batch_stage_refs`) never refused
+    /// an operation, and the commit then found no room for its own blocks
+    /// and lost every operation the batch had already reported successful.
     pub fn free_bytes(&self, kind: u64) -> u64 {
         match self {
             Allocator::Reclaim {
@@ -783,7 +859,20 @@ impl Allocator {
                     total.saturating_sub(withheld.bytes.get(flags).copied().unwrap_or(0))
                 })
                 .sum(),
-            Allocator::Bump { .. } => u64::MAX,
+            Allocator::Bump { groups, excluded } => groups
+                .iter()
+                .filter(|&&(_, _, flags, _)| bump_serves(flags, kind))
+                .map(|&(_, end, _, next)| {
+                    let covered: u64 = excluded
+                        .iter()
+                        .map(|&(start, len)| {
+                            let to = start.saturating_add(len).min(end);
+                            to.saturating_sub(start.max(next))
+                        })
+                        .sum();
+                    end.saturating_sub(next).saturating_sub(covered)
+                })
+                .sum(),
         }
     }
 
@@ -812,8 +901,7 @@ impl Allocator {
     }
 
     /// How many block groups the filesystem has, and the bytes in those that
-    /// hold metadata — `(u64::MAX, u64::MAX)` for the bump allocator, which
-    /// does not know.
+    /// hold metadata.
     pub(crate) fn group_shape(&self) -> (u64, u64) {
         match self {
             Allocator::Reclaim { view, .. } => (
@@ -824,7 +912,14 @@ impl Allocator {
                     .map(|&(_, len, _)| len)
                     .sum(),
             ),
-            Allocator::Bump { .. } => (u64::MAX, u64::MAX),
+            Allocator::Bump { groups, .. } => (
+                groups.len() as u64,
+                groups
+                    .iter()
+                    .filter(|&&(_, _, flags, _)| bump_serves(flags, format::BLOCK_GROUP_METADATA))
+                    .map(|&(start, end, _, _)| end - start)
+                    .sum(),
+            ),
         }
     }
 
@@ -844,7 +939,7 @@ impl Allocator {
     /// floor is needed).
     pub fn floor(&self) -> Option<u64> {
         match self {
-            Allocator::Bump { next, .. } => Some(*next),
+            Allocator::Bump { groups, .. } => groups.iter().map(|&(_, _, _, next)| next).max(),
             Allocator::Reclaim { .. } => None,
         }
     }

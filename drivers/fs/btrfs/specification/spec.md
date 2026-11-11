@@ -172,6 +172,19 @@ accepted changes durable, leaving any unreaped orphan record for recovery.
 
 ## 4. Invariants
 
+Without a free-space tree (never under `root-rw`, which requires one) the
+allocator appends past the highest extent of each block group, one cursor per
+group, and only into a group of the requested type: tree blocks into
+METADATA groups (SYSTEM for the chunk tree), data into DATA groups, either
+into a mixed group (the read-write gate admits a filesystem without the tree
+only when every block group is mixed, so the type rule is a guard). It reports as free the bytes past those cursors, so a
+batch's reservation check refuses an operation the commit could not fit; it
+reported unlimited space, and a batch then took operations until its commit
+failed and lost every one it had reported successful
+(`smoke_btrfs_admitted_operations_survive_commit`, and the `release` scenario's
+image without a free-space tree, judged by `btrfs check` and by the block
+group of every extent).
+
 A tree's root block always carries the generation its ROOT_ITEM records:
 when deletions leave a root with one child, a child the transaction has not
 already COWed is COWed before it becomes the root, in every tree, as Linux
@@ -574,3 +587,18 @@ limits; registration does not add support for further on-disk features.
 Directories cannot carry xattrs through the VFS yet: `DirOps::set_xattr` is
 the trait's default (`Unsupported`), so a directory's `user.*`, ACL or
 security xattrs cannot be set or removed through it.
+
+A transaction's commit cannot allocate a chunk. Admission keeps it from
+needing one: every operation is refused with `NoSpace` unless the free
+metadata of the allocated block groups covers the global reserve and twice
+the batch's first-order need, and the refusal commits, then grows the
+filesystem between operations (`autogrow!`, `write::locked_step`). Linux
+can also allocate a chunk inside a transaction (`btrfs_reserve_metadata_bytes`
+→ `flush_space(ALLOC_CHUNK)`, the block group created by
+`btrfs_create_pending_block_groups` at commit). Doing the same here would take:
+the batch's allocator adopting a chunk allocated within the batch (its
+free-space view extended, the chunk's own tree items staged as edits of the
+same transaction rather than committed by a separate `alloc_chunk`
+transaction), the chunk-tree, device-tree and block-group edits joining the
+commit's fixed point, and a test in which a batch runs out of metadata at
+commit with unallocated device space left.

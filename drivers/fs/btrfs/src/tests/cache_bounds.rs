@@ -59,7 +59,10 @@ kernel_test_in!(
 /// within its budget after reading every file of the fixture, and the
 /// shrinker gives its bytes back.
 fn smoke_btrfs_node_cache_reclaimable() -> TestResult {
-    let vol = match mount_fixture() {
+    // The free-space-tree fixture: the primary one's 16 MiB of mixed groups
+    // refuses 64 more files (a batch is admitted only with room for its
+    // commit, `smoke_btrfs_admitted_operations_survive_commit`).
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("fixture failed to mount"),
     };
