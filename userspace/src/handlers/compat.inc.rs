@@ -3198,10 +3198,14 @@ pub(crate) fn proc_exe_magic_target(task: u64, path: &str) -> Option<alloc::stri
         .map(|exe| exe.as_ref().clone())
 }
 
-/// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
-/// These are the magic symlinks glibc's fexecve / systemd's spawn execve.
+/// Parse `/proc/self/fd/<N>`, `/proc/thread-self/fd/<N>` or
+/// `/proc/<pid>/fd/<N>` → the fd number `N`. These are the magic symlinks
+/// glibc's fexecve / systemd's spawn execve.
 pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
-    let rest = if let Some(r) = path.strip_prefix("/proc/self/fd/") {
+    let rest = if let Some(r) = path
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| path.strip_prefix("/proc/thread-self/fd/"))
+    {
         r
     } else {
         let r = path.strip_prefix("/proc/")?;

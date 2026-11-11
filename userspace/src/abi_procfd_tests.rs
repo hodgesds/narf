@@ -475,6 +475,36 @@ kernel_test_in!(
     smoke_abi_procfd_thread_open_is_named_for_the_process
 );
 
+/// `tid_base_stuff` has `fd` too: `/proc/thread-self/fd/N` is the link
+/// `/proc/self/fd/N` is, to read and to reopen through.
+fn smoke_abi_procfd_thread_self_fd_is_the_same_link() -> TestResult {
+    with_fs(|| {
+        let fd = open("/pf/d/f", O_PATH | O_CLOEXEC, "open(O_PATH) failed")?;
+        let link = link_at("thread-self", fd);
+        let re = open(
+            &alloc::format!("/proc/thread-self/fd/{fd}"),
+            O_RDONLY,
+            "reopen through /proc/thread-self/fd/N failed",
+        );
+        let reopened = re.and_then(link_of);
+        if let Ok(re) = re {
+            close(re);
+        }
+        close(fd);
+        if link? != "/pf/d/f" {
+            return Err("/proc/thread-self/fd/N does not name the file");
+        }
+        if reopened? != "/pf/d/f" {
+            return Err("a reopen through /proc/thread-self/fd/N is not named by the file");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_procfd_thread_self_fd_is_the_same_link
+);
+
 /// A forked child holds the same open files: it reads their names through
 /// `/proc/self/fd`, and its parent reads them through `/proc/<child>/fd`.
 fn smoke_abi_procfd_fork_child_and_other_readers() -> TestResult {

@@ -1346,18 +1346,32 @@ impl DirOps for ProcTaskTidDir {
                 ino: proc_pid_ino(self.ino, name),
                 wchan: name == "wchan",
             })),
+            "fd" | "fdinfo" => Some(Arc::new(ProcDirMarker::new(proc_pid_ino(self.ino, name)))),
+            _ => None,
+        }
+    }
+    /// `tid_base_stuff`: `DIR("fd", …)` and `DIR("fdinfo", …)`. A thread's
+    /// descriptor table is its process's (`CLONE_FILES`), so these are the
+    /// directories `/proc/<pid>/fd` and `/proc/<pid>/fdinfo` are — which is
+    /// what makes `/proc/thread-self/fd/<n>` the link `/proc/self/fd/<n>` is.
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        match name {
+            "fd" => Some(Arc::new(ProcFdDir { pid: self.pid })),
+            "fdinfo" => Some(Arc::new(ProcFdInfoDir { pid: self.pid })),
             _ => None,
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        Box::new(
-            ["comm", "mem", "stat", "syscall", "wchan"]
-                .into_iter()
-                .map(|name| DirEntry {
-                    name: name.into(),
-                    file_type: FileType::File,
-                }),
-        )
+        let files = ["comm", "mem", "stat", "syscall", "wchan"]
+            .into_iter()
+            .map(|name| (name, FileType::File));
+        let dirs = ["fd", "fdinfo"]
+            .into_iter()
+            .map(|name| (name, FileType::Dir));
+        Box::new(files.chain(dirs).map(|(name, file_type)| DirEntry {
+            name: name.into(),
+            file_type,
+        }))
     }
 }
 

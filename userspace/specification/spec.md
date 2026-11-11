@@ -846,7 +846,8 @@ it, and a removed or replaced name is marked deleted. `fd::names` keeps the
 reverse map those calls need, every named open file by path, which is also
 what answers `umount(2)`'s busy check.
 
-`/proc/<pid>/fd/<n>` renders the name as `d_path` does: relative to the
+`/proc/<pid>/fd/<n>` (and `/proc/<pid>/task/<tid>/fd/<n>`, so
+`/proc/thread-self/fd/<n>`) renders the name as `d_path` does: relative to the
 reader's root, `<path> (deleted)` once the name is gone, `<dir>/#<ino>
 (deleted)` for an `O_TMPFILE` inode. A file with no name in the namespace
 reads its class: `pipe:[ino]`, `socket:[ino]`, `<nstype>:[ino]`,
