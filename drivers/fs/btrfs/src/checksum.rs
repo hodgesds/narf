@@ -29,9 +29,11 @@ use crate::format;
 /// Reflected Castagnoli polynomial.
 const POLY: u32 = 0x82F6_3B78;
 
-/// Compile-time CRC32C lookup table (one entry per input byte).
-const fn build_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
+/// Compile-time CRC32C lookup tables for slicing-by-8: `TABLES[k][b]` is
+/// the CRC of byte `b` followed by `k` zero bytes, so eight input bytes are
+/// folded in with eight independent lookups instead of eight dependent ones.
+const fn build_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
     let mut i = 0usize;
     while i < 256 {
         let mut crc = i as u32;
@@ -44,24 +46,65 @@ const fn build_table() -> [u32; 256] {
             };
             bit += 1;
         }
-        table[i] = crc;
+        tables[0][i] = crc;
         i += 1;
     }
-    table
+    let mut k = 1usize;
+    while k < 8 {
+        let mut i = 0usize;
+        while i < 256 {
+            let prev = tables[k - 1][i];
+            tables[k][i] = (prev >> 8) ^ tables[0][(prev & 0xff) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    tables
 }
 
-static TABLE: [u32; 256] = build_table();
+static TABLES: [[u32; 256]; 8] = build_tables();
+
+/// One byte at a time: the definition, and the tail of [`crc32c`].
+fn crc32c_bytewise(seed: u32, data: &[u8]) -> u32 {
+    let mut crc = seed;
+    for &byte in data {
+        let idx = ((crc ^ u32::from(byte)) & 0xff) as usize;
+        crc = TABLES[0][idx] ^ (crc >> 8);
+    }
+    crc
+}
 
 /// Raw running CRC32C update, matching Linux `crc32c(seed, data, len)`
 /// (`lib/crc32c.c`): no pre/post inversion, the caller supplies the seed and
 /// interprets the residue. This is the primitive both public helpers build on.
+///
+/// Eight bytes per step (slicing-by-8, as Linux's generic `crc32c` does
+/// where there is no CPU instruction for it): every tree block written or
+/// read is checksummed whole and every data sector once, so a 4 KiB write
+/// checksums some 80 KiB — its sector and the tree blocks on the paths it
+/// replaces — and a byte at a time that was most of what the write cost.
 pub fn crc32c(seed: u32, data: &[u8]) -> u32 {
     let mut crc = seed;
-    for &byte in data {
-        let idx = ((crc ^ u32::from(byte)) & 0xff) as usize;
-        crc = TABLE[idx] ^ (crc >> 8);
+    let mut words = data.chunks_exact(8);
+    for word in &mut words {
+        let lo = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) ^ crc;
+        let hi = u32::from_le_bytes([word[4], word[5], word[6], word[7]]);
+        crc = TABLES[7][(lo & 0xff) as usize]
+            ^ TABLES[6][((lo >> 8) & 0xff) as usize]
+            ^ TABLES[5][((lo >> 16) & 0xff) as usize]
+            ^ TABLES[4][(lo >> 24) as usize]
+            ^ TABLES[3][(hi & 0xff) as usize]
+            ^ TABLES[2][((hi >> 8) & 0xff) as usize]
+            ^ TABLES[1][((hi >> 16) & 0xff) as usize]
+            ^ TABLES[0][(hi >> 24) as usize];
     }
-    crc
+    crc32c_bytewise(crc, words.remainder())
+}
+
+/// Test-only: [`crc32c`] one byte at a time, to compare the two.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_crc32c_bytewise(seed: u32, data: &[u8]) -> u32 {
+    crc32c_bytewise(seed, data)
 }
 
 /// On-disk block checksum (superblock and every tree node): standard CRC32C

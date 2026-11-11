@@ -203,6 +203,11 @@ use survives any number of other fills
 outright when it filled, so one walk over more nodes than the bound left
 nothing for the next.
 
+CRC32C — every tree block written or read, every data sector — is computed
+eight bytes a step (slicing-by-8, as Linux's generic `crc32c`), checked
+against the byte-at-a-time definition
+(`smoke_btrfs_crc32c_sliced_matches_bytewise`).
+
 The allocator carves from one in-memory copy of the committed free-space tree
 per filesystem (`allocator::FreeView`, Linux's per-block-group free-space
 cache), read from disk on first use and advanced by each commit with exactly
