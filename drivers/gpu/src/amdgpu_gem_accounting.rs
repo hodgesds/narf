@@ -355,10 +355,19 @@ pub(super) struct Failures {
     unreported: AtomicU64,
 }
 
+/// Failure reports made while the card's placement gate was held.
+#[cfg(feature = "kernel-test")]
+pub(crate) static REPORTS_UNDER_GATE: AtomicU64 = AtomicU64::new(0);
+
 /// A GEM allocation or placement for DRM card `card` failed for lack of
 /// memory: count it, and log the state report unless one was logged within
 /// `REPORT_INTERVAL_NS` (the next report says how many it stood for). Only
 /// ever called on a failure. Any other error is the caller's own.
+///
+/// Callers release the card's placement gate first: the report walks every
+/// buffer and open of the card, resolves process names and writes the log,
+/// and every job, VA edit and commit of the card waits on that gate —
+/// most of all when VRAM is exhausted, which is when this runs.
 pub(crate) fn note_failure(
     card: Option<u32>,
     what: &str,
@@ -376,6 +385,10 @@ pub(crate) fn note_failure(
     let Some(stats) = stats::for_card(Some(card)) else {
         return;
     };
+    #[cfg(feature = "kernel-test")]
+    if try_placement(card).is_none() {
+        REPORTS_UNDER_GATE.fetch_add(1, Ordering::Relaxed);
+    }
     let failures = stats.failures();
     let nth = failures.total.fetch_add(1, Ordering::Relaxed) + 1;
     let now = narf_time::monotonic_ns().max(1);

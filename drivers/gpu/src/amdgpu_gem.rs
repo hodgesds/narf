@@ -1822,6 +1822,7 @@ pub async fn create_dumb_async(
     } else {
         result
     };
+    drop(gate);
     note_dumb_failure(card, size, &result);
     result
 }
@@ -1885,6 +1886,9 @@ pub(crate) async fn prepare_scanout_locked(
         // unless NO_CPU_ACCESS) for scanout. The allowed domains keep
         // governing every other move, so they are widened for this move only.
         if let Err(error) = pin_relocate(&gate, object, &unique).await {
+            // The commit is refused: let the card's other clients go on
+            // before the report walks its buffers and writes the log.
+            drop(gate);
             accounting::note_failure(
                 Some(card),
                 "scanout pin (prepare_fb)",
@@ -2205,6 +2209,7 @@ impl GemState {
         let card = self.card.ok_or(FsError::NoDevice)?;
         let gate = try_placement_live(card)?.ok_or(FsError::Busy)?;
         let result = self.create_dumb_locked(width, height, bpp, &gate);
+        drop(gate);
         let bytes = dumb_layout(width, height, bpp).map_or(0, |layout| layout.1);
         note_dumb_failure(card, bytes, &result);
         result
@@ -2472,6 +2477,7 @@ fn create(state: &GemState, arg: usize) -> Result<u64, FsError> {
         None => None,
     };
     let result = create_locked(state, arg, gate.as_ref());
+    drop(gate);
     note_create_failure(state, arg, &result);
     result
 }
