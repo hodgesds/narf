@@ -3997,7 +3997,9 @@ pub(crate) fn note_file_written(
 }
 
 mod writeback;
-pub(crate) use writeback::{device_mapped, forget_device, read_epoch, write_and_note};
+pub(crate) use writeback::{
+    device_mapped, forget_device, read_epoch, sync_all_files_async, write_and_note,
+};
 pub(crate) use writeback::{
     fallocate_serialized, flush_file_for_read, overlay_dirty, settle_unverified,
     size_change_serialized, sync_all_files, throttle_dirtier, unmapped, writable_mapping,

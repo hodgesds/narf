@@ -1656,6 +1656,31 @@ pub(crate) fn sync_all_files(device: Option<u64>) -> Result<(), FsError> {
     first.map_or(Ok(()), Err)
 }
 
+/// [`sync_all_files`] for a caller that is a task, not a syscall: the
+/// orderly and emergency power-off paths, which do not go through
+/// `reboot(2)` and so not through the pre-shutdown sync. Same engine, same
+/// batches, awaited instead of driven.
+pub(crate) async fn sync_all_files_async() {
+    super::release_deferred_slots();
+    if FILE_ENTRIES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    for (file, writer) in files_on(None) {
+        let mut budget = usize::MAX;
+        if let Err(error) = write_range(
+            &file,
+            &writer,
+            (0, u64::MAX),
+            Plan::background(Select::All),
+            &mut budget,
+        )
+        .await
+        {
+            file.record_error(error);
+        }
+    }
+}
+
 /// Whether a file of the filesystem `device` still has a page mapped. A
 /// mapping holds its file's mount on Linux (`vma->vm_file` pins the
 /// vfsmount), so a plain `umount` of it is `EBUSY`.

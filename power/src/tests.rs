@@ -4352,3 +4352,82 @@ kernel_test_in!(
     "power/service",
     smoke_power_monitor_first_poll_seeds_baseline
 );
+
+// ── orderly power-off: mapped pages before the filesystem sync ─────────
+
+static SYNC_ORDER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static MAPPED_AT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FILESYSTEMS_AT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn recording_mapped_sync(
+) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>> {
+    alloc::boxed::Box::pin(async {
+        MAPPED_AT.store(
+            SYNC_ORDER.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1,
+            core::sync::atomic::Ordering::Release,
+        );
+    })
+}
+
+fn stuck_mapped_sync(
+) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>> {
+    alloc::boxed::Box::pin(core::future::pending())
+}
+
+fn poll_until_ready<F: core::future::Future>(future: F) -> Option<F::Output> {
+    let mut future = core::pin::pin!(future);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    for _ in 0..50_000_000u64 {
+        if let core::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return Some(value);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// The sync both the orderly power-off and the forced (emergency) one run
+/// writes the unwritten mapped pages before it syncs the filesystems — the
+/// `reboot(2)` path already did; these two skipped them — and a stuck
+/// device cannot hold it past its deadline.
+fn smoke_orderly_sync_writes_mapped_pages_first() -> TestResult {
+    use core::sync::atomic::Ordering;
+    let saved = crate::orderly::__swap_mapped_page_sync_for_test(Some(recording_mapped_sync));
+    SYNC_ORDER.store(0, Ordering::Release);
+    MAPPED_AT.store(0, Ordering::Release);
+    FILESYSTEMS_AT.store(0, Ordering::Release);
+    let filesystems = async {
+        FILESYSTEMS_AT.store(
+            SYNC_ORDER.fetch_add(1, Ordering::AcqRel) + 1,
+            Ordering::Release,
+        );
+    };
+    let ran = poll_until_ready(crate::orderly::shutdown_sync(
+        narf_time::Deadline::after_ms(5_000),
+        filesystems,
+    ));
+    let ordered =
+        MAPPED_AT.load(Ordering::Acquire) == 1 && FILESYSTEMS_AT.load(Ordering::Acquire) == 2;
+
+    crate::orderly::__swap_mapped_page_sync_for_test(Some(stuck_mapped_sync));
+    let bounded = poll_until_ready(crate::orderly::shutdown_sync(
+        narf_time::Deadline::after_ms(20),
+        async {},
+    ));
+    crate::orderly::__swap_mapped_page_sync_for_test(saved);
+
+    if ran != Some(Some(())) {
+        return TestResult::Fail("the power-off sync did not complete");
+    }
+    if !ordered {
+        return TestResult::Fail("mapped pages were not written before the filesystem sync");
+    }
+    if bounded != Some(None) {
+        return TestResult::Fail("a stuck mapped-page sync was not cut off at its deadline");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/orderly",
+    smoke_orderly_sync_writes_mapped_pages_first
+);
