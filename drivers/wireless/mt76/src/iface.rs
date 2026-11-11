@@ -1340,6 +1340,20 @@ impl WirelessNetIface for Mt76Iface {
         true
     }
 
+    /// The ciphers the owner implements: CCMP-128 for data and the
+    /// BIP-CMAC-128 IGTK (`MCU_CIPHER_BIP_CMAC_128`) for robust management
+    /// frames. Advertising AES-CMAC is what gives wpa_supplicant
+    /// WPA_DRIVER_CAPA_ENC_BIP, without which a profile with the default
+    /// `pmf` never asks for PMF. Linux mt7921 lists mac80211's full set
+    /// (CCMP-256, GCMP-128/256, BIP-CMAC-256, BIP-GMAC-128/256 too); those
+    /// are not implemented by this owner and are not offered.
+    fn cipher_suites(&self) -> &'static [u32] {
+        &[
+            narf_wireless::CIPHER_SUITE_CCMP,
+            narf_wireless::CIPHER_SUITE_AES_CMAC,
+        ]
+    }
+
     /// The native station owner runs SAE (hunting-and-pecking and
     /// hash-to-element), the 4-way handshake and management-frame protection
     /// from a password (`Security::Wpa3Sae`), which is what
