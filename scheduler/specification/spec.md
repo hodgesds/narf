@@ -650,17 +650,21 @@ be mistaken for an empty runnable queue. A delayed node follows a migrated
 task's current parked token; the CPU-offline path drains again after moving its
 resident owners, paired with producers' token recheck under the inbox gate.
 
-A linked node names a task parked on that CPU, or one reaped from it that has
-no further wake to lose. Every path that takes a woken task out of a CPU's
-parked set to run it, other than the owner's drain (which has already detached
-the node), unlinks the node under the gate before the slot is enqueued
-anywhere: wake-time placement, synchronous wake affinity, a runtime
-affinity move, local activation, donation, the park-time wake recheck, and an
-idle CPU's pull. While the slot is in that path's hands its parked token is
-clear, so no producer can link the node again. Without this the node's claim
-would coalesce the task's next wake, and a task that slept again on its new CPU
-would wait for its old home to drain. The lock order is parked set, then gate;
-the gate remains a leaf.
+A node on a CPU's public inbox list names a task parked on that CPU, or one
+reaped from it that has no further wake to lose. Every path that takes a task
+out of a CPU's parked set to run it unlinks the task's node under the gate
+before the slot is enqueued anywhere: the owner's drain, wake-time placement,
+synchronous wake affinity, a runtime affinity move, local activation, donation,
+the park-time wake recheck, and an idle CPU's pull. The owner's drain is on
+that list because it releases a detached node's claim before it takes the slot
+(a wake after the release must be able to stage itself), and a wake in that
+window links the cell on the public list again. While the slot is in the
+taker's hands its parked token is clear, so no producer can link the node
+again. Without this the node's claim would coalesce the task's next wake, and
+a task that slept again on its new CPU would wait for its old home to drain.
+The one node a taker cannot unlink is one in the owner's detached batch; the
+drain that detached it is already running and releases or forwards it. The
+lock order is parked set, then gate; the gate remains a leaf.
 
 Home publication precedes the SeqCst parked-token store. The subsequent
 SeqCst awake-bit recheck pairs with the waker's SeqCst flag swap followed by
