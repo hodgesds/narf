@@ -701,6 +701,27 @@ pub async fn system_resume() -> Result<(), WirelessError> {
     }
 }
 
+/// Kernel-log lines [`note_failure`] may still print this boot.
+static FAILURE_NOTES: AtomicU32 = AtomicU32::new(24);
+
+/// Name the stage and native error behind a failed scan or association.
+/// cfg80211 reports only NL80211_CMD_SCAN_ABORTED or a CONNECT status code to
+/// userspace, and the `WirelessError` this driver returns folds every
+/// firmware/transport error into a handful of classes, so without this line
+/// a hardware boot cannot tell a regulatory refusal from an MCU timeout.
+/// Operator-driven and bounded for the boot.
+fn note_failure(stage: &str, error: &dyn core::fmt::Debug) {
+    if FAILURE_NOTES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+    {
+        use core::fmt::Write;
+        let _ = writeln!(narf_console::Writer, "mt76: {stage} failed: {error:?}");
+    }
+}
+
 fn transmit_admitted(bytes: &[u8], local: [u8; 6]) -> bool {
     (14..=1514).contains(&bytes.len())
         && bytes[6..12] == local
@@ -1078,12 +1099,15 @@ impl WirelessNetIface for Mt76Iface {
         }
         let result = async {
             use crate::mt7921::firmware_transport::{scan_boot_with_options, Error, ScanOptions};
-            let map_error = |error| match error {
-                Error::Bounds => WirelessError::InvalidArgs,
-                Error::Busy => WirelessError::Busy,
-                Error::Timeout => WirelessError::Timeout,
-                Error::Authority => WirelessError::Denied,
-                _ => WirelessError::HardwareError,
+            let map_error = |error: Error| {
+                note_failure("scan", &error);
+                match error {
+                    Error::Bounds => WirelessError::InvalidArgs,
+                    Error::Busy => WirelessError::Busy,
+                    Error::Timeout => WirelessError::Timeout,
+                    Error::Authority => WirelessError::Denied,
+                    _ => WirelessError::HardwareError,
+                }
             };
             let mut found = Vec::new();
             if !channels.is_empty() {
@@ -1165,25 +1189,34 @@ impl WirelessNetIface for Mt76Iface {
         if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
-        let six = self.validate_join(&req)?;
-        self.finish_teardown(true).await?;
+        let six = self
+            .validate_join(&req)
+            .inspect_err(|error| note_failure("associate: join validation", error))?;
+        self.finish_teardown(true)
+            .await
+            .inspect_err(|error| note_failure("associate: previous-link teardown", error))?;
         if self.link_up() {
             return Err(WirelessError::Busy);
         }
         let security = core::mem::replace(&mut req.security, narf_wireless::SecurityConfig::Open);
-        let (bss, security) = self.resolve_join(&req, security, six)?;
+        let (bss, security) = self
+            .resolve_join(&req, security, six)
+            .inspect_err(|error| note_failure("associate: BSS/security resolution", error))?;
         {
             use crate::mt7921::firmware_transport::{associate_boot_station_as, Error};
             // Stable under `control`: SET_INTERFACE also takes that lock.
             let p2p_client = self.current_iftype() == 8;
             let aid = associate_boot_station_as(&bss, &req.ssid, security, &req.ie, p2p_client)
                 .await
-                .map_err(|error| match error {
-                    Error::Bounds => WirelessError::InvalidArgs,
-                    Error::Busy => WirelessError::Busy,
-                    Error::Timeout => WirelessError::Timeout,
-                    Error::Authority => WirelessError::Denied,
-                    _ => WirelessError::HardwareError,
+                .map_err(|error| {
+                    note_failure("associate: firmware join/handshake", &error);
+                    match error {
+                        Error::Bounds => WirelessError::InvalidArgs,
+                        Error::Busy => WirelessError::Busy,
+                        Error::Timeout => WirelessError::Timeout,
+                        Error::Authority => WirelessError::Denied,
+                        _ => WirelessError::HardwareError,
+                    }
                 })?;
             let _ = aid;
             let (tx_prod, tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
