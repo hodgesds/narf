@@ -869,6 +869,20 @@ impl Actor {
                 (1, 0xd4) if b.len() == 428 => vec![],
                 (1, 0xd3) if b.len() == 12 => vec![],
                 (1, 0xed) if b.is_empty() => vec![],
+                // The P2P model's NVM sets LAR, so every P2P operation
+                // requeries the current regulatory profile with MCC_UPDATE_CMD
+                // "ZZ" (mvm/nvm.c iwl_mvm_update_mcc); answer with a v3
+                // response (world "00") whose 110 channels are
+                // VALID|ACTIVE|20MHZ.
+                (1, 0xc8) if self.native_p2p.is_some() && b.len() == 28 && b[..2] == *b"ZZ" => {
+                    let mut r = vec![0; 16 + 110 * 4];
+                    r[4..6].copy_from_slice(b"00");
+                    r[12..16].copy_from_slice(&110u32.to_le_bytes());
+                    for word in r[16..].chunks_exact_mut(4) {
+                        word.copy_from_slice(&0x109u32.to_le_bytes());
+                    }
+                    r
+                }
                 _ => return Err("unexpected MVM interface control publication"),
             };
             self.reply(c, if g == 1 && c == 0x18 { 0 } else { g }, s, body);
