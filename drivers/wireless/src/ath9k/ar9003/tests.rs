@@ -1465,8 +1465,11 @@ fn smoke_ath9k_ar9565_revision_and_ini_selection() -> TestResult {
     for (gain, want) in [
         (0x10, (0x2933_c147_64b7_9269, 711)),
         (0x30, (0x6e44_8409_1357_10d3, 711)),
-        (0x40, (0x1a89_dc82_fb67_258b, 711)),
-        (0x01, (0x2628_b5d3_2011_bf01, 711)),
+        // Mode 4 swaps the 56-row AR9565 TX table for the 102-row
+        // AR9300 2p2 mixed table; RX mode 1 the 259-row common table
+        // for the 256-row wo_xlna one.
+        (0x40, (0x1a89_dc82_fb67_258b, 757)),
+        (0x01, (0x2628_b5d3_2011_bf01, 708)),
     ] {
         let Some(tables) = tables_for(gain, &rev11, pll9565) else {
             return TestResult::Fail("identity refused");
@@ -1590,7 +1593,10 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
     let Some(default) = tables_for(0x00, &rev11, pll9485) else {
         return TestResult::Fail("identity refused");
     };
-    if oracle(&default) != (0x9169_df72_650e_e951, 648)
+    // txrxgain 0: `ar9003_rx_gain_table_mode0` replaces the
+    // `ar9003_hw_init_mode_regs` wo-XLNA default with
+    // `ar9485_common_rx_gain_1_1`.
+    if oracle(&default) != (0x80b4_c5ff_64c6_1020, 648)
         || default.tx_gain_kind != TxGain::LowestObDb
         || default.rx_gain_kind != RxGain::Common
         || !core::ptr::eq(default.mac_post, t::AR9485_1_1_MAC_POSTAMBLE)
@@ -1633,7 +1639,7 @@ fn smoke_ath9k_ar9485_revision_and_ini_selection() -> TestResult {
     let Some(default12) = tables_for(0x00, &rev12, pll9485) else {
         return TestResult::Fail("identity refused");
     };
-    if oracle(&default12) != (0x9169_df72_650e_e951, 648)
+    if oracle(&default12) != (0x80b4_c5ff_64c6_1020, 648)
         || !core::ptr::eq(default12.mac_core, t::AR9485_1_1_MAC_CORE)
     {
         return TestResult::Fail("AR9485 later macRev INI selection differs from Linux");
