@@ -21,6 +21,8 @@ const NEVER: u8 = 1;
 const NO_SPACE: u8 = 2;
 /// The write waits for `Store::gate_open`.
 const GATED: u8 = 3;
+/// Every write fails with EIO.
+const IO_ERROR: u8 = 4;
 
 /// What a test keeps of its file after dropping every reference to it.
 struct Store {
@@ -88,6 +90,7 @@ impl FileOps for MemFile {
             match self.store.mode.load(Ordering::Acquire) {
                 NEVER => core::future::pending::<()>().await,
                 NO_SPACE => return Err(FsError::NoSpace),
+                IO_ERROR => return Err(FsError::Io(narf_block::BlockError::IOError)),
                 GATED => Gate(&self.store.gate_open).await,
                 _ => {}
             }
@@ -864,26 +867,31 @@ fn smoke_hole_punch_reaches_cached_pages() -> TestResult {
 }
 kernel_test_in!("userspace/writeback", smoke_hole_punch_reaches_cached_pages);
 
-/// A background write that fails is recorded on the file and reported by
-/// the next `fsync`, once, with its own errno. A file whose writes keep
-/// failing does not keep its pages — or itself — for ever.
-fn smoke_write_error_is_reported_once_and_pages_dropped() -> TestResult {
+/// Write errors, as Linux btrfs treats them. A transient one (ENOSPC) keeps
+/// the page dirty for as many passes as it takes — it is never dropped on a
+/// timer — and the next `fsync` reports it once, after writing the page
+/// when space is back. A hard one (EIO) is recorded and reported once, and
+/// the page stops being dirty with the bytes that were attempted, as
+/// `extent_writepage` leaves a folio after `-EIO`.
+fn smoke_write_errors_keep_transient_pages_and_report_once() -> TestResult {
     let mut fixture = Fixture::new(2);
-    let Some(pages) = fixture.map(0, 1) else {
+    let Some(pages) = fixture.map(0, 2) else {
         return TestResult::Fail("could not map the test file");
     };
     store_bytes(pages[0], 0, b"no room for this");
-    fixture.unmap(&pages);
+    fixture.unmap(&pages[..1]);
 
     fixture.store.mode.store(NO_SPACE, Ordering::Release);
-    if run(background_pass()).is_none() {
-        return TestResult::Fail("the background pass did not complete");
+    for _ in 0..8 {
+        if run(background_pass()).is_none() {
+            return TestResult::Fail("the background pass did not complete");
+        }
     }
     if fixture.idle_dirty() != 1 || fixture.cached(0) != Some((false, true)) {
-        return TestResult::Fail("one failed write dropped the page");
+        return TestResult::Fail("a page that failed with ENOSPC was dropped or marked clean");
     }
-    // Space comes back; fsync writes the page and still has to say that a
-    // write was lost track of in the meantime.
+    // Space comes back; fsync writes the page and still says that a write
+    // was lost track of in the meantime — once.
     fixture.store.mode.store(WRITES, Ordering::Release);
     if super::super::flush_current_file(fixture.ops()) != Err(FsError::NoSpace) {
         return TestResult::Fail("fsync did not report the background ENOSPC");
@@ -895,35 +903,31 @@ fn smoke_write_error_is_reported_once_and_pages_dropped() -> TestResult {
         return TestResult::Fail("the same writeback error was reported twice");
     }
 
-    // A file that never takes the write again.
-    let Some(pages) = fixture.map(1, 1) else {
-        return TestResult::Fail("could not map the test file again");
-    };
-    store_bytes(pages[0], 0, b"never written");
-    fixture.unmap(&pages);
-    fixture.store.mode.store(NO_SPACE, Ordering::Release);
-    for _ in 0..MAX_FAILED_PASSES {
-        if run(background_pass()).is_none() {
-            return TestResult::Fail("the background pass did not complete");
-        }
+    // A hard error.
+    store_bytes(pages[1], 0, b"lost to EIO");
+    fixture.unmap(&pages[1..]);
+    fixture.store.mode.store(IO_ERROR, Ordering::Release);
+    if run(background_pass()).is_none() {
+        return TestResult::Fail("the background pass did not complete");
     }
-    if fixture.idle_dirty() != 0 || fixture.cached(1).is_some() {
-        return TestResult::Fail("a page whose writes keep failing was kept for ever");
+    if fixture.idle_dirty() != 0 {
+        return TestResult::Fail("a page that failed with EIO stayed dirty");
     }
-    // Still open here, so the entry — and the error — wait for an fsync.
-    if super::super::flush_current_file(fixture.ops()) != Err(FsError::NoSpace) {
-        return TestResult::Fail("fsync did not report the pages that were dropped");
+    fixture.store.mode.store(WRITES, Ordering::Release);
+    if !matches!(
+        super::super::flush_current_file(fixture.ops()),
+        Err(FsError::Io(_))
+    ) {
+        return TestResult::Fail("fsync did not report the background EIO");
     }
-    // Once nothing else has the file open the entry lets go of it too.
-    fixture.ops = None;
-    if run(background_pass()).is_none() || fixture.store.dropped.load(Ordering::Relaxed) != 1 {
-        return TestResult::Fail("a file with failed writes stayed pinned by the cache");
+    if super::super::flush_current_file(fixture.ops()) != Ok(()) {
+        return TestResult::Fail("the EIO was reported twice");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "userspace/writeback",
-    smoke_write_error_is_reported_once_and_pages_dropped
+    smoke_write_errors_keep_transient_pages_and_report_once
 );
 
 static THROTTLE_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -1162,7 +1166,7 @@ fn smoke_reads_see_unwritten_mapped_stores() -> TestResult {
     if run(fixture.ops().read(0, &mut read)) != Some(Ok(8192)) {
         return TestResult::Fail("read of the test file failed");
     }
-    overlay_dirty(fixture.ops(), 0, &mut read);
+    overlay_dirty(fixture.ops(), 0, &mut read, read_epoch());
     if read[4090..4105] != *b"across the page" {
         return TestResult::Fail("a read did not see a mapped store that is not written back");
     }
@@ -1171,7 +1175,7 @@ fn smoke_reads_see_unwritten_mapped_stores() -> TestResult {
     }
     // An unaligned window inside the second page.
     let mut tail = vec![0u8; 5];
-    overlay_dirty(fixture.ops(), 4100, &mut tail);
+    overlay_dirty(fixture.ops(), 4100, &mut tail, read_epoch());
     if tail != *b" page" {
         return TestResult::Fail("the overlay misplaced bytes in an unaligned read");
     }
@@ -1180,7 +1184,7 @@ fn smoke_reads_see_unwritten_mapped_stores() -> TestResult {
     // itself.
     fixture.unmap(&pages);
     let mut again = vec![0u8; 15];
-    overlay_dirty(fixture.ops(), 4090, &mut again);
+    overlay_dirty(fixture.ops(), 4090, &mut again, read_epoch());
     if again != *b"across the page" {
         return TestResult::Fail("a read after munmap lost the unwritten store");
     }
@@ -1400,7 +1404,7 @@ fn read2(fixture: &Fixture, len: usize) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; len];
     let n = run(fixture.ops().read(0, &mut buf))?.ok()?;
     buf.truncate(n);
-    overlay_dirty(fixture.ops(), 0, &mut buf);
+    overlay_dirty(fixture.ops(), 0, &mut buf, read_epoch());
     Some(buf)
 }
 
@@ -1590,4 +1594,263 @@ fn smoke_flusher_writes_for_real_user_tasks() -> TestResult {
 kernel_test_in!(
     "userspace/writeback",
     smoke_flusher_writes_for_real_user_tasks
+);
+
+/// Review item 1, the out-of-lock case: an unmapped dirty page; a write
+/// that does not take the file lock (AIO, a splice sink) samples its stamp;
+/// a batch that copied the page before that write puts the older bytes on
+/// the file after it. Completing, the batch must not settle the page — on a
+/// filesystem without a cache generation that freed it, on one with a
+/// generation it listed it for eviction — or the write's report finds no
+/// page to tell, and the older bytes stay on the file for good.
+fn smoke_out_of_lock_write_racing_a_batch_keeps_its_page() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    let page = pages[0];
+    store_bytes(page, 0, b"mapped store");
+    fixture.unmap(&pages);
+    let Some((entry, ops)) = fixture.entry() else {
+        return TestResult::Fail("a file with an unwritten page has no cache entry");
+    };
+    fixture.store.mode.store(GATED, Ordering::Release);
+    let mut cx = Context::from_waker(Waker::noop());
+    let stamp;
+    {
+        let mut budget = usize::MAX;
+        let mut batch = core::pin::pin!(write_range(
+            &entry,
+            &ops,
+            (0, u64::MAX),
+            Plan::background(Select::Idle),
+            &mut budget,
+        ));
+        if batch.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("the gated batch did not stop in its write");
+        }
+        // The out-of-lock write begins, and reaches the file.
+        stamp = write_stamp();
+        fixture.store.bytes.lock()[100..108].copy_from_slice(b"WRITE(2)");
+        // The batch's older image of the whole page lands after it.
+        fixture.store.gate_open.store(true, Ordering::Release);
+        if !matches!(batch.as_mut().poll(&mut cx), Poll::Ready(Ok(_))) {
+            return TestResult::Fail("the released batch did not complete");
+        }
+    }
+    fixture.store.mode.store(WRITES, Ordering::Release);
+    if fixture.cached(0) != Some((false, true)) {
+        return TestResult::Fail(
+            "a batch settled a page an out-of-lock write still had to report to",
+        );
+    }
+    note_file_written(fixture.ops(), 100, b"WRITE(2)", stamp);
+    if super::super::flush_current_file(fixture.ops()).is_err()
+        || fixture.file_bytes(100, 8) != *b"WRITE(2)"
+        || fixture.file_bytes(0, 12) != *b"mapped store"
+    {
+        return TestResult::Fail("the out-of-lock write was lost to the older batch image");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_out_of_lock_write_racing_a_batch_keeps_its_page
+);
+
+/// The guard of item 1 does not hold pages for ever under a writer that
+/// never pauses: a write that began after a page's last batch does not
+/// keep that page from settling.
+fn smoke_newer_writers_do_not_hold_pages() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    store_bytes(pages[0], 0, b"settle me");
+    fixture.unmap(&pages);
+    let older = write_stamp();
+    if super::super::flush_current_file(fixture.ops()).is_err() {
+        return TestResult::Fail("fsync of the mapped file failed");
+    }
+    if fixture.cached(0) != Some((false, true)) {
+        return TestResult::Fail("a page was settled while an older writer was in flight");
+    }
+    // A stream of writers: each new one starts before the last ends.
+    let newer = write_stamp();
+    drop(older);
+    if run(background_pass()).is_none() {
+        return TestResult::Fail("the background pass did not complete");
+    }
+    let settled = fixture.cached(0) == Some((false, false));
+    drop(newer);
+    if !settled {
+        return TestResult::Fail("a writer newer than the page's last batch kept it unsettled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/writeback", smoke_newer_writers_do_not_hold_pages);
+
+/// Review item 1, the `write(2)` path: while a batch of the file is in
+/// progress, a write waits for the file lock — nothing of it reaches the
+/// file or the cache — and then writes and reports in one step.
+fn smoke_write2_waits_for_a_batch_in_flight() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    let Some((entry, _)) = fixture.entry() else {
+        return TestResult::Fail("a mapped file has no cache entry");
+    };
+    let Some(batch_holds) = entry.lock.try_lock() else {
+        return TestResult::Fail("the file's writeback lock was not free");
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut write = core::pin::pin!(write_and_note(
+        Arc::clone(fixture.ops()),
+        64,
+        b"locked write".to_vec()
+    ));
+    if write.as_mut().poll(&mut cx).is_ready()
+        || fixture.store.attempts.load(Ordering::Relaxed) != 0
+    {
+        return TestResult::Fail("a write(2) ran while a batch held the file");
+    }
+    drop(batch_holds);
+    let done = match write.as_mut().poll(&mut cx) {
+        Poll::Ready((result, _)) => result,
+        Poll::Pending => return TestResult::Fail("the write did not run once the batch let go"),
+    };
+    if done != Ok(12)
+        || fixture.file_bytes(64, 12) != *b"locked write"
+        || page_bytes(pages[0], 64, 12) != *b"locked write"
+    {
+        return TestResult::Fail("the locked write did not reach both the file and the page");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_write2_waits_for_a_batch_in_flight
+);
+
+/// Review item 2: with no memory to do a batch, `fsync` says so — it does
+/// not return success with the pages unwritten — and the pages stay dirty
+/// for the next attempt.
+fn smoke_fsync_reports_no_memory_and_keeps_pages() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    store_bytes(pages[0], 0, b"not yet");
+    fixture.unmap(&pages);
+    FAIL_RESERVE.store(true, Ordering::Release);
+    let starved = super::super::flush_current_file(fixture.ops());
+    FAIL_RESERVE.store(false, Ordering::Release);
+    if starved != Err(FsError::OutOfMemory) {
+        return TestResult::Fail("fsync with no memory for a batch did not report ENOMEM");
+    }
+    if fixture.cached(0) != Some((false, true)) || !fixture.log().is_empty() {
+        return TestResult::Fail("a batch with no memory touched the page or the file");
+    }
+    if super::super::flush_current_file(fixture.ops()).is_err()
+        || fixture.file_bytes(0, 7) != *b"not yet"
+    {
+        return TestResult::Fail("the page was not written once memory was back");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_fsync_reports_no_memory_and_keeps_pages
+);
+
+/// Review item 3: the release hook memory calls under its locks never
+/// drops a file. A read-only page whose open has gone is released; the
+/// entry that held the file open is parked, and dropped at the next point
+/// that holds no lock.
+fn smoke_release_hook_never_drops_a_file() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    fixture.read_only = true;
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    fixture.ops = None;
+    fixture.unmap(&pages);
+    if fixture.store.dropped.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("the release hook dropped the file's last reference");
+    }
+    super::super::release_deferred_slots();
+    if fixture.store.dropped.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("a parked entry was never dropped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/writeback", smoke_release_hook_never_drops_a_file);
+
+/// Review item 5: a read that a batch overtakes. The page is stored to,
+/// the read fetches the file's older bytes, a batch writes the page and
+/// calls it clean, and only then is the read overlaid: it must still
+/// return the store.
+fn smoke_read_overtaken_by_a_batch_sees_the_store() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    store_bytes(pages[0], 0, b"stored before the read");
+    let epoch = read_epoch();
+    let mut read = vec![0u8; 22];
+    if run(fixture.ops().read(0, &mut read)) != Some(Ok(22)) {
+        return TestResult::Fail("read of the test file failed");
+    }
+    if super::super::flush_current_file(fixture.ops()).is_err() {
+        return TestResult::Fail("fsync of the mapped file failed");
+    }
+    overlay_dirty(fixture.ops(), 0, &mut read, epoch);
+    if read != *b"stored before the read" {
+        return TestResult::Fail("a read overtaken by a batch missed a store made before it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_read_overtaken_by_a_batch_sees_the_store
+);
+
+/// Review item 7: `syncfs` (`sync_all_files` for one device) reports a
+/// mapped page it could not write, and an unmount of that filesystem
+/// leaves nothing of it in the cache: no entry holding a file open, no
+/// page for a later writeback to send to the unmounted volume. While a page
+/// is still mapped, the unmount would be EBUSY.
+fn smoke_syncfs_reports_and_unmount_forgets_the_device() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    let device = fixture.identity.device;
+    store_bytes(pages[0], 0, b"cannot be written");
+    if !device_mapped(device) {
+        return TestResult::Fail("a mapped file's filesystem did not count as busy");
+    }
+    fixture.unmap(&pages);
+    if device_mapped(device) {
+        return TestResult::Fail("an unmapped file's filesystem still counted as busy");
+    }
+    fixture.store.mode.store(IO_ERROR, Ordering::Release);
+    if !matches!(sync_all_files(Some(device)), Err(FsError::Io(_))) {
+        return TestResult::Fail("syncfs did not report a mapped page it could not write");
+    }
+    fixture.ops = None;
+    forget_device(device);
+    super::super::release_deferred_slots();
+    if fixture.cached(0).is_some() {
+        return TestResult::Fail("a page of an unmounted filesystem stayed cached");
+    }
+    if fixture.store.dropped.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("the cache kept a file of an unmounted filesystem open");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_syncfs_reports_and_unmount_forgets_the_device
 );

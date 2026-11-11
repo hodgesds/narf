@@ -82,6 +82,7 @@ pub(crate) fn load_file_mapping_pages(
     if frames.try_reserve_exact(pages).is_err() {
         return Err(());
     }
+    let epoch = crate::mapped_file::read_epoch();
     for i in 0..pages {
         let frame = match narf_memory::alloc_frame() {
             Ok(frame) => frame.start_address(),
@@ -117,7 +118,7 @@ pub(crate) fn load_file_mapping_pages(
         // A store through another `MAP_SHARED` mapping that has not been
         // written back yet is part of the file this mapping copies.
         let done = done.min(want);
-        crate::mapped_file::overlay_dirty(ops, offset + off as u64, &mut dst[..done]);
+        crate::mapped_file::overlay_dirty(ops, offset + off as u64, &mut dst[..done], epoch);
         frames.push(frame);
     }
     Ok(frames)
@@ -149,6 +150,7 @@ pub(crate) fn load_file_demand_page(
         core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
     }
     let want = (file_size - offset).min(4096) as usize;
+    let epoch = crate::mapped_file::read_epoch();
     // The fill owns the frame from here: it is handed back on success and
     // freed on every other outcome. `filemap_fault` sleeps killably
     // (`__folio_lock_or_retry` under `FAULT_FLAG_KILLABLE`), so a fatal
@@ -163,7 +165,7 @@ pub(crate) fn load_file_demand_page(
             // else can reach it until this returns, and `want <= 4096`.
             let page =
                 unsafe { core::slice::from_raw_parts_mut(filled.kernel_mut_ptr::<u8>(), want) };
-            crate::mapped_file::overlay_dirty(ops, offset, page);
+            crate::mapped_file::overlay_dirty(ops, offset, page, epoch);
             Ok(filled)
         }
         Ok(Some(Err(error))) => Err(error),
@@ -3211,6 +3213,113 @@ mod tests {
     kernel_test_in!(
         "userspace/writeback",
         smoke_truncate_of_mapped_file_zaps_its_mapper
+    );
+
+    /// `mmap(PROT_READ, MAP_SHARED)` of `fd`, then `mprotect` to read and
+    /// write: the raw syscall result.
+    fn map_then_make_writable(fd: u32) -> Result<(u64, SyscallReturn), TestResult> {
+        let mut mmap = TestCtx {
+            args: SyscallArgs {
+                arg1: 4096,
+                arg2: 1,    // PROT_READ
+                arg3: 0x01, // MAP_SHARED
+                arg4: fd as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut mmap);
+        let base = match mmap.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
+            _ => return Err(TestResult::Fail("read-only MAP_SHARED mmap failed")),
+        };
+        let mut mprotect = TestCtx {
+            args: SyscallArgs {
+                arg0: base,
+                arg1: 4096,
+                arg2: 3, // PROT_READ | PROT_WRITE
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        crate::handlers::sys_mprotect(&mut mprotect);
+        match mprotect.ret {
+            Some(ret) => Ok((base, ret)),
+            None => Err(TestResult::Fail("mprotect returned nothing")),
+        }
+    }
+
+    /// A shared mapping of a descriptor not open for writing cannot be made
+    /// writable: Linux clears `VM_MAYWRITE` on it and `mprotect` is EACCES.
+    /// Through a descriptor open for writing it can, and its stores reach
+    /// the file.
+    fn smoke_mprotect_write_needs_a_writable_descriptor() -> TestResult {
+        let (aspace, file, rw_fd) = match fallback_test_setup(vec![0; 4096]) {
+            Ok(setup) => setup,
+            Err(result) => return result,
+        };
+        let ro_fd = crate::fd::install(
+            TASK,
+            crate::fd::FdEntry {
+                ops: Arc::clone(&file) as Arc<dyn FileOps>,
+                offset: 0,
+                flags: 0,
+                status_flags: crate::fd::O_RDONLY,
+            },
+        )
+        .unwrap_or(u32::MAX);
+        if ro_fd == u32::MAX {
+            fallback_test_teardown();
+            return TestResult::Fail("could not install a read-only fd");
+        }
+        let refused = match map_then_make_writable(ro_fd) {
+            Ok((_, ret)) => ret.status == SyscallReturn::OK && ret.value as i64 == -13,
+            Err(result) => {
+                fallback_test_teardown();
+                return result;
+            }
+        };
+        let allowed = match map_then_make_writable(rw_fd) {
+            Ok((base, ret)) => {
+                (ret.status == SyscallReturn::OK && ret.value as i64 >= 0).then_some(base)
+            }
+            Err(result) => {
+                fallback_test_teardown();
+                return result;
+            }
+        };
+        let persisted = allowed.is_some_and(|base| {
+            // SAFETY: the test owns this live user root; the address lies in
+            // the FILE_DEMAND mapping just published.
+            let _ = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(base)) };
+            let Some(region) = aspace.lookup(narf_memory::VirtAddr::new(base)) else {
+                return false;
+            };
+            let Some(phys) = region.phys.first().copied().filter(|phys| phys.raw() != 0) else {
+                return false;
+            };
+            // SAFETY: the cache frame behind the test's own writable mapping.
+            unsafe { core::ptr::copy_nonoverlapping(b"RW".as_ptr(), phys.kernel_mut_ptr::<u8>(), 2) };
+            call_syscall(crate::handlers::sys_sync, SyscallArgs::default()).is_ok()
+                && file.bytes.lock()[..2] == *b"RW"
+        });
+        fallback_test_teardown();
+        if !refused {
+            return TestResult::Fail(
+                "mprotect(PROT_WRITE) of a shared mapping of a read-only fd was not EACCES",
+            );
+        }
+        if allowed.is_none() {
+            return TestResult::Fail("mprotect(PROT_WRITE) through a writable fd was refused");
+        }
+        if !persisted {
+            return TestResult::Fail("a store after mprotect(PROT_WRITE) never reached the file");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/writeback",
+        smoke_mprotect_write_needs_a_writable_descriptor
     );
 
     /// write(2) must be visible through a live generic-fallback mapping,

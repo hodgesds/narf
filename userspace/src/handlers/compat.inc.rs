@@ -2403,6 +2403,7 @@ impl crate::elf::ExecBytes for ExecSource {
                 if end > *size {
                     return Err(crate::elf::ElfError::TooShort);
                 }
+                let epoch = crate::mapped_file::read_epoch();
                 let mut done = 0usize;
                 while done < dst.len() {
                     // `poll_io_to_completion`, not the budget-capped
@@ -2423,7 +2424,7 @@ impl crate::elf::ExecBytes for ExecSource {
                 // The image as a mapping of the file shows it: a linker
                 // that wrote its output through `MAP_SHARED` and exited may
                 // not have been written back yet.
-                crate::mapped_file::overlay_dirty(ops, off, dst);
+                crate::mapped_file::overlay_dirty(ops, off, dst, epoch);
                 Ok(())
             }
         }
@@ -2696,6 +2697,7 @@ fn do_execve_resolved(
         // bytes, filled before any binfmt handler is consulted.
         let prefix_len = core::cmp::min(file_size, EXEC_PREFIX_BYTES);
         let mut buf = alloc::vec![0u8; prefix_len];
+        let epoch = crate::mapped_file::read_epoch();
         let mut off = 0usize;
         while off < prefix_len {
             match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
@@ -2722,7 +2724,7 @@ fn do_execve_resolved(
             }
         }
         buf.truncate(off);
-        crate::mapped_file::overlay_dirty(&ops, 0, &mut buf);
+        crate::mapped_file::overlay_dirty(&ops, 0, &mut buf, epoch);
         Ok((buf, ops, file_size as u64))
     };
 
@@ -3341,6 +3343,7 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
     if size == 0 || size > 64 * 1024 * 1024 {
         return None;
     }
+    let epoch = crate::mapped_file::read_epoch();
     let mut buf = alloc::vec![0u8; size];
     let mut off = 0usize;
     while off < size {
@@ -3354,7 +3357,7 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
         }
     }
     buf.truncate(off);
-    crate::mapped_file::overlay_dirty(&ops, 0, &mut buf);
+    crate::mapped_file::overlay_dirty(&ops, 0, &mut buf, epoch);
     if buf.len() < 64 {
         None
     } else {
@@ -16411,6 +16414,7 @@ mod aio {
         // fix in the same class.
         let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
         let outcome = ops.map(|ops| {
+            let epoch = crate::mapped_file::read_epoch();
             let read = poll_blocking(ops.read(offset, &mut kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
                 .ok();
@@ -16418,7 +16422,7 @@ mod aio {
             // part of the file.
             if let Some(n) = read {
                 let n = n.min(kbuf.len());
-                crate::mapped_file::overlay_dirty(&ops, offset, &mut kbuf[..n]);
+                crate::mapped_file::overlay_dirty(&ops, offset, &mut kbuf[..n], epoch);
             }
             read
         });

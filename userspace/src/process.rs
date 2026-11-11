@@ -1308,6 +1308,7 @@ fn read_path_and_file_from_vfs(
     // 3. Read in one shot. Most FSes (initramfs / memfs / FAT /
     //    ext2 file read) honour a full-length read; we loop on
     //    short reads defensively.
+    let epoch = crate::mapped_file::read_epoch();
     let mut buf = alloc::vec![0u8; size as usize];
     let mut filled: u64 = 0;
     while filled < size {
@@ -1321,7 +1322,7 @@ fn read_path_and_file_from_vfs(
         filled = filled.saturating_add(n as u64);
     }
     // As every other read of file data: see `mapped_file::overlay_dirty`.
-    crate::mapped_file::overlay_dirty(&file, 0, &mut buf);
+    crate::mapped_file::overlay_dirty(&file, 0, &mut buf, epoch);
     Some((buf, file))
 }
 

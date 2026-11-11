@@ -576,15 +576,27 @@ pub(crate) fn protection_allowed(address_space_id: u64, base: u64, len: u64, pro
         return true;
     };
     let end = base.saturating_add(len);
+    let mut denied = false;
     let files: Vec<_> = bucket
         .lock()
         .iter()
         .filter(|m| m.base < end && base < m.base.saturating_add(m.len))
-        .map(|m| (m.ops.clone(), m.file_offset + base.saturating_sub(m.base)))
+        .map(|m| {
+            // Linux clears `VM_MAYWRITE` on a shared mapping of a file not
+            // open for writing, and `mprotect_fixup` refuses PROT_WRITE on
+            // it with EACCES. Allowing it here would let stores land in
+            // pages nothing will ever write back.
+            let shared = !m.private_copy && m.pfn.is_none();
+            if shared && prot & 2 != 0 && m.provenance.as_ref().is_some_and(|p| !p.writable) {
+                denied = true;
+            }
+            (m.ops.clone(), m.file_offset + base.saturating_sub(m.base))
+        })
         .collect();
-    files
-        .into_iter()
-        .all(|(ops, offset)| prot & 7 & !ops.mmap_max_prot(offset) == 0)
+    !denied
+        && files
+            .into_iter()
+            .all(|(ops, offset)| prot & 7 & !ops.mmap_max_prot(offset) == 0)
 }
 
 /// Publish a memory VMA and its external file owner as one transaction.
@@ -1322,6 +1334,26 @@ struct SharedFilePages {
     idle_clean: alloc::collections::BTreeSet<u64>,
 }
 
+/// File entries no page needs any more, waiting to be dropped. An entry
+/// may hold the last reference to its file, and dropping that can do
+/// anything a close can — a FUSE RELEASE, a btrfs last-view teardown. The
+/// release hooks that find an entry unused run under memory's VMA and
+/// shared-mapping transactions, interrupts off; they park the entry here,
+/// and it is dropped at the next point that holds no lock:
+/// [`release_deferred_slots`], called by `munmap`, address-space teardown,
+/// the flusher and every sync.
+static DEFERRED_SLOTS: IrqSafeSpinLock<Vec<FileSlot>> = IrqSafeSpinLock::new(Vec::new());
+
+fn defer_slot(slot: FileSlot) {
+    DEFERRED_SLOTS.lock().push(slot);
+}
+
+/// Drop the parked entries. Only from a context that holds no lock.
+pub(crate) fn release_deferred_slots() {
+    let parked = core::mem::take(&mut *DEFERRED_SLOTS.lock());
+    drop(parked);
+}
+
 /// What [`SharedFilePages::page_idle`] hands back for the caller to let go
 /// of once the cache lock is released: the page's own frame and that of a
 /// page evicted to make room for it, and the file's entry if this was the
@@ -1535,6 +1567,11 @@ impl SharedFilePages {
             return;
         }
         page.idle_dirty = true;
+        // Off the idle-clean list too, or eviction could free the only copy
+        // of what this page now owes the file.
+        if core::mem::take(&mut page.idle_clean) {
+            self.idle_clean.remove(&phys);
+        }
         let key = Self::key_from_ptr(page.identity, page.offset);
         let identity = page.identity;
         self.idle_dirty.insert(key);
@@ -1768,9 +1805,11 @@ impl SharedFilePublication {
                 }
             }
         }
-        // Outside the cache lock: an entry may hold the last reference to
-        // its file.
-        drop(unused);
+        // A publication can be released from a fault under memory's
+        // locks: park the entries rather than drop them here.
+        for slot in unused {
+            defer_slot(slot);
+        }
         self.active = false;
         for phys in free {
             narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
@@ -3088,9 +3127,12 @@ pub(crate) fn release_shared_file_page(phys: u64) -> bool {
         }
         pages.page_idle(phys)
     };
-    // Outside the cache lock: the entry may hold the last reference to its
-    // file, and dropping that can do anything a close can.
-    drop(slot);
+    // This is memory's release hook, called under its VMA and shared-mapping
+    // transactions: an entry that may hold the last reference to its file
+    // is parked, never dropped here.
+    if let Some(slot) = slot {
+        defer_slot(slot);
+    }
     for frame in frames.into_iter().flatten() {
         narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
     }
@@ -3927,7 +3969,7 @@ pub(crate) fn note_file_written(
                         core::slice::from_raw_parts_mut(page.phys.kernel_mut_ptr::<u8>(), 4096)
                     };
                     frame[in_page..in_page + n].copy_from_slice(&bytes[done..done + n]);
-                    if page.wb_pins == 0 && page.wb_seq <= stamp.0 {
+                    if page.wb_pins == 0 && page.wb_seq <= stamp.seq {
                         let clean_n = n.min(page.clean.len().saturating_sub(in_page));
                         if clean_n != 0 {
                             // Unshared here: only a batch holding the page
@@ -3955,10 +3997,11 @@ pub(crate) fn note_file_written(
 }
 
 mod writeback;
+pub(crate) use writeback::{device_mapped, forget_device, read_epoch, write_and_note};
 pub(crate) use writeback::{
-    discard_stores_past_eof, fallocate_serialized, flush_file_for_read, overlay_dirty,
-    settle_unverified, size_change_serialized, sync_all_files, throttle_dirtier, unmapped,
-    writable_mapping, write_stamp, WriteStamp, BATCH_PAGES as WRITEBACK_BATCH_PAGES,
+    fallocate_serialized, flush_file_for_read, overlay_dirty, settle_unverified,
+    size_change_serialized, sync_all_files, throttle_dirtier, unmapped, writable_mapping,
+    write_stamp, BATCH_PAGES as WRITEBACK_BATCH_PAGES,
 };
 
 #[cfg(feature = "kernel-test")]

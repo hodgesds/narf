@@ -112,6 +112,7 @@ impl<T: Send + 'static> KillableWait<T> {
         }
     }
 
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn finish_with(mut self, finish: fn(T)) -> Self {
         self.finish = finish;
         self
@@ -237,6 +238,8 @@ pub(crate) fn read(
     want: usize,
     options: ReadOptions,
 ) -> Waited<usize> {
+    // Before the filesystem read: see `mapped_file::overlay_dirty`.
+    let epoch = crate::mapped_file::read_epoch();
     if !stores_file_data(ops.as_ref()) {
         let want = want.min(staging.len());
         let outcome = crate::handlers::poll_blocking(ops.read_with_options(
@@ -247,7 +250,7 @@ pub(crate) fn read(
         // A file may be mappable without saying it is plain stored data.
         if let (Some(Ok(read)), false) = (&outcome, ops.is_stream()) {
             let read = (*read).min(want);
-            crate::mapped_file::overlay_dirty(ops, offset, &mut staging[..read]);
+            crate::mapped_file::overlay_dirty(ops, offset, &mut staging[..read], epoch);
         }
         return Ok(outcome);
     }
@@ -264,66 +267,39 @@ pub(crate) fn read(
         *staging = buffer;
         if let Ok(read) = result {
             let read = read.min(staging.len());
-            crate::mapped_file::overlay_dirty(ops, offset, &mut staging[..read]);
+            crate::mapped_file::overlay_dirty(ops, offset, &mut staging[..read], epoch);
         }
         result
     }))
 }
 
-type WriteDone = (
-    Result<usize, FsError>,
-    Vec<u8>,
-    Arc<dyn FileOps>,
-    u64,
-    crate::mapped_file::WriteStamp,
-);
-
-/// What every `write(2)` caller does once its write returns, for a write
-/// whose caller was killed first: live `MAP_SHARED` fallback pages of the
-/// file must still observe the bytes that reached it.
-fn finish_killed_write((result, payload, file, offset, stamp): WriteDone) {
-    if let Ok(written) = result {
-        if written != 0 && written <= payload.len() {
-            crate::mapped_file::note_file_written(&file, offset, &payload[..written], stamp);
-        }
-    }
-}
-
 /// `write(2)`-family write of `payload` — `generic_perform_write`'s
 /// `fatal_signal_pending` test, and the reservation and writeback-throttle
 /// sleeps under it (`btrfs` `wait_reserve_ticket`, `balance_dirty_pages`),
-/// which are `TASK_KILLABLE`. A killed write is not cut short: it completes
-/// in the background, whole, as if the signal had arrived just after it.
+/// which are `TASK_KILLABLE`, and the wait for the file's writeback lock. A
+/// killed write is not cut short: it completes in the background, whole,
+/// cache report included, as if the signal had arrived just after it.
 /// `payload` comes back with the result; after `Err(Killed)` and `Ok(None)`
 /// it is empty.
 ///
-/// Anything but stored file data ([`stores_file_data`]) is written as before.
+/// The live `MAP_SHARED` pages of the file are told of the bytes here
+/// ([`crate::mapped_file::write_and_note`]); callers do not report them
+/// again.
+///
+/// Anything but stored file data ([`stores_file_data`]) is not waited for
+/// killably.
 pub(crate) fn write(ops: &Arc<dyn FileOps>, offset: u64, payload: &mut Vec<u8>) -> Waited<usize> {
-    // A write that starts past EOF extends the file over bytes a mapping
-    // may have stored past the old EOF: those must read as zeros
-    // (`pagecache_isize_extended`). A write that starts at or below EOF
-    // overwrites them itself.
-    if !ops.is_stream() {
-        let size = ops.stat().size;
-        if offset > size {
-            crate::mapped_file::discard_stores_past_eof(ops.as_ref(), size, offset);
-        }
-    }
-    if !stores_file_data(ops.as_ref()) {
-        return Ok(crate::handlers::poll_blocking(ops.write(offset, payload)));
-    }
-    let file = ops.clone();
     let bytes = core::mem::take(payload);
-    // Before the write starts: see `mapped_file::note_file_written`.
-    let stamp = crate::mapped_file::write_stamp();
-    let op: OwnedWait<WriteDone> = Box::pin(async move {
-        let result = file.write(offset, &bytes).await;
-        (result, bytes, file, offset, stamp)
-    });
-    let wait =
-        KillableWait::new(crate::handlers::current_task_id(), op).finish_with(finish_killed_write);
+    let op = crate::mapped_file::write_and_note(ops.clone(), offset, bytes);
+    if !stores_file_data(ops.as_ref()) {
+        return Ok(crate::handlers::poll_blocking(op).map(|(result, bytes)| {
+            *payload = bytes;
+            result
+        }));
+    }
+    let wait = KillableWait::new(crate::handlers::current_task_id(), Box::pin(op));
     let done = wait_with(wait, crate::handlers::poll_blocking)?;
-    Ok(done.map(|(result, bytes, _, _, _)| {
+    Ok(done.map(|(result, bytes)| {
         *payload = bytes;
         result
     }))

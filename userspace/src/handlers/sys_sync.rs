@@ -11,7 +11,7 @@ use super::*;
 /// has any — including files no process has open or mapped any more: the
 /// file cache, not any one process's fsync/msync, is what can reach them.
 pub(crate) fn sys_sync(ctx: &mut dyn TrapContext) {
-    crate::mapped_file::sync_all_files(None);
+    let _ = crate::mapped_file::sync_all_files(None);
     let _ = sync_all_blocking();
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -31,7 +31,7 @@ pub fn sync_all_blocking() -> Option<narf_filesystem::sync_all::SyncReport> {
 pub(crate) fn pre_shutdown_sync() {
     use core::fmt::Write as _;
     // Mapped data nobody has synced is still only in the file cache.
-    crate::mapped_file::sync_all_files(None);
+    let _ = crate::mapped_file::sync_all_files(None);
     match sync_all_blocking() {
         Some(r) => {
             let _ = writeln!(

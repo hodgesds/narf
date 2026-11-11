@@ -162,7 +162,6 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
         if endpoint.append() {
             offset = endpoint.ops.stat().size;
         }
-        let stamp = crate::mapped_file::write_stamp();
         // `generic_perform_write`: killable, see `killable_wait::write`.
         let outcome = match crate::killable_wait::write(&endpoint.ops, offset, &mut payload) {
             Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
@@ -190,14 +189,6 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
             }
             Ok(0) => break,
             Ok(written) if written <= payload.len() => {
-                if written != 0 {
-                    crate::mapped_file::note_file_written(
-                        &endpoint.ops,
-                        offset,
-                        &payload[..written],
-                        stamp,
-                    );
-                }
                 total += written;
                 offset = offset.saturating_add(written as u64);
                 if written < payload.len() {
