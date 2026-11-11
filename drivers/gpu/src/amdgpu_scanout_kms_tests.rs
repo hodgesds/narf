@@ -1267,6 +1267,55 @@ kernel_test_in!(
     kms_linear_native_primary_keeps_target_and_placement
 );
 
+/// The display's plane admission is asked about the CRTC's active size
+/// after the request, whether or not the request carries the MODE_ID:
+/// Navi22 plans a positioned primary only against the stream it has lit,
+/// and after a modeset to another size (KScreen's saved resolution, say)
+/// the compositor's next commits — the pointer image on the primary, the
+/// cursor plane off with a GAMMA_LUT — name no mode at all while the
+/// display still shows the old one. Judged against the old stream, their
+/// placement would be refused ("Atomic commit failed" in KWin) although
+/// the modeset that lights the new mode is what validates it.
+fn kms_plane_admission_sees_the_committed_mode() -> TestResult {
+    let Ok(f) = Fixture::new(4) else {
+        return TestResult::Fail("fixture");
+    };
+    let card = f.mode.lock();
+    // The request does not name the CRTC: its committed 64x12 mode.
+    let mut state = crate::drm::atomic::AtomicState::default();
+    if crtc_size_after(&card, &state, CRTC) != Some((64, 12)) {
+        return TestResult::Fail("committed mode not used for an untouched CRTC");
+    }
+    // The request sets another mode: that one.
+    state.crtcs.push(crate::drm::atomic::CrtcState {
+        id: CRTC,
+        enable: true,
+        active: true,
+        mode: Some(crate::Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            bpp: 32,
+        }),
+        ..Default::default()
+    });
+    if crtc_size_after(&card, &state, CRTC) != Some((1920, 1080)) {
+        return TestResult::Fail("the request's mode not used");
+    }
+    // The request switches the CRTC off, or names no CRTC of the card.
+    state.crtcs[0].mode = None;
+    if crtc_size_after(&card, &state, CRTC).is_some()
+        || crtc_size_after(&card, &state, CRTC + 1).is_some()
+    {
+        return TestResult::Fail("a CRTC without a mode has an active size");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    kms_plane_admission_sees_the_committed_mode
+);
+
 /// A commit the check accepts is one the presenter shows
 /// (dc_validate_global_state admits what dc_commit_streams programs): an
 /// overlay on a CRTC driving HDMI skips the display's own admission only

@@ -337,17 +337,19 @@ pub const fn refusal_why(refusal: Refusal) -> &'static str {
 
 /// `dc_validate_global_state` for one CRTC's planes after a DRM commit
 /// (`planes`, as `drm_native_planes::check` built them) on the lit stream
-/// `basis`, at `mode` (width, height) when the commit sets one: exactly
-/// what the presenter programs is admitted, so a refused request never
-/// reaches it and the compositor falls back at TEST_ONLY.
+/// `basis`, at `mode`, the CRTC's active size (width, height) after the
+/// commit — the callers pass the request's MODE_ID's, else the committed
+/// mode's: exactly what the presenter programs is admitted, so a refused
+/// request never reaches it and the compositor falls back at TEST_ONLY.
 ///
 /// The primary is a linear 8888 framebuffer, unrotated, blended as the
 /// bottom plane (opaque and pre-multiplied are the same over the black
 /// background; Coverage is not), and a positioned or scaled one must plan
 /// on the lit pipe ([`Basis::plan`]: `resource_build_scaling_params`, then
 /// `dcn30_validate_bandwidth`). With no lit stream, or a mode other than
-/// the lit one (a modeset in the same commit), the placement is validated
-/// by the modeset that lights it.
+/// the lit one (a modeset in this commit, or one committed earlier that
+/// the display has not lit yet), the placement is validated by the modeset
+/// that lights it.
 ///
 /// An enabled overlay is refused: the presenter does not lease and program
 /// the slave pipe from a commit ([`plan_two`] and

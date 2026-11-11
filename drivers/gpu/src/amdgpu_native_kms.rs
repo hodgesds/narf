@@ -160,15 +160,22 @@ pub const PLANES_REFUSED: &str =
 /// `amdgpu_navi48_platform::display_admits_planes` and
 /// `amdgpu_navi22_plane::admit`): dc_validate_global_state for one CRTC.
 /// The error is the refusal trace's `why=` text.
+///
+/// `mode` is the timing the request itself sets on the CRTC, if any
+/// (Navi48 plans the planes on it); `active` is the CRTC's active size
+/// after the request — that timing's, else the committed mode's — which
+/// Navi22 compares with its lit stream: a plane placed for a mode the
+/// display is not showing yet is validated by the modeset that lights it,
+/// whether or not this request is the one carrying the MODE_ID.
 pub fn display_admits_planes(
     display: u8,
     connector: Option<u32>,
     mode: Option<&DrmModeModeInfo>,
+    active: Option<(u32, u32)>,
     planes: &crate::drm_native_planes::DisplayPlanes,
 ) -> Result<(), &'static str> {
     if navi22() {
-        let mode = mode.map(|m| (u32::from(m.hdisplay), u32::from(m.vdisplay)));
-        return crate::amdgpu_navi22_platform::planes_admitted(display, mode, planes);
+        return crate::amdgpu_navi22_platform::planes_admitted(display, active, planes);
     }
     crate::amdgpu_navi48_platform::display_admits_planes(
         display,

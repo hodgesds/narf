@@ -6381,9 +6381,12 @@ fn atomic_commit(
                     hdmi,
                     crate::amdgpu_native_kms::output_search_admits_planes(),
                     || {
-                        crate::amdgpu_native_kms::display_admits_planes(d, connector, wire, dp)
-                            .map_err(|refusal| why = refusal)
-                            .is_ok()
+                        let active = crtc_size_after(&card, &state, dp.crtc_id);
+                        crate::amdgpu_native_kms::display_admits_planes(
+                            d, connector, wire, active, dp,
+                        )
+                        .map_err(|refusal| why = refusal)
+                        .is_ok()
                     },
                 ) {
                     return Err(invalid_why(line!(), why));
@@ -7744,6 +7747,24 @@ fn note_commit_milestones(
 /// display is still asked: a commit the check accepts must be one the
 /// presenter shows.
 #[cfg(feature = "amdgpu")]
+/// CRTC `crtc_id`'s active size (width, height) after atomic request
+/// `state`: the mode the request gives it when it names the CRTC, else the
+/// committed one (drm_atomic_get_new_crtc_state, or the current state of a
+/// CRTC the request leaves alone). None when the CRTC has no mode then.
+pub(crate) fn crtc_size_after(
+    card: &crate::drm::card::Card,
+    state: &crate::drm::atomic::AtomicState,
+    crtc_id: u32,
+) -> Option<(u32, u32)> {
+    state
+        .crtcs
+        .iter()
+        .find(|c| c.id == crtc_id)
+        .map(|c| c.mode)
+        .unwrap_or_else(|| card.crtc(crtc_id).ok().and_then(|c| c.mode))
+        .map(|m| (m.width, m.height))
+}
+
 fn planes_admitted(hdmi: bool, search_admits_planes: bool, display: impl FnOnce() -> bool) -> bool {
     (hdmi && search_admits_planes) || display()
 }
@@ -7985,6 +8006,7 @@ fn handle_setcrtc_decoded(
                         d,
                         native_connector,
                         native_wire.as_ref(),
+                        mode.map(|m| (m.width, m.height)),
                         &planes,
                     ) {
                         return Err(invalid_why(line!(), why));
@@ -8640,8 +8662,14 @@ fn handle_setplane_decoded_native(
                 if let Some(d) =
                     crate::amdgpu_native_kms::crtc_display(dp.crtc_id).filter(|_| amdgpu)
                 {
+                    // SETPLANE changes no mode: the CRTC's committed one.
+                    let active = card
+                        .crtc(dp.crtc_id)
+                        .ok()
+                        .and_then(|c| c.mode)
+                        .map(|m| (m.width, m.height));
                     if let Err(why) =
-                        crate::amdgpu_native_kms::display_admits_planes(d, None, None, dp)
+                        crate::amdgpu_native_kms::display_admits_planes(d, None, None, active, dp)
                     {
                         return Err(invalid_why(line!(), why));
                     }

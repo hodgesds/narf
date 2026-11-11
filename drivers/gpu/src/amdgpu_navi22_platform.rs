@@ -2655,9 +2655,10 @@ pub(crate) fn placement_admitted(
 }
 
 /// `dc_validate_global_state` for display `display`'s planes after a DRM
-/// commit ([`crate::amdgpu_navi22_plane::admit`]) at `mode` (the commit's,
-/// None: the current one). Only CRTC 0 presents, so only its lit stream is
-/// a basis; another CRTC's placement has no stream to plan on here.
+/// commit ([`crate::amdgpu_navi22_plane::admit`]) at `mode`, the CRTC's
+/// active size after the commit (the request's MODE_ID's, else the
+/// committed mode's). Only CRTC 0 presents, so only its lit stream is a
+/// basis; another CRTC's placement has no stream to plan on here.
 pub(crate) fn planes_admitted(
     display: u8,
     mode: Option<(u32, u32)>,
