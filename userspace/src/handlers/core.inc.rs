@@ -13951,6 +13951,12 @@ struct PendingTermination {
     group: bool,
 }
 
+/// [`narf_power::orderly::MappedPageSync`]: see `wait_init`.
+fn mapped_page_sync(
+) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>> {
+    alloc::boxed::Box::pin(crate::mapped_file::sync_all_files_async())
+}
+
 pub fn wait_init() {
     // Once per boot: wait_init runs again on every test reset, and the pump
     // registry has a fixed number of slots.
@@ -13962,6 +13968,10 @@ pub fn wait_init() {
     // Every reboot / power-off / halt syncs every mounted filesystem before
     // the device shutdown hooks (NVMe Flush + CC.SHN) run. Idempotent.
     narf_power::system::install_pre_shutdown_sync(pre_shutdown_sync);
+    // The orderly and emergency power-offs (power button, thermal trip) do
+    // not go through `reboot(2)`: they write the unwritten mapped pages
+    // through this hook before their own filesystem sync.
+    narf_power::orderly::install_mapped_page_sync(mapped_page_sync);
     *PARENT_OF.lock() = Some(BTreeMap::new());
     parent_child_counts_init();
     crate::ptrace::ptrace_init();

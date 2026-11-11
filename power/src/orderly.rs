@@ -177,6 +177,59 @@ pub fn start_worker() {
     });
 }
 
+/// Writes back the file data that lives only in the kernel's own caches
+/// above the filesystems — dirty `MAP_SHARED` pages — so that a filesystem
+/// sync after it covers it. Installed by `narf_userspace`, which owns that
+/// cache.
+pub type MappedPageSync = fn() -> Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send>>;
+
+static MAPPED_PAGE_SYNC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the [`MappedPageSync`] hook. Idempotent.
+pub fn install_mapped_page_sync(hook: MappedPageSync) {
+    MAPPED_PAGE_SYNC.store(hook as usize, Ordering::Release);
+}
+
+/// Swap the hook, returning the old one. Test-only.
+#[doc(hidden)]
+pub fn __swap_mapped_page_sync_for_test(hook: Option<MappedPageSync>) -> Option<MappedPageSync> {
+    let old = MAPPED_PAGE_SYNC.swap(hook.map_or(0, |h| h as usize), Ordering::AcqRel);
+    // SAFETY: only `MappedPageSync` pointers (or 0) are stored.
+    (old != 0).then(|| unsafe { core::mem::transmute::<usize, MappedPageSync>(old) })
+}
+
+fn mapped_page_sync() -> Option<MappedPageSync> {
+    let raw = MAPPED_PAGE_SYNC.load(Ordering::Acquire);
+    // SAFETY: only `MappedPageSync` pointers (or 0) are stored.
+    (raw != 0).then(|| unsafe { core::mem::transmute::<usize, MappedPageSync>(raw) })
+}
+
+/// The filesystem sync of a power-off that does not go through `reboot(2)`:
+/// first the mapped pages (the hook), then `filesystems` — the order of
+/// Linux's `sync()`, which writes the page cache before the filesystems
+/// commit. Both are bounded together by `deadline`: a device that stops
+/// answering must not keep a thermal power-off from happening. Returns
+/// `None` when the deadline cut it short.
+pub(crate) async fn shutdown_sync<F: Future>(
+    deadline: narf_time::Deadline,
+    filesystems: F,
+) -> Option<F::Output> {
+    let hook = mapped_page_sync();
+    narf_time::timeout(deadline, async move {
+        if let Some(hook) = hook {
+            hook().await;
+        }
+        filesystems.await
+    })
+    .await
+    .ok()
+}
+
+/// How long the forced power-off of a hardware protection shutdown spends
+/// syncing before it powers off anyway (Linux `emergency_sync` is likewise
+/// best effort).
+const EMERGENCY_SYNC_MS: u64 = 2_000;
+
 /// The worker body after a request: sync (bounded), then power off.
 async fn run(reason: OrderlyReason) {
     use core::fmt::Write as _;
@@ -188,8 +241,8 @@ async fn run(reason: OrderlyReason) {
         budget
     );
     let deadline = narf_time::Deadline::after_ms(budget);
-    match narf_time::timeout(deadline, narf_filesystem::sync_all::sync_all()).await {
-        Ok(r) => {
+    match shutdown_sync(deadline, narf_filesystem::sync_all::sync_all()).await {
+        Some(r) => {
             let _ = writeln!(
                 narf_console::Writer,
                 "power: synced {} filesystem(s) ({} failed), flushed {} disk(s) ({} failed)",
@@ -199,7 +252,7 @@ async fn run(reason: OrderlyReason) {
                 r.flush_errors
             );
         }
-        Err(_) => {
+        None => {
             let _ = writeln!(
                 narf_console::Writer,
                 "power: WARNING: filesystem sync did not finish in {budget} ms; \
@@ -244,6 +297,21 @@ pub fn hw_protection_shutdown(reason: &str, ms_until_forced: u64) {
             narf_console::Writer,
             "power: EMERGENCY: orderly power-off did not start within {delay} ms; forcing power-off"
         );
+        // Linux `emergency_sync`: what can still be written in a bounded
+        // time, mapped pages first, then the filesystems.
+        let deadline = narf_time::Deadline::after_ms(EMERGENCY_SYNC_MS);
+        if shutdown_sync(deadline, narf_filesystem::sync_all::sync_all())
+            .await
+            .is_none()
+        {
+            let _ = writeln!(
+                narf_console::Writer,
+                "power: EMERGENCY: sync did not finish in {EMERGENCY_SYNC_MS} ms"
+            );
+        }
+        if crate::system::transition_started() {
+            return;
+        }
         crate::system::power_off_synced();
     });
 }
