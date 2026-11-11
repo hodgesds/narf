@@ -743,6 +743,7 @@ impl<B: Backend> Session<B> {
             && matches!(state, State::Associated { .. })
             && self.data_pending.is_empty()
             && (station.wmm_pending.is_some()
+                || station.ps_wanted != station.ps_applied
                 || !station.control_pending.is_empty()
                 || station.rx_ba.pending(self.backend.now_ns())
                 || station.tx_ba.pending(self.backend.now_ns())
@@ -2327,6 +2328,7 @@ impl<B: Backend> Session<B> {
                 self.boot_started = None;
                 self.station.peer_lost = false;
                 self.station.link_stats = Default::default();
+                self.station.ps_applied = false;
                 self.station.bss = Some(bss.clone());
                 self.station.wmm = plan.wmm();
                 self.station.ht20_profile = plan.ht20();
@@ -2621,6 +2623,7 @@ impl<B: Backend> Session<B> {
     /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control_in(&mut self, associated: State, restore: State) -> Result<(), Error> {
         if self.station.wmm_pending.is_none()
+            && self.station.ps_wanted == self.station.ps_applied
             && self.station.control_pending.is_empty()
             && !self.station.rx_ba.pending(self.backend.now_ns())
             && !self.station.tx_ba.pending(self.backend.now_ns())
@@ -2644,6 +2647,7 @@ impl<B: Backend> Session<B> {
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
             self.service_wmm_update().await?;
+            self.service_power_save().await?;
             self.service_transmit_ba().await?;
             self.service_receive_ba(info.capabilities.mac, peer).await?;
             for _ in 0..4 {
@@ -2712,6 +2716,20 @@ impl<B: Backend> Session<B> {
 
     /// Every association/key/port publication earns fresh authority after
     /// the preceding wait. Cleanup deliberately uses plain exchange instead.
+    /// mt7921_mcu_uni_bss_ps (`BSS_CHANGED_PS`): UNI_CMD BSS_INFO_UPDATE
+    /// with the `UNI_BSS_INFO_PS` (21) TLV, `ps_state` 2 (dynamic power
+    /// save, firmware-timed) or 0 (awake), for this link's BSS.
+    async fn service_power_save(&mut self) -> Result<(), Error> {
+        if self.station.ps_wanted == self.station.ps_applied {
+            return Ok(());
+        }
+        let body = bss_power_save(self.station.link.bss(), self.station.ps_wanted);
+        self.exchange_station(Command::Unified { id: 2 }, &body)
+            .await?;
+        self.station.ps_applied = self.station.ps_wanted;
+        Ok(())
+    }
+
     pub(super) async fn exchange_station(
         &mut self,
         command: Command,
@@ -2743,4 +2761,15 @@ impl<B: Backend> Session<B> {
         }
         Ok(())
     }
+}
+
+/// The `mt7921_mcu_uni_bss_ps` request: `{ bss_idx, pad[3] }` then the
+/// `UNI_BSS_INFO_PS` TLV `{ tag 21, len 8, ps_state, pad[3] }`.
+pub(super) fn bss_power_save(bss: u8, enabled: bool) -> [u8; 12] {
+    let mut body = [0; 12];
+    body[0] = bss;
+    body[4..6].copy_from_slice(&21u16.to_le_bytes());
+    body[6..8].copy_from_slice(&8u16.to_le_bytes());
+    body[8] = if enabled { 2 } else { 0 };
+    body
 }

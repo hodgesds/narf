@@ -97,3 +97,62 @@ kernel_test_in!(
     "drivers/wireless/mt7921/station",
     mt7922_station_records_the_aps_signal_for_get_station
 );
+
+/// NL80211_CMD_SET_POWER_SAVE on an associated MT7922 station: the owner
+/// sends mt7921_mcu_uni_bss_ps (BSS_INFO_UPDATE, UNI_BSS_INFO_PS, dynamic
+/// power save = 2) once, then the awake state (0) when it is turned off,
+/// and a new association starts awake so the setting is applied again.
+fn mt7922_power_save_follows_set_power_save_on_the_associated_bss() -> TestResult {
+    let associate = || {
+        let (mut session, bss) = super::pmf_tests::prepared(super::pmf_tests::pmf_ap());
+        let joined = run(Box::pin(session.associate_station(
+            &bss,
+            b"narf",
+            crate::mt7921::association::Security::Wpa2PskPmf {
+                psk: [0x55; 32],
+                required: false,
+            },
+            test_permission(),
+            &[],
+        )));
+        (session, joined)
+    };
+    let (mut session, joined) = associate();
+    if joined != Ok(42) || session.keys_pending() {
+        return TestResult::Fail("association, or control work without a request");
+    }
+    let body = |enabled| super::join::bss_power_save(0, enabled);
+    let sent = |session: &Session<Model>, from: usize, enabled: bool| {
+        session.backend.frames[from..]
+            .iter()
+            .filter(|(_, frame)| frame.ends_with(&body(enabled)))
+            .count()
+    };
+    for enabled in [true, false] {
+        session.station.ps_wanted = enabled;
+        if !session.keys_pending() {
+            return TestResult::Fail("power-save change not scheduled as control work");
+        }
+        let before = session.backend.frames.len();
+        if run(Box::pin(session.service_keys())).is_err()
+            || sent(&session, before, enabled) != 1
+            || session.station.ps_applied != enabled
+            || session.keys_pending()
+        {
+            return TestResult::Fail("UNI_BSS_INFO_PS not sent exactly once");
+        }
+    }
+    if body(true) != [0, 0, 0, 0, 21, 0, 8, 0, 2, 0, 0, 0] {
+        return TestResult::Fail("UNI_BSS_INFO_PS layout");
+    }
+    let (mut session, _) = associate();
+    session.station.ps_wanted = true;
+    if session.station.ps_applied || !session.keys_pending() {
+        return TestResult::Fail("a new association did not start awake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/power",
+    mt7922_power_save_follows_set_power_save_on_the_associated_bss
+);
