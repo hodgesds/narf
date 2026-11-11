@@ -38,7 +38,10 @@
 //! (`ar9003::packet::Packet`) then carries the station with the band's MAC
 //! clock, behind the shared station/interface owners.
 //!
-//! Every retune, recovery and resume is a generation reset:
+//! Hang recovery (FATAL, BB watchdog, TX hang, failed calibration, RX
+//! inactivity) is the in-place `ath_reset` ([`reset_in_place`]), which
+//! keeps the station generation and its association. Every retune,
+//! terminal-station recovery and resume is a generation reset:
 //! `hw.c::ath9k_hw_chip_reset` (`ATH9K_RESET_COLD` after FULL_SLEEP or
 //! when `AR_Q_TXE`/`AR_CR_RXE` are still set, else WARM; then
 //! `ath9k_hw_setpower(AWAKE)`), an `AR_SREV` re-check, and a full
@@ -432,24 +435,22 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
     })?;
     let prepared = o.prepared;
     let revision = o.revision;
-    let report = {
-        // SAFETY: probe or the last generation reset identified this
-        // AR9300 and ran its complete inactive preparation for `prepared`
-        // (whose power plan was just re-programmed); PCI parking was
-        // verified above and no packet DMA exists. The async mutex
-        // serializes the whole attempt.
-        let future = unsafe { o.radio.run(&mut io, &identity, &revision, &prepared) };
-        let mut future = core::pin::pin!(future);
-        core::future::poll_fn(|cx| {
-            if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_dual_in(&d)) {
-                return core::task::Poll::Ready(Err(BringUpError::Policy));
-            }
-            grant
-                .invoke(|| Ok(core::future::Future::poll(future.as_mut(), cx)))
-                .unwrap_or(core::task::Poll::Ready(Err(BringUpError::Policy)))
-        })
-        .await?
-    };
+    // SAFETY: probe or the last generation reset identified this AR9300
+    // and ran its complete inactive preparation for `prepared` (whose power
+    // plan was just re-programmed); PCI parking was verified above and no
+    // packet DMA exists. The async mutex serializes the whole attempt.
+    let report = unsafe {
+        calibrate(
+            &mut o.radio,
+            &mut io,
+            &identity,
+            &revision,
+            &prepared,
+            &grant,
+            permission,
+        )
+    }
+    .await?;
     // The attempt is retained before any MAC mutation.
     o.attempted = true;
     let station = compose(&mut o, report, permission).map_err(|error| {
@@ -470,6 +471,36 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
         BringUpError::BadState
     })?;
     Ok(report)
+}
+
+/// `ar9003::calib::Calibration::run` under the signed record and the
+/// current dual-band host permission, re-proved at every poll.
+///
+/// # Safety
+/// `calib::Calibration::run`'s contract: `prepared` is this chip's
+/// complete inactive preparation, PCI bus mastering is off and no packet
+/// DMA engine runs.
+async unsafe fn calibrate(
+    calibration: &mut ar9003::calib::Calibration,
+    io: &mut identity::Registers,
+    identity: &ar9003::eeprom::Identity,
+    revision: &ar9003::Revision,
+    prepared: &ar9003::phy::Prepared,
+    grant: &admission::Grant,
+    permission: calibration::Permission,
+) -> Result<ar9003::calib::Report, BringUpError> {
+    // SAFETY: forwarded from the caller's contract.
+    let future = unsafe { calibration.run(io, identity, revision, prepared) };
+    let mut future = core::pin::pin!(future);
+    core::future::poll_fn(|cx| {
+        if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_dual_in(&d)) {
+            return core::task::Poll::Ready(Err(BringUpError::Policy));
+        }
+        grant
+            .invoke(|| Ok(core::future::Future::poll(future.as_mut(), cx)))
+            .unwrap_or(core::task::Poll::Ready(Err(BringUpError::Policy)))
+    })
+    .await
 }
 
 fn compose(
@@ -637,6 +668,148 @@ async fn reset(
     initialize(owner).await
 }
 
+/// `main.c::ath_reset` on the current channel (`ath9k_queue_reset` ->
+/// `ath_reset_work` -> `ath_reset_internal`, no fast channel change): the
+/// station generation, its association, peer, host RSNA keys and netdev
+/// stay; only the chip and its DMA engines restart.
+///
+/// `ath_prepare_reset` ([`station::Radio::pause_for_reset`]: interrupts
+/// off, `ath_stoprecv`, `ath_drain_all_txq`, plus this tree's BME-off
+/// quiescence proof), then `ath9k_hw_reset` for the same primary: the
+/// pre-reset `AR_CFG_LED`, `ath9k_hw_chip_reset` (COLD while a TX queue or
+/// RX is still enabled, else WARM), the probe's `AR_SREV`, the inactive
+/// `ar9003::phy::prepare` that must equal the record's, the power plan at
+/// this generation's host permission (`ath9k_hw_apply_txpower`), a fresh
+/// `ar9003_hw_init_cal` (this tree keeps no per-channel `caldata`, so the
+/// TX IQ/CL results are re-measured rather than restored), the station
+/// MAC/queue program (`ar9003::mac::prepare`) and the AR9300 reset tail
+/// (LED, NF load/start, BB watchdog). `ath_complete_reset`
+/// ([`station::Radio::resume_after_reset`]) restarts RX/TX on the retained
+/// rings and re-writes BSSID/AID and slot. Key cache: `ath9k_hw_reset`
+/// never clears `AR_KEYTABLE` (only `ath9k_init_softc` resets it); this
+/// owner uses no hardware key-cache entry (CCMP is host-side), so nothing
+/// needs re-programming. Any failure closes the generation, which the
+/// supervisor then retires through [`reset`].
+async fn reset_in_place(owner: &Mutex<Owner>) -> Result<station::ResetType, BringUpError> {
+    let _control = CONTROL.lock().await;
+    let mut o = owner.lock().await;
+    if o.removed || o.pinned || o.suspended {
+        return Err(BringUpError::DeviceGone);
+    }
+    let station = o.station.clone().ok_or(BringUpError::BadState)?;
+    let mut radio = station.lock().await;
+    let kind = radio
+        .pause_for_reset()
+        .map_err(|_| BringUpError::BadState)?;
+    let restarted = match hw_reset_in_place(&mut o, &mut radio).await {
+        Ok(()) => radio
+            .resume_after_reset()
+            .map_err(|_| BringUpError::BadState),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = restarted {
+        // The supervisor retires this closed generation next tick.
+        let _ = radio.stop();
+        return Err(error);
+    }
+    Ok(kind)
+}
+
+/// `hw.c::ath9k_hw_reset` (same channel) between the two halves of
+/// [`reset_in_place`], on the paused station's retained native port.
+async fn hw_reset_in_place(
+    o: &mut Owner,
+    radio: &mut super::NativeRadio,
+) -> Result<(), BringUpError> {
+    let native = radio.reset_port().ok_or(BringUpError::BadState)?;
+    let command = identity::invoke(&o.cap, || narf_bus::pci::read_command(&o.cap, &o.device))
+        .map_err(|_| BringUpError::DeviceGone)?
+        .map_err(|_| BringUpError::DeviceGone)?;
+    if command == u16::MAX || command & narf_bus::pci::cmd::BUS_MASTER != 0 {
+        return Err(BringUpError::BadState);
+    }
+    let permission = native.ar9300_permission().ok_or(BringUpError::BadState)?;
+    let mut io = identity::Registers::new(o.mmio, o.cap);
+    let led = read_led(&mut io)?;
+    let busy = io.read32(AR_Q_TXE);
+    let cr = io.read32(AR_CR);
+    if busy == u32::MAX || cr == u32::MAX {
+        return Err(BringUpError::DeviceGone);
+    }
+    ar9003::reset_reg(&mut io, o.wa, busy != 0 || cr & AR_CR_RXE_9300 != 0)?;
+    if ar9003::revision(&mut io, o.revision.chip)? != o.revision {
+        return Err(BringUpError::BadIdentity);
+    }
+    let target = o.primary;
+    let ctl = ctl_at(&o.identity, target)?;
+    let identity = o.identity;
+    let mut prepared = ar9003::phy::prepare(
+        &mut io,
+        &o.revision,
+        &identity,
+        o.pll_pwrsave,
+        &o.image,
+        target,
+        ctl,
+        0,
+    )?;
+    if prepared != prepared_at(o, target)? {
+        return Err(BringUpError::BadState);
+    }
+    let grant = o.grant.clone();
+    let plan = ar9003::power::plan(
+        &o.image,
+        target,
+        ctl,
+        permission.budget(),
+        identity.tx_chainmask,
+    )?;
+    grant.invoke(|| ar9003::power::program(&mut io, &plan))?;
+    prepared.power = plan;
+    let revision = o.revision;
+    let mut calibration = ar9003::calib::Calibration::default();
+    // SAFETY: the chip was just reset and fully prepared for `prepared`
+    // (power re-programmed); `pause_for_reset` proved every RX/TX engine
+    // idle with bus mastering off (re-read above), so no packet DMA runs
+    // while the calibration owns the baseband. CONTROL and the owner and
+    // station locks serialize the attempt.
+    let report = unsafe {
+        calibrate(
+            &mut calibration,
+            &mut io,
+            &identity,
+            &revision,
+            &prepared,
+            &grant,
+            permission,
+        )
+    }
+    .await?;
+    let failed = |_| BringUpError::BadState;
+    ar9003::mac::prepare(
+        native,
+        &identity,
+        &o.image[..],
+        identity.mac,
+        report.five_ghz,
+    )
+    .map_err(failed)?;
+    let periodic = ar9003::calib::Periodic::new(
+        &revision,
+        &report,
+        *o.totals.lock(),
+        narf_time::monotonic_ns() / 1_000_000,
+    );
+    native
+        .ar9300_recalibrated(report, periodic)
+        .map_err(failed)?;
+    native.ar9300_reset_tail(led).map_err(failed)?;
+    o.led = led;
+    o.prepared = prepared;
+    o.radio = calibration;
+    Ok(())
+}
+
 /// Rejoin supervisor and `link.c::ath_ani_calibrate` cadence. A terminal
 /// station generation (disassociation, link loss, fatal interrupt, BB
 /// watchdog or failed DMA) is followed by a generation reset into a fresh
@@ -663,6 +836,7 @@ async fn supervise(owner: Shared) {
                 None => continue,
             }
         };
+        let mut queued = None;
         let terminal = {
             let Some(mut radio) = station.try_lock() else {
                 continue;
@@ -670,20 +844,53 @@ async fn supervise(owner: Shared) {
             if radio.terminal() {
                 true
             } else {
-                match radio.long_calibration() {
-                    Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
-                    Err(error) => {
-                        // The generation is now closed; the next tick resets.
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "ath9k: AR9003 periodic calibration closed: {:?}",
-                            error
-                        );
+                // `ath_hw_check_work`: a queued `ath9k_queue_reset` cause
+                // (FATAL, BB watchdog, TX hang, calibration) or RX
+                // inactivity is recovered by the in-place `ath_reset`.
+                queued = radio
+                    .reset_pending()
+                    .or_else(|| radio.rx_inactive_check(narf_time::monotonic_ns() / 1_000_000));
+                if queued.is_some() {
+                    false
+                } else {
+                    match radio.long_calibration() {
+                        Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
+                        Err(error) => {
+                            // A queued RESET_TYPE_CALIBRATION is reset in place
+                            // next tick; anything else closed the generation.
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "ath9k: AR9003 periodic calibration failed: {:?}",
+                                error
+                            );
+                        }
                     }
+                    false
                 }
-                false
             }
         };
+        if let Some(kind) = queued {
+            drop(station);
+            match reset_in_place(&owner).await {
+                Ok(_) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "ath9k: AR9003 in-place reset ({:?}) restarted RX/TX; association kept",
+                        kind
+                    );
+                }
+                Err(error) => {
+                    // The closed generation is retired on the next tick.
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "ath9k: AR9003 in-place reset ({:?}) closed: {:?}",
+                        kind,
+                        error
+                    );
+                }
+            }
+            continue;
+        }
         if !terminal {
             continue;
         }

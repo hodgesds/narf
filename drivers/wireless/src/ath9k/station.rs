@@ -44,6 +44,25 @@ impl From<station_security::Error> for Error {
         Self::Security(error)
     }
 }
+/// `ath9k.h::enum ath_reset_type` causes this tree recovers with an
+/// in-place `main.c::ath_reset` (the station generation, its association,
+/// peer and host keys stay; only the chip and its DMA engines restart)
+/// instead of retiring the generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResetType {
+    /// `RESET_TYPE_FATAL_INT` (`ath9k_tasklet`, `ATH9K_INT_FATAL`).
+    FatalInt,
+    /// `RESET_TYPE_BB_WATCHDOG` (`ATH9K_INT_BB_WATCHDOG`).
+    BbWatchdog,
+    /// `RESET_TYPE_TX_HANG` (`link.c::ath_tx_complete_check`).
+    TxHang,
+    /// `RESET_TYPE_RX_INACTIVE` (`link.c::ath_hw_rx_inactive_check`).
+    RxInactive,
+    /// `RESET_TYPE_CALIBRATION` (`link.c::ath_ani_calibrate`).
+    Calibration,
+}
+/// `link.c::RX_INACTIVE_CHECK_INTERVAL` (4 s).
+pub(super) const RX_INACTIVE_CHECK_INTERVAL_MS: u64 = 4_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Phase {
     Prepared,
@@ -212,6 +231,12 @@ pub(super) struct Radio<P: Port, E: Environment, K: Engine = Packet<P>> {
     ht: Option<u8>,
     force_twenty: bool,
     epoch: u64,
+    /// `ATH_OP_HW_RESET`: an `ath9k_queue_reset` cause awaiting the owner's
+    /// in-place reset. No packet operation runs until it completes.
+    reset_wanted: Option<ResetType>,
+    /// `sc->rx_active_count` / `sc->rx_active_check_time` (ms).
+    rx_active_count: u32,
+    rx_active_check_ms: u64,
 }
 impl<P: Port, E: Environment, K: Engine> core::fmt::Debug for Radio<P, E, K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -262,6 +287,9 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             ht: None,
             force_twenty: false,
             epoch: 1,
+            reset_wanted: None,
+            rx_active_count: 0,
+            rx_active_check_ms: 0,
         }
     }
     pub(super) fn closed(&self) -> Arc<AtomicBool> {
@@ -382,6 +410,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             && self.delivered_reply.is_none()
             && self.delivered_ba.is_none()
             && self.security.as_ref().is_none_or(Security::port_open)
+            && self.reset_wanted.is_none()
     }
     pub(super) fn receive_open(&self) -> bool {
         self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
@@ -427,7 +456,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         match self.packet.long_calibration() {
             Err(packet::Error::Busy) => Err(Error::Transport(packet::Error::Busy)),
             Err(error) => {
-                self.fail();
+                self.fail_or_queue_reset();
                 Err(Error::Transport(error))
             }
             ok => ok.map_err(Error::Transport),
@@ -600,6 +629,94 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
     fn fail(&mut self) {
         let _ = self.stop();
         self.phase = Phase::Failed;
+    }
+    /// `ath9k_queue_reset`: a cause the packet engine raised is kept for the
+    /// owner's in-place reset when this generation can survive one;
+    /// anything else (or a generation that cannot) closes it as before.
+    fn fail_or_queue_reset(&mut self) {
+        match self.packet.reset_request() {
+            Some(kind) if self.reset_admissible() => self.reset_wanted = Some(kind),
+            _ => self.fail(),
+        }
+    }
+    /// The pending in-place reset cause, if any.
+    pub(super) fn reset_pending(&self) -> Option<ResetType> {
+        if self.terminal() {
+            None
+        } else {
+            self.reset_wanted
+        }
+    }
+    /// An in-place reset keeps this generation only from a settled phase
+    /// (passive or associated, never mid-join) with nothing but a plain data
+    /// frame in flight: `ath_drain_all_txq` fails that frame, while a
+    /// handshake, block-ack or power-save exchange could not resume.
+    fn reset_admissible(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && matches!(self.phase, Phase::Passive | Phase::Open)
+            && self.pending.as_ref().is_none_or(|p| p.kind == Kind::Data)
+            && self.pair_pending.is_none()
+            && self.delivered_reply.is_none()
+            && self.delivered_ba.is_none()
+            && self.delivered_ps.is_none()
+            && self.ps_controls.is_empty()
+            && !self.ps_bound
+            && self
+                .security
+                .as_ref()
+                .is_none_or(|security| !security.handshake_active())
+    }
+    /// `link.c::ath_hw_rx_inactive_check`, one `ath_hw_check_work` pass:
+    /// at least one RX service per second over a 4..8 s window, else
+    /// `ath9k_queue_reset(RESET_TYPE_RX_INACTIVE)`. Policy: only an
+    /// associated station is checked (its AP's beacons bound the expected
+    /// RX rate; an idle unassociated receiver may legitimately hear
+    /// nothing). Returns the queued cause.
+    pub(super) fn rx_inactive_check(&mut self, now_ms: u64) -> Option<ResetType> {
+        if self.terminal() || self.reset_wanted.is_some() {
+            return None;
+        }
+        let interval = now_ms.saturating_sub(self.rx_active_check_ms);
+        if interval < RX_INACTIVE_CHECK_INTERVAL_MS {
+            return None;
+        }
+        let count = core::mem::take(&mut self.rx_active_count);
+        self.rx_active_check_ms = now_ms;
+        if interval > RX_INACTIVE_CHECK_INTERVAL_MS * 2
+            || u64::from(count) >= interval / 1000
+            || self.peer().is_none()
+            || !self.reset_admissible()
+        {
+            return None;
+        }
+        self.reset_wanted = Some(ResetType::RxInactive);
+        self.reset_wanted
+    }
+    /// `ath_prepare_reset`'s station half: the generation must still be
+    /// admissible, and the plain data frame `ath_drain_all_txq` fails is
+    /// withdrawn (counted lost, never re-sent). Association, peer, host
+    /// keys, sequence numbers and the receive epoch stay.
+    pub(super) fn begin_reset(&mut self) -> Result<ResetType, Error> {
+        let kind = self.reset_pending().ok_or(Error::State)?;
+        if !self.reset_admissible() {
+            return Err(Error::State);
+        }
+        // A drained (never completed) submission does not train rate control.
+        self.pending = None;
+        Ok(kind)
+    }
+    /// `ath_complete_reset`'s station half after the engine restarted:
+    /// `ATH_OP_HW_RESET` clears and the RX-activity window restarts.
+    pub(super) fn finish_reset(&mut self) -> Result<(), Error> {
+        if self.terminal() || self.reset_wanted.is_none() {
+            return Err(Error::State);
+        }
+        self.reset_wanted = None;
+        let now = self.environment.now_ms();
+        self.last_now = self.last_now.max(now);
+        self.rx_active_count = 0;
+        self.rx_active_check_ms = self.last_now;
+        Ok(())
     }
     fn now(&mut self) -> Result<u64, Error> {
         let now = self.environment.now_ms();
@@ -954,6 +1071,9 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         Ok(())
     }
     pub(super) fn poll(&mut self) -> Result<Vec<Vec<u8>>, Error> {
+        if self.reset_pending().is_some() {
+            return Err(Error::Busy);
+        }
         let result = {
             let publication = self.publication.clone();
             let _publication = publication.lock();
@@ -998,7 +1118,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
                 })
         };
         if result.is_err() {
-            self.fail();
+            self.fail_or_queue_reset();
         }
         result
     }
@@ -1049,11 +1169,17 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         self.delivery()?;
         self.rx_idle = false;
         let mut idle = false;
+        let mut serviced = false;
         for _ in 0..32 {
             let step = self.packet.receive()?;
             if !step.consumed {
                 idle = true;
                 break;
+            }
+            if !serviced {
+                // `ath9k_tasklet`: one `rx_active_count` per RX service.
+                serviced = true;
+                self.rx_active_count = self.rx_active_count.saturating_add(1);
             }
             if let Some(frame) = step.frame {
                 if self.lost(&frame) {
@@ -1758,6 +1884,9 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         dwell_ms: u64,
         ssids: &[Vec<u8>],
     ) -> Result<Vec<ObservedBss>, Error> {
+        if self.reset_pending().is_some() {
+            return Err(Error::Busy);
+        }
         if !(1..=1024).contains(&dwell_ms)
             || ssids.len() > 4
             || ssids.iter().any(|ssid| ssid.len() > 32)
@@ -1867,6 +1996,9 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         force_twenty: bool,
     ) -> Result<(), Error> {
         self.force_twenty = force_twenty;
+        if self.reset_pending().is_some() {
+            return Err(Error::Busy);
+        }
         if self.phase() != Phase::Passive {
             return Err(Error::State);
         }
@@ -2105,6 +2237,53 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             .as_ref()
             .is_err_and(|error| !matches!(error, Error::Busy | Error::Profile))
         {
+            self.fail();
+        }
+        result
+    }
+}
+/// The in-place `ath_reset` of an AR9003 EDMA station (the only engine
+/// with one). The owner runs `ath9k_hw_reset` on [`Self::reset_port`]
+/// between the two halves while it holds this station.
+impl<P: Port, E: Environment> Radio<P, E, Dispatch<P>> {
+    /// `ath_prepare_reset`: the station half ([`Self::begin_reset`]) then
+    /// the EDMA engine stop that keeps every ring and buffer. A failure
+    /// closes the generation (the owner then retires it).
+    pub(super) fn pause_for_reset(&mut self) -> Result<ResetType, Error> {
+        let result = (|| {
+            let kind = self.begin_reset()?;
+            let Dispatch::Ar9003(packet) = &mut self.packet else {
+                return Err(Error::State);
+            };
+            packet.pause_for_reset()?;
+            Ok(kind)
+        })();
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// The paused engine's port.
+    pub(super) fn reset_port(&self) -> Option<&P> {
+        match &self.packet {
+            Dispatch::Ar9003(packet) => packet.paused_port(),
+            Dispatch::Ar9002(_) => None,
+        }
+    }
+    /// `ath_complete_reset`: restart RX/TX DMA on the retained rings, re-write
+    /// the BSSID/AID and slot, re-enable interrupts, then the station half
+    /// ([`Self::finish_reset`]). A failure closes the generation.
+    pub(super) fn resume_after_reset(&mut self) -> Result<(), Error> {
+        let result = (|| {
+            let publication = self.publication.clone();
+            let _publication = publication.lock();
+            let Dispatch::Ar9003(packet) = &mut self.packet else {
+                return Err(Error::State);
+            };
+            packet.resume_after_reset()?;
+            self.finish_reset()
+        })();
+        if result.is_err() {
             self.fail();
         }
         result

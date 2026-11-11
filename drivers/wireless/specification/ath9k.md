@@ -2365,7 +2365,8 @@ grant and a live dual-band permission, `Native::new_ar9300` (with
 `station::Radio::new(packet.into(), ..)` (noise = chain-0 default NF,
 `ath9k_hw_getchan_noise` before any history) and `interface::publish`.
 Retune (`channels` routes non-AR9285 20 MHz requests after AR9280),
-recovery and resume share one generation reset: the target record and
+terminal-station recovery and resume share one generation reset (hang
+recovery is the in-place reset below): the target record and
 permission first, retire with proven DMA stop and BME off,
 `ar9003::set_power_awake` only after FULL_SLEEP (`ath9k_hw_setpower` is a
 no-op on an awake chip), the new `AR_CFG_LED`, `ar9003::reset_reg`
@@ -2376,9 +2377,9 @@ target equal to `expected`; then initialize. The `ath9k_hw_init_pll` that
 `ath9k_hw_chip_reset` runs is `prepare`'s PLL write (Linux marks the PHY
 inactive before the chip reset; here the reset precedes `prepare`'s
 `mark_phy_inactive`, which the chip reset already left inactive). The
-supervisor polls every 500 ms: a terminal station is reset (three
-failures, `DeviceGone` or `BadState` stop it); otherwise
-`long_calibration` runs the due `Periodic` steps. Suspend
+supervisor polls every 500 ms: a queued in-place reset runs first; a
+terminal station is reset (three failures, `DeviceGone` or `BadState`
+stop it); otherwise `long_calibration` runs the due `Periodic` steps. Suspend
 (`ath_pci_suspend`): retire, then `ar9003::disable_and_sleep` =
 `ath9k_hw_disable` (COLD `set_reset_reg`, `ath9k_hw_init_pll`) +
 `ath9k_set_power_sleep` for AR9300 without MCI (`AR_STA_ID1_PWR_SAV` set,
@@ -2389,6 +2390,49 @@ without `AR_WA_D3_L1_DISABLE`; no `AR_RC` write).
 not called on suspend (Linux calls it from `ath9k_stop`, not
 `ath_pci_suspend`) or on reset.
 Resume clears PCI config 0x41 and runs the generation reset (COLD).
+**In-place reset (`main.c::ath_reset`).** Where Linux calls
+`ath9k_queue_reset` the AR9003 EDMA packet owner records a
+`station::ResetType` instead of closing: `ath_isr`/`ath9k_tasklet` FATAL
+and BB watchdog (`FatalInt`/`BbWatchdog`, `service_begin`), a queue-0
+frame past its 1 s completion window (`TxHang`, the
+`ath_tx_complete_check` counterpart, `delivery`), a failed periodic
+`ar9003_hw_calibrate` step (`Calibration`), and
+`station::Radio::rx_inactive_check` (`link.c::ath_hw_rx_inactive_check`:
+4 s window, at least one RX service per second, `rx_active_count` counted
+once per poll pass that consumed a receive buffer; policy: only while
+associated, since an idle unassociated receiver may hear nothing). The
+station keeps the cause (`ATH_OP_HW_RESET`: `poll`, `send`, scans and
+joins report Busy, `interface::progress` leaves the link and rings
+alone) only from Passive/Open with nothing but a plain data frame in
+flight and no handshake running; otherwise it fails and the generation is
+retired as before. The supervisor then runs `ar9300_owner::reset_in_place`
+under `CONTROL`, the owner and the station lock: `ath_prepare_reset`
+(`Radio::pause_for_reset`: IER killed with the MSI vector kept,
+`ath_stoprecv`, `ath_drain_all_txq` dropping the in-flight frame without
+training rate control, BME off and the quiescence proof; every ring and
+buffer stays owned), `ath9k_hw_reset` on the same primary (LED,
+`ath9k_hw_chip_reset` COLD/WARM by `AR_Q_TXE`/`AR_CR_RXE`, `AR_SREV`,
+`phy::prepare` equal to the record's, the power plan at the generation's
+host permission, a fresh `Calibration::run` — no per-channel `caldata` is
+kept, so TX IQ/CL are re-measured rather than restored —,
+`ar9003::mac::prepare`, `Native::ar9300_recalibrated` (new `Periodic` over
+the carried `IqTotals`) and `ar9300_reset_tail`), then `ath_complete_reset`
+(`Radio::resume_after_reset`: status ring and RX buffer size re-programmed
+(`ath9k_hw_reset_txstatus_ring`), `ath_startrecv` re-feeding the same
+buffers, BSSID/AID and slot of the last `set_peer`
+(`ath9k_hw_write_associd`), interrupts re-enabled). The station
+generation, netdev, association, peer, host RSNA keys, sequence numbers
+and receive epoch stay. Key cache: `ath9k_hw_reset` never clears
+`AR_KEYTABLE` (only `ath9k_init_softc` does) and this owner programs no
+hardware key entry (CCMP is host-side), so nothing is re-written. Any
+failure stops the station and the next tick retires it through the
+generation reset. Not ported: `ath_hw_check`'s AR9300
+`ath9k_hw_detect_mac_hang` and the `RESET_TYPE_TX_GTT` path. The AR9002
+owners (AR5008/AR9280/AR9285/AR9287) keep the generation reset for these
+causes: their packet owner carries HT/EDCA/QoS/BA/power-save programs that
+an in-place restart would have to re-apply. Smokes (written, not
+executed): `smoke_ath9k_ar9300_in_place_reset_keeps_rings_and_restarts_rx_tx`,
+`smoke_ath9k_in_place_reset_keeps_association_and_keys`.
 The owner carries no HT, EDCA, QoS, block-ack, aggregation or power-save
 program, matching the AR9280 station scope; ANI is not ported. Smokes
 (written, not executed):

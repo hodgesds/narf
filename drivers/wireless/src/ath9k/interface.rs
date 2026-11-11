@@ -505,6 +505,12 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         if !matches!(radio.phase(), Phase::Passive | Phase::Open | Phase::Failed) {
             return (0, Vec::new());
         }
+        // ATH_OP_HW_RESET: TX queues stay stopped and nothing is polled
+        // until the owner's in-place reset completes; the link and the
+        // shared rings stay as they are.
+        if radio.reset_pending().is_some() {
+            return (0, Vec::new());
+        }
         let result: Result<Vec<Vec<u8>>, Error> = (|| {
             let frames = radio.poll()?;
             self.link(radio.peer());
@@ -595,6 +601,8 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         })();
         match result {
             Ok(frames) => (radio.receive_epoch(), frames),
+            // The failure queued an in-place reset; the generation stays.
+            Err(_) if radio.reset_pending().is_some() => (0, Vec::new()),
             Err(_) => {
                 self.close();
                 let _ = radio.stop();

@@ -565,7 +565,46 @@ impl Native {
     /// reset off, non-idle watchdog with `idle_count` 100 * 25 / 74.
     /// `ar9003_hw_disable_phy_restart` (`HW_PHYRESTART_CLC_WAR`, AR9300 2.2)
     /// is a no-op here: a fresh generation has no `bb_watchdog_last_status`
-    /// and a watchdog event closes the generation.
+    /// and a watchdog event queues the in-place reset, which re-runs this
+    /// tail.
+    /// The in-place `ath_reset` (`ath9k_hw_reset` with the same channel)
+    /// recalibrated this generation: `report` must describe the same
+    /// primary, band and chain masks, and `periodic` (built from it, with
+    /// the retained `IqTotals`) replaces the `ath_ani_calibrate` owner
+    /// before [`Self::ar9300_reset_tail`] restarts its NF calibration. The
+    /// grant, host permission and installed rate words stay; every later
+    /// access re-proves them against the re-programmed chip.
+    pub(super) fn ar9300_recalibrated(
+        &self,
+        report: super::ar9003::calib::Report,
+        periodic: super::ar9003::calib::Periodic,
+    ) -> Result<(), Error> {
+        let Calibrated::Ar9300 {
+            report: current,
+            periodic: retained,
+            ..
+        } = &self.calibrated
+        else {
+            return Err(Error::State);
+        };
+        if report.frequency_mhz != current.frequency_mhz
+            || report.five_ghz != current.five_ghz
+            || report.rx_chainmask != current.rx_chainmask
+            || report.tx_chainmask != current.tx_chainmask
+            || self.active.load(Ordering::Acquire)
+        {
+            return Err(Error::Packet);
+        }
+        *retained.try_lock().ok_or(Error::Busy)? = periodic;
+        Ok(())
+    }
+    /// The host permission this AR9300 generation's power plan used.
+    pub(super) fn ar9300_permission(&self) -> Option<super::calibration::Permission> {
+        match &self.calibrated {
+            Calibrated::Ar9300 { permission, .. } => Some(*permission),
+            _ => None,
+        }
+    }
     pub(super) fn ar9300_reset_tail(&self, led: u32) -> Result<(), Error> {
         let Calibrated::Ar9300 { periodic, .. } = &self.calibrated else {
             return Err(Error::State);

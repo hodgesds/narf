@@ -48,6 +48,7 @@ use super::irq;
 use crate::ath9k::descriptor::{self, TxStatus as LegacyStatus, WORDS};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
 use crate::ath9k::packet::{Delivery, Error, Phase, Port, ReceiveStep};
+use crate::ath9k::station::ResetType;
 use alloc::vec::Vec;
 use narf_io::DmaBuffer;
 
@@ -344,6 +345,21 @@ pub(in crate::ath9k) struct Packet<P: Port> {
     reclaimed: bool,
     irq: Option<irq::Mask>,
     full_imr: u32,
+    /// The `ath9k_queue_reset` cause of the last failure, if Linux
+    /// recovers it with an in-place `ath_reset`.
+    reset: Option<ResetType>,
+    /// Engines stopped for an in-place reset; storage retained.
+    paused: Option<Paused>,
+    /// The last programmed `set_peer` (BSSID/AID, slot), which
+    /// `ath9k_hw_reset` re-writes (`ath9k_hw_write_associd`, slot time).
+    peer: Option<PeerProgram>,
+}
+/// One `set_peer` program: BSSID/AID (or none) and the slot time.
+type PeerProgram = (Option<([u8; 6], u16)>, u32);
+/// What `pause_for_reset` stopped, for `resume_after_reset`.
+#[derive(Clone, Copy, Debug)]
+struct Paused {
+    interrupts: bool,
 }
 impl<P: Port> core::fmt::Debug for Packet<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -428,6 +444,9 @@ impl<P: Port> Packet<P> {
             reclaimed: false,
             irq: None,
             full_imr: 0,
+            reset: None,
+            paused: None,
+            peer: None,
         })
     }
     pub(in crate::ath9k) fn phase(&self) -> Phase {
@@ -502,6 +521,7 @@ impl<P: Port> Packet<P> {
         self.phase = Phase::Failed;
         self.port.transmit_allowed()?;
         crate::ath9k::mac::peer_clocked(&self.port, peer, slot_us, self.port.mac_clock())?;
+        self.peer = Some((peer, slot_us));
         self.phase = Phase::Running;
         Ok(())
     }
@@ -515,7 +535,13 @@ impl<P: Port> Packet<P> {
         if self.pending.is_some() {
             return Err(Error::Busy);
         }
-        self.port.long_calibration()
+        let result = self.port.long_calibration();
+        if matches!(result, Err(Error::Timeout | Error::Descriptor)) {
+            // ath_ani_calibrate: a failed `ath9k_hw_calibrate` queues
+            // RESET_TYPE_CALIBRATION.
+            self.reset = Some(ResetType::Calibration);
+        }
+        result
     }
     /// Legacy frame at `rate` (`descriptor::transmit`).
     pub(in crate::ath9k) fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
@@ -650,7 +676,16 @@ impl<P: Port> Packet<P> {
                 bytes: pending.original.clone(),
                 feedback: descriptor::transmit_feedback(&words).map_err(|_| Error::Descriptor)?,
             }))
-        })?;
+        });
+        let delivery = match delivery {
+            // ath_tx_complete_check: the queue-0 frame outlived its
+            // completion window, RESET_TYPE_TX_HANG.
+            Err(Error::Timeout) => {
+                self.reset = Some(ResetType::TxHang);
+                return Err(Error::Timeout);
+            }
+            other => other?,
+        };
         self.ring = ring;
         if delivery.is_some() {
             // The completed frame left the QCU; nothing else was queued.
@@ -752,7 +787,8 @@ impl<P: Port> Packet<P> {
     }
     /// `ath_isr` bottom half: read/clear causes and kill IER until
     /// [`Self::service_end`]. FATAL or the BB watchdog (`goto chip_reset`)
-    /// closes this owner, the native counterpart of Linux's chip reset.
+    /// fails this owner and queues the in-place reset
+    /// ([`Self::reset_request`]), as `ath9k_queue_reset` does.
     pub(in crate::ath9k) fn service_begin(&mut self) -> Result<Option<irq::Events>, Error> {
         let Some(mask) = self.irq else {
             return Ok(None);
@@ -768,6 +804,12 @@ impl<P: Port> Packet<P> {
             return Ok(None);
         };
         if events.reset() {
+            // ath_isr `goto chip_reset` -> ath9k_queue_reset.
+            self.reset = Some(if events.fatal {
+                ResetType::FatalInt
+            } else {
+                ResetType::BbWatchdog
+            });
             self.phase = Phase::Failed;
             return Err(Error::Access);
         }
@@ -892,6 +934,113 @@ impl<P: Port> Packet<P> {
         }
         self.reclaim();
         Ok(())
+    }
+    /// The cause the last failure queued for an in-place reset.
+    pub(in crate::ath9k) fn reset_request(&self) -> Option<ResetType> {
+        self.reset
+    }
+    /// `main.c::ath_prepare_reset` for `AR_SREV_9300_20_OR_LATER`:
+    /// `ath9k_hw_disable_interrupts`, then `ath_stoprecv` before
+    /// `ath_drain_all_txq` (the queue-0 frame in flight is dropped, as the
+    /// drain fails it). Bus mastering is then cleared and the post-BME-off
+    /// quiescence proof required before any chip reset is taken, but unlike
+    /// [`Self::stop`] every ring and buffer stays owned for
+    /// [`Self::resume_after_reset`]. The MSI vector stays installed
+    /// (`disable_irq`, not teardown). Any failure is terminal. Returns the
+    /// id of the drained frame.
+    pub(in crate::ath9k) fn pause_for_reset(&mut self) -> Result<Option<u64>, Error> {
+        if matches!(self.phase, Phase::Stopped | Phase::Prepared)
+            || self.paused.is_some()
+            || self.storage.is_none()
+            || !self.published
+        {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let interrupts = self.irq.take();
+        let killed = irq::kill(&self.port, interrupts.is_some_and(|m| m.msi));
+        let rx = self.stop_receive();
+        let tx = self.abort_transmit();
+        let master = self.port.master(false);
+        killed.and(rx).and(tx).and(master)?;
+        if !self.quiescent()? {
+            return Err(Error::Timeout);
+        }
+        let drained = self.pending.take().map(|pending| pending.id);
+        // The device owns no descriptor now: clear the TX controls, the
+        // status ring (`ath9k_hw_reset_txstatus_ring` clears it again on
+        // resume) and every RX status head (`ath_rx_edma_buf_link`).
+        let storage = self.storage.as_ref().ok_or(Error::State)?;
+        self.port.access(false, || {
+            storage.tx.put_words(0, &[0; TX_DEPTH * TXC_WORDS])?;
+            storage.status.put_words(0, &[0; TS_ENTRIES * TXS_WORDS])?;
+            for buffer in &storage.rx {
+                buffer.put_words(0, &[0; RXS_BYTES / 4])?;
+                buffer.sync();
+            }
+            storage.status.sync();
+            storage.tx.sync();
+            Ok(())
+        })?;
+        self.paused = Some(Paused {
+            interrupts: interrupts.is_some(),
+        });
+        Ok(drained)
+    }
+    /// `main.c::ath_complete_reset` after `ath9k_hw_reset` re-prepared the
+    /// MAC: `ath9k_hw_reset_txstatus_ring` and `ath9k_hw_set_rx_bufsize`
+    /// (`ath9k_hw_init_desc`/`ath9k_hw_reset` tail), `ath_startrecv`
+    /// ([`Self::start`]: both FIFOs re-fed from the same retained buffers,
+    /// bus mastering, PCU receive), `ath9k_hw_write_associd` plus the slot
+    /// time of the last [`Self::set_peer`], then `ath9k_hw_set_interrupts`
+    /// / `ath9k_hw_enable_interrupts` when they were enabled. The chip must
+    /// be parked exactly as [`Self::prepare`] requires.
+    pub(in crate::ath9k) fn resume_after_reset(&mut self) -> Result<(), Error> {
+        let paused = self.paused.ok_or(Error::State)?;
+        if self.phase != Phase::Failed {
+            return Err(Error::State);
+        }
+        if self.port.read(CR)? & CR_RXE != 0
+            || self.port.read(QTXE)? & 0x3ff != 0
+            || self.port.read(irq::IER)? & 1 != 0
+            || self.port.read(DIAG)? & RX_PARK != RX_PARK
+        {
+            return Err(Error::State);
+        }
+        let start = self.storage.as_ref().ok_or(Error::State)?.status.address();
+        let ring = with_io(&self.port, |io| {
+            let ring = StatusRing::setup(io, start, TS_ENTRIES as u16)?;
+            edma::set_rx_bufsize(io, RX_DATA)?;
+            Ok(ring)
+        })?;
+        if self.port.read(Q_STATUS_RING_START)? != start
+            || self.port.read(Q_STATUS_RING_END)? != start + (TS_ENTRIES * TXS_BYTES) as u32
+            || self.port.read(DATABUF_SIZE)? & 0xfff != u32::from(RX_DATA)
+        {
+            return Err(Error::Descriptor);
+        }
+        self.ring = ring;
+        self.next_tx = 0;
+        for (fifo, range) in self.fifos.iter_mut().zip([0..RX_HP, RX_HP..RX_HP + RX_LP]) {
+            fifo.order = range.collect();
+            fifo.discarding = false;
+        }
+        self.paused = None;
+        self.reset = None;
+        self.phase = Phase::Prepared;
+        self.start()?;
+        if let Some((peer, slot_us)) = self.peer {
+            self.set_peer(peer, slot_us)?;
+        }
+        if paused.interrupts {
+            self.enable_interrupts()?;
+        }
+        Ok(())
+    }
+    /// The retained port, for the owner's `ath9k_hw_reset` between
+    /// [`Self::pause_for_reset`] and [`Self::resume_after_reset`].
+    pub(in crate::ath9k) fn paused_port(&self) -> Option<&P> {
+        self.paused.map(|_| &self.port)
     }
     fn reclaim(&mut self) {
         self.pending = None;

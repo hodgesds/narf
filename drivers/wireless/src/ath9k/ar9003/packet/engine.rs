@@ -35,7 +35,8 @@ fn unmarked(frame: &[u8]) -> Result<(), Error> {
 /// (`ATH9K_INT_RXHP | ATH9K_INT_RXLP`); EDMA never fills `ah->intr_txqs`
 /// (TX completion is the status ring), and the AR9300 imask carries no
 /// `ATH9K_INT_TIM_TIMER` (no power-save program). FATAL and the BB
-/// watchdog already closed the owner in `service_begin`.
+/// watchdog already failed the owner in `service_begin`, queueing an
+/// in-place reset (`reset_request`).
 fn shared_events(events: super::irq::Events) -> irq::Events {
     irq::Events {
         rx: events.rx_hp || events.rx_lp,
@@ -238,5 +239,8 @@ impl<P: Port> station::Engine for Packet<P> {
     }
     fn periodic_deferred(&self) -> Result<bool, Error> {
         Ok(false)
+    }
+    fn reset_request(&self) -> Option<station::ResetType> {
+        Packet::reset_request(self)
     }
 }
