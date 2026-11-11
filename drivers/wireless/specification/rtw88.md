@@ -149,7 +149,8 @@ association remains explicit. Failed native receipts quarantine the original
 function and retain ambiguous DMA. Three native model cases are written for
 passive off/fresh-start/DHCP, associated refusal with preserved DATA, and
 foreground cancellation during original ingress; release/native acceptance
-remains pending. This implements IPS only. Associated LPS is still open.
+remains pending. `idle_function` has no in-tree production trigger yet
+(Linux `rtw_ips` on interface down / unassociated idle).
 
 `lps_request_function(BusAddr)` returns the separately signed continuation
 request for `lps_function(BusAddr, milliseconds) -> Result<(), RuntimeSleepError>`.
@@ -208,6 +209,23 @@ loss after OWN, native-page cancellation, private CCMP RX, peer/source loss
 in the HMEBOX_EXT/low-word gap of LPS entry, and RX in the wake-command gap
 (restaged and published exactly once, DATA retained). They are unexecuted
 pending batch validation.
+
+Production trigger (`interface.rs`): the shell advertises `SUPPORTS_PS`
+(`power_save_default`/`set_power_save`, main.c `SUPPORTS_PS` |
+`SUPPORTS_DYNAMIC_PS`, PS off by default) only when activate found a nondeep
+LPS firmware profile and a loadable N2xZ record (`Owner::lps_capable`).
+`set_power_save` is `rtw_recalc_lps` (`ps_enabled`). `Device::watchdog` runs
+`lps_watchdog` after the dm period: every 2s (`RTW_WATCH_DOG_DELAY_TIME`)
+with power save on, the link up and at most `RTW_LPS_THRESHOLD` (50) data
+frames each way since the last period (main.c `rtw_watch_dog_work`
+`!ps_active`), it runs one 100ms `Owner::lps_window` under the original UP
+identity, the same operation as `lps_function`. Linux stays in LPS until
+traffic; NARF sleeps one bounded window per period. Refusal (`Busy`/
+`Unsupported`: peer/queues busy, `wl_force_lps_ctrl`, a continuation-bound
+station, no N2xZ record on this channel) leaves the station open; a failed
+window has closed it and the shell drops the link. Case
+`smoke_rtw88_power_save_interface_follows_lps_capability` (written,
+unexecuted) covers the interface and the `ps_active` threshold.
 
 The `rtw88` asynchronous system-PM hook covers the retained C21/C22 identity-DMA
 profiles with an actual PCI PM capability in D0. A family barrier retains the
@@ -2363,11 +2381,18 @@ constraint) is not awaited for 10ms; its 0x0b reply updates
 `bt_ble_scan_type` when it arrives. WL RSSI comes from the bound N2xD
 tracker (`min_rssi`); without it RSSI is 0 (every RSSI state LOW: no
 RSSI-driven freerun). The noisy-environment CCK count is 0 (no CCK FA
-counter is shared with coex), so `wl_noisy_level` stays 0. No LPS owner is
-compiled, so `COEX_PS_LPS_OFF` only records `wl_force_lps_ctrl`
-(`Coex::forces_lps_off`), and LPS/IPS notifications are implemented but have
-no native caller; unassociated IPS stops the station, which unbinds and
-restores coexistence. HID game detection (and with it `COEX_WLINK_2GFREE`)
+counter is shared with coex), so `wl_noisy_level` stays 0.
+`COEX_PS_LPS_OFF` records `wl_force_lps_ctrl` (`Coex::forces_lps_off`),
+which refuses LPS entry like ps.c `rtw_enter_lps`
+(`State::coex_forces_lps_off` in `Owner::lps_window`). The LPS window sends
+`CoexEvent::Lps(true)` (`rtw_coex_lps_notify(COEX_LPS_ENABLE)`) before the
+LPS power-mode H2C and `CoexEvent::Lps(false)` after the confirmed ACTIVE
+wake (or when entry stays unissued); unassociated IPS sends
+`CoexEvent::Ips(true)` (`rtw_coex_ips_notify(COEX_IPS_ENTER)`) from
+`Device::idle_claim` before the station stops, which then unbinds and
+restores coexistence. `COEX_IPS_LEAVE` has no separate caller: the fresh
+generation's coexistence `start` (`rtw_coex_power_on_setting` + `init_hw`,
+scoreboard ACTIVE|ONOFF, `wl_under_ips` clear) is that state. HID game detection (and with it `COEX_WLINK_2GFREE`)
 requires `MIMO_PS` (`hid_supported`, Linux `wl_mimo_ps_support`); a 2GFREE
 mode reached without it is refused (`Unsupported`, restore and unbind).
 
@@ -4376,7 +4401,7 @@ changes. None is a physical blocker unless stated.
 | `radio_coexistence` | Source-complete under separate N2xK (see "C21/C22 Bluetooth coexistence state machine"): `coex.c` init/notify/BT-info/run_coex/actions/works with per-chip tables and hooks, efuse-qualified modes, full backup/restore. Five register-model cases written, unexecuted; no signed N2xK record or BT-active physical pass. |
 | `rf_power_tracking` | Source-complete for admitted C21 type0 RF-A HT20 under distinct N21W: real meter/AGC/txscale/associated IQK, exact H/R/T2/RTS plus C/Q/F/D current source composition, all-rate factory limits and actual native quiet/terminal/restore. Power-only restore retains keys/BA; after periodic IQK source loss requires a fresh owner. Eight native cases are written; release/native and physical acceptance remain pending. C22 retains N22D. HT40 variant: the same N21W program over the bound N2xB record's one-stream MCS0..7 at BW40, with the N2xB-bound request identity and its own `-ht40` filename; one index-selection case written, unexecuted. |
 | `rtl8822be` | Station core source-complete, pending validation (unexecuted tests, no hardware run, no board asset provisioned): the retained native B22 owner (identity, factory map, authenticated `rtw8822b_fw.bin`, `rtw8822b_mac_init`, the complete `rtw8822b_phy_set_param`, `rtw8822b_set_channel`), the signed `N2BQ` calibration IQK, `N2BP` operating power and `N2BS` awake-station grant ("RTL8822BE retained native B22 owner" ... "parked operating power"), per-channel `N2BO` 2.4/5GHz records and retune (refused over any bound extension), the `N2BD` dm watchdog (DIG/RA/PWR_TRACK/EDCCA) with `N2BW` associated re-IQK, `N2BL` legacy12/WMM, `N2BH` HT20 1SS/2SS, `N2BB` HT40 and `N2BV` VHT80 widening via `rtw8822b_set_channel` at 40/80, `N2BC` LDPC-only TX coding, `N2BQ` all-AC QoS, `N2BF` fallback, `N2BR`/`N2BT` recipient/originator BA and `N2BX` RTS (see the "RTL8822BE ..." sections of §3 from "RTL8822BE per-channel operating records" to "recipient/originator BA"). LPS and Bluetooth coexistence are separate C22 feature rows and stay open for B22 ("RTL8822BE documented gaps: LPS and Bluetooth coexistence"). Unprovisioned boards stay unadmitted. |
-| `runtime_sleep` | Source candidate: explicit unassociated IPS through `idle_function`, retained original callback/DMA/card-off/fresh-start workers; associated nondeep legacy CCK1 LPS through `lps_function` with distinct N2xZ program, real retained reserved-page DMA, original UP/peer/key epoch, fresh RFON plus actual TCR wake, PS-only HMEBOX_EXT/low-word publication fence and private CCMP RX. Three IPS and eight LPS native cases are written/unexecuted. Full review/release/native and physical acceptance are pending; do not remove this row until integration review accepts the whole candidate. |
+| `runtime_sleep` | Source candidate: explicit unassociated IPS through `idle_function`, retained original callback/DMA/card-off/fresh-start workers; associated nondeep legacy CCK1 LPS through `lps_function` with distinct N2xZ program, real retained reserved-page DMA, original UP/peer/key epoch, fresh RFON plus actual TCR wake, PS-only HMEBOX_EXT/low-word publication fence and private CCMP RX. Production trigger: `set_power_save` (`SUPPORTS_PS` only with a composed LPS owner) arms a 2s watchdog LPS window below `RTW_LPS_THRESHOLD`, with coex LPS/IPS notifications; IPS (`idle_function`) still has no production trigger. Three IPS, eight LPS and one interface case are written/unexecuted. Full review/release/native and physical acceptance are pending; do not remove this row until integration review accepts the whole candidate. |
 | `safe_rejoin` | Source-complete explicit C21/C22 channel1 Open/WPA2 rejoin: confirmed original reset/DMA retirement, exact name/ifindex/admin rebind, fresh provisioning/BSS scan/key exchange and original new-UP native publication lifetime. Original cookies/keys/replies never revive, failed/cancelled M4 stays closed, caller credentials zeroize. Four native cases are written; release/native and physical acceptance remain pending. |
 | `smps_txrx_1ss` | Source-complete for C22 under N22K `MIMO_PS` (see "Coexistence-driven static SMPS"): `rtw_coex_mimo_ps` -> `config_trx_mode(A, A)` with exact field restore, dm path diversity held on A, 1SS RA mask / STBC off, SM Power Save static/disabled action. Three register-model cases written, unexecuted; no signed N22K MIMO_PS record or BT-active measurement. |
 | `system_suspend` | Source-complete for actual C21/C22 identity-DMA PCI-PM D0 profiles: retained uncancelled native retirement/card-off/D3hot receipts, original-source C22 RFE6 DBI pad, D0/config restoration and fresh cold provisioning on the original netdev. Foreground cancellation rolls workers back; old keys/cookies never revive and fresh association stays explicit. Six native cases are written; release/native and physical S3 acceptance remain pending. |

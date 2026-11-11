@@ -987,6 +987,13 @@ impl<I: Io> Owner<I> {
     pub(super) fn station_local(&self) -> Option<[u8; 6]> {
         self.station.as_deref().map(super::station::State::local)
     }
+    /// `rtw_coex_ips_notify(COEX_IPS_ENTER)` on the retained station before
+    /// unassociated IPS stops it. Best effort, like Linux (no return value).
+    pub(super) async fn station_coex_ips_enter(&mut self) {
+        if let Some(station) = self.station.as_deref_mut() {
+            let _ = station.coex_ips_enter(&mut self.io).await;
+        }
+    }
     pub(super) fn station_ht_capability(&self) -> Option<[u8; 26]> {
         self.io
             .station_ht_facts()

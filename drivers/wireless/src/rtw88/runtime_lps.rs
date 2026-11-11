@@ -181,6 +181,15 @@ impl<I: Io> Owner<I> {
     ) -> Result<crate::rtw88::ContinuationRequest, NativeError> {
         self.io.station_continuation_request(&KIND)
     }
+    /// The interface advertises power save (`SUPPORTS_PS`) only when this
+    /// retained firmware has a nondeep LPS profile and the separately
+    /// signed N2xZ continuation loads over the current station gate.
+    pub(in crate::rtw88) fn lps_capable(&mut self) -> bool {
+        self.info
+            .and_then(|info| Profile::from_firmware(self.did, info))
+            .is_some()
+            && matches!(self.io.station_continuation(&KIND), Ok(Some(_)))
+    }
     pub(in crate::rtw88) async fn lps_window(
         &mut self,
         host: Lifetime,
@@ -191,6 +200,10 @@ impl<I: Io> Owner<I> {
         }
         self.station_check().map_err(|_| Error::Busy)?;
         let station = self.station.as_mut().ok_or(Error::Busy)?;
+        // ps.c `rtw_enter_lps`: coexistence `wl_force_lps_ctrl` refuses LPS.
+        if station.coex_forces_lps_off() {
+            return Err(Error::Busy);
+        }
         let (own, peer, aid) = station.lps_peer().ok_or(Error::Busy)?;
         if !self.io.station_ht_program_quiet().await? {
             return Err(Error::Busy);
@@ -232,12 +245,23 @@ impl<I: Io> Owner<I> {
             .station_reserved_page(&pages.bytes, boundary, &source, &admission)
             .await?;
         let expect = Some((own, peer, aid));
+        // ps.c `rtw_enter_lps_core`: `rtw_coex_lps_notify(COEX_LPS_ENABLE)`
+        // before `rtw_fw_set_pwr_mode`.
+        station
+            .coex_lps(&mut self.io, true)
+            .await
+            .map_err(|_| Error::Generation)?;
         for command in [pages.locations, wire::parameters(true)] {
             match send(&mut self.io, station, command, &source, &admission, expect).await {
                 // Unissued before LPS entry: firmware stays active, the page
                 // was restored and collected RX stays queued for ordinary
                 // processing, so the original station remains open.
+                // Coexistence returns to the awake state with it.
                 Err(Error::Busy) => {
+                    station
+                        .coex_lps(&mut self.io, false)
+                        .await
+                        .map_err(|_| Error::Generation)?;
                     attempt.armed = false;
                     return Err(Error::Busy);
                 }
@@ -317,6 +341,12 @@ impl<I: Io> Owner<I> {
         if !awake {
             return Err(NativeError::Timeout.into());
         }
+        // ps.c `rtw_leave_lps_core`: `rtw_coex_lps_notify(COEX_LPS_DISABLE)`
+        // after the ACTIVE `rtw_fw_set_pwr_mode` and leave check.
+        station
+            .coex_lps(&mut self.io, false)
+            .await
+            .map_err(|_| Error::Generation)?;
         crate::rtw88::firmware_transport::enclosed(
             |op| admission.run(|| source.invoke(op)),
             async {

@@ -18,6 +18,17 @@ use narf_wireless::{
 use zeroize::Zeroizing;
 type Error = station::Error;
 const EINVAL: i32 = 22;
+/// main.c `RTW_WATCH_DOG_DELAY_TIME` (2s).
+const LPS_PERIOD_MS: u64 = 2_000;
+/// ps.h `RTW_LPS_THRESHOLD`.
+const LPS_THRESHOLD: u32 = 50;
+/// One bounded nondeep LPS residence per period (`lps_function` maximum).
+const LPS_WINDOW_MS: u32 = 100;
+/// main.c `rtw_watch_dog_work`: `ps_enabled && !ps_active`, where
+/// `ps_active` is `tx_cnt > RTW_LPS_THRESHOLD || rx_cnt > RTW_LPS_THRESHOLD`.
+fn lps_due(enabled: bool, tx: u32, rx: u32) -> bool {
+    enabled && tx <= LPS_THRESHOLD && rx <= LPS_THRESHOLD
+}
 const EBUSY: i32 = 16;
 const ENODEV: i32 = 19;
 struct Rings {
@@ -81,6 +92,16 @@ pub(super) struct Device<I: Io> {
     wow_armed: AtomicBool,
     /// The last resume's `ieee80211_report_wowlan_wakeup` subset.
     wakeup: IrqSafeSpinLock<Option<super::wow::WakeReport>>,
+    /// `SUPPORTS_PS` for this generation (`Owner::lps_capable` at activate).
+    sleep_capable: AtomicBool,
+    /// mac80211 `vif->cfg.ps` (`rtw_recalc_lps` -> `ps_enabled`).
+    sleep_enabled: AtomicBool,
+    /// Data frames sent / delivered since the last LPS period
+    /// (`rtw_traffic_stats` `tx_cnt` / `rx_cnt`).
+    ps_tx: AtomicU32,
+    ps_rx: AtomicU32,
+    /// Next LPS watchdog period (environment ms).
+    ps_next: AtomicU64,
 }
 impl<I: Io> core::fmt::Debug for Device<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -159,6 +180,11 @@ impl<I: Io + 'static> Device<I> {
             bssid: AtomicU64::new(0),
             ht_capability: IrqSafeSpinLock::new(None),
             band5_capability: IrqSafeSpinLock::new(None),
+            sleep_capable: AtomicBool::new(false),
+            sleep_enabled: AtomicBool::new(false),
+            ps_tx: AtomicU32::new(0),
+            ps_rx: AtomicU32::new(0),
+            ps_next: AtomicU64::new(0),
             channels: AtomicU64::new(1 << 1),
             receive_generation: AtomicU64::new(0),
             metadata: IrqSafeSpinLock::new(()),
@@ -349,7 +375,7 @@ impl<I: Io + 'static> Device<I> {
         &self,
         reserve: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let retained = self.lifecycle.retained.lock().await;
+        let mut retained = self.lifecycle.retained.lock().await;
         if self.closed()
             || self.lifecycle.removed()
             || self.lifecycle.status().stage != super::firmware_lifecycle::Stage::StationReady
@@ -361,6 +387,13 @@ impl<I: Io + 'static> Device<I> {
             return Err(Error::Busy);
         }
         let claim = reserve()?;
+        // ps.c `rtw_enter_ips`: `rtw_coex_ips_notify(COEX_IPS_ENTER)` before
+        // `rtw_core_stop`. The fresh generation's coexistence `start`
+        // (`rtw_coex_power_on_setting` + `init_hw`, scoreboard ACTIVE|ONOFF)
+        // is the `COEX_IPS_LEAVE` state on resume.
+        if let Some(owner) = retained.as_mut() {
+            owner.station_coex_ips_enter().await;
+        }
         self.cancel_control();
         Ok(claim)
     }
@@ -370,12 +403,66 @@ impl<I: Io + 'static> Device<I> {
         if self.closed() || !self.admitted.load(Ordering::Acquire) {
             return false;
         }
-        match self.lifecycle.watchdog().await {
+        let ran = match self.lifecycle.watchdog().await {
             Ok(ran) => ran,
             Err(_) => {
                 self.close();
-                false
+                return false;
             }
+        };
+        self.lps_watchdog().await;
+        ran
+    }
+    /// main.c `rtw_watch_dog_work` LPS tail: every `RTW_WATCH_DOG_DELAY_TIME`
+    /// period with power save on (`ps_enabled`), an associated station and
+    /// at most `RTW_LPS_THRESHOLD` data frames each way (`!ps_active`),
+    /// `rtw_enter_lps`. NARF's LPS owner is the bounded nondeep window
+    /// (`Owner::lps_window`, the `lps_function` operation), so the period
+    /// sleeps one [`LPS_WINDOW_MS`] window and then confirms awake. Refusal
+    /// (busy peer/queues, coexistence `wl_force_lps_ctrl`, no N2xZ record on
+    /// this channel) leaves the station untouched; a failed window has
+    /// already closed the station, which needs reset/rejoin.
+    async fn lps_watchdog(&self) {
+        if !self.sleep_capable.load(Ordering::Acquire) {
+            return;
+        }
+        let now = self.environment.now_ms();
+        if now < self.ps_next.load(Ordering::Acquire) {
+            return;
+        }
+        self.ps_next
+            .store(now.saturating_add(LPS_PERIOD_MS), Ordering::Release);
+        let tx = self.ps_tx.swap(0, Ordering::AcqRel);
+        let rx = self.ps_rx.swap(0, Ordering::AcqRel);
+        if !lps_due(self.sleep_enabled.load(Ordering::Acquire), tx, rx)
+            || self.closed()
+            || !self.link_up()
+            || self.wow_armed.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(snapshot) = narf_net::iface::lookup(&self.name) else {
+            return;
+        };
+        if snapshot.mac != self.local {
+            return;
+        }
+        let Some(up) = narf_net::iface::OpenStopEvent::observe(&snapshot).filter(|e| e.up()) else {
+            return;
+        };
+        let Some(host) = up.native_identity() else {
+            return;
+        };
+        let mut retained = self.lifecycle.retained.lock().await;
+        if !up.current() || self.closed() {
+            return;
+        }
+        let Some(owner) = retained.as_mut() else {
+            return;
+        };
+        if owner.lps_window(host, LPS_WINDOW_MS).await.is_err() && self.closed() {
+            drop(retained);
+            self.close();
         }
     }
     pub(super) async fn activate(&self) -> Result<(), Error> {
@@ -392,7 +479,7 @@ impl<I: Io + 'static> Device<I> {
         self.lifecycle
             .start_station(self.environment.clone(), self.admission.clone())
             .await?;
-        let (authority, ht, channels, band5) = {
+        let (authority, ht, channels, band5, sleep) = {
             let mut retained = self.lifecycle.retained.lock().await;
             let owner = retained.as_mut().ok_or(Error::State)?;
             (
@@ -400,6 +487,7 @@ impl<I: Io + 'static> Device<I> {
                 owner.station_ht_capability(),
                 owner.station_admitted_channels(),
                 owner.station_band5_capability(),
+                owner.lps_capable(),
             )
         };
         self.admission.run(|| {
@@ -407,6 +495,7 @@ impl<I: Io + 'static> Device<I> {
                 self.admitted.store(true, Ordering::Release);
                 *self.ht_capability.lock() = ht;
                 *self.band5_capability.lock() = band5;
+                self.sleep_capable.store(sleep, Ordering::Release);
                 self.channels.store(channels, Ordering::Release);
                 Ok(())
             })
@@ -547,6 +636,9 @@ impl<I: Io + 'static> Device<I> {
             if !self.admission.teardown_pending() {
                 let _ = owner.station_stop();
             }
+        }
+        if result.is_ok() {
+            self.ps_tx.fetch_add(1, Ordering::Relaxed);
         }
         result.map_err(|_| ())
     }
@@ -805,6 +897,7 @@ impl<I: Io + 'static> Device<I> {
                         return Err(super::firmware_transport::Error::State);
                     }
                     narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
+                    self.ps_rx.fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 })
                 .is_err()
@@ -949,6 +1042,23 @@ impl<I: Io + 'static> WirelessNetIface for Device<I> {
     }
     fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
         self.wowlan()
+    }
+    /// main.c `SUPPORTS_PS` | `SUPPORTS_DYNAMIC_PS` (no
+    /// `WIPHY_FLAG_PS_ON_BY_DEFAULT`): only with a composed LPS owner.
+    fn power_save_default(&self) -> Option<bool> {
+        self.sleep_capable
+            .load(Ordering::Acquire)
+            .then(|| self.sleep_enabled.load(Ordering::Acquire))
+    }
+    /// `rtw_ops_config(IEEE80211_CONF_CHANGE_PS)` -> `rtw_recalc_lps`:
+    /// enabling arms the watchdog LPS entry; disabling stops further
+    /// windows (every window already ends awake).
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        if !self.sleep_capable.load(Ordering::Acquire) {
+            return Err(narf_wireless::EOPNOTSUPP);
+        }
+        self.sleep_enabled.store(enabled, Ordering::Release);
+        Ok(())
     }
     fn connected_bssid(&self) -> Option<[u8; 6]> {
         if !self.link_up() {

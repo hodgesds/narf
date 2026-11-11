@@ -309,3 +309,39 @@ kernel_test_in!(
     "drivers/wireless/rtw88",
     smoke_rtw88_band5_wiphy_caps_follow_admitted_station_offer
 );
+
+/// main.c `SUPPORTS_PS`: power save is advertised and settable only with a
+/// composed LPS owner (`Owner::lps_capable`), off by default; the watchdog
+/// enters LPS only below `RTW_LPS_THRESHOLD` (`ps_active` false).
+fn smoke_rtw88_power_save_interface_follows_lps_capability() -> TestResult {
+    let device = shell();
+    if device.power_save_default().is_some()
+        || device.set_power_save(true) != Err(narf_wireless::EOPNOTSUPP)
+        || device.sleep_enabled.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("shell without an LPS owner advertised power save");
+    }
+    device.sleep_capable.store(true, Ordering::Release);
+    if device.power_save_default() != Some(false) {
+        return TestResult::Fail("power save not advertised off by default");
+    }
+    if device.set_power_save(true).is_err() || device.power_save_default() != Some(true) {
+        return TestResult::Fail("power save enable not retained");
+    }
+    if device.set_power_save(false).is_err() || device.power_save_default() != Some(false) {
+        return TestResult::Fail("power save disable not retained");
+    }
+    if !lps_due(true, 0, 0)
+        || !lps_due(true, LPS_THRESHOLD, LPS_THRESHOLD)
+        || lps_due(true, LPS_THRESHOLD + 1, 0)
+        || lps_due(true, 0, LPS_THRESHOLD + 1)
+        || lps_due(false, 0, 0)
+    {
+        return TestResult::Fail("LPS entry differs from rtw_watch_dog_work ps_active");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw88_power_save_interface_follows_lps_capability
+);
