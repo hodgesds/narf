@@ -20,7 +20,7 @@ use std::time::Instant;
 use crate::dev::{sb_generation, Ev, RecDev, SB_LEN, SB_OFFSETS};
 use crate::host::block_on;
 use crate::linux;
-use crate::model::{diff, Cmp, Flat, FlatTree};
+use crate::model::{diff, Cmp, FlatTree};
 use crate::workload::{CommitRec, Rng};
 
 pub struct Input<'a> {
@@ -137,16 +137,11 @@ pub fn run(inp: &Input, opts: &Opts) -> Report {
         .entry(inp.base_gen)
         .or_default()
         .push(inp.base_state.clone());
-    // gen → the truncate in progress when it was committed, if any.
-    let mut shrinking: BTreeMap<u64, (usize, String, usize)> = BTreeMap::new();
     for c in inp.commits {
         states
             .entry(c.gen)
             .or_default()
             .extend(c.candidates.iter().cloned());
-        if let Some(s) = &c.shrinking {
-            shrinking.insert(c.gen, s.clone());
-        }
     }
 
     let mut checks: Vec<(std::process::Child, PathBuf, String)> = Vec::new();
@@ -253,7 +248,7 @@ pub fn run(inp: &Input, opts: &Opts) -> Report {
             ));
             continue;
         };
-        match narf_verify(inp, &narf_img, want, shrinking.get(&expect_gen), n % 4 == 0) {
+        match narf_verify(inp, &narf_img, want, n % 4 == 0) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&narf_img);
             }
@@ -282,7 +277,6 @@ fn narf_verify(
     inp: &Input,
     img: &Path,
     want: &[Vec<FlatTree>],
-    shrinking: Option<&(usize, String, usize)>,
     write_after: bool,
 ) -> Result<(), String> {
     let dev = Arc::new(RecDev::open(img, inp.lba, inp.fsid, inp.nodesize));
@@ -297,32 +291,8 @@ fn narf_verify(
         xattrs: true,
         dir_perms: true,
     };
-    // A truncate committed between two of its steps: the file at a length
-    // between the new one and a candidate's, holding the candidate's bytes.
-    let mut want: Vec<Vec<FlatTree>> = want.to_vec();
-    if let Some((sub, path, min)) = shrinking {
-        if let Some(Flat::File { data: found, .. }) = got.get(*sub).and_then(|t| t.get(path)) {
-            let partial: Vec<Vec<FlatTree>> = want
-                .iter()
-                .filter_map(|cand| {
-                    let Some(Flat::File { data, .. }) = cand.get(*sub)?.get(path) else {
-                        return None;
-                    };
-                    let between = found.len() >= *min && found.len() < data.len();
-                    (between && data.starts_with(found)).then(|| {
-                        let mut cut = cand.clone();
-                        if let Some(Flat::File { data, .. }) = cut[*sub].get_mut(path) {
-                            *data = found.clone();
-                        }
-                        cut
-                    })
-                })
-                .collect();
-            want.extend(partial);
-        }
-    }
     let mut best: Option<Vec<String>> = None;
-    for cand in &want {
+    for cand in want {
         let d: Vec<String> = cand
             .iter()
             .zip(&got)
