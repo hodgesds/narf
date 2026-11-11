@@ -3095,6 +3095,7 @@ dependencies = [
  "narf-ipc",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
  "narf-scheduler",
  "zeroize",
 ]

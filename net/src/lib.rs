@@ -121,6 +121,10 @@ pub mod readiness;
 pub mod resolv_conf;
 pub mod route;
 pub mod rss;
+// The scaling harness reads the slab counters, so it follows the feature
+// that pulls `narf-memory` in rather than `cfg(test)`.
+#[cfg(feature = "kernel-test")]
+mod scale_bench;
 pub mod sntp;
 pub mod stack;
 pub mod stun;

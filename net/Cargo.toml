@@ -20,6 +20,8 @@ narf-io           = { path = "../io" }
 narf-scheduler    = { path = "../scheduler" }
 narf-console      = { path = "../console" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+# Test image only: the scaling harness reports slab operations per packet.
+narf-memory       = { path = "../memory", optional = true }
 aes-gcm = { version = "0.10", default-features = false, features = ["alloc", "aes"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
@@ -27,7 +29,7 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # Compile the in-kernel test suite (the `kernel_test_in!` smokes). Off by
 # default so production kernels exclude all test code; the frame aggregator's
 # `kernel-test` feature enables it for the test image.
-kernel-test = []
+kernel-test = ["dep:narf-memory"]
 
 [lints]
 workspace = true
