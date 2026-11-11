@@ -41,11 +41,6 @@ fn make_pipe2() -> Result<(u32, u32), &'static str> {
 fn smoke_abi_fdio2_dev_fd_reopens_pipe() -> TestResult {
     with_setup(|| {
         let (rd, wr) = make_pipe2()?;
-        // `with_setup` gives this case a fresh fd table, but preceding ABI
-        // cases may have retained test-only fd-path bookkeeping at a reused
-        // number. A pipe is anonymous, so remove any such stale identity
-        // before exercising the same path a shell-created pipe uses.
-        crate::mqueue::forget_fd_path(FAKE_TASK, rd);
         let payload = *b"psub";
         if call(
             Syscall::Write.raw(),
@@ -97,7 +92,7 @@ fn smoke_abi_fdio2_dev_fd_reopens_pipe() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fdio2_dev_fd_reopens_pipe);
+kernel_test_in!("syscall_abi/procfd", smoke_abi_fdio2_dev_fd_reopens_pipe);
 
 /// bash's process substitution exactly: `pipe`, move the read end to fd 63
 /// with `fcntl(F_DUPFD, 63)`, close the original, then the redirect opens
@@ -107,7 +102,6 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio2_dev_fd_reopens_pipe);
 fn dev_fd_reopens_dupfd_pipe(chrooted: bool) -> Result<(), &'static str> {
     const F_DUPFD: u64 = 0;
     let (rd, wr) = make_pipe2()?;
-    crate::mqueue::forget_fd_path(FAKE_TASK, rd);
     let moved = match call(Syscall::Fcntl.raw(), a2(rd as u64, F_DUPFD, 63)) {
         Some(fd) if fd >= 63 => fd as u32,
         _ => return Err("fcntl(F_DUPFD, 63) on the pipe reader failed"),
@@ -153,13 +147,16 @@ fn dev_fd_reopens_dupfd_pipe(chrooted: bool) -> Result<(), &'static str> {
 fn smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe() -> TestResult {
     with_setup(|| dev_fd_reopens_dupfd_pipe(false))
 }
-kernel_test_in!("syscall_abi", smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe);
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe
+);
 
 fn smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe_in_chroot() -> TestResult {
     with_setup(|| dev_fd_reopens_dupfd_pipe(true))
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/procfd",
     smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe_in_chroot
 );
 

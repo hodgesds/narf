@@ -372,7 +372,6 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
-    crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
     // fork(2) is clone without CLONE_FS: a private copy of root + cwd.
     fs_fork(parent_pid, child_tid.raw(), false);
     personality_fork(parent_pid, child_tid.raw());

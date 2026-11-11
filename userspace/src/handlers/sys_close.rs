@@ -18,11 +18,8 @@ pub(crate) fn sys_close(ctx: &mut dyn TrapContext) {
         let _ = poll_blocking(ops.flush());
     }
     fd::release_closed(task, [ops.clone()]);
-    // inotify: IN_CLOSE_WRITE for the file (before we drop its path),
-    // then forget the fd → path mapping.
-    {
-        crate::mqueue::notify_close_fd(task, fd, ops.mq_queue_id());
-        crate::mqueue::forget_fd_path(task, fd);
-    }
+    // The file's name, and the inotify close event that carries it, go with
+    // the open file description when its last descriptor closes.
+    crate::mqueue::notify_close_fd(task, fd, ops.mq_queue_id());
     ctx.set_return(SyscallReturn::ok(0));
 }

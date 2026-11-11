@@ -536,7 +536,6 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             });
             match outcome {
                 Some(Ok(new_fd)) => {
-                    crate::mqueue::duplicate_fd_path(task, fd, new_fd);
                     ctx.set_return(SyscallReturn::ok(new_fd as u64));
                 }
                 // `f_dupfd` finishes with `alloc_fd(from, nofile, flags)`,

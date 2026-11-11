@@ -22,6 +22,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
+pub(crate) mod names;
 mod read_index;
 pub(crate) use read_index::ResolvedFd;
 use read_index::{ReadIndex, SharedTable};
@@ -155,10 +156,12 @@ pub(crate) struct OpenFileDescription {
     /// alias closes. Weak avoids a description -> file -> waker -> description
     /// cycle; the callback itself also retains only a Weak description.
     fasync_ops: Weak<dyn FileOps>,
-    /// The path this description was opened on and whether it names a
-    /// directory, for the inotify/fanotify close event `__fput` sends
-    /// (`fsnotify_close`). Recorded when the opening fd's path is registered.
-    close_notify: IrqSafeSpinLock<Option<(String, bool)>>,
+    /// What the file names — Linux `file::f_path`, kept as [`names`]
+    /// describes. Set when the file is opened by path and read by everything
+    /// that asks what a descriptor refers to: the `/proc/<pid>/fd` link, a
+    /// `*at` syscall's directory, the inotify/fanotify close event `__fput`
+    /// sends (`fsnotify_close`).
+    name: IrqSafeSpinLock<Option<names::FileName>>,
 }
 
 impl core::fmt::Debug for OpenFileDescription {
@@ -241,11 +244,13 @@ impl Drop for OpenFileDescription {
         // O_WRONLY and O_RDWR but not access mode 3), IN_CLOSE_NOWRITE
         // otherwise, and nothing for O_PATH (FMODE_NONOTIFY).
         let flags = self.status_flags.load(Ordering::Acquire);
-        if flags & O_PATH == 0 {
-            if let Some((path, is_dir)) = self.close_notify.lock().take() {
+        // The file stops being listed under its name either way; an unlinked
+        // one has no name left for the event to carry.
+        if let Some(name) = names::unbind(self).filter(|name| !name.deleted) {
+            if flags & O_PATH == 0 {
                 let accmode = flags & O_ACCMODE;
                 let writable = accmode == O_WRONLY || accmode == O_RDWR;
-                crate::mqueue::notify_close(&path, writable, is_dir);
+                crate::mqueue::notify_close(&name.path, writable, name.is_dir);
             }
         }
     }
@@ -387,26 +392,6 @@ impl OpenFileDescription {
 
     pub(crate) fn set_status_flags(&self, status_flags: u32) {
         self.status_flags.store(status_flags, Ordering::Release);
-    }
-
-    /// Record the path (and directory-ness) the close event will name. The
-    /// first registration wins: a description is opened on one path.
-    pub(crate) fn set_close_notify(&self, path: &str, is_dir: bool) {
-        let mut slot = self.close_notify.lock();
-        if slot.is_none() {
-            *slot = Some((String::from(path), is_dir));
-        }
-    }
-
-    /// The path this description was opened on, when it was opened by path:
-    /// Linux `file->f_path`, as far as `d_path` for `/proc/<pid>/fd/<n>`
-    /// needs it. Every alias of the description names the same file, also
-    /// one installed in another task by SCM_RIGHTS.
-    pub(crate) fn opened_path(&self) -> Option<String> {
-        self.close_notify
-            .lock()
-            .as_ref()
-            .map(|(path, _)| path.clone())
     }
 
     pub(crate) fn fasync_waiter_id(&self) -> u64 {
@@ -805,7 +790,7 @@ impl FdTable {
             }),
             fasync_waiter_id: next_fasync_waiter_id(),
             fasync_ops: Arc::downgrade(&entry.ops),
-            close_notify: IrqSafeSpinLock::new(None),
+            name: IrqSafeSpinLock::new(None),
         })
     }
 
@@ -1134,6 +1119,10 @@ fn fresh_table() -> FdTable {
                 status_flags: if fd == 0 { O_RDONLY } else { O_WRONLY },
             },
         );
+        // `console_on_rootfs`: init's stdio is an open of `/dev/console`.
+        if let Some(description) = t.description(fd) {
+            names::bind(&description, String::from("/dev/console"), None, false);
+        }
     }
     t
 }
@@ -1253,21 +1242,7 @@ pub fn with_table_alloc<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> 
 /// `get_unused_fd_flags` + `fd_install` in one step — so handlers do not each
 /// have to reach through [`with_table`] and flatten two layers of `Option`.
 pub fn install(task_id: u64, entry: FdEntry) -> Option<u32> {
-    let fd = with_table_alloc(task_id, |t| t.open(entry)).flatten()?;
-    forget_previous_identity(task_id, fd);
-    Some(fd)
-}
-
-/// A freshly installed descriptor starts with no pathname identity.
-///
-/// The fd→path side table is retired by `close(2)`, but a number can also be
-/// freed by CLOEXEC at exec, `close_range`, or a `CLONE_FILES` sibling's close
-/// — and an inherited row then outlives its file. Without this, a pipe or
-/// socket that reused such a number readlinked to the old file's path (a pipe
-/// end reading `/dev/null` in `/proc/<pid>/fd`). Opens that do have a path
-/// register it after the install.
-fn forget_previous_identity(task_id: u64, fd: u32) {
-    crate::mqueue::forget_fd_path(task_id, fd);
+    with_table_alloc(task_id, |t| t.open(entry)).flatten()
 }
 
 /// An unpublished descriptor number reserved for one in-flight open.
@@ -1295,7 +1270,6 @@ impl FdReservation {
             .unwrap_or(false);
         if installed {
             self.active = false;
-            forget_previous_identity(self.task_id, self.fd);
             Some(self.fd)
         } else {
             None
@@ -1333,7 +1307,7 @@ pub(crate) fn reserve(task_id: u64) -> Option<FdReservation> {
 ///
 /// `None` is -EMFILE, with the table exactly as it was.
 pub fn install_pair(task_id: u64, first: FdEntry, second: FdEntry) -> Option<(u32, u32)> {
-    let (a, b) = with_table_alloc(task_id, |t| {
+    with_table_alloc(task_id, |t| {
         let a = t.open(first)?;
         match t.open(second) {
             Some(b) => Some((a, b)),
@@ -1343,10 +1317,7 @@ pub fn install_pair(task_id: u64, first: FdEntry, second: FdEntry) -> Option<(u3
             }
         }
     })
-    .flatten()?;
-    forget_previous_identity(task_id, a);
-    forget_previous_identity(task_id, b);
-    Some((a, b))
+    .flatten()
 }
 
 /// Whether `task` could allocate a descriptor right now. See
@@ -1358,9 +1329,7 @@ pub fn has_free_descriptor(task_id: u64) -> bool {
 /// As [`install`], but at the lowest free descriptor at or above `min`.
 /// Backs `fcntl(F_DUPFD)`-shaped allocation.
 pub fn install_at_least(task_id: u64, entry: FdEntry, min: u32) -> Option<u32> {
-    let fd = with_table_alloc(task_id, |t| t.open_at_least(entry, min)).flatten()?;
-    forget_previous_identity(task_id, fd);
-    Some(fd)
+    with_table_alloc(task_id, |t| t.open_at_least(entry, min)).flatten()
 }
 
 /// Hook supplying a task's RLIMIT_NOFILE soft limit. The rlimit store lives

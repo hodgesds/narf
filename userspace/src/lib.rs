@@ -167,6 +167,7 @@ mod abi_pidns_tests;
 mod abi_populate_tests;
 mod abi_proc2_tests;
 mod abi_proc_tests;
+mod abi_procfd_tests;
 mod abi_pty_tests;
 mod abi_readahead_tests;
 mod abi_remount_tests;

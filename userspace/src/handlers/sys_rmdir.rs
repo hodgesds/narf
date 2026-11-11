@@ -83,6 +83,8 @@ pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str, last: LastCo
     match outcome {
         Some(Some(Ok(()))) => {
             crate::mqueue::notify_delete(path, true);
+            // `d_delete`: a directory still open reads `(deleted)`.
+            crate::fd::names::unlinked(&open_file_name(path));
             ctx.set_return(SyscallReturn::ok(0));
         }
         // The parent filesystem resolved but rmdir reported an error — map it

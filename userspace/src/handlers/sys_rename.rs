@@ -346,6 +346,8 @@ fn rename_impl(
             Some(Ok(())) => {
                 crate::mqueue::notify_moved(old_path, new_path);
                 crate::mqueue::notify_moved(new_path, old_path);
+                // `d_exchange`: open files under either name follow it.
+                crate::fd::names::exchanged(&open_file_name(old_path), &open_file_name(new_path));
                 0
             }
             // A filesystem that cannot exchange answers EINVAL, as Linux's
@@ -367,13 +369,29 @@ fn rename_impl(
         // file lands in a different directory a blanket EXDEV surfaces to
         // the user as "Invalid cross-device link" / "Disk full?" and the
         // config or cache is never written.
-        return cross_dir_rename(old_path, new_path) as i64;
+        let ret = cross_dir_rename(old_path, new_path) as i64;
+        if ret == 0 {
+            crate::fd::names::renamed(
+                &open_file_name(old_path),
+                &open_file_name(new_path),
+                old_is_dir,
+            );
+        }
+        return ret;
     }
     let outcome = poll_blocking(old_side.parent.rename(&old_side.leaf, &new_side.leaf));
     match outcome {
         Some(Ok(())) => {
             // inotify: paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie.
             crate::mqueue::notify_moved(old_path, new_path);
+            // `d_move`: the files open at the old name, and below it when a
+            // directory moved, now read the new one; a file the rename
+            // replaced reads `(deleted)`.
+            crate::fd::names::renamed(
+                &open_file_name(old_path),
+                &open_file_name(new_path),
+                old_is_dir,
+            );
             0
         }
         // Report the filesystem's ACTUAL error. systemd's

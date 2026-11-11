@@ -41,7 +41,6 @@ pub(crate) fn sys_dup2(ctx: &mut dyn TrapContext) {
         Some(Some(replaced)) => {
             // `do_dup2` closes the file the slot held (`filp_close`).
             fd::release_closed(task, replaced);
-            crate::mqueue::duplicate_fd_path(task, oldfd, newfd);
             ctx.set_return(SyscallReturn::ok(newfd as u64));
         }
         // oldfd not open → -EBADF (was InvalidOp).

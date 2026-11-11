@@ -830,10 +830,32 @@ file position and mutable status flags. `dup*`, `F_DUPFD`, fork inheritance,
 and `SCM_RIGHTS` alias that object, while `FD_CLOEXEC` remains per descriptor;
 independent opens create independent descriptions. Consequently `lseek`,
 sequential I/O, readiness-at-offset, `/proc/*/fdinfo`, and `F_GETFL/F_SETFL`
-observe changes made through any alias. The description also carries the path
-it was opened on (`OpenFileDescription::opened_path`, Linux `file->f_path`):
-a descriptor installed by `SCM_RIGHTS` in another task reads the sender's
-path through `/proc/<pid>/fd/<n>`, and a pathless one starts with none.
+observe changes made through any alias.
+
+The description also carries what the file names (`fd::names::FileName`, Linux
+`file->f_path`): the host-absolute, symlink-free path the open resolved, the
+mount it was opened through, and whether that name has since been removed.
+Every descriptor of the file — a `dup`, another `CLONE_FILES` thread, a forked
+child, an `SCM_RIGHTS` receiver — therefore reads one name,
+whichever task asks, and closing the last one retires it; no per-task or
+per-descriptor-number record exists. `rename`, `renameat2(RENAME_EXCHANGE)`,
+`unlink` and `rmdir` report the names they change (`names::renamed`,
+`exchanged`, `unlinked` — the counterparts of `d_move`, `d_exchange` and
+`d_delete`), so a name follows a rename of the file or of a directory above
+it, and a removed or replaced name is marked deleted. `fd::names` keeps the
+reverse map those calls need, every named open file by path, which is also
+what answers `umount(2)`'s busy check.
+
+`/proc/<pid>/fd/<n>` renders the name as `d_path` does: relative to the
+reader's root, `<path> (deleted)` once the name is gone, `<dir>/#<ino>
+(deleted)` for an `O_TMPFILE` inode. A file with no name in the namespace
+reads its class: `pipe:[ino]`, `socket:[ino]`, `<nstype>:[ino]`,
+`anon_inode:<class>` with the class name Linux's creator passes to
+`anon_inode_getfile`, `/memfd:<name> (deleted)`, `/secretmem (deleted)`,
+`/dmabuf:`. The helpers that re-resolve a descriptor (`fd_path_for_task`: a
+`*at` directory, a reopen or `stat` through the magic link, `fexecve`) return
+a path only while it leads to the file; one whose name was removed is reached
+as an object, like one that never had a name.
 Stdin is `O_RDONLY`, stdout/stderr are
 `O_WRONLY`, and sockets/socketpairs are `O_RDWR`; constructors do not rely on
 type-based access-mode exceptions. Sequential transfer syscalls pin these

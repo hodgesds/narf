@@ -1155,7 +1155,10 @@ fn smoke_abi_proc2_pid_fd_lists_and_symlinks() -> TestResult {
         result
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_fd_lists_and_symlinks);
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_proc2_pid_fd_lists_and_symlinks
+);
 
 // /proc/self/fd/<n> — the "self" magic dir must resolve as an INTERMEDIATE
 // down into the fd subtree. This is the exact path glibc's fexecve /
@@ -1197,7 +1200,10 @@ fn smoke_abi_proc2_self_fd_readlinks_backing() -> TestResult {
         result
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc2_self_fd_readlinks_backing);
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_proc2_self_fd_readlinks_backing
+);
 
 // An fd with NO path-based open (memfd) must still readlink to a NON-EMPTY
 // target — Linux renders "/memfd:<name> (deleted)"; NARF renders
@@ -1223,7 +1229,10 @@ fn smoke_abi_proc2_anon_fd_readlink_nonempty() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc2_anon_fd_readlink_nonempty);
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_proc2_anon_fd_readlink_nonempty
+);
 
 // Pathless fds readlink to what Linux's pseudo-filesystem d_dname produces:
 // `anon_inode:<name>` for anon_inodefs files, `pipe:[ino]` / `socket:[ino]`
@@ -1288,7 +1297,7 @@ fn smoke_abi_proc2_pathless_fd_links_name_the_file() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/procfd",
     smoke_abi_proc2_pathless_fd_links_name_the_file
 );
 
@@ -1339,7 +1348,7 @@ fn smoke_abi_proc2_memfd_fd_link_is_memfd_name_deleted() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/procfd",
     smoke_abi_proc2_memfd_fd_link_is_memfd_name_deleted
 );
 
@@ -1380,7 +1389,10 @@ fn smoke_abi_proc2_reused_fd_drops_stale_path() -> TestResult {
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc2_reused_fd_drops_stale_path);
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_proc2_reused_fd_drops_stale_path
+);
 
 fn smoke_abi_proc2_fdinfo_uses_live_fd_metadata() -> TestResult {
     with_procfs(FAKE_TASK, "fdinfoproc", &["fdinfoproc"], 0, |base| {
@@ -1424,7 +1436,10 @@ fn smoke_abi_proc2_fdinfo_uses_live_fd_metadata() -> TestResult {
         result
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc2_fdinfo_uses_live_fd_metadata);
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_proc2_fdinfo_uses_live_fd_metadata
+);
 
 // ── /proc/self resolves to the calling pid ──
 
@@ -3497,7 +3512,7 @@ fn smoke_abi_proc2_maps_memfd_mmap_names_the_memfd() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/procfd",
     smoke_abi_proc2_maps_memfd_mmap_names_the_memfd
 );
 
@@ -3946,7 +3961,7 @@ fn smoke_abi_proc2_dirfd_outside_root_resolves_from_the_fd() -> TestResult {
     })
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/procfd",
     smoke_abi_proc2_dirfd_outside_root_resolves_from_the_fd
 );
 
@@ -4049,7 +4064,10 @@ fn proc_dirfd_survives_chroot_into(target: &[u8]) -> TestResult {
 fn smoke_abi_proc2_proc_dirfd_survives_chroot() -> TestResult {
     proc_dirfd_survives_chroot_into(b"/abi-procjail\0")
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc2_proc_dirfd_survives_chroot);
+kernel_test_in!(
+    "syscall_abi/procfd",
+    smoke_abi_proc2_proc_dirfd_survives_chroot
+);
 
 /// The root Chromium actually picks: `ChrootToSelfFdinfo` chroots into
 /// `/proc/self/fdinfo/`, an empty procfs directory, so the root is itself
@@ -4058,7 +4076,7 @@ fn smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo() -> TestResult {
     proc_dirfd_survives_chroot_into(b"/proc/self/fdinfo/\0")
 }
 kernel_test_in!(
-    "syscall_abi",
+    "syscall_abi/procfd",
     smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo
 );
 

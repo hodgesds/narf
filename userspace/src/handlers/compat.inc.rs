@@ -8566,22 +8566,14 @@ fn fd_path_string_of(pid: u64, n: u32) -> Option<alloc::string::String> {
     // resolve pid→tid. Getting this wrong made /proc/self/fd/<n> unresolvable —
     // systemd execs its executor via `execve("/proc/self/fd/N")`, so an empty
     // resolution turned every service spawn into EBADF (project_pidns_flow_model).
-    let tid = proc_pid_to_tid(pid);
-    if let Some(path) = crate::mqueue::fd_path(tid, n) {
-        // Validate that the slot still exists before trusting the separately
-        // maintained fd→path table (fd numbers may be closed and reused).
-        if crate::fd::with_table(tid, |table| table.get(n).is_some()).unwrap_or(false) {
-            return Some(strip_chroot_prefix(tid, &path));
-        }
-    }
-    crate::fd::with_table(tid, |table| Some(pathless_fd_link(&*table.get(n)?.ops))).flatten()
+    fd_path_for_task(proc_pid_to_tid(pid), n)
 }
 
-/// `/proc/<pid>/fd/<n>` target of an fd with no recorded path — what Linux's
-/// pseudo-filesystem `d_dname` produces: `socket:[ino]` (sockfs),
-/// `pipe:[ino]` (pipefs), `anon_inode:<name>` (anon_inodefs, e.g.
-/// `anon_inode:[eventfd]`). `lsof`/`ss -p` match sockets by that inode, and
-/// tools tell eventfds from timerfds by the name.
+/// `/proc/<pid>/fd/<n>` target of a file with no name in the namespace — what
+/// Linux's pseudo-filesystem `d_dname` produces: `socket:[ino]` (sockfs),
+/// `pipe:[ino]` (pipefs), `net:[ino]` (nsfs), `anon_inode:<name>`
+/// (anon_inodefs, e.g. `anon_inode:[eventfd]`). `lsof`/`ss -p` match sockets
+/// by that inode, and tools tell eventfds from timerfds by the name.
 ///
 /// Never starts with `/`: fexecve via `/proc/self/fd/N` uses that to decide
 /// between re-resolving a path and exec'ing the fd's own bytes.
@@ -8590,6 +8582,14 @@ fn pathless_fd_link(ops: &dyn narf_filesystem::FileOps) -> alloc::string::String
     if let Some(name) = ops.anon_name() {
         return alloc::format!("anon_inode:{name}");
     }
+    // `fs/nsfs.c::ns_dname`: `<type>:[<inum>]`.
+    #[cfg(feature = "container")]
+    if let Some(ns) = ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::namespaces::NsFd>())
+    {
+        return ns.link_text();
+    }
     let dev = ops.inode_attrs().dev;
     if dev != 0 && dev == PseudoFs::Sock.dev() {
         return alloc::format!("socket:[{}]", ops.ino());
@@ -8597,52 +8597,71 @@ fn pathless_fd_link(ops: &dyn narf_filesystem::FileOps) -> alloc::string::String
     if dev != 0 && dev == PseudoFs::Pipe.dev() {
         return alloc::format!("pipe:[{}]", ops.ino());
     }
-    // Types not yet given an identity keep the non-empty placeholder. A
-    // memfd lands here too: its `/memfd:<name> (deleted)` link is rendered
+    // What is left is a file that has no name here: one whose name was
+    // removed (the path helpers send an unlinked file this way so that it is
+    // reached as an object, never by a path that no longer leads to it), a
+    // file on a kernel-internal mount (`/memfd:<name> (deleted)` is rendered
     // only by `fd_path_of`, because callers of this treat a `/` as a path to
-    // reopen.
+    // reopen), or a class nobody has named yet.
     "anon_inode:[FileOps]".into()
 }
 
-/// `d_path` of a file created unlinked on a kernel-internal mount
-/// ([`narf_filesystem::FileOps::internal_name`]): `/memfd:<name> (deleted)`.
+/// `d_path` of a file on a kernel-internal mount, which no path in the
+/// namespace leads to: one created unlinked there
+/// ([`narf_filesystem::FileOps::internal_name`], `/memfd:<name> (deleted)`),
+/// or a dma-buf (`dmabuffs_dname`, `/dmabuf:<name>` — NARF's are unnamed).
 pub(crate) fn internal_file_path(ops: &dyn narf_filesystem::FileOps) -> Option<alloc::string::String> {
-    ops.internal_name().map(|name| alloc::format!("/{name} (deleted)"))
+    if let Some(name) = ops.internal_name() {
+        return Some(alloc::format!("/{name} (deleted)"));
+    }
+    let dev = ops.inode_attrs().dev;
+    (dev != 0 && dev == narf_filesystem::inode_id::PseudoFs::DmaBuf.dev())
+        .then(|| alloc::string::String::from("/dmabuf:"))
 }
 
 pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSnapshot> {
     let tid = proc_pid_to_tid(pid);
-    let (pos, flags, ino, internal) = crate::fd::with_table(tid, |table| {
+    let (pos, flags, ops, name) = crate::fd::with_table(tid, |table| {
         let entry = table.get(n)?;
         Some((
             table.offset(n)?,
             table.status_flags(n)?,
-            entry.ops.ino(),
-            internal_file_path(&*entry.ops),
+            entry.ops.clone(),
+            table.description(n).and_then(|description| description.name()),
         ))
     })
     .flatten()?;
-    // Preferred: the real backing path recorded at open() time (the same
-    // fd→path table inotify/landlock use). This is what /proc/<pid>/fd/<n>
-    // readlinks to — musl's realpath() opens O_PATH then readlinks here.
-    // Report it chroot-relative so a chrooted process (e.g. udev in a
-    // distro chroot) can re-open the link target in its own namespace.
+    // `proc_fd_link` + `d_path`. A file on a kernel-internal mount reads its
+    // `d_dname` text. A file opened by path reads that path — the one its
+    // open file carries, so the same for every descriptor, thread and
+    // process that holds it, and following a rename — relative to the
+    // READER's root (`current->fs->root`; a path outside it stays absolute),
+    // with ` (deleted)` once the name is gone. musl's and Bun's realpath
+    // open `O_PATH` and read this. Anything else reads its class.
     //
-    // A memfd's link is what Linux readlink shows, `/memfd:<name> (deleted)`.
-    // It is display-only: the path helpers the exec and open paths consult
-    // (`fd_path_string_of`, `fd_path_for_task`) keep reporting no `/` path
-    // for it, so fexecve still runs the fd's own bytes rather than looking
-    // the text up as a file.
+    // The internal-mount and deleted texts are display-only: the path
+    // helpers the exec and open paths consult (`fd_path_string_of`,
+    // `fd_path_for_task`) report no `/` path for such a file, so fexecve
+    // still runs the fd's own bytes rather than looking the text up.
+    let path = match (internal_file_path(&*ops), &name) {
+        (Some(path), _) => path,
+        (None, Some(name)) => {
+            let shown = strip_chroot_prefix(current_task_id(), &name.path);
+            if name.deleted {
+                alloc::format!("{shown} (deleted)")
+            } else {
+                shown
+            }
+        }
+        (None, None) => pathless_fd_link(&*ops),
+    };
     Some(narf_filesystem::procfs::ProcFdSnapshot {
-        path: match internal {
-            Some(path) => path,
-            None => fd_path_string_of(pid, n)?,
-        },
+        path,
         info: narf_filesystem::procfs::ProcFdInfo {
             pos,
             flags,
-            mnt_id: crate::mqueue::fd_mount_id(tid, n).unwrap_or(0),
-            ino,
+            mnt_id: name.and_then(|name| name.mount_id).unwrap_or(0),
+            ino: ops.ino(),
         },
     })
 }
@@ -8652,11 +8671,36 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSna
 /// its first argument as a Linux PID for procfs. Treating a TaskId as a PID
 /// misroutes a lookup whenever it numerically collides with another process's
 /// PID (as systemd's forked mount helpers routinely do).
+///
+/// The answer is a path (it starts with `/`) only while that path leads to
+/// the file. A file whose name was removed is reached as an object, like one
+/// that never had a name: its old path leads nowhere, or to a different file
+/// made there since.
 pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::String> {
-    if let Some(p) = crate::mqueue::fd_path(task, n) {
-        return Some(strip_chroot_prefix(task, &p));
-    }
-    crate::fd::with_table(task, |t| Some(pathless_fd_link(&*t.get(n)?.ops))).flatten()
+    let (ops, name) = crate::fd::with_table(task, |t| {
+        Some((
+            t.get(n)?.ops.clone(),
+            t.description(n).and_then(|description| description.name()),
+        ))
+    })
+    .flatten()?;
+    Some(match name {
+        Some(name) if !name.deleted => strip_chroot_prefix(task, &name.path),
+        _ => pathless_fd_link(&*ops),
+    })
+}
+
+/// The name an open file would carry for `path`: the directory part with its
+/// symlinks resolved, as `open` records it. `rename`, `unlink` and `rmdir`
+/// report the names they changed in this form (`crate::fd::names`).
+pub(crate) fn open_file_name(path: &str) -> alloc::string::String {
+    let (dir, leaf) = match path.rsplit_once('/') {
+        Some(("", leaf)) => ("/", leaf),
+        Some((dir, leaf)) => (dir, leaf),
+        None => return alloc::string::String::from(path),
+    };
+    let dir = resolve_vfs_symlink_path(dir, true).unwrap_or_else(|| alloc::string::String::from(dir));
+    alloc::format!("{}/{leaf}", dir.trim_end_matches('/'))
 }
 
 /// Strip the task's chroot prefix from a host-absolute path, yielding the
@@ -14091,14 +14135,11 @@ fn install_recv_ancillary(
     let mut installed = 0;
     for passed in fds.into_iter().take(rights_to_install) {
         // `scm_detach_fds` → `receive_fd` installs the sender's `struct
-        // file` itself, `f_path` included, so `/proc/<pid>/fd/<n>` of the new
-        // descriptor names the file the sender opened. sshd's monitor passes
+        // file` itself. The open file description carries what the file
+        // names, so `/proc/<pid>/fd/<n>` of the new descriptor reads the
+        // sender's path with nothing to copy here — sshd's monitor passes
         // the pty it allocated to the session process this way, and
         // `ttyname` of the session's stdin reads that link.
-        let opened_path = passed
-            .description
-            .as_ref()
-            .and_then(|description| description.opened_path());
         if let Some(newfd) = fd::with_table_alloc(task, |t| {
             t.open_transferred(
                 passed.ops,
@@ -14109,15 +14150,6 @@ fn install_recv_ancillary(
         })
         .flatten()
         {
-            match opened_path {
-                Some(path) => {
-                    let mount_id = current_mount_id_at(&path);
-                    crate::mqueue::register_fd_path_owned(task, newfd, path, mount_id);
-                }
-                // A pathless file must not inherit the row a previous user
-                // of this descriptor number left behind (`fd::install`).
-                None => crate::mqueue::forget_fd_path(task, newfd),
-            }
             let offset = rights_start + 16 + installed * 4;
             ctrl[offset..offset + 4].copy_from_slice(&newfd.to_le_bytes());
             installed += 1;
@@ -14149,7 +14181,6 @@ fn install_recv_ancillary(
             let offset = rights_start + 16 + i * 4;
             let newfd = u32::from_le_bytes(ctrl[offset..offset + 4].try_into().unwrap());
             let _ = fd::with_table(task, |table| table.close(newfd));
-            crate::mqueue::forget_fd_path(task, newfd);
         }
         used = 0;
         truncated = true;
