@@ -317,6 +317,10 @@ pub struct JoinOptions {
     pub akms: AkmSet,
     /// WPA2-PSK management-frame protection policy (default disabled).
     pub pmf: Pmf,
+    /// The cipher suites the supplicant selected (`sm->pairwise_cipher`,
+    /// `group_cipher`, `mgmt_group_cipher`); `None` is CCMP-128 with
+    /// BIP-CMAC-128 ([`rsn::Ciphers::LEGACY`]). The AP must offer them.
+    pub ciphers: Option<rsn::Ciphers>,
 }
 impl JoinOptions {
     pub fn with_epd(mut self, epd: bool) -> Self {
@@ -331,6 +335,10 @@ impl JoinOptions {
         self.pmf = pmf;
         self
     }
+    pub fn with_ciphers(mut self, ciphers: rsn::Ciphers) -> Self {
+        self.ciphers = Some(ciphers);
+        self
+    }
 }
 
 /// The negotiated WPA2-Personal profile: AKM 2 or 6 and the RSN
@@ -341,15 +349,24 @@ struct Wpa2Profile {
     mfp: u16,
     /// Both RSNEs set MFPC: PMF is in force.
     pmf: bool,
+    ciphers: rsn::Ciphers,
 }
 impl Wpa2Profile {
     const LEGACY: Self = Self {
         akm: rsn::AKM_PSK,
         mfp: 0,
         pmf: false,
+        ciphers: rsn::Ciphers::LEGACY,
     };
     fn rsne(self, spp_amsdu: bool) -> RsnIe {
         let mut rsne = RsnIe::wpa2_psk_ccmp();
+        rsne.group_cipher = Suite::standard(self.ciphers.group);
+        rsne.pairwise_ciphers = vec![Suite::standard(self.ciphers.pairwise)];
+        // wpa_gen_wpa_ie_rsn names a non-default management cipher (and
+        // omits BIP-CMAC-128) under MFPC.
+        if self.mfp != 0 && self.ciphers.group_mgmt != rsn::CIPHER_BIP_CMAC_128 {
+            rsne.group_management_cipher = Some(Suite::standard(self.ciphers.group_mgmt));
+        }
         rsne.akms = vec![Suite::standard(self.akm)];
         rsne.rsn_capabilities = self.mfp
             | if spp_amsdu {
@@ -361,23 +378,24 @@ impl Wpa2Profile {
     }
     /// wpa_supplicant `wpa_supplicant_set_suites` for WPA-PSK /
     /// WPA-PSK-SHA256 with `ieee80211w` = `pmf`.
-    fn negotiate(ap: &RsnIe, akms: AkmSet, pmf: Pmf) -> Result<Self, Error> {
-        let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
+    fn negotiate(
+        ap: &RsnIe,
+        akms: AkmSet,
+        pmf: Pmf,
+        ciphers: Option<rsn::Ciphers>,
+    ) -> Result<Self, Error> {
+        let ciphers = ciphers.unwrap_or(rsn::Ciphers::LEGACY);
         let ap_mfpc = ap.rsn_capabilities & rsn::RSN_CAP_MFP_CAPABLE != 0;
         let ap_mfpr = ap.rsn_capabilities & rsn::RSN_CAP_MFP_REQUIRED != 0;
-        if ap.group_cipher != ccmp
-            || !ap.pairwise_ciphers.contains(&ccmp)
+        if !ciphers.valid()
+            || !ciphers.offered_by(ap, false)
             || ap.rsn_capabilities & rsn::RSN_CAP_NO_PAIRWISE != 0
             // "MFP required by AP but disabled locally".
             || (ap_mfpr && pmf == Pmf::Disabled)
             // "PMF required but AP not MFP capable".
             || (pmf == Pmf::Required && !ap_mfpc)
-            // Only the default BIP-CMAC-128 is implemented (Security IGTK).
-            || (pmf != Pmf::Disabled
-                && ap_mfpc
-                && ap
-                    .group_management_cipher
-                    .is_some_and(|c| c != Suite::standard(rsn::CIPHER_BIP_CMAC_128)))
+            // The AP's management cipher must be the selected one.
+            || (pmf != Pmf::Disabled && ap_mfpc && !ciphers.offered_by(ap, true))
         {
             return Err(Error::UnsupportedSecurity);
         }
@@ -395,6 +413,7 @@ impl Wpa2Profile {
             akm,
             mfp,
             pmf: mfp != 0 && ap_mfpc,
+            ciphers,
         })
     }
 }
@@ -667,41 +686,33 @@ pub enum SmeRsna {
 }
 
 /// The RSN element wpa_supplicant puts in a WPA2-Personal request
-/// (`wpa_gen_wpa_ie_rsn`): CCMP-128 group and pairwise, the one selected
-/// AKM, exactly the MFPC/MFPR bits the owner negotiates, no PMKID, and —
-/// under PMF only — the default BIP-CMAC-128 group management cipher,
-/// spelled out or omitted. Replay-counter bits are already cleared.
+/// (`wpa_gen_wpa_ie_rsn`): one group and one pairwise data cipher
+/// (CCMP-128/256, GCMP-128/256), the one selected AKM, exactly the
+/// MFPC/MFPR bits the owner negotiates, no PMKID, and — under PMF only — a
+/// BIP group management cipher, spelled out or omitted (BIP-CMAC-128).
+/// Replay-counter bits are already cleared.
 fn sme_wpa2_rsne(rsn: &RsnIe, akm: u8, mfp: u16) -> bool {
-    let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
     matches!(akm, rsn::AKM_PSK | rsn::AKM_PSK_SHA256)
         && rsn.version == 1
-        && rsn.group_cipher == ccmp
-        && rsn.pairwise_ciphers == [ccmp]
+        && rsn::Ciphers::of_station(rsn).is_some()
         && rsn.akms == [Suite::standard(akm)]
         && rsn.rsn_capabilities == mfp
         && rsn.pmkids.is_empty()
-        && rsn
-            .group_management_cipher
-            .is_none_or(|cipher| mfp != 0 && cipher == Suite::standard(rsn::CIPHER_BIP_CMAC_128))
+        && (mfp != 0 || rsn.group_management_cipher.is_none())
 }
 
 /// The RSN element wpa_supplicant puts in an SAE request with
-/// `ieee80211w=2` (`wpa_gen_wpa_ie_rsn`): CCMP-128 group and pairwise, one
-/// SAE AKM (8, or 24 for SAE-EXT-KEY), MFPC|MFPR, no PMKID, and the
-/// BIP-CMAC-128 group management cipher either spelled out or left to its
-/// default. Replay-counter bits are already cleared by the caller.
+/// `ieee80211w=2` (`wpa_gen_wpa_ie_rsn`): one group and one pairwise data
+/// cipher, one SAE AKM (8, or 24 for SAE-EXT-KEY), MFPC|MFPR, no PMKID,
+/// and a BIP group management cipher spelled out or left to its default.
+/// Replay-counter bits are already cleared by the caller.
 fn sme_sae_rsne(rsn: &RsnIe) -> bool {
-    let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
     rsn.version == 1
-        && rsn.group_cipher == ccmp
-        && rsn.pairwise_ciphers == [ccmp]
+        && rsn::Ciphers::of_station(rsn).is_some()
         && (rsn.akms == [Suite::standard(rsn::AKM_SAE)]
             || rsn.akms == [Suite::standard(rsn::AKM_SAE_EXT_KEY)])
         && rsn.rsn_capabilities == rsn::RSN_CAP_MFP_CAPABLE | rsn::RSN_CAP_MFP_REQUIRED
         && rsn.pmkids.is_empty()
-        && rsn
-            .group_management_cipher
-            .is_none_or(|cipher| cipher == Suite::standard(rsn::CIPHER_BIP_CMAC_128))
 }
 
 pub fn validate_sme_ies(bytes: &[u8], protected: bool) -> Result<(), Error> {
@@ -1408,7 +1419,7 @@ impl JoinPlan {
                 if bss.capability & 0x10 == 0 {
                     return Err(Error::UnsupportedSecurity);
                 }
-                wpa2 = Wpa2Profile::negotiate(&rsn, options.akms, options.pmf)?;
+                wpa2 = Wpa2Profile::negotiate(&rsn, options.akms, options.pmf, options.ciphers)?;
                 Some(wpa2.rsne(false).encode_body())
             }
             SecurityMode::Wpa3Sae { pwe } => {
@@ -1420,6 +1431,7 @@ impl JoinPlan {
                     rsnxe.as_deref(),
                     rate_elements.selectors & SEL_SAE_H2E != 0,
                     options.akms,
+                    options.ciphers,
                 )?;
                 if six_ghz_band && !join.h2e() {
                     // SAE on 6 GHz uses hash-to-element only.
@@ -1865,6 +1877,14 @@ impl JoinPlan {
     /// 1,2,5.5,11,6,9,12,18,24,36,48,54Mbps. Hardware indices stay driver-owned.
     pub fn legacy_rates(&self) -> (u16, u16) {
         (self.rates, self.basic)
+    }
+    /// The negotiated cipher suites (CCMP-128/BIP-CMAC-128 for an open or
+    /// legacy plan).
+    pub fn ciphers(&self) -> rsn::Ciphers {
+        match &self.sae {
+            Some(sae) => sae.ciphers(),
+            None => self.wpa2.ciphers,
+        }
     }
     pub fn rsn_body(&self) -> Option<Vec<u8>> {
         if let Some(sae) = self.sae.as_ref() {

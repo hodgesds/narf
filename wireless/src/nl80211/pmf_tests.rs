@@ -326,3 +326,73 @@ kernel_test_in!(
     "wireless/nl80211",
     smoke_nl80211_optional_mfp_wiphy_bit_and_parser_use_complete_offload_contract
 );
+
+/// GCMP-256 with BIP-GMAC-256 (and CCMP-256 / BIP-CMAC-256) offload: the
+/// suites must be the wiphy's, and the RSNE must name the attribute ciphers.
+fn wide_ciphers() -> Result<(), &'static str> {
+    let caps = ConnectCaps {
+        psk_offload: true,
+        psk_mfp_offload: true,
+        cipher_suites: &[
+            crate::CIPHER_SUITE_CCMP,
+            crate::CIPHER_SUITE_CCMP_256,
+            crate::CIPHER_SUITE_GCMP_256,
+            crate::CIPHER_SUITE_AES_CMAC,
+            crate::CIPHER_SUITE_BIP_CMAC_256,
+            crate::CIPHER_SUITE_BIP_GMAC_256,
+        ],
+        ..ConnectCaps::default()
+    };
+    let parse =
+        |bytes: &[u8], caps| parse_operation_caps(CONNECT, &attributes(bytes).unwrap(), caps, 0);
+    let request = |data: u8, mgmt: u8, attr: u32| {
+        let mut ie = REQUIRED;
+        ie[7] = data;
+        ie[13] = data;
+        ie[27] = mgmt;
+        let mut bytes = connect(Some(&ie), Some(1));
+        // Replace the CCMP attribute values with `attr`.
+        let ccmp = 0x000fac04u32.to_ne_bytes();
+        let mut at = 0;
+        while let Some(found) = bytes[at..].windows(4).position(|w| w == ccmp) {
+            let found = at + found;
+            bytes[found..found + 4].copy_from_slice(&attr.to_ne_bytes());
+            at = found + 4;
+        }
+        (bytes, ie)
+    };
+    for (data, mgmt) in [(9, 0x0c), (0x0a, 0x0d)] {
+        let (bytes, ie) = request(data, mgmt, 0x000fac00 | u32::from(data));
+        if !matches!(
+            parse(&bytes, caps),
+            Ok(Operation::Connect { ie: ref actual, .. }) if *actual == ie
+        ) {
+            return Err("a GCMP-256/CCMP-256 offload CONNECT was refused");
+        }
+        let narrow = ConnectCaps {
+            cipher_suites: &[crate::CIPHER_SUITE_CCMP, crate::CIPHER_SUITE_AES_CMAC],
+            ..caps
+        };
+        if parse(&bytes, narrow).is_ok() {
+            return Err("a cipher the wiphy does not list was accepted");
+        }
+    }
+    // Attributes naming CCMP-256 while the RSNE names GCMP-256.
+    let (bytes, _) = request(9, 0x0c, 0x000fac0a);
+    if parse(&bytes, caps).is_ok() {
+        return Err("the RSNE and the cipher attributes disagree");
+    }
+    // A management cipher the wiphy lacks.
+    let (bytes, _) = request(9, 0x0b, 0x000fac09);
+    if parse(&bytes, caps).is_ok() {
+        return Err("BIP-GMAC-128 accepted without its advertisement");
+    }
+    Ok(())
+}
+fn smoke_nl80211_offload_gcmp_and_ccmp256_suites() -> TestResult {
+    wide_ciphers().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_offload_gcmp_and_ccmp256_suites
+);

@@ -703,7 +703,7 @@ fn crypto_suites(attrs: &[(u16, &[u8])], suites: &[u32], cipher_limit: usize) ->
 /// its own RSN element (CCMP, PSK, explicitly optional/required PMF), so the requested
 /// RSN element must describe that admitted suite. Required PMF needs an
 /// explicit complete RSNE; it is never inferred from a cipher advertisement.
-fn psk_association_ies(ie: &[u8], mfp: u32, akm: u8) -> Result<(), i32> {
+fn psk_association_ies(ie: &[u8], mfp: u32, akm: u8, suites: &[u32]) -> Result<(), i32> {
     if ie.len() > 2048 {
         return Err(EINVAL);
     }
@@ -721,9 +721,8 @@ fn psk_association_ies(ie: &[u8], mfp: u32, akm: u8) -> Result<(), i32> {
     // (0x000c) toward every WMM AP (`rsn_supp_capab`).
     rsn.rsn_capabilities &= !(crate::rsn::RSN_CAP_PTKSA_REPLAY_COUNTER_MASK
         | crate::rsn::RSN_CAP_GTKSA_REPLAY_COUNTER_MASK);
-    let ccmp = crate::rsn::Suite::standard(crate::rsn::CIPHER_CCMP_128);
-    if rsn.group_cipher != ccmp
-        || rsn.pairwise_ciphers != [ccmp]
+    // One pairwise and one group data cipher, each among the wiphy's.
+    if !station_ciphers(&rsn, suites)
         || rsn.akms != [crate::rsn::Suite::standard(akm)]
         || mfp == 0
             && rsn.rsn_capabilities
@@ -747,11 +746,45 @@ fn psk_association_ies(ie: &[u8], mfp: u32, akm: u8) -> Result<(), i32> {
             || !rsn.pmkids.is_empty()
             || rsn.group_management_cipher.is_some_and(|cipher| {
                 cipher != crate::rsn::Suite::standard(crate::rsn::CIPHER_BIP_CMAC_128)
+                    && !suites.contains(&suite_value(cipher))
             }))
     {
         return Err(EOPNOTSUPP);
     }
     Ok(())
+}
+
+/// A suite selector as its nl80211 `u32` (`WLAN_CIPHER_SUITE_*`).
+fn suite_value(suite: crate::rsn::Suite) -> u32 {
+    u32::from_be_bytes([suite.oui[0], suite.oui[1], suite.oui[2], suite.suite_type])
+}
+
+/// A station RSNE's single pairwise cipher, group cipher and (default or
+/// named) group management cipher are valid RSNA suites the wiphy lists.
+fn station_ciphers(rsn: &crate::rsn::RsnIe, suites: &[u32]) -> bool {
+    crate::rsn::Ciphers::of_station(rsn).is_some_and(|ciphers| {
+        [ciphers.pairwise, ciphers.group]
+            .into_iter()
+            .all(|cipher| suites.contains(&(0x000f_ac00 | u32::from(cipher))))
+    })
+}
+
+/// The supplicant's RSNE in the CONNECT elements, if any, names the same
+/// pairwise and group ciphers as NL80211_ATTR_CIPHER_SUITES_PAIRWISE /
+/// CIPHER_SUITE_GROUP (the offloading owner follows the RSNE).
+fn rsne_names(ie: Option<&[u8]>, pairwise: Option<u32>, group: Option<u32>) -> bool {
+    let Some(Ok(ies)) = ie.map(elements) else {
+        return true;
+    };
+    ies.iter().filter(|(id, _)| *id == 48).all(|(_, body)| {
+        crate::rsn::RsnIe::decode_body(body)
+            .as_ref()
+            .and_then(crate::rsn::Ciphers::of_station)
+            .is_some_and(|ciphers| {
+                pairwise == Some(0x000f_ac00 | u32::from(ciphers.pairwise))
+                    && group == Some(0x000f_ac00 | u32::from(ciphers.group))
+            })
+    })
 }
 
 /// Split an information-element list (`validate_ie_attr`: well-formed
@@ -1050,7 +1083,13 @@ fn parse_operation_caps(
             let suites: &[u32] = if caps.external {
                 caps.cipher_suites
             } else if psk_offload || sae_offload {
-                &[crate::CIPHER_SUITE_CCMP]
+                // An offloading wiphy without a list runs CCMP-128 (the
+                // `cipher_suites` default).
+                if caps.cipher_suites.is_empty() {
+                    &[crate::CIPHER_SUITE_CCMP]
+                } else {
+                    caps.cipher_suites
+                }
             } else {
                 &[]
             };
@@ -1066,10 +1105,18 @@ fn parse_operation_caps(
             if attr(attrs, 277).is_some() && !sae_offload {
                 return Err(EINVAL);
             }
-            // CCMP (00-0F-AC:4) pairwise+group are required for every offload
-            // suite this profile accepts.
-            let ccmp = u32_attr(attrs, 73)? == Some(0x000fac04)
-                && u32_attr(attrs, 74)? == Some(0x000fac04);
+            // The offloading owner runs one pairwise and one group data
+            // cipher (CCMP-128/256, GCMP-128/256) that the wiphy lists;
+            // `crypto_suites` above checked membership.
+            let data = |value: Option<u32>| {
+                value.is_some_and(|suite| {
+                    suite >> 8 == 0x000fac && crate::rsn::data_cipher_key_len(suite as u8).is_some()
+                })
+            };
+            let ccmp = attr(attrs, 73).is_some_and(|raw| raw.len() == 4)
+                && data(u32_attr(attrs, 73)?)
+                && data(u32_attr(attrs, 74)?)
+                && rsne_names(attr(attrs, 42), u32_attr(attrs, 73)?, u32_attr(attrs, 74)?);
             let cred = if let Some(password) = attr(attrs, 277) {
                 // WPA3-SAE offload: SAE auth, AKM SAE (00-0F-AC:8), CCMP, and
                 // mandatory management-frame protection. wpa_supplicant's
@@ -1110,7 +1157,7 @@ fn parse_operation_caps(
                 {
                     return Err(EOPNOTSUPP);
                 }
-                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp, akm)?;
+                psk_association_ies(attr(attrs, 42).unwrap_or(&[]), mfp, akm, suites)?;
                 Credential::Psk(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
             } else if caps.external
                 && (attr(attrs, 70).is_some()
