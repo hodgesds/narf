@@ -3360,13 +3360,19 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             self.retire(root, root_level)?;
             root = child;
             root_level -= 1;
-            // A committed block promoted to root of a subvolume tree is COWed
-            // first, as Linux `balance_level` does: a root block is never
-            // shared, and this one may be (or may name its children through
-            // parent refs).
-            if self.state.shared.is_some() && !self.state.pending.contains_key(&root) {
+            // A committed block promoted to root is COWed first, in every tree,
+            // as Linux `balance_level` does (`btrfs_cow_block` on the child
+            // before it becomes the root): the root item is stamped with this
+            // transaction's generation, and a root node of an older one fails
+            // Linux's `verify_parent_transid` against it — "parent transid
+            // verify failed" on the csum tree after large deletes collapsed it
+            // a level. In a shared subvolume tree the copy also takes over the
+            // block's references (a root block is never shared).
+            if !self.state.pending.contains_key(&root) {
                 let cbuf = self.read(root).await?;
-                self.update_ref_for_cow(root, &cbuf, false).await?;
+                if self.state.shared.is_some() {
+                    self.update_ref_for_cow(root, &cbuf, false).await?;
+                }
                 let copy = self.store(alloc, (*cbuf).clone(), root_level)?;
                 if self.frees_committed(root)? {
                     self.state.freed.push((root, root_level));

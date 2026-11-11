@@ -154,6 +154,13 @@ accepted changes durable, leaving any unreaped orphan record for recovery.
 
 ## 4. Invariants
 
+A tree's root block always carries the generation its ROOT_ITEM records:
+when deletions leave a root with one child, a child the transaction has not
+already COWed is COWed before it becomes the root, in every tree, as Linux
+`balance_level` does. Promoting it as it was left a root block of an older
+generation under a root item of the new one, which Linux refuses to read
+("parent transid verify failed"; `smoke_btrfs_collapsed_root_is_cowed`).
+
 No buffer of the write, truncate, punch or read paths follows the length of
 a call: a write is laid down one new extent (`MAX_WRITE_EXTENT`, 128 KiB) at a
 time in one reused buffer, and a read of an uncompressed extent goes in
