@@ -358,6 +358,107 @@ pub fn double_frees_refused() -> u64 {
     DOUBLE_FREES_REFUSED.load(Ordering::Relaxed)
 }
 
+/// Fixed-size text sink: the failure report below runs when memory is
+/// exhausted, so it must not allocate.
+struct ReportBuf {
+    bytes: [u8; 1536],
+    len: usize,
+}
+
+impl fmt::Write for ReportBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let room = self.bytes.len() - self.len;
+        let take = s.len().min(room);
+        self.bytes[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+/// Write the allocator's free state for every online node: free and cached
+/// page totals, free blocks per order and migratetype as the zone lists hold
+/// them, and refused double frees. Takes each zone lock with `try_lock` only,
+/// so it is safe from any context, including one that already holds a zone
+/// lock (that zone is then reported as busy). Allocates nothing.
+pub fn write_free_state(out: &mut impl fmt::Write) -> fmt::Result {
+    write!(
+        out,
+        "frame: free state, double frees refused {}",
+        double_frees_refused()
+    )?;
+    let mut nodes = online_node_mask() | 1;
+    while nodes != 0 {
+        let node = nodes.trailing_zeros() as usize;
+        nodes &= nodes - 1;
+        if node >= MAX_NUMA_NODES {
+            break;
+        }
+        write!(
+            out,
+            "\nframe: node {node}: total {} free {} cached {} pairs {}",
+            ALLOC.node_total_frames[node].load(Ordering::Relaxed),
+            ALLOC.node_free_frames[node].load(Ordering::Relaxed),
+            FRAME_CACHE_FREE[node].load(Ordering::Relaxed),
+            PAIR_CACHE_FREE[node].load(Ordering::Relaxed),
+        )?;
+        let Some(zone) = ZONES[node].0.try_lock() else {
+            write!(out, "; zone busy")?;
+            continue;
+        };
+        write!(out, "; listed {}", zone.free_frame_count())?;
+        for mt in 0..buddy::NUM_MIGRATE_TYPES {
+            let kind = buddy::MigrateType::from_index(mt);
+            write!(out, "\nframe: node {node} {kind:?} blocks/order:")?;
+            for order in 0..=MAX_ORDER {
+                write!(out, " {}", zone.free_block_count_mt(order, kind))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Report a failed heap allocation on the console, once per `REPORT_LIMIT`
+/// failures since boot, with the allocator's free state, so the next
+/// "memory allocation failed" panic says where the memory was.
+pub(crate) fn report_allocation_failure(size: usize, align: usize) {
+    const REPORT_LIMIT: u64 = 4;
+    static REPORTS: AtomicU64 = AtomicU64::new(0);
+    if REPORTS.fetch_add(1, Ordering::Relaxed) >= REPORT_LIMIT {
+        return;
+    }
+    let mut buf = ReportBuf {
+        bytes: [0; 1536],
+        len: 0,
+    };
+    let _ = fmt::Write::write_fmt(
+        &mut buf,
+        format_args!("frame: heap allocation of {size} bytes (align {align}) failed\n"),
+    );
+    let _ = write_free_state(&mut buf);
+    let _ = fmt::Write::write_str(&mut buf, "\n");
+    console_write(&buf.bytes[..buf.len]);
+}
+
+#[cfg(target_os = "none")]
+fn console_write(bytes: &[u8]) {
+    extern "C" {
+        /// The kernel's console write export (`modules/src/kabi.rs`), linked
+        /// into every kernel image.
+        fn narf_printk(ptr: *const u8, len: usize) -> i32;
+    }
+    if bytes.is_empty() {
+        return;
+    }
+    // SAFETY: `bytes` is a live slice for the duration of the call, and
+    // `narf_printk` only reads `len` bytes from `ptr`. The text is UTF-8
+    // except possibly a final code point cut by the buffer bound, which
+    // `narf_printk` rejects as a whole rather than misreading.
+    let _ = unsafe { narf_printk(bytes.as_ptr(), bytes.len()) };
+}
+
+#[cfg(not(target_os = "none"))]
+fn console_write(_bytes: &[u8]) {}
+
 #[cold]
 fn note_double_free() {
     DOUBLE_FREES_REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -6129,6 +6230,67 @@ mod scale_tests {
         TestResult::Skip(Box::leak(report.into_boxed_str()))
     }
     kernel_test_in!("memory/frame/scale", scale_counter_report);
+
+    /// The allocator's free state as a test failure reason.
+    fn fail_with_state(what: &str) -> TestResult {
+        let mut state = String::new();
+        let _ = write_free_state(&mut state);
+        fail(format!("{what}; {state}"))
+    }
+
+    /// Unmovable order-2, -4 and -8 blocks must be available whenever free
+    /// memory is ample, both straight away and after order-0 churn has gone
+    /// through the per-CPU caches and back in shuffled order. A soak of the
+    /// cache rework failed a 16 KiB (order-2) heap allocation with 15 GiB
+    /// free, 17 s after boot.
+    fn scale_high_orders_survive_order0_churn() -> TestResult {
+        const ORDERS: [u8; 3] = [2, 4, 8];
+        let node = match scale_node() {
+            Ok(node) => node,
+            Err(skip) => return skip,
+        };
+        let try_orders = |label: &str| -> Option<TestResult> {
+            for round in 0..64 {
+                for order in ORDERS {
+                    // Leave a quarter of the node alone, as everywhere here.
+                    if node_free(node) / 4 < (1 << order) * 64 {
+                        return Some(TestResult::Skip("not enough free memory on this node"));
+                    }
+                    match alloc_pages_on(node, order) {
+                        Ok(block) => free_pages(block, order),
+                        Err(_) => {
+                            return Some(fail_with_state(&format!(
+                                "{label}: order-{order} unmovable allocation failed in round \
+                                 {round} with {} frames free",
+                                node_free(node)
+                            )))
+                        }
+                    }
+                }
+            }
+            None
+        };
+        if let Some(result) = try_orders("before churn") {
+            return result;
+        }
+        let count = (node_free(node) / 8).min(1 << 18);
+        let Some(mut frames) = take_frames(node, count) else {
+            return TestResult::Skip("not enough free order-0 frames on this node");
+        };
+        shuffle(&mut frames);
+        // Half back one at a time (through this CPU's cache), half batched.
+        let half = frames.len() / 2;
+        for phys in &frames[..half] {
+            free_pages(PhysFrame::new(*phys), 0);
+        }
+        release(&frames[half..]);
+        drop(frames);
+        if let Some(result) = try_orders("after churn") {
+            return result;
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/frame/scale", scale_high_orders_survive_order0_churn);
 }
 
 #[derive(Copy, Clone, Debug)]
