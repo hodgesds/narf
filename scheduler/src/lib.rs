@@ -104,6 +104,7 @@ mod pmu;
 #[cfg(feature = "instruction-quantum")]
 mod instructions;
 
+mod strand_tests;
 mod tests;
 
 pub use accounting::{
