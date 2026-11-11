@@ -61,6 +61,23 @@ impl<B: Memory> Pool<B> {
                 .collect(),
         ))
     }
+    /// The per-MSDU fragment list of a non-continuous MSDU (address and
+    /// its 8 bytes: payload address, length), as the device reads it
+    /// through `frags_paddr` (tests / device models).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub fn fragment_list(&self, id: u16) -> Option<(u64, [u8; 8])> {
+        let list = self
+            .slots
+            .get(usize::from(id))?
+            .as_ref()?
+            ._fragments
+            .as_ref()?;
+        let mut bytes = [0u8; 8];
+        for (at, byte) in bytes.iter_mut().enumerate() {
+            *byte = list.read(at);
+        }
+        Some((list.dma_address(), bytes))
+    }
     pub fn prepare(
         &mut self,
         config: Config,
