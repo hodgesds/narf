@@ -293,6 +293,37 @@ when their reservation does not fit (Linux
 `btrfs_start_transaction_fallback_global_rsv`, `evict_refill_and_join`), so a
 full filesystem can still be emptied; the batch then commits at once.
 
+Freeing a file's data is reserved for in steps, never for the file as a
+whole (`write::DEALLOC_STEP_EXTENTS`, 16 extent items). A truncate that
+drops more than a step's worth drops them from the end of the file, each
+step a truncate of its own to an intermediate size, and the eviction of an
+unlinked inode removes its extents a step at a time, the inode and its
+`ORPHAN_ITEM` staying (with `nbytes` following) until the last (Linux
+`btrfs_truncate` and `btrfs_evict_inode` around `btrfs_truncate_inode_items`,
+which returns `-EAGAIN` for its caller to restart the transaction;
+`evict_refill_and_join`). Each step is one staged operation, so what is
+reserved at a time is a step's first-order need whatever the size of the
+file, and the batch commits between steps when its reservation runs out
+(`smoke_btrfs_release_reserves_in_steps`, and the `release` scenario of
+`cargo xtask btrfs-host-rw`). Dropping all of a file's extents in one
+operation priced every one of them at its worst case at once — some thirty
+tree blocks an extent, 2.3 GiB for a 256 MiB file — which was refused on any
+filesystem, and the chunk allocation that follows a refusal converted
+unallocated space into METADATA chunks (four per attempt) before the
+operation failed with `ENOSPC`. Each step of a truncate writes the inode's
+size down to the start of the lowest item it dropped (Linux
+`btrfs_inode_safe_disk_i_size_write(inode, control.last_size)` before each
+restart), so a crash between two steps leaves the file at that size, above
+the one asked for and with its old contents up to there, and nothing past
+its end; Linux leaves the same, and has added no orphan item for a truncate
+since v4.18. A truncate that drops no more than one step's worth of items
+is a single operation in a single transaction: the file is at its old size
+or its new one. A crash between two steps of an eviction leaves an orphan
+that the next writable mount goes on reclaiming. `write::set_dealloc_step_sync`
+commits every step on its own, for the crash tests of the `release`
+scenario. Hole punching and `fallocate` still stage their whole range as
+one operation.
+
 `fsync` and `fdatasync`, on a file or a directory, both commit the open
 transaction and write its superblock (`sync_to_disk_exclusive`). `fdatasync`
 is not weaker: the size and extent items a write's data is read back through
@@ -380,7 +411,15 @@ scenario builds files of 1,000 to 16,000 single-page extents (one written
 in a shuffled page order), overwrites pages at random and in file order,
 and fails if the fs-tree nodes visited, the nodes read from the device or
 (loosely) the time per overwrite grow with the file's extent count; it also
-reports sequential-write throughput in 128 KiB and 4 KiB calls.
+reports sequential-write throughput in 128 KiB and 4 KiB calls. The `release`
+scenario truncates and unlinks files of 1, 1,000 and 100,000 extents on a
+6 GiB filesystem, and the 256 MiB truncate and 1 GiB unlink that found the
+defect: each must succeed without a METADATA chunk being allocated, and no
+step may reserve more than a step's worth. It then commits every step of a
+truncate (to nothing, to an extent boundary, into an extent) and of an
+unlink on its own and replays the write stream with a crash at every flush:
+each image must pass `btrfs check` and remount with the file at one of the
+step sizes.
 
 `cargo xtask btrfs-cycles [--cycles 50] [--seed N] [--jobs N]` runs the
 in-kernel driver through many mount lifetimes in one boot per guest

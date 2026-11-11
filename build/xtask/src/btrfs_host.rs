@@ -30,7 +30,7 @@ pub struct Args {
     #[arg(long)]
     pub exhaustive: bool,
     /// Comma-separated scenarios
-    /// (regress,root,snapshots,lba4k,gate,fst,enospc,scale,overwrite).
+    /// (regress,root,snapshots,lba4k,gate,fst,enospc,scale,overwrite,release).
     #[arg(long)]
     pub scenario: Option<String>,
     /// Concurrent `btrfs check` processes in the crash pass.

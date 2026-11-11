@@ -515,23 +515,83 @@ fn hole_edits(items: &[FileItem], a: u64, b: u64, ino: u64, gen: u64) -> Vec<Edi
 
 /// Resize `ino` to exactly `new_size` (`btrfs_setattr` → `btrfs_truncate` for
 /// a shrink, `btrfs_cont_expand` for a grow).
+///
+/// A truncate that drops many extents does it from the end of the file in
+/// steps of [`super::DEALLOC_STEP_EXTENTS`], each a truncate of its own to
+/// an intermediate size (Linux `btrfs_truncate`: `btrfs_truncate_inode_items`
+/// until it returns `-EAGAIN`, then a new transaction), so what is reserved
+/// at a time does not grow with the file. Every intermediate state is a
+/// shorter file with nothing past its end; when the reservation runs out
+/// between two steps the batch commits there, so a crash during a large
+/// truncate can leave the file at one of those sizes — above the size asked
+/// for, with its old contents up to that point — where Linux, which records
+/// the new size first and finishes from an orphan item at the next mount,
+/// leaves it at the new size.
 pub async fn truncate_file<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
     new_size: u64,
 ) -> Result<(), FsError> {
-    let r = {
-        let _hold = vol.hold_commits();
-        with_space_retry(vol, || truncate_once(vol, ino, new_size)).await
-    };
-    flush_if_full(vol).await?;
-    r
+    let ss = u64::from(vol.sectorsize());
+    for (size, drop_from) in truncate_steps(vol, ino, new_size)
+        .await?
+        .into_iter()
+        .chain([(new_size, align_up(new_size, ss))])
+    {
+        let r = {
+            let _hold = vol.hold_commits();
+            with_space_retry(vol, || truncate_once(vol, ino, size, drop_from)).await
+        };
+        flush_if_full(vol).await?;
+        r?;
+        super::dealloc_step_done(vol).await?;
+    }
+    Ok(())
 }
 
+/// The steps a shrinking (or same-size) truncate to `new_size` takes before
+/// its last: `(size, drop_from)` pairs, highest first, each dropping the
+/// extent items from `drop_from` on — at most
+/// [`super::DEALLOC_STEP_EXTENTS`] of them — and leaving the file `size`
+/// long (its own size where the items dropped are preallocation past EOF).
+async fn truncate_steps<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    new_size: u64,
+) -> Result<Vec<(u64, u64)>, FsError> {
+    let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
+    if !inode.is_regular() || new_size > inode.size {
+        return Ok(Vec::new());
+    }
+    let cut = align_up(new_size, u64::from(vol.sectorsize()));
+    let (fs_root, _) = vol.fs_tree_root();
+    let first = BtrfsKey::new(ino, format::EXTENT_DATA_KEY, cut);
+    let mut cursor = btree::Cursor::seek(vol, fs_root, &first).await?;
+    let mut starts: Vec<u64> = Vec::new();
+    while let Some((key, _)) = cursor.current()? {
+        if key.objectid != ino || key.item_type != format::EXTENT_DATA_KEY {
+            break;
+        }
+        starts.push(key.offset);
+        cursor.advance().await?;
+    }
+    let mut steps = Vec::new();
+    let mut left = starts.len();
+    while left > super::DEALLOC_STEP_EXTENTS {
+        left -= super::DEALLOC_STEP_EXTENTS;
+        steps.push((starts[left].min(inode.size).max(new_size), starts[left]));
+    }
+    Ok(steps)
+}
+
+/// Truncate to `new_size`, dropping the extent items from `drop_from` on
+/// (`align_up(new_size)` for a plain truncate; higher for a step of a large
+/// one that only drops preallocation past EOF).
 async fn truncate_once<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
     new_size: u64,
+    drop_from: u64,
 ) -> Result<(), FsError> {
     ensure_private_subvol(vol).await?;
     let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
@@ -550,10 +610,13 @@ async fn truncate_once<B: BlockDevice + 'static>(
             let sector_end = align_up(new_size, ss).min(old_size);
             zero_if_dirty(vol, ino, new_size, sector_end, old_size).await?;
         }
+        // Only the items from the cut on are read (and, below a sector, the
+        // one at offset 0, which may be inline).
         let (fs_root, _) = vol.fs_tree_root();
-        let items = file_items(vol, fs_root, ino).await?;
+        let cut = drop_from.max(align_up(new_size, ss));
+        let from = if new_size < ss { 0 } else { cut };
+        let items = file_items_in(vol, fs_root, ino, from, u64::MAX).await?;
         let gen = batch_gen(vol).await?;
-        let cut = align_up(new_size, ss);
         let mut extra = Vec::new();
         let mut inline_removed = 0u64;
         // An inline item past the new size shrinks in place, as

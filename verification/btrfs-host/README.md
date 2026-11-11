@@ -19,12 +19,17 @@ mostly-full DATA block groups, free space in hundreds of thousands of
 single-sector pieces, three-level free-space and extent trees;
 then a desktop-like workload in small transactions, with what each commit
 cost — nodes visited and written per tree, recording passes, blocks beyond
-the reservation, wall time — reported) and `overwrite` (files of 1,000 to
+the reservation, wall time — reported), `overwrite` (files of 1,000 to
 16,000 single-page extents, one written in a shuffled page order as a mapped
 file is written back; single-page overwrites at random and in file order
 must not visit more fs-tree nodes, read more from the device or — loosely —
 take longer as the file's extent count grows; then sequential writes in
-128 KiB and 4 KiB calls, with MiB/s reported). Every commit is audited against the
+128 KiB and 4 KiB calls, with MiB/s reported) and `release` (files of 1,
+1,000 and 100,000 extents, a 256 MiB and a 1 GiB file on a 6 GiB filesystem,
+truncated to nothing and unlinked: each must succeed, allocate no METADATA
+chunk, and reserve no more per step than a step's worth; then truncates and
+an unlink with every step committed and the write stream cut at every
+flush, each crashed image checked and remounted). Every commit is audited against the
 on-disk free-space tree (in `scale`, every commit of its second workload
 pass), and the run reports the most any commit allocated beyond its batch's
 reservation. `scale` takes a few minutes and about 2 GiB of disk at the
@@ -44,7 +49,7 @@ and 3 concurrent `btrfs check` processes. Run it with
 | `linux` | Linux userspace (`btrfs check`, `btrfs restore`, `dump-tree`) as the independent oracle |
 | `crash` | replay of write-stream prefixes under a volatile-write-cache device model |
 | `fixture` | fixture images |
-| `fst`, `enospc`, `scale`, `overwrite` | the scenarios of those names |
+| `fst`, `enospc`, `scale`, `overwrite`, `release` | the scenarios of those names |
 | `host` | host stand-ins the kernel crate graph needs in a `std` process (RAM, linker anchors, executor) |
 
 `file_loading_tests` holds the `#[cfg(test)]` file-loading tests.
