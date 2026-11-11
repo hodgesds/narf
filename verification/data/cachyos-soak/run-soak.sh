@@ -129,6 +129,9 @@ main() {
   cp --reflink=auto "${SOAK_KERNEL:-$ROOT/target/x86_64-unknown-none/release/narf-frame}" \
     "$RUN/narf-frame" 2> /dev/null || true
   python3 "$HERE/soak-report.py" "$RUN" | tee "$RUN/report.txt"
+  # The disk, from the host: btrfs check, and the data the guest wrote.
+  python3 "$HERE/soak-verify.py" "$RUN" "$ROOT/target/narf-cachyos-root-rw.img" |
+    tee "$RUN/verify.txt"
 }
 
 main "$@"

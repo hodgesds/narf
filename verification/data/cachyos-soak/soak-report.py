@@ -19,7 +19,7 @@ import subprocess
 import sys
 
 KERNEL = re.compile(
-    r"watchdog:|nvme:.*(gate|stall|timeout|Timeout)|btrfs:.*(READ-ONLY|abort|error|corrupt)|"
+    r"writeback:|filesystem wait with no task|watchdog:|nvme:.*(gate|stall|timeout|Timeout)|btrfs:.*(READ-ONLY|abort|error|corrupt)|"
     r"oom:|Out of memory|KERNEL PANIC|CPU EXCEPTION|panicked at|GateTimeout|coredump:",
     re.I,
 )
@@ -177,7 +177,7 @@ def episodes(lines, syms):
             what, name, rest = m.groups()
             if what == "begin":
                 cur = {"name": name, "ms": None, "rc": "?", "after": None, "out": [],
-                       "probes": {}, "streak": {}, "best": (0, "-"), "log": []}
+                       "probes": {}, "streak": {}, "best": (0, "-"), "log": [], "meta": 0}
                 found.append(cur)
             elif cur and what == "returned":
                 d = kv(rest)
@@ -202,13 +202,16 @@ def episodes(lines, syms):
                     cur["best"] = (cur["streak"][cpu] * 2, cpu)
         elif "watchdog:" in line:
             cur["log"].append(line)
+        elif "btrfs: grew METADATA" in line:
+            cur["meta"] += 1
     if not found:
         return
     print("\n-- directed episodes: one operation at a time on the idle system")
     print("   (ms = the command; after = seconds some CPU stayed busy once it had returned;")
-    print("    100% = longest run of samples with one CPU fully busy; probe columns = worst ms)")
+    print("    100% = longest run of samples with one CPU fully busy; probe columns = worst ms;")
+    print("    meta = `btrfs: grew METADATA` lines)")
     print(f"   {'episode':24s} {'ms':>7s} {'after':>6s} {'100%':>9s} "
-          f"{'logind':>7s} {'busctl':>7s} {'fsync':>7s} {'exec':>6s} {'read':>6s}  detector")
+          f"{'logind':>7s} {'busctl':>7s} {'fsync':>7s} {'exec':>6s} {'read':>6s} {'meta':>5s}  detector")
     for e in found:
         soft = sum("lockup -" in l for l in e["log"])
         starved = len({re.search(r"starved \[([^\]]*)\]", l).group(1) for l in e["log"] if "starved [" in l})
@@ -217,7 +220,7 @@ def episodes(lines, syms):
         pr = e["probes"]
         print(f"   {e['name']:24s} {e['ms'] if e['ms'] is not None else '?':>7} {after:>6s} {streak:>9s} "
               f"{pr.get('loginctl', 0):7d} {pr.get('busctl', 0):7d} {pr.get('fsync', 0):7d} "
-              f"{pr.get('exec', 0):6d} {pr.get('coldread', 0):6d}  "
+              f"{pr.get('exec', 0):6d} {pr.get('coldread', 0):6d} {e['meta']:5d}  "
               f"{f'{soft} lockup report(s), {starved} stranded task(s)' if soft or starved else '-'}")
     for e in found:
         for text in e["out"]:
@@ -262,7 +265,7 @@ def main():
     print(f"== {run} (kernel slide {slide:#x})")
     for line in lines:
         if re.search(r"SOAK-(START|CMDLINE|NET|NOTE|PHASE|BASELINE|FINAL|END|ERRCOUNT|OUT|EXITWB|"
-                     r"FORKFLUSH|SHMAP|SAMPLER|DIRTYEXIT)\b", line):
+                     r"FORKFLUSH|SHMAP|SAMPLER|DIRTYEXIT|DURABLE|HARDSTOP|INTEG)\b", line):
             print("  " + line[line.index("SOAK-"):][:300])
 
     episodes(lines, syms)

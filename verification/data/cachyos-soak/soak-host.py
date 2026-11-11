@@ -36,7 +36,8 @@ KERNEL_LINES = re.compile(
     r"watchdog:|nvme:|btrfs:|oom:|Out of memory|KERNEL PANIC|CPU EXCEPTION|panicked at|"
     r"READ-ONLY|GateTimeout|SOAK-ERR|SOAK-PHASE|SOAK-START|SOAK-END|SOAK-NET|UNKILLABLE|"
     r"STUCK|BUSY-STREAK|SOAK-BASELINE|SOAK-FINAL|SOAK-ERRCOUNT|SOAK-OUT|SOAK-EXITWB|"
-    r"SOAK-FORKFLUSH|SOAK-DIRTYEXIT|SOAK-EPISODE|SOAK-NOTE"
+    r"SOAK-FORKFLUSH|SOAK-DIRTYEXIT|SOAK-EPISODE|SOAK-NOTE|SOAK-DURABLE|SOAK-HARDSTOP|"
+    r"INTEGRITY-MISMATCH|SOAK-INTEG integrity:|writeback:|filesystem wait with no task"
 )
 
 
@@ -182,7 +183,7 @@ class Serial:
 
     def __init__(self, path):
         self.path = path
-        self.started = self.ended = self.panicked = False
+        self.started = self.ended = self.panicked = self.hardstop = False
         self.heavy = False
         self.last_pulse = None
         self.last_pulse_line = ""
@@ -221,6 +222,8 @@ class Serial:
             self.heavy = True
         if "SOAK-END" in text:
             self.ended = True
+        if "SOAK-HARDSTOP" in text:
+            self.hardstop = True
         if "KERNEL PANIC" in text or "CPU EXCEPTION" in text or "panicked at" in text:
             self.panicked = True
         if KERNEL_LINES.search(text) and "SOAK-PROBE" not in text and "SOAK-CPU" not in text:
@@ -437,6 +440,13 @@ def main():
                 if now - booted > 30:
                     verdict = "qemu-exited"
                     break
+        if serial.hardstop:
+            # The durability check: stop the VM now, with no sync and no
+            # shutdown, as a power cut would.
+            event("SOAK-HARDSTOP: quitting QEMU without a shutdown")
+            qmp.quit()
+            verdict = "hardstop"
+            break
         if serial.panicked:
             event("kernel panic marker on the serial console")
             time.sleep(5)
@@ -481,7 +491,7 @@ def main():
         for key in sorted(STATS.counts):
             f.write(f"{key}: {STATS.counts[key]}\n")
     event(f"verdict: {verdict}; " + ", ".join(f"{k}={v}" for k, v in sorted(STATS.counts.items())))
-    sys.exit(0 if verdict == "completed" else 1)
+    sys.exit(0 if verdict in ("completed", "hardstop") else 1)
 
 
 if __name__ == "__main__":
