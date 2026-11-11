@@ -31,6 +31,8 @@ mod sched_scan_tests;
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;
 
+#[path = "cipher_tests.rs"]
+mod cipher_tests;
 #[path = "dfs_tests.rs"]
 mod dfs_tests;
 #[path = "dynamic_wmm_tests.rs"]

@@ -36,7 +36,7 @@ impl StationSecurity {
                 .supplicant
                 .gtk
                 .as_ref()
-                .is_none_or(|gtk| gtk.len() != 16)
+                .is_none_or(|gtk| gtk.len() != self.ciphers.group_key_len())
         {
             return Err(Error::Busy);
         }

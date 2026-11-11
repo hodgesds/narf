@@ -35,8 +35,10 @@ pub(super) struct StationSecurity {
     /// `IEEE80211_NUM_TIDS` for management frames).
     management_pn: u64,
     /// The installed IGTK for software BIP verification (mt76 hands BIP
-    /// group management frames to mac80211 `ieee80211_crypto_aes_cmac_decrypt`).
-    igtk: narf_wireless::mfp::MfpKeyStore,
+    /// group management frames to mac80211 `ieee80211_crypto_aes_*_decrypt`).
+    igtk: narf_wireless::mfp::BipKeyStore,
+    /// The negotiated pairwise, group and group management ciphers.
+    pub(super) ciphers: narf_wireless::rsn::Ciphers,
     /// The last installed CCMP group key index, repeated as `key[0]` of
     /// the IGTK record (`sta_key_conf`).
     gtk_id: u8,
@@ -72,6 +74,13 @@ impl StationSecurity {
         }
         let key_mgmt = plan.akm().ok_or(Error::Bounds)?;
         let pmf = plan.pmf();
+        let ciphers = plan.ciphers();
+        if crate::mt7921::association::mcu_data_cipher(ciphers.pairwise).is_none()
+            || crate::mt7921::association::mcu_data_cipher(ciphers.group).is_none()
+            || !ciphers.valid()
+        {
+            return Err(Error::Bounds);
+        }
         let mut ies = &bss.information_elements[..];
         let mut ap_rsn_ie = None;
         let mut ap_rsnxe = None;
@@ -97,9 +106,9 @@ impl StationSecurity {
                 assoc_ie,
                 ap_rsn_ie: ap_rsn_ie.ok_or(Error::Bounds)?,
                 ap_rsnxe,
-                pairwise_key_len: 16,
-                group_key_len: 16,
-                mgmt_group_key_len: pmf.then_some(16),
+                pairwise_key_len: ciphers.pairwise_key_len(),
+                group_key_len: ciphers.group_key_len(),
+                mgmt_group_key_len: pmf.then_some(ciphers.mgmt_key_len()),
                 pmf,
             }),
             pairwise: [0; 17],
@@ -108,7 +117,8 @@ impl StationSecurity {
             pmf,
             ptk_installed: false,
             management_pn: 0,
-            igtk: narf_wireless::mfp::MfpKeyStore::new(),
+            igtk: narf_wireless::mfp::BipKeyStore::new(),
+            ciphers,
             gtk_id: 0,
         })
     }
@@ -146,7 +156,8 @@ impl StationSecurity {
     }
 
     pub(super) fn commit_group(&mut self, gtk: &Gtk) -> Result<(), Error> {
-        if gtk.key_id > 3 || gtk.key.len() != 16 || gtk.rsc[6..] != [0, 0] {
+        if gtk.key_id > 3 || gtk.key.len() != self.ciphers.group_key_len() || gtk.rsc[6..] != [0, 0]
+        {
             return Err(Error::MalformedEvent);
         }
         self.group[usize::from(gtk.key_id)] = Some([u64::from_le_bytes(gtk.rsc); 17]);
@@ -167,21 +178,30 @@ impl StationSecurity {
     /// The firmware accepted the IGTK record. The KDE IPN is the AP's last
     /// IPN; mac80211 seeds the BIP replay counter with it.
     pub(super) fn commit_igtk(&mut self, igtk: &narf_wireless::eapol::Igtk) -> Result<(), Error> {
-        let key: [u8; 16] = igtk
-            .key
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::MalformedEvent)?;
-        self.igtk
-            .install_active(key, igtk.key_id)
-            .map_err(|_| Error::MalformedEvent)?;
         let mut ipn = [0; 8];
         ipn[..6].copy_from_slice(&igtk.ipn);
-        if let Some(active) = self.igtk.active.as_mut() {
-            active.rx_pn = u64::from_le_bytes(ipn);
-        }
+        let key = narf_wireless::mfp::BipKey::new(
+            self.ciphers.group_mgmt,
+            &igtk.key,
+            igtk.key_id,
+            u64::from_le_bytes(ipn),
+        )
+        .map_err(|_| Error::MalformedEvent)?;
+        self.igtk.install_active(key);
         self.supplicant.group_keys_installed(None, Some(&igtk.key));
         Ok(())
+    }
+
+    /// The hardware decrypted `rx` under the negotiated cipher of the key
+    /// it names (pairwise key 0, else a GTK); mac80211 checks the RX key's
+    /// cipher the same way before it trusts RX_FLAG_DECRYPTED.
+    pub(super) fn decrypted_by(&self, rx: &super::scan::CcmpRx) -> bool {
+        let suite = if rx.key_id == 0 {
+            self.ciphers.pairwise
+        } else {
+            self.ciphers.group
+        };
+        crate::mt7921::association::mac_data_cipher(suite) == Some(rx.cipher)
     }
 
     /// The installed GTK, for the IGTK record's BIP batch `key[0]`.
@@ -189,7 +209,7 @@ impl StationSecurity {
         self.supplicant
             .gtk
             .as_deref()
-            .filter(|gtk| gtk.len() == 16)
+            .filter(|gtk| gtk.len() == self.ciphers.group_key_len())
             .map(|gtk| (self.gtk_id, gtk))
     }
 
@@ -220,8 +240,7 @@ impl StationSecurity {
                 return None;
             }
             let body =
-                narf_wireless::mfp::verify_inbound(&mut self.igtk, &frame[..24], &frame[24..])
-                    .ok()?;
+                narf_wireless::mfp::bip_verify(&mut self.igtk, &frame[..24], &frame[24..]).ok()?;
             let mut out = frame[..24].to_vec();
             out.extend_from_slice(body);
             return Some(out);
@@ -229,7 +248,11 @@ impl StationSecurity {
         // Unicast: hardware-decrypted under the pairwise key only, with a
         // strictly increasing management PN (ieee80211_crypto_ccmp_decrypt).
         let ccmp = ccmp?;
-        if !protected || ccmp.key_id != 0 || ccmp.pn <= self.management_pn {
+        if !protected
+            || ccmp.key_id != 0
+            || !self.decrypted_by(&ccmp)
+            || ccmp.pn <= self.management_pn
+        {
             return None;
         }
         self.management_pn = ccmp.pn;
@@ -259,12 +282,8 @@ impl Drop for StationSecurity {
         {
             key.zeroize();
         }
-        for igtk in [&mut self.igtk.active, &mut self.igtk.next]
-            .into_iter()
-            .flatten()
-        {
-            igtk.key.zeroize();
-        }
+        // BipKey keys are Zeroizing: dropping them wipes the IGTKs.
+        self.igtk = narf_wireless::mfp::BipKeyStore::new();
     }
 }
 
@@ -602,7 +621,9 @@ impl<B: Backend> Session<B> {
             return None;
         }
         let pn = match (native.ccmp, self.station.security.as_ref()) {
-            (Some(ccmp), Some(_)) if ccmp.key_id == 0 => Some(ccmp.pn),
+            (Some(ccmp), Some(security)) if ccmp.key_id == 0 && security.decrypted_by(&ccmp) => {
+                Some(ccmp.pn)
+            }
             (None, None) => None,
             _ => return None,
         };
@@ -654,6 +675,13 @@ impl<B: Backend> Session<B> {
         {
             receiver.clear();
             return None;
+        }
+        // A frame the hardware decrypted under another cipher is dropped.
+        if let (Some(ccmp), Some(security)) = (native.ccmp, self.station.security.as_ref()) {
+            if !security.decrypted_by(&ccmp) {
+                receiver.clear();
+                return None;
+            }
         }
         let floor = self
             .station
@@ -759,15 +787,17 @@ impl<B: Backend> Session<B> {
                     .as_ref()
                     .is_some_and(|security| !security.pending.is_empty()))
     }
-    async fn install_group_key(&mut self, gtk: &Gtk) -> Result<(), Error> {
+    /// Install `gtk` under the negotiated group `cipher`.
+    async fn install_group_key(&mut self, gtk: &Gtk, cipher: u8) -> Result<(), Error> {
         if gtk.rsc[6..] != [0, 0] {
             return Err(Error::MalformedEvent);
         }
-        let record = crate::mt7921::association::key_record_on(
+        let record = crate::mt7921::association::key_record_cipher_on(
             self.station.link,
             self.station.link.bmc(),
             gtk.key_id,
             Some(&gtk.key),
+            cipher,
         )
         .map_err(|_| Error::MalformedEvent)?;
         self.exchange_station(Command::Unified { id: 3 }, &record)
@@ -782,10 +812,20 @@ impl<B: Backend> Session<B> {
         security: &StationSecurity,
         igtk: &narf_wireless::eapol::Igtk,
     ) -> Result<(), Error> {
+        // mt7921_set_key takes only the AES-CMAC IGTK; mac80211 verifies
+        // the other BIP suites in software (`commit_igtk`'s key).
+        if security.ciphers.group_mgmt != narf_wireless::rsn::CIPHER_BIP_CMAC_128 {
+            return Ok(());
+        }
         let (gtk_id, gtk) = security.gtk().ok_or(Error::MalformedEvent)?;
-        let record =
-            crate::mt7921::association::igtk_record_on(self.station.link, gtk_id, gtk, &igtk.key)
-                .map_err(|_| Error::MalformedEvent)?;
+        let record = crate::mt7921::association::igtk_record_cipher_on(
+            self.station.link,
+            gtk_id,
+            gtk,
+            security.ciphers.group,
+            &igtk.key,
+        )
+        .map_err(|_| Error::MalformedEvent)?;
         self.exchange_station(Command::Unified { id: 3 }, &record)
             .await
             .map(|_| ())
@@ -877,11 +917,12 @@ impl<B: Backend> Session<B> {
                 )
                 .await?;
                 if let Some(tk) = tk {
-                    let record = crate::mt7921::association::key_record_on(
+                    let record = crate::mt7921::association::key_record_cipher_on(
                         self.station.link,
                         self.station.link.peer(),
                         0,
                         Some(&tk),
+                        security.ciphers.pairwise,
                     )
                     .map_err(|_| Error::MalformedEvent)?;
                     self.exchange_station(Command::Unified { id: 3 }, &record)
@@ -889,7 +930,7 @@ impl<B: Backend> Session<B> {
                     security.commit_pairwise();
                 }
                 if let Some(gtk) = gtk {
-                    self.install_group_key(&gtk).await?;
+                    self.install_group_key(&gtk, security.ciphers.group).await?;
                     security.commit_group(&gtk)?;
                 }
                 if let Some(igtk) = igtk.filter(|_| security.pmf) {
@@ -1297,7 +1338,7 @@ impl<B: Backend> Session<B> {
                 let Some(security) = self.station.security.as_mut() else {
                     continue;
                 };
-                if !protected {
+                if !protected || !security.decrypted_by(&ccmp) {
                     continue;
                 }
                 let tid = if header[0] & 0x80 != 0 {
@@ -1968,7 +2009,9 @@ impl<B: Backend> Session<B> {
             .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
             .ok_or(Error::Bounds)?;
         let own = info.capabilities.mac;
-        let mut plan = JoinPlan::prepare_native(bss, own, ssid, security, info, permission)?;
+        let ciphers = crate::mt7921::association::supplicant_ciphers(extra_ies);
+        let mut plan =
+            JoinPlan::prepare_native(bss, own, ssid, security, info, permission, ciphers)?;
         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
         self.backend.check_tx_permission(permission)?;
         if !self.station.rx_ba.begin_connection() || !self.station.tx_ba.begin_connection() {
@@ -2173,8 +2216,15 @@ impl<B: Backend> Session<B> {
                     Err(_) if cached.take().is_some() => {
                         self.pmksa.remove(bss.bssid);
                         sae_pmk = None;
-                        plan =
-                            JoinPlan::prepare_native(bss, own, ssid, security, info, permission)?;
+                        plan = JoinPlan::prepare_native(
+                            bss,
+                            own,
+                            ssid,
+                            security,
+                            info,
+                            permission,
+                            crate::mt7921::association::supplicant_ciphers(extra_ies),
+                        )?;
                         plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
                         self.stage(Stage::Authenticate);
                     }
@@ -2386,17 +2436,18 @@ impl<B: Backend> Session<B> {
                                 .await?;
                                 self.stage(Stage::StaRecord);
                                 let record = plan
-                                    .secure_peer_record_on(
+                                    .secure_peer_record_cipher_on(
                                         self.station.link,
                                         aid,
                                         m3.tk.as_deref().unwrap(),
+                                        security.ciphers.pairwise,
                                     )
                                     .map_err(|_| Error::MalformedEvent)?;
                                 self.exchange_station(Command::Unified { id: 3 }, &record)
                                     .await?;
                                 security.commit_pairwise();
                                 let gtk = m3.gtk.as_ref().unwrap();
-                                self.install_group_key(gtk).await?;
+                                self.install_group_key(gtk, security.ciphers.group).await?;
                                 security.commit_group(gtk)?;
                                 if let Some(igtk) = m3.igtk.as_ref().filter(|_| security.pmf) {
                                     self.install_igtk(&security, igtk).await?;

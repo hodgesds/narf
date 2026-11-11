@@ -1553,17 +1553,25 @@ impl WirelessNetIface for Mt76Iface {
         true
     }
 
-    /// The ciphers the owner implements: CCMP-128 for data and the
-    /// BIP-CMAC-128 IGTK (`MCU_CIPHER_BIP_CMAC_128`) for robust management
-    /// frames. Advertising AES-CMAC is what gives wpa_supplicant
+    /// The ciphers the owner implements, as Linux mt7921 lists them
+    /// (mt76 `cipher_suites` minus WEP/TKIP, which the owner does not run):
+    /// CCMP-128/256 and GCMP-128/256 data keys in hardware
+    /// (`MCU_CIPHER_AES_CCMP`/`CCMP_256`/`GCMP`/`GCMP_256`), the AES-CMAC
+    /// IGTK in hardware, and BIP-CMAC-256 / BIP-GMAC-128/256 verified in
+    /// software, as mac80211 does when mt7921_set_key refuses them.
+    /// Advertising AES-CMAC is what gives wpa_supplicant
     /// WPA_DRIVER_CAPA_ENC_BIP, without which a profile with the default
-    /// `pmf` never asks for PMF. Linux mt7921 lists mac80211's full set
-    /// (CCMP-256, GCMP-128/256, BIP-CMAC-256, BIP-GMAC-128/256 too); those
-    /// are not implemented by this owner and are not offered.
+    /// `pmf` never asks for PMF.
     fn cipher_suites(&self) -> &'static [u32] {
         &[
             narf_wireless::CIPHER_SUITE_CCMP,
+            narf_wireless::CIPHER_SUITE_CCMP_256,
+            narf_wireless::CIPHER_SUITE_GCMP,
+            narf_wireless::CIPHER_SUITE_GCMP_256,
             narf_wireless::CIPHER_SUITE_AES_CMAC,
+            narf_wireless::CIPHER_SUITE_BIP_CMAC_256,
+            narf_wireless::CIPHER_SUITE_BIP_GMAC_128,
+            narf_wireless::CIPHER_SUITE_BIP_GMAC_256,
         ]
     }
 
