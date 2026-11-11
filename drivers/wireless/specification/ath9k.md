@@ -855,7 +855,8 @@ uses the source STA_ID1/RTC/reset sequence and requires RTC_SHUTDOWN1.
 Wake performs a fresh complete actual20 cold generation at the retained primary,
 including identical raw factory/identity, INI/PLL/RF, current factory/host plan,
 analog calibration, complete MAC/key-cache preparation and native reports before
-new-name publication. Keys, association, PN/replay, BA, copies and old endpoints
+the fresh generation attaches to the same netdev (name and ifindex unchanged,
+§`interface::Netdev`). Keys, association, PN/replay, BA, copies and old endpoints
 do not survive. A40 predecessor cannot lend its center/report to a20 successor.
 Existing H/B/T/Q/S/P formats and qualification recipes are unchanged; no clock
 off happens under a live P1 always-awake or S1 packet owner. Physical board
@@ -871,11 +872,33 @@ new users and refuses extra live guards; resume cold-restores actual20. Remove
 permanently closes the original idle owner, and the terminal supervisor never
 resurrects an intentionally parked owner.
 
+Production driver (mac80211 `IEEE80211_CONF_IDLE` → `main.c::ath9k_config`):
+the original controller's supervisor (`ath9k.rs::supervise`) calls
+`idle::enter_when_idle` every tick; it requests idle (`set(true)`) only when
+`idle::idle_wanted` holds — the published generation is `idle_admissible`
+(Passive, unassociated, nothing pending), the netdev ran no
+scan/connect/configuration request within `IDLE_GRACE_NS` (5 s) and has none
+in flight (`interface::quiet_for`), the owner is Operational and not already
+desired, and no counted use beyond the station pin is held. The grace is a
+deliberate deviation from mac80211's immediate idle: leaving idle here is a
+full cold generation reset, so a scan then connect must not pay it twice.
+Every netdev control request (`scan`, `associate`, `set_config`) first runs
+the netdev's activity hook, `idle::activity`: an awake owner just counts a use
+held for the request (so idle cannot be admitted under it); a desired, armed
+or asleep owner cancels the delay or cold-wakes (`wake_use`, Linux's "the
+chip needs a reset to properly wake up from full sleep") before the request
+waits for the attached generation. Only the AR9285 original controller has an
+idle owner; the hook is a no-op for the other ath9k owners.
+
 The source contract and pinned Linux call chain are
 [AR9285 D0 idle FULL_SLEEP](ar9285-idle-full-sleep.md). Seven native cases are
 written, covering real Device/Radio/Packet/DMA, all-queue/RX retirement, current
 physical sleep/readback negatives, counted control/association refusal,
 cancelled delay, fresh Open/WPA2/kernel DHCP and full40-above/below to actual20.
+`smoke_ath9k_idle_policy_and_activity_leave_idle` covers the production
+predicate and the leave-idle use count, and
+`smoke_ath9k_netdev_activity_leaves_idle_into_same_netdev` scan/connect on an
+idle (detached) netdev waking into a generation under the same name/ifindex.
 They compose the production lifetime helpers with complete model cold-reset
 primitives; they do not instantiate the singleton native PCI controller.
 Release/native execution and physical acceptance remain pending.
@@ -1121,8 +1144,9 @@ rows and the tree facts that keep each open:
   original-controller baseline in §3.11: counted native/control/wake users,
   public desired/status controls, retained100ms continuation, full terminal
   DMA/IRQ proof before actual D0 SHUTDOWN and fresh actual20 cold wake.
-  Associated retention, runtime PCI D3 and physical board wake measurements are
-  not inferred. Seven native cases are written; release/native and physical
+  Production-driven from the supervisor (unassociated + quiet netdev) and
+  left by netdev scan/connect/config activity (§3.11). Associated retention, runtime PCI D3 and physical board wake measurements are
+  not inferred. Nine cases are written; release/native and physical
   acceptance remain pending.
 - `station_network_sleep` is source-complete for the admitted optional
   AR9285 N85S1 program in §3.9: actual public desired setting, PM notice/

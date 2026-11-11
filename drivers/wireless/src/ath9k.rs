@@ -697,6 +697,9 @@ async fn reset_owner_geometry_inner(
 /// (disassociation, link loss, fatal interrupt or failed DMA), reset into a
 /// fresh generation so the radio can be joined again. A generation whose DMA
 /// stop could not be proven stays pinned and is never followed.
+/// A live, unassociated generation whose netdev stayed quiet for
+/// `idle::IDLE_GRACE_NS` enters idle FULL_SLEEP (`idle::enter_when_idle`);
+/// netdev activity leaves it (`idle::activity`).
 async fn supervise(owner: Arc<Retained>) {
     let mut failures = 0u32;
     loop {
@@ -727,6 +730,16 @@ async fn supervise(owner: Arc<Retained>) {
                 .unwrap_or(false)
         };
         if !terminal {
+            // mac80211 idle: an unassociated, quiet netdev parks the chip
+            // in FULL_SLEEP until the next scan/connect/config wakes it.
+            if let Some(status) = idle::enter_when_idle(&owner).await {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "ath9k: idle FULL_SLEEP ({:?}) after generation {}",
+                    status.state,
+                    status.generation
+                );
+            }
             continue;
         }
         match reset_owner(&owner).await {

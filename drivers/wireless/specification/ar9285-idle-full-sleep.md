@@ -87,7 +87,7 @@ counted admission, terminal `retire_station`, cancellable armed timer and actual
 FULL_SLEEP helper with real Device/Radio/Packet, mapped native descriptors,
 reactive Open/WPA2 peers and kernel DHCP. They cover counted control refusal,
 retained RX-tail ownership, actual SHUTDOWN/order/readbacks, busy association,
-cancelled delay, cold new-name generation, all-ten-QCU/RX quarantine,
+cancelled delay, cold generation on the same netdev, all-ten-QCU/RX quarantine,
 revocation/removal/system-PM fences and actual full40 above/below to fresh
 primary20. They run the same complete identity/EEPROM/PHY/calibration/MAC
 primitives for model cold wakes. The singleton native PCI controller itself is

@@ -1061,6 +1061,25 @@ const HOUSEKEEPING_NS: u64 = 20_000_000;
 /// How long a control request waits for the netdev's next generation
 /// (a generation reset, idle wake or resume republishing the radio).
 const ATTACH_WAIT_NS: u64 = 10_000_000_000;
+/// Leave-idle hook run before every netdev control request (mac80211
+/// clearing `IEEE80211_CONF_IDLE`). Its result is a counted use held for the
+/// request, so idle cannot be entered under it.
+pub(super) type Activity = fn() -> Waking;
+/// The hook's future: the counted use (if any) to hold for the request.
+pub(super) type Waking =
+    core::pin::Pin<Box<dyn core::future::Future<Output = Option<Box<dyn Send>>> + Send>>;
+/// One control request in flight; its end restarts the quiet window.
+struct Busy<'a> {
+    busy: &'a AtomicU64,
+    quiet_since: &'a AtomicU64,
+}
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.quiet_since
+            .store(narf_time::monotonic_ns(), Ordering::Release);
+        self.busy.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 /// One netdev across station generations. Linux keeps the `net_device`
 /// (and `ieee80211_hw`) across `main.c::ath_reset`, mac80211 idle
 /// (`IEEE80211_CONF_IDLE`) and `ath9k_suspend`/`ath_pci_suspend`; here
@@ -1079,6 +1098,11 @@ pub(super) struct Netdev<P: Port, E: Environment, K: Engine = Packet<P>> {
     /// Scan IEs gathered by the generation(s) a scan ran on.
     scan_ies: IrqSafeSpinLock<Vec<([u8; 6], Vec<u8>)>>,
     removed: AtomicBool,
+    activity: Option<Activity>,
+    /// Control requests in flight and the end of the last one: the
+    /// "not scanning/connecting" half of the idle predicate.
+    busy: AtomicU64,
+    quiet_since: AtomicU64,
 }
 fn copy_info(info: &narf_wireless::WirelessIfaceInfo) -> narf_wireless::WirelessIfaceInfo {
     use narf_wireless::iface::*;
@@ -1105,7 +1129,7 @@ fn copy_info(info: &narf_wireless::WirelessIfaceInfo) -> narf_wireless::Wireless
 impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static>
     Netdev<P, E, K>
 {
-    pub(super) fn new(name: &'static str, own: [u8; 6]) -> Arc<Self> {
+    pub(super) fn new(name: &'static str, own: [u8; 6], activity: Option<Activity>) -> Arc<Self> {
         Arc::new(Self {
             name,
             own,
@@ -1115,7 +1139,33 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
             info: IrqSafeSpinLock::new(None),
             scan_ies: IrqSafeSpinLock::new(Vec::new()),
             removed: AtomicBool::new(false),
+            activity,
+            busy: AtomicU64::new(0),
+            quiet_since: AtomicU64::new(narf_time::monotonic_ns()),
         })
+    }
+    /// No control request is in flight and none ended within `ns`.
+    pub(super) fn quiet_for(&self, ns: u64) -> bool {
+        self.busy.load(Ordering::Acquire) == 0
+            && narf_time::monotonic_ns().saturating_sub(self.quiet_since.load(Ordering::Acquire))
+                >= ns
+    }
+    /// Begin a control request: count it, leave idle through the activity
+    /// hook (holding its use for the request), then the current generation.
+    async fn control(
+        &self,
+    ) -> Result<(Arc<Device<P, E, K>>, Busy<'_>, Option<Box<dyn Send>>), WirelessError> {
+        self.busy.fetch_add(1, Ordering::AcqRel);
+        let busy = Busy {
+            busy: &self.busy,
+            quiet_since: &self.quiet_since,
+        };
+        let wake = match self.activity {
+            Some(activity) => activity().await,
+            None => None,
+        };
+        let device = self.wait_generation().await?;
+        Ok((device, busy, wake))
     }
     /// The attached generation, if any.
     pub(super) fn generation(&self) -> Option<Arc<Device<P, E, K>>> {
@@ -1146,6 +1196,8 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
             *current = Some(device.clone());
             device
         };
+        self.quiet_since
+            .store(narf_time::monotonic_ns(), Ordering::Release);
         let info = device.get_wireless_info();
         *self.info.lock() = Some(info);
         Ok(device)
@@ -1286,7 +1338,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         )
     }
     async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
-        let device = self.wait_generation().await?;
+        let (device, _busy, _wake) = self.control().await?;
         // The generation the scan started on gathers every visited
         // channel's IEs, including those of retune successors.
         let list = device.scan(request).await?;
@@ -1302,7 +1354,8 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         Ok(list)
     }
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
-        self.wait_generation().await?.associate(request).await
+        let (device, _busy, _wake) = self.control().await?;
+        device.associate(request).await
     }
     async fn disassociate(&self) -> Result<(), WirelessError> {
         match self.generation() {
@@ -1311,7 +1364,8 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         }
     }
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
-        self.wait_generation().await?.set_config(config).await
+        let (device, _busy, _wake) = self.control().await?;
+        device.set_config(config).await
     }
 }
 pub(super) type Native = Device<
@@ -1347,7 +1401,11 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
             Some(netdev) if netdev.own == own => (netdev.clone(), false),
             Some(_) => return Err(Error::State),
             None => {
-                let netdev = NativeNetdev::new(narf_net::iface::reserve_name("wlan%d"), own);
+                let netdev = NativeNetdev::new(
+                    narf_net::iface::reserve_name("wlan%d"),
+                    own,
+                    Some(leave_idle),
+                );
                 *slot = Some(netdev.clone());
                 (netdev, true)
             }
@@ -1400,6 +1458,23 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
         }
     });
     Ok(device)
+}
+/// [`Activity`] of the published netdev: the original controller's
+/// leave-idle wake (a no-op `None` for the other owners).
+fn leave_idle() -> Waking {
+    Box::pin(async {
+        super::idle::activity()
+            .await
+            .map(|guard| Box::new(guard) as Box<dyn Send>)
+    })
+}
+/// Whether the published netdev had no control request in flight or
+/// ending within `ns` (false without a netdev).
+pub(super) fn quiet_for(ns: u64) -> bool {
+    NETDEV
+        .lock()
+        .clone()
+        .is_some_and(|netdev| netdev.quiet_for(ns))
 }
 /// The generation currently attached to the published netdev.
 pub(super) fn current() -> Option<Arc<Native>> {

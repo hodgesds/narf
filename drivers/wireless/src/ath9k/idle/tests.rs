@@ -853,3 +853,56 @@ kernel_test_in!(
     "drivers/wireless/ath9k/idle-full-sleep",
     smoke_ar9285_idle_full40_both_extensions_cold_wake_uses_fresh_primary20_and_wpa2_dhcp
 );
+
+/// The production idle predicate (`idle_wanted`, mac80211
+/// `IEEE80211_CONF_IDLE`) and the leave-idle half of `activity`: a pending
+/// idle request is cancelled and the use is counted before the request runs.
+fn policy_and_activity() -> Result<(), &'static str> {
+    let owner = Owner::new();
+    let status = owner.status(7);
+    check!(
+        idle_wanted(true, true, status, 0),
+        "unassociated quiet station idles"
+    );
+    check!(
+        !idle_wanted(false, true, status, 0),
+        "associated/pending station stays awake"
+    );
+    check!(
+        !idle_wanted(true, false, status, 0),
+        "recent scan/connect stays awake"
+    );
+    {
+        let _use = owner.use_awake(false).map_err(|_| "counted use")?;
+        check!(
+            !idle_wanted(true, true, owner.status(7), 0),
+            "in-flight netdev request stays awake"
+        );
+    }
+    check!(
+        !idle_wanted(true, true, owner.status(1), 1),
+        "a missing station pin is not the expected use count"
+    );
+    owner.begin_idle(0).map_err(|_| "idle admission")?;
+    check!(
+        !idle_wanted(true, true, owner.status(7), 0),
+        "already-desired idle is not re-entered"
+    );
+    check!(
+        owner.use_awake(false).is_err(),
+        "desired idle refuses a plain use"
+    );
+    owner.set_desired(false).map_err(|_| "leave idle")?;
+    check!(
+        owner.use_awake(false).is_ok(),
+        "activity counts the use after leaving idle"
+    );
+    Ok(())
+}
+fn smoke_ath9k_idle_policy_and_activity_leave_idle() -> TestResult {
+    verdict(policy_and_activity)
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/idle",
+    smoke_ath9k_idle_policy_and_activity_leave_idle
+);

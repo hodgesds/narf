@@ -580,3 +580,78 @@ pub(super) async fn system_resume(owner: &Retained) -> core::result::Result<(), 
             _ => BringUpError::BadState,
         })
 }
+
+/// How long netdev activity waits for an idle owner to leave FULL_SLEEP.
+const ACTIVITY_WAKE_NS: u64 = 10_000_000_000;
+/// Debounce before an unassociated, quiet netdev enters idle. mac80211
+/// (`iface.c::__ieee80211_recalc_idle`) idles at once; here leaving idle is
+/// a full cold generation reset, so a scan followed by a connect within this
+/// window must not pay it twice.
+pub(super) const IDLE_GRACE_NS: u64 = 5_000_000_000;
+
+/// mac80211 `IEEE80211_CONF_IDLE` for the single station vif: the published
+/// generation is unassociated with nothing in flight (`idle_admissible`), no
+/// scan/connect/configuration ran within the grace window (`quiet`), the
+/// owner is operational and not already idle, and no counted use beyond the
+/// station's own pin (`station_users`) is held.
+pub(super) fn idle_wanted(
+    admissible: bool,
+    quiet: bool,
+    status: Status,
+    station_users: u32,
+) -> bool {
+    admissible
+        && quiet
+        && status.state == State::Operational
+        && !status.desired
+        && status.users == station_users
+}
+
+/// Supervisor tick of the original controller: enter idle FULL_SLEEP when
+/// [`idle_wanted`] holds (Linux `main.c::ath9k_config` with
+/// `IEEE80211_CONF_IDLE`: `ath_cancel_work`, then `ath9k_ps_restore` takes
+/// the chip to FULL_SLEEP). Returns the entered status, if any.
+pub(super) async fn enter_when_idle(owner: &Retained) -> Option<Status> {
+    let wanted = {
+        let controller = owner.state.try_lock()?;
+        let station = controller.station.as_ref()?;
+        let admissible = station.try_lock()?.idle_admissible();
+        idle_wanted(
+            admissible,
+            interface::quiet_for(IDLE_GRACE_NS),
+            owner.idle.status(controller.generation),
+            u32::from(controller.station_use.is_some()),
+        )
+    };
+    if !wanted {
+        return None;
+    }
+    set(true).await.ok()
+}
+
+/// Netdev control activity (scan, connect, configuration) leaves idle:
+/// mac80211 clears `IEEE80211_CONF_IDLE` and `main.c::ath9k_config` wakes
+/// the chip with a reset ("the chip needs a reset to properly wake up from
+/// full sleep"). An awake owner only counts the use, so idle cannot be
+/// admitted while the request runs; an idle-desired, armed or asleep owner
+/// cancels the delay or cold-wakes into a fresh generation first. `None`
+/// when no original controller exists or it is blocked/removed; the caller
+/// then waits for a generation as usual.
+pub(super) async fn activity() -> Option<WakeGuard> {
+    let owner = { CONTROLLER.lock().clone() }?;
+    let deadline = narf_time::monotonic_ns().saturating_add(ACTIVITY_WAKE_NS);
+    loop {
+        if let Ok(guard) = owner.idle.use_awake(false) {
+            return Some(guard);
+        }
+        owner.idle.set_desired(false).ok()?;
+        match wake_use().await {
+            Ok(guard) => return Some(guard),
+            Err(Error::Removed) => return None,
+            Err(_) if narf_time::monotonic_ns() >= deadline => return None,
+            Err(_) => {
+                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(20_000_000)).await;
+            }
+        }
+    }
+}

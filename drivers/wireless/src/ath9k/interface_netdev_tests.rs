@@ -80,7 +80,7 @@ fn generations() -> Result<(), &'static str> {
     let own = first.plan.station;
     let plan = first.plan;
     let name = narf_net::iface::reserve_name("ar9-netdev%d");
-    let netdev = TestNetdev::new(name, own);
+    let netdev = TestNetdev::new(name, own, None);
     *NET.lock() = Some(netdev.clone());
     narf_net::iface::register(name, own, send);
     narf_net::iface::set_link_state(name, true);
@@ -168,4 +168,71 @@ fn smoke_ath9k_netdev_name_and_ifindex_survive_generation_reset() -> TestResult 
 kernel_test_in!(
     "drivers/wireless/ath9k/device",
     smoke_ath9k_netdev_name_and_ifindex_survive_generation_reset
+);
+
+static WAKES: AtomicU64 = AtomicU64::new(0);
+/// Fixture parts of generations the wake hook attached.
+static WOKEN: IrqSafeSpinLock<Vec<Generation>> = IrqSafeSpinLock::new(Vec::new());
+/// Stand-in for the original controller's leave-idle cold wake: count the
+/// activity and attach a fresh generation when the netdev is detached.
+fn wake_hook() -> Waking {
+    Box::pin(async {
+        WAKES.fetch_add(1, Ordering::AcqRel);
+        let netdev = NET.lock().clone()?;
+        if netdev.generation().is_none() {
+            let generation = attach(&netdev, tests::fixture(false).ok()?).ok()?;
+            WOKEN.lock().push(generation);
+        }
+        None
+    })
+}
+fn idle_activity() -> Result<(), &'static str> {
+    let first = tests::fixture(false)?;
+    let own = first.plan.station;
+    let name = narf_net::iface::reserve_name("ar9-idle-netdev%d");
+    let netdev = TestNetdev::new(name, own, Some(wake_hook));
+    *NET.lock() = Some(netdev.clone());
+    narf_net::iface::register(name, own, send);
+    narf_net::iface::set_link_state(name, true);
+    let ifindex = narf_net::iface::ifindex_of(name).ok_or("netdev ifindex")?;
+    let old = attach(&netdev, first)?;
+    if !netdev.quiet_for(0) || netdev.quiet_for(ATTACH_WAIT_NS) {
+        return Err("a fresh generation restarts the quiet window");
+    }
+    // Idle entry retires the generation; the netdev stays.
+    netdev.detach(&old.device.radio).ok_or("idle detach")?;
+    if !old.device.radio.try_lock().is_some_and(|mut r| r.retire()) {
+        return Err("idle generation DMA not reclaimed");
+    }
+    WAKES.store(0, Ordering::Release);
+    // Scan and connect leave idle through the activity hook first.
+    join(&netdev)?;
+    if WAKES.load(Ordering::Acquire) < 2
+        || WOKEN.lock().len() != 1
+        || narf_net::iface::ifindex_of(name) != Some(ifindex)
+        || carrier(name) != Some(true)
+    {
+        return Err("netdev activity did not wake into the same netdev");
+    }
+    if !netdev.quiet_for(0) || netdev.quiet_for(ATTACH_WAIT_NS) {
+        return Err("control requests did not restart the quiet window");
+    }
+    netdev.unregister();
+    for generation in WOKEN.lock().drain(..) {
+        let _ = generation.device.radio.try_lock().map(|mut r| r.retire());
+    }
+    Ok(())
+}
+fn smoke_ath9k_netdev_activity_leaves_idle_into_same_netdev() -> TestResult {
+    let result = idle_activity();
+    *NET.lock() = None;
+    WOKEN.lock().clear();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/idle",
+    smoke_ath9k_netdev_activity_leaves_idle_into_same_netdev
 );
