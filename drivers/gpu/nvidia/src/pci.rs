@@ -37,6 +37,7 @@ use narf_driver_runtime::{
 
 use crate::chip::{chip_info_for_pci_id, ChipFamily, ChipInfo, NVIDIA_VENDOR, PCI_CLASS_DISPLAY};
 use crate::mc::Boot0;
+use crate::pmu::Pmu;
 
 // ── BAR indices (per nvkm_device_pci/pci.c) ─────────────────────
 
@@ -73,6 +74,15 @@ pub struct NvidiaDevice {
     pub regs: MmioRegion,
     pub bar1: MmioRegion,
     pub bar3: Option<MmioRegion>,
+    /// PMU attach state at probe: true iff the PMU engine is
+    /// enabled in `PMC_ENABLE` (see `Pmu::engine_enabled`). The
+    /// PMU runs VBIOS-loaded firmware — probe attaches to it, it
+    /// never stages firmware into it (G2). False means the engine
+    /// is held in reset (or GSP-owned on Ampere/Ada, by design)
+    /// and no PMU messaging is possible yet; probe does NOT fail
+    /// on false — the card still binds, and later gaps (G3/G12)
+    /// gate on this bit.
+    pub pmu_ready: bool,
     /// Stable per-card index. Assigned monotonically by `probe`; used
     /// by upper layers to refer to a specific card without holding a
     /// raw `Arc<NvidiaCard>`. Mirrors Nouveau's `drm_dev_register`
@@ -146,12 +156,22 @@ impl NvidiaDevice {
             }
         }
 
+        // PMU attach (G2): the PMU runs VBIOS-loaded firmware, so
+        // probe only checks the engine is enabled in PMC_ENABLE —
+        // it never resets the Falcon or stages firmware into it
+        // (Nouveau is `nofw` for the PMU on Maxwell/Pascal; see
+        // `pmu.rs`). A clear bit records "not ready" and probe
+        // continues; the card binds regardless.
+        // SAFETY: `regs` is the BAR0 window just mapped above.
+        let pmu_ready = unsafe { Pmu::new(&regs).engine_enabled() };
+
         Ok(Self {
             chip,
             boot0,
             regs,
             bar1,
             bar3,
+            pmu_ready,
             card_index,
             bus_device: *device,
         })

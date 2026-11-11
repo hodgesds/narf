@@ -43,7 +43,6 @@ use crate::mc::{
 use crate::mmu::{
     pde_encode_pt, pte_encode_4k, Aperture, PageSize, PTE_RO, PTE_VALID, PTE_VOLATILE,
 };
-use crate::pmu::{pmu_firmware_for, PMU_INIT_MAGIC};
 
 // ────────────────────────────────────────────────────────────────
 // PCI id-table coverage
@@ -369,19 +368,36 @@ kernel_test_in!(
 // PMU
 // ────────────────────────────────────────────────────────────────
 
-fn smoke_pmu_init_magic_matches_nouveau() -> TestResult {
-    // The PMU firmware writes a fixed token into MAILBOX0 when it
-    // finishes init. Cite nvkm/subdev/pmu/base.c::nvkm_pmu_init.
-    if PMU_INIT_MAGIC == 0 {
-        return TestResult::Fail("PMU init magic should be non-zero");
+fn smoke_pmu_enable_bit_matches_nouveau() -> TestResult {
+    // The PMU's PMC_ENABLE bit is 0x2000 (bit 13): `gk104_mc_reset[]`
+    // in nvkm/subdev/mc/gk104.c (`{ 0x00002000, NVKM_SUBDEV_PMU, 0,
+    // true }`), the reset map `gp100_mc` uses, tested by
+    // `nv04_mc_device_enabled` against BAR0+0x200. It must not
+    // collide with any other engine bit in the crate's table.
+    use crate::mc::{
+        PMC_ENABLE_PCE0, PMC_ENABLE_PDISP, PMC_ENABLE_PFIFO, PMC_ENABLE_PGRAPH, PMC_ENABLE_PMSENC,
+        PMC_ENABLE_PMSPDEC, PMC_ENABLE_PMU, PMC_ENABLE_PSEC,
+    };
+    if PMC_ENABLE_PMU != 0x2000 {
+        return TestResult::Fail("PMC_ENABLE_PMU should be 0x2000 per gk104_mc_reset");
     }
-    let req = pmu_firmware_for("gm200");
-    if req.image_path.is_empty() || req.sig_path.is_empty() {
-        return TestResult::Fail("firmware paths must be non-empty");
+    let others = [
+        PMC_ENABLE_PFIFO,
+        PMC_ENABLE_PGRAPH,
+        PMC_ENABLE_PSEC,
+        PMC_ENABLE_PCE0,
+        PMC_ENABLE_PMSPDEC,
+        PMC_ENABLE_PMSENC,
+        PMC_ENABLE_PDISP,
+    ];
+    for o in others {
+        if o == PMC_ENABLE_PMU {
+            return TestResult::Fail("PMC_ENABLE_PMU collides with another engine bit");
+        }
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/pmu", smoke_pmu_init_magic_matches_nouveau);
+kernel_test_in!("drivers/nvidia/pmu", smoke_pmu_enable_bit_matches_nouveau);
 
 // ────────────────────────────────────────────────────────────────
 // MMU
@@ -2162,67 +2178,15 @@ kernel_test_in!(
 );
 
 // ────────────────────────────────────────────────────────────────
-// PMU firmware staging (item 10)
+// PMU attach (G2) — the staging model is deleted, see pmu.rs:
+// Nouveau is `nofw` for the PMU on Maxwell/Pascal and
+// linux-firmware ships no `nvidia/*/pmu/` blobs, so there is no
+// firmware-path table or staging error type left to test. The
+// live-PMU attach is the PMC_ENABLE-bit check in
+// `smoke_pmu_enable_bit_matches_nouveau` (above); a live attach
+// needs real MMIO and has no hermetic fixture (see the FakeMmio
+// note at the top of this file).
 // ────────────────────────────────────────────────────────────────
-
-fn smoke_pmu_firmware_paths_per_asic() -> TestResult {
-    // Per-ASIC path lookups must return ASIC-specific filenames.
-    let m = pmu_firmware_for("gm200");
-    if !m.image_path.contains("gm200") {
-        return TestResult::Fail("gm200 image path should mention gm200");
-    }
-    if !m.desc_path.contains("desc") {
-        return TestResult::Fail("desc path missing 'desc'");
-    }
-    if !m.sig_path.contains("sig") {
-        return TestResult::Fail("sig path missing 'sig'");
-    }
-    let p = pmu_firmware_for("gp104");
-    if !p.image_path.contains("gp104") {
-        return TestResult::Fail("gp104 fw path should mention gp104");
-    }
-    // Turing 104/106/116/117 all share tu102 firmware.
-    let t = pmu_firmware_for("tu104");
-    if !t.image_path.contains("tu102") {
-        return TestResult::Fail("tu104 should share tu102 fw");
-    }
-    // Ada parts share ad102 firmware.
-    let a = pmu_firmware_for("ad104");
-    if !a.image_path.contains("ad102") {
-        return TestResult::Fail("ad104 should share ad102 fw");
-    }
-    // Unknown ASIC falls back to generic.
-    let u = pmu_firmware_for("xx999");
-    if u.image_path != "nvidia/pmu/image.bin" {
-        return TestResult::Fail("unknown ASIC should fall back");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/nvidia/pmu", smoke_pmu_firmware_paths_per_asic);
-
-fn smoke_pmu_stage_error_variants_distinct() -> TestResult {
-    use crate::pmu::PmuStageError;
-    // Three distinct error roots.
-    let a = PmuStageError::BadAlignment;
-    let b = PmuStageError::Falcon(crate::falcon::FalconError::IdleTimeout);
-    let c = PmuStageError::Falcon(crate::falcon::FalconError::HaltTimeout);
-    // Variant kinds compare structurally — at least one of the
-    // pairs must differ. (Falcon errors do compare equal between
-    // themselves via inner type.)
-    match (&a, &b) {
-        (PmuStageError::BadAlignment, PmuStageError::Falcon(_)) => {}
-        _ => return TestResult::Fail("expected BadAlignment vs Falcon variant"),
-    }
-    match (&b, &c) {
-        (PmuStageError::Falcon(_), PmuStageError::Falcon(_)) => {}
-        _ => return TestResult::Fail("Falcon variants share kind"),
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/nvidia/pmu",
-    smoke_pmu_stage_error_variants_distinct
-);
 
 fn smoke_pmu_ampere_ada_short_circuit_in_bringup() -> TestResult {
     // On Ampere/Ada the PMU is GSP-owned; bring_up is supposed to

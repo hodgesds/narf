@@ -19,7 +19,6 @@ narf-drivers         = { path = "../.." }
 narf-bus             = { path = "../../../bus" }
 narf-memory          = { path = "../../../memory" }
 narf-init            = { path = "../../../init" }
-narf-firmware        = { path = "../../../firmware" }
 narf-crypto          = { path = "../../../crypto" }
 
 [features]

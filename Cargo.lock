@@ -2036,7 +2036,6 @@ dependencies = [
  "narf-crypto",
  "narf-driver-runtime",
  "narf-drivers",
- "narf-firmware",
  "narf-init",
  "narf-kernel-test",
  "narf-memory",
