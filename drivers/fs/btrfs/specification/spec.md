@@ -195,6 +195,14 @@ trees, the more leaves the records of one commit's blocks reach), since
 rejoining leaves of a subvolume tree means COWing a sibling that a snapshot
 may share. The on-disk format is unchanged.
 
+The node cache (4,096 nodes, 64 MiB at 16 KiB) is bounded in two
+generations: fills and hits go to the young one, and when it holds half the
+bound the old one is dropped and the young one takes its place. A node in
+use survives any number of other fills
+(`smoke_btrfs_node_cache_keeps_what_is_used`). It used to be emptied
+outright when it filled, so one walk over more nodes than the bound left
+nothing for the next.
+
 The allocator carves from one in-memory copy of the committed free-space tree
 per filesystem (`allocator::FreeView`, Linux's per-block-group free-space
 cache), read from disk on first use and advanced by each commit with exactly

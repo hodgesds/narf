@@ -123,11 +123,26 @@ impl Drop for VolumeIo {
 /// samples `epoch` before its read and only inserts if no invalidation has
 /// happened since, so a racing write costs a skipped fill rather than a wrong
 /// answer.
+///
+/// The cache is bounded in two generations. Every fill and every hit lands
+/// in `young`; when `young` holds half the bound, `old` is dropped and
+/// `young` takes its place. A node used since the last turn-over therefore
+/// survives the next one, and only nodes nothing has touched for a whole
+/// generation go. (It used to be one map emptied when it reached the bound,
+/// so a walk over more nodes than the bound — every extent item of a large
+/// fragmented file, say — left nothing behind for the next one, which read
+/// it all from the device again, upper levels included.)
 #[derive(Debug, Default)]
 struct NodeCache {
-    entries: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
+    young: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
+    old: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
     epoch: u64,
 }
+
+/// One generation of the [`NodeCache`], as retired by a turn-over: dropped
+/// by the caller once the cache lock is released, since it frees up to half
+/// the cache's nodes.
+type RetiredNodes = BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>;
 
 /// Cached nodes. At a 16 KiB nodesize this bounds the cache at 4 MiB in
 /// kernel-test and 64 MiB in production, comfortably holding the working set a
@@ -163,9 +178,75 @@ impl NodeCache {
     /// Drop `logical` and advance the epoch, so any fill already in flight for
     /// it (or for anything else) declines to publish.
     fn invalidate(&mut self, logical: u64) {
-        self.entries.remove(&logical);
+        self.remove(logical);
         self.epoch = self.epoch.wrapping_add(1);
     }
+
+    /// The cached node at `logical`, which becomes young again.
+    fn get(&mut self, logical: u64) -> Option<(Arc<alloc::vec::Vec<u8>>, Option<RetiredNodes>)> {
+        if let Some(hit) = self.young.get(&logical) {
+            return Some((hit.clone(), None));
+        }
+        let hit = self.old.remove(&logical)?;
+        let retired = self.insert(logical, hit.clone());
+        Some((hit, retired))
+    }
+
+    /// Cache `node` at `logical`. Returns the generation this retired, if
+    /// it turned the cache over.
+    fn insert(&mut self, logical: u64, node: Arc<alloc::vec::Vec<u8>>) -> Option<RetiredNodes> {
+        self.old.remove(&logical);
+        let retired = (self.young.len() >= NODE_CACHE_MAX / 2
+            && !self.young.contains_key(&logical))
+        .then(|| core::mem::replace(&mut self.old, core::mem::take(&mut self.young)));
+        self.young.insert(logical, node);
+        retired
+    }
+
+    /// Drop the node cached at `logical`, if any.
+    fn remove(&mut self, logical: u64) {
+        self.young.remove(&logical);
+        self.old.remove(&logical);
+    }
+
+    /// Addresses of the cached nodes in `[from, end)`.
+    fn cached_in(&self, from: u64, end: u64) -> alloc::vec::Vec<u64> {
+        self.young
+            .range(from..end)
+            .chain(self.old.range(from..end))
+            .map(|(&addr, _)| addr)
+            .collect()
+    }
+
+    /// Test-only: whether a node read once per insert survives twice the
+    /// bound of other inserts, and whether the cache stays within its bound.
+    #[cfg(feature = "kernel-test")]
+    fn __test_keeps_what_is_used() -> bool {
+        let mut cache = NodeCache::default();
+        let node = || Arc::new(alloc::vec::Vec::new());
+        let hot = 7u64;
+        let _ = cache.insert(hot, node());
+        for cold in 0..2 * NODE_CACHE_MAX as u64 {
+            let _ = cache.insert(1000 + cold, node());
+            if cache.get(hot).is_none() || cache.young.len() + cache.old.len() > NODE_CACHE_MAX {
+                return false;
+            }
+        }
+        // What nothing used for a generation is gone; what was just put in
+        // is not.
+        let last = 1000 + 2 * NODE_CACHE_MAX as u64 - 1;
+        cache.get(1000).is_none() && cache.get(last).is_some() && {
+            cache.remove(last);
+            cache.invalidate(hot);
+            cache.get(last).is_none() && cache.get(hot).is_none() && cache.epoch == 1
+        }
+    }
+}
+
+/// Test-only: [`NodeCache::__test_keeps_what_is_used`].
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_node_cache_keeps_what_is_used() -> bool {
+    NodeCache::__test_keeps_what_is_used()
 }
 
 /// Mutable volume metadata guarded by one lock (never held across I/O).
@@ -1690,13 +1771,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // full-node checksum verification; the clone is a memcpy against an
         // I/O plus a checksum over the whole node.
         let epoch = {
-            let cache = self.nodes.lock();
-            if let Some(hit) = cache.entries.get(&logical) {
-                return Ok(hit.clone());
+            let mut cache = self.nodes.lock();
+            if let Some((hit, retired)) = cache.get(logical) {
+                drop(cache);
+                drop(retired);
+                return Ok(hit);
             }
             cache.epoch
         };
-        let _ = epoch;
 
         let mut buf = vec![0u8; self.nodesize()];
         let copies = self.logical_read_copies(logical)?;
@@ -1726,18 +1808,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             // failed one is retried from another mirror, and caching it would
             // make a transient bad mirror permanent for this mount.
             let mut cache = self.nodes.lock();
-            if cache.epoch == epoch {
-                // A write landed while this read was in flight if the epoch
-                // moved; the bytes in hand may already be stale, so drop them
-                // rather than publish them.
-                if cache.entries.len() >= NODE_CACHE_MAX {
-                    // Crude but bounded, and the working set a commit revisits
-                    // sits far below the cap — an LRU's bookkeeping would cost
-                    // more here than the misses it saves.
-                    cache.entries.clear();
-                }
-                cache.entries.insert(logical, shared.clone());
-            }
+            // A write landed while this read was in flight if the epoch
+            // moved; the bytes in hand may already be stale, so drop them
+            // rather than publish them.
+            let retired = (cache.epoch == epoch)
+                .then(|| cache.insert(logical, shared.clone()))
+                .flatten();
+            drop(cache);
+            drop(retired);
             return Ok(shared);
         }
         Err(FsError::InvalidData)
@@ -2886,22 +2964,20 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if cache.epoch != epoch {
             return;
         }
-        if cache.entries.len() >= NODE_CACHE_MAX {
-            cache.entries.clear();
-        }
-        cache.entries.insert(logical, Arc::new(buf.to_vec()));
+        let retired = cache.insert(logical, Arc::new(buf.to_vec()));
+        drop(cache);
+        drop(retired);
     }
 
     /// Drop the cached copy of a tree block nothing references any more: one
     /// a commit replaced, or one a batch wrote and then replaced again.
     ///
-    /// The cache is bounded by emptying it when it fills, so every dead
-    /// block left in it brings the next emptying — and the re-reading of
-    /// every live node — closer. A reader still walking a tree that holds
-    /// the block reads it back from the device, where it stays intact until
-    /// its space is unpinned.
+    /// The cache is bounded, so every dead block left in it takes the place
+    /// of a live one. A reader still walking a tree that holds the block
+    /// reads it back from the device, where it stays intact until its space
+    /// is unpinned.
     pub(crate) fn forget_node(&self, logical: u64) {
-        self.nodes.lock().entries.remove(&logical);
+        self.nodes.lock().remove(logical);
     }
 
     /// Write one metadata node and keep it cached.
@@ -2959,12 +3035,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let end = logical.saturating_add(len as u64);
         let from = logical.saturating_sub(node.saturating_sub(1));
         let mut cache = self.nodes.lock();
-        let stale: alloc::vec::Vec<u64> = cache
-            .entries
-            .range(from..end)
-            .map(|(&addr, _)| addr)
-            .collect();
-        for addr in stale {
+        for addr in cache.cached_in(from, end) {
             cache.invalidate(addr);
         }
         cache.epoch = cache.epoch.wrapping_add(1);
