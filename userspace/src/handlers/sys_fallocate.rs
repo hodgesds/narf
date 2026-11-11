@@ -105,7 +105,10 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
         return;
     }
     let target_end = offset.saturating_add(len);
-    let outcome = (|| -> Result<(), narf_filesystem::FsError> {
+    // Excluded from writeback, with the file cache brought into line with
+    // whatever the mode did to the file's contents and size afterwards: see
+    // `mapped_file::fallocate_serialized`.
+    let change = || -> Result<(), narf_filesystem::FsError> {
         let ops = endpoint.ops.clone();
         match poll_blocking(ops.fallocate(mode as u32, offset, len)) {
             Some(Ok(())) => return Ok(()),
@@ -132,7 +135,15 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
             return Err(narf_filesystem::FsError::NoSpace);
         }
         Ok(())
-    })();
+    };
+    let outcome = crate::mapped_file::fallocate_serialized(
+        &endpoint.ops,
+        mode,
+        offset,
+        len,
+        change,
+        |outcome| outcome.is_ok(),
+    );
     match outcome {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(narf_filesystem::FsError::Unsupported) => ctx.set_return(errno_ret(EOPNOTSUPP)),

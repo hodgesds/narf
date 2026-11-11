@@ -1320,6 +1320,8 @@ fn read_path_and_file_from_vfs(
         }
         filled = filled.saturating_add(n as u64);
     }
+    // As every other read of file data: see `mapped_file::overlay_dirty`.
+    crate::mapped_file::overlay_dirty(&file, 0, &mut buf);
     Some((buf, file))
 }
 

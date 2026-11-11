@@ -1838,30 +1838,168 @@ owner row records the flags and keeps them across splits and moves:
 
 Generic filesystem mappings that cannot expose page-cache frames retain one
 canonical fallback page per filesystem device, anchored file identity and offset, plus an
-exact clean-byte snapshot. `fsync(2)` and `msync(2)` compare against that
-snapshot, write each changed canonical page once even when it has overlapping
-aliases, and advance the snapshot only after the full page write succeeds.
-Clean pages perform no filesystem write; the comparison is byte-exact rather
-than hash-based so collision cannot suppress persistence.
+exact clean-byte snapshot: the bytes last read from, or written to, the file.
+A page is dirty when it differs from its snapshot. Writeback writes each
+changed canonical page once even when it has overlapping aliases, and advances
+the snapshot to the bytes it WROTE — never to the page as it stands when the
+write completes — so a store that lands while the page is being written is
+still owed to the file. Clean pages perform no filesystem write; the comparison
+is byte-exact rather than hash-based so collision cannot suppress persistence.
 Filesystem device identity namespaces retained anchors and generation counters:
 a different filesystem cannot reuse idle pages when an anchor address is recycled.
 
-The fallback cache is coherent with the `write(2)` family and carries a
-writeback lifecycle, matching Linux's single page cache. Every successful
-`write`/`writev`/`pwrite64`/`pwritev*`/`copy_file_range`/`sendfile`-style
-transfer — including the AIO `io_submit` PWRITE/PWRITEV helpers — folds its
-bytes into each cached page it overlaps — frame and clean
-snapshot together, without refreshing the page's cache generation — so a
-live mapping observes the write and a later whole-page writeback cannot
-resurrect pre-write bytes. Dirty pages (frame ≠ snapshot) are never
-discarded while their file object lives: not by cache retirement, not by
-publication losing a race, and not by retention-cap eviction, which reclaims
-clean idle pages only. They are committed by the first of `fsync`/`msync`
-(which also sweep pages of the same file owned by other address spaces),
-`munmap` of an overlapping mapping, address-space teardown, `syncfs` (the
-fd's file), or `sync` (every cached file). A dirty page whose generation a
-filesystem can no longer vouch for is adopted as canonical on the next
-publication rather than dropped; its pending writeback decides its bytes.
+**Writeback of shared file pages** follows Linux: the store changes a page of
+the file cache and nothing else, and the data reaches the file later, from
+whoever's job that is.
+
+- *Ownership.* A dirty page belongs to its FILE, not to the address space that
+  stored to it. Every file with a mapped or unwritten cached page has one cache
+  entry, and the entry holds the file open. The last `munmap`, the last
+  `close`, an `execve` and the death of every process that mapped the file
+  therefore leave a dirty page in the cache, listed as idle-dirty, until it is
+  written; the entry — and its hold on the file — goes when the file has no
+  mapped and no unwritten page left. A page is written through an open whose
+  descriptor was open for writing when a mapping of it reached the page (the
+  first open of a file may be read-only, and on 9p or FUSE could not commit it).
+- *Never discarded.* A dirty page is not discarded by cache retirement, by a
+  publication losing a race, or by retention-cap eviction, which reclaims
+  clean idle pages only. It leaves the cache written, truncated away, or
+  dropped after repeated write failure (below). A dirty idle page whose
+  generation a filesystem can no longer vouch for is adopted as canonical by
+  the next publication rather than replaced by a stale read of the file.
+- *Recorded state, not comparison, on every path but writeback.* A page
+  records whether a mapping that can store to the file — a shared mapping
+  of a descriptor open for writing, Linux `VM_SHARED | VM_MAYWRITE` — has
+  held it since it was last known clean. Fault, `mmap`, `munmap` and
+  teardown consult that bit; none of them compares a page's bytes or walks
+  the cache. A page no such mapping has held is clean by record: its last
+  unmap lists it as idle-clean (or frees it), writeback never visits it,
+  and a read of the file skips it. A page one has held is listed for
+  writeback at its last unmap, and only writeback — outside every lock, a
+  batch at a time — compares it, writes it if it differs, and marks it
+  known clean again.
+- *What bounds the cache.* Mapped pages are bounded by the mappings that
+  hold them. Idle-clean pages are kept for reuse on a list capped at 1,024
+  pages; listing one past the cap evicts one other from the list, so
+  eviction is O(victims) and independent of the cache's size. Pages
+  waiting for writeback are not capped by eviction — they are the only
+  copy of their data — but by the dirtier throttle below; past it,
+  `mmap` of a writable shared file mapping and `munmap` wait for the
+  flusher.
+- *Nothing is written at `munmap`, `execve`, `exit` or a fatal signal*, and
+  none of them waits for the filesystem (`zap_pte_range` only moves the PTE
+  dirty bit to the folio). Address-space teardown runs wherever the last
+  reference drops — the executor thread, for an exit — and does no I/O at all.
+  A `fork` child inherits its parent's mappings and costs nothing for them
+  when it exits or execs.
+- *Who writes.* One kernel task, the flusher (`wb_workfn`), woken every 5 s
+  (`dirty_writeback_centisecs`) or by a kick from `munmap`, teardown or a
+  throttled dirtier. Each pass writes every idle-dirty page — it can change no
+  further and is memory the cache cannot release until it is clean — and every
+  still-mapped page that has been dirty for 30 s (`dirty_expire_centisecs`).
+  `fsync`/`fdatasync` write the whole file's dirty pages first, whoever
+  dirtied them, then call the filesystem's own fsync; `msync(MS_SYNC)` does
+  the same for the file range each VMA covers; `sync`, `syncfs` (every file on
+  the descriptor's device), an unmount and the pre-shutdown sync write every
+  file's, including files nothing has open any more. The flusher is an
+  ordinary task that may run on any CPU; it exists from the first writable
+  shared file mapping until the last user task is gone.
+- *One batch.* Every writer runs the same engine. Per batch it takes the
+  file's writeback lock; pins up to 256 pages (1 MiB) under the cache lock
+  without comparing or copying anything; with the cache lock released
+  compares each with its snapshot and copies the dirty ones, joining
+  neighbours; writes each run of neighbours with ONE filesystem operation,
+  clamped to the file's current size; then installs the written bytes as the
+  new snapshots and unpins. A clean page between two dirty runs is not
+  written to bridge them: its snapshot is the last content the cache saw,
+  not proof of what the file holds, and rewriting it could put stale bytes
+  over newer ones. Between batches the file lock is released and there is a
+  scheduling point in every context: the flusher returns to the executor,
+  and a syscall (`fsync`, `msync`, `sync`) yields its CPU to the tasks
+  queued behind it and reports an RCU quiescent state (`cond_resched`). A
+  filesystem whose writes complete inside one poll would otherwise turn a
+  long flush into one uninterrupted run. The mapped-page sweep examines at
+  most 16,384 pages per pass and resumes where it stopped.
+- *Size changes.* `ftruncate`, `truncate`, `O_TRUNC` and `fallocate` take the
+  same per-file lock around the filesystem operation and the invalidation that
+  follows (Linux `invalidate_lock`, and the writeback wait in
+  `truncate_inode_pages_range`): cached pages past the new EOF are dropped,
+  dirty or not, and the tail of the page the EOF falls in is zeroed;
+  `PUNCH_HOLE`/`ZERO_RANGE` zero the range in the cache; `COLLAPSE_RANGE`/
+  `INSERT_RANGE` write the file's dirty pages out first and drop the unmapped
+  ones from the offset on. A batch therefore completes before a size change
+  starts or begins after its invalidation, and can neither write a page the
+  truncate discarded nor extend the file again. Bytes past the EOF the
+  filesystem reports are never written; an unmapped page that owes only such
+  bytes for three passes running is dropped — not on first sight, because a
+  reported size can lag a write that has just extended the file.
+- *`write(2)`.* Every successful `write`/`writev`/`pwrite64`/`pwritev*`/
+  `copy_file_range`/`sendfile`-style transfer — including the AIO `io_submit`
+  PWRITE/PWRITEV helpers — folds its bytes into each cached page it overlaps,
+  so a live mapping observes the write and it is the last writer of that
+  range. The bytes join the page's snapshot too (the page is not written back
+  for them, and a range a mapping had dirtied and the write then overwrote is
+  settled: file, page and snapshot agree) unless a batch held the page, or
+  wrote it, after the write began: then the order on the file is unknown, the
+  snapshot is left alone, and the page — now different from it — is written
+  again by the next pass.
+- *Coherence.* `read`/`pread64`/`readv`/`preadv*`, the AIO PREAD helper, a
+  private file fault, an eager private mapping and the `execve` image reads
+  take, for every cached page in range, the bytes that differ from its
+  snapshot, so they see a `MAP_SHARED` store that has not been written back.
+  A second `MAP_SHARED` mapping gets the same page. `sendfile`/`splice` and
+  `copy_file_range` write the source's (and the latter also the
+  destination's) dirty pages out before they start.
+- *Bounded dirty memory.* Idle-dirty pages are counted. Above an eighth of
+  memory a task creating a writable shared file mapping, or returning from
+  `munmap`, waits killably for the flusher (`balance_dirty_pages`), for at
+  most two seconds per call. Teardown and the flusher never enter that wait.
+- *Errors.* A failed background write is recorded on the file and reported
+  once, with its own errno, by the next `fsync`/`msync` of that file; a failed
+  write in `fsync`/`msync` itself is that call's result. After three failed
+  passes in a row a file's idle-dirty pages are dropped with a console line
+  naming its device, inode and the errno, so a filesystem that keeps refusing
+  cannot pin memory or the file for ever.
+
+`LINUX-GAP`s of this design, with the intended fix:
+
+- What is recorded is that a page MAY be dirty (a writable mapping held it);
+  that it IS dirty is still found by comparison, in writeback only: a 4 KiB
+  compare for every page of a writable shared mapping the sweep visits, and
+  a second copy of every cached page. The store itself should be recorded,
+  from the page tables: map a clean shared file page read-only even in a
+  writable mapping, mark it dirty in the write fault
+  (`page_mkwrite`/`folio_mark_dirty`), and write-protect it again when
+  writeback starts (`folio_clear_dirty_for_io` → `page_mkclean`). That needs
+  a write-protect and a write-notify fault for `SHARED | EXTERNAL_REFS`
+  regions in `memory/` — a per-PTE permission below the VMA's, a fault hook
+  that upgrades it, and a way for the cache to write-protect every alias of
+  a frame (the reverse map this change adds finds the address spaces) —
+  after which a clean page costs nothing and the snapshot goes away.
+- `mtime`/`ctime` move when writeback writes the page, not at the first store
+  (Linux `file_update_time` from `page_mkwrite`). Fixed by the same fault.
+- A background write error is reported to the first `fsync`/`msync` caller of
+  the file, not once to every open file description (`errseq_t` keeps a
+  cursor per `struct file`).
+- `write(2)` does not take the per-file lock. A batch that copied a page
+  before a `write(2)` to it can reach the file after that write; the file then
+  holds the older bytes until the next pass rewrites the page (reads stay
+  correct throughout, since they overlay the page). Linux has one copy of the
+  data and no such window.
+- For the same reason a `write(2)` is not ordered against `ftruncate` or a
+  hole punch of the same file as far as the cache is concerned (Linux holds
+  `i_rwsem` across both). Two threads racing a `write(2)` against a truncate
+  or a hole punch of the very pages one of them maps can leave such a page
+  holding the loser's bytes while it counts as clean. The fix is the write
+  path taking the per-file lock, as the size changes do.
+- Bytes a mapping stores past EOF in the file's last page are not zeroed at
+  writeback (`block_write_full_folio` zeroes them on every call) or when the
+  file is extended (`pagecache_isize_extended`); if the file later grows
+  over them they are written. Zeroing them needs the old size sampled
+  atomically with the size change, which the per-file lock cannot give
+  while `write(2)` does not take it.
+- An unmount writes every file's dirty pages, not only that mount's: entries
+  are grouped by device number, which names a filesystem and not a mount.
 
 Unlocked generic `MAP_SHARED` publication is lazy like Linux
 `generic_file_mmap`: it publishes empty Region and writeback prefixes rather
@@ -1890,10 +2028,20 @@ fault answer has already acquired the external alias reference that memory
 releases on failed publication, `munmap`, replacement, or address-space
 teardown. `msync(MS_SYNC)` drives the mapped file's `fsync`, which writes
 dirty direct folios before returning. On shrink, the filesystem calls the
-installed truncation bridge; it walks every live address-space owner bucket
-and, under VMA → shared-owner ordering, unmaps every complete page beyond
-the new EOF before the filesystem can evict that folio. The partial EOF page
-remains aliased and is zeroed by the filesystem.
+installed truncation bridge. Every mapping-owner row is enrolled in its
+file's reverse map (Linux `address_space->i_mmap`): the bridge visits only
+the address spaces that map the file and, under VMA → shared-owner ordering,
+unmaps every complete page beyond the new EOF before the filesystem can
+evict that folio. A file nobody maps — every `open(O_TRUNC)` of an ordinary
+file — is decided by one atomic load: no address space is looked at and no
+lock is taken. The partial EOF page remains aliased and is zeroed by the
+filesystem.
+
+`LINUX-GAP`: a mapper's VMA transaction is an interrupts-off spinlock held
+for the whole of each VMA operation in that address space (`memory/`), so a
+truncate of a file still waits, spinning, for a mapper that is in the
+middle of a long `munmap` or population. Linux takes `i_mmap_rwsem` and the
+page-table locks, which no VMA operation holds across unbounded work.
 
 The equivalent internal bridge for `AF_NETLINK`/`NETLINK_NETFILTER` accepts
 only a live `NetfilterAdminHandle` whose immutable namespace id equals the

@@ -82,20 +82,24 @@ fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u
 #[cfg(feature = "native-ring")]
 pub(crate) fn munmap_native_v1(as_ref: &AddressSpace, base: u64) -> Result<(), ()> {
     let base = VirtAddr::new(base);
-    let region_len = as_ref.lookup(base).map(|region| region.len).unwrap_or(0);
-    let flush_files =
-        crate::mapped_file::file_ops_in_range(as_ref.identity(), base.as_u64(), region_len);
     as_ref
         .unmap_region(base)
         .map(|_| ())
         .or_else(|_| as_ref.unmap_huge_region(base))
         .map_err(|_| ())?;
     crate::mapped_file::unmap_current(base.as_u64());
-    // Commit the removed mapping's dirty fallback pages (see sys_munmap).
-    for ops in &flush_files {
-        let _ = crate::mapped_file::flush_shared_pages_for_ops(ops);
-    }
+    // The mapping's dirty pages stay in the file cache (see sys_munmap).
+    crate::mapped_file::unmapped();
     Ok(())
+}
+
+/// After a successful unmap: tell the flusher about any dirty file pages
+/// it left behind, and — `balance_dirty_pages` — wait for the flusher if
+/// dirtiers have got too far ahead of it. Killable, bounded, and after the
+/// unmap is complete: the wait holds nothing.
+fn left_dirty_pages_behind() {
+    crate::mapped_file::unmapped();
+    crate::mapped_file::throttle_dirtier();
 }
 
 pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
@@ -122,13 +126,16 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Snapshot the files mapped in the range before the punch retires
-    // their owner rows: munmap is a writeback lifecycle point for the
-    // generic fallback cache, whose dirty pages only the cache itself can
-    // still reach once the VMA is gone (#676). Linux keeps such pages in
-    // its page cache past munmap; NARF's fallback has no background
-    // flusher, so the bytes are committed here instead.
-    let flush_files = crate::mapped_file::file_ops_in_range(as_ref.identity(), base.as_u64(), len);
+    // `munmap` writes nothing. Linux `unmap_region` → `zap_pte_range` moves
+    // each PTE's dirty bit onto its folio and leaves the folio in the
+    // inode's page cache for the flusher. Here the unmap hands every dirty
+    // page to its file's cache entry (`release_shared_file_page`), which
+    // keeps the file open, and the writeback task commits it — or `msync`,
+    // `fsync`, `sync` do, sooner. This syscall used to write them itself,
+    // every cached page of every file in the range, one filesystem
+    // operation per page with no scheduling point: seconds to minutes on
+    // one CPU for a few thousand pages, with every task queued there
+    // waiting behind it.
 
     // Linux reaches SysV accounting only through `shm_vm_ops.close`. Inspect
     // the affected VMA range while holding the same per-mm transaction used by
@@ -148,9 +155,7 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
     });
     if let Some(result) = fast_result {
         if result.is_ok() {
-            for ops in &flush_files {
-                let _ = crate::mapped_file::flush_shared_pages_for_ops(ops);
-            }
+            left_dirty_pages_behind();
         }
         ctx.set_return(match result {
             Ok(()) => SyscallReturn::ok(0),
@@ -174,9 +179,7 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
     });
     match result {
         Ok(()) => {
-            for ops in &flush_files {
-                let _ = crate::mapped_file::flush_shared_pages_for_ops(ops);
-            }
+            left_dirty_pages_behind();
             ctx.set_return(SyscallReturn::ok(0));
         }
         // EINVAL for a malformed range, ENOMEM when the teardown itself

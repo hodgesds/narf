@@ -257,6 +257,15 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // `generic_shutdown_super` → `sync_filesystem`: a dirty `MAP_SHARED`
+    // page of a file on this mount must reach it before the mount goes. The
+    // cache's entry holds the file — and through it the filesystem — open,
+    // so this is also what lets the unmount release the filesystem: once a
+    // file's pages are written and unmapped its entry is dropped. (Every
+    // file is written, not only this mount's: the cache groups files by
+    // device number, which names a filesystem and not one of its mounts.)
+    crate::mapped_file::sync_all_files(None);
+
     let auth = narf_filesystem::bootstrap_mount_authority();
     // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
     // the registry uses internally to mint the per-mount handle.
