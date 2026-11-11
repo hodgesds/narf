@@ -2209,6 +2209,24 @@ or by the `cfg80211_cqm_rssi_update` range for a list. `level_dbm()` gives
 the averaged level, and `reconfigured()` clears the last event. mt76 uses
 it. Test: `wireless/cqm`.
 
+`rfkill.rs` is cfg80211's per-wiphy rfkill. Each wiphy is one `wlan`
+radio named `phyN`:
+
+- It is registered when the wiphy's first interface registers and
+  unregistered when the last one leaves. A wiphy seen before the core is
+  connected is registered on `install(Backend { register, unregister })`.
+- `narf-drivers-wireless` connects it to the platform rfkill core
+  (`register_radio_indexed`), so `/dev/rfkill`, `/sys/class/rfkill` and
+  the airplane key drive it.
+- `set_soft_blocked(index, true)` is `cfg80211_rfkill_set_block`. Every
+  connected interface of the wiphy disassociates from its own task and
+  reports a locally generated DISCONNECT (reason 3).
+- While the wiphy is blocked, every nl80211 do-operation on its netdevs
+  other than DISCONNECT is -ERFKILL: that radio's interfaces are shut down
+  (`cfg80211_rfkill_block_work`).
+- Tests: `wireless/rfkill` and
+  `smoke_nl80211_rfkill_blocked_wiphy_refuses_scan_and_connect`.
+
 ### 3.4.1 CCMP packet helpers (`ccmp.rs`)
 
 `build_aad` authenticates the three addresses, fragment number and optional

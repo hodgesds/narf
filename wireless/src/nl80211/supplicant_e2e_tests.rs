@@ -941,3 +941,72 @@ kernel_test_in!(
     "wireless/nl80211",
     smoke_nl80211_wpa_supplicant_wpa3_sae_offload_end_to_end
 );
+
+static RFKILL_HANDLES: IrqSafeSpinLock<Vec<String>> = IrqSafeSpinLock::new(Vec::new());
+fn rfkill_register(name: &str) -> usize {
+    let mut names = RFKILL_HANDLES.lock();
+    names.push(name.into());
+    names.len() - 1
+}
+fn rfkill_unregister(_: usize) {}
+
+/// The SAE station's wiphy is one rfkill radio. Soft-blocked, the
+/// supplicant's CONNECT and TRIGGER_SCAN are -ERFKILL (its interfaces are
+/// shut down) while DISCONNECT still reaches the driver; cleared, they are
+/// admitted again.
+fn smoke_nl80211_rfkill_blocked_wiphy_refuses_scan_and_connect() -> TestResult {
+    register();
+    crate::rfkill::__test_reset();
+    RFKILL_HANDLES.lock().clear();
+    let iface: Arc<dyn crate::WirelessNetIface> = Arc::new(SaeStub {
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+        connected: IrqSafeSpinLock::new(None),
+    });
+    narf_net::iface::register(SAE_NAME, SAE_MAC, |_, _| Ok(()));
+    crate::registry::register(iface.clone());
+    crate::rfkill::install(crate::rfkill::Backend {
+        register: rfkill_register,
+        unregister: rfkill_unregister,
+    });
+    let Some(ifindex) = narf_net::netlink_route::ifindex_for_name(SAE_NAME) else {
+        return TestResult::Fail("SAE stub has no ifindex");
+    };
+    let root = RequestContext {
+        init_net_admin: true,
+        net_admin: true,
+        ..RequestContext::default()
+    };
+    let Some(handle) = RFKILL_HANDLES
+        .lock()
+        .iter()
+        .position(|name| name.starts_with("phy"))
+    else {
+        return TestResult::Fail("wiphy not registered as an rfkill radio");
+    };
+    let mut scan = ifindex_attr(ifindex);
+    let mut ssids = Vec::new();
+    push_attr(&mut ssids, 1, &[]);
+    push_attr(&mut scan, 45 | NLA_F_NESTED, &ssids);
+    let connect = wpa_supplicant_sae_connect(ifindex, WPA3_ONLY, 2412, SAE_PASSWORD);
+    const ERFKILL: i32 = 132;
+    crate::rfkill::set_soft_blocked(handle, true);
+    let blocked = send(CONNECT, 5, &connect, root) == Err(ERFKILL)
+        && send(SCAN, 5, &scan, root) == Err(ERFKILL)
+        && send(DISCONNECT, 5, &ifindex_attr(ifindex), root) != Err(ERFKILL);
+    crate::rfkill::set_soft_blocked(handle, false);
+    let unblocked = send(SCAN, 5, &scan, root) != Err(ERFKILL);
+    crate::rfkill::__test_reset();
+    CACHE.lock().retain(|c| c.name != SAE_NAME);
+    if !blocked {
+        return TestResult::Fail("blocked wiphy admitted CONNECT/SCAN, or refused DISCONNECT");
+    }
+    if !unblocked {
+        return TestResult::Fail("cleared rfkill still refuses SCAN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211",
+    smoke_nl80211_rfkill_blocked_wiphy_refuses_scan_and_connect
+);

@@ -55,6 +55,7 @@ const ENOENT: i32 = 2;
 const EEXIST: i32 = 17;
 const ERANGE: i32 = 34;
 const EALREADY: i32 = 114;
+const ERFKILL: i32 = 132;
 const SCAN: u8 = 33;
 const GET_SCAN: u8 = 32;
 const CONNECT: u8 = 46;
@@ -1361,6 +1362,10 @@ fn route(
     let admin = authority(&context, iface.as_ref())?;
     if command == DISCONNECT {
         station::check_owner(iface.name(), context.portid)?;
+    } else if crate::rfkill::blocked(iface.wiphy_id()) {
+        // An rfkill-blocked wiphy has its interfaces shut down
+        // (`cfg80211_rfkill_block_work`); bringing one up is -ERFKILL.
+        return Err(ERFKILL);
     }
     let operation = parse_operation_caps(
         command,

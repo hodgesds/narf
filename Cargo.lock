@@ -2576,6 +2576,7 @@ dependencies = [
  "narf-crypto",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-drivers-platform",
  "narf-drivers-qcom-soc",
  "narf-drivers-sdio",
  "narf-drivers-spi",
