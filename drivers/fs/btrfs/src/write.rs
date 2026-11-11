@@ -1212,9 +1212,12 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // ── Path-COW the fs tree: drop only intersected EXTENT_DATA, add the new tiling,
     //    and update the inode (found via a lookup, not a full tree read) —
     //    COWing only the touched paths rather than rebuilding the whole tree. ──
+    // An absorbed item whose key a new extent takes is replaced by that
+    // extent's upsert; deleting it first would only make the leaf's rewrite
+    // a re-tiling instead of an overwrite of one item ([`patch_leaf`]).
     let mut edits: Vec<Edit> = converted.edits;
     for (i, (key, _)) in extents.iter().enumerate() {
-        if affected[i] {
+        if affected[i] && !new_eds.iter().any(|(new, _)| new == key) {
             edits.push(Edit::Delete(*key));
         }
     }
@@ -2546,6 +2549,44 @@ pub(crate) fn cow_leaf_apply(
     retile_leaf(leaf, leaf_items(leaf)?, edits, nodesize)
 }
 
+/// A copy of `leaf` with the bodies of `edits` written over the items they
+/// replace — when every edit replaces an existing item by a body of the same
+/// length, which is what an overwrite stages: an `EXTENT_DATA` item
+/// repointed, an `INODE_ITEM` updated. No item moves, so nothing needs
+/// decoding and re-tiling (an allocation and a copy per item of the leaf).
+/// `None` when any edit inserts, deletes or resizes an item.
+fn patch_leaf(leaf: &[u8], edits: &[Edit]) -> Result<Option<Vec<u8>>, FsError> {
+    let n = nritems(leaf)? as usize;
+    let mut spans: Vec<(usize, &[u8])> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let Edit::Upsert(key, body) = edit else {
+            return Ok(None);
+        };
+        let slot = btree::leaf_lower_bound(leaf, n, key)?;
+        if slot >= n || leaf_item_key(leaf, slot)? != *key {
+            return Ok(None);
+        }
+        let (off, size) = leaf_item_span(leaf, slot)?;
+        if size != body.len() {
+            return Ok(None);
+        }
+        spans.push((HEADER_SIZE + off, body.as_slice()));
+    }
+    let mut out = leaf.to_vec();
+    for (at, body) in spans {
+        out.get_mut(at..at + body.len())
+            .ok_or(FsError::InvalidData)?
+            .copy_from_slice(body);
+    }
+    Ok(Some(out))
+}
+
+/// Test-only: [`patch_leaf`].
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_patch_leaf(leaf: &[u8], edits: &[Edit]) -> Result<Option<Vec<u8>>, FsError> {
+    patch_leaf(leaf, edits)
+}
+
 /// Apply `edits` to a leaf's `items` and re-tile the result into as many
 /// leaves as it needs.
 ///
@@ -3233,6 +3274,8 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 }
             }
             retile_leaf(&leaf, items, group, self.nodesize)?
+        } else if let Some(patched) = patch_leaf(&leaf, group)? {
+            alloc::vec![patched]
         } else {
             cow_leaf_apply(&leaf, group, self.nodesize)?
         };

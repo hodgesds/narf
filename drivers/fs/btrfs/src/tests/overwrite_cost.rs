@@ -285,3 +285,68 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_crc32c_sliced_matches_bytewise
 );
+
+/// Replacing items by bodies of the same length patches the leaf in place
+/// with the same result as re-tiling it; anything that inserts, deletes or
+/// resizes an item is left to the re-tiling.
+fn smoke_btrfs_patch_leaf_matches_retile() -> TestResult {
+    use crate::write::{Edit, __test_patch_leaf, cow_leaf_apply};
+    let vol = match mount_writable(writable_sparse(FIXTURE_TALL_SPARSE)) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("patch fixture did not mount"),
+    };
+    // Any leaf with several items: the leftmost of the root tree.
+    let (root_tree, _) = vol.root_tree_root();
+    let Some(Ok(cursor)) = poll_once(btree::Cursor::seek(
+        &*vol,
+        root_tree,
+        &BtrfsKey::new(0, 0, 0),
+    )) else {
+        return TestResult::Fail("patch: root tree unreadable");
+    };
+    let Ok(Some((items, _))) = cursor.leaf() else {
+        return TestResult::Fail("patch: empty root tree");
+    };
+    if items.len() < 3 {
+        return TestResult::Fail("patch: leaf too small");
+    }
+    // The same items in a leaf of this driver's own packing.
+    let nodesize = vol.nodesize();
+    let build: Vec<Edit> = items
+        .iter()
+        .map(|(key, body)| Edit::Upsert(*key, body.clone()))
+        .collect();
+    let leaf = match cow_leaf_apply(&alloc::vec![0u8; nodesize], &build, nodesize) {
+        Ok(mut leaves) if leaves.len() == 1 => leaves.remove(0),
+        _ => return TestResult::Fail("patch: could not build the leaf"),
+    };
+    let flipped = |body: &[u8]| body.iter().map(|b| !b).collect::<Vec<u8>>();
+    let (first, last) = (&items[0], &items[items.len() - 1]);
+    let same_size = [
+        Edit::Upsert(first.0, flipped(&first.1)),
+        Edit::Upsert(last.0, flipped(&last.1)),
+    ];
+    let retiled = match cow_leaf_apply(&leaf, &same_size, nodesize) {
+        Ok(mut leaves) if leaves.len() == 1 => leaves.remove(0),
+        _ => return TestResult::Fail("patch: re-tiling failed"),
+    };
+    match __test_patch_leaf(&leaf, &same_size) {
+        Ok(Some(patched)) if patched == retiled => {}
+        _ => return TestResult::Fail("patch: patched leaf differs from the re-tiled one"),
+    }
+    let mut longer = first.1.clone();
+    longer.push(0);
+    let absent = BtrfsKey::new(u64::MAX - 1, 1, 0);
+    for edits in [
+        alloc::vec![Edit::Upsert(first.0, longer)],
+        alloc::vec![Edit::Upsert(absent, alloc::vec![0u8; 4])],
+        alloc::vec![Edit::Delete(first.0)],
+    ] {
+        if !matches!(__test_patch_leaf(&leaf, &edits), Ok(None)) {
+            return TestResult::Fail("patch: a resize, insert or delete was patched in place");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_patch_leaf_matches_retile);

@@ -123,7 +123,11 @@ blocks rewritten before it returns; there is no delayed allocation.
 extent items.
 
 Tree walks (`btree::Cursor`, `last_before`, `find_item`) hold the nodes on
-their path by reference to the node cache and never copy one.
+their path by reference to the node cache and never copy one. A path COW
+whose edits to a leaf only replace items by bodies of the same length (an
+overwrite's `EXTENT_DATA` and `INODE_ITEM`) patches a copy of the leaf
+instead of decoding and re-tiling its items (`write::patch_leaf`,
+`smoke_btrfs_patch_leaf_matches_retile`).
 
 Uncompressed reads covered entirely by valid data checksums retain windows up to
 128 KiB in the shared 32 MiB extent cache. Keys include shared-core identity,
