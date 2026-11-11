@@ -935,6 +935,40 @@ impl<P: Port> Packet<P> {
         self.reclaim();
         Ok(())
     }
+    /// `wow.c::ath9k_suspend`'s interrupt switch on a running owner with
+    /// nothing in flight: `wow_intr_before_sleep` is the retained full mask;
+    /// only `ATH9K_INT_BMISS` stays enabled (`irq::wow`). RX/TX DMA keep
+    /// running until `ath9k_hw_wow_enable` stops RX.
+    pub(in crate::ath9k) fn wow_interrupts(&mut self) -> Result<(), Error> {
+        let mask = self.irq.ok_or(Error::State)?;
+        if self.phase != Phase::Running || self.pending.is_some() || self.paused.is_some() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        irq::wow(&self.port, mask)?;
+        self.irq = Some(irq::Mask {
+            imr: irq::WOW_IMR,
+            ..mask
+        });
+        self.phase = Phase::Running;
+        Ok(())
+    }
+    /// `wow.c::ath9k_resume`'s restore of `wow_intr_before_sleep`.
+    pub(in crate::ath9k) fn restore_interrupts(&mut self) -> Result<(), Error> {
+        let mask = self.irq.ok_or(Error::State)?;
+        if self.phase != Phase::Running || mask.imr != irq::WOW_IMR {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let full = irq::Mask {
+            imr: self.full_imr,
+            ..mask
+        };
+        irq::restore(&self.port, full)?;
+        self.irq = Some(full);
+        self.phase = Phase::Running;
+        Ok(())
+    }
     /// The cause the last failure queued for an in-place reset.
     pub(in crate::ath9k) fn reset_request(&self) -> Option<ResetType> {
         self.reset

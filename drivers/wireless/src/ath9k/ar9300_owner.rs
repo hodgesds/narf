@@ -126,9 +126,69 @@ pub(super) struct Owner {
     fullsleep: bool,
     /// Retirement could not prove DMA stopped; the address stays reserved.
     pinned: bool,
+    /// `ath9k_init_wow`: present only for an AR9462 whose PCI subsystem
+    /// carries `ATH9K_PCI_WOW` (`pci.c`); `ah->wow`.
+    wow: Option<ar9003::wow::Wow>,
+    /// `ATH_OP_WOW_ENABLED`: system suspend left the associated station
+    /// armed in WoW sleep instead of retiring it.
+    wow_sleeping: bool,
 }
 pub(super) type Shared = Arc<Mutex<Owner>>;
 static OWNER: IrqSafeSpinLock<Option<Shared>> = IrqSafeSpinLock::new(None);
+/// `wiphy->wowlan` of the bound radio (`wow.c::ath9k_init_wow`).
+static WOWLAN_SUPPORT: IrqSafeSpinLock<Option<narf_wireless::WowlanSupport>> =
+    IrqSafeSpinLock::new(None);
+/// `wiphy->wowlan_config` (`nl80211_set_wowlan`).
+static WOWLAN: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>> = IrqSafeSpinLock::new(None);
+
+/// `wow.c::ath9k_init_wow`'s `wiphy->wowlan`: magic packet and disconnect
+/// wake, `ath9k_wowlan_support` (AR9462 2.0+: `MAX_NUM_PATTERN - 2` user
+/// patterns) or the legacy set, `pattern_min_len` 1, `pattern_max_len`
+/// `MAX_PATTERN_SIZE`, no packet offset.
+fn wowlan_support_for(revision: &ar9003::Revision) -> narf_wireless::WowlanSupport {
+    let support = ar9003::wow::WowlanSupport::for_revision(revision);
+    narf_wireless::WowlanSupport {
+        disconnect: true,
+        magic_packet: true,
+        max_patterns: support.n_patterns(),
+        min_pattern_len: 1,
+        max_pattern_len: support.pattern_max_len() as u16,
+        ..Default::default()
+    }
+}
+
+/// The bound AR9462 WoW subsystem's `wiphy->wowlan`; `None` for every
+/// other part.
+pub(super) fn wowlan_support() -> Option<narf_wireless::WowlanSupport> {
+    *WOWLAN_SUPPORT.lock()
+}
+
+/// `nl80211_set_wowlan` against `wowlan_support` (cfg80211's own
+/// validation: pattern count, lengths, mask size, no offset; GTK-rekey
+/// failure and net-detect are not advertised).
+pub(super) fn set_wowlan(config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+    let support = wowlan_support().ok_or(narf_wireless::EOPNOTSUPP)?;
+    if let Some(config) = &config {
+        let bad = config.gtk_rekey_failure
+            || config.net_detect.is_some()
+            || config.patterns.len() > usize::from(support.max_patterns)
+            || config.patterns.iter().any(|p| {
+                p.offset != 0
+                    || p.pattern.is_empty()
+                    || p.pattern.len() > usize::from(support.max_pattern_len)
+                    || p.mask.len() != p.pattern.len().div_ceil(8)
+            });
+        if bad {
+            return Err(22); // EINVAL
+        }
+    }
+    *WOWLAN.lock() = config;
+    Ok(())
+}
+
+pub(super) fn wowlan_config() -> Option<narf_wireless::WowlanConfig> {
+    WOWLAN.lock().clone()
+}
 
 /// `ath9k_regd_get_ctl` at `frequency` for the map's `regDmn[0]`:
 /// `ath_regd_get_band_ctl` (initial DFS region unset) | `CTL_11G` on
@@ -317,6 +377,17 @@ pub(super) fn probe(
         identity.tx_chainmask
     );
     let (vendor, device_id) = (device.id.vendor, device.id.device);
+    // ath9k_init_wow: `ATH9K_PCI_WOW` driver_data (AR9462 subsystems only).
+    let wow = ar9003::wow::init_capable(
+        ar9003::wow::driver_data(
+            device.id.device,
+            device.id.subsystem_vendor,
+            device.id.subsystem_id,
+        ),
+        false,
+    )
+    .then(|| ar9003::wow::Wow::new(&revision));
+    *WOWLAN_SUPPORT.lock() = wow.map(|_| wowlan_support_for(&revision));
     let owner = Arc::new(Mutex::new(Owner {
         mmio,
         device,
@@ -340,6 +411,8 @@ pub(super) fn probe(
         suspended: false,
         fullsleep: false,
         pinned: false,
+        wow,
+        wow_sleeping: false,
     }));
     *OWNER.lock() = Some(owner.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -952,6 +1025,8 @@ pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         let mut retained = OWNER.lock();
         if retained.as_ref().is_some_and(|r| Arc::ptr_eq(r, &owner)) {
             *retained = None;
+            *WOWLAN_SUPPORT.lock() = None;
+            *WOWLAN.lock() = None;
         }
         drop(retained);
         if reclaimed {
@@ -1002,6 +1077,13 @@ pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     if o.pinned {
         return Err(DeviceSuspendError::DriverError);
     }
+    // mac80211 `ieee80211_suspend` -> `ath9k_suspend` with a WoWLAN
+    // configuration, then `ath_pci_suspend` bypassed ("WOW is enabled").
+    // Linux's `ret = 1` (no association, no trigger) and a failed arming
+    // fall back to the ordinary suspend below.
+    if wow_suspend(&mut o)? {
+        return Ok(());
+    }
     if let Some(station) = o.station.clone() {
         let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
         interface::retire(&station);
@@ -1019,6 +1101,139 @@ pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     o.fullsleep = true;
     let mut io = identity::Registers::new(o.mmio, o.cap);
     ar9003::disable_and_sleep(&mut io, o.wa).map_err(|_| DeviceSuspendError::DriverError)
+}
+
+/// `wow.c::ath9k_suspend` for an armed WoW configuration on an associated
+/// station: the disassociate/deauthenticate patterns (slots 0/1), the
+/// user patterns (slots 2..), the interrupt switch to BMISS
+/// ([`station::Radio::wow_suspend`]) and `ar9003_wow.c::ath9k_hw_wow_enable`
+/// with the keep-alive null frame (`ah->txchainmask`, current band, own
+/// MAC, AP). ANI/calibration and the hang check stop with the supervisor
+/// (`suspended`). `Ok(false)`: WoW does not apply (Linux `ret = 1`) or
+/// arming failed; the caller then takes the ordinary suspend, which retires
+/// the station. MCI/btcoex is not involved (`mci_enabled` false).
+fn wow_suspend(o: &mut Owner) -> Result<bool, narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let (Some(mut wow), Some(config)) = (o.wow, WOWLAN.lock().clone()) else {
+        return Ok(false);
+    };
+    let Some(station) = o.station.clone() else {
+        return Ok(false);
+    };
+    let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
+    let triggers = ar9003::wow::map_triggers(&ar9003::wow::WowlanRequest {
+        disconnect: config.disconnect,
+        magic_pkt: config.magic_packet,
+        n_patterns: config.patterns.len() as u8,
+    });
+    let Some(bssid) = radio.wow_admissible() else {
+        return Ok(false);
+    };
+    if triggers == 0 {
+        return Ok(false);
+    }
+    let mut io = identity::Registers::new(o.mmio, o.cap);
+    let armed = (|| {
+        for (slot, pattern) in ar9003::wow::disassoc_deauth_patterns(&bssid)
+            .iter()
+            .enumerate()
+        {
+            wow.apply_pattern(&mut io, &pattern.bytes, &pattern.mask, slot, pattern.len)?;
+        }
+        if triggers & ar9003::wow::AH_WOW_USER_PATTERN_EN != 0 {
+            // ath9k_wow_add_pattern: zero-padded pattern, the cfg80211
+            // bitmask bytes copied as is, slot i + 2.
+            for (index, user) in config.patterns.iter().enumerate() {
+                let mut bytes = [0; ar9003::wow::MAX_PATTERN_SIZE];
+                let mut mask = [0; ar9003::wow::MAX_PATTERN_MASK_SIZE];
+                let len = user.pattern.len();
+                bytes
+                    .get_mut(..len)
+                    .ok_or(BringUpError::BadState)?
+                    .copy_from_slice(&user.pattern);
+                mask.get_mut(..user.mask.len())
+                    .ok_or(BringUpError::BadState)?
+                    .copy_from_slice(&user.mask);
+                let len = u8::try_from(len).map_err(|_| BringUpError::BadState)?;
+                wow.apply_pattern(&mut io, &bytes, &mask, index + 2, len)?;
+            }
+        }
+        radio.wow_suspend().map_err(|_| BringUpError::BadState)?;
+        wow.enable(
+            &mut io,
+            &o.revision,
+            triggers,
+            &ar9003::wow::KeepAlive {
+                tx_chainmask: o.identity.tx_chainmask,
+                is_2ghz: o.primary < 4800,
+                sta_mac: o.identity.mac,
+                ap_mac: bssid,
+            },
+        )
+    })();
+    if let Err(error) = armed {
+        let _ = writeln!(
+            narf_console::Writer,
+            "ath9k: AR9462 WoW arming failed ({:?}); ordinary suspend",
+            error
+        );
+        return Ok(false);
+    }
+    drop(radio);
+    o.wow = Some(wow);
+    o.wow_sleeping = true;
+    o.suspended = true;
+    let _ = writeln!(
+        narf_console::Writer,
+        "ath9k: AR9462 suspend with WoW triggers {:#x}; association kept",
+        triggers
+    );
+    Ok(true)
+}
+
+/// `wow.c::ath9k_resume`: the saved interrupt mask
+/// ([`station::Radio::wow_resume`], which also queues the RX-inactivity
+/// in-place reset that restarts the RX DMA `ath9k_hw_wow_enable` stopped),
+/// then `ath9k_hw_wow_wakeup` (wake reason, PME clear, event clear,
+/// `INIT_RSSI_THR`) and its `ath9k_hw_configpcipowersave(ah, false)`
+/// (`ar9003::serdes::configure`). TSF2 has no generic-timer owner here, so
+/// `tsf2_restart` is only reported. The supervisor then runs
+/// `ath_restart_work`'s hang check, i.e. the in-place reset, keeping the
+/// station generation and its association. A failed interrupt restore
+/// closes the generation; the supervisor retires it.
+fn wow_resume(o: &mut Owner) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let station = o.station.clone();
+    o.wow_sleeping = false;
+    o.suspended = false;
+    if let Some(station) = station {
+        let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
+        if let Err(error) = radio.wow_resume() {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ath9k: AR9462 WoW interrupt restore closed the station: {:?}",
+                error
+            );
+        }
+    }
+    let mut io = identity::Registers::new(o.mmio, o.cap);
+    let revision = o.revision;
+    let mut wow = o.wow.ok_or(DeviceSuspendError::DriverError)?;
+    let wakeup = wow
+        .wakeup(&mut io, &revision)
+        .map_err(|_| DeviceSuspendError::DriverError)?;
+    o.wow = Some(wow);
+    if wakeup.restore_pcie_powersave {
+        let tables = ar9003::ini::Tables::for_revision(&revision, &o.identity, o.pll_pwrsave);
+        ar9003::serdes::configure(&mut io, &revision, &tables, false, o.wa, o.aspm_l1_fix)
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "ath9k: AR9462 resume with WoW status {:#x}",
+        wakeup.status
+    );
+    Ok(())
 }
 
 /// `pci.c::ath_pci_resume`: re-disable PCI RETRY_TIMEOUT (config 0x41) that
@@ -1045,6 +1260,11 @@ pub(super) fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendErro
             })
             .map_err(|_| DeviceSuspendError::DriverError)?
             .map_err(|_| DeviceSuspendError::DriverError)?;
+        }
+        // `ath_pci_resume` runs for a WoW resume too; `ath9k_resume` then
+        // keeps the generation instead of the reset below.
+        if o.wow_sleeping {
+            return wow_resume(&mut o);
         }
         o.suspended = false;
     }

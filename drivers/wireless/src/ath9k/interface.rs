@@ -508,7 +508,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         // ATH_OP_HW_RESET: TX queues stay stopped and nothing is polled
         // until the owner's in-place reset completes; the link and the
         // shared rings stay as they are.
-        if radio.reset_pending().is_some() {
+        if radio.service_held() {
             return (0, Vec::new());
         }
         let result: Result<Vec<Vec<u8>>, Error> = (|| {
@@ -602,7 +602,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         match result {
             Ok(frames) => (radio.receive_epoch(), frames),
             // The failure queued an in-place reset; the generation stays.
-            Err(_) if radio.reset_pending().is_some() => (0, Vec::new()),
+            Err(_) if radio.service_held() => (0, Vec::new()),
             Err(_) => {
                 self.close();
                 let _ = radio.stop();
@@ -1295,6 +1295,15 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
     }
     fn max_scan_ie_len(&self) -> u16 {
         0
+    }
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        super::ar9300_owner::wowlan_support()
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        super::ar9300_owner::set_wowlan(config)
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        super::ar9300_owner::wowlan_config()
     }
     fn supports_handshake_offload(&self) -> bool {
         true

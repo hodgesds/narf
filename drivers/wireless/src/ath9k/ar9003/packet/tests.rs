@@ -535,6 +535,105 @@ fn smoke_ath9k_ar9300_in_place_reset_keeps_rings_and_restarts_rx_tx() -> TestRes
     }
 }
 
+/// AR9462 WoW on an associated AR9003 station: `ath9k_suspend` switches
+/// the interrupt mask to BMISS and holds service without closing the
+/// generation; `ath9k_resume` restores the saved mask and queues the
+/// RX-inactivity in-place reset, which restarts RX on the retained rings
+/// with the association intact.
+fn check_wow_station() -> Result<(), &'static str> {
+    use crate::ath9k::station::{self, tests::Env, Dispatch, Radio};
+    use core::sync::atomic::{AtomicBool, AtomicU64};
+    const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    let model = Model::new();
+    // SAFETY: isolated model begins parked; no physical controller is touched.
+    let packet = unsafe { Packet::prepare(&model, LOCAL) }.map_err(|_| "prepare fault")?;
+    *model.signal.borrow_mut() = Some(crate::ath9k::irq::Signal::new());
+    let env = Arc::new(Env {
+        now: AtomicU64::new(1_000),
+        entropy: AtomicBool::new(true),
+    });
+    let mut radio: Radio<&Model, Arc<Env>, Dispatch<&Model>> =
+        Radio::new(Dispatch::from(packet), LOCAL, -100, env.clone());
+    radio.start().map_err(|_| "station start")?;
+    radio.__test_open(narf_wireless::association::ObservedBss {
+        bss: narf_wireless::association::Bss {
+            bssid: AP,
+            ssid: b"narf-ar9462".to_vec(),
+            channel: 1,
+            band: None,
+            signal_dbm: Some(-40),
+            capability: 1,
+            beacon_interval: 100,
+            information_elements: Vec::new(),
+        },
+        ap_rsne: None,
+        ap_rsnxe: None,
+        rates: 0xf,
+        basic_rates: 0x3,
+    });
+    if radio.wow_admissible() != Some(AP) {
+        return Err("associated station not WoW-admissible");
+    }
+    if radio.wow_suspend() != Ok(AP)
+        || model.reg(irq::IMR) != irq::WOW_IMR
+        || model.reg(irq::IER) != 1
+        || radio.poll() != Err(station::Error::Busy)
+        || radio.ready()
+        || radio.terminal()
+        || radio.peer() != Some(AP)
+    {
+        return Err("ath9k_suspend did not arm BMISS-only and hold the generation");
+    }
+    env.now.store(60_000, core::sync::atomic::Ordering::Release);
+    radio.wow_resume().map_err(|_| "ath9k_resume fault")?;
+    if model.reg(irq::IMR) != irq::STATION_IMR
+        || radio.reset_pending() != Some(station::ResetType::RxInactive)
+        || radio.terminal()
+    {
+        return Err("ath9k_resume did not restore the mask and queue the RX restart");
+    }
+    if radio.pause_for_reset() != Ok(station::ResetType::RxInactive) || model.master.get() {
+        return Err("in-place reset after WoW did not pause");
+    }
+    for register in [
+        Q_STATUS_RING_START,
+        Q_STATUS_RING_END,
+        DATABUF_SIZE,
+        irq::IMR,
+    ] {
+        model.set(register, 0);
+    }
+    model.hp.borrow_mut().clear();
+    model.lp.borrow_mut().clear();
+    model.status_tail.set(0);
+    radio
+        .resume_after_reset()
+        .map_err(|_| "in-place reset after WoW did not resume")?;
+    if radio.terminal()
+        || radio.peer() != Some(AP)
+        || !radio.ready()
+        || model.hp.borrow().len() != 4
+        || model.lp.borrow().len() != 8
+        || !model.master.get()
+        || model.reg(irq::IMR) != irq::STATION_IMR
+    {
+        return Err("WoW resume lost the generation or RX did not restart");
+    }
+    radio.stop().map_err(|_| "stop")?;
+    Ok(())
+}
+
+fn smoke_ath9k_ar9462_wow_suspend_resume_keeps_generation() -> TestResult {
+    match check_wow_station() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_wow_suspend_resume_keeps_generation
+);
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9300_edma_packet_owner_tx_rx_and_stop

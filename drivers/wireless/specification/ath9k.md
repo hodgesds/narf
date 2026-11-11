@@ -2515,8 +2515,39 @@ every TX/RX gain mode with the mode 2/3 override arrays, computed
 from the local Linux headers, plus the SerDes `pll_pwrsave` selection
 matrix) and
 `smoke_ath9k_ar9462_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: WoW
-(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
+WoW (wired, physical wake unmeasured): `ath9k_init_wow` — the
+owner holds `ar9003::wow::Wow` only when `pci.c`'s `ATH9K_PCI_WOW`
+`driver_data` applies (`wow::driver_data`, the thirteen `0x0034`
+subsystems), and only then does the netdev advertise `wowlan_support`
+(magic packet, disconnect, `MAX_NUM_PATTERN - 2` user patterns of 1..256
+bytes, no offset; `set_wowlan`/`wowlan_config` keep a cfg80211-validated
+`WowlanConfig`). System suspend with a configuration, an associated
+station (`ATH_OP_PRIM_STA_VIF`), a non-zero `ath9k_wow_map_triggers` and a
+settled generation (Open, nothing in flight, no queued reset) takes
+`ar9300_owner::wow_suspend` (`wow.c::ath9k_suspend`): disassociate/
+deauthenticate patterns in slots 0/1, user patterns in slots 2.. (zero
+padded, cfg80211 mask bytes as is), `Radio::wow_suspend` (interrupt mask
+saved, `ATH9K_INT_BMISS` only via `ar9003::irq::wow`, service held),
+`Wow::enable` with the keep-alive null frame (`ah->txchainmask`, band,
+own MAC, AP), and `ath_pci_suspend` is bypassed (no retirement, no
+FULL_SLEEP); the supervisor (ANI/calibration, hang check) is parked.
+Anything else (Linux `ret = 1`) or a failed arming takes the ordinary
+retiring suspend. Resume runs `ath_pci_resume`'s config 0x41 fix, then
+`wow_resume` (`ath9k_resume`): `Radio::wow_resume` restores the saved
+mask (`ar9003::irq::restore`), `Wow::wakeup` reads/clears the wake reason
+and `ath9k_hw_configpcipowersave(ah, false)` re-runs
+`ar9003::serdes::configure`; TSF2 has no generic-timer owner and is only
+reported. RX DMA, which `ath9k_hw_wow_enable` stopped (`AR_CR_RXD`), is
+restarted by the in-place reset with the association kept: Linux reaches
+it through `ath_restart_work` -> `ath_hw_rx_inactive_check` about 5 s
+later; here `wow_resume` queues `ResetType::RxInactive` directly (RX is
+known stopped) and restarts the link-loss clock, so the access-proved
+packet path never runs against the WoW-sleeping chip and the 5 s
+link-loss window cannot expire first. Not done: PCI PME_En / D-state
+(platform-owned; `narf_bus::pci_pme::arm` has no driver caller), MCI
+(`mci_enabled` false). Smoke (written, not executed):
+`smoke_ath9k_ar9462_wow_suspend_resume_keeps_generation`.
+Remainder, not in this step: the AR9462 board-value
 deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
 **AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
@@ -2562,7 +2593,7 @@ the 648 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
 computed from the local Linux headers, plus the SerDes `pll_pwrsave`
 selection matrix) and
 `smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: WoW, the
+Remainder, not in this step: the
 AR9485 board-value deltas and per-chip calibration branches (including
 the 9485 antenna-diversity/LNA-diversity code).
 
@@ -2614,8 +2645,8 @@ the 711 default-selected 2 GHz HT20 rows for each of 1.0 and 1.1, and
 every TX/RX gain mode, computed from the local Linux headers, plus
 the SerDes `pll_pwrsave` selection matrix) and
 `smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: WoW
-(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), the AR9565 board-value
+WoW does not apply (Linux `pci.c` sets `ATH9K_PCI_WOW` only on
+`0x0034` subsystems). Remainder, not in this step: the AR9565 board-value
 deltas and per-chip calibration branches.
 
 **SerDes `pll_pwrsave` (`ar9003/serdes.rs`, modeled).**

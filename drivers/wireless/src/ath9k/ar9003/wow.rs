@@ -13,21 +13,18 @@
 //! are AZWAVE `0x1a3b:0x2110` and ASUSTEK `0x1043:0x850e`; the remaining
 //! subvendor numerics are copied from `pci.c:330-395`, never from memory.
 //!
-//! Scope: the hardware layer is complete (`apply_pattern`,
-//! `wow_enable`, `wow_wakeup`, the keep-alive pattern and the WoW-sleep
-//! power mode). What is NOT here: the owner-level suspend/resume wiring
-//! (`ath9k_suspend`/`ath9k_resume` in `wow.c` — ANI stop, btcoex stop,
-//! interrupt-mask save/restore, the associated-station and single-VIF
-//! gates — needs the `ar9300_owner` suspend path to grow a WoW branch),
-//! the MCI interaction (`ath9k_hw_mci_is_enabled` is always false until
-//! the MCI subsystem of #1912 §1 lands; the `mci_enabled` flag threads
-//! the Linux branches so they stay visible), and the
-//! `ath9k_hw_configpcipowersave(false)` restore in `wow_wakeup` (the
-//! AR9003 SerDes restore is PR #1911, unmerged; `Wakeup` reports it as
-//! `restore_pcie_powersave` for the caller instead of calling the AR9002
-//! helper). The TSF2 restart in `wow_wakeup` likewise reports
-//! `tsf2_restart`: Linux only restarts it when a TSF2 generic timer was
-//! enabled (`hw.c::ath9k_hw_gen_timer_start_tsf2`), and this tree has no
+//! Scope: the hardware layer (`apply_pattern`, `wow_enable`,
+//! `wow_wakeup`, the keep-alive pattern and the WoW-sleep power mode). The
+//! owner-level `ath9k_suspend`/`ath9k_resume` wiring lives in
+//! `ar9300_owner::{wow_suspend, wow_resume}` (interrupt-mask save/restore
+//! through `ar9003::irq::{wow, restore}`, the associated-station gate, the
+//! `ath9k_hw_configpcipowersave(false)` SerDes restore `Wakeup` reports, and
+//! the RX restart through the in-place reset). The MCI interaction
+//! (`ath9k_hw_mci_is_enabled`) stays false until the MCI owner is live; the
+//! `mci_enabled` flag threads the Linux branches so they stay visible. The
+//! TSF2 restart in `wow_wakeup` is reported as `tsf2_restart`: Linux only
+//! restarts it when a TSF2 generic timer was enabled
+//! (`hw.c::ath9k_hw_gen_timer_start_tsf2`), and this tree has no
 //! generic-timer table yet.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
@@ -374,8 +371,8 @@ pub(in crate::ath9k) struct Wakeup {
     /// timer was enabled).
     pub tsf2_restart: bool,
     /// A PCIe part came out of WoW sleep: the caller must restore PCIe
-    /// power-save (`ath9k_hw_configpcipowersave(ah, false)`; the AR9003
-    /// SerDes restore is PR #1911, unmerged).
+    /// power-save (`ath9k_hw_configpcipowersave(ah, false)`, the owner's
+    /// `ar9003::serdes::configure`).
     pub restore_pcie_powersave: bool,
 }
 

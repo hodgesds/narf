@@ -201,14 +201,51 @@ pub(in crate::ath9k) fn enable(port: &impl Port, msi: bool) -> Result<Mask, Erro
 
 /// `__ath9k_hw_enable_interrupts`, including the bounded AR_PCIE_MSI re-arm.
 pub(in crate::ath9k) fn resume(port: &impl Port, mask: Mask) -> Result<(), Error> {
+    resume_with(port, mask, MSI_MASK)
+}
+
+/// `AR_IMR_BMISS`: the only cause `wow.c::ath9k_suspend` leaves enabled.
+pub(in crate::ath9k) const WOW_IMR: u32 = ISR_BMISS;
+
+/// `wow.c::ath9k_suspend`'s interrupt switch: `ath9k_hw_disable_interrupts`,
+/// `ath9k_hw_set_interrupts` with imask `ATH9K_INT_BMISS |
+/// ATH9K_INT_GLOBAL` (IMR = `AR_IMR_BMISS`; `imrs2_reg` drops TIM..CST but
+/// keeps `AR_IMR_S2_BB_WATCHDOG`, which `set_interrupts` only clears when
+/// re-adding it; no TX/RX, so `msi_mask` 0) and
+/// `ath9k_hw_enable_interrupts`.
+pub(in crate::ath9k) fn wow(port: &impl Port, mask: Mask) -> Result<(), Error> {
+    kill(port, mask.msi)?;
+    port.write(IMR, WOW_IMR)?;
+    port.write(IMR_S2, STATION_IMR_S2 & !(S2_GTT | S2_CST))?;
+    resume_with(
+        port,
+        Mask {
+            imr: WOW_IMR,
+            ..mask
+        },
+        0,
+    )
+}
+
+/// `wow.c::ath9k_resume`'s interrupt restore: disable, the saved
+/// `wow_intr_before_sleep` imask (`mask`) through `ath9k_hw_set_interrupts`,
+/// enable.
+pub(in crate::ath9k) fn restore(port: &impl Port, mask: Mask) -> Result<(), Error> {
+    kill(port, mask.msi)?;
+    port.write(IMR, mask.imr)?;
+    port.write(IMR_S2, STATION_IMR_S2)?;
+    resume(port, mask)
+}
+
+fn resume_with(port: &impl Port, mask: Mask, msi_mask: u32) -> Result<(), Error> {
     port.write(IER, 1)?;
     port.write(ASYNC_ENABLE, MAC_IRQ)?;
     port.write(ASYNC_MASK, MAC_IRQ)?;
     port.write(SYNC_ENABLE, SYNC_DEFAULT)?;
     port.write(SYNC_MASK, SYNC_DEFAULT)?;
     if mask.msi {
-        port.write(PRIO_ASYNC_ENABLE, MSI_MASK)?;
-        port.write(PRIO_ASYNC_MASK, MSI_MASK)?;
+        port.write(PRIO_ASYNC_ENABLE, msi_mask)?;
+        port.write(PRIO_ASYNC_MASK, msi_mask)?;
         for _ in 0..200 {
             port.write(PCIE_MSI, (mask.msi_reg | MSI_ENABLE) & MSI_PENDING_64)?;
             if port.read(PCIE_MSI)? & MSI_ENABLE != 0 {

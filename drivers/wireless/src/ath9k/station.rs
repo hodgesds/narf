@@ -237,6 +237,8 @@ pub(super) struct Radio<P: Port, E: Environment, K: Engine = Packet<P>> {
     /// `sc->rx_active_count` / `sc->rx_active_check_time` (ms).
     rx_active_count: u32,
     rx_active_check_ms: u64,
+    /// `ATH_OP_WOW_ENABLED`: armed for WoW sleep; nothing is serviced.
+    wow_sleep: bool,
 }
 impl<P: Port, E: Environment, K: Engine> core::fmt::Debug for Radio<P, E, K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -290,6 +292,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             reset_wanted: None,
             rx_active_count: 0,
             rx_active_check_ms: 0,
+            wow_sleep: false,
         }
     }
     pub(super) fn closed(&self) -> Arc<AtomicBool> {
@@ -411,6 +414,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             && self.delivered_ba.is_none()
             && self.security.as_ref().is_none_or(Security::port_open)
             && self.reset_wanted.is_none()
+            && !self.wow_sleep
     }
     pub(super) fn receive_open(&self) -> bool {
         self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
@@ -639,6 +643,10 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             _ => self.fail(),
         }
     }
+    /// Service is held: an in-place reset is queued or WoW is armed.
+    pub(super) fn service_held(&self) -> bool {
+        self.wow_sleep || self.reset_pending().is_some()
+    }
     /// The pending in-place reset cause, if any.
     pub(super) fn reset_pending(&self) -> Option<ResetType> {
         if self.terminal() {
@@ -673,7 +681,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
     /// RX rate; an idle unassociated receiver may legitimately hear
     /// nothing). Returns the queued cause.
     pub(super) fn rx_inactive_check(&mut self, now_ms: u64) -> Option<ResetType> {
-        if self.terminal() || self.reset_wanted.is_some() {
+        if self.terminal() || self.reset_wanted.is_some() || self.wow_sleep {
             return None;
         }
         let interval = now_ms.saturating_sub(self.rx_active_check_ms);
@@ -1071,7 +1079,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         Ok(())
     }
     pub(super) fn poll(&mut self) -> Result<Vec<Vec<u8>>, Error> {
-        if self.reset_pending().is_some() {
+        if self.service_held() {
             return Err(Error::Busy);
         }
         let result = {
@@ -1884,7 +1892,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         dwell_ms: u64,
         ssids: &[Vec<u8>],
     ) -> Result<Vec<ObservedBss>, Error> {
-        if self.reset_pending().is_some() {
+        if self.service_held() {
             return Err(Error::Busy);
         }
         if !(1..=1024).contains(&dwell_ms)
@@ -1996,7 +2004,7 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         force_twenty: bool,
     ) -> Result<(), Error> {
         self.force_twenty = force_twenty;
-        if self.reset_pending().is_some() {
+        if self.service_held() {
             return Err(Error::Busy);
         }
         if self.phase() != Phase::Passive {
@@ -2242,6 +2250,16 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
         result
     }
 }
+#[cfg(feature = "kernel-test")]
+impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
+    /// Test-only: an established open association with `peer` on a started
+    /// radio, without the frame exchange (engines without an AP model).
+    pub(super) fn __test_open(&mut self, peer: ObservedBss) {
+        self.peer = Some(peer);
+        self.established = true;
+        self.phase = Phase::Open;
+    }
+}
 /// The in-place `ath_reset` of an AR9003 EDMA station (the only engine
 /// with one). The owner runs `ath9k_hw_reset` on [`Self::reset_port`]
 /// between the two halves while it holds this station.
@@ -2257,6 +2275,71 @@ impl<P: Port, E: Environment> Radio<P, E, Dispatch<P>> {
             };
             packet.pause_for_reset()?;
             Ok(kind)
+        })();
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// `wow.c::ath9k_suspend`'s station gates (`ATH_OP_PRIM_STA_VIF`: an
+    /// associated station; single vif by construction) plus this tree's: a
+    /// settled generation with no frame in flight and no queued reset.
+    /// Returns the BSSID the disassociate/deauthenticate patterns and the
+    /// keep-alive frame name.
+    pub(super) fn wow_admissible(&self) -> Option<[u8; 6]> {
+        let bssid = self.peer()?;
+        (!self.service_held()
+            && self.phase == Phase::Open
+            && self.reset_admissible()
+            && self.pending.is_none()
+            && matches!(self.packet, Dispatch::Ar9003(_)))
+        .then_some(bssid)
+    }
+    /// `ath9k_suspend`: interrupts switched to `ATH9K_INT_BMISS` and
+    /// `ATH_OP_WOW_ENABLED` set; association, keys and DMA rings stay. A
+    /// failure closes the generation (the ordinary suspend then retires it).
+    pub(super) fn wow_suspend(&mut self) -> Result<[u8; 6], Error> {
+        let result = (|| {
+            let bssid = self.wow_admissible().ok_or(Error::State)?;
+            let Dispatch::Ar9003(packet) = &mut self.packet else {
+                return Err(Error::State);
+            };
+            packet.wow_interrupts()?;
+            self.wow_sleep = true;
+            Ok(bssid)
+        })();
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// `ath9k_resume`: the saved interrupt mask is restored and
+    /// `ATH_OP_WOW_ENABLED` clears. `ath9k_hw_wow_enable` stopped RX DMA
+    /// (`AR_CR_RXD`) and nothing in `ath9k_resume` restarts it: Linux
+    /// recovers through `ath_restart_work` -> `ath_hw_check_work` ->
+    /// `ath_hw_rx_inactive_check` -> `ath_reset`. The RX-inactivity cause
+    /// is queued here directly (its outcome is fixed: RX is known stopped),
+    /// so the owner's in-place reset restarts RX without first running the
+    /// packet path against a WoW-sleeping chip or the 5 s link-loss window
+    /// expiring. The link-loss clock restarts, as mac80211's beacon monitor
+    /// does on a WoW resume. A failure closes the generation.
+    pub(super) fn wow_resume(&mut self) -> Result<(), Error> {
+        let result = (|| {
+            if !self.wow_sleep || self.terminal() {
+                return Err(Error::State);
+            }
+            let Dispatch::Ar9003(packet) = &mut self.packet else {
+                return Err(Error::State);
+            };
+            packet.restore_interrupts()?;
+            self.wow_sleep = false;
+            let now = self.environment.now_ms();
+            self.last_now = self.last_now.max(now);
+            self.last_peer = self.last_now;
+            self.rx_active_count = 0;
+            self.rx_active_check_ms = self.last_now;
+            self.reset_wanted = Some(ResetType::RxInactive);
+            Ok(())
         })();
         if result.is_err() {
             self.fail();
