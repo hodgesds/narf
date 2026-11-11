@@ -118,3 +118,158 @@ pub fn uncharge(bytes: u64) {
         let _ = invoke(pid, -(bytes as i64));
     }
 }
+
+// ── Per-page charging (Linux `mem_cgroup_charge` / `folio->memcg_data`) ──
+//
+// User pages — anonymous memory, file pages a task brings into the page
+// cache, shmem/tmpfs pages — are charged to the memory cgroup of the task
+// that allocates them, and the allocator records WHICH memory cgroup on the
+// frame itself (`frame::set_frame_memcg`). The free path uncharges that
+// recorded cgroup, not whoever happens to be running when the last owner
+// drops the page. Kernel memory (the heap, page tables, driver and
+// filesystem buffers) is not charged at all, as in Linux without
+// `__GFP_ACCOUNT`; nothing in the kernel heap path can be refused by a cgroup.
+//
+// A memory cgroup is named by a `MemcgId` (Linux `mem_cgroup_id`, 1..=65535;
+// 0 = no cgroup). The cgroupfs memory controller owns the ids and keeps a
+// removed cgroup's id (and its counters) alive until every page charged to it
+// has been uncharged, so a late uncharge always lands where the charge went.
+
+/// A memory cgroup's id; 0 means "not charged to any cgroup".
+pub type MemcgId = u32;
+
+/// `fn(pid, bytes, force) -> Result<MemcgId, MemcgId>`: charge `bytes` to
+/// `pid`'s memory cgroup chain. `Ok(0)` = nothing charged (no memory cgroup,
+/// or a nested charge from inside the controller); `Ok(id)` = charged,
+/// uncharge later with that id; `Err(id)` = refused because cgroup `id` is at
+/// its `memory.max` (the scope for a memcg OOM kill). With `force` the hook
+/// charges past `memory.max` instead of refusing (Linux `__GFP_NOFAIL`) and
+/// returns `Ok`.
+static PAGE_CHARGE_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// `fn(MemcgId, bytes)`: uncharge `bytes` from `id` and its ancestors.
+static PAGE_UNCHARGE_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// `fn(MemcgId, pid) -> bool`: run a memory-cgroup OOM kill for `id`, from a
+/// context with no allocator or address-space lock held (the OOM reaper).
+static MEMCG_OOM_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the per-page charge hooks. Called once by the cgroupfs memory
+/// controller, before any memory cgroup can be charged.
+pub fn install_page_charge_hooks(
+    charge: fn(u64, u64, bool) -> Result<MemcgId, MemcgId>,
+    uncharge: fn(MemcgId, u64),
+    oom: fn(MemcgId, u64) -> bool,
+) {
+    PAGE_UNCHARGE_HOOK.store(uncharge as usize, Ordering::Release);
+    MEMCG_OOM_HOOK.store(oom as usize, Ordering::Release);
+    PAGE_CHARGE_HOOK.store(charge as usize, Ordering::Release);
+}
+
+/// Charge `bytes` of user memory to the current task's memory cgroup and
+/// return `(memcg, pid)`; `memcg` 0 when there is no task or no memory cgroup.
+/// A refusal returns the cgroup at its limit. With `force`, a charge past the
+/// limit is taken anyway and returned as `Ok`, and the breach is reported to
+/// nobody: a forced charge is for an allocation that must not fail (a
+/// copy-on-write break of a page the task already owns).
+pub(crate) fn charge_current(bytes: u64, force: bool) -> Result<(MemcgId, u64), (MemcgId, u64)> {
+    let Some(pid) = current_charge_pid() else {
+        return Ok((0, 0));
+    };
+    let ptr = PAGE_CHARGE_HOOK.load(Ordering::Acquire);
+    if ptr == 0 {
+        return Ok((0, pid));
+    }
+    // SAFETY: only `install_page_charge_hooks` stores this word, from a
+    // `fn(u64, u64, bool) -> Result<MemcgId, MemcgId>`; the round trip
+    // through `usize` preserves the function pointer.
+    let f: fn(u64, u64, bool) -> Result<MemcgId, MemcgId> = unsafe { core::mem::transmute(ptr) };
+    match f(pid, bytes, force) {
+        Ok(id) => Ok((id, pid)),
+        Err(id) => Err((id, pid)),
+    }
+}
+
+/// Uncharge `bytes` from memory cgroup `id` (and its ancestors). No-op for 0.
+/// Allocation-free; callable from any frame-free path.
+pub(crate) fn uncharge_memcg(id: MemcgId, bytes: u64) {
+    if id == 0 || bytes == 0 {
+        return;
+    }
+    let ptr = PAGE_UNCHARGE_HOOK.load(Ordering::Acquire);
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: stored only by `install_page_charge_hooks` from a
+    // `fn(MemcgId, u64)`.
+    let f: fn(MemcgId, u64) = unsafe { core::mem::transmute(ptr) };
+    f(id, bytes);
+}
+
+/// One pending memory-cgroup OOM request: `(memcg id, faulting pid)`. Linux
+/// records the OOM in the faulting task and runs it once the fault has
+/// dropped its locks (`mem_cgroup_oom_synchronize`); NARF hands it to the OOM
+/// reaper, which runs with no lock held, and the faulting task waits on a
+/// reclaim ticket meanwhile.
+const MEMCG_OOM_SLOTS: usize = 16;
+static MEMCG_OOM_PENDING: [core::sync::atomic::AtomicU64; MEMCG_OOM_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MEMCG_OOM_SLOTS];
+static MEMCG_OOM_REQUESTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Queue a memory-cgroup OOM for `id` on behalf of `pid` and wake the reaper.
+/// Duplicate requests for the same cgroup coalesce; a full table drops the
+/// request (the next refused charge queues it again). Allocation-free.
+pub(crate) fn request_memcg_oom(id: MemcgId, pid: u64) {
+    if id == 0 {
+        return;
+    }
+    let word = (u64::from(id) << 40) | (pid & ((1 << 40) - 1));
+    for slot in &MEMCG_OOM_PENDING {
+        let current = slot.load(Ordering::Acquire);
+        if current >> 40 == u64::from(id) {
+            break;
+        }
+        if current == 0
+            && slot
+                .compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            MEMCG_OOM_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+    }
+    crate::oom::wake_reaper();
+}
+
+/// Run every queued memory-cgroup OOM. Called by the OOM reaper, which holds
+/// no allocator or address-space lock; the hook may allocate. Returns the
+/// number of requests processed.
+pub(crate) fn run_memcg_oom() -> usize {
+    let ptr = MEMCG_OOM_HOOK.load(Ordering::Acquire);
+    let mut processed = 0;
+    for slot in &MEMCG_OOM_PENDING {
+        let word = slot.swap(0, Ordering::AcqRel);
+        if word == 0 {
+            continue;
+        }
+        processed += 1;
+        if ptr == 0 {
+            continue;
+        }
+        // SAFETY: stored only by `install_page_charge_hooks` from a
+        // `fn(MemcgId, u64) -> bool`.
+        let f: fn(MemcgId, u64) -> bool = unsafe { core::mem::transmute(ptr) };
+        let _ = f((word >> 40) as MemcgId, word & ((1 << 40) - 1));
+    }
+    processed
+}
+
+/// Run queued memory-cgroup OOMs now. Kernel tests have no OOM reaper task;
+/// production runs them from the reaper.
+#[doc(hidden)]
+pub fn __run_memcg_oom_for_test() -> usize {
+    run_memcg_oom()
+}
+
+/// Memory-cgroup OOM requests queued since boot (diagnostic).
+pub fn memcg_oom_requests() -> u64 {
+    MEMCG_OOM_REQUESTS.load(Ordering::Relaxed)
+}

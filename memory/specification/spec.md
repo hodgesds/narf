@@ -96,6 +96,19 @@ pub struct Folio { order: u8, head: PhysFrame }
 pub struct PageSize(usize);   // base = 4 KiB; see §5 per-arch table
 
 pub fn alloc_frame() -> Option<PhysFrame>;
+/// (feature `cgroup`) Charge a just-allocated page-cache/shmem block to the
+/// current task's memory cgroup; uncharged by its final free.
+pub fn frame::charge_frame_to_current(frame: PhysFrame, order: u8) -> Result<(), FrameAllocError>;
+/// Move a migrating page's memory-cgroup charge to its destination.
+pub fn frame::transfer_frame_memcg(old: PhysAddr, new: PhysAddr);
+/// (feature `cgroup`) Per-page charge seam installed by the cgroupfs memory
+/// controller: charge(pid, bytes, force) -> Result<MemcgId, MemcgId>,
+/// uncharge(MemcgId, bytes), memcg OOM(MemcgId, pid) run by the OOM reaper.
+pub fn install_page_charge_hooks(
+    charge: fn(u64, u64, bool) -> Result<MemcgId, MemcgId>,
+    uncharge: fn(MemcgId, u64),
+    oom: fn(MemcgId, u64) -> bool,
+);
 pub fn alloc_folio(order: u8) -> Option<Folio>;     // 2^order base frames
 /// Contiguous kernel block with every byte at or below `limit_phys`
 /// (inclusive), searched across all online nodes — the frame half of
@@ -1555,6 +1568,22 @@ x86_64 is rejected at runtime.
   locked fallback; reinstalling the buddy publishes its lock-free kind only
   after the pointer is authoritative. Allocator replacement still requires the
   caller's documented ownership quiescence.
+- Memory-cgroup charging (feature `cgroup`) covers user memory only. A
+  `User`/`UserReserve` allocation, and a page-cache or shmem frame passed to
+  `charge_frame_to_current`, is charged to the current task's memory cgroup
+  before it is handed out; `Kernel` allocations (`alloc_frame`,
+  `alloc_pages_on`, `alloc_pages_below`, the heap) are never charged, so no
+  kernel allocation can fail on a cgroup limit. The charged `MemcgId` is
+  recorded per frame (a 4-byte word per boot-managed frame beside the flat COW
+  table, a sharded map for hot-plugged RAM; Linux `folio->memcg_data`) and the
+  frame's final free — `free_pages_ctx`, the final-owner return of
+  `free_frame`/batched frees, `free_movable_range` — takes the record and
+  uncharges that cgroup. A frame on a buddy free list never carries a record.
+  Page migration moves the record to the destination
+  (`transfer_frame_memcg`, Linux `mem_cgroup_migrate`); migration destinations
+  are not charged themselves. A refused user charge queues a memcg OOM for the
+  OOM reaper and returns `ReservePressure`; a copy-on-write break is
+  force-charged.
 - Runtime memory online is transactional: overlapping/unmapped ranges are
   rejected before donation, and allocator metadata may not grow while the
   frame lock is held. Offline succeeds only for an exact registered range

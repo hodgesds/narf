@@ -54,6 +54,12 @@ impl AnonymousSharedFile {
 
     fn allocate_zeroed() -> Result<narf_memory::PhysFrame, FsError> {
         let frame = narf_memory::frame::alloc_frame().map_err(|_| FsError::OutOfMemory)?;
+        // Shared anonymous memory is shmem: charged to the memory cgroup of
+        // the task that faults it in, uncharged by its final free.
+        if narf_memory::frame::charge_frame_to_current(frame, 0).is_err() {
+            narf_memory::frame::free_frame(frame);
+            return Err(FsError::OutOfMemory);
+        }
         // SAFETY: this fresh allocator frame is exclusively owned here and is
         // reachable through the kernel direct map.
         unsafe {

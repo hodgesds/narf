@@ -180,6 +180,9 @@ fn migrate_frame_multi(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
     let dst_frame =
         crate::frame::alloc_user_frame_on_strict(node).map_err(|_| MigrateError::Failed)?;
     let dst = dst_frame.start_address();
+    // `dst` takes over `src`'s memory-cgroup charge (Linux
+    // `mem_cgroup_migrate`); whichever frame is freed last uncharges it once.
+    crate::frame::transfer_frame_memcg(src, dst);
     // SAFETY: both frames are live, distinct 4 KiB direct-map ranges.
     unsafe {
         core::ptr::copy_nonoverlapping(

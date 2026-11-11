@@ -209,7 +209,7 @@ pub fn set_reaper_wake_hook(hook: fn()) {
     REAPER_WAKE_HOOK.store(hook as usize, Ordering::Release);
 }
 
-fn wake_reaper() {
+pub(crate) fn wake_reaper() {
     let p = REAPER_WAKE_HOOK.load(Ordering::Acquire);
     if p != 0 {
         // SAFETY: `p` came from a real static `fn()` in
@@ -374,6 +374,11 @@ pub fn take_reap_retry_request() -> bool {
 /// O(1), and the extra reserved slot covers the sole serialized in-flight
 /// victim, so freeing memory never allocates.
 pub fn reap_all() -> usize {
+    // Memory-cgroup OOMs queued by refused user charges run first, here,
+    // where no allocator or address-space lock is held; a victim they pick
+    // joins the queue this pass then reaps.
+    #[cfg(feature = "cgroup")]
+    crate::cgroup_charge::run_memcg_oom();
     let Some(_reap) = try_begin_reap() else {
         // The persistent worker will yield and retry after the current pass
         // releases its in-flight victim.

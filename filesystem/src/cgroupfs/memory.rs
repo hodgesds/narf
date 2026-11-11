@@ -1,36 +1,33 @@
 //! `memory` controller — memory accounting + limits.
 //!
 //! Real charge/uncharge accounting wired to the page/frame allocator
-//! (`narf-memory`) via the fn-pointer charge hook this module installs
-//! the first time a `memory` cgroup state is created. The allocator
-//! calls the hook on every user-facing frame allocation (positive byte
-//! delta) and free (negative delta); the hook walks the allocating
-//! task's cgroup chain and charges/uncharges every level.
+//! (`narf-memory`) through hooks this module installs the first time a
+//! `memory` cgroup state is created. User pages — anonymous memory, page
+//! cache a task brings in, tmpfs/shmem — are charged to the allocating task's
+//! cgroup chain; the allocator records the cgroup's `MemcgId` on the frame and
+//! the frame's final free uncharges that cgroup, whoever frees it. Kernel
+//! memory is never charged (Linux charges it only with `__GFP_ACCOUNT`).
+//! A pid-keyed charge hook remains for BPF maps and zswap payloads.
 //!
 //! # What is enforced vs accounting-only
 //!
-//! * **`memory.max` — ENFORCED without inline reclaim.** A positive charge
-//!   that would push any level over its `memory.max` publishes a capped,
-//!   coalesced background-reclaim request and returns `false`, so
-//!   `narf-memory`'s `alloc_frame*` / `alloc_pages_on` fail the
-//!   allocation with `FrameAllocError::Exhausted`. Fallible callers such as
-//!   BPF map creation preserve that as ENOMEM.
-//!   The breaching level's `memory.events` `max` counter is bumped. `oom` and
-//!   `oom_kill` remain unchanged because OOM selection is deliberately not run
-//!   from this arbitrary allocator/lock context.
+//! * **`memory.max` — ENFORCED for user memory.** A charge that would push
+//!   any level over its `memory.max` publishes a capped background-reclaim
+//!   request, bumps that level's `max` event and is refused. A refused user
+//!   page queues a memory-cgroup OOM, run by the OOM reaper with no lock
+//!   held, which kills a process of the cgroup's subtree (or the task whose
+//!   charge was refused) and bumps `oom`/`oom_kill`; the faulting task waits
+//!   on a reclaim cycle and retries. A copy-on-write break is force-charged.
 //! * **`memory.high` — deferred reclaim trigger.** v2 `memory.high` is a
 //!   throttle/reclaim trigger, never a hard wall. A positive charge that
 //!   would push a level over `high` publishes the same kind of background
 //!   request, commits the charge, and bumps the `high` event counter.
 //!
-//! ## Reclaim/OOM scope + limitations (first enforcement pass)
+//! ## Reclaim scope + limitations
 //!
-//! Background work currently enters the global kswapd reclaim engines rather
-//! than a per-cgroup LRU. It is never OOM-authorized: a memcg breach must not
-//! select a machine-wide victim. Full deferred `memory.high` throttling and
-//! scoped `memory.max` reclaim/OOM require stable per-allocation cgroup
-//! ownership plus a cgroup-keyed worker; current uncharge attribution is only
-//! best-effort when a page is freed by a different task.
+//! Background work enters the global kswapd reclaim engines rather than a
+//! per-cgroup LRU, so a cgroup at `memory.max` is relieved by its OOM kill,
+//! not by reclaiming its own pages.
 //! * **`memory.current` / `memory.peak` — REAL.** Live charged-byte
 //!   totals, summed from actual frame allocations attributed to the
 //!   cgroup's tasks (no fabricated numbers).
@@ -57,7 +54,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -276,9 +273,336 @@ fn ensure_hook_installed() {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        init_memcg_ids();
         narf_memory::install_cgroup_charge_hook(charge_hook);
+        narf_memory::install_page_charge_hooks(
+            charge_page_hook,
+            uncharge_page_hook,
+            memcg_oom_hook,
+        );
         narf_scheduler::install_memory_pid_provider();
     }
+}
+
+// ── Memory-cgroup ids and per-page charging ──────────────────────────────
+//
+// Every memory cgroup state gets a `MemcgId` (Linux `mem_cgroup_id`,
+// 1..=MEMCG_ID_MAX). The frame allocator records that id on each user page it
+// charges, and the page's final free uncharges the id's cgroup and its
+// ancestors — never whichever task happens to be running then.
+//
+// A cgroup that is removed (rmdir, or `memory` disabled in its parent's
+// `cgroup.subtree_control`) while pages are still charged to it goes
+// offline but keeps its id and counters until its `memory.current` reaches
+// 0, so late uncharges land on it and on its ancestors exactly as the charges
+// did. Linux reparents the dying cgroup's objcg to the parent; the
+// ancestors' counters come out the same either way, because a charge is
+// accounted at every level of the chain.
+
+/// Linux `MEM_CGROUP_ID_MAX`.
+const MEMCG_ID_MAX: usize = 65535;
+
+#[derive(Debug)]
+struct MemcgEntry {
+    state: Arc<dyn ControllerState>,
+    /// Id of the nearest ancestor with a memory state; 0 for the top.
+    parent: narf_memory::MemcgId,
+    /// The cgroup is gone; release the id once nothing is charged to it.
+    offline: bool,
+}
+
+#[derive(Debug)]
+struct MemcgSlot {
+    entry: IrqSafeSpinLock<Option<MemcgEntry>>,
+}
+
+/// Slot `id - 1` describes memory cgroup `id`. Allocated with the first
+/// memory cgroup; per-slot locks, so uncharges of different cgroups never
+/// meet on one lock.
+static MEMCG_SLOTS: narf_lib::sync::OnceLock<alloc::boxed::Box<[MemcgSlot]>> =
+    narf_lib::sync::OnceLock::new();
+/// Ids returned by released cgroups. Capacity for every id is reserved up
+/// front, so a release (which runs on the frame-free path) never allocates.
+static MEMCG_FREE_IDS: IrqSafeSpinLock<Vec<narf_memory::MemcgId>> =
+    IrqSafeSpinLock::new(Vec::new());
+/// Next never-used id.
+static MEMCG_NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+fn memcg_slots() -> Option<&'static [MemcgSlot]> {
+    MEMCG_SLOTS.get().map(|slots| &slots[..])
+}
+
+/// Allocate the id table. Runs once, from `ensure_hook_installed`, in the
+/// context of creating a cgroup, where allocation is fine.
+fn init_memcg_ids() {
+    let mut slots = Vec::with_capacity(MEMCG_ID_MAX);
+    slots.resize_with(MEMCG_ID_MAX, || MemcgSlot {
+        entry: IrqSafeSpinLock::new(None),
+    });
+    let _ = MEMCG_SLOTS.set(slots.into_boxed_slice());
+    let mut free = Vec::with_capacity(MEMCG_ID_MAX);
+    core::mem::swap(&mut *MEMCG_FREE_IDS.lock(), &mut free);
+}
+
+/// Give `state` an id. `parent` is the nearest ancestor's memory state. A
+/// full table leaves the state with id 0: its pages are then charged to the
+/// nearest ancestor that has an id (see `charge_page_hook`).
+fn register_memcg(state: &Arc<dyn ControllerState>, parent: Option<&Arc<dyn ControllerState>>) {
+    let Some(slots) = memcg_slots() else {
+        return;
+    };
+    let Some(memory) = state.as_any().downcast_ref::<MemoryState>() else {
+        return;
+    };
+    let parent_id = parent
+        .and_then(|p| p.as_any().downcast_ref::<MemoryState>())
+        .map_or(0, MemoryState::memcg_id);
+    let id = {
+        let reused = MEMCG_FREE_IDS.lock().pop();
+        match reused {
+            Some(id) => id,
+            None => {
+                let id = MEMCG_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                if id as usize > MEMCG_ID_MAX {
+                    MEMCG_NEXT_ID.store(MEMCG_ID_MAX as u32 + 1, Ordering::Relaxed);
+                    return;
+                }
+                id
+            }
+        }
+    };
+    *slots[id as usize - 1].entry.lock() = Some(MemcgEntry {
+        state: state.clone(),
+        parent: parent_id,
+        offline: false,
+    });
+    memory.id.store(id, Ordering::Release);
+}
+
+/// Take `state`'s cgroup offline: it has been removed from the hierarchy.
+/// Its id is released now if nothing is charged to it, else by the uncharge
+/// that brings it to zero.
+pub(super) fn offline_memcg(state: &Arc<dyn ControllerState>) {
+    let Some(memory) = state.as_any().downcast_ref::<MemoryState>() else {
+        return;
+    };
+    let id = memory.memcg_id();
+    let Some(slots) = memcg_slots() else {
+        return;
+    };
+    if id == 0 {
+        return;
+    }
+    if let Some(entry) = slots[id as usize - 1].entry.lock().as_mut() {
+        entry.offline = true;
+    }
+    release_if_drained(id);
+}
+
+/// Release `id` if its cgroup is offline and nothing is charged to it any
+/// more. Allocation-free: the free-id list has room for every id, and the
+/// final `Arc` of the state, if this is it, is dropped after every lock is
+/// released.
+fn release_if_drained(id: narf_memory::MemcgId) {
+    let Some(slots) = memcg_slots() else {
+        return;
+    };
+    let released = {
+        let mut entry = slots[id as usize - 1].entry.lock();
+        let drained = entry.as_ref().is_some_and(|e| {
+            e.offline
+                && e.state
+                    .as_any()
+                    .downcast_ref::<MemoryState>()
+                    .is_some_and(|m| m.current.load(Ordering::Acquire) == 0)
+        });
+        if drained {
+            entry.take()
+        } else {
+            None
+        }
+    };
+    if let Some(entry) = released {
+        if let Some(memory) = entry.state.as_any().downcast_ref::<MemoryState>() {
+            memory.id.store(0, Ordering::Release);
+        }
+        let mut free = MEMCG_FREE_IDS.lock();
+        if free.len() < free.capacity() {
+            free.push(id);
+        }
+        drop(free);
+        drop(entry);
+    }
+}
+
+/// `narf_memory` page-charge hook: charge `bytes` to `pid`'s memory cgroup
+/// chain and return the id the frame records. `Ok(0)` when nothing was
+/// charged; `Err(id)` names the cgroup whose `memory.max` refused it.
+fn charge_page_hook(
+    pid: u64,
+    bytes: u64,
+    force: bool,
+) -> Result<narf_memory::MemcgId, narf_memory::MemcgId> {
+    if bytes == 0 {
+        return Ok(0);
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    if BYPASS_CHARGE[cpu].load(Ordering::Acquire) != 0 {
+        return Ok(0);
+    }
+    if IN_CHARGE[cpu].swap(true, Ordering::AcqRel) {
+        return Ok(0);
+    }
+    struct Guard(usize);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IN_CHARGE[self.0].store(false, Ordering::Release);
+        }
+    }
+    let _guard = Guard(cpu);
+
+    let mut levels: Vec<Arc<dyn ControllerState>> = Vec::new();
+    super::with_chain_states(pid, "memory", |state| levels.push(state.clone()));
+    // The id the page records: the nearest level that has one. Every level
+    // from it up is charged, and its uncharge walks the same levels.
+    let Some(first) = levels.iter().position(|state| {
+        state
+            .as_any()
+            .downcast_ref::<MemoryState>()
+            .is_some_and(|m| m.memcg_id() != 0)
+    }) else {
+        return Ok(0);
+    };
+    let levels = &levels[first..];
+    let leaf = levels[0]
+        .as_any()
+        .downcast_ref::<MemoryState>()
+        .map_or(0, MemoryState::memcg_id);
+
+    let mut reserved = 0usize;
+    let mut breach = None;
+    for (index, state) in levels.iter().enumerate() {
+        let Some(m) = state.as_any().downcast_ref::<MemoryState>() else {
+            reserved = index + 1;
+            continue;
+        };
+        match m.try_reserve_charge(bytes) {
+            Ok(now) => {
+                m.finish_reserved_charge(now);
+            }
+            Err(deficit) if force => {
+                let now = m.current.fetch_add(bytes, Ordering::AcqRel) + bytes;
+                m.peak.fetch_max(now, Ordering::AcqRel);
+                m.note_max_event();
+                queue_background_reclaim(deficit);
+            }
+            Err(deficit) => {
+                m.note_max_event();
+                queue_background_reclaim(deficit);
+                breach = Some(m.memcg_id());
+                break;
+            }
+        }
+        reserved = index + 1;
+    }
+    if let Some(breach) = breach {
+        for state in &levels[..reserved] {
+            if let Some(m) = state.as_any().downcast_ref::<MemoryState>() {
+                m.uncharge(bytes);
+            }
+        }
+        // A breach at a level with no id (table full) is scoped to the leaf.
+        return Err(if breach == 0 { leaf } else { breach });
+    }
+    Ok(leaf)
+}
+
+/// `narf_memory` page-uncharge hook: return `bytes` to memory cgroup `id` and
+/// each ancestor it was charged through. Runs on frame-free paths with any
+/// lock held: allocation-free, per-slot locks only, no lock held across the
+/// counter updates.
+fn uncharge_page_hook(id: narf_memory::MemcgId, bytes: u64) {
+    let Some(slots) = memcg_slots() else {
+        return;
+    };
+    let mut next = id;
+    // Bounded by the hierarchy depth; the extra bound only guards a corrupted
+    // parent link from looping.
+    for _ in 0..MEMCG_ID_MAX {
+        if next == 0 || next as usize > MEMCG_ID_MAX {
+            break;
+        }
+        let current = next;
+        let (state, parent, offline) = {
+            let entry = slots[current as usize - 1].entry.lock();
+            match entry.as_ref() {
+                Some(e) => (e.state.clone(), e.parent, e.offline),
+                None => break,
+            }
+        };
+        if let Some(m) = state.as_any().downcast_ref::<MemoryState>() {
+            m.uncharge(bytes);
+        }
+        drop(state);
+        if offline {
+            release_if_drained(current);
+        }
+        next = parent;
+    }
+}
+
+/// `narf_memory` memcg-OOM hook, run by the OOM reaper with no allocator or
+/// address-space lock held (Linux `mem_cgroup_out_of_memory`): kill one
+/// process inside memory cgroup `id`'s subtree, chosen by the OOM policy; if
+/// none is eligible, the task whose charge was refused. Returns whether a
+/// victim was queued.
+fn memcg_oom_hook(id: narf_memory::MemcgId, pid: u64) -> bool {
+    let state = memcg_slots().and_then(|slots| {
+        if id == 0 || id as usize > MEMCG_ID_MAX {
+            return None;
+        }
+        slots[id as usize - 1]
+            .entry
+            .lock()
+            .as_ref()
+            .map(|e| e.state.clone())
+    });
+    let members = state.as_ref().and_then(super::memcg_member_pids);
+    if let Some(m) = state
+        .as_ref()
+        .and_then(|s| s.as_any().downcast_ref::<MemoryState>())
+    {
+        m.events_oom.fetch_add(1, Ordering::Relaxed);
+    }
+    let killed = members
+        .as_deref()
+        .filter(|pids| !pids.is_empty())
+        .and_then(narf_memory::oom::request_oom_relief_in)
+        .or_else(|| {
+            (pid != 0)
+                .then(|| narf_memory::oom::request_oom_relief_in(&[pid]))
+                .flatten()
+        });
+    if killed.is_some() {
+        if let Some(m) = state
+            .as_ref()
+            .and_then(|s| s.as_any().downcast_ref::<MemoryState>())
+        {
+            m.events_oom_kill.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    killed.is_some()
+}
+
+/// Test seams for the per-page charge hooks.
+#[doc(hidden)]
+pub fn charge_page_for_test(pid: u64, bytes: u64) -> Result<u32, u32> {
+    charge_page_hook(pid, bytes, false)
+}
+
+#[doc(hidden)]
+pub fn uncharge_page_for_test(id: u32, bytes: u64) {
+    uncharge_page_hook(id, bytes);
 }
 
 #[derive(Debug)]
@@ -289,9 +613,10 @@ impl Controller for MemoryController {
         "memory"
     }
 
-    fn new_state(&self, _parent: Option<Arc<dyn ControllerState>>) -> Arc<dyn ControllerState> {
+    fn new_state(&self, parent: Option<Arc<dyn ControllerState>>) -> Arc<dyn ControllerState> {
         ensure_hook_installed();
-        Arc::new(MemoryState {
+        let state: Arc<dyn ControllerState> = Arc::new(MemoryState {
+            id: AtomicU32::new(0),
             current: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             swap_current: AtomicU64::new(0),
@@ -309,12 +634,16 @@ impl Controller for MemoryController {
             events_oom_kill: AtomicU64::new(0),
             oom_group: AtomicBool::new(false),
             zswap_writeback: AtomicBool::new(true),
-        })
+        });
+        register_memcg(&state, parent.as_ref());
+        state
     }
 }
 
 #[derive(Debug)]
 pub struct MemoryState {
+    /// This cgroup's `MemcgId` (0 = none: id table full, or released).
+    id: AtomicU32,
     /// `memory.current` — live charged bytes for this level.
     current: AtomicU64,
     /// `memory.peak` — high-water mark of `current`.
@@ -395,6 +724,16 @@ fn parse_u64(buf: &[u8]) -> Result<u64, FsError> {
 }
 
 impl MemoryState {
+    /// The id user pages charged to this cgroup record; 0 if it has none.
+    pub fn memcg_id(&self) -> narf_memory::MemcgId {
+        self.id.load(Ordering::Acquire)
+    }
+
+    /// `memory.current`, in bytes.
+    pub fn current_bytes(&self) -> u64 {
+        self.current.load(Ordering::Acquire)
+    }
+
     /// Deterministically inject allocator charging between taking a locked
     /// limit snapshot and formatting it. This shares the production helper,
     /// so regressing the guard lifetime makes the test self-deadlock.

@@ -326,6 +326,17 @@ impl CacheFolio {
         } else {
             narf_memory::alloc_pages_on(narf_memory::current_cpu_node(), order).ok()?
         };
+        // Page cache is user memory: charge it to the memory cgroup of the
+        // task bringing it in (Linux `filemap_add_folio` →
+        // `mem_cgroup_charge`); its final free uncharges that cgroup.
+        if narf_memory::frame::charge_frame_to_current(frame, order).is_err() {
+            if order == 0 {
+                narf_memory::free_frame(frame);
+            } else {
+                narf_memory::free_pages(frame, order);
+            }
+            return None;
+        }
         // SAFETY: the freshly-allocated contiguous run is exclusively owned
         // here and all `len` bytes are reachable through the direct map.
         unsafe {
