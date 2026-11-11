@@ -123,13 +123,22 @@ impl StuckCpu {
         crate::policy::__test_set_cpu_state(CpuId(cpu as u32), CpuState::Active);
         crate::__test_set_cpu_halted(cpu, false);
         crate::CURRENT_TASK[cpu].store(u64::MAX, Ordering::Release);
-        Some(Self(cpu))
+        let stuck = Self(cpu);
+        // Start every test at a scheduling-pass count no earlier test saw.
+        stuck.pass_scheduling_point();
+        Some(stuck)
     }
 
     /// The same CPU between polls: still not draining, but running no task.
     fn set_running(&self, running: bool) {
         let task = if running { u64::MAX } else { 0 };
         crate::CURRENT_TASK[self.0].store(task, Ordering::Release);
+    }
+
+    /// What a live executor does every time round its loop and after every
+    /// poll. A CPU that keeps doing this is healthy however idle it is.
+    fn pass_scheduling_point(&self) {
+        crate::note_sched_pass(self.0);
     }
 
     fn release(self) {
@@ -491,9 +500,9 @@ kernel_test_in!(
     smoke_scheduler_stranded_wakes_run_on_another_cpu
 );
 
-/// The surplus rule covers staged wakes: a CPU that is running nothing keeps
-/// a single staged wake (it was kicked and will take it), gives one up when it
-/// holds two, and gives its only one up while it is running a task.
+/// The surplus rule covers staged wakes: a healthy CPU that is running nothing
+/// keeps a single staged wake (it was kicked and will take it), gives one up
+/// when it holds two, and gives its only one up while it is running a task.
 fn smoke_scheduler_staged_pull_leaves_idle_cpu_its_only_wake() -> TestResult {
     reset_probes();
     let Some(stuck) = StuckCpu::claim() else {
@@ -518,6 +527,8 @@ fn smoke_scheduler_staged_pull_leaves_idle_cpu_its_only_wake() -> TestResult {
         waker.wake();
     }
     let took_one_of_two = pull(stuck.0, me);
+    // Healthy: it has been round its loop since a thief last looked.
+    stuck.pass_scheduling_point();
     let took_last = pull(stuck.0, me);
     stuck.set_running(true);
     let took_from_running = pull(stuck.0, me);
@@ -966,4 +977,53 @@ fn smoke_scheduler_owner_drain_takes_relinked_node_along() -> TestResult {
 kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_owner_drain_takes_relinked_node_along
+);
+
+/// Longer than any threshold a thief uses to call a CPU stalled.
+const STALL_WAIT_NS: u64 = 3_000_000;
+
+/// A CPU can be stuck outside a task poll: in deferred destructors, the slab
+/// drain, the sleep pumps or the timer wheel, all of which run with no task
+/// current. It looks idle, and an idle CPU keeps its last staged wake. It must
+/// not keep it once thieves have watched that wake sit there with the CPU
+/// passing no scheduling point; a CPU that does pass them keeps it.
+fn smoke_scheduler_stalled_idle_cpu_gives_up_its_only_wake() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    stuck.set_running(false);
+    if park_probe_on(0, 1, stuck.0, None).is_none() {
+        stuck.release();
+        return TestResult::Fail("could not park the probe on the stuck CPU");
+    }
+    let_cool();
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    let took_at_first_sight = pull(stuck.0, me);
+    // Healthy and slow: a long time passes, but the CPU went round its loop.
+    stuck.pass_scheduling_point();
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+    let took_from_healthy = pull(stuck.0, me);
+    // Stalled: the same wake, the same pass count, and time.
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+    let took_from_stalled = pull(stuck.0, me);
+    crate::poll_one_round();
+    let ran = polls(0);
+    stuck.release();
+    if took_at_first_sight || took_from_healthy {
+        return TestResult::Fail("a healthy idle CPU's only staged wake was pulled");
+    }
+    if !took_from_stalled || ran != 2 {
+        return TestResult::Fail(
+            "the only staged wake of a CPU stalled outside a task poll was never pulled",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_stalled_idle_cpu_gives_up_its_only_wake
 );
