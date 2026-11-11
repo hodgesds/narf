@@ -530,16 +530,20 @@ fn dcn30_otg_lfc_engages_inserts_and_disengages() -> TestResult {
     if e.configure_dcn30_drr(Some(bounds)) != Ok(Some(bounds)) {
         return TestResult::Fail("DRR setup");
     }
-    // A config for other bounds is refused without writes.
+    // A config for other bounds is refused without writes. The other
+    // range still holds the 144 Hz mode (a range that does not has no LFC
+    // config at all: mod_freesync_build_vrr_params leaves it inactive).
     let writes = e.io.writes.len();
-    let other = LfcConfig::new(
+    let Some(other) = LfcConfig::new(
         &t,
         VrrRange {
-            min_hz: 48,
-            max_hz: 120,
+            min_hz: 60,
+            max_hz: 144,
         },
     )
-    .unwrap();
+    .filter(|other| other.base() != bounds) else {
+        return TestResult::Fail("no LFC config for a 60-144 Hz range on a 144 Hz mode");
+    };
     if e.configure_dcn30_lfc(Some(other)) != Err(Error::Invalid) || e.io.writes.len() != writes {
         return TestResult::Fail("LFC admitted for foreign bounds");
     }
