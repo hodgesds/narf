@@ -96,8 +96,8 @@ pub mod wmi_core;
 
 /// Vendor-neutral rfkill state surface: radios as state (soft /
 /// hard block) published at `/sys/class/rfkill/`, with the
-/// airplane-mode key wired to actual radio state.
-#[cfg(target_arch = "x86_64")]
+/// airplane-mode key wired to actual radio state. Architecture
+/// independent: Wi-Fi and Bluetooth radios register on every platform.
 pub mod rfkill;
 pub mod rfkill_dev;
 
@@ -319,13 +319,18 @@ pub fn register_initcalls() {
         let _ = think_lmi::init();
         InitResult::Ok
     });
-    // Userspace surfaces for the vendor laptop drivers: publish
-    // /sys/class/rfkill/* and /sys/firmware/acpi/platform_profile
-    // once every Stage::Subsys vendor driver has registered its
-    // radios / profile backend.
+    // The rfkill userspace surfaces (/sys/class/rfkill/*, /dev/rfkill)
+    // on every architecture: Wi-Fi and Bluetooth radios register here
+    // whether or not a vendor laptop driver exists. Published once every
+    // Stage::Subsys driver has registered its radios; later radios
+    // publish themselves.
+    narf_init::register(Stage::Late, "rfkill-userspace", || {
+        rfkill::publish_sysfs();
+        InitResult::Ok
+    });
+    // /sys/firmware/acpi/platform_profile for the vendor laptop drivers.
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Late, "wmi-userspace-surfaces", || {
-        rfkill::publish_sysfs();
         platform_profile::publish_sysfs();
         InitResult::Ok
     });
