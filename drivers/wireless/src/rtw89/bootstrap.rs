@@ -832,7 +832,7 @@ async fn finish_remove(owner: Arc<Bootstrap>) -> bool {
     );
     reclaimed
 }
-/// `narf_bus` PCI remove hook for the retained RTL8852B owner.
+/// `narf_bus` PCI remove hook for the retained B/C/8851B owner.
 pub(super) fn remove(device: BusDevice, _authority: Cap<BusDeviceCap, Write>) {
     let owner = OWNERS.lock().owner(device.addr);
     let Some(owner) = owner else {
@@ -916,7 +916,7 @@ pub(super) unsafe fn attach_cold(
     device: BusDevice,
     authority: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
-    if device.id.vendor != 0x10ec || !matches!(device.id.device, 0xb852 | 0xb85b | 0xc852) {
+    if device.id.vendor != 0x10ec || !super::bootstrap_did(device.id.device) {
         return Err(narf_bus::ProbeError::BadDevice);
     }
     let reservation = Reservation::claim(device.addr)?.ok_or(narf_bus::ProbeError::BadDevice)?;
