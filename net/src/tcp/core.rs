@@ -1116,6 +1116,21 @@ pub fn lookup_tcb(id: u32) -> Option<Arc<IrqSafeSpinLock<Tcb>>> {
     g.as_ref().and_then(|m| m.get(&id).cloned())
 }
 
+/// `(local addr, local port, remote addr, remote port)` of an IPv4 TCB —
+/// what `inet_getname` reads out of `inet_rcv_saddr`/`inet_sport` and
+/// `inet_daddr`/`inet_dport`. `None` for an IPv6 TCB or one that is gone.
+pub fn endpoints(id: u32) -> Option<([u8; 4], u16, [u8; 4], u16)> {
+    let tcb = lookup_tcb(id)?;
+    let tcb = tcb.lock();
+    (!tcb.is_ipv6).then_some((
+        tcb.local_addr,
+        tcb.local_port,
+        tcb.remote_addr,
+        tcb.remote_port,
+    ))
+}
+
+/// IPv6 counterpart of [`endpoints`].
 pub fn endpoints6(id: u32) -> Option<([u8; 16], u16, [u8; 16], u16)> {
     let tcb = lookup_tcb(id)?;
     let tcb = tcb.lock();

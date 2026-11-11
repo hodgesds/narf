@@ -1778,6 +1778,16 @@ reference closes. Per-namespace IPv4 loopback TCP/UDP delivery uses
 namespace-keyed endpoint tables, so identical loopback endpoints coexist and
 cannot exchange traffic across namespaces.
 
+A connected TCP socket has both names (`inet_getname`/`inet6_getname`).
+For a connection on the kernel TCP stack `getsockname`, `getpeername` and
+the address `accept(2)` returns are the TCB's four-tuple
+(`tcp_stack::endpoints`/`endpoints6`). A loopback connect keeps a bound
+address and port, otherwise takes the route's source (127.0.0.1 for 127/8,
+else the local destination itself; an unspecified destination is loopback)
+and an ephemeral port (`EADDRNOTAVAIL` when none is free); the accepted
+socket carries the mirror image. The local port stays reserved until the
+socket is released or disconnected with `connect(AF_UNSPEC)`.
+
 A followed pathname permission probe of `/proc/<pid>/ns/<flavour>` resolves
 the retained nsfs object, rather than treating its rendered
 `<flavour>:[inode]` text as an ordinary symlink target. `AT_SYMLINK_NOFOLLOW`
