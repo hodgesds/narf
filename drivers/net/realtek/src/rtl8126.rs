@@ -9,8 +9,10 @@
 //! applied from a `Stage::Late` hook (firmware first, matching
 //! Linux's `rtl8126a_hw_phy_config`). Deliberate asymmetries,
 //! shared with the 8125 driver: RX VLAN stripping stays OFF,
-//! the interface MTU stays 1500 with offloads advertised, and
-//! RSS stays off (Linux enables RSS only on VER_80). Still
+//! and RSS stays off (Linux enables RSS only on VER_80); the
+//! runtime MTU switch (#1276, via [`Rtl8126MtuControl`])
+//! reprograms the EEE timer per MTU and follows Linux's
+//! `fix_features` offload rules. Still
 //! missing: EEE PHY advertisement and GMII auto-negotiation
 //! tuning.
 //!
@@ -252,6 +254,18 @@ pub const fn mac_version_from_xid(xid: u32) -> MacVersion {
     match xid {
         0x649 | 0x64a => MacVersion::Ver70,
         other => MacVersion::Unknown(other),
+    }
+}
+
+impl MacVersion {
+    /// Linux `RTL_GIGA_MAC_VER_*` number for MTU validation
+    /// (`None` for an unknown XID — fail-closed: unknown
+    /// versions are treated as modern by `mtu_transition`).
+    pub const fn version_number(&self) -> Option<u32> {
+        match self {
+            MacVersion::Ver70 => Some(70),
+            MacVersion::Unknown(_) => None,
+        }
     }
 }
 
@@ -621,6 +635,11 @@ pub struct Rtl8126Nic {
     pub xid: u32,
     /// MAC version detected from TxConfig.XID at bring-up.
     pub mac_version: MacVersion,
+    /// Programmed interface MTU, the source of truth for
+    /// `Interface::mtu` / `HwNic::mtu` and the offload
+    /// advertisement. The [`Rtl8126MtuControl`] hook is the only
+    /// writer after bring-up.
+    mtu: IrqSafeSpinLock<u32>,
     /// Last WoL option set programmed via [`Rtl8126Nic::set_wol_opts`].
     wol_opts: IrqSafeSpinLock<crate::features::WolOpts>,
     /// True when PHYStatus.LinkSts read 1 at bring-up.
@@ -850,6 +869,7 @@ impl Rtl8126Nic {
             mac,
             xid,
             mac_version,
+            mtu: IrqSafeSpinLock::new(1500),
             wol_opts: IrqSafeSpinLock::new(crate::features::WolOpts::NONE),
             link_up,
             suspended: AtomicBool::new(false),
@@ -1096,6 +1116,48 @@ impl Rtl8126Nic {
     /// `rtl8169_get_lpi_caps` shape: 100/1000/2500/5000FD).
     pub fn eee_caps(&self) -> crate::features::EeeCaps {
         crate::features::eee_lpi_caps(70)
+    }
+
+    /// MAC version for MTU validation, via
+    /// [`MacVersion::version_number`].
+    fn mac_version_opt(&self) -> Option<u32> {
+        self.mac_version.version_number()
+    }
+
+    /// Program a validated MTU switch on live hardware (Linux
+    /// `rtl8169_change_mtu` shape for the 8125 family): the
+    /// jumbo Config bits via `apply_jumbo_config` under the
+    /// 9346CR unlock — a no-op for VER_61..80, where Linux's
+    /// `rtl_jumbo_config` takes the default arm — and the EEE
+    /// TX LPI idle timer via `apply_eee_txidle` (Linux's
+    /// `rtl_set_eee_txidle_timer` VER_61..LAST arm writes
+    /// `EEE_TXIDLE_TIMER_8125` = mtu + ETH_HLEN + 0x20; the
+    /// only live register write in `change_mtu` for this
+    /// family). RMS is NOT touched: it stays at the 16383
+    /// buffer bound, which covers every MTU up to the version
+    /// max, and Linux's change_mtu does not touch it either
+    /// (`rtl_set_rx_max_size` runs at hw-start only). MTPS is
+    /// NOT touched: the bring-up jumbo-max value already covers
+    /// any MTU up to the version max, and Linux's change_mtu
+    /// writes it only for VER_31..33. Rings are NOT resized:
+    /// RX buffers (16383) and TX slots (16384) already cover
+    /// the version max. Pause capabilities need phylink, which
+    /// NARF does not have; PCIe read-request size is never
+    /// programmed in-tree.
+    fn program_mtu(&self, program: crate::features::MtuProgram) {
+        // SAFETY: probe-time controller owns the BAR exclusively;
+        // the hook runs on that same controller.
+        unsafe {
+            self.mmio.write8(REG_9346CR, EEM_CONFIG_WRITE);
+            let mut regs = crate::features::MmioRegs(&self.mmio);
+            crate::features::apply_jumbo_config(
+                &mut regs,
+                self.mac_version_opt().unwrap_or(0),
+                program.jumbo,
+            );
+            crate::features::apply_eee_txidle(&mut regs, program.mtu);
+            self.mmio.write8(REG_9346CR, EEM_NORMAL);
+        }
     }
 
     /// Program Wake-on-LAN options (Linux's `__rtl8169_set_wol`
@@ -1414,6 +1476,34 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         );
     }
 
+    // Runtime MTU switch (#1276): install the DeviceControl hook
+    // so `try_set_mtu` validates + programs the switch instead
+    // of only changing registry metadata, and publish the
+    // initial (MTU 1500) offload advertisement. The stack reads
+    // entry.offloads, and this driver never published one
+    // before, so the stack ran software offload even at MTU
+    // 1500 despite the driver's claimed Interface::offloads —
+    // bind now publishes what the driver already claimed.
+    if let Some(ctrl) = controller(index) {
+        let name = ctrl.ifname();
+        let _ = narf_net::iface::set_device_control(
+            name,
+            Arc::new(Rtl8126MtuControl {
+                controller: ctrl.clone(),
+                name,
+            }),
+        );
+        let initial = crate::features::mtu_transition(ctrl.mac_version_opt(), 1500)
+            .map(offloads_for_program)
+            .unwrap_or(narf_net::OffloadCapabilities {
+                tx_checksum: true,
+                rx_checksum: true,
+                max_tso_bytes: TX_BUF_LEN as u32,
+                vlan_insert: true,
+            });
+        narf_net::iface::set_offloads(name, initial);
+    }
+
     // No pump spawn here: `bring_up` spawned the device's single RX/TX
     // pump pair, fed by the channel pair whose halves occupy the
     // `rx_ipc_ring`/`tx_ipc_ring` slots (igc's discipline). A second
@@ -1664,6 +1754,66 @@ pub struct Rtl8126NicIface {
     name: &'static str,
 }
 
+/// `OffloadCapabilities` matching a validated MTU program: TX
+/// checksum + TSO follow the program; RX checksum and VLAN
+/// insertion are never touched by Linux's `fix_features` rules
+/// and stay advertised.
+fn offloads_for_program(program: crate::features::MtuProgram) -> narf_net::OffloadCapabilities {
+    narf_net::OffloadCapabilities {
+        tx_checksum: program.tx_checksum,
+        rx_checksum: true,
+        max_tso_bytes: if program.tso { TX_BUF_LEN as u32 } else { 0 },
+        vlan_insert: true,
+    }
+}
+
+/// Current (TX checksum, TSO) advertisement for `nic`, derived from
+/// its programmed MTU (Linux `rtl8169_fix_features` rules, via
+/// `features::mtu_transition`). A stored MTU that somehow fails
+/// validation withdraws TX offload (fail-closed — unreachable, since
+/// the hook only stores validated values).
+fn current_tx_offloads(nic: &Rtl8126Nic) -> (bool, bool) {
+    let mtu = *nic.mtu.lock();
+    crate::features::mtu_transition(nic.mac_version_opt(), mtu)
+        .map(|p| (p.tx_checksum, p.tso))
+        .unwrap_or((false, false))
+}
+
+/// Linux `EINVAL` for a rejected MTU (see `netlink_route.rs`).
+const EINVAL: i32 = 22;
+
+/// `iface::DeviceControl` for the RTL8126 family: a proposed MTU
+/// change validates against the version range, programs the
+/// hardware switch, and republishes the offload advertisement
+/// so it always matches the programmed hardware. Any other
+/// metadata change passes through untouched (same MTU ⇒
+/// no-op Ok), and a rejected MTU leaves registry metadata
+/// unchanged (the `configure_device` contract: the hook runs
+/// before commit). The hook compares against the controller's
+/// programmed MTU, not the registry's, so a commit that lost a
+/// race to a rebind self-heals on the next `try_set_mtu` to
+/// the same value.
+#[derive(Debug)]
+pub struct Rtl8126MtuControl {
+    controller: Arc<Rtl8126Nic>,
+    name: &'static str,
+}
+
+impl narf_net::iface::DeviceControl for Rtl8126MtuControl {
+    fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
+        if config.mtu == *self.controller.mtu.lock() {
+            return Ok(());
+        }
+        let program =
+            crate::features::mtu_transition(self.controller.mac_version_opt(), config.mtu)
+                .map_err(|_| EINVAL)?;
+        self.controller.program_mtu(program);
+        *self.controller.mtu.lock() = program.mtu;
+        narf_net::iface::set_offloads(self.name, offloads_for_program(program));
+        Ok(())
+    }
+}
+
 impl narf_net::Interface for Rtl8126NicIface {
     fn name(&self) -> &str {
         // The dynamic `eth%d` name once published (issue #784); the
@@ -1679,20 +1829,25 @@ impl narf_net::Interface for Rtl8126NicIface {
         self.nic.mac
     }
     fn mtu(&self) -> u32 {
-        1500
+        *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
         self.nic.link_up
     }
     fn offloads(&self) -> narf_net::OffloadCapabilities {
         // The TSO byte cap is the TX slot buffer: a TSO packet is
-        // one frame copied into one slot.
-        narf_net::OffloadCapabilities {
-            tx_checksum: true,
-            rx_checksum: true,
-            max_tso_bytes: TX_BUF_LEN as u32,
-            vlan_insert: true,
-        }
+        // one frame copied into one slot. TX offload follows the
+        // programmed MTU (#1276); RX checksum + VLAN insertion
+        // are never withdrawn by the fix_features rules.
+        let mtu = *self.nic.mtu.lock();
+        crate::features::mtu_transition(self.nic.mac_version_opt(), mtu)
+            .map(offloads_for_program)
+            .unwrap_or(narf_net::OffloadCapabilities {
+                tx_checksum: false,
+                rx_checksum: true,
+                max_tso_bytes: 0,
+                vlan_insert: true,
+            })
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         // Ring consumer attached: enable the RX mirror (e1000's
@@ -1719,7 +1874,7 @@ impl crate::HwNic for Rtl8126NicIface {
         self.nic.mac
     }
     fn mtu(&self) -> u32 {
-        1500
+        *self.nic.mtu.lock()
     }
     fn link_up(&self) -> bool {
         self.nic.link_up
@@ -1728,10 +1883,15 @@ impl crate::HwNic for Rtl8126NicIface {
         crate::NicModel::RealtekRtl8168
     }
     fn caps(&self) -> crate::NicCaps {
-        crate::NicCaps::TX_CSUM
-            | crate::NicCaps::RX_CSUM
-            | crate::NicCaps::TSO
-            | crate::NicCaps::VLAN_TAGGING
+        let (tx_checksum, tso) = current_tx_offloads(&self.nic);
+        let mut caps = crate::NicCaps::RX_CSUM | crate::NicCaps::VLAN_TAGGING;
+        if tx_checksum {
+            caps = caps | crate::NicCaps::TX_CSUM;
+        }
+        if tso {
+            caps = caps | crate::NicCaps::TSO;
+        }
+        caps
     }
     fn ring_capacity(&self) -> usize {
         RING_LEN

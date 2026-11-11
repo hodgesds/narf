@@ -474,3 +474,98 @@ fn smoke_rtl8125_phystat_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_phystat_decode);
+
+// ── Runtime MTU switch (#1276) ───────────────────────────────────────
+
+fn smoke_rtl8125_mtu_switch() -> TestResult {
+    use super::RtlNic;
+    use crate::features::{
+        apply_eee_txidle, apply_jumbo_config, eee_txidle_timer, mtu_transition, RegLog,
+        REG_CONFIG3, REG_CONFIG4, REG_EEE_TXIDLE_TIMER_8125,
+    };
+
+    // Version map: every known 8125 kind is 16K class (VER_61..66).
+    for (kind, ver) in [
+        (ChipKind::Rtl8125A, 61u32),
+        (ChipKind::Rtl8125B, 63),
+        (ChipKind::Rtl8125D, 64),
+        (ChipKind::Rtl8125Cp, 65),
+        (ChipKind::Rtl8125Bp, 66),
+    ] {
+        if RtlNic::mac_version_for_kind(kind) != ver {
+            return TestResult::Fail("chip-kind → MAC version map drifted");
+        }
+        // Range: floor 68, ceiling = 16K max.
+        if mtu_transition(Some(ver), 67).is_ok() {
+            return TestResult::Fail("MTU 67 accepted below the 68 floor");
+        }
+        if mtu_transition(Some(ver), 68).is_err() {
+            return TestResult::Fail("MTU 68 rejected");
+        }
+        if mtu_transition(Some(ver), 16 * 1024 - 22).is_err() {
+            return TestResult::Fail("16K max MTU rejected");
+        }
+        if mtu_transition(Some(ver), 16 * 1024 - 21).is_ok() {
+            return TestResult::Fail("MTU above the 16K max accepted");
+        }
+    }
+    // Unknown XID maps to version 0, which the hook reports as
+    // no version: fail-closed 9K ceiling + modern offload rules.
+    if RtlNic::mac_version_for_kind(ChipKind::Unknown(0x999)) != 0 {
+        return TestResult::Fail("unknown kind must map to version 0");
+    }
+    if mtu_transition(None, 9 * 1024 - 22).is_err() {
+        return TestResult::Fail("unknown-version max MTU rejected");
+    }
+    if mtu_transition(None, 9 * 1024 - 21).is_ok() {
+        return TestResult::Fail("unknown-version MTU above max accepted");
+    }
+    // Jumbo boundary + fix_features matrix on VER_61.
+    let plain = match mtu_transition(Some(61), 1500) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("1500 rejected"),
+    };
+    if plain.jumbo || !plain.tx_checksum || !plain.tso {
+        return TestResult::Fail("1500 must be non-jumbo with full TX offload");
+    }
+    let jumbo = match mtu_transition(Some(61), 1501) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("1501 rejected"),
+    };
+    if !jumbo.jumbo || jumbo.tx_checksum || jumbo.tso {
+        return TestResult::Fail("jumbo on VER_61 must drop CSUM + TSO");
+    }
+    let big = match mtu_transition(Some(61), 2048) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("2048 rejected"),
+    };
+    if big.tso || big.tx_checksum {
+        return TestResult::Fail("2048 on VER_61 must drop CSUM + TSO");
+    }
+    // Fixture register conversation: the VER_61 jumbo program
+    // writes no Config bits (Linux `rtl_jumbo_config` default
+    // arm) and re-times the EEE idle timer to mtu + 14 + 0x20.
+    let mut regs = RegLog::new();
+    // SAFETY: RegLog fixture — no hardware is touched.
+    unsafe {
+        apply_jumbo_config(&mut regs, 61, true);
+        apply_eee_txidle(&mut regs, 9000);
+    }
+    if !regs.writes_to(REG_CONFIG3).is_empty() || !regs.writes_to(REG_CONFIG4).is_empty() {
+        return TestResult::Fail("VER_61 jumbo program must not touch Config3/4");
+    }
+    match regs.last_write_to(REG_EEE_TXIDLE_TIMER_8125) {
+        Some(w) if w.width == 2 && w.value == eee_txidle_timer(9000) as u32 => {}
+        _ => return TestResult::Fail("EEE TXIDLE timer write missing or wrong"),
+    }
+    // A non-jumbo MTU re-times the same register.
+    let mut regs = RegLog::new();
+    // SAFETY: RegLog fixture — no hardware is touched.
+    unsafe { apply_eee_txidle(&mut regs, 1500) };
+    match regs.last_write_to(REG_EEE_TXIDLE_TIMER_8125) {
+        Some(w) if w.value == eee_txidle_timer(1500) as u32 => {}
+        _ => return TestResult::Fail("EEE TXIDLE timer write missing at MTU 1500"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_mtu_switch);

@@ -308,3 +308,92 @@ fn smoke_rtl8126_mac_decode_helpers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_mac_decode_helpers);
+
+// ── Runtime MTU switch (#1276) ───────────────────────────────────────
+
+fn smoke_rtl8126_mtu_switch() -> TestResult {
+    use crate::features::{
+        apply_eee_txidle, apply_jumbo_config, eee_txidle_timer, mtu_transition, RegLog,
+        REG_CONFIG3, REG_CONFIG4, REG_EEE_TXIDLE_TIMER_8125,
+    };
+
+    // Version map: both RTL8126A XIDs are VER_70 (16K class);
+    // anything else is unknown (fail-closed 9K ceiling).
+    if mac_version_from_xid(0x649) != MacVersion::Ver70
+        || mac_version_from_xid(0x64a) != MacVersion::Ver70
+    {
+        return TestResult::Fail("RTL8126A XIDs must decode to VER_70");
+    }
+    if MacVersion::Ver70.version_number() != Some(70)
+        || MacVersion::Unknown(0x999).version_number().is_some()
+    {
+        return TestResult::Fail("MacVersion::version_number drifted");
+    }
+    // Range: floor 68, ceiling = 16K max.
+    if mtu_transition(Some(70), 67).is_ok() {
+        return TestResult::Fail("MTU 67 accepted below the 68 floor");
+    }
+    if mtu_transition(Some(70), 68).is_err() {
+        return TestResult::Fail("MTU 68 rejected");
+    }
+    if mtu_transition(Some(70), 16 * 1024 - 22).is_err() {
+        return TestResult::Fail("16K max MTU rejected");
+    }
+    if mtu_transition(Some(70), 16 * 1024 - 21).is_ok() {
+        return TestResult::Fail("MTU above the 16K max accepted");
+    }
+    if mtu_transition(None, 9 * 1024 - 22).is_err() {
+        return TestResult::Fail("unknown-version max MTU rejected");
+    }
+    if mtu_transition(None, 9 * 1024 - 21).is_ok() {
+        return TestResult::Fail("unknown-version MTU above max accepted");
+    }
+    // Jumbo boundary + fix_features matrix on VER_70.
+    let plain = match mtu_transition(Some(70), 1500) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("1500 rejected"),
+    };
+    if plain.jumbo || !plain.tx_checksum || !plain.tso {
+        return TestResult::Fail("1500 must be non-jumbo with full TX offload");
+    }
+    let jumbo = match mtu_transition(Some(70), 1501) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("1501 rejected"),
+    };
+    if !jumbo.jumbo || jumbo.tx_checksum || jumbo.tso {
+        return TestResult::Fail("jumbo on VER_70 must drop CSUM + TSO");
+    }
+    let big = match mtu_transition(Some(70), 2048) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("2048 rejected"),
+    };
+    if big.tso || big.tx_checksum {
+        return TestResult::Fail("2048 on VER_70 must drop CSUM + TSO");
+    }
+    // Fixture register conversation: the VER_70 jumbo program
+    // writes no Config bits (Linux `rtl_jumbo_config` default
+    // arm) and re-times the EEE idle timer to mtu + 14 + 0x20.
+    let mut regs = RegLog::new();
+    // SAFETY: RegLog fixture — no hardware is touched.
+    unsafe {
+        apply_jumbo_config(&mut regs, 70, true);
+        apply_eee_txidle(&mut regs, 9000);
+    }
+    if !regs.writes_to(REG_CONFIG3).is_empty() || !regs.writes_to(REG_CONFIG4).is_empty() {
+        return TestResult::Fail("VER_70 jumbo program must not touch Config3/4");
+    }
+    match regs.last_write_to(REG_EEE_TXIDLE_TIMER_8125) {
+        Some(w) if w.width == 2 && w.value == eee_txidle_timer(9000) as u32 => {}
+        _ => return TestResult::Fail("EEE TXIDLE timer write missing or wrong"),
+    }
+    // A non-jumbo MTU re-times the same register.
+    let mut regs = RegLog::new();
+    // SAFETY: RegLog fixture — no hardware is touched.
+    unsafe { apply_eee_txidle(&mut regs, 1500) };
+    match regs.last_write_to(REG_EEE_TXIDLE_TIMER_8125) {
+        Some(w) if w.value == eee_txidle_timer(1500) as u32 => {}
+        _ => return TestResult::Fail("EEE TXIDLE timer write missing at MTU 1500"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8126", smoke_rtl8126_mtu_switch);
