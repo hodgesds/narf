@@ -640,7 +640,15 @@ pub fn validate_sme_ies(bytes: &[u8], protected: bool) -> Result<(), Error> {
                 return Err(Error::InvalidBss);
             }
             rsn_seen = true;
-            let rsn = RsnIe::decode_body(body).ok_or(Error::InvalidBss)?;
+            let mut rsn = RsnIe::decode_body(body).ok_or(Error::InvalidBss)?;
+            // The PTKSA/GTKSA replay-counter counts (RSN Capabilities bits
+            // 2..=5) describe the sender's receive counters, not the suite
+            // being negotiated. wpa_supplicant sets PTKSA to 16 counters
+            // (0x000c) for every AP that has WMM (`rsn_supp_capab`). The
+            // element is replaced by the native owner's own RSNE before the
+            // first transmission, so only its selection is compared.
+            rsn.rsn_capabilities &=
+                !(rsn::RSN_CAP_PTKSA_REPLAY_COUNTER_MASK | rsn::RSN_CAP_GTKSA_REPLAY_COUNTER_MASK);
             if !protected || rsn != RsnIe::wpa2_psk_ccmp() {
                 return Err(Error::UnsupportedSecurity);
             }

@@ -472,3 +472,48 @@ kernel_test_in!(
     "drivers/wireless/mt7921/networkmanager",
     mt7922_networkmanager_discovery_with_absent_family_lookup
 );
+
+/// The association elements wpa_supplicant 2.12 hands a CONNECT for a
+/// WPA2-PSK network on an AP with WMM: its RSN element advertises sixteen
+/// PTKSA replay counters (RSN Capabilities 0x000c, `rsn_supp_capab`), then
+/// Supported Operating Classes and Extended Capabilities follow. The native
+/// station owner replaces the RSN element with its own, so it must admit
+/// this request for the 5200 MHz BSS rather than fail the join validation.
+fn mt7922_admits_wpa_supplicant_wpa2_association_elements() -> TestResult {
+    let Ok(iface) = Mt76Iface::new(String::from("wlan-wpas"), mt7922()) else {
+        return TestResult::Fail("radio identity");
+    };
+    // What the nl80211 CONNECT parser keys the PMK path on.
+    if !iface.supports_handshake_offload()
+        || iface.supports_external_supplicant()
+        || !iface.supports_ap_authenticator()
+    {
+        return TestResult::Fail("MT7921 station capability set changed");
+    }
+    let mut ie = alloc::vec![
+        48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2,
+        0x0c, 0x00,
+    ];
+    ie.extend_from_slice(&[59, 4, 115, 115, 116, 117]);
+    ie.extend_from_slice(&[127, 10, 0x04, 0, 0x08, 0, 0, 0, 0, 0x40, 0, 0x20]);
+    let request = AssociateRequest {
+        bssid: [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x40],
+        ssid: b"narf-transition".to_vec(),
+        frequency_mhz: 5200,
+        channel: 40,
+        security: narf_wireless::SecurityConfig::Wpa2 { psk: [0x5a; 32] },
+        ie,
+    };
+    match iface.validate_join(&request) {
+        Ok(false) => TestResult::Pass,
+        Ok(true) => TestResult::Fail("5200 MHz classified as 6 GHz"),
+        Err(WirelessError::NotSupported) => {
+            TestResult::Fail("wpa_supplicant's WPA2-PSK association elements refused")
+        }
+        Err(_) => TestResult::Fail("WPA2-PSK join to 5200 MHz failed validation"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/networkmanager",
+    mt7922_admits_wpa_supplicant_wpa2_association_elements
+);
