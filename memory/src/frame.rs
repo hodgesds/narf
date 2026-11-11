@@ -381,7 +381,10 @@ impl fmt::Write for ReportBuf {
 /// so it is safe from any context, including one that already holds a zone
 /// lock (that zone is then reported as busy). Allocates nothing.
 pub fn write_free_state(out: &mut impl fmt::Write) -> fmt::Result {
+    #[cfg(feature = "cgroup")]
     let (denials, denied_pid) = crate::cgroup_charge::denials();
+    #[cfg(not(feature = "cgroup"))]
+    let (denials, denied_pid) = (0usize, 0usize);
     write!(
         out,
         "frame: free state, double frees refused {}, cgroup charges refused {denials} \
