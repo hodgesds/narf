@@ -252,6 +252,9 @@ pub struct Tcb {
     /// When `pump_send` stopped for the device (queue stopped or TSQ limit);
     /// 0 when it is not waiting. Drives the lost-wake probe.
     pub tx_wait_since_cycles: u64,
+    /// Counts RTO rewinds of `snd_nxt` to `snd_una` (go-back-N). A refused
+    /// segment is only un-sent if none happened since it was marked.
+    pub rewind_epoch: u32,
 
     // ── Retransmit ──
     pub rtt: RttEstimator,
@@ -653,6 +656,7 @@ impl Tcb {
             xmit_owner: false,
             xmit_again: false,
             tx_wait_since_cycles: 0,
+            rewind_epoch: 0,
             rtt: RttEstimator::new(),
             retx_queue: VecDeque::new(),
             retx_deadline_cycles: 0,
@@ -3413,6 +3417,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // Reset the sender to retransmit from snd_una.
             t.send_buf.rewind_for_retransmit();
             t.snd_nxt = t.snd_una;
+            t.rewind_epoch = t.rewind_epoch.wrapping_add(1);
         }
         (ok, before_backoff)
     };
@@ -3840,6 +3845,8 @@ struct Marked {
     prev_high: u32,
     /// Added to `total_retrans` for this segment.
     resent: u32,
+    /// `rewind_epoch` when the segment was marked.
+    epoch: u32,
 }
 
 /// `tcp_write_xmit` for an egress with transmit backpressure.
@@ -3973,6 +3980,7 @@ fn pump_send_queued_once(
                 tso: (tso_max > 0 && len > mss).then_some(mss as u16),
                 prev_high,
                 resent,
+                epoch: t.rewind_epoch,
             }
         };
         let flags = match (marked.payload.is_empty(), marked.fin) {
@@ -4014,21 +4022,43 @@ fn pump_send_queued_once(
 }
 
 /// Undo `pump_send_queued_once`'s mark for a segment the device refused.
-/// Only if nothing moved meanwhile: an RTO that rewound `snd_nxt` to
-/// `snd_una` already covers the segment by go-back-N.
+///
+/// Not after an RTO rewound `snd_nxt` since the mark: go-back-N resends from
+/// `snd_una` and covers the segment. Otherwise everything of the segment the
+/// peer has not acknowledged becomes unsent again. That is the whole segment
+/// unless an ACK arrived while it was being offered: during go-back-N the
+/// segment's head was transmitted before the RTO, so the peer can
+/// acknowledge into its middle. The acknowledged part is gone from the send
+/// buffer; the rest — marked sent, never transmitted, and with the
+/// retransmit queue just emptied by that ACK covered by no timer — starts at
+/// `snd_una`. Leaving it marked hung the upload, or the close when the
+/// segment carried the FIN.
 fn unsend(t: &mut Tcb, marked: &Marked) {
     let len = marked.payload.len() as u32;
-    let end = marked
-        .seq
-        .wrapping_add(len)
-        .wrapping_add(u32::from(marked.fin));
-    if t.snd_nxt != end || seq_lt(marked.seq, t.snd_una) {
+    let data_end = marked.seq.wrapping_add(len);
+    let end = data_end.wrapping_add(u32::from(marked.fin));
+    if t.rewind_epoch != marked.epoch || t.snd_nxt != end {
         return;
     }
-    t.snd_nxt = marked.seq;
-    t.send_buf.unmark_sent(len as usize);
+    let start = if seq_lt(marked.seq, t.snd_una) {
+        t.snd_una
+    } else {
+        marked.seq
+    };
+    if !seq_lt(start, end) {
+        return;
+    }
+    t.snd_nxt = start;
+    if seq_lt(start, data_end) {
+        t.send_buf
+            .unmark_sent(data_end.wrapping_sub(start) as usize);
+    }
     if t.snd_high == end && seq_lt(marked.prev_high, end) {
-        t.snd_high = marked.prev_high;
+        t.snd_high = if seq_lt(marked.prev_high, start) {
+            start
+        } else {
+            marked.prev_high
+        };
     }
     t.total_retrans = t.total_retrans.saturating_sub(marked.resent);
 }
