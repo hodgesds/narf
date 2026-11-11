@@ -11,8 +11,9 @@
 #
 # A block holds: /proc/loadavg, /proc/meminfo, per-CPU /proc/stat deltas
 # (busy and system percent; `frozen` for a CPU whose counters stood still),
-# /proc/interrupts deltas of the NIC, NVMe and GPU lines, the non-zero
-# `ethtool -S` counters that changed, /sys/class/drm/card*/device/mem_info_*,
+# /proc/interrupts deltas of the NIC, NVMe and GPU lines (every line that
+# moved, where the kernel does not name its lines after their devices), the
+# non-zero `ethtool -S` counters that changed, /sys/class/drm/card*/device/mem_info_*,
 # process counts by state and the five largest processes.
 #
 # Built so that the hang it is waiting for cannot silence it early:
@@ -94,15 +95,13 @@ sample_cpus() {
 }
 
 sample_interrupts() {
-  local line key sum field rest quiet=0 line_out="irq deltas:"
+  local line key sum field rest quiet=0 named=0 line_out="irq deltas:" other=""
   local -a fields
   while read -r line; do
-    case $line in
-      *igc* | *eth* | *enp* | *nvme* | *amdgpu* | *i915* | *virtio* | *e1000*) ;;
-      *) continue ;;
-    esac
     key=${line%%:*}
     rest=${line#*:}
+    case $key in *[!0-9\ ]* | '') continue ;; esac
+    key=${key// /}
     # shellcheck disable=SC2206
     fields=($rest)
     sum=0
@@ -113,14 +112,24 @@ sample_interrupts() {
     # The device name is the last word of the line.
     key="$key/${fields[-1]}"
     if [ -n "${irq_prev[$key]}" ]; then
-      if ((sum != irq_prev[$key])); then
-        line_out+=" $key=+$((sum - irq_prev[$key]))"
-      else
+      if ((sum == irq_prev[$key])); then
         quiet=$((quiet + 1))
+      else
+        case $line in
+          *igc* | *eth* | *enp* | *nvme* | *amdgpu* | *i915* | *virtio* | *e1000*)
+            named=1
+            line_out+=" $key=+$((sum - irq_prev[$key]))"
+            ;;
+          *) other+=" $key=+$((sum - irq_prev[$key]))" ;;
+        esac
       fi
     fi
     irq_prev[$key]=$sum
   done < /proc/interrupts 2> /dev/null
+  # A kernel that does not name its interrupt lines after their devices
+  # (NARF labels most of them `legacy`) gets every line that moved instead;
+  # the vector numbers are in its boot log.
+  ((named)) || line_out+=$other
   add "$line_out ($quiet lines unchanged)"
 }
 
