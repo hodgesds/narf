@@ -431,7 +431,7 @@ fn hw_ip_info(
         info.ib_size_alignment = size;
         info.available_rings = available_rings(&snap.navi22, submission, ip);
     }
-    Ok(as_bytes(&info))
+    Ok(crate::amdgpu_info::hw_ip_bytes(&info))
 }
 
 /// `AMDGPU_INFO_HW_IP_COUNT`: `count` for an existing block, gated by the

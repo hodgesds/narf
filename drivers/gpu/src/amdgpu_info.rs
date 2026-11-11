@@ -374,6 +374,32 @@ pub(crate) fn as_bytes<T: Copy>(value: &T) -> Vec<u8> {
     }
 }
 
+/// `struct drm_amdgpu_info_hw_ip` as the bytes the ioctl copies out.
+///
+/// Unlike the other reply structs this one ends in alignment padding: 36
+/// bytes of fields in a 40-byte struct. [`as_bytes`] would hand out
+/// whatever the stack held in those four bytes. amdgpu_info_ioctl copies
+/// the padding of its zero-initialized `ip = {}`, so the fields are copied
+/// here and the tail stays zero.
+pub(crate) fn hw_ip_bytes(info: &uapi::DrmAmdgpuInfoHwIp) -> Vec<u8> {
+    // The fields end with `userq_num_slots`.
+    let fields = core::mem::offset_of!(uapi::DrmAmdgpuInfoHwIp, userq_num_slots)
+        + core::mem::size_of::<u32>();
+    let mut out = vec![0u8; core::mem::size_of::<uapi::DrmAmdgpuInfoHwIp>()];
+    // SAFETY: `info` is a live `#[repr(C)]` struct whose fields (u32, u32,
+    // u64, then u32s) fill its first `fields` bytes without a gap, so every
+    // byte read is initialized; `out` is longer than that and is a fresh
+    // allocation, so the ranges do not overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (info as *const uapi::DrmAmdgpuInfoHwIp).cast::<u8>(),
+            out.as_mut_ptr(),
+            fields,
+        );
+    }
+    out
+}
+
 /// `drm_amdgpu_heap_info`.
 ///
 /// `heap_usage` is zero because nothing allocates from these heaps yet. Linux
@@ -752,7 +778,7 @@ fn hw_ip_info(snap: &Snapshot, ip_type: u32, ip_instance: u32) -> Result<Vec<u8>
         info.ip_discovery_version =
             u32::from(block.major) << 16 | u32::from(block.minor) << 8 | u32::from(block.revision);
     }
-    Ok(as_bytes(&info))
+    Ok(hw_ip_bytes(&info))
 }
 
 /// The rings of `ip_type` instance `ip_instance` that DRM card `card` runs
@@ -1149,6 +1175,11 @@ mod topology_tests {
         let word = |at| u32::from_le_bytes(dec[at..at + 4].try_into().unwrap());
         if (word(0), word(4), word(16), word(20), word(24)) != (5, 0, 256, 64, 0) {
             return TestResult::Fail("HW_IP_INFO(VCN_DEC) is not the VCN block at 256/64");
+        }
+        // The struct's four bytes of tail padding are zero, as in Linux's
+        // `ip = {}`, never what the stack held.
+        if dec.len() != 40 || dec[36..] != [0; 4] {
+            return TestResult::Fail("HW_IP_INFO reply's tail padding is not zero");
         }
         if count(uapi::AMDGPU_HW_IP_VCN_DEC) != Ok(1u32.to_le_bytes().to_vec()) {
             return TestResult::Fail("HW_IP_COUNT(VCN_DEC) is not num_vcn_inst");
