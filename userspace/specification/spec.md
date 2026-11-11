@@ -803,7 +803,11 @@ file position and mutable status flags. `dup*`, `F_DUPFD`, fork inheritance,
 and `SCM_RIGHTS` alias that object, while `FD_CLOEXEC` remains per descriptor;
 independent opens create independent descriptions. Consequently `lseek`,
 sequential I/O, readiness-at-offset, `/proc/*/fdinfo`, and `F_GETFL/F_SETFL`
-observe changes made through any alias. Stdin is `O_RDONLY`, stdout/stderr are
+observe changes made through any alias. The description also carries the path
+it was opened on (`OpenFileDescription::opened_path`, Linux `file->f_path`):
+a descriptor installed by `SCM_RIGHTS` in another task reads the sender's
+path through `/proc/<pid>/fd/<n>`, and a pathless one starts with none.
+Stdin is `O_RDONLY`, stdout/stderr are
 `O_WRONLY`, and sockets/socketpairs are `O_RDWR`; constructors do not rely on
 type-based access-mode exceptions. Sequential transfer syscalls pin these
 descriptions, lock distinct implicit positions in stable address order (or an

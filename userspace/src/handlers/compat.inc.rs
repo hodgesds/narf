@@ -13901,6 +13901,15 @@ fn install_recv_ancillary(
     let task = current_task_id();
     let mut installed = 0;
     for passed in fds.into_iter().take(rights_to_install) {
+        // `scm_detach_fds` → `receive_fd` installs the sender's `struct
+        // file` itself, `f_path` included, so `/proc/<pid>/fd/<n>` of the new
+        // descriptor names the file the sender opened. sshd's monitor passes
+        // the pty it allocated to the session process this way, and
+        // `ttyname` of the session's stdin reads that link.
+        let opened_path = passed
+            .description
+            .as_ref()
+            .and_then(|description| description.opened_path());
         if let Some(newfd) = fd::with_table_alloc(task, |t| {
             t.open_transferred(
                 passed.ops,
@@ -13911,6 +13920,15 @@ fn install_recv_ancillary(
         })
         .flatten()
         {
+            match opened_path {
+                Some(path) => {
+                    let mount_id = current_mount_id_at(&path);
+                    crate::mqueue::register_fd_path_owned(task, newfd, path, mount_id);
+                }
+                // A pathless file must not inherit the row a previous user
+                // of this descriptor number left behind (`fd::install`).
+                None => crate::mqueue::forget_fd_path(task, newfd),
+            }
             let offset = rights_start + 16 + installed * 4;
             ctrl[offset..offset + 4].copy_from_slice(&newfd.to_le_bytes());
             installed += 1;
@@ -13942,6 +13960,7 @@ fn install_recv_ancillary(
             let offset = rights_start + 16 + i * 4;
             let newfd = u32::from_le_bytes(ctrl[offset..offset + 4].try_into().unwrap());
             let _ = fd::with_table(task, |table| table.close(newfd));
+            crate::mqueue::forget_fd_path(task, newfd);
         }
         used = 0;
         truncated = true;
