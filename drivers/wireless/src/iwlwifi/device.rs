@@ -1878,16 +1878,17 @@ impl WirelessNetIface for Device {
     }
     /// mld/mac80211.c `iwl_mac_hw_set_wiphy` station `ext_capab[0]` on an
     /// 11be NVM: IWL_MLD_EMLSR_CAPA as EML capabilities, exactly what the
-    /// native multiple-link request carries. NARF negotiates TID-to-link
-    /// mapping (SAME, one both-directions map — `sc_ttlm_neg`, wire values
-    /// verified #1553) and link reconfiguration (ML element of type
-    /// RECONF with per-station profiles, response status duples + group
-    /// key data — `sc_ttlm_neg`, wire layout verified #1553) and has no
-    /// UHR ML power management, so `mld_capa_and_ops` carries the
-    /// TTLM-negotiation SAME bit plus the link reconfiguration support
-    /// bit and `ext_mld_capa_and_ops` stays 0, and no Extended
-    /// Capabilities bit (ext_capa_base) is claimed because the native
-    /// request carries no Extended Capabilities element.
+    /// native multiple-link request carries. `mld_capa_and_ops` stays 0:
+    /// `sc_ttlm_neg` holds the negotiated TID-to-link mapping and link
+    /// reconfiguration frame engine (wire values verified #1553), but no
+    /// Protected EHT Action RX/TX transport and no `set_ttlm` /
+    /// `assoc_ml_reconf` request path reach it yet, so neither the
+    /// TTLM-negotiation bits nor `LINK_RECONF_SUPPORT` are claimed (Linux
+    /// mac80211 only advertises what `ieee80211_process_neg_ttlm_req` /
+    /// `ieee80211_process_ml_reconf_resp` actually service). There is no
+    /// UHR ML power management, so `ext_mld_capa_and_ops` stays 0, and no
+    /// Extended Capabilities bit (ext_capa_base) is claimed because the
+    /// native request carries no Extended Capabilities element.
     fn iftype_extended_capabilities(&self) -> Vec<narf_wireless::IftypeExtendedCapability> {
         if !self.supports_mlo() {
             return Vec::new();
@@ -1897,8 +1898,7 @@ impl WirelessNetIface for Device {
             capabilities: Vec::new(),
             mask: Vec::new(),
             eml_capabilities: narf_wireless::association::mlo::EmlCapabilities::INTEL_MLD_LOCAL.0,
-            mld_capa_and_ops: super::sc_ttlm_neg::MLD_CAP_OP_TTLM_NEG_SAME
-                | super::sc_ttlm_neg::MLD_CAP_OP_LINK_RECONF_SUPPORT,
+            mld_capa_and_ops: 0,
             ext_mld_capa_and_ops: 0,
         }]
     }

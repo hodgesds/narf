@@ -428,12 +428,12 @@ kernel_test_in!(
     smoke_iwl_device_current_policy_closes_queued_tx_copied_rx_and_retains_stop
 );
 
-fn smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_and_link_reconf() -> TestResult {
-    // The station MLD Capabilities and Operations field advertises
-    // negotiated TTLM (SAME, #1553 verified) and link reconfiguration
-    // (0x2000, wire layout verified #1553) and nothing else.
-    // `supports_mlo` keys off `phy.eht`, so build the fixture device
-    // with an EHT PHY.
+fn smoke_iwl_device_mld_capa_withholds_unwired_ttlm_and_link_reconf() -> TestResult {
+    // The station MLD Capabilities and Operations field claims neither
+    // negotiated TTLM nor link reconfiguration: `sc_ttlm_neg` has no
+    // Protected EHT Action transport or request path yet, and Linux
+    // mac80211 only advertises what it services. `supports_mlo` keys off
+    // `phy.eht`, so build the fixture device with an EHT PHY.
     let fixture = Fixture::new_with_eht(false);
     let device = fixture.device.as_ref().unwrap();
     let caps = narf_wireless::WirelessNetIface::iftype_extended_capabilities(&**device);
@@ -443,19 +443,14 @@ fn smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_and_link_reconf() -> Tes
         );
     }
     let cap = &caps[0];
-    if cap.iftype != 2
-        || cap.mld_capa_and_ops
-            != super::super::sc_ttlm_neg::MLD_CAP_OP_TTLM_NEG_SAME
-                | super::super::sc_ttlm_neg::MLD_CAP_OP_LINK_RECONF_SUPPORT
-        || cap.ext_mld_capa_and_ops != 0
-    {
+    if cap.iftype != 2 || cap.mld_capa_and_ops != 0 || cap.ext_mld_capa_and_ops != 0 {
         return TestResult::Fail(
-            "station MLD capabilities do not advertise TTLM negotiation and link reconfiguration",
+            "station MLD capabilities claim TTLM negotiation or link reconfiguration",
         );
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/wireless/iwlwifi/mlo",
-    smoke_iwl_device_mld_capa_advertises_negotiated_ttlm_and_link_reconf
+    smoke_iwl_device_mld_capa_withholds_unwired_ttlm_and_link_reconf
 );

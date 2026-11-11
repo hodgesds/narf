@@ -41,10 +41,10 @@
 //! indicator, switch time, expected duration, per-TID link maps) is
 //! Linux `WLAN_EID_EXT_TID_TO_LINK_MAPPING` (`ieee80211.h:1827`) and
 //! `ieee80211_tid_to_link_map_size_ok` (`ieee80211-eht.h:1201`).
-//! Negotiated TTLM is therefore ADVERTISED: `device.rs` sets the
-//! TID-to-link-map negotiation SAME bit in `mld_capa_and_ops`
-//! (`MLD_CAP_OP_TTLM_NEG_SAME`), matching this engine's single
-//! both-directions map.
+//! Negotiated TTLM is NOT advertised: `device.rs` leaves
+//! `mld_capa_and_ops` at 0 until the action-frame transport below exists
+//! (`MLD_CAP_OP_TTLM_NEG_SAME` is the bit this engine's single
+//! both-directions map would claim).
 //!
 //! ML RECONFIGURATION, VERIFIED (#1553). The request carries a
 //! Multi-Link element of type RECONF with per-station profiles (Linux
@@ -70,15 +70,18 @@
 //! TTLM element on the wire, and no switch time: the new valid set takes
 //! effect when the response is processed, and a negotiated mapping in
 //! effect is clipped to it (a TID left with no link drops the mapping
-//! to the default). Link reconfiguration is therefore ADVERTISED:
-//! `device.rs` sets `IEEE80211_MLD_CAP_OP_LINK_RECONF_SUPPORT` (0x2000,
-//! `ieee80211-eht.h:544`) in `mld_capa_and_ops`.
+//! to the default). Link reconfiguration is NOT advertised either:
+//! `IEEE80211_MLD_CAP_OP_LINK_RECONF_SUPPORT` (0x2000,
+//! `ieee80211-eht.h:544`) stays clear in `device.rs`.
 //!
-//! Standing limitation, shared with the advertised TTLM engine: the
-//! MLME action-frame receive/transmit transport that would call this
-//! engine is still missing; the engine is driven by its fixtures (and
-//! by `Connection::service_ttlm` at switch time for the negotiated
-//! map). An ML element over 255 bytes is refused by the request
+//! Standing limitation, and the reason neither bit is advertised: the
+//! MLME action-frame receive/transmit transport (Linux
+//! `ieee80211_process_neg_ttlm_req`/`_res`, `ieee80211_process_ml_reconf_resp`)
+//! and a `set_ttlm`/`assoc_ml_reconf` request path in `narf_wireless` are
+//! still missing; `begin_request`/`begin_reconf`/`handle_response`/
+//! `handle_reconf_response` are driven only by their fixtures, and
+//! `Connection::service_ttlm` services `due` for a map that production
+//! cannot stage yet. An ML element over 255 bytes is refused by the request
 //! builder (Linux fragments it, `ieee80211_fragment_element`);
 //! fragmentation is a remainder.
 //!
