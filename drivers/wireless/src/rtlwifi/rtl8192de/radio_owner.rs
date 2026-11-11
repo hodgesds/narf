@@ -106,6 +106,14 @@ impl<I: Io, M: Memory> Prepared<I, M> {
         )
         .await?;
         let identity = crate::rtlwifi::radio::factory_identity(factory);
+        // The packet owner's per-function facts (`rtlpci->receive_config`,
+        // `macphymode`, `interfaceindex`, `rf_type`).
+        self.packet.de92.facts = Some(super::packet::de92::Facts {
+            receive_config: radio.receive_config,
+            mode: radio.mode,
+            interface_index: radio.interface_index,
+            rf_type: radio.rf_type,
+        });
         self.rtl8192de = Some(alloc::boxed::Box::new(De92Radio {
             identity,
             radio,

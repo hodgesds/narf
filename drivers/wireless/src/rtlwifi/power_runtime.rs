@@ -281,6 +281,58 @@ pub(super) async fn disable_rtl8723be(io: &impl Io, firmware_ready: bool) -> Res
     io.write8(0x1c, 0x0e)
 }
 
+/// RTL8192DE `rtl92de_card_disable` for the rebuild's power-down. The
+/// retained owner's quiescence (`de92_quiesce`) already ran it after its
+/// descriptor retirement proof and read back its receipt
+/// (`REG_SYS_FUNC_EN + 1 == 0x51` after `_rtl92de_poweroff_adapter`, else
+/// `REG_CR == 0` with `REG_PCIE_CTRL_REG + 1 == 0xff` when
+/// `rtl92d_phy_check_poweroff` kept the shared adapter on for the other
+/// MAC); that state is accepted unchanged, as Linux disables the card once.
+/// A card still enabled (no owner was retained) gets the DMA-stop subset of
+/// `rtl92de_card_disable` (TX DMA stop `0xfe`, TX/RX DMA stop `0xff`, each
+/// with its 50 us, then `REG_CR = 0`); the RF-off / power-off steps need the
+/// configured radio and are left to the fresh owner's `rtl92de_hw_init`
+/// (whose download self-resets a running RAM image).
+pub(super) async fn disable_rtl8192de(io: &impl Io) -> Result<(), Error> {
+    use super::rtl8192de::{fw::REG_SYS_FUNC_EN, power};
+    let fen = io.read8(REG_SYS_FUNC_EN + 1)?;
+    if fen == 0xff && io.read32(0)? == u32::MAX {
+        return Err(Error::Gone);
+    }
+    if fen == 0x51 {
+        return Ok(());
+    }
+    if io.read8(power::REG_CR)? == 0 && io.read8(power::REG_PCIE_CTRL_REG + 1)? == 0xff {
+        return Ok(());
+    }
+    io.write8(power::REG_PCIE_CTRL_REG + 1, 0xfe)?;
+    io.delay_us(50).await;
+    io.write8(power::REG_PCIE_CTRL_REG + 1, 0xff)?;
+    io.delay_us(50).await;
+    io.write8(power::REG_CR, 0)?;
+    if io.read8(power::REG_CR)? != 0 || io.read8(power::REG_PCIE_CTRL_REG + 1)? != 0xff {
+        return Err(Error::Gate);
+    }
+    Ok(())
+}
+
+/// RTL8192DE enable before the fresh firmware download: the
+/// `_rtl92de_init_mac` power prefix (`rtl92d_phy_set_poweron` and the power
+/// document V11 resume, [`super::rtl8192de::power::power_on`]) for this
+/// function's mode and current band, which Linux's `rtl92de_hw_init` runs
+/// before `rtl92d_download_fw`. The fresh owner's `configure_rtl8192de`
+/// issues the same prefix again after the download (the existing NARF
+/// order, as on the probe path, whose power table precedes the first
+/// download).
+pub(super) async fn enable_rtl8192de(
+    io: &impl Io,
+    mode: super::rtl8192de::MacPhyMode,
+    function: u8,
+) -> Result<(), Error> {
+    let band = super::rtl8192de::mode_info(mode, function).current_band;
+    super::rtl8192de::power::power_on(io, mode, function, band).await
+}
+
 /// RTL8192CE / RTL8188CE `rtl92ce_card_disable` for the rebuild's power
 /// down. The retained owner's quiescence (`ce92_quiesce`) already ran
 /// `_rtl92ce_poweroff_adapter` after its descriptor retirement proof and

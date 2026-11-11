@@ -1094,6 +1094,7 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 | super::Chip::Rtl8192ee
                 | super::Chip::Rtl8192ce
                 | super::Chip::Rtl8723be
+                | super::Chip::Rtl8192de
         )
     }
     /// RTL8821AE: the current `NAPC` permission admits the HT station
@@ -1414,6 +1415,12 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 // rtl8723be_set_qos ignores the AP's rows (fixed BK/VI/VO).
                 return super::super::rtl8723be::station::set_qos_all(&self.io);
             }
+            if self.chip == super::Chip::Rtl8192de {
+                // rtl92d_set_qos is rtl92d_dm_init_edca_turbo only (no
+                // register write): the EDCA rows keep their
+                // `rtl92de_hw_init` values.
+                return Ok(());
+            }
             if self.station.ht_profile.is_some() {
                 return super::super::wmm::program_ht(&self.io, p);
             }
@@ -1470,7 +1477,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     ) -> Result<(), Error> {
         let ce = self.chip == super::Chip::Rtl8192ce;
         let be = self.chip == super::Chip::Rtl8723be;
-        let current = if be {
+        let de = self.chip == super::Chip::Rtl8192de;
+        let current = if de {
+            self.packet.de92.erp_timing
+        } else if be {
             self.packet.be8723.erp_timing
         } else if ce {
             self.packet.ce92.erp_timing
@@ -1485,7 +1495,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if new == old {
             return Ok(());
         }
-        if be {
+        if de {
+            // RTL8192DE: `HW_VAR_ACK_PREAMBLE` at `REG_RRSR + 2` with the
+            // programmed `cur_40_prime_sc`, `HW_VAR_SLOT_TIME`.
+            let prime_sc = self.rtl8192de_prime_sc();
+            self.station_publication(environment, || {
+                super::super::rtl8192de::station::erp_changed(&self.io, old, new, prime_sc)
+                    .map_err(|_| RadioError::State)
+            })?;
+            self.packet.de92.erp_timing = Some(new);
+        } else if be {
             // RTL8723BE: `HW_VAR_ACK_PREAMBLE` at `REG_TRXPTCL_CTL + 2`.
             self.station_publication(environment, || {
                 super::super::rtl8723be::station::erp_changed(&self.io, old, new)
@@ -1905,9 +1924,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         // DISFB from the TCB, inside the installed
         // `rtl8723be_update_hal_rate_mask` (a subset of the `NAPC`
         // admitted rates).
+        // RTL8192DE: `rtl92de_tx_fill_desc` writes USE_RATE / DISFB from
+        // the TCB, inside the installed `rtl92d_update_hal_rate_mask` (a
+        // subset of the `N92D` admitted rates).
         let protected_ra = matches!(
             self.chip,
-            super::Chip::Rtl8192ee | super::Chip::Rtl8192ce | super::Chip::Rtl8723be
+            super::Chip::Rtl8192ee
+                | super::Chip::Rtl8192ce
+                | super::Chip::Rtl8723be
+                | super::Chip::Rtl8192de
         );
         let fallback = if protected_ra {
             matches!(kind, Kind::Data) && self.rate_mask().is_some()
@@ -2227,7 +2252,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     // BSS ERP element (`ieee80211_handle_bss_capability`).
                     let erp92 = if matches!(
                         self.chip,
-                        super::Chip::Rtl8192ee | super::Chip::Rtl8192ce | super::Chip::Rtl8723be
+                        super::Chip::Rtl8192ee
+                            | super::Chip::Rtl8192ce
+                            | super::Chip::Rtl8723be
+                            | super::Chip::Rtl8192de
                     ) {
                         super::super::rtl8192ee::station::erp_octet(
                             &self
@@ -2285,6 +2313,21 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                             )
                             .map(|_| ());
                         }
+                        if self.chip == super::Chip::Rtl8192de {
+                            return super::super::rtl8192de::station::configure_rates(
+                                &self.io,
+                                super::super::rtl8192de::station::RateConfig {
+                                    rates,
+                                    basic,
+                                    capability: self.station.capability,
+                                    erp: erp92,
+                                    ht: self.station.ht_profile.is_some(),
+                                    prime_sc: self.rtl8192de_prime_sc(),
+                                    fw_version: self.packet.de92.fw_version,
+                                    cisco: false,
+                                },
+                            );
+                        }
                         super::super::station_control::configure_rates(
                             &self.io,
                             rates,
@@ -2302,6 +2345,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                         self.packet.ce92.erp_timing = Some(timing);
                     } else if self.chip == super::Chip::Rtl8723be {
                         self.packet.be8723.erp_timing = Some(timing);
+                    } else if self.chip == super::Chip::Rtl8192de {
+                        self.packet.de92.erp_timing = Some(timing);
                     }
                     if let Some(p) = self.station.wmm {
                         self.program_station_edca(p)?;
@@ -2653,7 +2698,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                     self.station.erp = erp;
                     if matches!(
                         self.chip,
-                        super::Chip::Rtl8192ee | super::Chip::Rtl8192ce | super::Chip::Rtl8723be
+                        super::Chip::Rtl8192ee
+                            | super::Chip::Rtl8192ce
+                            | super::Chip::Rtl8723be
+                            | super::Chip::Rtl8192de
                     ) {
                         self.track_rtl8192ee_erp(&candidate, environment)?;
                     }
@@ -3074,6 +3122,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 .install_rtl8723be_station_rate_mask(rates, level, environment)
                 .await;
         }
+        if self.chip == super::Chip::Rtl8192de {
+            return self
+                .install_rtl8192de_station_rate_mask(rates, level, environment)
+                .await;
+        }
         let mcs = self.station.ht_profile.map(|profile| profile.tx_mcs()[0]);
         let payload = super::super::rate_adaptive::rate_mask_width(
             rates,
@@ -3356,6 +3409,58 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         .await?;
         self.check_station_policy(environment)
     }
+    /// `rtl92d_update_hal_rate_mask(sta, level)` for the 2.4 GHz legacy
+    /// peer (`supp_rates[0]` = the association's legacy intersection,
+    /// `wireless_mode` B for `supp_rates[0] <= 0xf` else G as
+    /// `rtl_op_sta_add` derives it; HT is not admitted on this profile),
+    /// inside the `N92D` envelope's current authority. The mask must be a
+    /// non-empty subset of the current permission's admitted rates.
+    async fn install_rtl8192de_station_rate_mask(
+        &mut self,
+        rates: u16,
+        level: u8,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::rtl8192de::{h2c, rate::WirelessMode};
+        if self.station.ht_profile.is_some() || self.rtl8192de_power.is_none() {
+            return Err(Error::Profile);
+        }
+        let supp = u32::from(rates & 0xfff);
+        let peer = h2c::Peer {
+            mode: if supp <= 0xf {
+                WirelessMode::B
+            } else {
+                WirelessMode::G
+            },
+            supp_rates: [supp, 0],
+            rx_mask: [0; 2],
+            sgi20: false,
+            sgi40: false,
+            mimo_ps_static: false,
+            ap_or_adhoc: false,
+            aid: 0,
+        };
+        let bw40 = self.packet.width.is_some();
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .ok_or(Error::State)?
+            .clone();
+        let grant = self.station_grant().ok_or(Error::State)?;
+        power_wait(
+            base,
+            None,
+            None,
+            None,
+            None,
+            grant,
+            environment,
+            self.install_rtl8192de_rate_mask(peer, bw40, level),
+        )
+        .await?;
+        self.check_station_policy(environment)
+    }
     /// RTL8723BE watchdog step (`rtl_watchdog_wq_callback` every
     /// `RTL_WATCHDOG_TIME`, outside firmware LPS for the DM part): the
     /// queued C2H through the coexistence owner, the composed
@@ -3527,6 +3632,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
                 self.abort_station();
             }
             return result;
+        }
+        if self.chip == super::Chip::Rtl8192de {
+            // `rtl92de_dm_watchdog` has `rtl92d_dm_refresh_rate_adaptive_mask`
+            // commented out: the mask installed at association is never
+            // refreshed. Its DIG / dynamic TX power / EDCA turbo steps are
+            // not composed (the `rtl92de_hw_init` values stay).
+            return Ok(false);
         }
         if self.chip == super::Chip::Rtl8821ae {
             let result = self.rtl8821ae_watchdog(environment).await;

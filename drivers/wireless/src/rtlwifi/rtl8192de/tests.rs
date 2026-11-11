@@ -658,7 +658,7 @@ kernel_test_in!(
 // ── signed envelopes ──────────────────────────────────────────────────────
 
 /// Test board factory (synthetic values, not any board's).
-fn de_factory() -> crate::rtlwifi::efuse::Factory {
+pub(crate) fn de_factory() -> crate::rtlwifi::efuse::Factory {
     crate::rtlwifi::efuse::Factory {
         mac: [0x00, 0xe0, 0x4c, 0x81, 0x92, 0xde],
         logical: [0u8; 512],
@@ -666,7 +666,7 @@ fn de_factory() -> crate::rtlwifi::efuse::Factory {
 }
 
 /// A NAPC v2 row: (channel, bandwidth, offset, curve-value fn).
-type NapcRowV2 = (u8, u8, u8, fn(u8, u8) -> i16);
+pub(crate) type NapcRowV2 = (u8, u8, u8, fn(u8, u8) -> i16);
 /// A NAPC v3 row: (channel, band, bandwidth, offset, curve-value fn).
 type NapcRowV3 = (u8, u8, u8, u8, fn(u8, u8, u8) -> i16);
 
@@ -674,7 +674,12 @@ type NapcRowV3 = (u8, u8, u8, u8, fn(u8, u8, u8) -> i16);
 /// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
 /// `rows` are (channel, bandwidth, offset, curve-value fn) for v2, or
 /// (channel, 20, 0, fn) for v1.
-fn de_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRowV2]) -> Vec<u8> {
+pub(crate) fn de_napc_fixture(
+    version: u16,
+    antenna: i16,
+    qualified: i16,
+    rows: &[NapcRowV2],
+) -> Vec<u8> {
     let factory = de_factory();
     let identity = crate::rtlwifi::radio::factory_identity(&factory);
     let total = 96 + rows.len() * 388;
@@ -711,7 +716,7 @@ fn de_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRowV2
 
 /// Flat rising curves: output `2 * index` quarter dBm, so a 20 dBm
 /// ceiling with antenna 0 admits index 40 on every rate.
-fn de_rising(_curve: u8, idx: u8) -> i16 {
+pub(crate) fn de_rising(_curve: u8, idx: u8) -> i16 {
     i16::from(idx) * 2
 }
 
@@ -725,7 +730,7 @@ fn de_no_ht(curve: u8, idx: u8) -> i16 {
 }
 
 /// US 2.4 GHz domain: 2402-2472 MHz, 40 MHz, 20 dBm.
-fn de_us_domain() -> narf_wireless::reg::RegulatoryDomain {
+pub(crate) fn de_us_domain() -> narf_wireless::reg::RegulatoryDomain {
     use narf_wireless::reg::*;
     RegulatoryDomain {
         country_code: *b"US",

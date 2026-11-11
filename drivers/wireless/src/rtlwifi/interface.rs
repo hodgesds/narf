@@ -355,6 +355,20 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                 )
                 .await?;
             }
+        } else if owner.chip() == super::prepare::Chip::Rtl8192de {
+            if matches!(
+                owner.phase(),
+                Phase::RadioConfigured | Phase::ChannelConfigured | Phase::MacConfigured
+            ) && !owner.station_calibration_present()
+            {
+                super::prepare_native::admit_rtl8192de(
+                    owner,
+                    &self.factory,
+                    &self.environment.domain()?,
+                    self.lifecycle.channel.load(Ordering::Acquire),
+                )
+                .await?;
+            }
         } else if matches!(
             owner.phase(),
             Phase::RadioConfigured | Phase::ChannelConfigured
@@ -376,6 +390,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
                     | super::prepare::Chip::Rtl8192ee
                     | super::prepare::Chip::Rtl8192ce
                     | super::prepare::Chip::Rtl8723be
+                    | super::prepare::Chip::Rtl8192de
             ) {
                 return Err(Error::Profile);
             }
@@ -1504,14 +1519,19 @@ impl Environment for NativeEnvironment {
         let device = self.firmware().device_id();
         if matches!(
             device,
-            super::regs::RTL_DEV_8821AE | super::regs::RTL_DEV_8192EE | super::regs::RTL_DEV_8723BE
+            super::regs::RTL_DEV_8821AE
+                | super::regs::RTL_DEV_8192EE
+                | super::regs::RTL_DEV_8723BE
+                | super::regs::RTL_DEV_8192DE
         ) || super::rtl8192ce::is_8192ce(device)
         {
             // `_rtl8821ae_enable_aspm_back_door` / ASPM, the 8192EE /
-            // 8192CE `enable_aspm` and the 8723BE
-            // `_rtl8723be_enable_aspm_back_door` / `enable_aspm` are not
-            // composed for these profiles: probe's ASPM-disabled link
-            // state is kept.
+            // 8192CE `enable_aspm`, the 8723BE
+            // `_rtl8723be_enable_aspm_back_door` / `enable_aspm` and the
+            // 8192DE `enable_aspm` are not composed for these profiles:
+            // probe's ASPM-disabled link state is kept (the 8192DE back
+            // door is written with `const_support_pciaspm` 0 by
+            // `configure_rtl8192de`).
             return Ok(());
         }
         self.firmware()
@@ -1553,6 +1573,29 @@ impl Environment for NativeEnvironment {
                 return Err(Error::Profile);
             }
             return super::rtl8723be::envelope::Calibration::load_registered(factory)
+                .map_err(|_| Error::Profile)?
+                .permission(&self.domain()?, channel)
+                .map(|_| ())
+                .map_err(|_| Error::Profile);
+        }
+        if self.firmware().device_id() == super::regs::RTL_DEV_8192DE {
+            // Retuning rebuilds through `rtl92de_card_disable` and the
+            // `_rtl92de_init_mac` power prefix (`rebuild_native`);
+            // admission is the `N92D` 20 MHz permission on 2.4 GHz
+            // channels 1-11 of this function's bandset that
+            // `prepare_rtl8192de` re-derives.
+            let mode = super::rtl8192de::mode_from_prom(
+                super::rtl8192de::Interface::Pci,
+                &factory.logical,
+            )
+            .ok_or(Error::Profile)?;
+            let function = self.firmware().native().function().ok_or(Error::Profile)?;
+            if !(1..=11).contains(&channel)
+                || !super::rtl8192de::native_channel(channel, mode, function)
+            {
+                return Err(Error::Profile);
+            }
+            return super::rtl8192de::envelope::Calibration::load_registered(factory)
                 .map_err(|_| Error::Profile)?
                 .permission(&self.domain()?, channel)
                 .map(|_| ())

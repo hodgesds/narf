@@ -3517,8 +3517,8 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   calibration (`lck.rs`), the IQK reload wired into the channel switch
   (`calib::reload_iqk_setting` from `channel::switch_channel`), the
   reserved-page packet (`rsvd_page.rs`) and the 5 GHz native gate
-  (`native_channel`: a dual-dual MAC0 function admits the 5 GHz plan,
-  MAC1 admits 2.4 GHz 1–11). The orchestrator `init::configure` runs
+  (`native_channel`: the function's bandset; `prepare_rtl8192de` further
+  limits the composed station to 2.4 GHz 1–11). The orchestrator `init::configure` runs
   them in `hw.c` order: `mac::early_mode` (`earlymode_enable` false, as
   `rtl92de_init_sw_vars`), `cam_reset` then `enable_hw_security_config`
   (the NARF station encrypts in software, the `swenc=1` equivalent, so
@@ -3536,17 +3536,47 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   never sets `packet_report_type`; the `IMR_C2HCMD` dispatch in
   `pci.c` is gated to RTL8723AE), so a requested report only resolves
   through the 3 s timeout, as here.
-  Still open: probe admission (`pci.rs` retained set, the
-  `interface.rs` readiness dispatch). The shared station composition
-  has no 92DE packet branch yet: the station power `wait` dispatch
-  (`station.rs::power_wait`) now routes `Base::Rtl8192de` to
-  `wait_rtl8192de`, but `packet.rs` has no 92DE arm (start, descriptor
-  fill, RX, the 0x120/0x128 IMRs, LPS, join), and the 92DE join path
-  (`rtl8192de::station` BSSID/media-status helpers,
-  `station::join_bss_report`, whose `rsvd_page::Upload` writes a
-  CPU-side descriptor and rings the doorbell itself, so it needs a
-  DMA-ring form first) is not composed into the shared station.
-  Admitting the chip now would publish a station that cannot transmit.
+- Station composition (`rtl8192de/packet_owner.rs`, mounted as
+  `prepare::packet::de92`; written, build-gated, unexecuted): the 92DE
+  packet branch of the shared retained owner — `_rtl92de_init_mac` DESA
+  re-write after the `power_on` MAC IO release, BME, `REG_CR = 0x2ff`,
+  `REG_PCIE_CTRL_REG + 1 = 0`, `rtl92de_set_network_type(STATION)`;
+  `rtl92de_tx_fill_desc` TX (legacy 2.4 GHz only: no HT / A-MPDU / SGI;
+  firmware RA for ordinary unicast DATA under the mask, MC rate id
+  otherwise; every on-air rate admitted by the `N92D` permission); RX at
+  `drvinfo + shift` (no PHY-status RSSI); `rtl92de_{enable,disable}_
+  interrupt` / `interrupt_recognized` at `0x120`/`0x124`/`0x128` (the
+  shared `stop_packets` now selects those IMRs for 92DE); LPS a no-op
+  (`rtl92de_mod_params.fwctrl_lps = false` returns at
+  `rtl_lps_enter_core`'s first gate; `swctrl_lps` not composed); join
+  (`rtl_cam_reset_all_entry`, set_network_type linked, the
+  `HW_VAR_H2C_FW_JOINBSSRPT` envelope with the DMA-ring form of
+  `rtl92d_set_fw_rsvdpagepkt`: `rsvd_page::pages` in an owned DMA buffer,
+  `TxDesc::fill_cmd` on beacon descriptor 0 with the byte-40 link kept,
+  `Port::kick(BIT(4))`, `H2C_RSVDPAGE`, then `H2C_JOINBSSRPT`; no
+  KEEP_ALIVE, which the 92D `set_hw_reg` lacks); `rtl92d_update_hal_rate_
+  mask` bounded by the admitted rates (no BCN_CTRL write on 92D);
+  disassociation; `de92_quiesce` = descriptor retirement proof +
+  `rtl92de_card_disable` with its read-back receipt. Station arms: RA mask
+  (`install_rtl8192de_station_rate_mask`, B/G from `supp_rates[0]`),
+  EDCA (`rtl92d_set_qos` writes nothing), ERP preamble/slot tracking at
+  the programmed prime SC, `configure_rates` with the downloaded
+  `fw_version` (`bind_rtl8192de_firmware`), native protection / protected
+  RA; the watchdog does not refresh the mask (Linux has
+  `rtl92d_dm_refresh_rate_adaptive_mask` commented out). Interface
+  readiness dispatches `admit_rtl8192de`; `allow_channel` and
+  `prepare_rtl8192de` admit 2.4 GHz channels 1-11 of the function's
+  bandset only (a dual-dual MAC0 is not admitted); the rebuild runs
+  `power_runtime::disable_rtl8192de` (accepts the quiesce receipt) and
+  `enable_rtl8192de` (the `_rtl92de_init_mac` power prefix before the
+  fresh download). The `rsvd_page::Upload` / `station::join_bss_report`
+  host-model forms remain for the existing unit tests only. Smokes
+  `smoke_rtl8192de_native_owner_start_descriptors_receipt_and_rx`,
+  `smoke_rtl8192de_native_join_rsvd_page_ra_mask_and_leave` (written,
+  unexecuted).
+  Still open: probe admission (`pci.rs` retained set for `0x8193`);
+  not composed: HT/40 MHz and 5 GHz on 92DE, DIG / dynamic TX power /
+  EDCA turbo watchdog steps, software LPS, RX RSSI, ASPM.
 
 ## 4. Invariants
 

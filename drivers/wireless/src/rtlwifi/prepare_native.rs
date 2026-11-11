@@ -505,11 +505,11 @@ pub(super) async fn admit_rtl8192ee<I: super::firmware_transport::Io, M: Memory>
 /// from the signed per-board `N92D` envelope under current host policy,
 /// the operational MAC and the staged envelope the station re-proves at
 /// every publication. Packet DMA, CR gates and IRQs stay closed until
-/// the station service starts. The channel gate is the function's own
-/// bandset (`rtl8192de::native_channel` over the PROM mode and the PCI
-/// function): a dual-dual MAC0 function (5 GHz bandset) admits the
-/// 5 GHz station plan, MAC1 2.4 GHz channels 1-11, single and
-/// dual-single functions both bands.
+/// the station service starts. The channel gate is 2.4 GHz channels 1-11
+/// (the composed legacy station) inside the function's own bandset
+/// (`rtl8192de::native_channel` over the PROM mode and the PCI function):
+/// a dual-dual MAC0 function (5 GHz bandset) is not admitted, MAC1 and
+/// single / dual-single functions are.
 pub(super) async fn prepare_rtl8192de(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
@@ -522,13 +522,19 @@ pub(super) async fn prepare_rtl8192de(
     let interface_index = firmware.native().function().ok_or(Error::State)?;
     let mode = super::rtl8192de::mode_from_prom(super::rtl8192de::Interface::Pci, &factory.logical)
         .ok_or(Error::State)?;
-    if !super::rtl8192de::native_channel(channel, mode, interface_index) {
+    // The composed station is the 2.4 GHz legacy one
+    // (`rtl8192de/packet_owner.rs`): channels 1-11 of the function's own
+    // bandset only.
+    if !(1..=11).contains(&channel)
+        || !super::rtl8192de::native_channel(channel, mode, interface_index)
+    {
         return Err(Error::State);
     }
     if firmware.status().stage == super::firmware_transport::Stage::Detected {
-        firmware.initialize_registered().await?;
+        let info = firmware.initialize_registered().await?;
         let mut prepared = allocate(firmware, 128)?;
         prepared.bind_rtl8192de_mode(mode)?;
+        prepared.bind_rtl8192de_firmware(info.version);
         prepare_retained(&retained, prepared).await?;
         let mut storage = retained.lock().await;
         storage
