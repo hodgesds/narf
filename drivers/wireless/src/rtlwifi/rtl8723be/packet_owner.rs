@@ -800,7 +800,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// over the smoothed `undec_sm_pwdb`; a level change re-sends the mask
     /// with `update_bw`), then `rtl_watchdog_wq_callback`'s
     /// `btc_periodical` through the coexistence owner (with the queued C2H
-    /// first, as `c2hcmd_wq` runs ahead of it). The other DM steps keep
+    /// first, as `c2hcmd_wq` runs ahead of it; the coexistence step also
+    /// runs in leisure PS, the DM step does not). The other DM steps keep
     /// their `rtl8723be_hw_init` table values. Returns whether a mask was
     /// sent.
     pub(super) async fn be8723_dm_watchdog(
@@ -812,11 +813,10 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.be8723_service_c2h().await?;
-        if self.packet.leisure {
-            return Ok(false);
-        }
         let mut refreshed = false;
-        if let Some((peer, bw40, _)) = self.packet.be8723.link {
+        // The DM step runs only with the firmware out of power save;
+        // `btc_periodical` runs from `rtl_watchdog_wq_callback` either way.
+        if let (Some((peer, bw40, _)), false) = (self.packet.be8723.link, self.packet.leisure) {
             if let Some(state) = dm::ra_state(undec_sm_pwdb, self.packet.be8723.ratr_state) {
                 self.be8723_install_rate_mask(peer, bw40, state, true)
                     .await?;

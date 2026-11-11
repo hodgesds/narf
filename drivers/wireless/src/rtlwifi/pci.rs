@@ -502,11 +502,17 @@ pub unsafe fn bring_up(
     let did = device.id.device;
     // Retained native station profiles: RTL8188EE, (no BT coexistence)
     // RTL8821AE, (2.4 GHz, no BT coexistence, EFUSE TX power present)
-    // RTL8192EE and (qualified RF_1T1R / RF_2T2R version, provisioned map,
-    // no BT coexistence) RTL8192CE / RTL8188CE. Every other matched chip
-    // stays diagnostic.
+    // RTL8192EE, (qualified RF_1T1R / RF_2T2R version, provisioned map,
+    // no BT coexistence) RTL8192CE / RTL8188CE and (qualified version,
+    // provisioned map, path-A TX power; BT-coexist boards included: the
+    // coexistence owner runs) RTL8723BE. Every other matched chip stays
+    // diagnostic.
     let rtl8192ce = super::rtl8192ce::is_8192ce(did);
-    let retained = matches!(did, RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE) || rtl8192ce;
+    let rtl8723be = did == RTL_DEV_8723BE;
+    let retained = matches!(
+        did,
+        RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE | RTL_DEV_8723BE
+    ) || rtl8192ce;
     let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
             .map_err(|_| ProbeError::RegisterBarMapFailed)?;
@@ -517,6 +523,7 @@ pub unsafe fn bring_up(
             || (device.id.device == RTL_DEV_8192EE
                 && registers.len < super::rtl8192ee::MMIO_SIZE as u64)
             || (rtl8192ce && registers.len < super::rtl8192ce::MMIO_SIZE as u64)
+            || (rtl8723be && registers.len < super::rtl8723be::MMIO_SIZE as u64)
         {
             return Err(ProbeError::RegisterBarMapFailed);
         }
@@ -608,6 +615,40 @@ pub unsafe fn bring_up(
                         },
                     )
                 })
+            });
+
+        // RTL8723BE: the facts `configure_rtl8723be` re-derives.
+        // `_rtl8723be_read_chip_version` must carry `CHIP_8723B`, the map
+        // must be provisioned (`REG_9346CR` EFUSE boot, autoload, `0x8129`;
+        // `_rtl8723be_read_package_type` reads physical `0x1fb`, 0 after a
+        // timeout), the EFUSE MAC must be the factory identity and the
+        // path-A TX-power area must decode (`0x11 != 0xff`).
+        let admissible = admissible
+            && (!rtl8723be || {
+                use super::rtl8723be::{adapter, txpower, version};
+                // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+                let (sys_cfg1, sys_cfg, cr9346, multi_func_ctrl) = unsafe {
+                    (
+                        registers.read32(u64::from(version::REG_SYS_CFG1)),
+                        registers.read32(u64::from(version::REG_SYS_CFG)),
+                        registers.read8(u64::from(adapter::REG_9346CR)),
+                        registers.read32(u64::from(adapter::REG_MULTI_FUNC_CTRL)),
+                    )
+                };
+                // SAFETY: as above; only the EFUSE read registers are touched.
+                let package =
+                    unsafe { efuse::read_physical_byte(&registers, adapter::EFUSE_PACKAGE_ADDR) }
+                        .unwrap_or(0);
+                version::Version::from_registers(sys_cfg1, sys_cfg).is_ok_and(|qualified| {
+                    adapter::Adapter::from_hardware(
+                        qualified,
+                        cr9346,
+                        multi_func_ctrl,
+                        &factory.logical,
+                        package,
+                    )
+                    .is_ok_and(|facts| facts.mac == factory.mac)
+                }) && txpower::Efuse::from_logical(&factory.logical).is_ok()
             });
 
         Ok((registers, (factory, admissible)))
