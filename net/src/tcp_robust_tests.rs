@@ -1658,8 +1658,13 @@ fn smoke_tx_burst_larger_than_ring_waits_and_arrives_in_order() -> TestResult {
     if drain().iter().any(|f| frame_payload_len(f) != 0) {
         return TestResult::Fail("data bypassed the queue through the dropping hook");
     }
-    if nic.queue.busy() == 0 || nic.queue.restarts() == 0 {
+    if nic.queue.restarts() == 0 {
         return TestResult::Fail("the ring never pushed back");
+    }
+    // The sender reads the stopped flag before it builds a frame, so the
+    // ring pushes back without a single refused offer.
+    if nic.queue.busy() != 0 {
+        return TestResult::Fail("frames were built and offered to a stopped queue");
     }
     if __with_tcb(id, |t| t.tx_wait_since_cycles) != Some(0) {
         return TestResult::Fail("still marked waiting after everything was sent");
@@ -2374,8 +2379,15 @@ fn smoke_tx_stuck_sender_is_counted_and_cleared() -> TestResult {
     nic.busy_unstopped.store(false, Ordering::SeqCst);
     let _ = __with_tcb_mut(id, |t| t.tx_wait_since_cycles = 1);
     tick_retransmit(&arc);
-    if __with_tcb(id, |t| (t.tx_refused_in_row, t.tx_wait_start_cycles)) != Some((0, 0)) {
-        return TestResult::Fail("sending again did not clear the stuck-sender state");
+    // It sends until the ring stops it, which is an ordinary wait again.
+    if __with_tcb(id, |t| t.tx_refused_in_row) != Some(0) || nic.held().is_empty() {
+        return TestResult::Fail("sending again did not clear the refusal count");
+    }
+    if !drive_to_wire(&nic, 31_000) {
+        return TestResult::Fail("the connection did not finish sending");
+    }
+    if __with_tcb(id, |t| (t.tx_wait_start_cycles, t.tx_wait_since_cycles)) != Some((0, 0)) {
+        return TestResult::Fail("a connection with nothing left to send is still marked waiting");
     }
     TestResult::Pass
 }
