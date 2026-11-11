@@ -406,6 +406,11 @@ fn networkmanager_creates_a_wifi_device(absent_family_lookup: bool) -> Result<()
     }
     // WLAN_CIPHER_SUITE_CCMP is what gives the device _NM_WIFI_DEVICE_CAP_RSN;
     // a 2.4 or 5 GHz frequency sets the FREQ_VALID capability either way.
+    // BIP-CMAC-128 (00-0F-AC:6) gives wpa_supplicant ENC_BIP: with the
+    // default `pmf` it then negotiates optional PMF, which the owner runs.
+    if !info.ciphers.contains(&0x000f_ac06) {
+        return Err("wiphy does not advertise BIP-CMAC-128");
+    }
     if !info.ciphers.contains(&0x000f_ac04) {
         return Err("driver does not report CCMP");
     }
