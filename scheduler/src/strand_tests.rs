@@ -1323,3 +1323,55 @@ kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_staged_pull_window_moves_past_ineligible_entries
 );
+
+/// The floor counts tasks, not nodes. A node whose wake has been consumed
+/// (its task ran under a direct handoff and went back to sleep) is not
+/// runnable work, so a healthy idle CPU holding one real staged wake and one
+/// such node still keeps the wake.
+fn smoke_scheduler_staged_pull_floor_ignores_stale_nodes() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    stuck.set_running(false);
+    let (Some((_, stale)), Some(_)) = (
+        park_probe_on(0, 1, stuck.0, None),
+        park_probe_on(1, 1, stuck.0, None),
+    ) else {
+        stuck.release();
+        return TestResult::Fail("could not park the probes on the stuck CPU");
+    };
+    let_cool();
+    for slot in 0..2 {
+        if let Some(waker) = take_waker(slot) {
+            waker.wake();
+        }
+    }
+    // Probe 0's wake was consumed without the owner draining its node.
+    stale.flag.store(false, Ordering::SeqCst);
+    let nodes = staged_parked_wakes(stuck.0);
+    stuck.pass_scheduling_point();
+    let took_from_idle = pull(stuck.0, me);
+    stuck.set_running(true);
+    let took_from_running = pull(stuck.0, me);
+    crate::poll_one_round();
+    let ran = (polls(0), polls(1));
+    stuck.release();
+    if nodes != 2 {
+        return TestResult::Fail("both wakes should have staged a node");
+    }
+    if took_from_idle {
+        return TestResult::Fail(
+            "a stale node made an idle CPU's only real wake look like surplus",
+        );
+    }
+    if !took_from_running || ran != (1, 2) {
+        return TestResult::Fail("the real staged wake was not the one pulled from a busy CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_staged_pull_floor_ignores_stale_nodes
+);
