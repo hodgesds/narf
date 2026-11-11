@@ -333,7 +333,9 @@ fn run_prefix() -> Result<(), &'static str> {
     let frames = [frame(&h, 4310, 40), frame(&h, 4311, 50)];
     queue(&h, &frames)?;
     pump(&h);
-    if !aggregate_counts(&h).is_empty() || uplink_frames(&h)[3..] != frames {
+    // `aggregate_counts` is cumulative: the a + c A-MSDU above stays the
+    // only aggregate once the peer denied A-MSDU.
+    if aggregate_counts(&h) != [2] || uplink_frames(&h)[3..] != frames {
         return Err("mismatched-token native NO_AMSDU did not remain denial-only");
     }
     let mut delba = vec![0xd0, 0, 0, 0];
@@ -347,7 +349,7 @@ fn run_prefix() -> Result<(), &'static str> {
     let frames = [frame(&h, 4320, 40), frame(&h, 4321, 50)];
     queue(&h, &frames)?;
     pump(&h);
-    if !aggregate_counts(&h).is_empty() || uplink_frames(&h)[5..] != frames {
+    if aggregate_counts(&h) != [2] || uplink_frames(&h)[5..] != frames {
         return Err("DELBA/positive BA revived sticky NO_AMSDU for same peer");
     }
     Ok(())
