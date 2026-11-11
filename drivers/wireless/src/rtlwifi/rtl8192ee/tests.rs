@@ -213,6 +213,15 @@ impl Io for FwFake {
         if reg == fw::REG_RSV_CTRL + 1 && value & 1 != 0 && g.regs[usize::from(reg)] & 1 == 0 {
             g.resets += 1;
         }
+        // FWDL_CHKSUM_RPT is a hardware status bit: the 0x05 written by
+        // _rtl92ee_enable_fw_download does not set it; only the model's
+        // checksum report (read32) does.
+        let value = if reg == fw::REG_MCUFWDL {
+            let rpt = fw::FWDL_CHKSUM_RPT as u8;
+            (value & !rpt) | (g.regs[usize::from(reg)] & rpt)
+        } else {
+            value
+        };
         g.regs[usize::from(reg)] = value;
         Ok(())
     }
