@@ -179,12 +179,21 @@ rounds agreed, did not settle within its 64 rounds on a filesystem of 320
 block groups with three-level trees; `cargo xtask btrfs-host-rw --scenario
 scale` reproduces that shape.) What the trees hold afterwards is a function
 of the final block lists alone. Each new block's `METADATA_ITEM` key is
-checked absent from the committed extent tree before it is inserted. Extent
-and free-space leaves are kept dense: an overflowing leaf is split evenly
-(or left full when everything added sorts after what it held), and a sparse
+checked absent from the committed extent tree before it is inserted. In
+every tree a leaf that overflows is split evenly, or left full when
+everything added sorts after what it held (`write::retile_leaf`; Linux
+`split_leaf` splits at the middle, and `push_leaf_left` keeps appends
+dense). Filling the first leaf and spilling a remainder regardless of where
+the new items went left one full and one nearly empty leaf after every
+insert into the middle of a full leaf, and a file whose pages were first
+written in a scattered order — a mapped file written back in page-frame
+order — ended up with five extent items to a 16 KiB leaf instead of two
+hundred. Leaves written that way stay as they are until their items are
+deleted: only extent- and free-space-tree leaves are rejoined (a sparse
 committed leaf an edit reaches absorbs its right sibling; the sparser those
-trees, the more leaves the records of one commit's blocks reach. The on-disk
-format is unchanged.
+trees, the more leaves the records of one commit's blocks reach), since
+rejoining leaves of a subvolume tree means COWing a sibling that a snapshot
+may share. The on-disk format is unchanged.
 
 The allocator carves from one in-memory copy of the committed free-space tree
 per filesystem (`allocator::FreeView`, Linux's per-block-group free-space
