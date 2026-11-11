@@ -3477,12 +3477,17 @@ fn smoke_ath11k_dp_service_multi_pdev() -> TestResult {
     let b = mon.consume(&io).unwrap();
     phys_wr32(buf_addr_get(a[0], a[1]).0, 0x140 << 1); // HAL_RX_STATUS_BUFFER_DONE
     phys_wr32(buf_addr_get(b[0], b[1]).0, 0);
-    let hp_before = hal.srng(mon_id).expect("mon ring").hp;
+    let (hp_before, ring_size) = hal
+        .srng(mon_id)
+        .map(|s| (s.hp, s.ring_size))
+        .expect("mon ring");
     let mut budget = 8;
     let n = dp.reap_mon_status_for(&mut hal, &io, 1, 0, &mut budget);
     check!(n == 2, "two slots refilled");
     check!(dp.stats.mon_status_reaped == 1, "one DONE buffer");
-    for off in [hp_before, hp_before + mon.esz] {
+    // The two refilled slots are HP and the one after it, which wraps
+    // to slot 0 when HP is the ring's last entry (7 of 8 posted).
+    for off in [hp_before, (hp_before + mon.esz) % ring_size] {
         let cookie = field_get(BUFFER_ADDR_INFO1_SW_COOKIE, hal.desc_rd(mon_id, off, 1));
         check!(
             field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, cookie) == 1,
