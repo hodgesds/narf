@@ -23,6 +23,11 @@ those subsystems the hooks they need.
 
 ## 3. Public interface
 
+Production x86 boot enables tickless idle on capable local clockevents.
+`nohz=off` retains periodic ticks; the former `nohz_idle` flag remains accepted
+as an alias for the default. The power initcall installs the predictive idle
+governor and discovers firmware states before normal executor idle.
+
 Production boot forwards `steal_policy=full|numa|llc|pick2` to the scheduler's staged
 steal-policy selector before queue initialization. Absent or unknown values
 retain the existing NUMA-aware default; runtime policy installation remains

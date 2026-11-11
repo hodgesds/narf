@@ -1976,6 +1976,27 @@ kernel_test_in!(
     smoke_ipi_shootdown_handler_invpcid_path_taken
 );
 
+#[cfg(target_arch = "x86_64")]
+fn idle_budget_survives_earlier_timer() -> TestResult {
+    use crate::x86_64::apic::{next_arm_target, pending_scheduler_deadline};
+    let budget = 500_000;
+    let pending = pending_scheduler_deadline(100_000, budget);
+    if next_arm_target(100_000, pending, Some(200_000), 10_000) != 200_000 {
+        return TestResult::Fail("earlier wheel did not win");
+    }
+    let pending = pending_scheduler_deadline(200_000, pending);
+    if next_arm_target(200_000, pending, None, 10_000) != budget {
+        return TestResult::Fail("wheel IRQ discarded future budget");
+    }
+    let pending = pending_scheduler_deadline(budget, pending);
+    if next_arm_target(budget, pending, None, 10_000) != u64::MAX {
+        return TestResult::Fail("expired budget kept idle CPU ticking");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/timer", idle_budget_survives_earlier_timer);
+
 // --- one-shot multiplex: next_arm_target pure-logic smokes ------------
 
 #[cfg(target_arch = "aarch64")]

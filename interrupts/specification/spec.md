@@ -22,6 +22,15 @@ handling (drivers do that after the dispatch).
 
 ## 3. Public interface
 
+The x86 TSC-deadline clockevent implements local tickless idle through
+`ClockEvent::set_idle_tick`. Periodic, wheel and scheduler budget deadlines are
+tracked independently; an earlier wheel IRQ cannot discard a later budget
+expiry/replenishment. With no pending deadline, IA32_TSC_DEADLINE is disarmed
+with zero. Restarting execution restores a future periodic deadline. The
+InitialCount backend retains its periodic tick. Wheel ownership remains one
+CPU per global minimum. Local timer transitions serialize against their ISR
+with IRQ masking and restore the caller's original IRQ state.
+
 ```rust
 pub fn register_irq(n: IrqNum, target: IrqTarget, domain: DomainId);
 pub enum IrqTarget {

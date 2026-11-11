@@ -144,6 +144,14 @@ pub trait Clockevent {
 Boot-time selection: walk available clocksources, pick the highest
 rating that's also monotonic. Record the decision for telemetry.
 
+`ClockEvent::set_idle_tick(stop_tick, budget_deadline) -> bool` replaces the
+current CPU's idle budget deadline and stops or restarts its periodic tick.
+Unsupported devices return false and retain periodic operation. Implementations
+preserve caller IRQ state and independent wheel deadlines. `register_local`
+publishes a static backend once per CPU; steady transitions read it without a
+registry lock. `clockevent::set_idle_tick` also enforces the boot nohz policy;
+`restart_local_tick` restores preemption before runnable task dispatch.
+
 ### 3.4 SMP synchronisation
 
 - At boot, per-CPU counters are read in a coordinated protocol to

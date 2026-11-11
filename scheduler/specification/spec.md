@@ -68,6 +68,19 @@ experimental defaults. Backoff delays only future stealing, not local dispatch,
 reschedule IPIs, timers, or the core halt handshake. No policy-state lock spans
 queue sampling or migration. There are no new per-enqueue publication writes.
 
+Idle no longer arms the former 2 ms lost-wakeup recovery deadline. The
+halted-publish/recheck handshake covers reschedule requests, staged remote
+wakes, local deferred wakes, and dispatchable queued tasks; with reliable
+interrupts, the recheck and atomic enable-and-halt run with IRQs masked.
+Real timer-wheel deadlines, execution budgets and replenishment deadlines remain
+armed. Both empty and parked queues use the power governor with typed deadline
+hints and per-CPU residency feedback. Governor selection finishes before the
+final wake check; no policy lock spans sleep. Supported local clockevents stop
+the periodic tick when the governor permits it and restart it before either
+normal or nested task dispatch. Unsupported clockevents retain periodic ticks. `set_idle_backstop_hook`
+retains its historical public name but supplies scheduler clockevents, not
+an idle recovery timer.
+
 ### Caller authority and lifetime
 
 Caller-authority APIs and state described here require `native-ring`, off

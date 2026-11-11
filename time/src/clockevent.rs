@@ -90,6 +90,44 @@ pub trait ClockEvent: Sync + Send {
     fn kind(&self) -> ClockEventKind {
         ClockEventKind::Shared
     }
+
+    /// Replace the local idle budget deadline and stop/restart the periodic
+    /// tick. Returns false when this device cannot provide tickless idle.
+    /// Implementations preserve IRQ state and retain independent wheel events.
+    fn set_idle_tick(&self, _stop_tick: bool, _budget_deadline: Option<u64>) -> bool {
+        false
+    }
+}
+
+static LOCAL: [narf_lib::sync::OnceLock<&'static dyn ClockEvent>; narf_lib::percpu::MAX_CPUS] =
+    [const { narf_lib::sync::OnceLock::new() }; narf_lib::percpu::MAX_CPUS];
+
+/// Publish this CPU's clockevent during local timer initialization.
+pub fn register_local(dev: &'static dyn ClockEvent) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if let Some(slot) = LOCAL.get(cpu) {
+        let _ = slot.set(dev);
+    }
+}
+
+/// Prepare the current CPU's clockevent for idle. Unsupported backends retain
+/// their periodic tick. `budget_deadline` replaces the task execution deadline.
+pub fn set_idle_tick(stop_tick: bool, budget_deadline: Option<u64>) -> bool {
+    let cpu = narf_lib::percpu::current_cpu();
+    LOCAL
+        .get(cpu)
+        .and_then(|slot| slot.get())
+        .is_some_and(|dev| {
+            dev.set_idle_tick(stop_tick && crate::nohz_idle_enabled(), budget_deadline)
+        })
+}
+
+/// Restore preemption before entering a runnable task, including nested polls.
+pub fn restart_local_tick() {
+    let cpu = narf_lib::percpu::current_cpu();
+    if !crate::periodic_tick_wanted(cpu) {
+        set_idle_tick(false, None);
+    }
 }
 
 /// Why arming failed.

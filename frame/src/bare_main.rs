@@ -1272,7 +1272,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         //
         // `send_fixed_ipi` now programs the xAPIC ICR over MMIO, so every
         // hook here works in both APIC modes and the gate is gone. The
-        // TSC-deadline backstop is fine either way: it branches on
+        // TSC-deadline hook is fine either way: it branches on
         // X2APIC_ACTIVE internally, and IA32_TSC_DEADLINE is an ordinary
         // MSR gated on CPUID.01H:ECX[24], not an x2APIC register.
         {
@@ -1291,11 +1291,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_interrupts::VECTOR_RESCHED,
                 );
             });
-            // Idle-halt LOST-WAKEUP backstop: let the executor arm a short
-            // fallback LAPIC deadline before HLT so a halted AP always
-            // re-scans within a bounded time even if a cross-core wake is
-            // lost. `arm_tsc_deadline_if_earlier` only pulls the deadline
-            // IN, never pushes it out, so it can't delay a sooner real wake.
+            // Scheduler clockevents: execution/replenishment deadlines and
+            // periodic-tick restart after tickless idle. The hook retains its
+            // historical name; idle no longer arms a recovery timer.
+            // `arm_tsc_deadline_if_earlier` only pulls the deadline IN, never
+            // pushes it out, so it can't delay a sooner real wake.
             narf_scheduler::set_idle_backstop_hook(|deadline| {
                 narf_interrupts::x86_64::apic::arm_tsc_deadline_if_earlier(deadline);
             });
@@ -5225,13 +5225,9 @@ fn run_async_demo() -> ! {
                 );
             }
         }
-        // NO_HZ_IDLE opt-in (`nohz_idle` cmdline flag, default off): let an idle
-        // CPU stop the periodic tick and HLT until a real event. Set before the
-        // executor's first idle so the very first halt is tickless.
-        if narf_boot::args().has_flag("nohz_idle") {
-            narf_time::set_nohz_idle_enabled(true);
-            let _ = writeln!(console::Writer, "  nohz_idle: tickless idle ENABLED");
-        }
+        let tickless = narf_boot::args().value("nohz") != Some("off");
+        narf_time::set_nohz_idle_enabled(tickless);
+        let _ = writeln!(console::Writer, "  tickless idle: {}", tickless);
         // Latency-first virtio-net TX: kick the device for a lone frame instead
         // of letting EVENT_IDX suppression defer it (redis PING p99 tail).
         if narf_boot::args().has_flag("tx_always_kick") {

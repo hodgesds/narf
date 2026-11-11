@@ -3201,6 +3201,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power-core",
  "narf-rcu",
  "narf-time",
 ]

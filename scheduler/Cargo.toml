@@ -12,6 +12,7 @@ name = "narf_scheduler"
 path = "src/lib.rs"
 
 [dependencies]
+narf-power-core   = { path = "../power/core" }
 narf-lib          = { path = "../lib" }
 narf-acpi         = { path = "../acpi" }
 narf-arch         = { path = "../arch" }
@@ -26,7 +27,7 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 # Native userspace ring authority and task binding. Opt-in.
 native-ring = []
 
-kernel-test = ["narf-capabilities/kernel-test"]
+kernel-test = ["narf-capabilities/kernel-test", "narf-power-core/kernel-test"]
 # High-resolution tick (Linux CONFIG_SCHED_HRTICK): per-task one-shot slice
 # timer via the timer wheel, so a task is preempted precisely at slice
 # exhaustion. Off by default (the default build stays byte-identical).
