@@ -442,6 +442,12 @@ The target drains the inbox under its own queue and policy locks at the next
 executor round boundary. The mirrored inbox length and `NEED_RESCHED` flag
 remain part of the idle-halt lost-wake handshake.
 
+The target is not the inbox's only consumer. A staged slot has not been
+admitted to the target's policy, so an idle CPU's balance pass may remove one
+under a non-blocking inbox lock and admit it locally instead (§3.3). A task
+enqueued across CPUs is therefore not held until its target next reaches an
+executor boundary.
+
 #### 3.1.1 Pluggable scheduling policy
 
 Scheduling policy may be implemented in a separate `no_std` crate using only
@@ -644,6 +650,18 @@ be mistaken for an empty runnable queue. A delayed node follows a migrated
 task's current parked token; the CPU-offline path drains again after moving its
 resident owners, paired with producers' token recheck under the inbox gate.
 
+A linked node names a task parked on that CPU, or one reaped from it that has
+no further wake to lose. Every path that takes a woken task out of a CPU's
+parked set to run it, other than the owner's drain (which has already detached
+the node), unlinks the node under the gate before the slot is enqueued
+anywhere: wake-time placement, synchronous wake affinity, a runtime
+affinity move, local activation, donation, the park-time wake recheck, and an
+idle CPU's pull. While the slot is in that path's hands its parked token is
+clear, so no producer can link the node again. Without this the node's claim
+would coalesce the task's next wake, and a task that slept again on its new CPU
+would wait for its old home to drain. The lock order is parked set, then gate;
+the gate remains a leaf.
+
 Home publication precedes the SeqCst parked-token store. The subsequent
 SeqCst awake-bit recheck pairs with the waker's SeqCst flag swap followed by
 token load: both sides cannot miss the transition. Node-claim release and
@@ -780,6 +798,33 @@ pub struct TaskSpec {
   that was admitted or ran within the 500 us migration-cost window is
   cache-hot and is not an idle-steal candidate; explicit affinity and
   CPU-lifecycle moves are exempt.
+- **A woken task is runnable wherever it is held.** Besides its ready queue a
+  CPU holds woken tasks it has not activated yet: cross-CPU enqueues in its
+  wake inbox, and woken sleepers still in its parked set. They count toward
+  the victim's runnable work above, and when the ready queue offers a thief
+  nothing it may pull one of them under the same rules — dispatchable, inside
+  `allowed`, permitted by the steal strategy, not cache-hot, and leaving the
+  victim one runnable or running task (Linux `sched_balance_newidle`). A CPU
+  that is idle with a single staged wake keeps it. One pull inspects at most
+  the 32 newest staged entries per holding place; entries it may not take
+  count against that bound. For woken sleepers the thief pins those nodes
+  under the inbox gate, releases it, and only then judges and takes a slot
+  under the victim's parked-set lock, so the gate is never held over an
+  eligibility check or a steal-strategy callback. A pulled task moves as a whole slot, exactly like a ready-queue
+  steal: saved domain state, address-space owner, FP/SIMD image and budget
+  account travel with it and are restored by the thief's ordinary dispatch.
+- **A busy CPU advertises wakes it is not serving.** Each CPU's executor
+  counts the scheduling points it passes — a dispatch round starting, a polled
+  task returning to it, a direct task-to-task handoff — in a counter only that
+  CPU writes. When a CPU's timer tick
+  finds wakes staged there and its executor has passed no scheduling point
+  since the previous such tick, it sends one reschedule kick to a halted
+  online CPU, nearest higher-numbered first (Linux `sched_balance_trigger` →
+  `nohz_balancer_kick` → `kick_ilb`). The kick names no task; the woken CPU's
+  steal pass applies the rules above. It repeats each tick while the condition
+  holds. A CPU with interrupts masked takes no tick and sends no kick; there
+  the bound is the idle CPUs' own periodic pass (the periodic tick, or the
+  2 ms idle backstop).
 - Process-fork placement may take a non-blocking snapshot of every allowed,
   online run queue. Its load includes dispatchable queued slots, staged wake
   inbox entries, and the currently executing task. A contended queue is
@@ -1019,6 +1064,13 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
   continuation resumes masked until its architecture epilogue restores the
   interrupted state.
 - Work-stealing preserves per-task FIFO ordering of wakes.
+- A woken task has exactly one owner at every instant, and a non-owner takes
+  it only under the lock that owner uses: the ready-queue lock, the wake-inbox
+  lock, or the parked-set lock. The owner's drain, a direct-handoff claim,
+  wake-time placement and an idle pull all decide a parked task under the
+  parked-set lock, so exactly one of them gets the slot. A pull never takes a
+  running continuation or one under a direct-handoff claim, and takes every
+  victim-side lock except the leaf inbox gate without blocking.
 - `has_other_runnable_work` may return a false positive under queue contention
   but never blocks to refine the answer. A false result means the caller can
   elide a voluntary self-yield without withholding the CPU from known work.

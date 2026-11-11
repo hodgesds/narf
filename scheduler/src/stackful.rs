@@ -3264,6 +3264,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     if frame.vector != current_preempt_vector() {
         return false;
     }
+    // Every tick, whatever it interrupted: wakes staged on a CPU that is not
+    // reaching its executor are offered to an idle CPU (Linux
+    // `sched_balance_trigger`). None of the early returns below changes that.
+    crate::kick_idle_balance_from_tick();
     if !cpl_zero(frame.cs) {
         return false; // trapped from user mode; not our path
     }
@@ -3500,6 +3504,11 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
 /// Same live-frame and completed-EOI requirements as `try_preempt_aarch64`.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn try_preempt_aarch64_irq(frame: &Aarch64TrapFrame, tick: bool) -> bool {
+    if tick {
+        // See `try_preempt`: the tick-side idle-balance kick is independent
+        // of whether this CPU can be preempted right now.
+        crate::kick_idle_balance_from_tick();
+    }
     if !preempt_enabled() {
         return false;
     }
