@@ -240,6 +240,52 @@ const STA_REC_KEY_V2: u16 = 17;
 pub(crate) const MCU_CIPHER_AES_CCMP: u8 = 5;
 pub(crate) const MCU_CIPHER_BIP_CMAC_128: u8 = 10;
 
+/// The cipher suites of the supplicant's RSNE in its CONNECT elements
+/// (`wpa_gen_wpa_ie_rsn`: the pairwise, group and group management
+/// ciphers it selected), when it names hardware data ciphers.
+pub(crate) fn supplicant_ciphers(mut ies: &[u8]) -> Option<narf_wireless::rsn::Ciphers> {
+    while let [id, len, rest @ ..] = ies {
+        let body = rest.get(..usize::from(*len))?;
+        if *id == 48 {
+            let rsn = narf_wireless::rsn::RsnIe::decode_body(body)?;
+            let ciphers = narf_wireless::rsn::Ciphers::of_station(&rsn)?;
+            return (mcu_data_cipher(ciphers.pairwise).is_some()
+                && mcu_data_cipher(ciphers.group).is_some())
+            .then_some(ciphers);
+        }
+        ies = &rest[usize::from(*len)..];
+    }
+    None
+}
+
+/// `mt76_connac_mcu_get_cipher` for the data ciphers the station runs in
+/// hardware (mt7921_set_key: CCMP, CCMP-256, GCMP, GCMP-256), with the
+/// temporal key length.
+pub(crate) fn mcu_data_cipher(suite: u8) -> Option<(u8, usize)> {
+    use narf_wireless::rsn;
+    let mcu = match suite {
+        rsn::CIPHER_CCMP_128 => MCU_CIPHER_AES_CCMP,
+        rsn::CIPHER_CCMP_256 => 6,
+        rsn::CIPHER_GCMP_128 => 7,
+        rsn::CIPHER_GCMP_256 => 8,
+        _ => return None,
+    };
+    Some((mcu, rsn::data_cipher_key_len(suite)?))
+}
+
+/// The RXD1 `MT_RXD1_NORMAL_SEC_MODE` value (`enum mt76_cipher_type`) of
+/// a frame hardware decrypted under `suite`.
+pub(crate) fn mac_data_cipher(suite: u8) -> Option<u8> {
+    use narf_wireless::rsn;
+    Some(match suite {
+        rsn::CIPHER_CCMP_128 => 4,
+        rsn::CIPHER_CCMP_256 => 10,
+        rsn::CIPHER_GCMP_128 => 11,
+        rsn::CIPHER_GCMP_256 => 12,
+        _ => return None,
+    })
+}
+
 fn tlv(bytes: &mut Vec<u8>, id: u16, len: usize) -> usize {
     let offset = bytes.len();
     bytes.resize(offset + len, 0);
@@ -294,6 +340,8 @@ impl JoinPlan {
             ap_phy: None,
         })
     }
+    /// `ciphers` is the supplicant's selection ([`supplicant_ciphers`]);
+    /// `None` keeps CCMP-128 with BIP-CMAC-128.
     pub(crate) fn prepare_native(
         bss: &ScanBss,
         own: [u8; 6],
@@ -301,16 +349,20 @@ impl JoinPlan {
         security: Security,
         info: super::firmware_transport::RadioInfo,
         permission: TxPermission,
+        ciphers: Option<narf_wireless::rsn::Ciphers>,
     ) -> Result<Self, super::firmware_transport::Error> {
         use super::firmware_transport::Error as NativeError;
+        let options = match ciphers {
+            Some(ciphers) => security.options().with_ciphers(ciphers),
+            None => security.options(),
+        };
         if is_six_ghz(bss) || permission.six.is_some() {
-            return Self::prepare_native_6ghz(bss, own, ssid, security, info, permission);
+            return Self::prepare_native_6ghz(bss, own, ssid, security, info, permission, options);
         }
         if permission.native_width() == super::cmd::CH_BW_160 && !super::vht::wide160(info) {
             return Err(NativeError::UnsupportedFirmware);
         }
         let mode = security.mode();
-        let options = security.options();
         let wmm =
             wmm::Parameters::parse(&bss.information_elements).map_err(|_| NativeError::Bounds)?;
         let ap = narf_wireless::association::phy::ApElements::parse(&bss.information_elements)
@@ -438,6 +490,7 @@ impl JoinPlan {
         security: Security,
         info: super::firmware_transport::RadioInfo,
         permission: TxPermission,
+        options: narf_wireless::association::JoinOptions,
     ) -> Result<Self, super::firmware_transport::Error> {
         use super::firmware_transport::Error as NativeError;
         let grant = permission.six.ok_or(NativeError::Authority)?;
@@ -456,18 +509,11 @@ impl JoinPlan {
         .map_err(|_| NativeError::UnsupportedFirmware)?;
         let wmm =
             wmm::Parameters::parse(&bss.information_elements).map_err(|_| NativeError::Bounds)?;
-        let common = ManagementPlan::prepare_6ghz(
-            bss,
-            own,
-            ssid,
-            security.mode(),
-            &local,
-            security.options(),
-        )
-        .map_err(|error| match error {
-            Error::UnsupportedSecurity => NativeError::Bounds,
-            _ => NativeError::UnsupportedFirmware,
-        })?;
+        let common = ManagementPlan::prepare_6ghz(bss, own, ssid, security.mode(), &local, options)
+            .map_err(|error| match error {
+                Error::UnsupportedSecurity => NativeError::Bounds,
+                _ => NativeError::UnsupportedFirmware,
+            })?;
         let plan = common.six_ghz().ok_or(NativeError::UnsupportedFirmware)?;
         if !grant.matches(plan) {
             return Err(NativeError::Authority);
@@ -873,7 +919,18 @@ impl JoinPlan {
         aid: u16,
         key: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        if self.security == SecurityMode::Open || key.len() != 16 {
+        self.secure_peer_record_cipher_on(link, aid, key, narf_wireless::rsn::CIPHER_CCMP_128)
+    }
+    /// `secure_peer_record_on` for the negotiated pairwise `cipher`.
+    pub(crate) fn secure_peer_record_cipher_on(
+        &self,
+        link: Link,
+        aid: u16,
+        key: &[u8],
+        cipher: u8,
+    ) -> Result<Vec<u8>, Error> {
+        let (mcu, len) = mcu_data_cipher(cipher).ok_or(Error::UnsupportedSecurity)?;
+        if self.security == SecurityMode::Open || key.len() != len {
             return Err(Error::UnsupportedSecurity);
         }
         let mut out = self.peer_record_on(link, aid, true)?;
@@ -883,11 +940,11 @@ impl JoinPlan {
         let sec = tlv(&mut out, STA_REC_KEY_V2, 44);
         out[sec + 4] = 0; // enum set_key_cmd::SET_KEY, copied verbatim by Linux.
         out[sec + 5] = 1; // n_cipher = 1
-        out[sec + 8] = MCU_CIPHER_AES_CCMP;
+        out[sec + 8] = mcu;
         out[sec + 9] = 36; // cipher_len
         out[sec + 10] = 0; // key_id = 0
-        out[sec + 11] = 16; // key_len = 16
-        out[sec + 12..sec + 28].copy_from_slice(key);
+        out[sec + 11] = len as u8;
+        out[sec + 12..sec + 12 + len].copy_from_slice(key);
         Ok(out)
     }
 }
@@ -939,7 +996,20 @@ pub(crate) fn igtk_record_on(
     gtk: &[u8],
     igtk: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    if gtk_id > 3 || gtk.len() != 16 || igtk.len() != 16 {
+    igtk_record_cipher_on(link, gtk_id, gtk, narf_wireless::rsn::CIPHER_CCMP_128, igtk)
+}
+/// `igtk_record_on` whose `key[0]` repeats a GTK of `group_cipher`. Only
+/// the BIP-CMAC-128 IGTK is a hardware key (mt7921_set_key refuses the
+/// other BIP suites, which mac80211 then runs in software).
+pub(crate) fn igtk_record_cipher_on(
+    link: Link,
+    gtk_id: u8,
+    gtk: &[u8],
+    group_cipher: u8,
+    igtk: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let (mcu, len) = mcu_data_cipher(group_cipher).ok_or(Error::UnsupportedSecurity)?;
+    if gtk_id > 3 || gtk.len() != len || igtk.len() != 16 {
         return Err(Error::UnsupportedSecurity);
     }
     let mut out = vec![0; 8];
@@ -951,8 +1021,8 @@ pub(crate) fn igtk_record_on(
     let sec = tlv(&mut out, STA_REC_KEY_V2, 80);
     out[sec + 4] = 0; // SET_KEY
     out[sec + 5] = 2; // n_cipher
-    out[sec + 8..sec + 12].copy_from_slice(&[MCU_CIPHER_AES_CCMP, 36, gtk_id, 16]);
-    out[sec + 12..sec + 28].copy_from_slice(gtk);
+    out[sec + 8..sec + 12].copy_from_slice(&[mcu, 36, gtk_id, len as u8]);
+    out[sec + 12..sec + 12 + len].copy_from_slice(gtk);
     out[sec + 44..sec + 48].copy_from_slice(&[MCU_CIPHER_BIP_CMAC_128, 36, 0, 16]);
     out[sec + 48..sec + 64].copy_from_slice(igtk);
     Ok(out)
@@ -969,11 +1039,22 @@ pub(crate) fn key_record_on(
     key_id: u8,
     key: Option<&[u8]>,
 ) -> Result<Vec<u8>, Error> {
+    key_record_cipher_on(link, wcid, key_id, key, narf_wireless::rsn::CIPHER_CCMP_128)
+}
+/// `key_record_on` for a key of data `cipher` (CCMP-128/256, GCMP-128/256).
+pub(crate) fn key_record_cipher_on(
+    link: Link,
+    wcid: u8,
+    key_id: u8,
+    key: Option<&[u8]>,
+    cipher: u8,
+) -> Result<Vec<u8>, Error> {
+    let (mcu, len) = mcu_data_cipher(cipher).ok_or(Error::UnsupportedSecurity)?;
     let group = wcid == link.bmc();
     if !(group || wcid == link.peer())
         || key_id > 3
         || !group && key_id != 0
-        || key.is_some_and(|key| key.len() != 16)
+        || key.is_some_and(|key| key.len() != len)
     {
         return Err(Error::UnsupportedSecurity);
     }
@@ -989,8 +1070,8 @@ pub(crate) fn key_record_on(
     out[sec + 4] = u8::from(key.is_none());
     if let Some(key) = key {
         out[sec + 5] = 1;
-        out[sec + 8..sec + 12].copy_from_slice(&[MCU_CIPHER_AES_CCMP, 36, key_id, 16]);
-        out[sec + 12..sec + 28].copy_from_slice(key);
+        out[sec + 8..sec + 12].copy_from_slice(&[mcu, 36, key_id, len as u8]);
+        out[sec + 12..sec + 12 + len].copy_from_slice(key);
     }
     Ok(out)
 }

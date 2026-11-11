@@ -127,6 +127,9 @@ pub(super) fn rx_on_channel(packet: &[u8], channel: u8) -> Option<&[u8]> {
 pub(super) struct CcmpRx {
     pub pn: u64,
     pub key_id: u8,
+    /// `MT_RXD1_NORMAL_SEC_MODE` (`enum mt76_cipher_type`): AES_CCMP 4,
+    /// CCMP_256 10, GCMP 11, GCMP_256 12. Their PN layout is the same.
+    pub cipher: u8,
 }
 
 pub(super) struct NativeRx<'a> {
@@ -171,7 +174,8 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
     super::super::channel::from_rx_channel(channel)?;
     let r4 = word(packet, 16)?;
     let cipher = (r1 >> 16) & 0x1f;
-    if !matches!(cipher, 0 | 4) // MT_CIPHER_NONE / MT_CIPHER_AES_CCMP
+    // MT_CIPHER_NONE, AES_CCMP, CCMP_256, GCMP, GCMP_256.
+    if !matches!(cipher, 0 | 4 | 10 | 11 | 12)
         || r1 & (0x3f << 23) != 0
         || r2 & ((1 << 13) | (7 << 23)) != 0
     {
@@ -224,10 +228,11 @@ pub(super) fn rx_native_with_amsdu(packet: &[u8]) -> Option<NativeRx<'_>> {
         fragment,
         phy,
         rcpi,
-        ccmp: if cipher == 4 {
+        ccmp: if cipher != 0 {
             Some(CcmpRx {
                 pn: pn?,
                 key_id: ((r1 >> 21) & 3) as u8,
+                cipher: cipher as u8,
             })
         } else {
             None
