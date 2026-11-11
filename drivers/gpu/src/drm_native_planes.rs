@@ -750,9 +750,12 @@ fn synthesized_primary_fb(card: &Card, state: &AtomicState, crtc_id: u32) -> Opt
 }
 
 /// The synthesized primary of CRTC `crtc_id` after `state`: the request's
-/// primary plane state for it, else the committed framebuffer shown whole
-/// at `mode` (drm_atomic_helper_set_config), with DCN30's primary zpos.
-/// None when the CRTC has no primary framebuffer.
+/// primary plane state for it, else its committed state carried forward
+/// (drm_atomic_get_plane_state duplicates the plane's state) — the
+/// rectangles its last atomic commit gave it (`Card::primary_placement`),
+/// or after a legacy SETCRTC the framebuffer shown whole at `mode`
+/// (drm_atomic_helper_set_config) — with DCN30's primary zpos. None when
+/// the CRTC has no primary framebuffer.
 fn synthesized_primary(
     card: &Card,
     state: &AtomicState,
@@ -768,18 +771,22 @@ fn synthesized_primary(
             let fb = crtc.primary_fb?;
             // The framebuffer exists (it was validated when committed).
             card.framebuffer(fb).ok()?;
+            let (src, dst) = match card.primary_placement(crtc_id) {
+                Some(p) => (p.src, p.dst),
+                None => ((crtc.x, crtc.y, mode.0, mode.1), (0, 0, mode.0, mode.1)),
+            };
             PlaneState {
                 id,
                 crtc_id: Some(crtc_id),
                 fb_id: Some(fb),
-                crtc_x: 0,
-                crtc_y: 0,
-                crtc_w: mode.0,
-                crtc_h: mode.1,
-                src_x: crtc.x,
-                src_y: crtc.y,
-                src_w: mode.0,
-                src_h: mode.1,
+                crtc_x: dst.0,
+                crtc_y: dst.1,
+                crtc_w: dst.2,
+                crtc_h: dst.3,
+                src_x: src.0,
+                src_y: src.1,
+                src_w: src.2,
+                src_h: src.3,
                 in_fence_fd: None,
                 props: None,
             }
@@ -3018,6 +3025,121 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/drm",
         drm_native_planes_dcn30_kwin_pointer_on_primary
+    );
+
+    /// The two commits an RX 6750 XT's second KWin made 4.4 s apart on a
+    /// 3840x2160 screen showing only the pointer. First the 41x40 pointer
+    /// image on the primary at (1912, 1077): `plane64 crtc1 fb51 41x40
+    /// src=(0,0,41,40) crtc=(1912,1077,41,40)`. Then, flags PAGE_FLIP_EVENT
+    /// | NONBLOCK, `obj70{IN_FENCE_FD=-1 FB_ID=0 CRTC_ID=0} obj1{CTM=0
+    /// GAMMA_LUT=5 VRR_ENABLED=0}`: the cursor plane off and a gamma ramp,
+    /// the primary not named. drm_atomic_get_plane_state duplicates a
+    /// plane's committed state, so the primary amdgpu_dm_atomic_check adds
+    /// for the colour change (drm_atomic_add_affected_planes) and hands
+    /// dc_validate_global_state is the one the first commit validated, and
+    /// the second commit is accepted. Read back as the framebuffer whole at
+    /// the mode from the CRTC's x/y, the source rectangle lies outside the
+    /// 41x40 framebuffer, which Navi22's planner refuses
+    /// (`amdgpu_navi22_plane::stream_for`) — the EINVAL KWin logged as
+    /// "Atomic commit failed". The legacy x/y are the source origin
+    /// (drm_atomic_helper_update_legacy_modeset_state), and a legacy
+    /// SETCRTC or the framebuffer's removal ends the carried rectangles.
+    fn drm_native_planes_dcn30_untouched_primary_keeps_its_rectangles() -> TestResult {
+        let (mut card, fbs) = dcn30_card();
+        let uhd_mode = crate::Mode {
+            width: 3840,
+            height: 2160,
+            refresh_hz: 60,
+            bpp: 32,
+        };
+        card.crtcs[0].mode = Some(uhd_mode);
+        let pointer = {
+            let handle = card.gem.alloc(0x3000_0000, 41 * 40 * 4).unwrap();
+            card.addfb2(41, 40, AR24, 41 * 4, handle).unwrap()
+        };
+        let uhd = |_: u32| Some(uhd_mode);
+        let mut first = AtomicState::default();
+        first.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            pointer,
+            (41, 40),
+            (1912, 1077, 41, 40),
+        ));
+        if check(&card, &first, uhd).is_err() {
+            return TestResult::Fail("positioned pointer primary refused");
+        }
+        first.checked = true;
+        if first.core_commit(&mut card).is_err() {
+            return TestResult::Fail("positioned pointer primary not committed");
+        }
+        commit(&mut card, &first);
+        if (card.crtcs[0].x, card.crtcs[0].y) != (0, 0) {
+            return TestResult::Fail("legacy x/y are not the primary's source origin");
+        }
+        // The cursor plane off and a colour change on the CRTC.
+        let mut second = AtomicState::default();
+        let mut off = plane_state(&card, DCN30_CURSOR_PLANE_ID_BASE).unwrap();
+        off.fb_id = None;
+        off.crtc_id = None;
+        second.planes.push(off);
+        second.crtcs.push(crate::drm::atomic::CrtcState {
+            id: 1,
+            enable: true,
+            active: true,
+            mode: Some(uhd_mode),
+            ..Default::default()
+        });
+        let rects = |card: &Card, state: &AtomicState| {
+            synthesized_primary(card, state, 1, (3840, 2160)).map(|p| {
+                (
+                    p.fb_id,
+                    (p.src_x, p.src_y, p.src_w, p.src_h),
+                    (p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h),
+                )
+            })
+        };
+        if rects(&card, &second) != Some((Some(pointer), (0, 0, 41, 40), (1912, 1077, 41, 40))) {
+            return TestResult::Fail("untouched primary lost its committed rectangles");
+        }
+        match check(&card, &second, uhd) {
+            Ok(out) if out.is_empty() => {}
+            _ => return TestResult::Fail("cursor/colour commit refused over a positioned primary"),
+        }
+        // A request naming the primary still decides its own rectangles.
+        let mut third = AtomicState::default();
+        third.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            pointer,
+            (41, 40),
+            (100, 200, 41, 40),
+        ));
+        if rects(&card, &third) != Some((Some(pointer), (0, 0, 41, 40), (100, 200, 41, 40))) {
+            return TestResult::Fail("requested primary rectangles not used");
+        }
+        // drm_atomic_helper_set_config: the framebuffer whole at the mode.
+        card.set_primary_placement(1, None);
+        card.crtcs[0].primary_fb = Some(fbs[0]);
+        let empty = AtomicState::default();
+        if rects(&card, &empty) != Some((Some(fbs[0]), (0, 0, 3840, 2160), (0, 0, 3840, 2160))) {
+            return TestResult::Fail("legacy primary is not the framebuffer whole at the mode");
+        }
+        // A positioned primary whose framebuffer is removed leaves nothing
+        // to carry to the CRTC's next primary.
+        if first.core_commit(&mut card).is_err() || card.primary_placement(1).is_none() {
+            return TestResult::Fail("positioned primary not recorded");
+        }
+        if card.rmfb(pointer).is_err() || card.primary_placement(1).is_some() {
+            return TestResult::Fail("removed framebuffer left a primary placement");
+        }
+        card.crtcs[0].primary_fb = Some(fbs[0]);
+        if card.primary_placement(1).is_some() {
+            return TestResult::Fail("stale placement on the CRTC's next primary");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_dcn30_untouched_primary_keeps_its_rectangles
     );
 
     /// Commit/displays round-trip on DCN30: no overlay, no display; an

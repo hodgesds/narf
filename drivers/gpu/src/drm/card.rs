@@ -1062,6 +1062,14 @@ pub struct Card {
     /// primary of every CRTC the console lights while no client is master.
     /// No file owns it; RMFB/CLOSEFB refuse it.
     pub console_fb: Option<u32>,
+    /// The rectangles an atomic commit last gave each synthesized primary
+    /// plane (one the card keeps as its CRTC's `primary_fb` rather than as
+    /// a native plane), by CRTC id: drm_plane_state's src_* and crtc_*,
+    /// which a later commit that does not name the plane carries forward
+    /// unchanged. No entry: the legacy full-screen primary at the CRTC's
+    /// x/y (drm_atomic_helper_set_config). Read through
+    /// [`Card::primary_placement`].
+    pub(crate) primary_placements: Vec<(u32, Placement)>,
     pub(crate) property_blobs: Vec<PropertyBlob>,
     /// Next non-zero property-blob id.
     pub(crate) next_property_blob_id: u32,
@@ -1375,6 +1383,7 @@ impl Card {
             property_blobs: Vec::new(),
             committed_modes: Vec::new(),
             console_fb: None,
+            primary_placements: Vec::new(),
             next_property_blob_id: 1,
             vblank_seq: 0,
             next_vblank_ns: 0,
@@ -1393,6 +1402,26 @@ impl Card {
             overlay_formats: None,
             gfx12_modifiers: false,
             bo_tiling: Vec::new(),
+        }
+    }
+    /// The rectangles the last atomic commit of CRTC `crtc`'s synthesized
+    /// primary plane gave it, while that primary is still enabled. None
+    /// after a legacy SETCRTC (the framebuffer whole at the mode) or when
+    /// the primary is off.
+    pub fn primary_placement(&self, crtc: u32) -> Option<Placement> {
+        self.crtcs
+            .iter()
+            .find(|c| c.id == crtc)?
+            .primary_fb
+            .and(self.primary_placements.iter().find(|(id, _)| *id == crtc))
+            .map(|&(_, placement)| placement)
+    }
+    /// Record (or, with None, forget) the rectangles of CRTC `crtc`'s
+    /// synthesized primary plane.
+    pub fn set_primary_placement(&mut self, crtc: u32, placement: Option<Placement>) {
+        self.primary_placements.retain(|(id, _)| *id != crtc);
+        if let Some(placement) = placement {
+            self.primary_placements.push((crtc, placement));
         }
     }
     /// The native plane `id`, if this card has one.
@@ -2929,7 +2958,12 @@ impl Card {
         };
         if let Ok(c) = self.crtc_mut(crtc) {
             c.primary_fb = Some(id);
+            // drm_client_modeset_commit: the console framebuffer whole at
+            // the mode, from its origin.
+            c.x = 0;
+            c.y = 0;
         }
+        self.set_primary_placement(crtc, None);
     }
 
     pub fn rmfb(&mut self, fb_id: u32) -> Result<Option<(u64, u8)>, CardError> {
@@ -2965,6 +2999,8 @@ impl Card {
         {
             e.crtc_id = None;
         }
+        self.primary_placements
+            .retain(|(id, _)| !disabled.contains(id));
         for crtc in disabled {
             self.set_committed_mode(crtc, None);
         }

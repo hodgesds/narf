@@ -398,10 +398,8 @@ impl AtomicState {
         // A native card's overlay planes keep their own state
         // (`drm_native_planes::commit`).
         for ps in &self.planes {
-            if card
-                .native_plane(ps.id)
-                .is_some_and(|p| p.primary_of.is_none())
-            {
+            let native = card.native_plane(ps.id).map(|p| p.primary_of.is_some());
+            if native == Some(false) {
                 continue;
             }
             if let (Some(crtc_id), Some(fb_id)) = (ps.crtc_id, ps.fb_id) {
@@ -411,8 +409,24 @@ impl AtomicState {
                     .find(|c| c.id == crtc_id)
                     .ok_or(AtomicError::UnknownCrtc)?;
                 crtc.primary_fb = Some(fb_id);
-                crtc.x = ps.crtc_x.max(0) as u32;
-                crtc.y = ps.crtc_y.max(0) as u32;
+                // drm_atomic_helper_update_legacy_modeset_state: the
+                // legacy x/y are the primary's source origin, not where
+                // it sits on the CRTC.
+                crtc.x = ps.src_x;
+                crtc.y = ps.src_y;
+                // A synthesized primary's rectangles are plane state the
+                // next commit carries forward when it does not name the
+                // plane (a native primary keeps its own, in
+                // `drm_native_planes::commit`).
+                if native.is_none() {
+                    card.set_primary_placement(
+                        crtc_id,
+                        Some(crate::drm::card::Placement {
+                            src: (ps.src_x, ps.src_y, ps.src_w, ps.src_h),
+                            dst: (ps.crtc_x, ps.crtc_y, ps.crtc_w, ps.crtc_h),
+                        }),
+                    );
+                }
             }
         }
         Ok(())

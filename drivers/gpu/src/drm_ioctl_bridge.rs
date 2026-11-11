@@ -5239,6 +5239,14 @@ fn handle_obj_getproperties(
             } else {
                 (source_width, source_height)
             };
+            // The rectangles the last atomic commit gave the plane
+            // (drm_atomic_plane_get_property reads the plane state); a
+            // legacy primary shows the framebuffer from the CRTC's x/y at
+            // the CRTC's origin.
+            let (src, dst) = match card.primary_placement(crtc.id) {
+                Some(p) if !fixed_intel_view => (p.src, p.dst),
+                _ => ((crtc.x, crtc.y, width, height), (0, 0, width, height)),
+            };
             let (props, values) = (
                 vec![
                     PLANE_TYPE_PROP_ID,
@@ -5262,14 +5270,15 @@ fn handle_obj_getproperties(
                     } else {
                         0
                     },
-                    (crtc.x as u64) << 16,
-                    (crtc.y as u64) << 16,
-                    (width as u64) << 16,
-                    (height as u64) << 16,
-                    if fixed_intel_view { 0 } else { crtc.x as u64 },
-                    if fixed_intel_view { 0 } else { crtc.y as u64 },
-                    width as u64,
-                    height as u64,
+                    (src.0 as u64) << 16,
+                    (src.1 as u64) << 16,
+                    (src.2 as u64) << 16,
+                    (src.3 as u64) << 16,
+                    // CRTC_X/Y are signed range properties.
+                    dst.0 as i64 as u64,
+                    dst.1 as i64 as u64,
+                    dst.2 as u64,
+                    dst.3 as u64,
                     // IN_FENCE_FD reads back as -1 (never a live fd),
                     // matching drm_atomic_plane_get_property.
                     (-1i64) as u64,
@@ -6037,18 +6046,26 @@ fn atomic_commit(
                     .map(|fb| fb.height)
                     .or_else(|| crtc.mode.map(|mode| mode.height))
                     .unwrap_or(0);
+                // drm_atomic_get_plane_state duplicates the committed
+                // state: a property the request leaves out keeps the value
+                // the last commit gave it (a legacy primary shows the
+                // framebuffer from the CRTC's x/y at the CRTC's origin).
+                let (src, dst) = match card.primary_placement(crtc.id) {
+                    Some(p) => (p.src, p.dst),
+                    None => ((crtc.x, crtc.y, width, height), (0, 0, width, height)),
+                };
                 let mut plane = crate::drm::atomic::PlaneState {
                     id: object_id,
                     crtc_id: crtc.primary_fb.map(|_| crtc.id),
                     fb_id: crtc.primary_fb,
-                    crtc_x: crtc.x as i32,
-                    crtc_y: crtc.y as i32,
-                    crtc_w: width,
-                    crtc_h: height,
-                    src_x: crtc.x,
-                    src_y: crtc.y,
-                    src_w: width,
-                    src_h: height,
+                    crtc_x: dst.0,
+                    crtc_y: dst.1,
+                    crtc_w: dst.2,
+                    crtc_h: dst.3,
+                    src_x: src.0,
+                    src_y: src.1,
+                    src_w: src.2,
+                    src_h: src.3,
                     in_fence_fd: None,
                     props: None,
                 };
@@ -8027,7 +8044,13 @@ fn handle_setcrtc_decoded(
             }
         }
         // drm_atomic_helper_set_config: the primary shows the framebuffer
-        // whole at the mode again; the overlays stay as committed.
+        // whole at the mode again, from the request's x/y; the overlays
+        // stay as committed.
+        card.set_primary_placement(req.crtc_id, None);
+        if let Ok(crtc) = card.crtc_mut(req.crtc_id) {
+            crtc.x = req.x;
+            crtc.y = req.y;
+        }
         #[cfg(feature = "amdgpu")]
         crate::drm_native_planes::reset_primary(&mut card, req.crtc_id);
         #[cfg(feature = "amdgpu")]
@@ -8294,6 +8317,17 @@ fn handle_page_flip_decoded(
         let fits = crate::drm_native_planes::flip_fits(&card, req.crtc_id, req.fb_id);
         #[cfg(not(feature = "amdgpu"))]
         let fits: Option<bool> = None;
+        // So does a synthesized primary an atomic commit positioned or
+        // scaled: it is flipped where that commit left it.
+        let placement = mode
+            .filter(|_| card.plane_formats.is_some() && synthesized_primaries(&card))
+            .zip(card.primary_placement(req.crtc_id))
+            .and_then(|(m, p)| placement_of((p.dst, p.src), (m.width, m.height)));
+        let fits = fits.or(placement.map(|p| {
+            let within =
+                |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|end| end <= max);
+            within(p.src.0, p.src.2, fb.width) && within(p.src.1, p.src.3, fb.height)
+        }));
         match fits {
             Some(true) => {}
             Some(false) => return Err(FsError::NoSpace),
@@ -8304,7 +8338,10 @@ fn handle_page_flip_decoded(
         src_h = fb.height;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
-        src_frame = fb_frame(fb, src_phys.unwrap_or(0));
+        src_frame = crate::drm::card::PlaneFrame {
+            placement,
+            ..fb_frame(fb, src_phys.unwrap_or(0))
+        };
         // prepare_fb before the flip changes any state: a GEM framebuffer
         // that cannot be pinned fails PAGE_FLIP (no event is queued).
         if validate_only {
@@ -8323,7 +8360,8 @@ fn handle_page_flip_decoded(
             .bo
             .is_some()
             .then(|| prepared_frame(&card, fb, &prepared))
-            .flatten();
+            .flatten()
+            .map(|f| crate::drm::card::PlaneFrame { placement, ..f });
         intel = intel_frame(fb);
         virgl_resource = card.virtgpu_import(gem_handle).cloned();
 
