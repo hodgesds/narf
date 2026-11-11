@@ -4876,7 +4876,11 @@ kernel_test_in!(
 
 /// The `rtl92de_hw_init` orchestrator on a single-MAC 2.4 GHz
 /// function: power-on, MAC/BB/RF tail, TX-power level at channel 1,
-/// and the radio report (mode, band, RF type, RF on, PG store).
+/// and the radio report (mode, band, RF type, RF on, PG store); the
+/// Linux-order helpers it now runs: early mode off (`0x605 |= 0x30`
+/// only), software crypto (`REG_SECCFG` 0, `REG_CR+1` untouched), the
+/// ASPM back door with `support_backdoor` false (`0x349 = 0x03`), DM
+/// init and a two-path LC calibration (single-PHY 2T2R).
 fn smoke_rtl8192de_hw_init() -> TestResult {
     let efuse = match txpower::Efuse::from_hwinfo(&level_hwinfo(), false, false) {
         Ok(efuse) => efuse,
@@ -4895,11 +4899,29 @@ fn smoke_rtl8192de_hw_init() -> TestResult {
             channel: 1,
             bw40: false,
             autoload_fail: false,
+            earlymode_enable: false,
+            hw_security: mac::HwSecurity {
+                sw_crypto: true,
+                use_sw_sec: true,
+                use_defaultkey: false,
+            },
+            support_backdoor: false,
         },
     )) {
         Ok(radio) => radio,
         Err(_) => return TestResult::Fail("8192DE hw_init configure"),
     };
+    if de_mac_read8(&io, 0x605) & 0x70 != 0x30
+        || de_mac_read8(&io, mac::REG_EARLYMODE_CTRL + 3) != 0
+        || de_mac_read8(&io, mac::REG_SECCFG) != 0
+        || de_mac_read8(&io, 0x34b) != 0x93
+        || de_mac_read8(&io, 0x349) != 0x03
+        || de_mac_read8(&io, 0x352) != 0x01
+        || radio.dm != dm::Dm::new()
+        || radio.lc.path_count != 2
+    {
+        return TestResult::Fail("8192DE hw_init Linux-order helpers");
+    }
     if radio.mode != MacPhyMode::SingleMacSinglePhy
         || radio.band != Band::On2Ghz
         || radio.rf_type != RfType::TwoT2R

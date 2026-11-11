@@ -415,26 +415,28 @@ pub(super) async fn admit_rtl8192ee<I: super::firmware_transport::Io, M: Memory>
 /// from the signed per-board `N92D` envelope under current host policy,
 /// the operational MAC and the staged envelope the station re-proves at
 /// every publication. Packet DMA, CR gates and IRQs stay closed until
-/// the station service starts. 5 GHz native admission is future work:
-/// the envelope carries 5 GHz rows, but the native entry stays on
-/// 2.4 GHz channels 1-11 (the 8821AE dual-band gate is the only
-/// exception), so a dual-dual MAC0 function (5 GHz bandset) admits no
-/// channel here yet.
+/// the station service starts. The channel gate is the function's own
+/// bandset (`rtl8192de::native_channel` over the PROM mode and the PCI
+/// function): a dual-dual MAC0 function (5 GHz bandset) admits the
+/// 5 GHz station plan, MAC1 2.4 GHz channels 1-11, single and
+/// dual-single functions both bands.
 pub(super) async fn prepare_rtl8192de(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
     factory: Arc<super::efuse::Factory>,
     channel: u8,
 ) -> Result<(), Error> {
-    if !(1..=11).contains(&channel) || firmware.device_id() != super::regs::RTL_DEV_8192DE {
+    if firmware.device_id() != super::regs::RTL_DEV_8192DE {
         return Err(Error::State);
     }
     let interface_index = firmware.native().function().ok_or(Error::State)?;
+    let mode = super::rtl8192de::mode_from_prom(super::rtl8192de::Interface::Pci, &factory.logical)
+        .ok_or(Error::State)?;
+    if !super::rtl8192de::native_channel(channel, mode, interface_index) {
+        return Err(Error::State);
+    }
     if firmware.status().stage == super::firmware_transport::Stage::Detected {
         firmware.initialize_registered().await?;
-        let mode =
-            super::rtl8192de::mode_from_prom(super::rtl8192de::Interface::Pci, &factory.logical)
-                .ok_or(Error::State)?;
         let mut prepared = allocate(firmware, 128)?;
         prepared.bind_rtl8192de_mode(mode)?;
         prepare_retained(&retained, prepared).await?;
@@ -505,10 +507,14 @@ pub(super) async fn initialize_registered_on_channel(
     factory: Arc<super::efuse::Factory>,
     channel: u8,
 ) -> Result<(), Error> {
-    // RTL8821AE is dual-band (its own gate admits the 5 GHz plan); every
-    // other profile stays on 2.4 GHz channels 1-11.
+    // RTL8821AE and RTL8192DE are dual-band (their own gates admit the
+    // 5 GHz plan, 92DE per function bandset); every other profile stays on
+    // 2.4 GHz channels 1-11.
     if firmware.device_id() == super::regs::RTL_DEV_8821AE {
         return prepare_rtl8821ae(firmware, retained, factory, channel).await;
+    }
+    if firmware.device_id() == super::regs::RTL_DEV_8192DE {
+        return prepare_rtl8192de(firmware, retained, factory, channel).await;
     }
     if !(1..=11).contains(&channel) {
         return Err(Error::State);
@@ -518,9 +524,6 @@ pub(super) async fn initialize_registered_on_channel(
     }
     if super::rtl8192ce::is_8192ce(firmware.device_id()) {
         return prepare_rtl8192ce(firmware, retained, factory, channel).await;
-    }
-    if firmware.device_id() == super::regs::RTL_DEV_8192DE {
-        return prepare_rtl8192de(firmware, retained, factory, channel).await;
     }
     if firmware.device_id() != super::regs::RTL_DEV_8188EE {
         return Err(Error::State);

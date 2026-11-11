@@ -3448,20 +3448,39 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   deferred power-on is safe. RDG is dead in upstream Linux v6.1
   (`mac->rdg_en` is never assigned), so the RDG descriptor bit is
   carried but never set by the link. Step 6 (follow-up to #1865,
-  #1888) adds DM init (`rtl92d_dm_init`), the `rtl92de_hw_init`
-  early-mode / ASPM back-door / hardware-security steps, the IQK
-  reload wired into the channel switch, and the 5 GHz
-  native-admission gate (`native_channel`: a dual-dual MAC0
-  function admits the 5 GHz plan, MAC1 admits 2.4 GHz 1–11).
-  Still open (follow-up):
-  LC calibrate, IQK reload, the reserved-page packet, DM init,
-  earlymode, the ASPM back-door, HW security enable (keyed on the
-  software-crypto decision), TX-report arrival matching (no C2H path on 92D yet — Linux v6.1
-  gives 92D no C2H arrival route (`rtl92de_rx_query_desc` never
-  sets `packet_report_type`; the `IMR_C2HCMD` dispatch in `pci.c`
-  is gated to RTL8723AE), so a requested report can only resolve
-  via the 3 s timeout), and 5 GHz native admission (the envelope already
-  carries 5 GHz rows; the native entry stays 2.4 GHz).
+  #1888) adds the DM state (`rtl92d_dm_init`), the `rtl92de_hw_init`
+  early-mode / ASPM back-door / hardware-security helpers, LC
+  calibration (`lck.rs`), the IQK reload wired into the channel switch
+  (`calib::reload_iqk_setting` from `channel::switch_channel`), the
+  reserved-page packet (`rsvd_page.rs`) and the 5 GHz native gate
+  (`native_channel`: a dual-dual MAC0 function admits the 5 GHz plan,
+  MAC1 admits 2.4 GHz 1–11). The orchestrator `init::configure` runs
+  them in `hw.c` order: `mac::early_mode` (`earlymode_enable` false, as
+  `rtl92de_init_sw_vars`), `cam_reset` then `enable_hw_security_config`
+  (the NARF station encrypts in software, the `swenc=1` equivalent, so
+  nothing is written), original values + TX-power level, the station
+  address, `enable_aspm_back_door` (ASPM stays off on the probed link:
+  the `const_support_pciaspm` 0 back-door byte `0x03`), `Dm::new` (kept
+  in `Radio::dm`), `lck::lc_calibrate` (`init_ready` false, no scan;
+  a poll timeout proceeds as in Linux), then the dual-dual RF-ready
+  poll. `prepare_native::prepare_rtl8192de` gates the channel with
+  `native_channel` over the PROM mode and PCI function, and
+  `initialize_registered_on_channel` dispatches 92DE before the 2.4 GHz
+  1–11 gate. Test `smoke_rtl8192de_hw_init` (extended; written,
+  unexecuted). TX-report arrival matching is inapplicable on 92D, not
+  open: Linux gives 92D no C2H arrival route (`rtl92de_rx_query_desc`
+  never sets `packet_report_type`; the `IMR_C2HCMD` dispatch in
+  `pci.c` is gated to RTL8723AE), so a requested report only resolves
+  through the 3 s timeout, as here.
+  Still open: probe admission (`pci.rs` retained set, the
+  `interface.rs` readiness dispatch). The shared station composition
+  has no 92DE arm yet. The station power `wait` dispatch
+  (`station.rs`) has no `Base::Rtl8192de` case, `wait_rtl8192de` has
+  no caller, and the 92DE join path (`rtl8192de::station`
+  BSSID/media-status helpers, `station::join_bss_report` for the
+  reserved page) and descriptor fill are not composed into the shared
+  station. Admitting the chip now would publish a station that
+  cannot transmit.
 
 ## 4. Invariants
 

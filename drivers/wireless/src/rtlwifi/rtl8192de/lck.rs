@@ -40,10 +40,10 @@
 //! collision, and the two calibration pieces may want one home once
 //! both land.
 //!
-//! Not this step: the `rtl92de_hw_init` orchestrator call itself
-//! (blocked on #1889 Prepared integration / orchestrator landing) —
-//! [`lc_calibrate`] is exposed standalone first, and
-//! [`wait_dualphy_rf_ready`] is the hw_init follow-on step.
+//! Production caller: [`super::init::configure`] (the `rtl92de_hw_init`
+//! orchestrator) runs [`lc_calibrate`] after DM init, before its own
+//! dual-dual RF-ready poll (an inline copy of [`wait_dualphy_rf_ready`]
+//! that refuses on timeout, as Linux does).
 
 use super::phy::{self, Path};
 use super::{Band, MacPhyMode, RfType};
