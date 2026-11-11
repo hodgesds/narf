@@ -274,7 +274,117 @@ fn clone_writeback_window(
     Ok(phys)
 }
 
+/// One mapping-owner row's membership in its file's reverse map — Linux
+/// `address_space->i_mmap`, the list a truncate walks to find the VMAs of
+/// the file it is shrinking.
+///
+/// Every row holds one. Creating a row (or splitting, aliasing, relocating
+/// or forking one) enrols the row's address space under the file's
+/// identity; dropping the row takes it out again. A row cannot be built
+/// without one, so the map cannot miss a mapper.
+///
+/// What it buys: [`truncate_file_mappings`] used to take the VMA
+/// transaction of EVERY address space in the system, for every truncate of
+/// any file — an `open(O_TRUNC)` of a tmpfs file nobody has ever mapped
+/// included. That transaction is an interrupts-off spinlock held for the
+/// whole of a VMA operation, so one process in a long `munmap` made every
+/// shell redirection in the system spin with interrupts off until it was
+/// done. With the reverse map a file nobody maps costs one atomic load,
+/// and a mapped file's truncate waits only for the processes that map it.
+struct FileMapper {
+    identity: usize,
+    space: u64,
+}
+
+const FILE_MAPPER_SHARDS: usize = 64;
+const MAPPED_FILTER_BUCKETS: usize = 16 * 1024;
+
+/// `(file identity, address space) -> rows`, sharded by file. Each shard's
+/// lock is held for one map operation and nothing else.
+static FILE_MAPPERS: [IrqSafeSpinLock<BTreeMap<(usize, u64), usize>>; FILE_MAPPER_SHARDS] =
+    [const { IrqSafeSpinLock::new(BTreeMap::new()) }; FILE_MAPPER_SHARDS];
+
+/// Counting filter over the identities that have a row anywhere: zero
+/// means nobody maps the file, decided without a lock.
+static MAPPED_FILTER: [core::sync::atomic::AtomicU32; MAPPED_FILTER_BUCKETS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAPPED_FILTER_BUCKETS];
+
+fn mapper_hash(identity: usize) -> u64 {
+    (identity as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+fn mapper_shard(identity: usize) -> &'static IrqSafeSpinLock<BTreeMap<(usize, u64), usize>> {
+    &FILE_MAPPERS[(mapper_hash(identity) >> 58) as usize % FILE_MAPPER_SHARDS]
+}
+
+fn mapped_filter(identity: usize) -> &'static core::sync::atomic::AtomicU32 {
+    &MAPPED_FILTER[(mapper_hash(identity) >> 32) as usize % MAPPED_FILTER_BUCKETS]
+}
+
+impl FileMapper {
+    fn new(ops: &dyn FileOps, space: u64) -> Self {
+        Self::enrol(ops.mmap_backing_identity(), space)
+    }
+
+    /// The same file mapped by another address space (`fork`).
+    fn for_space(&self, space: u64) -> Self {
+        Self::enrol(self.identity, space)
+    }
+
+    fn enrol(identity: usize, space: u64) -> Self {
+        // The filter first: from here a truncate looks in the map.
+        mapped_filter(identity).fetch_add(1, Ordering::AcqRel);
+        *mapper_shard(identity)
+            .lock()
+            .entry((identity, space))
+            .or_insert(0) += 1;
+        Self { identity, space }
+    }
+}
+
+impl Clone for FileMapper {
+    fn clone(&self) -> Self {
+        Self::enrol(self.identity, self.space)
+    }
+}
+
+impl Drop for FileMapper {
+    fn drop(&mut self) {
+        {
+            let mut shard = mapper_shard(self.identity).lock();
+            let key = (self.identity, self.space);
+            if let Some(rows) = shard.get_mut(&key) {
+                *rows -= 1;
+                if *rows == 0 {
+                    shard.remove(&key);
+                }
+            }
+        }
+        mapped_filter(self.identity).fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The address spaces that map the file `identity`. Empty — and decided
+/// without taking any lock or looking at any address space — for a file
+/// nobody maps.
+fn file_mappers(identity: usize) -> Vec<u64> {
+    if mapped_filter(identity).load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    mapper_shard(identity)
+        .lock()
+        .range((identity, 0)..=(identity, u64::MAX))
+        .map(|((_, space), _)| *space)
+        .collect()
+}
+
+/// Address spaces whose VMA transaction [`truncate_file_mappings`] has
+/// taken. Kernel tests read it to show which truncates take none.
+pub(crate) static TRUNCATE_SPACE_VISITS: AtomicU64 = AtomicU64::new(0);
+
 struct MappingOwner {
+    /// This row's place in its file's reverse map.
+    mapper: FileMapper,
     base: u64,
     len: u64,
     /// File offset of `base`. Needed by [`demand_frame`] to turn a faulting
@@ -331,6 +441,10 @@ pub(crate) struct MappingProvenance {
     /// Host-absolute path the mapped fd was opened on; `None` when the fd
     /// has no recorded path (memfd, anonymous inodes).
     pub(crate) pathname: Option<alloc::string::String>,
+    /// The mapped descriptor is open for writing (Linux `VM_MAYWRITE` on a
+    /// shared mapping): stores through this mapping can dirty the file, so
+    /// its open is one writeback can write through.
+    pub(crate) writable: bool,
 }
 
 /// One file-owner row's provenance, as `/proc/<pid>/maps` needs it.
@@ -428,26 +542,19 @@ pub(crate) fn shared_file_at(address_space_id: u64, va: u64) -> Option<(Arc<dyn 
 }
 
 pub(crate) fn drop_address_space(address_space_id: u64) {
-    // Address-space teardown is the last writeback chance for this
-    // process's dirty fallback pages: a mapper that exits without
-    // munmap/fsync must still commit them, or its MAP_SHARED writes are
-    // silently lost. Flush first, while the bucket still names the files;
-    // the sweep itself is cache-driven and runs with no bucket lock held.
-    if let Some(bucket) = existing_mapping_owners(address_space_id) {
-        let files: Vec<Arc<dyn FileOps>> = {
-            let owners = bucket.lock();
-            let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
-            for mapping in owners.iter().filter(|mapping| !mapping.private_copy) {
-                if !files.iter().any(|file| Arc::ptr_eq(file, &mapping.ops)) {
-                    files.push(Arc::clone(&mapping.ops));
-                }
-            }
-            files
-        };
-        for ops in files {
-            let _ = flush_shared_pages_for_ops(&ops);
-        }
-    }
+    // Nothing is written here. This runs wherever the last reference to an
+    // address space happens to drop — for `exit`, a SIGKILL and the old
+    // image of an `execve` that is the executor thread, with no current
+    // task and the next task's slot already taken off the run queue. A
+    // write from here polled the filesystem with nothing to park on, so
+    // the CPU spun until every dirty page of every file the space mapped
+    // had been written, and the task it was about to run waited with it.
+    //
+    // Linux `exit_mmap` → `unmap_vmas` writes nothing either: the dirty
+    // folios stay in their inode's page cache for the flusher. Here the
+    // unmap has already handed each dirty page to its file's cache entry
+    // (`release_shared_file_page`), and the writeback task commits them.
+    writeback::torn_down();
     // Drop the bucket (and therefore FileOps/MmapLifetime references) after
     // releasing the global index: destructors may allocate or take arbitrary
     // filesystem locks.
@@ -460,32 +567,6 @@ pub(crate) fn drop_address_space(address_space_id: u64) {
     drop_advice_records(address_space_id);
     // A fork child dropped before `finish_fork_address_space` ran.
     let _ = FORK_DONT_COPY.lock().remove(&address_space_id);
-}
-
-/// Distinct files with a non-private mapping of `address_space_id`
-/// overlapping `[base, base + len)`. `munmap` snapshots this before the
-/// punch so it can commit the range's dirty pages afterwards, when the
-/// owner rows are already gone.
-pub(crate) fn file_ops_in_range(
-    address_space_id: u64,
-    base: u64,
-    len: u64,
-) -> Vec<Arc<dyn FileOps>> {
-    let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
-    if let Some(bucket) = existing_mapping_owners(address_space_id) {
-        let end = base.saturating_add(len);
-        let owners = bucket.lock();
-        for mapping in owners.iter().filter(|mapping| {
-            !mapping.private_copy
-                && mapping.base < end
-                && base < mapping.base.saturating_add(mapping.len)
-        }) {
-            if !files.iter().any(|file| Arc::ptr_eq(file, &mapping.ops)) {
-                files.push(Arc::clone(&mapping.ops));
-            }
-        }
-    }
-    files
 }
 
 /// Device page restrictions survive fd close and VMA splitting. Resolve the
@@ -569,6 +650,11 @@ fn publish_mapping_owner(
         zero_from,
         provenance,
     } = registration;
+    // Enrolled before the VMA is published: a truncate of this file that
+    // runs from here on finds this address space and waits for the
+    // publication instead of missing the mapping. Dropped again if the
+    // publication fails.
+    let mapper = FileMapper::new(ops.as_ref(), address_space_id);
     let owner_bucket = mapping_owners(address_space_id);
     let mut owners = owner_bucket.lock();
     let receipt = publish()?;
@@ -576,6 +662,7 @@ fn publish_mapping_owner(
         punch_locked(&mut owners, base, len);
     }
     owners.push(MappingOwner {
+        mapper,
         base,
         len,
         file_offset,
@@ -1119,8 +1206,10 @@ pub(crate) fn publish_current_zap(
 /// filesystem whose opens are separate `FileOps` objects (btrfs) shares the
 /// pages of one inode across every open and process.
 struct SharedFilePage {
-    /// Weak to avoid making the global cache keep an unlinked inode alive.
-    /// Every active mapping independently owns a strong FileOps reference.
+    /// Weak: the page does not keep its file alive. The file's
+    /// [`writeback::CachedFile`] does, for as long as the file has a mapped
+    /// or unwritten page, and this names that entry's open — so it upgrades
+    /// exactly while writeback can still reach the page.
     ops: Weak<dyn FileOps>,
     /// `mmap_backing_identity` of the file this page caches.
     identity: SharedFileIdentity,
@@ -1136,9 +1225,43 @@ struct SharedFilePage {
     cache_generation: Option<u64>,
     /// Exact bytes last read from, or successfully written to, the backing
     /// file. Generic mappings cannot rely on hardware dirty bits here, so an
-    /// exact snapshot lets fsync skip clean pages without risking a hash
-    /// collision that could lose a write.
-    clean: Vec<u8>,
+    /// exact snapshot lets writeback skip clean pages without risking a hash
+    /// collision that could lose a write. Shared, so writeback can compare
+    /// against it without holding the cache lock; replaced, never mutated,
+    /// while a second reference exists (`Arc::make_mut`).
+    clean: Arc<Vec<u8>>,
+    /// Writeback batches that hold this page (Linux `PG_writeback`): its
+    /// frame is being read or its bytes are on their way to the file. A
+    /// pinned page is never freed — see [`SharedFilePages::retire_phys`].
+    wb_pins: usize,
+    /// [`writeback::write_stamp`] value of the last batch that wrote this
+    /// page. A `write(2)` that began before it cannot know which of the two
+    /// reached the file last — see [`note_file_written`].
+    wb_seq: u64,
+    /// A `write(2)` or an invalidation changed the page while a batch held
+    /// it, so the batch's image is not the page's any more.
+    redirtied: bool,
+    /// Unmapped and holding bytes the file does not: listed in
+    /// [`SharedFilePages::idle_dirty`]. No mapping can change such a page, so
+    /// the flag is exact, and it is what stops an idle page from being
+    /// evicted or replaced before writeback has committed it.
+    idle_dirty: bool,
+    /// Set when background writeback first finds this mapped page dirty:
+    /// when it becomes due (`dirty_expire_centisecs` later).
+    write_due: Option<narf_time::Deadline>,
+    /// Consecutive writeback passes that found this unmapped page's unwritten
+    /// bytes lying past the file's EOF.
+    past_eof_passes: u8,
+    /// A mapping that can store to the file has held this page since its
+    /// bytes were last known to equal the clean image (Linux: the folio of
+    /// a `VM_SHARED | VM_MAYWRITE` mapping, which writeback has to look
+    /// at). This is what the unmap paths consult — recorded state, never a
+    /// comparison of the page's contents. Only writeback, which compares
+    /// outside every lock, turns it off again.
+    maybe_dirty: bool,
+    /// Unmapped, known clean, kept for reuse: listed in
+    /// [`SharedFilePages::idle_clean`].
+    idle_clean: bool,
 }
 
 // Pointer anchors and generation counters are only unique within a mounted
@@ -1161,9 +1284,62 @@ struct SharedFileKey {
     offset: u64,
 }
 
+/// One file's place in the cache: the entry that owns its writeback, and how
+/// many of its pages still need that entry.
+struct FileSlot {
+    file: Arc<writeback::CachedFile>,
+    /// The open that brought the file into the cache. Never replaced: every
+    /// page's weak `ops` names it, which is how a page tells that its file
+    /// still has an entry. Dropped only outside the cache lock.
+    ops: Arc<dyn FileOps>,
+    /// The open writeback writes through, once a mapping whose descriptor
+    /// is open for writing has reached the file ([`writeback::note_writer`]).
+    /// On a filesystem whose opens carry their access mode (9p, FUSE) the
+    /// first open may be read-only and unable to commit a page.
+    writer: Option<Arc<dyn FileOps>>,
+    /// Pages with a mapping or a pending publication.
+    held: usize,
+    /// Pages listed in [`SharedFilePages::idle_dirty`].
+    idle_dirty: usize,
+}
+
 struct SharedFilePages {
     by_phys: BTreeMap<u64, SharedFilePage>,
     by_file: BTreeMap<SharedFileKey, u64>,
+    /// Every file that has a mapped or unwritten page. The entry holds the
+    /// file open, which is what lets a dirty page outlive the last mapping
+    /// and the last descriptor of its file (Linux: the inode's
+    /// `address_space` owns the page, not the `mm` that dirtied it).
+    files: BTreeMap<SharedFileIdentity, FileSlot>,
+    /// Unmapped pages whose bytes the file does not have yet.
+    idle_dirty: alloc::collections::BTreeSet<SharedFileKey>,
+    /// Frames of pages removed from the cache while a writeback batch held
+    /// them, with the number of holds left. The last release frees the frame.
+    doomed: BTreeMap<u64, usize>,
+    /// Unmapped clean pages kept for reuse, by frame: the list eviction
+    /// takes its victims from (Linux reclaim works on an LRU list, never by
+    /// scanning a mapping). Bounded by [`MAX_RETAINED_SHARED_FILE_PAGES`].
+    idle_clean: alloc::collections::BTreeSet<u64>,
+}
+
+/// What [`SharedFilePages::page_idle`] hands back for the caller to let go
+/// of once the cache lock is released: the page's own frame and that of a
+/// page evicted to make room for it, and the file's entry if this was the
+/// last page that needed it.
+#[derive(Default)]
+struct IdleOutcome {
+    frames: [Option<PhysAddr>; 2],
+    slot: Option<FileSlot>,
+}
+
+/// What became of a page whose last mapping or publication went away.
+enum IdleFate {
+    /// Nothing can use it again: free the frame.
+    Retire,
+    /// Its bytes are not on the file yet.
+    KeepDirty,
+    /// Clean and reusable by a later mapping.
+    KeepClean,
 }
 
 impl SharedFilePages {
@@ -1171,6 +1347,10 @@ impl SharedFilePages {
         Self {
             by_phys: BTreeMap::new(),
             by_file: BTreeMap::new(),
+            files: BTreeMap::new(),
+            idle_dirty: alloc::collections::BTreeSet::new(),
+            doomed: BTreeMap::new(),
+            idle_clean: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -1182,6 +1362,9 @@ impl SharedFilePages {
         SharedFileKey { file, offset }
     }
 
+    /// Remove a page from both indexes and from the dirty accounting. The
+    /// caller owns the frame — but see [`Self::retire_phys`], which is what
+    /// every path that goes on to free it must use.
     fn remove_phys(&mut self, phys: u64) -> Option<SharedFilePage> {
         let page = self.by_phys.remove(&phys)?;
         let key = Self::key_from_ptr(page.identity, page.offset);
@@ -1190,7 +1373,227 @@ impl SharedFilePages {
             Some(phys),
             "shared-file indexes diverged"
         );
+        if page.idle_dirty {
+            self.idle_dirty.remove(&key);
+            if let Some(slot) = self.files.get_mut(&page.identity) {
+                slot.idle_dirty = slot.idle_dirty.saturating_sub(1);
+            }
+            writeback::IDLE_DIRTY_PAGES.fetch_sub(1, Ordering::Relaxed);
+        }
+        if page.idle_clean {
+            self.idle_clean.remove(&phys);
+        }
         Some(page)
+    }
+
+    /// Remove a page and say which frame may be freed now. A page a
+    /// writeback batch still holds gives `None`: its frame is parked in
+    /// [`Self::doomed`] until [`Self::unpin`] releases the last hold, so the
+    /// batch never reads a frame the allocator has handed out again.
+    fn retire_phys(&mut self, phys: u64) -> Option<PhysAddr> {
+        let page = self.remove_phys(phys)?;
+        if page.wb_pins != 0 {
+            self.doomed.insert(phys, page.wb_pins);
+            None
+        } else {
+            Some(page.phys)
+        }
+    }
+
+    /// Drop one writeback hold. Returns whether the page is still cached,
+    /// and the frame to free if this was the last hold on a removed page.
+    fn unpin(&mut self, phys: u64) -> (bool, Option<PhysAddr>) {
+        if let Some(page) = self.by_phys.get_mut(&phys) {
+            page.wb_pins = page.wb_pins.saturating_sub(1);
+            return (true, None);
+        }
+        match self.doomed.get_mut(&phys) {
+            Some(holds) if *holds > 1 => {
+                *holds -= 1;
+                (false, None)
+            }
+            Some(_) => {
+                self.doomed.remove(&phys);
+                (false, Some(PhysAddr::new(phys)))
+            }
+            None => (false, None),
+        }
+    }
+
+    /// Record that the page at `phys` is about to gain a mapping or a
+    /// pending publication. An idle page becomes its file's responsibility
+    /// again: the entry is (re)created — around `ops`, or around the open
+    /// that last vouched for the page — and the page leaves the idle-dirty
+    /// list, since a mapping can now change it. Call BEFORE the counter
+    /// moves.
+    fn page_held(&mut self, phys: u64, ops: Option<&Arc<dyn FileOps>>) {
+        let Some(page) = self.by_phys.get_mut(&phys) else {
+            return;
+        };
+        if page.mappings != 0 || page.pending != 0 {
+            return;
+        }
+        if page.wb_pins != 0 {
+            // A batch is writing this page from an image taken while
+            // nothing mapped it. A mapping can store to it from here on.
+            page.redirtied = true;
+        }
+        let identity = page.identity;
+        let key = Self::key_from_ptr(identity, page.offset);
+        let was_dirty = core::mem::take(&mut page.idle_dirty);
+        let was_listed_clean = core::mem::take(&mut page.idle_clean);
+        let recorded = page.ops.clone();
+        if was_listed_clean {
+            self.idle_clean.remove(&phys);
+        }
+        if was_dirty {
+            self.idle_dirty.remove(&key);
+            writeback::IDLE_DIRTY_PAGES.fetch_sub(1, Ordering::Relaxed);
+        }
+        // A strong reference taken here is handed to the new entry, so it
+        // is never the last one dropped under the cache lock.
+        let Some(slot) = self.ensure_slot(identity, || ops.cloned().or_else(|| recorded.upgrade()))
+        else {
+            return;
+        };
+        slot.held += 1;
+        if was_dirty {
+            slot.idle_dirty = slot.idle_dirty.saturating_sub(1);
+        }
+        let entry_ops = Arc::downgrade(&slot.ops);
+        if let Some(page) = self.by_phys.get_mut(&phys) {
+            page.ops = entry_ops;
+        }
+    }
+
+    /// The page at `phys` lost its last mapping and pending publication.
+    /// Decide its fate — from recorded state, without looking at its bytes
+    /// — and keep the accounting.
+    fn page_idle(&mut self, phys: u64) -> IdleOutcome {
+        let mut outcome = IdleOutcome::default();
+        let Some(page) = self.by_phys.get(&phys) else {
+            return outcome;
+        };
+        let identity = page.identity;
+        let key = Self::key_from_ptr(identity, page.offset);
+        let fate = idle_shared_page_fate(page);
+        let mut unused = false;
+        if let Some(slot) = self.files.get_mut(&identity) {
+            slot.held = slot.held.saturating_sub(1);
+            if matches!(fate, IdleFate::KeepDirty) {
+                slot.idle_dirty += 1;
+            }
+            unused = writeback::slot_is_unused(slot);
+        }
+        match fate {
+            IdleFate::Retire => outcome.frames[0] = self.retire_phys(phys),
+            IdleFate::KeepDirty => {
+                if let Some(page) = self.by_phys.get_mut(&phys) {
+                    page.idle_dirty = true;
+                    page.write_due = None;
+                }
+                self.idle_dirty.insert(key);
+                writeback::IDLE_DIRTY_PAGES.fetch_add(1, Ordering::Relaxed);
+            }
+            IdleFate::KeepClean => outcome.frames[1] = self.keep_idle_clean(phys),
+        }
+        if unused {
+            outcome.slot = self.remove_slot(identity);
+        }
+        outcome
+    }
+
+    /// List the unmapped clean page at `phys` for reuse. The list has a
+    /// cap; past it one other listed page is evicted — one list operation,
+    /// whatever the size of the cache — and its frame returned.
+    fn keep_idle_clean(&mut self, phys: u64) -> Option<PhysAddr> {
+        if let Some(page) = self.by_phys.get_mut(&phys) {
+            page.idle_clean = true;
+        }
+        self.idle_clean.insert(phys);
+        if self.idle_clean.len() <= MAX_RETAINED_SHARED_FILE_PAGES {
+            return None;
+        }
+        let victim = self
+            .idle_clean
+            .iter()
+            .find(|listed| **listed != phys)
+            .copied()?;
+        writeback::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        self.retire_phys(victim)
+    }
+
+    /// Mark an idle page as holding bytes the file does not (a `write(2)`
+    /// that raced a writeback batch). No-op for a mapped or listed page.
+    /// `ops` is the open that made the change: if the file's entry has
+    /// already been collected, it is what writeback will write through.
+    fn mark_idle_dirty(&mut self, phys: u64, ops: &Arc<dyn FileOps>) {
+        let Some(page) = self.by_phys.get_mut(&phys) else {
+            return;
+        };
+        if page.idle_dirty || page.mappings != 0 || page.pending != 0 {
+            return;
+        }
+        page.idle_dirty = true;
+        let key = Self::key_from_ptr(page.identity, page.offset);
+        let identity = page.identity;
+        self.idle_dirty.insert(key);
+        writeback::IDLE_DIRTY_PAGES.fetch_add(1, Ordering::Relaxed);
+        let Some(slot) = self.ensure_slot(identity, || Some(Arc::clone(ops))) else {
+            return;
+        };
+        slot.idle_dirty += 1;
+        let entry_ops = Arc::downgrade(&slot.ops);
+        if let Some(page) = self.by_phys.get_mut(&phys) {
+            page.ops = entry_ops;
+        }
+    }
+
+    /// The entry for `identity`, created around the open `owner` yields if
+    /// the file has none. `None` when there is no entry and no open to make
+    /// one from.
+    fn ensure_slot(
+        &mut self,
+        identity: SharedFileIdentity,
+        owner: impl FnOnce() -> Option<Arc<dyn FileOps>>,
+    ) -> Option<&mut FileSlot> {
+        if let alloc::collections::btree_map::Entry::Vacant(vacant) = self.files.entry(identity) {
+            let ops = owner()?;
+            writeback::filter_add(identity);
+            vacant.insert(FileSlot {
+                file: writeback::CachedFile::new(identity),
+                ops,
+                writer: None,
+                held: 0,
+                idle_dirty: 0,
+            });
+        }
+        self.files.get_mut(&identity)
+    }
+
+    /// Remove a file's entry. The caller drops it outside the cache lock:
+    /// it may hold the last reference to the file.
+    fn remove_slot(&mut self, identity: SharedFileIdentity) -> Option<FileSlot> {
+        let slot = self.files.remove(&identity)?;
+        writeback::filter_remove(identity);
+        Some(slot)
+    }
+
+    /// An idle page's bytes reached the file (or stopped mattering).
+    fn clear_idle_dirty(&mut self, phys: u64) {
+        let Some(page) = self.by_phys.get_mut(&phys) else {
+            return;
+        };
+        if !core::mem::take(&mut page.idle_dirty) {
+            return;
+        }
+        let key = Self::key_from_ptr(page.identity, page.offset);
+        let identity = page.identity;
+        self.idle_dirty.remove(&key);
+        writeback::IDLE_DIRTY_PAGES.fetch_sub(1, Ordering::Relaxed);
+        if let Some(slot) = self.files.get_mut(&identity) {
+            slot.idle_dirty = slot.idle_dirty.saturating_sub(1);
+        }
     }
 }
 
@@ -1234,32 +1637,40 @@ fn retain_pending_shared_page(page: &mut SharedFilePage) {
         .expect("shared-file pending hold overflow");
 }
 
-fn shared_page_is_clean(page: &SharedFilePage) -> bool {
-    // SAFETY: the cache entry owns `phys` while this function is called under
-    // SHARED_FILE_PAGES. No final mapping release can free it concurrently.
-    let current = unsafe { core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>(), 4096) };
-    page.clean.as_slice() == current
-}
-
-fn should_retire_idle_shared_page(page: &SharedFilePage, cache_len: usize) -> bool {
+/// What to do with a page that has just lost its last mapping and pending
+/// publication. Decided from recorded state alone: this runs under the
+/// cache lock on every unmap, exit and failed publication, and a 4 KiB
+/// compare per page there — let alone a walk of the cache — is exactly the
+/// kind of work those paths must not do.
+fn idle_shared_page_fate(page: &SharedFilePage) -> IdleFate {
+    if page.wb_pins != 0 {
+        // A batch is writing an image of this page taken earlier, and will
+        // decide what the page owes when it completes.
+        return IdleFate::KeepDirty;
+    }
     if page.cache_generation.is_none() && page.ops.upgrade().is_none() {
-        // The file object is gone and no generation discipline vouches for
-        // the page, so no writeback can ever reach it again and its
-        // identity cannot be trusted across opens; retaining the frame
-        // only leaks it. A generation-carrying page is the opposite case:
-        // its file is identified by (identity, generation), a later open
-        // can still flush or reuse it, and the cap below bounds retention.
-        return true;
+        // No file entry holds the file open (it would keep `ops` alive) and
+        // no generation discipline vouches for the page, so no writeback
+        // can ever reach it again and its identity cannot be trusted across
+        // opens; retaining the frame only leaks it. A generation-carrying
+        // page is the opposite case: its file is identified by (identity,
+        // generation), a later open can still reuse it, and the cap on the
+        // idle-clean list bounds retention.
+        return IdleFate::Retire;
     }
-    if !shared_page_is_clean(page) {
-        // A dirty page is the only copy of a MAP_SHARED write that no
-        // fsync/msync has committed yet. Retiring it would silently lose
-        // the write; the flush lifecycle (munmap / address-space teardown /
-        // sync / fsync) must get its chance to commit the page first, after
-        // which it is clean and this check lets it go.
-        return false;
+    if page.maybe_dirty {
+        // A mapping that could store to the file held this page. Whether it
+        // did is for writeback to find out, outside this lock; until then
+        // the page is the only copy of whatever was stored. It stays, owned
+        // by its file's entry — Linux keeps such a folio in the inode's
+        // page cache past `munmap` and `exit_mmap` in exactly this way.
+        return IdleFate::KeepDirty;
     }
-    page.cache_generation.is_none() || cache_len > MAX_RETAINED_SHARED_FILE_PAGES
+    if page.cache_generation.is_none() {
+        IdleFate::Retire
+    } else {
+        IdleFate::KeepClean
+    }
 }
 
 /// Consumable reservation for the canonical pages selected by one mmap
@@ -1298,6 +1709,7 @@ pub(crate) fn reserve_cached_shared_file_pages(
             canonical.push(PhysAddr::new(phys));
         }
         for phys in &canonical {
+            pages.page_held(phys.raw(), Some(ops));
             let page = pages
                 .by_phys
                 .get_mut(&phys.raw())
@@ -1333,31 +1745,32 @@ impl SharedFilePublication {
             return;
         }
         // Capacity is reserved before IRQs are masked. At most one page can
-        // become free for each reservation held by this publication.
-        let mut free = Vec::with_capacity(self.phys.len());
+        // become free for each reservation held by this publication, and at
+        // most one file entry unused.
+        let mut free = Vec::with_capacity(self.phys.len() * 2);
+        let mut unused: Vec<FileSlot> = Vec::with_capacity(self.phys.len());
         {
             let mut pages = SHARED_FILE_PAGES.lock();
             for phys in &self.phys {
-                let cache_len = pages.by_phys.len();
-                let retire = {
+                let idle = {
                     let page = pages
                         .by_phys
                         .get_mut(&phys.raw())
                         .expect("pending shared-file publication lost its canonical page");
                     assert!(page.pending != 0, "shared-file pending hold underflow");
                     page.pending -= 1;
-                    page.mappings == 0
-                        && page.pending == 0
-                        && should_retire_idle_shared_page(page, cache_len)
+                    page.mappings == 0 && page.pending == 0
                 };
-                if retire {
-                    let retired = pages
-                        .remove_phys(phys.raw())
-                        .expect("unreferenced shared-file page disappeared");
-                    free.push(retired.phys);
+                if idle {
+                    let outcome = pages.page_idle(phys.raw());
+                    free.extend(outcome.frames.into_iter().flatten());
+                    unused.extend(outcome.slot);
                 }
             }
         }
+        // Outside the cache lock: an entry may hold the last reference to
+        // its file.
+        drop(unused);
         self.active = false;
         for phys in free {
             narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
@@ -1460,7 +1873,7 @@ fn demand_frame_inner(
 ) -> Result<(u64, Option<FaultExpansion>), FileFaultError> {
     let page = vaddr & !0xFFFu64;
     let owner_bucket = existing_mapping_owners(address_space_id).ok_or(FileFaultError::NoOwner)?;
-    let (offset, ops, generic_fallback, private_copy, zero_from, owner_base, owner_len) = {
+    let (offset, ops, generic_fallback, private_copy, zero_from, owner_base, owner_len, writable) = {
         let owners = owner_bucket.lock();
         let owner = owners
             .iter()
@@ -1477,6 +1890,11 @@ fn demand_frame_inner(
             owner.zero_from,
             owner.base,
             owner.len,
+            // A row that does not say is taken to be writable.
+            owner
+                .provenance
+                .as_ref()
+                .is_none_or(|provenance| provenance.writable),
         )
     };
     if private_copy {
@@ -1527,6 +1945,7 @@ fn demand_frame_inner(
     if offset >= ops.stat().size {
         return Err(FileFaultError::Bus);
     }
+    writeback::settle_unverified(&ops, offset, 1);
     let expected_generation = ops.mmap_cache_generation();
     let (phys, publication) =
         if let Some((phys, publication)) = reserve_cached_shared_file_pages(&ops, offset, 1) {
@@ -1544,11 +1963,21 @@ fn demand_frame_inner(
                 publish_shared_file_pages(&ops, offset, candidates, expected_generation);
             (*phys.first().ok_or(FileFaultError::NoMemory)?, publication)
         };
-    if !retain_shared_file_page(phys.raw()) {
+    let retained = if writable {
+        retain_shared_file_page_writable(phys.raw())
+    } else {
+        retain_shared_file_page(phys.raw())
+    };
+    if !retained {
         drop(publication);
         return Err(FileFaultError::NoOwner);
     }
     publication.commit();
+    if writable {
+        // This mapping can dirty the page it just took: its open is the one
+        // to write the file back through.
+        writeback::note_writer(&ops);
+    }
 
     // Recording the fetched frame as the owner row's writeback fallback
     // has three outcomes, because this fill ran lock-free and the world
@@ -1803,6 +2232,7 @@ pub(crate) fn populate_file_cache(ops: &Arc<dyn FileOps>, offset: u64, len: u64)
     if end <= first {
         return 0;
     }
+    writeback::settle_unverified(ops, first, (end - first).div_ceil(4096) as usize);
     let identity = shared_file_identity(ops.as_ref());
     let mut populated = 0u64;
     let mut page = first;
@@ -2473,8 +2903,9 @@ pub(crate) fn publish_shared_file_pages(
     for candidate in candidates {
         // SAFETY: every candidate is a freshly allocated, identity-mapped
         // fallback page owned by this publication attempt.
-        let clean =
-            unsafe { core::slice::from_raw_parts(candidate.kernel_ptr::<u8>(), 4096).to_vec() };
+        let clean = Arc::new(unsafe {
+            core::slice::from_raw_parts(candidate.kernel_ptr::<u8>(), 4096).to_vec()
+        });
         prepared.push((candidate, clean));
     }
     let mut rejected = Vec::with_capacity(prepared.len());
@@ -2501,13 +2932,15 @@ pub(crate) fn publish_shared_file_pages(
             });
             if existing.is_none() && pages.by_file.contains_key(&key) {
                 let stale_phys = pages.by_file[&key];
-                // A dirty idle page holds MAP_SHARED writes no flush has
-                // committed yet. Adopt it as canonical — refreshing its
+                // A dirty idle page holds MAP_SHARED writes writeback has
+                // not committed yet. Adopt it as canonical — refreshing its
                 // generation — rather than freeing the only copy of those
-                // writes to make room for a stale device read.
-                let adopt = pages.by_phys.get(&stale_phys).is_some_and(|page| {
-                    shared_page_matches_ops(page, identity) && !shared_page_is_clean(page)
-                });
+                // writes to make room for a stale device read. The flag is
+                // exact for an idle page, so no compare runs under the lock.
+                let adopt = pages
+                    .by_phys
+                    .get(&stale_phys)
+                    .is_some_and(|page| page.identity == identity && page.idle_dirty);
                 if adopt {
                     let page = pages
                         .by_phys
@@ -2516,12 +2949,15 @@ pub(crate) fn publish_shared_file_pages(
                     page.cache_generation = cache_generation;
                     existing = Some(stale_phys);
                 } else {
-                    let stale = pages
-                        .remove_phys(stale_phys)
-                        .expect("shared-file key points to no physical page");
-                    debug_assert_eq!(stale.mappings, 0);
-                    debug_assert_eq!(stale.pending, 0);
-                    retired.push(stale.phys);
+                    debug_assert!(pages
+                        .by_phys
+                        .get(&stale_phys)
+                        .is_some_and(|stale| stale.mappings == 0 && stale.pending == 0));
+                    // `None` while a writeback batch still holds the frame;
+                    // its last release frees it.
+                    if let Some(stale) = pages.retire_phys(stale_phys) {
+                        retired.push(stale);
+                    }
                 }
             }
             let phys = if let Some(phys) = existing {
@@ -2547,6 +2983,14 @@ pub(crate) fn publish_shared_file_pages(
                                 pending: 0,
                                 cache_generation,
                                 clean,
+                                wb_pins: 0,
+                                wb_seq: 0,
+                                redirtied: false,
+                                idle_dirty: false,
+                                write_due: None,
+                                past_eof_passes: 0,
+                                maybe_dirty: false,
+                                idle_clean: false,
                             },
                         )
                         .is_none(),
@@ -2559,6 +3003,7 @@ pub(crate) fn publish_shared_file_pages(
                 canonical.push(candidate);
                 candidate
             };
+            pages.page_held(phys.raw(), Some(ops));
             let page = pages
                 .by_phys
                 .get_mut(&phys.raw())
@@ -2566,25 +3011,18 @@ pub(crate) fn publish_shared_file_pages(
             retain_pending_shared_page(page);
         }
         // Bound the retained set while this publication already holds the
-        // cache lock: past the cap, clean idle pages are evicted. Dirty
-        // pages are never eviction candidates — they leave only through
-        // the flush lifecycle, after which they are clean and evictable.
-        if pages.by_phys.len() > MAX_RETAINED_SHARED_FILE_PAGES {
-            let excess = pages.by_phys.len() - MAX_RETAINED_SHARED_FILE_PAGES;
-            let victims: Vec<u64> = pages
-                .by_phys
-                .values()
-                .filter(|page| {
-                    page.mappings == 0 && page.pending == 0 && shared_page_is_clean(page)
-                })
-                .map(|page| page.phys.raw())
-                .take(excess)
-                .collect();
-            for phys in victims {
-                let evicted = pages
-                    .remove_phys(phys)
-                    .expect("evicted shared-file page disappeared");
-                retired.push(evicted.phys);
+        // cache lock. Victims come off the idle-clean list — one list
+        // operation each — so a publication costs the same however large
+        // the cache is. Pages that may be dirty are not on that list: they
+        // leave only through writeback.
+        while pages.idle_clean.len() > MAX_RETAINED_SHARED_FILE_PAGES {
+            let Some(victim) = pages.idle_clean.iter().next().copied() else {
+                break;
+            };
+            writeback::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+            // Unlisted whether or not its frame can be freed yet.
+            if let Some(evicted) = pages.retire_phys(victim) {
+                retired.push(evicted);
             }
         }
     }
@@ -2604,21 +3042,42 @@ pub(crate) fn publish_shared_file_pages(
 /// the fallback page cache's lifetime. Return false for non-file-cache pages
 /// so the System V shared-memory registry can handle them instead.
 pub(crate) fn retain_shared_file_page(phys: u64) -> bool {
+    retain_page(phys, false)
+}
+
+/// [`retain_shared_file_page`] for a mapping that can store to the file: a
+/// shared mapping of a descriptor open for writing. From here on writeback
+/// has to look at the page; nothing else ever compares its bytes.
+pub(crate) fn retain_shared_file_page_writable(phys: u64) -> bool {
+    retain_page(phys, true)
+}
+
+fn retain_page(phys: u64, writable: bool) -> bool {
     let mut pages = SHARED_FILE_PAGES.lock();
-    let Some(page) = pages.by_phys.get_mut(&phys) else {
+    if !pages.by_phys.contains_key(&phys) {
         return false;
-    };
+    }
+    pages.page_held(phys, None);
+    let page = pages
+        .by_phys
+        .get_mut(&phys)
+        .expect("shared-file page present under the cache lock");
     page.mappings = page
         .mappings
         .checked_add(1)
         .expect("shared-file mapping hold overflow");
+    page.maybe_dirty |= writable;
     true
 }
 
+/// The last unmap of a page neither writes it nor drops it. A dirty page
+/// stays in the cache, listed for the writeback task and owned by its
+/// file's entry; this path — `munmap`, `exit_mmap`, the old image of an
+/// `execve` — does no I/O and waits for nothing (Linux `zap_pte_range` only
+/// transfers the PTE dirty bit to the folio).
 pub(crate) fn release_shared_file_page(phys: u64) -> bool {
-    let retired = {
+    let IdleOutcome { frames, slot } = {
         let mut pages = SHARED_FILE_PAGES.lock();
-        let cache_len = pages.by_phys.len();
         let Some(page) = pages.by_phys.get_mut(&phys) else {
             return false;
         };
@@ -2627,18 +3086,13 @@ pub(crate) fn release_shared_file_page(phys: u64) -> bool {
         if page.mappings != 0 || page.pending != 0 {
             return true;
         }
-        if should_retire_idle_shared_page(page, cache_len) {
-            Some(
-                pages
-                    .remove_phys(phys)
-                    .expect("unreferenced shared-file page disappeared"),
-            )
-        } else {
-            None
-        }
+        pages.page_idle(phys)
     };
-    if let Some(page) = retired {
-        narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
+    // Outside the cache lock: the entry may hold the last reference to its
+    // file, and dropping that can do anything a close can.
+    drop(slot);
+    for frame in frames.into_iter().flatten() {
+        narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
     }
     true
 }
@@ -2652,7 +3106,9 @@ fn register(
     lifetime: Option<Arc<dyn MmapLifetime>>,
     writeback: Option<FileWriteback>,
 ) {
+    let mapper = FileMapper::new(ops.as_ref(), address_space_id);
     mapping_owners(address_space_id).lock().push(MappingOwner {
+        mapper,
         base,
         len,
         file_offset,
@@ -2770,6 +3226,7 @@ fn prepare_aliases_locked(
             base: alias_base,
             len: alias_len,
             file_offset,
+            mapper: mapping.mapper.clone(),
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
@@ -2904,6 +3361,7 @@ fn prepare_relocated_owners_locked(
                 .file_offset
                 .checked_add(source_offset)
                 .ok_or(AddressSpaceError::OutOfRange)?,
+            mapper: mapping.mapper.clone(),
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
@@ -3000,6 +3458,7 @@ fn prepare_punch_suffixes_locked(
             base: end,
             len: mapping_end - end,
             file_offset: mapping.file_offset.saturating_add(end - mapping.base),
+            mapper: mapping.mapper.clone(),
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
             private_copy: mapping.private_copy,
@@ -3109,6 +3568,7 @@ fn punch_locked(owners: &mut Vec<MappingOwner>, base: u64, len: u64) {
                     // stale offset here would fault the wrong page of the file
                     // into the surviving half of a punched mapping.
                     file_offset: mapping.file_offset.saturating_add(end - original_base),
+                    mapper: mapping.mapper.clone(),
                     ops: Arc::clone(&mapping.ops),
                     lifetime: mapping.lifetime.clone(),
                     private_copy: mapping.private_copy,
@@ -3171,6 +3631,7 @@ pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
             !dont_copy
         })
         .map(|mapping| MappingOwner {
+            mapper: mapping.mapper.for_space(child_id),
             base: mapping.base,
             len: mapping.len,
             file_offset: mapping.file_offset,
@@ -3235,64 +3696,58 @@ fn owner_count(address_space_id: u64) -> usize {
         .unwrap_or(0)
 }
 
-/// Commit all fallback `MAP_SHARED` pages of `ops` in the current process.
-/// The kernel copies one page at a time before awaiting FileOps::write, so no
-/// IRQ-safe mapping lock spans filesystem I/O and an unmap racing this flush
-/// cannot free a page before its bytes have been snapshotted.
-pub(crate) fn flush_current_file(ops: &Arc<dyn FileOps>) -> Result<(), ()> {
-    // A task without an installed userspace address space cannot own any
-    // mapped-file fallback pages. `fsync` is still valid for its open file;
-    // treat the absent bucket as the same clean no-op as an empty bucket.
-    if let Some(address_space_id) = current_address_space_id() {
-        if let Some(owner_bucket) = existing_mapping_owners(address_space_id) {
-            let mappings: Vec<FileWriteback> = owner_bucket
-                .lock()
-                .iter()
-                .filter(|mapping| Arc::ptr_eq(&mapping.ops, ops))
-                .filter_map(|mapping| mapping.writeback.clone())
-                .collect();
-            flush_mappings(ops, mappings)?;
-        }
-    }
-    // fsync's contract covers the file, not the caller: pages of this file
-    // retained under another address space's mappings (or under none, after
-    // their owner unmapped) are just as much its responsibility.
-    flush_shared_pages_for_ops(ops)
+/// Commit every dirty cached `MAP_SHARED` page of `ops`'s file and report
+/// what `fsync` must: this call's own write failure, else a background
+/// writeback failure nobody has been told about yet.
+///
+/// The file, not the caller: pages of this file dirtied through another
+/// process's mapping, or left behind by one that has exited, are just as
+/// much `fsync`'s responsibility (`file_write_and_wait_range` works on the
+/// inode's mapping, whoever dirtied it).
+pub(crate) fn flush_current_file(ops: &Arc<dyn FileOps>) -> Result<(), FsError> {
+    writeback::sync_file(ops, 0, u64::MAX)
 }
 
-/// Commit the current process's fallback shared mappings overlapping
-/// `[base, base + len)`. `msync` uses this range form; a zero length follows
-/// Linux's no-op convention.
-pub(crate) fn flush_current_range(base: u64, len: u64) -> Result<(), ()> {
+/// Commit the cached pages behind the current process's shared file
+/// mappings overlapping `[base, base + len)` — `msync(MS_SYNC)`, which is
+/// `vfs_fsync_range` over the file range each VMA covers. A zero length
+/// follows Linux's no-op convention.
+pub(crate) fn flush_current_range(base: u64, len: u64) -> Result<(), FsError> {
     if len == 0 {
         return Ok(());
     }
     let Some(end) = base.checked_add(len) else {
-        return Err(());
+        return Err(FsError::InvalidData);
     };
-    let address_space_id = current_address_space_id().ok_or(())?;
+    let address_space_id = current_address_space_id().ok_or(FsError::InvalidData)?;
     let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
         return Ok(());
     };
-    let (mappings, files) = {
+    let (ranges, files) = {
         let owners = owner_bucket.lock();
-        let mut mappings = Vec::new();
+        let mut ranges: Vec<(Arc<dyn FileOps>, u64, u64)> = Vec::new();
         let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
         for mapping in owners
             .iter()
             .filter(|mapping| mapping.base < end && base < mapping.base.saturating_add(mapping.len))
         {
-            if let Some(writeback) = mapping.writeback.clone() {
-                mappings.push((Arc::clone(&mapping.ops), writeback));
+            if mapping.writeback.is_some() {
+                let low = base.max(mapping.base);
+                let high = end.min(mapping.base.saturating_add(mapping.len));
+                ranges.push((
+                    Arc::clone(&mapping.ops),
+                    mapping.file_offset.saturating_add(low - mapping.base),
+                    mapping.file_offset.saturating_add(high - mapping.base),
+                ));
             }
             if !mapping.private_copy && !files.iter().any(|file| Arc::ptr_eq(file, &mapping.ops)) {
                 files.push(Arc::clone(&mapping.ops));
             }
         }
-        (mappings, files)
+        (ranges, files)
     };
-    for (ops, mapping) in mappings {
-        flush_mappings(&ops, alloc::vec![mapping])?;
+    for (ops, low, high) in ranges {
+        writeback::sync_file(&ops, low, high)?;
     }
     // Direct page-cache mappings have no fallback frames to copy. Their
     // filesystem marks faulted folios dirty, so msync completes by driving
@@ -3300,7 +3755,8 @@ pub(crate) fn flush_current_range(base: u64, len: u64) -> Result<(), ()> {
     for ops in files {
         match crate::handlers::poll_blocking(ops.fsync(false)) {
             Some(Ok(())) => {}
-            _ => return Err(()),
+            Some(Err(error)) => return Err(error),
+            None => return Err(FsError::Io(narf_block::BlockError::IOError)),
         }
     }
     Ok(())
@@ -3322,6 +3778,15 @@ pub fn truncate_file_mappings(
         .checked_add(4095)
         .ok_or(narf_filesystem::FsError::InvalidData)?
         & !4095;
+    // Linux `unmap_mapping_range` walks `mapping->i_mmap`: the VMAs of THIS
+    // file. A file nobody maps has none, and its truncate — every shell
+    // `>` redirection onto a tmpfs file — looks at no address space and
+    // takes no lock here.
+    let mappers = file_mappers(file.mmap_backing_identity());
+    if mappers.is_empty() {
+        writeback::invalidate_beyond_eof(file);
+        return Ok(());
+    }
     let mut spaces = crate::handlers::all_address_spaces();
     if let Some(current) = crate::handlers::active_user_as() {
         if !spaces.iter().any(|space| Arc::ptr_eq(space, &current)) {
@@ -3331,9 +3796,17 @@ pub fn truncate_file_mappings(
 
     for address_space in spaces {
         let id = address_space.identity();
+        // Only the address spaces that map the file. The VMA transaction
+        // taken below is an interrupts-off spinlock its owner holds for the
+        // whole of a VMA operation; a process that does not map this file
+        // must never be waited for.
+        if !mappers.contains(&id) {
+            continue;
+        }
         let Some(owner_bucket) = existing_mapping_owners(id) else {
             continue;
         };
+        TRUNCATE_SPACE_VISITS.fetch_add(1, Ordering::Relaxed);
         let result = address_space.with_vma_transaction(|| {
             narf_memory::with_address_space_shared_mapping_transaction(id, || {
                 // Snapshot only after both transactions are held. Otherwise a
@@ -3384,113 +3857,54 @@ pub fn truncate_file_mappings(
     // moved past EOF). The fault-side clamp to the current i_size is
     // the guarantee either way.
     trim_advice_records_for_file(file.mmap_backing_identity());
+    // The zaps above left every page past the new EOF unmapped, and a dirty
+    // one is still in the cache waiting for writeback. Its bytes no longer
+    // belong to the file: written back they would extend it again, and
+    // adopted by a later mapping they would show data the truncate removed.
+    // Linux `truncate_inode_pages_range` drops such folios, dirty or not,
+    // and zeroes the tail of the one that straddles the new EOF.
+    writeback::invalidate_beyond_eof(file);
     Ok(())
 }
 
-fn flush_mappings(ops: &Arc<dyn FileOps>, mappings: Vec<FileWriteback>) -> Result<(), ()> {
-    for mapping in mappings {
-        for (index, phys) in mapping.phys.iter().enumerate() {
-            if phys.raw() == 0 {
-                continue;
-            }
-            let offset = mapping.offset + (index as u64) * 4096;
-            flush_shared_page(ops, offset, *phys)?;
-        }
-    }
-    Ok(())
-}
-
-/// Commit one cached fallback page if its bytes differ from the file's.
-/// The snapshot is taken under the cache lock; the write itself runs with
-/// every lock released, exactly as in [`flush_mappings`].
-fn flush_shared_page(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr) -> Result<(), ()> {
-    let file_len = ops.stat().size;
-    if offset >= file_len {
-        return Ok(());
-    }
-    let len = ((file_len - offset) as usize).min(4096);
-    let Some(bytes) = snapshot_dirty_page(ops, offset, phys, len) else {
-        return Ok(());
-    };
-    let mut done = 0;
-    while done < bytes.len() {
-        match crate::handlers::poll_io_to_completion(
-            ops.write(offset + done as u64, &bytes[done..]),
-        ) {
-            Some(Ok(0)) | Some(Err(_)) | None => return Err(()),
-            Some(Ok(n)) => done += n,
-        }
-    }
-    mark_page_clean(ops, offset, phys, &bytes);
-    Ok(())
-}
-
-/// Commit every cached fallback page of `ops`'s file, whichever address
-/// space — if any — currently maps it. The owner-bucket flushes only see
-/// the calling process's own mappings; the cache is the one place that can
-/// still reach a dirty page whose owner unmapped it, lives in another
-/// process, or has already exited. Page selection follows the cache's own
-/// `shared_page_matches_ops` identity rule.
-pub(crate) fn flush_shared_pages_for_ops(ops: &Arc<dyn FileOps>) -> Result<(), ()> {
-    let identity = shared_file_identity(ops.as_ref());
-    let targets: Vec<(u64, PhysAddr)> = {
-        let pages = SHARED_FILE_PAGES.lock();
-        pages
-            .by_phys
-            .values()
-            .filter(|page| shared_page_matches_ops(page, identity))
-            .map(|page| (page.offset, page.phys))
-            .collect()
-    };
-    for (offset, phys) in targets {
-        flush_shared_page(ops, offset, phys)?;
-    }
-    Ok(())
-}
-
-/// Commit every dirty fallback page in the cache, across all files. This
-/// is what gives `sync(2)` its global reach: dirty pages whose owning
-/// process never calls fsync are still the kernel's responsibility.
-pub(crate) fn flush_all_shared_file_pages() {
-    let files: Vec<Arc<dyn FileOps>> = {
-        let pages = SHARED_FILE_PAGES.lock();
-        let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
-        let mut seen: Vec<SharedFileIdentity> = Vec::new();
-        for page in pages.by_phys.values() {
-            // Dedup on the page's recorded identity: asking a filesystem
-            // for its identity may lock or allocate, which the cache lock
-            // must never span.
-            if seen.contains(&page.identity) {
-                continue;
-            }
-            if let Some(ops) = page.ops.upgrade() {
-                seen.push(page.identity);
-                files.push(ops);
-            }
-        }
-        files
-    };
-    for ops in files {
-        // sync(2) has no per-file error channel; one failing file must not
-        // stop the others from being committed.
-        let _ = flush_shared_pages_for_ops(&ops);
-    }
-}
-
-/// Fold a completed `write(2)`-family write into every cached fallback
-/// page it overlaps, so live `MAP_SHARED` mappings observe the new bytes
-/// and a later whole-page writeback cannot resurrect the pre-write image.
-/// The written bytes become part of the page's clean snapshot — they are
-/// already on the file — while bytes the write did not touch keep their
-/// previous clean/dirty state. The cache generation is deliberately left
-/// alone: an idle page whose generation a filesystem can no longer vouch
-/// for must still fail reuse validation, exactly as before.
-pub(crate) fn note_file_written(ops: &Arc<dyn FileOps>, offset: u64, bytes: &[u8]) {
+/// Fold a completed `write(2)`-family write into every cached page it
+/// overlaps, so live `MAP_SHARED` mappings observe the new bytes and a later
+/// writeback cannot resurrect the pre-write image.
+///
+/// The live page always takes the bytes: `write(2)` is the last writer of
+/// that range (Linux writes through the same folio a mapping sees). What
+/// happens to the page's clean image — the record of what the file holds —
+/// depends on whether a writeback batch could have written this page while
+/// the `write(2)` was in flight:
+///
+/// * No batch holds the page and none has written it since `stamp` was
+///   taken (before the write began): the file holds exactly these bytes, so
+///   they join the clean image. A page that differed from the file only by
+///   this write is clean again and is not written a second time; a range a
+///   mapping had dirtied and this write then overwrote is settled too —
+///   file, page and clean image all hold the `write(2)` bytes.
+/// * A batch holds the page, or wrote it after `stamp`: its image of the
+///   page predates this write and may have reached the file after it. The
+///   order on the file is unknown, so the clean image is left alone. The
+///   page now differs from it, which is what makes the next writeback pass
+///   write the `write(2)` bytes again. Claiming them clean here could leave
+///   the file with the batch's older bytes for good.
+///
+/// The cache generation is deliberately left alone: an idle page whose
+/// generation a filesystem can no longer vouch for must still fail reuse
+/// validation, exactly as before.
+pub(crate) fn note_file_written(
+    ops: &Arc<dyn FileOps>,
+    offset: u64,
+    bytes: &[u8],
+    stamp: writeback::WriteStamp,
+) {
     if bytes.is_empty() {
         return;
     }
     let identity = shared_file_identity(ops.as_ref());
     let mut done = 0usize;
+    let mut raced_idle = false;
     while done < bytes.len() {
         let cur = offset + done as u64;
         let page_offset = cur & !4095;
@@ -3502,6 +3916,7 @@ pub(crate) fn note_file_written(ops: &Arc<dyn FileOps>, offset: u64, bytes: &[u8
                 .by_file
                 .get(&SharedFilePages::key(identity, page_offset))
             {
+                let mut now_idle_dirty = false;
                 if let Some(page) = pages.by_phys.get_mut(&phys).filter(|page| {
                     page.offset == page_offset && shared_page_matches_ops(page, identity)
                 }) {
@@ -3512,59 +3927,39 @@ pub(crate) fn note_file_written(ops: &Arc<dyn FileOps>, offset: u64, bytes: &[u8
                         core::slice::from_raw_parts_mut(page.phys.kernel_mut_ptr::<u8>(), 4096)
                     };
                     frame[in_page..in_page + n].copy_from_slice(&bytes[done..done + n]);
-                    let clean_n = n.min(page.clean.len().saturating_sub(in_page));
-                    if clean_n != 0 {
-                        page.clean[in_page..in_page + clean_n]
-                            .copy_from_slice(&bytes[done..done + clean_n]);
+                    if page.wb_pins == 0 && page.wb_seq <= stamp.0 {
+                        let clean_n = n.min(page.clean.len().saturating_sub(in_page));
+                        if clean_n != 0 {
+                            // Unshared here: only a batch holding the page
+                            // keeps a second reference, and none does.
+                            Arc::make_mut(&mut page.clean)[in_page..in_page + clean_n]
+                                .copy_from_slice(&bytes[done..done + clean_n]);
+                        }
+                    } else {
+                        page.redirtied = true;
+                        page.maybe_dirty = true;
+                        now_idle_dirty = page.mappings == 0 && page.pending == 0;
                     }
+                }
+                if now_idle_dirty {
+                    pages.mark_idle_dirty(phys, ops);
+                    raced_idle = true;
                 }
             }
         }
         done += n;
     }
-}
-
-/// Snapshot a fallback page only when it differs from the last file image.
-/// Holding the cache lock pins the page against final-unmap reclamation while
-/// its bytes are copied; filesystem I/O starts only after the lock is dropped.
-fn snapshot_dirty_page(
-    ops: &Arc<dyn FileOps>,
-    offset: u64,
-    phys: PhysAddr,
-    len: usize,
-) -> Option<Vec<u8>> {
-    let identity = shared_file_identity(ops.as_ref());
-    let pages = SHARED_FILE_PAGES.lock();
-    let page = pages.by_phys.get(&phys.raw())?;
-    if page.offset != offset || !shared_page_matches_ops(page, identity) {
-        return None;
-    }
-    // SAFETY: the cache entry owns `phys`; the cache lock prevents its last
-    // mapping release from removing and freeing the entry during this copy.
-    let current = unsafe { core::slice::from_raw_parts(phys.kernel_ptr::<u8>(), len) };
-    if page.clean.get(..len) == Some(current) {
-        None
-    } else {
-        Some(current.to_vec())
+    if raced_idle {
+        writeback::kick();
     }
 }
 
-/// Advance the exact clean image only after the whole page write succeeds.
-/// If userspace changes the mapped page during I/O, the stored snapshot still
-/// describes what reached the file, so the next fsync observes it as dirty.
-fn mark_page_clean(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr, bytes: &[u8]) {
-    let cache_generation = ops.mmap_cache_generation();
-    let identity = shared_file_identity(ops.as_ref());
-    let mut pages = SHARED_FILE_PAGES.lock();
-    if let Some(page) = pages
-        .by_phys
-        .get_mut(&phys.raw())
-        .filter(|page| page.offset == offset && shared_page_matches_ops(page, identity))
-    {
-        page.clean[..bytes.len()].copy_from_slice(bytes);
-        page.cache_generation = cache_generation;
-    }
-}
+mod writeback;
+pub(crate) use writeback::{
+    fallocate_serialized, flush_file_for_read, overlay_dirty, settle_unverified,
+    size_change_serialized, sync_all_files, throttle_dirtier, unmapped, writable_mapping,
+    write_stamp, WriteStamp, BATCH_PAGES as WRITEBACK_BATCH_PAGES,
+};
 
 #[cfg(feature = "kernel-test")]
 #[path = "mapped_file_teardown_tests.rs"]
@@ -4178,7 +4573,7 @@ mod tests {
                     .find(|mapping| mapping.base == VB)
                     .and_then(|mapping| mapping.writeback.clone())
             })
-            .is_some_and(|writeback| flush_mappings(&ops, alloc::vec![writeback]).is_ok());
+            .is_some_and(|_recorded| flush_current_file(&ops).is_ok());
         let store_intact = {
             let store = owner.store.lock();
             store[4096..].iter().all(|&b| b == 0xB2)

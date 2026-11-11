@@ -62,7 +62,11 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     // size change, for the same reason a write does.
     file_remove_privs(endpoint.ops.as_ref(), task);
 
-    match poll_blocking(endpoint.ops.truncate(len)) {
+    // Excluded from writeback, and followed by the cache invalidation:
+    // see `mapped_file::size_change_serialized`.
+    match crate::mapped_file::size_change_serialized(&endpoint.ops, || {
+        poll_blocking(endpoint.ops.truncate(len))
+    }) {
         Some(Ok(())) => {
             // inotify: truncate changes file content → IN_MODIFY.
             crate::mqueue::notify_modify_fd(task, fd);

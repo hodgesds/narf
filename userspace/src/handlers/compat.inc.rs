@@ -2420,6 +2420,10 @@ impl crate::elf::ExecBytes for ExecSource {
                         _ => return Err(crate::elf::ElfError::ImageReadFailed),
                     }
                 }
+                // The image as a mapping of the file shows it: a linker
+                // that wrote its output through `MAP_SHARED` and exited may
+                // not have been written back yet.
+                crate::mapped_file::overlay_dirty(ops, off, dst);
                 Ok(())
             }
         }
@@ -2718,6 +2722,7 @@ fn do_execve_resolved(
             }
         }
         buf.truncate(off);
+        crate::mapped_file::overlay_dirty(&ops, 0, &mut buf);
         Ok((buf, ops, file_size as u64))
     };
 
@@ -3349,6 +3354,7 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
         }
     }
     buf.truncate(off);
+    crate::mapped_file::overlay_dirty(&ops, 0, &mut buf);
     if buf.len() < 64 {
         None
     } else {
@@ -16218,9 +16224,16 @@ mod aio {
         // fix in the same class.
         let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
         let outcome = ops.map(|ops| {
-            poll_blocking(ops.read(offset, &mut kbuf))
+            let read = poll_blocking(ops.read(offset, &mut kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
-                .ok()
+                .ok();
+            // As `read(2)`: a `MAP_SHARED` store not written back yet is
+            // part of the file.
+            if let Some(n) = read {
+                let n = n.min(kbuf.len());
+                crate::mapped_file::overlay_dirty(&ops, offset, &mut kbuf[..n]);
+            }
+            read
         });
         match outcome {
             Some(Some(n)) => {
@@ -16253,6 +16266,7 @@ mod aio {
         // Clone ops out, then run the blocking write outside the lock — same
         // non-reentrant / park-with-lock-held hazard as do_pread.
         let ops = fd::with_table(tid, |t| t.get(fd_no).map(|e| e.ops.clone())).flatten();
+        let stamp = crate::mapped_file::write_stamp();
         let outcome = ops.as_ref().map(|ops| {
             poll_blocking(ops.write(offset, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
@@ -16264,7 +16278,7 @@ mod aio {
         // sys_write/sys_pwrite64 do.
         if let (Some(ops), Some(Some(n))) = (&ops, &outcome) {
             if *n != 0 && *n <= kbuf.len() {
-                crate::mapped_file::note_file_written(ops, offset, &kbuf[..*n]);
+                crate::mapped_file::note_file_written(ops, offset, &kbuf[..*n], stamp);
             }
         }
         match outcome {
@@ -16345,11 +16359,12 @@ mod aio {
         // fd-table lock held (see do_pread).
         let ops = fd::with_table(tid, |t| t.get(iocb.aio_resfd).map(|e| e.ops.clone())).flatten();
         if let Some(ops) = ops {
+            let stamp = crate::mapped_file::write_stamp();
             if let Some(Ok(n)) = poll_blocking(ops.write(0, &one)) {
                 // Same write(2)-family fold-in as do_pwrite (#676); a no-op
                 // unless the resfd's file has fallback-cached pages.
                 if n != 0 && n <= one.len() {
-                    crate::mapped_file::note_file_written(&ops, 0, &one[..n]);
+                    crate::mapped_file::note_file_written(&ops, 0, &one[..n], stamp);
                 }
             }
         }

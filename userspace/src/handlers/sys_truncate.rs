@@ -118,7 +118,11 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
     // `do_truncate` passes `ATTR_KILL_SUID | ATTR_KILL_SGID` alongside the
     // size change, for the same reason a write does.
     file_remove_privs(ops.as_ref(), task);
-    match poll_blocking(ops.truncate(new_size)) {
+    // Excluded from writeback, and followed by the cache invalidation:
+    // see `mapped_file::size_change_serialized`.
+    match crate::mapped_file::size_change_serialized(&ops, || {
+        poll_blocking(ops.truncate(new_size))
+    }) {
         Some(Ok(())) => {
             // inotify: truncate changes file content → IN_MODIFY.
             crate::mqueue::notify_modify_path(&path);

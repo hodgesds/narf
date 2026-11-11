@@ -201,6 +201,15 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     let mut copied = 0usize;
     let mut optimized = false;
 
+    // The filesystem's own copy (a reflink, an extent copy) works on what
+    // the filesystem holds. Linux `vfs_copy_file_range` implementations
+    // write the source range out first (`filemap_write_and_wait_range`) for
+    // that reason; and a dirty page of the DESTINATION written back after
+    // the copy would put its whole pre-copy image over the copied bytes.
+    // Commit both files' dirty mapped pages before the copy starts.
+    crate::mapped_file::flush_file_for_read(&input.ops);
+    crate::mapped_file::flush_file_for_read(&output.ops);
+
     match poll_blocking(input.ops.copy_file_range_to(
         cur_in,
         output.ops.as_ref(),
@@ -241,6 +250,7 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
                 if read_n == 0 {
                     break;
                 }
+                let stamp = crate::mapped_file::write_stamp();
                 let write_n = match poll_blocking(output.ops.write(cur_out, &chunk[..read_n])) {
                     Some(Ok(n)) if n <= read_n => n,
                     Some(Ok(_)) => {
@@ -264,6 +274,7 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
                         &output.ops,
                         cur_out,
                         &chunk[..write_n],
+                        stamp,
                     );
                 }
                 copied += write_n;

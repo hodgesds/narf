@@ -216,6 +216,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             if endpoint.append() {
                 offset = endpoint.ops.stat().size;
             }
+            let stamp = crate::mapped_file::write_stamp();
             // `generic_perform_write`: a fatal signal ends the wait; the
             // write lands whole without this task.
             let outcome = match crate::killable_wait::write(&endpoint.ops, offset, &mut payload) {
@@ -233,6 +234,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                         &endpoint.ops,
                         offset,
                         &payload[..*written],
+                        stamp,
                     );
                 }
             }

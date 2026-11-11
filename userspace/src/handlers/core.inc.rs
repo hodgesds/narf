@@ -628,10 +628,102 @@ fn park_pending_future() -> bool {
     true
 }
 
+/// Linux `cond_resched()`: a scheduling point for kernel code with a long
+/// way still to go.
+///
+/// [`poll_blocking`] and [`poll_io_to_completion`] give up the CPU only when
+/// a future reports `Pending`. A filesystem operation that completes inside
+/// one poll — every btrfs write on a polled block device does — never
+/// reports it, so a loop of such operations runs from its first to its last
+/// with no scheduling point at all, and every task queued on that CPU waits
+/// for the whole loop while other CPUs sit idle. A loop like that calls
+/// this between operations, holding no lock.
+///
+/// Returns `true` when the caller is a task running on its own kernel stack
+/// (a syscall): it has yielded to a runnable peer on this CPU, or had none
+/// (`sched_yield` semantics — `yield_task_fair`). `false` means there is no
+/// such task; an `async` caller then yields through the executor instead.
+///
+/// Either way this CPU reports an RCU quiescent state, as Linux
+/// `cond_resched()` does (`rcu_all_qs`). The executor reports one at every
+/// cooperative poll boundary, but a long syscall with nothing else to run
+/// on its CPU never gets back there — the yield finds no peer and does not
+/// switch — and without a report of its own that CPU would hold every grace
+/// period open for the length of the loop while retired memory piled up.
+/// The caller is at a point where it could equally have parked, which is
+/// the executor's own condition for reporting: no RCU reference is held
+/// across it.
+pub(crate) fn cond_resched() -> bool {
+    {
+        // The report is per CPU: stay on this one while it is made.
+        let _on_this_cpu = narf_scheduler::stackful::preempt_disable();
+        narf_rcu::report_quiescent();
+    }
+    if narf_scheduler::stackful::current_stackful_waker().is_none() {
+        return false;
+    }
+    let uctx = crate::user_task::current_user_task();
+    if let Some(uctx) = uctx {
+        // SAFETY: as in `park_pending_future`: the in-flight task's
+        // poller-pinned context.
+        crate::handlers::close_kernel_span(unsafe { &*uctx }, current_task_id());
+    }
+    let yielded = narf_scheduler::stackful::sched_yield_current();
+    if let Some(uctx) = uctx {
+        // The continuation resumes here without re-entering
+        // `UserTaskFuture::poll`: restore the publication a peer replaced.
+        crate::user_task::install_current(uctx);
+        // SAFETY: as above.
+        crate::handlers::open_kernel_span(unsafe { &*uctx });
+    }
+    yielded
+}
+
+/// Waits that found no task to park and fell back to polling in place.
+///
+/// With a user task alive this is a CPU held hostage: the caller is the
+/// executor thread (or an interrupt-time path), the future can only
+/// complete through work other tasks do, and nothing else runs on this CPU
+/// until it does. The fallback still finishes the operation — abandoning a
+/// polled filesystem future would drop it with a lock held and an update
+/// half made — but no production path is supposed to reach it. Kernel
+/// tests assert that the paths which used to (address-space teardown,
+/// `munmap`) leave this counter alone.
+static FALLBACK_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// See [`FALLBACK_WAITS`].
+pub(crate) fn fallback_waits() -> u64 {
+    FALLBACK_WAITS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record one fallback wait and, when a user task could be starved by it,
+/// say who is doing it. Rate-limited: the first few, then every 1024th.
+#[cold]
+fn note_fallback_wait(caller: &core::panic::Location<'_>) {
+    let count = FALLBACK_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if narf_scheduler::live_user_task_count() == 0 {
+        // Boot, shutdown and the in-kernel test harness: nobody to starve.
+        return;
+    }
+    if count > 8 && count % 1024 != 0 {
+        return;
+    }
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "ERROR: filesystem wait with no task to park (cpu held until it completes): {}:{} \
+         [occurrence {}]",
+        caller.file(),
+        caller.line(),
+        count
+    );
+}
+
 /// Drive a filesystem Future to completion inside a synchronous syscall.
 /// `Pending` parks a stackful user task until the future's registered waker
 /// fires. Outside that execution model, retain a bounded spin-pump solely for
 /// kernel tests and early fallback contexts.
+#[track_caller]
 pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     let task_waker = narf_scheduler::stackful::current_stackful_waker();
@@ -652,6 +744,9 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
                 }
             }
             Poll::Pending => {
+                if fallback_polls == 0 {
+                    note_fallback_wait(core::panic::Location::caller());
+                }
                 sleep_pumps::run();
                 core::hint::spin_loop();
                 fallback_polls += 1;
@@ -667,6 +762,7 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
 /// future (and therefore its DMA ownership) alive for the whole sleep. The
 /// runtime path has no polling ceiling: completion or cancellation must wake
 /// it. Only the non-stackful test fallback retains a finite wedge detector.
+#[track_caller]
 pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     let task_waker = narf_scheduler::stackful::current_stackful_waker();
@@ -686,6 +782,9 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
                 }
             }
             Poll::Pending => {
+                if fallback_polls == 0 {
+                    note_fallback_wait(core::panic::Location::caller());
+                }
                 sleep_pumps::run();
                 core::hint::spin_loop();
                 fallback_polls += 1;
@@ -2456,7 +2555,11 @@ fn open_impl_reserved(
         && ops.stat().mode.file_type == narf_filesystem::FileType::File
         && ops.stat().size != 0
     {
-        match poll_blocking(ops.truncate(0)) {
+        // Excluded from writeback, and followed by the cache invalidation:
+        // see `mapped_file::size_change_serialized`.
+        match crate::mapped_file::size_change_serialized(&ops, || {
+            poll_blocking(ops.truncate(0))
+        }) {
             Some(Ok(())) => {
                 file_remove_privs(ops.as_ref(), task);
                 crate::mqueue::notify_modify_path(path);
@@ -5146,7 +5249,7 @@ impl CopyFdEndpoint {
     }
 }
 
-fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
+pub(crate) fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
     match error {
         narf_filesystem::FsError::NotFound => 2,
         narf_filesystem::FsError::NoSuchProcess => 3, // ESRCH
@@ -5467,6 +5570,13 @@ fn copy_fd_to_fd(
     let use_off_ptr = explicit_in_off.is_some();
     let use_out_off_ptr = explicit_out_off.is_some();
     let same_description = Arc::ptr_eq(&input.description, &output.description);
+    // `sendfile`/`splice` read the source through the page cache on Linux,
+    // so they see a `MAP_SHARED` store that has not been written back. The
+    // pipe paths below hand out the filesystem's own pages; commit the
+    // source's dirty mapped pages first so those pages hold them.
+    if !input.ops.is_stream() {
+        crate::mapped_file::flush_file_for_read(&input.ops);
+    }
     // Pipes and other streams have no f_pos. Their syscall modules reject an
     // explicit offset before reaching this core, and an implicit transfer must
     // neither serialize nor mutate the otherwise-unused description cursor.
@@ -5550,6 +5660,7 @@ fn copy_fd_to_fd(
             } else {
                 let mut sink_off = step_out_off;
                 crate::pipe::splice_to_sink(input_ops.as_ref(), want, |bytes| {
+                    let stamp = crate::mapped_file::write_stamp();
                     // The payload mutex is sleepable. Keep the source prefix
                     // until the sink accepts it, including an asynchronous sink.
                     let result = poll_blocking(output_ops.write(sink_off, bytes))
@@ -5560,6 +5671,7 @@ fn copy_fd_to_fd(
                                 output_ops,
                                 sink_off,
                                 &bytes[..written],
+                                stamp,
                             );
                         }
                         sink_off = sink_off.saturating_add(written as u64);
@@ -5571,6 +5683,8 @@ fn copy_fd_to_fd(
             crate::pipe::splice_from_source(input_ops.as_ref(), in_off, output_ops.as_ref(), want)
         } else {
             let mut kbuf = alloc::vec![0u8; want];
+            // (No overlay here: `copy_fd_to_fd` committed the source's
+            // dirty mapped pages before the loop.)
             let n = match poll_blocking(input_ops.read(in_off, &mut kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
             {
@@ -5586,6 +5700,7 @@ fn copy_fd_to_fd(
             if n == 0 {
                 break;
             }
+            let stamp = crate::mapped_file::write_stamp();
             match poll_blocking(output_ops.write(step_out_off, &kbuf))
                 .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
             {
@@ -5595,6 +5710,7 @@ fn copy_fd_to_fd(
                             output_ops,
                             step_out_off,
                             &kbuf[..written],
+                            stamp,
                         );
                     }
                     Ok(written)
@@ -10339,6 +10455,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                     break;
                 }
             };
+            let stamp = crate::mapped_file::write_stamp();
             // `generic_perform_write`: killable, see `killable_wait::write`.
             let outcome = match crate::killable_wait::write(&endpoint.ops, off, &mut payload) {
                 Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
@@ -10351,7 +10468,12 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             // coherent with the write (mapped_file::note_file_written).
             if let Ok(n) = &outcome {
                 if *n != 0 && *n <= payload.len() {
-                    crate::mapped_file::note_file_written(&endpoint.ops, off, &payload[..*n]);
+                    crate::mapped_file::note_file_written(
+                        &endpoint.ops,
+                        off,
+                        &payload[..*n],
+                        stamp,
+                    );
                 }
             }
             outcome

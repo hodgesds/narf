@@ -32,12 +32,14 @@ fn sync_fd(ctx: &mut dyn TrapContext, data_only: bool) {
             return;
         }
     }
-    // A generic filesystem may not expose physical page-cache frames for a
-    // MAP_SHARED mapping. NARF then maps private frames and records them for
-    // writeback; commit those bytes before the filesystem's own fsync so
-    // fsync retains its Linux data-before-metadata ordering.
-    if crate::mapped_file::flush_current_file(&ops).is_err() {
-        ctx.set_return(errno_ret(EIO));
+    // `file_write_and_wait_range` before `->fsync`: the file's dirty
+    // `MAP_SHARED` pages are written first, whoever dirtied them, so the
+    // filesystem's own fsync commits them with everything else. A write
+    // failure — this call's, or a background one nobody has been told
+    // about — is this fsync's result, with its own errno (ENOSPC is not
+    // EIO to a database deciding whether to retry).
+    if let Err(error) = crate::mapped_file::flush_current_file(&ops) {
+        ctx.set_return(errno_ret(copy_fs_errno(error)));
         return;
     }
     match poll_blocking(ops.fsync(data_only)) {

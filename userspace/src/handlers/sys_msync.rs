@@ -103,6 +103,6 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
     }
     match crate::mapped_file::flush_current_range(addr, len) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(()) => ctx.set_return(errno_ret(EIO)),
+        Err(error) => ctx.set_return(errno_ret(copy_fs_errno(error))),
     }
 }
