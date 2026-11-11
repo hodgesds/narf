@@ -224,6 +224,7 @@ pub fn publish_event(id: u16, group: u32, net_ns_id: u64, reply: GenlReply) {
     if !family.groups.iter().any(|g| g.id == group) {
         return;
     }
+    note_first_event(&family, reply.command, group);
     let sink = *EVENT_SINK.lock();
     if let Some(sink) = sink {
         let mut body = vec![reply.command, family.version, 0, 0];
@@ -377,6 +378,75 @@ const CONTROL_FAMILY: GenlFamily = GenlFamily {
     handler: unsupported_control,
 };
 
+/// The distinct `(family, command, dump, errno)` refusals already reported
+/// by [`note_refusal`] this boot.
+static REFUSALS_SEEN: IrqSafeSpinLock<Vec<(u16, u8, bool, i32)>> = IrqSafeSpinLock::new(Vec::new());
+/// Upper bound on the lines [`note_refusal`] prints in one boot.
+const REFUSALS_REPORTED: usize = 128;
+
+/// Name each distinct request a family refused, once. NetworkManager
+/// reports a refused nl80211 probe at debug level or not at all, so
+/// without this line neither the journal nor the kernel log can say which
+/// command stopped a bring-up: a command missing from
+/// the op table (-EOPNOTSUPP), a failed permission check (-EPERM) or the
+/// family's own errno. One line per `(family, command, do/dump, errno)`,
+/// bounded for the boot, and printed outside the bookkeeping lock.
+fn note_refusal(family: &GenlFamily, command: u8, dump: bool, portid: u32, errno: i32) {
+    let key = (family.id, command, dump, errno);
+    let first = {
+        let mut seen = REFUSALS_SEEN.lock();
+        if seen.len() >= REFUSALS_REPORTED || seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    };
+    if first {
+        narf_console::klog!(
+            "  genl: {} cmd={} {} from portid {:#x} refused with errno {} (reported once)",
+            family.name,
+            command,
+            if dump { "dump" } else { "do" },
+            portid,
+            errno
+        );
+    }
+}
+
+/// The distinct `(family, event command)` notifications already reported by
+/// [`note_first_event`] this boot.
+static EVENTS_SEEN: IrqSafeSpinLock<Vec<(u16, u8)>> = IrqSafeSpinLock::new(Vec::new());
+/// Upper bound on the lines [`note_first_event`] prints in one boot.
+const EVENTS_REPORTED: usize = 64;
+
+/// Name the first notification of each kind a family multicasts. For nl80211
+/// this is a record of how far a bring-up got — NEW_SCAN_RESULTS (34) or
+/// SCAN_ABORTED (35), CONNECT (46), PORT_AUTHORIZED (125), DISCONNECT (48),
+/// REG_CHANGE (36) — independent of whether any daemon was listening. One
+/// line per `(family, command)`, bounded for the boot, printed outside the
+/// bookkeeping lock.
+fn note_first_event(family: &GenlFamily, command: u8, group: u32) {
+    let key = (family.id, command);
+    let first = {
+        let mut seen = EVENTS_SEEN.lock();
+        if seen.len() >= EVENTS_REPORTED || seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    };
+    if first {
+        narf_console::klog!(
+            "  genl: {} first event cmd={} on group {}",
+            family.name,
+            command,
+            group
+        );
+    }
+}
+
 fn requested_attr(request: &[u8], requested_kind: u16) -> Option<&[u8]> {
     let mut off = NLMSG_HDRLEN + 4;
     while off + 4 <= request.len() {
@@ -437,6 +507,7 @@ fn build_one(
             .find(|op| op.command == command && op.flags & wanted != 0)
             .copied()
         else {
+            note_refusal(&family, command, dump, context.portid, EOPNOTSUPP);
             return Ok(vec![error(EOPNOTSUPP, seq, request)]);
         };
         // Then the op's permission flags, before any attribute is parsed or
@@ -447,6 +518,7 @@ fn build_one(
         // object (`RequestContext::capable` tells it which applied).
         let capable = context.capable_for(op.flags);
         if !capable && context.admin.is_none() {
+            note_refusal(&family, command, dump, context.portid, EPERM);
             return Ok(vec![error(EPERM, seq, request)]);
         }
         let cookie = core::cell::Cell::new(None);
@@ -468,6 +540,9 @@ fn build_one(
         } else {
             (family.handler)(command, &request[NLMSG_HDRLEN + 4..], dump)
         };
+        if let Err(errno) = &result {
+            note_refusal(&family, command, dump, context.portid, *errno);
+        }
         if let Some(job) = deferred.as_ref().and_then(DeferredRequest::take) {
             if matches!(&result, Ok(replies) if replies.is_empty()) {
                 deferred::spawn_ack(
