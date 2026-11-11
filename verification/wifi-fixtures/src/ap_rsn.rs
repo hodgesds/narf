@@ -41,8 +41,12 @@ pub(crate) struct RsnProfile {
     pub rsnxe: Option<u8>,
     /// SAE state, for an SAE AP.
     pub sae: Option<SaeAp>,
-    /// IGTK material, key ID and the last transmitted IPN.
+    /// The offered group/pairwise/management cipher suites.
+    pub ciphers: rsn::Ciphers,
+    /// IGTK material, key ID and the last transmitted IPN. A 256-bit BIP
+    /// suite's IGTK is `igtk || igtk_tail`.
     pub igtk: [u8; 16],
+    pub igtk_tail: [u8; 16],
     pub igtk_id: u16,
     pub ipn: u64,
     /// Negotiated in association: the station's AKM, PMF, and its
@@ -67,14 +71,29 @@ impl RsnProfile {
     pub fn rsne_body(&self) -> Vec<u8> {
         RsnIe {
             version: 1,
-            group_cipher: Suite::standard(rsn::CIPHER_CCMP_128),
-            pairwise_ciphers: vec![Suite::standard(rsn::CIPHER_CCMP_128)],
+            group_cipher: Suite::standard(self.ciphers.group),
+            pairwise_ciphers: vec![Suite::standard(self.ciphers.pairwise)],
             akms: self.akms.iter().map(|a| Suite::standard(*a)).collect(),
             rsn_capabilities: self.caps,
             pmkids: Vec::new(),
-            group_management_cipher: None,
+            // hostapd names a non-default management cipher under MFPC.
+            group_management_cipher: (self.caps & rsn::RSN_CAP_MFP_CAPABLE != 0
+                && self.ciphers.group_mgmt != rsn::CIPHER_BIP_CMAC_128)
+                .then_some(Suite::standard(self.ciphers.group_mgmt)),
         }
         .encode_body()
+    }
+    /// The IGTK of the management cipher's length.
+    pub fn igtk_key(&self) -> Vec<u8> {
+        let mut key = self.igtk.to_vec();
+        if self.ciphers.mgmt_key_len() == 32 {
+            key.extend_from_slice(&self.igtk_tail);
+        }
+        key
+    }
+    /// The GTK message 3 delivers (key ID 1), of the group cipher's length.
+    pub fn gtk(&self) -> Vec<u8> {
+        vec![0x77; self.ciphers.group_key_len()]
     }
     /// RSNE and RSNXE elements as the Beacon and message 3 carry them.
     pub fn elements(&self) -> Vec<u8> {
@@ -102,7 +121,6 @@ impl RsnProfile {
         let Some(sta) = RsnIe::decode_body(&rsne[2..]) else {
             return false;
         };
-        let ccmp = Suite::standard(rsn::CIPHER_CCMP_128);
         let [akm] = sta.akms.as_slice() else {
             return false;
         };
@@ -127,14 +145,16 @@ impl RsnProfile {
             || sae_akm != self.sae.is_some()
             || (km == Some(KeyMgmt::SaeExtKey) && !h2e)
             || self.sae.as_ref().is_some_and(|s| !s.accepted)
-            || sta.group_cipher != ccmp
-            || sta.pairwise_ciphers != [ccmp]
+            // The offered group and pairwise cipher, and under PMF the
+            // offered management cipher (default BIP-CMAC-128).
+            || rsn::Ciphers::of_station(&sta).is_none_or(|c| {
+                c.group != self.ciphers.group
+                    || c.pairwise != self.ciphers.pairwise
+                    || sta_mfpc && ap_mfpc && c.group_mgmt != self.ciphers.group_mgmt
+            })
             || (ap_mfpr && !sta_mfpc)
             || (sta_mfpr && !ap_mfpc)
             || (sae_akm && !(sta_mfpc && ap_mfpc))
-            || sta
-                .group_management_cipher
-                .is_some_and(|c| c != Suite::standard(rsn::CIPHER_BIP_CMAC_128))
             || !pmkid_ok
         {
             return false;
@@ -153,10 +173,11 @@ impl RsnProfile {
     }
     /// IGTK KDE (00-0F-AC:9): Key ID, IPN (6 octets), IGTK.
     pub fn igtk_kde(&self) -> Vec<u8> {
-        let mut out = vec![221, 28, 0, 0x0f, 0xac, 9];
+        let key = self.igtk_key();
+        let mut out = vec![221, (12 + key.len()) as u8, 0, 0x0f, 0xac, 9];
         out.extend_from_slice(&self.igtk_id.to_le_bytes());
         out.extend_from_slice(&self.ipn.to_le_bytes()[..6]);
-        out.extend_from_slice(&self.igtk);
+        out.extend_from_slice(&key);
         out
     }
 }
