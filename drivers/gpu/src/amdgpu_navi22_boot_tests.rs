@@ -746,6 +746,17 @@ fn navi22_trained_owner_survives_recovery_rebuild() -> TestResult {
     // 32 MiB training preimage the shared fixture GPU cannot fit.
     let mut regs = vec![0u32; 0x80000 / 4];
     let mut trained_gpu = gpu();
+    // Real Navi22 discovery reports MMHUB 2.1.0; `into_recovery` rebuilds
+    // the memory hubs (`Gmc::new_rdna2` validates both hubs), so the
+    // fixture GPU needs the block — same pattern as `rdna2_gpu` in
+    // amdgpu_gmc_navi22_tests.rs. Local only: the GMC tests' helpers push
+    // their own MMHUB block, so adding one to the shared `gpu()` would
+    // create duplicate instance-0 MMHUB blocks and break them.
+    let mut mm = trained_gpu.ip_blocks[0]; // GC block as the template
+    mm.hw_id = crate::amdgpu_discovery::HW_ID_MMHUB;
+    (mm.major, mm.minor, mm.revision) = (2, 1, 0);
+    mm.base_addrs[0] = 0x20000 / 4;
+    trained_gpu.ip_blocks.push(mm);
     trained_gpu.regs = narf_bus::MmioRegion {
         phys: narf_memory::PhysAddr::new(0xa000_0000),
         virt: regs.as_mut_ptr() as u64,
