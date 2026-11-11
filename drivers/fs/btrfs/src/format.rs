@@ -99,6 +99,11 @@ pub const LAST_FREE_OBJECTID: u64 = (-256i64) as u64;
 pub const INODE_ITEM_KEY: u8 = 1;
 pub const INODE_REF_KEY: u8 = 12;
 pub const XATTR_ITEM_KEY: u8 = 24;
+/// An inode's fs-verity descriptor and Merkle tree items (Linux
+/// `fs/btrfs/verity.c`). This driver does not implement fs-verity; it knows
+/// the two types to drop what an enable that never finished left behind.
+pub const VERITY_DESC_ITEM_KEY: u8 = 36;
+pub const VERITY_MERKLE_ITEM_KEY: u8 = 37;
 /// Legacy directory-log range key (defined by the format, no longer emitted by
 /// current Linux kernels). Kept so replay never copies it into the FS tree.
 pub const DIR_LOG_ITEM_KEY: u8 = 60;
