@@ -1514,7 +1514,14 @@ impl JoinPlan {
     }
     /// Ignore other peers/subtypes; a matching rejection is terminal.
     pub fn authentication_response(&mut self, bytes: &[u8]) -> Result<Option<&[u8]>, Error> {
-        if self.phase != Phase::AwaitAuthentication || self.sae.is_some() {
+        // An SAE plan takes Open System authentication only for a cached
+        // PMKSA (`start_pmksa_authentication`).
+        if self.phase != Phase::AwaitAuthentication
+            || self
+                .sae
+                .as_ref()
+                .is_some_and(|sae| !sae.awaiting_cached_authentication())
+        {
             return Err(Error::Busy);
         }
         if !self.response(bytes, 0xb0) {
@@ -1537,6 +1544,9 @@ impl JoinPlan {
                 self.phase = Phase::Failed;
                 return Err(Error::Protocol);
             }
+        }
+        if let Some(sae) = self.sae.as_mut() {
+            sae.cached_authentication_done();
         }
         self.phase = Phase::AwaitAssociation;
         Ok(Some(&self.assoc))

@@ -64,6 +64,9 @@ enum Auth {
     Idle,
     AwaitCommit,
     AwaitConfirm,
+    /// PMKSA caching: Open System authentication is outstanding and the
+    /// association request names the cached PMKID.
+    Cached,
     Done,
     Failed,
 }
@@ -251,6 +254,16 @@ fn replace_element(frame: &mut Vec<u8>, id: u8, body: &[u8]) -> Result<(), Error
     Err(Error::Protocol)
 }
 
+impl SaeJoin {
+    /// Open System authentication for a cached PMKSA is outstanding.
+    pub(super) fn awaiting_cached_authentication(&self) -> bool {
+        self.auth == Auth::Cached
+    }
+    pub(super) fn cached_authentication_done(&mut self) {
+        self.auth = Auth::Done;
+    }
+}
+
 impl JoinPlan {
     /// The negotiated SAE profile of a `SecurityMode::Wpa3Sae` plan.
     pub fn sae(&self) -> Option<&SaeJoin> {
@@ -286,6 +299,33 @@ impl JoinPlan {
         sae.auth = Auth::AwaitCommit;
         self.phase = Phase::AwaitAuthentication;
         Ok(&self.sae.as_ref().ok_or(Error::Protocol)?.frame)
+    }
+
+    /// SAE with a cached PMKSA (IEEE802.11-2020 12.6.10.3; wpa_supplicant
+    /// `sme_send_authentication` with `pmksa_cache` hit): Open System
+    /// authentication, then an association request whose RSNE names
+    /// `pmkid`. The caller keeps the PMK for the 4-way handshake. An AP that
+    /// no longer holds the PMKSA refuses the association
+    /// (WLAN_STATUS_INVALID_PMKID) and the caller runs full SAE with a new
+    /// plan, as wpa_supplicant does after dropping the cache entry.
+    pub fn start_pmksa_authentication(&mut self, pmkid: [u8; 16]) -> Result<&[u8], Error> {
+        if self.phase != Phase::Prepared {
+            return Err(Error::Busy);
+        }
+        if self.mld.is_some() {
+            // An MLD association binds its authentication to the link set.
+            return Err(Error::UnsupportedSecurity);
+        }
+        let sae = self.sae.as_mut().ok_or(Error::UnsupportedSecurity)?;
+        if sae.auth != Auth::Idle {
+            return Err(Error::Busy);
+        }
+        let rsne = sae.station_rsne(Some(pmkid));
+        sae.pmkid = Some(pmkid);
+        sae.auth = Auth::Cached;
+        replace_element(&mut self.assoc, 48, &rsne)?;
+        self.phase = Phase::AwaitAuthentication;
+        Ok(&self.auth)
     }
 
     /// The last SAE frame this plan produced, for the owner's

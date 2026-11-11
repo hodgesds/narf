@@ -1397,6 +1397,27 @@ impl WirelessNetIface for Mt76Iface {
         true
     }
 
+    /// The owner caches the SAE PMKSA itself (as a full-offload firmware
+    /// does), so userspace can delete or flush it but supplies none:
+    /// SET_PMKSA stays -EOPNOTSUPP.
+    fn del_pmksa(&self, entry: narf_wireless::PmksaEntry) -> Result<(), i32> {
+        use crate::mt7921::firmware_transport::{PmksaRequest, BOOT_PMKSA_REQUESTS};
+        let request = match (entry.bssid, entry.pmkid) {
+            (Some(bssid), _) => PmksaRequest::Bssid(bssid),
+            (None, Some(pmkid)) => PmksaRequest::Pmkid(pmkid),
+            (None, None) => return Err(22), // EINVAL
+        };
+        BOOT_PMKSA_REQUESTS.lock().push(request);
+        Ok(())
+    }
+    fn flush_pmksa(&self) -> Result<(), i32> {
+        use crate::mt7921::firmware_transport::{PmksaRequest, BOOT_PMKSA_REQUESTS};
+        let mut requests = BOOT_PMKSA_REQUESTS.lock();
+        requests.clear();
+        requests.push(PmksaRequest::Flush);
+        Ok(())
+    }
+
     /// mac80211's software CQM (`ieee80211_rx_bss_info`) over the AP's
     /// Beacon signal, for one threshold or a cfg80211 threshold list.
     fn supports_cqm_rssi(&self) -> bool {

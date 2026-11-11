@@ -420,3 +420,69 @@ smoke!(
     smoke_sae_join_rejections_reflection_binding_and_cancel,
     failures
 );
+
+/// PMKSA caching on an SAE plan: Open System authentication, an
+/// association request whose RSNE names the cached PMKID (and keeps the
+/// RSNXE), no SAE frames, and the ordinary association response; SAE and
+/// a cached attempt exclude each other; Open authentication without a
+/// cached attempt is still refused on an SAE plan.
+fn pmksa_cached() -> Result<(), &'static str> {
+    let ap = sae_ap();
+    let pmkid = [0x5c; 16];
+    let mut cached = plan(&ap, SaePwe::Both).map_err(|_| "SAE AP refused")?;
+    check!(
+        cached.start_authentication().is_err(),
+        "Open authentication accepted on an SAE plan without a PMKSA"
+    );
+    let auth = cached
+        .start_pmksa_authentication(pmkid)
+        .map_err(|_| "PMKSA attempt refused")?
+        .to_vec();
+    check!(
+        auth.len() >= 30 && auth[0] == 0xb0 && auth[24..30] == [0, 0, 1, 0, 0, 0],
+        "PMKSA attempt is not Open System authentication"
+    );
+    check!(
+        cached.sae_pending_frame().is_none(),
+        "PMKSA attempt left an SAE frame to retransmit"
+    );
+    check!(
+        cached.start_pmksa_authentication(pmkid).is_err(),
+        "second PMKSA attempt on one plan"
+    );
+    let mut open = from_ap(2, 0, &[]);
+    open[24..26].copy_from_slice(&0u16.to_le_bytes());
+    let assoc = cached
+        .authentication_response(&open)
+        .map_err(|_| "Open System response refused")?
+        .ok_or("Open System response ignored")?
+        .to_vec();
+    let rsne = rsne_of(&assoc).ok_or("association request without RSNE")?;
+    check!(
+        rsne.pmkids == [pmkid] && rsne.akms == [Suite::standard(rsn::AKM_SAE)],
+        "association request does not name the cached PMKID"
+    );
+    check!(
+        assoc.windows(3).any(|w| w == [244, 1, 0x20]),
+        "RSNXE dropped from the cached association request"
+    );
+    check!(
+        cached.association_response(&assoc_response(0x11)).is_ok(),
+        "association response refused after a PMKSA attempt"
+    );
+    // SAE first, then a PMKSA attempt: refused.
+    let mut sae = plan(&ap, SaePwe::HuntAndPeck).map_err(|_| "SAE AP refused")?;
+    let (mut sta, _) = sessions(false, b"secret", false);
+    sta.try_build_commit().map_err(|_| "commit")?;
+    sae.start_sae_authentication(&sta)
+        .map_err(|_| "SAE start refused")?;
+    check!(
+        sae.start_pmksa_authentication(pmkid).is_err(),
+        "PMKSA attempt after SAE started"
+    );
+    Ok(())
+}
+smoke!(
+    smoke_sae_join_pmksa_cached_open_authentication,
+    pmksa_cached
+);

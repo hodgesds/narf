@@ -587,3 +587,84 @@ kernel_test_in!(
     "drivers/wireless/mt7921/pmf",
     mt7922_wpa2_pmf_and_psk_sha256_from_the_supplicants_selection
 );
+
+/// SAE / Open System Authentication frames the station sent from `from`.
+fn auth_frames(session: &Session<Model>, from: usize, algorithm: u8) -> usize {
+    session.backend.frames[from..]
+        .iter()
+        .filter(|(_, f)| f.len() >= 30 && f[0] == 0xb0 && f[24..26] == [algorithm, 0])
+        .count()
+}
+
+/// PMKSA caching for an MT7922 WPA3 station, as wpa_supplicant does it for
+/// SAE: the first join runs SAE and caches the PMKSA; a reconnect to the AP
+/// that still holds it uses Open System authentication with the PMKID and
+/// no SAE frames; an AP that lost it answers WLAN_STATUS_INVALID_PMKID and
+/// the station falls back to full SAE within the same join, replacing the
+/// entry; other credentials never use the entry; FLUSH_PMKSA empties it.
+fn mt7922_sae_pmksa_cache_skips_sae_on_reconnect_and_falls_back() -> TestResult {
+    let (mut session, bss) = prepared(sae_ap(ApSaePwe::HashToElement));
+    if join(&mut session, &bss, sae()) != Ok(42) || session.pmksa.len() != 1 {
+        return TestResult::Fail("first SAE join did not cache its PMKSA");
+    }
+    let reconnect =
+        |session: &mut Session<Model>,
+         ap: fn(&mut FakeAp) -> Result<(), narf_wifi_fixtures::ApError>| {
+            if run(Box::pin(session.disassociate_station())).is_err() {
+                return Err("teardown");
+            }
+            ap(session.backend.access_point.as_mut().unwrap()).map_err(|_| "AP restart")?;
+            let before = session.backend.frames.len();
+            if join(session, &bss, sae()) != Ok(42) {
+                return Err("reconnect failed");
+            }
+            let ap = session.backend.access_point.as_ref().unwrap();
+            if ap.phase() != ApPhase::Authorized || !ap.pmf() {
+                return Err("AP did not authorize the reconnect with PMF");
+            }
+            Ok((
+                auth_frames(session, before, 0),
+                auth_frames(session, before, 3),
+            ))
+        };
+    // The AP still holds the PMKSA: Open System + PMKID, no SAE.
+    match reconnect(&mut session, FakeAp::restart_keeping_pmksa) {
+        Ok((1, 0)) => {}
+        Ok(_) => return TestResult::Fail("cached reconnect still ran SAE"),
+        Err(reason) => return TestResult::Fail(reason),
+    }
+    // The AP lost it: one refused Open System attempt, then full SAE.
+    match reconnect(&mut session, FakeAp::forget_pmksa) {
+        Ok((1, 2)) if session.pmksa.len() == 1 => {}
+        Ok(_) => return TestResult::Fail("no full-SAE fallback after INVALID_PMKID"),
+        Err(reason) => return TestResult::Fail(reason),
+    }
+    // Other credentials for the same BSS never use the cached PMK.
+    let other = crate::mt7921::pmksa::binding(b"narf", b"another-password");
+    let mine = crate::mt7921::pmksa::binding(b"narf", PASSWORD);
+    let now = session.backend.now_ns();
+    if session.pmksa.lookup(bss.bssid, other, now).is_some()
+        || session.pmksa.lookup(bss.bssid, mine, now).is_none()
+        || session
+            .pmksa
+            .lookup(bss.bssid, mine, now + crate::mt7921::pmksa::LIFETIME_NS)
+            .is_some()
+    {
+        return TestResult::Fail("PMKSA bound to the wrong credentials or lifetime");
+    }
+    // NL80211_CMD_FLUSH_PMKSA.
+    let mut cache = crate::mt7921::pmksa::Cache::default();
+    cache.insert(bss.bssid, mine, [1; 16], &[2; 32], 0);
+    super::BOOT_PMKSA_REQUESTS
+        .lock()
+        .push(super::PmksaRequest::Flush);
+    super::apply_pmksa_requests(&mut cache);
+    if !cache.is_empty() {
+        return TestResult::Fail("FLUSH_PMKSA left an entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/pmf",
+    mt7922_sae_pmksa_cache_skips_sae_on_reconnect_and_falls_back
+);
