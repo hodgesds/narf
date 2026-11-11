@@ -38,6 +38,7 @@ D=/run/narf-soak
 : "${SOAK_VIRTIO_NET:=10.0.2}" "${SOAK_E1000_NET:=10.0.3}" "${SOAK_POWEROFF:=1}"
 : "${SOAK_DROP_SECS:=30}" "${SOAK_BIG_MB:=0}" "${SOAK_XFER_MB:=100}"
 : "${SOAK_DIRECTED:=1}" "${SOAK_DIRTYEXIT:=0}" "${SOAK_SHARED_MAPS:=1}" "${SOAK_DURABLE:=0}"
+: "${SOAK_SETTLE:=cpu}"
 # <MiB>:<exit|kill> rounds of a process that dies with dirty shared pages.
 : "${SOAK_EXITWB:=8:exit 32:exit 32:kill}"
 # <window seconds>:<dirty MiB>:<forks per second> rounds of the forking parent.
@@ -554,10 +555,18 @@ episode() { # name command...
   while read -r line; do
     say "SOAK-EPISODE out $name: ${line:0:330}"
   done < <(tail -n 6 "$D/out/episode-$name.log")
-  while ((quiet < 3 && (${EPOCHREALTIME/./} - t1) / 1000000 < 300)); do
-    busiest_cpu
-    if ((BUSIEST >= 60)); then quiet=0; else quiet=$((quiet + 1)); fi
-  done
+  # SOAK_SETTLE=cpu waits until no CPU has been busy for three seconds (up to
+  # five minutes), from /proc/stat; a number waits that many seconds. Use a
+  # number on a kernel whose per-CPU /proc/stat counters are not monotonic
+  # (tickless idle), and read captures from the host's vCPU samples.
+  if [ "$SOAK_SETTLE" = cpu ]; then
+    while ((quiet < 3 && (${EPOCHREALTIME/./} - t1) / 1000000 < 300)); do
+      busiest_cpu
+      if ((BUSIEST >= 60)); then quiet=0; else quiet=$((quiet + 1)); fi
+    done
+  else
+    nap "$SOAK_SETTLE"
+  fi
   t2=${EPOCHREALTIME/./}
   stamp
   say "SOAK-EPISODE end $name up=$UP busy_after_return_ms=$(((t2 - t1) / 1000 - 3000))"
@@ -683,7 +692,10 @@ directed() {
   mkdir -p "$W/ep"
   # (b) a process dies with dirty shared pages.
   for spec in $SOAK_EXITWB; do
-    episode "die-${spec##*:}-${spec%%:*}m" "$NATIVE" dirtyexit "${spec%%:*}" "$W/ep/dirty.bin" \
+    # The capture after the exit is read from the host's samples; the tool's
+    # own /proc/stat watch is only kept for ten seconds.
+    episode "die-${spec##*:}-${spec%%:*}m" env DIRTYEXIT_WINDOW_MS=10000 "$NATIVE" dirtyexit \
+      "${spec%%:*}" "$W/ep/dirty.bin" \
       "${spec##*:}" "$TREE/userspace"
   done
   # (a) a long-lived parent keeps N MiB of a shared mapping dirty and forks

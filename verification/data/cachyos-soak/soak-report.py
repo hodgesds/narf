@@ -168,7 +168,43 @@ def raw_stranding(lines):
                 print("   " + line[line.index("watchdog:"):])
 
 
-def episodes(lines, syms):
+def rip_runs(run):
+    """[(up, {cpu: in_kernel_not_halted})] from the host's vCPU samples."""
+    out = []
+    path = os.path.join(run, "vcpu-rip-samples.log")
+    if not os.path.exists(path):
+        return out
+    for line in open(path):
+        m = re.search(r"up=([0-9.]+)", line)
+        if not m:
+            continue
+        cpus = {}
+        for cpu, _, cs, hlt in re.findall(r"(\d+):([0-9a-f]+):cs([0-9a-f]+)( hlt)?", line):
+            cpus[cpu] = not hlt and not int(cs, 16) & 3
+        out.append((float(m.group(1)), cpus))
+    return out
+
+
+def kernel_streak(samples, lo, hi):
+    """Longest time one vCPU was found in the kernel, not halted, in every
+    host sample between `lo` and `hi` (guest uptime): a capture, measured
+    from outside the guest."""
+    best, run, prev = (0.0, "-"), {}, None
+    for up, cpus in samples:
+        if not lo <= up <= hi:
+            continue
+        for cpu, busy in cpus.items():
+            if busy:
+                start = run.setdefault(cpu, prev if prev is not None else up)
+                if up - start > best[0]:
+                    best = (up - start, cpu)
+            else:
+                run.pop(cpu, None)
+        prev = up
+    return best
+
+
+def episodes(lines, syms, run=None):
     """Per-episode table for the directed part of a run."""
     found, cur = [], None
     for line in lines:
@@ -176,7 +212,7 @@ def episodes(lines, syms):
         if m:
             what, name, rest = m.groups()
             if what == "begin":
-                cur = {"name": name, "ms": None, "rc": "?", "after": None, "out": [],
+                cur = {"name": name, "begin": float(kv(rest).get("up", 0)), "ms": None, "rc": "?", "after": None, "out": [],
                        "probes": {}, "streak": {}, "best": (0, "-"), "log": [], "meta": 0}
                 found.append(cur)
             elif cur and what == "returned":
@@ -186,6 +222,7 @@ def episodes(lines, syms):
                 cur["out"].append(rest)
             elif cur and what == "end":
                 cur["after"] = int(kv(rest).get("busy_after_return_ms", 0))
+                cur["end"] = float(kv(rest).get("up", 0))
                 cur = None
             continue
         if cur is None:
@@ -210,7 +247,9 @@ def episodes(lines, syms):
     print("   (ms = the command; after = seconds some CPU stayed busy once it had returned;")
     print("    100% = longest run of samples with one CPU fully busy; probe columns = worst ms;")
     print("    meta = `btrfs: grew METADATA` lines)")
-    print(f"   {'episode':24s} {'ms':>7s} {'after':>6s} {'100%':>9s} "
+    samples = rip_runs(run) if run else []
+    print("    kern = longest stretch one vCPU was in the kernel in every host register sample)")
+    print(f"   {'episode':24s} {'ms':>7s} {'after':>6s} {'100%':>9s} {'kern':>8s} "
           f"{'logind':>7s} {'busctl':>7s} {'fsync':>7s} {'exec':>6s} {'read':>6s} {'meta':>5s}  detector")
     for e in found:
         soft = sum("lockup -" in l for l in e["log"])
@@ -218,7 +257,9 @@ def episodes(lines, syms):
         streak = f"{e['best'][0]}s@{e['best'][1]}" if e["best"][0] else "-"
         after = "?" if e["after"] is None else f"{max(e['after'], 0) / 1000:.0f}"
         pr = e["probes"]
-        print(f"   {e['name']:24s} {e['ms'] if e['ms'] is not None else '?':>7} {after:>6s} {streak:>9s} "
+        ks = kernel_streak(samples, e["begin"], e.get("end", 1e18))
+        kern = f"{ks[0]:.0f}s@{ks[1]}" if ks[0] else "-"
+        print(f"   {e['name']:24s} {e['ms'] if e['ms'] is not None else '?':>7} {after:>6s} {streak:>9s} {kern:>8s} "
               f"{pr.get('loginctl', 0):7d} {pr.get('busctl', 0):7d} {pr.get('fsync', 0):7d} "
               f"{pr.get('exec', 0):6d} {pr.get('coldread', 0):6d} {e['meta']:5d}  "
               f"{f'{soft} lockup report(s), {starved} stranded task(s)' if soft or starved else '-'}")
@@ -268,7 +309,7 @@ def main():
                      r"FORKFLUSH|SHMAP|SAMPLER|DIRTYEXIT|DURABLE|HARDSTOP|INTEG)\b", line):
             print("  " + line[line.index("SOAK-"):][:300])
 
-    episodes(lines, syms)
+    episodes(lines, syms, run)
 
     pulses = []
     for line in lines:
