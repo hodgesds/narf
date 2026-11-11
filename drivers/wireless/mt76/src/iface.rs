@@ -838,6 +838,8 @@ fn station_info_from(
         signal_avg_dbm: link.signal_avg_dbm(),
         chain_signal_dbm,
         rx_bitrate: link.rx_rate,
+        tx_bitrate: link.tx_rate,
+        tx_failed: link.tx_failed,
         rx_packets: counters.map(|c| clamp(c.rx_packets)),
         tx_packets: counters.map(|c| clamp(c.tx_packets)),
         ..Default::default()

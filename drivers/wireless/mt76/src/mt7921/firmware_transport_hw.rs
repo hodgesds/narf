@@ -612,6 +612,20 @@ impl Hardware {
         if !self.owner.published {
             return Err(Error::Busy);
         }
+        // mt7921e_tx_prepare_skb: the home station's data asks for a TX
+        // status every HZ/4, the source of its TX rate (fill_txs). An
+        // unused reservation is reused by the next frame.
+        let rate_pid = if link == crate::mt7921::vif_slots::Link::HOME {
+            let now = self.now_ns();
+            self.owner
+                .storage
+                .as_mut()
+                .ok_or(Error::Busy)?
+                .tx_sequence
+                .rate_pid(u16::from(link.peer()), now)
+        } else {
+            None
+        };
         let storage = self.owner.storage.as_ref().ok_or(Error::Busy)?;
         let token = if pipelined {
             storage.tokens.available_pipelined()?
@@ -648,7 +662,9 @@ impl Hardware {
         if qos && self.hw_amsdu {
             packet_tx::set_hw_amsdu(&mut header);
         }
-        if let Some(pid) = sample_pid {
+        // The BA-restart sample owns the frame's status when armed.
+        let rate_pid = rate_pid.filter(|_| sample_pid.is_none());
+        if let Some(pid) = sample_pid.or(rate_pid) {
             crate::mt7921::tx_sequence::request(&mut header, pid)?;
         }
         // SAFETY: fully validated lengths; this slot has neither DMA nor
@@ -669,6 +685,8 @@ impl Hardware {
         storage.tokens.begin_at(token, slot)?;
         if sample_pid.is_some() {
             storage.tx_sequence.begin(tid, token)?;
+        } else if rate_pid.is_some() {
+            storage.tx_sequence.begin_rate(token);
         }
         let ring = &mut storage.data;
         ring.pending = true; // conservative on any later doorbell failure
@@ -838,6 +856,12 @@ impl Backend for Hardware {
     ) -> Result<(), Error> {
         self.check()?;
         super::current_station_permission(permission, narf_wireless::reg::db::snapshot())
+    }
+    fn tx_rate_report(&self) -> Option<crate::mt7921::tx_sequence::RateReport> {
+        self.owner
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.tx_sequence.rate_report())
     }
     fn suspend_dma(&mut self) -> Result<(), Error> {
         self.update(GLOBAL, ENABLE, 0)?;

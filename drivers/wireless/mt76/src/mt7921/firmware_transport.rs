@@ -1509,6 +1509,10 @@ trait Backend {
         &self,
         permission: crate::mt7921::association::TxPermission,
     ) -> Result<(), Error>;
+    /// The home station's latest sampled TX status (rate and failures).
+    fn tx_rate_report(&self) -> Option<crate::mt7921::tx_sequence::RateReport> {
+        None
+    }
     fn quiesce(&mut self) -> Result<(), Error>;
     fn idle(&mut self) -> Result<bool, Error>;
     fn initialize(&mut self) -> Result<(), Error>;
