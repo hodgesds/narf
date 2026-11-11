@@ -39,6 +39,7 @@ pub mod association;
 pub mod bringup;
 pub(crate) mod channel;
 pub mod cmd;
+pub(crate) mod csa;
 pub mod dma;
 mod firmware_assets;
 mod firmware_parser_tests;
