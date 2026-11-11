@@ -24,6 +24,7 @@ mod extent_window;
 mod grow_tall;
 mod overwrite_cost;
 mod release_cost;
+mod root_collapse;
 mod safety;
 mod snapshots;
 mod write_buffers;
