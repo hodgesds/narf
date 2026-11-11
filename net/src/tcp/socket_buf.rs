@@ -88,9 +88,9 @@ impl SendBuf {
     pub fn write(&mut self, data: &[u8]) -> usize {
         let cap = self.limit.saturating_sub(self.bytes.len());
         let n = data.len().min(cap);
-        for &b in &data[..n] {
-            self.bytes.push_back(b);
-        }
+        // One block copy (`skb_copy_to_page_nocache`), not a push per byte:
+        // this runs under the connection lock on every `send(2)`.
+        self.bytes.extend(&data[..n]);
         n
     }
 
@@ -165,9 +165,8 @@ impl SendBuf {
         // Bytes ack'd = ack_seq - unacked_head_seq (wrap-aware).
         let n = ack_seq.wrapping_sub(self.unacked_head_seq) as usize;
         let n = n.min(self.bytes.len());
-        for _ in 0..n {
-            self.bytes.pop_front();
-        }
+        // Dropping an acknowledged prefix only moves the ring head.
+        self.bytes.drain(..n);
         self.unacked_head_seq = self.unacked_head_seq.wrapping_add(n as u32);
         self.sent_offset = self.sent_offset.saturating_sub(n);
         n
@@ -255,10 +254,11 @@ impl RecvBuf {
     /// User-facing read. Pops up to `dst.len()` bytes from
     /// `in_order`. Returns the byte count.
     pub fn read(&mut self, dst: &mut [u8]) -> usize {
-        let n = dst.len().min(self.in_order.len());
-        for slot in &mut dst[..n] {
-            *slot = self.in_order.pop_front().unwrap_or(0);
-        }
+        // Two block copies and a head move (`skb_copy_datagram_msg`). A
+        // pop per byte held the connection lock, with interrupts off, for the
+        // whole of a 64 KiB read while the RX path waited to queue segments.
+        let n = self.peek(dst);
+        self.in_order.drain(..n);
         n
     }
 
@@ -323,7 +323,7 @@ impl RecvBuf {
         let data = &data[..take];
 
         if seq == rcv_nxt {
-            self.in_order.extend(data.iter().copied());
+            self.in_order.extend(data);
             rcv_nxt = rcv_nxt.wrapping_add(data.len() as u32);
             rcv_nxt = self.drain_ooo_into_in_order(rcv_nxt);
         } else {
@@ -401,9 +401,7 @@ impl RecvBuf {
                     // post-rcv_nxt tail into in_order.
                     let skip = rcv_nxt.wrapping_sub(seg.seq) as usize;
                     let tail = &seg.data[skip..];
-                    for &b in tail {
-                        self.in_order.push_back(b);
-                    }
+                    self.in_order.extend(tail);
                     rcv_nxt = rcv_nxt.wrapping_add(tail.len() as u32);
                     consumed = Some(i);
                     break;
@@ -413,9 +411,7 @@ impl RecvBuf {
                 Some(i) => {
                     let seg = self.out_of_order.remove(i);
                     if seg.seq == rcv_nxt {
-                        for &b in &seg.data {
-                            self.in_order.push_back(b);
-                        }
+                        self.in_order.extend(&seg.data);
                         rcv_nxt = rcv_nxt.wrapping_add(seg.data.len() as u32);
                     }
                 }
@@ -536,4 +532,59 @@ mod tests {
         narf_kernel_test::TestResult::Pass
     }
     narf_kernel_test::kernel_test_in!("net/tcp/socket_buf", recv_buf_free_window_decreases);
+
+    /// Block copies must preserve byte order across the ring's wrap point
+    /// for both buffers, including a partial read and a partial ACK.
+    fn socket_bufs_copy_blocks_across_ring_wrap() -> narf_kernel_test::TestResult {
+        let pattern = |start: usize, len: usize| -> alloc::vec::Vec<u8> {
+            (start..start + len).map(|i| (i % 251) as u8).collect()
+        };
+        let mut r = RecvBuf::new(4096);
+        let mut rcv_nxt = 0u32;
+        let mut produced = 0usize;
+        let mut consumed = 0usize;
+        // Uneven write/read sizes walk the head through several wraps.
+        for round in 0..40 {
+            let chunk = pattern(produced, 700 + round * 13);
+            let next = r.accept(rcv_nxt, &chunk, rcv_nxt);
+            produced += next.wrapping_sub(rcv_nxt) as usize;
+            rcv_nxt = next;
+            let mut out = alloc::vec![0u8; 500 + round * 17];
+            let n = r.read(&mut out);
+            narf_kernel_test::kt_assert_eq!(&out[..n], &pattern(consumed, n)[..]);
+            consumed += n;
+        }
+        let mut rest = alloc::vec![0u8; 8192];
+        let n = r.read(&mut rest);
+        narf_kernel_test::kt_assert_eq!(&rest[..n], &pattern(consumed, n)[..]);
+        narf_kernel_test::kt_assert_eq!(consumed + n, produced);
+        narf_kernel_test::kt_assert!(!r.has_data());
+
+        let mut s = SendBuf::new(4096, 1000);
+        let mut written = 0usize;
+        let mut acked = 0usize;
+        for round in 0..40 {
+            written += s.write(&pattern(written, 900 + round * 7));
+            let take = s.unsent_len().min(600 + round * 11);
+            let (a, b) = s.unsent_slices(take);
+            let mut seen = a.to_vec();
+            seen.extend_from_slice(b);
+            let sent_at = acked + s.inflight_bytes();
+            narf_kernel_test::kt_assert_eq!(&seen[..], &pattern(sent_at, take)[..]);
+            s.mark_sent(take);
+            let release = s.inflight_bytes() / 2 + 1;
+            let n = s.ack(s.unacked_head_seq.wrapping_add(release as u32));
+            acked += n;
+            narf_kernel_test::kt_assert_eq!(s.unacked_head_seq, 1000 + acked as u32);
+        }
+        let (a, b) = s.full_slices();
+        let mut held = a.to_vec();
+        held.extend_from_slice(b);
+        narf_kernel_test::kt_assert_eq!(&held[..], &pattern(acked, written - acked)[..]);
+        narf_kernel_test::TestResult::Pass
+    }
+    narf_kernel_test::kernel_test_in!(
+        "net/tcp/socket_buf",
+        socket_bufs_copy_blocks_across_ring_wrap
+    );
 }
