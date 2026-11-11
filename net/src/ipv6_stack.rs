@@ -1682,8 +1682,10 @@ pub fn rx_frame_l2_at(iface: &str, frame_after_eth: &[u8], l2_dst: L2Dst, now_ns
             },
             next_nh,
             &body,
-            &invoking,
-            l2_dst,
+            Icmp6ErrorCtx {
+                invoking: &invoking,
+                l2_dst,
+            },
         );
     }
     let l4 = match skip_extension_headers(nh, payload) {
@@ -1701,9 +1703,20 @@ pub fn rx_frame_l2_at(iface: &str, frame_after_eth: &[u8], l2_dst: L2Dst, now_ns
         },
         l4.proto,
         &payload[l4.offset..],
-        invoking,
-        l2_dst,
+        Icmp6ErrorCtx { invoking, l2_dst },
     )
+}
+
+/// The context an L4 handler needs to originate an ICMPv6 error in
+/// reply to the packet being dispatched (RFC 4443 §2.4(e)): the
+/// invoking packet, quoted in the error body (§3), and the class of
+/// the link-layer destination it arrived on, which gates whether an
+/// error may be originated at all (§2.4(e.4)/(e.5)). The two travel
+/// together — bundled so `dispatch_l4` stays under clippy's
+/// argument-count limit without an `#[allow]`.
+struct Icmp6ErrorCtx<'a> {
+    invoking: &'a [u8],
+    l2_dst: L2Dst,
 }
 
 fn dispatch_l4(
@@ -1713,12 +1726,11 @@ fn dispatch_l4(
     meta: crate::udp_sock::RxIpMeta,
     proto: u8,
     l4: &[u8],
-    invoking: &[u8],
-    l2_dst: L2Dst,
+    err_ctx: Icmp6ErrorCtx<'_>,
 ) -> bool {
     match proto {
         NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, l4),
-        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, meta, l4, invoking, l2_dst),
+        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, meta, l4, err_ctx),
         NEXT_HEADER_TCP => handle_tcp6(iface, src_ip, dst_ip, l4),
         _ => false,
     }
@@ -1744,8 +1756,7 @@ fn handle_udp6(
     dst_ip: [u8; 16],
     meta: crate::udp_sock::RxIpMeta,
     datagram: &[u8],
-    invoking: &[u8],
-    l2_dst: L2Dst,
+    err_ctx: Icmp6ErrorCtx<'_>,
 ) -> bool {
     const UDP_HDR_LEN: usize = 8;
     if datagram.len() < UDP_HDR_LEN {
@@ -1794,13 +1805,13 @@ fn handle_udp6(
     // (e.3) multicast destination) and the §2.4(f) rate limit apply;
     // a link-layer multicast/broadcast frame suppresses per
     // §2.4(e.4)/(e.5). Every failure drops silently.
-    if !delivered && l2_dst != L2Dst::Multicast {
+    if !delivered && err_ctx.l2_dst != L2Dst::Multicast {
         let _ = send_icmp6_error_in(
             net_ns_id,
             iface,
             dst_ip,
             Icmp6ErrorKind::DestinationUnreachable(4),
-            invoking,
+            err_ctx.invoking,
         );
     }
     true

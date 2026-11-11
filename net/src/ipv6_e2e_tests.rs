@@ -2305,6 +2305,10 @@ fn wrap_eth(src_mac: [u8; 6], dst_mac: [u8; 6], packet: &[u8]) -> Vec<u8> {
 
 /// Stub userspace delivery hook that consumes every datagram: the "a
 /// socket owns this port" case for the DU suppression smoke.
+/// The 8-argument shape is dictated by `UserDeliverHook`
+/// (`udp_sock.rs`): the stub must match the hook's fn-pointer type
+/// exactly, so it cannot take a bundled struct.
+#[allow(clippy::too_many_arguments)]
 fn consume_all_udp6(
     _net_ns_id: u64,
     _src_ip: &[u8],
