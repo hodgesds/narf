@@ -26,6 +26,7 @@ pub mod rate;
 pub mod reconnect;
 pub mod reg;
 pub mod reorder;
+pub mod rfkill;
 pub mod rsn;
 pub mod sae;
 pub mod scan;

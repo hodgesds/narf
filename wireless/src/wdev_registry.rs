@@ -74,6 +74,7 @@ pub fn register(iface: Arc<dyn WirelessNetIface>) {
             retired: false,
             native_lifetime: narf_net::native_emission::ProviderLifetime::new(),
         });
+        crate::rfkill::wiphy_added(wiphy);
     }
 }
 /// Trusted driver binding pairs this actual child with its still-registered
@@ -284,7 +285,11 @@ pub fn unregister(name: &str) {
     };
     for (entry, native) in removed {
         native.notify();
+        let wiphy = entry.wiphy;
         drop(entry);
+        if !REGISTRY.lock().iter().any(|entry| entry.wiphy == wiphy) {
+            crate::rfkill::wiphy_removed(wiphy);
+        }
     }
 }
 

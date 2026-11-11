@@ -40,6 +40,8 @@ narf-aml          = { path = "../../aml" }
 narf-drivers-sdio = { path = "../sdio" }
 narf-drivers-spi  = { path = "../spi" }
 narf-drivers-usb  = { path = "../usb" }
+# The rfkill core and /dev/rfkill: each wiphy is one wlan radio.
+narf-drivers-platform = { path = "../platform" }
 # Per-driver crate (promoted from the former src/mt7921/ module). Built-in
 # here; the same crate also builds to a loadable `.ko` via `cargo xtask
 # build-module`. See drivers/wireless/mt76/ and drivers/net/i40e/ (template).
