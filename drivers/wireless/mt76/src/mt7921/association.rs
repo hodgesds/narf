@@ -589,6 +589,10 @@ impl JoinPlan {
         out.extend_from_slice(&wmm::INFORMATION);
         Ok(Some(SaeOutcome::Associate(out)))
     }
+    /// The request goes out as a Reassociation Request (roaming).
+    pub fn expect_reassociation(&mut self) {
+        self.common.expect_reassociation();
+    }
     pub fn association_response(&mut self, bytes: &[u8]) -> Result<Option<u16>, Error> {
         let Some(aid) = self.common.association_response(bytes)? else {
             return Ok(None);

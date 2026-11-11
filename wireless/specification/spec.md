@@ -613,7 +613,11 @@ anti-clogging token, at most `MAX_ANTI_CLOGGING` = 3 rounds, group 19 only),
 `Associate` (the association request with the SAE PMKID spliced into its
 RSNE). For a cached PMKSA the owner calls `start_pmksa_authentication(pmkid)`
 instead. It returns Open System authentication, and the association
-request's RSNE names that PMKID. `authentication_response` accepts the Open
+request's RSNE names that PMKID. For roaming (CONNECT with PREV_BSSID), the
+owner sends `association::reassociation_request(assoc, current_ap)` (subtype
+2, with the Current AP Address after the Listen Interval) and calls
+`expect_reassociation()`, so `association_response` takes the
+Reassociation Response (subtype 3). `authentication_response` accepts the Open
 System reply only for such an attempt, and SAE and a cached attempt exclude
 each other on one plan. An AP that has lost the PMKSA refuses the
 association (`Rejected(53)`); the owner then runs full SAE on a fresh plan.

@@ -139,6 +139,26 @@ pub struct JoinPlan {
     links: Vec<MldLink>,
     /// The local non-AP MLD whose Basic MLE this plan requests with.
     mld_local: Option<mlo::Local>,
+    /// The request went out as a Reassociation Request
+    /// ([`reassociation_request`]); the answer is a Reassociation Response.
+    reassociation: bool,
+}
+
+/// mac80211 `ieee80211_send_assoc` with a previous AP
+/// (`assoc_data->prev_ap_addr`, from NL80211_ATTR_PREV_BSSID): `assoc` as a
+/// Reassociation Request (subtype 2), its Current AP Address field after the
+/// Listen Interval (IEEE802.11-2020 9.3.3.8). `None` for anything but a plain
+/// Association Request.
+pub fn reassociation_request(assoc: &[u8], current_ap: [u8; 6]) -> Option<Vec<u8>> {
+    if assoc.len() < 28 || assoc[0] != 0x00 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(assoc.len() + 6);
+    out.extend_from_slice(&assoc[..28]);
+    out[0] = 0x20;
+    out.extend_from_slice(&current_ap);
+    out.extend_from_slice(&assoc[28..]);
+    Some(out)
 }
 
 /// One link of a multiple-link MLD request: the actual BSS of that
@@ -1490,7 +1510,14 @@ impl JoinPlan {
             mld,
             links: Vec::new(),
             mld_local: profile.mld,
+            reassociation: false,
         })
+    }
+
+    /// The association request is sent as [`reassociation_request`]: accept
+    /// the Reassociation Response (subtype 3) instead.
+    pub fn expect_reassociation(&mut self) {
+        self.reassociation = true;
     }
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
         if self.sae.is_some() {
@@ -1560,7 +1587,8 @@ impl JoinPlan {
         if self.phase != Phase::AwaitAssociation {
             return Err(Error::Busy);
         }
-        if !self.response(bytes, 0x10) {
+        let subtype = if self.reassociation { 0x30 } else { 0x10 };
+        if !self.response(bytes, subtype) {
             return Ok(None);
         }
         if !(30..=2078).contains(&bytes.len()) {

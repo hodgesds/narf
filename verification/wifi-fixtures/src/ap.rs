@@ -513,21 +513,25 @@ impl FakeAp {
                 self.phase = ApPhase::Association;
                 Ok(vec![response])
             }
-            (ApPhase::Association, 0x00) if fc & 0x0300 == 0 => {
+            (ApPhase::Association, 0x00 | 0x20) if fc & 0x0300 == 0 => {
+                // A Reassociation Request (roaming within the ESS) carries
+                // the Current AP Address and is answered by a
+                // Reassociation Response.
+                let response_subtype = if fc & 0x00fc == 0x20 { 0x30 } else { 0x10 };
                 if let Err(error) = self.check_association(frame) {
                     if error != ApError::InvalidPmkid {
                         return Err(error);
                     }
                     // WLAN_STATUS_INVALID_PMKID: the station falls back to
                     // full SAE (wpa_supplicant drops the PMKSA entry).
-                    let mut response = self.header(0x10, self.plan.station);
+                    let mut response = self.header(response_subtype, self.plan.station);
                     response.extend_from_slice(&self.capabilities().to_le_bytes());
                     response.extend_from_slice(&53u16.to_le_bytes());
                     response.extend_from_slice(&0u16.to_le_bytes());
                     self.phase = ApPhase::Authentication;
                     return Ok(vec![response]);
                 }
-                let mut response = self.header(0x10, self.plan.station);
+                let mut response = self.header(response_subtype, self.plan.station);
                 response.extend_from_slice(&self.capabilities().to_le_bytes());
                 response.extend_from_slice(&0u16.to_le_bytes());
                 response.extend_from_slice(&(self.aid | 0xc000).to_le_bytes());
@@ -640,7 +644,10 @@ impl FakeAp {
         if u16::from_le_bytes([fixed[0], fixed[1]]) & 0x11 != self.capabilities() {
             return Err(ApError::Association);
         }
-        let mut ies = frame.get(28..).ok_or(ApError::Association)?;
+        // A Reassociation Request has the 6-octet Current AP Address
+        // between the Listen Interval and the elements.
+        let elements_at = if frame[0] & 0xfc == 0x20 { 34 } else { 28 };
+        let mut ies = frame.get(elements_at..).ok_or(ApError::Association)?;
         let (mut ssid, mut rates, mut extended_rates, mut rsn) = (None, None, None, None);
         let mut rsnxe = None;
         while !ies.is_empty() {

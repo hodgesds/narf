@@ -263,6 +263,9 @@ struct Model {
     edca_progress_fault: u8,
     deny_tx_after: Option<usize>,
     tx_policy: Option<Arc<CurrentPolicy>>,
+    /// Keep the fixture AP after the station's closing deauth, for tests
+    /// that reconnect to it (they restart its phase themselves).
+    keep_access_point: bool,
     station_channel: u8,
     rx_stall: bool,
     idle_stall: bool,
@@ -406,6 +409,7 @@ impl Model {
             edca_progress_fault: 0,
             deny_tx_after: None,
             tx_policy: None,
+            keep_access_point: false,
             station_channel: 6,
             rx_stall: false,
             idle_stall: false,
@@ -1057,7 +1061,9 @@ impl Backend for Model {
                 {
                     return Err(Error::Bounds);
                 }
-                self.access_point = None;
+                if !self.keep_access_point {
+                    self.access_point = None;
+                }
                 return Ok(());
             }
         }

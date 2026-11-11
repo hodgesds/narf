@@ -539,6 +539,31 @@ pub(crate) async fn associate_boot_station_as(
         .await
 }
 
+/// Roam the home station to `bss` within the ESS (cfg80211 CONNECT with
+/// NL80211_ATTR_PREV_BSSID, mac80211 reassociation): leave the current AP
+/// `current_ap` with a deauthentication and its keys retired, then join
+/// `bss` with a Reassociation Request naming `current_ap`.
+pub(crate) async fn reassociate_boot_station(
+    bss: &ScanBss,
+    ssid: &[u8],
+    security: crate::mt7921::association::Security,
+    extra_ies: &[u8],
+    heard_beacon: bool,
+    current_ap: [u8; 6],
+) -> Result<u16, Error> {
+    disassociate_boot_station().await?;
+    {
+        let Some(mut owner) = BOOT_OWNER.try_lock() else {
+            return Err(Error::Busy);
+        };
+        owner
+            .as_mut()
+            .ok_or(Error::DeviceGone)?
+            .set_reassociation(current_ap);
+    }
+    associate_boot_station_as(bss, ssid, security, extra_ies, false, heard_beacon).await
+}
+
 /// Disassociate the current station using the retained boot owner.
 pub async fn disassociate_boot_station() -> Result<(), Error> {
     finish_boot_keys().await?;
@@ -1735,6 +1760,9 @@ struct StationLink {
     /// The regulatory policy snapshot the grant and the firmware channel
     /// domain / power limits were last programmed from.
     applied_policy: Option<Arc<narf_wireless::reg::RegulatoryDomain>>,
+    /// The AP this link is roaming away from: the next join sends a
+    /// Reassociation Request naming it (consumed by that join).
+    reassociate_from: Option<[u8; 6]>,
     bss: Option<ScanBss>,
     /// This link's group role captured at join; retained for the exact
     /// disconnect record of that association (Linux `vif->p2p` is fixed per
@@ -1794,6 +1822,7 @@ impl StationLink {
             ps_wanted: false,
             ps_applied: false,
             applied_policy: None,
+            reassociate_from: None,
             bss: None,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
             permission: None,
