@@ -607,6 +607,21 @@ fn read_cap_last_cap() -> String {
     String::from("40\n")
 }
 
+/// `kernel/overflowuid` and `kernel/overflowgid` (`kernel/sys.c`): the id a
+/// process sees for a uid/gid that has no mapping in its user namespace —
+/// `DEFAULT_OVERFLOWUID` / `DEFAULT_OVERFLOWGID`, 65534. NARF's id-map
+/// translation (`narf_userspace::namespaces::OVERFLOW_ID`) uses the same
+/// fixed value.
+///
+/// bubblewrap reads both before anything else and exits if either is
+/// missing ("Can't read /proc/sys/kernel/overflowuid"), which is how every
+/// glycin image-loader sandbox — and so every GTK app decoding an SVG —
+/// failed. LINUX-GAP: Linux lets root retune these (0..65535); here the
+/// value is fixed, so the files do not accept writes.
+fn read_overflow_id() -> String {
+    String::from("65534\n")
+}
+
 fn read_core_pattern() -> String {
     ensure_defaults();
     format!("{}\n", CORE_PATTERN.lock().as_str())
@@ -836,6 +851,18 @@ pub fn register_all() {
         read: read_printk_devkmsg,
         write: Some(write_printk_devkmsg),
         perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/overflowuid",
+        read: read_overflow_id,
+        write: None,
+        perms: 0o444,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/overflowgid",
+        read: read_overflow_id,
+        write: None,
+        perms: 0o444,
     });
     register_sysctl(SysctlEntry {
         path: "kernel/cap_last_cap",
@@ -1373,6 +1400,21 @@ fn smoke_kernel_cap_last_cap() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_cap_last_cap);
+
+/// `cat /proc/sys/kernel/overflow{uid,gid}` on Linux: `65534`. bubblewrap's
+/// `read_overflowids` loads both and dies on ENOENT or a value of 0.
+fn smoke_kernel_overflow_ids() -> TestResult {
+    register_all();
+    for key in ["kernel/overflowuid", "kernel/overflowgid"] {
+        match read_sys(key) {
+            Some(s) if s == "65534\n" => {}
+            Some(_) => return TestResult::Fail("kernel/overflow{uid,gid} is not 65534"),
+            None => return TestResult::Fail("kernel/overflow{uid,gid} is missing"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_overflow_ids);
 
 fn smoke_kernel_core_pattern_rw() -> TestResult {
     register_all();
