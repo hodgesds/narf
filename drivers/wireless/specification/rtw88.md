@@ -552,8 +552,10 @@ admitted only by `rtw88/rtw8822be-channelNN-v1-<mac>.bin`: the generic
 shared per-primary `Kind`, and a request that additionally hashes
 `channel_policy::SOURCE8822B` (the B22 program below). It binds
 `Gate::base_request`, which for B22 is the exact `N2BS` request (identity,
-MAC, `rtw8822be-station-v1` filename); continuation requests over a bound
-record are channel-scoped (`rtw8822be-chNN-station-...`) as for C21/C22.
+MAC, `rtw8822be-station-v1` filename); continuation requests
+(`Gate::extension_request`) bind the `N2BL` request over that base and,
+over a bound record, are channel-scoped (`rtw8822be-chNN-legacy-wmm-...`)
+exactly as `Gate::extension_base` scopes it, as for C21/C22.
 Payload: the N2xO header fields (primary, width 20, antenna gain, ceiling,
 three peaks), path-A TXAGC indices DESC_RATE 0..11 at 14..26 and path-B at
 36..48 (both ≤ 0x3f; CCK zero on 5GHz), gains/OFDM-reference/difference

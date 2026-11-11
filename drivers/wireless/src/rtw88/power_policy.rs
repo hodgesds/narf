@@ -1072,8 +1072,14 @@ impl Gate {
     /// Identity every continuation program is qualified over: the exact
     /// base, channel-scoped by the bound N2xO record off channel 1.
     pub(super) fn extension_request(&self) -> Option<super::station_profile::Request> {
-        self.base_request()
-            .map(|b| scoped(b, self.did(), self.channel.as_deref()))
+        // B22's unscoped base is the N2BS station record (what N2BO binds);
+        // its continuations bind the N2BL request over it, exactly as
+        // `ExtensionBase::request` scopes it.
+        let base = match &self.scope {
+            Scope::B22(grant, _) => Some(grant.extension_request()),
+            _ => self.base_request(),
+        };
+        base.map(|b| scoped(b, self.did(), self.channel.as_deref()))
     }
     /// The unscoped base (N22Cv2/N21S) request, which N2xO records bind.
     pub(super) fn base_request(&self) -> Option<super::station_profile::Request> {
