@@ -2595,13 +2595,22 @@ fn smoke_ath11k_ahb_live_wcn6750_wlfw_server() -> TestResult {
     // the future — so the poll loop lives in its own block, and the
     // borrow ends at the block's close, before anything below reads
     // `live` again.
+    //
+    // The core half has no CE target behind it, so `core_start` fails
+    // on its HTC/WMI timeouts. Those are measured on the fixture clock,
+    // but each wait slice is a real `CeIrqWait` sleep of up to
+    // `CORE_SLICE_MS` unless a CE / DP interrupt is pending — so the
+    // bound is real time (generous, a hang detector), not a poll count:
+    // how much real time a fixed number of polls covers depends on the
+    // poll cost and on interrupt state other tests leave behind.
     let mut server: Option<GlinkWlfwServer<'_>> = None;
     let out = {
         let mut fut = pin!(bring_up(&p, &mut *live));
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut out = None;
-        for _ in 0..200_000 {
+        let give_up = super::super::ce::monotonic_ms() + 30_000;
+        while super::super::ce::monotonic_ms() < give_up {
             if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
                 out = Some(v);
                 break;
