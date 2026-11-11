@@ -49,6 +49,15 @@ main() {
   HTTP_PORT=42080 TLS_PORT=42443 UDP_PORT=42053
   SSH_VIRTIO=42222 SSH_E1000=42223 IN_VIRTIO=42301 IN_E1000=42302
 
+  # One run at a time per worktree: every run boots the same scratch disk
+  # (target/narf-cachyos-root-rw.img, re-copied at the start of each run) and
+  # binds the same localhost ports.
+  mkdir -p "$WORK"
+  exec 7> "$WORK/.run.lock"
+  if ! flock -n 7; then
+    echo "run-soak: another soak run is using this worktree; waiting for it" >&2
+    flock 7
+  fi
   rm -rf "$RUN"
   mkdir -p "$RUN" "$WORK/bin" "$WORK/ssh" "$WORK/tls" "$WORK/tree"
   cd "$ROOT"
