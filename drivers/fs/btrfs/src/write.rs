@@ -10215,6 +10215,12 @@ pub(crate) fn root_rw_grow<'a, B: BlockDevice + 'static>(
 /// free-space leaf counts are resolved by the same fixed point [`commit_txn`]
 /// uses. `NoSpace` when the device (or system chunk) has no room.
 pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<(), FsError> {
+    // The growth rewrites the free-space tree with the new group's range; a
+    // filesystem without one (mixed groups written through the bump
+    // allocator) cannot grow here, and its caller is out of space.
+    if vol.superblock().compat_ro_flags & format::COMPAT_RO_FREE_SPACE_TREE == 0 {
+        return Err(FsError::NoSpace);
+    }
     grow_or_balance(vol, None, None).await.map(|_| ())
 }
 

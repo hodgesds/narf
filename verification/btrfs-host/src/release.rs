@@ -1043,6 +1043,163 @@ fn readonly_snapshot(args: &Args) -> Result<String, String> {
     ))
 }
 
+/// Every extent of `img` in a block group of its own type: tree blocks
+/// (`METADATA_ITEM`, or an `EXTENT_ITEM` flagged `TREE_BLOCK`) in METADATA
+/// or SYSTEM groups, data in DATA groups; a mixed group takes both. From
+/// Linux's own dump of the extent tree. Returns how many were checked.
+fn extents_in_their_groups(img: &Path) -> Result<usize, String> {
+    let out = linux::btrfs()
+        .args(["inspect-internal", "dump-tree", "-t", "extent"])
+        .arg(img)
+        .output()
+        .map_err(|e| format!("dump-tree: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    // (start, end, flags line), then (bytenr, is tree block).
+    let mut groups: Vec<(u64, u64, String)> = Vec::new();
+    let mut extents: Vec<(u64, bool)> = Vec::new();
+    let num = |w: &str| {
+        w.trim_matches(|c: char| !c.is_ascii_digit())
+            .parse::<u64>()
+            .ok()
+    };
+    for (i, line) in lines.iter().enumerate() {
+        let Some(at) = line.find("key (") else {
+            continue;
+        };
+        let words: Vec<&str> = line[at + 5..].split_whitespace().collect();
+        if words.len() < 3 {
+            continue;
+        }
+        let (Some(start), Some(third)) = (num(words[0]), num(words[2])) else {
+            continue;
+        };
+        let next = lines.get(i + 1).copied().unwrap_or("");
+        match words[1] {
+            "BLOCK_GROUP_ITEM" => groups.push((start, start + third, next.to_string())),
+            "METADATA_ITEM" => extents.push((start, true)),
+            "EXTENT_ITEM" => extents.push((start, next.contains("TREE_BLOCK"))),
+            _ => {}
+        }
+    }
+    if groups.is_empty() || extents.is_empty() {
+        return Err("no block groups or extents in the dump".into());
+    }
+    for &(bytenr, tree) in &extents {
+        let Some((_, _, flags)) = groups.iter().find(|(s, e, _)| bytenr >= *s && bytenr < *e)
+        else {
+            return Err(format!("extent {bytenr} lies in no block group"));
+        };
+        let fits = if tree {
+            flags.contains("METADATA") || flags.contains("SYSTEM")
+        } else {
+            flags.contains("DATA")
+        };
+        if !fits {
+            return Err(format!(
+                "{} at {bytenr} lies in a block group of the wrong type ({})",
+                if tree {
+                    "a tree block"
+                } else {
+                    "a data extent"
+                },
+                flags.trim()
+            ));
+        }
+    }
+    Ok(extents.len())
+}
+
+/// A filesystem without a free-space tree — mixed block groups, the only
+/// shape of one the read-write gate lets NARF write — goes through the bump
+/// allocator (the default profile; `root-rw` requires the tree). That
+/// allocator answered "infinitely much free" to the batch's reservation
+/// check, so a batch took operations until its commit found no room and
+/// lost all of them. Here files are created, written and unlinked until the
+/// filesystem says no: every operation must succeed or be refused with
+/// ENOSPC, every commit must land, the filesystem stay writable,
+/// `btrfs check` pass, and every extent lie in a block group of its type.
+fn no_free_space_tree(args: &Args) -> Result<String, String> {
+    let dir = args.workdir.join("release-no-fst");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let rootdir = dir.join("rootdir");
+    std::fs::create_dir_all(rootdir.join("@")).unwrap();
+    std::fs::create_dir_all(rootdir.join("@home")).unwrap();
+    let img = dir.join("release.img");
+    fixture::mkfs(
+        &img,
+        &rootdir,
+        &fixture::MkfsSpec {
+            uuid: "c4c405ee-0000-4a11-9e57-4e1e000000f5",
+            size: 128 << 20,
+            // Mixed block groups need nodesize = sectorsize.
+            nodesize: 4096,
+            csum: "crc32c",
+            features: "mixed-bg,no-holes,^free-space-tree,^block-group-tree",
+        },
+    )?;
+    let (fsid, nodesize, _) = dev::image_identity(&img);
+    let dev = Arc::new(RecDev::open(&img, 512, fsid, nodesize));
+    let fs = narf::mount_default(dev, &fsid, "@")?;
+    let top = block_on(fs.root().mkdir("churn")).map_err(err("mkdir"))?;
+    let mut done = 0usize;
+    let mut refused = None;
+    for i in 0..4000usize {
+        let name = format!("f{i}");
+        let r: Result<(), FsError> = block_on(async {
+            let file = top.create(&name).await?;
+            file.write(0, &noise(i as u64, 3000 + (i % 7) * 9000))
+                .await?;
+            drop(file);
+            // Every third file stays: the filesystem fills.
+            if i % 3 != 0 {
+                top.unlink(&name).await?;
+            }
+            if i % 50 == 49 {
+                top.fsync(false).await?;
+            }
+            Ok(())
+        });
+        match r {
+            Ok(()) => done += 1,
+            Err(error) => {
+                refused = Some(error);
+                break;
+            }
+        }
+    }
+    let synced = block_on(top.fsync(false));
+    let writable = !fs.always_read_only();
+    drop(top);
+    drop(fs);
+    narf::reset();
+    if let Some(error) = &refused {
+        if *error != FsError::NoSpace {
+            return Err(format!(
+                "no free-space tree: operation {done} failed with {error:?}, not ENOSPC"
+            ));
+        }
+    }
+    if synced.is_err() || !writable {
+        return Err(format!(
+            "no free-space tree: the last commit {synced:?}, writable {writable}: operations reported successful were lost"
+        ));
+    }
+    linux::check(&img, false).map_err(|e| format!("no free-space tree: {e}"))?;
+    let checked = extents_in_their_groups(&img).map_err(|e| format!("no free-space tree: {e}"))?;
+    if !args.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(format!(
+        "    no free-space tree, mixed groups (bump allocator): {done} files before {}; every commit landed, btrfs check clean, {checked} extents each in a block group of its type",
+        match refused {
+            Some(_) => "ENOSPC",
+            None => "the end of the run",
+        }
+    ))
+}
+
 pub fn run(args: &Args) -> Result<String, String> {
     let t0 = Instant::now();
     let mut lines = vec![reservation(args)?];
@@ -1227,6 +1384,7 @@ pub fn run(args: &Args) -> Result<String, String> {
     }
     lines.push(dir_orphan(args)?);
     lines.push(readonly_snapshot(args)?);
+    lines.push(no_free_space_tree(args)?);
     Ok(format!(
         "release: OK\n{}\n    btrfs check clean (also --check-data-csum), no orphan item left, files empty or gone after a remount; {:.0?}",
         lines.join("\n"),

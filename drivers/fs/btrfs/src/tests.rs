@@ -17,6 +17,7 @@ use crate::chunk::ChunkMap;
 use crate::format::{self, BtrfsKey, Superblock};
 use crate::volume::BtrfsVolume;
 
+mod admitted_ops;
 mod batch_commit;
 mod cache_bounds;
 mod commit_scale;
