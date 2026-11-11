@@ -429,7 +429,17 @@ fn smoke_rtl8188ee_registered_asset_denial_precedes_attempt_and_same_owner_retri
     let owner = Owner::new(io.clone(), super::super::regs::RTL_DEV_8188EE);
     let (write, read) = narf_firmware::bootstrap_authority();
     let name = "narf-test/rtlwifi/deferred-ee.bin";
+    // rtl8188ee/sw.c names exactly rtlwifi/rtl8188efw.bin; the production
+    // gate refuses any other registry name before touching the registry
+    // or the device.
     if narf_scheduler::block_on(owner.initialize_registered_from(&read, name))
+        != Err(Error::Unsupported)
+        || owner.status().stage != Stage::Detected
+        || !io.0.lock().ops.is_empty()
+    {
+        return TestResult::Fail("EE firmware name gate admitted a non-production image name");
+    }
+    if narf_scheduler::block_on(owner.initialize_registered_fixture(&read, name))
         != Err(Error::Firmware(narf_firmware::FirmwareError::NotFound))
         || owner.status().stage != Stage::Detected
         || !io.0.lock().ops.is_empty()
@@ -440,7 +450,7 @@ fn smoke_rtl8188ee_registered_asset_denial_precedes_attempt_and_same_owner_retri
     }
     crate::firmware_asset::tests::install(&write, name, &image(17), true).unwrap();
     read.revoke();
-    if narf_scheduler::block_on(owner.initialize_registered_from(&read, name))
+    if narf_scheduler::block_on(owner.initialize_registered_fixture(&read, name))
         != Err(Error::Firmware(
             narf_firmware::FirmwareError::AuthorityRevoked,
         ))
@@ -450,7 +460,7 @@ fn smoke_rtl8188ee_registered_asset_denial_precedes_attempt_and_same_owner_retri
         return TestResult::Fail("revoked registered EE authority consumed pre-attempt owner");
     }
     let (_, fresh) = narf_firmware::bootstrap_authority();
-    if narf_scheduler::block_on(owner.initialize_registered_from(&fresh, name)).is_err()
+    if narf_scheduler::block_on(owner.initialize_registered_fixture(&fresh, name)).is_err()
         || owner.status().stage != Stage::Ready
     {
         return TestResult::Fail(
@@ -459,7 +469,7 @@ fn smoke_rtl8188ee_registered_asset_denial_precedes_attempt_and_same_owner_retri
     }
     let before = io.0.lock().ops.len();
     fresh.revoke();
-    if narf_scheduler::block_on(owner.initialize_registered_from(&fresh, name))
+    if narf_scheduler::block_on(owner.initialize_registered_fixture(&fresh, name))
         != Err(Error::AlreadyStarted)
         || io.0.lock().ops.len() != before
     {
