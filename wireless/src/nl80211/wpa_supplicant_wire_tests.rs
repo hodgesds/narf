@@ -399,3 +399,50 @@ kernel_test_in!(
     "wireless/nl80211/wpa_supplicant",
     smoke_nl80211_wpa_supplicant_2_12_sae_offload_connect_on_the_wire
 );
+
+/// wpa_supplicant reconnecting (another BSS of the ESS, or the same one)
+/// while the wiphy is connected: `cfg80211_connect` refuses a CONNECT on a
+/// connected station with -EALREADY unless the driver reassociates, and
+/// `wpa_driver_nl80211_connect` answers that with DISCONNECT and a second
+/// CONNECT. A non-roaming offload driver (MT7921/MT7922) must get that
+/// errno, not a failed CONNECT event while its old link stays up.
+fn smoke_nl80211_wpa_supplicant_connect_while_connected_is_ealready() -> TestResult {
+    let connected = ConnectCaps {
+        connected: true,
+        ..offload_wiphy()
+    };
+    let roaming = ConnectCaps {
+        roam: true,
+        ..connected
+    };
+    let wire = connect(7, &[AKM_PSK]);
+    if parse(&wire, connected).err() != Some(EALREADY)
+        || parse(
+            &sae_connect(7, 4),
+            ConnectCaps {
+                sae_offload: true,
+                ..connected
+            },
+        )
+        .err()
+            != Some(EALREADY)
+    {
+        return TestResult::Fail("CONNECT on a connected non-roaming wiphy was not -EALREADY");
+    }
+    if !matches!(parse(&wire, roaming), Ok(Operation::Connect { .. }))
+        || !matches!(parse(&wire, offload_wiphy()), Ok(Operation::Connect { .. }))
+    {
+        return TestResult::Fail("CONNECT refused on a roaming or disconnected wiphy");
+    }
+    // Malformed requests keep their own errno ahead of the state check.
+    let mut bad = wire.clone();
+    push_attr(&mut bad, 66, &3u32.to_ne_bytes()); // USE_MFP out of range
+    if parse(&bad, connected) != Err(ERANGE) {
+        return TestResult::Fail("connected state masked an invalid CONNECT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "wireless/nl80211/wpa_supplicant",
+    smoke_nl80211_wpa_supplicant_connect_while_connected_is_ealready
+);

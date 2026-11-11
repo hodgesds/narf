@@ -3835,6 +3835,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
         self.associate_from(req, ConnectOrigin::Nl80211).await
     }
 
+    fn supports_roam(&self) -> bool {
+        true
+    }
+
     async fn roam(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         if self.shared.is_dead() {
             return Err(WirelessError::HardwareError);
