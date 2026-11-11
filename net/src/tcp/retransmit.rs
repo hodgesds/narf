@@ -156,6 +156,21 @@ impl RttEstimator {
         true
     }
 
+    /// Take back the back-off `before` describes, as `(rto_ns,
+    /// backoff_count)` read just ahead of [`Self::back_off_with_limit`].
+    ///
+    /// Linux `tcp_retransmit_timer` leaves through `goto out` before
+    /// `icsk_backoff++` when the local device would not take the
+    /// retransmission: nothing was sent, so the peer was not given another
+    /// chance and the attempt must not count toward giving up. Does nothing
+    /// if the estimator moved since (an RTT sample reset it).
+    pub fn undo_back_off(&mut self, before: (u64, u32)) {
+        if self.backoff_count == before.1.saturating_add(1) {
+            self.rto_ns = before.0;
+            self.backoff_count = before.1;
+        }
+    }
+
     /// Reset to "as new" — for connection close / reopen.
     pub fn reset(&mut self) {
         *self = Self::new();

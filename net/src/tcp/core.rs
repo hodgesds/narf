@@ -3382,8 +3382,9 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     let Some(seg) = oldest else { return };
 
     // Back-off; tear down if exceeded.
-    let backoff_ok = {
+    let (backoff_ok, before_backoff) = {
         let mut t = arc.lock();
+        let before_backoff = (t.rtt.rto_ns, t.rtt.backoff_count);
         let limit = if matches!(t.state, TcpState::SynSent | TcpState::SynReceived) {
             t.syn_retries as u32
         } else {
@@ -3413,7 +3414,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             t.send_buf.rewind_for_retransmit();
             t.snd_nxt = t.snd_una;
         }
-        ok
+        (ok, before_backoff)
     };
     if !backoff_ok {
         // Linux `tcp_write_err`: the soft (ICMP) error if one was seen,
@@ -3497,7 +3498,13 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // `tcp_retransmit_timer`: "Retransmission failed because of
             // local congestion, let senders fight for local resources
             // conservatively" — retry after TCP_RESOURCE_PROBE_INTERVAL,
-            // or the RTO if that is sooner.
+            // or the RTO if that is sooner. Linux leaves before
+            // `icsk_backoff++`: the peer never saw this attempt, so it
+            // neither doubles the RTO nor counts toward giving up. Counting
+            // it reset a healthy connection after eight probes — 3.5 s of a
+            // stalled or down device.
+            t.rtt.undo_back_off(before_backoff);
+            t.rto_count = t.rto_count.saturating_sub(1);
             let probe = t.rtt.current_rto().min(TCP_RESOURCE_PROBE_INTERVAL_NS);
             t.retx_deadline_cycles = narf_scheduler::narf_time::now_cycles()
                 .wrapping_add(narf_scheduler::narf_time::ns_to_cycles(probe));

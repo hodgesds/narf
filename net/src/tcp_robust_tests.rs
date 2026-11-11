@@ -1778,6 +1778,63 @@ kernel_test_in!(
     smoke_tx_refused_ack_is_retried_from_delayed_ack_timer
 );
 
+/// A device that takes nothing — stalled, link down, being reset — refuses
+/// every RTO retransmission. Linux retries those every
+/// TCP_RESOURCE_PROBE_INTERVAL without counting them (`tcp_retransmit_timer`
+/// leaves before `icsk_backoff++`). Counting them reset the connection after
+/// eight probes, 3.5 s into the stall.
+fn smoke_tx_refused_rto_retransmission_is_not_an_attempt() -> TestResult {
+    let (_nic, id, _) = backpressure_conn("txbp7", [10, 101, 0, 1], 7_928);
+    let Some(arc) = lookup_tcb(id) else {
+        return TestResult::Fail("connection vanished");
+    };
+    if send(id, &pattern(1000)) != Ok(1000) {
+        return TestResult::Fail("the segment was not sent");
+    }
+    let before = __with_tcb(id, |t| (t.rtt.rto_ns, t.rtt.backoff_count)).unwrap_or((0, 9));
+    CAPTURE_REFUSES.store(true, ::core::sync::atomic::Ordering::SeqCst);
+    for _ in 0..20 {
+        let _ = __with_tcb_mut(id, |t| t.retx_deadline_cycles = 1);
+        tick_retransmit(&arc);
+    }
+    CAPTURE_REFUSES.store(false, ::core::sync::atomic::Ordering::SeqCst);
+    let now = narf_scheduler::narf_time::now_cycles();
+    let Some((state, estimator, deadline)) = __with_tcb(id, |t| {
+        (
+            t.state,
+            (t.rtt.rto_ns, t.rtt.backoff_count),
+            t.retx_deadline_cycles,
+        )
+    }) else {
+        return TestResult::Fail("refused retransmissions reset the connection");
+    };
+    if state != TcpState::Established {
+        return TestResult::Fail("refused retransmissions closed the connection");
+    }
+    if estimator != before {
+        return TestResult::Fail("a refused retransmission backed the RTO off or was counted");
+    }
+    let probe = narf_scheduler::narf_time::ns_to_cycles(500_000_000);
+    if deadline == 0 || deadline.saturating_sub(now) > probe {
+        return TestResult::Fail("the next probe is not within TCP_RESOURCE_PROBE_INTERVAL");
+    }
+    // Once the device takes it, the retransmission goes out and is counted.
+    let _ = drain();
+    let _ = __with_tcb_mut(id, |t| t.retx_deadline_cycles = 1);
+    tick_retransmit(&arc);
+    if !drain().iter().any(|f| frame_payload_len(f) == 1000) {
+        return TestResult::Fail("the retransmission was not sent once the device took it");
+    }
+    if __with_tcb(id, |t| t.rtt.backoff_count) != Some(before.1 + 1) {
+        return TestResult::Fail("an accepted retransmission was not counted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_tx_refused_rto_retransmission_is_not_an_attempt
+);
+
 // ── Receive batches (`iface::rx_batch`) ─────────────────────────────────
 
 /// An Ethernet ARP request from `peer` for `target`.
