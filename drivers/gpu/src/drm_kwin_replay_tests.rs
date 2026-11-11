@@ -615,3 +615,46 @@ kernel_test_in!(
     "drivers/gpu/drm/kwin_replay",
     device_files_report_their_memory_in_fdinfo
 );
+
+/// An allocation the heap cannot hold, through the device file: the
+/// client gets its errno, the card counts the failure (and reports the
+/// heap), and the ioctl is named in the log as one that failed for lack
+/// of memory. None of it is silent.
+fn a_refused_allocation_is_counted_and_named() -> TestResult {
+    let Some(f) = Fixture::new(1) else {
+        return TestResult::Fail("fixture");
+    };
+    let Some(client) = DriCardFile::new(f.index) else {
+        return TestResult::Fail("open");
+    };
+    // Two pages of VRAM-only DISCARDABLE memory on a one-page heap: no
+    // GTT fallback (amdgpu_bo_create), nothing to evict.
+    let mut req = [0u8; 32];
+    req[..8].copy_from_slice(&(2 * PAGE).to_le_bytes());
+    req[16..24]
+        .copy_from_slice(&u64::from(crate::amdgpu_uapi::AMDGPU_GEM_DOMAIN_VRAM).to_le_bytes());
+    req[24..32].copy_from_slice(
+        &u64::from(crate::amdgpu_uapi::AMDGPU_GEM_CREATE_DISCARDABLE).to_le_bytes(),
+    );
+    let before = req;
+    let failures = crate::amdgpu_gem::accounting::failures(f.index);
+    if ioctl(&client, 0xc020_6440, req.as_mut_ptr() as usize) != Err(FsError::NoSpace)
+        || req != before
+    {
+        return TestResult::Fail("the allocation was not refused cleanly");
+    }
+    if crate::amdgpu_gem::accounting::failures(f.index) != failures + 1 {
+        return TestResult::Fail("the refused allocation was not counted");
+    }
+    if !crate::drm_ioctl_bridge::drm_fd_failure_noted(0x40) {
+        return TestResult::Fail("the failing ioctl was not named");
+    }
+    if f.vram_used() != 0 || f.fbs() != 0 {
+        return TestResult::Fail("the refused allocation left something behind");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm/kwin_replay",
+    a_refused_allocation_is_counted_and_named
+);
