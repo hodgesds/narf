@@ -35,7 +35,7 @@ D=/run/narf-soak
 : "${SOAK_TLS_PORT:=42443}" "${SOAK_UDP_PORT:=42053}" "${SOAK_LISTEN_PORT:=5201}"
 : "${SOAK_VIRTIO_NET:=10.0.2}" "${SOAK_E1000_NET:=10.0.3}" "${SOAK_POWEROFF:=1}"
 : "${SOAK_DROP_SECS:=30}" "${SOAK_BIG_MB:=0}" "${SOAK_XFER_MB:=100}"
-: "${SOAK_DIRECTED:=1}" "${SOAK_DIRTYEXIT:=0}"
+: "${SOAK_DIRECTED:=1}" "${SOAK_DIRTYEXIT:=0}" "${SOAK_SHARED_MAPS:=1}"
 # <MiB>:<exit|kill> rounds of a process that dies with dirty shared pages.
 : "${SOAK_EXITWB:=8:exit 32:exit 32:kill}"
 # <window seconds>:<dirty MiB>:<forks per second> rounds of the forking parent.
@@ -311,8 +311,8 @@ w_trees() {
   local n=0
   while ((SECONDS < END)); do
     rg -c 'unsafe' "$TREE" > /dev/null
-    git -C "$TREE" status --short > /dev/null || return 1
-    git -C "$TREE" grep -c 'spin_lock' > /dev/null
+    git -c safe.directory="$TREE" -C "$TREE" status --short > /dev/null || return 1
+    git -c safe.directory="$TREE" -C "$TREE" grep -c spin_lock > /dev/null
     find "$TREE" -type f -name '*.rs' -size +4k > /dev/null
     grep -r -l 'narf_scheduler' "$TREE/drivers" > /dev/null
     pacman -Qk > /dev/null 2>&1
@@ -322,13 +322,14 @@ w_trees() {
 }
 
 w_journal() {
-  local n=0 pad
+  local n=0 pad i
   pad=$(printf 'x%.0s' {1..300})
   while ((SECONDS < END)); do
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      n=$((n + 1))
-      printf 'soak journal line %s %s\n' "$n" "$pad"
+    # The loop body is one side of a pipe, so it cannot count for us.
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      printf 'soak journal line %s %s\n' "$((n + i))" "$pad"
     done | systemd-cat -t narf-soak || return 1
+    n=$((n + 10))
     ((n % 500 == 0)) && { journalctl -n 20 --no-pager > /dev/null || return 1; }
     hb journal "$n"
     nap 0.2
@@ -415,7 +416,7 @@ w_killtools() {
       3) rg -c fn "$TREE" > /dev/null & ;;
       4) sha256sum "$W/big.bin" > /dev/null & ;;
       5) cp -r "$TREE/userspace" "$W/kill/cp$((n % 3))" 2> /dev/null & ;;
-      6) git -C "$TREE" status > /dev/null 2>&1 & ;;
+      6) git -c safe.directory="$TREE" -C "$TREE" status > /dev/null 2>&1 & ;;
     esac
     pid=$!
     nap "0.$((RANDOM % 9))$((RANDOM % 10))"
@@ -561,11 +562,13 @@ five_times() {
 journal_fill() { # MiB
   local n=0 pad lines=$(($1 * 2048))
   pad=$(printf 'x%.0s' {1..440})
+  local i
   while ((n < lines)); do
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-      n=$((n + 1))
-      printf 'soak journal fill %s %s\n' "$n" "$pad"
+    # The loop body is one side of a pipe, so it cannot count for us.
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+      printf 'soak journal fill %s %s\n' "$((n + i))" "$pad"
     done | systemd-cat -t narf-soak-fill
+    n=$((n + 16))
   done
   journalctl --disk-usage --no-pager
 }
@@ -585,7 +588,7 @@ directed() {
   episode read-4x64m dd if="$W/ep/w2" of=/dev/null bs=64M
   episode cp-256m cp --reflink=never "$W/ep/w1" "$W/ep/copy"
   episode sha256-256m sha256sum "$W/ep/w3"
-  episode git-status git -C "$TREE" status --short
+  episode git-status git -c safe.directory="$TREE" -C "$TREE" status --short
   episode rg-tree rg -c unsafe "$TREE"
   episode truncate-256m truncate -s 0 "$W/ep/w3"
   episode unlink-256m rm -f "$W/ep/w1"
@@ -770,9 +773,13 @@ HEAVY_END=$((SECONDS + SOAK_HEAVY_SECS))
 stamp
 say "SOAK-PHASE heavy up=$UP"
 NATIVE_SECS=$((SOAK_SECS > 60 ? SOAK_SECS - 25 : SOAK_SECS))
-worker shared-tmp "$NATIVE" shared "$NATIVE_SECS" 3 12 "$W/shared" "$HB/shared-tmp"
-worker shared-home "$NATIVE" shared "$NATIVE_SECS" 2 16 /home/narf/soak-shared "$HB/shared-home"
-worker killstorm "$NATIVE" killstorm "$NATIVE_SECS" 10 "$W/big.bin" "$TREE" "$W/scratch" "$HB/killstorm"
+# SOAK_SHARED_MAPS=0 leaves out the workers that dirty shared file mappings
+# and die with them, to see what the rest of the load does on its own.
+if [ "$SOAK_SHARED_MAPS" = 1 ]; then
+  worker shared-tmp "$NATIVE" shared "$NATIVE_SECS" 3 12 "$W/shared" "$HB/shared-tmp"
+  worker shared-home "$NATIVE" shared "$NATIVE_SECS" 2 16 /home/narf/soak-shared "$HB/shared-home"
+  worker killstorm "$NATIVE" killstorm "$NATIVE_SECS" 10 "$W/big.bin" "$TREE" "$W/scratch" "$HB/killstorm"
+fi
 worker mmapfault "$NATIVE" mmapfault "$NATIVE_SECS" 4 "$W/big.bin" "$HB/mmapfault"
 worker readtree "$NATIVE" readtree "$NATIVE_SECS" 4 "$TREE" "$HB/readtree"
 worker lookups "$NATIVE" lookups "$NATIVE_SECS" 6 "$TREE" "$HB/lookups"

@@ -541,7 +541,8 @@ static void op_exec(void) {
         execl("/usr/bin/rg", "rg", "-c", "unsafe", g_tree, (char *)NULL);
         break;
     case 2:
-        execl("/usr/bin/git", "git", "-C", g_tree, "status", "--short", (char *)NULL);
+        execl("/usr/bin/git", "git", "-c", "safe.directory=*", "-C", g_tree, "status", "--short",
+              (char *)NULL);
         break;
     case 3:
         execl("/usr/bin/python3", "python3", "-c", "import ssl, json, subprocess, socket",
