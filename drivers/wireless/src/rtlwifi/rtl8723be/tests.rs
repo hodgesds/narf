@@ -1264,7 +1264,9 @@ impl Io for RegLog {
 }
 fn reg_log() -> RegLog {
     RegLog(IrqSafeSpinLock::new(RegLogModel {
-        regs: vec![0u8; 0x800],
+        // Through the BB page: the coexistence halt/antenna steps write
+        // `0x948` (`btc8723b2ant_set_ant_path`).
+        regs: vec![0u8; 0x1000],
         writes: Vec::new(),
     }))
 }
