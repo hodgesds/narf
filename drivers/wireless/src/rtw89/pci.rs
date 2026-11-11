@@ -381,6 +381,14 @@ unsafe fn bring_up_registers(
     })
 }
 
+/// What frees a CH12 buffer: an H2C with an ack identity is held
+/// until its C2H ack; FWDL header / section packets have no ack and
+/// are freed on TXBD consumption (`fwdl` picks the RPKT type).
+enum FwcmdHold {
+    Ack(super::fwcmd_8922a::FramedH2c),
+    Consumed { fwdl: bool },
+}
+
 fn rtw89_isr() {
     // Completion handling deferred to pumps.
 }
@@ -680,14 +688,37 @@ impl Rtw89Device {
     ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
         crate::rtw88::pci_park::invoke(&self.cap, || {
             // SAFETY: caller's live initialized ring/no-reset contract.
-            unsafe { self.submit_be_h2c_authorized(framed, buf) }
+            unsafe { self.submit_fwcmd_authorized(FwcmdHold::Ack(framed), buf) }
         })
         .map_err(|_| super::prepared_8922a::Error::Authority)?
     }
 
-    unsafe fn submit_be_h2c_authorized(
+    /// BE firmware-download submit (`rtw89_h2c_tx`, `core.c:1336`):
+    /// one FWHDR_DL command (`fwdl = false`, RPKT type H2C) or one
+    /// raw section packet (`fwdl = true`, RPKT type FWDL) across
+    /// CH12. Neither has a firmware ack, so the owner frees the
+    /// buffer once the chip consumes its TXBD
+    /// (`Prepared8922a::reclaim_fwcmd`).
+    ///
+    /// # Safety
+    /// Rings programmed through the Prepared owner, WCPU held in
+    /// firmware-download mode (`fwdl_be::enable_wcpu`), no
+    /// reset/removal racing.
+    pub(super) unsafe fn submit_be_fwdl(
         &self,
-        framed: super::fwcmd_8922a::FramedH2c,
+        buf: &[u8],
+        fwdl: bool,
+    ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live ring/FWDL-mode contract.
+            unsafe { self.submit_fwcmd_authorized(FwcmdHold::Consumed { fwdl }, buf) }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn submit_fwcmd_authorized(
+        &self,
+        hold: FwcmdHold,
         buf: &[u8],
     ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
         use super::dma::{TxBd, DEFAULT_TXBD_NUM, TXCH_CH12};
@@ -695,16 +726,18 @@ impl Rtw89Device {
         use super::prepared_8922a::Error;
         use super::tx_8922a::BUFFER_DMA_MASK;
         // `rtw89_pci_fwcmd_submit` (pci.c:1551): the 24-byte BE FWCMD
-        // descriptor (dword0 = H2C length | RPKT_TYPE_H2C) precedes the
-        // framed H2C in the same DMA buffer the TXBD points at.
-        let desc = fwcmd_txdesc(buf.len(), false)
+        // descriptor (dword0 = length | RPKT_TYPE H2C or FWDL)
+        // precedes the payload in the same DMA buffer the TXBD
+        // points at.
+        let fwdl = matches!(hold, FwcmdHold::Consumed { fwdl: true });
+        let desc = fwcmd_txdesc(buf.len(), fwdl)
             .ok_or(Error::Transport(super::tx_8922a::Error::BadFrame))?;
         let total = FWCMD_TXDESC_LEN + buf.len();
         let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
         let dma_buf = alloc_coherent_masked(total, DomainId::DRIVER_0, BUFFER_DMA_MASK)
             .map_err(|_| Error::NoMemory)?;
         // SAFETY: fresh owned allocation covers exactly `total` bytes:
-        // the descriptor then the framed H2C.
+        // the descriptor then the payload.
         unsafe {
             core::ptr::copy_nonoverlapping(desc.as_ptr(), dma_buf.as_mut_ptr(), FWCMD_TXDESC_LEN);
             core::ptr::copy_nonoverlapping(
@@ -714,7 +747,13 @@ impl Rtw89Device {
             );
         }
         dma_buf.sync(0, total);
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
         let mut owner = owner_lock.lock();
+        // `rtw89_h2c_tx`: reclaim consumed CH12 buffers first and
+        // refuse when no TXBD is free (-ENOSPC in Linux).
+        if owner.reclaim_fwcmd(regs)? == 0 {
+            return Err(Error::Transport(super::tx_8922a::Error::Full));
+        }
         let ring_dma = &self.tx_ring_dma[TXCH_CH12 as usize];
         // SAFETY: same ring-slice contract as `submit_be_data_authorized`.
         let bd = unsafe {
@@ -724,13 +763,18 @@ impl Rtw89Device {
             )
         };
         let prepared = owner.prepare_h2c(bd, dma_buf.dma_addr().raw(), total)?;
-        owner.retain_h2c(framed, dma_buf);
+        match hold {
+            FwcmdHold::Ack(framed) => {
+                owner.retain_h2c(framed, dma_buf);
+                owner.retain_fwcmd(None);
+            }
+            FwcmdHold::Consumed { .. } => owner.retain_fwcmd(Some(dma_buf)),
+        }
         ring_dma.sync(
             prepared.slot as usize * core::mem::size_of::<TxBd>(),
             core::mem::size_of::<TxBd>(),
         );
         native_dma_barrier();
-        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
         owner.kick_h2c(regs, &prepared)?;
         Ok(prepared)
     }

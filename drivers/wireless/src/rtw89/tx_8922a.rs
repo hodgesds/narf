@@ -520,4 +520,47 @@ impl H2cTx {
         doorbell_tx(regs, 12, self.state.wp).map_err(|_| Error::BadChannel)?;
         Ok(self.state.wp)
     }
+
+    /// Free CH12 TXBDs (`rtw89_pci_get_avail_txbd_num`, one slot
+    /// reserved to tell full from empty).
+    pub(super) fn avail(&self) -> u16 {
+        self.state.avail()
+    }
+
+    /// Buffers kicked but not yet consumed by the chip.
+    pub(super) fn in_flight(&self) -> u16 {
+        self.state.len - 1 - self.state.avail()
+    }
+
+    /// Re-read the CH12 hardware read pointer and return how many
+    /// TXBDs the chip consumed since the last observation
+    /// (`rtw89_pci_txbd_recalc` → `rtw89_pci_dma_recalc`,
+    /// `pci.c:61..98`). A read pointer that would retire more
+    /// TXBDs than are in flight (or lies outside the ring) is
+    /// refused without moving the cached pointer — Linux trusts
+    /// the register; the host owner fails closed instead.
+    pub(super) fn observe_rp(&mut self, regs: &mut impl Regs) -> Result<u16, Error> {
+        let raw = read_tx_idx(regs, 12).map_err(|_| Error::BadChannel)?;
+        let (cur_rp, _) = split_idx(raw);
+        if cur_rp >= self.state.len {
+            return Err(Error::BadIndex);
+        }
+        let rp = self.state.rp;
+        let cnt = if cur_rp >= rp {
+            cur_rp - rp
+        } else {
+            self.state.len - (rp - cur_rp)
+        };
+        if cnt > self.in_flight() {
+            return Err(Error::BadIndex);
+        }
+        self.state.set_rp(cur_rp);
+        Ok(cnt)
+    }
+
+    /// Forget all ring state (`rtw89_pci_reset_trx_rings` zeroes
+    /// the host WP/RP together with the hardware index).
+    pub(super) fn reset(&mut self) {
+        self.state = RingState::new(self.state.len);
+    }
 }

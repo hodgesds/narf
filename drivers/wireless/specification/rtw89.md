@@ -171,10 +171,18 @@ constant. The BE PCIe FWCMD TX descriptor (`h2c_desc_size` = 24-byte
 `rtw89_rxdesc_short_v2`, dword0 = packet length | `RPKT_TYPE`
 H2C(13)/FWDL(14), `pci.c rtw89_pci_fwcmd_submit`) is
 `fwcmd_8922a::fwcmd_txdesc`, and `pci::submit_be_h2c` now prepends it
-(it previously sent the framed H2C without one). Still open for the
-download itself: a FWDL submit using the FWDL type, CH12 release of
-FWDL buffers on TXBD consumption (no ack exists for them), the BE header `part_size` (`FW_HDR_V1_W7_PART_SIZE`; the
-plan assumes 2020), the BBMCU0 suit, and a production owner that runs
+(it previously sent the framed H2C without one). CH12 now mirrors
+`rtw89_h2c_tx` / `rtw89_pci_fwcmd_submit` / `rtw89_pci_release_fwcmd`:
+every submit first reclaims (`Prepared8922a::reclaim_fwcmd` reads the CH12
+hardware RP, `rtw89_pci_dma_recalc`; an RP past the in-flight window is
+refused) and is refused with no free TXBD (-ENOSPC); kicked buffers queue in
+TXBD order; consumed FWDL header/section buffers (`pci::submit_be_fwdl`,
+RPKT type H2C for FWHDR_DL, FWDL for sections — no ack exists for them) are
+freed beyond the 8-deep `RTW89_PCI_MULTITAG` window; ack-held H2C buffers
+stay with `release_h2c_by_ack`; `program_rings` (the `rtw89_pci_ops_reset`
+point) resets the CH12 host index and releases everything. Still open for
+the download itself: the BE header `part_size` (`FW_HDR_V1_W7_PART_SIZE`;
+the plan assumes 2020), the BBMCU0 suit, and a production owner that runs
 the sequence from `pci::bring_up`.
 
 The plan couples v1 ignored-security descriptor compaction/count with the
