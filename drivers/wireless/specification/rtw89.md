@@ -154,6 +154,29 @@ exposes it to the future download owner. The plan runs once per
 firmware download, never on a packet path (perf class (a): no hot path).
 No missing policy or signature falls back to an unsecured transfer.
 
+**RTL8922A firmware-download preparation (`fwdl_be.rs`, fixture-tested; no
+production caller yet).** The BE register programs between power-on and
+the first FWHDR_DL: `mac_func_en` (`mac_be.c:934 mac_func_en_be`, per-band
+CMAC power/function enable), `partial_init` (`mac.c:4307
+rtw89_mac_partial_init` up to the hci hook: HCI DMA TRX enable,
+`rtw8922a_bb_preinit(PHY_0)` + BB-MCU CR init through the 0x30000 window,
+`hci_func_en_be`, `dmac_func_pre_en_be`, `rtw89_mac_dle_init(DLFW, SCC)`
+with the `rtw8922a_dle_mem_pcie` DLFW table and its FIFO-size check, and
+the h2c-only `rtw89_mac_hfc_init`), `fwdl_preconfig`, `disable_cpu`,
+`enable_wcpu` (`set_cpu_en` + `wcpu_on`, BBMCU0 included since
+`bbmcu_nr = 1`), and the status reads `check_path_ready` /
+`fwdl_status` / `check_ready` (`fwdl_status_map`, `rtw89_fw_check_rdy`).
+`R_BE_SECURE_BOOT_MALLOC_INFO_8922A` is the `rtw89_fw_download_suit`
+constant. The BE PCIe FWCMD TX descriptor (`h2c_desc_size` = 24-byte
+`rtw89_rxdesc_short_v2`, dword0 = packet length | `RPKT_TYPE`
+H2C(13)/FWDL(14), `pci.c rtw89_pci_fwcmd_submit`) is
+`fwcmd_8922a::fwcmd_txdesc`, and `pci::submit_be_h2c` now prepends it
+(it previously sent the framed H2C without one). Still open for the
+download itself: a FWDL submit using the FWDL type, CH12 release of
+FWDL buffers on TXBD consumption (no ack exists for them), the BE header `part_size` (`FW_HDR_V1_W7_PART_SIZE`; the
+plan assumes 2020), the BBMCU0 suit, and a production owner that runs
+the sequence from `pci::bring_up`.
+
 The plan couples v1 ignored-security descriptor compaction/count with the
 same payload selection, strips host dynamic bytes and sets part_size2020.
 B's secure v0 length960 override changes both descriptor and payload; ambiguous

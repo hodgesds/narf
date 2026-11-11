@@ -111,6 +111,7 @@ mod fragment_wire;
 pub mod fw;
 mod fwcmd_8922a;
 pub mod fwdl;
+mod fwdl_be;
 pub mod h2c;
 mod he_htc;
 mod interface;
@@ -322,6 +323,9 @@ mod fwcmd_8922a_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 mod mac_pre_init_8922a_tests;
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod fwdl_be_tests;
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests;

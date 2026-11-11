@@ -163,3 +163,24 @@ fn smoke_rtw89_fwcmd_8922a_ack_match() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwcmd_8922a_ack_match);
+
+fn smoke_rtw89_fwcmd_8922a_txdesc() -> TestResult {
+    // dword0 = len [13:0] | type [29:24]; H2C = 13, FWDL = 14; 24 bytes.
+    let Some(h2c) = fwcmd_txdesc(0x48, false) else {
+        return TestResult::Fail("H2C descriptor refused");
+    };
+    if h2c[..4] != (0x48u32 | (13 << 24)).to_le_bytes() || h2c[4..].iter().any(|b| *b != 0) {
+        return TestResult::Fail("H2C FWCMD descriptor wrong");
+    }
+    let Some(fwdl) = fwcmd_txdesc(2020, true) else {
+        return TestResult::Fail("FWDL descriptor refused");
+    };
+    if fwdl[..4] != (2020u32 | (14 << 24)).to_le_bytes() {
+        return TestResult::Fail("FWDL FWCMD descriptor wrong");
+    }
+    if fwcmd_txdesc(0, false).is_some() || fwcmd_txdesc(0x4000, true).is_some() {
+        return TestResult::Fail("out-of-field lengths must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_fwcmd_8922a_txdesc);

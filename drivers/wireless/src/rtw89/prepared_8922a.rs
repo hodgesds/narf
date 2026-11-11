@@ -239,6 +239,30 @@ impl mac_pre_init_8922a::Regs for MmioRegs<'_> {
     }
 }
 
+/// [`super::fwdl_be::Regs`] over the same BAR2 window, for the BE
+/// firmware-download preparation and WCPU control. Infallible like the
+/// other ports; `R_BE_BOOT_REASON` needs the 16-bit accessors.
+impl super::fwdl_be::Regs for MmioRegs<'_> {
+    fn read16(&mut self, address: u32) -> u16 {
+        // SAFETY: caller's owned-BAR2 contract; `address` is a
+        // BAR2 offset inside the mapped window.
+        unsafe { self.0.read16(address as u64) }
+    }
+
+    fn read32(&mut self, address: u32) -> u32 {
+        <Self as Regs>::read32(self, address)
+    }
+
+    fn write16(&mut self, address: u32, value: u16) {
+        // SAFETY: same.
+        unsafe { self.0.write16(address as u64, value) }
+    }
+
+    fn write32(&mut self, address: u32, value: u32) {
+        <Self as Regs>::write32(self, address, value)
+    }
+}
+
 /// The prepared 8922A device: factory identity, admitted stations,
 /// BE data + H2C transport owners, and ring state. Constructed by
 /// `pci::bring_up` for a probed 8922A device and retained on

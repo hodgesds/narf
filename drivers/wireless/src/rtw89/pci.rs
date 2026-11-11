@@ -691,19 +691,29 @@ impl Rtw89Device {
         buf: &[u8],
     ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
         use super::dma::{TxBd, DEFAULT_TXBD_NUM, TXCH_CH12};
+        use super::fwcmd_8922a::{fwcmd_txdesc, FWCMD_TXDESC_LEN};
         use super::prepared_8922a::Error;
         use super::tx_8922a::BUFFER_DMA_MASK;
-        if buf.is_empty() || buf.len() > u16::MAX as usize {
-            return Err(Error::Transport(super::tx_8922a::Error::BadFrame));
-        }
+        // `rtw89_pci_fwcmd_submit` (pci.c:1551): the 24-byte BE FWCMD
+        // descriptor (dword0 = H2C length | RPKT_TYPE_H2C) precedes the
+        // framed H2C in the same DMA buffer the TXBD points at.
+        let desc = fwcmd_txdesc(buf.len(), false)
+            .ok_or(Error::Transport(super::tx_8922a::Error::BadFrame))?;
+        let total = FWCMD_TXDESC_LEN + buf.len();
         let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
-        let dma_buf = alloc_coherent_masked(buf.len(), DomainId::DRIVER_0, BUFFER_DMA_MASK)
+        let dma_buf = alloc_coherent_masked(total, DomainId::DRIVER_0, BUFFER_DMA_MASK)
             .map_err(|_| Error::NoMemory)?;
-        // SAFETY: fresh owned allocation covers exactly the buffer length.
+        // SAFETY: fresh owned allocation covers exactly `total` bytes:
+        // the descriptor then the framed H2C.
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), dma_buf.as_mut_ptr(), buf.len());
+            core::ptr::copy_nonoverlapping(desc.as_ptr(), dma_buf.as_mut_ptr(), FWCMD_TXDESC_LEN);
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                dma_buf.as_mut_ptr().add(FWCMD_TXDESC_LEN),
+                buf.len(),
+            );
         }
-        dma_buf.sync(0, buf.len());
+        dma_buf.sync(0, total);
         let mut owner = owner_lock.lock();
         let ring_dma = &self.tx_ring_dma[TXCH_CH12 as usize];
         // SAFETY: same ring-slice contract as `submit_be_data_authorized`.
@@ -713,7 +723,7 @@ impl Rtw89Device {
                 DEFAULT_TXBD_NUM as usize,
             )
         };
-        let prepared = owner.prepare_h2c(bd, dma_buf.dma_addr().raw(), buf.len())?;
+        let prepared = owner.prepare_h2c(bd, dma_buf.dma_addr().raw(), total)?;
         owner.retain_h2c(framed, dma_buf);
         ring_dma.sync(
             prepared.slot as usize * core::mem::size_of::<TxBd>(),
