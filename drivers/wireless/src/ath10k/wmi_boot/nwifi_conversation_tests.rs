@@ -128,6 +128,10 @@ fn conversation() -> Result<(), &'static str> {
         f.group_rekey_with(2, GTK)
     });
     deliver(&h, frame);
+    // The worker's flush_management step programs the committed GTK; the
+    // next drain takes its SEC_IND.
+    let _ = drive(h.device.flush_management());
+    h.pump();
     if native(&h, |f| f.native_tx) != sent + 1
         || hw(&h, |c| c.installs != 3 || c.key(false, 2) != Some(GTK))
     {
