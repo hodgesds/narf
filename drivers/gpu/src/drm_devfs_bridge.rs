@@ -442,7 +442,13 @@ impl FileOps for DriCardFile {
     /// lookup and no later edge exists to wake an infinite poll.
     fn poll_deadline(&self) -> Option<u64> {
         let now = narf_time::wall::monotonic_ns();
-        self.events.lock().next_event_deadline_ns(now)
+        let deadline = self.events.lock().next_event_deadline_ns(now);
+        // A poller parked on an event that never comes is where a lost
+        // flip strands a compositor: say so in the log, once.
+        if deadline.is_some() {
+            crate::drm::card::note_flip_stalls(now);
+        }
+        deadline
     }
 
     /// The DRM card fd is a PARKABLE readiness source: a poll/epoll set

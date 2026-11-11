@@ -1592,6 +1592,7 @@ async unsafe fn light(
     *PRESENT.geometry.lock() = boot.display_scanout_ref().map(|s| s.front().fb);
     *PLANE_BASIS.lock() = boot.display_plane_basis();
     PRESENT.native.store(back.is_ok(), Ordering::Release);
+    crate::drm::card::set_flip_stall_reporter(Some(report_presenter));
     restart_vblank();
     publish_console(boot);
     crate::amdgpu_navi22_kms::publish();
@@ -2916,6 +2917,57 @@ fn present_committed_again() {
     }
 }
 
+/// Where the presenter is, for the stalled-flip report
+/// ([`report_presenter`]): two relaxed stores at each step of a frame.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Phase {
+    Idle,
+    Start,
+    Fence,
+    Owner,
+    Latch,
+    Follow,
+    Copy,
+}
+static PHASE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static PHASE_NS: AtomicU64 = AtomicU64::new(0);
+fn phase(phase: Phase) {
+    PHASE.store(phase as u8, Ordering::Relaxed);
+    PHASE_NS.store(narf_time::monotonic_ns(), Ordering::Relaxed);
+}
+
+/// `drm::card::note_flip_stalls`' account of a flip of `display` that is
+/// overdue: what the presenter is doing and since when, and whether the
+/// display owner lock (which every flip needs) is held.
+fn report_presenter(display: u8) {
+    use core::fmt::Write;
+    let doing = match PHASE.load(Ordering::Relaxed) {
+        0 => "idle",
+        1 => "starting a frame",
+        2 => "waiting for the frame's render fence",
+        3 => "waiting for the display owner lock",
+        4 => "armed, waiting for the latch",
+        5 => "following a latched flip",
+        _ => "copying a frame",
+    };
+    let queued = match PRESENT.next.try_lock() {
+        Some(next) if next.is_some() => "yes",
+        Some(_) => "no",
+        None => "busy",
+    };
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi22 presenter (display {display}): {doing} for {} ms; native={} task={} frame-queued={queued} owner-lock={} presented direct={} copied={}",
+        narf_time::monotonic_ns().saturating_sub(PHASE_NS.load(Ordering::Relaxed)) / 1_000_000,
+        PRESENT.native.load(Ordering::Acquire),
+        PRESENT.presenting.load(Ordering::Acquire),
+        if OWNER.is_locked() { "held" } else { "free" },
+        PRESENT.direct.load(Ordering::Relaxed),
+        PRESENT.copied.load(Ordering::Relaxed),
+    );
+}
+
 async fn presenter() {
     use core::fmt::Write;
     loop {
@@ -2924,6 +2976,7 @@ async fn presenter() {
             if PRESENT.next.lock().is_some() && !PRESENT.presenting.swap(true, Ordering::AcqRel) {
                 continue;
             }
+            phase(Phase::Idle);
             return;
         };
         if !PRESENT.native.load(Ordering::Acquire) {
@@ -2931,6 +2984,7 @@ async fn presenter() {
             continue;
         }
         let started = narf_time::monotonic_ns();
+        phase(Phase::Start);
         // In place when the pinned client framebuffer can be fetched at its
         // own pitch, size and placement (amdgpu_dm never copies a client
         // framebuffer).
@@ -2939,6 +2993,7 @@ async fn presenter() {
             if let (Ok(_), Some(pin)) = (plan, frame.bo.as_ref()) {
                 // Rendering must finish before the HUBP fetches it; wait
                 // without OWNER (the producer may need it).
+                phase(Phase::Fence);
                 frame_copy::wait_rendered(pin).await?;
                 if let Direct::Shown(latched) = present_direct(&frame, pin).await? {
                     return Ok::<_, ScanError>(latched);
@@ -2956,6 +3011,7 @@ async fn presenter() {
             }
             // Wait on rendering and perform hidden-VRAM SDMA readback
             // before taking OWNER: the producer/transfer also needs it.
+            phase(Phase::Copy);
             let source = frame_copy::source(&frame).await?;
             let mut owner = OWNER.lock().await;
             let boot = owner.as_mut().ok_or(ScanError::Busy)?;
@@ -3059,6 +3115,7 @@ async fn flip_unlocked(
         None => boot.arm_display_flip(kind, external)?,
     };
     drop(owner);
+    phase(Phase::Latch);
     loop {
         narf_time::sleep_us(crate::amdgpu_dcn30_flip::POLL_US).await;
         let mut owner = OWNER.lock().await;
@@ -3160,6 +3217,7 @@ async fn present_direct(
     frame: &Frame,
     pin: &alloc::sync::Arc<crate::amdgpu_gem::ScanoutPin>,
 ) -> Result<Direct, ScanError> {
+    phase(Phase::Owner);
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ScanError::Busy)?;
     // A cancelled presenter may have left the old front's views draining.
@@ -3188,6 +3246,7 @@ async fn present_direct(
             drop(released);
             // Owned surfaces are both stale now; DIRTYFB damage restarts.
             PRESENT.damage.lock().forget();
+            phase(Phase::Follow);
             follow_external(before).await;
             Ok(Direct::Shown(latched))
         }
