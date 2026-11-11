@@ -9,12 +9,25 @@
 //!   Ampere=NV170, Ada=NV190 (cited
 //!   `drivers/gpu/drm/nouveau/include/nvkm/core/device.h`).
 //! - **`PMC_BOOT_0`** layout — universal NVIDIA chip-id register at
-//!   BAR0 offset 0x000000 (stable since Fermi). Bits[24:20] hold
-//!   ARCHITECTURE_VERSION, the value the chip reports about
-//!   itself. Cited per
-//!   `drivers/gpu/drm/nouveau/nvkm/subdev/mc/g84.c` & friends
-//!   which read `0x000000` to detect the silicon.
-//! - **Public `pci.ids` database** for every device-id entry.
+//!   BAR0 offset 0x000000 (stable since Fermi). The architecture
+//!   is a 6-bit field split across the register: low 5 bits at
+//!   bits[28:24] plus the MSB at bit 8 —
+//!   `arch = ((raw >> 8) & 1) << 5 | ((raw >> 24) & 0x1F)`.
+//!   Grounded against the upstream Linux Nova driver
+//!   (`drivers/gpu/nova-core/regs.rs`, commit
+//!   1b155edcab0832a887387dd77e209e37beb7b49c:
+//!   `NV_PMC_BOOT_0` = minor 3:0, major 7:4, architecture_1 bit 8,
+//!   implementation 23:20, architecture_0 bits 28:24), whose
+//!   `Architecture` enum pins GF100 = 0x0c, Turing = 0x16,
+//!   Ampere = 0x17, Ada = 0x19. The remaining values follow the
+//!   same rule from the NVxx codes above (arch = NV-code >> 4:
+//!   NVE0 → 0x0e, NV110 → 0x11, NV130 → 0x13, NV140 → 0x14).
+//! - **Public `pci.ids` database (version 2026.10.27)** for every
+//!   device-id entry below. Two attributions were adjudicated
+//!   against it in the crate-split step 3: 0x2786 is AD104
+//!   [GeForce RTX 4070] (not AD103) and 0x2882 is AD107
+//!   [GeForce RTX 4060] (not AD106); 0x2820 is AD106M
+//!   [GeForce RTX 4070 Max-Q / Mobile].
 //!
 //! NARF licence: GPL-2.0-or-later (see top-of-repo `LICENSE`). The
 //! Nouveau adaptations here are legitimate cross-references.
@@ -30,63 +43,64 @@ pub const PCI_CLASS_DISPLAY: u8 = 0x03;
 
 /// Chip-family generations the driver knows about.
 ///
-/// `PMC_BOOT_0[24:20]` is the **architecture version** the chip
-/// reports — a small integer that increments per generation.
-/// Maxwell is the earliest family this driver targets; pre-Maxwell
-/// parts use a substantially different display block (`dispnv04`)
-/// that we don't intend to support here.
+/// `PMC_BOOT_0` carries the **architecture version** the chip
+/// reports — a 6-bit value split across the register (low 5 bits
+/// at bits[28:24], MSB at bit 8; see the module header for the
+/// Nova grounding). Maxwell is the earliest family this driver
+/// targets; pre-Maxwell parts use a substantially different
+/// display block (`dispnv04`) that we don't intend to support here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ChipFamily {
-    /// Fermi (NVC0). Architecture tag 0x20.
+    /// Fermi (NVC0). Architecture value 0x0c.
     Fermi,
-    /// Kepler (NVE0). Architecture tag 0x30.
+    /// Kepler (NVE0). Architecture value 0x0e.
     Kepler,
-    /// Maxwell (NV110, GM10x/GM20x). Architecture tag 0x40.
+    /// Maxwell (NV110, GM10x/GM20x). Architecture value 0x11.
     Maxwell,
-    /// Pascal (NV130, GP10x). Architecture tag 0x50.
+    /// Pascal (NV130, GP10x). Architecture value 0x13.
     Pascal,
-    /// Volta (NV140, GV10x). Architecture tag 0x60.
+    /// Volta (NV140, GV10x). Architecture value 0x14.
     Volta,
-    /// Turing (NV160, TU10x). Architecture tag 0x70.
+    /// Turing (NV160, TU10x). Architecture value 0x16.
     Turing,
-    /// Ampere (NV170, GA10x). Architecture tag 0x80.
+    /// Ampere (NV170, GA10x). Architecture value 0x17.
     Ampere,
-    /// Ada Lovelace (NV190, AD10x). Architecture tag 0x90.
+    /// Ada Lovelace (NV190, AD10x). Architecture value 0x19.
     Ada,
     /// Architecture the driver doesn't recognise. Carries the raw
-    /// 5-bit value from PMC_BOOT_0 so a future maintainer doesn't
+    /// 6-bit value from PMC_BOOT_0 so a future maintainer doesn't
     /// lose data.
     Unknown(u8),
 }
 
 impl ChipFamily {
-    /// Decode the architecture version from `PMC_BOOT_0[24:20]`.
+    /// Decode the architecture version from `PMC_BOOT_0`.
     pub const fn from_arch_version(arch: u8) -> Self {
         match arch {
-            0x20 => ChipFamily::Fermi,
-            0x30 => ChipFamily::Kepler,
-            0x40 => ChipFamily::Maxwell,
-            0x50 => ChipFamily::Pascal,
-            0x60 => ChipFamily::Volta,
-            0x70 => ChipFamily::Turing,
-            0x80 => ChipFamily::Ampere,
-            0x90 => ChipFamily::Ada,
+            0x0c => ChipFamily::Fermi,
+            0x0e => ChipFamily::Kepler,
+            0x11 => ChipFamily::Maxwell,
+            0x13 => ChipFamily::Pascal,
+            0x14 => ChipFamily::Volta,
+            0x16 => ChipFamily::Turing,
+            0x17 => ChipFamily::Ampere,
+            0x19 => ChipFamily::Ada,
             n => ChipFamily::Unknown(n),
         }
     }
 
     /// The architecture version this family reports in
-    /// `PMC_BOOT_0[24:20]`.
+    /// `PMC_BOOT_0`.
     pub const fn arch_version(self) -> u8 {
         match self {
-            ChipFamily::Fermi => 0x20,
-            ChipFamily::Kepler => 0x30,
-            ChipFamily::Maxwell => 0x40,
-            ChipFamily::Pascal => 0x50,
-            ChipFamily::Volta => 0x60,
-            ChipFamily::Turing => 0x70,
-            ChipFamily::Ampere => 0x80,
-            ChipFamily::Ada => 0x90,
+            ChipFamily::Fermi => 0x0c,
+            ChipFamily::Kepler => 0x0e,
+            ChipFamily::Maxwell => 0x11,
+            ChipFamily::Pascal => 0x13,
+            ChipFamily::Volta => 0x14,
+            ChipFamily::Turing => 0x16,
+            ChipFamily::Ampere => 0x17,
+            ChipFamily::Ada => 0x19,
             ChipFamily::Unknown(n) => n,
         }
     }
@@ -184,7 +198,11 @@ pub const GA102_RTX_3080: u16 = 0x2206;
 pub const GA102_RTX_3090: u16 = 0x2204;
 
 // Ada Lovelace (AD10x) — RTX 40-series.
-pub const AD106_RTX_4060: u16 = 0x2882;
+pub const AD106_RTX_4060_TI: u16 = 0x2803;
+pub const AD106_RTX_4060_TI_16G: u16 = 0x2805;
+pub const AD106_RTX_4060: u16 = 0x2808;
+pub const AD106M_RTX_4070_MOBILE: u16 = 0x2820;
+pub const AD107_RTX_4060: u16 = 0x2882;
 pub const AD104_RTX_4070: u16 = 0x2786;
 pub const AD103_RTX_4080: u16 = 0x2704;
 pub const AD102_RTX_4090: u16 = 0x2684;
@@ -222,7 +240,9 @@ pub fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         AD102_RTX_4090 => (ChipFamily::Ada, "ad102"),
         AD103_RTX_4080 => (ChipFamily::Ada, "ad103"),
         AD104_RTX_4070 => (ChipFamily::Ada, "ad104"),
-        AD106_RTX_4060 => (ChipFamily::Ada, "ad106"),
+        AD106_RTX_4060_TI | AD106_RTX_4060_TI_16G | AD106_RTX_4060 => (ChipFamily::Ada, "ad106"),
+        AD106M_RTX_4070_MOBILE => (ChipFamily::Ada, "ad106m"),
+        AD107_RTX_4060 => (ChipFamily::Ada, "ad107"),
         _ => return None,
     };
     Some(ChipInfo {
@@ -236,6 +256,13 @@ pub fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
 /// Static table of all known PCI ids, in registration order. Used
 /// by the PCI driver-match registration and by smoke tests for
 /// coverage.
+///
+/// Every entry is grounded against the public `pci.ids` database,
+/// version 2026.10.27 (vendor 0x10DE section). Step-3 corrections
+/// against that snapshot: 0x2786 is AD104 [GeForce RTX 4070];
+/// 0x2882 is AD107 [GeForce RTX 4060]; 0x2820 is AD106M
+/// [GeForce RTX 4070 Max-Q / Mobile]; AD106 desktop parts are
+/// 0x2803 (4060 Ti), 0x2805 (4060 Ti 16GB), 0x2808 (4060).
 pub const KNOWN_DEVICES: &[(&str, u16)] = &[
     // Maxwell.
     ("nvidia-gm107-gtx750ti", GM107_GTX_750_TI),
@@ -271,5 +298,9 @@ pub const KNOWN_DEVICES: &[(&str, u16)] = &[
     ("nvidia-ad102-4090", AD102_RTX_4090),
     ("nvidia-ad103-4080", AD103_RTX_4080),
     ("nvidia-ad104-4070", AD104_RTX_4070),
+    ("nvidia-ad106-4060ti", AD106_RTX_4060_TI),
+    ("nvidia-ad106-4060ti-16g", AD106_RTX_4060_TI_16G),
     ("nvidia-ad106-4060", AD106_RTX_4060),
+    ("nvidia-ad106m-4070-mobile", AD106M_RTX_4070_MOBILE),
+    ("nvidia-ad107-4060", AD107_RTX_4060),
 ];
