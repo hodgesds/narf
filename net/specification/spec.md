@@ -1192,6 +1192,15 @@ are covered by their retransmission timers; RST and non-TCP frames are
 dropped and counted. Linux holds all of these in the qdisc instead; there is
 no qdisc here.
 
+### Receive batches
+
+`iface::rx_batch(name)` resolves the ingress device once per receive poll and
+returns an `RxBatch`; `RxBatch::receive(frame, timestamp)` delivers a frame
+whose native XDP action was PASS without touching the interface registry,
+and the batch's packet, byte and multicast counts are added to the interface
+when it is dropped. `iface::on_native_rx_timestamped` remains for callers
+that deliver single frames by name.
+
 IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,
 socket buffers, and errno path. Family-specific connected and listener
 indexes retain full-width addresses and include the network-namespace ID.

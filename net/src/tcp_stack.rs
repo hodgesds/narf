@@ -226,7 +226,30 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
 pub fn rx_handler_native(iface_name: &str, frame: &mut [u8], timestamp: Option<u64>) {
     rx_handler_inner(iface_name, frame, true, timestamp)
 }
+/// [`rx_handler_native`] for a caller that already holds the ingress device
+/// (`iface::RxBatch`): no registry lookup and no allocation per frame.
+pub fn rx_handler_native_resolved(
+    dev: &iface::NetIfaceSnapshot,
+    frame: &mut [u8],
+    timestamp: Option<u64>,
+) {
+    rx_handler_with(Some(dev), dev.name.as_str(), frame, true, timestamp)
+}
 fn rx_handler_inner(iface_name: &str, frame: &mut [u8], native: bool, timestamp: Option<u64>) {
+    let ingress = if iface_name.is_empty() {
+        None
+    } else {
+        iface::lookup(iface_name)
+    };
+    rx_handler_with(ingress.as_ref(), iface_name, frame, native, timestamp)
+}
+fn rx_handler_with(
+    ingress: Option<&iface::NetIfaceSnapshot>,
+    iface_name: &str,
+    frame: &mut [u8],
+    native: bool,
+    timestamp: Option<u64>,
+) {
     if frame.len() < ETH_HDR_LEN {
         return;
     }
@@ -246,31 +269,32 @@ fn rx_handler_inner(iface_name: &str, frame: &mut [u8], native: bool, timestamp:
     // Linux ref: linux/net/core/dev.c::netif_receive_skb_core
     // installs the XDP/AF_XDP hook ahead of the protocol-stack
     // dispatch; same shape.
-    let ingress = _iface_name.and_then(iface::lookup);
-    let net_ns_id = ingress.as_ref().map_or(0, |entry| entry.net_ns_id);
-    let bypass_iface = ingress
-        .as_ref()
-        .map(|entry| entry.name.clone())
+    let net_ns_id = ingress.map_or(0, |entry| entry.net_ns_id);
+    let primary;
+    let bypass_iface: &str = match ingress {
+        Some(entry) => entry.name.as_str(),
         // A frame handed in without its device (the legacy single-NIC RX
         // path) arrived on the primary NIC: the first non-loopback device.
-        .or_else(|| {
-            iface::snapshot_all()
+        None => {
+            primary = iface::snapshot_all()
                 .into_iter()
                 .find(|nic| nic.name != "lo")
                 .map(|nic| nic.name)
-        })
-        .unwrap_or_default();
+                .unwrap_or_default();
+            primary.as_str()
+        }
+    };
     // `classify` runs any attached XDP program, which may resize the frame
     // (`bpf_xdp_adjust_head`/`_tail`). The effective packet is `frame[..len]`;
     // everything below transmits or delivers that window rather than the
     // original slice.
     let (verdict, len) = if native {
         (
-            crate::bypass::classifier::classify_after_xdp(&bypass_iface, frame),
+            crate::bypass::classifier::classify_after_xdp(bypass_iface, frame),
             frame.len(),
         )
     } else {
-        crate::bypass::classifier::classify(&bypass_iface, frame)
+        crate::bypass::classifier::classify(bypass_iface, frame)
     };
     match verdict {
         crate::bypass::classifier::Verdict::Consumed => return,
@@ -284,7 +308,7 @@ fn rx_handler_inner(iface_name: &str, frame: &mut [u8], native: bool, timestamp:
         // XDP_TX has in Linux when the ring cannot take it — and is counted so it
         // is visible rather than silent.
         crate::bypass::classifier::Verdict::Transmit => {
-            if iface::send_on(&bypass_iface, &frame[..len]).is_err() {
+            if iface::send_on(bypass_iface, &frame[..len]).is_err() {
                 crate::bypass::classifier::count_xdp_tx_drop();
             }
             return;
@@ -310,7 +334,7 @@ fn rx_handler_inner(iface_name: &str, frame: &mut [u8], native: bool, timestamp:
             let mut ports = [0u32; crate::bypass::classifier::MAX_XDP_BROADCAST_PORTS];
             let (n, exclude_ingress) = crate::bypass::classifier::take_xdp_broadcast(&mut ports);
             let ingress = if exclude_ingress {
-                iface::ifindex_of(&bypass_iface)
+                iface::ifindex_of(bypass_iface)
             } else {
                 None
             };
@@ -333,11 +357,16 @@ fn rx_handler_inner(iface_name: &str, frame: &mut [u8], native: bool, timestamp:
     // AF_PACKET sockets see every frame before L3 dispatch, tagged with the
     // device it arrived on (`__netif_receive_skb_core` → `packet_rcv`:
     // `sll_ifindex = skb->dev->ifindex`).
-    if let Some(dev) = ingress
-        .clone()
-        .or_else(|| iface::lookup_in(net_ns_id, &bypass_iface))
-    {
-        crate::raw_sock::netif_receive_timestamped(&dev, frame, timestamp);
+    let looked_up;
+    let tap_dev = match ingress {
+        Some(dev) => Some(dev),
+        None => {
+            looked_up = iface::lookup_in(net_ns_id, bypass_iface);
+            looked_up.as_ref()
+        }
+    };
+    if let Some(dev) = tap_dev {
+        crate::raw_sock::netif_receive_timestamped(dev, frame, timestamp);
     }
 
     // Software GRO coalesces in-order TCP segments into one large frame before
@@ -348,7 +377,7 @@ fn rx_handler_inner(iface_name: &str, frame: &mut [u8], native: bool, timestamp:
     //   * interfaces that have not opted in (GRO stays disabled by default).
     // Linux ref: `napi_gro_receive` sits exactly here — after the `packet_rcv`
     // AF_PACKET taps and before the protocol handlers.
-    if ingress.as_ref().is_some_and(|dev| dev.software_gro) && iface_name != "lo" {
+    if ingress.is_some_and(|dev| dev.software_gro) && iface_name != "lo" {
         gro_rx::offer(iface_name, net_ns_id, frame);
     } else {
         dispatch_l3(_iface_name, net_ns_id, frame, false);
@@ -774,6 +803,7 @@ fn timer_tick_pump() {
 pub fn init() {
     iface::install_rx_handler(rx_handler);
     iface::install_native_rx_handler(rx_handler_native);
+    iface::install_native_rx_resolved_handler(rx_handler_native_resolved);
     // Register default netfilter hooks: conntrack at PRE_ROUTING &
     // LOCAL_OUT, filter at all five points, NAT at PRE_ROUTING /
     // POST_ROUTING. Idempotent — calling twice double-registers, so

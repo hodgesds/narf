@@ -2565,6 +2565,93 @@ pub fn install_native_rx_handler(h: fn(&str, &mut [u8], Option<u64>)) {
     NATIVE_RX_HANDLER.store(h as usize, Ordering::Release);
 }
 
+/// The native handler for a frame whose ingress device is already resolved.
+static NATIVE_RX_RESOLVED_HANDLER: AtomicUsize = AtomicUsize::new(0);
+type ResolvedRxHandler = fn(&NetIfaceSnapshot, &mut [u8], Option<u64>);
+pub fn install_native_rx_resolved_handler(h: ResolvedRxHandler) {
+    NATIVE_RX_RESOLVED_HANDLER.store(h as usize, Ordering::Release);
+}
+
+/// Interface lookups made by [`rx_batch`]; lets a test show that a poll
+/// resolves its device once, not once per frame.
+#[cfg(any(test, feature = "kernel-test"))]
+pub(crate) static RX_BATCH_LOOKUPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// One receive poll's view of its interface. Linux resolves `skb->dev` once,
+/// from the NAPI instance, and counts into per-ring statistics that are
+/// folded in later; the by-name path instead took the interface registry
+/// lock twice per frame and cloned a heap-backed snapshot each time.
+///
+/// [`rx_batch`] looks the device up once. [`RxBatch::receive`] then delivers
+/// each frame without touching the registry, and the packet, byte and
+/// multicast counts are added to the interface under one lock acquisition
+/// when the batch is dropped.
+#[derive(Debug)]
+pub struct RxBatch {
+    dev: Option<NetIfaceSnapshot>,
+    /// Set when the name is not registered: frames then take the by-name
+    /// path, as before.
+    unknown: Option<String>,
+    packets: u64,
+    bytes: u64,
+    multicast: u64,
+}
+
+/// Start a receive batch for `name`: one registry lookup per poll.
+pub fn rx_batch(name: &str) -> RxBatch {
+    #[cfg(any(test, feature = "kernel-test"))]
+    RX_BATCH_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+    let dev = lookup(name);
+    RxBatch {
+        unknown: dev.is_none().then(|| String::from(name)),
+        dev,
+        packets: 0,
+        bytes: 0,
+        multicast: 0,
+    }
+}
+
+impl RxBatch {
+    /// Deliver one frame whose native XDP action was PASS.
+    pub fn receive(&mut self, frame: &mut [u8], timestamp: Option<u64>) {
+        let handler = NATIVE_RX_RESOLVED_HANDLER.load(Ordering::Acquire);
+        let Some(dev) = self.dev.as_ref().filter(|_| handler != 0) else {
+            let name = match (&self.dev, &self.unknown) {
+                (Some(dev), _) => dev.name.as_str(),
+                (None, Some(name)) => name.as_str(),
+                (None, None) => return,
+            };
+            return on_native_rx_timestamped(name, frame, timestamp);
+        };
+        self.packets += 1;
+        self.bytes += frame.len() as u64;
+        // Linux's multicast counter excludes the all-ones broadcast address.
+        if frame.len() >= 6 && frame[0] & 1 != 0 && frame[..6] != [0xff; 6] {
+            self.multicast += 1;
+        }
+        // SAFETY: the pointer was installed with the ResolvedRxHandler signature.
+        let handler: ResolvedRxHandler = unsafe { core::mem::transmute(handler) };
+        handler(dev, frame, timestamp);
+    }
+}
+
+impl Drop for RxBatch {
+    fn drop(&mut self) {
+        let Some(dev) = self.dev.as_ref() else {
+            return;
+        };
+        if self.packets == 0 {
+            return;
+        }
+        let (packets, bytes, multicast) = (self.packets, self.bytes, self.multicast);
+        with_stats_mut(&dev.name, |stats| {
+            stats.rx_packets = stats.rx_packets.saturating_add(packets);
+            stats.rx_bytes = stats.rx_bytes.saturating_add(bytes);
+            stats.rx_multicast = stats.rx_multicast.saturating_add(multicast);
+        });
+    }
+}
 /// Deliver a packet whose native XDP action was PASS. The native handler
 /// performs software claims and protocol dispatch without executing XDP twice.
 pub fn on_native_rx_frame(name: &str, frame: &mut [u8]) {

@@ -1988,25 +1988,43 @@ fn spawn_pumps(
                     } else {
                         Vec::new()
                     };
-                    for mut frame in frames {
-                        let name = rx.name();
-                        crate::publish::mirror_rx(
-                            &frame,
-                            crate::publish::rx_mirror_attached(name),
-                            |f| {
-                                let _ = producer.lock().try_send(f);
-                            },
-                        );
-                        let (action, len) =
-                            narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
-                        frame.truncate(len as u32);
-                        if action == narf_net::bypass::classifier::XdpAction::Tx {
-                            if rx.submit_frame(frame, TxMeta::plain()).is_err() {
-                                narf_net::bypass::classifier::count_xdp_tx_drop();
+                    {
+                        // One interface lookup for the whole poll; its frame and
+                        // byte counts are folded in when the batch ends.
+                        let mut batch =
+                            (!frames.is_empty()).then(|| narf_net::iface::rx_batch(rx.name()));
+                        for mut frame in frames {
+                            let name = rx.name();
+                            crate::publish::mirror_rx(
+                                &frame,
+                                crate::publish::rx_mirror_attached(name),
+                                |f| {
+                                    let _ = producer.lock().try_send(f);
+                                },
+                            );
+                            let (action, len) =
+                                narf_net::bypass::classifier::run_xdp(name, frame.payload_mut());
+                            frame.truncate(len as u32);
+                            if action == narf_net::bypass::classifier::XdpAction::Tx {
+                                if rx.submit_frame(frame, TxMeta::plain()).is_err() {
+                                    narf_net::bypass::classifier::count_xdp_tx_drop();
+                                }
+                            } else {
+                                let timestamp = frame.rx_meta().timestamp_ns;
+                                use narf_net::bypass::classifier::XdpAction;
+                                match (action, batch.as_mut()) {
+                                    (
+                                        XdpAction::Pass | XdpAction::RedirectCpu { .. },
+                                        Some(batch),
+                                    ) => batch.receive(frame.payload_mut(), timestamp),
+                                    _ => native_redirect(
+                                        name,
+                                        frame.payload_mut(),
+                                        action,
+                                        timestamp,
+                                    ),
+                                }
                             }
-                        } else {
-                            let timestamp = frame.rx_meta().timestamp_ns;
-                            native_redirect(name, frame.payload_mut(), action, timestamp);
                         }
                     }
                     // The wake pass, once per poll: this poll reclaimed the

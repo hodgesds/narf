@@ -1777,3 +1777,69 @@ kernel_test_in!(
     "net/tcp/robust",
     smoke_tx_refused_ack_is_retried_from_delayed_ack_timer
 );
+
+// ── Receive batches (`iface::rx_batch`) ─────────────────────────────────
+
+/// An Ethernet ARP request from `peer` for `target`.
+fn arp_request(peer: [u8; 4], target: [u8; 4]) -> Vec<u8> {
+    let mac = [0x52, 0x54, 0, 0, 0, 1];
+    let mut f = vec![0u8; 60];
+    f[..6].fill(0xff);
+    f[6..12].copy_from_slice(&mac);
+    f[12..14].copy_from_slice(&[0x08, 0x06]);
+    f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    f[22..28].copy_from_slice(&mac);
+    f[28..32].copy_from_slice(&peer);
+    f[38..42].copy_from_slice(&target);
+    f
+}
+
+/// A receive poll resolves its interface once: every frame of the batch
+/// reaches the stack with the right device, with one registry lookup, and
+/// the interface counters are folded in when the batch ends.
+fn smoke_rx_batch_resolves_device_once_per_poll() -> TestResult {
+    use ::core::sync::atomic::Ordering;
+    const FRAMES: u64 = 32;
+    let local = [10, 93, 0, 1];
+    let peer = reset("rxbatch0", local);
+    iface::install_native_rx_handler(crate::tcp_stack::rx_handler_native);
+    iface::install_native_rx_resolved_handler(crate::tcp_stack::rx_handler_native_resolved);
+    let counters = || {
+        iface::lookup("rxbatch0").map_or((0, 0), |dev| (dev.stats.rx_packets, dev.stats.rx_bytes))
+    };
+    let before = counters();
+    let lookups = iface::RX_BATCH_LOOKUPS.load(Ordering::Relaxed);
+    {
+        let mut batch = iface::rx_batch("rxbatch0");
+        for _ in 0..FRAMES {
+            batch.receive(&mut arp_request(peer, local), None);
+        }
+        if counters() != before {
+            return TestResult::Fail("interface counters were taken under the lock per frame");
+        }
+    }
+    if iface::RX_BATCH_LOOKUPS.load(Ordering::Relaxed) != lookups + 1 {
+        return TestResult::Fail("the batch looked its interface up more than once");
+    }
+    if counters() != (before.0 + FRAMES, before.1 + FRAMES * 60) {
+        return TestResult::Fail("the batch's frames and bytes were not counted when it ended");
+    }
+    // Each request was answered from this interface: the stack saw the
+    // frames with their ingress device.
+    let replies = drain()
+        .iter()
+        .filter(|f| ethertype(f) == 0x0806 && f[20..22] == [0, 2] && f[28..32] == local)
+        .count();
+    if replies as u64 != FRAMES {
+        return TestResult::Fail("a frame of the batch did not reach the stack with its device");
+    }
+    // An unregistered name still takes the by-name path and counts nothing.
+    let mut unknown = iface::rx_batch("rxbatch-missing");
+    unknown.receive(&mut arp_request(peer, local), None);
+    drop(unknown);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_rx_batch_resolves_device_once_per_poll
+);
