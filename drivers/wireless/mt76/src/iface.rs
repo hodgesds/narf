@@ -90,6 +90,9 @@ pub struct Mt76Iface {
     /// The station link's statistics from the latest packet step, for
     /// NL80211_CMD_GET_STATION (`station_info`); cleared with the link.
     link_stats: IrqSafeSpinLock<Option<crate::mt7921::link_stats::LinkStats>>,
+    /// NL80211_CMD_SET_CQM and mac80211's software monitor over the AP's
+    /// Beacons; the monitor restarts with each association.
+    cqm: IrqSafeSpinLock<Cqm>,
     pending_tx: IrqSafeSpinLock<Option<Frame>>,
     control: narf_lib::mutex::Mutex<()>,
     teardown_needed: AtomicBool,
@@ -138,6 +141,7 @@ impl Mt76Iface {
             tx_cons: IrqSafeSpinLock::new(None),
             associated_bssid: IrqSafeSpinLock::new(None),
             link_stats: IrqSafeSpinLock::new(None),
+            cqm: IrqSafeSpinLock::new(Cqm::default()),
             pending_tx: IrqSafeSpinLock::new(None),
             control: narf_lib::mutex::Mutex::new(()),
             teardown_needed: AtomicBool::new(false),
@@ -372,6 +376,10 @@ impl Mt76Iface {
         self.refresh_receive_epoch()?;
         if let Some(link) = step.link {
             *self.link_stats.lock() = Some(link);
+            let events = self.cqm.lock().beacons(&link);
+            for (high, level_dbm) in events {
+                narf_wireless::nl80211::notify_cqm_rssi(&self.name, high, level_dbm);
+            }
         }
         let progress = step.transmitted || !step.received.is_empty();
         deliver_received_batch(
@@ -470,6 +478,7 @@ impl Mt76Iface {
         self.receive_epoch.store(0, Ordering::Release);
         *self.associated_bssid.lock() = None;
         *self.link_stats.lock() = None;
+        self.cqm.lock().restart();
         if !ap {
             publish_link(&self.name, false);
         }
@@ -776,6 +785,43 @@ fn note_failure(stage: &str, error: &dyn core::fmt::Debug) {
     {
         use core::fmt::Write;
         let _ = writeln!(narf_console::Writer, "mt76: {stage} failed: {error:?}");
+    }
+}
+
+/// The CQM configuration and its software monitor.
+#[derive(Debug, Default)]
+struct Cqm {
+    config: Option<narf_wireless::CqmRssiConfig>,
+    monitor: narf_wireless::cqm::SoftwareCqm,
+    /// `LinkStats::beacons` already fed to the monitor.
+    seen: u32,
+}
+impl Cqm {
+    fn configure(&mut self, config: Option<narf_wireless::CqmRssiConfig>) {
+        self.config = config;
+        self.monitor.reconfigured();
+    }
+    /// A new association: no beacon average, no previous event.
+    fn restart(&mut self) {
+        self.monitor = Default::default();
+        self.seen = 0;
+    }
+    /// Feed the Beacons `link` counted since the last step (each at the
+    /// latest Beacon's signal; at most eight per step) and return the
+    /// crossings to report as `(high, level_dbm)`.
+    fn beacons(&mut self, link: &crate::mt7921::link_stats::LinkStats) -> Vec<(bool, i32)> {
+        let mut events = Vec::new();
+        let new = link.beacons.wrapping_sub(self.seen).min(8);
+        self.seen = link.beacons;
+        let Some(signal) = link.beacon_signal_dbm else {
+            return events;
+        };
+        for _ in 0..new {
+            if let Some(high) = self.monitor.beacon(i32::from(signal), self.config.as_ref()) {
+                events.push((high, self.monitor.level_dbm().unwrap_or(i32::from(signal))));
+            }
+        }
+        events
     }
 }
 
@@ -1349,6 +1395,19 @@ impl WirelessNetIface for Mt76Iface {
 
     fn supports_handshake_offload(&self) -> bool {
         true
+    }
+
+    /// mac80211's software CQM (`ieee80211_rx_bss_info`) over the AP's
+    /// Beacon signal, for one threshold or a cfg80211 threshold list.
+    fn supports_cqm_rssi(&self) -> bool {
+        true
+    }
+    fn supports_cqm_rssi_list(&self) -> bool {
+        true
+    }
+    fn set_cqm_rssi(&self, config: Option<narf_wireless::CqmRssiConfig>) -> Result<(), i32> {
+        self.cqm.lock().configure(config);
+        Ok(())
     }
 
     /// mac80211 `SUPPORTS_PS | SUPPORTS_DYNAMIC_PS` (mt792x_init_wiphy)

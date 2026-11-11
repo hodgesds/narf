@@ -2201,6 +2201,14 @@ second local-disconnect event.
 index is bounds-checked and returns `None` outside the tables. ath11k and
 mt76 share them for `StationInfo` rates. Test: `wireless/rate`.
 
+`cqm.rs` holds `SoftwareCqm`, mac80211's software RSSI monitor for a
+station driver without firmware CQM. `beacon(signal, config)` keeps
+`ewma_beacon_signal` (precision 4, weight 4) and returns a LOW/HIGH crossing
+after `IEEE80211_SIGNAL_AVE_MIN_COUNT` Beacons: by threshold and hysteresis,
+or by the `cfg80211_cqm_rssi_update` range for a list. `level_dbm()` gives
+the averaged level, and `reconfigured()` clears the last event. mt76 uses
+it. Test: `wireless/cqm`.
+
 ### 3.4.1 CCMP packet helpers (`ccmp.rs`)
 
 `build_aad` authenticates the three addresses, fragment number and optional
