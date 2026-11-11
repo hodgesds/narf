@@ -1689,7 +1689,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // Resolve both physical copies under the lock, then release it before
         // I/O. A plain logical read can retry transport failure; callers with a
         // checksum (notably read_node and the data-csum path) retry corruption.
-        let mut buf = vec![0u8; len];
+        let mut buf = crate::databuf::zeroed(len)?;
         let copies = self.logical_read_copies(logical)?;
         let mut last = FsError::NotFound;
         for copy in 0..copies {
@@ -1711,7 +1711,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         len: usize,
         stored: &[u8],
     ) -> Result<Vec<u8>, FsError> {
-        let mut buf = vec![0u8; len];
+        let mut buf = crate::databuf::zeroed(len)?;
         let copies = self.logical_read_copies(logical)?;
         for copy in 0..copies {
             if self

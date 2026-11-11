@@ -25,6 +25,7 @@ mod overwrite_cost;
 mod release_cost;
 mod safety;
 mod snapshots;
+mod write_buffers;
 
 // ── Shared test harness ────────────────────────────────────────────
 

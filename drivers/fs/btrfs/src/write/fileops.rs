@@ -315,14 +315,14 @@ async fn zero_if_dirty<B: BlockDevice + 'static>(
         return Ok(());
     }
     let (fs_root, _) = vol.fs_tree_root();
-    let mut buf = alloc::vec![0u8; (to - from) as usize];
+    let mut buf = crate::databuf::zeroed((to - from) as usize)?;
     let n = crate::extent::read_file(vol, fs_root, ino, cover, from, &mut buf).await?;
     if buf[..n].iter().all(|&b| b == 0) && !compressed_in(vol, fs_root, ino, from, to).await? {
         return Ok(());
     }
     let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
-    let zeros = alloc::vec![0u8; (to - from) as usize];
-    cow_write_file_once(vol, ino, &inode, from, &zeros).await?;
+    buf.fill(0);
+    cow_write_file_once(vol, ino, &inode, from, &buf).await?;
     Ok(())
 }
 
@@ -385,7 +385,7 @@ async fn uninline<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>, ino: u64) -> R
     };
     let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
     let len = (inline.end - inline.start).min(inode.size);
-    let mut data = alloc::vec![0u8; len as usize];
+    let mut data = crate::databuf::zeroed(len as usize)?;
     let n = crate::extent::read_file(vol, fs_root, ino, inode.size, 0, &mut data).await?;
     data.truncate(n);
     if data.is_empty() {
@@ -628,7 +628,7 @@ async fn truncate_once<B: BlockDevice + 'static>(
                 if new_size == 0 {
                     extra.push(Edit::Delete(inline.key));
                 } else {
-                    let mut data = alloc::vec![0u8; new_size as usize];
+                    let mut data = crate::databuf::zeroed(new_size as usize)?;
                     crate::extent::read_file(vol, fs_root, ino, old_size, 0, &mut data).await?;
                     extra.push(Edit::Upsert(
                         inline.key,

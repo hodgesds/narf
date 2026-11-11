@@ -154,6 +154,18 @@ accepted changes durable, leaving any unreaped orphan record for recovery.
 
 ## 4. Invariants
 
+No buffer of the write, truncate, punch or read paths follows the length of
+a call: a write is laid down one new extent (`MAX_WRITE_EXTENT`, 128 KiB) at a
+time in one reused buffer, and a read of an uncompressed extent goes in
+pieces of at most 128 KiB, as Linux works folio by folio and extent by
+extent. A write of n bytes once needed a contiguous heap block of n bytes,
+and the kernel aborted when a fragmented heap had none. Data-sized buffers
+come from `databuf::zeroed`, which allocates fallibly: a failure is
+`OutOfMemory` (ENOMEM) with nothing staged, never an abort
+(`smoke_btrfs_large_write_buffers_bounded`,
+`smoke_btrfs_write_buffer_failure_is_enomem`, and the `overwrite` scenario of
+`cargo xtask btrfs-host-rw` under `btrfs check`).
+
 A commit maintains the free-space tree incrementally (`write/free_space.rs`,
 Linux `btrfs_add_to_free_space_tree` / `btrfs_remove_from_free_space_tree`
 run from the delayed refs): it reads only the leaves holding the items its

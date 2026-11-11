@@ -217,12 +217,25 @@ pub async fn read_file<B: BlockDevice + 'static>(
                 let d0 = (ov_start - offset) as usize;
                 let read_len = (ov_end - ov_start) as usize;
                 if compression == format::COMPRESS_NONE {
-                    // Read only the bytes the window needs.
+                    // Read only the bytes the window needs, a cacheable piece
+                    // at a time: an extent Linux wrote can be 128 MiB, and a
+                    // read of it must not need a buffer that size.
                     let logical = disk_bytenr + extent_offset + (ov_start - file_start);
-                    let data =
-                        read_uncompressed_cached(vol, csum_root, logical, read_len, le64(body, 0)?)
-                            .await?;
-                    dst[d0..d0 + read_len].copy_from_slice(&data);
+                    let piece = crate::decompress_cache::MAX_DISK_BYTES as usize;
+                    let mut done = 0usize;
+                    while done < read_len {
+                        let take = (read_len - done).min(piece);
+                        let data = read_uncompressed_cached(
+                            vol,
+                            csum_root,
+                            logical + done as u64,
+                            take,
+                            le64(body, 0)?,
+                        )
+                        .await?;
+                        dst[d0 + done..d0 + done + take].copy_from_slice(&data);
+                        done += take;
+                    }
                 } else {
                     // Compressed extents are decoded whole, then sliced. The
                     // compressed payload of length `disk_num_bytes` lives at
