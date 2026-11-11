@@ -3382,11 +3382,16 @@ fn smoke_ath11k_dp_service_multi_pdev() -> TestResult {
     check!(ids(&dp, 0).len() == 15, "pdev 0 refill posted");
     check!(ids(&dp, 1).len() == 15, "pdev 1 refill posted");
 
-    // RXDMA error on pdev 1's own error ring: one link descriptor
-    // naming a posted pdev-1 buffer cookie (PDEV_ID 1). The freed
-    // buffer must come back to pdev 1's refill ring, not pdev 0's.
-    let refill1 = msg_for(&msgs1, &hal, refill_id);
-    let (_, cookie, _) = buf_addr_get(refill1.entry(0)[0], refill1.entry(0)[1]);
+    // RXDMA error on pdev 1's own error ring: the device takes a posted
+    // pdev-1 buffer off the refill ring (moving its TP, as RXDMA does
+    // before it can name the buffer in an error) and reports it in one
+    // link descriptor (cookie PDEV_ID 1). The freed buffer must come
+    // back to pdev 1's refill ring, not pdev 0's: the replenish only
+    // has room because the device consumed the slot
+    // (`ath11k_hal_srng_src_num_free` syncs the HW TP).
+    let mut refill1 = msg_for(&msgs1, &hal, refill_id);
+    let w = refill1.consume(&io).expect("posted pdev 1 buffer");
+    let (_, cookie, _) = buf_addr_get(w[0], w[1]);
     let buf0 = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, cookie);
     check!(
         field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, cookie) == 1,
@@ -3417,11 +3422,14 @@ fn smoke_ath11k_dp_service_multi_pdev() -> TestResult {
         "the freed id is the reposted one"
     );
 
-    // Same buf_id on both radios resolves independently: distinct
-    // patterns written into each radio's first buffer must come back
+    // Same buf_id on both radios resolves independently: the device
+    // takes pdev 1's next posted buffer, pdev 0 holds the same id;
+    // distinct patterns written into each radio's buffer must come back
     // from that radio's take, and the sibling's buffer must survive.
-    let id0 = ids(&dp, 0)[0];
-    let id1 = ids(&dp, 1)[0];
+    let w = refill1.consume(&io).expect("next posted pdev 1 buffer");
+    let id1 = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, buf_addr_get(w[0], w[1]).1);
+    let id0 = id1;
+    check!(ids(&dp, 0).contains(&id0), "pdev 0 holds the same buf_id");
     let p0 = dp.pdevs().find(|p| p.mac_id == 0).expect("pdev 0");
     p0.rx_refill_buf_ring
         .bufs
