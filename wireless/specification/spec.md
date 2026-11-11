@@ -611,7 +611,13 @@ Result<SaeStep, Error>`: `Transmit` (Confirm, or a Commit carrying an
 anti-clogging token, at most `MAX_ANTI_CLOGGING` = 3 rounds, group 19 only),
 `Ignored` (other peers, a reflected Commit, a retransmitted peer Commit) or
 `Associate` (the association request with the SAE PMKID spliced into its
-RSNE). Status codes other than 0/126/76 are terminal `Rejected`; a Commit
+RSNE). For a cached PMKSA the owner calls `start_pmksa_authentication(pmkid)`
+instead. It returns Open System authentication, and the association
+request's RSNE names that PMKID. `authentication_response` accepts the Open
+System reply only for such an attempt, and SAE and a cached attempt exclude
+each other on one plan. An AP that has lost the PMKSA refuses the
+association (`Rejected(53)`); the owner then runs full SAE on a fresh plan.
+Status codes other than 0/126/76 are terminal `Rejected`; a Commit
 status that disagrees with the PWE method or a Confirm before the peer
 Commit is `Protocol`. `sae_pending_frame()` supplies retransmissions;
 `start_authentication`/`authentication_response` refuse SAE plans. The PMK

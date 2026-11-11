@@ -30,6 +30,8 @@ pub enum ApError {
     Association,
     Key,
     Mic,
+    /// The association named a PMKID this AP holds no PMKSA for.
+    InvalidPmkid,
 }
 
 /// A deterministic Open/WPA2-PSK/WPA3-SAE CCMP access point.
@@ -285,6 +287,44 @@ impl FakeAp {
         Ok(self)
     }
 
+    /// A new association attempt after a completed SAE one, with the SAE
+    /// PMKSA still cached (hostapd keeps it for `dot11RSNAConfigPMKLifetime`):
+    /// Open System authentication plus that PMKID in the association
+    /// request reaches the 4-way handshake with the same PMK.
+    pub fn restart_keeping_pmksa(&mut self) -> Result<(), ApError> {
+        let profile = self.rsn.as_mut().ok_or(ApError::Configuration)?;
+        if !profile.sae.as_ref().is_some_and(|sae| sae.accepted) {
+            return Err(ApError::Phase);
+        }
+        profile.km = None;
+        profile.pmf = false;
+        profile.assoc_ies.clear();
+        self.ptk = None;
+        self.phase = ApPhase::Authentication;
+        Ok(())
+    }
+
+    /// The AP lost its PMKSA (restart, expiry): a cached PMKID is refused
+    /// with WLAN_STATUS_INVALID_PMKID and only a new SAE exchange works.
+    pub fn forget_pmksa(&mut self) -> Result<(), ApError> {
+        let profile = self.rsn.as_mut().ok_or(ApError::Configuration)?;
+        let sae = profile.sae.as_mut().ok_or(ApError::Configuration)?;
+        let (own, peer) = sae.addresses;
+        sae.session = match sae.pwe {
+            ApSaePwe::HuntAndPeck => SaeSession::new_hunt_and_peck(&sae.password, own, peer),
+            ApSaePwe::HashToElement => {
+                SaeSession::new_h2e_bytes(&sae.ssid, &sae.password, own, peer)
+            }
+        };
+        sae.accepted = false;
+        profile.km = None;
+        profile.pmf = false;
+        profile.assoc_ies.clear();
+        self.ptk = None;
+        self.phase = ApPhase::Authentication;
+        Ok(())
+    }
+
     /// Select the IGTK, its key ID (4 or 5) and the IPN message 3 reports.
     pub fn with_igtk(mut self, igtk: [u8; 16], key_id: u16, ipn: u64) -> Result<Self, ApError> {
         if self.mld.is_some() && self.phase != ApPhase::Authentication {
@@ -447,6 +487,18 @@ impl FakeAp {
             return Err(ApError::Frame);
         }
         match (self.phase, fc & 0x00fc) {
+            // hostapd accepts Open System authentication on an SAE BSS for
+            // PMKSA caching; the PMKID is checked at association.
+            (ApPhase::Authentication, 0xb0)
+                if fc & 0x0300 == 0
+                    && self.rsn.as_ref().is_some_and(|p| p.sae.is_some())
+                    && frame.get(24..30) == Some(&[0, 0, 1, 0, 0, 0]) =>
+            {
+                let mut response = self.header(0xb0, self.plan.station);
+                response.extend_from_slice(&[0, 0, 2, 0, 0, 0]);
+                self.phase = ApPhase::Association;
+                Ok(vec![response])
+            }
             (ApPhase::Authentication, 0xb0)
                 if fc & 0x0300 == 0 && self.rsn.as_ref().is_some_and(|p| p.sae.is_some()) =>
             {
@@ -462,7 +514,19 @@ impl FakeAp {
                 Ok(vec![response])
             }
             (ApPhase::Association, 0x00) if fc & 0x0300 == 0 => {
-                self.check_association(frame)?;
+                if let Err(error) = self.check_association(frame) {
+                    if error != ApError::InvalidPmkid {
+                        return Err(error);
+                    }
+                    // WLAN_STATUS_INVALID_PMKID: the station falls back to
+                    // full SAE (wpa_supplicant drops the PMKSA entry).
+                    let mut response = self.header(0x10, self.plan.station);
+                    response.extend_from_slice(&self.capabilities().to_le_bytes());
+                    response.extend_from_slice(&53u16.to_le_bytes());
+                    response.extend_from_slice(&0u16.to_le_bytes());
+                    self.phase = ApPhase::Authentication;
+                    return Ok(vec![response]);
+                }
                 let mut response = self.header(0x10, self.plan.station);
                 response.extend_from_slice(&self.capabilities().to_le_bytes());
                 response.extend_from_slice(&0u16.to_le_bytes());
@@ -606,7 +670,18 @@ impl FakeAp {
                 })
             })
             || match (self.rsn.as_mut(), rsn) {
-                (Some(profile), Some(rsn)) => !profile.admit(rsn, rsnxe),
+                (Some(profile), Some(rsn)) => {
+                    if profile.admit(rsn, rsnxe) {
+                        false
+                    } else {
+                        let names_pmkid = narf_wireless::rsn::RsnIe::decode_body(&rsn[2..])
+                            .is_some_and(|ie| !ie.pmkids.is_empty());
+                        if profile.sae.is_some() && names_pmkid {
+                            return Err(ApError::InvalidPmkid);
+                        }
+                        true
+                    }
+                }
                 (Some(_), None) => true,
                 (None, _) if self.pmk.is_some() => rsn != Some(self.rsn_ie().as_slice()),
                 (None, _) => rsn.is_some(),

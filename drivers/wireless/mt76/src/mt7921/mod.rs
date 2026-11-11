@@ -56,6 +56,7 @@ mod p2p_cnm;
 mod p2p_wire;
 mod packet_tx;
 pub mod pci;
+pub(crate) mod pmksa;
 mod registers;
 mod registers_tests;
 pub mod regs;

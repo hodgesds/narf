@@ -645,6 +645,29 @@ pub(crate) fn boot_receive_publish(epoch: u64, publish: impl FnOnce()) -> Result
 pub(crate) static BOOT_FRAG_THRESHOLD: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
 
+/// NL80211_CMD_DEL_PMKSA / FLUSH_PMKSA for the home station's SAE PMKSA
+/// cache, applied by the boot owner before each join and packet step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PmksaRequest {
+    Flush,
+    Bssid([u8; 6]),
+    Pmkid([u8; 16]),
+}
+pub(crate) static BOOT_PMKSA_REQUESTS: narf_lib::sync::IrqSafeSpinLock<Vec<PmksaRequest>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+
+/// Apply queued PMKSA requests to `cache`.
+pub(crate) fn apply_pmksa_requests(cache: &mut crate::mt7921::pmksa::Cache) {
+    let requests = core::mem::take(&mut *BOOT_PMKSA_REQUESTS.lock());
+    for request in requests {
+        match request {
+            PmksaRequest::Flush => cache.flush(),
+            PmksaRequest::Bssid(bssid) => cache.remove(bssid),
+            PmksaRequest::Pmkid(pmkid) => cache.remove_pmkid(pmkid),
+        }
+    }
+}
+
 /// cfg80211 `wdev->ps` for the home station (`NL80211_CMD_SET_POWER_SAVE`):
 /// on by default as with `CONFIG_CFG80211_DEFAULT_PS`. The boot owner
 /// samples it before each packet step and applies it to an associated BSS.
@@ -1817,6 +1840,8 @@ struct Session<B: Backend> {
     wtbl: crate::mt7921::vif_slots::Wtbl,
     /// The wiphy fragmentation threshold (`u32::MAX` = off).
     frag_threshold: u32,
+    /// The home station's SAE PMKSA cache.
+    pmksa: crate::mt7921::pmksa::Cache,
     receive_epoch: u64,
     /// Original copy-time native packets handed from the scan collector to
     /// the associated station's parsers; never re-stamped at delivery.
@@ -1850,6 +1875,7 @@ impl<B: Backend> Session<B> {
             go: None,
             wtbl: crate::mt7921::vif_slots::Wtbl::default(),
             frag_threshold: u32::MAX,
+            pmksa: crate::mt7921::pmksa::Cache::default(),
             receive_epoch: 0,
             scan_packets: VecDeque::new(),
             scanning: false,

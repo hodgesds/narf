@@ -1965,6 +1965,7 @@ impl Transport {
             State::RadioReady(info) | State::ScanReady(info) => info,
             _ => return Err(Error::Busy),
         };
+        super::apply_pmksa_requests(&mut self.session.pmksa);
         // `heard_beacon`: the latest scan received this BSS's Beacon, so a
         // radar/NO_IR channel it operates on may be joined (never probed).
         let permission = crate::mt7921::association::TxPermission::from_ap_heard(
@@ -2115,6 +2116,7 @@ impl Transport {
             super::BOOT_FRAG_THRESHOLD.load(core::sync::atomic::Ordering::Relaxed);
         self.session.station.ps_wanted =
             super::BOOT_POWER_SAVE.load(core::sync::atomic::Ordering::Relaxed);
+        super::apply_pmksa_requests(&mut self.session.pmksa);
         self.session.step_network(tx)
     }
     pub(super) fn receive_current(&self, epoch: u64) -> Result<bool, Error> {

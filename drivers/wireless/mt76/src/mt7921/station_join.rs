@@ -1854,6 +1854,27 @@ impl<B: Backend> Session<B> {
         Err(Error::MalformedEvent)
     }
 
+    /// Wait for the AP's Open System Authentication response and return
+    /// the association request it releases.
+    async fn open_authentication_response(
+        &mut self,
+        plan: &mut JoinPlan,
+        rx_channel: u8,
+    ) -> Result<Vec<u8>, Error> {
+        self.wait_station_rx(3_000, |_, packet| {
+            if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                if let Some(assoc) = plan
+                    .authentication_response(frame)
+                    .map_err(|_| Error::MalformedEvent)?
+                {
+                    return Ok(Some(assoc.to_vec()));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
     pub(super) async fn associate_station(
         &mut self,
         bss: &ScanBss,
@@ -1954,6 +1975,20 @@ impl<B: Backend> Session<B> {
         self.station.wmm_pending = None;
         self.station.permission = Some(permission);
         let mut sae_pmk: Option<Zeroizing<[u8; 32]>> = None;
+        // The SAE network's credentials, and its live cached PMKSA for this
+        // BSS (wpa_supplicant `pmksa_cache_get`).
+        let credentials = match security {
+            Security::Wpa3Sae { password } => {
+                Some(crate::mt7921::pmksa::binding(ssid, password.as_bytes()))
+            }
+            _ => None,
+        };
+        let mut cached = credentials.and_then(|binding| {
+            let now = self.backend.now_ns();
+            self.pmksa.lookup(bss.bssid, binding, now)
+        });
+        // The PMKSA a full SAE exchange produced, recorded on success.
+        let mut new_pmksa: Option<([u8; 16], Zeroizing<[u8; 32]>)> = None;
         let result = async {
             if setup {
                 self.stage(Stage::ScanSetup);
@@ -2030,51 +2065,88 @@ impl<B: Backend> Session<B> {
 
             // 3. Send Authentication Request:
             self.stage(Stage::Authenticate);
-            let assoc_req = if let Security::Wpa3Sae { password } = security {
-                let (request, pmk) = self
-                    .authenticate_sae(&mut plan, bss, ssid, own, password, rx_channel)
-                    .await?;
-                sae_pmk = Some(pmk);
-                request
-            } else {
-                let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
-                self.send_management(auth_req, u16::from(self.station.link.peer()))
-                    .await?;
-
-                // 4. Wait for Authentication Response:
-                self.wait_station_rx(3_000, |_, packet| {
-                    if let Some(frame) = rx_on_channel(packet, rx_channel) {
-                        if let Some(assoc) = plan
-                            .authentication_response(frame)
-                            .map_err(|_| Error::MalformedEvent)?
-                        {
-                            return Ok(Some(assoc.to_vec()));
+            let aid = loop {
+                let attempt = async {
+                    let assoc_req = match (security, cached.as_ref()) {
+                        // PMKSA caching: Open System authentication and the
+                        // cached PMKID instead of a new SAE exchange.
+                        (Security::Wpa3Sae { .. }, Some((pmkid, pmk))) => {
+                            let auth_req = plan
+                                .start_pmksa_authentication(*pmkid)
+                                .map_err(|_| Error::Busy)?
+                                .to_vec();
+                            self.send_management(&auth_req, u16::from(self.station.link.peer()))
+                                .await?;
+                            let request = self
+                                .open_authentication_response(&mut plan, rx_channel)
+                                .await?;
+                            sae_pmk = Some(Zeroizing::new(**pmk));
+                            request
                         }
+                        (Security::Wpa3Sae { password }, None) => {
+                            let (request, pmk) = self
+                                .authenticate_sae(&mut plan, bss, ssid, own, password, rx_channel)
+                                .await?;
+                            new_pmksa = plan
+                                .sae()
+                                .and_then(|join| join.pmkid())
+                                .map(|pmkid| (pmkid, Zeroizing::new(*pmk)));
+                            sae_pmk = Some(pmk);
+                            request
+                        }
+                        _ => {
+                            let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
+                            self.send_management(auth_req, u16::from(self.station.link.peer()))
+                                .await?;
+                            // 4. Wait for Authentication Response:
+                            self.open_authentication_response(&mut plan, rx_channel)
+                                .await?
+                        }
+                    };
+
+                    // 5. Send Association Request:
+                    self.stage(Stage::Associate);
+                    self.send_management(&assoc_req, u16::from(self.station.link.peer()))
+                        .await?;
+
+                    // 6. Wait for Association Response:
+                    self.wait_station_rx(3_000, |_, packet| {
+                        if let Some(frame) = rx_on_channel(packet, rx_channel) {
+                            if let Some(aid) =
+                                plan.association_response(frame)
+                                    .map_err(|error| match error {
+                                        // The status itself only selects the
+                                        // PMKSA fallback below.
+                                        narf_wireless::association::Error::Rejected(status) => {
+                                            Error::Rejected(u8::try_from(status).unwrap_or(u8::MAX))
+                                        }
+                                        _ => Error::MalformedEvent,
+                                    })?
+                            {
+                                return Ok(Some(aid));
+                            }
+                        }
+                        Ok(None)
+                    })
+                    .await
+                }
+                .await;
+                match attempt {
+                    Ok(aid) => break aid,
+                    // wpa_supplicant: "PMKSA caching attempt rejected - drop
+                    // PMKSA cache entry and fall back to SAE authentication"
+                    // (WLAN_STATUS_INVALID_PMKID, or no answer to it).
+                    Err(_) if cached.take().is_some() => {
+                        self.pmksa.remove(bss.bssid);
+                        sae_pmk = None;
+                        plan =
+                            JoinPlan::prepare_native(bss, own, ssid, security, info, permission)?;
+                        plan.append_sme_ies(extra_ies).map_err(|_| Error::Bounds)?;
+                        self.stage(Stage::Authenticate);
                     }
-                    Ok(None)
-                })
-                .await?
+                    Err(error) => return Err(error),
+                }
             };
-
-            // 5. Send Association Request:
-            self.stage(Stage::Associate);
-            self.send_management(&assoc_req, u16::from(self.station.link.peer()))
-                .await?;
-
-            // 6. Wait for Association Response:
-            let aid = self
-                .wait_station_rx(3_000, |_, packet| {
-                    if let Some(frame) = rx_on_channel(packet, rx_channel) {
-                        if let Some(aid) = plan
-                            .association_response(frame)
-                            .map_err(|_| Error::MalformedEvent)?
-                        {
-                            return Ok(Some(aid));
-                        }
-                    }
-                    Ok(None)
-                })
-                .await?;
 
             self.station.management_rate = plan.management_rate();
             if let Some((width, center)) = plan.phy_channel() {
@@ -2322,6 +2394,10 @@ impl<B: Backend> Session<B> {
                 self.station.link_stats = Default::default();
                 self.station.ps_applied = false;
                 self.station.applied_policy = self.backend.regulatory_domain().ok();
+                if let (Some(binding), Some((pmkid, pmk))) = (credentials, new_pmksa.take()) {
+                    let now = self.backend.now_ns();
+                    self.pmksa.insert(bss.bssid, binding, pmkid, &pmk, now);
+                }
                 self.station.bss = Some(bss.clone());
                 self.station.wmm = plan.wmm();
                 self.station.ht20_profile = plan.ht20();
@@ -2343,6 +2419,12 @@ impl<B: Backend> Session<B> {
                 Ok(aid)
             }
             Err(error) => {
+                // A join that used a cached PMKSA and still failed (a 4-way
+                // handshake the AP's PMK did not match) drops the entry, as
+                // wpa_supplicant clears the current PMKSA on that failure.
+                if cached.is_some() {
+                    self.pmksa.remove(bss.bssid);
+                }
                 self.station.security = None;
                 self.station.wmm = None;
                 self.station.wmm_pending = None;

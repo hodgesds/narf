@@ -534,6 +534,11 @@ impl JoinPlan {
     pub fn start_authentication(&mut self) -> Result<&[u8], Error> {
         self.common.start_authentication()
     }
+    /// SAE with a cached PMKSA: Open System authentication and the PMKID
+    /// in the association request (`JoinPlan::start_pmksa_authentication`).
+    pub fn start_pmksa_authentication(&mut self, pmkid: [u8; 16]) -> Result<&[u8], Error> {
+        self.common.start_pmksa_authentication(pmkid)
+    }
     pub fn authentication_response(&mut self, bytes: &[u8]) -> Result<Option<&[u8]>, Error> {
         let typed_phy = self.common.offered_phy().is_some();
         let Some(request) = self.common.authentication_response(bytes)? else {
