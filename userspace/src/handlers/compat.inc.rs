@@ -8667,6 +8667,7 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSna
             mnt_id: name.and_then(|name| name.mount_id).unwrap_or(0),
             ino: ops.ino(),
         },
+        file: narf_filesystem::procfs::ProcFdFile(Some(ops)),
     })
 }
 

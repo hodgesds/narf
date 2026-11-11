@@ -327,7 +327,34 @@ pub struct ProcFdInfo {
 pub struct ProcFdSnapshot {
     pub path: String,
     pub info: ProcFdInfo,
+    /// The open file itself: its `FileOps::show_fdinfo` ends the fd's
+    /// fdinfo.
+    pub file: ProcFdFile,
 }
+
+/// The open file a [`ProcFdSnapshot`] describes. Two are equal when they
+/// are the same open file.
+#[derive(Clone, Default)]
+pub struct ProcFdFile(pub Option<Arc<dyn FileOps>>);
+impl fmt::Debug for ProcFdFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "ProcFdFile(open)"
+        } else {
+            "ProcFdFile(none)"
+        })
+    }
+}
+impl PartialEq for ProcFdFile {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => core::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for ProcFdFile {}
 
 /// One virtual-memory area entry. Mirrors what `/proc/[pid]/maps`
 /// reports per line: range, protection bits, and optional file backing.
@@ -448,6 +475,18 @@ pub fn __test_pidns_hooks_restore(snap: (usize, usize, usize, usize)) {
     PID_RESOLVE_HOOK.store(snap.1, Ordering::Release);
     PID_REPORT_HOOK.store(snap.2, Ordering::Release);
     CURRENT_TID_HOOK.store(snap.3, Ordering::Release);
+}
+
+/// The calling process's id, as `/proc/self` resolves it (0 before the
+/// process hooks are installed). For drivers that record who uses an open
+/// file (drm_file_update_pid).
+pub fn current_process_id() -> u64 {
+    current_outer_pid()
+}
+
+/// The name (`comm`) of process `pid`, if it is alive.
+pub fn process_comm(pid: u64) -> Option<String> {
+    task_info(pid, TaskInfoQuery::Basic).map(|task| task.comm)
 }
 
 pub(crate) fn current_pid() -> u64 {
@@ -894,6 +933,17 @@ pub(crate) fn hook_fd_pidfd_pid(pid: u64, fd: u32) -> Option<u64> {
     // SAFETY: v was stored by set_fd_pidfd_pid_hook as a FdPidfdPidFn fn-pointer; non-zero confirms it.
     let f: FdPidfdPidFn = unsafe { core::mem::transmute(v) };
     f(pid, fd)
+}
+
+/// The open file behind fd `fd` of `pid`, for its `show_fdinfo`.
+pub(crate) fn hook_fd_file(pid: u64, fd: u32) -> Option<Arc<dyn FileOps>> {
+    let v = FD_PATH_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: stored by install_proc_ext_hooks as an FdSnapshotFn; non-zero confirms it.
+    let f: FdSnapshotFn = unsafe { core::mem::transmute(v) };
+    f(pid, fd).and_then(|snapshot| snapshot.file.0)
 }
 
 pub(crate) fn hook_fd_info(pid: u64, fd: u32) -> Option<ProcFdInfo> {

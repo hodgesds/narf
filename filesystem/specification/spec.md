@@ -1759,7 +1759,14 @@ through `open(2)` produces an nsfs-like descriptor that retains the
 namespace object for `setns(2)`; `O_PATH|O_NOFOLLOW` instead opens the symlink
 node itself. The proc fd provider returns one `ProcFdSnapshot` containing the
 link target plus live offset, status flags, mount ID, and inode identity, so
-`fd/` and `fdinfo/` project the same open file description.
+`fd/` and `fdinfo/` project the same open file description. The snapshot also
+carries the open file itself (`ProcFdSnapshot::file`), and `fdinfo/<fd>` ends
+with whatever that file's `FileOps::show_fdinfo` writes — Linux's
+`file_operations::show_fdinfo`, which DRM device files use for the
+`drm-*` usage keys. The default writes nothing.
+`procfs::current_process_id()` and `procfs::process_comm(pid)` expose the
+caller's process id and a process's name to drivers through the same hooks
+procfs reads them with.
 For user namespaces, `/proc/<pid>/uid_map` and `gid_map` expose parent-to-child
 id ranges, while `setgroups` reads `allow` or `deny` and accepts the one-way
 `deny` transition before `gid_map` is installed. Their inode owners use the
