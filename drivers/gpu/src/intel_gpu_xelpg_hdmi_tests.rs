@@ -589,6 +589,25 @@ fn position(io: &ExtFake, f: impl Fn(u64, u32) -> bool) -> Option<usize> {
     io.writes.borrow().iter().position(|&(o, v)| f(o, v))
 }
 
+fn smoke_mtl_routes_leave_stack_for_resource_planning() -> TestResult {
+    // These values also live in activation results and error paths. Keep
+    // repeated route temporaries small enough to leave planner scratch room
+    // on ARM's 64 KiB bootstrap stack. The 4K60 lifecycle below exercises the
+    // complete call chain; inline resource snapshots copied through owners
+    // and results made it overflow that stack.
+    if core::mem::size_of::<MtlHdmiRoute>() > 2048
+        || core::mem::size_of::<crate::intel_gpu_xelpg_external::MtlExternalRoute>() > 2048
+        || core::mem::size_of::<crate::intel_gpu_xelpg_pipes::Pipes>() > 512
+    {
+        return TestResult::Fail("route values must leave room for resource planner scratch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/intel_gpu_xelpg_hdmi",
+    smoke_mtl_routes_leave_stack_for_resource_planning
+);
+
 fn smoke_mtl_hdmi_594_scrambled_route_scdc_order_and_reset() -> TestResult {
     let io = ddi_b_hdmi_sink(&edid_with_cta(edid_4k60(), &hf_vsdb(120, 0x80)));
     let probe = match probe_hdmi(

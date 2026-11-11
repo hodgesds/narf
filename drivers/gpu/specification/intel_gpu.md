@@ -7343,6 +7343,13 @@ reverse stop order. Failed local stop quarantines the owner and backing.
 The boot-console publication remains the first stream; multi-monitor
 compositor/KMS expansion is not part of this transport change.
 
+Pipe owners heap-allocate retained resource state before programming a
+transaction, and display-layout proofs return heap-owned temporary snapshots.
+Native fixtures bound inline DP/HDMI route values to 2 KiB and pipe-owner
+values to 512 bytes, leaving room for nested watermark/DBUF planner scratch
+on AArch64's 64 KiB bootstrap stack. Cloned snapshots keep independent
+ownership; a failed transition retains the previous state.
+
 The older Intel bridge now uses a source-qualified Dekel PLL for Tiger Lake
 and Alder Lake-P rather than combo DPLL0. Bank selection and access are
 serialized, masks preserve unrelated PLL fields, the DSSM reference selects
