@@ -44,6 +44,9 @@ use super::mci::{
 };
 use super::{field, rmw, Chip, HW_CAP_MCI};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
+use alloc::sync::Arc;
+use narf_io::DmaBuffer;
+use narf_lib::sync::IrqSafeSpinLock;
 
 /// `btcoex.h::ATH_WLANACTIVE_GPIO_9300`.
 const WLANACTIVE_GPIO_9300: u8 = 5;
@@ -276,6 +279,41 @@ impl Btcoex {
             bt_coex_mode2: 0,
             bt_coex_mode3: 0,
         }
+    }
+}
+
+/// The live MCI link the AR9300 owner and its packet engine share: the
+/// coexistence state (scheme + `Mci` engine) plus the coherent DMA
+/// buffer the hardware's GPM ring lives in (`mci.c::ath_mci_setup`'s
+/// single `dmam_alloc_coherent(SCHED + GPM)`; 256-byte schedule table
+/// followed by the 256-byte GPM ring, `mci::MCI_DMA_BUF_BYTES`).
+/// One instance is shared — two would diverge (GPM ring, `bt_state`).
+/// The owner creates it at probe; the packet engine holds a clone and
+/// reaches the engine only through this lock, so register writes stay
+/// serialized under the station lock.
+pub(in crate::ath9k) struct MciLink {
+    /// The coexistence state (scheme + `Mci` engine).
+    pub(in crate::ath9k) btcoex: Btcoex,
+    /// The 512-byte coherent DMA buffer (`None` when the scheme is not
+    /// MCI, the allocation was refused under a per-domain IOMMU, or it
+    /// failed; the engine then stays not-ready and every MCI call is a
+    /// no-op). Never program address 0: the DMA addresses are only
+    /// handed to the engine once this is `Some`.
+    pub(in crate::ath9k) dma: Option<Arc<DmaBuffer>>,
+}
+
+/// The shared MCI link, behind the lock the owner and the packet engine
+/// both take (never held across an await).
+pub(in crate::ath9k) type SharedMciLink = Arc<IrqSafeSpinLock<MciLink>>;
+
+impl MciLink {
+    /// The live-MCI gate: the scheme is MCI and the DMA ring exists.
+    /// `init_scheme` with coexistence compiled in selects MCI exactly
+    /// when `mci_is_enabled(true, hw_caps)` holds, so this is that
+    /// predicate (`hw.h::ath9k_hw_mci_is_enabled`), plus the DMA the
+    /// engine must have before any address is programmed.
+    pub(in crate::ath9k) fn mci_enabled(&self) -> bool {
+        self.btcoex.scheme == Scheme::Mci && self.dma.is_some()
     }
 }
 

@@ -115,6 +115,9 @@ pub(super) struct Owner {
     radio: ar9003::calib::Calibration,
     /// `ah->totalPowerMeasI/Q`, `totalIqCorrMeas` (never cleared in Linux).
     totals: Arc<IrqSafeSpinLock<ar9003::calib::IqTotals>>,
+    /// The live MCI link (coexistence state + DMA GPM ring), shared
+    /// with the packet engine; created at probe.
+    mci_link: ar9003::btcoex::SharedMciLink,
     station: Option<RetainedRadio>,
     attempted: bool,
     /// Physical generation; bumped by each successful generation reset.
@@ -376,6 +379,56 @@ pub(super) fn probe(
         identity.rx_chainmask,
         identity.tx_chainmask
     );
+    // `ath9k_init_btcoex` (`gpio.c`) + `ath_mci_setup` (`mci.c`): pick
+    // the scheme from the capability, install the MCI defaults, and —
+    // for MCI parts — allocate the single 512-byte coherent DMA buffer
+    // (schedule table + GPM ring), fill it with the reserved pattern,
+    // and run the MCI setup. A refused allocation (per-domain IOMMU)
+    // or a failed setup leaves the engine not-ready; WLAN bring-up
+    // proceeds without coexistence.
+    let mut btcoex = ar9003::btcoex::Btcoex::new(revision.chip);
+    ar9003::btcoex::init_scheme(&mut btcoex, true, identified.hw_caps);
+    ar9003::btcoex::init_mci(&mut btcoex);
+    let mut mci_dma = None;
+    if btcoex.scheme == ar9003::btcoex::Scheme::Mci
+        && narf_io::iommu::mode() != narf_io::iommu::IommuMode::PerDomain
+    {
+        match narf_io::alloc_coherent_masked(
+            ar9003::mci::MCI_DMA_BUF_BYTES,
+            narf_lib::id::DomainId::DRIVER_0,
+            u64::from(u32::MAX),
+        ) {
+            Ok(mut buffer) => {
+                buffer
+                    .as_mut_slice()
+                    .fill(ar9003::mci::MCI_GPM_RSVD_PATTERN);
+                let sched_addr = buffer.dma_addr().raw() as u32;
+                let gpm_addr = buffer
+                    .dma_addr_at(ar9003::mci::MCI_GPM_DMA_OFFSET as u64)
+                    .raw() as u32;
+                if let Err(error) =
+                    ar9003::mci::setup(&mut io, &mut btcoex.mci, gpm_addr, sched_addr)
+                {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  ath9k: MCI setup closed: {:?}; continuing without coexistence",
+                        error
+                    );
+                }
+                mci_dma = Some(Arc::new(buffer));
+            }
+            Err(_) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  ath9k: MCI DMA buffer allocation failed; continuing without coexistence"
+                );
+            }
+        }
+    }
+    let mci_link = Arc::new(IrqSafeSpinLock::new(ar9003::btcoex::MciLink {
+        btcoex,
+        dma: mci_dma,
+    }));
     let (vendor, device_id) = (device.id.vendor, device.id.device);
     // ath9k_init_wow: `ATH9K_PCI_WOW` driver_data (AR9462 subsystems only).
     let wow = ar9003::wow::init_capable(
@@ -404,6 +457,7 @@ pub(super) fn probe(
         grant,
         radio: ar9003::calib::Calibration::default(),
         totals: Arc::new(IrqSafeSpinLock::new(ar9003::calib::IqTotals::default())),
+        mci_link,
         station: None,
         attempted: false,
         generation: 0,
@@ -433,11 +487,21 @@ pub(super) fn probe(
             if attempt > 0 {
                 narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)).await;
             }
-            result = {
+            // A recalibration demand is retried through a generation
+            // reset (the radio is one-shot: a bare `initialize` retry
+            // would see `State::Ready` and return `BadState`). The
+            // reset locks `CONTROL` itself, so it is not called under
+            // the loop's guard.
+            result = if matches!(result, Err(BringUpError::RecalibrationNeeded)) {
+                reset(&owner, None, None).await
+            } else {
                 let _control = CONTROL.lock().await;
-                initialize(&owner).await
+                initialize(&owner, false).await
             };
-            if !matches!(result, Err(BringUpError::Policy)) {
+            if !matches!(
+                result,
+                Err(BringUpError::Policy | BringUpError::RecalibrationNeeded)
+            ) {
                 break;
             }
         }
@@ -463,9 +527,15 @@ pub(super) fn probe(
     Ok(())
 }
 
-/// `ath9k_hw_apply_txpower` at the signed ceiling, calibrate, then compose
-/// the native owners.
-async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, BringUpError> {
+/// `ath9k_hw_apply_txpower` at the signed ceiling, the MCI reset and
+/// calibration handshake, calibrate, then compose the native owners.
+/// `save_fullsleep` is the chip-fullsleep state the generation reset
+/// captured before the chip reset (the MCI stop/reset steps need the
+/// pre-reset value); the first bring-up passes false.
+async fn initialize(
+    owner: &Mutex<Owner>,
+    save_fullsleep: bool,
+) -> Result<ar9003::calib::Report, BringUpError> {
     let domain = narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
     if narf_net::trusted_net_authority().is_none() {
         return Err(BringUpError::Policy);
@@ -506,6 +576,47 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
     grant.invoke(|| {
         ar9003::serdes::configure(&mut io, &o.revision, &tables, false, o.wa, o.aspm_l1_fix)
     })?;
+    // `ath9k_hw_reset` step 5 (`hw.c`): re-program the MCI engine after
+    // the chip reset (the chip reset wiped its registers), then ask BT
+    // for a WLAN calibration window (`ar9003_calib.c` runs
+    // `init_cal_req` before the AGC calibration, gated on MCI + 2G).
+    // A failed MCI reset leaves the engine not-ready and this
+    // generation runs without coexistence; the next generation retries.
+    let is_2g = o.primary < 4800;
+    let mut mci_live = false;
+    {
+        let mut link = o.mci_link.lock();
+        if link.mci_enabled() {
+            // Clone the ring out of the link first: the sync takes the
+            // DMA buffer by reference while mutating the engine behind
+            // the same lock.
+            let dma = link.dma.clone();
+            if let Some(dma) = &dma {
+                ar9003::mci::sync_gpm_ring(&mut io, dma, &mut link.btcoex.mci);
+            }
+            match ar9003::mci::reset(&mut io, &mut link.btcoex.mci, false, is_2g, save_fullsleep) {
+                Ok(()) => {
+                    mci_live = true;
+                    if is_2g {
+                        // `is_reusable` has no consumer here: Linux uses
+                        // it only to decide whether the next `init_cal`
+                        // may reuse TX-IQ/CL coefficients, and this
+                        // owner always computes fresh ones (one-shot
+                        // calibration).
+                        let mut is_reusable = true;
+                        ar9003::mci::init_cal_req(&mut io, &mut link.btcoex.mci, &mut is_reusable);
+                    }
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "ath9k: AR9003 MCI reset closed: {:?}; continuing without coexistence",
+                        error
+                    );
+                }
+            }
+        }
+    }
     let prepared = o.prepared;
     let revision = o.revision;
     // SAFETY: probe or the last generation reset identified this AR9300
@@ -524,6 +635,39 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
         )
     }
     .await?;
+    if mci_live {
+        // `ar9003_calib.c` runs `init_cal_done` after the AGC
+        // calibration; `ath9k_hw_reset` step 7 (`end_reset`), step 8
+        // (the MCI-branch enable: `ath9k_start_btcoex` stomps NONE,
+        // then enables) and step 9 (`check_bt`) follow, with the
+        // channel map for the target (`main.c::ath9k_set_assoc_state`
+        // sends it with `allow_all=false`; the `true` case is "no
+        // primary station", which this owner never has). NARF is
+        // 20 MHz only, so `Ht40::None`; `check_bt` runs the pending
+        // 2G/5G switch, so no separate `switch_2g5g` call is needed
+        // here.
+        let mut link = o.mci_link.lock();
+        ar9003::mci::init_cal_done(&mut io, &mut link.btcoex.mci);
+        if let ar9003::mci::EndReset::RecalibrationNeeded =
+            ar9003::mci::end_reset(&mut io, &mut link.btcoex.mci, is_2g)?
+        {
+            // The caller re-arms the TIMING4 gain/DC/IQ-cal bit; the
+            // recalibration itself is a fresh generation reset (the
+            // radio is one-shot).
+            ar9003::mci::set_timing4_gain_dc_iq_cal(&mut io, true)?;
+            return Err(BringUpError::RecalibrationNeeded);
+        }
+        ar9003::btcoex::bt_stomp(&mut link.btcoex, ar9003::btcoex::StompType::None);
+        ar9003::btcoex::enable_mci(&mut io, &mut link.btcoex)?;
+        ar9003::mci::check_bt(&mut io, &mut link.btcoex.mci)?;
+        ar9003::mci::update_wlan_channels(
+            &mut io,
+            &mut link.btcoex.mci,
+            o.primary,
+            ar9003::mci::Ht40::None,
+            false,
+        )?;
+    }
     // The attempt is retained before any MAC mutation.
     o.attempted = true;
     let station = compose(&mut o, report, permission).map_err(|error| {
@@ -617,7 +761,7 @@ fn compose(
     let _ = native.arm_msi();
     // SAFETY: complete parked MAC/key-cache/queue preparation succeeded on
     // this same non-cloneable native adapter; prepare does not start DMA.
-    let packet = unsafe { ar9003::packet::Packet::prepare(native, mac) }?;
+    let packet = unsafe { ar9003::packet::Packet::prepare(native, mac, o.mci_link.clone()) }?;
     // `channels` routes this generation's retunes (either band) to
     // `transition`; HT40 requests fail closed (no AR9300 HT owner).
     let station = Arc::new(Mutex::new(station::Radio::new(
@@ -663,6 +807,9 @@ async fn reset(
     expected: Option<u32>,
 ) -> Result<ar9003::calib::Report, BringUpError> {
     let _control = CONTROL.lock().await;
+    // Assigned inside the locked block below (the pre-reset fullsleep
+    // value); every path that reaches `initialize` passes through it.
+    let save_fullsleep;
     {
         let mut o = owner.lock().await;
         if o.removed || o.pinned || o.suspended {
@@ -677,9 +824,32 @@ async fn reset(
                 narf_wireless::reg::db::ensure_domain().map_err(|_| BringUpError::Policy)?;
             calibration::Permission::from_domain_dual(&domain, target)?;
         }
+        // `ath9k_hw_reset` saves `ah->chip_fullsleep` before the chip
+        // reset; the MCI stop/reset steps need the pre-reset value.
+        save_fullsleep = o.fullsleep;
         // An absent, unsigned or foreign record for the target never
         // retires the current generation.
         let grant = record(&o, target)?;
+        // `ath9k_hw_reset` step 1: if BT is calibrating, grant it the
+        // window and skip this reset; the station stays live and the
+        // supervisor retries on the next tick (a retune fails cleanly
+        // to its requester instead of dropping the request).
+        {
+            let mut link = o.mci_link.lock();
+            if link.mci_enabled() {
+                let mut io = identity::Registers::new(o.mmio, o.cap);
+                // Clone the ring out of the link first: the sync takes
+                // the DMA buffer by reference while mutating the engine
+                // behind the same lock.
+                let dma = link.dma.clone();
+                if let Some(dma) = &dma {
+                    ar9003::mci::sync_gpm_ring(&mut io, dma, &mut link.btcoex.mci);
+                }
+                if ar9003::mci::start_reset(&mut io, &mut link.btcoex.mci, target < 4800) {
+                    return Err(BringUpError::RecalibrationNeeded);
+                }
+            }
+        }
         if !retire(&mut o).await {
             return Err(BringUpError::BadState);
         }
@@ -696,10 +866,23 @@ async fn reset(
         o.attempted = true;
         let mut io = identity::Registers::new(o.mmio, o.cap);
         let wa = o.wa;
+        // `ath9k_hw_reset` step 3: stop BT before the chip reset.
+        {
+            let mut link = o.mci_link.lock();
+            if link.mci_enabled() {
+                ar9003::mci::stop_bt(&mut io, &mut link.btcoex.mci, save_fullsleep)?;
+            }
+        }
         // ath9k_hw_setpower(AWAKE) is a no-op unless FULL_SLEEP parked
         // the chip (its RTC SHUTDOWN then takes the power-on reset).
         if o.fullsleep {
             ar9003::set_power_awake(&mut io, wa)?;
+            // `ath9k_hw_set_power_awake` also runs the MCI LNA
+            // workaround when MCI is enabled (`hw.c`).
+            let link = o.mci_link.lock();
+            if link.mci_enabled() {
+                ar9003::mci::set_power_awake(&mut io)?;
+            }
         }
         let led = read_led(&mut io)?;
         let busy = io.read32(AR_Q_TXE);
@@ -738,7 +921,7 @@ async fn reset(
         o.generation = o.generation.checked_add(1).ok_or(BringUpError::BadState)?;
         o.attempted = false;
     }
-    initialize(owner).await
+    initialize(owner, save_fullsleep).await
 }
 
 /// `main.c::ath_reset` on the current channel (`ath9k_queue_reset` ->
@@ -965,6 +1148,19 @@ async fn supervise(owner: Shared) {
             continue;
         }
         if !terminal {
+            // Periodic MCI poll (`ar9003_mci_check_bt`): sync BT state,
+            // the 2G/5G switch and the BT-info query/flush. A failed
+            // poll never closes the generation (Linux's `check_bt` is
+            // void); it is logged and the next tick retries.
+            if let Some(mut radio) = station.try_lock() {
+                if let Err(error) = radio.check_bt() {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "ath9k: AR9003 periodic MCI check closed: {:?}",
+                        error
+                    );
+                }
+            }
             continue;
         }
         drop(station);
@@ -1099,6 +1295,17 @@ pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     o.attempted = true;
     o.suspended = true;
     o.fullsleep = true;
+    // `ath9k_hw_setpower(FULL_SLEEP)` halts the BT GPM exchange when
+    // MCI is enabled (`hw.c`); resume's generation reset re-runs
+    // `mci::reset`, which re-arms the engine.
+    {
+        let mut link = o.mci_link.lock();
+        if link.mci_enabled() {
+            let mut io = identity::Registers::new(o.mmio, o.cap);
+            ar9003::mci::set_full_sleep(&mut io, &mut link.btcoex.mci)
+                .map_err(|_| DeviceSuspendError::DriverError)?;
+        }
+    }
     let mut io = identity::Registers::new(o.mmio, o.cap);
     ar9003::disable_and_sleep(&mut io, o.wa).map_err(|_| DeviceSuspendError::DriverError)
 }

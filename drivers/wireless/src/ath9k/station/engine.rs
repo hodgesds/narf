@@ -68,6 +68,9 @@ pub(in crate::ath9k) trait Engine {
     fn receive(&mut self) -> Result<ReceiveStep, Error>;
     fn enable_interrupts(&mut self) -> Result<bool, Error>;
     fn long_calibration(&mut self) -> Result<Option<i32>, Error>;
+    /// One periodic MCI coexistence poll (`ar9003_mci_check_bt`); a
+    /// no-op on engines without a live MCI link.
+    fn check_bt(&mut self) -> Result<(), Error>;
     fn interrupt(&self) -> Option<Arc<irq::Signal>>;
     fn service_begin(&mut self) -> Result<Option<irq::Events>, Error>;
     fn service_end(&mut self) -> Result<(), Error>;
@@ -224,6 +227,10 @@ impl<P: Port> Engine for Packet<P> {
     }
     fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
         Packet::long_calibration(self)
+    }
+    // No MCI engine on AR9002: the coexistence poll is a no-op.
+    fn check_bt(&mut self) -> Result<(), Error> {
+        Ok(())
     }
     fn interrupt(&self) -> Option<Arc<irq::Signal>> {
         Packet::interrupt(self)
@@ -425,6 +432,9 @@ impl<P: Port> Engine for Dispatch<P> {
     }
     fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
         dispatch!(self.long_calibration())
+    }
+    fn check_bt(&mut self) -> Result<(), Error> {
+        dispatch!(self.check_bt())
     }
     fn interrupt(&self) -> Option<Arc<irq::Signal>> {
         dispatch!(self.interrupt())

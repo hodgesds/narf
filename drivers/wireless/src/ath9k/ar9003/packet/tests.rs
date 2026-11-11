@@ -191,6 +191,17 @@ fn outbound() -> Vec<u8> {
     frame
 }
 
+/// A shared MCI link for a chip without the MCI capability: the packet
+/// engine never routes MCI interrupts for it.
+fn no_mci_link() -> SharedMciLink {
+    let mut btcoex = super::super::btcoex::Btcoex::new(super::super::Chip::Ar9300);
+    super::super::btcoex::init_scheme(&mut btcoex, true, 0);
+    super::super::btcoex::init_mci(&mut btcoex);
+    Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+        super::super::btcoex::MciLink { btcoex, dma: None },
+    ))
+}
+
 fn received() -> Vec<u8> {
     let mut frame = outbound();
     frame[1] = 2;
@@ -199,7 +210,8 @@ fn received() -> Vec<u8> {
 
 fn check_packet_path(model: &Model) -> Result<(), &'static str> {
     // SAFETY: isolated model begins parked; no physical controller is touched.
-    let mut packet = unsafe { Packet::prepare(model, LOCAL) }.map_err(|_| "prepare fault")?;
+    let mut packet =
+        unsafe { Packet::prepare(model, LOCAL, no_mci_link()) }.map_err(|_| "prepare fault")?;
     let start = model.reg(Q_STATUS_RING_START);
     if start == 0
         || model.reg(Q_STATUS_RING_END) != start + 16 * 36
@@ -347,7 +359,7 @@ fn check_interrupts() -> Result<(), &'static str> {
     let model = Model::new();
     let port = &model;
     model.set(0x40a4, 0x5064_0000);
-    let mask = irq::enable(&port, true).map_err(|_| "enable fault")?;
+    let mask = irq::enable(&port, true, false).map_err(|_| "enable fault")?;
     if model.reg(irq::IMR) != 0x8180_0175
         || model.reg(0xac) != 0x00c1_0000
         || model.reg(0xa4) != 1
@@ -415,7 +427,106 @@ fn check_interrupts() -> Result<(), &'static str> {
     if events.mci {
         return Err("async MCI bit reported with MCI disabled");
     }
+    // MCI enabled: the async-cause mask carries the MCI bit, so the
+    // engine can ever signal (`mac.c::__ath9k_hw_enable_interrupts`).
+    let mask = irq::enable(&port, true, true).map_err(|_| "enable fault (mci)")?;
+    if model.reg(0x403c) != 0x82 || model.reg(0x4030) != 0x82 || !mask.mci {
+        return Err("async MCI bit not programmed with MCI enabled");
+    }
     Ok(())
+}
+
+fn check_mci_service_begin() -> Result<(), &'static str> {
+    let model = Model::new();
+    // A live MCI link: AR9462 scheme + the 512-byte DMA ring, the
+    // engine as `mci::setup` leaves it (ring filled, ready, awake).
+    let mut dma = (&model)
+        .allocate(mci::MCI_DMA_BUF_BYTES)
+        .map_err(|_| "MCI DMA allocation failed")?;
+    let dma_addr = dma.dma_addr().raw() as u32;
+    dma.as_mut_slice().fill(mci::MCI_GPM_RSVD_PATTERN);
+    let mut btcoex = super::super::btcoex::Btcoex::new(super::super::Chip::Ar9462);
+    super::super::btcoex::init_scheme(&mut btcoex, true, super::super::HW_CAP_MCI);
+    super::super::btcoex::init_mci(&mut btcoex);
+    btcoex.mci.gpm_buf.fill(mci::MCI_GPM_RSVD_PATTERN);
+    btcoex.mci.ready = true;
+    btcoex.mci.gpm_len = mci::MCI_GPM_MAX_ENTRY as u32;
+    btcoex.mci.bt_state = mci::BtState::Awake;
+    let link = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(
+        super::super::btcoex::MciLink {
+            btcoex,
+            dma: Some(Arc::new(dma)),
+        },
+    ));
+    // SAFETY: isolated model begins parked; no physical controller is touched.
+    let mut packet =
+        unsafe { Packet::prepare(&model, LOCAL, link.clone()) }.map_err(|_| "prepare fault")?;
+    packet.start().map_err(|_| "start fault")?;
+    *model.signal.borrow_mut() = Some(crate::ath9k::irq::Signal::new());
+    if !matches!(packet.enable_interrupts(), Ok(true)) || packet.interrupt().is_none() {
+        return Err("interrupts not enabled");
+    }
+    // The MCI async mask was programmed (the engine can ever signal).
+    if model.reg(0x403c) != 0x82 {
+        return Err("async MCI bit not programmed with MCI enabled");
+    }
+    // BT posts a coex-agent version query in GPM slot 0.
+    model.set(0x4038, 0x80); // ASYNC_CAUSE: MCI bit
+    model.set(mci::AR_BTCOEX_CTRL, mci::AR_BTCOEX_CTRL_MCI_MODE_EN);
+    model.set(
+        mci::AR_MCI_INTERRUPT_RX_MSG_RAW,
+        mci::AR_MCI_INTERRUPT_RX_MSG_GPM,
+    );
+    let gpm = dma_addr + mci::MCI_GPM_DMA_OFFSET as u32;
+    model.put(gpm, 0);
+    model.put(
+        gpm + 4,
+        (mci::GpmSubtype::CoexAgent as u32) | ((mci::GpmCoexOpcode::VersionQuery as u32) << 8),
+    );
+    model.put(gpm + 8, 0);
+    model.put(gpm + 12, 0);
+    model.set(mci::AR_MCI_GPM_1, 1 << mci::AR_MCI_GPM_WRITE_PTR_S);
+    let writes_before = model.writes.borrow().len();
+    match packet.service_begin() {
+        Ok(Some(events)) if events.mci => {}
+        _ => return Err("service_begin did not route the MCI interrupt"),
+    }
+    // The version query was answered (a GPM send reached COMMAND0) and
+    // the walked slot was recycled.
+    if !model.writes.borrow()[writes_before..]
+        .iter()
+        .any(|&(r, _)| r == mci::AR_MCI_COMMAND0)
+    {
+        return Err("MCI version query was not answered");
+    }
+    if link.lock().btcoex.mci.gpm_buf[mci::MCI_GPM_COEX_B_GPM_TYPE] != mci::MCI_GPM_RSVD_PATTERN {
+        return Err("walked GPM slot was not recycled");
+    }
+    // BT requests a calibration window in GPM slot 1 while awake: the
+    // request closes the generation (Linux queues `RESET_TYPE_MCI`).
+    let gpm = gpm + 16;
+    model.put(gpm, 0);
+    model.put(gpm + 4, mci::GpmSubtype::BtCalReq as u32);
+    model.put(gpm + 8, 0);
+    model.put(gpm + 12, 0);
+    model.set(mci::AR_MCI_GPM_1, 2 << mci::AR_MCI_GPM_WRITE_PTR_S);
+    model.set(
+        mci::AR_MCI_INTERRUPT_RX_MSG_RAW,
+        mci::AR_MCI_INTERRUPT_RX_MSG_GPM,
+    );
+    model.set(0x4038, 0x80);
+    match packet.service_begin() {
+        Err(Error::Access) if packet.phase() == Phase::Failed => {}
+        _ => return Err("BT calibration request did not close the generation"),
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9300_edma_mci_service_begin() -> TestResult {
+    match check_mci_service_begin() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
 }
 
 fn smoke_ath9k_ar9300_edma_interrupt_mask_and_cause() -> TestResult {
@@ -434,7 +545,8 @@ fn check_in_place_reset() -> Result<(), &'static str> {
     const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
     let model = Model::new();
     // SAFETY: isolated model begins parked; no physical controller is touched.
-    let mut packet = unsafe { Packet::prepare(&model, LOCAL) }.map_err(|_| "prepare fault")?;
+    let mut packet =
+        unsafe { Packet::prepare(&model, LOCAL, no_mci_link()) }.map_err(|_| "prepare fault")?;
     let start = model.reg(Q_STATUS_RING_START);
     packet.start().map_err(|_| "start fault")?;
     packet
@@ -550,7 +662,8 @@ fn check_wow_station() -> Result<(), &'static str> {
     const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
     let model = Model::new();
     // SAFETY: isolated model begins parked; no physical controller is touched.
-    let packet = unsafe { Packet::prepare(&model, LOCAL) }.map_err(|_| "prepare fault")?;
+    let packet =
+        unsafe { Packet::prepare(&model, LOCAL, no_mci_link()) }.map_err(|_| "prepare fault")?;
     *model.signal.borrow_mut() = Some(crate::ath9k::irq::Signal::new());
     let env = Arc::new(Env {
         now: AtomicU64::new(1_000),
@@ -649,4 +762,8 @@ kernel_test_in!(
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9300_edma_interrupt_mask_and_cause
+);
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9300_edma_mci_service_begin
 );

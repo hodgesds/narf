@@ -147,7 +147,8 @@ pub(in crate::ath9k) struct Events {
     /// `ATH9K_INT_MCI`: the async cause carried the MCI bit while MCI
     /// was enabled. The owner runs `mci::get_isr` plus
     /// `mci::handle_interrupt` on its `RegisterIo` path when this is
-    /// set; live-owner wiring is a follow-up, not this lane.
+    /// set (the live-owner wiring); `mci::sync_gpm_ring` runs first so
+    /// the walk sees the DMA ring.
     pub mci: bool,
 }
 
@@ -165,11 +166,20 @@ pub(in crate::ath9k) struct Mask {
     pub imr: u32,
     pub msi: bool,
     pub msi_reg: u32,
+    /// The async-cause mask carries the MCI bit
+    /// (`mac.c::__ath9k_hw_enable_interrupts` ORs
+    /// `AR_INTR_ASYNC_MASK_MCI` in when `ATH9K_INT_MCI` is in the
+    /// imask); without it BT never signals.
+    pub mci: bool,
 }
 
 /// `ath9k_hw_init_interrupt_masks` + `ath9k_hw_set_interrupts` +
 /// `__ath9k_hw_enable_interrupts` for the queue-0 EDMA station owner.
-pub(in crate::ath9k) fn enable(port: &impl Port, msi: bool) -> Result<Mask, Error> {
+pub(in crate::ath9k) fn enable(
+    port: &impl Port,
+    msi: bool,
+    mci_enabled: bool,
+) -> Result<Mask, Error> {
     let mut msi_reg = 0;
     if msi {
         msi_reg = (port.read(PCIE_MSI)? | MSI_DBI_WR_EN) & MSI_PENDING_64;
@@ -194,6 +204,7 @@ pub(in crate::ath9k) fn enable(port: &impl Port, msi: bool) -> Result<Mask, Erro
         imr: STATION_IMR,
         msi,
         msi_reg,
+        mci: mci_enabled,
     };
     resume(port, mask)?;
     Ok(mask)
@@ -239,8 +250,13 @@ pub(in crate::ath9k) fn restore(port: &impl Port, mask: Mask) -> Result<(), Erro
 
 fn resume_with(port: &impl Port, mask: Mask, msi_mask: u32) -> Result<(), Error> {
     port.write(IER, 1)?;
-    port.write(ASYNC_ENABLE, MAC_IRQ)?;
-    port.write(ASYNC_MASK, MAC_IRQ)?;
+    let async_mask = if mask.mci {
+        MAC_IRQ | ASYNC_CAUSE_MCI
+    } else {
+        MAC_IRQ
+    };
+    port.write(ASYNC_ENABLE, async_mask)?;
+    port.write(ASYNC_MASK, async_mask)?;
     port.write(SYNC_ENABLE, SYNC_DEFAULT)?;
     port.write(SYNC_MASK, SYNC_DEFAULT)?;
     if mask.msi {

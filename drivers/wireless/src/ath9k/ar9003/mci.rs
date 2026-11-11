@@ -36,21 +36,22 @@
 //! names its Linux header.
 //!
 //! Out of scope, recorded in §3.12: the AIC states (`ar9003_aic.c`
-//! hard-disables AIC, so they read 0 here exactly as in Linux) and
-//! the live-owner wiring (the owner holding a `Btcoex`, routing
-//! `irq::Events::mci` into `get_isr`/`handle_interrupt`, applying the
-//! computed duty-cycle scheme, and recording HT state on channel
-//! change). The driver-layer BT profile list and duty-cycle scheme
-//! (`mci.c` `ath_mci_profile`/`ath_mci_update_scheme`) live in
-//! `Mci.profiles` below; there is no mac80211 consumer in-tree.
+//! hard-disables AIC, so they read 0 here exactly as in Linux). The
+//! driver-layer BT profile list and duty-cycle scheme (`mci.c`
+//! `ath_mci_profile`/`ath_mci_update_scheme`) live in `Mci.profiles`
+//! below; there is no mac80211 consumer in-tree. The live-owner wiring
+//! (the owner holding a `Btcoex`, routing `irq::Events::mci` into
+//! `get_isr`/`handle_interrupt`) landed with the owner; see
+//! `sync_gpm_ring` for the DMA↔CPU ring sync.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::btcoex::StompType;
 use super::{field, rmw, Chip};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
+use narf_io::{DmaBuffer, DmaDirection};
 
 /// `reg_mci.h::AR_MCI_COMMAND0`.
-const AR_MCI_COMMAND0: u64 = 0x1800;
+pub(in crate::ath9k) const AR_MCI_COMMAND0: u64 = 0x1800;
 const AR_MCI_COMMAND0_HEADER: u32 = 0xff;
 const AR_MCI_COMMAND0_HEADER_S: u32 = 0;
 const AR_MCI_COMMAND0_LEN: u32 = 0x1f00;
@@ -75,9 +76,9 @@ const AR_MCI_MSG_ATTRIBUTES_TABLE_INVALID_HDR_S: u32 = 16;
 const AR_MCI_SCHD_TABLE_0: u64 = 0x1818;
 /// `reg_mci.h::AR_MCI_GPM_0` / `AR_MCI_GPM_1`.
 const AR_MCI_GPM_0: u64 = 0x1820;
-const AR_MCI_GPM_1: u64 = 0x1824;
+pub(in crate::ath9k) const AR_MCI_GPM_1: u64 = 0x1824;
 const AR_MCI_GPM_WRITE_PTR: u32 = 0xffff_0000;
-const AR_MCI_GPM_WRITE_PTR_S: u32 = 16;
+pub(in crate::ath9k) const AR_MCI_GPM_WRITE_PTR_S: u32 = 16;
 /// `reg_mci.h::AR_MCI_INTERRUPT_RAW`.
 const AR_MCI_INTERRUPT_RAW: u64 = 0x1828;
 /// `reg_mci.h::AR_MCI_INTERRUPT_EN`.
@@ -93,14 +94,14 @@ const AR_MCI_INTERRUPT_REMOTE_SLEEP_UPDATE: u32 = 0x0000_0400;
 const AR_MCI_INTERRUPT_BT_PRI: u32 = 0x07ff_f800;
 const AR_MCI_INTERRUPT_CONT_INFO_TIMEOUT: u32 = 0x8000_0000;
 /// `reg_mci.h::AR_MCI_INTERRUPT_RX_MSG_RAW`.
-const AR_MCI_INTERRUPT_RX_MSG_RAW: u64 = 0x1838;
+pub(in crate::ath9k) const AR_MCI_INTERRUPT_RX_MSG_RAW: u64 = 0x1838;
 /// `reg_mci.h::AR_MCI_INTERRUPT_RX_MSG_EN`.
 const AR_MCI_INTERRUPT_RX_MSG_EN: u64 = 0x183c;
 const AR_MCI_INTERRUPT_RX_MSG_REMOTE_RESET: u32 = 0x0000_0001;
 const AR_MCI_INTERRUPT_RX_MSG_CONT_INFO: u32 = 0x0000_0008;
 const AR_MCI_INTERRUPT_RX_MSG_CONT_RST: u32 = 0x0000_0010;
 const AR_MCI_INTERRUPT_RX_MSG_SCHD_INFO: u32 = 0x0000_0020;
-const AR_MCI_INTERRUPT_RX_MSG_GPM: u32 = 0x0000_0100;
+pub(in crate::ath9k) const AR_MCI_INTERRUPT_RX_MSG_GPM: u32 = 0x0000_0100;
 const AR_MCI_INTERRUPT_RX_MSG_LNA_INFO: u32 = 0x0000_0200;
 const AR_MCI_INTERRUPT_RX_MSG_SYS_SLEEPING: u32 = 0x0000_0400;
 const AR_MCI_INTERRUPT_RX_MSG_SYS_WAKING: u32 = 0x0000_0800;
@@ -122,10 +123,10 @@ const AR_MCI_BT_PRI: u64 = 0x185c;
 /// `reg_mci.h::AR_MCI_TX_PAYLOAD0..3`.
 const AR_MCI_TX_PAYLOAD0: u64 = 0x1898;
 /// `reg_mci.h::AR_BTCOEX_CTRL`.
-const AR_BTCOEX_CTRL: u64 = 0x18ac;
+pub(in crate::ath9k) const AR_BTCOEX_CTRL: u64 = 0x18ac;
 const AR_BTCOEX_CTRL_AR9462_MODE_S: u32 = 0;
 const AR_BTCOEX_CTRL_WBTIMER_EN_S: u32 = 1;
-const AR_BTCOEX_CTRL_MCI_MODE_EN: u32 = 0x0000_0004;
+pub(in crate::ath9k) const AR_BTCOEX_CTRL_MCI_MODE_EN: u32 = 0x0000_0004;
 const AR_BTCOEX_CTRL_LNA_SHARED_S: u32 = 3;
 const AR_BTCOEX_CTRL_PA_SHARED_S: u32 = 4;
 const AR_BTCOEX_CTRL_ONE_STEP_LOOK_AHEAD_EN: u32 = 0x0000_0020;
@@ -352,10 +353,22 @@ const MCI_GPM_INVALID: u32 = 0xffff_ffff;
 /// `mci.h::ATH_MCI_GPM_MAX_ENTRY` (16 slots) and
 /// `mci.h::ATH_MCI_GPM_BUF_SIZE` (16 entries × 16 bytes).
 pub const MCI_GPM_MAX_ENTRY: usize = 16;
-const MCI_GPM_BUF_BYTES: usize = MCI_GPM_MAX_ENTRY * 16;
+pub(in crate::ath9k) const MCI_GPM_BUF_BYTES: usize = MCI_GPM_MAX_ENTRY * 16;
+/// `mci.h::ATH_MCI_SCHED_BUF_SIZE` (16 entries × 16 bytes): the
+/// schedule table that precedes the GPM ring in the shared DMA buffer.
+pub(in crate::ath9k) const MCI_SCHED_BUF_BYTES: usize = 16 * 16;
+/// The shared MCI DMA buffer (`mci.c::ath_mci_setup`'s single
+/// `dmam_alloc_coherent(ATH_MCI_SCHED_BUF_SIZE +
+/// ATH_MCI_GPM_BUF_SIZE)`): schedule table first, GPM ring second.
+pub(in crate::ath9k) const MCI_DMA_BUF_BYTES: usize = MCI_SCHED_BUF_BYTES + MCI_GPM_BUF_BYTES;
+/// Byte offset of the GPM ring inside the shared DMA buffer (the
+/// schedule table comes first).
+pub(in crate::ath9k) const MCI_GPM_DMA_OFFSET: usize = MCI_SCHED_BUF_BYTES;
+/// One GPM slot is 16 bytes (`mci.h`: the ring is 16 entries × 16).
+const MCI_GPM_SLOT_BYTES: usize = 16;
 /// `ar9003_mci.h::MCI_GPM_RSVD_PATTERN` / `MCI_GPM_RSVD_PATTERN32`:
 /// the byte/word a free GPM slot is filled with.
-const MCI_GPM_RSVD_PATTERN: u8 = 0xfe;
+pub(in crate::ath9k) const MCI_GPM_RSVD_PATTERN: u8 = 0xfe;
 const MCI_GPM_RSVD_PATTERN32: u32 = 0xfefe_fefe;
 /// `btcoex.h::ATH_BTCOEX_HT20_MAX_TXPOWER` / `ATH_BTCOEX_HT40_MAX_TXPOWER`.
 const ATH_BTCOEX_HT20_MAX_TXPOWER: u16 = 0x14;
@@ -910,8 +923,8 @@ const MCI_GPM_COEX_QUERY_BT_ALL_INFO: u8 = 1 << 0;
 const MCI_GPM_COEX_QUERY_BT_TOPOLOGY: u8 = 1 << 1;
 /// `ar9003_mci.h::MCI_GPM_COEX_B_GPM_TYPE` / `MCI_GPM_COEX_B_GPM_OPCODE`
 /// (byte offsets of the type/opcode in a 16-byte GPM payload).
-const MCI_GPM_COEX_B_GPM_TYPE: usize = 4;
-const MCI_GPM_COEX_B_GPM_OPCODE: usize = 5;
+pub(in crate::ath9k) const MCI_GPM_COEX_B_GPM_TYPE: usize = 4;
+pub(in crate::ath9k) const MCI_GPM_COEX_B_GPM_OPCODE: usize = 5;
 /// `ar9003_mci.h::MCI_GPM_WLAN_CAL_W_SEQUENCE` (word index of the WLAN
 /// calibration sequence in a cal GPM).
 const MCI_GPM_WLAN_CAL_W_SEQUENCE: usize = 2;
@@ -2777,6 +2790,96 @@ pub(in crate::ath9k) fn setup(
     mci.gpm_len = MCI_GPM_MAX_ENTRY as u32;
     mci.sched_addr = sched_addr;
     reset(io, mci, true, true, true)
+}
+
+/// Sync the DMA GPM ring with the engine's CPU-side `gpm_buf`, at every
+/// walk boundary (before `handle_interrupt`, `start_reset` and
+/// `init_cal_req`).
+///
+/// Linux walks the GPM ring in the DMA buffer itself
+/// (`mci.c::ath_mci_intr` reads `mci->gpm_buf.bf_addr`); this port keeps
+/// the CPU-side ring the engine walks, so the owner copies between the
+/// two here. Both directions are keyed on the hardware write pointer
+/// (`AR_MCI_GPM_1`) and the engine's read index (`mci.gpm_idx`):
+///
+/// - Pending slots (`gpm_idx..write_ptr`, wrapping the 16-slot ring)
+///   are copied DMA→CPU, but only into slots the engine already
+///   recycled (type byte is the reserved pattern): a slot the engine
+///   has not consumed yet keeps its pending content, so a hardware
+///   write that lapped the driver is not clobbered.
+/// - Consumed slots (everything outside the pending range) whose CPU
+///   copy is recycled are cleared in the DMA buffer, so a later
+///   `check_gpm_offset` walk from slot 0 cannot re-process a GPM the
+///   engine already consumed (a stale BT calibration request would
+///   otherwise re-request a generation reset on every reset).
+///
+/// A GPM that arrives between the write-pointer sample and the copy is
+/// lost either way (the walk would have skipped it as invalid); BT
+/// re-sends periodic coex messages and re-requests calibration, so the
+/// loss is a delay, not a break. GPMs that arrive during a
+/// `wait_for_gpm` bounded wait are likewise missed — `start_reset`
+/// ignores the wait result and `init_cal_req`'s reusability flag has no
+/// consumer in this port (calibration is never reused) — and are picked
+/// up by the next sync.
+pub(in crate::ath9k) fn sync_gpm_ring(io: &mut impl RegisterIo, dma: &DmaBuffer, mci: &mut Mci) {
+    if dma.len() < MCI_DMA_BUF_BYTES {
+        return;
+    }
+    let gpm_idx = mci.gpm_idx;
+    if gpm_idx as usize >= MCI_GPM_MAX_ENTRY {
+        return;
+    }
+    // Invalidate the CPU cache for the GPM half so the copy below reads
+    // what the hardware wrote.
+    dma.sync_for_cpu(
+        MCI_GPM_DMA_OFFSET,
+        MCI_GPM_BUF_BYTES,
+        DmaDirection::FromDevice,
+    );
+    let write_ptr = (io.read32(AR_MCI_GPM_1) & AR_MCI_GPM_WRITE_PTR) >> AR_MCI_GPM_WRITE_PTR_S;
+    if write_ptr as usize >= MCI_GPM_MAX_ENTRY {
+        return;
+    }
+    let dma_gpm = &dma.as_slice()[MCI_GPM_DMA_OFFSET..MCI_GPM_DMA_OFFSET + MCI_GPM_BUF_BYTES];
+    // The pending range, wrapping the 16-slot ring.
+    let mut pending = [false; MCI_GPM_MAX_ENTRY];
+    let mut idx = gpm_idx;
+    while idx != write_ptr {
+        pending[idx as usize] = true;
+        idx = (idx + 1) % MCI_GPM_MAX_ENTRY as u32;
+    }
+    for (slot, is_pending) in pending.iter().enumerate() {
+        let off = slot * MCI_GPM_SLOT_BYTES;
+        if *is_pending {
+            if mci.gpm_buf[off + MCI_GPM_COEX_B_GPM_TYPE] == MCI_GPM_RSVD_PATTERN {
+                mci.gpm_buf[off..off + MCI_GPM_SLOT_BYTES]
+                    .copy_from_slice(&dma_gpm[off..off + MCI_GPM_SLOT_BYTES]);
+            }
+        } else if mci.gpm_buf[off + MCI_GPM_COEX_B_GPM_TYPE] == MCI_GPM_RSVD_PATTERN
+            && dma_gpm[off + MCI_GPM_COEX_B_GPM_TYPE] != MCI_GPM_RSVD_PATTERN
+        {
+            // Consumed: clear the stale DMA slot. The CPU-side write
+            // is serialized by the `MciLink` lock the caller holds,
+            // and the hardware only writes pending slots, so this
+            // cannot clobber a GPM the walk has not consumed yet.
+            // SAFETY: `off..off+16` stays inside the GPM half
+            // (bytes 256..512) of a live 512-byte DMA buffer; the
+            // pointer is the buffer's own CPU view.
+            unsafe {
+                core::ptr::write_bytes(
+                    dma.cpu_mut_ptr::<u8>().add(MCI_GPM_DMA_OFFSET + off),
+                    MCI_GPM_RSVD_PATTERN,
+                    MCI_GPM_SLOT_BYTES,
+                );
+            }
+        }
+    }
+    // Push the CPU-side clears to the device.
+    dma.sync_for_device(
+        MCI_GPM_DMA_OFFSET,
+        MCI_GPM_BUF_BYTES,
+        DmaDirection::ToDevice,
+    );
 }
 
 /// `ar9003_mci_cleanup`: turn off MCI and Jupiter mode, disable the MCI
