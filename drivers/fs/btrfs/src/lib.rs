@@ -32,6 +32,7 @@ pub mod chunk;
 pub mod crash_check;
 pub mod csum;
 pub mod cycles;
+pub mod databuf;
 pub mod decompress_cache;
 pub mod dir;
 pub mod extent;

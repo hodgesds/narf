@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use narf_drivers_fs_btrfs::stats::{self, Totals};
-use narf_filesystem::{DirOps, FileOps, FsInstance};
+use narf_filesystem::{DirOps, FileOps, FsError, FsInstance};
 
 use crate::dev::RecDev;
 use crate::host::block_on;
@@ -277,6 +277,77 @@ fn sequential(
     })
 }
 
+/// Writes of 1, 8 and 64 MiB in one call each must build no data buffer
+/// larger than one extent (128 KiB, `databuf::largest`) and read back; a
+/// write whose buffer cannot be allocated (`databuf::fail_from`) must fail
+/// with `OutOfMemory` and leave the file as it was. The image is checked by
+/// Linux afterwards with the rest of the scenario.
+fn large_writes(top: &Arc<dyn DirOps>) -> Result<String, String> {
+    use narf_drivers_fs_btrfs::databuf;
+    let mut largest = 0usize;
+    for mib in [1usize, 8, 64] {
+        let len = mib << 20;
+        let body: Vec<u8> = (0..len)
+            .map(|i| (i as u8).wrapping_mul(29) ^ (i >> 13) as u8 ^ mib as u8)
+            .collect();
+        let name = format!("large-{mib}");
+        databuf::reset_largest();
+        block_on(async {
+            let file = top.create(&name).await?;
+            let n = file.write(0, &body).await?;
+            if n != len {
+                return Err(FsError::InvalidData);
+            }
+            file.fsync(false).await
+        })
+        .map_err(err("large write"))?;
+        largest = largest.max(databuf::largest());
+        let file = block_on(top.lookup_async(&name)).map_err(err("lookup"))?;
+        let mut got = vec![0u8; len];
+        let n = block_on(file.read(0, &mut got)).map_err(err("read"))?;
+        if n != len || got != body {
+            return Err(format!("{name}: a {mib} MiB write did not read back"));
+        }
+    }
+    if largest > 128 << 10 {
+        return Err(format!(
+            "a large write built a {largest}-byte data buffer; one extent is 128 KiB"
+        ));
+    }
+    let old = vec![0x33u8; 8192];
+    let new = vec![0x77u8; 256 << 10];
+    let refused = block_on(async {
+        let file = top.create("enomem").await?;
+        file.write(0, &old).await?;
+        file.fsync(false).await?;
+        databuf::fail_from(Some(32 << 10));
+        let refused = file.write(4096, &new).await;
+        databuf::fail_from(None);
+        Ok::<_, FsError>(refused)
+    })
+    .map_err(err("enomem setup"))?;
+    if !matches!(refused, Err(FsError::OutOfMemory)) {
+        return Err(format!(
+            "a write without a buffer returned {refused:?}, not OutOfMemory"
+        ));
+    }
+    let file = block_on(top.lookup_async("enomem")).map_err(err("lookup"))?;
+    let mut got = vec![0u8; 8192];
+    let n = block_on(file.read(0, &mut got)).map_err(err("read"))?;
+    let size = block_on(file.stat_async()).map_err(err("stat"))?.size;
+    if n != 8192 || got != old || size != 8192 {
+        return Err("the refused write changed the file".into());
+    }
+    block_on(async {
+        file.write(4096, &new).await?;
+        file.fsync(false).await
+    })
+    .map_err(err("write after OutOfMemory"))?;
+    Ok(format!(
+        "    single writes of 1, 8 and 64 MiB: largest data buffer {largest} bytes; a write refused for its buffer returned OutOfMemory and changed nothing"
+    ))
+}
+
 pub fn run(args: &Args) -> Result<String, String> {
     let t0 = Instant::now();
     let dir = args.workdir.join("overwrite");
@@ -342,6 +413,7 @@ pub fn run(args: &Args) -> Result<String, String> {
         Ok(())
     };
     check_all(&top, "in-session")?;
+    let big = large_writes(&top)?;
     drop(top);
     drop(fs);
     narf::reset();
@@ -374,6 +446,7 @@ pub fn run(args: &Args) -> Result<String, String> {
     for s in &streams {
         lines.push(format!("    sequential, {}", s.line));
     }
+    lines.push(big);
     let report = format!(
         "{}\n    btrfs check clean (also --check-data-csum); every page read back, before and after a remount; {:.0?}",
         lines.join("\n"),

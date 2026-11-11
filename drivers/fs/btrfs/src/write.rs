@@ -1102,25 +1102,15 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     let rewrite_len = rewrite_end
         .checked_sub(rewrite_start)
         .ok_or(FsError::InvalidData)?;
-    let rewrite_len_usize = usize::try_from(rewrite_len).map_err(|_| FsError::InvalidData)?;
-    let mut buf = alloc::vec![0u8; rewrite_len_usize];
     let old_window_end = rewrite_end.min(old_size);
-    let head_end = offset.min(old_window_end);
-    let (from, to) = match (rewrite_start < head_end, end < old_window_end) {
-        // Old bytes on both sides: one read (and, for a compressed extent,
-        // one decompression) covers them.
-        (true, true) => (rewrite_start, old_window_end),
-        (true, false) => (rewrite_start, head_end),
-        (false, true) => (end, old_window_end),
-        (false, false) => (0, 0),
-    };
-    if from < to {
-        let at = usize::try_from(from - rewrite_start).map_err(|_| FsError::InvalidData)?;
-        let len = usize::try_from(to - from).map_err(|_| FsError::InvalidData)?;
-        crate::extent::read_file(vol, fs_root, ino, old_size, from, &mut buf[at..at + len]).await?;
-    }
-    let o = usize::try_from(offset - rewrite_start).map_err(|_| FsError::InvalidData)?;
-    buf[o..o + data.len()].copy_from_slice(data);
+    // The window is built one new extent at a time in this one buffer, never
+    // whole: a write of many megabytes would otherwise need a contiguous
+    // heap block that size, which a fragmented heap may not have with
+    // gigabytes free (Linux works folio by folio and extent by extent).
+    // Taken before anything is staged, so that failing it changes nothing.
+    let tile_cap =
+        usize::try_from(rewrite_len.min(MAX_WRITE_EXTENT)).map_err(|_| FsError::InvalidData)?;
+    let mut tile = crate::databuf::zeroed(tile_cap)?;
 
     // Join the open transaction (opening one if this is the first operation).
     // The data extents tiled below are carved from the batch's allocator, not
@@ -1159,54 +1149,95 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), displaced + laid_down + 1).await?;
 
     // ── Tile the content into fresh extents; write each + its checksums ─
+    // A failure part-way gives the extents already taken back to the batch's
+    // allocator; nothing has been staged yet.
+    let snapshot_alloc = batch.alloc.clone();
     let mut new_data: Vec<DataRef> = Vec::new();
     let mut new_eds: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
-    let mut window_off = 0u64;
-    while window_off < rewrite_len {
-        let ext_len = (rewrite_len - window_off).min(MAX_WRITE_EXTENT);
-        let s = window_off as usize;
-        let e = s + ext_len as usize;
-        let plain = &buf[s..e];
-        let compressed = if emit_zlib {
-            let mut encoded = compress_zlib_heap(plain, 6)?;
-            let disk_len = align_up(encoded.len() as u64, sectorsize);
-            if disk_len < ext_len {
-                encoded.resize(disk_len as usize, 0);
-                Some(encoded)
+    let tiled: Result<(), FsError> = async {
+        let mut window_off = 0u64;
+        while window_off < rewrite_len {
+            let ext_len = (rewrite_len - window_off).min(MAX_WRITE_EXTENT);
+            // This extent's bytes: the old ones the write does not cover — before
+            // `offset` and after `end`, below the old EOF, read as Linux
+            // `prepare_one_folio` reads a folio the write covers partly — and the
+            // written ones. Holes and bytes past the old EOF stay zero.
+            let tile_start = rewrite_start + window_off;
+            let tile_end = tile_start + ext_len;
+            let plain = &mut tile[..ext_len as usize];
+            plain.fill(0);
+            for (a, b) in [
+                (tile_start, tile_end.min(offset)),
+                (tile_start.max(end), tile_end),
+            ] {
+                let b = b.min(old_window_end);
+                if a < b {
+                    let at = (a - tile_start) as usize;
+                    let len = (b - a) as usize;
+                    crate::extent::read_file(
+                        vol,
+                        fs_root,
+                        ino,
+                        old_size,
+                        a,
+                        &mut plain[at..at + len],
+                    )
+                    .await?;
+                }
+            }
+            let (a, b) = (tile_start.max(offset), tile_end.min(end));
+            if a < b {
+                plain[(a - tile_start) as usize..(b - tile_start) as usize]
+                    .copy_from_slice(&data[(a - offset) as usize..(b - offset) as usize]);
+            }
+            let plain = &tile[..ext_len as usize];
+            let compressed = if emit_zlib {
+                let mut encoded = compress_zlib_heap(plain, 6)?;
+                let disk_len = align_up(encoded.len() as u64, sectorsize);
+                if disk_len < ext_len {
+                    encoded.resize(disk_len as usize, 0);
+                    Some(encoded)
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
-        let (payload, compression) = match &compressed {
-            Some(encoded) => (encoded.as_slice(), format::COMPRESS_ZLIB),
-            None => (plain, format::COMPRESS_NONE),
-        };
-        let disk_len = payload.len() as u64;
-        let e_data = batch.alloc.alloc_data(vol, disk_len)?;
-        vol.write_logical(e_data, payload).await?;
-        let csums = if nodatasum {
-            Vec::new()
-        } else {
-            crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?
-        };
-        let file_off = rewrite_start + window_off;
-        new_data.push(DataRef {
-            id: DataRefId {
-                bytenr: e_data,
-                len: disk_len,
-                ref_root: vol.fs_tree_id(),
-                objectid: ino,
-                offset: file_off,
-            },
-            csums,
-        });
-        new_eds.push((
-            BtrfsKey::new(ino, format::EXTENT_DATA_KEY, file_off),
-            file_extent_reg_encoded(gen, e_data, disk_len, ext_len, compression),
-        ));
-        window_off += ext_len;
+            };
+            let (payload, compression) = match &compressed {
+                Some(encoded) => (encoded.as_slice(), format::COMPRESS_ZLIB),
+                None => (plain, format::COMPRESS_NONE),
+            };
+            let disk_len = payload.len() as u64;
+            let e_data = batch.alloc.alloc_data(vol, disk_len)?;
+            vol.write_logical(e_data, payload).await?;
+            let csums = if nodatasum {
+                Vec::new()
+            } else {
+                crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?
+            };
+            let file_off = rewrite_start + window_off;
+            new_data.push(DataRef {
+                id: DataRefId {
+                    bytenr: e_data,
+                    len: disk_len,
+                    ref_root: vol.fs_tree_id(),
+                    objectid: ino,
+                    offset: file_off,
+                },
+                csums,
+            });
+            new_eds.push((
+                BtrfsKey::new(ino, format::EXTENT_DATA_KEY, file_off),
+                file_extent_reg_encoded(gen, e_data, disk_len, ext_len, compression),
+            ));
+            window_off += ext_len;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = tiled {
+        batch.alloc = snapshot_alloc;
+        return Err(error);
     }
 
     // ── Path-COW the fs tree: drop only intersected EXTENT_DATA, add the new tiling,
