@@ -17,17 +17,17 @@
 //!
 //! Deliberate narrowings, each a grounded absence, not an oversight:
 //! - The RFMOD width table has NO 320MHz arm. `rtw8922a_set_channel_mac`
-//!   switches on 160/80/40/20-default only, so a 320MHz channel takes
-//!   the default arm there. `BE_WMAC_RFMOD_320M` (4) is defined in
-//!   `reg.h` but has no user anywhere in the local reference, so no
-//!   320MHz RFMOD mapping is claimed here; `rfmod_value` returns
-//!   `None` for 320MHz. Whether 320MHz RFMOD goes through a separate
-//!   path or is an upstream gap is a follow-up for a reader with the
-//!   full `phy.c`/`mac.c`, not a guess to encode.
-//! - The TX sub-carrier bitmap (`txsb`) values are NOT encoded: they
-//!   come from `rtw89_phy_get_txsb` (`phy.c`), which is not in the
-//!   local reference. Only the width-to-RFMOD table and the SIFS
-//!   value pairs from `set_channel_mac` are claimed.
+//!   (`rtw8922a.c:1048`) switches on 160/80/40/20-default only, so a
+//!   320MHz channel would take the default (20MHz) arm there.
+//!   `BE_WMAC_RFMOD_320M` (4, `reg.h:6614`) is defined but has no user
+//!   in the linux-7.2 reference (neither `rtw8922a.c` nor
+//!   `rtw8922d.c:1160` programs it), and RTL8922A's
+//!   `support_bandwidths` stops at 160MHz (`rtw8922a.c:3209`), so the
+//!   chip never reaches that arm. `rfmod_value` therefore returns
+//!   `None` for 320MHz rather than inventing a hardware value.
+//! - The TX sub-carrier word (`R_BE_TX_SUB_BAND_VALUE`) is encoded by
+//!   [`tx_sub_band_value`], built on [`get_txsb`], a transcription of
+//!   `rtw89_phy_get_txsb` (`phy.c:875`, linux-7.2 reference).
 //! - EHT MCS/NSS capability maps ARE encoded below (`eht_cap`,
 //!   mirroring `rtw89_init_eht_cap` in `core.c` @ 05441d6 — the
 //!   sparse-clone reference, which supersedes the step-1 note
@@ -116,6 +116,91 @@ pub(super) const fn sifs_values(width: Width) -> (u32, u32) {
         Width::Mhz20 => (0x3F, 0x3E),
         Width::Mhz40 | Width::Mhz80 | Width::Mhz160 | Width::Mhz320 => (0x41, 0x41),
     }
+}
+
+/// `rtw89_phy_get_txsb(chan, dbw)` (`phy.c:875`): the index of the
+/// `dbw`-wide sub-band holding the primary channel inside a `cbw`-wide
+/// channel centred on `central_ch`. Channel numbers are the 5 MHz IEEE
+/// numbers Linux uses (`chan->primary_channel`, `chan->channel`).
+/// Returns `None` when the primary lies outside the channel (the Linux
+/// u8 arithmetic would wrap there; a valid chandef never does).
+pub(super) fn get_txsb(cbw: Width, pri_ch: u8, central_ch: u8, dbw: Width) -> Option<u8> {
+    if cbw.mhz() == dbw.mhz() || matches!(cbw, Width::Mhz20) {
+        return Some(0);
+    }
+    let above = pri_ch > central_ch;
+    // `(pri_ch - central_ch + k) / d` in Linux u8 arithmetic.
+    let sub = |k: i16, d: i16| -> Option<u8> {
+        let v = pri_ch as i16 - central_ch as i16 + k;
+        if v < 0 {
+            None
+        } else {
+            Some((v / d) as u8)
+        }
+    };
+    match cbw {
+        Width::Mhz40 => Some(above as u8),
+        Width::Mhz80 => match dbw {
+            Width::Mhz20 => sub(6, 4),
+            _ => Some(above as u8),
+        },
+        Width::Mhz160 => match dbw {
+            Width::Mhz20 => sub(14, 4),
+            Width::Mhz40 => sub(12, 8),
+            _ => Some(above as u8),
+        },
+        Width::Mhz320 => match dbw {
+            Width::Mhz20 => sub(30, 4),
+            Width::Mhz40 => sub(28, 8),
+            Width::Mhz80 => sub(24, 16),
+            _ => Some(above as u8),
+        },
+        Width::Mhz20 => Some(0),
+    }
+}
+
+/// `B_BE_TXSB_20M_MASK` GENMASK(3, 0) (`reg.h:6644`).
+pub(super) const B_BE_TXSB_20M_MASK: u32 = 0xF;
+/// `B_BE_TXSB_40M_MASK` GENMASK(7, 4) (`reg.h:6640`).
+pub(super) const B_BE_TXSB_40M_MASK: u32 = 0xF << 4;
+/// `B_BE_TXSB_80M_MASK` GENMASK(11, 8) (`reg.h:6636`).
+pub(super) const B_BE_TXSB_80M_MASK: u32 = 0xF << 8;
+/// `B_BE_PRI20_BITMAP_MASK` GENMASK(31, 16) (`reg.h:6631`).
+pub(super) const B_BE_PRI20_BITMAP_MASK: u32 = 0xFFFF << 16;
+/// `BE_PRI20_BITMAP_MAX` (`reg.h:6632`).
+pub(super) const BE_PRI20_BITMAP_MAX: u8 = 15;
+
+/// The `R_BE_TX_SUB_BAND_VALUE` word `rtw8922a_set_channel_mac`
+/// writes (`rtw8922a.c:1060..1101`): the 20/40/80 MHz TXSB indices
+/// for the operating width (the 160MHz arm also fills the 80MHz index)
+/// plus the primary-20 bitmap bit. 320MHz takes the default arm like
+/// Linux: no TXSB fields, primary bitmap bit 0.
+pub(super) fn tx_sub_band_value(width: Width, pri_ch: u8, central_ch: u8) -> Option<u32> {
+    let (mut txsb20, mut txsb40, mut txsb80) = (0u8, 0u8, 0u8);
+    // The Linux switch falls through 160 -> 80 -> 40.
+    if matches!(width, Width::Mhz160) {
+        txsb80 = get_txsb(width, pri_ch, central_ch, Width::Mhz80)?;
+    }
+    if matches!(width, Width::Mhz160 | Width::Mhz80) {
+        txsb40 = get_txsb(width, pri_ch, central_ch, Width::Mhz40)?;
+    }
+    if matches!(width, Width::Mhz160 | Width::Mhz80 | Width::Mhz40) {
+        txsb20 = get_txsb(width, pri_ch, central_ch, Width::Mhz20)?;
+    }
+    // `u32_encode_bits` masks each index to its 4-bit field.
+    let f20 = (txsb20 as u32) & B_BE_TXSB_20M_MASK;
+    let f40 = ((txsb40 as u32) << 4) & B_BE_TXSB_40M_MASK;
+    let f80 = ((txsb80 as u32) << 8) & B_BE_TXSB_80M_MASK;
+    let mut txsb = match width {
+        Width::Mhz160 => f20 | f40 | f80,
+        Width::Mhz80 => f20 | f40,
+        Width::Mhz40 => f20,
+        Width::Mhz20 | Width::Mhz320 => 0,
+    };
+    if txsb20 <= BE_PRI20_BITMAP_MAX {
+        txsb |= ((1u32 << txsb20) << 16) & B_BE_PRI20_BITMAP_MASK;
+    }
+    Some(txsb)
 }
 
 // ── `rtw8922a_chan_to_rf18_val` bandwidth field ───────────────────────
