@@ -7704,12 +7704,26 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
     }
 }
 
-/// Most staged entries one pull inspects in each holding place, newest first.
-/// It bounds how long a thief keeps a victim's inbox lock or gate, both of
-/// which wakers take with interrupts masked. Entries the thief may not take
-/// (pinned, cache-hot, throttled, directly claimed) count against it, so a task
-/// behind more than this many such entries waits for one of them to leave.
+/// Most staged entries one pull judges in each holding place. It bounds how
+/// long a thief keeps a victim's inbox lock or gate, both of which wakers take
+/// with interrupts masked.
+///
+/// The window is not fixed at the front. A pull that judges a full window and
+/// takes nothing starts the next pull on that victim one window further on,
+/// and wraps at the end (`StagedWatch::{inbox_skip, parked_skip}`), so entries
+/// no thief may take — pinned to the victim, cache-hot, throttled, directly
+/// claimed, or stale — do not hide the entries behind them however long the
+/// victim stays stalled. The two holding places are ordered differently: the
+/// wake inbox is a queue and is scanned oldest first; the parked-wake list is
+/// a stack and is scanned newest first.
 const STAGED_STEAL_SCAN: usize = 32;
+
+/// How far down a victim's parked-wake list the window may start. The thief
+/// has to walk to the window under the gate, one pointer per node, so the
+/// reach is bounded: the newest `STAGED_PARKED_REACH + STAGED_STEAL_SCAN`
+/// (128) nodes are reachable by successive pulls, older ones only once newer
+/// ones have left. The wake inbox is indexed and has no such bound.
+const STAGED_PARKED_REACH: usize = 3 * STAGED_STEAL_SCAN;
 
 /// How long thieves must have watched wakes sit staged on a CPU that passes no
 /// scheduling point before they call it stalled and stop leaving it a last
@@ -7736,14 +7750,53 @@ struct StagedWatch {
     passes: AtomicU64,
     /// Cycle stamp of that sighting.
     since: AtomicU64,
+    /// Where the next pull's window starts in the victim's wake inbox,
+    /// counted from the oldest entry.
+    inbox_skip: AtomicUsize,
+    /// The same for its parked-wake list, counted from the newest node.
+    parked_skip: AtomicUsize,
 }
 
 static STAGED_WATCH: [StagedWatch; narf_lib::percpu::MAX_CPUS] = [const {
     StagedWatch {
         passes: AtomicU64::new(0),
         since: AtomicU64::new(0),
+        inbox_skip: AtomicUsize::new(0),
+        parked_skip: AtomicUsize::new(0),
     }
 }; narf_lib::percpu::MAX_CPUS];
+
+/// Where this pull's window starts in a holding place of `len` entries, given
+/// where the last fruitless pull left `cursor`. A cursor past the end, or past
+/// `reach`, starts over at the front.
+#[inline]
+fn staged_window_start(cursor: &AtomicUsize, len: usize, reach: usize) -> usize {
+    let start = cursor.load(Ordering::Relaxed);
+    if start >= len || start > reach {
+        0
+    } else {
+        start
+    }
+}
+
+/// Leave `cursor` for the next pull. A pull that took an entry keeps its
+/// window: the entry behind the taken one has moved into it. One that took
+/// nothing moves a window on, or back to the front when there is no further
+/// window within `len` and `reach`.
+#[inline]
+fn staged_window_advance(cursor: &AtomicUsize, start: usize, len: usize, reach: usize, took: bool) {
+    let moved_on = start.saturating_add(STAGED_STEAL_SCAN);
+    let next = if took {
+        start
+    } else if moved_on < len && moved_on <= reach {
+        moved_on
+    } else {
+        0
+    };
+    if cursor.load(Ordering::Relaxed) != next {
+        cursor.store(next, Ordering::Relaxed);
+    }
+}
 
 impl StagedWatch {
     /// Nothing is staged: whatever was being watched is over.
@@ -7751,6 +7804,12 @@ impl StagedWatch {
     fn forget(&self) {
         if self.passes.load(Ordering::Relaxed) != 0 {
             self.passes.store(0, Ordering::Relaxed);
+        }
+        if self.inbox_skip.load(Ordering::Relaxed) != 0 {
+            self.inbox_skip.store(0, Ordering::Relaxed);
+        }
+        if self.parked_skip.load(Ordering::Relaxed) != 0 {
+            self.parked_skip.store(0, Ordering::Relaxed);
         }
     }
 
@@ -7850,11 +7909,22 @@ fn try_steal_staged(
     // the task as the victim would have.
     if enqueued != 0 {
         let taken = WAKE_INBOX[victim].try_lock().and_then(|mut inbox| {
+            let len = inbox.len();
+            let start = staged_window_start(&watch.inbox_skip, len, usize::MAX);
             let position = inbox
                 .iter()
+                .enumerate()
+                .skip(start)
                 .take(STAGED_STEAL_SCAN)
-                .position(|(slot, _)| stealable(slot))?;
-            let taken = inbox.remove(position);
+                .find_map(|(position, (slot, _))| stealable(slot).then_some(position));
+            staged_window_advance(
+                &watch.inbox_skip,
+                start,
+                len,
+                usize::MAX,
+                position.is_some(),
+            );
+            let taken = inbox.remove(position?);
             WAKE_INBOX_LEN[victim].store(inbox.len(), Ordering::Release);
             taken
         });
@@ -7875,10 +7945,22 @@ fn try_steal_staged(
     }
     let mut pinned = [core::ptr::null::<WakeCell>(); STAGED_STEAL_SCAN];
     let mut count = 0;
+    let start = staged_window_start(&watch.parked_skip, woken, STAGED_PARKED_REACH);
     {
         let inbox = &PARKED_WAKE_INBOX[victim];
         let _gate = inbox.gate.lock();
         let mut node = inbox.head.load(Ordering::Relaxed).cast_const();
+        // Walk to the window. `woken` was read before the gate, so the list
+        // may have become shorter; then the window is empty and the cursor
+        // goes back to the front below.
+        for _ in 0..start {
+            if node.is_null() {
+                break;
+            }
+            // SAFETY: linked under the gate, hence kept alive by the inbox's
+            // reference; links change only under the gate.
+            node = unsafe { (*node).wake_next.load(Ordering::Relaxed) };
+        }
         while !node.is_null() && count < STAGED_STEAL_SCAN {
             // SAFETY: a node linked under the gate is kept alive by the
             // inbox's reference; this takes one more for the thief, so the
@@ -7914,6 +7996,15 @@ fn try_steal_staged(
         // SAFETY: each entry holds the reference taken under the gate.
         unsafe { Arc::decrement_strong_count(*node) };
     }
+    // An empty window means the list ended before it; count it as the end.
+    let seen_len = if count == 0 { 0 } else { woken };
+    staged_window_advance(
+        &watch.parked_skip,
+        start,
+        seen_len,
+        STAGED_PARKED_REACH,
+        taken.is_some(),
+    );
     let Some(slot) = taken else {
         return false;
     };
