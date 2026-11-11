@@ -1057,13 +1057,17 @@ fn parse_operation_caps(
             let ccmp = u32_attr(attrs, 73)? == Some(0x000fac04)
                 && u32_attr(attrs, 74)? == Some(0x000fac04);
             let cred = if let Some(password) = attr(attrs, 277) {
-                // WPA3-SAE offload: SAE auth, RSN (WPA2 versions), AKM SAE
-                // (00-0F-AC:8), CCMP, and mandatory management-frame protection.
+                // WPA3-SAE offload: SAE auth, AKM SAE (00-0F-AC:8), CCMP, and
+                // mandatory management-frame protection. wpa_supplicant's
+                // `wpa_ver_supported` sends NL80211_WPA_VERSION_3 (4) for an
+                // SAE AKM once the family's max attribute covers
+                // NL80211_ATTR_SAE_PASSWORD, and NL80211_WPA_VERSION_2 below
+                // that.
                 if !sae_offload
                     || auth != 4
                     || mfp != 1
                     || !ccmp
-                    || u32_attr(attrs, 75)? != Some(2)
+                    || !matches!(u32_attr(attrs, 75)?, Some(2 | 4))
                     || primary_akm(attrs) != Some(0x000fac08)
                     || attr(attrs, 254).is_some()
                 {
@@ -4423,8 +4427,8 @@ async fn execute(
                     let cache = CACHE.lock();
                     let results = cache.iter().find(|c| c.matches(iface.name(), ns, index));
                     results.and_then(|c| {
-                        select_bss(
-                            c.results.iter().map(|(b, _)| b),
+                        select_bss_with_ies(
+                            c.results.iter().map(|(b, ies)| (b, ies.as_slice())),
                             &ssid,
                             bssid,
                             frequency_mhz,
@@ -4455,11 +4459,7 @@ async fn execute(
                         })
                         .await?;
                     results.truncate(256);
-                    selected = select_bss(results.iter(), &ssid, bssid, frequency_mhz, akm);
-                    if !authorized_link(&admin, iface.as_ref(), ns, index) {
-                        return Err(crate::WirelessError::Denied);
-                    }
-                    let entries = results
+                    let entries: Vec<(crate::BssInfo, Vec<u8>)> = results
                         .into_iter()
                         .map(|bss| {
                             let ies = iface
@@ -4468,6 +4468,16 @@ async fn execute(
                             (bss, ies)
                         })
                         .collect();
+                    selected = select_bss_with_ies(
+                        entries.iter().map(|(b, ies)| (b, ies.as_slice())),
+                        &ssid,
+                        bssid,
+                        frequency_mhz,
+                        akm,
+                    );
+                    if !authorized_link(&admin, iface.as_ref(), ns, index) {
+                        return Err(crate::WirelessError::Denied);
+                    }
                     if let Some(cache) = CACHE
                         .lock()
                         .iter_mut()
@@ -4646,6 +4656,57 @@ fn select_bss<'a>(
         })
         .max_by_key(|b| b.rssi)
         .cloned()
+}
+
+/// [`select_bss`] over results that still carry each BSS's elements.
+///
+/// A WPA3-Personal transition BSS lists PSK and SAE in one RSN element and a
+/// scan summary classifies it as WPA2. wpa_supplicant prefers SAE there, so
+/// an SAE CONNECT must find that BSS too: when no WPA3-classified BSS
+/// matches, a WPA2-classified one whose RSN element offers an SAE AKM does.
+fn select_bss_with_ies<'a>(
+    results: impl Iterator<Item = (&'a crate::BssInfo, &'a [u8])> + Clone,
+    ssid: &[u8],
+    bssid: Option<[u8; 6]>,
+    frequency_mhz: Option<u32>,
+    akm: Akm,
+) -> Option<crate::BssInfo> {
+    select_bss(
+        results.clone().map(|(bss, _)| bss),
+        ssid,
+        bssid,
+        frequency_mhz,
+        akm,
+    )
+    .or_else(|| {
+        if akm != Akm::Sae {
+            return None;
+        }
+        results
+            .filter(|(b, ies)| {
+                b.ssid == ssid
+                    && bssid.is_none_or(|address| address == b.bssid)
+                    && frequency_mhz.is_none_or(|freq| freq == b.frequency_mhz)
+                    && matches!(b.security, crate::scan::BssSecurity::Wpa2)
+                    && rsn_offers_sae(ies)
+            })
+            .max_by_key(|(b, _)| b.rssi)
+            .map(|(b, _)| b.clone())
+    })
+}
+
+/// Whether the RSN element among `ies` lists an SAE AKM (00-0F-AC:8 or :24).
+fn rsn_offers_sae(ies: &[u8]) -> bool {
+    elements(ies)
+        .ok()
+        .and_then(|list| list.into_iter().find(|(id, _)| *id == 48))
+        .and_then(|(_, body)| crate::rsn::RsnIe::decode_body(body))
+        .is_some_and(|rsn| {
+            rsn.akms.iter().any(|akm| {
+                *akm == crate::rsn::Suite::standard(crate::rsn::AKM_SAE)
+                    || *akm == crate::rsn::Suite::standard(crate::rsn::AKM_SAE_EXT_KEY)
+            })
+        })
 }
 
 fn scan_reply(
