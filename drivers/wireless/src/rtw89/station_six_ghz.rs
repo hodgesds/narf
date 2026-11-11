@@ -191,8 +191,12 @@ fn parse(body: &[u8]) -> Option<(u8, Slot)> {
             for (out, value) in slot.power.iter_mut().zip(&values[..n]) {
                 *out = *value as i8;
             }
+            // No extension count byte (`values.len() == n`) means no
+            // extension entries; `values[n + 1..]` would start past
+            // the end of the field then.
             let k = k.min(16 - n);
-            for (out, value) in slot.power[n..].iter_mut().zip(&values[n + 1..n + 1 + k]) {
+            let ext = values.get(n + 1..n + 1 + k).unwrap_or(&[]);
+            for (out, value) in slot.power[n..].iter_mut().zip(ext) {
                 *out = *value as i8;
             }
             slot.count = n + k;
