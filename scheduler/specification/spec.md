@@ -878,13 +878,28 @@ pub struct TaskSpec {
   task returning to it, a direct task-to-task handoff — in a counter only that
   CPU writes. When a CPU's timer tick
   finds wakes staged there and its executor has passed no scheduling point
-  since the previous such tick, it sends one reschedule kick to a halted
-  online CPU, nearest higher-numbered first (Linux `sched_balance_trigger` →
-  `nohz_balancer_kick` → `kick_ilb`). The kick names no task; the woken CPU's
-  steal pass applies the rules above. It repeats each tick while the condition
-  holds. A CPU with interrupts masked takes no tick and sends no kick; there
-  the bound is the idle CPUs' own periodic pass (the periodic tick, or the
-  2 ms idle backstop).
+  since the previous such tick, it sends one reschedule kick to a halted CPU
+  (Linux `sched_balance_trigger` → `nohz_balancer_kick` → `kick_ilb`). The
+  kick names no task; the woken CPU's steal pass applies the rules above. It
+  is aimed and rationed, as `find_new_ilb` and `NOHZ_BALANCE_KICK` do for
+  Linux:
+  - the target must be in the union of the hard affinity masks of the staged,
+    runnable tasks (up to 32 per holding place are read, under `try_lock`);
+    if no other CPU is, no kick is sent, so wakes pinned to the stalled CPU
+    and nodes whose task went back to sleep wake nobody;
+  - the target must be online, halted, and `Active` or `Idle` — a logically
+    offlined CPU also publishes itself halted and stays online, but runs no
+    steal pass;
+  - a target whose `NEED_RESCHED` is still set has not consumed the last
+    kick or wake and is skipped;
+  - among those, the nearest higher-numbered CPU is chosen, wrapping;
+  - within one stall, stalled ticks 1, 2, 4, 8, … send while the number of
+    staged entries is unchanged, and a change starts over.
+
+  A kicked CPU consumes `NEED_RESCHED` at its next halt commit, so one kick
+  buys two steal passes. A CPU with interrupts masked takes no tick and sends
+  no kick; there the bound is the idle CPUs' own periodic pass (the periodic
+  tick, or the 2 ms idle backstop).
 - Process-fork placement may take a non-blocking snapshot of every allowed,
   online run queue. Its load includes dispatchable queued slots, staged wake
   inbox entries, and the currently executing task. A contended queue is

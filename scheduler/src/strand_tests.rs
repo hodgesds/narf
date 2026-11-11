@@ -1104,3 +1104,78 @@ kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_park_with_cpu_local_state_is_caught
 );
+
+/// The tick-side kick is rationed and aimed. Within a stall it sends on
+/// stalled ticks 1, 2, 4, 8, … while the staged count is unchanged and starts
+/// over when it changes. It is aimed only at CPUs that may run something
+/// staged: a wake pinned to the stalled CPU, or a node whose task has gone
+/// back to sleep, asks for nobody.
+fn smoke_scheduler_idle_balance_kick_is_aimed_and_rationed() -> TestResult {
+    let mut state = 0u64;
+    let mut sent = [false; 9];
+    for tick in sent.iter_mut().skip(1) {
+        let (next, due) = crate::staged_kick_backoff(state, 3);
+        state = next;
+        *tick = due;
+    }
+    if sent != [false, true, true, false, true, false, false, false, true] {
+        return TestResult::Fail("kick did not back off to stalled ticks 1, 2, 4, 8");
+    }
+    let (state, on_change) = crate::staged_kick_backoff(state, 4);
+    let (state, second) = crate::staged_kick_backoff(state, 4);
+    let (_, third) = crate::staged_kick_backoff(state, 4);
+    if !on_change || !second || third {
+        return TestResult::Fail("a change in what is staged did not restart the back-off");
+    }
+
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let stuck_bit = 1u64 << stuck.0;
+    let pinned = Affinity::pinned(CpuId(stuck.0 as u32));
+    if park_probe_on(0, 1, stuck.0, Some(pinned)).is_none() {
+        stuck.release();
+        return TestResult::Fail("could not park the pinned probe on the stuck CPU");
+    }
+    if let Some(waker) = take_waker(0) {
+        waker.wake();
+    }
+    let for_pinned = crate::staged_pull_mask(stuck.0);
+
+    let Some((_id, cell)) = park_probe_on(1, 1, stuck.0, None) else {
+        stuck.release();
+        return TestResult::Fail("could not park the probe on the stuck CPU");
+    };
+    if let Some(waker) = take_waker(1) {
+        waker.wake();
+    }
+    // Its node stays linked, but the wake has been consumed.
+    cell.flag.store(false, Ordering::SeqCst);
+    let for_stale_node = crate::staged_pull_mask(stuck.0);
+
+    crate::spawn_with_spec(Probe { slot: 2, parks: 0 }, any_cpu_preferring(me));
+    let Some(slot) = crate::READY[me].lock().as_mut().and_then(|q| q.pop_front()) else {
+        stuck.release();
+        return TestResult::Fail("spawned probe not found on this CPU");
+    };
+    crate::enqueue_on(stuck.0, slot, TaskEnqueueReason::Requeued);
+    let for_free_task = crate::staged_pull_mask(stuck.0);
+    stuck.release();
+
+    if for_pinned != 0 {
+        return TestResult::Fail("a wake pinned to the stalled CPU asked another CPU to come");
+    }
+    if for_stale_node != 0 {
+        return TestResult::Fail("a node whose task went back to sleep asked for a kick");
+    }
+    if for_free_task & (1u64 << me) == 0 || for_free_task & stuck_bit != 0 {
+        return TestResult::Fail("a task any CPU may run did not ask the other CPUs to come");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_idle_balance_kick_is_aimed_and_rationed
+);
