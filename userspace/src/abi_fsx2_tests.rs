@@ -1061,6 +1061,80 @@ fn smoke_abi_fsx2_mount_bind_subdir_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_subdir_pos);
 
+// mount(2) looks its target up with `user_path_at(AT_FDCWD, ...)` and a bind
+// source with `kern_path`: relative names start at the working directory.
+// bubblewrap's root setup is exactly this sequence — `chdir(base)`,
+// `mkdir("newroot")`, `mount("newroot", "newroot", NULL, MS_BIND | MS_REC)` —
+// and NARF resolved "newroot" as "/newroot" and returned ENOENT.
+fn smoke_abi_fsx2_mount_bind_relative_to_cwd_pos() -> TestResult {
+    with_setup(|| {
+        const MS_BIND: u64 = 1 << 12;
+        const MS_REC: u64 = 1 << 14;
+        let none = b"none\0";
+        let base = b"/abi-relmnt-base\0";
+        let tmpfs = b"tmpfs\0";
+        if call(
+            Syscall::Mount.raw(),
+            SyscallArgs {
+                arg0: none.as_ptr() as u64,
+                arg1: base.as_ptr() as u64,
+                arg2: tmpfs.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("base tmpfs mount failed");
+        }
+        let root = b"/\0";
+        let result = (|| {
+            if call(Syscall::Chdir.raw(), a0(base.as_ptr() as u64)) != Some(0) {
+                return Err("chdir into the base mount failed");
+            }
+            let newroot_abs = b"/abi-relmnt-base/newroot\0";
+            if call(
+                Syscall::Mkdir.raw(),
+                a2(newroot_abs.as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+            {
+                return Err("mkdir newroot failed");
+            }
+            let newroot = b"newroot\0";
+            let bind = SyscallArgs {
+                arg0: newroot.as_ptr() as u64,
+                arg1: newroot.as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_BIND | MS_REC,
+                ..Default::default()
+            };
+            match call(Syscall::Mount.raw(), bind) {
+                Some(0) => {}
+                Some(v) if v == ENOENT => {
+                    return Err("relative bind mount ignored the working directory (ENOENT)")
+                }
+                _ => return Err("relative bind mount in the cwd must return 0"),
+            }
+            // A relative name with nothing behind it is still -ENOENT.
+            let missing = b"abi-relmnt-missing\0";
+            let bad = SyscallArgs {
+                arg0: newroot.as_ptr() as u64,
+                arg1: missing.as_ptr() as u64,
+                arg2: 0,
+                arg3: MS_BIND,
+                ..Default::default()
+            };
+            if call(Syscall::Mount.raw(), bad) != Some(ENOENT) {
+                return Err("bind onto a missing relative target must be ENOENT");
+            }
+            let _ = call(Syscall::Umount2.raw(), a1(newroot_abs.as_ptr() as u64, 0));
+            Ok(())
+        })();
+        let _ = call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64));
+        let _ = call(Syscall::Umount2.raw(), a1(base.as_ptr() as u64, 0));
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_relative_to_cwd_pos);
+
 // mount(2) resolves both source and target symlinks before attaching a bind
 // mount. Fedora's /var/mail -> spool/mail exercises this during the
 // accounts-daemon sandbox setup: binding the symlink inode would make it a

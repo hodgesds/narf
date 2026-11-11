@@ -314,8 +314,17 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         .and_then(|fd| fd_path_for_task(current_task_id(), fd))
         .filter(|path| path.starts_with('/'))
         .unwrap_or(target_raw);
-    // Resolve target under the calling task's chroot.
-    let target = apply_chroot(target_path.as_str());
+    // Resolve target under the calling task's chroot. `user_path_at(AT_FDCWD,
+    // dir_name, ...)` is an ordinary lookup: a relative `dir_name` starts at
+    // the caller's working directory. bubblewrap builds its root that way —
+    // `chdir("/tmp"); mkdir("newroot"); mount("newroot", "newroot", NULL,
+    // MS_BIND | MS_REC, NULL)` — and treating "newroot" as "/newroot" made
+    // that -ENOENT.
+    let target = if target_path.starts_with('/') {
+        apply_chroot(target_path.as_str())
+    } else {
+        resolve_cwd_path(current_task_id(), target_path.as_str())
+    };
     // `mount(2)` resolves symlinks in the target before attaching. Fedora's
     // `/var/mail -> spool/mail` is one ordinary example: binding the link
     // inode as a file mount makes later namespace remounts fail instead of
@@ -390,8 +399,15 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         .and_then(|fd| fd_path_for_task(current_task_id(), fd))
         .filter(|path| path.starts_with('/'))
         .unwrap_or_else(|| source.clone());
+    // A bind or move source is a path (`kern_path(dev_name, LOOKUP_FOLLOW)`
+    // in `do_loopback` / `do_move_mount_old`), so a relative one is relative
+    // to the working directory. For every other mount the source is a device
+    // or a label and is left as given.
+    const SOURCE_IS_PATH: u64 = (1 << 12) | (1 << 13); // MS_BIND | MS_MOVE
     let source_resolved = if source_path.starts_with('/') {
         apply_chroot(source_path.as_str())
+    } else if !source_path.is_empty() && args.arg3 & SOURCE_IS_PATH != 0 {
+        resolve_cwd_path(current_task_id(), source_path.as_str())
     } else {
         source_path.clone()
     };
@@ -591,7 +607,8 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
                     } else {
                         alloc::format!("{}{}", target.trim_end_matches('/'), relative)
                     };
-                    let _ = current_mount_arc_with_flags(&auth, child_target.as_str(), fs, mnt_flags);
+                    let _ =
+                        current_mount_arc_with_flags(&auth, child_target.as_str(), fs, mnt_flags);
                 }
                 ctx.set_return(SyscallReturn::ok(0));
             }
@@ -615,8 +632,12 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     }
     let (uid, gid) = current_fs_ids();
     let request = narf_filesystem::MountRequest {
-        fs_type: &fstype, source: &source_resolved, options: &data,
-        uid, gid, umask: current_umask() as u16,
+        fs_type: &fstype,
+        source: &source_resolved,
+        options: &data,
+        uid,
+        gid,
+        umask: current_umask() as u16,
         initial_namespace: current_mount_namespace().is_none(),
         read_only: flags & MS_RDONLY != 0,
     };
