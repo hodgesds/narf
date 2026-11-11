@@ -52,6 +52,7 @@ pub use entropy::{
     has_hw_entropy, key_material_rng, try_fill_key_material, try_fill_random_bytes,
     try_per_task_rng,
 };
+pub mod gcm;
 pub mod hdcp;
 pub mod hkdf;
 pub mod michael_mic;
