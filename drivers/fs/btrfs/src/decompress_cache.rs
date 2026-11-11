@@ -33,23 +33,51 @@
 //! - **Only verified data.** Callers insert only after the compressed bytes
 //!   passed the checksum check (when the volume verifies checksums) *and*
 //!   decompressed successfully. Failures are never cached.
-//! - **Bounded.** At most [`BUDGET_BYTES`] of decompressed data. The least
-//!   recently used entry is evicted first. One spinlock serializes the
-//!   bookkeeping, and the data is shared out as `Arc<Vec<u8>>`, so the lock is
-//!   never held across I/O or decompression.
-//!   An entry-count limit also bounds bookkeeping for tiny read windows.
+//! - **Bounded.** At most [`budget_bytes`] (a fraction of RAM,
+//!   [`crate::cache_budget::DATA_CACHE`]) of heap, counting each entry's
+//!   buffer and its bookkeeping. The least recently used entry is evicted
+//!   first. One spinlock serializes the bookkeeping, and the data is shared
+//!   out as `Arc<Vec<u8>>`, so the lock is never held across I/O or
+//!   decompression. An entry-count limit also bounds the eviction scan.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Upper bound on cached extent bytes, across all volumes.
-pub const BUDGET_BYTES: usize = 32 << 20;
+/// Most entries, across all volumes: eviction scans them for the least
+/// recently used one.
 const MAX_ENTRIES: usize = 8192;
+
+/// Bookkeeping an entry costs on top of its buffer: the key and entry in the
+/// map's B-tree node, and the `Arc` header and `Vec` triple.
+const ENTRY_OVERHEAD: usize = 128;
+
+/// What caching `plain` costs the heap.
+fn charge(plain: &Arc<Vec<u8>>) -> usize {
+    plain.capacity() + ENTRY_OVERHEAD
+}
+
+/// The budget in bytes, computed from RAM on first use (0: not yet).
+static BUDGET: AtomicUsize = AtomicUsize::new(0);
+
+/// Upper bound on the heap the cache holds, across all volumes: a fraction
+/// of RAM ([`crate::cache_budget::DATA_CACHE`]; 32 MiB at 4 GiB, 128 MiB
+/// from 16 GiB up). It used to be a fixed 32 MiB of buffer bytes, not
+/// counting the bookkeeping.
+pub fn budget_bytes() -> usize {
+    match BUDGET.load(Ordering::Relaxed) {
+        0 => {
+            let budget = crate::cache_budget::DATA_CACHE.of(crate::cache_budget::total_ram_bytes());
+            BUDGET.store(budget, Ordering::Relaxed);
+            budget
+        }
+        budget => budget,
+    }
+}
 
 /// Identity of a volume: its allocation address. Stable while any entry holds
 /// its `Weak`.
@@ -171,8 +199,9 @@ pub fn epoch(vol: &VolumeRef) -> u64 {
 /// while the volume's epoch was `epoch`. A later write epoch rejects the fill.
 pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<u8>>) {
     let size = plain.len();
+    let budget = budget_bytes();
     if size == 0
-        || size > BUDGET_BYTES / 4
+        || charge(&plain) > budget / 4
         || id.disk_num_bytes == 0
         || id.disk_num_bytes > MAX_DISK_BYTES
         || (id.compression == crate::format::COMPRESS_NONE && size as u64 != id.disk_num_bytes)
@@ -189,7 +218,7 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
         cache.entries.retain(|_, e| {
             let live = e.owner.strong_count() > 0;
             if !live {
-                freed += e.plain.len();
+                freed += charge(&e.plain);
             }
             live
         });
@@ -199,7 +228,8 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
             .epochs
             .retain(|vol_key, _| *vol_key == vol.key || live.contains(vol_key));
     }
-    while cache.bytes + size > BUDGET_BYTES || cache.entries.len() >= MAX_ENTRIES {
+    let size = charge(&plain);
+    while cache.bytes + size > budget || cache.entries.len() >= MAX_ENTRIES {
         let Some(victim) = cache
             .entries
             .iter()
@@ -209,7 +239,7 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
             break;
         };
         if let Some(entry) = cache.entries.remove(&victim) {
-            cache.bytes -= entry.plain.len();
+            cache.bytes -= charge(&entry.plain);
         }
     }
     cache.clock += 1;
@@ -220,7 +250,7 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
         last_use: now,
     };
     if let Some(old) = cache.entries.insert(key(vol.key, id), entry) {
-        cache.bytes -= old.plain.len();
+        cache.bytes -= charge(&old.plain);
     }
     cache.bytes += size;
 }
@@ -256,7 +286,7 @@ pub fn invalidate(vol: VolKey, logical: u64, len: usize) {
         .collect();
     for k in doomed {
         if let Some(entry) = cache.entries.remove(&k) {
-            cache.bytes -= entry.plain.len();
+            cache.bytes -= charge(&entry.plain);
         }
     }
 }
