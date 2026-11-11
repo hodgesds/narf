@@ -358,6 +358,9 @@ unsafe fn alloc_once_or_request(
     let ptr = unsafe { backend.alloc(layout) };
     if ptr.is_null() {
         crate::reclaim::request_reclaim(node, background_reclaim_target(layout.size()));
+        // Most callers turn this null into a "memory allocation failed"
+        // panic with nothing else on the console; say where memory was.
+        crate::frame::report_allocation_failure(layout.size(), layout.align());
     }
     ptr
 }
