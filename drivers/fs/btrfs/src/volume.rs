@@ -516,6 +516,7 @@ impl<B: BlockDevice> VolCore<B> {
             inode: IrqSafeSpinLock::new(inode),
             live_size: core::sync::atomic::AtomicU64::new(inode.size),
             update_seq: core::sync::atomic::AtomicU64::new(0),
+            content_lock: Mutex::new(()),
         });
         anchors.insert((tree, ino), Arc::downgrade(&anchor));
         anchor
@@ -651,6 +652,12 @@ pub(crate) struct MmapAnchor {
     /// and publishes only if it did not move, so a tree read that lost a
     /// race never overwrites what the mutation published.
     pub(crate) update_seq: core::sync::atomic::AtomicU64,
+    /// Held for the whole of a write, truncate, fallocate or attribute
+    /// change of this inode — Linux `inode_lock`. A truncate or fallocate
+    /// takes the volume's operation lock only per step and lets other work
+    /// run between its steps; this keeps every other content change of the
+    /// same inode out until it is done.
+    pub(crate) content_lock: Mutex<()>,
 }
 
 /// Content-generation counters for one filesystem instance, backing

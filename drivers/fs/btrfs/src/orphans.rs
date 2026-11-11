@@ -9,6 +9,10 @@ use crate::{btree, format::BtrfsKey, volume::BtrfsVolume};
 pub(crate) const ORPHAN_OBJECTID: u64 = (-5i64) as u64;
 pub(crate) const ORPHAN_ITEM_KEY: u8 = 48;
 
+/// Steps of an orphan's eviction one operation takes on
+/// ([`BtrfsVolume::reap_orphans`]): 64 steps of 16 extent items.
+const REAP_STEP_BUDGET: usize = 64;
+
 pub(crate) fn key(ino: u64) -> BtrfsKey {
     BtrfsKey::new(ORPHAN_OBJECTID, ORPHAN_ITEM_KEY, ino)
 }
@@ -29,7 +33,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             self.note_orphan(self.fs_tree_id(), key.offset);
         }
         let had_orphans = !self.orphan_snapshot().is_empty();
-        self.reap_orphans().await?;
+        // At mount, evict them whole, as Linux `btrfs_orphan_cleanup` does.
+        self.reap_orphans_budget(usize::MAX).await?;
         if had_orphans {
             self.sync_to_disk().await?;
         }
@@ -40,6 +45,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// register their anchor against [`Self::claim_for_eviction`], which
     /// closes the lookup-versus-final-eviction race.
     pub(crate) async fn reap_orphans(&self) -> Result<(), FsError> {
+        self.reap_orphans_budget(REAP_STEP_BUDGET).await
+    }
+
+    /// [`Self::reap_orphans`], each orphan's eviction taking at most `budget`
+    /// steps that keep its inode: a large file's eviction goes on over the
+    /// operations that follow, with other work between, as Linux evicts in
+    /// transactions other work runs between.
+    pub(crate) async fn reap_orphans_budget(&self, budget: usize) -> Result<(), FsError> {
         for (tree, ino) in self.orphan_snapshot() {
             if !self.claim_for_eviction(tree, ino) {
                 continue;
@@ -48,8 +61,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             if !view.supports_writes() {
                 continue;
             }
-            crate::write::reclaim_orphan(&view, ino).await?;
-            self.forget_orphan(tree, ino);
+            if crate::write::reclaim_orphan_steps(&view, ino, budget).await? {
+                self.forget_orphan(tree, ino);
+            }
         }
         Ok(())
     }

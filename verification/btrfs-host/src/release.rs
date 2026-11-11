@@ -340,7 +340,12 @@ fn reservation(args: &Args) -> Result<String, String> {
                     block_on(async {
                         top.unlink(&gone_name).await?;
                         top.create(&poke).await?;
-                        top.fsync(false).await
+                        // Each operation (an fsync among them) takes on a
+                        // bounded part of the eviction: 64 steps.
+                        for _ in 0..items.div_ceil(STEP * 64) + 1 {
+                            top.fsync(false).await?;
+                        }
+                        Ok(())
                     })
                 },
             ));

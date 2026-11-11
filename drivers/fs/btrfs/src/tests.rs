@@ -22,6 +22,7 @@ mod commit_scale;
 mod data_cache;
 mod extent_window;
 mod grow_tall;
+mod inode_lock;
 mod overwrite_cost;
 mod release_cost;
 mod root_collapse;
@@ -179,12 +180,20 @@ fn poll_once<F: core::future::Future>(mut future: F) -> Option<F::Output> {
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut context = Context::from_waker(&waker);
     // SAFETY: `future` stays at this stack slot until dropped.
-    let pinned = unsafe { Pin::new_unchecked(&mut future) };
-    match pinned.poll(&mut context) {
-        Poll::Ready(value) => Some(value),
-        Poll::Pending => None,
+    let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
+    // A long truncate or fallocate yields between its steps
+    // (`write::step_break`) and is ready only after many polls; a future
+    // that is really blocked stays pending and comes back `None`.
+    for _ in 0..POLL_ONCE_LIMIT {
+        if let Poll::Ready(value) = pinned.as_mut().poll(&mut context) {
+            return Some(value);
+        }
     }
+    None
 }
+
+/// Polls [`poll_once`] spends on a future before calling it blocked.
+const POLL_ONCE_LIMIT: u32 = 1 << 20;
 
 /// Mount a `NARFBTR1` sparse image on a fresh `RamBlockDevice` (512-byte LBAs).
 fn mount_sparse(
