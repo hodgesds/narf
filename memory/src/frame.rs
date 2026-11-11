@@ -4229,6 +4229,25 @@ fn smoke_alloc_pages_below_honours_mask() -> narf_kernel_test::TestResult {
 }
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_alloc_pages_below_honours_mask);
 
+/// The node the frame-cache tests allocate on: this CPU's node when it has
+/// memory, else the first node that does. A node can have none at all — in
+/// the kernel-test VM the kernel image covers every frame of node 0 — and an
+/// allocation "on" it then comes from another node, which is not what these
+/// tests measure.
+#[cfg(feature = "kernel-test")]
+fn test_node_with_memory() -> usize {
+    if !ALLOC.numa_aware.load(Ordering::Acquire) {
+        return 0;
+    }
+    let local = current_cpu_node();
+    if node_total(local) != 0 {
+        return local;
+    }
+    (0..MAX_NUMA_NODES)
+        .find(|&node| node_total(node) != 0)
+        .unwrap_or(local)
+}
+
 #[cfg(feature = "kernel-test")]
 fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {
     use narf_kernel_test::TestResult;
@@ -4236,7 +4255,7 @@ fn smoke_order0_frame_cache_round_trip() -> narf_kernel_test::TestResult {
     if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
         return TestResult::Skip("frame caches not published");
     }
-    let node = current_cpu_node();
+    let node = test_node_with_memory();
     if FRAME_CACHE_HOTPLUG_BYPASS[node].load(Ordering::Acquire) {
         return TestResult::Skip("runtime hotplug intentionally bypasses frame cache");
     }
@@ -4337,11 +4356,7 @@ fn smoke_order1_frame_cache_spill_and_drain() -> narf_kernel_test::TestResult {
         return TestResult::Skip("frame caches not published");
     }
     narf_lib::sync::without_interrupts(|| {
-        let node = if ALLOC.numa_aware.load(Ordering::Acquire) {
-            current_cpu_node()
-        } else {
-            0
-        };
+        let node = test_node_with_memory();
         if frame_cache_bypassed(node) {
             return TestResult::Skip("frame cache bypass is active");
         }
