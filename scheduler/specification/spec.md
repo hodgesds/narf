@@ -865,9 +865,17 @@ pub struct TaskSpec {
   that is written by thieves only (per victim: the pass count at first sight
   and when), dropped when a visit finds nothing staged and restarted when the
   count has moved; the victim's scheduling paths do not touch it, and it does
-  not depend on the victim taking interrupts. One pull inspects at most
-  the 32 newest staged entries per holding place; entries it may not take
-  count against that bound. For woken sleepers the thief pins those nodes
+  not depend on the victim taking interrupts. One pull judges at most 32
+  staged entries per holding place. The wake inbox is a queue and is scanned
+  oldest first; the parked-wake list is a stack and is scanned newest first.
+  The window moves: a pull that judges a full window and takes nothing starts
+  the next pull on that victim one window further on and wraps at the end, so
+  entries no thief may take (pinned to the victim, cache-hot, throttled,
+  directly claimed, stale) do not hide the entries behind them. The inbox is
+  indexed and every entry is reachable this way. Reaching a window on the
+  parked-wake list means walking to it under the gate, so its start is
+  limited to 96 nodes down: the newest 128 nodes are reachable by successive
+  pulls, older ones only as newer ones leave. For woken sleepers the thief pins those nodes
   under the inbox gate, releases it, and only then judges and takes a slot
   under the victim's parked-set lock, so the gate is never held over an
   eligibility check or a steal-strategy callback. A pulled task moves as a whole slot, exactly like a ready-queue
