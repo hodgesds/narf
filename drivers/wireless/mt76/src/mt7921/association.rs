@@ -1194,35 +1194,60 @@ pub(crate) struct ChannelSwitch {
     pub channel: u8,
     /// Target Beacon Transmission Times until the switch (0: any time).
     pub count: u8,
-    /// The ECSA's operating class, when the AP sent one.
+    /// The ECSA's operating class, when the AP sent one this owner reads.
     pub operating_class: Option<u8>,
+    /// The Secondary Channel Offset element (62): 1 above, 3 below.
+    pub secondary_offset: Option<u8>,
+    /// The Wide Bandwidth Channel Switch subelement (194) of the Channel
+    /// Switch Wrapper (196): new channel width, CCFS0, CCFS1.
+    pub wide: Option<[u8; 3]>,
 }
 
-/// The first complete CSA or ECSA among `ies`.
-pub(crate) fn channel_switch(mut ies: &[u8]) -> Option<ChannelSwitch> {
-    while let [id, len, rest @ ..] = ies {
-        let len = usize::from(*len);
-        let body = rest.get(..len)?;
+/// The CSA or ECSA among `ies`, with the width elements that accompany it
+/// (mac80211 `ieee80211_parse_ch_switch_ie`): an ECSA whose operating
+/// class names a band is preferred over the CSA. Only complete elements
+/// before a truncation count.
+pub(crate) fn channel_switch(ies: &[u8]) -> Option<ChannelSwitch> {
+    let (mut csa, mut ecsa, mut secondary_offset, mut wide) = (None, None, None, None);
+    let mut rest = ies;
+    while let [id, len, tail @ ..] = rest {
+        let Some(body) = tail.get(..usize::from(*len)) else {
+            break;
+        };
         match (*id, body) {
-            (37, [mode, channel, count]) => {
-                return Some(ChannelSwitch {
-                    block_tx: *mode == 1,
-                    channel: *channel,
-                    count: *count,
-                    operating_class: None,
-                })
+            (37, &[mode, channel, count]) if csa.is_none() => {
+                csa = Some((mode, None, channel, count))
             }
-            (60, [mode, class, channel, count]) => {
-                return Some(ChannelSwitch {
-                    block_tx: *mode == 1,
-                    channel: *channel,
-                    count: *count,
-                    operating_class: Some(*class),
-                })
+            (60, &[mode, class, channel, count]) if ecsa.is_none() => {
+                ecsa = Some((mode, Some(class), channel, count));
             }
+            (62, &[offset]) if secondary_offset.is_none() => secondary_offset = Some(offset),
+            (196, wrapper) if wide.is_none() => wide = wide_bandwidth_switch(wrapper),
             _ => {}
         }
-        ies = &rest[len..];
+        rest = &tail[body.len()..];
+    }
+    let (mode, operating_class, channel, count) = ecsa
+        .filter(|&(_, class, _, _)| class.and_then(super::csa::class_band).is_some())
+        .or(csa)?;
+    (channel != 0).then_some(ChannelSwitch {
+        block_tx: mode == 1,
+        channel,
+        count,
+        operating_class,
+        secondary_offset,
+        wide,
+    })
+}
+
+/// The Wide Bandwidth Channel Switch subelement of a Channel Switch Wrapper.
+fn wide_bandwidth_switch(mut subelements: &[u8]) -> Option<[u8; 3]> {
+    while let [id, len, tail @ ..] = subelements {
+        let body = tail.get(..usize::from(*len))?;
+        if *id == 194 {
+            return body.get(..3)?.try_into().ok();
+        }
+        subelements = &tail[body.len()..];
     }
     None
 }
@@ -1323,6 +1348,53 @@ impl TxPermission {
     /// Granted on a radar/NO_IR channel because the AP's Beacon was heard.
     pub(crate) fn follows_heard_ap(self) -> bool {
         self.heard_ap
+    }
+    /// The grant of exactly `def` under `domain`.
+    pub(crate) fn from_chandef(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        def: super::csa::Chandef,
+    ) -> Option<Self> {
+        match def.width {
+            super::cmd::CH_BW_20 => Self::from_domain(domain, def.primary),
+            super::cmd::CH_BW_40 => Self::from_domain40(domain, def.primary, def.secondary()?),
+            super::cmd::CH_BW_80 => Self::from_domain80(domain, def.primary, def.center),
+            super::cmd::CH_BW_160 => Self::from_domain160(domain, def.primary, def.center),
+            _ => None,
+        }
+    }
+    /// The grant of a station following its associated AP to `def` (a
+    /// channel switch, or a width change in its Beacons): as for a heard
+    /// AP, a radar/NO_IR channel the AP operates on is allowed. A `vht`
+    /// connection keeps a permitted 80 MHz block as its VHT evidence, as
+    /// [`from_ap`](Self::from_ap) records it.
+    pub(crate) fn following_ap(
+        domain: &narf_wireless::reg::RegulatoryDomain,
+        def: super::csa::Chandef,
+        vht: bool,
+    ) -> Option<Self> {
+        let relaxed = Self::heard_ap_domain(domain);
+        let (mut grant, used) = match Self::from_chandef(domain, def) {
+            Some(grant) => (grant, domain),
+            None => {
+                let mut grant = Self::from_chandef(&relaxed, def)?;
+                grant.heard_ap = true;
+                (grant, &relaxed)
+            }
+        };
+        if vht && grant.vht80_channel.is_none() {
+            grant.vht80_channel = [36, 52, 100, 116, 132, 149, 165]
+                .into_iter()
+                .find(|&primary| Self::from_domain80(used, primary, primary + 6).is_some());
+        }
+        Some(grant)
+    }
+    /// This grant's occupied channel (2.4/5 GHz).
+    pub(crate) fn chandef(self) -> super::csa::Chandef {
+        super::csa::Chandef {
+            primary: self.channel,
+            width: self.native_width(),
+            center: self.center_channel(),
+        }
     }
     /// The same operating channel, width and band as `other` (power,
     /// country and WMM rule may differ).

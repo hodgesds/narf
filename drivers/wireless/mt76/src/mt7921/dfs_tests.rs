@@ -199,24 +199,43 @@ fn with_element(beacon: &[u8], element: &[u8]) -> Vec<u8> {
 }
 
 fn mt7922_channel_switch_elements_parse() -> TestResult {
-    if channel_switch(&[0, 1, b'x', 37, 3, 1, 100, 5])
-        != Some(ChannelSwitch {
-            block_tx: true,
-            channel: 100,
-            count: 5,
-            operating_class: None,
-        })
-        || channel_switch(&[60, 4, 0, 121, 100, 5])
-            != Some(ChannelSwitch {
-                block_tx: false,
-                channel: 100,
-                count: 5,
-                operating_class: Some(121),
-            })
+    let switch = |block_tx, channel, count, operating_class| ChannelSwitch {
+        block_tx,
+        channel,
+        count,
+        operating_class,
+        secondary_offset: None,
+        wide: None,
+    };
+    if channel_switch(&[0, 1, b'x', 37, 3, 1, 100, 5]) != Some(switch(true, 100, 5, None))
+        || channel_switch(&[60, 4, 0, 121, 100, 5]) != Some(switch(false, 100, 5, Some(121)))
         || channel_switch(&[0, 1, b'x', 37, 2, 1, 100]).is_some()
         || channel_switch(&[37, 3, 1]).is_some()
+        // New channel 0 is nothing this owner understands.
+        || channel_switch(&[37, 3, 1, 0, 5]).is_some()
     {
         return TestResult::Fail("CSA / ECSA element parsing");
+    }
+    // The ECSA wins when its operating class names a band; otherwise the
+    // CSA is used (ieee80211_parse_ch_switch_ie).
+    if channel_switch(&[37, 3, 0, 52, 3, 60, 4, 1, 128, 100, 2])
+        != Some(switch(true, 100, 2, Some(128)))
+        || channel_switch(&[37, 3, 0, 52, 3, 60, 4, 1, 200, 100, 2])
+            != Some(switch(false, 52, 3, None))
+    {
+        return TestResult::Fail("ECSA preference over CSA");
+    }
+    // Secondary Channel Offset and the Wide Bandwidth Channel Switch
+    // subelement of the Channel Switch Wrapper; a bare element 194 (an
+    // action-frame form) is not read from a Beacon.
+    let full = [
+        37, 3, 1, 100, 4, 62, 1, 1, 196, 9, 195, 2, 0, 0, 194, 3, 1, 106, 0,
+    ];
+    if channel_switch(&full).is_none_or(|s| {
+        s.secondary_offset != Some(1) || s.wide != Some([1, 106, 0]) || s.channel != 100
+    }) || channel_switch(&[37, 3, 1, 100, 4, 194, 3, 1, 106, 0]).is_none_or(|s| s.wide.is_some())
+    {
+        return TestResult::Fail("SCO / wide bandwidth channel switch parsing");
     }
     TestResult::Pass
 }
@@ -320,4 +339,111 @@ fn mt7922_station_leaves_on_a_channel_switch_it_cannot_follow() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/mt7921/dfs",
     mt7922_station_leaves_on_a_channel_switch_it_cannot_follow
+);
+
+/// The width an announced switch names (mac80211
+/// `ieee80211_parse_ch_switch_ie`): the Wide Bandwidth Channel Switch
+/// element for a VHT connection, else the ECSA operating class, else the
+/// Secondary Channel Offset; never wider than the connection's limit, and
+/// inconsistent channel data ends the link.
+fn mt7922_channel_switch_width_follows_mac80211() -> TestResult {
+    use crate::mt7921::csa::{switch_target, Chandef};
+    let switch = |offset, wide, class| ChannelSwitch {
+        block_tx: false,
+        channel: 100,
+        count: 1,
+        operating_class: class,
+        secondary_offset: offset,
+        wide,
+    };
+    let (Some(twenty), Some(forty), Some(eighty), Some(one_sixty)) = (
+        Chandef::twenty(100),
+        Chandef::forty(100, 1),
+        Chandef::eighty(100, 106),
+        Chandef::one_sixty(100, 114),
+    ) else {
+        return TestResult::Fail("chandef geometry");
+    };
+    let cases = [
+        // No offset element: 20 MHz even for a VHT connection.
+        (switch(None, None, None), 2, true, Some((twenty, twenty))),
+        // An offset alone keeps HT40.
+        (switch(Some(1), None, None), 2, true, Some((forty, forty))),
+        (
+            switch(Some(1), Some([1, 106, 0]), None),
+            2,
+            true,
+            Some((eighty, eighty)),
+        ),
+        // Revised 160 MHz encoding, narrowed to an 80 MHz connection.
+        (
+            switch(Some(1), Some([1, 106, 114]), None),
+            2,
+            true,
+            Some((one_sixty, eighty)),
+        ),
+        (
+            switch(Some(1), Some([1, 106, 114]), None),
+            3,
+            true,
+            Some((one_sixty, one_sixty)),
+        ),
+        // An HT connection reads neither the wide element nor beyond HT40.
+        (
+            switch(Some(1), Some([1, 106, 0]), None),
+            1,
+            false,
+            Some((forty, forty)),
+        ),
+        (
+            switch(Some(1), None, Some(128)),
+            1,
+            false,
+            Some((forty, forty)),
+        ),
+        // An ECSA operating class without the wide element.
+        (
+            switch(Some(1), None, Some(128)),
+            2,
+            true,
+            Some((eighty, eighty)),
+        ),
+        // A 20 MHz connection ignores the width elements.
+        (
+            switch(Some(1), Some([1, 106, 0]), None),
+            0,
+            true,
+            Some((twenty, twenty)),
+        ),
+        // The wide channel puts the secondary above; the offset says below.
+        (switch(Some(3), Some([1, 106, 0]), None), 2, true, None),
+        // An invalid wide element falls back to the offset's HT40.
+        (
+            switch(Some(1), Some([1, 107, 0]), None),
+            2,
+            true,
+            Some((forty, forty)),
+        ),
+    ];
+    if cases
+        .into_iter()
+        .any(|(announced, limit, vht, expected)| switch_target(&announced, limit, vht) != expected)
+    {
+        return TestResult::Fail("announced switch width");
+    }
+    // The downgrade chain and compatibility of the chandefs.
+    if one_sixty.downgrade() != eighty
+        || eighty.downgrade() != forty
+        || forty.downgrade() != twenty
+        || !eighty.compatible(forty)
+        || !eighty.compatible(twenty)
+        || Chandef::forty(104, 3).is_some_and(|other| eighty.compatible(other))
+    {
+        return TestResult::Fail("chandef downgrade / compatibility");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/dfs",
+    mt7922_channel_switch_width_follows_mac80211
 );
