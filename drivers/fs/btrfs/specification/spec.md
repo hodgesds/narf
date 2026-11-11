@@ -122,6 +122,9 @@ blocks rewritten before it returns; there is no delayed allocation.
 `truncate`, `fallocate` and hole punching still read all of the inode's
 extent items.
 
+Tree walks (`btree::Cursor`, `last_before`, `find_item`) hold the nodes on
+their path by reference to the node cache and never copy one.
+
 Uncompressed reads covered entirely by valid data checksums retain windows up to
 128 KiB in the shared 32 MiB extent cache. Keys include shared-core identity,
 logical byte range, compression tag and file-extent generation. Reads never
