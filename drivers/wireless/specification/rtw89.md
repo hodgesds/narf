@@ -154,8 +154,9 @@ exposes it to the future download owner. The plan runs once per
 firmware download, never on a packet path (perf class (a): no hot path).
 No missing policy or signature falls back to an unsecured transfer.
 
-**RTL8922A firmware-download preparation (`fwdl_be.rs`, fixture-tested; no
-production caller yet).** The BE register programs between power-on and
+**RTL8922A firmware-download preparation (`fwdl_be.rs`, fixture-tested;
+run from `pci::bring_up` by `Rtw89Device::boot_8922a`, which 0x8922 does not
+reach yet — `bootstrap_did` still excludes it).** The BE register programs between power-on and
 the first FWHDR_DL: `mac_func_en` (`mac_be.c:934 mac_func_en_be`, per-band
 CMAC power/function enable), `partial_init` (`mac.c:4307
 rtw89_mac_partial_init` up to the hci hook: HCI DMA TRX enable,
@@ -198,7 +199,18 @@ suit's WCPU/BB0 ready check, then `mdelay(5)` and FreeRTOS ready. The BE
 IDMEM share-mode write is skipped (`mac_be.c:3301` hook is NULL). It runs
 over a `fwdl_be::Port`; production is `pci::FwdlPort` (BAR2 +
 `submit_be_fwdl`). It is synchronous like Linux's process-context download.
-Still open: a production owner that runs it from `pci::bring_up`.
+`Rtw89Device::boot_8922a` (called at the end of `pci::bring_up` for 8922A)
+runs the `rtw89_core_start` prefix in Linux order: `mac_func_en`,
+`partial_init(include_bb)`, the hci `rtw89_pci_ops_mac_pre_init_be`
+(`pci_pre_init_8922a`: IO-recovery timers, power wake, DMA pre-init first
+half, `program_rings` as `rtw89_pci_ops_reset`, `dma_8922a::rst_bdram`,
+debounce / LDO low power / PCIe setting / SER setting by cut, then only CH12
+TX DMA on via `pre_init_dma_enable`), `fwdl_preconfig`, then the NORMAL suit
+from the trusted firmware registry and its BBMCU0 element through the
+fuse-selected plans. The outcome is recorded on the owner
+(`Prepared8922a::firmware_ready` / `firmware`) and is not fatal to the probe:
+nothing after the download (sys_init/trx_init, BB/RF, channel, RFK, TX power,
+C2H, RX, station control, interface) is wired yet.
 
 The plan couples v1 ignored-security descriptor compaction/count with the
 same payload selection, strips host dynamic bytes and sets part_size 2020

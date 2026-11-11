@@ -361,7 +361,7 @@ unsafe fn bring_up_registers(
         }
         None => None,
     };
-    Ok(Rtw89Device {
+    let device = Rtw89Device {
         bus_addr: device.addr,
         device: *device,
         cap: *cap,
@@ -378,7 +378,119 @@ unsafe fn bring_up_registers(
         rx_buffers,
         be_8922a,
         irq_vector,
-    })
+    };
+    // 8922A: run the `rtw89_core_start` prefix through the firmware
+    // download now that the rings and the Prepared owner exist. The
+    // outcome is recorded on the owner (`firmware_ready`), never
+    // fatal to the probe: nothing past the download is wired yet,
+    // so a failed download leaves an inert, inspectable device.
+    if is_8922a {
+        // SAFETY: caller's exclusive BAR/function contract; the rings
+        // were just allocated, nothing else uses them yet.
+        let outcome = unsafe { device.boot_8922a() };
+        if let Some(owner) = device.be_8922a.as_ref() {
+            owner.lock().record_firmware(outcome);
+        }
+    }
+    Ok(device)
+}
+
+/// Why the 8922A boot (`Rtw89Device::boot_8922a`) stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Boot8922aError {
+    /// Not an 8922A probe.
+    NoOwner,
+    /// `partial_init` / download sequence failure.
+    Fwdl(super::fwdl_be::Error),
+    /// DMA pre-init / ring programming failure.
+    Dma(super::prepared_8922a::Error),
+    /// BDRAM reset poll failure.
+    Bdram(super::dma_8922a::Error),
+    /// Firmware file / BBMCU0 element.
+    Firmware(super::fw::FwError),
+    /// Download plan (security, geometry).
+    Plan(super::download_plan::Error),
+}
+
+impl Rtw89Device {
+    /// RTL8922A `rtw89_core_start` prefix through the firmware
+    /// download, in Linux order:
+    ///
+    /// 1. `rtw89_mac_preinit` tail: `mac_func_en_be` (power-on
+    ///    already ran in `bring_up_registers`).
+    /// 2. `rtw89_mac_partial_init(include_bb = true)`
+    ///    (`mac.c:4307`): `fwdl_be::partial_init` (HCI DMA TRX, BB
+    ///    preinit, DMAC pre-init, DLFW DLE/HFC).
+    /// 3. hci `mac_pre_init` (`pci_be.c:484`): IO recovery, power
+    ///    wake, DMA pre-init first half, `rtw89_pci_ops_reset`
+    ///    (`program_rings`, CH12 reset), BDRAM reset, the
+    ///    debounce/LDO/PCIe/SER settings, then only CH12 TX DMA on.
+    /// 4. `rtw89_mac_fwdl_preconfig`.
+    /// 5. `rtw89_fw_download(NORMAL, include_bb)`: the NORMAL suit
+    ///    from the trusted firmware registry and its BBMCU0 element,
+    ///    each through the fuse-selected `DownloadPlan`, over CH12.
+    ///
+    /// # Safety
+    /// Caller owns BAR2, the PCI function and the probe-allocated
+    /// rings exclusively; no reset/removal races.
+    pub(super) unsafe fn boot_8922a(&self) -> Result<(), Boot8922aError> {
+        use super::dma::{DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, TXCH_NUM};
+        use super::fwdl_be::{self, CheckType, Suit};
+        let owner_lock = self.be_8922a.as_ref().ok_or(Boot8922aError::NoOwner)?;
+        let cv = self.chip_version;
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        fwdl_be::mac_func_en(regs);
+        fwdl_be::partial_init(regs).map_err(Boot8922aError::Fwdl)?;
+        super::pci_pre_init_8922a::io_rcy(regs);
+        super::pci_pre_init_8922a::power_wake(regs, true);
+        let tx_phys: [u64; TXCH_NUM] =
+            core::array::from_fn(|ch| self.tx_ring_dma[ch].dma_addr().raw());
+        let rx_phys = [
+            self.rx_ring_dma[0].dma_addr().raw(),
+            self.rx_ring_dma[1].dma_addr().raw(),
+        ];
+        let fuses = {
+            let mut owner = owner_lock.lock();
+            owner
+                .pre_init_dma_before_reset(regs, DEFAULT_RXBD_NUM, DEFAULT_RXBD_NUM)
+                .map_err(Boot8922aError::Dma)?;
+            owner
+                .program_rings(regs, &tx_phys, &rx_phys, DEFAULT_TXBD_NUM, DEFAULT_RXBD_NUM)
+                .map_err(Boot8922aError::Dma)?;
+            owner.secure_fuses()
+        };
+        super::dma_8922a::rst_bdram(regs).map_err(Boot8922aError::Bdram)?;
+        // A SER-clear timeout only warns in Linux (`pci_be.c:385`).
+        let _ = super::pci_pre_init_8922a::settings(regs, cv);
+        super::dma_8922a::pre_init_dma_enable(regs);
+        fwdl_be::fwdl_preconfig(regs);
+
+        let image = super::firmware_registry::load(ChipId::Rtl8922A, cv)
+            .map_err(Boot8922aError::Firmware)?;
+        let bb_image = image.bbmcu(cv, 0).map_err(Boot8922aError::Firmware)?;
+        let blacklist = super::secure::Blacklist::upstream(ChipId::Rtl8922A);
+        let normal = super::download_plan::DownloadPlan::new(image, fuses, blacklist)
+            .map_err(Boot8922aError::Plan)?;
+        let bb = super::download_plan::DownloadPlan::new(bb_image, fuses, blacklist)
+            .map_err(Boot8922aError::Plan)?;
+        // SAFETY: rings programmed above; caller's exclusivity contract.
+        let mut port = unsafe { FwdlPort::new(self) };
+        fwdl_be::download(
+            &mut port,
+            &Suit {
+                plan: &normal,
+                check: CheckType::Wcpu,
+                malloc_info: true,
+            },
+            &[Suit {
+                plan: &bb,
+                check: CheckType::Bb0,
+                malloc_info: false,
+            }],
+        )
+        .map(|_| ())
+        .map_err(Boot8922aError::Fwdl)
+    }
 }
 
 /// Production [`super::fwdl_be::Port`] for a probed 8922A device:

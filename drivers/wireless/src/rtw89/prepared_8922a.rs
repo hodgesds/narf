@@ -304,6 +304,9 @@ pub(crate) struct Prepared8922a {
     /// Consumed CH12 buffers still held back by the multi-tag
     /// window (Linux `rtwpci->h2c_release_queue`).
     fwcmd_release: VecDeque<DmaBuffer>,
+    /// Outcome of the firmware download `pci::bring_up` ran
+    /// (`Rtw89Device::boot_8922a`); `None` until it runs.
+    firmware: Option<Result<(), super::pci::Boot8922aError>>,
     /// Core chip version read during the MAC pre-init
     /// (`mac_pre_init_8922a::read_chip_ver`). `None` until the
     /// pre-init runs — the pci owner records it, not the probe
@@ -336,6 +339,7 @@ impl Prepared8922a {
             h2c_retained: Vec::new(),
             fwcmd_in_flight: VecDeque::new(),
             fwcmd_release: VecDeque::new(),
+            firmware: None,
             chip_ver: None,
             completion: completion_8922a::Worker::new(DEFAULT_RXBD_NUM, DEFAULT_RXBD_NUM)
                 .map_err(Error::Completion)?,
@@ -918,6 +922,21 @@ impl Prepared8922a {
     /// tail and reads the chip version.
     pub(super) fn record_chip_ver(&mut self, ver: HalChipVer) {
         self.chip_ver = Some(ver);
+    }
+
+    /// Record the firmware download outcome (`pci::bring_up`).
+    pub(super) fn record_firmware(&mut self, outcome: Result<(), super::pci::Boot8922aError>) {
+        self.firmware = Some(outcome);
+    }
+
+    /// True once the WCPU + BBMCU0 firmware reported FreeRTOS ready.
+    pub(super) fn firmware_ready(&self) -> bool {
+        matches!(self.firmware, Some(Ok(())))
+    }
+
+    /// The firmware download outcome, if it ran.
+    pub(super) fn firmware(&self) -> Option<Result<(), super::pci::Boot8922aError>> {
+        self.firmware
     }
 
     /// The core chip version read during the MAC pre-init, if

@@ -136,6 +136,7 @@ mod packet_format;
 pub mod pci;
 mod pci_basic;
 mod pci_basic_regs;
+mod pci_pre_init_8922a;
 mod pci_reset;
 mod pcie;
 mod pcie_native;
