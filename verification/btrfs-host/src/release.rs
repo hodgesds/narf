@@ -1016,9 +1016,11 @@ fn readonly_snapshot(args: &Args) -> Result<String, String> {
         };
         match restored.get(path) {
             Some(Flat::File { data: got, .. }) if got == data => compared += 1,
-            _ => return Err(format!(
+            _ => {
+                return Err(format!(
                 "read-only snapshot: {path} as restored differs from the source at snapshot time"
-            )),
+            ))
+            }
         }
     }
     if compared < 3 {
