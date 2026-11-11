@@ -1709,6 +1709,9 @@ struct StationLink {
     /// each association).
     ps_wanted: bool,
     ps_applied: bool,
+    /// The regulatory policy snapshot the grant and the firmware channel
+    /// domain / power limits were last programmed from.
+    applied_policy: Option<Arc<narf_wireless::reg::RegulatoryDomain>>,
     bss: Option<ScanBss>,
     /// This link's group role captured at join; retained for the exact
     /// disconnect record of that association (Linux `vif->p2p` is fixed per
@@ -1767,6 +1770,7 @@ impl StationLink {
             link_stats: crate::mt7921::link_stats::LinkStats::default(),
             ps_wanted: false,
             ps_applied: false,
+            applied_policy: None,
             bss: None,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
             permission: None,

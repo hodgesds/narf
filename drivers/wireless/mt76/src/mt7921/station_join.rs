@@ -743,6 +743,7 @@ impl<B: Backend> Session<B> {
             && matches!(state, State::Associated { .. })
             && self.data_pending.is_empty()
             && (station.wmm_pending.is_some()
+                || self.policy_changed(station)
                 || station.ps_wanted != station.ps_applied
                 || !station.control_pending.is_empty()
                 || station.rx_ba.pending(self.backend.now_ns())
@@ -1968,17 +1969,7 @@ impl<B: Backend> Session<B> {
                 self.check_station_tx()?;
             }
             // 1. Authorize transmission on the target channel in channel domain (NO_IR = 0):
-            let channels = permission.channels();
-            let mut domain = vec![0u8; 12 + 8 * channels.len()];
-            domain[..2].copy_from_slice(&permission.country);
-            domain[4..7].fill(1); // 20 MHz
-            domain[3 + usize::from(band.scan_tag())] = permission.domain_width();
-            domain[7 + usize::from(band.scan_tag())] = channels.len() as u8;
-            for (index, channel) in channels.into_iter().enumerate() {
-                domain[12 + index * 8..14 + index * 8]
-                    .copy_from_slice(&u16::from(channel).to_le_bytes());
-                // Flags zero only after complete occupied-channel admission.
-            }
+            let domain = station_channel_domain(permission, band);
             self.notify(
                 Command::Ce {
                     id: 0x0f,
@@ -2330,6 +2321,7 @@ impl<B: Backend> Session<B> {
                 self.station.peer_lost = false;
                 self.station.link_stats = Default::default();
                 self.station.ps_applied = false;
+                self.station.applied_policy = self.backend.regulatory_domain().ok();
                 self.station.bss = Some(bss.clone());
                 self.station.wmm = plan.wmm();
                 self.station.ht20_profile = plan.ht20();
@@ -2624,6 +2616,7 @@ impl<B: Backend> Session<B> {
     /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control_in(&mut self, associated: State, restore: State) -> Result<(), Error> {
         if self.station.wmm_pending.is_none()
+            && !self.policy_changed(&self.station)
             && self.station.ps_wanted == self.station.ps_applied
             && self.station.control_pending.is_empty()
             && !self.station.rx_ba.pending(self.backend.now_ns())
@@ -2647,6 +2640,7 @@ impl<B: Backend> Session<B> {
         self.stage(Stage::StaRecord);
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
+            self.service_regulatory(info).await?;
             self.service_wmm_update().await?;
             self.service_power_save().await?;
             self.service_transmit_ba().await?;
@@ -2717,6 +2711,73 @@ impl<B: Backend> Session<B> {
 
     /// Every association/key/port publication earns fresh authority after
     /// the preceding wait. Cleanup deliberately uses plain exchange instead.
+    /// The installed regulatory policy is no longer the one this station's
+    /// grant and firmware limits were programmed from.
+    pub(super) fn policy_changed(&self, station: &super::StationLink) -> bool {
+        // Compared by value: reinstalling identical rules is no change.
+        station.applied_policy.as_ref().is_some_and(|applied| {
+            self.backend
+                .regulatory_domain()
+                .is_ok_and(|now| !alloc::sync::Arc::ptr_eq(applied, &now) && **applied != *now)
+        })
+    }
+
+    /// cfg80211's `reg_notifier` -> `mt7921_regd_notifier` for an associated
+    /// station: the same BSS is re-admitted under the new policy and its
+    /// channel domain and power limits are programmed again
+    /// (`mt76_connac_mcu_set_channel_domain`, `mt76_connac_mcu_set_rate_txpower`).
+    /// A policy that no longer permits the operating channel at the same
+    /// width ends the link (`reg_leave_invalid_chans`).
+    async fn service_regulatory(&mut self, info: super::RadioInfo) -> Result<(), Error> {
+        if !self.policy_changed(&self.station) {
+            return Ok(());
+        }
+        let now = self.backend.regulatory_domain()?;
+        let (Some(old), Some(bss)) = (self.station.permission, self.station.bss.clone()) else {
+            return Err(Error::Authority);
+        };
+        let new = crate::mt7921::association::TxPermission::from_ap_heard(
+            &now,
+            info,
+            &bss,
+            old.follows_heard_ap(),
+        )
+        .filter(|new| new.same_operation(old));
+        let Some(new) = new else {
+            self.station.peer_lost = true;
+            self.station.rx_ba.fence();
+            self.station.tx_ba.fence();
+            return Err(Error::Authority);
+        };
+        let band = new.band().ok_or(Error::Bounds)?;
+        let limits = new
+            .rate_limits_for_paths(info.capabilities.phy.spatial_streams)
+            .ok_or(Error::Bounds)?;
+        // The new grant is current under the new policy; the old one may
+        // not be (a lower power ceiling).
+        self.station.permission = Some(new);
+        self.check_station_tx()?;
+        self.notify(
+            Command::Ce {
+                id: 0x0f,
+                query: false,
+            },
+            &station_channel_domain(new, band),
+        )
+        .await?;
+        self.notify(
+            Command::Ce {
+                id: 0x5d,
+                query: false,
+            },
+            &limits,
+        )
+        .await?;
+        self.confirm_command_progress().await?;
+        self.station.applied_policy = Some(now);
+        self.check_station_tx()
+    }
+
     /// mt7921_mcu_uni_bss_ps (`BSS_CHANGED_PS`): UNI_CMD BSS_INFO_UPDATE
     /// with the `UNI_BSS_INFO_PS` (21) TLV, `ps_state` 2 (dynamic power
     /// save, firmware-timed) or 0 (awake), for this link's BSS.
@@ -2773,4 +2834,24 @@ pub(super) fn bss_power_save(bss: u8, enabled: bool) -> [u8; 12] {
     body[6..8].copy_from_slice(&8u16.to_le_bytes());
     body[8] = if enabled { 2 } else { 0 };
     body
+}
+
+/// The station's channel domain (`mt76_connac_mcu_set_channel_domain`):
+/// the occupied channels of `permission` with NO_IR cleared, everything
+/// else absent.
+pub(super) fn station_channel_domain(
+    permission: crate::mt7921::association::TxPermission,
+    band: crate::mt7921::channel::Band,
+) -> Vec<u8> {
+    let channels = permission.channels();
+    let mut domain = vec![0u8; 12 + 8 * channels.len()];
+    domain[..2].copy_from_slice(&permission.country);
+    domain[4..7].fill(1); // 20 MHz
+    domain[3 + usize::from(band.scan_tag())] = permission.domain_width();
+    domain[7 + usize::from(band.scan_tag())] = channels.len() as u8;
+    for (index, channel) in channels.into_iter().enumerate() {
+        domain[12 + index * 8..14 + index * 8].copy_from_slice(&u16::from(channel).to_le_bytes());
+        // Flags zero only after complete occupied-channel admission.
+    }
+    domain
 }

@@ -1209,6 +1209,16 @@ impl TxPermission {
     pub(crate) fn follows_heard_ap(self) -> bool {
         self.heard_ap
     }
+    /// The same operating channel, width and band as `other` (power,
+    /// country and WMM rule may differ).
+    pub(crate) fn same_operation(self, other: Self) -> bool {
+        self.channel == other.channel
+            && self.secondary == other.secondary
+            && self.center80 == other.center80
+            && self.center160 == other.center160
+            && self.six.map(|six| (six.center, six.width))
+                == other.six.map(|six| (six.center, six.width))
+    }
     pub(crate) fn from_domain40(
         domain: &narf_wireless::reg::RegulatoryDomain,
         channel: u8,

@@ -8,7 +8,7 @@ pub mod policy;
 #[path = "reg/witness.rs"]
 pub mod witness;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegulatoryDomain {
     pub country_code: [u8; 2],
     pub rules: Vec<RegRule>,
@@ -303,6 +303,20 @@ pub mod db {
         pub(super) domain: Option<Arc<RegulatoryDomain>>,
         pub(super) revision: u64,
         source: Source,
+        /// Who selected the current Linux-database country
+        /// (`enum nl80211_reg_initiator` of cfg80211's last request).
+        pub(super) hint: Hint,
+    }
+    /// The initiator of the current Linux-database country.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Hint {
+        /// The boot-time world/staged domain (`NL80211_REGDOM_SET_BY_CORE`).
+        Core,
+        /// `iw reg set` / NL80211_CMD_REQ_SET_REG (`..._SET_BY_USER`).
+        User,
+        /// The associated AP's Country element (`..._SET_BY_COUNTRY_IE`);
+        /// `previous` is the country restored when the station disconnects.
+        CountryIe { previous: [u8; 2] },
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Source {
@@ -322,6 +336,7 @@ pub mod db {
                     domain: None,
                     revision: 0,
                     source: Source::Caller,
+                    hint: Hint::Core,
                 }),
             }
         }
@@ -331,6 +346,7 @@ pub mod db {
                 let mut state = self.state.lock();
                 state.revision = state.revision.saturating_add(1);
                 state.source = Source::Caller;
+                state.hint = Hint::Core;
                 state.domain.replace(domain)
             };
             // Free the retired rule storage outside the IRQ-safe DB lock.
@@ -341,6 +357,7 @@ pub mod db {
                 let mut state = self.state.lock();
                 state.revision = state.revision.saturating_add(1);
                 state.source = Source::Caller;
+                state.hint = Hint::Core;
                 state.domain.take()
             };
             drop(retired);
@@ -400,9 +417,96 @@ pub mod db {
         })
     }
 
+    /// The installation's revision: it moves with every domain change, so
+    /// a driver that programmed its firmware from one revision can tell
+    /// that the policy changed (cfg80211's `reg_notifier`).
+    pub fn revision() -> u64 {
+        ACTIVE_DOMAIN.state.lock().revision
+    }
+
+    /// The current initiator and, for a Linux-database country, its alpha2.
+    pub fn hint() -> (Hint, Option<[u8; 2]>) {
+        let state = ACTIVE_DOMAIN.state.lock();
+        let alpha2 = matches!(state.source, Source::Linux(_))
+            .then(|| state.domain.as_ref().map(|d| d.country_code))
+            .flatten();
+        (state.hint, alpha2)
+    }
+
+    /// cfg80211 `regulatory_hint_country_ie` on association: the AP's
+    /// Country element selects its country's Linux-database rules, unless
+    /// the user chose a country (that request stays authoritative) or the
+    /// installation is a signed deployment / caller policy. Returns whether
+    /// the country changed.
+    pub fn hint_country_ie(alpha2: [u8; 2]) -> Result<bool, policy::Error> {
+        hint_country_ie_with(&ACTIVE_DOMAIN, alpha2, |alpha2| {
+            super::linux::country(narf_firmware::linux_regulatory_database(), alpha2)
+                .map_err(policy::Error::Format)
+        })
+    }
+
+    pub(super) fn hint_country_ie_with(
+        database: &Database,
+        alpha2: [u8; 2],
+        load: impl FnOnce([u8; 2]) -> Result<(RegulatoryDomain, u8), policy::Error>,
+    ) -> Result<bool, policy::Error> {
+        // `regulatory_hint_country_ie`: "00" is the world, "99"/"98" are
+        // custom/intersected markers, never a country.
+        if !super::linux::valid_alpha2(alpha2) || matches!(&alpha2, b"00" | b"99" | b"98") {
+            return Ok(false);
+        }
+        let previous = {
+            let state = database.state.lock();
+            let Some(domain) = state.domain.as_ref() else {
+                return Ok(false);
+            };
+            if !matches!(state.source, Source::Linux(_))
+                || state.hint == Hint::User
+                || domain.country_code == alpha2
+            {
+                return Ok(false);
+            }
+            match state.hint {
+                Hint::CountryIe { previous } => previous,
+                _ => domain.country_code,
+            }
+        };
+        select_linux_hinted(database, || load(alpha2), Hint::CountryIe { previous })?;
+        Ok(true)
+    }
+
+    /// cfg80211 `regulatory_hint_disconnect` -> `restore_regulatory_settings`:
+    /// a country taken from an AP's Country element does not outlive the
+    /// connection. Returns whether the country changed.
+    pub fn restore_after_disconnect() -> Result<bool, policy::Error> {
+        restore_after_disconnect_with(&ACTIVE_DOMAIN, |alpha2| {
+            super::linux::country(narf_firmware::linux_regulatory_database(), alpha2)
+                .map_err(policy::Error::Format)
+        })
+    }
+
+    pub(super) fn restore_after_disconnect_with(
+        database: &Database,
+        load: impl FnOnce([u8; 2]) -> Result<(RegulatoryDomain, u8), policy::Error>,
+    ) -> Result<bool, policy::Error> {
+        let Hint::CountryIe { previous } = database.state.lock().hint else {
+            return Ok(false);
+        };
+        select_linux_hinted(database, || load(previous), Hint::Core)?;
+        Ok(true)
+    }
+
     pub(super) fn select_linux_with(
         database: &Database,
         load: impl FnOnce() -> Result<(RegulatoryDomain, u8), policy::Error>,
+    ) -> Result<(), policy::Error> {
+        select_linux_hinted(database, load, Hint::User)
+    }
+
+    fn select_linux_hinted(
+        database: &Database,
+        load: impl FnOnce() -> Result<(RegulatoryDomain, u8), policy::Error>,
+        hint: Hint,
     ) -> Result<(), policy::Error> {
         let revision = {
             let state = database.state.lock();
@@ -424,6 +528,7 @@ pub mod db {
             }
             state.revision += 1;
             state.source = Source::Linux(dfs);
+            state.hint = hint;
             state.domain.replace(domain)
         };
         drop(retired);
@@ -469,6 +574,7 @@ pub mod db {
         } else {
             guard.revision += 1;
             guard.source = source;
+            guard.hint = Hint::Core;
             guard.domain = Some(loaded.clone());
             Ok(loaded.clone())
         };
@@ -514,6 +620,73 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("wireless/regulatory", smoke_regulatory_policy_boundaries);
+
+    /// cfg80211 `regulatory_hint_country_ie` / `regulatory_hint_disconnect`:
+    /// the AP's country replaces a core (world) domain while connected and
+    /// is restored on disconnect; a user country is never overridden; a
+    /// signed deployment or caller policy is not a Linux-database country;
+    /// world/custom markers and malformed alpha2 are ignored.
+    fn smoke_regulatory_country_ie_hint_and_restore() -> TestResult {
+        use db::{
+            ensure_source_with, hint_country_ie_with, restore_after_disconnect_with,
+            select_linux_with, Database, Hint, Source,
+        };
+        let country = |alpha2: [u8; 2]| RegulatoryDomain {
+            country_code: alpha2,
+            rules: alloc::vec![rule(2402, 2482, 40, RegFlags::empty())],
+        };
+        let load = |alpha2: [u8; 2]| Ok((country(alpha2), 0));
+        let state = |database: &Database| {
+            let state = database.state.lock();
+            (state.hint, state.domain.as_ref().map(|d| d.country_code))
+        };
+        let database = Database::new();
+        ensure_source_with(&database, || Ok((country(*b"00"), Source::Linux(0)))).unwrap();
+        for ignored in [*b"00", *b"99", *b"98", *b"de", [0, 0]] {
+            if !matches!(hint_country_ie_with(&database, ignored, load), Ok(false)) {
+                return TestResult::Fail("world/custom/malformed alpha2 taken as a country");
+            }
+        }
+        if !matches!(hint_country_ie_with(&database, *b"DE", load), Ok(true))
+            || state(&database) != (Hint::CountryIe { previous: *b"00" }, Some(*b"DE"))
+        {
+            return TestResult::Fail("AP country not applied over the world domain");
+        }
+        // Roaming to an AP of another country keeps the original to restore.
+        if !matches!(hint_country_ie_with(&database, *b"FR", load), Ok(true))
+            || state(&database) != (Hint::CountryIe { previous: *b"00" }, Some(*b"FR"))
+            || !matches!(hint_country_ie_with(&database, *b"FR", load), Ok(false))
+        {
+            return TestResult::Fail("second AP country, or a repeated hint");
+        }
+        if !matches!(restore_after_disconnect_with(&database, load), Ok(true))
+            || state(&database) != (Hint::Core, Some(*b"00"))
+            || !matches!(restore_after_disconnect_with(&database, load), Ok(false))
+        {
+            return TestResult::Fail("disconnect did not restore the previous domain once");
+        }
+        // A user choice wins over every AP.
+        if select_linux_with(&database, || Ok((country(*b"US"), 0))).is_err()
+            || !matches!(hint_country_ie_with(&database, *b"DE", load), Ok(false))
+            || state(&database) != (Hint::User, Some(*b"US"))
+            || !matches!(restore_after_disconnect_with(&database, load), Ok(false))
+        {
+            return TestResult::Fail("AP country overrode the user's country");
+        }
+        // A deployment policy is not a Linux-database country.
+        let deployed = Database::new();
+        ensure_source_with(&deployed, || Ok((country(*b"GB"), Source::Deployment))).unwrap();
+        if !matches!(hint_country_ie_with(&deployed, *b"DE", load), Ok(false))
+            || state(&deployed).1 != Some(*b"GB")
+        {
+            return TestResult::Fail("AP country replaced a deployment policy");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/regulatory",
+        smoke_regulatory_country_ie_hint_and_restore
+    );
 
     fn rule(start: u32, end: u32, bandwidth: u32, flags: RegFlags) -> RegRule {
         RegRule {

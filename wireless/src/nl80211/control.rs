@@ -1280,15 +1280,8 @@ fn route(
     }
     if command == 27 {
         request_regulatory_country(bytes, &context, crate::reg::db::select_linux_country)?;
-        let domain = station::global_regdom()?;
-        let mut attrs = Vec::new();
-        let mut alpha2 = domain.alpha2.to_vec();
-        alpha2.push(0);
-        push_attr(&mut attrs, 33, &alpha2);
-        // NL80211_REGDOM_SET_BY_USER, NL80211_REGDOM_TYPE_COUNTRY.
-        push_attr(&mut attrs, 48, &[1]);
-        push_attr(&mut attrs, 49, &[u8::from(domain.alpha2 == *b"00")]);
-        publish_event(NL80211_FAMILY_ID, 20, 0, GenlReply { command: 36, attrs });
+        station::global_regdom()?;
+        publish_reg_change(REG_INITIATOR_USER);
         return Ok(Vec::new());
     }
     if matches!(
@@ -1396,6 +1389,55 @@ fn route(
         execute(iface, admin, namespace, index, operation).await;
     });
     Ok(Vec::new()) // generic netlink emits the requested ACK
+}
+
+/// `enum nl80211_reg_initiator`.
+const REG_INITIATOR_CORE: u8 = 0;
+const REG_INITIATOR_USER: u8 = 1;
+const REG_INITIATOR_COUNTRY_IE: u8 = 3;
+
+/// `nl80211_common_reg_change_event`: NL80211_CMD_REG_CHANGE for the
+/// current global domain on the "regulatory" group.
+fn publish_reg_change(initiator: u8) {
+    let Ok(domain) = station::global_regdom() else {
+        return;
+    };
+    let mut attrs = Vec::new();
+    let mut alpha2 = domain.alpha2.to_vec();
+    alpha2.push(0);
+    push_attr(&mut attrs, 33, &alpha2); // NL80211_ATTR_REG_ALPHA2
+    push_attr(&mut attrs, 48, &[initiator]); // NL80211_ATTR_REG_INITIATOR
+                                             // NL80211_ATTR_REG_TYPE: COUNTRY (0) or WORLD (1).
+    push_attr(&mut attrs, 49, &[u8::from(domain.alpha2 == *b"00")]);
+    publish_event(NL80211_FAMILY_ID, 20, 0, GenlReply { command: 36, attrs });
+}
+
+/// The alpha2 of a Country element (7) among `ies`.
+fn country_element(ies: &[u8]) -> Option<[u8; 2]> {
+    elements(ies)
+        .ok()?
+        .into_iter()
+        .find(|(id, body)| *id == 7 && body.len() >= 3)
+        .map(|(_, body)| [body[0], body[1]])
+}
+
+/// cfg80211 `regulatory_hint_country_ie` from `__cfg80211_connect_result`:
+/// the connected AP's Country element selects its country's rules unless
+/// the user chose a country.
+pub(crate) fn hint_country_ie(ies: &[u8]) {
+    if let Some(alpha2) = country_element(ies) {
+        if matches!(crate::reg::db::hint_country_ie(alpha2), Ok(true)) {
+            publish_reg_change(REG_INITIATOR_COUNTRY_IE);
+        }
+    }
+}
+
+/// cfg80211 `regulatory_hint_disconnect`: a country taken from the AP's
+/// Country element is dropped with the connection.
+pub(crate) fn regulatory_disconnect() {
+    if matches!(crate::reg::db::restore_after_disconnect(), Ok(true)) {
+        publish_reg_change(REG_INITIATOR_CORE);
+    }
 }
 
 /// A country hint selects authenticated database data; it cannot supply rules,
@@ -4557,6 +4599,14 @@ async fn execute(
                 let _ = iface.disassociate().await;
             }
             let status: u16 = if result.is_ok() && still_live { 0 } else { 1 };
+            if status == 0 {
+                if let Some(ies) = selected
+                    .as_ref()
+                    .and_then(|bss| iface.scan_information_elements(bss.bssid))
+                {
+                    hint_country_ie(&ies);
+                }
+            }
             if let Some(index) = wiphy_index(iface.as_ref()) {
                 push_attr(&mut attrs, 1, &index.to_ne_bytes()); // NL80211_ATTR_WIPHY
             }
@@ -4602,6 +4652,7 @@ async fn execute(
             if !live || iface.disassociate().await.is_err() {
                 return;
             }
+            regulatory_disconnect();
             if iface.reports_disconnect_events() {
                 return;
             }
