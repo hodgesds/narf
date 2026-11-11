@@ -161,7 +161,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     pub(crate) fn set_rtl8821ae_min_space_cfg(&mut self, value: u8) {
         self.packet.ae.min_space_cfg = value;
     }
-    fn ae_validate_rings(&self) -> Result<(), Error> {
+    pub(super) fn ae_validate_rings(&self) -> Result<(), Error> {
         for (queue, ring) in self.tx.iter().enumerate() {
             ring.sync();
             let base = extent(ring, self.depth * TX_BYTES, 256)?;

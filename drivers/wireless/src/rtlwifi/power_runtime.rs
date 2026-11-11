@@ -234,6 +234,24 @@ pub(super) async fn disable_rtl8192ee(io: &impl Io, firmware_ready: bool) -> Res
     io.write8(0x1c, 0x0e)
 }
 
+/// RTL8723BE CardDisabled→Active before the fresh firmware download: the
+/// `rtl8723be/hw.c::_rtl8723be_init_mac` prefix (`REG_RSV_CTRL = 0`,
+/// `REG_APS_FSMCO + 1` BIT(7) cleared) and `RTL8723_NIC_ENABLE_FLOW` — the
+/// same entry the initial probe runs synchronously through
+/// `power::power_on_with`. The rest of `_rtl8723be_init_mac` (the
+/// coexistence power-on setting, `REG_CR`, LLT, rings) is the fresh
+/// owner's `prepare`.
+pub(super) async fn enable_rtl8723be(io: &impl Io) -> Result<(), Error> {
+    io.write8(0x1c, 0)?;
+    update(io, 5, 0x80, 0).await?;
+    flow(
+        io,
+        PWR_CUT_ALL_MSK,
+        super::rtl8723be::pwrseq::RTL8723B_CARD_ENABLE_FLOW,
+    )
+    .await
+}
+
 /// RTL8723BE `rtl8723be_card_disable` → `_rtl8723be_poweroff_adapter`, in
 /// source order, after the independent old-DMA retirement proof:
 /// `RTL8723_NIC_LPS_ENTER_FLOW` (`rtl8723B_enter_lps_flow`); the `REG_RF_CTRL`
@@ -246,7 +264,6 @@ pub(super) async fn disable_rtl8192ee(io: &impl Io, firmware_ready: bool) -> Res
 /// write is not issued (88EE/8821AE/8192EE precedent). `iqk_initialized`
 /// is kept: `get_btc_status()` is always true on this chip. LED control is
 /// not composed. The rebuild owner composes it with the chip's admission.
-#[cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 pub(super) async fn disable_rtl8723be(io: &impl Io, firmware_ready: bool) -> Result<(), Error> {
     use super::rtl8723be::{
         fw,

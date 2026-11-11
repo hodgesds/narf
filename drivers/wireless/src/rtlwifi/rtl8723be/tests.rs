@@ -48,7 +48,7 @@ kernel_test_in!(
 
 // ── adapter facts ─────────────────────────────────────────────────────────
 
-fn provisioned() -> Vec<u8> {
+pub(crate) fn provisioned() -> Vec<u8> {
     let mut map = vec![0xffu8; adapter::HWSET_MAX_SIZE];
     map[0..2].copy_from_slice(&0x8129u16.to_le_bytes());
     map[0xd0..0xd6].copy_from_slice(&[0x00, 0xe0, 0x4c, 0x87, 0x23, 0xbe]);
@@ -1675,7 +1675,7 @@ kernel_test_in!(
 // ── Signed envelopes (`rtl8723be/envelope.rs`) ───────────────────────────
 
 /// Test board factory (synthetic values, not any board's).
-fn be_factory() -> crate::rtlwifi::efuse::Factory {
+pub(crate) fn be_factory() -> crate::rtlwifi::efuse::Factory {
     crate::rtlwifi::efuse::Factory {
         mac: [0x00, 0xe0, 0x4c, 0x87, 0x23, 0xbe],
         logical: [0u8; 512],
@@ -1683,7 +1683,7 @@ fn be_factory() -> crate::rtlwifi::efuse::Factory {
 }
 
 /// A NAPC row: (channel, bandwidth, offset, curve-value fn).
-type NapcRow = (u8, u8, u8, fn(u8, u8) -> i16);
+pub(crate) type NapcRow = (u8, u8, u8, fn(u8, u8) -> i16);
 
 /// Build a NAPC envelope from the documented layout (header 96, rows of
 /// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
@@ -1691,7 +1691,12 @@ type NapcRow = (u8, u8, u8, fn(u8, u8) -> i16);
 /// (channel, 20, 0, fn) for v1. The identity is the board's factory
 /// identity; the MAC matches the factory. The curve fn takes the curve
 /// index (0 CCK, 1 OFDM, 2 HT) and the TXAGC index.
-fn be_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRow]) -> Vec<u8> {
+pub(crate) fn be_napc_fixture(
+    version: u16,
+    antenna: i16,
+    qualified: i16,
+    rows: &[NapcRow],
+) -> Vec<u8> {
     let factory = be_factory();
     let identity = crate::rtlwifi::radio::factory_identity(&factory);
     let total = 96 + rows.len() * 388;
@@ -1728,7 +1733,7 @@ fn be_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRow])
 
 /// Flat rising curves: output `2 * index` quarter dBm, so a 20 dBm
 /// ceiling with antenna 0 admits index 40 on every rate.
-fn be_rising(_curve: u8, idx: u8) -> i16 {
+pub(crate) fn be_rising(_curve: u8, idx: u8) -> i16 {
     i16::from(idx) * 2
 }
 
@@ -1742,7 +1747,7 @@ fn be_no_ht(curve: u8, idx: u8) -> i16 {
 }
 
 /// US 2.4 GHz domain: 2402-2472 MHz, 40 MHz, 20 dBm.
-fn be_us_domain() -> narf_wireless::reg::RegulatoryDomain {
+pub(crate) fn be_us_domain() -> narf_wireless::reg::RegulatoryDomain {
     use narf_wireless::reg::*;
     RegulatoryDomain {
         country_code: *b"US",

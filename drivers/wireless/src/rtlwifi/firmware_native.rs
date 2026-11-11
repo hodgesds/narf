@@ -331,6 +331,19 @@ impl PciIo {
             _ => None,
         }
     }
+    /// One physical EFUSE byte (`efuse_one_byte_read` between the EFUSE
+    /// power switches) over the live function: `None` is Linux's 100-read
+    /// timeout. Used for the RTL8723BE `_rtl8723be_read_package_type`
+    /// `0x1fb` read before the firmware run.
+    pub(super) fn read_efuse_physical(&self, addr: u16) -> Result<Option<u8>, Error> {
+        self.access(0xcf, 1, || {
+            self.check_identity()?;
+            // SAFETY: the caller holds exclusive control of the powered
+            // function; current PCI identity/BAR were checked within this
+            // invocation. Only the EFUSE read registers are touched.
+            Ok(unsafe { super::efuse::read_physical_byte(&self.registers, addr) })
+        })?
+    }
     pub(super) fn verify_factory(&self, expected: &super::efuse::Factory) -> Result<(), Error> {
         self.access(0xcf, 1, || {
             self.check_identity()?;

@@ -109,6 +109,9 @@ pub(super) struct State<M: Memory> {
     pub(super) ee92: ee92::State,
     /// RTL8192CE / RTL8188CE mailbox and DM state (`rtl8192ce/packet_owner.rs`).
     pub(super) ce92: ce92::State,
+    /// RTL8723BE receive/beacon-control cache, RA link and RX C2H queue
+    /// (`rtl8723be/packet_owner.rs`).
+    pub(super) be8723: be8723::State,
     /// `sta_entry->ratr_index` of the installed `H2C_88E_RA_MASK`: DATA
     /// rate fallback is only enabled while the firmware owns this mask
     /// and the caller holds a current `NEFB` grant.
@@ -140,6 +143,7 @@ impl<M: Memory> State<M> {
             ae: ae::State::new(),
             ee92: ee92::State::new(),
             ce92: ce92::State::new(),
+            be8723: be8723::State::new(),
             rate_mask: None,
             retired: Vec::new(),
         }
@@ -296,7 +300,6 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     fn rtl8192ce(&self) -> bool {
         self.chip == super::Chip::Rtl8192ce
     }
-    /// RTL8723BE owns prepared rings only; no packet path is admitted.
     fn rtl8723be(&self) -> bool {
         self.chip == super::Chip::Rtl8723be
     }
@@ -311,7 +314,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return self.ce92_awake_station();
         }
         if self.rtl8723be() {
-            return Err(Error::State);
+            return self.be8723_awake_station();
         }
         if self.phase != Phase::MacConfigured {
             return Err(Error::State);
@@ -336,6 +339,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_prepare_peer(peer, rates, basic, capability);
+        }
+        if self.rtl8723be() {
+            return self.be8723_prepare_peer(peer, rates, basic, capability);
         }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
@@ -372,6 +378,11 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_complete_peer(peer, aid, admission, policy).await;
+        }
+        if self.rtl8723be() {
+            return self
+                .be8723_complete_peer(peer, aid, admission, policy)
+                .await;
         }
         if !self.transmit_ready() || self.packet.reserved.is_some() {
             return Err(Error::State);
@@ -528,6 +539,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8821ae()
             || self.rtl8192ee()
             || self.rtl8192ce()
+            || self.rtl8723be()
             || !self.transmit_ready()
             || self.packet.leisure
             || self.packet.local.is_none()
@@ -604,6 +616,32 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.rate_mask = self.packet.ce92.link.map(|(_, _, index)| index);
         Ok(())
     }
+    /// 8723BE `rtl8723be_update_hal_rate_mask` (`H2C_8723B_RA_MASK`) for
+    /// `peer` at DM `level`, bounded by the `NAPC` permission's admitted
+    /// rates (`rtl8723be/packet_owner.rs::be8723_install_rate_mask`).
+    pub(crate) async fn install_rtl8723be_rate_mask(
+        &mut self,
+        peer: super::super::rtl8723be::h2c::Peer,
+        bw40: bool,
+        level: u8,
+    ) -> Result<(), Error> {
+        if !self.rtl8723be() {
+            return Err(Error::State);
+        }
+        self.be8723_install_rate_mask(peer, bw40, level, true).await
+    }
+    /// 8723BE composed watchdog step (`be8723_dm_watchdog`). Returns
+    /// whether the RA mask was refreshed.
+    pub(crate) async fn rtl8723be_dm_watchdog(
+        &mut self,
+        undec_sm_pwdb: i64,
+        now_ms: u64,
+    ) -> Result<bool, Error> {
+        if !self.rtl8723be() {
+            return Err(Error::State);
+        }
+        self.be8723_dm_watchdog(undec_sm_pwdb, now_ms).await
+    }
     /// 8192CE / 8188CE composed `rtl92c_dm_watchdog` step
     /// (`packet_owner.rs::ce92_dm_watchdog`).
     pub(crate) fn rtl8192ce_dm_watchdog(&mut self, undec_sm_pwdb: i64) -> Result<bool, Error> {
@@ -668,6 +706,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ce() {
             return self.ce92_enter_leisure().await;
         }
+        if self.rtl8723be() {
+            return self.be8723_enter_leisure().await;
+        }
         if !self.transmit_ready() || self.packet.leisure || self.packet.local.is_none() {
             return Err(Error::State);
         }
@@ -688,6 +729,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_leave_leisure().await;
+        }
+        if self.rtl8723be() {
+            return self.be8723_leave_leisure().await;
         }
         if self.phase != Phase::Running || !self.packet.leisure {
             return Err(Error::State);
@@ -722,6 +766,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             self.ee92_disconnected().await?;
         } else if self.rtl8192ce() {
             self.ce92_disconnected().await?;
+        } else if self.rtl8723be() {
+            self.be8723_disconnected().await?;
         } else {
             if core::mem::take(&mut self.packet.leisure) {
                 self.packet.mailbox.awake(&self.io).await?;
@@ -780,11 +826,13 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return Err(Error::State);
         }
         self.phase = Phase::Failed;
-        if self.rtl8821ae() || self.rtl8192ee() || self.rtl8192ce() {
+        if self.rtl8821ae() || self.rtl8192ee() || self.rtl8192ce() || self.rtl8723be() {
             let report = if self.rtl8821ae() {
                 self.ae_disconnected().await
             } else if self.rtl8192ee() {
                 self.ee92_disconnected().await
+            } else if self.rtl8723be() {
+                self.be8723_disconnected().await
             } else {
                 self.ce92_disconnected().await
             };
@@ -848,6 +896,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         if self.rtl8192ce() {
             return self.ce92_quiesce().await;
         }
+        if self.rtl8723be() {
+            return self.be8723_quiesce().await;
+        }
         if self.phase != Phase::Stopped || !self.published {
             return Err(Error::State);
         }
@@ -901,7 +952,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return self.ce92_start_packets();
         }
         if self.rtl8723be() {
-            return Err(Error::State);
+            return self.be8723_start_packets();
         }
         if self.phase != Phase::MacConfigured
             || self.packet.local.is_none()
@@ -956,7 +1007,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             return self.ce92_enable_interrupts();
         }
         if self.rtl8723be() {
-            return Err(Error::State);
+            return self.be8723_enable_interrupts();
         }
         if self.phase != Phase::Running || self.packet.interrupts {
             return Err(Error::State);
@@ -1008,6 +1059,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_recognize_interrupts();
+        }
+        if self.rtl8723be() {
+            return self.be8723_recognize_interrupts();
         }
         if self.phase != Phase::Running || !self.packet.interrupts {
             return Err(Error::State);
@@ -1097,6 +1151,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_submit(frame, rate, aggregate, adaptive, short_gi);
+        }
+        if self.rtl8723be() {
+            return self.be8723_submit(frame, rate, aggregate, adaptive, short_gi);
         }
         if self.phase != Phase::Running || self.packet.pending.is_some() {
             return Err(Error::State);
@@ -1233,7 +1290,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(id)
     }
     fn delivery(&mut self) -> Result<Option<Delivery>, Error> {
-        if self.rtl8821ae() {
+        // RTL8723BE: the 8821AE `trx.h` TX entry (buffer dword 10, next
+        // dword 12), so the same host receipt.
+        if self.rtl8821ae() || self.rtl8723be() {
             return self.ae_delivery();
         }
         if self.rtl8192ee() {
@@ -1319,6 +1378,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         if self.rtl8192ce() {
             return self.ce92_receive_step();
+        }
+        if self.rtl8723be() {
+            return self.be8723_receive_step();
         }
         if self.phase != Phase::Running {
             return Err(Error::State);
@@ -1521,6 +1583,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
 
 #[path = "packet_ae.rs"]
 pub(crate) mod ae;
+#[path = "rtl8723be/packet_owner.rs"]
+pub(crate) mod be8723;
 #[path = "rtl8192ce/packet_owner.rs"]
 pub(crate) mod ce92;
 #[path = "rtl8192ee/packet_owner.rs"]

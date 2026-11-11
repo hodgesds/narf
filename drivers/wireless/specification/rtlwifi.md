@@ -2977,11 +2977,13 @@ Tests (written, unexecuted): `smoke_rtl8192ce_chip_version_rf_type_and_firmware_
 `smoke_rtl8192ce_linked_ring_profile`,
 `smoke_rtl8192ce_tables_verbatim_geometry`.
 
-### RTL8723BE retained runtime (in progress, not admitted)
+### RTL8723BE retained runtime (admitted legacy 2.4 GHz station)
 
 `rtl8723be/` holds the Linux `rtl8723be` + `rtl8723com` pieces the native
 RTL8723BE (`0xb723`, 1T1R 2.4 GHz + BT combo) owner is built from. Probe
-keeps the chip diagnostic until admission lands.
+retains a provisioned function (see "Station composition and probe
+admission" at the end of this section); BT-coexist boards are admitted,
+the coexistence owner runs every composed call site.
 
 - `version` — `_rtl8723be_read_chip_version`: `REG_SYS_CFG1` must carry
   `CHIP_8723B` (Linux only logs and continues with `VERSION_UNKNOWN`, which
@@ -3061,8 +3063,8 @@ keeps the chip diagnostic until admission lands.
   (`REG_CR = 0x2ff` is deferred to packet start), masks both IMRs, runs
   `rtl8723be::llt::init` and publishes the `REG_*_DESA` bases. The
   post-LLT segment belongs to the later radio step. Packet start,
-  interrupt enable, awake and the interface's admission refuse the chip
-  explicitly and `station_grant` is `None`, so no 88EE path can qualify it.
+  interrupt enable, awake, the station power grant and the interface's
+  admission are the 8723BE branches below (never an 88EE path).
   Test `smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt` (written,
   unexecuted).
 - `tables` / `phy` / `init` — `table.c` PHY_REG / PHY_REG_PG / RADIOA /
@@ -3161,10 +3163,8 @@ keeps the chip diagnostic until admission lands.
   `power_runtime::disable_rtl8723be` = `_rtl8723be_poweroff_adapter`
   (LPS-enter flow, self-reset on MCUFWDL BIT7 + ready, MCU reset,
   MCUFWDL 0, card-disable flow, RSV_CTRL+1 pulse, RSV_CTRL 0x0e); the
-  rebuild owner composes it with admission. None of this is reachable from
-  probe yet (chip diagnostic): the coexistence owner is wired (pass 3
-  below) and the signed envelope is delivered (#1461); probe admission
-  is the outstanding step. Tests `smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm`,
+  rebuild owner's power-down runs it after the station owner's
+  retirement proof (below). Tests `smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm`,
   `smoke_rtl8723be_ra_mask_dm_and_rx_pwdb`,
   `smoke_rtl8723be_c2h_irq_and_card_disable` (written, unexecuted).
 - BT coexistence, pass 1 (wired via the pass-3 owner below; not admitted). `btcoex/btc.rs` is the
@@ -3271,12 +3271,76 @@ keeps the chip diagnostic until admission lands.
   `C2hSource` over its RX ring (`C2hQueue`), dispatches RX C2H into the
   coexistence owner, and calls `ips` / `lps_*` / `scan` / `connect` /
   `media_status` / `special_packet` / `eapol` / `watchdog` / `c2h`.
-  Outstanding: probe admission only (the signed envelope is delivered,
-  #1461). Tests
+  The retained station owner reaches it through `Prepared` (see "Station
+  composition and probe admission" below). Tests
   `smoke_rtl8723be_coex_owner_lps_c2h_watchdog_halt`, the coexistence
   order checks added to `smoke_rtl8723be_erfon_block_and_channel_grant`
   and `smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt` (written,
   unexecuted).
+
+- Station composition and probe admission (implemented, pending
+  validation). Template: the RTL8192CE admission; ring geometry and host
+  receipt are the RTL8821AE ones (`trx.h` identical).
+  - Power base: `station_power::{Base,Grant}::Rtl8723be` over the `NAPC`
+    envelope (`Calibration::with_current`, `regrant` at the same operating
+    point, `wait_rtl8723be`); `station_grant` is the programmed
+    `rtl8723be_power`; `stage_rtl8723be_calibration`.
+  - Radio: `configure_rtl8723be_channel(calibration, domain, op)` programs
+    the `channel::Grant` `Calibration::grant_for` mints (measured index
+    capped at the Linux `rtl8723be_phy_set_txpower_level` index for the
+    configured EFUSE power / PHY_REG_PG store / regulatory option) and
+    records the permission; `configure_rtl8723be_mac` sets the station
+    address phase. `bind_rtl8723be_coex_measured` binds the coexistence
+    owner from the live `rtl8723be_read_bt_coexist_info_from_hwpg` facts.
+  - Packet branch `rtl8723be/packet_owner.rs` (`prepare::packet::be8723`):
+    start (`REG_CR` word `0x2ff`, `REG_PCIE_CTRL_REG + 1 = 0`,
+    `set_network_type(STATION)` unlinked); `rtl8723be_tx_fill_desc` TX
+    (forced rate + DISFB, or firmware RA at `_rtl_get_highest_n_rate` for
+    ordinary unicast DATA under the installed mask; RATE_ID NGB 0 / GB 4 /
+    B 6 / MC 7; `rtl_set_tx_report` for EAPOL / Null; RTS/CTS and
+    CTS-to-self at `DESC_RATE24M`; every on-air rate admitted by the
+    permission); RX with `rtl8723be_rx_query_desc` and `rpt_sel` C2H queued
+    for `be8723_service_c2h` (`rtl_c2h_content_parsing` through
+    `coex::Owner::c2h`, TX reports recorded); IRQ enable / recognition;
+    `rtl8723be/station.rs` (`_rtl8723be_set_media_status`,
+    `set_check_bssid`, `set_network_type`, `HW_VAR_{BSSID,BASIC_RATE,
+    SLOT_TIME,SIFS,ACK_PREAMBLE,AID}`, `update_channel_access_setting`,
+    `set_qos`); association (`rtl_cam_reset_all_entry`, `KEEP_ALIVE`,
+    linked network type, `HW_VAR_AID`, `_rtl8723be_download_rsvd_page`
+    over `rtl8723be/rsvd_page.rs` — the verbatim `fw.c`
+    `reserved_page_packet`, BCN_VALID polled, up to five uploads — and
+    the `H2C_8723B_RSVDPAGE` location, MSRRPT connect, then
+    `btc_mediastatus_notify`); `rtl8723be_update_hal_rate_mask` bounded by
+    the admitted rates; the watchdog (queued C2H, `rtl8723be_dm_refresh_
+    rate_adaptive_mask`, `btc_periodical`); LPS through
+    `coex::Owner::lps_{enter,leave}`; disassociation (MSRRPT disconnect,
+    `btc_mediastatus_notify(0)`, zero BSSID); stop (`btc_halt_notify`, then
+    the `RTL8723_NIC_LPS_ENTER_FLOW` TX-buffer-empty / RXDMA-idle proof).
+    Every H2C goes through the coexistence owner's mailbox (the chip's
+    single `last_hmeboxnum`). ERP preamble/slot tracking, fixed EDCA rows
+    and per-frame `DESC_RATE24M` protection are composed in the shared
+    station.
+  - Admission: `prepare_native::prepare_rtl8723be` (physical EFUSE `0x1fb`
+    package byte before the firmware run, registry firmware, packet claim,
+    measured coexistence bind, `prepare`, `configure_rtl8723be`, then
+    `admit_rtl8723be`: the `NAPC` 20 MHz grant on channels 1-11, MAC,
+    staged envelope); `interface.rs` readiness admits through
+    `admit_rtl8723be`; `allow_channel` re-derives the `NAPC` permission;
+    retune/removal rebuild through `power_runtime::disable_rtl8723be` +
+    `enable_rtl8723be` (`_rtl8723be_init_mac` prefix + enable flow); ASPM
+    stays off. `pci.rs::bring_up` retains `0xb723` when the BAR covers the
+    8723BE MMIO, `_rtl8723be_read_chip_version` qualifies, the map is
+    provisioned with the factory MAC and the path-A TX power decodes.
+  - Not composed (follow-ups): HT/40 MHz on this profile (the station
+    stays legacy 20 MHz; `rtl8723be_update_hal_rate_mask` N rows are never
+    installed), the `btc_scan_notify` / `connect` / `special_packet` / IPS
+    call sites from the shared station, `rtl8723be_dm_watchdog` steps other
+    than the RA refresh, short-preamble TX (as the other native profiles),
+    TX-report matching for the station, ASPM. Tests
+    `smoke_rtl8723be_station_registers_and_rsvd_page`,
+    `smoke_rtl8723be_native_owner_start_descriptors_receipt_and_rx`,
+    `smoke_rtl8723be_native_join_rsvd_page_ra_mask_and_leave` (written,
+    unexecuted).
 
 ### RTL8723AE retained runtime (in progress, not admitted)
 
