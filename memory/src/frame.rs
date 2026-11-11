@@ -340,6 +340,27 @@ static ZONE_HOLD_STATS: [ZoneHoldStats; MAX_NUMA_NODES] = [const {
     }
 }; MAX_NUMA_NODES];
 
+/// Per-frame free-state words for every frame the allocator manages: the
+/// buddy zones mirror their free lists into it. See "Per-frame free state"
+/// in `buddy.rs`.
+static FRAME_INDEX: buddy::FrameStateIndex = buddy::FrameStateIndex::new();
+
+/// Frees refused because the frame's state word said it was already free (the
+/// head of a free buddy block): a double free. The second free is dropped —
+/// accepting it would hand the same frame to two owners. Stays 0 in a correct
+/// kernel.
+static DOUBLE_FREES_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of frees the allocator has refused as double frees since boot.
+pub fn double_frees_refused() -> u64 {
+    DOUBLE_FREES_REFUSED.load(Ordering::Relaxed)
+}
+
+#[cold]
+fn note_double_free() {
+    DOUBLE_FREES_REFUSED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Order-0 frames one per-CPU cache refill or spill moves, from the size of
 /// the zone it fronts: about 0.025% of the zone, at most 256 KiB, clamped to a
 /// `2^n - 1` value (Linux `zone_batchsize`). 63 for any zone of 1 GiB or more.
@@ -802,10 +823,102 @@ pub fn reserve_for_slab_promotion() {
     for zone in &ZONES {
         zone.0.lock().reserve_growth_capacity();
     }
+    // Give every boot frame a state word, then have each zone mirror its free
+    // lists into them: from here a buddy lookup is one load instead of a scan
+    // of the free list. The sections come out of the buddy (8 bytes per frame
+    // of RAM, in 128 MiB granules), so they are taken before any zone is
+    // indexed and need nothing from the bootstrap arena beyond one small
+    // table per 512 GiB. A section that cannot be allocated just leaves its
+    // frames on the scanning path.
+    let boot_ranges = BOOT_MEMORY_RANGES.lock().clone();
+    for &(start, len) in &boot_ranges {
+        let first = start >> PAGE_SHIFT;
+        let end = start.saturating_add(len).saturating_add(PAGE_SIZE - 1) >> PAGE_SHIFT;
+        cover_frames_with_state(first, end.saturating_sub(first), None);
+    }
+    for (node, zone) in ZONES.iter().enumerate() {
+        zone.0.lock().enable_index(&FRAME_INDEX, node);
+    }
     // Free-list Vecs can no longer grow recursively through the slab. This is
     // the safe publication point for order-0 caches even on UMA machines that
     // never publish `numa_aware`.
     FRAME_CACHE_ENABLED.store(true, Ordering::Release);
+}
+
+/// Give every frame of `[first_frame, first_frame + count)` a state word,
+/// installing whichever index sections are missing. Returns
+/// `(covered, installed)`: whether the whole range now has words, and whether
+/// any section was newly installed (a zone that might already list frames of
+/// it then needs [`BuddyZone::sync_index`]).
+///
+/// Each section's words are allocated on `node` when the caller names one (a
+/// hot-plugged range, whose node the topology tables do not know yet), else
+/// on the node the section's own first frame belongs to.
+///
+/// Allocates from the buddy and from the heap: never call it under a zone or
+/// frame-cache lock.
+fn cover_frames_with_state(first_frame: u64, count: u64, node: Option<usize>) -> (bool, bool) {
+    if count == 0 {
+        return (true, false);
+    }
+    let mut covered = true;
+    let mut installed = false;
+    let last = (first_frame + (count - 1)) >> buddy::STATE_SECTION_SHIFT;
+    for section in (first_frame >> buddy::STATE_SECTION_SHIFT)..=last {
+        if FRAME_INDEX.has_section(section) {
+            continue;
+        }
+        let home = node
+            .unwrap_or_else(|| phys_to_node(section << (buddy::STATE_SECTION_SHIFT + PAGE_SHIFT)));
+        let Some((block, words)) = alloc_state_section(home) else {
+            covered = false;
+            continue;
+        };
+        // When the index declines `words` it keeps no copy of the reference,
+        // and this function does not use it again: freeing the block below
+        // leaves nothing that can reach its memory.
+        if FRAME_INDEX.install_section(section, words) {
+            installed = true;
+        } else {
+            // Out of table memory, or a racing caller installed the section
+            // first (`has_section` tells which). The frames go back.
+            free_block(block, STATE_SECTION_ORDER, buddy::MigrateType::Unmovable);
+            covered &= FRAME_INDEX.has_section(section);
+        }
+    }
+    (covered, installed)
+}
+
+/// Bytes of state words in one index section, and the buddy order that
+/// holds exactly that many.
+const STATE_SECTION_BYTES: usize = buddy::STATE_SECTION_FRAMES * core::mem::size_of::<AtomicU64>();
+const STATE_SECTION_ORDER: u8 = (STATE_SECTION_BYTES / PAGE_SIZE as usize).trailing_zeros() as u8;
+const _: () = assert!(STATE_SECTION_BYTES == (PAGE_SIZE as usize) << STATE_SECTION_ORDER);
+const _: () = assert!(STATE_SECTION_ORDER <= MAX_ORDER);
+
+/// One section's worth of zeroed state words, in frames taken from the buddy
+/// (preferring `node`), together with the block that backs them.
+fn alloc_state_section(node: usize) -> Option<(PhysFrame, &'static [AtomicU64])> {
+    let block =
+        alloc_pages_on_inner(node, STATE_SECTION_ORDER, buddy::MigrateType::Unmovable).ok()?;
+    let words = block.start_address().kernel_mut_ptr::<AtomicU64>();
+    // SAFETY: `block` is `1 << STATE_SECTION_ORDER` contiguous frames the
+    // buddy just handed out, so this code is their only owner; `words` is
+    // their direct-map (or boot identity-map) address, valid and writable
+    // for the kernel's lifetime — the same footing as the bootstrap-arena
+    // donation in `ensure_bootstrap_headroom`. The block is exactly
+    // `STATE_SECTION_BYTES` long (asserted above) and page-aligned, which
+    // satisfies `AtomicU64`'s alignment; an all-zero `AtomicU64` is a valid
+    // value. The slice is created only after the bytes are initialised and is
+    // only ever shared (never `&mut`). `'static` holds because the block is
+    // freed in exactly one case — `cover_frames_with_state`, when
+    // `install_section` declined the slice and so kept no reference to it —
+    // and the slice is not touched again after that.
+    let words = unsafe {
+        core::ptr::write_bytes(words, 0, buddy::STATE_SECTION_FRAMES);
+        core::slice::from_raw_parts(words.cast_const(), buddy::STATE_SECTION_FRAMES)
+    };
+    Some((block, words))
 }
 
 /// Make sure the bootstrap bump arena can satisfy `need` more bytes,
@@ -1005,6 +1118,22 @@ pub unsafe fn online_memory_range(
     {
         return Err(MemoryHotplugError::InvalidRange);
     }
+    let first_frame = start.raw() >> PAGE_SHIFT;
+    let frame_count = len >> PAGE_SHIFT;
+    // The new frames need state words before the buddy can list them in O(1).
+    // Installing a section allocates (buddy frames, possibly a heap table) and
+    // may free again, and a free can consult the hot-plug registry for the
+    // frame's node — so it happens here, before that registry is locked. A
+    // range refused further down keeps its words; they describe no free frame
+    // and cost nothing but their memory.
+    let mut new_sections = false;
+    if ALLOC.initialised.load(Ordering::Acquire) {
+        let (covered, installed) = cover_frames_with_state(first_frame, frame_count, Some(node));
+        if !covered {
+            return Err(MemoryHotplugError::MetadataCapacity);
+        }
+        new_sections = installed;
+    }
     let mut ranges = HOTPLUG_RANGES.lock();
     let end = start.raw() + len;
     let existing = ranges
@@ -1033,8 +1162,6 @@ pub unsafe fn online_memory_range(
     FRAME_CACHE_HOTPLUG_BYPASS[node].store(true, Ordering::Release);
     synchronize_frame_cache_bypass();
 
-    let first_frame = start.raw() >> PAGE_SHIFT;
-    let frame_count = len >> PAGE_SHIFT;
     if !ALLOC.initialised.load(Ordering::Acquire) {
         if reused {
             if let Some(range) = ranges
@@ -1071,6 +1198,12 @@ pub unsafe fn online_memory_range(
         return Err(MemoryHotplugError::MetadataCapacity);
     }
     zone.donate(first_frame, frame_count);
+    if new_sections {
+        // Nothing should already list a frame of a section that had no words
+        // until now; if something does, bring it into the index rather than
+        // leave it on the scanning path. O(free blocks), once per new section.
+        zone.sync_index();
+    }
     account_freed_frames(node, frame_count as usize);
     ALLOC.node_total_frames[node].fetch_add(frame_count as usize, Ordering::Relaxed);
     ALLOC
@@ -1650,6 +1783,25 @@ fn drain_cpu_node_cache(cache: &mut CpuFrameCache, node: usize) {
     PAIR_CACHE_FREE[node].fetch_sub(drained, Ordering::Relaxed);
 }
 
+/// One zone-lock hold returning up to `FRAME_RETURN_CHUNK` final-owner
+/// order-0 frames directly to `node`'s zone. Returns how many it took.
+fn free_order0_chunk_direct(node: usize, frames: &[u64]) -> usize {
+    debug_assert!(frames.len() <= FRAME_RETURN_CHUNK);
+    if frames.is_empty() {
+        return 0;
+    }
+    let mut zone = lock_zone(node);
+    let mut freed = 0usize;
+    for &frame in frames {
+        if zone.try_free_mt(frame, 0, buddy::MigrateType::Unmovable) {
+            freed += 1;
+        } else {
+            note_double_free();
+        }
+    }
+    freed
+}
+
 /// Publish a bounded set of final-owner order-0 frames for one NUMA node.
 ///
 /// No allocation is permitted here: callers have already removed the final
@@ -1658,18 +1810,14 @@ fn drain_cpu_node_cache(cache: &mut CpuFrameCache, node: usize) {
 /// installed in the buddy zone. That cache -> zone lock coupling is required
 /// so a concurrent drain/hot-remove transaction cannot observe the frames in
 /// neither location.
-fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
+fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) -> usize {
     debug_assert!(frames.len() <= FRAME_RETURN_CHUNK);
     if frames.is_empty() {
-        return;
+        return 0;
     }
     let node = node.min(MAX_NUMA_NODES - 1);
     if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
-        let mut zone = lock_zone(node);
-        for &frame in frames {
-            zone.free(frame, 0);
-        }
-        return;
+        return free_order0_chunk_direct(node, frames);
     }
 
     let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
@@ -1680,11 +1828,7 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
     // check. Match the scalar path by publishing directly to the zone.
     if frame_cache_bypassed(node) {
         drop(cache);
-        let mut zone = lock_zone(node);
-        for &frame in frames {
-            zone.free(frame, 0);
-        }
-        return;
+        return free_order0_chunk_direct(node, frames);
     }
 
     let local = &mut cache.nodes[node];
@@ -1716,6 +1860,7 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) {
             zone.free_cached(frame, 0);
         }
     }
+    frames.len()
 }
 
 /// Drain every CPU's cache for one node and run `f` while new cache entries
@@ -2218,6 +2363,14 @@ pub fn free_pages_ctx(frame: PhysFrame, order: u8, ctx: AllocContext) {
     if order > MAX_ORDER {
         return;
     }
+    free_block(frame, order, ctx.migrate_type());
+}
+
+/// Return a `1 << order` block to its node: the body of [`free_pages_ctx`],
+/// and the release for blocks taken with `alloc_pages_on_inner` and so never
+/// charged to a memory cgroup (their record is empty, so nothing is
+/// uncharged).
+fn free_block(frame: PhysFrame, order: u8, mt: buddy::MigrateType) {
     let phys = frame.start_address().raw();
     if phys >= LOW_RESERVED_BYTES {
         // Return whatever memory-cgroup charge the block's allocation
@@ -2245,12 +2398,15 @@ pub fn free_pages_ctx(frame: PhysFrame, order: u8, ctx: AllocContext) {
         account_freed_frames(zone_idx, 1);
         return;
     }
-    if order == 1 && ctx == AllocContext::Kernel && free_pair_to_cache(zone_idx, frame_no) {
+    if order == 1 && mt == buddy::MigrateType::Unmovable && free_pair_to_cache(zone_idx, frame_no) {
         account_freed_frames(zone_idx, 2);
         return;
     }
-    lock_zone(zone_idx).free_mt(frame_no, order, ctx.migrate_type());
-    account_freed_frames(zone_idx, 1usize << order);
+    if lock_zone(zone_idx).try_free_mt(frame_no, order, mt) {
+        account_freed_frames(zone_idx, 1usize << order);
+    } else {
+        note_double_free();
+    }
 }
 
 /// Return a previously-allocated frame to the pool. Dispatches
@@ -2312,12 +2468,25 @@ pub fn free_movable_range(base: PhysAddr, count: u64) {
     for i in 0..count {
         uncharge_freed_block(PhysAddr::new(base.raw() + i * PAGE_SIZE), PAGE_SIZE);
     }
-    let mut zone = lock_zone(node);
-    for i in 0..count {
-        zone.free_mt(first_frame + i, 0, buddy::MigrateType::Movable);
+    let end = first_frame + count;
+    let mut freed = 0usize;
+    let mut next = first_frame;
+    // `FRAME_RETURN_CHUNK` frames per zone-lock hold, like every other free.
+    // Compaction's own runs are a few frames and stay one hold, as before.
+    while next < end {
+        let stop = end.min(next + FRAME_RETURN_CHUNK as u64);
+        let mut zone = lock_zone(node);
+        for frame in next..stop {
+            if zone.try_free_mt(frame, 0, buddy::MigrateType::Movable) {
+                freed += 1;
+            } else {
+                note_double_free();
+            }
+        }
+        drop(zone);
+        next = stop;
     }
-    drop(zone);
-    account_freed_frames(node, count as usize);
+    account_freed_frames(node, freed);
 }
 
 /// Return a vector of independently owned base frames through the installed
@@ -2421,10 +2590,13 @@ fn buddy_return_unreferenced_frame(f: PhysFrame) {
     let Some((zone_idx, frame_no)) = buddy_unreferenced_route(f) else {
         return;
     };
-    if !free_order0_to_cache(zone_idx, frame_no) {
-        lock_zone(zone_idx).free(frame_no, 0);
+    let taken = free_order0_to_cache(zone_idx, frame_no)
+        || lock_zone(zone_idx).try_free_mt(frame_no, 0, buddy::MigrateType::Unmovable);
+    if taken {
+        account_freed_frames(zone_idx, 1);
+    } else {
+        note_double_free();
     }
-    account_freed_frames(zone_idx, 1);
 }
 
 /// Complete work that must precede publication of a final-owner frame.
@@ -2575,13 +2747,13 @@ fn free_released_window(released: &[PhysAddr]) {
             chunk[chunk_len] = buddy::frame_no(PhysFrame::new(phys));
             chunk_len += 1;
             if chunk_len == FRAME_RETURN_CHUNK {
-                free_order0_chunk_to_zone(node, &chunk);
-                account_freed_frames(node, chunk_len);
+                let freed = free_order0_chunk_to_zone(node, &chunk);
+                account_freed_frames(node, freed);
                 chunk_len = 0;
             }
         }
-        free_order0_chunk_to_zone(node, &chunk[..chunk_len]);
-        account_freed_frames(node, chunk_len);
+        let freed = free_order0_chunk_to_zone(node, &chunk[..chunk_len]);
+        account_freed_frames(node, freed);
     }
 }
 
