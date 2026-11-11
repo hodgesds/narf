@@ -1131,9 +1131,13 @@ fn smoke_iwl_p2p_public_primary_roles_protected_frames_and_host_policy_do_not_in
 ) -> TestResult {
     check(|| {
         let mut f = Fixture::new(None)?;
+        // The primary netdev may take P2P CLIENT/GO (8/9) on a GO-capable
+        // fixture, as iwlmvm advertises P2P_CLIENT | P2P_GO | P2P_DEVICE
+        // (mac80211.c iwl_mvm_mac_setup_register); only P2P DEVICE (10) is
+        // a control child, so the children below are still refused.
         require(
-            f.device().p2p_interface_types() == [10] && f.device().async_control_interfaces(),
-            "P2P device-only role advertisement",
+            f.device().p2p_interface_types() == [8, 9, 10] && f.device().async_control_interfaces(),
+            "P2P primary CLIENT/GO and DEVICE child role advertisement",
         )?;
         {
             let authority = f.parent_authority()?;
