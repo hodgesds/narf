@@ -3538,13 +3538,15 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   through the 3 s timeout, as here.
   Still open: probe admission (`pci.rs` retained set, the
   `interface.rs` readiness dispatch). The shared station composition
-  has no 92DE arm yet. The station power `wait` dispatch
-  (`station.rs`) has no `Base::Rtl8192de` case, `wait_rtl8192de` has
-  no caller, and the 92DE join path (`rtl8192de::station`
-  BSSID/media-status helpers, `station::join_bss_report` for the
-  reserved page) and descriptor fill are not composed into the shared
-  station. Admitting the chip now would publish a station that
-  cannot transmit.
+  has no 92DE packet branch yet: the station power `wait` dispatch
+  (`station.rs::power_wait`) now routes `Base::Rtl8192de` to
+  `wait_rtl8192de`, but `packet.rs` has no 92DE arm (start, descriptor
+  fill, RX, the 0x120/0x128 IMRs, LPS, join), and the 92DE join path
+  (`rtl8192de::station` BSSID/media-status helpers,
+  `station::join_bss_report`, whose `rsvd_page::Upload` writes a
+  CPU-side descriptor and rings the doorbell itself, so it needs a
+  DMA-ring form first) is not composed into the shared station.
+  Admitting the chip now would publish a station that cannot transmit.
 
 ## 4. Invariants
 

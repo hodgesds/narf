@@ -352,6 +352,11 @@ async fn power_wait<F: Future<Output = Result<(), RadioError>>>(
         {
             super::super::station_power::wait_rtl8192ce(base, permission, environment, future).await
         }
+        (Base::Rtl8192de(base), Grant::Rtl8192de(permission))
+            if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
+        {
+            super::super::station_power::wait_rtl8192de(base, permission, environment, future).await
+        }
         (Base::Rtl8723be(base), Grant::Rtl8723be(permission))
             if ht.is_none() && protection.is_none() && tracking.is_none() && antenna.is_none() =>
         {
