@@ -1179,3 +1179,147 @@ kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_idle_balance_kick_is_aimed_and_rationed
 );
+
+/// One more than a pull judges in one visit, plus the task behind them.
+const CROWD: usize = 34;
+
+static CROWD_WAKER: [IrqSafeSpinLock<Option<Waker>>; CROWD] =
+    [const { IrqSafeSpinLock::new(None) }; CROWD];
+static CROWD_POLLS: [AtomicUsize; CROWD] = [const { AtomicUsize::new(0) }; CROWD];
+
+/// Sleeps once, then finishes.
+struct CrowdTask {
+    index: usize,
+    slept: bool,
+}
+
+impl Future for CrowdTask {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        CROWD_POLLS[this.index].fetch_add(1, Ordering::AcqRel);
+        if this.slept {
+            return Poll::Ready(());
+        }
+        this.slept = true;
+        *CROWD_WAKER[this.index].lock() = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// A pull judges a bounded window of a victim's staged entries. Entries no
+/// other CPU may take must not hide the ones behind them for as long as the
+/// victim is stalled: a pull that finds nothing in its window starts the next
+/// one further on. Checked in both holding places with 33 tasks pinned to the
+/// stalled CPU in front of one that any CPU may run.
+fn smoke_scheduler_staged_pull_window_moves_past_ineligible_entries() -> TestResult {
+    reset_probes();
+    let Some(stuck) = StuckCpu::claim() else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    let me = narf_lib::percpu::current_cpu();
+    let pinned = Affinity::pinned(CpuId(stuck.0 as u32));
+    for index in 0..CROWD {
+        *CROWD_WAKER[index].lock() = None;
+        CROWD_POLLS[index].store(0, Ordering::Release);
+    }
+
+    // The wake inbox is scanned oldest first: the pinned tasks go in first,
+    // the free one last.
+    static INBOX_RAN: AtomicUsize = AtomicUsize::new(0);
+    INBOX_RAN.store(0, Ordering::Release);
+    for index in 0..CROWD {
+        let id = crate::spawn_with_spec(
+            async {
+                INBOX_RAN.fetch_add(1, Ordering::AcqRel);
+            },
+            any_cpu_preferring(me),
+        );
+        let Some(mut slot) = crate::READY[me].lock().as_mut().and_then(|q| q.pop_front()) else {
+            stuck.release();
+            return TestResult::Fail("spawned task not found on this CPU");
+        };
+        if index != CROWD - 1 {
+            slot.spec.affinity = pinned;
+            slot.affinity_generation = crate::register_task_affinity(id, pinned, false);
+        }
+        crate::enqueue_on(stuck.0, slot, TaskEnqueueReason::Requeued);
+    }
+    let inbox_first = pull(stuck.0, me);
+    let inbox_second = pull(stuck.0, me);
+    let inbox_left = staged_enqueues(stuck.0);
+    crate::poll_one_round();
+    let inbox_ran = INBOX_RAN.load(Ordering::Acquire);
+    // Clear the inbox so the parked half is judged on its own.
+    crate::WAKE_INBOX[stuck.0].lock().clear();
+    crate::WAKE_INBOX_LEN[stuck.0].store(0, Ordering::Release);
+
+    // The parked-wake list is scanned newest first: the free task is woken
+    // first, the pinned ones after it.
+    let mut ids = [TaskId::NONE; CROWD];
+    for (index, id) in ids.iter_mut().enumerate() {
+        *id = crate::spawn_with_spec(
+            CrowdTask {
+                index,
+                slept: false,
+            },
+            any_cpu_preferring(me),
+        );
+    }
+    crate::poll_one_round();
+    for (index, id) in ids.iter().enumerate() {
+        let Some(mut entry) = crate::PARKED[me]
+            .lock()
+            .as_mut()
+            .and_then(|parked| parked.remove(id))
+        else {
+            stuck.release();
+            return TestResult::Fail("crowd task did not park on this CPU");
+        };
+        if index != 0 {
+            entry.slot.spec.affinity = pinned;
+            entry.slot.affinity_generation = crate::register_task_affinity(*id, pinned, false);
+        }
+        crate::enqueue_on(stuck.0, entry.slot, TaskEnqueueReason::Migrated);
+    }
+    let_cool();
+    for waker in CROWD_WAKER.iter() {
+        let waker = waker.lock().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+    let staged = staged_parked_wakes(stuck.0);
+    let parked_first = pull(stuck.0, me);
+    let parked_second = pull(stuck.0, me);
+    let parked_left = staged_parked_wakes(stuck.0);
+    crate::poll_one_round();
+    let free_polls = CROWD_POLLS[0].load(Ordering::Acquire);
+    let pinned_polls: usize = CROWD_POLLS[1..]
+        .iter()
+        .map(|polls| polls.load(Ordering::Acquire))
+        .sum();
+    stuck.release();
+
+    if inbox_first || !inbox_second || inbox_left != CROWD - 1 || inbox_ran != 1 {
+        return TestResult::Fail(
+            "wake-inbox pull did not move past a window of entries pinned to the victim",
+        );
+    }
+    if staged != CROWD {
+        return TestResult::Fail("crowd wakes were not all staged on the stuck CPU");
+    }
+    if parked_first || !parked_second || parked_left != CROWD - 1 || free_polls != 2 {
+        return TestResult::Fail(
+            "parked-wake pull did not move past a window of nodes pinned to the victim",
+        );
+    }
+    if pinned_polls != CROWD - 1 {
+        return TestResult::Fail("a task pinned to the stuck CPU ran somewhere else");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_staged_pull_window_moves_past_ineligible_entries
+);
