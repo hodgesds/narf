@@ -1201,6 +1201,25 @@ read-only samples of live DMA state, not completion or quiescence proofs.
 An abrupt reset can lose the last buffered fragment and unsynced filesystem
 data; retained logs alone do not establish exactly when the machine stopped.
 
+#### A sampler for hangs
+
+`verification/data/host-capture/narf-hang-sampler` is separate from the
+collector and needs no installation. Run it as the login user for the
+session you want covered:
+
+```sh
+nohup verification/data/host-capture/narf-hang-sampler &   # every 2 s, eth0
+```
+
+It appends a block every two seconds to `~/narf-hang-sampler-<boot id>.log`
+and fsyncs the file: `/proc/meminfo`, per-CPU busy time, the interrupt
+deltas of the NIC, NVMe and GPU lines, changed `ethtool -S` counters, the
+GPU's `mem_info_*` files, process counts by state and the five largest
+processes. It reads `/proc` and `/sys` with shell builtins and hands the
+write and the fsync to a child, so a hang leaves its last seconds in the
+file, and a filesystem that stops accepting writes shows up as `disk:` lines
+giving the time since the last write returned instead of as silence.
+
 ### Investigating network and permission failures
 
 Use the collected `network.log` and kernel stream to distinguish PCI probe,
@@ -1288,6 +1307,34 @@ second NVMe controller. The smoke then:
    udev's view of the root;
 5. checks the decoy disk (and, under root-ro, the root image) is
    byte-identical.
+
+### QEMU soak under a desktop-like load
+
+```sh
+verification/data/cachyos-soak/run-soak.sh <name> [mem-mib] [load-seconds]
+```
+
+boots the same image read-write (`cachyos-root-smoke --rw`, NVMe, the
+bare-metal command line plus `watchdog_thresh=2
+sysctl.kernel.hung_task_timeout_secs=20 btrfs.fatal_errors=panic`), with the
+packages and the `narf` user `verification/data/cachyos-soak/image-hook.sh`
+adds, and runs a unit in the guest that loads it the way a desktop session
+does: threaded processes that write, map, truncate and rename the same
+files and die mid-operation, readers of a source tree, fsync+rename saves, a
+growing journal, TCP/TLS transfers over virtio-net and e1000, ssh logins
+running tmux, D-Bus calls, ptys, timers, signals and core dumps. The guest
+prints a pulse every second, per-CPU busy time every 2 s and the latency of
+a `loginctl` call, a `busctl` call, a cold file read, an fsync and an exec
+every 3 s on the serial console, all captured in
+`target/soak/<name>/serial.log`. When the pulse stops, the host dumps every
+vCPU's registers through QMP before it ends the run.
+`verification/data/cachyos-soak/soak-report.py target/soak/<name>` prints
+memory over time, the probe latencies, each lockup report with its
+symbolized stack, and the tasks the detector found stranded behind a busy
+CPU; `--stranded` prints the detector's own lines for those.
+
+Nothing on the host is touched: the disks are files under `target/`, and
+every listener and port forward is on 127.0.0.1.
 
 ## Open implementation work
 
