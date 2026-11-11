@@ -48,6 +48,15 @@ implements ETHTOOL_SETEEPROM (0x0c): igc writes shadow RAM via SRWR and
 updates the NVM checksum plus the flash commit; drivers without NVM write
 support refuse with -EOPNOTSUPP, and a bad EEPROM magic fails with -EFAULT.
 
+SR-IOV rides the same surface as Linux's `sriov_numvfs` write (the PF
+driver's `.sriov_configure`): `NicControl::sriov_num_vfs` /
+`set_sriov_num_vfs` (0 disables). Enable runs the PCI SR-IOV capability
+half first and the device-side VF allocation second, rolling the bus half
+back when the device half fails; disable tears the device half down before
+the bus half. igb implements it (1..=7 VFs, MSI-X required, resize refused
+while enabled — disable first); drivers without SR-IOV keep the default
+-EOPNOTSUPP.
+
 The ethtool surface mirrors Linux `igc_ethtool_ops`: `msglevel` /
 `set_msglevel` (`GMSGLVL` / `SMSGLVL`), `priv_flags` / `set_priv_flags` /
 `priv_flag_names` (`GPFLAGS` / `SPFLAGS`, `GSTRINGS` sset 2, `GDRVINFO`

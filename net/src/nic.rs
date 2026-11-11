@@ -348,6 +348,23 @@ pub trait NicControl: core::fmt::Debug + Send + Sync {
     fn kick_xsk(&self, _: u16) -> Result<()> {
         Ok(())
     }
+    /// Linux `sriov_numvfs` read: VFs currently enabled on this PF
+    /// (0 = SR-IOV off). Drivers without SR-IOV refuse with
+    /// EOPNOTSUPP (95); the count is the admin path's own state,
+    /// not a config-space re-read.
+    fn sriov_num_vfs(&self) -> Result<u16> {
+        Err(95)
+    }
+    /// Linux `sriov_numvfs` write / `.sriov_configure`: enable
+    /// `num_vfs` VFs, or disable SR-IOV with 0. The driver enables
+    /// the PCI SR-IOV capability first and allocates its
+    /// device-side VF state second, rolling the bus half back when
+    /// the device half fails; disable tears the device half down
+    /// before the bus half. EINVAL (22) for an out-of-range count,
+    /// EBUSY (16) for a resize while enabled (disable first).
+    fn set_sriov_num_vfs(&self, _: u16) -> Result<()> {
+        Err(95)
+    }
     fn runtime_suspend(&self) -> Result<()> {
         Err(95)
     }
