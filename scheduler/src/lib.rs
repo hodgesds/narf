@@ -7588,6 +7588,65 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
 /// behind more than this many such entries waits for one of them to leave.
 const STAGED_STEAL_SCAN: usize = 32;
 
+/// How long thieves must have watched wakes sit staged on a CPU that passes no
+/// scheduling point before they call it stalled and stop leaving it a last
+/// runnable task. One default tick period: far longer than a healthy CPU takes
+/// to answer the reschedule IPI a staged wake sends it.
+const STAGED_STALL_NS: u64 = 1_000_000;
+
+/// What idle thieves have seen of one victim's staged wakes. Thieves write it,
+/// the victim never touches it, so it costs the victim's scheduling paths
+/// nothing; a thief reaches it only for a victim whose ready queue offered
+/// nothing.
+///
+/// The observation is "wakes were staged at this scheduling-pass count, first
+/// seen at this time". It is dropped whenever a thief finds nothing staged, and
+/// replaced whenever the pass count has moved. So it ages only while every
+/// visit finds wakes staged and the victim's executor has not passed a
+/// scheduling point since: the definition of a stall that does not depend on
+/// whether the victim is inside a task poll or has interrupts enabled.
+/// Concurrent thieves race benignly; all of them store the same count and
+/// nearly the same time.
+#[repr(align(64))]
+struct StagedWatch {
+    /// The victim's `sched_passes + 1` at the first sighting; 0 = none.
+    passes: AtomicU64,
+    /// Cycle stamp of that sighting.
+    since: AtomicU64,
+}
+
+static STAGED_WATCH: [StagedWatch; narf_lib::percpu::MAX_CPUS] = [const {
+    StagedWatch {
+        passes: AtomicU64::new(0),
+        since: AtomicU64::new(0),
+    }
+}; narf_lib::percpu::MAX_CPUS];
+
+impl StagedWatch {
+    /// Nothing is staged: whatever was being watched is over.
+    #[inline]
+    fn forget(&self) {
+        if self.passes.load(Ordering::Relaxed) != 0 {
+            self.passes.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Record that wakes are staged at pass count `passes`, and report
+    /// whether that has now been so for `threshold` cycles.
+    #[inline]
+    fn stalled(&self, passes: u64, now: u64, threshold: u64) -> bool {
+        let stamp = passes.wrapping_add(1);
+        if self.passes.load(Ordering::Acquire) != stamp {
+            // `since` first, published by the release store of the count: a
+            // reader that sees the new count sees its time.
+            self.since.store(now, Ordering::Relaxed);
+            self.passes.store(stamp, Ordering::Release);
+            return false;
+        }
+        now.saturating_sub(self.since.load(Ordering::Relaxed)) >= threshold
+    }
+}
+
 /// Idle balance over woken tasks `victim` has not activated yet (Linux
 /// `sched_balance_newidle`, extended to what Linux would already have on the
 /// run queue).
@@ -7627,18 +7686,31 @@ fn try_steal_staged(
 ) -> bool {
     let enqueued = WAKE_INBOX_LEN[victim].load(Ordering::Acquire);
     let woken = PARKED_WAKE_INBOX[victim].len.load(Ordering::Acquire);
+    let watch = &STAGED_WATCH[victim];
     if enqueued == 0 && woken == 0 {
+        watch.forget();
         return false;
     }
     let victim_id = crate::affinity::CpuId(victim as u32);
+    let now = narf_time::now_cycles();
     let runnable = ready_dispatchable
         .saturating_add(enqueued)
         .saturating_add(woken);
     if !victim_has_stealable_surplus(cpu_running_task(victim_id), runnable) {
-        return false;
+        // Nothing is running there and this is its last runnable task. A
+        // healthy idle CPU keeps it. One that thieves have watched hold the
+        // wake without passing a scheduling point does not: `CURRENT_TASK` is
+        // clear in the executor's own maintenance too (deferred destructors,
+        // slab drain, sleep pumps, timer wheel), and a CPU stuck there is as
+        // unreachable as one stuck in a task.
+        let passes = SCHEDULER_TELEMETRY[victim]
+            .sched_passes
+            .load(Ordering::Relaxed);
+        if !watch.stalled(passes, now, narf_time::ns_to_cycles(STAGED_STALL_NS)) {
+            return false;
+        }
     }
     let thief = crate::affinity::CpuId(cpu as u32);
-    let now = narf_time::now_cycles();
     let migration_cost = narf_time::ns_to_cycles(MIGRATION_COST_NS);
     let stealable = |slot: &TaskSlot| {
         slot_is_dispatchable(slot, now)
