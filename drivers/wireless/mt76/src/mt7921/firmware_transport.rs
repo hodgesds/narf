@@ -600,6 +600,8 @@ async fn finish_received_data(
 pub struct PacketStep {
     pub transmitted: bool,
     pub received: Vec<Vec<u8>>,
+    /// The station link's statistics after this step (station steps only).
+    pub(crate) link: Option<crate::mt7921::link_stats::LinkStats>,
     /// Identifies the actual station/key receive owner that produced the batch.
     pub receive_epoch: u64,
 }
@@ -1693,6 +1695,9 @@ struct StationLink {
     tx_ba: tx_ba::Owner,
     tx_restart: Option<tx_ba_restart::Request>,
     peer_lost: bool,
+    /// Signal and receive rate of the frames from this link's AP, for
+    /// NL80211_CMD_GET_STATION; reset with each association.
+    link_stats: crate::mt7921::link_stats::LinkStats,
     bss: Option<ScanBss>,
     /// This link's group role captured at join; retained for the exact
     /// disconnect record of that association (Linux `vif->p2p` is fixed per
@@ -1748,6 +1753,7 @@ impl StationLink {
             tx_ba: tx_ba::Owner::default(),
             tx_restart: None,
             peer_lost: false,
+            link_stats: crate::mt7921::link_stats::LinkStats::default(),
             bss: None,
             network: crate::mt7921::p2p_wire::Network::Infrastructure,
             permission: None,

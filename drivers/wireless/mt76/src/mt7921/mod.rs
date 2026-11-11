@@ -47,6 +47,7 @@ mod fw_features;
 pub mod fwdl;
 pub(crate) mod he;
 pub(crate) mod ht20;
+pub(crate) mod link_stats;
 pub mod mac;
 mod mac_power;
 mod mac_power_tests;

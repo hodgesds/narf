@@ -59,6 +59,8 @@ mod rx_ba_tests;
 mod rx_fragment_tests;
 #[path = "six_ghz_tests.rs"]
 mod six_ghz_tests;
+#[path = "station_stats_tests.rs"]
+mod station_stats_tests;
 #[path = "system_pm_tests.rs"]
 mod system_pm_tests;
 #[path = "tx_ba_restart_tests.rs"]

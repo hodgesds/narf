@@ -1001,6 +1001,14 @@ impl<B: Backend> Session<B> {
                 self.clear_aggregate_receive();
                 continue;
             }
+            // GET_STATION: every frame the AP sent on the operating channel
+            // contributes its signal; data frames also their rate.
+            if native.frame.get(10..16) == Some(&peer[..]) {
+                let data = native.frame.first().is_some_and(|fc| fc & 0x0c == 0x08);
+                self.station
+                    .link_stats
+                    .observe(native.rcpi, native.phy, data);
+            }
             // PMF management admission before any MLME/BA consumer: mac80211
             // `ieee80211_drop_unencrypted_mgmt` plus the CCMP (hardware) and
             // BIP (software, `ieee80211_crypto_aes_cmac_decrypt`) management
@@ -1767,6 +1775,7 @@ impl<B: Backend> Session<B> {
         Ok(super::PacketStep {
             transmitted,
             received,
+            link: Some(self.station.link_stats),
             receive_epoch: epoch,
         })
     }
@@ -2317,6 +2326,7 @@ impl<B: Backend> Session<B> {
             Ok(aid) => {
                 self.boot_started = None;
                 self.station.peer_lost = false;
+                self.station.link_stats = Default::default();
                 self.station.bss = Some(bss.clone());
                 self.station.wmm = plan.wmm();
                 self.station.ht20_profile = plan.ht20();
