@@ -1192,3 +1192,111 @@ kernel_test_in!(
     "drivers/wireless/ath9k/station",
     smoke_ar9285_station_retirement_reports_exact_dma_reclamation
 );
+
+/// In-place reset bookkeeping on an authorized WPA2 station: a queued
+/// cause stops TX/RX service without closing the generation; after the
+/// reset the association, peer, host keys and receive epoch are unchanged
+/// and protected traffic flows both ways. RX inactivity
+/// (`ath_hw_rx_inactive_check`) queues one only when an associated
+/// station heard nothing over a 4 s window.
+fn in_place_reset() -> Result<(), &'static str> {
+    let mut f = fixture(true)?;
+    complete(f.radio.associate(AP, SSID, Some(Zeroizing::new(PMK)), &[]))
+        .map_err(|_| "native association")?;
+    let epoch = f.radio.receive_epoch();
+    let base = 100_000;
+    // First pass only opens the window.
+    if f.radio.rx_inactive_check(base).is_some() {
+        return Err("first window queued a reset");
+    }
+    for _ in 0..4 {
+        let beacon = { f.peer.lock().beacon() };
+        f.model.inject(&beacon, 0).map_err(|_| "beacon")?;
+        f.radio.poll().map_err(|_| "beacon poll")?;
+    }
+    if f.radio
+        .rx_inactive_check(base + RX_INACTIVE_CHECK_INTERVAL_MS)
+        .is_some()
+    {
+        return Err("active receiver queued a reset");
+    }
+    if f.radio
+        .rx_inactive_check(base + 2 * RX_INACTIVE_CHECK_INTERVAL_MS)
+        != Some(ResetType::RxInactive)
+        || f.radio.reset_pending() != Some(ResetType::RxInactive)
+    {
+        return Err("RX inactivity did not queue RESET_TYPE_RX_INACTIVE");
+    }
+    let outbound = udp_ipv4(
+        f.plan.bssid,
+        f.plan.station,
+        f.plan.lease_ip,
+        f.plan.server_ip,
+        4001,
+        4002,
+        b"AR9 after in-place reset",
+    );
+    if f.radio.ready()
+        || f.radio.send(&outbound) != Err(Error::Busy)
+        || f.radio.poll() != Err(Error::Busy)
+        || f.radio.terminal()
+        || f.radio.peer() != Some(AP)
+    {
+        return Err("queued reset did not hold service or closed the generation");
+    }
+    if f.radio.begin_reset() != Ok(ResetType::RxInactive) {
+        return Err("ath_prepare_reset station half refused");
+    }
+    f.radio
+        .finish_reset()
+        .map_err(|_| "ath_complete_reset station half")?;
+    if f.radio.reset_pending().is_some()
+        || f.radio.peer() != Some(AP)
+        || f.radio.receive_epoch() != epoch
+        || !f.radio.ready()
+        || f.peer.lock().ap.phase() != ApPhase::Authorized
+    {
+        return Err("reset lost association, keys or receive epoch");
+    }
+    f.radio
+        .send(&outbound)
+        .map_err(|_| "protected send after reset")?;
+    f.radio.poll().map_err(|_| "delivery after reset")?;
+    if f.peer.lock().uplink.last() != Some(&outbound) {
+        return Err("uplink after reset not decrypted by the AP");
+    }
+    let inbound = udp_ipv4(
+        f.plan.station,
+        f.plan.bssid,
+        f.plan.server_ip,
+        f.plan.lease_ip,
+        4002,
+        4001,
+        b"AR9 downlink after reset",
+    );
+    let wire = f.peer.lock().downlink(&inbound)?;
+    f.model.inject(&wire, 0).map_err(|_| "RX after reset")?;
+    if f.radio.poll().map_err(|_| "RX progress after reset")? != vec![inbound] {
+        return Err("downlink after reset not decrypted with the kept PTK");
+    }
+    // A mid-handshake or closed generation is never reset in place.
+    f.radio.stop().map_err(|_| "stop")?;
+    if f.radio
+        .rx_inactive_check(base + 10 * RX_INACTIVE_CHECK_INTERVAL_MS)
+        .is_some()
+        || f.radio.begin_reset().is_ok()
+    {
+        return Err("closed generation admitted an in-place reset");
+    }
+    Ok(())
+}
+fn smoke_ath9k_in_place_reset_keeps_association_and_keys() -> TestResult {
+    match in_place_reset() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/station",
+    smoke_ath9k_in_place_reset_keeps_association_and_keys
+);

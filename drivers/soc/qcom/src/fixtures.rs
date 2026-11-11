@@ -548,7 +548,19 @@ pub mod ph {
     pub const WLAN_IN: u32 = 14;
     pub const WLAN_FW_MEM: u32 = 15;
     pub const WLAN_CE_MEM: u32 = 16;
+    pub const AOSS_QMP: u32 = 17;
+    pub const RPMHPD: u32 = 18;
+    pub const RPMHCC: u32 = 19;
 }
+
+/// SC7280 `aop-cmd-db@80860000` (`qcom,cmd-db` reserved memory).
+pub const SC7280_CMD_DB: (u64, u64) = (0x8086_0000, 0x2_0000);
+/// SC7280 `aoss_qmp` message RAM (`power-management@c300000`).
+pub const SC7280_AOSS_MSGRAM: (u64, u64) = (0x0c30_0000, 0x400);
+/// SC7280 `apps_rsc` `drv-2` (`qcom,drv-id = <2>`).
+pub const SC7280_RSC_DRV2: (u64, u64) = (0x1822_0000, 0x1_0000);
+/// SC7280 `apps_rsc` `qcom,tcs-offset`.
+pub const SC7280_TCS_OFFSET: u32 = 0xd00;
 
 fn reserved(name: &str, phandle: u32, base: u64, size: u64) -> Node {
     Node::new(name)
@@ -744,9 +756,10 @@ pub fn ipq6018_wifi_dt(compat: &str, wifi_irqs: &[u32]) -> Vec<u8> {
     build_fdt(&root)
 }
 
-/// The SC7280 pieces WCN6750 touches, from Linux `sc7280.dtsi`
+/// The SC7280 pieces WCN6750 touches, from Linux `kodiak.dtsi`
 /// (`remoteproc_wpss`, `smp2p-wpss`, `wifi@17a10040`, `ipcc`,
-/// `wpss_mem`/`wlan_fw_mem`/`wlan_ce_mem`).
+/// `wpss_mem`/`wlan_fw_mem`/`wlan_ce_mem`, the PAS proxy-power nodes
+/// `aop_cmd_db_mem`, `aoss_qmp`, `apps_rsc` with `rpmhpd`/`rpmhcc`).
 pub fn sc7280_wifi_dt() -> Vec<u8> {
     let mut wifi = Vec::new();
     for n in 768..800 {
@@ -784,7 +797,13 @@ pub fn sc7280_wifi_dt() -> Vec<u8> {
                     ph::WLAN_CE_MEM,
                     0x004c_d000,
                     0x1000,
-                )),
+                ))
+                .child(
+                    Node::new("aop-cmd-db@80860000")
+                        .u32s("reg", &reg2(SC7280_CMD_DB.0, SC7280_CMD_DB.1))
+                        .strs("compatible", &["qcom,cmd-db"])
+                        .prop("no-map", Vec::new()),
+                ),
         )
         .child(
             Node::new("smem")
@@ -813,6 +832,54 @@ pub fn sc7280_wifi_dt() -> Vec<u8> {
                         .u32s("#interrupt-cells", &[3])
                         .u32s("#mbox-cells", &[2])
                         .u32s("phandle", &[ph::IPCC]),
+                )
+                .child(
+                    Node::new("power-management@c300000")
+                        .strs("compatible", &["qcom,sc7280-aoss-qmp", "qcom,aoss-qmp"])
+                        .u32s("reg", &reg2(SC7280_AOSS_MSGRAM.0, SC7280_AOSS_MSGRAM.1))
+                        // <&ipcc IPCC_CLIENT_AOP IPCC_MPROC_SIGNAL_GLINK_QMP ...>
+                        .u32s("interrupts-extended", &[ph::IPCC, 0, 0, 1])
+                        .u32s("mboxes", &[ph::IPCC, 0, 0])
+                        .u32s("#clock-cells", &[0])
+                        .u32s("phandle", &[ph::AOSS_QMP]),
+                )
+                .child(
+                    Node::new("rsc@18200000")
+                        .strs("compatible", &["qcom,rpmh-rsc"])
+                        .u32s(
+                            "reg",
+                            &[
+                                0,
+                                0x1820_0000,
+                                0,
+                                0x1_0000,
+                                0,
+                                0x1821_0000,
+                                0,
+                                0x1_0000,
+                                0,
+                                SC7280_RSC_DRV2.0 as u32,
+                                0,
+                                SC7280_RSC_DRV2.1 as u32,
+                            ],
+                        )
+                        .strs("reg-names", &["drv-0", "drv-1", "drv-2"])
+                        .u32s("qcom,tcs-offset", &[SC7280_TCS_OFFSET])
+                        .u32s("qcom,drv-id", &[2])
+                        // <ACTIVE_TCS 2>, <SLEEP_TCS 3>, <WAKE_TCS 3>, <CONTROL_TCS 1>
+                        .u32s("qcom,tcs-config", &[2, 2, 0, 3, 1, 3, 3, 1])
+                        .child(
+                            Node::new("power-controller")
+                                .strs("compatible", &["qcom,sc7280-rpmhpd"])
+                                .u32s("#power-domain-cells", &[1])
+                                .u32s("phandle", &[ph::RPMHPD]),
+                        )
+                        .child(
+                            Node::new("clock-controller")
+                                .strs("compatible", &["qcom,sc7280-rpmh-clk"])
+                                .u32s("#clock-cells", &[1])
+                                .u32s("phandle", &[ph::RPMHCC]),
+                        ),
                 )
                 .child(
                     Node::new("hwlock@1f40000")
@@ -860,7 +927,14 @@ pub fn sc7280_wifi_dt() -> Vec<u8> {
                                 "shutdown-ack",
                             ],
                         )
+                        // <&rpmhcc RPMH_CXO_CLK>
+                        .u32s("clocks", &[ph::RPMHCC, 0])
+                        .strs("clock-names", &["xo"])
+                        // <&rpmhpd SC7280_CX>, <&rpmhpd SC7280_MX>
+                        .u32s("power-domains", &[ph::RPMHPD, 0, ph::RPMHPD, 4])
+                        .strs("power-domain-names", &["cx", "mx"])
                         .u32s("memory-region", &[ph::WPSS_MEM])
+                        .u32s("qcom,qmp", &[ph::AOSS_QMP])
                         .u32s("qcom,smem-states", &[ph::SMP2P_OUT, 0])
                         .strs("qcom,smem-state-names", &["stop"])
                         .u32s("phandle", &[ph::RPROC])
@@ -1243,4 +1317,114 @@ pub fn glink_remote_open<P: crate::glink::GlinkPipe>(
     }
     g.process_rx();
     Some(lcid)
+}
+
+// ── PAS proxy-power fakes (cmd-db, RSC, AOSS) ─────────────────────
+
+/// Fixture RSC addresses of the cmd-db entries (test values, not SC7280
+/// silicon addresses).
+pub const FAKE_CX_ADDR: u32 = 0x0003_0000;
+pub const FAKE_MX_ADDR: u32 = 0x0003_0010;
+pub const FAKE_XO_ADDR: u32 = 0x0005_0000;
+/// Fixture ARC level maps (u16 vlvl per hlvl): cx tops out at hlvl 5,
+/// mx at hlvl 4 (zero padding after it).
+pub const FAKE_CX_LEVELS: &[u16] = &[0, 16, 48, 64, 128, 256];
+pub const FAKE_MX_LEVELS: &[u16] = &[0, 48, 64, 128, 384, 0, 0, 0];
+/// The fake AOSS message RAM's MCORE mailbox offset.
+pub const FAKE_QMP_MBOX: u32 = 0x100;
+
+/// A cmd-db table (`cmd-db.c` layout, one slave) with `entries`
+/// `(id, addr, aux u16 levels)`.
+pub fn cmd_db_table(entries: &[(&str, u32, &[u16])]) -> Vec<u8> {
+    let n = entries.len();
+    let data_offset = n * 24;
+    let aux_len: usize = entries.iter().map(|(_, _, a)| a.len() * 2).sum();
+    let mut b = vec![0u8; 112 + data_offset + aux_len];
+    b[0..4].copy_from_slice(&1u32.to_le_bytes());
+    b[4..8].copy_from_slice(&crate::cmd_db::CMD_DB_MAGIC);
+    b[8..10].copy_from_slice(&1u16.to_le_bytes());
+    b[12..14].copy_from_slice(&(data_offset as u16).to_le_bytes());
+    b[14..16].copy_from_slice(&(n as u16).to_le_bytes());
+    let mut at = 0usize;
+    for (i, (id, addr, aux)) in entries.iter().enumerate() {
+        let e = 112 + i * 24;
+        let idb = id.as_bytes();
+        b[e..e + idb.len().min(8)].copy_from_slice(&idb[..idb.len().min(8)]);
+        b[e + 16..e + 20].copy_from_slice(&addr.to_le_bytes());
+        b[e + 20..e + 22].copy_from_slice(&((aux.len() * 2) as u16).to_le_bytes());
+        b[e + 22..e + 24].copy_from_slice(&(at as u16).to_le_bytes());
+        for (k, v) in aux.iter().enumerate() {
+            let o = 112 + data_offset + at + 2 * k;
+            b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        at += aux.len() * 2;
+    }
+    b
+}
+
+/// Passive register fakes for [`crate::platform::PasPowerDt`]: the
+/// cmd-db region holds [`cmd_db_table`] with `cx.lvl`/`mx.lvl`/`xo.lvl`;
+/// the RSC DRV reports its first ACTIVE TCS complete on every read of
+/// IRQ_STATUS; the AOSS message RAM is a ready QMP descriptor whose
+/// remote acks are already UP and whose mailbox length word always
+/// reads 0 (each message consumed). The RSC and message RAM record
+/// their writes.
+#[derive(Debug)]
+pub struct PasPowerFakes {
+    pub cmd_db: &'static FakeRegs,
+    pub rsc: &'static FakeRegs,
+    pub msgram: &'static FakeRegs,
+}
+
+pub fn pas_power_fakes(pw: &crate::platform::PasPowerDt) -> PasPowerFakes {
+    let cmd_db: &'static FakeRegs = Box::leak(Box::new(FakeRegs::quiet()));
+    let t = cmd_db_table(&[
+        ("cx.lvl", FAKE_CX_ADDR, FAKE_CX_LEVELS),
+        ("mx.lvl", FAKE_MX_ADDR, FAKE_MX_LEVELS),
+        ("xo.lvl", FAKE_XO_ADDR, &[]),
+    ]);
+    crate::io::write_bytes(cmd_db, 0, &t);
+    let rsc: &'static FakeRegs = Box::leak(Box::new(FakeRegs::new()));
+    // IRQ_STATUS (0x04 in both register tables).
+    rsc.force(0x04, 1 << pw.rsc.active_tcs);
+    let msgram: &'static FakeRegs = Box::leak(Box::new(FakeRegs::new()));
+    msgram.set(0x00, 0x4d41_494c);
+    msgram.set(0x04, 1);
+    msgram.set(0x34, 64);
+    msgram.set(0x38, FAKE_QMP_MBOX);
+    for off in [0x28, 0x14, 0x30] {
+        msgram.force(off, 0x0000_ffff);
+    }
+    msgram.force(FAKE_QMP_MBOX, 0);
+    PasPowerFakes {
+        cmd_db,
+        rsc,
+        msgram,
+    }
+}
+
+/// The NUL-terminated QMP messages written to `msgram` since it was
+/// created, in order (each send writes the length word then the text).
+pub fn qmp_messages(msgram: &FakeRegs) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    for (off, v) in msgram.writes() {
+        if off == FAKE_QMP_MBOX {
+            if !cur.is_empty() {
+                out.push(core::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if (FAKE_QMP_MBOX + 4..FAKE_QMP_MBOX + 4 + 64).contains(&off) {
+            cur.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    for m in out.iter_mut() {
+        let end = m.iter().position(|b| *b == 0).unwrap_or(m.len());
+        m.truncate(end);
+    }
+    out
 }

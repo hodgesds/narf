@@ -40,6 +40,9 @@ struct Model {
     lps_to_on: bool,
     /// XTAL-SI command words written, in order.
     xtal_cmds: Vec<u32>,
+    /// A write to `R_BE_SYS_PW_CTRL` carried `APFM_OFFMAC` (the
+    /// trigger the `offmac_clears` emulation hides from reads).
+    offmac_written: bool,
 }
 
 impl Model {
@@ -54,6 +57,7 @@ impl Model {
             offmac_clears: false,
             lps_to_on: false,
             xtal_cmds: Vec::new(),
+            offmac_written: false,
         }
     }
 
@@ -106,6 +110,9 @@ impl Regs for Model {
     }
 
     fn write32(&mut self, address: u32, value: u32) {
+        if address == R_BE_SYS_PW_CTRL && value & B_BE_APFM_OFFMAC != 0 {
+            self.offmac_written = true;
+        }
         if address == R_BE_WLAN_XTAL_SI_CTRL {
             self.xtal_cmds.push(value);
             self.last_xtal_offset = (value & B_BE_WL_XTAL_SI_ADDR_MASK) as u8;
@@ -200,7 +207,9 @@ fn smoke_rtw89_mac_pre_init_reset_off() -> TestResult {
     let mut m = Model::new()
         .with32(R_BE_SYSON_FSM_MON, 0)
         .with32(R_BE_IC_PWR_STATE, 0)
-        .with32(R_BE_HCI_OPT_CTRL, 0x0FFF_FFFF)
+        // Both IO enables (bits 24, 28) set; the IO / backup-restore
+        // status bits (26, 27, 31) idle so the mac_be.c polls pass.
+        .with32(R_BE_HCI_OPT_CTRL, 0x13FF_FFFF)
         .with32(R_BE_SYS_PW_CTRL, B_BE_EN_WLON | B_BE_APFM_SWLPS);
     if reset_pwr_state(&mut m).is_err() {
         return TestResult::Fail("reset_pwr_state (MAC_OFF) failed");
@@ -238,8 +247,9 @@ fn smoke_rtw89_mac_pre_init_reset_on_lps() -> TestResult {
     if pw & (B_BE_EN_WLON | B_BE_APFM_SWLPS) != 0 {
         return TestResult::Fail("MAC_ON reset must end with EN_WLON/SWLPS clear");
     }
-    // The OFFMAC trigger was written (read emulation hides it back).
-    if pw & B_BE_APFM_OFFMAC == 0 {
+    // The OFFMAC trigger was written; the emulated self-clear hides
+    // it from the read-modify-write tail, so the stored word lacks it.
+    if !m.offmac_written {
         return TestResult::Fail("MAC_ON reset must set APFM_OFFMAC");
     }
     // MAC_LPS: state field 2; LPS->ON + OFFMAC-clear emulated.
@@ -325,16 +335,16 @@ fn smoke_rtw89_mac_pre_init_tail() -> TestResult {
     {
         return TestResult::Fail("tail must set both ADIE pad-power bits");
     }
-    // XTAL-SI program: 17 writes, first (PLL,0x02,0x02), last
-    // (SRAM_CTRL,0,SRAM_DIS=0x02).
-    if m.xtal_cmds.len() != 17 {
-        return TestResult::Fail("tail must issue exactly 17 XTAL-SI writes");
+    // XTAL-SI program: 16 writes (rtw8922a_pwr_on_func), first
+    // (PLL,0x02,0x02), last (SRAM_CTRL,0,SRAM_DIS=0x02).
+    if m.xtal_cmds.len() != 16 {
+        return TestResult::Fail("tail must issue exactly 16 XTAL-SI writes");
     }
     let first = m.xtal_cmds[0];
     if first != 0xE0 | (0x02 << 8) | (0x02 << 16) | (1 << 31) {
         return TestResult::Fail("first XTAL-SI write must be (PLL,0x02,0x02)");
     }
-    let last = m.xtal_cmds[16];
+    let last = m.xtal_cmds[15];
     if last != 0xA1 | (0x02 << 16) | (1 << 31) {
         return TestResult::Fail("last XTAL-SI write must be (SRAM_CTRL,0,0x02)");
     }

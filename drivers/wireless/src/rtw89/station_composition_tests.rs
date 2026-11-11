@@ -416,6 +416,8 @@ struct DriverModel {
     /// Admitted primaries mask and every native retune actually requested.
     channels: u64,
     retunes: Vec<u8>,
+    /// The tuned primary is a 5GHz one (band floor OFDM6 instead of CCK1).
+    tuned_5ghz: bool,
     /// Admitted wide profiles and every wide retune actually requested.
     wide: Vec<crate::rtw89::operating_channel::Profile>,
     wide_retunes: Vec<crate::rtw89::operating_channel::Profile>,
@@ -486,6 +488,7 @@ impl DriverModel {
             reclaimed: None,
             channels: NEXT_CHANNELS.swap(0, Ordering::AcqRel) | (1 << 1),
             retunes: Vec::new(),
+            tuned_5ghz: false,
             wide: core::mem::take(&mut *NEXT_WIDE.lock()),
             wide_retunes: Vec::new(),
             switches: Vec::new(),
@@ -558,6 +561,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
             return Err(crate::rtw89::power::Error::Busy);
         }
         self.retunes.push(primary);
+        self.tuned_5ghz = primary > 14;
         Ok(self.retunes.len() as u32 + 1)
     }
     fn station_wide_channels(
@@ -583,6 +587,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
             core.set_operating_width(profile.width() as u8, profile.is_5ghz());
         }
         self.wide_retunes.push(profile);
+        self.tuned_5ghz = profile.is_5ghz();
         Ok(self.wide_retunes.len() as u32 + 1000)
     }
     /// Associated channel switch model: same refusals as the native owner
@@ -600,6 +605,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
             return Err(crate::rtw89::power::Error::Busy);
         }
         self.switches.push(primary);
+        self.tuned_5ghz = primary > 14;
         Ok(self.retunes.len() as u32 + self.switches.len() as u32 + 1)
     }
     /// Associated wide channel switch model: same refusals as the
@@ -617,6 +623,7 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
             return Err(crate::rtw89::power::Error::Busy);
         }
         self.wide_switches.push(profile);
+        self.tuned_5ghz = profile.is_5ghz();
         Ok(self.retunes.len() as u32 + self.wide_switches.len() as u32 + 1)
     }
     fn station_sleep_capable(&mut self) -> Result<bool, crate::rtw89::power::Error> {
@@ -961,7 +968,18 @@ unsafe impl crate::rtw89::station::Io for DriverModel {
         report: bool,
         rate: u8,
     ) -> Result<u64, crate::rtw89::packet_core::Error> {
-        if rate != 0 && !self.wmm
+        // As `NativeStation::submit_packet_rate`: the band floor (core.c
+        // `rtw89_core_get_mgmt_rate`: CCK1 / OFDM6) needs no WMM program,
+        // and no fixed rate below it is published.
+        let lowest = if self.tuned_5ghz {
+            crate::rtw89::packet_format::OFDM6
+        } else {
+            0
+        };
+        let fixed = rate
+            & !(crate::rtw89::packet_format::FIRMWARE_RA | crate::rtw89::packet_format::DATA_ER);
+        if rate & crate::rtw89::packet_format::FIRMWARE_RA == 0 && fixed < lowest
+            || rate != lowest && !self.wmm
             || rate & crate::rtw89::packet_format::FIRMWARE_RA != 0 && !self.firmware_ra
         {
             return Err(crate::rtw89::packet_core::Error::Access);

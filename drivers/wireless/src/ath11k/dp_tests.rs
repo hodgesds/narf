@@ -40,14 +40,14 @@ macro_rules! check {
 
 // ── physical memory (the device side of DMA) ──────────────────────
 
-fn phys_rd32(pa: u64) -> u32 {
+pub(super) fn phys_rd32(pa: u64) -> u32 {
     // SAFETY: `pa` lies inside a live DMA32 coherent buffer the DP / HAL
     // under test allocated and owns (ring, pointer area or posted buffer);
     // the kernel direct map covers it and it is 4-byte aligned.
     unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(pa).kernel_ptr::<u32>()) }
 }
 
-fn phys_wr32(pa: u64, v: u32) {
+pub(super) fn phys_wr32(pa: u64, v: u32) {
     // SAFETY: as `phys_rd32`; the model only writes words the hardware
     // owns (ring entries it produces, its pointer, posted buffers).
     unsafe { core::ptr::write_volatile(narf_memory::PhysAddr::new(pa).kernel_mut_ptr::<u32>(), v) }
@@ -65,7 +65,7 @@ fn phys_read(pa: u64, out: &mut [u8]) {
     }
 }
 
-fn phys_write(pa: u64, src: &[u8]) {
+pub(super) fn phys_write(pa: u64, src: &[u8]) {
     // SAFETY: `pa` is a posted RX buffer (2048 bytes, callers write at
     // most that) or a link descriptor the model took from the idle list.
     unsafe {
@@ -99,7 +99,7 @@ enum HostPtr {
 /// One ring as the hardware sees it. `idx` is the device's pointer
 /// (TP of a SRC ring, HP of a DST ring), in words.
 #[derive(Copy, Clone, Debug)]
-struct DevRing {
+pub(super) struct DevRing {
     base: u64,
     size: u32,
     esz: u32,
@@ -123,7 +123,7 @@ impl DevRing {
     }
 
     /// DST ring: write one entry (fails when the ring is full).
-    fn produce(&mut self, io: &RecIo, w: &[u32]) -> bool {
+    pub(super) fn produce(&mut self, io: &RecIo, w: &[u32]) -> bool {
         let tp = self.host(io);
         if (self.idx + self.esz) % self.size == tp {
             return false;
@@ -137,7 +137,7 @@ impl DevRing {
     }
 
     /// SRC ring: take one entry the host posted.
-    fn consume(&mut self, io: &RecIo) -> Option<Vec<u32>> {
+    pub(super) fn consume(&mut self, io: &RecIo) -> Option<Vec<u32>> {
         if self.idx == self.host(io) {
             return None;
         }
@@ -150,11 +150,17 @@ impl DevRing {
     }
 
     /// Entries the host posted that the device has not consumed.
-    fn pending(&self, io: &RecIo) -> u32 {
+    pub(super) fn pending(&self, io: &RecIo) -> u32 {
         (self.host(io) + self.size - self.idx) % self.size / self.esz
     }
 
-    fn entry(&self, i: u32) -> Vec<u32> {
+    /// DST ring: entries the device produced that the host has not
+    /// consumed (HP − TP; [`Self::pending`] is the SRC-ring direction).
+    pub(super) fn unread(&self, io: &RecIo) -> u32 {
+        (self.idx + self.size - self.host(io)) % self.size / self.esz
+    }
+
+    pub(super) fn entry(&self, i: u32) -> Vec<u32> {
         (0..self.esz)
             .map(|k| phys_rd32(self.base + ((i * self.esz + k) as u64) * 4))
             .collect()
@@ -198,7 +204,7 @@ fn msg_word(m: &[u8], i: usize) -> u32 {
 /// An LMAC ring from its HTT SRING_SETUP message: SW→HW rings have the
 /// host HP at `ring_head_off32_remote_addr`, HW→SW rings the host TP at
 /// `ring_tail_off32_remote_addr`.
-fn lmac(m: &[u8]) -> DevRing {
+pub(super) fn lmac(m: &[u8]) -> DevRing {
     let info0 = msg_word(m, 0);
     let info1 = msg_word(m, 3);
     let hp = msg_word(m, 4) as u64 | ((msg_word(m, 5) as u64) << 32);
@@ -267,17 +273,17 @@ pub(super) const SMALL: DpRingSizes = DpRingSizes {
     n_link_desc: Some(64),
 };
 
-struct Rig {
-    hal: Hal,
-    io: RecIo,
-    dp: Dp,
-    msgs: Vec<Vec<u8>>,
+pub(super) struct Rig {
+    pub(super) hal: Hal,
+    pub(super) io: RecIo,
+    pub(super) dp: Dp,
+    pub(super) msgs: Vec<Vec<u8>>,
 }
 
 fn rig(sizes: DpRingSizes) -> Rig {
     rig_for_rev(sizes, HwRev::Wcn6855Hw21)
 }
-fn rig_for_rev(sizes: DpRingSizes, rev: HwRev) -> Rig {
+pub(super) fn rig_for_rev(sizes: DpRingSizes, rev: HwRev) -> Rig {
     let cfg = DpHwParams::for_rev(rev).expect("complete DP params");
     let mut hal = Hal::new(&cfg.hw).expect("hal");
     let io = RecIo::default();
@@ -3382,11 +3388,16 @@ fn smoke_ath11k_dp_service_multi_pdev() -> TestResult {
     check!(ids(&dp, 0).len() == 15, "pdev 0 refill posted");
     check!(ids(&dp, 1).len() == 15, "pdev 1 refill posted");
 
-    // RXDMA error on pdev 1's own error ring: one link descriptor
-    // naming a posted pdev-1 buffer cookie (PDEV_ID 1). The freed
-    // buffer must come back to pdev 1's refill ring, not pdev 0's.
-    let refill1 = msg_for(&msgs1, &hal, refill_id);
-    let (_, cookie, _) = buf_addr_get(refill1.entry(0)[0], refill1.entry(0)[1]);
+    // RXDMA error on pdev 1's own error ring: the device takes a posted
+    // pdev-1 buffer off the refill ring (moving its TP, as RXDMA does
+    // before it can name the buffer in an error) and reports it in one
+    // link descriptor (cookie PDEV_ID 1). The freed buffer must come
+    // back to pdev 1's refill ring, not pdev 0's: the replenish only
+    // has room because the device consumed the slot
+    // (`ath11k_hal_srng_src_num_free` syncs the HW TP).
+    let mut refill1 = msg_for(&msgs1, &hal, refill_id);
+    let w = refill1.consume(&io).expect("posted pdev 1 buffer");
+    let (_, cookie, _) = buf_addr_get(w[0], w[1]);
     let buf0 = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, cookie);
     check!(
         field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, cookie) == 1,
@@ -3417,11 +3428,14 @@ fn smoke_ath11k_dp_service_multi_pdev() -> TestResult {
         "the freed id is the reposted one"
     );
 
-    // Same buf_id on both radios resolves independently: distinct
-    // patterns written into each radio's first buffer must come back
+    // Same buf_id on both radios resolves independently: the device
+    // takes pdev 1's next posted buffer, pdev 0 holds the same id;
+    // distinct patterns written into each radio's buffer must come back
     // from that radio's take, and the sibling's buffer must survive.
-    let id0 = ids(&dp, 0)[0];
-    let id1 = ids(&dp, 1)[0];
+    let w = refill1.consume(&io).expect("next posted pdev 1 buffer");
+    let id1 = field_get(DP_RXDMA_BUF_COOKIE_BUF_ID, buf_addr_get(w[0], w[1]).1);
+    let id0 = id1;
+    check!(ids(&dp, 0).contains(&id0), "pdev 0 holds the same buf_id");
     let p0 = dp.pdevs().find(|p| p.mac_id == 0).expect("pdev 0");
     p0.rx_refill_buf_ring
         .bufs
@@ -3463,12 +3477,17 @@ fn smoke_ath11k_dp_service_multi_pdev() -> TestResult {
     let b = mon.consume(&io).unwrap();
     phys_wr32(buf_addr_get(a[0], a[1]).0, 0x140 << 1); // HAL_RX_STATUS_BUFFER_DONE
     phys_wr32(buf_addr_get(b[0], b[1]).0, 0);
-    let hp_before = hal.srng(mon_id).expect("mon ring").hp;
+    let (hp_before, ring_size) = hal
+        .srng(mon_id)
+        .map(|s| (s.hp, s.ring_size))
+        .expect("mon ring");
     let mut budget = 8;
     let n = dp.reap_mon_status_for(&mut hal, &io, 1, 0, &mut budget);
     check!(n == 2, "two slots refilled");
     check!(dp.stats.mon_status_reaped == 1, "one DONE buffer");
-    for off in [hp_before, hp_before + mon.esz] {
+    // The two refilled slots are HP and the one after it, which wraps
+    // to slot 0 when HP is the ring's last entry (7 of 8 posted).
+    for off in [hp_before, (hp_before + mon.esz) % ring_size] {
         let cookie = field_get(BUFFER_ADDR_INFO1_SW_COOKIE, hal.desc_rd(mon_id, off, 1));
         check!(
             field_get(DP_RXDMA_BUF_COOKIE_PDEV_ID, cookie) == 1,

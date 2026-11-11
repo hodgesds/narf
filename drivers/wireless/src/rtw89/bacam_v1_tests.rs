@@ -85,7 +85,8 @@ fn smoke_rtw89_bacam_v1_slots() -> TestResult {
     }
     // Fill the map, then: non-0/5 TID fails, TID 0 evicts the
     // lowest non-0/5 entry (idx 0 holds TID 1 after the fill).
-    for _ in 2..24 {
+    // Slot 1 holds TID 7, so 23 acquisitions fill the other slots.
+    for _ in 0..23 {
         if map.acquire(1).is_err() {
             return TestResult::Fail("bacam fill");
         }

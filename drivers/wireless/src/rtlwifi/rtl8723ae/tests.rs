@@ -688,8 +688,16 @@ kernel_test_in!(
     smoke_rtl8723ae_coex_wifi_state_and_rssi
 );
 
-/// `hal_bt_coexist.c` DM register writes: AGC `0xc78` tables, BB
-/// back-off `0xc04`, balance H2C `0x0c`, and idempotent all-off.
+/// LSSI write word `rtl8723_phy_rf_serial_write` puts on `0x840`
+/// (`RF90_PATH_A` `rf3wire_offset`).
+fn lssi_a(reg: u32, value: u32) -> (u16, u32, u8) {
+    (0x840, ((reg << 20) | (value & 0xfffff)) & 0x0fff_ffff, 4)
+}
+
+/// `hal_bt_coexist.c` DM register writes: AGC tables (all five dwords
+/// through the single `0xc78` port, then the RF half — `RF_RX_AGC_HP`
+/// x4 and `RF_RX_G1` on path A via LSSI `0x840`), BB back-off `0xc04`,
+/// balance H2C `0x0c`, and idempotent all-off.
 fn smoke_rtl8723ae_coex_dm_registers() -> TestResult {
     use coex::*;
     let io = fw_fake(false, false, false, false);
@@ -699,15 +707,20 @@ fn smoke_rtl8723ae_coex_dm_registers() -> TestResult {
     }
     {
         let g = io.0.lock();
-        if g.writes[..5]
+        if g.writes[..10]
             != [
                 (REG_AGC_TABLE, 0x641c0001, 4),
-                (REG_AGC_TABLE + 4, 0x631d0001, 4),
-                (REG_AGC_TABLE + 8, 0x621e0001, 4),
-                (REG_AGC_TABLE + 12, 0x611f0001, 4),
-                (REG_AGC_TABLE + 16, 0x60200001, 4),
+                (REG_AGC_TABLE, 0x631d0001, 4),
+                (REG_AGC_TABLE, 0x621e0001, 4),
+                (REG_AGC_TABLE, 0x611f0001, 4),
+                (REG_AGC_TABLE, 0x60200001, 4),
+                lssi_a(0x12, 0x32000),
+                lssi_a(0x12, 0x71000),
+                lssi_a(0x12, 0xb0000),
+                lssi_a(0x12, 0xfc000),
+                lssi_a(0x1a, 0x30355),
             ]
-            || g.writes[5] != (REG_BB_BACKOFF, BB_BACKOFF_OFF, 4)
+            || g.writes[10] != (REG_BB_BACKOFF, BB_BACKOFF_OFF, 4)
         {
             return TestResult::Fail("8723AE coex off table bytes");
         }
@@ -715,20 +728,25 @@ fn smoke_rtl8723ae_coex_dm_registers() -> TestResult {
     if owner.agc_table(&io, true).is_err() || owner.bb_back_off(&io, true).is_err() {
         return TestResult::Fail("8723AE coex on writes");
     }
-    if !owner.agc_rf_pending {
-        return TestResult::Fail("8723AE coex RF half recorded");
+    if !owner.agc_on {
+        return TestResult::Fail("8723AE coex agc on recorded");
     }
     {
         let g = io.0.lock();
-        if g.writes[6..11]
+        if g.writes[11..21]
             != [
                 (REG_AGC_TABLE, 0x4e1c0001, 4),
-                (REG_AGC_TABLE + 4, 0x4d1d0001, 4),
-                (REG_AGC_TABLE + 8, 0x4c1e0001, 4),
-                (REG_AGC_TABLE + 12, 0x4b1f0001, 4),
-                (REG_AGC_TABLE + 16, 0x4a200001, 4),
+                (REG_AGC_TABLE, 0x4d1d0001, 4),
+                (REG_AGC_TABLE, 0x4c1e0001, 4),
+                (REG_AGC_TABLE, 0x4b1f0001, 4),
+                (REG_AGC_TABLE, 0x4a200001, 4),
+                lssi_a(0x12, 0xdc000),
+                lssi_a(0x12, 0x90000),
+                lssi_a(0x12, 0x51000),
+                lssi_a(0x12, 0x12000),
+                lssi_a(0x1a, 0x00355),
             ]
-            || g.writes[11] != (REG_BB_BACKOFF, BB_BACKOFF_ON, 4)
+            || g.writes[21] != (REG_BB_BACKOFF, BB_BACKOFF_ON, 4)
         {
             return TestResult::Fail("8723AE coex on table bytes");
         }
@@ -744,7 +762,7 @@ fn smoke_rtl8723ae_coex_dm_registers() -> TestResult {
     }
     {
         let g = io.0.lock();
-        if g.writes[12..]
+        if g.writes[22..]
             != [
                 (REG_HMEBOX_0, u32::from(H2C_BALANCE), 1),
                 (REG_HMEBOX_0 + 1, 0x10, 1),
@@ -765,7 +783,7 @@ fn smoke_rtl8723ae_coex_dm_registers() -> TestResult {
         return TestResult::Fail("8723AE coex all-off flags");
     }
     let after = io.0.lock().writes.len();
-    if after - before != 6 {
+    if after - before != 11 {
         return TestResult::Fail("8723AE coex all-off sw subset writes");
     }
     if owner.coex_all_off(&io).is_err() || io.0.lock().writes.len() != after {
@@ -1212,10 +1230,10 @@ kernel_test_in!(
 // ── shared bt_coexistence mechanism trees (`dm.rs`) ────────────────────
 
 /// Reconstruct H2C fills from a `FwFake` write log. Each fill is
-/// `(command id, payload bytes)`: the box content bytes after the id,
-/// followed by the extension bytes written immediately before the box
-/// content (empty for payloads of three bytes or fewer; short payloads
-/// pad the content to three bytes with zeros, matching the box image).
+/// `(command id, payload bytes)` in command order: for a BIT(7) id the
+/// two extension bytes written immediately before the box, then the box
+/// content bytes after the id (short payloads pad the content to three
+/// bytes with zeros, matching the box image).
 /// Box rotation is irrelevant: fills are detected by box-base writes.
 fn dm_h2c_fills(writes: &[(u16, u32, u8)]) -> Vec<(u8, Vec<u8>)> {
     let mut fills = Vec::new();
@@ -1223,30 +1241,25 @@ fn dm_h2c_fills(writes: &[(u16, u32, u8)]) -> Vec<(u8, Vec<u8>)> {
     while i < writes.len() {
         let (reg, value, _) = writes[i];
         if (0x01d0..0x01e0).contains(&reg) && (reg - 0x01d0) % 4 == 0 {
-            let boxnum = usize::from(reg - 0x01d0) / 4;
-            let ext_base = 0x01f0u16 + (boxnum as u16) * 4;
-            // Extension bytes sit consecutively immediately before the
-            // box content; collect them backward, then reverse.
-            let mut ext_rev = Vec::new();
-            let mut j = i;
-            while j > 0 {
-                let (preg, pvalue, _) = writes[j - 1];
-                if (ext_base..ext_base + 4).contains(&preg) {
-                    ext_rev.push(pvalue as u8);
-                    j -= 1;
-                } else {
-                    break;
+            // `_rtl8723e_fill_h2c_command`: BIT(7) marks a 4/5-byte
+            // command whose first two bytes were written to the two-byte
+            // extension register `0x88 + 2 * box` just before the box.
+            let boxnum = (reg - 0x01d0) / 4;
+            let ext_base = 0x0088u16 + boxnum * 2;
+            let mut payload = Vec::new();
+            if value & 0x80 != 0 && i >= 2 {
+                for (preg, pvalue, _) in &writes[i - 2..i] {
+                    if (ext_base..ext_base + 2).contains(preg) {
+                        payload.push(*pvalue as u8);
+                    }
                 }
             }
-            ext_rev.reverse();
-            let mut payload = Vec::new();
             for t in 1..4 {
                 if i + t < writes.len() {
                     payload.push(writes[i + t].1 as u8);
                 }
             }
-            payload.extend_from_slice(&ext_rev);
-            fills.push((value as u8, payload));
+            fills.push(((value & 0x7f) as u8, payload));
             i += 4;
         } else {
             i += 1;
@@ -1264,19 +1277,23 @@ fn dm_find(fills: &[(u8, Vec<u8>)], id: u8) -> Option<&[u8]> {
 }
 
 /// `hal_btc.c` mechanism init + BT-info query: init zeroes the state,
-/// writes `0x76e = 0x04`, `0x778 = 0x03`, PTA on, and flags the owed RF
-/// origin reads; second init is silent; the query sends H2C `0x38
+/// reads the RF origins (`RF_RCK1` full mask, `RF_RCK2` `0xf0`) through
+/// the path-A LSSI readback, writes `0x76e = 0x04`, `0x778 = 0x03`, PTA
+/// on; second init is silent; the query sends H2C `0x38
 /// [0x01]` and marks the request sent.
 fn smoke_rtl8723ae_dm_mech_init_and_query() -> TestResult {
     use coex::*;
     use dm::*;
     let io = fw_fake(false, false, false, false);
+    // Path-A LSSI readback (`0x8a0`; `0x820` BIT(8) clear = SI mode).
+    io.0.lock().regs[0x8a0..0x8a4].copy_from_slice(&0x0001_2345u32.to_le_bytes());
     let mut owner = Owner::bind(&coex_bt());
-    if owner.mech_init(&io).is_err() {
+    if narf_scheduler::block_on(owner.mech_init(&io)).is_err() {
         return TestResult::Fail("8723AE dm mech_init error");
     }
     if !owner.mech_init_set
-        || !owner.lpf_rf_pending
+        || owner.rf_origin_1e != Some(0x12345)
+        || owner.rf_origin_1f != Some(0x4)
         || owner.cstate != 0
         || owner.saved_btdm != Btdm::default()
     {
@@ -1293,7 +1310,8 @@ fn smoke_rtl8723ae_dm_mech_init_and_query() -> TestResult {
         }
     }
     let before = io.0.lock().writes.len();
-    if owner.mech_init(&io).is_err() || io.0.lock().writes.len() != before {
+    if narf_scheduler::block_on(owner.mech_init(&io)).is_err() || io.0.lock().writes.len() != before
+    {
         return TestResult::Fail("8723AE dm mech_init idempotent");
     }
     if narf_scheduler::block_on(owner.query_bt_information(&io)).is_err() || !owner.req_sent {
@@ -1907,13 +1925,14 @@ fn smoke_rtl8723ae_dm_all_off_sequences() -> TestResult {
     }
     {
         let g = io.0.lock();
-        if g.writes[..5]
+        if g.writes[..6]
             != [
                 (REG_AGC_TABLE, 0x641c0001, 4),
-                (REG_AGC_TABLE + 4, 0x631d0001, 4),
-                (REG_AGC_TABLE + 8, 0x621e0001, 4),
-                (REG_AGC_TABLE + 12, 0x611f0001, 4),
-                (REG_AGC_TABLE + 16, 0x60200001, 4),
+                (REG_AGC_TABLE, 0x631d0001, 4),
+                (REG_AGC_TABLE, 0x621e0001, 4),
+                (REG_AGC_TABLE, 0x611f0001, 4),
+                (REG_AGC_TABLE, 0x60200001, 4),
+                lssi_a(0x12, 0x32000),
             ]
             || !g.writes.contains(&(REG_BB_BACKOFF, BB_BACKOFF_OFF, 4))
             || !g.writes.contains(&(0x4fd, 0x05, 1))
@@ -1921,6 +1940,22 @@ fn smoke_rtl8723ae_dm_all_off_sequences() -> TestResult {
         {
             return TestResult::Fail("8723AE dm all_off_sw writes");
         }
+        // No origin captured yet: the LPF resume writes nothing to RF 0x1e.
+        if g.writes.iter().any(|w| w.0 == 0x840 && (w.1 >> 20) == 0x1e) {
+            return TestResult::Fail("8723AE dm LPF resume before origin");
+        }
+    }
+    // LPF corner: shrink writes RF 0x1e = 0xf0ff7; resume restores the
+    // origin captured by mech_init.
+    owner.rf_origin_1e = Some(0x0abcd);
+    owner.sw_all_off = true;
+    let before = io.0.lock().writes.len();
+    if owner.set_sw_rf_rx_lpf_corner(&io, true).is_err()
+        || owner.sw_all_off
+        || owner.set_sw_rf_rx_lpf_corner(&io, false).is_err()
+        || io.0.lock().writes[before..] != [lssi_a(0x1e, 0xf0ff7), lssi_a(0x1e, 0x0abcd)]
+    {
+        return TestResult::Fail("8723AE dm LPF corner RF writes");
     }
     // HW: table 0x5a5aaaaa/0xcc/0x3 + PTA on (Linux's HW all-off
     // leaves PTA enabled).

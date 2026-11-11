@@ -857,8 +857,10 @@ fn smoke_rtw89_completion_8922a_rxq_ppdu() -> TestResult {
         Err(why) => return TestResult::Fail(why),
     };
     // PPDU status, phy report present (phy_rpt_sz 1): the 8-byte
-    // report follows the RXD and carries RSSI 0x123 in dword0.
-    let report = [0x12u8, 0x34, 0x56, 0x78, 0, 0, 0, 0];
+    // report follows the RXD and carries RSSI 0x123 in dword0
+    // bits 11:0 (`BE_RXD_PHY_RSSI`, txrx.h); the bits above the
+    // field must be masked off.
+    let report = [0x23u8, 0xF1, 0x56, 0x78, 0, 0, 0, 0];
     let body: Vec<u8> = (0..16u8).collect();
     let mut content = rxd(1, 16, 0, 0, 0, 1, 3, 0, 0, 0, 0, false);
     content.extend_from_slice(&report);
@@ -1011,4 +1013,80 @@ fn smoke_rtw89_completion_8922a_budget_and_wrap() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_completion_8922a_budget_and_wrap
+);
+
+/// CH12 TXBD-consumption release (`rtw89_pci_reclaim_tx_fwcmd` +
+/// `rtw89_pci_release_fwcmd`, `pci.c:100..144`): consumed buffers
+/// move to the release queue, all but the last `RTW89_PCI_MULTITAG`
+/// (8, `pci.h:1131`) are freed, an ack-held H2C marker frees nothing,
+/// an RP past the in-flight window is refused without moving state,
+/// and a ring reset releases everything (`release_all`).
+fn smoke_rtw89_8922a_fwcmd_consumption_release() -> TestResult {
+    let (mut owner, mut regs) = match programmed_owner(256) {
+        Ok(pair) => pair,
+        Err(why) => return TestResult::Fail(why),
+    };
+    let ch12_idx = super::dma::BE_DMA_ADDR_SET.tx[12].idx as u32;
+    let mut bd = vec![TxBd::default(); 256];
+    // 9 FWDL-style buffers then one ack-held H2C marker.
+    for i in 0..10u16 {
+        let buf = match alloc_coherent_masked(64, DomainId::DRIVER_0, BUFFER_DMA_MASK) {
+            Ok(buf) => buf,
+            Err(_) => return TestResult::Fail("CH12 buffer alloc failed"),
+        };
+        let prepared = match owner.prepare_h2c(&mut bd, buf.dma_addr().raw(), 64) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("prepare_h2c refused"),
+        };
+        if prepared.slot != i {
+            return TestResult::Fail("CH12 slots must advance in order");
+        }
+        owner.retain_fwcmd(if i < 9 { Some(buf) } else { None });
+        if owner.kick_h2c(&mut regs, &prepared).is_err() {
+            return TestResult::Fail("kick_h2c refused");
+        }
+    }
+    if owner.fwcmd_held() != (10, 0) {
+        return TestResult::Fail("ten CH12 entries must be in flight");
+    }
+    // Chip consumed 4: four buffers released into the multi-tag window.
+    regs.set_idx(ch12_idx, 4, 10);
+    match owner.reclaim_fwcmd(&mut regs) {
+        Ok(avail) if avail == 256 - 1 - 6 => {}
+        _ => return TestResult::Fail("avail after consuming 4 must be 249"),
+    }
+    if owner.fwcmd_held() != (6, 4) {
+        return TestResult::Fail("4 consumed buffers stay inside the multi-tag window");
+    }
+    // Chip consumed all 10: 9 owned buffers consumed, 8 kept, 1 freed.
+    regs.set_idx(ch12_idx, 10, 10);
+    match owner.reclaim_fwcmd(&mut regs) {
+        Ok(255) => {}
+        _ => return TestResult::Fail("avail after consuming all must be 255"),
+    }
+    if owner.fwcmd_held() != (0, 8) {
+        return TestResult::Fail("release must keep exactly RTW89_PCI_MULTITAG buffers");
+    }
+    // An RP beyond the in-flight window is refused.
+    regs.set_idx(ch12_idx, 11, 10);
+    if owner.reclaim_fwcmd(&mut regs).is_ok() {
+        return TestResult::Fail("RP past the in-flight window must be refused");
+    }
+    // Ring reset releases everything.
+    let tx_phys: [u64; TXCH_NUM] = core::array::from_fn(|i| 0x1_0000 + (i as u64) * 0x800);
+    let rx_phys: [u64; 2] = [0x2_0000, 0x2_1000];
+    if owner
+        .program_rings(&mut regs, &tx_phys, &rx_phys, 256, 256)
+        .is_err()
+    {
+        return TestResult::Fail("re-program refused");
+    }
+    if owner.fwcmd_held() != (0, 0) {
+        return TestResult::Fail("ring reset must release every CH12 buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_fwcmd_consumption_release
 );

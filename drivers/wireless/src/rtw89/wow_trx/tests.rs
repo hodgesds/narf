@@ -36,7 +36,9 @@ impl Model {
         set(HW_RPT_FWD, AWAKE_RPT);
         set(ACTION_FWD0, 0x02a9_5a95);
         set(TF_FWD, 0x0000_aa55);
-        set(DLE_EMPTY0, u32::MAX);
+        // Every `mac_is_txq_empty_ax` quota bit set. Not all-ones: an
+        // all-ones read is a removed device, which `Access::read` refuses.
+        set(DLE_EMPTY0, DLE_EMPTY_MASK);
         Self {
             words,
             halves: Vec::new(),

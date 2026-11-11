@@ -22,7 +22,8 @@ Other AX/BE profiles retain their parked diagnostic power/identity path.
 
 ## 3. Public interface
 
-For `10ec:b852`/`10ec:b85b`, `pci::probe` reserves its exact BDF before parking
+For the retained-bootstrap IDs (`rtw89::bootstrap_did`: `10ec:b852`/`10ec:b85b`,
+`10ec:c852` and `10ec:b851`), `pci::probe` reserves its exact BDF before parking
 and retains the actual reset owner before its first await. Generic binding
 requires an advertised, completed FLR and its consumed temporal fence. A
 repeat same-function probe performs no config access, including during reset
@@ -31,6 +32,8 @@ platform entry: the caller must independently prove actual function/slot reset,
 posted-traffic drainage and no DMA ownership since, and call before generic
 binding. Static board facts and BME-off cannot satisfy that temporal contract.
 Neither path can replace an existing reserved owner.
+`pci::register_pci_driver` registers `bootstrap::remove` for the same ID set;
+the A and 8922A IDs stay on the parked diagnostic probe.
 
 `Bootstrap` retains the same `Startup` inside `Arc<Lifecycle>` before discovery.
 `Startup::discover` earns the actual factory identity with BME off. One named
@@ -69,6 +72,11 @@ requested decoding fails before BAR mapping. Bus mastering remains disabled
 on success and every later error; identity and ring allocation do not authorize
 DMA. A repeat probe of the retained bus address returns without configuration access; a distinct additional singleton match parks only its own PCI function. Re-enabling
 BME requires the composed owned cold/firmware-download and packet/ring/reset owners.
+The one such owner today is the RTL8922A boot: `Rtw89Device::boot_8922a` sets
+`BUS_MASTER` through `rtw88::pci_park::master` (readback must show BME +
+MEM + INTx-off; Linux `rtw89_pci_claim_device` -> `pci_set_master`) before
+its ring programming and CH12 firmware download, and `bring_up_registers`
+re-parks the function (`pci_park::park`) when that boot fails.
 The complete diagnostic mapping/power/identity operation runs within actual
 capability invocation. It retains unpublished storage, with no ring base/index
 publication, enabled MSI-X delivery, RX pump or network-interface registration.
@@ -151,8 +159,67 @@ exposes it to the future download owner. The plan runs once per
 firmware download, never on a packet path (perf class (a): no hot path).
 No missing policy or signature falls back to an unsecured transfer.
 
+**RTL8922A firmware-download preparation (`fwdl_be.rs`, fixture-tested;
+run from `pci::bring_up` by `Rtw89Device::boot_8922a`, which 0x8922 does not
+reach yet — `bootstrap_did` still excludes it).** The BE register programs between power-on and
+the first FWHDR_DL: `mac_func_en` (`mac_be.c:934 mac_func_en_be`, per-band
+CMAC power/function enable), `partial_init` (`mac.c:4307
+rtw89_mac_partial_init` up to the hci hook: HCI DMA TRX enable,
+`rtw8922a_bb_preinit(PHY_0)` + BB-MCU CR init through the 0x30000 window,
+`hci_func_en_be`, `dmac_func_pre_en_be`, `rtw89_mac_dle_init(DLFW, SCC)`
+with the `rtw8922a_dle_mem_pcie` DLFW table and its FIFO-size check, and
+the h2c-only `rtw89_mac_hfc_init`), `fwdl_preconfig`, `disable_cpu`,
+`enable_wcpu` (`set_cpu_en` + `wcpu_on`, BBMCU0 included since
+`bbmcu_nr = 1`), and the status reads `check_path_ready` /
+`fwdl_status` / `check_ready` (`fwdl_status_map`, `rtw89_fw_check_rdy`).
+`R_BE_SECURE_BOOT_MALLOC_INFO_8922A` is the `rtw89_fw_download_suit`
+constant. The BE PCIe FWCMD TX descriptor (`h2c_desc_size` = 24-byte
+`rtw89_rxdesc_short_v2`, dword0 = packet length | `RPKT_TYPE`
+H2C(13)/FWDL(14), `pci.c rtw89_pci_fwcmd_submit`) is
+`fwcmd_8922a::fwcmd_txdesc`, and `pci::submit_be_h2c` now prepends it
+(it previously sent the framed H2C without one). CH12 now mirrors
+`rtw89_h2c_tx` / `rtw89_pci_fwcmd_submit` / `rtw89_pci_release_fwcmd`:
+every submit first reclaims (`Prepared8922a::reclaim_fwcmd` reads the CH12
+hardware RP, `rtw89_pci_dma_recalc`; an RP past the in-flight window is
+refused) and is refused with no free TXBD (-ENOSPC); kicked buffers queue in
+TXBD order; consumed FWDL header/section buffers (`pci::submit_be_fwdl`,
+RPKT type H2C for FWHDR_DL, FWDL for sections — no ack exists for them) are
+freed beyond the 8-deep `RTW89_PCI_MULTITAG` window; ack-held H2C buffers
+stay with `release_h2c_by_ack`; `program_rings` (the `rtw89_pci_ops_reset`
+point) resets the CH12 host index and releases everything. The BE plan
+segments by the header's `FW_HDR_V1_W7_PART_SIZE` (`fw.c:465`; AX keeps
+2020; zero or a part the 14-bit FWCMD `RPKT_LEN` cannot carry is refused,
+and a secure single-packet section must fit it), and the BBMCU0 suit is
+the firmware element id 0 behind the MFW images
+(`PreparedFirmware::bbmcu` / `fwdl::find_bbmcu`, `fw.c:1542` +
+`__rtw89_fw_recognize_from_elm`: first element with `cv` <= cut, no AID
+filter, contents after the 32-byte header). The sequence is
+`fwdl_be::download` / `download_once` / `download_suit` (`fw.c:1701..2025`
+`rtw89_fw_download` ×5 retries / `__rtw89_fw_download` /
+`rtw89_fw_download_suit`): disable CPU, WCPU enable in download mode with
+BBMCU0, per suit (NORMAL then BBMCU0) the 8922A `SECURE_BOOT_MALLOC_INFO`
+word (NORMAL only), H2C path ready, FWHDR_DL (seq 0, RPKT H2C), DLFW path
+ready, HALT H2C/C2H control clear, sections in part-size FWDL packets, the
+suit's WCPU/BB0 ready check, then `mdelay(5)` and FreeRTOS ready. The BE
+IDMEM share-mode write is skipped (`mac_be.c:3301` hook is NULL). It runs
+over a `fwdl_be::Port`; production is `pci::FwdlPort` (BAR2 +
+`submit_be_fwdl`). It is synchronous like Linux's process-context download.
+`Rtw89Device::boot_8922a` (called at the end of `pci::bring_up` for 8922A)
+runs the `rtw89_core_start` prefix in Linux order: `mac_func_en`,
+`partial_init(include_bb)`, the hci `rtw89_pci_ops_mac_pre_init_be`
+(`pci_pre_init_8922a`: IO-recovery timers, power wake, DMA pre-init first
+half, `program_rings` as `rtw89_pci_ops_reset`, `dma_8922a::rst_bdram`,
+debounce / LDO low power / PCIe setting / SER setting by cut, then only CH12
+TX DMA on via `pre_init_dma_enable`), `fwdl_preconfig`, then the NORMAL suit
+from the trusted firmware registry and its BBMCU0 element through the
+fuse-selected plans. The outcome is recorded on the owner
+(`Prepared8922a::firmware_ready` / `firmware`) and is not fatal to the probe:
+nothing after the download (sys_init/trx_init, BB/RF, channel, RFK, TX power,
+C2H, RX, station control, interface) is wired yet.
+
 The plan couples v1 ignored-security descriptor compaction/count with the
-same payload selection, strips host dynamic bytes and sets part_size2020.
+same payload selection, strips host dynamic bytes and sets part_size 2020
+(AX) or keeps the header's part size (BE).
 B's secure v0 length960 override changes both descriptor and payload; ambiguous
 checksum-bearing overrides and v0 ignored-descriptor cases fail explicitly.
 Signatures replace bytes only in owned output, preserving the verified image.
@@ -3924,7 +3991,11 @@ Chip row `rtl8851b`. These owners are the chip-specific RTL8851B
 (`10ec:b851`, 1T1R AX, 2.4/5GHz, 20/40/80MHz) pieces under the retained
 B architecture, following the RTL8852C pattern above. The radio,
 ordinary-grant and station composition sections below compose them; RTL8852B
-and RTL8852C bytes are unchanged.
+and RTL8852C bytes are unchanged. `pci::probe`, `pci::attach_cold`, the FLR binding
+(`pci_reset::Binding`) and the PCI remove hook route `10ec:b851` to the
+retained bootstrap (`rtw89::bootstrap_did`), whose `advance` selects
+`prepare_radio_51` for an RTL8851B identity (case
+`smoke_rtw89_bootstrap_routes_8851be_with_b_and_c`).
 
 **Secure policy.** `Blacklist::upstream(Rtl8851B)` is Linux's exact policy:
 `rtw8851b_chip_info.fw_blacklist` is NULL, so fw.c
@@ -4580,7 +4651,7 @@ Each blocker below was re-checked against this tree.
 
 | Row | Concrete blocker |
 |---|---|
-| `eht` | EHT operation on RTL8922A is implemented, steps 1–2, fixture-tested. Step 1 (`eht.rs`): RFMOD table for 20/40/80/160MHz, SIFS value pairs (320MHz included), CFGCH bandwidth field (320MHz = code 4), BB bandwidth class, the EHT arms of `bb_postinit` and `cfg_rx_nss_limit`, the EHT RX CRC counter block, and the EHT operation profile (320MHz supported, max MPDU 7991). Step 2 (`eht.rs` `eht_cap`/`EhtStation`, `txrx_be::eht_info_fields`, commit e1286e402): EHT MCS/NSS capability maps mirroring `rtw89_init_eht_cap` (`core.c` @ 05441d6 — the sparse-clone reference supersedes the step-1 note that `core.c` was not in the local reference), the EHT station-owner facet, and the TXWD_INFO EHT fields (INFO4 SW_EHT_NLTF_SWITCH/NLTF, INFO7 UL_EHT_USR_PRES). The facet is composed by the 8922A station owner: `station_8922a.rs` admission (commit ee7239294) via `prepared_8922a.rs` `admit_station`, constructed at bring-up in `pci.rs`. Still absent (chip row, not this row): 8922A admission into the shared `station_control::Controller::new` (RTL8852B/C + 8851B only; the 8922A owner uses the BE path `efuse_be.rs`/`irq_be.rs` — the legacy `efuse.rs` still returns `UnsupportedChip` for 8922A and the AX `irq::Mask::config` still rejects the `_v2` layout) and the complete TXWD_INFO v2 transport fill (`tx_8922a.rs`). Grounded gaps, not oversights: no 320MHz RFMOD arm exists in `set_channel_mac` (`BE_WMAC_RFMOD_320M` is defined but unused in-reference); TX sub-carrier bitmaps need `rtw89_phy_get_txsb` (`phy.c`), not in the local reference. The shared `association::eht` API is not the gap. |
+| `eht` | EHT operation on RTL8922A is implemented, steps 1–2, fixture-tested. Step 1 (`eht.rs`): RFMOD table for 20/40/80/160MHz, SIFS value pairs (320MHz included), CFGCH bandwidth field (320MHz = code 4), BB bandwidth class, the EHT arms of `bb_postinit` and `cfg_rx_nss_limit`, the EHT RX CRC counter block, and the EHT operation profile (320MHz supported, max MPDU 7991). Step 2 (`eht.rs` `eht_cap`/`EhtStation`, `txrx_be::eht_info_fields`, commit e1286e402): EHT MCS/NSS capability maps mirroring `rtw89_init_eht_cap` (`core.c` @ 05441d6 — the sparse-clone reference supersedes the step-1 note that `core.c` was not in the local reference), the EHT station-owner facet, and the TXWD_INFO EHT fields (INFO4 SW_EHT_NLTF_SWITCH/NLTF, INFO7 UL_EHT_USR_PRES). The facet is composed by the 8922A station owner: `station_8922a.rs` admission (commit ee7239294) via `prepared_8922a.rs` `admit_station`, constructed at bring-up in `pci.rs`. Still absent (chip row, not this row): 8922A admission into the shared `station_control::Controller::new` (RTL8852B/C + 8851B only; the 8922A owner uses the BE path `efuse_be.rs`/`irq_be.rs` — the legacy `efuse.rs` still returns `UnsupportedChip` for 8922A and the AX `irq::Mask::config` still rejects the `_v2` layout) and the complete TXWD_INFO v2 transport fill (`tx_8922a.rs`). Step 3 (`eht.rs` `get_txsb`/`tx_sub_band_value`): `rtw89_phy_get_txsb` (`phy.c:875`, present in the linux-7.2 reference — the earlier "not in the local reference" note was stale) and the `R_BE_TX_SUB_BAND_VALUE` word of `rtw8922a_set_channel_mac` (TXSB20/40/80 + PRI20 bitmap), fixture-tested, no production caller (the 8922A channel program has no runtime owner). Grounded absence, not an oversight: no 320MHz RFMOD arm — `BE_WMAC_RFMOD_320M` has no user in `rtw8922a.c` or `rtw8922d.c`, and RTL8922A `support_bandwidths` stops at 160MHz (`rtw8922a.c:3209`), so 320MHz is neither programmed nor advertised. EHT capabilities stay unadvertised until the 8922A station path programs them. The shared `association::eht` API is not the gap. |
 | `aggregation` | Source complete for the admitted RTL8852B HT/HE20 owner; TX A-MSDU and A-MSDU-in-A-MPDU now use the separate current signed full-program companion, original FIFO prefix, peer/BA/current RC bounds and actual one-MPDU DMA/terminal ownership described in §3. Software/native/physical validation remains pending; other-chip runtimes stay on their separate chip rows. |
 
 | `he_htc` | Implemented in HE recipe revision2 above; six native/shared regressions pass on both architectures. Row closed2026-10-29. |
@@ -4639,6 +4710,6 @@ triage above remains separate from implementation.
 | `uapsd` | Station U-APSD is source-inapplicable (no IEEE80211_VIF_SUPPORTS_UAPSD). This row covers AP-side WIPHY_FLAG_AP_UAPSD only. The host PS/service-period owner (`ap_ps.rs`) and AP H2C wire (`ap_wire.rs`) exist (§3 "RTL8852B AP groundwork"), and the AP MAC/firmware control owner (`ap_control.rs`: port program, CAM, CMAC/DMAC tables, MACID pause, peer MACIDs, BCN_UPD, start/stop; §3 "RTL8852B AP MAC/firmware control owner") exist, but no native caller, signed AP channel/power admission, multi-peer TXWD/RX MACID path, HIQ/CH9 ring or public AP controls compose them. |
 | `wow` | Source layer only (`wow_wire.rs`, `prepared::load_wow`; section 3 "RTL8852B Wake-on-WLAN source layer"): no native TRX-halt/firmware-swap/security-CAM/system-PM owner exists yet. The implemented non-WoW suspend path retires the generation and rebuilds it after resume; this does not preserve an associated wake-capable firmware context. |
 | `rtl8852a` | Step 1 done: NHM noise monitoring (`nhm.rs`, fixture-tested — 8852A-only threshold/report tables, 11k thresholds with the WA override, weighted-average noise, trigger/set/get-result model, `support_noise` true) and the authenticated board secure-policy load path (`Blacklist::board_8852a`; upstream 8852A policy is NULL but NARF takes no 8851B-style signature-only fallback for A). Step 2 done: the station owner — `station_control::Controller::new` admits A on B's codec (same CCTLINFO_UD, `bacam_num` 2 / BACAM_V0, `addrcam_ver` 0; `rtw8852a.c:2434..2437,2472` @ 05441d6), `startup_station::station_allowed` admits A, the A station window (`a_phy_window` 0x1d3fc from `rf_base_addr` {0xc000, 0xd000}, `a_station_window`) gates the preflight, RX DMA takes the AX geometry plus the A-only LTR software trigger (`rx_dma.rs`), TX transport admits A QoS/+HTC/host-CCMP with the 36-bit DAC mask, and packet composition runs through `transmit_a` (AX v0 body) with ordinary-station-only rings — all fixture-tested, including a byte-identical A-vs-B H2C/register stream. Step 3 done (Refs #1879): A RF bases (`rf_access::Rf::for_chip`, `rf_base_addr` {0xc000, 0xd000}, `Native` wires it), A PHY-cap (`Factory::a_phycap`, `phycap_addr` 0x580/size 128) with the A calibration decode (`factory_a.rs`: TSSI/thermal/PA-bias trims per rtw8852a.{c,h}) and the A PHY window (`a_phy_window`, last direct RF dword 0x1d3fc) gating `command_native::radio_access` for A, A-domain radio program identities (`radio_policy_a.rs`: WMM/QoS/RA/HT/HE/A-MPDU over the v0 TXWD path), and `packet_core` A admission (ordinary station rings on the AX address set, A-MPDU, A-MSDU to A's 3500-byte `max_amsdu_limit`, AP role with CH9). Still absent: the BB/RF tables (`rtw8852a_table.c`, 51,012 lines), the RFK flow on top of them, the A `Qualification`/`OrdinaryGrant` wiring in `command_native`, the A fragment companion (so no end-to-end A fragment submit yet), and a Native-level A `radio_access` test (needs an RX-Polling setup). Native A operation cannot be advertised yet. |
-| `rtl8851b` | Source identifies the 1TX/1RX dual-band chip. The exact secure policy is now pinned (Linux NULL `fw_blacklist`: no host chip list, content bounds still enforced, MSS signature still required) and the one-path antenna-diversity owner exists (`antdiv_51`, composed into `radio_51::prepare_controls` with retained state: `rfe_gpio` incl. the `<= 50` GPIO bound, `reg_init`/`set_ant` programs, EWMA stats + training/decision/track state machine). Remaining: hooking the state machine into the PHYSTS path and periodic work, and the remaining chip-specific firmware/RF/power/station ownership. |
+| `rtl8851b` | Source identifies the 1TX/1RX dual-band chip. The exact secure policy is now pinned (Linux NULL `fw_blacklist`: no host chip list, content bounds still enforced, MSS signature still required) and the one-path antenna-diversity owner exists (`antdiv_51`, composed into `radio_51::prepare_controls` with retained state: `rfe_gpio` incl. the `<= 50` GPIO bound, `reg_init`/`set_ant` programs, EWMA stats + training/decision/track state machine). The state machine is hooked into the PHYSTS path (`startup_station.rs` `packet_poll` -> `radio_51::parse_ppdu`, phy.c `rtw89_phy_antdiv_parse`) and periodic work (`radio_51::track` -> `antdiv_tick`, phy.c `rtw89_phy_antdiv_track`), and `pci::probe` routes `10ec:b851` to the retained bootstrap (`radio_51` station runtime). Remaining: signed N51 records/provisioning and native/physical acceptance. |
 | `rtl8852c` | The advertised AX-v1/three-band hardware description is not a native station profile. C needs the exact generation-specific PCI/descriptor transport plus firmware/security, RF/calibration/power and station composition; the current retained Controller/N52B profile is B-only. |
 | `rtl8922a` | BE EFUSE (DDV physical dump, 3-byte-header logical parse, per-block driver, PHY-cap window, secure/ECV/thermal-K readers, BAR MAC), chip container, BE TXD body v2 encode, BE RXD short v2 parse, v2 interrupt mask/enable/disable/recognize, and BE RA H2C v1 builder are implemented (`chip_8922a.rs`, `efuse_be.rs`, `txrx_be.rs`, `irq_be.rs`, `ra_v1.rs`, fixture-tested). Runtime step 1 is also implemented: BE PCI DMA control sequence (`dma_be`: WPDMA/TRXDMA/TXDMA channel + FW channel, index clear, mode-op, BDRAM reset, MIT, post-init tail, DMA-all), BACAM_V1 H2C encoding + slot map with Linux eviction rule (`bacam_v1`), G7 default CMAC table (`cctl_g7`). Steps 2–7 are also implemented, fixture-tested: station owner + admission (`station_8922a.rs`, step 2), TX-power profile + CCTL update builders + RA mask (`txpower_8922a.rs` TSSI/gain-offset parse, `cctl_g7` ampdu/txtime/punctured, `ra_mask`, step 3), BE DMA ring programming + transport (`dma_8922a.rs`, `tx_8922a.rs`, step 4), Prepared wiring + probe admission (`prepared_8922a.rs`, `pci.rs` bring-up, step 5), interrupt config/mask + v2 classification + MSI binding (`irq_be.rs` `IsrsBe::events`, `BindingBe`, step 6), and the C2H completion path (`completion_8922a.rs`: NAPI-order RPQ then RXQ drain, C2H envelope parse + route, H2C-ack surfacing, TX receipts freeing retained DMA buffers, step 7). Still absent: the complete firmware/RF/power/station profile (BB/RF tables — NULL in Linux, loaded from firmware — TX-power program including by-rate tables, thermal/TSSI tracking and regulatory limits, calibration, firmware-security wiring), MLO multi-link, legacy-mode admission, the MAC/PHY/BTC C2H handlers, BA reorder, A-MSDU deaggregation, RX fragment reassembly, and 8922A admission into `station_control`. Done 2026-11-08 (#1867 lane): FWCMD header framing for H2C bodies (`fwcmd_8922a.rs`) with H2C-ack → retained-buffer matching in the completion path, the TXWD_INFO v2 fill (`txrx_be::fill_txwd_info_v2`, `tx_8922a::build_header_with_info` / `Prepared8922a::prepare_data_with_info`), the full `pwr_on_func` tail / `mac_pre_init` owner (`mac_pre_init_8922a.rs`, run from `pci::bring_up`), and `cid` retention (`HalChipVer`, recorded on the owner). 6GHz admission is also implemented (station_8922a: TPE + power program, 20 MHz only; register-level `rtw8922a_set_txpwr` program and wide-6 GHz TPE still open). The AX-path 8922A refusals are verified already-delivered (see `tx_transport`, `packet_format`, `packet_core`, `efuse`, `factory`, `fifo`, `bdram`, `command_queue`, `download_dma`, `irq::Mask::config`, `station_control::Controller::new`). The 8922A dispatch gates still rejecting the chip, verified on main: `bdram.rs`, `command_queue.rs`, `download_dma.rs`, `efuse.rs` MAC path, `factory.rs`, `fifo.rs`, `irq.rs` `Mask::config`, `station_control.rs` `Controller::new`. Native EHT/320MHz cannot be enabled by shared IE encoders before that owner exists. |

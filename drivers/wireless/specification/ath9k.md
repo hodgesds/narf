@@ -593,11 +593,15 @@ exists. Failure pins the owner and starts no replacement. The same physical
 function is power-on/warm-reset, EEPROM and silicon identity are re-read and
 must match, and full INI/modal/detector/CTL/rate/PA/NF/IQ preparation repeats
 for the target primary. Only a fresh successful frequency-bound calibration
-report can create new Packet/Radio/Device objects. The old interface name is
-reserved and terminal; the successor registers a new name, as existing
-recovery does. Old Arc/ring/cache/key/BA authorities never reopen. A future
-stable-name or association-preserving retune would require another explicit
-publication protocol; this implementation does not claim one.
+report can create new Packet/Radio/Device objects. The netdev itself
+survives (Linux keeps the `net_device` across `ath_reset`): the successor
+generation attaches to the same `interface::Netdev` under the same name,
+ifindex, MAC and Narf-Rings. The stale-publisher guard is the netdev's
+`Seat` token: every attach/detach advances it and a generation addresses the
+name (carrier, disconnect event, ring clear, RX delivery, TX admission) only
+while its token is current, with carrier publication and the advance
+serialized, so no late old publication reaches the successor. Old
+Arc/cache/key/BA authorities never reopen; association is not preserved.
 
 `channels` owns the queued physical operation independently of public waiter
 lifetimes. A driver worker owns hardware timer wakeups; dropping the caller
@@ -851,7 +855,8 @@ uses the source STA_ID1/RTC/reset sequence and requires RTC_SHUTDOWN1.
 Wake performs a fresh complete actual20 cold generation at the retained primary,
 including identical raw factory/identity, INI/PLL/RF, current factory/host plan,
 analog calibration, complete MAC/key-cache preparation and native reports before
-new-name publication. Keys, association, PN/replay, BA, copies and old endpoints
+the fresh generation attaches to the same netdev (name and ifindex unchanged,
+§`interface::Netdev`). Keys, association, PN/replay, BA, copies and old endpoints
 do not survive. A40 predecessor cannot lend its center/report to a20 successor.
 Existing H/B/T/Q/S/P formats and qualification recipes are unchanged; no clock
 off happens under a live P1 always-awake or S1 packet owner. Physical board
@@ -867,11 +872,33 @@ new users and refuses extra live guards; resume cold-restores actual20. Remove
 permanently closes the original idle owner, and the terminal supervisor never
 resurrects an intentionally parked owner.
 
+Production driver (mac80211 `IEEE80211_CONF_IDLE` → `main.c::ath9k_config`):
+the original controller's supervisor (`ath9k.rs::supervise`) calls
+`idle::enter_when_idle` every tick; it requests idle (`set(true)`) only when
+`idle::idle_wanted` holds — the published generation is `idle_admissible`
+(Passive, unassociated, nothing pending), the netdev ran no
+scan/connect/configuration request within `IDLE_GRACE_NS` (5 s) and has none
+in flight (`interface::quiet_for`), the owner is Operational and not already
+desired, and no counted use beyond the station pin is held. The grace is a
+deliberate deviation from mac80211's immediate idle: leaving idle here is a
+full cold generation reset, so a scan then connect must not pay it twice.
+Every netdev control request (`scan`, `associate`, `set_config`) first runs
+the netdev's activity hook, `idle::activity`: an awake owner just counts a use
+held for the request (so idle cannot be admitted under it); a desired, armed
+or asleep owner cancels the delay or cold-wakes (`wake_use`, Linux's "the
+chip needs a reset to properly wake up from full sleep") before the request
+waits for the attached generation. Only the AR9285 original controller has an
+idle owner; the hook is a no-op for the other ath9k owners.
+
 The source contract and pinned Linux call chain are
 [AR9285 D0 idle FULL_SLEEP](ar9285-idle-full-sleep.md). Seven native cases are
 written, covering real Device/Radio/Packet/DMA, all-queue/RX retirement, current
 physical sleep/readback negatives, counted control/association refusal,
 cancelled delay, fresh Open/WPA2/kernel DHCP and full40-above/below to actual20.
+`smoke_ath9k_idle_policy_and_activity_leave_idle` covers the production
+predicate and the leave-idle use count, and
+`smoke_ath9k_netdev_activity_leaves_idle_into_same_netdev` scan/connect on an
+idle (detached) netdev waking into a generation under the same name/ifindex.
 They compose the production lifetime helpers with complete model cold-reset
 primitives; they do not instantiate the singleton native PCI controller.
 Release/native execution and physical acceptance remain pending.
@@ -1117,8 +1144,9 @@ rows and the tree facts that keep each open:
   original-controller baseline in §3.11: counted native/control/wake users,
   public desired/status controls, retained100ms continuation, full terminal
   DMA/IRQ proof before actual D0 SHUTDOWN and fresh actual20 cold wake.
-  Associated retention, runtime PCI D3 and physical board wake measurements are
-  not inferred. Seven native cases are written; release/native and physical
+  Production-driven from the supervisor (unassociated + quiet netdev) and
+  left by netdev scan/connect/config activity (§3.11). Associated retention, runtime PCI D3 and physical board wake measurements are
+  not inferred. Nine cases are written; release/native and physical
   acceptance remain pending.
 - `station_network_sleep` is source-complete for the admitted optional
   AR9285 N85S1 program in §3.9: actual public desired setting, PM notice/
@@ -1231,21 +1259,28 @@ Generation reset, rejoin and removal build on that proof:
 - `rejoin`: after publication a supervisor watches the station; once it is
   terminal (disassociation, peer loss, FATAL interrupt, failed DMA) it resets
   into a fresh generation so the radio can be joined again. Three consecutive
-  failed resets, a removed owner or a pinned generation end supervision. Each
-  generation publishes a new `wlan%d` name; retired names stay reserved
-  (stable names are not claimed).
+  failed resets, a removed owner or a pinned generation end supervision. Every
+  generation attaches to the one `wlan%d` netdev, which keeps its name and
+  ifindex across reset, idle and suspend (`interface::Netdev`); control
+  requests that arrive while no generation is attached wait (bounded,
+  `ATTACH_WAIT_NS`) for the next one.
 - `removal`: `narf_bus::register_pci_remove` for both AR9285 and AR2427 match
   names (Linux `pci.c::ath_pci_remove`). The hook marks the owner removed
   before waiting (blocking any initialization, reset or supervisor), retires
-  the generation, drops the controller and releases the singleton address
-  only when DMA was reclaimed; otherwise the address stays quarantined.
+  the generation, unregisters the netdev (`interface::unpublish`, Linux
+  `ieee80211_unregister_hw`), drops the controller and releases the singleton
+  address only when DMA was reclaimed; otherwise the address stays quarantined.
   `narf_drivers` has no bound-driver unrecord API, so the bound record is left.
 
 Covered by `smoke_ar9285_station_retirement_reports_exact_dma_reclamation`
 (reclaimed vs wedged DCU, idempotent retire) and
-`smoke_ar9285_native_device_retire_host_withdraws_generation` (carrier,
-interface table, reserved name, late TX, DMA stop). Physical chip reset and
-re-association after reset are unmeasured.
+`smoke_ar9285_native_device_retire_host_withdraws_generation` (standalone
+generation: carrier, interface table, reserved name, late TX, DMA stop) and
+`smoke_ath9k_netdev_name_and_ifindex_survive_generation_reset` (bound
+generations: same name/ifindex/rings across detach+attach, a detached
+generation's late carrier/TX/service pass never reaches the successor,
+removal unregisters). Physical chip reset and re-association after reset are
+unmeasured.
 
 Other ath9k devices need their own EEPROM maps, reset/PHY tables and
 descriptor/runtime variants before they can be claimed supported. The Linux
@@ -2330,7 +2365,8 @@ grant and a live dual-band permission, `Native::new_ar9300` (with
 `station::Radio::new(packet.into(), ..)` (noise = chain-0 default NF,
 `ath9k_hw_getchan_noise` before any history) and `interface::publish`.
 Retune (`channels` routes non-AR9285 20 MHz requests after AR9280),
-recovery and resume share one generation reset: the target record and
+terminal-station recovery and resume share one generation reset (hang
+recovery is the in-place reset below): the target record and
 permission first, retire with proven DMA stop and BME off,
 `ar9003::set_power_awake` only after FULL_SLEEP (`ath9k_hw_setpower` is a
 no-op on an awake chip), the new `AR_CFG_LED`, `ar9003::reset_reg`
@@ -2341,9 +2377,9 @@ target equal to `expected`; then initialize. The `ath9k_hw_init_pll` that
 `ath9k_hw_chip_reset` runs is `prepare`'s PLL write (Linux marks the PHY
 inactive before the chip reset; here the reset precedes `prepare`'s
 `mark_phy_inactive`, which the chip reset already left inactive). The
-supervisor polls every 500 ms: a terminal station is reset (three
-failures, `DeviceGone` or `BadState` stop it); otherwise
-`long_calibration` runs the due `Periodic` steps. Suspend
+supervisor polls every 500 ms: a queued in-place reset runs first; a
+terminal station is reset (three failures, `DeviceGone` or `BadState`
+stop it); otherwise `long_calibration` runs the due `Periodic` steps. Suspend
 (`ath_pci_suspend`): retire, then `ar9003::disable_and_sleep` =
 `ath9k_hw_disable` (COLD `set_reset_reg`, `ath9k_hw_init_pll`) +
 `ath9k_set_power_sleep` for AR9300 without MCI (`AR_STA_ID1_PWR_SAV` set,
@@ -2354,6 +2390,49 @@ without `AR_WA_D3_L1_DISABLE`; no `AR_RC` write).
 not called on suspend (Linux calls it from `ath9k_stop`, not
 `ath_pci_suspend`) or on reset.
 Resume clears PCI config 0x41 and runs the generation reset (COLD).
+**In-place reset (`main.c::ath_reset`).** Where Linux calls
+`ath9k_queue_reset` the AR9003 EDMA packet owner records a
+`station::ResetType` instead of closing: `ath_isr`/`ath9k_tasklet` FATAL
+and BB watchdog (`FatalInt`/`BbWatchdog`, `service_begin`), a queue-0
+frame past its 1 s completion window (`TxHang`, the
+`ath_tx_complete_check` counterpart, `delivery`), a failed periodic
+`ar9003_hw_calibrate` step (`Calibration`), and
+`station::Radio::rx_inactive_check` (`link.c::ath_hw_rx_inactive_check`:
+4 s window, at least one RX service per second, `rx_active_count` counted
+once per poll pass that consumed a receive buffer; policy: only while
+associated, since an idle unassociated receiver may hear nothing). The
+station keeps the cause (`ATH_OP_HW_RESET`: `poll`, `send`, scans and
+joins report Busy, `interface::progress` leaves the link and rings
+alone) only from Passive/Open with nothing but a plain data frame in
+flight and no handshake running; otherwise it fails and the generation is
+retired as before. The supervisor then runs `ar9300_owner::reset_in_place`
+under `CONTROL`, the owner and the station lock: `ath_prepare_reset`
+(`Radio::pause_for_reset`: IER killed with the MSI vector kept,
+`ath_stoprecv`, `ath_drain_all_txq` dropping the in-flight frame without
+training rate control, BME off and the quiescence proof; every ring and
+buffer stays owned), `ath9k_hw_reset` on the same primary (LED,
+`ath9k_hw_chip_reset` COLD/WARM by `AR_Q_TXE`/`AR_CR_RXE`, `AR_SREV`,
+`phy::prepare` equal to the record's, the power plan at the generation's
+host permission, a fresh `Calibration::run` — no per-channel `caldata` is
+kept, so TX IQ/CL are re-measured rather than restored —,
+`ar9003::mac::prepare`, `Native::ar9300_recalibrated` (new `Periodic` over
+the carried `IqTotals`) and `ar9300_reset_tail`), then `ath_complete_reset`
+(`Radio::resume_after_reset`: status ring and RX buffer size re-programmed
+(`ath9k_hw_reset_txstatus_ring`), `ath_startrecv` re-feeding the same
+buffers, BSSID/AID and slot of the last `set_peer`
+(`ath9k_hw_write_associd`), interrupts re-enabled). The station
+generation, netdev, association, peer, host RSNA keys, sequence numbers
+and receive epoch stay. Key cache: `ath9k_hw_reset` never clears
+`AR_KEYTABLE` (only `ath9k_init_softc` does) and this owner programs no
+hardware key entry (CCMP is host-side), so nothing is re-written. Any
+failure stops the station and the next tick retires it through the
+generation reset. Not ported: `ath_hw_check`'s AR9300
+`ath9k_hw_detect_mac_hang` and the `RESET_TYPE_TX_GTT` path. The AR9002
+owners (AR5008/AR9280/AR9285/AR9287) keep the generation reset for these
+causes: their packet owner carries HT/EDCA/QoS/BA/power-save programs that
+an in-place restart would have to re-apply. Smokes (written, not
+executed): `smoke_ath9k_ar9300_in_place_reset_keeps_rings_and_restarts_rx_tx`,
+`smoke_ath9k_in_place_reset_keeps_association_and_keys`.
 The owner carries no HT, EDCA, QoS, block-ack, aggregation or power-save
 program, matching the AR9280 station scope; ANI is not ported. Smokes
 (written, not executed):
@@ -2436,8 +2515,39 @@ every TX/RX gain mode with the mode 2/3 override arrays, computed
 from the local Linux headers, plus the SerDes `pll_pwrsave` selection
 matrix) and
 `smoke_ath9k_ar9462_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: WoW
-(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0034`), the AR9462 board-value
+WoW (wired, physical wake unmeasured): `ath9k_init_wow` — the
+owner holds `ar9003::wow::Wow` only when `pci.c`'s `ATH9K_PCI_WOW`
+`driver_data` applies (`wow::driver_data`, the thirteen `0x0034`
+subsystems), and only then does the netdev advertise `wowlan_support`
+(magic packet, disconnect, `MAX_NUM_PATTERN - 2` user patterns of 1..256
+bytes, no offset; `set_wowlan`/`wowlan_config` keep a cfg80211-validated
+`WowlanConfig`). System suspend with a configuration, an associated
+station (`ATH_OP_PRIM_STA_VIF`), a non-zero `ath9k_wow_map_triggers` and a
+settled generation (Open, nothing in flight, no queued reset) takes
+`ar9300_owner::wow_suspend` (`wow.c::ath9k_suspend`): disassociate/
+deauthenticate patterns in slots 0/1, user patterns in slots 2.. (zero
+padded, cfg80211 mask bytes as is), `Radio::wow_suspend` (interrupt mask
+saved, `ATH9K_INT_BMISS` only via `ar9003::irq::wow`, service held),
+`Wow::enable` with the keep-alive null frame (`ah->txchainmask`, band,
+own MAC, AP), and `ath_pci_suspend` is bypassed (no retirement, no
+FULL_SLEEP); the supervisor (ANI/calibration, hang check) is parked.
+Anything else (Linux `ret = 1`) or a failed arming takes the ordinary
+retiring suspend. Resume runs `ath_pci_resume`'s config 0x41 fix, then
+`wow_resume` (`ath9k_resume`): `Radio::wow_resume` restores the saved
+mask (`ar9003::irq::restore`), `Wow::wakeup` reads/clears the wake reason
+and `ath9k_hw_configpcipowersave(ah, false)` re-runs
+`ar9003::serdes::configure`; TSF2 has no generic-timer owner and is only
+reported. RX DMA, which `ath9k_hw_wow_enable` stopped (`AR_CR_RXD`), is
+restarted by the in-place reset with the association kept: Linux reaches
+it through `ath_restart_work` -> `ath_hw_rx_inactive_check` about 5 s
+later; here `wow_resume` queues `ResetType::RxInactive` directly (RX is
+known stopped) and restarts the link-loss clock, so the access-proved
+packet path never runs against the WoW-sleeping chip and the 5 s
+link-loss window cannot expire first. Not done: PCI PME_En / D-state
+(platform-owned; `narf_bus::pci_pme::arm` has no driver caller), MCI
+(`mci_enabled` false). Smoke (written, not executed):
+`smoke_ath9k_ar9462_wow_suspend_resume_keeps_generation`.
+Remainder, not in this step: the AR9462 board-value
 deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
 **AR9485 (`ar9485_enablement`, in progress — not claimed).** Step 1
 (identity and INI, plus owner probe and admission record):
@@ -2483,7 +2593,7 @@ the 648 default-selected 2 GHz HT20 rows and every TX/RX gain mode,
 computed from the local Linux headers, plus the SerDes `pll_pwrsave`
 selection matrix) and
 `smoke_ath9k_ar9485_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: WoW, the
+Remainder, not in this step: the
 AR9485 board-value deltas and per-chip calibration branches (including
 the 9485 antenna-diversity/LNA-diversity code).
 
@@ -2535,8 +2645,8 @@ the 711 default-selected 2 GHz HT20 rows for each of 1.0 and 1.1, and
 every TX/RX gain mode, computed from the local Linux headers, plus
 the SerDes `pll_pwrsave` selection matrix) and
 `smoke_ath9k_ar9565_admission_records_bind_part_channel_and_magic`.
-Remainder, not in this step: WoW
-(`ar9003_wow.c`, `ATH9K_PCI_WOW` for `0x0036`), the AR9565 board-value
+WoW does not apply (Linux `pci.c` sets `ATH9K_PCI_WOW` only on
+`0x0034` subsystems). Remainder, not in this step: the AR9565 board-value
 deltas and per-chip calibration branches.
 
 **SerDes `pll_pwrsave` (`ar9003/serdes.rs`, modeled).**

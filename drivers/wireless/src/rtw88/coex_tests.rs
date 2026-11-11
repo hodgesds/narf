@@ -225,9 +225,11 @@ fn smoke_rtw88_coex_c22_power_on_init_program() -> TestResult {
     let Ok(h2c) = run(c.start(&mut io, &auth, link(false))) else {
         return TestResult::Fail("init");
     };
-    // slot extend off (h2c69 opcode 0x0c para 1), TDMA off, BT info query.
+    // slot extend off (h2c69 opcode 0x0c para 1) and BT info query. The
+    // forced TDMA case 0 sends no H2C on a non-shared board: rtw_coex_tdma
+    // indexes tdma_nsant[type - 100], and (u8)(0 - 100) is out of range.
     if !has(&h2c, [0x69, 0x0c, 0x01, 0, 0, 0, 0, 0])
-        || !has(&h2c, [0x60, 0, 0, 0, 0, 0, 0, 0])
+        || h2c.iter().any(|c| c[0] == 0x60)
         || !has(&h2c, [0x61, 1, 0, 0, 0, 0, 0, 0])
     {
         return TestResult::Fail("init H2C");
@@ -324,12 +326,14 @@ fn smoke_rtw88_coex_unqualified_tdma_refused_and_restore_exact() -> TestResult {
     let mut io = regs();
     let before = io.mem.clone();
     let auth = Auth(Cell::new(true));
-    if associated(&mut c, &mut io, &auth).is_err() {
-        return TestResult::Fail("associate");
+    if run(c.start(&mut io, &auth, link(false))).is_err() {
+        return TestResult::Fail("init");
     }
-    // A2DP needs PS-TDMA, which this record does not qualify.
+    // With BT enabled, a 2.4GHz connect runs rtw_coex_action_wl_linkscan,
+    // whose non-shared case is PS-TDMA 107 (A2DP: 111): this PTA-only
+    // record does not qualify TDMA, so the connect is refused.
     if !matches!(
-        run(c.c2h(&mut io, &auth, link(true), &bt_a2dp())),
+        run(c.connect(&mut io, &auth, link(false), true)),
         Err(Error::Unsupported)
     ) {
         return TestResult::Fail("TDMA admitted without the record");
@@ -346,7 +350,9 @@ fn smoke_rtw88_coex_unqualified_tdma_refused_and_restore_exact() -> TestResult {
             return TestResult::Fail("register not restored");
         }
     }
-    if !has(&h2c, [0x66, 0, 0, 0, 0, 0, 0, 0]) || c.initialized() {
+    // The refused connect never reached media connect, so no WL channel
+    // info (H2C 0x66) or TDMA was sent and none is withdrawn.
+    if h2c.iter().any(|c| c[0] == 0x66 || c[0] == 0x60) || c.initialized() {
         return TestResult::Fail("firmware coex state not returned");
     }
     TestResult::Pass
@@ -420,13 +426,13 @@ fn smoke_rtw88_coex_c22_mimo_ps_config_trx_mode_and_exact_restore() -> TestResul
     // CCK TX A (8), OFDM TX A (ANTMAP0 0x11, TXLGMAP 7:0 = 0).
     if io.get(0x1800) != 0xa013_3312
         || io.get(0x4100) != 0x3621_1111
-        || io.get(0x1a2c) != 0x0004_c000
+        || io.get(0x1a2c) != 0x0000_c000
         || io.get(0x1a04) != 0x8069_5847
         || io.get(0x1d30) != 0x1000_0000
         || io.get(0xc44) != 3
         || io.get(0xc54) != 5
         || io.get(0xc38) != 7
-        || io.get(0x824) != 0x0111_0011
+        || io.get(0x824) != 0x0131_0011
         || io.get(0x820) != 0x2211
         || io.get(0x1e2c) != 0x2211_0400
     {

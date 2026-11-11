@@ -106,7 +106,9 @@ fn composition(protected: bool) -> Result<(), &'static str> {
             .find(|b| b[0] == 0x40)
             .ok_or("H2 actual RA absent")?;
         let expected = (0xfffu32 | (u32::from(mask) << 12)).to_le_bytes();
-        if ra[2] != 2 | (u8::from(sgi) << 7) || ra[4..8] != expected {
+        // RAID2 (BGN_20M_2SS), INIT_RA_LVL1 (bit5: fw.c rtw_fw_send_ra_info
+        // with si->init_ra_lv = 1 from rtw_sta_add), SGI_EN bit7.
+        if ra[2] != 2 | 1 << 5 | (u8::from(sgi) << 7) || ra[4..8] != expected {
             return Err("H2 native RA2/full28-bit mask/SGI");
         }
         let lease = narf_net::dhcp::dhcp_acquire(f.device().name(), 0).map_err(|_| "H2 DHCP")?;

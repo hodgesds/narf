@@ -1072,7 +1072,7 @@ They await coordinated release compilation and native execution; all prior
 v1/scan registrations remain required. Hardware measurements and physical
 USB/RF interoperability remain external.
 
-### RTL8192EU native owner (in progress)
+### RTL8192EU native owner
 
 RTL8192EU (and its 1T2R RTL8191EU bonding) is the second native rtl8xxxu
 chip. It reuses the retained one-shot `firmware_transport::Owner` and its
@@ -1300,7 +1300,7 @@ The RTL8192EU station is the shared gen2 station composition below
 (`### Gen2 station (RTL8192EU, RTL8723BU)`); the probe publishes its netdev
 after `wait_admit`.
 
-### RTL8723BU native owner (in progress)
+### RTL8723BU native owner
 
 RTL8723BU (1T1R WiFi + Bluetooth combo, `8723b.c`) is the third native
 rtl8xxxu chip. It reuses the retained one-shot `firmware_transport::Owner`

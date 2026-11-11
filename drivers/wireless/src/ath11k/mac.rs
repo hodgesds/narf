@@ -133,6 +133,14 @@ pub trait DataPort {
     fn ppdu_stats_req(&self) -> impl Future<Output = Result<(), i32>> + Send;
     /// `ath11k_mac_config_mon_status_default(ar, enable)`.
     fn mon_status_default(&self, enable: bool) -> impl Future<Output = Result<(), i32>> + Send;
+    /// `ath11k_mac_monitor_start` / `_stop`'s data-path half: set or clear
+    /// `ATH11K_FLAG_MONITOR_STARTED` for this port's pdev (routing its
+    /// monitor frames to this vdev) and send
+    /// `ath11k_dp_tx_htt_monitor_mode_ring_config(ar, !start)`. Ports
+    /// without a monitor-capable DP refuse.
+    fn monitor_mode(&self, _start: bool) -> impl Future<Output = Result<(), i32>> + Send {
+        core::future::ready(Err(errno::EOPNOTSUPP))
+    }
     /// `ath11k_dp_vdev_tx_attach`. `ap` selects the AP/GO data path rather
     /// than the associated-station path in the runtime.
     fn vdev_tx_attach(&self, vdev_id: u32, addr: [u8; 6], ap: bool);
@@ -590,24 +598,15 @@ pub struct MacConfig {
     pub frame_mode_ethernet: bool,
     /// `ATH11K_FLAG_RAW_MODE` (`cryptmode=1`).
     pub raw_mode: bool,
+    /// `hw_params.supports_monitor` (IPQ8074, IPQ6018, QCN9074): Linux
+    /// removes `NL80211_IFTYPE_MONITOR` from the wiphy otherwise.
+    pub supports_monitor: bool,
 }
 
 impl MacConfig {
     /// WCN6855 hw2.0 / hw2.1 (`ath11k_hw_params[]`).
     pub const fn wcn6855() -> Self {
-        MacConfig {
-            vdev_id: 0,
-            idle_ps: true,
-            supports_sta_ps: true,
-            current_cc_support: true,
-            single_pdev_only: true,
-            vdev_start_delay: true,
-            num_rxdma_per_pdev: 2,
-            listen_interval: 5,
-            powersave: true,
-            frame_mode_ethernet: false,
-            raw_mode: false,
-        }
+        Self::for_hw(super::hw::HwRev::Wcn6855Hw20, 2, true)
     }
 
     /// Bind a per-netdev MAC instance to a previously reserved firmware
@@ -618,25 +617,41 @@ impl MacConfig {
         self
     }
 
-    /// Per-radio config for a multi-pdev part: the WCN6855 policy
-    /// defaults (idle PS, station PS, current-CC, vdev-start delay,
-    /// listen interval, powersave) with `single_pdev_only` cleared and
-    /// the chip's own `num_rxdma_per_pdev`. These are mac-layer policy
-    /// knobs, not chip register values, so one shared default per radio
-    /// is honest; the vdev slot still comes from [`Self::with_vdev`].
-    pub const fn for_radio(num_rxdma_per_pdev: u32) -> Self {
+    /// The mac-layer fields of the chip's `ath11k_hw_params[]` entry
+    /// (Linux core.c). `idle_ps`, `supports_sta_ps`, `vdev_start_delay`
+    /// and `current_cc_support` are `true` on the client parts (QCA6390,
+    /// WCN6855 hw2.0/2.1, QCA2066, QCA6698AQ, WCN6750) and `false` on the
+    /// AP-class parts (IPQ8074, IPQ6018, IPQ5018, QCN9074). The two
+    /// data-path fields come from the same table through the DP config
+    /// (`Dp::cfg`), so callers pass them rather than this restating them.
+    /// [`HwRev::Unknown`](super::hw::HwRev::Unknown) keeps the client
+    /// policy (no unknown revision reaches a runtime).
+    pub const fn for_hw(
+        rev: super::hw::HwRev,
+        num_rxdma_per_pdev: u32,
+        single_pdev_only: bool,
+    ) -> Self {
+        use super::hw::HwRev;
+        let client = !matches!(
+            rev,
+            HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Ipq5018Hw10 | HwRev::Qcn9074Hw10
+        );
         MacConfig {
             vdev_id: 0,
-            idle_ps: true,
-            supports_sta_ps: true,
-            current_cc_support: true,
-            single_pdev_only: false,
-            vdev_start_delay: true,
+            idle_ps: client,
+            supports_sta_ps: client,
+            current_cc_support: client,
+            single_pdev_only,
+            vdev_start_delay: client,
             num_rxdma_per_pdev,
             listen_interval: 5,
             powersave: true,
             frame_mode_ethernet: false,
             raw_mode: false,
+            supports_monitor: matches!(
+                rev,
+                HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Qcn9074Hw10
+            ),
         }
     }
 }
@@ -802,6 +817,8 @@ pub enum VifKind {
     P2pDevice,
     P2pClient,
     P2pGo,
+    /// The monitor virtual interface (`WMI_VDEV_TYPE_MONITOR`).
+    Monitor,
 }
 
 impl VifKind {
@@ -5212,6 +5229,10 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
             // state. It lives across STOP_AP but must leave before VDEV_DELETE.
             let own = self.vif.as_ref().unwrap().addr;
             self.peer_delete(own).await;
+        } else if kind == VifKind::Monitor {
+            // ieee80211_link_release_channel → unassign_vif_chanctx:
+            // ath11k_mac_monitor_stop before the vdev is deleted.
+            self.monitor_stop().await;
         } else {
             self.scan_11d_stop().await;
         }
@@ -5406,6 +5427,229 @@ impl<P: WmiPort, D: DataPort> Mac<P, D> {
         self.conf_tx_all(&defaults).await?;
         self.run_deferred().await;
         Ok(vdev_id)
+    }
+
+    /// The monitor chandef for `channel` (nl80211 width values), usable
+    /// as cfg80211's `set_monitor_channel` requires
+    /// (`cfg80211_chandef_usable(.., IEEE80211_CHAN_DISABLED)`).
+    pub fn monitor_chandef(
+        &self,
+        channel: narf_wireless::monitor::Channel,
+    ) -> Result<ChanDef, MacError> {
+        let width = match channel.width {
+            0 => Width::W20NoHt,
+            1 => Width::W20,
+            2 => Width::W40,
+            3 => Width::W80,
+            4 => Width::W80P80,
+            5 => Width::W160,
+            other => {
+                return fail(
+                    step::VDEV_START,
+                    0x700 | other,
+                    errno::EOPNOTSUPP,
+                    "monitor chandef",
+                )
+            }
+        };
+        let def = ChanDef {
+            freq: channel.frequency_mhz,
+            band: freq_band(channel.frequency_mhz),
+            width,
+            center_freq1: if channel.center1_mhz == 0 {
+                channel.frequency_mhz
+            } else {
+                channel.center1_mhz
+            },
+            center_freq2: channel.center2_mhz,
+        };
+        if !peer::chandef_usable(&self.wiphy, &def) {
+            return fail(
+                step::VDEV_START,
+                0x701,
+                errno::EINVAL,
+                "monitor chandef (unusable)",
+            );
+        }
+        Ok(def)
+    }
+
+    /// The monitor virtual interface (`ieee80211_add_virtual_monitor` →
+    /// `ath11k_mac_op_add_interface` for `NL80211_IFTYPE_MONITOR`, then
+    /// `ieee80211_link_use_channel` → `ath11k_mac_op_assign_vif_chanctx`
+    /// → `ath11k_mac_monitor_start`): WMI_VDEV_CREATE (type MONITOR), the
+    /// encap/decap and NSS parameters, RTS threshold, DP vdev attach, then
+    /// the monitor vdev start / up on `def` and the HTT monitor-mode ring
+    /// filters. A failure deletes the vdev again.
+    pub async fn add_monitor_interface(&mut self, def: ChanDef) -> Result<u32, MacError> {
+        if self.vif.is_some() {
+            return fail(
+                step::VDEV_CREATE,
+                0x700,
+                errno::EBUSY,
+                "add monitor interface (vdev exists)",
+            );
+        }
+        let vdev_id = self.cfg.vdev_id;
+        let addr = self.caps.mac_addr;
+        let (nt, nr) = (self.own.num_tx_chains as u8, self.own.num_rx_chains as u8);
+        let mut p = VdevCreateParams {
+            if_id: vdev_id as u8,
+            vdev_type: vdev_type::MONITOR,
+            subtype: vdev_subtype::NONE,
+            pdev_id: self.caps.pdev_id,
+            ..Default::default()
+        };
+        if self.caps.pdev.supported_bands & WMI_HOST_WLAN_2G_CAP != 0 {
+            p.chains_2g = Chains { tx: nt, rx: nr };
+        }
+        if self.caps.pdev.supported_bands & WMI_HOST_WLAN_5G_CAP != 0 {
+            p.chains_5g = Chains { tx: nt, rx: nr };
+        }
+        let c = vdev_create_cmd(&addr, &p);
+        self.cmd(c, step::VDEV_CREATE, 0x701, "monitor vdev create")
+            .await?;
+        self.vif = Some(Vif {
+            vdev_id,
+            addr,
+            kind: VifKind::Monitor,
+            ..Default::default()
+        });
+        // ath11k_mac_op_update_vif_offload: a monitor vif never keeps the
+        // Ethernet offload; failures are warnings.
+        let encap = if self.cfg.raw_mode {
+            txrx::RAW
+        } else {
+            txrx::NATIVE_WIFI
+        };
+        let _ = self
+            .vdev_param(vdev_id, WMI_VDEV_PARAM_TX_ENCAP_TYPE, encap)
+            .await;
+        let _ = self
+            .vdev_param(vdev_id, WMI_VDEV_PARAM_RX_DECAP_TYPE, encap)
+            .await;
+        let nss = self.own.num_tx_chains.max(1);
+        if let Err(e) = self.vdev_param(vdev_id, WMI_VDEV_PARAM_NSS, nss).await {
+            let _ = self.wmi.send(vdev_delete_cmd(vdev_id as u8)).await;
+            self.vif = None;
+            return Err(e);
+        }
+        // ath11k_mac_txpower_recalc: bss_conf.txpower is INT_MIN → no-op.
+        let _ = self
+            .vdev_param(vdev_id, WMI_VDEV_PARAM_RTS_THRESHOLD, self.rts_threshold)
+            .await;
+        self.dp.vdev_tx_attach(vdev_id, addr, false);
+        if let Err(e) = self.monitor_start(def).await {
+            // ath11k_mac_monitor_start's failure: ath11k_mac_monitor_vdev_delete.
+            let _ = self.remove_interface().await;
+            return Err(e);
+        }
+        Ok(vdev_id)
+    }
+
+    /// `ath11k_mac_monitor_start` → `ath11k_mac_monitor_vdev_start`:
+    /// WMI_VDEV_START on `def` (synchronized on its response), then
+    /// WMI_VDEV_UP (aid 0, the radio address, no BSSID); a failed UP stops
+    /// the vdev again (`-EIO`). Once started, `ATH11K_FLAG_MONITOR_STARTED`
+    /// and `ath11k_dp_tx_htt_monitor_mode_ring_config(ar, false)`.
+    async fn monitor_start(&mut self, def: ChanDef) -> Result<(), MacError> {
+        let v = self.vif.clone().unwrap();
+        let chan = self.wiphy.get(def.freq).copied();
+        let mut arg = VdevStartReqArg {
+            vdev_id: v.vdev_id,
+            pref_tx_streams: self.own.num_tx_chains,
+            pref_rx_streams: self.own.num_rx_chains,
+            ..Default::default()
+        };
+        arg.channel.freq = def.freq;
+        arg.channel.band_center_freq1 = def.center_freq1;
+        arg.channel.band_center_freq2 = def.center_freq2;
+        arg.channel.mode = peer::vdev_phymode(&def);
+        if let Some(c) = chan {
+            arg.channel.chan_radar = c.flags & chan_flag::RADAR != 0;
+            arg.channel.max_power = c.max_power as u8;
+            arg.channel.max_reg_power = c.max_reg_power as u8;
+            arg.channel.max_antenna_gain = c.max_antenna_gain as u8;
+            arg.channel.passive = c.flags & chan_flag::NO_IR != 0;
+        }
+        self.pending.vdev_start = None;
+        let c = match vdev_start_cmd(&arg, false) {
+            Ok(c) => c,
+            Err(e) => return fail(step::VDEV_START, 0x702, e.errno(), "monitor vdev start"),
+        };
+        self.cmd(c, step::VDEV_START, 0x703, "monitor vdev start")
+            .await?;
+        let Some(resp) = self
+            .wait_for(timeout::VDEV_SETUP, |s| s.pending.vdev_start.take())
+            .await
+        else {
+            return fail(
+                step::VDEV_START_TIMEOUT,
+                def.freq,
+                errno::ETIMEDOUT,
+                "monitor vdev start (no response)",
+            );
+        };
+        if resp.status != WMI_VDEV_START_RESPONSE_STATUS_SUCCESS {
+            return fail(
+                step::VDEV_START_STATUS,
+                resp.status,
+                errno::EINVAL,
+                "monitor vdev start (status)",
+            );
+        }
+        self.vif.as_mut().unwrap().is_started = true;
+        let addr = self.caps.mac_addr;
+        let up = self
+            .cmd(
+                vdev_up_cmd(v.vdev_id, 0, &addr, None, 0, 0, None),
+                step::VDEV_UP,
+                0x704,
+                "monitor vdev up",
+            )
+            .await;
+        if up.is_err() {
+            // vdev_stop: the failed UP stops the started vdev again.
+            self.vdev_stop().await;
+            return fail(step::VDEV_UP, 0x705, errno::EIO, "monitor vdev up");
+        }
+        self.vif.as_mut().unwrap().is_up = true;
+        self.vif.as_mut().unwrap().chanctx = Some(def);
+        if let Err(e) = self.dp.monitor_mode(true).await {
+            return fail(step::START_DP, 0x706, e, "htt monitor mode ring config");
+        }
+        Ok(())
+    }
+
+    /// `ath11k_mac_monitor_stop` → `ath11k_mac_monitor_vdev_stop`:
+    /// WMI_VDEV_STOP (synchronized), WMI_VDEV_DOWN, then
+    /// `ATH11K_FLAG_MONITOR_STARTED` cleared and
+    /// `ath11k_dp_tx_htt_monitor_mode_ring_config(ar, true)`.
+    async fn monitor_stop(&mut self) {
+        let Some(v) = self.vif.clone() else {
+            return;
+        };
+        if !v.is_started {
+            return;
+        }
+        self.vdev_stop().await;
+        let _ = self
+            .cmd(
+                vdev_down_cmd(v.vdev_id as u8),
+                step::VDEV_UP,
+                0x707,
+                "monitor vdev down",
+            )
+            .await;
+        self.vif.as_mut().unwrap().is_up = false;
+        if let Err(e) = self.dp.monitor_mode(false).await {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  ath11k: mac: failed to configure htt monitor mode ring during stop: (-{})",
+                e
+            );
+        }
     }
 
     /// `ieee80211_do_open` → `ath11k_mac_op_add_interface` for a

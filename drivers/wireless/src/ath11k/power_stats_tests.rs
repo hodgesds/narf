@@ -169,15 +169,24 @@ fn smoke_ath11k_int_power_query_native_failure_and_late_receipt() -> TestResult 
         let pdev = run!(u.netdev.mac.lock())
             .tx_power_query_pdev()
             .ok_or("power context")?;
-        let endpoint = {
+        // Sends route by pdev (`wmi_ab.wmi[pdev_idx]`), so disconnect
+        // the pdev endpoint list as well as the soc handle.
+        let endpoints = {
             let mut rt = run!(u.shared.lock());
-            rt.core.wmi_ep.take()
+            (
+                rt.core.wmi_ep.take(),
+                core::mem::take(&mut rt.core.wmi_pdev_eps),
+            )
         };
         ensure!(
             run!(u.shared.refresh_tx_power(pdev)).is_err(),
             "missing native WMI endpoint fails send"
         );
-        run!(u.shared.lock()).core.wmi_ep = endpoint;
+        {
+            let mut rt = run!(u.shared.lock());
+            rt.core.wmi_ep = endpoints.0;
+            rt.core.wmi_pdev_eps = endpoints.1;
+        }
         run!(u.shared.refresh_tx_power(pdev)).map_err(|_| "known unpublished failure retry")?;
         pump(&u, 1);
         ensure!(

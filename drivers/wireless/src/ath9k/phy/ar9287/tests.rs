@@ -164,7 +164,15 @@ fn smoke_ath9k_ar9287_two_chain_masks_hwwar2_and_cck_fir() -> TestResult {
     if io.regs.get(&0x8344) != Some(&0x01c8_1083) {
         return TestResult::Fail("AR9287 HWWAR1/HWWAR2/KEYID not cleared");
     }
-    if io.writes.iter().any(|&(reg, _)| reg == 0xa204)
+    // `ar9287Modes_9287_1_1` / `ar9287Modes_rx_gain_9287_1_1` program
+    // 0xa204 during process_ini (ar9002_initvals.h); what
+    // `ar9002_hw_set_channel` (ar9002_phy.c:88-107) must not do on
+    // AR_SREV_9287_11_OR_LATER is the AR_PHY_CCK_TX_CTRL_JAPAN RMW after
+    // `ar5008_hw_set_rfmode` (the last 0xa200 write).
+    let Some(rfmode) = io.writes.iter().rposition(|&(reg, _)| reg == 0xa200) else {
+        return TestResult::Fail("AR9287 rfmode not programmed");
+    };
+    if io.writes[rfmode..].iter().any(|&(reg, _)| reg == 0xa204)
         || !AR9287_COMMON_NORMAL_CCK_FIR_COEFF_9287_1_1
             .iter()
             .all(|row| wrote(u64::from(row[0]), row[1]))

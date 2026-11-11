@@ -26,11 +26,11 @@
 //! 1. `power::power_on` + `mac::init_mac` (the `_rtl92de_init_mac`
 //!    power prefix and MAC init, minus the LLT + ring bases that
 //!    `Prepared::prepare` already programmed).
-//! 2. `0x605 |= 0x30` (`REG_TCR` byte 1; a no-op under the
-//!    `0x3200` TCR `init_mac` wrote, applied anyway as Linux does).
-//! 3. Early mode: not implemented in NARF (no early-mode support
-//!    anywhere in-tree); the `0x4d0 |= 0x1f`, `0x4d3 = 0x80`,
-//!    `0x605 |= 0x40` writes are skipped.
+//! 2. [`mac::early_mode`]: `0x605 |= 0x30` (`REG_TCR` byte 1) always.
+//! 3. The same call, with [`Params::earlymode_enable`]: the `0x4d0 |=
+//!    0x1f`, `0x4d3 = 0x80`, `0x605 |= 0x40` writes only when early mode
+//!    is enabled. Linux `rtl92de_init_sw_vars` leaves
+//!    `rtlhal->earlymode_enable` false, and so does the radio owner.
 //! 4. RDG: skipped — `mac->rdg_en` is never assigned upstream, so
 //!    the `REG_RD_CTRL` / `REG_RD_NAV_NXT` / `REG_RD_RESP_PKT_TH`
 //!    writes never execute in Linux either.
@@ -44,19 +44,23 @@
 //! 7. CCK block on (2.4 GHz only) + OFDM block on, then
 //!    `RFPGA0_ANALOGPARAMETER2` bits 10|11 `← 3` (both interface
 //!    indices take the same value in Linux).
-//! 8. `mac::hw_configure`, `mac::cam_reset`, and the software-crypto
-//!    station identity (`mac::station_identity`: `REG_SECCFG` 0 +
-//!    MAC address into `REG_MACID`). Enabling hardware security
-//!    (`rtl92de_enable_hw_security_config`: `REG_CR+1 = 0x02` plus
-//!    the `SCR_*` `REG_SECCFG` value) is a follow-up keyed on the
-//!    `sw_crypto` decision; the in-tree station code is
-//!    software-crypto.
+//! 8. `mac::hw_configure`, `mac::cam_reset`, then
+//!    `rtl92d_enable_hw_security_config` ([`mac::enable_hw_security_config`]
+//!    with [`Params::hw_security`]: nothing is written under software
+//!    crypto; otherwise `REG_CR+1 = 0x02` plus the `SCR_*` `REG_SECCFG`
+//!    value).
 //! 9. `phy::original_values` + `txpower::set_level` at the current
-//!    channel. The ASPM back-door (`_rtl92de_enable_aspm_back_door`)
-//!    is skipped with a note — ASPM stays disabled, as in the 92CE
-//!    port — and `rtl92d_dm_init` is software-only (no DM owner yet).
-//! 10. LC calibrate (`rtl92d_phy_lc_calibrate`) is a follow-up lane
-//!     (mechanical RF calibration, ~100 lines); `rtl92d_phy_reset_iqk_result`
+//!    channel, then `HW_VAR_ETHER_ADDR` ([`mac::station_identity`],
+//!    which also clears `REG_SECCFG` — only under software crypto, so
+//!    a hardware-security value written in step 8 survives), then
+//!    `_rtl92de_enable_aspm_back_door` ([`mac::enable_aspm_back_door`]
+//!    with [`Params::support_backdoor`]), then `rtl92de_dm_init`
+//!    ([`super::dm::Dm::new`], software state carried in
+//!    [`Radio::dm`]).
+//! 10. `rtl92d_phy_lc_calibrate` ([`super::lck::lc_calibrate`]; the
+//!     path count follows `IS_92D_SINGLEPHY`, `init_ready` is still
+//!     false inside `rtl92de_hw_init`, no scan is in progress; a poll
+//!     timeout proceeds as in Linux); `rtl92d_phy_reset_iqk_result`
 //!     is software-only. Then, on a dual-MAC-dual-PHY part, the
 //!     RF-ready poll: `RF_SYN_G6` (`0x2a`) BIT(11) on path A, up to
 //!     10,000 × 50 µs (`MAX_STALL_TIME`); expiry refuses with
@@ -112,6 +116,12 @@ pub struct Params {
     /// EFUSE autoload failed (PG walk skipped, TX power from
     /// defaults).
     pub autoload_fail: bool,
+    /// `rtlhal->earlymode_enable` (false in `rtl92de_init_sw_vars`).
+    pub earlymode_enable: bool,
+    /// `rtl92d_enable_hw_security_config` inputs.
+    pub hw_security: mac::HwSecurity,
+    /// `ppsc->support_backdoor` (`const_support_pciaspm == 1`).
+    pub support_backdoor: bool,
 }
 
 /// The `rtl92de_hw_init` report (see the module docs).
@@ -146,6 +156,10 @@ pub struct Radio {
     pub pg: Option<PgStore>,
     /// `ppsc->rfpwr_state == ERFON` (always true on success).
     pub rf_on: bool,
+    /// `rtl92de_dm_init` software state.
+    pub dm: super::dm::Dm,
+    /// The `rtl92d_phy_lc_calibrate` outcome of this init.
+    pub lc: super::lck::LcOutcome,
 }
 
 /// The `rtl92de_hw_init` post-download tail (see the module docs
@@ -154,8 +168,7 @@ pub async fn configure(io: &impl Io, params: &Params) -> Result<Radio, Error> {
     let band_5g = params.band == Band::On5Ghz;
     power::power_on(io, params.mode, params.interface_index, params.band).await?;
     mac::init_mac(io, params.mode).await?;
-    let tcr = io.read8(REG_TCR_BYTE1)?;
-    io.write8(REG_TCR_BYTE1, tcr | 0x30)?;
+    mac::early_mode(io, params.earlymode_enable)?;
     phy::mac_config(io, params.mode)?;
     let receive_config = mac::trim_receive_config(io)?;
     let bb = phy::bb_config(
@@ -196,7 +209,7 @@ pub async fn configure(io: &impl Io, params: &Params) -> Result<Radio, Error> {
     phy::set_bb(io, phy::RFPGA0_ANALOGPARAMETER2, (1 << 10) | (1 << 11), 3)?;
     mac::hw_configure(io, params.mode)?;
     mac::cam_reset(io)?;
-    mac::station_identity(io, &params.mac)?;
+    mac::enable_hw_security_config(io, params.hw_security)?;
     let OriginalValues {
         initialgain,
         framesync,
@@ -223,6 +236,32 @@ pub async fn configure(io: &impl Io, params: &Params) -> Result<Radio, Error> {
             from_eeprom: false,
         },
     };
+    if params.hw_security.seccfg().is_none() {
+        mac::station_identity(io, &params.mac)?;
+    } else {
+        mac::station_address(io, &params.mac)?;
+    }
+    mac::enable_aspm_back_door(io, params.support_backdoor)?;
+    let dm = super::dm::Dm::new();
+    // The curve-index tables only feed the reload inside the
+    // calibration itself (Linux reads them elsewhere only for debug
+    // prints), so the state stays local; boxed to keep the ~1 KiB
+    // tables off the stack.
+    let mut lck = alloc::boxed::Box::new(super::lck::Lck::new());
+    let lc = super::lck::lc_calibrate(
+        io,
+        &mut lck,
+        &super::lck::LcConfig {
+            rf_type: params.rf_type,
+            mode: params.mode,
+            interface_index: params.interface_index,
+            current_channel: params.channel,
+            band: params.band,
+            init_ready: false,
+            act_scanning: false,
+        },
+    )
+    .await?;
     if params.mode == MacPhyMode::DualMacDualPhy {
         let mut ready = false;
         for _ in 0..RF_READY_POLLS {
@@ -252,5 +291,7 @@ pub async fn configure(io: &impl Io, params: &Params) -> Result<Radio, Error> {
         power_levels,
         pg: bb.pg,
         rf_on: true,
+        dm,
+        lc,
     })
 }

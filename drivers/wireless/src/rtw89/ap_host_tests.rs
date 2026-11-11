@@ -143,7 +143,9 @@ fn smoke_rtw89_ap_host_plan_admits_only_the_20mhz_ccmp_profile() -> TestResult {
     {
         return TestResult::Fail("richer START_AP must be refused, not dropped");
     }
-    if legacy_rates(&[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x6c], false) != 0x80f
+    // CCK 1/2/5.5/11 -> bits 0..3, OFDM 6 -> bit 4, OFDM 54 -> bit 11
+    // (the 2 GHz sband bitrate order `rtw89_phy_ra_sta_update` indexes).
+    if legacy_rates(&[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x6c], false) != 0x81f
         || legacy_rates(&[0x82, 0x0c, 0x6c], true) != 0x810
     {
         return TestResult::Fail("RA legacy bitmap");

@@ -16,9 +16,11 @@
 //! past FW_READY has a CE/HTC/WMI target fake ([`CeTargetFake`]): it
 //! plays the target's CE rings (HTC READY, CONNECT_SERVICE, WMI
 //! SERVICE_READY / READY, HTT VERSION_CONF), so the WCN6750 core-start
-//! test runs past `firmware_start` to `LiveOutcome::Ready`. The IPQ
-//! end-to-end wiring is not done yet (the fake itself is map-driven,
-//! so an IPQ6018 variant is a new test, not a new fake).
+//! test runs past `firmware_start` to `LiveOutcome::Ready`. The IPQ6018
+//! variant drives a direct IPQ6018 core (its WLFW leg is the separate
+//! `smoke_ath11k_wlfw_over_glink_ipq6018`) on the IPQ6018 service map
+//! through two-radio core start and `runtime::start_ahb`
+//! (`smoke_ath11k_ahb_ipq6018_core_start_ce_fake`).
 
 extern crate alloc;
 
@@ -33,8 +35,8 @@ use core::task::{Context, Poll, Waker};
 
 use narf_drivers_qcom_soc::fixtures::{
     build_mdt, build_smem_v12_sized, glink_cmd, glink_data, glink_remote_open, glink_smem_edge,
-    ipq6018_wifi_dt, remote_item, run, sc7280_wifi_dt, CountingKick, FakeAlloc, FakeDelay,
-    FakeRegs, FakeSmc, GlinkRemote, Seg,
+    ipq6018_wifi_dt, qmp_messages, remote_item, run, sc7280_wifi_dt, CountingKick, FakeAlloc,
+    FakeDelay, FakeRegs, FakeSmc, GlinkRemote, Seg, FAKE_CX_ADDR, FAKE_MX_ADDR, FAKE_XO_ADDR,
 };
 use narf_drivers_qcom_soc::glink::{
     GLINK_CMD_INTENT, GLINK_CMD_OPEN, GLINK_CMD_OPEN_ACK, GLINK_CMD_RX_DONE,
@@ -296,6 +298,15 @@ fn env_for(p: &AhbPlatform, ready_bits: u32, ack_bits: u32) -> Box<Env> {
     let mut maps = BTreeMap::new();
     maps.insert(s.region, smem_regs);
     maps.insert(s.hwlock_base, lock_regs);
+    // PAS proxy power (WCN6750): passive cmd-db / RSC / AOSS fakes.
+    if let Some(pw) = &p.remote.platform.power {
+        let f = narf_drivers_qcom_soc::fixtures::pas_power_fakes(pw);
+        maps.insert(pw.cmd_db, f.cmd_db);
+        maps.insert(pw.rsc.drv, f.rsc);
+        if let Some(q) = &pw.qmp {
+            maps.insert(q.msgram, f.msgram);
+        }
+    }
     let mut env = Box::new(Env {
         maps,
         smem: smem_regs,
@@ -411,9 +422,91 @@ fn smoke_ath11k_ahb_live_wcn6750_pas() -> TestResult {
     kt_assert_eq!(live.env.stop_seen.load(Ordering::Relaxed), 1);
     kt_assert_eq!(live.rproc_state(), Some(RprocState::Offline));
     kt_assert_eq!(live.set_wlan_smp2p(0x0001_0002), Some(()), "wlan-smp2p-out");
+    // qcom_pas_start proxy power: load-state on, cx/mx at their highest
+    // corner, xo on; `handover` arrived with `ready`, so the votes were
+    // released right after start (xo off, cx 0, mx 0); the stop sent
+    // load-state off and cast no further vote.
+    let pw = p.remote.platform.power.as_ref().unwrap();
+    let rsc = live.env.maps.get(&pw.rsc.drv).copied().unwrap();
+    let msgram = live
+        .env
+        .maps
+        .get(&pw.qmp.as_ref().unwrap().msgram)
+        .copied()
+        .unwrap();
+    let (addr, data) = proxy_votes(rsc, pw.rsc.tcs_offset);
+    kt_assert_eq!(
+        addr,
+        alloc::vec![
+            FAKE_CX_ADDR,
+            FAKE_MX_ADDR,
+            FAKE_XO_ADDR,
+            FAKE_XO_ADDR,
+            FAKE_CX_ADDR,
+            FAKE_MX_ADDR
+        ]
+    );
+    kt_assert_eq!(data, alloc::vec![5, 4, 3, 0, 0, 0]);
+    kt_assert_eq!(
+        qmp_messages(msgram),
+        alloc::vec![
+            b"{class: image, res: load_state, name: wpss, val: on}".to_vec(),
+            b"{class: image, res: load_state, name: wpss, val: off}".to_vec(),
+        ]
+    );
+    kt_assert!(!live.proxy_held(), "handover released the proxy votes");
     TestResult::Pass
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_ahb_live_wcn6750_pas);
+
+/// The CMD_ADDR / CMD_DATA writes of the first ACTIVE TCS (TCS 0 on
+/// SC7280, `rpmh_rsc_reg_offset_ver_2_7` slot 0).
+fn proxy_votes(rsc: &FakeRegs, tcs_offset: u32) -> (Vec<u32>, Vec<u32>) {
+    (
+        rsc.writes_to(tcs_offset + 0x34),
+        rsc.writes_to(tcs_offset + 0x38),
+    )
+}
+
+/// WCN6750 without an early `handover`: the proxy votes stay cast after
+/// start and `qcom_pas_stop` releases them (load-state off, then
+/// `qcom_pas_handover` because `qcom_q6v5_unprepare` reports it never
+/// came).
+fn smoke_ath11k_ahb_live_wcn6750_proxy_released_at_stop() -> TestResult {
+    let blob: &'static [u8] = Box::leak(sc7280_wifi_dt().into_boxed_slice());
+    let node = find_ahb_devices(blob)[0].0.clone();
+    let p = Box::new(AhbPlatform::probe(blob, &node).unwrap());
+    // ready only (bit 1); stop-ack 3, shutdown-ack 7.
+    let env = env_for(&p, 1 << 1, (1 << 3) | (1 << 7));
+    let mut live = Box::new(LiveAhb::new(*env, blob));
+    let r = run(bring_up(&p, &mut *live));
+    kt_assert!(
+        matches!(r, Some(Err((BringUpStep::QmiReady, AhbError::Failed(_))))),
+        "fails at qmi_ready"
+    );
+    kt_assert_eq!(live.rproc_state(), Some(RprocState::Offline));
+    let pw = p.remote.platform.power.as_ref().unwrap();
+    let rsc = live.env.maps.get(&pw.rsc.drv).copied().unwrap();
+    let (addr, data) = proxy_votes(rsc, pw.rsc.tcs_offset);
+    kt_assert_eq!(
+        addr,
+        alloc::vec![
+            FAKE_CX_ADDR,
+            FAKE_MX_ADDR,
+            FAKE_XO_ADDR,
+            FAKE_XO_ADDR,
+            FAKE_CX_ADDR,
+            FAKE_MX_ADDR
+        ]
+    );
+    kt_assert_eq!(data, alloc::vec![5, 4, 3, 0, 0, 0]);
+    kt_assert!(!live.proxy_held(), "stop released the proxy votes");
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_live_wcn6750_proxy_released_at_stop
+);
 
 // ── fake WLFW server over GLINK ──────────────────────────────────
 
@@ -1463,12 +1556,11 @@ kernel_test_in!(
 // the reg path. A future lane can add it once the struct is
 // grounded.
 //
-// The fake answers CONNECT_SERVICE only for HTT_DATA_MSG and
-// WMI_CONTROL: WCN6750 is single-pdev (`wmi_ep_count = 1`), so the
-// host never connects WMI_CONTROL_MAC1/MAC2 here. An IPQ multi-pdev
-// variant needs those two services answered as well (their endpoint
-// ids follow the endpoint order after WMI_CONTROL); that is a test
-// addition, not a fake change — the map already drives the pipes.
+// The fake answers CONNECT_SERVICE for HTT_DATA_MSG, WMI_CONTROL and
+// WMI_CONTROL_MAC1: WCN6750 is single-pdev (`wmi_ep_count = 1`) and
+// never connects MAC1; IPQ6018 (`max_radios = 2`, `wmi_ep_count = 2`)
+// does, and its MAC1 commands arrive on CE7. WMI_CONTROL_MAC2 (IPQ8074
+// only, three radios) is not answered.
 //
 // The fake holds raw pointers to the ring / bounce buffers, captured
 // after `hal_ce_alloc` while the test owns `live`: the buffers never
@@ -1501,6 +1593,16 @@ const TARGET_CE_MAP_QCA6390: TargetCeMap = TargetCeMap {
     htt_dl: 1,
 };
 
+/// IPQ6018 (Linux `hw.c` `ath11k_target_service_to_ce_map_wlan_ipq6018`):
+/// RSVD_CTRL IN→1, WMI_CONTROL and WMI_CONTROL_MAC1 IN→2, HTT_DATA_MSG
+/// IN→1. Host→target: RSVD_CTRL OUT→0, WMI_CONTROL OUT→3,
+/// WMI_CONTROL_MAC1 OUT→7, HTT_DATA_MSG OUT→4.
+const TARGET_CE_MAP_IPQ6018: TargetCeMap = TargetCeMap {
+    ctrl_dl: 1,
+    wmi_dl: 2,
+    htt_dl: 1,
+};
+
 /// The target MAC the fake reports in the WMI READY event — the same
 /// fixture value as the HIF-level `Fw` (`core_tests.rs` `FW_MAC`), so
 /// the core's `mac_addr` assertion matches the established fixture.
@@ -1517,13 +1619,18 @@ mod htc_msg {
 /// HTC service ids (Linux `htc.h` `ATH11K_HTC_SVC_ID_*`).
 mod htc_svc {
     pub const WMI_CONTROL: u16 = 0x0100;
+    /// `SVC(ATH11K_HTC_SVC_GRP_WMI, 5)`.
+    pub const WMI_CONTROL_MAC1: u16 = 0x0105;
     pub const HTT_DATA_MSG: u16 = 0x0300;
 }
 
-/// HTC endpoint ids (Linux `htc.h` `enum ath11k_htc_ep_id`).
+/// HTC endpoint ids (Linux `htc.h` `enum ath11k_htc_ep_id`). The
+/// target assigns them in CONNECT_SERVICE_RESP; the fake hands out the
+/// next free id per connected service.
 mod htc_ep {
     pub const HTT: u8 = 1;
     pub const WMI: u8 = 2;
+    pub const WMI_MAC1: u8 = 3;
 }
 
 /// WMI event ids (Linux `wmi.h` `enum wmi_tlv_event_id`).
@@ -1539,6 +1646,7 @@ mod wmi_ev {
 mod wmi_tag {
     pub const ARRAY_UINT32: u16 = 0x10;
     pub const ARRAY_STRUCT: u16 = 0x12;
+    pub const ARRAY_FIXED_STRUCT: u16 = 0x13;
     pub const SERVICE_READY_EVENT: u16 = 0x20;
     pub const READY_EVENT: u16 = 0x23;
     pub const SERVICE_READY_EXT_EVENT: u16 = 0x1ac;
@@ -1603,6 +1711,10 @@ struct CeTargetScript {
     htt_version_conf: bool,
     /// MAC reported in the READY event.
     mac: [u8; 6],
+    /// Per-radio MACs in the READY event's `ARRAY_FIXED_STRUCT`
+    /// (`num_extra_mac_addr`; Linux `ath11k_wmi_tlv_rdy_parse` uses
+    /// them only when `num_radios > 1`). Empty on single-pdev parts.
+    extra_macs: Vec<[u8; 6]>,
 }
 
 impl Default for CeTargetScript {
@@ -1621,6 +1733,7 @@ impl Default for CeTargetScript {
             return_init_credit: true,
             htt_version_conf: true,
             mac: TGT_MAC,
+            extra_macs: Vec::new(),
         }
     }
 }
@@ -1684,6 +1797,11 @@ struct CeTargetFake {
     ver_conf_sent: bool,
     connect_htt_seen: bool,
     connect_wmi_seen: bool,
+    /// WMI_CONTROL_MAC1 connect seen / answered (multi-pdev only).
+    connect_wmi1_seen: bool,
+    conn_resp_wmi1: bool,
+    /// WMI commands consumed on the MAC1 endpoint.
+    wmi1_cmds: usize,
     setup_complete_seen: bool,
     init_seen: bool,
     ver_req_seen: bool,
@@ -1787,6 +1905,9 @@ impl CeTargetFake {
             ver_conf_sent: false,
             connect_htt_seen: false,
             connect_wmi_seen: false,
+            connect_wmi1_seen: false,
+            conn_resp_wmi1: false,
+            wmi1_cmds: 0,
             setup_complete_seen: false,
             init_seen: false,
             ver_req_seen: false,
@@ -2054,6 +2175,12 @@ impl CeTargetFake {
                             }
                         }
                     }
+                    htc_msg::CONNECT_SERVICE if svc == htc_svc::WMI_CONTROL_MAC1 => {
+                        self.connect_wmi1_seen = true;
+                        let r = Self::conn_svc_resp(svc, 0, htc_ep::WMI_MAC1, 2048);
+                        self.queue_ctrl(&r);
+                        self.conn_resp_wmi1 = true;
+                    }
                     htc_msg::SETUP_COMPLETE_EX => {
                         self.setup_complete_seen = true;
                         if self.script.svc_ready {
@@ -2086,7 +2213,7 @@ impl CeTargetFake {
                         &[]
                     };
                     if self.script.ready_event {
-                        let ev = Self::ready_event(self.script.mac);
+                        let ev = Self::ready_event(self.script.mac, &self.script.extra_macs);
                         self.queue_wmi(&ev, tr);
                         self.ready_event_sent = true;
                     } else if !tr.is_empty() {
@@ -2101,6 +2228,15 @@ impl CeTargetFake {
                     let f = Self::htc_frame(htc_ep::WMI, &[], &tr);
                     self.dl_queue[self.map.wmi_dl as usize].push_back(f);
                 }
+            }
+            // CE7: host→target WMI on the MAC1 endpoint (IPQ6018 map
+            // WMI_CONTROL_MAC1 OUT→7): no event is owed during core
+            // start; return the credit.
+            7 if eid == htc_ep::WMI_MAC1 && p.len() >= 4 => {
+                self.wmi1_cmds += 1;
+                let tr = Self::credit_trailer(&[(htc_ep::WMI_MAC1, 1)]);
+                let f = Self::htc_frame(htc_ep::WMI_MAC1, &[], &tr);
+                self.dl_queue[self.map.wmi_dl as usize].push_back(f);
             }
             // CE4: host→target HTT.
             4 if eid == htc_ep::HTT && p.first() == Some(&0) => {
@@ -2361,33 +2497,43 @@ impl CeTargetFake {
     /// fw_abi_vers[6], mac_addr, status, num_dscp_table,
     /// num_extra_mac_addr, num_total_peers, num_extra_peers,
     /// max_ast_index, pktlog_defs_checksum). The MAC is two words:
-    /// bytes 0..3 LE, then bytes 4..5 in the low half.
-    fn ready_event(mac: [u8; 6]) -> Vec<u8> {
-        let w0 = u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]);
-        let w1 = u32::from_le_bytes([mac[4], mac[5], 0, 0]);
-        Self::event(
-            wmi_ev::READY,
-            &[Self::tlv(
-                wmi_tag::READY_EVENT,
-                &Self::le(&[
-                    1,
-                    2,
-                    3,
-                    4,
-                    5,
-                    6,
-                    w0,
-                    w1,
-                    0,
-                    0,
-                    0,
-                    512,
-                    0,
-                    0x1000,
-                    0xcafe_babe,
-                ]),
-            )],
-        )
+    /// bytes 0..3 LE, then bytes 4..5 in the low half (`struct
+    /// wmi_mac_addr`). With `extra` MACs, `num_extra_mac_addr` is their
+    /// count and an `ARRAY_FIXED_STRUCT` of `wmi_mac_addr`s (8 bytes
+    /// each) follows, as `ath11k_wmi_tlv_rdy_parse` reads it.
+    fn ready_event(mac: [u8; 6], extra: &[[u8; 6]]) -> Vec<u8> {
+        let mac_words = |m: [u8; 6]| {
+            [
+                u32::from_le_bytes([m[0], m[1], m[2], m[3]]),
+                u32::from_le_bytes([m[4], m[5], 0, 0]),
+            ]
+        };
+        let [w0, w1] = mac_words(mac);
+        let mut tlvs = alloc::vec![Self::tlv(
+            wmi_tag::READY_EVENT,
+            &Self::le(&[
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                w0,
+                w1,
+                0,
+                0,
+                extra.len() as u32,
+                512,
+                0,
+                0x1000,
+                0xcafe_babe,
+            ]),
+        )];
+        if !extra.is_empty() {
+            let words: Vec<u32> = extra.iter().flat_map(|m| mac_words(*m)).collect();
+            tlvs.push(Self::tlv(wmi_tag::ARRAY_FIXED_STRUCT, &Self::le(&words)));
+        }
+        Self::event(wmi_ev::READY, &tlvs)
     }
 }
 
@@ -2449,13 +2595,22 @@ fn smoke_ath11k_ahb_live_wcn6750_wlfw_server() -> TestResult {
     // the future — so the poll loop lives in its own block, and the
     // borrow ends at the block's close, before anything below reads
     // `live` again.
+    //
+    // The core half has no CE target behind it, so `core_start` fails
+    // on its HTC/WMI timeouts. Those are measured on the fixture clock,
+    // but each wait slice is a real `CeIrqWait` sleep of up to
+    // `CORE_SLICE_MS` unless a CE / DP interrupt is pending — so the
+    // bound is real time (generous, a hang detector), not a poll count:
+    // how much real time a fixed number of polls covers depends on the
+    // poll cost and on interrupt state other tests leave behind.
     let mut server: Option<GlinkWlfwServer<'_>> = None;
     let out = {
         let mut fut = pin!(bring_up(&p, &mut *live));
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut out = None;
-        for _ in 0..200_000 {
+        let give_up = super::super::ce::monotonic_ms() + 30_000;
+        while super::super::ce::monotonic_ms() < give_up {
             if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
                 out = Some(v);
                 break;
@@ -2784,6 +2939,187 @@ fn smoke_ath11k_ahb_live_wcn6750_ce_fake_refuse_wmi() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath11k",
     smoke_ath11k_ahb_live_wcn6750_ce_fake_refuse_wmi
+);
+
+// ── IPQ6018 core start against the CE/HTC/WMI target fake ──────────
+
+/// Zeroed MMIO for the direct IPQ6018 core: reads 0, writes ignored. The
+/// fake plays the target through ring memory and `rdp` only (see the
+/// fake's module notes), so no register model is needed.
+#[derive(Clone, Copy, Default)]
+struct ZeroIo;
+
+impl super::super::power::ChipIo for ZeroIo {
+    fn read32(&self, _offset: u32) -> u32 {
+        0
+    }
+    fn write32(&self, _offset: u32, _value: u32) {}
+    fn delay_ms(&self, _ms: u32) {}
+    fn restore_window(&self) {}
+}
+
+/// The WLFW leg for IPQ6018 is its own fixture
+/// (`smoke_ath11k_wlfw_over_glink_ipq6018`); this core starts right at
+/// `firmware_start`, which the firmware accepts.
+struct StartedQmi;
+
+impl super::super::core::QmiFw for StartedQmi {
+    async fn firmware_start(
+        &mut self,
+        _mode: u32,
+        _shadow_reg_v2: &[u32],
+    ) -> Result<(), super::super::wlfw::WlfwError> {
+        Ok(())
+    }
+    async fn firmware_stop(&mut self) {}
+}
+
+/// Small DP rings (the no-MSI rig `ahb_netdev_tests` uses).
+const IPQ_SIZES: super::super::dp_ring::DpRingSizes = super::super::dp_ring::DpRingSizes {
+    wbm_release: 16,
+    tcl_cmd: 8,
+    tcl_status: 8,
+    tcl_data: Some(8),
+    tx_comp: 16,
+    reo_reinject: 8,
+    rx_release: 16,
+    reo_exception: 16,
+    reo_cmd: 8,
+    reo_status: 16,
+    reo_dst: 16,
+    rxdma_buf: 16,
+    rx_mac_buf: 16,
+    rxdma_err_dst: 16,
+    rxdma_mon_status: 8,
+    rxdma_mon_buf: 8,
+    rxdma_mon_dst: 8,
+    rxdma_mon_desc: 8,
+    tx_status_fifo: 8,
+    n_link_desc: Some(64),
+};
+
+/// IPQ6018 core start past `firmware_start` against the CE/HTC/WMI
+/// target fake on the IPQ6018 service map, then `runtime::start_ahb`:
+///
+/// - HTC: READY on CE1 (RSVD_CTRL IN→1), CONNECT_SERVICE for HTT,
+///   WMI_CONTROL *and* WMI_CONTROL_MAC1 (`max_radios = 2` → Linux
+///   `ath11k_htc_init` `wmi_ep_count = 2` with no preferred hw mode at
+///   attach), SETUP_COMPLETE_EX;
+/// - WMI: SERVICE_READY / AVAILABLE / EXT (+EXT2); the EXT's DBS mode
+///   (preferred over SINGLE, `ath11k_hw_mode_pri_map`) yields two radios
+///   with firmware pdev ids 1 and 2; INIT is the multi-pdev
+///   `ath11k_init_wmi_config_ipq8074` command on the WMI_CONTROL
+///   endpoint; READY carries one extra MAC per radio;
+/// - HTT VERSION_CONF, then `pdev_create` allocates both pdevs (HTT
+///   SRING_SETUP on CE4 for each);
+/// - `start_ahb` registers one netdev per radio with that radio's READY
+///   extra MAC, resolving the DP mac id (0, 1) to the firmware pdev id
+///   (1, 2) by index.
+fn smoke_ath11k_ahb_ipq6018_core_start_ce_fake() -> TestResult {
+    use super::super::ce::{monotonic_ms, Ce as HostCe, CeMsi, MsiCeIrq};
+    use super::super::core::{Ath11kCore, CeHif, CoreConfig};
+    use super::super::dp_ring::DpHwParams;
+    use super::super::hw::{HwRev, MSI_CONFIG_NONE};
+    use super::super::runtime::DpHooks;
+    const RADIO_MACS: [[u8; 6]; 2] = [
+        [0x00, 0x03, 0x7f, 0x12, 0x34, 0x60],
+        [0x00, 0x03, 0x7f, 0x12, 0x34, 0x61],
+    ];
+    let hw = AhbChip::Ipq6018Hw10.params().hw_params(HwRev::Ipq6018Hw10);
+    let Ok(ce) = HostCe::alloc(
+        &hw,
+        CeMsi {
+            addr: 0,
+            ep_base_data: 0,
+            config: &MSI_CONFIG_NONE,
+        },
+        monotonic_ms,
+    ) else {
+        return TestResult::Fail("IPQ6018 CE alloc");
+    };
+    let script = CeTargetScript {
+        extra_macs: RADIO_MACS.to_vec(),
+        ..CeTargetScript::default()
+    };
+    let Some(mut fake) = CeTargetFake::capture(&ce, TARGET_CE_MAP_IPQ6018, script) else {
+        return TestResult::Fail("IPQ6018 CE geometry");
+    };
+    let hif = CeHif {
+        ce,
+        io: ZeroIo,
+        irq: MsiCeIrq,
+        on_start: || {},
+        clock: monotonic_ms,
+    };
+    let Some(cfg) = CoreConfig::for_hw(&hw) else {
+        return TestResult::Fail("IPQ6018 core config");
+    };
+    let Ok(mut core) = Ath11kCore::new(hif, StartedQmi, cfg) else {
+        return TestResult::Fail("IPQ6018 core new");
+    };
+    let mut hooks = DpHooks::new(
+        DpHwParams::for_rev(hw.hw_rev),
+        hw.hw_rev as u32,
+        IPQ_SIZES,
+        None,
+    );
+    let out = {
+        let mut fut = pin!(core.qmi_firmware_ready(&mut hooks));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut out = None;
+        for _ in 0..200_000 {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                out = Some(v);
+                break;
+            }
+            fake.pump();
+        }
+        // The completing poll posts `pdev_create`'s SRING_SETUPs
+        // synchronously (see `drive_wcn6750_core_start`).
+        fake.pump();
+        out
+    };
+    let Some(Ok(())) = out else {
+        return TestResult::Fail("IPQ6018 core start did not succeed");
+    };
+    kt_assert!(core.is_ready());
+    kt_assert_eq!(core.mac_addr, Some(TGT_MAC));
+    kt_assert_eq!(core.num_radios(), 2);
+    kt_assert_eq!(core.wmi_pdev_eps.len(), 2);
+    kt_assert_eq!(fake.errors, 0);
+    kt_assert!(fake.conn_resp_htt && fake.conn_resp_wmi && fake.conn_resp_wmi1);
+    kt_assert!(fake.setup_complete_seen && fake.svc_ext_sent && fake.ext2_sent);
+    kt_assert!(fake.init_seen && fake.ready_event_sent);
+    kt_assert!(fake.ver_req_seen && fake.ver_conf_sent);
+    kt_assert!(fake.sring_setup_seen > 0);
+    let Some(dp) = hooks.dp.take() else {
+        return TestResult::Fail("IPQ6018 DP missing after core start");
+    };
+    kt_assert_eq!(dp.pdev_mac_ids(), alloc::vec![0, 1]);
+    let ext = core
+        .svc_ext
+        .as_ref()
+        .map(|e| e.pdevs.iter().map(|p| p.pdev_id).collect::<Vec<u32>>());
+    kt_assert_eq!(ext, Some(alloc::vec![1, 2]));
+    let (_shared, r) = super::super::runtime::start_ahb(core, dp);
+    let Ok(macs) = r else {
+        return TestResult::Fail("IPQ6018 start_ahb registered no radio");
+    };
+    kt_assert_eq!(macs, RADIO_MACS.to_vec());
+    for mac in RADIO_MACS {
+        kt_assert!(
+            narf_wireless::registry::list()
+                .into_iter()
+                .any(|p| p.mac() == mac),
+            "IPQ6018 radio netdev registered"
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_ahb_ipq6018_core_start_ce_fake
 );
 
 // ── post-boot SMP2P crash monitoring / recovery ─────────────────────

@@ -48,7 +48,7 @@ kernel_test_in!(
 
 // ── adapter facts ─────────────────────────────────────────────────────────
 
-fn provisioned() -> Vec<u8> {
+pub(crate) fn provisioned() -> Vec<u8> {
     let mut map = vec![0xffu8; adapter::HWSET_MAX_SIZE];
     map[0..2].copy_from_slice(&0x8129u16.to_le_bytes());
     map[0xd0..0xd6].copy_from_slice(&[0x00, 0xe0, 0x4c, 0x87, 0x23, 0xbe]);
@@ -527,7 +527,9 @@ fn smoke_rtl8723be_tx_rx_descriptor_layout() -> TestResult {
                 && s.macid == 3
                 && s.ampdu
                 && s.c2h
-                && s.rate == 0x0c
+                // rtl8723be/trx.h:292-299: RXMCS is dw3[6:0] and RXHT is
+                // dw3 BIT(6), so the HT bit is also rate bit 6.
+                && s.rate == 0x4c
                 && s.is_ht
                 && s.bw == 1
                 && s.short_preamble
@@ -1165,7 +1167,15 @@ fn smoke_rtl8723be_erfon_block_and_channel_grant() -> TestResult {
         {
             return TestResult::Fail("8723BE bt_hw_init order / dispatch");
         }
-        if !(mac < path && path < lck && lck < nav && nav < rx)
+        // `_rtl8723be_init_mac` already clears RXDMA_CONTROL BIT2
+        // (rtl8723be/hw.c:924-925), so the ERFON "Release Rx DMA if
+        // needed" step after NAV_UPPER (hw.c:1430-1434) writes nothing.
+        let last_rx = g
+            .writes
+            .iter()
+            .rposition(|x| x.0 == init::REG_RXDMA_CONTROL);
+        if !(rx < mac && mac < path && path < lck && lck < nav)
+            || last_rx != Some(rx)
             || iqk_at.is_some() != iqk
             || iqk_at.is_some_and(|i| !(path < i && i < lck))
             || radio.iqk.is_some() != iqk
@@ -1264,7 +1274,9 @@ impl Io for RegLog {
 }
 fn reg_log() -> RegLog {
     RegLog(IrqSafeSpinLock::new(RegLogModel {
-        regs: vec![0u8; 0x800],
+        // Through the BB page: the coexistence halt/antenna steps write
+        // `0x948` (`btc8723b2ant_set_ant_path`).
+        regs: vec![0u8; 0x1000],
         writes: Vec::new(),
     }))
 }
@@ -1302,7 +1314,9 @@ fn smoke_rtl8723be_h2c_boxes_pwrmode_and_rpwm() -> TestResult {
     {
         let g = io.0.lock();
         let w: Vec<_> = g.writes.iter().map(|w| (w.0, w.1)).collect();
-        if w[..4] != [(0x1f4, 0), (0x1f5, 0x40), (0x1f6, 0), (0x1f7, 0)]
+        // 7-byte SETPWRMODE: cmd[0..3] in the box, cmd[3..7] = [0, 0, 0x40,
+        // 0] in the extension (rtl8723be/fw.c:154 _rtl8723be_fill_h2c_command).
+        if w[..4] != [(0x1f4, 0), (0x1f5, 0), (0x1f6, 0x40), (0x1f7, 0)]
             || w[4..8] != [(0x1d4, 0x20), (0x1d5, 1), (0x1d6, 0x21), (0x1d7, 2)]
             || w[8] != (0x361, 0x80)
             || w.len() != 9
@@ -1675,7 +1689,7 @@ kernel_test_in!(
 // ── Signed envelopes (`rtl8723be/envelope.rs`) ───────────────────────────
 
 /// Test board factory (synthetic values, not any board's).
-fn be_factory() -> crate::rtlwifi::efuse::Factory {
+pub(crate) fn be_factory() -> crate::rtlwifi::efuse::Factory {
     crate::rtlwifi::efuse::Factory {
         mac: [0x00, 0xe0, 0x4c, 0x87, 0x23, 0xbe],
         logical: [0u8; 512],
@@ -1683,7 +1697,7 @@ fn be_factory() -> crate::rtlwifi::efuse::Factory {
 }
 
 /// A NAPC row: (channel, bandwidth, offset, curve-value fn).
-type NapcRow = (u8, u8, u8, fn(u8, u8) -> i16);
+pub(crate) type NapcRow = (u8, u8, u8, fn(u8, u8) -> i16);
 
 /// Build a NAPC envelope from the documented layout (header 96, rows of
 /// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
@@ -1691,7 +1705,12 @@ type NapcRow = (u8, u8, u8, fn(u8, u8) -> i16);
 /// (channel, 20, 0, fn) for v1. The identity is the board's factory
 /// identity; the MAC matches the factory. The curve fn takes the curve
 /// index (0 CCK, 1 OFDM, 2 HT) and the TXAGC index.
-fn be_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRow]) -> Vec<u8> {
+pub(crate) fn be_napc_fixture(
+    version: u16,
+    antenna: i16,
+    qualified: i16,
+    rows: &[NapcRow],
+) -> Vec<u8> {
     let factory = be_factory();
     let identity = crate::rtlwifi::radio::factory_identity(&factory);
     let total = 96 + rows.len() * 388;
@@ -1728,7 +1747,7 @@ fn be_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRow])
 
 /// Flat rising curves: output `2 * index` quarter dBm, so a 20 dBm
 /// ceiling with antenna 0 admits index 40 on every rate.
-fn be_rising(_curve: u8, idx: u8) -> i16 {
+pub(crate) fn be_rising(_curve: u8, idx: u8) -> i16 {
     i16::from(idx) * 2
 }
 
@@ -1742,7 +1761,7 @@ fn be_no_ht(curve: u8, idx: u8) -> i16 {
 }
 
 /// US 2.4 GHz domain: 2402-2472 MHz, 40 MHz, 20 dBm.
-fn be_us_domain() -> narf_wireless::reg::RegulatoryDomain {
+pub(crate) fn be_us_domain() -> narf_wireless::reg::RegulatoryDomain {
     use narf_wireless::reg::*;
     RegulatoryDomain {
         country_code: *b"US",
@@ -1982,13 +2001,14 @@ fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
     }
     // Golden bytes, hand-computed from `trx::TxDesc::fill`:
     // dw0 = offset 40<<16 | len 100 | firstseg<<27 | lastseg<<26
-    // (OWN clear); dw3 = seq<<12 | use_driver_rate<<8; dw4 = rate 12 |
+    // (OWN clear); dw3 = use_driver_rate<<8 (the sequence lives only in
+    // dw9[23:12], rtl8723be/trx.h:202); dw4 = rate 12 |
     // 0x1f<<8 | 0xf<<13 (= 0x1ff0c); dw7 = len; dw9 = seq<<12;
     // dw10 = buffer.
     if slot.dw[0] != 0x0c28_0064
         || slot.dw[1] != 0
         || slot.dw[2] != 0
-        || slot.dw[3] != 0x0012_3100
+        || slot.dw[3] != 0x0000_0100
         || slot.dw[4] != 0x0001_ff0c
         || slot.dw[5] != 0
         || slot.dw[6] != 0
@@ -2016,7 +2036,9 @@ fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
     if owner.fill_tx_slot(&mut bslot, &beacon).is_err() || bslot.queue_sel() != trx::QSLT_BEACON {
         return TestResult::Fail("8723BE packet beacon queuesel");
     }
-    // RTS variant: rts_en bit 12, RTS rate in dw4, SC + short in dw5.
+    // RTS variant: rts_en bit 12 beside use_rate bit 8 in dw3 (the
+    // sequence is dw9, trx.h set_tx_desc_seq), RTS rate in dw4, SC +
+    // short in dw5.
     let rts_tx = TxFrame {
         rts: Some(Rts {
             rts_enable: true,
@@ -2029,8 +2051,8 @@ fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
     };
     let mut rslot = trx::TxDesc::default();
     if owner.fill_tx_slot(&mut rslot, &rts_tx).is_err()
-        || rslot.dw[3] != 0x0012_4100
-        || rslot.dw[4] != 0x041f_f00c
+        || rslot.dw[3] != 0x0000_1100
+        || rslot.dw[4] != 0x0401_ff0c
         || rslot.dw[5] != 0x0000_5000
     {
         return TestResult::Fail("8723BE packet RTS descriptor bytes");
@@ -2159,4 +2181,87 @@ fn smoke_rtl8723be_packet_rx_c2h_and_notify() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_packet_rx_c2h_and_notify
+);
+
+// ── station MAC registers / reserved page ─────────────────────────────────
+
+/// `rtl8723be_set_fw_rsvdpagepkt` body over the verbatim `fw.c` initializer,
+/// and the `rtl8723be_set_hw_reg` station rows: `HW_VAR_BASIC_RATE` (`| 1`,
+/// INIRTS index), `update_channel_access_setting` SIFS 0x0a0a without HT,
+/// `HW_VAR_ACK_PREAMBLE` at `REG_TRXPTCL_CTL + 2` BIT(1), and
+/// `_rtl8723be_set_media_status` / `set_check_bssid` for the linked station.
+fn smoke_rtl8723be_station_registers_and_rsvd_page() -> TestResult {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(&rsvd_page::TEMPLATE);
+    let digest = hash.finalize();
+    let hex: alloc::string::String = digest.iter().map(|b| alloc::format!("{b:02x}")).collect();
+    if hex != rsvd_page::TEMPLATE_SHA256 {
+        return TestResult::Fail("8723BE reserved_page_packet digest");
+    }
+    let own = [0x00, 0xe0, 0x4c, 1, 2, 3];
+    let bssid = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let Some(pages) = rsvd_page::pages(own, bssid, 5) else {
+        return TestResult::Fail("8723BE reserved pages refused");
+    };
+    let ps = rsvd_page::PSPOLL_PG * rsvd_page::PAGE;
+    if pages[10..16] != own
+        || pages[16..22] != bssid
+        || pages[ps + 2..ps + 4] != [5, 0xc0]
+        || pages[ps + 10..ps + 16] != own
+        || pages[rsvd_page::BT_QOS_NULL_PG * rsvd_page::PAGE + 4..][..6] != bssid
+        || rsvd_page::pages(own, bssid, 0).is_some()
+    {
+        return TestResult::Fail("8723BE reserved page substitutions");
+    }
+    let io = reg_log();
+    if station::basic_rate(0x15f) != (0x15f, 8) || station::basic_rate(0x002) != (0x003, 1) {
+        return TestResult::Fail("8723BE HW_VAR_BASIC_RATE");
+    }
+    io.0.lock().regs[usize::from(station::REG_TRXPTCL_CTL + 2)] = 0xff;
+    // ERP-less short-preamble, short-slot capability; legacy station.
+    if station::configure_rates(&io, 0xfff, 0x15, 0x420, None, false) != Ok((true, true)) {
+        return TestResult::Fail("8723BE configure_rates");
+    }
+    {
+        let g = io.0.lock();
+        let r = |a: u16| g.regs[usize::from(a)];
+        // HW_VAR_BASIC_RATE takes the peer's supported rates
+        // (rtlwifi/core.c:1314): (0xfff & 0x15f) | 1 = 0x15f, highest bit 8.
+        if r(station::REG_RRSR) != 0x5f
+            || r(station::REG_RRSR + 1) != 0x01
+            || r(station::REG_INIRTS_RATE_SEL) != 8
+            || r(station::REG_SLOT) != 9
+            || r(station::REG_SIFS_CTX + 1) != 0x0a
+            || r(station::REG_SIFS_TRX + 1) != 0x0a
+            || r(station::REG_RESP_SIFS_OFDM) != 0x0e
+            || r(station::REG_RESP_SIFS_OFDM + 1) != 0x0e
+            || r(station::REG_TRXPTCL_CTL + 2) != 0xff
+            || !g.writes.contains(&(station::REG_EDCA_BK_PARAM, 0xa44f, 4))
+            || g.writes.iter().any(|w| w.0 == 0x0508)
+        {
+            return TestResult::Fail("8723BE station access/qos rows");
+        }
+    }
+    let mut receive = station::ReceiveConfig {
+        rcr: mac::RCR,
+        bcn_ctrl: 0x1f,
+    };
+    io.0.lock().regs[usize::from(station::MSR)] = 0x0c;
+    if station::network_type_station(&io, &mut receive, true).is_err() {
+        return TestResult::Fail("8723BE network type");
+    }
+    let g = io.0.lock();
+    if g.regs[usize::from(station::MSR)] != 0x0e
+        || g.regs[usize::from(station::REG_BCNTCFG + 1)] != 0x66
+        || receive.rcr != mac::RCR | station::RCR_CBSSID_DATA | station::RCR_CBSSID_BCN
+        || receive.bcn_ctrl != 0x1f & !(1 << 1) & !(1 << 4)
+        || g.regs[usize::from(h2c::REG_BCN_CTRL)] != receive.bcn_ctrl
+    {
+        return TestResult::Fail("8723BE media status / check BSSID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_station_registers_and_rsvd_page
 );

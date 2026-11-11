@@ -77,6 +77,13 @@ pub(in crate::ath9k) trait Engine {
     fn periodic_beacon(&mut self, rssi: i8);
     fn periodic_service(&mut self, eligible: bool) -> Result<(), Error>;
     fn periodic_deferred(&self) -> Result<bool, Error>;
+    /// The `ath9k_queue_reset` cause behind this engine's last failure,
+    /// when an in-place `ath_reset` (rather than a generation retirement)
+    /// is how Linux recovers it. Engines without an in-place reset path
+    /// report none.
+    fn reset_request(&self) -> Option<crate::ath9k::station::ResetType> {
+        None
+    }
 }
 
 impl<P: Port> Engine for Packet<P> {
@@ -445,5 +452,8 @@ impl<P: Port> Engine for Dispatch<P> {
     }
     fn periodic_deferred(&self) -> Result<bool, Error> {
         dispatch!(self.periodic_deferred())
+    }
+    fn reset_request(&self) -> Option<crate::ath9k::station::ResetType> {
+        dispatch!(self.reset_request())
     }
 }

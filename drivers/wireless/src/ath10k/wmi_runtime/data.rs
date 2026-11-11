@@ -435,7 +435,10 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
         if self.failed
             || self.station_link().is_none()
             || self.station.data.as_ref().is_none_or(|d| {
-                d.management.is_none() && d.wmm_update.is_none() && d.protection_update.is_none()
+                d.management.is_none()
+                    && d.wmm_update.is_none()
+                    && d.protection_update.is_none()
+                    && d.keys.is_empty()
             })
         {
             return Ok(coexistence);
@@ -462,10 +465,15 @@ impl<T: Hif + HostMemory + HttMemory> Radio<T> {
             }
         }
         self.failed = true;
+        // A key committed by a reply the synchronous drain completed (the
+        // group-key handshake after association) is programmed here, as
+        // mac80211's set_key runs from process context after the reply
+        // (mac.c ath10k_set_key -> ath10k_install_key).
+        let keys = self.send_station_keys().await?;
         let sent = self.send_station_management().await?;
         let wmm = self.send_station_wmm(&|| Ok(())).await?;
         self.failed = false;
-        Ok(coexistence || sent || wmm)
+        Ok(coexistence || keys || sent || wmm)
     }
     pub fn has_station_data(&self) -> bool {
         self.station.data.is_some()

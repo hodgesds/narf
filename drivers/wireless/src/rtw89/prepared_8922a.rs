@@ -79,6 +79,7 @@
 //! RPQ will ever arrive for it); the owner stays usable for the
 //! remaining slots.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use narf_bus::{BusDevice, BusDeviceCap, MmioRegion};
@@ -109,6 +110,10 @@ use super::tx_transport::Completion;
 /// before `prepare_data` / `prepare_data_with_info`, then copies
 /// only the built length (`Prepared::header.len()`).
 pub(super) const MAX_HEADER_BYTES: usize = 132;
+
+/// `RTW89_PCI_MULTITAG` (`pci.h:1131`): consumed CH12 buffers the
+/// release path keeps back before freeing.
+pub(super) const FWCMD_MULTITAG: usize = 8;
 
 /// Prepared-owner failures. Every variant is a refusal; a refused
 /// call leaves no partially-programmed artifact behind except the
@@ -239,6 +244,30 @@ impl mac_pre_init_8922a::Regs for MmioRegs<'_> {
     }
 }
 
+/// [`super::fwdl_be::Regs`] over the same BAR2 window, for the BE
+/// firmware-download preparation and WCPU control. Infallible like the
+/// other ports; `R_BE_BOOT_REASON` needs the 16-bit accessors.
+impl super::fwdl_be::Regs for MmioRegs<'_> {
+    fn read16(&mut self, address: u32) -> u16 {
+        // SAFETY: caller's owned-BAR2 contract; `address` is a
+        // BAR2 offset inside the mapped window.
+        unsafe { self.0.read16(address as u64) }
+    }
+
+    fn read32(&mut self, address: u32) -> u32 {
+        <Self as Regs>::read32(self, address)
+    }
+
+    fn write16(&mut self, address: u32, value: u16) {
+        // SAFETY: same.
+        unsafe { self.0.write16(address as u64, value) }
+    }
+
+    fn write32(&mut self, address: u32, value: u32) {
+        <Self as Regs>::write32(self, address, value)
+    }
+}
+
 /// The prepared 8922A device: factory identity, admitted stations,
 /// BE data + H2C transport owners, and ring state. Constructed by
 /// `pci::bring_up` for a probed 8922A device and retained on
@@ -266,6 +295,18 @@ pub(crate) struct Prepared8922a {
     /// firmware echoes in its C2H ack. A buffer leaves this list
     /// only on its ack (see `release_h2c_by_ack`).
     h2c_retained: Vec<(FramedH2c, DmaBuffer)>,
+    /// Every kicked CH12 buffer in TXBD order (Linux
+    /// `rtwpci->h2c_queue`). `Some` owns a buffer freed on TXBD
+    /// consumption (FWDL header / section packets — no firmware
+    /// ack exists for them); `None` marks an ack-retained H2C
+    /// whose buffer lives in `h2c_retained`.
+    fwcmd_in_flight: VecDeque<Option<DmaBuffer>>,
+    /// Consumed CH12 buffers still held back by the multi-tag
+    /// window (Linux `rtwpci->h2c_release_queue`).
+    fwcmd_release: VecDeque<DmaBuffer>,
+    /// Outcome of the firmware download `pci::bring_up` ran
+    /// (`Rtw89Device::boot_8922a`); `None` until it runs.
+    firmware: Option<Result<(), super::pci::Boot8922aError>>,
     /// Core chip version read during the MAC pre-init
     /// (`mac_pre_init_8922a::read_chip_ver`). `None` until the
     /// pre-init runs — the pci owner records it, not the probe
@@ -296,6 +337,9 @@ impl Prepared8922a {
             data_retained: Vec::new(),
             h2c_seq: H2cSeqAllocator::new(),
             h2c_retained: Vec::new(),
+            fwcmd_in_flight: VecDeque::new(),
+            fwcmd_release: VecDeque::new(),
+            firmware: None,
             chip_ver: None,
             completion: completion_8922a::Worker::new(DEFAULT_RXBD_NUM, DEFAULT_RXBD_NUM)
                 .map_err(Error::Completion)?,
@@ -539,6 +583,10 @@ impl Prepared8922a {
     ) -> Result<(), Error> {
         let worker = completion_8922a::Worker::new(rx_len, rx_len).map_err(Error::Completion)?;
         dma_8922a::reset_trx_rings(regs, tx_phys, rx_phys, tx_len, rx_len)?;
+        // `rtw89_pci_ops_reset` (pci.c:1877): after the ring reset
+        // every queued CH12 buffer is released (`release_all`).
+        self.h2c.reset();
+        self.release_fwcmd(self.fwcmd_in_flight.len(), true);
         self.completion = worker;
         self.rings_programmed = true;
         Ok(())
@@ -807,6 +855,50 @@ impl Prepared8922a {
         self.h2c_retained.push((framed, buf));
     }
 
+    /// Record one just-prepared CH12 buffer in TXBD order (Linux
+    /// `rtw89_pci_fwcmd_submit` queues the skb on `h2c_queue`).
+    /// `Some(buf)` is freed once the chip consumes its TXBD (FWDL
+    /// header + section packets); `None` stands for an H2C whose
+    /// buffer `retain_h2c` keeps until its ack.
+    pub(super) fn retain_fwcmd(&mut self, buf: Option<DmaBuffer>) {
+        self.fwcmd_in_flight.push_back(buf);
+    }
+
+    /// `__rtw89_pci_check_and_reclaim_tx_fwcmd_resource`
+    /// (`pci.c:1234`): observe the CH12 read pointer, move every
+    /// consumed buffer to the release queue, free all but the
+    /// last `RTW89_PCI_MULTITAG`, and return the free CH12 TXBD
+    /// count. `rtw89_h2c_tx` refuses a submit when it is zero.
+    pub(super) fn reclaim_fwcmd(&mut self, regs: &mut impl Regs) -> Result<u16, Error> {
+        if !self.rings_programmed {
+            return Err(Error::NotProgrammed);
+        }
+        let cnt = self.h2c.observe_rp(regs).map_err(Error::Transport)?;
+        self.release_fwcmd(usize::from(cnt), false);
+        Ok(self.h2c.avail())
+    }
+
+    /// Buffers kicked on CH12 and not yet consumed, plus consumed
+    /// ones still held by the multi-tag window.
+    pub(super) fn fwcmd_held(&self) -> (usize, usize) {
+        (self.fwcmd_in_flight.len(), self.fwcmd_release.len())
+    }
+
+    /// `rtw89_pci_release_fwcmd` (`pci.c:100`).
+    fn release_fwcmd(&mut self, cnt: usize, release_all: bool) {
+        for _ in 0..cnt {
+            match self.fwcmd_in_flight.pop_front() {
+                Some(Some(buf)) => self.fwcmd_release.push_back(buf),
+                Some(None) => {}
+                None => break,
+            }
+        }
+        let keep = if release_all { 0 } else { FWCMD_MULTITAG };
+        while self.fwcmd_release.len() > keep {
+            drop(self.fwcmd_release.pop_front());
+        }
+    }
+
     /// Release the retained H2C buffer whose FWCMD identity
     /// `ack` echoes, reporting its DONE_ACK return code (or
     /// `None` for a REC_ACK). `None` when no retained buffer
@@ -830,6 +922,21 @@ impl Prepared8922a {
     /// tail and reads the chip version.
     pub(super) fn record_chip_ver(&mut self, ver: HalChipVer) {
         self.chip_ver = Some(ver);
+    }
+
+    /// Record the firmware download outcome (`pci::bring_up`).
+    pub(super) fn record_firmware(&mut self, outcome: Result<(), super::pci::Boot8922aError>) {
+        self.firmware = Some(outcome);
+    }
+
+    /// True once the WCPU + BBMCU0 firmware reported FreeRTOS ready.
+    pub(super) fn firmware_ready(&self) -> bool {
+        matches!(self.firmware, Some(Ok(())))
+    }
+
+    /// The firmware download outcome, if it ran.
+    pub(super) fn firmware(&self) -> Option<Result<(), super::pci::Boot8922aError>> {
+        self.firmware
     }
 
     /// The core chip version read during the MAC pre-init, if

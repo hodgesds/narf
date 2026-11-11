@@ -230,34 +230,50 @@ impl Hif for HttModel {
             return Ok(());
         }
         if payload.first() == Some(&1) {
-            let expected = if self.config.continuous {
-                [
-                    1, 0x44, 0, 0x0c, 14, 0, 0, 0, 0, 0x20, 0x52, 0, 0xff, 0xff, 0, 0,
-                ]
+            // `struct htt_data_tx_desc`: the MSDU id (bytes 6..8) is any
+            // allocated one, and `frags_paddr` (bytes 8..12) names this
+            // MSDU's own fragment list. The fixture hands out 4 KiB-rounded
+            // DMA buffers from `tx_next`: the payload, then (non-continuous)
+            // the 16-byte list, so the list is the last buffer and the
+            // payload the one before; continuous parts index the shared
+            // fragment area (fixture base 0x522000) by `id * 64`.
+            if payload.len() < 16 {
+                return Err(BmiError::BadResponse);
+            }
+            let id = u16::from_le_bytes([payload[6], payload[7]]);
+            let (list, data) = if self.config.continuous {
+                (0x52_2000 + u64::from(id) * 64, self.tx_next - 4096)
             } else {
-                [
-                    1, 0x44, 0, 0x0c, 14, 0, 0, 0, 0, 0x10, 0x80, 0, 0xff, 0xff, 0, 0,
-                ]
+                (self.tx_next - 4096, self.tx_next - 2 * 4096)
             };
+            let mut expected = [1, 0x44, 0, 0x0c, 14, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0];
+            expected[6..8].copy_from_slice(&id.to_le_bytes());
+            expected[8..12].copy_from_slice(&(list as u32).to_le_bytes());
             if storage.tx.pending() != 1
                 || payload.len() != 32
                 || payload[..16] != expected
                 || payload[16..] != [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 8, 0, 0, 0]
+                || storage.tx.snapshot(id).map(|(address, _)| address) != Some(data)
             {
                 return Err(BmiError::BadResponse);
             }
             if self.config.continuous {
                 let ext = storage.fragments.as_ref().unwrap();
-                if ext.bytes[16..24] != [0, 0, 0x80, 0, 0, 0, 14, 0] {
+                let at = usize::from(id) * 64 + 16;
+                let mut want = [0u8; 8];
+                want[..4].copy_from_slice(&(data as u32).to_le_bytes());
+                want[6..].copy_from_slice(&14u16.to_le_bytes());
+                if ext.bytes[at..at + 8] != want {
                     return Err(BmiError::BadResponse);
                 }
             }
             if self.stall_tx {
                 core::future::pending::<()>().await;
             }
+            let [lo, hi] = id.to_le_bytes();
             self.inner
                 .rx
-                .push_back((self.receive_pipe, header(1, &[7, 0, 1, 0, 0, 0, 0, 0])));
+                .push_back((self.receive_pipe, header(1, &[7, 0, 1, 0, lo, hi, 0, 0])));
             return Ok(());
         }
         if payload.first() == Some(&6) {

@@ -824,6 +824,13 @@ impl DataPort for FakeDp {
             .push(if enable { "mon_on" } else { "mon_off" });
         core::future::ready(Ok(()))
     }
+    fn monitor_mode(&self, start: bool) -> impl Future<Output = Result<(), i32>> + Send {
+        self.0
+            .lock()
+            .dp_calls
+            .push(if start { "monitor_on" } else { "monitor_off" });
+        core::future::ready(Ok(()))
+    }
     fn vdev_tx_attach(&self, _vdev_id: u32, _addr: [u8; 6], _ap: bool) {
         self.0.lock().dp_calls.push("vdev_tx_attach");
     }
@@ -1326,6 +1333,71 @@ fn smoke_ath11k_mac_start_sequence() -> TestResult {
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_start_sequence);
 
+/// `MacConfig::for_hw` is the mac-layer slice of Linux core.c
+/// `ath11k_hw_params[]`: `idle_ps`, `supports_sta_ps`,
+/// `vdev_start_delay` and `current_cc_support` are true on the client
+/// parts and false on IPQ8074 / IPQ6018 / IPQ5018 / QCN9074 (each value
+/// read off that chip's table entry).
+fn smoke_ath11k_mac_config_per_hw_rev() -> TestResult {
+    use super::hw::HwRev;
+    run(|| {
+        let client = [
+            HwRev::Qca6390Hw20,
+            HwRev::Wcn6855Hw20,
+            HwRev::Wcn6855Hw21,
+            HwRev::Qca2066Hw21,
+            HwRev::Qca6698aqHw21,
+            HwRev::Wcn6750Hw10,
+        ];
+        let ap = [
+            HwRev::Ipq8074,
+            HwRev::Ipq6018Hw10,
+            HwRev::Ipq5018Hw10,
+            HwRev::Qcn9074Hw10,
+        ];
+        for (revs, want) in [(&client[..], true), (&ap[..], false)] {
+            for &rev in revs {
+                let c = MacConfig::for_hw(rev, 1, false);
+                if c.idle_ps != want
+                    || c.supports_sta_ps != want
+                    || c.vdev_start_delay != want
+                    || c.current_cc_support != want
+                {
+                    return Err("per-hw policy flags differ from ath11k_hw_params");
+                }
+                if c.num_rxdma_per_pdev != 1 || c.single_pdev_only || c.vdev_id != 0 {
+                    return Err("DP fields not taken from the caller");
+                }
+            }
+        }
+        // hw_params.supports_monitor: only IPQ8074, IPQ6018 and QCN9074.
+        for &rev in client.iter().chain(ap.iter()) {
+            let want = matches!(
+                rev,
+                HwRev::Ipq8074 | HwRev::Ipq6018Hw10 | HwRev::Qcn9074Hw10
+            );
+            if MacConfig::for_hw(rev, 1, false).supports_monitor != want {
+                return Err("supports_monitor differs from ath11k_hw_params");
+            }
+        }
+        if MacConfig::wcn6855() != MacConfig::for_hw(HwRev::Wcn6855Hw20, 2, true) {
+            return Err("wcn6855() is not the WCN6855 table entry");
+        }
+        if MacConfig::for_hw(HwRev::Ipq8074, 1, false)
+            .with_vdev(2)
+            .vdev_id
+            != 2
+        {
+            return Err("with_vdev");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mac_config_per_hw_rev
+);
+
 /// A WMI port that fails one `PDEV_SET_PARAM` id with `-ESHUTDOWN`.
 struct Failing(Shared, u32);
 
@@ -1741,6 +1813,130 @@ fn smoke_ath11k_mac_add_interface() -> TestResult {
     })
 }
 kernel_test_in!("drivers/wireless/ath11k", smoke_ath11k_mac_add_interface);
+
+/// The monitor vif (`ath11k_mac_op_add_interface` for MONITOR +
+/// `ath11k_mac_monitor_start`): VDEV_CREATE (type MONITOR), the
+/// encap/decap / NSS / RTS parameters, DP attach, VDEV_START on the
+/// monitor chandef, VDEV_UP (aid 0, own address, no BSSID) and the HTT
+/// monitor-mode ring config. Removal (`ath11k_mac_monitor_stop` + vdev
+/// delete): VDEV_STOP, VDEV_DOWN, ring config reset, VDEV_DELETE. A
+/// failed VDEV_START response deletes the vdev again.
+fn smoke_ath11k_mac_monitor_vdev_sequence() -> TestResult {
+    run(|| {
+        let reg = us_reg(false);
+        let (mut m, w) = new_mac(default_caps(), Some(&reg), FwCfg::default());
+        block(m.start()).unwrap();
+        take_sent(&w);
+        let ch = narf_wireless::monitor::Channel {
+            frequency_mhz: 5180,
+            width: 1,
+            center1_mhz: 5180,
+            center2_mhz: 0,
+        };
+        let def = m.monitor_chandef(ch).map_err(|_| "monitor chandef")?;
+        ensure!(
+            def.freq == 5180 && def.width == Width::W20,
+            "chandef fields"
+        );
+        ensure!(
+            block(m.add_monitor_interface(def)) == Ok(0),
+            "monitor vdev 0"
+        );
+        let sent = take_sent(&w);
+        let ids: Vec<u32> = sent.iter().map(|c| c.cmd_id).collect();
+        ensure!(
+            ids == vec![
+                WMI_VDEV_CREATE_CMDID,
+                WMI_VDEV_SET_PARAM_CMDID,
+                WMI_VDEV_SET_PARAM_CMDID,
+                WMI_VDEV_SET_PARAM_CMDID,
+                WMI_VDEV_SET_PARAM_CMDID,
+                WMI_VDEV_START_REQUEST_CMDID,
+                WMI_VDEV_UP_CMDID,
+            ],
+            "monitor start command ids"
+        );
+        let create = vdev_create_cmd(
+            &OWN,
+            &VdevCreateParams {
+                if_id: 0,
+                vdev_type: vdev_type::MONITOR,
+                subtype: vdev_subtype::NONE,
+                pdev_id: PDEV,
+                chains_2g: Chains { tx: 2, rx: 2 },
+                chains_5g: Chains { tx: 2, rx: 2 },
+                ..Default::default()
+            },
+        );
+        ensure!(
+            same_cmds(
+                &sent[..5],
+                &[
+                    create,
+                    vdev(WMI_VDEV_PARAM_TX_ENCAP_TYPE, 1),
+                    vdev(WMI_VDEV_PARAM_RX_DECAP_TYPE, 1),
+                    vdev(WMI_VDEV_PARAM_NSS, 2),
+                    vdev(WMI_VDEV_PARAM_RTS_THRESHOLD, 0xFFFF_FFFF),
+                ]
+            ),
+            "monitor vdev create + params"
+        );
+        ensure!(
+            sent[6] == vdev_up_cmd(0, 0, &OWN, None, 0, 0, None),
+            "monitor vdev up (aid 0, radio address)"
+        );
+        {
+            let g = w.lock();
+            ensure!(
+                g.dp_calls.ends_with(&["vdev_tx_attach", "monitor_on"]),
+                "dp attach then monitor ring config"
+            );
+        }
+        ensure!(
+            m.vif()
+                .is_some_and(|v| v.kind == VifKind::Monitor && v.is_started && v.is_up),
+            "monitor vif started"
+        );
+        ensure!(block(m.remove_interface()).is_ok(), "monitor removal");
+        let ids: Vec<u32> = take_sent(&w).iter().map(|c| c.cmd_id).collect();
+        ensure!(
+            ids == vec![
+                WMI_VDEV_STOP_CMDID,
+                WMI_VDEV_DOWN_CMDID,
+                WMI_VDEV_DELETE_CMDID
+            ],
+            "monitor stop command ids"
+        );
+        ensure!(
+            w.lock().dp_calls.last() == Some(&"monitor_off"),
+            "monitor ring config reset"
+        );
+        ensure!(m.vif().is_none(), "vif gone");
+
+        set_cfg(&w, |c| c.vdev_start_status = Some(1));
+        let (r, err, _) = latched(|| block(m.add_monitor_interface(def)));
+        ensure!(
+            r.is_err() && err == step::VDEV_START_STATUS,
+            "failed start refused"
+        );
+        ensure!(m.vif().is_none(), "failed start deletes the vdev");
+        ensure!(
+            take_sent(&w).last().map(|c| c.cmd_id) == Some(WMI_VDEV_DELETE_CMDID),
+            "vdev delete after the failed start"
+        );
+        let bad = narf_wireless::monitor::Channel {
+            frequency_mhz: 5185,
+            ..ch
+        };
+        let (r, _, _) = latched(|| m.monitor_chandef(bad));
+        ensure!(r.is_err(), "unknown channel refused");
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "drivers/wireless/ath11k",
+    smoke_ath11k_mac_monitor_vdev_sequence
+);
 
 fn smoke_ath11k_mac_wmm_params_layout() -> TestResult {
     run(|| {

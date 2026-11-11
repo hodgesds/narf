@@ -39,9 +39,66 @@ impl State {
         }
     }
 }
+/// The netdev's TX/RX Narf-Rings and per-TID software queues. A bound
+/// generation borrows its netdev's rings, so a consumer that took the RX
+/// ring (or a producer of the TX ring) keeps working across generations.
+pub(super) struct Rings {
+    state: Mutex<State>,
+    rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
+    tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
+}
+impl Rings {
+    fn new() -> Arc<Self> {
+        let (rx, consumer) = narf_ipc::channel();
+        let (producer, tx) = narf_ipc::channel();
+        Arc::new(Self {
+            state: Mutex::new(State {
+                rx,
+                tx,
+                pending: super::qos::Scheduler::default(),
+            }),
+            rx: IrqSafeSpinLock::new(Some(consumer)),
+            tx: IrqSafeSpinLock::new(Some(producer)),
+        })
+    }
+    fn clear_rx(&self) {
+        if let Some(rx) = self.rx.lock().as_mut() {
+            for _ in 0..RX_RING_N {
+                if !matches!(rx.try_recv(), Ok(Some(_))) {
+                    break;
+                }
+            }
+        }
+    }
+}
+/// The generation check of one netdev (replacing name reservation): every
+/// attach and detach advances `serial`, and a generation publishes under
+/// the netdev name (carrier, disconnect events, ring and RX delivery) only
+/// while its token is still the serial. Carrier publication and the
+/// advance serialize on `order`, so no carrier sample of a detached
+/// generation lands after its detach returned.
+pub(super) struct Seat {
+    serial: AtomicU64,
+    order: IrqSafeSpinLock<()>,
+}
+impl Seat {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            serial: AtomicU64::new(0),
+            order: IrqSafeSpinLock::new(()),
+        })
+    }
+    fn advance(&self) -> u64 {
+        let _order = self.order.lock();
+        self.serial.fetch_add(1, Ordering::AcqRel) + 1
+    }
+}
 pub(super) struct Device<P: Port, E: Environment, K: Engine = Packet<P>> {
     pub(super) radio: Arc<Mutex<Radio<P, E, K>>>,
-    state: Mutex<State>,
+    rings: Arc<Rings>,
+    /// The netdev this generation is bound to and its token; `None` for a
+    /// standalone generation that owns its name and rings.
+    seat: Option<(Arc<Seat>, u64)>,
     /// Copied scan output only; never an association/key/calibration authority.
     scan_ies: IrqSafeSpinLock<Vec<([u8; 6], Vec<u8>)>>,
     name: String,
@@ -54,8 +111,6 @@ pub(super) struct Device<P: Port, E: Environment, K: Engine = Packet<P>> {
     epoch: AtomicU64,
     #[cfg(feature = "kernel-test")]
     receive_hook: IrqSafeSpinLock<Option<ReceiveHook>>,
-    rx: IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>,
-    tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
 }
 impl<P: Port, E: Environment, K: Engine> core::fmt::Debug for Device<P, E, K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -92,21 +147,26 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
 impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static>
     Device<P, E, K>
 {
+    /// A standalone generation owning its own name and rings.
+    #[cfg(any(test, feature = "kernel-test"))]
     pub(super) fn new(name: &str, radio: Arc<Mutex<Radio<P, E, K>>>) -> Result<Self, Error> {
+        Self::with(name, radio, Rings::new(), None)
+    }
+    fn with(
+        name: &str,
+        radio: Arc<Mutex<Radio<P, E, K>>>,
+        rings: Arc<Rings>,
+        seat: Option<(Arc<Seat>, u64)>,
+    ) -> Result<Self, Error> {
         let (own, closed, publication) = {
             let owner = radio.try_lock().ok_or(Error::Busy)?;
             (owner.local(), owner.closed(), owner.publication())
         };
-        let (rx, consumer) = narf_ipc::channel();
-        let (producer, tx) = narf_ipc::channel();
         Ok(Self {
             radio,
+            rings,
+            seat,
             scan_ies: IrqSafeSpinLock::new(Vec::new()),
-            state: Mutex::new(State {
-                rx,
-                tx,
-                pending: super::qos::Scheduler::default(),
-            }),
             name: name.into(),
             own,
             admitted: AtomicBool::new(false),
@@ -117,11 +177,26 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
             epoch: AtomicU64::new(0),
             #[cfg(feature = "kernel-test")]
             receive_hook: IrqSafeSpinLock::new(None),
-            rx: IrqSafeSpinLock::new(Some(consumer)),
-            tx: IrqSafeSpinLock::new(Some(producer)),
         })
     }
+    /// Whether this generation still owns its netdev (always for a
+    /// standalone one). A detached generation never addresses the name,
+    /// rings or carrier of its successor.
+    pub(super) fn current(&self) -> bool {
+        self.seat
+            .as_ref()
+            .is_none_or(|(seat, token)| seat.serial.load(Ordering::Acquire) == *token)
+    }
+    fn clear_state(&self, state: &mut State) {
+        if self.current() {
+            state.clear();
+        }
+    }
     fn publish_link(&self, peer: Option<[u8; 6]>) {
+        let _order = self.seat.as_ref().map(|(seat, _)| seat.order.lock());
+        if !self.current() {
+            return;
+        }
         let mut packed = [0; 8];
         if let Some(peer) = peer {
             packed[..6].copy_from_slice(&peer);
@@ -302,7 +377,10 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         };
         let mut radio = self.radio.lock().await;
         self.start(&mut radio).map_err(wireless)?;
-        self.state.lock().await.clear();
+        {
+            let mut state = self.rings.state.lock().await;
+            self.clear_state(&mut state);
+        }
         let mut attempt = Attempt {
             device: self,
             armed: true,
@@ -352,6 +430,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
     }
     pub(super) fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
         if self.closed.load(Ordering::Acquire)
+            || !self.current()
             || !self.up.load(Ordering::Acquire)
             || !station::admitted(bytes, self.own)
             || !offloads(meta)
@@ -369,7 +448,8 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         if !self.permission(None) {
             return Err(());
         }
-        self.tx
+        self.rings
+            .tx
             .lock()
             .as_mut()
             .ok_or(())?
@@ -383,12 +463,8 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         Ok(())
     }
     fn clear_rx(&self) {
-        if let Some(rx) = self.rx.lock().as_mut() {
-            for _ in 0..RX_RING_N {
-                if !matches!(rx.try_recv(), Ok(Some(_))) {
-                    break;
-                }
-            }
+        if self.current() {
+            self.rings.clear_rx();
         }
     }
     fn permission(&self, epoch: Option<u64>) -> bool {
@@ -410,17 +486,29 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         let Some(mut radio) = self.radio.try_lock() else {
             return (0, Vec::new());
         };
-        let Some(mut state) = self.state.try_lock() else {
+        let Some(mut state) = self.rings.state.try_lock() else {
             return (0, Vec::new());
         };
+        if !self.current() {
+            // Detached: its successor owns the shared rings and carrier.
+            self.closed.store(true, Ordering::Release);
+            let _ = radio.stop();
+            return (0, Vec::new());
+        }
         if self.closed.load(Ordering::Acquire) {
-            state.clear();
+            self.clear_state(&mut state);
             let _ = radio.stop();
             self.link(None);
             self.clear_rx();
             return (0, Vec::new());
         }
         if !matches!(radio.phase(), Phase::Passive | Phase::Open | Phase::Failed) {
+            return (0, Vec::new());
+        }
+        // ATH_OP_HW_RESET: TX queues stay stopped and nothing is polled
+        // until the owner's in-place reset completes; the link and the
+        // shared rings stay as they are.
+        if radio.service_held() {
             return (0, Vec::new());
         }
         let result: Result<Vec<Vec<u8>>, Error> = (|| {
@@ -431,15 +519,15 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
                 self.clear_rx();
             }
             if self.closed.load(Ordering::Acquire) {
-                state.clear();
+                self.clear_state(&mut state);
                 return Ok(Vec::new());
             }
             if radio.peer().is_none() {
-                state.clear();
+                self.clear_state(&mut state);
                 return Ok(frames);
             }
             if !radio.current_receive(epoch)? {
-                state.clear();
+                self.clear_state(&mut state);
                 self.clear_rx();
                 return Ok(Vec::new());
             }
@@ -487,7 +575,7 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
                 }
             }
             if self.closed.load(Ordering::Acquire) {
-                state.clear();
+                self.clear_state(&mut state);
                 return Ok(Vec::new());
             }
             for bytes in &frames {
@@ -513,19 +601,35 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         })();
         match result {
             Ok(frames) => (radio.receive_epoch(), frames),
+            // The failure queued an in-place reset; the generation stays.
+            Err(_) if radio.service_held() => (0, Vec::new()),
             Err(_) => {
                 self.close();
                 let _ = radio.stop();
-                state.clear();
+                self.clear_state(&mut state);
                 self.clear_rx();
                 (0, Vec::new())
             }
         }
     }
-    /// Host-side retirement of this generation (see [`retire`]).
+    /// Host-side retirement of this generation (see [`retire`]). A bound
+    /// generation is detached from its netdev, which stays registered under
+    /// the same name and ifindex: carrier drops (with the disconnect event
+    /// while still current), the seat advances so no late publication of
+    /// this generation reaches the next one, and the shared rings are
+    /// cleared. A standalone generation leaves every registry and keeps its
+    /// name reserved instead.
     pub(super) fn retire_host(&self) {
         self.close();
-        if let Some(mut state) = self.state.try_lock() {
+        if let Some((seat, _)) = &self.seat {
+            seat.advance();
+            if let Some(mut state) = self.rings.state.try_lock() {
+                state.clear();
+            }
+            self.rings.clear_rx();
+            return;
+        }
+        if let Some(mut state) = self.rings.state.try_lock() {
             state.clear();
         }
         narf_wireless::registry::unregister(&self.name);
@@ -548,6 +652,9 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
                     if self.epoch.load(Ordering::Acquire) == epoch {
                         self.clear_rx();
                     }
+                    break;
+                }
+                if !self.current() {
                     break;
                 }
                 narf_net::iface::on_rx_frame_from(&self.name, &mut frame);
@@ -606,10 +713,10 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
         !self.closed.load(Ordering::Acquire) && self.up.load(Ordering::Acquire)
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>> {
-        &self.rx
+        &self.rings.rx
     }
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>> {
-        &self.tx
+        &self.rings.tx
     }
 }
 #[async_trait::async_trait]
@@ -783,7 +890,10 @@ impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'sta
     async fn disassociate(&self) -> Result<(), WirelessError> {
         self.close();
         let mut radio = self.radio.lock().await;
-        self.state.lock().await.clear();
+        {
+            let mut state = self.rings.state.lock().await;
+            self.clear_state(&mut state);
+        }
         self.link(None);
         radio.stop().map_err(wireless)
     }
@@ -956,60 +1066,387 @@ fn scan_dwell(request: &ScanRequest) -> Result<u64, WirelessError> {
 }
 /// Housekeeping period while MSI delivery drives RX/TX completion.
 const HOUSEKEEPING_NS: u64 = 20_000_000;
+/// How long a control request waits for the netdev's next generation
+/// (a generation reset, idle wake or resume republishing the radio).
+const ATTACH_WAIT_NS: u64 = 10_000_000_000;
+/// Leave-idle hook run before every netdev control request (mac80211
+/// clearing `IEEE80211_CONF_IDLE`). Its result is a counted use held for the
+/// request, so idle cannot be entered under it.
+pub(super) type Activity = fn() -> Waking;
+/// The hook's future: the counted use (if any) to hold for the request.
+pub(super) type Waking =
+    core::pin::Pin<Box<dyn core::future::Future<Output = Option<Box<dyn Send>>> + Send>>;
+/// One control request in flight; its end restarts the quiet window.
+struct Busy<'a> {
+    busy: &'a AtomicU64,
+    quiet_since: &'a AtomicU64,
+}
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.quiet_since
+            .store(narf_time::monotonic_ns(), Ordering::Release);
+        self.busy.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+/// One netdev across station generations. Linux keeps the `net_device`
+/// (and `ieee80211_hw`) across `main.c::ath_reset`, mac80211 idle
+/// (`IEEE80211_CONF_IDLE`) and `ath9k_suspend`/`ath_pci_suspend`; here
+/// every one of those is still a generation reset that retires the station
+/// owner, so the netdev keeps its name, ifindex, MAC and rings and swaps
+/// the radio generation behind them. The stale-publisher guard is the
+/// [`Seat`] token: a detached generation can no longer address the name.
+pub(super) struct Netdev<P: Port, E: Environment, K: Engine = Packet<P>> {
+    name: &'static str,
+    own: [u8; 6],
+    rings: Arc<Rings>,
+    seat: Arc<Seat>,
+    current: IrqSafeSpinLock<Option<Arc<Device<P, E, K>>>>,
+    /// The last attached generation's band/HT facts, served while detached.
+    info: IrqSafeSpinLock<Option<narf_wireless::WirelessIfaceInfo>>,
+    /// Scan IEs gathered by the generation(s) a scan ran on.
+    scan_ies: IrqSafeSpinLock<Vec<([u8; 6], Vec<u8>)>>,
+    removed: AtomicBool,
+    activity: Option<Activity>,
+    /// Control requests in flight and the end of the last one: the
+    /// "not scanning/connecting" half of the idle predicate.
+    busy: AtomicU64,
+    quiet_since: AtomicU64,
+}
+fn copy_info(info: &narf_wireless::WirelessIfaceInfo) -> narf_wireless::WirelessIfaceInfo {
+    use narf_wireless::iface::*;
+    WirelessIfaceInfo {
+        base_name: info.base_name.clone(),
+        base_mac: info.base_mac,
+        bands: info
+            .bands
+            .iter()
+            .map(|band| WirelessBand {
+                freq_mhz: band.freq_mhz,
+                channels: band.channels.clone(),
+            })
+            .collect(),
+        modes: info.modes,
+        hw_caps: HwCaps {
+            ht_supported: info.hw_caps.ht_supported,
+            vht_supported: info.hw_caps.vht_supported,
+            he_supported: info.hw_caps.he_supported,
+            eht_supported: info.hw_caps.eht_supported,
+        },
+    }
+}
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static>
+    Netdev<P, E, K>
+{
+    pub(super) fn new(name: &'static str, own: [u8; 6], activity: Option<Activity>) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            own,
+            rings: Rings::new(),
+            seat: Seat::new(),
+            current: IrqSafeSpinLock::new(None),
+            info: IrqSafeSpinLock::new(None),
+            scan_ies: IrqSafeSpinLock::new(Vec::new()),
+            removed: AtomicBool::new(false),
+            activity,
+            busy: AtomicU64::new(0),
+            quiet_since: AtomicU64::new(narf_time::monotonic_ns()),
+        })
+    }
+    /// No control request is in flight and none ended within `ns`.
+    pub(super) fn quiet_for(&self, ns: u64) -> bool {
+        self.busy.load(Ordering::Acquire) == 0
+            && narf_time::monotonic_ns().saturating_sub(self.quiet_since.load(Ordering::Acquire))
+                >= ns
+    }
+    /// Begin a control request: count it, leave idle through the activity
+    /// hook (holding its use for the request), then the current generation.
+    async fn control(
+        &self,
+    ) -> Result<(Arc<Device<P, E, K>>, Busy<'_>, Option<Box<dyn Send>>), WirelessError> {
+        self.busy.fetch_add(1, Ordering::AcqRel);
+        let busy = Busy {
+            busy: &self.busy,
+            quiet_since: &self.quiet_since,
+        };
+        let wake = match self.activity {
+            Some(activity) => activity().await,
+            None => None,
+        };
+        let device = self.wait_generation().await?;
+        Ok((device, busy, wake))
+    }
+    /// The attached generation, if any.
+    pub(super) fn generation(&self) -> Option<Arc<Device<P, E, K>>> {
+        self.current.lock().clone()
+    }
+    /// Bind the next generation (same MAC) to this netdev. Refused while a
+    /// generation is still attached or after removal.
+    pub(super) fn attach(
+        &self,
+        radio: Arc<Mutex<Radio<P, E, K>>>,
+    ) -> Result<Arc<Device<P, E, K>>, Error> {
+        let device = {
+            let mut current = self.current.lock();
+            if current.is_some() || self.removed.load(Ordering::Acquire) {
+                return Err(Error::State);
+            }
+            let token = self.seat.advance();
+            let device = Arc::new(Device::with(
+                self.name,
+                radio,
+                self.rings.clone(),
+                Some((self.seat.clone(), token)),
+            )?);
+            if device.own != self.own {
+                self.seat.advance();
+                return Err(Error::Profile);
+            }
+            *current = Some(device.clone());
+            device
+        };
+        self.quiet_since
+            .store(narf_time::monotonic_ns(), Ordering::Release);
+        let info = device.get_wireless_info();
+        *self.info.lock() = Some(info);
+        Ok(device)
+    }
+    /// Detach the generation that owns `radio` (see [`Device::retire_host`]);
+    /// the netdev stays registered. Returns the detached generation.
+    pub(super) fn detach(
+        &self,
+        radio: &Arc<Mutex<Radio<P, E, K>>>,
+    ) -> Option<Arc<Device<P, E, K>>> {
+        let device = {
+            let mut current = self.current.lock();
+            match current.as_ref() {
+                Some(device) if Arc::ptr_eq(&device.radio, radio) => current.take(),
+                _ => None,
+            }
+        }?;
+        device.retire_host();
+        Some(device)
+    }
+    /// Device removal (`ieee80211_unregister_hw`): detach any generation
+    /// and leave every registry. The seat advances, so no generation of
+    /// this netdev can address a later holder of the name.
+    pub(super) fn unregister(&self) {
+        self.removed.store(true, Ordering::Release);
+        let device = self.current.lock().take();
+        if let Some(device) = device {
+            device.retire_host();
+        }
+        self.seat.advance();
+        narf_wireless::registry::unregister(self.name);
+        narf_net::registry().unregister(self.name);
+        narf_net::iface::unregister(self.name);
+    }
+    /// The current generation, waiting for a reset/wake/resume in flight to
+    /// attach the next one.
+    async fn wait_generation(&self) -> Result<Arc<Device<P, E, K>>, WirelessError> {
+        let deadline = narf_time::monotonic_ns().saturating_add(ATTACH_WAIT_NS);
+        loop {
+            if let Some(device) = self.generation() {
+                return Ok(device);
+            }
+            if self.removed.load(Ordering::Acquire) {
+                return Err(WirelessError::HardwareError);
+            }
+            if narf_time::monotonic_ns() >= deadline {
+                return Err(WirelessError::Busy);
+            }
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(20_000_000)).await;
+        }
+    }
+}
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static> Interface
+    for Netdev<P, E, K>
+{
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.own
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        self.generation().is_some_and(|device| device.link_up())
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>> {
+        &self.rings.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>> {
+        &self.rings.tx
+    }
+}
+#[async_trait::async_trait]
+impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static>
+    WirelessNetIface for Netdev<P, E, K>
+{
+    fn power_save_default(&self) -> Option<bool> {
+        self.generation()?.power_save_default()
+    }
+    fn set_power_save(&self, enabled: bool) -> Result<(), i32> {
+        self.generation().ok_or(-16)?.set_power_save(enabled)
+    }
+    fn max_scan_ssids(&self) -> u8 {
+        4
+    }
+    fn max_scan_ie_len(&self) -> u16 {
+        0
+    }
+    fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
+        super::ar9300_owner::wowlan_support()
+    }
+    fn set_wowlan(&self, config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+        super::ar9300_owner::set_wowlan(config)
+    }
+    fn wowlan_config(&self) -> Option<narf_wireless::WowlanConfig> {
+        super::ar9300_owner::wowlan_config()
+    }
+    fn supports_handshake_offload(&self) -> bool {
+        true
+    }
+    fn reports_disconnect_events(&self) -> bool {
+        true
+    }
+    fn supports_scan_dwell(&self) -> bool {
+        true
+    }
+    fn cipher_suites(&self) -> &'static [u32] {
+        &[0x000fac04]
+    }
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        self.generation()?.connected_bssid()
+    }
+    fn scan_information_elements(&self, peer: [u8; 6]) -> Option<Vec<u8>> {
+        if let Some(ies) = self
+            .scan_ies
+            .lock()
+            .iter()
+            .find(|entry| entry.0 == peer)
+            .map(|entry| entry.1.clone())
+        {
+            return Some(ies);
+        }
+        self.generation()?.scan_information_elements(peer)
+    }
+    fn get_wireless_info(&self) -> narf_wireless::WirelessIfaceInfo {
+        if let Some(device) = self.generation() {
+            let info = device.get_wireless_info();
+            *self.info.lock() = Some(copy_info(&info));
+            return info;
+        }
+        self.info.lock().as_ref().map_or_else(
+            || narf_wireless::WirelessIfaceInfo {
+                base_name: self.name.into(),
+                base_mac: self.own,
+                bands: Vec::new(),
+                modes: narf_wireless::iface::WirelessModes::STATION,
+                hw_caps: narf_wireless::iface::HwCaps {
+                    ht_supported: false,
+                    vht_supported: false,
+                    he_supported: false,
+                    eht_supported: false,
+                },
+            },
+            copy_info,
+        )
+    }
+    async fn scan(&self, request: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        let (device, _busy, _wake) = self.control().await?;
+        // The generation the scan started on gathers every visited
+        // channel's IEs, including those of retune successors.
+        let list = device.scan(request).await?;
+        let mut saved = self.scan_ies.lock();
+        saved.clear();
+        for candidate in &list {
+            if let Some(ies) = device.scan_information_elements(candidate.bssid) {
+                if saved.len() < 128 {
+                    saved.push((candidate.bssid, ies));
+                }
+            }
+        }
+        Ok(list)
+    }
+    async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        let (device, _busy, _wake) = self.control().await?;
+        device.associate(request).await
+    }
+    async fn disassociate(&self) -> Result<(), WirelessError> {
+        match self.generation() {
+            Some(device) => device.disassociate().await,
+            None => Ok(()),
+        }
+    }
+    async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {
+        let (device, _busy, _wake) = self.control().await?;
+        device.set_config(config).await
+    }
+}
 pub(super) type Native = Device<
     super::packet_native::Native,
     station::NativeEnvironment,
     station::Dispatch<super::packet_native::Native>,
 >;
-trait Endpoint: Send + Sync {
-    fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()>;
-    fn drain(&self) -> bool;
-}
-impl<P: Port + Send + 'static, E: Environment + 'static, K: Engine + Send + 'static> Endpoint
-    for Device<P, E, K>
-{
-    fn enqueue(&self, bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-        Device::enqueue(self, bytes, meta)
-    }
-    fn drain(&self) -> bool {
-        Device::drain(self)
-    }
-}
-static ACTIVE: IrqSafeSpinLock<Option<Arc<dyn Endpoint>>> = IrqSafeSpinLock::new(None);
-/// The concrete published generation, for retirement by radio identity.
-static CURRENT: IrqSafeSpinLock<Option<Arc<Native>>> = IrqSafeSpinLock::new(None);
-static CLAIMED: AtomicBool = AtomicBool::new(false);
+type NativeNetdev = Netdev<
+    super::packet_native::Native,
+    station::NativeEnvironment,
+    station::Dispatch<super::packet_native::Native>,
+>;
+/// The single published ath9k netdev (one bound function at a time).
+static NETDEV: IrqSafeSpinLock<Option<Arc<NativeNetdev>>> = IrqSafeSpinLock::new(None);
 fn send(bytes: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
-    let device = ACTIVE.lock().clone().ok_or(())?;
+    let device = current().ok_or(())?;
     device.enqueue(bytes, meta)
 }
 fn drain() -> bool {
-    let device = ACTIVE.lock().clone();
-    device.is_some_and(|device| device.drain())
+    current().is_some_and(|device| device.drain())
 }
 /// Caller has retained this exact Radio Arc in Ath9k before any packet start.
+/// The first generation creates and registers the netdev (`wlan%d`); every
+/// later generation of the same MAC attaches to it under the same name.
 pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error> {
     let authority = narf_net::trusted_net_authority()
         .and_then(|cap| cap.derive().ok())
         .ok_or(Error::Profile)?;
-    CLAIMED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| Error::State)?;
-    let device = Arc::new(Device::new(narf_net::iface::reserve_name("wlan%d"), radio)?);
-    narf_net::registry()
-        .register(&authority, Registered(device.clone()))
-        .map_err(|_| Error::Profile)?;
-    *ACTIVE.lock() = Some(device.clone());
-    *CURRENT.lock() = Some(device.clone());
-    narf_net::iface::register(device.name(), device.own, send);
+    let own = radio.try_lock().ok_or(Error::Busy)?.local();
+    let (netdev, fresh) = {
+        let mut slot = NETDEV.lock();
+        match slot.as_ref() {
+            Some(netdev) if netdev.own == own => (netdev.clone(), false),
+            Some(_) => return Err(Error::State),
+            None => {
+                let netdev = NativeNetdev::new(
+                    narf_net::iface::reserve_name("wlan%d"),
+                    own,
+                    Some(leave_idle),
+                );
+                *slot = Some(netdev.clone());
+                (netdev, true)
+            }
+        }
+    };
+    if fresh {
+        if narf_net::registry()
+            .register(&authority, Registered(netdev.clone()))
+            .is_err()
+        {
+            *NETDEV.lock() = None;
+            return Err(Error::Profile);
+        }
+        narf_net::iface::register(netdev.name, own, send);
+        narf_wireless::registry::register(netdev.clone());
+        narf_net::iface::install_rx_drain(drain);
+    }
+    let device = netdev.attach(radio)?;
     device.link(None);
     device.admitted.store(true, Ordering::Release);
     {
         let mut radio = device.radio.try_lock().ok_or(Error::Busy)?;
         device.start(&mut radio)?;
     }
-    narf_wireless::registry::register(device.clone());
-    narf_net::iface::install_rx_drain(drain);
     let worker = device.clone();
     narf_scheduler::spawn(async move {
         loop {
@@ -1017,7 +1454,7 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
             let signal = worker.radio.try_lock().and_then(|r| r.interrupt());
             let seen = signal.as_ref().map(|s| s.count());
             worker.drain();
-            if worker.closed.load(Ordering::Acquire) {
+            if worker.closed.load(Ordering::Acquire) || !worker.current() {
                 // One more pass already stopped and parked the radio.
                 worker.drain();
                 break;
@@ -1039,29 +1476,47 @@ pub(super) fn publish(radio: super::RetainedRadio) -> Result<Arc<Native>, Error>
     });
     Ok(device)
 }
-pub(super) fn current() -> Option<Arc<Native>> {
-    CURRENT.lock().clone()
+/// [`Activity`] of the published netdev: the original controller's
+/// leave-idle wake (a no-op `None` for the other owners).
+fn leave_idle() -> Waking {
+    Box::pin(async {
+        super::idle::activity()
+            .await
+            .map(|guard| Box::new(guard) as Box<dyn Send>)
+    })
 }
-/// Withdraw only the generation that owns `radio`: close carrier and rings,
-/// leave every registry, and keep the retired name reserved so a late old
-/// publisher cannot address a successor. Returns whether it was published.
+/// Whether the published netdev had no control request in flight or
+/// ending within `ns` (false without a netdev).
+pub(super) fn quiet_for(ns: u64) -> bool {
+    NETDEV
+        .lock()
+        .clone()
+        .is_some_and(|netdev| netdev.quiet_for(ns))
+}
+/// The generation currently attached to the published netdev.
+pub(super) fn current() -> Option<Arc<Native>> {
+    let netdev = NETDEV.lock().clone()?;
+    netdev.generation()
+}
+/// Detach only the generation that owns `radio`: carrier and rings close
+/// and the seat advances, so a late old publisher cannot address its
+/// successor; the netdev keeps its name and ifindex. Returns whether that
+/// generation was attached.
 pub(super) fn retire(radio: &super::RetainedRadio) -> bool {
-    let device = {
-        let mut current = CURRENT.lock();
-        match current.as_ref() {
-            Some(device) if Arc::ptr_eq(&device.radio, radio) => current.take(),
-            _ => None,
-        }
-    };
-    let Some(device) = device else {
+    let Some(netdev) = NETDEV.lock().clone() else {
         return false;
     };
-    *ACTIVE.lock() = None;
-    device.retire_host();
-    CLAIMED.store(false, Ordering::Release);
-    true
+    netdev.detach(radio).is_some()
 }
-struct Registered(Arc<Native>);
+/// Device removal: unregister the netdev (after the owner retired its
+/// generation).
+pub(super) fn unpublish() {
+    let netdev = NETDEV.lock().take();
+    if let Some(netdev) = netdev {
+        netdev.unregister();
+    }
+}
+struct Registered(Arc<NativeNetdev>);
 impl Interface for Registered {
     fn name(&self) -> &str {
         self.0.name()
@@ -1094,3 +1549,7 @@ mod channel_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "interface_ht40_tests.rs"]
 mod ht40_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "interface_netdev_tests.rs"]
+mod netdev_tests;

@@ -28,7 +28,9 @@ struct Model {
 impl Model {
     fn new(reports: Vec<be_rfk::Report>) -> Self {
         Self {
-            words: vec![0; 0x20000 / 4],
+            // MAC + the BE PHY window (0x20000 + CR, e.g. the TSSI code
+            // registers at 0x2ee10 / 0x2ef10).
+            words: vec![0; 0x30000 / 4],
             rf: core::array::from_fn(|_| vec![0; 0x200]),
             rx_mode_polls: [0; 2],
             h2c: Vec::new(),

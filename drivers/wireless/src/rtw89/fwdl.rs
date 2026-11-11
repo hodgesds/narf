@@ -422,6 +422,70 @@ pub fn select_image(blob: &[u8], cut: u8, image_type: u8) -> Result<&[u8], FwErr
     Ok(&blob[start..end])
 }
 
+/// `RTW89_FW_ELEMENT_ALIGN` (`fw.h`): firmware elements start on a
+/// 16-byte boundary after the MFW images.
+pub const FW_ELEMENT_ALIGN: usize = 16;
+/// `sizeof(struct rtw89_fw_element_hdr)` (`fw.h:4497`): 24 fixed bytes
+/// plus the 8-byte head of the per-id union; `size` excludes it.
+pub const FW_ELEMENT_HDR_LEN: usize = 32;
+
+/// The BB-MCU firmware `instance` (0 = `RTW89_FW_ELEMENT_ID_BBMCU0`,
+/// 1 = `BBMCU1`) carried as a firmware element behind the MFW images.
+///
+/// Mirrors `rtw89_fw_recognize_elements` (`fw.c:1542`) walking from
+/// `ALIGN(rtw89_mfw_get_size, 16)` (the last MFW entry's shift + size,
+/// `fw.c:668`) and `__rtw89_fw_recognize_from_elm` (`fw.c:784`):
+/// elements are stored newest-CV first, so the first one whose
+/// `bbmcu.cv` is <= the chip cut wins; its contents start right after
+/// the 32-byte header and span `size` bytes. Linux applies no AID
+/// filter to BB-MCU elements and neither does this.
+///
+/// Deliberate difference, fail-closed: an element whose body runs past
+/// the file is `BadFormat` (Linux warns and stops the walk; the missing
+/// BBMCU0 then fails `needed_fw_elms` with -ENOENT anyway).
+pub fn find_bbmcu(blob: &[u8], cut: u8, instance: u8) -> Result<&[u8], FwError> {
+    if instance > 1 {
+        return Err(FwError::UnsupportedFormat);
+    }
+    if blob.first() != Some(&255) {
+        return Err(FwError::ImageMissing);
+    }
+    let count = usize::from(*blob.get(1).ok_or(FwError::BadFormat)?);
+    if count == 0 || 16 + count * 16 > blob.len() {
+        return Err(FwError::BadFormat);
+    }
+    let last = 16 + (count - 1) * 16;
+    let mfw_end = (read_u32(blob, last + 4)? as usize)
+        .checked_add(read_u32(blob, last + 8)? as usize)
+        .ok_or(FwError::BadFormat)?;
+    let align = |v: usize| {
+        v.checked_add(FW_ELEMENT_ALIGN - 1)
+            .map(|v| v & !(FW_ELEMENT_ALIGN - 1))
+            .ok_or(FwError::BadFormat)
+    };
+    let mut offset = align(mfw_end)?;
+    while offset
+        .checked_add(FW_ELEMENT_HDR_LEN)
+        .is_some_and(|end| end < blob.len())
+    {
+        let id = read_u32(blob, offset)?;
+        let size = read_u32(blob, offset + 4)? as usize;
+        let body = offset + FW_ELEMENT_HDR_LEN;
+        let end = body
+            .checked_add(size)
+            .filter(|&end| end <= blob.len())
+            .ok_or(FwError::BadFormat)?;
+        if id == u32::from(instance) && blob[offset + 24] <= cut {
+            if size == 0 {
+                return Err(FwError::BadFormat);
+            }
+            return Ok(&blob[body..end]);
+        }
+        offset = align(end)?;
+    }
+    Err(FwError::ImageMissing)
+}
+
 // ── Packet segmentation ─────────────────────────────────────────────
 
 /// One raw section slice for CH12. Only the firmware header is an FWHDR_DL

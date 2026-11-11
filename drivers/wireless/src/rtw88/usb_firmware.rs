@@ -1067,6 +1067,14 @@ unsafe impl<C: ControlIo, P: Bulk + Clone> firmware_transport::Io for Backend<C,
         self.station_allowed()?;
         super::qualification::request(kind, self.gate_ref()?)
     }
+    fn station_band5_capability(
+        &mut self,
+        channel: u8,
+    ) -> Result<Option<super::vht::Band5Capability>, Error> {
+        self.station_allowed()?;
+        let base = self.gate_ref()?.clone();
+        super::vht::band5_capability(&base, channel, |c| self.station_channel_grant(c))
+    }
     fn station_channel_grant(
         &mut self,
         channel: u8,

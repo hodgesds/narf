@@ -8,7 +8,7 @@ use core::future::Future;
 use narf_wireless::{WowlanConfig, WowlanPattern};
 
 fn harness(wow: bool) -> Harness {
-    Harness::new_on_firmware(
+    let h = Harness::new_on_firmware(
         4,
         Dialect::Tlv,
         true,
@@ -27,13 +27,19 @@ fn harness(wow: bool) -> Harness {
             features: (1 << 10) | (1 << 2) | (1 << 18) | if wow { 1 << 6 } else { 0 },
             htt: (3, 1),
             hardware_keys: true,
+            nlo: false,
         },
-    )
+    );
+    // `hardware_keys` is Linux `cryptmode=0`: the station installs its
+    // PTK/GTK with WMI_VDEV_INSTALL_KEY (mac.c ath10k_install_key), so the
+    // model firmware keeps the hardware key cache that answers it.
+    h.model(|m| m.data.as_mut().unwrap().hw = Some(Box::new(HwKeyCache::default())));
+    h
 }
 /// Poll the holder task and the caller's future with one noop waker, as the
 /// executor would interleave them.
-type Holder = Option<core::pin::Pin<Box<dyn Future<Output = ()>>>>;
-fn interleave<F: Future>(holder: &mut Holder, future: F) -> Poll<F::Output> {
+pub(super) type Holder = Option<core::pin::Pin<Box<dyn Future<Output = ()>>>>;
+pub(super) fn interleave<F: Future>(holder: &mut Holder, future: F) -> Poll<F::Output> {
     let mut future = core::pin::pin!(future);
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..8192 {
@@ -48,7 +54,7 @@ fn interleave<F: Future>(holder: &mut Holder, future: F) -> Poll<F::Output> {
     }
     Poll::Pending
 }
-fn word(v: &[u8], at: usize) -> u32 {
+pub(super) fn word(v: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(v[at..at + 4].try_into().unwrap())
 }
 

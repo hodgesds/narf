@@ -327,6 +327,13 @@ pub fn cam_reset(io: &impl Io) -> Result<(), Error> {
 /// address into `REG_MACID`.
 pub fn station_identity(io: &impl Io, mac: &[u8; 6]) -> Result<(), Error> {
     byte(io, REG_SECCFG, 0)?;
+    station_address(io, mac)
+}
+
+/// `HW_VAR_ETHER_ADDR` alone: the station MAC address into
+/// `REG_MACID`, leaving `REG_SECCFG` as
+/// [`enable_hw_security_config`] programmed it.
+pub fn station_address(io: &impl Io, mac: &[u8; 6]) -> Result<(), Error> {
     for (offset, value) in mac.iter().copied().enumerate() {
         byte(io, REG_MACID + offset as u16, value)?;
     }

@@ -259,14 +259,14 @@ fn smoke_rtw89_prepared_8922a_full_sequence() -> TestResult {
         return TestResult::Fail("rings_programmed not set");
     }
     // CH0 NUM/DESA (BE set: NUM 0xB030, DESA 0xB200/0xB204).
-    if regs.regs32.get(&0xB030) != Some(&256)
+    if regs.regs16.get(&0xB030) != Some(&256)
         || regs.regs32.get(&0xB200) != Some(&0x1_0000)
         || regs.regs32.get(&0xB204) != Some(&0)
     {
         return TestResult::Fail("CH0 ring programming wrong");
     }
     // CH12 NUM (0xB048) + RXQ doorbell seed len-1 (0xB160 = 255).
-    if regs.regs32.get(&0xB048) != Some(&256) || regs.regs16.get(&0xB160) != Some(&255) {
+    if regs.regs16.get(&0xB048) != Some(&256) || regs.regs16.get(&0xB160) != Some(&255) {
         return TestResult::Fail("CH12/RXQ ring programming wrong");
     }
     // WP-select block: group 0 packs channels 0..3, group 12 packs
@@ -731,6 +731,11 @@ fn smoke_rtw89_prepared_8922a_prepare_data_with_info() -> TestResult {
     }
     if u16::from_le_bytes(prepared.header[64..66].try_into().unwrap()) != 0x8000 {
         return TestResult::Fail("WP seq0 wrong with info block");
+    }
+    // The reserved CH0 slot must be published before the next
+    // prepare: `TxQueue::reserve` refuses while the WP slot is held.
+    if owner.kick_data(&mut Model::new(), &prepared).is_err() {
+        return TestResult::Fail("kick_data of the info frame failed");
     }
     // The plain path is unchanged: same body, no info block.
     let mut bd = vec![TxBd::default(); DATA_RING_DEPTH as usize];

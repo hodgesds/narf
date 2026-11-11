@@ -22,7 +22,14 @@ pub(in crate::ath10k) struct Parameters {
 struct Pending<B> {
     _payload: B,
     _fragments: Option<B>,
+    /// Sent with the legacy `HTT_H2T_MSG_TYPE_MGMT_TX` (HTT < 3): only a
+    /// `MGMT_TX_COMPLETION` names it.
     management: bool,
+    /// A management frame sent as `TX_FRM` (`ATH10K_HW_TXRX_MGMT`): either
+    /// completion names it, since htt_rx.c `HTT_T2H_MSG_TYPE_MGMT_TX_COMPLETION`
+    /// retires `desc_id` through the same `ath10k_txrx_tx_unref` as
+    /// `TX_COMPL_IND` does.
+    frame_management: bool,
 }
 #[derive(Debug)]
 pub(in crate::ath10k) struct Pool<B> {
@@ -53,6 +60,23 @@ impl<B: Memory> Pool<B> {
                 .map(|at| slot._payload.read(at))
                 .collect(),
         ))
+    }
+    /// The per-MSDU fragment list of a non-continuous MSDU (address and
+    /// its 8 bytes: payload address, length), as the device reads it
+    /// through `frags_paddr` (tests / device models).
+    #[cfg(any(test, feature = "kernel-test"))]
+    pub fn fragment_list(&self, id: u16) -> Option<(u64, [u8; 8])> {
+        let list = self
+            .slots
+            .get(usize::from(id))?
+            .as_ref()?
+            ._fragments
+            .as_ref()?;
+        let mut bytes = [0u8; 8];
+        for (at, byte) in bytes.iter_mut().enumerate() {
+            *byte = list.read(at);
+        }
+        Some((list.dma_address(), bytes))
     }
     pub fn prepare(
         &mut self,
@@ -108,6 +132,7 @@ impl<B: Memory> Pool<B> {
                 _payload: payload,
                 _fragments: None,
                 management: true,
+                frame_management: false,
             });
             self.next = (id + 1) % self.slots.len();
             barrier();
@@ -169,6 +194,7 @@ impl<B: Memory> Pool<B> {
             _payload: payload,
             _fragments: frags,
             management: false,
+            frame_management: parameters.kind == Kind::Management,
         });
         self.next = (id + 1) % self.slots.len();
         barrier();
@@ -178,8 +204,10 @@ impl<B: Memory> Pool<B> {
         for (at, id) in ids.iter().enumerate() {
             if ids[..at].contains(id)
                 || self.slots.get(usize::from(*id)).is_none_or(|s| {
-                    s.as_ref()
-                        .is_none_or(|pending| pending.management != management)
+                    s.as_ref().is_none_or(|pending| {
+                        pending.management != management
+                            && !(management && pending.frame_management)
+                    })
                 })
             {
                 return Err(Error::Malformed);

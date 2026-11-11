@@ -368,11 +368,29 @@ pub(super) fn transmit(m: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError>
         .snapshot(id)
         .ok_or(BmiError::BadResponse)?;
     let prefetch = length.min(50).div_ceil(4) * 4;
-    require(
-        word(b, 8) == address as u32 && b.len() == 16 + prefetch && b[16..] == payload[..prefetch],
-    )?;
+    require(b.len() == 16 + prefetch && b[16..] == payload[..prefetch])?;
     let frame = payload.get(..length).ok_or(BmiError::BadResponse)?.to_vec();
     let management = b[1] == 0x65;
+    // `frags_paddr` (htt_tx.c `ath10k_htt_tx_32`): the MSDU itself for
+    // ATH10K_HW_TXRX_MGMT; for RAW data on a part without
+    // `continuous_frag_desc` (QCA6174) the per-MSDU fragment list, whose
+    // one entry is the payload address and length.
+    if management {
+        require(word(b, 8) == address as u32)?;
+    } else {
+        let (list, entry) = m
+            .inner
+            .storage
+            .as_ref()
+            .ok_or(BmiError::BadResponse)?
+            .tx
+            .fragment_list(id)
+            .ok_or(BmiError::BadResponse)?;
+        let mut want = [0u8; 8];
+        want[..4].copy_from_slice(&(address as u32).to_le_bytes());
+        want[4..].copy_from_slice(&(length as u32).to_le_bytes());
+        require(word(b, 8) == list as u32 && entry == want)?;
+    }
     require(
         frame.len() >= 24
             && frame[10..16] == OWN

@@ -106,8 +106,10 @@ fn smoke_rtw88_scan_plan_rejects_unsupported_and_malformed_requests() -> TestRes
             WirelessError::NotSupported,
         ),
         (
+            // 6GHz channel 1: rtw88 registers no NL80211_BAND_6GHZ
+            // (main.c rtw_set_supported_band covers 2.4/5GHz only).
             ScanRequest {
-                frequencies_mhz: vec![5180],
+                frequencies_mhz: vec![5955],
                 ..base()
             },
             WirelessError::NotSupported,
@@ -144,6 +146,14 @@ fn smoke_rtw88_scan_plan_rejects_unsupported_and_malformed_requests() -> TestRes
         if scan::plan(&case, OWN) != Err(expected) {
             return TestResult::Fail("rtw88 scan plan admitted an unsupported request");
         }
+    }
+    // A 5GHz primary is an admitted plan (rtw88 5GHz software scan).
+    let band5 = ScanRequest {
+        frequencies_mhz: vec![5180],
+        ..base()
+    };
+    if scan::plan(&band5, OWN).map(|p| p.channels) != Ok(vec![36]) {
+        return TestResult::Fail("rtw88 scan plan refused a 5GHz primary");
     }
     if scan::plan(&base(), [1, 0, 0, 0, 0, 0]) != Err(WirelessError::InvalidArgs) {
         return TestResult::Fail("rtw88 probe used a group source address");

@@ -90,6 +90,36 @@ impl PreparedFirmware {
     }
 }
 
+impl PreparedFirmware {
+    /// The BB-MCU suit `instance` from this image's container
+    /// ([`fwdl::find_bbmcu`]), as its own prepared image with the
+    /// same name and chip. Linux downloads it with the same
+    /// `rtw89_fw_download_suit` / header parser as the normal suit
+    /// (`fw.c:1984`). The contents are copied: the suit is retained
+    /// independently of the normal image's lifetime.
+    pub fn bbmcu(&self, cut: u8, instance: u8) -> Result<PreparedFirmware, FwError> {
+        if cut > 15 {
+            return Err(FwError::BadFormat);
+        }
+        let contents = fwdl::find_bbmcu(self.container(), cut, instance)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(contents.len())
+            .map_err(|_| FwError::NoMemory)?;
+        bytes.extend_from_slice(contents);
+        let mut sections = [EMPTY; FWDL_SECTION_MAX_NUM];
+        let header = fwdl::parse_auto(&bytes, &mut sections)?;
+        Ok(PreparedFirmware {
+            image: 0..bytes.len(),
+            bytes,
+            sections,
+            header,
+            name: self.name,
+            chip: self.chip,
+        })
+    }
+}
+
 pub const fn filenames(chip: ChipId) -> &'static [&'static str] {
     // Firmware names follow Linux `rtw89_fw_get_filename`
     // (`fw.h:4736`: format <= 0 is `%s.bin`, otherwise

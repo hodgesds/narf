@@ -432,8 +432,10 @@ impl Fixture {
     #[inline(never)]
     fn new() -> Result<Self, &'static str> {
         let h = Harness::version_profile(false, false, 8, 4)?;
+        // Primary CLIENT/GO (8/9) beside the DEVICE child (10), as iwlmvm
+        // advertises them (mac80211.c iwl_mvm_mac_setup_register).
         require(
-            h.device.supports_virtual_interfaces() && h.device.p2p_interface_types() == [10],
+            h.device.supports_virtual_interfaces() && h.device.p2p_interface_types() == [8, 9, 10],
             "P2P Gen2 factual DEVICE subset absent",
         )?;
         let original = h

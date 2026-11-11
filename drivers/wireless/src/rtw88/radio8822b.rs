@@ -101,7 +101,7 @@ pub(super) async fn toggle_igi(io: &mut impl Io, rx: u8) -> Result<(), Error> {
 }
 
 /// `rtw8822b_set_channel_rfe_efem` / `_ifem`. Linux tests `IS_CH_2G_BAND`
-/// (`channel <= 14`), so channel 0 (no channel yet set) selects 5 GHz.
+/// (`channel <= 14`), so channel 0 (no channel yet set) selects 2.4 GHz.
 pub(super) async fn rfe(
     io: &mut impl Io,
     info: Info,

@@ -59,7 +59,7 @@ impl RxDescriptor {
     }
     delegate!(first_msdu -> bool, last_msdu -> bool, l3_pad_bytes -> u8, msdu_len -> u16, decap_type -> u8,
               encrypt_valid -> bool, encrypt_type -> u32, mpdu_tid -> u8, mpdu_start_seq_no -> u16,
-              mpdu_peer_id -> u16, mpdu_start_tag -> u32, msdu_done -> bool, msdu_freq -> u32);
+              mpdu_peer_id -> u16, mpdu_start_tag -> u32, mpdu_ppdu_id -> u16, msdu_done -> bool, msdu_freq -> u32);
     pub fn attention(&self) -> RxAttention {
         match self {
             Self::Wcn6855(d) => d.attention,

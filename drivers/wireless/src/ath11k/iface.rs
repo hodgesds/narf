@@ -326,6 +326,9 @@ pub struct RadioInfo {
     /// in [`Shared`] because `SET_WIPHY` is retained across MAC recreation.
     pub antenna_avail_tx: u32,
     pub antenna_avail_rx: u32,
+    /// `hw_params.supports_monitor` on an rxdma1 part: the monitor
+    /// destination path (`dp_mon`) and monitor vdev exist.
+    pub monitor: bool,
 }
 
 impl RadioInfo {
@@ -378,6 +381,7 @@ impl RadioInfo {
             dynamic_smps: own.ht_cap_info & super::mac_peer::wmi_ht::DYNAMIC_SMPS != 0,
             antenna_avail_tx: m.antenna_masks().0,
             antenna_avail_rx: m.antenna_masks().1,
+            monitor: m.config().supports_monitor,
         }
     }
 }
@@ -467,6 +471,13 @@ pub struct Ath11kNetdev<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     /// Whether this vdev was open immediately before the radio-wide cold
     /// system-suspend cycle and therefore needs its vdev recreated on resume.
     cold_reopen: AtomicBool,
+    /// The receive-only monitor channel (`cfg80211_set_monitor_channel`),
+    /// configured while down; admin-UP starts the monitor vdev on it.
+    monitor_channel: IrqSafeSpinLock<Option<narf_wireless::monitor::Channel>>,
+    /// The monitor vdev is created and started (`do_open` of iftype 6).
+    monitor_open: AtomicBool,
+    /// The AF_PACKET capture generation of the open monitor.
+    monitor_token: IrqSafeSpinLock<Option<narf_net::iface::MonitorRxToken>>,
 }
 
 /// A prepared system-sleep transport policy. Linux chooses the WoW path
@@ -607,6 +618,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
                 wowlan: IrqSafeSpinLock::new(None),
                 system_pm: IrqSafeSpinLock::new(SystemPmMode::Idle),
                 cold_reopen: AtomicBool::new(false),
+                monitor_channel: IrqSafeSpinLock::new(None),
+                monitor_open: AtomicBool::new(false),
+                monitor_token: IrqSafeSpinLock::new(None),
             },
             tx_cons,
         )
@@ -1033,7 +1047,20 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         } else {
             m.adopt_shared_start();
         }
+        let monitor_channel = *self.monitor_channel.lock();
         let added = match self.iftype.load(Ordering::Acquire) {
+            6 => match monitor_channel {
+                Some(channel) => match m.monitor_chandef(channel) {
+                    Ok(def) => m.add_monitor_interface(def).await,
+                    Err(e) => Err(e),
+                },
+                // cfg80211 has no monitor channel to give the vif.
+                None => Err(super::mac::MacError::new(
+                    super::mac::step::VDEV_START,
+                    0x708,
+                    super::mac::errno::EINVAL,
+                )),
+            },
             3 => m.add_ap_interface().await,
             8 => {
                 m.add_p2p_station_interface(super::mac::VifKind::P2pClient)
@@ -1055,6 +1082,9 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             self.shared.release_radio_mac();
             return Err(e);
         }
+        if self.current_iftype() == 6 {
+            self.monitor_open.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1066,7 +1096,14 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
     /// `num_pending_mgmt_tx = 0`).
     async fn do_stop(&self, m: &mut RtMac<Io, Irq, Q>) {
         let ap_vif = m.vif().is_some_and(|vif| vif.kind.is_ap());
-        if ap_vif {
+        let monitor_vif = m
+            .vif()
+            .is_some_and(|vif| vif.kind == super::mac::VifKind::Monitor);
+        if monitor_vif {
+            // The capture generation closes before the vdev stops.
+            self.monitor_open.store(false, Ordering::Release);
+            self.close_monitor();
+        } else if ap_vif {
             // AP carrier represents beaconing, not a station association;
             // it must not synthesize a cfg80211 disconnect while closing.
             self.shared.set_mbssid_beacons(self.vdev_id, None);
@@ -1282,6 +1319,57 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
         n
     }
 
+    /// Close the AF_PACKET capture generation (`end_monitor_rx`).
+    fn close_monitor(&self) {
+        if let Some(token) = self.monitor_token.lock().take() {
+            narf_net::iface::end_monitor_rx(token);
+        }
+    }
+
+    /// Monitor frames → radiotap → AF_PACKET (`ieee80211_rx_monitor`):
+    /// a frame's own channel, else the monitor channel (`ar->rx_channel`),
+    /// and the PPDU signal when the status carried one. The capture
+    /// generation begins once the monitor vdev is open and the interface
+    /// is up.
+    async fn deliver_monitor(&self) -> usize {
+        let frames = self.shared.take_monitor_rx_for(self.vdev_id).await;
+        if !self.monitor_open.load(Ordering::Acquire) {
+            return 0;
+        }
+        let token = {
+            let mut t = self.monitor_token.lock();
+            if t.is_none() {
+                *t = narf_net::iface::lookup(self.name)
+                    .and_then(|entry| narf_net::iface::begin_monitor_rx(&entry));
+            }
+            *t
+        };
+        let Some(token) = token else {
+            return 0;
+        };
+        let configured = self.monitor_channel.lock().map(|c| c.frequency_mhz);
+        let mut n = 0;
+        for f in frames {
+            let Some(frequency_mhz) = f.freq_mhz.or(configured) else {
+                continue;
+            };
+            let Ok(bytes) = narf_wireless::monitor::encode(
+                &f.frame,
+                narf_wireless::monitor::Metadata {
+                    frequency_mhz,
+                    signal_dbm: f.signal_dbm,
+                },
+            ) else {
+                continue;
+            };
+            if !narf_net::iface::on_monitor_frame_from(token, &bytes) {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
+
     /// One pass of the runtime loop: service + deliver RX (outside every
     /// lock: the stack may answer synchronously through `queue_tx`), then
     /// the mac layer's housekeeping if no control operation holds it.
@@ -1304,7 +1392,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Ath11kNetdev<Io, Irq, Q> {
             self.shared.release_scan(self.vdev_id);
         }
         let frames = self.shared.take_rx_for(self.vdev_id).await;
-        let n = self.deliver(frames);
+        let mut n = self.deliver(frames);
+        if self.current_iftype() == 6 {
+            n += self.deliver_monitor().await;
+        }
         if let Some(notice) = self.shared.take_fw_notice().await {
             self.recover(notice).await;
             return n;
@@ -2661,7 +2752,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
         // change_virtual_intf requires the old netdev down; never retag an
         // extant firmware vdev because it would leave its peer/DP state in
         // the previous role.
-        if !matches!(iftype, 2 | 3 | 8 | 9 | 10) {
+        if !matches!(iftype, 2 | 3 | 6 | 8 | 9 | 10) || (iftype == 6 && !self.radio.monitor) {
             return Err(WirelessError::NotSupported);
         }
         if self.admin_up() {
@@ -2673,7 +2764,25 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
         if m.vif().is_some() {
             return Err(WirelessError::Busy);
         }
+        let old = self.current_iftype();
+        // A monitor netdev carries radiotap, not Ethernet: switch the
+        // interface's link representation with the type.
+        let layer = |t: u32| {
+            if t == 6 {
+                narf_net::iface::LinkLayer::Ieee80211Radiotap
+            } else {
+                narf_net::iface::LinkLayer::Ethernet
+            }
+        };
+        if (old == 6) != (iftype == 6)
+            && narf_net::iface::set_link_layer(self.name, layer(iftype)).is_err()
+        {
+            return Err(WirelessError::Busy);
+        }
         if !self.shared.assign_vdev_iftype(self.vdev_id, iftype) {
+            if (old == 6) != (iftype == 6) {
+                let _ = narf_net::iface::set_link_layer(self.name, layer(old));
+            }
             return Err(WirelessError::Busy);
         }
         if iftype != 2 {
@@ -2682,6 +2791,35 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
             *self.station_tx_power.lock() = None;
         }
         self.iftype.store(iftype, Ordering::Release);
+        Ok(())
+    }
+
+    fn validate_monitor_flags(&self, flags: u32) -> Result<(), WirelessError> {
+        // The default capture profile only: no active monitor, injection,
+        // FCS-fail or control-frame selection beyond the HTT filter.
+        if self.radio.monitor && flags == 0 {
+            Ok(())
+        } else {
+            Err(WirelessError::NotSupported)
+        }
+    }
+
+    fn set_monitor_channel(
+        &self,
+        channel: narf_wireless::monitor::Channel,
+    ) -> Result<(), WirelessError> {
+        if !self.radio.monitor || self.current_iftype() != 6 {
+            return Err(WirelessError::NotSupported);
+        }
+        if self.admin_up() {
+            return Err(WirelessError::Busy);
+        }
+        let Some(m) = self.mac.try_lock() else {
+            return Err(WirelessError::Busy);
+        };
+        m.monitor_chandef(channel)
+            .map_err(|_| WirelessError::InvalidArgs)?;
+        *self.monitor_channel.lock() = Some(channel);
         Ok(())
     }
 
@@ -3646,7 +3784,16 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
                     channels: ch.clone(),
                 })
                 .collect(),
-            modes: WirelessModes::STATION | WirelessModes::AP | WirelessModes::P2P,
+            // NL80211_IFTYPE_MONITOR only where `hw_params.supports_monitor`
+            // (Linux removes it from the wiphy otherwise).
+            modes: WirelessModes::STATION
+                | WirelessModes::AP
+                | WirelessModes::P2P
+                | if self.radio.monitor {
+                    WirelessModes::MONITOR
+                } else {
+                    WirelessModes::empty()
+                },
             hw_caps: HwCaps {
                 ht_supported: self.radio.ht,
                 vht_supported: self.radio.vht,
@@ -3658,6 +3805,10 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> WirelessNetIface for Ath11kNetdev<Io, Irq, 
     }
 
     async fn scan(&self, req: ScanRequest) -> Result<Vec<BssInfo>, WirelessError> {
+        // cfg80211 refuses a scan on a monitor interface.
+        if self.current_iftype() == 6 {
+            return Err(WirelessError::NotSupported);
+        }
         if self.shared.is_dead() {
             return Err(WirelessError::HardwareError);
         }
@@ -4418,9 +4569,12 @@ fn register_pci_netdev(
 
 /// `ieee80211_register_hw` + `ieee80211_if_add("wlan%d")` for an
 /// AHB-attached core: the counterpart of [`register_pci`], with the
-/// same lifecycle expectations — one initial netdev on vdev 0, station
-/// iftype, registered with `narf_net` + `narf_wireless`, down with no
-/// carrier until IFF_UP, and the autoconnect command-line handling.
+/// same lifecycle expectations — one netdev per radio on that radio's
+/// vdev slot (`vdev_id`, assigned by `runtime::start_ahb` in pdev
+/// allocation order), station iftype, registered with `narf_net` +
+/// `narf_wireless`, down with no carrier until IFF_UP, and the
+/// autoconnect command-line handling on the first radio (slot 0) only,
+/// so one `ath11k.ssid=` never races two radios to the same AP.
 /// Two deliberate non-goals, both named rather than smuggled in:
 /// no system-PM ownership (the `AsyncSystemPm` implementation is
 /// PCI-concrete and MHI-shaped; an AHB suspend path is follow-up
@@ -4431,6 +4585,7 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     shared: Arc<Shared<Io, Irq, Q>>,
     mac: RtMac<Io, Irq, Q>,
     mac_addr: [u8; 6],
+    vdev_id: u32,
 ) -> &'static str {
     use core::fmt::Write as _;
     let name = narf_net::iface::reserve_name("wlan%d");
@@ -4440,7 +4595,7 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         mac,
         mac_addr,
         netdev_sinks(),
-        0,
+        vdev_id,
         2,
         None,
     );
@@ -4454,6 +4609,9 @@ pub fn register_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
         ahb_send_context,
         ahb_drain,
     );
+    if vdev_id != 0 {
+        return name;
+    }
     // Bring-up aid: `ath11k.scan=1` / `ath11k.ssid=…` (autoconnect.rs).
     match super::autoconnect::parse(narf_boot::cmdline()) {
         Ok(Some(cfg)) => {

@@ -1525,11 +1525,15 @@ fn smoke_ath11k_qcn9074_pci_startup() -> TestResult {
                 .any(|b| b.freq_mhz == 2400 && b.channels.contains(&6)),
             "2.4 GHz band from hal_reg_cap + the regulatory rules"
         );
+        // The shared fixture firmware is WCN6855's DBS shape: phy 0
+        // 2.4 GHz, phy 1 5 GHz. QCN9074 is not `single_pdev_only`, so
+        // each phy is its own pdev
+        // (`ath11k_wmi_tlv_ext_soc_hal_reg_caps_parse`), and radio 0
+        // registers only phy 0's band (`ath11k_mac_setup_channels_rates`
+        // on `hal_reg_cap[pdev_idx]`).
         ensure!(
-            info.bands
-                .iter()
-                .any(|b| b.freq_mhz == 5000 && b.channels.contains(&36)),
-            "5 GHz band"
+            info.bands.iter().all(|b| b.freq_mhz == 2400),
+            "pdev 0 is the fixture's 2.4 GHz phy: no 5 GHz band"
         );
         // The fixture's MAC/PHY caps carry no HT capability bits
         // (`ht_cap_info` 0) but a 5 GHz VHT capability.
@@ -1544,9 +1548,12 @@ fn smoke_ath11k_qcn9074_pci_startup() -> TestResult {
         );
         let g = run!(u.shared.lock());
         ensure!(g.vdev(0).unwrap().link.vif.is_some(), "DP vdev TX attach");
+        // `ath11k_mac_config_mon_status_default` arms `mon_reap_timer`
+        // only without rxdma1 (`!hw_params.rxdma1_enable`); QCN9074's
+        // status rings are serviced from the DP interrupt instead.
         ensure!(
-            g.mon_reap_at.is_some(),
-            "monitor reap timer armed by mac start"
+            g.mon_reap_at.is_none(),
+            "rxdma1 part: no monitor reap timer"
         );
         ensure!(g.core.state == CoreState::Ready, "core ready");
         ensure!(

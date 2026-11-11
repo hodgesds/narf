@@ -2169,11 +2169,14 @@ describe the remaining native paths.
   actual RF/SKU/bandwidth/MCC admission, every constituent NVM/MCC/host
   fact, full-span power and native extended control-position/rate ownership.
   Coordinated compilation/native/release acceptance remains pending.
-- **mlo (open).** Multiple live link/peer owners remain disabled. MLO
-  has the bounded §3.66 single-link native MLD draft plus shared Basic ML/
-  per-link key delivery. Multiple active PHY/LINK/STA/queue, power, PN/reorder
-  and public-control owners remain continuations. MLO,320MHz and EHT do
-  not apply to AX200/AX201 hardware.
+- **mlo (implemented; validation pending).** §3.66 carries the single-link
+  native MLD baseline plus multi-link passes 5-9: further links through
+  `associate_mlo`, EMLSR, advertised TTLM (dormant links and switch) and the
+  public `mlo_connection()` report. MLD Capabilities/Operations stay 0:
+  negotiated TTLM and link reconfiguration have a frame engine
+  (`sc_ttlm_neg`) but no Protected EHT Action transport or request path, so
+  they are not advertised. MLO,320MHz and EHT do not apply to AX200/AX201
+  hardware.
 - **six_ghz (implemented; validation pending).** §§3.63–3.67 implement
   explicit actual NVM/UMAC/RFH/cache/policy band identity, v4/v5 channel
   tails, active PSC/RNR and native PSC/passive periodic discovery, shared
@@ -4001,7 +4004,7 @@ ordinary boots and release gates remain pending. Physical acceptance remains
 separate; this implementation does not claim active/RNR/periodic6GHz scan or
 multiple live MLO links.
 
-### 3.66 Bounded native single-link non-AP MLD (validation pending)
+### 3.66 Bounded native non-AP MLD: single-link baseline, multi-link passes 5-9 (validation pending)
 
 **Identity and actual native source.** On the already admitted §3.64 Sc/Bz
 FM/WH core103 EHT source, an AP Basic Multi-Link element opts the station
@@ -4242,10 +4245,9 @@ A multiple-link request now carries Intel's `IWL_MLD_EMLSR_CAPA`
 (`EmlCapabilities::INTEL_MLD_LOCAL`) as mac80211 copies the station
 `wiphy_iftype_ext_capab`; MLD Capabilities/Operations stay 0 because
 TID-to-link mapping negotiation and link reconfiguration (Linux
-`IWL_MLD_CAPA_OPS`) are implemented in `sc_ttlm_neg` but not yet
-advertised: the Protected EHT Action field values and the MLD
-Capabilities bit positions are still unconfirmed (see the negotiated
-TTLM paragraph below), so no negotiation bit is claimed yet. A
+`IWL_MLD_CAPA_OPS`) have a frame engine in `sc_ttlm_neg` (wire values
+verified #1553) but no action-frame transport or request path (see the
+negotiated TTLM paragraph below), so no negotiation bit is claimed. A
 single-link MLD request is
 unchanged. The AP MLD's response Basic MLE EML capabilities and medium
 sync delay (mlme.c `vif->cfg.eml_cap`/`eml_med_sync_delay`, default
@@ -4393,14 +4395,15 @@ Request/Response; per-TID maps, dialog-token matching, switch-time
 staging through the same safety-buffered TSF rule as the advertised
 path, teardown back to default; a staged mapping's switch is applied by
 `Connection::service_ttlm`, and an accepted mapping cancels any planned
-advertised switch). No TTLM negotiation support is advertised yet (MLD
-Capabilities stay 0): the Protected EHT Action field values (used in
-frame order 0..4 per Linux's `ieee80211_mgmt` action union) and the MLD
-Capabilities bit positions for TID-to-link-negotiation and
-link-reconfiguration support are NOT yet confirmed against IEEE
-802.11be or Linux `net/mac80211/ieee80211_i.h`, and the MLME
-action-frame receive/transmit transport that would drive the engine is
-still missing. The expected-duration field is parsed only, as in Linux.
+advertised switch). The Protected EHT Action values (TTLM 0..2, ML
+reconfiguration 11/12, category 37) and the MLD Capabilities bits (TTLM
+negotiation SAME 0x0020, LINK_RECONF_SUPPORT 0x2000) are verified against
+Linux (#1553), but no negotiation or reconfiguration support is advertised
+(MLD Capabilities stay 0, `smoke_iwl_device_mld_capa_withholds_unwired_ttlm_and_link_reconf`):
+the MLME action-frame receive/transmit transport (Linux
+`ieee80211_process_neg_ttlm_req`/`ieee80211_process_ml_reconf_resp`) and a
+`set_ttlm`/`assoc_ml_reconf` request path in `narf_wireless` are still
+missing. The expected-duration field is parsed only, as in Linux.
 Written, unexecuted: `smoke_iwl_mld_advertised_ttlm_dormant_links_and_switch`.
 The single-link MLD FakeAp fixture (`sc_mlo_native_tests.rs`) now requires
 the associated MAC_CONFIG to carry esr_transition_timeout 0 and the
@@ -4416,8 +4419,8 @@ native EHT PHY already requires the NVM/TLV 11be facts). Its station
 transition delay) — exactly the EML Capabilities its multiple-link request
 carries. Linux's IWL_MLD_CAPA_OPS (TTLM negotiation, link reconfiguration)
 and the UHR ML power-management EXT_MLD bit are advertised as 0: TTLM
-negotiation and link reconfiguration are implemented in `sc_ttlm_neg`
-but unadvertised pending wire-value confirmation (see above), and UHR
+negotiation and link reconfiguration have a frame engine in `sc_ttlm_neg`
+but no action-frame transport or request path (see above), and UHR
 ML power management is not implemented, and no `ext_capa_base` Extended Capabilities bit is
 claimed (the native request carries no Extended Capabilities element), so
 the record's EXT_CAPA/mask are empty. Further links are now requested only

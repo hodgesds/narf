@@ -307,7 +307,16 @@ fn run_prefix() -> Result<(), &'static str> {
     let c = frame(&h, 4302, 60);
     queue(&h, &[a.clone(), b.clone(), c.clone()])?;
     pump(&h);
-    if uplink_frames(&h) != [a, b, c] || !aggregate_counts(&h).is_empty() {
+    // TID3 never joins a TID0 subframe, but the later TID0 frame `c` joins
+    // `a` at the tail of the TID0 queue (mac80211 keeps one TXQ per TID;
+    // `ieee80211_amsdu_aggregate` only looks at that TXQ's tail), so the
+    // single A-MSDU carries exactly a + c. The TID0 and TID3 queues are
+    // served independently, so only the delivered set is fixed.
+    let mut delivered = uplink_frames(&h);
+    delivered.sort();
+    let mut sent = vec![a, b, c];
+    sent.sort();
+    if delivered != sent || aggregate_counts(&h) != [2] {
         return Err("same AC must not skip a different original TID");
     }
     // An actual response can deny A-MSDU even with an unrelated dialog token.
@@ -324,7 +333,9 @@ fn run_prefix() -> Result<(), &'static str> {
     let frames = [frame(&h, 4310, 40), frame(&h, 4311, 50)];
     queue(&h, &frames)?;
     pump(&h);
-    if !aggregate_counts(&h).is_empty() || uplink_frames(&h)[3..] != frames {
+    // `aggregate_counts` is cumulative: the a + c A-MSDU above stays the
+    // only aggregate once the peer denied A-MSDU.
+    if aggregate_counts(&h) != [2] || uplink_frames(&h)[3..] != frames {
         return Err("mismatched-token native NO_AMSDU did not remain denial-only");
     }
     let mut delba = vec![0xd0, 0, 0, 0];
@@ -338,7 +349,7 @@ fn run_prefix() -> Result<(), &'static str> {
     let frames = [frame(&h, 4320, 40), frame(&h, 4321, 50)];
     queue(&h, &frames)?;
     pump(&h);
-    if !aggregate_counts(&h).is_empty() || uplink_frames(&h)[5..] != frames {
+    if aggregate_counts(&h) != [2] || uplink_frames(&h)[5..] != frames {
         return Err("DELBA/positive BA revived sticky NO_AMSDU for same peer");
     }
     Ok(())

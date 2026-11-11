@@ -532,11 +532,15 @@ impl Permission {
     ) -> Result<Self, Error> {
         Self::from_factory_width_with_hint(factory, domain, frequency, secondary, width80, hint)
     }
+    /// The witness of a two-segment receipt. A segment carries one only
+    /// when it needs it (radar constituents, or a World factory's NO_IR
+    /// layer), so a segment without one contributes nothing: a VHT160 or
+    /// 80+80 channel whose one half is radar keeps that half's witness.
     fn merge_hint(&mut self, other: &Self) -> Result<(), Error> {
         self.hint = match (&self.hint, &other.hint) {
             (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a.clone()),
             (Some(a), Some(b)) => Some(a.union(b).ok_or(Error::Unsupported)?),
-            _ => return Err(Error::Unsupported),
         };
         Ok(())
     }

@@ -403,6 +403,9 @@ fn c_container(rf_a: u32, rf_b: u32) -> Vec<u8> {
         bytes[start + 24] = idx;
         bytes.extend_from_slice(&address.to_le_bytes());
         bytes.extend_from_slice(&value.to_le_bytes());
+        // fw.c: the next element starts at ALIGN(offset,
+        // RTW89_FW_ELEMENT_ALIGN = 16).
+        bytes.resize(bytes.len().div_ceil(16) * 16, 0);
     }
     bytes
 }
@@ -569,6 +572,9 @@ fn n51_container(rf_a: u32) -> Vec<u8> {
         bytes[start + 4..start + 8].copy_from_slice(&8u32.to_le_bytes());
         bytes.extend_from_slice(&address.to_le_bytes());
         bytes.extend_from_slice(&value.to_le_bytes());
+        // fw.c: the next element starts at ALIGN(offset,
+        // RTW89_FW_ELEMENT_ALIGN = 16).
+        bytes.resize(bytes.len().div_ceil(16) * 16, 0);
     }
     bytes
 }

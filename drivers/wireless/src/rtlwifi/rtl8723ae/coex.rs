@@ -32,12 +32,13 @@
 //!
 //! ## Deliberately NOT ported here
 //!
-//! - The RF half of `agc_table`: Linux also programs
-//!   `RF_RX_AGC_HP` / `RF_RX_G1` on `RF90_PATH_A` via `phy_set_rf_reg`.
-//!   NARF `rf.rs` exposes no direct RF-write API, so this module programs
-//!   the MMIO `0xc78` table only and records `agc_rf_pending` so the
-//!   follow-up does not lose the RF half. The mechanism's RF LPF-corner
-//!   step is likewise flagged (`lpf_rf_pending` in `dm.rs`).
+//! - Nothing of the RF half is skipped any more: `agc_table` programs
+//!   `RF_RX_AGC_HP` (`0x12`) / `RF_RX_G1` (`0x1a`) on `RF90_PATH_A`
+//!   through the shared `rtl8723com` LSSI writer
+//!   ([`crate::rtlwifi::rtl8723be::phy::rf_serial_write`], the body of
+//!   `rtl8723_phy_rf_serial_write`; every coex RF write uses the full
+//!   `0xfffff` mask, so `rtl8723e_phy_set_rf_reg` reduces to it). The
+//!   LPF-corner step in `dm.rs` uses the same writer.
 //! - No H2C TDMA push: the shared `btcoex::H2C_BT_TDMA` (`0x66`) is the
 //!   8723B element-id (`rtl8723be/fw.h::H2C_8723B_B_TYPE_TDMA`), not an
 //!   8723A command. The 8723A antenna-sharing actions are `balance`,
@@ -58,12 +59,35 @@ use super::c2h::BtInfo as C2hBtInfo;
 use crate::rtlwifi::btcoex::btc::{BtCoexist, ChipInterface, ChipType, HwPg};
 use crate::rtlwifi::btcoex::{pattern_for, BtState, TdmaPattern, WifiState};
 use crate::rtlwifi::firmware_transport::{Error as FwError, Io};
+use crate::rtlwifi::rtl8723be::phy::{rf_serial_write, Path as RfPath};
 
 /// `hal_bt_coexist.h::BT_FW_COEX_THRESH_TOL`.
 pub const RSSI_TOL: i32 = 6;
 
-/// AGC table base (`hal_bt_coexist.c::rtl8723e_dm_bt_agc_table`).
+/// AGC table write port (`hal_bt_coexist.c::rtl8723e_dm_bt_agc_table`):
+/// Linux writes all five dwords to this one register.
 pub const REG_AGC_TABLE: u16 = 0x0c78;
+/// `reg.h::RF_RX_AGC_HP`.
+pub const RF_RX_AGC_HP: u32 = 0x12;
+/// `reg.h::RF_RX_G1`.
+pub const RF_RX_G1: u32 = 0x1a;
+/// RF half of `BT_AGCTABLE_OFF`: `(reg, value)` on `RF90_PATH_A`, mask
+/// `0xfffff`, in Linux order.
+pub const AGC_RF_OFF: [(u32, u32); 5] = [
+    (RF_RX_AGC_HP, 0x32000),
+    (RF_RX_AGC_HP, 0x71000),
+    (RF_RX_AGC_HP, 0xb0000),
+    (RF_RX_AGC_HP, 0xfc000),
+    (RF_RX_G1, 0x30355),
+];
+/// RF half of `BT_AGCTABLE_ON`.
+pub const AGC_RF_ON: [(u32, u32); 5] = [
+    (RF_RX_AGC_HP, 0xdc000),
+    (RF_RX_AGC_HP, 0x90000),
+    (RF_RX_AGC_HP, 0x51000),
+    (RF_RX_AGC_HP, 0x12000),
+    (RF_RX_G1, 0x00355),
+];
 /// AGC table, coex OFF: `0x641c0001, 0x631d0001, 0x621e0001, 0x611f0001,
 /// 0x60200001` (`BT_AGCTABLE_OFF`).
 pub const AGC_TABLE_OFF: [u32; 5] = [0x641c0001, 0x631d0001, 0x621e0001, 0x611f0001, 0x60200001];
@@ -84,8 +108,9 @@ pub const H2C_BALANCE: u8 = 0x0c;
 pub const REG_HMETFR: u16 = 0x01cc;
 /// First H2C box register.
 pub const REG_HMEBOX_0: u16 = 0x01d0;
-/// First H2C box-extension register.
-pub const REG_HMEBOX_EXT_0: u16 = 0x01f0;
+/// First H2C box-extension register (`rtl8723ae/reg.h`: `REG_HMEBOX_EXT_0..3`
+/// at `0x88`, `0x8a`, `0x8c`, `0x8e`, two bytes each).
+pub const REG_HMEBOX_EXT_0: u16 = 0x0088;
 /// HMETFR free-box poll bound, mirroring `rtl8723be/h2c.rs`.
 const HMETFR_CHECKS: u32 = 100;
 
@@ -227,9 +252,13 @@ pub struct Owner {
     pub hold_for_bt_operation: bool,
     /// Watchdog mechanism initialized (`init_set`).
     pub mech_init_set: bool,
-    /// An RF LPF-corner write is owed (shrink or resume): no NARF
-    /// RF-write API, so the mechanism flags it instead of writing.
-    pub lpf_rf_pending: bool,
+    /// `btcoexist.bt_rfreg_origin_1e`: RF `0x1e` (`RF_RCK1`, mask
+    /// `0xfffff`) captured by the mechanism init; the LPF-corner resume
+    /// restores it. `None` until [`Owner::mech_init`] ran.
+    pub rf_origin_1e: Option<u32>,
+    /// `btcoexist.bt_rfreg_origin_1f`: RF `0x1f` (`RF_RCK2`) bits `[7:4]`
+    /// captured by the mechanism init (Linux stores it and never reads it).
+    pub rf_origin_1f: Option<u32>,
     /// `btcoexist.cstate`.
     pub cstate: u32,
     /// `btcoexist.cstate_h` (BT counter levels live in bits 0..3).
@@ -248,9 +277,6 @@ pub struct Owner {
     pub balance_on: bool,
     /// AGC table currently programmed ON.
     pub agc_on: bool,
-    /// The RF half of the AGC table is still unprogrammed (no NARF
-    /// RF-write API); the follow-up lane must not lose it.
-    pub agc_rf_pending: bool,
     /// BB back-off currently programmed ON.
     pub backoff_on: bool,
     /// `fw_coexist_all_off` wrapper flag (see the module caveat).
@@ -276,6 +302,12 @@ pub enum Error {
 
 impl From<FwError> for Error {
     fn from(_: FwError) -> Self {
+        Error::Access
+    }
+}
+
+impl From<crate::rtlwifi::prepare::Error> for Error {
+    fn from(_: crate::rtlwifi::prepare::Error) -> Self {
         Error::Access
     }
 }
@@ -323,7 +355,8 @@ impl Owner {
             profile_action: super::dm::Mech::None,
             hold_for_bt_operation: false,
             mech_init_set: false,
-            lpf_rf_pending: false,
+            rf_origin_1e: None,
+            rf_origin_1f: None,
             cstate: state::BT_IDLE,
             cstate_h: 0,
             prev_cstate: state::BT_IDLE,
@@ -333,7 +366,6 @@ impl Owner {
             pre_rssi1: RssiState::High,
             balance_on: false,
             agc_on: false,
-            agc_rf_pending: false,
             backoff_on: false,
             fw_all_off: false,
             sw_all_off: false,
@@ -587,7 +619,8 @@ impl Owner {
         id: u8,
         payload: &[u8],
     ) -> Result<(), Error> {
-        if payload.is_empty() || payload.len() > 7 {
+        // `_rtl8723e_fill_h2c_command` handles 1..=5 command bytes.
+        if payload.is_empty() || payload.len() > 5 {
             return Err(Error::State);
         }
         let boxnum = self.h2c_next;
@@ -609,17 +642,21 @@ impl Owner {
             return Err(Error::CommandTimeout);
         }
         let base = REG_HMEBOX_0 + u16::from(boxnum) * 4;
+        // `rtl8723ae/fw.c::_rtl8723e_fill_h2c_command`: up to three bytes
+        // go in the box with BIT(7) clear; four or five bytes set BIT(7),
+        // put the first two in the two-byte extension register (written
+        // first) and the rest in the box.
         let mut content = [0u8; 4];
         content[0] = id;
         if payload.len() > 3 {
-            let ext_base = REG_HMEBOX_EXT_0 + u16::from(boxnum) * 4;
-            let mut ext = [0u8; 4];
-            ext[..payload.len() - 3].copy_from_slice(&payload[3..]);
-            for (i, b) in ext.iter().enumerate() {
+            content[0] |= 1 << 7;
+            let ext_base = REG_HMEBOX_EXT_0 + u16::from(boxnum) * 2;
+            for (i, b) in payload[..2].iter().enumerate() {
                 io.write8(ext_base + i as u16, *b)?;
             }
-            content[1..4].copy_from_slice(&payload[..3]);
+            content[1..1 + payload.len() - 2].copy_from_slice(&payload[2..]);
         } else {
+            content[0] &= !(1 << 7);
             content[1..1 + payload.len()].copy_from_slice(payload);
         }
         for (i, b) in content.iter().enumerate() {
@@ -648,17 +685,24 @@ impl Owner {
         Ok(())
     }
 
-    /// `rtl8723e_dm_bt_agc_table`: the five MMIO `0xc78` dwords for the
-    /// ON/OFF table. The RF half (`RF_RX_AGC_HP` / `RF_RX_G1` on
-    /// `RF90_PATH_A`) is NOT programmed here — no NARF RF-write API —
-    /// and is recorded in `agc_rf_pending` instead of silently dropped.
+    /// `rtl8723e_dm_bt_agc_table`: the five MMIO dwords for the ON/OFF
+    /// table, all written to the `0xc78` port as in Linux, then the RF
+    /// half (`RF_RX_AGC_HP` x4, `RF_RX_G1`) on `RF90_PATH_A` through
+    /// `rtl8723_phy_rf_serial_write` (full `0xfffff` mask, so
+    /// `rtl8723e_phy_set_rf_reg` does no read-modify-write).
     pub fn agc_table<I: Io>(&mut self, io: &I, on: bool) -> Result<(), Error> {
-        let table = if on { AGC_TABLE_ON } else { AGC_TABLE_OFF };
-        for (i, dword) in table.iter().enumerate() {
-            io.write32(REG_AGC_TABLE + (i as u16) * 4, *dword)?;
+        let (table, rf) = if on {
+            (AGC_TABLE_ON, AGC_RF_ON)
+        } else {
+            (AGC_TABLE_OFF, AGC_RF_OFF)
+        };
+        for dword in table {
+            io.write32(REG_AGC_TABLE, dword)?;
+        }
+        for (reg, value) in rf {
+            rf_serial_write(io, RfPath::A, reg, value)?;
         }
         self.agc_on = on;
-        self.agc_rf_pending = true;
         Ok(())
     }
 

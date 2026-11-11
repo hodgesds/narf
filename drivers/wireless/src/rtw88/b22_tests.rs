@@ -253,8 +253,10 @@ fn smoke_rtw8822be_phy_tables_follow_rtw8822b_phy_set_param_order() -> TestResul
         {
             return TestResult::Fail("8822B phy_set_param tail differs from rtw8822b.c");
         }
-        // channel 0 (no rtw_set_channel yet) selects the 5 GHz RFE program.
-        let trsw = if rfe == 2 { 0xa501 } else { 0xa5a5 };
+        // channel 0 (no rtw_set_channel yet) is IS_CH_2G_BAND (`<= 14`), so
+        // both the EFEM and IFEM RFE programs take their 2.4 GHz 2TX/2RX
+        // TRSW 0xa501 (rtw8822b_set_channel_rfe_{efem,ifem}).
+        let trsw = 0xa501;
         if r32(0xca0) & 0xffff != trsw || r32(0xea0) & 0xffff != trsw {
             return TestResult::Fail("8822B config_trx_mode RFE TRSW differs");
         }
@@ -852,7 +854,9 @@ fn smoke_rtw8822be_station_gate_and_program_refuse_without_station_arm() -> Test
         || gate.extension_base().is_none()
         || gate.calibrated_base().is_some()
         || gate.base_request().is_none()
-        || gate.ht_facts().is_some()
+        // N2BH (rtw_phy_get_2g_tx_power_index HT20 ceilings) exposes B22 HT
+        // facts over the base; no HT continuation is bound (base_only).
+        || gate.ht_facts().is_none()
         || gate.c21_indices().is_some()
         || !gate.base_only()
         || gate.current_with_policy_for_test(&us).is_err()
@@ -993,7 +997,9 @@ fn smoke_rtw8822be_n2bo_channel_record_binds_base_and_retunes() -> TestResult {
         if gate.channel() != 6
             || gate.b22_indices() != Some([a, b])
             || gate.extension_request().is_none_or(|r| {
-                !r.filename.starts_with("rtw88/rtw8822be-ch06-station-v1-")
+                // Continuations bind the channel-scoped N2BL request.
+                !r.filename
+                    .starts_with("rtw88/rtw8822be-ch06-legacy-wmm-v1-")
                     || r.identity == request.identity
             })
             || gate.without_channel().b22_indices() == Some([a, b])

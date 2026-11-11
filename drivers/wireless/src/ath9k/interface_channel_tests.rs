@@ -45,7 +45,7 @@ impl Environment for ChannelEnvironment {
             if !old.radio.lock().await.retire() {
                 return Err(Error::Transport(packet::Error::Timeout));
             }
-            old.state.lock().await.clear();
+            old.rings.state.lock().await.clear();
             // No new source/hardware preparation precedes the actual old DMA
             // proof. A wedged TX/RX engine leaves this sole owner terminal.
             let next = owner.prepare(frequency)?;

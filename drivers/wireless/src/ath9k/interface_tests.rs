@@ -938,10 +938,10 @@ fn smoke_ar9285_ht20_native_reentrant_aggregate_rekey_epoch_and_ordinary_tx_cred
             // Actual stack callback must own none of the driver/radio/ring/
             // publication locks and can synchronously queue host TX+drain.
             if target.device.radio.try_lock().is_none()
-                || target.device.state.try_lock().is_none()
+                || target.device.rings.state.try_lock().is_none()
                 || target.device.publication.try_lock().is_none()
-                || target.device.rx.try_lock().is_none()
-                || target.device.tx.try_lock().is_none()
+                || target.device.rings.rx.try_lock().is_none()
+                || target.device.rings.tx.try_lock().is_none()
             {
                 valid.store(false, Ordering::Release);
                 return;

@@ -123,13 +123,15 @@ fn smoke_rtw89_nhm_thresholds_and_average() -> TestResult {
     }
     // Hand-computed WA case: every counter 10, WA thresholds. Weights
     // 34, 39, 45, 51, 57, 65, 75, 85, 95, 105, 112, 112 (last two
-    // overridden from 164/220); fold moves counter 11 into counter 0.
-    // (20*34 + 10*841) / 120 >> 1 = 37.
+    // overridden from 164/220); fold moves counter 11 into counter 0,
+    // so weight 11 multiplies a zero counter (phy.c
+    // `rtw89_nhm_weighted_avg`). (20*34 + 10*(39+45+51+57+65+75+85
+    // +95+105+112)) / 120 >> 1 = (680 + 7290) / 120 >> 1 = 33.
     let mut state = NhmState::new();
     state.th = th_values(true);
     state.result = [10; NHM_RPT_NUM];
     state.sum = 120;
-    if weighted_avg(&mut state) != 37 {
+    if weighted_avg(&mut state) != 33 {
         return TestResult::Fail("NHM WA weighted average wrong");
     }
     if state.result[0] != 20 || state.result[NHM_RPT_NUM - 1] != 0 {
@@ -137,13 +139,14 @@ fn smoke_rtw89_nhm_thresholds_and_average() -> TestResult {
     }
     // Non-WA case: same counters, plain thresholds. Weights 34, 39, 45,
     // 51, 57, 65, 75, 85, 95, 105, 115, 122 (last = th[10]+2 = 122);
-    // fold still applies on this path. (20*34 + 10*(39+45+51+57+65+75
-    // +85+95+105+115+122)) / 120 >> 1 = (680 + 8540) / 120 >> 1 = 38.
+    // fold still applies on this path, zeroing counter 11.
+    // (20*34 + 10*(39+45+51+57+65+75+85+95+105+115)) / 120 >> 1 =
+    // (680 + 7320) / 120 >> 1 = 33.
     let mut state = NhmState::new();
     state.th = th_values(false);
     state.result = [10; NHM_RPT_NUM];
     state.sum = 120;
-    if weighted_avg(&mut state) != 38 {
+    if weighted_avg(&mut state) != 33 {
         return TestResult::Fail("NHM plain weighted average wrong");
     }
     TestResult::Pass
@@ -185,14 +188,16 @@ fn smoke_rtw89_nhm_init_and_trigger() -> TestResult {
     if set_params(&mut io, &mut state, 0, true) != Err(Error::InvalidMonitorTime) {
         return TestResult::Fail("NHM zero monitor time accepted");
     }
-    // Full trigger on zeroed registers. CFG = TH0 field (36<<24) |
-    // period 10000 | unit field (10000 & 3)<<16 = 0 | EN | INCLUDE_CCA.
+    // Full trigger on zeroed registers. CFG = TH0 field (36<<24 =
+    // 0x2400_0000) | period 10000 (0x2710) | unit field (Linux writes
+    // `period` there: (10000 << 16) & GENMASK(17, 16) = 0) | EN (bit
+    // 18) | INCLUDE_CCA (bit 19).
     let mut io = Fake::new();
     let mut state = NhmState::new();
     if trigger(&mut io, &mut state).is_err() {
         return TestResult::Fail("NHM trigger failed");
     }
-    if io.get(R_NHM_CFG) != 0x024C_2710 {
+    if io.get(R_NHM_CFG) != 0x240C_2710 {
         return TestResult::Fail("NHM trigger CFG word wrong");
     }
     // TH1 = 42 | 48<<8 | 54<<16 | 60<<24; TH5 = 70 | 80<<8 | 90<<16 |
@@ -262,7 +267,7 @@ fn smoke_rtw89_nhm_get_result() -> TestResult {
     }
     let mut state = NhmState::new();
     state.th = th_values(true);
-    if get_result(&mut io, &mut state) != Ok(Some(37)) {
+    if get_result(&mut io, &mut state) != Ok(Some(33)) {
         return TestResult::Fail("NHM get_result noise wrong");
     }
     if state.sum != 120 || state.result[0] != 20 || state.result[NHM_RPT_NUM - 1] != 0 {

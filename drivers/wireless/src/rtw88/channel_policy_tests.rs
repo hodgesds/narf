@@ -216,7 +216,14 @@ fn smoke_rtw8821ce_operating_readback_rf18_tracks_primary() -> TestResult {
         io.write32(0x2860, 0xc06).await?;
         radio8821c::write_txagc(&mut io, indices).await?;
         io.write32(0x1d0c, u32::from_le_bytes([24; 4])).await?;
-        io.write32(0x1d10, u32::from_le_bytes([24; 4])).await
+        io.write32(0x1d10, u32::from_le_bytes([24; 4])).await?;
+        // The rest of the committed operating state operating_readback_rf18
+        // requires clear (0x2820, 0x1bf0, 0x100 bit9, 0x680); the pattern
+        // model otherwise leaves nonzero bytes there.
+        for reg in [0x2820, 0x1bf0, 0x100, 0x680] {
+            io.write32(reg, 0).await?;
+        }
+        Ok::<(), crate::rtw88::firmware_transport::Error>(())
     });
     if setup.is_err() {
         return TestResult::Fail("C21 operating fixture rejected");
@@ -632,10 +639,18 @@ fn smoke_rtw88_channel5_record_ofdm_selection_and_kinds() -> TestResult {
     {
         return TestResult::Fail("5GHz kind identity/admission is not exact");
     }
-    // Regulatory span 5170..5190 under a plain UNII-1 rule; DFS refuses.
+    // Regulatory span 5170..5190 under a plain UNII-1 rule. Since the
+    // reg::witness passive primaries, a DFS rule admits the span as
+    // passive-only (`passive_rule`); INDOOR_ONLY and an uncovered span refuse.
     let unii1 = domain(5170, 5250, 23, RegFlags::empty());
     let dfs = domain(5170, 5250, 23, RegFlags::DFS);
-    if channel_policy::policy(&r, &unii1) != Ok(76) || channel_policy::policy(&r, &dfs).is_ok() {
+    let indoor = domain(5170, 5250, 23, RegFlags::INDOOR_ONLY);
+    let short = domain(5175, 5250, 23, RegFlags::empty());
+    if channel_policy::admission(&r, &unii1) != Ok((76, false))
+        || channel_policy::admission(&r, &dfs) != Ok((76, true))
+        || channel_policy::policy(&r, &indoor).is_ok()
+        || channel_policy::policy(&r, &short).is_ok()
+    {
         return TestResult::Fail("5GHz record regulatory span not checked");
     }
     TestResult::Pass

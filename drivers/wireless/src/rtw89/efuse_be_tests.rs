@@ -265,10 +265,11 @@ fn build_phy_map() -> [u8; 0x1300] {
     phy[idx..idx + 8].copy_from_slice(&[0x11, 0x5A, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]);
     idx += 8;
     // Header: page 1, blk 25, word_en 0 → 8 bytes at RF log 200..208;
-    // rfe_type is the second byte of word 1 (log 202).
+    // rfe_type is the first byte of word 1 (log 202 =
+    // `block_idx_to_logical_idx_be(25, 1)`, efuse_be.c).
     phy[idx..idx + 3].copy_from_slice(&[0x02, 0x01, 0x90]);
     idx += 3;
-    phy[idx..idx + 8].copy_from_slice(&[0x21, 0x22, 0x23, 0x77, 0x25, 0x26, 0x27, 0x28]);
+    phy[idx..idx + 8].copy_from_slice(&[0x21, 0x22, 0x77, 0x24, 0x25, 0x26, 0x27, 0x28]);
     idx += 8;
     // Terminator: any 0xFF header byte stops the parse.
     phy[idx] = 0xFF;
@@ -325,7 +326,11 @@ fn smoke_rtw89_be_efuse_logical_parse() -> TestResult {
     if hci_log[0..8] != *b"DECOY!!!" || hci_log[8..16].iter().any(|b| *b != 0xFF) {
         return TestResult::Fail("BE HCI_DIG parse leaked page-1 records");
     }
-    // Block index at the limit is rejected.
+    // `blk_idx >= RTW89_EFUSE_MAX_BLOCK_SIZE >> 3` (0x2000) cannot
+    // fire on the 3-byte header: EFUSE_HDR_OFFSET_MASK is 13 bits
+    // (max 0x1FFF), and the 0xFF bytes a larger value would need end
+    // the parse first (efuse_be.c). A lone other-page record is
+    // consumed and leaves the RF log untouched.
     let mut phy_bad = [0xFF; 0x1300];
     phy_bad[4..7].copy_from_slice(&[0x04, 0x00, 0x00]);
     let mut log = [0u8; 0x240];
@@ -335,9 +340,10 @@ fn smoke_rtw89_be_efuse_logical_parse() -> TestResult {
         EfuseBlockKind::Rf,
         chip_8922a::SEC_CTRL_EFUSE_SIZE as u32,
         &mut log,
-    ) != Err(BeEfuseError::InvalidBlock)
+    ) != Ok(())
+        || log.iter().any(|b| *b != 0xFF)
     {
-        return TestResult::Fail("BE logical parse accepted an out-of-range block index");
+        return TestResult::Fail("BE logical parse wrote another page's record");
     }
     // A map too short for its header is truncated, not read OOB.
     let short = [0xFF; 5];

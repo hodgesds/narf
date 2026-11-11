@@ -217,6 +217,7 @@ fn harness_version(
                 },
             htt: firmware_version,
             hardware_keys: false,
+            nlo: false,
         },
     );
     *h.policy.lock() = Some(five_ghz_policy());

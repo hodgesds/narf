@@ -192,15 +192,17 @@ fn smoke_rtw89_dma_be_post_init_order() -> TestResult {
     // clears STOP_AXI_MST (tx/rx arms are IGNORE, so TXDMA_EN
     // and RXDMA_EN stay as the caller left them — here clear)
     // and writes watchdog 4; wpdma enable clears STOP_WPDMA;
-    // txdma channels enabled (STOP1 keeps every bit except
-    // STOP_WPDMA and CH0..CH11); MIT programmed.
+    // txdma channels enabled and the FW-command channel kept
+    // running (STOP1 keeps every bit except STOP_WPDMA, CH0..CH11
+    // and CH12 — `rtw89_pci_ops_mac_post_init_be` ends with
+    // `txdma_fw_ch(true)`); MIT programmed.
     let mut m = Model::new()
         .with32(INIT_CFG1, STOP_AXI_MST)
         .with32(DMA_STOP1, 0xFFFF_FFFF);
     post_init_dma(&mut m);
     if m.regs32[&INIT_CFG1] != 0
         || m.regs32[&MST_WDT_TIMEOUT_SEL_V1] != MST_WDT_TIMEOUT_SEL_8922A
-        || m.regs32[&DMA_STOP1] != 0x7FFF_F000
+        || m.regs32[&DMA_STOP1] != 0x7FFF_E000
         || m.regs32[&PCIE_MIT0_CNT] != 0x8000_0200
     {
         return TestResult::Fail("post_init_dma words");

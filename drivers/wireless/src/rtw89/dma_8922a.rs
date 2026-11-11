@@ -216,12 +216,27 @@ pub(super) fn pre_init_dma_before_reset(
 /// `txdma_fw_ch(true)` → `configure_mit`); it is not wrapped
 /// here because it takes no parameters beyond the register bank.
 pub(super) fn pre_init_dma_after_reset(regs: &mut impl Regs) -> Result<(), Error> {
+    rst_bdram(regs)?;
+    pre_init_dma_enable(regs);
+    Ok(())
+}
+
+/// `rtw89_pci_rst_bdram_be`: `rst_bdram_set` then poll the bound
+/// bit clear. Linux runs debounce / LDO / PCIe / SER settings
+/// between this and [`pre_init_dma_enable`]
+/// (`pci_pre_init_8922a::settings`).
+pub(super) fn rst_bdram(regs: &mut impl Regs) -> Result<(), Error> {
     rst_bdram_set(regs);
-    poll_init_cfg1(regs, rst_bdram_done, BDRAM_ATTEMPTS)?;
+    poll_init_cfg1(regs, rst_bdram_done, BDRAM_ATTEMPTS)
+}
+
+/// The `rtw89_pci_ops_mac_pre_init_be` tail: `txdma_ch(false)` →
+/// `txdma_fw_ch(true)` → `trxdma(Enable, Enable, Enable)` — only
+/// the CH12 FW-command channel may move until the post-init tail.
+pub(super) fn pre_init_dma_enable(regs: &mut impl Regs) {
     txdma_ch(regs, false);
     txdma_fw_ch(regs, true);
     trxdma(regs, Ctrl::Enable, Ctrl::Enable, Ctrl::Enable);
-    Ok(())
 }
 
 /// LV1-reset stop half (`pci_be.c:669`): `ctrl_dma_all(false)` →

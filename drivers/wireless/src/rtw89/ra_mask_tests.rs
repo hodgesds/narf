@@ -161,8 +161,8 @@ fn smoke_rtw89_ra_mask_he() -> TestResult {
     // map is all-cap-0 = 0xFF groups, so either wrong
     // selection gives a different mask.) Trim: HE_1SS|
     // HE_2SS (bits 12..23, 24..35) + SUBOFDM bit 4.
-    // 0xFFF000000 | 0xFFF000 | 0x10 = 0xFFFFF0010.
-    if c.mask != 0xF_FFFF0010 || c.mode != 18 || c.bw_cap != 3 {
+    // 0xFFF000000 | 0xFFF000 | 0x10 = 0xF_FFFF_F010.
+    if c.mask != 0xF_FFFF_F010 || c.mode != 18 || c.bw_cap != 3 {
         return TestResult::Fail("ra mask he 80p80 values");
     }
     if c.sgi || !c.stbc || !c.ldpc || !c.dcm || !c.partial_bw_er {
@@ -229,7 +229,8 @@ fn smoke_rtw89_ra_mask_eht() -> TestResult {
     let Ok(c) = compute(&wide) else {
         return TestResult::Fail("ra mask eht nss4 rejects");
     };
-    if c.mask != 0x3FF3FF010 {
+    // 0x3FF << 28 | 0x3FF << 12 | 0x10 = 0x3F_F03F_F010.
+    if c.mask != 0x3F_F03F_F010 {
         return TestResult::Fail("ra mask eht nss4 trim");
     }
     // EHT beats HE in the else-if chain: with both caps,

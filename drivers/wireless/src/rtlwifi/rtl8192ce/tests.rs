@@ -735,7 +735,8 @@ fn smoke_rtl8192ce_linked_ring_profile() -> TestResult {
         }
     }
     if Chip::Rtl8192ce.next_desc_offset() != Some(40)
-        || Chip::from_device(crate::rtlwifi::regs::RTL_DEV_8192DE).is_some()
+        // The 8192DE has its own linked-ring profile (d619c9ba5), never 92CE's.
+        || Chip::from_device(crate::rtlwifi::regs::RTL_DEV_8192DE) != Some(Chip::Rtl8192de)
     {
         return TestResult::Fail("92CE next-descriptor offset / 8192DE excluded");
     }

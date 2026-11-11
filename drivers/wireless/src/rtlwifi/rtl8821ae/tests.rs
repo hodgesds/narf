@@ -689,7 +689,8 @@ fn smoke_rtl8821ae_parked_hw_init_mac_bb_rf_order() -> TestResult {
     if r[0x004] & 0x10 == 0
         || r[0x423] != 0xff
         || r[0x041] & 0x10 != 0
-        || u16::from_le_bytes([r[0x10c], r[0x10d]]) != 0xf5ba
+        // (old & 0xf) | 0xF5B1 (rtl8821ae/hw.c:965-968): BIT(0) is always set.
+        || u16::from_le_bytes([r[0x10c], r[0x10d]]) != 0xf5bb
         // The MAC table (written after init_mac) rewrites RCR bytes 0x608/9.
         || !trace.contains(&(4, 0x608, mac::RCR))
         || r[0x303] != 0x77
@@ -1507,7 +1508,17 @@ fn smoke_rtl8821ae_iqk_fill_and_full_restore() -> TestResult {
         .chain(iqk::AFE_REGS.iter())
         .enumerate()
     {
-        if r32(usize::from(*at)) != 0x5a00_0000 | i as u32 {
+        let value = 0x5a00_0000 | i as u32;
+        // `_rtl8821ae_iqk_restore_afe` reloads every AFE register on Page C,
+        // then (Page C1, 0x82c BIT31 = 1) zeroes 0xc80 / 0xc84 / 0xcb8
+        // (rtl8821ae/phy.c:4428-4441). This register model is unpaged, so
+        // the AFE reload is checked as the written value.
+        let restored = if i >= iqk::MACBB_REGS.len() {
+            trace.contains(&(4, *at, value))
+        } else {
+            r32(usize::from(*at)) == value
+        };
+        if !restored {
             return TestResult::Fail("backed-up MAC/BB/AFE register not restored");
         }
     }

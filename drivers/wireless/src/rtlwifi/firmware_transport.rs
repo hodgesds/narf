@@ -479,6 +479,34 @@ impl<I: Io> Owner<I> {
         {
             return Err(Error::Unsupported);
         }
+        self.load_registered(authority, name).await
+    }
+    /// Registry-mechanics fixtures (deferral, revocation, retry) stage a
+    /// unique image name so their absence/presence is independent of every
+    /// other fixture in the shared kernel registry. Everything after the
+    /// production per-chip name gate is the same path.
+    #[cfg(feature = "kernel-test")]
+    pub(super) async fn initialize_registered_fixture(
+        &self,
+        authority: &narf_capabilities::Cap<
+            narf_firmware::FirmwareRegistry,
+            narf_capabilities::Read,
+        >,
+        name: &str,
+    ) -> Result<Info, Error> {
+        if self.started.load(Ordering::Acquire) {
+            return Err(Error::AlreadyStarted);
+        }
+        self.load_registered(authority, name).await
+    }
+    async fn load_registered(
+        &self,
+        authority: &narf_capabilities::Cap<
+            narf_firmware::FirmwareRegistry,
+            narf_capabilities::Read,
+        >,
+        name: &str,
+    ) -> Result<Info, Error> {
         let asset = crate::firmware_asset::load(authority, name, HEADER + MAX_PAYLOAD, false)
             .map_err(Error::Firmware)?;
         parse(self.did, &asset.bytes)?;

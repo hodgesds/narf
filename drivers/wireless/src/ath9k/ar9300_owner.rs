@@ -38,7 +38,10 @@
 //! (`ar9003::packet::Packet`) then carries the station with the band's MAC
 //! clock, behind the shared station/interface owners.
 //!
-//! Every retune, recovery and resume is a generation reset:
+//! Hang recovery (FATAL, BB watchdog, TX hang, failed calibration, RX
+//! inactivity) is the in-place `ath_reset` ([`reset_in_place`]), which
+//! keeps the station generation and its association. Every retune,
+//! terminal-station recovery and resume is a generation reset:
 //! `hw.c::ath9k_hw_chip_reset` (`ATH9K_RESET_COLD` after FULL_SLEEP or
 //! when `AR_Q_TXE`/`AR_CR_RXE` are still set, else WARM; then
 //! `ath9k_hw_setpower(AWAKE)`), an `AR_SREV` re-check, and a full
@@ -123,9 +126,69 @@ pub(super) struct Owner {
     fullsleep: bool,
     /// Retirement could not prove DMA stopped; the address stays reserved.
     pinned: bool,
+    /// `ath9k_init_wow`: present only for an AR9462 whose PCI subsystem
+    /// carries `ATH9K_PCI_WOW` (`pci.c`); `ah->wow`.
+    wow: Option<ar9003::wow::Wow>,
+    /// `ATH_OP_WOW_ENABLED`: system suspend left the associated station
+    /// armed in WoW sleep instead of retiring it.
+    wow_sleeping: bool,
 }
 pub(super) type Shared = Arc<Mutex<Owner>>;
 static OWNER: IrqSafeSpinLock<Option<Shared>> = IrqSafeSpinLock::new(None);
+/// `wiphy->wowlan` of the bound radio (`wow.c::ath9k_init_wow`).
+static WOWLAN_SUPPORT: IrqSafeSpinLock<Option<narf_wireless::WowlanSupport>> =
+    IrqSafeSpinLock::new(None);
+/// `wiphy->wowlan_config` (`nl80211_set_wowlan`).
+static WOWLAN: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>> = IrqSafeSpinLock::new(None);
+
+/// `wow.c::ath9k_init_wow`'s `wiphy->wowlan`: magic packet and disconnect
+/// wake, `ath9k_wowlan_support` (AR9462 2.0+: `MAX_NUM_PATTERN - 2` user
+/// patterns) or the legacy set, `pattern_min_len` 1, `pattern_max_len`
+/// `MAX_PATTERN_SIZE`, no packet offset.
+fn wowlan_support_for(revision: &ar9003::Revision) -> narf_wireless::WowlanSupport {
+    let support = ar9003::wow::WowlanSupport::for_revision(revision);
+    narf_wireless::WowlanSupport {
+        disconnect: true,
+        magic_packet: true,
+        max_patterns: support.n_patterns(),
+        min_pattern_len: 1,
+        max_pattern_len: support.pattern_max_len() as u16,
+        ..Default::default()
+    }
+}
+
+/// The bound AR9462 WoW subsystem's `wiphy->wowlan`; `None` for every
+/// other part.
+pub(super) fn wowlan_support() -> Option<narf_wireless::WowlanSupport> {
+    *WOWLAN_SUPPORT.lock()
+}
+
+/// `nl80211_set_wowlan` against `wowlan_support` (cfg80211's own
+/// validation: pattern count, lengths, mask size, no offset; GTK-rekey
+/// failure and net-detect are not advertised).
+pub(super) fn set_wowlan(config: Option<narf_wireless::WowlanConfig>) -> Result<(), i32> {
+    let support = wowlan_support().ok_or(narf_wireless::EOPNOTSUPP)?;
+    if let Some(config) = &config {
+        let bad = config.gtk_rekey_failure
+            || config.net_detect.is_some()
+            || config.patterns.len() > usize::from(support.max_patterns)
+            || config.patterns.iter().any(|p| {
+                p.offset != 0
+                    || p.pattern.is_empty()
+                    || p.pattern.len() > usize::from(support.max_pattern_len)
+                    || p.mask.len() != p.pattern.len().div_ceil(8)
+            });
+        if bad {
+            return Err(22); // EINVAL
+        }
+    }
+    *WOWLAN.lock() = config;
+    Ok(())
+}
+
+pub(super) fn wowlan_config() -> Option<narf_wireless::WowlanConfig> {
+    WOWLAN.lock().clone()
+}
 
 /// `ath9k_regd_get_ctl` at `frequency` for the map's `regDmn[0]`:
 /// `ath_regd_get_band_ctl` (initial DFS region unset) | `CTL_11G` on
@@ -314,6 +377,17 @@ pub(super) fn probe(
         identity.tx_chainmask
     );
     let (vendor, device_id) = (device.id.vendor, device.id.device);
+    // ath9k_init_wow: `ATH9K_PCI_WOW` driver_data (AR9462 subsystems only).
+    let wow = ar9003::wow::init_capable(
+        ar9003::wow::driver_data(
+            device.id.device,
+            device.id.subsystem_vendor,
+            device.id.subsystem_id,
+        ),
+        false,
+    )
+    .then(|| ar9003::wow::Wow::new(&revision));
+    *WOWLAN_SUPPORT.lock() = wow.map(|_| wowlan_support_for(&revision));
     let owner = Arc::new(Mutex::new(Owner {
         mmio,
         device,
@@ -337,6 +411,8 @@ pub(super) fn probe(
         suspended: false,
         fullsleep: false,
         pinned: false,
+        wow,
+        wow_sleeping: false,
     }));
     *OWNER.lock() = Some(owner.clone());
     narf_drivers::record_bound(narf_drivers::BoundDriver {
@@ -432,24 +508,22 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
     })?;
     let prepared = o.prepared;
     let revision = o.revision;
-    let report = {
-        // SAFETY: probe or the last generation reset identified this
-        // AR9300 and ran its complete inactive preparation for `prepared`
-        // (whose power plan was just re-programmed); PCI parking was
-        // verified above and no packet DMA exists. The async mutex
-        // serializes the whole attempt.
-        let future = unsafe { o.radio.run(&mut io, &identity, &revision, &prepared) };
-        let mut future = core::pin::pin!(future);
-        core::future::poll_fn(|cx| {
-            if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_dual_in(&d)) {
-                return core::task::Poll::Ready(Err(BringUpError::Policy));
-            }
-            grant
-                .invoke(|| Ok(core::future::Future::poll(future.as_mut(), cx)))
-                .unwrap_or(core::task::Poll::Ready(Err(BringUpError::Policy)))
-        })
-        .await?
-    };
+    // SAFETY: probe or the last generation reset identified this AR9300
+    // and ran its complete inactive preparation for `prepared` (whose power
+    // plan was just re-programmed); PCI parking was verified above and no
+    // packet DMA exists. The async mutex serializes the whole attempt.
+    let report = unsafe {
+        calibrate(
+            &mut o.radio,
+            &mut io,
+            &identity,
+            &revision,
+            &prepared,
+            &grant,
+            permission,
+        )
+    }
+    .await?;
     // The attempt is retained before any MAC mutation.
     o.attempted = true;
     let station = compose(&mut o, report, permission).map_err(|error| {
@@ -470,6 +544,36 @@ async fn initialize(owner: &Mutex<Owner>) -> Result<ar9003::calib::Report, Bring
         BringUpError::BadState
     })?;
     Ok(report)
+}
+
+/// `ar9003::calib::Calibration::run` under the signed record and the
+/// current dual-band host permission, re-proved at every poll.
+///
+/// # Safety
+/// `calib::Calibration::run`'s contract: `prepared` is this chip's
+/// complete inactive preparation, PCI bus mastering is off and no packet
+/// DMA engine runs.
+async unsafe fn calibrate(
+    calibration: &mut ar9003::calib::Calibration,
+    io: &mut identity::Registers,
+    identity: &ar9003::eeprom::Identity,
+    revision: &ar9003::Revision,
+    prepared: &ar9003::phy::Prepared,
+    grant: &admission::Grant,
+    permission: calibration::Permission,
+) -> Result<ar9003::calib::Report, BringUpError> {
+    // SAFETY: forwarded from the caller's contract.
+    let future = unsafe { calibration.run(io, identity, revision, prepared) };
+    let mut future = core::pin::pin!(future);
+    core::future::poll_fn(|cx| {
+        if narf_wireless::reg::db::snapshot().is_none_or(|d| !permission.current_dual_in(&d)) {
+            return core::task::Poll::Ready(Err(BringUpError::Policy));
+        }
+        grant
+            .invoke(|| Ok(core::future::Future::poll(future.as_mut(), cx)))
+            .unwrap_or(core::task::Poll::Ready(Err(BringUpError::Policy)))
+    })
+    .await
 }
 
 fn compose(
@@ -637,6 +741,148 @@ async fn reset(
     initialize(owner).await
 }
 
+/// `main.c::ath_reset` on the current channel (`ath9k_queue_reset` ->
+/// `ath_reset_work` -> `ath_reset_internal`, no fast channel change): the
+/// station generation, its association, peer, host RSNA keys and netdev
+/// stay; only the chip and its DMA engines restart.
+///
+/// `ath_prepare_reset` ([`station::Radio::pause_for_reset`]: interrupts
+/// off, `ath_stoprecv`, `ath_drain_all_txq`, plus this tree's BME-off
+/// quiescence proof), then `ath9k_hw_reset` for the same primary: the
+/// pre-reset `AR_CFG_LED`, `ath9k_hw_chip_reset` (COLD while a TX queue or
+/// RX is still enabled, else WARM), the probe's `AR_SREV`, the inactive
+/// `ar9003::phy::prepare` that must equal the record's, the power plan at
+/// this generation's host permission (`ath9k_hw_apply_txpower`), a fresh
+/// `ar9003_hw_init_cal` (this tree keeps no per-channel `caldata`, so the
+/// TX IQ/CL results are re-measured rather than restored), the station
+/// MAC/queue program (`ar9003::mac::prepare`) and the AR9300 reset tail
+/// (LED, NF load/start, BB watchdog). `ath_complete_reset`
+/// ([`station::Radio::resume_after_reset`]) restarts RX/TX on the retained
+/// rings and re-writes BSSID/AID and slot. Key cache: `ath9k_hw_reset`
+/// never clears `AR_KEYTABLE` (only `ath9k_init_softc` resets it); this
+/// owner uses no hardware key-cache entry (CCMP is host-side), so nothing
+/// needs re-programming. Any failure closes the generation, which the
+/// supervisor then retires through [`reset`].
+async fn reset_in_place(owner: &Mutex<Owner>) -> Result<station::ResetType, BringUpError> {
+    let _control = CONTROL.lock().await;
+    let mut o = owner.lock().await;
+    if o.removed || o.pinned || o.suspended {
+        return Err(BringUpError::DeviceGone);
+    }
+    let station = o.station.clone().ok_or(BringUpError::BadState)?;
+    let mut radio = station.lock().await;
+    let kind = radio
+        .pause_for_reset()
+        .map_err(|_| BringUpError::BadState)?;
+    let restarted = match hw_reset_in_place(&mut o, &mut radio).await {
+        Ok(()) => radio
+            .resume_after_reset()
+            .map_err(|_| BringUpError::BadState),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = restarted {
+        // The supervisor retires this closed generation next tick.
+        let _ = radio.stop();
+        return Err(error);
+    }
+    Ok(kind)
+}
+
+/// `hw.c::ath9k_hw_reset` (same channel) between the two halves of
+/// [`reset_in_place`], on the paused station's retained native port.
+async fn hw_reset_in_place(
+    o: &mut Owner,
+    radio: &mut super::NativeRadio,
+) -> Result<(), BringUpError> {
+    let native = radio.reset_port().ok_or(BringUpError::BadState)?;
+    let command = identity::invoke(&o.cap, || narf_bus::pci::read_command(&o.cap, &o.device))
+        .map_err(|_| BringUpError::DeviceGone)?
+        .map_err(|_| BringUpError::DeviceGone)?;
+    if command == u16::MAX || command & narf_bus::pci::cmd::BUS_MASTER != 0 {
+        return Err(BringUpError::BadState);
+    }
+    let permission = native.ar9300_permission().ok_or(BringUpError::BadState)?;
+    let mut io = identity::Registers::new(o.mmio, o.cap);
+    let led = read_led(&mut io)?;
+    let busy = io.read32(AR_Q_TXE);
+    let cr = io.read32(AR_CR);
+    if busy == u32::MAX || cr == u32::MAX {
+        return Err(BringUpError::DeviceGone);
+    }
+    ar9003::reset_reg(&mut io, o.wa, busy != 0 || cr & AR_CR_RXE_9300 != 0)?;
+    if ar9003::revision(&mut io, o.revision.chip)? != o.revision {
+        return Err(BringUpError::BadIdentity);
+    }
+    let target = o.primary;
+    let ctl = ctl_at(&o.identity, target)?;
+    let identity = o.identity;
+    let mut prepared = ar9003::phy::prepare(
+        &mut io,
+        &o.revision,
+        &identity,
+        o.pll_pwrsave,
+        &o.image,
+        target,
+        ctl,
+        0,
+    )?;
+    if prepared != prepared_at(o, target)? {
+        return Err(BringUpError::BadState);
+    }
+    let grant = o.grant.clone();
+    let plan = ar9003::power::plan(
+        &o.image,
+        target,
+        ctl,
+        permission.budget(),
+        identity.tx_chainmask,
+    )?;
+    grant.invoke(|| ar9003::power::program(&mut io, &plan))?;
+    prepared.power = plan;
+    let revision = o.revision;
+    let mut calibration = ar9003::calib::Calibration::default();
+    // SAFETY: the chip was just reset and fully prepared for `prepared`
+    // (power re-programmed); `pause_for_reset` proved every RX/TX engine
+    // idle with bus mastering off (re-read above), so no packet DMA runs
+    // while the calibration owns the baseband. CONTROL and the owner and
+    // station locks serialize the attempt.
+    let report = unsafe {
+        calibrate(
+            &mut calibration,
+            &mut io,
+            &identity,
+            &revision,
+            &prepared,
+            &grant,
+            permission,
+        )
+    }
+    .await?;
+    let failed = |_| BringUpError::BadState;
+    ar9003::mac::prepare(
+        native,
+        &identity,
+        &o.image[..],
+        identity.mac,
+        report.five_ghz,
+    )
+    .map_err(failed)?;
+    let periodic = ar9003::calib::Periodic::new(
+        &revision,
+        &report,
+        *o.totals.lock(),
+        narf_time::monotonic_ns() / 1_000_000,
+    );
+    native
+        .ar9300_recalibrated(report, periodic)
+        .map_err(failed)?;
+    native.ar9300_reset_tail(led).map_err(failed)?;
+    o.led = led;
+    o.prepared = prepared;
+    o.radio = calibration;
+    Ok(())
+}
+
 /// Rejoin supervisor and `link.c::ath_ani_calibrate` cadence. A terminal
 /// station generation (disassociation, link loss, fatal interrupt, BB
 /// watchdog or failed DMA) is followed by a generation reset into a fresh
@@ -663,6 +909,7 @@ async fn supervise(owner: Shared) {
                 None => continue,
             }
         };
+        let mut queued = None;
         let terminal = {
             let Some(mut radio) = station.try_lock() else {
                 continue;
@@ -670,20 +917,53 @@ async fn supervise(owner: Shared) {
             if radio.terminal() {
                 true
             } else {
-                match radio.long_calibration() {
-                    Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
-                    Err(error) => {
-                        // The generation is now closed; the next tick resets.
-                        let _ = writeln!(
-                            narf_console::Writer,
-                            "ath9k: AR9003 periodic calibration closed: {:?}",
-                            error
-                        );
+                // `ath_hw_check_work`: a queued `ath9k_queue_reset` cause
+                // (FATAL, BB watchdog, TX hang, calibration) or RX
+                // inactivity is recovered by the in-place `ath_reset`.
+                queued = radio
+                    .reset_pending()
+                    .or_else(|| radio.rx_inactive_check(narf_time::monotonic_ns() / 1_000_000));
+                if queued.is_some() {
+                    false
+                } else {
+                    match radio.long_calibration() {
+                        Ok(_) | Err(station::Error::Transport(packet::Error::Busy)) => {}
+                        Err(error) => {
+                            // A queued RESET_TYPE_CALIBRATION is reset in place
+                            // next tick; anything else closed the generation.
+                            let _ = writeln!(
+                                narf_console::Writer,
+                                "ath9k: AR9003 periodic calibration failed: {:?}",
+                                error
+                            );
+                        }
                     }
+                    false
                 }
-                false
             }
         };
+        if let Some(kind) = queued {
+            drop(station);
+            match reset_in_place(&owner).await {
+                Ok(_) => {
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "ath9k: AR9003 in-place reset ({:?}) restarted RX/TX; association kept",
+                        kind
+                    );
+                }
+                Err(error) => {
+                    // The closed generation is retired on the next tick.
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "ath9k: AR9003 in-place reset ({:?}) closed: {:?}",
+                        kind,
+                        error
+                    );
+                }
+            }
+            continue;
+        }
         if !terminal {
             continue;
         }
@@ -730,6 +1010,8 @@ pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         }
         o.removed = true;
         let reclaimed = retire(&mut o).await;
+        // ieee80211_unregister_hw: the netdev leaves with the device.
+        interface::unpublish();
         if reclaimed {
             // `ath9k_stop` parks the PCIe SerDes in its awake array
             // (`ath9k_hw_configpcipowersave(ah, true)`); best effort
@@ -743,6 +1025,8 @@ pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         let mut retained = OWNER.lock();
         if retained.as_ref().is_some_and(|r| Arc::ptr_eq(r, &owner)) {
             *retained = None;
+            *WOWLAN_SUPPORT.lock() = None;
+            *WOWLAN.lock() = None;
         }
         drop(retained);
         if reclaimed {
@@ -793,6 +1077,13 @@ pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     if o.pinned {
         return Err(DeviceSuspendError::DriverError);
     }
+    // mac80211 `ieee80211_suspend` -> `ath9k_suspend` with a WoWLAN
+    // configuration, then `ath_pci_suspend` bypassed ("WOW is enabled").
+    // Linux's `ret = 1` (no association, no trigger) and a failed arming
+    // fall back to the ordinary suspend below.
+    if wow_suspend(&mut o)? {
+        return Ok(());
+    }
     if let Some(station) = o.station.clone() {
         let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
         interface::retire(&station);
@@ -810,6 +1101,139 @@ pub(super) fn pm_suspend() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     o.fullsleep = true;
     let mut io = identity::Registers::new(o.mmio, o.cap);
     ar9003::disable_and_sleep(&mut io, o.wa).map_err(|_| DeviceSuspendError::DriverError)
+}
+
+/// `wow.c::ath9k_suspend` for an armed WoW configuration on an associated
+/// station: the disassociate/deauthenticate patterns (slots 0/1), the
+/// user patterns (slots 2..), the interrupt switch to BMISS
+/// ([`station::Radio::wow_suspend`]) and `ar9003_wow.c::ath9k_hw_wow_enable`
+/// with the keep-alive null frame (`ah->txchainmask`, current band, own
+/// MAC, AP). ANI/calibration and the hang check stop with the supervisor
+/// (`suspended`). `Ok(false)`: WoW does not apply (Linux `ret = 1`) or
+/// arming failed; the caller then takes the ordinary suspend, which retires
+/// the station. MCI/btcoex is not involved (`mci_enabled` false).
+fn wow_suspend(o: &mut Owner) -> Result<bool, narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let (Some(mut wow), Some(config)) = (o.wow, WOWLAN.lock().clone()) else {
+        return Ok(false);
+    };
+    let Some(station) = o.station.clone() else {
+        return Ok(false);
+    };
+    let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
+    let triggers = ar9003::wow::map_triggers(&ar9003::wow::WowlanRequest {
+        disconnect: config.disconnect,
+        magic_pkt: config.magic_packet,
+        n_patterns: config.patterns.len() as u8,
+    });
+    let Some(bssid) = radio.wow_admissible() else {
+        return Ok(false);
+    };
+    if triggers == 0 {
+        return Ok(false);
+    }
+    let mut io = identity::Registers::new(o.mmio, o.cap);
+    let armed = (|| {
+        for (slot, pattern) in ar9003::wow::disassoc_deauth_patterns(&bssid)
+            .iter()
+            .enumerate()
+        {
+            wow.apply_pattern(&mut io, &pattern.bytes, &pattern.mask, slot, pattern.len)?;
+        }
+        if triggers & ar9003::wow::AH_WOW_USER_PATTERN_EN != 0 {
+            // ath9k_wow_add_pattern: zero-padded pattern, the cfg80211
+            // bitmask bytes copied as is, slot i + 2.
+            for (index, user) in config.patterns.iter().enumerate() {
+                let mut bytes = [0; ar9003::wow::MAX_PATTERN_SIZE];
+                let mut mask = [0; ar9003::wow::MAX_PATTERN_MASK_SIZE];
+                let len = user.pattern.len();
+                bytes
+                    .get_mut(..len)
+                    .ok_or(BringUpError::BadState)?
+                    .copy_from_slice(&user.pattern);
+                mask.get_mut(..user.mask.len())
+                    .ok_or(BringUpError::BadState)?
+                    .copy_from_slice(&user.mask);
+                let len = u8::try_from(len).map_err(|_| BringUpError::BadState)?;
+                wow.apply_pattern(&mut io, &bytes, &mask, index + 2, len)?;
+            }
+        }
+        radio.wow_suspend().map_err(|_| BringUpError::BadState)?;
+        wow.enable(
+            &mut io,
+            &o.revision,
+            triggers,
+            &ar9003::wow::KeepAlive {
+                tx_chainmask: o.identity.tx_chainmask,
+                is_2ghz: o.primary < 4800,
+                sta_mac: o.identity.mac,
+                ap_mac: bssid,
+            },
+        )
+    })();
+    if let Err(error) = armed {
+        let _ = writeln!(
+            narf_console::Writer,
+            "ath9k: AR9462 WoW arming failed ({:?}); ordinary suspend",
+            error
+        );
+        return Ok(false);
+    }
+    drop(radio);
+    o.wow = Some(wow);
+    o.wow_sleeping = true;
+    o.suspended = true;
+    let _ = writeln!(
+        narf_console::Writer,
+        "ath9k: AR9462 suspend with WoW triggers {:#x}; association kept",
+        triggers
+    );
+    Ok(true)
+}
+
+/// `wow.c::ath9k_resume`: the saved interrupt mask
+/// ([`station::Radio::wow_resume`], which also queues the RX-inactivity
+/// in-place reset that restarts the RX DMA `ath9k_hw_wow_enable` stopped),
+/// then `ath9k_hw_wow_wakeup` (wake reason, PME clear, event clear,
+/// `INIT_RSSI_THR`) and its `ath9k_hw_configpcipowersave(ah, false)`
+/// (`ar9003::serdes::configure`). TSF2 has no generic-timer owner here, so
+/// `tsf2_restart` is only reported. The supervisor then runs
+/// `ath_restart_work`'s hang check, i.e. the in-place reset, keeping the
+/// station generation and its association. A failed interrupt restore
+/// closes the generation; the supervisor retires it.
+fn wow_resume(o: &mut Owner) -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    use narf_power::device_pm::DeviceSuspendError;
+    let station = o.station.clone();
+    o.wow_sleeping = false;
+    o.suspended = false;
+    if let Some(station) = station {
+        let mut radio = station.try_lock().ok_or(DeviceSuspendError::Busy)?;
+        if let Err(error) = radio.wow_resume() {
+            let _ = writeln!(
+                narf_console::Writer,
+                "ath9k: AR9462 WoW interrupt restore closed the station: {:?}",
+                error
+            );
+        }
+    }
+    let mut io = identity::Registers::new(o.mmio, o.cap);
+    let revision = o.revision;
+    let mut wow = o.wow.ok_or(DeviceSuspendError::DriverError)?;
+    let wakeup = wow
+        .wakeup(&mut io, &revision)
+        .map_err(|_| DeviceSuspendError::DriverError)?;
+    o.wow = Some(wow);
+    if wakeup.restore_pcie_powersave {
+        let tables = ar9003::ini::Tables::for_revision(&revision, &o.identity, o.pll_pwrsave);
+        ar9003::serdes::configure(&mut io, &revision, &tables, false, o.wa, o.aspm_l1_fix)
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "ath9k: AR9462 resume with WoW status {:#x}",
+        wakeup.status
+    );
+    Ok(())
 }
 
 /// `pci.c::ath_pci_resume`: re-disable PCI RETRY_TIMEOUT (config 0x41) that
@@ -836,6 +1260,11 @@ pub(super) fn pm_resume() -> Result<(), narf_power::device_pm::DeviceSuspendErro
             })
             .map_err(|_| DeviceSuspendError::DriverError)?
             .map_err(|_| DeviceSuspendError::DriverError)?;
+        }
+        // `ath_pci_resume` runs for a WoW resume too; `ath9k_resume` then
+        // keeps the generation instead of the reset below.
+        if o.wow_sleeping {
+            return wow_resume(&mut o);
         }
         o.suspended = false;
     }

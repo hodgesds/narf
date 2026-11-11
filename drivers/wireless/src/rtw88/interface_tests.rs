@@ -266,3 +266,82 @@ kernel_test_in!(
     "drivers/wireless/rtw88/wow",
     smoke_rtw88_wow_interface_config_and_unlinked_suspend
 );
+
+/// 5GHz wiphy capabilities (main.c `rtw_init_ht_cap`/`rtw_init_vht_cap` on
+/// the 5GHz sband) carry exactly the qualified offer retained at activate:
+/// none for a legacy-only 5GHz join, HT20 alone, or HT20/40 + VHT80 when an
+/// admitted N2xV join exists. 2.4GHz keeps its own HT body and no VHT.
+fn smoke_rtw88_band5_wiphy_caps_follow_admitted_station_offer() -> TestResult {
+    let device = shell();
+    if device.phy_capabilities(5000).is_some()
+        || device.get_wireless_info().hw_caps.vht_supported
+        || device.get_wireless_info().hw_caps.ht_supported
+    {
+        return TestResult::Fail("unactivated shell advertised 5GHz HT/VHT");
+    }
+    let ht = [
+        0x2c, 0x01, 0x03, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let vht = [0x30, 0x11, 0x13, 0x03, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0];
+    *device.band5_capability.lock() = Some((ht, None));
+    match device.phy_capabilities(5000) {
+        Some(c) if c.ht == ht && c.vht.is_none() => {}
+        _ => return TestResult::Fail("admitted 5GHz HT20 offer not advertised"),
+    }
+    if device.get_wireless_info().hw_caps.vht_supported
+        || !device.get_wireless_info().hw_caps.ht_supported
+        || device.phy_capabilities(2400).is_some()
+    {
+        return TestResult::Fail("HT20-only 5GHz offer advertised VHT or leaked to 2.4GHz");
+    }
+    *device.band5_capability.lock() = Some((ht, Some(vht)));
+    match device.phy_capabilities(5000) {
+        Some(c) if c.ht == ht && c.vht == Some(vht) => {}
+        _ => return TestResult::Fail("admitted 5GHz VHT80 offer not advertised"),
+    }
+    if !device.get_wireless_info().hw_caps.vht_supported || device.phy_capabilities(6000).is_some()
+    {
+        return TestResult::Fail("VHT80 offer not reported or 6GHz advertised");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88",
+    smoke_rtw88_band5_wiphy_caps_follow_admitted_station_offer
+);
+
+/// main.c `SUPPORTS_PS`: power save is advertised and settable only with a
+/// composed LPS owner (`Owner::lps_capable`), off by default; the watchdog
+/// enters LPS only below `RTW_LPS_THRESHOLD` (`ps_active` false).
+fn smoke_rtw88_power_save_interface_follows_lps_capability() -> TestResult {
+    let device = shell();
+    if device.power_save_default().is_some()
+        || device.set_power_save(true) != Err(narf_wireless::EOPNOTSUPP)
+        || device.sleep_enabled.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("shell without an LPS owner advertised power save");
+    }
+    device.sleep_capable.store(true, Ordering::Release);
+    if device.power_save_default() != Some(false) {
+        return TestResult::Fail("power save not advertised off by default");
+    }
+    if device.set_power_save(true).is_err() || device.power_save_default() != Some(true) {
+        return TestResult::Fail("power save enable not retained");
+    }
+    if device.set_power_save(false).is_err() || device.power_save_default() != Some(false) {
+        return TestResult::Fail("power save disable not retained");
+    }
+    if !lps_due(true, 0, 0)
+        || !lps_due(true, LPS_THRESHOLD, LPS_THRESHOLD)
+        || lps_due(true, LPS_THRESHOLD + 1, 0)
+        || lps_due(true, 0, LPS_THRESHOLD + 1)
+        || lps_due(false, 0, 0)
+    {
+        return TestResult::Fail("LPS entry differs from rtw_watch_dog_work ps_active");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw88/ps",
+    smoke_rtw88_power_save_interface_follows_lps_capability
+);

@@ -87,10 +87,33 @@ impl<I: Io, M: Memory> Prepared<I, M> {
                 channel: default_channel,
                 bw40: false,
                 autoload_fail,
+                // `rtl92de_init_sw_vars` leaves early mode off.
+                earlymode_enable: false,
+                // The NARF station encrypts in software (the `swenc=1`
+                // equivalent), so `rtl92d_enable_hw_security_config`
+                // returns before any write.
+                hw_security: crate::rtlwifi::rtl8192de::mac::HwSecurity {
+                    sw_crypto: true,
+                    use_sw_sec: true,
+                    use_defaultkey: false,
+                },
+                // ASPM stays disabled on the probed link (as for the other
+                // retained rtlwifi profiles): the `const_support_pciaspm`
+                // 0 setting, whose back door byte is `0x03`.
+                support_backdoor: crate::rtlwifi::rtl8192de::lifecycle::AspmVars::new(0)
+                    .support_backdoor(),
             },
         )
         .await?;
         let identity = crate::rtlwifi::radio::factory_identity(factory);
+        // The packet owner's per-function facts (`rtlpci->receive_config`,
+        // `macphymode`, `interfaceindex`, `rf_type`).
+        self.packet.de92.facts = Some(super::packet::de92::Facts {
+            receive_config: radio.receive_config,
+            mode: radio.mode,
+            interface_index: radio.interface_index,
+            rf_type: radio.rf_type,
+        });
         self.rtl8192de = Some(alloc::boxed::Box::new(De92Radio {
             identity,
             radio,
@@ -168,9 +191,10 @@ impl<I: Io, M: Memory> Prepared<I, M> {
             &op,
             &mut state.radio.chnlval,
             &mut state.radio.iqk,
-            // No `Lck` state is owned here (LC calibration has no
-            // production caller yet), so the snapshot is clear and no
-            // LCK wait runs — main's behavior, unchanged.
+            // `rtl92d_phy_lc_calibrate` runs to completion inside
+            // `configure_rtl8192de` (`init::configure`), which clears
+            // `lck_inprogress` before returning, so no calibration can be
+            // in progress at a channel switch.
             false,
         )
         .await?;

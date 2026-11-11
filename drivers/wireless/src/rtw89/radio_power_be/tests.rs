@@ -261,9 +261,11 @@ fn smoke_rtw89_be_limit_pages_follow_phy_be() -> TestResult {
     if limit[1][4] != 14 {
         return TestResult::Fail("80MHz BE OFDM limit not read at the primary channel");
     }
-    // RU: ru26 sections 0/3 = ch36/48; ru52 section 1 = ch40;
-    // ru106 2TX section 3 = ch48.
-    if ru[0][0] != 25 || ru[0][3] != 26 || ru[0][17] != 12 || ru[1][35] != 13 {
+    // RU: the 5GHz RU fixture has no ru26 rows, so every ru26
+    // section reads 0 (`rtw89_phy_read_txpwr_limit_ru` has no
+    // fallback past regd/WW); ru52 section 1 = ch40; ru106 2TX
+    // section 3 = ch48.
+    if ru[0][..16].iter().any(|&v| v != 0) || ru[0][17] != 12 || ru[1][35] != 13 {
         return TestResult::Fail("80MHz BE RU page differs from fill_txpwr_limit_ru_80m_be");
     }
     TestResult::Pass
@@ -304,10 +306,11 @@ fn smoke_rtw89_be_visit_emits_rtw8922a_set_txpwr_order() -> TestResult {
         || writes[108] != (0x26C04, 0x3, 1)
         || writes[109] != (0x11FAC, u32::MAX, 0)
         || writes[110] != (0x11FB0, u32::MAX, 0x0019_0000)
-        || writes[111] != (0x11FB4, u32::MAX, 0x0000_001a)
+        || writes[111] != (0x11FB4, u32::MAX, 0)
+        || writes[112] != (0x11FB8, u32::MAX, 0x0000_001a)
         || writes[118] != (0x11FD0, u32::MAX, 0x0016_0000)
         || writes[126] != (0x11FF0, u32::MAX, 0x0000_0014)
-        || writes[147] != (0x12048, u32::MAX, 0x1a00_1a19)
+        || writes[147] != (0x12048, u32::MAX, 0)
         || writes[151] != (0x12058, u32::MAX, 0x0000_0c00)
     {
         return TestResult::Fail("BE byrate/offset/shape/limit/RU writes differ");

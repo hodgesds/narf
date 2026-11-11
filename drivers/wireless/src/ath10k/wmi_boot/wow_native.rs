@@ -1,6 +1,7 @@
 //! Model TLV firmware WoW endpoint: records every GRP_WOW command, answers
 //! WOW_ENABLE with the HTC endpoint-0 SEND_SUSPEND_COMPLETE and
-//! WOW_HOSTWAKEUP_FROM_SLEEP with WOW_WAKEUP_HOST (`wmi-tlv.c`, `htc.c`).
+//! WOW_HOSTWAKEUP_FROM_SLEEP with WOW_WAKEUP_HOST (`wmi-tlv.c`, `htc.c`);
+//! the NLO config command (0x18001) is recorded with them.
 use super::*;
 
 #[derive(Debug, Default)]
@@ -14,7 +15,9 @@ pub(super) fn handles(model: &RadioModel, bytes: &[u8]) -> bool {
     model.wow.is_some()
         && model.inner.inner.dialect == Dialect::Tlv
         && bytes.get(..4).is_some_and(|id| {
-            (0x13001..=0x13005).contains(&u32::from_le_bytes(id.try_into().unwrap()))
+            let id = u32::from_le_bytes(id.try_into().unwrap());
+            // GRP_WOW, and the NLO_OFL config a net-detect suspend sends.
+            (0x13001..=0x13005).contains(&id) || id == 0x18001
         })
 }
 pub(super) fn send(model: &mut RadioModel, bytes: &[u8]) -> Result<(), BmiError> {

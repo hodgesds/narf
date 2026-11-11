@@ -1045,6 +1045,28 @@ fn smoke_qcom_platform_sc7280_dt() -> TestResult {
         platform::smp2p_entry(&blob, ph::WLAN_OUT),
         Some(("/smp2p-wpss".into(), "wlan".into()))
     );
+    // PAS proxy power (kodiak.dtsi): apps_rsc drv-2 with tcs-offset
+    // 0xd00, ACTIVE TCS first (index 0); cmd-db reserved memory; cx/mx
+    // rpmhpd rails; aoss_qmp kicked through <&ipcc IPCC_CLIENT_AOP
+    // IPCC_MPROC_SIGNAL_GLINK_QMP>.
+    let pw = p.power.as_ref().unwrap();
+    kt_assert_eq!(pw.rsc.drv, (0x1822_0000, 0x1_0000));
+    kt_assert_eq!(
+        (pw.rsc.drv_id, pw.rsc.tcs_offset, pw.rsc.active_tcs),
+        (2, 0xd00, 0)
+    );
+    kt_assert_eq!(pw.cmd_db, (0x8086_0000, 0x2_0000));
+    kt_assert_eq!(pw.rails, alloc::vec!["cx", "mx"]);
+    let q = pw.qmp.as_ref().unwrap();
+    kt_assert_eq!(q.msgram, (0x0c30_0000, 0x400));
+    kt_assert_eq!(
+        q.kick,
+        KickDt::Ipcc {
+            base: (0x0040_8000, 0x1000),
+            client: 0,
+            signal: 0
+        }
+    );
     TestResult::Pass
 }
 kernel_test_in!("drivers/soc/qcom", smoke_qcom_platform_sc7280_dt);

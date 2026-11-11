@@ -102,15 +102,20 @@ pub(super) fn refusals<F: Fixture>() -> Result<(), &'static str> {
     let mut tail = good.clone();
     tail[127] = 1;
     cases.push(tail);
-    // C21 may not enable C22-only CFO; C22 may not enable reserved bit7.
+    // C21 may not enable C22-only CFO; C22 may not enable reserved bit8
+    // (bit7 is DPK since `rtw8822c_do_dpk` tracking).
     cases.push(record(
         &f,
         if F::c21() {
             MECHANISMS | super::dm::CFO
         } else {
-            MECHANISMS | 1 << 7
+            MECHANISMS | 1 << 8
         },
     )?);
+    // A DPK window without DPK enabled is not a measured envelope.
+    let mut window = good.clone();
+    window[65] = 1;
+    cases.push(window);
     for b in cases {
         if f.stage_dm(b, Cap::bootstrap(), true).is_ok() {
             return Err("altered/foreign N2xD admitted");

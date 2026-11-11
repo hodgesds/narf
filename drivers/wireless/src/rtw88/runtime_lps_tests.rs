@@ -335,8 +335,11 @@ fn smoke_rtw8821ce_lps_rx_in_wake_h2c_gap_retries_unissued_once_and_keeps_data()
     }
     {
         let m = h.port.0.lock();
+        // Station bring-up already published one ACTIVE power-mode H2C;
+        // count only the wake published after this window's LPS entry.
+        let entry = m.mailboxes.iter().rposition(|w| w[..2] == [0x20, 1]);
         if m.ps_staged.iter().filter(|w| **w == wake).count() != 2
-            || m.mailboxes.iter().filter(|w| **w == wake).count() != 1
+            || entry.is_none_or(|at| m.mailboxes[at..].iter().filter(|w| **w == wake).count() != 1)
         {
             return TestResult::Fail("wake H2C published twice or without restaging");
         }

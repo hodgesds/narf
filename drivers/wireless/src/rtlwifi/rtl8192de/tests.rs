@@ -216,7 +216,7 @@ fn fw_image(signature: u16, version: u16, subversion: u8, body_len: usize) -> Ve
 /// mismatch), plus the `firmware_transport` DID dispatch.
 fn smoke_rtl8192de_firmware_header_geometry() -> TestResult {
     for signature in [
-        0x92c0, 0x92c1, 0x88c0, 0x88cf, 0x92d0, 0x92d1, 0x92d2, 0x92d3,
+        0x92c0, 0x92c1, 0x92c2, 0x88c0, 0x88cf, 0x92d0, 0x92d1, 0x92d2, 0x92d3,
     ] {
         let bytes = fw_image(signature, 0x1234, 0x56, 100);
         match fw::parse(&bytes) {
@@ -235,7 +235,9 @@ fn smoke_rtl8192de_firmware_header_geometry() -> TestResult {
             _ => return TestResult::Fail("8192DE transport DID dispatch"),
         }
     }
-    for signature in [0x92c2, 0x92d4, 0x5300, 0x2300, 0x0000] {
+    // `0x92Cx` / `0x88Cx` match on the high 12 bits, `0x92D0..=0x92D3`
+    // exactly (`rtl8192d/fw_common.h` IS_FW_HEADER_EXIST).
+    for signature in [0x92e2, 0x92b0, 0x88d0, 0x92d4, 0x5300, 0x2300, 0x0000] {
         if fw::parse(&fw_image(signature, 1, 0, 100)).is_ok() {
             return TestResult::Fail("8192DE bad signature admitted");
         }
@@ -286,9 +288,14 @@ impl Io for DeFwFake {
         let mut g = self.0.lock();
         if reg == fw::REG_IN_PROCESS && g.wait_finish_after > 0 {
             g.wait_reads += 1;
-            if g.wait_reads >= g.wait_finish_after {
-                g.regs[usize::from(reg)] &= !fw::IN_PROCESS_BIT;
+            // The other function's download completes: its
+            // `rtl92d_fw_free_to_go` sets MCUFWDL_RDY before it clears
+            // `0x1f[5]` (rtl8192de/fw.c:99-102), so the waiter's next
+            // `rtl92d_is_fw_downloaded` sees RDY with the flag still set.
+            if g.wait_reads == g.wait_finish_after {
                 g.regs[usize::from(fw::REG_MCUFWDL)] |= fw::MCUFWDL_EN | 0x02;
+            } else if g.wait_reads > g.wait_finish_after {
+                g.regs[usize::from(reg)] &= !fw::IN_PROCESS_BIT;
             }
         }
         // The firmware raises the MAC-ready bit once the image is
@@ -658,7 +665,7 @@ kernel_test_in!(
 // ── signed envelopes ──────────────────────────────────────────────────────
 
 /// Test board factory (synthetic values, not any board's).
-fn de_factory() -> crate::rtlwifi::efuse::Factory {
+pub(crate) fn de_factory() -> crate::rtlwifi::efuse::Factory {
     crate::rtlwifi::efuse::Factory {
         mac: [0x00, 0xe0, 0x4c, 0x81, 0x92, 0xde],
         logical: [0u8; 512],
@@ -666,7 +673,7 @@ fn de_factory() -> crate::rtlwifi::efuse::Factory {
 }
 
 /// A NAPC v2 row: (channel, bandwidth, offset, curve-value fn).
-type NapcRowV2 = (u8, u8, u8, fn(u8, u8) -> i16);
+pub(crate) type NapcRowV2 = (u8, u8, u8, fn(u8, u8) -> i16);
 /// A NAPC v3 row: (channel, band, bandwidth, offset, curve-value fn).
 type NapcRowV3 = (u8, u8, u8, u8, fn(u8, u8, u8) -> i16);
 
@@ -674,7 +681,12 @@ type NapcRowV3 = (u8, u8, u8, u8, fn(u8, u8, u8) -> i16);
 /// 388 bytes: channel/band/bandwidth/offset + three 64-entry curves).
 /// `rows` are (channel, bandwidth, offset, curve-value fn) for v2, or
 /// (channel, 20, 0, fn) for v1.
-fn de_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRowV2]) -> Vec<u8> {
+pub(crate) fn de_napc_fixture(
+    version: u16,
+    antenna: i16,
+    qualified: i16,
+    rows: &[NapcRowV2],
+) -> Vec<u8> {
     let factory = de_factory();
     let identity = crate::rtlwifi::radio::factory_identity(&factory);
     let total = 96 + rows.len() * 388;
@@ -711,7 +723,7 @@ fn de_napc_fixture(version: u16, antenna: i16, qualified: i16, rows: &[NapcRowV2
 
 /// Flat rising curves: output `2 * index` quarter dBm, so a 20 dBm
 /// ceiling with antenna 0 admits index 40 on every rate.
-fn de_rising(_curve: u8, idx: u8) -> i16 {
+pub(crate) fn de_rising(_curve: u8, idx: u8) -> i16 {
     i16::from(idx) * 2
 }
 
@@ -725,7 +737,7 @@ fn de_no_ht(curve: u8, idx: u8) -> i16 {
 }
 
 /// US 2.4 GHz domain: 2402-2472 MHz, 40 MHz, 20 dBm.
-fn de_us_domain() -> narf_wireless::reg::RegulatoryDomain {
+pub(crate) fn de_us_domain() -> narf_wireless::reg::RegulatoryDomain {
     use narf_wireless::reg::*;
     RegulatoryDomain {
         country_code: *b"US",
@@ -1035,7 +1047,8 @@ fn smoke_rtl8192de_envelope_v3_5ghz_two_stream() -> TestResult {
     };
     match cal_no_2ss.permission_for(&domain5, Operating::twenty(36)) {
         Ok(p)
-            if p.admitted_rates() == 0xfff0
+            // OFDM bits 4..11 + MCS0-7 bits 12..19; MCS8-15 (20..27) off.
+            if p.admitted_rates() == 0x000f_fff0
                 && ht::admitted(&p)
                 && !ht::two_stream(&p, RfType::TwoT2R) => {}
         _ => return TestResult::Fail("8192DE envelope unmeasured 2SS admitted"),
@@ -1823,7 +1836,11 @@ fn smoke_rtl8192de_channel_places() -> TestResult {
             return TestResult::Fail("8192DE right channel place");
         }
     }
-    if channel::rightchnlplace(0) != 0 || channel::rightchnlplace(166) != 0 {
+    // `_rtl92c_phy_get_rightchnlplace` (rtl8192d/phy_common.c:390): an
+    // unknown 5 GHz channel leaves `place` at ARRAY_SIZE(channel_all).
+    if channel::rightchnlplace(0) != 0
+        || channel::rightchnlplace(166) != channel::CHANNEL_ALL.len() as u8
+    {
         return TestResult::Fail("8192DE unknown channel place");
     }
     for (chnl, place) in [(1u8, 0u8), (36, 1), (64, 15), (165, 45)] {
@@ -1831,7 +1848,9 @@ fn smoke_rtl8192de_channel_places() -> TestResult {
             return TestResult::Fail("8192DE IQK place");
         }
     }
-    if channel::iqk_place(0) != 0 || channel::iqk_place(100) != 0 {
+    // rtl8192d/phy_common.c:486: 100 is channel_all[29] (place 16); 166
+    // is not in the table.
+    if channel::iqk_place(0) != 0 || channel::iqk_place(100) != 16 || channel::iqk_place(166) != 0 {
         return TestResult::Fail("8192DE IQK place for unknown channel");
     }
     TestResult::Pass
@@ -1870,10 +1889,12 @@ fn smoke_rtl8192de_operating() -> TestResult {
             38,
             channel::PRIME_CHNL_OFFSET_LOWER,
         ),
+        // 104 below 100: wide 102 (98 is not in `channel_all`, the same
+        // rule that refuses 13 above 15 and 165 above 167).
         (
-            100,
+            104,
             channel::ChannelType::Ht40Minus,
-            98,
+            102,
             channel::PRIME_CHNL_OFFSET_UPPER,
         ),
     ];
@@ -1888,6 +1909,7 @@ fn smoke_rtl8192de_operating() -> TestResult {
         (1, channel::ChannelType::Ht40Minus),
         (13, channel::ChannelType::Ht40Plus),
         (165, channel::ChannelType::Ht40Plus),
+        (100, channel::ChannelType::Ht40Minus),
         (166, channel::ChannelType::Ht20),
     ] {
         if channel::Operating::new(channel, ht).is_ok() {
@@ -1999,12 +2021,15 @@ fn smoke_rtl8192de_efuse_decode() -> TestResult {
         Ok(efuse) => efuse,
         Err(_) => return TestResult::Fail("8192DE normal EFUSE decode"),
     };
+    // Channel-indexed through `rtl92d_get_chnlgroup_fromarray`: channel
+    // index 0..=2 is group 0, 3..=8 group 1, 9..=13 group 2.
     if efuse.cck[0][0] != 0x20
-        || efuse.cck[0][1] != 0x21
-        || efuse.cck[0][2] != 0x22
+        || efuse.cck[0][2] != 0x20
+        || efuse.cck[0][3] != 0x21
+        || efuse.cck[0][9] != 0x22
         || efuse.cck[1][0] != 0x23
-        || efuse.cck[1][1] != 0x24
-        || efuse.cck[1][2] != 0x25
+        || efuse.cck[1][3] != 0x24
+        || efuse.cck[1][13] != 0x25
         || efuse.ht40_1s[0][0] != 0x30
         || efuse.ht40_1s[1][0] != 0x33
         || efuse.ht40_2s[0][0] != 0x30 - 1
@@ -2103,9 +2128,10 @@ fn smoke_rtl8192de_set_level_24g() -> TestResult {
         || de_mac_read32(&io, 0xe00) != 0x3030_3030
         || de_mac_read32(&io, 0xe10) != 0x3030_3030
         || de_mac_read32(&io, 0xe1c) != 0x3030_3030
-        || de_mac_read32(&io, 0xc90) != 0x28
-        || de_mac_read32(&io, 0xc91) != 0x20
-        || de_mac_read32(&io, 0xc92) != 0x1a
+        // Byte writes: rtl_write_byte(0xc90 + i) in _rtl92d_write_ofdm_power_reg.
+        || de_mac_read8(&io, 0xc90) != 0x28
+        || de_mac_read8(&io, 0xc91) != 0x20
+        || de_mac_read8(&io, 0xc92) != 0x1a
     {
         return TestResult::Fail("8192DE set_level 2.4G AGC registers");
     }
@@ -2583,7 +2609,8 @@ fn smoke_rtl8192de_qos_ht() -> TestResult {
     }
     if station::acm_ctrl(&io, 0x00, true, true, station::AC_VO).is_err()
         || de_mac_read8(&io, station::REG_ACMHWCTRL) != 0x08
-        || !station::edca_turbo_init()
+        // rtl92d_dm_init_edca_turbo leaves current_turbo_edca false.
+        || station::edca_turbo_init()
     {
         return TestResult::Fail("8192DE ACM control write / EDCA turbo");
     }
@@ -3249,9 +3276,11 @@ fn smoke_rtl8192de_bw_mode() -> TestResult {
     }
     // The RF channel-value word: 2.4 GHz clears the band bits, 5 GHz
     // sets them (plus BIT(18) above channel 99).
-    if channel::rfreg_chnlval(6, false, 0x1234_5600) != 0x1234_5606
-        || channel::rfreg_chnlval(36, true, 0x1234_5600) != 0x1235_5724
-        || channel::rfreg_chnlval(149, true, 0x1234_5600) != 0x1239_5795
+    // rtl8192de/phy.c:2150 CMDID_RF_WRITEREG: 0x1234_5600 has BIT(18) set
+    // and BIT(16)/BIT(8) clear.
+    if channel::rfreg_chnlval(6, false, 0x1234_5600) != 0x1230_5606
+        || channel::rfreg_chnlval(36, true, 0x1234_5600) != 0x1231_5724
+        || channel::rfreg_chnlval(149, true, 0x1234_5600) != 0x1235_5795
     {
         return TestResult::Fail("8192DE RF channel value");
     }
@@ -3301,7 +3330,8 @@ fn smoke_rtl8192de_configure_end_to_end() -> TestResult {
     if !outcome.switched
         || band != super::Band::On2Ghz
         || bandset != super::BandSet::OnBoth
-        || chnlval != [0x1234_5606, 0x1234_5606]
+        // 2.4 GHz clears BIT(18) | BIT(16) | BIT(8) (rtl8192de/phy.c:2167).
+        || chnlval != [0x1230_5606, 0x1230_5606]
         || de_mac_read8(&io, mac::REG_BWOPMODE) != mac::BWOPMODE_20MHZ
         || de_mac_read32(&io, phy::RFPGA0_ANALOGPARAMETER2) != 0xc00
         || de_mac_read32(&io, 0xe00) != 0x3030_3030
@@ -3345,7 +3375,9 @@ fn smoke_rtl8192de_configure_end_to_end() -> TestResult {
         || outcome.rf3c != Some([0, 0])
         || chnlval != [0x0001_0524, 0x0001_0524]
         || de_mac_read8(&io, super::power::REG_MAC0) != super::power::MAC0_ON
-        || de_mac_read32(&io, phy::RFPGA0_XAB_RFPARAMETER) != 0x0001_8001
+        // BIT(0) | BIT(16) set; BIT(31) | BIT(15) then follow EEPROM 0xcc
+        // bits 6/4, both clear here (rtl8192de/phy.c:2614).
+        || de_mac_read32(&io, phy::RFPGA0_XAB_RFPARAMETER) != 0x0001_0001
         || de_mac_read32(&io, phy::ROFDM0_TRXPATHENABLE) != 0x33
         || de_mac_read32(&io, phy::ROFDM1_TRXPATHENABLE) != 0x03
         || de_mac_read32(&io, phy::ROFDM0_XARXIQIMBALANCE) != 0x4000_0100
@@ -3910,7 +3942,9 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         bw40: true,
         rssi_level: 2,
     });
-    if mask.payload != [0x00, 0xf0, 0x07, 0x00, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_NGB {
+    // SMPS narrows the bitmap only; the 40 MHz short-GI peer at MAC id 0
+    // keeps short GI (rtl8192d/hw_common.c:919, :963).
+    if mask.payload != [0x00, 0xf0, 0x07, 0x00, 0xa0] || mask.ratr_index != RATR_INX_WIRELESS_NGB {
         return TestResult::Fail("8192DE rate mask N SMPS static");
     }
     // N 5 GHz, 1T1R, 20 MHz, RSSI 1: 0x000f_0000, index NG (1).
@@ -3958,7 +3992,8 @@ fn smoke_rtl8192de_rate_mask() -> TestResult {
         bw40: true,
         rssi_level: 3,
     });
-    if mask.payload != [0xff, 0xf0, 0x0f, 0x0f, 0xa0] || mask.ratr_index != RATR_INX_WIRELESS_NGB {
+    // The default case never sets short GI (rtl8192d/hw_common.c:977).
+    if mask.payload != [0xff, 0xf0, 0x0f, 0x0f, 0x80] || mask.ratr_index != RATR_INX_WIRELESS_NGB {
         return TestResult::Fail("8192DE rate mask unknown");
     }
     TestResult::Pass
@@ -4107,12 +4142,14 @@ fn smoke_rtl8192de_rate_mask_send() -> TestResult {
     };
     if mask.payload != [0x15, 0xf0, 0x0f, 0x0f, 0xa0]
         || mailbox.last_hmeboxnum != 1
-        || de_mac_read8(&io, REG_HMEBOX_EXT_0 + 2) != 0x15
-        || de_mac_read8(&io, REG_HMEBOX_EXT_0 + 3) != 0xf0
-        || de_mac_read8(&io, REG_HMEBOX_0 + 4) != 0x86
-        || de_mac_read8(&io, REG_HMEBOX_0 + 5) != 0x0f
-        || de_mac_read8(&io, REG_HMEBOX_0 + 6) != 0x0f
-        || de_mac_read8(&io, REG_HMEBOX_0 + 7) != 0xa0
+        // A fresh mailbox fills box 0: EXT_0 + 0*2 and HMEBOX_0 + 0*4
+        // (rtl8192d/fw_common.c _rtl92d_fill_h2c_command).
+        || de_mac_read8(&io, REG_HMEBOX_EXT_0) != 0x15
+        || de_mac_read8(&io, REG_HMEBOX_EXT_0 + 1) != 0xf0
+        || de_mac_read8(&io, REG_HMEBOX_0) != 0x86
+        || de_mac_read8(&io, REG_HMEBOX_0 + 1) != 0x0f
+        || de_mac_read8(&io, REG_HMEBOX_0 + 2) != 0x0f
+        || de_mac_read8(&io, REG_HMEBOX_0 + 3) != 0xa0
     {
         return TestResult::Fail("8192DE rate mask mailbox bytes");
     }
@@ -4566,6 +4603,10 @@ fn smoke_rtl8192de_lc_calibrate_sw() -> TestResult {
     io.0.lock().regs[usize::from(lck::ROFDM0_XBAGCCORE1)] = 0x5a;
     de_mac_rf_set(&io, 0, lck::RF_SYN_G6, 0);
     de_mac_rf_set(&io, 1, lck::RF_SYN_G6, 0);
+    // RF 0x3F is modeled (0) so its masked rtl_set_rfreg(0x3F, 0x7f, i)
+    // read-modify-write (rtl8192de/phy.c:1985) reads back a defined word.
+    de_mac_rf_set(&io, 0, lck::RF_LCK_CURVE_SEL, 0);
+    de_mac_rf_set(&io, 1, lck::RF_LCK_CURVE_SEL, 0);
     de_mac_rf_set_g6_after(&io, 0, 3);
     de_mac_rf_set_g6_after(&io, 1, 3);
     lck_curve_counts(&io);
@@ -4678,13 +4719,22 @@ kernel_test_in!(
     smoke_rtl8192de_lc_calibrate
 );
 
+/// A MAC fake with the RF register model armed (both paths' `RF_SYN_G4`
+/// present at 0), so `rtl_set_rfreg` writes are recorded and readable.
+fn lck_rf_fake() -> DeMacFake {
+    let io = de_mac_fake();
+    de_mac_rf_set(&io, 0, lck::RF_SYN_G4, 0);
+    de_mac_rf_set(&io, 1, lck::RF_SYN_G4, 0);
+    io
+}
+
 /// `_rtl92d_phy_reload_lck_setting` directly: 5 GHz / 2.4 GHz path
 /// selection, the SYN_G4 merge (`curve << 11`), the dual-dual other-PHY
 /// enable + RF-env save/restore + powerdown, and the bad-channel
 /// refusals.
 fn smoke_rtl8192de_reload_lck_setting() -> TestResult {
     // 5 GHz channel 36, single mode: path A, curve 42.
-    let io = de_mac_fake();
+    let io = lck_rf_fake();
     let mut lck_state = lck::Lck::new();
     lck_state.curveindex_5g[35] = 42;
     if narf_scheduler::block_on(lck::reload_lck_setting(
@@ -4703,7 +4753,7 @@ fn smoke_rtl8192de_reload_lck_setting() -> TestResult {
         return TestResult::Fail("8192DE reload LCK 5G");
     }
     // 2.4 GHz channel 1, single-PHY (2T2R): path B, curve 7.
-    let io = de_mac_fake();
+    let io = lck_rf_fake();
     let mut lck_state = lck::Lck::new();
     lck_state.curveindex_2g[0] = 7;
     if narf_scheduler::block_on(lck::reload_lck_setting(
@@ -4722,7 +4772,7 @@ fn smoke_rtl8192de_reload_lck_setting() -> TestResult {
         return TestResult::Fail("8192DE reload LCK 2G single");
     }
     // 2.4 GHz channel 1, dual (1T1R): path A, curve 7.
-    let io = de_mac_fake();
+    let io = lck_rf_fake();
     if narf_scheduler::block_on(lck::reload_lck_setting(
         &io,
         &lck_state,
@@ -4740,7 +4790,7 @@ fn smoke_rtl8192de_reload_lck_setting() -> TestResult {
     // Dual-dual 5 GHz on MAC1: the other-PHY enable runs (DBI powerdown
     // lands last, CTRL 0xf840), the RF-env enable sets bits 20+4 of
     // 0x860, and the SYN_G4 write still lands.
-    let io = de_mac_fake();
+    let io = lck_rf_fake();
     lck_state.curveindex_5g[35] = 42;
     if narf_scheduler::block_on(lck::reload_lck_setting(
         &io,
@@ -4759,7 +4809,7 @@ fn smoke_rtl8192de_reload_lck_setting() -> TestResult {
         return TestResult::Fail("8192DE reload LCK dual-dual");
     }
     // Bad channels are refused: 0, and past the band table.
-    let io = de_mac_fake();
+    let io = lck_rf_fake();
     if narf_scheduler::block_on(lck::reload_lck_setting(
         &io,
         &lck_state,
@@ -4876,7 +4926,11 @@ kernel_test_in!(
 
 /// The `rtl92de_hw_init` orchestrator on a single-MAC 2.4 GHz
 /// function: power-on, MAC/BB/RF tail, TX-power level at channel 1,
-/// and the radio report (mode, band, RF type, RF on, PG store).
+/// and the radio report (mode, band, RF type, RF on, PG store); the
+/// Linux-order helpers it now runs: early mode off (`0x605 |= 0x30`
+/// only), software crypto (`REG_SECCFG` 0, `REG_CR+1` untouched), the
+/// ASPM back door with `support_backdoor` false (`0x349 = 0x03`), DM
+/// init and a two-path LC calibration (single-PHY 2T2R).
 fn smoke_rtl8192de_hw_init() -> TestResult {
     let efuse = match txpower::Efuse::from_hwinfo(&level_hwinfo(), false, false) {
         Ok(efuse) => efuse,
@@ -4895,11 +4949,29 @@ fn smoke_rtl8192de_hw_init() -> TestResult {
             channel: 1,
             bw40: false,
             autoload_fail: false,
+            earlymode_enable: false,
+            hw_security: mac::HwSecurity {
+                sw_crypto: true,
+                use_sw_sec: true,
+                use_defaultkey: false,
+            },
+            support_backdoor: false,
         },
     )) {
         Ok(radio) => radio,
         Err(_) => return TestResult::Fail("8192DE hw_init configure"),
     };
+    if de_mac_read8(&io, 0x605) & 0x70 != 0x30
+        || de_mac_read8(&io, mac::REG_EARLYMODE_CTRL + 3) != 0
+        || de_mac_read8(&io, mac::REG_SECCFG) != 0
+        || de_mac_read8(&io, 0x34b) != 0x93
+        || de_mac_read8(&io, 0x349) != 0x03
+        || de_mac_read8(&io, 0x352) != 0x01
+        || radio.dm != dm::Dm::new()
+        || radio.lc.path_count != 2
+    {
+        return TestResult::Fail("8192DE hw_init Linux-order helpers");
+    }
     if radio.mode != MacPhyMode::SingleMacSinglePhy
         || radio.band != Band::On2Ghz
         || radio.rf_type != RfType::TwoT2R

@@ -258,6 +258,12 @@ enum CoexEvent {
     C2h(Vec<u8>),
     Watchdog(super::coex::Traffic),
     Works,
+    /// ps.c `rtw_enter_ips` (`COEX_IPS_ENTER`) / `rtw_ips_pwr_up`
+    /// (`COEX_IPS_LEAVE`).
+    Ips(bool),
+    /// ps.c `rtw_enter_lps_core` (`COEX_LPS_ENABLE`) /
+    /// `rtw_leave_lps_core` (`COEX_LPS_DISABLE`).
+    Lps(bool),
 }
 /// Separately qualified dynamic-mechanism watchdog (`dm`, tag `D`).
 #[derive(Default)]
@@ -473,6 +479,8 @@ impl State {
                 Box::pin(owner.watchdog(io, &live, link, traffic)).await
             }
             CoexEvent::Works => Box::pin(owner.poll(io, &live, link)).await,
+            CoexEvent::Ips(enter) => Box::pin(owner.ips(io, &live, link, enter)).await,
+            CoexEvent::Lps(enable) => Box::pin(owner.lps(io, &live, link, enable)).await,
         };
         // rtw_coex_mimo_ps -> rtw_set_txrx_1ss: the dm path diversity is
         // first returned to path A and held, then config_trx_mode runs.
@@ -896,6 +904,25 @@ impl State {
     }
     pub(super) fn receive_open(&self) -> bool {
         self.peer().is_some() && self.security.as_ref().is_none_or(Security::port_open)
+    }
+    /// ps.c `rtw_coex_lps_notify` from the LPS enter (`enable`) / leave
+    /// paths (`runtime_lps::lps_window`). No-op without a bound coexistence
+    /// owner; a failed run restores and unbinds coexistence (`coex_event`).
+    pub(super) async fn coex_lps(&mut self, io: &mut impl Io, enable: bool) -> Result<(), Error> {
+        self.coex_event(io, CoexEvent::Lps(enable)).await
+    }
+    /// ps.c `rtw_enter_ips` -> `rtw_coex_ips_notify(COEX_IPS_ENTER)` before
+    /// the unassociated station is stopped (`Device::idle_claim`).
+    pub(super) async fn coex_ips_enter(&mut self, io: &mut impl Io) -> Result<(), Error> {
+        self.coex_event(io, CoexEvent::Ips(true)).await
+    }
+    /// ps.c `rtw_enter_lps`: `coex.stat.wl_force_lps_ctrl` (set by
+    /// `COEX_PS_LPS_OFF`) keeps the station out of LPS.
+    pub(super) fn coex_forces_lps_off(&self) -> bool {
+        self.coex
+            .owner
+            .as_deref()
+            .is_some_and(super::coex::Coex::forces_lps_off)
     }
     /// Actual completed association, unextended fixed CCK1 only. This new
     /// program does not borrow qualification for HT/BA/tracking combinations.
@@ -1723,7 +1750,18 @@ impl State {
                                 frame.rate >= 0x40 || v.rx >> (frame.rate - 0x2c) & 1 == 0
                             })
                         } else if frame.rate >= 12 {
-                            self.ht.is_none() || frame.rate >= 20
+                            // HT MCS0..15 only within the locally advertised
+                            // RX set (`rtw_init_ht_cap` rx_mask: MCS0..7, or
+                            // MCS0..15 for a two-stream N22H record),
+                            // independent of the peer's narrower RX set. A
+                            // profile without HT DATA keeps the one-stream set.
+                            let rx = match self.data_profile.rx_mcs {
+                                0 => 0xff,
+                                rx => rx,
+                            };
+                            self.ht.is_none()
+                                || frame.rate >= 28
+                                || rx >> (frame.rate - 12) & 1 == 0
                         } else {
                             self.data_profile.rates & (1 << frame.rate) == 0
                         })

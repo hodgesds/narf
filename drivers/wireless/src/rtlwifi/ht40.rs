@@ -46,7 +46,8 @@ impl Geometry {
         self.secondary
     }
     pub(in crate::rtlwifi) fn center(self) -> u8 {
-        (self.primary + self.secondary) / 2
+        // Widened: 5 GHz pairs above 127 (e.g. 157/161) overflow a u8 sum.
+        ((u16::from(self.primary) + u16::from(self.secondary)) / 2) as u8
     }
     pub(in crate::rtlwifi) fn prime(self) -> u8 {
         if self.primary < self.secondary {

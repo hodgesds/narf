@@ -27,6 +27,8 @@ impl
         let rtl8821ae = device == super::super::regs::RTL_DEV_8821AE;
         let rtl8192ee = device == super::super::regs::RTL_DEV_8192EE;
         let rtl8192ce = super::super::rtl8192ce::is_8192ce(device);
+        let rtl8723be = device == super::super::regs::RTL_DEV_8723BE;
+        let rtl8192de = device == super::super::regs::RTL_DEV_8192DE;
         let disabled = if rtl8821ae {
             super::super::power_runtime::disable_rtl8821ae(&io, ready).await
         } else if rtl8192ee {
@@ -37,13 +39,21 @@ impl
             // `rtl92ce_card_disable`, normally already run by the owner's
             // `ce92_quiesce` (accepted by its `SYS_FUNC_EN + 1` receipt).
             super::super::power_runtime::disable_rtl8192ce(&io).await
+        } else if rtl8723be {
+            // `rtl8723be_card_disable` → `_rtl8723be_poweroff_adapter`,
+            // after the owner's `be8723_quiesce` retirement proof.
+            super::super::power_runtime::disable_rtl8723be(&io, ready).await
+        } else if rtl8192de {
+            // `rtl92de_card_disable`, normally already run by the owner's
+            // `de92_quiesce` (accepted by its receipt).
+            super::super::power_runtime::disable_rtl8192de(&io).await
         } else {
             super::super::power_runtime::disable(&io, ready).await
         };
         disabled.map_err(prepare::Error::Access)?;
         self.power_state.store(1, Ordering::Release);
-        if rtl8821ae || rtl8192ee || rtl8192ce {
-            // ASPM is not composed for 8821AE/8192EE/8192CE
+        if rtl8821ae || rtl8192ee || rtl8192ce || rtl8723be || rtl8192de {
+            // ASPM is not composed for 8821AE/8192EE/8192CE/8723BE/8192DE
             // (`prepare_bus_power`; 8192EE / 8192CE `enable_aspm` is not
             // issued): the probe's ASPM-disabled link state is kept.
             return Ok(());
@@ -84,16 +94,23 @@ impl
         use super::super::{
             firmware_transport::Owner,
             prepare,
-            regs::{RTL_DEV_8188EE, RTL_DEV_8192EE, RTL_DEV_8821AE},
+            regs::{
+                RTL_DEV_8188EE, RTL_DEV_8192DE, RTL_DEV_8192EE, RTL_DEV_8723BE, RTL_DEV_8821AE,
+            },
         };
         // The fresh-generation rebuild is the card-disable/enable flow:
         // 88EE `_rtl88ee_poweroff_adapter` + NIC enable, 8821AE
         // `_rtl8821ae_poweroff_adapter` + `_rtl8821ae_init_mac`'s enable,
         // 8192EE `_rtl92ee_poweroff_adapter` + `_rtl92ee_init_mac`'s enable,
-        // 8192CE `rtl92ce_card_disable` + a fresh `rtl92ce_hw_init`.
+        // 8192CE `rtl92ce_card_disable` + a fresh `rtl92ce_hw_init`,
+        // 8723BE `_rtl8723be_poweroff_adapter` + `_rtl8723be_init_mac`'s
+        // enable, 8192DE `rtl92de_card_disable` + the `_rtl92de_init_mac`
+        // power prefix.
         let device = self.firmware().device_id();
-        if !matches!(device, RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE)
-            && !super::super::rtl8192ce::is_8192ce(device)
+        if !matches!(
+            device,
+            RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE | RTL_DEV_8723BE | RTL_DEV_8192DE
+        ) && !super::super::rtl8192ce::is_8192ce(device)
         {
             return Err(Error::State);
         }
@@ -109,6 +126,16 @@ impl
             super::super::power_runtime::enable_rtl8821ae(&io).await
         } else if device == RTL_DEV_8192EE {
             super::super::power_runtime::enable_rtl8192ee(&io).await
+        } else if device == RTL_DEV_8723BE {
+            super::super::power_runtime::enable_rtl8723be(&io).await
+        } else if device == RTL_DEV_8192DE {
+            let mode = super::super::rtl8192de::mode_from_prom(
+                super::super::rtl8192de::Interface::Pci,
+                &factory.logical,
+            )
+            .ok_or(prepare::Error::State)?;
+            let function = old.native().function().ok_or(prepare::Error::State)?;
+            super::super::power_runtime::enable_rtl8192de(&io, mode, function).await
         } else if super::super::rtl8192ce::is_8192ce(device) {
             // No separate enable: the fresh owner's firmware run issues the
             // `_rtl92ce_init_mac` power prefix (`power_runtime::

@@ -229,7 +229,7 @@ impl C2hQueue {
     }
 
     /// Enqueue one RX C2H payload, truncated to [`C2H_MAX`].
-    fn push(&mut self, packet: &[u8]) {
+    pub(crate) fn push(&mut self, packet: &[u8]) {
         let n = packet.len().min(C2H_MAX);
         let mut buf = [0u8; C2H_MAX];
         buf[..n].copy_from_slice(&packet[..n]);
@@ -237,7 +237,7 @@ impl C2hQueue {
     }
 
     /// Pop the oldest queued packet.
-    fn pop(&mut self) -> Option<(usize, [u8; C2H_MAX])> {
+    pub(crate) fn pop(&mut self) -> Option<(usize, [u8; C2H_MAX])> {
         self.queue.pop_front()
     }
 }

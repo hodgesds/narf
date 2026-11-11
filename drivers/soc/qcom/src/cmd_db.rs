@@ -4,7 +4,8 @@
 //! Linux counterpart: `drivers/soc/qcom/cmd-db.c` (`cmd_db_read_addr`,
 //! `cmd_db_get_header`). The table lives in a reserved-memory region;
 //! this module only parses a byte slice, so the caller owns the mapping
-//! (DT `reserved-memory` lookup is a follow-up, not invented here).
+//! (the `qcom,cmd-db` `reserved-memory` node is resolved by
+//! [`crate::platform::pas_power`]).
 //!
 //! Layout (all multi-byte fields little-endian), from `cmd-db.c`:
 //!
@@ -97,6 +98,23 @@ impl<'a> CmdDb<'a> {
         let (hdr, ent) = self.find(&query)?;
         let _ = hdr;
         read_u32(self.data, ent + 16)
+    }
+
+    /// `cmd_db_read_aux_data`: the resource's aux data (`entry.len`
+    /// bytes at `data + rsc_hdr.data_offset + entry.offset`, Linux
+    /// `rsc_offset`), or `None` when the id is absent or the data runs
+    /// past the table. Same id query as [`Self::read_addr`].
+    pub fn read_aux_data(&self, id: &str) -> Option<&'a [u8]> {
+        let mut query = [0u8; 8];
+        let bytes = id.as_bytes();
+        let n = bytes.len().min(8);
+        query[..n].copy_from_slice(&bytes[..n]);
+        let (hdr, ent) = self.find(&query)?;
+        let data_offset = read_u16(self.data, hdr + 4)? as usize;
+        let len = read_u16(self.data, ent + 20)? as usize;
+        let offset = read_u16(self.data, ent + 22)? as usize;
+        let start = HEADER_LEN + data_offset + offset;
+        self.data.get(start..start + len)
     }
 
     /// `cmd_db_get_header` for the id query: the `(rsc_hdr, entry)`

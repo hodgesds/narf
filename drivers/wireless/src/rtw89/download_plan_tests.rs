@@ -60,6 +60,134 @@ fn firmware(version: u8, security: usize, formatted: bool) -> Vec<u8> {
     image
 }
 
+/// Stamp a BE `FW_HDR_V1_W7_PART_SIZE` (fw.h:685, GENMASK(15, 0)).
+fn be_part(mut image: Vec<u8>, part: u16) -> Vec<u8> {
+    image[28..30].copy_from_slice(&part.to_le_bytes());
+    image
+}
+
+fn smoke_rtw89_8922a_download_plan_part_size() -> TestResult {
+    // fw.c:465: BE segments by the header's part size, not 2020, and
+    // `__rtw89_fw_download_tweak_hdr_v1` writes it back unchanged.
+    let off = Fuses::from_be(ChipId::Rtl8922A, SecureInfo::disabled());
+    let plan = match DownloadPlan::new(
+        prepare(be_part(firmware(1, 0, false), 2048), ChipId::Rtl8922A),
+        off,
+        Blacklist::upstream(ChipId::Rtl8922A),
+    ) {
+        Ok(plan) => plan,
+        Err(_) => return TestResult::Fail("BE plan with a 2048-byte part refused"),
+    };
+    if plan.part_size() != 2048 || plan.header()[28..30] != [0x00, 0x08] {
+        return TestResult::Fail("BE part size not taken from / written to W7");
+    }
+    let first = plan.chunk(0, 0).unwrap();
+    let second = plan.chunk(0, 2048).unwrap();
+    if first.len() != 2048 || second.len() != 4057 - 2048 || plan.chunk(0, 2020).is_ok() {
+        return TestResult::Fail("BE chunks not cut at the header part size");
+    }
+    let mut raw = first;
+    raw.extend_from_slice(&second);
+    if raw != (0..4057).map(|n| (n % 251) as u8).collect::<Vec<_>>() {
+        return TestResult::Fail("BE chunks lost section bytes");
+    }
+    // Zero, and a part the 14-bit FWCMD RPKT_LEN cannot carry, are refused.
+    for part in [0u16, 0x4000] {
+        if !matches!(
+            DownloadPlan::new(
+                prepare(be_part(firmware(1, 0, false), part), ChipId::Rtl8922A),
+                off,
+                Blacklist::upstream(ChipId::Rtl8922A),
+            ),
+            Err(Error::SectionGeometry)
+        ) {
+            return TestResult::Fail("BE part size outside 1..=0x3fff accepted");
+        }
+    }
+    // AX keeps the fixed 2020 split whatever W7 says.
+    let ax = DownloadPlan::new(
+        prepare(be_part(firmware(1, 0, false), 2048), ChipId::Rtl8852C),
+        Fuses::decode(ChipId::Rtl8852C, 0xff, 0xff).unwrap(),
+        Blacklist::upstream(ChipId::Rtl8852C),
+    )
+    .unwrap();
+    if ax.part_size() != 2020 || ax.header()[28..30] != [0xe4, 7] {
+        return TestResult::Fail("AX part size must stay 2020");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_download_plan_part_size
+);
+
+fn smoke_rtw89_8922a_bbmcu_element() -> TestResult {
+    // fw.c:1542 + fw.c:784: BBMCU0 is element id 0 behind the MFW
+    // images (16-byte aligned, 32-byte header, cv at byte 24); the
+    // first element whose cv <= the chip cut wins (newest first).
+    let normal = be_part(firmware(1, 0, false), 2048);
+    let mut newer = be_part(firmware(1, 0, false), 2048);
+    newer[48] = 0x11; // distinct descriptor address
+    let older = be_part(firmware(1, 0, false), 1024);
+    let mut file = vec![0u8; 32];
+    file[0] = 255;
+    file[1] = 1;
+    // MFW entry 0: cv 0, type NORMAL (1), mp 0, shift 32, size.
+    file[16 + 1] = 1;
+    put(&mut file, 16 + 4, 32);
+    put(&mut file, 16 + 8, normal.len() as u32);
+    file.extend_from_slice(&normal);
+    for (id, cv, body) in [(0u32, 2u8, &newer), (1, 0, &newer), (0, 0, &older)] {
+        file.resize((file.len() + 15) & !15, 0);
+        let at = file.len();
+        file.resize(at + 32, 0);
+        put(&mut file, at, id);
+        put(&mut file, at + 4, body.len() as u32);
+        file[at + 24] = cv;
+        file.extend_from_slice(body);
+    }
+    let image = prepare(file.clone(), ChipId::Rtl8922A); // cut 1
+    let bb = match image.bbmcu(1, 0) {
+        Ok(bb) => bb,
+        Err(_) => return TestResult::Fail("BBMCU0 element not found for cut 1"),
+    };
+    if bb.image() != older.as_slice() || bb.chip() != ChipId::Rtl8922A {
+        return TestResult::Fail("cut 1 must skip the cv-2 element and take the cv-0 one");
+    }
+    match image.bbmcu(2, 0) {
+        Ok(bb) if bb.image() == newer.as_slice() => {}
+        _ => return TestResult::Fail("cut 2 must take the first (cv-2) element"),
+    }
+    match image.bbmcu(1, 1) {
+        Ok(bb) if bb.image() == newer.as_slice() => {}
+        _ => return TestResult::Fail("BBMCU1 is element id 1"),
+    }
+    // A BBMCU0 plan cuts at its own header's part size.
+    let off = Fuses::from_be(ChipId::Rtl8922A, SecureInfo::disabled());
+    match DownloadPlan::new(bb, off, Blacklist::upstream(ChipId::Rtl8922A)) {
+        Ok(plan) if plan.part_size() == 1024 => {}
+        _ => return TestResult::Fail("BBMCU0 plan part size"),
+    }
+    // A truncated element body is refused; no element is ImageMissing.
+    let mut cut_short = file.clone();
+    cut_short.truncate(cut_short.len() - 1);
+    if !matches!(
+        crate::rtw89::fwdl::find_bbmcu(&cut_short, 1, 0),
+        Err(FwError::BadFormat)
+    ) {
+        return TestResult::Fail("truncated BBMCU element accepted");
+    }
+    let bare = &file[..32 + normal.len()];
+    if !matches!(
+        crate::rtw89::fwdl::find_bbmcu(bare, 1, 0),
+        Err(FwError::ImageMissing)
+    ) {
+        return TestResult::Fail("container without elements must be ImageMissing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_bbmcu_element);
+
 fn smoke_rtw89_8922a_secure_download_plan() -> TestResult {
     // The 8922A secure download plan, end to end: the valid BE efuse
     // vector (cryp-sel index 0, magnitude 0x8000100; WinlinInbox,
@@ -87,8 +215,8 @@ fn smoke_rtw89_8922a_secure_download_plan() -> TestResult {
     // overlaps `key_sign_len` (bytes 60..62) in fw.h's section
     // union, and 0x8000100 is the magnitude whose overlap reads as
     // a 512-byte signature length (0x0800 >> 2); 0xC000180 would
-    // parse as 48-byte signatures.
-    let mut bytes = firmware(1, 1, true);
+    // parse as 768-byte signatures.
+    let mut bytes = be_part(firmware(1, 1, true), 0x1000);
     bytes[1040 + 32] = 0;
     bytes[1040 + 32 + 51] = 0x10;
     bytes[80 + 58..80 + 62].copy_from_slice(&0x8000100u32.to_le_bytes());
@@ -113,8 +241,11 @@ fn smoke_rtw89_8922a_secure_download_plan() -> TestResult {
     }
     // A foreign magnitude ignores the section: secure hardware with
     // no matching signature is refused, never downloaded unsigned.
+    // 0x8000180 keeps the overlapping `key_sign_len` half (0x0800 ->
+    // 512-byte signatures) so the image still parses; 0xC000180 would
+    // read 0x0C00 >> 2 = 768-byte signatures and overrun the pool.
     let mut foreign = bytes.clone();
-    foreign[80 + 58..80 + 62].copy_from_slice(&0xC000180u32.to_le_bytes());
+    foreign[80 + 58..80 + 62].copy_from_slice(&0x8000180u32.to_le_bytes());
     if !matches!(
         DownloadPlan::new(
             prepare(foreign, ChipId::Rtl8922A),
@@ -141,7 +272,7 @@ fn smoke_rtw89_8922a_secure_download_plan() -> TestResult {
     // blacklist policy, are both refused.
     if !matches!(
         DownloadPlan::new(
-            prepare(firmware(1, 0, false), ChipId::Rtl8922A),
+            prepare(be_part(firmware(1, 0, false), 0x1000), ChipId::Rtl8922A),
             fuses,
             Blacklist::upstream(ChipId::Rtl8922A)
         ),

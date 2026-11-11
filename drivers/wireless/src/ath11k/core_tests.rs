@@ -1494,6 +1494,10 @@ fn smoke_ath11k_wmi_per_pdev_routing() -> TestResult {
     };
     core.wmi_ep = Some(ep0);
     core.wmi_pdev_eps = vec![ep0, ep1];
+    // `ath11k_htc_connect_service` records the service on the endpoint;
+    // RX on an endpoint without one is dropped as not connected.
+    core.htc.endpoints[2].service_id = svc_id::WMI_CONTROL;
+    core.htc.endpoints[3].service_id = svc_id::WMI_CONTROL_MAC1;
     core.htc.endpoints[2].ul_pipe_id = 5;
     core.htc.endpoints[2].tx_credit_flow_enabled = false;
     core.htc.endpoints[3].ul_pipe_id = 7;

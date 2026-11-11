@@ -8,7 +8,9 @@ use super::*;
 use narf_wifi_fixtures::ApPmf;
 
 const GTK_A: [u8; 16] = [0x66; 16];
-const GTK_B: [u8; 16] = [0x77; 16];
+/// Distinct from the message-3 GTK the FakeAp hands out ([0x77; 16], key
+/// 1): reusing earlier material is refused as KeyReuse.
+const GTK_B: [u8; 16] = [0x88; 16];
 
 fn harness(version: u32, dialect: Dialect) -> Harness {
     let hardware = if dialect == Dialect::Tlv {
@@ -38,6 +40,7 @@ fn harness(version: u32, dialect: Dialect) -> Harness {
                 | if dialect == Dialect::Tlv { 1 << 18 } else { 0 },
             htt: (3, 1),
             hardware_keys: true,
+            nlo: false,
         },
     );
     h.model(|m| {
@@ -124,6 +127,11 @@ fn rekey(h: &Harness, gtk: [u8; 16], replay: u64) {
         f.group_rekey_with(2, gtk)
     });
     deliver(h, frame);
+    // The device worker's step after the drain (`flush_management`)
+    // programs the key the delivered group reply committed; the next drain
+    // takes its SEC_IND.
+    let _ = drive(h.device.flush_management());
+    h.pump();
 }
 
 fn conversation(version: u32, dialect: Dialect) -> Result<(), &'static str> {

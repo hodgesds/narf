@@ -400,8 +400,10 @@ fn smoke_rtl8821ae_native_join_rsvd_page_h2c_and_leave() -> TestResult {
     if run(owner.leave_station_peer()).is_err()
         || port.reg32(mac::REG_RCR) != mac::RCR & !0xc0
         || (0..6).any(|i| port.reg8(hw::REG_BSSID + i) != 0)
-        || port.wrote(1, 0x1dc, h2c::H2C_MSRRPT.into()).is_none()
-        || port.reg8(0x1dd) != 0
+        // Boxes so far: KEEP_ALIVE 0, RSVDPAGE 1, MSRRPT 2, RA_MASK 3;
+        // `last_hmeboxnum` wraps, so the disconnect report takes box 0.
+        || port.wrote(1, 0x1d0, h2c::H2C_MSRRPT.into()).is_none()
+        || port.reg8(0x1d1) != 0
         || owner.packet.rate_mask.is_some()
         || owner.packet.retired.len() != 1
     {
@@ -513,9 +515,12 @@ fn rx_buffer(
     dw3: u32,
 ) -> Result<super::super::ReceiveStep, Error> {
     let rx = owner.packet.receive;
+    // The device's status write-back keeps the EOR bit the host armed on
+    // the last descriptor (`rtl8821ae_set_desc` HW_DESC_RXERO).
+    let eor = if rx + 1 == owner.depth { 1 << 30 } else { 0 };
     owner.buffers[rx].write_bytes(0, bytes).unwrap();
     let ring = owner.receive.as_mut().unwrap();
-    ring.write32(rx * 32, dw0).unwrap();
+    ring.write32(rx * 32, dw0 | eor).unwrap();
     ring.write32(rx * 32 + 8, dw2).unwrap();
     ring.write32(rx * 32 + 12, dw3).unwrap();
     owner.poll_receive_step()

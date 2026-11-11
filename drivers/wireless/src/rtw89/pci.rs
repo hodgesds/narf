@@ -125,10 +125,12 @@ pub unsafe fn attach_cold(
 
 /// Probe entry called by `narf-bus::driver_match`.
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    // RTL8852BE (b852/b85b) and RTL8852CE (c852, rtw8852ce.c
-    // `rtw89_8852ce_id_table`) run the retained reset/firmware/radio/
-    // station bootstrap; C station admission needs its signed C records.
-    if device.id.vendor == 0x10ec && matches!(device.id.device, 0xb852 | 0xb85b | 0xc852) {
+    // RTL8852BE (b852/b85b), RTL8852CE (c852, rtw8852ce.c
+    // `rtw89_8852ce_id_table`) and RTL8851BE (b851, rtw8851be.c
+    // `rtw89_8851be_id_table`) run the retained reset/firmware/radio/
+    // station bootstrap; C and 8851B station admission need their signed
+    // records.
+    if device.id.vendor == 0x10ec && super::bootstrap_did(device.id.device) {
         return super::bootstrap::probe(device, cap);
     }
     let bound = CONTROLLER.lock().as_ref().map(|owner| owner.bus_addr);
@@ -359,7 +361,7 @@ unsafe fn bring_up_registers(
         }
         None => None,
     };
-    Ok(Rtw89Device {
+    let device = Rtw89Device {
         bus_addr: device.addr,
         device: *device,
         cap: *cap,
@@ -376,7 +378,184 @@ unsafe fn bring_up_registers(
         rx_buffers,
         be_8922a,
         irq_vector,
-    })
+    };
+    // 8922A: run the `rtw89_core_start` prefix through the firmware
+    // download now that the rings and the Prepared owner exist. The
+    // outcome is recorded on the owner (`firmware_ready`), never
+    // fatal to the probe: nothing past the download is wired yet,
+    // so a failed download leaves an inert, inspectable device.
+    if is_8922a {
+        // SAFETY: caller's exclusive BAR/function contract; the rings
+        // were just allocated, nothing else uses them yet.
+        let outcome = unsafe { device.boot_8922a() };
+        if outcome.is_err() {
+            // Inert device: revoke the DMA authority the boot enabled.
+            let _ = crate::rtw88::pci_park::park(&device.device, &device.cap);
+        }
+        if let Some(owner) = device.be_8922a.as_ref() {
+            owner.lock().record_firmware(outcome);
+        }
+    }
+    Ok(device)
+}
+
+/// Why the 8922A boot (`Rtw89Device::boot_8922a`) stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Boot8922aError {
+    /// Not an 8922A probe.
+    NoOwner,
+    /// PCI bus mastering could not be enabled / read back.
+    BusMaster,
+    /// `partial_init` / download sequence failure.
+    Fwdl(super::fwdl_be::Error),
+    /// DMA pre-init / ring programming failure.
+    Dma(super::prepared_8922a::Error),
+    /// BDRAM reset poll failure.
+    Bdram(super::dma_8922a::Error),
+    /// Firmware file / BBMCU0 element.
+    Firmware(super::fw::FwError),
+    /// Download plan (security, geometry).
+    Plan(super::download_plan::Error),
+}
+
+impl Rtw89Device {
+    /// RTL8922A `rtw89_core_start` prefix through the firmware
+    /// download, in Linux order:
+    ///
+    /// 1. `rtw89_mac_preinit` tail: `mac_func_en_be` (power-on
+    ///    already ran in `bring_up_registers`).
+    /// 2. `rtw89_mac_partial_init(include_bb = true)`
+    ///    (`mac.c:4307`): `fwdl_be::partial_init` (HCI DMA TRX, BB
+    ///    preinit, DMAC pre-init, DLFW DLE/HFC).
+    /// 3. hci `mac_pre_init` (`pci_be.c:484`): IO recovery, power
+    ///    wake, DMA pre-init first half, `rtw89_pci_ops_reset`
+    ///    (`program_rings`, CH12 reset), BDRAM reset, the
+    ///    debounce/LDO/PCIe/SER settings, then only CH12 TX DMA on.
+    /// 4. `rtw89_mac_fwdl_preconfig`.
+    /// 5. `rtw89_fw_download(NORMAL, include_bb)`: the NORMAL suit
+    ///    from the trusted firmware registry and its BBMCU0 element,
+    ///    each through the fuse-selected `DownloadPlan`, over CH12.
+    ///
+    /// # Safety
+    /// Caller owns BAR2, the PCI function and the probe-allocated
+    /// rings exclusively; no reset/removal races.
+    pub(super) unsafe fn boot_8922a(&self) -> Result<(), Boot8922aError> {
+        use super::dma::{DEFAULT_RXBD_NUM, DEFAULT_TXBD_NUM, TXCH_NUM};
+        use super::fwdl_be::{self, CheckType, Suit};
+        let owner_lock = self.be_8922a.as_ref().ok_or(Boot8922aError::NoOwner)?;
+        let cv = self.chip_version;
+        // `map_bar_control` left BME off (parked). Linux sets it in
+        // `rtw89_pci_claim_device` (`pci.c`) before any chip access;
+        // CH12 FWDL and the RX rings need it. The caller parks again
+        // when this boot fails.
+        crate::rtw88::pci_park::master(&self.device, &self.cap)
+            .map_err(|_| Boot8922aError::BusMaster)?;
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
+        fwdl_be::mac_func_en(regs);
+        fwdl_be::partial_init(regs).map_err(Boot8922aError::Fwdl)?;
+        super::pci_pre_init_8922a::io_rcy(regs);
+        super::pci_pre_init_8922a::power_wake(regs, true);
+        let tx_phys: [u64; TXCH_NUM] =
+            core::array::from_fn(|ch| self.tx_ring_dma[ch].dma_addr().raw());
+        let rx_phys = [
+            self.rx_ring_dma[0].dma_addr().raw(),
+            self.rx_ring_dma[1].dma_addr().raw(),
+        ];
+        let fuses = {
+            let mut owner = owner_lock.lock();
+            owner
+                .pre_init_dma_before_reset(regs, DEFAULT_RXBD_NUM, DEFAULT_RXBD_NUM)
+                .map_err(Boot8922aError::Dma)?;
+            owner
+                .program_rings(regs, &tx_phys, &rx_phys, DEFAULT_TXBD_NUM, DEFAULT_RXBD_NUM)
+                .map_err(Boot8922aError::Dma)?;
+            owner.secure_fuses()
+        };
+        super::dma_8922a::rst_bdram(regs).map_err(Boot8922aError::Bdram)?;
+        // A SER-clear timeout only warns in Linux (`pci_be.c:385`).
+        let _ = super::pci_pre_init_8922a::settings(regs, cv);
+        super::dma_8922a::pre_init_dma_enable(regs);
+        fwdl_be::fwdl_preconfig(regs);
+
+        let image = super::firmware_registry::load(ChipId::Rtl8922A, cv)
+            .map_err(Boot8922aError::Firmware)?;
+        let bb_image = image.bbmcu(cv, 0).map_err(Boot8922aError::Firmware)?;
+        let blacklist = super::secure::Blacklist::upstream(ChipId::Rtl8922A);
+        let normal = super::download_plan::DownloadPlan::new(image, fuses, blacklist)
+            .map_err(Boot8922aError::Plan)?;
+        let bb = super::download_plan::DownloadPlan::new(bb_image, fuses, blacklist)
+            .map_err(Boot8922aError::Plan)?;
+        // SAFETY: rings programmed above; caller's exclusivity contract.
+        let mut port = unsafe { FwdlPort::new(self) };
+        fwdl_be::download(
+            &mut port,
+            &Suit {
+                plan: &normal,
+                check: CheckType::Wcpu,
+                malloc_info: true,
+            },
+            &[Suit {
+                plan: &bb,
+                check: CheckType::Bb0,
+                malloc_info: false,
+            }],
+        )
+        .map(|_| ())
+        .map_err(Boot8922aError::Fwdl)
+    }
+}
+
+/// Production [`super::fwdl_be::Port`] for a probed 8922A device:
+/// BAR2 for the register program and `Rtw89Device::submit_be_fwdl`
+/// for CH12 packets.
+pub(super) struct FwdlPort<'a> {
+    device: &'a Rtw89Device,
+    regs: super::prepared_8922a::MmioRegs<'a>,
+}
+
+impl<'a> FwdlPort<'a> {
+    /// # Safety
+    /// Same contract as [`Rtw89Device::submit_be_fwdl`] for the
+    /// port's whole lifetime: rings programmed through the Prepared
+    /// owner, no reset/removal racing, caller owns BAR2.
+    pub(super) unsafe fn new(device: &'a Rtw89Device) -> Self {
+        Self {
+            device,
+            regs: super::prepared_8922a::MmioRegs(&device.mmio_bar2),
+        }
+    }
+}
+
+impl super::fwdl_be::Regs for FwdlPort<'_> {
+    fn read16(&mut self, address: u32) -> u16 {
+        super::fwdl_be::Regs::read16(&mut self.regs, address)
+    }
+    fn read32(&mut self, address: u32) -> u32 {
+        super::fwdl_be::Regs::read32(&mut self.regs, address)
+    }
+    fn write16(&mut self, address: u32, value: u16) {
+        super::fwdl_be::Regs::write16(&mut self.regs, address, value)
+    }
+    fn write32(&mut self, address: u32, value: u32) {
+        super::fwdl_be::Regs::write32(&mut self.regs, address, value)
+    }
+}
+
+impl super::fwdl_be::Port for FwdlPort<'_> {
+    fn submit(&mut self, buf: &[u8], fwdl: bool) -> Result<(), super::fwdl_be::Error> {
+        // SAFETY: `FwdlPort::new`'s contract covers this submit.
+        unsafe { self.device.submit_be_fwdl(buf, fwdl) }
+            .map(|_| ())
+            .map_err(|_| super::fwdl_be::Error::Transport)
+    }
+}
+
+/// What frees a CH12 buffer: an H2C with an ack identity is held
+/// until its C2H ack; FWDL header / section packets have no ack and
+/// are freed on TXBD consumption (`fwdl` picks the RPKT type).
+enum FwcmdHold {
+    Ack(super::fwcmd_8922a::FramedH2c),
+    Consumed { fwdl: bool },
 }
 
 fn rtw89_isr() {
@@ -678,31 +857,72 @@ impl Rtw89Device {
     ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
         crate::rtw88::pci_park::invoke(&self.cap, || {
             // SAFETY: caller's live initialized ring/no-reset contract.
-            unsafe { self.submit_be_h2c_authorized(framed, buf) }
+            unsafe { self.submit_fwcmd_authorized(FwcmdHold::Ack(framed), buf) }
         })
         .map_err(|_| super::prepared_8922a::Error::Authority)?
     }
 
-    unsafe fn submit_be_h2c_authorized(
+    /// BE firmware-download submit (`rtw89_h2c_tx`, `core.c:1336`):
+    /// one FWHDR_DL command (`fwdl = false`, RPKT type H2C) or one
+    /// raw section packet (`fwdl = true`, RPKT type FWDL) across
+    /// CH12. Neither has a firmware ack, so the owner frees the
+    /// buffer once the chip consumes its TXBD
+    /// (`Prepared8922a::reclaim_fwcmd`).
+    ///
+    /// # Safety
+    /// Rings programmed through the Prepared owner, WCPU held in
+    /// firmware-download mode (`fwdl_be::enable_wcpu`), no
+    /// reset/removal racing.
+    pub(super) unsafe fn submit_be_fwdl(
         &self,
-        framed: super::fwcmd_8922a::FramedH2c,
+        buf: &[u8],
+        fwdl: bool,
+    ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
+        crate::rtw88::pci_park::invoke(&self.cap, || {
+            // SAFETY: caller's live ring/FWDL-mode contract.
+            unsafe { self.submit_fwcmd_authorized(FwcmdHold::Consumed { fwdl }, buf) }
+        })
+        .map_err(|_| super::prepared_8922a::Error::Authority)?
+    }
+
+    unsafe fn submit_fwcmd_authorized(
+        &self,
+        hold: FwcmdHold,
         buf: &[u8],
     ) -> Result<super::tx_8922a::H2cPrepared, super::prepared_8922a::Error> {
         use super::dma::{TxBd, DEFAULT_TXBD_NUM, TXCH_CH12};
+        use super::fwcmd_8922a::{fwcmd_txdesc, FWCMD_TXDESC_LEN};
         use super::prepared_8922a::Error;
         use super::tx_8922a::BUFFER_DMA_MASK;
-        if buf.is_empty() || buf.len() > u16::MAX as usize {
-            return Err(Error::Transport(super::tx_8922a::Error::BadFrame));
-        }
+        // `rtw89_pci_fwcmd_submit` (pci.c:1551): the 24-byte BE FWCMD
+        // descriptor (dword0 = length | RPKT_TYPE H2C or FWDL)
+        // precedes the payload in the same DMA buffer the TXBD
+        // points at.
+        let fwdl = matches!(hold, FwcmdHold::Consumed { fwdl: true });
+        let desc = fwcmd_txdesc(buf.len(), fwdl)
+            .ok_or(Error::Transport(super::tx_8922a::Error::BadFrame))?;
+        let total = FWCMD_TXDESC_LEN + buf.len();
         let owner_lock = self.be_8922a.as_ref().ok_or(Error::NoOwner)?;
-        let dma_buf = alloc_coherent_masked(buf.len(), DomainId::DRIVER_0, BUFFER_DMA_MASK)
+        let dma_buf = alloc_coherent_masked(total, DomainId::DRIVER_0, BUFFER_DMA_MASK)
             .map_err(|_| Error::NoMemory)?;
-        // SAFETY: fresh owned allocation covers exactly the buffer length.
+        // SAFETY: fresh owned allocation covers exactly `total` bytes:
+        // the descriptor then the payload.
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), dma_buf.as_mut_ptr(), buf.len());
+            core::ptr::copy_nonoverlapping(desc.as_ptr(), dma_buf.as_mut_ptr(), FWCMD_TXDESC_LEN);
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                dma_buf.as_mut_ptr().add(FWCMD_TXDESC_LEN),
+                buf.len(),
+            );
         }
-        dma_buf.sync(0, buf.len());
+        dma_buf.sync(0, total);
+        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
         let mut owner = owner_lock.lock();
+        // `rtw89_h2c_tx`: reclaim consumed CH12 buffers first and
+        // refuse when no TXBD is free (-ENOSPC in Linux).
+        if owner.reclaim_fwcmd(regs)? == 0 {
+            return Err(Error::Transport(super::tx_8922a::Error::Full));
+        }
         let ring_dma = &self.tx_ring_dma[TXCH_CH12 as usize];
         // SAFETY: same ring-slice contract as `submit_be_data_authorized`.
         let bd = unsafe {
@@ -711,14 +931,19 @@ impl Rtw89Device {
                 DEFAULT_TXBD_NUM as usize,
             )
         };
-        let prepared = owner.prepare_h2c(bd, dma_buf.dma_addr().raw(), buf.len())?;
-        owner.retain_h2c(framed, dma_buf);
+        let prepared = owner.prepare_h2c(bd, dma_buf.dma_addr().raw(), total)?;
+        match hold {
+            FwcmdHold::Ack(framed) => {
+                owner.retain_h2c(framed, dma_buf);
+                owner.retain_fwcmd(None);
+            }
+            FwcmdHold::Consumed { .. } => owner.retain_fwcmd(Some(dma_buf)),
+        }
         ring_dma.sync(
             prepared.slot as usize * core::mem::size_of::<TxBd>(),
             core::mem::size_of::<TxBd>(),
         );
         native_dma_barrier();
-        let regs = &mut super::prepared_8922a::MmioRegs(&self.mmio_bar2);
         owner.kick_h2c(regs, &prepared)?;
         Ok(prepared)
     }
@@ -1000,7 +1225,7 @@ pub fn register_pci_driver() {
             },
             probe,
         });
-        if matches!(did, 0xb852 | 0xb85b | 0xc852) {
+        if super::bootstrap_did(did) {
             narf_bus::register_pci_remove(name_for(did), super::bootstrap::remove);
         }
     }

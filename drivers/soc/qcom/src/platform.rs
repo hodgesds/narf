@@ -15,7 +15,9 @@
 //! - each interrupt as a GIC SPI or an SMP2P inbound bit, and the
 //!   `stop` state as an SMP2P outbound entry + bit;
 //! - the SMP2P edge (`qcom,smem`, pids, kick mailbox, its IPC interrupt);
-//! - the SMEM region and its TCSR-mutex hwlock.
+//! - the SMEM region and its TCSR-mutex hwlock;
+//! - for PAS, the proxy power resources (`power-domains` on the RPMh
+//!   RSC, the `xo` RPMh clock, `qcom,cmd-db`, `qcom,qmp`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -126,6 +128,176 @@ pub struct HaltRegsDt {
     pub nc: u32,
 }
 
+/// One RPMh RSC DRV (`rpmh-rsc.c` `rpmh_rsc_probe` +
+/// `rpmh_probe_tcs_config`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RscDt {
+    /// The `drv-<qcom,drv-id>` register window.
+    pub drv: (u64, u64),
+    pub drv_id: u32,
+    /// `qcom,tcs-offset`.
+    pub tcs_offset: u32,
+    /// The first ACTIVE TCS: the `qcom,tcs-config` counts of the
+    /// non-CONTROL groups listed before ACTIVE (groups are numbered in
+    /// DT order; CONTROL takes no TCS index).
+    pub active_tcs: u32,
+}
+
+/// The AOSS QMP channel (`qcom_aoss.c` `qmp_probe`): message RAM and
+/// its outgoing mailbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QmpDt {
+    pub msgram: (u64, u64),
+    pub kick: KickDt,
+}
+
+/// The proxy resources `qcom_q6v5_pas.c` votes around a PAS start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasPowerDt {
+    pub rsc: RscDt,
+    /// The `qcom,cmd-db` reserved-memory region (`cmd_db_dev_probe`).
+    pub cmd_db: (u64, u64),
+    /// `power-domain-names` resolved to rpmhpd rails (`cx`, `mx`).
+    pub rails: Vec<&'static str>,
+    /// `qcom,qmp` (`None`: Linux skips the load-state message).
+    pub qmp: Option<QmpDt>,
+}
+
+/// `rpmhpd.c` `sc7280_rpmhpds[]` index → rail (`res_name` minus
+/// `.lvl`), for the indices a PAS proxy domain names. Only the SC7280
+/// table is transcribed.
+fn rpmhpd_rail(compat: &[String], index: u32) -> Option<&'static str> {
+    if !compat.iter().any(|c| c == "qcom,sc7280-rpmhpd") {
+        return None;
+    }
+    // SC7280_CX 0, SC7280_CX_AO 1, SC7280_EBI 2, SC7280_GFX 3,
+    // SC7280_MX 4, SC7280_MX_AO 5, SC7280_LCX 6, SC7280_LMX 7,
+    // SC7280_MSS 8 (dt-bindings `qcom,rpmhpd.h`).
+    match index {
+        0 => Some("cx"),
+        4 => Some("mx"),
+        _ => None,
+    }
+}
+
+/// `qcom,tcs-config` group types (dt-bindings `qcom,rpmh-rsc.h`).
+const ACTIVE_TCS: u32 = 2;
+const CONTROL_TCS: u32 = 3;
+const TCS_TYPE_NR: usize = 4;
+const DRV_NAMES: [&str; 8] = [
+    "drv-0", "drv-1", "drv-2", "drv-3", "drv-4", "drv-5", "drv-6", "drv-7",
+];
+
+fn rsc(node: &PlatformDevice) -> Result<RscDt, DtError> {
+    let drv_id = node
+        .prop_u32("qcom,drv-id")
+        .ok_or(DtError::MissingResource("qcom,drv-id"))?;
+    let name = DRV_NAMES
+        .get(drv_id as usize)
+        .ok_or(DtError::Malformed("qcom,drv-id"))?;
+    let drv = node.reg_by_name(name)?;
+    let tcs_offset = node
+        .prop_u32("qcom,tcs-offset")
+        .ok_or(DtError::MissingResource("qcom,tcs-offset"))?;
+    let cfg = node
+        .prop_u32s("qcom,tcs-config")
+        .filter(|v| v.len() == 2 * TCS_TYPE_NR)
+        .ok_or(DtError::Malformed("qcom,tcs-config"))?;
+    let mut st = 0;
+    let mut active = None;
+    for pair in cfg.chunks(2) {
+        let (ty, n) = (pair[0], pair[1]);
+        if ty as usize >= TCS_TYPE_NR {
+            return Err(DtError::Malformed("qcom,tcs-config"));
+        }
+        if n == 0 || ty == CONTROL_TCS {
+            continue;
+        }
+        if ty == ACTIVE_TCS {
+            active = Some(st);
+        }
+        st += n;
+    }
+    // Linux falls back to a WAKE TCS when no ACTIVE TCS exists; that
+    // path is not implemented here, so such a DRV is refused.
+    let active_tcs = active.ok_or(DtError::Malformed("no ACTIVE TCS"))?;
+    Ok(RscDt {
+        drv,
+        drv_id,
+        tcs_offset,
+        active_tcs,
+    })
+}
+
+/// Resolve the PAS proxy resources of the remoteproc `node`:
+/// `power-domains` + `power-domain-names` (rpmhpd rails under one
+/// `qcom,rpmh-rsc`), `clocks` `xo` (the RPMh `RPMH_CXO_CLK` under the
+/// same RSC), the `qcom,cmd-db` reserved memory and the optional
+/// `qcom,qmp` AOSS channel. `qcom_q6v5_pas.c` fails probe without the
+/// proxy domains or the `xo` clock, so their absence is an error.
+pub fn pas_power(blob: &[u8], node: &PlatformDevice) -> Result<PasPowerDt, DtError> {
+    let names = node.prop_strings("power-domain-names");
+    let pds = node.phandle_args(blob, "power-domains", "#power-domain-cells")?;
+    if pds.is_empty() || pds.len() != names.len() {
+        return Err(DtError::MissingResource("power-domains"));
+    }
+    let mut rsc_path = None;
+    let mut rails = Vec::new();
+    for (pd, name) in pds.iter().zip(names.iter()) {
+        let ctl = dt::find_phandle(blob, pd.phandle)?;
+        let index = *pd.args.first().ok_or(DtError::Malformed("power-domains"))?;
+        let rail = rpmhpd_rail(&ctl.compatible, index)
+            .ok_or(DtError::Malformed("unsupported power domain"))?;
+        if rail != name.as_str() {
+            return Err(DtError::Malformed("power-domain-names"));
+        }
+        let parent = String::from(parent_path(&ctl.path));
+        if rsc_path.get_or_insert_with(|| parent.clone()) != &parent {
+            return Err(DtError::Malformed("power domains on different RSCs"));
+        }
+        rails.push(rail);
+    }
+    let rsc_path = rsc_path.ok_or(DtError::MissingResource("power-domains"))?;
+    let rsc_node = dt::find_compatible(blob, "qcom,rpmh-rsc")
+        .into_iter()
+        .find(|n| n.path == rsc_path)
+        .ok_or(DtError::Malformed("rpmhpd parent is not an RSC"))?;
+    let xo = node.phandle_args_by_name(blob, "clocks", "#clock-cells", "clock-names", "xo")?;
+    let clk = dt::find_phandle(blob, xo.phandle)?;
+    // RPMH_CXO_CLK = 0 (dt-bindings `qcom,rpmh.h`) on a `clk-rpmh`
+    // provider under the same RSC: the `xo.lvl` ARC vote.
+    if !clk.compatible.iter().any(|c| c.ends_with("-rpmh-clk"))
+        || parent_path(&clk.path) != rsc_path
+        || xo.args.as_slice() != [0]
+    {
+        return Err(DtError::Malformed("xo is not the RPMh CXO clock"));
+    }
+    let cmd_db = dt::find_compatible(blob, "qcom,cmd-db")
+        .into_iter()
+        .next()
+        .ok_or(DtError::MissingResource("qcom,cmd-db"))?
+        .reg(0)?;
+    let qmp = match node.prop_u32("qcom,qmp") {
+        Some(ph) => {
+            let n = dt::find_phandle(blob, ph)?;
+            if !n.is_compatible("qcom,aoss-qmp") {
+                return Err(DtError::Malformed("qcom,qmp"));
+            }
+            Some(QmpDt {
+                msgram: n.reg(0)?,
+                kick: mbox_kick(blob, &n)?,
+            })
+        }
+        None => None,
+    };
+    Ok(PasPowerDt {
+        rsc: rsc(&rsc_node)?,
+        cmd_db,
+        rails,
+        qmp,
+    })
+}
+
 /// Everything a Q6 remoteproc needs, resolved.
 #[derive(Clone, Debug)]
 pub struct Q6Platform {
@@ -144,6 +316,8 @@ pub struct Q6Platform {
     pub stop: Option<(String, String, u32)>,
     pub edges: Vec<Smp2pDt>,
     pub smem: Option<SmemDt>,
+    /// PAS proxy power ([`pas_power`]); `None` for WCSS.
+    pub power: Option<PasPowerDt>,
 }
 
 impl Q6Platform {
@@ -424,6 +598,10 @@ pub fn q6_platform(blob: &[u8], phandle: u32) -> Result<Q6Platform, DtError> {
     } else {
         Some(smem(blob)?)
     };
+    let power = match kind {
+        RprocKind::Pas { .. } => Some(pas_power(blob, &node)?),
+        RprocKind::Wcss => None,
+    };
     Ok(Q6Platform {
         node,
         kind,
@@ -438,5 +616,6 @@ pub fn q6_platform(blob: &[u8], phandle: u32) -> Result<Q6Platform, DtError> {
         stop,
         edges,
         smem,
+        power,
     })
 }

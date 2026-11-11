@@ -138,6 +138,10 @@ impl Port for &Model {
             // AR_CR_RXD stops both receive queues.
             CR if value & CR_RXD != 0 => self.set(CR, 0),
             CR => self.set(CR, if value == 0 { CR_RXE } else { value }),
+            // `AR_INTR_SYNC_CAUSE` is write-one-to-clear: the
+            // `ath9k_hw_init_interrupt_masks` all-ones write and
+            // `ar9003_hw_get_isr`'s write-back clear causes, never set them.
+            0x4028 => self.set(register, self.reg(register) & !value),
             _ => self.set(register, value),
         }
         Ok(())
@@ -421,9 +425,226 @@ fn smoke_ath9k_ar9300_edma_interrupt_mask_and_cause() -> TestResult {
     }
 }
 
+/// In-place `ath_reset`: a FATAL cause queues a reset instead of closing
+/// the owner; `ath_prepare_reset` stops RX/TX with every allocation kept,
+/// the chip reset wipes the MAC, and `ath_complete_reset` re-feeds the same
+/// buffers, re-writes BSSID/AID and re-enables interrupts, after which RX
+/// and TX run again on the retained rings.
+fn check_in_place_reset() -> Result<(), &'static str> {
+    const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    let model = Model::new();
+    // SAFETY: isolated model begins parked; no physical controller is touched.
+    let mut packet = unsafe { Packet::prepare(&model, LOCAL) }.map_err(|_| "prepare fault")?;
+    let start = model.reg(Q_STATUS_RING_START);
+    packet.start().map_err(|_| "start fault")?;
+    packet
+        .set_peer(Some((AP, 5)), 9)
+        .map_err(|_| "peer fault")?;
+    *model.signal.borrow_mut() = Some(crate::ath9k::irq::Signal::new());
+    if !matches!(packet.enable_interrupts(), Ok(true)) {
+        return Err("interrupts not enabled");
+    }
+    let mut posted: Vec<u32> = model
+        .hp
+        .borrow()
+        .iter()
+        .chain(model.lp.borrow().iter())
+        .copied()
+        .collect();
+    posted.sort_unstable();
+    let id = packet.submit(&outbound(), 0).map_err(|_| "submit fault")?;
+    // ATH9K_INT_FATAL (PCIe completion timeout sync cause).
+    model.set(0x7044, 2);
+    model.set(0x4038, 0);
+    model.set(0x80, 0);
+    model.set(0xc0, 0);
+    model.set(0x4028, 0x1000);
+    if packet.service_begin().is_ok() || packet.reset_request() != Some(ResetType::FatalInt) {
+        return Err("FATAL did not queue RESET_TYPE_FATAL_INT");
+    }
+    model.set(0x4028, 0);
+    if packet.pause_for_reset() != Ok(Some(id))
+        || model.master.get()
+        || model.reg(irq::IER) & 1 != 0
+        || model.reg(CR) & CR_RXE != 0
+        || !model.released.borrow().is_empty()
+        || packet.reclaimed()
+        || packet.paused_port().is_none()
+    {
+        return Err("ath_prepare_reset did not stop DMA while keeping storage");
+    }
+    // ath9k_hw_chip_reset: the MAC loses its ring, FIFO, BSSID and IRQ state.
+    for register in [
+        Q_STATUS_RING_START,
+        Q_STATUS_RING_END,
+        DATABUF_SIZE,
+        0x8008,
+        0x800c,
+        irq::IMR,
+    ] {
+        model.set(register, 0);
+    }
+    model.hp.borrow_mut().clear();
+    model.lp.borrow_mut().clear();
+    model.status_tail.set(0);
+    packet
+        .resume_after_reset()
+        .map_err(|_| "ath_complete_reset fault")?;
+    let mut reposted: Vec<u32> = model
+        .hp
+        .borrow()
+        .iter()
+        .chain(model.lp.borrow().iter())
+        .copied()
+        .collect();
+    reposted.sort_unstable();
+    if model.reg(Q_STATUS_RING_START) != start
+        || model.reg(DATABUF_SIZE) != 4048
+        || reposted != posted
+        || !model.master.get()
+        || model.reg(DIAG) & RX_PARK != 0
+        || model.reg(0x8008) != u32::from_le_bytes([AP[0], AP[1], AP[2], AP[3]])
+        || model.reg(irq::IER) != 1
+        || model.reg(irq::IMR) != irq::STATION_IMR
+        || packet.reset_request().is_some()
+        || packet.phase() != Phase::Running
+    {
+        return Err("ath_complete_reset did not restart the retained engines");
+    }
+    model.receive(true, &received(), false);
+    match packet.receive() {
+        Ok(step) if step.frame.as_ref().is_some_and(|f| f.bytes() == received()) => {}
+        _ => return Err("RX did not restart"),
+    }
+    let next = packet
+        .submit(&outbound(), 0)
+        .map_err(|_| "post-reset submit")?;
+    model.complete(true);
+    if !matches!(packet.delivery(), Ok(Some(d)) if d.id == next && d.delivered) {
+        return Err("TX did not restart on the reset status ring");
+    }
+    model.set(0x80, 0);
+    model.set(0xc0, 0);
+    packet.stop().map_err(|_| "stop fault")?;
+    if !packet.reclaimed() || model.released.borrow().len() != 16 {
+        return Err("terminal stop after reset did not reclaim");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9300_in_place_reset_keeps_rings_and_restarts_rx_tx() -> TestResult {
+    match check_in_place_reset() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+
+/// AR9462 WoW on an associated AR9003 station: `ath9k_suspend` switches
+/// the interrupt mask to BMISS and holds service without closing the
+/// generation; `ath9k_resume` restores the saved mask and queues the
+/// RX-inactivity in-place reset, which restarts RX on the retained rings
+/// with the association intact.
+fn check_wow_station() -> Result<(), &'static str> {
+    use crate::ath9k::station::{self, tests::Env, Dispatch, Radio};
+    use core::sync::atomic::{AtomicBool, AtomicU64};
+    const AP: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    let model = Model::new();
+    // SAFETY: isolated model begins parked; no physical controller is touched.
+    let packet = unsafe { Packet::prepare(&model, LOCAL) }.map_err(|_| "prepare fault")?;
+    *model.signal.borrow_mut() = Some(crate::ath9k::irq::Signal::new());
+    let env = Arc::new(Env {
+        now: AtomicU64::new(1_000),
+        entropy: AtomicBool::new(true),
+    });
+    let mut radio: Radio<&Model, Arc<Env>, Dispatch<&Model>> =
+        Radio::new(Dispatch::from(packet), LOCAL, -100, env.clone());
+    radio.start().map_err(|_| "station start")?;
+    radio.__test_open(narf_wireless::association::ObservedBss {
+        bss: narf_wireless::association::Bss {
+            bssid: AP,
+            ssid: b"narf-ar9462".to_vec(),
+            channel: 1,
+            band: None,
+            signal_dbm: Some(-40),
+            capability: 1,
+            beacon_interval: 100,
+            information_elements: Vec::new(),
+        },
+        ap_rsne: None,
+        ap_rsnxe: None,
+        rates: 0xf,
+        basic_rates: 0x3,
+    });
+    if radio.wow_admissible() != Some(AP) {
+        return Err("associated station not WoW-admissible");
+    }
+    if radio.wow_suspend() != Ok(AP)
+        || model.reg(irq::IMR) != irq::WOW_IMR
+        || model.reg(irq::IER) != 1
+        || radio.poll() != Err(station::Error::Busy)
+        || radio.ready()
+        || radio.terminal()
+        || radio.peer() != Some(AP)
+    {
+        return Err("ath9k_suspend did not arm BMISS-only and hold the generation");
+    }
+    env.now.store(60_000, core::sync::atomic::Ordering::Release);
+    radio.wow_resume().map_err(|_| "ath9k_resume fault")?;
+    if model.reg(irq::IMR) != irq::STATION_IMR
+        || radio.reset_pending() != Some(station::ResetType::RxInactive)
+        || radio.terminal()
+    {
+        return Err("ath9k_resume did not restore the mask and queue the RX restart");
+    }
+    if radio.pause_for_reset() != Ok(station::ResetType::RxInactive) || model.master.get() {
+        return Err("in-place reset after WoW did not pause");
+    }
+    for register in [
+        Q_STATUS_RING_START,
+        Q_STATUS_RING_END,
+        DATABUF_SIZE,
+        irq::IMR,
+    ] {
+        model.set(register, 0);
+    }
+    model.hp.borrow_mut().clear();
+    model.lp.borrow_mut().clear();
+    model.status_tail.set(0);
+    radio
+        .resume_after_reset()
+        .map_err(|_| "in-place reset after WoW did not resume")?;
+    if radio.terminal()
+        || radio.peer() != Some(AP)
+        || !radio.ready()
+        || model.hp.borrow().len() != 4
+        || model.lp.borrow().len() != 8
+        || !model.master.get()
+        || model.reg(irq::IMR) != irq::STATION_IMR
+    {
+        return Err("WoW resume lost the generation or RX did not restart");
+    }
+    radio.stop().map_err(|_| "stop")?;
+    Ok(())
+}
+
+fn smoke_ath9k_ar9462_wow_suspend_resume_keeps_generation() -> TestResult {
+    match check_wow_station() {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_wow_suspend_resume_keeps_generation
+);
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9300_edma_packet_owner_tx_rx_and_stop
+);
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9300_in_place_reset_keeps_rings_and_restarts_rx_tx
 );
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",

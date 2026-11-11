@@ -356,6 +356,13 @@ impl Public {
                 narf_net::raw_sock::ETH_P_ALL.to_be(),
             )
             .map_err(|_| "monitor raw bind")?;
+        // Every fixture binds while the interface is still admin DOWN:
+        // `packet_do_bind` (net/packet/af_packet.c:3303) then reports
+        // `sk->sk_err = ENETDOWN`, which the first recv returns and clears.
+        // NETDEV_UP re-registers the hook (`packet_notifier`).
+        if socket.recv(false).err() != Some(100) {
+            return Err("bind on a DOWN monitor did not report ENETDOWN");
+        }
         self.sockets.push(socket.clone());
         Ok(socket)
     }

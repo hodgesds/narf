@@ -12,10 +12,12 @@
 //!   metadata buffer.
 //! - **stop**: SMP2P `stop` request, `PAS_SHUTDOWN`, unprepare.
 //!
-//! Proxy resources Linux votes around start — the RPMh `xo` clock and the
-//! `cx`/`mx` power domains via `qcom,qmp` load-state — are the caller's
-//! responsibility; NARF has no RPMh/AOSS-QMP driver yet (recorded as a
-//! WCN6750 blocker in the wireless ledger).
+//! Proxy resources Linux votes around start — the AOSS `qcom,qmp`
+//! load-state message, the `cx`/`mx` power domains at their highest
+//! corner and the RPMh `xo` clock, released on `handover` — are the
+//! caller's: `wpss::WpssPower` composes them (`cmd_db`, `rpmh`, `aoss`)
+//! and `ath11k::ahb_live::LiveAhb` drives it around this start/stop
+//! from the DT nodes `platform::pas_power` resolves.
 
 use crate::io::Delay;
 use crate::mdt::{Mdt, SegmentSource};

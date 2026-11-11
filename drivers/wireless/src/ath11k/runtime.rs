@@ -978,6 +978,9 @@ pub struct VdevRuntime {
     /// Locally detected TKIP Michael failures awaiting the netdev's
     /// cfg80211 `MICHAEL_MIC_FAILURE` notification.
     pub mic_failures: VecDeque<MichaelMicFailure>,
+    /// Monitor frames of this vdev's pdev while it is the monitor vdev
+    /// (`ath11k_dp_rx_mon_deliver` → the monitor netdev).
+    pub monitor_rx: VecDeque<super::dp_mon::MonRxFrame>,
 }
 
 /// Counters.
@@ -1022,6 +1025,10 @@ pub struct RtStats {
     pub fw_crash_counter: u32,
     /// Recoveries that brought the device back.
     pub recoveries: u32,
+    /// Monitor frames of a pdev with no started monitor vdev, or beyond
+    /// the vdev's monitor queue.
+    pub mon_rx_unrouted: u32,
+    pub mon_rx_queue_full: u32,
 }
 
 /// `ath11k_core_reset`'s bookkeeping (`fail_cont_count`,
@@ -1064,6 +1071,9 @@ pub struct Rt<Io: RtIo, Irq: DpIrq, Q: RtQmi> {
     pub stats: RtStats,
     /// `mon_reap_timer` armed (next expiry).
     pub mon_reap_at: Option<u64>,
+    /// `(mac_id, vdev_id)` of each pdev whose monitor vdev is started
+    /// (`ar->monitor_vdev_id` with `ATH11K_FLAG_MONITOR_STARTED`).
+    pub monitor_vdevs: Vec<(u32, u32)>,
     /// `ath11k_wow_op_suspend` completed the MHI-M3 handoff.  While set,
     /// the runtime must not poll CE/DP rings or run their shadow timers:
     /// their MMIO writes are invalid until `ath11k_hif_resume` restores M0.
@@ -1185,6 +1195,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
             mgmt: MgmtTx::default(),
             stats: RtStats::default(),
             mon_reap_at: None,
+            monitor_vdevs: Vec::new(),
             wowlan_suspended: false,
             wowlan_mon_reap_active: false,
             qmi_service_at: 0,
@@ -1220,6 +1231,54 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
     /// ([`device_caps_for`]).
     pub fn device_caps_for(&self, pdev_id: u32) -> Result<DeviceCaps, TransportError> {
         device_caps_for(&self.core, pdev_id)
+    }
+
+    /// `ath11k_mac_allocate`'s radio list, shared by [`start_pci`] and
+    /// [`start_ahb`]: one `(mac_id, caps)` per allocated pdev, in
+    /// allocation order. A single-pdev core takes the legacy device-MAC
+    /// caps ([`Self::device_caps`]) and its failure is returned (the
+    /// caller strands the runtime). On a multi-pdev core a radio whose
+    /// caps fail is logged and skipped: its MAC address is unknowable
+    /// without the READY extra addresses, and the other radios still
+    /// come up. Returns `(single, radios)`.
+    ///
+    /// The DP `mac_id` is the pdev *index* (`ath11k_dp_pdev_alloc` /
+    /// `ath11k_mac_allocate` walk `ab->pdevs[i]` with `mac_id = i`), while
+    /// [`Self::device_caps_for`] selects by the firmware's `pdev_id`
+    /// (`ath11k_pull_mac_phy_cap_svc_ready_ext`: `pdev->pdev_id =
+    /// mac_phy_caps->pdev_id`, 1-based on multi-pdev firmware), so the
+    /// index is resolved through SERVICE_READY_EXT's pdev list first.
+    pub fn pdev_radios(&self) -> Result<(bool, Vec<(u32, DeviceCaps)>), TransportError> {
+        let pdevs = self.dp.pdev_mac_ids();
+        let single = pdevs.len() <= 1;
+        let mut radios = Vec::new();
+        for mac_id in pdevs {
+            if single {
+                radios.push((mac_id, self.device_caps()?));
+                continue;
+            }
+            let fw_pdev = self
+                .core
+                .svc_ext
+                .as_ref()
+                .and_then(|e| e.pdevs.get(mac_id as usize))
+                .map(|p| p.pdev_id);
+            let Some(fw_pdev) = fw_pdev else {
+                log(format_args!(
+                    "ath11k mac register: radio pdev {} skipped: no SERVICE_READY_EXT pdev",
+                    mac_id
+                ));
+                continue;
+            };
+            match self.device_caps_for(fw_pdev) {
+                Ok(c) => radios.push((mac_id, c)),
+                Err(e) => log(format_args!(
+                    "ath11k mac register: radio pdev {} skipped: step {} detail {:#x} (-{})",
+                    mac_id, e.step, e.detail, e.errno
+                )),
+            }
+        }
+        Ok((single, radios))
     }
 
     fn apply(&mut self, op: SyncOp) {
@@ -1638,6 +1697,29 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
         }
     }
 
+    /// Hand each monitor frame to its pdev's started monitor vdev
+    /// (`ath11k_dp_rx_deliver_msdu` of an `RX_FLAG_ONLY_MONITOR` skb).
+    fn route_monitor_rx(&mut self) {
+        for f in self.dp.take_mon_rx() {
+            let Some(vdev_id) = self
+                .monitor_vdevs
+                .iter()
+                .find(|(mac_id, _)| *mac_id == f.mac_id)
+                .map(|(_, v)| *v)
+            else {
+                self.stats.mon_rx_unrouted += 1;
+                continue;
+            };
+            match self.vdev_mut(vdev_id) {
+                Some(vdev) if vdev.monitor_rx.len() < super::dp_mon::MON_RX_QUEUE_MAX => {
+                    vdev.monitor_rx.push_back(f);
+                }
+                Some(_) => self.stats.mon_rx_queue_full += 1,
+                None => self.stats.mon_rx_unrouted += 1,
+            }
+        }
+    }
+
     fn handle_dp_output(&mut self, out: DpServiceOutput, now: u64) {
         for m in out.rx {
             self.rx_msdu(m);
@@ -1707,6 +1789,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Rt<Io, Irq, Q> {
                 }
             }
         }
+        self.route_monitor_rx();
         for failure in self.dp.take_mic_failures() {
             const MAX_PENDING_MIC_FAILURES: usize = 32;
             if let Some(vdev) = self.vdev_mut(failure.vdev_id as u32) {
@@ -2782,7 +2865,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
     /// A vdev is assigned before registration and changed only while down,
     /// so this lock is never held across WMI work or an await.
     pub fn assign_vdev_iftype(&self, vdev_id: u32, iftype: u32) -> bool {
-        if (vdev_id as usize) >= WCN6855_MAX_VDEVS || !matches!(iftype, 2 | 3 | 8 | 9 | 10) {
+        if (vdev_id as usize) >= WCN6855_MAX_VDEVS || !matches!(iftype, 2 | 3 | 6 | 8 | 9 | 10) {
             return false;
         }
         let mut roles = self.vdev_iftypes.lock();
@@ -2796,7 +2879,8 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
                 2 => station += 1,
                 3 | 8 | 9 => ap_client_go += 1,
                 10 => p2p_device += 1,
-                0 => {}
+                // A monitor is outside cfg80211's interface combinations.
+                0 | 6 => {}
                 _ => unreachable!("role was validated before publication"),
             }
         }
@@ -3702,6 +3786,16 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> Shared<Io, Irq, Q> {
         self.take_rx_for(0).await
     }
 
+    /// Monitor frames routed to `vdev_id` (its pdev's started monitor
+    /// vdev) since the last call; services the device first.
+    pub async fn take_monitor_rx_for(&self, vdev_id: u32) -> Vec<super::dp_mon::MonRxFrame> {
+        let mut g = self.lock().await;
+        g.service();
+        g.vdev_mut(vdev_id)
+            .map(|vdev| vdev.monitor_rx.drain(..).collect())
+            .unwrap_or_default()
+    }
+
     /// As [`Self::take_rx`], but only for a selected firmware vdev.
     pub async fn take_rx_for(&self, vdev_id: u32) -> Vec<(Vec<u8>, bool)> {
         let mut g = self.lock().await;
@@ -4031,7 +4125,7 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
         let msgs = {
             let rt = &mut *g;
             rt.dp
-                .mon_status_default_msgs(&rt.core.hif.ce.hal, enable)
+                .mon_status_default_msgs_for(&rt.core.hif.ce.hal, self.2, enable)
                 .map_err(|e| e.errno)?
         };
         // Linux keeps going and returns the last ring's result.
@@ -4046,6 +4140,33 @@ impl<Io: RtIo, Irq: DpIrq, Q: RtQmi> DataPort for Port<Io, Irq, Q> {
             g.mon_reap_at = Some(now + ATH11K_MON_TIMER_INTERVAL);
         }
         ret
+    }
+
+    async fn monitor_mode(&self, start: bool) -> Result<(), i32> {
+        // ath11k_mac_monitor_start / _stop: ATH11K_FLAG_MONITOR_STARTED,
+        // then ath11k_dp_tx_htt_monitor_mode_ring_config(ar, !start).
+        let mac_id = self.2;
+        let mut g = self.0.lock().await;
+        if !g.dp.monitor_capable() {
+            return Err(super::dp_ring::EOPNOTSUPP);
+        }
+        g.dp.set_monitor_started(mac_id, start);
+        g.monitor_vdevs.retain(|(m, _)| *m != mac_id);
+        if start {
+            g.monitor_vdevs.push((mac_id, self.1));
+        } else if let Some(vdev) = g.vdev_mut(self.1) {
+            vdev.monitor_rx.clear();
+        }
+        let msgs = {
+            let rt = &mut *g;
+            rt.dp
+                .monitor_mode_ring_config_msgs(&rt.core.hif.ce.hal, mac_id, !start)
+                .map_err(|e| e.errno)?
+        };
+        for m in &msgs {
+            g.core.htt_send(m).map_err(|e| e.errno)?;
+        }
+        Ok(())
     }
 
     fn vdev_tx_attach(&self, vdev_id: u32, addr: [u8; 6], ap: bool) {
@@ -4565,35 +4686,21 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     // One MAC + netdev per allocated pdev (`ath11k_mac_register` per
     // `ar`), in allocation order, each on its own global vdev slot.
     // The single-pdev path is exactly the old one: pdev 0, vdev slot 0,
-    // `wcn6855()` config, and a caps failure strands the runtime.
-    let pdevs = rt.dp.pdev_mac_ids();
-    let single = pdevs.len() <= 1;
-    let num_rxdma = rt.dp.cfg.num_rxdma_per_pdev;
-    let mut radios: Vec<(u32, DeviceCaps)> = Vec::new();
-    for mac_id in &pdevs {
-        let r = if single {
-            rt.device_caps()
-        } else {
-            rt.device_caps_for(*mac_id)
-        };
-        match r {
-            Ok(c) => radios.push((*mac_id, c)),
-            Err(e) => {
-                if single {
-                    e.report("ath11k mac register");
-                    *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
-                    return;
-                }
-                // A later radio's caps failure only skips that radio:
-                // its MAC address is unknowable without the READY extra
-                // addresses, and the other radios still come up.
-                log(format_args!(
-                    "ath11k mac register: radio pdev {} skipped: step {} detail {:#x} (-{})",
-                    mac_id, e.step, e.detail, e.errno
-                ));
-            }
+    // and a caps failure strands the runtime. Each MAC takes the chip's
+    // own `ath11k_hw_params` policy ([`super::mac::MacConfig::for_hw`]).
+    let hw_cfg = super::mac::MacConfig::for_hw(
+        rt.dp.cfg.hw.hw_rev,
+        rt.dp.cfg.num_rxdma_per_pdev,
+        rt.dp.cfg.single_pdev_only,
+    );
+    let (single, radios) = match rt.pdev_radios() {
+        Ok(r) => r,
+        Err(e) => {
+            e.report("ath11k mac register");
+            *STRANDED_RT.lock() = Some(Shared::new(rt, secure_random));
+            return;
         }
-    }
+    };
     if radios.is_empty() {
         // No radio registered (unreachable after a successful
         // `pdev_create`, which allocates at least pdev 0): park the
@@ -4605,11 +4712,7 @@ pub async fn start_pci(core: super::core::PciCore, dp: Dp) {
     let shared = Shared::new(rt, secure_random);
     for (slot, (mac_id, caps)) in radios.iter().enumerate() {
         let slot = slot as u32;
-        let cfg = if single {
-            super::mac::MacConfig::wcn6855()
-        } else {
-            super::mac::MacConfig::for_radio(num_rxdma).with_vdev(slot)
-        };
+        let cfg = hw_cfg.with_vdev(if single { 0 } else { slot });
         let mac = super::mac::Mac::new(
             Port(shared.clone(), slot, *mac_id),
             Port(shared.clone(), slot, *mac_id),
@@ -4638,47 +4741,77 @@ pub fn tx_ring_selector(rev: super::hw::HwRev, flow_hash: impl FnOnce() -> u32) 
     }
 }
 
-/// [`start_ahb`]'s result: the runtime and the MAC (or the
-/// `device_caps` failure).
-pub type AhbStart<Io, Irq, Q> = (Arc<Shared<Io, Irq, Q>>, Result<[u8; 6], TransportError>);
+/// [`start_ahb`]'s result: the runtime and the MAC of every registered
+/// radio, in pdev allocation order (or the single-pdev `device_caps`
+/// failure).
+pub type AhbStart<Io, Irq, Q> = (
+    Arc<Shared<Io, Irq, Q>>,
+    Result<Vec<[u8; 6]>, TransportError>,
+);
 
 /// The AHB counterpart of [`start_pci`], after
 /// `ath11k_core_qmi_firmware_ready`: the runtime over the ready core and
-/// its DP ([`Rt`] + [`Shared`]), the MAC `device_caps` reports, and the
-/// initial netdev registered by [`super::iface::register_ahb`]
-/// (`ath11k_mac_register`'s output). On a `device_caps` failure the
-/// runtime is still returned unregistered — the caller keeps it alive
-/// (see `AHB_RUNTIME`) because the firmware owns the core's memory
-/// until the device is torn down — mirroring `start_pci`'s
+/// its DP ([`Rt`] + [`Shared`]), then `ath11k_mac_register`'s output —
+/// one MAC + netdev per allocated pdev ([`Rt::pdev_radios`]), each
+/// registered by [`super::iface::register_ahb`] on its own vdev slot.
+/// IPQ8074 (three radios) and IPQ6018 / IPQ5018 (two) therefore get one
+/// `wlan%d` per radio; a single-pdev core (WCN6750) keeps one netdev on
+/// slot 0. Every MAC takes its chip's `ath11k_hw_params` policy from
+/// [`super::mac::MacConfig::for_hw`] (the IPQ parts run with idle PS,
+/// station PS, the vdev-start delay and current-CC support off).
+/// On a single-pdev `device_caps` failure, or when no radio registers,
+/// the runtime is still returned unregistered — the caller keeps it
+/// alive (see `AHB_RUNTIME`) because the firmware owns the core's
+/// memory until the device is torn down — mirroring `start_pci`'s
 /// `STRANDED_RT` handling.
 pub fn start_ahb<Io: RtIo + Sync, Irq: DpIrq, Q: RtQmi>(
     core: Ath11kCore<CeHif<Io, Irq>, Q>,
     dp: Dp,
 ) -> AhbStart<Io, Irq, Q> {
     let rt = Rt::new(core, dp);
-    let caps = match rt.device_caps() {
-        Ok(c) => c,
+    let hw_cfg = super::mac::MacConfig::for_hw(
+        rt.dp.cfg.hw.hw_rev,
+        rt.dp.cfg.num_rxdma_per_pdev,
+        rt.dp.cfg.single_pdev_only,
+    );
+    let (single, radios) = match rt.pdev_radios() {
+        Ok(r) => r,
         Err(e) => {
             e.report("ath11k mac register");
             return (Shared::new(rt, secure_random), Err(e));
         }
     };
+    if radios.is_empty() {
+        // No pdev allocated or every multi-pdev radio skipped
+        // (unreachable after a successful `pdev_create` that reported
+        // the READY extra addresses): keep the runtime unregistered.
+        return (
+            Shared::new(rt, secure_random),
+            Err(TransportError::new(step::MAC_CAPS, 8, ENODEV)),
+        );
+    }
     let initial_reg = rt.core.reg_info.clone();
     let shared = Shared::new(rt, secure_random);
-    let mac = super::mac::Mac::new(
-        Port(shared.clone(), 0, 0),
-        Port(shared.clone(), 0, 0),
-        caps.clone(),
-        super::mac::MacConfig::wcn6855(),
-        initial_reg.as_deref(),
-    );
-    let m = caps.mac_addr;
-    let name = super::iface::register_ahb(shared.clone(), mac, m);
-    log(format_args!(
-        "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
-        name, m[0], m[1], m[2], m[3], m[4], m[5]
-    ));
-    (shared, Ok(m))
+    let mut macs = Vec::with_capacity(radios.len());
+    for (slot, (mac_id, caps)) in radios.iter().enumerate() {
+        let slot = slot as u32;
+        let cfg = hw_cfg.with_vdev(if single { 0 } else { slot });
+        let mac = super::mac::Mac::new(
+            Port(shared.clone(), slot, *mac_id),
+            Port(shared.clone(), slot, *mac_id),
+            caps.clone(),
+            cfg,
+            initial_reg.as_deref(),
+        );
+        let m = caps.mac_addr;
+        let name = super::iface::register_ahb(shared.clone(), mac, m, slot);
+        log(format_args!(
+            "{}: registered, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (data path up; starts on IFF_UP)",
+            name, m[0], m[1], m[2], m[3], m[4], m[5]
+        ));
+        macs.push(m);
+    }
+    (shared, Ok(macs))
 }
 
 fn secure_random(out: &mut [u8]) -> Result<(), i32> {

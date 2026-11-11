@@ -524,14 +524,11 @@ impl Harness {
             *byte = (index % 251) as u8;
         }
         if ht {
-            static NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-            let name: &'static str = Box::leak(
-                alloc::format!(
-                    "narf-test/rtlwifi/ht20-fw-{}.bin",
-                    NEXT.fetch_add(1, Ordering::AcqRel)
-                )
-                .into_boxed_str(),
-            ); // The registered fixture retains this name for the kernel lifetime.
+            // rtl8188ee/sw.c fw_name: the production per-chip gate admits
+            // only this registry name. Re-installing the identical image
+            // replaces the registry entry; earlier fixtures' blob caps keep
+            // their own bindings.
+            let name = super::super::super::super::super::fw::FW_8188EE;
             let (write, read) = narf_firmware::bootstrap_authority();
             crate::firmware_asset::tests::install(&write, name, &image, true).unwrap();
             complete(firmware.initialize_registered_from(&read, name)).unwrap();
