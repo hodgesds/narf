@@ -54,6 +54,7 @@ impl<B: Backend> Session<B> {
                     &self.backend,
                     info,
                     config,
+                    crate::mt7921::wowlan_nlo::LIMITS,
                     self.station.permission,
                 )
                 .map(Arc::new)

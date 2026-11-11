@@ -226,3 +226,51 @@ kernel_test_in!(
     "drivers/wireless/mt7921/scan",
     mt76_sched_scan_probes_only_under_current_regulatory_grant
 );
+
+/// mt7921 `wiphy->max_match_sets` = MT76_CONNAC_MAX_SCAN_MATCH (16): the
+/// whole wire array, while WoWLAN net-detect keeps its 10.
+fn match_sets() -> Result<(), &'static str> {
+    let mut session = Session::new(Model::new(), firmware(32));
+    run(session.run()).map_err(|_| "firmware fixture")?;
+    run(session.initialize_radio()).map_err(|_| "radio fixture")?;
+    let mut full = config(false);
+    full.matches = (0..16u8)
+        .map(|index| NetDetectMatch {
+            ssid: vec![b'a' + index],
+            rssi_threshold_dbm: Some(-70),
+        })
+        .collect();
+    let mut over = full.clone();
+    over.matches.push(full.matches[0].clone());
+    let before = session.backend.frames.len();
+    if run(session.start_sched_scan(&over)) != Err(Error::Bounds)
+        || session.backend.frames.len() != before
+        || crate::mt7921::wowlan_nlo::validate(&full) != Err(Error::Bounds)
+    {
+        return Err("17 match sets, or 16 for WoWLAN, were accepted");
+    }
+    run(session.start_sched_scan(&full)).map_err(|_| "16 match sets")?;
+    let body = session
+        .backend
+        .frames
+        .iter()
+        .rev()
+        .find_map(|(_, frame)| ce(frame, 0x62))
+        .ok_or("NLO body")?;
+    let last = 368 + 40 * 15;
+    if body[4] != 16
+        || body[last..last + 4] != (-70i32).to_le_bytes()
+        || body[last + 4] != b'p'
+        || body[last + 36] != 1
+    {
+        return Err("the sixteenth match record");
+    }
+    Ok(())
+}
+fn mt76_sched_scan_takes_sixteen_match_sets() -> TestResult {
+    match_sets().map_or_else(TestResult::Fail, |()| TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/wireless/mt7921/scan",
+    mt76_sched_scan_takes_sixteen_match_sets
+);

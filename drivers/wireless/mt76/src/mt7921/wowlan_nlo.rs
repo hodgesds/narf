@@ -11,6 +11,7 @@ pub(super) const REQUEST: u8 = 0x62;
 pub(super) const ENABLE: u8 = 0x61;
 const REQUEST_LEN: usize = 1224;
 
+/// WoWLAN net-detect (mt7921 `max_nd_match_sets` = 10).
 pub(crate) const LIMITS: SchedScanSupport = SchedScanSupport {
     max_match_sets: 10,
     max_ssids: 10,
@@ -22,14 +23,33 @@ pub(crate) const LIMITS: SchedScanSupport = SchedScanSupport {
     random_mac: true,
 };
 
+/// `struct mt76_connac_sched_scan_req` holds MT76_CONNAC_MAX_SCAN_MATCH
+/// (16) match records (offsets 368..1008).
+const WIRE_MATCHES: usize = 16;
+
+/// Host scheduled scan: mt7921 `wiphy->max_match_sets` =
+/// MT76_CONNAC_MAX_SCAN_MATCH, the whole wire array.
+pub(crate) const SCHED_LIMITS: SchedScanSupport = SchedScanSupport {
+    max_match_sets: WIRE_MATCHES as u8,
+    ..LIMITS
+};
+
 #[path = "wowlan_nlo_tests.rs"]
 mod tests;
 
+/// The WoWLAN net-detect bounds.
 pub(super) fn validate(config: &NetDetectConfig) -> Result<(), Error> {
+    validate_with(config, LIMITS)
+}
+
+pub(super) fn validate_with(
+    config: &NetDetectConfig,
+    limits: SchedScanSupport,
+) -> Result<(), Error> {
     if config.probe_ssids.len() > 10
         || config.probe_ssids.iter().any(|ssid| ssid.len() > 32)
         || config.matches.is_empty()
-        || config.matches.len() > 10
+        || config.matches.len() > usize::from(limits.max_match_sets).min(WIRE_MATCHES)
         || config
             .matches
             .iter()
@@ -54,7 +74,8 @@ pub(super) fn request(
     channels: &[(channel::Band, u8)],
     random_address: Option<[u8; 6]>,
 ) -> Result<Vec<u8>, Error> {
-    validate(config)?;
+    // The caller's plan applied its own limits; this is the wire bound.
+    validate_with(config, SCHED_LIMITS)?;
     if sequence == 0
         || sequence > 127
         || channels.is_empty()

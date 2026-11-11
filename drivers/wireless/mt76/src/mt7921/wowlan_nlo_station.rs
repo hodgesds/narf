@@ -28,9 +28,10 @@ impl Plan {
         backend: &B,
         info: RadioInfo,
         config: &NetDetectConfig,
+        limits: narf_wireless::SchedScanSupport,
         operating: Option<crate::mt7921::association::TxPermission>,
     ) -> Result<Self, Error> {
-        wowlan_nlo::validate(config)?;
+        wowlan_nlo::validate_with(config, limits)?;
         let policy = (!config.probe_ssids.is_empty())
             .then(|| backend.regulatory_domain())
             .transpose()?;
