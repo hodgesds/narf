@@ -223,3 +223,69 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/gem-pressure",
     relocation_copies_outside_the_placement_lock
 );
+
+/// ttm_tt_populate allocates a buffer's pages under the buffer's own
+/// reservation, never under a device-wide lock. The card's placement gate
+/// is taken by every job, VA edit and KMS commit, so a user open's
+/// GEM_CREATE allocates and zeroes system pages before it waits for the
+/// gate, and holds the gate only to publish the buffer. A create that is
+/// cancelled while it waits returns its pages.
+fn system_pages_are_allocated_outside_placement_admission() -> TestResult {
+    use core::future::Future;
+    use core::task::{Context, Waker};
+    const CARD: u32 = 0xe1c4;
+    let Some(_heap) = Heap::new(CARD, 4) else {
+        return TestResult::Fail("heap");
+    };
+    let state = GemState::for_card(CARD);
+    let base = gtt_used();
+    let request = || {
+        let mut request = [0u8; 32];
+        request[..8].copy_from_slice(&(3 * PAGE_SIZE).to_le_bytes());
+        request[16..24].copy_from_slice(&u64::from(uapi::AMDGPU_GEM_DOMAIN_GTT).to_le_bytes());
+        request
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    let Some(gate) = try_placement(CARD) else {
+        return TestResult::Fail("placement admission");
+    };
+    let mut first = request();
+    let mut create = alloc::boxed::Box::pin(dispatch_async(
+        0xc020_6440,
+        first.as_mut_ptr() as usize,
+        &state,
+    ));
+    if !create.as_mut().poll(&mut cx).is_pending() {
+        return TestResult::Fail("a buffer was published without placement admission");
+    }
+    if gtt_used() != base + 3 * PAGE_SIZE {
+        return TestResult::Fail("system pages were allocated under the placement gate");
+    }
+    // A second create is cancelled while it waits: its pages go back.
+    let mut second = request();
+    let mut cancelled = alloc::boxed::Box::pin(dispatch_async(
+        0xc020_6440,
+        second.as_mut_ptr() as usize,
+        &state,
+    ));
+    if !cancelled.as_mut().poll(&mut cx).is_pending() || gtt_used() != base + 6 * PAGE_SIZE {
+        return TestResult::Fail("second create did not wait with its pages");
+    }
+    drop(cancelled);
+    if gtt_used() != base + 3 * PAGE_SIZE || second != request() {
+        return TestResult::Fail("a cancelled create kept its pages or wrote its reply");
+    }
+    drop(gate);
+    if narf_scheduler::block_on_spin(create) != Some(Ok(0)) {
+        return TestResult::Fail("create after admission");
+    }
+    let handle = u32::from_le_bytes(first[..4].try_into().unwrap());
+    if state.get(handle).is_none_or(|o| !o.system()) || gtt_used() != base + 3 * PAGE_SIZE {
+        return TestResult::Fail("published buffer or its accounting");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/gem-pressure",
+    system_pages_are_allocated_outside_placement_admission
+);
