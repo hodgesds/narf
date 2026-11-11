@@ -232,3 +232,21 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_overwrite_cost_tracks_range_not_extent_count
 );
+
+/// The node cache keeps a node that is still being used across any number
+/// of other fills, stays within its bound, and forgets what an invalidation
+/// or `forget_node` names from both of its generations.
+fn smoke_btrfs_node_cache_keeps_what_is_used() -> TestResult {
+    if crate::volume::__test_node_cache_keeps_what_is_used() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail(
+            "the node cache dropped a node in use, outgrew its bound or kept a stale node",
+        )
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_node_cache_keeps_what_is_used
+);
