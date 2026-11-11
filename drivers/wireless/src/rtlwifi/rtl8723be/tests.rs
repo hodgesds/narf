@@ -2036,7 +2036,9 @@ fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
     if owner.fill_tx_slot(&mut bslot, &beacon).is_err() || bslot.queue_sel() != trx::QSLT_BEACON {
         return TestResult::Fail("8723BE packet beacon queuesel");
     }
-    // RTS variant: rts_en bit 12, RTS rate in dw4, SC + short in dw5.
+    // RTS variant: rts_en bit 12 beside use_rate bit 8 in dw3 (the
+    // sequence is dw9, trx.h set_tx_desc_seq), RTS rate in dw4, SC +
+    // short in dw5.
     let rts_tx = TxFrame {
         rts: Some(Rts {
             rts_enable: true,
@@ -2049,8 +2051,8 @@ fn smoke_rtl8723be_packet_admission_and_desc() -> TestResult {
     };
     let mut rslot = trx::TxDesc::default();
     if owner.fill_tx_slot(&mut rslot, &rts_tx).is_err()
-        || rslot.dw[3] != 0x0012_4100
-        || rslot.dw[4] != 0x041f_f00c
+        || rslot.dw[3] != 0x0000_1100
+        || rslot.dw[4] != 0x0401_ff0c
         || rslot.dw[5] != 0x0000_5000
     {
         return TestResult::Fail("8723BE packet RTS descriptor bytes");
