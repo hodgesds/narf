@@ -1853,8 +1853,9 @@ whoever's job that is.
   `truncate_inode_pages_range`): cached pages past the new EOF are dropped,
   dirty or not, and the tail of the page the EOF falls in is zeroed;
   `PUNCH_HOLE`/`ZERO_RANGE` zero the range in the cache; `COLLAPSE_RANGE`/
-  `INSERT_RANGE` write the file's dirty pages out first and drop the unmapped
-  ones from the offset on. Bytes a mapping stored past EOF in the last page
+  `INSERT_RANGE` write the file's dirty pages out first, then take every
+  page from the offset on out of every mapping and drop it
+  (`unmap_mapping_range`, `truncate_pagecache_range`). Bytes a mapping stored past EOF in the last page
   never become file data: writeback writes that page only up to EOF and
   clears the tail (`folio_zero_segment`), and a `write(2)` starting past EOF,
   `ftruncate` up and `fallocate` first clear what a mapping stored between
@@ -1865,33 +1866,70 @@ whoever's job that is.
   filesystem reports are never written; an unmapped page that owes only such
   bytes for three passes running is dropped — not on first sight, because a
   reported size can lag a write that has just extended the file.
-- *`write(2)`.* Every successful `write`/`writev`/`pwrite64`/`pwritev*`/
-  `copy_file_range`/`sendfile`-style transfer — including the AIO `io_submit`
-  PWRITE/PWRITEV helpers — folds its bytes into each cached page it overlaps,
-  so a live mapping observes the write and it is the last writer of that
-  range. The bytes join the page's snapshot too (the page is not written back
-  for them, and a range a mapping had dirtied and the write then overwrote is
-  settled: file, page and snapshot agree) unless a batch held the page, or
-  wrote it, after the write began: then the order on the file is unknown, the
-  snapshot is left alone, and the page — now different from it — is written
-  again by the next pass.
+- *`write(2)`.* `write`/`writev`/`pwrite64`/`pwritev*` write and report to
+  the cache as one operation under the file's writeback lock, when the file
+  has a cache entry (Linux `inode_lock` across `generic_perform_write`): no
+  batch of the file runs between the filesystem write and the cache update,
+  so the bytes join each overlapped page and its snapshot together and file,
+  page and snapshot agree on the last writer. The wait for the lock is
+  killable like the write itself; a killed write finishes, lock and report
+  included, in the background. The out-of-lock transfers — `copy_file_range`
+  fallback, `sendfile`/`splice` sink, the AIO `io_submit` PWRITE/PWRITEV and
+  eventfd-resfd helpers — fold their bytes in afterwards with a stamp taken
+  before the write: the bytes join the snapshot unless a batch held or wrote
+  the page after the stamp, in which case the page is left dirty and is
+  written again; and while such a write is in flight, a batch that completes
+  does not settle a page it wrote (call it clean, list it for reuse, free it)
+  until no stamp older than that batch is still alive, so the write always
+  finds the page to report to. A stamp newer than a page's last batch does
+  not hold the page, so a writer that never pauses cannot keep it unsettled.
+- *Lock order.* The file's writeback lock (an async mutex) is outermost:
+  `write(2)`, a writeback batch, and the size changes take it before the
+  filesystem's own locks and before the cache lock; nothing that holds a
+  filesystem lock or the cache lock takes it. The cache lock is taken before
+  the in-flight-stamp lock. Memory's VMA and shared-mapping transactions may
+  be held when the cache lock is taken (the release hooks); nothing drops a
+  file reference under them — an entry that may hold a file's last
+  reference is parked and dropped at the next point that holds no lock
+  (`munmap`, teardown, the flusher, every sync).
 - *Coherence.* `read`/`pread64`/`readv`/`preadv*`, the AIO PREAD helper, a
   private file fault, an eager private mapping and the `execve` image reads
   take, for every cached page in range, the bytes that differ from its
   snapshot, so they see a `MAP_SHARED` store that has not been written back.
-  A second `MAP_SHARED` mapping gets the same page. `sendfile`/`splice` and
-  `copy_file_range` write the source's (and the latter also the
-  destination's) dirty pages out before they start.
+  Each samples a writeback epoch before its filesystem read; a page a batch
+  wrote after that epoch is copied whole, since the filesystem may have
+  returned the bytes from before that write and the page no longer differs
+  from its snapshot to say so. A second `MAP_SHARED` mapping gets the same
+  page. `sendfile`/`splice` and `copy_file_range` write the source's (and
+  the latter also the destination's) dirty pages out before they start.
+- *`mprotect`.* A `MAP_SHARED` file mapping whose descriptor was not open for
+  writing cannot be given `PROT_WRITE` (EACCES; Linux clears `VM_MAYWRITE`
+  on it), so no store can land in a page writeback never looks at.
 - *Bounded dirty memory.* Idle-dirty pages are counted. Above an eighth of
   memory a task creating a writable shared file mapping, or returning from
   `munmap`, waits killably for the flusher (`balance_dirty_pages`), for at
   most two seconds per call. Teardown and the flusher never enter that wait.
-- *Errors.* A failed background write is recorded on the file and reported
-  once, with its own errno, by the next `fsync`/`msync` of that file; a failed
-  write in `fsync`/`msync` itself is that call's result. After three failed
-  passes in a row a file's idle-dirty pages are dropped with a console line
-  naming its device, inode and the errno, so a filesystem that keeps refusing
-  cannot pin memory or the file for ever.
+  Exit, fork and `execve` create no dirty page, so they need no throttle.
+- *Errors.* No unwritten page is dropped on a timer. A transient error
+  (ENOSPC, EDQUOT, ENOMEM, EAGAIN) keeps the page dirty and the file is
+  retried after a back-off of 1, 2, 4 … up to 12 passes, logged once per run
+  of failures (Linux `redirty_page_for_writepage`). Any other error is hard:
+  the page is marked clean with the bytes that were attempted, as btrfs
+  `extent_writepage` leaves a folio after `-EIO` — its dirty bit already
+  cleared by `folio_clear_dirty_for_io`, writeback ended with the error set
+  on the mapping, the data still in the page cache. Either way the error is
+  recorded on the file and reported once, with its own errno, by the next
+  `fsync`/`msync`; a failed write in `fsync`/`msync` itself is that call's
+  result. No memory for a batch is ENOMEM from `fsync`/`msync`, never
+  success with pages unwritten; the pages stay dirty. `syncfs` returns a
+  mapped page's write failure on its filesystem (`sb->s_wb_err`).
+- *Unmount.* `umount` writes the dirty pages of that filesystem's files
+  (by device number; every file when the filesystem reports none), is
+  EBUSY while one of them is still mapped (a mapping holds the mount), and
+  after a successful non-lazy unmount drops every cached page and entry of
+  that filesystem, logging pages that could not be written — Linux evicts
+  the inodes after `sync_filesystem` whatever it returned. A lazy detach
+  leaves the filesystem alive for its users, with its cached pages.
 
 `LINUX-GAP`s of this design, with the intended fix:
 
@@ -1913,19 +1951,21 @@ whoever's job that is.
 - A background write error is reported to the first `fsync`/`msync` caller of
   the file, not once to every open file description (`errseq_t` keeps a
   cursor per `struct file`).
-- `write(2)` does not take the per-file lock. A batch that copied a page
-  before a `write(2)` to it can reach the file after that write; the file then
-  holds the older bytes until the next pass rewrites the page (reads stay
-  correct throughout, since they overlay the page). Linux has one copy of the
-  data and no such window.
-- For the same reason a `write(2)` is not ordered against `ftruncate` or a
-  hole punch of the same file as far as the cache is concerned (Linux holds
-  `i_rwsem` across both). Two threads racing a `write(2)` against a truncate
-  or a hole punch of the very pages one of them maps can leave such a page
-  holding the loser's bytes while it counts as clean. The fix is the write
-  path taking the per-file lock, as the size changes do.
-- An unmount writes every file's dirty pages, not only that mount's: entries
-  are grouped by device number, which names a filesystem and not a mount.
+- The out-of-lock write paths (AIO, `copy_file_range` fallback,
+  `sendfile`/`splice` sink) are not ordered against a batch, a truncate or a
+  hole punch of the same file. Their bytes are never lost (a racing batch's
+  older image is rewritten by the next pass), but the file may hold the
+  older bytes until then, and a race against a truncate or punch of pages
+  one of them maps can leave such a page holding the loser's bytes while it
+  counts as clean. The fix is taking the file lock there too, once those
+  paths stop holding other locks across their write.
+- The cache's index inserts (`BTreeMap`/`BTreeSet`, a file entry's `Arc`)
+  abort on allocation failure: the allocator offers no fallible insert.
+  Every other allocation on the writeback path is reserved fallibly before
+  a batch pins anything.
+- `syncfs`/`umount` find a filesystem's files by device number; a
+  filesystem that reports device 0 cannot be told apart, so `umount` of one
+  writes every file and drops none.
 
 Unlocked generic `MAP_SHARED` publication is lazy like Linux
 `generic_file_mmap`: it publishes empty Region and writeback prefixes rather

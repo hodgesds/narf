@@ -10455,28 +10455,15 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                     break;
                 }
             };
-            let stamp = crate::mapped_file::write_stamp();
             // `generic_perform_write`: killable, see `killable_wait::write`.
-            let outcome = match crate::killable_wait::write(&endpoint.ops, off, &mut payload) {
+            // `killable_wait::write` also tells the file's cached pages.
+            match crate::killable_wait::write(&endpoint.ops, off, &mut payload) {
                 Ok(outcome) => outcome.unwrap_or(Err(narf_filesystem::FsError::WouldBlock)),
                 Err(crate::killable_wait::Killed) => {
                     ctx.set_return(errno_ret(EINTR));
                     return;
                 }
-            };
-            // Keep any live generic-fallback MAP_SHARED page of this file
-            // coherent with the write (mapped_file::note_file_written).
-            if let Ok(n) = &outcome {
-                if *n != 0 && *n <= payload.len() {
-                    crate::mapped_file::note_file_written(
-                        &endpoint.ops,
-                        off,
-                        &payload[..*n],
-                        stamp,
-                    );
-                }
             }
-            outcome
         } else {
             let mut staging = alloc::vec![0u8; iovec.len];
             // `filemap_read`: killable, see `killable_wait::read`.

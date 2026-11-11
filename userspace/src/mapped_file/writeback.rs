@@ -87,6 +87,7 @@ use super::{
     SharedFilePages, SHARED_FILE_PAGES,
 };
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -155,6 +156,8 @@ const DIRTY_EXPIRE_MS: u64 = 30_000;
 /// dirty pages are dropped. A filesystem that keeps refusing — a volume
 /// that went read-only, a device that is gone — must not pin its pages and
 /// its file for ever.
+/// Passes running an unmapped page must be found owing only bytes past EOF
+/// before it is let go.
 const MAX_FAILED_PASSES: u32 = 3;
 
 /// `u64::MAX`: use [`DIRTY_EXPIRE_MS`]. Tests shorten it.
@@ -223,6 +226,8 @@ pub(super) struct CachedFile {
     /// caller to ask is the one that sees it).
     error: IrqSafeSpinLock<Option<FsError>>,
     failed_passes: AtomicU32,
+    /// Background passes still to skip after a transient failure.
+    skip_passes: AtomicU32,
 }
 
 impl CachedFile {
@@ -232,6 +237,7 @@ impl CachedFile {
             lock: narf_lib::mutex::Mutex::new(()),
             error: IrqSafeSpinLock::new(None),
             failed_passes: AtomicU32::new(0),
+            skip_passes: AtomicU32::new(0),
         })
     }
 
@@ -250,14 +256,78 @@ impl CachedFile {
 
 static WRITEBACK_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// "No writeback batch has completed since" — taken by a `write(2)` before
-/// it writes, and compared in [`super::note_file_written`] with the batch
-/// number each cached page was last written by.
+/// Stamps of the writes now in flight outside the file lock, by value.
+/// [`WRITEBACK_SEQ`] moves only with this lock held, so a stamp is either
+/// registered before a batch completes or sees that batch's number.
+/// Lock order: cache lock, then this one.
+static IN_FLIGHT: IrqSafeSpinLock<BTreeMap<u64, usize>> = IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Where writeback stood when a kernel read began: see [`overlay_dirty`].
 #[derive(Copy, Clone)]
-pub(crate) struct WriteStamp(pub(super) u64);
+pub(crate) struct ReadEpoch(u64);
+
+/// Sample before a filesystem read whose result goes through
+/// [`overlay_dirty`].
+pub(crate) fn read_epoch() -> ReadEpoch {
+    ReadEpoch(WRITEBACK_SEQ.load(Ordering::Acquire))
+}
+
+/// "No writeback batch has completed since" — taken by a write that runs
+/// outside the file's writeback lock (AIO, the `copy_file_range` fallback,
+/// a splice/sendfile sink) before it writes, and handed to
+/// [`super::note_file_written`] after. While it is alive, a batch that
+/// completes keeps the pages it wrote listed instead of settling them: the
+/// write may yet have to tell such a page that the batch put older bytes
+/// on the file after it ([`settle_allowed`]). A guard newer than a page's
+/// last batch does not hold that page, so a writer that never pauses
+/// cannot keep pages unsettled for ever.
+pub(crate) struct WriteStamp {
+    pub(super) seq: u64,
+    registered: bool,
+}
 
 pub(crate) fn write_stamp() -> WriteStamp {
-    WriteStamp(WRITEBACK_SEQ.load(Ordering::Acquire))
+    let mut in_flight = IN_FLIGHT.lock();
+    let seq = WRITEBACK_SEQ.load(Ordering::Acquire);
+    *in_flight.entry(seq).or_insert(0) += 1;
+    WriteStamp {
+        seq,
+        registered: true,
+    }
+}
+
+impl WriteStamp {
+    /// For a write made under the file's writeback lock: no batch of this
+    /// file can run between the write and its report, so the report always
+    /// settles the bytes and holds no other page back.
+    fn locked() -> Self {
+        Self {
+            seq: u64::MAX,
+            registered: false,
+        }
+    }
+}
+
+impl Drop for WriteStamp {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut in_flight = IN_FLIGHT.lock();
+        if let Some(count) = in_flight.get_mut(&self.seq) {
+            *count -= 1;
+            if *count == 0 {
+                in_flight.remove(&self.seq);
+            }
+        }
+    }
+}
+
+/// A page last written by batch `wb_seq` may be settled — called clean,
+/// listed for reuse or freed — only when no out-of-lock write that began
+/// before that batch completed is still in flight.
+fn settle_allowed(oldest_in_flight: Option<u64>, wb_seq: u64) -> bool {
+    oldest_in_flight.is_none_or(|oldest| oldest >= wb_seq)
 }
 
 /// Which pages a batch takes.
@@ -288,9 +358,23 @@ enum Action {
     /// size a filesystem reports can lag a write that has just extended the
     /// file, and one stale answer must not cost a page its data.
     PastEof,
-    /// The write failed, or there was no memory to do it. The page stays
-    /// dirty.
+    /// The write failed with an error worth retrying, or there was no
+    /// memory to do it. The page stays dirty.
     Failed,
+}
+
+/// Errors after which a page stays dirty and is retried (Linux
+/// `redirty_page_for_writepage` on `-ENOSPC`, `-EDQUOT`, `-ENOMEM`,
+/// `-EAGAIN`). Any other write error is hard: it is recorded for the next
+/// `fsync` and the page is marked clean with the bytes that were attempted,
+/// as btrfs `extent_writepage` leaves a folio after `-EIO` — writeback over,
+/// dirty bit already cleared by `folio_clear_dirty_for_io`, the error set on
+/// the mapping, the data still in the page cache.
+fn transient(error: FsError) -> bool {
+    matches!(
+        error,
+        FsError::NoSpace | FsError::QuotaExceeded | FsError::OutOfMemory | FsError::WouldBlock
+    )
 }
 
 struct Pinned {
@@ -330,16 +414,14 @@ fn pin(page: &mut SharedFilePage, batch: &mut Vec<Pinned>) {
 /// Step 2 of a batch. Returns the pinned pages, where to resume (`None`:
 /// the range is exhausted) and how many entries were stepped over.
 fn pin_batch(
+    mut batch: Vec<Pinned>,
     identity: SharedFileIdentity,
     from: u64,
     end: u64,
     select: Select,
     scan: usize,
 ) -> (Vec<Pinned>, Option<u64>, usize) {
-    let mut batch: Vec<Pinned> = Vec::new();
-    if batch.try_reserve_exact(BATCH_PAGES).is_err() {
-        return (batch, None, 0);
-    }
+    debug_assert!(batch.capacity() >= BATCH_PAGES && batch.is_empty());
     let mut next = None;
     let mut examined = 0usize;
     let mut pages = SHARED_FILE_PAGES.lock();
@@ -400,8 +482,18 @@ fn pin_batch(
 
 /// Step 3 of a batch: decide each pinned page's fate against the file size
 /// `size`, and copy the dirty ones into runs. Runs with no lock held.
-fn examine(batch: &mut [Pinned], size: u64, select: Select) -> Vec<Run> {
+///
+/// `out_of_memory` is set when a dirty page could not be copied: it stays
+/// dirty, and the caller must not report the range written.
+fn examine(batch: &mut [Pinned], size: u64, select: Select, out_of_memory: &mut bool) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
+    if runs.try_reserve(batch.len()).is_err() {
+        *out_of_memory = true;
+        for page in batch.iter_mut() {
+            page.action = Action::Failed;
+        }
+        return runs;
+    }
     for page in batch.iter_mut() {
         if page.offset >= size {
             page.action = Action::PastEof;
@@ -467,6 +559,7 @@ fn examine(batch: &mut [Pinned], size: u64, select: Select) -> Vec<Run> {
         let index = runs.len() - 1;
         let run = &mut runs[index];
         if run.buf.try_reserve(len).is_err() {
+            *out_of_memory = true;
             page.action = Action::Failed;
             if run.buf.is_empty() {
                 runs.pop();
@@ -504,11 +597,14 @@ fn settle_runs(batch: &mut [Pinned], runs: &[Run], results: &[Result<(), FsError
             continue;
         };
         page.action = match results[run] {
-            Ok(()) => {
+            Err(error) if transient(error) => Action::Failed,
+            // Written, or failed hard: either way what was attempted is the
+            // page's clean image from now on.
+            Ok(()) | Err(_) => {
                 let mut image = Vec::new();
                 if image.try_reserve_exact(4096).is_err() {
-                    // Written, but with no memory to record it the page
-                    // simply stays dirty and is written again.
+                    // With no memory to record it the page simply stays
+                    // dirty and is written again.
                     Action::Failed
                 } else {
                     image.extend_from_slice(&runs[run].buf[at..at + len]);
@@ -516,23 +612,32 @@ fn settle_runs(batch: &mut [Pinned], runs: &[Run], results: &[Result<(), FsError
                     Action::Written(Arc::new(image))
                 }
             }
-            Err(_) => Action::Failed,
         };
     }
 }
 
 /// Step 5 of a batch: record what was written and release the pins.
 /// Returns the number of pages written.
-fn finish_batch(batch: Vec<Pinned>, generation: Option<u64>) -> usize {
-    let mut free: Vec<PhysAddr> = Vec::with_capacity(batch.len());
-    // Old clean images, dropped after the cache lock.
-    let mut garbage: Vec<Arc<Vec<u8>>> = Vec::with_capacity(batch.len() * 2);
+///
+/// `free` and `garbage` were reserved before the batch pinned anything
+/// ([`Reserved`]), so nothing here allocates.
+fn finish_batch(
+    batch: Vec<Pinned>,
+    generation: Option<u64>,
+    mut free: Vec<PhysAddr>,
+    mut garbage: Vec<Arc<Vec<u8>>>,
+) -> usize {
     let mut wrote = 0usize;
     {
         let mut pages = SHARED_FILE_PAGES.lock();
-        // Under the cache lock: a `write(2)` that sampled the counter before
-        // this point sees these pages as written after it began.
-        let seq = WRITEBACK_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+        // Under the cache lock, and with the in-flight set's lock: a stamp
+        // registered before this point sees these pages as written after
+        // it began.
+        let (seq, oldest_in_flight) = {
+            let in_flight = IN_FLIGHT.lock();
+            let seq = WRITEBACK_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+            (seq, in_flight.keys().next().copied())
+        };
         for pinned in batch {
             let Pinned {
                 phys,
@@ -594,6 +699,11 @@ fn finish_batch(batch: Vec<Pinned>, generation: Option<u64>) -> usize {
                 }
                 Action::Queued { .. } | Action::Failed => {}
             }
+            // An out-of-lock write that began before this page's last batch
+            // may still have to report that the batch overwrote it on the
+            // file. Keep the page listed until it has.
+            settled &= settle_allowed(oldest_in_flight, page.wb_seq);
+            discard &= settle_allowed(oldest_in_flight, page.wb_seq);
             let retire =
                 discard || (settled && page.wb_pins == 0 && page.cache_generation.is_none());
             if settled {
@@ -626,12 +736,53 @@ fn finish_batch(batch: Vec<Pinned>, generation: Option<u64>) -> usize {
 /// for ever (it could then be neither retired nor trusted by `write(2)`).
 struct Batch {
     pages: Vec<Pinned>,
+    reserved: Reserved,
+}
+
+/// Kernel tests: make the next reservations fail, as an exhausted allocator
+/// would.
+#[cfg(feature = "kernel-test")]
+static FAIL_RESERVE: AtomicBool = AtomicBool::new(false);
+
+/// Everything step 5 needs, reserved — fallibly — before a batch pins a
+/// page: completing a batch must not fail, and failing to reserve must
+/// leave nothing pinned.
+#[derive(Default)]
+struct Reserved {
+    pages: Vec<Pinned>,
+    /// Frames to free: a doomed page's last hold, a retired page, a page
+    /// evicted to make room — at most three per page.
+    free: Vec<PhysAddr>,
+    /// Clean images dropped after the cache lock: the pinned one and the
+    /// replaced one — at most two per page.
+    garbage: Vec<Arc<Vec<u8>>>,
+    results: Vec<Result<(), FsError>>,
+}
+
+impl Reserved {
+    fn new() -> Result<Self, FsError> {
+        #[cfg(feature = "kernel-test")]
+        if FAIL_RESERVE.load(Ordering::Acquire) {
+            return Err(FsError::OutOfMemory);
+        }
+        let mut reserved = Self::default();
+        reserved
+            .pages
+            .try_reserve_exact(BATCH_PAGES)
+            .and_then(|()| reserved.free.try_reserve_exact(3 * BATCH_PAGES))
+            .and_then(|()| reserved.garbage.try_reserve_exact(2 * BATCH_PAGES))
+            .and_then(|()| reserved.results.try_reserve_exact(BATCH_PAGES))
+            .map_err(|_| FsError::OutOfMemory)?;
+        Ok(reserved)
+    }
 }
 
 impl Batch {
     /// Step 5: record what was written and unpin. Returns pages written.
     fn finish(mut self, generation: Option<u64>) -> usize {
-        finish_batch(core::mem::take(&mut self.pages), generation)
+        let pages = core::mem::take(&mut self.pages);
+        let reserved = core::mem::take(&mut self.reserved);
+        finish_batch(pages, generation, reserved.free, reserved.garbage)
     }
 }
 
@@ -640,7 +791,9 @@ impl Drop for Batch {
         if !self.pages.is_empty() {
             // Abandoned before its writes were accounted: nothing is marked
             // written, every queued page simply stays dirty.
-            finish_batch(core::mem::take(&mut self.pages), None);
+            let pages = core::mem::take(&mut self.pages);
+            let reserved = core::mem::take(&mut self.reserved);
+            finish_batch(pages, None, reserved.free, reserved.garbage);
         }
     }
 }
@@ -717,26 +870,31 @@ async fn write_range(
                 resume: Some(from),
             });
         }
+        // Never `Ok` with pages unwritten: no memory to do the batch is
+        // this call's error, and the pages stay dirty for a later pass.
+        let mut reserved = Reserved::new()?;
         let guard = if locked {
             None
         } else {
             Some(file.lock.lock().await)
         };
         let (pages, next, examined) = pin_batch(
+            core::mem::take(&mut reserved.pages),
             file.identity,
             from,
             end,
             select,
             (*budget).min(SCAN_PER_HOLD),
         );
-        let mut batch = Batch { pages };
+        let mut results = core::mem::take(&mut reserved.results);
+        let mut batch = Batch { pages, reserved };
         *budget = budget.saturating_sub(examined.max(1));
         // Sampled under the file lock: no truncate can move it before the
         // writes below, so a batch never writes past the size it saw.
         let size = ops.stat().size;
-        let runs = examine(&mut batch.pages, size, select);
-        let mut results: Vec<Result<(), FsError>> = Vec::with_capacity(runs.len());
-        let mut failure = None;
+        let mut out_of_memory = false;
+        let runs = examine(&mut batch.pages, size, select, &mut out_of_memory);
+        let mut failure = out_of_memory.then_some(FsError::OutOfMemory);
         for run in &runs {
             let result = write_all(ops, run.offset, &run.buf).await;
             if let Err(error) = result {
@@ -829,6 +987,62 @@ pub(super) fn note_writer(ops: &Arc<dyn FileOps>) {
     drop(previous);
 }
 
+/// The `write(2)` family's write of `bytes` to `ops` at `offset`, with the
+/// cache told of it — one operation, under the file's writeback lock when
+/// the file has a cache entry (Linux: `inode_lock` across
+/// `generic_perform_write`, and the folio lock writeback also takes).
+///
+/// No writeback batch of the file can run between the filesystem write and
+/// the cache update, so a batch can neither put older bytes on the file
+/// after this write nor be mistaken about which reached it last. A file
+/// with no entry — nearly every write — takes no lock: the filter turns it
+/// away. Owned, so a killed writer's operation finishes — lock, write,
+/// report — in the task it is handed to.
+///
+/// Lock order: the file's writeback lock is outermost. It is taken here
+/// before the filesystem's own locks and the cache lock; a writeback batch
+/// takes it before the cache lock and the filesystem's locks too. Callers
+/// hold none of those.
+pub(crate) async fn write_and_note(
+    ops: Arc<dyn FileOps>,
+    offset: u64,
+    bytes: Vec<u8>,
+) -> (Result<usize, FsError>, Vec<u8>) {
+    let entry = if FILE_ENTRIES.load(Ordering::Acquire) != 0
+        && may_have_entry(shared_file_identity(ops.as_ref()))
+    {
+        lookup(shared_file_identity(ops.as_ref())).map(|(file, _)| file)
+    } else {
+        None
+    };
+    let guard = match entry.as_ref() {
+        Some(file) => Some(file.lock.lock().await),
+        None => None,
+    };
+    // A write that starts past EOF extends the file over bytes a mapping
+    // may have stored past the old EOF: those must read as zeros
+    // (`pagecache_isize_extended`).
+    if !ops.is_stream() {
+        let size = ops.stat().size;
+        if offset > size {
+            discard_stores_past_eof(ops.as_ref(), size, offset);
+        }
+    }
+    let stamp = if guard.is_some() {
+        WriteStamp::locked()
+    } else {
+        write_stamp()
+    };
+    let result = ops.write(offset, &bytes).await;
+    if let Ok(written) = result {
+        if written != 0 && written <= bytes.len() {
+            super::note_file_written(&ops, offset, &bytes[..written], stamp);
+        }
+    }
+    drop(guard);
+    (result, bytes)
+}
+
 /// `mmap(MAP_SHARED)` of a file through a descriptor open for writing:
 /// from here on the file can be dirtied through a mapping. Record the open
 /// for any page the mapping already took, start the task that will write
@@ -885,8 +1099,11 @@ pub(super) fn sync_file(ops: &Arc<dyn FileOps>, from: u64, end: u64) -> Result<(
     ));
     let result = match outcome {
         Some(Ok(progress)) => {
+            // A write that reached the file ends any run of failures, and
+            // the back-off with it.
             if progress.wrote != 0 {
                 file.failed_passes.store(0, Ordering::Relaxed);
+                file.skip_passes.store(0, Ordering::Relaxed);
             }
             match file.take_error() {
                 Some(error) => Err(error),
@@ -986,7 +1203,14 @@ pub(crate) fn flush_file_for_read(ops: &Arc<dyn FileOps>) {
 ///
 /// Only the differing bytes are taken, so a page that is clean — or stale
 /// in ways the filesystem already knows better — changes nothing.
-pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8]) {
+///
+/// `epoch` is [`read_epoch`] sampled before the filesystem read. A batch
+/// that completed after it may have written a page and made it clean
+/// between the read and this call: the filesystem may have returned the
+/// bytes from before that write, and the page no longer differs from its
+/// clean image to say so. For such a page the whole range is taken from
+/// the page, which is what the batch put on the file.
+pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8], epoch: ReadEpoch) {
     if buf.is_empty() || FILE_ENTRIES.load(Ordering::Acquire) == 0 {
         return;
     }
@@ -1017,9 +1241,11 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8])
             let Some(page) = pages.by_phys.get(phys) else {
                 continue;
             };
+            let written_since = page.wb_seq > epoch.0;
             // Recorded state first: a page no writable mapping has held,
-            // and that is not waiting for writeback, equals the file.
-            if !page.maybe_dirty && !page.idle_dirty {
+            // that is not waiting for writeback, and that no batch wrote
+            // during the read, equals what the read returned.
+            if !page.maybe_dirty && !page.idle_dirty && !written_since {
                 continue;
             }
             visited += 1;
@@ -1034,10 +1260,14 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8])
                 core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>().add(in_page), count)
             };
             let clean = &page.clean[in_page..in_page + count];
+            let out = &mut buf[(low - offset) as usize..(low - offset) as usize + count];
+            if written_since {
+                out.copy_from_slice(live);
+                continue;
+            }
             if live == clean {
                 continue;
             }
-            let out = &mut buf[(low - offset) as usize..(low - offset) as usize + count];
             for ((out, live), clean) in out.iter_mut().zip(live).zip(clean) {
                 if live != clean {
                     *out = *live;
@@ -1257,6 +1487,7 @@ fn release_if_unused(identity: SharedFileIdentity) {
     };
     // Outside the cache lock: this may close the file.
     drop(unused);
+    super::release_deferred_slots();
 }
 
 pub(super) fn slot_is_unused(slot: &FileSlot) -> bool {
@@ -1346,7 +1577,15 @@ pub(crate) fn fallocate_serialized<R>(
             zero_cached_range(file.identity, offset, len);
         }
         if shifts {
-            let mut cursor = offset & !4095;
+            // Linux `unmap_mapping_range` then `truncate_pagecache_range`
+            // from the offset: every page from there on now holds other
+            // file content. Take them out of every mapping first, so none
+            // is still mapped — and zeroed in place — when it is dropped.
+            let first = offset & !4095;
+            if super::truncate_file_mappings(ops.as_ref(), first).is_err() {
+                file.record_error(FsError::OutOfMemory);
+            }
+            let mut cursor = first;
             while let Some(next) = invalidate_step(file.identity, cursor, u64::MAX) {
                 cursor = next;
             }
@@ -1379,23 +1618,119 @@ fn files_on(device: Option<u64>) -> Vec<(Arc<CachedFile>, Arc<dyn FileOps>)> {
 ///
 /// `sync` has no per-file error channel: a failure is recorded on its file
 /// and the others are still written.
-pub(crate) fn sync_all_files(device: Option<u64>) {
+///
+/// Returns the first error: this call's own write failure, else one
+/// recorded earlier by background writeback on a file it covered (Linux
+/// `syncfs` reports `sb->s_wb_err`). The recorded error is not consumed —
+/// each file's next `fsync` still reports it.
+pub(crate) fn sync_all_files(device: Option<u64>) -> Result<(), FsError> {
+    super::release_deferred_slots();
     if FILE_ENTRIES.load(Ordering::Acquire) == 0 {
-        return;
+        return Ok(());
     }
+    let mut first = None;
     for (file, writer) in files_on(device) {
         let mut budget = usize::MAX;
-        if let Some(Err(error)) = drive(write_range(
+        match drive(write_range(
             &file,
             &writer,
             (0, u64::MAX),
             Plan::SYNC,
             &mut budget,
         )) {
-            file.record_error(error);
+            Some(Err(error)) => {
+                file.record_error(error);
+                first.get_or_insert(error);
+            }
+            None => {
+                first.get_or_insert(FsError::Io(narf_block::BlockError::IOError));
+            }
+            Some(Ok(_)) => {
+                if let Some(error) = *file.error.lock() {
+                    first.get_or_insert(error);
+                }
+            }
         }
     }
     collect_unused();
+    first.map_or(Ok(()), Err)
+}
+
+/// Whether a file of the filesystem `device` still has a page mapped. A
+/// mapping holds its file's mount on Linux (`vma->vm_file` pins the
+/// vfsmount), so a plain `umount` of it is `EBUSY`.
+pub(crate) fn device_mapped(device: u64) -> bool {
+    let pages = SHARED_FILE_PAGES.lock();
+    pages
+        .files
+        .iter()
+        .any(|(identity, slot)| identity.device == device && slot.held != 0)
+}
+
+/// The filesystem `device` has been unmounted, after [`sync_all_files`]
+/// wrote what it could: let go of everything the cache holds for it, so no
+/// entry keeps a file of the unmounted volume open and no later writeback
+/// reaches it. Pages that could not be written are lost, with the count
+/// logged — as Linux evicts the inodes of an unmounted filesystem after
+/// `sync_filesystem` whatever that returned.
+///
+/// Device 0 names no filesystem in particular (one that does not track
+/// devices); nothing is forgotten for it.
+pub(crate) fn forget_device(device: u64) {
+    if device == 0 {
+        return;
+    }
+    let first = SharedFileIdentity { device, anchor: 0 };
+    let mut lost = 0usize;
+    loop {
+        let mut free: Vec<PhysAddr> = Vec::new();
+        let more = {
+            let mut pages = SHARED_FILE_PAGES.lock();
+            let victims: Vec<(u64, bool)> = pages
+                .by_file
+                .range(key(first, 0)..)
+                .take_while(|(cached, _)| cached.file.device == device)
+                .filter_map(|(_, phys)| pages.by_phys.get(phys))
+                .filter(|page| page.mappings == 0 && page.pending == 0)
+                .take(BATCH_PAGES)
+                .map(|page| (page.phys.raw(), page.idle_dirty))
+                .collect();
+            for (phys, dirty) in &victims {
+                lost += usize::from(*dirty);
+                if let Some(frame) = pages.retire_phys(*phys) {
+                    free.push(frame);
+                }
+            }
+            victims.len() == BATCH_PAGES
+        };
+        for frame in free {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
+        }
+        if !more {
+            break;
+        }
+    }
+    let gone: Vec<FileSlot> = {
+        let mut pages = SHARED_FILE_PAGES.lock();
+        let identities: Vec<SharedFileIdentity> = pages
+            .files
+            .iter()
+            .filter(|(identity, slot)| identity.device == device && slot.held == 0)
+            .map(|(identity, _)| *identity)
+            .collect();
+        identities
+            .into_iter()
+            .filter_map(|identity| pages.remove_slot(identity))
+            .collect()
+    };
+    drop(gone);
+    if lost != 0 {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "writeback: dev {device:#x} unmounted with {lost} page(s) that could not be written"
+        );
+    }
 }
 
 /// Drop every entry nothing needs any more.
@@ -1418,6 +1753,7 @@ fn collect_unused() {
 
 /// Give up on `identity`'s unmapped dirty pages. Returns how many were
 /// dropped.
+#[cfg(feature = "kernel-test")]
 fn drop_idle_dirty(identity: SharedFileIdentity) -> usize {
     let mut dropped = 0usize;
     loop {
@@ -1456,11 +1792,12 @@ fn drop_idle_dirty(identity: SharedFileIdentity) -> usize {
 
 /// Account for one file's share of a background pass.
 ///
-/// Only a write that reached the file ends a run of failed passes. A pass
-/// visits a file twice — its unmapped pages, then its mapped ones — and the
-/// second visit usually has nothing to write: counting that as success
-/// would wipe out the failure the first visit had just recorded, and a file
-/// whose writes never succeed would never be given up on.
+/// No page is ever dropped for failing to be written. A hard error has
+/// already settled its pages (see [`transient`]); a transient one leaves
+/// them dirty, and the file is skipped for a growing number of passes —
+/// 1, 2, 4 … up to 12, a minute — so a full volume is not hammered every
+/// five seconds. Both are logged once per file per run of failures, and
+/// recorded for the next `fsync`.
 fn pass_outcome(
     file: &Arc<CachedFile>,
     ops: &Arc<dyn FileOps>,
@@ -1470,6 +1807,7 @@ fn pass_outcome(
         Ok(progress) => {
             if progress.wrote != 0 {
                 file.failed_passes.store(0, Ordering::Relaxed);
+                file.skip_passes.store(0, Ordering::Relaxed);
             }
             return;
         }
@@ -1478,24 +1816,34 @@ fn pass_outcome(
     file.record_error(error);
     WRITE_ERRORS.fetch_add(1, Ordering::Relaxed);
     let failed = file.failed_passes.fetch_add(1, Ordering::Relaxed) + 1;
-    if failed < MAX_FAILED_PASSES {
-        return;
+    if transient(error) {
+        let skip = 1u32.checked_shl(failed.min(4) - 1).unwrap_or(12).min(12);
+        file.skip_passes.store(skip, Ordering::Relaxed);
     }
-    file.failed_passes.store(0, Ordering::Relaxed);
-    let dropped = drop_idle_dirty(file.identity);
-    if dropped != 0 {
+    if failed == 1 {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "writeback: dev {:#x} ino {}: {} dirty page(s) of a file nothing maps were dropped \
-             after {} failed passes, errno {}",
+            "writeback: dev {:#x} ino {}: write failed, errno {}{}",
             file.identity.device,
             ops.ino(),
-            dropped,
-            MAX_FAILED_PASSES,
             crate::handlers::copy_fs_errno(error),
+            if transient(error) {
+                "; pages kept dirty, retrying"
+            } else {
+                "; reported to the next fsync, pages no longer dirty"
+            },
         );
     }
+}
+
+/// Whether the background pass should leave `file` alone this time.
+fn backing_off(file: &CachedFile) -> bool {
+    file.skip_passes
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |skip| {
+            skip.checked_sub(1)
+        })
+        .is_ok()
 }
 
 /// Where the sweep over mapped pages resumes.
@@ -1529,6 +1877,7 @@ static WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// One pass of the flusher (`wb_writeback`).
 async fn background_pass() {
     PASSES.fetch_add(1, Ordering::Relaxed);
+    super::release_deferred_slots();
 
     // Pages nobody maps: all of them. They cannot change any more, and they
     // are memory the cache cannot release until they are on the file.
@@ -1542,6 +1891,9 @@ async fn background_pass() {
             .collect()
     };
     for (file, ops) in idle {
+        if backing_off(&file) {
+            continue;
+        }
         let mut budget = usize::MAX;
         let outcome = write_range(
             &file,
@@ -1568,6 +1920,12 @@ async fn background_pass() {
             cursor = None;
             break;
         };
+        // Backing off after a transient failure (counted down by the idle
+        // half of the pass): step over the file this time.
+        if file.skip_passes.load(Ordering::Relaxed) != 0 {
+            cursor = Some(key(file.identity, u64::MAX));
+            continue;
+        }
         let outcome = write_range(
             &file,
             &ops,
@@ -1778,6 +2136,7 @@ static THROTTLE_WAITS: AtomicU64 = AtomicU64::new(0);
 /// Pages left behind by an unmap are the flusher's now: make sure it is
 /// running and knows. For `munmap`, which has a task to do this from.
 pub(crate) fn unmapped() {
+    super::release_deferred_slots();
     if IDLE_DIRTY_PAGES.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -1790,6 +2149,8 @@ pub(crate) fn unmapped() {
 /// wake it. Spawning is a run-queue insertion — no I/O, no filesystem lock,
 /// no wait.
 pub(super) fn torn_down() {
+    // After memory has let go of the space's frames, outside its locks.
+    super::release_deferred_slots();
     if IDLE_DIRTY_PAGES.load(Ordering::Relaxed) != 0 {
         start_flusher();
         kick();
