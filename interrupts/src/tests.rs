@@ -1642,6 +1642,68 @@ fn smoke_ipi_handler_noop_does_not_count() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/ipi", smoke_ipi_handler_noop_does_not_count);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_xapic_icr_send_is_masked_and_ordered() -> TestResult {
+    // The xAPIC ICR is two registers: the destination is latched by the
+    // ICR_HI write and the IPI leaves on the ICR_LO write. A handler that
+    // sends an IPI between the two (the scheduler tick does) redirects the
+    // interrupted sender's IPI. The send must therefore run wait-idle,
+    // destination, command in that order with interrupts masked from before
+    // the first step to after the last, and hand back the caller's interrupt
+    // state unchanged — from a context with interrupts on and from one that
+    // already had them off. The register writes are replaced by a recorder,
+    // so this runs whatever APIC mode the machine is in.
+    use crate::x86_64::apic::{icr_send_masked, IcrStep};
+    const HI: u32 = 0x0300_0000;
+    const LO: u32 = 0x0000_40fd;
+    let expected = [
+        IcrStep::WaitIdle,
+        IcrStep::WriteHigh(HI),
+        IcrStep::WriteLow(LO),
+    ];
+
+    let run = || {
+        let mut steps = [IcrStep::WaitIdle; 4];
+        let mut count = 0usize;
+        let mut saw_unmasked = false;
+        icr_send_masked(HI, LO, |step| {
+            saw_unmasked |= narf_arch::interrupts_enabled();
+            if count < steps.len() {
+                steps[count] = step;
+            }
+            count += 1;
+        });
+        (count == 3 && steps[..3] == expected, saw_unmasked)
+    };
+
+    let entered_enabled = narf_arch::interrupts_enabled();
+    let (ordered, saw_unmasked) = run();
+    if narf_arch::interrupts_enabled() != entered_enabled {
+        return TestResult::Fail("xAPIC ICR send changed the caller's interrupt state");
+    }
+    if !ordered {
+        return TestResult::Fail("xAPIC ICR send is not wait-idle, destination, command");
+    }
+    if saw_unmasked {
+        return TestResult::Fail("xAPIC ICR was programmed with interrupts enabled");
+    }
+    // The same from a caller that already has interrupts off, as an interrupt
+    // handler or a lock holder does: they must still be off afterwards.
+    let (nested_ordered, nested_unmasked, left_masked) = narf_lib::sync::without_interrupts(|| {
+        let (ordered, saw_unmasked) = run();
+        (ordered, saw_unmasked, !narf_arch::interrupts_enabled())
+    });
+    if !nested_ordered || nested_unmasked || !left_masked {
+        return TestResult::Fail("xAPIC ICR send from a masked caller re-enabled interrupts");
+    }
+    if narf_arch::interrupts_enabled() != entered_enabled {
+        return TestResult::Fail("xAPIC ICR send leaked a masked interrupt state");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_xapic_icr_send_is_masked_and_ordered);
+
 // ── deep interrupts/hpet ─────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]

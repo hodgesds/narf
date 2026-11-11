@@ -328,6 +328,18 @@ way before it offers a wake-capable sleep state.
   which task was interrupted. Drivers that rely on low-latency
   interrupt delivery use UIPI; NMI is reserved for the kernel's own
   rare-event needs (panic IPI, watchdog, profiling overflow).
+- **An xAPIC IPI is sent with interrupts masked.** Under x2APIC the ICR
+  is one MSR write. Under xAPIC it is two memory-mapped writes — ICR_HI
+  latches the destination, ICR_LO sends — and interrupt handlers send
+  IPIs themselves (the scheduler tick's reschedule and idle-balance
+  kicks, the stall watchdog's NMI probe). A handler that sends between a
+  task-level sender's two writes redirects that sender's IPI to its own
+  destination. Every xAPIC sender in `x86_64/apic.rs` therefore goes
+  through one routine that masks interrupts, waits for Delivery Status to
+  clear, writes ICR_HI then ICR_LO, and restores the caller's interrupt
+  state (Linux: `default_send_IPI_single` →
+  `__default_send_IPI_dest_field` under `local_irq_save`). NMIs are not
+  masked by this; NMI-context code must not send through the xAPIC ICR.
 
 ## 5. Architecture notes
 
