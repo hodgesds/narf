@@ -8191,6 +8191,7 @@ pub fn responsive_spin<F: FnMut() -> bool>(mut done: F, max_iters: u32) -> bool 
 /// without the own-stack model) — the caller should then plain-spin.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
+#[track_caller]
 pub fn cooperative_yield() -> bool {
     stackful::cooperative_yield()
 }

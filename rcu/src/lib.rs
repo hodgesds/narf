@@ -451,6 +451,15 @@ pub fn report_quiescent() {
     qsbr::report_quiescent();
 }
 
+/// QSBR read guards live on the current CPU; zero outside every read
+/// section. The scheduler checks it wherever a continuation is about to leave
+/// its CPU, because a guard that is unpinned on another CPU corrupts both
+/// CPUs' reader counts (spec §3.3, §3.7).
+#[inline]
+pub fn reader_nesting() -> usize {
+    qsbr::reader_nesting()
+}
+
 /// Hand grace-period-expired destructors to a worker instead of running them
 /// inline at the quiescent point that found them (see
 /// [`qsbr::set_reclaim_offload`]).

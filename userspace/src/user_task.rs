@@ -2321,6 +2321,9 @@ pub fn install_user_task_hooks() {
         crate::handlers::resume_current_kernel_span,
     );
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
+    // Lets the scheduler's park-with-CPU-local-state report name the system
+    // call the offending task is in.
+    narf_scheduler::stackful::set_park_syscall_hook(crate::handlers::park_syscall_frame);
     // Per-task-own-stack model: flips a trap/syscall from a user task onto that
     // task's OWN kernel stack with preemption via a clean kernel_switch
     // (try_preempt_user), retiring the longjmp-out-of-trap-handler path.
@@ -4042,6 +4045,7 @@ pub fn install_user_task_hooks() {
         crate::handlers::resume_current_kernel_span,
     );
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
+    narf_scheduler::stackful::set_park_syscall_hook(crate::handlers::park_syscall_frame);
     narf_scheduler::stackful::enable_user_own_stack();
 }
 

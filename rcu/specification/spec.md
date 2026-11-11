@@ -269,6 +269,22 @@ sleep-pump step during a driver busy-wait) is not a quiescent point:
 the interrupted frame may hold driver gates, locks or raw RCU
 pointers.
 
+A second, read-only hook exists for the scheduler:
+
+```rust
+pub fn reader_nesting() -> usize;   // live QSBR guards on this CPU
+```
+
+`pin()` and the guard's drop both act on the CPU they run on. `ReadGuard`
+is `!Send`, which keeps a guard from crossing an `.await` in an `async fn`,
+but a stackful continuation is suspended and resumed as a stack and is
+never subject to that check. If one leaves its CPU inside a read section
+and resumes elsewhere, the CPU it left stays pinned for ever and the CPU
+it reaches counts below zero. The scheduler therefore reads
+`reader_nesting()` where a stackful continuation gives up its CPU of its
+own accord, and reports a park or yield made with a non-zero count
+(`scheduler/` §4).
+
 **Reclamation worker.** Destructors are arbitrary `Drop` code — the
 last reference to an address space, a mapped device file or a GPU
 buffer — and may take driver gates or wait on hardware. Linux runs

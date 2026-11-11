@@ -973,6 +973,20 @@ pub fn cpu_demand(cpu: CpuId) -> CpuDemand;
 pub fn interrupt_account_enter(kind: InterruptKind) -> InterruptAccountGuard;
 pub fn preempt_disable() -> PreemptGuard;
 pub fn preempt_count() -> u32;
+
+// scheduler::stackful — a continuation gave up its CPU holding CPU-local
+// state (§4). Detection is always on; these only shape the report.
+pub struct ParkViolation {
+    pub task: u64,
+    pub cpu: u32,
+    pub rcu_readers: usize,
+    pub preempt_depth: u32,
+    pub site: &'static core::panic::Location<'static>,
+}
+pub type ParkSyscallHook = fn(task: u64, syscall: &mut [u64; 9]) -> bool;
+pub fn set_park_syscall_hook(hook: ParkSyscallHook);
+pub fn set_park_violation_hook(hook: fn(&ParkViolation));
+pub fn park_violation_count() -> u64;
 ```
 
 `CpuDemand` reads only one CPU-local queue and copied/atomic counters. It
@@ -1164,6 +1178,26 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
   hook relies on poll-boundary release; holding a non-sleepable guard
   across await is a UAF waiting to happen. Enforced by `!Send` + type
   discipline in `rcu/`; the scheduler treats the invariant as given.
+- **A stackful continuation gives up its CPU holding no CPU-local state.**
+  The type discipline above covers `async fn` state machines only: a
+  stackful continuation is switched as a stack, so a `ReadGuard` or a
+  `PreemptGuard` live in one of its frames crosses the switch unseen. Both are
+  counted on the CPU that took them and released on the CPU that drops them.
+  A sleeping task may be resumed by any allowed CPU (wake-time placement, a
+  ready-queue steal, an idle pull of a staged wake), so the scheduler checks
+  at the switch itself:
+  - Every voluntary switch-out (`yield_current_stackful`, `cooperative_yield`,
+    `sched_yield_current`, the syscall-exit reschedule) reads this CPU's QSBR
+    reader nesting (`rcu::reader_nesting()`) and preempt-disable depth: two
+    loads of the CPU's own counters. Either being non-zero is a
+    `ParkViolation`. It is counted, and reported once per requesting source
+    location with the task, CPU, both counts and — through
+    `set_park_syscall_hook`, which `userspace/` installs — the system call the
+    task is in. `set_park_violation_hook` replaces the built-in line. Under
+    the `kernel-test` feature it is a panic unless the test armed
+    `__test_expect_park_violation`. A switch-out made inside a nested executor
+    round is not judged: the enclosing frame's state is counted on the same
+    CPU and stays there with it.
 
 ## 5. Architecture notes
 

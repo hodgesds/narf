@@ -1027,3 +1027,80 @@ kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_stalled_idle_cpu_gives_up_its_only_wake
 );
+
+/// A stackful continuation that gives up its CPU inside a QSBR read section,
+/// or with preemption disabled, is caught at the switch. The same yield with
+/// neither held is not. Under `kernel-test` an unexpected violation panics;
+/// this test arms the expectation, so its two are counted instead.
+#[cfg(all(
+    feature = "kernel-test",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn smoke_scheduler_park_with_cpu_local_state_is_caught() -> TestResult {
+    use core::sync::atomic::AtomicU64;
+    static YIELDS: AtomicUsize = AtomicUsize::new(0);
+    static SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static DONE: AtomicBool = AtomicBool::new(false);
+
+    reset_probes();
+    YIELDS.store(0, Ordering::Release);
+    DONE.store(false, Ordering::Release);
+    let before = crate::stackful::park_violation_count();
+    crate::stackful::__test_expect_park_violation(true);
+    crate::spawn_stackful(async {
+        let yielded = |held: usize| {
+            if crate::stackful::cooperative_yield() {
+                YIELDS.fetch_add(1, Ordering::AcqRel);
+            }
+            SEEN[held].store(crate::stackful::park_violation_count(), Ordering::Release);
+        };
+        yielded(0);
+        {
+            let guard = narf_rcu::pin();
+            yielded(1);
+            drop(guard);
+        }
+        {
+            let pin = crate::preempt_disable();
+            yielded(2);
+            drop(pin);
+        }
+        DONE.store(true, Ordering::Release);
+    });
+    for _ in 0..64 {
+        crate::poll_one_round();
+        if DONE.load(Ordering::Acquire) {
+            break;
+        }
+    }
+    crate::stackful::__test_expect_park_violation(false);
+    let finished = DONE.load(Ordering::Acquire);
+    let yields = YIELDS.load(Ordering::Acquire);
+    let seen = [
+        SEEN[0].load(Ordering::Acquire).wrapping_sub(before),
+        SEEN[1].load(Ordering::Acquire).wrapping_sub(before),
+        SEEN[2].load(Ordering::Acquire).wrapping_sub(before),
+    ];
+    reset_probes();
+    if !finished || yields != 3 {
+        return TestResult::Fail("the stackful task did not yield three times and finish");
+    }
+    if seen[0] != 0 {
+        return TestResult::Fail("a yield holding no CPU-local state was reported");
+    }
+    if seen[1] != 1 {
+        return TestResult::Fail("a yield inside a QSBR read section was not caught");
+    }
+    if seen[2] != 2 {
+        return TestResult::Fail("a yield with preemption disabled was not caught");
+    }
+    TestResult::Pass
+}
+#[cfg(all(
+    feature = "kernel-test",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_park_with_cpu_local_state_is_caught
+);
