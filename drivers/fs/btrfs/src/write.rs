@@ -8089,13 +8089,16 @@ pub(crate) const DEALLOC_STEP_EXTENTS: usize = 16;
 /// Reclaim an orphan after the final node/mapping reference. Caller holds
 /// op_lock.
 ///
-/// The inode's extents go [`DEALLOC_STEP_EXTENTS`] at a time (Linux
-/// `btrfs_evict_inode`: `btrfs_truncate_inode_items` in a loop, a new
-/// transaction handle per step). Until the last step the inode and its
-/// ORPHAN_ITEM stay, with `nbytes` following the extents left, so a crash in
-/// between leaves an orphan that the next writable mount goes on reclaiming;
-/// the last step removes what remains of the extents, the inode, its xattrs
-/// and the ORPHAN_ITEM in one COW edit.
+/// The inode's items go [`DEALLOC_STEP_EXTENTS`] at a time from its highest
+/// key down (Linux `btrfs_evict_inode`: `btrfs_truncate_inode_items` with
+/// `new_size` 0 in a loop, a new transaction handle per step), so the extent
+/// items go from the end of the file first. Until the last step the inode
+/// and its ORPHAN_ITEM stay, with `nbytes` following the extents left (and
+/// saturating at zero, as `inode_sub_bytes` does), so a crash in between
+/// leaves an orphan that the next writable mount goes on reclaiming; the
+/// last step removes what remains, the inode item and the ORPHAN_ITEM in one
+/// COW edit. A directory orphan (an emptied directory removed while open)
+/// is reclaimed the same way.
 pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     ino: u64,
@@ -8106,8 +8109,8 @@ pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
         if btree::find_item(vol, root, &orphan).await?.is_none() {
             return Err(FsError::InvalidData);
         }
-        let inode = match vol.load_inode_in(root, ino).await {
-            Ok(inode) if inode.nlink == 0 => inode,
+        match vol.load_inode_in(root, ino).await {
+            Ok(inode) if inode.nlink == 0 => {}
             // An orphan item for an inode that still has links, or for one
             // that no longer exists, marks no inode to reclaim. Linux
             // `btrfs_orphan_cleanup` (`if (!inode || inode->vfs_inode.i_nlink)`)
@@ -8136,75 +8139,97 @@ pub(crate) async fn reclaim_orphan<B: BlockDevice + 'static>(
             }
             Err(error) => return Err(error),
         };
-        if inode.is_dir() {
-            return Err(FsError::InvalidData);
-        }
-        // The inode's own items, and the first extents: one step's worth.
-        let mut others: Vec<BtrfsKey> = Vec::new();
-        let mut extents: Vec<BtrfsKey> = Vec::new();
+        // One step: the inode's items from its highest key down, as
+        // `btrfs_truncate_inode_items(new_size = 0, min_type = 0)` walks
+        // them for `btrfs_evict_inode` — extent items from the end of the
+        // file first, then xattrs and whatever else the inode holds — at
+        // most a step's worth. The inode item and the ORPHAN_ITEM go with
+        // the last step. A file and an emptied directory (Linux leaves one
+        // behind `btrfs_rmdir` when a crash comes while it is still open)
+        // are reclaimed alike.
+        let mut items: Vec<BtrfsKey> = Vec::new();
         let mut dropped_data = Vec::new();
         let mut removed_nbytes = 0u64;
         let mut more = false;
-        let mut cursor = btree::Cursor::seek(vol, root, &BtrfsKey::new(ino, 0, 0)).await?;
-        while let Some((key, body)) = cursor.current()? {
-            if key.objectid != ino {
+        let mut ceiling = BtrfsKey::new(ino, u8::MAX, u64::MAX);
+        while let Some((key, body)) = btree::last_before(vol, root, &ceiling).await? {
+            if key.objectid != ino || key.item_type <= format::INODE_ITEM_KEY {
+                break;
+            }
+            if items.len() == DEALLOC_STEP_EXTENTS {
+                more = true;
                 break;
             }
             match key.item_type {
-                format::INODE_ITEM_KEY | format::XATTR_ITEM_KEY => others.push(key),
                 format::EXTENT_DATA_KEY => {
-                    if extents.len() == DEALLOC_STEP_EXTENTS {
-                        more = true;
-                        break;
-                    }
                     if body.len() < 21 {
                         return Err(FsError::InvalidData);
                     }
                     if body[20] == format::FILE_EXTENT_INLINE {
-                        removed_nbytes = removed_nbytes.saturating_add(le64(body, 8)?);
+                        removed_nbytes = removed_nbytes.saturating_add(le64(&body, 8)?);
                     } else {
-                        let bytenr = le64(body, 21)?;
+                        let bytenr = le64(&body, 21)?;
                         if bytenr != 0 {
                             dropped_data.push(DataRefId {
                                 bytenr,
-                                len: le64(body, 29)?,
+                                len: le64(&body, 29)?,
                                 ref_root: vol.fs_tree_id(),
                                 objectid: ino,
                                 offset: key
                                     .offset
-                                    .checked_sub(le64(body, 37)?)
+                                    .checked_sub(le64(&body, 37)?)
                                     .ok_or(FsError::InvalidData)?,
                             });
-                            removed_nbytes = removed_nbytes.saturating_add(le64(body, 45)?);
+                            removed_nbytes = removed_nbytes.saturating_add(le64(&body, 45)?);
                         }
                     }
-                    extents.push(key);
                 }
-                _ => return Err(FsError::Unsupported),
+                // A name of the inode, or an entry of a directory, contradicts
+                // `nlink == 0` and an empty directory: refuse rather than
+                // leave a name or a child pointing at nothing.
+                format::INODE_REF_KEY
+                | format::INODE_EXTREF_KEY
+                | format::DIR_ITEM_KEY
+                | format::DIR_INDEX_KEY => return Err(FsError::InvalidData),
+                _ => {}
             }
-            cursor.advance().await?;
+            items.push(key);
+            ceiling = key;
         }
-        let mut edits: Vec<Edit> = Vec::new();
+        let inode_key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
+        let mut edits: Vec<Edit> = items.into_iter().map(Edit::Delete).collect();
         if more {
             // Not the last step: the inode stays, counting what is left.
-            let inode_key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
             let mut item = btree::find_item(vol, root, &inode_key)
                 .await?
                 .ok_or(FsError::NotFound)?;
             let gen = batch_gen(vol).await?;
-            let nbytes = le64(&item, 24)?
-                .checked_sub(removed_nbytes)
-                .ok_or(FsError::InvalidData)?;
+            let nbytes = match le64(&item, 24)?.checked_sub(removed_nbytes) {
+                Some(nbytes) => nbytes,
+                // The count was already wrong; the inode is going. Linux
+                // `inode_sub_bytes` does not fail either.
+                None => {
+                    use core::fmt::Write as _;
+                    static WARNED: core::sync::atomic::AtomicBool =
+                        core::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "btrfs: evicting inode {ino}: its nbytes is below what its extents hold; counting from 0"
+                        );
+                    }
+                    0
+                }
+            };
             item[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
             item[24..32].copy_from_slice(&nbytes.to_le_bytes());
-            edits.extend(extents.into_iter().map(Edit::Delete));
             edits.push(Edit::Upsert(inode_key, item));
             commit_fs_edits_reclaiming(vol, &edits, dropped_data).await?;
             dealloc_step_done(vol).await?;
             continue;
         }
+        edits.push(Edit::Delete(inode_key));
         edits.push(Edit::Delete(orphan));
-        edits.extend(others.into_iter().chain(extents).map(Edit::Delete));
         commit_fs_edits_reclaiming(vol, &edits, dropped_data).await?;
         vol.bump_cache_generation(vol.fs_tree_id(), ino);
         return Ok(());
@@ -8519,12 +8544,51 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
         },
         Edit::Delete(BtrfsKey::new(parent_ino, format::DIR_INDEX_KEY, dir_index)),
         Edit::Delete(ref_key),
-        Edit::Delete(BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0)),
     ];
-    edits.extend(xattr_keys.into_iter().map(Edit::Delete));
+    if RMDIR_LEAVES_ORPHAN.load(core::sync::atomic::Ordering::Acquire) {
+        // What Linux `btrfs_rmdir` commits for a directory still open
+        // (`btrfs_orphan_add`, then `btrfs_unlink_inode`): the inode stays,
+        // unlinked, under an ORPHAN_ITEM, until its eviction.
+        let mut child = btree::find_item(
+            vol,
+            fs_root,
+            &BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
+        )
+        .await?
+        .ok_or(FsError::NotFound)?;
+        child[8..16].copy_from_slice(&gen.to_le_bytes()); // transid
+        child[16..24].copy_from_slice(&0u64.to_le_bytes()); // size
+        child[40..44].copy_from_slice(&0u32.to_le_bytes()); // nlink
+        edits.push(Edit::Upsert(
+            BtrfsKey::new(child_ino, format::INODE_ITEM_KEY, 0),
+            child,
+        ));
+        edits.push(Edit::Upsert(crate::orphans::key(child_ino), Vec::new()));
+    } else {
+        edits.push(Edit::Delete(BtrfsKey::new(
+            child_ino,
+            format::INODE_ITEM_KEY,
+            0,
+        )));
+        edits.extend(xattr_keys.into_iter().map(Edit::Delete));
+    }
 
     commit_fs_edits_reclaiming(vol, &edits, Vec::new()).await?;
     Ok(())
+}
+
+/// Whether [`rmdir_dir`] leaves the directory as Linux does while it is
+/// still open ([`set_rmdir_leaves_orphan`]).
+static RMDIR_LEAVES_ORPHAN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// For tests: make `rmdir` commit the state Linux `btrfs_rmdir` leaves on
+/// disk for a directory that is still open — the inode unlinked under an
+/// ORPHAN_ITEM — and stop there, so that a test can unmount and see the next
+/// mount evict it. Nothing evicts it in this mount. Never set on a
+/// production mount.
+pub fn set_rmdir_leaves_orphan(on: bool) {
+    RMDIR_LEAVES_ORPHAN.store(on, core::sync::atomic::Ordering::Release);
 }
 
 /// Rename entry `old_name` to `new_name` within directory `parent_ino` (default

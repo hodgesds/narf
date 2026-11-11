@@ -98,6 +98,7 @@ pub const LAST_FREE_OBJECTID: u64 = (-256i64) as u64;
 
 pub const INODE_ITEM_KEY: u8 = 1;
 pub const INODE_REF_KEY: u8 = 12;
+pub const INODE_EXTREF_KEY: u8 = 13;
 pub const XATTR_ITEM_KEY: u8 = 24;
 /// An inode's fs-verity descriptor and Merkle tree items (Linux
 /// `fs/btrfs/verity.c`). This driver does not implement fs-verity; it knows
