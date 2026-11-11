@@ -21,8 +21,8 @@
 //   soak-native dirtyexit <mib> <file> <exit|kill> <tree>
 //       One process maps <file> MAP_SHARED, dirties <mib> MiB of it and
 //       exits without msync (or is SIGKILLed). Reports how long the exit
-//       took to reap, for how long afterwards some CPU spent 90% or more of
-//       its time in the kernel (or took no timer tick at all), and the worst
+//       took to reap, for how long afterwards some CPU stayed 90% or more
+//       busy (or took no timer tick at all), and the worst
 //       stat() and fork+exec latency another thread saw meanwhile.
 //   soak-native forkparent <secs> <dirty-mib> <forks-per-sec> <file> <hbfile>
 //       One long-lived process keeps <dirty-mib> MiB of a MAP_SHARED mapping
@@ -633,7 +633,9 @@ static int read_cpu_times(uint64_t *sys, uint64_t *total) {
         if (sscanf(line, "cpu%u %llu %llu %llu %llu %llu %llu %llu %llu", &cpu, &v[0], &v[1],
                    &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) < 5)
             continue;
-        sys[n] = v[2] + v[5] + v[6];
+        // Busy time, whatever it is charged to: a kernel that runs work on
+        // behalf of no task does not reliably call it system time.
+        sys[n] = v[0] + v[1] + v[2] + v[5] + v[6] + v[7];
         total[n] = v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7];
         n++;
     }
@@ -744,7 +746,7 @@ static int dirtyexit(size_t mib, const char *file, int kill_it) {
     }
     lat.stop = 1;
     pthread_join(prober, NULL);
-    printf("dirtyexit: mib=%zu mode=%s dirty_ms=%llu reap_ms=%llu kernel_bound_ms=%llu "
+    printf("dirtyexit: mib=%zu mode=%s dirty_ms=%llu reap_ms=%llu cpu_bound_ms=%llu "
            "cpus_bound_max=%d%s stat_max_ms=%llu exec_max_ms=%llu (stat n=%llu exec n=%llu)\n",
            mib, kill_it ? "kill" : "exit", (unsigned long long)((t_dirty - t0) / 1000000),
            (unsigned long long)((t_reaped - t_end) / 1000000),
@@ -761,7 +763,7 @@ static int dirtyexit(size_t mib, const char *file, int kill_it) {
 
 static unsigned char *g_dirty_map;
 static size_t g_dirty_len;
-static volatile int g_dirty_stop;
+static volatile int g_dirty_stop, g_dirty_passes;
 
 static void *dirtier_thread(void *arg) {
     if (arg) {
@@ -773,6 +775,7 @@ static void *dirtier_thread(void *arg) {
     for (uint64_t pass = 1; !g_dirty_stop; pass++) {
         for (size_t off = 0; off < g_dirty_len && !g_dirty_stop; off += 4096)
             memcpy(g_dirty_map + off, &pass, sizeof pass);
+        g_dirty_passes = (int)pass;
         usleep(20000);
     }
     return NULL;
@@ -817,7 +820,9 @@ static int forkparent(uint64_t secs, size_t mib, double rate, const char *file, 
     if (clean)
         pthread_join(dirtier, NULL);
     else
-        usleep(300000);
+        // Every page is faulted in and dirty before the first fork.
+        while (g_dirty_passes == 0)
+            usleep(10000);
     uint64_t start = now_ns(), end = start + secs * 1000000000ull;
     uint64_t period = (uint64_t)(1e9 / rate), next_fork = start, next_hb = start;
     uint64_t forks = 0, skipped = 0;
@@ -913,10 +918,11 @@ static int forkparent(uint64_t secs, size_t mib, double rate, const char *file, 
            (unsigned long long)forks,
            (unsigned long long)skipped, max_live, live, MS(finished > end ? finished - end : 0),
            AVG(fork_s), MS(fork_s.max), AVG(exec_s), MS(exec_s.max), AVG(exit_s), MS(exit_s.max));
-    munmap(g_dirty_map, g_dirty_len);
-    close(fd);
+    // No munmap: the parent dies with its pages dirty, like the processes
+    // this stands in for. Its teardown is the last thing the round costs.
+    fflush(stdout);
     unlink(file);
-    return 0;
+    _exit(0);
 }
 
 // ── killstorm ───────────────────────────────────────────────────────

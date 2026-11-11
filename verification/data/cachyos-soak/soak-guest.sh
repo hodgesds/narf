@@ -12,25 +12,35 @@
 # go quiet with the thing it is watching.
 #   SOAK-PULSE   every second: uptime, load, free and available memory
 #   SOAK-CPU     every 2 s: per-CPU busy/system percent; `f` marks a CPU
-#                whose counters did not advance (no timer tick)
+#                whose counters did not advance (no timer tick), BUSY-STREAK
+#                lists CPUs that have been fully busy for 5 samples or more
 #   SOAK-PROBE   every 3 s: milliseconds for a loginctl call, a busctl call,
 #                a systemctl call, a cold file read, a write+fsync, an exec
 #                and a directory listing; STUCK(<s>) while one has not come
 #                back
 #   SOAK-SAMPLE  every 5 s: meminfo, pressure, task states, what tasks are
 #                waiting in, the busiest and largest tasks, worker progress
+#
+# Before the load, SOAK_DIRECTED=1 runs single operations one at a time on
+# the quiet system, each bracketed by SOAK-EPISODE lines, so the samples and
+# the kernel's lockup reports between two brackets belong to one operation:
+# exits and fork+execs of a process with dirty shared pages, long single
+# system calls that touch no mapping (large writes and reads, fsync, cp,
+# unlink), and the journal readers an ordinary boot runs.
 export LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
 D=/run/narf-soak
-# shellcheck disable=SC1091
-[ -r "$D/soak.env" ] && . "$D/soak.env"
+# shellcheck disable=SC1090
+[ -r "$D/soak-settings.env" ] && . "$D/soak-settings.env"
 : "${SOAK_SECS:=1200}" "${SOAK_HEAVY_SECS:=420}" "${SOAK_HTTP_PORT:=42080}"
 : "${SOAK_TLS_PORT:=42443}" "${SOAK_UDP_PORT:=42053}" "${SOAK_LISTEN_PORT:=5201}"
 : "${SOAK_VIRTIO_NET:=10.0.2}" "${SOAK_E1000_NET:=10.0.3}" "${SOAK_POWEROFF:=1}"
 : "${SOAK_DROP_SECS:=30}" "${SOAK_BIG_MB:=0}" "${SOAK_XFER_MB:=100}"
-: "${SOAK_EXITWB:=16:exit 64:exit 64:kill}"
+: "${SOAK_DIRECTED:=1}" "${SOAK_DIRTYEXIT:=0}"
+# <MiB>:<exit|kill> rounds of a process that dies with dirty shared pages.
+: "${SOAK_EXITWB:=8:exit 32:exit 32:kill}"
 # <window seconds>:<dirty MiB>:<forks per second> rounds of the forking parent.
 # A fourth field `clean` makes the mapping read-only-touched (nothing dirty).
-: "${SOAK_FORKFLUSH:=10:1:1 10:256:1:clean 10:16:1 6:128:1}"
+: "${SOAK_FORKFLUSH:=10:1:1 10:16:1 3:48:1}"
 W=/var/tmp/narf-soak
 TREE=/home/narf/src/narf
 HB=$D/hb
@@ -97,9 +107,12 @@ cpu_sampler() {
           local busy=$((100 - 100 * (idle + iowait - pidle[$name]) / d))
           local sys=$((100 * (system + irq + softirq - psys[$name]) / d))
           line+=" ${name#cpu}:$busy/$sys"
-          if ((sys >= 95)); then
+          # A captured CPU is busy in every sample from then on. What the
+          # time is charged to says little: kernel work done for no task
+          # is not reliably system time.
+          if ((busy >= 99)); then
             sysrun[$name]=$((${sysrun[$name]:-0} + 1))
-            ((sysrun[$name] >= 3)) && stuck+=" ${name#cpu}x${sysrun[$name]}"
+            ((sysrun[$name] >= 5)) && stuck+=" ${name#cpu}x${sysrun[$name]}"
           else
             sysrun[$name]=0
           fi
@@ -110,7 +123,7 @@ cpu_sampler() {
       psys[$name]=$((system + irq + softirq))
     done < /proc/stat
     stamp
-    [ -n "$line" ] && say "SOAK-CPU up=$UP busy/sys%$line${stuck:+ SYSTEM-BOUND$stuck}"
+    [ -n "$line" ] && say "SOAK-CPU up=$UP busy/sys%$line${stuck:+ BUSY-STREAK$stuck}"
     nap 2
   done
 }
@@ -485,6 +498,128 @@ w_idlers() {
   wait
 }
 
+# ── directed episodes ───────────────────────────────────────────────
+
+# Highest busy percentage of any CPU over the next second.
+busiest_cpu() {
+  local name user nice system idle iowait irq softirq steal _ total d
+  local -A t0 i0
+  while read -r name user nice system idle iowait irq softirq steal _; do
+    case $name in cpu[0-9]*) ;; *) continue ;; esac
+    t0[$name]=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    i0[$name]=$((idle + iowait))
+  done < /proc/stat
+  nap 1
+  BUSIEST=0
+  while read -r name user nice system idle iowait irq softirq steal _; do
+    case $name in cpu[0-9]*) ;; *) continue ;; esac
+    total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    d=$((total - t0[$name]))
+    ((d > 0)) || continue
+    d=$((100 - 100 * (idle + iowait - i0[$name]) / d))
+    ((d > BUSIEST)) && BUSIEST=$d
+  done < /proc/stat
+}
+
+# Run one command alone and bracket it on the console. A process that has
+# exited can leave work behind it (its address space is torn down later, on
+# whichever CPU drops it), so the episode lasts until no CPU has been busy
+# for three seconds, and says how long that took.
+episode() { # name command...
+  local name=$1 t0 t1 t2 rc line quiet=0
+  shift
+  stamp
+  say "SOAK-EPISODE begin $name up=$UP"
+  t0=${EPOCHREALTIME/./}
+  "$@" > "$D/out/episode-$name.log" 2>&1
+  rc=$?
+  t1=${EPOCHREALTIME/./}
+  stamp
+  say "SOAK-EPISODE returned $name up=$UP ms=$(((t1 - t0) / 1000)) rc=$rc"
+  while read -r line; do
+    say "SOAK-EPISODE out $name: ${line:0:330}"
+  done < <(tail -n 6 "$D/out/episode-$name.log")
+  while ((quiet < 3 && (${EPOCHREALTIME/./} - t1) / 1000000 < 300)); do
+    busiest_cpu
+    if ((BUSIEST >= 60)); then quiet=0; else quiet=$((quiet + 1)); fi
+  done
+  t2=${EPOCHREALTIME/./}
+  stamp
+  say "SOAK-EPISODE end $name up=$UP busy_after_return_ms=$(((t2 - t1) / 1000 - 3000))"
+}
+
+# Time a command five times in a row.
+five_times() {
+  local i t0
+  for i in 1 2 3 4 5; do
+    t0=${EPOCHREALTIME/./}
+    "$@" > /dev/null 2>&1
+    echo "run $i: $(((${EPOCHREALTIME/./} - t0) / 1000)) ms rc=$?"
+  done
+}
+
+journal_fill() { # MiB
+  local n=0 pad lines=$(($1 * 2048))
+  pad=$(printf 'x%.0s' {1..440})
+  while ((n < lines)); do
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+      n=$((n + 1))
+      printf 'soak journal fill %s %s\n' "$n" "$pad"
+    done | systemd-cat -t narf-soak-fill
+  done
+  journalctl --disk-usage --no-pager
+}
+
+directed() {
+  local spec window mib rate kind
+  mkdir -p "$W/ep"
+  # (b) a process dies with dirty shared pages.
+  for spec in $SOAK_EXITWB; do
+    episode "die-${spec##*:}-${spec%%:*}m" "$NATIVE" dirtyexit "${spec%%:*}" "$W/ep/dirty.bin" \
+      "${spec##*:}" "$TREE/userspace"
+  done
+  # (a) a long-lived parent keeps N MiB of a shared mapping dirty and forks
+  # a child that execs /usr/bin/true once per period.
+  for spec in $SOAK_FORKFLUSH; do
+    IFS=: read -r window mib rate kind <<< "$spec"
+    if [ "$kind" = clean ]; then
+      episode "forkexec-clean-${mib}m" env FORKPARENT_CLEAN=1 "$NATIVE" forkparent "$window" \
+        "$mib" "$rate" "$W/ep/forkparent.bin" "$HB/forkparent"
+    else
+      episode "forkexec-dirty-${mib}m" "$NATIVE" forkparent "$window" "$mib" "$rate" \
+        "$W/ep/forkparent.bin" "$HB/forkparent"
+    fi
+  done
+  rm -f "$HB/forkparent"
+  # (c) long system calls that touch no mapping.
+  episode write-256x1m $PY bigwrite "$W/ep/w1" 1 256 nofsync
+  episode write-4x64m $PY bigwrite "$W/ep/w2" 64 4 nofsync
+  episode write-1x256m $PY bigwrite "$W/ep/w3" 256 1 nofsync
+  episode write-128x1m-fsync $PY bigwrite "$W/ep/w4" 1 128 fsync
+  episode read-256x1m dd if="$W/ep/w1" of=/dev/null bs=1M
+  episode read-4x64m dd if="$W/ep/w2" of=/dev/null bs=64M
+  episode cp-256m cp --reflink=never "$W/ep/w1" "$W/ep/copy"
+  episode sha256-256m sha256sum "$W/ep/w3"
+  episode git-status git -C "$TREE" status --short
+  episode rg-tree rg -c unsafe "$TREE"
+  episode truncate-256m truncate -s 0 "$W/ep/w3"
+  episode unlink-256m rm -f "$W/ep/w1"
+  episode rm-rest rm -rf "$W/ep"
+  # (d) what an ordinary boot does: readers of journald's mapped journal.
+  episode journal-fill journal_fill 4
+  (while :; do
+    printf 'soak journal trickle %s\n' "$SECONDS" | systemd-cat -t narf-soak-fill
+    nap 0.5
+  done) &
+  local trickle=$!
+  survey_shared journal
+  episode journalctl-n1 five_times journalctl -n 1 --no-pager
+  episode systemctl-status five_times systemctl status sshd.service --no-pager
+  episode loginctl-sessions five_times loginctl list-sessions --no-pager
+  episode journalctl-unit five_times journalctl -b -u sshd.service --no-pager
+  kill "$trickle" 2> /dev/null
+}
+
 # ── run ─────────────────────────────────────────────────────────────
 
 net_up() {
@@ -557,18 +692,31 @@ settle_meminfo() { # label
 
 read -r _ MEM_KB _ < /proc/meminfo
 MEM_MB=$((MEM_KB / 1024))
-((SOAK_BIG_MB > 0)) || SOAK_BIG_MB=$((MEM_MB <= 6144 ? MEM_MB * 3 / 2 : 4096))
+# Buffered writes run at some tens of MiB/s here, and nothing read stays
+# cached, so a larger file buys a longer setup and no colder reads.
+((SOAK_BIG_MB > 0)) || SOAK_BIG_MB=1024
 read -r cmdline < /proc/cmdline
 stamp
 say "SOAK-START up=$UP nap_fifo=$NAP_FIFO mem_mb=$MEM_MB cpus=$(nproc) secs=$SOAK_SECS heavy=$SOAK_HEAVY_SECS big_mb=$SOAK_BIG_MB"
 say "SOAK-CMDLINE $cmdline"
 say "SOAK-UNAME $(uname -a)"
 
+# The samplers stay on the last CPU when the kernel honours affinity, so a
+# CPU captured elsewhere cannot silence them; everything else stays off it.
+LAST_CPU=$(($(nproc) - 1))
 KEEP=" $$ "
 pulse &
 KEEP+="$! "
+PINNED="$!"
 cpu_sampler &
 KEEP+="$! "
+PINNED+=" $!"
+if ((LAST_CPU > 0)) && taskset -cp "0-$((LAST_CPU - 1))" $$ > /dev/null 2>&1; then
+  for pid in $PINNED; do taskset -cp "$LAST_CPU" "$pid" > /dev/null 2>&1; done
+  say "SOAK-NOTE samplers on cpu $LAST_CPU, load on 0-$((LAST_CPU - 1)): $(taskset -cp $$ 2>&1)"
+else
+  say "SOAK-NOTE no CPU affinity: samplers share CPUs with the load"
+fi
 net_up
 settle_meminfo SOAK-BASELINE
 
@@ -597,39 +745,17 @@ say "SOAK-PHASE prep-done up=$UP $(df -P / | tail -n 1)"
 
 sampler &
 KEEP+="$! "
+taskset -cp "$LAST_CPU" $! > /dev/null 2>&1
 probes &
 KEEP+="$! "
+taskset -cp "$LAST_CPU" $! > /dev/null 2>&1
 
-# First, alone on a quiet system: how long does one exit with dirty shared
-# pages keep a CPU in the kernel, and what does a stat() or a fork+exec on
-# another CPU wait meanwhile?
 survey_shared boot
-stamp
-say "SOAK-PHASE exitwb up=$UP"
-for spec in $SOAK_EXITWB; do
-  line=$("$NATIVE" dirtyexit "${spec%%:*}" "$W/dirty.bin" "${spec##*:}" "$TREE/userspace" 2>&1)
+if [ "$SOAK_DIRECTED" = 1 ]; then
   stamp
-  say "SOAK-EXITWB up=$UP $line"
-done
-
-# Then the long-lived parent: it keeps N MiB of a shared mapping dirty and
-# forks a child that execs /usr/bin/true, once per period, not waiting for
-# the last one. On Linux every number below is a millisecond or less.
-stamp
-say "SOAK-PHASE forkflush up=$UP"
-for spec in $SOAK_FORKFLUSH; do
-  IFS=: read -r window mib rate kind <<< "$spec"
-  stamp
-  say "SOAK-FORKFLUSH up=$UP start window_s=$window ${kind:-dirty}_mib=$mib rate=$rate"
-  line=$(
-    [ "$kind" = clean ] && export FORKPARENT_CLEAN=1
-    "$NATIVE" forkparent "$window" "$mib" "$rate" "$W/forkparent.bin" "$HB/forkparent" 2>&1
-  )
-  stamp
-  say "SOAK-FORKFLUSH up=$UP $line"
-  nap 5
-done
-rm -f "$HB/forkparent"
+  say "SOAK-PHASE directed up=$UP"
+  directed
+fi
 
 END=$((SECONDS + SOAK_SECS))
 HEAVY_END=$((SECONDS + SOAK_HEAVY_SECS))
@@ -646,9 +772,11 @@ worker killstorm "$NATIVE" killstorm "$NATIVE_SECS" 10 "$W/big.bin" "$TREE" "$W/
 worker mmapfault "$NATIVE" mmapfault "$NATIVE_SECS" 4 "$W/big.bin" "$HB/mmapfault"
 worker readtree "$NATIVE" readtree "$NATIVE_SECS" 4 "$TREE" "$HB/readtree"
 worker lookups "$NATIVE" lookups "$NATIVE_SECS" 6 "$TREE" "$HB/lookups"
-worker dirtyexit1 w_dirtyexit 1 exit
-worker dirtyexit2 w_dirtyexit 2 kill
-worker dirtyexit3 w_dirtyexit 3 exit
+if [ "$SOAK_DIRTYEXIT" = 1 ]; then
+  worker dirtyexit1 w_dirtyexit 1 exit
+  worker dirtyexit2 w_dirtyexit 2 kill
+  worker dirtyexit3 w_dirtyexit 3 exit
+fi
 worker trees w_trees
 worker fsio1 $PY fsio "$HB/fsio1" "$W/fsio1" "$SOAK_SECS"
 worker fsio2 $PY fsio "$HB/fsio2" /home/narf/soak-fsio "$SOAK_SECS"

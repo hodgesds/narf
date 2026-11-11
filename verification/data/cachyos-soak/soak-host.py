@@ -35,8 +35,8 @@ BLOCK = os.urandom(1 << 20)
 KERNEL_LINES = re.compile(
     r"watchdog:|nvme:|btrfs:|oom:|Out of memory|KERNEL PANIC|CPU EXCEPTION|panicked at|"
     r"READ-ONLY|GateTimeout|SOAK-ERR|SOAK-PHASE|SOAK-START|SOAK-END|SOAK-NET|UNKILLABLE|"
-    r"STUCK|SYSTEM-BOUND|SOAK-BASELINE|SOAK-FINAL|SOAK-ERRCOUNT|SOAK-OUT|SOAK-EXITWB|"
-    r"SOAK-FORKFLUSH|SOAK-DIRTYEXIT"
+    r"STUCK|BUSY-STREAK|SOAK-BASELINE|SOAK-FINAL|SOAK-ERRCOUNT|SOAK-OUT|SOAK-EXITWB|"
+    r"SOAK-FORKFLUSH|SOAK-DIRTYEXIT|SOAK-EPISODE|SOAK-NOTE"
 )
 
 
@@ -225,7 +225,7 @@ class Serial:
             self.panicked = True
         if KERNEL_LINES.search(text) and "SOAK-PROBE" not in text and "SOAK-CPU" not in text:
             event("serial: " + text[:400])
-        elif "STUCK" in text or "SYSTEM-BOUND" in text:
+        elif "STUCK" in text or "BUSY-STREAK" in text:
             event("serial: " + text[:400])
 
 

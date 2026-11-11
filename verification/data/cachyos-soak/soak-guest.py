@@ -337,6 +337,30 @@ def cmd_fsio(hb, directory, secs):
             beat(hb, rounds)
 
 
+def cmd_bigwrite(path, chunk_mib, count, sync):
+    """Write <count> chunks of <chunk_mib> MiB, one write() each, and time
+    every call; then, on request, one fsync."""
+    chunk = BLOCK * chunk_mib
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    times = []
+    for _ in range(count):
+        t = time.monotonic()
+        done = 0
+        while done < len(chunk):
+            done += os.write(fd, chunk[done:])
+        times.append((time.monotonic() - t) * 1000)
+    total = sum(times) / 1000
+    line = (f"bigwrite: {count} x {chunk_mib} MiB write(): min {min(times):.0f} ms, "
+            f"avg {sum(times) / len(times):.0f} ms, max {max(times):.0f} ms, "
+            f"{count * chunk_mib / total:.1f} MiB/s")
+    if sync == "fsync":
+        t = time.monotonic()
+        os.fsync(fd)
+        line += f"; fsync {(time.monotonic() - t) * 1000:.0f} ms"
+    os.close(fd)
+    print(line)
+
+
 def cmd_crash(mib):
     """Die of SIGSEGV with <mib> MiB of touched heap, for a core dump."""
     heap = bytearray(mib << 20)
@@ -364,6 +388,8 @@ def main():
             cmd_pty(args[0], int(args[1]))
         elif cmd == "fsio":
             cmd_fsio(args[0], args[1], int(args[2]))
+        elif cmd == "bigwrite":
+            cmd_bigwrite(args[0], int(args[1]), int(args[2]), args[3])
         elif cmd == "crash":
             cmd_crash(int(args[0]))
         else:

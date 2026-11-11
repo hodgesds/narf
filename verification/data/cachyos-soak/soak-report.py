@@ -57,6 +57,135 @@ def pct(values, p):
     return values[min(len(values) - 1, int(len(values) * p))] if values else 0
 
 
+def lockup_reports(block, syms):
+    """Condense the lockup detector's lines of one stretch of the log.
+
+    Returns printable lines: each distinct soft/hard lockup (task, longest
+    duration, symbolized stack), and each stranded task with its longest wait
+    and how many other CPUs were idle in that report.
+    """
+    out = []
+    lockups = {}
+    stranded = {}
+    i = 0
+    while i < len(block):
+        line = block[i]
+        m = re.search(r"watchdog: (soft|hard) lockup - CPU#(\d+) .*?(\d+)s.*?\[([^\]]*)\]", line)
+        if m:
+            kind, cpu, secs, task = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+            stack = []
+            j = i + 1
+            while j < len(block) and re.search(r"watchdog:\s+CPU#", block[j]):
+                a = re.search(r"0x(ffff[0-9a-f]{12})", block[j])
+                if a and syms and "backtrace" not in block[j]:
+                    name = syms.name(int(a.group(1), 16))
+                    if name:
+                        name = name.rsplit("+", 1)[0]
+                        if not stack or stack[-1] != name:
+                            stack.append(name)
+                j += 1
+            # One entry per task. The stack scan keeps a fixed number of
+            # frames, so a deep filesystem path cuts off before its caller;
+            # keep the report whose stack reaches furthest out (the most
+            # frames outside the filesystem and the block layer).
+            def reach(frames):
+                return sum(1 for f in frames if "narf_userspace" in f or "narf_scheduler" in f
+                           or "syscall" in f or "narf_memory::address_space" in f)
+
+            best = lockups.setdefault((kind, task), [0, set(), stack, line])
+            best[0] = max(best[0], secs)
+            best[1].add(cpu)
+            if reach(stack) > reach(best[2]):
+                best[2], best[3] = stack, line
+            i = j
+            continue
+        m = re.search(r"watchdog:\s+starved \[([^\]]*)\] cpu=(\d+) wait=([0-9.]+)s held_in=(\S+)", line)
+        if m:
+            task, cpu, wait, where = m.group(1), m.group(2), float(m.group(3)), m.group(4)
+            # The per-CPU lines that follow this report say how many CPUs
+            # had nothing to do while the task waited.
+            idle = 0
+            for follow in block[i + 1:i + 40]:
+                if re.search(r"watchdog:\s+cpu=\d+ idle", follow):
+                    idle += 1
+                elif "runnable task(s)" in follow or "lockup -" in follow:
+                    break
+            best = stranded.setdefault((task, cpu, where), [0.0, 0])
+            if wait >= best[0]:
+                best[0], best[1] = wait, idle
+        i += 1
+    for (kind, task), (secs, cpus, stack, line) in lockups.items():
+        out.append(f"{kind} lockup, CPU {'/'.join(sorted(cpus))}, up to {secs} s without scheduling: [{task}]")
+        out.append("    " + line[line.index("watchdog:"):][:230])
+        for name in stack:
+            out.append("      " + name[:150])
+    for (task, cpu, where), (wait, idle) in sorted(stranded.items(), key=lambda kv: -kv[1][0]):
+        out.append(f"stranded on cpu {cpu} ({where}) for up to {wait:.1f} s while {idle} CPUs were idle: [{task}]")
+    return out
+
+
+def episodes(lines, syms):
+    """Per-episode table for the directed part of a run."""
+    found, cur = [], None
+    for line in lines:
+        m = re.search(r"SOAK-EPISODE (begin|returned|end|out) (\S+?):? (.*)", line)
+        if m:
+            what, name, rest = m.groups()
+            if what == "begin":
+                cur = {"name": name, "ms": None, "rc": "?", "after": None, "out": [],
+                       "probes": {}, "streak": {}, "best": (0, "-"), "log": []}
+                found.append(cur)
+            elif cur and what == "returned":
+                d = kv(rest)
+                cur["ms"], cur["rc"] = int(d.get("ms", 0)), d.get("rc", "?")
+            elif cur and what == "out":
+                cur["out"].append(rest)
+            elif cur and what == "end":
+                cur["after"] = int(kv(rest).get("busy_after_return_ms", 0))
+                cur = None
+            continue
+        if cur is None:
+            continue
+        if "SOAK-PROBE" in line:
+            for name, value in re.findall(r" (\w+)=(STUCK\(\d+s\)|\d+)", line.split("ms:", 1)[-1]):
+                ms = int(re.search(r"\d+", value).group()) * (1000 if "STUCK" in value else 1)
+                cur["probes"][name] = max(cur["probes"].get(name, 0), ms)
+        elif "SOAK-CPU" in line:
+            for cpu, cell in re.findall(r" (\d+):(f|\d+/\d+)", line):
+                full = cell != "f" and int(cell.split("/")[0]) >= 99
+                cur["streak"][cpu] = cur["streak"].get(cpu, 0) + 1 if full else 0
+                if cur["streak"][cpu] * 2 > cur["best"][0]:
+                    cur["best"] = (cur["streak"][cpu] * 2, cpu)
+        elif "watchdog:" in line:
+            cur["log"].append(line)
+    if not found:
+        return
+    print("\n-- directed episodes: one operation at a time on the idle system")
+    print("   (ms = the command; after = seconds some CPU stayed busy once it had returned;")
+    print("    100% = longest run of samples with one CPU fully busy; probe columns = worst ms)")
+    print(f"   {'episode':24s} {'ms':>7s} {'after':>6s} {'100%':>9s} "
+          f"{'logind':>7s} {'busctl':>7s} {'fsync':>7s} {'exec':>6s} {'read':>6s}  detector")
+    for e in found:
+        soft = sum("lockup -" in l for l in e["log"])
+        starved = len({re.search(r"starved \[([^\]]*)\]", l).group(1) for l in e["log"] if "starved [" in l})
+        streak = f"{e['best'][0]}s@{e['best'][1]}" if e["best"][0] else "-"
+        after = "?" if e["after"] is None else f"{max(e['after'], 0) / 1000:.0f}"
+        pr = e["probes"]
+        print(f"   {e['name']:24s} {e['ms'] if e['ms'] is not None else '?':>7} {after:>6s} {streak:>9s} "
+              f"{pr.get('loginctl', 0):7d} {pr.get('busctl', 0):7d} {pr.get('fsync', 0):7d} "
+              f"{pr.get('exec', 0):6d} {pr.get('coldread', 0):6d}  "
+              f"{f'{soft} lockup report(s), {starved} stranded task(s)' if soft or starved else '-'}")
+    for e in found:
+        for text in e["out"]:
+            print(f"   {e['name']}: {text[:260]}")
+    for e in found:
+        reports = lockup_reports(e["log"], syms)
+        if reports:
+            print(f"\n   detector during {e['name']}:")
+            for text in reports:
+                print("     " + text)
+
+
 def main():
     run = sys.argv[1]
     lines = load(run)
@@ -85,9 +214,11 @@ def main():
 
     print(f"== {run} (kernel slide {slide:#x})")
     for line in lines:
-        if re.search(r"SOAK-(START|CMDLINE|NET|PHASE|BASELINE|FINAL|END|ERRCOUNT|OUT|EXITWB|"
-                     r"FORKFLUSH|SHMAP|SAMPLER)", line):
+        if re.search(r"SOAK-(START|CMDLINE|NET|NOTE|PHASE|BASELINE|FINAL|END|ERRCOUNT|OUT|EXITWB|"
+                     r"FORKFLUSH|SHMAP|SAMPLER|DIRTYEXIT)\b", line):
             print("  " + line[line.index("SOAK-"):][:300])
+
+    episodes(lines, syms)
 
     pulses = []
     for line in lines:
@@ -102,8 +233,8 @@ def main():
         print(f"\n-- memory (guest uptime s, MiB) from {len(pulses)} pulses")
         print("     up    free   avail  load1")
         step = max(1, len(pulses) // 30)
-        for up, free, avail, load in pulses[::step] + [pulses[-1]]:
-            print(f"  {up:7.1f} {free >> 10:7d} {avail >> 10:7d}  {load}")
+        for up, free, avail, load1 in pulses[::step] + [pulses[-1]]:
+            print(f"  {up:7.1f} {free >> 10:7d} {avail >> 10:7d}  {load1}")
         low = min(pulses, key=lambda p: p[1])
         print(f"  lowest free {low[1] >> 10} MiB at {low[0]:.1f} s; last pulse at {pulses[-1][0]:.1f} s")
         gaps = [(b[0] - a[0], a[0]) for a, b in zip(pulses, pulses[1:]) if b[0] - a[0] > 5]
@@ -132,7 +263,7 @@ def main():
             else:
                 total += int(cell.split("/")[0])
         busy.append((up, total / 100))
-        if "SYSTEM-BOUND" in line:
+        if "BUSY-STREAK" in line:
             bound.append(line[line.index("SOAK-CPU"):][:200])
     if busy:
         print(f"\n-- busy CPUs (mean per tenth of the run, of {len(cells)})")
@@ -145,7 +276,7 @@ def main():
         for line in bound[:10]:
             print("  " + line)
         if len(bound) > 10:
-            print(f"  ... {len(bound)} SYSTEM-BOUND samples in total")
+            print(f"  ... {len(bound)} BUSY-STREAK samples in total")
 
     probes, stuck = {}, []
     for line in lines:
@@ -191,12 +322,17 @@ def main():
     for line in errs[:40]:
         print("  " + line[:300])
 
-    kernel = [line for line in lines if KERNEL.search(line) and "SOAK-" not in line]
-    print(f"\n-- kernel lines of interest: {len(kernel)}")
-    for line in kernel[:120]:
+    watchdog = [line for line in lines if "watchdog:" in line and "detector on" not in line]
+    print(f"\n-- lockup detector, whole run: {len(watchdog)} lines")
+    for text in lockup_reports(watchdog, syms):
+        print("  " + text)
+    kernel = [line for line in lines
+              if KERNEL.search(line) and "SOAK-" not in line and "watchdog:" not in line]
+    print(f"\n-- other kernel lines of interest: {len(kernel)}")
+    for line in kernel[:60]:
         print("  " + line[:400] + symbolize(line))
-    if len(kernel) > 120:
-        print(f"  ... {len(kernel) - 120} more")
+    if len(kernel) > 60:
+        print(f"  ... {len(kernel) - 60} more")
 
     for name in sorted(os.listdir(run)):
         if name.startswith("registers-") and syms:
