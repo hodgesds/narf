@@ -1,5 +1,4 @@
 use alloc::{vec, vec::Vec};
-use narf_crypto::bip_cmac::Igtk;
 use narf_wireless::association::channel::CHANNELS_5GHZ;
 use narf_wireless::eapol::{self, HmacPrimitive, KeyFrame, Ptk};
 use narf_wireless::sae::SaeSession;
@@ -208,7 +207,9 @@ impl FakeAp {
                 password: password.to_vec(),
                 addresses: (plan.bssid, plan.station),
             }),
+            ciphers: narf_wireless::rsn::Ciphers::LEGACY,
             igtk: [0x6b; 16],
+            igtk_tail: [0x6c; 16],
             igtk_id: 4,
             ipn: 1,
             km: None,
@@ -244,7 +245,9 @@ impl FakeAp {
                     caps,
                     rsnxe: None,
                     sae: None,
+                    ciphers: narf_wireless::rsn::Ciphers::LEGACY,
                     igtk: [0x6b; 16],
+                    igtk_tail: [0x6c; 16],
                     igtk_id: 4,
                     ipn: 1,
                     km: None,
@@ -325,6 +328,59 @@ impl FakeAp {
         Ok(())
     }
 
+    /// Offer `ciphers` (CCMP-128/256 or GCMP-128/256 data, any BIP suite)
+    /// instead of CCMP-128 with BIP-CMAC-128. The 4-way handshake then
+    /// derives a TK and delivers a GTK/IGTK of their lengths. A WPA2 AP
+    /// without PMF gets an RSN profile without MFPC.
+    pub fn with_ciphers(mut self, ciphers: narf_wireless::rsn::Ciphers) -> Result<Self, ApError> {
+        if self.phase != ApPhase::Authentication
+            || self.mld.is_some()
+            || self.pmk.is_none() && self.rsn.is_none()
+            || !ciphers.valid()
+        {
+            return Err(ApError::Configuration);
+        }
+        if self.rsn.is_none() {
+            self.rsn = Some(alloc::boxed::Box::new(RsnProfile {
+                akms: vec![narf_wireless::rsn::AKM_PSK],
+                caps: 0,
+                rsnxe: None,
+                sae: None,
+                ciphers,
+                igtk: [0x6b; 16],
+                igtk_tail: [0x6c; 16],
+                igtk_id: 4,
+                ipn: 1,
+                km: None,
+                pmf: false,
+                assoc_ies: Vec::new(),
+            }));
+        }
+        if let Some(profile) = self.rsn.as_mut() {
+            profile.ciphers = ciphers;
+        }
+        Ok(self)
+    }
+
+    /// The pairwise TK installed by the 4-way handshake, of any length.
+    pub fn pairwise_key(&self) -> Option<Vec<u8>> {
+        self.ptk.as_ref().map(|p| p.tk.to_vec())
+    }
+
+    /// The GTK message 3 delivered.
+    pub fn group_key(&self) -> Option<Vec<u8>> {
+        self.rsn.as_ref().map(|p| p.gtk())
+    }
+
+    /// The IGTK (of the management cipher's length) and key ID delivered in
+    /// message 3.
+    pub fn igtk_key(&self) -> Option<(Vec<u8>, u16)> {
+        self.rsn
+            .as_ref()
+            .filter(|p| p.pmf)
+            .map(|p| (p.igtk_key(), p.igtk_id))
+    }
+
     /// Select the IGTK, its key ID (4 or 5) and the IPN message 3 reports.
     pub fn with_igtk(mut self, igtk: [u8; 16], key_id: u16, ipn: u64) -> Result<Self, ApError> {
         if self.mld.is_some() && self.phase != ApPhase::Authentication {
@@ -373,11 +429,16 @@ impl FakeAp {
     pub fn bip_broadcast_deauth(&mut self, reason: u16) -> Result<Vec<u8>, ApError> {
         let header = self.header(0xc0, [255; 6]);
         let profile = self.rsn.as_mut().filter(|p| p.pmf).ok_or(ApError::Phase)?;
-        let mut igtk = Igtk::install(profile.igtk, profile.igtk_id).map_err(|_| ApError::Key)?;
-        igtk.tx_pn = profile.ipn;
+        let mut igtk = narf_wireless::mfp::BipKey::new(
+            profile.ciphers.group_mgmt,
+            &profile.igtk_key(),
+            profile.igtk_id,
+            0,
+        )
+        .map_err(|_| ApError::Key)?;
+        igtk.tx_ipn = profile.ipn;
         let mut body = reason.to_le_bytes().to_vec();
-        narf_wireless::mfp::protect_outbound(&mut igtk, &header, &mut body)
-            .map_err(|_| ApError::Key)?;
+        narf_wireless::mfp::bip_protect(&mut igtk, &header, &mut body).map_err(|_| ApError::Key)?;
         profile.ipn += 1;
         let mut frame = header;
         frame.extend_from_slice(&body);
@@ -840,7 +901,7 @@ impl FakeAp {
                     &self.plan.station,
                     &self.anonce,
                     &key.key_nonce,
-                    16,
+                    profile.ciphers.pairwise_key_len(),
                 );
                 check(&ptk.kck)?;
                 let mut m3 = KeyFrame::empty(16);
@@ -849,12 +910,13 @@ impl FakeAp {
                     | eapol::KI_INSTALL
                     | eapol::KI_SECURE
                     | eapol::KI_ENCRYPTED_KEY_DATA;
-                m3.key_length = 16;
+                m3.key_length = profile.ciphers.pairwise_key_len() as u16;
                 m3.replay_counter = 2;
                 m3.key_nonce = self.anonce;
                 let mut clear = profile.elements();
-                clear.extend_from_slice(&[221, 22, 0, 0x0f, 0xac, 1, 1, 0]);
-                clear.extend_from_slice(&[0x77; 16]);
+                let gtk = profile.gtk();
+                clear.extend_from_slice(&[221, (6 + gtk.len()) as u8, 0, 0x0f, 0xac, 1, 1, 0]);
+                clear.extend_from_slice(&gtk);
                 if profile.pmf {
                     clear.extend_from_slice(&profile.igtk_kde());
                 }
