@@ -2213,9 +2213,54 @@ fn free_chunks(chunks: &[(u64, u8)]) {
     }
 }
 
-/// `pages` of zeroed system memory as buddy blocks in buffer order: the
-/// binary decomposition of `pages`, each block split in two when the
-/// allocator has none that large, within the GTT limit.
+/// The buddy blocks `(address, order)` backing `pages` pages, in buffer
+/// order, as ttm_pool_alloc walks the orders: start at the largest order
+/// that fits what is left (`ttm_pool_alloc_find_order`), and once `alloc`
+/// has refused an order never ask for it again — the rest of the buffer
+/// comes from the orders below. A buffer therefore costs at most one
+/// refused attempt per order (each of which runs the page allocator's
+/// reclaim and compaction), however fragmented memory is. `free` returns a
+/// block when the walk fails part-way (no order-0 page left: ENOMEM).
+fn alloc_blocks(
+    pages: u64,
+    max_order: u8,
+    mut alloc: impl FnMut(u8) -> Option<u64>,
+    mut free: impl FnMut(u64, u8),
+) -> Result<Vec<(u64, u8)>, FsError> {
+    let mut chunks: Vec<(u64, u8)> = Vec::new();
+    let mut remaining = pages;
+    let mut order = max_order;
+    // Some(block): a block taken but not recorded when the walk failed.
+    let mut failed = None;
+    while remaining != 0 {
+        order = order.min(remaining.ilog2() as u8);
+        match alloc(order) {
+            Some(phys) => {
+                if chunks.try_reserve(1).is_err() {
+                    failed = Some(Some((phys, order)));
+                    break;
+                }
+                chunks.push((phys, order));
+                remaining -= 1 << order;
+            }
+            None if order > 0 => order -= 1,
+            None => {
+                failed = Some(None);
+                break;
+            }
+        }
+    }
+    if let Some(unrecorded) = failed {
+        for (phys, order) in chunks.into_iter().chain(unrecorded) {
+            free(phys, order);
+        }
+        return Err(FsError::NoSpace);
+    }
+    Ok(chunks)
+}
+
+/// `pages` of zeroed system memory as buddy blocks in buffer order
+/// ([`alloc_blocks`]), within the GTT limit.
 fn alloc_system(pages: u64) -> Result<Vec<(u64, u8)>, FsError> {
     let bytes = pages * PAGE_SIZE;
     let limit = gtt_limit();
@@ -2224,53 +2269,19 @@ fn alloc_system(pages: u64) -> Result<Vec<(u64, u8)>, FsError> {
             used.checked_add(bytes).filter(|&total| total <= limit)
         })
         .map_err(|_| FsError::NoSpace)?;
-    let mut chunks: Vec<(u64, u8)> = Vec::new();
-    // Orders still to allocate, largest first; a failed one is retried as
-    // two of the next order down.
-    let mut wanted: Vec<u8> = Vec::new();
-    for order in (0..=63u8).rev() {
-        let order_pages = 1u64.checked_shl(u32::from(order)).unwrap_or(0);
-        if pages & order_pages == 0 {
-            continue;
-        }
-        // Blocks above the allocator's largest are several of its largest.
-        let max = narf_memory::buddy::MAX_ORDER;
-        if order > max {
-            // The GTT limit, checked above, bounds the count.
-            wanted.extend(core::iter::repeat_n(max, 1usize << (order - max)));
-        } else {
-            wanted.push(order);
-        }
-    }
-    let result = (|| {
-        let mut at = 0;
-        while at < wanted.len() {
-            let order = wanted[at];
-            match narf_memory::frame::alloc_pages_on(0, order) {
-                Ok(frame) => {
-                    let phys = frame.start_address().raw();
-                    chunks.try_reserve(1).map_err(|_| {
-                        narf_memory::frame::free_pages(frame, order);
-                        FsError::NoSpace
-                    })?;
-                    chunks.push((phys, order));
-                    at += 1;
-                }
-                Err(_) if order > 0 => {
-                    wanted.try_reserve(1).map_err(|_| FsError::NoSpace)?;
-                    wanted[at] = order - 1;
-                    wanted.insert(at + 1, order - 1);
-                }
-                Err(_) => return Err(FsError::NoSpace),
-            }
-        }
-        Ok(())
-    })();
-    if let Err(e) = result {
-        free_chunks(&chunks);
+    let chunks = alloc_blocks(
+        pages,
+        narf_memory::buddy::MAX_ORDER,
+        |order| {
+            narf_memory::frame::alloc_pages_on(0, order)
+                .ok()
+                .map(|frame| frame.start_address().raw())
+        },
+        |phys, order| free_chunks(&[(phys, order)]),
+    )
+    .inspect_err(|_| {
         GTT_USED.fetch_sub(bytes, Ordering::Relaxed);
-        return Err(e);
-    }
+    })?;
     // Zero before userspace or the GPU can see it. This is not optional:
     // the pages come from the kernel's own allocator and may hold anything.
     for &(phys, order) in &chunks {
@@ -2772,3 +2783,7 @@ mod eviction_tests;
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_placement_liveness_tests.rs"]
 mod placement_liveness_tests;
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_gem_pressure_tests.rs"]
+mod pressure_tests;
