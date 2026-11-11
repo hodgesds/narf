@@ -144,7 +144,10 @@ The cache is bounded in bytes of heap — each entry's buffer capacity plus
 128 MiB (`cache_budget::DATA_CACHE`: 32 MiB at 4 GiB of RAM, 128 MiB from
 16 GiB up; 4 GiB is assumed where no frame allocator reports RAM, as in the
 host harness). An 8,192-entry ceiling also bounds the least-recently-used
-eviction scan.
+eviction scan. The cache registers the `btrfs-extent-data` shrinker
+(`narf_memory::reclaim::register_shrinker`) on its first fill; under memory
+pressure kswapd's `try_to_free` evicts least recently used entries up to its
+page share, as Linux page reclaim drops clean page-cache folios.
 
 Last-link unlink and file replacement remove the name and persist `nlink=0`
 with a Linux `ORPHAN_ITEM` in the owning fs tree. Existing handles and private
@@ -229,7 +232,10 @@ nodes, at 4 GiB of RAM; 256 MiB, 16,384 nodes, from 32 GiB up; kernel tests
 cap it at 4 MiB). It used to be a fixed 4,096 nodes, 64 MiB at 16 KiB,
 whatever the machine. It is kept in two generations: fills and hits go to
 the young one, and when the young one would outgrow half the budget the old
-one is dropped and the young one takes its place. A node in
+one is dropped and the young one takes its place. Every filesystem's node cache is registered
+with one `btrfs-nodes` shrinker at mount; under pressure it drops the old
+generation first and then young nodes, up to its page share, as Linux page
+reclaim releases the btree inode's extent buffers (`btree_release_folio`). A node in
 use survives any number of other fills
 (`smoke_btrfs_node_cache_keeps_what_is_used`). It used to be emptied
 outright when it filled, so one walk over more nodes than the bound left

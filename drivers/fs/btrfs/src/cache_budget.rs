@@ -71,3 +71,6 @@ pub(crate) fn total_ram_bytes() -> Option<u64> {
     let pages = narf_memory::frame::stats().total as u64;
     (pages != 0).then(|| pages.saturating_mul(narf_memory::frame::PAGE_SIZE))
 }
+
+/// Base page size the reclaim shrinkers count in.
+pub(crate) const PAGE: usize = narf_memory::frame::PAGE_SIZE as usize;
