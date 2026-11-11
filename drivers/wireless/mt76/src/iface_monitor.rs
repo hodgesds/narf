@@ -17,7 +17,9 @@ impl Mt76Iface {
         }
         let _control = self.control.try_lock().ok_or(WirelessError::Busy)?;
         let _reservation = self.ap_serial.try_reserve()?;
-        if self.sleeping.load(Ordering::Acquire) {
+        // The synchronous mode change cannot stop firmware's scheduled scan;
+        // userspace stops it first (STOP_SCHED_SCAN).
+        if self.sleeping.load(Ordering::Acquire) || self.sched_scan_running() {
             return Err(WirelessError::Busy);
         }
         // The group link shares the home station owner's channel context

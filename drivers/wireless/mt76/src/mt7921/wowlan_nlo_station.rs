@@ -126,6 +126,11 @@ impl Plan {
         Ok(plan)
     }
 
+    /// The request's channels in scan-id (RXD channel) form.
+    pub(in crate::mt7921::firmware_transport) fn scan_ids(&self) -> &[u8] {
+        &self.ids
+    }
+
     pub(in crate::mt7921::firmware_transport) fn current<B: Backend>(
         &self,
         backend: &B,

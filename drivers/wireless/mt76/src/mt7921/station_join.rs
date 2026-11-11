@@ -1926,7 +1926,7 @@ impl<B: Backend> Session<B> {
         extra_ies: &[u8],
         network: crate::mt7921::p2p_wire::Network,
     ) -> Result<u16, Error> {
-        if self.p2p_rf_busy() {
+        if self.p2p_rf_busy() || self.sched_scan_running() {
             return Err(Error::Busy);
         }
         let (info, setup) = match self.state {

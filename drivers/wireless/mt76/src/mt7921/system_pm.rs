@@ -78,7 +78,7 @@ impl<B: Backend> Session<B> {
         }
         // mac80211 leaves every station vif before a non-WoW suspend; the
         // group vif must already be stopped (no in-place group teardown).
-        if self.group_published() {
+        if self.group_published() || self.sched_scan_running() {
             return Err(Error::Busy);
         }
         let (info, vif) = match self.state {

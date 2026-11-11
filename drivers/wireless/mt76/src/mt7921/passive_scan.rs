@@ -13,6 +13,8 @@ pub(super) fn occupied_domain(
 }
 #[path = "wowlan_nlo_station.rs"]
 pub(super) mod nlo;
+#[path = "sched_scan.rs"]
+pub(super) mod sched;
 
 pub use narf_wireless::association::Bss as ScanBss;
 /// Linux MT76_CONNAC_SCAN_IE_LEN; the packed v1 request reserves600 bytes.
@@ -76,6 +78,23 @@ impl ScanReport {
             && self.beaconed.len() < 64
         {
             self.beaconed.push(key);
+        }
+    }
+
+    /// Add or refresh `bss`, received in `packet`; a hidden-SSID Beacon
+    /// does not replace a Probe Response's SSID. At most 64 results.
+    pub(super) fn record(&mut self, packet: &[u8], bss: ScanBss) {
+        self.note_beacon(packet, &bss);
+        if let Some(old) = self.bss.iter_mut().find(|old| {
+            old.bssid == bss.bssid && old.channel == bss.channel && old.band == bss.band
+        }) {
+            if !bss.ssid.is_empty() || old.ssid.is_empty() {
+                *old = bss;
+            }
+        } else if self.bss.len() < 64 {
+            self.bss.push(bss);
+        } else {
+            self.truncated = true;
         }
     }
 }
@@ -626,7 +645,7 @@ impl<B: Backend> Session<B> {
         mut policy: impl FnMut() -> Result<narf_wireless::reg::RegulatoryDomain, Error>,
     ) -> Result<ScanReport, Error> {
         validate_scan_options(options)?;
-        if self.p2p_rf_busy() {
+        if self.p2p_rf_busy() || self.sched_scan_running() {
             return Err(Error::Busy);
         }
         let sequence = self.scan_seq % 127 + 1;
@@ -861,20 +880,7 @@ impl<B: Backend> Session<B> {
                         if scan_id(&bss).is_none_or(|id| !channels.contains(&id)) {
                             continue;
                         }
-                        report.note_beacon(&packet, &bss);
-                        if let Some(old) = report.bss.iter_mut().find(|old| {
-                            old.bssid == bss.bssid
-                                && old.channel == bss.channel
-                                && old.band == bss.band
-                        }) {
-                            if !bss.ssid.is_empty() || old.ssid.is_empty() {
-                                *old = bss;
-                            }
-                        } else if report.bss.len() < 64 {
-                            report.bss.push(bss);
-                        } else {
-                            report.truncated = true;
-                        }
+                        report.record(&packet, bss);
                     }
                     if let Some(event) = backend.receive()? {
                         if event.len() < 36 {

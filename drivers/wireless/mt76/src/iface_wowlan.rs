@@ -98,6 +98,9 @@ impl Mt76Iface {
         target: SystemSleepState,
     ) -> Result<(), WirelessError> {
         let _control = self.control.lock().await;
+        // cfg80211 wiphy_suspend leaves the station, which stops its
+        // scheduled scan (cfg80211_leave).
+        self.end_sched_scan().await?;
         if self.monitor_started.load(Ordering::Acquire) {
             self.close_monitor();
             crate::mt7921::firmware_transport::stop_boot_monitor()

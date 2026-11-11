@@ -31,6 +31,8 @@ pub(crate) mod p2p;
 pub(crate) mod p2p_go;
 #[path = "iface_p2p_group.rs"]
 pub(crate) mod p2p_group;
+#[path = "iface_sched_scan.rs"]
+mod sched_scan;
 #[path = "iface_wowlan.rs"]
 mod wowlan;
 
@@ -114,6 +116,8 @@ pub struct Mt76Iface {
     /// obtains a fresh native wake-route receipt.
     wake_reported: AtomicBool,
     wowlan: IrqSafeSpinLock<Option<narf_wireless::WowlanConfig>>,
+    /// The running scheduled scan's event source (its START request).
+    sched_scan: IrqSafeSpinLock<Option<narf_wireless::ap_control::RadioEventAuthority>>,
 }
 impl Mt76Iface {
     /// Build from validated radio identity, without disconnected frame rings.
@@ -160,6 +164,7 @@ impl Mt76Iface {
             sleeping: AtomicBool::new(false),
             wake_reported: AtomicBool::new(false),
             wowlan: IrqSafeSpinLock::new(None),
+            sched_scan: IrqSafeSpinLock::new(None),
         })
     }
     /// Legacy 20 MHz channels on firmware-reported bands.
@@ -320,6 +325,9 @@ impl Mt76Iface {
                 self.finish_teardown(false).await?;
             }
             self.drain_network()?;
+            if !self.link_up() {
+                self.poll_sched_scan().await;
+            }
             if self.link_up() {
                 let Some(_control) = self.control.try_lock() else {
                     return Ok(());
@@ -1110,6 +1118,27 @@ impl WirelessNetIface for Mt76Iface {
     fn wowlan_support(&self) -> Option<narf_wireless::WowlanSupport> {
         self.native_wowlan_support()
     }
+    /// mt7921 `wiphy->max_sched_scan_*`: the network-list offload request
+    /// (one plan, MT76_CONNAC_MAX_SCHED_SCAN_SSID probe SSIDs).
+    fn sched_scan_support(&self) -> Option<narf_wireless::SchedScanSupport> {
+        Some(crate::mt7921::wowlan_nlo::LIMITS)
+    }
+    fn async_sched_scan_control(&self) -> bool {
+        true
+    }
+    async fn start_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+        request: narf_wireless::SchedScanRequest,
+    ) -> Result<(), i32> {
+        self.start_sched_scan_native(authority, request).await
+    }
+    async fn stop_sched_scan_async(
+        &self,
+        authority: &narf_wireless::ap_control::RadioControlAuthority,
+    ) -> Result<(), i32> {
+        self.stop_sched_scan_native(authority).await
+    }
     fn wowlan_net_detect_limits(&self) -> Option<narf_wireless::SchedScanSupport> {
         Some(crate::mt7921::wowlan_nlo::LIMITS)
     }
@@ -1214,6 +1243,7 @@ impl WirelessNetIface for Mt76Iface {
             Vec::new()
         };
         let _control = self.control.lock().await;
+        self.end_sched_scan().await?;
         if self.link_up() {
             if req.random_mac.is_some() {
                 return Err(WirelessError::Busy);
@@ -1265,17 +1295,7 @@ impl WirelessNetIface for Mt76Iface {
                 found.extend(report.bss);
                 beaconed.extend(report.beaconed);
             }
-            let results = found
-                .iter()
-                .map(|bss| BssInfo {
-                    bssid: bss.bssid,
-                    ssid: bss.ssid.clone(),
-                    frequency_mhz: scan_frequency(bss).unwrap_or(0),
-                    channel: u32::from(bss.channel),
-                    rssi: bss.signal_dbm.unwrap_or(-128),
-                    security: scan_security(bss),
-                })
-                .collect();
+            let results = found.iter().map(bss_info).collect();
             *self.scan_cache.lock() = found;
             *self.scan_beaconed.lock() = beaconed;
             Ok(results)
@@ -1317,6 +1337,9 @@ impl WirelessNetIface for Mt76Iface {
         if !self.station_role() {
             return Err(WirelessError::NotSupported);
         }
+        self.end_sched_scan()
+            .await
+            .inspect_err(|error| note_failure("associate: scheduled-scan stop", error))?;
         let six = self
             .validate_join(&req)
             .inspect_err(|error| note_failure("associate: join validation", error))?;
@@ -1650,6 +1673,18 @@ fn scan_channels(req: &ScanRequest, bands: u8, six: bool) -> Result<Vec<u8>, Wir
         channels.push(value);
     }
     Ok(channels)
+}
+
+/// A native scan result as cfg80211 reports it.
+fn bss_info(bss: &ScanBss) -> BssInfo {
+    BssInfo {
+        bssid: bss.bssid,
+        ssid: bss.ssid.clone(),
+        frequency_mhz: scan_frequency(bss).unwrap_or(0),
+        channel: u32::from(bss.channel),
+        rssi: bss.signal_dbm.unwrap_or(-128),
+        security: scan_security(bss),
+    }
 }
 
 /// A scan result's centre frequency in its own band.

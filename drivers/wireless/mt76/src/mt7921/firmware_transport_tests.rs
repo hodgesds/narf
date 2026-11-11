@@ -25,6 +25,8 @@ mod p2p_management_model;
 mod active_scan_tests;
 #[path = "rxd_fields_tests.rs"]
 mod rxd_fields_tests;
+#[path = "sched_scan_tests.rs"]
+mod sched_scan_tests;
 
 #[path = "amsdu_rx_tests.rs"]
 mod amsdu_rx_tests;

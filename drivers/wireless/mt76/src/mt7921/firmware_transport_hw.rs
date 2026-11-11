@@ -2118,6 +2118,20 @@ impl Transport {
         self.session.stop_monitor().await
     }
 
+    /// Host scheduled scan on the idle station (`mt7921_start_sched_scan`).
+    pub async fn start_sched_scan(
+        &mut self,
+        config: &narf_wireless::NetDetectConfig,
+    ) -> Result<(), Error> {
+        self.session.start_sched_scan(config).await
+    }
+    pub(super) fn step_sched_scan(&mut self) -> Result<Option<super::ScanReport>, Error> {
+        self.session.step_sched_scan()
+    }
+    pub async fn stop_sched_scan(&mut self) -> Result<(), Error> {
+        self.session.stop_sched_scan().await
+    }
+
     /// Last observed boot stage/result, also preserved after cancellation.
     pub fn state(&self) -> State {
         self.session.state
