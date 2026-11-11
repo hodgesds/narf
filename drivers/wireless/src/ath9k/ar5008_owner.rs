@@ -669,6 +669,8 @@ pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         }
         o.removed = true;
         let reclaimed = retire(&mut o).await;
+        // ieee80211_unregister_hw: the netdev leaves with the device.
+        interface::unpublish();
         drop(o);
         let mut retained = OWNER.lock();
         if retained.as_ref().is_some_and(|r| Arc::ptr_eq(r, &owner)) {

@@ -863,6 +863,8 @@ fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
             return;
         }
         let reclaimed = retire_generation(&mut controller).await && !controller.pinned;
+        // ieee80211_unregister_hw: the netdev leaves with the device.
+        interface::unpublish();
         drop(controller);
         let mut retained = CONTROLLER.lock();
         if retained.as_ref().is_some_and(|r| Arc::ptr_eq(r, &owner)) {

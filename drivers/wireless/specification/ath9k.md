@@ -593,11 +593,15 @@ exists. Failure pins the owner and starts no replacement. The same physical
 function is power-on/warm-reset, EEPROM and silicon identity are re-read and
 must match, and full INI/modal/detector/CTL/rate/PA/NF/IQ preparation repeats
 for the target primary. Only a fresh successful frequency-bound calibration
-report can create new Packet/Radio/Device objects. The old interface name is
-reserved and terminal; the successor registers a new name, as existing
-recovery does. Old Arc/ring/cache/key/BA authorities never reopen. A future
-stable-name or association-preserving retune would require another explicit
-publication protocol; this implementation does not claim one.
+report can create new Packet/Radio/Device objects. The netdev itself
+survives (Linux keeps the `net_device` across `ath_reset`): the successor
+generation attaches to the same `interface::Netdev` under the same name,
+ifindex, MAC and Narf-Rings. The stale-publisher guard is the netdev's
+`Seat` token: every attach/detach advances it and a generation addresses the
+name (carrier, disconnect event, ring clear, RX delivery, TX admission) only
+while its token is current, with carrier publication and the advance
+serialized, so no late old publication reaches the successor. Old
+Arc/cache/key/BA authorities never reopen; association is not preserved.
 
 `channels` owns the queued physical operation independently of public waiter
 lifetimes. A driver worker owns hardware timer wakeups; dropping the caller
@@ -1231,21 +1235,28 @@ Generation reset, rejoin and removal build on that proof:
 - `rejoin`: after publication a supervisor watches the station; once it is
   terminal (disassociation, peer loss, FATAL interrupt, failed DMA) it resets
   into a fresh generation so the radio can be joined again. Three consecutive
-  failed resets, a removed owner or a pinned generation end supervision. Each
-  generation publishes a new `wlan%d` name; retired names stay reserved
-  (stable names are not claimed).
+  failed resets, a removed owner or a pinned generation end supervision. Every
+  generation attaches to the one `wlan%d` netdev, which keeps its name and
+  ifindex across reset, idle and suspend (`interface::Netdev`); control
+  requests that arrive while no generation is attached wait (bounded,
+  `ATTACH_WAIT_NS`) for the next one.
 - `removal`: `narf_bus::register_pci_remove` for both AR9285 and AR2427 match
   names (Linux `pci.c::ath_pci_remove`). The hook marks the owner removed
   before waiting (blocking any initialization, reset or supervisor), retires
-  the generation, drops the controller and releases the singleton address
-  only when DMA was reclaimed; otherwise the address stays quarantined.
+  the generation, unregisters the netdev (`interface::unpublish`, Linux
+  `ieee80211_unregister_hw`), drops the controller and releases the singleton
+  address only when DMA was reclaimed; otherwise the address stays quarantined.
   `narf_drivers` has no bound-driver unrecord API, so the bound record is left.
 
 Covered by `smoke_ar9285_station_retirement_reports_exact_dma_reclamation`
 (reclaimed vs wedged DCU, idempotent retire) and
-`smoke_ar9285_native_device_retire_host_withdraws_generation` (carrier,
-interface table, reserved name, late TX, DMA stop). Physical chip reset and
-re-association after reset are unmeasured.
+`smoke_ar9285_native_device_retire_host_withdraws_generation` (standalone
+generation: carrier, interface table, reserved name, late TX, DMA stop) and
+`smoke_ath9k_netdev_name_and_ifindex_survive_generation_reset` (bound
+generations: same name/ifindex/rings across detach+attach, a detached
+generation's late carrier/TX/service pass never reaches the successor,
+removal unregisters). Physical chip reset and re-association after reset are
+unmeasured.
 
 Other ath9k devices need their own EEPROM maps, reset/PHY tables and
 descriptor/runtime variants before they can be claimed supported. The Linux

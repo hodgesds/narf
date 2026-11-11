@@ -730,6 +730,8 @@ pub(super) fn remove(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) {
         }
         o.removed = true;
         let reclaimed = retire(&mut o).await;
+        // ieee80211_unregister_hw: the netdev leaves with the device.
+        interface::unpublish();
         if reclaimed {
             // `ath9k_stop` parks the PCIe SerDes in its awake array
             // (`ath9k_hw_configpcipowersave(ah, true)`); best effort

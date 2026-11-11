@@ -160,7 +160,7 @@ impl Environment for WideEnvironment {
             if !old.radio.lock().await.retire() {
                 return Err(Error::Transport(packet::Error::Timeout));
             }
-            old.state.lock().await.clear();
+            old.rings.state.lock().await.clear();
             let next = match grant {
                 Some(grant) => match owner.prepare_wide(grant) {
                     Ok(device) => device,
