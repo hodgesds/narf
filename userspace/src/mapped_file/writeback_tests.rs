@@ -1385,3 +1385,209 @@ kernel_test_in!(
     "userspace/writeback",
     smoke_dirtiness_is_recorded_not_compared_at_unmap
 );
+
+/// A file `len` bytes long, mapped in full (`len < 4096`).
+fn short_file(len: usize) -> Option<(Fixture, PhysAddr)> {
+    let mut fixture = Fixture::new(1);
+    fixture.store.bytes.lock().truncate(len);
+    let page = fixture.map(0, 1)?[0];
+    Some((fixture, page))
+}
+
+/// Read the file through the filesystem node and then through the read
+/// overlay, as `read(2)` does: the bytes a reader gets.
+fn read2(fixture: &Fixture, len: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let n = run(fixture.ops().read(0, &mut buf))?.ok()?;
+    buf.truncate(n);
+    overlay_dirty(fixture.ops(), 0, &mut buf);
+    Some(buf)
+}
+
+/// Writing back the file's last page writes it only up to EOF, and what a
+/// mapping stored past EOF is cleared from the page (`folio_zero_segment`).
+fn smoke_writeback_clears_stores_past_eof() -> TestResult {
+    let Some((fixture, page)) = short_file(100) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    store_bytes(page, 10, b"in");
+    store_bytes(page, 200, b"GARBAGE");
+    if super::super::flush_current_file(fixture.ops()).is_err() {
+        return TestResult::Fail("fsync of the mapped file failed");
+    }
+    if fixture.store.bytes.lock().len() != 100 {
+        return TestResult::Fail("writeback of the last page extended the file");
+    }
+    if fixture.file_bytes(10, 2) != *b"in" {
+        return TestResult::Fail("the store inside EOF did not reach the file");
+    }
+    if page_bytes(page, 200, 7) != [0; 7] {
+        return TestResult::Fail("a store past EOF survived writeback in the mapped page");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_writeback_clears_stores_past_eof
+);
+
+/// The checks both extension tests share: past the old EOF the file reads
+/// zeros through `read(2)`, through the mapping and from the file node,
+/// before and after writeback.
+fn zeros_past_old_eof(fixture: &Fixture, page: PhysAddr) -> Result<(), &'static str> {
+    if page_bytes(page, 200, 7) != [0; 7] {
+        return Err("the mapping still shows a store made past the old EOF");
+    }
+    match read2(fixture, 4096) {
+        Some(bytes) if bytes.len() > 207 && bytes[200..207] == [0; 7] => {}
+        _ => return Err("read(2) returned a store made past the old EOF"),
+    }
+    if super::super::flush_current_file(fixture.ops()).is_err() {
+        return Err("fsync of the mapped file failed");
+    }
+    if fixture.file_bytes(200, 7) != [0; 7] {
+        return Err("a store made past the old EOF reached the file");
+    }
+    if fixture.file_bytes(10, 2) != *b"in" {
+        return Err("the store inside the old EOF was lost");
+    }
+    Ok(())
+}
+
+/// `ftruncate` up over bytes a mapping stored past EOF: they read as zeros
+/// everywhere (`pagecache_isize_extended` / `truncate_setsize`).
+fn smoke_ftruncate_up_zeroes_stores_past_eof() -> TestResult {
+    let Some((fixture, page)) = short_file(100) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    store_bytes(page, 10, b"in");
+    store_bytes(page, 200, b"GARBAGE");
+    let grown = size_change_serialized(fixture.ops(), || run(fixture.ops().truncate(4096)));
+    if grown != Some(Ok(())) {
+        return TestResult::Fail("the extending truncate failed");
+    }
+    match zeros_past_old_eof(&fixture, page) {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_ftruncate_up_zeroes_stores_past_eof
+);
+
+/// A `write(2)` that starts past EOF, over bytes a mapping stored there:
+/// the gap reads as zeros everywhere, the written bytes as written.
+fn smoke_write_past_eof_zeroes_stores_in_the_gap() -> TestResult {
+    let Some((fixture, page)) = short_file(100) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    store_bytes(page, 10, b"in");
+    store_bytes(page, 200, b"GARBAGE");
+    // The handler path: killable write, then the cache is told.
+    let stamp = write_stamp();
+    let mut payload = b"W".to_vec();
+    let wrote = crate::killable_wait::write(fixture.ops(), 300, &mut payload);
+    if !matches!(wrote, Ok(Some(Ok(1)))) {
+        return TestResult::Fail("the extending write failed");
+    }
+    note_file_written(fixture.ops(), 300, b"W", stamp);
+    if let Err(why) = zeros_past_old_eof(&fixture, page) {
+        return TestResult::Fail(why);
+    }
+    if fixture.file_bytes(300, 1) != *b"W" || page_bytes(page, 300, 1) != *b"W" {
+        return TestResult::Fail("the extending write's own bytes were lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_write_past_eof_zeroes_stores_in_the_gap
+);
+
+/// One writer's life as a real user task: it holds pages of a writable
+/// shared mapping, stores through them, unmaps them and exits — no msync,
+/// no fsync, no kick. Only the flusher's own scheduling (its first pass and
+/// its timer) is left to write the pages.
+async fn writer_task(pages: Vec<PhysAddr>, text: &'static [u8]) {
+    // What the first writable shared mapping does.
+    ensure_flusher();
+    narf_scheduler::yield_now().await;
+    for phys in &pages {
+        store_bytes(*phys, 0, text);
+        release_shared_file_page(phys.raw());
+    }
+}
+
+/// Run one writer as a real user task and the executor until everything —
+/// writer, flusher — has finished. Returns whether its stores reached the
+/// file (read from the file node, not through the overlay), and how many
+/// times a flusher was started.
+fn one_writer(pid: u64, text: &'static [u8]) -> Result<(bool, u64), &'static str> {
+    const PAGES: usize = 2;
+    let mut fixture = Fixture::new(PAGES);
+    let pages = fixture.map(0, PAGES).ok_or("could not map the test file")?;
+    // The task owns these mapping references now.
+    fixture.held.clear();
+    // SAFETY: kernel tests run with paging enabled; a fresh inactive root.
+    let mm = unsafe { narf_memory::AddressSpace::new_for_user() }
+        .map_err(|_| "AddressSpace::new_for_user failed")?;
+    let starts = FLUSHER_STARTS.load(Ordering::Relaxed);
+    narf_scheduler::spawn_user(
+        narf_scheduler::TaskId(pid),
+        writer_task(pages, text),
+        narf_scheduler::TaskSpec::unthrottled(),
+        Arc::new(mm),
+    );
+    narf_scheduler::run_until_empty();
+    crate::task::release_task(pid);
+    let written = (0..PAGES).all(|page| fixture.file_bytes(page * 4096, text.len()) == text)
+        && fixture.idle_dirty() == 0;
+    Ok((written, FLUSHER_STARTS.load(Ordering::Relaxed) - starts))
+}
+
+/// The flusher under real user tasks, with nothing calling it by hand: the
+/// first writer starts it, it writes what that writer left when it exited,
+/// it goes when no user task is left, and the next writer starts another.
+///
+/// SIGKILL of the writer is not run here: delivering a fatal signal needs a
+/// real user program in this harness. A killed task ends through the same
+/// slot drop and address-space teardown as this one's exit, which is what
+/// hands its pages to the flusher.
+fn smoke_flusher_writes_for_real_user_tasks() -> TestResult {
+    narf_scheduler::__reset_queues_for_test();
+    if FLUSHER_STARTED.load(Ordering::Acquire) {
+        return TestResult::Fail("a dropped flusher left its running flag set");
+    }
+    // The timer path within a test's patience; the logic is unchanged.
+    WRITEBACK_INTERVAL_OVERRIDE_MS.store(20, Ordering::Relaxed);
+    let passes = PASSES.load(Ordering::Relaxed);
+    let first = one_writer(0x5742_1000, b"first writer");
+    let flag_after_first = FLUSHER_STARTED.load(Ordering::Acquire);
+    let second = one_writer(0x5742_1001, b"second writer");
+    WRITEBACK_INTERVAL_OVERRIDE_MS.store(u64::MAX, Ordering::Relaxed);
+    let (first, second) = match (first, second) {
+        (Ok(first), Ok(second)) => (first, second),
+        (Err(why), _) | (_, Err(why)) => return TestResult::Fail(why),
+    };
+    if PASSES.load(Ordering::Relaxed) == passes {
+        return TestResult::Fail("no flusher pass ran");
+    }
+    if !first.0 {
+        return TestResult::Fail("an exited writer's stores never reached the file");
+    }
+    if first.1 != 1 {
+        return TestResult::Fail("the first writer did not start exactly one flusher");
+    }
+    if flag_after_first {
+        return TestResult::Fail("the flusher did not go when no user task was left");
+    }
+    if !second.0 || second.1 != 1 {
+        return TestResult::Fail("the next writer did not get a new flusher of its own");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_flusher_writes_for_real_user_tasks
+);

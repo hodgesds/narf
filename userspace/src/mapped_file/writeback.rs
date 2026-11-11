@@ -413,12 +413,32 @@ fn examine(batch: &mut [Pinned], size: u64, select: Select) -> Vec<Run> {
         // mapping may be storing into the page while it is read: writeback
         // then captures either side of that store, and whichever it missed
         // leaves the page different from the image written, hence dirty.
+        if len < 4096 {
+            // The file's last page. What a mapping stored past EOF is not
+            // file data: Linux zeroes the folio's tail on every writeback of
+            // it (`folio_zero_segment` in `block_write_full_folio`), so the
+            // bytes can never reach the file, even if it later grows over
+            // them. Here the tail goes back to its clean image, which past
+            // EOF is what the file reads there — zeros.
+            // SAFETY: the page is pinned and identity-mapped (see the read
+            // below); `len < 4096`.
+            let tail = unsafe {
+                core::slice::from_raw_parts_mut(
+                    page.phys.kernel_mut_ptr::<u8>().add(len),
+                    4096 - len,
+                )
+            };
+            for (byte, clean) in tail.iter_mut().zip(&page.clean[len..]) {
+                if *byte != *clean {
+                    *byte = *clean;
+                }
+            }
+        }
+        // SAFETY: as described above the tail clearing: pinned until
+        // `finish_batch`, identity-mapped, one whole page.
         let live = unsafe { core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>(), 4096) };
         PAGE_COMPARES.fetch_add(1, Ordering::Relaxed);
         if live[..len] == page.clean[..len] {
-            if page.idle && live[len..] != page.clean[len..] {
-                page.action = Action::PastEof;
-            }
             continue;
         }
         if select == Select::Aged {
@@ -1126,6 +1146,55 @@ pub(super) fn invalidate_beyond_eof(file: &dyn FileOps) {
     invalidate_past(identity, file.stat().size);
 }
 
+/// `ops`'s file is about to grow from `old_size` to cover `new_end`, by a
+/// `write(2)` past EOF, an `ftruncate` up, or `fallocate`. Bytes a mapping
+/// stored past the old EOF in its last page are not file data and must
+/// not become file data: the file reads zeros there. Restore them to the
+/// page's clean image (zeros past EOF) — Linux `pagecache_isize_extended`,
+/// and the zeroing `truncate_setsize` does on the old last page.
+///
+/// Only bytes that differ from the clean image are touched: a `write(2)`
+/// that put bytes there updated both, so a racing writer's data is never
+/// taken for a stray store. One page, under the cache lock.
+pub(crate) fn discard_stores_past_eof(ops: &dyn FileOps, old_size: u64, new_end: u64) {
+    let in_page = (old_size % 4096) as usize;
+    if in_page == 0 || new_end <= old_size || FILE_ENTRIES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let identity = shared_file_identity(ops);
+    if !may_have_entry(identity) {
+        return;
+    }
+    let end = (new_end - (old_size - in_page as u64)).min(4096) as usize;
+    let mut pages = SHARED_FILE_PAGES.lock();
+    let Some(phys) = pages
+        .by_file
+        .get(&key(identity, old_size - in_page as u64))
+        .copied()
+    else {
+        return;
+    };
+    let Some(page) = pages.by_phys.get_mut(&phys) else {
+        return;
+    };
+    // SAFETY: the cache entry owns the frame while the cache lock is held,
+    // and `in_page < end <= 4096`.
+    let live = unsafe {
+        core::slice::from_raw_parts_mut(
+            page.phys.kernel_mut_ptr::<u8>().add(in_page),
+            end - in_page,
+        )
+    };
+    for (byte, clean) in live.iter_mut().zip(&page.clean[in_page..end]) {
+        if *byte != *clean {
+            *byte = *clean;
+        }
+    }
+    if page.wb_pins != 0 {
+        page.redirtied = true;
+    }
+}
+
 /// `fallocate(PUNCH_HOLE | ZERO_RANGE)` made `[offset, offset + len)` read
 /// as zeros: so must the cached pages, or a dirty one would write the old
 /// bytes back into the hole.
@@ -1210,10 +1279,13 @@ pub(crate) fn size_change_serialized<R>(ops: &Arc<dyn FileOps>, change: impl FnO
     // `None` only where there is nothing to park on and the lock never
     // came free; the operation must still run.
     let guard = drive(file.lock.lock());
+    let old_size = ops.stat().size;
     let result = change();
     // The size the file has NOW, not the one asked for: a `write(2)` does
     // not take this lock and may have extended the file since.
-    invalidate_past(file.identity, ops.stat().size);
+    let new_size = ops.stat().size;
+    discard_stores_past_eof(ops.as_ref(), old_size, new_size);
+    invalidate_past(file.identity, new_size);
     drop(guard);
     let identity = file.identity;
     drop(file);
@@ -1266,7 +1338,9 @@ pub(crate) fn fallocate_serialized<R>(
             file.record_error(error);
         }
     }
+    let old_size = ops.stat().size;
     let result = change();
+    discard_stores_past_eof(ops.as_ref(), old_size, ops.stat().size);
     if succeeded(&result) {
         if mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0 {
             zero_cached_range(file.identity, offset, len);
@@ -1565,21 +1639,51 @@ fn dirtiers_alive() -> bool {
     narf_scheduler::live_user_task_count() != 0
 }
 
-async fn flusher_main() {
+/// `u64::MAX`: use [`WRITEBACK_INTERVAL_MS`]. Tests shorten it.
+static WRITEBACK_INTERVAL_OVERRIDE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn writeback_interval_ms() -> u64 {
+    match WRITEBACK_INTERVAL_OVERRIDE_MS.load(Ordering::Relaxed) {
+        u64::MAX => WRITEBACK_INTERVAL_MS,
+        ms => ms,
+    }
+}
+
+/// Clears [`FLUSHER_STARTED`] however the flusher ends — returning, or its
+/// task being dropped — so a later dirtier can start another.
+struct FlusherRunning;
+
+impl Drop for FlusherRunning {
+    fn drop(&mut self) {
+        FLUSHER_STARTED.store(false, Ordering::Release);
+    }
+}
+
+/// `running` is created with the task, not in its first poll: a task that
+/// is dropped before it ever runs must clear the flag too.
+async fn flusher_main(running: FlusherRunning) {
     loop {
         background_pass().await;
-        if !dirtiers_alive() {
+        // Not merely "no user task": the last one may have exited between
+        // that pass and this test, leaving the pages it unmapped on the way
+        // out. They are written by the next pass, and only then does the
+        // flusher go.
+        if !dirtiers_alive() && IDLE_DIRTY_PAGES.load(Ordering::Acquire) == 0 {
             break;
         }
         NextPass {
-            tick: narf_time::sleep_ms(WRITEBACK_INTERVAL_MS),
+            tick: narf_time::sleep_ms(writeback_interval_ms()),
         }
         .await;
     }
-    FLUSHER_STARTED.store(false, Ordering::Release);
-    // A dirtier that appeared between the test above and the store found
-    // the task still marked as running.
-    ensure_flusher();
+    drop(running);
+    // A dirtier that appeared between the test above and the flag clearing
+    // found the task still marked as running.
+    if IDLE_DIRTY_PAGES.load(Ordering::Acquire) != 0 {
+        start_flusher();
+    } else {
+        ensure_flusher();
+    }
 }
 
 /// Start the writeback task if it is not running and there is anybody to
@@ -1597,15 +1701,23 @@ pub(crate) fn ensure_flusher() {
     if !dirtiers_alive() {
         return;
     }
+    start_flusher();
+}
+
+/// Flushers started. Kernel tests read it.
+static FLUSHER_STARTS: AtomicU64 = AtomicU64::new(0);
+
+fn start_flusher() {
     if FLUSHER_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    FLUSHER_STARTS.fetch_add(1, Ordering::Relaxed);
     let spec = narf_scheduler::TaskSpec {
         affinity: narf_scheduler::Affinity::any(),
         work_kind: narf_scheduler::WorkKind::KernelThread,
         ..narf_scheduler::TaskSpec::unthrottled()
     };
-    narf_scheduler::spawn_with_spec(flusher_main(), spec);
+    narf_scheduler::spawn_with_spec(flusher_main(FlusherRunning), spec);
 }
 
 static DIRTY_LIMIT: AtomicUsize = AtomicUsize::new(0);
@@ -1673,12 +1785,13 @@ pub(crate) fn unmapped() {
     kick();
 }
 
-/// The same for address-space teardown, which runs on the executor thread:
-/// wake the flusher if it is waiting, and nothing else. No task is started
-/// from there; a page can only have been dirtied through a writable
-/// mapping, and creating one started the flusher.
+/// The same for address-space teardown, which runs wherever the last
+/// reference drops: make sure a flusher exists for what was left behind and
+/// wake it. Spawning is a run-queue insertion — no I/O, no filesystem lock,
+/// no wait.
 pub(super) fn torn_down() {
     if IDLE_DIRTY_PAGES.load(Ordering::Relaxed) != 0 {
+        start_flusher();
         kick();
     }
 }
