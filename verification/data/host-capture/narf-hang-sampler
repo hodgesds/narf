@@ -1,0 +1,225 @@
+#!/usr/bin/bash
+# Leave the last seconds before a hang on disk.
+#
+#   narf-hang-sampler [interval-seconds] [nic]        (defaults: 2, eth0)
+#
+# Appends one timestamped block per interval to
+#   ~/narf-hang-sampler-<boot id>.log     (NARF_SAMPLER_OUT overrides)
+# and fsyncs the file after each block. Run it as the login user from a
+# terminal, `nohup narf-hang-sampler &`, or a tmux pane; stop it with
+# Ctrl-C or kill.
+#
+# A block holds: /proc/loadavg, /proc/meminfo, per-CPU /proc/stat deltas
+# (busy and system percent; `frozen` for a CPU whose counters stood still),
+# /proc/interrupts deltas of the NIC, NVMe and GPU lines, the non-zero
+# `ethtool -S` counters that changed, /sys/class/drm/card*/device/mem_info_*,
+# process counts by state and the five largest processes.
+#
+# Built so that the hang it is waiting for cannot silence it early:
+# - Everything read from /proc and /sys is read with shell builtins. On the
+#   hang this was written for, /proc kept answering after file reads and bus
+#   calls had stopped.
+# - The only program started per block is ethtool, under a timeout, and its
+#   absence or failure costs one line.
+# - The write and the fsync run in a child. While a child has not come back
+#   the next blocks wait in memory and each records how long the disk has
+#   been stuck, so a filesystem that stalls and recovers still gets the
+#   samples taken meanwhile, and one that never recovers has the stall's
+#   onset as its last block.
+# Needs bash 5, coreutils and (optionally) ethtool. No configuration, no
+# root.
+export LC_ALL=C
+interval=${1:-2}
+nic=${2:-eth0}
+boot=unknown
+[ -r /proc/sys/kernel/random/boot_id ] && read -r boot < /proc/sys/kernel/random/boot_id
+out=${NARF_SAMPLER_OUT:-$HOME/narf-hang-sampler-${boot%%-*}.log}
+state=${XDG_RUNTIME_DIR:-/dev/shm}/narf-hang-sampler.$$
+: > "$state" 2> /dev/null || state=/tmp/narf-hang-sampler.$$
+printf '0\n' > "$state"
+trap 'rm -f "$state" "$state.tick"; exit 0' INT TERM
+
+# A timed read on a FIFO nobody writes to sleeps without starting a process.
+use_fifo=0
+if mkfifo "$state.tick" 2> /dev/null && exec 9<> "$state.tick"; then
+  read -r -t 0.01 <&9
+  (($? > 128)) && use_fifo=1
+fi 2> /dev/null
+nap() {
+  if ((use_fifo)); then
+    read -r -t "$1" <&9
+  else
+    sleep "$1"
+  fi
+}
+
+declare -A cpu_total cpu_idle cpu_sys irq_prev eth_prev
+declare -a top_v top_l
+block=""
+add() { block+="$*"$'\n'; }
+
+top_insert() { # value label
+  local v=$1 i j
+  for ((i = 0; i < 5; i++)); do
+    if ((v > ${top_v[i]:-0})); then
+      for ((j = 4; j > i; j--)); do
+        top_v[j]=${top_v[j - 1]:-0}
+        top_l[j]=${top_l[j - 1]:-}
+      done
+      top_v[i]=$v
+      top_l[i]=$2
+      return
+    fi
+  done
+}
+
+sample_cpus() {
+  local name user nice system idle iowait irq softirq steal _ total d line="cpu busy%/sys%:"
+  while read -r name user nice system idle iowait irq softirq steal _; do
+    case $name in cpu[0-9]*) ;; *) continue ;; esac
+    total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    if [ -n "${cpu_total[$name]}" ]; then
+      d=$((total - cpu_total[$name]))
+      if ((d <= 0)); then
+        line+=" ${name#cpu}:frozen"
+      else
+        line+=" ${name#cpu}:$((100 - 100 * (idle + iowait - cpu_idle[$name]) / d))/$((100 * (system + irq + softirq - cpu_sys[$name]) / d))"
+      fi
+    fi
+    cpu_total[$name]=$total
+    cpu_idle[$name]=$((idle + iowait))
+    cpu_sys[$name]=$((system + irq + softirq))
+  done < /proc/stat
+  add "$line"
+}
+
+sample_interrupts() {
+  local line key sum field rest quiet=0 line_out="irq deltas:"
+  local -a fields
+  while read -r line; do
+    case $line in
+      *igc* | *eth* | *enp* | *nvme* | *amdgpu* | *i915* | *virtio* | *e1000*) ;;
+      *) continue ;;
+    esac
+    key=${line%%:*}
+    rest=${line#*:}
+    # shellcheck disable=SC2206
+    fields=($rest)
+    sum=0
+    for field in "${fields[@]}"; do
+      case $field in '' | *[!0-9]*) break ;; esac
+      sum=$((sum + field))
+    done
+    # The device name is the last word of the line.
+    key="$key/${fields[-1]}"
+    if [ -n "${irq_prev[$key]}" ]; then
+      if ((sum != irq_prev[$key])); then
+        line_out+=" $key=+$((sum - irq_prev[$key]))"
+      else
+        quiet=$((quiet + 1))
+      fi
+    fi
+    irq_prev[$key]=$sum
+  done < /proc/interrupts 2> /dev/null
+  add "$line_out ($quiet lines unchanged)"
+}
+
+sample_ethtool() {
+  local name value line="ethtool -S $nic deltas:" any=0
+  command -v ethtool > /dev/null 2>&1 || {
+    add "ethtool: not installed"
+    return
+  }
+  while IFS=: read -r name value; do
+    name=${name//[[:space:]]/}
+    value=${value//[[:space:]]/}
+    case $value in '' | *[!0-9]*) continue ;; esac
+    any=1
+    if [ -n "${eth_prev[$name]}" ] && ((value != eth_prev[$name])); then
+      line+=" $name=+$((value - eth_prev[$name]))"
+    fi
+    eth_prev[$name]=$value
+  done < <(timeout -k 1 2 ethtool -S "$nic" 2> /dev/null)
+  ((any)) || line="ethtool -S $nic: no counters (timeout, no such interface, or not supported)"
+  add "$line"
+}
+
+sample_drm() {
+  local f v line=""
+  for f in /sys/class/drm/card*/device/mem_info_*; do
+    [ -r "$f" ] || continue
+    v=""
+    read -r v < "$f"
+    f=${f#/sys/class/drm/}
+    line+=" ${f%%/*}/${f##*/}=$v"
+  done
+  [ -n "$line" ] && add "drm:$line"
+}
+
+sample_processes() {
+  local stat comm rest pid line threads=0
+  local -A states=()
+  local -a f
+  top_v=()
+  top_l=()
+  for stat in /proc/[0-9]*/stat; do
+    read -r line 2> /dev/null < "$stat" || continue
+    pid=${stat#/proc/}
+    pid=${pid%/stat}
+    comm=${line#*(}
+    comm=${comm%)*}
+    rest=${line##*) }
+    # shellcheck disable=SC2206
+    f=($rest)
+    states[${f[0]}]=$((${states[${f[0]}]:-0} + 1))
+    threads=$((threads + ${f[17]:-1}))
+    top_insert "${f[21]:-0}" "$comm/$pid"
+  done
+  line="processes:"
+  for stat in "${!states[@]}"; do line+=" $stat=${states[$stat]}"; done
+  add "$line threads=$threads"
+  line="largest rss (MiB):"
+  for pid in "${!top_v[@]}"; do line+=" ${top_l[pid]// /_}=$((top_v[pid] * 4 / 1024))"; done
+  add "$line"
+}
+
+seq=0
+flushed=0
+last_started=0
+started_at=0
+pending=""
+printf 'narf-hang-sampler: every %s s to %s\n' "$interval" "$out" >&2
+while :; do
+  seq=$((seq + 1))
+  block=""
+  read -r uptime _ < /proc/uptime
+  printf -v now '%(%F %T)T' -1
+  add "===== sample $seq $now uptime=$uptime ====="
+  read -r load < /proc/loadavg
+  add "loadavg: $load"
+  sample_cpus
+  sample_interrupts
+  sample_ethtool
+  sample_drm
+  sample_processes
+  while read -r line; do add "$line"; done < /proc/meminfo
+
+  read -r flushed < "$state"
+  if ((last_started > flushed)); then
+    # The previous write or fsync has not returned: keep the block and say so.
+    add "disk: write+fsync of sample $last_started has not returned for $((SECONDS - started_at)) s"
+    pending+=$block
+    # Do not hold more than a few minutes of samples in memory.
+    ((${#pending} > 2000000)) && pending=${pending: -1000000}
+  else
+    pending+=$block
+    last_started=$seq
+    started_at=$SECONDS
+    (
+      printf '%s' "$pending" >> "$out" && sync "$out"
+      printf '%s\n' "$seq" > "$state"
+    ) &
+    pending=""
+  fi
+  nap "$interval"
+done
