@@ -2386,12 +2386,28 @@ impl Card {
     }
 
     /// Register a new dumb backing. Returns the gem handle.
+    ///
+    /// A card-table dumb buffer reaches a presenter as a bare physical
+    /// address ([`PlaneFrame::phys`], no `bo`). Nothing keeps that address
+    /// alive for a presenter that works after the commit returned: the
+    /// backing goes back to the page allocator when the buffer's last
+    /// reference does (DESTROY_DUMB and RMFB, or a closed framebuffer
+    /// leaving the screen, `collect_closed_fbs`). The linear GEM card
+    /// (Navi 22), whose presenter queues frames and keeps the committed
+    /// one for a relight, must therefore never have one, and does not: its
+    /// CREATE_DUMB makes a GEM buffer in the opener's table or fails
+    /// (`drm_ioctl_bridge::amdgpu_dumb`), so every client frame that
+    /// presenter holds carries a scanout pin.
     pub fn register_dumb_backing(
         &mut self,
         phys: u64,
         byte_len: usize,
         order: u8,
     ) -> Result<u32, CardError> {
+        debug_assert!(
+            !(self.driver_name == "amdgpu" && self.native_atomic && !self.gfx12_modifiers),
+            "a card-table dumb buffer on the linear GEM card: its presenter would hold a bare address"
+        );
         let handle = self
             .gem
             .alloc(phys, byte_len)

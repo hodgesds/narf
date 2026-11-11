@@ -2770,6 +2770,14 @@ pub fn release_client_scanout_async() {
 }
 #[derive(Clone, Debug)]
 struct Frame {
+    /// For a frame without a pin (`bo`), the address of its pixels, which
+    /// nothing here keeps alive while the frame is queued
+    /// (`PRESENT.next`), kept for a relight (`PRESENT.committed`) or being
+    /// copied. No client buffer arrives that way on this card: a client's
+    /// framebuffer is always a GEM buffer and comes with its scanout pin
+    /// (`Card::register_dumb_backing` states the invariant and asserts
+    /// it). A frame made without a pin must outlive the presenter's use of
+    /// it by its maker's own means.
     phys: u64,
     pitch: u32,
     width: u32,
