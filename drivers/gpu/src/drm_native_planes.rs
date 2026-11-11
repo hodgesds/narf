@@ -1263,6 +1263,8 @@ fn display_planes(
 /// framebuffer (an overlay's; a primary's is its CRTC's), rectangles and
 /// properties.
 pub fn commit(card: &mut Card, state: &AtomicState) {
+    // The CRTCs whose primary this commit switches off.
+    let mut off: Vec<u32> = Vec::new();
     for p in &state.planes {
         let Some(native) = card.native_planes.iter_mut().find(|n| n.id == p.id) else {
             continue;
@@ -1272,18 +1274,34 @@ pub fn commit(card: &mut Card, state: &AtomicState) {
             // (the bridge marks a new one again).
             native.internal_fb = false;
         }
-        if native.primary_of.is_none() {
-            native.crtc_id = p.crtc_id;
-            native.fb_id = p.fb_id;
-        } else {
-            native.crtc_id = p.crtc_id;
-            native.fb_id = p.fb_id;
-            native.placed = true;
-        }
+        native.crtc_id = p.crtc_id;
+        native.fb_id = p.fb_id;
         native.src = (p.src_x, p.src_y, p.src_w, p.src_h);
         native.dst = (p.crtc_x, p.crtc_y, p.crtc_w, p.crtc_h);
+        if let Some(crtc) = native.primary_of {
+            // drm_atomic_helper_disable_plane: a disabled plane has no
+            // framebuffer, no CRTC and no rectangles. A compositor
+            // switches off the other CRTCs' primaries in its modeset; one
+            // left "placed" with zero rectangles would be judged on them
+            // by the next commit that does not name it.
+            native.placed = p.crtc_id.is_some() && p.fb_id.is_some();
+            if !native.placed {
+                native.crtc_id = None;
+                native.fb_id = None;
+                native.src = (0, 0, 0, 0);
+                native.dst = (0, 0, 0, 0);
+                off.push(crtc);
+            }
+        }
         if let Some(props) = p.props {
             native.props = props;
+        }
+    }
+    // The primary's framebuffer is its CRTC's `primary_fb`
+    // (`plane_state`): a primary switched off shows none.
+    for crtc in off {
+        if let Ok(c) = card.crtc_mut(crtc) {
+            c.primary_fb = None;
         }
     }
 }
@@ -2981,6 +2999,113 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/drm",
         drm_native_planes_dcn30_untouched_primary_keeps_its_rectangles
+    );
+
+    /// A primary without a framebuffer has no plane state
+    /// (drm_atomic_helper_disable_plane, __drm_atomic_helper_plane_reset):
+    /// the other CRTC's primary KWin switches off in its modeset is not
+    /// left "placed" with zero rectangles, its CRTC shows no framebuffer,
+    /// and the console that takes a CRTC over shows its framebuffer whole
+    /// at the mode (drm_client_modeset_commit) wherever the last atomic
+    /// commit had put the primary.
+    fn drm_native_planes_disabled_primary_has_no_state() -> TestResult {
+        let (mut card, fbs) = dcn30_card();
+        let pointer = {
+            let handle = card.gem.alloc(0x3000_0000, 41 * 40 * 4).unwrap();
+            card.addfb2(41, 40, AR24, 41 * 4, handle).unwrap()
+        };
+        // KWin's modeset: the pointer image on CRTC 1's primary, CRTC 2 and
+        // its primary off.
+        let mut modeset = AtomicState::default();
+        modeset.planes.push(on(
+            PRIMARY_PLANE_ID_BASE,
+            pointer,
+            (41, 40),
+            (1000, 500, 41, 40),
+        ));
+        let mut other = plane_state(&card, PRIMARY_PLANE_ID_BASE + 1).unwrap();
+        other.crtc_id = None;
+        other.fb_id = None;
+        modeset.planes.push(other);
+        modeset.crtcs.push(crate::drm::atomic::CrtcState {
+            id: 2,
+            enable: false,
+            active: false,
+            mode: None,
+            ..Default::default()
+        });
+        if check(&card, &modeset, dcn30_mode).is_err() {
+            return TestResult::Fail("modeset refused");
+        }
+        modeset.checked = true;
+        if modeset.core_commit(&mut card).is_err() {
+            return TestResult::Fail("modeset not committed");
+        }
+        commit(&mut card, &modeset);
+        let off = *card.native_plane(PRIMARY_PLANE_ID_BASE + 1).unwrap();
+        if off.placed
+            || off.crtc_id.is_some()
+            || off.fb_id.is_some()
+            || (off.src, off.dst) != ((0, 0, 0, 0), (0, 0, 0, 0))
+            || card.crtcs[1].primary_fb.is_some()
+        {
+            return TestResult::Fail("disabled primary kept plane state");
+        }
+        let read = plane_state(&card, PRIMARY_PLANE_ID_BASE + 1).unwrap();
+        if read.fb_id.is_some() || read.crtc_id.is_some() {
+            return TestResult::Fail("disabled primary reads back a framebuffer");
+        }
+        // A later commit that names neither primary is judged on CRTC 1's
+        // committed rectangles and on nothing of CRTC 2's.
+        let mut later = AtomicState::default();
+        let mut cursor = plane_state(&card, DCN30_CURSOR_PLANE_ID_BASE).unwrap();
+        cursor.fb_id = None;
+        cursor.crtc_id = None;
+        later.planes.push(cursor);
+        later.crtcs.push(crate::drm::atomic::CrtcState {
+            id: 1,
+            enable: true,
+            active: true,
+            mode: dcn30_mode(1),
+            ..Default::default()
+        });
+        match check(&card, &later, dcn30_mode) {
+            Ok(out) if out.len() == 1 && out[0].crtc_id == 1 => {}
+            _ => return TestResult::Fail("commit after the modeset refused"),
+        }
+        // The CRTC loses its primary without a plane commit (its sink went,
+        // or the client closed), and the console takes it over.
+        card.crtcs[0].primary_fb = None;
+        card.show_console(1);
+        let console = card.crtcs[0].primary_fb;
+        let read = plane_state(&card, PRIMARY_PLANE_ID_BASE).unwrap();
+        if console.is_none()
+            || console == Some(pointer)
+            || read.fb_id != console
+            || (read.src_x, read.src_y, read.src_w, read.src_h) != (0, 0, 1920, 1080)
+            || (read.crtc_x, read.crtc_y, read.crtc_w, read.crtc_h) != (0, 0, 1920, 1080)
+            || card
+                .native_plane(PRIMARY_PLANE_ID_BASE)
+                .is_none_or(|p| p.placed)
+        {
+            return TestResult::Fail("console shown where the pointer image was placed");
+        }
+        // Switching a primary off through the plane switches it off on its
+        // CRTC as well.
+        let mut disable = AtomicState::default();
+        let mut primary = plane_state(&card, PRIMARY_PLANE_ID_BASE).unwrap();
+        primary.crtc_id = None;
+        primary.fb_id = None;
+        disable.planes.push(primary);
+        commit(&mut card, &disable);
+        if card.crtcs[0].primary_fb.is_some() || card.framebuffer(fbs[0]).is_err() {
+            return TestResult::Fail("disabled primary still shows a framebuffer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/drm",
+        drm_native_planes_disabled_primary_has_no_state
     );
 
     /// Commit/displays round-trip on DCN30: every enabled CRTC's display

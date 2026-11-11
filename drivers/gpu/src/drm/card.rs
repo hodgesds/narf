@@ -1417,11 +1417,25 @@ impl Card {
             .map(|&(_, placement)| placement)
     }
     /// Record (or, with None, forget) the rectangles of CRTC `crtc`'s
-    /// synthesized primary plane.
+    /// synthesized primary plane. Forgetting them also ends a native
+    /// primary's own (`NativePlane::placed`): whoever gives the CRTC its
+    /// next primary without a plane state of its own — a legacy SETCRTC,
+    /// the console takeover, a CRTC that lost its sink — shows it whole at
+    /// the mode (drm_atomic_helper_set_config, drm_client_modeset_commit),
+    /// not where the last atomic commit had put another framebuffer.
     pub fn set_primary_placement(&mut self, crtc: u32, placement: Option<Placement>) {
         self.primary_placements.retain(|(id, _)| *id != crtc);
-        if let Some(placement) = placement {
-            self.primary_placements.push((crtc, placement));
+        match placement {
+            Some(placement) => self.primary_placements.push((crtc, placement)),
+            None => {
+                for p in self
+                    .native_planes
+                    .iter_mut()
+                    .filter(|p| p.primary_of == Some(crtc))
+                {
+                    p.placed = false;
+                }
+            }
         }
     }
     /// The native plane `id`, if this card has one.
