@@ -1678,7 +1678,18 @@ password `SAE_OFFLOAD` (-EINVAL otherwise); pairwise / group ciphers must be
 wiphy cipher suites (-EINVAL). CONNECT accepts up to five pairwise selectors,
 while direct ASSOCIATE accepts one, as `nl80211_crypto_settings` does.
 `CONTROL_PORT_OVER_NL80211` needs
-`SOCKET_OWNER` (-EINVAL), then the ext feature (-EOPNOTSUPP). For the PMK
+`SOCKET_OWNER` (-EINVAL), then the ext feature (-EOPNOTSUPP). A CONNECT on a
+station that is already connected is -EALREADY, after the request's own
+validation, unless `WirelessNetIface::supports_roam()` (default false; true
+for drivers that implement `roam`) says the driver reassociates
+(`cfg80211_connect`). wpa_supplicant answers -EALREADY with DISCONNECT and a
+second CONNECT. A SAE-offload CONNECT carries `NL80211_ATTR_SAE_PASSWORD`,
+auth type SAE, `USE_MFP` required, AKM SAE, CCMP, and `WPA_VERSIONS` 2 or 3
+(wpa_supplicant `wpa_ver_supported` sends 3 once the family covers
+`SAE_PASSWORD`). The SAE elements are admitted by
+`association::validate_sme_ies_for(.., SmeRsna::Wpa3Sae)`. BSS selection for
+an SAE CONNECT also finds a WPA3-Personal transition BSS: a WPA2-classified
+result whose RSNE offers AKM 8 or 24 (`select_bss_with_ies`). For the PMK
 path the RSN element in `NL80211_ATTR_IE` must describe CCMP/PSK. Required
 PMF additionally needs the explicit default-false
 `WirelessNetIface::supports_wpa2_mfp_offload() -> bool` and `USE_MFP=1`;
