@@ -2622,8 +2622,10 @@ pub(crate) fn resched_remote_force(target_cpu: u32) {
 /// loads only this CPU's own gauges and counters. A due kick reads this CPU's
 /// staged entries under `try_lock`s — the tick cannot have interrupted a
 /// holder on its own CPU, since those locks mask interrupts — and then other
-/// CPUs' halted flags and states. A CPU with interrupts masked takes no tick
-/// and sends no kick; idle CPUs' own periodic passes cover that case.
+/// CPUs' halted flags and states. With tickless idle a halted CPU has no
+/// periodic tick of its own, so this kick is what starts its steal pass. A CPU
+/// with interrupts masked takes no tick and sends no kick; then only an idle
+/// CPU waking for some other reason reaches its staged wakes.
 pub(crate) fn kick_idle_balance_from_tick() {
     let cpu = narf_lib::percpu::current_cpu();
     if cpu >= narf_lib::percpu::MAX_CPUS || !wake_list_pending(cpu) {
@@ -7716,21 +7718,43 @@ fn try_steal_among(
 ) -> bool {
     let max = narf_lib::percpu::MAX_CPUS;
     let thief = crate::affinity::CpuId(cpu as u32);
-    let idle = |id| policy::cpu_state(id) == CpuState::Idle;
+    // Wakes staged on a victim (its wake inbox and woken parked tasks) are
+    // runnable work a thief may pull (`try_steal_staged`), so the policies'
+    // hints count them: a CPU holding staged wakes is not an idle CPU that
+    // will serve them itself — it may be stuck in executor maintenance with
+    // its state still `Idle` — and its queued load includes them, as
+    // `select_fork_cpu` counts them. Without this a policy that skips idle or
+    // empty-queued donors would never visit a stalled CPU whose only work is
+    // staged. Two gauge loads per hint; the pull itself re-checks everything.
+    let staged = |cpu: usize| {
+        WAKE_INBOX_LEN
+            .get(cpu)
+            .map_or(0, |len| len.load(Ordering::Acquire))
+            .saturating_add(
+                PARKED_WAKE_INBOX
+                    .get(cpu)
+                    .map_or(0, |inbox| inbox.len.load(Ordering::Acquire)),
+            )
+    };
+    let idle = |id: CpuId| policy::cpu_state(id) == CpuState::Idle && staged(id.0 as usize) == 0;
+    // The owner's dispatch scan republishes the peer hint from its ready
+    // queue alone and can clear it over a wake staged just after its drain.
     let runnable = |id: CpuId| {
         RUNNABLE_STATE
             .get(id.0 as usize)
             .is_some_and(|state| state.peer.load(Ordering::Acquire))
+            || staged(id.0 as usize) != 0
     };
     let node = |id: CpuId| narf_acpi::cpu_node(id.0);
     let queued = |id: CpuId| {
         // Two-choice policies sample only their candidates. No global scan or
         // new enqueue counter; locks are released before the policy visits.
-        READY
+        let ready = READY
             .get(id.0 as usize)?
             .try_lock()?
             .as_ref()
-            .map(|q| q.len())
+            .map(|q| q.len())?;
+        Some(ready.saturating_add(staged(id.0 as usize)))
     };
     let context = steal::StealContext::new(
         online,

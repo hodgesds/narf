@@ -918,9 +918,20 @@ pub struct TaskSpec {
     staged entries is unchanged, and a change starts over.
 
   A kicked CPU consumes `NEED_RESCHED` at its next halt commit, so one kick
-  buys two steal passes. A CPU with interrupts masked takes no tick and sends
-  no kick; there the bound is the idle CPUs' own periodic pass (the periodic
-  tick, or the 2 ms idle backstop).
+  buys two steal passes. With tickless idle a halted CPU takes no periodic
+  tick, so this kick is what starts its steal pass. A CPU with interrupts
+  masked takes no tick and sends no kick; there nothing bounds the wait but
+  an idle CPU waking for another reason (an interrupt, its own timer
+  deadline, a wake aimed at it) — the 2 ms idle recovery deadline that used to
+  bound it is gone (see the tickless-idle paragraph in §3).
+- **Steal policies see staged wakes.** The hints the core hands a
+  `StealStrategy` (`StealContext`) count them: a CPU with wakes staged is not
+  reported idle whatever its executor state, is reported as possibly having a
+  runnable peer, and its queued load is its ready queue plus its staged
+  entries. `LlcAwareSteal` and `Pick2Steal` skip idle, peer-less and
+  empty-queued donors, and a CPU stuck in executor maintenance reports `Idle`
+  with an empty ready queue, so without this they would not visit it. The
+  hints stay advisory; the pull applies every rule above.
 - Process-fork placement may take a non-blocking snapshot of every allowed,
   online run queue. Its load includes dispatchable queued slots, staged wake
   inbox entries, and the currently executing task. A contended queue is
