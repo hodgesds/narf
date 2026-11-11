@@ -4567,6 +4567,117 @@ fn smoke_rfkill_sysfs_surface() -> TestResult {
 }
 kernel_test_in!("drivers/platform/wmi1086", smoke_rfkill_sysfs_surface);
 
+static FX_INDEXED_SWITCH: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(usize, bool)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+fn fx_indexed_switch(idx: usize, blocked: bool) -> bool {
+    FX_INDEXED_SWITCH.lock().push((idx, blocked));
+    true
+}
+
+/// Poll a file future once.
+fn poll_once<T>(
+    mut future: narf_filesystem::FsFuture<'_, T>,
+) -> core::task::Poll<Result<T, narf_filesystem::FsError>> {
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    future.as_mut().poll(&mut cx)
+}
+
+/// `/dev/rfkill` as `net/rfkill/core.c` serves it: ADD per radio on open,
+/// CHANGE/DEL as states move, writes per index and per type, a hard block
+/// reported but never cleared from userspace, V1-sized reads, EINVAL for
+/// malformed writes, and an empty queue that does not complete a read.
+fn smoke_dev_rfkill_events_and_control() -> TestResult {
+    use crate::rfkill::{self, RadioType};
+    use crate::rfkill_dev::{encode, OP_ADD, OP_CHANGE, OP_CHANGE_ALL, OP_DEL, TYPE_ALL};
+    use core::task::Poll;
+    use narf_filesystem::{FileOps, FsError, POLL_IN};
+
+    rfkill::__test_reset();
+    FX_INDEXED_SWITCH.lock().clear();
+    let wlan = rfkill::register_radio_indexed("fx-phy0", RadioType::Wlan, fx_indexed_switch);
+    let bt = rfkill::register_radio("fx-bt", RadioType::Bluetooth, None);
+    let reader = rfkill::open_reader();
+    let next = |reader: &crate::rfkill_dev::RfkillFile| {
+        let mut buf = [0u8; 16];
+        match poll_once(reader.read(0, &mut buf)) {
+            Poll::Ready(Ok(n)) => Some(buf[..n].to_vec()),
+            _ => None,
+        }
+    };
+    let write = |reader: &crate::rfkill_dev::RfkillFile, event: &[u8]| match poll_once(
+        reader.write(0, event),
+    ) {
+        Poll::Ready(result) => result,
+        Poll::Pending => Err(FsError::Busy),
+    };
+    if next(&reader) != Some(encode(wlan as u32, 1, OP_ADD, false, false).to_vec())
+        || next(&reader) != Some(encode(bt as u32, 2, OP_ADD, false, false).to_vec())
+        || next(&reader).is_some()
+        || reader.poll_readiness() & POLL_IN != 0
+    {
+        return TestResult::Fail("open did not queue exactly one ADD per radio");
+    }
+    // CHANGE on the wlan radio drives its indexed switch and is reported.
+    if write(&reader, &encode(wlan as u32, 1, OP_CHANGE, true, false)) != Ok(9)
+        || *FX_INDEXED_SWITCH.lock() != [(wlan, true)]
+        || reader.poll_readiness() & POLL_IN == 0
+        || next(&reader) != Some(encode(wlan as u32, 1, OP_CHANGE, true, false).to_vec())
+    {
+        return TestResult::Fail("RFKILL_OP_CHANGE");
+    }
+    // A type mismatch changes nothing; CHANGE_ALL with TYPE_ALL unblocks
+    // the wlan radio and reports only what changed.
+    let _ = write(&reader, &encode(wlan as u32, 2, OP_CHANGE, false, false));
+    if next(&reader).is_some() {
+        return TestResult::Fail("CHANGE applied across radio types");
+    }
+    if write(&reader, &encode(0, TYPE_ALL, OP_CHANGE_ALL, false, false)) != Ok(9)
+        || next(&reader) != Some(encode(wlan as u32, 1, OP_CHANGE, false, false).to_vec())
+        || next(&reader).is_some()
+    {
+        return TestResult::Fail("RFKILL_OP_CHANGE_ALL");
+    }
+    // A hard block from the platform is reported (with its reason) and a
+    // userspace write cannot clear it.
+    rfkill::set_hard_block(bt, true);
+    let _ = write(&reader, &encode(bt as u32, 2, OP_CHANGE, false, false));
+    if next(&reader) != Some(encode(bt as u32, 2, OP_CHANGE, false, true).to_vec())
+        || !rfkill::radio_state(bt).is_some_and(|s| s.hard_blocked)
+    {
+        return TestResult::Fail("hard block not reported or cleared by userspace");
+    }
+    // Malformed writes.
+    if write(&reader, &encode(wlan as u32, 1, OP_ADD, true, false)) != Err(FsError::InvalidData)
+        || write(&reader, &[0; 6]) != Err(FsError::InvalidData)
+        || write(&reader, &encode(wlan as u32, 9, OP_CHANGE, true, false))
+            != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("malformed write accepted");
+    }
+    // An 8-byte (RFKILL_EVENT_SIZE_V1) read gets the V1 event.
+    rfkill::unregister_radio(wlan);
+    let mut v1 = [0u8; 8];
+    match poll_once(reader.read(0, &mut v1)) {
+        Poll::Ready(Ok(8)) if v1[..] == encode(wlan as u32, 1, OP_DEL, false, false)[..8] => {}
+        _ => return TestResult::Fail("DEL event, or the V1-sized read"),
+    }
+    // A later open sees only the live radio; the index is not reused.
+    let late = rfkill::open_reader();
+    let again = rfkill::register_radio_indexed("fx-phy1", RadioType::Wlan, fx_indexed_switch);
+    if next(&late) != Some(encode(bt as u32, 2, OP_ADD, false, true).to_vec())
+        || again == wlan
+        || next(&late) != Some(encode(again as u32, 1, OP_ADD, false, false).to_vec())
+    {
+        return TestResult::Fail("reader opened after DEL, or index reuse");
+    }
+    rfkill::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/platform/rfkill",
+    smoke_dev_rfkill_events_and_control
+);
+
 static FX_PROFILE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
 fn fx_profile_get() -> Option<crate::platform_profile::PlatformProfile> {

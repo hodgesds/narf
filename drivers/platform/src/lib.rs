@@ -99,6 +99,7 @@ pub mod wmi_core;
 /// airplane-mode key wired to actual radio state.
 #[cfg(target_arch = "x86_64")]
 pub mod rfkill;
+pub mod rfkill_dev;
 
 /// Vendor-neutral platform-profile surface:
 /// `/sys/firmware/acpi/platform_profile{,_choices}` with one
