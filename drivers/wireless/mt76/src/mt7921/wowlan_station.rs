@@ -28,7 +28,7 @@ impl<B: Backend> Session<B> {
         }
         // WoW offloads only the home link (mt76_connac_mcu_set_suspend_iter
         // would iterate a group vif too); an associated group link refuses.
-        if self.group_published() {
+        if self.group_published() || self.sched_scan_running() {
             return Err(Error::Busy);
         }
         let associated = matches!(self.state, State::Associated { .. }).then_some(self.state);

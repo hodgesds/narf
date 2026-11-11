@@ -120,6 +120,7 @@ impl<B: Backend> Session<B> {
         self.ap_keys.clear_active();
         self.wow_config = None;
         self.wow_nlo = None;
+        self.sched = None;
         self.station.wmm = None;
         self.station.wmm_pending = None;
         self.station.permission = None;

@@ -449,6 +449,40 @@ pub async fn stop_boot_monitor() -> Result<(), Error> {
         .stop_monitor()
         .await
 }
+/// Start a host scheduled scan on the retained idle station.
+pub async fn start_boot_sched_scan(config: &narf_wireless::NetDetectConfig) -> Result<(), Error> {
+    narf_wireless::reg::db::ensure_domain().map_err(|_| Error::Authority)?;
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .start_sched_scan(config)
+        .await
+}
+/// One bounded collection step of the running scheduled scan: a finished
+/// cycle's results, or `None` while it runs. `Busy` when the owner is
+/// taken; `Cancelled` when no scheduled scan runs any more.
+pub fn step_boot_sched_scan() -> Result<Option<ScanReport>, Error> {
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner.as_mut().ok_or(Error::DeviceGone)?.step_sched_scan()
+}
+pub async fn stop_boot_sched_scan() -> Result<(), Error> {
+    finish_boot_keys().await?;
+    let Some(mut owner) = BOOT_OWNER.try_lock() else {
+        return Err(Error::Busy);
+    };
+    owner
+        .as_mut()
+        .ok_or(Error::DeviceGone)?
+        .stop_sched_scan()
+        .await
+}
+
 pub fn step_boot_monitor() -> Result<MonitorCapture, Error> {
     let domain = narf_wireless::reg::db::get_domain().ok_or(Error::Authority)?;
     let Some(mut owner) = BOOT_OWNER.try_lock() else {
@@ -1897,6 +1931,8 @@ struct Session<B: Backend> {
     ap_keys: ap_crypto::Keys,
     wow_config: Option<narf_wireless::WowlanConfig>,
     wow_nlo: Option<Arc<scan::nlo::Plan>>,
+    /// The running host scheduled scan (NL80211_CMD_START_SCHED_SCAN).
+    sched: Option<scan::sched::Running>,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -1925,6 +1961,7 @@ impl<B: Backend> Session<B> {
             ap_keys: ap_crypto::Keys::default(),
             wow_config: None,
             wow_nlo: None,
+            sched: None,
         }
     }
     fn stage(&mut self, stage: Stage) {
