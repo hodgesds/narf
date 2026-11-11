@@ -2723,10 +2723,14 @@ impl<B: Backend> Session<B> {
     /// Advance recipient BA and declined requests under the retained control
     /// owner. Dropping this future cannot restore an associated producer.
     async fn service_control_in(&mut self, associated: State, restore: State) -> Result<(), Error> {
-        let switch_due = self
-            .station
-            .csa
-            .is_some_and(|(_, at)| self.backend.now_ns() >= at);
+        // A switch falls due only in the ordinary associated state: an
+        // associated scan restores its own state and retries afterwards.
+        let switch_due = matches!(restore, State::Associated { .. })
+            && self
+                .station
+                .csa
+                .is_some_and(|(_, at)| self.backend.now_ns() >= at);
+        let mut restore = restore;
         // While Channel Switch Mode 1 holds data, other control work waits
         // for the switch: nothing may be sent on the old channel.
         if self.station.csa_block_tx && !switch_due {
@@ -2759,7 +2763,21 @@ impl<B: Backend> Session<B> {
         self.boot_started = Some(self.backend.now_ns());
         let result = async {
             if switch_due {
-                self.service_channel_switch(info).await?;
+                if let Some(channel) = self.service_channel_switch(info, associated).await? {
+                    // The state restored after the control work is the
+                    // association on its new channel.
+                    if let State::Associated {
+                        info, peer, aid, ..
+                    } = restore
+                    {
+                        restore = State::Associated {
+                            info,
+                            peer,
+                            channel,
+                            aid,
+                        };
+                    }
+                }
             }
             self.service_regulatory(info).await?;
             self.service_wmm_update().await?;
@@ -2843,21 +2861,22 @@ impl<B: Backend> Session<B> {
     /// per-beacon checks built on them are dropped. A switch the policy or
     /// the band does not allow ends the link, as mac80211 does when it
     /// cannot follow (`ieee80211_sta_connection_lost`).
-    async fn service_channel_switch(&mut self, info: super::RadioInfo) -> Result<(), Error> {
+    async fn service_channel_switch(
+        &mut self,
+        info: super::RadioInfo,
+        associated: State,
+    ) -> Result<Option<u8>, Error> {
         let Some((switch, _)) = self.station.csa.take() else {
-            return Ok(());
+            return Ok(None);
         };
         self.station.csa_block_tx = false;
-        let State::Associated {
-            peer, channel, aid, ..
-        } = self.state
-        else {
+        let State::Associated { channel, .. } = associated else {
             return Err(Error::Busy);
         };
         let (Some(old), Some(mut bss)) = (self.station.permission, self.station.bss.clone()) else {
             return Err(Error::Authority);
         };
-        let leave = |session: &mut Self| -> Result<(), Error> {
+        let leave = |session: &mut Self| -> Result<Option<u8>, Error> {
             session.station.peer_lost = true;
             session.station.rx_ba.fence();
             session.station.tx_ba.fence();
@@ -2868,7 +2887,7 @@ impl<B: Backend> Session<B> {
             && !crate::mt7921::association::is_six_ghz(&bss);
         if !same_band || switch.channel == channel {
             return if switch.channel == channel {
-                Ok(())
+                Ok(None)
             } else {
                 leave(self)
             };
@@ -2890,13 +2909,7 @@ impl<B: Backend> Session<B> {
         self.clear_aggregate_receive();
         self.reconfigure_station_channel(info, switch.channel, new, 1)
             .await?;
-        self.state = State::Associated {
-            info,
-            peer,
-            channel: switch.channel,
-            aid,
-        };
-        Ok(())
+        Ok(Some(switch.channel))
     }
 
     /// The installed regulatory policy is no longer the one this station's
