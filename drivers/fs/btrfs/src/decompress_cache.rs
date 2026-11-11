@@ -44,7 +44,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -208,6 +208,7 @@ pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<
     {
         return;
     }
+    register_shrinker();
     let mut cache = CACHE.lock();
     if cache.epochs.get(&vol.key).copied().unwrap_or(0) != epoch_at_read {
         return;
@@ -289,6 +290,60 @@ pub fn invalidate(vol: VolKey, logical: u64, len: usize) {
             cache.bytes -= charge(&entry.plain);
         }
     }
+}
+
+static SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Let reclaim shrink the cache under memory pressure. Linux keeps
+/// decompressed and verified file data in the page cache, which page reclaim
+/// shrinks; this cache stands in for it and gives memory back the same way.
+fn register_shrinker() {
+    if !SHRINKER_REGISTERED.swap(true, Ordering::AcqRel) {
+        narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+            name: "btrfs-extent-data",
+            count: shrinker_count,
+            scan: shrinker_scan,
+        });
+    }
+}
+
+/// Shrinker `count`: base pages the cache holds. Allocation-free.
+fn shrinker_count() -> usize {
+    CACHE.lock().bytes / crate::cache_budget::PAGE
+}
+
+/// Shrinker `scan`: evict least recently used entries worth at most `nr`
+/// base pages, never reporting more. Allocation-free; the lock is taken
+/// per eviction and each entry is freed outside it.
+fn shrinker_scan(nr: usize) -> usize {
+    (shrink_bytes(nr.saturating_mul(crate::cache_budget::PAGE))) / crate::cache_budget::PAGE
+}
+
+/// Evict least recently used entries worth at most `max_bytes`; returns the
+/// bytes evicted.
+fn shrink_bytes(max_bytes: usize) -> usize {
+    let mut freed = 0usize;
+    loop {
+        let victim = {
+            let mut cache = CACHE.lock();
+            let Some((key, size)) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_use)
+                .map(|(k, e)| (*k, charge(&e.plain)))
+            else {
+                break;
+            };
+            if freed + size > max_bytes {
+                break;
+            }
+            cache.bytes -= size;
+            freed += size;
+            cache.entries.remove(&key)
+        };
+        drop(victim);
+    }
+    freed
 }
 
 /// `(hits, misses)` since boot.

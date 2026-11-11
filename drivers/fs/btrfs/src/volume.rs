@@ -207,7 +207,6 @@ impl NodeCache {
     }
 
     /// Bytes both generations hold.
-    #[cfg(feature = "kernel-test")]
     fn bytes(&self) -> usize {
         self.young_bytes + self.old_bytes
     }
@@ -265,6 +264,40 @@ impl NodeCache {
         }
     }
 
+    /// Give back at most `max_bytes` (the shrinker's share): the old
+    /// generation first, whose nodes nothing has used since the last
+    /// turn-over, then the young one. Returns the bytes released.
+    ///
+    /// Allocation-free. Dropping an entry does not move the epoch: what is
+    /// left is still current, and a fill in flight may still publish.
+    fn shrink(&mut self, max_bytes: usize) -> usize {
+        let mut freed = 0;
+        for young in [false, true] {
+            loop {
+                let map = if young {
+                    &mut self.young
+                } else {
+                    &mut self.old
+                };
+                let Some(entry) = map.first_entry() else {
+                    break;
+                };
+                let charge = node_charge(entry.get());
+                if freed + charge > max_bytes {
+                    return freed;
+                }
+                drop(entry.remove());
+                if young {
+                    self.young_bytes -= charge;
+                } else {
+                    self.old_bytes -= charge;
+                }
+                freed += charge;
+            }
+        }
+        freed
+    }
+
     /// Addresses of the cached nodes in `[from, end)`.
     fn cached_in(&self, from: u64, end: u64) -> alloc::vec::Vec<u64> {
         self.young
@@ -301,6 +334,59 @@ impl NodeCache {
             cache.get(last).is_none() && cache.get(hot).is_none() && cache.epoch == 1
         }
     }
+}
+
+/// Every mounted filesystem's node cache, for the shrinker.
+static NODE_CACHES: IrqSafeSpinLock<Vec<Weak<IrqSafeSpinLock<NodeCache>>>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+static NODE_SHRINKER_REGISTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Let reclaim shrink `cache` under memory pressure, as Linux's btree inode
+/// hands its extent buffers' pages to page reclaim
+/// (`btree_release_folio`). One shrinker covers every filesystem; caches of
+/// unmounted filesystems are dropped from the list here.
+fn register_node_cache(cache: &Arc<IrqSafeSpinLock<NodeCache>>) {
+    {
+        let mut caches = NODE_CACHES.lock();
+        caches.retain(|cache| cache.strong_count() != 0);
+        caches.push(Arc::downgrade(cache));
+    }
+    if !NODE_SHRINKER_REGISTERED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+            name: "btrfs-nodes",
+            count: node_shrinker_count,
+            scan: node_shrinker_scan,
+        });
+    }
+}
+
+/// Shrinker `count`: base pages the node caches hold. Allocation-free.
+fn node_shrinker_count() -> usize {
+    let caches = NODE_CACHES.lock();
+    let bytes = caches
+        .iter()
+        .filter_map(Weak::upgrade)
+        .fold(0usize, |sum, cache| {
+            sum.saturating_add(cache.lock().bytes())
+        });
+    bytes / crate::cache_budget::PAGE
+}
+
+/// Shrinker `scan`: release at most `nr` base pages of cached nodes, never
+/// reporting more. Allocation-free.
+fn node_shrinker_scan(nr: usize) -> usize {
+    let max = nr.saturating_mul(crate::cache_budget::PAGE);
+    let mut freed = 0usize;
+    let caches = NODE_CACHES.lock();
+    for cache in caches.iter().filter_map(Weak::upgrade) {
+        if freed >= max {
+            break;
+        }
+        freed += cache.lock().shrink(max - freed);
+    }
+    freed / crate::cache_budget::PAGE
 }
 
 /// Test-only: [`NodeCache::__test_keeps_what_is_used`].
@@ -911,7 +997,7 @@ pub struct VolCore<B: BlockDevice> {
     /// from its root. Every miss costs an (emulated) device read plus a
     /// full-node checksum verification, and both are pure repetition for a
     /// block nothing has written since.
-    nodes: IrqSafeSpinLock<NodeCache>,
+    nodes: Arc<IrqSafeSpinLock<NodeCache>>,
     /// Set when a transaction was lost after its operations had already
     /// reported success. See [`Self::abort_transaction`].
     aborted: core::sync::atomic::AtomicBool,
@@ -2260,6 +2346,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let seed = ChunkMap::seed_from_sys_array(&superblock.sys_chunk_array)?;
         seed.map_logical(superblock.chunk_root)?;
 
+        let node_cache = Arc::new(IrqSafeSpinLock::new(NodeCache::new(node_cache_budget())));
+        register_node_cache(&node_cache);
         let core = Arc::new(VolCore {
             mmap_anchors: IrqSafeSpinLock::new(BTreeMap::new()),
             orphans: IrqSafeSpinLock::new(BTreeSet::new()),
@@ -2290,7 +2378,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             reader_roots: IrqSafeSpinLock::new(BTreeMap::new()),
             reader_epochs: IrqSafeSpinLock::new(ReaderEpochs::default()),
             evictions: core::sync::atomic::AtomicU64::new(0),
-            nodes: IrqSafeSpinLock::new(NodeCache::new(node_cache_budget())),
+            nodes: node_cache,
             aborted: core::sync::atomic::AtomicBool::new(false),
             refused_after_abort: core::sync::atomic::AtomicU64::new(0),
             quota_override: core::sync::atomic::AtomicBool::new(false),
