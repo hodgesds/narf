@@ -250,3 +250,38 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_node_cache_keeps_what_is_used
 );
+
+/// The eight-bytes-a-step CRC32C equals the byte-at-a-time definition for
+/// every length and alignment around its word size and for whole tree
+/// blocks, and matches the standard check value.
+fn smoke_btrfs_crc32c_sliced_matches_bytewise() -> TestResult {
+    use crate::checksum::{__test_crc32c_bytewise, crc32c};
+    // CRC-32C("123456789") = 0xE3069283 (RFC 3720 appendix B.4).
+    if !crc32c(!0, b"123456789") != 0xE306_9283 {
+        return TestResult::Fail("crc32c: wrong check value");
+    }
+    let mut data = alloc::vec![0u8; 16384 + 64];
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    for b in data.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+    for start in 0..9 {
+        for len in (0..80).chain([4096 - 32, 4096, 16384 - 32, 16384]) {
+            let slice = &data[start..start + len];
+            for seed in [0u32, !0, 0x1234_5678] {
+                if crc32c(seed, slice) != __test_crc32c_bytewise(seed, slice) {
+                    return TestResult::Fail("crc32c: sliced and bytewise results differ");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_crc32c_sliced_matches_bytewise
+);
