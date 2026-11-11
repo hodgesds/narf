@@ -3887,6 +3887,11 @@ fn pump_send_queued_once(
     egress: &CachedEgress,
     driver: &dyn crate::txq::TxBackpressure,
 ) {
+    // Segments the device refused during this call. One immediate re-offer
+    // is allowed, for a wake that raced the refusal; after that the sender
+    // parks whatever the queue's flag says and is resumed by the wake pass
+    // or the probe timer. It never re-offers in a loop.
+    let mut refusals = 0u32;
     loop {
         let marked = {
             let mut t = arc.lock();
@@ -3942,6 +3947,32 @@ fn pump_send_queued_once(
                     }
                     return;
                 }
+            }
+            // Ask the queue before building anything: a frame offered to a
+            // stopped queue costs a payload copy, a frame build and the
+            // packet taps, and then is not sent (Linux tests
+            // `netif_xmit_frozen_or_stopped` before `dev_hard_start_xmit`).
+            // A connection that has already waited a probe interval first
+            // checks that its queue still is the driver's: `ethtool -G/-L`
+            // replaces the queue objects, and a flag nobody clears any more
+            // would park it for good.
+            let stopped = match t.tx_bind.as_ref() {
+                Some(bind) if bind.account.queue().is_stopped() => {
+                    if t.tx_wait_since_cycles != 0 && !binding_current(driver, bind) {
+                        None
+                    } else {
+                        Some(bind.account.queue().wait(&bind.account))
+                    }
+                }
+                _ => Some(false),
+            };
+            match stopped {
+                None => t.tx_bind = None,
+                Some(true) => {
+                    tx_park(&mut t);
+                    return;
+                }
+                Some(false) => {}
             }
             let (seq, payload) = if fin_only {
                 (t.fin_seq, Vec::new())
@@ -4000,25 +4031,61 @@ fn pump_send_queued_once(
         if sent == Err(TxRefusal::Busy) {
             let mut t = arc.lock();
             unsend(&mut t, &marked);
+            refusals += 1;
+            // The queue the driver refused on is not the one this
+            // connection is bound to (replaced by a resize): drop the
+            // binding, so the next offer selects a queue again, and park.
+            if t.tx_bind
+                .as_ref()
+                .is_some_and(|bind| !binding_current(driver, bind))
+            {
+                t.tx_bind = None;
+            }
             // Listed on the queue before its stopped flag is read: a wake
             // that ran in between shows here as "not stopped" and the
-            // segment is simply offered again.
+            // segment is offered once more.
             let still_stopped = t
                 .tx_bind
                 .as_ref()
                 .is_none_or(|bind| bind.account.queue().wait(&bind.account));
-            if still_stopped {
-                if t.tx_wait_since_cycles == 0 {
-                    t.tx_wait_since_cycles = narf_scheduler::narf_time::now_cycles().max(1);
-                }
+            if still_stopped || refusals > 1 {
+                tx_park(&mut t);
                 return;
             }
             continue;
+        }
+        if sent == Err(TxRefusal::Dropped) {
+            // A queue index the driver no longer has is dropped every time:
+            // re-select instead of sending the rest of the stream into it.
+            let mut t = arc.lock();
+            if t.tx_bind
+                .as_ref()
+                .is_some_and(|bind| !binding_current(driver, bind))
+            {
+                t.tx_bind = None;
+            }
         }
         if marked.fin {
             return;
         }
     }
+}
+
+/// The sender stops for its device queue: the wake pass resumes it, or
+/// `tick_tx_wait` after the probe interval.
+fn tx_park(t: &mut Tcb) {
+    if t.tx_wait_since_cycles == 0 {
+        t.tx_wait_since_cycles = narf_scheduler::narf_time::now_cycles().max(1);
+    }
+}
+
+/// Whether `bind` still names the queue object the driver uses for that
+/// index. Slow path only: asked after a refusal, a drop, or a probe interval
+/// spent waiting.
+fn binding_current(driver: &dyn crate::txq::TxBackpressure, bind: &TxBinding) -> bool {
+    driver
+        .tx_queue(bind.queue)
+        .is_some_and(|queue| Arc::ptr_eq(&queue, bind.account.queue()))
 }
 
 /// Undo `pump_send_queued_once`'s mark for a segment the device refused.
