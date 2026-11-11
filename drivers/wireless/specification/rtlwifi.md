@@ -3361,10 +3361,22 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   periodical decision (shared `btcoex` matrix) and the DM primitives
   (`hal_bt_coexist.c`); the 1-ant / 2-ant mechanism trees live in `dm.rs`
   (#1470: `run_mechanism`, 2-ant dispatch, `set_bt_dm`, `_8723a` all-off).
-  Remainder: the RF halves — the RF half of `agc_table` and the
-  LPF-corner RF write (`RF90_PATH_A`) — are flagged (`agc_rf_pending` /
-  `lpf_rf_pending`), not silently dropped, pending an `rf.rs` RF-write
-  API; the 1-ant path is a Linux stub, ported as a no-op.
+  The RF halves are programmed through the shared `rtl8723com` LSSI
+  writer (`rtl8723be::phy::rf_serial_write` = `rtl8723_phy_rf_serial_write`;
+  every coex RF write is full-mask, so `rtl8723e_phy_set_rf_reg` reduces
+  to it): `agc_table` writes its five dwords through the single `0xc78`
+  port (as Linux; an earlier port wrote `0xc78..0xc88`) and then
+  `RF_RX_AGC_HP` x4 / `RF_RX_G1` on `RF90_PATH_A`; `mech_init` (now
+  async) reads the `RF_RCK1` / `RF_RCK2[7:4]` origins with
+  `rtl8723be::phy::get_rf` (`rtl8723e_dm_init_bt_coexist`); the LPF
+  corner (`rtl8723e_dm_bt_set_sw_rf_rx_lpf_corner`) writes RF `0x1e =
+  0xf0ff7` on shrink and restores the captured origin on resume.
+  Deliberate deviation: resume before the first init (Linux would write
+  the zero-initialised origin) is skipped. Tests
+  `smoke_rtl8723ae_coex_dm_registers`, `smoke_rtl8723ae_dm_mech_init_and_query`,
+  `smoke_rtl8723ae_dm_all_off_sequences` (written, unexecuted). The
+  1-ant path is a Linux stub, ported as a no-op. The coex owner is still
+  unreachable from probe (chip not admitted).
 - `envelope` — signed per-board NAPC power envelopes, 2.4 GHz only
   (#1458): `Calibration::permission_for` mints the `Permission` the
   packet owner transmits under (v1/v2 rows, CCK/OFDM/HT 1SS curves,

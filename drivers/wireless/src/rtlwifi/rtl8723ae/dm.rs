@@ -18,6 +18,8 @@
 //! | Linux source | NARF item |
 //! |---|---|
 //! | `rtl8723e_dm_bt_coexist_8723` (:1613) | [`Owner::run_mechanism`] |
+//! | `rtl8723e_dm_init_bt_coexist` (`dm.c:795`, incl. the `RF_RCK1`/`RF_RCK2` origin reads) | [`Owner::mech_init`] |
+//! | `rtl8723e_dm_bt_set_sw_rf_rx_lpf_corner` (:178, `RF90_PATH_A` `0x1e`) | [`Owner::set_sw_rf_rx_lpf_corner`] |
 //! | `rtl8723e_dm_bt_query_bt_information` (:1506) | [`Owner::query_bt_information`] (H2C `0x38`) |
 //! | `rtl8723e_dm_bt_bt_hw_counters_monitor` (:1521) | [`Owner::counters_monitor`] (`0x770`/`0x774`) |
 //! | `rtl8723e_dm_bt_bt_enable_disable_check` (:1560) | [`Owner::enable_disable_check`] |
@@ -35,13 +37,6 @@
 //!
 //! ## Deliberately NOT ported here
 //!
-//! - The RF half of the mechanism: `set_sw_rf_rx_lpf_corner`
-//!   (`RF90_PATH_A` `0x1e` via `phy_set_rf_reg`) and the RF origin reads
-//!   in the watchdog init. NARF `rf.rs` exposes no RF-write API, so the
-//!   mechanism records [`Owner::lpf_rf_pending`] instead of silently
-//!   dropping the step, exactly like the pass-1 owner's
-//!   `agc_rf_pending`. Both the shrink and the resume path set the flag:
-//!   either way an RF write is owed.
 //! - The watchdog's outer gate (`rfpwr_state == ERFON`, firmware awake,
 //!   no RF change in progress, `dm.c:787`): the caller enforces it —
 //!   the owner carries no firmware power state — and the counter-enable
@@ -68,6 +63,15 @@
 
 use super::coex::{state, Error, Owner, WifiTraffic};
 use crate::rtlwifi::firmware_transport::Io;
+use crate::rtlwifi::rtl8723be::phy::{get_rf, rf_serial_write, Path as RfPath, RFREG_OFFSET_MASK};
+
+/// `reg.h::RF_RCK1` — the RX LPF corner register.
+pub const RF_RCK1: u32 = 0x1e;
+/// `reg.h::RF_RCK2`.
+pub const RF_RCK2: u32 = 0x1f;
+/// `hal_btc.c::rtl8723e_dm_bt_set_sw_rf_rx_lpf_corner` shrink value
+/// (`0x1e[7:4] = 1111 ==> [11:4]`).
+pub const RF_LPF_SHRINK: u32 = 0xf0ff7;
 
 /// High-priority BT TX/RX counters (`hal_bt_coexist.h:16`).
 pub const REG_HIGH_PRIORITY_TXRX: u16 = 0x0770;
@@ -196,7 +200,7 @@ pub struct Btdm {
     pub b2_ant_hid_en: bool,
     /// Low-penalty TX rate adaptation.
     pub low_penalty_rate_adaptive: bool,
-    /// RF RX LPF corner shrunk (RF write — see `lpf_rf_pending`).
+    /// RF RX LPF corner shrunk (`RF90_PATH_A` `0x1e`).
     pub rf_rx_lpf_shrink: bool,
     /// Reject aggregated packets (Linux stub — always a no-op).
     pub reject_aggre_pkt: bool,
@@ -325,16 +329,18 @@ pub struct RunOutcome {
 impl Owner {
     /// Watchdog init (`rtl8723e_dm_init_bt_coexist`, `dm.c`): zeroes the
     /// coexistence state, enables the counter statistics (`0x76e =
-    /// 0x04`, `0x778 = 0x03`) and PTA (`0x40 = 0x20`). The RF origin
-    /// reads (`bt_rfreg_origin_1e`/`1f` via `rtl_get_rfreg`) have no NARF
-    /// RF API, so [`Owner::lpf_rf_pending`] is set instead. Idempotent
-    /// via `mech_init_set`. Note the state zeroing mirrors Linux's
+    /// 0x04`, `0x778 = 0x03`) and PTA (`0x40 = 0x20`). It first reads the
+    /// RF origins exactly as Linux (`rtl_get_rfreg`: `RF_RCK1` mask
+    /// `0xfffff` into [`Owner::rf_origin_1e`], `RF_RCK2` mask `0xf0`
+    /// into [`Owner::rf_origin_1f`]). Idempotent via `mech_init_set`. Note the state zeroing mirrors Linux's
     /// first-watchdog behavior even though `bind` starts from
     /// `BT_IDLE`: the first mechanism run restarts from zero.
-    pub fn mech_init<I: Io>(&mut self, io: &I) -> Result<(), Error> {
+    pub async fn mech_init<I: Io>(&mut self, io: &I) -> Result<(), Error> {
         if self.mech_init_set {
             return Ok(());
         }
+        self.rf_origin_1e = Some(get_rf(io, RfPath::A, RF_RCK1, RFREG_OFFSET_MASK).await?);
+        self.rf_origin_1f = Some(get_rf(io, RfPath::A, RF_RCK2, 0xf0).await?);
         self.cstate = 0;
         self.prev_cstate = 0;
         self.cstate_h = 0;
@@ -343,7 +349,6 @@ impl Owner {
         io.write8(REG_COUNTER_76E, 0x04)?;
         io.write8(REG_COUNTER_778, 0x03)?;
         io.write8(REG_PTA_MODE, PTA_ON)?;
-        self.lpf_rf_pending = true;
         self.mech_init_set = true;
         Ok(())
     }
@@ -368,7 +373,7 @@ impl Owner {
             });
         }
         if !self.mech_init_set {
-            self.mech_init(io)?;
+            self.mech_init(io).await?;
         }
         self.query_bt_information(io).await?;
         self.counters_monitor(io)?;
@@ -780,7 +785,7 @@ impl Owner {
     /// the saved setting (identical → no writes at all), then the hold
     /// gate (ignore WLAN_ACT only), then the all-off gate (combined
     /// sequences only), then the apply order — reject stub, rate-adapt
-    /// penalty, RF LPF corner (flagged, not written), AGC table, BB
+    /// penalty, RF LPF corner, AGC table, BB
     /// back-off, retry index, DAC-swing level, WLAN_ACT, coex table,
     /// PTA mode, the exclusive 2-ant-HID / TDMA / PS-TDMA / none
     /// branch, the 30 ms settle, SW DAC swing, BT power decrease.
@@ -799,7 +804,7 @@ impl Owner {
         }
         self.reject_ap_aggregated_packet(btdm.reject_aggre_pkt);
         self.set_penalty_tx_rate_adapt(io, btdm.low_penalty_rate_adaptive)?;
-        self.set_sw_rf_rx_lpf_corner(btdm.rf_rx_lpf_shrink);
+        self.set_sw_rf_rx_lpf_corner(io, btdm.rf_rx_lpf_shrink)?;
         if btdm.agc_table_en {
             self.agc_table(io, true)?;
         } else {
@@ -938,15 +943,24 @@ impl Owner {
     }
 
     /// `rtl8723e_dm_bt_set_sw_rf_rx_lpf_corner` (`hal_btc.c:178`):
-    /// shrink writes `RF90_PATH_A` `0x1e` (`0xf0ff7`); resume restores
-    /// the origin value. Both are RF writes with no NARF API, so this
-    /// records [`Owner::lpf_rf_pending`] and writes nothing. Shrink
-    /// clears the SW all-off wrapper flag, as in Linux.
-    pub fn set_sw_rf_rx_lpf_corner(&mut self, shrink: bool) {
-        self.lpf_rf_pending = true;
+    /// shrink writes `RF90_PATH_A` `0x1e = 0xf0ff7`; resume restores
+    /// [`Owner::rf_origin_1e`]. Both go through
+    /// `rtl8723_phy_rf_serial_write` (full mask). Shrink clears the SW
+    /// all-off wrapper flag, as in Linux.
+    ///
+    /// Deliberate deviation: Linux resumes with whatever
+    /// `bt_rfreg_origin_1e` holds, which is zero when an IPS all-off
+    /// runs before the first watchdog init. NARF skips the resume write
+    /// until [`Owner::mech_init`] captured the origin rather than
+    /// clobbering the RF RCK1 value with zero.
+    pub fn set_sw_rf_rx_lpf_corner<I: Io>(&mut self, io: &I, shrink: bool) -> Result<(), Error> {
         if shrink {
+            rf_serial_write(io, RfPath::A, RF_RCK1, RF_LPF_SHRINK)?;
             self.sw_all_off = false;
+        } else if let Some(origin) = self.rf_origin_1e {
+            rf_serial_write(io, RfPath::A, RF_RCK1, origin)?;
         }
+        Ok(())
     }
 
     /// `dm_bt_set_sw_penalty_tx_rate_adapt` (`hal_btc.c:199`):
@@ -1171,13 +1185,13 @@ impl Owner {
 
     /// `rtl8723e_dm_bt_sw_coex_all_off_8723a` (`hal_btc.c:1495`):
     /// AGC off, BB back-off off, reject stub (no-op), rate-adapt
-    /// normal, RF LPF resume (flagged, not written), SW DAC swing off.
+    /// normal, RF LPF resume, SW DAC swing off.
     pub fn all_off_sw<I: Io>(&mut self, io: &I) -> Result<(), Error> {
         self.agc_table(io, false)?;
         self.bb_back_off(io, false)?;
         self.reject_ap_aggregated_packet(false);
         self.set_penalty_tx_rate_adapt(io, false)?;
-        self.set_sw_rf_rx_lpf_corner(false);
+        self.set_sw_rf_rx_lpf_corner(io, false)?;
         self.set_sw_full_time_dac_swing(io, false, SW_DAC_SWING_OFF_LVL)?;
         Ok(())
     }
