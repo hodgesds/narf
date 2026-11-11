@@ -2528,12 +2528,12 @@ impl VirtioNetPci {
 
     /// Notify peers of our MAC location (Linux `netdev_notify_peers`):
     /// gratuitous ARP for the interface's primary IPv4 address, via
-    /// the stack's existing `send_gratuitous_arp` surface. No-op when
-    /// the controller has no registered name or no IPv4 address.
-    /// IPv6 unsolicited NA has no stack emit surface yet — the
-    /// builder exists (`ndp::build_na`) but nothing transmits an
-    /// ICMPv6 packet on an interface — so the IPv6 half is a filed
-    /// remainder (issue #1536), not invented here.
+    /// the stack's existing `send_gratuitous_arp` surface, plus one
+    /// unsolicited Neighbor Advertisement per usable IPv6 address
+    /// (RFC 4861 §7.2.6), via the stack's `send_unsolicited_na`
+    /// surface (#1536). No-op when the controller has no registered
+    /// name; each half independently sends nothing when the
+    /// interface has no address of that family.
     fn notify_peers(&self) {
         let name = match self.ifname.lock().as_deref() {
             Some(n) => alloc::string::String::from(n),
@@ -2542,12 +2542,13 @@ impl VirtioNetPci {
         if let Some(addr) = narf_net::ifaddr::iface_primary_addr(&name) {
             narf_net::arp_cache::send_gratuitous_arp(&name, addr.addr.0);
         }
+        let _ = narf_net::ipv6_stack::send_unsolicited_na(&name);
     }
 
     /// Config-change event handler — the config-change watcher's
     /// per-fire action: if the device raised
-    /// `VIRTIO_NET_S_ANNOUNCE`, notify peers (gratuitous ARP) and
-    /// ack the announce, then republish link metadata. Order mirrors
+    /// `VIRTIO_NET_S_ANNOUNCE`, notify peers (gratuitous ARP +
+    /// unsolicited NA) and ack the announce, then republish link
     /// Linux `virtnet_config_changed_work`: peers first, ack second,
     /// link state last. The ack is best-effort: a refused ack leaves
     /// S_ANNOUNCE set, so the next config-change fire retries; the
@@ -4079,7 +4080,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     // interrupts to `msix_config` exclusively, so the vector itself
     // is the discriminator — no ISR read needed, matching Linux's
     // `vp_config_changed`). Each fire runs `handle_config_change`:
-    // announce (gratuitous ARP + ANNOUNCE_ACK) when the device
+    // announce (gratuitous ARP + unsolicited NA + ANNOUNCE_ACK) when the device
     // raised S_ANNOUNCE, then a link-metadata republish from live
     // STATUS; both are idempotent, so a spurious fire is harmless.
     // No vector (table exhausted at probe) → no watcher; link state
@@ -6430,5 +6431,189 @@ mod tx_tests {
     kernel_test_in!(
         "drivers/virtio/net-pci",
         smoke_virtio_net_announce_handle_config_change
+    );
+
+    // TX-capture cell for the announce test below: the fixture
+    // registers the interface with this send fn, so every frame
+    // `notify_peers` emits lands here instead of a device.
+    static ANNOUNCE_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
+
+    fn announce_capture(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+        ANNOUNCE_TX.lock().push(frame.to_vec());
+        Ok(())
+    }
+
+    /// `notify_peers` via `handle_config_change` (gap 13, IPv6 half):
+    /// with S_ANNOUNCE raised, a registered name, a primary IPv4
+    /// address and usable IPv6 addresses, the announce emits the
+    /// gratuitous ARP AND one unsolicited NA per usable IPv6 address
+    /// (Solicited clear, Override set, dst ff02::1, target == src,
+    /// TLLA option == our MAC), then the link republish still runs.
+    /// A Tentative address gets no NA. Registry state is removed
+    /// afterwards so the shared registries are left clean.
+    fn smoke_virtio_net_announce_notify_peers_na() -> TestResult {
+        const IFACE: &str = "vnet-na-1535";
+        const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x53];
+        const V4: [u8; 4] = [192, 168, 7, 5];
+        const GLOBAL: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        const TENTATIVE: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ];
+        const ALL_NODES: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let ll = narf_net::ipv6::addrs::link_local_from_mac(MAC);
+
+        let run = || -> Result<(), &'static str> {
+            use narf_net::ipv6::addrs::{AddrScope, AddrState, Ipv6IfAddr};
+            use narf_net::pkt_ipv6::{NA_FLAG_OVERRIDE, NA_FLAG_SOLICITED};
+
+            let mut fx = TxFixture::new()?;
+            let page = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "cfg page")?;
+            let region = VirtioRegion {
+                region: narf_bus::MmioRegion {
+                    phys: page.phys_addr(),
+                    virt: page.cpu_ptr::<u8>() as u64,
+                    len: 4096,
+                    kind: narf_bus::BarKind::Mmio32 {
+                        prefetchable: false,
+                    },
+                },
+                virt: page.cpu_ptr::<u8>() as u64,
+                offset: 0,
+                length: 4096,
+            };
+            fx.dev.device_cfg = Some(region);
+            fx.dev.has_status = true;
+            fx.dev.has_guest_announce = true;
+
+            // Register the fixture interface with the capture send fn
+            // and give it one IPv4 + two usable IPv6 addresses, plus
+            // a Tentative one that must not be announced.
+            let registered = narf_net::iface::register(IFACE, MAC, announce_capture);
+            if registered != IFACE {
+                return Err("announce iface registered under a different name");
+            }
+            narf_net::ifaddr::iface_add_addr(IFACE, narf_net::ipv4::Ipv4Addr(V4), 24);
+            for (addr, state, scope) in [
+                (ll, AddrState::Preferred, AddrScope::LinkLocal),
+                (GLOBAL, AddrState::Preferred, AddrScope::Global),
+                (TENTATIVE, AddrState::Tentative, AddrScope::Global),
+            ] {
+                narf_net::ipv6::addrs::add(Ipv6IfAddr {
+                    iface: alloc::string::String::from(IFACE),
+                    addr,
+                    prefix_len: 64,
+                    state,
+                    scope,
+                    preferred_deadline_ns: u64::MAX,
+                    valid_deadline_ns: u64::MAX,
+                    temporary: false,
+                });
+            }
+            fx.dev.set_ifname(alloc::string::String::from(IFACE));
+
+            // SAFETY: CFG_STATUS lies within the coherent page owned by
+            // this fixture, which stays live through handle_config_change.
+            unsafe {
+                fx.dev
+                    .device_cfg
+                    .as_ref()
+                    .ok_or("no device_cfg")?
+                    .write16(CFG_STATUS, VIRTIO_NET_S_LINK_UP | VIRTIO_NET_S_ANNOUNCE);
+            }
+            ANNOUNCE_TX.lock().clear();
+            fx.dev.handle_config_change();
+            if !fx.dev.link_up() {
+                return Err("link did not read up after announce handle");
+            }
+
+            let frames = {
+                let mut g = ANNOUNCE_TX.lock();
+                let out = g.clone();
+                g.clear();
+                out
+            };
+            if frames.len() != 3 {
+                return Err("announce did not emit exactly ARP + 2 NAs");
+            }
+            let mut saw_arp = false;
+            let mut na_srcs: [bool; 2] = [false, false];
+            for frame in &frames {
+                if frame.len() < 14 {
+                    return Err("announce emitted a runt frame");
+                }
+                let ethertype = [frame[12], frame[13]];
+                if ethertype == [0x08, 0x06] {
+                    // Gratuitous ARP: SPA == TPA == our IPv4 address.
+                    if frame.len() < 42 || frame[28..32] != V4 || frame[38..42] != V4 {
+                        return Err("gratuitous ARP SPA/TPA != our IPv4 address");
+                    }
+                    if saw_arp {
+                        return Err("announce emitted two gratuitous ARPs");
+                    }
+                    saw_arp = true;
+                } else if ethertype == [0x86, 0xdd] {
+                    // Unsolicited NA: IPv6/ICMPv6 (58), type 136,
+                    // code 0, Solicited clear, Override set, dst
+                    // ff02::1, target == src, TLLA option == our MAC.
+                    if frame.len() < 86 || frame[20] != 58 {
+                        return Err("unsolicited NA is not ICMPv6 or is truncated");
+                    }
+                    if frame[54] != 136 || frame[55] != 0 {
+                        return Err("unsolicited NA type/code != 136/0");
+                    }
+                    let flags = u32::from_be_bytes([frame[58], frame[59], frame[60], frame[61]]);
+                    if flags & NA_FLAG_SOLICITED != 0 {
+                        return Err("unsolicited NA Solicited flag must be clear");
+                    }
+                    if flags & NA_FLAG_OVERRIDE == 0 {
+                        return Err("unsolicited NA Override flag must be set");
+                    }
+                    if frame[38..54] != ALL_NODES {
+                        return Err("unsolicited NA dst != ff02::1");
+                    }
+                    let src: [u8; 16] = frame[22..38].try_into().map_err(|_| "NA src slice")?;
+                    if frame[62..78] != src {
+                        return Err("unsolicited NA target != src address");
+                    }
+                    if frame[78] != 2 || frame[79] != 1 || frame[80..86] != MAC {
+                        return Err("unsolicited NA TLLA option != our MAC");
+                    }
+                    if src == ll {
+                        na_srcs[0] = true;
+                    } else if src == GLOBAL {
+                        na_srcs[1] = true;
+                    } else {
+                        return Err("unsolicited NA src is not one of our usable addresses");
+                    }
+                } else {
+                    return Err("announce emitted a frame that is neither ARP nor IPv6");
+                }
+            }
+            if !saw_arp {
+                return Err("announce emitted no gratuitous ARP");
+            }
+            if !na_srcs.iter().all(|s| *s) {
+                return Err("announce missed an unsolicited NA for a usable address");
+            }
+            Ok(())
+        };
+        let result = match run() {
+            Ok(()) => TestResult::Pass,
+            Err(e) => TestResult::Fail(e),
+        };
+        // Leave the shared registries clean whatever the outcome was.
+        narf_net::iface::unregister(IFACE);
+        for addr in [ll, GLOBAL, TENTATIVE] {
+            narf_net::ipv6::addrs::remove(IFACE, &addr);
+        }
+        narf_net::ifaddr::iface_del_addr(IFACE, narf_net::ipv4::Ipv4Addr(V4), 24);
+        ANNOUNCE_TX.lock().clear();
+        result
+    }
+    kernel_test_in!(
+        "drivers/virtio/net-pci",
+        smoke_virtio_net_announce_notify_peers_na
     );
 }
