@@ -778,11 +778,17 @@ unsafe impl Registers for Port {
     }
     fn claim_firmware_dma(&mut self, base: u32) -> Result<(), Error> {
         self.access()?;
-        let model = self.0.lock();
-        let ring = model.ring.lock();
-        if u64::from(base) != ring.address || ring.bytes[..16] != [0; 16] || ring.syncs == 0 {
-            return Err(Error::Prerequisite);
+        let mut model = self.0.lock();
+        {
+            let ring = model.ring.lock();
+            if u64::from(base) != ring.address || ring.bytes[..16] != [0; 16] || ring.syncs == 0 {
+                return Err(Error::Prerequisite);
+            }
         }
+        // `pci_firmware::Native::registers`: REG_BCNQ_TXBD_DESA (0x308)
+        // holds the retained beacon ring, which the station-era page upload
+        // (`runtime_ps_page`) and the swap window read back.
+        model.bytes[0x308..0x30c].copy_from_slice(&base.to_le_bytes());
         Ok(())
     }
     fn read8(&mut self, reg: u16) -> Result<u8, Error> {
@@ -797,10 +803,17 @@ unsafe impl Registers for Port {
         if reg == 0x204 && model.stale_valid {
             value |= 1 << 15;
         }
+        // REG_FIFOPAGE_INFO_1..4 available counts of the drained 8821C
+        // page_table (16/16/16/14) for programs that check TX quiescence:
+        // TX BA, protection, power tracking and the LPS window
+        // (`station_ht_program_quiet`, `ps_model`).
         if matches!(reg, 0x232 | 0x236 | 0x23a | 0x23e)
-            && model.station_gate.as_ref().is_some_and(|g| {
-                g.allows_tx_ba() || g.protection_grant().is_some() || g.power_tracking().is_some()
-            })
+            && (model.ps_model
+                || model.station_gate.as_ref().is_some_and(|g| {
+                    g.allows_tx_ba()
+                        || g.protection_grant().is_some()
+                        || g.power_tracking().is_some()
+                }))
         {
             if model
                 .packet_model
