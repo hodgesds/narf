@@ -4356,11 +4356,16 @@ async fn e1000_rx_pump(device: Arc<E1000>) {
     // old 1-ms timer poll capped a receiver to roughly one ACK opportunity per
     // millisecond (~17 Mbit/s in the TAP iperf diagnostic).
     //
-    // Once awake, drain without yielding until the ring is empty. This is the
-    // same shape as an interrupt-driven NAPI poll: the device interrupt starts
-    // a burst, then descriptor DD bits drive the hot path without one wake per
-    // packet. A short deadline remains as a lost-interrupt safety net; devices
-    // without a wired vector retain the 1-ms polling fallback.
+    // Once awake, drain until the ring is empty without waiting for another
+    // interrupt. This is the shape of an interrupt-driven NAPI poll: the
+    // device interrupt starts a burst, then descriptor DD bits drive the hot
+    // path without one wake per packet. Each pass is bounded by
+    // `RX_DRAIN_BUDGET`, and a pass that found frames gives the CPU to the
+    // other tasks queued on it before the next one, as `net_rx_action` does
+    // when a poll uses its budget: a sender that keeps the ring non-empty
+    // must not hold the CPU for as long as it keeps sending. A short deadline
+    // remains as a lost-interrupt safety net; devices without a wired vector
+    // retain the 1-ms polling fallback.
     const IRQ_FALLBACK_MS: u64 = 10;
     let poll_fallback_cycles = narf_time::ns_to_cycles(1_000_000);
     loop {
@@ -4380,6 +4385,12 @@ async fn e1000_rx_pump(device: Arc<E1000>) {
         });
         if device.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| dispatch_rx_frame(&device, frame)) != 0
         {
+            // This pump is not pinned, so it may resume on another CPU: hand
+            // up what this CPU's coalescer holds first (`__napi_poll` flushes
+            // GRO before a repoll for the same reason — nothing may wait on a
+            // poll that is no longer running here).
+            narf_net::tcp_stack::gro_flush();
+            narf_scheduler::yield_now().await;
             continue;
         }
 
