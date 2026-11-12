@@ -253,6 +253,8 @@ struct ParkedTasks {
     slots: alloc::vec::Vec<ParkedEntry>,
     free: Option<usize>,
     len: usize,
+    /// Parked tasks that are idle workers ([`WakeCell::idle_worker`]).
+    idle_workers: usize,
     capped: alloc::vec::Vec<usize>,
 }
 
@@ -269,12 +271,18 @@ impl ParkedTasks {
             slots: alloc::vec::Vec::new(),
             free: None,
             len: 0,
+            idle_workers: 0,
             capped: alloc::vec::Vec::new(),
         }
     }
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    /// Parked tasks that are work: all but idle workers.
+    fn busy_len(&self) -> usize {
+        self.len - self.idle_workers
     }
 
     fn values(&self) -> impl Iterator<Item = &ParkedSlot> {
@@ -336,6 +344,9 @@ impl ParkedTasks {
             self.capped.push(index);
             PARKED_CAPPED_COUNT[cpu].store(self.capped.len(), Ordering::Release);
         }
+        if entry.slot.awake.idle_worker.load(Ordering::Acquire) {
+            self.idle_workers += 1;
+        }
         self.slots[index].task = Some(entry);
         self.len += 1;
         index
@@ -365,6 +376,10 @@ impl ParkedTasks {
         entry.next_free = self.free;
         self.free = Some(index);
         self.len -= 1;
+        // Stable while parked: only the task itself changes it, when it runs.
+        if task.slot.awake.idle_worker.load(Ordering::Acquire) {
+            self.idle_workers -= 1;
+        }
         Some(task)
     }
 
@@ -403,6 +418,7 @@ impl ParkedTasks {
         self.slots.clear();
         self.free = None;
         self.len = 0;
+        self.idle_workers = 0;
         self.capped.clear();
     }
 }
@@ -1166,6 +1182,16 @@ pub(crate) fn tick_preemption_required(current: u64, now: u64, slice_expired: bo
 /// run-queue and is no longer findable by id). Returns `None`
 /// when the active task is kernel-only (no AS) or the executor
 /// isn't currently polling.
+/// Mark the task that owns `waker` as an idle worker (or not) — call it
+/// before returning `Pending` to park idle, and with `false` once woken.
+/// A CPU whose only parked tasks are idle workers counts as empty for
+/// [`run_until_empty`]. No effect for a waker that is not a task's.
+pub fn set_idle_worker(waker: &Waker, idle: bool) {
+    if let Some(cell) = scheduler_wake_cell(waker) {
+        cell.idle_worker.store(idle, Ordering::Release);
+    }
+}
+
 pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     active_user_as_slot().lock().clone()
 }
@@ -1229,6 +1255,12 @@ pub(crate) struct WakeCell {
     /// executor, where ordinary affinity and CPU-lifecycle validation plus the
     /// normal migration enqueue path still own placement.
     sync_requeue_cpu: AtomicU32,
+    /// The task is an idle worker waiting for work (a workqueue worker
+    /// parked on its pool's idle list, Linux `WORKER_IDLE`). Set by the task
+    /// itself before it parks, cleared when it runs again, so it is stable
+    /// while parked. A parked idle worker is not work: `run_until_empty`
+    /// treats a CPU whose only parked tasks are idle workers as empty.
+    idle_worker: AtomicBool,
 }
 
 impl WakeCell {
@@ -1527,6 +1559,7 @@ fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
         wake_halt_gen: AtomicU64::new(0),
         stackful: AtomicPtr::new(core::ptr::null_mut()),
         user_rt: AtomicBool::new(false),
+        idle_worker: AtomicBool::new(false),
         direct_eligible: AtomicBool::new(direct_eligible),
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
@@ -7263,11 +7296,14 @@ pub fn run_until_empty() {
         // Sleeping residents still require timer-wheel and sleep-pump service
         // below. Returning to run_forever's truly-empty halt would bypass that
         // maintenance and could strand a deadline with no runnable slot.
+        // Idle workqueue workers waiting for work are not residents with
+        // work to do: a CPU parking only those is empty (they are woken by a
+        // queueing, which re-enters the executor like any wake).
         let local_empty = ready_empty
             && PARKED[cpu]
                 .lock()
                 .as_ref()
-                .is_none_or(|parked| parked.len() == 0);
+                .is_none_or(|parked| parked.busy_len() == 0);
         if !local_dispatchable {
             if try_steal_one(cpu) {
                 continue;
@@ -9015,6 +9051,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         wake_halt_gen: AtomicU64::new(0),
         stackful: AtomicPtr::new(core::ptr::null_mut()),
         user_rt: AtomicBool::new(false),
+        idle_worker: AtomicBool::new(false),
         direct_eligible: AtomicBool::new(false),
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),

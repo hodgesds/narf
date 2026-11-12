@@ -323,3 +323,78 @@ kernel_test_in!(
     "scheduler/workqueue",
     smoke_workqueue_rescuer_runs_when_pool_is_full
 );
+
+/// Idle workers are kept, as Linux keeps them: after a work runs, the pool
+/// still has a worker parked idle, the next work reuses it without a new
+/// one being created, and an executor drained to empty does not wait for
+/// the parked idle worker (it is not work).
+fn smoke_workqueue_idle_workers_are_kept_and_not_work() -> TestResult {
+    crate::__reset_queues_for_test();
+    let wq = workqueue::system_wq();
+    let a = counted();
+    // SAFETY: the Boxes outlive the works; both run below.
+    unsafe { queue_work_on(me(), wq, &a.work) };
+    let ran = rounds_until(1000, || a.runs.load(Ordering::Acquire) == 1);
+    // The worker that ran it, and the reserve it created before starting.
+    let idle = rounds_until(1000, || workqueue::__pool_idle_workers(me()) >= 2);
+    let workers = workqueue::__pool_workers(Some(me()));
+    let b = counted();
+    // SAFETY: as above.
+    unsafe { queue_work_on(me(), wq, &b.work) };
+    // Returns although idle workers stay parked on this CPU.
+    crate::run_until_empty();
+    let reused = b.runs.load(Ordering::Acquire) == 1;
+    let created = workqueue::__pool_workers(Some(me())) - workers;
+    if !ran || !idle {
+        return TestResult::Fail("no worker was kept idle after a work ran");
+    }
+    if !reused || created != 0 {
+        return TestResult::Fail("the next work did not reuse the idle worker");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/workqueue",
+    smoke_workqueue_idle_workers_are_kept_and_not_work
+);
+
+/// `idle_worker_timeout`: once a burst of sleeping works is over, the idle
+/// workers beyond the reserve (two, while idle ones outnumber the busy by
+/// `MAX_IDLE_WORKERS_RATIO`) are reaped after the idle timeout.
+fn smoke_workqueue_idle_reaper_trims_the_pool() -> TestResult {
+    crate::__reset_queues_for_test();
+    workqueue::__set_idle_timeout_for_test(5);
+    let wq = workqueue::system_wq();
+    GATE.store(false, Ordering::Release);
+    ASYNC_DONE.store(0, Ordering::Release);
+    const N: usize = 8;
+    let sleepers: Vec<Box<WorkStruct>> = (0..N)
+        .map(|_| Box::new(WorkStruct::new(WorkFn::Async(sleeper_fn))))
+        .collect();
+    for s in &sleepers {
+        // SAFETY: the Boxes outlive the works; all finish below.
+        unsafe { queue_work_on(me(), wq, s) };
+    }
+    let grown = rounds_until(2000, || workqueue::__pool_workers(Some(me())) >= N);
+    GATE.store(true, Ordering::Release);
+    let done = rounds_until(2000, || ASYNC_DONE.load(Ordering::Acquire) == N);
+    let trimmed = rounds_until(2000, || workqueue::__pool_workers(Some(me())) <= 3);
+    workqueue::__set_idle_timeout_for_test(0);
+    for s in &sleepers {
+        flush_work_blocking(s);
+    }
+    if !grown || !done {
+        return TestResult::Fail("the sleeping works did not each get a worker and finish");
+    }
+    if !trimmed {
+        return TestResult::Fail("idle workers past the reserve were not reaped");
+    }
+    if workqueue::__pool_idle_workers(me()) < 2 {
+        return TestResult::Fail("the reaper took the pool's idle reserve");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/workqueue",
+    smoke_workqueue_idle_reaper_trims_the_pool
+);
