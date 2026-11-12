@@ -191,6 +191,12 @@ pub fn enabled() -> bool {
     }
 }
 
+/// Test-only: turn the cache on or off, as `btrfs.data_cache=` would.
+#[cfg(feature = "kernel-test")]
+pub fn set_enabled_for_test(on: bool) {
+    ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
 /// Look up a decompressed extent or verified uncompressed window.
 pub fn get(vol: &VolumeRef, id: ExtentId) -> Option<Arc<Vec<u8>>> {
     if !enabled() {
