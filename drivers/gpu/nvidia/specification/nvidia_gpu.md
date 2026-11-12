@@ -112,7 +112,11 @@ The license / SPDX-header check rule:
   `NV_PMC_BOOT_0` decoder (architecture / implementation /
   major / minor / revision fields), `NV_PMC_ENABLE` per-engine
   bits, `NV_PMC_INTR_*` mask layout. Source: open-gpu-doc
-  `dev_pmc.ref.txt`.
+  `dev_pmc.ref.txt`. [CORRECTED in G4: that file does not exist;
+  the INTR bit table is grounded on Nouveau's MC intr tables
+  (`nvkm/subdev/mc/gp100.c` `gp100_mc_intr[]` for Pascal,
+  `gk104.c` / `gf100.c` agreeing) — PMU is bit 24, SEC2/GSP have
+  no top-level `PMC_INTR_0` bit; see `mc.rs`.]
 - **`nvidia_gpu_falcon`** — Falcon CPU register codec — generic
   across every NVIDIA microcontroller the host driver brings up
   (PMU, SEC2, GSP, GPCCS): `CPUCTL`, `BOOTVEC`, `IMEMC` /

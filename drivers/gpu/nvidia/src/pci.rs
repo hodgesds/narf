@@ -36,6 +36,7 @@ use narf_driver_runtime::{
 };
 
 use crate::chip::{chip_info_for_pci_id, ChipFamily, ChipInfo, NVIDIA_VENDOR, PCI_CLASS_DISPLAY};
+use crate::irq::IrqState;
 use crate::mc::Boot0;
 use crate::pmu::Pmu;
 
@@ -83,6 +84,11 @@ pub struct NvidiaDevice {
     /// on false — the card still binds, and later gaps (G3/G12)
     /// gate on this bit.
     pub pmu_ready: bool,
+    /// Interrupt state (G4): delivery mode, vector, top-half
+    /// counters, pending mask. Starts in polling mode; `probe`
+    /// routes MSI via `crate::irq::route_irq` after the card is in
+    /// the controller list.
+    pub irq: IrqState,
     /// Stable per-card index. Assigned monotonically by `probe`; used
     /// by upper layers to refer to a specific card without holding a
     /// raw `Arc<NvidiaCard>`. Mirrors Nouveau's `drm_dev_register`
@@ -172,6 +178,7 @@ impl NvidiaDevice {
             bar1,
             bar3,
             pmu_ready,
+            irq: IrqState::new(),
             card_index,
             bus_device: *device,
         })
@@ -239,7 +246,16 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // pieces of the driver flesh it out further down.
     crate::pcie_recovery::register_for_card(&card);
 
-    CONTROLLER.lock().push(card);
+    CONTROLLER.lock().push(card.clone());
+    // IRQ path (G4): route one MSI vector + install the PMC top-half
+    // handler, then spawn the drain task. Best-effort — on failure the
+    // card stays in polling mode and still binds; only interrupt
+    // delivery is off. `INTX_DISABLE` stays set (MSI does not use
+    // the INTx line; Nouveau's `pci_enable_msi` leaves it disabled).
+    // SAFETY: caller-authority on the BusDevice + cap; the card is in
+    // the controller list, so the handler can find it from the first
+    // delivery on. APIC init precedes device initcalls.
+    unsafe { crate::irq::route_irq(&card, &device, &cap) };
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("nvidia"),
         kind: narf_drivers::BoundKind::Graphics,

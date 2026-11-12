@@ -49,6 +49,7 @@ pub mod gr;
 pub mod gsp;
 pub mod hdcp;
 pub mod hpd;
+pub mod irq;
 pub mod kms;
 pub mod mc;
 pub mod mmu;

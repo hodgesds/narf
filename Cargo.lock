@@ -2037,8 +2037,10 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-init",
+ "narf-interrupts",
  "narf-kernel-test",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
