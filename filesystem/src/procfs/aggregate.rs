@@ -112,6 +112,7 @@ pub fn register_all() {
     register_proc("iomem", agg(gen_iomem));
     register_proc("ioports", agg(gen_ioports));
     register_proc("slabinfo", agg(gen_slabinfo));
+    register_proc("narf/slab", agg(gen_narf_slab));
     register_proc("vmstat", agg(gen_vmstat));
     register_proc("zoneinfo", agg(gen_zoneinfo));
     register_proc("buddyinfo", agg(gen_buddyinfo));
@@ -395,34 +396,119 @@ fn gen_slabinfo() -> Vec<u8> {
          : slabdata <active_slabs> <num_slabs> <sharedavail>"
     );
 
-    let stats = narf_memory::slab::stats();
-    for cls in stats.classes.iter() {
-        if cls.block_size == 0 {
-            continue;
-        }
-        let objs_per_slab = if cls.block_size > 0 {
-            (narf_memory::PAGE_SIZE as usize) / cls.block_size
-        } else {
-            1
-        };
-        let objs_per_slab = objs_per_slab.max(1);
-        // active_slabs ≈ ceil(in_use / objs_per_slab).
-        let active_slabs = cls.in_use.div_ceil(objs_per_slab);
-        let total_slabs = cls.grown.div_ceil(objs_per_slab);
+    let classes = slab_class_snapshot();
+    let (limit, batch) = narf_memory::slab::magazine_tunables();
+    for d in classes.iter().filter(|d| d.block_size != 0) {
+        // Linux semantics: active_slabs are slabs with at least one object in
+        // use (or cached per CPU); num_slabs every slab the cache holds;
+        // sharedavail the free objects in per-CPU arrays.
         let _ = writeln!(
             s,
-            "kmalloc-{:<6} {:>8} {:>8} {:>8} {:>8} {:>12} \
-             : tunables 0 0 0 \
-             : slabdata {:>8} {:>8} 0",
-            cls.block_size,
-            cls.in_use,
-            cls.grown,
-            cls.block_size,
-            objs_per_slab,
+            "kmalloc-{:<9} {:>8} {:>8} {:>8} {:>8} {:>12} \
+             : tunables {:>4} {:>4} 0 \
+             : slabdata {:>8} {:>8} {:>6}",
+            d.block_size,
+            d.live_objects,
+            d.frames * d.objs_per_frame,
+            d.block_size,
+            d.objs_per_frame,
             1, // pages per slab — 1 for small classes
-            active_slabs,
-            total_slabs,
+            limit,
+            batch,
+            d.frames.saturating_sub(d.empty_frames),
+            d.frames,
+            d.magazine_free,
         );
+    }
+    // Allocations above the largest class are page-allocator backed, as in
+    // SLUB's kmalloc_large: one object per (1 << order)-page block.
+    let large = narf_memory::slab::large_detail();
+    let page = narf_memory::PAGE_SIZE as usize;
+    for (order, &live) in large.live_by_order.iter().enumerate().skip(1) {
+        let bytes = page << order;
+        let name = if bytes >= 1 << 20 {
+            alloc::format!("kmalloc-{}M", bytes >> 20)
+        } else {
+            alloc::format!("kmalloc-{}k", bytes >> 10)
+        };
+        let _ = writeln!(
+            s,
+            "{:<17} {:>8} {:>8} {:>8} {:>8} {:>12} \
+             : tunables    0    0 0 \
+             : slabdata {:>8} {:>8} {:>6}",
+            name,
+            live,
+            live,
+            bytes,
+            1,
+            1usize << order,
+            live,
+            live,
+            0,
+        );
+    }
+    // The scattered (vmalloc) fallback has no fixed object size; report the
+    // mean so `num_slabs * pagesperslab` still approximates its frames.
+    let mean_frames = large
+        .vmalloc_frames
+        .checked_div(large.vmalloc_live)
+        .unwrap_or(0);
+    let _ = writeln!(
+        s,
+        "{:<17} {:>8} {:>8} {:>8} {:>8} {:>12} \
+         : tunables    0    0 0 \
+         : slabdata {:>8} {:>8} {:>6}",
+        "kmalloc-vmalloc",
+        large.vmalloc_live,
+        large.vmalloc_live,
+        mean_frames * page,
+        1,
+        mean_frames,
+        large.vmalloc_live,
+        large.vmalloc_live,
+        0,
+    );
+    s.into_bytes()
+}
+
+/// Every size class's retention detail, taken before any formatting:
+/// `class_detail` takes the class lock, and `writeln!` into a `String`
+/// allocates from the slab.
+fn slab_class_snapshot() -> Vec<narf_memory::slab::ClassDetail> {
+    let n = narf_memory::slab::num_classes();
+    let mut out = Vec::with_capacity(n);
+    for c in 0..n {
+        out.push(narf_memory::slab::class_detail(c));
+    }
+    out
+}
+
+// ── /proc/narf/slab ──────────────────────────────────────────────────
+//
+// NARF-specific, `memory.stat`-style `key value` lines: where every frame
+// the kernel heap holds is, per size class, so a soak can tell a leak
+// (`live` rising) from retention (`live` back at baseline, `frames` not).
+
+fn gen_narf_slab() -> Vec<u8> {
+    let mut s = String::new();
+    let classes = slab_class_snapshot();
+    let large = narf_memory::slab::large_detail();
+    let _ = writeln!(s, "frames_held {}", narf_memory::slab::frames_held());
+    let _ = writeln!(s, "large_frames {}", large.frames);
+    let _ = writeln!(s, "large_vmalloc_live {}", large.vmalloc_live);
+    let _ = writeln!(s, "large_vmalloc_frames {}", large.vmalloc_frames);
+    for (order, &live) in large.live_by_order.iter().enumerate() {
+        let _ = writeln!(s, "large_order{}_live {}", order, live);
+    }
+    for d in classes.iter() {
+        let b = d.block_size;
+        let _ = writeln!(s, "class{}_frames {}", b, d.frames);
+        let _ = writeln!(s, "class{}_live {}", b, d.live_objects);
+        let _ = writeln!(s, "class{}_magazine_free {}", b, d.magazine_free);
+        let _ = writeln!(s, "class{}_central_free {}", b, d.central_free);
+        let _ = writeln!(s, "class{}_partial_frames {}", b, d.partial_frames);
+        let _ = writeln!(s, "class{}_empty_frames {}", b, d.empty_frames);
+        let _ = writeln!(s, "class{}_legacy_free {}", b, d.legacy_free);
     }
     s.into_bytes()
 }
