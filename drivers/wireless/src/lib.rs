@@ -15,6 +15,7 @@ pub mod rtl8xxxu;
 pub mod rtlwifi;
 pub mod rtw88;
 pub mod rtw89;
+mod watchdog_work;
 
 // MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920). Promoted out of the
 // former `src/mt7921/` module into the standalone dual-build crate

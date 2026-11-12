@@ -1348,7 +1348,7 @@ pub(super) fn publish<I: Io + 'static>(device: Arc<Device<I>>) -> Result<(), Err
     narf_net::iface::install_rx_drain(super::endpoints::drain);
     narf_wireless::registry::register(device.clone());
     device.published.store(true, Ordering::Release);
-    start_watchdog_work(&device);
+    crate::watchdog_work::start(&device, WATCHDOG_PERIOD_MS);
     narf_scheduler::spawn(async move {
         while !device.withdrawn() {
             if I::SYNCHRONOUS {
@@ -1367,67 +1367,18 @@ const WATCHDOG_PERIOD_MS: u64 = 2000;
 
 /// `rtwdev->watch_dog_work`: the station's dynamic-mechanism period as
 /// delayed work (Linux `rtw_watch_dog_work`, re-queued every
-/// `RTW_WATCH_DOG_DELAY_TIME`). It holds the device weakly and frees itself
-/// when the device is withdrawn.
-#[repr(C)]
-struct WatchdogWork<I: Io> {
-    /// First field: the work function's `WorkRef` is this struct.
-    dw: narf_scheduler::workqueue::DelayedWork,
-    device: alloc::sync::Weak<Device<I>>,
-}
-
-fn start_watchdog_work<I: Io + 'static>(device: &Arc<Device<I>>) {
-    let ww = alloc::boxed::Box::leak(alloc::boxed::Box::new(WatchdogWork {
-        dw: narf_scheduler::workqueue::DelayedWork::new(
-            narf_scheduler::workqueue::WorkFn::Async(watchdog_work_fn::<I>),
-            false,
-        ),
-        device: Arc::downgrade(device),
-    }));
-    queue_watchdog(&ww.dw);
-}
-
-fn queue_watchdog(dw: &narf_scheduler::workqueue::DelayedWork) {
-    let delay = narf_time::timer::ns_to_jiffies(WATCHDOG_PERIOD_MS * 1_000_000);
-    // SAFETY: the delayed work is leaked until its own function frees it,
-    // which it does only when it does not re-queue.
-    unsafe {
-        narf_scheduler::workqueue::queue_delayed_work(
-            narf_scheduler::workqueue::system_wq(),
-            dw,
-            delay,
-        )
-    };
-}
-
-fn watchdog_work_fn<I: Io + 'static>(
-    r: narf_scheduler::workqueue::WorkRef,
-) -> narf_scheduler::workqueue::WorkFuture {
-    let addr = r.as_ptr() as usize;
-    // SAFETY: only `WatchdogWork<I>` uses this function; its delayed work
-    // (whose `work` is first) is its first field, and it is alive until this
-    // function frees it.
-    let device = unsafe { &*(addr as *const WatchdogWork<I>) }
-        .device
-        .upgrade();
-    alloc::boxed::Box::pin(async move {
-        // `addr` (a usize, not a pointer) is what lives across the await.
-        match device {
-            Some(device) if !device.withdrawn() => {
-                let _ = device.watchdog().await;
-                drop(device);
-                // SAFETY: as above; not freed on this path.
-                queue_watchdog(unsafe { &(*(addr as *const WatchdogWork<I>)).dw });
-            }
-            device => {
-                drop(device);
-                // SAFETY: neither pending nor queued (this run is the last,
-                // it does not re-queue), and the pool never touches a work
-                // after calling its function: the work is ours to free.
-                drop(unsafe { alloc::boxed::Box::from_raw(addr as *mut WatchdogWork<I>) });
-            }
-        }
-    })
+/// `RTW_WATCH_DOG_DELAY_TIME`) until the device is withdrawn.
+impl<I: Io + 'static> crate::watchdog_work::Watchdog for Device<I> {
+    fn watchdog_stopped(&self) -> bool {
+        self.withdrawn()
+    }
+    fn watchdog_step(
+        self: Arc<Self>,
+    ) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>> {
+        alloc::boxed::Box::pin(async move {
+            let _ = self.watchdog().await;
+        })
+    }
 }
 struct Registered<I: Io>(Arc<Device<I>>);
 impl<I: Io + 'static> Interface for Registered<I> {
