@@ -1200,6 +1200,107 @@ fn no_free_space_tree(args: &Args) -> Result<String, String> {
     ))
 }
 
+/// Two handles of one file, overlapping writes through either, and a read
+/// through either after every operation, against a byte model: unaligned
+/// writes of 1 byte to 70 KiB, truncates up and down, fsyncs, and a handle
+/// dropped and reopened now and then. The soak saw reads return a range's
+/// previous bytes after a store; here every read must return the model's.
+fn two_handles(args: &Args) -> Result<String, String> {
+    let dir = args.workdir.join("release-two-handles");
+    let img = mkfs(&dir, 512 << 20, 0x2b, FEATURES)?;
+    let (fsid, nodesize, _) = dev::image_identity(&img);
+    let dev = Arc::new(RecDev::open(&img, 512, fsid, nodesize));
+    narf::register_root(dev, &fsid)?;
+    let fs = narf::mount_root_rw(&fsid, "@", &[])?.remove(0);
+    let root = fs.root();
+    let open = || block_on(root.lookup_async("shared")).map_err(err("lookup"));
+    drop(block_on(root.create("shared")).map_err(err("create"))?);
+    let mut handles = [open()?, open()?];
+    let mut model: Vec<u8> = Vec::new();
+    let mut rng = args.seed ^ 0x2b2b_7777;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    const SPAN: u64 = 1 << 20;
+    let ops = args.ops.max(300) * 4;
+    let mut reads = 0usize;
+    for op in 0..ops {
+        let h = (next() % 2) as usize;
+        let kind = next() % 20;
+        let at = next() % SPAN;
+        let len = 1 + next() % (70 << 10);
+        let what: Result<(), String> = block_on(async {
+            match kind {
+                0..=11 => {
+                    let body = noise(op as u64 ^ at, len as usize);
+                    let mut done = 0usize;
+                    while done < body.len() {
+                        let n = handles[h]
+                            .write(at + done as u64, &body[done..])
+                            .await
+                            .map_err(err("write"))?;
+                        done += n;
+                    }
+                    let end = (at + len) as usize;
+                    if model.len() < end {
+                        model.resize(end, 0);
+                    }
+                    model[at as usize..end].copy_from_slice(&body);
+                }
+                12..=13 => {
+                    let size = next() % SPAN;
+                    handles[h].truncate(size).await.map_err(err("truncate"))?;
+                    model.resize(size as usize, 0);
+                }
+                14 => handles[h].fsync(false).await.map_err(err("fsync"))?,
+                15 => {
+                    // Drop a handle and look the file up again.
+                    handles[h] = root.lookup_async("shared").await.map_err(err("lookup"))?;
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        what.map_err(|e| format!("two handles: op {op}: {e}"))?;
+        // A read through either handle of a range around the last write.
+        for (reader, handle) in handles.iter().enumerate() {
+            let from = at.saturating_sub(next() % 8192);
+            let want_len = (len + 16384).min(SPAN) as usize;
+            let mut got = vec![0u8; want_len];
+            let n = block_on(handle.read(from, &mut got)).map_err(err("read"))?;
+            let want: &[u8] = model.get(from as usize..).unwrap_or(&[]);
+            let want = &want[..want.len().min(want_len)];
+            if n != want.len() || got[..n] != *want {
+                let first = got[..n]
+                    .iter()
+                    .zip(want)
+                    .position(|(g, w)| g != w)
+                    .map_or(n.min(want.len()), |i| i);
+                return Err(format!(
+                    "two handles: op {op} (kind {kind}, handle {h}, at {at}, len {len}): read through handle {reader} of {want_len} at {from} returned {n} bytes, {} expected; first difference at file offset {}",
+                    want.len(),
+                    from + first as u64
+                ));
+            }
+            reads += 1;
+        }
+    }
+    drop(handles);
+    drop(root);
+    drop(fs);
+    narf::reset();
+    linux::check(&img, false).map_err(|e| format!("two handles: {e}"))?;
+    if !args.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(format!(
+        "    two handles of one file: {ops} writes/truncates/fsyncs/reopens, {reads} reads each equal to the model; btrfs check clean"
+    ))
+}
+
 pub fn run(args: &Args) -> Result<String, String> {
     let t0 = Instant::now();
     let mut lines = vec![reservation(args)?];
@@ -1385,6 +1486,7 @@ pub fn run(args: &Args) -> Result<String, String> {
     lines.push(dir_orphan(args)?);
     lines.push(readonly_snapshot(args)?);
     lines.push(no_free_space_tree(args)?);
+    lines.push(two_handles(args)?);
     Ok(format!(
         "release: OK\n{}\n    btrfs check clean (also --check-data-csum), no orphan item left, files empty or gone after a remount; {:.0?}",
         lines.join("\n"),
