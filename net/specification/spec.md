@@ -1209,6 +1209,29 @@ are covered by their retransmission timers; RST and non-TCP frames are
 dropped and counted. Linux holds all of these in the qdisc instead; there is
 no qdisc here.
 
+### Transmit watchdog (`watchdog`, Linux `dev_watchdog` / `ndo_tx_timeout`)
+
+A NIC with a transmit timeout implements `NetdevWatchdog`
+(`tx_timed_out(now)`: a transmit waited past the timeout with carrier up and
+no recovery under way; `tx_timeout()`: count it and reset) and starts
+`DevWatchdog::start_for_device(weak, timeo_ns)` (or `start` for a handle that
+stops it on drop). Every `watchdog_timeo` a timer-wheel timer asks
+`tx_timed_out`; on a stall it queues `tx_timeout` on `system_wq` — a reset
+may wait, a timer callback may not. The device is held weakly and the
+watchdog stops with it. e1000, igb, ixgbe, r8169, forcedeth and igc use it.
+
+### Network timers
+
+Every network timer is a timer-wheel `timer_list`: one per TCP connection
+(retransmit, delayed ACK, zero-window probe, keepalive, TIME-WAIT / orphan
+FIN-WAIT-2, transmit-wait probe, deferred accept — armed for the earliest
+deadline, holding a TCB reference while pending), one per IPv4 fragment
+queue (`ip_expire`), one per resolving neighbour (`neigh_timer_handler`:
+retransmit every `RETRANS_TIME`, give up after the probe budget), and the
+neighbour table's periodic GC (`neigh_periodic_work`: every 15 s once the
+table holds `gc_thresh1` entries, drop FAILED entries and unused ones past
+`GC_STALETIME`). No sleep pump scans connections, queues or neighbours.
+
 ### Receive batches
 
 `iface::rx_batch(name)` resolves the ingress device once per receive poll and

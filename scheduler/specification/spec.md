@@ -1124,6 +1124,28 @@ reports runnable work-kind counts, RT reservation, next deadline, state, and
 cumulative hard-IRQ/NMI cycles. It is a governor input, never a frequency
 control callback.
 
+### 3.6 Workqueues (`narf_scheduler::workqueue`, Linux `kernel/workqueue.c`)
+
+| Linux | NARF |
+| --- | --- |
+| `struct work_struct`, `INIT_WORK`, `work_func_t` | `WorkStruct::new(WorkFn::Sync(fn) \| WorkFn::Async(fn -> future))`; the function gets a `WorkRef` (pointer) and may free its work |
+| `struct delayed_work`, `INIT_(DEFERRABLE_)DELAYED_WORK` | `DelayedWork::new(fn, deferrable)`: a work and a timer-wheel `timer_list` |
+| `alloc_workqueue(name, flags, max_active)`, `alloc_ordered_workqueue` | same; `WQ_UNBOUND`, `WQ_HIGHPRI`, `WQ_MEM_RECLAIM`, `WQ_FREEZABLE` (accepted), `WQ_POWER_EFFICIENT` (unbound) |
+| `system_wq`, `system_highpri_wq`, `system_long_wq`, `system_unbound_wq`, `system_power_efficient_wq` | same, created at `workqueue_init` (scheduler `init`) |
+| `queue_work(_on)`, `schedule_work`, `queue_delayed_work(_on)`, `schedule_delayed_work`, `mod_delayed_work(_on)` | same; never allocate or block (callable from timer callbacks and interrupt handlers) |
+| `cancel_work_sync`, `cancel_delayed_work(_sync)`, `flush_work` | same, async; `*_blocking` forms drive nested executor rounds |
+| per-CPU normal / highpri `worker_pool`s, unbound pool | same; per-CPU workers are pinned tasks, unbound ones run anywhere |
+| concurrency management (`nr_running`, `wq_worker_sleeping`, `kick_pool`) | a pending async work puts its worker to sleep; queued work with no running worker gets a new worker (from interrupt context: the pool's manager timer, next jiffy) |
+| `max_active`, inactive list | per workqueue, queue order kept |
+| rescuer, `send_mayday` | a pool at `MAX_WORKERS_PER_POOL` sends its `WQ_MEM_RECLAIM` work to the workqueue's rescuer task |
+
+Departures, each because of the executor: idle workers are not kept (a
+worker exits when its pool's worklist is empty — a parked task would keep the
+CPU's executor from draining); a synchronous work that spins holds its CPU as
+a non-preemptible kthread would; high-priority pools run at the default task
+priority; the rescuer is started on mayday (task creation does not fail).
+`__reset_queues_for_test` forgets every pool with the workers it drops.
+
 ### Live Linux user-thread policies
 
 ```rust
