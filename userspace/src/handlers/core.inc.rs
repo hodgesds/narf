@@ -712,7 +712,9 @@ pub(crate) fn cond_resched() -> bool {
 /// `munmap`) leave this counter alone.
 static FALLBACK_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// See [`FALLBACK_WAITS`].
+/// See [`FALLBACK_WAITS`]. Read by the x86_64 `sys_mmap` tests and the
+/// writeback kernel tests only.
+#[cfg(any(target_arch = "x86_64", feature = "kernel-test"))]
 pub(crate) fn fallback_waits() -> u64 {
     FALLBACK_WAITS.load(core::sync::atomic::Ordering::Relaxed)
 }

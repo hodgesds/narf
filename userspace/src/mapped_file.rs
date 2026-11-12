@@ -4153,17 +4153,21 @@ pub(crate) fn cached_page_state_for_test(
     Some((page.dirty, page.idle_dirty, page.mappings))
 }
 /// Kernel tests: run the flusher's mapped-page reclaim step directly.
+/// Used by the x86_64 `sys_mmap` tests only.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn reclaim_mapped_for_test(target: usize) -> usize {
     writeback::reclaim_mapped(target)
 }
 pub(crate) use writeback::shrink_all_for_test;
+/// Read by the x86_64 `sys_mmap` writeback tests only.
+#[cfg(target_arch = "x86_64")]
+pub(crate) use writeback::BATCH_PAGES as WRITEBACK_BATCH_PAGES;
 pub(crate) use writeback::{
     device_mapped, forget_device, read_epoch, sync_all_files_async, write_and_note,
 };
 pub(crate) use writeback::{
     fallocate_serialized, flush_file_for_read, overlay_dirty, size_change_serialized,
     sync_all_files, throttle_dirtier, unmapped, writable_mapping, write_stamp,
-    BATCH_PAGES as WRITEBACK_BATCH_PAGES,
 };
 
 #[cfg(feature = "kernel-test")]
