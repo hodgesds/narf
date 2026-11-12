@@ -1041,3 +1041,71 @@ kernel_test_in!(
     "drivers/fs/btrfs/race",
     smoke_btrfs_mutex_handoff_wakes_a_parked_waiter
 );
+
+/// A caller outside any task (a boot initcall under `block_on`, this test's
+/// thread) must not take another task's close for its own: while a task on
+/// another CPU holds the transaction closed, as the commit timer does, the
+/// caller's commit waits for it and runs after, not inside it. The boot-time
+/// btrfs write smoke once committed inside the commit timer's close.
+fn anonymous_commit_waits_for_a_task_close() -> Result<(), &'static str> {
+    use core::sync::atomic::AtomicBool;
+    if narf_lib::smp::cpu_count() < 2 {
+        return Err("skip");
+    }
+    let vol =
+        mount_writable(writable_sparse(FIXTURE_BGT_SPARSE)).map_err(|_| "fixture did not mount")?;
+    let file = poll_once(vol.root().create("anon"))
+        .and_then(|r| r.ok())
+        .ok_or("create failed")?;
+    if !matches!(poll_once(file.write(0, b"x")), Some(Ok(1))) {
+        return Err("write failed");
+    }
+    let closed = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    {
+        let (vol, closed, release) = (vol.clone(), closed.clone(), release.clone());
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                let _closed = vol.close_txn().await;
+                closed.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    narf_time::sleep_ms(1).await;
+                }
+            },
+            1,
+        );
+    }
+    let mut spins = 0u64;
+    while !closed.load(Ordering::Acquire) && spins < 4_000_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    if !closed.load(Ordering::Acquire) {
+        return Err("the closing task never ran");
+    }
+    let mut sync = vol.sync_to_disk();
+    let early = poll_once(sync.as_mut());
+    release.store(true, Ordering::Release);
+    if early.is_some() {
+        return Err("a caller outside any task committed inside another task's close");
+    }
+    let mut spins = 0u64;
+    loop {
+        if let Some(result) = poll_once(sync.as_mut()) {
+            return result.map_err(|_| "the commit failed once the close was released");
+        }
+        spins += 1;
+        if spins > 1000 {
+            return Err("the commit never ran after the close was released");
+        }
+    }
+}
+
+fn smoke_btrfs_anonymous_commit_waits_for_a_task_close() -> TestResult {
+    result(anonymous_commit_waits_for_a_task_close())
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_anonymous_commit_waits_for_a_task_close
+);
