@@ -30,10 +30,19 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The calling task (0 when the kernel cannot say, as on the host harness,
-/// whose operations all run in one thread).
+/// The caller's identity: the scheduler task being polled on this CPU, or —
+/// where none is (a boot initcall driven by `block_on`, the host harness's
+/// one thread) — the CPU, which such a caller does not leave. Never 0, and
+/// never shared with a task: an anonymous caller must not be taken for one
+/// that holds a close or a join. It once was: the boot-time btrfs write
+/// smoke, run under `block_on`, took itself for the commit timer task while
+/// the timer held the transaction closed, and committed inside the timer's
+/// commit (aarch64, whose slower boot let the 30 s timer fire mid-smoke).
 fn task() -> u64 {
-    narf_filesystem::killable::current_task()
+    match narf_scheduler::current_task_id().raw() {
+        0 => (1 << 63) | narf_lib::percpu::current_cpu() as u64,
+        id => id,
+    }
 }
 
 #[derive(Default)]
@@ -129,23 +138,17 @@ impl TxnGate {
         }
     }
 
-    /// Whether the calling task holds the close. Where the kernel cannot
-    /// name the task (the host harness, one thread), whether any close is
-    /// held: nothing joined runs while one is.
+    /// Whether the caller ([`task`]) holds the close.
     pub(crate) fn closed_by_current(&self) -> bool {
         let state = self.state.lock();
-        let me = task();
-        state.closed && (me == 0 || state.closer == me)
+        state.closed && state.closer == task()
     }
 
-    /// Whether the calling task is joined. Where the kernel cannot name the
-    /// task, whether any operation is.
+    /// Whether the caller ([`task`]) is joined.
     pub(crate) fn joined_by_current(&self) -> bool {
         let state = self.state.lock();
-        match task() {
-            0 => state.joined > 0,
-            me => state.owners.iter().any(|(t, _)| *t == me),
-        }
+        let me = task();
+        state.owners.iter().any(|(t, _)| *t == me)
     }
 
     fn wake_all(&self) {
