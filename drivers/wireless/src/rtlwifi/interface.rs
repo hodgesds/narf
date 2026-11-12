@@ -104,7 +104,8 @@ struct Leisure {
     linked: u8,
     leave: bool,
 }
-/// `RTL_WATCHDOG_TIME` (base.h): 2 s LPS decision period.
+/// `RTL_WATCH_DOG_TIME` (base.h): the 2 s watchdog period (LPS decision,
+/// `dm_watchdog`).
 const WATCHDOG_MS: u64 = 2_000;
 /// Linux `rtl88ee_mod_params.fwctrl_lps` (module parameter `fwlps`),
 /// default off exactly like the upstream RTL8188EE driver.
@@ -686,6 +687,33 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         } else if periods >= 5 && !owner.leisure() && owner.transmit_ready() {
             let _ = owner.enter_leisure().await;
         }
+    }
+    /// The prompt half of [`Self::power_save`]: a pending data-path leave
+    /// request, LPS disabled or the link gone leaves LPS now rather than at
+    /// the next watchdog period (Linux `rtl_lps_leave` from the TX/RX paths
+    /// and `lps_change_work`). The period's traffic sample is untouched.
+    pub(super) async fn lps_leave(&self, enabled: bool) {
+        let leave = core::mem::take(&mut self.leisure.lock().leave);
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return;
+        };
+        if self.admission.closed.load(Ordering::Acquire) || !owner.leisure() {
+            return;
+        }
+        let linked = owner.phase() == Phase::Running && owner.station_linked();
+        if leave || !enabled || !linked {
+            let _ = owner.leave_leisure().await;
+        }
+    }
+    /// `rtl_watchdog_wq_callback`: one `RTL_WATCH_DOG_TIME` period of the
+    /// LPS decision and `dm_watchdog` (thermal tracking, antenna diversity,
+    /// rate-adaptive mask), run from the device's watchdog work.
+    pub(super) async fn watchdog(&self) {
+        self.gain_tracking().await;
+        self.antenna_diversity().await;
+        self.power_save(FW_LPS.load(Ordering::Acquire)).await;
+        self.rate_adaptive().await;
     }
     /// Linux `rtl_pci_remove` for the native owner. `ieee80211_unregister_hw`
     /// closes every control/packet path and withdraws the netdev, wireless
@@ -1882,6 +1910,9 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
     // Linux `rtl_pci_intr_mode_decide`: MSI first. Without a vector the
     // owner keeps every IMR clear and this worker polls at 1 ms.
     device.environment.firmware().native().arm_msi();
+    // `rtl_watch_dog_timer` → `rtl_watchdog_wq_callback`, every
+    // `RTL_WATCH_DOG_TIME`, until `rtl_pci_remove`.
+    crate::watchdog_work::start(&device, WATCHDOG_MS);
     narf_scheduler::spawn(async move {
         let mut retries = 0;
         let mut retry_at = 0;
@@ -1940,10 +1971,9 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             let signal = device.environment.interrupt();
             let seen = signal.as_ref().map(|s| s.count());
             device.drain();
-            device.gain_tracking().await;
-            device.antenna_diversity().await;
-            device.power_save(FW_LPS.load(Ordering::Acquire)).await;
-            device.rate_adaptive().await;
+            // The periodic steps run from the watchdog work; only a
+            // data-path LPS leave is served here, without waiting for it.
+            device.lps_leave(FW_LPS.load(Ordering::Acquire)).await;
             match (signal, seen) {
                 (Some(signal), Some(seen)) => {
                     // Station deadlines are millisecond timers; a slow
@@ -1958,6 +1988,21 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
         }
     });
     Ok(())
+}
+/// The device's `rtl_watchdog_wq_callback` work; `rtl_pci_remove` stops it.
+impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'static>
+    crate::watchdog_work::Watchdog for Device<I, M, E>
+where
+    Self: Send + Sync,
+{
+    fn watchdog_stopped(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
+    }
+    fn watchdog_step(
+        self: Arc<Self>,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>> {
+        Box::pin(async move { self.watchdog().await })
+    }
 }
 /// Housekeeping tick while a bound vector drives RX/TX service.
 const HOUSEKEEPING_NS: u64 = 20_000_000;
