@@ -803,6 +803,13 @@ slab_sites() { # label
     n=$((n + 1))
     ((n <= 90)) && say "SOAK-SITES $1 $line"
   done < /proc/narf/slab_sites
+  # Scheduler tasks /proc does not list, grouped by where they wait.
+  n=0
+  [ -r /proc/narf/tasks ] || return 0
+  while read -r line; do
+    n=$((n + 1))
+    ((n <= 70)) && say "SOAK-NTASKS $1 $line"
+  done < /proc/narf/tasks
 }
 
 settle_meminfo() { # label
