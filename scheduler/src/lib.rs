@@ -5961,6 +5961,14 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
     }
 }
 
+/// Reschedule IPIs `cpu` has sent since boot.
+#[doc(hidden)]
+pub fn __test_resched_ipis_sent(cpu: usize) -> u64 {
+    SCHEDULER_TELEMETRY.get(cpu).map_or(0, |telemetry| {
+        telemetry.resched_sent.load(Ordering::Relaxed)
+    })
+}
+
 unsafe fn drop_raw(data: *const ()) {
     // SAFETY: reconstructing consumes the refcount owned by this waker.
     unsafe {
