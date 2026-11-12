@@ -75,6 +75,18 @@ unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
 // SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
 unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
+/// [`Mutex::held_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldState {
+    /// Held, by a guard or by a grant not yet claimed.
+    pub locked: bool,
+    /// The waiter (its id) a release handed the lock to, which has not run
+    /// to claim it yet.
+    pub granted_to: Option<u64>,
+    /// Futures queued for the lock.
+    pub waiters: usize,
+}
+
 impl<T> Mutex<T> {
     pub const fn new(data: T) -> Self {
         Self {
@@ -137,6 +149,20 @@ impl<T: ?Sized> Mutex<T> {
     #[inline]
     pub fn is_locked(&self) -> bool {
         self.inner.lock().locked
+    }
+
+    /// Who has the lock, for state dumps: held or not, the waiter a release
+    /// handed it to that has not yet run to claim it (it owns the lock
+    /// meanwhile, so nothing else can take it), and how many wait. A lock
+    /// held by a grantee that never runs looks free to every other
+    /// diagnostic; this names it. Racy, like [`Self::is_locked`].
+    pub fn held_state(&self) -> HeldState {
+        let inner = self.inner.lock();
+        HeldState {
+            locked: inner.locked,
+            granted_to: inner.granted.map(|WaiterId(id)| id),
+            waiters: inner.waiters.len(),
+        }
     }
 }
 
@@ -414,6 +440,9 @@ mod admission_tests {
         // queued or not, can take it in between.
         drop(barger);
         assert!(mutex.try_lock().is_none());
+        // The grant shows in the state dump until A runs to claim it.
+        let held = mutex.held_state();
+        assert!(held.locked && held.granted_to.is_some());
         let mut c = mutex.lock();
         assert!(Pin::new(&mut c).poll(&mut cx).is_pending());
         let Poll::Ready(a_guard) = Pin::new(&mut a).poll(&mut cx) else {
