@@ -3379,6 +3379,117 @@ kernel_test_in!(
     smoke_memory_page_tables_return_after_map_unmap_exit
 );
 
+/// A user address space with one materialized, written page in each of three
+/// PML4 slots. Returns the space and the three addresses.
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+fn mm_user_fixture() -> Result<(alloc::sync::Arc<crate::AddressSpace>, [u64; 3]), TestResult> {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+    let bases = [
+        0x0000_0080_0000_0000_u64,
+        0x0000_4000_0000_0000_u64,
+        0x0000_7fff_f000_0000_u64,
+    ];
+    // SAFETY: paging is enabled; the test exclusively owns the AS.
+    let space = unsafe { AddressSpace::new_for_user() }
+        .map_err(|_| TestResult::Skip("new_for_user failed"))?;
+    for (i, base) in bases.iter().enumerate() {
+        let backing = crate::alloc_frame()
+            .map_err(|_| TestResult::Skip("frame allocator drained"))?
+            .start_address();
+        // SAFETY: a fresh frame this test owns, reached through the direct map.
+        unsafe { backing.kernel_mut_ptr::<u64>().write(0x5a00 + i as u64) };
+        space
+            .map_region(Region {
+                base: VirtAddr::new(*base),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![backing].into(),
+            })
+            .map_err(|_| TestResult::Fail("fixture region was rejected"))?;
+    }
+    // SAFETY: the test owns the root and every backing frame.
+    unsafe { space.materialize() }.map_err(|_| TestResult::Fail("fixture materialize failed"))?;
+    Ok((alloc::sync::Arc::new(space), bases))
+}
+
+/// Linux `mmget_not_zero` against `exit_mmap`, in every interleaving: an
+/// accessor that took a user reference before the last task left keeps the
+/// memory readable until it lets go, and its `mmput` is what runs
+/// `exit_mmap`; one that comes after the last task fails to take one, so it
+/// can never read memory `exit_mmap` is freeing. A `Weak`/`Arc` alone
+/// (`mm_count`) does not keep the memory.
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+fn smoke_memory_mmget_not_zero_orders_against_exit_mmap() -> TestResult {
+    use crate::{RemoteAccess, RemoteBuf};
+    let read = |space: &crate::AddressSpace, addr: u64| -> Option<u64> {
+        let mut word = [0u8; 8];
+        let access = RemoteAccess {
+            write: false,
+            force: true,
+            expand_stack: None,
+        };
+        // SAFETY: the callers hold a user reference on `space`.
+        (unsafe { space.access_remote(addr, RemoteBuf::Read(&mut word), access) } == 8)
+            .then(|| u64::from_ne_bytes(word))
+    };
+    for round in 0..64u32 {
+        let (space, bases) = match mm_user_fixture() {
+            Ok(fixture) => fixture,
+            Err(result) => return result,
+        };
+        // No task yet: no user, nothing to take.
+        if space.mmget_not_zero().is_some() {
+            return TestResult::Fail("mmget_not_zero succeeded with no user");
+        }
+        space.scheduler_attach_user_task();
+        let weak = alloc::sync::Arc::downgrade(&space);
+        match round % 2 {
+            // The accessor gets in first: the task's exit must not tear the
+            // memory down under it; its own mmput does.
+            0 => {
+                let Some(user) = weak.upgrade().and_then(|mm| mm.mmget_not_zero()) else {
+                    return TestResult::Fail("mmget_not_zero failed on a live space");
+                };
+                if space.scheduler_detach_user_task() {
+                    return TestResult::Fail("the task's exit was counted as the last user");
+                }
+                for (i, base) in bases.iter().enumerate() {
+                    if read(&user, *base) != Some(0x5a00 + i as u64) {
+                        return TestResult::Fail("memory went away under a user reference");
+                    }
+                }
+                drop(user);
+                if space.region_count() != 0 || space.page_table_frames() != 1 {
+                    return TestResult::Fail("the last mmput did not run exit_mmap");
+                }
+            }
+            // The task leaves first: exit_mmap runs, and a later accessor's
+            // mmget_not_zero must fail although the struct is still there.
+            _ => {
+                if !space.scheduler_detach_user_task() {
+                    return TestResult::Fail("the only task's exit was not the last user");
+                }
+                space.exit_mmap();
+                if weak.upgrade().and_then(|mm| mm.mmget_not_zero()).is_some() {
+                    return TestResult::Fail("mmget_not_zero succeeded after the last user");
+                }
+                if space.region_count() != 0 || space.page_table_frames() != 1 {
+                    return TestResult::Fail("exit_mmap left mappings or tables");
+                }
+            }
+        }
+        if space.scheduler_user_tasks() != 0 {
+            return TestResult::Fail("user count did not return to zero");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+kernel_test_in!(
+    "memory/sparse-teardown",
+    smoke_memory_mmget_not_zero_orders_against_exit_mmap
+);
+
 // ── dual-arch tests (no AS::drop-realloc cycle) ───────────────────
 
 /// Accounting callers must be able to total a large lazy mapping without

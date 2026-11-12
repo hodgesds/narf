@@ -34,7 +34,12 @@ impl AnonReclaimer for TaskAnonReclaimer {
             }
             // Only user processes have an address space; a kernel task or an
             // already-reaped zombie resolves to None and is skipped.
-            let Some(aspace) = narf_scheduler::address_space_of_live(TaskId(tid)) else {
+            // A user reference for the scan (Linux `mmget_not_zero`): a space
+            // whose last task is gone is being emptied by `exit_mmap` and has
+            // nothing left worth swapping.
+            let Some(aspace) = narf_scheduler::address_space_of_live(TaskId(tid))
+                .and_then(|aspace| aspace.mmget_not_zero())
+            else {
                 continue;
             };
             // Tier zero: drain this space's deferred-flush quarantine — the

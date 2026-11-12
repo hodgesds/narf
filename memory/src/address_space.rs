@@ -2673,6 +2673,37 @@ pub struct AddressSpace {
     membarrier_task_state: core::sync::atomic::AtomicU32,
 }
 
+/// A user reference to an address space (Linux `mmget`/`mmput`), from
+/// [`AddressSpace::mmget_not_zero`]. Its memory and page tables stay in place
+/// while it lives; dropping the last user runs `exit_mmap`.
+#[derive(Debug)]
+pub struct MmUser {
+    space: alloc::sync::Arc<AddressSpace>,
+}
+
+impl MmUser {
+    /// The address space, as an `Arc` (`mm_count`) a caller may keep.
+    pub fn arc(&self) -> &alloc::sync::Arc<AddressSpace> {
+        &self.space
+    }
+}
+
+impl core::ops::Deref for MmUser {
+    type Target = AddressSpace;
+
+    fn deref(&self) -> &AddressSpace {
+        &self.space
+    }
+}
+
+impl Drop for MmUser {
+    fn drop(&mut self) {
+        if self.space.scheduler_detach_user_task() {
+            self.space.exit_mmap();
+        }
+    }
+}
+
 // `clone_for_fork` is intentionally a by-value interface today. Keep the
 // value small enough that nested syscall/fork frames cannot silently consume
 // a material fraction of the 32 KiB kernel-task stack again. Large bounded
@@ -2918,8 +2949,35 @@ impl AddressSpace {
         false
     }
 
-    /// Scheduler tasks which may still execute through this address space
-    /// (Linux `mm_users`, as opposed to the `Arc` count, `mm_count`).
+    /// Linux `mmget_not_zero`: take a user reference (`mm_users`) for the
+    /// duration of an access to another task's memory, unless the last user
+    /// is already gone — then `exit_mmap` has run or is running, and the
+    /// caller must fail as Linux does (`-ESRCH`, `-EIO`, a short or empty
+    /// read). While the returned [`MmUser`] lives, `exit_mmap` cannot start;
+    /// dropping it is `mmput`, and the drop that ends the last user runs
+    /// `exit_mmap` itself. An `Arc` alone (`mm_count`) keeps only the struct.
+    pub fn mmget_not_zero(self: &alloc::sync::Arc<Self>) -> Option<MmUser> {
+        self.membarrier_task_state
+            .fetch_update(
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+                |state| {
+                    let count = state >> LIVE_USER_TASKS_SHIFT;
+                    if count == 0 || count >= u32::MAX >> LIVE_USER_TASKS_SHIFT {
+                        return None;
+                    }
+                    Some((state & MEMBARRIER_STATE_MASK) | ((count + 1) << LIVE_USER_TASKS_SHIFT))
+                },
+            )
+            .ok()
+            .map(|_| MmUser {
+                space: self.clone(),
+            })
+    }
+
+    /// Users of this address space (Linux `mm_users`): scheduler tasks which
+    /// may still execute through it plus [`MmUser`] references held by
+    /// accessors of its memory — as opposed to the `Arc` count, `mm_count`.
     pub fn scheduler_user_tasks(&self) -> u32 {
         self.membarrier_task_state
             .load(core::sync::atomic::Ordering::Acquire)
