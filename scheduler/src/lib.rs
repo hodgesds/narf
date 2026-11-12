@@ -9044,6 +9044,10 @@ pub fn responsive_spin_until<F: FnMut() -> bool>(
         }
         if i & 0xFFF == 0 {
             sleep_pumps::run();
+            // The timer softirq the executor round runs: a waiter outside
+            // the executor (polled driver paths, boot-time tests) still
+            // sees timer-wheel timers — request timeouts — expire.
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
         }
         core::hint::spin_loop();
         i = i.wrapping_add(1);
@@ -9152,8 +9156,12 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
             Poll::Pending => {
                 // Tick the sleep pumps so cursor/FB/serial stay
                 // alive while we wait for an IRQ wake or self-
-                // wake from the future's busy-poll.
+                // wake from the future's busy-poll, and expire the
+                // timer wheel as the executor round would (a future
+                // waiting on a timer-wheel timer is woken here, not
+                // by an executor that is not running).
                 sleep_pumps::run();
+                let _ = narf_time::hrtimer::hrtimer_run_softirq();
                 if allow_halt && !awake.flag.load(Ordering::Acquire) {
                     // Cooperative path: idle until something
                     // fires an IRQ. IRQ handler (or the future's
