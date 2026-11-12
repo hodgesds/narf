@@ -965,6 +965,18 @@ static LARGE_IN_USE: AtomicUsize = AtomicUsize::new(0);
 /// count here so [`frames_held`] can be exact.
 static LARGE_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
+/// Live contiguous LARGE allocations per buddy order, the large-object
+/// counterpart of a size class's live-object count (`/proc/slabinfo`
+/// `kmalloc-8k`… rows). One relaxed RMW on a path that already takes the
+/// buddy lock.
+static LARGE_LIVE_BY_ORDER: [AtomicUsize; MAX_ORDER as usize + 1] =
+    [const { AtomicUsize::new(0) }; MAX_ORDER as usize + 1];
+
+/// Live LARGE allocations served by the scattered vmalloc fallback, and the
+/// order-0 frames backing them.
+static LARGE_VMALLOC_LIVE: AtomicUsize = AtomicUsize::new(0);
+static LARGE_VMALLOC_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
 /// Why an allocation failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SlabError {
@@ -1444,6 +1456,7 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     if let Ok(frame) = alloc_pages_on(0, order) {
         LARGE_IN_USE.fetch_add(1, Ordering::Relaxed);
         LARGE_FRAMES.fetch_add(1usize << order, Ordering::Relaxed);
+        LARGE_LIVE_BY_ORDER[order as usize].fetch_add(1, Ordering::Relaxed);
         let p = frame.start_address().kernel_mut_ptr::<u8>();
         // SAFETY: `p` is reachable through the per-arch kernel
         // mapping + page-aligned to its order.
@@ -1462,6 +1475,8 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     // that is the whole point of the fallback, so it must not be accounted
     // as though it had allocated a contiguous block.
     LARGE_FRAMES.fetch_add(n_pages, Ordering::Relaxed);
+    LARGE_VMALLOC_LIVE.fetch_add(1, Ordering::Relaxed);
+    LARGE_VMALLOC_FRAMES.fetch_add(n_pages, Ordering::Relaxed);
     Ok(p)
 }
 
@@ -1474,7 +1489,10 @@ unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
         // slab always frees a large block with its original layout).
         unsafe { crate::vmalloc::vfree(ptr, layout.size()) };
         LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
-        LARGE_FRAMES.fetch_sub(layout.size().div_ceil(PAGE_SIZE_USIZE), Ordering::Relaxed);
+        let n_pages = layout.size().div_ceil(PAGE_SIZE_USIZE);
+        LARGE_FRAMES.fetch_sub(n_pages, Ordering::Relaxed);
+        LARGE_VMALLOC_LIVE.fetch_sub(1, Ordering::Relaxed);
+        LARGE_VMALLOC_FRAMES.fetch_sub(n_pages, Ordering::Relaxed);
         return;
     }
     // `alloc_large` handed out `frame.start_address().kernel_mut_ptr()`,
@@ -1516,6 +1534,7 @@ unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
     free_pages(frame, order);
     LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
     LARGE_FRAMES.fetch_sub(1usize << order, Ordering::Relaxed);
+    LARGE_LIVE_BY_ORDER[order as usize].fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Smallest buddy order that fits `n_pages`. Returns Err when the
@@ -1600,6 +1619,93 @@ pub fn magazine_stats() -> MagazineStats {
     MagazineStats {
         mag_hit_count: hits,
         mag_miss_count: misses,
+    }
+}
+
+/// Where one size class's frames are: the retention breakdown behind
+/// `/proc/slabinfo` and the `memory.stat`-style `/proc/narf/slab` detail.
+///
+/// `frames - empty_frames` frames hold at least one object that is allocated
+/// or parked in a per-CPU magazine; `live_objects` against
+/// `frames * objs_per_frame` is the class's packing. A class whose
+/// `live_objects` keeps rising across identical load cycles leaks; one whose
+/// `live_objects` returns to baseline while `frames` does not retains freed
+/// memory (fragmentation or an over-large empty-frame cache).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClassDetail {
+    pub block_size: usize,
+    pub objs_per_frame: usize,
+    /// Frames the class currently holds from the buddy.
+    pub frames: usize,
+    /// Objects handed out and not yet freed.
+    pub live_objects: usize,
+    /// Free objects cached in per-CPU magazines.
+    pub magazine_free: usize,
+    /// Free objects on the central lists (tracked frames and legacy FIFO).
+    pub central_free: usize,
+    /// Tracked frames with some, but not all, objects on the central list.
+    pub partial_frames: usize,
+    /// Tracked frames with every object on the central list: returnable to
+    /// the buddy as they stand.
+    pub empty_frames: usize,
+    /// Free objects on the untracked legacy FIFO (frames grown before PFN
+    /// metadata existed), including any held by an in-progress reclaim scan.
+    pub legacy_free: usize,
+}
+
+/// Live LARGE (> largest class) allocations.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LargeDetail {
+    /// Contiguous allocations alive per buddy order.
+    pub live_by_order: [usize; MAX_ORDER as usize + 1],
+    /// Scattered vmalloc-fallback allocations alive.
+    pub vmalloc_live: usize,
+    /// Order-0 frames backing the vmalloc-fallback allocations.
+    pub vmalloc_frames: usize,
+    /// All frames held by large allocations.
+    pub frames: usize,
+}
+
+/// Retention breakdown of size class `c` (`c < num_classes()`). Takes the
+/// class lock for a constant number of loads (no allocation, no walk), so it
+/// is safe from any sleepable diagnostic reader; the magazine figure is a
+/// relaxed snapshot.
+pub fn class_detail(c: usize) -> ClassDetail {
+    let class = &CLASSES[c];
+    let (partial_frames, empty_frames, legacy_free) = {
+        let g = class.head.lock();
+        let (partial, empty) = g.frames.counts();
+        (partial, empty, g.len + g.scan.pending_count)
+    };
+    let grown = class.grown.load(Ordering::Relaxed);
+    let bpf = blocks_per_frame(c);
+    let magazine_free = class.magazines.iter().fold(0usize, |free, mag| {
+        free.saturating_add(mag.available.load(Ordering::Relaxed))
+    });
+    ClassDetail {
+        block_size: class_size(c),
+        objs_per_frame: bpf,
+        frames: grown / bpf,
+        live_objects: class.in_use(grown),
+        magazine_free,
+        central_free: class.central_free.load(Ordering::Relaxed),
+        partial_frames,
+        empty_frames,
+        legacy_free,
+    }
+}
+
+/// Live LARGE allocation breakdown. Lock-free relaxed snapshot.
+pub fn large_detail() -> LargeDetail {
+    let mut live_by_order = [0usize; MAX_ORDER as usize + 1];
+    for (slot, counter) in live_by_order.iter_mut().zip(LARGE_LIVE_BY_ORDER.iter()) {
+        *slot = counter.load(Ordering::Relaxed);
+    }
+    LargeDetail {
+        live_by_order,
+        vmalloc_live: LARGE_VMALLOC_LIVE.load(Ordering::Relaxed),
+        vmalloc_frames: LARGE_VMALLOC_FRAMES.load(Ordering::Relaxed),
+        frames: LARGE_FRAMES.load(Ordering::Relaxed),
     }
 }
 
@@ -1938,6 +2044,12 @@ unsafe fn reclaim_class_frames(c: usize, max_pages: usize) -> usize {
     // SAFETY: exactly the initialized detached prefix is passed once.
     unsafe { free_detached_slab_frames(&frames[..detached]) };
     detached
+}
+
+/// `(limit, batchcount)` of the per-CPU magazines, for `/proc/slabinfo`'s
+/// `tunables` columns: capacity, and the batch moved per central transfer.
+pub const fn magazine_tunables() -> (usize, usize) {
+    (MAG_SIZE, MAG_SIZE / 2)
 }
 
 /// Number of distinct size classes the allocator supports.

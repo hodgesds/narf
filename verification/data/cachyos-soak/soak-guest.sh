@@ -213,6 +213,13 @@ sampler() {
       line+=" ${k%:}=$v"
     done < /proc/meminfo
     say "$line"
+    if ((n % 12 == 0)) && [ -r /proc/narf/slab ]; then
+      line="SOAK-SLAB n=$n"
+      while read -r k v; do
+        [ "$v" = 0 ] || line+=" $k=$v"
+      done < /proc/narf/slab
+      say "$line"
+    fi
     for k in cpu memory io; do
       [ -r /proc/pressure/$k ] || continue
       while read -r line; do say "SOAK-PSI $k $line"; done < /proc/pressure/$k
@@ -798,6 +805,15 @@ settle_meminfo() { # label
     esac
   done < /proc/meminfo
   say "$line"
+  # Where the kernel heap's frames are (NARF only): live objects against
+  # frames per size class separates a leak from retained free memory.
+  if [ -r /proc/narf/slab ]; then
+    line="SOAK-SLAB $1"
+    while read -r k v; do
+      [ "$v" = 0 ] || line+=" $k=$v"
+    done < /proc/narf/slab
+    say "$line"
+  fi
 }
 
 read -r _ MEM_KB _ < /proc/meminfo
