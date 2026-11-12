@@ -2106,10 +2106,16 @@ static WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 async fn background_pass() {
     PASSES.fetch_add(1, Ordering::Relaxed);
     super::release_deferred_slots();
-    let wanted = RECLAIM_WANTED.swap(0, Ordering::AcqRel);
-    if wanted != 0 {
-        reclaim_mapped(wanted);
+    // A batch at a time, yielding between batches, until the request is met
+    // or nothing more can be freed.
+    let mut wanted = RECLAIM_WANTED.swap(0, Ordering::AcqRel);
+    while wanted != 0 {
+        let freed = reclaim_mapped(wanted);
         narf_scheduler::yield_now().await;
+        if freed == 0 {
+            break;
+        }
+        wanted = wanted.saturating_sub(freed);
     }
 
     // Pages nobody maps: all of them. They cannot change any more, and they
@@ -2390,7 +2396,9 @@ pub(super) fn reclaim_mapped(target: usize) -> usize {
     if target == 0 {
         return 0;
     }
-    let budget = target.saturating_mul(RECLAIM_SCAN_FACTOR).min(4096);
+    // At most a batch of pages per call: the flusher yields between calls.
+    let target = target.min(BATCH_PAGES);
+    let budget = target.saturating_mul(RECLAIM_SCAN_FACTOR);
     let mut chosen: Vec<(SharedFileIdentity, u64, PhysAddr)> = Vec::new();
     if chosen.try_reserve(target.min(budget)).is_err() {
         return 0;
@@ -2465,6 +2473,7 @@ pub(crate) fn register_shrinker() {
         super::shared_page_write_enabled,
         super::shared_page_write_fault,
     );
+    narf_filesystem::procfs::set_page_cache_stats_hook(super::page_cache_stats);
     narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
         name: "shared-file-pages",
         count: shrink_count,
