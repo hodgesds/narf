@@ -1708,12 +1708,25 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // reclaim. Its scheduler kick is deliberately enough to end
                 // that wait; honour the pending fatal signal before this failed
                 // allocation is misclassified as a fresh synchronous SIGSEGV.
-                if from_user && narf_userspace::handlers::current_task_fatal_signal_pending() {
-                    let mut ctx = X86TrapContext::from_int80(frame);
-                    if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
-                        hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
-                    }
-                }
+                //
+                // The default action exits the task on this stack and never
+                // returns, so no destructor of a local here runs: release the
+                // address-space reference first. Holding it across the exit
+                // leaked one strong `Arc` per task killed in a fault — its
+                // whole address space outlived it (a kill storm's ~14 page
+                // tables and the pages of every such child). Should the hook
+                // return, take a fresh reference for the stack-grow attempt.
+                let as_arc =
+                    if from_user && narf_userspace::handlers::current_task_fatal_signal_pending() {
+                        drop(as_arc);
+                        let mut ctx = X86TrapContext::from_int80(frame);
+                        if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
+                            hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+                        }
+                        narf_userspace::active_user_as()
+                    } else {
+                        Some(as_arc)
+                    };
                 file_fault_bus = r == Err(narf_memory::AddressSpaceError::Bus);
                 // A guard marker is a final SIGSEGV, never a stack grow.
                 let guard_fault = r == Err(narf_memory::AddressSpaceError::GuardPage);
@@ -1735,7 +1748,9 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // are delivered far more often near a stack boundary).
                 // try_grow_stack requires a nearby real STACK_GUARD region, so
                 // a non-stack user vaddr still reaches the SEGV/panic surface.
-                if !file_fault_bus && !guard_fault && (from_user || cr2_in_user_half) {
+                if let Some(as_arc) = as_arc
+                    .filter(|_| !file_fault_bus && !guard_fault && (from_user || cr2_in_user_half))
+                {
                     // SAFETY: same identity-map argument.
                     if unsafe {
                         as_arc.try_grow_stack_with_limits(
