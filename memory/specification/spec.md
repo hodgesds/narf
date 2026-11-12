@@ -1214,6 +1214,21 @@ impl AddressSpace {
 /// corresponding translations have been invalidated. Plain SHARED mappings
 /// instead retain backing through their VMA-level or in-memory owner.
 pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64));
+/// Dirty tracking for SHARED|EXTERNAL_REFS frames (Linux write-notify:
+/// `do_wp_page` -> `page_mkwrite`). A PTE for such a frame in a writable
+/// region carries the write bit only while `write_enabled(phys)` says so; a
+/// store to a read-only one reaches `cow_split_on_write`, which calls
+/// `write_notify(phys)` instead of copying, and the fault path re-installs
+/// the PTE. Both hooks run under the region lock and must not re-enter this
+/// crate. Uninstalled, such PTEs are writable as before.
+pub fn install_shared_page_write_hooks(write_enabled: fn(u64) -> bool, write_notify: fn(u64) -> bool);
+impl AddressSpace {
+    /// Re-install `vaddr`'s PTE from the region's current state if it still
+    /// maps `expected` in a SHARED|EXTERNAL_REFS region (Linux `folio_mkclean`
+    /// per mapper); every CPU's TLB entry for it is invalidated before return.
+    pub unsafe fn refresh_shared_page(&self, vaddr: VirtAddr, expected: PhysAddr)
+        -> Result<bool, AddressSpaceError>;
+}
 /// Clone upper-layer VMA ownership while the parent fork transaction still
 /// excludes mutation, before a child may expose borrowed shared backing.
 /// Callers that create SHARED mappings without EXTERNAL_REFS must either
