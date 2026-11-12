@@ -187,7 +187,7 @@ executor.
 | `timers_dead_cpu` | `timers_dead_cpu(cpu)` from CPU offline |
 | `schedule_timeout` / `msleep` | `TimeoutHandle` (`process_timeout` wakes by reference); `narf_time::msleep` |
 | `struct tmigr_group` hierarchy, `TMIGR_CHILDREN_PER_GROUP` = 8 | `timer_migration::Tmigr`: level 0 groups CPUs sharing a last-level cache, level 1 groups those by package / NUMA node, level 2 fans in by eight, level 3 is the root (four levels reach one root for up to 4096 CPUs); built at CPU online (`tmigr_cpu_online(cpu, llc, node)` from the scheduler's CPU startup) |
-| `migr_state` (active mask, migrator), `tmigr_active_up` / `tmigr_inactive_up` | per group: active children and one migrator child; going idle hands the role to an active sibling, and a group with none left goes idle in its parent; waking takes the role in a group without one and continues up. Updated under the group lock (Linux: lock-free CAS with a sequence) |
+| `migr_state` (active mask, migrator), `tmigr_active_up` / `tmigr_inactive_up` | per group: active children and one migrator child; going idle hands the role to an active sibling, and a group with none left goes idle in its parent; waking takes the role in a group without one and continues up. One atomic word per group (active mask, migrator, 16-bit sequence) changed only by compare-and-exchange, as Linux: activation takes no lock and leaves its queued events marked `ignore` (dropped lazily under the group lock); an inactive walk keeps a child group's bit if that child went active again meanwhile |
 | `struct tmigr_event`, `tmigr_update_events` | an idle CPU's next GLOBAL expiry is an event in its group; an idle group's first event (with its CPU) is an event in the parent. A walk carries the child's view into the parent while holding the child's lock |
 | `tmigr_cpu_deactivate` return / `tmc->wakeup` | only the CPU whose walk leaves the root idle (the last active CPU, or an idle CPU whose new timer reaches an idle root) wakes for the root's first event; every other idle CPU's next event leaves its GLOBAL timers out |
 | `tmigr_requires_handle_remote` / `tmigr_handle_remote` / `tmigr_handle_remote_cpu` / `timer_expire_remote` | lock-free check from the executor round; the walk up the groups this CPU is migrator of (or that have none) pops each due event and runs that idle CPU's GLOBAL base here, then requeues its next expiry; an active migrator's next event includes those groups' first events |
@@ -362,7 +362,12 @@ single-shot drain, and PPS.
   late only if its migrator does not run its executor round (an active CPU
   with interrupts masked), as a pinned timer is if its own CPU does not.
   Locks: `tmc` → group locks bottom-up, at most a child and its parent at
-  once; no timer base lock is held across them.
+  once; no timer base lock is held across them. A group's active mask and
+  migrator change only by sequence-counted compare-and-exchange; an event
+  update re-reads the child's state under the child's and parent's locks
+  and leaves an active child's event ignored, so a stale walk can add a
+  spurious remote expiry (which rechecks under the CPU's `tmc` lock) but
+  never drop an idle CPU's event.
 - Wall-clock jumps (NTP step) never leak into monotonic time.
 - Frequency changes from `arch/` (CPU DVFS) are invisible through
   this interface — the clocksource frequency is either invariant
