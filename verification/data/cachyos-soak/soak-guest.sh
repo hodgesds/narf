@@ -793,14 +793,15 @@ survey_shared() { # label
   say "SOAK-SHMAP $1 total=$n"
 }
 
-# Who holds the heap (NARF only): the live bytes per allocation site, top 30,
-# as .text offsets to symbolize against the run's kernel.
+# Who holds the heap (NARF only): the live bytes per allocation site, top 40,
+# as .text offsets to symbolize against the run's kernel; then the same for
+# buddy frames when frame attribution is armed.
 slab_sites() { # label
   local n=0 line
   [ -r /proc/narf/slab_sites ] || return 0
   while read -r line; do
     n=$((n + 1))
-    ((n <= 33)) && say "SOAK-SITES $1 $line"
+    ((n <= 90)) && say "SOAK-SITES $1 $line"
   done < /proc/narf/slab_sites
 }
 
