@@ -429,6 +429,43 @@ kernel_test_in!(
     smoke_connect_fails_ehostunreach_when_arp_gives_up
 );
 
+/// The neighbour's resolution timer is a wheel timer (`neigh->timer`): with
+/// nobody scanning, the executor round's timer softirq alone re-sends the
+/// ARP request after `RETRANS_TIME`; the reply stops the timer.
+fn smoke_neigh_timer_retransmits_from_the_wheel() -> TestResult {
+    let local = [10, 0, 98, 1];
+    let _ = reset("tcp-rob-neigh-wheel", local);
+    let peer = [10, 0, 98, 9];
+    let peer_mac = [0x02, 0, 0, 0, 0, 0x98];
+    let Ok(_) = core::connect_start_in(0, peer, 80, core::ConnectOptions::default()) else {
+        return TestResult::Fail("connect_start_in failed");
+    };
+    let mut requests = arp_requests_for(&drain(), peer);
+    if crate::tcp_stack::__neigh_timer_pending("tcp-rob-neigh-wheel", peer) != Some(true) {
+        return TestResult::Fail("starting resolution did not arm the neighbour timer");
+    }
+    // Twice RETRANS_TIME, expiring timers only as an executor round does.
+    let end = narf_scheduler::narf_time::monotonic_ns() + 2_500_000_000;
+    while requests < 2 && narf_scheduler::narf_time::monotonic_ns() < end {
+        let _ = narf_scheduler::narf_time::hrtimer::hrtimer_run_softirq();
+        requests += arp_requests_for(&drain(), peer);
+        ::core::hint::spin_loop();
+    }
+    if requests < 2 {
+        return TestResult::Fail("the neighbour timer did not re-send the ARP request");
+    }
+    arp_reply("tcp-rob-neigh-wheel", local, peer, peer_mac);
+    let _ = drain();
+    if crate::tcp_stack::__neigh_timer_pending("tcp-rob-neigh-wheel", peer).is_some() {
+        return TestResult::Fail("the ARP reply did not stop the neighbour timer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tcp/robust",
+    smoke_neigh_timer_retransmits_from_the_wheel
+);
+
 /// A SYN from a peer whose MAC we do not know is answered without waiting in
 /// the RX path: the SYN-ACK queues on the neighbour and goes out with the ARP
 /// reply. (This used to spin up to 500 ms inside the receive handler.)

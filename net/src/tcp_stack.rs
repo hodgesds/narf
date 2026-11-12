@@ -129,6 +129,7 @@ pub fn neigh_output_in(net_ns_id: u64, nexthop: [u8; 4], len: usize, cont: arp_c
     arp_cache::queue_pending(net_ns_id, &name, nexthop, len, cont);
     if !resolving {
         arp_cache::mark_incomplete(&name, nexthop);
+        neigh_add_timer(net_ns_id, &name, nexthop);
         let _ = send_arp_request_in(net_ns_id, nexthop);
     }
     // Resolved between the lookup and the queueing: flush now.
@@ -154,6 +155,7 @@ pub fn neigh_start_in(net_ns_id: u64, nexthop: [u8; 4]) -> Option<[u8; 6]> {
         return None;
     }
     arp_cache::mark_incomplete(&name, nexthop);
+    neigh_add_timer(net_ns_id, &name, nexthop);
     let _ = send_arp_request_in(net_ns_id, nexthop);
     arp_lookup_local(net_ns_id, nexthop)
 }
@@ -161,53 +163,195 @@ pub fn neigh_start_in(net_ns_id: u64, nexthop: [u8; 4]) -> Option<[u8; 6]> {
 /// An ARP packet taught us `ip`'s MAC on `iface_name`: send everything that
 /// was waiting for it (`neigh_update` → `neigh_update_process_arp_queue`).
 pub fn neigh_resolved(net_ns_id: u64, iface_name: &str, ip: [u8; 4], mac: [u8; 6]) {
+    // `neigh_update` to NUD_REACHABLE: the resolution timer stops.
+    neigh_del_timer(iface_name, ip);
     for cont in arp_cache::take_pending(net_ns_id, iface_name, ip) {
         cont(Some(mac));
     }
     crate::udp_sock::neighbor_resolved(net_ns_id, iface_name, ip, mac);
 }
 
-/// The neighbour timer (`neigh_timer_handler`) for resolutions that have
-/// transmits waiting: retransmit the request every `RETRANS_TIME`, and once
-/// the probe budget is spent mark the neighbour FAILED and fail its queue.
-pub fn neigh_tick() {
-    let mut waiting = arp_cache::pending_neighbours();
-    for n in crate::udp_sock::pending_neighbours() {
-        if !waiting.contains(&n) {
-            waiting.push(n);
-        }
+// ── Neighbour timers (`neigh_timer_handler`) ────────────────────
+//
+// Linux arms `neigh->timer` while a neighbour resolves (NUD_INCOMPLETE /
+// NUD_PROBE): every RETRANS_TIME it re-sends the request, and once the probe
+// budget is spent it marks the neighbour FAILED and fails its queue
+// (`neigh_invalidate`). NARF keeps one wheel timer per resolving neighbour,
+// keyed by (interface, address), outside the ARP entry (entries are copied
+// out of the cache by value).
+//
+// Lifetime is reference counted, as `neigh_hold` / `neigh_release` around
+// `neigh_add_timer` / `neigh_del_timer`: the map holds one `Arc`, a pending
+// timer holds one more (taken when it goes idle → pending, returned by its
+// callback or by a delete), so the callback may drop the last reference.
+
+/// One resolving neighbour's timer.
+#[repr(C)]
+struct NeighTimer {
+    /// First field: the callback's `TimerRef` is the `Arc` payload pointer.
+    timer: narf_scheduler::narf_time::timer::TimerList,
+    net_ns_id: u64,
+    name: alloc::string::String,
+    ip: [u8; 4],
+}
+
+type NeighKey = (alloc::string::String, [u8; 4]);
+
+static NEIGH_TIMERS: IrqSafeSpinLock<BTreeMap<NeighKey, alloc::sync::Arc<NeighTimer>>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Arm `nt` for monotonic `at_ns` (`neigh_add_timer`).
+fn neigh_timer_arm(nt: &alloc::sync::Arc<NeighTimer>, at_ns: u64) {
+    use narf_scheduler::narf_time::timer;
+    let j = timer::ns_to_jiffies(at_ns).max(timer::jiffies() + 1);
+    // SAFETY: the timer lives in the `Arc` allocation, which a pending timer
+    // keeps alive through the reference taken below.
+    if unsafe { timer::mod_timer_checked(&nt.timer, j, false) } == 0 {
+        // SAFETY: `nt` is a live `Arc` (the caller holds it), so the count
+        // is non-zero; the callback or a delete gives this one back.
+        unsafe { alloc::sync::Arc::increment_strong_count(alloc::sync::Arc::as_ptr(nt)) };
     }
-    for (net_ns_id, name, ip) in waiting {
-        match arp_cache::poll_resolution(&name, ip) {
-            arp_cache::ResolutionStep::Retransmit => {
-                let _ = send_arp_request_in(net_ns_id, ip);
+}
+
+/// `neigh_del_timer` + forget the neighbour's timer: dequeue it, give back
+/// the pending reference, refuse later arms. A callback already running
+/// finishes with its own reference.
+fn neigh_timer_stop(nt: alloc::sync::Arc<NeighTimer>) {
+    if narf_scheduler::narf_time::timer::timer_shutdown(&nt.timer) {
+        // SAFETY: the dequeued timer's reference; `nt` is another, so this
+        // is never the last.
+        unsafe { alloc::sync::Arc::decrement_strong_count(alloc::sync::Arc::as_ptr(&nt)) };
+    }
+}
+
+/// Start (or restart) the resolution timer of `(name, ip)` for the
+/// retransmit deadline `mark_incomplete` just set.
+fn neigh_add_timer(net_ns_id: u64, name: &str, ip: [u8; 4]) {
+    let Some(at) = arp_cache::retrans_deadline(name, ip) else {
+        return;
+    };
+    let nt = {
+        let mut m = NEIGH_TIMERS.lock();
+        m.entry((alloc::string::String::from(name), ip))
+            .or_insert_with(|| {
+                alloc::sync::Arc::new(NeighTimer {
+                    timer: narf_scheduler::narf_time::timer::TimerList::new(neigh_timer_fn, 0),
+                    net_ns_id,
+                    name: alloc::string::String::from(name),
+                    ip,
+                })
+            })
+            .clone()
+    };
+    neigh_timer_arm(&nt, at);
+}
+
+/// The neighbour resolved or went away: its timer stops.
+fn neigh_del_timer(name: &str, ip: [u8; 4]) {
+    let nt = NEIGH_TIMERS
+        .lock()
+        .remove(&(alloc::string::String::from(name), ip));
+    if let Some(nt) = nt {
+        neigh_timer_stop(nt);
+    }
+}
+
+/// Every resolution timer on `name` stops (the interface is going away).
+pub(crate) fn neigh_del_timers_on(name: &str) {
+    let gone: alloc::vec::Vec<alloc::sync::Arc<NeighTimer>> = {
+        let mut m = NEIGH_TIMERS.lock();
+        let keys: alloc::vec::Vec<NeighKey> =
+            m.keys().filter(|(n, _)| n == name).cloned().collect();
+        keys.iter().filter_map(|k| m.remove(k)).collect()
+    };
+    for nt in gone {
+        neigh_timer_stop(nt);
+    }
+}
+
+fn neigh_timer_fn(r: narf_scheduler::narf_time::timer::TimerRef) {
+    // SAFETY: only `NeighTimer`s use this callback, and `timer` is the first
+    // field of the repr(C) `Arc` payload, so this is `Arc::as_ptr`. The
+    // pending timer held one strong reference (`neigh_timer_arm`); take it.
+    let nt = unsafe { alloc::sync::Arc::from_raw(r.as_ptr() as *const NeighTimer) };
+    neigh_timer_handler(&nt);
+    // May free the timer; nothing touches it afterwards.
+    drop(nt);
+}
+
+/// `neigh_timer_handler` for one neighbour: retransmit, or give up and fail
+/// the queue, or release the queue of a neighbour no longer resolving. Re-arms
+/// while the resolution continues; otherwise the timer is forgotten.
+fn neigh_timer_handler(nt: &alloc::sync::Arc<NeighTimer>) {
+    let (net_ns_id, name, ip) = (nt.net_ns_id, nt.name.as_str(), nt.ip);
+    match arp_cache::poll_resolution(name, ip) {
+        arp_cache::ResolutionStep::Retransmit => {
+            let _ = send_arp_request_in(net_ns_id, ip);
+        }
+        arp_cache::ResolutionStep::GaveUp => {
+            for cont in arp_cache::take_pending(net_ns_id, name, ip) {
+                cont(None);
             }
-            arp_cache::ResolutionStep::GaveUp => {
-                for cont in arp_cache::take_pending(net_ns_id, &name, ip) {
-                    cont(None);
-                }
-                crate::udp_sock::neighbor_failed(net_ns_id, &name, ip);
-            }
-            arp_cache::ResolutionStep::Wait => {
-                // A neighbour that is no longer resolving (resolved by a
-                // path that did not flush, or evicted) releases its queue.
-                if !matches!(
-                    arp_cache::entry_state(&name, ip),
-                    Some(arp_cache::ArpState::Incomplete)
-                ) {
-                    match arp_lookup_local(net_ns_id, ip) {
-                        Some(mac) => neigh_resolved(net_ns_id, &name, ip, mac),
-                        None => {
-                            for cont in arp_cache::take_pending(net_ns_id, &name, ip) {
-                                cont(None);
-                            }
-                            crate::udp_sock::neighbor_failed(net_ns_id, &name, ip);
+            crate::udp_sock::neighbor_failed(net_ns_id, name, ip);
+        }
+        arp_cache::ResolutionStep::Wait => {
+            // A neighbour that is no longer resolving (resolved by a path
+            // that did not flush, or evicted) releases its queue.
+            if !matches!(
+                arp_cache::entry_state(name, ip),
+                Some(arp_cache::ArpState::Incomplete)
+            ) {
+                match arp_lookup_local(net_ns_id, ip) {
+                    Some(mac) => neigh_resolved(net_ns_id, name, ip, mac),
+                    None => {
+                        for cont in arp_cache::take_pending(net_ns_id, name, ip) {
+                            cont(None);
                         }
+                        crate::udp_sock::neighbor_failed(net_ns_id, name, ip);
                     }
                 }
             }
         }
     }
+    match arp_cache::retrans_deadline(name, ip) {
+        Some(at) => {
+            // Still resolving, and still this neighbour's timer.
+            let ours = NEIGH_TIMERS
+                .lock()
+                .get(&(alloc::string::String::from(name), ip))
+                .is_some_and(|m| alloc::sync::Arc::ptr_eq(m, nt));
+            if ours {
+                neigh_timer_arm(nt, at);
+            }
+        }
+        None => {
+            let mut m = NEIGH_TIMERS.lock();
+            let key = (alloc::string::String::from(name), ip);
+            if m.get(&key).is_some_and(|x| alloc::sync::Arc::ptr_eq(x, nt)) {
+                // The map's reference; the caller still holds its own.
+                m.remove(&key);
+            }
+        }
+    }
+}
+
+/// Run every neighbour timer's handler now, whatever its deadline (tests
+/// that drive ARP time by hand; normal operation runs each from its timer).
+pub fn neigh_tick() {
+    let all: alloc::vec::Vec<alloc::sync::Arc<NeighTimer>> =
+        NEIGH_TIMERS.lock().values().cloned().collect();
+    for nt in all {
+        neigh_timer_handler(&nt);
+    }
+}
+
+/// Neighbours with a resolution timer (tests).
+#[doc(hidden)]
+pub fn __neigh_timer_pending(name: &str, ip: [u8; 4]) -> Option<bool> {
+    NEIGH_TIMERS
+        .lock()
+        .get(&(alloc::string::String::from(name), ip))
+        .map(|nt| nt.timer.is_pending())
 }
 
 // ── RX dispatch ─────────────────────────────────────────────────
@@ -782,24 +926,19 @@ pub fn signal_icmp_error_in(
     );
 }
 
-// ── Periodic timer tick ─────────────────────────────────────────
+// ── Timers ──────────────────────────────────────────────────────
 //
-// Wired into a `sleep_pump` at boot so neighbour resolution retransmits
-// and gives up even when no traffic is arriving.
+// Every network timer runs on the timer wheel: TCP's per connection, IPv4
+// fragment expiry per queue, neighbour resolution per neighbour (above), and
+// the neighbour table's garbage collection (`neigh_periodic_work`, in
+// `arp_cache`), started here once.
 
 static TIMER_PUMP_INSTALLED: AtomicUsize = AtomicUsize::new(0);
 
-fn timer_tick_pump() {
-    // TCP's timers and IPv4 fragment expiry run on the timer wheel (one
-    // `timer_list` per connection / queue); only neighbour resolution is
-    // still a scan.
-    neigh_tick();
-}
-
 // ── Init ────────────────────────────────────────────────────────
 
-/// Wire the RX handler + timer pump into the kernel scaffolding.
-/// Called once at boot.
+/// Wire the RX handler into the kernel scaffolding and start the neighbour
+/// table's garbage collection. Called once at boot.
 pub fn init() {
     iface::install_rx_handler(rx_handler);
     iface::install_native_rx_handler(rx_handler_native);
@@ -813,7 +952,7 @@ pub fn init() {
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        narf_scheduler::sleep_pumps::register(timer_tick_pump);
+        arp_cache::start_periodic_gc();
     }
 }
 
