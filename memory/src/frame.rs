@@ -4564,7 +4564,7 @@ pub mod cow {
     }
 
     /// The page-table mark of `key`; `None` when it has no flat slot.
-    pub(super) fn page_table_mark(key: u64) -> Option<bool> {
+    pub(crate) fn page_table_mark(key: u64) -> Option<bool> {
         flat_entry(key).map(|slot| slot.node_plus_one.load(Ordering::Acquire) & PAGE_TABLE_BIT != 0)
     }
 
@@ -5426,6 +5426,20 @@ pub fn stats() -> FrameStats {
 /// `init_from_map`. Sizes the flat COW refcount table: every frame the
 /// buddy can hand out lies below this bound (memory hotplug can later
 /// donate above it; those frames use the sharded-hash COW path).
+/// The managed RAM ranges `(start, len)` the buddy allocator was seeded
+/// with, plus hot-plugged ones (a snapshot).
+pub(crate) fn managed_ram_ranges() -> Vec<(u64, u64)> {
+    let mut ranges = BOOT_MEMORY_RANGES.lock().clone();
+    ranges.extend(
+        HOTPLUG_RANGES
+            .lock()
+            .iter()
+            .filter(|range| range.online)
+            .map(|range| (range.start, range.len)),
+    );
+    ranges
+}
+
 pub(crate) fn managed_phys_end() -> u64 {
     BOOT_MEMORY_RANGES
         .lock()

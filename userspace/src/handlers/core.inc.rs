@@ -1333,6 +1333,16 @@ impl narf_filesystem::procfs::ProcFile for NarfTasksFile {
     }
 }
 
+/// `/proc/narf/mm_holders`, read-only (sweeps RAM on every read).
+#[derive(Debug)]
+struct NarfMmHoldersFile;
+
+impl narf_filesystem::procfs::ProcFile for NarfMmHoldersFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        narf_mm_holders_report()
+    }
+}
+
 /// `/proc/narf/mm_orphans`, read-only.
 #[derive(Debug)]
 struct NarfMmOrphansFile;
@@ -1390,6 +1400,7 @@ pub fn init_per_task_state() {
     // `/proc/narf/mm_orphans`: address spaces no task reaches, and who still
     // holds them (see `narf_mm_orphans_report`).
     narf_filesystem::procfs::register_proc("narf/mm_orphans", Arc::new(NarfMmOrphansFile));
+    narf_filesystem::procfs::register_proc("narf/mm_holders", Arc::new(NarfMmHoldersFile));
     rlimit_init();
     nice_init();
     umask_init();
