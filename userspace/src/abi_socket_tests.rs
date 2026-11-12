@@ -4,6 +4,14 @@ use crate::abi_test_support::*;
 // ── Linux socket constants (subset the NARF handlers understand) ──
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
+/// Only used by the #2001 `kernel-test` regression cases (like
+/// `open_inet_stream` below); ungated it warns dead-code in default builds.
+#[cfg(feature = "kernel-test")]
+const AF_INET6: u64 = 10;
+/// IPv6 loopback ::1, as a 16-byte address (Linux `in6addr_loopback`).
+/// Only used by the #2001 `kernel-test` regression cases.
+#[cfg(feature = "kernel-test")]
+const IN6ADDR_LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_SEQPACKET: u64 = 5;
@@ -48,6 +56,18 @@ fn open_inet_stream() -> Result<u64, &'static str> {
     match call(n, a2(AF_INET, SOCK_STREAM, 0)) {
         Some(fd) if fd >= 0 => Ok(fd as u64),
         _ => Err("socket(AF_INET, SOCK_STREAM) did not return a valid fd"),
+    }
+}
+
+/// Open an AF_INET6 SOCK_STREAM socket via the real `socket(2)` handler and
+/// return its fd. Panics-as-Err if the handler reports the -1 sentinel.
+/// Only used by the #2001 `kernel-test` regression cases.
+#[cfg(feature = "kernel-test")]
+fn open_inet6_stream() -> Result<u64, &'static str> {
+    let n = Syscall::SocketOpen.raw();
+    match call(n, a2(AF_INET6, SOCK_STREAM, 0)) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("socket(AF_INET6, SOCK_STREAM) did not return a valid fd"),
     }
 }
 
@@ -5636,6 +5656,130 @@ fn smoke_abi_socket_inet_any_connect_racing_listener_close_refused() -> TestResu
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_inet_any_connect_racing_listener_close_refused
+);
+
+/// Regression for #2001 (inet6 ghost-connect window, the AF_INET6 analog of
+/// #1995): the #2000 fix retires `Inet6Listener` state in `unregister()`
+/// the same way it retires `InetListener` — same `listening` flag, same
+/// enqueue guard in `dispatch_inet6_stream` Connect (exact-key lookup
+/// with the `::` wildcard fallback) — but the #2000 regression test
+/// stages only the AF_INET cases: no AF_INET6 stream-connect scaffolding
+/// existed in this group to build an in6 case on. This case is the mirror
+/// of `inet_ghost_connect_case`, over AF_INET6: the listener binds ::1
+/// (or ::) and the client always connects to ::1.
+///
+/// The interleaving is staged deterministically with the `kernel-test`
+/// seam in `dispatch_inet6_stream` Connect: the armed hook runs the
+/// listener's last-close teardown (`unregister()`) after the lookup
+/// cloned the `Arc` and before the enqueue-time state check. Pre-fix
+/// the connect returns success (the test fails); post-fix the state
+/// check refuses it with -ECONNREFUSED. The seam is disarmed on every
+/// path out of the connect call, so a failure here cannot poison later
+/// cases. The tail of the test re-binds the released address/port and
+/// runs a normal connect/accept, proving the fix did not break the
+/// live path.
+///
+/// `listen_ip` is the address the listener binds; the client always
+/// connects to ::1, which reaches a `::` listener through the
+/// registry's wildcard fallback — so the loopback case exercises the
+/// exact-key lookup and the `::` case the fallback lookup.
+#[cfg(feature = "kernel-test")]
+fn inet6_ghost_connect_case(listen_ip: [u8; 16], port: u16) -> Result<(), &'static str> {
+    // sockaddr_in6: family(u16 LE) + port(u16 BE) + flowinfo(u32) +
+    // addr(16 bytes) + scope_id(u32). Same layout as the file-level
+    // `sockaddr_in6` helper and as Linux `sockaddr_in6`.
+    fn inet6_sockaddr(ip: [u8; 16], port: u16) -> ([u8; 28], u64) {
+        let mut buf = [0u8; 28];
+        buf[0..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+        buf[2..4].copy_from_slice(&port.to_be_bytes());
+        buf[8..24].copy_from_slice(&ip);
+        (buf, 28)
+    }
+    let srv = open_inet6_stream()?;
+    let (addr, alen) = inet6_sockaddr(listen_ip, port);
+    match call(
+        Syscall::SocketBind.raw(),
+        a2(srv, addr.as_ptr() as u64, alen),
+    ) {
+        Some(0) => {}
+        _ => return Err("server bind failed"),
+    }
+    match call(Syscall::SocketListen.raw(), a1(srv, 16)) {
+        Some(0) => {}
+        _ => return Err("server listen failed"),
+    }
+    let cli = open_inet6_stream()?;
+    let (caddr, calen) = inet6_sockaddr(IN6ADDR_LOOPBACK, port);
+    crate::socket::SocketFile::__test_arm_inet6_connect_pre_enqueue_hook(
+        crate::socket::SocketFile::__test_unregister_inet_listener,
+    );
+    let r = call(
+        Syscall::SocketConnect.raw(),
+        a2(cli, caddr.as_ptr() as u64, calen),
+    );
+    crate::socket::SocketFile::__test_disarm_inet6_connect_pre_enqueue_hook();
+    match r {
+        Some(ECONNREFUSED) => {}
+        _ => {
+            return Err("connect racing the listener's last close succeeded into a dead listener");
+        }
+    }
+    // The address/port was released: a fresh listener can bind it and
+    // serve a normal connect/accept.
+    let srv2 = open_inet6_stream()?;
+    let (addr2, alen2) = inet6_sockaddr(listen_ip, port);
+    match call(
+        Syscall::SocketBind.raw(),
+        a2(srv2, addr2.as_ptr() as u64, alen2),
+    ) {
+        Some(0) => {}
+        _ => return Err("fresh listener bind failed after the ghost connect"),
+    }
+    match call(Syscall::SocketListen.raw(), a1(srv2, 16)) {
+        Some(0) => {}
+        _ => return Err("fresh listener listen failed after the ghost connect"),
+    }
+    let cli2 = open_inet6_stream()?;
+    match call(
+        Syscall::SocketConnect.raw(),
+        a2(cli2, caddr.as_ptr() as u64, calen),
+    ) {
+        Some(0) => {}
+        _ => return Err("normal connect to the fresh listener failed"),
+    }
+    let conn = match call(Syscall::SocketAccept.raw(), a0(srv2)) {
+        Some(fd) if fd >= 0 => fd as u64,
+        _ => return Err("fresh listener accept did not return a connection fd"),
+    };
+    let _ = call(Syscall::Close.raw(), a0(cli));
+    let _ = call(Syscall::Close.raw(), a0(cli2));
+    let _ = call(Syscall::Close.raw(), a0(conn));
+    let _ = call(Syscall::Close.raw(), a0(srv));
+    let _ = call(Syscall::Close.raw(), a0(srv2));
+    Ok(())
+}
+
+/// #2001, loopback listener half: the listener binds ::1.
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_socket_inet6_connect_racing_listener_close_refused() -> TestResult {
+    with_setup(|| inet6_ghost_connect_case(IN6ADDR_LOOPBACK, 47343))
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_inet6_connect_racing_listener_close_refused
+);
+
+/// #2001, `::` listener half: the listener binds :: and the client still
+/// connects to ::1, via the wildcard fallback.
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_socket_inet6_any_connect_racing_listener_close_refused() -> TestResult {
+    with_setup(|| inet6_ghost_connect_case([0u8; 16], 47344))
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_inet6_any_connect_racing_listener_close_refused
 );
 
 /// SCM_RIGHTS: sendmsg an fd over one socketpair half, recvmsg the other
