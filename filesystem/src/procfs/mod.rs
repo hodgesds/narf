@@ -2944,44 +2944,119 @@ fn page_cache_stats() -> PageCacheStats {
     f()
 }
 
+/// Where every allocator-managed page is, in kB: Linux's `/proc/meminfo`
+/// split, with NARF lines for what Linux has no field for. The disjoint
+/// parts (`Cached`, `AnonPages`, `Slab`, `KernelStack`, `NarfStackCache`,
+/// `PageTables`, `NarfUnaccounted`) sum to `MemTotal - MemFree`;
+/// `NarfUnaccounted` is the remainder no counter claims yet, so a growing
+/// value names a missing counter instead of hiding it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemBreakdown {
+    pub total_kb: u64,
+    pub free_kb: u64,
+    pub reserved_kb: u64,
+    pub cached_kb: u64,
+    /// User pages charged to memory cgroups that are not page cache.
+    pub anon_kb: u64,
+    /// Kernel heap. Kernel stacks are vmapped frames, not heap (`KernelStack`).
+    pub slab_kb: u64,
+    pub kernel_stack_kb: u64,
+    pub stack_cache_kb: u64,
+    pub page_tables_kb: u64,
+    pub unaccounted_kb: u64,
+    /// Heap and page-cache pages the registered shrinkers can release.
+    pub shrinkable_kb: u64,
+    pub user_charged_kb: u64,
+}
+
+impl MemBreakdown {
+    /// The disjoint parts of the used memory, summed.
+    pub fn claimed_kb(&self) -> u64 {
+        self.cached_kb
+            + self.anon_kb
+            + self.slab_kb
+            + self.kernel_stack_kb
+            + self.stack_cache_kb
+            + self.page_tables_kb
+    }
+}
+
+/// Snapshot [`MemBreakdown`]. Lock-free relaxed counters, so the parts can
+/// disagree by in-flight allocations.
+pub fn mem_breakdown() -> MemBreakdown {
+    let stats = narf_memory::frame::stats();
+    let total_kb = stats.total as u64 * 4;
+    let free_kb = stats.free as u64 * 4;
+    let heap_kb = narf_memory::slab::frames_held() as u64 * 4;
+    let (stack_live, stack_cached) = narf_scheduler::stackful::kernel_stack_bytes();
+    let kernel_stack_kb = stack_live as u64 / 1024;
+    let stack_cache_kb = stack_cached as u64 / 1024;
+    let cached_kb = page_cache_stats().pages as u64 * 4;
+    let user_charged_kb = narf_memory::cgroup_charge::user_charged_bytes() / 1024;
+    let mut m = MemBreakdown {
+        total_kb,
+        free_kb,
+        reserved_kb: stats.reserved as u64 * 4,
+        cached_kb,
+        anon_kb: user_charged_kb.saturating_sub(cached_kb),
+        slab_kb: heap_kb,
+        kernel_stack_kb,
+        stack_cache_kb,
+        page_tables_kb: narf_memory::frame::page_table_frames() as u64 * 4,
+        unaccounted_kb: 0,
+        shrinkable_kb: narf_memory::reclaim::shrinkable_pages() as u64 * 4,
+        user_charged_kb,
+    };
+    m.unaccounted_kb = total_kb
+        .saturating_sub(free_kb)
+        .saturating_sub(m.claimed_kb());
+    m
+}
+
 fn gen_meminfo() -> String {
     use core::fmt::Write as _;
-    let stats = narf_memory::frame::stats();
-    // Frames are 4 KiB on every arch we target.
-    let total_kb = stats.total * 4;
-    let free_kb = stats.free * 4;
-    let reserved_kb = stats.reserved * 4;
-    let slab_unreclaimable_kb = narf_memory::slab::frames_held() * 4;
+    let m = mem_breakdown();
+    let cache = page_cache_stats();
     let mut s = String::new();
-    let _ = writeln!(s, "MemTotal:     {:>10} kB", total_kb);
-    let _ = writeln!(s, "MemFree:      {:>10} kB", free_kb);
+    let _ = writeln!(s, "MemTotal:     {:>10} kB", m.total_kb);
+    let _ = writeln!(s, "MemFree:      {:>10} kB", m.free_kb);
     // Without page-cache + slab accounting separated out we can't
     // distinguish "available" from "free"; report the same value
     // so the standard `free` math (`available = MemAvailable`)
     // still produces a meaningful number.
-    let _ = writeln!(s, "MemAvailable: {:>10} kB", free_kb);
+    let _ = writeln!(s, "MemAvailable: {:>10} kB", m.free_kb);
     let _ = writeln!(s, "Buffers:      {:>10} kB", 0);
-    let cache = page_cache_stats();
-    let _ = writeln!(s, "Cached:       {:>10} kB", cache.pages * 4);
+    let _ = writeln!(s, "Cached:       {:>10} kB", m.cached_kb);
     let _ = writeln!(s, "SwapCached:   {:>10} kB", 0);
     // NARF has no swap. Linux still prints both lines on a swapless kernel,
     // and systemd-oomd refuses to start without them ("Failed to get
     // SwapTotal from /proc/meminfo").
     let _ = writeln!(s, "SwapTotal:    {:>10} kB", 0);
     let _ = writeln!(s, "SwapFree:     {:>10} kB", 0);
-    let _ = writeln!(s, "Slab:         {:>10} kB", slab_unreclaimable_kb);
+    let _ = writeln!(s, "AnonPages:    {:>10} kB", m.anon_kb);
+    let _ = writeln!(s, "Slab:         {:>10} kB", m.slab_kb);
     let _ = writeln!(s, "SReclaimable: {:>10} kB", 0);
-    let _ = writeln!(s, "SUnreclaim:   {:>10} kB", slab_unreclaimable_kb);
-    let _ = writeln!(s, "Reserved:     {:>10} kB", reserved_kb);
-    // NARF-specific (tools skip lines they do not know): the mapped-file
-    // cache's own heap, inside `Slab` above, and its unmapped pages still
-    // waiting for writeback.
+    let _ = writeln!(s, "SUnreclaim:   {:>10} kB", m.slab_kb);
+    let _ = writeln!(s, "KernelStack:  {:>10} kB", m.kernel_stack_kb);
+    let _ = writeln!(s, "PageTables:   {:>10} kB", m.page_tables_kb);
+    let _ = writeln!(s, "Reserved:     {:>10} kB", m.reserved_kb);
+    // NARF-specific (tools skip lines they do not know).
+    // The mapped-file cache's own heap, inside `Slab` above, and its
+    // unmapped pages still waiting for writeback.
     let _ = writeln!(s, "NarfCacheRecords: {:>6} kB", cache.record_bytes / 1024);
     let _ = writeln!(
         s,
         "NarfCacheUnwritten: {:>4} kB",
         cache.unwritten_unmapped * 4
     );
+    // Zeroed, still-mapped kernel stacks parked for reuse.
+    let _ = writeln!(s, "NarfStackCache: {:>8} kB", m.stack_cache_kb);
+    // User memory charged to memory cgroups (`AnonPages` + charged cache).
+    let _ = writeln!(s, "NarfUserCharged: {:>7} kB", m.user_charged_kb);
+    // What the registered shrinkers could release (heap caches + page cache).
+    let _ = writeln!(s, "NarfShrinkable: {:>8} kB", m.shrinkable_kb);
+    // Used pages that no counter above claims.
+    let _ = writeln!(s, "NarfUnaccounted: {:>7} kB", m.unaccounted_kb);
     s
 }
 
@@ -4029,6 +4104,60 @@ fn smoke_meminfo_has_linux_slab_fields() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs", smoke_meminfo_has_linux_slab_fields);
+
+/// Every page a workload takes lands in a named meminfo field: 4 MiB of heap
+/// moves `Slab`, 256 page-table frames move `PageTables`, and neither moves
+/// `NarfUnaccounted`; the parts plus `MemFree` add up to `MemTotal`; freeing
+/// returns all of them.
+fn smoke_meminfo_breakdown_accounts_every_page() -> TestResult {
+    const SLACK_KB: i64 = 1024; // other CPUs keep allocating meanwhile
+    let delta = |a: u64, b: u64| b as i64 - a as i64;
+    let before = mem_breakdown();
+    if before.free_kb + before.claimed_kb() + before.unaccounted_kb != before.total_kb {
+        return TestResult::Fail("meminfo parts do not sum to MemTotal");
+    }
+    let mut heap: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..256 {
+        heap.push(alloc::vec![1u8; 16 * 1024]);
+    }
+    let mut tables = Vec::new();
+    for _ in 0..256 {
+        match narf_memory::alloc_frame() {
+            Ok(f) => {
+                narf_memory::frame::__pagetable_register(f.start_address().raw());
+                tables.push(f);
+            }
+            Err(_) => break,
+        }
+    }
+    let mid = mem_breakdown();
+    let tables_kb = tables.len() as i64 * 4;
+    for f in tables.drain(..) {
+        narf_memory::frame::__pagetable_unregister(f.start_address().raw());
+        narf_memory::free_frame(f);
+    }
+    drop(heap);
+    let after = mem_breakdown();
+    if (delta(before.slab_kb, mid.slab_kb) - 4096).abs() > SLACK_KB {
+        return TestResult::Fail("4 MiB of heap did not show in Slab");
+    }
+    if (delta(before.page_tables_kb, mid.page_tables_kb) - tables_kb).abs() > SLACK_KB {
+        return TestResult::Fail("page-table frames did not show in PageTables");
+    }
+    if delta(before.unaccounted_kb, mid.unaccounted_kb).abs() > SLACK_KB {
+        return TestResult::Fail("the workload's pages fell into NarfUnaccounted");
+    }
+    if delta(before.page_tables_kb, after.page_tables_kb).abs() > SLACK_KB
+        || delta(before.slab_kb, after.slab_kb) > SLACK_KB
+    {
+        return TestResult::Fail("freeing did not return the pages");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_meminfo_breakdown_accounts_every_page
+);
 
 /// Regression: the static cpuinfo file still resolves through the
 /// root and returns non-empty content. This verifies the refactor

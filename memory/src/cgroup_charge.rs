@@ -201,7 +201,12 @@ pub(crate) fn charge_current(bytes: u64, force: bool) -> Result<(MemcgId, u64), 
     // through `usize` preserves the function pointer.
     let f: fn(u64, u64, bool) -> Result<MemcgId, MemcgId> = unsafe { core::mem::transmute(ptr) };
     match f(pid, bytes, force) {
-        Ok(id) => Ok((id, pid)),
+        Ok(id) => {
+            if id != 0 {
+                USER_CHARGED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Ok((id, pid))
+        }
         Err(id) => {
             DENIALS.fetch_add(1, Ordering::Relaxed);
             LAST_DENIED_PID.store(pid as usize, Ordering::Relaxed);
@@ -224,6 +229,17 @@ pub(crate) fn uncharge_memcg(id: MemcgId, bytes: u64) {
     // `fn(MemcgId, u64)`.
     let f: fn(MemcgId, u64) = unsafe { core::mem::transmute(ptr) };
     f(id, bytes);
+    USER_CHARGED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// User memory (anonymous and file pages) currently charged to some memory
+/// cgroup, through the page-charge hooks. The memory-cgroup view of
+/// `AnonPages + Cached`; 0 without memory cgroups.
+static USER_CHARGED_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Bytes of user memory charged to memory cgroups right now.
+pub fn user_charged_bytes() -> u64 {
+    USER_CHARGED_BYTES.load(Ordering::Relaxed)
 }
 
 /// One pending memory-cgroup OOM request: `(memcg id, faulting pid)`. Linux

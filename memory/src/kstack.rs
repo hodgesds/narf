@@ -206,6 +206,15 @@ pub fn stack_containing(addr: u64) -> Option<(u64, u64)> {
     (pages != 0 && addr < lo + pages * 4096).then_some((lo, lo + pages * 4096))
 }
 
+/// Bytes of frames mapped as kernel stacks, live and cached (Linux
+/// `NR_KERNEL_STACK_KB` counts the same pages).
+static MAPPED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes of frames currently mapped as kernel stacks.
+pub fn mapped_bytes() -> usize {
+    MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
 /// Live stacks, diagnostic only.
 pub fn live_stacks() -> usize {
     let m = MAP.lock();
@@ -320,6 +329,7 @@ impl KernelStack {
         // Publish the extent only once every page is mapped: the fault path
         // never reports a half-built stack.
         PAGES[slot].store(pages as u8, Ordering::Release);
+        MAPPED_BYTES.fetch_add(pages * 4096, Ordering::Relaxed);
         Ok(Self {
             // SAFETY: area addresses are non-null kernel VA.
             base: unsafe { NonNull::new_unchecked(base as *mut u8) },
@@ -373,6 +383,7 @@ impl Drop for KernelStack {
         let base = self.base();
         let slot = ((base - area_base()) / KSTACK_SLOT_BYTES) as usize;
         PAGES[slot].store(0, Ordering::Release);
+        MAPPED_BYTES.fetch_sub(self.len.div_ceil(4096) * 4096, Ordering::Relaxed);
         if let Some(root) = crate::bpf_text::kernel_root_for_mapping() {
             // SAFETY: `alloc` mapped exactly these pages; the owner is being
             // dropped, so nothing runs on or references the stack any more.

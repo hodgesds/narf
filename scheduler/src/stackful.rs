@@ -252,10 +252,12 @@ fn acquire_kernel_stack(stack_bytes: usize) -> KernelStack {
             mag.pop()
         });
         if let Some(stack) = local {
+            KSTACK_CACHED_BYTES.fetch_sub(stack.len(), Ordering::Relaxed);
             return stack;
         }
         // Tier 2: global depot.
         if let Some(stack) = STACK_DEPOT.lock().pop() {
+            KSTACK_CACHED_BYTES.fetch_sub(stack.len(), Ordering::Relaxed);
             return stack;
         }
     }
@@ -283,6 +285,9 @@ fn recycle_kernel_stack(mut stack: KernelStack, used: usize) {
     let len = stack.len();
     stack[len - used.min(len)..].fill(0);
     stack[..STACK_CANARY_WORDS * 8].fill(0);
+    // Counted as cached before it becomes reachable, so a concurrent pop's
+    // decrement never runs ahead of it; undone below if it frees instead.
+    KSTACK_CACHED_BYTES.fetch_add(len, Ordering::Relaxed);
 
     // Tier 1: this CPU's magazine.
     let overflow = narf_lib::sync::without_interrupts(|| {
@@ -297,7 +302,59 @@ fn recycle_kernel_stack(mut stack: KernelStack, used: usize) {
     // Tier 2: global depot. The lock is released at the end of this statement;
     // if the depot is full too, the handed-back `Box` drops below, freeing to
     // the buddy outside the lock.
-    let _buddy = STACK_DEPOT.lock().push(stack);
+    let buddy = STACK_DEPOT.lock().push(stack);
+    if buddy.is_some() {
+        KSTACK_CACHED_BYTES.fetch_sub(len, Ordering::Relaxed);
+    } else if !STACK_SHRINKER_REGISTERED.swap(true, Ordering::AcqRel) {
+        // First stack parked in the depot: let reclaim and drop_caches
+        // empty it. Registration writes a fixed array; it never allocates.
+        narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
+            name: "kstack-depot",
+            count: stack_depot_count,
+            scan: stack_depot_scan,
+        });
+    }
+}
+
+/// Bytes of zeroed, still-mapped stacks parked in the per-CPU magazines and
+/// the depot.
+static KSTACK_CACHED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// `(live, cached)` kernel-stack bytes for `/proc/meminfo`'s `KernelStack`
+/// and stack-cache lines: every mapped stack (`kstack::mapped_bytes`) is
+/// either cached here or owned by a live task.
+pub fn kernel_stack_bytes() -> (usize, usize) {
+    let cached = KSTACK_CACHED_BYTES.load(Ordering::Relaxed);
+    (
+        narf_memory::kstack::mapped_bytes().saturating_sub(cached),
+        cached,
+    )
+}
+
+static STACK_SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Base pages per default-size kernel stack.
+const STACK_PAGES: usize = DEFAULT_KERNEL_STACK_BYTES / 4096;
+
+/// Shrinker `count`: base pages of stacks in the global depot. The per-CPU
+/// magazines (Linux's per-CPU cached vmapped stacks) stay.
+fn stack_depot_count() -> usize {
+    STACK_DEPOT.lock().len * STACK_PAGES
+}
+
+/// Shrinker `scan`: unmap and free depot stacks, at most `nr_pages` pages'
+/// worth. Each is taken under the depot lock and dropped after it.
+fn stack_depot_scan(nr_pages: usize) -> usize {
+    let mut freed = 0usize;
+    while freed + STACK_PAGES <= nr_pages {
+        let Some(stack) = STACK_DEPOT.lock().pop() else {
+            break;
+        };
+        KSTACK_CACHED_BYTES.fetch_sub(stack.len(), Ordering::Relaxed);
+        drop(stack);
+        freed += STACK_PAGES;
+    }
+    freed
 }
 
 /// Deepest released-stack high-water mark seen since boot.
