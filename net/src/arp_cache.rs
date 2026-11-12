@@ -133,8 +133,8 @@ pub struct ArpEntry {
     /// give up. Reset to 0 whenever a reply confirms the entry.
     pub requests_outstanding: u8,
     /// Monotonic deadline for the next retransmit while Incomplete or
-    /// Probe. Linux arms a per-entry timer for this; NARF's resolver polls
-    /// it, so the deadline is stored rather than scheduled.
+    /// Probe: the expiry of the neighbour's resolution timer
+    /// (`tcp_stack`'s per-neighbour `timer_list`, Linux `neigh->timer`).
     pub retrans_at: u64,
 }
 
@@ -338,8 +338,8 @@ pub enum ResolutionStep {
 /// }
 /// ```
 ///
-/// Linux arms a real timer per entry; NARF's resolver polls, so the
-/// deadline lives on the entry and this is called as it spins. The budget
+/// The neighbour's resolution timer (`tcp_stack`, one `timer_list` per
+/// resolving neighbour, armed for `retrans_at`) calls this. The budget
 /// is checked BEFORE sending, so `max_probes` requests go out in total
 /// rather than one more than that.
 pub fn poll_resolution(iface_name: &str, ip: [u8; 4]) -> ResolutionStep {
@@ -366,6 +366,74 @@ pub fn poll_resolution(iface_name: &str, ip: [u8; 4]) -> ResolutionStep {
     entry.requests_outstanding = entry.requests_outstanding.saturating_add(1);
     entry.retrans_at = now + RETRANS_TIME_NS;
     ResolutionStep::Retransmit
+}
+
+/// The retransmit deadline (monotonic ns) of a resolution in flight —
+/// `neigh->timer`'s expiry while NUD_INCOMPLETE / NUD_PROBE — or `None` when
+/// `ip` is not resolving.
+pub fn retrans_deadline(iface_name: &str, ip: [u8; 4]) -> Option<u64> {
+    let g = CACHES.lock();
+    let entry = g.iter().find(|c| c.name == iface_name)?.entries.get(&ip)?;
+    (matches!(entry.state, ArpState::Incomplete | ArpState::Probe) && entry.retrans_at != 0)
+        .then_some(entry.retrans_at)
+}
+
+// ── Garbage collection (`neigh_periodic_work`) ─────────────────────────
+
+/// `gc_thresh1`: below this many entries the periodic GC leaves the table
+/// alone (`arp_tbl`, `net/ipv4/arp.c`).
+pub const GC_THRESH1: usize = 128;
+/// `GC_STALETIME`: an unused entry older than this is collected (60 s).
+pub const GC_STALETIME_NS: u64 = 60_000_000_000;
+/// The GC runs every `BASE_REACHABLE_TIME / 2`.
+pub const GC_INTERVAL_NS: u64 = REACHABLE_TIME_NS / 2;
+
+/// One `neigh_periodic_work` pass at `now`: once the table holds at least
+/// [`GC_THRESH1`] entries, drop every FAILED entry and every entry outside a
+/// timer state (not resolving, not reachable) unused for
+/// [`GC_STALETIME_NS`]. Returns the entries dropped.
+pub fn neigh_periodic_gc(now: u64) -> usize {
+    let mut g = CACHES.lock();
+    let total: usize = g.iter().map(|c| c.entries.len()).sum();
+    if total < GC_THRESH1 {
+        return 0;
+    }
+    let mut dropped = 0;
+    for cache in g.iter_mut() {
+        let before = cache.entries.len();
+        cache.entries.retain(|_, e| {
+            // A Reachable entry past its expiry is Stale (NARF ages lazily).
+            let reachable = e.state == ArpState::Reachable && now < e.expires_at;
+            // NUD_IN_TIMER: resolving or reachable entries are not collected.
+            if reachable || matches!(e.state, ArpState::Incomplete | ArpState::Probe) {
+                return true;
+            }
+            !(e.state == ArpState::Failed || now.saturating_sub(e.last_used_ns) >= GC_STALETIME_NS)
+        });
+        dropped += before - cache.entries.len();
+    }
+    dropped
+}
+
+/// `tbl->gc_work`: a deferrable wheel timer (it never wakes an idle CPU,
+/// like Linux's `system_power_efficient_wq` work) re-armed each pass.
+static NEIGH_GC_TIMER: narf_time::timer::TimerList =
+    narf_time::timer::TimerList::new(neigh_gc_fn, narf_time::timer::TIMER_DEFERRABLE);
+
+fn neigh_gc_fn(_: narf_time::timer::TimerRef) {
+    let _ = neigh_periodic_gc(now_ns());
+    arm_gc();
+}
+
+fn arm_gc() {
+    let j = narf_time::timer::jiffies() + narf_time::timer::ns_to_jiffies(GC_INTERVAL_NS);
+    // SAFETY: the timer is a static.
+    unsafe { narf_time::timer::mod_timer(&NEIGH_GC_TIMER, j) };
+}
+
+/// Start the periodic neighbour GC (boot, once).
+pub fn start_periodic_gc() {
+    arm_gc();
 }
 
 /// Whether resolution for `ip` has already been given up on.
@@ -762,3 +830,41 @@ fn smoke_arp_failed_entry_revives_on_reply() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 narf_kernel_test::kernel_test_in!("net/arp", smoke_arp_failed_entry_revives_on_reply);
+
+/// `neigh_periodic_work`: below `gc_thresh1` the table is left alone; at or
+/// above it, FAILED entries and entries unused for `GC_STALETIME` go, while
+/// a resolving entry stays.
+fn smoke_arp_periodic_gc_drops_stale_and_failed() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const IFACE: &str = "arp-gc";
+    __reset_for_test();
+    let now = now_ns();
+    for i in 0..(GC_THRESH1 as u8 - 10) {
+        insert(IFACE, [10, 9, 1, i], [2, 0, 0, 0, 1, i]);
+    }
+    if neigh_periodic_gc(now + 2 * GC_STALETIME_NS) != 0 {
+        __reset_for_test();
+        return TestResult::Fail("GC ran below gc_thresh1");
+    }
+    for i in 0..10u8 {
+        insert(IFACE, [10, 9, 2, i], [2, 0, 0, 0, 2, i]);
+    }
+    mark_incomplete(IFACE, [10, 9, 3, 1]);
+    // Fresh entries: nothing is old, nothing failed.
+    if neigh_periodic_gc(now) != 0 {
+        __reset_for_test();
+        return TestResult::Fail("GC dropped fresh entries");
+    }
+    let total = entry_count(IFACE);
+    let dropped = neigh_periodic_gc(now + 2 * GC_STALETIME_NS);
+    let left = entry_state(IFACE, [10, 9, 3, 1]);
+    __reset_for_test();
+    if dropped != total - 1 {
+        return TestResult::Fail("GC did not drop every unused entry past GC_STALETIME");
+    }
+    if left != Some(ArpState::Incomplete) {
+        return TestResult::Fail("GC dropped a resolving entry");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("net/arp", smoke_arp_periodic_gc_drops_stale_and_failed);

@@ -259,8 +259,10 @@ impl Transport for TcpTransport {
                     let mut got = 0usize;
                     let arrived = narf_scheduler::responsive_spin_until(
                         || {
+                            // Neighbour and TCP timers are wheel timers,
+                            // expired by the executor rounds the spin's
+                            // sleep pumps run.
                             while crate::iface::drain_pump() {}
-                            crate::tcp_stack::neigh_tick();
                             match crate::tcp::core::recv(self.id, &mut buf[filled..]) {
                                 Ok(n) if n > 0 => {
                                     got = n;

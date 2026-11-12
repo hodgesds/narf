@@ -2158,9 +2158,11 @@ pub fn connect_wait(id: u32, options: ConnectOptions) -> Result<u32, i32> {
     let _ = narf_scheduler::responsive_spin_until(
         || {
             while iface::drain_pump() {}
-            // Pump the neighbour and SYN timers from inside the spin so a
-            // lost ARP request or SYN gets retried before the deadline.
-            crate::tcp_stack::neigh_tick();
+            // The neighbour's resolution timer and this connection's timer
+            // are wheel timers; the spin's sleep pumps run executor rounds,
+            // which expire them, so a lost ARP request or SYN is retried
+            // before the deadline. The direct call keeps a SYN retry on
+            // time where the spin runs with no executor step pump.
             tick_retransmit(&arc);
             !matches!(arc.lock().state, TcpState::SynSent | TcpState::SynReceived)
         },
