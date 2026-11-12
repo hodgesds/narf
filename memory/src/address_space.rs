@@ -2892,7 +2892,12 @@ impl AddressSpace {
     /// Retire one scheduler task after its final poll. The zero transition is
     /// the OOM reaper's quiescence event: no task can newly fault or contend a
     /// VMA lock through this address space after it becomes visible.
-    pub fn scheduler_detach_user_task(&self) {
+    ///
+    /// Returns `true` for that zero transition — Linux `mmput` dropping the
+    /// last `mm_users` reference — after which the caller runs
+    /// [`Self::exit_mmap`] once it holds no lock the teardown cannot run
+    /// under.
+    pub fn scheduler_detach_user_task(&self) -> bool {
         let previous = self
             .membarrier_task_state
             .fetch_update(
@@ -2908,7 +2913,9 @@ impl AddressSpace {
             .expect("address-space live-task count underflow");
         if previous >> LIVE_USER_TASKS_SHIFT == 1 {
             crate::oom::wake_reaper_if_pending();
+            return true;
         }
+        false
     }
 
     /// Scheduler tasks which may still execute through this address space
@@ -7346,7 +7353,74 @@ impl AddressSpace {
         if self.root.as_u64() == 0 || self.is_vm_shared() {
             return 0;
         }
+        self.unmap_all_regions()
+    }
 
+    /// Linux `exit_mmap`, run by `mmput` when the last user of the mm
+    /// (`mm_users`) is gone: here, when the last scheduler task attached to
+    /// this address space detaches ([`Self::scheduler_detach_user_task`]
+    /// returned `true`). Every mapping, its backing and every user page table
+    /// below the root go back now; only the root and this struct remain until
+    /// the last `Arc` (Linux `mm_count`, `mmdrop`) drops. Passive holders —
+    /// `/proc` readers, futex keys, a lazily active root on a CPU that has not
+    /// switched away yet, or a reference nobody released — see an empty
+    /// address space and keep no memory alive with it.
+    ///
+    /// Unlike [`Self::reclaim_unshared_on_exit`] this needs no `CLONE_VM`
+    /// refusal: a zero `mm_users` count proves no task of any process can
+    /// execute, fault or map through this space again. Idempotent; regions an
+    /// unmap could not take (a swap transition in flight) stay for `Drop`,
+    /// together with the tables that map them. Returns the base pages removed.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn exit_mmap(&self) -> usize {
+        if self.root.as_u64() == 0 {
+            return 0;
+        }
+        debug_assert!(self.user_tasks_quiesced());
+        let pages = self.unmap_all_regions();
+        #[cfg(target_arch = "x86_64")]
+        if self.regions.lock().iter().next().is_none() && self.huge_regions.lock().is_empty() {
+            // Linux free_pgtables: the empty tables the unmaps left (every
+            // PDPT, and anything a partial path kept) go too. Quarantined
+            // unmaps first, so no detached table is freed twice.
+            self.flush_deferred();
+            let root = self.root;
+            let tag = self.translation_tag();
+            // SAFETY: no scheduler task can use this space any more and every
+            // region is gone, so no walk can create a table under the root
+            // again; the invalidation retires every cached walk of the root,
+            // which may still be some CPU's lazy active root, before a table
+            // frame is freed. A leftover leaf has no region backing it; only
+            // its reverse-map entry is retired, as final teardown does.
+            unsafe {
+                crate::x86_64::paging::free_user_subtrees_keep_root(
+                    root,
+                    || {
+                        crate::tlb_shootdown::shootdown_owned(
+                            root.as_u64(),
+                            crate::tlb_shootdown::ShootdownRequest::for_tag(tag),
+                        )
+                    },
+                    |phys, va| {
+                        crate::rmap::remove(phys, root, va);
+                    },
+                );
+            }
+        }
+        pages
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn exit_mmap(&self) -> usize {
+        0
+    }
+
+    /// Unmap every huge and ordinary region through the ordinary unmap
+    /// paths (leaf invalidation, backing release, emptied PT/PD detach).
+    /// Stops at a region whose unmap fails (a swap transition) and leaves it
+    /// and later regions for final `Drop`. Returns the base pages removed.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn unmap_all_regions(&self) -> usize {
         // Linux exit_mmap's mmu_notifier_release, before any frame below is
         // released. Device mirrors of this address space are retired.
         self.notify_release();

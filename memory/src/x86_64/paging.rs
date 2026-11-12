@@ -2381,66 +2381,107 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
 ///   time of the call.
 pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
     pml4_phys: PhysAddr,
-    mut visit_leaf: impl FnMut(PhysAddr, VirtAddr),
+    visit_leaf: impl FnMut(PhysAddr, VirtAddr),
 ) {
-    use crate::frame::{free_unique_frame_batch, PhysFrame};
-    const FREE_BATCH_FRAMES: usize = 64;
-
-    #[inline]
-    fn flush_reclaimed(frames: &mut Vec<PhysFrame>) {
-        if frames.is_empty() {
-            return;
-        }
-        // SAFETY: every queued table was detached from the final inactive
-        // root and unregistered before it entered this batch. Page tables are
-        // never COW-shared.
-        unsafe { free_unique_frame_batch(frames) };
-        frames.clear();
-        #[cfg(feature = "kernel-test")]
-        TEARDOWN_FREE_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn queue_reclaimed(frames: &mut Vec<PhysFrame>, phys: PhysAddr) {
-        frames.push(PhysFrame::new(phys));
-        if frames.len() == FREE_BATCH_FRAMES {
-            flush_reclaimed(frames);
-        }
-    }
-
     if pml4_phys.raw() == 0 {
         return;
     }
     USER_PML4_LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     crate::as_origin::forget(pml4_phys.raw());
+    // SAFETY: forwarded from the caller. The caller contract excludes live
+    // users, so detached children need no TLB retirement before traversal.
+    let detached = unsafe { detach_user_subtrees(pml4_phys) };
+    let mut reclaimed = Vec::with_capacity(TEARDOWN_FREE_BATCH_FRAMES);
+    // SAFETY: the subtrees were detached from the inactive root just above.
+    unsafe { free_detached_user_subtrees(detached, visit_leaf, &mut reclaimed) };
+    // Finally release the PML4 itself.
+    crate::frame::__pagetable_unregister(pml4_phys.raw());
+    queue_teardown_reclaimed(&mut reclaimed, pml4_phys);
+    flush_teardown_reclaimed(&mut reclaimed);
+}
+
+/// Linux `free_pgtables` at `exit_mmap`: detach every AS-private user-half
+/// subtree of `pml4_phys`, run `invalidate` — which must retire every
+/// translation and paging-structure cache entry of the address space on
+/// every CPU — and only then free the detached tables, visiting each present
+/// 4 KiB leaf first. The root itself stays allocated and installed: a CPU
+/// may still hold it as its lazy active root until it switches away, and
+/// with an empty user half it can neither reach nor cache any table freed
+/// here. Returns the number of table frames freed.
+///
+/// # Safety
+/// - `pml4_phys` must be a user root built by `new_user_pml4`.
+/// - No task may execute through, fault on, or map into this root any more
+///   (the address space's last scheduler user has detached), and every
+///   region's backing must already be released except through leaves the
+///   callback retires.
+pub(crate) unsafe fn free_user_subtrees_keep_root(
+    pml4_phys: PhysAddr,
+    invalidate: impl FnOnce(),
+    visit_leaf: impl FnMut(PhysAddr, VirtAddr),
+) -> usize {
+    if pml4_phys.raw() == 0 {
+        return 0;
+    }
+    // SAFETY: forwarded from the caller.
+    let detached = unsafe { detach_user_subtrees(pml4_phys) };
+    if detached.is_empty() {
+        return 0;
+    }
+    // A CPU that still runs on this root (the lazy active root) may have
+    // cached the detached entries; no frame may be reused before they are
+    // gone everywhere.
+    invalidate();
+    let mut reclaimed = Vec::with_capacity(TEARDOWN_FREE_BATCH_FRAMES);
+    // SAFETY: detached above and invalidated by the caller's callback.
+    let freed = unsafe { free_detached_user_subtrees(detached, visit_leaf, &mut reclaimed) };
+    flush_teardown_reclaimed(&mut reclaimed);
+    freed
+}
+
+const TEARDOWN_FREE_BATCH_FRAMES: usize = 64;
+
+#[inline]
+fn flush_teardown_reclaimed(frames: &mut Vec<crate::frame::PhysFrame>) {
+    if frames.is_empty() {
+        return;
+    }
+    // SAFETY: every queued table was detached from its root, invalidated (or
+    // the root is inactive) and unregistered before it entered this batch.
+    // Page tables are never COW-shared.
+    unsafe { crate::frame::free_unique_frame_batch(frames) };
+    frames.clear();
+    #[cfg(feature = "kernel-test")]
+    TEARDOWN_FREE_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn queue_teardown_reclaimed(frames: &mut Vec<crate::frame::PhysFrame>, phys: PhysAddr) {
+    frames.push(crate::frame::PhysFrame::new(phys));
+    if frames.len() == TEARDOWN_FREE_BATCH_FRAMES {
+        flush_teardown_reclaimed(frames);
+    }
+}
+
+/// Clear every AS-private user-half PML4 entry of `pml4_phys` under its
+/// page-table shard and return the detached `(slot, PDPT)` pairs.
+///
+/// # Safety
+/// `pml4_phys` must be an identity-reachable user root built by
+/// `new_user_pml4`.
+unsafe fn detach_user_subtrees(pml4_phys: PhysAddr) -> Vec<(usize, PhysAddr)> {
     // Reserve before taking the IRQ-safe page-table lock. There are exactly
-    // 255 candidate private slots, so pushes in the critical section cannot
+    // 256 candidate private slots, so pushes in the critical section cannot
     // grow the allocation.
-    let mut detached_pdpts = Vec::with_capacity(255);
+    let mut detached_pdpts = Vec::with_capacity(256);
     {
         // Serialise the short root-detach transaction against any stale
-        // concurrent map/unmap. The caller contract excludes live users, so
-        // detached children need no TLB retirement before traversal.
+        // concurrent map/unmap.
         let _pt_guard = pt_lock_for(pml4_phys).lock();
         // SAFETY: identity-reachable per caller contract.
         let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
-        // Only PML4[1] holds user-private subtree (per `new_user_pml4`,
-        // user binaries link at virt 0x0000_0080_0000_1000 → PML4[1]
-        // PDPT[0] PD[0] PT[1], and `new_user_pml4` allocates a fresh
-        // PDPT for that slot). Every other PML4[0..256] entry is a
-        // bulk-copied pointer to a SHARED kernel page-table page —
-        //   - PML4[0]: the kernel low-4-GiB identity PDPT (`PDPT_lo` in
-        //     `EARLY_PAGE_TABLES`), reused by every AS for DMA / phys
-        //     access from kernel mode.
-        //   - PML4[2..=255]: currently reserved-zero, but if the kernel
-        //     ever lights one up it'll be shared too.
-        // Walking those and freeing the PDPT they point at returns
-        // kernel page tables to the buddy allocator; the next
-        // `alloc_coherent` hands the freed PDPT to a driver, `memset`
-        // zeros it, and the huge-page entries vanish mid-write — the
-        // exact #PF that surfaced the audio probe regression.
-        // Walk EVERY user-half PML4 slot (1..=255), not a hardcoded pair.
-        // A real process lights up far more than slots 1 + 129:
+        // Walk EVERY user-half PML4 slot, not a hardcoded list. A real
+        // process lights up far more than one slot:
         //   slot 1   — user binary  (0x0000_0080_0000_0000)
         //   slot 128 — ELF interpreter / ld-musl bias (0x0000_4000_0000_0000)
         //   slot 129 — mmap arena    (0x0000_4080_0000_0000)
@@ -2451,20 +2492,15 @@ pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
         // registrations accumulated in PT_REGISTRY and accelerated the
         // ring-wrap clobber behind the "marginal-buddy" double-free.
         //
-        // Slot 0 (kernel low-4-GiB identity) and slots 256..512 (kernel
-        // high-half) are SHARED — `new_user_pml4_on` bulk-copies the kernel
-        // PDPT pointers into them, so freeing them would return kernel page
-        // tables to the buddy. The loop bound (1..256) excludes both. As an
-        // extra guard against a future kernel mapping inside the user half,
-        // only AS-private PDPTs are walked: those are the ones recorded in
-        // PT_REGISTRY (`new_user_pml4_on` / `ensure_next_table` register
+        // Slots 256..512 (kernel high-half) are SHARED — `new_user_pml4_on`
+        // bulk-copies the kernel PDPT pointers into them, so freeing them
+        // would return kernel page tables to the buddy (the exact #PF that
+        // surfaced the audio probe regression). The loop bound excludes them.
+        // As an extra guard against a future kernel mapping inside the user
+        // half, only AS-private PDPTs are walked: those are the ones recorded
+        // in PT_REGISTRY (`new_user_pml4_on` / `ensure_next_table` register
         // every table they allocate); a kernel-shared PDPT is never
-        // registered, so the `__pagetable_is_registered` check below skips
-        // it.
-        // Slot 0 is included: it is AS-private now that the kernel identity
-        // map no longer lives there. The `__pagetable_is_registered` check
-        // below still protects any kernel-shared PDPT, which is never
-        // registered, so widening the bound cannot free a kernel table.
+        // registered, so the `__pagetable_is_registered` check skips it.
         for slot in 0usize..256 {
             let pml4e = pml4.entries[slot];
             if !pml4e.is_present() {
@@ -2487,12 +2523,25 @@ pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
         detached_pdpts.len() as u64,
         core::sync::atomic::Ordering::Relaxed,
     );
+    detached_pdpts
+}
 
+/// Walk subtrees [`detach_user_subtrees`] took off a root, visit their
+/// present 4 KiB leaves and queue every table frame on `reclaimed`. Returns
+/// the number of table frames queued.
+///
+/// # Safety
+/// The subtrees must be detached and unreachable by any CPU's walk.
+unsafe fn free_detached_user_subtrees(
+    detached_pdpts: Vec<(usize, PhysAddr)>,
+    mut visit_leaf: impl FnMut(PhysAddr, VirtAddr),
+    reclaimed: &mut Vec<crate::frame::PhysFrame>,
+) -> usize {
     // All allocator work is deliberately outside the page-table shard. Walk
     // only detached, registry-owned subtrees and return table frames in
     // bounded batches so a large sparse process neither monopolises the shard
     // nor builds an unbounded temporary vector during exit.
-    let mut reclaimed = Vec::with_capacity(FREE_BATCH_FRAMES);
+    let mut freed = 0usize;
     for (pml4_idx, pdpt_pa) in detached_pdpts {
         // SAFETY: identity-reachable; PDPT is a page-table frame.
         let pdpt = unsafe { &mut *pdpt_pa.kernel_mut_ptr::<PageTable>() };
@@ -2502,12 +2551,9 @@ pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
                 continue;
             }
             let pd_pa = pdpte.addr();
-            // Same AS-private guard as the PDPT level: slot 1's PDPT
-            // carries bulk-copied kernel PDPT[1..512] pointers. Those
-            // high-MMIO mappings are 1-GiB HUGE pages (skipped above), but
-            // guard against any non-huge kernel PD pointer slipping
-            // through — a kernel PD is never registered, so skip it rather
-            // than return a live kernel page table to the buddy.
+            // Same AS-private guard as the PDPT level: a kernel PD is never
+            // registered, so skip it rather than return a live kernel page
+            // table to the buddy.
             if !crate::frame::__pagetable_is_registered(pd_pa.raw()) {
                 continue;
             }
@@ -2542,18 +2588,18 @@ pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
                     visit_leaf(pte.addr(), va);
                 }
                 crate::frame::__pagetable_unregister(pt_pa.raw());
-                queue_reclaimed(&mut reclaimed, pt_pa);
+                queue_teardown_reclaimed(reclaimed, pt_pa);
+                freed += 1;
             }
             crate::frame::__pagetable_unregister(pd_pa.raw());
-            queue_reclaimed(&mut reclaimed, pd_pa);
+            queue_teardown_reclaimed(reclaimed, pd_pa);
+            freed += 1;
         }
         crate::frame::__pagetable_unregister(pdpt_pa.raw());
-        queue_reclaimed(&mut reclaimed, pdpt_pa);
+        queue_teardown_reclaimed(reclaimed, pdpt_pa);
+        freed += 1;
     }
-    // Finally release the PML4 itself.
-    crate::frame::__pagetable_unregister(pml4_phys.raw());
-    queue_reclaimed(&mut reclaimed, pml4_phys);
-    flush_reclaimed(&mut reclaimed);
+    freed
 }
 
 /// Return the PT-level flags currently set for `virt`, or `None` if

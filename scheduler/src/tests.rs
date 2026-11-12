@@ -6650,3 +6650,163 @@ kernel_test_in!(
     "scheduler",
     smoke_wake_arriving_during_activation_keeps_notification
 );
+
+/// Build a user address space with one materialized page in each of three
+/// PML4 slots (each with its own PDPT/PD/PT chain), so its teardown has
+/// tables at every level to return.
+#[cfg(target_arch = "x86_64")]
+fn mm_exit_fixture() -> Result<alloc::sync::Arc<narf_memory::AddressSpace>, TestResult> {
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    let bases = [
+        0x0000_0080_0000_0000_u64,
+        0x0000_4000_0000_0000_u64,
+        0x0000_7fff_f000_0000_u64,
+    ];
+    // SAFETY: paging is enabled in the kernel test environment.
+    let space = unsafe { AddressSpace::new_for_user() }
+        .map_err(|_| TestResult::Skip("new_for_user failed"))?;
+    for base in bases {
+        let backing = narf_memory::alloc_frame()
+            .map_err(|_| TestResult::Skip("frame allocator drained"))?
+            .start_address();
+        space
+            .map_region(Region {
+                base: VirtAddr::new(base),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![backing].into(),
+            })
+            .map_err(|_| TestResult::Fail("fixture region was rejected"))?;
+    }
+    // SAFETY: the test owns the root and every backing frame.
+    unsafe { space.materialize() }.map_err(|_| TestResult::Fail("fixture materialize failed"))?;
+    Ok(alloc::sync::Arc::new(space))
+}
+
+/// Linux `exit_mm` → `mmput` → `exit_mmap`: the last task of an address space
+/// finishing returns its mappings and every page table below the root at
+/// once, while a passive holder — a zombie's bookkeeping, a `/proc` reader, a
+/// reference nobody released — still has the `Arc`. The root follows when
+/// that last `Arc` goes (`mmdrop`). Two tasks share the space (a process and
+/// its thread): the first to finish must leave it intact.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_last_user_task_releases_mm() -> TestResult {
+    extern crate alloc;
+    use crate::{spawn_user, TaskSpec};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    crate::__reset_queues_for_test();
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    RAN.store(0, Ordering::Relaxed);
+    let tables_before = narf_memory::frame::page_table_frames();
+    let space = match mm_exit_fixture() {
+        Ok(space) => space,
+        Err(result) => return result,
+    };
+    let walked = space.page_table_frames();
+    if walked < 10 {
+        return TestResult::Fail("fixture built fewer tables than three chains need");
+    }
+    // The passive holder.
+    let passive = space.clone();
+    for _ in 0..2 {
+        spawn_user(
+            crate::alloc_task_id(),
+            async {
+                RAN.fetch_add(1, Ordering::Relaxed);
+            },
+            TaskSpec::unthrottled(),
+            space.clone(),
+        );
+    }
+    drop(space);
+    crate::run_until_empty();
+    if RAN.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("user tasks did not run");
+    }
+    if passive.scheduler_user_tasks() != 0 {
+        return TestResult::Fail("finished tasks still counted as mm users");
+    }
+    if passive.region_count() != 0 {
+        return TestResult::Fail("mappings outlived the last task");
+    }
+    if passive.page_table_frames() != 1 {
+        return TestResult::Fail("page tables below the root outlived the last task");
+    }
+    // Other CPUs may map kernel memory meanwhile; allow a little.
+    if narf_memory::frame::page_table_frames() > tables_before + 1 + 4 {
+        return TestResult::Fail("PageTables did not return to baseline plus the root");
+    }
+    let root = passive.root.raw();
+    if narf_memory::as_origin::info(root).is_none() {
+        return TestResult::Fail("the root must live until the last Arc");
+    }
+    if passive.exit_mmap() != 0 || passive.page_table_frames() != 1 {
+        return TestResult::Fail("a second exit_mmap was not a no-op");
+    }
+    drop(passive);
+    if narf_memory::as_origin::info(root).is_some() {
+        return TestResult::Fail("the root outlived the last Arc");
+    }
+    if narf_memory::frame::page_table_frames() > tables_before + 4 {
+        return TestResult::Fail("PageTables did not return to baseline");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "scheduler/mm-exit",
+    smoke_scheduler_last_user_task_releases_mm
+);
+
+/// Linux `exec_mmap` → `mmput(old_mm)`: an exec that displaces the last user
+/// of the old address space releases that space's mappings and tables at
+/// once, even though the exec path (and here the test) still holds an `Arc`
+/// to it; the new space is untouched.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_exec_displacing_last_user_releases_old_mm() -> TestResult {
+    extern crate alloc;
+    use crate::{replace_address_space, spawn_user, TaskSpec};
+
+    crate::__reset_queues_for_test();
+    let old = match mm_exit_fixture() {
+        Ok(space) => space,
+        Err(result) => return result,
+    };
+    let new = match mm_exit_fixture() {
+        Ok(space) => space,
+        Err(result) => return result,
+    };
+    let new_tables = new.page_table_frames();
+    let tid = spawn_user(
+        crate::alloc_task_id(),
+        async {},
+        TaskSpec::unthrottled(),
+        old.clone(),
+    );
+    let displaced = replace_address_space(tid, new.clone());
+    let ok_displaced = matches!(&displaced, Some(p) if alloc::sync::Arc::ptr_eq(p, &old));
+    let old_regions = old.region_count();
+    let old_tables = old.page_table_frames();
+    let new_users = new.scheduler_user_tasks();
+    let new_after = new.page_table_frames();
+    drop(displaced);
+    crate::run_until_empty();
+    if !ok_displaced {
+        return TestResult::Fail("replace_address_space did not return the old space");
+    }
+    if old_regions != 0 || old_tables != 1 {
+        return TestResult::Fail("the displaced space kept its mappings or tables");
+    }
+    if new_users != 1 || new_after != new_tables {
+        return TestResult::Fail("the new space lost its user or its tables");
+    }
+    if new.region_count() != 0 || new.page_table_frames() != 1 {
+        return TestResult::Fail("the new space outlived its only task");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "scheduler/mm-exit",
+    smoke_scheduler_exec_displacing_last_user_releases_old_mm
+);
