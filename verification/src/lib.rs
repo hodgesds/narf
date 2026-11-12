@@ -34,6 +34,8 @@ mod pipe_abi;
 #[cfg(target_arch = "x86_64")]
 mod timer_strand;
 
+mod frame_canary;
+
 // Force-link crates that contribute tests via the `narf.tests` link
 // section but whose public surface is not otherwise referenced from
 // this mega-lib. Without a load-bearing reference the rlib linker
