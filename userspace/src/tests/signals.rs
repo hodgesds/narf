@@ -3305,8 +3305,15 @@ fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
         return TestResult::Fail("timer_settime failed");
     }
 
-    // Force expiry by advancing past the deadline via the pump.
-    posix_timer::__test_run_pump();
+    // The timer's own hrtimer (`posix_timer_fn`) raises the signal at its
+    // 1 ns deadline. This CPU may run the test with interrupts masked, so
+    // expire its due timers the way an executor round does.
+    let sig = crate::handlers::sig_bit(10);
+    let end = narf_scheduler::narf_time::monotonic_ns() + 500_000_000;
+    while signal_pending_of(task) & sig == 0 && narf_scheduler::narf_time::monotonic_ns() < end {
+        let _ = narf_scheduler::narf_time::hrtimer::hrtimer_run_softirq();
+        core::hint::spin_loop();
+    }
 
     let pending = signal_pending_of(task);
     __test_signal_reset();

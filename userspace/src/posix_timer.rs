@@ -3,18 +3,35 @@
 //!
 //! Signal-delivered sibling of `timerfd_*`. A timer is a (clockid,
 //! sigevent) tuple stored per-task; arming records an
-//! `itimerspec` (initial + interval). A `sleep_pumps` callback walks
-//! the table on every scheduler tick and, on expiry, ORs the signum
-//! bit into the per-task `SIGNAL_PENDING` bitmap via the same path
-//! `kill(2)` uses, so the next return-to-user picks the signal up
-//! through the existing Wave-51/55 delivery hook.
+//! `itimerspec` (initial + interval). On expiry the signum bit is ORed
+//! into the pending bitmap via the same path `kill(2)` uses, so the next
+//! return-to-user picks the signal up through the existing Wave-51/55
+//! delivery hook.
+//!
+//! Expiry is driven by hrtimers, as in Linux: every POSIX timer owns an
+//! hrtimer on its clock's base (`k_itimer::it.real.timer`, callback
+//! `posix_timer_fn`), and every task with an ITIMER_REAL owns one on the
+//! MONOTONIC base (`signal_struct::real_timer`, callback `it_real_fn`). Both
+//! callbacks run in hard-IRQ context on the CPU whose base holds the timer:
+//! they take only IRQ-safe locks, raise the signal through the alloc-free
+//! path on pending rows seeded when the timer was armed, and restart a
+//! periodic timer at its next deadline.
+//!
+//! Lock order: `TIMERS` / `ITIMERS` / `IT_REAL_NODES` → hrtimer base lock.
+//! No hrtimer is cancelled-and-waited (`hrtimer_cancel`, also run by
+//! [`KTimer`]'s `Drop`) with one of those locks held: a callback may be
+//! waiting for it.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_scheduler::narf_time::hrtimer::{
+    self, ClockId, HrTimer, HrTimerFn, HrtimerMode, HrtimerRestart,
+};
 
-use crate::handlers::{current_task_id, raise_signal_pending};
+use crate::handlers::current_task_id;
 use crate::syscall::{SyscallReturn, TrapContext};
 
 // ── clockids accepted by `timer_create` / `clock_nanosleep` ──────────
@@ -104,7 +121,7 @@ fn timer_id_arg(raw: u64) -> Option<u32> {
 }
 
 /// One armed POSIX timer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct PosixTimer {
     /// Task the expiry signal is delivered to.
     ///
@@ -123,14 +140,17 @@ struct PosixTimer {
     /// thread group's shared set (`PIDTYPE_TGID`), where any thread that does
     /// not block it may take it.
     thread_directed: bool,
-    /// One of CLOCK_REALTIME / CLOCK_MONOTONIC / CLOCK_BOOTTIME, as the
-    /// 32-bit `clockid_t` the ABI delivers. Realtime currently shares the
-    /// monotonic source — no NTP yet.
-    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
+    /// The 32-bit `clockid_t` the timer was created on.
+    #[allow(dead_code)] // reported by /proc/<pid>/timers once that exists
     clockid: i32,
+    /// The hrtimer clock base `clockid` runs on. `next_fire_ns` is in this
+    /// clock (a CLOCK_REALTIME `TIMER_ABSTIME` value is wall time).
+    clock: ClockId,
+    /// The timer's hrtimer (`k_itimer::it.real.timer`).
+    node: Box<KTimer>,
     /// Signum to raise on expiry (SIGEV_SIGNAL); 0 = SIGEV_NONE.
     signum: u32,
-    /// Absolute monotonic-ns deadline for the next fire; 0 = disarmed.
+    /// Absolute deadline in `clock` (ns) for the next fire; 0 = disarmed.
     next_fire_ns: u64,
     /// Re-arm interval in ns; 0 = one-shot.
     interval_ns: u64,
@@ -170,29 +190,166 @@ struct TimerTable {
 }
 
 static TIMERS: IrqSafeSpinLock<Option<BTreeMap<u64, TimerTable>>> = IrqSafeSpinLock::new(None);
-static PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// The hrtimer behind one POSIX timer (`id`) or one task's ITIMER_REAL
+/// (`id == ITIMER_REAL_ID`). Boxed so it keeps its address while the table
+/// that names it reshapes; dropping it cancels the timer and waits out a
+/// running callback, so drop it with no timer-table lock held.
+#[repr(C)]
+struct KTimer {
+    /// First field: callbacks recover the node from it (`container_of`).
+    timer: HrTimer,
+    task: u64,
+    id: u32,
+}
+
+const ITIMER_REAL_ID: u32 = u32::MAX;
+
+impl core::fmt::Debug for KTimer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KTimer")
+            .field("task", &self.task)
+            .field("id", &self.id)
+            .field("queued", &self.timer.is_queued())
+            .finish()
+    }
+}
+
+impl KTimer {
+    fn new(task: u64, id: u32, clock: ClockId, function: HrTimerFn) -> Box<Self> {
+        Box::new(Self {
+            timer: HrTimer::new(function, clock, HrtimerMode::ABS_HARD),
+            task,
+            id,
+        })
+    }
+
+    /// (Re)arm for `next_fire_ns` in the timer's clock, or stop it for 0.
+    /// Called with the owning table's lock held (lock order table → base);
+    /// stopping never waits, so a callback blocked on that lock cannot
+    /// deadlock with it: it re-reads the table and finds the timer disarmed.
+    fn program(&self, next_fire_ns: u64) {
+        if next_fire_ns == 0 {
+            let _ = hrtimer::hrtimer_try_to_cancel(&self.timer);
+        } else {
+            // SAFETY: the node is boxed and its Drop cancels the timer before
+            // the storage is freed.
+            unsafe {
+                hrtimer::hrtimer_start_range_ns(&self.timer, next_fire_ns, 0, HrtimerMode::ABS)
+            };
+        }
+    }
+}
+
+impl Drop for KTimer {
+    fn drop(&mut self) {
+        hrtimer::hrtimer_cancel(&self.timer);
+    }
+}
+
+/// `clockid_t` → the hrtimer clock base it runs on. The ALARM clocks run on
+/// their base clock (NARF has no RTC wake alarm); CPU-time clocks never
+/// reach here (`timer_create_clock_ok`).
+fn clock_base_of(clockid: i32) -> ClockId {
+    match clockid {
+        CLOCKID_REALTIME | CLOCKID_REALTIME_ALARM => ClockId::Realtime,
+        CLOCKID_BOOTTIME | CLOCKID_BOOTTIME_ALARM => ClockId::Boottime,
+        CLOCKID_TAI => ClockId::Tai,
+        _ => ClockId::Monotonic,
+    }
+}
+
+/// Queue a timer signal from any context, hard IRQ included: the alloc-free
+/// raise on rows seeded when the timer was armed, then the target's wake.
+fn deliver_timer_signal(target: u64, signum: u32, thread_directed: bool) {
+    if thread_directed {
+        if crate::handlers::raise_signal_pending_irq(target, signum) {
+            crate::handlers::wake_signal(target);
+        }
+    } else if !crate::handlers::raise_group_signal_irq(target, signum) {
+        let _ = crate::handlers::raise_signal_pending_irq(target, signum);
+        crate::handlers::wake_signal(target);
+    }
+}
+
+/// One expiry check of a POSIX timer at `now` (its clock): count missed
+/// periods into the overrun, advance or disarm, and return the signal to
+/// queue. Shared by the hrtimer callback and the test-only table walk.
+fn expire_posix_timer(t: &mut PosixTimer, now: u64) -> Option<(u64, u32, bool)> {
+    if t.next_fire_ns == 0 || now < t.next_fire_ns {
+        return None;
+    }
+    let fires = if t.interval_ns == 0 {
+        1
+    } else {
+        ((now - t.next_fire_ns) / t.interval_ns).saturating_add(1)
+    };
+    t.overrun = t.overrun.saturating_add(fires.saturating_sub(1) as u32);
+    let delivery = if t.signum != 0 {
+        // Queue one signal — POSIX collapses missed expiries into a single
+        // signal + overrun count. `posix_timer_queue_signal` latches the
+        // accumulator into `it_overrun_last` and restarts it, so the count
+        // belongs to THIS signal. A SIGEV_NONE timer (signum 0) queues
+        // nothing and keeps accumulating, as in Linux.
+        t.overrun_last = t.overrun;
+        t.overrun = 0;
+        Some((t.target, t.signum, t.thread_directed))
+    } else {
+        None
+    };
+    if t.interval_ns == 0 {
+        t.next_fire_ns = 0;
+    } else {
+        t.next_fire_ns = t
+            .next_fire_ns
+            .saturating_add(t.interval_ns.saturating_mul(fires));
+    }
+    delivery
+}
+
+/// `posix_timer_fn`: a POSIX timer's hrtimer expired (hard IRQ). The table
+/// is the source of truth: a timer re-armed or disarmed while this callback
+/// was in flight is reconciled here, never double-fired.
+fn posix_timer_fn(t: &HrTimer) -> HrtimerRestart {
+    // SAFETY: only `KTimer` nodes use this callback; `timer` is the first
+    // field of the repr(C) struct.
+    let k = unsafe { &*(t as *const HrTimer as *const KTimer) };
+    let delivery = {
+        let mut g = TIMERS.lock();
+        let Some(entry) = g
+            .as_mut()
+            .and_then(|m| m.get_mut(&k.task))
+            .and_then(|table| table.by_id.get_mut(&k.id))
+        else {
+            return HrtimerRestart::NoRestart;
+        };
+        let delivery = expire_posix_timer(entry, hrtimer::clock_now(entry.clock));
+        entry.node.program(entry.next_fire_ns);
+        delivery
+    };
+    if let Some((target, signum, thread_directed)) = delivery {
+        deliver_timer_signal(target, signum, thread_directed);
+    }
+    HrtimerRestart::NoRestart
+}
 
 /// Boot-time init — call once before any user task issues a
 /// `timer_create`. Idempotent.
 pub fn posix_timer_init() {
-    *TIMERS.lock() = Some(BTreeMap::new());
-    *ITIMERS.lock() = Some(BTreeMap::new());
-    NEXT_ITIMER_REAL_DEADLINE_NS.store(NO_ITIMER_REAL_DEADLINE, Ordering::Release);
-    CPU_ITIMERS_ARMED.store(0, Ordering::Release);
-    if !PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
-        // Register a sleep-pump so timer expiries fire even while a
-        // user task is parked in `sys_sleep` / `sys_clock_nanosleep`.
-        narf_scheduler::sleep_pumps::register(posix_timer_pump);
-    }
+    __test_reset();
 }
 
 /// Test hook — drop every timer.
 #[doc(hidden)]
 pub fn __test_reset() {
-    *TIMERS.lock() = Some(BTreeMap::new());
+    // Take the tables out under their locks and drop them after: dropping a
+    // node cancels its hrtimer and may wait for a callback that needs a lock.
+    let timers = TIMERS.lock().replace(BTreeMap::new());
+    let nodes = core::mem::take(&mut *IT_REAL_NODES.lock());
     *ITIMERS.lock() = Some(BTreeMap::new());
-    NEXT_ITIMER_REAL_DEADLINE_NS.store(NO_ITIMER_REAL_DEADLINE, Ordering::Release);
     CPU_ITIMERS_ARMED.store(0, Ordering::Release);
+    drop(timers);
+    drop(nodes);
 }
 
 /// Exit-time disarm: drop the dying task's POSIX timers and interval
@@ -200,13 +357,15 @@ pub fn __test_reset() {
 /// dead tid (or, once pids recycle, the wrong process). Part of the
 /// `release_task_tables` teardown sweep.
 pub fn release_task_timers(task: u64) {
-    if let Some(m) = TIMERS.lock().as_mut() {
-        m.remove(&task);
-    }
+    // Unhash under the locks, cancel (drop) after them.
+    let table = TIMERS.lock().as_mut().and_then(|m| m.remove(&task));
+    let node = IT_REAL_NODES.lock().remove(&task);
     if let Some(m) = ITIMERS.lock().as_mut() {
         m.remove(&task);
         refresh_itimer_real_deadline_locked(m);
     }
+    drop(table);
+    drop(node);
 }
 
 /// Test hook — directly arm a task's ITIMER_REAL slot, bypassing the
@@ -525,6 +684,12 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
     };
 
     let task = current_task_id();
+    // The expiry callback raises the signal from hard IRQ through the
+    // alloc-free path: seed the target's pending rows now.
+    crate::handlers::ensure_signal_pending_slot(target_task);
+    if target_task != task {
+        crate::handlers::ensure_signal_pending_slot(task);
+    }
     let id = with_table(|m| {
         let t = m.entry(task).or_default();
         // Stay inside 0..INT_MAX: `lock_timer()` refuses to look up
@@ -535,12 +700,15 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
             t.next_id = 1;
         }
         let id = t.next_id;
+        let clock = clock_base_of(clockid);
         t.by_id.insert(
             id,
             PosixTimer {
                 target: target_task,
                 thread_directed,
                 clockid,
+                clock,
+                node: KTimer::new(task, id, clock, posix_timer_fn),
                 signum: effective_signum,
                 next_fire_ns: 0,
                 interval_ns: 0,
@@ -564,11 +732,8 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
     if unsafe { crate::handlers::copy_to_user(out_ptr, &id_bytes) }.is_err() {
         // Linux takes the `goto out` cleanup path here too — the timer is
         // unhashed and freed, so the failed id is not left live.
-        with_table(|m| {
-            if let Some(t) = m.get_mut(&task) {
-                t.by_id.remove(&id);
-            }
-        });
+        let removed = with_table(|m| m.get_mut(&task).and_then(|t| t.by_id.remove(&id)));
+        drop(removed);
         ctx.set_return(err(EFAULT));
         return;
     }
@@ -669,22 +834,22 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
     };
 
     let task = current_task_id();
-    let now = narf_scheduler::narf_time::monotonic_ns();
     // Linux does not validate `flags`: `common_timer_set` only ever tests
     // `flags & TIMER_ABSTIME`, every other bit is accepted and ignored.
     // Matching that (rather than rejecting unknown bits) is deliberate —
     // a caller passing a bit from a newer ABI must not start failing.
-    let next_fire = if value_ns == 0 {
-        0 // disarm
-    } else if flags & (TIMER_ABSTIME as i32) != 0 {
-        value_ns
-    } else {
-        now.saturating_add(value_ns)
-    };
-
     let prev = with_table(|m| {
         let t = m.get_mut(&task)?;
         let entry = t.by_id.get_mut(&id)?;
+        // The value is in the timer's own clock (`common_timer_set`).
+        let now = hrtimer::clock_now(entry.clock);
+        let next_fire = if value_ns == 0 {
+            0 // disarm
+        } else if flags & (TIMER_ABSTIME as i32) != 0 {
+            value_ns
+        } else {
+            now.saturating_add(value_ns)
+        };
         let prev_next = entry.next_fire_ns;
         let prev_interval = entry.interval_ns;
         entry.next_fire_ns = next_fire;
@@ -694,9 +859,11 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
         // settime cannot report a count from the previous arming.
         entry.overrun = 0;
         entry.overrun_last = 0;
-        Some((prev_next, prev_interval))
+        // `common_hrtimer_arm`.
+        entry.node.program(next_fire);
+        Some((prev_next, prev_interval, now))
     });
-    let (prev_next, prev_interval) = match prev {
+    let (prev_next, prev_interval, now) = match prev {
         Some(p) => p,
         None => {
             ctx.set_return(err(EINVAL));
@@ -705,7 +872,11 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
     };
 
     if old_ptr != 0 {
-        let remaining = prev_next.saturating_sub(now);
+        let remaining = if prev_next == 0 {
+            0
+        } else {
+            prev_next.saturating_sub(now)
+        };
         let mut out = [0u8; 32];
         let (is, in_) = ns_to_timespec(prev_interval);
         let (vs, vn) = ns_to_timespec(remaining);
@@ -760,13 +931,12 @@ pub fn sys_timer_gettime(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
-    let now = narf_scheduler::narf_time::monotonic_ns();
     let snap = with_table(|m| {
         let t = m.get(&task)?;
         let e = t.by_id.get(&id)?;
-        Some((e.next_fire_ns, e.interval_ns))
+        Some((e.next_fire_ns, e.interval_ns, hrtimer::clock_now(e.clock)))
     });
-    let (next, interval) = match snap {
+    let (next, interval, now) = match snap {
         Some(s) => s,
         None => {
             ctx.set_return(err(EINVAL));
@@ -826,8 +996,11 @@ pub fn sys_timer_delete(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
-    let removed = with_table(|m| m.get_mut(&task).and_then(|t| t.by_id.remove(&id)).is_some());
-    if removed {
+    // Unhash under the table lock; the node's Drop cancels the hrtimer
+    // (waiting out a running callback) after the lock is released.
+    let removed = with_table(|m| m.get_mut(&task).and_then(|t| t.by_id.remove(&id)));
+    if removed.is_some() {
+        drop(removed);
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(err(EINVAL));
@@ -962,6 +1135,12 @@ fn nanosleep_common(
     };
     let deadline = match restarted {
         Some(d) => d,
+        // An absolute CLOCK_REALTIME expiry is wall time: the park runs on
+        // the monotonic clock, so convert through the current wall offset.
+        None if absolute && clockid == CLOCK_REALTIME => {
+            let offset = narf_scheduler::narf_time::wall_offset_ns();
+            (target_ns as i128 - offset as i128).clamp(0, u64::MAX as i128) as u64
+        }
         None if absolute => target_ns,
         None => now.saturating_add(target_ns),
     };
@@ -1100,8 +1279,7 @@ fn nanosleep_block(
 //   ITIMER_REAL    (0) — wall-clock; delivers SIGALRM.
 //   ITIMER_VIRTUAL (1) — user CPU time; delivers SIGVTALRM.
 //   ITIMER_PROF    (2) — user+sys CPU time; delivers SIGPROF.
-// ITIMER_REAL is driven by the same `sleep_pumps` pump as the POSIX
-// timers above plus the per-tick IRQ scan. VIRTUAL/PROF are CPU-clock
+// ITIMER_REAL is a per-task hrtimer (`it_real_fn`). VIRTUAL/PROF are CPU-clock
 // timers: their `next_fire_ns` is a deadline on the owning task's CPU
 // time (user for VIRTUAL, user+sys for PROF), not the monotonic clock,
 // and they are checked from the timer tick / syscall-exit hook for the
@@ -1134,16 +1312,68 @@ struct Itimer {
 /// Per-task `[ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF]`.
 static ITIMERS: IrqSafeSpinLock<Option<BTreeMap<u64, [Itimer; 3]>>> = IrqSafeSpinLock::new(None);
 
-/// Earliest armed ITIMER_REAL deadline, or `u64::MAX` when none is armed.
-///
-/// Linux attaches ITIMER_REAL to an independent hrtimer, so expiry does not
-/// depend on a timer interrupt happening to return directly to user mode. NARF
-/// uses this cache to give syscall-exit the same guarantee without taking the
-/// global `ITIMERS` lock on every syscall. Writers publish it while holding
-/// `ITIMERS`; a stale deadline can only cause one extra slow-path scan, never a
-/// missed expiry.
-const NO_ITIMER_REAL_DEADLINE: u64 = u64::MAX;
-static NEXT_ITIMER_REAL_DEADLINE_NS: AtomicU64 = AtomicU64::new(NO_ITIMER_REAL_DEADLINE);
+/// Per-task ITIMER_REAL hrtimer (`signal_struct::real_timer`), created on the
+/// first arm. Separate from `ITIMERS` so the callback, which takes `ITIMERS`,
+/// never needs this lock.
+static IT_REAL_NODES: IrqSafeSpinLock<BTreeMap<u64, Box<KTimer>>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// `it_real_fn`: a task's ITIMER_REAL hrtimer expired (hard IRQ). SIGALRM is
+/// process-directed (`kill_pid_info(SIGALRM, SEND_SIG_PRIV, leader)`).
+fn it_real_fn(t: &HrTimer) -> HrtimerRestart {
+    // SAFETY: only `KTimer` nodes use this callback; `timer` is the first
+    // field of the repr(C) struct.
+    let k = unsafe { &*(t as *const HrTimer as *const KTimer) };
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let due = {
+        let mut g = ITIMERS.lock();
+        let Some(map) = g.as_mut() else {
+            return HrtimerRestart::NoRestart;
+        };
+        let Some(slots) = map.get_mut(&k.task) else {
+            return HrtimerRestart::NoRestart;
+        };
+        let slot = &mut slots[ITIMER_REAL as usize];
+        let due = advance_itimer(slot, now);
+        k.program(slot.next_fire_ns);
+        due
+    };
+    if due {
+        deliver_timer_signal(k.task, SIGALRM, false);
+    }
+    HrtimerRestart::NoRestart
+}
+
+/// One ITIMER_REAL expiry check at `now`: advance a periodic slot past it,
+/// disarm a one-shot. Returns whether SIGALRM is due.
+fn advance_itimer(slot: &mut Itimer, now: u64) -> bool {
+    if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
+        return false;
+    }
+    if slot.interval_ns == 0 {
+        slot.next_fire_ns = 0;
+    } else {
+        let fires = ((now - slot.next_fire_ns) / slot.interval_ns).saturating_add(1);
+        slot.next_fire_ns = slot
+            .next_fire_ns
+            .saturating_add(slot.interval_ns.saturating_mul(fires));
+    }
+    true
+}
+
+/// (Re)program `task`'s ITIMER_REAL hrtimer from its slot (`do_setitimer`).
+/// Task context: the first arm allocates the node.
+fn program_it_real(task: u64) {
+    let mut nodes = IT_REAL_NODES.lock();
+    let node = nodes
+        .entry(task)
+        .or_insert_with(|| KTimer::new(task, ITIMER_REAL_ID, ClockId::Monotonic, it_real_fn));
+    let next = with_itimers(|m| {
+        m.get(&task)
+            .map_or(0, |slots| slots[ITIMER_REAL as usize].next_fire_ns)
+    });
+    node.program(next);
+}
 
 /// Count of armed ITIMER_VIRTUAL/ITIMER_PROF slots across all tasks — the
 /// per-tick fast gate for [`itimer_cpu_tick`]. Zero (nobody profiles) costs
@@ -1153,13 +1383,6 @@ static NEXT_ITIMER_REAL_DEADLINE_NS: AtomicU64 = AtomicU64::new(NO_ITIMER_REAL_D
 static CPU_ITIMERS_ARMED: AtomicU64 = AtomicU64::new(0);
 
 fn refresh_itimer_real_deadline_locked(map: &BTreeMap<u64, [Itimer; 3]>) {
-    let next = map
-        .values()
-        .map(|slots| slots[ITIMER_REAL as usize].next_fire_ns)
-        .filter(|deadline| *deadline != 0)
-        .min()
-        .unwrap_or(NO_ITIMER_REAL_DEADLINE);
-    NEXT_ITIMER_REAL_DEADLINE_NS.store(next, Ordering::Release);
     let cpu_armed = map
         .values()
         .flat_map(|slots| {
@@ -1182,36 +1405,6 @@ fn with_itimers<R>(f: impl FnOnce(&mut BTreeMap<u64, [Itimer; 3]>) -> R) -> R {
     let result = f(m);
     refresh_itimer_real_deadline_locked(m);
     result
-}
-
-/// Return the current time only when an ITIMER_REAL deadline may be due.
-///
-/// This is the syscall/timer-exit common-path gate: when no real timer is
-/// armed it costs one acquire load and avoids both a clock read and the global
-/// timer-table lock.
-pub fn itimer_real_due_now() -> Option<u64> {
-    let deadline = NEXT_ITIMER_REAL_DEADLINE_NS.load(Ordering::Acquire);
-    if deadline == NO_ITIMER_REAL_DEADLINE {
-        return None;
-    }
-    let now = narf_scheduler::narf_time::monotonic_ns();
-    (now >= deadline).then_some(now)
-}
-
-/// The [`itimer_real_due_now`] gate against a clock the caller already read
-/// — one acquire load, no clock read, no lock. (The `u64::MAX` disarmed
-/// sentinel can never compare due.)
-pub fn itimer_real_due_at(now: u64) -> bool {
-    NEXT_ITIMER_REAL_DEADLINE_NS.load(Ordering::Acquire) <= now
-}
-
-/// Ensure the `sleep_pumps` callback that fires interval timers is
-/// registered. Idempotent — the boot path never calls
-/// `posix_timer_init`, so the first armed itimer wires the pump.
-fn ensure_pump_registered() {
-    if !PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
-        narf_scheduler::sleep_pumps::register(posix_timer_pump);
-    }
 }
 
 fn read_timeval(buf: &[u8; 16]) -> (i64, i64) {
@@ -1358,11 +1551,9 @@ pub fn sys_setitimer(ctx: &mut dyn TrapContext) {
         now.saturating_add(value_ns)
     };
 
-    ensure_pump_registered();
-    // Pre-create the task's SIGNAL_PENDING entry now (in syscall context,
-    // where allocation is fine) so the IRQ-context `itimer_real_check_due_irq`
-    // → `raise_signal_pending_irq` fast path only ever sets a bit in an
-    // existing entry — never allocates from the timer trap.
+    // Pre-create the task's pending-signal rows now (syscall context, where
+    // allocation is fine): the hard-IRQ `it_real_fn` raise only ever sets a
+    // bit in an existing row.
     crate::handlers::ensure_signal_pending_slot(task);
     let prev = with_itimers(|m| {
         let slots = m.entry(task).or_default();
@@ -1373,6 +1564,9 @@ pub fn sys_setitimer(ctx: &mut dyn TrapContext) {
         };
         prev
     });
+    if which == ITIMER_REAL as usize {
+        program_it_real(task);
+    }
 
     if old_ptr != 0 {
         let mut out = [0u8; 32];
@@ -1489,9 +1683,6 @@ pub fn sys_alarm(ctx: &mut dyn TrapContext) {
         now.saturating_add(secs.saturating_mul(1_000_000_000))
     };
 
-    ensure_pump_registered();
-    // See sys_setitimer: pre-create the pending slot so the IRQ fast path
-    // never allocates.
     crate::handlers::ensure_signal_pending_slot(task);
     let prev = with_itimers(|m| {
         let slots = m.entry(task).or_default();
@@ -1502,6 +1693,7 @@ pub fn sys_alarm(ctx: &mut dyn TrapContext) {
         };
         prev
     });
+    program_it_real(task);
 
     let prev_remaining = if prev.next_fire_ns == 0 {
         0
@@ -1533,122 +1725,27 @@ fn itimer_pump_collect(now: u64, deliveries: &mut Vec<(u64, u32, bool)>) {
         None => return,
     };
     for (task, slots) in map.iter_mut() {
-        let slot = &mut slots[ITIMER_REAL as usize];
-        if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
-            continue;
-        }
-        // ITIMER_REAL: process-directed.
-        deliveries.push((*task, SIGALRM, false));
-        if slot.interval_ns == 0 {
-            slot.next_fire_ns = 0;
-        } else {
-            let fires = ((now - slot.next_fire_ns) / slot.interval_ns).saturating_add(1);
-            slot.next_fire_ns = slot
-                .next_fire_ns
-                .saturating_add(slot.interval_ns.saturating_mul(fires));
+        if advance_itimer(&mut slots[ITIMER_REAL as usize], now) {
+            // ITIMER_REAL: process-directed.
+            deliveries.push((*task, SIGALRM, false));
         }
     }
-    refresh_itimer_real_deadline_locked(map);
 }
 
-/// IRQ-context fast path for ITIMER_REAL — the half that makes a
-/// CPU-bound task's `setitimer`/`alarm` actually fire. The sleep-pump
-/// above only runs when *some* task parks (sleep/pause); a task spinning
-/// in a tight loop with no syscalls never parks, so without this its
-/// real timer would never expire. Mirrors Linux's `it_real_fn` (the
-/// ITIMER_REAL hrtimer callback raises SIGALRM straight from hardirq).
-///
-/// Checks ONLY `task`'s ITIMER_REAL slot (the interrupted task — on a
-/// single CPU that's the only one that can be CPU-bound), re-arms a
-/// periodic timer / disarms a one-shot, and returns true when SIGALRM
-/// is due. Fully alloc-free: takes only the `IrqSafeSpinLock` and never
-/// inserts (a missing table / slot just returns false). The caller
-/// raises the pending bit via the alloc-free `raise_signal_pending_irq`.
-///
-/// Re-arming under the lock keeps the slow pump from double-firing: once
-/// this advances `next_fire_ns`, the pump sees a future deadline.
+/// The ITIMER_REAL expiry step of `it_real_fn` for one task at `now`:
+/// re-arms a periodic timer / disarms a one-shot and returns whether SIGALRM
+/// is due. Alloc-free (IRQ-safe lock, no insert). Test entry point for the
+/// expiry arithmetic; the hrtimer callback is the production caller.
 pub fn itimer_real_check_due_irq(task: u64, now: u64) -> bool {
     let mut g = ITIMERS.lock();
     let map = match g.as_mut() {
         Some(m) => m,
         None => return false,
     };
-    let slot = match map.get_mut(&task) {
-        Some(slots) => &mut slots[ITIMER_REAL as usize],
-        None => return false,
-    };
-    if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
-        return false;
+    match map.get_mut(&task) {
+        Some(slots) => advance_itimer(&mut slots[ITIMER_REAL as usize], now),
+        None => false,
     }
-    if slot.interval_ns == 0 {
-        slot.next_fire_ns = 0;
-    } else {
-        let fires = ((now - slot.next_fire_ns) / slot.interval_ns).saturating_add(1);
-        slot.next_fire_ns = slot
-            .next_fire_ns
-            .saturating_add(slot.interval_ns.saturating_mul(fires));
-    }
-    refresh_itimer_real_deadline_locked(map);
-    true
-}
-
-/// IRQ-context scan of **every** task's ITIMER_REAL slot — the multi-task
-/// generalization of [`itimer_real_check_due_irq`]. For each due slot it
-/// advances (periodic) / disarms (one-shot) the deadline under the lock and
-/// records the owning task id in `out`; returns the number written (bounded
-/// by `out.len()` — any overflow stays due and is caught next tick).
-///
-/// Why this exists: the single-current-task check only ever inspects the
-/// *interrupted* task's slot. But a task that arms `setitimer(ITIMER_REAL)`
-/// and then PARKS (e.g. blocks in `waitpid`) is never the interrupted task
-/// while sibling CPU-bound tasks run — and the sleep-pump that would catch
-/// the parked owner starves under that load (each busy task holds its CPU's
-/// executor, so no round runs). Linux's `it_real_fn` is a per-process
-/// hrtimer that fires regardless of which task is on-CPU; this restores that
-/// semantics. Fully alloc-free (advance-in-place under the existing
-/// `IrqSafeSpinLock`); the caller raises + wakes each returned task.
-///
-/// **O(1) stack.** Returns the lowest task id strictly greater than `after`
-/// (or the lowest of all, when `after` is `None`) whose `ITIMER_REAL` is due
-/// at `now`, advancing that slot in place so a subsequent call skips it.
-/// `None` means no more are due. The caller loops, feeding the previous result
-/// back as `after`, raising + waking each returned task between calls (so
-/// `wake_signal` never runs under the `ITIMERS` lock).
-///
-/// This replaces an earlier `collect_all(out: &mut [u64])` form: returning the
-/// owners through a `[u64; 64]` (~512 B) buffer put that array on the timer
-/// IRQ's stack — the *user task's own kernel stack* under the per-task-own-stack
-/// model — and that large IRQ-path frame deterministically smashed the timer
-/// handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn. Same
-/// hazard the timer-wheel drain documents (hrtimer expiry wakes by reference only):
-/// no big on-stack buffer in IRQ context.
-pub fn itimer_real_take_one_due_irq(now: u64, after: Option<u64>) -> Option<u64> {
-    use core::ops::Bound;
-    let lower = match after {
-        Some(a) => Bound::Excluded(a),
-        None => Bound::Unbounded,
-    };
-    let mut g = ITIMERS.lock();
-    let map = g.as_mut()?;
-    for (task, slots) in map.range_mut((lower, Bound::Unbounded)) {
-        let slot = &mut slots[ITIMER_REAL as usize];
-        if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
-            continue;
-        }
-        if slot.interval_ns == 0 {
-            slot.next_fire_ns = 0;
-        } else {
-            let fires = ((now - slot.next_fire_ns) / slot.interval_ns).saturating_add(1);
-            slot.next_fire_ns = slot
-                .next_fire_ns
-                .saturating_add(slot.interval_ns.saturating_mul(fires));
-        }
-        return Some(*task);
-    }
-    // The caller has exhausted the due-task walk. Publish the next future
-    // deadline (or the disarmed sentinel) before its next fast-path probe.
-    refresh_itimer_real_deadline_locked(map);
-    None
 }
 
 /// Sample `task`'s CPU clocks for the VIRTUAL (user) and PROF (user+sys)
@@ -1814,56 +1911,22 @@ fn posix_timer_pump() {
     posix_timer_pump_at(narf_scheduler::narf_time::monotonic_ns());
 }
 
-/// The pump body, against a SUPPLIED instant.
+/// Test-only: run every POSIX timer's and ITIMER_REAL's expiry step at a
+/// SUPPLIED instant, as their hrtimer callbacks would.
 ///
-/// Split out so a test can drive expiry deterministically instead of racing
-/// the real clock. Overrun accounting is arithmetic on `(now - next_fire) /
-/// interval`, so a case that arms a timer and then waits for wall time to
-/// pass would be asserting on however many intervals happened to elapse —
-/// exactly the kind of assertion that passes locally and fails under load.
+/// Lets a test drive expiry deterministically instead of racing the real
+/// clock: overrun accounting is arithmetic on `(now - next_fire) / interval`,
+/// so a case that waited for wall time would assert on however many
+/// intervals happened to elapse. Production expiry is the callbacks.
 fn posix_timer_pump_at(now: u64) {
-    // Collect (task, signum) pairs under the lock; deliver after
-    // releasing it so we don't nest SIGNAL_PENDING under TIMERS.
-    // (target task, signum, thread-directed)
     let mut deliveries: Vec<(u64, u32, bool)> = Vec::new();
     {
-        // The POSIX-timer table may be uninitialised in a real boot
-        // (`posix_timer_init` only runs in the test harness). Skip its
-        // walk when absent rather than aborting the whole pump — the
-        // itimer half below stands up its own table on first use.
         let mut g = TIMERS.lock();
         if let Some(map) = g.as_mut() {
-            for (_task, table) in map.iter_mut() {
-                for (_id, t) in table.by_id.iter_mut() {
-                    if t.next_fire_ns == 0 || now < t.next_fire_ns {
-                        continue;
-                    }
-                    let fires = if t.interval_ns == 0 {
-                        1
-                    } else {
-                        ((now - t.next_fire_ns) / t.interval_ns).saturating_add(1)
-                    };
-                    t.overrun = t.overrun.saturating_add(fires.saturating_sub(1) as u32);
-                    if t.signum != 0 {
-                        // Queue one signal — POSIX collapses missed
-                        // expiries into a single signal + overrun count.
-                        //
-                        // `posix_timer_queue_signal` latches the accumulator
-                        // into `it_overrun_last` and restarts it, so the count
-                        // belongs to THIS signal. A SIGEV_NONE timer (signum
-                        // 0) queues nothing and keeps accumulating, which is
-                        // also what Linux does — there is no delivery to
-                        // attribute the count to.
-                        t.overrun_last = t.overrun;
-                        t.overrun = 0;
-                        deliveries.push((t.target, t.signum, t.thread_directed));
-                    }
-                    if t.interval_ns == 0 {
-                        t.next_fire_ns = 0;
-                    } else {
-                        t.next_fire_ns = t
-                            .next_fire_ns
-                            .saturating_add(t.interval_ns.saturating_mul(fires));
+            for table in map.values_mut() {
+                for t in table.by_id.values_mut() {
+                    if let Some(d) = expire_posix_timer(t, now) {
+                        deliveries.push(d);
                     }
                 }
             }
@@ -1871,15 +1934,7 @@ fn posix_timer_pump_at(now: u64) {
     }
     itimer_pump_collect(now, &mut deliveries);
     for (task, signum, thread_directed) in deliveries {
-        if thread_directed {
-            raise_signal_pending(task, signum);
-        } else {
-            let _ = crate::handlers::raise_group_signal(
-                task,
-                signum,
-                crate::handlers::GroupSigInfo::None,
-            );
-        }
+        deliver_timer_signal(task, signum, thread_directed);
     }
 }
 
@@ -1929,14 +1984,14 @@ pub fn next_fire_of(task: u64, id: u32) -> Option<u64> {
     })
 }
 
-/// Force the pump to run — for tests that don't have a real
-/// scheduler tick driving `sleep_pumps`.
+/// Run every timer's expiry step now — for tests that call the syscall
+/// entry points directly and do not wait for the hrtimer interrupt.
 #[doc(hidden)]
 pub fn __test_run_pump() {
     posix_timer_pump();
 }
 
-/// Force the pump to run AT a given monotonic instant.
+/// Run every timer's expiry step AT a given instant.
 ///
 /// Lets an overrun case state the elapsed time rather than wait for it, so
 /// the expected count is fixed by arithmetic rather than by how long the
@@ -1948,10 +2003,9 @@ pub fn __test_run_pump_at(now: u64) {
 
 // ── ITIMER_REAL IRQ fast-path lifecycle smokes ──────────────────────
 //
-// `itimer_real_check_due_irq` is the alloc-free hardirq-context half that
-// makes a CPU-bound task's `setitimer(ITIMER_REAL)` actually fire (the slow
-// `sleep_pumps` half only runs when *some* task parks). It is the mechanism a
-// stress-ng worker relies on to be told to stop. These pin its three load-
+// `itimer_real_check_due_irq` is the expiry step of the hard-IRQ `it_real_fn`
+// callback that makes a CPU-bound task's `setitimer(ITIMER_REAL)` fire. It is
+// the mechanism a stress-ng worker relies on to be told to stop. These pin its three load-
 // bearing behaviours — fire-when-due, one-shot-disarm, periodic-re-arm — which
 // were verified live during the SMP `chroot_run` investigation but had no unit
 // guard (only the syscall-ABI `setitimer`/`getitimer` smokes existed).
@@ -2068,4 +2122,46 @@ fn smoke_itimer_real_unarmed_never_fires() -> narf_kernel_test::TestResult {
 narf_kernel_test::kernel_test_in!(
     "userspace/posix_timer",
     smoke_itimer_real_unarmed_never_fires
+);
+
+/// `it_real_fn`: an armed ITIMER_REAL raises SIGALRM from its own hrtimer —
+/// no sleep pump, no tick scan — and a one-shot disarms. Process-directed,
+/// so the bit lands on the group's shared set.
+#[cfg(target_arch = "x86_64")]
+fn smoke_itimer_real_hrtimer_raises_sigalrm() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let task = 0xFEED_0000_0000_0003;
+    // The kernel-test boot leaves the signal tables to the tests that use
+    // them; stand them up so the seeded rows exist.
+    crate::handlers::__test_signal_reset();
+    crate::handlers::ensure_signal_pending_slot(task);
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    __test_arm_itimer_real(task, now + 1_000_000, 0);
+    program_it_real(task);
+    let sig = crate::handlers::sig_bit(SIGALRM);
+    let end = now + 500_000_000;
+    while crate::handlers::signal_pending_of(task) & sig == 0
+        && narf_scheduler::narf_time::monotonic_ns() < end
+    {
+        // This CPU may run tests with interrupts masked: expire its due
+        // timers the way an executor round does.
+        let _ = hrtimer::hrtimer_run_softirq();
+        core::hint::spin_loop();
+    }
+    let raised = crate::handlers::signal_pending_of(task) & sig != 0;
+    let disarmed = __test_itimer_real_next_fire(task) == 0;
+    release_task_timers(task);
+    crate::handlers::__test_signal_reset();
+    if !raised {
+        return TestResult::Fail("ITIMER_REAL's hrtimer never raised SIGALRM");
+    }
+    if !disarmed {
+        return TestResult::Fail("a fired one-shot ITIMER_REAL stayed armed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+narf_kernel_test::kernel_test_in!(
+    "userspace/posix_timer",
+    smoke_itimer_real_hrtimer_raises_sigalrm
 );

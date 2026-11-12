@@ -9406,72 +9406,14 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
     false
 }
 
-/// Timer-tick hook (called from the arch timer ISR). Raises any signal
-/// whose timer has expired for the *currently running* task, so a
-/// CPU-bound task that never parks still receives e.g. SIGALRM from
-/// `alarm()` / `setitimer(ITIMER_REAL)`. Alloc-free — safe to call with
-/// interrupts disabled from the trap handler. The raised signal is then
-/// delivered by `signal_delivery_hook` on the same trap's return to user.
+/// Timer-tick hook (called from the arch timer ISR and at syscall exit).
+/// Runs the CPU-clock interval timers (ITIMER_VIRTUAL → SIGVTALRM,
+/// ITIMER_PROF → SIGPROF) for the current task, which Linux also samples from
+/// the tick in the task's own context. Alloc-free; one atomic load when no
+/// CPU itimer is armed. ITIMER_REAL and POSIX timers are hrtimers and raise
+/// their own signals from their expiry callbacks.
 pub fn timer_tick_raise_due_signals() {
-    // CPU itimers (ITIMER_VIRTUAL → SIGVTALRM, ITIMER_PROF → SIGPROF) for
-    // the interrupted/current task. Checked ahead of the REAL scan because
-    // the REAL fast gate below returns from the whole function; both paths
-    // are alloc-free and one-atomic-load cheap when unused.
     crate::posix_timer::itimer_cpu_tick();
-    {
-        let Some(now) = crate::posix_timer::itimer_real_due_now() else {
-            return;
-        };
-        // Scan EVERY armed ITIMER_REAL slot, not just the interrupted task's.
-        // The owner of a `setitimer(ITIMER_REAL)` is frequently PARKED (e.g.
-        // blocked in waitpid while CPU-bound children spin) — so it's never
-        // the interrupted task, and the sleep-pump that would catch it
-        // starves under that load. Without this scan the parked owner's
-        // SIGALRM never fires (the kernel cause of the SMP chroot_run /
-        // stress-ng hang, where a parent stops its workers via an alarm).
-        //
-        // O(1)-stack drain: take one due owner at a time, then raise + wake it
-        // OUTSIDE the ITIMERS lock. We MUST NOT collect the owners into a large
-        // on-stack `[u64; N]` buffer here: this runs in the timer ISR on the
-        // *user task's own kernel stack* (per-task-own-stack model), and a
-        // ~512 B array on that IRQ-path frame deterministically smashed this
-        // handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn
-        // — the same "no big on-stack array in IRQ context" hazard the timer
-        // wheel documents (the hrtimer expiry path).
-        raise_due_itimer_real(now);
-    }
-}
-
-/// Drain-and-raise every due ITIMER_REAL owner at `now`. Shared by the
-/// timer-tick hook above and the park loop's backstop kick
-/// (`park_should_block`): a parked owner's own 1 ms backstop treadmill
-/// otherwise never raises — its re-executed syscall parks again without
-/// reaching the syscall-EXIT hook, the posix-timer sleep pump only runs
-/// from nested waits (not the executor's `run_io` rounds), and an idle
-/// CPU's tick interrupts the executor, not user mode. The raise then
-/// depended on UNRELATED system activity — measured 6.5 s (and worse) of
-/// SIGALRM latency to a task parked in a FIFO open on an idle guest.
-///
-/// Alloc-free and IRQ-safe (O(1)-stack take-one drain; see the stack
-/// hazard note above). Every lock `wake_signal` touches is an
-/// `IrqSafeSpinLock`, so both the timer ISR and executor contexts may
-/// call this.
-pub(crate) fn raise_due_itimer_real(now: u64) {
-    let mut after: Option<u64> = None;
-    while let Some(t) = crate::posix_timer::itimer_real_take_one_due_irq(now, after) {
-        after = Some(t);
-        // SIGALRM (14). Slot was pre-created when the timer was armed, so
-        // this only sets a bit in an existing entry (never allocates).
-        // ITIMER_REAL is process-directed (`it_real_fn` ->
-        // `kill_pid_info(SIGALRM, SEND_SIG_PRIV, leader_pid)`): raise it on the
-        // group's shared set and wake a thread that wants it — which may be a
-        // sibling when the owner blocks SIGALRM. The owner's slot was seeded
-        // when the timer was armed, so this never allocates.
-        if !raise_group_signal_irq(t, 14) {
-            let _ = raise_signal_pending_irq(t, 14);
-            wake_signal(t);
-        }
-    }
 }
 
 /// Preemptive time-slice: hand a CPU-bound user task back to the
