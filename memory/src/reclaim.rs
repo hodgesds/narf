@@ -988,6 +988,34 @@ pub fn shrink_all(target_pages: usize) -> usize {
     shrink_snapshot(&snap, target_pages)
 }
 
+/// `echo 2 > /proc/sys/vm/drop_caches` (`mm/vmscan.c::drop_slab`): run every
+/// registered shrinker until a pass frees nothing, then return every empty
+/// heap frame to the buddy ([`crate::slab::shrink`]) — the objects those
+/// shrinkers freed only leave `Slab` once their frames do. Returns the base
+/// pages released.
+///
+/// Sleepable task context with no locks held: the shrinkers take their own
+/// locks and the slab release calls the buddy.
+pub fn drop_slab() -> usize {
+    // Linux repeats `drop_slab_node` while a pass frees more than a trickle;
+    // a fixed cap keeps a cache that refills as fast as it is shrunk from
+    // pinning the writer.
+    const MAX_PASSES: usize = 16;
+    let mut freed = 0usize;
+    for _ in 0..MAX_PASSES {
+        let reclaimable = shrinkable_pages();
+        if reclaimable == 0 {
+            break;
+        }
+        let n = shrink_all(reclaimable);
+        freed = freed.saturating_add(n);
+        if n == 0 {
+            break;
+        }
+    }
+    freed.saturating_add(crate::slab::shrink())
+}
+
 fn shrink_snapshot(snap: &[Option<Shrinker>; MAX_SHRINKERS], target_pages: usize) -> usize {
     let total: usize = snap
         .iter()

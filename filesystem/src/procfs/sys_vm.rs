@@ -48,8 +48,6 @@ extern crate alloc;
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use narf_lib::sync::IrqSafeSpinLock;
-
 use super::sys::register_sysctl;
 use super::sys::SysctlEntry;
 use crate::FsError;
@@ -101,14 +99,18 @@ fn read_val(v: u64) -> String {
 
 // ── drop_caches trigger ──────────────────────────────────────────
 
-/// Write-only: 1=drop pagecache, 2=drop dentries+inodes, 3=both.
-/// NARF has no page-cache or dentry-cache today; we call the reclaim
-/// hook if it's wired, otherwise this is a no-op accepted silently
-/// (same behaviour as Linux when caches are already clean).
+/// Write-only: 1=drop pagecache, 2=drop reclaimable slab objects, 3=both.
 ///
-/// Linux ref: `mm/vmscan.c` `drop_caches_sysctl_handler`.
-static DROP_CACHES_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
-
+/// NARF's caches (page cache, mapped-file cache, btrfs caches) all register
+/// as shrinkers without Linux's pagecache/slab split, so either bit runs
+/// every shrinker until a pass frees nothing and then returns the heap's
+/// empty frames to the buddy (`narf_memory::reclaim::drop_slab`). This used
+/// to be a no-op, so a soak's "drop caches, then read Slab" measured nothing
+/// having been dropped. Like Linux, concurrent writers are not serialised:
+/// the shrinkers and the slab release each take their own locks, and must
+/// not run under an IRQ-masking spinlock held across them.
+///
+/// Linux ref: `mm/vmscan.c` `drop_caches_sysctl_handler`, `drop_slab`.
 fn drop_caches_read() -> String {
     // Write-only per Linux convention; reading returns "0\n".
     String::from("0\n")
@@ -119,12 +121,7 @@ fn drop_caches_write(s: &str) -> Result<(), FsError> {
     if v == 0 {
         return Err(FsError::InvalidData);
     }
-    // Hold a trivial lock to serialise concurrent drop-caches requests.
-    let _g = DROP_CACHES_LOCK.lock();
-    // NARF reclaim hook — no-op today; accepted silently.
-    // When narf_memory::reclaim::drop_caches(v) is available, call it here.
-    // No-op: NARF has no page-cache or dentry-cache in Stage-10.
-    let _ = v; // used: passed to would-be hook
+    narf_memory::reclaim::drop_slab();
     Ok(())
 }
 
