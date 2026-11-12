@@ -3699,6 +3699,7 @@ impl AddressSpace {
     /// Caller must run with paging enabled. Post-construction the
     /// AS is safe to build up and activate per the normal flow.
     #[cfg(target_arch = "x86_64")]
+    #[track_caller]
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
         let floor = crate::kaslr::user_mmap_slot(Self::MMAP_CURSOR_BASE);
         // SAFETY: forwarded from this function's caller; `floor` is the fresh
@@ -3715,6 +3716,7 @@ impl AddressSpace {
     /// Same paging contract as [`Self::new_for_user`]. `floor` must be a
     /// page-aligned address in the ordinary mmap randomization window.
     #[cfg(target_arch = "x86_64")]
+    #[track_caller]
     unsafe fn new_for_user_with_mmap_floor(floor: u64) -> Result<Self, AddressSpaceError> {
         debug_assert_eq!(floor & 0xFFF, 0);
         debug_assert!((Self::MMAP_CURSOR_BASE..Self::MMAP_WINDOW_TOP).contains(&floor));
@@ -3724,6 +3726,7 @@ impl AddressSpace {
         // SAFETY: contract documented on the function.
         let phys = unsafe { crate::x86_64::paging::new_user_pml4() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
+        crate::as_origin::record(phys.raw(), core::panic::Location::caller());
         Ok(Self {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
@@ -13494,6 +13497,7 @@ impl AddressSpace {
     ///   space fork hook clones its VMA-level owner before this function
     ///   releases the parent VMA transaction.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[track_caller]
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
         // Linux `dup_mm` copies `mm_struct`, including `mmap_base`; ASLR is
         // chosen for a fresh layout at exec, not redrawn at fork. Besides

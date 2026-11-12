@@ -2412,6 +2412,7 @@ pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
         return;
     }
     USER_PML4_LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    crate::as_origin::forget(pml4_phys.raw());
     // Reserve before taking the IRQ-safe page-table lock. There are exactly
     // 255 candidate private slots, so pushes in the critical section cannot
     // grow the allocation.

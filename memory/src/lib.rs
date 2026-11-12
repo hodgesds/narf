@@ -23,6 +23,7 @@ pub mod atomic_pool;
 pub mod bpf_arena;
 pub mod bpf_extable;
 pub mod bpf_stack;
+pub mod as_origin;
 pub mod bpf_text;
 pub mod buddy;
 #[cfg(feature = "cgroup")]
