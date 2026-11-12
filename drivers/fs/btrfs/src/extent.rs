@@ -23,23 +23,67 @@ use crate::volume::BtrfsVolume;
 /// Decompress a whole compressed extent according to its algorithm. zlib and
 /// zstd are single streams; LZO is btrfs's sector-segmented framing, which needs
 /// `sectorsize`.
+///
+/// The decoder state comes from a [`crate::workspace`] pool, as Linux takes a
+/// workspace: built here per call, it gave this function a 19 KiB frame on
+/// every compressed read.
 fn decompress(compression: u8, input: &[u8], sectorsize: usize) -> Result<Vec<u8>, FsError> {
     match compression {
-        format::COMPRESS_ZLIB => {
-            miniz_oxide::inflate::decompress_to_vec_zlib(input).map_err(|_| FsError::InvalidData)
-        }
-        format::COMPRESS_ZSTD => {
-            use ruzstd::io::Read;
-            let mut decoder =
-                ruzstd::decoding::StreamingDecoder::new(input).map_err(|_| FsError::InvalidData)?;
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|_| FsError::InvalidData)?;
-            Ok(out)
-        }
+        format::COMPRESS_ZLIB => inflate_zlib(input),
+        format::COMPRESS_ZSTD => decode_zstd(input),
         format::COMPRESS_LZO => crate::lzo::decompress_extent(input, sectorsize),
         _ => Err(FsError::InvalidData),
+    }
+}
+
+/// A zlib stream, inflated by a pooled inflater (miniz's
+/// `decompress_to_vec_zlib` loop, which would build its own each call).
+fn inflate_zlib(mut input: &[u8]) -> Result<Vec<u8>, FsError> {
+    use miniz_oxide::inflate::core::{decompress, inflate_flags};
+    use miniz_oxide::inflate::TINFLStatus;
+    let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+        | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+    let mut ws = crate::workspace::ZLIB.get();
+    ws.init();
+    let mut out: Vec<u8> = alloc::vec![0; input.len().saturating_mul(2).max(64)];
+    let mut at = 0;
+    loop {
+        let (status, consumed, produced) = decompress(&mut ws, input, &mut out, at, flags);
+        at += produced;
+        match status {
+            TINFLStatus::Done => {
+                out.truncate(at);
+                return Ok(out);
+            }
+            TINFLStatus::HasMoreOutput if consumed <= input.len() => {
+                input = &input[consumed..];
+                let grown = out.len().saturating_mul(2);
+                out.resize(grown, 0);
+            }
+            _ => return Err(FsError::InvalidData),
+        }
+    }
+}
+
+/// A zstd frame, decoded by a pooled frame decoder, straight into the output
+/// (ruzstd's `read_to_end` stages through a 16 KiB stack buffer of its own).
+fn decode_zstd(input: &[u8]) -> Result<Vec<u8>, FsError> {
+    use ruzstd::io::Read;
+    const STEP: usize = 64 * 1024;
+    let mut ws = crate::workspace::ZSTD.get();
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new_with_decoder(input, &mut *ws)
+        .map_err(|_| FsError::InvalidData)?;
+    let mut out = Vec::new();
+    loop {
+        let at = out.len();
+        out.resize(at + STEP, 0);
+        let n = decoder
+            .read(&mut out[at..])
+            .map_err(|_| FsError::InvalidData)?;
+        out.truncate(at + n);
+        if n == 0 {
+            return Ok(out);
+        }
     }
 }
 
