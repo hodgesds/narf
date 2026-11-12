@@ -334,10 +334,10 @@ struct TmigrTimer {
     slot: usize,
 }
 
-fn tmigr_timer_fn(t: &narf_time::timer::TimerList) {
+fn tmigr_timer_fn(r: narf_time::timer::TimerRef) {
     // SAFETY: only `TmigrTimer` uses this callback; `timer` is its first
-    // field (repr(C)).
-    let slot = unsafe { (*(t as *const narf_time::timer::TimerList as *const TmigrTimer)).slot };
+    // field (repr(C)); the test keeps it alive.
+    let slot = unsafe { (*(r.as_ptr() as *const TmigrTimer)).slot };
     TMIGR_FIRED_CPU[slot].store(narf_lib::percpu::current_cpu(), Ordering::Release);
 }
 

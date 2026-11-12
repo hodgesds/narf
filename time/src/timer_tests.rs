@@ -21,9 +21,10 @@ struct Counted {
     at: AtomicU64,
 }
 
-fn counted_fn(t: &TimerList) {
-    // SAFETY: only `Counted` uses this callback; `timer` is its first field.
-    let c = unsafe { &*(t as *const TimerList as *const Counted) };
+fn counted_fn(r: timer::TimerRef) {
+    // SAFETY: only `Counted` uses this callback; `timer` is its first field;
+    // the test keeps it alive.
+    let c = unsafe { &*(r.as_ptr() as *const Counted) };
     c.at.store(jiffies(), Ordering::Release);
     c.fired.fetch_add(1, Ordering::AcqRel);
 }
@@ -185,3 +186,90 @@ fn smoke_timer_wheel_dead_cpu_moves_timers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time/timer", smoke_timer_wheel_dead_cpu_moves_timers);
+/// The batch-delete repro: three timers due in the same bucket of one base;
+/// whichever callback runs first deletes B, which is collected for this
+/// expiry but has not run (another CPU dropping a coarse sleeper whose task
+/// was woken some other way does the same). B must not fire, the other two
+/// must, and nothing may stay pending. The wheel as first merged unlinked B
+/// through its stale bucket links, ran it anyway and lost the rest of the
+/// batch: their sleepers were never woken.
+#[repr(C)]
+struct Batch {
+    timer: TimerList,
+    fired: AtomicUsize,
+}
+
+static BATCH_VICTIM: core::sync::atomic::AtomicPtr<Batch> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+fn batch_fn(r: timer::TimerRef) {
+    // SAFETY: only `Batch` uses this callback; `timer` is its first field;
+    // the test keeps it alive.
+    let b = unsafe { &*(r.as_ptr() as *const Batch) };
+    b.fired.fetch_add(1, Ordering::AcqRel);
+    let v = BATCH_VICTIM.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if !v.is_null() {
+        // SAFETY: the victim is a live Box owned by the test.
+        del_timer(unsafe { &(*v).timer });
+    }
+}
+
+fn smoke_timer_wheel_delete_from_collected_batch() -> TestResult {
+    let ever = narf_lib::smp::ever_online_bitmap();
+    let Some(dead) = (1..narf_lib::percpu::MAX_CPUS)
+        .rev()
+        .find(|c| ever & (1u64 << c) == 0)
+    else {
+        return TestResult::Skip("every CPU index has been online");
+    };
+    timer::timers_prepare_cpu(dead);
+    let mk = || {
+        Box::new(Batch {
+            timer: TimerList::new(batch_fn, 0),
+            fired: AtomicUsize::new(0),
+        })
+    };
+    let (a, b, c) = (mk(), mk(), mk());
+    let at = jiffies() + 2;
+    // SAFETY: the Boxes outlive the timers; deleted below.
+    unsafe {
+        add_timer_on(&c.timer, at, dead);
+        add_timer_on(&b.timer, at, dead);
+        add_timer_on(&a.timer, at, dead);
+    }
+    // The first callback to run deletes B.
+    BATCH_VICTIM.store(&*b as *const Batch as *mut Batch, Ordering::Release);
+    let end = crate::monotonic_ns() + 200_000_000;
+    while crate::monotonic_ns() < end
+        && (a.fired.load(Ordering::Acquire) == 0 || c.fired.load(Ordering::Acquire) == 0)
+    {
+        let _ = timer::expire_remote_global(dead);
+        core::hint::spin_loop();
+    }
+    let _ = timer::expire_remote_global(dead);
+    let fired = (
+        a.fired.load(Ordering::Acquire),
+        b.fired.load(Ordering::Acquire),
+        c.fired.load(Ordering::Acquire),
+    );
+    let pending = (
+        a.timer.is_pending(),
+        b.timer.is_pending(),
+        c.timer.is_pending(),
+    );
+    BATCH_VICTIM.store(core::ptr::null_mut(), Ordering::Release);
+    del_timer_sync(&a.timer);
+    del_timer_sync(&b.timer);
+    del_timer_sync(&c.timer);
+    if fired.1 != 0 {
+        return TestResult::Fail("a timer deleted after it was collected still fired");
+    }
+    if fired.0 != 1 || fired.2 != 1 || pending.2 {
+        return TestResult::Fail("deleting one collected timer lost the rest of the batch");
+    }
+    if pending.0 || pending.1 {
+        return TestResult::Fail("a fired or deleted timer is still pending");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time/timer", smoke_timer_wheel_delete_from_collected_batch);
