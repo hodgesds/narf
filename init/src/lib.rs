@@ -196,6 +196,27 @@ pub fn set_verbose_log(on: bool) {
     VERBOSE.store(on, Ordering::Release);
 }
 
+/// Called immediately before (`entering = true`) and after each initcall,
+/// with its stage and name. Lets the boot measure what each initcall costs
+/// (its stack depth) without this crate knowing about stacks.
+pub type InitcallHook = fn(stage: Stage, name: &'static str, entering: bool);
+
+static CALL_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the [`InitcallHook`]; replaces any previous one.
+pub fn set_initcall_hook(hook: InitcallHook) {
+    CALL_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn call_hook(stage: Stage, name: &'static str, entering: bool) {
+    let h = CALL_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: only `set_initcall_hook` stores here, an `InitcallHook`.
+        let f: InitcallHook = unsafe { core::mem::transmute(h) };
+        f(stage, name, entering);
+    }
+}
+
 fn log(line: &str) {
     let h = LOG_HOOK.load(Ordering::Acquire);
     if h != 0 {
@@ -327,9 +348,11 @@ pub fn run_stage(stage: Stage) -> StageStats {
         }
 
         stats.total += 1;
+        call_hook(stage, ic.name, true);
         let t0 = narf_time::now_cycles();
         let result = (ic.func)();
         let dt = narf_time::now_cycles().saturating_sub(t0);
+        call_hook(stage, ic.name, false);
         stats.total_cycles = stats.total_cycles.saturating_add(dt);
         if dt > stats.max_cycles {
             stats.max_cycles = dt;
