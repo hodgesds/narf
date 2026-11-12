@@ -108,6 +108,8 @@ mod instructions;
 
 mod strand_tests;
 mod tests;
+#[cfg(feature = "kernel-test")]
+mod tmigr_race_tests;
 
 pub use accounting::{
     hardirq_cycles, interrupt_account_enter, nmi_cycles, InterruptAccountGuard, InterruptKind,
