@@ -2581,10 +2581,15 @@ fn resched_remote(target_cpu: u32) {
     // Publish the reschedule request BEFORE the Dekker fence so a target that
     // commits to halt after this point observes it in its halt-commit check
     // (see NEED_RESCHED). Authoritative even when the IPI below is skipped.
-    NEED_RESCHED[target_cpu as usize].store(true, Ordering::Release);
+    let already_requested = NEED_RESCHED[target_cpu as usize].swap(true, Ordering::AcqRel);
     // Pair with the idle side's `mark_halted(true); fence; final-scan`.
     core::sync::atomic::fence(Ordering::SeqCst);
-    if !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
+    // A request that was already pending on a halted target has its IPI on
+    // the way (Linux `set_nr_and_not_polling` sends only on the first setter):
+    // the halt commit consumes the flag before halting, so a set flag on a
+    // halted CPU was set after its commit, and that setter saw it halted and
+    // sends. A second IPI for the same request is a wake storm, not a wake.
+    if already_requested || !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
         local_scheduler_telemetry()
             .resched_skip
             .fetch_add(1, Ordering::Relaxed);
