@@ -1818,6 +1818,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     source.capacity,
                     start + offset,
                     &mut bytes,
+                    false,
                 )
                 .await?;
                 write_exact_to(
@@ -1999,7 +2000,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         dst: &mut [u8],
     ) -> Result<(), FsError> {
         let member = self.member(devid)?;
-        read_exact_from(&*member.device, &member.io, member.capacity, offset, dst).await
+        // A plain reader — a lookup, a file read, a page fill — gives up its
+        // place in the queue for the device when its task is sent SIGKILL
+        // (Linux `folio_lock_killable` in `filemap_read`). Not inside an
+        // operation or a commit: a read that is part of one completes, as
+        // Linux never interrupts a transaction's own reads.
+        let killable = !(self.txn_gate.closed_by_current() || self.txn_gate.joined_by_current());
+        read_exact_from(
+            &*member.device,
+            &member.io,
+            member.capacity,
+            offset,
+            dst,
+            killable,
+        )
+        .await
     }
 
     /// Read one direct-copy choice, splitting at chunk/stripe boundaries.
@@ -2471,7 +2486,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     continue;
                 }
                 let mut candidate = vec![0u8; format::SUPERBLOCK_SIZE];
-                if read_exact_from(&*device, &io, capacity, offset, &mut candidate)
+                if read_exact_from(&*device, &io, capacity, offset, &mut candidate, false)
                     .await
                     .is_err()
                 {
@@ -4260,6 +4275,7 @@ async fn read_exact_from<B: BlockDevice + 'static>(
     limit: u64,
     offset: u64,
     dst: &mut [u8],
+    killable: bool,
 ) -> Result<(), FsError> {
     let end = offset
         .checked_add(dst.len() as u64)
@@ -4270,7 +4286,11 @@ async fn read_exact_from<B: BlockDevice + 'static>(
     let mut done = 0usize;
     while done < dst.len() {
         let absolute = offset + done as u64;
-        let guard = io.lock().await;
+        let guard = if killable {
+            crate::volume::killable(io.lock()).await?
+        } else {
+            io.lock().await
+        };
         let block_size = guard.block_size;
         let (lba, blocks, in_run, copy) = io_run(absolute, dst.len() - done, block_size, guard.len);
         let request = BlockRequest {
