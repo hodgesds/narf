@@ -3152,6 +3152,11 @@ pub fn init() {
     steal::register_current_cpu();
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();
+    // Hrtimer sleepers whose waker is ours expire in hard IRQ: our
+    // `wake_by_ref` only publishes the awake bit and places the wake (no
+    // allocation, no free). Every other waker expires from the executor.
+    narf_time::hrtimer::hrtimers_init();
+    narf_time::hrtimer::set_hardirq_waker_predicate(is_scheduler_waker);
     for (cpu, q) in READY.iter().enumerate() {
         blocking::reset(cpu);
         *q.lock() = Some(VecDeque::new());
@@ -6149,6 +6154,13 @@ unsafe fn drop_raw(data: *const ()) {
     }
 }
 
+/// Whether `waker` is a scheduler task waker, whose `wake_by_ref` is safe in
+/// hard-IRQ context: it sets the awake flag and places the wake without
+/// allocating or releasing a reference.
+pub fn is_scheduler_waker(waker: &Waker) -> bool {
+    core::ptr::eq(waker.vtable(), &TASK_VTABLE)
+}
+
 fn make_waker(cell: Arc<WakeCell>) -> Waker {
     let raw = Arc::into_raw(cell) as *const ();
     // SAFETY: vtable functions are matched to the `Arc<WakeCell>`
@@ -7202,7 +7214,7 @@ pub fn run_until_empty() {
             // context already drops Wakers via `drain_and_wake` below, so the
             // alloc is permitted. Servicing the entry clears the past-due
             // deadline, so the next arm reverts to a full `now + period` slice.
-            let _ = narf_time::timer_wheel::fire_due(now);
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
             if now.wrapping_sub(last_pump_cycles) >= pump_interval_cycles {
                 last_pump_cycles = now;
                 // `run_io`, not `run`: the executor loop is running, so the
@@ -7264,7 +7276,7 @@ pub fn run_until_empty() {
             // awake flag, so the executor actually reaches this branch.
             // Non-IRQ context here, so the expired Waker's `Sleepable`
             // dealloc on drop is legal (same as the `any_runnable` fire_due).
-            if narf_time::timer_wheel::fire_due(narf_time::now_cycles()) > 0 {
+            if narf_time::hrtimer::hrtimer_run_softirq() > 0 {
                 continue;
             }
             // Idle path. Nothing is runnable — HLT the CPU until an
@@ -7307,7 +7319,7 @@ pub fn run_until_empty() {
                 }
             }
             let now = narf_time::now_cycles();
-            let wheel_deadline = narf_time::timer_wheel::next_deadline_cycles();
+            let wheel_deadline = narf_time::hrtimer::next_event_cycles_local();
             let budget_deadline = next_budget_replenishment(cpu, now);
             let next_deadline = match (wheel_deadline, budget_deadline) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -7459,7 +7471,7 @@ pub fn run_until_empty() {
             if next_deadline.is_some() {
                 // After the wake (or if the deadline already passed),
                 // fire any due wakers in this non-IRQ context.
-                let _ = narf_time::timer_wheel::fire_due(narf_time::now_cycles());
+                let _ = narf_time::hrtimer::hrtimer_run_softirq();
             }
         }
     }
@@ -7494,7 +7506,7 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
         return true;
     }
     // A parked sleeper's deadline has already passed.
-    if let Some(d) = narf_time::timer_wheel::next_deadline_cycles_try() {
+    if let Some(d) = narf_time::hrtimer::next_event_cycles_local() {
         if narf_time::now_cycles() >= d {
             return true;
         }
@@ -8453,7 +8465,7 @@ pub fn run_forever() -> ! {
         // `sti;hlt;cli` — the same handshake as run_until_empty's idle
         // path, minus wheel/budget deadline handling (an empty CPU has no
         // queued sleepers or budget replenishments to serve).
-        let next_deadline = narf_time::timer_wheel::next_deadline_cycles();
+        let next_deadline = narf_time::hrtimer::next_event_cycles_local();
         let idle_plan = narf_power_core::executor::prepare_idle(narf_power_core::IdleHints {
             cpu,
             now_cycles: narf_time::now_cycles(),
@@ -8531,7 +8543,7 @@ pub fn run_forever() -> ! {
                 narf_power_core::executor::reflect_idle(cpu, idle_plan, elapsed);
             }
             if next_deadline.is_some() {
-                narf_time::timer_wheel::fire_due(narf_time::now_cycles());
+                narf_time::hrtimer::hrtimer_run_softirq();
             }
         } else {
             // Unreliable-tick / IF=0 contexts (kernel-test, InitialCount

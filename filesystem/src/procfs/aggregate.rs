@@ -825,23 +825,31 @@ fn gen_pagetypeinfo() -> Vec<u8> {
 // ── /proc/timer_list ─────────────────────────────────────────────────
 //
 // Linux: kernel/time/timer_list.c show_timer_list
-// NARF uses a timer-wheel in narf-time::timer_wheel.
+// NARF's hrtimers are per-CPU bases (narf-time::hrtimer), listed per CPU.
 
 fn gen_timer_list() -> Vec<u8> {
     let mut s = String::new();
     let _ = writeln!(s, "Timer List Version: v0.9");
-    let _ = writeln!(s, "HRTIMER_MAX_CLOCK_BASES: 4");
+    let _ = writeln!(
+        s,
+        "HRTIMER_MAX_CLOCK_BASES: {}",
+        narf_time::hrtimer::HRTIMER_MAX_CLOCK_BASES
+    );
     let _ = writeln!(s, "now at {} nsecs", narf_time::monotonic_ns());
-    let _ = writeln!(s);
-    let _ = writeln!(s, "cpu: 0");
-    let occupied = narf_time::timer_wheel::occupied();
-    if occupied == 0 {
-        let _ = writeln!(s, " no timers pending");
-    } else {
-        let _ = writeln!(s, " pending timers: {}", occupied);
-        if let Some(next) = narf_time::timer_wheel::next_deadline_cycles() {
-            let next_ns = narf_time::cycles_to_ns(next);
-            let _ = writeln!(s, " next deadline: {} nsecs", next_ns);
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        if !narf_lib::smp::is_online(cpu as u32) {
+            continue;
+        }
+        let _ = writeln!(s);
+        let _ = writeln!(s, "cpu: {}", cpu);
+        let queued = narf_time::hrtimer::nr_queued_on(cpu);
+        if queued == 0 {
+            let _ = writeln!(s, " no timers pending");
+        } else {
+            let _ = writeln!(s, " pending timers: {}", queued);
+        }
+        if let Some(next) = narf_time::hrtimer::next_event_ns_of(cpu) {
+            let _ = writeln!(s, " expires_next: {} nsecs", next);
         }
     }
     s.into_bytes()

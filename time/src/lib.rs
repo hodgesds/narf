@@ -16,12 +16,14 @@
 
 pub mod clockevent;
 pub mod hpet;
+pub mod hrtimer;
 pub mod ntp;
 pub mod phc;
 pub mod rtc;
-pub mod timer_wheel;
+pub mod timerqueue;
 pub mod wall;
 
+mod hrtimer_tests;
 mod tests;
 pub use wall::{
     adjust_wall_offset_ns, begin_leap_smear, cyc_to_ns_mult_shift, cycles_per_ns, cycles_to_ns,
@@ -203,21 +205,17 @@ pub fn busy_wait_cycles(cycles: u64) {
     }
 }
 
-/// Future that yields Pending until `deadline` has passed,
-/// driven by an IRQ-armed timer wheel rather than busy-poll.
+/// Future that yields Pending until `deadline` has passed, driven by an
+/// hrtimer sleeper on the polling CPU's base (Linux `schedule_hrtimeout`).
 ///
-/// On first poll, the future registers `(deadline, waker)`
-/// with `timer_wheel::register`. When the wheel's HPET arm
-/// fires the deadline, the waker runs and the next poll
-/// returns `Ready`. If the wheel is full (more than
-/// `MAX_SLEEPERS` concurrent sleepers), the future falls
-/// back to self-wake busy-poll so the system keeps making
-/// progress at the cost of CPU. Drop while pending cancels
-/// the wheel slot.
+/// The first pending poll arms a [`hrtimer::SleepHandle`] for the deadline;
+/// its expiry wakes the task by reference. Later polls only refresh the
+/// waker. Without a clockevent programmer (early boot, bare tests) the future
+/// self-wakes and polls. Dropping it while pending cancels the timer.
 #[derive(Debug)]
 pub struct SleepUntil {
     deadline: Instant,
-    handle: Option<timer_wheel::SleepHandle>,
+    handle: Option<hrtimer::SleepHandle>,
 }
 
 impl SleepUntil {
@@ -229,55 +227,43 @@ impl SleepUntil {
     }
 }
 
+/// Monotonic ns by which `deadline_cycles` has certainly passed:
+/// `cycles_to_ns` truncates, so a timer at the truncated value could fire a
+/// fraction of a nanosecond before the cycle deadline.
+#[inline]
+pub fn deadline_cycles_to_ns(deadline_cycles: u64) -> u64 {
+    if deadline_cycles == u64::MAX {
+        return u64::MAX;
+    }
+    cycles_to_ns(deadline_cycles).saturating_add(1)
+}
+
 impl Future for SleepUntil {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if Instant::now() >= this.deadline {
-            if let Some(h) = this.handle.take() {
-                timer_wheel::cancel(h);
-            }
+            this.handle = None;
             return Poll::Ready(());
         }
-        match this.handle {
-            Some(h) => {
-                if !timer_wheel::refresh_waker(h, cx.waker().clone()) {
-                    // Slot recycled (fired + reused) but our
-                    // deadline hasn't passed — must've been a
-                    // spurious wake. Re-register.
-                    this.handle = None;
-                    return Pin::new(this).poll(cx);
-                }
-            }
-            None => {
-                match timer_wheel::register(this.deadline.as_cycles(), cx.waker().clone()) {
-                    Ok(h) => {
-                        this.handle = Some(h);
-                    }
-                    Err(timer_wheel::WheelError::Full) => {
-                        // Fall back: self-wake busy-poll.
-                        cx.waker().wake_by_ref();
-                    }
-                }
+        let refreshed = this
+            .handle
+            .as_ref()
+            .is_some_and(|h| h.refresh_waker(cx.waker()));
+        if !refreshed {
+            // First poll, or woken before the deadline after the timer had
+            // already fired: (re)arm.
+            let expires = deadline_cycles_to_ns(this.deadline.as_cycles());
+            match this.handle.as_ref() {
+                Some(h) => h.start(expires, 0, hrtimer::HrtimerMode::ABS, cx.waker()),
+                None => this.handle = Some(hrtimer::SleepHandle::arm(expires, 0, cx.waker())),
             }
         }
-        // No installed arm callback (typical in early-boot or
-        // bare-test contexts): the wheel won't fire on its own,
-        // so degrade to self-wake busy-poll. This keeps the
-        // executor making progress at the cost of CPU.
-        if !timer_wheel::arm_callback_installed() {
+        if !hrtimer::arm_callback_installed() {
             cx.waker().wake_by_ref();
         }
         Poll::Pending
-    }
-}
-
-impl Drop for SleepUntil {
-    fn drop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            timer_wheel::cancel(h);
-        }
     }
 }
 

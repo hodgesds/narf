@@ -2261,7 +2261,7 @@ fn smoke_userspace_futex_timeout_unpark_unqueues_waiter() -> TestResult {
     // (Also cleans up the ghost so later tests see a clean global table.)
     let ghost_woken = futex_wake_waiters_for_test(uaddr, u32::MAX);
     if let Some(h) = sleep_handle.take() {
-        narf_scheduler::narf_time::timer_wheel::cancel(h);
+        drop(h);
     }
     if leaked || ghost_woken != 0 {
         return TestResult::Fail(
@@ -2305,7 +2305,7 @@ fn smoke_userspace_vfork_wait_ignores_sigchld() -> TestResult {
     let parked_after_release = __test_park_should_block(&uc, &waker, &mut sleep_handle);
     crate::handlers::drop_signal_waker(tid);
     if let Some(h) = sleep_handle.take() {
-        narf_scheduler::narf_time::timer_wheel::cancel(h);
+        drop(h);
     }
     if !parked_with_sigchld {
         return TestResult::Fail("a pending SIGCHLD ended the TASK_KILLABLE vfork park");

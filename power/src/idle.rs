@@ -79,7 +79,7 @@ pub unsafe fn idle() {
     let plan = narf_power_core::executor::prepare_idle(narf_power_core::IdleHints {
         cpu: narf_lib::percpu::current_cpu(),
         now_cycles: narf_time::now_cycles(),
-        next_deadline_cycles: narf_time::timer_wheel::next_deadline_cycles(),
+        next_deadline_cycles: narf_time::hrtimer::next_event_cycles_local(),
     });
     // SAFETY: caller owns IRQ state and the wake handshake.
     unsafe { narf_power_core::executor::enter_idle(plan) };
