@@ -1725,6 +1725,102 @@ kernel_test_in!(
     smoke_rtl8188ee_native_device_rate_mask_follows_rx_pwdb
 );
 
+/// `rtl_watch_dog_timer` → `rtl_watchdog_wq_callback`: the rate-adaptive
+/// refresh runs from the device's watchdog delayed work (nothing else
+/// drives it here), which re-queues itself each period and frees itself
+/// once `rtl_pci_remove` has run.
+pub(crate) fn smoke_rtl8188ee_native_watchdog_runs_as_delayed_work() -> TestResult {
+    let h = Harness::new(false);
+    *h.env.fallback.lock() = Some((
+        narf_capabilities::Cap::bootstrap(),
+        h.firmware.identity().unwrap(),
+        true,
+    ));
+    {
+        let mut p = h.peer.lock();
+        let ap = core::mem::replace(&mut p.ap, Peer::new(false).ap);
+        p.ap = ap.with_legacy_rates(&LEGACY_RATES).unwrap();
+    }
+    h.join();
+    h.pump();
+    let masks = |h: &Harness| {
+        h.packet
+            .model
+            .lock()
+            .commands
+            .iter()
+            .filter(|(id, _)| *id == 0x84)
+            .count()
+    };
+    let level = |h: &Harness| {
+        h.device
+            .prepared
+            .try_lock()
+            .and_then(|owner| owner.as_ref().map(|o| o.station_rate_state().1))
+    };
+    if masks(&h) != 1 {
+        return TestResult::Fail("association did not install the level-0 RA mask");
+    }
+    let wait = |h: &Harness, done: &dyn Fn(&Harness) -> bool| {
+        let end = narf_time::monotonic_ns() + 1_000_000_000;
+        while narf_time::monotonic_ns() < end && !done(h) {
+            let _ = narf_scheduler::poll_one_round();
+            core::hint::spin_loop();
+        }
+        done(h)
+    };
+    let weak = Arc::weak_count(&h.device);
+    // A one-jiffy period so the test does not wait out RTL_WATCH_DOG_TIME;
+    // the station's own 2 s gate still holds until the clock advances.
+    crate::watchdog_work::start_jiffies(&h.device, 1);
+    if Arc::weak_count(&h.device) != weak + 1 {
+        return TestResult::Fail("the watchdog work does not hold the device weakly");
+    }
+    let mut phy = [0u8; 28];
+    phy[4] = 0xa0; // OFDM pwdb_all -> -30 dBm -> 70%.
+    for _ in 0..60 {
+        let beacon = { h.peer.lock().ap.beacon() };
+        h.packet.emit_native(&beacon, 11, 0, Some(&phy)).unwrap();
+        h.device.drain();
+    }
+    h.env.now.fetch_add(2_000, Ordering::AcqRel);
+    if !wait(&h, &|h| masks(h) == 2) || level(&h) != Some(1) {
+        return TestResult::Fail("the watchdog work did not refresh the RA mask to HIGH");
+    }
+    // Re-queued: later periods keep running. Weak beacons walk the level
+    // HIGH -> MIDDLE -> LOW one 2 s period at a time.
+    phy[4] = 0x28; // -90 dBm -> 10%.
+    for _ in 0..6 {
+        for _ in 0..30 {
+            let beacon = { h.peer.lock().ap.beacon() };
+            h.packet.emit_native(&beacon, 11, 0, Some(&phy)).unwrap();
+            h.device.drain();
+        }
+        h.env.now.fetch_add(2_000, Ordering::AcqRel);
+        // Many one-jiffy periods: this period's refresh has run.
+        let end = narf_time::monotonic_ns() + 50_000_000;
+        while narf_time::monotonic_ns() < end {
+            let _ = narf_scheduler::poll_one_round();
+            core::hint::spin_loop();
+        }
+    }
+    if level(&h) != Some(3) || masks(&h) < 3 {
+        return TestResult::Fail("the watchdog work did not re-queue itself");
+    }
+    h.packet.radio.hardware_byte(0x286, 2);
+    if !complete(h.device.remove()) {
+        return TestResult::Fail("EE removal did not reclaim DMA");
+    }
+    if !wait(&h, &|h| Arc::weak_count(&h.device) == weak) {
+        return TestResult::Fail("the watchdog work outlived rtl_pci_remove");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/device",
+    smoke_rtl8188ee_native_watchdog_runs_as_delayed_work
+);
+
 /// Linux `rtl_pci_remove` on the composed Device: the linked station sends
 /// its disconnect report, the chip is masked before the vector is released,
 /// and the rings are freed only after the card-disable quiescence proof.
