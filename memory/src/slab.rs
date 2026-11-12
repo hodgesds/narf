@@ -1049,7 +1049,7 @@ pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
                 site_audit::record(
                     p.as_ptr() as usize,
                     pages * PAGE_SIZE_USIZE,
-                    0x8000_0000 | pages as u32,
+                    site_audit::KIND_LARGE | pages as u32,
                 );
             }
             Ok(p)
