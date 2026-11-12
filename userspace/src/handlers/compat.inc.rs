@@ -3085,6 +3085,10 @@ fn do_execve_resolved(
         // its cached pages. The mapping the new image needs keeps its own
         // reference, so dropping this one here is safe.
         drop(exec_file);
+        // Diagnostic: record any address-space `Arc` this jump abandons
+        // (`/proc/narf/mm_orphans`).
+        #[cfg(target_arch = "x86_64")]
+        narf_scheduler::stackful::note_abandoned_stack();
         let top = narf_scheduler::stackful::current_stackful_stack_top();
         // SAFETY: new AS active; entry/rsp mapped by the loader; resets the EL1
         // exception stack to this task's top and enters the new image.
@@ -8138,6 +8142,86 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
     sorted.sort_unstable_by(|a, b| b.1 .0.cmp(&a.1 .0));
     for (key, (count, rss)) in sorted.iter().take(40) {
         let _ = writeln!(s, "group n={} rss_pages={} {}", count, rss, key);
+    }
+    s.push_str(&lines);
+    s.into_bytes()
+}
+
+/// `/proc/narf/mm_orphans`: user address spaces whose page tables are still
+/// live while no scheduler task reaches them, with what the weak registry
+/// (`narf_memory::as_origin`) knows of each: strong references now and at
+/// the last task's exit, the frame on that task's abandoned exit stack that
+/// still held one (`.text` offset, 0 none), scheduler tasks still attached
+/// (`mm_users`), and whether the first task attached is still in the task
+/// registry (`live`, `zombie`, `unregistered`) or the scheduler (`sched`).
+///
+/// Header lines, then one `group` line per distinct description, largest
+/// first, then up to 32 `orphan` lines.
+pub fn narf_mm_orphans_report() -> alloc::vec::Vec<u8> {
+    use alloc::collections::BTreeMap;
+    use core::fmt::Write as _;
+    let spaces = narf_scheduler::all_address_spaces();
+    let mut owned: alloc::vec::Vec<u64> = spaces.iter().map(|a| a.root.raw()).collect();
+    drop(spaces);
+    owned.sort_unstable();
+    let mut roots = alloc::vec::Vec::new();
+    narf_memory::as_origin::for_each(|root, _| {
+        if owned.binary_search(&root).is_err() {
+            roots.push(root);
+        }
+    });
+    let mut groups: BTreeMap<alloc::string::String, usize> = BTreeMap::new();
+    let mut lines = alloc::string::String::new();
+    let mut listed = 0usize;
+    for root in roots.iter().copied() {
+        let Some(info) = narf_memory::as_origin::info(root) else {
+            continue;
+        };
+        let tid = info.owner_tid;
+        let state = if tid == 0 {
+            "none"
+        } else {
+            match crate::task::task_get(tid) {
+                None => "unregistered",
+                Some(t) if t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE => "zombie",
+                Some(_) => "live",
+            }
+        };
+        let sched = tid != 0
+            && narf_scheduler::address_space_of_live(narf_scheduler::TaskId(tid)).is_some();
+        let (file, line) = info.origin.map_or(("?", 0), |o| (o.file(), o.line()));
+        let opt = |v: Option<usize>| v.map_or(alloc::string::String::from("-"), |v| alloc::format!("{v}"));
+        let key = alloc::format!(
+            "origin={}:{} owner={}{} strong={} exit_strong={} held_site={:#x} held_by_owner={} mm_users={}",
+            file,
+            line,
+            state,
+            if sched { "+sched" } else { "" },
+            opt(info.strong),
+            opt(info.exit_strong),
+            info.held_site,
+            u8::from(info.held_tid != 0 && info.held_tid == tid),
+            opt(info.user_tasks.map(|u| u as usize)),
+        );
+        if listed < 32 {
+            listed += 1;
+            let _ = writeln!(
+                lines,
+                "orphan root={:#x} tid={} held_tid={} {}",
+                root, tid, info.held_tid, key
+            );
+        }
+        *groups.entry(key).or_insert(0) += 1;
+    }
+    let (exits, held) = narf_memory::as_origin::exit_counts();
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "orphans {}", roots.len());
+    let _ = writeln!(s, "exits {}", exits);
+    let _ = writeln!(s, "exits_stack_held {}", held);
+    let mut sorted: alloc::vec::Vec<_> = groups.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    for (key, count) in sorted.iter().take(40) {
+        let _ = writeln!(s, "group n={} {}", count, key);
     }
     s.push_str(&lines);
     s.into_bytes()

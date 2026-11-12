@@ -5063,6 +5063,64 @@ pub fn current_stackful_waker() -> Option<Waker> {
     None
 }
 
+/// Address spaces that outlive their tasks (`/proc/narf/mm_orphans`): the
+/// current task is about to abandon its kernel stack — exit, or exec entering
+/// the new image at the stack top — so no destructor of a local still live
+/// on it will ever run. Hand the live part, `[rsp, top)`, to
+/// [`narf_memory::as_origin::scan_abandoned_stack`], which records every
+/// registered `Arc<AddressSpace>` found there and the frame that held it.
+/// Returns whether one was found. Runs once per exit or exec, never on a hot
+/// path; a no-op outside a stackful task.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+pub fn note_abandoned_stack() -> bool {
+    extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+    }
+    let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+    if p.is_null() {
+        return false;
+    }
+    // SAFETY: `p` is this CPU's in-flight task.
+    let (base, top) = unsafe { (*p).stack_bounds() };
+    let rsp: u64;
+    // SAFETY: reads the stack pointer only.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags))
+    };
+    if rsp < base || rsp >= top {
+        return false;
+    }
+    // SAFETY: `[rsp, top)` is the live part of this task's own mapped stack.
+    unsafe {
+        narf_memory::as_origin::scan_abandoned_stack(
+            rsp & !7,
+            top & !7,
+            crate::current_task_id().raw(),
+            core::ptr::addr_of!(__text_start) as u64,
+            core::ptr::addr_of!(__text_end) as u64,
+        )
+    }
+}
+
+/// [`note_abandoned_stack`] at a task exit, with the exiting space's strong
+/// count.
+#[cfg(target_arch = "x86_64")]
+fn note_exit_address_space() {
+    let (root, strong) = {
+        let active = crate::active_user_as_slot().lock();
+        match active.as_ref() {
+            Some(space) => (space.root.raw(), Arc::strong_count(space)),
+            None => (0, 0),
+        }
+    };
+    let held = note_abandoned_stack();
+    if root != 0 {
+        narf_memory::as_origin::note_exit(root, strong, held);
+    }
+}
+
 /// Mark the CURRENT stackful task complete and `kernel_switch` out — never
 /// returns (the executor observes `completed` and drops the task). The
 /// per-task-own-stack replacement for the longjmp-based task exit.
@@ -5073,6 +5131,10 @@ pub fn current_stackful_waker() -> Option<Waker> {
 pub unsafe fn exit_current_stackful() -> ! {
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    #[cfg(target_arch = "x86_64")]
+    if !p.is_null() {
+        note_exit_address_space();
+    }
     if !p.is_null() {
         // SAFETY: in-flight task on this CPU.
         unsafe {

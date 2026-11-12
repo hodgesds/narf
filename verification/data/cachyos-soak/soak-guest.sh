@@ -803,6 +803,14 @@ slab_sites() { # label
     n=$((n + 1))
     ((n <= 90)) && say "SOAK-SITES $1 $line"
   done < /proc/narf/slab_sites
+  # Address spaces no task reaches, and who still holds them.
+  n=0
+  if [ -r /proc/narf/mm_orphans ]; then
+    while read -r line; do
+      n=$((n + 1))
+      ((n <= 80)) && say "SOAK-MMORPH $1 $line"
+    done < /proc/narf/mm_orphans
+  fi
   # Scheduler tasks /proc does not list, grouped by where they wait.
   n=0
   [ -r /proc/narf/tasks ] || return 0

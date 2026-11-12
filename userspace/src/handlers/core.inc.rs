@@ -1363,6 +1363,16 @@ impl narf_filesystem::procfs::ProcFile for NarfTasksFile {
     }
 }
 
+/// `/proc/narf/mm_orphans`, read-only.
+#[derive(Debug)]
+struct NarfMmOrphansFile;
+
+impl narf_filesystem::procfs::ProcFile for NarfMmOrphansFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        narf_mm_orphans_report()
+    }
+}
+
 pub fn init_per_task_state() {
     bootstrap_init();
     // Publish the descriptor-allocation bound to the fd table. Until this is
@@ -1408,6 +1418,9 @@ pub fn init_per_task_state() {
     // `/proc/narf/tasks`: scheduler tasks `/proc` does not list, and what
     // they still hold (see `narf_tasks_report`).
     narf_filesystem::procfs::register_proc("narf/tasks", Arc::new(NarfTasksFile));
+    // `/proc/narf/mm_orphans`: address spaces no task reaches, and who still
+    // holds them (see `narf_mm_orphans_report`).
+    narf_filesystem::procfs::register_proc("narf/mm_orphans", Arc::new(NarfMmOrphansFile));
     rlimit_init();
     nice_init();
     umask_init();
@@ -12240,7 +12253,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         // have no base-page demand-fault path.
         // `clone_for_fork` has already write-protected only the present parent
         // leaves whose backing became newly shared.
-        alloc::sync::Arc::new(dup)
+        let dup = alloc::sync::Arc::new(dup);
+        narf_memory::as_origin::note_arc(&dup);
+        dup
     };
     // Reserve the pidfd number before allocating a PID or publishing child
     // state. Linux pidfd_prepare makes descriptor exhaustion fail the entire
