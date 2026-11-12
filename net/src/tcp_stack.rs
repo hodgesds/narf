@@ -784,16 +784,16 @@ pub fn signal_icmp_error_in(
 
 // ── Periodic timer tick ─────────────────────────────────────────
 //
-// Wired into a `sleep_pump` at boot so retransmit / delayed-ACK /
-// persist / keepalive / TIME-WAIT timers all advance even when
-// no traffic is arriving.
+// Wired into a `sleep_pump` at boot so neighbour resolution retransmits
+// and gives up even when no traffic is arriving.
 
 static TIMER_PUMP_INSTALLED: AtomicUsize = AtomicUsize::new(0);
 
 fn timer_tick_pump() {
+    // TCP's timers and IPv4 fragment expiry run on the timer wheel (one
+    // `timer_list` per connection / queue); only neighbour resolution is
+    // still a scan.
     neigh_tick();
-    crate::tcp::core::tick_all();
-    crate::ip_fragment::tick();
 }
 
 // ── Init ────────────────────────────────────────────────────────
