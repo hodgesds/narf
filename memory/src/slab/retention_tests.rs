@@ -166,3 +166,96 @@ kernel_test_in!(
     "memory/slab_retention",
     smoke_slab_shrink_releases_every_empty_frame
 );
+
+/// Objects a mock cache holds through a registered shrinker, standing in for
+/// the btrfs node/data caches and the page cache's heap records.
+static MOCK_CACHE: narf_lib::sync::IrqSafeSpinLock<Vec<usize>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+const MOCK_SHRINKER: &str = "test-slab-retention-cache";
+/// Class 8: 4 KiB objects, one per frame, as the btrfs data cache holds.
+const MOCK_CLASS: usize = N_CLASSES - 1;
+
+fn mock_count() -> usize {
+    MOCK_CACHE.lock().len()
+}
+
+fn mock_scan(nr: usize) -> usize {
+    // Detach under the lock, free outside it: a free may spill to the
+    // central list and must not nest under an unrelated spinlock.
+    let mut taken = [None::<usize>; 64];
+    let n = {
+        let mut g = MOCK_CACHE.lock();
+        let n = nr.min(g.len()).min(taken.len());
+        for slot in taken.iter_mut().take(n) {
+            *slot = g.pop();
+        }
+        n
+    };
+    for &addr in taken.iter().take(n).flatten() {
+        let p = NonNull::new(addr as *mut u8).expect("cached object is non-null");
+        // SAFETY: each address came from `alloc(layout(MOCK_CLASS))` and was
+        // removed from the cache above, so it is freed exactly once.
+        unsafe { dealloc(p, layout(MOCK_CLASS)) };
+    }
+    n
+}
+
+/// `drop_caches` empties a shrinker-held heap cache and hands the frames
+/// back: the class's live objects and frames return to their baseline. This
+/// is what tells a cache (gone after drop_slab) from a leak (still live),
+/// and what `/proc/sys/vm/drop_caches` now runs.
+fn smoke_slab_drop_caches_empties_shrinker_cache() -> TestResult {
+    const OBJECTS: usize = 512;
+    const NOISE: usize = super::MAG_SIZE + 8;
+    let before = class_detail(MOCK_CLASS);
+    // Fill outside the IRQ-masking lock (allocation is sleepable-only), then
+    // publish the whole table at once.
+    let mut table: Vec<usize> = Vec::new();
+    if table.try_reserve_exact(OBJECTS).is_err() {
+        return TestResult::Skip("mock cache table allocation failed");
+    }
+    for _ in 0..OBJECTS {
+        match alloc(layout(MOCK_CLASS)) {
+            Ok(p) => table.push(p.as_ptr() as usize),
+            Err(_) => break,
+        }
+    }
+    let old = core::mem::replace(&mut *MOCK_CACHE.lock(), table);
+    drop(old);
+    crate::reclaim::register_shrinker(crate::reclaim::Shrinker {
+        name: MOCK_SHRINKER,
+        count: mock_count,
+        scan: mock_scan,
+    });
+    let held = class_detail(MOCK_CLASS);
+    crate::reclaim::drop_slab();
+    let after = class_detail(MOCK_CLASS);
+    crate::reclaim::__unregister_shrinker_for_test(MOCK_SHRINKER);
+    let mut leftover = 0usize;
+    loop {
+        let n = mock_scan(usize::MAX);
+        if n == 0 {
+            break;
+        }
+        leftover += n;
+    }
+    let table = core::mem::take(&mut *MOCK_CACHE.lock());
+    drop(table);
+    if held.live_objects < before.live_objects + OBJECTS / 2 {
+        return TestResult::Skip("could not populate the mock cache");
+    }
+    if leftover != 0 {
+        return TestResult::Fail("drop_slab left objects in a shrinker-held cache");
+    }
+    if after.live_objects > before.live_objects + NOISE {
+        return TestResult::Fail("drop_slab left the cache's objects live");
+    }
+    if after.frames > before.frames + NOISE {
+        return TestResult::Fail("drop_slab freed the objects but kept their frames");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/slab_retention",
+    smoke_slab_drop_caches_empties_shrinker_cache
+);
