@@ -2157,7 +2157,8 @@ fn note_drm_fd_resource_failure(cmd: u32, error: FsError) {
 }
 
 /// Whether ioctl number `nr`'s first resource failure has been logged.
-#[cfg(feature = "kernel-test")]
+/// Read by the x86_64 `drm_kwin_replay` tests only.
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
 pub(crate) fn drm_fd_failure_noted(nr: u32) -> bool {
     FD_FAILURE_SEEN[((nr & 0xff) / 64) as usize].load(core::sync::atomic::Ordering::Relaxed)
         & (1u64 << (nr % 64))
