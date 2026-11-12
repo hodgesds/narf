@@ -164,6 +164,8 @@ pub fn cpu_take_offline(
     // `hrtimers_cpu_dying`: its queue is gone, so are its timers — every
     // hrtimer still queued on the CPU's base moves to this CPU's base.
     narf_time::hrtimer::hrtimers_cpu_dying(id as usize);
+    // `timers_dead_cpu`: its timer-wheel timers move here too.
+    narf_time::timer::timers_dead_cpu(id as usize);
     policy::notify_cpu_state(cpu, CpuState::Offline, None);
     Ok(())
 }

@@ -20,11 +20,14 @@ pub mod hrtimer;
 pub mod ntp;
 pub mod phc;
 pub mod rtc;
+pub mod timer;
+pub mod timer_migration;
 pub mod timerqueue;
 pub mod wall;
 
 mod hrtimer_tests;
 mod tests;
+mod timer_tests;
 pub use wall::{
     adjust_wall_offset_ns, begin_leap_smear, cyc_to_ns_mult_shift, cycles_per_ns, cycles_to_ns,
     monotonic_ns, now_wall, ns_to_cycles, set_clock_hz, set_cycles_per_ns, set_wall_offset,
@@ -306,6 +309,9 @@ pub fn busy_wait_cycles(cycles: u64) {
 pub struct SleepUntil {
     deadline: Instant,
     handle: Option<hrtimer::SleepHandle>,
+    /// `msleep`: a coarse sleep on the timer wheel instead of an hrtimer.
+    coarse: Option<timer::TimeoutHandle>,
+    wheel: bool,
 }
 
 impl SleepUntil {
@@ -313,6 +319,18 @@ impl SleepUntil {
         Self {
             deadline,
             handle: None,
+            coarse: None,
+            wheel: false,
+        }
+    }
+
+    /// Linux `msleep`: sleep on the timer wheel (`schedule_timeout`), which
+    /// may fire up to one wheel-level granularity late but costs no
+    /// hrtimer reprogramming.
+    pub fn coarse(deadline: Instant) -> Self {
+        Self {
+            wheel: true,
+            ..Self::new(deadline)
         }
     }
 }
@@ -335,7 +353,19 @@ impl Future for SleepUntil {
         let this = self.get_mut();
         if Instant::now() >= this.deadline {
             this.handle = None;
+            this.coarse = None;
             return Poll::Ready(());
+        }
+        if this.wheel {
+            // The first jiffy whose start is at or after the deadline.
+            let expires = timer::ns_to_jiffies(deadline_cycles_to_ns(this.deadline.as_cycles()));
+            this.coarse
+                .get_or_insert_with(|| timer::TimeoutHandle::new(0))
+                .arm(expires, cx.waker());
+            if !hrtimer::arm_callback_installed() {
+                cx.waker().wake_by_ref();
+            }
+            return Poll::Pending;
         }
         let refreshed = this
             .handle
@@ -389,6 +419,13 @@ pub fn sleep_us(us: u64) -> SleepUntil {
 /// Sleep for `ms` milliseconds of wall-clock time.
 pub fn sleep_ms(ms: u64) -> SleepUntil {
     sleep_until(Deadline::after_ms(ms))
+}
+
+/// Linux `msleep`: a coarse sleep on the timer wheel, which may end up to
+/// one wheel-level granularity late. For waits whose length does not
+/// matter to the millisecond; use [`sleep_ms`] otherwise.
+pub fn msleep(ms: u64) -> SleepUntil {
+    SleepUntil::coarse(Deadline::after_ms(ms).0)
 }
 
 /// Wall-clock deadline anchored to a future TSC reading. Cheap to
