@@ -130,7 +130,7 @@ pub fn next_deadline() -> Option<Instant>;
 | Linux | NARF |
 | --- | --- |
 | `struct hrtimer_cpu_base` (per CPU) | `HrTimerCpuBase`, allocated per CPU at bring-up (`hrtimers_prepare_cpu`); a static array holds only pointers |
-| `HRTIMER_MAX_CLOCK_BASES` = MONOTONIC, REALTIME, BOOTTIME, TAI + `_SOFT` | same eight clock bases; REALTIME/TAI expiries convert through the wall (+TAI) offset, BOOTTIME = MONOTONIC (no suspend offset yet) |
+| `HRTIMER_MAX_CLOCK_BASES` = MONOTONIC, REALTIME, BOOTTIME, TAI + `_SOFT` | same eight clock bases; REALTIME/TAI expiries convert through the wall (+TAI) offset, BOOTTIME through `offs_boot` (time spent suspended; MONOTONIC excludes it, `timekeeping_suspend`/`timekeeping_resume` around s2idle). Clockevents are programmed on raw counter time (`mono_to_raw_cycles`) |
 | `struct timerqueue_head` (rbtree, leftmost cached) | `timerqueue::TimerQueueHead`: intrusive red-black tree, earliest cached; FIFO on equal expiry |
 | `struct hrtimer`, `hrtimer_setup` | `HrTimer::new(fn, clock, mode)` — caller-owned storage, intrusive node |
 | `hrtimer_start_range_ns`, `_softexpires` / `expires` | `hrtimer_start_range_ns(timer, tim, delta, mode)`; expiry runs at `softexpires`, the clockevent is programmed for `expires` |
