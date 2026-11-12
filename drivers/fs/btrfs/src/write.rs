@@ -1697,7 +1697,11 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
 pub(crate) fn spawn_orphan_reaper<B: BlockDevice + 'static>(
     core: &alloc::sync::Arc<crate::volume::VolCore<B>>,
 ) {
-    narf_scheduler::spawn(orphan_reaper(alloc::sync::Arc::downgrade(core)));
+    // Boxed before `spawn` so the caller's frame holds a pointer, not the
+    // task's state (`start_commit_timer` was 10 KiB deep with both inline).
+    narf_scheduler::spawn(alloc::boxed::Box::pin(orphan_reaper(
+        alloc::sync::Arc::downgrade(core),
+    )));
 }
 
 /// The reaper task's body: asleep until an unlinked inode's last reference
@@ -1742,7 +1746,8 @@ pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(
     core: &alloc::sync::Arc<crate::volume::VolCore<B>>,
 ) {
     let weak = alloc::sync::Arc::downgrade(core);
-    narf_scheduler::spawn(async move {
+    // Boxed before `spawn`, as in `spawn_orphan_reaper`.
+    narf_scheduler::spawn(alloc::boxed::Box::pin(async move {
         let tick = commit_interval_cycles();
         loop {
             narf_time::sleep_cycles(tick).await;
@@ -1761,7 +1766,7 @@ pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(
             let view = BtrfsVolume::view_for_tree(&core, tree);
             let _ = commit_if_stale(&view).await;
         }
-    });
+    }));
 }
 
 /// Whether the open batch, if any, has already COWed `vol`'s fs tree.
