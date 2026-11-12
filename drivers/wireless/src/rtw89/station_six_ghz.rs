@@ -65,16 +65,27 @@ fn constraint(raw: i8) -> i8 {
     ((i16::from(raw) - 19) / 2) as i8
 }
 
-/// The regd.c `rtw89_calculate_tpe` constraint (dBm) for a 20MHz station
-/// on `primary` inside the AP's HE 6GHz channel `ap`: mac80211
-/// `ieee80211_parse_tpe` (after `ieee80211_valid_tpe_element`; a later
-/// element replaces an earlier one of the same interpretation), then
-/// `ieee80211_rearrange_tpe` to the used 20MHz chandef (EIRP: the 20MHz
-/// entry; PSD: the primary's subchannel), then the minimum over the local
-/// and regulatory-client EIRP and PSD limits (PSD + `10 * log10(20)`).
-/// `Ok(None)`: no valid default-category TPE. `Err`: an 80+80MHz AP channel
-/// (not rearranged here) or a primary outside `ap`.
-pub(in crate::rtw89) fn tpe(ies: &[u8], ap: &six_ghz::SixGhzChannel) -> Result<Option<i8>, ()> {
+/// The regd.c `rtw89_calculate_tpe` constraint (dBm) for a station of
+/// width `used` on `primary` inside the AP's HE 6GHz channel `ap`:
+/// mac80211 `ieee80211_parse_tpe` (after
+/// `ieee80211_valid_tpe_element`; a later element replaces an earlier
+/// one of the same interpretation), then `ieee80211_rearrange_tpe` to
+/// the used chandef — EIRP: the entries up to the used width
+/// (`ieee80211_chandef_num_widths`, intersected by regd.c
+/// `tpe_deal_with_eirp`, so the minimum over the width entries);
+/// PSD: the used 20 MHz subchannels, reordered into full-channel
+/// order first (`ieee80211_rearrange_tpe_psd`, via
+/// `ieee80211_calc_chandef_subchan_offset`), then the minimum over
+/// them — then the minimum over the local and regulatory-client EIRP
+/// and PSD limits (PSD + `10 * log10(20)`). `Ok(None)`: no valid
+/// default-category TPE. `Err`: an 80+80MHz AP channel, a primary
+/// outside `ap`, or a used width wider than the AP channel (the used
+/// chandef is a downgrade of the AP chandef, never wider).
+pub(in crate::rtw89) fn tpe(
+    ies: &[u8],
+    ap: &six_ghz::SixGhzChannel,
+    used: Width,
+) -> Result<Option<i8>, ()> {
     let have: u32 = match ap.width {
         _ if ap.discontiguous => return Err(()),
         Width::Twenty => 1,
@@ -82,12 +93,26 @@ pub(in crate::rtw89) fn tpe(ies: &[u8], ap: &six_ghz::SixGhzChannel) -> Result<O
         Width::Eighty => 4,
         Width::OneSixty => 8,
     };
+    let needed: u32 = match used {
+        Width::Twenty => 1,
+        Width::Forty => 2,
+        Width::Eighty => 4,
+        Width::OneSixty => 8,
+    };
+    if needed > have {
+        return Err(());
+    }
     let low = ap.center_mhz.checked_sub(10 * have).ok_or(())?;
     let index = ap.primary_mhz.checked_sub(low).ok_or(())? / 20;
     if index >= have {
         return Err(());
     }
-    let (have, index) = (have as usize, index as usize);
+    let (have, needed, index) = (have as usize, needed as usize, index as usize);
+    // First subchannel of the used channel inside the AP channel:
+    // `ieee80211_calc_chandef_subchan_offset(ap, needed)` — the
+    // aligned `needed`-wide block containing the primary (the
+    // downgrade path halves the chandef around it).
+    let used_offset = index - index % needed;
     // max_local, psd_local, max_reg_client, psd_reg_client.
     let mut slots: [Option<Slot>; 4] = [None; 4];
     let mut rest = ies;
@@ -112,30 +137,60 @@ pub(in crate::rtw89) fn tpe(ies: &[u8], ap: &six_ghz::SixGhzChannel) -> Result<O
             continue;
         };
         if interpret & 1 == 0 {
-            // EIRP: `count` limited to `ieee80211_chandef_num_widths` (1).
-            intersect(constraint(slot.power[0]));
+            // EIRP: mac80211 limits `count` to
+            // `ieee80211_chandef_num_widths(used)` (20/40/80/160
+            // MHz -> 1/2/3/4) and regd.c `tpe_deal_with_eirp`
+            // intersects every remaining entry, so the
+            // constraint is the minimum over the width entries
+            // up to the used width (at 20 MHz, the 20 MHz entry
+            // alone, as before).
+            let widths = match used {
+                Width::Twenty => 1,
+                Width::Forty => 2,
+                Width::Eighty => 3,
+                Width::OneSixty => 4,
+            };
+            for value in slot.power.iter().take(slot.count.min(widths)) {
+                intersect(constraint(*value));
+            }
             continue;
         }
-        // PSD: `ieee80211_rearrange_tpe_psd` with needed = 1.
-        let value = if slot.n == 0 {
-            slot.power[0]
+        // PSD: `ieee80211_rearrange_tpe_psd` to the used chandef,
+        // then regd.c `tpe_deal_with_psd` intersects every
+        // rearranged entry: the minimum over every used 20 MHz
+        // subchannel.
+        if slot.n == 0 {
+            intersect(constraint(slot.power[0]).saturating_add(13));
+            continue;
+        }
+        // Reorder into full-channel order first: the N entries
+        // cover the N-wide block containing the primary (at
+        // `offset_n`, the `ieee80211_calc_chandef_subchan_offset`
+        // for N), the K extension entries the rest, in element
+        // order; entries the element leaves out stay `NO_LIMIT`
+        // (mac80211's `ieee80211_clear_tpe` fill).
+        let offset_n = if have <= slot.n {
+            0
         } else {
-            let offset = if have <= slot.n {
-                0
-            } else {
-                index - index % slot.n
-            };
-            let i = if index < offset {
-                index + slot.n
-            } else if index < offset + slot.n {
-                index - offset
-            } else {
-                index
-            };
-            slot.power[i]
+            index - index % slot.n
         };
-        // tpe_convert_psd_to_eirp: + 10 * 1301 / 1000.
-        intersect(constraint(value).saturating_add(13));
+        let mut full = [NO_LIMIT; 16];
+        for (i, out) in full.iter_mut().take(have).enumerate() {
+            *out = if i < offset_n {
+                slot.power[i + slot.n]
+            } else if i < offset_n + slot.n {
+                slot.power[i - offset_n]
+            } else {
+                slot.power[i]
+            };
+        }
+        // Then the used subset, limited to the entries the
+        // element actually carries (mac80211 limits
+        // `psd->count` to `needed` after the rearrange).
+        for value in full.iter().skip(used_offset).take(slot.count.min(needed)) {
+            // tpe_convert_psd_to_eirp: + 10 * 1301 / 1000.
+            intersect(constraint(*value).saturating_add(13));
+        }
     }
     Ok(result)
 }
@@ -238,7 +293,10 @@ mod tests {
             (&[195, 2, 0x08, 21], Some(14)),
         ];
         for (ies, expected) in cases {
-            if tpe(ies, &ap80) != Ok(expected) {
+            // The 8852C station is HE20-only: the used chandef
+            // is always 20 MHz, so these goldens are the
+            // pre-existing 20 MHz rearrange, unchanged.
+            if tpe(ies, &ap80, Width::Twenty) != Ok(expected) {
                 return TestResult::Fail("rtw89 6GHz TPE differs from mac80211/regd.c");
             }
         }

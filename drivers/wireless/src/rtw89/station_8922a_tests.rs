@@ -192,22 +192,13 @@ fn smoke_rtw89_8922a_admit_refusals() -> TestResult {
         power: PowerType6Ghz::Lpi,
         tpe_dbm: None,
     };
-    let cases: [(Request, Error); 12] = [
+    let cases: [(Request, Error); 11] = [
         (
             Request {
                 band: Band::Ghz6,
                 ..req
             },
             Error::SixGhzPowerMissing,
-        ),
-        (
-            Request {
-                band: Band::Ghz6,
-                width_mhz: 40,
-                six_ghz: Some(lpi),
-                ..req
-            },
-            Error::SixGhzWidthUnsupported,
         ),
         (
             Request {
@@ -353,7 +344,10 @@ fn smoke_rtw89_8922a_admit_6ghz_tpe_power_program() -> TestResult {
         (&[195, 2, 0x08, 21], Some(14)),
     ];
     for (ies, expected) in cases {
-        if tpe(ies, &ap80) != Ok(expected) {
+        // The 20 MHz goldens are unchanged by the wide
+        // rearrange: at 20 MHz the used chandef is the primary
+        // subchannel alone.
+        if tpe(ies, &ap80, Width::Twenty) != Ok(expected) {
             return TestResult::Fail("8922A 6GHz TPE differs from mac80211/regd.c");
         }
     }
@@ -364,6 +358,7 @@ fn smoke_rtw89_8922a_admit_6ghz_tpe_power_program() -> TestResult {
             discontiguous: true,
             ..ap80
         },
+        Width::Twenty,
     ) != Err(())
     {
         return TestResult::Fail("80+80 AP channel must refuse TPE");
@@ -374,6 +369,7 @@ fn smoke_rtw89_8922a_admit_6ghz_tpe_power_program() -> TestResult {
             primary_mhz: 7000,
             ..ap80
         },
+        Width::Twenty,
     ) != Err(())
     {
         return TestResult::Fail("primary outside AP channel must refuse TPE");
@@ -415,7 +411,7 @@ fn smoke_rtw89_8922a_admit_6ghz_tpe_power_program() -> TestResult {
     }
     // Standard Power with the intersected TPE (23 dBm) admits;
     // the MAC-unit constraint is 23 << 1 = 46.
-    let tpe_std = match tpe(&both, &ap80) {
+    let tpe_std = match tpe(&both, &ap80, Width::Twenty) {
         Ok(Some(c)) => c,
         _ => return TestResult::Fail("STD TPE must compute"),
     };
@@ -456,6 +452,202 @@ fn smoke_rtw89_8922a_admit_6ghz_tpe_power_program() -> TestResult {
     };
     if st5.six_ghz().is_some() {
         return TestResult::Fail("5GHz station must record no 6GHz program");
+    }
+    TestResult::Pass
+}
+
+fn smoke_rtw89_8922a_wide_6ghz_tpe_rearrange() -> TestResult {
+    let ap80 = SixGhzChannel {
+        primary: 5,
+        primary_mhz: 5975,
+        width: Width::Eighty,
+        discontiguous: false,
+        center_mhz: 5985,
+        center2_mhz: None,
+    };
+    // EIRP per-width selection: regd.c `tpe_deal_with_eirp`
+    // intersects every entry mac80211 keeps
+    // (`ieee80211_chandef_num_widths(used)`), so the constraint
+    // is the minimum over the width entries up to the used
+    // width — not the matching entry alone. Rising entries
+    // (raw 72/80/88 -> 26/30/34 dBm) pin the minimum to the
+    // 20 MHz entry at every width; falling entries (raw
+    // 88/80/72 -> 34/30/26 dBm) pin it to the used width's
+    // entry. At 160 MHz the count is still capped at the
+    // entries the element carries (3).
+    let rising = [195, 4, 0x02, 72, 80, 88];
+    let falling = [195, 4, 0x02, 88, 80, 72];
+    let ap160 = SixGhzChannel {
+        primary: 5,
+        primary_mhz: 5975,
+        width: Width::OneSixty,
+        discontiguous: false,
+        center_mhz: 5995,
+        center2_mhz: None,
+    };
+    let eirp_cases: [(&[u8], &SixGhzChannel, Width, Option<i8>); 8] = [
+        (&rising, &ap80, Width::Twenty, Some(26)),
+        (&rising, &ap80, Width::Forty, Some(26)),
+        (&rising, &ap80, Width::Eighty, Some(26)),
+        (&rising, &ap160, Width::OneSixty, Some(26)),
+        (&falling, &ap80, Width::Twenty, Some(34)),
+        (&falling, &ap80, Width::Forty, Some(30)),
+        (&falling, &ap80, Width::Eighty, Some(26)),
+        (&falling, &ap160, Width::OneSixty, Some(26)),
+    ];
+    for (ies, ap, used, expected) in eirp_cases {
+        if tpe(ies, ap, used) != Ok(expected) {
+            return TestResult::Fail("wide 6GHz EIRP rearrange mismatch");
+        }
+    }
+    // PSD minimum over every used subchannel: regulatory-client
+    // PSD, N = 4, raw [60, 50, 40, 30] -> 33/28/23/18 dBm on
+    // subchannels 0..3 of the 80 MHz AP. Primary 5 (subchannel
+    // 1) sees 28 dBm at 20/40 MHz (used block 0..1) and 18 dBm
+    // at 80 MHz (all four subchannels); primary 9 (subchannel
+    // 2) sees 23 dBm at 20 MHz and 18 dBm at 40 MHz (used block
+    // 2..3) and 80 MHz.
+    let psd = [195, 5, 0x1b, 60, 50, 40, 30];
+    let psd_cases: [(&SixGhzChannel, Width, Option<i8>); 6] = [
+        (&ap80, Width::Twenty, Some(28)),
+        (&ap80, Width::Forty, Some(28)),
+        (&ap80, Width::Eighty, Some(18)),
+        (
+            &SixGhzChannel {
+                primary: 9,
+                primary_mhz: 5995,
+                ..ap80
+            },
+            Width::Twenty,
+            Some(23),
+        ),
+        (
+            &SixGhzChannel {
+                primary: 9,
+                primary_mhz: 5995,
+                ..ap80
+            },
+            Width::Forty,
+            Some(18),
+        ),
+        (
+            &SixGhzChannel {
+                primary: 9,
+                primary_mhz: 5995,
+                ..ap80
+            },
+            Width::Eighty,
+            Some(18),
+        ),
+    ];
+    for (ap, used, expected) in psd_cases {
+        if tpe(&psd, ap, used) != Ok(expected) {
+            return TestResult::Fail("wide 6GHz PSD rearrange mismatch");
+        }
+    }
+    // PSD N/K rotation: local PSD, count 2 (N = 2, raw [30, 70])
+    // plus K = 2 extension entries (raw [50, 60]). Primary 13
+    // (subchannel 3) reorders the entries to full-channel order
+    // [50, 60, 30, 70] (the N block sits at offset 2), so the
+    // 20 MHz constraint follows the primary's own entry
+    // (70 -> 38 dBm) while 40 MHz (used block 2..3) and 80 MHz
+    // take the minimum over the used subchannels (30 -> 18 dBm).
+    let rotated = [195, 6, 0x0a, 30, 70, 0x02, 50, 60];
+    let ap13 = SixGhzChannel {
+        primary: 13,
+        primary_mhz: 6015,
+        ..ap80
+    };
+    let rotated_cases: [(Width, Option<i8>); 3] = [
+        (Width::Twenty, Some(38)),
+        (Width::Forty, Some(18)),
+        (Width::Eighty, Some(18)),
+    ];
+    for (used, expected) in rotated_cases {
+        if tpe(&rotated, &ap13, used) != Ok(expected) {
+            return TestResult::Fail("wide 6GHz PSD N/K rotation mismatch");
+        }
+    }
+    // Refusals still hold at wide widths: a used width wider
+    // than the AP channel, an 80+80 MHz AP channel, and a
+    // primary outside the AP channel.
+    let ap20 = SixGhzChannel {
+        primary: 5,
+        primary_mhz: 5975,
+        width: Width::Twenty,
+        discontiguous: false,
+        center_mhz: 5975,
+        center2_mhz: None,
+    };
+    if tpe(&rising, &ap20, Width::Eighty) != Err(())
+        || tpe(&rising, &ap20, Width::Forty) != Err(())
+        || tpe(
+            &rising,
+            &SixGhzChannel {
+                discontiguous: true,
+                ..ap80
+            },
+            Width::Eighty,
+        ) != Err(())
+        || tpe(
+            &rising,
+            &SixGhzChannel {
+                primary_mhz: 7000,
+                ..ap80
+            },
+            Width::Eighty,
+        ) != Err(())
+    {
+        return TestResult::Fail("wide 6GHz TPE refusals mismatch");
+    }
+    // Wide admission end-to-end: 40/80/160 MHz 6 GHz stations
+    // admit with the rearranged TPE recorded on the program
+    // (40/80 MHz on the 80 MHz AP: 18 dBm -> MAC 36;
+    // 160 MHz on a 160 MHz AP: 18 dBm -> MAC 36).
+    let both = [195, 4, 0x02, 72, 80, 88, 195, 5, 0x1b, 30, 40, 50, 60];
+    let f = factory();
+    let facet = match facet() {
+        Ok(facet) => facet,
+        Err(e) => return e,
+    };
+    let mut pool = MacIdPool::new();
+    let wide_cases: [(u32, &SixGhzChannel, Width); 3] = [
+        (40, &ap80, Width::Forty),
+        (80, &ap80, Width::Eighty),
+        (160, &ap160, Width::OneSixty),
+    ];
+    for (width_mhz, ap, used) in wide_cases {
+        let constraint = match tpe(&both, ap, used) {
+            Ok(Some(c)) => c,
+            _ => return TestResult::Fail("wide 6GHz TPE must compute"),
+        };
+        if constraint != 18 {
+            return TestResult::Fail("wide 6GHz TPE constraint mismatch");
+        }
+        let mut req = base_req();
+        req.band = Band::Ghz6;
+        req.width_mhz = width_mhz;
+        req.primary = 5;
+        req.six_ghz = Some(SixGhzAdmission {
+            power: PowerType6Ghz::Sp,
+            tpe_dbm: Some(constraint),
+        });
+        let st = match admit(&f, facet, &mut pool, &req) {
+            Ok(st) => st,
+            Err(_) => return TestResult::Fail("wide 6GHz admission refused"),
+        };
+        let program = match st.six_ghz() {
+            Some(program) => program,
+            None => return TestResult::Fail("wide 6GHz station records no power program"),
+        };
+        if st.width_mhz != width_mhz
+            || program.tpe_dbm != Some(18)
+            || program.tpe_mac != 36
+            || program.reg_6ghz_power() != 2
+        {
+            return TestResult::Fail("wide 6GHz power program mismatch");
+        }
+        st.release_macid(&mut pool);
     }
     TestResult::Pass
 }
@@ -1045,6 +1237,10 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_8922a_admit_6ghz_tpe_power_program
 );
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_wide_6ghz_tpe_rearrange
+);
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_macid_pool);
 kernel_test_in!(
     "drivers/wireless/rtw89",
@@ -1492,7 +1688,7 @@ fn smoke_rtw89_8922a_admit_legacy_6ghz_he20() -> TestResult {
     }
     // Standard Power with the intersected TPE (23 dBm)
     // admits; the MAC-unit constraint is 23 << 1 = 46.
-    let tpe_std = match tpe(&both, &ap80) {
+    let tpe_std = match tpe(&both, &ap80, Width::Twenty) {
         Ok(Some(c)) => c,
         _ => return TestResult::Fail("STD TPE must compute"),
     };

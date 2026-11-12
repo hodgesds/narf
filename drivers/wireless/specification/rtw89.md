@@ -3919,12 +3919,16 @@ MAX_MPDU_LEN restricted to 3895 (no RX A-MSDU on this C profile, so
 `rtw8852c_chip_info.max_vht_mpdu_cap` 11454 is not promised). *TPE:*
 `station_six_ghz::tpe` is mac80211 `ieee80211_parse_tpe` (after
 `ieee80211_valid_tpe_element`) + `ieee80211_rearrange_tpe` to the used
-20MHz chandef inside the AP's HE 6GHz channel (EIRP: 20MHz entry; PSD: the
+chandef (20 MHz for this HE20 station: EIRP: 20MHz entry; PSD: the
 primary's subchannel via `ieee80211_calc_chandef_subchan_offset`), then
 regd.c `rtw89_calculate_tpe` on the default category (`tpe_get_constraint`
 (raw - 19) / 2, PSD + 13), min over local/regulatory-client EIRP/PSD; only
 for `RTW89_REG_6GHZ_POWER_STD`; below -10 dBm refuses the join (regd.c
-`-EINVAL`); an 80+80MHz AP channel is refused. *RA:* `configure_ra` with HE
+`-EINVAL`); an 80+80MHz AP channel is refused. The shared `tpe` takes
+the used width: the 8922A owner passes 20/40/80/160 MHz and the
+rearrange covers the full operating width (EIRP: minimum over the
+width entries up to the used width; PSD: minimum over every used
+20 MHz subchannel). *RA:* `configure_ra` with HE
 and no HT is `codec::ra_he6`: phy.c `rtw89_phy_ra_sta_update` on
 `RTW89_BAND_6G` (`supp_rates[6GHz] << 4` OFDM only, `mode = HE|OFDM`, 20MHz
 SGI from the absent HT cap = 0); the AX RA H2C (version 0) has no band
@@ -3941,26 +3945,33 @@ from the scanned beacon/probe response stays; the scan ignores
 `psc_no_listen`/unsolicited-probe target hints (every planned channel is
 dwelt); TX A-MPDU on 6GHz follows HE-only negotiation (`ampdu` admits `he` without `ht`, density 0 per Linux's zeroed 6GHz ht_cap).
 
-**8922A 6GHz admission (`station_8922a`, closes #1875).** The 8922A
-station owner admits 6 GHz at 20 MHz only, with a caller-supplied
+**8922A 6GHz admission (`station_8922a`, closes #1875; wide-6 GHz
+TPE rearrange closes #1898).** The 8922A
+station owner admits 6 GHz at 20/40/80/160 MHz, with a caller-supplied
 6 GHz power program (`Request.six_ghz`: `SixGhzAdmission`, the AP's
 client power type + the regd.c TPE constraint from
 `station_8922a::tpe`). `tpe` is the shared mac80211/regd.c parse
 (`station_six_ghz::tpe`, the 8852C template: validate, parse,
-rearrange to the used 20 MHz chandef, intersect local and
+rearrange to the used chandef, intersect local and
 regulatory-client EIRP/PSD limits) — the 8922A owner adds the
 admission rules around its result rather than a second copy of
-the parse. Admission is fail-closed: no program refuses
+the parse. The rearrange covers the full operating width:
+EIRP is the minimum over the width entries up to the used width
+(mac80211 `ieee80211_chandef_num_widths`, intersected by regd.c
+`tpe_deal_with_eirp`) and PSD is the minimum over every used
+20 MHz subchannel (mac80211 `ieee80211_rearrange_tpe_psd` to the
+used chandef, intersected by regd.c `tpe_deal_with_psd`), so a
+wide station is admitted on its whole channel's constraint, never
+on the primary subchannel's alone. A used width wider than the AP
+channel, an 80+80 MHz AP channel, and a primary outside the AP
+channel refuse the TPE (the caller refuses the join). Admission is
+fail-closed: no program refuses
 (`SixGhzPowerMissing`), a program on a non-6 GHz band refuses
 (`SixGhzContextUnexpected`), a TPE under a non-STD power type
 refuses (`SixGhzTpeNotStandard`, as
-`Plan::from_elements_6ghz`), a TPE below -10 dBm refuses
-(`SixGhzTpeBelowMinimum`, regd.c `-EINVAL`), and a 6 GHz width
-above 20 MHz refuses (`SixGhzWidthUnsupported`): the TPE is the
-primary-20 MHz subchannel constraint only, and a wide station
-would need the full-width EIRP/PSD rearrange (follow-up) — the
-primary-subchannel constraint alone could over-permit power on
-the other subchannels. The admitted `Station` records the
+`Plan::from_elements_6ghz`), and a TPE below -10 dBm refuses
+(`SixGhzTpeBelowMinimum`, regd.c `-EINVAL`). The admitted `Station`
+records the
 program (`SixGhzProgram`: power type, TPE dBm, phy.c
 `rtw89_phy_get_tpe_constraint` in MAC units via
 `radio_power_c::tpe_mac`, 63 with no TPE) for the
@@ -3983,9 +3994,8 @@ caller-supplied container, RFE, host country and channel
 center) and applied by
 `prepared_8922a::Prepared8922a::set_txpwr` over the BAR2
 register port (197 writes; a refused program writes
-nothing). Still open: the wide-6 GHz TPE rearrange, and
-8922A admission into `station_control` (the join flow that
-supplies the program). Unexecuted cases:
+nothing). Still open: 8922A admission into `station_control`
+(the join flow that supplies the program). Unexecuted cases:
 `smoke_rtw8852c_6ghz_txpwr_follows_rtw89_regd_and_phy_6g`,
 `smoke_rtw8852c_6ghz_channel_records_admit_profile_power_type_and_rule`,
 `smoke_rtw8852c_6ghz_tpe_follows_mac80211_rearrange_and_regd`,
