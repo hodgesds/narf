@@ -518,6 +518,9 @@ impl ProcFile for SlabSitesFile {
         let _ = writeln!(s, "sample_small {}", site_audit::SMALL_SAMPLE);
         let _ = writeln!(s, "sample_frame0 {}", site_audit::FRAME_SAMPLE);
         let _ = writeln!(s, "untracked {}", dropped);
+        let (heap_total, frame_total) = site_audit::totals();
+        let _ = writeln!(s, "heap_bytes_est {}", heap_total);
+        let _ = writeln!(s, "frame_bytes_est {}", frame_total);
         for r in heap[..nh].iter().chain(frames[..nf].iter()) {
             let tag = r.kind & !(site_audit::KIND_LARGE | site_audit::KIND_FRAME);
             if r.kind & site_audit::KIND_LARGE != 0 {

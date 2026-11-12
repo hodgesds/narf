@@ -355,6 +355,25 @@ pub fn snapshot(out: &mut [SiteRow], frames: bool) -> (usize, u64) {
     (n, DROPPED.load(Ordering::Relaxed))
 }
 
+/// Live bytes over every site, scaled up by the sampling rates:
+/// `(heap, frames)`. Tells how much of the attributed memory the top rows of
+/// [`snapshot`] leave out.
+pub fn totals() -> (u64, u64) {
+    let g = STATE.lock();
+    let (mut heap, mut frames) = (0u64, 0u64);
+    for s in g.sites[..g.nsites].iter() {
+        if s.kind & KIND_FRAME != 0 {
+            let scale = if s.kind & 0xff == 0 { FRAME_SAMPLE } else { 1 };
+            frames = frames.saturating_add(s.bytes.saturating_mul(scale));
+        } else if s.kind & KIND_LARGE != 0 {
+            heap = heap.saturating_add(s.bytes);
+        } else {
+            heap = heap.saturating_add(s.bytes.saturating_mul(SMALL_SAMPLE));
+        }
+    }
+    (heap, frames)
+}
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;
