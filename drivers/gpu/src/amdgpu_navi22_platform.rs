@@ -1531,7 +1531,7 @@ async unsafe fn light(
     use crate::amdgpu_navi22_display::Detection;
     use crate::amdgpu_navi22_kms::{Action, KMS};
     use crate::amdgpu_navi22_modeset::Error as M;
-    let reports = boot.detect_displays().await?;
+    let reports = alloc::boxed::Box::pin(boot.detect_displays()).await?;
     reconcile_displays(boot, &reports);
     let action = {
         let mut kms = KMS.lock();
@@ -1552,8 +1552,10 @@ async unsafe fn light(
     };
     let output_settings = KMS.lock().connectors[route].output;
     // SAFETY: the caller's obligations.
-    let result =
-        unsafe { boot.modeset_display(connector, &sink, want, output_settings, draw) }.await;
+    let result = alloc::boxed::Box::pin(unsafe {
+        boot.modeset_display(connector, &sink, want, output_settings, draw)
+    })
+    .await;
     // Admission inputs (and a DP sink's verified link) exist now, lit or
     // not: offer what they admit.
     reconcile_displays(boot, &reports);
@@ -1583,7 +1585,7 @@ async unsafe fn light(
     };
     // Without a back buffer (allocation failed) DRM frames fall back to
     // copies onto the visible front.
-    let back = boot.prepare_display_back_buffer().await;
+    let back = alloc::boxed::Box::pin(boot.prepare_display_back_buffer()).await;
     PRESENT.damage.lock().forget();
     // The new pipeline fetches its owned activation surface.
     let released = PRESENT.shown.lock().latched_owned();
@@ -1958,14 +1960,14 @@ async unsafe fn monitor_hotplug(
         }
         if running.is_some_and(|(route, _)| changed.contains(&route)) {
             // SAFETY: as above.
-            let stopped = unsafe { unlight(boot) }.await;
+            let stopped = alloc::boxed::Box::pin(unsafe { unlight(boot) }).await;
             KMS.lock().attempted = None;
             crate::amdgpu_navi22_kms::wake();
             if let Err(error) = stopped {
                 return Some(Err(error));
             }
         }
-        return Some(match boot.detect_displays().await {
+        return Some(match alloc::boxed::Box::pin(boot.detect_displays()).await {
             Ok(reports) => {
                 reconcile_displays(boot, &reports);
                 {
@@ -1997,7 +1999,7 @@ async unsafe fn monitor_hotplug(
             return Some(Ok(MonitorStep::HdmiLinkState(route, action, health)));
         }
         // SAFETY: same withdrawal and CPU-view retirement as other relights.
-        let result = unsafe { unlight(boot) }.await;
+        let result = alloc::boxed::Box::pin(unsafe { unlight(boot) }).await;
         if action == LinkAction::Relight && result.is_ok() {
             KMS.lock().attempted = None;
             crate::amdgpu_navi22_kms::wake();
@@ -2021,7 +2023,7 @@ async unsafe fn monitor_hotplug(
                         "amdgpu: navi22 DP retrain failed ({error:?}); relighting"
                     );
                     // SAFETY: as above.
-                    let stopped = unsafe { unlight(boot) }.await;
+                    let stopped = alloc::boxed::Box::pin(unsafe { unlight(boot) }).await;
                     KMS.lock().attempted = None;
                     crate::amdgpu_navi22_kms::wake();
                     Some(stopped.map(|()| MonitorStep::RetrainFailed))
@@ -2040,6 +2042,9 @@ async unsafe fn monitor_hotplug(
 /// # Safety
 /// As for `modeset_displays`.
 async unsafe fn monitor_pass() {
+    // The display steps below are boxed where they are awaited: inline, each
+    // one's state machine was nested into this future and its poll frames, and
+    // the monitor -> light -> modeset chain grew past a 64 KiB task stack.
     use crate::amdgpu_navi22_kms::{Action, KMS};
     use core::fmt::Write;
     let recoveries = crate::amdgpu_navi22_recovery::recoveries();
@@ -2064,20 +2069,20 @@ async unsafe fn monitor_pass() {
         Some((route, o.timing))
     });
     // SAFETY: the caller's obligations, with OWNER held.
-    if let Some(step) = unsafe { monitor_hotplug(boot, running) }.await {
+    if let Some(step) = alloc::boxed::Box::pin(unsafe { monitor_hotplug(boot, running) }).await {
         let _ = writeln!(narf_console::Writer, "amdgpu: navi22 display {step:?}");
         return;
     }
-    update_hdmi_metadata(boot).await;
-    converge_hdmi_vrr(boot).await;
-    converge_crtc_color(boot).await;
-    converge_dp_vrr(boot).await;
+    alloc::boxed::Box::pin(update_hdmi_metadata(boot)).await;
+    alloc::boxed::Box::pin(converge_hdmi_vrr(boot)).await;
+    alloc::boxed::Box::pin(converge_crtc_color(boot)).await;
+    alloc::boxed::Box::pin(converge_dp_vrr(boot)).await;
     // The monitor pass is the per-VUPDATE BTR service on Navi22 (50 ms
     // steps): a missed VUPDATE only resets the BTR cycle, it never
     // shortens the wrong frame.
     boot.display_lfc_progress();
     // SAFETY: as below; a lit or wanted multi-stream context owns the pass.
-    if unsafe { converge_group(boot, running) }.await {
+    if alloc::boxed::Box::pin(unsafe { converge_group(boot, running) }).await {
         return;
     }
     let action = KMS.lock().next(running);
@@ -2085,9 +2090,15 @@ async unsafe fn monitor_pass() {
         Action::Nothing => return,
         // SAFETY: serialized by the owner lock; the monitor is the only
         // display client after boot.
-        Action::Unlight => unsafe { unlight(boot) }.await.map(|()| None),
+        Action::Unlight => alloc::boxed::Box::pin(unsafe { unlight(boot) })
+            .await
+            .map(|()| None),
         // SAFETY: as above.
-        Action::Light { .. } => unsafe { light(boot, |_, row| row.fill(0)) }.await.map(Some),
+        Action::Light { .. } => {
+            alloc::boxed::Box::pin(unsafe { light(boot, |_, row| row.fill(0)) })
+                .await
+                .map(Some)
+        }
     };
     let _ = writeln!(
         narf_console::Writer,
@@ -2148,7 +2159,10 @@ async unsafe fn converge_group(
             .iter_mut()
             .enumerate()
             .fold(0u8, |mask, (i, m)| mask | (u8::from(m.poll_due(now)) << i));
-        for (route, health) in boot.check_group_hdmi_links(due).await.unwrap_or_default() {
+        for (route, health) in alloc::boxed::Box::pin(boot.check_group_hdmi_links(due))
+            .await
+            .unwrap_or_default()
+        {
             let action = HDMI_LINKS
                 .lock()
                 .get_mut(route)
@@ -2165,7 +2179,7 @@ async unsafe fn converge_group(
             }
             // SAFETY: OWNER excludes presentation; all group CPU views are
             // retired by the same normal group-withdraw path before teardown.
-            let result = unsafe { unlight_group(boot) }.await;
+            let result = alloc::boxed::Box::pin(unsafe { unlight_group(boot) }).await;
             if action == LinkAction::Relight && result.is_ok() {
                 KMS.lock().attempted_group = None;
                 crate::amdgpu_navi22_kms::wake();
@@ -2186,7 +2200,7 @@ async unsafe fn converge_group(
         GroupAction::Nothing => return running.is_some(),
         GroupAction::Unlight => {
             // SAFETY: the caller's obligations.
-            let r = unsafe { unlight_group(boot) }.await;
+            let r = alloc::boxed::Box::pin(unsafe { unlight_group(boot) }).await;
             let _ = writeln!(
                 narf_console::Writer,
                 "amdgpu: navi22 displays Unlight: {r:?}"
@@ -2198,7 +2212,7 @@ async unsafe fn converge_group(
     };
     if single.is_some() || boot.display_output().is_some() {
         // SAFETY: the caller's obligations; the next pass lights the group.
-        let r = unsafe { unlight(boot) }.await;
+        let r = alloc::boxed::Box::pin(unsafe { unlight(boot) }).await;
         let _ = writeln!(
             narf_console::Writer,
             "amdgpu: navi22 display Unlight for group: {r:?}"
@@ -2206,7 +2220,7 @@ async unsafe fn converge_group(
         crate::amdgpu_navi22_kms::wake();
         return true;
     }
-    let reports = match boot.detect_displays().await {
+    let reports = match alloc::boxed::Box::pin(boot.detect_displays()).await {
         Ok(reports) => reports,
         Err(_) => return false,
     };
@@ -2237,7 +2251,9 @@ async unsafe fn converge_group(
     }
     KMS.lock().attempted_group = Some(targets.iter().map(|t| (t.1, t.2)).collect());
     // SAFETY: the caller's obligations; the single pipe is dark.
-    let result = unsafe { boot.modeset_group(&requests, |_, _, row| row.fill(0)) }.await;
+    let result =
+        alloc::boxed::Box::pin(unsafe { boot.modeset_group(&requests, |_, _, row| row.fill(0)) })
+            .await;
     reconcile_displays(boot, &reports);
     let _ = writeln!(
         narf_console::Writer,
@@ -2308,7 +2324,7 @@ async unsafe fn unlight_group(boot: &mut boot::ColdBoot) -> Result<(), boot::Err
     }
     crate::scanout_access::wait_retired().await;
     // SAFETY: withdrawn and retired above.
-    let result = unsafe { boot.stop_group() }.await;
+    let result = alloc::boxed::Box::pin(unsafe { boot.stop_group() }).await;
     GROUP_CRTCS.lock().clear();
     {
         let mut kms = crate::amdgpu_navi22_kms::KMS.lock();
@@ -2362,7 +2378,7 @@ pub unsafe fn spawn_display_monitor() {
                 waited += MONITOR_STEP_MS;
             }
             // SAFETY: the monitor's contract, accepted at spawn.
-            unsafe { monitor_pass() }.await;
+            alloc::boxed::Box::pin(unsafe { monitor_pass() }).await;
         }
     });
 }
@@ -2379,7 +2395,7 @@ pub fn relight_after_recovery() {
 /// zero streams in `dm_suspend` during GPU reset.
 async fn withdraw_for_reset(boot: &mut boot::ColdBoot) {
     // SAFETY: recovery excludes every other display client.
-    let _ = unsafe { unlight_group(boot) }.await;
+    let _ = alloc::boxed::Box::pin(unsafe { unlight_group(boot) }).await;
     withdraw(boot).await;
     if boot.display_output().is_some() {
         // SAFETY: withdrawn and drained above; recovery excludes others.

@@ -976,8 +976,9 @@ impl Group {
         if self.state != GroupState::At(Phase::Prepared) {
             return Err(Error::Busy);
         }
-        match self
-            .bring_up(power, pool, tables, board, links, aux, &draw)
+        // Boxed: the bring-up's state is tens of KiB; inline it sat in this
+        // future and every frame polling it.
+        match alloc::boxed::Box::pin(self.bring_up(power, pool, tables, board, links, aux, &draw))
             .await
         {
             Ok(outputs) => {
@@ -986,7 +987,7 @@ impl Group {
             }
             Err(error) => {
                 let phase = self.phase;
-                let _ = self.tear_down(tables, aux).await;
+                let _ = alloc::boxed::Box::pin(self.tear_down(tables, aux)).await;
                 self.state = GroupState::Failed { phase, error };
                 Err(error)
             }
