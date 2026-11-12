@@ -3351,7 +3351,13 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
         return None;
     }
     let epoch = crate::mapped_file::read_epoch();
-    let mut buf = alloc::vec![0u8; size];
+    // Fallible, as in `read_path_and_file_from_vfs`: memory pressure fails
+    // the exec instead of panicking the kernel.
+    let mut buf = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(size).is_err() {
+        return None;
+    }
+    buf.resize(size, 0u8);
     let mut off = 0usize;
     while off < size {
         // Same rule as the main image read in read_exec: an exec image read

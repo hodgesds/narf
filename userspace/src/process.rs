@@ -1309,7 +1309,14 @@ fn read_path_and_file_from_vfs(
     //    ext2 file read) honour a full-length read; we loop on
     //    short reads defensively.
     let epoch = crate::mapped_file::read_epoch();
-    let mut buf = alloc::vec![0u8; size as usize];
+    // Fallible: under memory pressure a large image must fail this exec,
+    // not panic the kernel (`vec!` aborts on allocation failure — observed
+    // on a 4 GiB soak: a 287,736-byte ld.so read took the machine down).
+    let mut buf = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(size as usize).is_err() {
+        return None;
+    }
+    buf.resize(size as usize, 0u8);
     let mut filled: u64 = 0;
     while filled < size {
         let n = poll_io_to_completion(file.read(filled, &mut buf[filled as usize..]))
