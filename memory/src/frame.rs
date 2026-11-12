@@ -3573,6 +3573,17 @@ static PT_REGISTRY: [core::sync::atomic::AtomicU64; PT_REGISTRY_LEN] = {
     [Z; PT_REGISTRY_LEN]
 };
 
+/// Hash-registry slots examined by register/unregister/is_registered
+/// (kernel-test builds), for the registry scale test.
+#[cfg(feature = "kernel-test")]
+static PT_REGISTRY_PROBES: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn note_pt_probe() {
+    #[cfg(feature = "kernel-test")]
+    PT_REGISTRY_PROBES.fetch_add(1, Ordering::Relaxed);
+}
+
 #[inline]
 fn pagetable_registry_start(phys: u64) -> usize {
     debug_assert!(PT_REGISTRY_LEN.is_power_of_two());
@@ -3589,6 +3600,7 @@ pub fn __pagetable_register(phys: u64) {
         for distance in 0..PT_REGISTRY_LEN {
             let index = (start + distance) & (PT_REGISTRY_LEN - 1);
             let value = PT_REGISTRY[index].load(Ordering::Acquire);
+            note_pt_probe();
             if value == phys {
                 return;
             }
@@ -3646,6 +3658,7 @@ pub fn __pagetable_unregister(phys: u64) {
     for distance in 0..PT_REGISTRY_LEN {
         let slot = &PT_REGISTRY[(start + distance) & (PT_REGISTRY_LEN - 1)];
         let value = slot.load(Ordering::Acquire);
+        note_pt_probe();
         if value == 0 {
             return;
         }
@@ -3667,6 +3680,7 @@ pub fn __pagetable_is_registered(phys: u64) -> bool {
     let start = pagetable_registry_start(phys);
     for distance in 0..PT_REGISTRY_LEN {
         let value = PT_REGISTRY[(start + distance) & (PT_REGISTRY_LEN - 1)].load(Ordering::Acquire);
+        note_pt_probe();
         if value == phys {
             return true;
         }
@@ -3676,6 +3690,77 @@ pub fn __pagetable_is_registered(phys: u64) -> bool {
     }
     false
 }
+
+/// Registering and unregistering page tables must cost the same however many
+/// distinct frames have been page tables before, and must leave the registry
+/// as it found it. Process churn makes every page-table frame ever used pass
+/// through here once; a registry that keeps a trace of each one (a tombstone
+/// in an open-addressed table) slows down for good. Linux keeps the
+/// page-table mark in the page itself (`PG_table`).
+#[cfg(feature = "kernel-test")]
+fn smoke_pagetable_registry_churn_is_constant() -> narf_kernel_test::TestResult {
+    use alloc::format;
+    use narf_kernel_test::TestResult;
+
+    const FRAMES: usize = 4096;
+    const ROUNDS: usize = 4;
+    let occupancy = || {
+        PT_REGISTRY
+            .iter()
+            .filter(|slot| slot.load(Ordering::Relaxed) != 0)
+            .count()
+    };
+    let mut frames = Vec::new();
+    if frames.try_reserve_exact(FRAMES).is_err() {
+        return TestResult::Skip("no memory for the frame list");
+    }
+    for _ in 0..FRAMES {
+        match alloc_frame() {
+            Ok(frame) => frames.push(frame),
+            Err(_) => break,
+        }
+    }
+    if frames.len() != FRAMES {
+        free_frame_batch(&frames);
+        return TestResult::Skip("not enough frames");
+    }
+    let before = occupancy();
+    let probes_before = PT_REGISTRY_PROBES.load(Ordering::Relaxed);
+    let mut lost = false;
+    for _ in 0..ROUNDS {
+        for frame in &frames {
+            __pagetable_register(frame.start_address().raw());
+        }
+        lost |= frames
+            .iter()
+            .any(|frame| !__pagetable_is_registered(frame.start_address().raw()));
+        for frame in &frames {
+            __pagetable_unregister(frame.start_address().raw());
+        }
+        lost |= frames
+            .iter()
+            .any(|frame| __pagetable_is_registered(frame.start_address().raw()));
+    }
+    let probes = PT_REGISTRY_PROBES.load(Ordering::Relaxed) - probes_before;
+    let after = occupancy();
+    free_frame_batch(&frames);
+    let operations = (ROUNDS * FRAMES * 4) as u64;
+    if lost {
+        return TestResult::Fail("a registered page table was not found, or stayed found");
+    }
+    if after != before || probes > operations {
+        return TestResult::Fail(alloc::boxed::Box::leak(
+            format!(
+                "registry churn of {FRAMES} frames x {ROUNDS}: occupied slots {before} -> {after}; \
+                 {probes} slot probes for {operations} operations"
+            )
+            .into_boxed_str(),
+        ));
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("memory/frame", smoke_pagetable_registry_churn_is_constant);
 
 /// Per-frame reference counting for the COW-fork path.
 ///
