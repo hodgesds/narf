@@ -554,7 +554,8 @@ fn gen_narf_rcu() -> Vec<u8> {
     let _ = writeln!(
         s,
         "rcu_epoch_lag {}",
-        c.global_epoch.saturating_sub(c.min_quiescent.min(c.global_epoch))
+        c.global_epoch
+            .saturating_sub(c.min_quiescent.min(c.global_epoch))
     );
     let _ = writeln!(s, "rcu_stalled_mask {:#x}", c.stalled_mask);
     s.into_bytes()
