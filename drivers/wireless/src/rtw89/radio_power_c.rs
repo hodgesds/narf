@@ -758,6 +758,37 @@ impl Plan {
         .ok_or(Error::Policy)?;
         Self::build(elements, rfe, c, None)
     }
+    /// RTL8852A (rtw8852a.c `rtw8852a_set_txpwr`, PHY_0) from the same
+    /// firmware TXPWR elements and fw.c selection as RTL8852C: the typed
+    /// B 2.4/5GHz 20/40/80MHz profile is restated as the identical C
+    /// geometry (center checked) and built by the same generic AX
+    /// `rtw89_phy_read_txpwr_{byrate,limit,limit_ru}` rules under regd WW
+    /// with no SAR/DAG. `rtw8852a_set_txpwr` has no shape step (and
+    /// `.cfg_txrx_path` is NULL), so the plan's `shape` is measured but
+    /// never emitted by [`Self::visit_a`]; a container missing BYRATE,
+    /// the band's TXPWR_LMT / LMT_RU or TX_SHAPE_LMT is still refused
+    /// (the container is the shared firmware file). Only
+    /// [`Self::visit_a`] may emit the result.
+    pub(super) fn from_elements_a(
+        elements: &[Element],
+        rfe: u8,
+        channel: super::operating_channel::Profile,
+    ) -> Result<Self, Error> {
+        use super::operating_channel::Width as BWidth;
+        let primary = channel.primary();
+        let c = match (channel.width(), channel.is_5ghz()) {
+            (BWidth::Mhz20, false) => Profile::new20(Band::Ghz2, primary),
+            (BWidth::Mhz20, true) => Profile::new20(Band::Ghz5, primary),
+            (BWidth::Mhz40, false) => Profile::new_2ghz_40(primary, channel.secondary_above()),
+            (BWidth::Mhz40, true) => Profile::new_wide(Band::Ghz5, primary, Width::Mhz40),
+            (BWidth::Mhz80, true) => Profile::new_wide(Band::Ghz5, primary, Width::Mhz80),
+            // rtw8852a.c `support_bandwidths` has no 160MHz (nor 2.4GHz 80).
+            _ => None,
+        }
+        .filter(|c| c.center() == channel.center() && c.primary() == primary)
+        .ok_or(Error::Policy)?;
+        Self::build(elements, rfe, c, None)
+    }
     /// `rtw8851b_set_txpwr(chan, PHY_0)` then `rtw8851b_set_txpwr_ctrl`
     /// as (absolute address, mask, value) writes in Linux order, for a
     /// [`Self::from_elements_51`] plan. `rf_path_num` 1 bounds phy.c
@@ -798,6 +829,52 @@ impl Plan {
             emit(R_AX_PWR_RU_LMT + 4 * i as u32, u32::MAX, pack(w))?;
         }
         reference_51(emit)
+    }
+    /// `rtw8852a_set_txpwr(chan, PHY_0)` then `rtw8852a_set_txpwr_ctrl`
+    /// as (absolute address, mask, value) writes in Linux order, for a
+    /// [`Self::from_elements_a`] plan. `rf_path_num` 2 bounds phy.c
+    /// `rtw89_phy_set_txpwr_byrate_ax` to nss 0..1 (CCK, OFDM, MCS,
+    /// HEDCM: 11 words) and `_limit_ax` / `_limit_ru_ax` to both TX
+    /// pages. There is no shape step: `rtw8852a_set_txpwr` is byrate +
+    /// offset + limit + limit_ru only (unlike C, which adds
+    /// `set_tx_shape`, `set_txpwr_diff` and `set_txpwr_sar_diff`), and
+    /// no bandedge/TSSI configuration is emitted.
+    /// `rtw8852a_set_txpwr_ref` (ref 0) writes the same words as B's
+    /// reference control on both paths (`rtw8852a_bb_cal_txpwr_ref`:
+    /// base_cw_0db 0x27, tssi_16dbm_cw 0x12c, so (172 << 18) | (312 << 9)),
+    /// so the visit ends with [`super::radio_power::reference`].
+    pub(super) fn visit_a(
+        &self,
+        mut emit: impl FnMut(u32, u32, u32) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let pack = |b: &[i8]| u32::from_le_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8]);
+        for (i, w) in self.byrate.chunks_exact(4).enumerate() {
+            emit(R_AX_PWR_BY_RATE + 4 * i as u32, u32::MAX, pack(w))?;
+        }
+        let mut offset = 0;
+        for (i, &v) in self.offset.iter().enumerate() {
+            offset |= (v as u8 as u32 & 0xf) << (4 * i);
+        }
+        emit(R_AX_PWR_RATE_OFST_CTRL, 0xf_ffff, offset)?;
+        for (p, page) in self.limit.iter().enumerate() {
+            for (i, w) in page.chunks_exact(4).enumerate() {
+                emit(
+                    R_AX_PWR_LMT + 40 * p as u32 + 4 * i as u32,
+                    u32::MAX,
+                    pack(w),
+                )?;
+            }
+        }
+        for (p, page) in self.ru.iter().enumerate() {
+            for (i, w) in page.chunks_exact(4).enumerate() {
+                emit(
+                    R_AX_PWR_RU_LMT + 24 * p as u32 + 4 * i as u32,
+                    u32::MAX,
+                    pack(w),
+                )?;
+            }
+        }
+        super::radio_power::reference(&mut emit)
     }
     fn build(
         elements: &[Element],

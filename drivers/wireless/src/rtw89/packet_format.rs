@@ -501,8 +501,8 @@ fn transmit_profile_inner(tx: Tx<'_>) -> Result<(Vec<u8>, Queue), Error> {
         // RTL8852A: the AX v0 body (`txwd_body_size`/`txwd_info_size` as
         // RTL8852B, `rtw8852a.c:2473..2474` @ 05441d6, pci.c
         // `rtw89_pci_fill_txaddr_info`), A-MSDU to its 3500 ceiling
-        // (`transmit_a`); no fragment program.
-        ChipId::Rtl8852A if !fragments => false,
+        // (`transmit_a`); fragments under the signed N5AF companion.
+        ChipId::Rtl8852A => false,
         // RTL8851B: the AX v0 body (`txwd_body_size`/`txwd_info_size` as
         // RTL8852B, pci.c `rtw89_pci_fill_txaddr_info`); no A-MSDU or
         // fragment program.

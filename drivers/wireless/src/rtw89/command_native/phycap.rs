@@ -40,7 +40,7 @@ impl scheduler_mailbox::Interface for Port<'_> {
             if self.0.state != State::Active
                 || !matches!(
                     self.0.chip,
-                    ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
+                    ChipId::Rtl8852A | ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B
                 )
                 || !self.0.phycap_attempted
                 || self.0.phycap.is_some()
@@ -95,7 +95,8 @@ impl Native {
             receipt.initial_profile()?;
         }
         // The receipt must come from this chip's own register block/decode.
-        if receipt.is_c() != (attempt.native.chip == ChipId::Rtl8852C)
+        if receipt.is_a() != (attempt.native.chip == ChipId::Rtl8852A)
+            || receipt.is_c() != (attempt.native.chip == ChipId::Rtl8852C)
             || receipt.is_51() != (attempt.native.chip == ChipId::Rtl8851B)
         {
             return Err(power::Error::Access);

@@ -7,9 +7,44 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub(in crate::rtw89) struct Binding {
     device: Cap<BusDeviceCap, Write>,
-    qualification: Arc<crate::rtw89::radio_policy::Qualification>,
+    qualification: FragmentQualification,
     peer: control::Peer,
     admission: control::Admission,
+}
+/// The signed fragment program a binding is measured against: B
+/// (`radio_policy::Qualification`, N52F) or A
+/// (`radio_policy_a::Qualification`, N5AF). C and RTL8851B have no signed
+/// fragment companion: "no program".
+#[derive(Clone)]
+pub(in crate::rtw89) enum FragmentQualification {
+    B(Arc<crate::rtw89::radio_policy::Qualification>),
+    A(Arc<crate::rtw89::radio_policy_a::Qualification>),
+}
+impl FragmentQualification {
+    fn fragments_allowed(&self) -> Result<bool, power::Error> {
+        match self {
+            Self::B(q) => q.fragments_allowed().map_err(|_| power::Error::Access),
+            Self::A(q) => q.fragments_allowed().map_err(|_| power::Error::Access),
+        }
+    }
+    fn with_current<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, power::Error>,
+    ) -> Result<T, power::Error> {
+        match self {
+            Self::B(q) => q.with_current(operation),
+            Self::A(q) => q.with_current(operation),
+        }
+    }
+    /// Whether this binding's qualification is the installed ordinary
+    /// grant (same program object, same chip).
+    fn same_grant(&self, ordinary: Option<&OrdinaryGrant>) -> bool {
+        match (self, ordinary) {
+            (Self::B(q), Some(OrdinaryGrant::B(g))) => Arc::ptr_eq(g, q),
+            (Self::A(q), Some(OrdinaryGrant::A(g))) => Arc::ptr_eq(g, q),
+            _ => false,
+        }
+    }
 }
 enum Payload {
     Secure(Arc<narf_wireless::station_security::fragment::FragmentTrain>),
@@ -33,6 +68,36 @@ impl Binding {
     pub(in crate::rtw89) fn model(
         device: Cap<BusDeviceCap, Write>,
         qualification: Arc<crate::rtw89::radio_policy::Qualification>,
+        peer: control::Peer,
+        admission: control::Admission,
+    ) -> Result<Self, power::Error> {
+        Self::new(
+            device,
+            FragmentQualification::B(qualification),
+            peer,
+            admission,
+        )
+    }
+    /// The RTL8852A fixture counterpart of [`Self::model`].
+    #[cfg(feature = "kernel-test")]
+    pub(in crate::rtw89) fn model_a(
+        device: Cap<BusDeviceCap, Write>,
+        qualification: Arc<crate::rtw89::radio_policy_a::Qualification>,
+        peer: control::Peer,
+        admission: control::Admission,
+    ) -> Result<Self, power::Error> {
+        Self::new(
+            device,
+            FragmentQualification::A(qualification),
+            peer,
+            admission,
+        )
+    }
+    /// Fixture-only shared construction for [`Self::model`]/[`Self::model_a`].
+    #[cfg(feature = "kernel-test")]
+    fn new(
+        device: Cap<BusDeviceCap, Write>,
+        qualification: FragmentQualification,
         peer: control::Peer,
         admission: control::Admission,
     ) -> Result<Self, power::Error> {
@@ -214,21 +279,23 @@ impl Part {
 impl Native {
     pub(in crate::rtw89) fn station_fragments_allowed(&mut self) -> Result<bool, power::Error> {
         self.ordinary_current()?;
-        // RTL8852C has no signed fragment companion: "no program".
-        let Some(qualification) = self.ordinary.as_ref().ok_or(power::Error::Unsupported)?.b()
-        else {
-            return Ok(false);
-        };
-        qualification
-            .fragments_allowed()
-            .map_err(|_| power::Error::Access)
+        // RTL8852C and RTL8851B have no signed fragment companion: "no program".
+        match self.ordinary.as_ref().ok_or(power::Error::Unsupported)? {
+            OrdinaryGrant::A(qualification) => qualification
+                .fragments_allowed()
+                .map_err(|_| power::Error::Access),
+            OrdinaryGrant::B(qualification) => qualification
+                .fragments_allowed()
+                .map_err(|_| power::Error::Access),
+            OrdinaryGrant::C(_) | OrdinaryGrant::N51(_) => Ok(false),
+        }
     }
     pub(in crate::rtw89) fn fragment_binding(
         &mut self,
         admission: &control::Admission,
     ) -> Result<Binding, power::Error> {
         self.with_ordinary_current(|native| {
-            if native.chip != ChipId::Rtl8852B
+            if !matches!(native.chip, ChipId::Rtl8852A | ChipId::Rtl8852B)
                 || native.station_runtime.monitor.is_some()
                 || native.sleep_blocked
                 || native.sleep_reset.is_some()
@@ -238,13 +305,15 @@ impl Native {
             }
             admission.check()?;
             control::awake(&mut native.io)?;
-            let qualification = native
-                .ordinary
-                .as_ref()
-                .ok_or(power::Error::Terminal)?
-                .b()
-                .ok_or(power::Error::Unsupported)?
-                .clone();
+            let qualification = match native.ordinary.as_ref().ok_or(power::Error::Terminal)? {
+                OrdinaryGrant::A(q) if native.chip == ChipId::Rtl8852A => {
+                    FragmentQualification::A(q.clone())
+                }
+                OrdinaryGrant::B(q) if native.chip == ChipId::Rtl8852B => {
+                    FragmentQualification::B(q.clone())
+                }
+                _ => return Err(power::Error::Unsupported),
+            };
             if !qualification
                 .fragments_allowed()
                 .map_err(|_| power::Error::Access)?
@@ -301,13 +370,7 @@ impl Native {
                         .peer
                         .as_ref()
                         .is_none_or(|peer| !peer.same(&binding.peer))
-                    || native
-                        .ordinary
-                        .as_ref()
-                        .and_then(OrdinaryGrant::b)
-                        .is_none_or(|qualification| {
-                            !Arc::ptr_eq(qualification, &binding.qualification)
-                        })
+                    || !binding.qualification.same_grant(native.ordinary.as_ref())
                     || native.station_runtime.monitor.is_some()
                     || native.sleep_blocked
                     || native.sleep_reset.is_some()

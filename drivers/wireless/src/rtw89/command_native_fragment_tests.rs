@@ -148,6 +148,145 @@ kernel_test_in!(
     "drivers/wireless/rtw89/fragmentation",
     smoke_rtw8852b_fragment_native_original_descriptor_and_two_fact_terminal_train
 );
+fn setup_a() -> (
+    FragmentFixture,
+    station_control::Admission,
+    Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+    Cap<narf_firmware::FirmwareBlob, narf_capabilities::Read>,
+) {
+    let mut f = Fixture::aperture(ChipId::Rtl8852A, 0x20000).unwrap();
+    f.activate().unwrap();
+    let (qualification, base, companion) = crate::rtw89::radio_policy_a::tests::fragment_model();
+    let qualification = Arc::new(qualification);
+    f.native.ordinary = Some(OrdinaryGrant::A(Arc::clone(&qualification)));
+    // The installed A program also backs `station_tx_current`, so the
+    // fragment submit exercises the A envelope arm, not the B fallback.
+    f.native.qualification_a = Some(qualification);
+    let (admission, peer) = crate::rtw89::lps::tests::peer();
+    f.native.station_runtime.peer = Some(peer);
+    f.native.receive = crate::rtw89::rx_dma::tests::native_fixture();
+    let (core, registers) =
+        packet::tests::native_fragment_core_for_chip(ChipId::Rtl8852A, OWN).unwrap();
+    for (a, v) in registers {
+        f.words[a as usize / 4] = v;
+    }
+    f.native.station_runtime.core = Some(core);
+    f.native.station_runtime.model_started();
+    (FragmentFixture(f), admission, base, companion)
+}
+fn terminal_a() -> Result<(), &'static str> {
+    let (mut f, admission, _, _) = setup_a();
+    let parts = frames();
+    let train =
+        f.0.native
+            .fragment_binding(&admission)
+            .map_err(|_| "native precrypto binding")?
+            .plain(parts.clone())
+            .map_err(|_| "native original immutable train")?;
+    for (number, expected) in parts.iter().enumerate() {
+        let part = train.next().ok_or("next exact terminal fragment")?;
+        let id =
+            f.0.native
+                .submit_fragment(&part, false)
+                .map_err(|_| "actual Native fragment issue")?;
+        if train.next().is_some()
+            || part.current().is_ok()
+            || f.0.native.submit_fragment(&part, false) != Err(packet::Error::Busy)
+        {
+            return Err("issued fragment allowed reuse or premature next part");
+        }
+        let snapshot =
+            f.0.native
+                .station_runtime
+                .core
+                .as_ref()
+                .unwrap()
+                .model_fragment()
+                .map_err(|_| "actual fragment DMA snapshot")?
+                .ok_or("retained issued maps")?;
+        let word =
+            |offset| u32::from_le_bytes(snapshot.header[offset..offset + 4].try_into().unwrap());
+        // The A TXWD is the AX v0 body shared with B (`transmit_a`), so the
+        // same descriptor invariants hold: SW_SN/rate/NAV/bytes unaltered.
+        if snapshot.id != id
+            || &snapshot.body != expected
+            || word(0) & 7 != 0
+            || word(12) & 0xfff != 0x325
+            || word(12) & 1 << 12 != 0
+            || word(24) != 1 << 30 | 1 << 10
+            || snapshot.body[22] & 15 != number as u8
+            || snapshot.descriptors[usize::from(snapshot.ticket.slot) * 8..][..2]
+                != 64u16.to_le_bytes()
+        {
+            return Err("native descriptor altered original fragment SW_SN/rate/NAV/bytes");
+        }
+        let idx = snapshot.queue.regs().idx as usize / 4;
+        // DMA read pointer alone cannot release retained bytes or advance train.
+        f.0.words[idx] = u32::from(snapshot.next) << 16 | u32::from(snapshot.next);
+        if f.0
+            .native
+            .poll_packets()
+            .map_err(|_| "native DMA-only poll")?
+            .receipt
+            .is_some()
+            || train.next().is_some()
+        {
+            return Err("DMA-only consumption retired fragment before exact RPQ");
+        }
+        f.0.native
+            .retain_event(report(&snapshot))
+            .map_err(|_| "actual parsed RPQ retain")?;
+        let receipt =
+            f.0.native
+                .poll_packets()
+                .map_err(|_| "native RPQ terminal poll")?
+                .receipt
+                .ok_or("actual two-fact fragment terminal")?;
+        if receipt.id != id || receipt.bytes != *expected || !receipt.radio_acknowledged {
+            return Err("native fragment terminal byte/identity/status mismatch");
+        }
+    }
+    if !train.complete() || train.next().is_some() {
+        return Err("whole train did not terminate once");
+    }
+    Ok(())
+}
+fn smoke_rtw8852a_fragment_native_original_descriptor_and_two_fact_terminal_train() -> TestResult {
+    match terminal_a() {
+        Ok(()) => {}
+        Err(message) => return TestResult::Fail(message),
+    }
+    // The N5AF companion and the N5AB base gate the binding: revoking
+    // either refuses a fresh fragment binding.
+    let (mut f, admission, base, companion) = setup_a();
+    companion.revoke();
+    if f.0.native.fragment_binding(&admission).is_ok() {
+        return TestResult::Fail("revoked N5AF retained the A fragment binding");
+    }
+    base.revoke();
+    if f.0.native.fragment_binding(&admission).is_ok() {
+        return TestResult::Fail("revoked N5AB retained the A fragment binding");
+    }
+    // The fixture binding constructor itself enforces companion currency.
+    let (qualification, _, companion) = crate::rtw89::radio_policy_a::tests::fragment_model();
+    companion.revoke();
+    let (admission, peer) = crate::rtw89::lps::tests::peer();
+    if crate::rtw89::command_native::FragmentBinding::model_a(
+        cap(),
+        Arc::new(qualification),
+        peer,
+        admission,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("revoked N5AF built an A fragment binding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89/fragmentation",
+    smoke_rtw8852a_fragment_native_original_descriptor_and_two_fact_terminal_train
+);
 fn fences() -> Result<(), &'static str> {
     for loss in 0..6 {
         let (mut f, admission, base, companion) = setup();
