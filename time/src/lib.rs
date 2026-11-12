@@ -416,9 +416,13 @@ pub fn sleep_us(us: u64) -> SleepUntil {
     sleep_until(Deadline::after_us(us))
 }
 
-/// Sleep for `ms` milliseconds of wall-clock time.
+/// Sleep for `ms` milliseconds of wall-clock time: Linux `msleep`, a coarse
+/// sleep on the timer wheel ([`msleep`]) — it ends no earlier than `ms` and
+/// at most one wheel-level granularity later (within a jiffy or two below
+/// 63 ms).
+/// Use [`sleep_us`] / [`sleep_ns`] (hrtimers) where the millisecond matters.
 pub fn sleep_ms(ms: u64) -> SleepUntil {
-    sleep_until(Deadline::after_ms(ms))
+    msleep(ms)
 }
 
 /// Linux `msleep`: a coarse sleep on the timer wheel, which may end up to
