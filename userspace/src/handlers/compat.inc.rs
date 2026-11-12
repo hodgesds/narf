@@ -8042,7 +8042,7 @@ pub fn proc_pid_report(outer: u64) -> Option<u64> {
 pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
     use alloc::collections::BTreeMap;
     use core::fmt::Write as _;
-    let ids = narf_scheduler::all_task_ids();
+    let ids = narf_scheduler::task_origins();
     let mut visible = 0usize;
     let mut hidden = 0usize;
     let mut hidden_as = 0usize;
@@ -8050,7 +8050,7 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
     let mut groups: BTreeMap<alloc::string::String, (usize, u64)> = BTreeMap::new();
     let mut lines = alloc::string::String::new();
     let mut listed = 0usize;
-    for id in ids.iter() {
+    for (id, origin) in ids.iter() {
         let tid = id.raw();
         if task_to_pid_raw(tid).is_some() {
             visible += 1;
@@ -8080,9 +8080,28 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
             hidden_as += 1;
             hidden_rss = hidden_rss.saturating_add(rss);
         }
+        // The future's type path, trimmed to its last three segments.
+        let short = {
+            let mut cut = origin.len();
+            for _ in 0..3 {
+                match origin[..cut].rfind("::") {
+                    Some(at) => cut = at,
+                    None => {
+                        cut = 0;
+                        break;
+                    }
+                }
+            }
+            if cut == 0 {
+                *origin
+            } else {
+                &origin[cut + 2..]
+            }
+        };
         let key = alloc::format!(
-            "{} as={} sys={} at={}",
+            "{} origin={} as={} sys={} at={}",
             state,
+            short,
             u8::from(space.is_some()),
             sys.as_deref().unwrap_or("-"),
             site.as_deref().unwrap_or("-"),
@@ -8094,7 +8113,7 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
             listed += 1;
             let _ = writeln!(
                 lines,
-                "task tid={} pid={} comm={} {} as_rss={} as_refs={} sys={} at={}",
+                "task tid={} pid={} comm={} {} as_rss={} as_refs={} sys={} at={} origin={}",
                 tid,
                 last_pid,
                 proc_comm_of_task(tid).unwrap_or_default(),
@@ -8103,6 +8122,7 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
                 as_refs,
                 sys.as_deref().unwrap_or("-"),
                 site.as_deref().unwrap_or("-"),
+                origin,
             );
         }
     }
