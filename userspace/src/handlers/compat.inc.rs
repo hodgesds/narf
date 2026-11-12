@@ -2406,18 +2406,20 @@ impl crate::elf::ExecBytes for ExecSource {
                 let epoch = crate::mapped_file::read_epoch();
                 let mut done = 0usize;
                 while done < dst.len() {
-                    // `poll_io_to_completion`, not the budget-capped
+                    // `poll_io_to_completion`'s patience, not the budget-capped
                     // `poll_blocking`, for the same reason the old whole-image
                     // read used it: overrunning a healthy read under concurrent
-                    // block I/O surfaced as execve(2) = EIO, and dropping an
-                    // in-flight future abandons a virtio-blk request that is
-                    // still DMA-ing into a pooled scratch buffer.
-                    match poll_io_to_completion(ops.read(off + done as u64, &mut dst[done..])) {
+                    // block I/O surfaced as execve(2) = EIO. Killable, as
+                    // Linux's `kernel_read` is: a killed exec stops here (the
+                    // task dies on its way out), and the read, which may have a
+                    // virtio-blk request DMA-ing into a pooled scratch buffer,
+                    // finishes in the background into its own buffer.
+                    match crate::killable_wait::read_into(ops, off + done as u64, &mut dst[done..]) {
                         // A read that stops short of a range inside the file
                         // means the file changed under us or the device is
                         // lying; either way the caller must not get zeros.
-                        Some(Ok(0)) => return Err(crate::elf::ElfError::ImageReadFailed),
-                        Some(Ok(n)) => done += n,
+                        Ok(Some(Ok(0))) => return Err(crate::elf::ElfError::ImageReadFailed),
+                        Ok(Some(Ok(n))) => done += n,
                         _ => return Err(crate::elf::ElfError::ImageReadFailed),
                     }
                 }
@@ -2700,7 +2702,12 @@ fn do_execve_resolved(
         let epoch = crate::mapped_file::read_epoch();
         let mut off = 0usize;
         while off < prefix_len {
-            match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
+            // Killable (`kernel_read`): see `ExecSource::read_exact_at`.
+            let read = match crate::killable_wait::read_into(&ops, off as u64, &mut buf[off..]) {
+                Ok(read) => read,
+                Err(crate::killable_wait::Killed) => return Err(-EINTR),
+            };
+            match read {
                 Some(Ok(0)) => break, // short read at EOF
                 Some(Ok(n)) => off += n,
                 Some(Err(e)) => {
@@ -3350,9 +3357,10 @@ fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
         // Same rule as the main image read in read_exec: an exec image read
         // is never pumped with the budget-capped poll_blocking (overrun both
         // fails a healthy exec AND drops an in-flight block-I/O future).
-        match poll_io_to_completion(ops.read(off as u64, &mut buf[off..])) {
-            Some(Ok(0)) => break,
-            Some(Ok(n)) => off += n,
+        // Killable (`kernel_read`): see `ExecSource::read_exact_at`.
+        match crate::killable_wait::read_into(&ops, off as u64, &mut buf[off..]) {
+            Ok(Some(Ok(0))) => break,
+            Ok(Some(Ok(n))) => off += n,
             _ => return None,
         }
     }
