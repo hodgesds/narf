@@ -167,9 +167,14 @@ fn membarrier_poke(targets: u64) {
 /// Receiving the interrupt un-halts or interrupts the target CPU. Queue
 /// mutation is deliberately deferred to task context: a ready queue may grow,
 /// and scheduler policy callbacks are forbidden in hard-IRQ context.
+///
+/// The one thing the handler does is `retrigger_next_event`: when another
+/// CPU queued an earlier hrtimer on this CPU's base it set the base's
+/// retrigger flag before sending this IPI, and the handler re-programs the
+/// local clockevent from the base (a flag test otherwise).
 #[cfg(target_arch = "x86_64")]
 pub fn install_resched_ipi() {
-    dispatch::install(VECTOR_RESCHED, || {});
+    dispatch::install(VECTOR_RESCHED, narf_time::hrtimer::retrigger_next_event);
 }
 
 #[cfg(target_arch = "x86_64")]

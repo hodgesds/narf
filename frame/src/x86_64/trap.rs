@@ -610,11 +610,11 @@ mod stall_wd {
         // SMP strand (finite futex park deaf to the parent's SIGALRM).
         let now_ns = narf_scheduler::narf_time::monotonic_ns();
         let now_cyc = narf_scheduler::narf_time::now_cycles();
-        let nd = narf_scheduler::narf_time::timer_wheel::next_deadline_cycles();
+        let nd = narf_scheduler::narf_time::hrtimer::next_event_cycles_any();
         let _ = writeln!(
             TrapWriter,
             "STALL-WD wheel: occ={} next={:?} now_cyc={now_cyc} now_ns={now_ns}",
-            narf_scheduler::narf_time::timer_wheel::occupied(),
+            narf_scheduler::narf_time::hrtimer::nr_queued_all(),
             nd
         );
         // Perf state: a leaked live event keeps `drain_irq_samples` scanning on
@@ -1283,7 +1283,7 @@ fn dispatch_trap(frame: &mut TrapFrame) {
             #[cfg(feature = "perf-dump")]
             perf_dump::on_tick(frame.rip, frame.cs);
         }
-        // Note: we don't call timer_wheel::fire_due from this trap
+        // Note: hrtimer expiry happens in the clockevent handlers below
         // context. fire_due drops Wakers, which deallocate via the
         // global Sleepable allocator — that's a panic in IRQ
         // context (IF=0). The wheel is advanced by:

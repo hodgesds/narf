@@ -3579,8 +3579,8 @@ kernel_test_in!(
     smoke_scheduler_policy_wants_tick_reflects_policy
 );
 
-// hrtick: a finite slice arms a one-shot wheel entry, and draining the wheel
-// past its deadline fires the static waker → reschedules the entry's CPU. A long
+// hrtick: a finite slice arms the CPU's hrtick hrtimer, and expiring the base
+// past its deadline runs the callback → reschedules the timer's CPU. A long
 // slice is used so the real LAPIC does not fire it before the assertion window.
 #[cfg(feature = "hrtick")]
 fn smoke_hrtick_finite_slice_arms_and_fires() -> TestResult {
@@ -3591,7 +3591,9 @@ fn smoke_hrtick_finite_slice_arms_and_fires() -> TestResult {
     if !crate::hrtick::is_armed(cpu) {
         return TestResult::Fail("finite-slice hrtick did not register a slice timer");
     }
-    let _ = narf_time::timer_wheel::fire_due(now.saturating_add(20_000_000));
+    // Re-arm at an already-past deadline and expire this CPU's base.
+    crate::hrtick::arm(cpu, 0, 1);
+    let _ = narf_time::hrtimer::hrtimer_run_softirq();
     let fired = crate::__test_need_resched(cpu);
     crate::hrtick::disarm(cpu);
     crate::__test_clear_need_resched(cpu);

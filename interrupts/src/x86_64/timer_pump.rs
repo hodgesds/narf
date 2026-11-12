@@ -1,7 +1,7 @@
-//! x86 timer-wheel pump.
+//! x86 hrtimer clockevent pump.
 //!
-//! Bridges `narf_time::timer_wheel` (a passive deadline registry)
-//! to the selected clockevent. Reliable LAPIC TSC-deadline is the
+//! Bridges the per-CPU `narf_time::hrtimer` bases to the selected
+//! clockevent (`tick_program_event`). Reliable LAPIC TSC-deadline is the
 //! primary path; HPET comparator 0 remains the fallback when the
 //! selected LAPIC is not a reliable one-shot source. At boot the
 //! fallback allocates one IDT vector + one IOAPIC redirection. This
@@ -15,8 +15,9 @@
 //! [`crate::dispatch::on_irq`]:
 //!
 //!   1. Disarm + clear HPET status latch (level-triggered line).
-//!   2. Drain the wheel — wake every sleeper with deadline ≤ now.
-//!   3. Re-arm HPET to the new earliest deadline if any remains.
+//!   2. Expire every CPU's due hrtimers (HPET is one global comparator
+//!      with no per-CPU deadline, so it is the broadcast expiry).
+//!   3. Re-arm HPET to the earliest remaining event of any CPU.
 //!
 //! `enter_irq`/`exit_irq` bracketing happens in `dispatch::on_irq`
 //! around the synchronous handler call.
@@ -133,14 +134,13 @@ fn deadline_cycles_to_hpet_target(deadline_cycles: u64) -> u64 {
     now_hpet.wrapping_add(delta_hpet.max(1))
 }
 
-/// Wheel arm callback. Reprograms HPET comparator 0 to fire at
-/// `deadline_cycles`. Called from inside `timer_wheel::register`
-/// and from our IRQ handler — both with IRQs already disabled.
+/// Hrtimer clockevent programmer (`tick_program_event`) for THIS CPU's
+/// base. Called from an hrtimer enqueue or expiry with IRQs disabled.
 fn wheel_arm(deadline_cycles: u64) {
-    // Primary: LAPIC TSC-deadline one-shot (reliable under KVM, where the
-    // HPET one-shot IRQ isn't promptly delivered). Unconditional — must run
-    // even before the HPET pump's STATE.initialised is set.
-    crate::x86_64::apic::arm_timer_wheel_deadline(deadline_cycles);
+    // Primary: this CPU's LAPIC TSC-deadline one-shot (reliable under KVM,
+    // where the HPET one-shot IRQ isn't promptly delivered). Unconditional —
+    // must run even before the HPET pump's STATE.initialised is set.
+    crate::x86_64::apic::arm_hrtimer_event(deadline_cycles);
     // Secondary: HPET one-shot only when the selected primary is not reliable
     // TSC-deadline. The clockevent probe is the authority here: preserving an
     // always-on HPET duplicate after LAPIC passed merely delivers the same
@@ -148,6 +148,15 @@ fn wheel_arm(deadline_cycles: u64) {
     if !STATE.initialised.load(Ordering::Acquire) || !USE_HPET_FALLBACK.load(Ordering::Acquire) {
         return;
     }
+    // One comparator serves every CPU: arm it for the earliest event of
+    // any base, never a later local one that would hide an earlier remote.
+    let Some(earliest) = narf_time::hrtimer::next_event_cycles_any() else {
+        return;
+    };
+    arm_hpet(earliest.min(deadline_cycles));
+}
+
+fn arm_hpet(deadline_cycles: u64) {
     let gsi = STATE.gsi.load(Ordering::Relaxed);
     let target = deadline_cycles_to_hpet_target(deadline_cycles);
     // SAFETY: HPET window initialised at boot (init() checked);
@@ -169,22 +178,12 @@ fn pump_irq() {
     unsafe {
         let _ = narf_time::hpet::disarm(0);
     }
-    let now = narf_time::now_cycles();
-    // Use `take_due` (no wake — safe in IRQ context) and stash
-    // the wakers in a per-CPU pending-wakes queue. The wakes
-    // themselves fire from `run_until_empty`'s idle path, which
-    // runs in non-IRQ context where slab dealloc is allowed.
-    // Calling wake() here (via the old `fire_due`) panics on
-    // the alloc-context check when a wake's Arc drop is the
-    // last reference.
-    // O(1)-stack drain straight into the deferred-wake queue. Must NOT use
-    // `take_due*` here: their ~1 KiB on-stack waker array, on the user task's
-    // own kernel stack (the per-task-own-stack model), smashed this IRQ
-    // handler's return chain under fork/exec churn (rip=0x3). See
-    // `timer_wheel::drain_due_to_deferred`.
-    narf_time::timer_wheel::drain_due_to_deferred(now);
-    if let Some(next) = narf_time::timer_wheel::next_deadline_cycles() {
-        wheel_arm(next);
+    // Broadcast expiry: every CPU's due hard timers run here (their
+    // callbacks wake by reference and never free); due soft timers are raised
+    // on their own CPU. O(1) stack.
+    let next = narf_time::hrtimer::hrtimer_run_all_bases();
+    if next != narf_time::hrtimer::KTIME_MAX && USE_HPET_FALLBACK.load(Ordering::Acquire) {
+        arm_hpet(narf_time::hrtimer::ns_to_deadline_cycles(next));
     }
 }
 
@@ -194,7 +193,7 @@ fn pump_irq() {
 ///   - ACPI MADT walk populated `narf_acpi::ioapic` and
 ///     `narf_acpi::apic_id_at`.
 ///
-/// On success, installs the `timer_wheel` arm callback so future
+/// On success, installs the hrtimer clockevent programmer so future
 /// `SleepUntil` registrations program HPET automatically.
 pub fn init() -> Result<(), TimerPumpInitError> {
     if STATE
@@ -276,11 +275,10 @@ pub fn init() -> Result<(), TimerPumpInitError> {
     // future `register` calls actually program HPET. Anything
     // installed before this point would race against an
     // unconfigured pump.
-    narf_time::timer_wheel::set_arm_callback(wheel_arm);
+    narf_time::hrtimer::set_arm_callback(wheel_arm);
 
-    // If the wheel already had pending sleepers (registered before
-    // init), arm now so they don't sit untriggered.
-    if let Some(d) = narf_time::timer_wheel::next_deadline_cycles() {
+    // Timers queued before init: arm now so they don't sit untriggered.
+    if let Some(d) = narf_time::hrtimer::next_event_cycles_local() {
         wheel_arm(d);
     }
     Ok(())

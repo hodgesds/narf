@@ -21,8 +21,8 @@ use core::task::Waker;
 
 use crate::sync::IrqSafeSpinLock;
 
-/// Max wakers stashed per CPU. 64 matches `timer_wheel::MAX_SLEEPERS`
-/// — one full wheel drain can fit without overflow. Bursts beyond
+/// Max wakers stashed per CPU. 64 covers one burst of device-IRQ wakes
+/// without overflow. Bursts beyond
 /// that are recoverable: the wake source (timer tick) re-fires on
 /// the next deadline; missed wakers stay parked until then.
 const MAX_PENDING: usize = 64;
@@ -107,10 +107,10 @@ pub fn push_pending_iter<I: IntoIterator<Item = Waker>>(wakers: I) {
 
 /// Push ONE waker; on a full queue return it to the caller instead of
 /// dropping it. IRQ-safe (bounded array, no allocation). The caller owns
-/// the recovery — e.g. `timer_wheel::drain_due_to_deferred` re-registers
-/// the sleeper on the wheel so its wake is deferred one tick, never lost
-/// (a dropped WHEEL waker has no re-fire source: the wheel slot was
-/// already vacated, so the module-doc overflow rationale doesn't apply).
+/// the recovery (re-queueing the wake on its source) so the wake is
+/// deferred, never lost. Timer expiry no longer uses this queue: hrtimer
+/// sleepers wake by reference from their own CPU's base
+/// (`narf_time::hrtimer`).
 pub fn try_push_one(w: Waker) -> Result<(), Waker> {
     let cpu = crate::percpu::current_cpu();
     let cpu = if cpu < N_CPUS { cpu } else { 0 };

@@ -9353,7 +9353,7 @@ pub fn timer_tick_raise_due_signals() {
         // ~512 B array on that IRQ-path frame deterministically smashed this
         // handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn
         // — the same "no big on-stack array in IRQ context" hazard the timer
-        // wheel documents (`timer_wheel::drain_due_to_deferred`).
+        // wheel documents (the hrtimer expiry path).
         raise_due_itimer_real(now);
     }
 }

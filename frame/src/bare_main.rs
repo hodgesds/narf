@@ -1285,6 +1285,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // its cross-core wake inbox at the next executor round boundary,
             // outside hard-IRQ context where queue growth is permitted.
             narf_interrupts::install_resched_ipi();
+            // Remote earlier hrtimer (`trigger_dyntick_cpu`): the same IPI,
+            // whose handler re-programs the target's clockevent.
+            narf_scheduler::narf_time::hrtimer::set_remote_kick(|cpu| {
+                narf_interrupts::x86_64::apic::send_fixed_ipi(
+                    1u64 << cpu,
+                    narf_interrupts::VECTOR_RESCHED,
+                );
+            });
             narf_scheduler::set_resched_ipi_hook(|cpu| {
                 narf_interrupts::x86_64::apic::send_fixed_ipi(
                     1u64 << cpu,

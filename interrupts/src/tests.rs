@@ -517,7 +517,7 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
     unsafe { narf_arch::disable_interrupts() };
 
     if !woken {
-        return TestResult::Fail("timer_wheel never woke the sleep waker");
+        return TestResult::Fail("the hrtimer never woke the sleep waker");
     }
 
     if !matches!(Pin::new(&mut s).poll(&mut cx), Poll::Ready(())) {

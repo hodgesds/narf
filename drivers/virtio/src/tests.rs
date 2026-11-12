@@ -416,8 +416,8 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     // Skip if a real arm callback (e.g. timer_pump's wheel_arm)
     // is already installed so we don't clobber it.
     fn _wheel_arm_noop(_deadline_cycles: u64) {}
-    let _wheel_arm_installed_by_us = if !narf_time::timer_wheel::arm_callback_installed() {
-        narf_time::timer_wheel::set_arm_callback(_wheel_arm_noop);
+    let _wheel_arm_installed_by_us = if !narf_time::hrtimer::arm_callback_installed() {
+        narf_time::hrtimer::set_arm_callback(_wheel_arm_noop);
         true
     } else {
         false
@@ -465,7 +465,7 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     // isn't actually init'd) aren't affected by our temporary
     // install.
     if _wheel_arm_installed_by_us {
-        narf_time::timer_wheel::clear_arm_callback();
+        narf_time::hrtimer::clear_arm_callback();
     }
     // Branchy diagnostic sentinel: distinct fail strings let us
     // discriminate the failure mode from the test runner output.
@@ -618,8 +618,8 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     // breaks the HLT idle loop in kernel-test mode where
     // timer_pump::init never ran).
     fn _wheel_arm_noop(_deadline_cycles: u64) {}
-    let _wheel_arm_installed_by_us = if !narf_time::timer_wheel::arm_callback_installed() {
-        narf_time::timer_wheel::set_arm_callback(_wheel_arm_noop);
+    let _wheel_arm_installed_by_us = if !narf_time::hrtimer::arm_callback_installed() {
+        narf_time::hrtimer::set_arm_callback(_wheel_arm_noop);
         true
     } else {
         false
@@ -636,7 +636,7 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     let read_res = drive(blk_pci::read_sector_irq_async(1), &mut ctx, &WOKEN);
     // Restore the wheel arm-callback state before returning.
     if _wheel_arm_installed_by_us {
-        narf_time::timer_wheel::clear_arm_callback();
+        narf_time::hrtimer::clear_arm_callback();
     }
     match write_res {
         Some(Ok(())) => {}
