@@ -673,6 +673,22 @@ context pass; helper and repair work earns no additional row credit. Full
 release/native validation remains at25 completed rows. Counting unvalidated
 implementations,78 remain; physical RF/firmware/board acceptance stays separate.
 
+**2026-11-11 — ledger audit cleanup.** After the ledger-audit batch (PR#2031)
+the remaining ledger holds **2 `feature`** rows (rtlwifi `bt_coexistence`,
+rtw89 `eht`), **13 `chip`** and **0 `unknown`**. The 2026-11-11 audit, which
+checked each row against the code, removes three duplicate rows (rtlwifi
+`rtl8723ae`, `rtl8723be`, rtw89 `eht`). It moves QCN9074, WCN6750 and
+RTL8851B to `research/implemented-pending-validation.tsv` (now 92 rows), and
+narrows the RTL8192DE, RTL8723BE, RTL8922A, RTL8852A and IPQ rows to their
+actual residuals. Capability text in both ledgers is condensed to a short
+summary; the family specs keep the detail. Pending rows record the
+2026-11-11 targeted x86_64 kernel-test result for their family: ath9k,
+ath10k, ath11k, rtw88, rtlwifi, rtw89 and iwlwifi pass. The exceptions are
+three RTL8852A cases, six iwlwifi P2P cases, one RTL8723BE
+configuration-order case and one order-dependent iwlwifi 6 GHz case.
+brcmfmac, cyw43439, mt76 and rtl8xxxu were not run in that batch. aarch64
+native runs and physical acceptance remain separate.
+
 | Family | Documented feature gaps | Required software beyond the initial station milestone |
 |---|---:|---|
 | iwlwifi | 0 | Multiple-active-link MLO; WoWLAN is implemented pending validation; native legacy20 AP and admitted6GHz/EHT/320/single-link MLD are software-accepted at `6813a24c6`; prior exact station/HE/TX A-MSDU and periodic-scan profiles are software-validated; admitted DEVICE/SESSION1/SESSION2, bounded GO9/NoA and CLIENT8/MAC7 public management/association/security/data/terminal owners are implemented pending validation; unsupported GO PS producer formats and richer PHY/concurrency stay unadvertised |

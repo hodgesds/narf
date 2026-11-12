@@ -377,7 +377,7 @@ kernel_test_in!(
     smoke_rtw8852c_packet_txwd_v1_body_info_wp_and_addr_info
 );
 
-fn smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_refuses_amsdu() -> TestResult {
+fn smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_bounds_amsdu() -> TestResult {
     // A shares B's AX v0 TXWD body/info/WP/address-info layout, so the
     // frozen B references must reproduce byte-identically through
     // `transmit_a`.
@@ -396,6 +396,7 @@ fn smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_refuses_amsdu() -> TestResul
             index >= 2,
             0,
             None,
+            None,
         );
         if result.as_ref().map(|(bytes, _)| bytes.as_slice()) != Ok(expected.as_slice()) {
             return TestResult::Fail(
@@ -403,16 +404,78 @@ fn smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_refuses_amsdu() -> TestResul
             );
         }
     }
-    // A-MSDU QoS (control bit 0x80) has no A program; the 36-bit DMA mask
-    // binds A like B; the AX ring registers are B's.
+    // A-MSDU QoS (control bit 0x80) needs the A-MSDU limit and stays inside
+    // A's own ceiling (`rtw8852a_chip_info.max_amsdu_limit` 3500,
+    // rtw8852a.c:2356); with it the TXWD is B's byte for byte (shared v0
+    // `rtw89_core_fill_txdesc`). The 36-bit DMA mask binds A like B; the AX
+    // ring registers are B's.
     let mut qos = frame(100, false);
     qos[0] = 0x88;
     qos[24..26].fill(0);
     let mut amsdu = qos.clone();
+    amsdu.copy_within(4..10, 16);
     amsdu[24] = 0x80;
-    if transmit_a(&amsdu, OWN, 0, 1, 0x1000, false, FIRMWARE_RA, None).is_ok()
-        || transmit_a(&qos, OWN, 0, 1, 0x10_0000_0000, false, FIRMWARE_RA, None).is_ok()
-        || transmit_a(&qos, OWN, 0, 1, DMA_MASK - 3, false, FIRMWARE_RA, None).is_ok()
+    let a = transmit_a(
+        &amsdu,
+        OWN,
+        0,
+        1,
+        0x1000,
+        false,
+        FIRMWARE_RA,
+        None,
+        Some(3500),
+    );
+    let b = transmit_profile(
+        &amsdu,
+        OWN,
+        0,
+        1,
+        0x1000,
+        false,
+        FIRMWARE_RA,
+        None,
+        Some(3500),
+    );
+    if transmit_a(&amsdu, OWN, 0, 1, 0x1000, false, FIRMWARE_RA, None, None).is_ok()
+        || a.is_err()
+        || a != b
+        || transmit_a(
+            &amsdu,
+            OWN,
+            0,
+            1,
+            0x1000,
+            false,
+            FIRMWARE_RA,
+            None,
+            Some(3501),
+        )
+        .is_ok()
+        || transmit_a(
+            &qos,
+            OWN,
+            0,
+            1,
+            0x10_0000_0000,
+            false,
+            FIRMWARE_RA,
+            None,
+            None,
+        )
+        .is_ok()
+        || transmit_a(
+            &qos,
+            OWN,
+            0,
+            1,
+            DMA_MASK - 3,
+            false,
+            FIRMWARE_RA,
+            None,
+            None,
+        )
+        .is_ok()
         || Queue::Data.regs_for(ChipId::Rtl8852A).desa_l != Queue::Data.regs().desa_l
         || Queue::Management.regs_for(ChipId::Rtl8852A).desa_l != Queue::Management.regs().desa_l
     {
@@ -422,5 +485,5 @@ fn smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_refuses_amsdu() -> TestResul
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_refuses_amsdu
+    smoke_rtw8852a_packet_txwd_matches_b_v0_body_and_bounds_amsdu
 );

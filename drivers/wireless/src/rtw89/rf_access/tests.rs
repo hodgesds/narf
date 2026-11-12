@@ -353,33 +353,33 @@ fn smoke_rtw8852a_rf_native_window_uses_a_rf_bases() -> TestResult {
 
 fn smoke_rtw89_a_rf_direct_uses_a_bases() -> TestResult {
     use super::super::mac::ChipId;
-    // Linux rtw8852a.c `rtw8852a_chip_info.rf_base_addr` {0xc000, 0xd000}:
-    // every frozen B direct case replays on A with the same values and the
-    // same SWSI path, only the direct aperture moves 0x2000 down
-    // (path 0: 0x1e154 -> 0x1c154, path 1: 0x1f154 -> 0x1d154).
-    for &(write, seed, path, address, mask, value, trace) in CASES {
+    // Linux rtw8852a.c `rtw8852a_chip_ops.{read,write}_rf` are
+    // phy.c `rtw89_phy_read_rf`/`rtw89_phy_write_rf` (phy.c:928/1128): no
+    // SWSI path, every access goes to `rf_base_addr[path] + (addr & 0xff)
+    // * 4` with `rf_base_addr` {0xc000, 0xd000}. So every frozen B case,
+    // analog or direct, replays on A as B's direct twin (same seed, path,
+    // mask, write) with the aperture 0x2000 down (path 0: 0x1e154 ->
+    // 0x1c154, path 1: 0x1f154 -> 0x1d154). Only register reads (op 0) and
+    // writes (op 4) carry an address; a delay record (op 8) carries its
+    // microseconds and stays as it is.
+    for &(write, seed, path, address, mask, _, _) in CASES {
+        let Some(&(.., value, trace)) = CASES.iter().find(|case| {
+            (case.0, case.1, case.2, case.3, case.4) == (write, seed, path, address | 0x10000, mask)
+        }) else {
+            return TestResult::Fail("frozen B case has no direct twin");
+        };
         let mut rf = Rf::for_chip(ChipId::Rtl8852A);
         let mut io = Model::new(seed);
         let expected: Vec<(u8, u32, u32)> = trace
             .iter()
-            .map(|&(op, a, v)| {
-                (
-                    op,
-                    if address & 0x10000 != 0 {
-                        a - 0x2000
-                    } else {
-                        a
-                    },
-                    v,
-                )
-            })
+            .map(|&(op, a, v)| (op, if op == 8 { a } else { a - 0x2000 }, v))
             .collect();
         if ready(execute(&mut rf, &mut io, write, path, address, mask)) != Some(Ok(value))
             || io.trace != expected
             || rf.state() != State::Idle
         {
             return TestResult::Fail(
-                "A RF transaction differs from the B frozen reference outside the direct base",
+                "A RF transaction differs from the B frozen direct reference outside the base",
             );
         }
     }

@@ -548,7 +548,27 @@ fn smoke_rtw89_a_phycap_and_efuse_match_linux_rtw8852a_layout() -> TestResult {
     if (A_PHYCAP_ADDR, A_PHYCAP_SIZE) != (0x580, 128) {
         return TestResult::Fail("A PHY-cap window differs from rtw8852a_chip_info");
     }
+    // Program the A logical TSSI and thermal words (rtw8852a.h
+    // `struct rtw8852a_efuse`) after the shared records so their offsets
+    // are pinned: 0x21b is `rsvd[7]` of path A and must not leak into MCS.
     let mut source = SourceModel::new(ChipId::Rtl8852A);
+    let mut cursor = 4 + 6 * 4;
+    for (offset, bytes) in [
+        (0x210, [0x01, 0x02]),
+        (0x216, [0x07, 0x08]),
+        (0x21a, [0x0b, 0x0c]),
+        (0x222, [0x13, 0x14]),
+        (0x22e, [0x1f, 0x20]),
+        (0x23a, [0x81, 0x82]),
+        (0x258, [0x91, 0x92]),
+        (0x2d0, [0x21, 0x22]),
+    ] {
+        let block = offset / 8;
+        source.raw[cursor] = (block >> 4) as u8;
+        source.raw[cursor + 1] = ((block & 15) << 4) as u8 | (15 ^ (1 << ((offset % 8) / 2)));
+        source.raw[cursor + 2..cursor + 4].copy_from_slice(&bytes);
+        cursor += 4;
+    }
     let mut factory = Factory::default();
     if ready(factory.read(&mut source)) != Some(Ok(())) {
         return TestResult::Fail("A full PHY-cap snapshot failed");
@@ -567,8 +587,19 @@ fn smoke_rtw89_a_phycap_and_efuse_match_linux_rtw8852a_layout() -> TestResult {
     let Some(a) = Calibration::from_factory(&factory) else {
         return TestResult::Fail("A calibration refused a complete factory snapshot");
     };
-    // The model leaves the logical TSSI/thermal bytes unset (0); the
-    // 0x2b8 record ([255, 0x33]) pins the thermal offsets against a shift.
+    // Unprogrammed logical bytes stay 0xff (efuse.c
+    // `rtw89_parse_efuse_map_ax` memsets the logical map to 0xff), i.e. -1
+    // as the s8 TSSI offsets; the 0x2b8 record ([255, 0x33]) pins the
+    // thermal offsets against a shift.
+    let e = -1i8;
+    let tssi_cck = [[1, 2, e, e, e, e], [0x81u8 as i8, 0x82u8 as i8, e, e, e, e]];
+    // MCS: `bw40_tssi[5]` then `bw40_1s_tssi_5g[14]` after `rsvd[7]`.
+    let mut tssi_mcs = [[e; 19]; 2];
+    tssi_mcs[0][..2].copy_from_slice(&[7, 8]);
+    tssi_mcs[0][4] = 0x0b;
+    tssi_mcs[0][5..7].copy_from_slice(&[0x13, 0x14]);
+    tssi_mcs[0][17..].copy_from_slice(&[0x1f, 0x20]);
+    tssi_mcs[1][17..].copy_from_slice(&[0x91u8 as i8, 0x92u8 as i8]);
     if a.thermal_trim != [0x5f, 0x5c]
         || a.pa_bias != [0x5e, 0x5b]
         || a.tssi_trim
@@ -579,9 +610,9 @@ fn smoke_rtw89_a_phycap_and_efuse_match_linux_rtw8852a_layout() -> TestResult {
         || !a.trim_programmed
         || !a.thermal_programmed
         || !a.pa_programmed
-        || a.thermal != [0, 0]
-        || a.tssi_cck != [[0; 6]; 2]
-        || a.tssi_mcs != [[0; 19]; 2]
+        || a.thermal != [0x21, 0x22]
+        || a.tssi_cck != tssi_cck
+        || a.tssi_mcs != tssi_mcs
     {
         return TestResult::Fail("A PHY-cap/efuse values or validity flags were misdecoded");
     }

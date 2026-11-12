@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
-//! Real RTL8852A/B RF v1 SWSI/direct transactions, separate from PCIe PHY MDIO.
-//! Linux phy.c::{read,write}_rf_v1 and phy_gen_ax.cr_base=0x10000.
+//! Real RTL8852A/B RF transactions, separate from PCIe PHY MDIO.
+//! RTL8852B/C/8851B: Linux phy.c::{read,write}_rf_v1 (SWSI unless the
+//! 0x10000 direct-select bit is set); RTL8852A: phy.c `rtw89_phy_read_rf`/
+//! `rtw89_phy_write_rf` (phy.c:928/1128, rtw8852a.c `rtw8852a_chip_ops`),
+//! which always use the direct aperture at `addr & 0xff`. phy_gen_ax
+//! cr_base=0x10000.
 //! The direct RF bases are per chip: RTL8852A uses `rf_base_addr`
 //! {0xc000, 0xd000} (rtw8852a.c `rtw8852a_chip_info`), every other AX chip
 //! {0xe000, 0xf000} (rtw8852b/c `rtw8852b_chip_info` / `rtw8852c_chip_info`).
@@ -59,6 +63,11 @@ impl Rf {
         };
         result
     }
+    /// RTL8852A has no SWSI RF path: `rtw8852a_chip_ops.{read,write}_rf`
+    /// are `rtw89_phy_{read,write}_rf`, direct for every address.
+    fn always_direct(&self) -> bool {
+        self.chip == ChipId::Rtl8852A
+    }
     fn direct(&self, path: u8, address: u32) -> u32 {
         // Linux `rtw89_phy_read_rf`/`rtw89_phy_write_rf` direct aperture:
         // `cr_base + rf_base_addr[path] + (addr & 0xff) * 4`. A is
@@ -89,7 +98,7 @@ impl Rf {
         self.begin(path, address, mask)?;
         let mask = mask & RF_MASK;
         let result = async {
-            if address & 0x10000 != 0 {
+            if self.always_direct() || address & 0x10000 != 0 {
                 return Ok((read(io, self.direct(path, address))? & mask) >> mask.trailing_zeros());
             }
             idle(io).await?;
@@ -125,7 +134,7 @@ impl Rf {
         self.begin(path, address, mask)?;
         let mask = mask & RF_MASK;
         let result = async {
-            if address & 0x10000 != 0 {
+            if self.always_direct() || address & 0x10000 != 0 {
                 modify(io, self.direct(path, address), mask, data)?;
                 io.delay_us(1).await;
                 return Ok(());
