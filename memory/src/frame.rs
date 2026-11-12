@@ -5620,11 +5620,9 @@ mod scale_tests {
         if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
             return Err(TestResult::Skip("frame caches not published"));
         }
-        let node = if ALLOC.numa_aware.load(Ordering::Acquire) {
-            current_cpu_node().min(MAX_NUMA_NODES - 1)
-        } else {
-            0
-        };
+        // This CPU's node, or the first node with memory when it has none
+        // (node 0 can be all kernel image in the test VM).
+        let node = test_node_with_memory().min(MAX_NUMA_NODES - 1);
         if frame_cache_bypassed(node) {
             return Err(TestResult::Skip("frame cache bypass is active"));
         }
