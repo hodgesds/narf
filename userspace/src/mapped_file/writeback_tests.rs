@@ -756,10 +756,11 @@ fn smoke_truncate_excludes_a_batch_in_flight() -> TestResult {
         drop(guard);
     }
     fixture.store.mode.store(WRITES, Ordering::Release);
-    let shrink = size_change_serialized(fixture.ops(), || run(fixture.ops().truncate(0)));
+    let shrink = size_change_serialized(fixture.ops(), || run(fixture.ops().truncate(0))).flatten();
     let grow = size_change_serialized(fixture.ops(), || {
         run(fixture.ops().truncate(PAGES as u64 * 4096))
-    });
+    })
+    .flatten();
     if shrink != Some(Ok(())) || grow != Some(Ok(())) {
         return TestResult::Fail("the truncate failed");
     }
@@ -1510,7 +1511,8 @@ fn smoke_ftruncate_up_zeroes_stores_past_eof() -> TestResult {
     };
     store_bytes(page, 10, b"in");
     store_bytes(page, 200, b"GARBAGE");
-    let grown = size_change_serialized(fixture.ops(), || run(fixture.ops().truncate(4096)));
+    let grown =
+        size_change_serialized(fixture.ops(), || run(fixture.ops().truncate(4096))).flatten();
     if grown != Some(Ok(())) {
         return TestResult::Fail("the extending truncate failed");
     }
