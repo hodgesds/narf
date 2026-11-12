@@ -644,7 +644,13 @@ fn park_pending_future() -> bool {
     // SAFETY: this is the in-flight task's poller-pinned UserTaskCtx. The
     // continuation stays on this task's private kernel stack while asleep.
     let uc = unsafe { &*uctx };
-    crate::handlers::close_kernel_span(uc, current_task_id());
+    let task = current_task_id();
+    crate::handlers::close_kernel_span(uc, task);
+    // Which lock, if a lock is what this poll is waiting for.
+    let site = narf_lib::mutex::take_wait_site();
+    if let Some(site) = site {
+        PARKED_AT.lock().insert(task, site);
+    }
     uc.parked_in_syscall
         .store(true, core::sync::atomic::Ordering::Release);
     // SAFETY: a current stackful task and its executor context were verified
@@ -655,7 +661,22 @@ fn park_pending_future() -> bool {
     // so restore the publication another task may have replaced while we slept.
     crate::user_task::install_current(uctx);
     crate::handlers::open_kernel_span(uc);
+    if site.is_some() {
+        PARKED_AT.lock().remove(&task);
+    }
     true
+}
+
+/// The lock each parked task is queued on (its `lock()` call site), for
+/// `/proc/<pid>/stack`.
+static PARKED_AT: narf_lib::sync::IrqSafeSpinLock<
+    BTreeMap<u64, &'static core::panic::Location<'static>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Where task `task` is parked, if it parked waiting for a lock.
+pub(crate) fn parked_wait_site(task: u64) -> Option<alloc::string::String> {
+    let site = PARKED_AT.lock().get(&task).copied()?;
+    Some(alloc::format!("{}:{}", site.file(), site.line()))
 }
 
 /// Linux `cond_resched()`: a scheduling point for kernel code with a long
@@ -766,6 +787,8 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
     let mut fallback_polls = 0u64;
     loop {
+        // A site noted by whatever this CPU polled before is not ours.
+        let _ = narf_lib::mutex::take_wait_site();
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
             Poll::Pending if task_waker.is_some() => {
@@ -804,6 +827,8 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
     let mut fallback_polls = 0u64;
     loop {
+        // A site noted by whatever this CPU polled before is not ours.
+        let _ = narf_lib::mutex::take_wait_site();
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
             Poll::Pending if task_waker.is_some() => {
@@ -2588,9 +2613,14 @@ fn open_impl_reserved(
     {
         // Excluded from writeback, and followed by the cache invalidation:
         // see `mapped_file::size_change_serialized`.
-        match crate::mapped_file::size_change_serialized(&ops, || {
+        let Some(outcome) = crate::mapped_file::size_change_serialized(&ops, || {
             poll_blocking(ops.truncate(0))
-        }) {
+        }) else {
+            // Killed while waiting for the file's writeback lock.
+            ctx.set_return(errno_ret(EINTR));
+            return;
+        };
+        match outcome {
             Some(Ok(())) => {
                 file_remove_privs(ops.as_ref(), task);
                 crate::mqueue::notify_modify_path(path);

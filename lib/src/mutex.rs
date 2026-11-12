@@ -97,10 +97,12 @@ impl<T: ?Sized> Mutex<T> {
     /// Returns a future that resolves to a `MutexGuard` when the
     /// lock is available.
     #[inline]
+    #[track_caller]
     pub fn lock(&self) -> LockFuture<'_, T> {
         LockFuture {
             mutex: self,
             waiter_id: None,
+            site: core::panic::Location::caller(),
         }
     }
 
@@ -148,10 +150,40 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
     }
 }
 
+/// Where a waiter on this CPU last found a lock taken: the call site of
+/// its `lock()`. A task that parks right after takes it
+/// ([`take_wait_site`]) so the kernel can say what a blocked task waits on
+/// — the hung-task question "which lock?". One pointer per CPU, written on
+/// the slow path only.
+static WAIT_SITE: [core::sync::atomic::AtomicPtr<core::panic::Location<'static>>;
+    crate::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; crate::percpu::MAX_CPUS];
+
+/// Record that a lock acquired at `site` is making this CPU's current
+/// poll wait. Any lock type may report here.
+pub fn note_wait_site(site: &'static core::panic::Location<'static>) {
+    let cpu = crate::percpu::current_cpu();
+    if let Some(slot) = WAIT_SITE.get(cpu) {
+        slot.store(site as *const _ as *mut _, Ordering::Relaxed);
+    }
+}
+
+/// Take what [`note_wait_site`] recorded on this CPU since the last take.
+pub fn take_wait_site() -> Option<&'static core::panic::Location<'static>> {
+    let cpu = crate::percpu::current_cpu();
+    let raw = WAIT_SITE
+        .get(cpu)?
+        .swap(core::ptr::null_mut(), Ordering::Relaxed);
+    // SAFETY: only `note_wait_site` stores here, from a `&'static Location`.
+    (!raw.is_null()).then(|| unsafe { &*raw })
+}
+
 /// Future returned by [`Mutex::lock`].
 pub struct LockFuture<'a, T: ?Sized> {
     mutex: &'a Mutex<T>,
     waiter_id: Option<WaiterId>,
+    /// Where `lock()` was called, for [`note_wait_site`].
+    site: &'static core::panic::Location<'static>,
 }
 
 impl<T: ?Sized> fmt::Debug for LockFuture<'_, T> {
@@ -217,6 +249,7 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
                 }
             }
         }
+        note_wait_site(this.site);
         Poll::Pending
     }
 }

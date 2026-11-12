@@ -555,8 +555,23 @@ fn render_schedstat(pid: u64) -> String {
 /// to walk. The single null frame keeps the `[<%px>] %pS` shape a parser
 /// expects rather than inventing symbol names (`/proc/<pid>/wchan` names the
 /// blocking syscall instead, which NARF can answer truthfully).
-fn render_stack(_pid: u64) -> String {
-    "[<0000000000000000>] 0x0\n".to_string()
+/// `/proc/<pid>/stack`. NARF has no kernel unwinder to print the frames
+/// Linux does; it prints what it knows of a parked task — the lock it is
+/// queued on (its `lock()` call site) and the syscall it is parked in — in
+/// Linux's line format, or the old placeholder when it knows neither.
+fn render_stack(pid: u64) -> String {
+    let snapshot = super::hook_sched_snapshot(pid);
+    let mut out = String::new();
+    if let Some(site) = snapshot.wait_site {
+        out.push_str(&format!("[<0>] lock at {site}\n"));
+    }
+    if let Some(wchan) = snapshot.wchan {
+        out.push_str(&format!("[<0>] {wchan}\n"));
+    }
+    if out.is_empty() {
+        out.push_str("[<0000000000000000>] 0x0\n");
+    }
+    out
 }
 
 /// `/proc/<pid>/wchan` — where the task is sleeping.
@@ -1538,6 +1553,7 @@ fn test_sched_snapshot(_pid: u64) -> super::ProcSchedSnapshot {
         policy: 0,
         nice: 0,
         // `read(fd=4, buf=0x1000, count=0x200)` parked at sp/pc.
+        wait_site: None,
         syscall: Some([0, 4, 0x1000, 0x200, 0, 0, 0, 0x7fff_f000, 0x0040_1000]),
         wchan: Some(alloc::string::String::from("read")),
     }
@@ -1604,6 +1620,33 @@ fn smoke_syscall_and_wchan_for_a_running_task() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs/pid_ext",
     smoke_syscall_and_wchan_for_a_running_task
+);
+
+fn test_sched_snapshot_waiting_on_a_lock(_pid: u64) -> super::ProcSchedSnapshot {
+    super::ProcSchedSnapshot {
+        wchan: Some(alloc::string::String::from("msync")),
+        wait_site: Some(alloc::string::String::from(
+            "drivers/fs/btrfs/src/write.rs:42",
+        )),
+        ..Default::default()
+    }
+}
+
+/// A task parked waiting for a lock says which: `/proc/<pid>/stack` names
+/// the lock's acquisition site above the syscall it is parked in, so a
+/// hung-task report can tell one stalled lock from another.
+fn smoke_stack_names_the_lock_a_task_waits_on() -> TestResult {
+    let prev = super::__test_sched_snapshot_hook_swap(Some(test_sched_snapshot_waiting_on_a_lock));
+    let stack = render_stack(1);
+    super::__test_sched_snapshot_hook_restore(prev);
+    if stack != "[<0>] lock at drivers/fs/btrfs/src/write.rs:42\n[<0>] msync\n" {
+        return TestResult::Fail("/proc/<pid>/stack did not name the lock and the syscall");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_stack_names_the_lock_a_task_waits_on
 );
 
 /// Thread 7 is parked in `futex(0x1000, 128, 0)`; thread 8 sleeps outside a
