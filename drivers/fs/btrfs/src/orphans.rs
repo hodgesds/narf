@@ -24,7 +24,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if !self.admits_writes() {
             return Ok(());
         }
-        let _op = self.begin_op().await;
+        let _op = self.begin_admin().await;
         let (root, _) = self.fs_tree_root();
         for (key, body) in btree::collect_for(self, root, ORPHAN_OBJECTID, ORPHAN_ITEM_KEY).await? {
             if !body.is_empty() {
@@ -53,6 +53,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// operations that follow, with other work between, as Linux evicts in
     /// transactions other work runs between.
     pub(crate) async fn reap_orphans_budget(&self, budget: usize) -> Result<(), FsError> {
+        // Operations run side by side and each reaps on its way in; one at a
+        // time evicts, and the others go on with their own work.
+        let Some(_reaper) = self.try_reaper() else {
+            return Ok(());
+        };
         for (tree, ino) in self.orphan_snapshot() {
             if !self.claim_for_eviction(tree, ino) {
                 continue;

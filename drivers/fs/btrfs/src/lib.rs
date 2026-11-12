@@ -48,6 +48,7 @@ pub mod registry;
 pub mod roots;
 pub mod rw_gate;
 pub mod stats;
+pub(crate) mod txn_gate;
 pub mod volume;
 pub mod write;
 
