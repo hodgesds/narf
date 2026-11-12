@@ -4310,6 +4310,71 @@ kernel_test_in!(
     smoke_scheduler_wake_activates_parked_task_once
 );
 
+#[allow(
+    clippy::waker_clone_wake,
+    reason = "Exercise consuming RawWaker callbacks separately from wake_by_ref"
+)]
+fn smoke_scheduler_owned_and_borrowed_wakes_account_once() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let mut spec = crate::TaskSpec::unthrottled();
+    spec.affinity = crate::Affinity::pinned(crate::CpuId(cpu as u32));
+    let task = crate::spawn_with_spec(core::future::pending::<()>(), spec);
+    let _ = crate::poll_one_round();
+    let cell = crate::PARKED[cpu]
+        .lock()
+        .as_ref()
+        .and_then(|slots| slots.get(&task))
+        .map(|entry| entry.slot.awake.clone());
+    let Some(cell) = cell else {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("task did not park");
+    };
+    let old_pressure = crate::WAKE_PRESSURE[cpu].swap(0, Ordering::AcqRel);
+    let waker = crate::make_waker(cell);
+    let mut failure = None;
+    for owned in [true, false] {
+        crate::WAKE_PRESSURE[cpu].store(0, Ordering::Release);
+        if owned {
+            waker.clone().wake();
+        } else {
+            waker.wake_by_ref();
+        }
+        if crate::WAKE_PRESSURE[cpu].load(Ordering::Acquire) != 1 {
+            failure = Some("fresh wake did not contribute exactly once to placement backlog");
+            break;
+        }
+        for _ in 0..8 {
+            waker.clone().wake();
+            waker.wake_by_ref();
+        }
+        if crate::WAKE_PRESSURE[cpu].load(Ordering::Acquire) != 1 {
+            failure = Some("coalesced wake inflated placement backlog");
+            break;
+        }
+        crate::drain_wake_list(cpu);
+        crate::drain_wake_list(cpu);
+        let exactly_once = crate::READY[cpu]
+            .lock()
+            .as_ref()
+            .is_some_and(|queue| queue.len() == 1 && queue[0].id == task);
+        if !exactly_once {
+            failure = Some("mixed waker ownership duplicated runnable activation");
+            break;
+        }
+        let _ = crate::poll_one_round();
+    }
+    crate::__reset_queues_for_test();
+    crate::WAKE_PRESSURE[cpu].store(old_pressure, Ordering::Release);
+    failure.map_or(TestResult::Pass, TestResult::Fail)
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_scheduler_owned_and_borrowed_wakes_account_once
+);
+
 fn smoke_scheduler_sync_wake_activates_locally_without_inbox() -> TestResult {
     use core::sync::atomic::Ordering;
     use narf_capabilities::{Cap, Grant};

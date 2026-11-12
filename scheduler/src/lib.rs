@@ -5276,6 +5276,18 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
 // needed: the awake bit IS the runnable bit, and the scan reads it
 // directly.
 
+/// Account one false-to-true wake transition, regardless of Waker ownership.
+#[inline]
+fn note_fresh_wake(cell: &WakeCell, home: u32) {
+    wake_race_stamp(cell, home);
+    note_runnable_peer(home, cell.task);
+    user_policy::note_rt_wake(cell, home);
+    // Placement counts fresh wakes, not repeated notifications of runnable work.
+    if let Some(pressure) = WAKE_PRESSURE.get(home as usize) {
+        pressure.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// Publish a consuming wake, leaving parked activation to the executor. An
 /// exact local handoff can claim the indexed parked owner before that drain.
 #[inline]
@@ -5289,9 +5301,7 @@ fn publish_owned_wake(cell: &WakeCell) -> u32 {
     // tail). `resched_remote` no-ops for same-CPU / running targets.
     let home = cell.cpu.load(Ordering::Acquire);
     if !prev_awake {
-        wake_race_stamp(cell, home);
-        note_runnable_peer(home, cell.task);
-        user_policy::note_rt_wake(cell, home);
+        note_fresh_wake(cell, home);
     }
     home
 }
@@ -5331,17 +5341,7 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) -> bool {
     let (home, task) = unsafe { ((*ptr).cpu.load(Ordering::Acquire), (*ptr).task) };
     if !prev_awake {
         // SAFETY: the caller holds a live Waker, so `ptr`'s WakeCell is valid.
-        unsafe { wake_race_stamp(&*ptr, home) };
-        note_runnable_peer(home, task);
-        // SAFETY: the native waker pins this WakeCell.
-        user_policy::note_rt_wake(unsafe { &*ptr }, home);
-        // Backlog gauge for wake-time placement (see WAKE_PRESSURE): one
-        // fresh wake toward `home` since its last dispatch round. Re-wakes
-        // of an already-awake slot add no queue load and are skipped by the
-        // prev_awake gate above.
-        if (home as usize) < WAKE_PRESSURE.len() {
-            WAKE_PRESSURE[home as usize].fetch_add(1, Ordering::AcqRel);
-        }
+        note_fresh_wake(unsafe { &*ptr }, home);
     }
     let mut dispatch_home = home;
     if urgent_task == Some(task) {
