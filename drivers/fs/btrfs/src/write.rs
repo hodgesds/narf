@@ -1663,8 +1663,8 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     // The timer runs beside operations on other CPUs. Committing between an
     // operation's tree reads and its staging would hand it a tree that moved
     // (a fresh root with no METADATA_ITEM yet, a closed batch), so it waits
-    // for the operation to finish (`op_lock`).
-    let _op = vol.op_lock().lock().await;
+    // for the running operation to finish (`commit_excl`).
+    let _op = vol.begin_commit().await;
     // An orphan that cannot be reclaimed for lack of space must not keep
     // the transaction from ageing out: committing is what releases space.
     match vol.reap_orphans().await {
@@ -1884,6 +1884,8 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
     subvol.ops += 1;
     let (root, level) = subvol.cow.root();
     vol.advance_fs_root(root, level);
+    // For `fsync`: which objects this transaction changed.
+    vol.note_staged(tree_id, edits.iter().map(|e| e.key().objectid), batch.gen);
     // A data extent this batch allocated and has now released never reached
     // the extent tree, so it must not be recorded as a drop: `commit_txn`
     // resolves every dropped reference against the *committed* extent tree,
@@ -8042,7 +8044,7 @@ where
     if !vol.admits_writes() {
         return Err(FsError::ReadOnly);
     }
-    let _op = vol.op_lock().lock().await;
+    let _op = vol.begin_op().await;
     if !vol.admits_writes() {
         return Err(FsError::ReadOnly);
     }

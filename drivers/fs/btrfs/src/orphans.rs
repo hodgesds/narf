@@ -24,7 +24,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if !self.admits_writes() {
             return Ok(());
         }
-        let _op = self.op_lock().lock().await;
+        let _op = self.begin_op().await;
         let (root, _) = self.fs_tree_root();
         for (key, body) in btree::collect_for(self, root, ORPHAN_OBJECTID, ORPHAN_ITEM_KEY).await? {
             if !body.is_empty() {

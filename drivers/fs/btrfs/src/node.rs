@@ -127,7 +127,7 @@ macro_rules! autogrow {
             return Err(FsError::ReadOnly);
         }
         // One mutating operation at a time, from its first read to staging.
-        let _op = $vol.op_lock().lock().await;
+        let _op = $vol.begin_op().await;
         if !$vol.admits_writes() {
             return Err(FsError::ReadOnly);
         }
@@ -170,7 +170,7 @@ macro_rules! admin_op {
         if !$vol.admits_admin_writes() {
             return Err(FsError::ReadOnly);
         }
-        let _op = $vol.op_lock().lock().await;
+        let _op = $vol.begin_op().await;
         if !$vol.admits_admin_writes() {
             return Err(FsError::ReadOnly);
         }
@@ -1079,8 +1079,10 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     }
 
     /// `fsync` must leave every write that has already returned durable on
-    /// disk: it delegates to [`BtrfsVolume::sync_to_disk_exclusive`], which
-    /// commits the open batch and writes the staged superblock.
+    /// disk: it delegates to [`BtrfsVolume::sync_object`], which commits the
+    /// open batch and writes the staged superblock if any change to this
+    /// inode is not yet durable, sharing the commit with every concurrent
+    /// `fsync`.
     ///
     /// `fdatasync` (`data_only`) does the same. It may skip metadata that is
     /// not needed to read the data back (timestamps), never the metadata
@@ -1095,7 +1097,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     /// (The tree-log is only used to *replay* a crashed volume's log on mount,
     /// not to defer writes, so both are a full commit.)
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.volume()?.sync_to_disk_exclusive().await })
+        Box::pin(async move { self.volume()?.sync_object(self.ino).await })
     }
 
     fn stat(&self) -> Stat {

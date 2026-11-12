@@ -244,6 +244,11 @@ pub const DISK_KEY_SIZE: usize = 17;
 const OFF_CSUM: usize = 0;
 const OFF_MAGIC: usize = 64;
 const OFF_GENERATION: usize = 72;
+
+/// The `generation` of a raw superblock image.
+pub(crate) fn super_generation(raw: &[u8]) -> Option<u64> {
+    le64(raw, OFF_GENERATION).ok()
+}
 const OFF_ROOT: usize = 80;
 const OFF_CHUNK_ROOT: usize = 88;
 pub const OFF_LOG_ROOT: usize = 96;
