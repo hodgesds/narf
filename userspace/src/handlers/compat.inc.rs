@@ -3968,7 +3968,7 @@ pub(crate) unsafe fn copy_from_user_vec(
     // a 1 MiB `send` copy in `sys_socket_send`).
     let mut buf = alloc::vec::Vec::new();
     if buf.try_reserve_exact(len).is_err() {
-        return Err(ENOMEM);
+        return Err(ENOMEM as u64);
     }
     buf.resize(len, 0u8);
     // SAFETY: validated above; SMAP bracket inside copy_from_user.
