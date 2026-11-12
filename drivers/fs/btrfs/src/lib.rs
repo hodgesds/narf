@@ -50,6 +50,7 @@ pub mod rw_gate;
 pub mod stats;
 pub(crate) mod txn_gate;
 pub mod volume;
+pub(crate) mod workspace;
 pub mod write;
 
 mod orphans;
