@@ -898,7 +898,6 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     /// RCR_ACCEPT_CTRL_FRAME), so holes advance only by window or timeout.
     fn service_ba(&mut self, now: u64) -> Result<(), Error> {
         self.service_tx_ba(now);
-        self.service_rate_adaptation(now);
         for tid in 0..8u16 {
             let Some(session) = self.rx_ba[usize::from(tid)].as_mut() else {
                 continue;
@@ -932,7 +931,9 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
     }
     /// `rtl8xxxu_watchdog_callback` -> `rtl8xxxu_ra_iter`: report the SNR of
     /// the averaged signal and `rtl8xxxu_refresh_rate_mask` (non-forced).
-    fn service_rate_adaptation(&mut self, now: u64) {
+    /// The device's watchdog work calls it every 2 s; the period gate makes
+    /// any extra call within a period a no-op.
+    pub(super) fn service_rate_adaptation(&mut self, now: u64) {
         if now < self.next_watchdog {
             return;
         }

@@ -437,6 +437,19 @@ impl<C: ControlIo, B: packet_transport::Io, E: Environment> Service<C, B, E> {
         }
         result
     }
+    /// `rtl8xxxu_watchdog_callback` for the connected station: the host RA
+    /// SNR report and rate-mask refresh (no EP0 I/O). A no-op unless
+    /// connected.
+    pub fn rate_watchdog(&mut self) -> Result<(), Error> {
+        if self.phase() != Phase::Connected {
+            return Ok(());
+        }
+        let now = self.now()?;
+        if let Some(station) = self.station.as_mut() {
+            station.service_rate_adaptation(now);
+        }
+        Ok(())
+    }
     /// True when a connected station holds a live EDCA update that only the
     /// async `maintain` path may program over EP0.
     pub fn maintenance_pending(&self) -> bool {
