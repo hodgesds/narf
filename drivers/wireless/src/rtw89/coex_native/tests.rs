@@ -321,6 +321,68 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_wlan_only_coex_init_follows_btc_init_cfg_and_gnt_v1
 );
+/// Linux coex.c `_write_scbd(..., BTC_WSCB_WLRFK, state)`: the WLRFK
+/// bit (`BIT(11)`) flips while every other scoreboard bit survives,
+/// including the full-word init bits (ACTIVE|ON|BTLOG = 0x4003) and a
+/// bit outside the init word (5GHICH, `BIT(6)`); the firmware-owned
+/// high bits are preserved by `scoreboard`'s write. A set when already
+/// set (and a clear when already clear) leaves the word unchanged.
+fn smoke_rtw89_scoreboard_rmw_sets_and_clears_wlrfk_only() -> TestResult {
+    let r32 = |io: &Model, a: usize| u32::from_le_bytes(io.bytes[a..a + 4].try_into().unwrap());
+    // Seed R_AX_WL_SCBD (0xac): a firmware-owned high bit (BIT(25)) plus
+    // the 0x4003 init word, then set WLRFK.
+    let mut io = Model::new(0);
+    io.bytes[0xac..0xb0].copy_from_slice(&0x0200_4003u32.to_le_bytes());
+    if ready(scoreboard_set_bit(&mut io, WLRFK, true)) != Some(Ok(()))
+        || r32(&io, 0xac) != 0x8300_4803
+    {
+        return TestResult::Fail("scoreboard RMW set clobbered other bits");
+    }
+    // Setting an already-set bit is a no-op on the word.
+    if ready(scoreboard_set_bit(&mut io, WLRFK, true)) != Some(Ok(()))
+        || r32(&io, 0xac) != 0x8300_4803
+    {
+        return TestResult::Fail("scoreboard RMW set was not idempotent");
+    }
+    // Clearing restores the init word, high bits intact.
+    if ready(scoreboard_set_bit(&mut io, WLRFK, false)) != Some(Ok(()))
+        || r32(&io, 0xac) != 0x8300_4003
+    {
+        return TestResult::Fail("scoreboard RMW clear clobbered other bits");
+    }
+    // Clearing an already-clear bit is a no-op on the word.
+    if ready(scoreboard_set_bit(&mut io, WLRFK, false)) != Some(Ok(()))
+        || r32(&io, 0xac) != 0x8300_4003
+    {
+        return TestResult::Fail("scoreboard RMW clear was not idempotent");
+    }
+    // A bit outside the init word (5GHICH, BIT(6)) survives both directions.
+    let mut io = Model::new(0);
+    io.bytes[0xac..0xb0].copy_from_slice(&0x4043u32.to_le_bytes());
+    if ready(scoreboard_set_bit(&mut io, WLRFK, true)) != Some(Ok(()))
+        || r32(&io, 0xac) != 0x8100_4843
+    {
+        return TestResult::Fail("scoreboard RMW set dropped the 5GHICH bit");
+    }
+    if ready(scoreboard_set_bit(&mut io, WLRFK, false)) != Some(Ok(()))
+        || r32(&io, 0xac) != 0x8100_4043
+    {
+        return TestResult::Fail("scoreboard RMW clear dropped the 5GHICH bit");
+    }
+    // A read failure (u32::MAX = gone device) fails closed before any write.
+    let mut io = Model::new(0);
+    io.bytes[0xac..0xb0].copy_from_slice(&u32::MAX.to_le_bytes());
+    if ready(scoreboard_set_bit(&mut io, WLRFK, true))
+        != Some(Err(Error::Register(power::Error::Gone)))
+    {
+        return TestResult::Fail("scoreboard RMW accepted a gone device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_scoreboard_rmw_sets_and_clears_wlrfk_only
+);
 /// RTL8851B `rtw8851b_btc_set_rfe`/`rtw8851b_btc_init_cfg` on one RF path:
 /// the cxinit encoding per antenna layout, path-A-only trx masks with the
 /// group remap, no B-only PTA_WL_TX_EN/RSP_CHK_BTCCA write, and B's generic
