@@ -1900,6 +1900,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_memory::kaslr::image_phys_delta(),
                     narf_memory::kaslr::image_phys_bounds().0
                 );
+                // Every page of the image must be mapped at this slide: a hole
+                // faults only when something there first runs or is read.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // SAFETY: the stub's tables are live; RAM is reachable
+                    // through them (the console already runs on the image).
+                    let hole = unsafe { narf_memory::kaslr::first_unmapped_image_page() };
+                    if let Some((va, got)) = hole {
+                        panic!(
+                            "kaslr: image page {va:#x} is mapped to {got:#x?}, not {:#x}, \
+                             at slide {:#x}",
+                            narf_memory::kaslr::image_virt_to_phys(va),
+                            narf_memory::kaslr::kernel_slide()
+                        );
+                    }
+                }
             }
 
             // MMU handoff per console/ §3.1. The three-step sequence
@@ -4812,8 +4828,36 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     break;
                 }
                 let _ = narf_init::run_stage(s);
+                // The boot stack runs every initcall. One that reached past its
+                // bottom is named here, before what lies below is relied on.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let stack = aarch64::boot_stack::usage();
+                    if stack.guard_written != 0 {
+                        panic!(
+                            "boot stack overflow in init stage {}: {} of {} bytes used, \
+                             {} guard words written, lowest at phys {:#x?}",
+                            s.name(),
+                            stack.used,
+                            stack.size,
+                            stack.guard_written,
+                            stack.lowest_written
+                        );
+                    }
+                }
             }
             let _ = narf_init::print_summary(&mut console::Writer);
+            #[cfg(target_arch = "aarch64")]
+            {
+                let stack = aarch64::boot_stack::usage();
+                let _ = writeln!(
+                    console::Writer,
+                    "  boot stack: {} of {} bytes used after init ({} byte guard intact)",
+                    stack.used,
+                    stack.size,
+                    stack.guard
+                );
+            }
             // Status-panel diag: initcalls done; flip the phase to
             // Userspace so the panel shows the kernel reached its
             // final boot phase (scheduler, executors, sleep_pumps).

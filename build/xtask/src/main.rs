@@ -43,6 +43,7 @@ mod composition;
 mod crate_release;
 mod efi_image;
 mod http3_smoke;
+mod kaslr_knob;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
 mod net_robust;
@@ -4747,6 +4748,16 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
                 table.total(),
                 table.encoded_len()
             );
+            if matches!(args.arch, Arch::Aarch64) {
+                // Written on every link — 0 unless asked — so an image patched
+                // for one run never carries its slide into the next.
+                let slide = kaslr_knob::slide_from_env()?;
+                kaslr_knob::set_slide(&elf, slide)
+                    .with_context(|| format!("patching the KASLR slide into {}", elf.display()))?;
+                if slide != 0 {
+                    println!("xtask: KASLR slide pinned to {slide:#x} (NARF_KASLR_SLIDE)");
+                }
+            }
         }
     }
 

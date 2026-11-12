@@ -9,6 +9,7 @@ core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("vec.S"));
 core::arch::global_asm!(include_str!("smp_entry.S"));
 
+pub mod boot_stack;
 mod signal;
 pub mod smp;
 pub mod trap;
