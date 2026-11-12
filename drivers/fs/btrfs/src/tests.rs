@@ -20,6 +20,7 @@ use crate::volume::BtrfsVolume;
 mod admitted_ops;
 mod batch_commit;
 mod cache_bounds;
+mod cache_off;
 mod commit_scale;
 mod concurrent_ops;
 mod data_cache;
