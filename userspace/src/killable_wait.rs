@@ -177,11 +177,19 @@ impl<T: Send + 'static> Drop for KillableWait<T> {
     }
 }
 
-fn wait_with<T: Send + 'static>(
-    wait: KillableWait<T>,
-    drive: fn(KillableWait<T>) -> Option<Result<T, Killed>>,
-) -> Result<Option<T>, Killed> {
-    match drive(wait) {
+/// Drive `wait` with `poll_io_to_completion` (`io`) or `poll_blocking`.
+///
+/// Every function between a syscall handler and here is `#[track_caller]`,
+/// so a task parked in one of these waits is named in `/proc/<pid>/stack`
+/// by the handler line that started it, not by this module.
+#[track_caller]
+fn wait_with<T: Send + 'static>(wait: KillableWait<T>, io: bool) -> Result<Option<T>, Killed> {
+    let outcome = if io {
+        crate::handlers::poll_io_to_completion(wait)
+    } else {
+        crate::handlers::poll_blocking(wait)
+    };
+    match outcome {
         Some(Ok(value)) => Ok(Some(value)),
         Some(Err(Killed)) => Err(Killed),
         None => Ok(None),
@@ -190,15 +198,17 @@ fn wait_with<T: Send + 'static>(
 
 /// [`crate::handlers::poll_blocking`] that a fatal signal ends. `Ok(None)`
 /// is `poll_blocking`'s `None`: there was no executor to park on.
+#[track_caller]
 pub(crate) fn wait<T: Send + 'static>(op: OwnedWait<T>) -> Result<Option<T>, Killed> {
     let wait = KillableWait::new(crate::handlers::current_task_id(), op);
-    wait_with(wait, crate::handlers::poll_blocking)
+    wait_with(wait, false)
 }
 
 /// [`crate::handlers::poll_io_to_completion`] that a fatal signal ends.
+#[track_caller]
 pub(crate) fn wait_io<T: Send + 'static>(op: OwnedWait<T>) -> Result<Option<T>, Killed> {
     let wait = KillableWait::new(crate::handlers::current_task_id(), op);
-    wait_with(wait, crate::handlers::poll_io_to_completion)
+    wait_with(wait, true)
 }
 
 /// Whether `ops` is stored file data: a regular file of an on-disk or
@@ -231,6 +241,7 @@ fn stores_file_data(ops: &dyn FileOps) -> bool {
 /// Stored file data is read through the file's cached `MAP_SHARED` pages:
 /// a store made through a mapping and not written back yet is part of what
 /// `read(2)` returns, as it is on Linux, where both use one folio.
+#[track_caller]
 pub(crate) fn read(
     ops: &Arc<dyn FileOps>,
     offset: u64,
@@ -288,6 +299,7 @@ pub(crate) fn read(
 ///
 /// Anything but stored file data ([`stores_file_data`]) is not waited for
 /// killably.
+#[track_caller]
 pub(crate) fn write(ops: &Arc<dyn FileOps>, offset: u64, payload: &mut Vec<u8>) -> Waited<usize> {
     let bytes = core::mem::take(payload);
     let op = crate::mapped_file::write_and_note(ops.clone(), offset, bytes);
@@ -298,7 +310,7 @@ pub(crate) fn write(ops: &Arc<dyn FileOps>, offset: u64, payload: &mut Vec<u8>) 
         }));
     }
     let wait = KillableWait::new(crate::handlers::current_task_id(), Box::pin(op));
-    let done = wait_with(wait, crate::handlers::poll_blocking)?;
+    let done = wait_with(wait, false)?;
     Ok(done.map(|(result, bytes)| {
         *payload = bytes;
         result
@@ -306,6 +318,7 @@ pub(crate) fn write(ops: &Arc<dyn FileOps>, offset: u64, payload: &mut Vec<u8>) 
 }
 
 /// `getdents64` batch — `iterate_dir`'s `down_read_killable(&inode->i_rwsem)`.
+#[track_caller]
 pub(crate) fn enumerate(
     dir: &Arc<dyn DirOps>,
     cursor: usize,
@@ -317,10 +330,57 @@ pub(crate) fn enumerate(
     ))
 }
 
+/// A durability wait — `fsync`/`fdatasync` (`ops.fsync`), `syncfs`
+/// (`ops.syncfs`) or `sync` — that a fatal signal ends.
+///
+/// Linux does not sleep killably here: `btrfs_sync_file` takes the inode
+/// lock and waits for its transaction to commit uninterruptibly. What makes
+/// that tolerable there is that the wait is short; here the commit queues
+/// behind every other operation on the volume, and a killed task sat in that
+/// queue for minutes before it could exit. Ending the wait changes nothing
+/// anyone can observe: a sync has no result but its return value, and the
+/// task that would read it is dying. So a task that already has SIGKILL
+/// pending does not start one at all, and one that is killed while it waits
+/// leaves the operation — which may already hold the volume's operation lock
+/// or have a commit in flight — to finish in the background, as a killed
+/// write does.
+#[track_caller]
+fn durability(op: OwnedWait<Result<(), FsError>>) -> Waited<()> {
+    if fatal_signal_pending(crate::handlers::current_task_id()) {
+        return Err(Killed);
+    }
+    wait(op)
+}
+
+/// `fsync(2)`/`fdatasync(2)`'s filesystem commit. See [`durability`].
+#[track_caller]
+pub(crate) fn fsync(ops: &Arc<dyn FileOps>, data_only: bool) -> Waited<()> {
+    let file = ops.clone();
+    durability(Box::pin(async move { file.fsync(data_only).await }))
+}
+
+/// `syncfs(2)`'s filesystem commit. See [`durability`].
+#[track_caller]
+pub(crate) fn syncfs(ops: &Arc<dyn FileOps>) -> Waited<()> {
+    let file = ops.clone();
+    durability(Box::pin(async move { file.syncfs().await }))
+}
+
+/// `sync(2)`: every mounted filesystem, then every disk. See
+/// [`durability`].
+#[track_caller]
+pub(crate) fn sync_all() -> Result<Option<narf_filesystem::sync_all::SyncReport>, Killed> {
+    if fatal_signal_pending(crate::handlers::current_task_id()) {
+        return Err(Killed);
+    }
+    wait(Box::pin(narf_filesystem::sync_all::sync_all()))
+}
+
 /// A file page fault's cache fill — `filemap_fault` →
 /// `__folio_lock_or_retry` with `FAULT_FLAG_KILLABLE`. The frame it resolves
 /// to is the file's own cache page, so a fill that finishes after its
 /// faulting task died leaves nothing to release.
+#[track_caller]
 pub(crate) fn mmap_fault(ops: &Arc<dyn FileOps>, offset: u64) -> Waited<u64> {
     let file = ops.clone();
     wait_io(Box::pin(async move { file.mmap_fault_async(offset).await }))
@@ -352,6 +412,7 @@ impl Drop for FilledFrame {
 /// frame belongs to the fill from here on: it is returned on success and
 /// freed on a read error, on `Ok(None)` and when the fill outlives a killed
 /// task.
+#[track_caller]
 pub(crate) fn fill_frame(
     ops: &Arc<dyn FileOps>,
     offset: u64,

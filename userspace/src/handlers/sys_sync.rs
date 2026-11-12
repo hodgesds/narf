@@ -12,7 +12,9 @@ use super::*;
 /// file cache, not any one process's fsync/msync, is what can reach them.
 pub(crate) fn sys_sync(ctx: &mut dyn TrapContext) {
     let _ = crate::mapped_file::sync_all_files(None);
-    let _ = sync_all_blocking();
+    // A fatal signal ends the wait; the sync finishes without this task.
+    // `sync(2)` reports nothing either way.
+    let _ = crate::killable_wait::sync_all();
     ctx.set_return(SyscallReturn::ok(0));
 }
 
