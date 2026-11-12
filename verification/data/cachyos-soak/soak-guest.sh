@@ -811,6 +811,10 @@ slab_sites() { # label
       ((n <= 80)) && say "SOAK-MMORPH $1 $line"
     done < /proc/narf/mm_orphans
   fi
+  # And who holds them (a sweep of RAM: slow, so only every third time).
+  if [ -r /proc/narf/mm_holders ] && ((++MMHOLD_N % 3 == 1)); then
+    while read -r line; do say "SOAK-MMHOLD $1 $line"; done < /proc/narf/mm_holders
+  fi
   # Scheduler tasks /proc does not list, grouped by where they wait.
   n=0
   [ -r /proc/narf/tasks ] || return 0

@@ -326,6 +326,8 @@ pub struct RootInfo {
     /// Scheduler tasks that may still execute through it (Linux
     /// `mm_users`), when it could be read.
     pub user_tasks: Option<u32>,
+    /// The address its `Arc`s store (0: no weak reference registered).
+    pub arc: u64,
 }
 
 /// Look up `root` (racy snapshot). Reads the strong count through the weak
@@ -333,11 +335,11 @@ pub struct RootInfo {
 pub fn info(root: u64) -> Option<RootInfo> {
     let i = find(root)?;
     let origin = ORIGINS[i].load(Ordering::Acquire);
-    let (strong, user_tasks) = {
+    let (strong, user_tasks, arc) = {
         let _g = WEAK_LOCK.lock();
         let raw = WEAK[i].load(Ordering::Acquire);
         if raw.is_null() {
-            (None, None)
+            (None, None, 0)
         } else {
             // SAFETY: `raw` is a live `Weak::into_raw` pointer: `forget`
             // swaps it out under this lock before releasing it. Wrapped in
@@ -353,7 +355,7 @@ pub fn info(root: u64) -> Option<RootInfo> {
             } else {
                 None
             };
-            (Some(strong), user_tasks)
+            (Some(strong), user_tasks, arc_inner_addr(raw))
         }
     };
     let exit_strong = EXIT_STRONG[i].load(Ordering::Relaxed);
@@ -367,7 +369,55 @@ pub fn info(root: u64) -> Option<RootInfo> {
         held_site: HELD_SITE[i].load(Ordering::Relaxed),
         held_tid: HELD_TID[i].load(Ordering::Relaxed),
         user_tasks,
+        arc,
     })
+}
+
+/// Words on each side of a hit that [`scan_ram_for_arcs`] hands its visitor.
+pub const HIT_CONTEXT: usize = 8;
+
+/// Diagnostic sweep for the owner of an `Arc` nobody released: read every
+/// managed RAM frame but page tables through the direct map and call
+/// `visit(phys, words, at)` for each 8-byte word equal to one of `targets`
+/// (sorted `ArcInner` addresses), with the `2 * HIT_CONTEXT` words around it
+/// (`words[at]` is the hit; words outside the frame read as 0). Freed memory
+/// keeps stale copies, so a single hit proves nothing; an owner shows up as
+/// the same surrounding layout — usually a vtable or `.rodata` word at a fixed
+/// distance — repeated once per leaked space. Racy, read-only, and slow
+/// (every word of RAM): for `/proc` diagnostics only.
+pub fn scan_ram_for_arcs(
+    targets: &[u64],
+    mut visit: impl FnMut(u64, &[u64; 2 * HIT_CONTEXT], usize),
+) {
+    let (Some(&lo), Some(&hi)) = (targets.first(), targets.last()) else {
+        return;
+    };
+    for (start, len) in crate::frame::managed_ram_ranges() {
+        let mut page = (start + 4095) & !4095;
+        while page + 4096 <= start + len {
+            if crate::frame::cow::page_table_mark(page) != Some(true) {
+                let base = crate::PhysAddr::new(page).kernel_ptr::<u64>();
+                for i in 0..512usize {
+                    // SAFETY: managed RAM is mapped in the kernel's direct map;
+                    // a racy volatile read of a live frame is all this does.
+                    let w = unsafe { base.add(i).read_volatile() };
+                    if w < lo || w > hi || targets.binary_search(&w).is_err() {
+                        continue;
+                    }
+                    let mut words = [0u64; 2 * HIT_CONTEXT];
+                    for (k, slot) in words.iter_mut().enumerate() {
+                        let j = i as isize + k as isize - HIT_CONTEXT as isize;
+                        if (0..512).contains(&j) {
+                            // SAFETY: as above, inside the same frame.
+                            *slot = unsafe { base.add(j as usize).read_volatile() };
+                        }
+                    }
+                    visit(page + i as u64 * 8, &words, HIT_CONTEXT);
+                }
+            }
+            page += 4096;
+        }
+    }
 }
 
 /// `(exits seen, exits whose abandoned stack held the space)`.

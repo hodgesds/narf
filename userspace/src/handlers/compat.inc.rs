@@ -8227,6 +8227,84 @@ pub fn narf_mm_orphans_report() -> alloc::vec::Vec<u8> {
     s.into_bytes()
 }
 
+/// `/proc/narf/mm_holders`: who holds the address spaces that
+/// `/proc/narf/mm_orphans` lists with no task left (`mm_users` 0) but a
+/// strong reference. Sweeps all RAM for words equal to their `Arc` address
+/// ([`narf_memory::as_origin::scan_ram_for_arcs`]) and groups the hits by the
+/// nearest kernel-image word before them (a vtable, `.rodata` or `.text`
+/// address, as a `.text`-relative offset) and its distance in words: an owner
+/// repeats one layout once per leaked space, stale copies scatter. Then the
+/// first hits raw, with their surrounding words. Slow; read on demand.
+pub fn narf_mm_holders_report() -> alloc::vec::Vec<u8> {
+    use alloc::collections::BTreeMap;
+    use core::fmt::Write as _;
+    extern "C" {
+        static __text_start: u8;
+        static __rodata_end: u8;
+    }
+    let image_lo = core::ptr::addr_of!(__text_start) as u64;
+    let image_hi = core::ptr::addr_of!(__rodata_end) as u64;
+    let spaces = narf_scheduler::all_address_spaces();
+    let mut owned: alloc::vec::Vec<u64> = spaces.iter().map(|a| a.root.raw()).collect();
+    drop(spaces);
+    owned.sort_unstable();
+    let mut roots = alloc::vec::Vec::new();
+    narf_memory::as_origin::for_each(|root, _| {
+        if owned.binary_search(&root).is_err() {
+            roots.push(root);
+        }
+    });
+    let mut targets: alloc::vec::Vec<u64> = roots
+        .iter()
+        .filter_map(|&root| narf_memory::as_origin::info(root))
+        .filter(|info| info.strong.is_some_and(|s| s > 0) && info.user_tasks == Some(0))
+        .map(|info| info.arc)
+        .filter(|&arc| arc != 0)
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    let mut patterns: BTreeMap<(i64, u64), usize> = BTreeMap::new();
+    let mut raw = alloc::string::String::new();
+    let mut hits = 0usize;
+    narf_memory::as_origin::scan_ram_for_arcs(&targets, |phys, words, at| {
+        hits += 1;
+        let in_image = |w: u64| w >= image_lo && w < image_hi;
+        let key = (0..at)
+            .rev()
+            .find(|&k| in_image(words[k]))
+            .map(|k| ((at - k) as i64, words[k] - image_lo))
+            .or_else(|| {
+                (at + 1..words.len())
+                    .find(|&k| in_image(words[k]))
+                    .map(|k| (-((k - at) as i64), words[k] - image_lo))
+            })
+            .unwrap_or((0, 0));
+        *patterns.entry(key).or_insert(0) += 1;
+        if hits <= 8 {
+            let _ = write!(raw, "hit phys={:#x} words", phys);
+            for (k, w) in words.iter().enumerate() {
+                let mark = if k == at { "*" } else { "" };
+                if in_image(*w) {
+                    let _ = write!(raw, " {}img+{:#x}", mark, w - image_lo);
+                } else {
+                    let _ = write!(raw, " {}{:#x}", mark, w);
+                }
+            }
+            raw.push('\n');
+        }
+    });
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "targets {}", targets.len());
+    let _ = writeln!(s, "hits {}", hits);
+    let mut sorted: alloc::vec::Vec<_> = patterns.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    for ((dist, word), count) in sorted.iter().take(30) {
+        let _ = writeln!(s, "pattern n={} dist={} img+{:#x}", count, dist, word);
+    }
+    s.push_str(&raw);
+    s.into_bytes()
+}
+
 /// /proc enumerator — every live PROCESS (thread-group leader, keyed in
 /// `PID_TO_TASK` by its outer ProcessId) that is visible in the READER's PID
 /// namespace, reported as the reader's inner pid. A namespaced reader sees
