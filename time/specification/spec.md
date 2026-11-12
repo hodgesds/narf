@@ -122,8 +122,8 @@ pub fn next_deadline() -> Option<Instant>;
   calibration must call `calibrate_clocks()` first. A literal cycle count
   passed to `sleep_cycles` is a different duration on every CPU.
 - hrtimer-grade precision (≤ 1 µs jitter target on a quiet CPU).
-- Timer wheel (`timer_list`) for bulk coarse-grained kernel timeouts —
-  Stage 5 B, not yet present; every current sleep and timeout is an hrtimer.
+- Timer wheel (`timer_list`, §3.2.2) for coarse kernel timeouts that are
+  usually cancelled before they fire (`msleep`, park backstops).
 
 ### 3.2.1 hrtimers (`narf_time::hrtimer`, Linux `kernel/time/hrtimer.c`)
 
@@ -171,6 +171,25 @@ A sleeper whose waker is a scheduler task waker (`set_hardirq_waker_predicate`)
 is queued on a hard base and woken from the timer interrupt with
 `wake_by_ref`; any other waker uses the `_SOFT` base and is woken from the
 executor.
+
+### 3.2.2 Timer wheel and timer migration (`narf_time::timer`, `narf_time::timer_migration`)
+
+| Linux | NARF |
+| --- | --- |
+| `struct timer_base` × `BASE_LOCAL` / `BASE_GLOBAL` / `BASE_DEF` per CPU | three `TimerBase`s per CPU, allocated on first use (`timers_prepare_cpu`); pinned → LOCAL, deferrable → DEF, else GLOBAL |
+| non-cascading wheel, `LVL_DEPTH` (9 at HZ=1000) × 64 buckets, `calc_wheel_index`, `pending_map` | same geometry and index arithmetic; a timer fires no earlier than its expiry and at most one level granularity later |
+| `struct timer_list`, `timer_setup` | `TimerList::new(fn, flags)` — caller-owned, intrusive bucket links |
+| `mod_timer` / `add_timer_on` / `timer_delete` / `timer_delete_sync` / `timer_pending` | `mod_timer` / `add_timer_on` / `del_timer` / `del_timer_sync` / `is_pending`; an unpinned re-arm moves to the calling CPU unless the callback runs; `forward_timer_base` before indexing |
+| `__run_timers`, `collect_expired_timers`, `__next_timer_interrupt` | same, from `run_timer_softirq` in the executor round (`TIMER_SOFTIRQ`, raised by `timer_tick` from the timer interrupt) |
+| `get_next_timer_interrupt` / `tick_nohz_next_event` | `next_timer_event_ns_local()`, folded into the CPU's next clockevent event (`hrtimer::next_event_cycles_local`, `hrtimer_interrupt`, `retrigger_next_event`); DEF timers count only while the CPU is active |
+| `trigger_dyntick_cpu` | a new first non-deferrable timer on another CPU's base kicks it (`hrtimer::kick_cpu_next_event`) |
+| `timers_dead_cpu` | `timers_dead_cpu(cpu)` from CPU offline |
+| `schedule_timeout` / `msleep` | `TimeoutHandle` (`process_timeout` wakes by reference); `narf_time::msleep` |
+| tmigr (`tmigr_cpu_deactivate` / `activate`, migrator, `tmigr_handle_remote`, `timer_expire_remote`) | one group (NARF's CPU count fits one): a CPU entering tickless idle sets its idle bit; while any CPU is active an idle CPU's GLOBAL timers are left out of its next event and expired by an active CPU's timer softirq; the last CPU to go idle covers every idle CPU's GLOBAL timers; LOCAL timers always wake their own CPU |
+
+Users: the console byte-waker park backstop and `msleep`. Callbacks run in
+executor context with no base lock held; `del_timer_sync` must not be
+called from the timer's own callback.
 
 ### 3.3 Clocksource / Clockevent abstractions (for arch backends)
 
