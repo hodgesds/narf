@@ -182,6 +182,65 @@ pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64)) {
     *SHARED_FRAME_HOOKS.lock() = Some((retain, release));
 }
 
+/// Dirty tracking for the frames of `SHARED | EXTERNAL_REFS` regions (the
+/// generic file page cache above this crate), as Linux tracks a shared file
+/// folio through its write-notify fault (`do_wp_page` → `page_mkwrite` /
+/// `folio_mark_dirty`).
+///
+/// * `write_enabled(phys)` — may a PTE for `phys` in a writable shared
+///   region carry the write bit now? The owner answers "yes" only for a
+///   frame it has recorded as dirty; every other such PTE is installed
+///   read-only, so the first store to it faults.
+/// * `write_notify(phys)` — a store hit a read-only PTE for `phys` in a
+///   writable shared region. The owner records the frame dirty and returns
+///   `true`; the fault path then re-installs the PTE, now writable. `false`
+///   (not the owner's frame) leaves the fault to its usual outcome.
+///
+/// Both are called with this address space's region lock held: they must
+/// not call back into the memory crate. Uninstalled, every such PTE stays
+/// writable as before.
+static SHARED_PAGE_WRITE_ENABLED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static SHARED_PAGE_WRITE_NOTIFY: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the dirty-tracking hooks for `SHARED | EXTERNAL_REFS` frames.
+pub fn install_shared_page_write_hooks(
+    write_enabled: fn(u64) -> bool,
+    write_notify: fn(u64) -> bool,
+) {
+    use core::sync::atomic::Ordering;
+    SHARED_PAGE_WRITE_ENABLED.store(write_enabled as usize, Ordering::Release);
+    SHARED_PAGE_WRITE_NOTIFY.store(write_notify as usize, Ordering::Release);
+}
+
+fn shared_page_write_enabled(phys: PhysAddr) -> bool {
+    let raw = SHARED_PAGE_WRITE_ENABLED.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 || phys.raw() == 0 {
+        return true;
+    }
+    // SAFETY: only `install_shared_page_write_hooks` stores here, a
+    // `fn(u64) -> bool`.
+    let hook: fn(u64) -> bool = unsafe { core::mem::transmute(raw) };
+    hook(phys.raw())
+}
+
+fn shared_page_write_notify(phys: PhysAddr) -> bool {
+    let raw = SHARED_PAGE_WRITE_NOTIFY.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 || phys.raw() == 0 {
+        return false;
+    }
+    // SAFETY: only `install_shared_page_write_hooks` stores here, a
+    // `fn(u64) -> bool`.
+    let hook: fn(u64) -> bool = unsafe { core::mem::transmute(raw) };
+    hook(phys.raw())
+}
+
+#[inline]
+fn is_external_shared(perms: RegionPerms) -> bool {
+    perms.contains(RegionPerms::SHARED) && perms.contains(RegionPerms::EXTERNAL_REFS)
+}
+
 /// Install the callback which retires ownership metadata kept above the
 /// memory crate when an address space reaches its last reference.
 pub fn install_address_space_drop_hook(hook: AddressSpaceDropHook) {
@@ -699,6 +758,9 @@ fn user_page_writable(perms: RegionPerms, phys: PhysAddr) -> bool {
 fn user_page_writable_at_count(perms: RegionPerms, phys: PhysAddr, cow_count: u32) -> bool {
     perms.contains(RegionPerms::WRITE)
         && (!perms.contains(RegionPerms::COW) || phys.raw() == 0 || cow_count <= 1)
+        // A shared file-cache page is writable only once its owner has
+        // recorded it dirty (see `install_shared_page_write_hooks`).
+        && (!is_external_shared(perms) || shared_page_write_enabled(phys))
 }
 
 /// A contiguous user virtual mapping with block-indexed physical backing.
@@ -13749,6 +13811,26 @@ impl AddressSpace {
 
             let mut regions = self.regions.lock();
             let region = regions.containing(v).ok_or(AddressSpaceError::Unmapped)?;
+            // Write-notify: a store to a clean shared file-cache page, which
+            // is mapped read-only until its owner records it dirty. Nothing
+            // is copied — the page is the file's — and the trap path's
+            // `remap_page` then installs the PTE writable.
+            if !force && is_external_shared(region.perms) {
+                if !region.perms.contains(RegionPerms::WRITE) {
+                    return Err(AddressSpaceError::Unmapped);
+                }
+                let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+                let phys = region
+                    .phys
+                    .get(page_idx)
+                    .map(|phys| phys.raw())
+                    .unwrap_or(0);
+                return if shared_page_write_notify(PhysAddr::new(phys)) {
+                    Ok(())
+                } else {
+                    Err(AddressSpaceError::Unmapped)
+                };
+            }
             // A present write fault is recoverable only when fork explicitly
             // made this logically-writable private mapping COW. In particular,
             // mprotect(PROT_READ) must fall through to SIGSEGV.
@@ -14736,6 +14818,54 @@ impl AddressSpace {
         result
     }
 
+    /// Re-install the PTE for `vaddr` from the region's current state, but
+    /// only while it still maps `expected` in a `SHARED | EXTERNAL_REFS`
+    /// region. Returns whether it did.
+    ///
+    /// The owner of such frames calls it after changing its answer to
+    /// `write_enabled` (see `install_shared_page_write_hooks`): to
+    /// write-protect a page before writing it back (Linux `folio_mkclean`)
+    /// every mapper's PTE is re-installed read-only, and the TLB entries of
+    /// every CPU that may hold one are invalidated before this returns
+    /// (`remap_page`: `flush_region_broadcast` on x86_64, the broadcast
+    /// `TLBI` of `unmap_4kb` on aarch64). A store after that faults and is
+    /// recorded.
+    ///
+    /// # Safety
+    /// As [`Self::remap_page`]; `self.root` is this address space's live
+    /// root. The region lock taken here re-resolves the page, so a region
+    /// unmapped or replaced concurrently is either skipped or re-installed
+    /// with its own current frame and permissions.
+    pub unsafe fn refresh_shared_page(
+        &self,
+        vaddr: VirtAddr,
+        expected: PhysAddr,
+    ) -> Result<bool, AddressSpaceError> {
+        let v = vaddr.as_u64() & !0xFFF;
+        {
+            let regions = self.regions.lock();
+            let Some(region) = regions.containing(v) else {
+                return Ok(false);
+            };
+            if !is_external_shared(region.perms) {
+                return Ok(false);
+            }
+            let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+            let current = region
+                .phys
+                .get(page_idx)
+                .map(|phys| phys.raw())
+                .unwrap_or(0);
+            if current == 0 || current != expected.raw() {
+                return Ok(false);
+            }
+        }
+        // SAFETY: forwarded caller contract; `remap_page` re-resolves the
+        // page under the region lock and installs exactly what the region
+        // now says for it.
+        unsafe { self.remap_page(VirtAddr::new(v)) }.map(|()| true)
+    }
+
     /// aarch64 sibling of the x86_64 `remap_page`. Same contract:
     /// look up the region containing `vaddr`, install a fresh PTE
     /// for that 4 KiB page reflecting the region's current
@@ -14819,9 +14949,11 @@ impl AddressSpace {
             // Genuinely read-only mapping — not writable, not recoverable.
             return false;
         }
-        if region.perms.contains(RegionPerms::COW) {
+        if region.perms.contains(RegionPerms::COW) || is_external_shared(region.perms) {
             // Writable-but-COW: resolve the private copy and rewrite the leaf so
             // the upcoming supervisor write lands on a private, writable page.
+            // A clean shared file-cache page is read-only until its owner
+            // records it dirty: the same call takes its write-notify path.
             // SAFETY: forwarded to the callees' documented contract.
             if unsafe { self.cow_split_on_write(vaddr) }.is_err() {
                 return false;
