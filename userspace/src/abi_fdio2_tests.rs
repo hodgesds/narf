@@ -962,7 +962,7 @@ fn smoke_io_mux_empty_reads_are_not_eof() -> TestResult {
     }
 
     // ---- timerfd: never armed, so no expirations ----
-    let tfd = TimerFd::new();
+    let tfd = TimerFd::new(narf_scheduler::narf_time::hrtimer::ClockId::Monotonic);
     if !tfd.nonblock_read_eagain() {
         return TestResult::Fail("timerfd does not opt into EAGAIN-on-empty");
     }

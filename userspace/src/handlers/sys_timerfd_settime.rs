@@ -116,7 +116,8 @@ pub(crate) fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     let value_total = (value_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(value_ns as u64);
-    let now = narf_scheduler::narf_time::monotonic_ns();
+    // Absolute values are in the fd's clock (`TFD_TIMER_ABSTIME`).
+    let now = tfd.now();
     let next_fire = if value_total == 0 {
         0
     } else if (flags & TFD_TIMER_ABSTIME) != 0 {
