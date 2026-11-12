@@ -2425,36 +2425,28 @@ kernel_test_in!(
     smoke_page_removed_while_mapped_is_kept_and_put_back
 );
 
-/// A file-cache mapping that takes a frame no owner knows (memory's last
-/// owner, the cache, declines it): reported, read-only until a store to it
-/// has been seen, then writable; its holds are counted out.
-fn smoke_unindexed_frame_is_read_only_until_stored() -> TestResult {
+/// A `SHARED | EXTERNAL_REFS` frame no cache page names belongs to its
+/// mapping's own owner (a device aperture, XDP UMEM, a direct provider —
+/// the soak's first run reported four such frames): the cache neither
+/// claims it, reports it, nor changes its writability.
+fn smoke_other_owners_frames_are_left_alone() -> TestResult {
     let Ok(frame) = narf_memory::alloc_frame() else {
         return TestResult::Fail("no frame");
     };
     let phys = frame.start_address().raw();
     let reports = super::super::GHOST_REPORTS.load(Ordering::Relaxed);
     let result = (|| {
-        if !super::super::retain_external_unclaimed(phys) {
-            return Err("an unindexed frame was not taken in");
-        }
-        if super::super::GHOST_REPORTS.load(Ordering::Relaxed) == reports {
-            return Err("an unindexed frame was not reported");
-        }
-        if super::super::shared_page_write_enabled(phys) {
-            return Err("an unindexed frame was writable before any store");
-        }
-        if !super::super::shared_page_write_fault(phys) {
-            return Err("a store to an unindexed frame was refused");
+        if super::super::retain_external_unclaimed(phys) {
+            return Err("the cache claimed another owner's frame");
         }
         if !super::super::shared_page_write_enabled(phys) {
-            return Err("an unindexed frame stayed read-only after its store");
-        }
-        if !super::super::release_external_unclaimed(phys) {
-            return Err("the hold on an unindexed frame was not counted out");
+            return Err("another owner's frame was made read-only");
         }
         if super::super::release_external_unclaimed(phys) {
-            return Err("an unindexed frame outlived its last hold");
+            return Err("the cache released another owner's frame");
+        }
+        if super::super::GHOST_REPORTS.load(Ordering::Relaxed) != reports {
+            return Err("another owner's frame was reported");
         }
         Ok(())
     })();
@@ -2466,7 +2458,7 @@ fn smoke_unindexed_frame_is_read_only_until_stored() -> TestResult {
 }
 kernel_test_in!(
     "userspace/writeback",
-    smoke_unindexed_frame_is_read_only_until_stored
+    smoke_other_owners_frames_are_left_alone
 );
 
 /// A file's clean pages are its content after its entry is collected too:
