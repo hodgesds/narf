@@ -1056,6 +1056,17 @@ impl Modeset {
     pub fn new(data: ModesetData) -> Self {
         Self(alloc::sync::Arc::new(data))
     }
+    /// Built in place on the heap: a `ModesetData` built first and then
+    /// moved in passes 7.5 KiB through the caller's frame.
+    #[inline(always)]
+    pub fn new_with(data: impl FnOnce() -> ModesetData) -> Self {
+        let mut m = alloc::sync::Arc::<ModesetData>::new_uninit();
+        alloc::sync::Arc::get_mut(&mut m)
+            .expect("a new Arc is unique")
+            .write(data());
+        // SAFETY: initialized by the write above.
+        Self(unsafe { m.assume_init() })
+    }
 }
 
 impl core::ops::Deref for Modeset {
@@ -3496,9 +3507,14 @@ impl ColdBoot {
             .await?;
         // SAFETY: the caller's obligations.
         let mut lit = unsafe {
-            self.light(pipe, crtc, extra, selection, plans[0], &mut |_, y, row| {
-                fill(y, row)
-            })
+            self.light(
+                pipe,
+                crtc,
+                extra,
+                &selection,
+                &plans[0],
+                &mut |_, y, row| fill(y, row),
+            )
         }
         .await?;
         lit.modes = self.offered_modes(
@@ -3600,9 +3616,11 @@ impl ColdBoot {
         self.sst_outputs.clear();
         let mut started = Vec::with_capacity(mst.len());
         for route in mst {
-            started.push(self.start_mst_route(route).await?);
+            started.push(crate::out_of_line::boxed!(self.start_mst_route(route)).await?);
         }
-        let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
+        let ports = crate::out_of_line::boxed!(self.scan_display())
+            .await
+            .map_err(ModesetError::Boot)?;
         let paths = self
             .display_paths()
             .map_err(|_| ModesetError::NoSink)?
@@ -3661,7 +3679,7 @@ impl ColdBoot {
         // Scan from the first stream's OTG master (any pool pipe when none).
         let first = head_pipes(current, &crtcs).first().copied().unwrap_or(0);
         self.select_display(first)?;
-        let soc = self.prepare_configuration(&selections).await?;
+        let soc = crate::out_of_line::boxed!(self.prepare_configuration(&selections)).await?;
         self.update_sst_outputs(Some(&soc), &paths, &board, &[]);
         if selections.is_empty() {
             for plan in &mst_plans {
@@ -3683,8 +3701,7 @@ impl ColdBoot {
             .collect::<Result<_, ModesetError>>()?;
         let (pipes, extra): (Vec<u8>, Vec<DisplayPipes>) =
             light_pipes(current, &streams)?.into_iter().unzip();
-        self.prepare_pipes(&selections, &plans, &pipes, &extra)
-            .await?;
+        crate::out_of_line::boxed!(self.prepare_pipes(&selections, &plans, &pipes, &extra)).await?;
         let mut lit = Vec::with_capacity(selections.len());
         let mut failed = None;
         for ((((selection, plan), &pipe), &crtc), &extra) in selections
@@ -3695,8 +3712,13 @@ impl ColdBoot {
             .zip(&extra)
         {
             // SAFETY: the caller's obligations; every earlier display is lit
-            // in its own slot and left to it by each step.
-            match unsafe { self.light(pipe, crtc, extra, *selection, *plan, &mut fill) }.await {
+            // in its own slot and left to it by each step. Boxed: lighting's
+            // state is tens of KiB, inline it sat in this frame.
+            match crate::out_of_line::boxed!(unsafe {
+                self.light(pipe, crtc, extra, selection, plan, &mut fill)
+            })
+            .await
+            {
                 Ok(m) => lit.push(m),
                 Err(e) if lit.is_empty() => return Err(e),
                 Err(e) => {
@@ -3836,15 +3858,19 @@ impl ColdBoot {
         pipe: u8,
         crtc: u8,
         pipes: DisplayPipes,
-        selection: Selection,
-        plan: dml::Plan,
+        selection: &Selection,
+        plan: &dml::Plan,
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
     ) -> Result<Modeset, ModesetError> {
         self.select_display(pipe)?;
         self.teardowns
-            .begin_activation(pipe, pipes.odm, &selection, pipes.encoders)?;
+            .begin_activation(pipe, pipes.odm, selection, pipes.encoders)?;
         // SAFETY: the caller owns this unpublished activation and every writer.
-        match unsafe { self.light_inner(pipe, crtc, pipes, selection, plan, fill) }.await {
+        match crate::out_of_line::boxed!(unsafe {
+            self.light_inner(pipe, crtc, pipes, selection, plan, fill)
+        })
+        .await
+        {
             Ok(m) => {
                 // No await between native completion and retained ownership.
                 // A later pipe or platform adoption can suspend or be dropped.
@@ -3857,12 +3883,15 @@ impl ColdBoot {
                 // SAFETY: no Modeset was returned or CPU scanout published.
                 // Native guards validate each checkpoint; cleanup failure
                 // retains the journal and memory. Preserve the original error.
-                let _ = unsafe { self.abort_modeset_activation(pipe) }.await;
+                let _ = crate::out_of_line::boxed!(unsafe { self.abort_modeset_activation(pipe) })
+                    .await;
                 Err(e)
             }
         }
     }
     /// The activation body, covered by light's retained in-flight marker.
+    /// The selection (1.5 KiB) and plan (2.6 KiB) are borrowed: by value,
+    /// each level of the lighting copied them through its frame.
     /// # Safety
     /// As for light.
     async unsafe fn light_inner(
@@ -3870,12 +3899,12 @@ impl ColdBoot {
         pipe: u8,
         crtc: u8,
         pipes: DisplayPipes,
-        selection: Selection,
-        plan: dml::Plan,
+        selection: &Selection,
+        plan: &dml::Plan,
         fill: &mut impl FnMut(u8, u32, &mut [u32]),
     ) -> Result<Modeset, ModesetError> {
         let odm = pipes.odm;
-        let (primary, overlays) = plane_requests(&selection, pipe, &pipes);
+        let (primary, overlays) = plane_requests(selection, pipe, &pipes);
         let (width, height) = (primary.width, primary.height);
         // Each overlay's pipe(s), bottom first.
         let stack: Vec<otg::SurfaceRequest> = overlays.iter().flatten().copied().collect();
@@ -3884,18 +3913,18 @@ impl ColdBoot {
         // retained owner below; every step validates its own preconditions.
         unsafe {
             // The CRTC's color, for its head pipe's scanout start.
-            self.set_display_color(pipe, crtc_color(crtc)).await?;
-            self.retire_display_planes().await?;
-            self.set_display_hubp_power(pipe, true).await?;
+            crate::out_of_line::boxed!(self.set_display_color(pipe, crtc_color(crtc))).await?;
+            crate::out_of_line::boxed!(self.retire_display_planes()).await?;
+            crate::out_of_line::boxed!(self.set_display_hubp_power(pipe, true)).await?;
             for q in odm.into_iter().chain(pipes.mpc) {
-                self.set_display_hubp_power(q, true).await?;
+                crate::out_of_line::boxed!(self.set_display_hubp_power(q, true)).await?;
             }
             for o in &stack {
                 for p in core::iter::once(o.pipe).chain(o.odm).chain(o.mpc) {
-                    self.set_display_hubp_power(p, true).await?;
+                    crate::out_of_line::boxed!(self.set_display_hubp_power(p, true)).await?;
                 }
             }
-            self.prepare_display_surface(primary).await?;
+            crate::out_of_line::boxed!(self.prepare_display_surface(primary)).await?;
             // `fill` draws XRGB8888 rows; any other format keeps the cleared
             // surface, which is black in each of them.
             if selection.format == otg::SurfaceFormat::Xrgb8888 {
@@ -3908,32 +3937,36 @@ impl ColdBoot {
             // Each overlay's surface starts cleared: transparent in its
             // alpha formats, black in the others, until DRM presents.
             for &o in &stack {
-                self.prepare_display_surface(o).await?;
+                crate::out_of_line::boxed!(self.prepare_display_surface(o)).await?;
             }
             // Every plane's apertures before any plane's DPP: a memory
             // restage keeps only the planes staged on the same context.
-            self.prepare_display_memory(pipe).await?;
+            crate::out_of_line::boxed!(self.prepare_display_memory(pipe)).await?;
             for &o in &overlay_pipes {
-                self.prepare_display_memory(o).await?;
+                crate::out_of_line::boxed!(self.prepare_display_memory(o)).await?;
             }
-            self.prepare_display_timing(otg::Request {
+            crate::out_of_line::boxed!(self.prepare_display_timing(otg::Request {
                 odm,
-                ..timing_request(pipe, &plan, &selection)
-            })
+                ..timing_request(pipe, plan, selection)
+            }))
             .await?;
-            self.prepare_display_blank(selection.blank_request(pipe))
+            crate::out_of_line::boxed!(self.prepare_display_blank(selection.blank_request(pipe)))
                 .await?;
-            self.prepare_display_dpp(pipe).await?;
+            crate::out_of_line::boxed!(self.prepare_display_dpp(pipe)).await?;
             for &o in &overlay_pipes {
-                self.prepare_display_dpp(o).await?;
+                crate::out_of_line::boxed!(self.prepare_display_dpp(o)).await?;
             }
             self.prepare_display_mpc(pipe)?;
             for &o in &overlay_pipes {
                 self.prepare_display_mpc(o)?;
             }
-            self.prepare_display_requestor_planes(pipe, &overlay_pipes, &plan)
-                .await?;
-            self.prepare_display_deadlines(pipe, &plan).await?;
+            crate::out_of_line::boxed!(self.prepare_display_requestor_planes(
+                pipe,
+                &overlay_pipes,
+                plan,
+            ))
+            .await?;
+            crate::out_of_line::boxed!(self.prepare_display_deadlines(pipe, plan)).await?;
             match self.enable_display_hpd(selection.port) {
                 // A board without an HPD selector still lights; monitoring
                 // then reports Unsupported.
@@ -3942,16 +3975,24 @@ impl ColdBoot {
             }
             // The output the encoders were acquired on (its link settings were
             // decided before acquisition, as dp_decide_link_settings).
-            let output = self.stream_output(&selection)?;
-            let (selection, scanout) = self.start_link(selection, pipe, pipes.encoders).await?;
-            Ok(Modeset::new(ModesetData {
-                selection,
+            let output = self.stream_output(selection)?;
+            // The linked selection and scanout (4 KiB) come back boxed:
+            // returned by value they sat in this frame twice, as the poll's
+            // output and as the moved result.
+            let linked = crate::out_of_line::boxed!(async {
+                self.start_link(*selection, pipe, pipes.encoders)
+                    .await
+                    .map(alloc::boxed::Box::new)
+            })
+            .await?;
+            Ok(Modeset::new_with(|| ModesetData {
+                selection: linked.0,
                 pipe,
                 crtc,
                 output,
                 encoders: pipes.encoders,
-                plan,
-                scanout,
+                plan: *plan,
+                scanout: linked.1,
                 modes: [None; MAX_MODES],
             }))
         }
@@ -4555,7 +4596,9 @@ impl ColdBoot {
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn retrain_modeset(&mut self, m: &mut Modeset) -> Result<(), ModesetError> {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
-        self.pin_display_uclk().await?;
+        // Each step is out of line: inline, they gave the display monitor's
+        // retrain an 18 KiB frame.
+        crate::out_of_line::boxed!(self.pin_display_uclk()).await?;
         self.teardowns.check_idle()?;
         // The display's records are its head pipe's.
         self.select_display(m.pipe)?;
@@ -4572,22 +4615,30 @@ impl ColdBoot {
         // SAFETY: as documented above; each step checks its predecessor state.
         let stopped = unsafe {
             if m.selection.audio.is_some() {
-                self.stop_display_audio(port, false).await?;
+                crate::out_of_line::boxed!(self.stop_display_audio(port, false)).await?;
             }
-            self.stop_display_scanout(m.pipe).await?;
+            crate::out_of_line::boxed!(self.stop_display_scanout(m.pipe)).await?;
             if m.selection.uhbr() {
-                self.stop_uhbr(port, false).await?;
+                crate::out_of_line::boxed!(self.stop_uhbr(port, false)).await?;
             } else {
-                self.stop_display_dp_video(port).await?;
-                self.stop_display_dp_frontend(port).await?;
-                self.stop_display_dp_link(port).await?;
+                crate::out_of_line::boxed!(self.stop_display_dp_video(port)).await?;
+                crate::out_of_line::boxed!(self.stop_display_dp_frontend(port)).await?;
+                crate::out_of_line::boxed!(self.stop_display_dp_link(port)).await?;
             }
             self.display_timing_status()?.state
         };
         // SAFETY: as above.
-        match unsafe { self.start_link(m.selection, m.pipe, m.encoders) }.await {
-            Ok((selection, scanout)) => {
-                (m.selection, m.scanout) = (selection, scanout);
+        // The result comes back boxed (as in light_inner).
+        match crate::out_of_line::boxed!(async {
+            unsafe { self.start_link(m.selection, m.pipe, m.encoders) }
+                .await
+                .map(alloc::boxed::Box::new)
+        })
+        .await
+        {
+            Ok(linked) => {
+                m.selection = linked.0;
+                m.scanout = linked.1;
                 self.teardowns.finish_retrain(m.pipe, None);
                 self.retain_retrained_modeset(m, &soc);
                 Ok(())
@@ -4609,6 +4660,8 @@ impl ColdBoot {
             }
         }
     }
+    /// Out of line: the offered-mode table it builds is kilobytes.
+    #[inline(never)]
     fn retain_retrained_modeset(&mut self, m: &mut Modeset, soc: &dml::Soc) {
         // Preserve the actual completion before doing any further work.
         self.modesets.retain(m.clone());
@@ -5173,7 +5226,7 @@ impl ColdBoot {
         mst: &[MstRoute<'_>],
     ) -> Result<Result<Configuration, BesideRefusal>, ModesetError> {
         // dcn401_prepare_bandwidth: pinned before any configuration change.
-        self.pin_display_uclk().await?;
+        crate::out_of_line::boxed!(self.pin_display_uclk()).await?;
         self.teardowns.check_idle()?;
         let mut running: Vec<Modeset> = self.display_modesets().into_iter().flatten().collect();
         if running.is_empty() {
@@ -5217,13 +5270,15 @@ impl ColdBoot {
                 crtcs: &unlit,
                 ..*route
             };
-            if self.start_mst_route_beside(&unlit_route).await? {
+            if crate::out_of_line::boxed!(self.start_mst_route_beside(&unlit_route)).await? {
                 started.push(MstRoute { ..*route });
             }
         }
         let mst = &started[..];
         self.select_display(idle)?;
-        let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
+        let ports = crate::out_of_line::boxed!(self.scan_display())
+            .await
+            .map_err(ModesetError::Boot)?;
         let paths = self
             .display_paths()
             .map_err(|_| ModesetError::NoSink)?
@@ -5384,14 +5439,17 @@ impl ColdBoot {
         };
         let (new_pipes, extra): (Vec<u8>, Vec<DisplayPipes>) = acquired.into_iter().unzip();
         // SAFETY: the caller's obligations; the running displays stay lit.
-        unsafe { self.transition_running(&mut running, &running_plans, request) }.await?;
+        crate::out_of_line::boxed!(unsafe {
+            self.transition_running(&mut running, &running_plans, request)
+        })
+        .await?;
         let mut lit = Vec::with_capacity(new.len());
         let mut failed = None;
         for (((&(selection, crtc), &pipe), plan), d) in
             new.iter().zip(&new_pipes).zip(&new_plans).zip(&extra)
         {
             self.select_display(pipe)?;
-            let clocks = async {
+            let clocks = crate::out_of_line::boxed!(async {
                 self.prepare_display_pipe_clocks_beside(pipe_clock_request(pipe, plan, &selection))
                     .await
                     .map_err(ModesetError::PipeClocks)?;
@@ -5436,11 +5494,17 @@ impl ColdBoot {
                     }
                 }
                 Ok::<(), ModesetError>(())
-            }
+            })
             .await;
             let result = match clocks {
                 // SAFETY: the caller's obligations; earlier displays stay lit.
-                Ok(()) => unsafe { self.light(pipe, crtc, *d, selection, *plan, &mut fill) }.await,
+                // Boxed: lighting's state is tens of KiB.
+                Ok(()) => {
+                    crate::out_of_line::boxed!(unsafe {
+                        self.light(pipe, crtc, *d, &selection, plan, &mut fill)
+                    })
+                    .await
+                }
                 Err(e) => Err(e),
             };
             match result {
@@ -5461,7 +5525,10 @@ impl ColdBoot {
             targets.extend(running_dpp_targets(m, &m.plan));
         }
         // SAFETY: as above.
-        unsafe { self.optimize_running(&mut running, request, &targets) }.await?;
+        crate::out_of_line::boxed!(unsafe {
+            self.optimize_running(&mut running, request, &targets)
+        })
+        .await?;
         let mut displays = running;
         displays.extend(lit);
         displays.sort_by_key(|m| m.crtc);

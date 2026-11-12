@@ -247,7 +247,7 @@ pub fn status() -> Status {
                 sdma_interrupts: boot.sdma_interrupts(),
                 display_clocks: boot.display_clock_status(),
                 display_pipe_clocks: boot.display_pipe_clock_status(),
-                display_timing: boot.display_timing_status(),
+                display_timing: boot.display_timing_status().copied(),
                 power: crate::amdgpu_navi48_power::snapshot(),
             })
         }),
@@ -4966,7 +4966,7 @@ pub fn present_damaged(
     // A frame of a commit that also changed the planes waits for the
     // display monitor's seamless update (`kick_presenters` drains it).
     if shown && !planes_pending(display) && !slot.presenting.swap(true, Ordering::AcqRel) {
-        narf_scheduler::spawn(presenter(display));
+        spawn_presenter(display);
     }
     true
 }
@@ -4982,9 +4982,16 @@ fn kick_presenters() {
     for display in 0..PRESENT.len() as u8 {
         let slot = present_slot(display);
         if slot.next.lock().is_some() && !slot.presenting.swap(true, Ordering::AcqRel) {
-            narf_scheduler::spawn(presenter(display));
+            spawn_presenter(display);
         }
     }
+}
+
+/// Out of line and boxed: spawning the presenter's 13 KiB future by value
+/// put it on the frame of every caller (the DRM flip path among them).
+#[inline(never)]
+fn spawn_presenter(display: u8) {
+    narf_scheduler::spawn(alloc::boxed::Box::pin(presenter(display)));
 }
 
 async fn presenter(display: u8) {
@@ -6109,8 +6116,10 @@ async fn stream_updater() {
         {
             let mut owner = OWNER.lock().await;
             if let Some(boot) = owner.as_mut() {
-                converge_streams(boot).await;
-                converge_vrr(boot).await;
+                // Boxed: inline, both converges' state sat in this task's
+                // frame (24 KiB) on every DRM color or VRR request.
+                crate::out_of_line::boxed!(converge_streams(boot)).await;
+                crate::out_of_line::boxed!(converge_vrr(boot)).await;
             }
         }
         STREAM_UPDATER.store(false, Ordering::Release);
@@ -6307,12 +6316,14 @@ async fn converge_vrr(boot: &mut boot::ColdBoot) {
     let wants = vrr_wants();
     for m in boot.display_modesets().into_iter().flatten() {
         let k = usize::from(m.crtc);
-        let Ok(Some(status)) = boot.display_status(m.pipe) else {
-            continue;
+        // Only the DRR and FreeSync records are kept across the awaits below,
+        // not the 14 KiB status they are read from.
+        let (drr, freesync) = match boot.display_status(m.pipe) {
+            Ok(Some(s)) if s.state == crate::amdgpu_dcn401_otg::State::ScanoutRunning(m.pipe) => {
+                (s.drr, s.freesync)
+            }
+            _ => continue,
         };
-        if status.state != crate::amdgpu_dcn401_otg::State::ScanoutRunning(m.pipe) {
-            continue;
-        }
         let want = wanted_drr(&m, wants[k]);
         let packet = m
             .selection
@@ -6326,22 +6337,27 @@ async fn converge_vrr(boot: &mut boot::ColdBoot) {
                     want.is_some(),
                 )
             });
-        let unchanged = status.drr.map(|a| a.drr) == want
-            && status.freesync.filter(|p| p.complete).map(|p| p.packet) == packet;
+        let unchanged = drr.map(|a| a.drr) == want
+            && freesync.filter(|p| p.complete).map(|p| p.packet) == packet;
         // A timing/packet change invalidates the currently scheduled FAMS2
         // configuration, including a transition back to fixed refresh.
-        if !unchanged && boot.pin_display_uclk().await.is_err() {
+        if !unchanged
+            && crate::out_of_line::boxed!(boot.pin_display_uclk())
+                .await
+                .is_err()
+        {
             continue;
         }
         // SAFETY: OWNER is held; the platform excludes timing/stream writers.
         let result = if unchanged {
-            Ok(status.drr)
+            Ok(drr)
         } else if let Some(packet) = packet {
             // SAFETY: OWNER serializes this display's timing and stream writers.
-            unsafe { boot.set_display_freesync(m.pipe, want, packet) }.await
+            crate::out_of_line::boxed!(unsafe { boot.set_display_freesync(m.pipe, want, packet) })
+                .await
         } else {
             // SAFETY: OWNER serializes this display's timing writers.
-            unsafe { boot.set_display_drr(m.pipe, want) }.await
+            crate::out_of_line::boxed!(unsafe { boot.set_display_drr(m.pipe, want) }).await
         };
         if let Err(e) = result {
             let _ = core::fmt::Write::write_fmt(
@@ -6357,8 +6373,12 @@ async fn converge_vrr(boot: &mut boot::ColdBoot) {
                 .and_then(|range| {
                     crate::amdgpu_freesync::LfcConfig::new(&m.selection.timing, range)
                 });
-            let current_lfc = status.drr.and_then(|a| a.lfc()).map(|lfc| lfc.config);
-            if current_lfc != config && boot.pin_display_uclk().await.is_err() {
+            let current_lfc = drr.and_then(|a| a.lfc()).map(|lfc| lfc.config);
+            if current_lfc != config
+                && crate::out_of_line::boxed!(boot.pin_display_uclk())
+                    .await
+                    .is_err()
+            {
                 continue;
             }
             // SAFETY: OWNER is held. Unchanged policy needs no register write.
@@ -6366,7 +6386,7 @@ async fn converge_vrr(boot: &mut boot::ColdBoot) {
                 Ok(())
             } else {
                 // SAFETY: OWNER is held and the changed policy pinned UCLK above.
-                unsafe { boot.set_display_lfc(m.pipe, config) }.await
+                crate::out_of_line::boxed!(unsafe { boot.set_display_lfc(m.pipe, config) }).await
             };
             match lfc_result {
                 Ok(()) if config.is_some() => kick_lfc_service(),
@@ -6925,8 +6945,9 @@ fn admits_with_format(
 pub fn restore_displays() {
     release_drm_cursors();
     // drm_fb_helper's restore commit takes every plane off the closed
-    // clients' framebuffers (their pins go after it latches).
-    narf_scheduler::spawn(async {
+    // clients' framebuffers (their pins go after it latches). Boxed: the
+    // task's future is 12 KiB, which spawning by value put on this frame.
+    narf_scheduler::spawn(alloc::boxed::Box::pin(async {
         let mut owner = OWNER.lock().await;
         if PRESENT_GATED.load(Ordering::Acquire) {
             return;
@@ -6935,7 +6956,7 @@ pub fn restore_displays() {
             // SAFETY: OWNER serializes display writers.
             let _ = unsafe { release_client_scanout(boot) }.await;
         }
-    });
+    }));
     let mut outputs = OUTPUTS.lock();
     for c in outputs.crtcs.iter_mut() {
         c.active = true;
@@ -7105,6 +7126,10 @@ async unsafe fn retire_suspend_displays(boot: &mut boot::ColdBoot) -> Result<(),
 /// off or whose sink left, retrain lost links, and relight the whole
 /// configuration when a sink appears (or a CRTC returns) or a running
 /// display's requested mode or output range changed.
+///
+/// Each step is boxed where it is awaited: inline, lighting alone (40 KiB of
+/// state) and the poll code inlined with it gave this task a 26 KiB frame on
+/// a 64 KiB stack.
 /// # Safety
 /// As for `modeset_displays`.
 pub async unsafe fn monitor_displays(
@@ -7156,7 +7181,7 @@ pub async unsafe fn monitor_displays(
             }
             // SAFETY: this activation never published a CPU scanout; OWNER
             // and the caller's exclusions retain every native resource.
-            unsafe { boot.abort_modeset_activation(pipe) }.await?;
+            crate::out_of_line::boxed!(unsafe { boot.abort_modeset_activation(pipe) }).await?;
             // Its CRTC (whichever acquired the pipe) is a new attempt.
             displays.considered &= displays
                 .lit
@@ -7252,7 +7277,7 @@ pub async unsafe fn monitor_displays(
         // appear now (dm_helpers_dp_mst_start_top_mgr), the root's own
         // connector carrying no sink, as a lighting would start it.
         // SAFETY: as above; no stream runs on the port.
-        if unsafe { start_plugged_mst(boot, port) }.await? {
+        if crate::out_of_line::boxed!(unsafe { start_plugged_mst(boot, port) }).await? {
             let mut ports = OUTPUTS.lock().mst_ports();
             ports.push(port);
             ports.sort_unstable();
@@ -7282,7 +7307,7 @@ pub async unsafe fn monitor_displays(
                 })
             };
             let before = shown(boot);
-            match boot.service_display_mst(port).await {
+            match crate::out_of_line::boxed!(boot.service_display_mst(port)).await {
                 Ok(boot::MstService::Kept) => {}
                 // A failed up-request poll, resource query or probe is
                 // logged, as Linux's MST handlers log it; the streams run
@@ -7325,7 +7350,10 @@ pub async unsafe fn monitor_displays(
         if unplugged || lost || !wants[usize::from(k)].0 || pending.is_some() {
             // Finish a recorded teardown even when DRM has since requested on.
             // SAFETY: OWNER and the caller's exclusions cover the whole resume.
-            unsafe { retire_monitored_display(boot, displays, k, unplugged) }.await?;
+            crate::out_of_line::boxed!(unsafe {
+                retire_monitored_display(boot, displays, k, unplugged)
+            })
+            .await?;
             if m.selection.mst.is_some() && !left_ports.contains(&m.selection.port) {
                 left_ports.push(m.selection.port);
             }
@@ -7360,7 +7388,7 @@ pub async unsafe fn monitor_displays(
             continue;
         }
         // SAFETY: serialized retained owners; writers stay excluded.
-        match unsafe { boot.check_modeset(&m) }.await? {
+        match crate::out_of_line::boxed!(unsafe { boot.check_modeset(&m) }).await? {
             Health::Running(_) => {}
             Health::FrlRetrain => {
                 // Full retirement quiesces writers/fetch before SCDC cleanup
@@ -7378,7 +7406,9 @@ pub async unsafe fn monitor_displays(
                 // the retrain land in it and show once scanout resumes.
                 let mut m = m;
                 // SAFETY: as above.
-                if let Err(e) = unsafe { boot.retrain_modeset(&mut m) }.await {
+                if let Err(e) =
+                    crate::out_of_line::boxed!(unsafe { boot.retrain_modeset(&mut m) }).await
+                {
                     // A refused retrain whose link stopped again is ordinary
                     // teardown from timing on: retire it (writers, planes,
                     // surfaces) and light again, against the verified link.
@@ -7393,7 +7423,10 @@ pub async unsafe fn monitor_displays(
                         format_args!("amdgpu: navi48 display {k} retrain failed: {e:?}\n"),
                     );
                     // SAFETY: as above; the journal resumes after the link.
-                    unsafe { retire_monitored_display(boot, displays, k, false) }.await?;
+                    crate::out_of_line::boxed!(unsafe {
+                        retire_monitored_display(boot, displays, k, false)
+                    })
+                    .await?;
                     steps.push(MonitorStep::Disabled(k));
                     relight = true;
                     continue;
@@ -7415,7 +7448,10 @@ pub async unsafe fn monitor_displays(
             }
             Health::Unplugged => {
                 // SAFETY: as above; the helper records intent before withdrawing.
-                unsafe { retire_monitored_display(boot, displays, k, true) }.await?;
+                crate::out_of_line::boxed!(unsafe {
+                    retire_monitored_display(boot, displays, k, true)
+                })
+                .await?;
                 steps.push(MonitorStep::Unplugged(k));
             }
         }
@@ -7423,7 +7459,7 @@ pub async unsafe fn monitor_displays(
     // With the departed devices' streams retired, adopt their ports' trees
     // beside the streams still running; anything else relights.
     for &port in &lost_ports {
-        match boot.service_display_mst(port).await {
+        match crate::out_of_line::boxed!(boot.service_display_mst(port)).await {
             Ok(boot::MstService::Kept) => {}
             Ok(_) => relight = true,
             Err(e) => log_mst_service(port, e),
@@ -7440,7 +7476,11 @@ pub async unsafe fn monitor_displays(
     for k in (0..count).filter(|&k| plane_updates & 1 << k != 0) {
         let (format, setup) = (wants[usize::from(k)].2, wants[usize::from(k)].3);
         // SAFETY: as above; the display stays lit and published.
-        if unsafe { update_lit_planes(boot, displays, k, format, setup) }.await? {
+        if crate::out_of_line::boxed!(unsafe {
+            update_lit_planes(boot, displays, k, format, setup)
+        })
+        .await?
+        {
             steps.push(MonitorStep::PlanesUpdated(k));
         } else {
             relight = true;
@@ -7459,9 +7499,12 @@ pub async unsafe fn monitor_displays(
         for &port in &left_ports {
             match boot.mst_affected_streams(port, &[], &|_| None) {
                 // SAFETY: as above.
-                Some(affected) => unsafe {
-                    modeset_affected(boot, displays, affected, &mut steps).await?
-                },
+                Some(affected) => {
+                    crate::out_of_line::boxed!(unsafe {
+                        modeset_affected(boot, displays, affected, &mut steps)
+                    })
+                    .await?
+                }
                 None => relight = true,
             }
         }
@@ -7482,7 +7525,7 @@ pub async unsafe fn monitor_displays(
         // its surviving stream must retire and acquire that new topology.
         // Keeping its old joint plan would also prevent P-state convergence.
         // SAFETY: as above; the running displays stay lit and published.
-        match unsafe { boot.replan_displays() }.await {
+        match crate::out_of_line::boxed!(unsafe { boot.replan_displays() }).await {
             Ok(running) => {
                 let mut outputs = OUTPUTS.lock();
                 for m in &running {
@@ -7518,7 +7561,10 @@ pub async unsafe fn monitor_displays(
         let beside = if !relight && lit_mask != 0 {
             let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
             // SAFETY: as above; the running displays stay lit and published.
-            let mut beside = unsafe { light_beside(boot, &displays.lit, fill, reprobe) }.await?;
+            let mut beside = crate::out_of_line::boxed!(unsafe {
+                light_beside(boot, &displays.lit, fill, reprobe)
+            })
+            .await?;
             // Refused because the new streams' DSC fairness search changes
             // running MST streams: Linux modesets just those (torn down
             // here) and lights them with the new streams beside the rest.
@@ -7530,10 +7576,16 @@ pub async unsafe fn monitor_displays(
             };
             if let Some(affected) = affected.filter(|&a| a != 0) {
                 // SAFETY: as above.
-                unsafe { modeset_affected(boot, displays, affected, &mut steps) }.await?;
+                crate::out_of_line::boxed!(unsafe {
+                    modeset_affected(boot, displays, affected, &mut steps)
+                })
+                .await?;
                 if displays.lit.iter().any(Option::is_some) {
                     // SAFETY: as above.
-                    beside = unsafe { light_beside(boot, &displays.lit, fill, reprobe) }.await?;
+                    beside = crate::out_of_line::boxed!(unsafe {
+                        light_beside(boot, &displays.lit, fill, reprobe)
+                    })
+                    .await?;
                 }
             }
             beside.ok()
@@ -7569,11 +7621,16 @@ pub async unsafe fn monitor_displays(
             };
             let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
             // SAFETY: the caller's exclusions and OWNER cover withdrawal/retirement.
-            unsafe { retire_monitored_display(boot, displays, k, unplugged) }.await?;
+            crate::out_of_line::boxed!(unsafe {
+                retire_monitored_display(boot, displays, k, unplugged)
+            })
+            .await?;
         }
         let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
         // SAFETY: as above; every display is stopped.
-        let lit = match unsafe { light_displays(boot, fill, &current) }.await {
+        let lit = match crate::out_of_line::boxed!(unsafe { light_displays(boot, fill, &current) })
+            .await
+        {
             Err(e @ (ModesetError::NoSink | ModesetError::Link | ModesetError::LinkReduced))
                 if !pending_display_work(boot) =>
             {
@@ -7602,7 +7659,10 @@ pub async unsafe fn monitor_displays(
                     c.planes = boot::PlaneSetup::NONE;
                 }
                 // SAFETY: as above.
-                Some(unsafe { light_displays(boot, fill, &current) }.await?)
+                Some(
+                    crate::out_of_line::boxed!(unsafe { light_displays(boot, fill, &current) })
+                        .await?,
+                )
             }
             Err(e) => return Err(e),
             Ok(config) => Some(config),
@@ -7642,10 +7702,10 @@ pub async unsafe fn monitor_displays(
         publish_outputs();
     }
     // Apply refresh limits while pinned, then plan the resulting live timing.
-    converge_vrr(boot).await;
+    crate::out_of_line::boxed!(converge_vrr(boot)).await;
     // UCLK P-state switching for the configuration now running.
     // SAFETY: the caller's obligations; OWNER is held.
-    match unsafe { boot.converge_uclk_pstate(drr_wanted(boot)) }.await {
+    match crate::out_of_line::boxed!(unsafe { boot.converge_uclk_pstate(drr_wanted(boot)) }).await {
         Ok(moved) => {
             for m in moved {
                 let crtc = usize::from(m.crtc);
@@ -7660,7 +7720,7 @@ pub async unsafe fn monitor_displays(
         }
     }
     // Nor do CRTC color and HDR metadata changes.
-    converge_streams(boot).await;
+    crate::out_of_line::boxed!(converge_streams(boot)).await;
     // Client framebuffers a relight, plane update or stop let go of.
     retire_all_scanout_pins(boot);
     // Frames that waited for this pass's relight in a new plane format.
@@ -7668,7 +7728,7 @@ pub async unsafe fn monitor_displays(
     // DRM cursors on the pipes this pass lit (amdgpu_dm commits the cursor
     // after the planes).
     // SAFETY: the caller's obligations; OWNER is held.
-    unsafe { converge_drm_cursors(boot) }.await;
+    crate::out_of_line::boxed!(unsafe { converge_drm_cursors(boot) }).await;
     Ok(steps)
 }
 
@@ -7758,7 +7818,7 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
                 }
             }
             // SAFETY: the spawner's obligations hold for the task's lifetime.
-            match unsafe { monitor_displays(&mut displays) }.await {
+            match crate::out_of_line::boxed!(unsafe { monitor_displays(&mut displays) }).await {
                 Ok(steps) => {
                     // Plane updates follow DRM commits, possibly every
                     // frame: not worth a console line each.
