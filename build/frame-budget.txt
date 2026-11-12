@@ -112,6 +112,7 @@
 13624 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
 13560 narf_drivers_wireless::ath10k::interface::publish_with_mac
 13528 narf_drivers_wireless::iwlwifi::probe
+13240 narf_drivers_gpu::amdgpu_navi48_boot::mst::topology::reconcile
 13144 narf_drivers_wireless::ath11k::iface::register_pci_netdev
 13080 narf_drivers_wireless::iwlwifi::ap_session::Session::prepare_native::{{closure}}
 12424 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::draw_inputs
@@ -121,12 +122,12 @@
 11976 narf_drivers_wireless::ath11k::iface::register_pci
 11912 narf_drivers_wireless::ath10k::interface::ap::<impl narf_drivers_wireless::ath10k::interface::Device<T>>::ap_control::{{closure}}
 11640 narf_drivers_wireless::iwlwifi::connection::Connection::associate_links_in_domain::{{closure}}
-11544 <core::pin::Pin<P> as core::future::future::Future>::poll
+11624 <core::pin::Pin<P> as core::future::future::Future>::poll
 11256 alloc::sync::Arc<T,A>::new_cyclic_in
 11032 narf_drivers_gpu::amdgpu_dcn401_otg::dp_phy::training::frontend::video::<impl narf_drivers_gpu::amdgpu_dcn401_otg::Engine<I>>::dp_audio_verify_transport
 10952 <narf_drivers_wireless::rtl8xxxu::interface::Device<C,B,E> as narf_wireless::WirelessNetIface>::associate::{{closure}}
 10952 narf_drivers_gpu::intel_gpu_xelpg_resources::compute_ip_vblank
-10904 narf_drivers_gpu::amdgpu_navi48_platform::converge_streams::{{closure}}
+10792 narf_drivers_gpu::amdgpu_navi48_platform::converge_streams::{{closure}}
 10776 narf_drivers_wireless::rtl8xxxu::service_runtime::Service<C,B,E>::connect::{{closure}}
 10680 narf_drivers_gpu::intel_gpu_gt_runtime::Owner::cold_start
 10568 narf_drivers_wireless::ath10k::wmi_runtime::data::<impl narf_drivers_wireless::ath10k::wmi_runtime::Radio<T>>::start_data_with_nonce_checked::{{closure}}
