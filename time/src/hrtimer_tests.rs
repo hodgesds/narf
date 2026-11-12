@@ -275,3 +275,53 @@ fn smoke_hrtimer_offline_moves_timers() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time/hrtimer", smoke_hrtimer_offline_moves_timers);
+
+/// `clock_was_set`: stepping the wall clock forward past a pending
+/// CLOCK_REALTIME timer's expiry makes it due at once (its base offset moved),
+/// while a MONOTONIC timer with the same distance stays pending.
+fn smoke_hrtimer_clock_was_set_moves_realtime_timers() -> TestResult {
+    let rt = Box::new(Counted {
+        timer: HrTimer::new(counted_fn, ClockId::Realtime, HrtimerMode::ABS_HARD),
+        fired: AtomicUsize::new(0),
+        order: AtomicU64::new(0),
+        restarts: AtomicUsize::new(0),
+        interval: 0,
+    });
+    let mono = counted(HrtimerMode::ABS_HARD);
+    const AHEAD: u64 = 10_000_000_000;
+    let saved = crate::wall_offset_ns();
+    // SAFETY: the Boxes stay put; cancelled below.
+    unsafe {
+        hrtimer_start_range_ns(
+            &rt.timer,
+            hrtimer::clock_now(ClockId::Realtime) + AHEAD,
+            0,
+            HrtimerMode::ABS,
+        );
+        hrtimer_start_range_ns(
+            &mono.timer,
+            crate::monotonic_ns() + AHEAD,
+            0,
+            HrtimerMode::ABS,
+        );
+    }
+    // Step the wall clock 20 s forward (settimeofday): this calls
+    // `clock_was_set`.
+    crate::set_wall_offset_uncapped(saved.saturating_add(2 * AHEAD as i64));
+    let fired = expire_until(|| rt.fired.load(Ordering::Acquire) == 1);
+    let mono_pending = mono.timer.is_queued() && mono.fired.load(Ordering::Acquire) == 0;
+    crate::set_wall_offset_uncapped(saved);
+    hrtimer_cancel(&rt.timer);
+    hrtimer_cancel(&mono.timer);
+    if !fired {
+        return TestResult::Fail("a wall-clock step past a REALTIME timer did not expire it");
+    }
+    if !mono_pending {
+        return TestResult::Fail("a wall-clock step moved a MONOTONIC timer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "time/hrtimer",
+    smoke_hrtimer_clock_was_set_moves_realtime_timers
+);
