@@ -42,7 +42,16 @@ fn sync_fd(ctx: &mut dyn TrapContext, data_only: bool) {
         ctx.set_return(errno_ret(copy_fs_errno(error)));
         return;
     }
-    match poll_blocking(ops.fsync(data_only)) {
+    // A fatal signal ends the wait for the commit; the commit itself
+    // finishes without this task (`killable_wait::fsync`).
+    let outcome = match crate::killable_wait::fsync(&ops, data_only) {
+        Ok(outcome) => outcome,
+        Err(crate::killable_wait::Killed) => {
+            ctx.set_return(errno_ret(EINTR));
+            return;
+        }
+    };
+    match outcome {
         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
         // `fs/sync.c::vfs_fsync_range` opens with
         // `if (!file->f_op->fsync) return -EINVAL;`, so a descriptor whose

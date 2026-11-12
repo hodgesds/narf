@@ -18,7 +18,16 @@ pub(crate) fn sys_syncfs(ctx: &mut dyn TrapContext) {
     // Both run; the filesystem's own failure is reported first, then a
     // mapped page that could not be written (Linux ≥ 5.8 `syncfs` returns
     // `sb->s_wb_err`, which writeback of those pages sets).
-    match (poll_blocking(ops.syncfs()), mapped) {
+    // A fatal signal ends the wait; the commit finishes without this task
+    // (`killable_wait::syncfs`).
+    let committed = match crate::killable_wait::syncfs(&ops) {
+        Ok(outcome) => outcome,
+        Err(crate::killable_wait::Killed) => {
+            ctx.set_return(errno_ret(EINTR));
+            return;
+        }
+    };
+    match (committed, mapped) {
         (Some(Ok(())), Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
         (Some(Ok(())), Err(error)) => ctx.set_return(errno_ret(copy_fs_errno(error))),
         _ => ctx.set_return(errno_ret(EIO)),
