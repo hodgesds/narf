@@ -81,9 +81,21 @@ fn probe_cpu_id_reader() -> u8 {
 /// # Safety
 /// Reading TSC_AUX is always defined at CPL=0; the function is safe
 /// to call from any context.
+///
+/// A hosted build (the btrfs host harness: kernel code in a Linux process)
+/// is CPU 0, the BSP. IA32_TSC_AUX there is not NARF's: Linux loads it with
+/// the host CPU the thread happens to run on, and moves the thread between
+/// any two instructions. Kernel code takes a context's CPU id as fixed until
+/// that context yields to the scheduler; reading the host's number broke it
+/// (the btrfs transaction gate keys a caller outside any task by its CPU,
+/// and the harness's one thread lost track of its own join when Linux
+/// migrated it, then waited on itself).
 #[inline]
 pub fn current_cpu() -> u32 {
     use core::sync::atomic::Ordering;
+    if cfg!(not(target_os = "none")) {
+        return 0;
+    }
     let state = match CPU_ID_READER.load(Ordering::Acquire) {
         0 => {
             let reader = probe_cpu_id_reader();
