@@ -948,3 +948,96 @@ kernel_test_in!(
     "drivers/fs/btrfs/race",
     smoke_btrfs_sync_lookup_parks_beside_a_held_io_lock
 );
+
+/// An async mutex handed to a parked waiter on an otherwise idle CPU: the
+/// release that grants it must wake that waiter, which then runs and takes
+/// it promptly. The soak saw the btrfs I/O lock granted to a waiter that
+/// never ran, with 119 tasks queued behind it.
+///
+/// The hand-off is forced the way it happens: the waiter is queued, the
+/// lock is released and taken at once by a newcomer before the woken
+/// waiter runs; the waiter, passed over, goes back to the front, and the
+/// newcomer's release grants it the lock.
+fn handoff_wakes_parked_waiter() -> Result<(), &'static str> {
+    use narf_lib::mutex::Mutex;
+    if narf_lib::smp::cpu_count() < 5 {
+        return Err("skip");
+    }
+    for round in 0..20u32 {
+        let lock: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let got = Arc::new(AtomicU32::new(0));
+        let mut holder = poll_once(lock.lock()).ok_or("the lock was busy")?;
+        {
+            let (lock, got) = (lock.clone(), got.clone());
+            narf_scheduler::spawn_stackful_pinned(
+                async move {
+                    let mut guard = lock.lock().await;
+                    *guard += 1;
+                    got.store(1, Ordering::Release);
+                },
+                4,
+            );
+        }
+        // Wait until the waiter is queued (and parked).
+        let mut spins = 0u64;
+        while lock.held_state().waiters == 0 && spins < 4_000_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        if lock.held_state().waiters == 0 {
+            return Err("the waiter never queued");
+        }
+        // Release and take it straight back, ahead of the woken waiter.
+        drop(holder);
+        holder = match lock.try_lock() {
+            Some(guard) => guard,
+            // The waiter ran first and has it: no hand-off this round.
+            None => {
+                let mut spins = 0u64;
+                while got.load(Ordering::Acquire) == 0 && spins < 4_000_000_000 {
+                    core::hint::spin_loop();
+                    spins += 1;
+                }
+                if got.load(Ordering::Acquire) == 0 {
+                    return Err("a woken waiter never took a free lock");
+                }
+                continue;
+            }
+        };
+        // Let the passed-over waiter re-queue at the front.
+        let mut spins = 0u64;
+        while lock.held_state().waiters == 0 && spins < 4_000_000_000 {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+        drop(holder);
+        // Granted: the waiter must run and claim it within 100 ms.
+        let deadline =
+            narf_time::now_cycles().saturating_add(narf_time::wall::ns_to_cycles(100_000_000));
+        while got.load(Ordering::Acquire) == 0 && narf_time::now_cycles() < deadline {
+            core::hint::spin_loop();
+        }
+        if got.load(Ordering::Acquire) == 0 {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "hand-off round {round}: {:?}",
+                lock.held_state()
+            );
+            return Err("a lock handed to a parked waiter was not claimed within 100 ms");
+        }
+        if lock.held_state().locked {
+            return Err("the waiter's guard did not release the lock");
+        }
+    }
+    Ok(())
+}
+
+fn smoke_btrfs_mutex_handoff_wakes_a_parked_waiter() -> TestResult {
+    result(handoff_wakes_parked_waiter())
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_mutex_handoff_wakes_a_parked_waiter
+);
