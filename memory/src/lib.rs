@@ -41,6 +41,7 @@ mod ioremap_cache;
 #[cfg(feature = "kasan")]
 pub mod kasan;
 pub mod kaslr;
+pub mod kstack;
 #[cfg(target_arch = "x86_64")]
 pub mod kvm_pv;
 pub mod mempolicy;
