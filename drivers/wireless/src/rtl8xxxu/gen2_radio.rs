@@ -946,16 +946,40 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
             }
         }
     }
-    pub(super) fn maintenance_pending(&self, now: u64) -> bool {
-        self.recovery_pending()
-            || !self.bt.is_empty()
-            || self.ra.is_some() && now >= self.next_watchdog
+    pub(super) fn maintenance_pending(&self) -> bool {
+        self.recovery_pending() || !self.bt.is_empty()
     }
-    /// The async half: `rtl8xxxu_ra_iter` every 2 s while associated
-    /// (`ra_watchdog_8192e`/`ra_watchdog_8723b` with `-ewma_rssi_read`) and
-    /// queued `C2H_8723B_BT_INFO` records through `c2h_bt_8723b` with
-    /// `rtl8xxxu_is_assoc`.
-    pub async fn maintain(&mut self, now: u64) -> Result<(), Error> {
+    /// `rtl8xxxu_watchdog_callback` → `rtl8xxxu_ra_iter` while associated:
+    /// `ra_watchdog_8192e`/`ra_watchdog_8723b` with `-ewma_rssi_read`. The
+    /// device's watchdog work calls it every `WATCHDOG_MS`; the period gate
+    /// makes any extra call within a period a no-op. Failure is terminal.
+    pub async fn ra_watchdog(&mut self, now: u64) -> Result<(), Error> {
+        self.current()?;
+        if self.phase() != Phase::Receiving || self.ra.is_none() || now < self.next_watchdog {
+            return Ok(());
+        }
+        let mut attempt = self.attempt();
+        let signal = self.rssi.signal();
+        let result = match (&mut self.ra, &self.grant) {
+            (Some(ra), Grant::Rtl8192e(_)) => self.firmware.ra_watchdog_8192e(ra, signal).await,
+            (Some(ra), Grant::Rtl8723b(_)) => self.firmware.ra_watchdog_8723b(ra, signal).await,
+            (None, _) => Ok(()),
+        };
+        attempt.armed = false;
+        match result {
+            Ok(()) => {
+                self.next_watchdog = now.saturating_add(WATCHDOG_MS);
+                Ok(())
+            }
+            Err(error) => {
+                self.fail_terminal();
+                Err(Error::Control(error))
+            }
+        }
+    }
+    /// The async half of `poll`: recovery and queued `C2H_8723B_BT_INFO`
+    /// records through `c2h_bt_8723b` with `rtl8xxxu_is_assoc`.
+    pub async fn maintain(&mut self) -> Result<(), Error> {
         self.current()?;
         if self.phase() != Phase::Receiving {
             return Err(Error::State);
@@ -965,16 +989,6 @@ impl<C: ControlIo, B: PacketIo> Radio<C, B> {
         }
         let mut attempt = self.attempt();
         let result = async {
-            if let Some(ra) = &mut self.ra {
-                if now >= self.next_watchdog {
-                    let signal = self.rssi.signal();
-                    match self.grant {
-                        Grant::Rtl8192e(_) => self.firmware.ra_watchdog_8192e(ra, signal).await?,
-                        Grant::Rtl8723b(_) => self.firmware.ra_watchdog_8723b(ra, signal).await?,
-                    }
-                    self.next_watchdog = now.saturating_add(WATCHDOG_MS);
-                }
-            }
             let assoc = self.ra.is_some();
             while let Some(record) = self.bt.pop_front() {
                 if let Some(coex) = &mut self.coex {

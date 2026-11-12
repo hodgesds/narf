@@ -328,6 +328,19 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         }
         result
     }
+    /// `rtl8xxxu_watchdog_callback` for this station's radio: the RA
+    /// iteration once per period while associated (a no-op otherwise).
+    /// Failure is terminal, as for `step`.
+    pub async fn watchdog(&mut self, now: u64) -> Result<(), Error> {
+        if !matches!(self.phase(), Phase::FourWay | Phase::Open) {
+            return Ok(());
+        }
+        let result = self.radio.ra_watchdog(now).await.map_err(Error::Radio);
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
     /// Bounded self-driven service (management, RSNA, DATA delivery). The
     /// worker supplies monotonic milliseconds and fresh CSPRNG SNonce bytes.
     pub async fn step(
@@ -352,8 +365,8 @@ impl<C: ControlIo, B: packet_transport::Io> Station<C, B> {
         now: u64,
         nonce: &mut (impl FnMut() -> Option<[u8; 32]> + Send),
     ) -> Result<(), Error> {
-        if self.radio.maintenance_pending(now) {
-            self.radio.maintain(now).await.map_err(Error::Radio)?;
+        if self.radio.maintenance_pending() {
+            self.radio.maintain().await.map_err(Error::Radio)?;
         }
         if let Some(p) = self.edca_pending.take() {
             self.program_edca(p).await?;
