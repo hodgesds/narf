@@ -31,6 +31,8 @@ extern crate alloc;
 
 #[cfg(feature = "user-mode-e2e")]
 mod pipe_abi;
+#[cfg(target_arch = "x86_64")]
+mod timer_strand;
 
 // Force-link crates that contribute tests via the `narf.tests` link
 // section but whose public surface is not otherwise referenced from

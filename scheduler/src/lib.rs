@@ -997,6 +997,14 @@ pub fn enable_user_task_smp() {
     USER_SMP_ENABLED.store(true, Ordering::Release);
 }
 
+/// Test-only: set whether user-task SMP is enabled and return the previous
+/// value. With it on, an idle CPU halts with interrupts enabled (as in a
+/// production boot) instead of spin-polling with them masked.
+#[doc(hidden)]
+pub fn __test_set_user_task_smp(on: bool) -> bool {
+    USER_SMP_ENABLED.swap(on, Ordering::AcqRel)
+}
+
 /// Whether user tasks may run on application processors. Consulted by
 /// [`TaskSpec::user_task`] (initial affinity) and the steal floor.
 #[inline]
@@ -2416,6 +2424,12 @@ pub fn __test_set_cpu_halted(cpu: usize, halted: bool) {
     if cpu < narf_lib::percpu::MAX_CPUS {
         CPU_HALTED[cpu].store(halted, Ordering::SeqCst);
     }
+}
+
+/// Test-only: read a CPU's published halted flag.
+#[doc(hidden)]
+pub fn __test_cpu_halted(cpu: usize) -> bool {
+    cpu < narf_lib::percpu::MAX_CPUS && CPU_HALTED[cpu].load(Ordering::SeqCst)
 }
 
 /// Test-only: read a CPU's published reschedule request (`NEED_RESCHED`).
