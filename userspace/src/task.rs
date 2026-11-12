@@ -680,7 +680,22 @@ pub(crate) fn switch_counts(tid: u64) -> (u64, u64, u64) {
 /// CPU, and prints "running" otherwise.
 #[inline]
 pub(crate) fn parked_in_syscall(tid: u64) -> bool {
-    task_get(tid).is_some_and(|task| task.uctx.parked_in_syscall.load(Ordering::Relaxed))
+    // A zombie is parked in nothing, whatever its exit work last left in the
+    // flag (see `mark_zombie`).
+    task_get(tid).is_some_and(|task| {
+        task.state.load(Ordering::Acquire) != TASK_ZOMBIE
+            && task.uctx.parked_in_syscall.load(Ordering::Relaxed)
+    })
+}
+
+/// The raw number of the syscall `tid` is executing, if it is inside one
+/// (parked or not). A zombie is inside none.
+pub(crate) fn running_syscall(tid: u64) -> Option<u32> {
+    let task = task_get(tid)?;
+    if task.state.load(Ordering::Acquire) == TASK_ZOMBIE {
+        return None;
+    }
+    task.uctx.in_syscall.load(Ordering::Relaxed).checked_sub(1)
 }
 
 #[inline]
@@ -1429,6 +1444,17 @@ pub fn mark_zombie(tid: u64) -> bool {
         Some(t) => {
             #[cfg(feature = "native-ring")]
             t.authority_control.retire();
+            // A task that parked in the syscall it exits from (a killable
+            // wait SIGKILL ended, a fault taken by `exit_group`'s robust-list
+            // walk) never returns through the dispatcher that clears this. A
+            // zombie is parked in nothing: left set, `/proc/<pid>/wchan`,
+            // `syscall` and `stack` kept naming that syscall, decoded from a
+            // kernel stack the task no longer owns, for as long as the zombie
+            // waited to be reaped — dead tasks read as stuck ones.
+            t.uctx.parked_in_syscall.store(false, Ordering::Release);
+            t.uctx.park_site.store(0, Ordering::Relaxed);
+            t.uctx.yield_site.store(0, Ordering::Relaxed);
+            t.uctx.in_syscall.store(0, Ordering::Relaxed);
             t.state.store(TASK_ZOMBIE, Ordering::Release);
             true
         }

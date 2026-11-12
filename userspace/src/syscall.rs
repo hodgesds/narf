@@ -3632,7 +3632,14 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         // what accumulates is execution time and never the sleep in between.
         if let Some(u) = crate::user_task::current_user_task() {
             // SAFETY: in-flight task's poller-pinned UserTaskCtx.
-            crate::handlers::open_kernel_span(unsafe { &*u });
+            let uc = unsafe { &*u };
+            crate::handlers::open_kernel_span(uc);
+            // Only a syscall the task made: the kernel's own dispatches (the
+            // file-op ring bridge) run inside some other syscall's span.
+            if ctx.returning_to_user() {
+                uc.in_syscall
+                    .store(raw_n.wrapping_add(1), core::sync::atomic::Ordering::Relaxed);
+            }
         }
         // `/proc/<pid>/io` accounting. Linux does this at ONE funnel —
         // `vfs_read`/`vfs_write` — so every syscall that reaches the file
@@ -3683,6 +3690,10 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             let uc = unsafe { &*u };
             uc.parked_in_syscall
                 .store(false, core::sync::atomic::Ordering::Release);
+            if ctx.returning_to_user() {
+                uc.in_syscall
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
+            }
             crate::handlers::close_kernel_span(uc, crate::handlers::current_task_id());
         }
     } else {
@@ -4495,7 +4506,30 @@ pub fn kernel_syscall_entry_plain_with_state(
     // by the 2-byte `syscall` width). Such a syscall has not completed, so it
     // must NOT fire an exit-stop — the re-issued syscall will trace again.
     let entry_rip = ctx.rip();
+    // `/proc/<pid>/stack` of a task inside this syscall that is not parked.
+    let in_syscall = if user_state.is_null() {
+        None
+    } else {
+        crate::user_task::current_user_task()
+    };
+    if let Some(u) = in_syscall {
+        // SAFETY: the in-flight task's poller-pinned ctx; atomic store only.
+        unsafe {
+            (*u).in_syscall.store(
+                effective_num.wrapping_add(1),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
     table.dispatch(n, &mut ctx);
+    if let Some(u) = crate::user_task::current_user_task().filter(|_| in_syscall.is_some()) {
+        // SAFETY: as above. Re-read: a park may have moved this continuation
+        // to another CPU, where `current_user_task` is still this task.
+        unsafe {
+            (*u).in_syscall
+                .store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
     // Return-value half of the trace. Without it the log shows what was
     // ASKED but not what was ANSWERED, which is exactly what you need when
     // userspace takes a different branch than it does on Linux (an epoll
