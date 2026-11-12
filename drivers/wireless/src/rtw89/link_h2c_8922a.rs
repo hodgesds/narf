@@ -97,6 +97,7 @@ use super::h2c::{
     H2C_FUNC_MAC_MACID_PAUSE_SLEEP,
 };
 use super::station_8922a::{LegacyStation, MldLink, MldStation, Station, MAX_LINK_ID};
+use alloc::boxed::Box;
 
 /// `enum rtw89_self_role` (`core.h:285`): the station client.
 /// (`SELF_ROLE_AP` / `SELF_ROLE_AP_CLIENT` live in `ap_wire.rs`.)
@@ -490,13 +491,16 @@ pub(super) fn macid_pause_sleep(
 
 /// The MACID pause body: plain (`CMD_MACID_PAUSE`) or SLEEP
 /// (`CMD_MACID_PAUSE_SLEEP`), selected by the firmware
-/// `MACID_PAUSE_SLEEP` feature.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `MACID_PAUSE_SLEEP` feature. The SLEEP body is boxed: at 256
+/// bytes it dwarfs the 32-byte plain body, and a by-value enum
+/// would trip `clippy::large_enum_variant` (and copy 257 bytes
+/// per value). The enum is therefore `Clone` but not `Copy`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MacidPause {
     /// Plain 32-byte body.
     Plain([u8; MACID_PAUSE_LEN]),
     /// SLEEP 256-byte body.
-    Sleep([u8; MACID_PAUSE_SLEEP_LEN]),
+    Sleep(Box<[u8; MACID_PAUSE_SLEEP_LEN]>),
 }
 
 impl MacidPause {
@@ -916,8 +920,9 @@ impl LinkView {
 /// built by admission) the default CMAC table, then the default
 /// DMAC table. Station links send nothing here — every field
 /// is `None` — and the caller must not send the default CMAC
-/// twice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// twice. Not `Copy`: `pause` may hold the boxed 256-byte SLEEP
+/// body (see [`MacidPause`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LinkAdd {
     /// MACID unpause (AP/TDLS only).
     pub(super) pause: Option<MacidPause>,
@@ -954,7 +959,7 @@ pub(super) fn link_add_h2cs(view: &LinkView) -> Result<LinkAdd, Error> {
         });
     }
     let pause = if view.vif.macid_pause_sleep {
-        MacidPause::Sleep(macid_pause_sleep(view.macid, false)?)
+        MacidPause::Sleep(Box::new(macid_pause_sleep(view.macid, false)?))
     } else {
         MacidPause::Plain(super::station_control::codec::pause_at(view.macid, false))
     };
