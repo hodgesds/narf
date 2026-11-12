@@ -390,6 +390,7 @@ fn smoke_nvme_timed_out_buffer_retained_while_device_live() -> TestResult {
         let res = CmdResources {
             prp_list: q.prp_page(),
             hold: Some(Arc::clone(&buffer)),
+            pages: None,
         };
         let id = q.post(tag, sqe, res).ok()?;
         Some(Cmd::new(q, id))

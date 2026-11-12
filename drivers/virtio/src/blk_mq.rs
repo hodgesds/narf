@@ -44,6 +44,9 @@ use crate::queue::{VirtqDesc, Virtqueue, VIRTQ_DESC_F_WRITE};
 pub const SLOT_BYTES: usize = 64;
 /// Descriptors per request chain: header, payload (reads/writes), status.
 const CHAIN_DESCS: u16 = 3;
+/// Most payload segments one chain carries (one descriptor each); bounded
+/// by the queue size at construction.
+pub const MAX_SEGMENTS: u16 = 32;
 /// How long a wait parks before the used ring is looked at regardless of
 /// the vector (lost-interrupt fallback; the only clock on a polled queue).
 pub const POLL_SLICE_MS: u64 = 250;
@@ -76,6 +79,7 @@ struct Slot {
     reported: AtomicBool,
     waker: IrqSafeSpinLock<Option<Waker>>,
     hold: IrqSafeSpinLock<Option<Arc<DmaBuffer>>>,
+    pages: IrqSafeSpinLock<Option<Arc<narf_io::sg::PageList>>>,
 }
 
 impl Slot {
@@ -88,6 +92,7 @@ impl Slot {
             reported: AtomicBool::new(false),
             waker: IrqSafeSpinLock::new(None),
             hold: IrqSafeSpinLock::new(None),
+            pages: IrqSafeSpinLock::new(None),
         }
     }
     fn wake(&self) {
@@ -126,6 +131,7 @@ pub struct BlkQueue {
     tags: IrqSafeSpinLock<TagState>,
     /// Chain head → slot, for requests in flight.
     inflight: IrqSafeSpinLock<BTreeMap<u16, u16>>,
+    max_segs: u16,
     vector: AtomicU8,
     has_vector: AtomicBool,
     in_flight: AtomicUsize,
@@ -183,6 +189,7 @@ impl BlkQueue {
                 waiters: VecDeque::with_capacity(n),
             }),
             inflight: IrqSafeSpinLock::new(BTreeMap::new()),
+            max_segs: MAX_SEGMENTS.min(qsize.saturating_sub(2)).max(1),
             vector: AtomicU8::new(0),
             has_vector: AtomicBool::new(false),
             in_flight: AtomicUsize::new(0),
@@ -285,6 +292,11 @@ impl BlkQueue {
         }
     }
 
+    /// Most payload segments a chain on this queue may carry.
+    pub fn max_segments(&self) -> u16 {
+        self.max_segs
+    }
+
     /// Post a request under `slot`: `payload` (`len` bytes, device-written
     /// for a read) is pinned until the terminal completion. Builds the
     /// header, the 2- or 3-descriptor chain, adds it and kicks.
@@ -296,6 +308,33 @@ impl BlkQueue {
         payload: Option<Arc<DmaBuffer>>,
         len: usize,
     ) -> Result<ReqId, VirtioPciError> {
+        let segs: Vec<(u64, u32)> = match (&payload, op) {
+            (Some(p), BlkOp::Read | BlkOp::Write) => {
+                if len == 0 || len > p.len() {
+                    return Err(VirtioPciError::QueueTooSmall);
+                }
+                alloc::vec![(p.dma_addr().raw(), len as u32)]
+            }
+            _ => Vec::new(),
+        };
+        self.post_segments(slot, op, sector, &segs, payload, None)
+    }
+
+    /// [`Self::post`] over `segs` (device addresses + lengths, one
+    /// descriptor each, at most [`Self::max_segments`]); `hold` / `pages`
+    /// pin whatever backs them until the terminal completion.
+    pub fn post_segments(
+        &self,
+        slot: u16,
+        op: BlkOp,
+        sector: u64,
+        segs: &[(u64, u32)],
+        hold: Option<Arc<DmaBuffer>>,
+        pages: Option<Arc<narf_io::sg::PageList>>,
+    ) -> Result<ReqId, VirtioPciError> {
+        if segs.len() > self.max_segs as usize || (op != BlkOp::Flush && segs.is_empty()) {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
         let s = &self.slots[slot as usize];
         debug_assert_eq!(s.state.load(Ordering::Relaxed), FREE);
         let type_tag = match op {
@@ -316,37 +355,36 @@ impl BlkQueue {
             core::ptr::write_volatile(h.add(8) as *mut u64, sector);
             core::ptr::write_volatile(self.status_ptr(slot), 0xFF);
         }
-        let mut descs = [VirtqDesc {
+        let mut descs: Vec<VirtqDesc> = Vec::with_capacity(segs.len() + 2);
+        descs.push(VirtqDesc {
             addr: header_phys,
             len: 16,
             flags: 0,
             next: 0,
-        }; 3];
-        let mut n = 1;
-        if let (Some(p), true) = (payload.as_ref(), op != BlkOp::Flush) {
-            if len == 0 || len > p.len() {
-                return Err(VirtioPciError::QueueTooSmall);
+        });
+        if op != BlkOp::Flush {
+            for &(addr, len) in segs {
+                descs.push(VirtqDesc {
+                    addr,
+                    len,
+                    flags: if op == BlkOp::Read {
+                        VIRTQ_DESC_F_WRITE
+                    } else {
+                        0
+                    },
+                    next: 0,
+                });
             }
-            descs[n] = VirtqDesc {
-                addr: p.dma_addr().raw(),
-                len: len as u32,
-                flags: if op == BlkOp::Read {
-                    VIRTQ_DESC_F_WRITE
-                } else {
-                    0
-                },
-                next: 0,
-            };
-            n += 1;
         }
-        descs[n] = VirtqDesc {
+        descs.push(VirtqDesc {
             addr: header_phys + 16,
             len: 1,
             flags: VIRTQ_DESC_F_WRITE,
             next: 0,
-        };
-        n += 1;
-        *s.hold.lock() = payload;
+        });
+        let n = descs.len();
+        *s.hold.lock() = hold;
+        *s.pages.lock() = pages;
         s.status.store(0xFF, Ordering::Relaxed);
         s.reported.store(false, Ordering::Relaxed);
         let deadline = narf_time::monotonic_ns().saturating_add(STALL_REPORT_MS * 1_000_000);
@@ -571,9 +609,11 @@ impl BlkQueue {
     fn reap(&self, slot: u16) {
         let s = &self.slots[slot as usize];
         let hold = s.hold.lock().take();
+        let pages = s.pages.lock().take();
         let old = s.waker.lock().take();
         drop(old);
         drop(hold);
+        drop(pages);
         s.deadline_ns.store(u64::MAX, Ordering::Relaxed);
         s.state.store(FREE, Ordering::Release);
         self.free_slot(slot);
@@ -771,6 +811,7 @@ pub fn submit_async(
         sector,
         payload,
         len,
+        segs: None,
         req: None,
     }
 }
@@ -782,7 +823,28 @@ pub struct Submit {
     sector: u64,
     payload: Option<Arc<DmaBuffer>>,
     len: usize,
+    /// Scatter-gather form: the segments and the page list that backs them.
+    segs: Option<(Vec<(u64, u32)>, Arc<narf_io::sg::PageList>)>,
     req: Option<Req>,
+}
+
+/// [`submit_async`] over the segments of `pages`.
+pub fn submit_async_segments(
+    q: Arc<BlkQueue>,
+    op: BlkOp,
+    sector: u64,
+    segs: Vec<(u64, u32)>,
+    pages: Arc<narf_io::sg::PageList>,
+) -> Submit {
+    Submit {
+        q,
+        op,
+        sector,
+        payload: None,
+        len: 0,
+        segs: Some((segs, pages)),
+        req: None,
+    }
 }
 
 impl core::fmt::Debug for Submit {
@@ -801,10 +863,16 @@ impl Future for Submit {
             let Some(slot) = this.q.try_alloc_slot(Some(cx.waker())) else {
                 return Poll::Pending;
             };
-            let id = match this
-                .q
-                .post(slot, this.op, this.sector, this.payload.take(), this.len)
-            {
+            let posted = match this.segs.take() {
+                Some((segs, pages)) => {
+                    this.q
+                        .post_segments(slot, this.op, this.sector, &segs, None, Some(pages))
+                }
+                None => this
+                    .q
+                    .post(slot, this.op, this.sector, this.payload.take(), this.len),
+            };
+            let id = match posted {
                 Ok(id) => id,
                 Err(e) => return Poll::Ready(Err(e)),
             };
@@ -856,7 +924,7 @@ impl narf_block::BlockQueue for VirtioBlkQueue {
         narf_block::QueueLimits {
             logical_block_size: 512,
             max_transfer_bytes: crate::blk_pci::MAX_IO_SECTORS as u32 * 512,
-            max_segments: 1,
+            max_segments: self.q.max_segments() as u32,
             max_segment_bytes: crate::blk_pci::MAX_IO_SECTORS as u32 * 512,
             dma_alignment: 1,
             queue_depth: self.q.slot_count() as u32,
@@ -937,5 +1005,49 @@ impl narf_block::BlockQueue for VirtioBlkQueue {
 
     fn in_flight(&self) -> usize {
         self.q.in_flight()
+    }
+
+    /// One conforming scatter-gather request: a descriptor per segment.
+    fn submit_sg(&self, req: narf_block::SgRequest) -> narf_block::BoxedCompletion {
+        use narf_block::{BlockError, BlockOp};
+        let user_tag = req.user_tag;
+        let op = match req.op {
+            BlockOp::Read => BlkOp::Read,
+            BlockOp::Write { .. } => BlkOp::Write,
+            BlockOp::Trim | BlockOp::WriteZeroes => {
+                return narf_block::queue::ready_completion(user_tag, Err(BlockError::IOError));
+            }
+        };
+        let Some(list) = req.resolve() else {
+            return narf_block::queue::ready_completion(
+                user_tag,
+                Err(BlockError::PermissionDenied),
+            );
+        };
+        let Some(segs) = req.segments(&list, 512) else {
+            return narf_block::queue::ready_completion(user_tag, Err(BlockError::InvalidRange));
+        };
+        let segs: Vec<(u64, u32)> = segs.iter().map(|s| (s.dma, s.len)).collect();
+        let fua = matches!(req.op, BlockOp::Write { fua: true });
+        let q = Arc::clone(&self.q);
+        let flush_after = fua && self.flush_supported;
+        let lba = req.lba;
+        Box::pin(async move {
+            let mut result = submit_async_segments(Arc::clone(&q), op, lba, segs, list)
+                .await
+                .map_err(|_| BlockError::IOError)
+                .and_then(map_status);
+            if result.is_ok() && flush_after {
+                result = submit_async(q, BlkOp::Flush, 0, None, 0)
+                    .await
+                    .map_err(|_| BlockError::IOError)
+                    .and_then(map_status);
+            }
+            narf_block::BlockCompletion {
+                tag: lba,
+                user_tag,
+                result,
+            }
+        })
     }
 }

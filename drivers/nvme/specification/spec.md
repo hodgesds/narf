@@ -89,6 +89,12 @@ multipath / fabrics (defer).
   replay, controller found dead or mid-reset at submission). Requests
   longer than MDTS are issued as a sequence of commands. Flush is queued
   too; Dataset Management / Write Zeroes stay gate-held (no data moves).
+  Scatter-gather (`narf_block::SgRequest` over a `Cap<PageList, Read>`,
+  `req::NvmeQueue::submit_sg`): the block layer splits to this queue's
+  `QueueLimits` (MDTS, 513 pages per command, dword alignment) and the
+  driver builds PRP1 + a per-command PRP-list page straight from the
+  list's segments (`req::build_rw_sqe_segments`); the list is pinned in
+  the command's slot until the terminal completion like a buffer.
   `BlockCompletion::tag` encodes `(instance, qid, cid, generation)`;
   `cancel(tag)` issues an NVMe Abort (admin opcode 0x08,
   `Controller::abort_command`) and reports `Cancelled` exactly when the

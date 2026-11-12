@@ -38,6 +38,20 @@ fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) }
 }
 
+/// One pass of the bridge primitives' pump — sleep pumps and the timer
+/// softirq — as any polled waiter gets between checks.
+fn pump_once() {
+    let mut first = true;
+    narf_scheduler::responsive_spin_until(
+        move || {
+            let f = first;
+            first = false;
+            !f
+        },
+        narf_time::Deadline::after_ms(5),
+    );
+}
+
 fn fill(buf: &DmaBuffer, seed: u8) {
     // SAFETY: a live coherent buffer, exclusively ours.
     unsafe {
@@ -70,7 +84,7 @@ fn drive_all(
             return false;
         }
         futs.retain_mut(|f| f.as_mut().poll(&mut cx).is_pending());
-        narf_time::timer::run_timer_softirq();
+        pump_once();
         core::hint::spin_loop();
     }
     true
@@ -251,4 +265,103 @@ fn smoke_vblk_mq_dropped_request_releases_on_completion_qemu() -> TestResult {
 kernel_test_in!(
     "drivers/virtio/blk-pci/mq",
     smoke_vblk_mq_dropped_request_releases_on_completion_qemu
+);
+
+fn smoke_vblk_mq_scatter_gather_split_qemu() -> TestResult {
+    // A scatter-gather write over more pages than one chain may carry is
+    // split by the block layer into chains of at most `max_segments`
+    // descriptors; the read back (split the same way) returns the data.
+    use narf_block::{BlockOp, SgRequest};
+    let Some(sync) = vblk() else {
+        return TestResult::Skip("no virtio-blk device");
+    };
+    let Some(queue) = sync.queue().cloned() else {
+        return TestResult::Fail("vblk0 exposes no queue");
+    };
+    let limits = queue.limits();
+    // 64 KiB disk: 8 pages at sector 32 fit; with the segment limit forced
+    // below that by the splitter's view (max_segments may exceed 8), use a
+    // tightened limit copy through the splitter directly.
+    let pages = 8usize;
+    let bytes = pages * 4096;
+    let blocks = (bytes / 512) as u32;
+    let tight = narf_block::QueueLimits {
+        max_segments: 3,
+        ..limits
+    };
+    let mk = |n: usize| -> Option<(Vec<DmaBuffer>, narf_io::sg::PageList)> {
+        let mut keep = Vec::new();
+        let mut frames = Vec::new();
+        for _ in 0..n {
+            let b = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+            frames.push(narf_memory::PhysAddr::new(b.dma_addr().raw()));
+            keep.push(b);
+        }
+        let list = narf_io::sg::PageList::new(frames, n * 4096, DomainId::DRIVER_0).ok()?;
+        Some((keep, list))
+    };
+    let (Some((wkeep, wlist)), Some((rkeep, rlist))) = (mk(pages), mk(pages)) else {
+        return TestResult::Fail("page allocation failed");
+    };
+    for (i, b) in wkeep.iter().enumerate() {
+        fill(b, 0x11 + i as u8);
+    }
+    let wcap = narf_io::register_pages_with_cap(wlist);
+    let rcap = narf_io::register_pages_with_cap(rlist);
+    let (Ok(wr), Ok(rr)) = (
+        wcap.derive::<narf_capabilities::Read>(),
+        rcap.derive::<narf_capabilities::Read>(),
+    ) else {
+        return TestResult::Fail("derive failed");
+    };
+    // SAFETY: APIC initialised; the queue's MSI lands in our IDT vector.
+    unsafe { narf_arch::enable_interrupts() };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut drive = |mut f: narf_block::BoxedCompletion| -> Option<narf_block::BlockCompletion> {
+        let deadline = narf_time::Deadline::after_ms(10_000);
+        loop {
+            if let Poll::Ready(c) = f.as_mut().poll(&mut cx) {
+                return Some(c);
+            }
+            if deadline.expired() {
+                return None;
+            }
+            pump_once();
+            core::hint::spin_loop();
+        }
+    };
+    let submit_one = |child: SgRequest| queue.submit_sg(child);
+    let w = narf_block::split_to_limits(
+        SgRequest::new(BlockOp::Write { fua: false }, 32, blocks, wr, 1),
+        &tight,
+        &submit_one,
+    );
+    let w = drive(w);
+    let r = narf_block::split_to_limits(
+        SgRequest::new(BlockOp::Read, 32, blocks, rr, 2),
+        &tight,
+        &submit_one,
+    );
+    let r = drive(r);
+    // SAFETY: counterpart to the enable above.
+    unsafe { narf_arch::disable_interrupts() };
+    if !matches!(w, Some(ref c) if c.result.is_ok()) {
+        return TestResult::Fail("split SG write failed or hung");
+    }
+    if !matches!(r, Some(ref c) if c.result.is_ok()) {
+        return TestResult::Fail("split SG read failed or hung");
+    }
+    for (i, b) in rkeep.iter().enumerate() {
+        if !check(b, 0x11 + i as u8) {
+            return TestResult::Fail("split SG read-back mismatch");
+        }
+    }
+    narf_io::unregister_pages(wcap);
+    narf_io::unregister_pages(rcap);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/blk-pci/mq",
+    smoke_vblk_mq_scatter_gather_split_qemu
 );

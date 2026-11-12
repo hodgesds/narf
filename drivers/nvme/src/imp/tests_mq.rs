@@ -37,6 +37,20 @@ fn counting_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) }
 }
 
+/// One pass of the bridge primitives' pump — sleep pumps and the timer
+/// softirq — as any polled waiter gets between checks.
+fn pump_once() {
+    let mut first = true;
+    narf_scheduler::responsive_spin_until(
+        move || {
+            let f = first;
+            first = false;
+            !f
+        },
+        narf_time::Deadline::after_ms(5),
+    );
+}
+
 fn read_sqe(prp1: u64) -> Sqe {
     let mut sqe = Sqe::zero();
     sqe.cdw0 = IoOpcode::Read as u32;
@@ -76,6 +90,7 @@ fn smoke_nvme_mq_dropped_future_releases_only_on_completion() -> TestResult {
     let res = CmdResources {
         prp_list: Some(prp),
         hold: Some(Arc::clone(&payload)),
+        pages: None,
     };
     let Ok(id) = q.post(tag, read_sqe(payload.dma_addr().raw()), res) else {
         return TestResult::Fail("post failed");
@@ -133,6 +148,7 @@ fn smoke_nvme_mq_teardown_resets_inflight_and_refuses_posts() -> TestResult {
         let res = CmdResources {
             prp_list: None,
             hold: hold.then(|| Arc::clone(&payload)),
+            pages: None,
         };
         let id = q.post(tag, read_sqe(payload.dma_addr().raw()), res).ok()?;
         Some(Cmd::new(Arc::clone(&q), id))
@@ -240,12 +256,13 @@ fn smoke_nvme_mq_timeout_timer_marks_expired_commands() -> TestResult {
         return TestResult::Fail("a fresh command reads as timed out");
     }
     let wakes0 = WAKES.load(Ordering::Acquire);
-    // Run this CPU's timer wheel until the timer has fired (bounded).
-    let give_up = narf_time::Deadline::after_ms(2_000);
-    while q.timed_out(id) != Some(true) && !give_up.expired() {
-        narf_time::timer::run_timer_softirq();
-        core::hint::spin_loop();
-    }
+    // Wait as a polled driver path would (the bridge's pump expires the
+    // timer wheel) until the queue timer has marked the command.
+    let q2 = Arc::clone(&q);
+    narf_scheduler::responsive_spin_until(
+        move || q2.timed_out(id) == Some(true),
+        narf_time::Deadline::after_ms(2_000),
+    );
     if q.timed_out(id) != Some(true) {
         return TestResult::Fail("the queue timer never marked the command");
     }
@@ -338,10 +355,41 @@ fn drive_all(
             return false;
         }
         futs.retain_mut(|f| f.as_mut().poll(&mut cx).is_pending());
-        narf_time::timer::run_timer_softirq();
+        // The bridge primitives' pump (timer wheel included), as any
+        // polled waiter gets it.
+        pump_once();
         core::hint::spin_loop();
     }
     true
+}
+
+/// The bytes of `nvme0n<nsid>` at `lba`, saved so a writing smoke can put
+/// them back: the kernel-test disk is the btrfs image xtask verifies with
+/// `btrfs check` after the run.
+struct SavedRange {
+    nsid: u32,
+    lba: u64,
+    blocks: u16,
+    bytes: Vec<u8>,
+}
+
+impl SavedRange {
+    fn save(nsid: u32, lba: u64, blocks: u16, lba_bytes: usize) -> Option<Self> {
+        let dev = super::NvmeNamespaceBlock::new(0, nsid);
+        let mut bytes = alloc::vec![0u8; blocks as usize * lba_bytes];
+        dev.read(lba, blocks, &mut bytes).ok()?;
+        Some(Self {
+            nsid,
+            lba,
+            blocks,
+            bytes,
+        })
+    }
+    fn restore(&self) -> bool {
+        super::NvmeNamespaceBlock::new(0, self.nsid)
+            .write(self.lba, self.blocks, &self.bytes)
+            .is_ok()
+    }
 }
 
 /// Peak commands in flight observed by any task of the concurrent smokes.
@@ -504,6 +552,10 @@ fn smoke_nvme_mq_concurrent_integrity_qemu() -> TestResult {
     if limits.nr_queues == 0 || limits.queue_depth < limits.nr_queues {
         return TestResult::Fail("queue limits do not describe the queue set");
     }
+    let Some(saved) = SavedRange::save(nsid, 8192, (N as u32 * BLOCKS) as u16, lba_bytes as usize)
+    else {
+        return TestResult::Fail("saving the scratch window failed");
+    };
     // SAFETY: APIC initialised; the queues' MSIs land in our IDT vectors.
     unsafe { narf_arch::enable_interrupts() };
     FAILURES.store(0, Ordering::Release);
@@ -566,6 +618,9 @@ fn smoke_nvme_mq_concurrent_integrity_qemu() -> TestResult {
     let drove = drive_all(futs, narf_time::Deadline::after_ms(30_000));
     // SAFETY: counterpart to the enable above.
     unsafe { narf_arch::disable_interrupts() };
+    if !saved.restore() {
+        return TestResult::Fail("restoring the scratch window failed");
+    }
     if !drove {
         return TestResult::Fail("concurrent writers/readers did not all complete in 30 s");
     }
@@ -583,3 +638,165 @@ fn smoke_nvme_mq_concurrent_integrity_qemu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme/mq", smoke_nvme_mq_concurrent_integrity_qemu);
+
+// ── Scatter-gather over the queue ─────────────────────────────────
+
+/// `n` separately allocated order-0 frames as a page list of `len` bytes.
+fn sg_pages(n: usize, len: usize) -> Option<(Vec<DmaBuffer>, narf_io::sg::PageList)> {
+    let mut keep = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..n {
+        let b = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+        frames.push(narf_memory::PhysAddr::new(b.dma_addr().raw()));
+        keep.push(b);
+    }
+    let list = narf_io::sg::PageList::new(frames, len, DomainId::DRIVER_0).ok()?;
+    Some((keep, list))
+}
+
+fn smoke_nvme_mq_scatter_gather_round_trip_qemu() -> TestResult {
+    // A write over 5 non-contiguous pages (PRP1 + a PRP list built from the
+    // segments) and a read back into 5 others through the registry
+    // device's queue; then a request larger than the controller's maximum
+    // transfer, which the block layer splits into children that complete
+    // as one.
+    use narf_block::{BlockOp, SgRequest};
+    match install_qemu_controller() {
+        None => return TestResult::Skip("no QEMU NVMe controller"),
+        Some(Err(e)) => return TestResult::Fail(e),
+        Some(Ok(())) => {}
+    }
+    let (lba_bytes, nsid) =
+        super::with_controller(|c| (c.lba_bytes, c.primary_nsid)).unwrap_or((512, 1));
+    let ns_dev: Arc<dyn BlockDeviceSync> = Arc::new(super::NvmeNamespaceBlock::new(0, nsid));
+    let Some(queue) = ns_dev.queue() else {
+        return TestResult::Fail("no queue");
+    };
+    let limits = queue.limits();
+    // SAFETY: APIC initialised; MSIs land in our IDT vectors.
+    unsafe { narf_arch::enable_interrupts() };
+    let waker = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut drive = |mut f: narf_block::BoxedCompletion| -> Option<narf_block::BlockCompletion> {
+        let deadline = narf_time::Deadline::after_ms(10_000);
+        loop {
+            if let Poll::Ready(c) = f.as_mut().poll(&mut cx) {
+                return Some(c);
+            }
+            if deadline.expired() {
+                return None;
+            }
+            pump_once();
+            core::hint::spin_loop();
+        }
+    };
+    let pages = 5usize;
+    let bytes = pages * 4096;
+    let blocks = (bytes / lba_bytes as usize) as u32;
+    let Some(saved_small) = SavedRange::save(nsid, 16384, blocks as u16, lba_bytes as usize) else {
+        return TestResult::Fail("saving the scratch window failed");
+    };
+    let Some((wkeep, wlist)) = sg_pages(pages, bytes) else {
+        return TestResult::Fail("page allocation failed");
+    };
+    let Some((rkeep, rlist)) = sg_pages(pages, bytes) else {
+        return TestResult::Fail("page allocation failed");
+    };
+    for (i, b) in wkeep.iter().enumerate() {
+        fill(b, 0x40 + i as u8);
+    }
+    let wcap = narf_io::register_pages_with_cap(wlist);
+    let rcap = narf_io::register_pages_with_cap(rlist);
+    let (Ok(wr), Ok(rr)) = (
+        wcap.derive::<narf_capabilities::Read>(),
+        rcap.derive::<narf_capabilities::Read>(),
+    ) else {
+        return TestResult::Fail("derive failed");
+    };
+    let w = narf_block::queue::submit_sg(
+        &*queue,
+        SgRequest::new(BlockOp::Write { fua: false }, 16384, blocks, wr, 7),
+    );
+    match drive(w) {
+        Some(c) if c.result.is_ok() => {}
+        _ => return TestResult::Fail("SG write failed or hung"),
+    }
+    let r =
+        narf_block::queue::submit_sg(&*queue, SgRequest::new(BlockOp::Read, 16384, blocks, rr, 8));
+    match drive(r) {
+        Some(c) if c.result.is_ok() => {}
+        _ => return TestResult::Fail("SG read failed or hung"),
+    }
+    for (i, b) in rkeep.iter().enumerate() {
+        if !check(b, 0x40 + i as u8) {
+            return TestResult::Fail("SG read-back mismatch: the device did not land each page");
+        }
+    }
+    narf_io::unregister_pages(wcap);
+    narf_io::unregister_pages(rcap);
+    if !saved_small.restore() {
+        return TestResult::Fail("restoring the scratch window failed");
+    }
+
+    // Over the maximum transfer: split into children, data intact.
+    let big_pages = (limits.max_transfer_bytes as usize / 4096 + 2).min(600);
+    let big_bytes = big_pages * 4096;
+    let big_blocks = (big_bytes / lba_bytes as usize) as u32;
+    let Some(saved_big) = SavedRange::save(nsid, 32768, big_blocks as u16, lba_bytes as usize)
+    else {
+        return TestResult::Fail("saving the scratch window failed");
+    };
+    let Some((wkeep, wlist)) = sg_pages(big_pages, big_bytes) else {
+        return TestResult::Skip("not enough DMA memory for the split case");
+    };
+    let Some((rkeep, rlist)) = sg_pages(big_pages, big_bytes) else {
+        return TestResult::Skip("not enough DMA memory for the split case");
+    };
+    for (i, b) in wkeep.iter().enumerate() {
+        fill(b, i as u8);
+    }
+    let wcap = narf_io::register_pages_with_cap(wlist);
+    let rcap = narf_io::register_pages_with_cap(rlist);
+    let (Ok(wr), Ok(rr)) = (
+        wcap.derive::<narf_capabilities::Read>(),
+        rcap.derive::<narf_capabilities::Read>(),
+    ) else {
+        return TestResult::Fail("derive failed");
+    };
+    let w = narf_block::queue::submit_sg(
+        &*queue,
+        SgRequest::new(BlockOp::Write { fua: false }, 32768, big_blocks, wr, 9),
+    );
+    match drive(w) {
+        Some(c) if c.result.is_ok() => {}
+        _ => return TestResult::Fail("split SG write failed or hung"),
+    }
+    let r = narf_block::queue::submit_sg(
+        &*queue,
+        SgRequest::new(BlockOp::Read, 32768, big_blocks, rr, 10),
+    );
+    match drive(r) {
+        Some(c) if c.result.is_ok() => {}
+        _ => return TestResult::Fail("split SG read failed or hung"),
+    }
+    for (i, b) in rkeep.iter().enumerate() {
+        if !check(b, i as u8) {
+            return TestResult::Fail("split SG read-back mismatch");
+        }
+    }
+    // SAFETY: counterpart to the enable above.
+    unsafe { narf_arch::disable_interrupts() };
+    narf_io::unregister_pages(wcap);
+    narf_io::unregister_pages(rcap);
+    if !saved_big.restore() {
+        return TestResult::Fail("restoring the scratch window failed");
+    }
+    if queue.in_flight() != 0 {
+        return TestResult::Fail("commands left in flight");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/mq",
+    smoke_nvme_mq_scatter_gather_round_trip_qemu
+);
