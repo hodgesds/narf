@@ -93,7 +93,7 @@ pub use address_space::{
     install_file_batch_fault_hook, install_file_fault_hook, install_shared_frame_hooks,
     install_shared_page_write_hooks, with_address_space_shared_mapping_transaction,
     with_shared_mapping_transaction, AddressSpace, AddressSpaceError, BrkUpdateResult,
-    FileFaultError, FixedRelocationError, FutureLockPolicy, HugeRegion, MappingReceipt,
+    FileFaultError, FixedRelocationError, FutureLockPolicy, HugeRegion, MappingReceipt, MmUser,
     MremapLimits, NumaRegionSnapshot, Region, RegionPerms, RemoteAccess, RemoteBuf,
     SharedMremapMode, StackGrowthLimits, ZapOutcome,
 };
