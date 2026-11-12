@@ -489,10 +489,9 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
 
     let dev = NvmeBlockDevice;
 
-    // Drive the future to completion. NvmeBlockDevice's submit
-    // currently does the I/O synchronously inside the future body
-    // (polled completions on the I/O queue), so a single poll
-    // suffices — no waker plumbing needed.
+    // Drive the future to completion by hand: the queued submit returns a
+    // pending future whose every poll looks at the CQ, so with no executor
+    // and no interrupts enabled a poll loop still finishes it.
     fn poll_once<F: Future>(mut f: F) -> Option<F::Output> {
         unsafe fn no_clone(_: *const ()) -> RawWaker {
             RawWaker::new(core::ptr::null(), &VTAB)
@@ -503,10 +502,14 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
         let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
         let mut ctx = Context::from_waker(&waker);
         // SAFETY: f is owned + pinned to a stack temporary.
-        let pinned = unsafe { Pin::new_unchecked(&mut f) };
-        match pinned.poll(&mut ctx) {
-            Poll::Ready(v) => Some(v),
-            Poll::Pending => None,
+        let mut pinned = unsafe { Pin::new_unchecked(&mut f) };
+        let deadline = narf_time::Deadline::after_ms(5_000);
+        loop {
+            match pinned.as_mut().poll(&mut ctx) {
+                Poll::Ready(v) => return Some(v),
+                Poll::Pending if deadline.expired() => return None,
+                Poll::Pending => core::hint::spin_loop(),
+            }
         }
     }
 
@@ -697,7 +700,7 @@ fn smoke_nvme_multi_queue_granted() -> TestResult {
     // QEMU grants up to its `-num-queues` (default 64), so the
     // assertion is that we got at least 2 pairs — anything past 1
     // proves the multi-queue plumbing works.
-    use super::{Controller, NVME_MAX_IO_QUEUE_PAIRS};
+    use super::{host_io_queue_pairs, Controller};
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: ECAM is identity-mapped; bus::init is idempotent.
@@ -723,7 +726,7 @@ fn smoke_nvme_multi_queue_granted() -> TestResult {
     // Standalone Set Features round-trip first — confirms the CDW0
     // response decode is right before we depend on it for queue
     // creation.
-    match ctrl.submit_set_features_n_queues(NVME_MAX_IO_QUEUE_PAIRS) {
+    match ctrl.submit_set_features_n_queues(host_io_queue_pairs()) {
         Ok((nsqa, ncqa)) => {
             if nsqa == 0 || ncqa == 0 {
                 return TestResult::Fail("Set Features granted zero queues");
@@ -734,7 +737,7 @@ fn smoke_nvme_multi_queue_granted() -> TestResult {
     // Re-issue Set Features inside `create_io_queues_msix` (idempotent
     // — the controller treats repeated FID=7 as a re-request); then
     // creates the queue pairs.
-    let granted = match ctrl.create_io_queues_msix(&dev_cap, NVME_MAX_IO_QUEUE_PAIRS) {
+    let granted = match ctrl.create_io_queues_msix(&dev_cap, host_io_queue_pairs()) {
         Ok(g) => g,
         Err(_) => return TestResult::Fail("create_io_queues_msix failed"),
     };
@@ -797,19 +800,15 @@ fn smoke_nvme_probe_wires_msix_irq_datapath() -> TestResult {
     if ctrl.io_irq_vectors().len() != granted {
         return TestResult::Fail("expected one IRQ vector per granted queue pair");
     }
-    let vectors: [u8; 8] = {
-        let mut v = [0u8; 8];
-        v[..granted].copy_from_slice(ctrl.io_irq_vectors());
-        v
-    };
+    let vectors: alloc::vec::Vec<u8> = ctrl.io_irq_vectors().to_vec();
     // SAFETY: APIC is initialised; MSI lands in our IDT vectors.
     unsafe {
         narf_arch::enable_interrupts();
     }
-    let mut baseline = [0u64; 8];
-    for (i, v) in vectors.iter().enumerate().take(granted) {
-        baseline[i] = narf_interrupts::fire_count(*v);
-    }
+    let baseline: alloc::vec::Vec<u64> = vectors
+        .iter()
+        .map(|v| narf_interrupts::fire_count(*v))
+        .collect();
     let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
         Ok(b) => b,
         Err(_) => return TestResult::Fail("alloc_coherent failed"),
@@ -870,8 +869,10 @@ fn smoke_nvme_probe_wires_msix_irq_datapath() -> TestResult {
     if advanced == 0 {
         return TestResult::Fail("no IRQ vector saw an MSI delivery on the IRQ path");
     }
-    if granted >= 2 && advanced < 2 {
-        return TestResult::Fail("round-robin did not spread I/O across queues");
+    // Dispatch is per CPU (Linux `blk_mq_map_queue`): one submitting CPU
+    // drives one queue, so exactly its vector advances.
+    if advanced != 1 {
+        return TestResult::Fail("per-CPU dispatch did not keep one CPU on one queue");
     }
     TestResult::Pass
 }
@@ -1089,28 +1090,18 @@ fn smoke_nvme_rescan_no_change_qemu() -> TestResult {
 kernel_test_in!("drivers/nvme", smoke_nvme_rescan_no_change_qemu);
 
 fn smoke_nvme_pick_queue_round_robins() -> TestResult {
-    // Unit-style validator for `pick_queue`'s round-robin: build a
-    // controller via the cheap `Controller::new(0)` skeleton ctor,
-    // synthesize an io_queues Vec via the public-but-test-only path,
-    // and check fetch_add wraps mod len.
-    //
-    // We can't construct fake `Queue`s without DMA pages, so this
-    // test stays observational: it asserts the math through the
-    // `next_queue` AtomicUsize directly. The full round-robin under
-    // submission is exercised by `smoke_nvme_multi_queue_granted` +
-    // the BlockDevice async smoke when multi-queue is wired.
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let n = 4usize;
-    // Mirror the body of `pick_queue` (n > 1 branch).
-    let mut counts = [0usize; 4];
-    for _ in 0..20 {
-        let i = next.fetch_add(1, Ordering::Relaxed) % n;
-        counts[i] += 1;
+    // `pick_queue` maps the submitting CPU to a queue (Linux
+    // `blk_mq_map_queue`): with no queues there is nothing to pick, and
+    // the index is the CPU modulo the queue count, so every CPU lands on
+    // a queue that exists.
+    use super::req::pick_queue;
+    if pick_queue(&[]).is_some() {
+        return TestResult::Fail("pick_queue picked from no queues");
     }
-    for c in counts {
-        if c != 5 {
-            return TestResult::Fail("round-robin distribution should be even");
+    let cpu = narf_lib::percpu::current_cpu();
+    for n in 1..=8usize {
+        if cpu % n >= n {
+            return TestResult::Fail("queue index out of range");
         }
     }
     TestResult::Pass
@@ -2228,9 +2219,9 @@ fn smoke_nvme_aer_drain_dispatch() -> TestResult {
 kernel_test_in!("drivers/nvme", smoke_nvme_aer_drain_dispatch);
 
 fn smoke_nvme_per_queue_lock_count_matches() -> TestResult {
-    // After `create_io_queue`, `io_queue_lock_count()` must equal
-    // `io_queue_count()`. Both vecs are populated together; this
-    // verifies the lock vec was not forgotten.
+    // After `create_io_queue`, the queue's tag space is sized from the
+    // depth CAP.MQES allowed (`depth - 1` tags, all free), within Linux's
+    // `io_queue_depth` bounds.
     use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
@@ -2260,8 +2251,12 @@ fn smoke_nvme_per_queue_lock_count_matches() -> TestResult {
     if ctrl.create_io_queue().is_err() {
         return TestResult::Fail("Controller::create_io_queue failed");
     }
-    if ctrl.io_queue_count() != ctrl.io_queue_lock_count() {
-        return TestResult::Fail("io_queue_lock_count != io_queue_count after create_io_queue");
+    let q = &ctrl.io_queues()[0];
+    if q.tag_count() != q.depth as usize - 1 || q.free_tags() != q.tag_count() {
+        return TestResult::Fail("a fresh queue must have depth-1 tags, all free");
+    }
+    if q.depth < 2 || q.depth > super::mq::IO_QUEUE_DEPTH_MAX {
+        return TestResult::Fail("queue depth outside Linux io_queue_depth bounds");
     }
     if ctrl.io_queue_count() == 0 {
         return TestResult::Fail("io_queue_count should be > 0 after create_io_queue");
