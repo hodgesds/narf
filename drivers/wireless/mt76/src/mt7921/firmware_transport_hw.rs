@@ -1434,7 +1434,11 @@ impl Backend for Hardware {
 /// Retained coherent MCU/FWDL transport with verified reset/recovery.
 #[derive(Debug)]
 pub struct Transport {
-    session: Session<Hardware>,
+    /// Boxed: the session (13.6 KiB, mostly the retained hardware state) made
+    /// a Transport moved by value — through Option, Result, Poll and KeyWork —
+    /// copy itself into every frame on the way (27 KiB frames in
+    /// provision_radio_inner, retire_for_removal, KeyWork::prepare).
+    session: alloc::boxed::Box<Session<Hardware>>,
     /// PCI binding generation this transport was claimed under.
     generation: u64,
 }
@@ -1701,7 +1705,7 @@ impl Transport {
                 ],
             };
             Ok(Self {
-                session: Session::new(
+                session: alloc::boxed::Box::new(Session::new(
                     Hardware {
                         mmio,
                         device,
@@ -1715,7 +1719,7 @@ impl Transport {
                         wake: wake::Wake::default(),
                     },
                     firmware,
-                ),
+                )),
                 generation,
             })
         })
