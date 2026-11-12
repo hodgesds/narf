@@ -188,11 +188,15 @@ fn scan(out: &mut [u64; SITE_DEPTH]) {
         core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags))
     };
     let mut n = 0;
-    for i in 0..SCAN_WORDS as u64 {
-        // SAFETY: words just above the live stack pointer belong to this
-        // task's kernel stack or, for a shallow stack, to the mapped memory
-        // right above it (heap-allocated stacks, static boot/IRQ stacks);
-        // the panic backtrace scans the same window. Read-only, volatile.
+    // Never past the page `rsp` is in: the word above a shallow stack's top
+    // can be an unmapped guard page (vmapped kernel stacks, and a soak hit
+    // a #PF 155 words above rsp on one). The live stack page is mapped.
+    let to_page_end = (4096 - (rsp & 4095)) / 8;
+    let words = (SCAN_WORDS as u64).min(to_page_end);
+    for i in 0..words {
+        // SAFETY: every address read lies in the 4 KiB page that holds the
+        // current stack pointer, which is mapped and readable while this
+        // code runs on it. Read-only, volatile.
         let w = unsafe { ((rsp + i * 8) as *const u64).read_volatile() };
         if w > tstart && w < tend {
             out[n] = w - tstart;
