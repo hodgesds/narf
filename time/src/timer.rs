@@ -122,8 +122,36 @@ pub const TIMER_PINNED: u32 = 1 << 0;
 /// `TIMER_DEFERRABLE`: never wakes an idle CPU (`BASE_DEF`).
 pub const TIMER_DEFERRABLE: u32 = 1 << 1;
 
-/// Timer callback. Runs in the executor round with no base lock held.
-pub type TimerFn = fn(&TimerList);
+/// Timer callback (`void (*)(struct timer_list *)`). Runs in the executor
+/// round with no base lock held. It may re-arm its own timer; it must not
+/// block or wait for its own timer.
+///
+/// The wheel never touches the timer after handing it over, so, as in Linux,
+/// the callback may free it (for instance by dropping the last reference to
+/// the object embedding it). That is why it gets a [`TimerRef`] — a pointer,
+/// not a borrow that would have to outlive the call.
+pub type TimerFn = fn(TimerRef);
+
+/// The expiring timer, as handed to its callback.
+#[derive(Copy, Clone, Debug)]
+pub struct TimerRef(*const TimerList);
+
+impl TimerRef {
+    /// The timer. Valid until the callback frees it; the borrow must end
+    /// before that.
+    #[inline]
+    pub fn timer(&self) -> &TimerList {
+        // SAFETY: the wheel hands out live timers (arm contract); a callback
+        // that frees its timer does so after its last use of this borrow.
+        unsafe { &*self.0 }
+    }
+
+    /// Raw pointer, for `container_of` (`from_timer`).
+    #[inline]
+    pub fn as_ptr(&self) -> *const TimerList {
+        self.0
+    }
+}
 
 const NO_CPU: u32 = u32::MAX;
 const MIGRATING: u32 = u32::MAX - 1;
@@ -148,7 +176,9 @@ pub struct TimerList {
     /// CPU whose base holds the timer, `NO_CPU`, or `MIGRATING`.
     cpu: AtomicU32,
     pending: AtomicBool,
-    running: AtomicBool,
+    /// `timer_shutdown`: every later arm is refused (Linux clears
+    /// `function`).
+    shutdown: AtomicBool,
 }
 
 // SAFETY: the `UnsafeCell`s are touched only under the lock of the base the
@@ -179,8 +209,13 @@ impl TimerList {
             flags,
             cpu: AtomicU32::new(NO_CPU),
             pending: AtomicBool::new(false),
-            running: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
         }
+    }
+
+    /// Whether [`timer_shutdown`] was called on it.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
     /// `timer_pending`.
@@ -218,7 +253,18 @@ struct WheelInner {
     timers_pending: bool,
     pending_map: [u64; LVL_DEPTH],
     vectors: [*mut TimerList; WHEEL_SIZE],
+    /// `base->running_timer`: the timer whose callback runs now. Compared,
+    /// never dereferenced (the callback may have freed it).
+    running_timer: *const TimerList,
+    /// An expiry is in progress (the owner and a migrator may both try to
+    /// expire a GLOBAL base; one at a time, so `running_timer` is exact).
+    expiry_active: bool,
+    /// Collected timers waiting for their callback (`idx == EXPIRING`).
+    expiring: *mut TimerList,
 }
+
+/// `idx` of a timer on its base's expiry list.
+const EXPIRING: usize = usize::MAX;
 
 // SAFETY: raw node pointers are guarded by the base lock.
 unsafe impl Send for WheelInner {}
@@ -271,6 +317,9 @@ pub fn timers_prepare_cpu(cpu: usize) {
             timers_pending: false,
             pending_map: [0; LVL_DEPTH],
             vectors: [ptr::null_mut(); WHEEL_SIZE],
+            running_timer: ptr::null(),
+            expiry_active: false,
+            expiring: ptr::null_mut(),
         }),
         next_expiry: AtomicU64::new(u64::MAX),
         nr_expired: AtomicU64::new(0),
@@ -352,20 +401,25 @@ fn detach_timer(w: &mut WheelInner, t: &TimerList) -> bool {
     if !t.pending.load(Ordering::Relaxed) {
         return false;
     }
-    // SAFETY: pending under this lock ⇒ linked into `vectors[idx]`.
+    // SAFETY: pending under this lock ⇒ linked into `vectors[idx]`, or into
+    // the expiry list when `idx == EXPIRING`.
     unsafe {
         let idx = *t.idx.get();
         let next = *t.next.get();
         let prev = *t.prev.get();
         if prev.is_null() {
-            w.vectors[idx] = next;
+            if idx == EXPIRING {
+                w.expiring = next;
+            } else {
+                w.vectors[idx] = next;
+            }
         } else {
             *(*prev).next.get() = next;
         }
         if !next.is_null() {
             *(*next).prev.get() = prev;
         }
-        if w.vectors[idx].is_null() {
+        if idx != EXPIRING && w.vectors[idx].is_null() {
             w.pending_map[idx / LVL_SIZE] &= !(1 << (idx % LVL_SIZE));
         }
         *t.next.get() = ptr::null_mut();
@@ -487,7 +541,29 @@ fn lock_timer_base(t: &TimerList) -> Locked {
 /// returned (or it fired and was not re-armed).
 pub unsafe fn mod_timer(t: &TimerList, expires: u64) -> bool {
     // SAFETY: caller contract.
-    unsafe { mod_timer_on(t, expires, None) }
+    unsafe { mod_timer_on(t, expires, false, None) == 1 }
+}
+
+/// `timer_reduce`: arm, or move a pending timer's expiry earlier only.
+/// Returns whether it was pending before.
+///
+/// # Safety
+/// As for [`mod_timer`].
+pub unsafe fn timer_reduce(t: &TimerList, expires: u64) -> bool {
+    // SAFETY: caller contract.
+    unsafe { mod_timer_on(t, expires, true, None) == 1 }
+}
+
+/// [`mod_timer`] (`reduce`: [`timer_reduce`]) that tells a refused arm
+/// apart: 1 if the timer was pending, 0 if this call armed it, -1 if it was
+/// shut down and nothing was armed. Owners that hold a reference for each
+/// pending timer (`sk_reset_timer`'s `sock_hold`) need the difference.
+///
+/// # Safety
+/// As for [`mod_timer`].
+pub unsafe fn mod_timer_checked(t: &TimerList, expires: u64, reduce: bool) -> i32 {
+    // SAFETY: caller contract.
+    unsafe { mod_timer_on(t, expires, reduce, None) }
 }
 
 /// `add_timer_on`: arm `t` on `cpu`'s base (offline migration, tests).
@@ -496,24 +572,48 @@ pub unsafe fn mod_timer(t: &TimerList, expires: u64) -> bool {
 /// As for [`mod_timer`].
 pub unsafe fn add_timer_on(t: &TimerList, expires: u64, cpu: usize) -> bool {
     // SAFETY: caller contract.
-    unsafe { mod_timer_on(t, expires, Some(cpu)) }
+    unsafe { mod_timer_on(t, expires, false, Some(cpu)) == 1 }
 }
 
-unsafe fn mod_timer_on(t: &TimerList, expires: u64, target: Option<usize>) -> bool {
+/// `__mod_timer`. Returns 1 (was pending), 0 (armed now) or -1 (shut down).
+unsafe fn mod_timer_on(t: &TimerList, expires: u64, reduce: bool, target: Option<usize>) -> i32 {
+    if t.is_shutdown() {
+        return -1;
+    }
+    // `MOD_TIMER_REDUCE` fast path: pending no later already.
+    if reduce && t.is_pending() && t.expires() <= expires {
+        return 1;
+    }
     let (was_pending, kick) = narf_lib::sync::without_interrupts(|| {
         let bases: &'static CpuTimerBases = match target {
             Some(cpu) => cpu_bases(cpu).expect("add_timer_on: CPU not prepared"),
             None => this_cpu_bases(),
         };
         let want = &bases.bases[t.base_index()];
-        let (old, mut g, was_pending) = match lock_timer_base(t) {
-            Locked::Base(b, mut g) => {
-                let p = detach_timer(&mut g, t);
-                (Some(b), Some(g), p)
-            }
-            Locked::Unbound => (None, None, false),
+        let (old, mut g) = match lock_timer_base(t) {
+            Locked::Base(b, g) => (Some(b), Some(g)),
+            Locked::Unbound => (None, None),
         };
-        let keep = old.is_some_and(|b| ptr::eq(b, want) || t.running.load(Ordering::Acquire));
+        if t.is_shutdown() {
+            if g.is_none() {
+                t.cpu.store(NO_CPU, Ordering::Release);
+            }
+            return (-1, None);
+        }
+        if reduce && t.is_pending() && t.expires() <= expires {
+            return (1, None);
+        }
+        let was_pending = match g.as_mut() {
+            Some(g) => i32::from(detach_timer(g, t)),
+            None => 0,
+        };
+        // A running callback keeps its timer on its base, so
+        // `del_timer_sync` sees it and the timer stays serialised against
+        // itself.
+        let running = g
+            .as_ref()
+            .is_some_and(|g| ptr::eq(g.running_timer, t as *const TimerList));
+        let keep = old.is_some_and(|b| ptr::eq(b, want) || running);
         let (base, mut guard) = if keep {
             (old.expect("kept base"), g.take().expect("kept guard"))
         } else {
@@ -557,29 +657,70 @@ pub fn del_timer(t: &TimerList) -> bool {
     })
 }
 
+/// `try_to_del_timer_sync`: 1 if it was pending and is now removed, 0 if
+/// inactive, -1 if its callback is running.
+pub fn try_to_del_timer_sync(t: &TimerList) -> i32 {
+    narf_lib::sync::without_interrupts(|| match lock_timer_base(t) {
+        Locked::Unbound => {
+            t.cpu.store(NO_CPU, Ordering::Release);
+            0
+        }
+        Locked::Base(_, mut g) => {
+            if ptr::eq(g.running_timer, t as *const TimerList) {
+                -1
+            } else {
+                i32::from(detach_timer(&mut g, t))
+            }
+        }
+    })
+}
+
 /// `timer_delete_sync` / `del_timer_sync`: deactivate and wait for a running
-/// callback. Not from the timer's own callback.
+/// callback (`base->running_timer`). Not from the timer's own callback.
 pub fn del_timer_sync(t: &TimerList) -> bool {
-    let r = del_timer(t);
-    while t.running.load(Ordering::Acquire) {
-        core::hint::spin_loop();
+    loop {
+        match try_to_del_timer_sync(t) {
+            -1 => core::hint::spin_loop(),
+            r => return r == 1,
+        }
     }
-    r
+}
+
+/// `timer_shutdown`: [`del_timer`], and every later arm is refused. Does not
+/// wait for a running callback, so its callback may call it.
+pub fn timer_shutdown(t: &TimerList) -> bool {
+    t.shutdown.store(true, Ordering::Release);
+    narf_lib::sync::without_interrupts(|| match lock_timer_base(t) {
+        Locked::Unbound => {
+            t.cpu.store(NO_CPU, Ordering::Release);
+            false
+        }
+        Locked::Base(_, mut g) => detach_timer(&mut g, t),
+    })
+}
+
+/// `timer_shutdown_sync`: [`del_timer_sync`], and every later arm is
+/// refused (teardown of the owning object).
+pub fn timer_shutdown_sync(t: &TimerList) -> bool {
+    t.shutdown.store(true, Ordering::Release);
+    del_timer_sync(t)
 }
 
 // ── expiry ──────────────────────────────────────────────────────────────
 
-/// Collect due timers of `base` at its clock, one bucket per level, into a
-/// local list (`collect_expired_timers`). Returns the list head.
-fn collect_expired(w: &mut WheelInner) -> *mut TimerList {
-    let mut out: *mut TimerList = ptr::null_mut();
+/// `collect_expired_timers`: move every due bucket at the base clock (one
+/// per level at most) onto the base's expiry list. The timers stay pending
+/// and linked (`idx == EXPIRING`) until their callback is about to run, so a
+/// `del_timer` that races the expiry unlinks them from that list like from
+/// any bucket. Linux keeps the list on the expiring CPU's stack; the base
+/// keeps it here, which keeps the expiry path shallow.
+fn collect_expired(w: &mut WheelInner) {
     let mut clk = w.clk;
     for lvl in 0..LVL_DEPTH {
         let idx = lvl * LVL_SIZE + (clk & LVL_MASK) as usize;
         let bit = 1u64 << (idx % LVL_SIZE);
         if w.pending_map[lvl] & bit != 0 {
             w.pending_map[lvl] &= !bit;
-            // Splice the whole bucket onto `out`.
             let mut n = w.vectors[idx];
             w.vectors[idx] = ptr::null_mut();
             while !n.is_null() {
@@ -587,8 +728,14 @@ fn collect_expired(w: &mut WheelInner) -> *mut TimerList {
                 // guarded by the base lock.
                 unsafe {
                     let next = *(*n).next.get();
-                    *(*n).next.get() = out;
-                    out = n;
+                    let head = w.expiring;
+                    *(*n).next.get() = head;
+                    *(*n).prev.get() = ptr::null_mut();
+                    if !head.is_null() {
+                        *(*head).prev.get() = n;
+                    }
+                    w.expiring = n;
+                    *(*n).idx.get() = EXPIRING;
                     n = next;
                 }
             }
@@ -598,7 +745,6 @@ fn collect_expired(w: &mut WheelInner) -> *mut TimerList {
         }
         clk >>= LVL_CLK_SHIFT;
     }
-    out
 }
 
 /// `__run_timers` for one base. Returns callbacks run.
@@ -609,34 +755,40 @@ fn run_base(base: &'static TimerBase) -> u64 {
     }
     let mut ran = 0;
     let mut g = base.inner.lock();
+    if g.expiry_active {
+        // Another CPU (the owner, or a migrator) is expiring this base.
+        return 0;
+    }
+    g.expiry_active = true;
     while now >= g.clk && now >= g.next_expiry {
         // Jump an idle stretch straight to the next pending bucket.
         if g.next_expiry > g.clk {
             g.clk = g.next_expiry;
         }
-        let mut list = collect_expired(&mut g);
+        collect_expired(&mut g);
+        // While timers run the clock is one ahead, so a callback re-arming
+        // for "now" lands in the next round.
         g.clk += 1;
         recalc_next_expiry(base, &mut g);
-        while !list.is_null() {
-            // SAFETY: collected nodes are live and still marked pending.
-            let t = unsafe { &*list };
-            // SAFETY: as above, under the base lock.
-            list = unsafe { *t.next.get() };
-            // SAFETY: as above.
-            unsafe {
-                *t.next.get() = ptr::null_mut();
-                *t.prev.get() = ptr::null_mut();
+        loop {
+            let head = g.expiring;
+            if head.is_null() {
+                break;
             }
-            t.pending.store(false, Ordering::Release);
-            t.running.store(true, Ordering::Release);
+            // SAFETY: linked ⇒ live (mod_timer contract), under the lock.
+            let t = unsafe { &*head };
+            detach_timer(&mut g, t);
+            g.running_timer = t;
+            let f = t.function;
             drop(g);
-            (t.function)(t);
+            f(TimerRef(head));
             ran += 1;
+            // `t` may be freed by now: only its address is compared.
             g = base.inner.lock();
-            // Last touch: a waiting `del_timer_sync` may free it after this.
-            t.running.store(false, Ordering::Release);
+            g.running_timer = ptr::null();
         }
     }
+    g.expiry_active = false;
     if !g.timers_pending {
         base.next_expiry.store(u64::MAX, Ordering::Release);
     }
@@ -775,10 +927,10 @@ struct TimeoutNode {
     waker: IrqSafeSpinLock<Option<core::task::Waker>>,
 }
 
-fn process_timeout(t: &TimerList) {
+fn process_timeout(r: TimerRef) {
     // SAFETY: only `TimeoutNode` uses this callback; `timer` is its first
-    // field (repr(C)).
-    let n = unsafe { &*(t as *const TimerList as *const TimeoutNode) };
+    // field (repr(C)); its owner frees it only after `del_timer_sync`.
+    let n = unsafe { &*(r.as_ptr() as *const TimeoutNode) };
     if let Some(w) = n.waker.lock().as_ref() {
         w.wake_by_ref();
     }
