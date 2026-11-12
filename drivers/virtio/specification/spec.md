@@ -114,6 +114,26 @@ memory-window ownership and do not use this control-register path.
   request slot and completion wakes it after removing the request from the
   used ring. Unsupported/no-op flush, discard, and cancel paths resolve
   immediately rather than returning a permanently pending future.
+- **virtio-blk-pci queued submission** (`blk_mq.rs`, Linux `virtio_blk.c`
+  on blk-mq). Queue 0 carries a request table sized from the negotiated
+  queue size (`qsize / 3` three-descriptor chains, one header/status slot
+  each — no fixed constant): a request takes a slot, builds its own chain
+  over its own pinned payload, adds it under the virtqueue lock and kicks;
+  completions are matched by chain head on the used ring, by the queue's
+  MSI-X handler (bound at probe; polled fallback) or by any waiter that
+  looks first, and the owner is woken by reference and reaps in process
+  context. Many requests are in flight at once; nothing holds a lock across
+  an await. `VirtioBlkBlockSync::queue()` exposes the table as a
+  `narf_block::BlockQueue` (`VirtioBlkQueue`) so `SyncBlock::submit` returns
+  a pending future; the sync `read` / `write` / `flush` post on the same
+  table and spin for their own slot (no gate across the transfer; up to
+  `MAX_IO_SECTORS` = 256 sectors per chain). A dropped request future
+  abandons its request — slot and payload pin held until the used entry
+  lands. Timeouts: a per-queue timer reports a request outstanding
+  `STALL_REPORT_MS` to the fatal stall watchdog and keeps waiting
+  (`BLK_EH_RESET_TIMER`; virtio has no abort), as Linux's virtio-blk does.
+  FUA is emulated as write + flush; Trim / Write Zeroes are refused (not
+  negotiated).
 - The virtio-blk-pci sync driver negotiates VIRTIO_BLK_F_FLUSH when the
   device offers it and drains the device write cache with a T_FLUSH
   request; its `BlockDeviceSync::capabilities` reports `volatile_cache`

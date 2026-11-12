@@ -11,6 +11,7 @@ extern crate narf_io;
 
 pub mod balloon_pci;
 pub mod blk;
+pub mod blk_mq;
 pub mod blk_pci;
 pub mod class_blk;
 pub mod console_pci;
@@ -34,6 +35,7 @@ pub mod snd_pci;
 pub mod video_pci;
 pub mod vsock_pci;
 
+mod blk_mq_tests;
 mod e2e_tests;
 mod tests;
 
