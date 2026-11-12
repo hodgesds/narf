@@ -17,7 +17,7 @@ fn completed_modeset(pipe: u8) -> Modeset {
         dchub_refclk_khz: 50_000,
     };
     let plan = admit_displays(&soc, &[selection]).unwrap()[0];
-    Modeset {
+    Modeset::new(ModesetData {
         selection,
         pipe,
         crtc: pipe,
@@ -44,7 +44,7 @@ fn completed_modeset(pipe: u8) -> Modeset {
             frame_after: 3,
         },
         modes: [None; MAX_MODES],
-    }
+    })
 }
 
 fn navi48_completed_modesets_survive_configuration_and_publication_cancellation() -> TestResult {
@@ -64,8 +64,8 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
                 // A caller's temporary configuration disappears on cancellation.
                 let mut local = Vec::new();
                 for m in [&first, &second] {
-                    retained.retain(**m);
-                    local.push(alloc::boxed::Box::new(**m));
+                    retained.retain((**m).clone());
+                    local.push(alloc::boxed::Box::new((**m).clone()));
                 }
                 if during_startup {
                     journal
@@ -88,10 +88,10 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
         }
         assert_eq!(retained.check_stopped(), Err(otg::Error::Busy.into()));
         let mut recovered: alloc::boxed::Box<[Option<Modeset>; 4]> =
-            alloc::boxed::Box::new([None; 4]);
+            alloc::boxed::Box::new([None, None, None, None]);
         assert_eq!(retained.restore(&mut recovered), Ok(0b0101));
         assert!(recovered[0] == Some(*first) && recovered[1].is_none());
-        assert!(recovered[2] == Some(*second) && recovered[3].is_none());
+        assert!(recovered[2] == Some((*second).clone()) && recovered[3].is_none());
         assert_eq!(retained.restore(&mut recovered), Ok(0));
         // Handle recovery must not clear a cancelled native startup's quarantine.
         if during_startup {
@@ -103,9 +103,10 @@ fn navi48_completed_modesets_survive_configuration_and_publication_cancellation(
         // configuration preparation and stays available after another restore.
         retained.stopped(0);
         assert_eq!(retained.check_stopped(), Err(otg::Error::Busy.into()));
-        let mut again: alloc::boxed::Box<[Option<Modeset>; 4]> = alloc::boxed::Box::new([None; 4]);
+        let mut again: alloc::boxed::Box<[Option<Modeset>; 4]> =
+            alloc::boxed::Box::new([None, None, None, None]);
         assert_eq!(retained.restore(&mut again), Ok(0b0100));
-        assert!(again[2] == Some(*second));
+        assert!(again[2] == Some((*second).clone()));
         retained.stopped(2);
         assert_eq!(retained.check_stopped(), Ok(()));
     }
@@ -123,10 +124,11 @@ fn navi48_modeset_restore_refuses_conflicting_incarnations_before_changes() -> T
     let last = alloc::boxed::Box::new(completed_modeset(3));
     let mut retained = alloc::boxed::Box::new(RetainedModesets::new());
     retained.retain(*first);
-    retained.retain(*last);
+    retained.retain((*last).clone());
     let mut old = last.clone();
     old.scanout.address += 4096;
-    let mut caller: alloc::boxed::Box<[Option<Modeset>; 4]> = alloc::boxed::Box::new([None; 4]);
+    let mut caller: alloc::boxed::Box<[Option<Modeset>; 4]> =
+        alloc::boxed::Box::new([None, None, None, None]);
     caller[3] = Some(*old);
     let before = caller.clone();
     assert_eq!(retained.restore(&mut caller), Err(otg::Error::Busy.into()));
@@ -139,8 +141,8 @@ fn navi48_modeset_restore_refuses_conflicting_incarnations_before_changes() -> T
     updated.modes[0] = Some(last.selection.timing);
     updated.scanout.frame_before = 10;
     updated.scanout.frame_after = 11;
-    retained.retain(*updated);
-    *caller = [None; 4];
+    retained.retain((*updated).clone());
+    *caller = [None, None, None, None];
     assert_eq!(retained.restore(&mut caller), Ok(0b1001));
     assert_eq!(caller[3], Some(*updated));
     TestResult::Pass
@@ -1657,7 +1659,7 @@ fn navi48_dp_alternatives_keep_dsc_admission_and_bound_the_fallback_link() -> Te
         dchub_refclk_khz: 50_000,
     };
     let previous = edid_timings(&edid_three_modes(false));
-    let refreshed = admitted_modes(&soc, &[m], 0, previous, |t| {
+    let refreshed = admitted_modes(&soc, core::slice::from_ref(&m), 0, previous, |t| {
         dp_offered_modes(t, &m.selection, soc.dispclk_max_khz)
     });
     assert_eq!(
@@ -1670,7 +1672,7 @@ fn navi48_dp_alternatives_keep_dsc_admission_and_bound_the_fallback_link() -> Te
     );
     // Even an empty old list retains the actual running timing as a historical
     // witness; alternatives still need fresh admission.
-    let refreshed = admitted_modes(&soc, &[m], 0, [], |_| Vec::new());
+    let refreshed = admitted_modes(&soc, core::slice::from_ref(&m), 0, [], |_| Vec::new());
     assert_eq!(refreshed[0], Some(m.selection.timing));
     assert_eq!(refreshed.into_iter().flatten().count(), 1);
     TestResult::Pass
@@ -4328,9 +4330,9 @@ fn live_on(
     plan: &dml::Plan,
 ) -> Option<DisplayPipes> {
     let mut running: Vec<Modeset> = Vec::with_capacity(1 + others.len());
-    running.push(*m);
+    running.push(m.clone());
     for o in others {
-        running.push(**o);
+        running.push((*o).clone());
     }
     let mut s = m.selection;
     s.planes = *setup;
@@ -5030,7 +5032,7 @@ fn navi48_dsc_joint_admission_retries_depth_and_offered_modes() -> TestResult {
     // candidates, then joint admission with the retained sibling.
     lit.selection.lanes = 4;
     lit.selection.rate = DpRate::Legacy(LinkRate::Hbr3);
-    let offered = admitted_modes(&soc, &[lit, sibling], 0, [s.timing], |t| {
+    let offered = admitted_modes(&soc, &[lit.clone(), sibling.clone()], 0, [s.timing], |t| {
         dp_offered_modes(t, &lit.selection, soc.dispclk_max_khz)
     });
     assert!(offered.contains(&Some(s.timing)));
@@ -5154,8 +5156,8 @@ fn navi48_dsc_offered_modes_preserve_plane_topology() -> TestResult {
     assert!(!candidates.is_empty());
     assert!(candidates
         .iter()
-        .any(|m| admit_native_modes(&soc, &[*m]).is_ok()));
-    let offered = admitted_modes(&soc, &[lit], 0, [timing], |t| {
+        .any(|m| admit_native_modes(&soc, core::slice::from_ref(m)).is_ok()));
+    let offered = admitted_modes(&soc, core::slice::from_ref(&lit), 0, [timing], |t| {
         dp_offered_modes(t, &lit.selection, soc.dispclk_max_khz)
     });
     assert!(!offered.contains(&Some(timing)));

@@ -1044,8 +1044,48 @@ pub fn limited_range(broadcast_rgb: u8) -> bool {
 }
 
 /// A successful modeset, retained by both the caller and device owner for teardown.
+///
+/// A shared handle: the description is 7.5 KiB, and as a `Copy` value it was
+/// copied into every frame and future that passed one along — four of them
+/// made `Displays` 30 KiB, and the display monitor's future 109 KiB. Cloning
+/// shares it; a change goes to a private copy (`DerefMut`, `Arc::make_mut`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Modeset(alloc::sync::Arc<ModesetData>);
+
+impl Modeset {
+    pub fn new(data: ModesetData) -> Self {
+        Self(alloc::sync::Arc::new(data))
+    }
+}
+
+impl core::ops::Deref for Modeset {
+    type Target = ModesetData;
+    fn deref(&self) -> &ModesetData {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Modeset {
+    fn deref_mut(&mut self) -> &mut ModesetData {
+        if alloc::sync::Arc::get_mut(&mut self.0).is_none() {
+            unshare(&mut self.0);
+        }
+        alloc::sync::Arc::get_mut(&mut self.0).expect("a Modeset just unshared is unique")
+    }
+}
+
+/// Give a shared `Modeset` its own copy before a change. Out of line: the
+/// copy passes through a 7.5 KiB temporary, which inlined `Arc::make_mut`
+/// put in the frame of every function that changes a field.
+#[cold]
+#[inline(never)]
+fn unshare(data: &mut alloc::sync::Arc<ModesetData>) {
+    *data = alloc::sync::Arc::new(ModesetData::clone(data));
+}
+
+/// What a [`Modeset`] describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Modeset {
+pub struct ModesetData {
     pub selection: Selection,
     /// The stream's OTG master: its head pipe (and display slot), acquired
     /// as DC acquires it, not the CRTC's index.
@@ -1064,7 +1104,7 @@ pub struct Modeset {
     pub modes: [Option<Timing>; MAX_MODES],
 }
 
-impl Modeset {
+impl ModesetData {
     /// An MST stream's payload source (`MstPayload::stream`): the stream
     /// encoder it acquired, DIO on 8b/10b and HPO DP on 128b/132b.
     pub fn mst_stream_encoder(&self) -> Option<u8> {
@@ -1111,7 +1151,8 @@ impl RetainedModesets {
         Self(slots.try_into().expect("four modeset slots"))
     }
     pub(super) fn retain(&mut self, m: Modeset) {
-        self.0[usize::from(m.pipe)] = Some(m);
+        let pipe = usize::from(m.pipe);
+        self.0[pipe] = Some(m);
     }
     fn stopped(&mut self, pipe: u8) {
         self.0[usize::from(pipe)] = None;
@@ -1128,7 +1169,7 @@ impl RetainedModesets {
         // Validate the whole transfer before changing any caller's records.
         for retained in self.0.iter().flatten() {
             let old = to.get(usize::from(retained.crtc)).ok_or(otg::Error::Busy)?;
-            if old.is_some_and(|o| o != *retained) {
+            if old.as_ref().is_some_and(|o| o != retained) {
                 return Err(otg::Error::Busy.into());
             }
         }
@@ -1136,7 +1177,7 @@ impl RetainedModesets {
         for retained in self.0.iter().flatten() {
             let old = &mut to[usize::from(retained.crtc)];
             if old.is_none() {
-                *old = Some(*retained);
+                *old = Some(retained.clone());
                 recovered |= 1 << retained.crtc;
             }
         }
@@ -3460,8 +3501,13 @@ impl ColdBoot {
             })
         }
         .await?;
-        lit.modes = self.offered_modes(&soc, &[lit], 0, &edid_of(&ports, &paths, &selection));
-        self.modesets.retain(lit);
+        lit.modes = self.offered_modes(
+            &soc,
+            core::slice::from_ref(&lit),
+            0,
+            &edid_of(&ports, &paths, &selection),
+        );
+        self.modesets.retain(lit.clone());
         Ok(lit)
     }
     /// Light every lightable sink (`select_all`) as one configuration, each
@@ -3666,7 +3712,7 @@ impl ColdBoot {
                 _ => edid_of(&ports, &paths, &s),
             };
             lit[k].modes = self.offered_modes(&soc, &lit, k, &edid);
-            self.modesets.retain(lit[k]);
+            self.modesets.retain(lit[k].clone());
         }
         self.update_sst_outputs(Some(&soc), &paths, &board, &lit);
         if failed.is_none() {
@@ -3802,7 +3848,7 @@ impl ColdBoot {
             Ok(m) => {
                 // No await between native completion and retained ownership.
                 // A later pipe or platform adoption can suspend or be dropped.
-                self.modesets.retain(m);
+                self.modesets.retain(m.clone());
                 self.teardowns.finish_activation(pipe, true);
                 Ok(m)
             }
@@ -3898,7 +3944,7 @@ impl ColdBoot {
             // decided before acquisition, as dp_decide_link_settings).
             let output = self.stream_output(&selection)?;
             let (selection, scanout) = self.start_link(selection, pipe, pipes.encoders).await?;
-            Ok(Modeset {
+            Ok(Modeset::new(ModesetData {
                 selection,
                 pipe,
                 crtc,
@@ -3907,7 +3953,7 @@ impl ColdBoot {
                 plan,
                 scanout,
                 modes: [None; MAX_MODES],
-            })
+            }))
         }
     }
     /// The timings of display `k`'s sink a later configuration could switch
@@ -4565,13 +4611,13 @@ impl ColdBoot {
     }
     fn retain_retrained_modeset(&mut self, m: &mut Modeset, soc: &dml::Soc) {
         // Preserve the actual completion before doing any further work.
-        self.modesets.retain(*m);
+        self.modesets.retain(m.clone());
         let lit: Vec<_> = self.display_modesets().into_iter().flatten().collect();
         let k = lit.iter().position(|old| old.pipe == m.pipe).unwrap();
         m.modes = admitted_modes(soc, &lit, k, m.modes.into_iter().flatten(), |t| {
             dp_offered_modes(t, &m.selection, soc.dispclk_max_khz)
         });
-        self.modesets.retain(*m);
+        self.modesets.retain(m.clone());
     }
     /// Tear down a modeset whose sink left: as `stop_modeset`, but a DP link
     /// stops without addressing the sink, and only while HPD stays low. An
@@ -4750,7 +4796,7 @@ impl ColdBoot {
             let d = unsafe { self.update_live_display_plan(m.pipe, plan, true) }.await?;
             m.plan = d.plan;
             m.scanout.plan = d.plan;
-            self.modesets.retain(*m);
+            self.modesets.retain(m.clone());
         }
         Ok(())
     }
@@ -5081,7 +5127,7 @@ impl ColdBoot {
             let d = unsafe { self.update_live_display_plan(m.pipe, plan, false) }.await?;
             m.plan = d.plan;
             m.scanout.plan = d.plan;
-            self.modesets.retain(*m);
+            self.modesets.retain(m.clone());
         }
         if let Some(phantom) = &s.phantom {
             let hw = self.stage_display_subvp(running[0].pipe, phantom).await?;
@@ -5429,7 +5475,7 @@ impl ColdBoot {
                 None => edid_of(&ports, &paths, s),
             };
             display.modes = self.offered_modes(&soc, &all, k, &edid);
-            self.modesets.retain(*display);
+            self.modesets.retain(display.clone());
         }
         self.update_sst_outputs(Some(&soc), &paths, &board, &displays);
         if failed.is_none() {
