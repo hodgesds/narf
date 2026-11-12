@@ -78,6 +78,14 @@ pub(crate) fn register_current_cpu() {
     }
     // Publication is cold. A cached policy refreshes after AP discovery.
     TOPOLOGY_GENERATION.fetch_add(1, Ordering::Release);
+    // `tmigr_cpu_online`: join the timer-migration hierarchy, grouped by the
+    // same cache identity and by NUMA node.
+    let cpu = narf_lib::percpu::current_cpu();
+    narf_time::timer_migration::tmigr_cpu_online(
+        cpu,
+        llc_id(CpuId(cpu as u32)),
+        narf_acpi::cpu_node(cpu as u32),
+    );
 }
 
 pub(crate) fn llc_id(cpu: CpuId) -> Option<u64> {

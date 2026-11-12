@@ -27,6 +27,7 @@ pub mod wall;
 
 mod hrtimer_tests;
 mod tests;
+mod timer_migration_tests;
 mod timer_tests;
 pub use wall::{
     adjust_wall_offset_ns, begin_leap_smear, cyc_to_ns_mult_shift, cycles_per_ns, cycles_to_ns,
