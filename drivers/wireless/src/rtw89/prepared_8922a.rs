@@ -986,9 +986,10 @@ impl Prepared8922a {
             .position(|mld| mld.base_macid == base_macid)
             .ok_or(Error::NoMld)?;
         // Disjoint field borrows: the link slot out of `mlds`,
-        // the factory for the new link's CCTLs.
+        // the factory for the new link's CCTLs, and the shared
+        // MACID pool the link's slot comes from.
         let mld = &mut self.mlds[index];
-        mld.add_link(&self.factory, facet, link)
+        mld.add_link(&self.factory, facet, &mut self.pool, link)
             .map_err(Error::Station)
     }
 
