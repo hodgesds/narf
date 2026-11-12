@@ -39,8 +39,12 @@
 //!  stack_bottom─► └─────────────┘
 //! ```
 //!
-//! Stack overflow: phase 1b uses a plain `Box<[u8]>` with no guard
-//! page. Phase 3 adds a guard page via vmalloc.
+//! Stack overflow: every task stack is a guarded, virtually mapped
+//! [`KernelStack`] (`narf_memory::kstack`, Linux `CONFIG_VMAP_STACK`). The
+//! VA below the stack is never mapped, so an overflow faults on the guard and
+//! the trap layer reports it ("kernel stack overflow") instead of the stack
+//! silently writing into the frame below. The low-end canary stays as a
+//! cheap second check and as the high-water baseline.
 
 #![allow(dead_code)]
 
@@ -55,6 +59,8 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
+
+use narf_memory::kstack::KernelStack;
 
 #[cfg(target_arch = "aarch64")]
 use narf_arch::aarch64::kernel_ctx::{kernel_switch, KernelContext};
@@ -99,7 +105,7 @@ fn current_preempt_vector() -> u64 {
     }
 }
 
-/// Default per-task kernel stack size. 32 KiB: under the own-stack
+/// Default per-task kernel stack size. Under the own-stack
 /// model the ENTIRE syscall/trap path of a user task runs on this
 /// stack — with interrupts enabled, so an IRQ handler's frames land
 /// on top of whatever depth the syscall body already reached. The
@@ -107,9 +113,21 @@ fn current_preempt_vector() -> u64 {
 /// plumbing, ext2 block staging, pty open), and 16 KiB measurably
 /// overflowed during `fork(2)` (the wl_xdg slab-canary corruption —
 /// see STACK_CANARY below, which now catches any recurrence with
-/// attribution). 32 KiB gives those paths + IRQ nesting real
-/// headroom at 8 pages per task.
-pub const DEFAULT_KERNEL_STACK_BYTES: usize = 32 * 1024;
+/// attribution).
+///
+/// 64 KiB, sized from measurement, not by analogy with Linux's 16 KiB: a
+/// 16 GiB QEMU soak with 64 KiB stacks and a release-time high-water probe
+/// saw most stackful-task stacks peak at 4–12 KiB, over 7,000 at 20–32 KiB,
+/// 61 beyond 32 KiB and the deepest at 49,792 bytes — so 32 KiB (which the
+/// soak also overflowed, silently, before stacks had guards) cannot hold the
+/// real paths, and 64 KiB leaves ~14 KiB over the deepest observed. NARF's
+/// own-stack model puts a whole syscall, its futures' poll frames and the
+/// trap frames of IRQs taken mid-syscall on this one stack, and Rust frames
+/// carry large by-value futures/structs that Linux's C frames do not. The
+/// guard (`narf_memory::kstack`) turns anything deeper into a reported fault;
+/// `note_released_stack_depth` reports new depth maxima with the deepest
+/// return addresses so the heavy paths can be slimmed and this lowered.
+pub const DEFAULT_KERNEL_STACK_BYTES: usize = 64 * 1024;
 
 /// Stack-overflow tripwire: number of canary words at the LOW end of
 /// every `KernelTask` stack. A stack that grows past its bottom must
@@ -154,7 +172,10 @@ const STACK_CANARY: u64 = 0x5AFE_57AC_0F10_D511;
 /// (`StackfulAdapter::drop` → `KernelTask::mark_stack_recyclable`); a
 /// `KernelTask` freed by any other path frees its stack straight to the buddy,
 /// so a still-referenced stack can never be handed back out.
-// Kept deliberately small: the cache holds whole 32 KiB stacks, and a
+// (History: stacks were heap blocks then. They are now guarded `KernelStack`s
+// built from order-0 frames, so fragmentation no longer fails them; what the
+// cache saves is the per-page map/unmap and global TLB invalidation.)
+// Kept deliberately small: the cache holds whole 64 KiB stacks, and a
 // fork/exit storm already hovers near memory exhaustion, so a large cache would
 // sequester megabytes that the storm needs and tip it into OOM sooner (observed
 // — a 16 MiB cache OOM'd a sweep a 4 MiB one survived). A couple per CPU plus a
@@ -163,7 +184,7 @@ const STACK_MAG_SIZE: usize = 2;
 const STACK_DEPOT_CAP: usize = 32;
 
 struct StackSlots<const N: usize> {
-    slots: [Option<alloc::boxed::Box<[u8]>>; N],
+    slots: [Option<KernelStack>; N],
     len: usize,
 }
 impl<const N: usize> StackSlots<N> {
@@ -175,7 +196,7 @@ impl<const N: usize> StackSlots<N> {
     }
     /// Store `stack`, or hand it back (`Some`) when full.
     #[inline]
-    fn push(&mut self, stack: alloc::boxed::Box<[u8]>) -> Option<alloc::boxed::Box<[u8]>> {
+    fn push(&mut self, stack: KernelStack) -> Option<KernelStack> {
         if self.len >= N {
             return Some(stack);
         }
@@ -184,7 +205,7 @@ impl<const N: usize> StackSlots<N> {
         None
     }
     #[inline]
-    fn pop(&mut self) -> Option<alloc::boxed::Box<[u8]>> {
+    fn pop(&mut self) -> Option<KernelStack> {
         if self.len == 0 {
             return None;
         }
@@ -215,11 +236,13 @@ static STACK_DEPOT: narf_lib::sync::IrqSafeSpinLock<StackSlots<STACK_DEPOT_CAP>>
     narf_lib::sync::IrqSafeSpinLock::new(StackSlots::new());
 
 /// Obtain a `stack_bytes` kernel stack: this CPU's magazine first, then the
-/// global depot, then a fresh zeroed buddy allocation. Cached stacks were
+/// global depot, then a fresh zeroed guarded mapping. Cached stacks were
 /// already zeroed at free, so there is no scrub here (off the hot path);
 /// `with_stack_size` re-arms the overflow canary either way. Non-default sizes
-/// always allocate fresh.
-fn acquire_kernel_stack(stack_bytes: usize) -> alloc::boxed::Box<[u8]> {
+/// always allocate fresh. A cached stack keeps its mapping and its guards:
+/// the cache holds `KernelStack` handles, not memory (Linux keeps
+/// `NR_CACHED_STACKS` vmapped stacks per CPU the same way).
+fn acquire_kernel_stack(stack_bytes: usize) -> KernelStack {
     if stack_bytes == DEFAULT_KERNEL_STACK_BYTES {
         // Tier 1: this CPU's magazine — no shared lock on the hot path.
         let local = narf_lib::sync::without_interrupts(|| {
@@ -236,8 +259,11 @@ fn acquire_kernel_stack(stack_bytes: usize) -> alloc::boxed::Box<[u8]> {
             return stack;
         }
     }
-    // Tier 3: fresh (also the only path for non-default sizes).
-    alloc::vec![0u8; stack_bytes].into_boxed_slice()
+    // Tier 3: fresh (also the only path for non-default sizes). Infallible
+    // like the heap allocation it replaces: a task without a stack cannot be
+    // built, and the error names why.
+    KernelStack::alloc(stack_bytes)
+        .unwrap_or_else(|e| panic!("kernel stack allocation ({stack_bytes} bytes) failed: {e:?}"))
 }
 
 /// Return a default-size kernel stack to the cache after zeroing it, or let it
@@ -245,11 +271,18 @@ fn acquire_kernel_stack(stack_bytes: usize) -> alloc::boxed::Box<[u8]> {
 /// when both are full (the final `Box` drop happens outside every lock). MUST
 /// only be called once the stack is provably unreferenced — i.e. from the RCU
 /// reclaim of a `KernelTask` marked recyclable (see `KernelTask::drop`).
-fn recycle_kernel_stack(mut stack: alloc::boxed::Box<[u8]>) {
+///
+/// `used` is the stack's high-water mark (`KernelTask::stack_high_water`):
+/// every word below it, canary aside, is still zero, so only the top `used`
+/// bytes and the canary words need the scrub.
+fn recycle_kernel_stack(mut stack: KernelStack, used: usize) {
     if stack.len() != DEFAULT_KERNEL_STACK_BYTES {
-        return; // non-default: frees to the buddy here
+        return; // non-default: unmaps and frees here
     }
-    stack.fill(0); // SECURITY: scrub before the stack enters any tier
+    // SECURITY: scrub before the stack enters any tier.
+    let len = stack.len();
+    stack[len - used.min(len)..].fill(0);
+    stack[..STACK_CANARY_WORDS * 8].fill(0);
 
     // Tier 1: this CPU's magazine.
     let overflow = narf_lib::sync::without_interrupts(|| {
@@ -265,6 +298,131 @@ fn recycle_kernel_stack(mut stack: alloc::boxed::Box<[u8]>) {
     // if the depot is full too, the handed-back `Box` drops below, freeing to
     // the buddy outside the lock.
     let _buddy = STACK_DEPOT.lock().push(stack);
+}
+
+/// Deepest released-stack high-water mark seen since boot.
+static STACK_DEPTH_MAX: AtomicUsize = AtomicUsize::new(0);
+/// Depth maxima below this are routine and not reported.
+const STACK_DEPTH_REPORT_BYTES: usize = 24 * 1024;
+
+/// Report a released stack that set a new depth record past
+/// `STACK_DEPTH_REPORT_BYTES`, with the return addresses left at its deepest
+/// point (the frames of the deepest call chain stay in the stack after it
+/// unwinds; symbolise `+off` with addr2line). Runs at release, never on the
+/// path that went deep, so it cannot perturb it. Feeds the stack sizing in
+/// `DEFAULT_KERNEL_STACK_BYTES`.
+fn note_released_stack_depth(stack: &KernelStack, used: usize) {
+    if used < STACK_DEPTH_REPORT_BYTES || used <= STACK_DEPTH_MAX.fetch_max(used, Ordering::Relaxed)
+    {
+        return;
+    }
+    extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+    }
+    let (ts, te) = (
+        core::ptr::addr_of!(__text_start) as u64,
+        core::ptr::addr_of!(__text_end) as u64,
+    );
+    narf_console::klog!(
+        "KSTACK-DEPTH record: {} of {} bytes (stack {:#x}); deepest return addresses:",
+        used,
+        stack.len(),
+        stack.base()
+    );
+    let deepest = stack.len() - used.min(stack.len());
+    let mut shown = 0;
+    let mut off = deepest & !7;
+    while off + 8 <= stack.len() && shown < 16 {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&stack[off..off + 8]);
+        let v = u64::from_ne_bytes(w);
+        if (ts..te).contains(&v) {
+            narf_console::klog!(
+                "KSTACK-DEPTH   [top-{:#x}] {:#x} (+{:#x})",
+                stack.len() - off,
+                v,
+                v - ts
+            );
+            shown += 1;
+        }
+        off += 8;
+    }
+}
+
+// ── Kernel-stack overflow: test expectation + recovery ───────────────
+//
+// An overflow is fatal: the trap layer's report (`frame/kstack_overflow.rs`)
+// panics. The only exception is a kernel test that deliberately overflows a
+// task it owns: it arms the expected stack base, and the report then retires
+// that task (`exit_current_stackful`) instead of panicking, so the test can
+// assert the guard fired. Arming exists only in kernel-test builds; in every
+// other build `overflow_test_recovery` always answers `None`.
+
+/// Stack base a kernel test expects to overflow (0 = none armed).
+static OVERFLOW_EXPECT_BASE: AtomicU64 = AtomicU64::new(0);
+/// Guard address of the last expected overflow (0 = none seen yet).
+static OVERFLOW_SEEN_FAULT: AtomicU64 = AtomicU64::new(0);
+
+/// Arm (`base != 0`) or disarm (`0`) the overflow expectation.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __arm_overflow_expectation(base: u64) {
+    // Arming clears the last observation; disarming keeps it for the test.
+    if base != 0 {
+        OVERFLOW_SEEN_FAULT.store(0, Ordering::Release);
+    }
+    OVERFLOW_EXPECT_BASE.store(base, Ordering::Release);
+}
+
+/// Guard address the last expected overflow faulted on, if one was seen.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __overflow_seen() -> Option<u64> {
+    match OVERFLOW_SEEN_FAULT.load(Ordering::Acquire) {
+        0 => None,
+        f => Some(f),
+    }
+}
+
+/// Called by the trap layer after it reported an overflow of the stack
+/// `[base, top)` at guard address `fault`. Returns the `(pc, sp)` to resume at
+/// when a kernel test armed exactly this overflow (consuming the expectation);
+/// `None` otherwise, and the caller panics. The resume point runs on the top
+/// of the overflowed stack — whose contents are dead, the task never returns
+/// to them — and retires the task.
+pub fn overflow_test_recovery(base: u64, top: u64, fault: u64) -> Option<(u64, u64)> {
+    if base == 0
+        || OVERFLOW_EXPECT_BASE
+            .compare_exchange(base, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return None;
+    }
+    OVERFLOW_SEEN_FAULT.store(fault.max(1), Ordering::Release);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Function-entry alignment: rsp ≡ 8 (mod 16), as after a `call`.
+        Some((overflow_test_recover as usize as u64, (top & !0xF) - 8))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        Some((overflow_test_recover as usize as u64, top & !0xF))
+    }
+}
+
+/// Resume point of an expected overflow: re-arm the canary the recursion ran
+/// through, then retire the task exactly like a direct exit.
+extern "C" fn overflow_test_recover() -> ! {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: the overflowed task is current on this CPU; its continuation
+        // is abandoned, so this is the only code touching it.
+        unsafe { (*p).rearm_stack_canary() };
+    }
+    // SAFETY: kernel mode, on the current task's own stack (its top).
+    unsafe { exit_current_stackful() }
 }
 
 /// One cache-line-isolated CPU-local value. Scheduler context transitions
@@ -1698,6 +1856,18 @@ pub fn current_stackful_stack_top() -> u64 {
     ((task.stack.as_ptr() as u64) + task.stack.len() as u64) & !0xFu64
 }
 
+/// `(high-water bytes, stack bytes)` of the stackful task running on this
+/// CPU, or `None` outside one. See [`KernelTask::stack_high_water`].
+pub fn current_stackful_high_water() -> Option<(usize, usize)> {
+    let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: `p` is the in-flight task on this CPU, alive while it runs.
+    let task = unsafe { &*p };
+    Some((task.stack_high_water(), task.stack.len()))
+}
+
 /// Per-CPU storage for the cooperative executor's resume context.
 ///
 /// `StackfulAdapter::poll` switches into a stackful task and the task
@@ -2127,9 +2297,9 @@ pub struct KernelTask {
     /// The future being driven. Pinned in a Box so its address is
     /// stable across poll calls.
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
-    /// Per-task kernel stack. Box<[u8]> for automatic drop. Size
-    /// captured at `new()` time; phase 1b doesn't grow stacks.
-    stack: Box<[u8]>,
+    /// Per-task kernel stack: a guarded vmapped [`KernelStack`] (unmapped VA
+    /// below and above). Size captured at `new()` time; stacks don't grow.
+    stack: KernelStack,
     /// Set only on the RCU-confirmed-dead reclaim path
     /// (`StackfulAdapter::drop`). When set, `Drop` returns `stack` to the
     /// per-CPU stack cache for reuse; when clear (a `KernelTask` freed by any
@@ -2352,13 +2522,17 @@ impl KernelTask {
     }
 
     /// Same as `new` but with a custom stack size. Must be ≥ 4 KiB
-    /// (one page) and 16-byte aligned. Caller-driven for drivers
-    /// that genuinely need deeper stacks.
+    /// (one page), ≤ `KSTACK_MAX_BYTES` (128 KiB) and 16-byte aligned.
+    /// Caller-driven for drivers that genuinely need deeper stacks.
     pub fn with_stack_size<F>(future: F, stack_bytes: usize) -> Box<Self>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         assert!(stack_bytes >= 4096, "kernel stack must be ≥ 4 KiB");
+        assert!(
+            stack_bytes <= narf_memory::kstack::KSTACK_MAX_BYTES,
+            "kernel stack must be ≤ 128 KiB"
+        );
         assert!(
             stack_bytes & 0xF == 0,
             "kernel stack must be 16-byte aligned"
@@ -2369,7 +2543,7 @@ impl KernelTask {
         // rsp at this stack — both pointers must stay valid). Reuses a
         // recycled default-size stack when available (see STACK_CACHE) so a
         // fork storm does not churn an order-3 buddy block per task.
-        let mut stack: Box<[u8]> = acquire_kernel_stack(stack_bytes);
+        let mut stack: KernelStack = acquire_kernel_stack(stack_bytes);
 
         // Arm the overflow tripwire at the LOW end of the stack. See
         // STACK_CANARY: a stack overrunning its bottom pushes through
@@ -2519,6 +2693,39 @@ impl KernelTask {
             }
         }
         None
+    }
+
+    /// Deepest bytes of this task's stack ever written: stacks start zeroed
+    /// (fresh mappings and recycled stacks alike), so the lowest non-zero word
+    /// above the canary marks the high-water mark. Linux `stack_not_used`
+    /// (`CONFIG_DEBUG_STACK_USAGE`) measures the same way. A stack whose canary
+    /// is gone reports its full length.
+    pub fn stack_high_water(&self) -> usize {
+        if self.stack_canary_clobbered().is_some() {
+            return self.stack.len();
+        }
+        let words = self.stack.len() / 8;
+        for i in STACK_CANARY_WORDS..words {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&self.stack[i * 8..(i + 1) * 8]);
+            if u64::from_ne_bytes(w) != 0 {
+                return self.stack.len() - i * 8;
+            }
+        }
+        0
+    }
+
+    /// Bounds `[base, top)` of this task's kernel stack.
+    pub fn stack_bounds(&self) -> (u64, u64) {
+        (self.stack.base(), self.stack.top())
+    }
+
+    /// Re-write the low-end canary words (the overflow test's recovery: its
+    /// deliberate overflow ran through them before reaching the guard).
+    fn rearm_stack_canary(&mut self) {
+        for i in 0..STACK_CANARY_WORDS {
+            self.stack[i * 8..(i + 1) * 8].copy_from_slice(&STACK_CANARY.to_ne_bytes());
+        }
     }
 
     /// Resume the task. Switches to its stack and lets it run
@@ -3178,8 +3385,8 @@ impl Drop for KernelTask {
         self.unbind_wake_cell();
         self.drop_active_poll_waker();
         self.clear_current_slots();
-        // Recycle the stack to the per-CPU cache instead of freeing its 8
-        // contiguous frames to the buddy — ONLY when this drop is the
+        // Recycle the stack (mapping and guards included) to the per-CPU cache
+        // instead of unmapping it and freeing its frames — ONLY when this drop is the
         // RCU-confirmed-dead reclaim (`recyclable_stack` set by
         // `StackfulAdapter::drop`), the sole point the stack is provably
         // unreferenced by any CPU. Any other free path (the backstop for a
@@ -3187,11 +3394,13 @@ impl Drop for KernelTask {
         // stack drops here and frees to the buddy — never handed back out while
         // a stale `rsp` might still point into it. `mem::take` leaves an empty,
         // non-allocating placeholder so the field's own drop is a no-op.
+        let used = self.stack_high_water();
+        note_released_stack_depth(&self.stack, used);
         let stack = core::mem::take(&mut self.stack);
         if self.recyclable_stack.load(Ordering::Acquire) {
-            recycle_kernel_stack(stack);
+            recycle_kernel_stack(stack, used);
         }
-        // else: `stack` frees to the buddy as it drops here.
+        // else: `stack` unmaps and frees its frames as it drops here.
     }
 }
 
@@ -3626,7 +3835,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // #UD. Catch it with attribution instead of silently corrupting.
     let frame_addr = frame as *const TrapFrame as u64;
     // SAFETY: live KernelTask per the CURRENT_STACKFUL_TASK invariant above;
-    // `stack` is a `Box<[u8]>` whose base/len bound the task's kernel stack.
+    // `stack` is a `KernelStack` whose base/len bound the task's kernel stack.
     let task_ref: &KernelTask = unsafe { &*task_ptr };
     let stk_base = task_ref.stack.as_ptr() as u64;
     let stk_top = stk_base + task_ref.stack.len() as u64;
@@ -4943,6 +5152,144 @@ impl Future for StackfulAdapter {
 }
 
 // Tests are inline below — same gating as the kernel_ctx smokes.
+
+/// Guarded-stack tests (`scheduler/kstack`): a real overflow must end on the
+/// guard and be reported, and the wake path's measured stack cost.
+#[cfg(feature = "kernel-test")]
+pub mod kstack_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// One ~256-byte frame per level, kept alive by `black_box`, with work
+    /// after the call so it cannot become a loop.
+    #[inline(never)]
+    fn recurse(depth: u64, stop: u64, at_bottom: &mut dyn FnMut()) -> u64 {
+        let frame = core::hint::black_box([depth; 32]);
+        if depth == stop {
+            at_bottom();
+            return frame[1];
+        }
+        recurse(depth + 1, stop, at_bottom).wrapping_add(core::hint::black_box(frame[3]))
+    }
+
+    /// Recurses until the stack runs out.
+    struct Overflow;
+    impl Future for Overflow {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            core::hint::black_box(recurse(0, u64::MAX, &mut || {}));
+            Poll::Ready(())
+        }
+    }
+
+    /// A task that recurses off the bottom of its stack must fault on the
+    /// guard below it and be reported (here: retired, because the test armed
+    /// the expectation; otherwise the report panics). Before guard pages the
+    /// same recursion wrote straight into the frame below the stack.
+    fn smoke_kstack_overflow_faults_on_guard() -> TestResult {
+        let mut task = KernelTask::new(Overflow);
+        let (base, _top) = task.stack_bounds();
+        __arm_overflow_expectation(base);
+        #[allow(clippy::default_constructed_unit_structs)]
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: single-threaded test; the task is driven only from here.
+        let result = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        __arm_overflow_expectation(0);
+        let Some(fault) = __overflow_seen() else {
+            return TestResult::Fail("overflow was not reported by the guard fault");
+        };
+        if fault >= base || base - fault > narf_memory::kstack::KSTACK_MAX_BYTES as u64 {
+            return TestResult::Fail("reported fault is not in the guard below the stack");
+        }
+        if result != Poll::Ready(()) {
+            return TestResult::Fail("overflowed task was not retired");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("scheduler/kstack", smoke_kstack_overflow_faults_on_guard);
+
+    static PARKED_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    static PLAIN_HW: AtomicUsize = AtomicUsize::new(0);
+    static WAKE_HW: AtomicUsize = AtomicUsize::new(0);
+    static STACK_LEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Parks once, recording its scheduler waker; completes when woken.
+    struct ParkOnce(bool);
+    impl Future for ParkOnce {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            if this.0 {
+                return Poll::Ready(());
+            }
+            *PARKED_WAKER.lock() = Some(cx.waker().clone());
+            this.0 = true;
+            Poll::Pending
+        }
+    }
+
+    /// Recursion depth used for both runs: ~14 KiB of the default stack.
+    const DEPTH: u64 = 48;
+
+    /// The wake path run at depth on a task stack, the way a wake from an
+    /// interrupt landing on a deep syscall stack runs: IRQs masked, real
+    /// scheduler waker of a parked task, full `wake_by_ref` → placement path.
+    /// Its cost is the high-water difference against the same recursion
+    /// without the wake, each on a fresh zeroed stack. The wake must leave at
+    /// least a quarter of the stack free.
+    fn smoke_kstack_wake_path_headroom() -> TestResult {
+        crate::__reset_queues_for_test();
+        *PARKED_WAKER.lock() = None;
+        crate::spawn(ParkOnce(false));
+        crate::spawn_stackful(async {
+            crate::yield_now().await;
+            core::hint::black_box(recurse(0, DEPTH, &mut || {}));
+            if let Some((hw, len)) = current_stackful_high_water() {
+                PLAIN_HW.store(hw, Ordering::Release);
+                STACK_LEN.store(len, Ordering::Release);
+            }
+        });
+        crate::spawn_stackful(async {
+            crate::yield_now().await;
+            crate::yield_now().await;
+            let waker = PARKED_WAKER.lock().take();
+            core::hint::black_box(recurse(0, DEPTH, &mut || {
+                if let Some(w) = waker.as_ref() {
+                    narf_lib::sync::without_interrupts(|| w.wake_by_ref());
+                }
+            }));
+            if let Some((hw, _)) = current_stackful_high_water() {
+                WAKE_HW.store(hw, Ordering::Release);
+            }
+        });
+        crate::run_until_empty();
+        let (plain, wake, len) = (
+            PLAIN_HW.load(Ordering::Acquire),
+            WAKE_HW.load(Ordering::Acquire),
+            STACK_LEN.load(Ordering::Acquire),
+        );
+        narf_console::klog!(
+            "[kstack] wake path at depth: plain {} B, with wake {} B, wake cost {} B, stack {} B",
+            plain,
+            wake,
+            wake.saturating_sub(plain),
+            len
+        );
+        if plain == 0 || wake == 0 || len == 0 {
+            return TestResult::Fail("high-water marks not recorded");
+        }
+        if wake <= plain {
+            return TestResult::Fail("wake at depth used no stack: not measured");
+        }
+        if wake > len - len / 4 {
+            return TestResult::Fail("wake path at depth left under a quarter of the stack");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("scheduler/kstack", smoke_kstack_wake_path_headroom);
+}
 
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {

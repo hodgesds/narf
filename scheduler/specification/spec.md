@@ -190,6 +190,16 @@ pub fn stackful::materialize_current_user_fpu() -> bool;
 pub fn stackful::reset_current_user_fpu() -> bool;
 #[cfg(target_arch = "x86_64")]
 pub fn stackful::handle_user_fpu_unavailable() -> bool;
+/// Guarded kernel stacks: every stackful task runs on a `narf_memory::kstack::
+/// KernelStack` (≤ 128 KiB; `StackfulOptions::stack_bytes` above that panics).
+pub fn stackful::KernelTask::stack_bounds(&self) -> (u64, u64);
+/// Bytes of the task stack ever written (stacks start zeroed).
+pub fn stackful::KernelTask::stack_high_water(&self) -> usize;
+pub fn stackful::current_stackful_high_water() -> Option<(usize, usize)>;
+/// Trap layer, after reporting an overflow of [base, top) at `fault`:
+/// Some((pc, sp)) only for an overflow a kernel test armed for this stack.
+pub fn stackful::overflow_test_recovery(base: u64, top: u64, fault: u64)
+    -> Option<(u64, u64)>;
 pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 /// Mark a dequeued synchronous waiter for an immediate local handoff.
@@ -1129,6 +1139,18 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
 
 ## 4. Invariants & safety properties
 
+- **Every stackful task stack is guarded** (`memory/` §4, kernel stacks): an
+  overflow faults on unmapped VA and is reported by `frame/` (§4), never
+  written into a neighbouring object. The per-CPU stack cache holds
+  `KernelStack` handles, so a recycled stack keeps its mapping and guards; it
+  is zeroed before it enters the cache and is recycled only on the
+  RCU-confirmed-dead path. An overflowed task is never resumed: outside
+  kernel-test builds the report panics.
+- **The raw-waker path reserves no `TaskSlot`-sized frame.** Helpers that move
+  a `TaskSlot` (`try_activate_parked_local`, `try_sync_wake_affine`,
+  `try_migrate_wakee_to`) stay out of line, so a wake that does not move a
+  slot — the common case, and the one taken from interrupts on a deep task
+  stack — pays only its own small frames.
 - A task initially polls in its spawn domain and resumes in its saved domain;
   scope entry/exit updates the same task-owned logical authority state.
 - A user task polls with its own address-space root active. On both
