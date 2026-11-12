@@ -1848,6 +1848,19 @@ pub fn alloc_user_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocEr
     alloc_frame_on_strict_inner(node, node, AllocContext::User, false)
 }
 
+/// Bytes of user memory (anonymous and file pages) charged to memory cgroups
+/// right now; 0 without the `cgroup` feature.
+pub fn user_charged_bytes() -> u64 {
+    #[cfg(feature = "cgroup")]
+    {
+        crate::cgroup_charge::user_charged_bytes()
+    }
+    #[cfg(not(feature = "cgroup"))]
+    {
+        0
+    }
+}
+
 /// Move the memory-cgroup charge of a migrating page from `old` to `new`.
 /// Call once the destination exists; the old frame's final free then
 /// uncharges nothing, and the new frame's uncharges the original cgroup.
