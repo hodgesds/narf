@@ -1466,6 +1466,47 @@ kernel_test_in!(
     smoke_scheduler_steal_policies_see_staged_wakes
 );
 
+/// Turn tickless idle on, as production boots, and let every AP pass through
+/// one more idle entry so the ones that idle stop their periodic tick. The
+/// kernel-test boot leaves it off. Returns whether a tickless clockevent is in
+/// use: some AP's tick stopped.
+fn enter_tickless_idle(aps: u64) -> bool {
+    narf_time::set_nohz_idle_enabled(true);
+    // An idle AP still ticks until its next tick, when it re-enters idle with
+    // tickless on. Two tick periods (100 Hz) cover that.
+    wait_for(1_000_000_000, || {
+        (0..MAX_CPUS).any(|cpu| aps & (1u64 << cpu) != 0 && !narf_time::periodic_tick_wanted(cpu))
+    })
+}
+
+/// Undo [`enter_tickless_idle`]: tickless off, and every AP dispatches once so
+/// its periodic tick is running again before the next test.
+fn leave_tickless_idle(aps: u64) {
+    static WOKE: AtomicUsize = AtomicUsize::new(0);
+    narf_time::set_nohz_idle_enabled(false);
+    WOKE.store(0, Ordering::Release);
+    let mut count = 0;
+    for cpu in (0..MAX_CPUS).filter(|cpu| aps & (1u64 << cpu) != 0) {
+        crate::spawn_with_spec(
+            async {
+                WOKE.fetch_add(1, Ordering::AcqRel);
+            },
+            TaskSpec {
+                affinity: Affinity::pinned(CpuId(cpu as u32)),
+                ..TaskSpec::kernel_any()
+            },
+        );
+        count += 1;
+    }
+    let _ = wait_for(1_000_000_000, || WOKE.load(Ordering::Acquire) == count);
+}
+
+/// Every AP that really came up, as a mask.
+fn live_aps() -> u64 {
+    let me = narf_lib::percpu::current_cpu();
+    narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap() & !(1u64 << me)
+}
+
 /// Spawn probe `slot` preferring `cpu` and wait until it has run once and is
 /// parked there.
 fn park_probe_on_real_cpu(slot: usize, cpu: usize) -> bool {
@@ -1490,36 +1531,50 @@ const WAKE_BOUND_NS: u64 = 100_000_000;
 
 /// A wake aimed at a halted CPU wakes it with one reschedule IPI: under
 /// tickless idle there is no tick to wait for, so the task runs only because
-/// of the IPI the wake sent.
+/// of the IPI the wake sent. A CPU the idle governor keeps polling instead of
+/// halting gets none and still runs it at once.
 fn smoke_scheduler_wake_to_idle_cpu_runs_by_ipi() -> TestResult {
     reset_probes();
     let me = narf_lib::percpu::current_cpu();
-    let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
-    let Some(ap) = (0..MAX_CPUS).find(|cpu| *cpu != me && live & (1u64 << cpu) != 0) else {
+    let aps = live_aps();
+    let Some(ap) = (0..MAX_CPUS).find(|cpu| aps & (1u64 << cpu) != 0) else {
         return TestResult::Skip("needs a second CPU that really came up");
     };
+    if !enter_tickless_idle(aps) {
+        leave_tickless_idle(aps);
+        return TestResult::Skip("no AP stopped its tick: no tickless clockevent");
+    }
     if !park_probe_on_real_cpu(0, ap) {
+        leave_tickless_idle(aps);
         reset_probes();
         return TestResult::Fail("the AP did not run and park a task enqueued onto it");
     }
-    if !wait_for(1_000_000_000, || {
-        crate::CPU_HALTED[ap].load(Ordering::SeqCst)
-    }) {
-        reset_probes();
-        return TestResult::Skip("the AP did not go idle");
-    }
+    let tickless = wait_for(1_000_000_000, || {
+        crate::CPU_HALTED[ap].load(Ordering::SeqCst) && !narf_time::periodic_tick_wanted(ap)
+    });
     let Some(waker) = take_waker(0) else {
+        leave_tickless_idle(aps);
         reset_probes();
         return TestResult::Fail("probe published no waker");
     };
     let ipis = crate::__test_resched_ipis_sent(me);
+    let halted_at_wake = crate::CPU_HALTED[ap].load(Ordering::SeqCst);
     waker.wake();
     let sent = crate::__test_resched_ipis_sent(me).wrapping_sub(ipis);
     let ran = wait_for(WAKE_BOUND_NS, || polls(0) == 2);
     let ran_on = PROBE_LAST_CPU[0].load(Ordering::Acquire);
+    leave_tickless_idle(aps);
     reset_probes();
-    if sent != 1 {
-        return TestResult::Fail("a wake to a halted CPU did not send exactly one IPI");
+    if !tickless {
+        return TestResult::Skip("the AP did not go tickless-idle");
+    }
+    if sent > 1 {
+        return TestResult::Fail("a wake to an idle CPU sent more than one IPI");
+    }
+    // A CPU the idle governor keeps polling is not halted and needs no IPI
+    // (Linux `TIF_POLLING_NRFLAG`); one seen halted just before the wake does.
+    if sent == 0 && halted_at_wake {
+        return TestResult::Fail("a wake to a CPU seen halted sent no IPI");
     }
     if !ran || ran_on != ap {
         return TestResult::Fail("a task woken on a halted CPU did not run there promptly");
@@ -1544,15 +1599,20 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
     static MASKED_DONE: AtomicBool = AtomicBool::new(false);
     reset_probes();
     let me = narf_lib::percpu::current_cpu();
-    let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
-    let mut aps = (0..MAX_CPUS).filter(|cpu| *cpu != me && live & (1u64 << cpu) != 0);
+    let live = live_aps();
+    let mut aps = (0..MAX_CPUS).filter(|cpu| live & (1u64 << cpu) != 0);
     let (Some(held), Some(_)) = (aps.next(), aps.next()) else {
         return TestResult::Skip("needs two APs that really came up");
     };
+    if !enter_tickless_idle(live) {
+        leave_tickless_idle(live);
+        return TestResult::Skip("no AP stopped its tick: no tickless clockevent");
+    }
     MASKED_STARTED.store(false, Ordering::Release);
     MASKED_RELEASE.store(false, Ordering::Release);
     MASKED_DONE.store(false, Ordering::Release);
     if !park_probe_on_real_cpu(0, held) {
+        leave_tickless_idle(live);
         reset_probes();
         return TestResult::Fail("the AP did not run and park a task enqueued onto it");
     }
@@ -1573,9 +1633,20 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
     );
     if !wait_for(1_000_000_000, || MASKED_STARTED.load(Ordering::Acquire)) {
         MASKED_RELEASE.store(true, Ordering::Release);
+        leave_tickless_idle(live);
         reset_probes();
         return TestResult::Fail("the AP did not start the masked section");
     }
+    // Every other AP is idle with its tick stopped; nothing periodic will
+    // come along and look at the held CPU's queues.
+    let _ = wait_for(100_000_000, || {
+        (0..MAX_CPUS).all(|cpu| {
+            cpu == held
+                || live & (1u64 << cpu) == 0
+                || (crate::CPU_HALTED[cpu].load(Ordering::SeqCst)
+                    && !narf_time::periodic_tick_wanted(cpu))
+        })
+    });
     crate::enable_work_stealing();
     let placements = crate::__test_wake_placements();
 
@@ -1606,6 +1677,7 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
     MASKED_RELEASE.store(true, Ordering::Release);
     let released = wait_for(1_000_000_000, || MASKED_DONE.load(Ordering::Acquire));
     crate::disable_work_stealing();
+    leave_tickless_idle(live);
     reset_probes();
 
     let (Some(wake_ipis), Some(enqueue_ipis)) = (woke, enqueued) else {
