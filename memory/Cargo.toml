@@ -68,6 +68,16 @@ slab-free-audit = []
 # atomic op per alloc/free.
 frame-alloc-audit = []
 
+# Free-frame poison check (Linux CONFIG_PAGE_POISONING): every frame is
+# filled with 0xDEAD_BEEF_DEAD_BEEF as it becomes free — on every free path,
+# per-CPU caches included — and verified as it is handed out again. A store
+# into free memory panics at the next hand-out of that frame, naming the
+# frame, the first changed word's offset and value, and the words around it
+# (plus alloc/free sites with frame-alloc-audit). Off by default — adds a
+# 4 KiB write per freed frame, a 4 KiB read per allocated frame, and a pass
+# over all free RAM at boot.
+frame-poison-check = []
+
 # Reverse-map free-site audit: the Linux `free_pages_prepare` "nonzero
 # mapcount" `bad_page` analogue. On every buddy free of a final-owner frame,
 # assert the frame has no `rmap` owners; panic at the SOURCE naming the
