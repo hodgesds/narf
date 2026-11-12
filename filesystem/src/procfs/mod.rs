@@ -2903,6 +2903,38 @@ fn gen_cpuinfo() -> String {
     s
 }
 
+/// What the mapped-file page cache (in `narf_userspace`) holds, for
+/// `/proc/meminfo`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageCacheStats {
+    /// Cached file pages (frames), mapped or not.
+    pub pages: u64,
+    /// Unmapped pages still waiting for writeback.
+    pub unwritten_unmapped: u64,
+    /// Kernel heap bytes held by the cache's own records (page records,
+    /// their index nodes, per-file entries) — not by the pages.
+    pub record_bytes: u64,
+}
+
+type PageCacheStatsFn = fn() -> PageCacheStats;
+static PAGE_CACHE_STATS_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire `/proc/meminfo`'s page-cache figures.
+pub fn set_page_cache_stats_hook(f: PageCacheStatsFn) {
+    PAGE_CACHE_STATS_HOOK.store(f as usize, Ordering::Release);
+}
+
+fn page_cache_stats() -> PageCacheStats {
+    let v = PAGE_CACHE_STATS_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return PageCacheStats::default();
+    }
+    // SAFETY: only `set_page_cache_stats_hook` stores here, a
+    // `PageCacheStatsFn`.
+    let f: PageCacheStatsFn = unsafe { core::mem::transmute(v) };
+    f()
+}
+
 fn gen_meminfo() -> String {
     use core::fmt::Write as _;
     let stats = narf_memory::frame::stats();
@@ -2920,7 +2952,8 @@ fn gen_meminfo() -> String {
     // still produces a meaningful number.
     let _ = writeln!(s, "MemAvailable: {:>10} kB", free_kb);
     let _ = writeln!(s, "Buffers:      {:>10} kB", 0);
-    let _ = writeln!(s, "Cached:       {:>10} kB", 0);
+    let cache = page_cache_stats();
+    let _ = writeln!(s, "Cached:       {:>10} kB", cache.pages * 4);
     let _ = writeln!(s, "SwapCached:   {:>10} kB", 0);
     // NARF has no swap. Linux still prints both lines on a swapless kernel,
     // and systemd-oomd refuses to start without them ("Failed to get
@@ -2931,6 +2964,15 @@ fn gen_meminfo() -> String {
     let _ = writeln!(s, "SReclaimable: {:>10} kB", 0);
     let _ = writeln!(s, "SUnreclaim:   {:>10} kB", slab_unreclaimable_kb);
     let _ = writeln!(s, "Reserved:     {:>10} kB", reserved_kb);
+    // NARF-specific (tools skip lines they do not know): the mapped-file
+    // cache's own heap, inside `Slab` above, and its unmapped pages still
+    // waiting for writeback.
+    let _ = writeln!(s, "NarfCacheRecords: {:>6} kB", cache.record_bytes / 1024);
+    let _ = writeln!(
+        s,
+        "NarfCacheUnwritten: {:>4} kB",
+        cache.unwritten_unmapped * 4
+    );
     s
 }
 

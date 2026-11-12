@@ -445,29 +445,52 @@ pub(super) fn write_protect_pages(anchor: usize, pages: &[(u64, PhysAddr)]) {
     }
 }
 
+/// Pages one hold of a mapper's VMA transaction may unmap. That
+/// transaction is an interrupts-off spinlock, and every zap under it ends
+/// in a cross-CPU TLB shootdown; a fault in the same address space and every
+/// other CPU waiting on an IPI wait for the whole hold. A soak that held it
+/// across thousands of single-page zaps saw nine CPUs report hard lockups
+/// at once.
+const UNMAP_PAGES_PER_HOLD: u64 = 16;
+
 /// Remove these pages from every mapping that maps them, keeping the VMAs:
 /// a later access refaults from the cache or the file (Linux
 /// `try_to_unmap`). Each removal releases the mapping's hold on the page.
+///
+/// Neighbouring pages are unmapped as one range (one TLB shootdown), at
+/// most [`UNMAP_PAGES_PER_HOLD`] pages per hold of the address space's VMA
+/// transaction, which is released between holds.
 pub(super) fn unmap_pages(anchor: usize, pages: &[(u64, PhysAddr)]) {
-    for (space, hits) in page_mappings(anchor, pages) {
+    for (space, mut hits) in page_mappings(anchor, pages) {
         let id = space.identity();
-        space.with_vma_transaction(|| {
-            narf_memory::with_address_space_shared_mapping_transaction(id, || {
-                for (vaddr, _) in &hits {
-                    let _ = publish_current_zap(id, *vaddr, 4096, || {
+        hits.sort_unstable_by_key(|(vaddr, _)| *vaddr);
+        let mut index = 0;
+        while index < hits.len() {
+            let base = hits[index].0;
+            let mut pages = 1u64;
+            while index + (pages as usize) < hits.len()
+                && pages < UNMAP_PAGES_PER_HOLD
+                && hits[index + pages as usize].0 == base + pages * 4096
+            {
+                pages += 1;
+            }
+            index += pages as usize;
+            space.with_vma_transaction(|| {
+                narf_memory::with_address_space_shared_mapping_transaction(id, || {
+                    let _ = publish_current_zap(id, base, pages * 4096, || {
                         // SAFETY: the enclosing closures hold this address
                         // space's VMA and shared-owner transactions in order.
                         unsafe {
                             space.zap_mapping_range_locked_for_syscall_with_shared(
-                                narf_memory::VirtAddr::new(*vaddr),
-                                4096,
+                                narf_memory::VirtAddr::new(base),
+                                pages * 4096,
                                 true,
                             )
                         }
                     });
-                }
-            })
-        });
+                })
+            });
+        }
     }
 }
 
@@ -3180,6 +3203,30 @@ fn retain_page(phys: u64, writable: bool) -> bool {
     // Dirtiness is recorded by the write-notify fault, not by who maps it.
     let _ = writable;
     true
+}
+
+/// `/proc/meminfo`'s figures for the cache. Counts are O(1); a cache lock
+/// held elsewhere reads as zero rather than waiting.
+pub(crate) fn page_cache_stats() -> narf_filesystem::procfs::PageCacheStats {
+    // A B-tree entry costs its key and value plus about a third again of
+    // node overhead.
+    fn entry<K, V>() -> u64 {
+        ((core::mem::size_of::<K>() + core::mem::size_of::<V>()) * 4 / 3) as u64
+    }
+    let Some(pages) = SHARED_FILE_PAGES.try_lock() else {
+        return narf_filesystem::procfs::PageCacheStats::default();
+    };
+    let cached = pages.by_phys.len() as u64;
+    let record_bytes = cached * (entry::<u64, SharedFilePage>() + entry::<SharedFileKey, u64>())
+        + pages.files.len() as u64
+            * (entry::<SharedFileIdentity, FileSlot>()
+                + core::mem::size_of::<writeback::CachedFile>() as u64)
+        + (pages.idle_dirty.len() + pages.idle_clean.len()) as u64 * entry::<SharedFileKey, ()>();
+    narf_filesystem::procfs::PageCacheStats {
+        pages: cached,
+        unwritten_unmapped: pages.idle_dirty.len() as u64,
+        record_bytes,
+    }
 }
 
 /// memory's `write_enabled` hook: may a writable shared mapping's PTE for
