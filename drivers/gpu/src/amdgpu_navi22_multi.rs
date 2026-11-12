@@ -203,7 +203,7 @@ const MPC_OUT_STRIDE: u64 = 4; // linux: mmMPC_OUT1_MUX - mmMPC_OUT0_MUX
 const MPC_OUT_RATE_CONTROL_DISABLE: u32 = 1 << 8; // linux: MPC_OUT0_MUX__MPC_OUT_RATE_CONTROL_DISABLE_MASK
 const MPC_OUT_RATE_CONTROL: u32 = 1 << 9; // linux: MPC_OUT0_MUX__MPC_OUT_RATE_CONTROL_MASK
 
-impl Pipeline {
+impl PipelineInner {
     fn odm_reg(&self, reg: u64) -> u64 {
         self.d2(reg + u64::from(self.route.pipe) * ODM_STRIDE)
     }
@@ -1178,7 +1178,7 @@ impl Group {
         // prepare_bandwidth for the whole context: accelerated mode, the
         // clocks every stream needs, then the one watermark set.
         self.at(Phase::Bandwidth);
-        let lead = &mut self.members[0];
+        let lead: &mut PipelineInner = &mut self.members[0];
         lead.at(Step::Clocks);
         lead.regs.update(
             lead.nbio1 + BIOS_SCRATCH_6 * 4,
@@ -1648,7 +1648,7 @@ impl Group {
             let signal = self.requests[k].connector.signal;
             let dig = lease.route.stream;
             lend_clocks(&mut self.members, k);
-            let m = &mut self.members[k];
+            let m: &mut PipelineInner = &mut self.members[k];
             if m.reached >= Step::Plane && m.audio.record(dig).is_some() {
                 let _ = m.audio.stop(dig, &mut m.clocks).await;
             }
