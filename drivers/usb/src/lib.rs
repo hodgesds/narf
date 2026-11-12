@@ -43,6 +43,7 @@ pub mod rndis;
 pub mod serial;
 pub mod uac;
 pub mod uac_card;
+pub mod uas;
 pub mod uhci;
 pub mod uvc;
 pub mod wbdi;

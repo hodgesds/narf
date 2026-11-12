@@ -54,8 +54,11 @@
 //! (UNIT ATTENTION, spin-up), a Phase Error or an unparseable
 //! CSW triggers Reset Recovery (§5.3) and one retry, and a
 //! durable failure surfaces with its sense data attached
-//! ([`MscError::Sense`]). UAS (USB Attached SCSI) remains
-//! deferred — no issue in the MSC family covers it.
+//! ([`MscError::Sense`]). UAS (USB Attached SCSI) detection and
+//! streams negotiation live in [`crate::uas`] (slice 1 of #833);
+//! the Command/Status IU transport that would make a UAS bind
+//! usable is slice 2, so the attach cascade stays BOT-only and a
+//! UAS device keeps working through its BOT alternate setting.
 
 use alloc::vec::Vec;
 

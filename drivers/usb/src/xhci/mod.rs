@@ -710,7 +710,7 @@ impl EndpointKind {
 /// USB `bInterval`; [`Xhci::configure_endpoints`] translates it to
 /// the xHCI Endpoint Context encoding using the addressed slot's
 /// negotiated speed.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct EndpointConfig {
     pub ep_addr: u8,
     pub max_packet: u16,
@@ -737,6 +737,20 @@ pub(crate) struct EndpointContextParams {
     pub interval: u8,
     pub max_esit_payload: u32,
     pub error_count: u8,
+}
+
+/// Endpoint Context dword 0 bits for `MaxPStreams` (xHCI 1.2 §6.2.3
+/// Table 6-8, bits 14:10; Linux `EP_MAXPSTREAMS(p)`). The value is
+/// the negotiated stream count encoded as `MaxPStreams =
+/// log2(count) - 1` (see `uas::max_pstreams_encode`); 0 disables
+/// streams. Slice 2 ORs this into the Endpoint Context dword 0 built
+/// by `configure_endpoints_generation` once Stream Context Arrays
+/// exist — writing a nonzero value today would be invalid (§6.2.3.2:
+/// `MaxPStreams > 0` requires the TR Dequeue Pointer to reference a
+/// Primary Stream Context Array, which this tree does not allocate
+/// yet), so nothing calls this yet.
+pub const fn ep_context_max_pstreams_field(max_pstreams: u8) -> u32 {
+    ((max_pstreams as u32) & 0x1f) << 10
 }
 
 /// Translate USB 2.0 endpoint-descriptor scheduling fields to xHCI

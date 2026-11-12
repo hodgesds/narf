@@ -1178,6 +1178,36 @@ the USB download itself remains a target-silicon gate.
   Recovery (Mass Storage Reset + both pipes cleared) and one
   retry. The BOT exchanges sit behind a `BotTransport` seam so the
   conversation is fixture-testable without an xHCI.
+- **UAS** (`uas`, slice 1 of #833): USB Attached SCSI detection and
+  streams negotiation, fixture-tested against byte-exact
+  configuration blobs. `find_uas_endpoints` walks the blob for the
+  first interface with the UAS triple (class 0x08, subclass 0x06,
+  protocol 0x62) and binds its four bulk pipes — command OUT,
+  status IN, data-in IN, data-out OUT — by Pipe Usage descriptor
+  (`bDescriptorType` 0x24, pipe IDs 1..=4), never by endpoint number
+  or descriptor order (Linux `uas-detect.h`: `uas_is_interface`,
+  `uas_find_uas_alt_setting`, `uas_find_endpoints`); a duplicate
+  pipe ID, a pipe whose direction contradicts the pipe table, or a
+  non-bulk endpoint in the UAS alternate setting is rejected, and
+  the device falls back to BOT. `negotiate_streams` takes the
+  minimum stream capacity over the three streamed pipes (status,
+  data-in, data-out — the command pipe takes no streams, as in
+  Linux `usb_alloc_streams(intf, eps + 1, 3, ...)`) from each
+  endpoint's SuperSpeed companion `bmAttributes` (`2^field`, 0
+  means no streams), clamps it to the host controller's
+  `MaxPSASize` (HCCPARAMS1: the Primary Stream Array holds
+  `2^(MaxPSASize+1)` entries; 0 means no streams) and the 256
+  streams UAS asks for, rounds down to a power of two, and requires
+  at least two (stream 0 is reserved); the result also yields the
+  Endpoint Context `MaxPStreams` value (bits 14:10,
+  `MaxPStreams = log2(count) - 1`). `prefer_uas` is the binding
+  decision — UAS only when detection succeeds *and* streams
+  negotiate — but the attach cascade does not call it yet.
+  Known remainder (slice 2): the Command/Status IU transport,
+  tag↔stream-ID queueing, Stream Context Array allocation in
+  `configure_endpoints`, and the attach-cascade wiring; until then
+  the BOT path above stays the live bind and UAS devices keep
+  working through their BOT alternate setting, without queueing.
 - **Hub** (`hub`): hub class enumeration, multiple-TT detection from the
   Device Descriptor protocol, TT think-time propagation, and downstream
   route addressing so low/full-speed devices behind high-speed hubs are

@@ -133,6 +133,32 @@ impl HccParams1 {
             xecp_dwords: ((v >> 16) & 0xFFFF) as u16,
         }
     }
+
+    /// Maximum bulk-stream count this host controller can offer
+    /// (xHCI 1.2 §5.3.6 Table 5-13): the Primary Stream Array holds
+    /// `2^(MaxPSASize+1)` entries; a `MaxPSASize` of 0 means streams
+    /// are not supported. The usable stream IDs are 1..=this value
+    /// (stream 0 is reserved).
+    pub const fn max_streams(&self) -> u32 {
+        hc_max_streams(self.max_psa_size)
+    }
+}
+
+/// Maximum bulk-stream count a host controller offers, from its
+/// HCCPARAMS1 `MaxPSASize` field (xHCI 1.2 §5.3.6 Table 5-13): the
+/// Primary Stream Array holds `2^(MaxPSASize+1)` entries; 0 means
+/// streams are not supported. `MaxPSASize` is a 4-bit field, so the
+/// result tops out at 65536.
+pub const fn hc_max_streams(max_psa_size: u8) -> u32 {
+    // The field is 4 bits wide; a wider input is clamped to the
+    // field maximum rather than shifting out of range. (`u8::min`
+    // is not const on this toolchain, so the clamp is an `if`.)
+    let n = if max_psa_size > 15 { 15 } else { max_psa_size };
+    if n == 0 {
+        0
+    } else {
+        1u32 << (n as u32 + 1)
+    }
 }
 
 /// Convenience: decode HCSPARAMS1 directly.
