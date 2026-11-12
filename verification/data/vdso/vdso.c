@@ -24,6 +24,8 @@ struct vvar {
     int64_t wall_offset_ns; // realtime_ns = monotonic_ns + wall_offset_ns
     uint32_t mult; // cycles→ns fixed-point: ns = (cyc * mult) >> shift
     uint32_t shift; // == time crate C2N_MULT / C2N_SHIFT
+    uint64_t suspended_cycles; // counter cycles spent suspended (MONOTONIC excludes them)
+    uint64_t boot_offset_ns; // offs_boot: BOOTTIME = MONOTONIC + this
 };
 
 struct vdso_timespec {
@@ -68,6 +70,7 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
     uint32_t cpns;
     int64_t off;
     uint32_t mult, shift;
+    uint64_t suspended, boot_off;
     for (;;) {
         uint32_t seq = __atomic_load_n(&vv->seq, __ATOMIC_ACQUIRE);
         if (seq & 1u) {
@@ -77,6 +80,8 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
         off = vv->wall_offset_ns;
         mult = vv->mult;
         shift = vv->shift;
+        suspended = vv->suspended_cycles;
+        boot_off = vv->boot_offset_ns;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (seq == __atomic_load_n(&vv->seq, __ATOMIC_ACQUIRE)) {
             break;
@@ -86,7 +91,9 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
     // (exact to <1 ppm). The truncated cyc/cpns is only a pre-calibration
     // fallback — using it for an absolute deadline (TFD_TIMER_ABSTIME) skews
     // the wakeup by ~0.1·uptime against the kernel timerfd timebase.
-    uint64_t cyc = read_cycles();
+    // Monotonic counter time excludes time spent suspended, as the kernel's
+    // `now_cycles()` does.
+    uint64_t cyc = read_cycles() - suspended;
     uint64_t ns;
     if (mult != 0) {
         ns = (uint64_t)(((unsigned __int128)cyc * mult) >> shift);
@@ -99,7 +106,9 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
     switch (clk) {
     case CLOCK_MONOTONIC:
     case CLOCK_MONOTONIC_RAW:
+        break;
     case CLOCK_BOOTTIME:
+        ns += boot_off;
         break;
     case CLOCK_REALTIME:
         ns += (uint64_t)off;

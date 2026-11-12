@@ -325,3 +325,59 @@ kernel_test_in!(
     "time/hrtimer",
     smoke_hrtimer_clock_was_set_moves_realtime_timers
 );
+
+/// Linux's MONOTONIC/BOOTTIME split across a suspend: while timekeeping is
+/// suspended CLOCK_MONOTONIC stands still; on resume the time asleep is
+/// injected into CLOCK_BOOTTIME (`offs_boot`) only. A BOOTTIME hrtimer
+/// therefore comes due by the time slept, a MONOTONIC one with the same
+/// distance does not, and monotonic time continues from where it stopped.
+fn smoke_timekeeping_suspend_injects_boottime() -> TestResult {
+    const SLEEP_NS: u64 = 20_000_000;
+    const AHEAD: u64 = 30_000_000;
+    let boot = Box::new(Counted {
+        timer: HrTimer::new(counted_fn, ClockId::Boottime, HrtimerMode::ABS_HARD),
+        fired: AtomicUsize::new(0),
+        order: AtomicU64::new(0),
+        restarts: AtomicUsize::new(0),
+        interval: 0,
+    });
+    let mono = counted(HrtimerMode::ABS_HARD);
+    let (m0, b0) = (crate::monotonic_ns(), crate::boottime_ns());
+    // SAFETY: the Boxes stay put; cancelled below.
+    unsafe {
+        hrtimer_start_range_ns(&boot.timer, b0 + AHEAD, 0, HrtimerMode::ABS);
+        hrtimer_start_range_ns(&mono.timer, m0 + AHEAD, 0, HrtimerMode::ABS);
+    }
+    crate::timekeeping_suspend();
+    let frozen = crate::monotonic_ns();
+    let t = crate::raw_cycles();
+    while crate::raw_cycles().wrapping_sub(t) < crate::ns_to_cycles(SLEEP_NS) {
+        core::hint::spin_loop();
+    }
+    let still = crate::monotonic_ns();
+    let slept = crate::timekeeping_resume();
+    let (m1, b1) = (crate::monotonic_ns(), crate::boottime_ns());
+    let ok_order = expire_until(|| {
+        boot.fired.load(Ordering::Acquire) == 1 && mono.fired.load(Ordering::Acquire) == 1
+    }) && boot.order.load(Ordering::Acquire) < mono.order.load(Ordering::Acquire);
+    hrtimer_cancel(&boot.timer);
+    hrtimer_cancel(&mono.timer);
+    if still != frozen {
+        return TestResult::Fail("CLOCK_MONOTONIC advanced while timekeeping was suspended");
+    }
+    if slept < SLEEP_NS {
+        return TestResult::Fail("resume injected less than the time asleep");
+    }
+    if m1.saturating_sub(m0) > 5_000_000 {
+        return TestResult::Fail("CLOCK_MONOTONIC counted the time asleep");
+    }
+    let boot_gain = b1.saturating_sub(b0).saturating_sub(m1.saturating_sub(m0));
+    if boot_gain.abs_diff(slept) > 1_000_000 {
+        return TestResult::Fail("CLOCK_BOOTTIME did not gain exactly the time asleep");
+    }
+    if !ok_order {
+        return TestResult::Fail("the BOOTTIME timer did not come due before the MONOTONIC one");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time/hrtimer", smoke_timekeeping_suspend_injects_boottime);
