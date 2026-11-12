@@ -2329,7 +2329,11 @@ struct SchedulerTelemetry {
     /// stalled ticks since that number last changed in the low half (see
     /// [`staged_kick_backoff`]). Owner-only, written from its tick.
     staged_kick: AtomicU64,
-    _pad: [u8; 8],
+    /// Cycle stamp of this CPU's latest scheduling point (see
+    /// [`note_sched_pass`]). Owner-written; wakers, enqueuers and idle thieves
+    /// read it to tell a CPU that is not rescheduling from one that is
+    /// ([`cpu_not_rescheduling`]).
+    sched_pass_cycles: AtomicU64,
 }
 
 impl SchedulerTelemetry {
@@ -2342,7 +2346,7 @@ impl SchedulerTelemetry {
             staged_tick_pass: AtomicU64::new(0),
             staged_pulls: AtomicU64::new(0),
             staged_kick: AtomicU64::new(0),
-            _pad: [0; 8],
+            sched_pass_cycles: AtomicU64::new(0),
         }
     }
 }
@@ -2377,8 +2381,8 @@ pub fn note_forward_progress() {
 
 /// Count one scheduling point on `cpu`: a dispatch round started, a polled
 /// task returned to the executor, or one task handed the CPU directly to
-/// another. Only the owning CPU writes the counter, so a plain load/store is
-/// enough and no locked instruction is issued.
+/// another. Only the owning CPU writes the counter and its time stamp, so
+/// plain loads/stores are enough and no locked instruction is issued.
 #[inline]
 pub(crate) fn note_sched_pass(cpu: usize) {
     if let Some(telemetry) = SCHEDULER_TELEMETRY.get(cpu) {
@@ -2386,7 +2390,37 @@ pub(crate) fn note_sched_pass(cpu: usize) {
         telemetry
             .sched_passes
             .store(passes.wrapping_add(1), Ordering::Relaxed);
+        telemetry
+            .sched_pass_cycles
+            .store(narf_time::now_cycles(), Ordering::Relaxed);
     }
+}
+
+/// How long a CPU that is awake may go without passing a scheduling point
+/// before wakers, enqueuers and idle thieves stop treating it as about to run
+/// what is queued for it. One millisecond: far longer than a healthy executor
+/// takes between scheduling points, and far shorter than any wait a user would
+/// notice.
+const NOT_RESCHEDULING_NS: u64 = 1_000_000;
+
+/// Whether `cpu` is awake but has passed no scheduling point for
+/// [`NOT_RESCHEDULING_NS`]: inside a long task poll or kernel section, or
+/// stuck in executor maintenance, possibly with interrupts masked. Work
+/// queued there waits for it, and a reschedule IPI does not help when its
+/// interrupts are masked. A halted CPU is not counted: an IPI wakes it.
+///
+/// Reads the halted flag and the owner's pass stamp (two loads on lines the
+/// owner writes); never blocks. The answer is advisory: whoever acts on it
+/// re-checks ownership under the usual locks.
+#[inline]
+fn cpu_not_rescheduling(cpu: usize, now: u64) -> bool {
+    let (Some(halted), Some(telemetry)) = (CPU_HALTED.get(cpu), SCHEDULER_TELEMETRY.get(cpu))
+    else {
+        return false;
+    };
+    !halted.load(Ordering::Acquire)
+        && now.saturating_sub(telemetry.sched_pass_cycles.load(Ordering::Relaxed))
+            >= narf_time::ns_to_cycles(NOT_RESCHEDULING_NS)
 }
 
 /// Monotonic completed-work counter used by fatal-path watchdogs.
@@ -2558,9 +2592,10 @@ pub(crate) fn resched_remote_force(target_cpu: u32) {
 /// staged entries under `try_lock`s — the tick cannot have interrupted a
 /// holder on its own CPU, since those locks mask interrupts — and then other
 /// CPUs' halted flags and states. With tickless idle a halted CPU has no
-/// periodic tick of its own, so this kick is what starts its steal pass. A CPU
-/// with interrupts masked takes no tick and sends no kick; then only an idle
-/// CPU waking for some other reason reaches its staged wakes.
+/// periodic tick of its own, so a kick is what starts its steal pass. A CPU
+/// with interrupts masked takes no tick and sends no kick, so this is only the
+/// second line: wakers and enqueuers already moved the work or kicked an idle
+/// CPU for it ([`wake_place_and_kick`], [`kick_idle_puller`]).
 pub(crate) fn kick_idle_balance_from_tick() {
     let cpu = narf_lib::percpu::current_cpu();
     if cpu >= narf_lib::percpu::MAX_CPUS || !wake_list_pending(cpu) {
@@ -4387,7 +4422,23 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
         policy::CpuState::Active | policy::CpuState::Idle
     );
     if cpu != me && cpu < narf_lib::percpu::MAX_CPUS && target_drains {
+        // A target that is awake but not rescheduling drains its inbox only
+        // when it gets back to its executor, and an IPI does not bring that
+        // closer when its interrupts are masked. Linux has the enqueuer kick
+        // an idle CPU for such a backlog (`nohz_balancer_kick` → `kick_ilb`);
+        // here the enqueuer does it, since the target's own tick may never
+        // come. The target still gets its reschedule request (no IPI: it is
+        // not halted), so this is still at most one IPI per enqueue.
+        let allowed = slot.spec.affinity.allowed.bits();
+        let pullable = user_task_smp_enabled() || slot.addr_space.is_none();
         let was_empty = wake_list_push(cpu, slot, reason);
+        if pullable
+            && cpu_not_rescheduling(cpu, narf_time::now_cycles())
+            && kick_idle_puller(cpu, allowed & !(1u64 << cpu))
+        {
+            resched_remote(cpu as u32);
+            return;
+        }
         // Kick the target on the empty->nonempty edge. The IPI is deliberately
         // notification-only: folding the inbox here would run ready-queue growth
         // and policy callbacks in hard-IRQ context. The target drains at its next
@@ -5886,50 +5937,71 @@ fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
     }
 }
 
-/// Wake-time placement + kick — NARF's `ttwu_queue` mechanism, split exactly
-/// like Linux: the POLICY decides WHERE (`Scheduler::select_task_rq`, the
-/// analogue of `sched_class->select_task_rq`), and the scheduler CORE performs
-/// the mechanical migrate + enqueue + IPI (`set_task_cpu` + `ttwu_queue`).
+/// Wake-time placement + kick — NARF's `try_to_wake_up` → `select_task_rq` →
+/// `ttwu_queue`, split like Linux: the POLICY decides WHERE
+/// (`Scheduler::select_task_rq`, the analogue of `sched_class->select_task_rq`)
+/// and the scheduler CORE performs the mechanical migrate + enqueue + IPI
+/// (`set_task_cpu` + `ttwu_queue_wakelist`).
 ///
-/// On a wake whose `home` (prev_cpu) is BUSY, ask the policy for an idle,
-/// affinity-permitted sibling; if it names one, MIGRATE the wakee's slot there
-/// and let `enqueue_on` kick it. This is a PUSH at wake time — it does NOT rely
-/// on the idle sibling later PULLING the task via work-stealing (Linux uses
-/// stealing only in the periodic/newidle balancer, never on the wake path). If
-/// no idle sibling is offered, keep the task on `home` and `resched_remote(home)`
-/// (an idle home is woken by its IPI; a busy home runs it at its next round).
+/// `home` is the wakee's previous CPU. What happens depends on what it is
+/// doing (Linux `select_idle_sibling`: keep `prev` when it is idle, else find
+/// an idle sibling):
 ///
-/// Runs in the raw-waker path (possibly IRQ context): allocation-light,
-/// non-blocking (`try_lock`), bounded CPU scan. Any migrate contention falls
-/// back to the plain `home` kick, so a wake is never dropped.
+/// - **Halted**: keep the task there and IPI it (`resched_remote`). Under
+///   tickless idle the IPI is what wakes it; no tick is waited for.
+/// - **Awake, running no task, rescheduling** (between polls, or spinning on
+///   an empty queue): keep it; the executor picks the wake up at its next
+///   round, cache-hot. Only a backlog of fresh wakes since its last round
+///   (`WAKE_PRESSURE` ≥ 2) asks for an idle sibling.
+/// - **Running another task** (Linux: `prev` is busy): ask for an idle,
+///   allowed sibling and move the task there.
+/// - **Not rescheduling** ([`cpu_not_rescheduling`]: awake, no scheduling
+///   point for `NOT_RESCHEDULING_NS`, perhaps with interrupts masked, so an
+///   IPI to it does nothing): the task must not stay. Move it to an idle
+///   sibling; if it cannot be moved from here (a contended queue, or a slot
+///   the wake-time move does not take), IPI that idle CPU instead, and its
+///   steal pass pulls the wake (Linux `kick_ilb`): the stalled CPU's own tick
+///   is not relied on, since it may take none.
+///
+/// For a busy or stalled `home` the core falls back to `select_idle_sibling`
+/// when the policy names no CPU, so a policy without a placement model cannot
+/// strand a wake. A wake whose `home` is the waker's own CPU keeps today's
+/// shape (the waker returns to that executor), as does a self-wake.
+///
+/// At most one IPI per wake: to the halted `home`, to the destination of a
+/// move (`enqueue_on`'s first-entry kick), or to the idle CPU asked to pull.
+/// A reschedule request to an awake `home` sends none.
+///
+/// Runs in the raw-waker path (possibly IRQ context): allocation-free,
+/// non-blocking (`try_lock`), bounded CPU scan. Any contention falls back to
+/// the plain kick, so a wake is never dropped.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
-    // Placement is only actionable with migration enabled and a BUSY home. An
-    // idle home is already being IPI'd to run the task itself (the cache-warm,
-    // hot ping-pong path) — never migrate off an idle home.
+    let h = home as usize;
     if !STEAL_ENABLED.load(Ordering::Acquire)
-        || (home as usize) >= CPU_HALTED.len()
-        || CPU_HALTED[home as usize].load(Ordering::SeqCst)
+        || h >= CPU_HALTED.len()
+        || CPU_HALTED[h].load(Ordering::SeqCst)
     {
         resched_remote(home);
         return;
     }
-    // Home is awake, but "not halted" is NOT the same as "backlogged": an
-    // executor spinning on an empty queue picks a kicked wake up immediately
-    // and cache-hot, while migration pays a cross-queue move plus — for a
-    // halted destination — a full HLT wakeup. Migrate only when home has a
-    // REAL backlog: at least one OTHER fresh wake since home's executor last
-    // began a dispatch round (the exit-storm shape placement exists for —
-    // wakes arriving faster than dispatch — crosses this on its second
-    // queued wake). `WAKE_PRESSURE[home]` counts this wake too (the waker
-    // bumped it before dispatching here), so `< 2` means "only this wake":
-    // kick home. Without a backlog gate the futexbench5 cold-wake chain
-    // regressed 3.7 -> 9.5 µs/wake — every wake whose home happened to be
-    // polling was pushed to a HALTED sibling and paid its HLT latency. The
-    // counter replaces this gate's first shape (a READY[home] lock + slot
-    // scan per wake), whose lock acquisition was itself worth ~1.5 µs on
-    // the cold-wake path.
-    if WAKE_PRESSURE[home as usize].load(Ordering::Acquire) < 2 {
+    let me = narf_lib::percpu::current_cpu();
+    let remote = h != me;
+    let not_rescheduling = remote && cpu_not_rescheduling(h, narf_time::now_cycles());
+    let running_other = remote && {
+        let current = CURRENT_TASK[h].load(Ordering::Acquire);
+        current != TaskId::NONE.raw() && current != task
+    };
+    // Home is awake, but "not halted" is NOT the same as "busy": an executor
+    // spinning on an empty queue picks a kicked wake up immediately and
+    // cache-hot, while migration pays a cross-queue move plus — for a halted
+    // destination — a full HLT wakeup. Without a task running there, migrate
+    // only on a REAL backlog: at least one OTHER fresh wake since home's
+    // executor last began a dispatch round. `WAKE_PRESSURE[home]` counts this
+    // wake too, so `< 2` means "only this wake". Without that gate the
+    // futexbench5 cold-wake chain regressed 3.7 -> 9.5 µs/wake.
+    let backlog = WAKE_PRESSURE[h].load(Ordering::Acquire) >= 2;
+    if !not_rescheduling && !running_other && !backlog {
         resched_remote(home);
         return;
     }
@@ -5939,26 +6011,104 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
     let allowed_set = task_affinity(TaskId(task));
     let allowed = |c: crate::affinity::CpuId| allowed_set.is_none_or(|s| s.contains(c));
     let is_online = |c: crate::affinity::CpuId| narf_lib::smp::is_online(c.0);
-    let is_idle = |c: crate::affinity::CpuId| {
-        (c.0 as usize) < CPU_HALTED.len() && CPU_HALTED[c.0 as usize].load(Ordering::SeqCst)
-    };
+    let is_idle = |c: crate::affinity::CpuId| cpu_halted_and_schedulable(c.0 as usize);
     let home_id = crate::affinity::CpuId(home);
-    let waker = crate::affinity::CpuId(narf_lib::percpu::current_cpu() as u32);
+    let waker = crate::affinity::CpuId(me as u32);
     let target = policy::try_with_scheduler(home_id, |scheduler| {
         scheduler.and_then(|s| s.select_task_rq(home_id, waker, &is_online, &is_idle, &allowed))
     })
-    .flatten();
-    match target {
-        Some(t) if t.0 != home && allowed(t) => {
-            // CORE mechanism: migrate to the policy-selected idle CPU; on success
-            // `enqueue_on` kicked it. Any contention → kick `home` so the wake
-            // still lands (never dropped).
-            if !try_migrate_wakee_to(home, t.0, cell) {
-                resched_remote(home);
-            }
-        }
-        _ => resched_remote(home),
+    .flatten()
+    .or_else(|| {
+        (not_rescheduling || running_other)
+            .then(|| policy::select_idle_sibling(home_id, waker, &is_online, &is_idle, &allowed))
+            .flatten()
+    });
+    let Some(t) = target.filter(|t| t.0 != home && allowed(*t)) else {
+        resched_remote(home);
+        return;
+    };
+    // CORE mechanism: move to the selected idle CPU; on success `enqueue_on`
+    // kicked it.
+    if try_migrate_wakee_to(home, t.0, cell) {
+        note_wake_placement(WakePlacement::Moved);
+        return;
     }
+    // Not moved. A busy home that is rescheduling runs it at its next round.
+    resched_remote(home);
+    if not_rescheduling {
+        // A stalled home does not: ask the idle CPU to come and pull it. The
+        // pull's own rules apply (`try_steal_staged`); a stalled victim lifts
+        // its floor and its cache-hot window.
+        resched_remote(t.0);
+        note_wake_placement(WakePlacement::PullKick);
+    }
+}
+
+/// Whether `cpu` is halted in the executor's idle path and will run a steal
+/// pass when kicked: halted, and `Active` or `Idle` (a logically offlined CPU
+/// also publishes itself halted but parks without stealing).
+#[inline]
+fn cpu_halted_and_schedulable(cpu: usize) -> bool {
+    cpu < CPU_HALTED.len()
+        && CPU_HALTED[cpu].load(Ordering::SeqCst)
+        && matches!(
+            policy::cpu_state(CpuId(cpu as u32)),
+            CpuState::Active | CpuState::Idle
+        )
+}
+
+/// Enqueuer-side half of the idle kick: `victim` was just given a runnable
+/// task (`allowed` is its hard affinity) and is not rescheduling, so the task
+/// would wait for it. IPI the nearest halted, schedulable, allowed CPU whose
+/// last kick has been consumed, so its steal pass pulls the task (Linux
+/// `nohz_balancer_kick` → `kick_ilb`, issued here by the enqueuer because the
+/// victim's own tick may never come). Returns whether a CPU was kicked.
+fn kick_idle_puller(victim: usize, allowed: u64) -> bool {
+    if !STEAL_ENABLED.load(Ordering::Acquire) || victim >= narf_lib::percpu::MAX_CPUS {
+        return false;
+    }
+    let candidates = narf_lib::smp::online_bitmap() & allowed;
+    let ready = |target: usize| {
+        cpu_halted_and_schedulable(target) && !NEED_RESCHED[target].load(Ordering::Relaxed)
+    };
+    match idle_balance_kick_target(victim, candidates, ready) {
+        Some(target) => {
+            resched_remote(target);
+            note_wake_placement(WakePlacement::PullKick);
+            true
+        }
+        None => false,
+    }
+}
+
+/// How a wake or enqueue avoided a CPU that would have held it.
+#[derive(Clone, Copy)]
+enum WakePlacement {
+    /// Moved at wake time to an idle CPU.
+    Moved,
+    /// An idle CPU was IPI'd to pull it.
+    PullKick,
+}
+
+#[cfg(feature = "kernel-test")]
+static WAKE_PLACEMENTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[inline]
+fn note_wake_placement(kind: WakePlacement) {
+    #[cfg(feature = "kernel-test")]
+    WAKE_PLACEMENTS[kind as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(feature = "kernel-test"))]
+    let _ = kind;
+}
+
+/// `(moved at wake time, idle CPUs kicked to pull)` since boot.
+#[cfg(feature = "kernel-test")]
+#[doc(hidden)]
+pub fn __test_wake_placements() -> (u64, u64) {
+    (
+        WAKE_PLACEMENTS[WakePlacement::Moved as usize].load(Ordering::Relaxed),
+        WAKE_PLACEMENTS[WakePlacement::PullKick as usize].load(Ordering::Relaxed),
+    )
 }
 
 /// Reschedule IPIs `cpu` has sent since boot.
@@ -7811,31 +7961,12 @@ const STAGED_STEAL_SCAN: usize = 32;
 /// ones have left. The wake inbox is indexed and has no such bound.
 const STAGED_PARKED_REACH: usize = 3 * STAGED_STEAL_SCAN;
 
-/// How long thieves must have watched wakes sit staged on a CPU that passes no
-/// scheduling point before they call it stalled and stop leaving it a last
-/// runnable task. One default tick period: far longer than a healthy CPU takes
-/// to answer the reschedule IPI a staged wake sends it.
-const STAGED_STALL_NS: u64 = 1_000_000;
-
-/// What idle thieves have seen of one victim's staged wakes. Thieves write it,
-/// the victim never touches it, so it costs the victim's scheduling paths
-/// nothing; a thief reaches it only for a victim whose ready queue offered
-/// nothing.
-///
-/// The observation is "wakes were staged at this scheduling-pass count, first
-/// seen at this time". It is dropped whenever a thief finds nothing staged, and
-/// replaced whenever the pass count has moved. So it ages only while every
-/// visit finds wakes staged and the victim's executor has not passed a
-/// scheduling point since: the definition of a stall that does not depend on
-/// whether the victim is inside a task poll or has interrupts enabled.
-/// Concurrent thieves race benignly; all of them store the same count and
-/// nearly the same time.
+/// Where the next pull on one victim starts in each of its holding places.
+/// Thieves write it, the victim never touches it, so it costs the victim's
+/// scheduling paths nothing; a thief reaches it only for a victim whose ready
+/// queue offered nothing. Concurrent thieves race benignly.
 #[repr(align(64))]
 struct StagedWatch {
-    /// The victim's `sched_passes + 1` at the first sighting; 0 = none.
-    passes: AtomicU64,
-    /// Cycle stamp of that sighting.
-    since: AtomicU64,
     /// Where the next pull's window starts in the victim's wake inbox,
     /// counted from the oldest entry.
     inbox_skip: AtomicUsize,
@@ -7845,8 +7976,6 @@ struct StagedWatch {
 
 static STAGED_WATCH: [StagedWatch; narf_lib::percpu::MAX_CPUS] = [const {
     StagedWatch {
-        passes: AtomicU64::new(0),
-        since: AtomicU64::new(0),
         inbox_skip: AtomicUsize::new(0),
         parked_skip: AtomicUsize::new(0),
     }
@@ -7885,33 +8014,15 @@ fn staged_window_advance(cursor: &AtomicUsize, start: usize, len: usize, reach: 
 }
 
 impl StagedWatch {
-    /// Nothing is staged: whatever was being watched is over.
+    /// Nothing is staged: the windows start over at the front.
     #[inline]
     fn forget(&self) {
-        if self.passes.load(Ordering::Relaxed) != 0 {
-            self.passes.store(0, Ordering::Relaxed);
-        }
         if self.inbox_skip.load(Ordering::Relaxed) != 0 {
             self.inbox_skip.store(0, Ordering::Relaxed);
         }
         if self.parked_skip.load(Ordering::Relaxed) != 0 {
             self.parked_skip.store(0, Ordering::Relaxed);
         }
-    }
-
-    /// Record that wakes are staged at pass count `passes`, and report
-    /// whether that has now been so for `threshold` cycles.
-    #[inline]
-    fn stalled(&self, passes: u64, now: u64, threshold: u64) -> bool {
-        let stamp = passes.wrapping_add(1);
-        if self.passes.load(Ordering::Acquire) != stamp {
-            // `since` first, published by the release store of the count: a
-            // reader that sees the new count sees its time.
-            self.since.store(now, Ordering::Relaxed);
-            self.passes.store(stamp, Ordering::Release);
-            return false;
-        }
-        now.saturating_sub(self.since.load(Ordering::Relaxed)) >= threshold
     }
 }
 
@@ -7931,7 +8042,9 @@ impl StagedWatch {
 /// the cache-hot window, and the victim must keep one runnable or running task
 /// — with staged wakes now counted as runnable, as `select_fork_cpu` already
 /// counts them. A healthy CPU that is idle with a single staged wake is
-/// therefore left to take it itself; it has been kicked. The count is of
+/// therefore left to take it itself; it has been kicked. A victim that is not
+/// rescheduling ([`cpu_not_rescheduling`]) keeps neither its last wake nor a
+/// hot one: nothing it holds runs until it comes back. The count is of
 /// tasks: the parked-wake gauge counts nodes, and a node can outlive its wake,
 /// so the woken sleepers are judged first and the floor is applied to what
 /// they turn out to be before anything is taken from either place.
@@ -7972,27 +8085,18 @@ fn try_steal_staged(
     let victim_id = crate::affinity::CpuId(victim as u32);
     let now = narf_time::now_cycles();
     let running = cpu_running_task(victim_id);
+    // Awake and past no scheduling point for `NOT_RESCHEDULING_NS`, by the
+    // victim's own pass stamp: inside a long poll or kernel section, or stuck
+    // in executor maintenance (deferred destructors, slab drain, sleep pumps,
+    // timer wheel, where `CURRENT_TASK` is clear), possibly with interrupts
+    // masked. What is staged there waits for it.
+    let stalled = cpu_not_rescheduling(victim, now);
     // The floor: taking one task must leave the victim a runnable or running
     // one. With `runnable` staged-or-queued tasks that holds when there are
-    // two, or one and the victim is busy. Busy is running a task, or — for
-    // its last task only, and only then is the record consulted — stalled: a
-    // healthy idle CPU keeps its last wake, one that thieves have watched
-    // hold it without passing a scheduling point does not. `CURRENT_TASK` is
-    // clear in the executor's own maintenance too (deferred destructors, slab
-    // drain, sleep pumps, timer wheel), and a CPU stuck there is as
-    // unreachable as one stuck in a task.
-    let floor_allows = |runnable: usize| {
-        runnable > 1
-            || (runnable == 1
-                && (running
-                    || watch.stalled(
-                        SCHEDULER_TELEMETRY[victim]
-                            .sched_passes
-                            .load(Ordering::Relaxed),
-                        now,
-                        narf_time::ns_to_cycles(STAGED_STALL_NS),
-                    )))
-    };
+    // two, or one and the victim is busy — running a task, or stalled. A
+    // healthy idle CPU keeps its last wake; it has been kicked and is about
+    // to run it.
+    let floor_allows = |runnable: usize| runnable > 1 || (runnable == 1 && (running || stalled));
     // First on the gauges, without a lock. They can only overcount — a node
     // is counted whether or not its task is still runnable — so a refusal
     // here is final, and an acceptance is checked again below against the
@@ -8006,13 +8110,18 @@ fn try_steal_staged(
     }
     let thief = crate::affinity::CpuId(cpu as u32);
     let migration_cost = narf_time::ns_to_cycles(MIGRATION_COST_NS);
+    // The cache-hot window protects a warm cache the task would get back
+    // shortly. A stalled victim gives it nothing back: the task waits however
+    // warm its cache is (Linux likewise migrates a hot task once balancing on
+    // its behalf keeps failing, `nr_balance_failed > cache_nice_tries`).
     let stealable = |slot: &TaskSlot| {
         slot_is_dispatchable(slot, now)
-            && !task_is_migration_hot(
-                slot.awake.last_run_cycles.load(Ordering::Acquire),
-                now,
-                migration_cost,
-            )
+            && (stalled
+                || !task_is_migration_hot(
+                    slot.awake.last_run_cycles.load(Ordering::Acquire),
+                    now,
+                    migration_cost,
+                ))
             && strategy.allow_steal(thief, &crate::policy::TaskMeta::from_slot_at(slot, now))
     };
 

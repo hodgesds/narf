@@ -821,12 +821,12 @@ pub struct TaskSpec {
   not the only way to be unreachable: the executor has no current task while
   it runs deferred destructors, the slab drain, the sleep pumps or the timer
   wheel, and a CPU stuck there looks idle. So the floor is also lifted for a
-  stalled victim, one that thieves have found holding staged wakes on every
-  visit for 1 ms while its scheduling-pass counter did not move. The record of
-  that is written by thieves only (per victim: the pass count at first sight
-  and when), dropped when a visit finds nothing staged and restarted when the
-  count has moved; the victim's scheduling paths do not touch it, and it does
-  not depend on the victim taking interrupts. The floor counts tasks, not
+  victim that is **not rescheduling**: awake (not halted) and past no
+  scheduling point for 1 ms, by the pass stamp its executor writes at every
+  scheduling point (see the next item). The same victim gives no warm cache
+  back to a hot task, so the cache-hot window does not apply to its staged
+  wakes either (Linux migrates a hot task once balancing on its behalf keeps
+  failing). Neither test depends on the victim taking interrupts. The floor counts tasks, not
   inbox nodes: a node can outlive its wake (its task ran under a direct
   handoff and sleeps again, or is running that way now), so the thief judges
   the woken sleepers in its window first and applies the floor to the ones
@@ -850,7 +850,7 @@ pub struct TaskSpec {
 - **A busy CPU advertises wakes it is not serving.** Each CPU's executor
   counts the scheduling points it passes — a dispatch round starting, a polled
   task returning to it, a direct task-to-task handoff — in a counter only that
-  CPU writes. When a CPU's timer tick
+  CPU writes, and stamps the time of the latest one beside it. When a CPU's timer tick
   finds wakes staged there and its executor has passed no scheduling point
   since the previous such tick, it sends one reschedule kick to a halted CPU
   (Linux `sched_balance_trigger` → `nohz_balancer_kick` → `kick_ilb`). The
@@ -872,11 +872,37 @@ pub struct TaskSpec {
 
   A kicked CPU consumes `NEED_RESCHED` at its next halt commit, so one kick
   buys two steal passes. With tickless idle a halted CPU takes no periodic
-  tick, so this kick is what starts its steal pass. A CPU with interrupts
-  masked takes no tick and sends no kick; there nothing bounds the wait but
-  an idle CPU waking for another reason (an interrupt, its own timer
-  deadline, a wake aimed at it) — the 2 ms idle recovery deadline that used to
-  bound it is gone (see the tickless-idle paragraph in §3).
+  tick, so a kick is what starts its steal pass. A CPU with interrupts masked
+  takes no tick and sends no kick, so the tick-side kick is only a second
+  line: wakers and enqueuers act first (next item), and nothing relies on the
+  stalled CPU's own tick or on any periodic backstop.
+- **A wake or enqueue never waits behind a CPU that is not rescheduling**
+  (Linux `try_to_wake_up` → `select_task_rq` → `select_idle_sibling`, and
+  `nohz_balancer_kick` → `kick_ilb`). The waker classifies the wakee's
+  previous CPU (`home`):
+  - halted: the task stays and `home` gets one reschedule IPI; under tickless
+    idle that IPI, not a tick, starts it;
+  - awake, running no task and rescheduling: the task stays and `home` runs it
+    at its next round (no IPI); only a backlog of two or more fresh wakes
+    since that round asks for an idle sibling;
+  - running another task (Linux: `prev` busy): the task moves to an idle
+    sibling if there is one;
+  - not rescheduling (awake, no scheduling point for 1 ms, perhaps with
+    interrupts masked): the task moves to an idle sibling; if the wake-time
+    move cannot take it (contended queue, or a slot it does not move:
+    non-default class or priority, a budget, a donation), the waker IPIs that
+    idle CPU and its steal pass pulls the wake under the rules above.
+
+  A wake whose `home` is the waker's own CPU, and a self-wake, keep `home`.
+  An idle sibling is a halted, online, `Active`/`Idle` CPU inside the task's
+  hard affinity: the policy's `select_task_rq` chooses it, and when the
+  policy names none for a busy or stalled `home` the core uses
+  `select_idle_sibling` (waker's CPU if idle and node-local, then the nearest
+  idle CPU in `home`'s last-level cache, then in its NUMA node, then any).
+  A cross-CPU enqueue onto a CPU that is not rescheduling stages the slot in
+  that CPU's wake inbox as before and IPIs one halted, schedulable, allowed CPU
+  to pull it instead of IPI-ing the stalled target. Each wake or enqueue sends
+  at most one reschedule IPI.
 - **Steal policies see staged wakes.** The hints the core hands a
   `StealStrategy` (`StealContext`) count them: a CPU with wakes staged is not
   reported idle whatever its executor state, is reported as possibly having a
@@ -1145,6 +1171,12 @@ existing `userspace` LINUX-GAP); RT mutex inheritance is a separate contract.
   parked-set lock, so exactly one of them gets the slot. A pull never takes a
   running continuation or one under a direct-handoff claim, and takes every
   victim-side lock except the leaf inbox gate without blocking.
+- A woken or enqueued task never depends on a CPU that is not rescheduling to
+  reach it: the waker or enqueuer moves it to an idle CPU or IPIs an idle CPU
+  to pull it (§3.3), and every move is a whole-slot `enqueue_on(...,
+  Migrated)` under the owner's locks above. No periodic timer is part of the
+  guarantee; the only residual wait is a CPU whose own task wakes a peer that
+  last ran on that same CPU and then keeps the CPU with interrupts masked.
 - `has_other_runnable_work` may return a false positive under queue contention
   but never blocks to refine the answer. A false result means the caller can
   elide a voluntary self-yield without withholding the CPU from known work.

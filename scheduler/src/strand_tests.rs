@@ -522,6 +522,8 @@ fn smoke_scheduler_staged_pull_leaves_idle_cpu_its_only_wake() -> TestResult {
     if let Some(waker) = take_waker(0) {
         waker.wake();
     }
+    // Healthy: it went round its loop just now.
+    stuck.pass_scheduling_point();
     let took_only_wake = pull(stuck.0, me);
     if let Some(waker) = take_waker(1) {
         waker.wake();
@@ -591,6 +593,8 @@ kernel_test_in!(
 
 /// The cache-hot window applies to staged wakes as it does to queued ones: a
 /// task that ran within the migration cost stays, and may go once it cools.
+/// A CPU that is not rescheduling gives the warm cache back to nobody, so
+/// there a hot task goes at once.
 fn smoke_scheduler_staged_pull_respects_cache_hot_window() -> TestResult {
     reset_probes();
     let Some(stuck) = StuckCpu::claim() else {
@@ -604,18 +608,39 @@ fn smoke_scheduler_staged_pull_respects_cache_hot_window() -> TestResult {
     if let Some(waker) = take_waker(0) {
         waker.wake();
     }
-    // Ran "just now", whatever the time the steps above took.
+    // Ran "just now", whatever the time the steps above took, on a CPU that
+    // is still rescheduling.
     cell.last_run_cycles
         .store(narf_time::now_cycles(), Ordering::Release);
+    stuck.pass_scheduling_point();
     let took_hot = pull(stuck.0, me);
     let_cool();
+    stuck.pass_scheduling_point();
     let took_cold = pull(stuck.0, me);
+    crate::poll_one_round();
+
+    // The same, hot, on a CPU that has passed no scheduling point for longer
+    // than the not-rescheduling threshold.
+    let Some((_id, cell)) = park_probe_on(1, 1, stuck.0, None) else {
+        stuck.release();
+        return TestResult::Fail("could not park the second probe on the stuck CPU");
+    };
+    if let Some(waker) = take_waker(1) {
+        waker.wake();
+    }
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+    cell.last_run_cycles
+        .store(narf_time::now_cycles(), Ordering::Release);
+    let took_hot_from_stalled = pull(stuck.0, me);
     stuck.release();
     if took_hot {
         return TestResult::Fail("a cache-hot staged wake was pulled");
     }
     if !took_cold {
         return TestResult::Fail("a staged wake was not pulled after it cooled");
+    }
+    if !took_hot_from_stalled {
+        return TestResult::Fail("a hot wake was left on a CPU that is not rescheduling");
     }
     TestResult::Pass
 }
@@ -985,8 +1010,8 @@ const STALL_WAIT_NS: u64 = 3_000_000;
 /// A CPU can be stuck outside a task poll: in deferred destructors, the slab
 /// drain, the sleep pumps or the timer wheel, all of which run with no task
 /// current. It looks idle, and an idle CPU keeps its last staged wake. It must
-/// not keep it once thieves have watched that wake sit there with the CPU
-/// passing no scheduling point; a CPU that does pass them keeps it.
+/// not keep it once it has passed no scheduling point for the not-rescheduling
+/// threshold; a CPU that has just passed one keeps it.
 fn smoke_scheduler_stalled_idle_cpu_gives_up_its_only_wake() -> TestResult {
     reset_probes();
     let Some(stuck) = StuckCpu::claim() else {
@@ -1002,12 +1027,12 @@ fn smoke_scheduler_stalled_idle_cpu_gives_up_its_only_wake() -> TestResult {
     if let Some(waker) = take_waker(0) {
         waker.wake();
     }
-    let took_at_first_sight = pull(stuck.0, me);
-    // Healthy and slow: a long time passes, but the CPU went round its loop.
+    // Healthy: it went round its loop just now.
     stuck.pass_scheduling_point();
-    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+    let took_at_first_sight = pull(stuck.0, me);
+    stuck.pass_scheduling_point();
     let took_from_healthy = pull(stuck.0, me);
-    // Stalled: the same wake, the same pass count, and time.
+    // Stalled: the same wake, no scheduling point since, and time.
     narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
     let took_from_stalled = pull(stuck.0, me);
     crate::poll_one_round();
@@ -1552,6 +1577,7 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
         return TestResult::Fail("the AP did not start the masked section");
     }
     crate::enable_work_stealing();
+    let placements = crate::__test_wake_placements();
 
     // The wake: issued at once, while the held CPU is running a task.
     let woke = take_waker(0).map(|waker| {
@@ -1574,6 +1600,7 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
     // This CPU does not poll: only an AP can run either task.
     let ran = wait_for(WAKE_BOUND_NS, || polls(0) == 2 && polls(1) == 1);
     let held_throughout = !MASKED_DONE.load(Ordering::Acquire);
+    let after = crate::__test_wake_placements();
     let woken_cpu = PROBE_LAST_CPU[0].load(Ordering::Acquire);
     let enqueued_cpu = PROBE_LAST_CPU[1].load(Ordering::Acquire);
     MASKED_RELEASE.store(true, Ordering::Release);
@@ -1595,6 +1622,9 @@ fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
     }
     if woken_cpu == held || enqueued_cpu == held || woken_cpu == me || enqueued_cpu == me {
         return TestResult::Fail("a task ran on a CPU that could not have run it");
+    }
+    if after.0 == placements.0 && after.1 == placements.1 {
+        return TestResult::Fail("neither a wake-time move nor a pull kick happened");
     }
     if wake_ipis > 1 || enqueue_ipis > 1 {
         return TestResult::Fail("a single wake or enqueue sent more than one IPI");
