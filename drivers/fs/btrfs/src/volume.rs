@@ -593,10 +593,21 @@ impl<B: BlockDevice> Drop for ReaderGuard<B> {
 #[derive(Debug)]
 pub(crate) struct CommitHold<'a>(&'a core::sync::atomic::AtomicUsize);
 
-/// One running operation ([`VolCore::begin_op`]).
-pub(crate) struct OpGuard<'a> {
-    _excl: narf_lib::mutex::MutexGuard<'a, ()>,
-    _queue: narf_lib::mutex::MutexGuard<'a, ()>,
+/// One running operation ([`VolCore::begin_op`], [`VolCore::begin_data_op`],
+/// [`VolCore::begin_admin`]). The transaction guard is declared first, so it
+/// is released before the queue moves on.
+pub(crate) enum OpGuard<'a> {
+    Joined {
+        _joined: crate::txn_gate::Joined<'a>,
+    },
+    Queued {
+        _joined: crate::txn_gate::Joined<'a>,
+        _queue: narf_lib::mutex::MutexGuard<'a, ()>,
+    },
+    Admin {
+        _closed: crate::txn_gate::Closed<'a>,
+        _queue: narf_lib::mutex::MutexGuard<'a, ()>,
+    },
 }
 
 impl Drop for CommitHold<'_> {
@@ -902,6 +913,13 @@ pub(crate) struct MmapAnchor {
     pub(crate) content_lock: Mutex<()>,
 }
 
+impl MmapAnchor {
+    /// The inode's number.
+    pub(crate) fn ino(&self) -> u64 {
+        self.ino
+    }
+}
+
 impl Drop for MmapAnchor {
     /// The inode's last lookup or mapping is gone: forget its anchor entry
     /// and its content generation, so neither table grows with every file
@@ -1054,19 +1072,27 @@ pub struct VolCore<B: BlockDevice> {
     /// (`read`, `lookup`, `stat`) may take it, exactly as no Linux reader
     /// waits for a transaction: see [`ReaderEpochs`] and `evictions`.
     ///
-    /// This is the queue operations wait in. What excludes a commit from an
-    /// operation's read-to-stage span is `commit_excl`, which an operation
-    /// takes once it is at the head of this queue ([`Self::begin_op`]).
+    /// Data operations — writes, truncate and fallocate steps, attribute and
+    /// xattr changes — no longer take it: each holds its inode's lock
+    /// (`MmapAnchor::content_lock`, Linux `inode_lock`) and joins the
+    /// running transaction (`txn_gate`), side by side with others. What
+    /// still queues here: namespace changes (which also hold their
+    /// directories' and inodes' locks) and administrative work (subvolumes,
+    /// snapshots, quotas, remount, mount-time recovery), which closes the
+    /// transaction for itself.
     op_lock: Mutex<()>,
-    /// Held by the one running operation, and by a commit forced from
-    /// outside any operation (`fsync`, `syncfs`, the commit timer): such a
-    /// commit must not land between an operation's tree reads and its
-    /// staging, so it waits for the operation in flight — but only for that
-    /// one, not for every operation queued on `op_lock` behind it. Linux's
-    /// `btrfs_commit_transaction` likewise waits for the handles that have
-    /// joined the transaction (`num_writers`) and stops new ones joining; it
-    /// does not wait for every writer that will ever want one.
-    commit_excl: Mutex<()>,
+    /// The running transaction's door ([`crate::txn_gate`]): every
+    /// operation joins it for its read-to-stage span; a commit — `fsync`,
+    /// `syncfs`, the commit timer, or one an operation needs — closes it,
+    /// waiting for the operations in flight and keeping new ones out (Linux
+    /// `num_writers` and `TRANS_STATE_COMMIT_START`).
+    txn_gate: crate::txn_gate::TxnGate,
+    /// One orphan reaper at a time: concurrent operations each try to reap
+    /// on their way in, and an eviction must not run twice at once.
+    reaper: Mutex<()>,
+    /// Held by a cross-directory rename around its directory locks (Linux
+    /// `s_vfs_rename_mutex` in `lock_rename`).
+    rename_lock: Mutex<()>,
     /// Generation of the newest superblock this core has written to the
     /// device (Linux `fs_info->last_trans_committed`, counted at the
     /// superblock write rather than at the commit, because a commit's
@@ -1417,7 +1443,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.frozen.store(true, Ordering::Release);
         // Wait out any operation admitted before the freeze; none can start
         // after it.
-        let _ops = self.begin_op().await;
+        let _ops = self.begin_admin().await;
         let result = loop {
             if let Err(err) = self.sync_to_disk().await {
                 break Err(err);
@@ -2206,7 +2232,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // commit the previous subvolume's tree into the new subvolume's root
         // item. Log replay walks several roots in a row and is the path that
         // reaches this. The commit waits for any running operation of
-        // another mount (see `commit_excl`).
+        // another mount (see `txn_gate`).
         {
             let _op = self.begin_commit().await;
             crate::write::flush_batch(self).await?;
@@ -2542,7 +2568,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             sharing_checked: core::sync::atomic::AtomicBool::new(false),
             txn_lock: Mutex::new(()),
             op_lock: Mutex::new(()),
-            commit_excl: Mutex::new(()),
+            txn_gate: crate::txn_gate::TxnGate::new(),
+            reaper: Mutex::new(()),
+            rename_lock: Mutex::new(()),
             durable_gen: core::sync::atomic::AtomicU64::new(superblock.generation),
             staged_gen: core::sync::atomic::AtomicU64::new(superblock.generation),
             dirty_objects: IrqSafeSpinLock::new(BTreeMap::new()),
@@ -2634,29 +2662,100 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         &self.op_lock
     }
 
-    /// Start one mutating operation: wait in the operation queue
-    /// (`op_lock`), then for any commit forced from outside an operation
-    /// (`commit_excl`). Held until the operation has staged, or failed.
+    /// Start one namespace change: wait in the operation queue (`op_lock`),
+    /// then join the running transaction. The caller already holds the
+    /// directory and inode locks it needs (never taken while joined: see
+    /// [`crate::txn_gate`]).
     pub(crate) async fn begin_op(&self) -> OpGuard<'_> {
         let queue = self.op_lock.lock().await;
-        let excl = self.commit_excl.lock().await;
-        OpGuard {
-            _excl: excl,
+        let joined = self.txn_gate.join().await;
+        OpGuard::Queued {
+            _joined: joined,
             _queue: queue,
         }
     }
 
-    /// Exclude the running operation for a commit forced from outside any
-    /// operation, or for one step of a truncate or fallocate, ahead of the
-    /// operations still queued (see `commit_excl`).
-    pub(crate) async fn begin_commit(&self) -> narf_lib::mutex::MutexGuard<'_, ()> {
-        self.commit_excl.lock().await
+    /// Start one data operation (or one step of a truncate or fallocate):
+    /// join the running transaction, beside every other operation joined.
+    /// The caller holds its inode's lock.
+    pub(crate) async fn begin_data_op(&self) -> OpGuard<'_> {
+        OpGuard::Joined {
+            _joined: self.txn_gate.join().await,
+        }
     }
 
-    /// Test-only: the lock a running operation and an outside commit share.
+    /// Start administrative work (subvolumes, snapshots, quotas, remount,
+    /// recovery): wait in the operation queue, then close the transaction
+    /// to every other operation for the whole of it.
+    pub(crate) async fn begin_admin(&self) -> OpGuard<'_> {
+        let queue = self.op_lock.lock().await;
+        let closed = self.txn_gate.close().await;
+        OpGuard::Admin {
+            _closed: closed,
+            _queue: queue,
+        }
+    }
+
+    /// Close the transaction for a commit forced from outside any
+    /// operation: waits for the operations in flight, not for those queued
+    /// behind them.
+    pub(crate) async fn begin_commit(&self) -> crate::txn_gate::Closed<'_> {
+        self.txn_gate.close().await
+    }
+
+    /// Run `work` with the transaction closed — a commit, a chunk
+    /// allocation, any transaction of its own over the committed trees.
+    ///
+    /// Called with the transaction already closed, it is the closer that
+    /// runs (nothing joined runs while it is closed) and `work` runs
+    /// directly. Called by a joined operation, the operation steps out,
+    /// closes, runs `work` and joins again, waiting like any other joiner
+    /// ([`crate::txn_gate::Upgrade`]); operation code calls this only at a
+    /// point where it holds nothing it read from the tree beyond what its
+    /// inode and directory locks keep stable. With nothing joined it closes
+    /// first (mount, unmount, tests).
+    pub(crate) async fn exclusive<T>(&self, work: impl core::future::Future<Output = T>) -> T {
+        if self.txn_gate.is_closed() {
+            return work.await;
+        }
+        let upgrade = (self.txn_gate.joined() > 0)
+            .then(|| crate::txn_gate::Upgrade::step_out(&self.txn_gate));
+        let out = {
+            let _closed = self.txn_gate.close().await;
+            work.await
+        };
+        if let Some(upgrade) = upgrade {
+            upgrade.step_in().await;
+        }
+        out
+    }
+
+    /// Whether the transaction is closed (by the running code, when it is
+    /// the one asking: nothing joined runs while it is).
+    pub(crate) fn txn_closed(&self) -> bool {
+        self.txn_gate.is_closed()
+    }
+
+    /// Test-only: close the transaction, as a commit would.
     #[cfg(feature = "kernel-test")]
-    pub(crate) fn commit_excl(&self) -> &Mutex<()> {
-        &self.commit_excl
+    pub(crate) fn close_txn(&self) -> crate::txn_gate::CloseFuture<'_> {
+        self.txn_gate.close()
+    }
+
+    /// Test-only: join the transaction, as an operation in flight would.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn join_txn(&self) -> crate::txn_gate::JoinFuture<'_> {
+        self.txn_gate.join()
+    }
+
+    /// The cross-directory rename lock (see the field).
+    pub(crate) fn rename_lock(&self) -> &Mutex<()> {
+        &self.rename_lock
+    }
+
+    /// The orphan reaper's lock, if no other operation is reaping.
+    pub(crate) fn try_reaper(&self) -> Option<narf_lib::mutex::MutexGuard<'_, ()>> {
+        self.reaper.try_lock()
     }
 
     /// Generation of the newest superblock written to the device.
@@ -3209,7 +3308,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     ///
     /// Waits for the running operation, so the commit cannot land between
     /// another CPU's tree reads and its staging — but not for the operations
-    /// queued behind it (`commit_excl`). Concurrent callers share commits:
+    /// queued behind it (`txn_gate`). Concurrent callers share commits:
     /// whoever gets the lock first commits everything open, and each one
     /// after it finds its generation durable and returns (Linux joins an
     /// `fsync` to the transaction already committing,
@@ -3252,10 +3351,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     pub fn sync_to_disk(&self) -> crate::write::BoxFut<'_, ()> {
-        alloc::boxed::Box::pin(async move {
+        alloc::boxed::Box::pin(self.exclusive(async move {
             crate::write::flush_batch(self).await?;
             self.write_staged_super().await
-        })
+        }))
     }
 
     /// Push the staged superblock, if any, through to the device — the second

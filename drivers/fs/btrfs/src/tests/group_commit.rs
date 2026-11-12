@@ -60,7 +60,7 @@ fn check() -> Result<(), &'static str> {
         return Err("write failed");
     }
     let before = commits(&vol);
-    let running = poll_once(vol.commit_excl().lock()).ok_or("commit lock busy")?;
+    let running = poll_once(vol.join_txn()).ok_or("transaction closed")?;
     match poll_once(clean.fsync(false)) {
         Some(Ok(())) => {}
         Some(Err(_)) => return Err("fsync of an unchanged file failed"),

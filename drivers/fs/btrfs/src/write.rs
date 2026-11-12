@@ -1542,8 +1542,12 @@ where
 {
     match op().await {
         Err(FsError::NoSpace) => {
-            vol.sync_to_disk().await?;
-            alloc_metadata_ahead(vol).await?;
+            // Commit and grow with every other operation out, then retry.
+            vol.exclusive(async {
+                vol.sync_to_disk().await?;
+                alloc_metadata_ahead(vol).await
+            })
+            .await?;
             op().await
         }
         Err(FsError::QuotaExceeded) if batch_owns_fs_tree(vol).await => {
@@ -1663,7 +1667,7 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     // The timer runs beside operations on other CPUs. Committing between an
     // operation's tree reads and its staging would hand it a tree that moved
     // (a fresh root with no METADATA_ITEM yet, a closed batch), so it waits
-    // for the running operation to finish (`commit_excl`).
+    // for the running operations to finish (`txn_gate`).
     let _op = vol.begin_commit().await;
     // An orphan that cannot be reclaimed for lack of space must not keep
     // the transaction from ageing out: committing is what releases space.
@@ -2195,6 +2199,11 @@ async fn flush_batch_from<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     origin: FlushOrigin,
 ) -> Result<(), FsError> {
+    // A commit closes the transaction: every operation joined to it has
+    // left, and none joins until it is done (`VolCore::exclusive`).
+    if !vol.txn_closed() {
+        return vol.exclusive(Box::pin(flush_batch_from(vol, origin))).await;
+    }
     let _txn = vol.txn_lock().lock().await;
     let batch = vol.fs_batch().lock().await.take();
     match batch {
@@ -3816,6 +3825,11 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
     let root_refs = metadata_root_refcount(vol, old_root, old_level, root_id).await?;
     if old_owner == root_id && root_refs == 1 {
         return Ok(());
+    }
+    // Materialising the tree is a transaction of its own: every other
+    // operation out, and the check above made again once they are.
+    if !vol.txn_closed() {
+        return vol.exclusive(Box::pin(ensure_private_subvol(vol))).await;
     }
 
     // Not a batchable operation: it reads the extent/csum/root/free-space
@@ -8037,11 +8051,10 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
 /// `btrfs_start_transaction` joins the running one) and calls
 /// `btrfs_btree_balance_dirty`, which may sleep.
 ///
-/// A step does not wait in the operation queue (`op_lock`): it takes
-/// `commit_excl` directly ([`crate::volume::VolCore::begin_commit`]), so it
-/// waits for the operation in flight and at most the one at the head of the
-/// queue, never for every operation queued behind it. One step is a bounded
-/// amount of work, so neither do those operations wait long for it.
+/// A step does not wait in the operation queue (`op_lock`): it joins the
+/// running transaction beside every other operation
+/// ([`crate::volume::VolCore::begin_data_op`]), as Linux's `btrfs_truncate`
+/// starts a fresh handle per step.
 pub(crate) async fn locked_step<B, F, Fut, T>(vol: &BtrfsVolume<B>, mut op: F) -> Result<T, FsError>
 where
     B: BlockDevice + 'static,
@@ -8051,7 +8064,7 @@ where
     if !vol.admits_writes() {
         return Err(FsError::ReadOnly);
     }
-    let _op = vol.begin_commit().await;
+    let _op = vol.begin_data_op().await;
     if !vol.admits_writes() {
         return Err(FsError::ReadOnly);
     }
@@ -10147,6 +10160,14 @@ pub(crate) fn root_rw_grow<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
 ) -> BoxFut<'a, ()> {
     Box::pin(async move {
+        // A chunk allocation: every operation out, one at a time. A grower
+        // that waited behind another finds the space it needed and its
+        // retry fits without a second chunk only if the growth re-checks;
+        // `root_rw_grow` allocates for the type that ran short either way,
+        // as Linux's `btrfs_chunk_alloc` may when two tasks race to it.
+        if !vol.txn_closed() {
+            return vol.exclusive(root_rw_grow(vol)).await;
+        }
         use core::sync::atomic::Ordering;
         let refused = META_RESERVE_REFUSAL.swap(false, Ordering::Relaxed);
         let meta_short = refused
@@ -10224,6 +10245,11 @@ pub(crate) fn root_rw_grow<'a, B: BlockDevice + 'static>(
 /// free-space leaf counts are resolved by the same fixed point [`commit_txn`]
 /// uses. `NoSpace` when the device (or system chunk) has no room.
 pub async fn grow_add_chunk<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<(), FsError> {
+    // Growth is its own transaction over the committed trees: every
+    // operation out, one grower at a time.
+    if !vol.txn_closed() {
+        return vol.exclusive(Box::pin(grow_add_chunk(vol))).await;
+    }
     // The growth rewrites the free-space tree with the new group's range; a
     // filesystem without one (mixed groups written through the bump
     // allocator) cannot grow here, and its caller is out of space.

@@ -150,8 +150,16 @@ pub(crate) async fn alloc_chunk<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     kind: u64,
 ) -> Result<(), FsError> {
-    // Its own transaction over the committed trees, like any non-batchable
-    // operation: the batch's allocator predates the new group.
+    // Its own transaction over the committed trees, with every operation
+    // out (Linux allocates a chunk under `chunk_mutex` inside a handle that
+    // the commit then waits for).
+    if !vol.txn_closed() {
+        return vol
+            .exclusive(alloc::boxed::Box::pin(alloc_chunk(vol, kind)))
+            .await;
+    }
+    // Like any non-batchable operation: the batch's allocator predates the
+    // new group.
     vol.sync_to_disk().await?;
     let sb = vol.superblock();
     let members = vol.member_dev_items();

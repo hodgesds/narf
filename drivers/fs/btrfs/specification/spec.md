@@ -423,8 +423,9 @@ its own, for the crash tests of the `release` scenario
 
 A truncate or fallocate holds its inode's own lock (`MmapAnchor::content_lock`,
 Linux `inode_lock`) from start to end, and excludes the running operation
-one step at a time (`write::locked_step`: `commit_excl` without waiting in
-the operation queue, as an `fsync` does; with the orphan reaping and the
+one step at a time (`write::locked_step`: each step joins the running
+transaction beside other operations, without waiting in the operation queue;
+with the orphan reaping and the
 grow-and-retry `autogrow!` gives a whole operation), yielding between steps
 (`write::step_break`, Linux ending its transaction and
 `btrfs_btree_balance_dirty`). Other operations of the filesystem run between
@@ -459,10 +460,8 @@ gone or no newer than the last superblock written returns at once (Linux
 `btrfs_sync_file` with the inode's `last_trans` committed). On a directory,
 and for `syncfs`, everything staged so far is made durable
 (`sync_to_disk_exclusive`). Concurrent callers share commits: each waits for
-the running operation only, not for the operations queued behind it — a
-mutating operation waits in `op_lock` and then takes `commit_excl`
-(`begin_op`), while a commit forced from outside any operation takes only
-`commit_excl` (`begin_commit`) — and after the first has committed, the
+the operations in flight only, not for those queued behind them, and after
+the first has committed, the
 others find their generation durable and return
 (`smoke_btrfs_fsync_waits_for_the_running_operation_only`; the `release`
 scenario's `group commit` crash case). `fdatasync`
@@ -472,6 +471,29 @@ nothing of that write durable (`smoke_btrfs_fdatasync_survives_a_later_crash`;
 Linux `btrfs_sync_file` ignores `datasync` too). Neither goes through a tree
 log: the driver replays a log at mount and can write one (`write_log`), but
 `fsync` does not use it.
+
+Operations of different inodes run side by side (`txn_gate`, Linux
+`num_writers` and `TRANS_STATE_COMMIT_START`). An operation takes its locks
+first — a data operation (write, truncate or fallocate step, attribute or
+xattr change) its inode's `content_lock`; a namespace change its
+directories' locks by inode number, then the locks of the inodes it names
+by inode number, with the cross-directory rename lock (Linux
+`s_vfs_rename_mutex`) before both — and only then joins the running
+transaction (`begin_data_op`, `begin_op`); it never waits for a lock while
+joined. Namespace changes also queue on `op_lock`, which keeps new inode
+numbers distinct; administrative work (subvolumes, snapshots, quota and
+qgroup changes, remount, orphan recovery at mount) queues there and closes
+the transaction for its whole span (`begin_admin`). A commit closes the
+transaction: it waits for every joined operation to leave and lets none join
+until it is done, ahead of the joiners that arrived after it. A joined
+operation that needs a commit or a chunk of its own (`with_space_retry`, a
+full batch, growth, a shared tree made private) steps out, closes, does it
+and joins again (`VolCore::exclusive`). One orphan is evicted at a time
+(`reaper`). Tested on four CPUs
+(`smoke_btrfs_concurrent_creates_get_distinct_numbers`,
+`smoke_btrfs_cross_dir_renames_do_not_deadlock`,
+`smoke_btrfs_orphan_eviction_beside_lookups`,
+`smoke_btrfs_quota_two_concurrent_writers`).
 
 Filesystem constructors execute without the registry lock held. Missing
 sources return `FsError::NotFound`; failed construction publishes no mount.

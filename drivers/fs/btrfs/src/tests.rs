@@ -21,6 +21,7 @@ mod admitted_ops;
 mod batch_commit;
 mod cache_bounds;
 mod commit_scale;
+mod concurrent_ops;
 mod data_cache;
 mod extent_window;
 mod group_commit;
@@ -3426,9 +3427,9 @@ fn check_queued_mutation_cache_epoch(kind: u8) -> TestResult {
     if !matches!(poll_once(file.write(0, &old)), Some(Ok(8192))) {
         return TestResult::Fail("cache epoch file seed failed");
     }
-    // The lock every mutation holds while it runs, whole operations and a
-    // truncate's or fallocate's steps alike.
-    let held = match poll_once(vol.commit_excl().lock()) {
+    // A commit in progress: the transaction closed, which keeps out every
+    // mutation, whole operations and a truncate's or fallocate's steps alike.
+    let held = match poll_once(vol.close_txn()) {
         Some(held) => held,
         None => return TestResult::Fail("cache epoch operation lock busy"),
     };
