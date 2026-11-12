@@ -2421,41 +2421,54 @@ async fn background_pass() {
 }
 
 static KICKED: AtomicBool = AtomicBool::new(false);
-static FLUSHER_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+/// A flusher episode is under way: from its start until the pass that finds
+/// nobody left to write back for.
 static FLUSHER_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Ask the flusher for a pass now instead of at its next tick. Does no I/O
-/// and takes no filesystem lock; callable from any syscall.
+/// The flusher (`wb->dwork`, run by `wb_workfn`).
+static WB_DWORK: narf_scheduler::workqueue::DelayedWork =
+    narf_scheduler::workqueue::DelayedWork::new(
+        narf_scheduler::workqueue::WorkFn::Async(wb_workfn),
+        false,
+    );
+
+static BDI_WQ: core::sync::atomic::AtomicPtr<narf_scheduler::workqueue::Workqueue> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// `bdi_wq`: writeback is on the memory-reclaim path (`WQ_MEM_RECLAIM`, so
+/// a full worker pool cannot stop it), runs on any CPU (`WQ_UNBOUND`).
+fn bdi_wq() -> &'static narf_scheduler::workqueue::Workqueue {
+    use narf_scheduler::workqueue::{alloc_workqueue, WQ_FREEZABLE, WQ_MEM_RECLAIM, WQ_UNBOUND};
+    let p = BDI_WQ.load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: workqueues are never freed.
+        return unsafe { &*p };
+    }
+    let wq = alloc_workqueue("writeback", WQ_MEM_RECLAIM | WQ_UNBOUND | WQ_FREEZABLE, 0);
+    match BDI_WQ.compare_exchange(
+        core::ptr::null_mut(),
+        wq as *const _ as *mut _,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => wq,
+        // SAFETY: as above.
+        Err(p) => unsafe { &*p },
+    }
+}
+
+/// Ask the flusher for a pass now instead of at its next tick
+/// (`wb_wakeup`). Does no I/O and takes no filesystem lock; callable from
+/// any syscall.
 pub(super) fn kick() {
     if KICKED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let waker = FLUSHER_WAKER.lock().take();
-    if let Some(waker) = waker {
-        waker.wake();
-    }
-}
-
-/// The flusher's sleep: until it is kicked or the writeback interval ends.
-struct NextPass {
-    tick: narf_time::SleepUntil,
-}
-
-impl Future for NextPass {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        if KICKED.swap(false, Ordering::AcqRel) {
-            return Poll::Ready(());
-        }
-        *FLUSHER_WAKER.lock() = Some(cx.waker().clone());
-        // A kick between the test above and the registration found no
-        // waker to wake.
-        if KICKED.swap(false, Ordering::AcqRel) {
-            return Poll::Ready(());
-        }
-        Pin::new(&mut this.tick).poll(cx)
+    // A pass waiting on its timer runs now; one running sees the kick when
+    // it re-queues itself.
+    if WB_DWORK.is_pending() {
+        // SAFETY: the delayed work is a static.
+        unsafe { narf_scheduler::workqueue::mod_delayed_work(bdi_wq(), &WB_DWORK, 0) };
     }
 }
 
@@ -2475,54 +2488,49 @@ fn writeback_interval_ms() -> u64 {
     }
 }
 
-/// Clears [`FLUSHER_STARTED`] however the flusher ends — returning, or its
-/// task being dropped — so a later dirtier can start another.
-struct FlusherRunning;
-
-impl Drop for FlusherRunning {
-    fn drop(&mut self) {
-        FLUSHER_STARTED.store(false, Ordering::Release);
-    }
-}
-
-/// `running` is created with the task, not in its first poll: a task that
-/// is dropped before it ever runs must clear the flag too.
-async fn flusher_main(running: FlusherRunning) {
-    loop {
+/// `wb_workfn`: one pass (`wb_writeback`), then the next pass is queued
+/// `dirty_writeback_interval` later (`wb_wakeup_delayed`) — at once if the
+/// flusher was kicked during the pass — while anybody can still dirty a
+/// page or pages wait.
+fn wb_workfn(_: narf_scheduler::workqueue::WorkRef) -> narf_scheduler::workqueue::WorkFuture {
+    alloc::boxed::Box::pin(async {
+        // Kicks before this pass are served by it.
+        KICKED.store(false, Ordering::Release);
         background_pass().await;
         // Not merely "no user task": the last one may have exited between
         // that pass and this test, leaving the pages it unmapped on the way
         // out. They are written by the next pass, and only then does the
         // flusher go.
         if !dirtiers_alive() && IDLE_DIRTY_PAGES.load(Ordering::Acquire) == 0 {
-            break;
+            FLUSHER_STARTED.store(false, Ordering::Release);
+            // A dirtier that appeared between the test above and the flag
+            // clearing found the flusher still marked as running.
+            if IDLE_DIRTY_PAGES.load(Ordering::Acquire) != 0 {
+                start_flusher();
+            } else {
+                ensure_flusher();
+            }
+            return;
         }
-        NextPass {
-            tick: narf_time::sleep_ms(writeback_interval_ms()),
-        }
-        .await;
-    }
-    drop(running);
-    // A dirtier that appeared between the test above and the flag clearing
-    // found the task still marked as running.
-    if IDLE_DIRTY_PAGES.load(Ordering::Acquire) != 0 {
-        start_flusher();
-    } else {
-        ensure_flusher();
-    }
+        let delay = if KICKED.swap(false, Ordering::AcqRel) {
+            0
+        } else {
+            narf_time::timer::ns_to_jiffies(writeback_interval_ms().saturating_mul(1_000_000))
+        };
+        // SAFETY: the delayed work is a static.
+        unsafe { narf_scheduler::workqueue::queue_delayed_work(bdi_wq(), &WB_DWORK, delay) };
+    })
 }
 
-/// Start the writeback task if it is not running and there is anybody to
-/// write back for.
+/// Start the flusher if it is not running and there is anybody to write
+/// back for.
 ///
-/// It is an ordinary kernel task — it parks on the filesystem's wakers and
-/// on its timer like any other, and a nested executor round can run it —
-/// and it may run on any CPU, so one busy CPU cannot strand it. It lives as
-/// long as a user task does: from the first writable shared file mapping
+/// It is delayed work on `bdi_wq` (Linux `wb->dwork`): each pass runs on a
+/// worker of the unbound pool, on any CPU, so one busy CPU cannot strand
+/// it, and between passes it is only a timer. It keeps queueing itself as
+/// long as a user task lives: from the first writable shared file mapping
 /// until the last process is gone, which on a running system is until
-/// shutdown. (It ends rather than sleeping for ever so that an executor
-/// drained to empty, as the in-kernel test harness drains it, is not kept
-/// from emptying.)
+/// shutdown.
 pub(crate) fn ensure_flusher() {
     if !dirtiers_alive() {
         return;
@@ -2538,12 +2546,23 @@ fn start_flusher() {
         return;
     }
     FLUSHER_STARTS.fetch_add(1, Ordering::Relaxed);
-    let spec = narf_scheduler::TaskSpec {
-        affinity: narf_scheduler::Affinity::any(),
-        work_kind: narf_scheduler::WorkKind::KernelThread,
-        ..narf_scheduler::TaskSpec::unthrottled()
-    };
-    narf_scheduler::spawn_with_spec(flusher_main(FlusherRunning), spec);
+    // SAFETY: the delayed work is a static.
+    unsafe { narf_scheduler::workqueue::queue_delayed_work(bdi_wq(), &WB_DWORK, 0) };
+}
+
+/// Whether a flusher episode is under way (tests).
+#[doc(hidden)]
+pub(crate) fn __flusher_running() -> bool {
+    FLUSHER_STARTED.load(Ordering::Acquire)
+}
+
+/// Forget a flusher whose work the test harness dropped with its worker
+/// pools (`__reset_queues_for_test`).
+#[doc(hidden)]
+pub(crate) fn __reset_flusher_for_test() {
+    let _ = narf_scheduler::workqueue::cancel_delayed_work(&WB_DWORK);
+    FLUSHER_STARTED.store(false, Ordering::Release);
+    KICKED.store(false, Ordering::Release);
 }
 
 /// Pages of memory one cached page costs: its frame. (A few dozen bytes of

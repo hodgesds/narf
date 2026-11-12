@@ -1590,6 +1590,14 @@ fn one_writer(pid: u64, text: &'static [u8]) -> Result<(bool, u64), &'static str
         Arc::new(mm),
     );
     narf_scheduler::run_until_empty();
+    // The flusher is delayed work: between passes it is a timer, not a
+    // task, so the drained executor does not wait for it. Run rounds (its
+    // timer and workers) until the episode is over.
+    let end = narf_time::monotonic_ns() + 5_000_000_000;
+    while __flusher_running() && narf_time::monotonic_ns() < end {
+        let _ = narf_scheduler::poll_one_round();
+        core::hint::spin_loop();
+    }
     crate::task::release_task(pid);
     let written = (0..PAGES).all(|page| fixture.file_bytes(page * 4096, text.len()) == text)
         && fixture.idle_dirty() == 0;
@@ -1606,9 +1614,8 @@ fn one_writer(pid: u64, text: &'static [u8]) -> Result<(bool, u64), &'static str
 /// hands its pages to the flusher.
 fn smoke_flusher_writes_for_real_user_tasks() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
-    if FLUSHER_STARTED.load(Ordering::Acquire) {
-        return TestResult::Fail("a dropped flusher left its running flag set");
-    }
+    // The reset dropped the worker pools; a flusher queued on one goes too.
+    __reset_flusher_for_test();
     // The timer path within a test's patience; the logic is unchanged.
     WRITEBACK_INTERVAL_OVERRIDE_MS.store(20, Ordering::Relaxed);
     let passes = PASSES.load(Ordering::Relaxed);
