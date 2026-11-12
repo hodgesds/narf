@@ -7524,6 +7524,12 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
             return true;
         }
     }
+    // This CPU is the timer migrator of a group whose idle CPU has a due
+    // global timer (`tmigr_requires_handle_remote`): the executor round runs
+    // it, so a CPU-bound task must yield as for its own timers.
+    if narf_time::timer_migration::requires_handle_remote() {
+        return true;
+    }
     // A cross-core wake is staged for this CPU (Linux `rq->wake_list`).
     if wake_list_pending(cpu) {
         return true;
