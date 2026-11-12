@@ -7737,6 +7737,7 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
     let (timeslices, voluntary_switches, involuntary_switches) = crate::task::switch_counts(task);
     let syscall = proc_task_syscall_frame(task);
     let wchan = proc_wchan_of_frame(syscall);
+    let wait_site = wchan.as_ref().and_then(|_| crate::handlers::parked_wait_site(task));
     narf_filesystem::procfs::ProcSchedSnapshot {
         run_ns: cpu_time_ns_of(task).saturating_add(kern_time_ns_of(task)),
         timeslices,
@@ -7746,6 +7747,7 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         nice: nice_of(pid),
         syscall,
         wchan,
+        wait_site,
     }
 }
 

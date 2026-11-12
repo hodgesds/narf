@@ -632,6 +632,9 @@ pub struct ProcSchedSnapshot {
     /// Where a parked task is waiting — the handler it is blocked in.
     /// `None` prints `0`, as Linux does when it cannot name the site.
     pub wchan: Option<String>,
+    /// The lock a parked task is queued on, as the source location of its
+    /// `lock()` call (`file:line`), when it parked waiting for one.
+    pub wait_site: Option<String>,
 }
 
 type SchedSnapshotFn = fn(u64) -> ProcSchedSnapshot;
