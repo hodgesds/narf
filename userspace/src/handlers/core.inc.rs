@@ -1343,6 +1343,16 @@ impl narf_filesystem::procfs::ProcFile for NarfMmHoldersFile {
     }
 }
 
+/// `/proc/narf/kill_latency`, read-only.
+#[derive(Debug)]
+struct NarfKillLatencyFile;
+
+impl narf_filesystem::procfs::ProcFile for NarfKillLatencyFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        narf_kill_latency_report()
+    }
+}
+
 /// `/proc/narf/mm_orphans`, read-only.
 #[derive(Debug)]
 struct NarfMmOrphansFile;
@@ -1400,6 +1410,7 @@ pub fn init_per_task_state() {
     // `/proc/narf/mm_orphans`: address spaces no task reaches, and who still
     // holds them (see `narf_mm_orphans_report`).
     narf_filesystem::procfs::register_proc("narf/mm_orphans", Arc::new(NarfMmOrphansFile));
+    narf_filesystem::procfs::register_proc("narf/kill_latency", Arc::new(NarfKillLatencyFile));
     narf_filesystem::procfs::register_proc("narf/mm_holders", Arc::new(NarfMmHoldersFile));
     rlimit_init();
     nice_init();
@@ -11151,6 +11162,9 @@ pub(crate) fn terminate_current_task(
     signum: u32,
     core_dumped: bool,
 ) {
+    if signum == 9 {
+        kill_latency_mark(task_to_pid_raw(task).unwrap_or(task), KillMark::Noticed);
+    }
     // A fatal signal is `do_group_exit(signum)` → `do_exit`: the tracer's
     // PTRACE_EVENT_EXIT stop comes first (skipped for SIGKILL, see
     // `ptrace_report_exit`).
@@ -14124,6 +14138,7 @@ pub fn wait_init() {
     crate::user_task::register_process_exit_observer(shared_pending_process_exit);
     crate::user_task::register_process_exit_observer(release_exiting_process_mm);
     crate::user_task::register_process_exit_observer(on_child_exit);
+    crate::user_task::register_process_exit_observer(kill_latency_notified);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
     // Abnormal slot drops (budget kill / revoked cap) must run the same
@@ -15143,6 +15158,7 @@ fn parent_of_remove(child: u64) {
 /// mapping — still intact at reap time because nothing removes it before
 /// this point.
 pub(crate) fn release_reaped_task(child_pid: u64) {
+    kill_latency_reaped(child_pid);
     if let Some(tid) = pid_to_task_raw(child_pid) {
         // Only release a task that actually ran its exit path. A
         // CLONE_THREAD sibling's exit stages a reap entry under the
@@ -15658,8 +15674,16 @@ fn shared_pending_process_exit(pid: u64, tid: u64) {
 /// thread's robust-futex, clear-child-tid and rusage user-memory accesses
 /// have finished; registered after SysV/process signal cleanup and before
 /// `on_child_exit`.
-fn release_exiting_process_mm(_pid: u64, tid: u64) {
+fn release_exiting_process_mm(pid: u64, tid: u64) {
+    kill_latency_last_thread(pid, tid);
+    kill_latency_mark(pid, KillMark::MmStart);
     narf_scheduler::exit_mm(narf_scheduler::TaskId(tid));
+    kill_latency_mark(pid, KillMark::MmDone);
+}
+
+/// Kill-latency stamp: the parent has been notified (`/proc/narf/kill_latency`).
+fn kill_latency_notified(pid: u64, _tid: u64) {
+    kill_latency_mark(pid, KillMark::Notified);
 }
 
 /// Test-only: run the AIO-context exit sweep for `tid` (the

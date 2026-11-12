@@ -8158,6 +8158,322 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
     s.into_bytes()
 }
 
+// ── SIGKILL-to-reap latency (`/proc/narf/kill_latency`) ──────────────
+//
+// Per killed process: when the first SIGKILL was sent and where each of its
+// threads was then (syscall + wait site), when a thread of it noticed
+// (entered the fatal-signal exit), when the last thread's `exit_mm` started
+// and finished, when the parent was notified, and when the parent reaped it.
+// Phases go into log2-microsecond histograms; the slowest few are kept with
+// the site of the thread the kill was sent through and of the thread that
+// exited last (the one the process's exit waited for).
+
+/// One killed process in flight.
+struct KillRec {
+    sent: u64,
+    noticed: u64,
+    mm_start: u64,
+    mm_done: u64,
+    notified: u64,
+    /// Every thread at the kill, the target first, with its site.
+    sites: alloc::vec::Vec<(u64, alloc::string::String)>,
+    /// The thread that exited last (0: not seen).
+    last: u64,
+}
+
+const KILL_PHASE_NAMES: [&str; 6] = [
+    "sent_to_noticed",
+    "noticed_to_exit_mm",
+    "exit_mm",
+    "exit_mm_to_notified",
+    "notified_to_reaped",
+    "total",
+];
+const KILL_BUCKETS: usize = 26;
+/// Killed processes in flight, by pid. Its capacity is reserved once, outside
+/// the lock: nothing allocates while an IRQ-safe lock is held.
+static KILL_RECS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<(u64, KillRec)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+const KILL_RECS_CAP: usize = 4096;
+static KILL_HIST: [[AtomicU64; KILL_BUCKETS]; 6] =
+    [const { [const { AtomicU64::new(0) }; KILL_BUCKETS] }; 6];
+/// Kills reaped with no "noticed" stamp: the process died without a thread
+/// taking the fatal-signal path (killed before it ever ran, or exited first).
+static KILL_UNNOTICED: AtomicU64 = AtomicU64::new(0);
+/// Last-exiting threads' sites at the kill, over every kill whose exit took
+/// longer than [`KILL_SLOW_US`] after it was noticed: site -> (count, max µs).
+static KILL_SLOW_SITES: narf_lib::sync::IrqSafeSpinLock<
+    alloc::vec::Vec<(alloc::string::String, u64, u64)>,
+> = narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+const KILL_SLOW_CAP: usize = 256;
+const KILL_SLOW_US: u64 = 100_000;
+const KILL_WORST: usize = 10;
+/// Slowest kills: total µs, phases, the last thread's site, every thread's
+/// (target first).
+type KillWorst = alloc::vec::Vec<(u64, [u64; 5], alloc::string::String, alloc::string::String)>;
+static KILL_WORST_TABLE: narf_lib::sync::IrqSafeSpinLock<KillWorst> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Reserve `cap` in the vector behind `lock` once, without holding the lock
+/// across the allocation.
+fn kill_reserve<T>(lock: &narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<T>>, cap: usize) {
+    if lock.lock().capacity() >= cap {
+        return;
+    }
+    let mut fresh = alloc::vec::Vec::with_capacity(cap);
+    let old = {
+        let mut g = lock.lock();
+        if g.capacity() >= cap {
+            return;
+        }
+        fresh.extend(g.drain(..));
+        core::mem::replace(&mut *g, fresh)
+    };
+    drop(old);
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum KillMark {
+    Noticed,
+    MmStart,
+    MmDone,
+    Notified,
+}
+
+/// Where thread `tid` is: the syscall it is in and the site it waits at.
+fn kill_site_of(tid: u64) -> alloc::string::String {
+    let sys = proc_wchan_of_frame(proc_task_syscall_frame(tid)).or_else(|| {
+        crate::task::running_syscall(tid)
+            .and_then(|nr| crate::syscall::syscall_name_of_number(u64::from(nr)))
+            .map(alloc::string::String::from)
+    });
+    let at = crate::handlers::parked_wait_site(tid)
+        .or_else(|| crate::handlers::parked_park_site(tid))
+        .or_else(|| crate::handlers::yielded_site(tid));
+    // A site ends in `path/file.rs:line`, and a lock waiter adds the
+    // waiter's address: keep the file and line.
+    let at = at.map(|at| {
+        let at = at.split(" waiter").next().unwrap_or(&at);
+        let cut = at.rfind('/').map_or(0, |i| i + 1);
+        alloc::string::String::from(&at[cut..])
+    });
+    alloc::format!(
+        "{}@{}",
+        sys.as_deref().unwrap_or("user"),
+        at.as_deref().unwrap_or("-")
+    )
+}
+
+/// Record the first SIGKILL sent to process `pid` through thread `target`.
+pub(crate) fn kill_latency_sent(pid: u64, target: u64) {
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    kill_reserve(&KILL_RECS, KILL_RECS_CAP);
+    if KILL_RECS.lock().iter().any(|(p, _)| *p == pid) {
+        return;
+    }
+    let mut sites = alloc::vec![(target, kill_site_of(target))];
+    for tid in crate::task::thread_group_tids(pid) {
+        if tid != target && sites.len() < 64 {
+            sites.push((tid, kill_site_of(tid)));
+        }
+    }
+    let rec = KillRec {
+        sent: now,
+        noticed: 0,
+        mm_start: 0,
+        mm_done: 0,
+        notified: 0,
+        sites,
+        last: 0,
+    };
+    let mut recs = KILL_RECS.lock();
+    if recs.len() < recs.capacity() && !recs.iter().any(|(p, _)| *p == pid) {
+        recs.push((pid, rec));
+        return;
+    }
+    drop(recs);
+    // Full, or raced: the record (and its sites) drops outside the lock.
+    drop(rec);
+}
+
+/// The thread `tid` is the last of killed process `pid` to exit.
+pub(crate) fn kill_latency_last_thread(pid: u64, tid: u64) {
+    if let Some((_, rec)) = KILL_RECS.lock().iter_mut().find(|(p, _)| *p == pid) {
+        rec.last = tid;
+    }
+}
+
+/// Stamp a later point of a killed process's exit (first stamp wins).
+pub(crate) fn kill_latency_mark(pid: u64, mark: KillMark) {
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let mut recs = KILL_RECS.lock();
+    let Some((_, rec)) = recs.iter_mut().find(|(p, _)| *p == pid) else {
+        return;
+    };
+    let slot = match mark {
+        KillMark::Noticed => &mut rec.noticed,
+        KillMark::MmStart => &mut rec.mm_start,
+        KillMark::MmDone => &mut rec.mm_done,
+        KillMark::Notified => &mut rec.notified,
+    };
+    if *slot == 0 {
+        *slot = now;
+    }
+}
+
+fn kill_bucket(us: u64) -> usize {
+    ((64 - us.leading_zeros()) as usize).min(KILL_BUCKETS - 1)
+}
+
+/// The parent reaped killed process `pid`: fold its phases into the stats.
+pub(crate) fn kill_latency_reaped(pid: u64) {
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let taken = {
+        let mut recs = KILL_RECS.lock();
+        recs.iter()
+            .position(|(p, _)| *p == pid)
+            .map(|at| recs.swap_remove(at).1)
+    };
+    let Some(rec) = taken else {
+        return;
+    };
+    if rec.noticed == 0 {
+        KILL_UNNOTICED.fetch_add(1, Ordering::Relaxed);
+    }
+    let stamps = [
+        rec.sent,
+        rec.noticed,
+        rec.mm_start,
+        rec.mm_done,
+        rec.notified,
+        now,
+    ];
+    let mut phases = [0u64; 5];
+    for (i, phase) in phases.iter_mut().enumerate() {
+        let (a, b) = (stamps[i], stamps[i + 1]);
+        if a != 0 && b != 0 && b >= a {
+            *phase = (b - a) / 1000;
+            KILL_HIST[i][kill_bucket(*phase)].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let total = now.saturating_sub(rec.sent) / 1000;
+    KILL_HIST[5][kill_bucket(total)].fetch_add(1, Ordering::Relaxed);
+    // Every thread's site, the target first, at most eight.
+    let mut target = alloc::string::String::new();
+    for (i, (_, site)) in rec.sites.iter().take(8).enumerate() {
+        if i != 0 {
+            target.push('|');
+        }
+        target.push_str(site);
+    }
+    let last = rec
+        .sites
+        .iter()
+        .find(|(tid, _)| *tid == rec.last)
+        .map(|(_, s)| s.clone())
+        .unwrap_or_else(|| alloc::string::String::from("?"));
+    // The time from the first thread noticing to the last one leaving is
+    // the wait for the slowest thread: charge it to that thread's site.
+    let straggle = if rec.noticed != 0 && rec.mm_start >= rec.noticed {
+        (rec.mm_start - rec.noticed) / 1000
+    } else {
+        0
+    };
+    kill_reserve(&KILL_SLOW_SITES, KILL_SLOW_CAP);
+    kill_reserve(&KILL_WORST_TABLE, KILL_WORST);
+    // Displaced strings drop after the locks are released.
+    let mut spare = None;
+    if straggle >= KILL_SLOW_US {
+        let key = last.clone();
+        let mut slow = KILL_SLOW_SITES.lock();
+        if let Some(e) = slow.iter_mut().find(|e| e.0 == key) {
+            e.1 += 1;
+            e.2 = e.2.max(straggle);
+            spare = Some(key);
+        } else if slow.len() < slow.capacity() {
+            slow.push((key, 1, straggle));
+        } else {
+            spare = Some(key);
+        }
+    }
+    let displaced = {
+        let mut worst = KILL_WORST_TABLE.lock();
+        if worst.len() < worst.capacity().min(KILL_WORST) {
+            worst.push((total, phases, target, last));
+            None
+        } else if let Some(min) = (0..worst.len()).min_by_key(|&i| worst[i].0) {
+            if worst[min].0 < total {
+                Some(core::mem::replace(&mut worst[min], (total, phases, target, last)))
+            } else {
+                Some((total, phases, target, last))
+            }
+        } else {
+            Some((total, phases, target, last))
+        }
+    };
+    drop(displaced);
+    drop(spare);
+}
+
+/// `/proc/narf/kill_latency`: per phase, the count and the log2-µs
+/// histogram's p50/p90/p99/max bucket upper bounds; the sites slow exits
+/// waited for (the last thread's site at the kill, with the count of exits
+/// that waited over 100 ms for it and the longest wait); then the slowest
+/// kills with every phase in µs.
+pub fn narf_kill_latency_report() -> alloc::vec::Vec<u8> {
+    use core::fmt::Write as _;
+    let mut s = alloc::string::String::new();
+    let in_flight = KILL_RECS.lock().len();
+    let _ = writeln!(s, "in_flight {}", in_flight);
+    let _ = writeln!(s, "unnoticed {}", KILL_UNNOTICED.load(Ordering::Relaxed));
+    for (p, name) in KILL_PHASE_NAMES.iter().enumerate() {
+        let counts: alloc::vec::Vec<u64> = KILL_HIST[p]
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let n: u64 = counts.iter().sum();
+        let upper = |b: usize| if b == 0 { 1u64 } else { 1u64 << b };
+        let quantile = |q: u64| -> u64 {
+            let want = (n * q).div_ceil(100).max(1);
+            let mut seen = 0;
+            for (b, c) in counts.iter().enumerate() {
+                seen += c;
+                if seen >= want {
+                    return upper(b);
+                }
+            }
+            0
+        };
+        let max = counts.iter().rposition(|&c| c != 0).map_or(0, upper);
+        let _ = writeln!(
+            s,
+            "phase {} n={} p50_us<={} p90_us<={} p99_us<={} max_us<={}",
+            name,
+            n,
+            quantile(50),
+            quantile(90),
+            quantile(99),
+            max
+        );
+    }
+    // A /proc read is rare; copying the strings out under the lock is fine.
+    let mut slow = KILL_SLOW_SITES.lock().clone();
+    slow.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    for (site, count, max) in slow.iter().take(16) {
+        let _ = writeln!(s, "straggler n={} max_us={} at={}", count, max, site);
+    }
+    let mut worst = KILL_WORST_TABLE.lock().clone();
+    worst.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (total, phases, target, last) in worst.iter() {
+        let _ = writeln!(
+            s,
+            "worst total_us={} noticed={} to_exit_mm={} exit_mm={} to_notified={} to_reaped={} last={} threads={}",
+            total, phases[0], phases[1], phases[2], phases[3], phases[4], last, target
+        );
+    }
+    s.into_bytes()
+}
+
 /// `/proc/narf/mm_orphans`: user address spaces whose page tables are still
 /// live while no scheduler task reaches them, with what the weak registry
 /// (`narf_memory::as_origin`) knows of each: strong references now and at
@@ -9249,6 +9565,7 @@ pub(crate) fn raise_group_signal(target: u64, signum: u32, info: GroupSigInfo) -
     }
     if signum == 9 {
         let pid = task_to_pid_raw(target).unwrap_or(target);
+        kill_latency_sent(pid, target);
         let mut saw_target = false;
         for_each_group_member(pid, |t| {
             saw_target |= t == target;
