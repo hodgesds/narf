@@ -255,6 +255,17 @@ impl Task {
             poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             select_park: narf_lib::sync::IrqSafeSpinLock::new(None),
         });
+        // copy_process: the child inherits the creator's timer slack, and its
+        // default (`PR_SET_TIMERSLACK(0)`) becomes the creator's current one.
+        if let Some(parent) = crate::user_task::current_user_task() {
+            // SAFETY: `current_user_task` names the running task's live,
+            // poller-pinned ctx; only atomics are read.
+            let slack = unsafe { (*parent).timer_slack() };
+            t.uctx.timer_slack_ns.store(slack, Ordering::Relaxed);
+            t.uctx
+                .default_timer_slack_ns
+                .store(slack, Ordering::Relaxed);
+        }
         task_registry_shard(tid).tasks.lock().insert(tid, t.clone());
         // /proc/[pid]/stat starttime source — every task (spawn, fork,
         // clone, the abi-test harness) registers exactly once, so this
