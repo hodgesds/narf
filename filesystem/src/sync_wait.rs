@@ -26,8 +26,9 @@ pub struct SyncWaitHooks {
     /// Whether the caller runs on a user task's stackful continuation.
     pub in_user_task: fn() -> bool,
     /// Park the current user task until its waker fires; false if it
-    /// cannot be parked.
-    pub park: fn() -> bool,
+    /// cannot be parked. The location is the filesystem entry point that is
+    /// waiting, so `/proc/<pid>/stack` names it as the park site.
+    pub park: fn(&'static core::panic::Location<'static>) -> bool,
 }
 
 static HOOKS: AtomicPtr<SyncWaitHooks> = AtomicPtr::new(core::ptr::null_mut());
@@ -55,6 +56,7 @@ pub fn spins_with_user_task() -> u64 {
 /// a user task, spinning only where there is no task to park.
 #[track_caller]
 pub fn wait_sync<F: Future>(future: F) -> F::Output {
+    let caller = core::panic::Location::caller();
     let mut future = core::pin::pin!(future);
     let hooks = hooks();
     let user = hooks.is_some_and(|h| (h.in_user_task)());
@@ -68,7 +70,7 @@ pub fn wait_sync<F: Future>(future: F) -> F::Output {
                 // A user task parks through its own layer, which keeps its
                 // syscall bookkeeping (kernel span, the parked-at site).
                 Some(h) if user => {
-                    if !(h.park)() {
+                    if !(h.park)(caller) {
                         break;
                     }
                 }
