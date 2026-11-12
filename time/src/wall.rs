@@ -239,6 +239,9 @@ impl From<CapError> for WallError {
 pub fn set_wall_offset(cap: &Cap<WallClock, Write>, offset_ns: i64) -> Result<(), WallError> {
     cap.invoke(NoopOp)?;
     WALL_OFFSET_NS.store(offset_ns, Ordering::Release);
+    // A step of the wall clock moves every REALTIME/TAI hrtimer's expiry
+    // relative to the hardware (`clock_was_set`).
+    crate::hrtimer::clock_was_set();
     Ok(())
 }
 
@@ -249,6 +252,9 @@ pub fn set_wall_offset(cap: &Cap<WallClock, Write>, offset_ns: i64) -> Result<()
 /// `bootstrap_wall_clock_authority` lands.
 pub fn set_wall_offset_uncapped(offset_ns: i64) {
     WALL_OFFSET_NS.store(offset_ns, Ordering::Release);
+    // `clock_settime` / `settimeofday` / `ADJ_SETOFFSET` step the clock:
+    // every CPU re-evaluates its REALTIME/TAI hrtimers (`clock_was_set`).
+    crate::hrtimer::clock_was_set();
 }
 
 /// Current monotonic→wall offset in nanoseconds (`now_wall = monotonic_ns +

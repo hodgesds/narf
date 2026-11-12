@@ -146,14 +146,26 @@ pub fn next_deadline() -> Option<Instant>;
 | `hrtimer_get_next_event` (nohz) | `next_event_cycles_local()` (lock-free, IRQ-safe) |
 | `hrtimers_cpu_dying` | `hrtimers_cpu_dying(cpu)`: moves every queued timer to the calling CPU |
 | `struct hrtimer_sleeper`, `hrtimer_wakeup`, `schedule_hrtimeout_range` | `SleepHandle` (`arm`, `start`, `refresh_waker`, drop = cancel); expiry wakes by reference |
-| `clock_was_set` | `clock_was_set()` re-evaluates every base |
+| `clock_was_set` | `clock_was_set()` re-evaluates every base; called by every wall-clock step (`clock_settime`, `settimeofday`, `ADJ_SETOFFSET`, an NTP step), not by slews |
 | `current->timer_slack_ns`, `PR_SET_TIMERSLACK` | `UserTaskCtx::timer_slack_ns` (`userspace/`), used as the range of every park timer (nanosleep, poll/select/epoll, futex) |
 
 Users today: `SleepUntil` (every kernel `sleep*`), the user-task park timer
 behind nanosleep/clock_nanosleep, poll/ppoll/select/pselect/epoll_wait,
-futex and rt_sigtimedwait timeouts and the console byte-waker backstop, and
-the scheduler's hrtick. POSIX timers, itimers and timerfd still expire from
-the scheduler's `sleep_pumps` and move to hrtimer callbacks next.
+futex and rt_sigtimedwait timeouts and the console byte-waker backstop, the
+scheduler's hrtick, and in `userspace/`: POSIX timers (`posix_timer_fn`, one
+hrtimer per timer on its clock's base), ITIMER_REAL (`it_real_fn`, one per
+task) and timerfd (`timerfd_tmrproc`, one per fd). Those three callbacks run
+in hard IRQ, take only IRQ-safe locks, raise their signal or readiness
+through alloc-free paths, and restart a periodic timer at its next expiry.
+ITIMER_VIRTUAL/PROF stay on the tick, as in Linux (`run_posix_cpu_timers`).
+
+Every CPU's local clockevent installs itself as the programmer when it
+starts (the x86 TSC-deadline LAPIC; the aarch64 generic timer). An executor
+round (`poll_one_round`, the run loop) is the softirq context: it expires the
+CPU's due soft timers and any hard timer whose interrupt was not taken (a CPU
+that runs with interrupts masked — the kernel-test runner — gets no timer
+interrupt). Code that waits for a timer while spinning with interrupts
+masked must run such a round; Linux never sleeps with interrupts off.
 
 A sleeper whose waker is a scheduler task waker (`set_hardirq_waker_predicate`)
 is queued on a hard base and woken from the timer interrupt with
