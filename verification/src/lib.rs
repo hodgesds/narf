@@ -32,6 +32,8 @@ extern crate alloc;
 #[cfg(feature = "user-mode-e2e")]
 mod pipe_abi;
 
+mod frame_canary;
+
 // Force-link crates that contribute tests via the `narf.tests` link
 // section but whose public surface is not otherwise referenced from
 // this mega-lib. Without a load-bearing reference the rlib linker
