@@ -12982,6 +12982,23 @@ impl AddressSpace {
     /// The result includes base-page and hardware-huge regions. Lazy base-page
     /// slots whose physical entry is zero contribute virtual bytes but not
     /// resident pages.
+    /// Page-table frames this address space owns: its root and every marked
+    /// table in the user half (Linux `mm_pgtables_bytes(mm) / PAGE_SIZE`).
+    /// Walked, not counted, so it is diagnostic; 0 off x86_64.
+    pub fn page_table_frames(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.root.raw() == 0 {
+                return 0;
+            }
+            crate::x86_64::paging::count_marked_tables(self.root, 0..256)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    }
+
     pub fn memory_stats(&self) -> AddressSpaceMemoryStats {
         let mut stats = AddressSpaceMemoryStats::default();
         {

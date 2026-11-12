@@ -472,6 +472,53 @@ pub fn user_pml4_live() -> i64 {
     USER_PML4_LIVE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Page-table frames reachable from `root` through PML4 slots `slots`,
+/// counting only tables carrying the page-table mark (AS-private user tables
+/// and the kernel's registered vmalloc/module/stack tables; the boot tables
+/// are never marked), plus `root` itself when it is marked. The per-tree
+/// half of Linux's `mm->pgtables_bytes`, computed by walking.
+///
+/// Diagnostic: reads the tree without its lock, so a concurrent map or
+/// unmap can make the count transiently off by the tables it touches. Only
+/// marked tables are descended, so every frame read is a live page table or
+/// one being retired (still a direct-mapped frame).
+pub fn count_marked_tables(root: PhysAddr, slots: core::ops::Range<usize>) -> usize {
+    let marked =
+        |pa: PhysAddr| pa.raw() >= 0x100000 && crate::frame::__pagetable_is_registered(pa.raw());
+    let mut count = usize::from(marked(root));
+    // SAFETY: `root` is a page-table frame, readable through the direct map.
+    let pml4 = unsafe { &*root.kernel_ptr::<PageTable>() };
+    for slot in slots {
+        let e = pml4.entries[slot];
+        if !e.is_present() || !marked(e.addr()) {
+            continue;
+        }
+        count += 1;
+        // SAFETY: a marked table, direct-mapped.
+        let pdpt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
+        for pdpte in pdpt.entries.iter() {
+            if !pdpte.is_present()
+                || pdpte.flags().contains(PtFlags::HUGE_PAGE)
+                || !marked(pdpte.addr())
+            {
+                continue;
+            }
+            count += 1;
+            // SAFETY: a marked table, direct-mapped.
+            let pd = unsafe { &*pdpte.addr().kernel_ptr::<PageTable>() };
+            for pde in pd.entries.iter() {
+                if pde.is_present()
+                    && !pde.flags().contains(PtFlags::HUGE_PAGE)
+                    && marked(pde.addr())
+                {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Test-only cumulative counts for final-root subtree detachment and allocator
 /// batches. Production builds contain neither counter nor update.
 #[cfg(feature = "kernel-test")]

@@ -217,7 +217,7 @@ sampler() {
       line="SOAK-SLAB n=$n"
       while read -r k v; do
         [ "$v" = 0 ] || line+=" $k=$v"
-      done < <(cat /proc/narf/slab /proc/narf/rcu 2> /dev/null)
+      done < <(cat /proc/narf/slab /proc/narf/rcu /proc/narf/pgtables 2> /dev/null)
       say "$line"
     fi
     ((n % 36 == 0)) && slab_sites "n=$n"
@@ -831,7 +831,7 @@ settle_meminfo() { # label
     line="SOAK-SLAB $1"
     while read -r k v; do
       [ "$v" = 0 ] || line+=" $k=$v"
-    done < <(cat /proc/narf/slab /proc/narf/rcu 2> /dev/null)
+    done < <(cat /proc/narf/slab /proc/narf/rcu /proc/narf/pgtables 2> /dev/null)
     say "$line"
   fi
   slab_sites "$1"
