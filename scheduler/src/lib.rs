@@ -648,7 +648,17 @@ impl Drop for TaskSlot {
             // the future cannot be polled again after Drop begins. Passive Arc
             // owners may outlive it, but no task represented by this slot can
             // fault or enter a VMA critical section after this decrement.
-            address_space.scheduler_detach_user_task();
+            //
+            // The last such slot is Linux `mmput` reaching zero `mm_users`:
+            // tear the mappings and page tables down now (`exit_mmap`), not
+            // when the last passive `Arc` happens to drop — a zombie's
+            // bookkeeping, a lazily active root or a leaked reference would
+            // otherwise keep the whole process image alive. This is the same
+            // context the final `Arc` drop (and so the full teardown) runs in
+            // when the slot owns the last reference.
+            if address_space.scheduler_detach_user_task() {
+                address_space.exit_mmap();
+            }
         }
         unregister_task_affinity(self.id);
         if self.user_scheduling.is_some() {
@@ -5300,8 +5310,14 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         // Drop (or, in synthetic contexts that bypass the epilogue, by
         // `__test_clear_published_address_space`). The ready-queue path
         // below tolerates a missing previous AS the same way.
+        // An exec that displaced the last user of the old space is its
+        // `mmput` (Linux `exec_mmap`): the caller no longer touches the old
+        // image, and the teardown's invalidation covers this CPU, which still
+        // runs on the old root until the new one is activated.
         if let Some(previous) = previous_active.as_ref() {
-            previous.scheduler_detach_user_task();
+            if previous.scheduler_detach_user_task() {
+                previous.exit_mmap();
+            }
         }
         let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
         let prev = p
@@ -5330,7 +5346,9 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             // lock is released; the reaper waker may itself touch scheduler
             // state.
             if let Some(previous) = prev.as_ref() {
-                previous.scheduler_detach_user_task();
+                if previous.scheduler_detach_user_task() {
+                    previous.exit_mmap();
+                }
             }
             return prev;
         }
@@ -5349,7 +5367,9 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         };
         if let Some(prev) = replaced {
             if let Some(previous) = prev.as_ref() {
-                previous.scheduler_detach_user_task();
+                if previous.scheduler_detach_user_task() {
+                    previous.exit_mmap();
+                }
             }
             return prev;
         }
