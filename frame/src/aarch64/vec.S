@@ -19,6 +19,43 @@
  * configuration.
  */
 
+/* ──────────────────────────────────────────────────────────────
+ * Kernel-stack overflow check (Linux arm64 `kernel_ventry`'s VMAP_STACK
+ * test, `arch/arm64/kernel/entry.S`).
+ *
+ * Guarded kernel stacks live in L0 slot KSTACK_L0_SLOT (`memory/kstack.rs`):
+ * each stack sits at the bottom of a (2 << KSTACK_SHIFT)-aligned slot, so
+ * bit KSTACK_SHIFT of any SP inside a stack is 0, and of an SP that ran off
+ * the stack's base (into the upper half of the slot below) is 1. Linux tests
+ * the same bit on every stack because all of its stacks are THREAD_ALIGNed;
+ * NARF's boot/AP stacks are not, so the bit is tested only for an SP inside
+ * the kernel-stack slot.
+ *
+ * Tested on the SP the frame push will use (SP - TRAP_FRAME_BYTES), like
+ * Linux. Needs one scratch register before anything may be stored: x0 is
+ * parked in TPIDRRO_EL0, which NARF never hands to EL0 (always zero there;
+ * Linux uses it as entry scratch the same way) and is zeroed again here.
+ * Clobbers NZCV only, which SPSR_EL1 already holds.
+ * ────────────────────────────────────────────────────────────── */
+.equ KSTACK_L0_SLOT,   279
+.equ KSTACK_SHIFT,     17
+.equ TRAP_FRAME_BYTES, 816
+
+.macro KSTACK_CHECK
+    msr     tpidrro_el0, x0
+    mov     x0, sp
+    sub     x0, x0, #TRAP_FRAME_BYTES
+    ubfx    x0, x0, #39, #9
+    cmp     x0, #KSTACK_L0_SLOT
+    b.ne    8f
+    mov     x0, sp
+    sub     x0, x0, #TRAP_FRAME_BYTES
+    tbnz    x0, #KSTACK_SHIFT, __narf_kstack_overflow
+8:
+    mrs     x0, tpidrro_el0
+    msr     tpidrro_el0, xzr
+.endm
+
 .section .text
 .align 11                  /* 2 KiB alignment */
 .global __narf_vector_table
@@ -35,14 +72,21 @@ __narf_vector_table:
     .align 7
     b       __narf_vec_serror          /* 0x180 — SError */
 
-    /* ─── Current EL, SP_ELx (0x200 .. 0x380) ─── main case */
+    /* ─── Current EL, SP_ELx (0x200 .. 0x380) ─── main case
+     * Every entry taken on SP_EL1 first checks that SP has not run off the
+     * bottom of a guarded kernel stack (KSTACK_CHECK below): the hardware
+     * does not switch stacks, so an overflow fault would otherwise re-fault
+     * on its own frame push, walking down through the guard. */
     .align 7
+    KSTACK_CHECK
     b       __narf_vec_sync_spx        /* 0x200 — synchronous */
     .align 7
+    KSTACK_CHECK
     b       __narf_vec_irq             /* 0x280 — IRQ ← the one */
     .align 7
     b       __narf_vec_unimpl          /* 0x300 — FIQ */
     .align 7
+    KSTACK_CHECK
     b       __narf_vec_serror          /* 0x380 — SError */
 
     /* ─── Lower EL, AArch64 (0x400 .. 0x580) ─── EL0 → EL1 ─── */
@@ -276,6 +320,43 @@ __narf_vec_serror:
 1:  wfe
     b       1b
 .size __narf_vec_serror, . - __narf_vec_serror
+
+/* Kernel-stack overflow (from KSTACK_CHECK): x0 = scratch, the interrupted
+ * x0 is in TPIDRRO_EL0, SP is the overflowed stack pointer. Switch to this
+ * CPU's overflow stack (top in TPIDR_EL1, set by `init_overflow_stack`),
+ * keep the old SP on it, rebuild the full frame there and report. Linux:
+ * `__bad_stack` → `handle_bad_stack`. */
+.align 4
+.type __narf_kstack_overflow, @function
+__narf_kstack_overflow:
+    mrs     x0, tpidr_el1          /* x0 = overflow stack top */
+    add     sp, sp, x0             /* sp' = sp + top            */
+    sub     x0, sp, x0             /* x0  = sp (overflowed)     */
+    sub     sp, sp, x0             /* sp  = top                 */
+    str     x0, [sp, #-16]!        /* [sp] = overflowed SP      */
+    mrs     x0, tpidrro_el0
+    msr     tpidrro_el0, xzr
+    SAVE_ALL_GPRS
+    mov     x0, sp
+    ldr     x1, [sp, #TRAP_FRAME_BYTES]
+    bl      rust_aarch64_bad_stack
+    /* Only an overflow a kernel test armed returns here: the frame now
+     * names `__narf_overflow_resume` with x29 = pc and x30 = sp. */
+    RESTORE_ALL_GPRS
+    add     sp, sp, #16
+    eret
+.size __narf_kstack_overflow, . - __narf_kstack_overflow
+
+/* Resume a retired task's continuation on a fresh SP: x30 = sp, x29 = pc. */
+.align 4
+.global __narf_overflow_resume
+.type __narf_overflow_resume, @function
+__narf_overflow_resume:
+    mov     sp, x30
+    mov     x16, x29               /* x16: BTI `c`-compatible branch */
+    mov     x30, xzr
+    br      x16
+.size __narf_overflow_resume, . - __narf_overflow_resume
 
 .align 4
 .type __narf_vec_unimpl, @function

@@ -271,6 +271,34 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
     let esr = unsafe { sysreg::read_esr_el1() };
     let ec = (esr >> 26) & 0x3F;
 
+    // EL1 data abort on a kernel-stack guard with SP still inside the stack
+    // (a store below SP, e.g. a faulting pre-indexed push): KSTACK_CHECK only
+    // fires once SP itself has left the stack, so classify it here.
+    if ec == 0x25 && frame.spsr & 0xF != 0 {
+        // SAFETY: FAR_EL1 read at EL1 is always defined.
+        let far = unsafe { sysreg::read_far_el1() };
+        if let Some(hit) = narf_memory::kstack::guard_hit(far) {
+            let sp = (frame as *const TrapFrame as u64) + 816;
+            if let Some((pc, sp)) = super::super::kstack_overflow::report(
+                "data abort",
+                hit,
+                far,
+                frame.elr,
+                sp,
+                frame.x29,
+            ) {
+                extern "C" {
+                    fn __narf_overflow_resume();
+                }
+                frame.elr = __narf_overflow_resume as usize as u64;
+                frame.spsr = 0x3c5;
+                frame.x29 = pc;
+                frame.x30 = sp;
+            }
+            return;
+        }
+    }
+
     if ec == EC_SVC_AARCH64 {
         // Convention: x8 = syscall number, x0..x5 = args. Return
         // value placed in x0 (value) + x1 (status) so callers can
@@ -602,6 +630,71 @@ pub extern "C" fn rust_aarch64_serror(frame: &TrapFrame) -> ! {
     dump_frame(frame);
     // SAFETY: exit.
     unsafe { narf_arch::exit_kernel(42) }
+}
+
+// `vec.S`'s KSTACK_CHECK hard-codes the slot and the tested bit.
+const _: () = assert!(narf_memory::kstack::KSTACK_L0_SLOT == 279);
+const _: () = assert!(narf_memory::kstack::KSTACK_SHIFT == 17);
+
+/// Overflow-stack size per CPU. Linux's arm64 `OVERFLOW_STACK_SIZE` is 4 KiB;
+/// NARF's report also walks and prints a backtrace, so it gets 16 KiB.
+const OVERFLOW_STACK_BYTES: usize = 16 * 1024;
+
+/// Give this CPU its kernel-stack overflow stack and publish the top in
+/// `TPIDR_EL1` (unused otherwise: NARF finds the CPU id via MPIDR), which the
+/// `vec.S` overflow path loads before it may store anything. The stack is a
+/// guarded `KernelStack` itself and lives for the life of the CPU. Must run on
+/// each CPU before it runs anything on a guarded stack; TPIDR_EL1 is UNKNOWN
+/// at reset, so this writes it unconditionally.
+pub fn init_overflow_stack() {
+    match narf_memory::kstack::KernelStack::alloc(OVERFLOW_STACK_BYTES) {
+        Ok(stack) => {
+            let top = stack.top() & !0xF;
+            core::mem::forget(stack); // per-CPU, never freed
+                                      // SAFETY: TPIDR_EL1 is an EL1 software register no other NARF
+                                      // code uses; writing it has no architectural side effect.
+            unsafe {
+                core::arch::asm!("msr tpidr_el1, {t}", t = in(reg) top, options(nomem, nostack))
+            };
+        }
+        Err(e) => {
+            let _ = writeln!(Writer, "  kstack: no overflow stack for this CPU: {e:?}");
+        }
+    }
+}
+
+/// `vec.S` `__narf_kstack_overflow`: an exception was taken with SP below the
+/// base of a guarded kernel stack. Runs on this CPU's overflow stack; `old_sp`
+/// is the overflowed SP. Reports (task, bounds, guard address, backtrace) and
+/// panics, unless a kernel test armed this exact overflow, in which case the
+/// frame is redirected to retire the task and this returns.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_aarch64_bad_stack(frame: &mut TrapFrame, old_sp: u64) {
+    // SAFETY: FAR_EL1 / ESR_EL1 reads are always legal at EL1.
+    let (far, esr) = unsafe { (sysreg::read_far_el1(), sysreg::read_esr_el1()) };
+    let push = old_sp.wrapping_sub(816);
+    let hit = narf_memory::kstack::guard_hit(far)
+        .map(|h| (far, h))
+        .or_else(|| narf_memory::kstack::guard_hit(push).map(|h| (push, h)));
+    let Some((fault, hit)) = hit else {
+        panic!(
+            "kernel stack overflow (bad stack): sp {old_sp:#x} is outside every kernel stack \
+             (far {far:#x} esr {esr:#x} elr {:#x})",
+            frame.elr
+        );
+    };
+    if let Some((pc, sp)) =
+        super::super::kstack_overflow::report("bad stack", hit, fault, frame.elr, old_sp, frame.x29)
+    {
+        extern "C" {
+            fn __narf_overflow_resume();
+        }
+        frame.elr = __narf_overflow_resume as usize as u64;
+        // EL1h with D, A, I, F masked: the resume runs to a context switch.
+        frame.spsr = 0x3c5;
+        frame.x29 = pc;
+        frame.x30 = sp;
+    }
 }
 
 #[unsafe(no_mangle)]

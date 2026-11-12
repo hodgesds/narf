@@ -439,6 +439,7 @@ pub mod aarch64;
 
 mod canary;
 mod cross_crate_init;
+pub(crate) mod kstack_overflow;
 mod measure;
 mod reclaim_wait;
 mod secure_boot;
@@ -2103,6 +2104,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // stays fixed — `bpf_arena.rs` requires it at its slot boundary so
                 // an undershoot lands in the guard slot.
                 narf_memory::bpf_text::randomize_window();
+                narf_memory::kstack::randomize_window();
                 match narf_memory::bpf_text::reserve_kernel_slots() {
                     Ok(()) => {
                         let _ = writeln!(
@@ -2116,6 +2118,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
                     }
                 }
+                // The kernel-stack slot exists now: move the BSP's hardirq
+                // stack off its unguarded .bss static.
+                crate::x86_64::percpu::guard_irq_stack();
+                crate::x86_64::gdt::guard_ist_stacks();
 
                 // Pre-populate the vmalloc window's kernel PML4 slot in the
                 // live kernel root, BEFORE the per-domain PML4 clones and any
@@ -2946,6 +2952,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // stays fixed — `bpf_arena.rs` requires it at its slot boundary so
                 // an undershoot lands in the guard slot.
                 narf_memory::bpf_text::randomize_window();
+                narf_memory::kstack::randomize_window();
                 match narf_memory::bpf_text::reserve_kernel_slots() {
                     Ok(()) => {
                         let _ = writeln!(
@@ -2959,6 +2966,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let _ = writeln!(console::Writer, "  bpf: slot reservation failed: {e:?}");
                     }
                 }
+                // The kernel-stack slot is reserved now; give the boot CPU its
+                // overflow stack before the first task stack exists.
+                crate::aarch64::trap::init_overflow_stack();
 
                 // vmalloc window: same treatment, and it was not reserved on
                 // aarch64 either — only the x86_64 path called it, so the

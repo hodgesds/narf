@@ -262,6 +262,8 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     unsafe {
         let (rsp0_top, irq_top) = super::gdt::init_ap();
         super::percpu::init_ap(id, rsp0_top, irq_top);
+        super::percpu::guard_irq_stack();
+        super::gdt::guard_ist_stacks();
         super::syscall::enable();
         // EFER.NXE — the BSP sets this in bare_main before userspace;
         // each AP must set it too. Without it, every user data/stack PTE
@@ -396,7 +398,8 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     // 5. Enter the per-CPU scheduler run loop. `run_forever` drains
     //    this CPU's ready queue, attempts to steal from siblings,
     //    and halts on IRQ when nothing is runnable. Returns never.
-    narf_scheduler::run_forever();
+    // On a guarded stack: the trampoline's direct-mapped block has no guard.
+    super::super::kstack_overflow::run_executor_on_guarded_stack();
 }
 
 /// Bring up every AP advertised by `narf_lib::smp::cpu_count()`.
