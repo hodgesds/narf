@@ -201,7 +201,11 @@ timer (retransmit, delayed ACK, zero-window probe, keepalive, TIME-WAIT and
 orphan FIN-WAIT-2, transmit-wait probe, deferred accept — one `timer_list`
 per connection armed for the earliest deadline, holding a TCB reference while
 pending, `sk_reset_timer` discipline); IPv4 fragment queue expiry
-(`ip_expire`, one per queue). Callbacks run in executor context with no base
+(`ip_expire`, one per queue); neighbour resolution (`neigh->timer`, one
+per resolving neighbour) and the neighbour GC; the net-device transmit
+watchdog (`dev_watchdog`, one per NIC); and every delayed work
+(`narf_scheduler::workqueue::DelayedWork`: the writeback flusher, the LED
+engine). Callbacks run in executor context with no base
 lock held; `del_timer_sync` must not be called from the timer's own callback.
 
 ### 3.3 Clocksource / Clockevent abstractions (for arch backends)
