@@ -22,6 +22,7 @@ narf-drivers-fs-iso9660 = { path = "../drivers/fs/iso9660" }
 narf-drivers-fs-udf = { path = "../drivers/fs/udf" }
 
 narf-lib          = { path = "../lib" }
+narf-boot         = { path = "../boot" }
 narf-rcu          = { path = "../rcu" }
 narf-arch         = { path = "../arch" }
 narf-abi          = { path = "../abi" }

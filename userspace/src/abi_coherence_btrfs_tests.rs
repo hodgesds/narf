@@ -483,6 +483,211 @@ kernel_test_in!(
     smoke_btrfs_two_map_stores_then_fresh_map
 );
 
+/// Two caches in front of one file's bytes, on btrfs: warm every read cache
+/// that sits in front of them — the read(2)-path readahead (sequential
+/// 64 KiB preads, `pread64`'s own chunk size, populate the mapped-file cache
+/// ahead of the stream) and btrfs's verified-window cache (a repeated
+/// 64 KiB pread of committed data is served from it) — then store through a
+/// mapping into both the read window and the readahead window, unmap, and
+/// pread the same 64 KiB windows: before writeback, after it, after a
+/// commit, and after the mapped-file cache dropped its pages so the
+/// filesystem alone answers. Every read must show the stores.
+fn smoke_btrfs_readahead_warm_windows_then_map_store() -> TestResult {
+    const LEN: u64 = 64 * PAGE;
+    const WIN: usize = 64 * 1024;
+    let seed = content(LEN as usize);
+    with_btrfs(&seed, |fx| {
+        // Commit the seed so its checksums exist: btrfs caches only
+        // verified windows.
+        fsync(fx.fd1)?;
+        let mut buf = alloc::vec![0u8; WIN];
+        // Sequential: the second read confirms the stream and populates
+        // [128 KiB, 256 KiB) ahead of it.
+        pread(fx.fd1, &mut buf, 0)?;
+        pread(fx.fd1, &mut buf, WIN as u64)?;
+        // The same window again, through the other open: a btrfs window hit.
+        let (hits0, _) = narf_drivers_fs_btrfs::decompress_cache::stats();
+        pread(fx.fd2, &mut buf, WIN as u64)?;
+        let (hits1, _) = narf_drivers_fs_btrfs::decompress_cache::stats();
+        {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "RA-WARM btrfs window hits on the repeated pread: {}",
+                hits1 - hits0
+            );
+        }
+        let mut model = seed.clone();
+        // One store inside the warm read window, one inside the readahead
+        // window; both end mid-page, as the soak's stale runs did.
+        let stores = [
+            (WIN as u64 + 1000, 2 * WIN as u64 - 1738, 0xafu8),
+            (
+                2 * WIN as u64 + 3 * PAGE + 77,
+                2 * WIN as u64 + 9 * PAGE + 3008,
+                0x5c,
+            ),
+        ];
+        for (from, to, byte) in stores {
+            mapped_generation(fx, fx.fd1, LEN, from, to, byte)?;
+            model[from as usize..to as usize].fill(byte);
+        }
+        let check = |when: &'static str| -> Result<(), &'static str> {
+            for fd in [fx.fd1, fx.fd2] {
+                for window in 0..(LEN as usize / WIN) {
+                    let at = window * WIN;
+                    let mut got = alloc::vec![0u8; WIN];
+                    pread(fd, &mut got, at as u64)?;
+                    if let Some(i) = (0..WIN).find(|i| got[*i] != model[at + i]) {
+                        use core::fmt::Write as _;
+                        let run = (i..WIN).take_while(|j| got[*j] != model[at + j]).count();
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "RA-STALE {when}: fd {fd} offset {} got {:#x} want {:#x} run {run}",
+                            at + i,
+                            got[i],
+                            model[at + i]
+                        );
+                        return Err("a pread missed a mapped store (see RA-STALE)");
+                    }
+                }
+            }
+            Ok(())
+        };
+        check("right after munmap")?;
+        let _ = crate::mapped_file::sync_all_files(None);
+        check("after writeback")?;
+        fsync(fx.fd2)?;
+        check("after a commit")?;
+        crate::mapped_file::shrink_all_for_test();
+        check("after the mapped-file cache dropped its pages")?;
+        // The filesystem alone, with no overlay at all.
+        let mut direct = alloc::vec![0u8; LEN as usize];
+        let n = crate::handlers::poll_io_to_completion(fx.ops1.read(0, &mut direct))
+            .and_then(|r| r.ok())
+            .ok_or("the direct filesystem read failed")?;
+        if n != LEN as usize || direct != model {
+            return Err("btrfs itself returned stale bytes for the stored ranges");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/coherence/btrfs",
+    smoke_btrfs_readahead_warm_windows_then_map_store
+);
+
+/// The whole file through a fresh read-only-use mapping matches `model`.
+fn fresh_map_matches(fx: &Fixture, fd: u64, model: &[u8]) -> Result<Option<usize>, &'static str> {
+    let len = model.len() as u64;
+    let mlen = len.div_ceil(PAGE) * PAGE;
+    let base = map_shared(fd, mlen)?;
+    let mut wrong = None;
+    let mut page = 0u64;
+    while page < len && wrong.is_none() {
+        let ptr = fault(&fx.aspace, base + page)?;
+        let n = (len - page).min(PAGE) as usize;
+        let got = mapped_bytes(ptr, n);
+        wrong = (0..n)
+            .find(|i| got[*i] != model[page as usize + i])
+            .map(|i| page as usize + i);
+        page += PAGE;
+    }
+    munmap(base, mlen)?;
+    Ok(wrong)
+}
+
+/// Soak mismatches (2) and (3), op for op (offsets scaled to the fixture):
+/// the region lies in a hole left by a truncate far below it and a regrow;
+/// map-store 0xbd over a range covering page P whole, unmap; map-store 0x77
+/// from 1,784 bytes into P through a mapping based at P, msync it, unmap;
+/// a fresh mapping must show 0xbd for P's first 1,784 bytes — and still
+/// after two ftruncates above, another msync and an fdatasync.
+fn smoke_btrfs_partial_store_over_unwritten_store_keeps_its_head() -> TestResult {
+    const LEN: u64 = 64 * PAGE;
+    let seed = alloc::vec![0x11u8; LEN as usize];
+    with_btrfs(&seed, |fx| {
+        let mut model = seed.clone();
+        // The hole: truncate far below, grow back, commit.
+        ftruncate(fx.fd1, 12_345)?;
+        model.truncate(12_345);
+        ftruncate(fx.fd1, 60 * PAGE + 2810)?;
+        model.resize((60 * PAGE + 2810) as usize, 0);
+        fsync(fx.fd1)?;
+        let p = 40 * PAGE;
+        // Store 1: [P - 26,000, P + 48,813), 0xbd, no msync.
+        let (s1_from, s1_to) = (p - 26_000, p + 48_813);
+        mapped_generation(fx, fx.fd1, LEN, s1_from, s1_to, 0xbd)?;
+        model[s1_from as usize..s1_to as usize].fill(0xbd);
+        // Store 2: from P + 1,784 through a mapping based at P, msync.
+        let (s2_from, s2_to) = (p + 1784, p + 1784 + 120_000);
+        let mlen = (s2_to.div_ceil(PAGE) * PAGE).min(model.len() as u64 / PAGE * PAGE) - p;
+        let s2_to = s2_to.min(p + mlen);
+        let args = SyscallArgs {
+            arg0: 0,
+            arg1: mlen,
+            arg2: PROT_READ | PROT_WRITE,
+            arg3: MAP_SHARED,
+            arg4: fx.fd1,
+            arg5: p,
+        };
+        let base = match call(Syscall::Mmap.raw(), args) {
+            Some(addr) if addr > 0 => addr as u64,
+            _ => return Err("MAP_SHARED mmap at P failed"),
+        };
+        let mut at = s2_from;
+        while at < s2_to {
+            let end = ((at / PAGE) + 1) * PAGE;
+            let end = end.min(s2_to);
+            let ptr = fault(&fx.aspace, base + (at - p))?;
+            // SAFETY: inside the faulted page's frame.
+            let ptr = unsafe { ptr.add((at % PAGE) as usize) };
+            store(ptr, &alloc::vec![0x77; (end - at) as usize]);
+            at = end;
+        }
+        model[s2_from as usize..s2_to as usize].fill(0x77);
+        msync(base, mlen)?;
+        munmap(base, mlen)?;
+        fn report(when: &str, at: usize, p: u64, want: u8) {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "PARTIAL-HEAD {when}: offset {at} (P + {}) want {want:#x}",
+                at as i64 - p as i64,
+            );
+        }
+        if let Some(at) = fresh_map_matches(fx, fx.fd2, &model)? {
+            report("after the msync", at, p, model[at]);
+            return Err("a fresh mapping lost the first store's bytes (see PARTIAL-HEAD)");
+        }
+        // Two ftruncates above, another msync, an fdatasync.
+        ftruncate(fx.fd1, 62 * PAGE + 100)?;
+        model.resize((62 * PAGE + 100) as usize, 0);
+        ftruncate(fx.fd1, 61 * PAGE + 7)?;
+        model.truncate((61 * PAGE + 7) as usize);
+        let base = map_shared(fx.fd1, 61 * PAGE)?;
+        msync(base, 61 * PAGE)?;
+        munmap(base, 61 * PAGE)?;
+        fsync(fx.fd1)?;
+        if let Some(at) = fresh_map_matches(fx, fx.fd2, &model)? {
+            report("after ftruncates, msync and fsync", at, p, model[at]);
+            return Err("the lost bytes stayed lost (see PARTIAL-HEAD)");
+        }
+        crate::mapped_file::shrink_all_for_test();
+        let mut got = alloc::vec![0u8; model.len()];
+        pread(fx.fd2, &mut got, 0)?;
+        if let Some(at) = (0..model.len()).find(|i| got[*i] != model[*i]) {
+            report("pread after the cache dropped its pages", at, p, model[at]);
+            return Err("the file lost the first store's bytes (see PARTIAL-HEAD)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/coherence/btrfs",
+    smoke_btrfs_partial_store_over_unwritten_store_keeps_its_head
+);
+
 static INTEG_VERDICT: IrqSafeSpinLock<Option<alloc::string::String>> = IrqSafeSpinLock::new(None);
 
 /// The integrity worker, replayed against a byte model of the file: random

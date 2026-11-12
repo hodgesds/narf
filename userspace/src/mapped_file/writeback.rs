@@ -92,7 +92,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use narf_filesystem::{FileOps, FsError};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -928,7 +928,9 @@ fn finish_batch(batch: Vec<Pinned>, generation: Option<u64>, mut free: Vec<PhysA
                 pages.clear_idle_dirty(phys.raw());
             }
             if retire {
-                if let Some(frame) = pages.retire_phys(phys.raw()) {
+                // Written and settled, or all of it past EOF (no longer the
+                // file's).
+                if let Some(frame) = pages.retire_phys_discarding(phys.raw()) {
                     free.push(frame);
                 }
             } else if settled {
@@ -957,6 +959,107 @@ struct Batch {
 /// would.
 #[cfg(feature = "kernel-test")]
 static FAIL_RESERVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the cache's coherence checks run: always in kernel-test builds,
+/// and on a running kernel with `narf.mapped_file_check=1` on the command
+/// line (a soak's diagnosis switch; each costs a read or a page compare).
+pub(crate) fn checks_enabled() -> bool {
+    // 0: not looked up yet, 1: off, 2: on.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = cfg!(feature = "kernel-test")
+                || narf_boot::args()
+                    .value("narf.mapped_file_check")
+                    .is_some_and(|value| value != "0");
+            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Pages a batch called clean whose bytes the filesystem did not return
+/// when read back right after the write (counted while
+/// [`checks_enabled`]).
+pub(crate) static CLEAN_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// Pages removed from the cache while they still owed their file bytes,
+/// other than by truncate, punch, unmount or deliberate discard.
+pub(crate) static UNWRITTEN_REMOVED: AtomicUsize = AtomicUsize::new(0);
+
+/// A page that may hold bytes its file does not is being removed from the
+/// cache by a path that is not a truncate of its range — the bytes would be
+/// lost and a later read or fault would see the file's older ones. Linux
+/// never removes a dirty or writeback folio but by truncation. A kernel
+/// test fails on it; with `narf.mapped_file_check=1` it is reported.
+pub(super) fn unwritten_page_removed(page: &SharedFilePage) {
+    if !checks_enabled() {
+        return;
+    }
+    UNWRITTEN_REMOVED.fetch_add(1, Ordering::Relaxed);
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "WB-INVARIANT unwritten page at {:#x} left the cache (dirty {}, listed {}, pins {})",
+        page.offset,
+        page.dirty,
+        page.idle_dirty,
+        page.wb_pins
+    );
+    if cfg!(feature = "kernel-test") {
+        panic!("mapped-file: an unwritten page left the cache other than by truncate");
+    }
+}
+
+/// Coherence check (see [`checks_enabled`]): the invariant every clean page
+/// rests on. A page this batch wrote, and that nothing has dirtied again
+/// since, must read back from the filesystem as its own bytes (up to
+/// `size`). The pages are still pinned, so their frames are live; the file
+/// lock is held, so no other batch or size change runs.
+async fn check_written_pages_match_file(ops: &Arc<dyn FileOps>, batch: &[Pinned], size: u64) {
+    let mut file = alloc::vec![0u8; 4096];
+    for page in batch {
+        if !matches!(page.action, Action::Written) || page.offset >= size {
+            continue;
+        }
+        let len = (size - page.offset).min(4096) as usize;
+        let mut done = 0usize;
+        while done < len {
+            match ops
+                .read(page.offset + done as u64, &mut file[done..len])
+                .await
+            {
+                Ok(0) | Err(_) => break,
+                Ok(n) => done += n,
+            }
+        }
+        let still_clean = SHARED_FILE_PAGES
+            .lock()
+            .by_phys
+            .get(&page.phys.raw())
+            .is_some_and(|cached| !cached.dirty);
+        if !still_clean {
+            continue;
+        }
+        // SAFETY: pinned, so allocated until `finish_batch`; identity-mapped.
+        let live = unsafe { core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>(), len) };
+        if done != len || live != &file[..len] {
+            CLEAN_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+            let first = (0..done).find(|i| live[*i] != file[*i]).unwrap_or(done);
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "WB-INVARIANT clean page at {:#x} differs from the file: read {done}/{len}, \
+                 first difference at +{first} (page {:#x}, file {:#x})",
+                page.offset,
+                live.get(first).copied().unwrap_or(0),
+                file.get(first).copied().unwrap_or(0),
+            );
+        }
+    }
+}
 
 /// Everything step 5 needs, reserved — fallibly — before a batch pins a
 /// page: completing a batch must not fail, and failing to reserve must
@@ -1145,6 +1248,12 @@ async fn write_range(
         }
         settle_runs(&mut batch.pages, &results);
         drop(runs);
+        // A hard write error also ends a page's dirtiness, by design: only a
+        // batch whose writes all succeeded promises the file has the pages.
+        // (`narf.mapped_file_check=1`, or a kernel test.)
+        if checks_enabled() && results.iter().all(|result| result.is_ok()) {
+            check_written_pages_match_file(ops, &batch.pages, size).await;
+        }
         let generation = ops.mmap_cache_generation();
         wrote += batch.finish(generation);
         drop(guard);
@@ -1387,22 +1496,22 @@ pub(crate) fn flush_file_for_read(ops: &Arc<dyn FileOps>) {
 /// Cache-lock takes by [`overlay_dirty`]. Kernel tests read it.
 pub(super) static OVERLAY_LOCKS: AtomicU64 = AtomicU64::new(0);
 
-/// Make the bytes a kernel read just fetched from `ops` at `offset` agree
-/// with the file's cached pages: wherever a cached page differs from its
-/// clean image, the page's byte is the file's current content and replaces
-/// what the filesystem returned. `read(2)` and a private page fault then see
-/// a `MAP_SHARED` store that has not been written back yet, as they do on
-/// Linux, where they read the same folio the mapping stores to.
+/// Make the bytes a kernel read just fetched from `ops` at `offset` the
+/// file's: for every page of the range the cache holds, the cached page's
+/// bytes replace what the filesystem returned. Linux `filemap_read` copies
+/// from the page-cache folio whenever there is one — dirty, under
+/// writeback, or clean — and only reads the device for what is absent;
+/// `read(2)` and a private page fault here see the same thing: a
+/// `MAP_SHARED` store, written back or not, and while a batch is still
+/// writing it.
 ///
-/// Only the differing bytes are taken, so a page that is clean — or stale
-/// in ways the filesystem already knows better — changes nothing.
+/// The one cached page not taken is a clean, idle, unpinned page of an
+/// older generation ([`super::shared_page_authoritative`]): the file may
+/// have changed under it, and a fault would replace it too.
 ///
-/// `epoch` is [`read_epoch`] sampled before the filesystem read. A batch
-/// that completed after it may have written a page and made it clean
-/// between the read and this call: the filesystem may have returned the
-/// bytes from before that write, and the page no longer differs from its
-/// clean image to say so. For such a page the whole range is taken from
-/// the page, which is what the batch put on the file.
+/// `epoch` is [`read_epoch`] sampled before the filesystem read: a page a
+/// batch wrote since then is taken whatever its generation, since the
+/// filesystem may have answered from before that write.
 pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8], epoch: ReadEpoch) {
     if buf.is_empty() || FILE_ENTRIES.load(Ordering::Acquire) == 0 {
         return;
@@ -1410,10 +1519,11 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8],
     let Some(identity) = entry_identity(ops.as_ref()) else {
         return;
     };
+    // Outside the cache lock: a filesystem may take its own locks for it.
+    let generation = ops.mmap_cache_generation();
     let end = offset.saturating_add(buf.len() as u64);
     let mut cursor = offset & !4095;
-    // A few pages per hold of the cache lock; each is at most one 4 KiB
-    // compare and a copy of the bytes that differ.
+    // A few pages per hold of the cache lock; each is at most a 4 KiB copy.
     const PAGES_PER_HOLD: usize = 4;
     loop {
         OVERLAY_LOCKS.fetch_add(1, Ordering::Relaxed);
@@ -1435,9 +1545,7 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8],
                 continue;
             };
             let written_since = page.wb_seq > epoch.0;
-            // A clean page that no batch wrote during the read equals what
-            // the read returned.
-            if !page.dirty && !page.idle_dirty && !written_since {
+            if !super::shared_page_authoritative(page, generation) && !written_since {
                 continue;
             }
             visited += 1;
@@ -1492,7 +1600,7 @@ fn invalidate_step(identity: SharedFileIdentity, from: u64, end: u64) -> Option<
                 .get(phys)
                 .is_some_and(|page| page.mappings == 0 && page.pending == 0);
             if unmapped {
-                if let Some(frame) = pages.retire_phys(*phys) {
+                if let Some(frame) = pages.retire_phys_discarding(*phys) {
                     free.push(frame);
                 }
             } else if let Some(page) = pages.by_phys.get_mut(phys) {
@@ -1925,7 +2033,7 @@ pub(crate) fn forget_device(device: u64) {
                 .collect();
             for (phys, dirty) in &victims {
                 lost += usize::from(*dirty);
-                if let Some(frame) = pages.retire_phys(*phys) {
+                if let Some(frame) = pages.retire_phys_discarding(*phys) {
                     free.push(frame);
                 }
             }
@@ -2003,7 +2111,7 @@ fn drop_idle_dirty(identity: SharedFileIdentity) -> usize {
                     continue;
                 };
                 dropped += 1;
-                if let Some(frame) = pages.retire_phys(phys) {
+                if let Some(frame) = pages.retire_phys_discarding(phys) {
                     free.push(frame);
                 }
             }

@@ -2148,3 +2148,168 @@ kernel_test_in!(
     "userspace/writeback",
     smoke_cache_returns_to_baseline_and_shrinks_on_reclaim
 );
+
+/// `read(2)` as the syscall does it: epoch, filesystem read, overlay.
+fn read_like_syscall(fixture: &Fixture, at: u64, len: usize) -> Option<Vec<u8>> {
+    let epoch = read_epoch();
+    let mut buf = vec![0u8; len];
+    let n = run(fixture.ops().read(at, &mut buf))?.ok()?;
+    buf.truncate(n);
+    overlay_dirty(fixture.ops(), at, &mut buf, epoch);
+    Some(buf)
+}
+
+/// Soak mismatch (1) and the 64 KiB "previous store" reads: a `pread` that
+/// runs while the batch writing a mapped store is still in its write. The
+/// batch has called the page clean; the file does not have the bytes yet.
+/// The read must still return the store — with the page mapped, and after
+/// the last unmap.
+fn smoke_read_during_writeback_sees_the_store() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    let Some((entry, ops)) = fixture.entry() else {
+        return TestResult::Fail("a mapped file has no cache entry");
+    };
+    store_bytes(pages[0], 100, b"STORE-ONE");
+    fixture.store.mode.store(GATED, Ordering::Release);
+    let (mapped, unmapped) = {
+        let mut budget = usize::MAX;
+        let mut batch = core::pin::pin!(write_range(
+            &entry,
+            &ops,
+            (0, u64::MAX),
+            Plan::background(Select::All),
+            &mut budget,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        if batch.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("the gated batch did not stop in its write");
+        }
+        let mapped = read_like_syscall(&fixture, 0, 4096);
+        fixture.unmap(&pages);
+        let unmapped = read_like_syscall(&fixture, 0, 4096);
+        fixture.store.gate_open.store(true, Ordering::Release);
+        if !matches!(batch.as_mut().poll(&mut cx), Poll::Ready(Ok(_))) {
+            return TestResult::Fail("the released batch did not complete");
+        }
+        (mapped, unmapped)
+    };
+    if mapped.as_deref().map(|b| &b[100..109]) != Some(b"STORE-ONE") {
+        return TestResult::Fail(
+            "a read while the store's writeback was in flight returned the file's older bytes \
+             (page mapped)",
+        );
+    }
+    if unmapped.as_deref().map(|b| &b[100..109]) != Some(b"STORE-ONE") {
+        return TestResult::Fail(
+            "a read while the store's writeback was in flight returned the file's older bytes \
+             (page unmapped)",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_read_during_writeback_sees_the_store
+);
+
+/// Soak mismatches (2) and (3): a store through one mapping, its last unmap,
+/// and a second mapping of the page faulted while the batch writing the
+/// store is in its write and the file's cache generation has moved (another
+/// write to the file). The second mapping must get the stored page, not a
+/// fresh read of the file's older bytes — which its own partial store and
+/// msync would then put on the file, the store's other bytes lost for good.
+/// `pinned_mapped`: the batch took the page while it was still mapped.
+fn refault_during_writeback(pinned_mapped: bool) -> TestResult {
+    let mut fixture = Fixture::new(2);
+    let Some(first) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    let Some((entry, ops)) = fixture.entry() else {
+        return TestResult::Fail("a mapped file has no cache entry");
+    };
+    store_bytes(first[0], 0, &[0xbd; 4096]);
+    if !pinned_mapped {
+        fixture.unmap(&first);
+    }
+    let checks_before = (
+        CLEAN_MISMATCHES.load(Ordering::Relaxed),
+        super::super::REPLACED_MISMATCHES.load(Ordering::Relaxed),
+    );
+    fixture.store.mode.store(GATED, Ordering::Release);
+    let refaulted = {
+        let mut budget = usize::MAX;
+        let mut batch = core::pin::pin!(write_range(
+            &entry,
+            &ops,
+            (0, u64::MAX),
+            Plan::background(Select::All),
+            &mut budget,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        if batch.as_mut().poll(&mut cx).is_ready() {
+            return TestResult::Fail("the gated batch did not stop in its write");
+        }
+        if pinned_mapped {
+            fixture.unmap(&first);
+        }
+        // Another write to the file moves its cache generation.
+        fixture.store.mode.store(WRITES, Ordering::Release);
+        if run(fixture.ops().write(4096, b"elsewhere")) != Some(Ok(9)) {
+            return TestResult::Fail("the unrelated write failed");
+        }
+        let Some(second) = fixture.map(0, 1) else {
+            return TestResult::Fail("could not map the test file again");
+        };
+        let refaulted = page_bytes(second[0], 0, 1784);
+        store_bytes(second[0], 1784, &[0x42; 4096 - 1784]);
+        fixture.unmap(&second);
+        fixture.store.gate_open.store(true, Ordering::Release);
+        if !matches!(batch.as_mut().poll(&mut cx), Poll::Ready(Ok(_))) {
+            return TestResult::Fail("the released batch did not complete");
+        }
+        refaulted
+    };
+    if super::super::flush_current_file(fixture.ops()).is_err() {
+        return TestResult::Fail("fsync of the mapped file failed");
+    }
+    let checks_after = (
+        CLEAN_MISMATCHES.load(Ordering::Relaxed),
+        super::super::REPLACED_MISMATCHES.load(Ordering::Relaxed),
+    );
+    if refaulted.iter().any(|b| *b != 0xbd) {
+        return TestResult::Fail(
+            "a fault during writeback got the file's older bytes instead of the stored page",
+        );
+    }
+    if fixture.file_bytes(0, 1784).iter().any(|b| *b != 0xbd)
+        || fixture
+            .file_bytes(1784, 4096 - 1784)
+            .iter()
+            .any(|b| *b != 0x42)
+    {
+        return TestResult::Fail("the file lost the first store under the second");
+    }
+    if checks_after != checks_before {
+        return TestResult::Fail("a clean-page invariant check fired (see WB-INVARIANT)");
+    }
+    TestResult::Pass
+}
+
+fn smoke_refault_during_writeback_of_an_unmapped_page() -> TestResult {
+    refault_during_writeback(false)
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_refault_during_writeback_of_an_unmapped_page
+);
+
+fn smoke_refault_during_writeback_of_a_page_pinned_mapped() -> TestResult {
+    refault_during_writeback(true)
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_refault_during_writeback_of_a_page_pinned_mapped
+);

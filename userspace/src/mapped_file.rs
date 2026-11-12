@@ -1531,7 +1531,25 @@ impl SharedFilePages {
     /// writeback batch still holds gives `None`: its frame is parked in
     /// [`Self::doomed`] until [`Self::unpin`] releases the last hold, so the
     /// batch never reads a frame the allocator has handed out again.
+    ///
+    /// Only for a page that owes its file nothing: clean, listed as clean,
+    /// and held by no batch (Linux never removes a dirty or writeback folio
+    /// from its mapping but by truncation). A page that still may — a
+    /// truncate or hole punch of its range, an unmount, a deliberate
+    /// discard — goes through [`Self::retire_phys_discarding`].
     fn retire_phys(&mut self, phys: u64) -> Option<PhysAddr> {
+        if let Some(page) = self.by_phys.get(&phys) {
+            if page.dirty || page.idle_dirty || page.wb_pins != 0 {
+                writeback::unwritten_page_removed(page);
+            }
+        }
+        self.retire_phys_discarding(phys)
+    }
+
+    /// [`Self::retire_phys`] for a page whose unwritten bytes are no longer
+    /// the file's: its range was truncated or punched, its device unmounted,
+    /// or its file can never be written again.
+    fn retire_phys_discarding(&mut self, phys: u64) -> Option<PhysAddr> {
         let page = self.remove_phys(phys)?;
         if page.wb_pins != 0 {
             self.doomed.insert(phys, page.wb_pins);
@@ -1627,7 +1645,8 @@ impl SharedFilePages {
             unused = writeback::slot_is_unused(slot);
         }
         match fate {
-            IdleFate::Retire => outcome.frames[0] = self.retire_phys(phys),
+            // Clean, or of a file no open can ever write again.
+            IdleFate::Retire => outcome.frames[0] = self.retire_phys_discarding(phys),
             IdleFate::KeepDirty => {
                 if let Some(page) = self.by_phys.get_mut(&phys) {
                     page.idle_dirty = true;
@@ -1789,6 +1808,23 @@ fn retain_pending_shared_page(page: &mut SharedFilePage) {
 /// cache lock on every unmap, exit and failed publication, and a 4 KiB
 /// compare per page there — let alone a walk of the cache — is exactly the
 /// kind of work those paths must not do.
+/// Whether a cached page is its file's content for its range — what a read
+/// copies and a fault maps, as Linux's page-cache folio is for every reader
+/// (`filemap_read`, `filemap_fault`). A dirty page, one listed as unwritten,
+/// one a writeback batch holds, and a mapped or pending one always are:
+/// they may hold bytes the file does not have yet. Only a clean, idle,
+/// unpinned page whose generation no longer matches the file's
+/// (`generation`) is not — the file may have changed under it — and only
+/// such a page is ever replaced by a fresh filesystem read.
+fn shared_page_authoritative(page: &SharedFilePage, generation: Option<u64>) -> bool {
+    page.dirty
+        || page.idle_dirty
+        || page.wb_pins != 0
+        || page.mappings != 0
+        || page.pending != 0
+        || (generation.is_some() && page.cache_generation == generation)
+}
+
 fn idle_shared_page_fate(page: &SharedFilePage) -> IdleFate {
     if page.wb_pins != 0 {
         // A batch is writing an image of this page taken earlier, and will
@@ -1846,9 +1882,7 @@ pub(crate) fn reserve_cached_shared_file_pages(
             let phys = *pages.by_file.get(&key)?;
             let page = pages.by_phys.get(&phys)?;
             if !shared_page_matches_ops(page, identity)
-                || (page.mappings == 0
-                    && page.pending == 0
-                    && page.cache_generation != Some(generation))
+                || !shared_page_authoritative(page, Some(generation))
             {
                 return None;
             }
@@ -2336,8 +2370,7 @@ fn shared_file_page_present(identity: SharedFileIdentity, offset: u64, generatio
     let Some(page) = pages.by_phys.get(&phys) else {
         return false;
     };
-    shared_page_matches_ops(page, identity)
-        && (page.mappings != 0 || page.pending != 0 || page.cache_generation == Some(generation))
+    shared_page_matches_ops(page, identity) && shared_page_authoritative(page, Some(generation))
 }
 
 /// Populate the shared page cache for `[offset, offset + len)` of a
@@ -3032,6 +3065,45 @@ pub(crate) fn populate_range(
     }
 }
 
+/// Idle pages a fault replaced with a fresh read that differed from them
+/// although they claimed to hold nothing the file did not (counted only
+/// while [`writeback::checks_enabled`]).
+pub(crate) static REPLACED_MISMATCHES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Coherence check (`narf.mapped_file_check=1`, always on in kernel-test
+/// builds): an idle page a fault drops for a fresh filesystem read (its
+/// generation is stale) must, if clean and not under writeback, equal that
+/// read — every write(2) is folded into it and every truncate zeroes it. A
+/// difference means one of the two holds bytes it should not, or the file
+/// changed through a path that does not tell the cache.
+fn check_replaced_page(stale: &SharedFilePage, candidate: PhysAddr) {
+    if stale.dirty || stale.idle_dirty || stale.wb_pins != 0 || candidate.raw() == 0 {
+        return;
+    }
+    // SAFETY: the cache lock is held, so the stale frame is allocated; the
+    // candidate is the caller's own fresh frame; both are identity-mapped.
+    let (old, new) = unsafe {
+        (
+            core::slice::from_raw_parts(stale.phys.kernel_ptr::<u8>(), 4096),
+            core::slice::from_raw_parts(candidate.kernel_ptr::<u8>(), 4096),
+        )
+    };
+    if let Some(first) = (0..4096).find(|i| old[*i] != new[*i]) {
+        REPLACED_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+        let run = (first..4096).take_while(|i| old[*i] != new[*i]).count();
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "WB-INVARIANT clean idle page at {:#x} differs from a fresh read: +{first} \
+             for {run} bytes (page {:#x}, file {:#x})",
+            stale.offset,
+            old[first],
+            new[first],
+        );
+    }
+}
+
 /// Publish freshly loaded fallback pages into the process-independent file
 /// page cache. A concurrent/overlapping mapper may already have published a
 /// page; in that case use its physical page and return the unused allocation
@@ -3056,26 +3128,27 @@ pub(crate) fn publish_shared_file_pages(
                 .checked_add(index as u64 * 4096)
                 .expect("validated mmap file offset overflowed");
             let key = SharedFilePages::key(identity, page_offset);
+            // A cached page is the file's content: the fresh read is used
+            // only where none is, or where the cached one is a clean,
+            // unpinned page of an older generation (Linux `filemap_fault`
+            // maps the folio already in the mapping; a dirty or writeback
+            // folio is never replaced by a new read).
             let mut existing = pages.by_file.get(&key).copied().filter(|phys| {
                 pages.by_phys.get(phys).is_some_and(|page| {
                     shared_page_matches_ops(page, identity)
-                        && (page.mappings != 0
-                            || page.pending != 0
-                            || (cache_generation.is_some()
-                                && page.cache_generation == cache_generation))
+                        && shared_page_authoritative(page, cache_generation)
                 })
             });
             if existing.is_none() && pages.by_file.contains_key(&key) {
                 let stale_phys = pages.by_file[&key];
-                // A dirty idle page holds MAP_SHARED writes writeback has
-                // not committed yet. Adopt it as canonical — refreshing its
-                // generation — rather than freeing the only copy of those
-                // writes to make room for a stale device read. The flag is
-                // exact for an idle page, so no compare runs under the lock.
-                let adopt = pages
-                    .by_phys
-                    .get(&stale_phys)
-                    .is_some_and(|page| page.identity == identity && page.idle_dirty);
+                // A page that may hold bytes the file does not — stored and
+                // not written, or being written — is the only copy of them.
+                // Adopt it as canonical, refreshing its generation, rather
+                // than replace it with a read of the file's older bytes.
+                let adopt = pages.by_phys.get(&stale_phys).is_some_and(|page| {
+                    page.identity == identity
+                        && (page.dirty || page.idle_dirty || page.wb_pins != 0)
+                });
                 if adopt {
                     let page = pages
                         .by_phys
@@ -3088,6 +3161,11 @@ pub(crate) fn publish_shared_file_pages(
                         .by_phys
                         .get(&stale_phys)
                         .is_some_and(|stale| stale.mappings == 0 && stale.pending == 0));
+                    if writeback::checks_enabled() {
+                        if let Some(stale) = pages.by_phys.get(&stale_phys) {
+                            check_replaced_page(stale, candidate);
+                        }
+                    }
                     // `None` while a writeback batch still holds the frame;
                     // its last release frees it.
                     if let Some(stale) = pages.retire_phys(stale_phys) {
