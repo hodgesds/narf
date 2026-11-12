@@ -1303,6 +1303,17 @@ Private futex wait queues are keyed by `(address-space identity, user address)`;
 virtual address cannot consume one another's `FUTEX_WAKE_PRIVATE` events.
 Classic `FUTEX_WAIT` returns `EAGAIN` when the user word no longer equals the
 expected value; a stale wait is never reported as a successful wake.
+Classic `FUTEX_WAKE` and `FUTEX_WAKE_BITSET` interpret the low 32 count bits as
+signed and, like Linux's dequeue-before-limit check, wake at most one matching
+waiter when that count is zero or negative. The separate futex2 `futex_wake`
+syscall keeps its strict zero-count no-op after address and mask validation;
+a negative count still selects at most one matching waiter.
+`FUTEX_WAKE_OP` applies the same signed count rule independently to each wake
+queue. Its comparison codes are Linux's EQ, NE, LT, LE, GT, GE over the signed
+pre-operation value. An unknown comparison returns `ENOSYS` after the atomic
+word update but before waking either queue. `FUTEX_REQUEUE` and
+`FUTEX_CMP_REQUEUE` return the sum of woken and moved waiters and reject negative
+counts before resolving either address.
 The read-to-queue lost-wakeup guard uses one permanent atomic generation per
 hash bucket, occupying a fixed 4 KiB across all 64 buckets. Sampling and
 bumping a generation are O(1), allocation-free operations; no per-address

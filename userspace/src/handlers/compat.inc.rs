@@ -9858,12 +9858,9 @@ fn futex_wake_op(
             Err(e) => return -(e as i64),
         }
     };
-    // Wake `nr_wake` on uaddr unconditionally. `key` is the caller's
-    // `get_futex_key` result — rebuilding it from the address here would key
-    // a shared-object futex by VA.
-    futex_bump_counter_key(key);
-    let mut woken = futex_wake_waiters_key(key, nr_wake) as i64;
-    // Conditionally wake `nr_wake2` on uaddr2 if (oldval CMP cmparg).
+    // Linux checks the comparison after the RMW, but before dequeuing either
+    // queue. An unknown comparison still updates the word, then returns ENOSYS
+    // without waking a waiter.
     let ov = oldval as i32;
     let cond = match cmp {
         0 => ov == cmparg, // FUTEX_OP_CMP_EQ
@@ -9874,11 +9871,21 @@ fn futex_wake_op(
         5 => ov >= cmparg, // GE
         _ => return -ENOSYS,
     };
+    // Both loops test their signed limit after dequeuing the first waiter.
+    futex_bump_counter_key(key);
+    let mut woken = futex_wake_waiters_key(key, classic_futex_wake_count(nr_wake)) as i64;
     if cond {
         futex_bump_counter_key(key2);
-        woken += futex_wake_waiters_key(key2, nr_wake2) as i64;
+        woken += futex_wake_waiters_key(key2, classic_futex_wake_count(nr_wake2)) as i64;
     }
     woken
+}
+
+/// Classic WAKE and WAKE_OP compare a signed limit after the first dequeue.
+/// Requeue and the futex2 strict-zero shortcut have separate count rules.
+#[inline]
+fn classic_futex_wake_count(count: u32) -> u32 {
+    (count as i32).max(1) as u32
 }
 
 /// Sign-extend the low 12 bits of a `FUTEX_WAKE_OP` operand field, matching

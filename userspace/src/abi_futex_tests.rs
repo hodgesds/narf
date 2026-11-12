@@ -14,6 +14,8 @@ use narf_memory::AddressSpace;
 
 const FUTEX_WAKE: u64 = 1;
 const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_CMP_REQUEUE: u64 = 4;
+const FUTEX_WAKE_OP: u64 = 5;
 const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE_FLAG: u64 = 128;
 const MATCH_ANY: u32 = 0xffff_ffff;
@@ -391,6 +393,183 @@ kernel_test_in!(
     smoke_abi_futex_wake_bitset_filters_waiters
 );
 
+/// Classic wake tests its signed limit after the first matching dequeue;
+/// futex2 adds a zero-count no-op. Exercise populated queues so a missing
+/// waiter cannot hide that distinction, and preserve bitset filtering.
+fn smoke_abi_futex_wake_signed_counts() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let p = &word as *const u32 as u64;
+        const TIDS: [u64; 3] = [0x7e_0048, 0x7e_0049, 0x7e_004a];
+        for api in 0..3 {
+            for (raw_count, classic_count) in [
+                (0u64, 1u32),
+                (u32::MAX as u64, 1),
+                (i32::MIN as u32 as u64, 1),
+                (2, 2),
+                (1u64 << 32, 1),
+                ((1u64 << 32) | 2, 2),
+            ] {
+                let hits = [
+                    queue(true, p, 0x1, TIDS[0])?,
+                    queue(true, p, 0x1, TIDS[1])?,
+                    queue(true, p, 0x2, TIDS[2])?,
+                ];
+                let result = (|| {
+                    let expected = if api == 2 && raw_count as u32 == 0 {
+                        0
+                    } else {
+                        classic_count
+                    };
+                    let returned = match api {
+                        0 => futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, raw_count, 0),
+                        1 => futex(p, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, raw_count, 0x1),
+                        _ => call(
+                            Syscall::FutexWake.raw(),
+                            a3(p, 0x1, raw_count, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE),
+                        ),
+                    };
+                    let total: u32 = hits.iter().map(|h| h.load(Ordering::Acquire)).sum();
+                    if returned != Some(i64::from(expected)) || total != expected {
+                        return Err(
+                            "futex wake did not apply the syscall's signed count semantics",
+                        );
+                    }
+                    if api != 0 && hits[2].load(Ordering::Acquire) != 0 {
+                        return Err("wake count normalization bypassed the bitset filter");
+                    }
+                    Ok(())
+                })();
+                for tid in TIDS {
+                    crate::handlers::__test_futex_drop_current(true, p, tid);
+                }
+                result?;
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_wake_signed_counts);
+
+/// Linux UAPI comparison numbers, tested on values below, equal to, and above
+/// a negative operand. Also check that an invalid comparison updates the word
+/// but leaves both queues intact.
+fn smoke_abi_futex_wake_op_comparisons() -> TestResult {
+    with_setup(|| {
+        let word = AtomicU32::new(0);
+        let word2 = AtomicU32::new(0);
+        let p = word.as_ptr() as u64;
+        let p2 = word2.as_ptr() as u64;
+        const T1: u64 = 0x7e_0071;
+        const T2: u64 = 0x7e_0072;
+        let comparisons = [
+            (0u32, [false, true, false]), // EQ
+            (1, [true, false, true]),     // NE
+            (2, [true, false, false]),    // LT
+            (3, [true, true, false]),     // LE
+            (4, [false, false, true]),    // GT
+            (5, [false, true, true]),     // GE
+            (6, [false; 3]),
+            (15, [false; 3]),
+        ];
+        for (cmp, expected) in comparisons {
+            for (old, second_wake) in [-2i32, -1, 0].into_iter().zip(expected) {
+                word2.store(old as u32, Ordering::Release);
+                let first = queue(true, p, 0x1, T1)?;
+                let second = queue(true, p2, 0x2, T2)?;
+                // ADD 1, compare the old signed value with -1.
+                let encoded = (1 << 28) | (cmp << 24) | (1 << 12) | 0xfff;
+                let result = call(
+                    Syscall::Futex.raw(),
+                    SyscallArgs {
+                        arg0: p,
+                        arg1: FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG,
+                        arg2: 1,
+                        arg3: 1,
+                        arg4: p2,
+                        arg5: encoded as u64,
+                    },
+                );
+                crate::handlers::__test_futex_drop_current(true, p, T1);
+                crate::handlers::__test_futex_drop_current(true, p2, T2);
+                let valid = cmp < 6;
+                let expected_result = if valid {
+                    1 + i64::from(second_wake)
+                } else {
+                    -38
+                };
+                if result != Some(expected_result)
+                    || first.load(Ordering::Acquire) != u32::from(valid)
+                    || second.load(Ordering::Acquire) != u32::from(second_wake)
+                    || word2.load(Ordering::Acquire) != old.wrapping_add(1) as u32
+                {
+                    return Err(
+                        "FUTEX_WAKE_OP comparison, side effect, or wake order differs from Linux",
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_wake_op_comparisons);
+
+fn smoke_abi_futex_wake_op_signed_counts() -> TestResult {
+    with_setup(|| {
+        let word = AtomicU32::new(0);
+        let word2 = AtomicU32::new(0);
+        let p = word.as_ptr() as u64;
+        let p2 = word2.as_ptr() as u64;
+        const TIDS: [u64; 6] = [
+            0x7e_0078, 0x7e_0079, 0x7e_007a, 0x7e_007b, 0x7e_007c, 0x7e_007d,
+        ];
+        for (n1, n2, expected1, expected2) in [
+            (0u64, 0u64, 1, 1),
+            (u32::MAX as u64, i32::MIN as u32 as u64, 1, 1),
+            (2, u32::MAX as u64, 2, 1),
+            (1u64 << 32, (1u64 << 32) | 2, 1, 2),
+        ] {
+            let hits = [
+                queue(true, p, 1, TIDS[0])?,
+                queue(true, p, 2, TIDS[1])?,
+                queue(true, p, 4, TIDS[2])?,
+                queue(true, p2, 1, TIDS[3])?,
+                queue(true, p2, 2, TIDS[4])?,
+                queue(true, p2, 4, TIDS[5])?,
+            ];
+            // SET 0 and EQ 0: both wake loops must run.
+            let result = call(
+                Syscall::Futex.raw(),
+                SyscallArgs {
+                    arg0: p,
+                    arg1: FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG,
+                    arg2: n1,
+                    arg3: n2,
+                    arg4: p2,
+                    arg5: 0,
+                },
+            );
+            for (index, tid) in TIDS.into_iter().enumerate() {
+                crate::handlers::__test_futex_drop_current(
+                    true,
+                    if index < 3 { p } else { p2 },
+                    tid,
+                );
+            }
+            let first: u32 = hits[..3].iter().map(|h| h.load(Ordering::Acquire)).sum();
+            let second: u32 = hits[3..].iter().map(|h| h.load(Ordering::Acquire)).sum();
+            if first != expected1
+                || second != expected2
+                || result != Some(i64::from(first + second))
+            {
+                return Err("FUTEX_WAKE_OP must normalize both signed counts independently");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_wake_op_signed_counts);
+
 /// futex2 `futex_wake(uaddr, mask, nr, flags)` is `futex_wake(..., mask)`:
 /// the same bitset filter, and the return value is the number actually
 /// woken (`ret`), not the `nr` requested.
@@ -463,6 +642,73 @@ fn smoke_abi_futex_requeue_ignores_bitset() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/futex", smoke_abi_futex_requeue_ignores_bitset);
+
+fn smoke_abi_futex_requeue_counts_moved_waiters() -> TestResult {
+    with_setup(|| {
+        let word = AtomicU32::new(0);
+        let word2 = AtomicU32::new(0);
+        let p = word.as_ptr() as u64;
+        let p2 = word2.as_ptr() as u64;
+        const TIDS: [u64; 3] = [0x7e_0081, 0x7e_0082, 0x7e_0083];
+        for op in [FUTEX_REQUEUE, FUTEX_CMP_REQUEUE] {
+            let hits = [
+                queue(true, p, 1, TIDS[0])?,
+                queue(true, p, 2, TIDS[1])?,
+                queue(true, p, 1, TIDS[2])?,
+            ];
+            let result = (|| {
+                let moved = call(
+                    Syscall::Futex.raw(),
+                    SyscallArgs {
+                        arg0: p,
+                        arg1: op | FUTEX_PRIVATE_FLAG,
+                        arg2: 0,
+                        arg3: 2,
+                        arg4: p2,
+                        arg5: 0,
+                    },
+                );
+                if moved != Some(2) || hits.iter().any(|h| h.load(Ordering::Acquire) != 0) {
+                    return Err("requeue must count moved waiters without waking them");
+                }
+                if futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 3, 0) != Some(1)
+                    || futex(p2, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 3, 2) != Some(1)
+                    || futex(p2, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 3, 0) != Some(1)
+                    || hits.iter().any(|h| h.load(Ordering::Acquire) != 1)
+                {
+                    return Err("requeue must preserve destination ownership and waiter bitsets");
+                }
+                Ok(())
+            })();
+            for tid in TIDS {
+                crate::handlers::__test_futex_drop_current(true, p, tid);
+                crate::handlers::__test_futex_drop_current(true, p2, tid);
+            }
+            result?;
+            for (wake, requeue) in [(u32::MAX as u64, 0), (0, i32::MIN as u32 as u64)] {
+                if call(
+                    Syscall::Futex.raw(),
+                    SyscallArgs {
+                        arg0: 0,
+                        arg1: op | FUTEX_PRIVATE_FLAG,
+                        arg2: wake,
+                        arg3: requeue,
+                        arg4: p2,
+                        arg5: 0,
+                    },
+                ) != Some(-22)
+                {
+                    return Err("negative requeue counts must be rejected before a bad address");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_requeue_counts_moved_waiters
+);
 
 // ════════════════════════════════════════════════════════════════════
 // PI futexes (`kernel/futex/pi.c`).
