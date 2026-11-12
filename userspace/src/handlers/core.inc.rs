@@ -666,8 +666,14 @@ fn park_pending_future(caller: &'static core::panic::Location<'static>) -> bool 
     // What this task waits on, for `/proc/<pid>/stack`: the lock, if a lock
     // is what this poll is waiting for, and otherwise the kernel code that
     // parked it (the `poll_blocking` caller).
+    // Which of the lock's waiters this task is (a state dump names the
+    // waiter a lock was handed to; this says which task that is).
+    let waiter = narf_lib::mutex::take_wait_waiter();
     let site = match narf_lib::mutex::take_wait_site() {
-        Some(lock) => lock as *const _ as usize | PARK_SITE_LOCK,
+        Some(lock) => {
+            PARKED_WAITER.lock().insert(task, waiter);
+            lock as *const _ as usize | PARK_SITE_LOCK
+        }
         None => caller as *const _ as usize,
     };
     uc.park_site
@@ -685,6 +691,7 @@ fn park_pending_future(caller: &'static core::panic::Location<'static>) -> bool 
     uc.parked_in_syscall
         .store(false, core::sync::atomic::Ordering::Release);
     uc.park_site.store(0, core::sync::atomic::Ordering::Relaxed);
+    PARKED_WAITER.lock().remove(&task);
     crate::handlers::open_kernel_span(uc);
     true
 }
@@ -709,13 +716,23 @@ fn park_site_of(task: u64) -> usize {
     })
 }
 
-/// Where task `task` is parked, if it parked waiting for a lock.
+/// The mutex waiter id of each task parked on a lock, so a dump that names
+/// the waiter a lock was handed to also names the task.
+static PARKED_WAITER: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, u64>> =
+    narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Where task `task` is parked, if it parked waiting for a lock, with the
+/// lock waiter id it holds.
 pub(crate) fn parked_wait_site(task: u64) -> Option<alloc::string::String> {
     let site = park_site_of(task);
     if site & PARK_SITE_LOCK == 0 {
         return None;
     }
-    location_text(site)
+    let text = location_text(site)?;
+    Some(match PARKED_WAITER.lock().get(&task).copied() {
+        Some(w) if w != 0 => alloc::format!("{text} waiter {w}"),
+        _ => text,
+    })
 }
 
 /// The kernel site that parked task `task`, if it parked on something other

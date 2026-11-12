@@ -192,6 +192,25 @@ pub fn note_wait_site(site: &'static core::panic::Location<'static>) {
     if let Some(slot) = WAIT_SITE.get(cpu) {
         slot.store(site as *const _ as *mut _, Ordering::Relaxed);
     }
+    // A lock type with waiter ids sets its own right after.
+    if let Some(slot) = WAIT_WAITER.get(cpu) {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The waiter id ([`HeldState::granted_to`]) of the lock wait
+/// [`note_wait_site`] last recorded on this CPU, 0 for a lock type without
+/// one. Taken with the site, so a dump can match a granted waiter to the
+/// task parked on it.
+static WAIT_WAITER: [core::sync::atomic::AtomicU64; crate::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::percpu::MAX_CPUS];
+
+/// Take the waiter id recorded with the last [`note_wait_site`] on this CPU.
+pub fn take_wait_waiter() -> u64 {
+    let cpu = crate::percpu::current_cpu();
+    WAIT_WAITER
+        .get(cpu)
+        .map_or(0, |slot| slot.swap(0, Ordering::Relaxed))
 }
 
 /// Take what [`note_wait_site`] recorded on this CPU since the last take.
@@ -276,6 +295,12 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
             }
         }
         note_wait_site(this.site);
+        if let (Some(WaiterId(id)), Some(slot)) = (
+            this.waiter_id,
+            WAIT_WAITER.get(crate::percpu::current_cpu()),
+        ) {
+            slot.store(id, Ordering::Relaxed);
+        }
         Poll::Pending
     }
 }
