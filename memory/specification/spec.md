@@ -2044,7 +2044,9 @@ x86_64 is rejected at runtime.
   class keeps at most SLUB's `min_partial` (`clamp(ilog2(size)/2, 5, 10)`)
   empty tracked frames: a dealloc spill that leaves more only sets a flag
   (the dealloc path never calls the buddy), and the executor maintenance
-  point returns the excess. Remote magazines are flushed only by their own
+  point returns the excess, clamping each batch to `empty - min_partial`
+  under the class lock so concurrent per-CPU drains cannot overshoot.
+  Remote magazines are flushed only by their own
   CPU at that point, on a `slab::shrink` generation request. The slab
   updates class ownership under the class lock, then releases that lock before
   buddy return, cgroup uncharge, or any callback that can re-enter the
