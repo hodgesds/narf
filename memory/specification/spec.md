@@ -45,6 +45,37 @@ the following 2 GiB remains the frame-backed valloc heap. Aligned 2 MiB
 non-RAM spans use large leaves, while unaligned spans and any span intersecting
 known System RAM use 4 KiB leaves. This keeps the WC-to-WB RAM clamp exact.
 
+**Guarded kernel stacks (`kstack`, Linux `CONFIG_VMAP_STACK`).** Every kernel
+task stack (and each aarch64 CPU's overflow stack) is a `KernelStack`: zeroed
+order-0 frames mapped virtually contiguous in top-level slot
+`KSTACK_L0_SLOT` (279), reserved with the other shared kernel slots by
+`bpf_text::reserve_kernel_slots` and randomized at 2 MiB granularity by
+`kstack::randomize_window` before the first stack exists.
+
+```rust
+pub const KSTACK_L0_SLOT: usize;          // 279
+pub const KSTACK_SHIFT: u32;              // 17
+pub const KSTACK_MAX_BYTES: usize;        // 128 KiB = 1 << KSTACK_SHIFT
+pub const KSTACK_SLOT_BYTES: u64;         // 256 KiB per stack
+pub struct KernelStack;                   // Send + Sync; Deref<[u8]>; Drop unmaps
+impl KernelStack {
+    pub const fn empty() -> Self;         // len 0, drop is a no-op
+    pub fn alloc(len: usize) -> Result<Self, KstackError>; // 0 < len ≤ 128 KiB
+    pub fn base(&self) -> u64; pub fn top(&self) -> u64; pub fn len(&self) -> usize;
+}
+pub struct GuardHit { pub stack_base: u64, pub stack_top: u64 }
+pub fn guard_hit(addr: u64) -> Option<GuardHit>;      // lock-free, fault path
+pub fn stack_containing(addr: u64) -> Option<(u64, u64)>;
+pub fn area_contains(addr: u64) -> bool;
+pub fn randomize_window();
+```
+
+Each stack occupies the bottom of its 256 KiB-aligned slot; slot 0 is never
+allocated. Leaves use `valloc`'s flags (RW, NX, non-global, protection key 0).
+`guard_hit` attributes an unmapped address to the stack in the next slot up —
+the one whose overflow reaches it — and is what #PF/#DF (x86_64) and the
+bad-stack entry (aarch64) consult.
+
 ```rust
 pub struct PhysFrame;     // owned 4 KiB physical frame (base page)
 pub struct VirtAddr(u64);
@@ -1533,6 +1564,16 @@ x86_64 is rejected at runtime.
 
 ## 4. Invariants & safety properties
 
+- **A kernel stack never has a mapped page below it.** Every `KernelStack`
+  starts at a 256 KiB slot boundary with at least `KSTACK_MAX_BYTES` (128 KiB)
+  of never-mapped VA below its base and the rest of its slot above its top.
+  Both target specs use inline stack probes, so even a frame larger than the
+  guard touches the first page below the base first: an overflow is a fault
+  on the guard, never a write into another object. Inside a stack, bit
+  `KSTACK_SHIFT` of the address is 0; in the guard directly below, it is 1
+  (the aarch64 entry check relies on this). A stack's extent is published
+  only after all its pages are mapped and cleared before they are unmapped,
+  so `guard_hit` never attributes to a half-built or freed stack.
 - Every non-identity kernel mapping has a domain assignment; untagged
   mappings panic in debug, deny-by-default in release.
 - **User memory types never alias System RAM against the kernel's type.**
@@ -2302,6 +2343,7 @@ x86_64 is rejected at runtime.
   | 0        | `0x0`                 | AP trampoline pages *only* — see below |
   | 1        | `0x0000_0080_0000_0000` | high MMIO window; never maps RAM    |
   | 272      | `0xFFFF_8800_0000_0000` | `vmalloc` / `ioremap`               |
+  | 279      | `0xFFFF_8B80_0000_0000` | guarded kernel stacks (`kstack`), same slot on aarch64 |
   | 384..510 | `0xFFFF_C000_0000_0000` (`KERNEL_DIRECT_MAP_BASE`) | direct map of RAM |
   | 511      | `0xFFFF_FFFF_8000_0000` (`KERNEL_VIRT_BASE`) | kernel image        |
 

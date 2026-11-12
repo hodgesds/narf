@@ -101,6 +101,7 @@ use crate::{PhysAddr, VirtAddr};
 //   272        vmalloc, 0xFFFF_8800_0000_0000     (`vmalloc.rs` — note that
 //              file's "273" comment is wrong; 0xFFFF_8800_0000_0000 >> 39
 //              is 0x110 = 272)
+//   279        guarded kernel stacks              (`kstack.rs`)
 //   384..=510  kernel direct map                  (`addr.rs`)
 //   511        kernel image (-2 GiB)              (`mmu.rs`)
 //
@@ -392,6 +393,10 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
             BPF_ARENA_PML4_SLOT,
             crate::text_poke::POKE_PML4_SLOT,
             crate::domain_heap::HEAP_L0_SLOT,
+            // Guarded kernel stacks (`kstack.rs`): stacks are switched to on
+            // every CPU in every address space, so the slot's table must be
+            // shared before the first user root copies the kernel half.
+            crate::kstack::KSTACK_L0_SLOT,
         ] {
             // SAFETY: `root` is the live kernel PML4, identity-reachable
             // (page tables live in low RAM), and we are single-threaded on the
@@ -416,6 +421,7 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
             // The per-domain module heap. Same requirement as the others: a
             // top-level entry present in every address space before first use.
             crate::domain_heap::HEAP_L0_SLOT,
+            crate::kstack::KSTACK_L0_SLOT,
         ] {
             // SAFETY: same as x86_64 — live kernel root, single-threaded BSP.
             unsafe { reserve_slot_aarch64(root, slot)? };
