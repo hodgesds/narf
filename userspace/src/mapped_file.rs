@@ -1514,6 +1514,7 @@ impl SharedFilePages {
             Some(phys),
             "shared-file indexes diverged"
         );
+        writeback::page_filter_remove(page.identity);
         if page.idle_dirty {
             self.idle_dirty.remove(&key);
             if let Some(slot) = self.files.get_mut(&page.identity) {
@@ -3077,7 +3078,7 @@ pub(crate) static REPLACED_MISMATCHES: core::sync::atomic::AtomicUsize =
 /// read — every write(2) is folded into it and every truncate zeroes it. A
 /// difference means one of the two holds bytes it should not, or the file
 /// changed through a path that does not tell the cache.
-fn check_replaced_page(stale: &SharedFilePage, candidate: PhysAddr) {
+fn check_replaced_page(stale: &SharedFilePage, candidate: PhysAddr, ino: u64) {
     if stale.dirty || stale.idle_dirty || stale.wb_pins != 0 || candidate.raw() == 0 {
         return;
     }
@@ -3095,8 +3096,9 @@ fn check_replaced_page(stale: &SharedFilePage, candidate: PhysAddr) {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "WB-INVARIANT clean idle page at {:#x} differs from a fresh read: +{first} \
-             for {run} bytes (page {:#x}, file {:#x})",
+            "WB-INVARIANT dev {:#x} ino {ino}: clean idle page at {:#x} differs from a fresh \
+             read: +{first} for {run} bytes (page {:#x}, file {:#x})",
+            stale.identity.device,
             stale.offset,
             old[first],
             new[first],
@@ -3121,6 +3123,9 @@ pub(crate) fn publish_shared_file_pages(
     let cache_generation =
         expected_generation.filter(|generation| ops.mmap_cache_generation() == Some(*generation));
     let identity = shared_file_identity(ops.as_ref());
+    // For the coherence check's report: read before the cache lock.
+    let checks = writeback::checks_enabled();
+    let ino = if checks { ops.ino() } else { 0 };
     {
         let mut pages = SHARED_FILE_PAGES.lock();
         for (index, candidate) in candidates.into_iter().enumerate() {
@@ -3161,9 +3166,9 @@ pub(crate) fn publish_shared_file_pages(
                         .by_phys
                         .get(&stale_phys)
                         .is_some_and(|stale| stale.mappings == 0 && stale.pending == 0));
-                    if writeback::checks_enabled() {
+                    if checks {
                         if let Some(stale) = pages.by_phys.get(&stale_phys) {
-                            check_replaced_page(stale, candidate);
+                            check_replaced_page(stale, candidate, ino);
                         }
                     }
                     // `None` while a writeback batch still holds the frame;
@@ -3212,6 +3217,7 @@ pub(crate) fn publish_shared_file_pages(
                     pages.by_file.insert(key, phys).is_none(),
                     "shared-file key was already indexed"
                 );
+                writeback::page_filter_add(identity);
                 canonical.push(candidate);
                 candidate
             };

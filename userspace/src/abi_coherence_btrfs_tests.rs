@@ -577,6 +577,43 @@ kernel_test_in!(
     smoke_btrfs_readahead_warm_windows_then_map_store
 );
 
+/// The soak's `WB-INVARIANT` (b) shape on btrfs: map-store, unmap, fsync
+/// (the pages are clean and the file's cache entry can go), truncate into
+/// the stored range mid-page, extend again. The formerly stored range past
+/// the cut reads as zeros — through `pread` and a fresh mapping — and the
+/// head before it keeps the store.
+fn smoke_btrfs_truncate_then_extend_after_writeback_reads_zeros() -> TestResult {
+    const LEN: u64 = 64 * PAGE;
+    let seed = alloc::vec![0x11u8; LEN as usize];
+    with_btrfs(&seed, |fx| {
+        let (from, to) = (10 * PAGE, 30 * PAGE);
+        mapped_generation(fx, fx.fd1, LEN, from, to, 0xf1)?;
+        fsync(fx.fd1)?;
+        let _ = crate::mapped_file::sync_all_files(None);
+        let cut = 20 * PAGE + 3933;
+        ftruncate(fx.fd1, cut)?;
+        ftruncate(fx.fd1, LEN)?;
+        let mut model = seed.clone();
+        model[from as usize..to as usize].fill(0xf1);
+        model[cut as usize..].fill(0);
+        for fd in [fx.fd1, fx.fd2] {
+            let mut got = alloc::vec![0u8; LEN as usize];
+            pread(fd, &mut got, 0)?;
+            if got != model {
+                return Err("pread after truncate-and-extend showed the old bytes");
+            }
+        }
+        if fresh_map_matches(fx, fx.fd2, &model)?.is_some() {
+            return Err("a fresh mapping after truncate-and-extend showed the old bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/coherence/btrfs",
+    smoke_btrfs_truncate_then_extend_after_writeback_reads_zeros
+);
+
 /// The whole file through a fresh read-only-use mapping matches `model`.
 fn fresh_map_matches(fx: &Fixture, fd: u64, model: &[u8]) -> Result<Option<usize>, &'static str> {
     let len = model.len() as u64;

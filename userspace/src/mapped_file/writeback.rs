@@ -233,6 +233,43 @@ fn may_have_entry(identity: SharedFileIdentity) -> bool {
     filter_bucket(identity).load(Ordering::Acquire) != 0
 }
 
+/// Counting filter over cached pages, by backing anchor — a file's
+/// `mapping->nrpages`, shared by the few files whose anchors collide. A
+/// file's clean pages outlive its entry (a later open may reuse them), so a
+/// truncate must find them whether or not the file has an entry; for a file
+/// with no cached page — nearly every truncate — this is one atomic load.
+static PAGE_FILTER: [AtomicU32; FILTER_BUCKETS] = [const { AtomicU32::new(0) }; FILTER_BUCKETS];
+
+fn page_bucket(anchor: usize) -> &'static AtomicU32 {
+    let mixed = (anchor as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &PAGE_FILTER[(mixed >> 54) as usize % FILTER_BUCKETS]
+}
+
+/// Called with the cache lock held, when a page is indexed.
+pub(super) fn page_filter_add(identity: SharedFileIdentity) {
+    page_bucket(identity.anchor).fetch_add(1, Ordering::AcqRel);
+}
+
+/// Called with the cache lock held, when a page leaves the index.
+pub(super) fn page_filter_remove(identity: SharedFileIdentity) {
+    page_bucket(identity.anchor).fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Whether `ops`'s file may have an entry or cached pages: what a size
+/// change or `fallocate` has to serialize against and clean up after.
+fn may_have_cached_pages(ops: &dyn FileOps) -> bool {
+    entry_identity(ops).is_some()
+        || page_bucket(ops.mmap_backing_identity()).load(Ordering::Acquire) != 0
+}
+
+/// `ops`'s identity, if its file may have cached pages, entry or not.
+fn cached_pages_identity(ops: &dyn FileOps) -> Option<SharedFileIdentity> {
+    if page_bucket(ops.mmap_backing_identity()).load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    Some(shared_file_identity(ops))
+}
+
 /// One file's writeback state. Shared by the cache's entry for the file and
 /// by whoever is writing or resizing it right now.
 pub(super) struct CachedFile {
@@ -1002,7 +1039,9 @@ pub(super) fn unwritten_page_removed(page: &SharedFilePage) {
     use core::fmt::Write as _;
     let _ = writeln!(
         narf_console::Writer,
-        "WB-INVARIANT unwritten page at {:#x} left the cache (dirty {}, listed {}, pins {})",
+        "WB-INVARIANT dev {:#x}: unwritten page at {:#x} left the cache (dirty {}, listed {}, \
+         pins {})",
+        page.identity.device,
         page.offset,
         page.dirty,
         page.idle_dirty,
@@ -1051,8 +1090,10 @@ async fn check_written_pages_match_file(ops: &Arc<dyn FileOps>, batch: &[Pinned]
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "WB-INVARIANT clean page at {:#x} differs from the file: read {done}/{len}, \
-                 first difference at +{first} (page {:#x}, file {:#x})",
+                "WB-INVARIANT dev {:#x} ino {}: clean page at {:#x} differs from the file: \
+                 read {done}/{len}, first difference at +{first} (page {:#x}, file {:#x})",
+                ops.inode_attrs().dev,
+                ops.ino(),
                 page.offset,
                 live.get(first).copied().unwrap_or(0),
                 file.get(first).copied().unwrap_or(0),
@@ -1630,7 +1671,7 @@ fn zero_cached(page: &mut SharedFilePage, at: usize, len: usize) {
 /// the tail of the page `size` falls in (`truncate_inode_pages_range` and
 /// `truncate_inode_partial_folio`).
 fn invalidate_past(identity: SharedFileIdentity, size: u64) {
-    if !may_have_entry(identity) {
+    if page_bucket(identity.anchor).load(Ordering::Acquire) == 0 {
         return;
     }
     let in_page = (size % 4096) as usize;
@@ -1654,11 +1695,13 @@ fn invalidate_past(identity: SharedFileIdentity, size: u64) {
 
 /// The truncate bridge's cache half: `file` has (or is about to have) the
 /// size it reports now.
+///
+/// Whether or not the file still has an entry: its clean pages outlive the
+/// entry, and pages past the new size must go with the truncate (Linux
+/// `truncate_inode_pages_range` runs whenever `mapping->nrpages` is
+/// non-zero). Left behind, they would hold bytes the file no longer has.
 pub(super) fn invalidate_beyond_eof(file: &dyn FileOps) {
-    if FILE_ENTRIES.load(Ordering::Acquire) == 0 {
-        return;
-    }
-    let Some(identity) = entry_identity(file) else {
+    let Some(identity) = cached_pages_identity(file) else {
         return;
     };
     invalidate_past(identity, file.stat().size);
@@ -1799,10 +1842,12 @@ pub(crate) fn size_change_serialized<R>(
     ops: &Arc<dyn FileOps>,
     change: impl FnOnce() -> R,
 ) -> Option<R> {
-    // A file with no cache entry has no page for writeback to write and none
-    // to drop: every `open(O_TRUNC)` of an unmapped file — every shell
-    // redirection — takes no lock and allocates nothing here.
-    if entry_identity(ops.as_ref()).is_none() {
+    // A file with no cache entry and no cached page has nothing for
+    // writeback to write and nothing to drop: every `open(O_TRUNC)` of an
+    // unmapped file — every shell redirection — takes no lock and allocates
+    // nothing here. Clean pages outlive the entry (a later open may reuse
+    // them), so a file that still has some takes the full path.
+    if !may_have_cached_pages(ops.as_ref()) {
         return Some(change());
     }
     let (file, _) = acquire(ops);
@@ -1852,7 +1897,7 @@ pub(crate) fn fallocate_serialized<R>(
     change: impl FnOnce() -> R,
     succeeded: impl FnOnce(&R) -> bool,
 ) -> Option<R> {
-    if entry_identity(ops.as_ref()).is_none() {
+    if !may_have_cached_pages(ops.as_ref()) {
         return Some(change());
     }
     let (file, writer) = acquire(ops);

@@ -2313,3 +2313,76 @@ kernel_test_in!(
     "userspace/writeback",
     smoke_refault_during_writeback_of_a_page_pinned_mapped
 );
+
+/// The soak's `WB-INVARIANT` (b) lines: a file whose entry was collected
+/// keeps its clean pages (a later open may reuse them), and a truncate must
+/// still drop those past the new size and zero the tail of the page it ends
+/// in (Linux `truncate_inode_pages_range`, which runs whenever the inode
+/// has pages). Truncate down, then extend: the formerly cached range reads
+/// as zeros through `read(2)` and through a fresh mapping, and the cache
+/// itself holds nothing of it.
+fn smoke_truncate_without_an_entry_drops_retained_pages() -> TestResult {
+    const PAGES: usize = 4;
+    let mut fixture = Fixture::new(PAGES);
+    let Some(pages) = fixture.map(0, PAGES) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    for page in &pages {
+        store_bytes(*page, 0, &[0x5a; 4096]);
+    }
+    fixture.unmap(&pages);
+    if super::super::flush_current_file(fixture.ops()).is_err() {
+        return TestResult::Fail("writing the stores back failed");
+    }
+    release_if_unused(fixture.identity);
+    if fixture.entry().is_some() {
+        return TestResult::Fail("the file's entry was not collected");
+    }
+    if fixture.cached(3).is_none() {
+        return TestResult::Fail("the clean pages were not retained past the entry");
+    }
+
+    const CUT: usize = 4096 + 100;
+    let shrink =
+        size_change_serialized(fixture.ops(), || run(fixture.ops().truncate(CUT as u64))).flatten();
+    let grow = size_change_serialized(fixture.ops(), || {
+        run(fixture.ops().truncate((PAGES * 4096) as u64))
+    })
+    .flatten();
+    if shrink != Some(Ok(())) || grow != Some(Ok(())) {
+        return TestResult::Fail("the truncates failed");
+    }
+    if fixture.cached(2).is_some() || fixture.cached(3).is_some() {
+        return TestResult::Fail("pages past the truncate stayed cached with no entry");
+    }
+    {
+        let pages = SHARED_FILE_PAGES.lock();
+        let straddling = pages
+            .by_file
+            .get(&key(fixture.identity, 4096))
+            .and_then(|phys| pages.by_phys.get(phys))
+            .map(|page| page_bytes(page.phys, 100, 4096 - 100));
+        if straddling.is_some_and(|tail| tail.iter().any(|b| *b != 0)) {
+            return TestResult::Fail("the page the truncate ended in kept its old tail");
+        }
+    }
+    let Some(read) = read_like_syscall(&fixture, 0, PAGES * 4096) else {
+        return TestResult::Fail("read of the test file failed");
+    };
+    if read[..CUT].iter().any(|b| *b != 0x5a) || read[CUT..].iter().any(|b| *b != 0) {
+        return TestResult::Fail("read(2) after truncate-and-extend showed the old bytes");
+    }
+    let Some(fresh) = fixture.map(0, PAGES) else {
+        return TestResult::Fail("could not map the test file again");
+    };
+    let mapped: Vec<u8> = fresh.iter().flat_map(|p| page_bytes(*p, 0, 4096)).collect();
+    fixture.unmap(&fresh);
+    if mapped[..CUT].iter().any(|b| *b != 0x5a) || mapped[CUT..].iter().any(|b| *b != 0) {
+        return TestResult::Fail("a fresh mapping after truncate-and-extend showed the old bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_truncate_without_an_entry_drops_retained_pages
+);
