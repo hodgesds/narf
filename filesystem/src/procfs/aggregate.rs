@@ -62,6 +62,7 @@ use narf_interrupts::{snapshot_counters, PERCPU_FIRES_MAX};
 use narf_lib::smp::cpu_count;
 
 use super::{register_proc, ProcFile};
+use crate::FsError;
 
 // NUMA node count via a weak hook (see sysfs.rs for why filesystem
 // avoids a direct narf-acpi dep). `narf-frame` provides the definition.
@@ -113,6 +114,8 @@ pub fn register_all() {
     register_proc("ioports", agg(gen_ioports));
     register_proc("slabinfo", agg(gen_slabinfo));
     register_proc("narf/slab", agg(gen_narf_slab));
+    register_proc("narf/slab_sites", Arc::new(SlabSitesFile));
+    register_proc("narf/rcu", agg(gen_narf_rcu));
     register_proc("vmstat", agg(gen_vmstat));
     register_proc("zoneinfo", agg(gen_zoneinfo));
     register_proc("buddyinfo", agg(gen_buddyinfo));
@@ -488,6 +491,74 @@ fn slab_class_snapshot() -> Vec<narf_memory::slab::ClassDetail> {
 // NARF-specific, `memory.stat`-style `key value` lines: where every frame
 // the kernel heap holds is, per size class, so a soak can tell a leak
 // (`live` rising) from retention (`live` back at baseline, `frames` not).
+
+/// `/proc/narf/slab_sites`: live heap bytes per allocation site. Writing `1`
+/// arms the audit, `0` disarms and clears it (root only, 0644). Each row is
+/// `<bytes> <live> <kind> <off>...`: `kind` is a size class in bytes, or
+/// `L<pages>` for a buddy-backed large block; the offsets are stack words
+/// relative to `__text_start` (add the ELF's `.text` address for
+/// `addr2line`). Small-class rows are 1-in-`sample_small` samples.
+#[derive(Debug)]
+struct SlabSitesFile;
+
+impl ProcFile for SlabSitesFile {
+    fn read(&self) -> Vec<u8> {
+        use narf_memory::slab::site_audit;
+        // Snapshot under the audit lock into a heap buffer allocated first:
+        // the snapshot itself must not allocate.
+        let mut rows = alloc::vec![site_audit::SiteRow::default(); 64];
+        let (n, dropped) = site_audit::snapshot(&mut rows);
+        let mut s = String::new();
+        let _ = writeln!(s, "armed {}", u8::from(site_audit::armed()));
+        let _ = writeln!(s, "sample_small {}", site_audit::SMALL_SAMPLE);
+        let _ = writeln!(s, "untracked {}", dropped);
+        for r in &rows[..n] {
+            if r.kind & 0x8000_0000 != 0 {
+                let _ = write!(s, "{} {} L{}", r.bytes, r.live, r.kind & 0x7fff_ffff);
+            } else {
+                let _ = write!(s, "{} {} {}", r.bytes, r.live, r.kind);
+            }
+            for w in r.words.iter().filter(|&&w| w != 0) {
+                let _ = write!(s, " {:#x}", w);
+            }
+            let _ = writeln!(s);
+        }
+        s.into_bytes()
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn write(&self, buf: &[u8]) -> Result<usize, FsError> {
+        match buf.iter().find(|b| !b.is_ascii_whitespace()) {
+            Some(b'1') => narf_memory::slab::site_audit::set_armed(true),
+            Some(b'0') => narf_memory::slab::site_audit::set_armed(false),
+            _ => return Err(FsError::InvalidData),
+        }
+        Ok(buf.len())
+    }
+}
+
+/// `/proc/narf/rcu`: the QSBR deferred-reclaim backlog. `rcu_pending` is
+/// objects retired whose destructor has not run yet; a backlog that grows
+/// and never drains holds everything those objects own (task stacks,
+/// dentries, ...) in `Slab`.
+fn gen_narf_rcu() -> Vec<u8> {
+    let c = narf_rcu::qsbr::census();
+    let mut s = String::new();
+    let _ = writeln!(s, "rcu_retired {}", c.retired);
+    let _ = writeln!(s, "rcu_destroyed {}", c.destroyed);
+    let _ = writeln!(s, "rcu_pending {}", c.retired.saturating_sub(c.destroyed));
+    let _ = writeln!(s, "rcu_global_epoch {}", c.global_epoch);
+    let _ = writeln!(
+        s,
+        "rcu_epoch_lag {}",
+        c.global_epoch.saturating_sub(c.min_quiescent.min(c.global_epoch))
+    );
+    let _ = writeln!(s, "rcu_stalled_mask {:#x}", c.stalled_mask);
+    s.into_bytes()
+}
 
 fn gen_narf_slab() -> Vec<u8> {
     let mut s = String::new();

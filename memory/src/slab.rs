@@ -49,6 +49,7 @@ use crate::frame::{alloc_frame, alloc_pages_on, free_pages, PhysFrame};
 use crate::PAGE_SIZE;
 
 mod central;
+pub mod site_audit;
 pub(crate) use central::FrameState;
 #[cfg(feature = "kernel-test")]
 mod retention_tests;
@@ -1036,9 +1037,23 @@ pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
             let p = alloc_class(c)?;
             #[cfg(feature = "kasan")]
             kasan_alloc(p, c);
+            if site_audit::sample_small(c) {
+                site_audit::record(p.as_ptr() as usize, class_size(c), class_size(c) as u32);
+            }
             Ok(p)
         }
-        None => alloc_large(layout),
+        None => {
+            let p = alloc_large(layout)?;
+            if site_audit::armed() {
+                let pages = layout.size().div_ceil(PAGE_SIZE_USIZE);
+                site_audit::record(
+                    p.as_ptr() as usize,
+                    pages * PAGE_SIZE_USIZE,
+                    0x8000_0000 | pages as u32,
+                );
+            }
+            Ok(p)
+        }
     }
 }
 
@@ -1051,7 +1066,11 @@ pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
 /// `GlobalAlloc::dealloc` contract.
 pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
-    match class_for(need) {
+    let class = class_for(need);
+    if site_audit::armed() && class.is_none_or(|c| c >= site_audit::SMALL_MIN_CLASS) {
+        site_audit::forget(ptr.as_ptr() as usize);
+    }
+    match class {
         Some(c) => {
             #[cfg(feature = "kasan")]
             kasan_free(ptr, c);
