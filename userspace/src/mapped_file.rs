@@ -1552,6 +1552,17 @@ impl SharedFilePages {
     /// or its file can never be written again.
     fn retire_phys_discarding(&mut self, phys: u64) -> Option<PhysAddr> {
         let page = self.remove_phys(phys)?;
+        if page.mappings != 0 {
+            // A page some mapping still maps: never removed by design, so
+            // an invariant violation. Its frame must outlive the mappings
+            // (it is never freed), and a store to it must not go unseen.
+            // Its holds leave the file's entry with it.
+            if let Some(slot) = self.files.get_mut(&page.identity) {
+                slot.held = slot.held.saturating_sub(page.mappings);
+            }
+            ghost_removed_while_mapped(page);
+            return None;
+        }
         if page.wb_pins != 0 {
             self.doomed.insert(phys, page.wb_pins);
             None
@@ -3270,6 +3281,109 @@ pub(crate) fn retain_shared_file_page_writable(phys: u64) -> bool {
     retain_page(phys, true)
 }
 
+/// A frame a file-cache mapping maps that the cache does not index. Linux
+/// has no such thing — every page a shared file mapping maps is in the page
+/// cache — and here it is an invariant violation, reported when found. It is
+/// made safe rather than silent: the frame is never freed while it may be
+/// mapped, its PTEs are installed read-only so a store to it faults, and
+/// the fault puts a page the cache lost back where it was.
+struct Ghost {
+    /// The record of a page removed from the index while mapped, if that is
+    /// how it arose; `None` for a frame the cache never knew.
+    page: Option<SharedFilePage>,
+    /// Mapping holds the cache has seen for it.
+    holds: usize,
+    /// A store to it has been reported; its PTEs may be writable again.
+    notified: bool,
+}
+
+/// Lock order: the cache lock, then this one.
+static GHOSTS: IrqSafeSpinLock<BTreeMap<u64, Ghost>> = IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Violations found: kernel tests and `/proc` readers can see them.
+pub(crate) static GHOST_REPORTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn report_ghost(what: &str, phys: u64, page: Option<&SharedFilePage>) {
+    let seen = GHOST_REPORTS.fetch_add(1, Ordering::Relaxed);
+    // Each is a bug; the first few say enough.
+    if seen < 64 {
+        use core::fmt::Write as _;
+        let (device, offset) =
+            page.map_or((0, u64::MAX), |page| (page.identity.device, page.offset));
+        let _ = writeln!(
+            narf_console::Writer,
+            "MAPPED-FILE-INVARIANT {what}: frame {phys:#x} dev {device:#x} offset {offset:#x}"
+        );
+    }
+}
+
+/// Called under the cache lock with a page just removed from the index
+/// while mappings still held it.
+fn ghost_removed_while_mapped(page: SharedFilePage) {
+    let phys = page.phys.raw();
+    report_ghost(
+        "page removed from the cache while mapped",
+        phys,
+        Some(&page),
+    );
+    let holds = page.mappings;
+    GHOSTS.lock().insert(
+        phys,
+        Ghost {
+            page: Some(page),
+            holds,
+            notified: false,
+        },
+    );
+}
+
+/// The last owner memory asks to retain a `SHARED | EXTERNAL_REFS` frame
+/// (after the relocation aliases, mapped folios and System V segments
+/// declined it): a cache page, or else a frame no owner knows.
+pub(crate) fn retain_external_unclaimed(phys: u64) -> bool {
+    if retain_page(phys, false) {
+        return true;
+    }
+    let mut ghosts = GHOSTS.lock();
+    match ghosts.get_mut(&phys) {
+        Some(ghost) => ghost.holds = ghost.holds.saturating_add(1),
+        None => {
+            report_ghost(
+                "a mapping took a frame the cache does not index",
+                phys,
+                None,
+            );
+            ghosts.insert(
+                phys,
+                Ghost {
+                    page: None,
+                    holds: 1,
+                    notified: false,
+                },
+            );
+        }
+    }
+    true
+}
+
+/// The release twin of [`retain_external_unclaimed`]. A ghost frame is
+/// never freed: no owner can say it is no longer in use.
+pub(crate) fn release_external_unclaimed(phys: u64) -> bool {
+    if release_shared_file_page(phys) {
+        return true;
+    }
+    let mut ghosts = GHOSTS.lock();
+    let Some(ghost) = ghosts.get_mut(&phys) else {
+        return false;
+    };
+    ghost.holds = ghost.holds.saturating_sub(1);
+    if ghost.holds == 0 {
+        ghosts.remove(&phys);
+    }
+    true
+}
+
 fn retain_page(phys: u64, writable: bool) -> bool {
     let mut pages = SHARED_FILE_PAGES.lock();
     if !pages.by_phys.contains_key(&phys) {
@@ -3319,7 +3433,13 @@ pub(crate) fn page_cache_stats() -> narf_filesystem::procfs::PageCacheStats {
 /// cache page is not this cache's to restrict.
 pub(crate) fn shared_page_write_enabled(phys: u64) -> bool {
     let pages = SHARED_FILE_PAGES.lock();
-    pages.by_phys.get(&phys).is_none_or(|page| page.dirty)
+    if let Some(page) = pages.by_phys.get(&phys) {
+        return page.dirty;
+    }
+    // Not a cache page: another owner's frame (writable as before), or a
+    // frame a file-cache mapping should never map — read-only until a store
+    // to it has been seen, so none goes unnoticed.
+    GHOSTS.lock().get(&phys).is_none_or(|ghost| ghost.notified)
 }
 
 /// memory's `write_notify` hook: a store hit the read-only PTE of cache
@@ -3329,12 +3449,68 @@ pub(crate) fn shared_page_write_enabled(phys: u64) -> bool {
 /// so the page is written again after it.
 pub(crate) fn shared_page_write_fault(phys: u64) -> bool {
     let mut pages = SHARED_FILE_PAGES.lock();
+    if !pages.by_phys.contains_key(&phys) {
+        return ghost_write_fault(&mut pages, phys);
+    }
     let Some(page) = pages.by_phys.get_mut(&phys) else {
         return false;
     };
     page.dirty = true;
     if page.wb_pins != 0 {
         page.redirtied = true;
+    }
+    true
+}
+
+/// A store hit a ghost frame (see [`Ghost`]). A page the cache lost while
+/// mapped goes back into the index, dirty, if its place is still free, so
+/// the store reaches the file; otherwise the violation is reported and the
+/// store allowed. Called with the cache lock held.
+fn ghost_write_fault(pages: &mut SharedFilePages, phys: u64) -> bool {
+    let mut ghosts = GHOSTS.lock();
+    let Some(ghost) = ghosts.get_mut(&phys) else {
+        return false;
+    };
+    let free_slot = ghost.page.as_ref().is_some_and(|page| {
+        !pages
+            .by_file
+            .contains_key(&SharedFilePages::key(page.identity, page.offset))
+    });
+    if !free_slot {
+        if !ghost.notified {
+            report_ghost(
+                "a store to a frame the cache does not index",
+                phys,
+                ghost.page.as_ref(),
+            );
+        }
+        ghost.notified = true;
+        return true;
+    }
+    let holds = ghost.holds;
+    let Some(mut page) = ghosts.remove(&phys).and_then(|ghost| ghost.page) else {
+        return false;
+    };
+    drop(ghosts);
+    report_ghost(
+        "re-inserting a page the cache lost while mapped",
+        phys,
+        Some(&page),
+    );
+    page.mappings = holds;
+    page.pending = 0;
+    page.wb_pins = 0;
+    page.dirty = true;
+    page.idle_dirty = false;
+    page.idle_clean = false;
+    let identity = page.identity;
+    let key = SharedFilePages::key(identity, page.offset);
+    let owner = page.ops.clone();
+    pages.by_phys.insert(phys, page);
+    pages.by_file.insert(key, phys);
+    writeback::page_filter_add(identity);
+    if let Some(slot) = pages.ensure_slot(identity, || owner.upgrade()) {
+        slot.held = slot.held.saturating_add(holds);
     }
     true
 }

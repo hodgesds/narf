@@ -1534,6 +1534,36 @@ pub(crate) fn flush_file_for_read(ops: &Arc<dyn FileOps>) {
     }
 }
 
+/// Reads that found a page owing its file nothing hold other bytes than the
+/// filesystem returned (see [`overlay_dirty`]).
+pub(crate) static READ_MISMATCHES: AtomicUsize = AtomicUsize::new(0);
+
+/// Called with the cache lock held: no filesystem call here. Device and
+/// offset name the file and page; `in_page` is where `live` starts in it.
+fn report_clean_page_differs_on_read(
+    (dev, ino): (u64, u64),
+    page_offset: u64,
+    in_page: usize,
+    live: &[u8],
+    file: &[u8],
+) {
+    READ_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+    let first = (0..live.len()).find(|i| live[*i] != file[*i]).unwrap_or(0);
+    let run = (first..live.len())
+        .take_while(|i| live[*i] != file[*i])
+        .count();
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        narf_console::Writer,
+        "WB-INVARIANT dev {dev:#x} ino {ino}: clean page at {:#x} differs from the file on \
+         read: +{} for {run} bytes (page {:#x}, file {:#x})",
+        page_offset,
+        in_page + first,
+        live[first],
+        file[first],
+    );
+}
+
 /// Cache-lock takes by [`overlay_dirty`]. Kernel tests read it.
 pub(super) static OVERLAY_LOCKS: AtomicU64 = AtomicU64::new(0);
 
@@ -1554,14 +1584,23 @@ pub(super) static OVERLAY_LOCKS: AtomicU64 = AtomicU64::new(0);
 /// batch wrote since then is taken whatever its generation, since the
 /// filesystem may have answered from before that write.
 pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8], epoch: ReadEpoch) {
-    if buf.is_empty() || FILE_ENTRIES.load(Ordering::Acquire) == 0 {
+    if buf.is_empty() {
         return;
     }
-    let Some(identity) = entry_identity(ops.as_ref()) else {
+    // Entry or not: a file's clean pages outlive its entry and are its
+    // content all the same.
+    let Some(identity) = cached_pages_identity(ops.as_ref()) else {
         return;
     };
     // Outside the cache lock: a filesystem may take its own locks for it.
     let generation = ops.mmap_cache_generation();
+    let checks = checks_enabled();
+    // For the check's report: read before the cache lock.
+    let names = if checks {
+        (ops.inode_attrs().dev, ops.ino())
+    } else {
+        (0, 0)
+    };
     let end = offset.saturating_add(buf.len() as u64);
     let mut cursor = offset & !4095;
     // A few pages per hold of the cache lock; each is at most a 4 KiB copy.
@@ -1569,9 +1608,6 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8],
     loop {
         OVERLAY_LOCKS.fetch_add(1, Ordering::Relaxed);
         let pages = SHARED_FILE_PAGES.lock();
-        if !pages.files.contains_key(&identity) {
-            return;
-        }
         let mut visited = 0usize;
         let mut resume = None;
         for (cached, phys) in pages.by_file.range(key(identity, cursor)..) {
@@ -1599,9 +1635,19 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8],
             let live = unsafe {
                 core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>().add(in_page), count)
             };
+            let dst = &mut buf[(low - offset) as usize..(low - offset) as usize + count];
+            // Coherence check: a page that owes the file nothing and that no
+            // batch wrote during this read holds what the filesystem just
+            // returned. A difference is a store the cache never recorded, or
+            // a write the cache was never told of.
+            let owes_nothing =
+                !page.dirty && !page.idle_dirty && page.wb_pins == 0 && !written_since;
+            if checks && owes_nothing && live != &*dst {
+                report_clean_page_differs_on_read(names, page.offset, in_page, live, dst);
+            }
             // The page is the file's current content: every write(2) of it
             // updates the page too, and every store is in it.
-            buf[(low - offset) as usize..(low - offset) as usize + count].copy_from_slice(live);
+            dst.copy_from_slice(live);
         }
         drop(pages);
         match resume {

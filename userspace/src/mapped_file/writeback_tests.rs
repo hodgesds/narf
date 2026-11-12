@@ -2386,3 +2386,129 @@ kernel_test_in!(
     "userspace/writeback",
     smoke_truncate_without_an_entry_drops_retained_pages
 );
+
+/// The fail-safe for a cache page removed from the index while a mapping
+/// still maps it (never done by design): the frame is kept, not freed; its
+/// PTEs go read-only; the store that then faults puts the page back in the
+/// index, dirty, and the store reaches the file.
+fn smoke_page_removed_while_mapped_is_kept_and_put_back() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    let phys = pages[0];
+    let reports = super::super::GHOST_REPORTS.load(Ordering::Relaxed);
+    let freed = SHARED_FILE_PAGES.lock().retire_phys_discarding(phys.raw());
+    if freed.is_some() {
+        return TestResult::Fail("a mapped page's frame was handed back to be freed");
+    }
+    if super::super::GHOST_REPORTS.load(Ordering::Relaxed) == reports {
+        return TestResult::Fail("removing a mapped page was not reported");
+    }
+    if super::super::shared_page_write_enabled(phys.raw()) {
+        return TestResult::Fail("a page the cache lost stayed writable");
+    }
+    // The store faults on the read-only PTE.
+    store_bytes(phys, 0, b"kept by the mapping");
+    if fixture.cached(0) != Some((true, false)) {
+        return TestResult::Fail("the store did not put the page back in the cache");
+    }
+    if super::super::flush_current_file(fixture.ops()).is_err()
+        || fixture.file_bytes(0, 19) != *b"kept by the mapping"
+    {
+        return TestResult::Fail("the store to the page put back did not reach the file");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_page_removed_while_mapped_is_kept_and_put_back
+);
+
+/// A file-cache mapping that takes a frame no owner knows (memory's last
+/// owner, the cache, declines it): reported, read-only until a store to it
+/// has been seen, then writable; its holds are counted out.
+fn smoke_unindexed_frame_is_read_only_until_stored() -> TestResult {
+    let Ok(frame) = narf_memory::alloc_frame() else {
+        return TestResult::Fail("no frame");
+    };
+    let phys = frame.start_address().raw();
+    let reports = super::super::GHOST_REPORTS.load(Ordering::Relaxed);
+    let result = (|| {
+        if !super::super::retain_external_unclaimed(phys) {
+            return Err("an unindexed frame was not taken in");
+        }
+        if super::super::GHOST_REPORTS.load(Ordering::Relaxed) == reports {
+            return Err("an unindexed frame was not reported");
+        }
+        if super::super::shared_page_write_enabled(phys) {
+            return Err("an unindexed frame was writable before any store");
+        }
+        if !super::super::shared_page_write_fault(phys) {
+            return Err("a store to an unindexed frame was refused");
+        }
+        if !super::super::shared_page_write_enabled(phys) {
+            return Err("an unindexed frame stayed read-only after its store");
+        }
+        if !super::super::release_external_unclaimed(phys) {
+            return Err("the hold on an unindexed frame was not counted out");
+        }
+        if super::super::release_external_unclaimed(phys) {
+            return Err("an unindexed frame outlived its last hold");
+        }
+        Ok(())
+    })();
+    narf_memory::free_frame(frame);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_unindexed_frame_is_read_only_until_stored
+);
+
+/// A file's clean pages are its content after its entry is collected too:
+/// `read(2)` copies them. And the check for the soak's last stale read: a
+/// page that owes the file nothing but holds other bytes (a store the cache
+/// never recorded) is reported on read.
+fn smoke_read_uses_clean_pages_without_an_entry_and_checks_them() -> TestResult {
+    let mut fixture = Fixture::new(1);
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    store_bytes(pages[0], 0, b"written back");
+    fixture.unmap(&pages);
+    if super::super::flush_current_file(fixture.ops()).is_err() {
+        return TestResult::Fail("writing the store back failed");
+    }
+    release_if_unused(fixture.identity);
+    if fixture.entry().is_some() || fixture.cached(0).is_none() {
+        return TestResult::Fail("the test needs a retained page with no entry");
+    }
+    let before = READ_MISMATCHES.load(Ordering::Relaxed);
+    if read_like_syscall(&fixture, 0, 12).as_deref() != Some(b"written back".as_slice()) {
+        return TestResult::Fail("read of a retained clean page failed");
+    }
+    if READ_MISMATCHES.load(Ordering::Relaxed) != before {
+        return TestResult::Fail("a clean page equal to the file was reported");
+    }
+    // A store the cache never heard of.
+    // SAFETY: the cache retains this frame; the test owns the file.
+    unsafe {
+        core::ptr::copy_nonoverlapping(b"UNRECORDED".as_ptr(), pages[0].kernel_mut_ptr::<u8>(), 10);
+    }
+    let read = read_like_syscall(&fixture, 0, 12);
+    if READ_MISMATCHES.load(Ordering::Relaxed) == before {
+        return TestResult::Fail("a clean page that differs from the file was not reported");
+    }
+    if read.as_deref() != Some(b"UNRECORDEDck".as_slice()) {
+        return TestResult::Fail("read(2) did not copy the cached page");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_read_uses_clean_pages_without_an_entry_and_checks_them
+);

@@ -10891,7 +10891,7 @@ pub fn retain_external_shared_frame(phys: u64) {
             return;
         }
     }
-    let _ = crate::mapped_file::retain_shared_file_page(phys);
+    let _ = crate::mapped_file::retain_external_unclaimed(phys);
 }
 
 pub fn release_external_shared_frame(phys: u64) {
@@ -10906,7 +10906,7 @@ pub fn release_external_shared_frame(phys: u64) {
             return;
         }
     }
-    let _ = crate::mapped_file::release_shared_file_page(phys);
+    let _ = crate::mapped_file::release_external_unclaimed(phys);
 }
 
 // ── FirmwareInstall — arg0=name_ptr, arg1=name_len,
