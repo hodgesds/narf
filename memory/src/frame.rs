@@ -3562,9 +3562,15 @@ fn scrub_freed_frame(phys: PhysAddr) {
 /// Entries are cleared on each AS's teardown (`__pagetable_unregister`
 /// via `free_user_pml4_tree`), so a correctly-drained registry only ever
 /// holds the page-table pages of currently-live ASes (a handful of
-/// processes × their sparse user mappings). The registry is a fixed
-/// open-addressed atomic hash table so it can be consulted without allocation
-/// or the buddy lock. A flat linear scan made sparse MAP_FIXED/mremap table
+/// processes × their sparse user mappings). For every frame with a flat
+/// per-frame slot the registration is a bit in that slot (Linux `PG_table`):
+/// register, unregister and lookup are one atomic each and leave nothing
+/// behind. The fixed open-addressed atomic hash table below serves only the
+/// frames without a slot (hot-plugged RAM, and boot before the flat table
+/// exists); its unregistrations leave tombstones, which is why it must not be
+/// the path for every page table — under process churn each frame that was
+/// ever a page table left one, the vacant slots ran out, and each operation
+/// probed up to the whole table. A flat linear scan made sparse MAP_FIXED/mremap table
 /// construction quadratic and overflowed after 16 K live tables.
 const PT_REGISTRY_LEN: usize = 131072;
 const PT_REGISTRY_TOMBSTONE: u64 = 1;
@@ -3594,6 +3600,11 @@ fn pagetable_registry_start(phys: u64) -> usize {
 pub fn __pagetable_register(phys: u64) {
     use core::sync::atomic::Ordering;
     debug_assert!(phys > PT_REGISTRY_TOMBSTONE && phys & (PAGE_SIZE - 1) == 0);
+    // O(1) mark in the frame's own slot (Linux `PG_table`); the hash table
+    // below serves only frames without one.
+    if cow::set_page_table_mark(phys, true) {
+        return;
+    }
     let start = pagetable_registry_start(phys);
     'retry: loop {
         let mut first_tombstone = None;
@@ -3645,6 +3656,31 @@ pub fn __pagetable_register(phys: u64) {
     }
 }
 
+/// Move every hash-registry entry that now has a flat slot into that slot's
+/// page-table mark, and clear the table if nothing else is left in it. Runs
+/// once, as the flat table is published during boot, before any user address
+/// space exists.
+fn move_pagetable_registry_into_marks() {
+    let mut remaining = 0usize;
+    for slot in &PT_REGISTRY {
+        let value = slot.load(Ordering::Acquire);
+        if value <= PT_REGISTRY_TOMBSTONE {
+            continue;
+        }
+        if cow::set_page_table_mark(value, true) {
+            slot.store(PT_REGISTRY_TOMBSTONE, Ordering::Release);
+        } else {
+            remaining += 1;
+        }
+    }
+    if remaining == 0 {
+        // Only tombstones left: an empty table probes nothing.
+        for slot in &PT_REGISTRY {
+            slot.store(0, Ordering::Release);
+        }
+    }
+}
+
 /// Count of `__pagetable_register` calls that found no free slot. Stays
 /// 0 in healthy operation; a non-zero value means address spaces are
 /// leaking page tables faster than they're reclaimed.
@@ -3654,6 +3690,9 @@ pub static PT_REGISTRY_OVERFLOWS: core::sync::atomic::AtomicUsize =
 #[doc(hidden)]
 pub fn __pagetable_unregister(phys: u64) {
     use core::sync::atomic::Ordering;
+    if cow::set_page_table_mark(phys, false) {
+        return;
+    }
     let start = pagetable_registry_start(phys);
     for distance in 0..PT_REGISTRY_LEN {
         let slot = &PT_REGISTRY[(start + distance) & (PT_REGISTRY_LEN - 1)];
@@ -3677,6 +3716,9 @@ pub fn __pagetable_unregister(phys: u64) {
 #[doc(hidden)]
 pub fn __pagetable_is_registered(phys: u64) -> bool {
     use core::sync::atomic::Ordering;
+    if let Some(marked) = cow::page_table_mark(phys) {
+        return marked;
+    }
     let start = pagetable_registry_start(phys);
     for distance in 0..PT_REGISTRY_LEN {
         let value = PT_REGISTRY[(start + distance) & (PT_REGISTRY_LEN - 1)].load(Ordering::Acquire);
@@ -4092,6 +4134,8 @@ pub mod cow {
         // Physical provenance is independent of COW/pin ownership and survives
         // reuse. Zero means unknown; registered RAM stores node + 1. This fits
         // in the existing padding, keeping the 64-byte descriptor unchanged.
+        // The top bit is the frame's page-table mark (`PAGE_TABLE_BIT`, Linux
+        // `PG_table`); the node lives in the bits below it.
         node_plus_one: AtomicU32,
         // Independent slab bookkeeping. Zeroed before publication, protected
         // exclusively by the owning slab size-class lock, never by COW locks.
@@ -4247,11 +4291,34 @@ pub mod cow {
     /// topology locks, or heap allocation occur on this path.
     #[inline]
     pub(super) fn cached_node_for_phys(key: u64) -> Option<usize> {
-        flat_entry(key)?
-            .node_plus_one
-            .load(Ordering::Relaxed)
+        (flat_entry(key)?.node_plus_one.load(Ordering::Relaxed) & !PAGE_TABLE_BIT)
             .checked_sub(1)
             .map(|node| node as usize)
+    }
+
+    /// Page-table mark in `FlatCowSlot::node_plus_one` (Linux `PG_table`).
+    const PAGE_TABLE_BIT: u32 = 1 << 31;
+
+    /// Mark or unmark `key` as a page-table frame in its flat slot, in O(1).
+    /// `false` when the frame has no flat slot (hot-plugged RAM, or before
+    /// the table is published); the caller then uses the hash registry.
+    pub(super) fn set_page_table_mark(key: u64, on: bool) -> bool {
+        let Some(slot) = flat_entry(key) else {
+            return false;
+        };
+        if on {
+            slot.node_plus_one
+                .fetch_or(PAGE_TABLE_BIT, Ordering::AcqRel);
+        } else {
+            slot.node_plus_one
+                .fetch_and(!PAGE_TABLE_BIT, Ordering::AcqRel);
+        }
+        true
+    }
+
+    /// The page-table mark of `key`; `None` when it has no flat slot.
+    pub(super) fn page_table_mark(key: u64) -> Option<bool> {
+        flat_entry(key).map(|slot| slot.node_plus_one.load(Ordering::Acquire) & PAGE_TABLE_BIT != 0)
     }
 
     /// Retain RAM independently of its mappings. The caller holds the mapping
@@ -4444,6 +4511,9 @@ pub mod cow {
         init_memcg_words(frames);
         FLAT_FRAMES.store(frames, Ordering::Relaxed);
         FLAT.store(base, Ordering::Release);
+        // Page tables registered before the table existed (kernel tables
+        // built during boot) move from the hash registry to their marks.
+        super::move_pagetable_registry_into_marks();
     }
 
     /// Increment the refcount on `phys`. Returns the new count.
