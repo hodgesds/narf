@@ -85,11 +85,71 @@ fn arm_park_timer(
     slack_ns: u64,
     waker: &core::task::Waker,
 ) {
+    arm_park_timer_on(
+        handle,
+        narf_scheduler::narf_time::hrtimer::ClockId::Monotonic,
+        expires_ns,
+        slack_ns,
+        waker,
+    );
+}
+
+/// [`arm_park_timer`] on a named clock's base (`expires_ns` in that clock).
+fn arm_park_timer_on(
+    handle: &mut Option<narf_scheduler::narf_time::hrtimer::SleepHandle>,
+    clock: narf_scheduler::narf_time::hrtimer::ClockId,
+    expires_ns: u64,
+    slack_ns: u64,
+    waker: &core::task::Waker,
+) {
     use narf_scheduler::narf_time::hrtimer::{HrtimerMode, SleepHandle};
-    match handle.as_ref() {
-        Some(h) => h.start(expires_ns, slack_ns, HrtimerMode::ABS, waker),
-        None => *handle = Some(SleepHandle::arm(expires_ns, slack_ns, waker)),
+    if handle.as_ref().is_some_and(|h| h.timer().clock() != clock) {
+        // A sleeper's clock is fixed at setup; a park on another clock gets
+        // a fresh one (the old one is cancelled as it drops).
+        *handle = None;
     }
+    let h = handle.get_or_insert_with(|| SleepHandle::new(clock));
+    h.start(expires_ns, slack_ns, HrtimerMode::ABS, waker);
+}
+
+/// Record that the park deadline `mono_deadline_ns` stands for the absolute
+/// CLOCK_REALTIME expiry `realtime_ns` (absolute `clock_nanosleep`,
+/// `FUTEX_CLOCK_REALTIME` waits). The park then runs its timer on the
+/// REALTIME base, so a clock step (`clock_was_set`) moves it, as in Linux.
+pub(crate) fn note_realtime_park(uc: &UserTaskCtx, mono_deadline_ns: u64, realtime_ns: u64) {
+    uc.sleep_realtime_ns.store(realtime_ns, Ordering::Release);
+    uc.sleep_realtime_mono_ns
+        .store(mono_deadline_ns, Ordering::Release);
+}
+
+/// The clock and expiry a park with deadline `deadline` (monotonic ns) runs
+/// its timer on. A deadline recorded by [`note_realtime_park`] is
+/// re-derived from its wall-clock expiry against the current wall offset —
+/// and `sleep_deadline_ns` updated — so every reader sees the moved
+/// deadline after a clock step. Any other deadline is monotonic.
+fn park_timer_target(
+    uc: &UserTaskCtx,
+    deadline: u64,
+) -> (narf_scheduler::narf_time::hrtimer::ClockId, u64, u64) {
+    use narf_scheduler::narf_time::hrtimer::ClockId;
+    let realtime = uc.sleep_realtime_ns.load(Ordering::Acquire);
+    if realtime == 0
+        || deadline == u64::MAX
+        || uc.sleep_realtime_mono_ns.load(Ordering::Acquire) != deadline
+    {
+        return (ClockId::Monotonic, deadline, deadline);
+    }
+    let offset = narf_scheduler::narf_time::wall_offset_ns();
+    let mono = (realtime as i128 - offset as i128).clamp(1, (u64::MAX - 1) as i128) as u64;
+    if mono != deadline
+        && uc
+            .sleep_deadline_ns
+            .compare_exchange(deadline, mono, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        uc.sleep_realtime_mono_ns.store(mono, Ordering::Release);
+    }
+    (ClockId::Realtime, realtime, mono)
 }
 
 /// Per-task context the polling routine installs in
@@ -128,6 +188,12 @@ pub struct UserTaskCtx {
     pub timer_slack_ns: AtomicU64,
     /// `current->default_timer_slack_ns`: what `PR_SET_TIMERSLACK(0)` restores.
     pub default_timer_slack_ns: AtomicU64,
+    /// Absolute CLOCK_REALTIME expiry of the current park, valid while
+    /// `sleep_realtime_mono_ns == sleep_deadline_ns` (see
+    /// `note_realtime_park`); 0 = none.
+    pub sleep_realtime_ns: AtomicU64,
+    /// The monotonic park deadline `sleep_realtime_ns` was converted to.
+    pub sleep_realtime_mono_ns: AtomicU64,
     /// Set true by `sys_epoll_wait`/`sys_poll` while parked so the
     /// poll routine registers this task's waker in the net-readiness
     /// table (`crate::handlers::register_io_waiter`). When inbound TCP
@@ -825,6 +891,8 @@ impl UserTaskCtx {
             sleep_deadline_ns: AtomicU64::new(0),
             timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
+            sleep_realtime_ns: AtomicU64::new(0),
+            sleep_realtime_mono_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
             durable_io_wait: AtomicBool::new(false),
             sem_wait_pending: AtomicBool::new(false),
@@ -1233,6 +1301,49 @@ mod current_user_task_source_tests {
     );
 }
 
+#[cfg(feature = "kernel-test")]
+mod realtime_park_tests {
+    use super::{note_realtime_park, park_timer_target, UserTaskCtx};
+    use core::sync::atomic::Ordering;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_scheduler::narf_time::hrtimer::ClockId;
+
+    /// An absolute CLOCK_REALTIME park (`clock_nanosleep(TIMER_ABSTIME)`,
+    /// `FUTEX_CLOCK_REALTIME`) runs its timer on the REALTIME base at the
+    /// wall-clock expiry, and its monotonic deadline follows a clock step,
+    /// as Linux's REALTIME hrtimer sleeper does. A monotonic park is
+    /// untouched by the step.
+    fn smoke_realtime_park_follows_clock_step() -> TestResult {
+        const STEP: i64 = 5_000_000_000;
+        let uc = UserTaskCtx::new();
+        let saved = narf_scheduler::narf_time::wall_offset_ns();
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        let realtime = (now as i64 + saved + 60_000_000_000) as u64;
+        let mono = (realtime as i64 - saved) as u64;
+        note_realtime_park(&uc, mono, realtime);
+        uc.sleep_deadline_ns.store(mono, Ordering::Release);
+        let before = park_timer_target(&uc, mono);
+        // settimeofday +5 s: the wall-clock expiry is 5 s of monotonic time
+        // nearer.
+        narf_scheduler::narf_time::set_wall_offset_uncapped(saved + STEP);
+        let after = park_timer_target(&uc, mono);
+        let stored = uc.sleep_deadline_ns.load(Ordering::Acquire);
+        let plain = park_timer_target(&uc, now + 1_000);
+        narf_scheduler::narf_time::set_wall_offset_uncapped(saved);
+        if before != (ClockId::Realtime, realtime, mono) {
+            return TestResult::Fail("a REALTIME park did not run on the REALTIME base");
+        }
+        if after.2 != mono - STEP as u64 || stored != after.2 {
+            return TestResult::Fail("a clock step did not move a REALTIME park's deadline");
+        }
+        if plain != (ClockId::Monotonic, now + 1_000, now + 1_000) {
+            return TestResult::Fail("a monotonic park was treated as a REALTIME one");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace/process", smoke_realtime_park_follows_clock_step);
+}
+
 // ── Per-task-own-stack syscall park ─────────────────────────────────
 //
 // In the own-stack model a blocking syscall does NOT longjmp back to the
@@ -1359,7 +1470,10 @@ fn park_should_block(
     }
 
     // Deadline-based park (sleep / nanosleep / pause / blocking poll·epoll·futex).
-    let deadline = uc.sleep_deadline_ns.load(Ordering::Acquire);
+    // A wall-clock (REALTIME) deadline is re-derived against the current
+    // wall offset first, so a clock step since the last evaluation counts.
+    let (park_clock, park_expiry, deadline) =
+        park_timer_target(uc, uc.sleep_deadline_ns.load(Ordering::Acquire));
     // Infinite SysV semaphore waits have a durable queue-local waker and no
     // timer. Keep their hot handoff out of the generic I/O/futex/flock/timer
     // decision tree while preserving the same signal arm-then-recheck rule.
@@ -1633,7 +1747,17 @@ fn park_should_block(
             // (re)arm this park's hrtimer sleeper on this CPU's base. Re-arming
             // the same sleeper on every park keeps its expiry current (a futex
             // park broken by its gen guard re-parks here with a new deadline).
-            arm_park_timer(sleep_handle, fire_ns, uc.timer_slack(), waker);
+            if park_clock == narf_scheduler::narf_time::hrtimer::ClockId::Monotonic {
+                arm_park_timer(sleep_handle, fire_ns, uc.timer_slack(), waker);
+            } else {
+                arm_park_timer_on(
+                    sleep_handle,
+                    park_clock,
+                    park_expiry,
+                    uc.timer_slack(),
+                    waker,
+                );
+            }
             if uc.net_io_wait.load(Ordering::Acquire) {
                 #[cfg(feature = "syscall-trace")]
                 crate::syscall::syscall_trace_account_park(
@@ -2757,7 +2881,11 @@ impl core::future::Future for UserTaskFuture {
         // then return Pending. The scale is tuned for ~1 ms per
         // park iteration: short enough not to perturb other tasks,
         // long enough to keep heap pressure flat.
-        let deadline = this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire);
+        // A wall-clock (REALTIME) park deadline is re-derived first.
+        let (park_clock, park_expiry, deadline) = park_timer_target(
+            &this.task.uctx,
+            this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire),
+        );
         if deadline != 0 {
             // Watchdog liveness signal (see `UserTaskCtx::dbg_park_checks`).
             this.task
@@ -2981,7 +3109,17 @@ impl core::future::Future for UserTaskFuture {
                 // timeout, and the check→register race is closed above.
                 let fire_ns = deadline;
                 let slack = this.task.uctx.timer_slack();
-                arm_park_timer(&mut this.sleep_handle, fire_ns, slack, cx.waker());
+                if park_clock == narf_scheduler::narf_time::hrtimer::ClockId::Monotonic {
+                    arm_park_timer(&mut this.sleep_handle, fire_ns, slack, cx.waker());
+                } else {
+                    arm_park_timer_on(
+                        &mut this.sleep_handle,
+                        park_clock,
+                        park_expiry,
+                        slack,
+                        cx.waker(),
+                    );
+                }
                 if !narf_scheduler::narf_time::hrtimer::arm_callback_installed() {
                     // No clockevent programmer: self-wake so the task still
                     // makes progress (degraded, never wedged).

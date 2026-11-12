@@ -1138,8 +1138,14 @@ fn nanosleep_common(
         // An absolute CLOCK_REALTIME expiry is wall time: the park runs on
         // the monotonic clock, so convert through the current wall offset.
         None if absolute && clockid == CLOCK_REALTIME => {
-            let offset = narf_scheduler::narf_time::wall_offset_ns();
-            (target_ns as i128 - offset as i128).clamp(0, u64::MAX as i128) as u64
+            let mono = realtime_to_mono(target_ns);
+            // The sleep's timer runs on the REALTIME base, so a clock step
+            // moves it (`hrtimer_nanosleep` on CLOCK_REALTIME).
+            if let Some(uc) = crate::user_task::current_user_task() {
+                // SAFETY: the running task's live ctx; atomics only.
+                crate::user_task::note_realtime_park(unsafe { &*uc }, mono, target_ns.max(1));
+            }
+            mono
         }
         None if absolute => target_ns,
         None => now.saturating_add(target_ns),
@@ -1156,7 +1162,20 @@ fn nanosleep_common(
             // SAFETY: the in-flight task's poller-pinned ctx, live for this
             // trap; the own-stack park returns here when the sleep ends.
             let uc = unsafe { &*uctx };
-            nanosleep_block(ctx, uc, deadline, req_ptr, rem_ptr, absolute);
+            let realtime_target = if absolute && clockid == CLOCK_REALTIME {
+                target_ns.max(1)
+            } else {
+                0
+            };
+            nanosleep_block(
+                ctx,
+                uc,
+                deadline,
+                req_ptr,
+                rem_ptr,
+                absolute,
+                realtime_target,
+            );
             return;
         }
     }
@@ -1218,6 +1237,12 @@ fn nanosleep_common(
 ///
 /// Only a signal this thread can take ends the sleep early: the park loop
 /// re-parks on a blocked one, and an ignored one is discarded when sent.
+/// The monotonic time at which wall time reaches `realtime_ns`.
+fn realtime_to_mono(realtime_ns: u64) -> u64 {
+    let offset = narf_scheduler::narf_time::wall_offset_ns();
+    (realtime_ns as i128 - offset as i128).clamp(0, u64::MAX as i128) as u64
+}
+
 fn nanosleep_block(
     ctx: &mut dyn TrapContext,
     uc: &crate::user_task::UserTaskCtx,
@@ -1225,9 +1250,17 @@ fn nanosleep_block(
     req_ptr: u64,
     rem_ptr: u64,
     absolute: bool,
+    // Absolute CLOCK_REALTIME expiry (0 = none): the deadline follows clock
+    // steps, re-derived from it on every pass.
+    realtime_target: u64,
 ) {
     let task = current_task_id();
+    let mut deadline = deadline;
     loop {
+        if realtime_target != 0 {
+            deadline = realtime_to_mono(realtime_target);
+            crate::user_task::note_realtime_park(uc, deadline, realtime_target);
+        }
         uc.sleep_deadline_ns.store(deadline, Ordering::Release);
         // SAFETY: `uc` is this task's live ctx; the saved frame is what the
         // own-stack park resumes from.
@@ -1237,6 +1270,9 @@ fn nanosleep_block(
         }
         crate::handlers::own_stack_block(ctx);
         uc.sleep_deadline_ns.store(0, Ordering::Release);
+        if realtime_target != 0 {
+            deadline = realtime_to_mono(realtime_target);
+        }
         let now = narf_scheduler::narf_time::monotonic_ns();
         if now >= deadline {
             ctx.set_return(SyscallReturn::ok(0));

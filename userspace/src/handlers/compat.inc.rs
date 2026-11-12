@@ -9792,13 +9792,18 @@ fn futex_timeout_deadline(
     }
     let wall_now = narf_scheduler::narf_time::now_wall().as_nanos();
     let remaining = i128::from(requested).saturating_sub(wall_now);
-    if remaining <= 0 {
-        Ok(Some(monotonic_now))
+    let deadline = if remaining <= 0 {
+        monotonic_now
     } else {
-        Ok(Some(monotonic_now.saturating_add(
-            u64::try_from(remaining).unwrap_or(u64::MAX),
-        )))
+        monotonic_now.saturating_add(u64::try_from(remaining).unwrap_or(u64::MAX))
+    };
+    // The wait's timer runs on the REALTIME base so a clock step moves it
+    // (`futex_setup_timer` with `CLOCK_REALTIME`).
+    if let Some(uc) = crate::user_task::current_user_task() {
+        // SAFETY: the running task's live ctx; atomics only.
+        crate::user_task::note_realtime_park(unsafe { &*uc }, deadline, requested.max(1));
     }
+    Ok(Some(deadline))
 }
 
 /// Perform `FUTEX_WAKE_OP` (Linux `kernel/futex/core.c::futex_wake_op`).
