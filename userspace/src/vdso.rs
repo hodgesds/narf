@@ -61,6 +61,8 @@ const VVAR_CPNS: usize = 4; // u32
 const VVAR_OFF: usize = 8; // i64
 const VVAR_MULT: usize = 16; // u32 — cycles→ns fixed-point multiplier
 const VVAR_SHIFT: usize = 20; // u32 — cycles→ns fixed-point shift
+const VVAR_SUSPENDED: usize = 24; // u64 — counter cycles spent suspended
+const VVAR_BOOT_OFF: usize = 32; // u64 — offs_boot: BOOTTIME − MONOTONIC (ns)
 
 struct VdsoImage {
     vvar_frame: PhysAddr,
@@ -134,6 +136,14 @@ pub fn register_vdso_image(bytes: &[u8], cycles_per_ns: u32) {
         vvar_frame: vvar,
         vdso_frames: frames,
     });
+    // Every clock step or resume (`clock_was_set`) republishes the clock
+    // data: the wall offset, the suspend offset and `offs_boot`.
+    narf_scheduler::narf_time::hrtimer::set_clock_was_set_notifier(republish);
+}
+
+/// `clock_was_set` notifier: republish the current clock data.
+fn republish() {
+    update_wall_offset(narf_scheduler::narf_time::wall_offset_ns());
 }
 
 /// Publish a new realtime offset (called from `clock_settime`). Seqlock-
@@ -229,6 +239,14 @@ fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
         core::ptr::write_volatile(base.add(VVAR_OFF) as *mut i64, offset_ns);
         core::ptr::write_volatile(base.add(VVAR_MULT) as *mut u32, mult);
         core::ptr::write_volatile(base.add(VVAR_SHIFT) as *mut u32, shift);
+        core::ptr::write_volatile(
+            base.add(VVAR_SUSPENDED) as *mut u64,
+            narf_scheduler::narf_time::suspended_cycles(),
+        );
+        core::ptr::write_volatile(
+            base.add(VVAR_BOOT_OFF) as *mut u64,
+            narf_scheduler::narf_time::boot_offset_ns(),
+        );
         fence(Ordering::Release);
         core::ptr::write_volatile(seq_ptr, (seq | 1).wrapping_add(1)); // even
     }

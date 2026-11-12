@@ -36,8 +36,9 @@
 //!
 //! Time unit: nanoseconds of the timer's clock (`ktime_t`). MONOTONIC is
 //! [`crate::monotonic_ns`]; REALTIME and TAI are MONOTONIC plus the wall
-//! offset (TAI adds the NTP TAI offset); BOOTTIME is MONOTONIC (NARF has no
-//! suspend offset yet). The clockevent hook takes TSC/counter cycles.
+//! offset (TAI adds the NTP TAI offset); BOOTTIME is MONOTONIC plus the time
+//! spent suspended (`offs_boot`). The clockevent hook takes monotonic counter
+//! cycles; a clockevent that compares against the raw counter converts.
 //!
 //! Lock order: a CPU base lock is never held while another CPU base lock is
 //! taken (`switch_hrtimer_base` releases the old base before it locks the new
@@ -457,7 +458,9 @@ fn tick_program_event(deadline_ns: Ktime) {
     f(ns_to_deadline_cycles(deadline_ns));
 }
 
-/// Cycle count at which `ns` of monotonic time has certainly passed.
+/// Monotonic cycle count at which `ns` of monotonic time has certainly
+/// passed. Clockevents that compare against the raw counter convert with
+/// [`crate::mono_to_raw_cycles`].
 #[inline]
 pub fn ns_to_deadline_cycles(ns: Ktime) -> u64 {
     if ns == KTIME_MAX {
@@ -505,6 +508,7 @@ pub fn set_tai_offset_ns(off: u64) {
 fn base_offset(index: usize) -> i64 {
     match index % HRTIMER_BASE_SOFT {
         1 => crate::wall_offset_ns(),
+        2 => crate::boot_offset_ns() as i64,
         3 => crate::wall_offset_ns().saturating_add(TAI_OFFSET_NS.load(Ordering::Relaxed) as i64),
         _ => 0,
     }
@@ -994,8 +998,27 @@ pub fn retrigger_next_event() {
     let _ = next;
 }
 
-/// `clock_was_set`: REALTIME/TAI offsets changed; every CPU re-evaluates.
+static CLOCK_WAS_SET_NOTIFIER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the hook `clock_was_set` runs after the bases are re-evaluated
+/// (the vDSO republishes its clock data from it).
+pub fn set_clock_was_set_notifier(f: fn()) {
+    CLOCK_WAS_SET_NOTIFIER.store(f as usize, Ordering::Release);
+}
+
+/// `clock_was_set`: REALTIME/TAI/BOOTTIME offsets changed; every CPU
+/// re-evaluates its bases.
 pub fn clock_was_set() {
+    clock_was_set_bases();
+    let raw = CLOCK_WAS_SET_NOTIFIER.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: only `fn()` values are stored by the setter.
+        let f: fn() = unsafe { core::mem::transmute(raw) };
+        f();
+    }
+}
+
+fn clock_was_set_bases() {
     let me = this_cpu();
     for cpu in 0..MAX_CPUS {
         let Some(base) = cpu_base(cpu) else { continue };

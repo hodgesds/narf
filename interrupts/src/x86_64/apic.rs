@@ -399,13 +399,17 @@ pub struct LapicClockEvent;
 
 impl narf_time::clockevent::ClockEvent for LapicClockEvent {
     fn set_idle_tick(&self, stop_tick: bool, budget_deadline: Option<u64>) -> bool {
+        // The TSC-deadline MSR compares against the raw counter; scheduler
+        // and hrtimer deadlines are monotonic counter time (which excludes
+        // time spent suspended). Convert at this boundary.
+        let budget_deadline = budget_deadline.map(narf_time::mono_to_raw_cycles);
         let enabled = narf_arch::interrupts_enabled();
         // SAFETY: serialize the local deadline registers with the timer ISR.
         unsafe { narf_arch::disable_interrupts() };
         let cpu = tsc_cpu();
         let period = TSC_DEADLINE_PERIOD_CYCLES[cpu].load(Ordering::Relaxed);
         if period != 0 {
-            let now = narf_time::now_cycles();
+            let now = narf_time::raw_cycles();
             let was_stopped = !narf_time::periodic_tick_wanted(cpu);
             narf_time::set_periodic_tick_wanted(cpu, !stop_tick);
             if !stop_tick && was_stopped {
@@ -419,7 +423,8 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
             };
             // This CPU's own next hrtimer event (`tick_nohz_stop_tick` →
             // `hrtimer_get_next_event`); every CPU carries its own.
-            let wheel = narf_time::hrtimer::next_event_cycles_local();
+            let wheel =
+                narf_time::hrtimer::next_event_cycles_local().map(narf_time::mono_to_raw_cycles);
             let target = next_arm_target(
                 now,
                 periodic.min(budget_deadline.unwrap_or(u64::MAX)),
@@ -1106,7 +1111,8 @@ pub fn on_timer_tick() {
     // carries only its own base, so a stuck CPU delays only its own timers)
     // and learn its next event. Expiry retires the due timers here, so the
     // re-arm below never lands on an already-past event (no re-fire storm).
-    let next_hrtimer = narf_time::hrtimer::hrtimer_interrupt();
+    // Monotonic → raw counter time for the TSC-deadline MSR.
+    let next_hrtimer = narf_time::mono_to_raw_cycles(narf_time::hrtimer::hrtimer_interrupt());
     let wheel_earliest = (next_hrtimer != u64::MAX).then_some(next_hrtimer);
     let scheduler =
         pending_scheduler_deadline(now, TSC_SCHED_DEADLINE[cpu].load(Ordering::Relaxed));
@@ -1268,6 +1274,8 @@ pub(crate) const fn should_rearm_tsc_deadline(
 /// interleave. `hrtimer_event` false = a scheduler budget deadline, which is
 /// also recorded so it survives an earlier interrupt.
 fn arm_tsc_deadline(deadline_cycles: u64, hrtimer_event: bool) {
+    // Callers pass monotonic counter time; the MSR compares the raw counter.
+    let deadline_cycles = narf_time::mono_to_raw_cycles(deadline_cycles);
     // IRQs are masked across the whole RCW below (see the disable/enable
     // pair), so `tsc_cpu()` is stable — we can't migrate mid-function — and
     // the per-CPU `TSC_ARMED`/MSR we read, compare, and write all belong to

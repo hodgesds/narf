@@ -39,8 +39,13 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
             let w = narf_scheduler::narf_time::now_wall();
             (w.secs, w.nanos as i64)
         }
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
             let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
+            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+        }
+        // CLOCK_BOOTTIME counts time spent suspended (`offs_boot`).
+        CLOCK_BOOTTIME => {
+            let ns: u64 = narf_scheduler::narf_time::boottime_ns();
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
