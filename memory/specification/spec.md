@@ -1479,6 +1479,25 @@ pub fn kfree(ptr: NonNull<u8>, size: usize, domain: DomainId);
 pub fn slab::stats() -> SlabStats;
 pub fn slab::magazine_stats() -> MagazineStats;
 
+/// Retention breakdown of one size class (frames held, live objects,
+/// magazine / central free objects, partial / empty tracked frames, legacy
+/// FIFO blocks) and of large allocations (live blocks per buddy order, vmalloc
+/// fallback). `class_detail` takes the class lock for a constant number of
+/// loads and never allocates. Rendered by `/proc/slabinfo` (Linux 2.1 format,
+/// plus `kmalloc-8k..` rows for page-backed sizes) and `/proc/narf/slab`.
+pub fn slab::class_detail(c: usize) -> ClassDetail;
+pub fn slab::large_detail() -> LargeDetail;
+pub const fn slab::magazine_tunables() -> (usize, usize);
+
+/// `kmem_cache_shrink` for the whole heap: flush this CPU's magazines, request
+/// every other CPU flush its own at its next executor maintenance tick, and
+/// return every empty tracked frame to the buddy. Sleepable, lock-free
+/// context only; never from inside an allocator call.
+pub fn slab::shrink() -> usize;
+/// `drop_slab`: run all shrinkers until a pass frees nothing, then
+/// `slab::shrink`. Backs `/proc/sys/vm/drop_caches`.
+pub fn reclaim::drop_slab() -> usize;
+
 /// Ordinary slab frames use per-frame central chains and intrusive partial /
 /// empty frame lists. Frame descriptors keep their 64-byte footprint: slab
 /// bookkeeping occupies existing padding independently of COW and pin atomics.
@@ -2021,7 +2040,12 @@ x86_64 is rejected at runtime.
   from that finite snapshot and new frees append after it, so producers cannot
   extend a pass. Partial candidates remain private across bounded visits and
   return to the queue in O(1) after one snapshot; a complete candidate detaches
-  exactly one frame. The old whole-list address sort is forbidden. The slab
+  exactly one frame. The old whole-list address sort is forbidden. A size
+  class keeps at most SLUB's `min_partial` (`clamp(ilog2(size)/2, 5, 10)`)
+  empty tracked frames: a dealloc spill that leaves more only sets a flag
+  (the dealloc path never calls the buddy), and the executor maintenance
+  point returns the excess. Remote magazines are flushed only by their own
+  CPU at that point, on a `slab::shrink` generation request. The slab
   updates class ownership under the class lock, then releases that lock before
   buddy return, cgroup uncharge, or any callback that can re-enter the
   allocator. The negative cgroup uncharge path reached during final-owner
