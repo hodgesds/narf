@@ -482,6 +482,58 @@ fn note_double_free() {
     DOUBLE_FREES_REFUSED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// A free refused because the frame's state says it cannot be freed as asked
+/// (Linux `bad_page`): count it, and report the first few on the console with
+/// the frame, the order and the reason. The memory stays with whoever holds
+/// it — never on a free list twice.
+#[cold]
+fn note_refused_free(frame: u64, order: u8, refusal: buddy::FreeRefusal) {
+    note_double_free();
+    const REPORT_LIMIT: u64 = 16;
+    static REPORTS: AtomicU64 = AtomicU64::new(0);
+    if REPORTS.fetch_add(1, Ordering::Relaxed) >= REPORT_LIMIT {
+        return;
+    }
+    let mut buf = ReportBuf {
+        bytes: [0; 1536],
+        len: 0,
+    };
+    let held = match refusal {
+        buddy::FreeRefusal::OrderMismatch(held) => held,
+        _ => order,
+    };
+    let _ = fmt::Write::write_fmt(
+        &mut buf,
+        format_args!(
+            "frame: refused free of phys {:#x} order {order}: {} (held order {held})\n",
+            frame << PAGE_SHIFT,
+            refusal.describe(),
+        ),
+    );
+    #[cfg(feature = "frame-alloc-audit")]
+    {
+        if let Some((allocated, alloc_site, free_site)) =
+            buddy::frame_audit_state(PhysAddr::new(frame << PAGE_SHIFT))
+        {
+            let _ = fmt::Write::write_fmt(
+                &mut buf,
+                format_args!(
+                    "frame:   audit: allocated {allocated}, alloc site {}:{}, last free {}:{}\n",
+                    alloc_site.0, alloc_site.1, free_site.0, free_site.1,
+                ),
+            );
+        }
+    }
+    console_write(&buf.bytes[..buf.len]);
+}
+
+/// Turn a live order-`order` block into `2^order` order-0 frames that may be
+/// freed one at a time (Linux `split_page`). `false`, changing nothing, when
+/// `frame` does not head a live block of that order.
+pub fn split_block(frame: PhysFrame, order: u8) -> bool {
+    FRAME_INDEX.split_allocated(buddy::frame_no(frame), order)
+}
+
 // ── Per-CPU frame caches ────────────────────────────────────────────────
 //
 // Each CPU keeps, per NUMA node, a list of free order-0 frames and a list of
@@ -1205,6 +1257,10 @@ pub fn reserve_for_slab_promotion() {
         let end = start.saturating_add(len).saturating_add(PAGE_SIZE - 1) >> PAGE_SHIFT;
         cover_frames_with_state(first, end.saturating_sub(first), None);
     }
+    // Every frame not on a free list now is allocated with an order nobody
+    // recorded: mark them all, then let each zone write its free blocks'
+    // words (and clear their interiors) over that.
+    FRAME_INDEX.fill(buddy::STATE_LEGACY);
     for (node, zone) in ZONES.iter().enumerate() {
         zone.0.lock().enable_index(&FRAME_INDEX, node);
     }
@@ -2065,6 +2121,7 @@ fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
     // An allocation interrupts a streak of frees (Linux `rmqueue_pcplist`).
     local.free_count >>= 1;
     if let Some(frame) = cache_list_pop(&mut local.frames) {
+        FRAME_INDEX.mark_allocated(frame, 0);
         local.count -= 1;
         FRAME_CACHE_FREE[node].fetch_sub(1, Ordering::Relaxed);
         account_allocated_frames(node, 1);
@@ -2089,9 +2146,11 @@ fn alloc_order0_on(node: usize) -> Option<PhysFrame> {
             break;
         };
         let frame = buddy::frame_no(extra);
-        let linked = FRAME_INDEX
-            .slot(frame)
-            .is_some_and(|word| cache_list_push(&mut local.frames, frame, word));
+        // The zone marked it allocated; it is free again, in this cache.
+        let linked = FRAME_INDEX.slot(frame).is_some_and(|word| {
+            word.store(0, Ordering::Relaxed);
+            cache_list_push(&mut local.frames, frame, word)
+        });
         if !linked {
             // No state word to link it through (no index section covers the
             // frame), so it cannot be cached: hand it straight back and
@@ -2140,7 +2199,8 @@ enum CacheFree {
     /// Not cacheable — caching is off for the node, or the frame has no
     /// state word. The caller returns it directly to the node's zone.
     Declined,
-    /// The frame is already free: a double free, dropped and counted.
+    /// The free was refused (already free, a tail, not allocated, wrong
+    /// order): dropped, counted and reported.
     AlreadyFree,
 }
 
@@ -2304,8 +2364,8 @@ fn free_order0_to_cache(node: usize, frame: u64) -> CacheFree {
     buddy::audit_cached_free(frame);
     // Checked before any trim: a trim could move the earlier copy of a
     // doubly-freed frame out of this cache and make it unrecognisable.
-    if word.load(Ordering::Relaxed) != 0 {
-        note_double_free();
+    if let Err(refusal) = FRAME_INDEX.claim_free(frame, 0) {
+        note_refused_free(frame, 0, refusal);
         return CacheFree::AlreadyFree;
     }
     cache_make_room(local, node, 1, false);
@@ -2329,6 +2389,7 @@ fn alloc_cached_pair(node: usize) -> Option<PhysFrame> {
     }
     let local = &mut cache.nodes[node];
     let frame = cache_list_pop(&mut local.pairs)?;
+    FRAME_INDEX.mark_allocated(frame, 1);
     local.pair_count -= 1;
     local.count -= 2;
     local.free_count >>= 1;
@@ -2349,7 +2410,7 @@ fn free_pair_to_cache(node: usize, frame: u64) -> CacheFree {
     if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) || frame_cache_bypassed(node) {
         return CacheFree::Declined;
     }
-    let (Some(word), Some(second)) = (FRAME_INDEX.slot(frame), FRAME_INDEX.slot(frame + 1)) else {
+    let (Some(word), Some(_)) = (FRAME_INDEX.slot(frame), FRAME_INDEX.slot(frame + 1)) else {
         return CacheFree::Declined;
     };
     let cpu = current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
@@ -2360,10 +2421,10 @@ fn free_pair_to_cache(node: usize, frame: u64) -> CacheFree {
     let local = &mut cache.nodes[node];
     buddy::audit_cached_free(frame);
     buddy::audit_cached_free(frame + 1);
-    // The block is linked through its first frame; its second frame must not
-    // be free on its own either. Checked before any trim, as for a base page.
-    if word.load(Ordering::Relaxed) != 0 || second.load(Ordering::Relaxed) != 0 {
-        note_double_free();
+    // The block must be a live order-1 block, freed by its head; claiming it
+    // clears both words. Checked before any trim, as for a base page.
+    if let Err(refusal) = FRAME_INDEX.claim_free(frame, 1) {
+        note_refused_free(frame, 1, refusal);
         return CacheFree::AlreadyFree;
     }
     cache_make_room(local, node, 2, true);
@@ -2398,10 +2459,9 @@ fn free_order0_chunk_direct(node: usize, frames: &[u64]) -> usize {
     let mut zone = lock_zone(node);
     let mut freed = 0usize;
     for &frame in frames {
-        if zone.try_free_mt(frame, 0, buddy::MigrateType::Unmovable) {
-            freed += 1;
-        } else {
-            note_double_free();
+        match zone.try_free_checked(frame, 0, buddy::MigrateType::Unmovable) {
+            Ok(()) => freed += 1,
+            Err(refusal) => note_refused_free(frame, 0, refusal),
         }
     }
     freed
@@ -2455,10 +2515,13 @@ fn free_order0_chunk_to_zone(node: usize, frames: &[u64]) -> usize {
             continue;
         };
         buddy::audit_cached_free(frame);
-        if cache_list_push(&mut local.frames, frame, word) {
-            cached += 1;
-        } else {
-            note_double_free();
+        match FRAME_INDEX.claim_free(frame, 0) {
+            Ok(()) => {
+                let linked = cache_list_push(&mut local.frames, frame, word);
+                debug_assert!(linked);
+                cached += 1;
+            }
+            Err(refusal) => note_refused_free(frame, 0, refusal),
         }
     }
     local.count += cached;
@@ -3069,13 +3132,10 @@ fn free_block(frame: PhysFrame, order: u8, mt: buddy::MigrateType) {
         CacheFree::Cached => account_freed_frames(zone_idx, 1usize << order),
         // Dropped and counted by the cache.
         CacheFree::AlreadyFree => {}
-        CacheFree::Declined => {
-            if lock_zone(zone_idx).try_free_mt(frame_no, order, mt) {
-                account_freed_frames(zone_idx, 1usize << order);
-            } else {
-                note_double_free();
-            }
-        }
+        CacheFree::Declined => match lock_zone(zone_idx).try_free_checked(frame_no, order, mt) {
+            Ok(()) => account_freed_frames(zone_idx, 1usize << order),
+            Err(refusal) => note_refused_free(frame_no, order, refusal),
+        },
     }
 }
 
@@ -3110,6 +3170,11 @@ pub fn reserve_frame_range(base: PhysAddr, count: u64) -> bool {
     let first_frame = base.raw() >> 12;
     let removed = lock_zone(node).remove_free_range(first_frame, count);
     if removed {
+        // Handed out like allocations, one order-0 frame each: compaction
+        // frees them that way (`free_movable_range`).
+        for offset in 0..count {
+            FRAME_INDEX.mark_allocated(first_frame + offset, 0);
+        }
         // Exact-range reservation claims free pages just like allocation.
         // Compaction may publish them as live migration destinations; leaving
         // their audit bits free makes that owner's eventual release look like
@@ -3147,10 +3212,9 @@ pub fn free_movable_range(base: PhysAddr, count: u64) {
         let stop = end.min(next + FRAME_RETURN_CHUNK as u64);
         let mut zone = lock_zone(node);
         for frame in next..stop {
-            if zone.try_free_mt(frame, 0, buddy::MigrateType::Movable) {
-                freed += 1;
-            } else {
-                note_double_free();
+            match zone.try_free_checked(frame, 0, buddy::MigrateType::Movable) {
+                Ok(()) => freed += 1,
+                Err(refusal) => note_refused_free(frame, 0, refusal),
             }
         }
         drop(zone);
@@ -3265,10 +3329,9 @@ fn buddy_return_unreferenced_frame(f: PhysFrame) {
         // Dropped and counted by the cache.
         CacheFree::AlreadyFree => {}
         CacheFree::Declined => {
-            if lock_zone(zone_idx).try_free_mt(frame_no, 0, buddy::MigrateType::Unmovable) {
-                account_freed_frames(zone_idx, 1);
-            } else {
-                note_double_free();
+            match lock_zone(zone_idx).try_free_checked(frame_no, 0, buddy::MigrateType::Unmovable) {
+                Ok(()) => account_freed_frames(zone_idx, 1),
+                Err(refusal) => note_refused_free(frame_no, 0, refusal),
             }
         }
     }
@@ -6112,6 +6175,10 @@ mod scale_tests {
             return TestResult::Skip("order-10 allocation fell back to another node");
         }
         let frames = 1u64 << ORDER;
+        if !split_block(block, ORDER) {
+            free_pages(block, ORDER);
+            return TestResult::Fail("a live order-10 block could not be split");
+        }
         for index in 0..frames {
             free_pages(
                 PhysFrame::new(PhysAddr::new(base.raw() + index * PAGE_SIZE)),
@@ -6231,8 +6298,8 @@ mod scale_tests {
         });
         drain(node);
         let drained = word.load(Ordering::Relaxed);
-        if allocated != 0 {
-            return TestResult::Fail("an allocated frame's state word is not empty");
+        if allocated != buddy::alloc_head_state(0) {
+            return TestResult::Fail("an allocated frame's state word does not say order-0 head");
         }
         if bypassed {
             return TestResult::Skip("a drain bypassed the frame cache during the test");
@@ -6354,6 +6421,10 @@ mod scale_tests {
             return TestResult::Skip("order-1 allocation fell back to another NUMA node");
         }
         let second = PhysFrame::new(PhysAddr::new(base.raw() + PAGE_SIZE));
+        if !split_block(pair, 1) {
+            free_pages(pair, 1);
+            return TestResult::Fail("a live order-1 block could not be split");
+        }
         let accepted_again = with_node_cache_bypassed(node, || {
             free_pages(pair, 0);
             let accepted = lock_zone(node).try_free_mt(
