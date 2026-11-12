@@ -23,13 +23,23 @@ handling (drivers do that after the dispatch).
 ## 3. Public interface
 
 The x86 TSC-deadline clockevent implements local tickless idle through
-`ClockEvent::set_idle_tick`. Periodic, wheel and scheduler budget deadlines are
-tracked independently; an earlier wheel IRQ cannot discard a later budget
+`ClockEvent::set_idle_tick`. Periodic, hrtimer and scheduler budget deadlines
+are tracked independently; an earlier hrtimer IRQ cannot discard a later budget
 expiry/replenishment. With no pending deadline, IA32_TSC_DEADLINE is disarmed
 with zero. Restarting execution restores a future periodic deadline. The
-InitialCount backend retains its periodic tick. Wheel ownership remains one
-CPU per global minimum. Local timer transitions serialize against their ISR
-with IRQ masking and restore the caller's original IRQ state.
+InitialCount backend retains its periodic tick and runs the low-resolution
+`hrtimer_run_queues` from it. Every CPU's clockevent carries its own hrtimer
+base's next event (`time/` §3.2.1): the timer interrupt calls
+`narf_time::hrtimer::hrtimer_interrupt()`, and `arm_hrtimer_event` is the
+`tick_program_event` behind the base's arm callback. The reschedule IPI
+(`VECTOR_RESCHED`; aarch64 has no tickless idle and needs none) runs
+`hrtimer::retrigger_next_event`, which re-programs the local clockevent when a
+remote CPU queued an earlier timer on this CPU's base. The HPET fallback pump
+expires every CPU's base (`hrtimer_run_all_bases`) and is armed for the
+earliest event of any base. The aarch64 generic timer runs
+`hrtimer_interrupt` each tick and re-arms for `min(period, next event)`. Local
+timer transitions serialize against their ISR with IRQ masking and restore the
+caller's original IRQ state.
 
 ```rust
 pub fn register_irq(n: IrqNum, target: IrqTarget, domain: DomainId);
@@ -280,6 +290,12 @@ way before it offers a wake-capable sleep state.
 ## 4. Invariants & safety properties
 
 - Every IRQ has exactly one `target` at any time.
+- A CPU's timer interrupt expires only that CPU's hrtimer base (the HPET
+  fallback, a global comparator, expires all). Expiry callbacks run in this
+  IRQ context with no base lock held and wake by reference: no allocation and
+  no free happen in the timer interrupt. The reschedule-IPI handler only
+  re-programs the local clockevent, and only when a remote enqueue set the
+  base's retrigger flag before sending it.
 - UIPI targets carry a domain id; kernel programs UITT so hardware
   delivers only inside that domain.
 - EOI is always issued, even on spurious; missed EOI panics with a
