@@ -16,24 +16,30 @@ use narf_filesystem::FsError;
 use narf_memory::{RemoteAccess, RemoteBuf};
 
 /// Linux `get_task_mm(task)`: the address space `task` runs in, whether it is
-/// queued, parked or being polled on some CPU right now. A `CLONE_THREAD`
-/// sibling shares the group's mm, so any queued member answers for a member
-/// that is momentarily invisible. `None` for a task without one (a kernel
-/// task, or one whose mm is already torn down — Linux's `PF_EXITING`).
-pub(crate) fn task_mm(task: u64) -> Option<Arc<AddressSpace>> {
+/// queued, parked or being polled on some CPU right now, with a user
+/// reference (`mmget`) held for as long as the caller keeps the result. A
+/// `CLONE_THREAD` sibling shares the group's mm, so any queued member answers
+/// for a member that is momentarily invisible. `None` for a task without one
+/// (a kernel task), or whose mm has lost its last user — exiting or exited,
+/// its `exit_mmap` run or running (`mmget_not_zero` failed: Linux's
+/// `PF_EXITING`).
+pub(crate) fn task_mm(task: u64) -> Option<narf_memory::MmUser> {
     // CLONE_THREAD implies CLONE_VM: every thread of the caller's own
     // process runs in the caller's mm.
-    if same_thread_group(task, current_task_id()) {
-        return current_address_space();
-    }
-    if let Some(mm) = narf_scheduler::address_space_of_live(narf_scheduler::TaskId(task)) {
-        return Some(mm);
-    }
-    let pid = task_to_pid_raw(task)?;
-    crate::task::thread_group_tids(pid)
-        .into_iter()
-        .filter(|&member| member != task)
-        .find_map(|member| narf_scheduler::address_space_of_live(narf_scheduler::TaskId(member)))
+    let mm = if same_thread_group(task, current_task_id()) {
+        current_address_space()
+    } else {
+        narf_scheduler::address_space_of_live(narf_scheduler::TaskId(task)).or_else(|| {
+            let pid = task_to_pid_raw(task)?;
+            crate::task::thread_group_tids(pid)
+                .into_iter()
+                .filter(|&member| member != task)
+                .find_map(|member| {
+                    narf_scheduler::address_space_of_live(narf_scheduler::TaskId(member))
+                })
+        })
+    }?;
+    mm.mmget_not_zero()
 }
 
 /// `kernel/ptrace.c::ptrace_access_vm(tsk, addr, buf, len, gup_flags)` for
@@ -70,9 +76,9 @@ pub(crate) fn ptrace_access_vm(tracer: u64, tracee: u64, addr: u64, buf: RemoteB
         // `__access_remote_vm` expands a stack VMA under `current`'s limits.
         expand_stack: Some(current_stack_growth_limits()),
     };
-    // SAFETY: `mm` is a live user address space (the Arc retains it); the
-    // remote helper faults pages in and breaks COW through the same paths
-    // the owner's own faults take.
+    // SAFETY: `mm` is a live user address space whose user reference keeps
+    // `exit_mmap` from starting; the remote helper faults pages in and breaks
+    // COW through the same paths the owner's own faults take.
     unsafe { mm.access_remote(addr, buf, access) }
 }
 
@@ -323,7 +329,7 @@ pub(crate) fn process_vm_transfer(ctx: &mut dyn TrapContext, vm_write: bool) {
         ctx.set_return(errno_ret(ESRCH));
         return;
     };
-    let own_mm = current_address_space().is_some_and(|own| Arc::ptr_eq(&own, &mm));
+    let own_mm = current_address_space().is_some_and(|own| Arc::ptr_eq(&own, mm.arc()));
     if !own_mm && !ptrace_may_access_mode(caller, target, PtraceCreds::Real) {
         ctx.set_return(errno_ret(EPERM));
         return;
@@ -352,9 +358,10 @@ pub(crate) fn process_vm_transfer(ctx: &mut dyn TrapContext, vm_write: bool) {
 // ── /proc/<pid>/mem ──────────────────────────────────────────────────
 
 /// The mm an open `/proc/<pid>/mem` is bound to. Linux holds it with
-/// `mmgrab` (the struct survives) but not `mmget` (its memory does not):
-/// once the process exits or execs, `mmget_not_zero` fails and every access
-/// returns 0. A `Weak` is the same contract.
+/// `mmgrab` (the struct survives) but not `mmget` (its memory does not), and
+/// takes `mmget_not_zero` around each access: once the process exits or
+/// execs, that fails and every access returns 0. A `Weak` plus
+/// [`AddressSpace::mmget_not_zero`] is the same contract.
 struct ProcMemMm {
     mm: alloc::sync::Weak<AddressSpace>,
 }
@@ -366,7 +373,7 @@ impl ProcMemMm {
     /// `proc_mem_force_override` is `PROC_MEM_FORCE_ALWAYS`
     /// (`CONFIG_PROC_MEM_ALWAYS_FORCE`), so FOLL_FORCE is unconditional.
     fn rw(&self, addr: u64, buf: RemoteBuf<'_>) -> Result<usize, FsError> {
-        let Some(mm) = self.mm.upgrade() else {
+        let Some(mm) = self.mm.upgrade().and_then(|mm| mm.mmget_not_zero()) else {
             return Ok(0);
         };
         let access = RemoteAccess {
@@ -374,7 +381,8 @@ impl ProcMemMm {
             force: true,
             expand_stack: Some(current_stack_growth_limits()),
         };
-        // SAFETY: the upgraded Arc keeps the address space alive.
+        // SAFETY: the user reference keeps the address space's memory in
+        // place: `exit_mmap` cannot start until it drops.
         match unsafe { mm.access_remote(addr, buf, access) } {
             0 => Err(FsError::Io(narf_block::BlockError::IOError)),
             n => Ok(n),
@@ -403,11 +411,11 @@ pub fn proc_mem_open(pid: u64) -> Result<Arc<dyn ProcMemAccess>, FsError> {
     let caller = current_task_id();
     let task = pid_to_task_raw(pid).ok_or(FsError::NoSuchProcess)?;
     let mm = task_mm(task).ok_or(FsError::NoSuchProcess)?;
-    let own_mm = current_address_space().is_some_and(|own| Arc::ptr_eq(&own, &mm));
+    let own_mm = current_address_space().is_some_and(|own| Arc::ptr_eq(&own, mm.arc()));
     if !own_mm && !ptrace_may_access_mode(caller, task, PtraceCreds::Fs) {
         return Err(FsError::PermissionDenied);
     }
     Ok(Arc::new(ProcMemMm {
-        mm: Arc::downgrade(&mm),
+        mm: Arc::downgrade(mm.arc()),
     }))
 }
