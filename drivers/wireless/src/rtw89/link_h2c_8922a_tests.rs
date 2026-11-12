@@ -640,7 +640,10 @@ fn smoke_rtw89_link_h2c_ap_tdls_transitions() -> TestResult {
     let Some(MacidPause::Sleep(pause)) = add.pause else {
         return TestResult::Fail("SLEEP firmware must select the sleep pause body");
     };
-    if word(&pause, 0) != 0 || word(&pause, 8) != 0 || word(&pause, 4) != 1 || word(&pause, 12) != 1
+    if word(&pause[..], 0) != 0
+        || word(&pause[..], 8) != 0
+        || word(&pause[..], 4) != 1
+        || word(&pause[..], 12) != 1
     {
         return TestResult::Fail("AP link-add SLEEP unpause words wrong");
     }
@@ -653,7 +656,7 @@ fn smoke_rtw89_link_h2c_ap_tdls_transitions() -> TestResult {
     }
     // Link-remove: role REMOVE (0x200 | 0x400 | 0x4000 = 0x4600).
     match link_remove_h2cs(&view) {
-        Ok(Some(role)) if role == [0x00, 0x46, 0x00, 0x00] => {}
+        Ok(Some([0x00, 0x46, 0x00, 0x00])) => {}
         _ => return TestResult::Fail("AP link-remove role REMOVE wrong"),
     }
     // Assoc: join W0 = 3<<24 | 2<<26 | 2<<30 = 0x8B000000
