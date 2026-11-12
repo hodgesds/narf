@@ -1179,6 +1179,11 @@ pub enum IgbError {
     QueueEnableTimeout,
     QueueTooSmall,
     UnsupportedOffload,
+    /// SR-IOV bus-half failure, carrying the bus error (no SR-IOV
+    /// cap, bad VF count against TotalVFs, revoked authority…).
+    SriovBus(narf_bus::sriov::SriovError),
+    /// No probe-retained bus authority (fixture device).
+    SriovNoAuthority,
     /// Catch-all.
     Other(&'static str),
 }
@@ -1754,6 +1759,22 @@ pub struct Igb {
     /// SR-IOV / VMDq allocation, `None` until [`Igb::vt_allocate`].
     /// Lock order everywhere: `vt` before `vlan_filter`, never reversed.
     vt: IrqSafeSpinLock<Option<vmdq::VtState>>,
+    /// Wired SR-IOV geometry from the bus half
+    /// (`narf_bus::sriov::SriovEnabled`), `None` while SR-IOV is
+    /// off. Set only by [`Igb::sriov_enable_with`] after both
+    /// halves succeed, cleared only by [`Igb::sriov_disable_with`];
+    /// the enumeration lane (#1568) reads the VF offset/stride/BAR
+    /// geometry from here. Never held across the `vt` lock.
+    sriov: IrqSafeSpinLock<Option<narf_bus::sriov::SriovEnabled>>,
+    /// Probe-retained bus authority for the SR-IOV config-space
+    /// half: the PF's `BusDevice` plus a copy of probe's
+    /// `Cap<BusDeviceCap, Write>` (the cap `enable_sriov` requires;
+    /// its doc says the caller must have claimed the capability).
+    /// Per-instance, not a module static, so a second PF keeps its
+    /// own authority (issue #795 shape). `None` in fixtures, which
+    /// drive the admin path through `sriov_enable_with` with a fake
+    /// bus half instead.
+    sriov_auth: IrqSafeSpinLock<Option<(BusDevice, Cap<BusDeviceCap, Write>)>>,
     /// Live counters for the ethtool surface.
     stats: IgbStats,
     /// WoL filters the suspend sequence will arm (default: none).
@@ -2078,6 +2099,8 @@ impl Igb {
             device_id: device.id.device,
             mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
             vt: IrqSafeSpinLock::new(None),
+            sriov: IrqSafeSpinLock::new(None),
+            sriov_auth: IrqSafeSpinLock::new(Some((*device, *cap))),
             stats: IgbStats::default(),
             wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
             suspended: AtomicBool::new(false),
@@ -2360,12 +2383,13 @@ impl Igb {
     /// What this does NOT do (remainders, see the spec): PCI SR-IOV
     /// config-space enablement and VF BAR exposure — the caller
     /// enables the bus half first via `narf_bus::sriov::enable_sriov`
-    /// (cap + device from bring-up) — and live PF queue relocation
-    /// to `rbase_offset` (bring-up is queue-0-only; the pool math
-    /// itself is fixture-proven in `vmdq`). The mailbox pump IS
-    /// wired here: MBVFIMR is unmasked and IMS gains VMMB, and the
-    /// RX pump drains the ISR's flag through
-    /// [`Igb::vt_mailbox_pump_step`].
+    /// (cap + device from bring-up); [`Igb::sriov_enable`] owns that
+    /// order plus rollback, and is the production entry point — and
+    /// live PF queue relocation to `rbase_offset` (bring-up is
+    /// queue-0-only; the pool math itself is fixture-proven in
+    /// `vmdq`). The mailbox pump IS wired here: MBVFIMR is unmasked
+    /// and IMS gains VMMB, and the RX pump drains the ISR's flag
+    /// through [`Igb::vt_mailbox_pump_step`].
     ///
     /// Later RSS reprogramming of MRQC must pass `vmdq = true` and
     /// the actual RSS queue count to [`mrqc_word`]; with VFs
@@ -2396,10 +2420,15 @@ impl Igb {
             }
             state.vfre = self.mmio.read32(vmdq::REG_VFRE);
             state.vfte = self.mmio.read32(vmdq::REG_VFTE);
+            // Pre-images for `vt_free`: the exact program this
+            // allocation is about to replace.
+            state.pre_mrqc = self.mmio.read32(REG_MRQC);
+            state.pre_rxcsum = self.mmio.read32(REG_RXCSUM);
             // VT_CTL: PF default pool + replication (replication only
             // for families whose switch programming exists — see
             // `igb_vmm_control`'s early return for I210/I211).
             let vt_ctl = self.mmio.read32(vmdq::REG_VT_CTL);
+            state.pre_vt_ctl = vt_ctl;
             let vt_ctl = vmdq::vt_ctl_default_pool_word(vt_ctl, vmdq::pf_pool(num_vfs));
             let vt_ctl = match vmdq::switch_family_for_device(self.device_id) {
                 Some(vmdq::SwitchFamily::Dtxswc82576) | Some(vmdq::SwitchFamily::TxswcI350) => {
@@ -2412,18 +2441,22 @@ impl Igb {
             match vmdq::switch_family_for_device(self.device_id) {
                 Some(vmdq::SwitchFamily::Dtxswc82576) => {
                     let dtxctl = self.mmio.read32(vmdq::REG_DTXCTL);
+                    state.pre_dtxctl = dtxctl;
                     self.mmio
                         .write32(vmdq::REG_DTXCTL, dtxctl | vmdq::DTXCTL_VLAN_ADDED);
                     let rplolr = self.mmio.read32(vmdq::REG_RPLOLR);
+                    state.pre_rplolr = rplolr;
                     self.mmio
                         .write32(vmdq::REG_RPLOLR, rplolr | vmdq::RPLOLR_STRVLAN);
                     let dtxswc = self.mmio.read32(vmdq::REG_DTXSWC);
+                    state.pre_dtxswc = dtxswc;
                     let dtxswc = vmdq::switch_loopback_word(dtxswc, true);
                     let dtxswc = vmdq::switch_antispoof_word(dtxswc, vmdq::pf_pool(num_vfs));
                     self.mmio.write32(vmdq::REG_DTXSWC, dtxswc);
                 }
                 Some(vmdq::SwitchFamily::TxswcI350) => {
                     let txswc = self.mmio.read32(vmdq::REG_TXSWC);
+                    state.pre_txswc = txswc;
                     let txswc = vmdq::switch_loopback_word(txswc, true);
                     let txswc = vmdq::switch_antispoof_word(txswc, vmdq::pf_pool(num_vfs));
                     self.mmio.write32(vmdq::REG_TXSWC, txswc);
@@ -2435,7 +2468,7 @@ impl Igb {
             // register; RXCSUM keeps its current bits.
             self.mmio
                 .write32(REG_MRQC, mrqc_word(false, false, true, 1));
-            let rxcsum = self.mmio.read32(REG_RXCSUM);
+            let rxcsum = state.pre_rxcsum;
             self.mmio.write32(REG_RXCSUM, rxcsum_rss_word(rxcsum));
             // Mailbox interrupts (Linux `igb_irq_enable`, MSI-X
             // branch, `vfs_allocated_count != 0`): unmask every VF
@@ -2447,6 +2480,172 @@ impl Igb {
         }
         *vt_guard = Some(state);
         Ok(())
+    }
+
+    /// Free the VT allocation (device-side half of SR-IOV disable,
+    /// Linux `igb_disable_sriov` minus the reset): mask the VF
+    /// mailbox, clear IMS.VMMB, restore the switch / MRQC / RXCSUM
+    /// pre-images [`Igb::vt_allocate`] saved, and drop the
+    /// `VtState`. The mailbox pump then has nothing to drain and
+    /// [`Igb::resume`] skips the VT re-arm (`vt_allocated` is
+    /// false). Fails when nothing is allocated.
+    pub fn vt_free(&self) -> Result<(), IgbError> {
+        let mut vt_guard = self.vt.lock();
+        let Some(state) = vt_guard.take() else {
+            return Err(IgbError::Other("igb VT not allocated"));
+        };
+        // SAFETY: mapped MMIO throughout; every address is a
+        // documented igb register for this device family.
+        unsafe {
+            self.mmio.write32(vmdq::REG_MBVFIMR, 0);
+            // IMC clears mask bits: one bit, not the `!0` blanket
+            // detach / suspend use, so the PF's other causes stay
+            // unmasked.
+            self.mmio.write32(REG_IMC, IMS_VMMB);
+            self.mmio.write32(vmdq::REG_VT_CTL, state.pre_vt_ctl);
+            match vmdq::switch_family_for_device(self.device_id) {
+                Some(vmdq::SwitchFamily::Dtxswc82576) => {
+                    self.mmio.write32(vmdq::REG_DTXCTL, state.pre_dtxctl);
+                    self.mmio.write32(vmdq::REG_RPLOLR, state.pre_rplolr);
+                    self.mmio.write32(vmdq::REG_DTXSWC, state.pre_dtxswc);
+                }
+                Some(vmdq::SwitchFamily::TxswcI350) => {
+                    self.mmio.write32(vmdq::REG_TXSWC, state.pre_txswc);
+                }
+                _ => {}
+            }
+            self.mmio.write32(REG_MRQC, state.pre_mrqc);
+            self.mmio.write32(REG_RXCSUM, state.pre_rxcsum);
+        }
+        Ok(())
+    }
+
+    /// VFs currently enabled through the admin path (0 = SR-IOV off).
+    pub fn sriov_num_vfs(&self) -> u16 {
+        self.sriov.lock().map(|s| s.num_vfs).unwrap_or(0)
+    }
+
+    /// Wired VF geometry from the bus half, if SR-IOV is enabled:
+    /// VF offset / stride / device id plus the programmed VF BAR
+    /// windows. Read by the VF enumeration lane (#1568).
+    pub fn sriov_geometry(&self) -> Option<narf_bus::sriov::SriovEnabled> {
+        *self.sriov.lock()
+    }
+
+    /// Enable SR-IOV over an injected bus half: the fixture seam
+    /// for the admin path (the real bus half needs live ECAM, so
+    /// fixtures pass recording closures instead). Order is the
+    /// issue's prescription, grounded on Linux `igb_enable_sriov`
+    /// and the PCI IOV howto (`pci_enable_sriov` first, device-side
+    /// allocation second): bus half first, then `vt_allocate`; a
+    /// device-half failure rolls the bus half back via
+    /// `bus_disable` and stores no geometry. A repeat enable with
+    /// the same count is an idempotent no-op returning the stored
+    /// geometry (Linux `sriov_configure` returns the existing count
+    /// when it matches); a different count while enabled is refused
+    /// — disable first, then enable. Counts outside 1..=7 are
+    /// refused before either half runs. The `sriov` lock is never
+    /// held across the `vt` lock.
+    fn sriov_enable_with(
+        &self,
+        num_vfs: u16,
+        bus_enable: impl FnOnce() -> Result<narf_bus::sriov::SriovEnabled, narf_bus::sriov::SriovError>,
+        bus_disable: impl FnOnce(),
+    ) -> Result<narf_bus::sriov::SriovEnabled, IgbError> {
+        if num_vfs == 0 || num_vfs as usize > vmdq::MAX_VFS {
+            return Err(IgbError::Other("igb SR-IOV VF count outside 1..=7"));
+        }
+        if let Some(enabled) = *self.sriov.lock() {
+            if enabled.num_vfs == num_vfs {
+                return Ok(enabled);
+            }
+            return Err(IgbError::Other(
+                "igb SR-IOV already enabled with a different VF count (disable first)",
+            ));
+        }
+        let enabled = bus_enable().map_err(IgbError::SriovBus)?;
+        if let Err(e) = self.vt_allocate(num_vfs as usize) {
+            bus_disable();
+            return Err(e);
+        }
+        *self.sriov.lock() = Some(enabled);
+        Ok(enabled)
+    }
+
+    /// Enable SR-IOV with `num_vfs` VFs through the production bus
+    /// half (Linux `igb_sriov_configure` / `sriov_numvfs` write):
+    /// bus half first over the probe-retained authority
+    /// (`narf_bus::sriov::enable_sriov` — programs the SR-IOV cap,
+    /// sizes + programs the VF BARs, writes NumVFs and sets VF
+    /// Enable), then the device half ([`Igb::vt_allocate`] — VMDq
+    /// pools, VT_CTL, MRQC, mailbox unmask). A device-half failure
+    /// rolls the bus half back (`disable_sriov`); the error is the
+    /// device half's. Requires MSI-X (checked by `vt_allocate`,
+    /// after the bus half — the rollback covers it) and a retained
+    /// bus authority (fixtures have none; they use
+    /// `sriov_enable_with`). The resulting VF geometry is stored
+    /// for the enumeration lane; see [`Igb::sriov_geometry`].
+    pub fn sriov_enable(&self, num_vfs: u16) -> Result<narf_bus::sriov::SriovEnabled, IgbError> {
+        let Some((device, cap)) = *self.sriov_auth.lock() else {
+            return Err(IgbError::SriovNoAuthority);
+        };
+        self.sriov_enable_with(
+            num_vfs,
+            || narf_bus::sriov::enable_sriov(&cap, &device, num_vfs),
+            || {
+                let _ = narf_bus::sriov::disable_sriov(&cap, &device);
+            },
+        )
+    }
+
+    /// Disable SR-IOV over an injected bus half (fixture seam,
+    /// mirror of [`Igb::sriov_enable_with`]): device half first
+    /// ([`Igb::vt_free`] — mailbox masked, switch / MRQC program
+    /// restored), then the bus half (`disable_sriov` — VF Enable +
+    /// Memory Space Enable cleared, NumVFs zeroed), mirroring Linux
+    /// `igb_disable_sriov` (device teardown before
+    /// `pci_disable_sriov`). Idempotent: disabling with nothing
+    /// enabled succeeds, and a device-only allocation (the test-only
+    /// `vt_allocate` shape, no bus half) is freed without calling
+    /// the bus half. A bus-half failure is reported, but the device
+    /// half is already torn down and the stored geometry is cleared
+    /// — the driver no longer tracks VFs it cannot address, and the
+    /// caller must treat config space as possibly still enabled.
+    fn sriov_disable_with(
+        &self,
+        bus_disable: impl FnOnce() -> Result<(), narf_bus::sriov::SriovError>,
+    ) -> Result<(), IgbError> {
+        let had_geometry = self.sriov.lock().is_some();
+        let had_vt = self.vt.lock().is_some();
+        if !had_geometry && !had_vt {
+            return Ok(());
+        }
+        if had_vt {
+            // Best-effort: a racing disable may have freed it first.
+            let _ = self.vt_free();
+        }
+        if had_geometry {
+            let result = bus_disable().map_err(IgbError::SriovBus);
+            *self.sriov.lock() = None;
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Disable SR-IOV through the production bus half (Linux
+    /// `sriov_numvfs` write of 0 / `igb_sriov_configure(0)`):
+    /// device half first, then the bus half; see
+    /// [`Igb::sriov_disable_with`]. Idempotent when already off.
+    pub fn sriov_disable(&self) -> Result<(), IgbError> {
+        let auth = *self.sriov_auth.lock();
+        self.sriov_disable_with(|| match auth {
+            Some((device, cap)) => narf_bus::sriov::disable_sriov(&cap, &device),
+            // No bus half was ever enabled (fixture shape) — the
+            // seam returns early without calling this when there is
+            // no geometry, so this only fires with geometry stored
+            // but no authority, which probe never produces.
+            None => Err(narf_bus::sriov::SriovError::AuthorityRevoked),
+        })
     }
 
     /// Run one PF↔VF mailbox message for `vf` through the VT
@@ -3694,6 +3893,53 @@ impl narf_net::iface::DeviceControl for IgbMtuControl {
     fn configure(&self, config: &narf_net::iface::DeviceConfig) -> Result<(), i32> {
         self.controller.set_mtu(config.mtu)
     }
+    fn nic(&self) -> Option<&dyn narf_net::nic::NicControl> {
+        Some(self)
+    }
+}
+
+impl narf_net::nic::NicControl for IgbMtuControl {
+    /// Linux `sriov_numvfs` read: VFs enabled through the admin path.
+    fn sriov_num_vfs(&self) -> narf_net::nic::Result<u16> {
+        Ok(self.controller.sriov_num_vfs())
+    }
+
+    /// Linux `sriov_numvfs` write: enable `num_vfs` VFs, or disable
+    /// SR-IOV with 0. Errno mapping: EINVAL (22) for a count outside
+    /// 1..=7, EBUSY (16) for a resize while enabled (disable first),
+    /// EOPNOTSUPP (95) when MSI-X is absent or the bus half reports
+    /// no SR-IOV capability / no retained authority, EIO (5) for any
+    /// other bus- or device-half failure.
+    fn set_sriov_num_vfs(&self, num_vfs: u16) -> narf_net::nic::Result<()> {
+        if num_vfs > vmdq::MAX_VFS as u16 {
+            return Err(22);
+        }
+        if num_vfs == 0 {
+            return self.controller.sriov_disable().map_err(|_| 5);
+        }
+        let current = self.controller.sriov_num_vfs();
+        if current != 0 && current != num_vfs {
+            return Err(16);
+        }
+        // MSI-X is the device half's gate (`vt_allocate`); refuse
+        // before the bus half runs so a polled-only PF never
+        // enables VFs in config space it cannot serve.
+        if self.controller._msix.is_none() {
+            return Err(95);
+        }
+        self.controller
+            .sriov_enable(num_vfs)
+            .map(|_| ())
+            .map_err(|e| match e {
+                IgbError::SriovNoAuthority
+                | IgbError::SriovBus(narf_bus::sriov::SriovError::CapNotPresent)
+                | IgbError::SriovBus(narf_bus::sriov::SriovError::NotPcie)
+                | IgbError::SriovBus(narf_bus::sriov::SriovError::AuthorityRevoked) => 95,
+                IgbError::SriovBus(narf_bus::sriov::SriovError::AlreadyEnabled) => 16,
+                IgbError::SriovBus(narf_bus::sriov::SriovError::BadVfCount) => 22,
+                _ => 5,
+            })
+    }
 }
 
 // ── HwNic adapter ───────────────────────────────────────────────────
@@ -4488,6 +4734,8 @@ mod tests {
             device_id: IGB_I350_COPPER,
             mtu: IrqSafeSpinLock::new(1500),
             vt: IrqSafeSpinLock::new(None),
+            sriov: IrqSafeSpinLock::new(None),
+            sriov_auth: IrqSafeSpinLock::new(None),
             stats: IgbStats::default(),
             wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
             suspended: AtomicBool::new(false),
@@ -4700,6 +4948,343 @@ mod tests {
         "drivers/net/igb",
         smoke_igb_mailbox_pump_reset_event_and_ack
     );
+
+    /// Canned bus-half geometry for the SR-IOV admin seam tests
+    /// (the bus test's fake VF device id; the values are fixture
+    /// constants, not hardware claims).
+    fn fake_sriov_enabled(num_vfs: u16) -> narf_bus::sriov::SriovEnabled {
+        narf_bus::sriov::SriovEnabled {
+            num_vfs,
+            vf_offset: 8,
+            vf_stride: 1,
+            vf_device_id: 0xABCD,
+            page_size: 4096,
+            vf_bars: [None; 6],
+        }
+    }
+
+    fn smoke_igb_sriov_admin_enable_disable() -> TestResult {
+        let Some((igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        let enable_calls = AtomicU64::new(0);
+        let disable_calls = AtomicU64::new(0);
+        // Bus half runs before the device half: VT must still be
+        // free when it is called.
+        let enabled = match igb.sriov_enable_with(
+            2,
+            || {
+                if igb.vt.lock().is_some() {
+                    return Err(narf_bus::sriov::SriovError::ConfigFailed);
+                }
+                enable_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_sriov_enabled(2))
+            },
+            || {
+                disable_calls.fetch_add(1, Ordering::SeqCst);
+            },
+        ) {
+            Ok(e) => e,
+            Err(_) => return TestResult::Fail("sriov_enable_with failed on the fixture"),
+        };
+        if enabled != fake_sriov_enabled(2)
+            || enable_calls.load(Ordering::SeqCst) != 1
+            || disable_calls.load(Ordering::SeqCst) != 0
+            || igb.sriov_num_vfs() != 2
+            || igb.sriov_geometry() != Some(fake_sriov_enabled(2))
+        {
+            return TestResult::Fail("enable did not wire the VF geometry");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        let mbvfimr = unsafe { igb.mmio.read32(vmdq::REG_MBVFIMR) };
+        // SAFETY: fixture-owned MMIO backing; IMS is a mapped status-register read.
+        let ims = unsafe { igb.mmio.read32(REG_IMS) };
+        if mbvfimr != vmdq::MBVFIMR_ALL_VFS || ims & IMS_VMMB == 0 {
+            return TestResult::Fail("enable did not run the device half");
+        }
+        // Same-count re-enable is an idempotent no-op: the bus half
+        // is not called again.
+        if igb
+            .sriov_enable_with(
+                2,
+                || Err(narf_bus::sriov::SriovError::ConfigFailed),
+                || {
+                    disable_calls.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .is_err()
+        {
+            return TestResult::Fail("same-count re-enable was not an idempotent no-op");
+        }
+        if enable_calls.load(Ordering::SeqCst) != 1 || disable_calls.load(Ordering::SeqCst) != 0 {
+            return TestResult::Fail("same-count re-enable touched the bus half");
+        }
+        // Resize while enabled, and counts outside 1..=7, are
+        // refused before either half runs.
+        for bad in [3u16, 0, 8] {
+            if igb
+                .sriov_enable_with(
+                    bad,
+                    || {
+                        enable_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(fake_sriov_enabled(bad))
+                    },
+                    || {
+                        disable_calls.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+                .is_ok()
+            {
+                return TestResult::Fail("bad VF count or resize was accepted");
+            }
+        }
+        if enable_calls.load(Ordering::SeqCst) != 1 || disable_calls.load(Ordering::SeqCst) != 0 {
+            return TestResult::Fail("refused enable touched the bus half");
+        }
+        if igb
+            .sriov_disable_with(|| {
+                disable_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err()
+        {
+            return TestResult::Fail("sriov_disable_with failed on the fixture");
+        }
+        if disable_calls.load(Ordering::SeqCst) != 1
+            || igb.sriov_num_vfs() != 0
+            || igb.sriov_geometry().is_some()
+        {
+            return TestResult::Fail("disable did not clear the stored geometry");
+        }
+        // SAFETY: fixture-owned MMIO backing. Fake MMIO does not
+        // model IMC clearing IMS, so the assertion is on the IMC
+        // write itself (one VMMB bit, not the blanket mask).
+        let (mbvfimr, imc, mrqc, vt_ctl, rxcsum) = unsafe {
+            (
+                igb.mmio.read32(vmdq::REG_MBVFIMR),
+                igb.mmio.read32(REG_IMC),
+                igb.mmio.read32(REG_MRQC),
+                igb.mmio.read32(vmdq::REG_VT_CTL),
+                igb.mmio.read32(REG_RXCSUM),
+            )
+        };
+        if mbvfimr != 0 || imc != IMS_VMMB || mrqc != 0 || vt_ctl != 0 || rxcsum != 0 {
+            return TestResult::Fail("disable did not restore the pre-allocation program");
+        }
+        // Re-enable proves the free left the device reusable, and a
+        // disable with nothing enabled is an idempotent no-op.
+        if igb
+            .sriov_enable_with(
+                2,
+                || {
+                    enable_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(fake_sriov_enabled(2))
+                },
+                || {
+                    disable_calls.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .is_err()
+        {
+            return TestResult::Fail("re-enable after disable failed");
+        }
+        if enable_calls.load(Ordering::SeqCst) != 2 {
+            return TestResult::Fail("re-enable did not run the bus half");
+        }
+        if igb
+            .sriov_disable_with(|| {
+                disable_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err()
+        {
+            return TestResult::Fail("second disable failed");
+        }
+        if igb
+            .sriov_disable_with(|| {
+                disable_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err()
+        {
+            return TestResult::Fail("idempotent disable failed");
+        }
+        if disable_calls.load(Ordering::SeqCst) != 2 {
+            return TestResult::Fail("idempotent disable touched the bus half");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_sriov_admin_enable_disable);
+
+    fn smoke_igb_sriov_admin_rollback() -> TestResult {
+        // Device-half failure after a successful bus half rolls the
+        // bus half back and stores no geometry.
+        let Some((igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        if igb.vt_allocate(2).is_err() {
+            return TestResult::Fail("vt_allocate failed on the pump fixture");
+        }
+        let disable_calls = AtomicU64::new(0);
+        if igb
+            .sriov_enable_with(
+                2,
+                || Ok(fake_sriov_enabled(2)),
+                || {
+                    disable_calls.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .is_ok()
+        {
+            return TestResult::Fail("enable succeeded over an already-allocated VT");
+        }
+        if disable_calls.load(Ordering::SeqCst) != 1 || igb.sriov_num_vfs() != 0 {
+            return TestResult::Fail("device-half failure did not roll the bus half back");
+        }
+        // Bus-half failure: the device half never runs, so there is
+        // nothing to roll back.
+        let Some((igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        let disable_calls = AtomicU64::new(0);
+        if igb
+            .sriov_enable_with(
+                2,
+                || Err(narf_bus::sriov::SriovError::CapNotPresent),
+                || {
+                    disable_calls.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .is_ok()
+        {
+            return TestResult::Fail("enable succeeded without an SR-IOV capability");
+        }
+        if disable_calls.load(Ordering::SeqCst) != 0 || igb.vt.lock().is_some() {
+            return TestResult::Fail("bus-half failure ran the device half or a rollback");
+        }
+        // MSI-X gate: no MSI-X table, so `vt_allocate` fails after
+        // the bus half and the rollback runs.
+        let Some((mut igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        igb._msix = None;
+        let disable_calls = AtomicU64::new(0);
+        if igb
+            .sriov_enable_with(
+                2,
+                || Ok(fake_sriov_enabled(2)),
+                || {
+                    disable_calls.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .is_ok()
+        {
+            return TestResult::Fail("enable succeeded without MSI-X");
+        }
+        if disable_calls.load(Ordering::SeqCst) != 1 || igb.sriov_num_vfs() != 0 {
+            return TestResult::Fail("MSI-X failure did not roll the bus half back");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_sriov_admin_rollback);
+
+    fn smoke_igb_sriov_vt_free_restores() -> TestResult {
+        let Some((igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        // Seed a distinctive pre-allocation program so the restore
+        // is observable (the fixture backing starts zeroed).
+        // SAFETY: fixture-owned MMIO backing.
+        unsafe {
+            igb.mmio.write32(REG_MRQC, 0x1234_5678);
+            igb.mmio.write32(REG_RXCSUM, 0x0000_00FF);
+            igb.mmio.write32(vmdq::REG_VT_CTL, 0xA5A5_0001);
+            igb.mmio.write32(vmdq::REG_TXSWC, 0x0000_00F0);
+        }
+        if igb.vt_allocate(2).is_err() {
+            return TestResult::Fail("vt_allocate failed on the pump fixture");
+        }
+        // The allocation replaced the program (spot-check MRQC).
+        // SAFETY: fixture-owned MMIO backing.
+        let mrqc = unsafe { igb.mmio.read32(REG_MRQC) };
+        if mrqc == 0x1234_5678 {
+            return TestResult::Fail("vt_allocate did not program MRQC");
+        }
+        if igb.vt_free().is_err() {
+            return TestResult::Fail("vt_free failed on an allocated VT");
+        }
+        // SAFETY: fixture-owned MMIO backing.
+        let (mrqc, rxcsum, vt_ctl, txswc, mbvfimr, imc) = unsafe {
+            (
+                igb.mmio.read32(REG_MRQC),
+                igb.mmio.read32(REG_RXCSUM),
+                igb.mmio.read32(vmdq::REG_VT_CTL),
+                igb.mmio.read32(vmdq::REG_TXSWC),
+                igb.mmio.read32(vmdq::REG_MBVFIMR),
+                igb.mmio.read32(REG_IMC),
+            )
+        };
+        if mrqc != 0x1234_5678
+            || rxcsum != 0x0000_00FF
+            || vt_ctl != 0xA5A5_0001
+            || txswc != 0x0000_00F0
+            || mbvfimr != 0
+            || imc != IMS_VMMB
+        {
+            return TestResult::Fail("vt_free did not restore the pre-allocation program");
+        }
+        // A second free fails, and the device allocates again.
+        if igb.vt_free().is_ok() {
+            return TestResult::Fail("second vt_free succeeded without an allocation");
+        }
+        if igb.vt_allocate(2).is_err() {
+            return TestResult::Fail("vt_allocate failed after vt_free");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_sriov_vt_free_restores);
+
+    fn smoke_igb_sriov_nic_control() -> TestResult {
+        use narf_net::iface::DeviceControl;
+        use narf_net::nic::NicControl;
+        let Some((igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        let ctl = super::IgbMtuControl {
+            controller: alloc::sync::Arc::new(igb),
+        };
+        if DeviceControl::nic(&ctl).is_none() {
+            return TestResult::Fail("IgbMtuControl does not expose NicControl");
+        }
+        if ctl.sriov_num_vfs() != Ok(0) {
+            return TestResult::Fail("sriov_num_vfs was not 0 on a fresh fixture");
+        }
+        if ctl.set_sriov_num_vfs(8) != Err(22) {
+            return TestResult::Fail("VF count 8 was not EINVAL");
+        }
+        // Fixture has no retained bus authority: enable refuses
+        // EOPNOTSUPP instead of touching config space.
+        if ctl.set_sriov_num_vfs(2) != Err(95) {
+            return TestResult::Fail("enable without bus authority was not EOPNOTSUPP");
+        }
+        // Disable is an idempotent no-op while off.
+        if ctl.set_sriov_num_vfs(0).is_err() {
+            return TestResult::Fail("disable while off failed");
+        }
+        // Polled-only PF: the MSI-X gate refuses before the bus half.
+        let Some((mut igb, _backing)) = fixture_igb_vt() else {
+            return TestResult::Fail("mailbox pump fixture allocation failed");
+        };
+        igb._msix = None;
+        let ctl = super::IgbMtuControl {
+            controller: alloc::sync::Arc::new(igb),
+        };
+        if ctl.set_sriov_num_vfs(2) != Err(95) {
+            return TestResult::Fail("enable without MSI-X was not EOPNOTSUPP");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igb", smoke_igb_sriov_nic_control);
 
     fn smoke_igb_per_queue_enable_layout() -> TestResult {
         // The per-queue DMA-enable handshake is the functional delta vs
@@ -5601,6 +6186,8 @@ mod tests {
                 device_id: IGB_I210_COPPER,
                 mtu: IrqSafeSpinLock::new(mtu::STD_MTU),
                 vt: IrqSafeSpinLock::new(None),
+                sriov: IrqSafeSpinLock::new(None),
+                sriov_auth: IrqSafeSpinLock::new(None),
                 stats: IgbStats::default(),
                 wol_filters: IrqSafeSpinLock::new(WolFilters::default()),
                 suspended: AtomicBool::new(false),

@@ -794,6 +794,19 @@ pub struct VtState {
     /// on a speed change). 0 = no rate limit was ever set, so the
     /// re-check is a no-op.
     pub vf_rate_link_speed: u32,
+    /// MMIO pre-images saved by `Igb::vt_allocate` before it
+    /// programs the switch/MRQC registers, so `Igb::vt_free` can
+    /// restore the exact pre-allocation program (Linux
+    /// `igb_disable_sriov` reaches the same state via reset; NARF
+    /// has no reset on the disable path, so the pre-images are the
+    /// restore source). Zero until `vt_allocate` fills them.
+    pub pre_vt_ctl: u32,
+    pub pre_dtxctl: u32,
+    pub pre_rplolr: u32,
+    pub pre_dtxswc: u32,
+    pub pre_txswc: u32,
+    pub pre_mrqc: u32,
+    pub pre_rxcsum: u32,
 }
 
 impl VtState {
@@ -826,6 +839,13 @@ impl VtState {
             vfte: 0,
             vlan_promisc: false,
             vf_rate_link_speed: 0,
+            pre_vt_ctl: 0,
+            pre_dtxctl: 0,
+            pre_rplolr: 0,
+            pre_dtxswc: 0,
+            pre_txswc: 0,
+            pre_mrqc: 0,
+            pre_rxcsum: 0,
         })
     }
 
