@@ -382,7 +382,10 @@ fn smoke_scheduler_task_snapshot_names_each_task_once() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_task_snapshot_names_each_task_once);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_task_snapshot_names_each_task_once
+);
 
 fn smoke_scheduler_budget_cap_revokes_task() -> TestResult {
     // A Cap<CpuBudget, Spend>-attached task runs while the cap is live,
