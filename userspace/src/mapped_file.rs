@@ -4019,10 +4019,15 @@ pub(crate) fn flush_current_range(base: u64, len: u64) -> Result<(), FsError> {
     // filesystem marks faulted folios dirty, so msync completes by driving
     // that inode's ordinary writeback path after all fallback copies.
     for ops in files {
-        match crate::handlers::poll_blocking(ops.fsync(false)) {
-            Some(Ok(())) => {}
-            Some(Err(error)) => return Err(error),
-            None => return Err(FsError::Io(narf_block::BlockError::IOError)),
+        // A fatal signal ends the wait for the commit, which finishes
+        // without the dying caller (`killable_wait::fsync`). `msync` reports
+        // -EINTR for a flush a fatal signal cut short, here or between the
+        // batches above.
+        match crate::killable_wait::fsync(&ops, false) {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(error))) => return Err(error),
+            Ok(None) => return Err(FsError::Io(narf_block::BlockError::IOError)),
+            Err(crate::killable_wait::Killed) => return Ok(()),
         }
     }
     Ok(())

@@ -467,6 +467,52 @@ kernel_test_in!(
     smoke_killable_fill_frame_frees_the_frame_of_a_killed_fault
 );
 
+// ── execve image reads ─────────────────────────────────────────────
+
+/// An `execve` image read of a file whose read never completes ends on
+/// SIGKILL — Linux `kernel_read` is killable — without touching the
+/// destination, and the read finishes into its own buffer afterwards. A read
+/// that is not killed fills the destination, a staging chunk at a time.
+fn smoke_killable_exec_image_read_ends_on_sigkill() -> TestResult {
+    use crate::elf::ExecBytes;
+    let _fixture = DetachFixture::new(SYSCALL_TASK);
+    crate::handlers::install_task_id_lookup(syscall_task);
+    let file = NeverFile::new();
+    let ops: Arc<dyn FileOps> = file.clone();
+    let image = crate::handlers::ExecSource::File {
+        ops: ops.clone(),
+        size: 1 << 20,
+    };
+    let mut header = [0u8; 64];
+    crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+    if image.read_exact_at(0, &mut header) != Err(crate::elf::ElfError::ImageReadFailed) {
+        return TestResult::Fail("an image read of a stuck file did not end on SIGKILL");
+    }
+    if file.reads.load(Ordering::Relaxed) != 1 || header != [0u8; 64] {
+        return TestResult::Fail("the killed image read touched its destination");
+    }
+    let Some(mut detached) = DETACHED.lock().take() else {
+        return TestResult::Fail("the stuck image read was dropped with its I/O in flight");
+    };
+    let waker = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    file.release.store(true, Ordering::Release);
+    if detached.as_mut().poll(&mut cx) != Poll::Ready(()) {
+        return TestResult::Fail("the detached image read could not finish");
+    }
+    crate::handlers::clear_signal_pending(SYSCALL_TASK, 9);
+    // Not killed: the whole range, in staging chunks.
+    let mut big = alloc::vec![0u8; READ_INTO_MAX + 100];
+    if image.read_exact_at(0, &mut big).is_err() || big.iter().any(|&b| b != 0x5a) {
+        return TestResult::Fail("an image read did not fill its destination");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_exec_image_read_ends_on_sigkill
+);
+
 // ── Durability waits: fsync, fdatasync, syncfs ──────────────────────
 
 /// What a [`StuckSync`] commit has seen: how often it was polled, the poll
@@ -531,7 +577,7 @@ impl FileOps for StuckSync {
 
     fn stat(&self) -> Stat {
         Stat {
-            size: 0,
+            size: 2 * 4096,
             blocks: 0,
             mode: Mode::FILE_RW,
             mtime_cycles: 0,
@@ -705,6 +751,62 @@ fn smoke_killable_syncfs_ends_on_sigkill_within_one_pass() -> TestResult {
 kernel_test_in!(
     "userspace/killable",
     smoke_killable_syncfs_ends_on_sigkill_within_one_pass
+);
+
+static MSYNC_AS: IrqSafeSpinLock<Option<Arc<narf_memory::AddressSpace>>> =
+    IrqSafeSpinLock::new(None);
+
+fn lookup_msync_as() -> Option<Arc<narf_memory::AddressSpace>> {
+    MSYNC_AS.lock().clone()
+}
+
+fn msync_case() -> Result<(), &'static str> {
+    use crate::abi_test_support::{a2, call, FAKE_TASK};
+    use crate::syscall::{Syscall, SyscallArgs};
+    const MS_SYNC: u64 = 4;
+    const LEN: u64 = 2 * 4096;
+    let (file, state) = StuckSync::new(KILL_AT, kill_fake_task);
+    let fd = install_on(FAKE_TASK, file).ok_or("could not install the test file")?;
+    let map = SyscallArgs {
+        arg0: 0,
+        arg1: LEN,
+        arg2: 3, // PROT_READ | PROT_WRITE
+        arg3: 1, // MAP_SHARED
+        arg4: u64::from(fd),
+        arg5: 0,
+    };
+    let addr = match call(Syscall::Mmap.raw(), map) {
+        Some(addr) if addr > 0 => addr as u64,
+        _ => return Err("MAP_SHARED mmap of the test file failed"),
+    };
+    if call(Syscall::Msync.raw(), a2(addr, LEN, MS_SYNC)) != Some(EINTR_RET) {
+        return Err("msync(MS_SYNC) of a stuck file did not return -EINTR on SIGKILL");
+    }
+    if state.polls.load(Ordering::Acquire) != KILL_AT {
+        return Err("msync kept waiting for the commit after its task was sent SIGKILL");
+    }
+    finish_detached(&state)
+}
+
+/// `msync(MS_SYNC)` of a shared mapping whose file's commit never
+/// completes: the commit it ends with is waited for killably too.
+fn smoke_killable_msync_commit_ends_on_sigkill_within_one_pass() -> TestResult {
+    with_fixture(|| {
+        // SAFETY: kernel tests run with paging enabled; the new root inherits
+        // only the kernel half and is owned by this test.
+        let aspace = unsafe { narf_memory::AddressSpace::new_for_user() }
+            .map_err(|_| "failed to create the test address space")?;
+        *MSYNC_AS.lock() = Some(Arc::new(aspace));
+        crate::handlers::install_address_space_lookup(lookup_msync_as);
+        let outcome = msync_case();
+        crate::handlers::restore_address_space_lookup(None);
+        *MSYNC_AS.lock() = None;
+        outcome
+    })
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_msync_commit_ends_on_sigkill_within_one_pass
 );
 
 const GROUP_LEADER: u64 = 0x6b11_a000;

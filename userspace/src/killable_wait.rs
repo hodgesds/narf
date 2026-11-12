@@ -284,6 +284,37 @@ pub(crate) fn read(
     }))
 }
 
+/// The largest read [`read_into`] stages at once.
+pub(crate) const READ_INTO_MAX: usize = 256 << 10;
+
+/// A kernel read of a file into `dst` — `execve`'s image reads, Linux
+/// `kernel_read` → `filemap_read`, killable. The read goes through an owned
+/// staging buffer, so a killed one can finish without the caller's
+/// destination (a frame being filled, a header buffer on its stack); the
+/// bytes are copied out only on success. Waited for with
+/// `poll_io_to_completion`'s patience, and without the mapped-store overlay
+/// [`read`] applies (the caller applies its own). `Ok(Some(Ok(n)))` filled
+/// `dst[..n]`; one call reads at most [`READ_INTO_MAX`] bytes, so the staging
+/// copy stays small and callers loop, as they do for short reads anyway.
+#[track_caller]
+pub(crate) fn read_into(ops: &Arc<dyn FileOps>, offset: u64, dst: &mut [u8]) -> Waited<usize> {
+    let file = ops.clone();
+    let dst_len = dst.len().min(READ_INTO_MAX);
+    let dst = &mut dst[..dst_len];
+    let mut buffer = alloc::vec![0u8; dst_len];
+    let done = wait_io(Box::pin(async move {
+        let result = file.read(offset, &mut buffer).await;
+        (result, buffer)
+    }))?;
+    Ok(done.map(|(result, buffer)| {
+        result.map(|n| {
+            let n = n.min(dst.len());
+            dst[..n].copy_from_slice(&buffer[..n]);
+            n
+        })
+    }))
+}
+
 /// `write(2)`-family write of `payload` — `generic_perform_write`'s
 /// `fatal_signal_pending` test, and the reservation and writeback-throttle
 /// sleeps under it (`btrfs` `wait_reserve_ticket`, `balance_dirty_pages`),
