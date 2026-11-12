@@ -116,6 +116,7 @@ pub fn register_all() {
     register_proc("narf/slab", agg(gen_narf_slab));
     register_proc("narf/slab_sites", Arc::new(SlabSitesFile));
     register_proc("narf/rcu", agg(gen_narf_rcu));
+    register_proc("narf/pgtables", agg(gen_narf_pgtables));
     register_proc("vmstat", agg(gen_vmstat));
     register_proc("zoneinfo", agg(gen_zoneinfo));
     register_proc("buddyinfo", agg(gen_buddyinfo));
@@ -551,6 +552,41 @@ impl ProcFile for SlabSitesFile {
         }
         Ok(buf.len())
     }
+}
+
+/// `/proc/narf/pgtables`: where the `PageTables` frames are. `marked` is the
+/// global count of frames carrying the page-table mark; `sched_tables` the
+/// tables walked from every address space the scheduler can reach (Linux
+/// `mm->pgtables_bytes`, summed); `kernel_tables` the marked tables in the
+/// kernel half (vmalloc, modules, stacks). `unexplained` is what neither
+/// accounts for: tables of address spaces nothing schedules any more, or
+/// frames freed without their mark cleared. `user_roots_live` against
+/// `sched_address_spaces` says how many user roots outlive every task.
+fn gen_narf_pgtables() -> Vec<u8> {
+    let mut s = String::new();
+    let marked = narf_memory::frame::page_table_frames();
+    let spaces = narf_scheduler::all_address_spaces();
+    let sched_tables: usize = spaces.iter().map(|a| a.page_table_frames()).sum();
+    #[cfg(target_arch = "x86_64")]
+    let (kernel_tables, roots_live) = (
+        narf_memory::bpf_text::kernel_root_for_mapping().map_or(0, |root| {
+            narf_memory::x86_64::paging::count_marked_tables(root, 256..512)
+        }),
+        narf_memory::x86_64::paging::user_pml4_live(),
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (kernel_tables, roots_live) = (0usize, 0i64);
+    let _ = writeln!(s, "marked {}", marked);
+    let _ = writeln!(s, "user_roots_live {}", roots_live);
+    let _ = writeln!(s, "sched_address_spaces {}", spaces.len());
+    let _ = writeln!(s, "sched_tables {}", sched_tables);
+    let _ = writeln!(s, "kernel_tables {}", kernel_tables);
+    let _ = writeln!(
+        s,
+        "unexplained {}",
+        marked.saturating_sub(sched_tables + kernel_tables)
+    );
+    s.into_bytes()
 }
 
 /// `/proc/narf/rcu`: the QSBR deferred-reclaim backlog. `rcu_pending` is

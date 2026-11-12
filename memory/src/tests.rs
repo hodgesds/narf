@@ -3313,6 +3313,72 @@ kernel_test_in!(
     smoke_memory_sparse_root_teardown_is_batched
 );
 
+/// Map / unmap / exit loops leave `PageTables` where they found it, and while
+/// an address space lives its walked table count is exactly what it added to
+/// the global count (Linux `mm->pgtables_bytes` against `NR_PAGETABLE`).
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+fn smoke_memory_page_tables_return_after_map_unmap_exit() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+    const ROUNDS: usize = 16;
+    // Slots 1, 128 and 255, each in its own PDPT/PD/PT chain.
+    let bases = [
+        0x0000_0080_0000_0000_u64,
+        0x0000_4000_0000_0000_u64,
+        0x0000_7fff_f000_0000_u64,
+    ];
+    let baseline = crate::frame::page_table_frames();
+    for _ in 0..ROUNDS {
+        // SAFETY: paging is enabled; the test exclusively owns the AS.
+        let space = match unsafe { AddressSpace::new_for_user() } {
+            Ok(space) => space,
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let before = crate::frame::page_table_frames();
+        for base in bases {
+            let backing = match crate::alloc_frame() {
+                Ok(frame) => frame.start_address(),
+                Err(_) => return TestResult::Skip("frame allocator drained"),
+            };
+            if space
+                .map_region(Region {
+                    base: VirtAddr::new(base),
+                    len: 4096,
+                    perms: RegionPerms::READ | RegionPerms::WRITE,
+                    phys: alloc::vec![backing].into(),
+                })
+                .is_err()
+            {
+                crate::free_frame(crate::PhysFrame::new(backing));
+                return TestResult::Fail("fixture region was rejected");
+            }
+        }
+        // SAFETY: the test owns the root and every backing frame.
+        if unsafe { space.materialize() }.is_err() {
+            return TestResult::Fail("fixture materialize failed");
+        }
+        let grown = crate::frame::page_table_frames().saturating_sub(before);
+        // The root was counted before `before`; the walk includes it. A
+        // kernel mapping on another CPU may move the global count a little.
+        if space.page_table_frames().abs_diff(grown + 1) > 2 {
+            return TestResult::Fail("walked page tables differ from what the space added");
+        }
+        if space.unmap_region(VirtAddr::new(bases[1])).is_err() {
+            return TestResult::Fail("unmap of a fixture region failed");
+        }
+        drop(space);
+    }
+    // Other CPUs may map kernel memory meanwhile; allow a little.
+    if crate::frame::page_table_frames() > baseline + 8 {
+        return TestResult::Fail("map/unmap/exit left page-table frames behind");
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+kernel_test_in!(
+    "memory/sparse-teardown",
+    smoke_memory_page_tables_return_after_map_unmap_exit
+);
+
 // ── dual-arch tests (no AS::drop-realloc cycle) ───────────────────
 
 /// Accounting callers must be able to total a large lazy mapping without
