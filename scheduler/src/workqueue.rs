@@ -16,17 +16,21 @@
 //!   it runs to completion on its worker, as a Linux work that does not
 //!   block. Async work is a future; when it returns `Pending` its worker is
 //!   asleep (`wq_worker_sleeping`) and, if the pool has queued work and no
-//!   running worker left, a new worker is created (`kick_pool` /
-//!   `create_worker`), so one sleeping work never stalls the pool. Queueing
-//!   onto a pool with no running worker creates one, or, from interrupt
-//!   context, arms the pool's manager timer to create it on the next jiffy.
-//!   Where NARF cannot follow Linux: idle workers are not kept (a worker
-//!   exits when its pool's worklist is empty, where Linux keeps it for
-//!   `IDLE_WORKER_TIMEOUT`), because a parked task would keep its CPU's
-//!   executor from ever draining; a synchronous work that spins holds its
-//!   worker's CPU just as a kthread spinning with preemption off would — the
-//!   executor does not preempt a polled task to run a sibling worker; and
-//!   the high-priority pools run at the default task priority.
+//!   running worker left, an idle worker is woken or a new one created
+//!   (`kick_pool` / `create_worker`), so one sleeping work never stalls the
+//!   pool. A worker about to run a work first makes sure the pool keeps an
+//!   idle worker in reserve (`may_start_working`), so queueing — even from
+//!   interrupt context, which cannot create workers — normally only wakes
+//!   one; failing that, the pool's manager timer creates one on the next
+//!   jiffy. Idle workers park on the pool's idle list, marked to the
+//!   scheduler as idle workers (not counted as work when the executor
+//!   decides it is empty), and the pool's idle timer reaps those beyond the
+//!   reserve after `IDLE_WORKER_TIMEOUT` (`too_many_workers`,
+//!   `idle_worker_timeout`). The high-priority pools' workers run at nice
+//!   -20 (`HIGHPRI_NICE_LEVEL`). Where NARF cannot follow Linux: a
+//!   synchronous work that spins holds its worker's CPU just as a kthread
+//!   spinning with preemption off would — the executor does not preempt a
+//!   polled task to run a sibling worker.
 //! * **`max_active`** bounds the works of one workqueue executing at once;
 //!   the rest wait on the workqueue's inactive list in queue order. An
 //!   ordered workqueue ([`alloc_ordered_workqueue`]) is unbound with
@@ -353,15 +357,73 @@ impl Workqueue {
 /// Workers a pool may have; past this a pool sends mayday to rescuers.
 pub const MAX_WORKERS_PER_POOL: usize = 64;
 
+/// `IDLE_WORKER_TIMEOUT`: an idle worker beyond the pool's reserve is
+/// reaped after 5 minutes idle.
+pub const IDLE_WORKER_TIMEOUT_JIFFIES: u64 = 300 * wheel::HZ;
+
+/// Tests shorten the idle timeout (0: use [`IDLE_WORKER_TIMEOUT_JIFFIES`]).
+static IDLE_TIMEOUT_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+fn idle_timeout() -> u64 {
+    match IDLE_TIMEOUT_OVERRIDE.load(Ordering::Relaxed) {
+        0 => IDLE_WORKER_TIMEOUT_JIFFIES,
+        j => j,
+    }
+}
+
+/// Set the idle-worker timeout in jiffies (0 restores the default; tests).
+#[doc(hidden)]
+pub fn __set_idle_timeout_for_test(jiffies: u64) {
+    IDLE_TIMEOUT_OVERRIDE.store(jiffies, Ordering::Relaxed);
+}
+
+/// Idle workers parked on `cpu`'s normal pool (tests).
+#[doc(hidden)]
+pub fn __pool_idle_workers(cpu: usize) -> usize {
+    let p = CPU_POOLS[cpu.min(MAX_CPUS - 1)][0].load(Ordering::Acquire);
+    // SAFETY: pools are leaked.
+    (!p.is_null())
+        .then(|| unsafe { &*p }.inner.lock().idle.len())
+        .unwrap_or(0)
+}
+
+/// `MAX_IDLE_WORKERS_RATIO`.
+const MAX_IDLE_WORKERS_RATIO: usize = 4;
+
+/// An idle worker parked on its pool's idle list (`WORKER_IDLE`).
+struct IdleWorker {
+    id: u64,
+    waker: Waker,
+    /// `kick_pool` woke it (by reference; it removes itself when it runs).
+    woken: bool,
+    /// The idle reaper asks it to exit (`set_worker_dying`).
+    reap: bool,
+    /// Jiffy it went idle (`last_active`).
+    since: u64,
+}
+
 struct PoolInner {
     worklist: WorkList,
     nr_workers: usize,
     /// Workers spawned that have not reached their loop yet.
     nr_starting: usize,
     nr_running: usize,
+    /// `idle_list`, oldest first.
+    idle: Vec<IdleWorker>,
+    next_id: u64,
     /// `busy_hash`: works executing on this pool, with the queue sequence of
     /// the instance (compared by address only; never dereferenced).
     busy: Vec<(usize, u64)>,
+}
+
+impl PoolInner {
+    /// `too_many_workers`: more than two idle and idle beyond a quarter of
+    /// the busy ones.
+    fn too_many_workers(&self) -> bool {
+        let nr_idle = self.idle.iter().filter(|w| !w.woken).count();
+        let nr_busy = self.nr_workers.saturating_sub(nr_idle);
+        nr_idle > 2 && (nr_idle - 2) * MAX_IDLE_WORKERS_RATIO >= nr_busy
+    }
 }
 
 /// `struct worker_pool`.
@@ -372,11 +434,56 @@ pub struct Pool {
     /// interrupt context) on a pool with no worker to take it, and creates
     /// one, or past the limit sends mayday.
     mayday_timer: TimerList,
+    /// `idle_timer`: reaps idle workers past `IDLE_WORKER_TIMEOUT`.
+    idle_timer: TimerList,
     cpu: Option<u32>,
     highpri: bool,
     inner: IrqSafeSpinLock<PoolInner>,
     /// Works run (diagnostic).
     nr_done: AtomicU64,
+}
+
+/// `idle_worker_timeout`: while the pool has too many idle workers, ask
+/// the longest-idle one to exit once it has been idle `IDLE_WORKER_TIMEOUT`;
+/// re-arm for the next one.
+fn pool_idle_fn(r: TimerRef) {
+    // SAFETY: only pools use this callback; `idle_timer` is a field of the
+    // repr(C) `Pool`; step back to it. Pools are leaked.
+    let pool: &'static Pool = unsafe {
+        &*((r.as_ptr() as *const u8).sub(core::mem::offset_of!(Pool, idle_timer)) as *const Pool)
+    };
+    let now = wheel::jiffies();
+    let rearm = {
+        let mut g = pool.inner.lock();
+        let mut rearm = None;
+        while g.too_many_workers() {
+            let Some(w) = g.idle.iter_mut().find(|w| !w.woken) else {
+                break;
+            };
+            let due = w.since + idle_timeout();
+            if now < due {
+                rearm = Some(due);
+                break;
+            }
+            w.reap = true;
+            w.woken = true;
+            // By reference: the worker drops its own entry when it runs.
+            w.waker.wake_by_ref();
+        }
+        rearm
+    };
+    if let Some(due) = rearm {
+        // SAFETY: the timer lives in a leaked pool.
+        unsafe { wheel::mod_timer(&pool.idle_timer, due) };
+    }
+}
+
+/// A worker went idle: start the reaper if the pool now has too many.
+fn arm_idle_reaper(pool: &'static Pool, too_many: bool) {
+    if too_many && !pool.idle_timer.is_pending() {
+        // SAFETY: the timer lives in a leaked pool.
+        unsafe { wheel::mod_timer(&pool.idle_timer, wheel::jiffies() + idle_timeout()) };
+    }
 }
 
 /// `MAYDAY_INTERVAL`: re-check a starved pool every 100 ms.
@@ -433,6 +540,7 @@ fn new_pool(cpu: Option<u32>, highpri: bool) -> &'static Pool {
                 0
             },
         ),
+        idle_timer: TimerList::new(pool_idle_fn, wheel::TIMER_DEFERRABLE),
         cpu,
         highpri,
         inner: IrqSafeSpinLock::new(PoolInner {
@@ -440,6 +548,8 @@ fn new_pool(cpu: Option<u32>, highpri: bool) -> &'static Pool {
             nr_workers: 0,
             nr_starting: 0,
             nr_running: 0,
+            idle: Vec::new(),
+            next_id: 0,
             busy: Vec::new(),
         }),
         nr_done: AtomicU64::new(0),
@@ -502,25 +612,47 @@ fn pool_for(wq: &Workqueue, cpu: usize) -> Option<&'static Pool> {
 
 /// `create_worker`: spawn a worker task for `pool` (task context).
 fn create_worker(pool: &'static Pool) {
-    {
+    let id = {
         let mut g = pool.inner.lock();
         g.nr_workers += 1;
         g.nr_starting += 1;
-    }
-    let spec = match pool.cpu {
+        g.next_id += 1;
+        g.next_id
+    };
+    let mut spec = match pool.cpu {
         Some(cpu) => TaskSpec {
             affinity: Affinity::pinned(CpuId(cpu)),
             ..TaskSpec::kernel_any()
         },
         None => TaskSpec::kernel_any(),
     };
-    crate::spawn_with_spec(worker_main(pool), spec);
+    if pool.highpri {
+        // `HIGHPRI_NICE_LEVEL`: the high-priority pools' workers run at
+        // nice -20, ahead of every default-priority task in their class.
+        spec.priority = crate::priority::Priority(HIGHPRI_NICE_LEVEL);
+    }
+    crate::spawn_with_spec(worker_main(pool, id), spec);
 }
 
-/// `kick_pool` / `need_more_worker`: whether the pool has queued work and
-/// no worker running or starting to take it (all asleep or gone).
+/// `HIGHPRI_NICE_LEVEL` (`MIN_NICE`).
+const HIGHPRI_NICE_LEVEL: i8 = -20;
+
+/// `kick_pool`: queued work and no running worker — wake an idle one.
+/// Returns whether the pool needs a new worker instead (none idle or
+/// starting).
 fn kick_pool(g: &mut PoolInner) -> bool {
-    g.worklist.len != 0 && g.nr_running == 0 && g.nr_starting == 0
+    if g.worklist.len == 0 || g.nr_running != 0 || g.nr_starting != 0 {
+        return false;
+    }
+    if let Some(w) = g.idle.iter_mut().rev().find(|w| !w.woken) {
+        // The most recently idle (Linux `first_idle_worker` is the list
+        // head, where workers are added).
+        w.woken = true;
+        // By reference: no `Waker` is dropped here (IRQ-safe).
+        w.waker.wake_by_ref();
+        return false;
+    }
+    true
 }
 
 /// Queued work found no worker: create one now, or — in interrupt context,
@@ -1075,7 +1207,13 @@ impl Future for Tracked {
 /// (`send_mayday`). Task or timer context.
 fn worker_needed(pool: &'static Pool) {
     let (at_limit, starting) = {
-        let g = pool.inner.lock();
+        let mut g = pool.inner.lock();
+        if let Some(w) = g.idle.iter_mut().rev().find(|w| !w.woken) {
+            // An idle worker takes it.
+            w.woken = true;
+            w.waker.wake_by_ref();
+            return;
+        }
         (g.nr_workers >= MAX_WORKERS_PER_POOL, g.nr_starting != 0)
     };
     if starting {
@@ -1177,12 +1315,78 @@ async fn process_one(pool: &'static Pool, w: &'static WorkStruct) {
     wake_flushers();
 }
 
-/// `worker_thread`. Runs works while the pool has any, then exits: an idle
-/// worker parked for ever would keep this CPU's executor from ever draining
-/// (the in-kernel test harness drains it), so idle workers are not kept —
-/// Linux keeps them for `IDLE_WORKER_TIMEOUT`. The next queueing creates a
-/// worker again.
-async fn worker_main(pool: &'static Pool) {
+/// Parks an idle worker on its pool's idle list until `kick_pool` (or the
+/// reaper) wakes it (`worker_enter_idle` … `worker_leave_idle`). Marked as
+/// an idle worker to the scheduler meanwhile, so it is not counted as work.
+/// Resolves to whether the reaper asked it to exit.
+struct IdleWait {
+    pool: &'static Pool,
+    id: u64,
+}
+
+impl Future for IdleWait {
+    type Output = bool;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        let (pool, id) = (self.pool, self.id);
+        let (done, too_many) = {
+            let mut g = pool.inner.lock();
+            match g.idle.iter().position(|w| w.id == id) {
+                Some(pos) if g.idle[pos].woken => {
+                    // `worker_leave_idle`.
+                    let w = g.idle.remove(pos);
+                    let reap = w.reap;
+                    if reap {
+                        g.nr_workers -= 1;
+                    } else {
+                        g.nr_running += 1;
+                    }
+                    drop(g);
+                    crate::set_idle_worker(cx.waker(), false);
+                    drop(w);
+                    return Poll::Ready(reap);
+                }
+                Some(pos) => {
+                    if !g.idle[pos].waker.will_wake(cx.waker()) {
+                        g.idle[pos].waker = cx.waker().clone();
+                    }
+                    (false, false)
+                }
+                None if g.worklist.len != 0 => {
+                    // Work arrived before this worker went idle.
+                    (true, false)
+                }
+                None => {
+                    // `worker_enter_idle`.
+                    g.nr_running -= 1;
+                    let since = wheel::jiffies();
+                    g.idle.push(IdleWorker {
+                        id,
+                        waker: cx.waker().clone(),
+                        woken: false,
+                        reap: false,
+                        since,
+                    });
+                    (false, g.too_many_workers())
+                }
+            }
+        };
+        if done {
+            return Poll::Ready(false);
+        }
+        crate::set_idle_worker(cx.waker(), true);
+        arm_idle_reaper(pool, too_many);
+        Poll::Pending
+    }
+}
+
+/// `worker_thread`. Runs the pool's works; with none, parks idle (and is
+/// reaped by the pool's idle timer once there are too many idle workers and
+/// it has been idle `IDLE_WORKER_TIMEOUT`). Before running a work it makes
+/// sure the pool keeps an idle worker in reserve (`may_start_working` /
+/// `manage_workers`), so a queueing while every worker is busy or asleep —
+/// possibly from interrupt context, which cannot create workers — finds one
+/// to wake.
+async fn worker_main(pool: &'static Pool, id: u64) {
     {
         let mut g = pool.inner.lock();
         g.nr_starting -= 1;
@@ -1191,17 +1395,28 @@ async fn worker_main(pool: &'static Pool) {
     loop {
         let w = {
             let mut g = pool.inner.lock();
-            if let Some(w) = g.worklist.pop_front() {
+            let w = g.worklist.pop_front();
+            if let Some(w) = w {
                 w.flags.fetch_and(!ON_POOL, Ordering::AcqRel);
-                w
-            } else {
-                // Under the pool lock: a queueing after this sees one
-                // worker fewer and creates one.
-                g.nr_running -= 1;
-                g.nr_workers -= 1;
+            }
+            w
+        };
+        let Some(w) = w else {
+            if (IdleWait { pool, id }).await {
+                // Reaped.
                 return;
             }
+            continue;
         };
+        let spare = {
+            let g = pool.inner.lock();
+            !g.idle.iter().any(|w| !w.woken)
+                && g.nr_starting == 0
+                && g.nr_workers < MAX_WORKERS_PER_POOL
+        };
+        if spare {
+            create_worker(pool);
+        }
         process_one(pool, w).await;
         // Let the CPU's other tasks run between works. This worker still
         // counts as running: queued work waits for it rather than for a new

@@ -1091,13 +1091,18 @@ control callback.
 | concurrency management (`nr_running`, `wq_worker_sleeping`, `kick_pool`) | a pending async work puts its worker to sleep; queued work with no running worker gets a new worker (from interrupt context: the pool's manager timer, next jiffy) |
 | `max_active`, inactive list | per workqueue, queue order kept |
 | rescuer, `send_mayday` | a pool at `MAX_WORKERS_PER_POOL` sends its `WQ_MEM_RECLAIM` work to the workqueue's rescuer task |
+| `may_start_working` / `manage_workers` | a worker about to run a work makes sure the pool keeps an idle worker in reserve |
+| `WORKER_IDLE`, `idle_list`, `idle_worker_timeout`, `too_many_workers`, `IDLE_WORKER_TIMEOUT` (300 s) | idle workers park on the pool's idle list; the pool's idle timer reaps those beyond the reserve (more than 2 idle, idle ≥ busy / 4) after 300 s |
+| `HIGHPRI_NICE_LEVEL` (`MIN_NICE`) | high-priority pool workers run at `Priority(-20)` |
 
-Departures, each because of the executor: idle workers are not kept (a
-worker exits when its pool's worklist is empty — a parked task would keep the
-CPU's executor from draining); a synchronous work that spins holds its CPU as
-a non-preemptible kthread would; high-priority pools run at the default task
-priority; the rescuer is started on mayday (task creation does not fail).
-`__reset_queues_for_test` forgets every pool with the workers it drops.
+An idle worker marks itself to the executor (`set_idle_worker`) before it
+parks; the executor counts it as no work, so `run_until_empty` treats a CPU
+whose only parked tasks are idle workers as empty (`ParkedTasks::busy_len`).
+
+Departures, each because of the executor: a synchronous work that spins
+holds its CPU as a non-preemptible kthread would; the rescuer is started on
+mayday (task creation does not fail). `__reset_queues_for_test` forgets every
+pool with the workers it drops.
 
 ### Live Linux user-thread policies
 
