@@ -1302,7 +1302,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
     /// `block_on` is not. The update completes without waiting unless
     /// another CPU is mid-operation on this filesystem.
     fn set_times(&self, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> Result<(), FsError> {
-        narf_scheduler::block_on_spin(self.set_times_async(atime_ns, mtime_ns))
+        narf_filesystem::wait_sync(self.set_times_async(atime_ns, mtime_ns))
     }
 
     fn ioctl_async<'a>(
@@ -1458,10 +1458,11 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         // Lookups are async (tree reads), but the synchronous VFS API must
         // still resolve real entries: OverlayFS consults its lower layers
         // through it (the session-writable root over a read-only btrfs root),
-        // as do bind-mount source resolution and exec path checks. Same
-        // bridge as ext's: re-entrancy-safe, never halts, and the block
-        // device's completion still arrives.
-        match narf_scheduler::block_on_spin(self.lookup_async(name)) {
+        // as do bind-mount source resolution and exec path checks. In a
+        // system call the wait parks the task ([`narf_filesystem::wait_sync`]):
+        // spinning here once held a CPU whose own tasks the lock it waited
+        // for had been handed to, and the filesystem stopped.
+        match narf_filesystem::wait_sync(self.lookup_async(name)) {
             Ok(node) => Some(node),
             Err(error) => {
                 note_lookup_error(name, error);
@@ -1472,7 +1473,7 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         // See `lookup`.
-        match narf_scheduler::block_on_spin(self.lookup_dir_async(name)) {
+        match narf_filesystem::wait_sync(self.lookup_dir_async(name)) {
             Ok(node) => Some(node),
             Err(error) => {
                 note_lookup_error(name, error);
@@ -2005,7 +2006,7 @@ impl<B: BlockDevice + 'static> FsInstance for BtrfsVolume<B> {
     /// with `ReadOnly` where a read-write mount would be (disk policy,
     /// write-safety gate, an aborted transaction).
     fn reconfigure_sb(&self, sb_flags: u64, sb_mask: u64, options: &str) -> Result<(), FsError> {
-        narf_scheduler::block_on_spin(self.reconfigure_sb_async(sb_flags, sb_mask, options))
+        narf_filesystem::wait_sync(self.reconfigure_sb_async(sb_flags, sb_mask, options))
     }
 
     fn reconfigure_sb_async<'a>(

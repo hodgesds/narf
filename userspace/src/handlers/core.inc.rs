@@ -564,7 +564,15 @@ pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
     TASK_LOOKUP.store(lookup as usize, Ordering::Release);
     // Filesystem lock waits on a syscall's behalf end on SIGKILL.
     narf_filesystem::killable::install_kill_hooks(&KILL_HOOKS);
+    // A synchronous filesystem entry point's wait parks the user task.
+    narf_filesystem::sync_wait::install_sync_wait_hooks(&SYNC_WAIT_HOOKS);
 }
+
+static SYNC_WAIT_HOOKS: narf_filesystem::sync_wait::SyncWaitHooks =
+    narf_filesystem::sync_wait::SyncWaitHooks {
+        in_user_task: || crate::user_task::current_user_task().is_some(),
+        park: park_pending_future,
+    };
 
 static KILL_HOOKS: narf_filesystem::killable::KillHooks = narf_filesystem::killable::KillHooks {
     current: current_task_id,

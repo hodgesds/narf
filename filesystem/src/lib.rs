@@ -68,6 +68,8 @@ extern crate alloc;
 pub mod bluetooth;
 pub mod bpffs;
 pub mod killable;
+pub mod sync_wait;
+pub use sync_wait::wait_sync;
 #[cfg(feature = "cgroup")]
 pub mod cgroupfs;
 pub mod console_tty;
