@@ -23,6 +23,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use crate::sg::SgRequest;
 use crate::{BlockCompletion, BlockError, BlockOp, BlockRequest, CancelResult};
 
 /// Boxed completion future of one request.
@@ -80,6 +81,19 @@ pub trait BlockQueue: Send + Sync {
     /// Requests currently at the device (diagnostic; the queued-submission
     /// smokes assert it exceeds one under concurrent submitters).
     fn in_flight(&self) -> usize;
+    /// Submit a scatter-gather request that already conforms to
+    /// [`Self::limits`] — callers go through [`crate::split_to_limits`],
+    /// which splits an oversized one first. The default refuses.
+    fn submit_sg(&self, req: SgRequest) -> BoxedCompletion {
+        ready_completion(req.user_tag, Err(BlockError::InvalidRange))
+    }
+}
+
+/// [`BlockQueue::submit_sg`] through the block layer's splitter: the entry
+/// every submitter uses.
+pub fn submit_sg(q: &dyn BlockQueue, req: SgRequest) -> BoxedCompletion {
+    let limits = q.limits();
+    crate::sg::split_to_limits(req, &limits, &|child| q.submit_sg(child))
 }
 
 /// A window `[start, start + len)` LBAs onto `inner`, for partitions.
@@ -135,6 +149,14 @@ impl BlockQueue for OffsetQueue {
     }
     fn in_flight(&self) -> usize {
         self.inner.in_flight()
+    }
+    fn submit_sg(&self, mut req: SgRequest) -> BoxedCompletion {
+        let end = req.lba.checked_add(req.blocks as u64);
+        if end.is_none_or(|end| end > self.len) {
+            return ready_completion(req.user_tag, Err(BlockError::InvalidRange));
+        }
+        req.lba += self.start;
+        self.inner.submit_sg(req)
     }
 }
 

@@ -99,6 +99,43 @@ pub struct BlockCompletion {
 }
 ```
 
+**Scatter-gather requests** (`block/src/sg.rs`, Linux `bio` + `bio_vec`,
+`bio_split_to_limits`):
+
+```rust
+pub struct SgRequest {
+    pub op:       BlockOp,
+    pub lba:      u64,
+    pub blocks:   u32,
+    pub pages:    Cap<PageList, Read>,  // the caller's own pages (io/ §3)
+    pub offset:   usize,                // byte offset of the payload in the list
+    pub qos:      QosHint,
+    pub user_tag: u64,
+}
+
+impl BlockDevice { fn submit_sg(&self, req: SgRequest) -> impl Future<Output = BlockCompletion>; }
+impl BlockQueue  { fn submit_sg(&self, req: SgRequest) -> BoxedCompletion; }   // conforming requests only
+pub fn queue::submit_sg(q: &dyn BlockQueue, req: SgRequest) -> BoxedCompletion; // through the splitter
+pub fn split_to_limits(req, &QueueLimits, submit_one) -> BoxedCompletion;
+```
+
+The payload is a list of pages under one capability; no bounce buffer. The
+block layer, not the submitter, fits a request to the device: `queue::submit_sg`
+/ `split_to_limits` classify it against `QueueLimits` (`fit`) and cut one that
+exceeds `max_transfer_bytes`, `max_segments` or `max_segment_bytes` into
+whole-block children (`child_ranges`, greedy per block, segments merged as
+the device sees them), issued all at once; `SplitCompletion` completes the
+parent when every child has, the first child error winning; dropping the
+parent future drops (cancels) outstanding children. `InvalidRange` is kept for
+requests that can never conform: a segment misaligned to `dma_alignment`, a
+single block larger than the transfer limit, a range outside the device or the
+list. `BlockDevice::submit_sg`'s default refuses; devices without
+scatter-gather DMA iterate the pages (`RamBlockDevice` copies page by page,
+`SyncBlock` bounces each ≤ 64 KiB run through its sync calls); NVMe builds
+PRP entries from the segments (one list page per command from the queue's
+pool), virtio-blk one descriptor per segment. `BlockRequest` (one contiguous
+`Cap<DmaBuffer, Read>`) is unchanged and remains the single-buffer form.
+
 **Two tags, not one.** The submission carries a caller-set
 `user_tag` (opaque correlation cookie) and receives a
 kernel-assigned `tag` in the completion. The kernel's `tag` is

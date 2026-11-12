@@ -932,6 +932,17 @@ impl crate::BlockQueue for PolicyQueue {
     fn in_flight(&self) -> usize {
         self.inner.in_flight()
     }
+    fn submit_sg(&self, req: crate::SgRequest) -> crate::BoxedCompletion {
+        if crate::queue::op_writes(req.op) && !permits_write(self.disk, self.dev, self.write_parent)
+        {
+            refuse_write(self.name, &self.warned, req.lba, req.blocks);
+            return crate::queue::ready_completion(
+                req.user_tag,
+                Err(crate::BlockError::PermissionDenied),
+            );
+        }
+        self.inner.submit_sg(req)
+    }
 }
 
 impl BlockDeviceSync for PolicyGuard {

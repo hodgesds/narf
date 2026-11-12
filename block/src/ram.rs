@@ -121,9 +121,47 @@ impl BlockDevice for RamBlockDevice {
     async fn cancel(&self, _tag: u64) -> CancelResult {
         CancelResult::NotFound
     }
+
+    /// Scatter-gather by iteration: the pages are copied one by one.
+    fn submit_sg(&self, req: crate::SgRequest) -> impl Future<Output = BlockCompletion> + Send {
+        let result = self.do_sg(&req);
+        core::future::ready(BlockCompletion {
+            tag: 0,
+            user_tag: req.user_tag,
+            result,
+        })
+    }
 }
 
 impl RamBlockDevice {
+    fn do_sg(&self, req: &crate::SgRequest) -> Result<(), BlockError> {
+        let list = req.resolve().ok_or(BlockError::PermissionDenied)?;
+        let (start, end) = self.byte_range(req.lba, req.blocks)?;
+        let span = end - start;
+        if req.offset.checked_add(span).is_none_or(|e| e > list.len()) {
+            return Err(BlockError::InvalidRange);
+        }
+        let mut storage = self.storage.lock();
+        let ok = match req.op {
+            BlockOp::Read => {
+                crate::sg::copy_pages(&list, req.offset, &mut storage[start..end], true)
+            }
+            BlockOp::Write { .. } => {
+                crate::sg::copy_pages(&list, req.offset, &mut storage[start..end], false)
+            }
+            BlockOp::WriteZeroes => {
+                storage[start..end].fill(0);
+                true
+            }
+            BlockOp::Trim => true,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(BlockError::InvalidRange)
+        }
+    }
+
     fn do_io(
         &self,
         req: &BlockRequest,
