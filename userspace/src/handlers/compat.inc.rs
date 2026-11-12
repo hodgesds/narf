@@ -8050,7 +8050,7 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
     let mut groups: BTreeMap<alloc::string::String, (usize, u64)> = BTreeMap::new();
     let mut lines = alloc::string::String::new();
     let mut listed = 0usize;
-    for (id, origin) in ids.iter() {
+    for (id, origin, spawned_at) in ids.iter() {
         let tid = id.raw();
         if task_to_pid_raw(tid).is_some() {
             visible += 1;
@@ -8099,9 +8099,11 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
             }
         };
         let key = alloc::format!(
-            "{} origin={} as={} sys={} at={}",
+            "{} origin={} spawned={}:{} as={} sys={} at={}",
             state,
             short,
+            spawned_at.file(),
+            spawned_at.line(),
             u8::from(space.is_some()),
             sys.as_deref().unwrap_or("-"),
             site.as_deref().unwrap_or("-"),

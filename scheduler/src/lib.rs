@@ -2807,6 +2807,9 @@ pub(crate) struct TaskSlot {
     /// only (`task_origins`): names a task that has no pid, comm or registry
     /// entry, such as a kernel helper a soak finds accumulating.
     pub(crate) origin: &'static str,
+    /// Where it was spawned (`spawn`'s caller; for the other spawn wrappers,
+    /// the wrapper). Diagnostic only, with `origin`.
+    pub(crate) site: &'static core::panic::Location<'static>,
     /// Why the policy selected this dispatch; copied into its runtime event.
     pub(crate) dispatch_reason: policy::DispatchReason,
     task: BoxedTask,
@@ -4594,6 +4597,7 @@ fn notify_cpu_active(cpu: usize) {
 ///
 /// Returns the `TaskId` stamped on the newly-created task — `donate_to`
 /// and future `cancel`/`join` primitives name the task by this id.
+#[track_caller]
 pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) -> TaskId {
     spawn_with_spec(f, TaskSpec::unthrottled())
 }
@@ -4602,6 +4606,7 @@ pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) -> TaskId {
 /// `budget_cap` makes the task always-runnable; a live cap is
 /// epoch-checked on every round and the task drops when the cap is
 /// revoked.
+#[track_caller]
 pub fn spawn_with_spec<F>(f: F, spec: TaskSpec) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
@@ -4615,6 +4620,7 @@ where
 /// `StackfulOptions::domain` (the same value stamped into the
 /// stackful `domain_byte`) so authority and `current_domain()`
 /// agree from the task's first poll.
+#[track_caller]
 fn spawn_with_spec_in_domain<F>(f: F, spec: TaskSpec, domain: DomainId) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
@@ -4641,6 +4647,7 @@ where
     authority.publish();
     let slot = TaskSlot {
         origin: core::any::type_name::<F>(),
+        site: core::panic::Location::caller(),
         user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(f),
@@ -4709,6 +4716,7 @@ where
     authority.publish();
     let slot = TaskSlot {
         origin: core::any::type_name::<F>(),
+        site: core::panic::Location::caller(),
         user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
@@ -4997,6 +5005,7 @@ where
     authority.publish();
     let slot = TaskSlot {
         origin: "user task",
+        site: core::panic::Location::caller(),
         user_scheduling: Some(user_scheduling),
         dispatch_reason: policy::DispatchReason::Policy,
         task,
@@ -5116,13 +5125,17 @@ pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
 /// Every queued or parked task with the type name of the future it runs,
 /// for diagnostics (`/proc/narf/tasks`). Same snapshot semantics as
 /// [`all_task_ids`].
-pub fn task_origins() -> alloc::vec::Vec<(TaskId, &'static str)> {
+pub fn task_origins() -> alloc::vec::Vec<(
+    TaskId,
+    &'static str,
+    &'static core::panic::Location<'static>,
+)> {
     let mut out = alloc::vec::Vec::new();
     for q in READY.iter() {
         let g = q.lock();
         if let Some(ref dq) = *g {
             for slot in dq.iter() {
-                out.push((slot.id, slot.origin));
+                out.push((slot.id, slot.origin, slot.site));
             }
         }
     }
@@ -5130,7 +5143,7 @@ pub fn task_origins() -> alloc::vec::Vec<(TaskId, &'static str)> {
         let g = q.lock();
         if let Some(ref parked) = *g {
             for (id, entry) in parked.iter() {
-                out.push((*id, entry.slot.origin));
+                out.push((*id, entry.slot.origin, entry.slot.site));
             }
         }
     }
