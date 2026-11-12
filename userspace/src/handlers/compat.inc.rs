@@ -8029,6 +8029,98 @@ pub fn proc_pid_report(outer: u64) -> Option<u64> {
     }
 }
 
+/// `/proc/narf/tasks`: every scheduler task that `/proc` does not list (no
+/// pid binding), with what it still holds. A task the scheduler keeps after
+/// its process left `/proc` keeps its future, its kernel stack and, if it has
+/// one, its address space — its resident pages and page tables — alive.
+///
+/// Header lines count scheduler tasks, `/proc`-visible ones, hidden ones,
+/// hidden ones that still own an address space and those address spaces'
+/// resident pages. Then one `group` line per (registry state, syscall, wait
+/// site) with its count and resident pages, largest first, and up to 64
+/// `task` lines.
+pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
+    use alloc::collections::BTreeMap;
+    use core::fmt::Write as _;
+    let ids = narf_scheduler::all_task_ids();
+    let mut visible = 0usize;
+    let mut hidden = 0usize;
+    let mut hidden_as = 0usize;
+    let mut hidden_rss = 0u64;
+    let mut groups: BTreeMap<alloc::string::String, (usize, u64)> = BTreeMap::new();
+    let mut lines = alloc::string::String::new();
+    let mut listed = 0usize;
+    for id in ids.iter() {
+        let tid = id.raw();
+        if task_to_pid_raw(tid).is_some() {
+            visible += 1;
+            continue;
+        }
+        hidden += 1;
+        let task = crate::task::task_get(tid);
+        let state = match task.as_ref() {
+            None => "unregistered",
+            Some(t) if t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE => "zombie",
+            Some(_) => "live",
+        };
+        let last_pid = task.as_ref().map_or(0, |t| t.pid.load(Ordering::Relaxed));
+        let frame = proc_task_syscall_frame(tid);
+        let sys = proc_wchan_of_frame(frame).or_else(|| {
+            crate::task::running_syscall(tid)
+                .and_then(|nr| crate::syscall::syscall_name_of_number(u64::from(nr)))
+                .map(alloc::string::String::from)
+        });
+        let site = crate::handlers::parked_wait_site(tid)
+            .or_else(|| crate::handlers::parked_park_site(tid))
+            .or_else(|| crate::handlers::yielded_site(tid));
+        let space = narf_scheduler::address_space_of(*id);
+        let rss = space.as_ref().map_or(0, |s| s.memory_stats().resident_pages);
+        let as_refs = space.as_ref().map_or(0, |s| Arc::strong_count(s).saturating_sub(1));
+        if space.is_some() {
+            hidden_as += 1;
+            hidden_rss = hidden_rss.saturating_add(rss);
+        }
+        let key = alloc::format!(
+            "{} as={} sys={} at={}",
+            state,
+            u8::from(space.is_some()),
+            sys.as_deref().unwrap_or("-"),
+            site.as_deref().unwrap_or("-"),
+        );
+        let e = groups.entry(key).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = e.1.saturating_add(rss);
+        if listed < 64 {
+            listed += 1;
+            let _ = writeln!(
+                lines,
+                "task tid={} pid={} comm={} {} as_rss={} as_refs={} sys={} at={}",
+                tid,
+                last_pid,
+                proc_comm_of_task_try(tid).unwrap_or_default(),
+                state,
+                rss,
+                as_refs,
+                sys.as_deref().unwrap_or("-"),
+                site.as_deref().unwrap_or("-"),
+            );
+        }
+    }
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "sched_tasks {}", ids.len());
+    let _ = writeln!(s, "proc_visible {}", visible);
+    let _ = writeln!(s, "hidden {}", hidden);
+    let _ = writeln!(s, "hidden_with_as {}", hidden_as);
+    let _ = writeln!(s, "hidden_as_rss_pages {}", hidden_rss);
+    let mut sorted: alloc::vec::Vec<_> = groups.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    for (key, (count, rss)) in sorted.iter().take(40) {
+        let _ = writeln!(s, "group n={} rss_pages={} {}", count, rss, key);
+    }
+    s.push_str(&lines);
+    s.into_bytes()
+}
+
 /// /proc enumerator — every live PROCESS (thread-group leader, keyed in
 /// `PID_TO_TASK` by its outer ProcessId) that is visible in the READER's PID
 /// namespace, reported as the reader's inner pid. A namespaced reader sees

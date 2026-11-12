@@ -1353,6 +1353,16 @@ fn task_nofile_limit(task: u64) -> u64 {
         .unwrap_or_else(|| default_rlimits()[RLIMIT_NOFILE_RESOURCE].cur)
 }
 
+/// `/proc/narf/tasks`, read-only.
+#[derive(Debug)]
+struct NarfTasksFile;
+
+impl narf_filesystem::procfs::ProcFile for NarfTasksFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        narf_tasks_report()
+    }
+}
+
 pub fn init_per_task_state() {
     bootstrap_init();
     // Publish the descriptor-allocation bound to the fd table. Until this is
@@ -1395,6 +1405,9 @@ pub fn init_per_task_state() {
         crate::proc_ipc_limit_read,
         crate::proc_ipc_limit_write,
     );
+    // `/proc/narf/tasks`: scheduler tasks `/proc` does not list, and what
+    // they still hold (see `narf_tasks_report`).
+    narf_filesystem::procfs::register_proc("narf/tasks", Arc::new(NarfTasksFile));
     rlimit_init();
     nice_init();
     umask_init();
