@@ -415,20 +415,30 @@ pub fn neigh_periodic_gc(now: u64) -> usize {
     dropped
 }
 
-/// `tbl->gc_work`: a deferrable wheel timer (it never wakes an idle CPU,
-/// like Linux's `system_power_efficient_wq` work) re-armed each pass.
-static NEIGH_GC_TIMER: narf_time::timer::TimerList =
-    narf_time::timer::TimerList::new(neigh_gc_fn, narf_time::timer::TIMER_DEFERRABLE);
+/// `tbl->gc_work`: deferrable delayed work (its timer never wakes an idle
+/// CPU) on `system_power_efficient_wq`, re-queued each pass, as Linux's
+/// `neigh_periodic_work`.
+static NEIGH_GC_WORK: narf_scheduler::workqueue::DelayedWork =
+    narf_scheduler::workqueue::DelayedWork::new(
+        narf_scheduler::workqueue::WorkFn::Sync(neigh_gc_fn),
+        true,
+    );
 
-fn neigh_gc_fn(_: narf_time::timer::TimerRef) {
+fn neigh_gc_fn(_: narf_scheduler::workqueue::WorkRef) {
     let _ = neigh_periodic_gc(now_ns());
     arm_gc();
 }
 
 fn arm_gc() {
-    let j = narf_time::timer::jiffies() + narf_time::timer::ns_to_jiffies(GC_INTERVAL_NS);
-    // SAFETY: the timer is a static.
-    unsafe { narf_time::timer::mod_timer(&NEIGH_GC_TIMER, j) };
+    let delay = narf_time::timer::ns_to_jiffies(GC_INTERVAL_NS);
+    // SAFETY: the delayed work is a static.
+    unsafe {
+        narf_scheduler::workqueue::queue_delayed_work(
+            narf_scheduler::workqueue::system_power_efficient_wq(),
+            &NEIGH_GC_WORK,
+            delay,
+        )
+    };
 }
 
 /// Start the periodic neighbour GC (boot, once).
