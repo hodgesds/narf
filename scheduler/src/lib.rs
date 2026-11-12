@@ -94,6 +94,8 @@ pub mod priority;
 pub mod stackful;
 pub mod steal;
 mod user_policy;
+pub mod workqueue;
+mod workqueue_tests;
 
 #[cfg(feature = "hrtick")]
 mod hrtick;
@@ -3242,6 +3244,10 @@ pub fn init() {
     // byte-for-byte. Idempotent for the same reason the wave D/E
     // installs are.
     steal::install_default_if_unset();
+    // `workqueue_init`: the boot CPU's worker pools and the system
+    // workqueues. Other CPUs' pools are created on first use; workers are
+    // created when work is queued.
+    workqueue::workqueue_init();
 }
 
 /// Test-only hook: clear every ready queue without re-running
@@ -3250,6 +3256,9 @@ pub fn init() {
 /// touching the one-shot `INITIALIZED` flag in `init`.
 #[doc(hidden)]
 pub fn __reset_queues_for_test() {
+    // The worker tasks of every pool go with the queues: the next use of a
+    // workqueue creates fresh pools.
+    workqueue::__reset_for_test();
     for (cpu, q) in READY.iter().enumerate() {
         blocking::reset(cpu);
         if let Some(d) = q.lock().as_mut() {
