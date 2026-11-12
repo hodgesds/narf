@@ -131,3 +131,38 @@ kernel_test_in!(
     "memory/slab_retention",
     smoke_slab_mixed_churn_returns_empty_frames
 );
+
+/// `shrink` (`kmem_cache_shrink`, what `drop_caches` ends with) empties this
+/// CPU's magazines and returns every empty frame: after the same churn, no
+/// class keeps even the `min_partial` cache, and the frames this CPU's
+/// magazines pinned are free too.
+fn smoke_slab_shrink_releases_every_empty_frame() -> TestResult {
+    let mut base = [0usize; N_CLASSES];
+    for (c, slot) in base.iter_mut().enumerate() {
+        *slot = class_detail(c).frames;
+    }
+    if let Err(r) = churn_every_class() {
+        return r;
+    }
+    super::shrink();
+    // Only other CPUs' concurrent activity can leave frames behind now.
+    const OTHER_CPU_NOISE: usize = 8;
+    let cpu = narf_lib::percpu::current_cpu();
+    for (c, &before) in base.iter().enumerate() {
+        let d = class_detail(c);
+        if d.frames > before + OTHER_CPU_NOISE {
+            return TestResult::Fail("shrink left the churn's frames in a class");
+        }
+        if d.empty_frames > OTHER_CPU_NOISE {
+            return TestResult::Fail("shrink left empty frames on a central list");
+        }
+        if super::_test_magazine_top(c, cpu) != 0 {
+            return TestResult::Fail("shrink left blocks in this CPU's magazine");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/slab_retention",
+    smoke_slab_shrink_releases_every_empty_frame
+);
