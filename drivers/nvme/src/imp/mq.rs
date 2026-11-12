@@ -108,6 +108,8 @@ pub struct CmdResources {
     pub prp_list: Option<DmaBuffer>,
     /// The caller's payload, pinned for the device's use.
     pub hold: Option<Arc<DmaBuffer>>,
+    /// The caller's page list (scatter-gather), pinned likewise.
+    pub pages: Option<Arc<narf_io::sg::PageList>>,
 }
 
 impl core::fmt::Debug for CmdResources {
@@ -115,6 +117,7 @@ impl core::fmt::Debug for CmdResources {
         f.debug_struct("CmdResources")
             .field("prp_list", &self.prp_list.is_some())
             .field("hold", &self.hold.is_some())
+            .field("pages", &self.pages.is_some())
             .finish()
     }
 }
@@ -874,7 +877,9 @@ impl IoQueue {
             self.release_resources(res);
         } else if let Some(res) = res {
             super::RETAINED_IO_BUFFERS.fetch_add(
-                res.hold.is_some() as u64 + res.prp_list.is_some() as u64,
+                res.hold.is_some() as u64
+                    + res.prp_list.is_some() as u64
+                    + res.pages.is_some() as u64,
                 Ordering::Relaxed,
             );
             core::mem::forget(res);
@@ -893,6 +898,7 @@ impl IoQueue {
                 self.prp_pool.release(page);
             }
             drop(res.hold);
+            drop(res.pages);
         }
     }
 

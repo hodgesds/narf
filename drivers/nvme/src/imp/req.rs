@@ -100,6 +100,7 @@ pub(crate) fn build_rw_sqe(
     let mut res = CmdResources {
         prp_list: None,
         hold,
+        pages: None,
     };
     let pair = if prp::prp_list_pages_needed(dma, bytes) == 0 {
         prp::setup_prps(dma, bytes, &mut [], &[])
@@ -142,7 +143,7 @@ pub(crate) fn build_rw_sqe_segments(
     lba: u64,
     n_blocks: u32,
     segs: &[(u64, u32)],
-    hold: Option<Arc<DmaBuffer>>,
+    pages: Option<Arc<narf_io::sg::PageList>>,
 ) -> Result<(Sqe, CmdResources), NvmeError> {
     let bytes = check_rw(ns, max_transfer, lba, n_blocks)?;
     let page = prp::NVME_CTRL_PAGE_SIZE as u64;
@@ -175,7 +176,8 @@ pub(crate) fn build_rw_sqe_segments(
     }
     let mut res = CmdResources {
         prp_list: None,
-        hold,
+        hold: None,
+        pages,
     };
     let (prp1, prp2) = match prps.len() {
         1 => (prps[0], 0),
@@ -298,6 +300,8 @@ pub struct NvmeRequest {
     lba: u64,
     blocks: u32,
     payload: Option<Arc<DmaBuffer>>,
+    /// Scatter-gather payload: the page list and the byte offset into it.
+    pages: Option<(Arc<narf_io::sg::PageList>, usize)>,
     user_tag: u64,
     /// Blocks completed by earlier commands of this request.
     done: u32,
@@ -365,6 +369,7 @@ impl NvmeRequest {
             lba,
             blocks,
             payload,
+            pages: None,
             user_tag,
             done: 0,
             cur_blocks: 0,
@@ -402,6 +407,33 @@ impl NvmeRequest {
                 sqe.cdw0 = IoOpcode::Flush as u32;
                 sqe.nsid = ns.nsid;
                 Ok((sqe, CmdResources::default()))
+            }
+            ReqOp::Read | ReqOp::Write { .. } if self.pages.is_some() => {
+                let (list, base) = self.pages.clone().expect("pages");
+                let lba_bytes = ns.lba_bytes as usize;
+                let per_cmd = (path.max_transfer as usize / lba_bytes).max(1) as u32;
+                let n = per_cmd.min(self.blocks - self.done);
+                self.cur_blocks = n;
+                let offset = base + self.done as usize * lba_bytes;
+                let fua = matches!(self.op, ReqOp::Write { fua: true });
+                match list.segments_in(offset, n as usize * lba_bytes) {
+                    None => Err(BlockError::InvalidRange),
+                    Some(segs) => {
+                        let segs: Vec<(u64, u32)> = segs.iter().map(|s| (s.dma, s.len)).collect();
+                        build_rw_sqe_segments(
+                            q,
+                            ns,
+                            path.max_transfer,
+                            fua,
+                            self.op.opcode(),
+                            self.lba + self.done as u64,
+                            n,
+                            &segs,
+                            Some(list),
+                        )
+                        .map_err(super::map_nvme_err)
+                    }
+                }
             }
             ReqOp::Read | ReqOp::Write { .. } => {
                 let payload = self.payload.clone().ok_or(BlockError::PermissionDenied);
@@ -774,5 +806,37 @@ impl BlockQueue for NvmeQueue {
 
     fn in_flight(&self) -> usize {
         self.path().map_or(0, |p| p.in_flight())
+    }
+
+    /// One conforming scatter-gather request (the splitter,
+    /// `narf_block::queue::submit_sg`, cut it to [`Self::limits`]): PRPs
+    /// are built straight from the page list's segments.
+    fn submit_sg(&self, req: narf_block::SgRequest) -> BoxedCompletion {
+        let op = match req.op {
+            BlockOp::Read => ReqOp::Read,
+            BlockOp::Write { fua } => ReqOp::Write { fua },
+            BlockOp::Trim => {
+                let r = super::nvme_discard_ns(self.instance, self.nsid, req.lba, req.blocks);
+                return Self::ready(req.user_tag, r);
+            }
+            BlockOp::WriteZeroes => {
+                let r = super::nvme_write_zeroes_ns(self.instance, self.nsid, req.lba, req.blocks);
+                return Self::ready(req.user_tag, r);
+            }
+        };
+        let Some(list) = req.resolve() else {
+            return Self::ready(req.user_tag, Err(BlockError::PermissionDenied));
+        };
+        let mut fut = NvmeRequest::new(
+            self.instance,
+            self.nsid,
+            op,
+            req.lba,
+            req.blocks,
+            None,
+            req.user_tag,
+        );
+        fut.pages = Some((list, req.offset));
+        Box::pin(fut)
     }
 }
