@@ -368,13 +368,29 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         29 /* PR_SET_TIMERSLACK */ => {
-            // Timer slack tunes nanosleep/poll wakeup coalescing; NARF doesn't
-            // coalesce timers, so accept and ignore (arg_a==0 resets to default).
+            // kernel/sys.c: arg2 > 0 sets `current->timer_slack_ns`; 0 restores
+            // `default_timer_slack_ns`. The slack widens every hrtimer sleep and
+            // timeout this task arms (nanosleep, poll/select/epoll, futex).
+            if let Some(uc) = crate::user_task::current_user_task() {
+                // SAFETY: the running task's live ctx; atomics only.
+                let uc = unsafe { &*uc };
+                let slack = if arg_a == 0 {
+                    uc.default_timer_slack_ns.load(Ordering::Relaxed)
+                } else {
+                    arg_a
+                };
+                uc.timer_slack_ns.store(slack, Ordering::Relaxed);
+            }
             ctx.set_return(SyscallReturn::ok(0));
         }
         30 /* PR_GET_TIMERSLACK */ => {
-            // Return value IS the slack (ns); report the Linux default (50µs).
-            ctx.set_return(SyscallReturn::ok(50_000));
+            // The return value IS the slack (ns).
+            let slack = crate::user_task::current_user_task().map_or(
+                crate::user_task::DEFAULT_TIMER_SLACK_NS,
+                // SAFETY: the running task's live ctx; atomics only.
+                |uc| unsafe { (*uc).timer_slack() },
+            );
+            ctx.set_return(SyscallReturn::ok(slack));
         }
         25 /* PR_GET_TSC */ => {
             // rdtsc is always enabled for user mode on NARF; report ON (1)
