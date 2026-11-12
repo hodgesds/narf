@@ -440,6 +440,11 @@ before setting the target's `WAKE_PENDING` notification. Its false-to-true edge
 sends an IPI even to a busy CPU; subsequent wakes coalesce until the target
 claims the batch. A halted target retains the final halt-race kick. Notification
 does not set `NEED_RESCHED`: that flag carries policy, timer, and control requests.
+Within one wake, parked-node publication records the CPU it notified; later
+placement skips a duplicate notification to that same CPU, even if the CPU has
+already claimed the batch. A changed destination is still notified, and the
+original inbox owner keeps its notification so it can drain the pinned node.
+Independent wakes retain the pending-bit and halt-handshake checks.
 Both channels and the pending queues participate in the idle-halt handshake.
 Idle destination selection excludes CPUs with pending activation.
 

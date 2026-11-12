@@ -1436,13 +1436,15 @@ pub(crate) fn release_direct_handoff_target(cell: &WakeCell, completed: bool) {
     // A wake may have arrived while direct_claimed suppressed activation.
     // Re-stage after release, including completion so the adapter is reaped.
     if cell.flag.load(Ordering::SeqCst) {
-        if !try_activate_parked_local(cell) {
-            parked_wake_push(cell);
-        }
+        let notified = if try_activate_parked_local(cell) {
+            None
+        } else {
+            parked_wake_push(cell)
+        };
         let home = cell.cpu.load(Ordering::Acquire);
         note_runnable_peer(home, cell.task);
         user_policy::note_rt_wake(cell, home);
-        notify_wake_cpu(home);
+        notify_wake_cpu_once(home, notified);
     }
 }
 
@@ -3670,15 +3672,17 @@ static PARKED_WAKE_INBOX: [ParkedWakeHead; narf_lib::percpu::MAX_CPUS] = [const 
     }
 };
     narf_lib::percpu::MAX_CPUS];
-fn parked_wake_push(cell: &WakeCell) {
+/// Return the CPU notified for this publication. Placement must still notify a
+/// different destination, but need not kick the queued node's owner twice.
+fn parked_wake_push(cell: &WakeCell) -> Option<u32> {
     'retry: loop {
         if cell.parked_location.load(Ordering::SeqCst) == NOT_PARKED
             || cell.task == TaskId::NONE.raw()
         {
-            return;
+            return None;
         }
         if cell.activation_queued.swap(true, Ordering::SeqCst) {
-            return;
+            return None;
         }
         let ptr = core::ptr::from_ref(cell).cast_mut();
         loop {
@@ -3692,7 +3696,7 @@ fn parked_wake_push(cell: &WakeCell) {
                 if cell.flag.load(Ordering::SeqCst) {
                     continue 'retry;
                 }
-                return;
+                return None;
             }
             let cpu = token % narf_lib::percpu::MAX_CPUS;
             let inbox = &PARKED_WAKE_INBOX[cpu];
@@ -3717,8 +3721,9 @@ fn parked_wake_push(cell: &WakeCell) {
             // cell.cpu before the raw waker issues its ordinary placement kick.
             if CURRENT_TASK[cpu].0.load(Ordering::Acquire) != cell.task {
                 notify_wake_cpu(cpu as u32);
+                return Some(cpu as u32);
             }
-            return;
+            return None;
         }
     }
 }
@@ -3947,8 +3952,8 @@ fn drain_parked_wakes(cpu: usize) -> usize {
         if home != cpu {
             // A queued activation can outlive a migration and a subsequent
             // sleep. Route the pinned node to its current parked owner.
-            parked_wake_push(&cell);
-            notify_wake_cpu(cell.cpu.load(Ordering::Acquire));
+            let notified = parked_wake_push(&cell);
+            notify_wake_cpu_once(cell.cpu.load(Ordering::Acquire), notified);
             continue;
         }
         let id = TaskId(cell.task);
@@ -5342,45 +5347,46 @@ fn note_fresh_wake(cell: &WakeCell, home: u32) {
 /// Publish a consuming wake, leaving parked activation to the executor. An
 /// exact local handoff can claim the indexed parked owner before that drain.
 #[inline]
-fn publish_owned_wake(cell: &WakeCell) -> u32 {
+fn publish_owned_wake(cell: &WakeCell) -> (u32, Option<u32>) {
     let prev_awake = cell.flag.swap(true, Ordering::SeqCst);
-    if !prev_awake {
-        parked_wake_push(cell);
-    }
-    // Kick the owner's CPU if it's idle on another core (else the awake
-    // bit waits until that CPU's next timer tick — the cross-core wake
-    // tail). `resched_remote` no-ops for same-CPU / running targets.
+    let notified = if prev_awake {
+        None
+    } else {
+        parked_wake_push(cell)
+    };
+    // Home publication precedes the parked token, so load home after staging
+    // activation to observe any migration that changed the queued owner.
     let home = cell.cpu.load(Ordering::Acquire);
     if !prev_awake {
         note_fresh_wake(cell, home);
     }
-    home
+    (home, notified)
 }
 
 unsafe fn wake_raw(data: *const ()) {
     // wake-by-value: consume the Arc.
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
-    let home = publish_owned_wake(&arc);
+    let (home, notified) = publish_owned_wake(&arc);
     // Name this task its home CPU's next-buddy so the dispatch picks it ahead
     // of the tasks already queued in front of it (Linux `set_next_buddy`).
     record_wake_next(home, arc.task);
     // ttwu: the POLICY selects an idle sibling for a busy home and the CORE
     // migrates the wakee there and kicks it (or kicks `home` when idle/kept).
-    wake_place_and_kick(Arc::as_ptr(&arc), home, arc.task);
+    wake_place_and_kick(Arc::as_ptr(&arc), home, arc.task, notified);
 }
 
 unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) -> bool {
     let ptr = data as *const WakeCell;
+    let mut notified = None;
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
-    // SAFETY: Valid memory or trusted environment
     let prev_awake = unsafe {
         let prev = (*ptr).flag.swap(true, Ordering::SeqCst);
         if !prev {
             let cell = &*ptr;
             if urgent_task != Some(cell.task) || !try_activate_parked_local(cell) {
-                parked_wake_push(cell);
+                notified = parked_wake_push(cell);
             }
         }
         prev
@@ -5420,14 +5426,14 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) -> bool {
         // Exact synchronous wake: already co-located by try_sync_wake_affine —
         // just kick its (local or home) CPU. No idle-sibling migrate here: that
         // would split the producer/consumer pair this path is establishing.
-        notify_wake_cpu(dispatch_home);
+        notify_wake_cpu_once(dispatch_home, notified);
     } else {
         // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
         record_wake_next(home, task);
         // ttwu placement: the POLICY picks an idle sibling when `home` is busy
         // and the CORE migrates the wakee there and kicks it (a PUSH at wake).
         // Stealing is NOT used on the wake path (it stays the periodic balancer).
-        wake_place_and_kick(ptr, dispatch_home, task);
+        wake_place_and_kick(ptr, dispatch_home, task, notified);
     }
     !prev_awake
 }
@@ -5466,7 +5472,7 @@ pub fn wake_preempt_task(waker: Waker, expected_task: u64) {
         // WakeCell Arc. It remains live until this function returns.
         let cell = unsafe { &*ptr };
         if cell.task == expected_task {
-            let home = publish_owned_wake(cell);
+            let (home, notified) = publish_owned_wake(cell);
             let cpu = narf_lib::percpu::current_cpu();
             if home as usize == cpu
                 && expected_task != current_task_id().raw()
@@ -5479,7 +5485,7 @@ pub fn wake_preempt_task(waker: Waker, expected_task: u64) {
                 stackful::note_local_urgent_wake_preempt(expected_task);
             } else {
                 record_wake_next(home, cell.task);
-                wake_place_and_kick(ptr, home, cell.task);
+                wake_place_and_kick(ptr, home, cell.task, notified);
                 if cell.cpu.load(Ordering::Acquire) as usize == cpu {
                     stackful::note_urgent_wake_preempt(expected_task);
                 }
@@ -5560,6 +5566,17 @@ fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
     }
 }
 
+/// Deduplicate only within this wake publication. The first notification follows
+/// the durable inbox node and already covers its owner's halt handshake, even
+/// if that owner consumes WAKE_PENDING before placement finishes. Independent
+/// wakes and a changed destination retain their own notification.
+#[inline]
+fn notify_wake_cpu_once(cpu: u32, notified: Option<u32>) {
+    if notified != Some(cpu) {
+        notify_wake_cpu(cpu);
+    }
+}
+
 /// Wake-time placement + kick — NARF's `ttwu_queue` mechanism, split exactly
 /// like Linux: the POLICY decides WHERE (`Scheduler::select_task_rq`, the
 /// analogue of `sched_class->select_task_rq`), and the scheduler CORE performs
@@ -5577,7 +5594,7 @@ fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
 /// non-blocking (`try_lock`), bounded CPU scan. Any migrate contention falls
 /// back to the plain `home` kick, so a wake is never dropped.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
+fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Option<u32>) {
     // A self-rearm is not newly runnable peer work.
     if CURRENT_TASK
         .get(home as usize)
@@ -5592,7 +5609,7 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
         || (home as usize) >= CPU_HALTED.len()
         || CPU_HALTED[home as usize].load(Ordering::SeqCst)
     {
-        notify_wake_cpu(home);
+        notify_wake_cpu_once(home, notified);
         return;
     }
     // Home is awake, but "not halted" is NOT the same as "backlogged": an
@@ -5611,7 +5628,7 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
     // scan per wake), whose lock acquisition was itself worth ~1.5 µs on
     // the cold-wake path.
     if WAKE_PRESSURE[home as usize].load(Ordering::Acquire) < 2 {
-        notify_wake_cpu(home);
+        notify_wake_cpu_once(home, notified);
         return;
     }
     // Snapshot the registered affinity before taking the policy lock. Missing
@@ -5637,10 +5654,10 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
             // `enqueue_on` kicked it. Any contention → kick `home` so the wake
             // still lands (never dropped).
             if !try_migrate_wakee_to(home, t.0, cell) {
-                notify_wake_cpu(home);
+                notify_wake_cpu_once(home, notified);
             }
         }
-        _ => notify_wake_cpu(home),
+        _ => notify_wake_cpu_once(home, notified),
     }
 }
 

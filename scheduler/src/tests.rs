@@ -843,6 +843,128 @@ kernel_test_in!(
     smoke_scheduler_wake_notification_is_not_preemption
 );
 
+/// Force the first IPI to claim WAKE_PENDING before the raw waker finishes.
+/// A second kick for the same publication is redundant even in that race;
+/// a concurrent ownership change and a later independent wake still need kicks.
+fn smoke_scheduler_parked_wake_notifies_each_destination_once() -> TestResult {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static MIGRATE: AtomicBool = AtomicBool::new(false);
+    static TASK: AtomicU64 = AtomicU64::new(0);
+    fn consume_notification(cpu: u32) {
+        crate::WAKE_PENDING[cpu as usize].store(false, Ordering::SeqCst);
+        if cpu == 1 && MIGRATE.swap(false, Ordering::SeqCst) {
+            // Simulate a concurrent move after node publication but before the
+            // waker reloads home. CPU 2 is quiesced, so enqueue publishes READY
+            // directly; the waker must notice and notify the changed owner.
+            let entry = crate::PARKED[1]
+                .lock()
+                .as_mut()
+                .and_then(|slots| slots.remove(&crate::TaskId(TASK.load(Ordering::Relaxed))))
+                .expect("test wake owner missing");
+            crate::enqueue_on(2, entry.slot, crate::policy::TaskEnqueueReason::Migrated);
+        }
+    }
+
+    if narf_lib::smp::ever_online_bitmap() != 1 {
+        return TestResult::Skip("requires exclusive ownership of fake CPUs 1 and 2");
+    }
+    crate::__reset_queues_for_test();
+    let stealing = crate::STEAL_ENABLED.swap(false, Ordering::AcqRel);
+    let old_hook = crate::RESCHED_IPI_HOOK.swap(consume_notification as usize, Ordering::AcqRel);
+    let local = narf_lib::percpu::current_cpu();
+    narf_lib::smp::__test_fake_online(1);
+    let old_state = crate::policy::cpu_state(crate::CpuId(2));
+    crate::policy::__test_set_cpu_state(crate::CpuId(2), crate::policy::CpuState::Offline);
+    let mut valid = true;
+    for migrate in [false, true] {
+        for halted in [false, true] {
+            for mode in 0..4 {
+                crate::__reset_queues_for_test();
+                let task = crate::spawn(async {});
+                let slot = crate::READY[local]
+                    .lock()
+                    .as_mut()
+                    .and_then(|ready| ready.pop_front())
+                    .expect("test task missing");
+                let cell = slot.awake.clone();
+                cell.flag.store(false, Ordering::SeqCst);
+                crate::enqueue_on(1, slot, crate::policy::TaskEnqueueReason::Migrated);
+                TASK.store(task.raw(), Ordering::Relaxed);
+                MIGRATE.store(migrate, Ordering::SeqCst);
+                crate::__test_set_cpu_halted(1, halted);
+                let waker = crate::make_waker(cell.clone());
+                let before = crate::local_scheduler_telemetry()
+                    .resched_sent
+                    .load(Ordering::Relaxed);
+                match mode {
+                    0 => crate::make_waker(cell.clone()).wake(),
+                    1 => waker.wake_by_ref(),
+                    2 => crate::wake_urgent_task(&waker, task.raw()),
+                    _ => crate::wake_preempt_task(crate::make_waker(cell.clone()), task.raw()),
+                }
+                let expected = before + if migrate { 2 } else { 1 };
+                valid &= crate::local_scheduler_telemetry()
+                    .resched_sent
+                    .load(Ordering::Relaxed)
+                    == expected;
+                valid &= cell.flag.load(Ordering::SeqCst)
+                    && crate::PARKED_WAKE_INBOX[1].len.load(Ordering::Acquire) == 1;
+                // This is a different wake, not the tail of the first one.
+                waker.wake_by_ref();
+                valid &= crate::local_scheduler_telemetry()
+                    .resched_sent
+                    .load(Ordering::Relaxed)
+                    == expected + 1;
+
+                // Return ownership to this CPU, then retire the original inbox
+                // reference. The stale node must neither lose nor duplicate it.
+                let slot = if migrate {
+                    crate::READY[2]
+                        .lock()
+                        .as_mut()
+                        .and_then(|ready| ready.pop_front())
+                        .expect("migrated wake owner missing")
+                } else {
+                    crate::PARKED[1]
+                        .lock()
+                        .as_mut()
+                        .and_then(|slots| slots.remove(&task))
+                        .expect("parked wake owner missing")
+                        .slot
+                };
+                crate::enqueue_on(local, slot, crate::policy::TaskEnqueueReason::Migrated);
+                crate::drain_parked_wakes(1);
+                valid &= crate::PARKED_WAKE_INBOX[1].len.load(Ordering::Acquire) == 0
+                    && !cell.activation_queued.load(Ordering::SeqCst)
+                    && crate::READY[local].lock().as_ref().is_some_and(|ready| {
+                        ready.len() == 1 && ready.front().is_some_and(|slot| slot.id == task)
+                    });
+                let _ = crate::poll_one_round();
+                valid &= crate::READY[local]
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|ready| ready.is_empty());
+            }
+        }
+    }
+    crate::RESCHED_IPI_HOOK.store(old_hook, Ordering::Release);
+    crate::STEAL_ENABLED.store(stealing, Ordering::Release);
+    crate::__test_set_cpu_halted(1, false);
+    narf_lib::smp::mark_offline(1);
+    crate::policy::__test_set_cpu_state(crate::CpuId(2), old_state);
+    crate::__reset_queues_for_test();
+    if valid {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("wake duplicated a kick, missed a changed owner, or lost activation")
+    }
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_parked_wake_notifies_each_destination_once
+);
+
 fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
     // With work-stealing on and per-CPU queues seeded across two
     // NUMA nodes, a steal should pull from a same-node victim first.
