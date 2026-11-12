@@ -309,10 +309,11 @@ kernel_test_in!(
     smoke_btrfs_cross_dir_renames_do_not_deadlock
 );
 
-/// Unlinks that leave orphans, lookups of the same names, and writes that
-/// reap the orphans on their way in, from three CPUs at once: a lookup
+/// Unlinks that leave orphans (some still open), lookups of the same names,
+/// and writes and fsyncs of another file, from three CPUs at once: a lookup
 /// either finds a name with its data or does not find it, an orphan is
-/// evicted once, and none is left once the operations stop.
+/// evicted once — at the unlink, or by the background reaper once its last
+/// handle goes — and none is left once the operations stop.
 fn orphans_vs_lookups() -> Result<(), &'static str> {
     const FILES: u32 = 60;
     let (dev, vol) = fresh()?;
@@ -392,12 +393,10 @@ fn orphans_vs_lookups() -> Result<(), &'static str> {
         })
     };
     run_parallel(alloc::vec![(1, unlinker), (2, looker), (3, reaper)])?;
-    // Every handle is gone: one more operation reaps what is left.
-    for _ in 0..4 {
-        if !matches!(poll_once(other.write(0, b"last")), Some(Ok(4))) {
-            return Err("final write failed");
-        }
-    }
+    // Every handle is gone: the delayed iputs evict what is left (the
+    // background reaper's pass, run here: this thread spinning would keep
+    // the reaper off its CPU).
+    poll_once(vol.run_delayed_iputs());
     if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
         return Err("sync failed");
     }
@@ -535,4 +534,312 @@ fn smoke_btrfs_quota_two_concurrent_writers() -> TestResult {
 kernel_test_in!(
     "drivers/fs/btrfs/race",
     smoke_btrfs_quota_two_concurrent_writers
+);
+
+/// The soak's stop phase at the btrfs layer: `rm -rf` of a tree whose files
+/// another CPU still holds open and keeps writing and fsyncing (the
+/// mapped-file flusher's writes), while a third truncates a journal file up
+/// and down with fsyncs and a fourth fsyncs another file. Everything must
+/// finish, the unlinked files' space must come back at their last
+/// reference (the final iput, or the background reaper for those still
+/// open), and no orphan may be left once the handles are gone.
+fn rm_rf_beside_writers() -> Result<(), &'static str> {
+    const DIRS: u32 = 6;
+    const FILES: u32 = 12;
+    let (dev, vol) = fresh()?;
+    let root = vol.root();
+    let tree = poll_once(root.mkdir("tree"))
+        .and_then(|r| r.ok())
+        .ok_or("mkdir failed")?;
+    let mut held: Vec<Arc<dyn FileOps>> = Vec::new();
+    for d in 0..DIRS {
+        let dir = poll_once(tree.mkdir(&format!("d{d}")))
+            .and_then(|r| r.ok())
+            .ok_or("mkdir failed")?;
+        for f in 0..FILES {
+            let file = poll_once(dir.create(&format!("f{f}")))
+                .and_then(|r| r.ok())
+                .ok_or("create failed")?;
+            if !matches!(poll_once(file.write(0, &[f as u8; 96 << 10])), Some(Ok(_))) {
+                return Err("seed write failed");
+            }
+            if f % 3 == 0 {
+                held.push(file);
+            }
+        }
+    }
+    let journal = poll_once(root.create("journal"))
+        .and_then(|r| r.ok())
+        .ok_or("create failed")?;
+    let other = poll_once(root.create("other"))
+        .and_then(|r| r.ok())
+        .ok_or("create failed")?;
+    let stop = Arc::new(AtomicU32::new(0));
+    let remover: Job = {
+        let (tree, stop) = (tree.clone(), stop.clone());
+        Box::pin(async move {
+            for d in 0..DIRS {
+                let dir = tree
+                    .lookup_dir_async(&format!("d{d}"))
+                    .await
+                    .map_err(err("lookup"))?;
+                for f in 0..FILES {
+                    dir.unlink(&format!("f{f}")).await.map_err(err("unlink"))?;
+                }
+                drop(dir);
+                tree.rmdir(&format!("d{d}")).await.map_err(err("rmdir"))?;
+            }
+            stop.store(1, Ordering::Release);
+            Ok(())
+        })
+    };
+    let writer: Job = {
+        let stop = stop.clone();
+        let held = held.clone();
+        Box::pin(async move {
+            let mut round = 0u64;
+            while stop.load(Ordering::Acquire) == 0 {
+                for file in &held {
+                    file.write((round % 24) * 4096, &[0x77; 4096])
+                        .await
+                        .map_err(err("write"))?;
+                }
+                if round % 4 == 3 {
+                    held[(round as usize / 4) % held.len()]
+                        .fsync(false)
+                        .await
+                        .map_err(err("fsync"))?;
+                }
+                round += 1;
+            }
+            Ok(())
+        })
+    };
+    let truncator: Job = {
+        let (journal, stop) = (journal.clone(), stop.clone());
+        Box::pin(async move {
+            let mut round = 0u64;
+            while stop.load(Ordering::Acquire) == 0 {
+                journal
+                    .write(0, &[0x4a; 256 << 10])
+                    .await
+                    .map_err(err("write"))?;
+                journal
+                    .truncate((round % 5) * 8192)
+                    .await
+                    .map_err(err("truncate"))?;
+                journal.fsync(true).await.map_err(err("fdatasync"))?;
+                round += 1;
+            }
+            Ok(())
+        })
+    };
+    let syncer: Job = {
+        let (other, stop) = (other.clone(), stop.clone());
+        Box::pin(async move {
+            let mut i = 0u64;
+            while stop.load(Ordering::Acquire) == 0 {
+                other
+                    .write(i * 512 % (64 << 10), &[0x11; 512])
+                    .await
+                    .map_err(err("write"))?;
+                other.fsync(false).await.map_err(err("fsync"))?;
+                i += 1;
+            }
+            Ok(())
+        })
+    };
+    run_parallel(alloc::vec![
+        (1, remover),
+        (2, writer),
+        (3, truncator),
+        (4, syncer)
+    ])?;
+    // The last references to the files still held go now: the background
+    // reaper evicts them (Linux's delayed iputs).
+    drop(held);
+    poll_once(vol.run_delayed_iputs());
+    if !vol.orphan_snapshot().is_empty() {
+        return Err("the delayed iputs left unlinked, closed files unevicted");
+    }
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return Err("sync failed");
+    }
+    let orphans = poll_once(btree::collect_for(
+        &*vol,
+        vol.fs_tree_root().0,
+        crate::orphans::ORPHAN_OBJECTID,
+        crate::orphans::ORPHAN_ITEM_KEY,
+    ))
+    .and_then(|r| r.ok())
+    .ok_or("reading orphan items failed")?;
+    if !orphans.is_empty() {
+        return Err("orphan items were left behind");
+    }
+    if !dir_indexes(&vol, tree.ino())?.is_empty() {
+        return Err("rm -rf left names behind");
+    }
+    drop((tree, journal, other, root));
+    mount_writable(dev)
+        .map(|_| ())
+        .map_err(|_| "remount failed")
+}
+
+fn smoke_btrfs_rm_rf_beside_writers_truncates_and_fsyncs() -> TestResult {
+    result(rm_rf_beside_writers())
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_rm_rf_beside_writers_truncates_and_fsyncs
+);
+
+/// The real reaper task on a volume with no fault or crash armed: an
+/// unlinked file stays an orphan while it is open, and once its last
+/// handle goes the reaper — woken by that drop, not polling — evicts it
+/// without anyone calling `run_delayed_iputs`.
+fn reaper_on_last_close() -> Result<(), &'static str> {
+    let (_dev, vol) = fresh()?;
+    vol.enable_reaper_for_test();
+    // The reaper as the mount starts it, pinned to a CPU this thread does
+    // not spin on.
+    narf_scheduler::spawn_stackful_pinned(
+        crate::write::orphan_reaper(Arc::downgrade(vol.core())),
+        2,
+    );
+    let root = vol.root();
+    let file = poll_once(root.create("doomed"))
+        .and_then(|r| r.ok())
+        .ok_or("create failed")?;
+    if !matches!(poll_once(file.write(0, &[0x33; 256 << 10])), Some(Ok(_))) {
+        return Err("write failed");
+    }
+    if !matches!(poll_once(root.unlink("doomed")), Some(Ok(()))) {
+        return Err("unlink failed");
+    }
+    if vol.orphan_snapshot().is_empty() {
+        return Err("an open, unlinked file was evicted while still open");
+    }
+    drop(file);
+    let watcher: Job = {
+        let vol = vol.clone();
+        Box::pin(async move {
+            for _ in 0..2000 {
+                if vol.orphan_snapshot().is_empty() {
+                    return Ok(());
+                }
+                narf_time::sleep_ms(5).await;
+            }
+            Err("the reaper did not evict the closed, unlinked file within 10 s".into())
+        })
+    };
+    run_parallel(alloc::vec![(1, watcher)])?;
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return Err("sync failed");
+    }
+    let orphans = poll_once(btree::collect_for(
+        &*vol,
+        vol.fs_tree_root().0,
+        crate::orphans::ORPHAN_OBJECTID,
+        crate::orphans::ORPHAN_ITEM_KEY,
+    ))
+    .and_then(|r| r.ok())
+    .ok_or("reading orphan items failed")?;
+    if !orphans.is_empty() {
+        return Err("the evicted file's orphan item is still there");
+    }
+    Ok(())
+}
+
+fn smoke_btrfs_reaper_evicts_at_the_last_close() -> TestResult {
+    result(reaper_on_last_close())
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_reaper_evicts_at_the_last_close
+);
+
+/// Lookups of stable files on two CPUs while a third evicts large unlinked
+/// files back to back: every lookup completes with its file, and none is
+/// ever sent back — an eviction sends back only a lookup of the inode it
+/// evicts, never one of an unrelated name.
+fn lookups_beside_evictions() -> Result<(), &'static str> {
+    const STABLE: u32 = 16;
+    let (_dev, vol) = fresh()?;
+    let root = vol.root();
+    let dir = poll_once(root.mkdir("stable"))
+        .and_then(|r| r.ok())
+        .ok_or("mkdir failed")?;
+    for i in 0..STABLE {
+        let file = poll_once(dir.create(&format!("s{i}")))
+            .and_then(|r| r.ok())
+            .ok_or("create failed")?;
+        if !matches!(poll_once(file.write(0, &body("s", i))), Some(Ok(_))) {
+            return Err("seed write failed");
+        }
+    }
+    let before = vol.lookup_retries();
+    let stop = Arc::new(AtomicU32::new(0));
+    let evictor: Job = {
+        let (root, stop) = (root.clone(), stop.clone());
+        Box::pin(async move {
+            for round in 0..24u32 {
+                let name = format!("big{round}");
+                let file = root.create(&name).await.map_err(err("create"))?;
+                // Many single-page extents: an eviction of many steps.
+                for page in 0..256u64 {
+                    file.write(page * 8192, &[round as u8; 4096])
+                        .await
+                        .map_err(err("write"))?;
+                }
+                drop(file);
+                root.unlink(&name).await.map_err(err("unlink"))?;
+            }
+            stop.store(1, Ordering::Release);
+            Ok(())
+        })
+    };
+    let looker = |dir: Arc<dyn DirOps>, stop: Arc<AtomicU32>| -> Job {
+        Box::pin(async move {
+            let mut rounds = 0u32;
+            while stop.load(Ordering::Acquire) == 0 || rounds == 0 {
+                for i in 0..STABLE {
+                    let file = dir
+                        .lookup_async(&format!("s{i}"))
+                        .await
+                        .map_err(err("lookup"))?;
+                    let mut buf = alloc::vec![0u8; 64];
+                    let n = file.read(0, &mut buf).await.map_err(err("read"))?;
+                    if buf[..n] != body("s", i)[..n] {
+                        return Err(format!("s{i}: wrong bytes"));
+                    }
+                }
+                rounds += 1;
+                narf_scheduler::yield_now().await;
+            }
+            Ok(())
+        })
+    };
+    run_parallel(alloc::vec![
+        (1, evictor),
+        (2, looker(dir.clone(), stop.clone())),
+        (3, looker(dir.clone(), stop.clone())),
+    ])?;
+    if !vol.orphan_snapshot().is_empty() {
+        return Err("an unlinked, closed file was not evicted at its unlink");
+    }
+    if vol.lookup_retries() != before {
+        return Err("a lookup of an unrelated file was sent back by an eviction");
+    }
+    Ok(())
+}
+
+fn smoke_btrfs_unrelated_lookups_do_not_retry_on_evictions() -> TestResult {
+    result(lookups_beside_evictions())
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_unrelated_lookups_do_not_retry_on_evictions
 );

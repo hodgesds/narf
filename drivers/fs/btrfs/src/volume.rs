@@ -593,6 +593,15 @@ impl<B: BlockDevice> Drop for ReaderGuard<B> {
 #[derive(Debug)]
 pub(crate) struct CommitHold<'a>(&'a core::sync::atomic::AtomicUsize);
 
+/// A wait on a syscall's behalf that SIGKILL ends ([`narf_filesystem::killable`]).
+/// The error never reaches the caller's program: a task sent SIGKILL does
+/// not return from its system call.
+pub(crate) async fn killable<F: core::future::Future>(future: F) -> Result<F::Output, FsError> {
+    narf_filesystem::killable::killable(future)
+        .await
+        .ok_or(FsError::Busy)
+}
+
 /// One running operation ([`VolCore::begin_op`], [`VolCore::begin_data_op`],
 /// [`VolCore::begin_admin`]). The transaction guard is declared first, so it
 /// is released before the queue moves on.
@@ -673,6 +682,23 @@ impl<B: BlockDevice> Drop for BtrfsVolume<B> {
 
 /// Accessors on the shared core.
 impl<B: BlockDevice> VolCore<B> {
+    /// Whether this filesystem's background reaper acts.
+    pub(crate) fn reaper_on(&self) -> bool {
+        self.reaper_on.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only: let this filesystem's background reaper act.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn enable_reaper_for_test(&self) {
+        self.reaper_on
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// The reaper's sleep until an unlinked inode's last reference goes.
+    pub(crate) fn reap_wanted(&self) -> ReapWanted {
+        ReapWanted(Arc::clone(&self.inode_tables))
+    }
+
     /// The live superblock's generation (the last committed transaction).
     pub(crate) fn committed_generation(&self) -> u64 {
         self.state.lock().superblock.generation
@@ -804,6 +830,7 @@ impl<B: BlockDevice> VolCore<B> {
 
     pub(crate) fn forget_orphan(&self, tree: u64, ino: u64) {
         self.orphans.lock().remove(&(tree, ino));
+        self.evicting.lock().remove(&(tree, ino));
     }
 
     /// The transaction accumulating operations that have not committed yet.
@@ -937,6 +964,7 @@ impl Drop for MmapAnchor {
         let Some(tables) = self.tables.upgrade() else {
             return;
         };
+        let unlinked = self.inode.lock().nlink == 0;
         let mut tables = tables.lock();
         let key = (self.tree, self.ino);
         let mine = tables
@@ -947,6 +975,39 @@ impl Drop for MmapAnchor {
             tables.anchors.remove(&key);
             tables.generations.values.remove(&key);
         }
+        // The last reference to an unlinked inode: queue its delayed iput
+        // and wake the reaper (Linux `btrfs_add_delayed_iput` waking the
+        // cleaner kthread).
+        let waker = if unlinked {
+            tables.reap_wanted = true;
+            tables.reap_waker.take()
+        } else {
+            None
+        };
+        drop(tables);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// The orphan reaper's sleep: ready once an unlinked inode's last reference
+/// has gone since it last woke ([`crate::write::orphan_reaper`]).
+pub(crate) struct ReapWanted(pub(crate) Arc<IrqSafeSpinLock<InodeTables>>);
+
+impl core::future::Future for ReapWanted {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        let mut tables = self.0.lock();
+        if core::mem::take(&mut tables.reap_wanted) {
+            return core::task::Poll::Ready(());
+        }
+        tables.reap_waker = Some(cx.waker().clone());
+        core::task::Poll::Pending
     }
 }
 
@@ -962,6 +1023,10 @@ pub(crate) struct InodeTables {
     anchors: BTreeMap<(u64, u64), Weak<MmapAnchor>>,
     /// Content generations of open inodes ([`CacheGenerations`]).
     generations: CacheGenerations,
+    /// An unlinked inode's last reference has gone: the reaper has work.
+    reap_wanted: bool,
+    /// The reaper, asleep until then.
+    reap_waker: Option<core::task::Waker>,
 }
 
 /// Content-generation counters for one filesystem instance, backing
@@ -1090,6 +1155,10 @@ pub struct VolCore<B: BlockDevice> {
     /// One orphan reaper at a time: concurrent operations each try to reap
     /// on their way in, and an eviction must not run twice at once.
     reaper: Mutex<()>,
+    /// Whether the background reaper acts: not in kernel-test builds, whose
+    /// tests drive every operation of their volume themselves (a fault
+    /// injected or a crash armed included), unless a test turns it on.
+    reaper_on: core::sync::atomic::AtomicBool,
     /// Held by a cross-directory rename around its directory locks (Linux
     /// `s_vfs_rename_mutex` in `lock_rename`).
     rename_lock: Mutex<()>,
@@ -1186,10 +1255,16 @@ pub struct VolCore<B: BlockDevice> {
     /// Inodes final eviction has started on. A lookup takes no operation
     /// lock, so it can resolve a name to an inode that an unlink and the
     /// orphan reaper then destroy before the lookup's anchor exists: the
-    /// reaper counts here before its last open check, the lookup reads this
-    /// after publishing its anchor, and whichever loses that race notices
-    /// (the reaper skips the inode, the lookup starts over).
-    evictions: core::sync::atomic::AtomicU64,
+    /// reaper enters the inode here before its last open check, the lookup
+    /// looks for its own inode here after publishing its anchor, and
+    /// whichever loses that race notices (the reaper skips the inode, the
+    /// lookup starts over). Only the lookup of that inode starts over;
+    /// evictions of other inodes never send a lookup back (they once did,
+    /// through a filesystem-wide counter, and continuous eviction starved
+    /// every lookup).
+    evicting: IrqSafeSpinLock<BTreeSet<(u64, u64)>>,
+    /// Lookups sent back by an eviction of the inode they resolved.
+    lookup_retries: core::sync::atomic::AtomicU64,
     /// Metadata node cache, keyed by logical address.
     ///
     /// Consecutive commits path-COW the same upper levels of the extent,
@@ -1443,7 +1518,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.frozen.store(true, Ordering::Release);
         // Wait out any operation admitted before the freeze; none can start
         // after it.
-        let _ops = self.begin_admin().await;
+        let _ops = self.begin_admin().await?;
         let result = loop {
             if let Err(err) = self.sync_to_disk().await {
                 break Err(err);
@@ -2234,7 +2309,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // reaches this. The commit waits for any running operation of
         // another mount (see `txn_gate`).
         {
-            let _op = self.begin_commit().await;
+            let _op = self.begin_commit().await?;
             crate::write::flush_batch(self).await?;
         }
         // The resolution reads the root tree (and the trees on the path)
@@ -2552,7 +2627,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             inode_tables: Arc::new(IrqSafeSpinLock::new(InodeTables {
                 anchors: BTreeMap::new(),
                 generations: CacheGenerations::new(),
+                reap_wanted: false,
+                reap_waker: None,
             })),
+            reaper_on: core::sync::atomic::AtomicBool::new(cfg!(not(feature = "kernel-test"))),
             orphans: IrqSafeSpinLock::new(BTreeSet::new()),
             device: source_device,
             magic: superblock.magic,
@@ -2585,7 +2663,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             reader_roots: IrqSafeSpinLock::new(BTreeMap::new()),
             reader_epochs: IrqSafeSpinLock::new(ReaderEpochs::default()),
-            evictions: core::sync::atomic::AtomicU64::new(0),
+            evicting: IrqSafeSpinLock::new(BTreeSet::new()),
+            lookup_retries: core::sync::atomic::AtomicU64::new(0),
             nodes: node_cache,
             aborted: core::sync::atomic::AtomicBool::new(false),
             refused_after_abort: core::sync::atomic::AtomicU64::new(0),
@@ -2666,41 +2745,41 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// then join the running transaction. The caller already holds the
     /// directory and inode locks it needs (never taken while joined: see
     /// [`crate::txn_gate`]).
-    pub(crate) async fn begin_op(&self) -> OpGuard<'_> {
-        let queue = self.op_lock.lock().await;
-        let joined = self.txn_gate.join().await;
-        OpGuard::Queued {
+    pub(crate) async fn begin_op(&self) -> Result<OpGuard<'_>, FsError> {
+        let queue = killable(self.op_lock.lock()).await?;
+        let joined = killable(self.txn_gate.join()).await?;
+        Ok(OpGuard::Queued {
             _joined: joined,
             _queue: queue,
-        }
+        })
     }
 
     /// Start one data operation (or one step of a truncate or fallocate):
     /// join the running transaction, beside every other operation joined.
     /// The caller holds its inode's lock.
-    pub(crate) async fn begin_data_op(&self) -> OpGuard<'_> {
-        OpGuard::Joined {
-            _joined: self.txn_gate.join().await,
-        }
+    pub(crate) async fn begin_data_op(&self) -> Result<OpGuard<'_>, FsError> {
+        Ok(OpGuard::Joined {
+            _joined: killable(self.txn_gate.join()).await?,
+        })
     }
 
     /// Start administrative work (subvolumes, snapshots, quotas, remount,
     /// recovery): wait in the operation queue, then close the transaction
     /// to every other operation for the whole of it.
-    pub(crate) async fn begin_admin(&self) -> OpGuard<'_> {
-        let queue = self.op_lock.lock().await;
-        let closed = self.txn_gate.close().await;
-        OpGuard::Admin {
+    pub(crate) async fn begin_admin(&self) -> Result<OpGuard<'_>, FsError> {
+        let queue = killable(self.op_lock.lock()).await?;
+        let closed = killable(self.txn_gate.close()).await?;
+        Ok(OpGuard::Admin {
             _closed: closed,
             _queue: queue,
-        }
+        })
     }
 
     /// Close the transaction for a commit forced from outside any
     /// operation: waits for the operations in flight, not for those queued
     /// behind them.
-    pub(crate) async fn begin_commit(&self) -> crate::txn_gate::Closed<'_> {
-        self.txn_gate.close().await
+    pub(crate) async fn begin_commit(&self) -> Result<crate::txn_gate::Closed<'_>, FsError> {
+        killable(self.txn_gate.close()).await
     }
 
     /// Run `work` with the transaction closed — a commit, a chunk
@@ -2811,13 +2890,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         &self.txn_lock
     }
 
-    /// Start the core's commit timer once.
+    /// Start the core's commit timer and orphan reaper once.
     fn start_commit_timer(self: &Arc<Self>) {
         if !self
             .timer_started
             .swap(true, core::sync::atomic::Ordering::AcqRel)
         {
             crate::write::spawn_commit_timer(&self.core);
+            crate::write::spawn_orphan_reaper(&self.core);
         }
     }
 
@@ -3319,25 +3399,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if self.durable_gen() >= target {
             return Ok(());
         }
-        let _commit = self.begin_commit().await;
+        let _commit = self.begin_commit().await?;
         if self.durable_gen() >= target {
             return Ok(());
         }
-        // Reclaiming orphans is housekeeping this call does on the way; what
-        // it owes its caller is the commit. An orphan that cannot be
-        // reclaimed for lack of space must not cost the sync — the commit
-        // releases pinned space, after which the reclaim is tried once more,
-        // and an orphan still left keeps its on-disk record for later.
-        let reaped = self.reap_orphans().await;
-        self.sync_to_disk().await?;
-        match reaped {
-            Err(FsError::NoSpace) => match self.reap_orphans().await {
-                Ok(()) => self.sync_to_disk().await,
-                Err(FsError::NoSpace) => Ok(()),
-                Err(error) => Err(error),
-            },
-            other => other,
-        }
+        // No orphan eviction here: what an fsync owes is the commit
+        // (eviction runs at the final iput and in the background reaper).
+        self.sync_to_disk().await
     }
 
     /// `syncfs`: [`Self::sync_to_disk_exclusive`] plus a trailing device
@@ -3347,6 +3415,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// I/O, and on a read-only or aborted filesystem only flushes.
     pub async fn sync_fs(&self) -> Result<(), FsError> {
         if !self.core_read_only() && !self.aborted.load(core::sync::atomic::Ordering::Acquire) {
+            // Evict what no handle holds any more before the commit, as
+            // Linux runs the delayed iputs before a filesystem goes away
+            // (`close_ctree`), so a syncfs before shutdown leaves no orphan
+            // behind that it could have reclaimed.
+            self.run_delayed_iputs().await;
             self.sync_to_disk_exclusive().await?;
         }
         self.flush().await
@@ -3444,10 +3517,29 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         }
     }
 
-    /// See [`VolCore::evictions`]: read it before resolving a name and again
-    /// after the resolved node exists.
-    pub(crate) fn eviction_count(&self) -> u64 {
-        self.evictions.load(core::sync::atomic::Ordering::SeqCst)
+    /// Whether final eviction has started on `(tree, ino)` (see the
+    /// `evicting` field): asked by a lookup after its anchor exists.
+    pub(crate) fn is_evicting(&self, tree: u64, ino: u64) -> bool {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.evicting.lock().contains(&(tree, ino))
+    }
+
+    /// A lookup resolved an inode being evicted and starts over.
+    pub(crate) fn note_lookup_retry(&self) {
+        self.lookup_retries
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only: lookups sent back by an eviction so far.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn lookup_retries(&self) -> u64 {
+        self.lookup_retries
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Eviction of `(tree, ino)` is over, done or given up.
+    pub(crate) fn end_eviction(&self, tree: u64, ino: u64) {
+        self.evicting.lock().remove(&(tree, ino));
     }
 
     /// Claim `(tree, ino)` for final eviction: false when a lookup or mapping
@@ -3456,9 +3548,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if self.inode_is_open(tree, ino) {
             return false;
         }
-        self.evictions
-            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        !self.inode_is_open(tree, ino)
+        self.evicting.lock().insert((tree, ino));
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if self.inode_is_open(tree, ino) {
+            self.end_eviction(tree, ino);
+            return false;
+        }
+        true
     }
 
     /// The roots lock-free readers are walking from, as `(addr, nodesize)`

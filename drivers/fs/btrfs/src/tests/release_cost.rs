@@ -412,7 +412,9 @@ fn smoke_btrfs_eviction_survives_low_nbytes() -> TestResult {
         return TestResult::Fail("nbytes: could not lower nbytes");
     }
     drop(file);
-    // The next operation reclaims the orphan, and itself succeeds.
+    // Its last handle gone, the delayed iput evicts the orphan (the
+    // background reaper's work, run here), and writing goes on.
+    poll_once(vol.run_delayed_iputs());
     if !matches!(poll_once(dir.create("after")), Some(Ok(_)))
         || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
     {
