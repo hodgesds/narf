@@ -413,6 +413,12 @@ pub struct UserTaskCtx {
     /// trap/syscall register frame lives while it is parked, Linux's
     /// `task_pt_regs()`. Written once, the first time the task runs.
     pub kernel_stack_top: AtomicU64,
+    /// The polling future's `UserProcess`, published by its first poll (the
+    /// future is pinned in its task for the task's life). An own-stack exec
+    /// never returns to that poll, so it installs the new address space here
+    /// itself — otherwise the future keeps the pre-exec address space alive
+    /// until the task exits (Linux `exec_mmap` drops the old mm at exec).
+    process: core::sync::atomic::AtomicPtr<crate::UserProcess>,
     /// Non-zero while this task is parked in a blocked F_SETLKW: the
     /// lock-table key it waits on. `park_should_block` registers the
     /// task's waker on `fd::locks`' per-key waiter queue through this,
@@ -876,6 +882,35 @@ impl UserTaskCtx {
         ])
     }
 
+    /// Publish the polling future's pinned `UserProcess` (see `process`).
+    fn publish_process(&self, process: &mut crate::UserProcess) {
+        self.process.store(process, Ordering::Release);
+    }
+
+    /// Install `address_space` as the polling future's own reference after
+    /// an own-stack exec, returning the one it replaces — the pre-exec space,
+    /// which the caller drops once the new root is active. `None` when no
+    /// future was published (a task not run by a `UserTaskFuture`).
+    ///
+    /// # Safety
+    /// Only the task itself may call this, from its own exec on its own
+    /// stack: its future is pinned in the task and is not being polled.
+    pub(crate) unsafe fn replace_process_address_space(
+        &self,
+        address_space: alloc::sync::Arc<narf_memory::AddressSpace>,
+    ) -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+        let process = self.process.load(Ordering::Acquire);
+        if process.is_null() {
+            return None;
+        }
+        // SAFETY: caller contract — the pinned future outlives this call and
+        // nothing else accesses its `process` while the task runs its exec.
+        Some(core::mem::replace(
+            unsafe { &mut (*process).address_space },
+            address_space,
+        ))
+    }
+
     /// Record this task's kernel stack top the first time its future runs on
     /// it (the stack never moves for the task's lifetime). 0 = no own stack.
     fn record_kernel_stack_top(&self) {
@@ -937,6 +972,7 @@ impl UserTaskCtx {
             park_site: core::sync::atomic::AtomicUsize::new(0),
             yield_site: core::sync::atomic::AtomicUsize::new(0),
             kernel_stack_top: AtomicU64::new(0),
+            process: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             flock_key: core::sync::atomic::AtomicUsize::new(0),
             sigwait_set: AtomicU64::new(0),
             sigwait_interrupted: core::sync::atomic::AtomicBool::new(false),
@@ -3399,6 +3435,7 @@ impl core::future::Future for UserTaskFuture {
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         publish_current_task(&this.task);
         this.task.uctx.record_kernel_stack_top();
+        this.task.uctx.publish_process(&mut this.process);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Activate the user AS. `addr_space.activate()` does the
@@ -4038,6 +4075,7 @@ impl core::future::Future for UserTaskFuture {
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         publish_current_task(&this.task);
         this.task.uctx.record_kernel_stack_top();
+        this.task.uctx.publish_process(&mut this.process);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Linux schedule_tail performs this only after switching to the new
