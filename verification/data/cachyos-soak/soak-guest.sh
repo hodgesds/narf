@@ -812,7 +812,7 @@ settle_meminfo() { # label
   stamp
   line="$1 up=$UP"
   while read -r k v _; do
-    case $k in MemTotal: | MemFree: | MemAvailable: | Cached: | Slab: | SUnreclaim: | AnonPages: | Shmem: | KernelStack: | PageTables:)
+    case $k in MemTotal: | MemFree: | MemAvailable: | Cached: | Slab: | SUnreclaim: | AnonPages: | Shmem: | KernelStack: | PageTables: | Narf*:)
       line+=" ${k%:}=$v" ;;
     esac
   done < /proc/meminfo
@@ -858,7 +858,7 @@ else
 fi
 net_up
 # Arm the heap allocation-site audit before the baseline (NARF only).
-[ -w /proc/narf/slab_sites ] && echo 1 > /proc/narf/slab_sites
+[ -w /proc/narf/slab_sites ] && echo 2 > /proc/narf/slab_sites
 settle_meminfo SOAK-BASELINE
 
 stamp

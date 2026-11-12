@@ -3754,6 +3754,17 @@ fn move_pagetable_registry_into_marks() {
     }
 }
 
+/// Frames carrying the page-table mark (Linux `NR_PAGETABLE`), counted on
+/// each mark transition. Hot-plugged frames tracked in the hash registry are
+/// not included.
+pub(crate) static PAGE_TABLE_FRAMES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Page-table frames currently marked, for `/proc/meminfo`'s `PageTables`.
+pub fn page_table_frames() -> usize {
+    PAGE_TABLE_FRAMES.load(Ordering::Relaxed)
+}
+
 /// Count of `__pagetable_register` calls that found no free slot. Stays
 /// 0 in healthy operation; a non-zero value means address spaces are
 /// leaking page tables faster than they're reclaimed.
@@ -4419,11 +4430,19 @@ pub mod cow {
             return false;
         };
         if on {
-            slot.node_plus_one
+            let prev = slot
+                .node_plus_one
                 .fetch_or(PAGE_TABLE_BIT, Ordering::AcqRel);
+            if prev & PAGE_TABLE_BIT == 0 {
+                super::PAGE_TABLE_FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
-            slot.node_plus_one
+            let prev = slot
+                .node_plus_one
                 .fetch_and(!PAGE_TABLE_BIT, Ordering::AcqRel);
+            if prev & PAGE_TABLE_BIT != 0 {
+                super::PAGE_TABLE_FRAMES.fetch_sub(1, Ordering::Relaxed);
+            }
         }
         true
     }
