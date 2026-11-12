@@ -97,6 +97,17 @@ const LINK_ESTABLISH_INTERVAL_MS: u64 = 250;
 /// before declining to register the transport.
 const ESTABLISH_BUDGET_MS: u64 = 5_000;
 
+/// Bounded wait for the peer's WOKEN after a WAKEUP on resume
+/// (§9.1): one link-establishment interval (§8 footnote [1]) — a
+/// live peer answers WOKEN immediately; longer means it lost power
+/// and the resume falls back to full re-establishment.
+const H5_WAKEUP_WAIT_MS: u64 = LINK_ESTABLISH_INTERVAL_MS;
+
+/// Bounded budget for link re-establishment on resume: mirrors the
+/// 1 s PM-handler wait the PCIe BT ops use for a D3 transition
+/// (`btintel_pcie::D3_TRANSITION_TIMEOUT_MS`).
+const H5_RESUME_ESTABLISH_BUDGET_MS: u64 = 1_000;
+
 /// Proposed sliding window when the caller does not say otherwise.
 /// Spec-legal (1..=7, §8.8.2); a local choice, not a spec value.
 const DEFAULT_WINDOW: u8 = 4;
@@ -437,6 +448,15 @@ impl H5Transport {
             return None;
         }
         crate::transport::register(transport.clone());
+        // Device-PM suspend/resume (#1580 item 3): the ops live
+        // next to the transport because both are keyed off the same
+        // controller, resolving the HCI index lazily by transport
+        // identity (see `H5TransportPm`). One entry per UART name;
+        // re-binding the same UART replaces its ops.
+        narf_power::device_pm::register_device_pm_ops(
+            &alloc::format!("h5-{}", transport.port_name()),
+            alloc::sync::Arc::new(H5TransportPm::new(transport.clone())),
+        );
         Some(transport)
     }
 
@@ -490,6 +510,60 @@ impl H5Transport {
         let mut inner = self.inner.lock();
         drive_locked(&self.port, &self.config, &mut inner);
     }
+
+    /// Whether the peer is asleep (§9.3): it announced SLEEP and
+    /// has not answered WAKEUP with WOKEN yet.
+    pub(crate) fn peer_asleep(&self) -> bool {
+        self.inner.lock().peer_asleep
+    }
+
+    /// Host-initiated sleep sequencing (§9.3, device-PM suspend):
+    /// send SLEEP to the peer and mark it asleep, so sends stall
+    /// with `Transient` until the WAKEUP/WOKEN exchange on resume.
+    /// Only when the link is Active and the peer is not already
+    /// asleep; otherwise a no-op.
+    pub(crate) fn send_sleep(&self) {
+        let mut inner = self.inner.lock();
+        if inner.state != H5LinkState::Active || inner.peer_asleep {
+            return;
+        }
+        send_link_frame(&self.port, &mut inner, LinkControlKind::Sleep, &[]);
+        inner.peer_asleep = true;
+    }
+
+    /// Restart link establishment at Uninitialized (§8.3),
+    /// discarding stale sequence state: after a power cut the peer
+    /// has reset, so the restored seq/ack numbers describe a link
+    /// that no longer exists. `drive` re-sends SYNC from
+    /// Uninitialized, so this is all resume needs before
+    /// `establish`.
+    pub(crate) fn reset_link(&self) {
+        reset_link(&mut self.inner.lock());
+    }
+
+    /// Wake the peer (§9.1, device-PM resume fast path): send
+    /// WAKEUP and drive until WOKEN clears `peer_asleep` or the
+    /// bounded wait expires. Returns true when the link is Active
+    /// with the peer awake — the peer kept power across suspend,
+    /// so the link (sequence numbers included) survives untouched.
+    /// False when the link was not Active, or no WOKEN arrived:
+    /// the caller falls back to `reset_link` + `establish`.
+    pub(crate) fn wake_peer(&self) -> bool {
+        if self.link_state() != H5LinkState::Active {
+            return false;
+        }
+        {
+            let mut inner = self.inner.lock();
+            send_link_frame(&self.port, &mut inner, LinkControlKind::Wakeup, &[]);
+        }
+        narf_scheduler::responsive_spin_until(
+            || {
+                self.drive();
+                !self.peer_asleep()
+            },
+            Deadline::after_ms(H5_WAKEUP_WAIT_MS),
+        ) && self.link_state() == H5LinkState::Active
+    }
 }
 
 impl HciTransport for H5Transport {
@@ -540,6 +614,107 @@ impl HciTransport for H5Transport {
 
     fn name(&self) -> &'static str {
         "h5-uart"
+    }
+}
+
+// ── Device-PM suspend/resume (#1580 item 3) ─────────────────────────
+
+/// [`DevicePmOps`](narf_power::device_pm::DevicePmOps) for one
+/// bound H5 transport.
+///
+/// The S3/s2idle hook point is `power::device_pm`: the S3 and s2idle
+/// phase machines fan `suspend_all_devices` / `resume_all_devices`
+/// out, and the power-suspend programme's hook points have landed
+/// (closed #997/#998) — H5 simply had no ops registered, so a
+/// suspend left the pump running into a sleeping peer and a resume
+/// trusted stale link state. Suspend parks the pump, then sequences
+/// host-initiated sleep (SLEEP, §9.3); resume runs WAKEUP→WOKEN,
+/// falling back to full re-establishment when the peer lost power.
+///
+/// No [`SuspendStateHook`](narf_power::suspend_service::SuspendStateHook):
+/// H5 has no state outside the S4 image (design §5.3), and the link
+/// state that *is* in the image is stale after a peer power cut — a
+/// reset peer has no sequence numbers to match — so resume discards
+/// it rather than sealing it. The S4 resume path runs the same
+/// device-PM resume fan-out, so this covers S4 too once the S4
+/// coordinator wires it (no production `VerifiedResume` consumer
+/// exists yet).
+///
+/// Mirrors `BtIntelPciePm` (#1576/#1578): the HCI index resolves
+/// lazily by transport identity (it only exists once `bring_up_all`
+/// has run), the pump is unparked only after the link is re-armed,
+/// and a resume that cannot re-establish reports the failure and
+/// stays parked. UART power sequencing itself belongs to the serial
+/// driver; this sequences the link on top of it.
+#[derive(Debug)]
+pub(crate) struct H5TransportPm {
+    transport: Arc<H5Transport>,
+}
+
+impl H5TransportPm {
+    pub(crate) fn new(transport: Arc<H5Transport>) -> Self {
+        Self { transport }
+    }
+
+    fn hci_transport(&self) -> Arc<dyn HciTransport> {
+        self.transport.clone()
+    }
+}
+
+impl narf_power::device_pm::DevicePmOps for H5TransportPm {
+    fn suspend(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        use core::fmt::Write as _;
+        // Park first: the pump must not issue HCI into a UART whose
+        // peer is about to sleep.
+        if let Some(index) = crate::controller::index_of_transport(&self.hci_transport()) {
+            crate::pm::suspend_controller(index);
+        } else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  h5: suspend with no HCI index (bring-up not run); park skipped, SLEEP still sent",
+            );
+        }
+        // Host-initiated sleep sequencing (§9.3). Best-effort: a
+        // peer that ignores SLEEP sees silence, as before — never a
+        // reason to abort the system suspend over a UART peer.
+        self.transport.send_sleep();
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<(), narf_power::device_pm::DevicePmError> {
+        use core::fmt::Write as _;
+        use narf_power::device_pm::DeviceSuspendError as PmErr;
+        // Fast path: the peer kept power and answers WOKEN — the
+        // link (sequence numbers included) survives untouched.
+        if self.transport.wake_peer() {
+            if let Some(index) = crate::controller::index_of_transport(&self.hci_transport()) {
+                crate::pm::resume_controller(index);
+            }
+            return Ok(());
+        }
+        // Slow path: the peer lost power (or never woke). Its
+        // sequence state is gone, so the host's is stale by
+        // definition — discard it and re-establish (§8.3). The pump
+        // stays parked unless the link comes back: unparking onto a
+        // dead link would wedge the first HCI command in `Transient`
+        // until the link layer noticed.
+        self.transport.reset_link();
+        if self
+            .transport
+            .establish(Deadline::after_ms(H5_RESUME_ESTABLISH_BUDGET_MS))
+            .is_err()
+        {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  h5: link did not re-establish within {} ms; controller stays parked",
+                H5_RESUME_ESTABLISH_BUDGET_MS,
+            );
+            return Err(PmErr::DriverError);
+        }
+        if let Some(index) = crate::controller::index_of_transport(&self.hci_transport()) {
+            crate::pm::resume_controller(index);
+        }
+        Ok(())
     }
 }
 
@@ -969,6 +1144,12 @@ pub mod tests {
         tx_seq: u8,
         rx_expected: u8,
         dropped_once: bool,
+        /// A power-cut peer has reset (sequence numbers zeroed) and
+        /// answers nothing until the host re-establishes the link
+        /// with SYNC (§8.3) — a WAKEUP to a reset peer goes
+        /// unanswered, modelling a controller that lost power
+        /// across suspend.
+        power_cut: bool,
     }
 
     #[derive(Debug)]
@@ -988,10 +1169,36 @@ pub mod tests {
                     tx_seq: 0,
                     rx_expected: 0,
                     dropped_once: false,
+                    power_cut: false,
                 }),
                 config_answer,
                 drop_first_command,
             })
+        }
+
+        /// Model a controller power cut across suspend: the peer
+        /// resets (sequence numbers zeroed) and answers nothing
+        /// until the host re-establishes the link with SYNC (§8.3).
+        fn cut_power(&self) {
+            let mut inner = self.inner.lock();
+            inner.tx_seq = 0;
+            inner.rx_expected = 0;
+            inner.power_cut = true;
+        }
+
+        /// How many link-control frames of this kind arrived.
+        fn count_link(&self, want: LinkControlKind) -> usize {
+            self.inner
+                .lock()
+                .received
+                .iter()
+                .filter(|f| {
+                    f.header.ptype == H5PacketType::LinkControl
+                        && LinkControlKind::from_payload(&f.payload)
+                            .map(|(k, _)| k == want)
+                            .unwrap_or(false)
+                })
+                .count()
         }
 
         /// Inject a link-control frame into the transport's receive
@@ -1157,6 +1364,20 @@ pub mod tests {
     }
 
     fn react_peer(cfg: H5Config, drop_first: bool, inner: &mut PeerInner, frame: &H5Frame) {
+        // A power-cut peer answers nothing until SYNC
+        // re-establishes the link (§8.3); anything else is
+        // swallowed, including a WAKEUP to the reset controller.
+        if inner.power_cut {
+            if frame.header.ptype == H5PacketType::LinkControl {
+                if let Some((LinkControlKind::Sync, _)) =
+                    LinkControlKind::from_payload(&frame.payload)
+                {
+                    inner.power_cut = false;
+                    queue_link(inner, LinkControlKind::SyncResp, &[]);
+                }
+            }
+            return;
+        }
         match frame.header.ptype {
             H5PacketType::LinkControl => {
                 let Some((kind, _)) = LinkControlKind::from_payload(&frame.payload) else {
@@ -1396,6 +1617,185 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/h5-transport", smoke_h5_wakeup_gets_woken_reply);
+
+    /// Shared suspend/resume fixture (#1580 item 3): an established
+    /// link over the scripted peer, the transport registered as a
+    /// live controller (so the ops resolve its HCI index lazily by
+    /// transport identity, as the PCIe ops do), and the H5 PM ops
+    /// registered in an isolated device-PM registry. Returns the
+    /// peer, the transport, and the HCI index. The caller owns
+    /// resetting the PM park flags (`crate::pm::__reset_for_test`).
+    fn pm_fixture() -> Option<(Arc<ScriptedPeer>, Arc<H5Transport>, usize)> {
+        use narf_power::device_pm;
+        let (peer, transport) = peer_transport(
+            default_answer(),
+            false,
+            H5TransportConfig {
+                baud: 921_600,
+                ..Default::default()
+            },
+        );
+        if transport.establish(Deadline::after_ms(2_000)).is_err() {
+            return None;
+        }
+        let hci: Arc<dyn HciTransport> = transport.clone();
+        let index = crate::controller::register_ready_transport(
+            hci,
+            crate::controller::ControllerInfo::default(),
+        );
+        device_pm::register_device_pm_ops(
+            "h5-pm-fixture",
+            Arc::new(H5TransportPm::new(transport.clone())),
+        );
+        Some((peer, transport, index))
+    }
+
+    fn smoke_h5_pm_suspend_sleeps_and_resume_wakes() -> TestResult {
+        use narf_power::device_pm;
+        crate::pm::__reset_for_test();
+        let _pm_registry = device_pm::__test_isolate_registry();
+        let Some((peer, transport, index)) = pm_fixture() else {
+            return TestResult::Fail("PM fixture link did not establish");
+        };
+        // Suspend: the fan-out parks the pump and the peer sees
+        // SLEEP (§9.3 host-initiated sleep sequencing).
+        if !device_pm::suspend_all_devices().ok() {
+            return TestResult::Fail("suspend fan-out failed on the live-peer path");
+        }
+        if !crate::pm::is_parked(index) || !crate::pm::parked_for_power(index) {
+            return TestResult::Fail("suspend did not park the controller for power");
+        }
+        if !peer.saw_link(LinkControlKind::Sleep) || !transport.peer_asleep() {
+            return TestResult::Fail("suspend did not send SLEEP / mark the peer asleep");
+        }
+        // Resume: WAKEUP→WOKEN is the fast path — the peer kept
+        // power, so the link (sequence numbers included) survives
+        // and no re-establishment SYNC goes out.
+        let syncs_before = peer.count_link(LinkControlKind::Sync);
+        if !device_pm::resume_all_devices().ok() {
+            return TestResult::Fail("resume fan-out failed on the live-peer path");
+        }
+        if crate::pm::is_parked(index) || transport.peer_asleep() {
+            return TestResult::Fail("resume did not unpark / clear peer-asleep on WOKEN");
+        }
+        if transport.link_state() != H5LinkState::Active {
+            return TestResult::Fail("resume left the link non-Active on the live-peer path");
+        }
+        if !peer.saw_link(LinkControlKind::Wakeup)
+            || peer.count_link(LinkControlKind::Sync) != syncs_before
+        {
+            return TestResult::Fail("resume did not run WAKEUP→WOKEN without re-establishing");
+        }
+        // And the link still carries HCI: a command goes out at
+        // the next sequence number and its Command Complete comes
+        // back — no re-establishment reset the numbering.
+        let cmd = Command {
+            opcode: op::HCI_READ_LOCAL_VERSION,
+            params: alloc::vec![],
+        };
+        if transport.send_command(&cmd).is_err() {
+            return TestResult::Fail("post-resume command failed on the live-peer path");
+        }
+        if peer.receipts_of_seq(0) != 1 {
+            return TestResult::Fail("post-resume command did not arrive at seq 0");
+        }
+        match transport.recv_event() {
+            Ok(Some(_)) => {}
+            _ => return TestResult::Fail("post-resume Command Complete did not arrive"),
+        }
+        crate::pm::__reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/h5-transport",
+        smoke_h5_pm_suspend_sleeps_and_resume_wakes
+    );
+
+    fn smoke_h5_pm_resume_reestablishes_after_peer_power_cut() -> TestResult {
+        use narf_power::device_pm;
+        crate::pm::__reset_for_test();
+        let _pm_registry = device_pm::__test_isolate_registry();
+        let Some((peer, transport, index)) = pm_fixture() else {
+            return TestResult::Fail("PM fixture link did not establish");
+        };
+        if !device_pm::suspend_all_devices().ok() {
+            return TestResult::Fail("suspend fan-out failed before the power cut");
+        }
+        // The peer loses power across suspend: it resets and will
+        // answer nothing until SYNC re-establishes the link.
+        peer.cut_power();
+        let syncs_before = peer.count_link(LinkControlKind::Sync);
+        // Resume: WAKEUP goes unanswered, so the ops discard the
+        // stale link state and re-establish (§8.3); the pump is
+        // unparked only once the link is back.
+        if !device_pm::resume_all_devices().ok() {
+            return TestResult::Fail("resume fan-out failed on the power-cut path");
+        }
+        if crate::pm::is_parked(index) || transport.link_state() != H5LinkState::Active {
+            return TestResult::Fail("resume did not re-establish and unpark after power cut");
+        }
+        if peer.count_link(LinkControlKind::Sync) <= syncs_before {
+            return TestResult::Fail("resume did not re-send SYNC after the power cut");
+        }
+        // Sequence numbers restarted: the next command goes out at
+        // seq 0 and is answered, proving the peer and host agree on
+        // the fresh link.
+        let cmd = Command {
+            opcode: op::HCI_READ_LOCAL_VERSION,
+            params: alloc::vec![],
+        };
+        if transport.send_command(&cmd).is_err() {
+            return TestResult::Fail("post-re-establishment command failed");
+        }
+        if peer.receipts_of_seq(0) != 1 {
+            return TestResult::Fail("post-re-establishment command did not arrive at seq 0");
+        }
+        if transport.recv_event().is_err() {
+            return TestResult::Fail("post-re-establishment event read failed");
+        }
+        crate::pm::__reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/h5-transport",
+        smoke_h5_pm_resume_reestablishes_after_peer_power_cut
+    );
+
+    fn smoke_h5_pm_suspend_resume_without_hci_index() -> TestResult {
+        use narf_power::device_pm;
+        crate::pm::__reset_for_test();
+        let _pm_registry = device_pm::__test_isolate_registry();
+        // No `register_ready_transport`: bring-up never ran, so the
+        // ops resolve no HCI index. The link work must still run —
+        // only the index-keyed park flags are skipped.
+        let (peer, transport) = peer_transport(
+            default_answer(),
+            false,
+            H5TransportConfig {
+                baud: 921_600,
+                ..Default::default()
+            },
+        );
+        if transport.establish(Deadline::after_ms(2_000)).is_err() {
+            return TestResult::Fail("link did not establish");
+        }
+        device_pm::register_device_pm_ops(
+            "h5-pm-no-index",
+            Arc::new(H5TransportPm::new(transport.clone())),
+        );
+        if !device_pm::suspend_all_devices().ok() || !peer.saw_link(LinkControlKind::Sleep) {
+            return TestResult::Fail("suspend without an index did not send SLEEP");
+        }
+        if !device_pm::resume_all_devices().ok() || transport.link_state() != H5LinkState::Active {
+            return TestResult::Fail("resume without an index did not restore the link");
+        }
+        crate::pm::__reset_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "bluetooth/h5-transport",
+        smoke_h5_pm_suspend_resume_without_hci_index
+    );
 
     fn smoke_h5_out_of_sequence_event_discarded() -> TestResult {
         let (peer, transport) = peer_transport(
