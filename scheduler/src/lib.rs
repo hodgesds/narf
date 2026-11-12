@@ -2851,6 +2851,10 @@ fn send_resched_ipi(target_cpu: u32) {
 
 pub(crate) struct TaskSlot {
     user_scheduling: Option<user_policy::UserSlot>,
+    /// What the task runs: the future's type name, set at spawn. Diagnostic
+    /// only (`task_origins`): names a task that has no pid, comm or registry
+    /// entry, such as a kernel helper a soak finds accumulating.
+    pub(crate) origin: &'static str,
     /// Why the policy selected this dispatch; copied into its runtime event.
     pub(crate) dispatch_reason: policy::DispatchReason,
     task: BoxedTask,
@@ -4692,6 +4696,7 @@ where
     #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
+        origin: core::any::type_name::<F>(),
         user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(f),
@@ -4759,6 +4764,7 @@ where
     #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
+        origin: core::any::type_name::<F>(),
         user_scheduling: None,
         dispatch_reason: policy::DispatchReason::Policy,
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
@@ -5046,6 +5052,7 @@ where
     #[cfg(feature = "native-ring")]
     authority.publish();
     let slot = TaskSlot {
+        origin: "user task",
         user_scheduling: Some(user_scheduling),
         dispatch_reason: policy::DispatchReason::Policy,
         task,
@@ -5157,6 +5164,30 @@ pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
         let g = q.lock();
         if let Some(ref parked) = *g {
             out.extend(parked.keys().copied());
+        }
+    }
+    out
+}
+
+/// Every queued or parked task with the type name of the future it runs,
+/// for diagnostics (`/proc/narf/tasks`). Same snapshot semantics as
+/// [`all_task_ids`].
+pub fn task_origins() -> alloc::vec::Vec<(TaskId, &'static str)> {
+    let mut out = alloc::vec::Vec::new();
+    for q in READY.iter() {
+        let g = q.lock();
+        if let Some(ref dq) = *g {
+            for slot in dq.iter() {
+                out.push((slot.id, slot.origin));
+            }
+        }
+    }
+    for q in PARKED.iter() {
+        let g = q.lock();
+        if let Some(ref parked) = *g {
+            for (id, entry) in parked.iter() {
+                out.push((*id, entry.slot.origin));
+            }
         }
     }
     out
