@@ -593,6 +593,12 @@ impl<B: BlockDevice> Drop for ReaderGuard<B> {
 #[derive(Debug)]
 pub(crate) struct CommitHold<'a>(&'a core::sync::atomic::AtomicUsize);
 
+/// One running operation ([`VolCore::begin_op`]).
+pub(crate) struct OpGuard<'a> {
+    _excl: narf_lib::mutex::MutexGuard<'a, ()>,
+    _queue: narf_lib::mutex::MutexGuard<'a, ()>,
+}
+
 impl Drop for CommitHold<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
@@ -1047,7 +1053,34 @@ pub struct VolCore<B: BlockDevice> {
     /// held for hundreds of milliseconds at a time. Nothing on the read side
     /// (`read`, `lookup`, `stat`) may take it, exactly as no Linux reader
     /// waits for a transaction: see [`ReaderEpochs`] and `evictions`.
+    ///
+    /// This is the queue operations wait in. What excludes a commit from an
+    /// operation's read-to-stage span is `commit_excl`, which an operation
+    /// takes once it is at the head of this queue ([`Self::begin_op`]).
     op_lock: Mutex<()>,
+    /// Held by the one running operation, and by a commit forced from
+    /// outside any operation (`fsync`, `syncfs`, the commit timer): such a
+    /// commit must not land between an operation's tree reads and its
+    /// staging, so it waits for the operation in flight — but only for that
+    /// one, not for every operation queued on `op_lock` behind it. Linux's
+    /// `btrfs_commit_transaction` likewise waits for the handles that have
+    /// joined the transaction (`num_writers`) and stops new ones joining; it
+    /// does not wait for every writer that will ever want one.
+    commit_excl: Mutex<()>,
+    /// Generation of the newest superblock this core has written to the
+    /// device (Linux `fs_info->last_trans_committed`, counted at the
+    /// superblock write rather than at the commit, because a commit's
+    /// superblock may be staged in memory for a while).
+    durable_gen: core::sync::atomic::AtomicU64,
+    /// Generation of the newest transaction an operation has staged into.
+    staged_gen: core::sync::atomic::AtomicU64,
+    /// `(tree, objectid)` → the newest generation that staged an edit of a
+    /// key with that objectid, for generations not yet durable: everything
+    /// of an inode — its item, its names (`INODE_REF`), its extents, its
+    /// xattrs — is keyed by its number. `fsync` of a file whose entry is gone
+    /// or durable has nothing to wait for (Linux `btrfs_inode_in_log` /
+    /// `inode->last_trans <= last_committed` in `btrfs_sync_file`).
+    dirty_objects: IrqSafeSpinLock<BTreeMap<(u64, u64), u64>>,
     /// Raw `flags` word of the selected superblock (for [`crate::rw_gate`]).
     super_flags: u64,
     /// The write-safety gate's verdict, computed once at mount: `Some` means
@@ -1384,7 +1417,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.frozen.store(true, Ordering::Release);
         // Wait out any operation admitted before the freeze; none can start
         // after it.
-        let _ops = self.op_lock.lock().await;
+        let _ops = self.begin_op().await;
         let result = loop {
             if let Err(err) = self.sync_to_disk().await {
                 break Err(err);
@@ -2173,9 +2206,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // commit the previous subvolume's tree into the new subvolume's root
         // item. Log replay walks several roots in a row and is the path that
         // reaches this. The commit waits for any running operation of
-        // another mount (see `op_lock`).
+        // another mount (see `commit_excl`).
         {
-            let _op = self.op_lock().lock().await;
+            let _op = self.begin_commit().await;
             crate::write::flush_batch(self).await?;
         }
         // The resolution reads the root tree (and the trees on the path)
@@ -2509,6 +2542,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             sharing_checked: core::sync::atomic::AtomicBool::new(false),
             txn_lock: Mutex::new(()),
             op_lock: Mutex::new(()),
+            commit_excl: Mutex::new(()),
+            durable_gen: core::sync::atomic::AtomicU64::new(superblock.generation),
+            staged_gen: core::sync::atomic::AtomicU64::new(superblock.generation),
+            dirty_objects: IrqSafeSpinLock::new(BTreeMap::new()),
             timer_started: core::sync::atomic::AtomicBool::new(false),
             frozen: core::sync::atomic::AtomicBool::new(false),
             devices: IrqSafeSpinLock::new(devices),
@@ -2591,9 +2628,80 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.read_only.load(core::sync::atomic::Ordering::Acquire)
     }
 
-    /// Held across one mutating operation (see the field).
+    /// Test-only: the queue mutating operations wait in (see the field).
+    #[cfg(feature = "kernel-test")]
     pub(crate) fn op_lock(&self) -> &Mutex<()> {
         &self.op_lock
+    }
+
+    /// Start one mutating operation: wait in the operation queue
+    /// (`op_lock`), then for any commit forced from outside an operation
+    /// (`commit_excl`). Held until the operation has staged, or failed.
+    pub(crate) async fn begin_op(&self) -> OpGuard<'_> {
+        let queue = self.op_lock.lock().await;
+        let excl = self.commit_excl.lock().await;
+        OpGuard {
+            _excl: excl,
+            _queue: queue,
+        }
+    }
+
+    /// Exclude the running operation for a commit forced from outside any
+    /// operation, ahead of the operations still queued (see `commit_excl`).
+    pub(crate) async fn begin_commit(&self) -> narf_lib::mutex::MutexGuard<'_, ()> {
+        self.commit_excl.lock().await
+    }
+
+    /// Test-only: the lock a running operation and an outside commit share.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn commit_excl(&self) -> &Mutex<()> {
+        &self.commit_excl
+    }
+
+    /// Generation of the newest superblock written to the device.
+    pub(crate) fn durable_gen(&self) -> u64 {
+        self.durable_gen.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// An operation has staged `edits` into the transaction of generation
+    /// `gen` in subvolume tree `tree`: remember which objects it touched.
+    pub(crate) fn note_staged(&self, tree: u64, objectids: impl Iterator<Item = u64>, gen: u64) {
+        self.staged_gen
+            .fetch_max(gen, core::sync::atomic::Ordering::AcqRel);
+        let mut dirty = self.dirty_objects.lock();
+        for objectid in objectids {
+            let slot = dirty.entry((tree, objectid)).or_insert(gen);
+            *slot = (*slot).max(gen);
+        }
+    }
+
+    /// The generation whose superblock must be durable before every change
+    /// to object `objectid` of tree `tree` is, or `None` if all of them are.
+    pub(crate) fn dirty_generation(&self, tree: u64, objectid: u64) -> Option<u64> {
+        let durable = self.durable_gen();
+        self.dirty_objects
+            .lock()
+            .get(&(tree, objectid))
+            .copied()
+            .filter(|&gen| gen > durable)
+    }
+
+    /// The generation whose superblock must be durable before everything
+    /// staged or committed so far is.
+    pub(crate) fn newest_generation(&self) -> u64 {
+        self.staged_gen
+            .load(core::sync::atomic::Ordering::Acquire)
+            .max(self.superblock().generation)
+    }
+
+    /// A superblock of generation `gen` is on the device.
+    fn note_durable(&self, gen: u64) {
+        let before = self
+            .durable_gen
+            .fetch_max(gen, core::sync::atomic::Ordering::AcqRel);
+        if gen > before {
+            self.dirty_objects.lock().retain(|_, staged| *staged > gen);
+        }
     }
 
     /// Serialises closing one transaction against opening the next.
@@ -3077,11 +3185,42 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// `smoke_btrfs_fsync_survives_a_later_crash` holds this to account: it
     /// fsyncs, crashes the following commit, and requires the fsynced data
     /// back. Deferring commits without doing the work here turns that red.
-    /// [`Self::sync_to_disk`] from outside any operation (`fsync`, `syncfs`):
-    /// waits for the running operation, so the commit it forces cannot land
-    /// between another CPU's tree reads and its staging.
+    /// [`Self::sync_to_disk`] from outside any operation (`fsync` of a
+    /// directory, `syncfs`): make everything staged or committed so far
+    /// durable.
     pub async fn sync_to_disk_exclusive(&self) -> Result<(), FsError> {
-        let _op = self.op_lock().lock().await;
+        self.commit_through(self.newest_generation()).await
+    }
+
+    /// `fsync` of object `objectid` (a file) of this mount's tree: make every
+    /// change to it durable. Nothing to do if none is newer than the last
+    /// superblock written (Linux `btrfs_sync_file` returning early for an
+    /// inode whose `last_trans` is committed).
+    pub async fn sync_object(&self, objectid: u64) -> Result<(), FsError> {
+        match self.dirty_generation(self.fs_tree_id(), objectid) {
+            Some(gen) => self.commit_through(gen).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Make the transaction of generation `target` durable, committing the
+    /// open one if no superblock of `target` or later has been written.
+    ///
+    /// Waits for the running operation, so the commit cannot land between
+    /// another CPU's tree reads and its staging — but not for the operations
+    /// queued behind it (`commit_excl`). Concurrent callers share commits:
+    /// whoever gets the lock first commits everything open, and each one
+    /// after it finds its generation durable and returns (Linux joins an
+    /// `fsync` to the transaction already committing,
+    /// `btrfs_commit_transaction` with `cur_trans->state >= COMMIT_START`).
+    async fn commit_through(&self, target: u64) -> Result<(), FsError> {
+        if self.durable_gen() >= target {
+            return Ok(());
+        }
+        let _commit = self.begin_commit().await;
+        if self.durable_gen() >= target {
+            return Ok(());
+        }
         // Reclaiming orphans is housekeeping this call does on the way; what
         // it owes its caller is the commit. An orphan that cannot be
         // reclaimed for lack of space must not cost the sync — the commit
@@ -3424,6 +3563,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     async fn write_superblock_unchecked(&self, raw: &[u8]) -> Result<(), FsError> {
         let result = self.write_all_supers(raw).await;
+        if result.is_ok() {
+            if let Some(gen) = format::super_generation(raw) {
+                self.note_durable(gen);
+            }
+        }
         if result.is_err() {
             // `btrfs_handle_fs_error` after a failed `write_all_supers`: the
             // trees in memory are ahead of anything durable, so the only

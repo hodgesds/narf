@@ -450,8 +450,21 @@ read-write. An unlinked inode's fs-verity items go with the rest of its items
 when it is evicted, as `btrfs_truncate_inode_items` removes every item of the
 inode.
 
-`fsync` and `fdatasync`, on a file or a directory, both commit the open
-transaction and write its superblock (`sync_to_disk_exclusive`). `fdatasync`
+`fsync` and `fdatasync` of a file commit the open transaction and write its
+superblock if any change to the inode is not yet durable
+(`BtrfsVolume::sync_object`): staging records, per subvolume tree, the newest
+generation that edited a key of each objectid, and a file whose entry is
+gone or no newer than the last superblock written returns at once (Linux
+`btrfs_sync_file` with the inode's `last_trans` committed). On a directory,
+and for `syncfs`, everything staged so far is made durable
+(`sync_to_disk_exclusive`). Concurrent callers share commits: each waits for
+the running operation only, not for the operations queued behind it — a
+mutating operation waits in `op_lock` and then takes `commit_excl`
+(`begin_op`), while a commit forced from outside any operation takes only
+`commit_excl` (`begin_commit`) — and after the first has committed, the
+others find their generation durable and return
+(`smoke_btrfs_fsync_waits_for_the_running_operation_only`; the `release`
+scenario's `group commit` crash case). `fdatasync`
 is not weaker: the size and extent items a write's data is read back through
 live in the open batch until it commits, so a device flush alone makes
 nothing of that write durable (`smoke_btrfs_fdatasync_survives_a_later_crash`;

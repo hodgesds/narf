@@ -1301,6 +1301,236 @@ fn two_handles(args: &Args) -> Result<String, String> {
     ))
 }
 
+/// One of the operations [`poll_all`] runs side by side.
+type Job<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + 'a>>;
+
+/// Poll `futures` round-robin until every one is done, calling `done(i)` as
+/// future `i` completes: on the host nothing parks, so a future that is
+/// pending is waiting for a lock another of them holds, or yielded between
+/// two steps of a long operation.
+fn poll_all(
+    mut futures: Vec<Job<'_>>,
+    mut done: impl FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut finished = vec![false; futures.len()];
+    for _ in 0..1u64 << 26 {
+        let mut all = true;
+        for (i, future) in futures.iter_mut().enumerate() {
+            if finished[i] {
+                continue;
+            }
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => {
+                    result?;
+                    finished[i] = true;
+                    done(i)?;
+                }
+                Poll::Pending => all = false,
+            }
+        }
+        if all {
+            return Ok(());
+        }
+    }
+    Err("futures still pending after 2^26 rounds".into())
+}
+
+/// Concurrent `fsync`s beside a long truncate: a stepwise truncate of a
+/// file of 96 one-page extents, `fsync`s of two files written just before,
+/// a write and `fsync` of a third, and an `fsync` of a fourth with nothing
+/// new, all polled round-robin so their commits interleave with the
+/// truncate's steps and share commits with each other.
+///
+/// Every crash cut of the recorded stream must check clean and remount at
+/// a state some commit could hold, and each `fsync` must keep its promise:
+/// the image as it stands when the call returns, read by `btrfs restore`,
+/// holds the file's new contents.
+fn group_commit(args: &Args) -> Result<String, String> {
+    const FILES: usize = 4;
+    const PAGES: usize = 96;
+    const BODY: usize = 64 << 10;
+    let dir = args.workdir.join("release-group-commit");
+    let img = mkfs(&dir, 512 << 20, 0x6c, FEATURES)?;
+    let (fsid, nodesize, _) = dev::image_identity(&img);
+    let open = |recording: bool| -> Result<(Arc<RecDev>, Arc<dyn FsInstance>), String> {
+        let dev = Arc::new(RecDev::open(&img, 512, fsid, nodesize));
+        dev.set_recording(recording);
+        narf::register_root(dev.clone(), &fsid)?;
+        Ok((dev, narf::mount_root_rw(&fsid, "@", &[])?.remove(0)))
+    };
+    let name = |i: usize| format!("f{i}");
+    {
+        let (_dev, fs) = open(false)?;
+        let top = block_on(fs.root().mkdir("g")).map_err(err("mkdir"))?;
+        for i in 0..FILES {
+            let file = block_on(top.create(&name(i))).map_err(err("create"))?;
+            block_on(write_all(&file, 0, &noise(0x900 + i as u64, BODY)))?;
+        }
+        drop(build(&top, "victim", PAGES, PAGE)?);
+        block_on(top.fsync(false)).map_err(err("fsync"))?;
+        drop(top);
+        drop(fs);
+        narf::reset();
+    }
+    let base = dir.join("base.img");
+    linux::clone_file(&img, &base);
+    let base_gen = dev::image_identity(&base).2;
+
+    let (dev, fs) = open(true)?;
+    let root = fs.root();
+    let before = narf::walk(&root)?.0;
+    let top = block_on(root.lookup_dir_async("g")).map_err(err("lookup"))?;
+    let files: Vec<Arc<dyn FileOps>> = (0..FILES)
+        .map(|i| block_on(top.lookup_async(&name(i))).map_err(err("lookup")))
+        .collect::<Result<_, _>>()?;
+    let victim = block_on(top.lookup_async("victim")).map_err(err("lookup"))?;
+    let new: Vec<Vec<u8>> = (0..FILES).map(|i| noise(0xa00 + i as u64, BODY)).collect();
+    for (file, body) in files.iter().zip(&new).take(2) {
+        block_on(write_all(file, 0, body))?;
+    }
+    // What each future, once done, promises is durable: (file, contents).
+    let promises: Vec<Option<(usize, Vec<u8>)>> = vec![
+        None,
+        Some((0, new[0].clone())),
+        Some((1, new[1].clone())),
+        Some((2, new[2].clone())),
+        Some((3, noise(0x903, BODY))),
+    ];
+    let futures: Vec<Job<'_>> = vec![
+        Box::pin(async { victim.truncate(0).await.map_err(err("truncate")) }),
+        Box::pin(async { files[0].fsync(false).await.map_err(err("fsync")) }),
+        Box::pin(async { files[1].fsync(true).await.map_err(err("fdatasync")) }),
+        Box::pin(async {
+            write_all(&files[2], 0, &new[2]).await?;
+            files[2].fsync(false).await.map_err(err("fsync"))
+        }),
+        Box::pin(async { files[3].fsync(false).await.map_err(err("fsync")) }),
+    ];
+    let mut snapshots: Vec<(PathBuf, usize, Vec<u8>)> = Vec::new();
+    poll_all(futures, |i| {
+        if let Some((file, data)) = &promises[i] {
+            let snap = dir.join(format!("fsync{i}.img"));
+            linux::clone_file(&img, &snap);
+            snapshots.push((snap, *file, data.clone()));
+        }
+        Ok(())
+    })?;
+    let after = narf::walk(&root)?.0;
+    drop(files);
+    drop(victim);
+    drop(top);
+    drop(root);
+    drop(fs);
+    narf::reset();
+    dev.set_recording(false);
+    let log = dev.take_log();
+    let gens: std::collections::BTreeSet<u64> = dev
+        .sb_gens()
+        .into_iter()
+        .filter(|&gen| gen > base_gen)
+        .collect();
+    drop(dev);
+
+    // Each fsync's promise, on the image as it stood when the call returned.
+    for (snap, file, data) in &snapshots {
+        let subs = linux::subvolumes(snap)?;
+        let id = linux::subvol_id(&subs, "@").ok_or("group commit: no @ subvolume")?;
+        let tree = linux::restore(snap, id, &snap.with_extension("restore"))?;
+        match tree.get(&format!("g/{}", name(*file))) {
+            Some(Flat::File { data: got, .. }) if **got == *data => {}
+            _ => {
+                return Err(format!(
+                    "group commit: {} did not hold f{file}'s fsynced contents",
+                    snap.display()
+                ))
+            }
+        }
+    }
+
+    // Every state a crash may leave: f0 and f1 rewritten (no commit came
+    // between their writes and the fsyncs), f2 old or new, and the victim
+    // whole, cut at each step's extent boundary, or empty.
+    let Some(Flat::File { data: old, .. }) = before.get("g/victim") else {
+        return Err("group commit: no victim in the model".into());
+    };
+    let old = old.clone();
+    let mut cuts: Vec<usize> = vec![old.len(), 0];
+    let mut left = PAGES;
+    while left > STEP {
+        left -= STEP;
+        cuts.push(left * PAGE);
+    }
+    let set = |state: &mut crate::model::FlatTree, path: &str, bytes: Vec<u8>| {
+        if let Some(Flat::File { data, .. }) = state.get_mut(path) {
+            *data = Arc::new(bytes);
+        }
+    };
+    let mut states = vec![vec![before.clone()], vec![after]];
+    for &cut in &cuts {
+        for f2 in [false, true] {
+            let mut state = before.clone();
+            set(&mut state, "g/f0", new[0].clone());
+            set(&mut state, "g/f1", new[1].clone());
+            if f2 {
+                set(&mut state, "g/f2", new[2].clone());
+            }
+            set(&mut state, "g/victim", old[..cut].to_vec());
+            states.push(vec![state]);
+        }
+    }
+    let commits: Vec<CommitRec> = gens
+        .iter()
+        .map(|&gen| CommitRec {
+            gen,
+            candidates: states.clone(),
+        })
+        .collect();
+    let rep = crash::run(
+        &crash::Input {
+            base: &base,
+            log: &log,
+            commits: &commits,
+            base_gen,
+            base_state: vec![before],
+            lba: 512,
+            fsid,
+            nodesize,
+            root_subvol: "@",
+            others: &[],
+            default_profile: false,
+        },
+        &crash::Opts {
+            cuts: 0,
+            exhaustive: true,
+            seed: args.seed,
+            jobs: args.jobs,
+            workdir: dir.join("cuts"),
+        },
+    );
+    if !rep.failures.is_empty() {
+        return Err(format!(
+            "group commit: {} of {} crash cuts failed (images kept in {}):\n{}",
+            rep.failures.len(),
+            rep.cuts,
+            dir.join("cuts").display(),
+            rep.failures.join("\n")
+        ));
+    }
+    if !args.keep {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(format!(
+        "    group commit: {} fsyncs beside a stepwise truncate kept their promises in {} commits; {} cuts over {} flushes check clean and remount at one of {} states",
+        snapshots.len(),
+        gens.len(),
+        rep.cuts,
+        rep.flush_boundaries,
+        states.len(),
+    ))
+}
+
 pub fn run(args: &Args) -> Result<String, String> {
     let t0 = Instant::now();
     let mut lines = vec![reservation(args)?];
@@ -1487,6 +1717,7 @@ pub fn run(args: &Args) -> Result<String, String> {
     lines.push(readonly_snapshot(args)?);
     lines.push(no_free_space_tree(args)?);
     lines.push(two_handles(args)?);
+    lines.push(group_commit(args)?);
     Ok(format!(
         "release: OK\n{}\n    btrfs check clean (also --check-data-csum), no orphan item left, files empty or gone after a remount; {:.0?}",
         lines.join("\n"),

@@ -32,6 +32,7 @@ mod safety;
 mod snapshot_gen;
 mod snapshots;
 mod two_handles;
+mod group_commit;
 mod write_buffers;
 
 // ── Shared test harness ────────────────────────────────────────────
