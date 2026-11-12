@@ -3,15 +3,28 @@
 //!
 //! ## References
 //!
-//! - **`/home/daniel/git/linux/drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c`**
-//!   — generic `nvkm_mc_*` entry points.
-//! - **`drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp100.c`** &
-//!   **`gp10b.c`** — Pascal/Volta MC functable; the
-//!   `nvkm_wr32(device, 0x000200, 0xffffffff)` "everything on"
-//!   sequence (cited gp10b.c:30, ga100.c:64).
+//! - **`drivers/gpu/drm/nouveau/nvkm/subdev/mc/base.c`** —
+//!   `nvkm_mc_enable/disable/reset/enabled`: per-engine
+//!   `PMC_ENABLE` mask-set / mask-clear / readback-check against
+//!   BAR0+0x200 (via the `nv04_mc_device` ops in `nv04.c`).
+//! - **`drivers/gpu/drm/nouveau/nvkm/subdev/mc/nv50.c`** —
+//!   `nv50_mc_init`: the discrete-Pascal MC bring-up, the
+//!   `.init` hook `gp100_mc` uses — a single
+//!   `nvkm_wr32(device, 0x000200, 0xffffffff)` ("everything on").
+//!   No per-engine order, no delay, no poll after the write.
+//!   `gp10b.c` adds a second all-ones write at 0x20c (ELPG) —
+//!   Tegra-only, not the discrete path.
 //! - **`drivers/gpu/drm/nouveau/nvkm/subdev/mc/ga100.c`** —
-//!   Ampere+ MC (slightly reshaped, but PMC_ENABLE @ 0x000200
-//!   still works).
+//!   Ampere+ MC (`ga100_mc_init`: all-ones at 0x200 *and* 0x600).
+//! - **`drivers/gpu/drm/nouveau/nvkm/subdev/mc/gp100.c`** &
+//!   **`gk104.c`** — Pascal/Kepler MC functables; `gp100_mc_intrs[]`
+//!   / `gk104_mc_intrs[]` are the top-level INTR_0 bit tables
+//!   (PMU = `0x01000000`, DISP = `0x04000000`, FIFO = `0x100`).
+//! - **envytools `hw/bus/pmc.html`** — independent second source
+//!   for the GF100+ `PMC_ENABLE` bit list and the GF100+
+//!   `INTR_HOST` bit list (used where Nouveau carries the bits
+//!   only in runtime-parsed PTOP data, e.g. the copy/video
+//!   engines and PSEC).
 //! - **PMC_BOOT_0** at BAR0 offset 0x000000 — universal chip-id
 //!   register. Used here as the presence + family detect.
 //!
@@ -55,23 +68,49 @@ pub const PMC_ENABLE_UNK0: u64 = 0x0000_0204;
 
 // ── PMC_ENABLE engine-bit assignments ────────────────────────────
 //
-// Bit layout is reasonably stable across Maxwell→Ada for the
-// engines we touch in Stage 1. Cite `nvkm/subdev/mc/gp100.c`
-// (gp100_mc_reset) which enumerates the canonical bit names; the
-// numeric positions match `dev_pmc.ref.txt`.
+// Grounded (G3, 2026-11-11) against upstream Nouveau
+// (`torvalds/linux` master `067c5c24`) and envytools
+// (`hw/bus/pmc.html`, GF100+ lists) — NOT `dev_pmc.ref.txt`,
+// which does not exist in open-gpu-doc (see §5 of the Nvidia
+// driver programme record). Two earlier values were wrong and
+// are corrected here:
+//
+// - `PMSPDEC` was `1 << 17`: that is the Fermi `MSPDEC` bit
+//   (`gf100_mc_reset[]`: `{ 0x00020000, NVKM_ENGINE_MSPDEC }`).
+//   On GM107+ the video-decoder enable is bit 15 (envytools
+//   GF100+ ENABLE: "15: PVDEC [GM107:]"; bit 17 is the
+//   decoder's *interrupt* line on GM107+, and the pre-GM107
+//   PPDEC enable).
+// - `PCE0` was `1 << 15`: that is the GM107+ PVDEC enable bit.
+//   The copy engines are PCOPY[0..2] = bits 6, 7, 21 on GF100+
+//   (envytools GF100+ ENABLE list). GP107 has four copy engines
+//   (`nv137_chipset`: `.ce = { 0xf, gp102_ce_new }`); the
+//   PCOPY[3] enable bit is unresolved in both sources, so only
+//   PCOPY[0] is named here — CE bring-up (G10) must re-verify
+//   the per-instance bits before enabling engines individually.
+//
+// The remaining bits are pinned by both sources: PFIFO 8 and
+// PGRAPH 12 also appear in `nv04_mc_reset[]`
+// (`{ 0x1000, NVKM_ENGINE_GR }, { 0x100, NVKM_ENGINE_FIFO }`);
+// PMU 13 in `gk104_mc_reset[]`; PSEC 14, PVENC 18 and PDISP 30
+// in the envytools GF100+ ENABLE list. Note the ENABLE and
+// INTR_0 bit numbers for one engine often differ (PSEC: enable
+// 14, interrupt 15; PVDEC: enable 15, interrupt 17) — the old
+// table copied several INTR positions into ENABLE slots and
+// vice versa; both tables below are now sourced independently.
 
 /// `NV_PMC_ENABLE.PFIFO` — host FIFO engine.
 pub const PMC_ENABLE_PFIFO: u32 = 1 << 8;
 /// `NV_PMC_ENABLE.PGRAPH` — graphics engine.
 pub const PMC_ENABLE_PGRAPH: u32 = 1 << 12;
-/// `NV_PMC_ENABLE.PMSPDEC` — video decoder.
-pub const PMC_ENABLE_PMSPDEC: u32 = 1 << 17;
-/// `NV_PMC_ENABLE.PMSENC` — video encoder.
+/// `NV_PMC_ENABLE.PMSPDEC` — video decoder (PVDEC on GM107+).
+pub const PMC_ENABLE_PMSPDEC: u32 = 1 << 15;
+/// `NV_PMC_ENABLE.PMSENC` — video encoder (PVENC).
 pub const PMC_ENABLE_PMSENC: u32 = 1 << 18;
 /// `NV_PMC_ENABLE.PSEC` — security engine (SEC2).
 pub const PMC_ENABLE_PSEC: u32 = 1 << 14;
-/// `NV_PMC_ENABLE.PCE0` — copy engine 0.
-pub const PMC_ENABLE_PCE0: u32 = 1 << 15;
+/// `NV_PMC_ENABLE.PCE0` — copy engine 0 (PCOPY[0]).
+pub const PMC_ENABLE_PCE0: u32 = 1 << 6;
 /// `NV_PMC_ENABLE.PMU` — power-management microcontroller.
 ///
 /// Grounded against upstream Nouveau, NOT `dev_pmc.ref.txt` (which
@@ -83,12 +122,25 @@ pub const PMC_ENABLE_PCE0: u32 = 1 << 15;
 /// `nv04_mc_device_enabled`, which reads `PMC_ENABLE` (BAR0+0x200)
 /// and checks `(value & mask) == mask`
 /// (`nvkm/subdev/mc/nv04.c`). Bit set = PMU engine out of reset.
+/// Envytools agrees independently (falcon parameters: PMU
+/// "PMC enable bit: v2+: 13").
 pub const PMC_ENABLE_PMU: u32 = 1 << 13;
 /// `NV_PMC_ENABLE.PDISP` — display engine.
 pub const PMC_ENABLE_PDISP: u32 = 1 << 30;
 
-/// "Everything on" — used by Pascal+ MC bring-up. Cite
-/// `nvkm/subdev/mc/gp10b.c:30`.
+/// Engines `gk104_mc_reset[]` proves present on Pascal (FIFO +
+/// PMU). Used as the post-enable sanity check: after the
+/// all-ones write, both bits must read back set. Other engines
+/// (GR, DISP, …) are enabled by the same write but are not part
+/// of the check — their presence is a per-chip property the
+/// readback alone cannot prove.
+pub const PMC_ENABLE_CORE_MASK: u32 = PMC_ENABLE_PFIFO | PMC_ENABLE_PMU;
+
+/// "Everything on" — the discrete-Pascal MC bring-up write.
+/// Cite `nvkm/subdev/mc/nv50.c::nv50_mc_init`
+/// (`nvkm_wr32(device, 0x000200, 0xffffffff)`, the `.init` hook
+/// `gp100_mc` uses for GP107) and `nv04.c::nv04_mc_init`
+/// (same write, "everything enabled").
 pub const PMC_ENABLE_ALL: u32 = 0xFFFF_FFFF;
 
 // ── PMC_BOOT_0 field layout ──────────────────────────────────────
@@ -250,6 +302,10 @@ pub enum IntrSource {
     Display,
     Sec,
     Pmu,
+    // Kept (G4): no top-level `PMC_INTR_0` bit (`intr0_bit` is 0);
+    // G3 removed this variant, but the G4 IRQ design keeps it so
+    // the walker can enumerate it and skip it, and the G4 test
+    // pins the 0 bit. Restored during the G3 rebase onto main.
     Gsp,
 }
 
@@ -438,4 +494,85 @@ pub unsafe fn unmask_intr_source(bar0: &narf_driver_runtime::MmioRegion, source:
         let cur = bar0.read32(PMC_INTR_EN_0);
         bar0.write32(PMC_INTR_EN_0, cur | source.intr0_bit());
     }
+}
+
+// ── PMC_ENABLE writer (G3) ───────────────────────────────────────
+//
+// The bring-up sequence, grounded on upstream Nouveau (see the
+// module header): there is NO per-engine enable order. The MC
+// subdev's `.init` hook writes all-ones to `PMC_ENABLE` in one
+// shot — `nv50_mc_init` on discrete Pascal (`gp100_mc`), and
+// the same write in `nv04_mc_init` and `ga100_mc_init` — and
+// individual engines are only ever toggled afterwards, around
+// their own init/fini (`nvkm_mc_enable/disable`, via the
+// `nv04_mc_device` ops: mask-set + posting read / mask-clear).
+// Nouveau performs no delay and no poll after the all-ones
+// write; the posting read below is our own addition (same shape
+// as `nv04_mc_device_enable`'s), so probe can verify the write
+// landed instead of assuming it.
+
+/// Take every engine out of reset in one write, then read
+/// `PMC_ENABLE` back. Returns the readback value; the caller
+/// checks it with [`engines_enabled`].
+///
+/// This is `nv50_mc_init` (`nvkm_wr32(device, 0x000200,
+/// 0xffffffff) /* everything on */`) plus a readback. It
+/// enables engines whose bring-up does not exist yet (GR, CE,
+/// NVDEC/NVENC, …) as well as the ones probe needs — that is
+/// what Nouveau does at MC init, and an engine in reset cannot
+/// be programmed by its later bring-up lane. The write does not
+/// start any engine's firmware; it only releases reset.
+///
+/// # Safety
+/// `bar0` is the kernel-mapped BAR0 view; caller has exclusive
+/// access to `PMC_ENABLE` for the duration of the call.
+pub unsafe fn enable_all_engines(bar0: &narf_driver_runtime::MmioRegion) -> u32 {
+    // SAFETY: caller's responsibility.
+    unsafe {
+        bar0.write32(PMC_ENABLE, PMC_ENABLE_ALL);
+        // Posting read: flushes the write and gives the caller a
+        // value to verify (cf. `nv04_mc_device_enable`).
+        bar0.read32(PMC_ENABLE)
+    }
+}
+
+/// Enable one engine (or engine set) by mask: set exactly the
+/// masked bits in `PMC_ENABLE`, then a posting read. Mirrors
+/// `nvkm_mc_enable` / `nv04_mc_device_enable` (`nvkm_mask(dev,
+/// 0x200, mask, mask); nvkm_rd32(dev, 0x200)`). The mask must
+/// come from the `PMC_ENABLE_*` constants above; per-engine
+/// masks Nouveau derives from runtime-parsed PTOP data are not
+/// re-derived here.
+///
+/// # Safety
+/// Same as [`enable_all_engines`].
+pub unsafe fn enable_engine(bar0: &narf_driver_runtime::MmioRegion, mask: u32) {
+    // SAFETY: caller's responsibility.
+    unsafe {
+        let cur = bar0.read32(PMC_ENABLE);
+        bar0.write32(PMC_ENABLE, cur | mask);
+        let _ = bar0.read32(PMC_ENABLE);
+    }
+}
+
+/// Disable one engine (or engine set) by mask: clear exactly the
+/// masked bits in `PMC_ENABLE`. Mirrors `nvkm_mc_disable` /
+/// `nv04_mc_device_disable` (`nvkm_mask(dev, 0x200, mask, 0)`);
+/// Nouveau performs no posting read on the disable path.
+///
+/// # Safety
+/// Same as [`enable_all_engines`].
+pub unsafe fn disable_engine(bar0: &narf_driver_runtime::MmioRegion, mask: u32) {
+    // SAFETY: caller's responsibility.
+    unsafe {
+        let cur = bar0.read32(PMC_ENABLE);
+        bar0.write32(PMC_ENABLE, cur & !mask);
+    }
+}
+
+/// Pure readback check: true iff every bit in `mask` is set in
+/// the `PMC_ENABLE` sample. Mirrors `nvkm_mc_enabled` /
+/// `nv04_mc_device_enabled` (`(rd32(0x200) & mask) == mask`).
+pub fn engines_enabled(readback: u32, mask: u32) -> bool {
+    mask != 0 && (readback & mask) == mask
 }

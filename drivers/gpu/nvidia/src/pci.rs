@@ -89,6 +89,13 @@ pub struct NvidiaDevice {
     /// routes MSI via `crate::irq::route_irq` after the card is in
     /// the controller list.
     pub irq: IrqState,
+    /// `PMC_ENABLE` readback sampled by the G3 enable write
+    /// (`mc::enable_all_engines`). 0 when the write was skipped
+    /// (PMU not ready, or a family whose MC init this lane did
+    /// not re-ground). Callers test individual engines against
+    /// this value with `mc::engines_enabled`, the same way
+    /// Nouveau's `nvkm_mc_enabled` re-reads BAR0+0x200.
+    pub pmc_enable: u32,
     /// Stable per-card index. Assigned monotonically by `probe`; used
     /// by upper layers to refer to a specific card without holding a
     /// raw `Arc<NvidiaCard>`. Mirrors Nouveau's `drm_dev_register`
@@ -169,7 +176,38 @@ impl NvidiaDevice {
         // `pmu.rs`). A clear bit records "not ready" and probe
         // continues; the card binds regardless.
         // SAFETY: `regs` is the BAR0 window just mapped above.
-        let pmu_ready = unsafe { Pmu::new(&regs).engine_enabled() };
+        let mut pmu_ready = unsafe { Pmu::new(&regs).engine_enabled() };
+
+        // Engine enable (G3): take the engines out of reset with
+        // Nouveau's MC-init write — a single all-ones write to
+        // PMC_ENABLE (`nv50_mc_init`, the `.init` hook of the
+        // `gp100_mc` functable GP107 uses; same write in
+        // `nv04_mc_init`). There is no per-engine order and no
+        // delay/poll after the write in Nouveau.
+        //
+        // Gated on `pmu_ready` and on the family: the write is
+        // only re-grounded for Maxwell/Pascal (whose MC functables
+        // — `gk104_mc`, `gp100_mc` — both use `nv50_mc_init`).
+        // Volta/Turing were not re-grounded in this lane, and
+        // Ampere/Ada are GSP-owned (`pmu_ready` false by design),
+        // so those families skip the write and keep `pmc_enable`
+        // at 0. This gate is stricter than Nouveau, which enables
+        // unconditionally at MC init before the PMU subdev comes
+        // up; it is deliberate here because on this driver the
+        // PMU is the only clock/power owner probe knows about,
+        // and enabling GR without a live PMU is unproven. A
+        // later lane may relax it once PMU bring-up (G12) exists.
+        //
+        // The readback re-checks the PMU bit: if the engine
+        // dropped out of reset across the write, `pmu_ready`
+        // clears to match silicon. Probe still never fails on a
+        // clear bit (G2 invariant).
+        let mut pmc_enable = 0u32;
+        if pmu_ready && matches!(boot0.family, ChipFamily::Maxwell | ChipFamily::Pascal) {
+            // SAFETY: `regs` is the BAR0 window just mapped above.
+            pmc_enable = unsafe { crate::mc::enable_all_engines(&regs) };
+            pmu_ready = crate::mc::engines_enabled(pmc_enable, crate::mc::PMC_ENABLE_PMU);
+        }
 
         Ok(Self {
             chip,
@@ -179,6 +217,7 @@ impl NvidiaDevice {
             bar3,
             pmu_ready,
             irq: IrqState::new(),
+            pmc_enable,
             card_index,
             bus_device: *device,
         })
