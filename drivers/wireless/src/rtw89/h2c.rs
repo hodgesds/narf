@@ -86,6 +86,9 @@ pub const H2C_FUNC_MAC_CCTLINFO_UD: u8 = 0x2;
 pub const H2C_FUNC_MAC_BCN_UPD: u8 = 0x5;
 /// `H2C_FUNC_MAC_DCTLINFO_UD_V1` (9). `fw.h:4567`. DMAC table v1.
 pub const H2C_FUNC_MAC_DCTLINFO_UD_V1: u8 = 0x9;
+/// `H2C_FUNC_MAC_DCTLINFO_UD_V2` (0xC). `fw.h:4825`. DMAC table
+/// v2 (RTL8922A default DMAC table).
+pub const H2C_FUNC_MAC_DCTLINFO_UD_V2: u8 = 0xC;
 
 /// `H2C_CL_MAC_ADDR_CAM_UPDATE` (6). `fw.h:4575`.
 pub const H2C_CL_MAC_ADDR_CAM_UPDATE: u8 = 0x6;
@@ -101,6 +104,12 @@ pub const H2C_FUNC_MAC_FWROLE_MAINTAIN: u8 = 0x4;
 
 /// `H2C_CL_MAC_FW_OFLD` (9). `fw.h:4585`.
 pub const H2C_CL_MAC_FW_OFLD: u8 = 0x9;
+/// `H2C_FUNC_MAC_MACID_PAUSE` (0x8). `fw.h:4844`. MACID pause
+/// (plain variant, REC_ACK only).
+pub const H2C_FUNC_MAC_MACID_PAUSE: u8 = 0x8;
+/// `H2C_FUNC_MAC_MACID_PAUSE_SLEEP` (0x28). `fw.h:4856`. MACID
+/// pause with sleep (firmware `MACID_PAUSE_SLEEP`, REC_ACK only).
+pub const H2C_FUNC_MAC_MACID_PAUSE_SLEEP: u8 = 0x28;
 /// `H2C_FUNC_PACKET_OFLD` (0x1). `fw.h:4587`.
 pub const H2C_FUNC_PACKET_OFLD: u8 = 0x1;
 /// `H2C_FUNC_OFLD_CFG` (0x14). `fw.h:4591`. Offload-config setup.
