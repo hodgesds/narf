@@ -894,6 +894,7 @@ pub fn frame_audit_state(phys: crate::PhysAddr) -> FrameAuditState {
 /// explicitly. No-op when frame auditing is disabled.
 #[inline]
 pub(crate) fn audit_cached_free(frame: u64) {
+    crate::slab::site_audit::frame_free(frame, 0);
     #[cfg(feature = "frame-alloc-audit")]
     audit_free(frame, 0);
     #[cfg(not(feature = "frame-alloc-audit"))]
@@ -904,6 +905,7 @@ pub(crate) fn audit_cached_free(frame: u64) {
 /// exact-range reservation) back to caller ownership.
 #[inline]
 pub(crate) fn audit_cached_alloc(frame: u64) {
+    crate::slab::site_audit::frame_alloc(frame, 0);
     #[cfg(feature = "frame-alloc-audit")]
     audit_alloc(frame, 0);
     #[cfg(not(feature = "frame-alloc-audit"))]
@@ -1217,6 +1219,7 @@ impl BuddyZone {
     /// Record a buddy hand-out in the audit, iff this zone opted in.
     #[inline]
     fn note_alloc(&self, frame: u64, order: u8) {
+        crate::slab::site_audit::frame_alloc(frame, order);
         if let Some(index) = self.index {
             index.mark_allocated(frame, order);
         }
@@ -1231,6 +1234,7 @@ impl BuddyZone {
     /// Record a buddy return in the audit, iff this zone opted in.
     #[inline]
     fn note_free(&self, frame: u64, order: u8) {
+        crate::slab::site_audit::frame_free(frame, order);
         #[cfg(feature = "frame-alloc-audit")]
         if self.audit {
             audit_free(frame, order);

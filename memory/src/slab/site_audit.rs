@@ -24,19 +24,30 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Text words that make up one site key.
-pub const SITE_DEPTH: usize = 8;
+pub const SITE_DEPTH: usize = 12;
 /// Stack words scanned for them.
 const SCAN_WORDS: usize = 160;
 /// Distinct sites tracked; the rest pool in site 0 ("other").
 const MAX_SITES: usize = 2048;
 /// Live tracked allocations (open addressing, power of two).
-const TABLE: usize = 1 << 17;
+const TABLE: usize = 1 << TABLE_BITS;
+const TABLE_BITS: u32 = 18;
 /// Classes `>= SMALL_MIN_CLASS` (512 B and up) are sampled.
 pub const SMALL_MIN_CLASS: usize = 5;
 /// One in this many small-class allocations is tracked.
 pub const SMALL_SAMPLE: u64 = 8;
 
 static ARMED: AtomicBool = AtomicBool::new(false);
+/// Also attribute buddy frames (`echo 2`): every block of order >= 1 and the
+/// order-0 frames whose frame number is a multiple of [`FRAME_SAMPLE`].
+static FRAMES_ARMED: AtomicBool = AtomicBool::new(false);
+/// One in this many order-0 frames is tracked (chosen by frame number, so
+/// the same frames are sampled on allocation and on free).
+pub const FRAME_SAMPLE: u64 = 8;
+/// `kind` tag of a buddy-frame record; the low bits are the order.
+pub const KIND_FRAME: u32 = 0x4000_0000;
+/// `kind` tag of a large heap block; the low bits are its page count.
+pub const KIND_LARGE: u32 = 0x8000_0000;
 static SAMPLE: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
@@ -91,9 +102,49 @@ static STATE: IrqSafeSpinLock<State> = IrqSafeSpinLock::new(State {
     }; TABLE],
 });
 
+/// Arm (`heap`, and `frames` for buddy frames) or disarm. Disarming clears
+/// every record.
+pub fn set_armed_frames(heap: bool, frames: bool) {
+    FRAMES_ARMED.store(heap && frames, Ordering::Release);
+    set_armed(heap);
+}
+
+/// Whether buddy frames are being attributed.
+pub fn frames_armed() -> bool {
+    FRAMES_ARMED.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn frame_sampled(frame: u64, order: u8) -> bool {
+    order != 0 || frame % FRAME_SAMPLE == 0
+}
+
+/// Buddy hand-out of `2^order` frames at frame number `frame`.
+#[inline]
+pub fn frame_alloc(frame: u64, order: u8) {
+    if FRAMES_ARMED.load(Ordering::Relaxed) && frame_sampled(frame, order) {
+        // Frame numbers are far below any kernel virtual address, so they
+        // share the table with heap pointers without colliding.
+        record(
+            frame as usize,
+            4096usize << order,
+            KIND_FRAME | u32::from(order),
+        );
+    }
+}
+
+/// Buddy return of the block [`frame_alloc`] recorded.
+#[inline]
+pub fn frame_free(frame: u64, order: u8) {
+    if FRAMES_ARMED.load(Ordering::Relaxed) && frame_sampled(frame, order) {
+        forget(frame as usize);
+    }
+}
+
 /// Arm or disarm. Disarming clears every record.
 pub fn set_armed(on: bool) {
     if !on {
+        FRAMES_ARMED.store(false, Ordering::Release);
         ARMED.store(false, Ordering::Release);
         let mut g = STATE.lock();
         g.nsites = 0;
@@ -120,7 +171,7 @@ pub fn sample_small(class: usize) -> bool {
 }
 
 fn slot_of(ptr: u64) -> usize {
-    ((ptr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 17)) as usize & (TABLE - 1)
+    ((ptr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - TABLE_BITS)) as usize & (TABLE - 1)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -272,14 +323,18 @@ pub struct SiteRow {
 }
 
 /// Copy the sites with the most live bytes into `out` (largest first);
-/// returns how many were written and the count of untracked allocations
+/// `frames` selects buddy-frame sites instead of heap sites. Returns how
+/// many were written and the count of untracked allocations
 /// (table full). Small-class figures are samples: multiply by
 /// [`SMALL_SAMPLE`].
-pub fn snapshot(out: &mut [SiteRow]) -> (usize, u64) {
+pub fn snapshot(out: &mut [SiteRow], frames: bool) -> (usize, u64) {
     let mut n = 0usize;
     {
         let g = STATE.lock();
-        for s in g.sites[..g.nsites].iter().filter(|s| s.live != 0) {
+        for s in g.sites[..g.nsites]
+            .iter()
+            .filter(|s| s.live != 0 && (s.kind & KIND_FRAME != 0) == frames)
+        {
             let row = SiteRow {
                 words: s.words,
                 kind: s.kind,
@@ -314,7 +369,7 @@ mod tests {
         let Ok(layout) = Layout::from_size_align(PAGES * 4096, 16) else {
             return TestResult::Fail("layout");
         };
-        let kind = 0x8000_0000 | PAGES as u32;
+        let kind = KIND_LARGE | PAGES as u32;
         let count = |rows: &[SiteRow]| -> u64 {
             rows.iter().filter(|r| r.kind == kind).map(|r| r.live).sum()
         };
@@ -325,7 +380,7 @@ mod tests {
             *slot = crate::slab::alloc(layout).ok();
         }
         let mut rows = [SiteRow::default(); 64];
-        let (n, _) = snapshot(&mut rows);
+        let (n, _) = snapshot(&mut rows, false);
         let live = count(&rows[..n]);
         let keyed = rows[..n]
             .iter()
@@ -335,7 +390,7 @@ mod tests {
             // SAFETY: allocated above with `layout`, freed exactly once.
             unsafe { crate::slab::dealloc(*p, layout) };
         }
-        let (n2, _) = snapshot(&mut rows);
+        let (n2, _) = snapshot(&mut rows, false);
         let after = count(&rows[..n2]);
         set_armed(was);
         if ptrs.iter().any(Option::is_none) {

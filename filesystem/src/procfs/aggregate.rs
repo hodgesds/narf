@@ -493,9 +493,11 @@ fn slab_class_snapshot() -> Vec<narf_memory::slab::ClassDetail> {
 // (`live` rising) from retention (`live` back at baseline, `frames` not).
 
 /// `/proc/narf/slab_sites`: live heap bytes per allocation site. Writing `1`
-/// arms the audit, `0` disarms and clears it (root only, 0644). Each row is
-/// `<bytes> <live> <kind> <off>...`: `kind` is a size class in bytes, or
-/// `L<pages>` for a buddy-backed large block; the offsets are stack words
+/// arms the heap audit, `2` heap and buddy frames, `0` disarms and clears it
+/// (root only, 0644). Heap rows come first, then frame rows. Each row is
+/// `<bytes> <live> <kind> <off>...`: `kind` is a size class in bytes,
+/// `L<pages>` for a buddy-backed large heap block, or `F<order>` for a buddy
+/// block (order-0 rows are 1-in-`sample_frame0` samples); the offsets are stack words
 /// relative to `__text_start` (add the ELF's `.text` address for
 /// `addr2line`). Small-class rows are 1-in-`sample_small` samples.
 #[derive(Debug)]
@@ -506,17 +508,24 @@ impl ProcFile for SlabSitesFile {
         use narf_memory::slab::site_audit;
         // Snapshot under the audit lock into a heap buffer allocated first:
         // the snapshot itself must not allocate.
-        let mut rows = alloc::vec![site_audit::SiteRow::default(); 64];
-        let (n, dropped) = site_audit::snapshot(&mut rows);
+        let mut heap = alloc::vec![site_audit::SiteRow::default(); 40];
+        let mut frames = alloc::vec![site_audit::SiteRow::default(); 40];
+        let (nh, dropped) = site_audit::snapshot(&mut heap, false);
+        let (nf, _) = site_audit::snapshot(&mut frames, true);
         let mut s = String::new();
-        let _ = writeln!(s, "armed {}", u8::from(site_audit::armed()));
+        let armed = u8::from(site_audit::armed()) + u8::from(site_audit::frames_armed());
+        let _ = writeln!(s, "armed {}", armed);
         let _ = writeln!(s, "sample_small {}", site_audit::SMALL_SAMPLE);
+        let _ = writeln!(s, "sample_frame0 {}", site_audit::FRAME_SAMPLE);
         let _ = writeln!(s, "untracked {}", dropped);
-        for r in &rows[..n] {
-            if r.kind & 0x8000_0000 != 0 {
-                let _ = write!(s, "{} {} L{}", r.bytes, r.live, r.kind & 0x7fff_ffff);
+        for r in heap[..nh].iter().chain(frames[..nf].iter()) {
+            let tag = r.kind & !(site_audit::KIND_LARGE | site_audit::KIND_FRAME);
+            if r.kind & site_audit::KIND_LARGE != 0 {
+                let _ = write!(s, "{} {} L{}", r.bytes, r.live, tag);
+            } else if r.kind & site_audit::KIND_FRAME != 0 {
+                let _ = write!(s, "{} {} F{}", r.bytes, r.live, tag);
             } else {
-                let _ = write!(s, "{} {} {}", r.bytes, r.live, r.kind);
+                let _ = write!(s, "{} {} {}", r.bytes, r.live, tag);
             }
             for w in r.words.iter().filter(|&&w| w != 0) {
                 let _ = write!(s, " {:#x}", w);
@@ -532,7 +541,8 @@ impl ProcFile for SlabSitesFile {
 
     fn write(&self, buf: &[u8]) -> Result<usize, FsError> {
         match buf.iter().find(|b| !b.is_ascii_whitespace()) {
-            Some(b'1') => narf_memory::slab::site_audit::set_armed(true),
+            Some(b'2') => narf_memory::slab::site_audit::set_armed_frames(true, true),
+            Some(b'1') => narf_memory::slab::site_audit::set_armed_frames(true, false),
             Some(b'0') => narf_memory::slab::site_audit::set_armed(false),
             _ => return Err(FsError::InvalidData),
         }
