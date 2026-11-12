@@ -123,6 +123,11 @@ fn mapped_bytes(ptr: *const u8, len: usize) -> alloc::vec::Vec<u8> {
 }
 
 fn store(ptr: *mut u8, bytes: &[u8]) {
+    // A real store faults on the clean page's read-only PTE first and the
+    // write-notify hook records it; through the direct map the test takes
+    // that step itself.
+    let page = narf_memory::PhysAddr::from_kernel_ptr(ptr).raw() & !0xFFF;
+    crate::mapped_file::shared_page_write_fault(page);
     // SAFETY: as `mapped_bytes`; the frame stays mapped for the test.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) }
 }

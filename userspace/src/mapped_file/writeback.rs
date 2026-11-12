@@ -170,12 +170,8 @@ fn dirty_expire_ms() -> u64 {
     }
 }
 
-/// Pages evicted from the idle-clean list, and page-content comparisons
-/// made — by writeback and by the read overlay, the only code that makes
-/// any. Kernel tests read both to show that a fault, an unmap and a
-/// publication do work that does not grow with the cache.
+/// Pages evicted from the idle-clean list. Kernel tests read it.
 pub(super) static EVICTIONS: AtomicU64 = AtomicU64::new(0);
-pub(super) static PAGE_COMPARES: AtomicU64 = AtomicU64::new(0);
 
 /// Unmapped pages that may hold bytes their file does not have yet. This
 /// is the memory writeback owes back, and what [`throttle_dirtier`] bounds.
@@ -514,10 +510,11 @@ enum Action {
     Clean,
     /// Dirty, mapped, and not due yet: remember when it will be.
     Defer(narf_time::Deadline),
-    /// Copied into a run, at `at..at + len` of the run's buffer.
-    Queued { run: usize, at: usize, len: usize },
-    /// The run reached the file: this is the page's new clean image.
-    Written(Arc<Vec<u8>>),
+    /// To be written, `len` bytes of it, as part of run `run`.
+    Queued { run: usize, len: usize },
+    /// The run reached the file (or failed hard, which also ends the
+    /// page's dirtiness, as btrfs leaves a folio after `-EIO`).
+    Written,
     /// Everything the page still owes lies past EOF — the whole page, or
     /// the part of it that differs from its clean image. Those bytes are
     /// not file data and are never written; an unmapped page in this state
@@ -547,7 +544,9 @@ fn transient(error: FsError) -> bool {
 struct Pinned {
     offset: u64,
     phys: PhysAddr,
-    clean: Arc<Vec<u8>>,
+    /// Recorded dirty when pinned. A listed page that is not owes the file
+    /// nothing new: it was written, and is only waiting to be settled.
+    dirty: bool,
     /// No mapping and no pending publication when it was pinned.
     idle: bool,
     due: Option<narf_time::Deadline>,
@@ -571,7 +570,7 @@ fn pin(page: &mut SharedFilePage, batch: &mut Vec<Pinned>) {
     batch.push(Pinned {
         offset: page.offset,
         phys: page.phys,
-        clean: Arc::clone(&page.clean),
+        dirty: page.dirty,
         idle: page.mappings == 0 && page.pending == 0,
         due: page.write_due,
         action: Action::Clean,
@@ -629,12 +628,11 @@ fn pin_batch(
                     continue;
                 };
                 let held = page.mappings != 0 || page.pending != 0;
-                // Recorded state picks the pages; nothing is compared here.
-                // A mapped page no writable mapping has held cannot differ
-                // from the file, and an unmapped page that is not listed
-                // is clean.
+                // Recorded state picks the pages: only a page recorded
+                // dirty (by its write-notify fault, or a raced `write(2)`)
+                // holds anything the file does not.
                 let wanted = if held {
-                    page.maybe_dirty
+                    page.dirty
                 } else {
                     select == Select::All && page.idle_dirty
                 };
@@ -647,14 +645,30 @@ fn pin_batch(
     (batch, next, examined)
 }
 
-/// Step 3 of a batch: decide each pinned page's fate against the file size
-/// `size`, and copy the dirty ones into runs. Runs with no lock held.
+/// Step 3 of a batch, with no lock held: decide each pinned page's fate
+/// against the file size `size`, write-protect the ones to write in every
+/// mapping, and copy them into runs.
 ///
-/// `out_of_memory` is set when a dirty page could not be copied: it stays
-/// dirty, and the caller must not report the range written.
-fn examine(batch: &mut [Pinned], size: u64, select: Select, out_of_memory: &mut bool) -> Vec<Run> {
+/// The order is what makes the copy safe without comparing anything. Each
+/// page to write is marked clean first, so a PTE installed from here on is
+/// read-only; then every existing mapping of it is re-installed read-only,
+/// with every CPU's TLB entry invalidated (Linux `folio_mkclean`); only then
+/// is it copied. A store before the write-protect is in the copy; a store
+/// after it faults, marks the page dirty again (and `redirtied`, since the
+/// batch holds it), and is written by a later pass.
+///
+/// `out_of_memory` is set when a page to write could not be copied: it is
+/// dirty again, and the caller must not report the range written.
+fn examine(
+    identity: SharedFileIdentity,
+    batch: &mut [Pinned],
+    size: u64,
+    select: Select,
+    out_of_memory: &mut bool,
+) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
-    if runs.try_reserve(batch.len()).is_err() {
+    let mut to_write: Vec<(u64, PhysAddr)> = Vec::new();
+    if runs.try_reserve(batch.len()).is_err() || to_write.try_reserve(batch.len()).is_err() {
         *out_of_memory = true;
         for page in batch.iter_mut() {
             page.action = Action::Failed;
@@ -666,38 +680,13 @@ fn examine(batch: &mut [Pinned], size: u64, select: Select, out_of_memory: &mut 
             page.action = Action::PastEof;
             continue;
         }
-        let len = (size - page.offset).min(4096) as usize;
-        // SAFETY: the page is pinned, so its frame stays allocated until
-        // `finish_batch` unpins it, and every frame is identity-mapped. A
-        // mapping may be storing into the page while it is read: writeback
-        // then captures either side of that store, and whichever it missed
-        // leaves the page different from the image written, hence dirty.
-        if len < 4096 {
-            // The file's last page. What a mapping stored past EOF is not
-            // file data: Linux zeroes the folio's tail on every writeback of
-            // it (`folio_zero_segment` in `block_write_full_folio`), so the
-            // bytes can never reach the file, even if it later grows over
-            // them. Here the tail goes back to its clean image, which past
-            // EOF is what the file reads there — zeros.
-            // SAFETY: the page is pinned and identity-mapped (see the read
-            // below); `len < 4096`.
-            let tail = unsafe {
-                core::slice::from_raw_parts_mut(
-                    page.phys.kernel_mut_ptr::<u8>().add(len),
-                    4096 - len,
-                )
-            };
-            for (byte, clean) in tail.iter_mut().zip(&page.clean[len..]) {
-                if *byte != *clean {
-                    *byte = *clean;
-                }
-            }
-        }
-        // SAFETY: as described above the tail clearing: pinned until
-        // `finish_batch`, identity-mapped, one whole page.
-        let live = unsafe { core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>(), 4096) };
-        PAGE_COMPARES.fetch_add(1, Ordering::Relaxed);
-        if live[..len] == page.clean[..len] {
+        if !page.dirty {
+            // Written already, and only kept listed until no older
+            // out-of-lock write can still report on it: settle it without
+            // writing it again (which would move its batch number past every
+            // newer writer, so a writer that never pauses would keep it
+            // unsettled for ever).
+            page.action = Action::Clean;
             continue;
         }
         if select == Select::Aged {
@@ -713,6 +702,41 @@ fn examine(batch: &mut [Pinned], size: u64, select: Select, out_of_memory: &mut 
                 }
             }
         }
+        let len = (size - page.offset).min(4096) as usize;
+        page.action = Action::Queued { run: 0, len };
+        to_write.push((page.offset, page.phys));
+    }
+    if to_write.is_empty() {
+        return runs;
+    }
+    {
+        let mut pages = SHARED_FILE_PAGES.lock();
+        for (_, phys) in &to_write {
+            if let Some(page) = pages.by_phys.get_mut(&phys.raw()) {
+                page.dirty = false;
+            }
+        }
+    }
+    super::write_protect_pages(identity.anchor, &to_write);
+    for page in batch.iter_mut() {
+        let Action::Queued { len, .. } = page.action else {
+            continue;
+        };
+        if len < 4096 {
+            // The file's last page. What a mapping stored past EOF is not
+            // file data: Linux zeroes the folio's tail on every writeback
+            // (`folio_zero_segment` in `block_write_full_folio`), so the
+            // bytes can never reach the file, even if it later grows over
+            // them.
+            // SAFETY: the page is pinned, so its frame stays allocated until
+            // `finish_batch` unpins it; frames are identity-mapped and
+            // `len < 4096`.
+            unsafe {
+                core::ptr::write_bytes(page.phys.kernel_mut_ptr::<u8>().add(len), 0, 4096 - len);
+            }
+        }
+        // SAFETY: as above; one whole page.
+        let live = unsafe { core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>(), len) };
         // A short page is the file's last: nothing can follow it in a run.
         let joins = runs.last().is_some_and(|run| {
             run.buf.len() % 4096 == 0 && run.offset + run.buf.len() as u64 == page.offset
@@ -733,13 +757,8 @@ fn examine(batch: &mut [Pinned], size: u64, select: Select, out_of_memory: &mut 
             }
             continue;
         }
-        let at = run.buf.len();
-        run.buf.extend_from_slice(&live[..len]);
-        page.action = Action::Queued {
-            run: index,
-            at,
-            len,
-        };
+        run.buf.extend_from_slice(live);
+        page.action = Action::Queued { run: index, len };
     }
     runs
 }
@@ -755,30 +774,15 @@ async fn write_all(ops: &Arc<dyn FileOps>, offset: u64, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-/// Turn each queued page of a finished run into its outcome: the bytes that
-/// were written become the page's clean image (past the written length the
-/// old image stands — those bytes were not written).
-fn settle_runs(batch: &mut [Pinned], runs: &[Run], results: &[Result<(), FsError>]) {
+/// Turn each queued page of a finished run into its outcome.
+fn settle_runs(batch: &mut [Pinned], results: &[Result<(), FsError>]) {
     for page in batch.iter_mut() {
-        let Action::Queued { run, at, len } = page.action else {
+        let Action::Queued { run, .. } = page.action else {
             continue;
         };
         page.action = match results[run] {
             Err(error) if transient(error) => Action::Failed,
-            // Written, or failed hard: either way what was attempted is the
-            // page's clean image from now on.
-            Ok(()) | Err(_) => {
-                let mut image = Vec::new();
-                if image.try_reserve_exact(4096).is_err() {
-                    // With no memory to record it the page simply stays
-                    // dirty and is written again.
-                    Action::Failed
-                } else {
-                    image.extend_from_slice(&runs[run].buf[at..at + len]);
-                    image.extend_from_slice(&page.clean[len..]);
-                    Action::Written(Arc::new(image))
-                }
-            }
+            Ok(()) | Err(_) => Action::Written,
         };
     }
 }
@@ -786,14 +790,9 @@ fn settle_runs(batch: &mut [Pinned], runs: &[Run], results: &[Result<(), FsError
 /// Step 5 of a batch: record what was written and release the pins.
 /// Returns the number of pages written.
 ///
-/// `free` and `garbage` were reserved before the batch pinned anything
+/// `free` was reserved before the batch pinned anything
 /// ([`Reserved`]), so nothing here allocates.
-fn finish_batch(
-    batch: Vec<Pinned>,
-    generation: Option<u64>,
-    mut free: Vec<PhysAddr>,
-    mut garbage: Vec<Arc<Vec<u8>>>,
-) -> usize {
+fn finish_batch(batch: Vec<Pinned>, generation: Option<u64>, mut free: Vec<PhysAddr>) -> usize {
     let mut wrote = 0usize;
     {
         let mut pages = SHARED_FILE_PAGES.lock();
@@ -807,13 +806,8 @@ fn finish_batch(
         };
         for pinned in batch {
             let Pinned {
-                phys,
-                clean,
-                idle,
-                action,
-                ..
+                phys, idle, action, ..
             } = pinned;
-            garbage.push(clean);
             let (cached, release) = pages.unpin(phys.raw());
             if let Some(frame) = release {
                 free.push(frame);
@@ -821,9 +815,6 @@ fn finish_batch(
             if !cached {
                 // Invalidated while it was being written: a truncate or a
                 // hole punch owns the outcome now.
-                if let Action::Written(image) = action {
-                    garbage.push(image);
-                }
                 continue;
             }
             let page = pages
@@ -843,8 +834,7 @@ fn finish_batch(
                 page.past_eof_passes = 0;
             }
             match action {
-                Action::Written(image) => {
-                    garbage.push(core::mem::replace(&mut page.clean, image));
+                Action::Written => {
                     page.wb_seq = seq;
                     page.cache_generation = generation;
                     page.write_due = None;
@@ -864,19 +854,22 @@ fn finish_batch(
                         && page.wb_pins == 0
                         && u32::from(page.past_eof_passes) >= MAX_FAILED_PASSES;
                 }
-                Action::Queued { .. } | Action::Failed => {}
+                // Not written: it still owes the file its bytes.
+                Action::Queued { .. } | Action::Failed => page.dirty = true,
             }
             // An out-of-lock write that began before this page's last batch
             // may still have to report that the batch overwrote it on the
             // file. Keep the page listed until it has.
-            settled &= settle_allowed(oldest_in_flight, page.wb_seq);
-            discard &= settle_allowed(oldest_in_flight, page.wb_seq);
+            // An out-of-lock write that began before this page's last batch
+            // may still report that the batch overwrote it on the file (and
+            // mark it dirty then): keep it listed, clean, until none can.
+            let allowed = settle_allowed(oldest_in_flight, page.wb_seq);
+            settled &= allowed;
+            discard &= allowed;
             let retire =
                 discard || (settled && page.wb_pins == 0 && page.cache_generation.is_none());
             if settled {
-                // Compared (or written) with no mapping to change it since:
-                // the one place a page becomes known clean again.
-                page.maybe_dirty = false;
+                // Written with no mapping to change it since.
                 pages.clear_idle_dirty(phys.raw());
             }
             if retire {
@@ -890,7 +883,6 @@ fn finish_batch(
             }
         }
     }
-    drop(garbage);
     for frame in free {
         narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
     }
@@ -920,9 +912,6 @@ struct Reserved {
     /// Frames to free: a doomed page's last hold, a retired page, a page
     /// evicted to make room — at most three per page.
     free: Vec<PhysAddr>,
-    /// Clean images dropped after the cache lock: the pinned one and the
-    /// replaced one — at most two per page.
-    garbage: Vec<Arc<Vec<u8>>>,
     results: Vec<Result<(), FsError>>,
 }
 
@@ -937,7 +926,6 @@ impl Reserved {
             .pages
             .try_reserve_exact(BATCH_PAGES)
             .and_then(|()| reserved.free.try_reserve_exact(3 * BATCH_PAGES))
-            .and_then(|()| reserved.garbage.try_reserve_exact(2 * BATCH_PAGES))
             .and_then(|()| reserved.results.try_reserve_exact(BATCH_PAGES))
             .map_err(|_| FsError::OutOfMemory)?;
         Ok(reserved)
@@ -949,7 +937,7 @@ impl Batch {
     fn finish(mut self, generation: Option<u64>) -> usize {
         let pages = core::mem::take(&mut self.pages);
         let reserved = core::mem::take(&mut self.reserved);
-        finish_batch(pages, generation, reserved.free, reserved.garbage)
+        finish_batch(pages, generation, reserved.free)
     }
 }
 
@@ -960,7 +948,7 @@ impl Drop for Batch {
             // written, every queued page simply stays dirty.
             let pages = core::mem::take(&mut self.pages);
             let reserved = core::mem::take(&mut self.reserved);
-            finish_batch(pages, None, reserved.free, reserved.garbage);
+            finish_batch(pages, None, reserved.free);
         }
     }
 }
@@ -1066,7 +1054,13 @@ async fn write_range(
         // writes below, so a batch never writes past the size it saw.
         let size = ops.stat().size;
         let mut out_of_memory = false;
-        let runs = examine(&mut batch.pages, size, select, &mut out_of_memory);
+        let runs = examine(
+            file.identity,
+            &mut batch.pages,
+            size,
+            select,
+            &mut out_of_memory,
+        );
         let mut failure = out_of_memory.then_some(FsError::OutOfMemory);
         for run in &runs {
             let result = write_all(ops, run.offset, &run.buf).await;
@@ -1075,7 +1069,7 @@ async fn write_range(
             }
             results.push(result);
         }
-        settle_runs(&mut batch.pages, &runs, &results);
+        settle_runs(&mut batch.pages, &results);
         drop(runs);
         let generation = ops.mmap_cache_generation();
         wrote += batch.finish(generation);
@@ -1224,20 +1218,8 @@ pub(crate) async fn write_and_note(
 /// for any page the mapping already took, start the task that will write
 /// its pages back, and — `balance_dirty_pages` — hold the caller back if
 /// dirtiers are already ahead of that task.
-///
-/// `pages` are the cache pages the mapping was populated with at `mmap`
-/// time, if any (a lazy mapping takes its pages one fault at a time, and
-/// the fault marks them): stores can reach them without another fault.
-pub(crate) fn writable_mapping(ops: &Arc<dyn FileOps>, pages: &[PhysAddr]) {
+pub(crate) fn writable_mapping(ops: &Arc<dyn FileOps>) {
     register_shrinker();
-    if pages.iter().any(|phys| phys.raw() != 0) {
-        let mut cache = SHARED_FILE_PAGES.lock();
-        for phys in pages {
-            if let Some(page) = cache.by_phys.get_mut(&phys.raw()) {
-                page.maybe_dirty = true;
-            }
-        }
-    }
     note_writer(ops);
     ensure_flusher();
     throttle_dirtier();
@@ -1294,100 +1276,6 @@ pub(super) fn sync_file(ops: &Arc<dyn FileOps>, from: u64, end: u64) -> Result<(
     // If that was the file's last unwritten page, the cache is done with it.
     release_if_unused(identity);
     result
-}
-
-/// A fault or an `mmap` is about to look up `count` cached pages of `ops`'s
-/// file from `offset`. If one of them is unmapped, still waiting for
-/// writeback, and was last vouched for under an older generation of the
-/// file (or under none), run writeback over the range first.
-///
-/// Such a page is one of two things: holding a store that never reached
-/// the file — then it stays dirty and is adopted, its data winning over the
-/// file's as a dirty folio does on Linux — or simply not looked at yet, and
-/// stale now that the file has changed behind it — then it is marked clean
-/// here, and the generation rule for clean pages hands the new mapping a
-/// fresh read instead. Without this the publication would adopt the page
-/// either way, as it rightly does for a page whose generation is current.
-pub(crate) fn settle_unverified(ops: &Arc<dyn FileOps>, offset: u64, count: usize) {
-    if IDLE_DIRTY_PAGES.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let Some(identity) = entry_identity(ops.as_ref()) else {
-        return;
-    };
-    let generation = ops.mmap_cache_generation();
-    let first = offset & !4095;
-    let end = first.saturating_add(count as u64 * 4096);
-    // This runs on a page fault and in `mmap`: it compares, it never
-    // writes. A filesystem write from here would run the whole write path
-    // — on btrfs a copy-on-write extent update — on top of whatever the
-    // faulting task's stack already holds. Pin the stale pages, compare
-    // each with its clean image with no lock held, and settle the ones
-    // that turn out clean; a page that really holds a store stays dirty
-    // and is adopted, as before.
-    let mut pinned: Vec<(u64, Arc<Vec<u8>>)> = Vec::new();
-    {
-        let mut pages = SHARED_FILE_PAGES.lock();
-        let SharedFilePages {
-            by_phys,
-            by_file,
-            idle_dirty,
-            ..
-        } = &mut *pages;
-        for listed in idle_dirty.range(key(identity, first)..) {
-            if listed.file != identity || listed.offset >= end {
-                break;
-            }
-            let Some(page) = by_file.get(listed).and_then(|phys| by_phys.get_mut(phys)) else {
-                continue;
-            };
-            let stale = page.cache_generation.is_none() || page.cache_generation != generation;
-            if !stale || page.wb_pins != 0 || pinned.try_reserve(1).is_err() {
-                continue;
-            }
-            page.wb_pins += 1;
-            page.redirtied = false;
-            pinned.push((page.phys.raw(), Arc::clone(&page.clean)));
-        }
-    }
-    if pinned.is_empty() {
-        return;
-    }
-    let clean: Vec<bool> = pinned
-        .iter()
-        .map(|(phys, image)| {
-            PAGE_COMPARES.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: pinned until the release below; identity-mapped.
-            let live = unsafe {
-                core::slice::from_raw_parts(PhysAddr::new(*phys).kernel_ptr::<u8>(), 4096)
-            };
-            live == image.as_slice()
-        })
-        .collect();
-    let mut free: Vec<PhysAddr> = Vec::with_capacity(pinned.len());
-    {
-        let mut pages = SHARED_FILE_PAGES.lock();
-        let oldest_in_flight = IN_FLIGHT.lock().keys().next().copied();
-        for ((phys, _), clean) in pinned.iter().zip(&clean) {
-            let (cached, release) = pages.unpin(*phys);
-            free.extend(release);
-            if !cached || !clean {
-                continue;
-            }
-            let Some(page) = pages.by_phys.get_mut(phys) else {
-                continue;
-            };
-            let idle = page.mappings == 0 && page.pending == 0;
-            if idle && !page.redirtied && settle_allowed(oldest_in_flight, page.wb_seq) {
-                page.maybe_dirty = false;
-                pages.clear_idle_dirty(*phys);
-            }
-        }
-    }
-    drop(pinned);
-    for frame in free {
-        narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
-    }
 }
 
 /// The kernel is about to consume `ops`'s file through the filesystem's own
@@ -1473,14 +1361,12 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8],
                 continue;
             };
             let written_since = page.wb_seq > epoch.0;
-            // Recorded state first: a page no writable mapping has held,
-            // that is not waiting for writeback, and that no batch wrote
-            // during the read, equals what the read returned.
-            if !page.maybe_dirty && !page.idle_dirty && !written_since {
+            // A clean page that no batch wrote during the read equals what
+            // the read returned.
+            if !page.dirty && !page.idle_dirty && !written_since {
                 continue;
             }
             visited += 1;
-            PAGE_COMPARES.fetch_add(1, Ordering::Relaxed);
             let low = offset.max(cached.offset);
             let high = end.min(cached.offset + 4096);
             let in_page = (low - cached.offset) as usize;
@@ -1490,20 +1376,9 @@ pub(crate) fn overlay_dirty(ops: &Arc<dyn FileOps>, offset: u64, buf: &mut [u8],
             let live = unsafe {
                 core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>().add(in_page), count)
             };
-            let clean = &page.clean[in_page..in_page + count];
-            let out = &mut buf[(low - offset) as usize..(low - offset) as usize + count];
-            if written_since {
-                out.copy_from_slice(live);
-                continue;
-            }
-            if live == clean {
-                continue;
-            }
-            for ((out, live), clean) in out.iter_mut().zip(live).zip(clean) {
-                if live != clean {
-                    *out = *live;
-                }
-            }
+            // The page is the file's current content: every write(2) of it
+            // updates the page too, and every store is in it.
+            buf[(low - offset) as usize..(low - offset) as usize + count].copy_from_slice(live);
         }
         drop(pages);
         match resume {
@@ -1565,7 +1440,6 @@ fn zero_cached(page: &mut SharedFilePage, at: usize, len: usize) {
     unsafe {
         core::ptr::write_bytes(page.phys.kernel_mut_ptr::<u8>().add(at), 0, len);
     }
-    Arc::make_mut(&mut page.clean)[at..at + len].fill(0);
     // A batch that holds this page has an image from before the change.
     page.redirtied = true;
 }
@@ -1646,10 +1520,10 @@ pub(crate) fn discard_stores_past_eof(ops: &dyn FileOps, old_size: u64, new_end:
             end - in_page,
         )
     };
-    for (byte, clean) in live.iter_mut().zip(&page.clean[in_page..end]) {
-        if *byte != *clean {
-            *byte = *clean;
-        }
+    // Only a dirty page can hold a store there; a clean one reads zeros
+    // past EOF as the file does.
+    if page.dirty {
+        live.fill(0);
     }
     if page.wb_pins != 0 {
         page.redirtied = true;
@@ -2143,6 +2017,11 @@ static WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 async fn background_pass() {
     PASSES.fetch_add(1, Ordering::Relaxed);
     super::release_deferred_slots();
+    let wanted = RECLAIM_WANTED.swap(0, Ordering::AcqRel);
+    if wanted != 0 {
+        reclaim_mapped(wanted);
+        narf_scheduler::yield_now().await;
+    }
 
     // Pages nobody maps: all of them. They cannot change any more, and they
     // are memory the cache cannot release until they are on the file.
@@ -2343,32 +2222,39 @@ fn start_flusher() {
     narf_scheduler::spawn_with_spec(flusher_main(FlusherRunning), spec);
 }
 
-/// Pages of memory one cached page costs: its frame and its clean image.
-const PAGES_PER_CACHED_PAGE: usize = 2;
+/// Pages of memory one cached page costs: its frame. (A few dozen bytes of
+/// record besides — see the kernel test that measures them.)
+const PAGES_PER_CACHED_PAGE: usize = 1;
 
 /// The reclaimer's view of the cache: unmapped clean pages kept for reuse
 /// (frame plus clean image each). Dirty pages are not reclaimable — they
 /// are the only copy of their data — and the flusher is kicked instead.
 fn shrink_count() -> usize {
-    SHARED_FILE_PAGES
-        .try_lock()
-        .map_or(0, |pages| pages.idle_clean.len() * PAGES_PER_CACHED_PAGE)
+    // Every clean page is reclaimable, mapped or not; only dirty ones are
+    // the sole copy of their data.
+    SHARED_FILE_PAGES.try_lock().map_or(0, |pages| {
+        pages.by_phys.len().saturating_sub(pages.idle_dirty.len()) * PAGES_PER_CACHED_PAGE
+    })
 }
 
-/// Drop up to `nr_pages` pages' worth of unmapped clean pages, oldest
-/// listed first. Linux reclaims clean page cache the same way
-/// (`shrink_folio_list` on the inactive list). Never waits: a cache lock
-/// already held — reclaim run under it — frees nothing this time.
+/// Mapped clean pages reclaim has asked for and the flusher has yet to
+/// unmap and free.
+static RECLAIM_WANTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Free up to `nr_pages` pages of clean cache, oldest listed first (Linux
+/// `shrink_folio_list` on the inactive list). Unmapped clean pages go at
+/// once. Mapped ones need every mapper's VMA transaction to unmap — locks
+/// a shrinker, which may run under memory's own locks, must not take — so
+/// the rest of the request goes to the flusher, which unmaps and frees them
+/// from task context (kswapd's `try_to_unmap`). Never waits, never
+/// allocates: a cache lock already held frees nothing this time.
 fn shrink_scan(nr_pages: usize) -> usize {
-    if IDLE_DIRTY_PAGES.load(Ordering::Relaxed) != 0 {
-        kick();
-    }
     let want = nr_pages / PAGES_PER_CACHED_PAGE;
     if want == 0 {
         return 0;
     }
     let mut freed = 0usize;
-    // One frame at a time, outside the lock: no allocation on this path.
+    // One frame at a time, outside the lock.
     while freed < want {
         let frame = {
             let Some(mut pages) = SHARED_FILE_PAGES.try_lock() else {
@@ -2380,22 +2266,110 @@ fn shrink_scan(nr_pages: usize) -> usize {
             EVICTIONS.fetch_add(1, Ordering::Relaxed);
             pages.retire_phys(victim)
         };
-        // The clean image went with the page: freed whether or not the
-        // frame could be (a frame a batch still holds is freed by it).
         freed += 1;
         if let Some(frame) = frame {
             narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
         }
     }
+    if freed < want {
+        RECLAIM_WANTED.fetch_add(want - freed, Ordering::AcqRel);
+        kick();
+    } else if IDLE_DIRTY_PAGES.load(Ordering::Relaxed) != 0 {
+        kick();
+    }
     freed * PAGES_PER_CACHED_PAGE
 }
 
-/// Register the cache with the reclaimer, once.
+/// Cache pages a reclaim pass looks at per page it frees, at most.
+const RECLAIM_SCAN_FACTOR: usize = 4;
+
+/// Where the reclaim scan over mapped pages resumes.
+static RECLAIM_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+/// Unmap up to `target` clean mapped pages from every mapper and free them
+/// (Linux `shrink_folio_list` → `try_to_unmap` → `folio_free`). A page that
+/// a store dirties meanwhile keeps its data: the store faulted on a
+/// read-only PTE and recorded it, and an unmapped dirty page is kept for
+/// writeback. Returns the number freed.
+pub(super) fn reclaim_mapped(target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+    let budget = target.saturating_mul(RECLAIM_SCAN_FACTOR).min(4096);
+    let mut chosen: Vec<(SharedFileIdentity, u64, PhysAddr)> = Vec::new();
+    if chosen.try_reserve(target.min(budget)).is_err() {
+        return 0;
+    }
+    {
+        let pages = SHARED_FILE_PAGES.lock();
+        let from = RECLAIM_CURSOR.load(Ordering::Relaxed);
+        let mut last = from;
+        for (phys, page) in pages
+            .by_phys
+            .range(from..)
+            .chain(pages.by_phys.range(..from))
+            .take(budget)
+        {
+            last = *phys + 1;
+            if chosen.len() == target {
+                break;
+            }
+            if page.dirty || page.wb_pins != 0 || page.pending != 0 || page.mappings == 0 {
+                continue;
+            }
+            chosen.push((page.identity, page.offset, page.phys));
+        }
+        RECLAIM_CURSOR.store(last, Ordering::Relaxed);
+    }
+    chosen.sort_by_key(|(identity, offset, _)| (*identity, *offset));
+    let mut start = 0;
+    while start < chosen.len() {
+        let identity = chosen[start].0;
+        let end = chosen[start..]
+            .iter()
+            .position(|(other, _, _)| *other != identity)
+            .map_or(chosen.len(), |n| start + n);
+        let group: Vec<(u64, PhysAddr)> = chosen[start..end]
+            .iter()
+            .map(|(_, offset, phys)| (*offset, *phys))
+            .collect();
+        super::unmap_pages(identity.anchor, &group);
+        start = end;
+    }
+    let mut freed = 0usize;
+    for (_, _, phys) in &chosen {
+        let frame = {
+            let mut pages = SHARED_FILE_PAGES.lock();
+            let free = pages.by_phys.get(&phys.raw()).is_some_and(|page| {
+                !page.dirty && page.wb_pins == 0 && page.mappings == 0 && page.pending == 0
+            });
+            if free {
+                EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                pages.retire_phys(phys.raw())
+            } else {
+                None
+            }
+        };
+        if let Some(frame) = frame {
+            freed += 1;
+            narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
+        }
+    }
+    freed
+}
+
+/// Register the cache with the memory crate, once, before its first page
+/// exists: the reclaimer's shrinker, and the dirty-tracking hooks that make
+/// a clean page's PTEs read-only and record the store that faults on one.
 pub(crate) fn register_shrinker() {
     static REGISTERED: AtomicBool = AtomicBool::new(false);
     if REGISTERED.swap(true, Ordering::AcqRel) {
         return;
     }
+    narf_memory::install_shared_page_write_hooks(
+        super::shared_page_write_enabled,
+        super::shared_page_write_fault,
+    );
     narf_memory::reclaim::register_shrinker(narf_memory::reclaim::Shrinker {
         name: "shared-file-pages",
         count: shrink_count,
@@ -2405,14 +2379,12 @@ pub(crate) fn register_shrinker() {
 
 static DIRTY_LIMIT: AtomicUsize = AtomicUsize::new(0);
 
-/// Unmapped dirty pages allowed before a dirtier is made to wait. Each one
-/// costs two pages — its frame and its 4 KiB clean image on the kernel heap
-/// — so the bound is a sixteenth of memory in pages, an eighth in bytes
-/// (Linux `dirty_ratio` is a fifth of what it calls dirtyable).
+/// Unmapped dirty pages allowed before a dirtier is made to wait: an eighth
+/// of memory (Linux `dirty_ratio` is a fifth of what it calls dirtyable).
 fn dirty_limit() -> usize {
     match DIRTY_LIMIT.load(Ordering::Relaxed) {
         0 => {
-            let limit = (narf_memory::frame::stats().total / 16).max(256);
+            let limit = (narf_memory::frame::stats().total / 8).max(256);
             DIRTY_LIMIT.store(limit, Ordering::Relaxed);
             limit
         }
