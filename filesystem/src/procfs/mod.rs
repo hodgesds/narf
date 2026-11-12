@@ -635,6 +635,15 @@ pub struct ProcSchedSnapshot {
     /// The lock a parked task is queued on, as the source location of its
     /// `lock()` call (`file:line`), when it parked waiting for one.
     pub wait_site: Option<String>,
+    /// Where a parked task's wait was made from (`file:line` of the kernel
+    /// code that parked it), when it is not queued on a named lock.
+    pub park_site: Option<String>,
+    /// The syscall a task that is NOT parked is executing — on a CPU, or
+    /// runnable and waiting for one. `None` outside a syscall.
+    pub running_in: Option<String>,
+    /// Where a task running a syscall last gave up its CPU at a scheduling
+    /// point (`cond_resched`) and is runnable again, if it is there now.
+    pub yield_site: Option<String>,
 }
 
 type SchedSnapshotFn = fn(u64) -> ProcSchedSnapshot;

@@ -559,14 +559,27 @@ fn render_schedstat(pid: u64) -> String {
 /// Linux does; it prints what it knows of a parked task — the lock it is
 /// queued on (its `lock()` call site) and the syscall it is parked in — in
 /// Linux's line format, or the old placeholder when it knows neither.
+///
+/// A parked task: the lock it is queued on, or else the kernel site that
+/// parked it, then the syscall. A task inside a syscall that is not parked
+/// (on a CPU, or runnable and waiting for one): the scheduling point it
+/// yielded at, if any, then `<syscall> (running)`. Linux prints the frames
+/// of a running task's stack too; this is the part NARF can name.
 fn render_stack(pid: u64) -> String {
     let snapshot = super::hook_sched_snapshot(pid);
     let mut out = String::new();
-    if let Some(site) = snapshot.wait_site {
-        out.push_str(&format!("[<0>] lock at {site}\n"));
-    }
     if let Some(wchan) = snapshot.wchan {
+        if let Some(site) = snapshot.wait_site {
+            out.push_str(&format!("[<0>] lock at {site}\n"));
+        } else if let Some(site) = snapshot.park_site {
+            out.push_str(&format!("[<0>] wait at {site}\n"));
+        }
         out.push_str(&format!("[<0>] {wchan}\n"));
+    } else if let Some(name) = snapshot.running_in {
+        if let Some(site) = snapshot.yield_site {
+            out.push_str(&format!("[<0>] yield at {site}\n"));
+        }
+        out.push_str(&format!("[<0>] {name} (running)\n"));
     }
     if out.is_empty() {
         out.push_str("[<0000000000000000>] 0x0\n");
@@ -1556,6 +1569,7 @@ fn test_sched_snapshot(_pid: u64) -> super::ProcSchedSnapshot {
         wait_site: None,
         syscall: Some([0, 4, 0x1000, 0x200, 0, 0, 0, 0x7fff_f000, 0x0040_1000]),
         wchan: Some(alloc::string::String::from("read")),
+        ..Default::default()
     }
 }
 
@@ -1647,6 +1661,52 @@ fn smoke_stack_names_the_lock_a_task_waits_on() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs/pid_ext",
     smoke_stack_names_the_lock_a_task_waits_on
+);
+
+fn test_sched_snapshot_parked_off_lock(_pid: u64) -> super::ProcSchedSnapshot {
+    super::ProcSchedSnapshot {
+        wchan: Some(alloc::string::String::from("fsync")),
+        park_site: Some(alloc::string::String::from(
+            "userspace/src/killable_wait.rs:7",
+        )),
+        ..Default::default()
+    }
+}
+
+fn test_sched_snapshot_running_in_syscall(_pid: u64) -> super::ProcSchedSnapshot {
+    super::ProcSchedSnapshot {
+        running_in: Some(alloc::string::String::from("msync")),
+        yield_site: Some(alloc::string::String::from(
+            "userspace/src/mapped_file/writeback.rs:9",
+        )),
+        ..Default::default()
+    }
+}
+
+/// Every task inside a syscall gets a stack that says where it is: a task
+/// parked on something other than a lock names the site that parked it, and
+/// one that is not parked at all — busy, or runnable after a scheduling
+/// point — names its syscall and that scheduling point. Both used to read
+/// `0x0`, which said nothing about a task that might be the one holding up
+/// everything else.
+fn smoke_stack_names_every_park_and_a_running_syscall() -> TestResult {
+    let prev = super::__test_sched_snapshot_hook_swap(Some(test_sched_snapshot_parked_off_lock));
+    let parked = render_stack(1);
+    super::__test_sched_snapshot_hook_swap(Some(test_sched_snapshot_running_in_syscall));
+    let running = render_stack(1);
+    super::__test_sched_snapshot_hook_restore(prev);
+    if parked != "[<0>] wait at userspace/src/killable_wait.rs:7\n[<0>] fsync\n" {
+        return TestResult::Fail("/proc/<pid>/stack did not name the site that parked the task");
+    }
+    if running != "[<0>] yield at userspace/src/mapped_file/writeback.rs:9\n[<0>] msync (running)\n"
+    {
+        return TestResult::Fail("/proc/<pid>/stack did not name a running task's syscall");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_stack_names_every_park_and_a_running_syscall
 );
 
 /// Thread 7 is parked in `futex(0x1000, 128, 0)`; thread 8 sleeps outside a

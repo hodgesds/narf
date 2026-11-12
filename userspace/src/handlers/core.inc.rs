@@ -632,7 +632,7 @@ fn raw_waker() -> RawWaker {
 /// Returns `false` only outside a stackful user task (principally kernel-test
 /// contexts and architectures which have not enabled own-stack user tasks).
 #[inline]
-fn park_pending_future() -> bool {
+fn park_pending_future(caller: &'static core::panic::Location<'static>) -> bool {
     sleep_pumps::run();
     let Some(uctx) = crate::user_task::current_user_task() else {
         return false;
@@ -646,11 +646,15 @@ fn park_pending_future() -> bool {
     let uc = unsafe { &*uctx };
     let task = current_task_id();
     crate::handlers::close_kernel_span(uc, task);
-    // Which lock, if a lock is what this poll is waiting for.
-    let site = narf_lib::mutex::take_wait_site();
-    if let Some(site) = site {
-        PARKED_AT.lock().insert(task, site);
-    }
+    // What this task waits on, for `/proc/<pid>/stack`: the lock, if a lock
+    // is what this poll is waiting for, and otherwise the kernel code that
+    // parked it (the `poll_blocking` caller).
+    let site = match narf_lib::mutex::take_wait_site() {
+        Some(lock) => lock as *const _ as usize | PARK_SITE_LOCK,
+        None => caller as *const _ as usize,
+    };
+    uc.park_site
+        .store(site, core::sync::atomic::Ordering::Relaxed);
     uc.parked_in_syscall
         .store(true, core::sync::atomic::Ordering::Release);
     // SAFETY: a current stackful task and its executor context were verified
@@ -660,23 +664,59 @@ fn park_pending_future() -> bool {
     // A stackful resume continues here without re-entering UserTaskFuture::poll,
     // so restore the publication another task may have replaced while we slept.
     crate::user_task::install_current(uctx);
+    // Running again: parked on nothing, whatever the syscall does next.
+    uc.parked_in_syscall
+        .store(false, core::sync::atomic::Ordering::Release);
+    uc.park_site.store(0, core::sync::atomic::Ordering::Relaxed);
     crate::handlers::open_kernel_span(uc);
-    if site.is_some() {
-        PARKED_AT.lock().remove(&task);
-    }
     true
 }
 
-/// The lock each parked task is queued on (its `lock()` call site), for
-/// `/proc/<pid>/stack`.
-static PARKED_AT: narf_lib::sync::IrqSafeSpinLock<
-    BTreeMap<u64, &'static core::panic::Location<'static>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new());
+/// `UserTaskCtx::park_site` bit 0: the site is a lock's `lock()` call.
+/// `Location` is word-aligned, so the bit is free.
+const PARK_SITE_LOCK: usize = 1;
+
+fn location_text(addr: usize) -> Option<alloc::string::String> {
+    if addr == 0 {
+        return None;
+    }
+    // SAFETY: only `&'static Location` addresses are stored in these fields
+    // (bit 0 masked off here).
+    let site = unsafe { &*((addr & !PARK_SITE_LOCK) as *const core::panic::Location<'static>) };
+    Some(alloc::format!("{}:{}", site.file(), site.line()))
+}
+
+fn park_site_of(task: u64) -> usize {
+    crate::task::task_get(task).map_or(0, |t| {
+        t.uctx.park_site.load(core::sync::atomic::Ordering::Relaxed)
+    })
+}
 
 /// Where task `task` is parked, if it parked waiting for a lock.
 pub(crate) fn parked_wait_site(task: u64) -> Option<alloc::string::String> {
-    let site = PARKED_AT.lock().get(&task).copied()?;
-    Some(alloc::format!("{}:{}", site.file(), site.line()))
+    let site = park_site_of(task);
+    if site & PARK_SITE_LOCK == 0 {
+        return None;
+    }
+    location_text(site)
+}
+
+/// The kernel site that parked task `task`, if it parked on something other
+/// than a lock.
+pub(crate) fn parked_park_site(task: u64) -> Option<alloc::string::String> {
+    let site = park_site_of(task);
+    if site & PARK_SITE_LOCK != 0 {
+        return None;
+    }
+    location_text(site)
+}
+
+/// The scheduling point task `task` yielded at inside a syscall and is
+/// runnable from, if it is there now.
+pub(crate) fn yielded_site(task: u64) -> Option<alloc::string::String> {
+    location_text(crate::task::task_get(task).map_or(0, |t| {
+        t.uctx.yield_site.load(core::sync::atomic::Ordering::Relaxed)
+    }))
 }
 
 /// Linux `cond_resched()`: a scheduling point for kernel code with a long
@@ -704,6 +744,9 @@ pub(crate) fn parked_wait_site(task: u64) -> Option<alloc::string::String> {
 /// The caller is at a point where it could equally have parked, which is
 /// the executor's own condition for reporting: no RCU reference is held
 /// across it.
+///
+/// While the task is off its CPU here, `/proc/<pid>/stack` names the caller.
+#[track_caller]
 pub(crate) fn cond_resched() -> bool {
     {
         // The report is per CPU: stay on this one while it is made.
@@ -713,11 +756,17 @@ pub(crate) fn cond_resched() -> bool {
     if narf_scheduler::stackful::current_stackful_waker().is_none() {
         return false;
     }
+    let caller = core::panic::Location::caller();
     let uctx = crate::user_task::current_user_task();
     if let Some(uctx) = uctx {
         // SAFETY: as in `park_pending_future`: the in-flight task's
         // poller-pinned context.
-        crate::handlers::close_kernel_span(unsafe { &*uctx }, current_task_id());
+        let uc = unsafe { &*uctx };
+        crate::handlers::close_kernel_span(uc, current_task_id());
+        uc.yield_site.store(
+            caller as *const _ as usize,
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
     let yielded = narf_scheduler::stackful::sched_yield_current();
     if let Some(uctx) = uctx {
@@ -725,7 +774,9 @@ pub(crate) fn cond_resched() -> bool {
         // `UserTaskFuture::poll`: restore the publication a peer replaced.
         crate::user_task::install_current(uctx);
         // SAFETY: as above.
-        crate::handlers::open_kernel_span(unsafe { &*uctx });
+        let uc = unsafe { &*uctx };
+        uc.yield_site.store(0, core::sync::atomic::Ordering::Relaxed);
+        crate::handlers::open_kernel_span(uc);
     }
     yielded
 }
@@ -794,7 +845,7 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
             Poll::Pending if task_waker.is_some() => {
-                if !park_pending_future() {
+                if !park_pending_future(core::panic::Location::caller()) {
                     return None;
                 }
             }
@@ -834,7 +885,7 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
             Poll::Pending if task_waker.is_some() => {
-                if !park_pending_future() {
+                if !park_pending_future(core::panic::Location::caller()) {
                     return None;
                 }
             }
@@ -14492,10 +14543,21 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
         unsafe {
             // Mark the park so the kernel-time bracket skips this
             // syscall's fold (see UserTaskCtx::parked_in_syscall).
+            (*uctx).park_site.store(
+                core::panic::Location::caller() as *const _ as usize,
+                core::sync::atomic::Ordering::Relaxed,
+            );
             (*uctx)
                 .parked_in_syscall
                 .store(true, core::sync::atomic::Ordering::Release);
             narf_scheduler::stackful::yield_current_stackful();
+            // Running again: parked on nothing until the next park.
+            (*uctx)
+                .parked_in_syscall
+                .store(false, core::sync::atomic::Ordering::Release);
+            (*uctx)
+                .park_site
+                .store(0, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }

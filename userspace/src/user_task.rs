@@ -330,6 +330,19 @@ pub struct UserTaskCtx {
     /// and skips the fold when set (matching the longjmp paths, which
     /// never reach the fold at all).
     pub parked_in_syscall: core::sync::atomic::AtomicBool,
+    /// The raw number of the syscall this task is executing, plus one; 0
+    /// outside a syscall. `/proc/<pid>/stack` names it for a task that is
+    /// inside a syscall but not parked (on a CPU, or runnable): such a task
+    /// has no stable frame to decode, and used to report nothing at all.
+    pub in_syscall: core::sync::atomic::AtomicU32,
+    /// What this task is parked on, for `/proc/<pid>/stack`: the address of
+    /// a `&'static Location` (the lock's `lock()` call site with bit 0 set,
+    /// or the kernel site that parked it with bit 0 clear), 0 when parked on
+    /// nothing nameable or not parked. Lock-free so a park pays one store.
+    pub park_site: core::sync::atomic::AtomicUsize,
+    /// The scheduling point (`cond_resched` caller) this task yielded at
+    /// and is runnable from, as a `&'static Location` address; 0 otherwise.
+    pub yield_site: core::sync::atomic::AtomicUsize,
     /// Top of this task's own kernel stack (0 when it has none): where its
     /// trap/syscall register frame lives while it is parked, Linux's
     /// `task_pt_regs()`. Written once, the first time the task runs.
@@ -848,6 +861,9 @@ impl UserTaskCtx {
             wait_child_status_ptr: AtomicU64::new(0),
             wait_child_rusage_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
+            in_syscall: core::sync::atomic::AtomicU32::new(0),
+            park_site: core::sync::atomic::AtomicUsize::new(0),
+            yield_site: core::sync::atomic::AtomicUsize::new(0),
             kernel_stack_top: AtomicU64::new(0),
             flock_key: core::sync::atomic::AtomicUsize::new(0),
             sigwait_set: AtomicU64::new(0),
@@ -1792,8 +1808,16 @@ pub(crate) fn own_stack_park_until(completed: impl Fn() -> bool) {
         crate::task::note_park(narf_scheduler::current_task_id().raw());
         // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
         unsafe {
+            // `/proc/<pid>/stack`: a readiness/sleep park, named by this site.
+            (*uctx).park_site.store(
+                core::panic::Location::caller() as *const _ as usize,
+                Ordering::Relaxed,
+            );
             (*uctx).parked_in_syscall.store(true, Ordering::Release);
             narf_scheduler::stackful::yield_current_stackful();
+            // Running again: parked on nothing until the next park.
+            (*uctx).parked_in_syscall.store(false, Ordering::Release);
+            (*uctx).park_site.store(0, Ordering::Relaxed);
         }
         // ── Resumed via kernel_switch (NOT a re-poll) ── re-publish this task's
         // `CURRENT` cell: `install_current` runs only in `UserTaskFuture::poll`,
@@ -1983,6 +2007,27 @@ pub fn notify_task_exited(pid: u64, tid: u64) {
 pub fn __test_clear_exit_observers() {
     THREAD_EXIT_OBSERVERS.lock().clear();
     PROCESS_EXIT_OBSERVERS.lock().clear();
+}
+
+/// Test-only: the registered exit observers (thread, process), for a test
+/// that installs its own set and must give every other test the boot set
+/// back afterwards ([`__test_restore_exit_observers`]).
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_take_exit_observers(
+) -> (alloc::vec::Vec<ExitObserver>, alloc::vec::Vec<ExitObserver>) {
+    (
+        core::mem::take(&mut *THREAD_EXIT_OBSERVERS.lock()),
+        core::mem::take(&mut *PROCESS_EXIT_OBSERVERS.lock()),
+    )
+}
+
+/// Test-only: put back what [`__test_take_exit_observers`] took.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_restore_exit_observers(
+    saved: (alloc::vec::Vec<ExitObserver>, alloc::vec::Vec<ExitObserver>),
+) {
+    *THREAD_EXIT_OBSERVERS.lock() = saved.0;
+    *PROCESS_EXIT_OBSERVERS.lock() = saved.1;
 }
 
 /// Test-only reset.

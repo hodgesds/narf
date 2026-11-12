@@ -7738,6 +7738,19 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
     let syscall = proc_task_syscall_frame(task);
     let wchan = proc_wchan_of_frame(syscall);
     let wait_site = wchan.as_ref().and_then(|_| crate::handlers::parked_wait_site(task));
+    let park_site = wchan.as_ref().and_then(|_| crate::handlers::parked_park_site(task));
+    // Not parked, but inside a syscall: on a CPU, or runnable after a
+    // scheduling point.
+    let running_in = if wchan.is_none() {
+        crate::task::running_syscall(task)
+            .and_then(|nr| crate::syscall::syscall_name_of_number(u64::from(nr)))
+            .map(alloc::string::String::from)
+    } else {
+        None
+    };
+    let yield_site = running_in
+        .as_ref()
+        .and_then(|_| crate::handlers::yielded_site(task));
     narf_filesystem::procfs::ProcSchedSnapshot {
         run_ns: cpu_time_ns_of(task).saturating_add(kern_time_ns_of(task)),
         timeslices,
@@ -7748,6 +7761,9 @@ pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapsh
         syscall,
         wchan,
         wait_site,
+        park_site,
+        running_in,
+        yield_site,
     }
 }
 

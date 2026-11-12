@@ -999,6 +999,38 @@ fn smoke_task_refcount_lifetime() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_task_refcount_lifetime);
 
+/// A task that exits from a syscall it had parked in is no longer parked:
+/// a zombie reports no wchan, syscall or stack, even though nothing ran
+/// the dispatcher's clearing of the park flag on the way out. Before, a
+/// zombie leader kept naming the syscall it died in — decoded from a kernel
+/// stack it no longer owned — and read as stuck for as long as it waited
+/// for its siblings and its parent.
+fn smoke_zombie_is_parked_in_no_syscall() -> TestResult {
+    use core::sync::atomic::Ordering;
+    const TID: u64 = 0xF0_46;
+    crate::task::release_task(TID);
+    let task = crate::task::Task::new_registered(TID, TID);
+    task.uctx.parked_in_syscall.store(true, Ordering::Release);
+    let parked_while_live = crate::task::parked_in_syscall(TID);
+    crate::task::mark_zombie(TID);
+    let flag_after_exit = task.uctx.parked_in_syscall.load(Ordering::Acquire);
+    // Exit work that parks after the zombie flip sets the flag again.
+    task.uctx.parked_in_syscall.store(true, Ordering::Release);
+    let parked_as_zombie = crate::task::parked_in_syscall(TID);
+    crate::task::release_task(TID);
+    if !parked_while_live {
+        return TestResult::Fail("a live parked task was not reported parked");
+    }
+    if flag_after_exit {
+        return TestResult::Fail("exit left the task's park flag set");
+    }
+    if parked_as_zombie {
+        return TestResult::Fail("a zombie was reported parked in a syscall");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_zombie_is_parked_in_no_syscall);
+
 /// Exit must run the master per-task table sweep (release_task_tables):
 /// every tid-keyed row — signal state, parked wakers, /proc mirrors,
 /// foreground-console slot, robust-list head, interval timers — drops
