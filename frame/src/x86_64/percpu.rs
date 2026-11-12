@@ -212,6 +212,38 @@ pub unsafe fn set_kernel_stack_top(top: u64) {
     }
 }
 
+/// Move this CPU's hardirq stack onto a guarded `KernelStack` (Linux maps IRQ
+/// stacks with guard pages too: `map_irq_stack` under `CONFIG_VMAP_STACK`), so
+/// an overflowing IRQ body faults on the guard and is reported by #DF instead
+/// of writing into whatever sits below the boot-time static / per-AP block
+/// stack. That boot-time stack stays the fallback until this runs (the
+/// kernel-stack slot is reserved only after the per-CPU block is up).
+///
+/// Call from task/boot context on the CPU itself (never from its IRQ body):
+/// the single `gs:[24]` store is atomic with respect to this CPU's IRQs, and
+/// an IRQ already in flight is not on the stack being replaced.
+pub fn guard_irq_stack() {
+    const GUARDED_IRQ_STACK_BYTES: usize = 16 * 1024;
+    match narf_memory::kstack::KernelStack::alloc(GUARDED_IRQ_STACK_BYTES) {
+        Ok(stack) => {
+            let top = stack.top() - 8; // Linux top-8 convention, as `init_*`
+            core::mem::forget(stack); // per-CPU, lives as long as the CPU
+                                      // SAFETY: CPL0 with kernel GS (boot / AP bring-up); gs:[24] is
+                                      // `irq_stack_top`, read only by this CPU's IRQ shim.
+            unsafe {
+                core::arch::asm!("mov gs:[24], {t}", t = in(reg) top, options(nostack, preserves_flags));
+            }
+        }
+        Err(e) => {
+            use core::fmt::Write;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  kstack: hardirq stack stays unguarded on this CPU: {e:?}"
+            );
+        }
+    }
+}
+
 /// This CPU's current SYSCALL kernel-stack top (`gs:[8]`). Diagnostic / for
 /// restoring the per-CPU baseline on switch-out.
 #[inline]
