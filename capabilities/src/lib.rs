@@ -766,6 +766,8 @@ pub enum CapKind {
     /// is the same authority as the BPF JIT reaching it through
     /// `bpf_text::seal`.
     Jit = 0x0053,
+    /// `narf_io::sg::PageList`: a list of page frames one DMA payload spans.
+    DmaPageList = 0x0054,
 
     // Tracing / observability
     Probe = 0x0060,
@@ -927,6 +929,7 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("Endpoint", CapKind::Endpoint),
     ("Domain", CapKind::Domain),
     ("DmaBuffer", CapKind::DmaBuffer),
+    ("DmaPageList", CapKind::DmaPageList),
     ("SharedRegion", CapKind::SharedRegion),
     ("Jit", CapKind::Jit),
     ("Probe", CapKind::Probe),

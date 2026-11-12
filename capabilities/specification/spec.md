@@ -196,6 +196,7 @@ pub enum CapKind {
     Domain               = 0x0050,    // claim a DomainId; security-sensitive
     DmaBuffer            = 0x0051,
     SharedRegion         = 0x0052,
+    DmaPageList          = 0x0054,   // io/: a list of page frames one DMA payload spans
 
     // Tracing / observability
     Probe                = 0x0060,
