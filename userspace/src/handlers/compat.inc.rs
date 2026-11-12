@@ -3075,6 +3075,17 @@ fn do_execve_resolved(
         // refs now — after activate(), so teardown of a last-ref pre-exec AS
         // never races the CR3 it used to back.
         shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
+        // The polling future owns a reference too, and this path never
+        // returns to the poll that would swap it: install the new space
+        // there, so the pre-exec one is released now rather than when the
+        // task exits (it kept every exec'd daemon's fork-time address space
+        // alive for the daemon's whole life).
+        let future_as = crate::user_task::current_user_task().and_then(|uctx| {
+            // SAFETY: this task's own exec, on its own stack; its future is
+            // pinned in the task and is not being polled.
+            unsafe { (*uctx).replace_process_address_space(new_as.clone()) }
+        });
+        drop(future_as);
         drop(new_as);
         drop(prev_slot_as);
         // The resolved binary's `FileOps`. Added with demand-paged exec and
