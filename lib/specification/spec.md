@@ -269,6 +269,17 @@ Continuation alone does not create a poll edge. The callback can run once per
 direction under the readiness lock and must neither allocate nor drop wakers.
 This prevents available data/space from stranding other exclusive blockers.
 
+### 3.8 Deferred IRQ wakes
+
+`deferred_wake::{push_pending_iter, try_push_one}` publish wakers to a bounded
+CPU-local stash without allocation. `has_pending_local()` is one acquire load
+of a cache-line-isolated presence flag; it never scans slots or uses another
+CPU's wake count. Producers set that flag under the queue lock.
+`drain_and_wake()` takes the batch and clears presence under the same lock,
+then invokes wakers after unlocking, outside hard-IRQ context. A callback may
+enqueue another waker; its new presence publication survives for the next pass.
+The scheduler drains at executor and completed own-stack user-return boundaries.
+
 ## 4. Invariants & safety properties
 
 - All `no_std`-clean. No hidden `alloc` dependency without a

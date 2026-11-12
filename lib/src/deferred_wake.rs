@@ -16,7 +16,7 @@
 //! Per-CPU storage avoids cross-CPU contention. Bounded size means
 //! no allocation in IRQ context.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::Waker;
 
 use crate::sync::IrqSafeSpinLock;
@@ -49,6 +49,12 @@ static QUEUES: [IrqSafeSpinLock<Queue>; N_CPUS] = {
     [Q; N_CPUS]
 };
 
+/// Published under the corresponding queue lock. Padding keeps independent
+/// IRQ producers from sharing the cache line read at every user return.
+#[repr(align(64))]
+struct PendingFlag(AtomicBool);
+static PENDING: [PendingFlag; N_CPUS] = [const { PendingFlag(AtomicBool::new(false)) }; N_CPUS];
+
 /// Diagnostic: total wakers that overflowed (lost). Surfaced for
 /// debugging — non-zero suggests sleep deadlines are firing
 /// faster than the idle path drains them.
@@ -79,6 +85,7 @@ pub fn push_pending_iter<I: IntoIterator<Item = Waker>>(wakers: I) {
         for slot in q.slots.iter_mut() {
             if slot.is_none() {
                 *slot = Some(w);
+                PENDING[cpu].0.store(true, Ordering::Release);
                 QUEUED_WAKERS.fetch_add(1, Ordering::Relaxed);
                 placed = true;
                 break;
@@ -111,6 +118,7 @@ pub fn try_push_one(w: Waker) -> Result<(), Waker> {
     for slot in q.slots.iter_mut() {
         if slot.is_none() {
             *slot = Some(w);
+            PENDING[cpu].0.store(true, Ordering::Release);
             QUEUED_WAKERS.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -138,12 +146,12 @@ pub fn has_pending() -> bool {
 /// [`has_pending`]. Using the global counter there is a correctness+liveness
 /// bug: an empty-queue CPU sees "pending" because a DIFFERENT CPU has an
 /// undrained waker it cannot reach, so it never halts and spins in `run_forever`
-/// (observed as a core stuck at CPL=0 in the steal loop). Bounded scan of this
-/// CPU's fixed slot array under its own lock; no cross-CPU traffic.
+/// (observed as a core stuck at CPL=0 in the steal loop). One acquire load of
+/// the queue's published presence flag; no lock, scan, or cross-CPU counter.
 pub fn has_pending_local() -> bool {
     let cpu = crate::percpu::current_cpu();
     let cpu = if cpu < N_CPUS { cpu } else { 0 };
-    QUEUES[cpu].lock().slots.iter().any(Option::is_some)
+    PENDING[cpu].0.load(Ordering::Acquire)
 }
 
 /// Drain this CPU's pending queue and call wake() on each. Must
@@ -164,6 +172,9 @@ pub fn drain_and_wake() -> usize {
         for (i, slot) in q.slots.iter_mut().enumerate() {
             taken[i] = slot.take();
         }
+        // Clear before releasing the lock/calling wakers: a callback that
+        // queues another wake publishes its own durable true for the next pass.
+        PENDING[cpu].0.store(false, Ordering::Release);
     }
     let mut n = 0usize;
     for w in taken.into_iter().flatten() {

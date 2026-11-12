@@ -790,3 +790,44 @@ fn smoke_errno_linux_abi_values() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("lib", smoke_errno_linux_abi_values);
+
+fn smoke_deferred_wake_presence_survives_reentrant_enqueue() -> TestResult {
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::Waker;
+    struct Again(AtomicUsize);
+    impl Wake for Again {
+        fn wake(self: Arc<Self>) {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                let _ = crate::deferred_wake::try_push_one(Waker::from(self));
+            }
+        }
+    }
+    let state = Arc::new(Again(AtomicUsize::new(0)));
+    let waker = Waker::from(state.clone());
+    let valid = crate::sync::without_interrupts(|| {
+        crate::deferred_wake::drain_and_wake();
+        let empty = !crate::deferred_wake::has_pending_local();
+        crate::deferred_wake::push_pending_iter([waker]);
+        let published = crate::deferred_wake::has_pending_local();
+        let first = crate::deferred_wake::drain_and_wake();
+        let requeued = crate::deferred_wake::has_pending_local();
+        let second = crate::deferred_wake::drain_and_wake();
+        empty
+            && published
+            && first == 1
+            && requeued
+            && second == 1
+            && !crate::deferred_wake::has_pending_local()
+    });
+    if valid && state.0.load(Ordering::Relaxed) == 2 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("deferred-wake presence lost a callback's reentrant enqueue")
+    }
+}
+kernel_test_in!(
+    "lib/deferred_wake",
+    smoke_deferred_wake_presence_survives_reentrant_enqueue
+);
