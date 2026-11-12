@@ -586,6 +586,42 @@ fn gen_narf_pgtables() -> Vec<u8> {
         "unexplained {}",
         marked.saturating_sub(sched_tables + kernel_tables)
     );
+    // User roots no scheduled task owns, grouped by where their address
+    // space was built, with the page tables they hold.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut owned: Vec<u64> = spaces.iter().map(|a| a.root.raw()).collect();
+        owned.sort_unstable();
+        let mut groups: alloc::collections::BTreeMap<(&'static str, u32), (usize, usize)> =
+            alloc::collections::BTreeMap::new();
+        let mut orphans = Vec::new();
+        narf_memory::as_origin::for_each(|root, origin| {
+            if owned.binary_search(&root).is_err() {
+                orphans.push((root, origin.map_or(("?", 0), |o| (o.file(), o.line()))));
+            }
+        });
+        for (root, key) in orphans {
+            let tables = narf_memory::x86_64::paging::count_marked_tables(
+                narf_memory::PhysAddr::new(root),
+                0..256,
+            );
+            let e = groups.entry(key).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += tables;
+        }
+        let _ = writeln!(
+            s,
+            "origin_records_dropped {}",
+            narf_memory::as_origin::dropped()
+        );
+        for ((file, line), (count, tables)) in groups {
+            let _ = writeln!(
+                s,
+                "orphan_roots {}:{} count={} tables={}",
+                file, line, count, tables
+            );
+        }
+    }
     s.into_bytes()
 }
 
