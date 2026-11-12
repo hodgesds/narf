@@ -5161,6 +5161,12 @@ pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
             out.extend(parked.keys().copied());
         }
     }
+    // Each queue is locked only for its own scan, so a task that moves while
+    // the scan runs — stolen to a later CPU's queue, or parked after its
+    // ready queue was read — is seen twice. Report each task once, as
+    // Linux's task-list walk does (`/proc`, loadavg's total).
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -5189,6 +5195,9 @@ pub fn task_origins() -> alloc::vec::Vec<(
             }
         }
     }
+    // One entry per task; see `all_task_ids`.
+    out.sort_unstable_by_key(|entry| entry.0);
+    out.dedup_by_key(|entry| entry.0);
     out
 }
 

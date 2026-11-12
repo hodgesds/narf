@@ -340,6 +340,50 @@ fn smoke_scheduler_respects_waker() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_respects_waker);
 
+/// `all_task_ids` and `task_origins` name each task once, whatever queue it
+/// sits in and however often it moves between ready and parked while the
+/// snapshot is taken (the soak's `/proc/loadavg` total counted one kernel
+/// thread three times).
+fn smoke_scheduler_task_snapshot_names_each_task_once() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DUPLICATE: AtomicBool = AtomicBool::new(false);
+
+    fn unique() -> bool {
+        let ids = crate::all_task_ids();
+        let origins = crate::task_origins();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut origin_ids: alloc::vec::Vec<_> = origins.iter().map(|o| o.0).collect();
+        origin_ids.sort_unstable();
+        origin_ids.dedup();
+        sorted.len() == ids.len() && origin_ids.len() == origins.len()
+    }
+
+    DUPLICATE.store(false, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    for _ in 0..8 {
+        crate::spawn(async {
+            for _ in 0..20 {
+                crate::yield_now().await;
+                if !unique() {
+                    DUPLICATE.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    let spawned = crate::all_task_ids().len();
+    if !unique() || spawned < 8 {
+        return TestResult::Fail("a fresh snapshot named a task twice or missed one");
+    }
+    crate::run_until_empty();
+    if DUPLICATE.load(Ordering::Relaxed) {
+        return TestResult::Fail("a snapshot taken while tasks moved named one twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_task_snapshot_names_each_task_once);
+
 fn smoke_scheduler_budget_cap_revokes_task() -> TestResult {
     // A Cap<CpuBudget, Spend>-attached task runs while the cap is live,
     // and is dropped by the scheduler once the cap is revoked.
