@@ -758,8 +758,10 @@ pub unsafe fn load_elf_bytes_file<S: crate::elf::ExecBytes + ?Sized>(
     unsafe { addr_space.materialize() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
+    let address_space = Arc::new(addr_space);
+    narf_memory::as_origin::note_arc(&address_space);
     Ok(LoadedElf {
-        address_space: Arc::new(addr_space),
+        address_space,
         program_entry: EntryPoint(VirtAddr::new(entry)),
         program_bias: bias,
         image,

@@ -169,6 +169,7 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     // whose backing became newly shared. Repeated forks therefore do not
     // re-walk pages that were already COW read-only.
     let child_as = alloc::sync::Arc::new(child_as);
+    narf_memory::as_origin::note_arc(&child_as);
 
     // Snapshot the parent's trap frame BEFORE we set the parent's
     // own return value below. The snapshot captures the syscall-

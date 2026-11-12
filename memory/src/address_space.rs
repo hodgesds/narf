@@ -2911,6 +2911,14 @@ impl AddressSpace {
         }
     }
 
+    /// Scheduler tasks which may still execute through this address space
+    /// (Linux `mm_users`, as opposed to the `Arc` count, `mm_count`).
+    pub fn scheduler_user_tasks(&self) -> u32 {
+        self.membarrier_task_state
+            .load(core::sync::atomic::Ordering::Acquire)
+            >> LIVE_USER_TASKS_SHIFT
+    }
+
     /// Whether every scheduler task which could execute through this address
     /// space has completed its final poll.
     pub(crate) fn user_tasks_quiesced(&self) -> bool {

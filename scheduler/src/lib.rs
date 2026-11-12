@@ -573,12 +573,14 @@ static LIVE_USER_ADDRESS_SPACES: IrqSafeSpinLock<LiveUserAddressSpaces> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 fn register_live_user_address_space(id: TaskId, address_space: &Arc<AddressSpace>) {
+    narf_memory::as_origin::note_owner(address_space, id.raw());
     let mut live = LIVE_USER_ADDRESS_SPACES.lock();
     debug_assert!(live.iter().all(|(existing, _)| *existing != id));
     live.push((id, address_space.clone()));
 }
 
 fn replace_live_user_address_space(id: TaskId, address_space: &Arc<AddressSpace>) {
+    narf_memory::as_origin::note_owner(address_space, id.raw());
     if let Some((_, existing)) = LIVE_USER_ADDRESS_SPACES
         .lock()
         .iter_mut()
