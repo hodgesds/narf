@@ -254,6 +254,14 @@ fn smoke_oa_per_context_job_executes_on_bound_queue_and_saves_state() -> TestRes
         service_contexts(&io, &mut registered, true);
     }
     assert_eq!(fence.result(), Some(Ok(())));
+    // The register phase (finish) is what arms the unit: `enable` sets
+    // `per_context` from the session, so the Disable `begin` below can
+    // build its job. The runtime caller runs begin → submit → finish for
+    // every request (see `intel_gpu_gt_runtime::oa_control`); this test
+    // skipped finish after the Open, leaving `per_context` false, so the
+    // Disable `begin` returned zero jobs (:293). Mirrors the kernel-ring
+    // test's finish at the same tick.
+    gt.oa_finish(&session, &request, 900, || true).unwrap();
     // The LRI landed live on the bound queue's context...
     assert_eq!(
         (
