@@ -254,6 +254,73 @@ const _: () = assert!(NUM_MIGRATE_TYPES <= 1 << (STATE_NODE_SHIFT - STATE_MT_SHI
 const _: () =
     assert!(crate::frame::MAX_NUMA_NODES <= 1 << (STATE_PAYLOAD_SHIFT - STATE_NODE_SHIFT));
 
+// ── Allocated frames (Linux page flags / compound head-tail state) ─────
+//
+// A frame handed out also carries a word, with kind bits 0: the head of a
+// live order-N block (`STATE_ALLOC`, N in bits 6..12) or a tail frame of one
+// (`STATE_TAIL`). The free of a block must name its head with its order. A
+// free of a tail ("tail of a live order-N block"), of a frame whose word is
+// 0 ("not allocated" — inside a free buddy block, or never handed out), or
+// of a head with another order, is refused and reported, as Linux's
+// `free_pages_prepare` reports a `bad_page`. Frames that were already
+// allocated when the index was enabled at boot carry `STATE_LEGACY`: their
+// order is unknown, so any order is accepted for them.
+const STATE_ALLOC: u64 = 1 << 4;
+const STATE_TAIL: u64 = 1 << 5;
+const ALLOC_ORDER_SHIFT: u32 = 6;
+const ALLOC_ORDER_UNKNOWN: u64 = 0x3F;
+/// Word of a frame allocated before the index existed (order unknown).
+pub(crate) const STATE_LEGACY: u64 = STATE_ALLOC | (ALLOC_ORDER_UNKNOWN << ALLOC_ORDER_SHIFT);
+
+/// Word of the head of a live order-`order` block.
+#[inline]
+pub(crate) const fn alloc_head_state(order: u8) -> u64 {
+    STATE_ALLOC | ((order as u64) << ALLOC_ORDER_SHIFT)
+}
+
+/// Why a free was refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FreeRefusal {
+    /// The frame heads a free block or sits in a per-CPU cache.
+    AlreadyFree,
+    /// The frame is a tail of a live block; only its head may be freed.
+    TailOfLiveBlock,
+    /// The frame is not allocated: inside a free block, or never handed out.
+    NotAllocated,
+    /// The frame heads a live block of another order.
+    OrderMismatch(u8),
+}
+
+impl FreeRefusal {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            FreeRefusal::AlreadyFree => "already free (free-block head or cached)",
+            FreeRefusal::TailOfLiveBlock => "tail of a live block",
+            FreeRefusal::NotAllocated => "not allocated (inside a free block, or never handed out)",
+            FreeRefusal::OrderMismatch(_) => "head of a live block of another order",
+        }
+    }
+}
+
+/// Judge freeing an order-`order` block whose head word is `state`.
+#[inline]
+pub(crate) const fn judge_free(state: u64, order: u8) -> Result<(), FreeRefusal> {
+    if state & STATE_KIND_MASK != 0 {
+        return Err(FreeRefusal::AlreadyFree);
+    }
+    if state & STATE_TAIL != 0 {
+        return Err(FreeRefusal::TailOfLiveBlock);
+    }
+    if state & STATE_ALLOC == 0 {
+        return Err(FreeRefusal::NotAllocated);
+    }
+    let held = (state >> ALLOC_ORDER_SHIFT) & ALLOC_ORDER_UNKNOWN;
+    if held != ALLOC_ORDER_UNKNOWN && held != order as u64 {
+        return Err(FreeRefusal::OrderMismatch(held as u8));
+    }
+    Ok(())
+}
+
 /// End-of-list marker for a per-CPU cache's frame list.
 pub(crate) const NO_FRAME: u64 = u64::MAX;
 
@@ -302,6 +369,78 @@ impl FrameStateIndex {
             .get()
             .copied()?;
         Some(&words[(frame as usize) & (STATE_SECTION_FRAMES - 1)])
+    }
+
+    /// Mark `[frame, frame + 2^order)` as a live block: head and tails. The
+    /// caller owns the block (it was just taken off a free list or cache).
+    #[inline]
+    pub(crate) fn mark_allocated(&self, frame: u64, order: u8) {
+        let Some(head) = self.slot(frame) else {
+            return;
+        };
+        head.store(alloc_head_state(order), Ordering::Release);
+        for tail in frame + 1..frame + order_frames(order) {
+            if let Some(word) = self.slot(tail) {
+                word.store(STATE_TAIL, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Validate and claim the free of the order-`order` block at `frame`:
+    /// on success its head and tail words are 0 (the caller now holds the
+    /// block as free). A frame without a word is accepted unchecked. The head
+    /// is claimed with one compare-exchange, so two racing frees of the same
+    /// block cannot both succeed.
+    #[inline]
+    pub(crate) fn claim_free(&self, frame: u64, order: u8) -> Result<(), FreeRefusal> {
+        let Some(head) = self.slot(frame) else {
+            return Ok(());
+        };
+        let state = head.load(Ordering::Acquire);
+        judge_free(state, order)?;
+        if head
+            .compare_exchange(state, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(FreeRefusal::AlreadyFree);
+        }
+        for tail in frame + 1..frame + order_frames(order) {
+            if let Some(word) = self.slot(tail) {
+                word.store(0, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Turn a live order-`order` block into `2^order` live order-0 frames
+    /// (Linux `split_page`), so they can be freed one by one. `false` when
+    /// `frame` does not head a live block of that order.
+    pub(crate) fn split_allocated(&self, frame: u64, order: u8) -> bool {
+        let Some(head) = self.slot(frame) else {
+            return true;
+        };
+        let state = head.load(Ordering::Acquire);
+        if judge_free(state, order).is_err() {
+            return false;
+        }
+        for each in frame..frame + order_frames(order) {
+            if let Some(word) = self.slot(each) {
+                word.store(alloc_head_state(0), Ordering::Release);
+            }
+        }
+        true
+    }
+
+    /// Set every word of every installed section to `value`. Boot-only: run
+    /// before any zone is indexed, with nothing else using the words.
+    pub(crate) fn fill(&self, value: u64) {
+        for table in self.root.iter().filter_map(|table| table.get()) {
+            for section in table.iter().filter_map(|section| section.get()) {
+                for word in section.iter() {
+                    word.store(value, Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Whether section number `section` (`frame >> STATE_SECTION_SHIFT`) has
@@ -755,6 +894,13 @@ impl BuddyZone {
                     if let Some(slot) = index.slot(frame) {
                         slot.store(self.block_state(mt, order, pos), Ordering::Relaxed);
                     }
+                    // A free block's other frames carry no state: a free of
+                    // one of them is a free of memory nobody owns.
+                    for interior in frame + 1..frame + order_frames(order as u8) {
+                        if let Some(slot) = index.slot(interior) {
+                            slot.store(0, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         }
@@ -807,7 +953,7 @@ impl BuddyZone {
     #[inline]
     fn already_free(&self, frame: u64) -> bool {
         self.slot(frame)
-            .is_some_and(|slot| slot.load(Ordering::Relaxed) != 0)
+            .is_some_and(|slot| slot.load(Ordering::Relaxed) & STATE_KIND_MASK != 0)
     }
 
     #[inline]
@@ -903,6 +1049,9 @@ impl BuddyZone {
     /// Record a buddy hand-out in the audit, iff this zone opted in.
     #[inline]
     fn note_alloc(&self, frame: u64, order: u8) {
+        if let Some(index) = self.index {
+            index.mark_allocated(frame, order);
+        }
         #[cfg(feature = "frame-alloc-audit")]
         if self.audit {
             audit_alloc(frame, order);
@@ -1381,16 +1530,28 @@ impl BuddyZone {
     /// freed. Only frames with a state word can be refused; a zone that is not
     /// indexed accepts every free, as before.
     pub(crate) fn try_free_mt(&mut self, frame: u64, order: u8, mt: MigrateType) -> bool {
+        self.try_free_checked(frame, order, mt).is_ok()
+    }
+
+    /// [`Self::try_free_mt`], saying why a free was refused: the frame is
+    /// already free, is a tail of a live block, is not allocated at all
+    /// (inside a free block), or heads a block of another order.
+    pub(crate) fn try_free_checked(
+        &mut self,
+        frame: u64,
+        order: u8,
+        mt: MigrateType,
+    ) -> Result<(), FreeRefusal> {
         debug_assert!(order <= MAX_ORDER);
         debug_assert_eq!(frame & (order_frames(order) - 1), 0);
         // The audit (when compiled in) names a double free at its source
         // before the refusal below can hide it.
         self.note_free(frame, order);
-        if self.already_free(frame) {
-            return false;
+        if let Some(index) = self.index {
+            index.claim_free(frame, order)?;
         }
         self.free_inner(frame, order, mt);
-        true
+        Ok(())
     }
 
     /// Return a block that was already recorded free while resident in a
@@ -1951,6 +2112,9 @@ mod index_tests {
         }
         let mut a = indexed_zone(0);
         let mut b = indexed_zone(1);
+        // Both frames are live order-0 frames before they are freed.
+        TEST_INDEX.mark_allocated(FIRST, 0);
+        TEST_INDEX.mark_allocated(FIRST + 1, 0);
         a.free_mt(FIRST, 0, MigrateType::Movable);
         b.free_mt(FIRST + 1, 0, MigrateType::Movable);
         kt_assert_eq!(a.free_block_count(0), 1);
@@ -2098,6 +2262,53 @@ mod index_tests {
         smoke_buddy_index_uncovered_frames_fall_back_to_the_scan
     );
 
+    /// Linux `bad_page` cases a free must refuse: a tail of a live block, a
+    /// head freed with the wrong order, a frame inside a free block. A live
+    /// block split with `split_allocated` frees frame by frame.
+    fn smoke_buddy_index_refuses_bad_frees() -> TestResult {
+        const FIRST: u64 = 0x10_E000;
+        if !cover(FIRST, 16) {
+            return OUT_OF_MEMORY;
+        }
+        let mut zone = indexed_zone(4);
+        zone.donate(FIRST, 16);
+        let mt = MigrateType::Unmovable;
+        let Some(block) = zone.alloc(2) else {
+            return TestResult::Fail("synthetic zone could not supply an order-2 block");
+        };
+        kt_assert_eq!(
+            zone.try_free_checked(block + 1, 0, mt),
+            Err(FreeRefusal::TailOfLiveBlock)
+        );
+        kt_assert_eq!(
+            zone.try_free_checked(block, 1, mt),
+            Err(FreeRefusal::OrderMismatch(2))
+        );
+        kt_assert!(zone.try_free_checked(block, 2, mt).is_ok());
+        kt_assert_eq!(zone.free_frame_count(), 16);
+        // Everything is one free order-4 block again; its frames are free.
+        kt_assert_eq!(
+            zone.try_free_checked(FIRST + 3, 0, mt),
+            Err(FreeRefusal::NotAllocated)
+        );
+        kt_assert_eq!(
+            zone.try_free_checked(FIRST, 4, mt),
+            Err(FreeRefusal::AlreadyFree)
+        );
+        // A split block frees one frame at a time.
+        let Some(block) = zone.alloc(2) else {
+            return TestResult::Fail("synthetic zone could not supply an order-2 block");
+        };
+        kt_assert!(TEST_INDEX.split_allocated(block, 2));
+        for frame in block..block + 4 {
+            kt_assert!(zone.try_free_checked(frame, 0, mt).is_ok());
+        }
+        kt_assert_eq!(zone.free_frame_count(), 16);
+        kt_assert!(zone.validate_index().is_ok());
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/buddy", smoke_buddy_index_refuses_bad_frees);
+
     /// A cache link round-trips, and is neither an empty word nor any zone's
     /// block word; a frame carrying one is refused by a zone like any other
     /// frame that is already free.
@@ -2128,7 +2339,7 @@ mod index_tests {
         };
         word.store(cached_state(NO_FRAME), Ordering::Relaxed);
         kt_assert!(!zone.try_free_mt(frame, 0, MigrateType::Unmovable));
-        word.store(0, Ordering::Relaxed);
+        word.store(alloc_head_state(0), Ordering::Relaxed);
         kt_assert!(zone.try_free_mt(frame, 0, MigrateType::Unmovable));
         TestResult::Pass
     }
