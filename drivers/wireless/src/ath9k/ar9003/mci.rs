@@ -1816,7 +1816,12 @@ fn is_gpm_valid(mci: &Mci, msg_index: u32) -> bool {
 /// the 5-bit output-mux field (`AR_GPIO_OUTPUT_MUX1..3`, pin `> 11` in
 /// MUX3, `> 5` in MUX2, else MUX1, at `(gpio % 6) * 5`). The pre-
 /// AR9280-2.0 legacy mux shuffle does not apply to any AR9003 part.
-fn gpio_request_out(io: &mut impl RegisterIo, gpio: u32, mux: u32) -> Result<(), BringUpError> {
+/// Shared with `btcoex` (`enable_2wire`/`enable_3wire`/`disable`).
+pub(super) fn gpio_request_out(
+    io: &mut impl RegisterIo,
+    gpio: u32,
+    mux: u32,
+) -> Result<(), BringUpError> {
     let addr = if gpio > 11 {
         AR_GPIO_OUTPUT_MUX3
     } else if gpio > 5 {
