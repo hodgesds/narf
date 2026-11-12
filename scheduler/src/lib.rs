@@ -598,10 +598,64 @@ fn live_user_address_space(id: TaskId) -> Option<Arc<AddressSpace>> {
         .map(|(_, address_space)| address_space.clone())
 }
 
-fn unregister_live_user_address_space(id: TaskId) {
-    LIVE_USER_ADDRESS_SPACES
-        .lock()
-        .retain(|(existing, _)| *existing != id);
+/// Remove `id`'s registry entry, returning the address space it named. The
+/// entry is the task's user reference (`mm_users`): it is taken at spawn and
+/// moved by exec in step with `scheduler_attach_user_task`, so whoever takes
+/// it out owns the matching detach.
+fn take_live_user_address_space(id: TaskId) -> Option<Arc<AddressSpace>> {
+    let mut live = LIVE_USER_ADDRESS_SPACES.lock();
+    let at = live.iter().position(|(existing, _)| *existing == id)?;
+    Some(live.swap_remove(at).1)
+}
+
+/// Linux `mmput`: drop one user of `space`; the last one tears it down.
+fn mmput(space: &Arc<AddressSpace>) {
+    if space.scheduler_detach_user_task() {
+        let start = narf_time::monotonic_ns();
+        space.exit_mmap();
+        note_exit_mmap_ns(narf_time::monotonic_ns().saturating_sub(start));
+    }
+}
+
+static EXIT_MMAP_COUNT: AtomicU64 = AtomicU64::new(0);
+static EXIT_MMAP_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static EXIT_MMAP_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static EXIT_MMAP_IN_TASK: AtomicU64 = AtomicU64::new(0);
+
+fn note_exit_mmap_ns(ns: u64) {
+    EXIT_MMAP_COUNT.fetch_add(1, Ordering::Relaxed);
+    EXIT_MMAP_TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
+    EXIT_MMAP_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// `(count, total ns, max ns, run in the exiting task)` of the `exit_mmap`
+/// teardowns the scheduler has run (`/proc/narf/pgtables`).
+pub fn exit_mmap_stats() -> (u64, u64, u64, u64) {
+    (
+        EXIT_MMAP_COUNT.load(Ordering::Relaxed),
+        EXIT_MMAP_TOTAL_NS.load(Ordering::Relaxed),
+        EXIT_MMAP_MAX_NS.load(Ordering::Relaxed),
+        EXIT_MMAP_IN_TASK.load(Ordering::Relaxed),
+    )
+}
+
+/// Linux `exit_mm`: the exiting task `id` gives up its address space — its
+/// user reference (`mm_users`) goes now, in its own context, and when it was
+/// the last one `exit_mmap` runs here, before the exit is reported to the
+/// parent, not later in the executor when the slot is dropped. The task must
+/// not touch user memory afterwards; its root stays installed (lazy active
+/// root) until it switches away. Returns whether the task had one to give up
+/// (a second call, or a task without a user space, is a no-op).
+pub fn exit_mm(id: TaskId) -> bool {
+    let Some(space) = take_live_user_address_space(id) else {
+        return false;
+    };
+    let before = EXIT_MMAP_COUNT.load(Ordering::Relaxed);
+    mmput(&space);
+    if EXIT_MMAP_COUNT.load(Ordering::Relaxed) != before {
+        EXIT_MMAP_IN_TASK.fetch_add(1, Ordering::Relaxed);
+    }
+    true
 }
 
 // Task-id selection is a cold management operation. Dispatch retains the
@@ -637,28 +691,30 @@ pub fn transfer_task_cap(
 
 impl Drop for TaskSlot {
     fn drop(&mut self) {
-        unregister_live_user_address_space(self.id);
+        // The task's user reference, unless its exit already gave it up
+        // (`exit_mm`). The registry entry, not `addr_space`, is the one
+        // `scheduler_attach_user_task` paired with: an exec moves it at once,
+        // while the slot's own field follows at the next reconciliation.
+        let user = take_live_user_address_space(self.id);
         #[cfg(feature = "native-ring")]
         {
             self.authority.retire();
             authority::unregister(self.id);
         }
-        if let Some(address_space) = self.addr_space.as_ref() {
+        if let Some(address_space) = user.as_ref() {
             // Final slot drop is the execution-liveness boundary for this MM:
             // the future cannot be polled again after Drop begins. Passive Arc
             // owners may outlive it, but no task represented by this slot can
             // fault or enter a VMA critical section after this decrement.
             //
-            // The last such slot is Linux `mmput` reaching zero `mm_users`:
-            // tear the mappings and page tables down now (`exit_mmap`), not
-            // when the last passive `Arc` happens to drop — a zombie's
-            // bookkeeping, a lazily active root or a leaked reference would
-            // otherwise keep the whole process image alive. This is the same
-            // context the final `Arc` drop (and so the full teardown) runs in
-            // when the slot owns the last reference.
-            if address_space.scheduler_detach_user_task() {
-                address_space.exit_mmap();
-            }
+            // The last user is Linux `mmput` reaching zero `mm_users`: tear the
+            // mappings and page tables down now (`exit_mmap`), not when the
+            // last passive `Arc` happens to drop — a zombie's bookkeeping, a
+            // lazily active root or a leaked reference would otherwise keep
+            // the whole process image alive. A task that exits through the
+            // user exit path has already done this in its own context
+            // (`exit_mm`); this covers every other end of a user slot.
+            mmput(address_space);
         }
         unregister_task_affinity(self.id);
         if self.user_scheduling.is_some() {
@@ -5315,9 +5371,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         // image, and the teardown's invalidation covers this CPU, which still
         // runs on the old root until the new one is activated.
         if let Some(previous) = previous_active.as_ref() {
-            if previous.scheduler_detach_user_task() {
-                previous.exit_mmap();
-            }
+            mmput(previous);
         }
         let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
         let prev = p
@@ -5346,9 +5400,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             // lock is released; the reaper waker may itself touch scheduler
             // state.
             if let Some(previous) = prev.as_ref() {
-                if previous.scheduler_detach_user_task() {
-                    previous.exit_mmap();
-                }
+                mmput(previous);
             }
             return prev;
         }
@@ -5367,9 +5419,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
         };
         if let Some(prev) = replaced {
             if let Some(previous) = prev.as_ref() {
-                if previous.scheduler_detach_user_task() {
-                    previous.exit_mmap();
-                }
+                mmput(previous);
             }
             return prev;
         }
