@@ -8097,7 +8097,7 @@ pub fn narf_tasks_report() -> alloc::vec::Vec<u8> {
                 "task tid={} pid={} comm={} {} as_rss={} as_refs={} sys={} at={}",
                 tid,
                 last_pid,
-                proc_comm_of_task_try(tid).unwrap_or_default(),
+                proc_comm_of_task(tid).unwrap_or_default(),
                 state,
                 rss,
                 as_refs,
