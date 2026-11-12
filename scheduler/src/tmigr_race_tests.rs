@@ -133,10 +133,23 @@ fn wait_ns(ns: u64, mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
+/// Rounds, each on a fresh hierarchy with its own interleavings.
+const ROUNDS: u64 = 6;
+
 /// APs toggle idle on a shared hierarchy while their timers are armed:
 /// every GLOBAL timer fires exactly once, on time, and none is lost; the
 /// hierarchy's invariants hold afterwards.
 fn smoke_tmigr_cross_cpu_activate_deactivate_race() -> TestResult {
+    for round in 0..ROUNDS {
+        match race_round(round) {
+            TestResult::Pass => {}
+            other => return other,
+        }
+    }
+    TestResult::Pass
+}
+
+fn race_round(round: u64) -> TestResult {
     let me = narf_lib::percpu::current_cpu();
     let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
     let aps: Vec<usize> = (0..MAX_CPUS.min(64))
@@ -173,7 +186,9 @@ fn smoke_tmigr_cross_cpu_activate_deactivate_race() -> TestResult {
                 h,
                 cpu: dead[i],
                 timers: &timers[i * TIMERS_PER_CPU..(i + 1) * TIMERS_PER_CPU],
-                seed: 0x9e37_79b9_7f4a_7c15 ^ (i as u64 + 1).wrapping_mul(0xbf58_476d),
+                seed: 0x9e37_79b9_7f4a_7c15
+                    ^ (i as u64 + 1).wrapping_mul(0xbf58_476d)
+                    ^ round << 40,
                 stop,
                 armed,
                 done,

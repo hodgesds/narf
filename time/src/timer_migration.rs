@@ -25,22 +25,25 @@
 //! * The **last** CPU to go idle — its walk leaves the root inactive — gets
 //!   the root's first event back (`tmc->wakeup`) and wakes for it.
 //! * Leaving idle ([`tmigr_cpu_activate`]) sets the bit again and, in a group
-//!   without a migrator, takes the role and continues up; its own event
-//!   leaves the queue (an active CPU handles its own timers).
+//!   without a migrator, takes the role and continues up (`tmigr_active_up`).
+//!   Its queued events are not dequeued: they are marked `ignore`d and
+//!   dropped lazily by whoever next looks at the queue under its lock.
 //!
 //! A CPU that is not part of the hierarchy (never registered by
 //! [`tmigr_cpu_online`]) counts as active and handles its own timers.
 //!
 //! Units: jiffies; `u64::MAX` is "no event".
 //!
-//! Locking: a CPU's `tmc` lock, then group locks bottom-up. A walk that
-//! carries a child group's first event into its parent holds the child's
-//! lock while it takes the parent's (Linux `tmigr_update_events`), so a
-//! concurrent walk can never overwrite a parent with an older view of the
-//! child. Linux keeps the active/migrator state in a lock-free atomic with a
-//! sequence count; NARF updates it under the group lock, which the event
-//! update takes anyway, and mirrors it into atomics for the lock-free reads.
-//! Timer base locks are never held across any of these.
+//! Locking, as Linux: a group's active children, migrator and a sequence
+//! count are one atomic word (`union tmigr_state`) changed only by
+//! compare-and-exchange, so activation takes no lock at all and an
+//! inactive walk takes a group lock only for the event update. Event queues
+//! are under their group's lock; an event update that carries a child
+//! group's first event into its parent holds the child's lock, then the
+//! parent's (`tmigr_update_events`), and re-reads the child's state there:
+//! a child that went active meanwhile is left alone. A CPU's `tmc` lock is
+//! held across its own walks and its remote expiry; it is taken before any
+//! group lock. Timer base locks are never held across any of these.
 
 extern crate alloc;
 
@@ -68,6 +71,37 @@ const LVL_LLC: u8 = 0;
 const LVL_ROOT: u8 = 3;
 const _: () = assert!(MAX_CPUS <= 4096);
 
+/// `union tmigr_state`: active children, the migrator child (or
+/// `TMIGR_NONE`) and a sequence count bumped by every change, so a
+/// compare-and-exchange never succeeds on a state that changed and changed
+/// back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MigrState {
+    active: u8,
+    migrator: u8,
+    seq: u16,
+}
+
+impl MigrState {
+    const INITIAL: MigrState = MigrState {
+        active: 0,
+        migrator: TMIGR_NONE,
+        seq: 0,
+    };
+
+    const fn pack(self) -> u32 {
+        self.active as u32 | (self.migrator as u32) << 8 | (self.seq as u32) << 16
+    }
+
+    const fn unpack(v: u32) -> Self {
+        MigrState {
+            active: v as u8,
+            migrator: (v >> 8) as u8,
+            seq: (v >> 16) as u16,
+        }
+    }
+}
+
 /// `struct tmigr_event`: the earliest global timer of a CPU or of an idle
 /// group, queued in the parent group's queue (guarded by that lock).
 #[repr(C)]
@@ -76,6 +110,9 @@ struct TmigrEvent {
     /// CPU the timer belongs to (`evt->cpu`).
     cpu: AtomicU32,
     queued: AtomicBool,
+    /// `evt->ignore`: the owner is active (or has no event); a queued
+    /// event is skipped and dropped by the next look at the queue.
+    ignore: AtomicBool,
 }
 
 impl TmigrEvent {
@@ -84,11 +121,19 @@ impl TmigrEvent {
             node: UnsafeCell::new(TimerQueueNode::new()),
             cpu: AtomicU32::new(0),
             queued: AtomicBool::new(false),
+            ignore: AtomicBool::new(true),
         }
     }
 
     fn node_ptr(&self) -> *mut TimerQueueNode {
         self.node.get()
+    }
+
+    /// The queued expiry. Written only by holders of the queue's group
+    /// lock, which (for a CPU's event) also hold that CPU's `tmc` lock.
+    fn expires(&self) -> u64 {
+        // SAFETY: see above; the caller holds one of those locks.
+        unsafe { (*self.node_ptr()).expires }
     }
 
     /// `container_of(node, struct tmigr_event, nextevt)`: `node` is the
@@ -100,10 +145,6 @@ impl TmigrEvent {
 
 struct GroupState {
     events: TimerQueueHead,
-    /// Active children (bit per child slot).
-    active: u8,
-    /// The migrator child's bit, or `TMIGR_NONE`.
-    migrator: u8,
     num_children: u8,
 }
 
@@ -113,6 +154,8 @@ unsafe impl Send for GroupState {}
 /// `struct tmigr_group`. Groups are leaked once created and never freed.
 pub struct TmigrGroup {
     state: IrqSafeSpinLock<GroupState>,
+    /// `group->migr_state` ([`MigrState`] packed).
+    migr_state: AtomicU32,
     parent: AtomicPtr<TmigrGroup>,
     /// This group's event in the parent's queue (parent's lock).
     groupevt: TmigrEvent,
@@ -121,17 +164,19 @@ pub struct TmigrGroup {
     level: u8,
     /// Topology key the group was built for (LLC id, node id, or 0).
     key: u64,
-    /// Lock-free mirrors of the migrator and the first event.
-    migrator: AtomicU8,
+    /// `group->next_expiry`: the first event, written under the lock and
+    /// read lock-free (it may be stale-early: an ignored event).
     next_expiry: AtomicU64,
 }
 
 impl core::fmt::Debug for TmigrGroup {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.migr();
         f.debug_struct("TmigrGroup")
             .field("level", &self.level)
             .field("key", &self.key)
-            .field("migrator", &self.migrator.load(Ordering::Relaxed))
+            .field("active", &s.active)
+            .field("migrator", &s.migrator)
             .field("next_expiry", &self.next_expiry.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -150,16 +195,14 @@ impl TmigrGroup {
         Box::leak(Box::new(TmigrGroup {
             state: IrqSafeSpinLock::new(GroupState {
                 events: TimerQueueHead::new(),
-                active: 0,
-                migrator: TMIGR_NONE,
                 num_children: 0,
             }),
+            migr_state: AtomicU32::new(MigrState::INITIAL.pack()),
             parent: AtomicPtr::new(ptr::null_mut()),
             groupevt: TmigrEvent::new(),
             groupmask: AtomicU8::new(0),
             level,
             key,
-            migrator: AtomicU8::new(TMIGR_NONE),
             next_expiry: AtomicU64::new(NONE),
         }))
     }
@@ -173,42 +216,72 @@ impl TmigrGroup {
     fn lock(&'static self) -> GGuard {
         self.state.lock()
     }
-}
 
-/// First event of a group's queue: (expiry, cpu); `NONE` if empty.
-fn first_event(g: &GroupState) -> (u64, u32) {
-    let n = g.events.first();
-    if n.is_null() {
-        return (NONE, 0);
+    fn migr(&self) -> MigrState {
+        MigrState::unpack(self.migr_state.load(Ordering::Acquire))
     }
-    // SAFETY: linked events live in leaked groups / CPUs and are guarded by
-    // this group's lock, which the caller holds.
-    let (exp, e) = unsafe { ((*n).expires, &*TmigrEvent::from_node(n)) };
-    (exp, e.cpu.load(Ordering::Relaxed))
+
+    /// `tmigr_check_migrator`: `childmask` is this group's migrator, or it
+    /// has none.
+    fn check_migrator(&self, childmask: u8) -> bool {
+        let m = self.migr().migrator;
+        m == childmask || m == TMIGR_NONE
+    }
+
+    /// `tmigr_next_groupevt`: the first event not to be ignored; ignored
+    /// ones in front of it leave the queue. Updates `next_expiry`. Lock
+    /// held.
+    fn next_groupevt(&self, g: &mut GroupState) -> Option<&'static TmigrEvent> {
+        loop {
+            let n = g.events.first();
+            if n.is_null() {
+                self.next_expiry.store(NONE, Ordering::Release);
+                return None;
+            }
+            // SAFETY: linked events live in leaked groups / CPUs and are
+            // guarded by this group's lock, which the caller holds.
+            let evt: &'static TmigrEvent = unsafe { &*TmigrEvent::from_node(n) };
+            if !evt.ignore.load(Ordering::Acquire) {
+                self.next_expiry.store(evt.expires(), Ordering::Release);
+                return Some(evt);
+            }
+            dequeue(g, evt);
+        }
+    }
+
+    /// `tmigr_next_expired_groupevt`: pop the first event if due at `now`,
+    /// marking it ignored (it is no longer queued). Lock held.
+    fn next_expired_groupevt(&self, g: &mut GroupState, now: u64) -> Option<&'static TmigrEvent> {
+        let evt = self.next_groupevt(g)?;
+        if evt.expires() > now {
+            return None;
+        }
+        dequeue(g, evt);
+        evt.ignore.store(true, Ordering::Release);
+        let _ = self.next_groupevt(g);
+        Some(evt)
+    }
 }
 
-/// Put `evt` in `g`'s queue at `exp` for `cpu`, or take it out (`NONE`).
-fn requeue(g: &mut GroupState, evt: &TmigrEvent, exp: u64, cpu: u32) {
+/// Take `evt` out of `g`'s queue if it is queued there. Lock held.
+fn dequeue(g: &mut GroupState, evt: &TmigrEvent) {
     if evt.queued.load(Ordering::Relaxed) {
         // SAFETY: queued ⇒ linked into `g.events`, under this lock.
         let _ = unsafe { g.events.remove(evt.node_ptr()) };
         evt.queued.store(false, Ordering::Relaxed);
     }
-    if exp != NONE {
-        // SAFETY: unlinked, owned under this lock; events never move (they
-        // live in leaked groups / CPUs).
-        unsafe {
-            (*evt.node_ptr()).expires = exp;
-            evt.cpu.store(cpu, Ordering::Relaxed);
-            let _ = g.events.add(evt.node_ptr());
-        }
-        evt.queued.store(true, Ordering::Relaxed);
-    }
 }
 
-fn publish(group: &TmigrGroup, g: &GroupState) {
-    group.migrator.store(g.migrator, Ordering::Release);
-    group.next_expiry.store(first_event(g).0, Ordering::Release);
+/// Queue unqueued `evt` in `g` at `exp` for `cpu`. Lock held.
+fn enqueue(g: &mut GroupState, evt: &TmigrEvent, exp: u64, cpu: u32) {
+    // SAFETY: unlinked, owned under this lock; events never move (they live
+    // in leaked groups / CPUs).
+    unsafe {
+        (*evt.node_ptr()).expires = exp;
+        evt.cpu.store(cpu, Ordering::Relaxed);
+        let _ = g.events.add(evt.node_ptr());
+    }
+    evt.queued.store(true, Ordering::Relaxed);
 }
 
 struct CpuState {
@@ -240,14 +313,162 @@ impl core::fmt::Debug for TmigrCpu {
     }
 }
 
-// SAFETY: `cpuevt` is touched only under its group's lock; the rest is atomic
-// or behind `state`.
+// SAFETY: `cpuevt`'s node is touched only under its group's lock; the rest is
+// atomic or behind `state`.
 unsafe impl Sync for TmigrCpu {}
 // SAFETY: as above.
 unsafe impl Send for TmigrCpu {}
 
-/// One migration hierarchy. The kernel's is [`static@TMIGR`]; tests build
-/// private ones over CPU indices that never came online.
+/// `struct tmigr_walk`: what a walk up the hierarchy carries.
+struct Walk {
+    /// The CPU's next global event (CPU level only).
+    nextexp: u64,
+    /// The root's first event, when the walk left the root inactive.
+    firstexp: u64,
+    /// The CPU's event and CPU number.
+    evt: &'static TmigrEvent,
+    cpu: u32,
+    /// The current child's bit in the group being walked.
+    childmask: u8,
+    /// The walk follows a remote expiry (`tmigr_handle_remote_cpu`).
+    remote: bool,
+}
+
+/// `tmigr_active_up`: `childmask` went active in `group`. Lock-free.
+/// Returns whether the walk is done (the group already had a migrator).
+fn active_up(group: &TmigrGroup, childmask: u8) -> bool {
+    let mut cur = group.migr_state.load(Ordering::Acquire);
+    let done = loop {
+        let mut s = MigrState::unpack(cur);
+        let mut done = true;
+        if s.migrator == TMIGR_NONE {
+            s.migrator = childmask;
+            done = false;
+        }
+        s.active |= childmask;
+        s.seq = s.seq.wrapping_add(1);
+        match group
+            .migr_state
+            .compare_exchange(cur, s.pack(), Ordering::SeqCst, Ordering::Acquire)
+        {
+            Ok(_) => break done,
+            Err(now) => cur = now,
+        }
+    };
+    // Active (again): its event in the parent, if still queued, is stale.
+    group.groupevt.ignore.store(true, Ordering::SeqCst);
+    done
+}
+
+/// `tmigr_inactive_up`: the child (`child`, or the CPU when `None`) went
+/// inactive in `group`: clear its bit (unless a child group went active
+/// again meanwhile) and hand the migrator role on, then update the events.
+/// Returns whether the walk is done (the group still has a migrator).
+fn inactive_up(
+    group: &'static TmigrGroup,
+    child: Option<&'static TmigrGroup>,
+    w: &mut Walk,
+) -> bool {
+    let childmask = w.childmask;
+    let mut cur = group.migr_state.load(Ordering::Acquire);
+    let done = loop {
+        let child_active = child.is_some_and(|c| c.migr().active != 0);
+        let mut s = MigrState::unpack(cur);
+        let mut done = true;
+        if !child_active {
+            s.active &= !childmask;
+            if s.migrator == childmask {
+                if s.active != 0 {
+                    s.migrator = 1 << s.active.trailing_zeros();
+                } else {
+                    s.migrator = TMIGR_NONE;
+                    done = false;
+                }
+            }
+        }
+        s.seq = s.seq.wrapping_add(1);
+        match group
+            .migr_state
+            .compare_exchange(cur, s.pack(), Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => break done,
+            Err(now) => cur = now,
+        }
+    };
+    w.remote = false;
+    let _ = update_events(group, child, w);
+    done
+}
+
+/// `tmigr_update_events`: carry the child's first event into `group`'s
+/// queue — the CPU's `w.nextexp`, or the child group's first event — and,
+/// at an inactive root, report the first event of all. Returns whether a
+/// walk of event updates is done.
+fn update_events(
+    group: &'static TmigrGroup,
+    child: Option<&'static TmigrGroup>,
+    w: &mut Walk,
+) -> bool {
+    let mut done = false;
+    let (_child_guard, mut g, evt, nextexp, cpu, ignore) = match child {
+        Some(child) => {
+            // Child, then parent: no walk can carry an older view of the
+            // child up while this one holds the child's lock.
+            let mut cg = child.lock();
+            let g = group.lock();
+            let first = child.next_groupevt(&mut cg);
+            let (nextexp, cpu) =
+                first.map_or((NONE, 0), |e| (e.expires(), e.cpu.load(Ordering::Relaxed)));
+            let ignore = nextexp == NONE;
+            // Store, then read the state (both SeqCst), against
+            // `active_up`'s state CAS, then store: whichever order they
+            // interleave in, an active child's event ends up ignored.
+            child.groupevt.ignore.store(ignore, Ordering::SeqCst);
+            if MigrState::unpack(child.migr_state.load(Ordering::SeqCst)).active != 0 {
+                // It went active: its migrator handles its events.
+                child.groupevt.ignore.store(true, Ordering::SeqCst);
+                return true;
+            }
+            (Some(cg), g, &child.groupevt, nextexp, cpu, ignore)
+        }
+        None => {
+            let ignore = w.evt.ignore.load(Ordering::Acquire);
+            // Without a remote expiry before, the next level's walk takes
+            // an ignored CPU event out (it re-reads this group).
+            if ignore && !w.remote && group.parent().is_some() {
+                return true;
+            }
+            (None, group.lock(), w.evt, w.nextexp, w.cpu, ignore)
+        }
+    };
+    let gs = group.migr();
+    let unchanged = evt.queued.load(Ordering::Relaxed) && evt.expires() == nextexp && !ignore;
+    if unchanged {
+        evt.cpu.store(cpu, Ordering::Relaxed);
+    } else {
+        dequeue(&mut g, evt);
+        if ignore {
+            // Nothing to carry up unless a remote expiry took an event out
+            // of an inactive group (it must be recomputed up the tree).
+            if !w.remote || gs.active != 0 {
+                done = true;
+            }
+        } else {
+            enqueue(&mut g, evt, nextexp, cpu);
+        }
+    }
+    let first = group.next_groupevt(&mut g);
+    if group.parent().is_none() && gs.migrator == TMIGR_NONE {
+        done = true;
+        if !w.remote {
+            w.firstexp = first.map_or(NONE, |e| e.expires());
+        }
+    }
+    done
+}
+
+/// One hierarchy. The kernel's is [`static@TMIGR`]; tests build private
+/// ones over CPU indices that never came online.
 pub struct Tmigr {
     cpus: [AtomicPtr<TmigrCpu>; MAX_CPUS],
     /// Every group, for find-or-create when a CPU comes online.
@@ -364,15 +585,25 @@ impl Tmigr {
     pub fn cpu_offline(&self, cpu: usize) {
         let Some(tmc) = self.tmc(cpu) else { return };
         let mut st = tmc.state.lock();
-        st.idle = true;
-        tmc.idle.store(true, Ordering::Release);
-        let _ = Self::walk_inactive(tmc, NONE);
+        if !st.online {
+            return;
+        }
+        if st.idle {
+            // As after a remote expiry: recompute every inactive group up
+            // the tree, so none keeps an event of an offline CPU.
+            let _ = Self::walk_new_timer(tmc, NONE, true);
+        } else {
+            st.idle = true;
+            tmc.idle.store(true, Ordering::Release);
+            let _ = Self::walk_inactive(tmc, NONE);
+        }
         tmc.wakeup.store(NONE, Ordering::Release);
         st.online = false;
     }
 
     /// `tmigr_cpu_activate`: `cpu` left idle; it handles its own timers and,
-    /// in a group without a migrator, becomes it (`tmigr_active_up`).
+    /// in a group without a migrator, becomes it (`tmigr_active_up`). No
+    /// group lock: its queued events are only marked ignored.
     pub fn activate(&self, cpu: usize) {
         let Some(tmc) = self.tmc(cpu) else { return };
         let mut st = tmc.state.lock();
@@ -381,27 +612,13 @@ impl Tmigr {
         }
         st.idle = false;
         tmc.idle.store(false, Ordering::Release);
+        tmc.cpuevt.ignore.store(true, Ordering::Release);
         tmc.wakeup.store(NONE, Ordering::Release);
         let mut group = tmc.group;
         let mut childmask = tmc.groupmask;
-        let mut child_evt = &tmc.cpuevt;
-        loop {
-            let mut g = group.lock();
-            // An active child handles its own events.
-            requeue(&mut g, child_evt, NONE, 0);
-            let was_inactive = g.migrator == TMIGR_NONE;
-            g.active |= childmask;
-            if was_inactive {
-                g.migrator = childmask;
-            }
-            publish(group, &g);
-            drop(g);
-            if !was_inactive {
-                break;
-            }
+        while !active_up(group, childmask) {
             let Some(parent) = group.parent() else { break };
             childmask = group.groupmask.load(Ordering::Relaxed);
-            child_evt = &group.groupevt;
             group = parent;
         }
         drop(st);
@@ -418,53 +635,69 @@ impl Tmigr {
         if !st.online {
             return None;
         }
-        st.idle = true;
-        tmc.idle.store(true, Ordering::Release);
-        let wake = Self::walk_inactive(tmc, nextexp);
+        let wake = if st.idle {
+            if st.remote {
+                // The migrator expiring us requeues our next event.
+                return Some(tmc.wakeup.load(Ordering::Acquire));
+            }
+            Self::walk_new_timer(tmc, nextexp, false)
+        } else {
+            st.idle = true;
+            tmc.idle.store(true, Ordering::Release);
+            Self::walk_inactive(tmc, nextexp)
+        };
         tmc.wakeup.store(wake, Ordering::Release);
         drop(st);
         Some(wake)
     }
 
-    /// Walk up from idle `tmc` with its next global event `nextexp`
-    /// (`tmigr_inactive_up` + `tmigr_update_events`): requeue the event,
-    /// hand the migrator role on, and continue while groups are left without
-    /// a migrator. Returns the root's first event if the walk reached an
-    /// inactive root, else `NONE`. `tmc`'s lock is held.
+    /// `__tmigr_cpu_deactivate`: walk `tmigr_inactive_up` from `tmc` with
+    /// its next global event. Returns the root's first event if the walk
+    /// left the root inactive, else `NONE`. `tmc`'s lock is held.
     fn walk_inactive(tmc: &'static TmigrCpu, nextexp: u64) -> u64 {
+        tmc.cpuevt.ignore.store(nextexp == NONE, Ordering::Release);
+        let mut w = Walk {
+            nextexp,
+            firstexp: NONE,
+            evt: &tmc.cpuevt,
+            cpu: tmc.cpu,
+            childmask: tmc.groupmask,
+            remote: false,
+        };
         let mut group = tmc.group;
-        let mut childmask = tmc.groupmask;
-        let mut g = group.lock();
-        requeue(&mut g, &tmc.cpuevt, nextexp, tmc.cpu);
-        loop {
-            g.active &= !childmask;
-            if g.migrator == childmask {
-                g.migrator = if g.active != 0 {
-                    1 << g.active.trailing_zeros()
-                } else {
-                    TMIGR_NONE
-                };
-            }
-            publish(group, &g);
-            if g.migrator != TMIGR_NONE {
-                // Still active: its migrator handles the events here.
-                return NONE;
-            }
-            let (first, first_cpu) = first_event(&g);
-            let Some(parent) = group.parent() else {
-                // The root is inactive: the caller is (or stands in for) the
-                // last active CPU and wakes for the first global timer.
-                return first;
-            };
-            // Hand over hand: the child's view goes up while its lock is
-            // held, so no walk can overwrite the parent with an older view.
-            let mut pg = parent.lock();
-            requeue(&mut pg, &group.groupevt, first, first_cpu);
-            drop(g);
-            childmask = group.groupmask.load(Ordering::Relaxed);
+        let mut child = None;
+        while !inactive_up(group, child, &mut w) {
+            let Some(parent) = group.parent() else { break };
+            w.childmask = group.groupmask.load(Ordering::Relaxed);
+            child = Some(group);
             group = parent;
-            g = pg;
         }
+        w.firstexp
+    }
+
+    /// `tmigr_new_timer_up` walk from idle `tmc`: requeue its next global
+    /// event (after a remote expiry when `remote`) up through inactive
+    /// groups. Returns the root's first event as [`Self::walk_inactive`].
+    /// `tmc`'s lock is held.
+    fn walk_new_timer(tmc: &'static TmigrCpu, nextexp: u64, remote: bool) -> u64 {
+        tmc.cpuevt.ignore.store(nextexp == NONE, Ordering::Release);
+        let mut w = Walk {
+            nextexp,
+            firstexp: NONE,
+            evt: &tmc.cpuevt,
+            cpu: tmc.cpu,
+            childmask: tmc.groupmask,
+            remote,
+        };
+        let mut group = tmc.group;
+        let mut child = None;
+        while !update_events(group, child, &mut w) {
+            let Some(parent) = group.parent() else { break };
+            w.childmask = group.groupmask.load(Ordering::Relaxed);
+            child = Some(group);
+            group = parent;
+        }
+        w.firstexp
     }
 
     /// Whether `cpu` is active (not deactivated). A CPU outside the
@@ -492,8 +725,7 @@ impl Tmigr {
         let mut group = tmc.group;
         let mut childmask = tmc.groupmask;
         loop {
-            let m = group.migrator.load(Ordering::Acquire);
-            if m != childmask && m != TMIGR_NONE {
+            if !group.check_migrator(childmask) {
                 return next;
             }
             next = next.min(group.next_expiry.load(Ordering::Acquire));
@@ -517,8 +749,7 @@ impl Tmigr {
         let mut group = tmc.group;
         let mut childmask = tmc.groupmask;
         loop {
-            let m = group.migrator.load(Ordering::Acquire);
-            if m != childmask && m != TMIGR_NONE {
+            if !group.check_migrator(childmask) {
                 return false;
             }
             if group.next_expiry.load(Ordering::Acquire) <= now {
@@ -545,57 +776,67 @@ impl Tmigr {
         let mut group = tmc.group;
         let mut childmask = tmc.groupmask;
         let mut firstexp = NONE;
-        loop {
-            // `tmigr_check_migrator`.
-            let m = group.migrator.load(Ordering::Acquire);
-            if m != childmask && m != TMIGR_NONE {
-                break;
-            }
+        let reached_root = 'up: loop {
+            // `tmigr_handle_remote_up`.
             loop {
-                let mut g = group.lock();
-                let (exp, remote) = first_event(&g);
-                if exp > now {
-                    firstexp = exp;
-                    break;
+                if !group.check_migrator(childmask) {
+                    break 'up false;
                 }
-                // `tmigr_next_expired_groupevt`: pop it; handling the CPU
-                // requeues that CPU's next event up the tree.
-                let n = g.events.first();
-                // SAFETY: the queue is non-empty (`exp != NONE`); linked
-                // events are live.
-                let evt = unsafe { &*TmigrEvent::from_node(n) };
-                requeue(&mut g, evt, NONE, 0);
-                publish(group, &g);
-                drop(g);
-                ran += self.handle_remote_cpu(remote as usize);
+                let mut g = group.lock();
+                match group.next_expired_groupevt(&mut g, now) {
+                    Some(evt) => {
+                        let remote = evt.cpu.load(Ordering::Relaxed);
+                        drop(g);
+                        ran += self.handle_remote_cpu(remote as usize, now);
+                    }
+                    None => {
+                        firstexp = group.next_expiry.load(Ordering::Acquire);
+                        break;
+                    }
+                }
             }
-            let Some(parent) = group.parent() else { break };
+            let Some(parent) = group.parent() else {
+                break 'up true;
+            };
             childmask = group.groupmask.load(Ordering::Relaxed);
             group = parent;
+        };
+        let st = tmc.state.lock();
+        if st.idle {
+            // Still the hierarchy's last idle CPU: wake for its first event.
+            let wake = if reached_root { firstexp } else { NONE };
+            tmc.wakeup.store(wake, Ordering::Release);
         }
-        if tmc.idle.load(Ordering::Acquire) {
-            tmc.wakeup.store(firstexp, Ordering::Release);
-        }
+        drop(st);
         ran
     }
 
     /// `tmigr_handle_remote_cpu`: run idle `cpu`'s due global timers here and
     /// requeue its next one. Returns the callbacks run.
-    fn handle_remote_cpu(&self, cpu: usize) -> u64 {
+    fn handle_remote_cpu(&self, cpu: usize, now: u64) -> u64 {
         let Some(tmc) = self.tmc(cpu) else { return 0 };
         {
             let mut st = tmc.state.lock();
-            // Active: it handles its own. Remote: another migrator is at it.
-            if !st.online || st.remote || !st.idle {
+            // Active (ignored event): it handles its own. Remote: another
+            // migrator is at it. Not due: its event moved meanwhile.
+            if !st.online
+                || st.remote
+                || !st.idle
+                || tmc.cpuevt.ignore.load(Ordering::Acquire)
+                || now < tmc.cpuevt.expires()
+            {
                 return 0;
             }
             st.remote = true;
+            tmc.wakeup.store(NONE, Ordering::Release);
         }
         let ran = crate::timer::expire_remote_global(cpu);
-        let next = crate::timer::global_next(cpu);
         let mut st = tmc.state.lock();
-        if st.idle {
-            let _ = Self::walk_inactive(tmc, next);
+        if st.online && st.idle {
+            // Even with no next timer: the walk recomputes the inactive
+            // groups this expiry took an event out of.
+            let next = crate::timer::global_next(cpu);
+            let _ = Self::walk_new_timer(tmc, next, true);
         }
         st.remote = false;
         ran
@@ -604,7 +845,7 @@ impl Tmigr {
     /// Whether `cpu` is the migrator of its level-0 group (tests).
     pub fn is_group_migrator(&self, cpu: usize) -> bool {
         self.tmc(cpu)
-            .is_some_and(|t| t.group.migrator.load(Ordering::Acquire) == t.groupmask)
+            .is_some_and(|t| t.group.migr().migrator == t.groupmask)
     }
 
     /// Level-0 group of `cpu`, as an opaque identity (tests: who shares).
@@ -641,8 +882,8 @@ impl Tmigr {
             .fold(0, |m, c| m | 1 << c)
     }
 
-    /// Check every group: queue shape, and migrator ⇔ some child active
-    /// (test-only).
+    /// Check every group of a quiescent hierarchy: queue shape, and
+    /// migrator ⇔ some child active (test-only).
     #[doc(hidden)]
     pub fn __validate(&self) -> Result<usize, &'static str> {
         let groups = self.groups.lock();
@@ -651,10 +892,11 @@ impl Tmigr {
             let st = g.lock();
             // SAFETY: the group lock is held.
             n += unsafe { st.events.__validate()? };
-            if st.migrator != TMIGR_NONE && st.active & st.migrator == 0 {
+            let s = g.migr();
+            if s.migrator != TMIGR_NONE && s.active & s.migrator == 0 {
                 return Err("a group's migrator is not one of its active children");
             }
-            if (st.migrator == TMIGR_NONE) != (st.active == 0) {
+            if (s.migrator == TMIGR_NONE) != (s.active == 0) {
                 return Err("a group with active children has no migrator");
             }
         }
