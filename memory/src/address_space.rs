@@ -15203,6 +15203,59 @@ impl Default for AddressSpace {
     }
 }
 
+impl AddressSpace {
+    /// Teardown of the swap entries a dropped address space still owns.
+    ///
+    /// A large pressure victim can own hundreds of thousands of swap entries.
+    /// Teardown must free them without first allocating region-sized VA and
+    /// SwapPte vectors from the already exhausted heap, so it works in fixed
+    /// on-stack batches, each one root-lock transaction and one backend
+    /// retirement. Out of line and kept small (64 pages, 2 KiB of batch state):
+    /// `Drop` can run from the scheduler's wake path when a parked slot holds
+    /// the last `Arc<AddressSpace>`, and a 512-page batch inlined into `Drop`
+    /// made its frame 18 KiB — over half a kernel stack, paid by every drop
+    /// whether or not anything was swapped.
+    #[cfg(target_arch = "x86_64")]
+    #[cold]
+    #[inline(never)]
+    fn drop_swap_entries(&self, regions: &mut RegionTable) {
+        const SWAP_TEARDOWN_BATCH: usize = 64;
+        const _: () = assert!(SWAP_TEARDOWN_BATCH <= crate::swap::SWAP_BATCH_PAGES_MAX);
+        let mut pages = [VirtAddr::new(0); SWAP_TEARDOWN_BATCH];
+        let mut entries = [crate::swap::SwapPte {
+            swap_type: 0,
+            offset: 0,
+        }; SWAP_TEARDOWN_BATCH];
+        let mut slots = [crate::swap::SwapSlot::NONE; SWAP_TEARDOWN_BATCH];
+        while !regions.swap_pages.is_empty() {
+            let mut count = 0usize;
+            for (&va, state) in regions.swap_pages.iter().rev().take(SWAP_TEARDOWN_BATCH) {
+                assert_eq!(
+                    *state,
+                    SwapPageState::Swapped,
+                    "address space dropped during a swap ownership transition"
+                );
+                pages[count] = VirtAddr::new(va);
+                count += 1;
+            }
+            // SAFETY: Drop has exclusive ownership of this live root; the
+            // stable records remain pinned until removed below.
+            unsafe {
+                crate::swap::take_swap_entries_into(
+                    self.root,
+                    &pages[..count],
+                    &mut entries[..count],
+                )
+            }
+            .expect("stable swapped page lost its swap PTE before drop");
+            for page in &pages[..count] {
+                regions.swap_pages.remove(&page.as_u64());
+            }
+            crate::swap::swap_discard_batch_noalloc(&mut entries[..count], &mut slots[..count]);
+        }
+    }
+}
+
 impl Drop for AddressSpace {
     /// Process-exit teardown: log + (eventually) release every
     /// still-mapped region's data frames, free the per-AS page-
@@ -15281,48 +15334,8 @@ impl Drop for AddressSpace {
             #[cfg(target_arch = "x86_64")]
             let mut regions = regions;
             #[cfg(target_arch = "x86_64")]
-            {
-                // A large pressure victim can own hundreds of thousands of
-                // swap entries. Teardown must free them without first
-                // allocating region-sized VA and SwapPte vectors from the
-                // already exhausted heap. Fixed batches preserve one root-lock
-                // transaction and one backend retirement per bounded window.
-                const SWAP_TEARDOWN_BATCH: usize = crate::swap::SWAP_BATCH_PAGES_MAX;
-                let mut pages = [VirtAddr::new(0); SWAP_TEARDOWN_BATCH];
-                let mut entries = [crate::swap::SwapPte {
-                    swap_type: 0,
-                    offset: 0,
-                }; SWAP_TEARDOWN_BATCH];
-                let mut slots = [crate::swap::SwapSlot::NONE; SWAP_TEARDOWN_BATCH];
-                while !regions.swap_pages.is_empty() {
-                    let mut count = 0usize;
-                    for (&va, state) in regions.swap_pages.iter().rev().take(SWAP_TEARDOWN_BATCH) {
-                        assert_eq!(
-                            *state,
-                            SwapPageState::Swapped,
-                            "address space dropped during a swap ownership transition"
-                        );
-                        pages[count] = VirtAddr::new(va);
-                        count += 1;
-                    }
-                    // SAFETY: Drop has exclusive ownership of this live root;
-                    // the stable records remain pinned until removed below.
-                    unsafe {
-                        crate::swap::take_swap_entries_into(
-                            self.root,
-                            &pages[..count],
-                            &mut entries[..count],
-                        )
-                    }
-                    .expect("stable swapped page lost its swap PTE before drop");
-                    for page in &pages[..count] {
-                        regions.swap_pages.remove(&page.as_u64());
-                    }
-                    crate::swap::swap_discard_batch_noalloc(
-                        &mut entries[..count],
-                        &mut slots[..count],
-                    );
-                }
+            if !regions.swap_pages.is_empty() {
+                self.drop_swap_entries(&mut regions);
             }
 
             if self.root.as_u64() != 0 {
