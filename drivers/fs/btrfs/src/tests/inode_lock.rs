@@ -66,7 +66,44 @@ fn long_file(
     Ok((vol, file))
 }
 
-/// A truncate over many extents takes the volume's operation lock one step
+/// A truncate's steps do not wait in the operation queue: with `op_lock`
+/// held (operations queued for it), a truncate over many extents still
+/// runs to the end, a step at a time, as an `fsync` would (Linux's
+/// `btrfs_truncate` joins the running transaction per step instead of
+/// queueing behind every writer of the filesystem).
+fn smoke_btrfs_truncate_steps_skip_the_operation_queue() -> TestResult {
+    let (vol, long) = match long_file("queued", 2000) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let Some(queue) = poll_once(vol.op_lock().lock()) else {
+        return TestResult::Fail("lock: operation queue busy");
+    };
+    let mut truncate = long.truncate(0);
+    let mut polls = 0u32;
+    let done = loop {
+        polls += 1;
+        if let Some(result) = poll_step(&mut truncate) {
+            break result;
+        }
+        if polls > 1_000_000 {
+            return TestResult::Fail("lock: the truncate waited in the operation queue");
+        }
+    };
+    drop(truncate);
+    drop(queue);
+    if done.is_err() || !matches!(poll_once(long.stat_async()), Some(Ok(stat)) if stat.size == 0) {
+        return TestResult::Fail("lock: the truncate failed");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_truncate_steps_skip_the_operation_queue
+);
+
+/// A truncate over many extents excludes the running operation one step
 /// at a time and yields between steps (Linux ends its transaction and may
 /// reschedule there), so a write, a read and a stat of another file
 /// complete while it is in progress; before, the whole truncate held the

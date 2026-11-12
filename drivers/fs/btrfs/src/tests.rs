@@ -23,6 +23,7 @@ mod cache_bounds;
 mod commit_scale;
 mod data_cache;
 mod extent_window;
+mod group_commit;
 mod grow_tall;
 mod inode_lock;
 mod overwrite_cost;
@@ -32,7 +33,6 @@ mod safety;
 mod snapshot_gen;
 mod snapshots;
 mod two_handles;
-mod group_commit;
 mod write_buffers;
 
 // ── Shared test harness ────────────────────────────────────────────
@@ -3426,7 +3426,9 @@ fn check_queued_mutation_cache_epoch(kind: u8) -> TestResult {
     if !matches!(poll_once(file.write(0, &old)), Some(Ok(8192))) {
         return TestResult::Fail("cache epoch file seed failed");
     }
-    let held = match poll_once(vol.op_lock().lock()) {
+    // The lock every mutation holds while it runs, whole operations and a
+    // truncate's or fallocate's steps alike.
+    let held = match poll_once(vol.commit_excl().lock()) {
         Some(held) => held,
         None => return TestResult::Fail("cache epoch operation lock busy"),
     };
