@@ -5812,6 +5812,10 @@ pub fn poll_one_round() -> usize {
         0
     };
 
+    // An executor round is this CPU's softirq context: expire its due
+    // hrtimers (soft ones, and hard ones whose interrupt has not been taken —
+    // a caller driving rounds with interrupts masked gets no timer interrupt).
+    let _ = narf_time::hrtimer::hrtimer_run_softirq();
     // Fold any cross-core wakes into READY first (Linux `sched_ttwu_pending`)
     // so a remote-pushed task is visited this round.
     drain_wake_list(cpu);
