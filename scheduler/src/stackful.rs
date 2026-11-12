@@ -368,19 +368,32 @@ const STACK_DEPTH_REPORT_BYTES: usize = 24 * 1024;
 /// unwinds; symbolise `+off` with addr2line). Runs at release, never on the
 /// path that went deep, so it cannot perturb it. Feeds the stack sizing in
 /// `DEFAULT_KERNEL_STACK_BYTES`.
+/// The kernel image's text range, for telling return addresses from data.
+/// Hosted builds (the btrfs host harness) link without the kernel linker
+/// script, so there is no text range and nothing is reported as one.
+#[cfg(target_os = "none")]
+fn kernel_text_range() -> (u64, u64) {
+    extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+    }
+    (
+        core::ptr::addr_of!(__text_start) as u64,
+        core::ptr::addr_of!(__text_end) as u64,
+    )
+}
+
+#[cfg(not(target_os = "none"))]
+fn kernel_text_range() -> (u64, u64) {
+    (0, 0)
+}
+
 fn note_released_stack_depth(stack: &KernelStack, used: usize) {
     if used < STACK_DEPTH_REPORT_BYTES || used <= STACK_DEPTH_MAX.fetch_max(used, Ordering::Relaxed)
     {
         return;
     }
-    extern "C" {
-        static __text_start: u8;
-        static __text_end: u8;
-    }
-    let (ts, te) = (
-        core::ptr::addr_of!(__text_start) as u64,
-        core::ptr::addr_of!(__text_end) as u64,
-    );
+    let (ts, te) = kernel_text_range();
     narf_console::klog!(
         "KSTACK-DEPTH record: {} of {} bytes (stack {:#x}); deepest return addresses:",
         used,
