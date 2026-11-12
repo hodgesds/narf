@@ -74,33 +74,46 @@ kernel_test_in!("scheduler", smoke_scheduler_parked_idle_leaves_rcu_census);
 /// held, and the CPU spun forever with interrupts masked (every other CPU
 /// then stalled on its TLB-shootdown ack). The nested round must leave the
 /// CPU's quiescent state untouched; a top-level round must still report.
+///
+/// Measured on the CPU's reported epoch, opened one ahead of it: a nested
+/// round must leave it behind, a top-level round must catch it up. (The
+/// quiescent timestamp is no proxy: a poll on an idle CPU rejoins the census
+/// before it runs — `narf_rcu::exit_idle` — without reporting quiescence.)
 fn smoke_scheduler_nested_round_is_not_quiescent() -> TestResult {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static POLLED: AtomicUsize = AtomicUsize::new(0);
     let cpu = narf_lib::percpu::current_cpu();
-    if cpu >= 64 {
-        return TestResult::Skip("current CPU is outside watchdog mask");
-    }
-    let bit = 1u64 << cpu;
     crate::__reset_queues_for_test();
     POLLED.store(0, Ordering::Relaxed);
 
-    // Inactive: no published quiescent timestamp on this CPU.
-    crate::report_parked_queue_idle();
+    // This CPU reports epoch `e`; then a retirement opens `e + 1` without it.
+    let behind = || {
+        narf_rcu::report_quiescent();
+        let reported = narf_rcu::__test_last_quiescent(cpu);
+        {
+            let guard = narf_rcu::pin();
+            narf_rcu::defer_drop(narf_rcu::Owned::new(0u64), &guard);
+        }
+        narf_rcu::advance_epoch_if_pending();
+        reported
+    };
+
+    let reported = behind();
     crate::spawn(async {
         POLLED.fetch_add(1, Ordering::Relaxed);
     });
     let _ = crate::poll_one_round_nested();
-    let nested_reported = narf_rcu::stalled_cpu_mask(u64::MAX, 1) & bit != 0;
+    let nested_reported = narf_rcu::__test_last_quiescent(cpu) != reported;
     let nested_polled = POLLED.load(Ordering::Relaxed);
 
     // A top-level round is a quiescent point and must still report one.
-    crate::report_parked_queue_idle();
+    let reported = behind();
     crate::spawn(async {
         POLLED.fetch_add(1, Ordering::Relaxed);
     });
     let _ = crate::poll_one_round();
-    let top_reported = narf_rcu::stalled_cpu_mask(u64::MAX, 1) & bit != 0;
+    let after = narf_rcu::__test_last_quiescent(cpu);
+    let top_reported = after != reported && after != u64::MAX;
 
     crate::__reset_queues_for_test();
     narf_rcu::report_quiescent();
@@ -115,7 +128,10 @@ fn smoke_scheduler_nested_round_is_not_quiescent() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_nested_round_is_not_quiescent);
+kernel_test_in!(
+    "scheduler/rcu_idle",
+    smoke_scheduler_nested_round_is_not_quiescent
+);
 
 /// An idle CPU leaves the QSBR census (`report_idle` publishes the
 /// "inactive" sentinel, past every epoch). When it wakes, it must rejoin the

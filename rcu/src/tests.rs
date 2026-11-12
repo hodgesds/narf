@@ -1153,3 +1153,50 @@ fn smoke_rcu_sync_waits_for_a_real_grace_period() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("rcu", smoke_rcu_sync_waits_for_a_real_grace_period);
+
+/// Interrupt and NMI entry on an idle CPU rejoin the grace-period census and
+/// return to idle on exit; an entry nested inside one that rejoined (an NMI
+/// in an interrupt) changes nothing, and an entry on a CPU that is not idle
+/// changes nothing either. `exit_idle` rejoins and stays rejoined.
+fn smoke_rcu_idle_exit_and_interrupt_entry_nest() -> TestResult {
+    let cpu = narf_lib::percpu::current_cpu();
+    let word = || crate::__test_last_quiescent(cpu);
+    let result = narf_lib::sync::without_interrupts(|| {
+        crate::report_idle();
+        if word() != u64::MAX {
+            return Err("report_idle did not leave the census");
+        }
+        let outer = crate::IrqEntry::enter();
+        let rejoined = word();
+        if rejoined == u64::MAX || rejoined > crate::qsbr::global_epoch() {
+            return Err("interrupt entry on an idle CPU did not adopt the live epoch");
+        }
+        let nested = crate::IrqEntry::enter();
+        drop(nested);
+        if word() != rejoined {
+            return Err("a nested entry's exit took the CPU out from under its outer entry");
+        }
+        drop(outer);
+        if word() != u64::MAX {
+            return Err("interrupt exit did not return the idle CPU to idle");
+        }
+        if !crate::exit_idle() || word() == u64::MAX {
+            return Err("exit_idle did not rejoin an idle CPU");
+        }
+        let busy = crate::IrqEntry::enter();
+        drop(busy);
+        if word() == u64::MAX {
+            return Err("an interrupt on a CPU that was not idle sent it idle");
+        }
+        if crate::exit_idle() {
+            return Err("exit_idle reported a CPU that was not idle as idle");
+        }
+        Ok(())
+    });
+    crate::report_quiescent();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!("rcu", smoke_rcu_idle_exit_and_interrupt_entry_nest);

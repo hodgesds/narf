@@ -31,7 +31,7 @@
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use narf_lib::percpu::MAX_CPUS;
@@ -64,8 +64,9 @@ impl CpuCell {
     // Initial `last_quiescent = u64::MAX` means "this CPU is not active,
     // and therefore vacuously past every epoch". Offline / unscheduled
     // CPUs otherwise pin `min_last_quiescent` to 0 forever and block all
-    // reclamation. A CPU that comes online pulls this down to the
-    // current epoch on its first `pin()` or `report_quiescent()` call.
+    // reclamation. A CPU leaves that state through `exit_idle` (the
+    // executor before it runs anything, an interrupt on entry) before it
+    // reads anything RCU-protected.
     const NEW: Self = Self {
         active_readers: AtomicUsize::new(0),
         last_quiescent: AtomicU64::new(u64::MAX),
@@ -218,11 +219,87 @@ pub fn advance_epoch_if_pending() {
     }
 }
 
+/// Leave the idle state ("extended quiescent state") before running anything
+/// that may read RCU-protected data — Linux's `rcu_eqs_exit`. Returns whether
+/// this CPU was idle (its `last_quiescent` the inactive sentinel).
+///
+/// While idle a CPU counts as past every epoch, so a grace period completes
+/// without it. A reader that ran on it before it rejoined the census would be
+/// invisible: an object it loaded could be freed under it. Rejoining is a
+/// fully ordered handshake with the retire side ([`defer_node`]) and the
+/// reclaim side ([`min_last_quiescent`], [`all_cpus_past`]), each of which
+/// fences before reading the other side's word:
+///
+/// - the epoch is read with a read-modify-write and the adoption stored, then
+///   a full fence, all before the caller's first RCU load;
+/// - a retirer fences between unpublishing an object and reading the epoch it
+///   stamps it with; a reclaimer fences before scanning `last_quiescent`.
+///
+/// So either the reader's load sees the object already unpublished, or the
+/// reclaimer sees the adopted epoch — which is at most the object's stamp, so
+/// the object waits for this CPU's next quiescent report.
+#[inline]
+pub fn exit_idle() -> bool {
+    let rejoined = rejoin_census();
+    if rejoined {
+        this_cpu()
+            .last_quiescent_ns
+            .store(narf_time::monotonic_ns(), Ordering::Release);
+    }
+    rejoined
+}
+
+/// [`exit_idle`] for interrupt and NMI entry (Linux `rcu_irq_enter` /
+/// `rcu_nmi_enter`): the same handshake, without the stall-detector
+/// timestamp, so it takes no lock and reads no clock. Safe in NMI context and
+/// when nested anywhere — inside an interrupt, inside [`exit_idle`],
+/// [`report_idle`] or [`reenter_idle`] on this CPU:
+///
+/// - only a CPU at the idle sentinel rejoins, so an entry nested in a context
+///   that already rejoined does nothing, and its exit does nothing either;
+/// - an entry that lands between another path's sentinel check and its store
+///   rejoins and restores the sentinel before that path resumes, which then
+///   completes its own transition exactly as if uninterrupted.
+///
+/// While the stamp stays zero the stall detector ignores the CPU, which is
+/// what it does for an idle CPU anyway.
+#[inline]
+pub fn exit_idle_from_interrupt() -> bool {
+    rejoin_census()
+}
+
+#[inline]
+fn rejoin_census() -> bool {
+    let cell = this_cpu();
+    if cell.last_quiescent.load(Ordering::Relaxed) != u64::MAX {
+        return false;
+    }
+    let now = GLOBAL_EPOCH.fetch_add(0, Ordering::SeqCst);
+    cell.last_quiescent.store(now, Ordering::SeqCst);
+    fence(Ordering::SeqCst);
+    true
+}
+
+/// Return to the idle state after an interrupt or NMI that
+/// [`exit_idle_from_interrupt`] took this CPU out of — Linux's
+/// `rcu_irq_exit` / `rcu_nmi_exit` on an idle CPU. Lock-free and NMI-safe.
+/// The interrupted context was idle and holds no reader. A reader the
+/// handler left pinned keeps the CPU in the census instead.
+#[inline]
+pub fn reenter_idle() {
+    let cell = this_cpu();
+    if cell.active_readers.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    cell.last_quiescent.store(u64::MAX, Ordering::Release);
+    cell.last_quiescent_ns.store(0, Ordering::Release);
+}
+
 /// Declare that this CPU is going idle. Resets `last_quiescent` to
 /// the `u64::MAX` "inactive" sentinel so subsequent `sync()` calls
 /// don't wait on a CPU that may not poll again before its next
-/// wake. The CPU will re-adopt the live epoch on its first
-/// `report_quiescent` after wake. Drains the local bucket first so
+/// wake. The CPU must call [`exit_idle`] when it wakes, before it reads
+/// anything RCU-protected. Drains the local bucket first so
 /// any pending deferred drops are reclaimed before this CPU stops
 /// reporting.
 pub fn report_idle() {
@@ -405,6 +482,11 @@ pub(crate) fn defer_node(node: *mut DeferHdr) {
     if node.is_null() {
         return;
     }
+    // Order the caller's unpublish before the epoch read: a CPU leaving idle
+    // adopts the epoch and fences before its first RCU load (see
+    // `exit_idle`), so either it cannot load this object any more, or this
+    // read sees an epoch no older than the one it adopted.
+    fence(Ordering::SeqCst);
     let epoch = GLOBAL_EPOCH.load(Ordering::Acquire);
     let cell = this_cpu();
     // IRQ-masked: the per-CPU bucket is a lock-free `UnsafeCell`, but
@@ -513,6 +595,9 @@ fn drain_local_bucket(cell: &CpuCell, inline: bool) {
 }
 
 fn min_last_quiescent() -> u64 {
+    // Pairs with the fence in `exit_idle`: a CPU that rejoined the census
+    // before this scan is seen with its adopted epoch, not the idle sentinel.
+    fence(Ordering::SeqCst);
     let mut min = u64::MAX;
     for c in CPUS.iter() {
         let v = c.last_quiescent.load(Ordering::Acquire);
@@ -645,6 +730,8 @@ pub fn sync_until(deadline_ns: u64) -> bool {
 }
 
 fn all_cpus_past(target: u64) -> bool {
+    // Pairs with the fence in `exit_idle`, as in `min_last_quiescent`.
+    fence(Ordering::SeqCst);
     for c in CPUS.iter() {
         if c.last_quiescent.load(Ordering::Acquire) < target {
             return false;
