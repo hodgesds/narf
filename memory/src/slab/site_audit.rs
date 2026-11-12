@@ -457,4 +457,33 @@ mod tests {
         "memory/slab_sites",
         smoke_slab_site_audit_tracks_and_retires
     );
+
+    /// A buffer grown by repeated reallocation through the large sizes, then
+    /// dropped, leaves the heap estimate where it was: every realloc retires
+    /// the old block's record, and nothing is scaled by the wrong rate.
+    fn smoke_slab_site_audit_estimate_follows_realloc() -> TestResult {
+        const NOISE: u64 = 4 << 20; // other CPUs allocate meanwhile
+        let was = armed();
+        set_armed(true);
+        let (before, _) = totals();
+        let mut grown: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        for _ in 0..(1 << 20) / 4096 {
+            grown.extend_from_slice(&[0u8; 4096]);
+        }
+        let (during, _) = totals();
+        drop(grown);
+        let (after, _) = totals();
+        set_armed(was);
+        if during < before + (1 << 20) - NOISE.min(1 << 19) {
+            return TestResult::Fail("a live 1 MiB buffer is missing from the estimate");
+        }
+        if after > before + NOISE {
+            return TestResult::Fail("reallocated or freed blocks stayed in the estimate");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/slab_sites",
+        smoke_slab_site_audit_estimate_follows_realloc
+    );
 }
