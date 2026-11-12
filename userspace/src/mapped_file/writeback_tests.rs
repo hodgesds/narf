@@ -2504,3 +2504,55 @@ kernel_test_in!(
     "userspace/writeback",
     smoke_read_uses_clean_pages_without_an_entry_and_checks_them
 );
+
+/// The soak's "clean page differs from the file on read" lines: a fault
+/// read a page, a truncate into it (and its invalidation, which found
+/// nothing cached yet) ran, the file grew back, and only then did the fault
+/// publish what it had read — the old bytes past the cut, which the file
+/// now reads as zeros, kept in a clean page that a long-lived mapping made
+/// every read(2) use. A fill whose generation moved is not published; the
+/// fault reads again and publishes the file's current bytes.
+fn smoke_fill_racing_a_truncate_is_read_again() -> TestResult {
+    let fixture = Fixture::new(2);
+    fixture.store.bytes.lock().fill(0x77);
+    let ops = Arc::clone(fixture.ops());
+    // The fault's read, before the truncate.
+    let generation = ops.mmap_cache_generation();
+    let Ok(frame) = narf_memory::alloc_frame() else {
+        return TestResult::Fail("no frame");
+    };
+    let candidate = frame.start_address();
+    // SAFETY: a fresh, exclusively owned, identity-mapped frame.
+    unsafe { core::ptr::write_bytes(candidate.kernel_mut_ptr::<u8>(), 0x77, 4096) };
+    // The truncate into the page and the regrow land before it publishes.
+    let shrink = size_change_serialized(&ops, || run(ops.truncate(100))).flatten();
+    let grow = size_change_serialized(&ops, || run(ops.truncate(8192))).flatten();
+    if shrink != Some(Ok(())) || grow != Some(Ok(())) {
+        narf_memory::free_frame(frame);
+        return TestResult::Fail("the truncates failed");
+    }
+    // Rejected (and freed by the publication).
+    if super::super::publish_shared_file_pages_checked(&ops, 0, vec![candidate], generation, true)
+        .is_some()
+    {
+        return TestResult::Fail("a fill read before a truncate was published");
+    }
+    if fixture.cached(0).is_some() {
+        return TestResult::Fail("a rejected fill was left in the cache");
+    }
+    // The fault reads again.
+    let mut fixture = fixture;
+    let Some(pages) = fixture.map(0, 1) else {
+        return TestResult::Fail("could not map the test file");
+    };
+    let bytes = page_bytes(pages[0], 0, 4096);
+    fixture.unmap(&pages);
+    if bytes[..100].iter().any(|b| *b != 0x77) || bytes[100..].iter().any(|b| *b != 0) {
+        return TestResult::Fail("the second read did not see the truncate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_fill_racing_a_truncate_is_read_again
+);
