@@ -121,6 +121,74 @@ fn raise_gpm(io: &mut MciFixture, count: u32) {
         .insert(AR_MCI_INTERRUPT_RX_MSG_RAW, AR_MCI_INTERRUPT_RX_MSG_GPM);
 }
 
+/// Stage a BT profile-info GPM in `slot` (Linux byte layout:
+/// type/linkid/state/role/rate/votype at bytes 6..12, `T` LE u16 at
+/// bytes 12..13, `W`/`A` at bytes 14/15). One parameter per wire
+/// field, mirroring the 10-byte image.
+#[allow(clippy::too_many_arguments)]
+fn put_profile(
+    mci: &mut Mci,
+    slot: usize,
+    profile: u8,
+    handle: u8,
+    start: u8,
+    master: u8,
+    edr: u8,
+    voice_type: u8,
+    t: u16,
+    w: u8,
+    a: u8,
+) {
+    put_gpm(
+        mci,
+        slot,
+        GpmSubtype::CoexAgent as u8,
+        GpmCoexOpcode::BtProfileInfo as u8,
+        &[
+            (MCI_GPM_COEX_B_PROFILE_TYPE, profile),
+            (MCI_GPM_COEX_B_PROFILE_LINKID, handle),
+            (MCI_GPM_COEX_B_PROFILE_STATE, start),
+            (MCI_GPM_COEX_B_PROFILE_ROLE, master),
+            (MCI_GPM_COEX_B_PROFILE_RATE, edr),
+            (MCI_GPM_COEX_B_PROFILE_VOTYPE, voice_type),
+            (MCI_GPM_COEX_H_PROFILE_T, (t & 0xff) as u8),
+            (MCI_GPM_COEX_H_PROFILE_T + 1, (t >> 8) as u8),
+            (MCI_GPM_COEX_B_PROFILE_W, w),
+            (MCI_GPM_COEX_B_PROFILE_A, a),
+        ],
+    );
+}
+
+/// Stage a BT status-update GPM in `slot`.
+fn put_status(mci: &mut Mci, slot: usize, is_link: u8, handle: u8, is_critical: u8) {
+    put_gpm(
+        mci,
+        slot,
+        GpmSubtype::CoexAgent as u8,
+        GpmCoexOpcode::BtStatusUpdate as u8,
+        &[
+            (MCI_GPM_COEX_B_STATUS_TYPE, is_link),
+            (MCI_GPM_COEX_B_STATUS_LINKID, handle),
+            (MCI_GPM_COEX_B_STATUS_STATE, is_critical),
+        ],
+    );
+}
+
+/// Raise `count` staged GPM slots and run them through `get_isr` +
+/// `handle_interrupt`; `None` when no interrupt latched or the
+/// interrupt errored.
+fn pump_gpm(
+    io: &mut MciFixture,
+    btcoex: &mut btcoex::Btcoex,
+    count: u32,
+) -> Option<InterruptOutcome> {
+    raise_gpm(io, count);
+    if !get_isr(io, &mut btcoex.mci) {
+        return None;
+    }
+    handle_interrupt(io, &mut btcoex.mci).ok()
+}
+
 fn mci_message_exchange() -> TestResult {
     let (mut io, mut btcoex) = live();
     send_coex_version_query(&mut io, &mut btcoex.mci, true);
@@ -988,6 +1056,502 @@ fn mci_header_values() -> TestResult {
     TestResult::Pass
 }
 
+fn mci_bt_profile_list() -> TestResult {
+    // Profile-type decoding (`ar9003_mci.h` enum order).
+    if GpmCoexProfile::from_u8(5) != Some(GpmCoexProfile::Voice)
+        || GpmCoexProfile::from_u8(7).is_some()
+        || GpmCoexProfile::from_u8(8).is_some()
+        || GpmCoexProfile::Voice as u8 != 5
+        || GpmCoexProfile::Max as u8 != 7
+    {
+        return TestResult::Fail("GpmCoexProfile decoding is wrong");
+    }
+    // Single SCO, T=12: the 10-byte payload image parses field for
+    // field and the scheme picks duty 50 / aggr 8 / period 20.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 5, 0, 1, 1, 0, 6, 12, 3, 2);
+    // The staged slot is pinned byte-for-byte against the Linux
+    // layout (`ar9003_mci.h` offsets 6..16).
+    if btcoex.mci.gpm_buf[6..16] != [5, 0, 1, 1, 0, 6, 12, 0, 3, 2] {
+        return TestResult::Fail("profile GPM slot bytes do not match the Linux layout");
+    }
+    let Some(outcome) = pump_gpm(&mut io, &mut btcoex, 1) else {
+        return TestResult::Fail("profile GPM did not pump");
+    };
+    if outcome.gpm_seen != 1 {
+        return TestResult::Fail("profile GPM was not seen");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_sco != 1 || profiles.num_profiles() != 1 {
+        return TestResult::Fail("SCO profile was not counted");
+    }
+    let Some(entry) = profiles.entries[0] else {
+        return TestResult::Fail("SCO profile entry is missing");
+    };
+    if entry.profile != GpmCoexProfile::Voice
+        || entry.conn_handle != 0
+        || !entry.start
+        || !entry.master
+        || entry.edr
+        || entry.voice_type != 6
+        || entry.t != 12
+        || entry.w != 3
+        || entry.a != 2
+    {
+        return TestResult::Fail("profile payload did not parse field for field");
+    }
+    if profiles.voice_priority != 114 {
+        return TestResult::Fail("voice priority is not table[6] = 114");
+    }
+    if profiles.duty_cycle != 50
+        || profiles.btcoex_period != 20
+        || profiles.bt_stomp_type != btcoex::StompType::Low
+        || profiles.aggr_limit != 8
+        || profiles.btcoex_no_stomp != 10
+        || profiles.concur_txprio != [114, 114, 114, 0, 0]
+    {
+        return TestResult::Fail("single-SCO scheme is wrong");
+    }
+    // Voice type out of range falls back to priority 110.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 5, 0, 1, 0, 0, 9, 6, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("voice-type-9 GPM did not pump");
+    }
+    if btcoex.mci.profiles.voice_priority != 110 {
+        return TestResult::Fail("voice type >= 9 did not fall back to 110");
+    }
+    // T=6 SCO: duty 30, aggr 6.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 5, 0, 1, 0, 0, 0, 6, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("T=6 SCO GPM did not pump");
+    }
+    if btcoex.mci.profiles.duty_cycle != 30 || btcoex.mci.profiles.aggr_limit != 6 {
+        return TestResult::Fail("T=6 SCO scheme is wrong");
+    }
+    // Type change on a known handle (A2DP -> HID in one interrupt),
+    // then the stop: the entry is dropped and the scheme returns to
+    // the empty-list duty 55.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 2, 3, 1, 0, 1, 0, 0, 0, 0);
+    put_profile(&mut btcoex.mci, 1, 3, 3, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 2).is_none() {
+        return TestResult::Fail("type-change GPMs did not pump");
+    }
+    if btcoex.mci.profiles.num_a2dp != 0 || btcoex.mci.profiles.num_hid != 1 {
+        return TestResult::Fail("type change did not move the count");
+    }
+    if btcoex.mci.profiles.duty_cycle != 30 || btcoex.mci.profiles.aggr_limit != 6 {
+        return TestResult::Fail("single-HID scheme after type change is wrong");
+    }
+    put_profile(&mut btcoex.mci, 2, 3, 3, 0, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 3).is_none() {
+        return TestResult::Fail("profile-stop GPM did not pump");
+    }
+    if btcoex.mci.profiles.num_profiles() != 0 || btcoex.mci.profiles.duty_cycle != 55 {
+        return TestResult::Fail("profile stop did not empty the list");
+    }
+    // Illegal types are ignored and never run the scheme.
+    for bad_type in [0u8, 7u8] {
+        let (mut io, mut btcoex) = live();
+        put_profile(&mut btcoex.mci, 0, bad_type, 0, 1, 0, 0, 0, 0, 0, 0);
+        if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+            return TestResult::Fail("illegal-type GPM did not pump");
+        }
+        if btcoex.mci.profiles.num_profiles() != 0 || btcoex.mci.profiles.duty_cycle != 0 {
+            return TestResult::Fail("illegal profile type reached the list");
+        }
+    }
+    // SCO cap: a second voice profile is refused.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 5, 0, 1, 0, 0, 0, 12, 0, 0);
+    put_profile(&mut btcoex.mci, 1, 5, 1, 1, 0, 0, 0, 12, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 2).is_none() {
+        return TestResult::Fail("SCO-cap GPMs did not pump");
+    }
+    if btcoex.mci.profiles.num_sco != 1 || btcoex.mci.profiles.num_profiles() != 1 {
+        return TestResult::Fail("second SCO profile was admitted");
+    }
+    // ACL cap: 7 RFCOMM fill the list; an 8th RFCOMM and an A2DPVO
+    // (SCO-counted but not VOICE-exempt from the ACL cap) are refused.
+    let (mut io, mut btcoex) = live();
+    for handle in 0..7u8 {
+        put_profile(
+            &mut btcoex.mci,
+            handle as usize,
+            1,
+            handle,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+    }
+    put_profile(&mut btcoex.mci, 7, 1, 7, 1, 0, 0, 0, 0, 0, 0);
+    put_profile(&mut btcoex.mci, 8, 6, 7, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 9).is_none() {
+        return TestResult::Fail("ACL-cap GPMs did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_other_acl != 7 || profiles.num_sco != 0 || profiles.num_profiles() != 7 {
+        return TestResult::Fail("ACL cap admitted too many profiles");
+    }
+    if profiles.duty_cycle != 95 || profiles.aggr_limit != 4 || profiles.btcoex_period != 20 {
+        return TestResult::Fail("seven-profile scheme is wrong");
+    }
+    TestResult::Pass
+}
+
+fn mci_bt_profile_scheme() -> TestResult {
+    // Single PAN, AR9462: duty 35, period 53 halved to 26.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 4, 1, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("PAN GPM did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_pan != 1
+        || profiles.duty_cycle != 35
+        || profiles.btcoex_period != 26
+        || profiles.btcoex_no_stomp != 16
+        || profiles.aggr_limit != 0
+    {
+        return TestResult::Fail("single-PAN AR9462 scheme is wrong");
+    }
+    // Single PAN, AR9565: duty 40.
+    let (mut io, mut btcoex) = live_chip(Chip::Ar9565);
+    put_profile(&mut btcoex.mci, 0, 4, 1, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("AR9565 PAN GPM did not pump");
+    }
+    if btcoex.mci.profiles.duty_cycle != 40 || btcoex.mci.profiles.btcoex_no_stomp != 15 {
+        return TestResult::Fail("single-PAN AR9565 scheme is wrong");
+    }
+    // Single HID: duty 30, aggr 6.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("HID GPM did not pump");
+    }
+    if btcoex.mci.profiles.duty_cycle != 30 || btcoex.mci.profiles.aggr_limit != 6 {
+        return TestResult::Fail("single-HID scheme is wrong");
+    }
+    // Single EDR A2DP: no special case; duty 50, aggr 0, and the
+    // concurrent-TX priorities fold in the A2DP priority 90.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 2, 0, 1, 0, 1, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("A2DP GPM did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.duty_cycle != 50
+        || profiles.aggr_limit != 0
+        || profiles.num_bdr != 0
+        || profiles.concur_txprio != [90, 90, 90, 0, 0]
+    {
+        return TestResult::Fail("single-EDR-A2DP scheme is wrong");
+    }
+    // Single basic-rate A2DP: the +20 BDR bonus applies (50 + 20).
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("BDR A2DP GPM did not pump");
+    }
+    if btcoex.mci.profiles.num_bdr != 1
+        || btcoex.mci.profiles.duty_cycle != 70
+        || btcoex.mci.profiles.btcoex_no_stomp != 6
+    {
+        return TestResult::Fail("BDR duty bonus is wrong");
+    }
+    // Two profiles (A2DP + HID): duty 60, aggr 6.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 2, 0, 1, 0, 1, 0, 0, 0, 0);
+    put_profile(&mut btcoex.mci, 1, 3, 1, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 2).is_none() {
+        return TestResult::Fail("two-profile GPMs did not pump");
+    }
+    if btcoex.mci.profiles.duty_cycle != 60 || btcoex.mci.profiles.aggr_limit != 6 {
+        return TestResult::Fail("two-profile scheme is wrong");
+    }
+    // Two HIDs: duty 30.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0);
+    put_profile(&mut btcoex.mci, 1, 3, 1, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 2).is_none() {
+        return TestResult::Fail("two-HID GPMs did not pump");
+    }
+    if btcoex.mci.profiles.duty_cycle != 30 {
+        return TestResult::Fail("two-HID scheme is wrong");
+    }
+    // Three profiles: duty 70, aggr 4.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0);
+    put_profile(&mut btcoex.mci, 1, 2, 1, 1, 0, 1, 0, 0, 0, 0);
+    put_profile(&mut btcoex.mci, 2, 3, 2, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 3).is_none() {
+        return TestResult::Fail("three-profile GPMs did not pump");
+    }
+    if btcoex.mci.profiles.duty_cycle != 70 || btcoex.mci.profiles.aggr_limit != 4 {
+        return TestResult::Fail("three-profile scheme is wrong");
+    }
+    // Eight profiles, HT: duty 98, period unhalved at 40, and the
+    // aggregation limit is adjusted down to half the (zero) airtime.
+    let (mut io, mut btcoex) = live();
+    btcoex.mci.is_ht = true;
+    for handle in 0..7u8 {
+        put_profile(
+            &mut btcoex.mci,
+            handle as usize,
+            1,
+            handle,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+    }
+    put_profile(&mut btcoex.mci, 7, 5, 7, 1, 0, 0, 0, 12, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 8).is_none() {
+        return TestResult::Fail("eight-profile HT GPMs did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_profiles() != 8
+        || profiles.duty_cycle != 98
+        || profiles.btcoex_period != 40
+        || profiles.aggr_limit != 0
+        || profiles.btcoex_no_stomp != 0
+    {
+        return TestResult::Fail("eight-profile HT scheme is wrong");
+    }
+    // Eight profiles, non-HT: period halved to 20, aggr stays 4.
+    let (mut io, mut btcoex) = live();
+    for handle in 0..7u8 {
+        put_profile(
+            &mut btcoex.mci,
+            handle as usize,
+            1,
+            handle,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+    }
+    put_profile(&mut btcoex.mci, 7, 5, 7, 1, 0, 0, 0, 12, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 8).is_none() {
+        return TestResult::Fail("eight-profile GPMs did not pump");
+    }
+    if btcoex.mci.profiles.btcoex_period != 20 || btcoex.mci.profiles.aggr_limit != 4 {
+        return TestResult::Fail("eight-profile non-HT scheme is wrong");
+    }
+    // 5 GHz: the BDR bonus and no-stomp computation are skipped.
+    let (mut io, mut btcoex) = live();
+    btcoex.mci.is_2g = false;
+    put_profile(&mut btcoex.mci, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("5 GHz GPM did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_bdr != 1
+        || profiles.duty_cycle != 50
+        || profiles.btcoex_period != 40
+        || profiles.btcoex_no_stomp != 0
+    {
+        return TestResult::Fail("5 GHz scheme is wrong");
+    }
+    // DISABLE_TUNING after a scheme: the duty cycle and stomp type
+    // stand, only the 2 GHz period halving still applies.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 4, 1, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("PAN GPM did not pump");
+    }
+    btcoex.mci.config |= ATH_MCI_CONFIG_DISABLE_TUNING;
+    put_profile(&mut btcoex.mci, 1, 3, 5, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 2).is_none() {
+        return TestResult::Fail("tuning-disabled GPM did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_hid != 1
+        || profiles.duty_cycle != 35
+        || profiles.btcoex_period != 13
+        || profiles.aggr_limit != 0
+        || profiles.btcoex_no_stomp != 8
+    {
+        return TestResult::Fail("DISABLE_TUNING did not hold the scheme");
+    }
+    // DISABLE_TUNING from the start: nothing is ever tuned.
+    let (mut io, mut btcoex) = live();
+    btcoex.mci.config |= ATH_MCI_CONFIG_DISABLE_TUNING;
+    put_profile(&mut btcoex.mci, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("tuning-disabled HID GPM did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_hid != 1
+        || profiles.duty_cycle != 0
+        || profiles.btcoex_period != 0
+        || profiles.bt_stomp_type != btcoex::StompType::All
+    {
+        return TestResult::Fail("DISABLE_TUNING from the start tuned anyway");
+    }
+    TestResult::Pass
+}
+
+fn mci_bt_profile_status() -> TestResult {
+    // A critical status update for an unknown handle counts as a
+    // management link and stomps everything.
+    let (mut io, mut btcoex) = live();
+    put_status(&mut btcoex.mci, 0, 0, 2, 1);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("status GPM did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_mgmt != 1
+        || profiles.duty_cycle != 55
+        || profiles.bt_stomp_type != btcoex::StompType::All
+        || profiles.concur_txprio != [62, 0, 62, 0, 0]
+    {
+        return TestResult::Fail("critical status update was not counted");
+    }
+    // Repeating the same update, and clearing a bit that was never
+    // set, leave the management count alone (no scheme re-run).
+    put_status(&mut btcoex.mci, 1, 0, 2, 1);
+    if pump_gpm(&mut io, &mut btcoex, 2).is_none() {
+        return TestResult::Fail("repeat status GPM did not pump");
+    }
+    if btcoex.mci.profiles.num_mgmt != 1 {
+        return TestResult::Fail("repeat status update changed the count");
+    }
+    put_status(&mut btcoex.mci, 2, 0, 3, 0);
+    if pump_gpm(&mut io, &mut btcoex, 3).is_none() {
+        return TestResult::Fail("clear status GPM did not pump");
+    }
+    if btcoex.mci.profiles.num_mgmt != 1 {
+        return TestResult::Fail("clearing an unset bit changed the count");
+    }
+    // Clearing the critical bit drops the management count and the
+    // stomp type returns to LOW with empty priorities.
+    put_status(&mut btcoex.mci, 3, 0, 2, 0);
+    if pump_gpm(&mut io, &mut btcoex, 4).is_none() {
+        return TestResult::Fail("un-critical status GPM did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_mgmt != 0
+        || profiles.bt_stomp_type != btcoex::StompType::Low
+        || profiles.concur_txprio != [0, 0, 0, 0, 0]
+    {
+        return TestResult::Fail("clearing the critical bit did not release the stomp");
+    }
+    // Link-status updates are ignored.
+    put_status(&mut btcoex.mci, 4, 1, 5, 1);
+    if pump_gpm(&mut io, &mut btcoex, 5).is_none() {
+        return TestResult::Fail("link status GPM did not pump");
+    }
+    if btcoex.mci.profiles.num_mgmt != 0 {
+        return TestResult::Fail("link status update was counted");
+    }
+    // A status update for a handle that already has a profile is
+    // ignored (its critical bit stays clear).
+    put_profile(&mut btcoex.mci, 5, 1, 4, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 6).is_none() {
+        return TestResult::Fail("RFCOMM GPM did not pump");
+    }
+    put_status(&mut btcoex.mci, 6, 0, 4, 1);
+    if pump_gpm(&mut io, &mut btcoex, 7).is_none() {
+        return TestResult::Fail("known-handle status GPM did not pump");
+    }
+    if btcoex.mci.profiles.num_mgmt != 0 || btcoex.mci.profiles.status[4] {
+        return TestResult::Fail("known-handle status update was counted");
+    }
+    // Handles at or above the profile maximum are ignored.
+    put_status(&mut btcoex.mci, 7, 0, 8, 1);
+    if pump_gpm(&mut io, &mut btcoex, 8).is_none() {
+        return TestResult::Fail("handle-8 status GPM did not pump");
+    }
+    if btcoex.mci.profiles.num_mgmt != 0 {
+        return TestResult::Fail("out-of-range handle was counted");
+    }
+    TestResult::Pass
+}
+
+fn mci_bt_profile_flush() -> TestResult {
+    // Two live profiles, then stale BT info: the next coex GPM
+    // flushes the list and re-arms the status query. The flush does
+    // not re-run the scheme (duty 60 stands, aggr resets to 0).
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0);
+    put_profile(&mut btcoex.mci, 1, 3, 1, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 2).is_none() {
+        return TestResult::Fail("profile GPMs did not pump");
+    }
+    if btcoex.mci.profiles.num_profiles() != 2 || btcoex.mci.profiles.duty_cycle != 60 {
+        return TestResult::Fail("profile setup did not reach two profiles");
+    }
+    btcoex.mci.need_flush_btinfo = true;
+    btcoex.mci.unhalt_bt_gpm = false;
+    put_gpm(
+        &mut btcoex.mci,
+        2,
+        GpmSubtype::CoexAgent as u8,
+        GpmCoexOpcode::VersionQuery as u8,
+        &[],
+    );
+    if pump_gpm(&mut io, &mut btcoex, 3).is_none() {
+        return TestResult::Fail("flush-trigger GPM did not pump");
+    }
+    let profiles = &btcoex.mci.profiles;
+    if profiles.num_profiles() != 0
+        || profiles.num_other_acl != 0
+        || profiles.num_hid != 0
+        || profiles.aggr_limit != 0
+        || profiles.duty_cycle != 60
+    {
+        return TestResult::Fail("stale BT info did not flush the profile list");
+    }
+    if btcoex.mci.need_flush_btinfo || btcoex.mci.query_bt {
+        return TestResult::Fail("flush did not clear the re-fetch flags");
+    }
+    // The re-arm is a topology status query: type COEX_AGENT (0x0c)
+    // and opcode STATUS_QUERY (0x02) in payload word 1, bitmap byte
+    // 0x02 (QUERY_BT_TOPOLOGY) at byte 6.
+    if io.last_write(AR_MCI_TX_PAYLOAD0 + 4) != Some(0x0002_020c) {
+        return TestResult::Fail("flush did not send the topology status query");
+    }
+    // While an UNHALT is still owed, the flush does not fire.
+    let (mut io, mut btcoex) = live();
+    put_profile(&mut btcoex.mci, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0);
+    if pump_gpm(&mut io, &mut btcoex, 1).is_none() {
+        return TestResult::Fail("unhalt-case profile GPM did not pump");
+    }
+    btcoex.mci.need_flush_btinfo = true;
+    // `unhalt_bt_gpm` stays true from `init_mci`.
+    put_gpm(
+        &mut btcoex.mci,
+        1,
+        GpmSubtype::CoexAgent as u8,
+        GpmCoexOpcode::VersionQuery as u8,
+        &[],
+    );
+    if pump_gpm(&mut io, &mut btcoex, 2).is_none() {
+        return TestResult::Fail("unhalt-case GPM did not pump");
+    }
+    if btcoex.mci.profiles.num_profiles() != 1 {
+        return TestResult::Fail("flush fired while an UNHALT was owed");
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_message_exchange);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_send_gating);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_gpio_observation);
@@ -1003,4 +1567,8 @@ kernel_test_in!(
     mci_bt_gain_ctrl_and_timing4
 );
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_check_bt);
+kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_list);
+kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_scheme);
+kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_status);
+kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_flush);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_header_values);

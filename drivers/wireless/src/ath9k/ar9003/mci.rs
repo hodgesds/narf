@@ -36,13 +36,16 @@
 //! names its Linux header.
 //!
 //! Out of scope, recorded in §3.12: the AIC states (`ar9003_aic.c`
-//! hard-disables AIC, so they read 0 here exactly as in Linux), the
-//! driver-layer BT profile list and duty-cycle scheme (`mci.c`
-//! `ath_mci_profile`/`ath_mci_update_scheme`, no mac80211 consumer
-//! in-tree), and the live-owner wiring (the owner holding a `Btcoex`,
-//! routing `irq::Events::mci` into `get_isr`/`handle_interrupt`).
+//! hard-disables AIC, so they read 0 here exactly as in Linux) and
+//! the live-owner wiring (the owner holding a `Btcoex`, routing
+//! `irq::Events::mci` into `get_isr`/`handle_interrupt`, applying the
+//! computed duty-cycle scheme, and recording HT state on channel
+//! change). The driver-layer BT profile list and duty-cycle scheme
+//! (`mci.c` `ath_mci_profile`/`ath_mci_update_scheme`) live in
+//! `Mci.profiles` below; there is no mac80211 consumer in-tree.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
+use super::btcoex::StompType;
 use super::{field, rmw, Chip};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
 
@@ -327,6 +330,8 @@ const ATH_MCI_CONFIG_AGGR_THRESH_S: u32 = 8;
 const ATH_MCI_CONFIG_DISABLE_AGGR_THRESH: u32 = 0x0000_0800;
 const ATH_MCI_CONFIG_CLK_DIV: u32 = 0x0000_3000;
 const ATH_MCI_CONFIG_CLK_DIV_S: u32 = 12;
+/// `ar9003_mci.h::ATH_MCI_CONFIG_DISABLE_TUNING`.
+const ATH_MCI_CONFIG_DISABLE_TUNING: u32 = 0x0000_4000;
 const ATH_MCI_CONFIG_ANT_ARCH: u32 = 0x0700_0000;
 const ATH_MCI_CONFIG_ANT_ARCH_S: u32 = 24;
 const ATH_MCI_CONFIG_MCI_STAT_DBG: u32 = 0x2000_0000;
@@ -453,9 +458,451 @@ pub(in crate::ath9k) enum GpmCoexOpcode {
     Noop = 8,
 }
 
-// `ar9003_mci.h::enum ath_mci_gpm_coex_profile_type` is driver-layer
-// (`mci.c::ath_mci_profile`); it is not transcribed here — the hw layer
-// never parses profile fields. See §3.12.
+/// `ar9003_mci.h::enum ath_mci_gpm_coex_profile_type`, in Linux order.
+/// Driver-layer (`mci.c::ath_mci_profile`): the BT profile a
+/// `BT_PROFILE_INFO` GPM reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(in crate::ath9k) enum GpmCoexProfile {
+    /// `MCI_GPM_COEX_PROFILE_UNKNOWN`.
+    Unknown = 0,
+    /// `MCI_GPM_COEX_PROFILE_RFCOMM`.
+    Rfcomm = 1,
+    /// `MCI_GPM_COEX_PROFILE_A2DP`.
+    A2dp = 2,
+    /// `MCI_GPM_COEX_PROFILE_HID`.
+    Hid = 3,
+    /// `MCI_GPM_COEX_PROFILE_BNEP`.
+    Bnep = 4,
+    /// `MCI_GPM_COEX_PROFILE_VOICE`.
+    Voice = 5,
+    /// `MCI_GPM_COEX_PROFILE_A2DPVO`.
+    A2dpVo = 6,
+    /// `MCI_GPM_COEX_PROFILE_MAX` (sentinel, never a real profile).
+    Max = 7,
+}
+
+impl GpmCoexProfile {
+    /// Decode a profile-type byte; `None` for the `MAX` sentinel and
+    /// anything above it (Linux rejects `type >= MAX` as illegal).
+    pub(super) fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::Unknown,
+            1 => Self::Rfcomm,
+            2 => Self::A2dp,
+            3 => Self::Hid,
+            4 => Self::Bnep,
+            5 => Self::Voice,
+            6 => Self::A2dpVo,
+            _ => return None,
+        })
+    }
+}
+
+/// `ar9003_mci.h::MCI_GPM_COEX_B_PROFILE_*` (byte offsets of the
+/// profile-info fields in a 16-byte GPM payload; the 10-byte
+/// `ath_mci_profile_info` image is bytes 6..16).
+const MCI_GPM_COEX_B_PROFILE_TYPE: usize = 6;
+const MCI_GPM_COEX_B_PROFILE_LINKID: usize = 7;
+const MCI_GPM_COEX_B_PROFILE_STATE: usize = 8;
+const MCI_GPM_COEX_B_PROFILE_ROLE: usize = 9;
+const MCI_GPM_COEX_B_PROFILE_RATE: usize = 10;
+const MCI_GPM_COEX_B_PROFILE_VOTYPE: usize = 11;
+/// `ar9003_mci.h::MCI_GPM_COEX_H_PROFILE_T` (the `T` field is a
+/// little-endian u16 at bytes 12..13).
+const MCI_GPM_COEX_H_PROFILE_T: usize = 12;
+const MCI_GPM_COEX_B_PROFILE_W: usize = 14;
+const MCI_GPM_COEX_B_PROFILE_A: usize = 15;
+/// `ar9003_mci.h::MCI_GPM_COEX_B_STATUS_*` (status-update fields).
+const MCI_GPM_COEX_B_STATUS_TYPE: usize = 6;
+const MCI_GPM_COEX_B_STATUS_LINKID: usize = 7;
+const MCI_GPM_COEX_B_STATUS_STATE: usize = 8;
+
+/// `mci.h::ATH_MCI_MAX_ACL_PROFILE` / `ATH_MCI_MAX_SCO_PROFILE` /
+/// `ATH_MCI_MAX_PROFILE` (at most 7 ACL + 1 SCO profiles).
+const ATH_MCI_MAX_ACL_PROFILE: u8 = 7;
+const ATH_MCI_MAX_SCO_PROFILE: u8 = 1;
+const ATH_MCI_MAX_PROFILE: usize = 8;
+/// `mci.h::ATH_MCI_DEF_BT_PERIOD` (default BT period, ms).
+const ATH_MCI_DEF_BT_PERIOD: u32 = 40;
+/// `mci.h::ATH_MCI_BDR_DUTY_CYCLE` (extra duty for a non-EDR profile).
+const ATH_MCI_BDR_DUTY_CYCLE: u32 = 20;
+/// `mci.h::ATH_MCI_MAX_DUTY_CYCLE` (duty-cycle cap, percent).
+const ATH_MCI_MAX_DUTY_CYCLE: u32 = 90;
+/// `mci.h::ATH_MCI_INQUIRY_PRIO` (concurrent-TX priority while a
+/// management link is critical).
+const ATH_MCI_INQUIRY_PRIO: u8 = 62;
+/// `mci.h::ATH_MCI_HI_PRIO` (voice-priority floor for the LOW stomp).
+const ATH_MCI_HI_PRIO: u8 = 60;
+/// `btcoex.h::ATH_BTCOEX_STOMP_MAX`: one TX-priority byte per stomp
+/// type (mirrors `btcoex::STOMP_MAX`).
+const CONCUR_TXPRIO_LEN: usize = 5;
+
+/// `mci.c::ath_mci_duty_cycle`: duty cycle (percent) by profile count.
+const ATH_MCI_DUTY_CYCLE: [u8; 9] = [55, 50, 60, 70, 80, 85, 90, 95, 98];
+/// `mci.c::ath_mci_add_profile::voice_priority`: voice TX priority by
+/// voice type (`voice_type >= 9` falls back to 110).
+const ATH_MCI_VOICE_PRIORITY: [u8; 9] = [110, 110, 110, 112, 110, 110, 114, 116, 118];
+
+/// `mci.h::struct ath_mci_profile_info`: one BT profile, as carried by
+/// a `BT_PROFILE_INFO` GPM. The 10-byte payload image maps field for
+/// field (`type`, `conn_handle`, `start`, `master`, `edr`,
+/// `voice_type`, `T`, `W`, `A`); a nonzero state/role/rate byte reads
+/// as true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ath9k) struct ProfileInfo {
+    /// Profile type.
+    pub(super) profile: GpmCoexProfile,
+    /// BT connection handle (the list key).
+    pub(super) conn_handle: u8,
+    /// Profile started (`STATE` byte) rather than stopped.
+    pub(super) start: bool,
+    /// BT is master (`ROLE` byte).
+    pub(super) master: bool,
+    /// EDR rate (`RATE` byte); false means a basic-rate profile.
+    pub(super) edr: bool,
+    /// Voice type (SCO only).
+    pub(super) voice_type: u8,
+    /// Voice `Tvoice` / HID `Tsniff`, in slots.
+    pub(super) t: u16,
+    /// Voice `Wvoice` / HID sniff timeout, in slots.
+    pub(super) w: u8,
+    /// HID sniff attempt, in slots.
+    pub(super) a: u8,
+}
+
+impl ProfileInfo {
+    /// Parse the 10-byte profile image at bytes 6..16 of a GPM slot.
+    /// Callers validate the type byte first; an unmapped type reads
+    /// back as `Unknown` here and never reaches the list.
+    pub(super) fn from_gpm(gpm: &[u8]) -> Self {
+        Self {
+            profile: GpmCoexProfile::from_u8(gpm[MCI_GPM_COEX_B_PROFILE_TYPE])
+                .unwrap_or(GpmCoexProfile::Unknown),
+            conn_handle: gpm[MCI_GPM_COEX_B_PROFILE_LINKID],
+            start: gpm[MCI_GPM_COEX_B_PROFILE_STATE] != 0,
+            master: gpm[MCI_GPM_COEX_B_PROFILE_ROLE] != 0,
+            edr: gpm[MCI_GPM_COEX_B_PROFILE_RATE] != 0,
+            voice_type: gpm[MCI_GPM_COEX_B_PROFILE_VOTYPE],
+            t: u16::from_le_bytes([
+                gpm[MCI_GPM_COEX_H_PROFILE_T],
+                gpm[MCI_GPM_COEX_H_PROFILE_T + 1],
+            ]),
+            w: gpm[MCI_GPM_COEX_B_PROFILE_W],
+            a: gpm[MCI_GPM_COEX_B_PROFILE_A],
+        }
+    }
+}
+
+/// `mci.h::struct ath_mci_profile_status`: one BT status update, as
+/// carried by a `BT_STATUS_UPDATE` GPM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ath9k) struct ProfileStatus {
+    /// Link-status update (`STATUS_TYPE` byte); those are not handled.
+    pub(super) is_link: bool,
+    /// BT connection handle.
+    pub(super) conn_handle: u8,
+    /// Link is critical (`STATUS_STATE` byte).
+    pub(super) is_critical: bool,
+}
+
+impl ProfileStatus {
+    /// Parse the status-update fields at bytes 6..8 of a GPM slot.
+    pub(super) fn from_gpm(gpm: &[u8]) -> Self {
+        Self {
+            is_link: gpm[MCI_GPM_COEX_B_STATUS_TYPE] != 0,
+            conn_handle: gpm[MCI_GPM_COEX_B_STATUS_LINKID],
+            is_critical: gpm[MCI_GPM_COEX_B_STATUS_STATE] != 0,
+        }
+    }
+}
+
+/// `mci.h::struct ath_mci_profile`: the driver-layer BT profile list,
+/// plus the duty-cycle scheme `update_scheme` selects from it
+/// (`struct ath_btcoex` fields in Linux). The list is a fixed 8-slot
+/// array (no allocation): the add caps admit at most 7 ACL + 1 SCO
+/// entries, so a slot is always free when an add is allowed. The
+/// scheme outputs are stored here for the owner to apply (weights via
+/// `btcoex::bt_stomp`, enable/disable); this module performs no
+/// hardware writes for the scheme.
+#[derive(Clone, Debug)]
+pub(in crate::ath9k) struct ProfileList {
+    /// Live profiles, keyed by connection handle.
+    pub(super) entries: [Option<ProfileInfo>; ATH_MCI_MAX_PROFILE],
+    /// Critical-link bitmap, one bit per connection handle
+    /// (`DECLARE_BITMAP(status, ATH_MCI_MAX_PROFILE)`).
+    pub(super) status: [bool; ATH_MCI_MAX_PROFILE],
+    /// Aggregation limit, in 0.25 ms units.
+    pub(super) aggr_limit: u16,
+    /// Number of critical management links.
+    pub(super) num_mgmt: u8,
+    /// Number of SCO profiles (voice + A2DP-voice).
+    pub(super) num_sco: u8,
+    /// Number of A2DP profiles.
+    pub(super) num_a2dp: u8,
+    /// Number of HID profiles.
+    pub(super) num_hid: u8,
+    /// Number of PAN (BNEP) profiles.
+    pub(super) num_pan: u8,
+    /// Number of other ACL profiles (RFCOMM).
+    pub(super) num_other_acl: u8,
+    /// Number of basic-rate (non-EDR) A2DP profiles.
+    pub(super) num_bdr: u8,
+    /// Voice TX priority (from the voice-type table on add).
+    pub(super) voice_priority: u8,
+    /// Selected BT duty cycle, percent.
+    pub(super) duty_cycle: u8,
+    /// Selected BT coexistence period, ms.
+    pub(super) btcoex_period: u32,
+    /// Selected WLAN no-stomp airtime, ms.
+    pub(super) btcoex_no_stomp: u32,
+    /// Selected BT stomp type.
+    pub(super) bt_stomp_type: StompType,
+    /// Concurrent-TX priority per stomp type, for the owner to apply
+    /// via `btcoex::set_concur_txprio`.
+    pub(super) concur_txprio: [u8; CONCUR_TXPRIO_LEN],
+}
+
+impl ProfileList {
+    /// Empty list. The zeroed state matches Linux (`ath_softc` is
+    /// `kzalloc`'d): no duty cycle or period until the first scheme
+    /// run, stomp type `ALL` (the zero value).
+    pub(super) fn new() -> Self {
+        Self {
+            entries: [None; ATH_MCI_MAX_PROFILE],
+            status: [false; ATH_MCI_MAX_PROFILE],
+            aggr_limit: 0,
+            num_mgmt: 0,
+            num_sco: 0,
+            num_a2dp: 0,
+            num_hid: 0,
+            num_pan: 0,
+            num_other_acl: 0,
+            num_bdr: 0,
+            voice_priority: 0,
+            duty_cycle: 0,
+            btcoex_period: 0,
+            btcoex_no_stomp: 0,
+            bt_stomp_type: StompType::All,
+            concur_txprio: [0; CONCUR_TXPRIO_LEN],
+        }
+    }
+
+    /// `mci.h::NUM_PROF`: total live profiles.
+    pub(super) fn num_profiles(&self) -> u8 {
+        self.num_other_acl + self.num_a2dp + self.num_hid + self.num_pan + self.num_sco
+    }
+
+    /// `mci.c::ath_mci_find_profile`: the entry for a handle, if any.
+    pub(super) fn find(&self, conn_handle: u8) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.is_some_and(|info| info.conn_handle == conn_handle))
+    }
+
+    /// `mci.h::INC_PROF`: count a profile by type (A2DP without EDR
+    /// also counts as basic-rate). Counts are bounded by the 8-entry
+    /// list, so saturation is unreachable in a consistent flow; it
+    /// only guards against a malformed BT stream panicking the driver.
+    fn inc(&mut self, info: &ProfileInfo) {
+        match info.profile {
+            GpmCoexProfile::Rfcomm => self.num_other_acl = self.num_other_acl.saturating_add(1),
+            GpmCoexProfile::A2dp => {
+                self.num_a2dp = self.num_a2dp.saturating_add(1);
+                if !info.edr {
+                    self.num_bdr = self.num_bdr.saturating_add(1);
+                }
+            }
+            GpmCoexProfile::Hid => self.num_hid = self.num_hid.saturating_add(1),
+            GpmCoexProfile::Bnep => self.num_pan = self.num_pan.saturating_add(1),
+            GpmCoexProfile::Voice | GpmCoexProfile::A2dpVo => {
+                self.num_sco = self.num_sco.saturating_add(1)
+            }
+            GpmCoexProfile::Unknown | GpmCoexProfile::Max => {}
+        }
+    }
+
+    /// `mci.h::DEC_PROF`: uncount a profile by type.
+    fn dec(&mut self, info: &ProfileInfo) {
+        match info.profile {
+            GpmCoexProfile::Rfcomm => self.num_other_acl = self.num_other_acl.saturating_sub(1),
+            GpmCoexProfile::A2dp => {
+                self.num_a2dp = self.num_a2dp.saturating_sub(1);
+                if !info.edr {
+                    self.num_bdr = self.num_bdr.saturating_sub(1);
+                }
+            }
+            GpmCoexProfile::Hid => self.num_hid = self.num_hid.saturating_sub(1),
+            GpmCoexProfile::Bnep => self.num_pan = self.num_pan.saturating_sub(1),
+            GpmCoexProfile::Voice | GpmCoexProfile::A2dpVo => {
+                self.num_sco = self.num_sco.saturating_sub(1)
+            }
+            GpmCoexProfile::Unknown | GpmCoexProfile::Max => {}
+        }
+    }
+
+    /// `mci.c::ath_mci_add_profile`: admit a profile, subject to the
+    /// SCO/ACL caps (only a `VOICE` profile may take the SCO slot;
+    /// anything else counts against the 7 ACL slots). Sets the voice
+    /// priority for voice profiles. False when the cap refuses it.
+    pub(super) fn add(&mut self, info: &ProfileInfo) -> bool {
+        if self.num_sco == ATH_MCI_MAX_SCO_PROFILE && info.profile == GpmCoexProfile::Voice {
+            return false;
+        }
+        if self.num_profiles() - self.num_sco == ATH_MCI_MAX_ACL_PROFILE
+            && info.profile != GpmCoexProfile::Voice
+        {
+            return false;
+        }
+        let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) else {
+            return false;
+        };
+        *slot = Some(*info);
+        self.inc(info);
+        if info.profile == GpmCoexProfile::Voice {
+            self.voice_priority = if (info.voice_type as usize) < ATH_MCI_VOICE_PRIORITY.len() {
+                ATH_MCI_VOICE_PRIORITY[info.voice_type as usize]
+            } else {
+                110
+            };
+        }
+        true
+    }
+
+    /// `mci.c::ath_mci_del_profile`: drop the entry at `idx`.
+    pub(super) fn remove(&mut self, idx: usize) {
+        if let Some(entry) = self.entries[idx].take() {
+            self.dec(&entry);
+        }
+    }
+
+    /// `mci.c::ath_mci_flush_profile`: drop every profile and reset
+    /// the aggregation limit and management count. The critical-link
+    /// bitmap and voice priority are left alone, exactly as in Linux
+    /// (the bitmap is rebuilt by later status updates).
+    pub(super) fn flush(&mut self) {
+        self.aggr_limit = 0;
+        self.num_mgmt = 0;
+        for idx in 0..ATH_MCI_MAX_PROFILE {
+            if let Some(entry) = self.entries[idx].take() {
+                self.dec(&entry);
+            }
+        }
+    }
+
+    /// `mci.c::ath_mci_process_profile`: apply a profile-info update.
+    /// A known handle whose type changed is uncounted under the old
+    /// type and counted under the new one; a `start` update adds a new
+    /// handle (false when the cap refuses it), a stop removes it.
+    /// Returns whether the scheme must be re-run.
+    pub(super) fn process_profile(&mut self, info: &ProfileInfo) -> bool {
+        let found = self.find(info.conn_handle);
+        if let Some(idx) = found {
+            if let Some(old) = self.entries[idx] {
+                if old.profile != info.profile {
+                    self.dec(&old);
+                    self.inc(info);
+                }
+                self.entries[idx] = Some(*info);
+            }
+        }
+        if info.start {
+            if found.is_none() && !self.add(info) {
+                return false;
+            }
+        } else if let Some(idx) = found {
+            self.remove(idx);
+        }
+        self.set_concur_txprio();
+        true
+    }
+
+    /// `mci.c::ath_mci_process_status`: apply a status update. Link
+    /// updates are ignored, as are updates for a handle that already
+    /// has a profile and handles at or above `ATH_MCI_MAX_PROFILE`.
+    /// Otherwise the handle's critical bit is set or cleared and the
+    /// management count rebuilt from the bitmap. Returns whether the
+    /// management count changed (and so the scheme must be re-run).
+    pub(super) fn process_status(&mut self, status: &ProfileStatus) -> bool {
+        if status.is_link {
+            return false;
+        }
+        if self.find(status.conn_handle).is_some() {
+            return false;
+        }
+        if status.conn_handle as usize >= ATH_MCI_MAX_PROFILE {
+            return false;
+        }
+        self.status[status.conn_handle as usize] = status.is_critical;
+        let old_num_mgmt = self.num_mgmt;
+        self.num_mgmt = 0;
+        for bit in self.status {
+            if bit {
+                self.num_mgmt += 1;
+            }
+        }
+        self.set_concur_txprio();
+        old_num_mgmt != self.num_mgmt
+    }
+
+    /// `mci.c::ath_mci_set_concur_txprio`: compute the concurrent-TX
+    /// priority per stomp type from the live profiles. A critical
+    /// management link pins `ALL` (and `NONE` when no PAN/other-ACL
+    /// profile is live) to the inquiry priority; otherwise the RFCOMM
+    /// / A2DP / HID / PAN priorities (50/90/94/52) and the voice
+    /// priority fold in via `update_stomp_txprio`.
+    pub(super) fn set_concur_txprio(&mut self) {
+        let mut txprio = [0u8; CONCUR_TXPRIO_LEN];
+        if self.num_mgmt != 0 {
+            txprio[StompType::All as usize] = ATH_MCI_INQUIRY_PRIO;
+            if self.num_pan == 0 && self.num_other_acl == 0 {
+                txprio[StompType::None as usize] = ATH_MCI_INQUIRY_PRIO;
+            }
+        } else {
+            // RFCOMM, A2DP, HID, PAN.
+            const PROF_PRIO: [u8; 4] = [50, 90, 94, 52];
+            txprio[StompType::Low as usize] = 0xff;
+            txprio[StompType::None as usize] = 0xff;
+            if self.num_sco != 0 {
+                update_stomp_txprio(self.voice_priority, &mut txprio);
+            }
+            if self.num_other_acl != 0 {
+                update_stomp_txprio(PROF_PRIO[0], &mut txprio);
+            }
+            if self.num_a2dp != 0 {
+                update_stomp_txprio(PROF_PRIO[1], &mut txprio);
+            }
+            if self.num_hid != 0 {
+                update_stomp_txprio(PROF_PRIO[2], &mut txprio);
+            }
+            if self.num_pan != 0 {
+                update_stomp_txprio(PROF_PRIO[3], &mut txprio);
+            }
+            if txprio[StompType::None as usize] == 0xff {
+                txprio[StompType::None as usize] = 0;
+            }
+            if txprio[StompType::Low as usize] == 0xff {
+                txprio[StompType::Low as usize] = 0;
+            }
+        }
+        self.concur_txprio = txprio;
+    }
+}
+
+/// `mci.c::ath_mci_update_stomp_txprio`: fold one profile priority
+/// into the per-stomp table (lowest wins for `NONE`, highest for
+/// `ALL`, highest above `HI_PRIO` for `LOW`).
+fn update_stomp_txprio(cur_txprio: u8, stomp_txprio: &mut [u8; CONCUR_TXPRIO_LEN]) {
+    if cur_txprio < stomp_txprio[StompType::None as usize] {
+        stomp_txprio[StompType::None as usize] = cur_txprio;
+    }
+    if cur_txprio > stomp_txprio[StompType::All as usize] {
+        stomp_txprio[StompType::All as usize] = cur_txprio;
+    }
+    if cur_txprio > ATH_MCI_HI_PRIO && cur_txprio < stomp_txprio[StompType::Low as usize] {
+        stomp_txprio[StompType::Low as usize] = cur_txprio;
+    }
+}
 
 /// `ar9003_mci.h::MCI_GPM_COEX_QUERY_BT_ALL_INFO`.
 const MCI_GPM_COEX_QUERY_BT_ALL_INFO: u8 = 1 << 0;
@@ -656,8 +1103,15 @@ pub(in crate::ath9k) struct Mci {
     pub(super) update_2g5g: bool,
     /// Current band is 2.4 GHz.
     pub(super) is_2g: bool,
+    /// Current channel uses HT (`IS_CHAN_HT`). The owner records it
+    /// on channel change alongside `is_2g`; nothing sets it yet, so
+    /// the scheme uses the non-HT branch until then.
+    pub(super) is_ht: bool,
     /// BT profile/status info is stale; re-query on next `check_bt`.
     pub(super) query_bt: bool,
+    /// Driver-layer BT profile list (`mci.c::ath_mci_profile`) and the
+    /// duty-cycle scheme it selects (`ath_mci_update_scheme`).
+    pub(super) profiles: ProfileList,
     /// An UNHALT GPM is owed to BT.
     pub(super) unhalt_bt_gpm: bool,
     /// A HALT GPM was sent and not yet unhalted.
@@ -709,7 +1163,9 @@ impl Mci {
             ready: false,
             update_2g5g: false,
             is_2g: false,
+            is_ht: false,
             query_bt: false,
+            profiles: ProfileList::new(),
             unhalt_bt_gpm: false,
             halted_bt_gpm: false,
             need_flush_btinfo: false,
@@ -1513,12 +1969,154 @@ pub(in crate::ath9k) fn check_bt(
     Ok(())
 }
 
+/// `mci.c::ath_mci_msg` (profile arms only): the driver-layer
+/// reaction to a received coex-agent GPM. When BT info was flagged
+/// stale, the profile list is flushed and a status query re-arms the
+/// re-fetch; profile-info GPMs update the list (illegal types —
+/// `UNKNOWN` or `>= MAX` — are ignored) and status-update GPMs
+/// maintain the critical-link bitmap. Either change re-runs the
+/// duty-cycle scheme. Other coex opcodes are hw-layer only and are
+/// left to `process_gpm_extra`.
+fn process_profile_msg(
+    io: &mut impl RegisterIo,
+    mci: &mut Mci,
+    gpm_opcode: u8,
+    gpm: &[u8],
+) -> Result<(), BringUpError> {
+    if state(io, mci, MciState::NeedFlushBtInfo)? != 0 && state(io, mci, MciState::Enable)? != 0 {
+        mci.profiles.flush();
+        state(io, mci, MciState::SendStatusQuery)?;
+    }
+    let mut rerun_scheme = false;
+    if gpm_opcode == GpmCoexOpcode::BtProfileInfo as u8 {
+        let Some(profile) = GpmCoexProfile::from_u8(gpm[MCI_GPM_COEX_B_PROFILE_TYPE]) else {
+            return Ok(());
+        };
+        if profile == GpmCoexProfile::Unknown {
+            return Ok(());
+        }
+        rerun_scheme = mci.profiles.process_profile(&ProfileInfo::from_gpm(gpm));
+    } else if gpm_opcode == GpmCoexOpcode::BtStatusUpdate as u8 {
+        rerun_scheme = mci.profiles.process_status(&ProfileStatus::from_gpm(gpm));
+    }
+    if rerun_scheme {
+        update_scheme(mci);
+    }
+    Ok(())
+}
+
+/// `mci.c::ath_mci_adjust_aggr_limit`: shrink the aggregation limit
+/// to half the WLAN airtime when the airtime is 4 ms or less, so an
+/// aggregate still fits without colliding with BT traffic. Airtime is
+/// in ms; the limit is in 0.25 ms units.
+fn adjust_aggr_limit(mci: &mut Mci) {
+    let profiles = &mut mci.profiles;
+    let wlan_airtime = profiles.btcoex_period * (100 - u32::from(profiles.duty_cycle)) / 100;
+    if wlan_airtime <= 4
+        && (profiles.aggr_limit == 0 || u32::from(profiles.aggr_limit) > 2 * wlan_airtime)
+    {
+        profiles.aggr_limit = (2 * wlan_airtime) as u16;
+    }
+}
+
+/// `mci.c::ath_mci_update_scheme`: select the duty-cycle scheme from
+/// the live profiles and store it on the list for the owner to apply.
+/// With tuning enabled (`ATH_MCI_CONFIG_DISABLE_TUNING` clear) the
+/// duty cycle comes from the profile-count table with the single-SCO
+/// / single-PAN-or-other-ACL / single-HID / two-profile /
+/// three-or-more special cases (single PAN takes 40% on AR9565, 35%
+/// otherwise) and the period resets to the default; with tuning
+/// disabled the previous duty cycle, period and stomp type stand. The
+/// 2 GHz tail still runs either way (HT adjusts the aggregation
+/// limit, non-HT halves the period), 5 GHz returns before the BDR
+/// bonus, and on 2 GHz a basic-rate profile adds 20% duty capped at
+/// 90% and the no-stomp airtime is recomputed.
+///
+/// Deliberate deviation: Linux defers this to the `mci_work`
+/// workqueue and then pauses the btcoex timer, disables/enables the
+/// hw coexistence and resumes the timer. There is no workqueue or
+/// btcoex timer in-tree, so the scheme runs inline here (pure state,
+/// no hardware writes) and the owner applies the stored outputs
+/// (`bt_stomp` for the stomp type, enable/disable).
+fn update_scheme(mci: &mut Mci) {
+    if mci.config & ATH_MCI_CONFIG_DISABLE_TUNING == 0 {
+        let is_ar9565 = mci.chip == Chip::Ar9565;
+        let profiles = &mut mci.profiles;
+        profiles.aggr_limit = 0;
+        let num_profile = profiles.num_profiles();
+        profiles.duty_cycle = ATH_MCI_DUTY_CYCLE[num_profile as usize];
+        profiles.btcoex_period = ATH_MCI_DEF_BT_PERIOD;
+        profiles.bt_stomp_type = if num_profile != 0 {
+            StompType::Low
+        } else if profiles.num_mgmt != 0 {
+            StompType::All
+        } else {
+            StompType::Low
+        };
+        if num_profile == 1 {
+            // The only live entry (copied: the scheme mutates the
+            // list below, so no borrow is held across it).
+            let info = *profiles
+                .entries
+                .iter()
+                .flatten()
+                .next()
+                .expect("one profile is live");
+            if profiles.num_sco != 0 {
+                if info.t == 12 {
+                    profiles.aggr_limit = 8;
+                } else if info.t == 6 {
+                    profiles.aggr_limit = 6;
+                    profiles.duty_cycle = 30;
+                } else {
+                    profiles.aggr_limit = 6;
+                }
+            } else if profiles.num_pan != 0 || profiles.num_other_acl != 0 {
+                profiles.duty_cycle = if is_ar9565 { 40 } else { 35 };
+                profiles.btcoex_period = 53;
+            } else if profiles.num_hid != 0 {
+                profiles.duty_cycle = 30;
+                profiles.aggr_limit = 6;
+            }
+        } else if num_profile == 2 {
+            if profiles.num_hid == 2 {
+                profiles.duty_cycle = 30;
+            }
+            profiles.aggr_limit = 6;
+        } else if num_profile >= 3 {
+            profiles.aggr_limit = 4;
+        }
+    }
+    if mci.is_2g {
+        if mci.is_ht {
+            adjust_aggr_limit(mci);
+        } else {
+            mci.profiles.btcoex_period >>= 1;
+        }
+    }
+    // Linux pauses the btcoex timer and disables hw coexistence here;
+    // 5 GHz returns before the BDR bonus below.
+    if !mci.is_2g {
+        return;
+    }
+    let mut duty_cycle = u32::from(mci.profiles.duty_cycle);
+    if mci.profiles.num_bdr != 0 {
+        duty_cycle += ATH_MCI_BDR_DUTY_CYCLE;
+    }
+    if duty_cycle > ATH_MCI_MAX_DUTY_CYCLE {
+        duty_cycle = ATH_MCI_MAX_DUTY_CYCLE;
+    }
+    mci.profiles.duty_cycle = duty_cycle as u8;
+    mci.profiles.btcoex_no_stomp = mci.profiles.btcoex_period * (100 - duty_cycle) / 100;
+}
+
 /// `ar9003_mci.c::ar9003_mci_process_gpm_extra`: the hw-level reaction
 /// to a received coex-agent GPM — answer version queries, learn the BT
 /// version from responses, re-send WLAN channels on a status query,
 /// and flag BT info for re-fetch on profile/status updates. The
-/// driver-layer profile bookkeeping (`mci.c::ath_mci_msg`) is a
-/// follow-up; see §3.12.
+/// driver-layer profile bookkeeping for those updates lives in
+/// `process_profile_msg` (`mci.c::ath_mci_msg`), called alongside this
+/// from `handle_interrupt`; see §3.12.
 fn process_gpm_extra(
     io: &mut impl RegisterIo,
     mci: &mut Mci,
@@ -2707,6 +3305,7 @@ pub(in crate::ath9k) fn handle_interrupt(
                         .try_into()
                         .expect("GPM slot is 16 bytes");
                     process_gpm_extra(io, mci, subtype, opcode, &slot);
+                    process_profile_msg(io, mci, opcode, &slot)?;
                 }
             }
             outcome.gpm_seen += 1;

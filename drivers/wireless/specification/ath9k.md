@@ -960,6 +960,33 @@ signals to GPIO 0..3 (and 5) per the `ATH_MCI_CONFIG_MCI_OBS_*` bits;
 the MCI GPIO mux values are `MCI_WLAN_DATA 0x16`, `MCI_WLAN_CLK 0x17`,
 `MCI_BT_DATA 0x18`, `MCI_BT_CLK 0x19`.
 
+Profiles: `Mci.profiles` is the driver-layer BT profile list
+(`mci.c::ath_mci_profile`, `struct ath_mci_profile`): up to 8 entries
+(7 ACL + 1 SCO) keyed by connection handle, with per-type counts, the
+critical-link bitmap (`num_mgmt`), the aggregation limit and the voice
+priority. `handle_interrupt` routes coex-agent GPMs to
+`process_profile_msg` (`mci.c::ath_mci_msg`, profile arms only) after
+the hw-layer `process_gpm_extra`: profile-info GPMs add, update or
+remove entries from the 10-byte payload image (`type/linkid/state/
+role/rate/votype/T/W/A` at bytes 6..16, `T` little-endian u16),
+status-update GPMs maintain the critical bitmap for handles with no
+profile, and either change re-runs the duty-cycle scheme.
+`update_scheme` (`mci.c::ath_mci_update_scheme`) selects the duty
+cycle from `ath_mci_duty_cycle` by profile count with the single-SCO
+(`T` 12/6), single-PAN-or-other-ACL (40% on AR9565, 35% otherwise,
+period 53 ms), single-HID, two-profile and three-or-more special
+cases, the basic-rate +20% bonus capped at 90%, and the 2 GHz non-HT
+period halving; `ATH_MCI_CONFIG_DISABLE_TUNING` (`0x4000`) skips the
+tuning block while the period halving and BDR bonus still apply. The
+scheme outputs (`duty_cycle`, `btcoex_period`, `bt_stomp_type`,
+`btcoex_no_stomp`, `aggr_limit`, `concur_txprio`) are stored on the
+list for the owner to apply (weights via `bt_stomp`, enable/disable);
+Linux applies them inline from the `mci_work` workqueue with a btcoex
+timer pause/resume and hw enable/disable, which have no in-tree
+equivalent yet, so the scheme runs inline in the interrupt path
+instead of deferred. `is_ht` is recorded by the owner on channel
+change; until then the scheme uses the non-HT branch.
+
 Deliberate deviations, all documented in code: the Linux deadbeef spin
 loops (`reset_req_wakeup`, `set_power_awake`) are bounded at 1000
 iterations instead of looping forever on a dead card; `end_reset` does
@@ -971,12 +998,15 @@ answers 0.0, kept verbatim. AIC is hard-disabled in Linux
 Not in this step: the live-owner integration (owner holds `Btcoex`,
 `service_begin` routes `Events.mci`, reset path calls
 `start_reset`/`end_reset`, periodic `check_bt`, channel change calls
-`switch_2g5g`/`update_wlan_channels`); the driver-layer BT profile list
-and duty-cycle scheme; the 2WIRE/3WIRE btcoex enable/init paths; the WoW
+`switch_2g5g`/`update_wlan_channels`, applying the computed scheme and
+recording HT state); the 2WIRE/3WIRE btcoex enable/init paths; the WoW
 `mci_enabled` flag integration (open draft PR #1921 wires it once MCI
 lands). Fixture tests cover the message exchange end to end, capability
 gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
-walk, and the calibration handshake.
+walk, the calibration handshake, and the BT profile list + duty-cycle
+scheme (profile add/update/remove, the SCO/ACL caps, status-update
+management counting, the flush on stale BT info, and every scheme
+branch including `DISABLE_TUNING`).
 
 ## 4. Invariants
 
