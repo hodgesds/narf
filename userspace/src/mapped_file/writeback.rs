@@ -310,10 +310,12 @@ impl FairLock {
         }
     }
 
+    #[track_caller]
     pub(super) fn lock(&self) -> FairLockFuture<'_> {
         FairLockFuture {
             lock: self,
             ticket: None,
+            site: core::panic::Location::caller(),
         }
     }
 
@@ -347,6 +349,7 @@ impl FairLock {
 pub(super) struct FairLockFuture<'a> {
     lock: &'a FairLock,
     ticket: Option<u64>,
+    site: &'static core::panic::Location<'static>,
 }
 
 impl<'a> Future for FairLockFuture<'a> {
@@ -365,6 +368,7 @@ impl<'a> Future for FairLockFuture<'a> {
                 state.next_ticket += 1;
                 state.queue.push_back((ticket, Some(cx.waker().clone())));
                 this.ticket = Some(ticket);
+                narf_lib::mutex::note_wait_site(this.site);
                 Poll::Pending
             }
             Some(ticket) => {
@@ -376,6 +380,7 @@ impl<'a> Future for FairLockFuture<'a> {
                 if let Some(entry) = state.queue.iter_mut().find(|(t, _)| *t == ticket) {
                     entry.1 = Some(cx.waker().clone());
                 }
+                narf_lib::mutex::note_wait_site(this.site);
                 Poll::Pending
             }
         }
@@ -406,6 +411,56 @@ impl Drop for FairLockFuture<'_> {
 
 pub(super) struct FairGuard<'a> {
     lock: &'a FairLock,
+}
+
+/// Whether the calling task — a syscall's — has been sent SIGKILL.
+fn caller_killed() -> bool {
+    crate::handlers::task_fatal_signal_pending(crate::handlers::current_task_id())
+}
+
+/// [`FairLock::lock`] that a fatal signal ends (Linux
+/// `down_write_killable`): `None` if the calling task was killed while it
+/// waited. Nothing is held while waiting, so giving up is safe; the queue
+/// slot goes with the dropped future.
+struct KillableLock<'a> {
+    inner: FairLockFuture<'a>,
+    task: u64,
+    armed: bool,
+}
+
+impl<'a> KillableLock<'a> {
+    fn new(lock: FairLockFuture<'a>) -> Self {
+        Self {
+            inner: lock,
+            task: crate::handlers::current_task_id(),
+            armed: false,
+        }
+    }
+}
+
+impl<'a> Future for KillableLock<'a> {
+    type Output = Option<FairGuard<'a>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<FairGuard<'a>>> {
+        let this = self.get_mut();
+        if let Poll::Ready(guard) = Pin::new(&mut this.inner).poll(cx) {
+            return Poll::Ready(Some(guard));
+        }
+        crate::handlers::register_signal_waker(this.task, cx.waker().clone());
+        this.armed = true;
+        if crate::handlers::task_fatal_signal_pending(this.task) {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for KillableLock<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::handlers::drop_signal_waker(self.task);
+        }
+    }
 }
 
 impl Drop for FairGuard<'_> {
@@ -1034,8 +1089,27 @@ async fn write_range(
         // Never `Ok` with pages unwritten: no memory to do the batch is
         // this call's error, and the pages stay dirty for a later pass.
         let mut reserved = Reserved::new()?;
+        // A syscall whose task has been killed stops here — between
+        // batches, holding nothing; the pages it did not reach stay dirty
+        // for the flusher.
+        if caller == Caller::Syscall && caller_killed() {
+            return Ok(Progress {
+                wrote,
+                resume: Some(from),
+            });
+        }
         let guard = if locked {
             None
+        } else if caller == Caller::Syscall {
+            match KillableLock::new(file.lock.lock()).await {
+                Some(guard) => Some(guard),
+                None => {
+                    return Ok(Progress {
+                        wrote,
+                        resume: Some(from),
+                    })
+                }
+            }
         } else {
             Some(file.lock.lock().await)
         };
@@ -1610,17 +1684,26 @@ pub(super) fn slot_is_unused(slot: &FileSlot) -> bool {
 /// `truncate_inode_pages_range` to the same end. Without it, a batch that
 /// copied a page before the truncate could write it afterwards: the data
 /// would be back, and the file as long as before.
-pub(crate) fn size_change_serialized<R>(ops: &Arc<dyn FileOps>, change: impl FnOnce() -> R) -> R {
+///
+/// `None`: the calling task was killed while it waited for the lock, and
+/// nothing was done (Linux's killable `inode_lock` wait in `do_truncate`).
+pub(crate) fn size_change_serialized<R>(
+    ops: &Arc<dyn FileOps>,
+    change: impl FnOnce() -> R,
+) -> Option<R> {
     // A file with no cache entry has no page for writeback to write and none
     // to drop: every `open(O_TRUNC)` of an unmapped file — every shell
     // redirection — takes no lock and allocates nothing here.
     if entry_identity(ops.as_ref()).is_none() {
-        return change();
+        return Some(change());
     }
     let (file, _) = acquire(ops);
-    // `None` only where there is nothing to park on and the lock never
-    // came free; the operation must still run.
-    let guard = drive(file.lock.lock());
+    let Some(guard) = drive(KillableLock::new(file.lock.lock())).flatten() else {
+        let identity = file.identity;
+        drop(file);
+        release_if_unused(identity);
+        return None;
+    };
     let old_size = ops.stat().size;
     let result = change();
     // The size the file has NOW, not the one asked for: a `write(2)` does
@@ -1632,7 +1715,7 @@ pub(crate) fn size_change_serialized<R>(ops: &Arc<dyn FileOps>, change: impl FnO
     let identity = file.identity;
     drop(file);
     release_if_unused(identity);
-    result
+    Some(result)
 }
 
 const FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
@@ -1660,12 +1743,18 @@ pub(crate) fn fallocate_serialized<R>(
     len: u64,
     change: impl FnOnce() -> R,
     succeeded: impl FnOnce(&R) -> bool,
-) -> R {
+) -> Option<R> {
     if entry_identity(ops.as_ref()).is_none() {
-        return change();
+        return Some(change());
     }
     let (file, writer) = acquire(ops);
-    let guard = drive(file.lock.lock());
+    let Some(guard) = drive(KillableLock::new(file.lock.lock())).flatten() else {
+        let identity = file.identity;
+        drop(file);
+        drop(writer);
+        release_if_unused(identity);
+        return None;
+    };
     let shifts = mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE) != 0;
     if shifts {
         let mut budget = usize::MAX;
@@ -1711,7 +1800,7 @@ pub(crate) fn fallocate_serialized<R>(
     drop(file);
     drop(writer);
     release_if_unused(identity);
-    result
+    Some(result)
 }
 
 /// Every file with an entry on `device` (`None`: on any device).

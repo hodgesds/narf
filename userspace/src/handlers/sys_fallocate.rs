@@ -144,6 +144,11 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
         change,
         |outcome| outcome.is_ok(),
     );
+    let Some(outcome) = outcome else {
+        // Killed while waiting for the file's writeback lock.
+        ctx.set_return(errno_ret(EINTR));
+        return;
+    };
     match outcome {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(narf_filesystem::FsError::Unsupported) => ctx.set_return(errno_ret(EOPNOTSUPP)),

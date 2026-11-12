@@ -64,9 +64,14 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
 
     // Excluded from writeback, and followed by the cache invalidation:
     // see `mapped_file::size_change_serialized`.
-    match crate::mapped_file::size_change_serialized(&endpoint.ops, || {
+    let Some(outcome) = crate::mapped_file::size_change_serialized(&endpoint.ops, || {
         poll_blocking(endpoint.ops.truncate(len))
-    }) {
+    }) else {
+        // Killed while waiting for the file's writeback lock.
+        ctx.set_return(errno_ret(EINTR));
+        return;
+    };
+    match outcome {
         Some(Ok(())) => {
             // inotify: truncate changes file content → IN_MODIFY.
             crate::mqueue::notify_modify_fd(task, fd);
