@@ -552,8 +552,6 @@ pub const RX_BUF_LEN: usize = 2048;
 /// descriptor posted longer ago than this with VALID still set is
 /// a wedged ring, not congestion.
 const TX_TIMEOUT_NS: u64 = 5_000_000_000;
-/// Watchdog supervisor cadence, matching igc's 10 ms maintenance tick.
-const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
 
 /// True when any posted TX descriptor has waited longer than
 /// `timeout` cycles with VALID still set — the ring is wedged (igc
@@ -1384,19 +1382,12 @@ impl ForcedethNic {
         self.tx_resets.load(Ordering::Relaxed)
     }
 
-    /// One watchdog pass (shared by the supervisor task and the
-    /// fixture): if the link is up and a TX descriptor has waited
-    /// past the timeout, count the timeout and recover. Returns
-    /// true when recovery fired.
+    /// One watchdog pass, synchronously (the fixture): the core
+    /// watchdog's check, then `ndo_tx_timeout` if it fired. Returns
+    /// true when recovery fired and succeeded.
     fn check_tx_watchdog_at(&self, now: u64) -> bool {
-        if self.recovering.load(Ordering::Acquire) {
-            return false;
-        }
-        if !self.live_link_up() {
-            return false;
-        }
-        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
-        if !tx_stalled(&self.tx_posted_at.lock(), now, timeout) {
+        use narf_net::watchdog::NetdevWatchdog;
+        if !self.tx_timed_out(now) {
             return false;
         }
         self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -1807,10 +1798,11 @@ fn spawn_pumps(
         forcedeth_tx_pump(d2, tx_cons).await;
     });
 
-    let d3 = device;
-    narf_scheduler::spawn(async move {
-        forcedeth_watchdog_pump(d3).await;
-    });
+    // `dev_watchdog`: a timer every `watchdog_timeo` (5 s) that queues
+    // the reset when a transmit is stuck; it stops with the device.
+    let weak: alloc::sync::Weak<dyn narf_net::watchdog::NetdevWatchdog> =
+        Arc::downgrade(&device) as _;
+    narf_net::watchdog::DevWatchdog::start_for_device(weak, TX_TIMEOUT_NS);
 }
 
 async fn forcedeth_rx_pump(device: Arc<ForcedethNic>, mut rx_prod: Producer<Frame, RX_RING_N>) {
@@ -1858,15 +1850,26 @@ async fn forcedeth_tx_pump(device: Arc<ForcedethNic>, mut tx_cons: Consumer<Fram
     }
 }
 
-/// TX-timeout supervisor (igc maintenance-task shape): every 10 ms
-/// run one watchdog pass; a ring stalled 5 s with carrier up is
-/// recovered and counted. The pass itself gates on an in-flight
-/// recovery, so this loop is only a timer.
-async fn forcedeth_watchdog_pump(device: Arc<ForcedethNic>) {
-    let tick = narf_time::ns_to_cycles(TX_WATCHDOG_POLL_NS);
-    loop {
-        narf_time::sleep_cycles(tick).await;
-        device.check_tx_watchdog_at(narf_time::now_cycles());
+/// The core transmit watchdog's view of the device (`dev_watchdog` +
+/// `nv_tx_timeout`).
+impl narf_net::watchdog::NetdevWatchdog for ForcedethNic {
+    /// A TX descriptor waited past `TX_TIMEOUT_NS` with link up and no
+    /// recovery in progress.
+    fn tx_timed_out(&self, now: u64) -> bool {
+        if self.recovering.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.live_link_up() {
+            return false;
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        tx_stalled(&self.tx_posted_at.lock(), now, timeout)
+    }
+
+    /// Count the timeout and reset the transmit path (task context).
+    fn tx_timeout(&self) {
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+        let _ = self.recover();
     }
 }
 

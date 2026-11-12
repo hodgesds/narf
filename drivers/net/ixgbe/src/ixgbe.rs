@@ -200,8 +200,8 @@ pub const ADVTXD_VLAN_SHIFT: u32 = 16;
 /// descriptor posted longer ago than this with DD still clear is
 /// a wedged ring, not congestion.
 const TX_TIMEOUT_NS: u64 = 5_000_000_000;
-/// Watchdog supervisor cadence, matching igc's 10 ms maintenance tick.
-const TX_WATCHDOG_POLL_NS: u64 = 10_000_000;
+/// VF mailbox poll cadence (10 ms).
+const MAILBOX_POLL_NS: u64 = 10_000_000;
 /// TSO frame cap for `tx()`: the advertised bound (see probe's
 /// `max_tso_bytes`). The per-slot copy buffer is 10240 bytes (see
 /// bring_up), so the 4096 cap is conservative, not slot-bound;
@@ -2347,23 +2347,12 @@ impl Ixgbe {
         self.tx_resets.load(Ordering::Relaxed)
     }
 
-    /// One watchdog pass (shared by the supervisor task and the
-    /// fixture): if the link is up and a TX descriptor has waited
-    /// past the timeout, count the timeout and recover. Returns
-    /// true when recovery fired.
+    /// One watchdog pass, synchronously (the fixture): the core
+    /// watchdog's check, then `ndo_tx_timeout` if it fired. Returns
+    /// true when recovery fired and succeeded.
     fn check_tx_watchdog_at(&self, now: u64) -> bool {
-        if *self.quiesced.lock() || self.recovering.load(Ordering::Acquire) {
-            return false;
-        }
-        if self.read_links() & LINKS_UP == 0 {
-            return false;
-        }
-        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
-        let stalled = self
-            .tx_queues
-            .iter()
-            .any(|q| tx_stalled(&q.tx_posted_at.lock(), now, timeout));
-        if !stalled {
+        use narf_net::watchdog::NetdevWatchdog;
+        if !self.tx_timed_out(now) {
             return false;
         }
         self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -3319,9 +3308,14 @@ fn spawn_pumps(
             });
         }
     }
+    // `dev_watchdog`: a timer every `watchdog_timeo` (5 s) that queues
+    // the reset when a transmit is stuck; it stops with the device.
+    let weak: alloc::sync::Weak<dyn narf_net::watchdog::NetdevWatchdog> =
+        Arc::downgrade(&device) as _;
+    narf_net::watchdog::DevWatchdog::start_for_device(weak, TX_TIMEOUT_NS);
     let d = device;
     narf_scheduler::spawn(async move {
-        ixgbe_watchdog_pump(d).await;
+        ixgbe_mailbox_pump(d).await;
     });
 }
 
@@ -3379,20 +3373,41 @@ async fn ixgbe_tx_pump(device: Arc<Ixgbe>, q: usize, mut tx_cons: Consumer<Frame
     }
 }
 
-/// TX-timeout supervisor (igc maintenance-task shape): every 10 ms
-/// run one watchdog pass; a queue stalled 5 s with carrier up is
-/// recovered and counted. The pass itself gates on detach/suspend
-/// (quiesced) and on an in-flight recovery, so this loop is only a
-/// timer. The same tick is the mailbox pump's firing path (issue
-/// #1261): a pending VF message is dispatched and answered within
-/// one tick — `vt_mailbox_pump_step` no-ops until `configure_vmdq`
-/// runs, so the tick costs nothing on a non-VT device.
-async fn ixgbe_watchdog_pump(device: Arc<Ixgbe>) {
-    let tick = narf_time::ns_to_cycles(TX_WATCHDOG_POLL_NS);
+/// The VF mailbox pump's firing path (issue #1261): every 10 ms a
+/// pending VF message is dispatched and answered —
+/// `vt_mailbox_pump_step` no-ops until `configure_vmdq` runs, so the
+/// tick costs nothing on a non-VT device. (Linux takes the mailbox
+/// interrupt; the transmit watchdog is the core `dev_watchdog`.)
+async fn ixgbe_mailbox_pump(device: Arc<Ixgbe>) {
+    let tick = narf_time::ns_to_cycles(MAILBOX_POLL_NS);
     loop {
         narf_time::sleep_cycles(tick).await;
-        device.check_tx_watchdog_at(narf_time::now_cycles());
         device.vt_mailbox_pump_step();
+    }
+}
+
+/// The core transmit watchdog's view of the device (`dev_watchdog` +
+/// `ixgbe_tx_timeout` → `ixgbe_reset_subtask`).
+impl narf_net::watchdog::NetdevWatchdog for Ixgbe {
+    /// A TX descriptor on any queue waited past `TX_TIMEOUT_NS` with link
+    /// up, and the device is neither quiesced nor already recovering.
+    fn tx_timed_out(&self, now: u64) -> bool {
+        if *self.quiesced.lock() || self.recovering.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.read_links() & LINKS_UP == 0 {
+            return false;
+        }
+        let timeout = narf_time::ns_to_cycles(TX_TIMEOUT_NS);
+        self.tx_queues
+            .iter()
+            .any(|q| tx_stalled(&q.tx_posted_at.lock(), now, timeout))
+    }
+
+    /// Count the timeout and reset the transmit path (task context).
+    fn tx_timeout(&self) {
+        self.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+        let _ = self.recover();
     }
 }
 
