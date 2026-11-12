@@ -3951,8 +3951,7 @@ fn smoke_sysfs_active_vt_notifies_each_open() -> TestResult {
     let second = dir.lookup("active").unwrap();
     let mut buf = [0u8; 16];
     for file in [&first, &second] {
-        if crate::wait_sync(file.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty1\n"
-        {
+        if crate::wait_sync(file.read(0, &mut buf)) != Ok(5) || &buf[..5] != b"tty1\n" {
             return TestResult::Fail("initial active VT read");
         }
     }
