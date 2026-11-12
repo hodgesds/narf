@@ -562,7 +562,16 @@ static TASK_LOOKUP: AtomicUsize = AtomicUsize::new(0);
 /// Boot wires `|| scheduler::current_task_id().raw()` here.
 pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
     TASK_LOOKUP.store(lookup as usize, Ordering::Release);
+    // Filesystem lock waits on a syscall's behalf end on SIGKILL.
+    narf_filesystem::killable::install_kill_hooks(&KILL_HOOKS);
 }
+
+static KILL_HOOKS: narf_filesystem::killable::KillHooks = narf_filesystem::killable::KillHooks {
+    current: current_task_id,
+    pending: task_fatal_signal_pending,
+    arm: register_signal_waker,
+    disarm: drop_signal_waker,
+};
 
 /// Test hook: drop any installed current-task lookup so
 /// `current_task_id()` falls back to 0. The in-kernel smoke tests
