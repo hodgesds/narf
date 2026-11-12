@@ -975,11 +975,7 @@ pub(crate) fn eee_status(r: &impl Registers) -> Result<narf_net::nic::EeeStatus,
         let local2 = mmd(r, 7, 62, None)?;
         let partner = mmd(r, 7, 61, None)?;
         let partner2 = mmd(r, 7, 63, None)?;
-        let modes = |v: u16, v2: u16| {
-            (u32::from(v & 2 != 0) * 8)
-                | (u32::from(v & 4 != 0) * 16)
-                | (u32::from(v2 & 1 != 0) * 32)
-        };
+        let modes = crate::phy::eee_modes_from_mmd;
         Ok(narf_net::nic::EeeStatus {
             advertised: modes(local, local2),
             partner: modes(partner, partner2),

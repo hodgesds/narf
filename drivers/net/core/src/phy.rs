@@ -53,15 +53,48 @@
 //! assumes a Clause-22 page register at 0x1F and would read the
 //! wrong page through such a window.
 //!
-//! ## EEE rides here later (issue #794)
+//! ## EEE (issue #794) — the shared surface
 //!
-//! This trait deliberately exposes the Clause-45 MMD accessors
-//! ([`Phy::read_mmd`] / [`Phy::write_mmd`]) that the EEE surface
-//! needs (AN MMD 7.60 / 7.62 advertisement, 7.61 / 7.63 link
-//! partner). No EEE policy lives here — #794 builds on these
-//! accessors; this lane only proves the transport.
+//! The Clause-45 MMD accessors ([`Phy::read_mmd`] /
+//! [`Phy::write_mmd`]) are the transport; this section is the
+//! policy that rides them: the AN MMD 7.60 / 7.62 advertisement
+//! and 7.61 / 7.63 link-partner registers, decoded into the
+//! `narf_net::nic::EeeStatus` bit encoding (8 = 100BASE-TX, 16 =
+//! 1000BASE-T, 32 = 2.5GBASE-T) that e1000, igb and igc already
+//! used — each with its own hand-rolled copy of the decode. The
+//! shared [`eee_modes_from_mmd`] / [`eee_mmd_adv_words`] are
+//! that decode/encode in one place, and the provided
+//! [`Phy::eee_advertisement`] / [`Phy::eee_partner`] /
+//! [`Phy::set_eee_advertisement`] / [`Phy::eee_status`] methods
+//! are the trait-level surface drivers call instead of
+//! re-deriving the registers.
+//!
+//! Two deliberate limits, stated here so no caller over-reads
+//! them:
+//!
+//! * `tx_lpi` is a MAC register (EEER TX-LPI-EN), not a PHY
+//!   register: [`eee_status_from`] / [`Phy::eee_status`] report
+//!   it `false`. Drivers that own the MAC side (e1000, igb, igc)
+//!   keep their own status derivation and gate `active` on live
+//!   link-up; the PHY-side `active` is just the negotiated
+//!   intersection.
+//! * The shared decode knows 100M / 1G / 2.5G only. 10GBASE-T
+//!   EEE (7.60 bit 3) and 5GBASE-T EEE (7.62 bit 1) exist on the
+//!   wire — Realtek's `features::eee_adv` / `eee_adv2` already
+//!   program them — but `EeeStatus` has no bits for them, so the
+//!   shared decode ignores those bits rather than inventing an
+//!   encoding. Extending `EeeStatus` is a follow-up, not this
+//!   lane.
+//! * Realtek's internal PHYs (RTL8125 / RTL8126 / RTL8127) expose
+//!   no MMD registers: Linux emulates AN MMD 7.60 / 7.62 on
+//!   vendor paged registers and NARF's `advertise_eee` programs
+//!   those directly. The shared trait methods ride Clause-45
+//!   indirection and are for transports whose PHY answers it
+//!   (e1000's MDIC; r8169 per `phy_access.rs`); they are NOT a
+//!   replacement for the Realtek paged-emulation path.
 
 use narf_net::iface::LinkDuplex;
+use narf_net::nic::EeeStatus;
 
 use crate::publish::LinkSample;
 use crate::rtl_phy::{
@@ -110,6 +143,103 @@ pub const MII_MMD_DATA: u8 = 0x0E;
 pub const MMD_CTRL_ADDRESS: u16 = 0x0000;
 /// MMD control word: data phase (reads/writes the selected register).
 pub const MMD_CTRL_DATA: u16 = 0x4000;
+
+// ── EEE (IEEE 802.3az) — issue #794 ────────────────────────────────
+// The bit map comes from Linux `include/uapi/linux/mdio.h`
+// (`MDIO_MMD_AN` 7, `MDIO_AN_EEE_ADV` 60 / `MDIO_AN_EEE_LPABLE`
+// 61 / `MDIO_AN_EEE_ADV2` 62 / `MDIO_AN_EEE_LPABLE2` 63,
+// `MDIO_EEE_100TX` / `MDIO_EEE_1000T` / `MDIO_EEE_2_5GT`) and
+// is cross-checked in-tree by the three decodes this section
+// unifies (e1000, igb, igc) and by Realtek's `features::eee_adv`
+// / `eee_adv2` encode — all four agree on 7/60 bit 1 = 100M,
+// bit 2 = 1G, 7/62 bit 0 = 2.5G.
+
+/// AN MMD device (Clause 45): Auto-Negotiation.
+pub const EEE_MMD_DEV: u8 = 7;
+/// AN MMD EEE advertisement register (7.60).
+pub const EEE_MMD_ADV: u16 = 60;
+/// AN MMD link-partner EEE advertisement register (7.61).
+pub const EEE_MMD_LP_ADV: u16 = 61;
+/// AN MMD EEE advertisement-2 register (7.62).
+pub const EEE_MMD_ADV2: u16 = 62;
+/// AN MMD link-partner EEE advertisement-2 register (7.63).
+pub const EEE_MMD_LP_ADV2: u16 = 63;
+
+/// MMD 7/60 (and 7/61) bit: 100BASE-TX EEE.
+pub const EEE_MMD_100M: u16 = 1 << 1;
+/// MMD 7/60 (and 7/61) bit: 1000BASE-T EEE.
+pub const EEE_MMD_1G: u16 = 1 << 2;
+/// MMD 7/62 (and 7/63) bit: 2.5GBASE-T EEE.
+pub const EEE_MMD_2_5G: u16 = 1 << 0;
+
+/// `EeeStatus` advertised/partner bit: 100BASE-TX EEE.
+pub const EEE_ADV_100M: u32 = 1 << 3;
+/// `EeeStatus` advertised/partner bit: 1000BASE-T EEE.
+pub const EEE_ADV_1G: u32 = 1 << 4;
+/// `EeeStatus` advertised/partner bit: 2.5GBASE-T EEE.
+pub const EEE_ADV_2_5G: u32 = 1 << 5;
+/// Every speed the shared decode knows (100M + 1G + 2.5G).
+pub const EEE_ADV_ALL: u32 = EEE_ADV_100M | EEE_ADV_1G | EEE_ADV_2_5G;
+
+/// Decode an EEE advertisement pair (MMD 7/60 + 7/62, or the
+/// link-partner pair 7/61 + 7/63 — same layout) into the
+/// `EeeStatus` bit encoding. Bits outside the three known modes
+/// (10GBASE-T in 7/60 bit 3, 5GBASE-T in 7/62 bit 1, and every
+/// reserved bit) are ignored, never leaked into the result.
+pub const fn eee_modes_from_mmd(local: u16, local2: u16) -> u32 {
+    (if local & EEE_MMD_100M != 0 {
+        EEE_ADV_100M
+    } else {
+        0
+    }) | (if local & EEE_MMD_1G != 0 {
+        EEE_ADV_1G
+    } else {
+        0
+    }) | (if local2 & EEE_MMD_2_5G != 0 {
+        EEE_ADV_2_5G
+    } else {
+        0
+    })
+}
+
+/// MMD advertisement words (7/60, 7/62) for an advertised set:
+/// the inverse of [`eee_modes_from_mmd`]. A 10G/5G request has
+/// no `EeeStatus` bit and so cannot be expressed here — it is
+/// dropped, never programmed as a neighbouring mode.
+pub const fn eee_mmd_adv_words(advertised: u32) -> (u16, u16) {
+    (
+        (if advertised & EEE_ADV_100M != 0 {
+            EEE_MMD_100M
+        } else {
+            0
+        }) | (if advertised & EEE_ADV_1G != 0 {
+            EEE_MMD_1G
+        } else {
+            0
+        }),
+        if advertised & EEE_ADV_2_5G != 0 {
+            EEE_MMD_2_5G
+        } else {
+            0
+        },
+    )
+}
+
+/// PHY-side EEE status from an advertised set and a link-partner
+/// set: `active` is the negotiated intersection
+/// (`advertised ∩ partner` non-empty). NOT gated on link-up —
+/// the caller gates on live link (MAC STATUS.LU) the way
+/// e1000/igb do — and `tx_lpi` is always `false`: TX LPI is a
+/// MAC register (EEER), not a PHY register, so a PHY-only read
+/// cannot prove it.
+pub const fn eee_status_from(advertised: u32, partner: u32) -> EeeStatus {
+    EeeStatus {
+        advertised,
+        partner,
+        active: (advertised & partner) != 0,
+        tx_lpi: false,
+    }
+}
 
 // ── Negotiated link ─────────────────────────────────────────────────
 
@@ -334,7 +464,7 @@ pub trait Phy {
     /// indirection sequence (IEEE 802.3 Clause 45 over Clause
     /// 22): write the device to 0x0D, the register to 0x0E,
     /// `0x4000 | device` to 0x0D (data phase), then read 0x0E.
-    /// This is the transport the #794 EEE surface will ride
+    /// This is the transport the EEE surface below rides
     /// (AN MMD 7.60 / 7.62).
     fn read_mmd(&self, dev: u8, reg: u16) -> Result<u16, Self::Error> {
         self.write_reg(MII_MMD_CTRL, u16::from(dev) | MMD_CTRL_ADDRESS)?;
@@ -385,5 +515,45 @@ pub trait Phy {
     /// decode on top of [`read_status_c22`].
     fn read_status(&self) -> Result<PhyLink, Self::Error> {
         read_status_c22(self)
+    }
+
+    /// Our EEE advertisement, read from the AN MMD (7/60 +
+    /// 7/62) and decoded into the `EeeStatus` bit encoding.
+    /// Rides [`Phy::read_mmd`]; see the module docs for the
+    /// transports this does (and does not) apply to.
+    fn eee_advertisement(&self) -> Result<u32, Self::Error> {
+        let local = self.read_mmd(EEE_MMD_DEV, EEE_MMD_ADV)?;
+        let local2 = self.read_mmd(EEE_MMD_DEV, EEE_MMD_ADV2)?;
+        Ok(eee_modes_from_mmd(local, local2))
+    }
+
+    /// The link partner's EEE advertisement (7/61 + 7/63),
+    /// decoded into the `EeeStatus` bit encoding.
+    fn eee_partner(&self) -> Result<u32, Self::Error> {
+        let partner = self.read_mmd(EEE_MMD_DEV, EEE_MMD_LP_ADV)?;
+        let partner2 = self.read_mmd(EEE_MMD_DEV, EEE_MMD_LP_ADV2)?;
+        Ok(eee_modes_from_mmd(partner, partner2))
+    }
+
+    /// Program our EEE advertisement (7/60 + 7/62). This only
+    /// writes the words: the caller restarts autonegotiation
+    /// afterwards (BMCR restart) so the new advertisement goes
+    /// on the wire — without it the change only takes effect at
+    /// the next renegotiation.
+    fn set_eee_advertisement(&self, advertised: u32) -> Result<(), Self::Error> {
+        let (adv, adv2) = eee_mmd_adv_words(advertised);
+        self.write_mmd(EEE_MMD_DEV, EEE_MMD_ADV, adv)?;
+        self.write_mmd(EEE_MMD_DEV, EEE_MMD_ADV2, adv2)
+    }
+
+    /// PHY-side EEE status: advertised + partner + negotiated
+    /// intersection ([`eee_status_from`]). `active` is NOT gated
+    /// on link-up and `tx_lpi` is always `false` here — both
+    /// need MAC-side state the PHY cannot prove; drivers that
+    /// own the MAC keep their own derivation.
+    fn eee_status(&self) -> Result<EeeStatus, Self::Error> {
+        let advertised = self.eee_advertisement()?;
+        let partner = self.eee_partner()?;
+        Ok(eee_status_from(advertised, partner))
     }
 }

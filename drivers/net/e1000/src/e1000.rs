@@ -1672,13 +1672,11 @@ fn mdic_data(word: u32) -> u16 {
 }
 
 /// Decode an EEE advertisement pair (MMD 7/60 + 7/62) into the
-/// `narf_net::nic::EeeStatus` bit encoding: MMD 7/60 bit 1 →
-/// 100BASE-TX (8), bit 2 → 1000BASE-T (16); MMD 7/62 bit 0 →
-/// 2.5GBASE-T (32). Same decode as igc's `modes()` closure.
+/// `narf_net::nic::EeeStatus` bit encoding — the shared decode
+/// ([`crate::phy::eee_modes_from_mmd`]); this keeps the name
+/// the existing call sites and smokes use.
 fn eee_modes_from_mmd(local: u16, local2: u16) -> u32 {
-    (if local & 0x2 != 0 { EEE_ADV_100M } else { 0 })
-        | (if local & 0x4 != 0 { EEE_ADV_1G } else { 0 })
-        | (if local2 & 0x1 != 0 { EEE_ADV_2_5G } else { 0 })
+    crate::phy::eee_modes_from_mmd(local, local2)
 }
 
 /// Next IPCNFG word for an advertised set: rewrite only the PCH
