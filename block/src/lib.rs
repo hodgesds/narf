@@ -40,6 +40,7 @@ pub mod mq;
 pub mod noop;
 pub mod opal;
 pub mod partition;
+pub mod queue;
 pub mod ram;
 pub mod registry;
 pub mod scsi;
@@ -54,6 +55,7 @@ pub use io_scheduler::{
 };
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
 pub use noop::NoopScheduler;
+pub use queue::{BlockQueue, BoxedCancel, BoxedCompletion, BoxedResult, OffsetQueue, QueueLimits};
 
 #[cfg(feature = "cgroup")]
 pub use cgroup::{dev_id_from_ptr, install_cgroup_io_hook, IoCgroupHook};

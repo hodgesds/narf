@@ -139,6 +139,43 @@ device via `BlockSchedulerPolicy` if a specific workload demands it.
 - Consumers don't see queue multiplicity; they submit against the
   device, `block/` picks the queue (CPU-local preferred).
 
+**Queued submission behind registry devices** (`block/src/queue.rs`,
+Linux `request_queue` + `queue_limits`). The registry holds
+`Arc<dyn BlockDeviceSync>`; a driver with a real queued data path
+publishes it through the object-safe `BlockQueue`:
+
+```rust
+pub trait BlockDeviceSync {
+    /* … */
+    fn queue(&self) -> Option<Arc<dyn BlockQueue>> { None }   // the device's request queue
+}
+
+pub trait BlockQueue: Send + Sync {
+    fn limits(&self) -> QueueLimits;                 // max transfer / segments / alignment / depth
+    fn submit(&self, req: BlockRequest) -> BoxedCompletion;   // pending until the device completes
+    fn flush(&self) -> BoxedResult;
+    fn cancel(&self, tag: u64) -> BoxedCancel;
+    fn in_flight(&self) -> usize;                     // requests at the device (diagnostic)
+}
+
+pub struct QueueLimits {                              // Linux `struct queue_limits`
+    pub logical_block_size: u32, pub max_transfer_bytes: u32,
+    pub max_segments: u32, pub max_segment_bytes: u32, pub dma_alignment: u32,
+    pub queue_depth: u32, pub nr_queues: u32,
+}
+```
+
+`SyncBlock::new` resolves the device's queue once; its `submit` /
+`flush_result` / `cancel` go through it and return pending futures, so
+N tasks have N requests at the device at once. Without a queue the
+request is performed synchronously inside `submit`, one per device at a
+time, as before. Wrappers forward the queue with their own contract
+kept: `PartitionBlockDevice` windows it (`OffsetQueue`: range-checked,
+LBA-shifted), `PolicyGuard` gates writes, write-zeroes and trims on it
+exactly as it gates the sync calls (`PolicyQueue`); encrypted / LUKS
+devices expose none and stay on the synchronous path. A request outside
+`QueueLimits` is refused with `InvalidRange`, never split by `block/`.
+
 ### 3.5 Registry lookup
 
 ```rust
