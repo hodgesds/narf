@@ -5129,11 +5129,14 @@ fn smoke_ipv6_fragment_reassembly_two_pieces() -> TestResult {
     let part2 = alloc::vec![0xBBu8; 4];
 
     // Process them.
-    if process_fragment(src, dst, &frag1_hdr, &part1).is_some() {
+    if process_fragment(src, dst, &frag1_hdr, &part1, &[])
+        .0
+        .is_some()
+    {
         return TestResult::Fail("first fragment shouldn't complete");
     }
-    let result = process_fragment(src, dst, &frag2_hdr, &part2);
-    let (nh, assembled) = match result {
+    let result = process_fragment(src, dst, &frag2_hdr, &part2, &[]);
+    let (nh, assembled) = match result.0 {
         Some(t) => t,
         None => return TestResult::Fail("reassembly didn't complete"),
     };

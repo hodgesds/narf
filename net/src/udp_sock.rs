@@ -964,6 +964,13 @@ pub fn install_user_deliver_hook(hook: UserDeliverHook) {
     USER_DELIVER_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
 }
 
+/// Clear the userspace-socket delivery hook, so a smoke that installed
+/// a stub does not leak it into the next smoke. Test-only.
+#[doc(hidden)]
+pub fn __reset_user_deliver_hook_for_test() {
+    USER_DELIVER_HOOK.store(0, core::sync::atomic::Ordering::Release);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn user_deliver(
     net_ns_id: u64,

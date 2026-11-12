@@ -1304,14 +1304,14 @@ fn smoke_cov_ipv6_frag_out_of_order_completes() -> TestResult {
     let a = [0xAAu8; 16];
     let b = [0xBBu8; 8];
     let c = [0xCCu8; 5];
-    let r1 = process_fragment_at(1, s, d, &frag_hdr(24, false, 71), &c);
-    let r2 = process_fragment_at(2, s, d, &frag_hdr(0, true, 71), &a);
-    let r3 = process_fragment_at(3, s, d, &frag_hdr(16, true, 71), &b);
+    let r1 = process_fragment_at(1, s, d, &frag_hdr(24, false, 71), &c, &[]);
+    let r2 = process_fragment_at(2, s, d, &frag_hdr(0, true, 71), &a, &[]);
+    let r3 = process_fragment_at(3, s, d, &frag_hdr(16, true, 71), &b, &[]);
     __reset_for_test();
-    if r1.is_some() || r2.is_some() {
+    if r1.0.is_some() || r2.0.is_some() {
         return TestResult::Fail("reassembly completed with a hole");
     }
-    let (_, body) = match r3 {
+    let (_, body) = match r3.0 {
         Some(t) => t,
         None => return TestResult::Fail("out-of-order fragments did not reassemble"),
     };
@@ -1331,14 +1331,14 @@ fn smoke_cov_ipv6_frag_overlap_abandons_datagram() -> TestResult {
     use crate::ipv6_stack::{__reset_for_test, process_fragment_at};
     __reset_for_test();
     let (s, d) = (v6(3), v6(4));
-    let _ = process_fragment_at(1, s, d, &frag_hdr(0, true, 72), &[1u8; 16]);
+    let _ = process_fragment_at(1, s, d, &frag_hdr(0, true, 72), &[1u8; 16], &[]);
     // Overlaps bytes 8..16 of the first piece with different content.
-    let _ = process_fragment_at(2, s, d, &frag_hdr(8, true, 72), &[2u8; 16]);
+    let _ = process_fragment_at(2, s, d, &frag_hdr(8, true, 72), &[2u8; 16], &[]);
     // Completing pieces for BOTH interpretations: neither may complete.
-    let r1 = process_fragment_at(3, s, d, &frag_hdr(16, false, 72), &[3u8; 8]);
-    let r2 = process_fragment_at(4, s, d, &frag_hdr(24, false, 72), &[3u8; 8]);
+    let r1 = process_fragment_at(3, s, d, &frag_hdr(16, false, 72), &[3u8; 8], &[]);
+    let r2 = process_fragment_at(4, s, d, &frag_hdr(24, false, 72), &[3u8; 8], &[]);
     __reset_for_test();
-    if r1.is_some() || r2.is_some() {
+    if r1.0.is_some() || r2.0.is_some() {
         return TestResult::Fail("datagram with overlapping fragments was reassembled");
     }
     TestResult::Pass
@@ -1353,14 +1353,14 @@ fn smoke_cov_ipv6_frag_exact_duplicate_tolerated() -> TestResult {
     use crate::ipv6_stack::{__reset_for_test, process_fragment_at};
     __reset_for_test();
     let (s, d) = (v6(5), v6(6));
-    let _ = process_fragment_at(1, s, d, &frag_hdr(0, true, 73), &[7u8; 8]);
-    let dup = process_fragment_at(2, s, d, &frag_hdr(0, true, 73), &[7u8; 8]);
-    let done = process_fragment_at(3, s, d, &frag_hdr(8, false, 73), &[8u8; 3]);
+    let _ = process_fragment_at(1, s, d, &frag_hdr(0, true, 73), &[7u8; 8], &[]);
+    let dup = process_fragment_at(2, s, d, &frag_hdr(0, true, 73), &[7u8; 8], &[]);
+    let done = process_fragment_at(3, s, d, &frag_hdr(8, false, 73), &[8u8; 3], &[]);
     __reset_for_test();
-    if dup.is_some() {
+    if dup.0.is_some() {
         return TestResult::Fail("duplicate first fragment completed a datagram");
     }
-    match done {
+    match done.0 {
         Some((_, body)) if body.len() == 11 => TestResult::Pass,
         _ => TestResult::Fail("exact duplicate fragment broke reassembly"),
     }
@@ -1375,17 +1375,17 @@ fn smoke_cov_ipv6_frag_rejects_bad_lengths() -> TestResult {
     __reset_for_test();
     let (s, d) = (v6(7), v6(8));
     // Non-final fragment whose length is not a multiple of 8.
-    let _ = process_fragment_at(1, s, d, &frag_hdr(0, true, 74), &[1u8; 12]);
-    let odd = process_fragment_at(2, s, d, &frag_hdr(12 & 0xFFF8, false, 74), &[1u8; 4]);
+    let _ = process_fragment_at(1, s, d, &frag_hdr(0, true, 74), &[1u8; 12], &[]);
+    let odd = process_fragment_at(2, s, d, &frag_hdr(12 & 0xFFF8, false, 74), &[1u8; 4], &[]);
     // offset + length > 65535 (would also overflow the u16 arithmetic).
-    let huge = process_fragment_at(3, s, d, &frag_hdr(65528, false, 75), &[0u8; 16]);
+    let huge = process_fragment_at(3, s, d, &frag_hdr(65528, false, 75), &[0u8; 16], &[]);
     // Truncated fragment header.
-    let short = process_fragment_at(4, s, d, &[0u8; 7], &[0u8; 8]);
+    let short = process_fragment_at(4, s, d, &[0u8; 7], &[0u8; 8], &[]);
     __reset_for_test();
-    if odd.is_some() {
+    if odd.0.is_some() {
         return TestResult::Fail("non-final fragment with a non-multiple-of-8 length accepted");
     }
-    if huge.is_some() || short.is_some() {
+    if huge.0.is_some() || short.0.is_some() {
         return TestResult::Fail("oversized or truncated fragment accepted");
     }
     TestResult::Pass
@@ -1401,12 +1401,12 @@ fn smoke_cov_ipv6_frag_inconsistent_end_abandons() -> TestResult {
     use crate::ipv6_stack::{__reset_for_test, process_fragment_at};
     __reset_for_test();
     let (s, d) = (v6(9), v6(10));
-    let _ = process_fragment_at(1, s, d, &frag_hdr(16, false, 76), &[1u8; 8]);
-    let _ = process_fragment_at(2, s, d, &frag_hdr(8, false, 76), &[2u8; 4]);
-    let r = process_fragment_at(3, s, d, &frag_hdr(0, true, 76), &[3u8; 8]);
-    let r2 = process_fragment_at(4, s, d, &frag_hdr(8, true, 76), &[3u8; 8]);
+    let _ = process_fragment_at(1, s, d, &frag_hdr(16, false, 76), &[1u8; 8], &[]);
+    let _ = process_fragment_at(2, s, d, &frag_hdr(8, false, 76), &[2u8; 4], &[]);
+    let r = process_fragment_at(3, s, d, &frag_hdr(0, true, 76), &[3u8; 8], &[]);
+    let r2 = process_fragment_at(4, s, d, &frag_hdr(8, true, 76), &[3u8; 8], &[]);
     __reset_for_test();
-    if r.is_some() || r2.is_some() {
+    if r.0.is_some() || r2.0.is_some() {
         return TestResult::Fail("datagram with two conflicting final fragments reassembled");
     }
     TestResult::Pass
@@ -1423,17 +1423,17 @@ fn smoke_cov_ipv6_frag_reassembly_times_out() -> TestResult {
     __reset_for_test();
     let (s, d) = (v6(11), v6(12));
     let t0 = 1_000_000_000u64;
-    let _ = process_fragment_at(t0, s, d, &frag_hdr(0, true, 77), &[1u8; 8]);
+    let _ = process_fragment_at(t0, s, d, &frag_hdr(0, true, 77), &[1u8; 8], &[]);
     let late = t0 + FRAG_REASSEMBLY_TIMEOUT_NS + 1;
-    let r = process_fragment_at(late, s, d, &frag_hdr(8, false, 77), &[2u8; 8]);
+    let r = process_fragment_at(late, s, d, &frag_hdr(8, false, 77), &[2u8; 8], &[]);
     // Control: the same two fragments inside the window DO reassemble.
-    let _ = process_fragment_at(t0, s, d, &frag_hdr(0, true, 78), &[1u8; 8]);
-    let ok = process_fragment_at(t0 + 1_000, s, d, &frag_hdr(8, false, 78), &[2u8; 8]);
+    let _ = process_fragment_at(t0, s, d, &frag_hdr(0, true, 78), &[1u8; 8], &[]);
+    let ok = process_fragment_at(t0 + 1_000, s, d, &frag_hdr(8, false, 78), &[2u8; 8], &[]);
     __reset_for_test();
-    if r.is_some() {
+    if r.0.is_some() {
         return TestResult::Fail("fragment completed a reassembly older than 60 s");
     }
-    if ok.is_none() {
+    if ok.0.is_none() {
         return TestResult::Fail("control: in-window fragments did not reassemble");
     }
     TestResult::Pass

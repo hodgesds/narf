@@ -112,6 +112,31 @@ struct FragBuf {
     nh: u8,
     /// Monotonic time the first-arriving fragment was received.
     first_ns: u64,
+    /// Whether the offset-0 (first) fragment arrived (Linux
+    /// `INET_FRAG_FIRST_IN`). Only reassemblies with this set get a
+    /// Time Exceeded on timeout.
+    first_in: bool,
+    /// The offset-0 fragment's full IPv6 packet as received (header +
+    /// Fragment header + payload), capped at the minimum IPv6 MTU:
+    /// the §2.4(c) quote bound (1232 bytes) never needs more. This is
+    /// the invoking packet quoted by the Time Exceeded error when
+    /// this reassembly times out.
+    invoking: Vec<u8>,
+}
+
+/// A reassembly abandoned by the 60 s timeout whose sender is owed a
+/// Time Exceeded (code 1) error (RFC 4443 §3.3, Linux
+/// `ip6_expire_frag_queue`). Only reassemblies whose first (offset-0)
+/// fragment arrived are reported — Linux sends no error if the first
+/// segment did not arrive.
+#[derive(Debug)]
+pub struct ExpiredReassembly {
+    /// Source of the timed-out datagram (the error's destination).
+    pub src: [u8; 16],
+    /// Destination of the timed-out datagram (the error's source).
+    pub dst: [u8; 16],
+    /// The first fragment's full IPv6 packet, quoted by the error.
+    pub invoking: Vec<u8>,
 }
 
 static FRAGS: IrqSafeSpinLock<BTreeMap<FragKey, FragBuf>> = IrqSafeSpinLock::new(BTreeMap::new());
@@ -123,16 +148,24 @@ static NEXT_FRAGMENT_ID: AtomicU32 = AtomicU32::new(1);
 /// first-arriving fragment must be abandoned.
 pub const FRAG_REASSEMBLY_TIMEOUT_NS: u64 = 60_000_000_000;
 
-/// Process a fragment. Returns `Some((nh, body))` if the assembly is
-/// complete; `None` otherwise.
+/// Process a fragment. Returns the completed reassembly, if any,
+/// plus the reassemblies abandoned by the 60 s timeout while
+/// processing it (see [`ExpiredReassembly`]).
+///
+/// `invoking_packet` is this fragment's full IPv6 packet as received
+/// (header + Fragment header + payload); the offset-0 fragment's copy
+/// is retained (capped at the minimum IPv6 MTU) as the invoking
+/// packet for a later Time Exceeded. Callers that do not have the
+/// packet (unit tests) pass `&[]` and get no timeout error for it.
 pub fn process_fragment(
     src: [u8; 16],
     dst: [u8; 16],
     frag_hdr: &[u8],
     fragment_payload: &[u8],
-) -> Option<(u8, Vec<u8>)> {
+    invoking_packet: &[u8],
+) -> (Option<(u8, Vec<u8>)>, Vec<ExpiredReassembly>) {
     let now = narf_scheduler::narf_time::monotonic_ns();
-    process_fragment_at(now, src, dst, frag_hdr, fragment_payload)
+    process_fragment_at(now, src, dst, frag_hdr, fragment_payload, invoking_packet)
 }
 
 /// [`process_fragment`] with an explicit clock, so the reassembly timeout
@@ -144,9 +177,10 @@ pub fn process_fragment_at(
     dst: [u8; 16],
     frag_hdr: &[u8],
     fragment_payload: &[u8],
-) -> Option<(u8, Vec<u8>)> {
+    invoking_packet: &[u8],
+) -> (Option<(u8, Vec<u8>)>, Vec<ExpiredReassembly>) {
     if frag_hdr.len() < 8 {
-        return None;
+        return (None, Vec::new());
     }
     let nh = frag_hdr[0];
     let offset_word = u16::from_be_bytes([frag_hdr[2], frag_hdr[3]]);
@@ -162,14 +196,34 @@ pub fn process_fragment_at(
     // overflowing the u16 arithmetic below.
     let end = frag_offset as usize + fragment_payload.len();
     if end > u16::MAX as usize || (more && fragment_payload.len() % 8 != 0) {
-        return None;
+        return (None, Vec::new());
     }
     let end = end as u16;
 
     let mut g = FRAGS.lock();
     // Abandon reassemblies that outlived the 60 s window. Without this, a
     // datagram that never completes pins its fragments forever.
-    g.retain(|_, b| now_ns.saturating_sub(b.first_ns) < FRAG_REASSEMBLY_TIMEOUT_NS);
+    // Reassemblies whose first (offset-0) fragment arrived are reported
+    // so the caller can originate Time Exceeded (code 1) for them —
+    // Linux `ip6_expire_frag_queue` sends no error if the first
+    // segment did not arrive. The rest are dropped silently.
+    // Deviation, stated plainly: Linux expires on a timer; NARF has no
+    // reassembly timer, so expiry — and its error — happen lazily when
+    // the next fragment for any key arrives.
+    let mut expired = Vec::new();
+    g.retain(|key, b| {
+        if now_ns.saturating_sub(b.first_ns) < FRAG_REASSEMBLY_TIMEOUT_NS {
+            return true;
+        }
+        if b.first_in && !b.invoking.is_empty() {
+            expired.push(ExpiredReassembly {
+                src: key.src,
+                dst: key.dst,
+                invoking: core::mem::take(&mut b.invoking),
+            });
+        }
+        false
+    });
     let buf = g.entry(key).or_insert_with(|| FragBuf {
         first_ns: now_ns,
         ..FragBuf::default()
@@ -185,11 +239,11 @@ pub fn process_fragment_at(
         }
         if (frag_offset as usize) < o_end && (*off as usize) < end as usize {
             g.remove(&key);
-            return None;
+            return (None, expired);
         }
     }
     if duplicate {
-        return None;
+        return (None, expired);
     }
     // A last fragment that disagrees with an earlier one about where the
     // datagram ends, or a piece reaching past a known end, cannot belong to
@@ -206,10 +260,18 @@ pub fn process_fragment_at(
     };
     if inconsistent {
         g.remove(&key);
-        return None;
+        return (None, expired);
     }
     if frag_offset == 0 {
         buf.nh = nh;
+        // First fragment arrived: retain its full packet (capped at
+        // the minimum IPv6 MTU — the §2.4(c) quote bound never needs
+        // more) as the invoking packet for a later Time Exceeded.
+        buf.first_in = true;
+        if buf.invoking.is_empty() {
+            let cap = invoking_packet.len().min(crate::pkt_ipv6::ICMPV6_MIN_MTU);
+            buf.invoking = invoking_packet[..cap].to_vec();
+        }
     }
     buf.pieces.push((frag_offset, fragment_payload.to_vec()));
     if !more {
@@ -218,24 +280,27 @@ pub fn process_fragment_at(
 
     // Have we got everything? Sum the piece lengths and compare to
     // the declared total.
-    let total = buf.total?;
+    let total = match buf.total {
+        Some(t) => t,
+        None => return (None, expired),
+    };
     let mut sorted = buf.pieces.clone();
     sorted.sort_by_key(|p| p.0);
     let mut assembled = Vec::with_capacity(total as usize);
     let mut next_expected = 0u16;
     for (off, data) in sorted {
         if off != next_expected {
-            return None; // Hole — wait for more.
+            return (None, expired); // Hole — wait for more.
         }
         assembled.extend_from_slice(&data);
         next_expected = next_expected.saturating_add(data.len() as u16);
     }
     if next_expected != total {
-        return None;
+        return (None, expired);
     }
     let nh = buf.nh;
     g.remove(&key);
-    Some((nh, assembled))
+    (Some((nh, assembled)), expired)
 }
 
 /// Addressing and L4 payload for an outbound IPv6 frame.
@@ -1426,9 +1491,12 @@ pub fn icmp6_error_rate_limiter() -> &'static Icmp6ErrorRateLimiter {
 /// stack itself drops for a specific reason.
 ///
 /// The (e.4)/(e.5) link-layer multicast/broadcast checks still need
-/// the RX path to forward the L2 destination, which it currently
-/// strips — callers answering a link-layer multicast/broadcast frame
-/// must suppress themselves.
+/// the RX path to forward the L2 destination: [`rx_frame_l2`] threads
+/// it through as [`L2Dst`], and the #1727 RX-triggered generators
+/// suppress themselves on a link-layer multicast/broadcast frame.
+/// Callers of this entry point that cannot see the L2 destination
+/// (notably the test-only [`rx_frame`]) pass [`L2Dst::Unknown`], which
+/// fails open — the checks cannot be evaluated without the address.
 pub fn send_icmp6_error(
     iface_name: &str,
     src_ip: [u8; 16],
@@ -1472,11 +1540,82 @@ pub fn send_icmp6_error_in(
 }
 
 // ── Inbound dispatch ────────────────────────────────────────────────
+//
+// #1727 RX-triggered ICMPv6 error generation points (each goes through
+// `send_icmp6_error_in`, so the §2.4(e) suppression + §2.4(f) rate
+// limit apply to every one):
+//   (a) UDP RX with no listener → Destination Unreachable code 4,
+//       in `handle_udp6` (Linux `__udp6_lib_rcv`). LIVE.
+//   (b) Packet Too Big for forwarded packets exceeding the next-hop
+//       MTU → NOT APPLICABLE: there is no IPv6 forwarding path in
+//       this tree (`ip_forward::try_forward` is IPv4-only and
+//       `tcp_stack::dispatch_l3` has no IPv6 arm), and a host that
+//       does not forward has nothing to generate (Linux `ip6_forward`
+//       is only reached when forwarding is enabled). The PTB builder
+//       stays available for the forwarding lane that owns this.
+//   (c) Time Exceeded code 1 on fragment reassembly timeout, in the
+//       fragment branch below (Linux `ip6_expire_frag_queue`). LIVE.
+//   (d) RFC 4443 §2.4(e.4)/(e.5) link-layer suppression: the L2
+//       destination is threaded through as `L2Dst`. LIVE for the
+//       generators below; `send_icmp6_error_in` itself cannot see it.
+
+/// Class of the link-layer destination a frame arrived on, for the
+/// RFC 4443 §2.4(e.4)/(e.5) suppression checks: no error may be
+/// originated for a packet received as a link-layer multicast or
+/// broadcast. The broadcast address has the I/G bit set, so one
+/// class covers both rules.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum L2Dst {
+    /// The L2 destination is not known (legacy/test entry point):
+    /// the (e.4)/(e.5) checks cannot be evaluated and fail open.
+    Unknown,
+    /// Unicast L2 destination: errors may be originated.
+    Unicast,
+    /// Link-layer multicast or broadcast destination: the #1727
+    /// generators suppress themselves.
+    Multicast,
+}
+
+impl L2Dst {
+    /// Classify an Ethernet destination MAC by the I/G bit (LSB of
+    /// the first octet).
+    pub fn from_mac(dst_mac: [u8; 6]) -> Self {
+        if dst_mac[0] & 1 != 0 {
+            L2Dst::Multicast
+        } else {
+            L2Dst::Unicast
+        }
+    }
+}
 
 /// Inbound dispatch — call from the IPv6 RX hook in `tcp_stack`.
 /// `iface` is the iface name on which the frame arrived. Returns
 /// `true` iff the frame was recognised.
+///
+/// The L2 destination is unknown through this entry point, so the
+/// §2.4(e.4)/(e.5) checks fail open; production callers that have
+/// the Ethernet header use [`rx_frame_l2`].
 pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
+    rx_frame_l2(iface, frame_after_eth, L2Dst::Unknown)
+}
+
+/// [`rx_frame`] with the link-layer destination class, for the
+/// RFC 4443 §2.4(e.4)/(e.5) suppression checks. Production callers
+/// classify the Ethernet destination MAC with [`L2Dst::from_mac`].
+pub fn rx_frame_l2(iface: &str, frame_after_eth: &[u8], l2_dst: L2Dst) -> bool {
+    rx_frame_l2_at(
+        iface,
+        frame_after_eth,
+        l2_dst,
+        narf_scheduler::narf_time::monotonic_ns(),
+    )
+}
+
+/// [`rx_frame_l2`] with an explicit clock, so the fragment
+/// reassembly timeout (and its Time Exceeded) can be exercised
+/// deterministically.
+#[doc(hidden)]
+pub fn rx_frame_l2_at(iface: &str, frame_after_eth: &[u8], l2_dst: L2Dst, now_ns: u64) -> bool {
     let ip = match Ipv6Header::decode(frame_after_eth) {
         Ok(h) => h,
         Err(_) => return false,
@@ -1493,11 +1632,46 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
             return false;
         }
         let frag_payload = &payload[8..];
-        let assembled = process_fragment(ip.src_ip, ip.dst_ip, &payload[..8], frag_payload);
+        let (assembled, expired) = process_fragment_at(
+            now_ns,
+            ip.src_ip,
+            ip.dst_ip,
+            &payload[..8],
+            frag_payload,
+            frame_after_eth,
+        );
+        // #1727(c): Time Exceeded code 1 for each reassembly that
+        // timed out (Linux `ip6_expire_frag_queue`). Each goes
+        // through `send_icmp6_error_in` (§2.4(e)/(f) apply); a
+        // link-layer multicast/broadcast frame suppresses, per
+        // §2.4(e.4)/(e.5). Failures drop silently — the fragments
+        // are already gone.
+        if l2_dst != L2Dst::Multicast {
+            let net_ns_id = crate::iface::lookup(iface)
+                .map(|entry| entry.net_ns_id)
+                .unwrap_or(0);
+            for e in &expired {
+                let _ = send_icmp6_error_in(
+                    net_ns_id,
+                    iface,
+                    e.dst,
+                    Icmp6ErrorKind::TimeExceeded(1),
+                    &e.invoking,
+                );
+            }
+        }
         let (next_nh, body) = match assembled {
             Some(t) => t,
             None => return true, // got the fragment, waiting for more
         };
+        // Reconstruct the invoking (reassembled) packet for the L4
+        // handlers: the decoded header with the reassembled length
+        // and next-header, plus the reassembled body.
+        let mut hdr = ip;
+        hdr.payload_length = body.len() as u16;
+        hdr.next_header = next_nh;
+        let mut invoking = hdr.encode().to_vec();
+        invoking.extend_from_slice(&body);
         return dispatch_l4(
             iface,
             ip.src_ip,
@@ -1508,12 +1682,17 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
             },
             next_nh,
             &body,
+            Icmp6ErrorCtx {
+                invoking: &invoking,
+                l2_dst,
+            },
         );
     }
     let l4 = match skip_extension_headers(nh, payload) {
         Some(l) => l,
         None => return false,
     };
+    let invoking = &frame_after_eth[..IPV6_HDR_LEN + ip.payload_length as usize];
     dispatch_l4(
         iface,
         ip.src_ip,
@@ -1524,7 +1703,20 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
         },
         l4.proto,
         &payload[l4.offset..],
+        Icmp6ErrorCtx { invoking, l2_dst },
     )
+}
+
+/// The context an L4 handler needs to originate an ICMPv6 error in
+/// reply to the packet being dispatched (RFC 4443 §2.4(e)): the
+/// invoking packet, quoted in the error body (§3), and the class of
+/// the link-layer destination it arrived on, which gates whether an
+/// error may be originated at all (§2.4(e.4)/(e.5)). The two travel
+/// together — bundled so `dispatch_l4` stays under clippy's
+/// argument-count limit without an `#[allow]`.
+struct Icmp6ErrorCtx<'a> {
+    invoking: &'a [u8],
+    l2_dst: L2Dst,
 }
 
 fn dispatch_l4(
@@ -1534,10 +1726,11 @@ fn dispatch_l4(
     meta: crate::udp_sock::RxIpMeta,
     proto: u8,
     l4: &[u8],
+    err_ctx: Icmp6ErrorCtx<'_>,
 ) -> bool {
     match proto {
         NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, l4),
-        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, meta, l4),
+        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, meta, l4, err_ctx),
         NEXT_HEADER_TCP => handle_tcp6(iface, src_ip, dst_ip, l4),
         _ => false,
     }
@@ -1563,6 +1756,7 @@ fn handle_udp6(
     dst_ip: [u8; 16],
     meta: crate::udp_sock::RxIpMeta,
     datagram: &[u8],
+    err_ctx: Icmp6ErrorCtx<'_>,
 ) -> bool {
     const UDP_HDR_LEN: usize = 8;
     if datagram.len() < UDP_HDR_LEN {
@@ -1590,7 +1784,7 @@ fn handle_udp6(
             )
         })
         .unwrap_or((0, 0));
-    crate::udp_sock::user_deliver(
+    let delivered = crate::udp_sock::user_deliver(
         net_ns_id,
         &src_ip,
         src_port,
@@ -1600,6 +1794,26 @@ fn handle_udp6(
         ifindex,
         meta,
     );
+    // #1727(a): no listener consumed the datagram. Linux
+    // `__udp6_lib_rcv` answers that with Destination Unreachable
+    // code 4 (port unreachable) — after the checksum validation
+    // above, as here. The in-kernel socket table has no IPv6 demux
+    // (`deliver_in` is IPv4-only), so the userspace delivery hook IS
+    // the listener check for IPv6: `false` means no socket, in-kernel
+    // or userspace, owns the port. The error goes through
+    // `send_icmp6_error_in`, so the §2.4(e) suppression (including
+    // (e.3) multicast destination) and the §2.4(f) rate limit apply;
+    // a link-layer multicast/broadcast frame suppresses per
+    // §2.4(e.4)/(e.5). Every failure drops silently.
+    if !delivered && err_ctx.l2_dst != L2Dst::Multicast {
+        let _ = send_icmp6_error_in(
+            net_ns_id,
+            iface,
+            dst_ip,
+            Icmp6ErrorKind::DestinationUnreachable(4),
+            err_ctx.invoking,
+        );
+    }
     true
 }
 
