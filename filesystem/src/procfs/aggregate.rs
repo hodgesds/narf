@@ -581,6 +581,13 @@ fn gen_narf_pgtables() -> Vec<u8> {
     let _ = writeln!(s, "sched_address_spaces {}", spaces.len());
     let _ = writeln!(s, "sched_tables {}", sched_tables);
     let _ = writeln!(s, "kernel_tables {}", kernel_tables);
+    // Teardowns at the last user's exit: how many, what they cost, and how
+    // many ran in the exiting task (Linux `exit_mm`) rather than at slot drop.
+    let (exits, total_ns, max_ns, in_task) = narf_scheduler::exit_mmap_stats();
+    let _ = writeln!(s, "exit_mmap_count {}", exits);
+    let _ = writeln!(s, "exit_mmap_total_us {}", total_ns / 1000);
+    let _ = writeln!(s, "exit_mmap_max_us {}", max_ns / 1000);
+    let _ = writeln!(s, "exit_mmap_in_task {}", in_task);
     let _ = writeln!(
         s,
         "unexplained {}",

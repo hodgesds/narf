@@ -2111,6 +2111,15 @@ pub fn notify_task_exited(pid: u64, tid: u64) {
         o(pid, tid);
     }
     let (group_dead, was_multithreaded) = crate::handlers::thread_group_live_dec_state(pid);
+    if !group_dead {
+        // Linux `exit_mm` for a thread whose group lives on: its user
+        // reference goes in its own context, after the thread observers'
+        // last user-memory access (clear_child_tid). The group's last
+        // thread does this among the process observers instead
+        // (`release_exiting_process_mm`), after the ones that still read the
+        // address space and before the parent is told.
+        narf_scheduler::exit_mm(narf_scheduler::TaskId(tid));
+    }
     if group_dead {
         // Complete the wait4 rusage snapshot with the process's vm size —
         // once per process, here, while the last thread's AS is still
