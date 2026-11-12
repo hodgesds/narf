@@ -3365,7 +3365,8 @@ fn smoke_epoll_fd_forwards_nested_timerfd_poll_deadline() -> TestResult {
     let epfd = r.value as u32;
 
     // Install an armed timerfd (absolute deadline well in the future).
-    let tfd_ops = crate::io_mux::TimerFd::new();
+    let tfd_ops =
+        crate::io_mux::TimerFd::new(narf_scheduler::narf_time::hrtimer::ClockId::Monotonic);
     let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(500_000_000);
     tfd_ops.arm(deadline, 0);
     let tfd = crate::fd::install(
