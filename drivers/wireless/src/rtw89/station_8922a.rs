@@ -96,11 +96,14 @@
 //!   record is the exception: admission stores the negotiated
 //!   caps, so [`LegacyStation::ra_h2c`] builds the command on
 //!   demand via `ra_mask::build`.
-//! - 6 GHz legacy admission stays refused
-//!   (`SixGhzPowerMissing`): the 6 GHz power program is the
-//!   separate 6 GHz lane's work, and composing it into the
-//!   legacy path (HE20 6 GHz stations) is a follow-up once
-//!   that program exists, not part of this remainder.
+//! - 6 GHz legacy admission (HE20) composes the same 6 GHz
+//!   power program as the EHT path
+//!   ([`SixGhzProgram::from_admission`]): a legacy 6 GHz
+//!   request must carry [`SixGhzAdmission`]
+//!   (`SixGhzPowerMissing` without it), is 20 MHz only
+//!   (`SixGhzWidthUnsupported`), and the admitted
+//!   [`LegacyStation`] records the program (see
+//!   [`LegacyStation::six_ghz`]).
 //! ## MLO model (Linux grounding)
 //!
 //! Grounded in torvalds/linux master `7475ea8b`
@@ -793,9 +796,19 @@ pub(super) struct LegacyStation {
     pub(super) default_cctl: DefaultCmac,
     /// G7 association CMAC table for this station.
     pub(super) assoc_cctl: DefaultCmac,
+    /// 6 GHz power program (`Some` exactly when
+    /// `band == Band::Ghz6`).
+    pub(super) six_ghz: Option<SixGhzProgram>,
 }
 
 impl LegacyStation {
+    /// The 6 GHz power program of this station, if it is a
+    /// 6 GHz station: the client power type, the TPE
+    /// constraint (dBm, STD only) and its MAC-unit form.
+    pub(super) fn six_ghz(&self) -> Option<SixGhzProgram> {
+        self.six_ghz
+    }
+
     /// Highest non-EHT mode this station negotiated, in
     /// Linux's else-if priority.
     pub(super) fn mode(&self) -> LegacyMode {
@@ -891,15 +904,27 @@ impl LegacyStation {
 /// `req.has_he` must agree with the facet's HE caps — the
 /// caller supplies both — and drives the assoc table's BSR
 /// format bit. PPE pads are parsed from `req.peer_ies`.
+/// A 6 GHz request must carry a [`SixGhzAdmission`]
+/// (20 MHz only); the program is recorded on the admitted
+/// station (see [`LegacyStation::six_ghz`]).
 pub(super) fn admit_legacy(
     factory: &BeFactory,
     caps: &LegacyCaps,
     pool: &mut MacIdPool,
     req: &Request,
 ) -> Result<LegacyStation, Error> {
-    if req.band == Band::Ghz6 {
-        return Err(Error::SixGhzPowerMissing);
-    }
+    // 6 GHz composes the same power program as the EHT path
+    // (`validate`): a 6 GHz request without an admission is
+    // refused, a non-6 GHz request carrying one is refused,
+    // and a TPE is validated the same way. The 20 MHz-only
+    // width rule is checked with the width below, in the
+    // same relative order as `validate`.
+    let six_ghz = match (req.band, req.six_ghz) {
+        (Band::Ghz6, None) => return Err(Error::SixGhzPowerMissing),
+        (Band::Ghz6, Some(admission)) => Some(SixGhzProgram::from_admission(admission)?),
+        (_, Some(_)) => return Err(Error::SixGhzContextUnexpected),
+        (_, None) => None,
+    };
     if req.eht_support {
         return Err(Error::EhtInLegacyRequest);
     }
@@ -908,6 +933,9 @@ pub(super) fn admit_legacy(
     }
     if !chip_8922a::SUPPORT_BANDWIDTHS_MHZ.contains(&req.width_mhz) {
         return Err(Error::WidthNotAdvertised);
+    }
+    if req.band == Band::Ghz6 && req.width_mhz != 20 {
+        return Err(Error::SixGhzWidthUnsupported);
     }
     if req.nss == 0 || req.nss as usize > chip_8922a::TX_NSS {
         return Err(Error::NssOutOfRange);
@@ -952,6 +980,7 @@ pub(super) fn admit_legacy(
         bacam,
         default_cctl,
         assoc_cctl,
+        six_ghz,
     })
 }
 

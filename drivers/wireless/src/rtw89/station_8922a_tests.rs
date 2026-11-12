@@ -1049,6 +1049,10 @@ kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_admit_legacy_vht);
 kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_8922a_admit_legacy_he);
 kernel_test_in!(
     "drivers/wireless/rtw89",
+    smoke_rtw89_8922a_admit_legacy_6ghz_he20
+);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
     smoke_rtw89_8922a_admit_legacy_refusals
 );
 kernel_test_in!(
@@ -1371,12 +1375,179 @@ fn smoke_rtw89_8922a_admit_legacy_he() -> TestResult {
     TestResult::Pass
 }
 
+fn smoke_rtw89_8922a_admit_legacy_6ghz_he20() -> TestResult {
+    // HE20 6 GHz legacy admission composes the EHT path's
+    // 6 GHz power program (`SixGhzProgram::from_admission`,
+    // via `tpe`): the TPE fixture is the same mac80211/regd.c
+    // golden the EHT 6 GHz test uses — local EIRP
+    // 20/40/80 (raw 72/80/88) constrains to 26 dBm, the
+    // regulatory-client PSD (N = 4, primary subchannel 1,
+    // raw 40) to 23 dBm, and the intersected constraint is
+    // the min — not a re-derived value.
+    let ap80 = SixGhzChannel {
+        primary: 5,
+        primary_mhz: 5975,
+        width: Width::Eighty,
+        discontiguous: false,
+        center_mhz: 5985,
+        center2_mhz: None,
+    };
+    let both = [195, 4, 0x02, 72, 80, 88, 195, 5, 0x1b, 30, 40, 50, 60];
+    let f = factory();
+    let mut pool = MacIdPool::new();
+    let caps = LegacyCaps {
+        supp_rates: 0xFF,
+        ht: None,
+        vht: None,
+        he: Some(HeCaps {
+            rx_mcs_80: 0xFE,
+            rx_mcs_160: 0,
+            rx_mcs_80p80: 0,
+            has_80p80: false,
+            stbc_under_80: true,
+            ldpc_in_payload: true,
+            dcm_16qam: false,
+            partial_bw_er: false,
+        }),
+        rssi: 40,
+        er_cap: false,
+    };
+    let req = Request {
+        band: Band::Ghz6,
+        width_mhz: 20,
+        primary: 5,
+        has_he: true,
+        peer_ies: IES_H1_HE_PPE_NSS1,
+        six_ghz: Some(SixGhzAdmission {
+            power: PowerType6Ghz::Lpi,
+            tpe_dbm: None,
+        }),
+        ..legacy_req()
+    };
+    let st = match admit_legacy(&f, &caps, &mut pool, &req) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz HE20 legacy admission refused"),
+    };
+    if st.macid != 0
+        || st.mode() != LegacyMode::He
+        || st.band != Band::Ghz6
+        || st.width_mhz != 20
+        || st.primary != 5
+    {
+        return TestResult::Fail("6GHz HE20 legacy station record mismatch");
+    }
+    // LPI without a TPE admits with an unconstrained program:
+    // phy.c `rtw89_phy_get_tpe_constraint` with no TPE is
+    // `dbm_to_mac(S8_MAX)` = 63.
+    let program = match st.six_ghz() {
+        Some(program) => program,
+        None => return TestResult::Fail("6GHz legacy station records no power program"),
+    };
+    if program.power != PowerType6Ghz::Lpi
+        || program.tpe_dbm.is_some()
+        || program.tpe_mac != 63
+        || program.reg_6ghz_power() != 1
+    {
+        return TestResult::Fail("6GHz LPI legacy power program mismatch");
+    }
+    // Assoc golden, same HE arm as the 5 GHz HE test (6 GHz
+    // is non-2.4, so the OFDM6 lowest rate, EHT-off w4, HE
+    // BSR bit and peer-IE pads [2, 1, 0, 2, 1] all match):
+    // w5 0x186, w6 AID 7 + station mode, w8 2.
+    let a = &st.assoc_cctl;
+    if a.c0 != 0x80
+        || a.w[1] != 0x4000_0000
+        || a.m[1] != 0xF000_0000
+        || a.w[4] != 0
+        || a.m[4] != 0x7
+        || a.w[5] != 0x186
+        || a.m[5] != 0x3FF
+        || a.w[6] != 0x8000_0007
+        || a.m[6] != 0x8000_0FFF
+        || a.w[8] != 2
+        || a.m[8] != 2
+    {
+        return TestResult::Fail("6GHz HE20 legacy assoc CCTL golden mismatch");
+    }
+    // RA golden, hand-computed from phy.c
+    // `rtw89_phy_ra_sta_update` via ra_mask: mode HE|OFDM
+    // (18), HE NSS0 cap 2 (MCS11, 0xFFF<<12) + legacy
+    // 0xFF<<4 on 6 GHz, trimmed to 0xFFF010; bw 20 (0);
+    // STBC + LDPC; fixed GI/LTF 2XHE08 (w3 fix_en + fix 3)
+    // and band 6 GHz (2 << 29).
+    // w0 = 18<<1 | ldpc<<22 | stbc<<23 = 0xC00024;
+    // w4 = mode 18 | bw 0 << 8 = 0x12.
+    let ra = match st.ra_h2c(0, false, false) {
+        Ok(ra) => ra,
+        Err(_) => return TestResult::Fail("6GHz HE20 legacy RA build refused"),
+    };
+    if ra != [0xC00024, 0xFFF010, 0, 0x4000_3800, 0x12, 0] {
+        return TestResult::Fail("6GHz HE20 legacy RA golden mismatch");
+    }
+    // Standard Power with the intersected TPE (23 dBm)
+    // admits; the MAC-unit constraint is 23 << 1 = 46.
+    let tpe_std = match tpe(&both, &ap80) {
+        Ok(Some(c)) => c,
+        _ => return TestResult::Fail("STD TPE must compute"),
+    };
+    let req_std = Request {
+        six_ghz: Some(SixGhzAdmission {
+            power: PowerType6Ghz::Sp,
+            tpe_dbm: Some(tpe_std),
+        }),
+        ..req
+    };
+    let st = match admit_legacy(&f, &caps, &mut pool, &req_std) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("6GHz STD legacy admission refused"),
+    };
+    let program = match st.six_ghz() {
+        Some(program) => program,
+        None => return TestResult::Fail("6GHz STD legacy station records no power program"),
+    };
+    if program.power != PowerType6Ghz::Sp
+        || program.tpe_dbm != Some(23)
+        || program.tpe_mac != 46
+        || program.reg_6ghz_power() != 2
+        || st.macid != 1
+    {
+        return TestResult::Fail("6GHz STD legacy power program mismatch");
+    }
+    // A 2.4 GHz legacy station records no program, and a
+    // 6 GHz request without one is still refused (the
+    // refusals test covers the wider cases).
+    let st2 = match admit_legacy(&f, &legacy_caps(), &mut pool, &legacy_req()) {
+        Ok(st) => st,
+        Err(_) => return TestResult::Fail("2.4GHz legacy admission refused"),
+    };
+    if st2.six_ghz().is_some() {
+        return TestResult::Fail("2.4GHz legacy station must record no 6GHz program");
+    }
+    if admit_legacy(
+        &f,
+        &caps,
+        &mut pool,
+        &Request {
+            six_ghz: None,
+            ..req
+        },
+    ) != Err(Error::SixGhzPowerMissing)
+    {
+        return TestResult::Fail("6GHz legacy admission without a program not refused");
+    }
+    TestResult::Pass
+}
+
 fn smoke_rtw89_8922a_admit_legacy_refusals() -> TestResult {
     let f = factory();
     let mut pool = MacIdPool::new();
     let req = legacy_req();
     let caps = legacy_caps();
-    let cases: [(Request, LegacyCaps, Error); 10] = [
+    let lpi = SixGhzAdmission {
+        power: PowerType6Ghz::Lpi,
+        tpe_dbm: None,
+    };
+    let cases: [(Request, LegacyCaps, Error); 14] = [
         (
             Request {
                 band: Band::Ghz6,
@@ -1384,6 +1555,50 @@ fn smoke_rtw89_8922a_admit_legacy_refusals() -> TestResult {
             },
             caps,
             Error::SixGhzPowerMissing,
+        ),
+        (
+            Request {
+                band: Band::Ghz6,
+                width_mhz: 40,
+                six_ghz: Some(lpi),
+                ..req
+            },
+            caps,
+            Error::SixGhzWidthUnsupported,
+        ),
+        (
+            Request {
+                band: Band::Ghz6,
+                width_mhz: 20,
+                six_ghz: Some(SixGhzAdmission {
+                    power: PowerType6Ghz::Lpi,
+                    tpe_dbm: Some(20),
+                }),
+                ..req
+            },
+            caps,
+            Error::SixGhzTpeNotStandard,
+        ),
+        (
+            Request {
+                band: Band::Ghz6,
+                width_mhz: 20,
+                six_ghz: Some(SixGhzAdmission {
+                    power: PowerType6Ghz::Sp,
+                    tpe_dbm: Some(-19),
+                }),
+                ..req
+            },
+            caps,
+            Error::SixGhzTpeBelowMinimum,
+        ),
+        (
+            Request {
+                six_ghz: Some(lpi),
+                ..req
+            },
+            caps,
+            Error::SixGhzContextUnexpected,
         ),
         (
             Request {
