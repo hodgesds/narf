@@ -347,13 +347,34 @@ type StateTable = &'static [OnceLock<StateSection>];
 /// Sparse table of per-frame free-state words. See the section comment above.
 pub(crate) struct FrameStateIndex {
     root: [OnceLock<StateTable>; STATE_ROOT_LEN],
+    /// `frame-poison-check`: free frames hold the poison pattern; a frame is
+    /// poisoned as its word turns free and verified as it turns allocated.
+    #[cfg(feature = "frame-poison-check")]
+    check_contents: core::sync::atomic::AtomicBool,
 }
 
 impl FrameStateIndex {
     pub(crate) const fn new() -> Self {
         Self {
             root: [const { OnceLock::new() }; STATE_ROOT_LEN],
+            #[cfg(feature = "frame-poison-check")]
+            check_contents: core::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// `frame-poison-check`: from now on poison every block whose word turns
+    /// free and verify it as it turns allocated. The caller has poisoned every
+    /// block that is free at this point ([`BuddyZone::poison_free_blocks`]).
+    #[cfg(feature = "frame-poison-check")]
+    pub(crate) fn enable_content_check(&self) {
+        self.check_contents.store(true, Ordering::Release);
+    }
+
+    /// Whether free blocks of this index must hold the poison pattern.
+    #[cfg(feature = "frame-poison-check")]
+    #[inline]
+    fn checks_contents(&self) -> bool {
+        self.check_contents.load(Ordering::Acquire)
     }
 
     /// The state word of `frame`, or `None` when no section covers it.
@@ -378,6 +399,10 @@ impl FrameStateIndex {
         let Some(head) = self.slot(frame) else {
             return;
         };
+        #[cfg(feature = "frame-poison-check")]
+        if self.checks_contents() {
+            poison::verify(frame, order, head.load(Ordering::Acquire));
+        }
         head.store(alloc_head_state(order), Ordering::Release);
         for tail in frame + 1..frame + order_frames(order) {
             if let Some(word) = self.slot(tail) {
@@ -408,6 +433,12 @@ impl FrameStateIndex {
             if let Some(word) = self.slot(tail) {
                 word.store(0, Ordering::Relaxed);
             }
+        }
+        // The block is free from here on: nothing may write it until it is
+        // handed out again.
+        #[cfg(feature = "frame-poison-check")]
+        if self.checks_contents() {
+            poison::fill(frame, order_frames(order));
         }
         Ok(())
     }
@@ -486,6 +517,123 @@ impl FrameStateIndex {
         table[(section as usize) & (STATE_TABLE_LEN - 1)]
             .set(words)
             .is_ok()
+    }
+}
+
+// ── Free-frame poison check (frame-poison-check feature) ─────────────────
+//
+// Linux `CONFIG_PAGE_POISONING` / `init_on_free` + `check_poison_mem`: every
+// frame is filled with a poison word as it becomes free (its state word
+// leaves the allocated kinds) and verified as it is handed out again (its
+// state word becomes allocated). A store into a free frame — a stale pointer
+// writing after the frame's free, or a write through a frame freed while
+// still in use — is reported at the hand-out with the frame, the offset and
+// value of the first changed word and the words around it, then panics.
+// Covers every frame with a state word: all boot RAM and hot-added RAM.
+#[cfg(feature = "frame-poison-check")]
+mod poison {
+    use super::order_frames;
+
+    /// The word every free frame holds (non-canonical as a pointer).
+    pub(super) const WORD: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+    const WORDS_PER_FRAME: usize = (crate::PAGE_SIZE / 8) as usize;
+
+    #[inline]
+    fn words(frame: u64) -> *mut u64 {
+        crate::PhysAddr::new(frame << 12).kernel_mut_ptr::<u64>()
+    }
+
+    /// Poison `frames` frames from `frame`. The caller owns them as free.
+    pub(super) fn fill(frame: u64, frames: u64) {
+        for each in frame..frame + frames {
+            let dst = words(each);
+            // SAFETY: a free RAM frame the caller owns (its state word was
+            // just claimed free, or it sits on a free list under the zone
+            // lock), reached through the kernel direct map, which covers all
+            // managed RAM once the index is enabled. Writes stay in the frame.
+            unsafe {
+                for i in 0..WORDS_PER_FRAME {
+                    core::ptr::write_volatile(dst.add(i), WORD);
+                }
+            }
+        }
+    }
+
+    /// Verify that the free order-`order` block at `frame`, about to be
+    /// handed out, still holds the poison. Panics naming the first changed
+    /// word otherwise. `state` is the head's state word before the hand-out.
+    pub(super) fn verify(frame: u64, order: u8, state: u64) {
+        for each in frame..frame + order_frames(order) {
+            let src = words(each);
+            let mut changed = 0usize;
+            let mut first = usize::MAX;
+            let mut last = 0usize;
+            for i in 0..WORDS_PER_FRAME {
+                // SAFETY: as in `fill`; the block is still free, owned by the
+                // allocator handing it out.
+                let value = unsafe { core::ptr::read_volatile(src.add(i)) };
+                if value != WORD {
+                    changed += 1;
+                    first = first.min(i);
+                    last = i;
+                }
+            }
+            if changed != 0 {
+                report(frame, order, state, each, changed, first, last);
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn report(
+        head: u64,
+        order: u8,
+        state: u64,
+        frame: u64,
+        changed: usize,
+        first: usize,
+        last: usize,
+    ) -> ! {
+        let src = words(frame);
+        let start = first.saturating_sub(2);
+        let mut around = [0u64; 8];
+        for (k, slot) in around.iter_mut().enumerate() {
+            if start + k < WORDS_PER_FRAME {
+                // SAFETY: as in `verify`.
+                *slot = unsafe { core::ptr::read_volatile(src.add(start + k)) };
+            }
+        }
+        #[cfg(feature = "frame-alloc-audit")]
+        let (alloc_site, free_site) = (
+            super::audit::alloc_site_of(frame),
+            super::audit::prior_free_site(frame),
+        );
+        #[cfg(not(feature = "frame-alloc-audit"))]
+        let (alloc_site, free_site) = (
+            ("<frame-alloc-audit off>", 0u32),
+            ("<frame-alloc-audit off>", 0u32),
+        );
+        panic!(
+            "frame-poison-check: free frame phys {:#x} (block phys {:#x} order {}, word {:#x}) \
+             was written while free: {} of {} words changed, first at +{:#x} = {:#x}, last at \
+             +{:#x}; words from +{:#x}: {:x?}; last alloc @ {}:{}, last free @ {}:{}",
+            frame << 12,
+            head << 12,
+            order,
+            state,
+            changed,
+            WORDS_PER_FRAME,
+            first * 8,
+            around[first - start],
+            last * 8,
+            start * 8,
+            around,
+            alloc_site.0,
+            alloc_site.1,
+            free_site.0,
+            free_site.1,
+        );
     }
 }
 
@@ -616,10 +764,11 @@ mod audit {
         }
     }
 
-    /// Frame-number ceiling the bitmap covers (4 Mi frames = 16 GiB of
-    /// physical RAM). Frames above this are not tracked (the test
-    /// configs sit well under 4 GiB).
-    const AUDIT_FRAMES: usize = 4 * 1024 * 1024;
+    /// Frame-number ceiling the bitmap covers (16 Mi frames = 64 GiB of
+    /// physical address space, a 2 MiB bitmap). Frames above this are not
+    /// tracked. A 16 GiB guest's RAM already ends past 17 GiB (the PCI hole
+    /// pushes it up), beyond the 16 GiB this covered before.
+    const AUDIT_FRAMES: usize = 16 * 1024 * 1024;
     const WORDS: usize = AUDIT_FRAMES / 64;
     static BITS: [AtomicU64; WORDS] = {
         const Z: AtomicU64 = AtomicU64::new(0);
@@ -906,6 +1055,25 @@ impl BuddyZone {
         }
     }
 
+    /// `frame-poison-check`: poison every listed free block that has a state
+    /// word, before [`FrameStateIndex::enable_content_check`]. Under the zone
+    /// lock, with the direct map covering the zone's RAM.
+    #[cfg(feature = "frame-poison-check")]
+    pub(crate) fn poison_free_blocks(&self) {
+        let Some(index) = self.index else {
+            return;
+        };
+        for lists in &self.free_lists {
+            for (order, list) in lists.iter().enumerate() {
+                for &frame in list {
+                    if index.slot(frame).is_some() {
+                        poison::fill(frame, order_frames(order as u8));
+                    }
+                }
+            }
+        }
+    }
+
     /// The state word of `frame`, when this zone is indexed and a section
     /// covers the frame.
     #[inline]
@@ -1186,6 +1354,15 @@ impl BuddyZone {
                     break;
                 }
                 order -= 1;
+            }
+            // RAM donated once free frames are checked (hot-add) must hold
+            // the poison like every other free block.
+            #[cfg(feature = "frame-poison-check")]
+            if self
+                .index
+                .is_some_and(|index| index.checks_contents() && index.slot(start).is_some())
+            {
+                poison::fill(start, order_frames(order));
             }
             self.list_push(mt.index(), order as usize, start);
             start += order_frames(order);

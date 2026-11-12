@@ -1264,6 +1264,16 @@ pub fn reserve_for_slab_promotion() {
     for (node, zone) in ZONES.iter().enumerate() {
         zone.0.lock().enable_index(&FRAME_INDEX, node);
     }
+    // `frame-poison-check`: every free frame holds the poison from here on,
+    // and is verified as it is handed out. Boot is single-threaded here, so
+    // nothing is freed between a zone's poisoning and the switch.
+    #[cfg(feature = "frame-poison-check")]
+    {
+        for zone in &ZONES {
+            zone.0.lock().poison_free_blocks();
+        }
+        FRAME_INDEX.enable_content_check();
+    }
     // Free-list Vecs can no longer grow recursively through the slab, and
     // cached frames have state words to be linked through. This is the safe
     // publication point for the per-CPU caches even on UMA machines that
@@ -3866,6 +3876,45 @@ fn smoke_pagetable_registry_churn_is_constant() -> narf_kernel_test::TestResult 
 }
 #[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_pagetable_registry_churn_is_constant);
+
+/// `frame-poison-check`: a freed block holds the poison on every frame, and
+/// is handed out again (verified) without complaint.
+#[cfg(all(feature = "kernel-test", feature = "frame-poison-check"))]
+fn smoke_frame_poison_fills_freed_blocks() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+    let words = (PAGE_SIZE / 8) as usize;
+    let node = current_cpu_node();
+    for order in [0u8, 2] {
+        let Ok(block) = alloc_pages_on(node, order) else {
+            return TestResult::Skip("no block available");
+        };
+        let base = block.start_address().kernel_mut_ptr::<u64>();
+        let len = words << order;
+        // SAFETY: the block was just allocated and is owned here.
+        unsafe {
+            for i in 0..len {
+                core::ptr::write_volatile(base.add(i), i as u64);
+            }
+        }
+        free_pages(block, order);
+        // Reading a free block is harmless; nobody may write it.
+        // SAFETY: direct-map RAM; only read.
+        let poisoned = (0..len).all(|i| unsafe { core::ptr::read_volatile(base.add(i)) } == POISON);
+        if !poisoned {
+            return TestResult::Fail("a freed block does not hold the poison");
+        }
+        // The next hand-outs verify the poison, this block's frames among
+        // them once they come round again.
+        let Ok(again) = alloc_pages_on(node, order) else {
+            return TestResult::Skip("no block available");
+        };
+        free_pages(again, order);
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "kernel-test", feature = "frame-poison-check"))]
+narf_kernel_test::kernel_test_in!("memory/frame", smoke_frame_poison_fills_freed_blocks);
 
 /// Per-frame reference counting for the COW-fork path.
 ///
