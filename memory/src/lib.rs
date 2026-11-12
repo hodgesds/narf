@@ -20,10 +20,10 @@ pub mod atomic_pool;
 // BPF memory: the executable-text allocator, the program heap, the recoverable
 // -fault table, and the per-CPU BPF stack. `bpf_text::reserve_kernel_slots` is
 // boot-order critical — see `bpf/specification/spec.md` §4.1.
+pub mod as_origin;
 pub mod bpf_arena;
 pub mod bpf_extable;
 pub mod bpf_stack;
-pub mod as_origin;
 pub mod bpf_text;
 pub mod buddy;
 #[cfg(feature = "cgroup")]
