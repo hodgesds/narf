@@ -158,6 +158,10 @@ fn map_page(space: u64, ops: &Arc<dyn FileOps>, offset: u64) -> Option<PhysAddr>
 
 /// A store through the mapping: the page now differs from the file.
 fn dirty(phys: PhysAddr) {
+    // A real store faults on the clean page's read-only PTE first, and the
+    // write-notify hook records it; through the direct map the test takes
+    // that step itself.
+    shared_page_write_fault(phys.raw());
     // SAFETY: the cache owns the frame and the test holds a mapping of it.
     unsafe {
         let byte = phys.kernel_mut_ptr::<u8>();

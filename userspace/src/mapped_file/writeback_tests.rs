@@ -281,7 +281,12 @@ impl Drop for Fixture {
     }
 }
 
+/// A store through a writable shared mapping of `phys`. A real one faults
+/// on the clean page's read-only PTE first, and the write-notify hook
+/// records it; through the kernel's direct map nothing faults, so the test
+/// takes that step itself.
 fn store_bytes(phys: PhysAddr, at: usize, bytes: &[u8]) {
+    super::super::shared_page_write_fault(phys.raw());
     // SAFETY: the test maps this cache page; frames are identity-mapped.
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -1178,9 +1183,6 @@ fn smoke_reads_see_unwritten_mapped_stores() -> TestResult {
     // "across the page": six bytes at the end of page 0, nine in page 1.
     store_bytes(pages[0], 4090, b"across");
     store_bytes(pages[1], 0, b" the page");
-    // The file changes behind the cache's back at a byte no mapping stored
-    // to: the filesystem knows better there.
-    fixture.store.bytes.lock()[100] = 0x5A;
 
     let mut read = vec![0u8; 8192];
     if run(fixture.ops().read(0, &mut read)) != Some(Ok(8192)) {
@@ -1190,8 +1192,9 @@ fn smoke_reads_see_unwritten_mapped_stores() -> TestResult {
     if read[4090..4105] != *b"across the page" {
         return TestResult::Fail("a read did not see a mapped store that is not written back");
     }
-    if read[100] != 0x5A {
-        return TestResult::Fail("the overlay replaced bytes no mapping had changed");
+    // A page nobody stored to is not consulted at all.
+    if read[..100].iter().any(|byte| *byte != 0) {
+        return TestResult::Fail("the overlay changed bytes of the file it should not have");
     }
     // An unaligned window inside the second page.
     let mut tail = vec![0u8; 5];
@@ -1312,17 +1315,16 @@ kernel_test_in!(
     smoke_two_teardowns_at_once_write_nothing
 );
 
-/// `(page comparisons, evictions)` made while `PROBE` pages are faulted in
-/// and unmapped through a read-only mapping and as many through a writable
-/// one, with `resident` other pages already in the cache.
-fn fault_and_unmap_work(resident: usize) -> Option<(u64, u64)> {
+/// Evictions made while `PROBE` pages are faulted in and unmapped through
+/// a read-only mapping and as many through a writable one, with `resident`
+/// other pages already in the cache.
+fn fault_and_unmap_evictions(resident: usize) -> Option<u64> {
     const PROBE: usize = 32;
     let mut cache = Fixture::new(resident);
     cache.map(0, resident)?;
     let mut read_only = Fixture::new(PROBE);
     read_only.read_only = true;
     let mut writable = Fixture::new(PROBE);
-    let compares = PAGE_COMPARES.load(Ordering::Relaxed);
     let evictions = EVICTIONS.load(Ordering::Relaxed);
 
     let pages = read_only.map(0, PROBE)?;
@@ -1333,32 +1335,24 @@ fn fault_and_unmap_work(resident: usize) -> Option<(u64, u64)> {
     }
     writable.unmap(&pages);
 
-    Some((
-        PAGE_COMPARES.load(Ordering::Relaxed) - compares,
-        EVICTIONS.load(Ordering::Relaxed) - evictions,
-    ))
+    Some(EVICTIONS.load(Ordering::Relaxed) - evictions)
 }
 
 /// A fault's publication and an unmap cost the same however full the cache
-/// is. With the cache past its retention cap, every publication used to
-/// walk the whole cache under the cache lock, comparing each unmapped page
-/// with its clean copy, and every unmap compared the page it released:
-/// 65,536 first touches of a clean 256 MiB mapping took 70 s. Now neither
-/// path compares anything — whether a page may be dirty is recorded — and
-/// eviction takes at most one page off a list per page released.
+/// is: neither walks the cache, and eviction takes at most one page off a
+/// list per page released. (The soak's numbers to beat: 65,536 first
+/// touches of a clean 256 MiB mapping took 70 s when every publication
+/// walked the cache comparing pages.)
 fn smoke_fault_and_unmap_cost_does_not_grow_with_the_cache() -> TestResult {
     const PROBE: u64 = 32;
     let cap = super::super::MAX_RETAINED_SHARED_FILE_PAGES;
     let (Some(small), Some(large)) = (
-        fault_and_unmap_work(cap + 64),
-        fault_and_unmap_work(3 * cap),
+        fault_and_unmap_evictions(cap + 64),
+        fault_and_unmap_evictions(3 * cap),
     ) else {
         return TestResult::Skip("frame allocator drained");
     };
-    if small.0 != 0 || large.0 != 0 {
-        return TestResult::Fail("a fault or an unmap compared page contents");
-    }
-    if small.1 > PROBE || large.1 > PROBE {
+    if small > PROBE || large > PROBE {
         return TestResult::Fail("faulting and unmapping evicted more pages than it released");
     }
     TestResult::Pass
@@ -1368,34 +1362,24 @@ kernel_test_in!(
     smoke_fault_and_unmap_cost_does_not_grow_with_the_cache
 );
 
-/// A page only read-only mappings have held is clean by record: its last
-/// unmap lists it for reuse without comparing it, and writeback never
-/// looks at it. A page a writable mapping has held is writeback's to
-/// check, and is found clean there — outside every lock — if nothing was
-/// stored.
-fn smoke_dirtiness_is_recorded_not_compared_at_unmap() -> TestResult {
-    let mut read_only = Fixture::new(2);
-    read_only.read_only = true;
-    let Some(pages) = read_only.map(0, 2) else {
-        return TestResult::Fail("could not map the test file");
-    };
-    let compares = PAGE_COMPARES.load(Ordering::Relaxed);
-    read_only.unmap(&pages);
-    if read_only.idle_dirty() != 0 || read_only.cached(0) != Some((false, false)) {
-        return TestResult::Fail("a page only mapped read-only was listed for writeback");
-    }
-
+/// Dirtiness is the store's own record: a page that was only read — even
+/// through a writable mapping — leaves its last unmap clean, kept for
+/// reuse and never written; a page that was stored to is the one written.
+fn smoke_only_stored_pages_are_dirty() -> TestResult {
     let mut writable = Fixture::new(2);
     let Some(pages) = writable.map(0, 2) else {
         return TestResult::Fail("could not map the test file");
     };
-    store_bytes(pages[1], 0, b"stored");
-    writable.unmap(&pages);
-    if PAGE_COMPARES.load(Ordering::Relaxed) != compares {
-        return TestResult::Fail("an unmap compared page contents");
+    if super::super::shared_page_write_enabled(pages[0].raw()) {
+        return TestResult::Fail("a clean page's PTE would be installed writable");
     }
-    if writable.idle_dirty() != 2 {
-        return TestResult::Fail("pages of a writable mapping were not left for writeback");
+    store_bytes(pages[1], 0, b"stored");
+    if !super::super::shared_page_write_enabled(pages[1].raw()) {
+        return TestResult::Fail("a page that took a store stays read-only after its fault");
+    }
+    writable.unmap(&pages);
+    if writable.idle_dirty() != 1 || writable.cached(0) != Some((false, false)) {
+        return TestResult::Fail("an unstored page was left for writeback");
     }
     if run(background_pass()).is_none() {
         return TestResult::Fail("the background pass did not complete");
@@ -1403,11 +1387,51 @@ fn smoke_dirtiness_is_recorded_not_compared_at_unmap() -> TestResult {
     if writable.log() != [(4096, 4096)] || writable.idle_dirty() != 0 {
         return TestResult::Fail("writeback did not write exactly the page that was stored to");
     }
+    if super::super::shared_page_write_enabled(pages[1].raw()) {
+        return TestResult::Fail("a written page's PTE would still be installed writable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/writeback", smoke_only_stored_pages_are_dirty);
+
+/// Live heap bytes, as the slab allocator counts them.
+fn heap_bytes() -> usize {
+    let stats = narf_memory::slab::stats();
+    stats
+        .classes
+        .iter()
+        .map(|class| class.in_use * class.block_size)
+        .sum::<usize>()
+        + stats.large_in_use
+}
+
+/// What one cached page costs the kernel heap is its record — not a copy
+/// of the page — and does not grow with the number of pages. (Each page
+/// used to carry a 4 KiB clean copy on the heap; a 1 GiB mapping cost
+/// 1 GiB of unreclaimable slab besides its frames.)
+fn smoke_heap_bytes_per_cached_page_are_bounded() -> TestResult {
+    const SMALL: usize = 64;
+    const LARGE: usize = 512;
+    const BOUND: usize = 512;
+    let measure = |pages: usize| -> Option<usize> {
+        let mut fixture = Fixture::new(pages);
+        let before = heap_bytes();
+        let mapped = fixture.map(0, pages)?;
+        let after = heap_bytes();
+        fixture.unmap(&mapped);
+        Some(after.saturating_sub(before) / pages)
+    };
+    let (Some(small), Some(large)) = (measure(SMALL), measure(LARGE)) else {
+        return TestResult::Skip("frame allocator drained");
+    };
+    if small > BOUND || large > BOUND {
+        return TestResult::Fail("a cached page costs more heap than its record");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "userspace/writeback",
-    smoke_dirtiness_is_recorded_not_compared_at_unmap
+    smoke_heap_bytes_per_cached_page_are_bounded
 );
 
 /// A file `len` bytes long, mapped in full (`len < 4096`).

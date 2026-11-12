@@ -1208,8 +1208,6 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             crate::mapped_file::truncate_file_mappings,
         );
         if shared_file_fallback {
-            // Before any cached page of the range can be taken over.
-            crate::mapped_file::settle_unverified(&ops, offset, pages);
             shared_cache_generation = ops.mmap_cache_generation();
             shared_file_ops = Some(Arc::clone(&ops));
         }
@@ -1305,7 +1303,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     {
         // Stores through this mapping will dirty pages of the file cache:
         // see `mapped_file::writable_mapping`.
-        crate::mapped_file::writable_mapping(ops, &phys_list);
+        crate::mapped_file::writable_mapping(ops);
     }
     let backing = match narf_memory::region_backing::RegionBacking::try_from_slice(&phys_list) {
         Ok(backing) => backing,
@@ -2508,6 +2506,8 @@ mod tests {
             Some(region) if region.phys.len() == 1 && region.phys[0].raw() != 0 => region,
             _ => return TestResult::Fail("file fault did not publish a physical page"),
         };
+        // A real store would fault on the clean page's read-only PTE first.
+        crate::mapped_file::shared_page_write_fault(region.phys[0].raw());
         // SAFETY: the syscall allocated this page exclusively for the test
         // mapping and all physical memory is kernel identity-mapped.
         unsafe {
@@ -2588,6 +2588,8 @@ mod tests {
             return TestResult::Fail("fsync rewrote a clean MAP_SHARED page");
         }
 
+        // A real store would fault on the clean page's read-only PTE first.
+        crate::mapped_file::shared_page_write_fault(second_region.phys[0].raw());
         // SAFETY: both mappings still retain the identity-mapped page.
         unsafe {
             *(second_region.phys[0].kernel_mut_ptr::<u8>()).add(8) = b'!';
@@ -2935,6 +2937,8 @@ mod tests {
                 return result;
             }
         };
+        // A real store would fault on the clean page's read-only PTE first.
+        crate::mapped_file::shared_page_write_fault(phys.raw());
         // SAFETY: the fault published this cache-owned frame for the test
         // mapping and all physical memory is kernel identity-mapped.
         unsafe {
@@ -3047,6 +3051,8 @@ mod tests {
                 fallback_test_teardown();
                 return TestResult::Fail("a page of the large mapping did not fault in");
             };
+            // A real store would fault on the clean page's read-only PTE first.
+            crate::mapped_file::shared_page_write_fault(phys.raw());
             // SAFETY: the cache-owned frame behind the test's own mapping.
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -3298,6 +3304,8 @@ mod tests {
             let Some(phys) = region.phys.first().copied().filter(|phys| phys.raw() != 0) else {
                 return false;
             };
+            // A real store would fault on the clean page's read-only PTE first.
+            crate::mapped_file::shared_page_write_fault(phys.raw());
             // SAFETY: the cache frame behind the test's own writable mapping.
             unsafe { core::ptr::copy_nonoverlapping(b"RW".as_ptr(), phys.kernel_mut_ptr::<u8>(), 2) };
             call_syscall(crate::handlers::sys_sync, SyscallArgs::default()).is_ok()
@@ -3320,6 +3328,118 @@ mod tests {
     kernel_test_in!(
         "userspace/writeback",
         smoke_mprotect_write_needs_a_writable_descriptor
+    );
+
+    /// The frame a page of the test mapping holds now, if any.
+    fn mapped_frame(aspace: &Arc<AddressSpace>, va: u64) -> Option<narf_memory::PhysAddr> {
+        aspace
+            .page_backing(narf_memory::VirtAddr::new(va))
+            .map(|(_, phys)| phys)
+            .filter(|phys| phys.raw() != 0)
+    }
+
+    /// Clean shared file pages are reclaimable while mapped, and their
+    /// mappings record stores by faulting. A file is mapped writable and
+    /// read in full; a few pages are then stored to, through the kernel
+    /// write path that takes the same write-notify fault a user store does.
+    /// Reclaim then unmaps every clean page from the mapping and frees it,
+    /// and leaves the stored-to pages alone; touching an unmapped page again
+    /// refaults it with the file's bytes; and the stores reach the file.
+    fn smoke_reclaim_frees_clean_mapped_pages_and_keeps_stores() -> TestResult {
+        const PAGES: usize = 16;
+        const STORED: usize = 3;
+        let mut image = vec![0u8; PAGES * 4096];
+        for (page, chunk) in image.chunks_mut(4096).enumerate() {
+            chunk.fill(page as u8 + 1);
+        }
+        let (aspace, file, fd) = match fallback_test_setup(image) {
+            Ok(setup) => setup,
+            Err(result) => return result,
+        };
+        let (base, _) = match mmap_shared_faulted(&aspace, fd, (PAGES * 4096) as u64) {
+            Ok(pair) => pair,
+            Err(result) => {
+                fallback_test_teardown();
+                return result;
+            }
+        };
+        let va = |page: usize| base + (page * 4096) as u64;
+        for page in 0..PAGES {
+            if mapped_frame(&aspace, va(page)).is_none() {
+                // SAFETY: the test owns this live user root; the address lies
+                // in the FILE_DEMAND mapping published by sys_mmap.
+                let _ = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(va(page))) };
+            }
+        }
+        let Some(first) = mapped_frame(&aspace, va(0)) else {
+            fallback_test_teardown();
+            return TestResult::Fail("the mapping did not fault in");
+        };
+        if crate::mapped_file::shared_page_write_enabled(first.raw()) {
+            fallback_test_teardown();
+            return TestResult::Fail("a clean page of a writable shared mapping was mapped writable");
+        }
+        for page in 0..STORED {
+            // SAFETY: as above; the kernel write path for a present user page.
+            if !unsafe { aspace.user_page_writable_or_resolve(narf_memory::VirtAddr::new(va(page))) } {
+                fallback_test_teardown();
+                return TestResult::Fail("the write-notify fault did not admit a store");
+            }
+            let Some(phys) = mapped_frame(&aspace, va(page)) else {
+                fallback_test_teardown();
+                return TestResult::Fail("a stored-to page was not mapped");
+            };
+            if !crate::mapped_file::shared_page_write_enabled(phys.raw()) {
+                fallback_test_teardown();
+                return TestResult::Fail("the write-notify fault did not record the store");
+            }
+            // SAFETY: the cache frame behind the test's own writable mapping.
+            unsafe { *phys.kernel_mut_ptr::<u8>().add(7) = 0xEE };
+        }
+
+        // Reclaim until every clean page is gone from the mapping (other
+        // tests' cache pages may be scanned first).
+        for _ in 0..64 {
+            if (STORED..PAGES).all(|page| mapped_frame(&aspace, va(page)).is_none()) {
+                break;
+            }
+            crate::mapped_file::reclaim_mapped_for_test(PAGES);
+        }
+        let clean_gone = (STORED..PAGES).all(|page| mapped_frame(&aspace, va(page)).is_none());
+        let dirty_kept = (0..STORED).all(|page| mapped_frame(&aspace, va(page)).is_some());
+        // Touch an unmapped page again: it comes back from the file.
+        // SAFETY: as above.
+        let _ = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(va(PAGES - 1))) };
+        let refaulted = mapped_frame(&aspace, va(PAGES - 1)).is_some_and(|phys| {
+            // SAFETY: the frame now backing the test's own mapping.
+            unsafe { core::slice::from_raw_parts(phys.kernel_ptr::<u8>(), 4096) }
+                .iter()
+                .all(|byte| *byte == PAGES as u8)
+        });
+        let synced = call_syscall(crate::handlers::sys_sync, SyscallArgs::default()).is_ok();
+        let stored = {
+            let bytes = file.bytes.lock();
+            (0..STORED).all(|page| bytes[page * 4096 + 7] == 0xEE)
+                && (STORED..PAGES).all(|page| bytes[page * 4096 + 7] == page as u8 + 1)
+        };
+        fallback_test_teardown();
+        if !clean_gone {
+            return TestResult::Fail("reclaim left a clean mapped page mapped");
+        }
+        if !dirty_kept {
+            return TestResult::Fail("reclaim unmapped a page holding an unwritten store");
+        }
+        if !refaulted {
+            return TestResult::Fail("a reclaimed page did not come back with the file's bytes");
+        }
+        if !synced || !stored {
+            return TestResult::Fail("stores through the mapping did not reach the file");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/writeback",
+        smoke_reclaim_frees_clean_mapped_pages_and_keeps_stores
     );
 
     /// write(2) must be visible through a live generic-fallback mapping,
@@ -3371,6 +3491,8 @@ mod tests {
             fallback_test_teardown();
             return TestResult::Fail("write(2) did not update the live MAP_SHARED page");
         }
+        // A real store would fault on the clean page's read-only PTE first.
+        crate::mapped_file::shared_page_write_fault(phys.raw());
         // One mapped store, then msync: writeback must carry the store
         // without clobbering the write(2) bytes at offset 100.
         // SAFETY: as above.
@@ -3426,6 +3548,8 @@ mod tests {
                 return result;
             }
         };
+        // A real store would fault on the clean page's read-only PTE first.
+        crate::mapped_file::shared_page_write_fault(phys.raw());
         // SAFETY: the fault published this cache-owned frame for the test
         // mapping and all physical memory is kernel identity-mapped.
         unsafe {
@@ -3487,6 +3611,8 @@ mod tests {
                 return result;
             }
         };
+        // A real store would fault on the clean page's read-only PTE first.
+        crate::mapped_file::shared_page_write_fault(phys.raw());
         // SAFETY: the fault published this cache-owned frame for the test
         // mapping and all physical memory is kernel identity-mapped.
         unsafe {
