@@ -50,6 +50,8 @@ use crate::PAGE_SIZE;
 
 mod central;
 pub(crate) use central::FrameState;
+#[cfg(feature = "kernel-test")]
+mod retention_tests;
 
 /// Local `usize` view of `PAGE_SIZE` (which the rest of the crate
 /// exposes as `u64` because it doubles as a physical-address
