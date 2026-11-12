@@ -1440,3 +1440,169 @@ kernel_test_in!(
     "scheduler/strand",
     smoke_scheduler_steal_policies_see_staged_wakes
 );
+
+/// Spawn probe `slot` preferring `cpu` and wait until it has run once and is
+/// parked there.
+fn park_probe_on_real_cpu(slot: usize, cpu: usize) -> bool {
+    crate::spawn_with_spec(Probe { slot, parks: 1 }, any_cpu_preferring(cpu));
+    wait_for(1_000_000_000, || {
+        polls(slot) == 1
+            && PROBE_WAKER[slot]
+                .lock()
+                .as_ref()
+                .and_then(crate::scheduler_wake_cell)
+                .is_some_and(|cell| {
+                    let token = cell.parked_location.load(Ordering::Acquire);
+                    token != crate::NOT_PARKED && token % MAX_CPUS == cpu
+                })
+    })
+}
+
+/// How long a wake may take to reach a task on real CPUs before it counts as
+/// stranded. Far below any periodic backstop, far above an IPI round trip
+/// even under an emulator.
+const WAKE_BOUND_NS: u64 = 100_000_000;
+
+/// A wake aimed at a halted CPU wakes it with one reschedule IPI: under
+/// tickless idle there is no tick to wait for, so the task runs only because
+/// of the IPI the wake sent.
+fn smoke_scheduler_wake_to_idle_cpu_runs_by_ipi() -> TestResult {
+    reset_probes();
+    let me = narf_lib::percpu::current_cpu();
+    let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
+    let Some(ap) = (0..MAX_CPUS).find(|cpu| *cpu != me && live & (1u64 << cpu) != 0) else {
+        return TestResult::Skip("needs a second CPU that really came up");
+    };
+    if !park_probe_on_real_cpu(0, ap) {
+        reset_probes();
+        return TestResult::Fail("the AP did not run and park a task enqueued onto it");
+    }
+    if !wait_for(1_000_000_000, || {
+        crate::CPU_HALTED[ap].load(Ordering::SeqCst)
+    }) {
+        reset_probes();
+        return TestResult::Skip("the AP did not go idle");
+    }
+    let Some(waker) = take_waker(0) else {
+        reset_probes();
+        return TestResult::Fail("probe published no waker");
+    };
+    let ipis = crate::__test_resched_ipis_sent(me);
+    waker.wake();
+    let sent = crate::__test_resched_ipis_sent(me).wrapping_sub(ipis);
+    let ran = wait_for(WAKE_BOUND_NS, || polls(0) == 2);
+    let ran_on = PROBE_LAST_CPU[0].load(Ordering::Acquire);
+    reset_probes();
+    if sent != 1 {
+        return TestResult::Fail("a wake to a halted CPU did not send exactly one IPI");
+    }
+    if !ran || ran_on != ap {
+        return TestResult::Fail("a task woken on a halted CPU did not run there promptly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_wake_to_idle_cpu_runs_by_ipi
+);
+
+/// An AP holds its CPU with interrupts masked, so it takes no IPI and no tick
+/// and sends neither. Every other AP is idle. A task that last ran on the held
+/// AP is woken, and another is enqueued onto it: both must run on another CPU
+/// within a small bound, because the waker and the enqueuer moved them or
+/// IPI'd an idle CPU to pull them — the held CPU's tick cannot have, and no
+/// timer is involved. Each of the two operations sends at most one IPI.
+#[cfg(feature = "kernel-test")]
+fn smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere() -> TestResult {
+    static MASKED_STARTED: AtomicBool = AtomicBool::new(false);
+    static MASKED_RELEASE: AtomicBool = AtomicBool::new(false);
+    static MASKED_DONE: AtomicBool = AtomicBool::new(false);
+    reset_probes();
+    let me = narf_lib::percpu::current_cpu();
+    let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
+    let mut aps = (0..MAX_CPUS).filter(|cpu| *cpu != me && live & (1u64 << cpu) != 0);
+    let (Some(held), Some(_)) = (aps.next(), aps.next()) else {
+        return TestResult::Skip("needs two APs that really came up");
+    };
+    MASKED_STARTED.store(false, Ordering::Release);
+    MASKED_RELEASE.store(false, Ordering::Release);
+    MASKED_DONE.store(false, Ordering::Release);
+    if !park_probe_on_real_cpu(0, held) {
+        reset_probes();
+        return TestResult::Fail("the AP did not run and park a task enqueued onto it");
+    }
+    // A plain future cannot be preempted; with interrupts masked the CPU
+    // also takes no tick and no IPI.
+    crate::spawn_with_spec(
+        async {
+            narf_lib::sync::without_interrupts(|| {
+                MASKED_STARTED.store(true, Ordering::Release);
+                wait_for(HOLD_LIMIT_NS, || MASKED_RELEASE.load(Ordering::Acquire));
+            });
+            MASKED_DONE.store(true, Ordering::Release);
+        },
+        TaskSpec {
+            affinity: Affinity::pinned(CpuId(held as u32)),
+            ..TaskSpec::kernel_any()
+        },
+    );
+    if !wait_for(1_000_000_000, || MASKED_STARTED.load(Ordering::Acquire)) {
+        MASKED_RELEASE.store(true, Ordering::Release);
+        reset_probes();
+        return TestResult::Fail("the AP did not start the masked section");
+    }
+    crate::enable_work_stealing();
+
+    // The wake: issued at once, while the held CPU is running a task.
+    let woke = take_waker(0).map(|waker| {
+        let ipis = crate::__test_resched_ipis_sent(me);
+        waker.wake();
+        crate::__test_resched_ipis_sent(me).wrapping_sub(ipis)
+    });
+
+    // The enqueue: once the held CPU has passed no scheduling point for longer
+    // than the not-rescheduling threshold.
+    narf_time::busy_wait_cycles(narf_time::ns_to_cycles(STALL_WAIT_NS));
+    crate::spawn_with_spec(Probe { slot: 1, parks: 0 }, any_cpu_preferring(me));
+    let slot = crate::READY[me].lock().as_mut().and_then(|q| q.pop_front());
+    let enqueued = slot.map(|slot| {
+        let ipis = crate::__test_resched_ipis_sent(me);
+        crate::enqueue_on(held, slot, TaskEnqueueReason::Requeued);
+        crate::__test_resched_ipis_sent(me).wrapping_sub(ipis)
+    });
+
+    // This CPU does not poll: only an AP can run either task.
+    let ran = wait_for(WAKE_BOUND_NS, || polls(0) == 2 && polls(1) == 1);
+    let held_throughout = !MASKED_DONE.load(Ordering::Acquire);
+    let woken_cpu = PROBE_LAST_CPU[0].load(Ordering::Acquire);
+    let enqueued_cpu = PROBE_LAST_CPU[1].load(Ordering::Acquire);
+    MASKED_RELEASE.store(true, Ordering::Release);
+    let released = wait_for(1_000_000_000, || MASKED_DONE.load(Ordering::Acquire));
+    crate::disable_work_stealing();
+    reset_probes();
+
+    let (Some(wake_ipis), Some(enqueue_ipis)) = (woke, enqueued) else {
+        return TestResult::Fail("probe published no waker, or the spawned probe was not found");
+    };
+    if !released {
+        return TestResult::Fail("the masked section never finished");
+    }
+    if !ran {
+        return TestResult::Fail("a task stayed stranded behind a CPU with interrupts masked");
+    }
+    if !held_throughout {
+        return TestResult::Fail("the AP left its masked section before the check");
+    }
+    if woken_cpu == held || enqueued_cpu == held || woken_cpu == me || enqueued_cpu == me {
+        return TestResult::Fail("a task ran on a CPU that could not have run it");
+    }
+    if wake_ipis > 1 || enqueue_ipis > 1 {
+        return TestResult::Fail("a single wake or enqueue sent more than one IPI");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "scheduler/strand",
+    smoke_scheduler_wake_behind_masked_cpu_runs_elsewhere
+);
