@@ -3963,7 +3963,14 @@ pub(crate) unsafe fn copy_from_user_vec(
     len: usize,
 ) -> Result<alloc::vec::Vec<u8>, u64> {
     validate_user_range(src_uptr, len)?;
-    let mut buf = alloc::vec![0u8; len];
+    // Fallible: a large user buffer under memory pressure is -ENOMEM to the
+    // caller, not a kernel panic (`vec!` aborts; observed on a 4 GiB soak,
+    // a 1 MiB `send` copy in `sys_socket_send`).
+    let mut buf = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return Err(crate::errno::wire::ENOMEM);
+    }
+    buf.resize(len, 0u8);
     // SAFETY: validated above; SMAP bracket inside copy_from_user.
     unsafe { copy_from_user(&mut buf, src_uptr) }?;
     Ok(buf)
