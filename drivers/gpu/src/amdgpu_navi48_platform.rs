@@ -3876,7 +3876,7 @@ async unsafe fn update_lit_planes(
     format: SurfaceFormat,
     setup: boot::PlaneSetup,
 ) -> Result<bool, ModesetError> {
-    let Some(m) = displays.lit[usize::from(k)] else {
+    let Some(m) = displays.lit[usize::from(k)].clone() else {
         return Ok(false);
     };
     let pipe = m.pipe;
@@ -3928,9 +3928,10 @@ async unsafe fn update_lit_planes(
                 }
             }
             for d in change.displays {
-                displays.lit[usize::from(d.crtc)] = Some(d);
+                let crtc = usize::from(d.crtc);
+                displays.lit[crtc] = Some(d);
             }
-            if let Some(m) = displays.lit[usize::from(k)] {
+            if let Some(m) = displays.lit[usize::from(k)].clone() {
                 // SAFETY: as above.
                 unsafe { adopt_planes(boot, &m) }.await;
             }
@@ -6091,10 +6092,15 @@ static STREAM_UPDATER: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 static STREAM_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Run the stream updater (once at a time) to apply new non-modeset stream
 /// state: CRTC color and HDR metadata.
+/// Out of line: building the updater task passes its 19 KiB future through
+/// this frame, which inlined into each KMS request (`request_crtc_color`,
+/// `request_connector_color`, `request_vrr_enabled`) gave every one of them
+/// a 20 KiB frame.
+#[inline(never)]
 fn kick_stream_updater() {
     STREAM_DIRTY.store(true, Ordering::Release);
     if !STREAM_UPDATER.swap(true, Ordering::AcqRel) {
-        narf_scheduler::spawn(stream_updater());
+        narf_scheduler::spawn(alloc::boxed::Box::pin(stream_updater()));
     }
 }
 async fn stream_updater() {
@@ -7019,7 +7025,9 @@ async unsafe fn retire_monitored_display(
     k: u8,
     unplugged: bool,
 ) -> Result<(), ModesetError> {
-    let m = displays.lit[usize::from(k)].ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
+    let m = displays.lit[usize::from(k)]
+        .clone()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Invalid)?;
     let pipe = m.pipe;
     // Before teardown can change the branch's payload records.
     let target = target_of(boot, &m);
@@ -7075,12 +7083,14 @@ async unsafe fn retire_suspend_displays(boot: &mut boot::ColdBoot) -> Result<(),
     let mut displays = Displays {
         generation: DISPLAY_GENERATION.load(Ordering::Acquire),
         epoch: recoveries(),
-        lit: [None; 4],
+        lit: [None, None, None, None],
         considered: 0,
     };
     boot.restore_modesets(&mut displays.lit)?;
     for k in 0..displays.lit.len() {
-        let Some(m) = displays.lit[k] else { continue };
+        let Some(m) = displays.lit[k].clone() else {
+            continue;
+        };
         let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
         // SAFETY: forwarded exclusion and retained-owner obligations.
         unsafe { retire_monitored_display(boot, &mut displays, k as u8, unplugged) }.await?;
@@ -7111,7 +7121,7 @@ pub async unsafe fn monitor_displays(
     }
     if displays.epoch != recoveries() {
         displays.epoch = recoveries();
-        displays.lit = [None; 4];
+        displays.lit = [None, None, None, None];
         for k in 0..4 {
             set_crtc_pipe(k, None);
         }
@@ -7130,7 +7140,7 @@ pub async unsafe fn monitor_displays(
     let pipes = crate::amdgpu_rdna4::pipe_pool().pipes();
     let count = crtc_count() as u8;
     for k in (0..count).filter(|k| recovered & (1 << k) != 0) {
-        let m = displays.lit[usize::from(k)].unwrap();
+        let m = displays.lit[usize::from(k)].clone().unwrap();
         let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
         boot.begin_modeset_teardown(&m, unplugged)?;
     }
@@ -7303,7 +7313,7 @@ pub async unsafe fn monitor_displays(
         }
     }
     for k in monitor_order(pending_mask, count) {
-        let Some(m) = displays.lit[usize::from(k)] else {
+        let Some(m) = displays.lit[usize::from(k)].clone() else {
             continue;
         };
         let pending = boot.display_teardown_status(m.pipe);
@@ -7388,7 +7398,7 @@ pub async unsafe fn monitor_displays(
                     relight = true;
                     continue;
                 }
-                displays.lit[usize::from(k)] = Some(m);
+                displays.lit[usize::from(k)] = Some(m.clone());
                 {
                     let offered: Vec<Timing> = m.modes.into_iter().flatten().collect();
                     let mut outputs = OUTPUTS.lock();
@@ -7483,7 +7493,8 @@ pub async unsafe fn monitor_displays(
                 drop(outputs);
                 let count = running.len() as u8;
                 for m in running {
-                    displays.lit[usize::from(m.crtc)] = Some(m);
+                    let crtc = usize::from(m.crtc);
+                    displays.lit[crtc] = Some(m);
                 }
                 steps.push(MonitorStep::Replanned(count));
             }
@@ -7539,7 +7550,8 @@ pub async unsafe fn monitor_displays(
             let mut count = 0;
             for m in config.displays {
                 count += u8::from(lit_mask & 1 << m.crtc == 0);
-                displays.lit[usize::from(m.crtc)] = Some(m);
+                let crtc = usize::from(m.crtc);
+                displays.lit[crtc] = Some(m);
             }
             displays.considered = wanted_mask(boot);
             steps.push(MonitorStep::LitBeside(count));
@@ -7549,10 +7561,10 @@ pub async unsafe fn monitor_displays(
     if relit && !lit_beside {
         // Withdraw every writer, stop every display, light them again: one
         // commit from the configuration that ran.
-        let running: Vec<Modeset> = displays.lit.iter().flatten().copied().collect();
+        let running: Vec<Modeset> = displays.lit.iter().flatten().cloned().collect();
         let current = boot::dc_state(&running);
         for k in (0..count).rev() {
-            let Some(m) = displays.lit[usize::from(k)] else {
+            let Some(m) = displays.lit[usize::from(k)].clone() else {
                 continue;
             };
             let unplugged = boot.display_hpd(m.selection.port) == Ok(false);
@@ -7609,7 +7621,8 @@ pub async unsafe fn monitor_displays(
                 );
             }
             for m in config.displays {
-                displays.lit[usize::from(m.crtc)] = Some(m);
+                let crtc = usize::from(m.crtc);
+                displays.lit[crtc] = Some(m);
                 count += 1;
             }
         }
@@ -7635,7 +7648,8 @@ pub async unsafe fn monitor_displays(
     match unsafe { boot.converge_uclk_pstate(drr_wanted(boot)) }.await {
         Ok(moved) => {
             for m in moved {
-                displays.lit[usize::from(m.crtc)] = Some(m);
+                let crtc = usize::from(m.crtc);
+                displays.lit[crtc] = Some(m);
             }
         }
         Err(e) => {
@@ -7672,7 +7686,7 @@ pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configura
             // Empty configuration after reset must relight even if the old
             // connector inventory still reports every sink present.
             epoch: recoveries().wrapping_sub(u64::from(config.displays.is_empty())),
-            lit: [None; 4],
+            lit: [None, None, None, None],
             considered: 0,
         };
         for m in config.displays {

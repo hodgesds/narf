@@ -229,7 +229,7 @@ impl ColdBoot {
         let Some(i) = running.iter().position(|m| m.pipe == display) else {
             return Ok(None);
         };
-        let m = running[i];
+        let m = running[i].clone();
         let mut selection = m.selection;
         selection.format = format;
         selection.planes = setup;
@@ -276,7 +276,7 @@ impl ColdBoot {
         {
             return Ok(None);
         }
-        let mut next = m;
+        let mut next = m.clone();
         next.selection = selection;
         next.plan = plan;
         // The display's pipes after the change, for the clock targets.
@@ -359,7 +359,7 @@ impl ColdBoot {
                     .await?;
                 running[j].plan = d.plan;
                 running[j].scanout.plan = d.plan;
-                self.modesets.retain(running[j]);
+                self.modesets.retain(running[j].clone());
                 continue;
             }
             // SAFETY: the caller's obligations, CPU views of replaced surfaces
@@ -383,8 +383,8 @@ impl ColdBoot {
                 Err(e) => return Err(e.into()),
             };
             next.scanout = change.scanout;
-            running[i] = next;
-            self.modesets.retain(next);
+            running[i] = next.clone();
+            self.modesets.retain(next.clone());
             updated = Some(change);
         }
         let updated = updated.ok_or(otg::Error::Invalid)?;
@@ -396,7 +396,7 @@ impl ColdBoot {
         // SAFETY: as above.
         unsafe { self.optimize_running(&mut running, request, &targets) }.await?;
         for r in &running {
-            self.modesets.retain(*r);
+            self.modesets.retain(r.clone());
         }
         Ok(Some(PlanesChange {
             pipe: display,
