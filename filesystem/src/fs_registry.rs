@@ -40,9 +40,9 @@ pub struct MountRequest<'a> {
 ///
 /// The halting [`narf_scheduler::block_on`] panics inside an executor poll,
 /// and a syscall is one: systemd's fstab mount units reach the constructors
-/// through `mount(8)`. There the constructor spins
-/// ([`narf_scheduler::block_on_spin`]), as the sync lookups of block-backed
-/// filesystems do. Boot-time callers keep the idling wait.
+/// through `mount(8)`. There the constructor parks the task
+/// ([`crate::wait_sync`]), as the sync lookups of block-backed filesystems
+/// do. Boot-time callers keep the idling wait.
 ///
 /// The future is boxed: a syscall runs on the task's 32 KiB kernel stack,
 /// and a filesystem's whole mount state machine (a btrfs mount of a shared
@@ -53,7 +53,7 @@ pub fn mount_wait<F: core::future::Future>(fut: F) -> F::Output {
     if narf_scheduler::current_task_id() == narf_scheduler::TaskId::NONE {
         narf_scheduler::block_on(fut)
     } else {
-        narf_scheduler::block_on_spin(fut)
+        crate::wait_sync(fut)
     }
 }
 

@@ -843,3 +843,108 @@ kernel_test_in!(
     "drivers/fs/btrfs/race",
     smoke_btrfs_unrelated_lookups_do_not_retry_on_evictions
 );
+
+/// The p-dump freeze in miniature, all on one CPU: task A holds the device
+/// I/O lock across a sleep (a read in flight); task B makes a synchronous
+/// lookup that needs that lock (a cold node cache); task C is pinned to the
+/// same CPU and must get to run while B waits. B's wait must park
+/// (`narf_filesystem::wait_sync`) — when it spun, C and A's own wake-up
+/// never ran on that CPU again, and nothing finished.
+fn sync_lookup_parks() -> Result<(), &'static str> {
+    use core::sync::atomic::AtomicBool;
+    const CPU: u32 = 3;
+    let (_dev, vol) = fresh()?;
+    let root = vol.root();
+    let dir = poll_once(root.mkdir("d"))
+        .and_then(|r| r.ok())
+        .ok_or("mkdir failed")?;
+    drop(
+        poll_once(dir.create("x"))
+            .and_then(|r| r.ok())
+            .ok_or("create failed")?,
+    );
+    if !matches!(poll_once(vol.sync_to_disk()), Some(Ok(()))) {
+        return Err("sync failed");
+    }
+    // Every node read from now on goes to the device, through its lock.
+    crate::volume::__test_node_shrinker(usize::MAX);
+    let spins_before = narf_filesystem::sync_wait::spins_with_user_task();
+    let held = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let looked = Arc::new(AtomicU32::new(0));
+    let ticks = Arc::new(AtomicU32::new(0));
+    {
+        let (vol, held, release) = (vol.clone(), held.clone(), release.clone());
+        narf_scheduler::spawn_stackful_pinned(
+            async move { vol.__test_hold_io_until(&held, &release).await },
+            CPU,
+        );
+    }
+    let mut spins = 0u64;
+    while !held.load(Ordering::Acquire) && spins < 4_000_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    if !held.load(Ordering::Acquire) {
+        return Err("the I/O lock holder never ran");
+    }
+    {
+        let (dir, looked) = (dir.clone(), looked.clone());
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                let found = dir.lookup("x").is_some();
+                looked.store(if found { 1 } else { 2 }, Ordering::Release);
+            },
+            CPU,
+        );
+    }
+    {
+        let (ticks, looked) = (ticks.clone(), looked.clone());
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                while looked.load(Ordering::Acquire) == 0 && ticks.load(Ordering::Acquire) < 1000 {
+                    ticks.fetch_add(1, Ordering::AcqRel);
+                    narf_time::sleep_ms(1).await;
+                }
+            },
+            CPU,
+        );
+    }
+    // The pinned peer runs while the lookup waits for the lock.
+    let mut spins = 0u64;
+    while ticks.load(Ordering::Acquire) < 20 && spins < 20_000_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    let peer_ran = ticks.load(Ordering::Acquire) >= 20;
+    if looked.load(Ordering::Acquire) != 0 {
+        return Err("the lookup finished while the I/O lock was held");
+    }
+    release.store(true, Ordering::Release);
+    let mut spins = 0u64;
+    while looked.load(Ordering::Acquire) == 0 && spins < 20_000_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    if !peer_ran {
+        return Err("a task pinned to the CPU never ran while a sync lookup waited there");
+    }
+    match looked.load(Ordering::Acquire) {
+        1 => {}
+        0 => return Err("the sync lookup never finished after the I/O lock was released"),
+        _ => return Err("the sync lookup did not find the file"),
+    }
+    if narf_filesystem::sync_wait::spins_with_user_task() != spins_before {
+        return Err("a sync wait spun with a user task current");
+    }
+    Ok(())
+}
+
+fn smoke_btrfs_sync_lookup_parks_beside_a_held_io_lock() -> TestResult {
+    result(sync_lookup_parks())
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_sync_lookup_parks_beside_a_held_io_lock
+);

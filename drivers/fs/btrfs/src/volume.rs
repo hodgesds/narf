@@ -3530,6 +3530,26 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Test-only: hold the first member device's I/O lock, as a task does
+    /// across a device read, until `release` is set; `held` once it is.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) async fn __test_hold_io_until(
+        &self,
+        held: &core::sync::atomic::AtomicBool,
+        release: &core::sync::atomic::AtomicBool,
+    ) {
+        use core::sync::atomic::Ordering;
+        let member = self.devices.lock().values().next().cloned();
+        let Some(member) = member else {
+            return;
+        };
+        let _io = member.io.lock().await;
+        held.store(true, Ordering::Release);
+        while !release.load(Ordering::Acquire) {
+            narf_time::sleep_ms(1).await;
+        }
+    }
+
     /// Test-only: lookups sent back by an eviction so far.
     #[cfg(feature = "kernel-test")]
     pub(crate) fn lookup_retries(&self) -> u64 {
