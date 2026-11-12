@@ -217,9 +217,10 @@ sampler() {
       line="SOAK-SLAB n=$n"
       while read -r k v; do
         [ "$v" = 0 ] || line+=" $k=$v"
-      done < /proc/narf/slab
+      done < <(cat /proc/narf/slab /proc/narf/rcu 2> /dev/null)
       say "$line"
     fi
+    ((n % 36 == 0)) && slab_sites "n=$n"
     for k in cpu memory io; do
       [ -r /proc/pressure/$k ] || continue
       while read -r line; do say "SOAK-PSI $k $line"; done < /proc/pressure/$k
@@ -792,6 +793,17 @@ survey_shared() { # label
   say "SOAK-SHMAP $1 total=$n"
 }
 
+# Who holds the heap (NARF only): the live bytes per allocation site, top 30,
+# as .text offsets to symbolize against the run's kernel.
+slab_sites() { # label
+  local n=0 line
+  [ -r /proc/narf/slab_sites ] || return 0
+  while read -r line; do
+    n=$((n + 1))
+    ((n <= 33)) && say "SOAK-SITES $1 $line"
+  done < /proc/narf/slab_sites
+}
+
 settle_meminfo() { # label
   local k v line
   sync
@@ -811,9 +823,10 @@ settle_meminfo() { # label
     line="SOAK-SLAB $1"
     while read -r k v; do
       [ "$v" = 0 ] || line+=" $k=$v"
-    done < /proc/narf/slab
+    done < <(cat /proc/narf/slab /proc/narf/rcu 2> /dev/null)
     say "$line"
   fi
+  slab_sites "$1"
 }
 
 read -r _ MEM_KB _ < /proc/meminfo
@@ -844,6 +857,8 @@ else
   say "SOAK-NOTE no CPU affinity: samplers share CPUs with the load"
 fi
 net_up
+# Arm the heap allocation-site audit before the baseline (NARF only).
+[ -w /proc/narf/slab_sites ] && echo 1 > /proc/narf/slab_sites
 settle_meminfo SOAK-BASELINE
 
 stamp

@@ -82,6 +82,46 @@ unsafe impl Sync for CpuCell {}
 
 static CPUS: [CpuCell; MAX_CPUS] = [const { CpuCell::NEW }; MAX_CPUS];
 
+/// Objects retired (deferred) and destroyed, per CPU that did it. Each CPU
+/// adds only to its own cells, so the counters cost one uncontended relaxed
+/// add; [`census`] sums them. `retired - destroyed` is what RCU still holds:
+/// waiting for a grace period, or queued for the reclaim worker.
+static RETIRED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static DESTROYED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+#[inline]
+fn census_cpu() -> usize {
+    (narf_arch::current_cpu_id().raw() as usize).min(MAX_CPUS - 1)
+}
+
+/// RCU's deferred-reclaim backlog, for `/proc/narf/rcu`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Census {
+    /// Objects ever retired.
+    pub retired: u64,
+    /// Objects whose destructor has run.
+    pub destroyed: u64,
+    /// The published grace-period epoch.
+    pub global_epoch: u64,
+    /// The oldest epoch any CPU has reported quiescence for (`u64::MAX` when
+    /// every CPU is idle).
+    pub min_quiescent: u64,
+    /// CPUs whose last quiescent report is older than one second.
+    pub stalled_mask: u64,
+}
+
+/// Snapshot the deferred-reclaim backlog. Lock-free; relaxed sums.
+pub fn census() -> Census {
+    let sum = |a: &[AtomicU64]| a.iter().fold(0u64, |t, c| t.wrapping_add(c.load(Ordering::Relaxed)));
+    Census {
+        retired: sum(&RETIRED),
+        destroyed: sum(&DESTROYED),
+        global_epoch: GLOBAL_EPOCH.load(Ordering::Relaxed),
+        min_quiescent: min_last_quiescent(),
+        stalled_mask: stalled_cpu_mask(narf_time::monotonic_ns(), 1_000_000_000),
+    }
+}
+
 #[inline]
 fn this_cpu() -> &'static CpuCell {
     let idx = narf_arch::current_cpu_id().raw() as usize;
@@ -438,6 +478,7 @@ pub(super) unsafe fn run_droppers(mut list: *mut DeferHdr) -> usize {
         }
         ran += 1;
     }
+    DESTROYED[census_cpu()].fetch_add(ran as u64, Ordering::Relaxed);
     ran
 }
 
@@ -510,6 +551,7 @@ pub(crate) fn defer_node(node: *mut DeferHdr) {
             bucket.len += 1;
         }
     });
+    RETIRED[census_cpu()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// `inline`: run ready destructors here (the explicit grace-period waits) or
