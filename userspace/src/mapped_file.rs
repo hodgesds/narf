@@ -2141,6 +2141,7 @@ fn demand_frame_inner(
     }
     let mut attempts = 0usize;
     let (phys, publication, expected_generation) = loop {
+        let changes_at_read = writeback::content_changes(ops.mmap_backing_identity());
         let expected_generation = ops.mmap_cache_generation();
         if let Some((phys, publication)) = reserve_cached_shared_file_pages(&ops, offset, 1) {
             break (
@@ -2165,13 +2166,13 @@ fn demand_frame_inner(
         // `invalidate_lock` against both; here the generation sampled
         // before the read is checked under the cache lock, and a stale fill
         // is read again.
-        let fresh_only = attempts < FRESH_FILL_ATTEMPTS;
+        let checked = (attempts < FRESH_FILL_ATTEMPTS).then_some(changes_at_read);
         if let Some((phys, publication)) = publish_shared_file_pages_checked(
             &ops,
             offset,
             candidates,
             expected_generation,
-            fresh_only,
+            checked,
         ) {
             break (
                 *phys.first().ok_or(FileFaultError::NoMemory)?,
@@ -2439,6 +2440,8 @@ pub(crate) fn populate_file_cache(ops: &Arc<dyn FileOps>, offset: u64, len: u64)
     if len == 0 || ops.supports_mmap_fault() {
         return 0;
     }
+    // Before any read: see `publish_shared_file_pages_checked`.
+    let changes = writeback::content_changes(ops.mmap_backing_identity());
     let Some(generation) = ops.mmap_cache_generation() else {
         return 0;
     };
@@ -2464,9 +2467,13 @@ pub(crate) fn populate_file_cache(ops: &Arc<dyn FileOps>, offset: u64, len: u64)
             candidates.push(candidate);
             // Advisory: a fill that raced a change to the file is dropped,
             // not published, and population stops there.
-            let Some((_phys, publication)) =
-                publish_shared_file_pages_checked(ops, page, candidates, Some(generation), true)
-            else {
+            let Some((_phys, publication)) = publish_shared_file_pages_checked(
+                ops,
+                page,
+                candidates,
+                Some(generation),
+                Some(changes),
+            ) else {
                 break;
             };
             publication.commit();
@@ -3156,7 +3163,7 @@ pub(crate) fn publish_shared_file_pages(
     candidates: Vec<PhysAddr>,
     expected_generation: Option<u64>,
 ) -> (Vec<PhysAddr>, SharedFilePublication) {
-    publish_shared_file_pages_checked(ops, offset, candidates, expected_generation, false)
+    publish_shared_file_pages_checked(ops, offset, candidates, expected_generation, None)
         .expect("an unchecked publication always publishes")
 }
 
@@ -3165,11 +3172,13 @@ pub(crate) fn publish_shared_file_pages(
 /// left to the change's own second invalidation pass.
 const FRESH_FILL_ATTEMPTS: usize = 16;
 
-/// [`publish_shared_file_pages`], refusing — when `fresh_only` — to make a
-/// candidate the cache's page if the file's generation moved since
-/// `expected_generation` was sampled before the candidates were read: they
-/// may hold bytes a truncate or write has since replaced, and that change's
-/// invalidation has already run. Offsets the cache already holds a page for
+/// [`publish_shared_file_pages`], refusing — given `changes_at_read`, the
+/// [`writeback::content_changes`] count sampled before the candidates were
+/// read — to make a candidate the cache's page if the file changed since:
+/// its generation moved from `expected_generation`, or the count did (checked
+/// under the cache lock, so a change counted after the check corrects the
+/// page itself). The candidates may hold bytes a truncate or write has since
+/// replaced, and that change's invalidation or fold has already run. Offsets the cache already holds a page for
 /// are unaffected (that page is used). `None`: nothing was published, the
 /// candidates were freed, and the caller reads again.
 pub(crate) fn publish_shared_file_pages_checked(
@@ -3177,7 +3186,7 @@ pub(crate) fn publish_shared_file_pages_checked(
     offset: u64,
     candidates: Vec<PhysAddr>,
     expected_generation: Option<u64>,
-    fresh_only: bool,
+    changes_at_read: Option<u64>,
 ) -> Option<(Vec<PhysAddr>, SharedFilePublication)> {
     writeback::register_shrinker();
     let mut rejected = Vec::with_capacity(candidates.len());
@@ -3185,13 +3194,16 @@ pub(crate) fn publish_shared_file_pages_checked(
     let mut canonical = Vec::with_capacity(candidates.len());
     let cache_generation =
         expected_generation.filter(|generation| ops.mmap_cache_generation() == Some(*generation));
-    let stale_fill = fresh_only && expected_generation.is_some() && cache_generation.is_none();
     let identity = shared_file_identity(ops.as_ref());
     // For the coherence check's report: read before the cache lock.
     let checks = writeback::checks_enabled();
     let ino = if checks { ops.ino() } else { 0 };
     {
         let mut pages = SHARED_FILE_PAGES.lock();
+        let stale_fill = changes_at_read.is_some_and(|changes| {
+            (expected_generation.is_some() && cache_generation.is_none())
+                || writeback::content_changes(identity.anchor) != changes
+        });
         if stale_fill {
             let all_cached = (0..candidates.len()).all(|index| {
                 let key = SharedFilePages::key(identity, offset + index as u64 * 4096);
@@ -4424,6 +4436,9 @@ pub(crate) fn note_file_written(
     if bytes.is_empty() {
         return;
     }
+    // Before the fold: a fill that read from before this write must not be
+    // published after it (see `writeback::note_content_change`).
+    writeback::note_content_change(ops.mmap_backing_identity());
     let identity = shared_file_identity(ops.as_ref());
     let mut done = 0usize;
     let mut raced_idle = false;

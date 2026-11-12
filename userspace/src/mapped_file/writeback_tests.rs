@@ -2517,6 +2517,7 @@ fn smoke_fill_racing_a_truncate_is_read_again() -> TestResult {
     fixture.store.bytes.lock().fill(0x77);
     let ops = Arc::clone(fixture.ops());
     // The fault's read, before the truncate.
+    let changes = content_changes(ops.mmap_backing_identity());
     let generation = ops.mmap_cache_generation();
     let Ok(frame) = narf_memory::alloc_frame() else {
         return TestResult::Fail("no frame");
@@ -2532,8 +2533,14 @@ fn smoke_fill_racing_a_truncate_is_read_again() -> TestResult {
         return TestResult::Fail("the truncates failed");
     }
     // Rejected (and freed by the publication).
-    if super::super::publish_shared_file_pages_checked(&ops, 0, vec![candidate], generation, true)
-        .is_some()
+    if super::super::publish_shared_file_pages_checked(
+        &ops,
+        0,
+        vec![candidate],
+        generation,
+        Some(changes),
+    )
+    .is_some()
     {
         return TestResult::Fail("a fill read before a truncate was published");
     }
@@ -2555,4 +2562,57 @@ fn smoke_fill_racing_a_truncate_is_read_again() -> TestResult {
 kernel_test_in!(
     "userspace/writeback",
     smoke_fill_racing_a_truncate_is_read_again
+);
+
+/// The window the generation alone left open (h-soak16): btrfs moves a
+/// file's generation only when its truncate finishes, after the cut is on
+/// the file and between its two invalidation passes. A fill that read
+/// before the cut and checked the generation before the move could publish
+/// after the second pass, keeping the cut bytes for good. The change count
+/// moves before each pass's cache work and is checked under the cache lock:
+/// a fill that sees it moved is not published, even with the generation
+/// unchanged; and so for a `write(2)` fold.
+fn smoke_fill_racing_an_invalidation_is_read_again() -> TestResult {
+    let fixture = Fixture::new(1);
+    fixture.store.bytes.lock().fill(0x77);
+    let ops = Arc::clone(fixture.ops());
+    for (what, change) in [
+        (
+            "an invalidation",
+            (|ops: &Arc<dyn FileOps>| invalidate_beyond_eof(ops.as_ref())) as fn(&Arc<dyn FileOps>),
+        ),
+        ("a write(2) fold", |ops: &Arc<dyn FileOps>| {
+            super::super::note_file_written(ops, 0, &[0x77], write_stamp())
+        }),
+    ] {
+        let changes = content_changes(ops.mmap_backing_identity());
+        let generation = ops.mmap_cache_generation();
+        let Ok(frame) = narf_memory::alloc_frame() else {
+            return TestResult::Fail("no frame");
+        };
+        // The change lands between the fill's read and its publication,
+        // without moving the generation.
+        change(&ops);
+        if ops.mmap_cache_generation() != generation {
+            narf_memory::free_frame(frame);
+            return TestResult::Fail("the test needs the generation unmoved");
+        }
+        let published = super::super::publish_shared_file_pages_checked(
+            &ops,
+            0,
+            vec![frame.start_address()],
+            generation,
+            Some(changes),
+        );
+        if published.is_some() {
+            use core::fmt::Write as _;
+            let _ = writeln!(narf_console::Writer, "racing {what}");
+            return TestResult::Fail("a fill read before a counted change was published");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/writeback",
+    smoke_fill_racing_an_invalidation_is_read_again
 );

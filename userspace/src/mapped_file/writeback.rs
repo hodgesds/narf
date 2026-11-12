@@ -262,6 +262,31 @@ fn may_have_cached_pages(ops: &dyn FileOps) -> bool {
         || page_bucket(ops.mmap_backing_identity()).load(Ordering::Acquire) != 0
 }
 
+/// Changes to a file's content that the cache has to hear of — truncates,
+/// hole punches, `write(2)` folds — counted by backing anchor (shared only
+/// by colliding anchors). Each is counted before its invalidation or fold
+/// takes the cache lock, so a fault fill that sampled the count before its
+/// read and finds it moved under the cache lock knows its bytes may be
+/// older than the change, and a fill that finds it unmoved is published
+/// before the change's own cache work, which then corrects it — Linux's
+/// folio lock and `invalidate_lock`, as a sequence count.
+static CHANGES: [AtomicU64; FILTER_BUCKETS] = [const { AtomicU64::new(0) }; FILTER_BUCKETS];
+
+/// The change count a fill samples before its read.
+pub(super) fn content_changes(anchor: usize) -> u64 {
+    CHANGES[change_bucket(anchor)].load(Ordering::Acquire)
+}
+
+/// Count a change to `anchor`'s file. Call before the cache work it does.
+pub(super) fn note_content_change(anchor: usize) {
+    CHANGES[change_bucket(anchor)].fetch_add(1, Ordering::AcqRel);
+}
+
+fn change_bucket(anchor: usize) -> usize {
+    let mixed = (anchor as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (mixed >> 54) as usize % FILTER_BUCKETS
+}
+
 /// `ops`'s identity, if its file may have cached pages, entry or not.
 fn cached_pages_identity(ops: &dyn FileOps) -> Option<SharedFileIdentity> {
     if page_bucket(ops.mmap_backing_identity()).load(Ordering::Acquire) == 0 {
@@ -1717,6 +1742,7 @@ fn zero_cached(page: &mut SharedFilePage, at: usize, len: usize) {
 /// the tail of the page `size` falls in (`truncate_inode_pages_range` and
 /// `truncate_inode_partial_folio`).
 fn invalidate_past(identity: SharedFileIdentity, size: u64) {
+    note_content_change(identity.anchor);
     if page_bucket(identity.anchor).load(Ordering::Acquire) == 0 {
         return;
     }
@@ -1747,6 +1773,9 @@ fn invalidate_past(identity: SharedFileIdentity, size: u64) {
 /// `truncate_inode_pages_range` runs whenever `mapping->nrpages` is
 /// non-zero). Left behind, they would hold bytes the file no longer has.
 pub(super) fn invalidate_beyond_eof(file: &dyn FileOps) {
+    // Counted even with nothing cached: a fill in flight must not publish
+    // what it read from before this change.
+    note_content_change(file.mmap_backing_identity());
     let Some(identity) = cached_pages_identity(file) else {
         return;
     };
@@ -1805,6 +1834,7 @@ pub(crate) fn discard_stores_past_eof(ops: &dyn FileOps, old_size: u64, new_end:
 /// as zeros: so must the cached pages, or a dirty one would write the old
 /// bytes back into the hole.
 fn zero_cached_range(identity: SharedFileIdentity, offset: u64, len: u64) {
+    note_content_change(identity.anchor);
     let end = offset.saturating_add(len);
     let mut cursor = offset & !4095;
     loop {
