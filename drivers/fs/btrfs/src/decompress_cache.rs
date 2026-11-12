@@ -39,6 +39,9 @@
 //!   first. One spinlock serializes the bookkeeping, and the data is shared
 //!   out as `Arc<Vec<u8>>`, so the lock is never held across I/O or
 //!   decompression. An entry-count limit also bounds the eviction scan.
+//! - **Can be switched off.** `btrfs.data_cache=0` on the kernel command
+//!   line makes every lookup miss and every fill a no-op ([`enabled`]), so a
+//!   suspected stale read can be checked against a run without the cache.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -171,8 +174,29 @@ fn key(vol: VolKey, id: ExtentId) -> Key {
     }
 }
 
+/// Cache state from the command line: 0 not read yet, 1 on, 2 off.
+static ENABLED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Whether the cache is in use: unless `btrfs.data_cache=0` is on the
+/// kernel command line.
+pub fn enabled() -> bool {
+    match ENABLED.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = narf_boot::args().value("btrfs.data_cache") != Some("0");
+            ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Look up a decompressed extent or verified uncompressed window.
 pub fn get(vol: &VolumeRef, id: ExtentId) -> Option<Arc<Vec<u8>>> {
+    if !enabled() {
+        MISSES.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let mut cache = CACHE.lock();
     cache.clock += 1;
     let now = cache.clock;
@@ -200,7 +224,8 @@ pub fn epoch(vol: &VolumeRef) -> u64 {
 pub fn insert(vol: &VolumeRef, id: ExtentId, epoch_at_read: u64, plain: Arc<Vec<u8>>) {
     let size = plain.len();
     let budget = budget_bytes();
-    if size == 0
+    if !enabled()
+        || size == 0
         || charge(&plain) > budget / 4
         || id.disk_num_bytes == 0
         || id.disk_num_bytes > MAX_DISK_BYTES
