@@ -432,10 +432,23 @@ grow-and-retry `autogrow!` gives a whole operation), yielding between steps
 two steps (`smoke_btrfs_truncate_steps_let_others_run`); writes, truncates,
 fallocates and attribute changes of the same inode take the inode lock too and
 wait (`smoke_btrfs_truncates_of_one_file_serialize`). Each truncate step works
-out its range from the tree as it is. An orphan's eviction takes at most 64
-steps per operation (`orphans::REAP_STEP_BUDGET`); the rest goes on in the
-operations, fsyncs and commit-timer passes that follow, and a mount evicts its
-recovered orphans whole.
+out its range from the tree as it is. An unlinked inode is evicted at its
+last reference, as Linux evicts in the final `iput`: by the unlink, rmdir or
+rename that dropped its last link when no handle or mapping holds it, else
+by the background reaper once the last one closes (Linux's delayed iputs),
+and before a `syncfs` (`BtrfsVolume::run_delayed_iputs`). Each eviction goes
+four steps per join of the transaction, one eviction at a time. Writers,
+fsyncs and the commit timer never evict; an operation out of space reaps
+before it retries, as Linux `flush_space` waits for the delayed iputs. A
+mount evicts its recovered orphans whole
+(`smoke_btrfs_rm_rf_beside_writers_truncates_and_fsyncs`).
+
+A wait on a syscall's behalf — for an inode or directory lock, the rename
+lock, the operation queue or the transaction — ends when the task is sent
+SIGKILL (`narf_filesystem::killable`, Linux `inode_lock_killable` and
+`mutex_lock_killable`). A truncate or fallocate killed between two of its
+steps stops there, with the file at a step boundary, which is a state a crash
+may leave as well.
 
 An `ORPHAN_ITEM` whose inode still has links, or no longer exists, marks
 no inode to reclaim. Recovery does with it what Linux `btrfs_orphan_cleanup`

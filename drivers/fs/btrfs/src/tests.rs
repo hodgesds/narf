@@ -3600,7 +3600,7 @@ kernel_test_in!(
 );
 
 /// Lookup and final eviction race without a lock: an eviction either sees the
-/// lookup's anchor and backs off, or the lookup sees the eviction's count.
+/// lookup's anchor and backs off, or the lookup sees its inode evicting.
 fn smoke_btrfs_eviction_claim_excludes_open_inodes() -> TestResult {
     use narf_filesystem::FsInstance;
     let vol = match mount_fixture() {
@@ -3613,20 +3613,23 @@ fn smoke_btrfs_eviction_claim_excludes_open_inodes() -> TestResult {
         _ => return TestResult::Fail("create evict.dat failed"),
     };
     let (tree, ino) = (vol.fs_tree_id(), file.ino());
-    let before = vol.eviction_count();
     if vol.claim_for_eviction(tree, ino) {
         return TestResult::Fail("eviction claimed an open inode");
     }
-    if vol.eviction_count() != before {
+    if vol.is_evicting(tree, ino) {
         return TestResult::Fail("a refused claim sent running lookups back to the start");
     }
     drop(file);
     if !vol.claim_for_eviction(tree, ino) {
         return TestResult::Fail("eviction refused a closed inode");
     }
-    if vol.eviction_count() == before {
+    if !vol.is_evicting(tree, ino) {
         return TestResult::Fail("an eviction was invisible to a running lookup");
     }
+    if vol.is_evicting(tree, ino + 1) {
+        return TestResult::Fail("an eviction was visible to a lookup of another inode");
+    }
+    vol.end_eviction(tree, ino);
     TestResult::Pass
 }
 kernel_test_in!(
@@ -12270,6 +12273,9 @@ fn smoke_btrfs_block_group_tree_write() -> TestResult {
         return TestResult::Fail("unlink on block-group-tree fs failed");
     }
     drop(file);
+    // The delayed iput of the closed, unlinked file (the background
+    // reaper's work, run here).
+    poll_once(vol.run_delayed_iputs());
     for i in 0..4 {
         if !matches!(
             poll_once(vol.root().create(&format!("bgt-small-{i}.txt"))),

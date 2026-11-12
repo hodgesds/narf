@@ -1668,13 +1668,7 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     // operation's tree reads and its staging would hand it a tree that moved
     // (a fresh root with no METADATA_ITEM yet, a closed batch), so it waits
     // for the running operations to finish (`txn_gate`).
-    let _op = vol.begin_commit().await;
-    // An orphan that cannot be reclaimed for lack of space must not keep
-    // the transaction from ageing out: committing is what releases space.
-    match vol.reap_orphans().await {
-        Ok(()) | Err(FsError::NoSpace) => {}
-        Err(error) => return Err(error),
-    }
+    let _op = vol.begin_commit().await?;
     let stale = {
         let guard = vol.fs_batch().lock().await;
         match guard.as_ref() {
@@ -1694,6 +1688,37 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
         vol.sync_to_disk().await?;
     }
     Ok(())
+}
+
+/// Start the filesystem's orphan reaper: the delayed iputs of inodes whose
+/// last reference went while an operation could not evict them (a handle or
+/// a mapping closed after the unlink; Linux `btrfs_add_delayed_iput`, run by
+/// the cleaner thread). Writers never evict.
+pub(crate) fn spawn_orphan_reaper<B: BlockDevice + 'static>(
+    core: &alloc::sync::Arc<crate::volume::VolCore<B>>,
+) {
+    narf_scheduler::spawn(orphan_reaper(alloc::sync::Arc::downgrade(core)));
+}
+
+/// The reaper task's body: asleep until an unlinked inode's last reference
+/// goes (`MmapAnchor`'s drop wakes it), then the delayed iputs.
+pub(crate) async fn orphan_reaper<B: BlockDevice + 'static>(
+    weak: alloc::sync::Weak<crate::volume::VolCore<B>>,
+) {
+    loop {
+        let Some(wanted) = weak.upgrade().map(|core| core.reap_wanted()) else {
+            return;
+        };
+        wanted.await;
+        let Some(core) = weak.upgrade() else {
+            return;
+        };
+        if !core.reaper_on() || core.is_core_read_only() {
+            continue;
+        }
+        let view = BtrfsVolume::view_for_tree(&core, format::FS_TREE_OBJECTID);
+        view.run_delayed_iputs().await;
+    }
 }
 
 /// Start the transaction timer for a freshly mounted volume.
@@ -8064,14 +8089,11 @@ where
     if !vol.admits_writes() {
         return Err(FsError::ReadOnly);
     }
-    let _op = vol.begin_data_op().await;
+    let _op = vol.begin_data_op().await?;
     if !vol.admits_writes() {
         return Err(FsError::ReadOnly);
     }
-    let mut r = match vol.reap_orphans().await {
-        Ok(()) => op().await,
-        Err(error) => Err(error),
-    };
+    let mut r = op().await;
     let root_rw = crate::rw_gate::active_profile() == crate::rw_gate::Profile::RootRw;
     let mut tries = 0u32;
     while tries < 4 && matches!(r, Err(FsError::NoSpace)) {

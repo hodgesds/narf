@@ -142,17 +142,14 @@ macro_rules! autogrow {
             return Err(FsError::ReadOnly);
         }
         // From the operation's first read to its staging.
-        let _op = $vol.$begin().await;
+        let _op = $vol.$begin().await?;
         if !$vol.admits_writes() {
             return Err(FsError::ReadOnly);
         }
-        // Reclaiming an orphan allocates like any other operation, so its
-        // `NoSpace` takes the same ladder as the operation's own: it is part
-        // of what is retried, not a way out before the retry starts.
-        let mut r = match $vol.reap_orphans().await {
-            Ok(()) => $op,
-            Err(error) => Err(error),
-        };
+        // No orphan eviction on the way in: an unlinked inode is evicted at
+        // its last reference (`BtrfsVolume::run_delayed_iputs`), not by
+        // whichever writer comes next.
+        let mut r = $op;
         let mut tries = 0u32;
         // Under `narf.disks=root-rw` the whole-tree-repacking growth path is
         // never used on a production root; a chunk is allocated the way
@@ -167,6 +164,8 @@ macro_rules! autogrow {
                 crate::write::grow_add_chunk(&$vol).await?;
             }
             tries += 1;
+            // Out of space: evicted orphans give their space back (Linux
+            // `flush_space` waits for the delayed iputs before it grows).
             r = match $vol.reap_orphans().await {
                 Ok(()) => $op,
                 Err(error) => Err(error),
@@ -185,7 +184,7 @@ macro_rules! admin_op {
         if !$vol.admits_admin_writes() {
             return Err(FsError::ReadOnly);
         }
-        let _op = $vol.begin_admin().await;
+        let _op = $vol.begin_admin().await?;
         if !$vol.admits_admin_writes() {
             return Err(FsError::ReadOnly);
         }
@@ -205,7 +204,7 @@ macro_rules! namespace_locks {
         let __dirs = crate::node::sorted_anchors(alloc::vec![$(alloc::sync::Arc::clone(&$dir.anchor)),*]);
         let mut __dir_guards = alloc::vec::Vec::with_capacity(__dirs.len());
         for anchor in &__dirs {
-            __dir_guards.push(anchor.content_lock.lock().await);
+            __dir_guards.push(crate::volume::killable(anchor.content_lock.lock()).await?);
         }
         let mut __children = alloc::vec::Vec::new();
         $(
@@ -219,7 +218,7 @@ macro_rules! namespace_locks {
         let __children = crate::node::sorted_anchors(__children);
         let mut __child_guards = alloc::vec::Vec::with_capacity(__children.len());
         for anchor in &__children {
-            __child_guards.push(anchor.content_lock.lock().await);
+            __child_guards.push(crate::volume::killable(anchor.content_lock.lock()).await?);
         }
     };
 }
@@ -454,7 +453,7 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
         }
         let vol = self.volume()?;
         // Linux `inode_lock` around `setattr`.
-        let _inode = self.anchor.content_lock.lock().await;
+        let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
         autogrow!(
             vol,
             async {
@@ -939,18 +938,23 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
     /// the inode going away between the two reads here: an unlink or
     /// replacing rename plus final eviction. The anchor `load_child` takes
     /// stops an eviction that has not begun; one already past that point
-    /// moved `eviction_count`, so start over against the current tree.
+    /// marked the inode evicting, so start over against the current tree.
+    /// Evictions of other inodes never send a lookup back.
     async fn lookup_child(&self, name: &str) -> Result<Arc<BtrfsNode<B>>, FsError> {
         let vol = self.volume()?;
         let _reader = vol.begin_reader();
+        let tree = self.tree_id.unwrap_or_else(|| vol.fs_tree_id());
         loop {
-            let evictions = vol.eviction_count();
             let result = match self.find_child(name).await {
                 Ok(entry) => self.load_child(&vol, &entry).await,
                 Err(error) => Err(error),
             };
-            if vol.eviction_count() == evictions {
-                return result;
+            // Only an eviction of the very inode resolved sends the lookup
+            // back: its anchor came too late to stop it, and the name it
+            // came by is gone or going.
+            match &result {
+                Ok(node) if vol.is_evicting(tree, node.ino) => vol.note_lookup_retry(),
+                _ => return result,
             }
         }
     }
@@ -1056,7 +1060,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             }
             let vol = self.volume()?;
             // Linux `inode_lock` around a buffered write.
-            let _inode = self.anchor.content_lock.lock().await;
+            let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
             autogrow!(
                 vol,
                 async {
@@ -1091,7 +1095,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             }
             // Linux `inode_lock`: the whole truncate, whose steps take the
             // volume's operation lock one at a time (`write::locked_step`).
-            let _inode = self.anchor.content_lock.lock().await;
+            let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
             // The epoch, visible EOF and PTE revoke all belong to this
             // serialized mutation, before retiring its extents.
             let update = self.begin_content_update(&vol);
@@ -1138,7 +1142,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
             }
             // Linux `inode_lock`, as for truncate: its steps take the
             // operation lock one at a time.
-            let inode_lock = self.anchor.content_lock.lock().await;
+            let inode_lock = crate::volume::killable(self.anchor.content_lock.lock()).await?;
             {
                 // Epochs as for write. A staged fallocate can change bytes
                 // before returning an error, so invalidate before its first
@@ -1354,7 +1358,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            let _inode = self.anchor.content_lock.lock().await;
+            let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
             autogrow!(
                 vol,
                 crate::write::set_xattr_item(&vol, self.ino, name, value, flags).await
@@ -1368,7 +1372,7 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 return Err(FsError::ReadOnly);
             }
             let vol = self.volume()?;
-            let _inode = self.anchor.content_lock.lock().await;
+            let _inode = crate::volume::killable(self.anchor.content_lock.lock()).await?;
             autogrow!(
                 vol,
                 crate::write::remove_xattr_item(&vol, self.ino, name).await
@@ -1586,12 +1590,18 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             }
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
-            namespace_locks!(vol, dirs: [self], children: [(self, name)]);
-            autogrow!(
-                namespace,
-                vol,
-                crate::write::unlink_file(&vol, self.ino, name).await
-            )
+            let result = async {
+                namespace_locks!(vol, dirs: [self], children: [(self, name)]);
+                autogrow!(
+                    namespace,
+                    vol,
+                    crate::write::unlink_file(&vol, self.ino, name).await
+                )
+            }
+            .await;
+            // The last link gone and no handle held: this is the final iput.
+            vol.run_delayed_iputs().await;
+            result
         })
     }
 
@@ -1622,12 +1632,17 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             }
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
             let vol = self.volume()?;
-            namespace_locks!(vol, dirs: [self], children: [(self, name)]);
-            autogrow!(
-                namespace,
-                vol,
-                crate::write::rmdir_dir(&vol, self.ino, name).await
-            )
+            let result = async {
+                namespace_locks!(vol, dirs: [self], children: [(self, name)]);
+                autogrow!(
+                    namespace,
+                    vol,
+                    crate::write::rmdir_dir(&vol, self.ino, name).await
+                )
+            }
+            .await;
+            vol.run_delayed_iputs().await;
+            result
         })
     }
 
@@ -1638,12 +1653,18 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             }
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[old_name, new_name]);
             let vol = self.volume()?;
-            namespace_locks!(vol, dirs: [self], children: [(self, old_name), (self, new_name)]);
-            autogrow!(
-                namespace,
-                vol,
-                crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
-            )
+            let result = async {
+                namespace_locks!(vol, dirs: [self], children: [(self, old_name), (self, new_name)]);
+                autogrow!(
+                    namespace,
+                    vol,
+                    crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+                )
+            }
+            .await;
+            // A replaced target's last link.
+            vol.run_delayed_iputs().await;
+            result
         })
     }
 
@@ -1684,27 +1705,35 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
             let _rename = if dest.ino == self.ino {
                 None
             } else {
-                Some(vol.rename_lock().lock().await)
+                Some(crate::volume::killable(vol.rename_lock().lock()).await?)
             };
-            namespace_locks!(
-                vol,
-                dirs: [self, dest],
-                children: [(self, old_name), (dest, new_name)]
-            );
-            if dest.ino == self.ino {
-                autogrow!(
-                    namespace,
+            let result = async {
+                namespace_locks!(
                     vol,
-                    crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
-                )
-            } else {
-                autogrow!(
-                    namespace,
-                    vol,
-                    crate::write::rename_cross_dir(&vol, self.ino, dest.ino, old_name, new_name)
+                    dirs: [self, dest],
+                    children: [(self, old_name), (dest, new_name)]
+                );
+                if dest.ino == self.ino {
+                    autogrow!(
+                        namespace,
+                        vol,
+                        crate::write::rename_same_dir(&vol, self.ino, old_name, new_name).await
+                    )
+                } else {
+                    autogrow!(
+                        namespace,
+                        vol,
+                        crate::write::rename_cross_dir(
+                            &vol, self.ino, dest.ino, old_name, new_name
+                        )
                         .await
-                )
+                    )
+                }
             }
+            .await;
+            drop(_rename);
+            vol.run_delayed_iputs().await;
+            result
         })
     }
 

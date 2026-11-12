@@ -114,13 +114,9 @@ fn smoke_btrfs_collapsed_root_is_cowed() -> TestResult {
     }
     let spacer_ino = spacer.ino();
     drop(spacer);
-    // Unlinked with nothing holding it; evicted whole here (an operation
-    // takes on only a bounded part of an eviction).
+    // Unlinked with nothing holding it: the unlink's final iput evicts it.
     if !matches!(poll_once(vol.root().unlink("spacer")), Some(Ok(())))
-        || !matches!(
-            poll_once(crate::write::reclaim_orphan(&vol, spacer_ino)),
-            Some(Ok(()))
-        )
+        || !vol.orphan_snapshot().is_empty()
         || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
     {
         return TestResult::Fail("collapse: removing the spacer failed");
