@@ -506,11 +506,57 @@ pub fn advance_epoch_if_pending() {
 /// Declare that the current CPU is going idle (about to halt and
 /// stop polling). Resets the per-CPU `last_quiescent` to the
 /// inactive sentinel so `sync()` doesn't block on an asleep CPU.
-/// The CPU re-adopts the live epoch on its first
-/// `report_quiescent` after wake.
+/// The CPU must call [`exit_idle`] when it wakes, before anything that
+/// may read RCU-protected data runs on it.
 #[inline]
 pub fn report_idle() {
     qsbr::report_idle();
+}
+
+/// Rejoin the grace-period census after [`report_idle`] — Linux's
+/// `rcu_eqs_exit`. The executor calls it when it leaves its idle halt and
+/// before every task poll; until then the CPU counts as past every epoch, and
+/// a reader running on it would not hold a grace period open. Returns whether
+/// the CPU was idle. Near-free (one load of this CPU's word) when it was not.
+#[inline]
+pub fn exit_idle() -> bool {
+    qsbr::exit_idle()
+}
+
+/// Interrupt and NMI entry on behalf of RCU — Linux's `rcu_irq_enter` /
+/// `rcu_nmi_enter`. An interrupt or NMI taken while the CPU is idle may run
+/// handlers that read RCU-protected data (the stall detector and crash dump
+/// run from NMI), so the CPU rejoins the census for the handler's duration
+/// and returns to idle when the guard drops (`rcu_irq_exit` /
+/// `rcu_nmi_exit`). Lock-free, reads no clock, and nesting-safe: an entry
+/// nested in an interrupt, an NMI, or an idle transition on this CPU does
+/// nothing or completes its own round trip first (see
+/// [`qsbr::exit_idle_from_interrupt`]). On a CPU that is not idle it costs
+/// one load.
+#[must_use = "the CPU leaves the RCU census again when the guard drops"]
+#[derive(Debug)]
+pub struct IrqEntry {
+    exited_idle: bool,
+}
+
+impl IrqEntry {
+    /// Call first in the interrupt or NMI dispatch path, before any handler
+    /// runs.
+    #[inline]
+    pub fn enter() -> Self {
+        Self {
+            exited_idle: qsbr::exit_idle_from_interrupt(),
+        }
+    }
+}
+
+impl Drop for IrqEntry {
+    #[inline]
+    fn drop(&mut self) {
+        if self.exited_idle {
+            qsbr::reenter_idle();
+        }
+    }
 }
 
 /// Wait one grace period and drain the resulting drop batch.

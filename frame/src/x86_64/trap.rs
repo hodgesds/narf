@@ -1101,6 +1101,9 @@ unsafe extern "C" {
 extern "C" fn irq_dispatch_body(frame: *mut TrapFrame) {
     // SAFETY: `frame` is the live trap frame on the entry stack (shim contract).
     let frame = unsafe { &mut *frame };
+    // An interrupt on an idle CPU rejoins the RCU census before any handler
+    // runs and leaves it again on return (Linux `rcu_irq_enter`/`_exit`).
+    let _rcu = narf_rcu::IrqEntry::enter();
     narf_lib::context::enter_trap_handler();
     let mut regs = [0; 34];
     regs[..20].copy_from_slice(&[
@@ -1232,6 +1235,9 @@ fn dispatch_trap(frame: &mut TrapFrame) {
         // (whose trap-entry LAST_RIP never updates). Cheap; NMI context.
         #[cfg(feature = "stall-watchdog")]
         stall_wd::record_nmi(narf_lib::percpu::current_cpu(), frame.rip, frame.cs);
+        // An NMI on an idle CPU rejoins the RCU census for its handlers (the
+        // stall detector and crash dump run here) — Linux `rcu_nmi_enter`.
+        let _rcu = narf_rcu::IrqEntry::enter();
         narf_interrupts::on_nmi();
         return;
     }

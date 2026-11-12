@@ -2956,6 +2956,10 @@ impl core::fmt::Debug for TaskSlot {
 /// or any other scheduler-owned data is touched.
 #[inline]
 fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
+    // A task may read RCU-protected data: if this CPU has been idle since its
+    // last poll, it rejoins the grace-period census first (Linux
+    // `rcu_eqs_exit`). One load when it was not idle.
+    narf_rcu::exit_idle();
     #[cfg(feature = "native-ring")]
     let _authority = authority::CurrentGuard::enter(&slot.authority);
     let executor_domain = narf_memory::save_domain_state();
@@ -7507,6 +7511,7 @@ pub fn run_until_empty() {
             if woke_late {
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+                narf_rcu::exit_idle();
                 if race_free_halt {
                     // SAFETY: restore the IRQ state we masked above; a wake is
                     // already pending so we loop straight back to polling.
@@ -7540,6 +7545,7 @@ pub fn run_until_empty() {
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+                narf_rcu::exit_idle();
                 // SAFETY: restore the IRQ state to the idle path's natural
                 // enabled state (it was enabled before we masked it).
                 unsafe {
@@ -7560,6 +7566,7 @@ pub fn run_until_empty() {
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+                narf_rcu::exit_idle();
             }
             if next_deadline.is_some() {
                 // After the wake (or if the deadline already passed),
@@ -8470,6 +8477,7 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
     if matches!(state_after_publish, CpuState::Active | CpuState::Idle) {
         CPU_HALTED[cpu].store(false, Ordering::SeqCst);
         narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+        narf_rcu::exit_idle();
         if interrupts_were_enabled {
             // SAFETY: restores the state masked above.
             unsafe { narf_arch::enable_interrupts() };
@@ -8494,6 +8502,7 @@ fn park_for_cpu_lifecycle(cpu: usize) -> bool {
     }
     CPU_HALTED[cpu].store(false, Ordering::SeqCst);
     narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+    narf_rcu::exit_idle();
     if interrupts_were_enabled {
         // SAFETY: restores the state masked above.
         unsafe { narf_arch::enable_interrupts() };
@@ -8602,6 +8611,7 @@ pub fn run_forever() -> ! {
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+            narf_rcu::exit_idle();
             if race_free_halt {
                 // SAFETY: restore the IRQ state we masked above; work is
                 // already queued so we loop straight back to polling.
@@ -8625,6 +8635,7 @@ pub fn run_forever() -> ! {
             }
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+            narf_rcu::exit_idle();
             // SAFETY: restore the enabled state this idle path runs with.
             unsafe {
                 narf_arch::enable_interrupts();
@@ -8647,6 +8658,7 @@ pub fn run_forever() -> ! {
             credit_idle_since(cpu, idle_t0);
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             narf_memory::tlb_shootdown::mark_busy(cpu as u32);
+            narf_rcu::exit_idle();
         }
     }
 }

@@ -34,6 +34,10 @@ pub extern "C" fn rust_aarch64_irq(frame: &mut TrapFrame) {
 fn dispatch_irq(frame: &mut TrapFrame) {
     let hardirq_account =
         narf_scheduler::interrupt_account_enter(narf_scheduler::InterruptKind::HardIrq);
+    // An interrupt on an idle CPU rejoins the RCU census before any handler
+    // runs (Linux `rcu_irq_enter`); dropped before a preemption switch can
+    // carry this frame to another CPU.
+    let rcu_irq = narf_rcu::IrqEntry::enter();
     // SAFETY: we are in the IRQ handler by the vector-table contract, and
     // IRQs are only unmasked after `gic::init_bsp` / `gic::init_ap`.
     let iar = unsafe { narf_interrupts::aarch64::ack_irq() };
@@ -118,6 +122,7 @@ fn dispatch_irq(frame: &mut TrapFrame) {
             hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
         }
     }
+    drop(rcu_irq);
     if tick || narf_scheduler::stackful::realtime_irq_pending() {
         // SAFETY: this is the live vector frame, and EOI/accounting completed
         // above before a switch can strand the trap continuation.
