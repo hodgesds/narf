@@ -2139,23 +2139,47 @@ fn demand_frame_inner(
     if offset >= ops.stat().size {
         return Err(FileFaultError::Bus);
     }
-    let expected_generation = ops.mmap_cache_generation();
-    let (phys, publication) =
+    let mut attempts = 0usize;
+    let (phys, publication, expected_generation) = loop {
+        let expected_generation = ops.mmap_cache_generation();
         if let Some((phys, publication)) = reserve_cached_shared_file_pages(&ops, offset, 1) {
-            (*phys.first().ok_or(FileFaultError::NoMemory)?, publication)
-        } else {
-            let candidate =
-                crate::handlers::load_file_demand_page(&ops, offset).map_err(fault_error)?;
-            let mut candidates = Vec::new();
-            if candidates.try_reserve_exact(1).is_err() {
-                narf_memory::free_frame(narf_memory::PhysFrame::new(candidate));
-                return Err(FileFaultError::NoMemory);
-            }
-            candidates.push(candidate);
-            let (phys, publication) =
-                publish_shared_file_pages(&ops, offset, candidates, expected_generation);
-            (*phys.first().ok_or(FileFaultError::NoMemory)?, publication)
-        };
+            break (
+                *phys.first().ok_or(FileFaultError::NoMemory)?,
+                publication,
+                expected_generation,
+            );
+        }
+        let candidate =
+            crate::handlers::load_file_demand_page(&ops, offset).map_err(fault_error)?;
+        let mut candidates = Vec::new();
+        if candidates.try_reserve_exact(1).is_err() {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(candidate));
+            return Err(FileFaultError::NoMemory);
+        }
+        candidates.push(candidate);
+        attempts += 1;
+        // A fill that raced a change to the file — a truncate, a write —
+        // read bytes from before it; published, the page would keep them
+        // (the change's invalidation has already run) and a mapping would
+        // show them. Linux's fault holds the folio lock and
+        // `invalidate_lock` against both; here the generation sampled
+        // before the read is checked under the cache lock, and a stale fill
+        // is read again.
+        let fresh_only = attempts < FRESH_FILL_ATTEMPTS;
+        if let Some((phys, publication)) = publish_shared_file_pages_checked(
+            &ops,
+            offset,
+            candidates,
+            expected_generation,
+            fresh_only,
+        ) {
+            break (
+                *phys.first().ok_or(FileFaultError::NoMemory)?,
+                publication,
+                expected_generation,
+            );
+        }
+    };
     let retained = if writable {
         retain_shared_file_page_writable(phys.raw())
     } else {
@@ -2438,8 +2462,13 @@ pub(crate) fn populate_file_cache(ops: &Arc<dyn FileOps>, offset: u64, len: u64)
                 Err(_) => break,
             };
             candidates.push(candidate);
-            let (_phys, publication) =
-                publish_shared_file_pages(ops, page, candidates, Some(generation));
+            // Advisory: a fill that raced a change to the file is dropped,
+            // not published, and population stops there.
+            let Some((_phys, publication)) =
+                publish_shared_file_pages_checked(ops, page, candidates, Some(generation), true)
+            else {
+                break;
+            };
             publication.commit();
             populated += 1;
         }
@@ -3127,18 +3156,67 @@ pub(crate) fn publish_shared_file_pages(
     candidates: Vec<PhysAddr>,
     expected_generation: Option<u64>,
 ) -> (Vec<PhysAddr>, SharedFilePublication) {
+    publish_shared_file_pages_checked(ops, offset, candidates, expected_generation, false)
+        .expect("an unchecked publication always publishes")
+}
+
+/// Fills a fault reads again before giving up on a fresh one: a file
+/// changed this often under one fault is published from the last read and
+/// left to the change's own second invalidation pass.
+const FRESH_FILL_ATTEMPTS: usize = 16;
+
+/// [`publish_shared_file_pages`], refusing — when `fresh_only` — to make a
+/// candidate the cache's page if the file's generation moved since
+/// `expected_generation` was sampled before the candidates were read: they
+/// may hold bytes a truncate or write has since replaced, and that change's
+/// invalidation has already run. Offsets the cache already holds a page for
+/// are unaffected (that page is used). `None`: nothing was published, the
+/// candidates were freed, and the caller reads again.
+pub(crate) fn publish_shared_file_pages_checked(
+    ops: &Arc<dyn FileOps>,
+    offset: u64,
+    candidates: Vec<PhysAddr>,
+    expected_generation: Option<u64>,
+    fresh_only: bool,
+) -> Option<(Vec<PhysAddr>, SharedFilePublication)> {
     writeback::register_shrinker();
     let mut rejected = Vec::with_capacity(candidates.len());
     let mut retired = Vec::new();
     let mut canonical = Vec::with_capacity(candidates.len());
     let cache_generation =
         expected_generation.filter(|generation| ops.mmap_cache_generation() == Some(*generation));
+    let stale_fill = fresh_only && expected_generation.is_some() && cache_generation.is_none();
     let identity = shared_file_identity(ops.as_ref());
     // For the coherence check's report: read before the cache lock.
     let checks = writeback::checks_enabled();
     let ino = if checks { ops.ino() } else { 0 };
     {
         let mut pages = SHARED_FILE_PAGES.lock();
+        if stale_fill {
+            let all_cached = (0..candidates.len()).all(|index| {
+                let key = SharedFilePages::key(identity, offset + index as u64 * 4096);
+                pages
+                    .by_file
+                    .get(&key)
+                    .and_then(|phys| pages.by_phys.get(phys))
+                    .is_some_and(|page| {
+                        page.identity == identity
+                            && (shared_page_authoritative(page, None)
+                                || page.dirty
+                                || page.idle_dirty
+                                || page.wb_pins != 0)
+                    })
+            });
+            if !all_cached {
+                drop(pages);
+                for candidate in candidates {
+                    if candidate.raw() != 0 {
+                        narf_memory::free_frame(narf_memory::PhysFrame::new(candidate));
+                    }
+                }
+                return None;
+            }
+        }
         for (index, candidate) in candidates.into_iter().enumerate() {
             let page_offset = offset
                 .checked_add(index as u64 * 4096)
@@ -3177,7 +3255,8 @@ pub(crate) fn publish_shared_file_pages(
                         .by_phys
                         .get(&stale_phys)
                         .is_some_and(|stale| stale.mappings == 0 && stale.pending == 0));
-                    if checks {
+                    // A fill read across a change to the file may be the stale side.
+                    if checks && cache_generation.is_some() {
                         if let Some(stale) = pages.by_phys.get(&stale_phys) {
                             check_replaced_page(stale, candidate, ino);
                         }
@@ -3264,7 +3343,7 @@ pub(crate) fn publish_shared_file_pages(
         phys: canonical.clone(),
         active: true,
     };
-    (canonical, receipt)
+    Some((canonical, receipt))
 }
 
 /// Memory's `RegionPerms::SHARED` hooks call these to tie each mapped alias to
