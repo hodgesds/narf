@@ -117,6 +117,135 @@ fn smoke_scheduler_nested_round_is_not_quiescent() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_nested_round_is_not_quiescent);
 
+/// An idle CPU leaves the QSBR census (`report_idle` publishes the
+/// "inactive" sentinel, past every epoch). When it wakes, it must rejoin the
+/// census before it runs anything that reads RCU-protected data — Linux's
+/// `rcu_eqs_exit` — or a grace period completes under that reader.
+///
+/// An idle AP is woken to run one task that pins, loads an object from an
+/// RCU cell, and holds it. Meanwhile this CPU retires the object and waits a
+/// bounded time for a grace period. None may complete, the object must not
+/// be dropped, and the reader must still see it intact (the drop poisons it)
+/// when it finally looks.
+fn smoke_scheduler_reader_on_woken_cpu_holds_grace_period() -> TestResult {
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    const LIVE: u64 = 0x11FE_11FE_11FE_11FE;
+    const POISON: u64 = 0xDEAD_DEAD_DEAD_DEAD;
+
+    struct Probe {
+        magic: u64,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            FREES.fetch_add(1, Ordering::AcqRel);
+            // SAFETY: a field of the value being dropped.
+            unsafe { core::ptr::write_volatile(&mut self.magic, POISON) };
+        }
+    }
+
+    static CELL: narf_rcu::Atomic<Probe> = narf_rcu::Atomic::null();
+    static FREES: AtomicUsize = AtomicUsize::new(0);
+    static HOLDING: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+
+    fn wait_for(ns: u64, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(ns));
+        loop {
+            if done() {
+                return true;
+            }
+            if narf_time::now_cycles() >= deadline {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    let me = narf_lib::percpu::current_cpu();
+    let live = narf_lib::smp::ever_online_bitmap() & narf_lib::smp::online_bitmap();
+    let Some(ap) = (0..64).find(|cpu| *cpu != me && live & (1u64 << cpu) != 0) else {
+        return TestResult::Skip("needs a second CPU that really came up");
+    };
+    if !wait_for(2_000_000_000, || {
+        narf_rcu::__test_last_quiescent(ap) == u64::MAX
+    }) {
+        return TestResult::Skip("the AP never went idle");
+    }
+
+    HOLDING.store(false, Ordering::Release);
+    RELEASE.store(false, Ordering::Release);
+    DONE.store(false, Ordering::Release);
+    SEEN.store(0, Ordering::Release);
+    {
+        let guard = narf_rcu::pin();
+        CELL.store(narf_rcu::Owned::new(Probe { magic: LIVE }), &guard);
+    }
+    narf_rcu::sync();
+    let frees_before = FREES.load(Ordering::Acquire);
+
+    // The AP's first poll after waking: pin, load, hold.
+    crate::spawn_with_spec(
+        async {
+            let guard = narf_rcu::pin();
+            let held = CELL.load(&guard).as_ref();
+            HOLDING.store(true, Ordering::Release);
+            wait_for(3_000_000_000, || RELEASE.load(Ordering::Acquire));
+            let seen = held.map_or(0, |probe| {
+                // SAFETY: `probe` is protected by `guard` — the property under test.
+                unsafe { core::ptr::read_volatile(&probe.magic) }
+            });
+            SEEN.store(seen, Ordering::Release);
+            drop(guard);
+            DONE.store(true, Ordering::Release);
+        },
+        crate::TaskSpec {
+            affinity: crate::Affinity::pinned(crate::CpuId(ap as u32)),
+            ..crate::TaskSpec::kernel_any()
+        },
+    );
+    if !wait_for(2_000_000_000, || HOLDING.load(Ordering::Acquire)) {
+        RELEASE.store(true, Ordering::Release);
+        return TestResult::Fail("the woken AP did not run the reader");
+    }
+
+    // Retire the object the AP holds and give a grace period every chance.
+    {
+        let guard = narf_rcu::pin();
+        CELL.store(narf_rcu::Owned::new(Probe { magic: LIVE }), &guard);
+    }
+    let elapsed = narf_rcu::sync_until(narf_time::monotonic_ns() + 200_000_000);
+    let freed_under_reader = FREES.load(Ordering::Acquire) - frees_before;
+
+    RELEASE.store(true, Ordering::Release);
+    let finished = wait_for(3_000_000_000, || DONE.load(Ordering::Acquire));
+    let seen = SEEN.load(Ordering::Acquire);
+    {
+        let guard = narf_rcu::pin();
+        CELL.clear(&guard);
+    }
+    narf_rcu::sync();
+
+    if !finished {
+        return TestResult::Fail("the reader on the AP did not finish");
+    }
+    if elapsed || freed_under_reader != 0 {
+        return TestResult::Fail(
+            "a grace period completed and freed the object under a reader on a just-woken CPU",
+        );
+    }
+    if seen != LIVE {
+        return TestResult::Fail("the reader on a just-woken CPU saw its object poisoned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/rcu_idle",
+    smoke_scheduler_reader_on_woken_cpu_holds_grace_period
+);
+
 fn smoke_scheduler_drives_future() -> TestResult {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static COUNT: AtomicUsize = AtomicUsize::new(0);
