@@ -28,7 +28,11 @@ pub const SITE_DEPTH: usize = 12;
 /// Stack words scanned for them.
 const SCAN_WORDS: usize = 160;
 /// Distinct sites tracked; the rest pool in site 0 ("other").
-const MAX_SITES: usize = 2048;
+const MAX_SITES: usize = 4096;
+/// Sites 0..OTHER_SITES pool records once every site is taken, one per
+/// category, so a full table never mixes sampled and unsampled bytes:
+/// small-class, large heap, order-0 frame, higher-order frame.
+const OTHER_SITES: usize = 4;
 /// Live tracked allocations (open addressing, power of two).
 const TABLE: usize = 1 << TABLE_BITS;
 const TABLE_BITS: u32 = 18;
@@ -222,15 +226,34 @@ pub fn record(ptr: usize, bytes: usize, kind: u32) {
     let mut g = STATE.lock();
     let g = &mut *g;
     if g.nsites == 0 {
-        g.nsites = 1;
-        g.sites[0] = Site::EMPTY;
+        for (i, other) in [0, KIND_LARGE, KIND_FRAME, KIND_FRAME | 0xfe]
+            .into_iter()
+            .enumerate()
+        {
+            g.sites[i] = Site {
+                kind: other,
+                ..Site::EMPTY
+            };
+        }
+        g.nsites = OTHER_SITES;
     }
+    let other = if kind & KIND_FRAME != 0 {
+        if kind & 0xff == 0 {
+            2
+        } else {
+            3
+        }
+    } else if kind & KIND_LARGE != 0 {
+        1
+    } else {
+        0
+    };
     let mut k = (h >> 32) as usize & (SITE_INDEX - 1);
     let site = loop {
         let e = g.index[k] as usize;
         if e == 0 {
             if g.nsites == MAX_SITES {
-                break 0;
+                break other;
             }
             let i = g.nsites;
             g.nsites += 1;
