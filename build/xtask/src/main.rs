@@ -42,6 +42,7 @@ mod ci_clippy;
 mod composition;
 mod crate_release;
 mod efi_image;
+mod frame_budget;
 mod http3_smoke;
 mod kaslr_knob;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
@@ -4757,6 +4758,12 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
                 if slide != 0 {
                     println!("xtask: KASLR slide pinned to {slide:#x} (NARF_KASLR_SLIDE)");
                 }
+            }
+            // Stack-frame budget on the image the merge gates test: every
+            // function's frame within 8 KiB unless listed, and the list only
+            // shrinks (frame_budget.rs).
+            if matches!(args.arch, Arch::X86_64) && features.contains("kernel-test") {
+                frame_budget::check(&elf, &root.join("build/frame-budget.txt"))?;
             }
         }
     }
