@@ -3340,30 +3340,20 @@ fn ghost_removed_while_mapped(page: SharedFilePage) {
 
 /// The last owner memory asks to retain a `SHARED | EXTERNAL_REFS` frame
 /// (after the relocation aliases, mapped folios and System V segments
-/// declined it): a cache page, or else a frame no owner knows.
+/// declined it): a cache page, a ghost the cache already tracks, or a frame
+/// whose lifetime its mapping's own owner keeps — device apertures, XDP
+/// UMEM, direct `mmap_fault` providers — which is none of the cache's
+/// business. Only a page the cache itself lost while mapped is a ghost:
+/// an unknown frame cannot be told apart from those owners' here.
 pub(crate) fn retain_external_unclaimed(phys: u64) -> bool {
     if retain_page(phys, false) {
         return true;
     }
     let mut ghosts = GHOSTS.lock();
-    match ghosts.get_mut(&phys) {
-        Some(ghost) => ghost.holds = ghost.holds.saturating_add(1),
-        None => {
-            report_ghost(
-                "a mapping took a frame the cache does not index",
-                phys,
-                None,
-            );
-            ghosts.insert(
-                phys,
-                Ghost {
-                    page: None,
-                    holds: 1,
-                    notified: false,
-                },
-            );
-        }
-    }
+    let Some(ghost) = ghosts.get_mut(&phys) else {
+        return false;
+    };
+    ghost.holds = ghost.holds.saturating_add(1);
     true
 }
 
