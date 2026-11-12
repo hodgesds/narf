@@ -159,6 +159,7 @@ mod ra_mask;
 mod ra_v1;
 mod radio_51;
 mod radio_assets;
+mod radio_be;
 mod radio_c;
 mod radio_full;
 mod radio_gain;

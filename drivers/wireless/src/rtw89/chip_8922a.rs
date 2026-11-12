@@ -11,11 +11,17 @@
 //! What of it now exists: the firmware-parameter load path
 //! (`radio_assets` admits Rtl8922A: BB/GAIN/RADIO_A idx0/RADIO_B idx1/
 //! NCTL from the container, no static fallback), the BE TX-power
-//! program (`radio_power_be::Plan`), and the power-trim parse
-//! (`efuse_be::BeFactory::power_trim`). Still open: BE BB/RF/NCTL table
-//! application, calibration `Board::new_be`, power-trim application,
-//! periodic thermal/TSSI tracking, RFK execution, FW security
-//! (follow-ups of #1878).
+//! program (`radio_power_be::Plan`), the power-trim parse
+//! (`efuse_be::BeFactory::power_trim`), the BE BB/RF/NCTL table
+//! application (`radio_be::Tables` / `apply_tables`, #1906), the
+//! calibration identity (`calibration_policy::Board::new_be`, N22A
+//! record), and the power-trim application (`radio_be::power_trim_writes`
+//! / `apply_power_trim`, `rtw8922a_set_txpwr_ctrl` reference fields).
+//! Still open: the BE DM owner that consumes the plan
+//! (`rtw8922a_bb_sethw`, PHYSTS/DIG/CFO/EDCCA sub-inits,
+//! `rtw8922a_rfk_init`, `rtw8922a_bb_cfg_txrx_path`), BE coexistence
+//! (no NARF BE BTC row), periodic thermal/TSSI tracking, RFK
+//! execution, FW security (follow-ups of #1878 / #1906).
 //!
 //! Deliberate narrowings, all from the Linux struct itself:
 //! - `support_bandwidths` is 20/40/80/160 MHz. 320 MHz EHT operation is

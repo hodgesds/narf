@@ -248,7 +248,7 @@ pub(super) fn noio_pages(qualified: Qualified, assets: &Assets) -> Result<[Vec<u
     };
     Ok([page(2)?, page(3)?])
 }
-fn validate_bb(program: &[Pair]) -> Result<(), Error> {
+pub(super) fn validate_bb(program: &[Pair]) -> Result<(), Error> {
     for &Pair(address, data) in program {
         if (0xf9..=0xfe).contains(&address) || data == 0xbabecafe {
             continue;
@@ -259,7 +259,7 @@ fn validate_bb(program: &[Pair]) -> Result<(), Error> {
     }
     Ok(())
 }
-fn rf_pages(program: &[Pair]) -> Result<Vec<u8>, Error> {
+pub(super) fn rf_pages(program: &[Pair]) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     for &Pair(address, data) in program {
         if address == 0xfe {
@@ -278,7 +278,7 @@ fn rf_pages(program: &[Pair]) -> Result<Vec<u8>, Error> {
     }
     Ok(bytes)
 }
-async fn bb(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
+pub(super) async fn bb(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
     for &Pair(address, data) in program {
         let delay = match address {
             0xfe => 50_000,
@@ -708,6 +708,15 @@ pub(super) async fn nctl(io: &mut impl Io, program: &[Pair]) -> Result<(), Error
 /// RTL8852B/BT-only second `R_IOQ_IQK_DPK |= 0x2`, then the selected
 /// firmware NCTL table (`rtw8852c_chip_info.nctl_post_table` is NULL).
 pub(super) async fn nctl_c(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
+    nctl_for(io, program, &NCTL_PREINIT[..4]).await
+}
+/// RTL8922A NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` with the P1 reset
+/// (the chip is not RTL8851B) and no RTL8852B/BT second `R_IOQ_IQK_DPK`
+/// write, then the selected firmware NCTL table;
+/// `rtw8922a_chip_info.nctl_post_table` is NULL (`rtw8922a.c:3246`), so
+/// there is no post-table step. (Shared with the BE table-application
+/// owner, `radio_be`; the 8852A sibling lane owns the A paths.)
+pub(super) async fn nctl_be(io: &mut impl Io, program: &[Pair]) -> Result<(), Error> {
     nctl_for(io, program, &NCTL_PREINIT[..4]).await
 }
 /// RTL8851B NCTL: phy.c `rtw89_phy_preinit_rf_nctl_ax` with the one-path

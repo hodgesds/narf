@@ -384,3 +384,170 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8851b_calibration_record_is_n51b_and_never_a_b_or_c_record
 );
+
+fn be_factory() -> super::super::efuse_be::BeFactory {
+    super::super::efuse_be::BeFactory {
+        mac: [2, 4, 6, 8, 10, 12],
+        rfe_type: 1,
+        xtal_cap: 0x20,
+        country: [b'U', b'S'],
+        phycap: [0u8; 0x38],
+        cv: Some(1),
+        thermal_k: None,
+        secure: super::super::efuse_be::SecureInfo::disabled(),
+    }
+}
+fn be_container(a_idx: u8, b_idx: u8) -> alloc::vec::Vec<u8> {
+    // Same synthetic element container as the `radio_assets` BE
+    // fixture: MFW header + five aid-0 PHY elements (BB id 2, GAIN
+    // id 3, RADIO_A id 4, RADIO_B id 5, NCTL id 8). One (addr, value)
+    // pair per table; the gain pair decodes as LNA band 0 path 0.
+    const MFW: usize = 16;
+    const INFO: usize = 16;
+    const HEADER: usize = 32;
+    const SIZE: usize = 4;
+    const AID: usize = 12;
+    const INDEX: usize = 24;
+    fn pair(a: u32, v: u32) -> alloc::vec::Vec<u8> {
+        [a.to_le_bytes(), v.to_le_bytes()].concat()
+    }
+    let mut bytes = vec![0; MFW + INFO + 16];
+    bytes[0] = 255;
+    bytes[1] = 1;
+    bytes[MFW + 4..MFW + 8].copy_from_slice(&((MFW + INFO) as u32).to_le_bytes());
+    bytes[MFW + 8..MFW + 12].copy_from_slice(&16u32.to_le_bytes());
+    let add = |bytes: &mut alloc::vec::Vec<u8>, id: u32, idx: u8, payload: &[u8]| {
+        let start = bytes.len();
+        bytes.resize(start + HEADER, 0);
+        bytes[start..start + 4].copy_from_slice(&id.to_le_bytes());
+        bytes[start + SIZE..start + SIZE + 4]
+            .copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes[start + AID..start + AID + 2].copy_from_slice(&0u16.to_le_bytes());
+        bytes[start + INDEX] = idx;
+        bytes.extend_from_slice(payload);
+        bytes.resize(bytes.len().div_ceil(16) * 16, 0);
+    };
+    add(&mut bytes, 2, 0, &pair(0x100, 1));
+    add(&mut bytes, 3, 0, &pair(0x00000000, 0x01020304));
+    add(&mut bytes, 4, a_idx, &pair(0x60, 1));
+    add(&mut bytes, 5, b_idx, &pair(0x60, 1));
+    add(&mut bytes, 8, 0, &pair(0x100, 1));
+    bytes
+}
+fn smoke_rtw89_be_calibration_record_is_n22a_and_new_be_binds_factory_and_assets() -> TestResult {
+    let device = narf_bus::DeviceId {
+        vendor: 0x10ec,
+        device: 0x8922,
+        class: 0x028000,
+        subsystem_vendor: 1,
+        subsystem_id: 2,
+    };
+    let factory = be_factory();
+    let assets = match Assets::parse_for(ChipId::Rtl8922A, &be_container(0, 1)) {
+        Ok(assets) => assets,
+        Err(_) => return TestResult::Fail("8922A five-table fixture container refused"),
+    };
+    let be_board = match Board::new_be(&factory, device, &assets) {
+        Ok(board) => board,
+        Err(_) => return TestResult::Fail("exact RTL8922A factory/assets refused a board"),
+    };
+    // The identity binds RFE, cut, PHY-cap, firmware tables and the
+    // PCI subsystem: varying any one must change it.
+    let mut identities = alloc::vec::Vec::new();
+    identities.push(be_board.identity());
+    for variant in 0..5 {
+        let mut factory = factory.clone();
+        let mut device = device;
+        match variant {
+            0 => factory.rfe_type = 5,
+            1 => factory.cv = Some(0),
+            2 => factory.phycap[7] = 0x53,
+            3 => device.subsystem_id = 3,
+            _ => device.device = 0x892b,
+        }
+        let identity = match Board::new_be(&factory, device, &assets) {
+            Ok(board) => board.identity(),
+            Err(_) => {
+                return TestResult::Fail("admitted RTL8922A variant refused a board");
+            }
+        };
+        if identities.contains(&identity) {
+            return TestResult::Fail(
+                "different actual RFE/cut/PHY-cap/subsystem/device reused calibration identity",
+            );
+        }
+        identities.push(identity);
+    }
+    // Refusals: wrong vendor/device, RFE 255, missing cut, C assets.
+    let mut bad_device = device;
+    bad_device.vendor = 0x10eb;
+    let mut bad_rfe = factory.clone();
+    bad_rfe.rfe_type = 255;
+    let mut no_cut = factory.clone();
+    no_cut.cv = None;
+    let c_assets = Assets::parse_for(ChipId::Rtl8852C, &be_container(1, 0)).unwrap();
+    for (factory, device, assets) in [
+        (&factory, bad_device, &assets),
+        (
+            &factory,
+            narf_bus::DeviceId {
+                device: 0xc852,
+                ..device
+            },
+            &assets,
+        ),
+        (&bad_rfe, device, &assets),
+        (&no_cut, device, &assets),
+        (&factory, device, &c_assets),
+    ] {
+        if Board::new_be(factory, device, assets).is_ok() {
+            return TestResult::Fail("wrong vendor/device/RFE/cut/assets acquired a BE board");
+        }
+    }
+    // The N22A record round-trips on the BE board and never admits a
+    // B, C or 51B board; no other family magic admits the BE board.
+    let b = board();
+    let c = Board {
+        device: 0xc852,
+        chip: ChipId::Rtl8852C,
+        ..b
+    };
+    let n51 = Board {
+        device: 0xb851,
+        chip: ChipId::Rtl8851B,
+        ..b
+    };
+    let cap = authority();
+    let mut bytes = image(be_board);
+    for magic in [b"N52B", b"N5CB", b"N51B"] {
+        bytes[..4].copy_from_slice(magic);
+        if Calibration::from_verified(&bytes, Some([3; 32]), be_board, cap).is_ok() {
+            return TestResult::Fail("B/C/51B calibration magic admitted an RTL8922A board");
+        }
+    }
+    bytes[..4].copy_from_slice(b"N22A");
+    let calibration = match Calibration::from_verified(&bytes, Some([3; 32]), be_board, cap) {
+        Ok(calibration) => calibration,
+        Err(_) => return TestResult::Fail("exact N22A calibration refused"),
+    };
+    if !calibration.matches(be_board)
+        || calibration.matches(b)
+        || calibration.matches(c)
+        || calibration.matches(n51)
+        || calibration.check(&domain()).is_err()
+    {
+        return TestResult::Fail("RTL8922A calibration bound to the wrong board or span");
+    }
+    for other in [b, c, n51] {
+        let mut o = image(other);
+        o[..4].copy_from_slice(b"N22A");
+        if Calibration::from_verified(&o, Some([3; 32]), other, cap).is_ok() {
+            return TestResult::Fail("N22A record admitted an RTL8852B/C/51B board");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_be_calibration_record_is_n22a_and_new_be_binds_factory_and_assets
+);
