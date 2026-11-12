@@ -61,6 +61,96 @@ fn fatal_signal_pending(task: u64) -> bool {
     crate::handlers::task_fatal_signal_pending(task)
 }
 
+/// Tasks whose killed operations are still finishing in the scheduler,
+/// with how many each has. Their waits count as killed
+/// ([`hook_pending`]) even after the task itself is gone, so an operation
+/// that only reads — a lookup, a file or exec read, a fault fill — gives up
+/// at its next wait instead of running to the end for nobody.
+static ABANDONED: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, usize>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// The killed task a detached operation polled on this CPU belongs to, 0
+/// when none is being polled.
+static ABANDONED_OWNER: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Killed operations still finishing in the scheduler (for tests).
+#[cfg(feature = "kernel-test")]
+pub(crate) fn abandoned_in_flight() -> usize {
+    ABANDONED.lock().values().sum()
+}
+
+/// The `current` hook of [`narf_filesystem::killable`]: inside a detached
+/// operation, the killed task it belongs to.
+pub(crate) fn hook_current() -> u64 {
+    let cpu = narf_lib::percpu::current_cpu();
+    match ABANDONED_OWNER
+        .get(cpu)
+        .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed))
+    {
+        0 => crate::handlers::current_task_id(),
+        owner => owner,
+    }
+}
+
+/// The `pending` hook of [`narf_filesystem::killable`]: a fatal signal is
+/// pending, or the task's operations were abandoned when it was killed.
+pub(crate) fn hook_pending(task: u64) -> bool {
+    fatal_signal_pending(task) || ABANDONED.lock().contains_key(&task)
+}
+
+/// A killed task's operation, finishing in the scheduler. While it is
+/// polled, filesystem waits see it as the killed task's
+/// ([`hook_current`]), so the waits that a fatal signal ends end for it too.
+struct Abandoned {
+    task: u64,
+    op: Detached,
+}
+
+impl Abandoned {
+    fn new(task: u64, op: Detached) -> Self {
+        *ABANDONED.lock().entry(task).or_insert(0) += 1;
+        Self { task, op }
+    }
+}
+
+impl Future for Abandoned {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let slot = ABANDONED_OWNER.get(narf_lib::percpu::current_cpu());
+        let previous = slot.map_or(0, |s| {
+            s.swap(this.task, core::sync::atomic::Ordering::Relaxed)
+        });
+        let result = this.op.as_mut().poll(cx);
+        if let Some(slot) = slot {
+            slot.store(previous, core::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        let mut abandoned = ABANDONED.lock();
+        if let Some(count) = abandoned.get_mut(&self.task) {
+            *count -= 1;
+            if *count == 0 {
+                abandoned.remove(&self.task);
+            }
+        }
+    }
+}
+
+/// A slot the detached operation leaves its result in for `finish`.
+type ResultSlot<T> = Arc<narf_lib::sync::IrqSafeSpinLock<Option<T>>>;
+
+fn abandoned_result<T>() -> (ResultSlot<T>, ResultSlot<T>) {
+    let slot = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(None));
+    (slot.clone(), slot)
+}
+
 fn detach_to_scheduler(op: Detached) {
     #[cfg(feature = "kernel-test")]
     {
@@ -137,6 +227,14 @@ impl<T: Send + 'static> Future for KillableWait<T> {
             // in any case not be polled from here again.
             _ => return Poll::Ready(Err(Killed)),
         };
+        // Linux starts no work for a task with a fatal signal pending
+        // (`fatal_signal_pending` at the head of `filemap_read`,
+        // `iterate_dir`, the fault path): an operation never polled holds
+        // nothing, so it is dropped here instead of being detached.
+        if !this.started && fatal_signal_pending(this.task) {
+            this.killed = true;
+            return Poll::Ready(Err(Killed));
+        }
         match op.as_mut().poll(cx) {
             Poll::Ready(value) => {
                 this.op = None;
@@ -168,9 +266,22 @@ impl<T: Send + 'static> Drop for KillableWait<T> {
         if self.killed && self.started {
             // Runs after `poll` returned, with no registry or driver lock
             // held. The scheduler task's first poll installs its own waker
-            // in whatever the operation is waiting on.
+            // in whatever the operation is waiting on. Marked abandoned, so
+            // its remaining killable waits end at once and only the work
+            // that holds shared state (a write staging, a commit) goes on.
             let finish = self.finish;
-            (self.detach)(Box::pin(async move { finish(op.await) }));
+            let task = self.task;
+            let (slot, sink) = abandoned_result::<T>();
+            let finish_op: Detached = Box::pin(async move {
+                let value = op.await;
+                *sink.lock() = Some(value);
+            });
+            (self.detach)(Box::pin(async move {
+                Abandoned::new(task, finish_op).await;
+                if let Some(value) = slot.lock().take() {
+                    finish(value);
+                }
+            }));
         }
         // Not killed: the caller gave up for a reason of its own (no
         // executor to park on), exactly as `poll_blocking` always has.
@@ -456,6 +567,11 @@ pub(crate) fn fill_frame(
     let done = wait_io(Box::pin(async move {
         let mut filled = 0usize;
         while filled < want {
+            // A fill for a killed task stops between reads (Linux
+            // `filemap_fault` returns `VM_FAULT_RETRY` to a dying task).
+            if narf_filesystem::killable::current_killed() {
+                return Err(FsError::Io(narf_block::BlockError::IOError));
+            }
             // SAFETY: the guard owns `frame` exclusively until it is taken
             // or dropped, the frame is direct-mapped, and `want <= 4096`.
             // The slice is rebuilt per read so no raw pointer lives across
