@@ -137,6 +137,7 @@ pub mod tls_x509;
 pub mod txq;
 pub mod udp_gso;
 pub mod udp_sock;
+pub mod watchdog;
 pub mod wireguard;
 pub mod ws;
 pub use stack::{
@@ -155,6 +156,8 @@ mod e2e_tests;
 mod errno_linux_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod ip_fragment_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod watchdog_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod ip_output_tests;
 #[cfg(any(test, feature = "kernel-test"))]

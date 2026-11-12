@@ -2125,6 +2125,11 @@ fn spawn_pumps(
             }
         }
     });
+    // `dev_watchdog`: a timer every `watchdog_timeo` (5 s) that queues the
+    // reset when a queue's transmit is stuck; it stops with the device.
+    let weak: alloc::sync::Weak<dyn narf_net::watchdog::NetdevWatchdog> =
+        Arc::downgrade(&device) as _;
+    narf_net::watchdog::DevWatchdog::start_for_device(weak, IGC_TX_TIMEOUT_NS);
     narf_scheduler::spawn(async move {
         while !device.removed.load(Ordering::Acquire) {
             device.maintain_admin();
@@ -2147,29 +2152,42 @@ fn spawn_pumps(
                 crate::publish::publish_link(device.name(), link);
                 *device.published_link.lock() = link;
             }
-            let timeout = narf_time::ns_to_cycles(5_000_000_000);
-            if link.carrier
-                && device
-                    .queues()
-                    .iter()
-                    .any(|q| q.stalled(narf_time::now_cycles(), timeout))
-            {
-                let first = {
-                    let mut stats = device.stats.lock();
-                    stats.tx_timeouts += 1;
-                    stats.tx_timeouts == 1
-                };
-                if first {
-                    device
-                        .completion_autopsy_pending
-                        .store(true, Ordering::Release);
-                    device.dump_completion_state();
-                }
-                let _ = device.recover();
-            }
             narf_time::sleep_cycles(narf_time::ns_to_cycles(10_000_000)).await;
         }
     });
+}
+
+/// `dev->watchdog_timeo`: a queue whose transmit waited this long with
+/// carrier up is wedged.
+const IGC_TX_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// The core transmit watchdog's view of the device (`dev_watchdog` +
+/// `igc_tx_timeout` → `igc_reset_task`).
+impl narf_net::watchdog::NetdevWatchdog for Igc {
+    /// A queue's transmit waited past `IGC_TX_TIMEOUT_NS` with carrier up.
+    fn tx_timed_out(&self, now: u64) -> bool {
+        if self.removed.load(Ordering::Acquire) || !self.link_sample().carrier {
+            return false;
+        }
+        let timeout = narf_time::ns_to_cycles(IGC_TX_TIMEOUT_NS);
+        self.queues().iter().any(|q| q.stalled(now, timeout))
+    }
+
+    /// Count the timeout (the first one dumps the completion state for the
+    /// autopsy) and reset the transmit path (task context).
+    fn tx_timeout(&self) {
+        let first = {
+            let mut stats = self.stats.lock();
+            stats.tx_timeouts += 1;
+            stats.tx_timeouts == 1
+        };
+        if first {
+            self.completion_autopsy_pending
+                .store(true, Ordering::Release);
+            self.dump_completion_state();
+        }
+        let _ = self.recover();
+    }
 }
 
 /// Every Intel device id this driver claims. Kept as a single
