@@ -916,6 +916,20 @@ unless `AR_ENT_OTP_49GHZ_DISABLE` (`0x00100000`) is set.
 `btcoex::mci_is_enabled` is `btcoex_enabled && hw_caps &
 ATH9K_HW_CAP_MCI` (`hw.h::ath9k_hw_mci_is_enabled`).
 
+WoW: the owner probe wires the flag — `Wow::new(revision,
+mci_enabled)` with `mci_enabled = btcoex::mci_is_enabled(true,
+identified.hw_caps)` — so `ath9k_hw_wow_enable` takes the Linux MCI
+branches on MCI-capable parts: `AR_RTC_KEEP_AWAKE` (`0x7034`) is
+written `0x2` in `enable` and again in the WoW sleep, and
+`AR_STA_ID1_PWR_SAV` is skipped while the MCI WLAN power-save state
+reader (`ar9003_mci_state(MCI_STATE_GET_WLAN_PS_STATE)`) is absent,
+which stays the conservative choice. Coexistence is enabled in this
+tree (the same `true` the owner wiring passes to `init_scheme`);
+upstream Linux defaults it off (`init.c`: the `btcoex_enable` module
+parameter, `0` unless passed `1`), so the enablement default is a
+maintainer-visible choice, and the owner-held `Btcoex` becomes the
+single source for the flag once #2028 lands.
+
 Scheme: `btcoex::init_scheme` selects NONE when coexistence is
 disabled, MCI when the capability is set, 3WIRE otherwise (every AR9003
 part satisfies `AR_SREV_9300_20_OR_LATER`, so the AR9280 2WIRE branch is
@@ -1030,14 +1044,15 @@ Not in this step: the live-owner integration (owner holds `Btcoex`,
 `switch_2g5g`/`update_wlan_channels`, applying the computed scheme and
 recording HT state, and the owner calls
 `init_btcoex_hw` / `init_2wire` / `init_3wire` / `btcoex_enable` /
-`btcoex_disable` / `deinit` for the 2WIRE/3WIRE schemes); the WoW
-`mci_enabled` flag integration (open draft PR #1921 wires it once MCI
-lands). Fixture tests cover the message exchange end to end, capability
+`btcoex_disable` / `deinit` for the 2WIRE/3WIRE schemes). Fixture tests
+cover the message exchange end to end, capability
 gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
 walk, the calibration handshake, and the BT profile list + duty-cycle
 scheme (profile add/update/remove, the SCO/ACL caps, status-update
 management counting, the flush on stale BT info, and every scheme
-branch including `DISABLE_TUNING`).
+branch including `DISABLE_TUNING`), plus the WoW `mci_enabled`
+wiring (flag storage, the probe-time capability computation, and the
+`AR_RTC_KEEP_AWAKE` / `AR_STA_ID1_PWR_SAV` branches in `enable`).
 
 ## 4. Invariants
 
@@ -2605,8 +2620,9 @@ later; here `wow_resume` queues `ResetType::RxInactive` directly (RX is
 known stopped) and restarts the link-loss clock, so the access-proved
 packet path never runs against the WoW-sleeping chip and the 5 s
 link-loss window cannot expire first. Not done: PCI PME_En / D-state
-(platform-owned; `narf_bus::pci_pme::arm` has no driver caller), MCI
-(`mci_enabled` false). Smoke (written, not executed):
+(platform-owned; `narf_bus::pci_pme::arm` has no driver caller) and the
+MCI engine work in suspend (setup, GPM handling, profile flush); the
+WoW `mci_enabled` flag itself is wired at probe (§3.12). Smoke (written, not executed):
 `smoke_ath9k_ar9462_wow_suspend_resume_keeps_generation`.
 Remainder, not in this step: the AR9462 board-value
 deltas (`thermo_cal`, switch tables) and per-chip calibration branches.
