@@ -178,7 +178,8 @@ fn slot_of(ptr: u64) -> usize {
     ((ptr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - TABLE_BITS)) as usize & (TABLE - 1)
 }
 
-#[cfg(target_arch = "x86_64")]
+// Hosted builds (the btrfs host harness) have no kernel text symbols.
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
 fn scan(out: &mut [u64; SITE_DEPTH]) {
     extern "C" {
         static __text_start: u8;
@@ -212,7 +213,7 @@ fn scan(out: &mut [u64; SITE_DEPTH]) {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 fn scan(_out: &mut [u64; SITE_DEPTH]) {}
 
 /// Record a live allocation of `bytes` at `ptr`; `kind` as in [`Site`].
