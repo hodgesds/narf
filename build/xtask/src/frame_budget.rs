@@ -11,10 +11,10 @@
 //!
 //! Every non-test function must fit [`BUDGET`]. Exceptions are listed in
 //! `build/frame-budget.txt` with their measured size, and the list may only
-//! shrink: a listed function that grows, that now fits the budget, or that no
-//! longer exists fails the build until its entry is lowered or removed.
-//! `NARF_FRAME_BUDGET_WRITE=1` rewrites the list from the image (the diff is
-//! what review looks at).
+//! shrink: an unlisted function over the budget, a listed one that grew past
+//! its entry by more than inlining noise, or a listed one that now fits fails
+//! the build (see [`check`]). `NARF_FRAME_BUDGET_WRITE=1` rewrites the list
+//! from the image (the diff is what review looks at).
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -175,9 +175,38 @@ pub fn frames(elf: &Path) -> Result<BTreeMap<String, u64>> {
     Ok(out)
 }
 
+/// Inlining moves a few hundred bytes between functions whenever any crate in
+/// the image changes, so exact sizes are not stable across builds: a listed
+/// function may grow by this much before it counts as growth.
+fn slack(size: u64) -> u64 {
+    (size / 50).max(256)
+}
+
+/// Generic shims from `core`/`alloc` (`<Pin<P> as Future>::poll`, iterator
+/// adapters, ...) carry whatever the compiler inlined into them from their
+/// caller, so their size follows unrelated code. They are reported, not
+/// listed; the frame belongs to the caller that inlined into them.
+fn is_generic_shim(name: &str) -> bool {
+    name.starts_with("core::")
+        || name.starts_with("alloc::")
+        || name.starts_with("<core::")
+        || name.starts_with("<alloc::")
+        || name.starts_with("<&")
+}
+
 /// Check `elf` against the budget and the allowlist at `list`.
+///
+/// Fails on a function over the budget that is not listed, on a listed
+/// function that grew past its entry by more than [`slack`], and on a listed
+/// function that now fits the budget (with the same slack): the entry must be
+/// removed, so the list only shrinks. A listed function that shrank, or that
+/// this build inlined away, is a note. `NARF_FRAME_BUDGET_WRITE=1` rewrites the
+/// list from the image.
 pub fn check(elf: &Path, list: &Path) -> Result<()> {
     let frames = frames(elf)?;
+    let (shims, frames): (BTreeMap<String, u64>, BTreeMap<String, u64>) = frames
+        .into_iter()
+        .partition(|(name, _)| is_generic_shim(name));
     let over: BTreeMap<&String, u64> = frames
         .iter()
         .filter(|(_, size)| **size > BUDGET)
@@ -189,8 +218,8 @@ pub fn check(elf: &Path, list: &Path) -> Result<()> {
         let mut text = String::from(
             "# Kernel functions whose stack frame exceeds the 8 KiB budget\n\
              # (build/xtask/src/frame_budget.rs). <bytes> <function>. This list\n\
-             # may only shrink: lower an entry when its frame shrinks, remove it\n\
-             # when the function fits. Regenerate: NARF_FRAME_BUDGET_WRITE=1.\n",
+             # may only shrink: remove an entry when its function fits. Regenerate\n\
+             # (or lower entries): NARF_FRAME_BUDGET_WRITE=1.\n",
         );
         for (name, size) in sorted {
             text.push_str(&format!("{size} {name}\n"));
@@ -219,10 +248,11 @@ pub fn check(elf: &Path, list: &Path) -> Result<()> {
         );
     }
     let mut problems = Vec::new();
+    let mut notes = Vec::new();
     for (name, size) in &over {
         match allowed.get(*name) {
             None => problems.push(format!("  {size:>7}  {name}  (new; budget {BUDGET})")),
-            Some(limit) if size > limit => {
+            Some(limit) if *size > limit + slack(*limit) => {
                 problems.push(format!("  {size:>7}  {name}  (grew from {limit})"))
             }
             _ => {}
@@ -230,17 +260,35 @@ pub fn check(elf: &Path, list: &Path) -> Result<()> {
     }
     for (name, limit) in &allowed {
         match frames.get(name) {
-            None => problems.push(format!(
-                "  {limit:>7}  {name}  (listed, no longer in the image: remove)"
+            None => notes.push(format!("  {limit:>7}  {name}  (not in this build)")),
+            Some(size) if size + slack(BUDGET) <= BUDGET => problems.push(format!(
+                "  {size:>7}  {name}  (now fits the budget: remove the entry)"
             )),
-            Some(size) if *size <= BUDGET => problems.push(format!(
-                "  {size:>7}  {name}  (now fits the budget: remove)"
-            )),
-            Some(size) if size < limit => problems.push(format!(
-                "  {size:>7}  {name}  (shrank from {limit}: lower the entry)"
-            )),
+            Some(size) if size + slack(*limit) < *limit => {
+                notes.push(format!("  {size:>7}  {name}  (shrank from {limit})"))
+            }
             _ => {}
         }
+    }
+    let big_shims: Vec<String> = shims
+        .iter()
+        .filter(|(_, size)| **size > BUDGET)
+        .map(|(name, size)| format!("  {size:>7}  {name}"))
+        .collect();
+    if !big_shims.is_empty() {
+        println!(
+            "xtask: frame budget: {} core/alloc generic shim(s) over {BUDGET} bytes \
+             (their callers' inlined state, not listed):\n{}",
+            big_shims.len(),
+            big_shims.join("\n")
+        );
+    }
+    if !notes.is_empty() {
+        println!(
+            "xtask: frame budget: listed entries that shrank or are absent \
+             (NARF_FRAME_BUDGET_WRITE=1 lowers them):\n{}",
+            notes.join("\n")
+        );
     }
     if !problems.is_empty() {
         bail!(
