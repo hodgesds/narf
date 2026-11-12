@@ -204,17 +204,29 @@ pub struct CpuLoad {
 /// dispatch and handed to [`Scheduler::wakeup_preempt`]. The running task's
 /// slot is detached from the queue during its poll, so this is how a policy
 /// sees the runner. `vdeadline` is the runner's EEVDF virtual-deadline
-/// protection horizon (`vruntime`-at-dispatch + base slice); an eligibility
-/// policy preempts a wake only when the wakee is more eligible than this. See
+/// protection horizon (`vruntime`-at-dispatch + base slice). Fair policies
+/// check current's runnable eligibility before honoring that protection. See
 /// `specification/scheduling-policies.md` §5.
 #[derive(Copy, Clone, Debug)]
 pub struct CurrentTask {
     pub id: TaskId,
     pub class: SchedClass,
+    pub priority: Priority,
     /// Virtual runtime at dispatch, in TSC cycles.
     pub vruntime: u64,
     /// Protected virtual deadline = `vruntime`-at-dispatch + base slice.
     pub vdeadline: u64,
+}
+
+/// Wake-preemption decision for the current dispatch. `After` retains a
+/// deferred check at user-return/tick boundaries without expiring the quantum
+/// or installing a recovery timer. Its value is elapsed TSC cycles in this
+/// dispatch, not a wall-clock deadline; the core rejects non-future values.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WakePreemption {
+    KeepRunning,
+    Now,
+    After(u64),
 }
 
 /// Per-CPU scheduling context handed to a policy's decision hooks. Assembled by
@@ -233,9 +245,8 @@ pub struct CpuSchedContext {
     /// Snapshot of the task currently running on `cpu`.
     pub current: CurrentTask,
     /// TSC cycles the running task has executed since its current dispatch. Lets
-    /// a policy apply RUN_TO_PARITY slice protection (don't preempt the runner
-    /// until it has consumed a base slice) — the batching guard that keeps a
-    /// cooperative producer/consumer from context-switching on every wake.
+    /// a policy account current's live service before checking eligibility and
+    /// virtual request protection, as Linux update_curr does before wake picks.
     pub elapsed: u64,
     /// The resolved [`QuantumUnit`] the core enforces the per-task SLICE in:
     /// `Nanos` compares TSC-elapsed against the slice, `Cycles` compares APERF
@@ -550,21 +561,23 @@ pub trait Scheduler: Any + Send + Sync + 'static {
     /// core budget charging. Must not allocate, block or re-enter scheduling.
     fn on_task_runtime(&self, _cpu: CpuId, _runtime: TaskRuntime) {}
 
-    /// Decide whether the task currently running on `cpu` (`current`) should
-    /// cede at its next cooperative preemption point because a wake just made a
-    /// peer in `queue` runnable. NARF's analogue of Linux
-    /// `check_preempt_wakeup_fair` (`kernel/sched/fair.c`). Consulted ONCE per
-    /// wake, at the waker's syscall-exit — never on a no-wake exit — so its cost
-    /// is paid only when a wake actually happened.
-    ///
-    /// Default `false`: a policy without an eligibility model (FIFO, priority,
-    /// strict-class) does not wake-preempt, preserving its batching. An
-    /// EEVDF-style policy overrides this to preempt iff the wakee is more
-    /// eligible than the runner's protected `vdeadline`. The core still owns the
-    /// mechanism (the sticky per-CPU request, the syscall-exit yield); this only
-    /// decides yes/no. See `specification/scheduling-policies.md` §5.
+    /// Boolean wake-preemption hook, evaluated on the target after activation.
+    /// The core owns context switching; the installed policy owns this decision.
+    /// Default false preserves batching for policies which do not implement it.
+    /// Policies with slice protection should also implement wakeup_preemption
+    /// so a declined wake can request reconsideration when protection expires.
     fn wakeup_preempt(&self, _ctx: &CpuSchedContext, _queue: &RunQueue<'_>) -> bool {
         false
+    }
+
+    /// Extended wake decision. Existing policies retain their boolean hook;
+    /// policies with slice protection can request a deferred reconsideration.
+    fn wakeup_preemption(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) -> WakePreemption {
+        if self.wakeup_preempt(ctx, queue) {
+            WakePreemption::Now
+        } else {
+            WakePreemption::KeepRunning
+        }
     }
 
     /// Wake-time CPU placement — NARF's analogue of Linux `select_task_rq`.
@@ -572,15 +585,13 @@ pub trait Scheduler: Any + Send + Sync + 'static {
     /// scheduler CORE performs the mechanical migrate + enqueue + IPI
     /// (`ttwu_queue`). Consulted on the wake path when the wakee's `prev_cpu`
     /// (its cache-warm home CPU) is BUSY. Returns `Some(cpu)` to run the wakee
-    /// on an idle sibling now, or `None` to keep it on `prev_cpu`. `waker_cpu`
+    /// on a selected CPU now, or `None` to keep it on `prev_cpu`. `waker_cpu`
     /// is the CPU issuing the wake.
     ///
-    /// The three predicates are supplied by the core: `is_online` and `is_idle`
-    /// report per-CPU state, and `allowed` reports whether the wakee's affinity
-    /// permits that CPU. An implementation MUST only ever return a CPU for which
-    /// `allowed(cpu)` is true (Linux's `select_task_rq` likewise intersects with
-    /// `p->cpus_ptr`); a returned CPU is otherwise the core's authority to
-    /// reject, but honoring `allowed` keeps the selection meaningful.
+    /// The core supplies `is_online`, `is_idle`, and an affinity predicate.
+    /// Implementations must honor `allowed`; the core still validates affinity
+    /// and CPU state before migrating, and notifies the existing owner if
+    /// placement cannot complete.
     ///
     /// Allocation-free and a bounded CPU scan: the raw-waker path that calls
     /// this can be IRQ context.
@@ -778,6 +789,38 @@ impl Scheduler for ClassScheduler {
         allowed: &dyn Fn(CpuId) -> bool,
     ) -> Option<CpuId> {
         select_idle_sibling(prev_cpu, waker_cpu, is_online, is_idle, allowed)
+    }
+
+    fn wakeup_preempt(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) -> bool {
+        self.wakeup_preemption(ctx, queue) == WakePreemption::Now
+    }
+
+    fn wakeup_preemption(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) -> WakePreemption {
+        let mut fair = crate::eevdf::FairWake::new(ctx);
+        for row in queue.iter_sched() {
+            if !row.runnable
+                || row.eligibility == BudgetEligibility::Throttled
+                || row.handle.task_id() == ctx.current.id
+            {
+                continue;
+            }
+            if row.class != ctx.current.class {
+                if row.class.rank() > ctx.current.class.rank() {
+                    return WakePreemption::Now;
+                }
+                continue;
+            }
+            if row.priority != ctx.current.priority {
+                if row.priority.raw() < ctx.current.priority.raw() {
+                    return WakePreemption::Now;
+                }
+                continue;
+            }
+            if matches!(row.class, SchedClass::Default | SchedClass::Interactive) {
+                fair.observe(row.vruntime);
+            }
+        }
+        fair.decision()
     }
 
     fn name(&self) -> &'static str {

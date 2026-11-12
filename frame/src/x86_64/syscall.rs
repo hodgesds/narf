@@ -420,6 +420,10 @@ extern "C" fn dispatch_syscall(
     // the kernel survives. The return value is unchanged.
     state.rip = sysret_safe_rip(state.rip);
 
+    // SAFETY: the dispatcher has completed on the current task's stack, with
+    // no locks held. Both SYSRET and the sigreturn IRET tail retain masked IRQs.
+    unsafe { narf_scheduler::stackful::finish_user_return() };
+
     // rt_sigreturn resumes an *interrupted* user context whose rcx/r11 are
     // live registers of the interrupted code — but `sysretq` architecturally
     // consumes rcx (return RIP) and r11 (RFLAGS), so the sysret tail can

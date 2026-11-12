@@ -23,6 +23,15 @@ pub use narf_arch::aarch64::trap_frame::TrapFrame;
 /// Device mapping, untagged, so reachable from FRAME in every task).
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_aarch64_irq(frame: &mut TrapFrame) {
+    dispatch_irq(frame);
+    if frame.spsr & 0xF == 0 {
+        // SAFETY: dispatch has dropped IRQ guards/locks on the task stack;
+        // the vector restore keeps IRQs masked until eret restores user state.
+        unsafe { narf_scheduler::stackful::finish_user_return() };
+    }
+}
+
+fn dispatch_irq(frame: &mut TrapFrame) {
     let hardirq_account =
         narf_scheduler::interrupt_account_enter(narf_scheduler::InterruptKind::HardIrq);
     // SAFETY: we are in the IRQ handler by the vector-table contract, and
@@ -262,6 +271,15 @@ const fn abort_is_translation_fault(fsc: u64) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
+    dispatch_sync(frame);
+    if frame.spsr & 0xF == 0 {
+        // SAFETY: dispatch has dropped IRQ guards/locks on the task stack;
+        // the vector restore keeps IRQs masked until eret restores user state.
+        unsafe { narf_scheduler::stackful::finish_user_return() };
+    }
+}
+
+fn dispatch_sync(frame: &mut TrapFrame) {
     // SAFETY: ESR_EL1 read at EL1 is always defined.
     let esr = unsafe { sysreg::read_esr_el1() };
     let ec = (esr >> 26) & 0x3F;

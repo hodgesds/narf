@@ -139,10 +139,21 @@ bootstrap capabilities. Both architectures' IRQ tails finish EOI and interrupt
 accounting before an RT event can request an own-stack user switch; kernel-mode
 user continuations carry a sticky request to completed syscall exit.
 
+Ordinary own-stack user returns (syscall, interrupt, and recoverable exception) call
+`narf_scheduler::stackful::finish_user_return` after releasing handler locks and
+hard-IRQ guards. It may enable interrupts on the task stack to activate queued
+wakes and perform policy-approved rescheduling, then returns with interrupts
+masked. Register/domain restoration keeps that mask until the atomic user
+return instruction. A notification received late in kernel mode therefore
+cannot be consumed by an IPI after the final wake check but before user entry.
+
 ## 4. Invariants & safety properties
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.
-- A trap handler never allocates.
+- Hard-IRQ handling never allocates. The completed own-stack user-return loop
+  may grow a ready queue after IRQ accounting ends and interrupts are enabled.
+- IST exceptions (NMI, double fault, machine check, and SEV-ES #VC) never enter
+  the scheduling return loop; their exception stacks cannot be suspended.
 - Anonymous user demand faults that hit the protected memory reserve may yield
   only after memory has retired the page claim, released address-space and
   allocator locks, and frame has cleared the active per-CPU mempolicy slot.

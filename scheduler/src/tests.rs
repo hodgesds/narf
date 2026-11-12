@@ -789,68 +789,59 @@ fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_spawn_kicks_halted_remote_cpu);
 
-/// The hardened wake path publishes a per-CPU `NEED_RESCHED` request on EVERY
-/// cross-core wake, independent of the IPI decision. This is the authoritative
-/// second Dekker channel: even when the target is running (IPI correctly
-/// skipped), the request is durable so the target catches it via the O(1)
-/// check at its next halt commit instead of relying on a bounded idle spin.
-/// Asserted through the test accessors on the same commandeered-CPU-1 harness
-/// as the kick test (SMP=1 only, or a real AP owns CPU 1's resched state).
-fn smoke_scheduler_wake_publishes_need_resched() -> TestResult {
+/// Wake delivery publishes WAKE_PENDING independently of policy preemption.
+/// A busy remote CPU receives an IPI for the first wake in a batch; subsequent
+/// wakes retain the notification without forcing NEED_RESCHED. This harness
+/// requires SMP=1 so no real AP owns the fake CPU 1 state.
+fn smoke_scheduler_wake_notification_is_not_preemption() -> TestResult {
     use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
-
-    if narf_lib::smp::online_count() > 1 {
-        return TestResult::Skip("needs SMP=1 — a live AP owns CPU 1's NEED_RESCHED");
-    }
+    use core::sync::atomic::Ordering;
     if narf_lib::smp::ever_online_bitmap() != 1 {
-        return TestResult::Skip(
-            "an AP really came up this boot — CPU 1's resched state isn't ours",
-        );
+        return TestResult::Skip("requires exclusive ownership of fake CPU 1");
     }
-
     crate::__reset_queues_for_test();
     narf_lib::smp::__test_fake_online(1);
-    // A faked-online halted AP must also read as `Idle` so the wake path takes
-    // the cross-core kick branch (see `target_drains`), not the quiesced direct
-    // enqueue that skips the IPI + NEED_RESCHED publish.
     crate::policy::__test_set_cpu_state(CpuId(1), crate::policy::CpuState::Idle);
-
-    let spec = || TaskSpec {
-        affinity: Affinity {
-            allowed: crate::affinity::CpuSet::ALL,
-            preferred: Some(CpuId(1)),
-        },
-        ..TaskSpec::unthrottled()
-    };
-
-    // Case A: target halted → request published AND IPI sent.
-    crate::__test_set_cpu_halted(1, true);
-    crate::__test_clear_need_resched(1);
-    let _ = spawn_with_spec(async {}, spec());
-    let need_when_halted = crate::__test_need_resched(1);
-
-    // Case B: target running → IPI skipped, but the request is STILL published
-    // (the durable channel is what hardens the halt-poll-window race).
-    crate::__test_set_cpu_halted(1, false);
-    crate::__test_clear_need_resched(1);
-    let _ = spawn_with_spec(async {}, spec());
-    let need_when_running = crate::__test_need_resched(1);
-
+    let mut valid = true;
+    for halted in [true, false] {
+        crate::__test_set_cpu_halted(1, halted);
+        crate::__test_clear_need_resched(1);
+        crate::WAKE_PENDING[1].store(false, Ordering::SeqCst);
+        let before = crate::local_scheduler_telemetry()
+            .resched_sent
+            .load(Ordering::Relaxed);
+        for _ in 0..2 {
+            spawn_with_spec(
+                async {},
+                TaskSpec {
+                    affinity: Affinity::pinned(CpuId(1)),
+                    ..TaskSpec::unthrottled()
+                },
+            );
+        }
+        valid &= crate::wake_notification_pending(1) && !crate::__test_need_resched(1);
+        // A busy CPU receives one IPI for the batch. A halted CPU may need a
+        // fresh kick after a prior interrupt raced the halt commitment.
+        if !halted {
+            valid &= crate::local_scheduler_telemetry()
+                .resched_sent
+                .load(Ordering::Relaxed)
+                == before + 1;
+        }
+    }
     narf_lib::smp::mark_offline(1);
-    crate::__test_clear_need_resched(1);
+    crate::__test_set_cpu_halted(1, false);
     crate::__reset_queues_for_test();
-
-    if !need_when_halted {
-        return TestResult::Fail("wake to a halted remote CPU did not publish NEED_RESCHED");
+    if valid {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("wake delivery forced preemption or failed to batch a busy-CPU IPI")
     }
-    if !need_when_running {
-        return TestResult::Fail(
-            "wake to a running remote CPU did not publish NEED_RESCHED (authoritative channel lost)",
-        );
-    }
-    TestResult::Pass
 }
-kernel_test_in!("scheduler", smoke_scheduler_wake_publishes_need_resched);
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_wake_notification_is_not_preemption
+);
 
 fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
     // With work-stealing on and per-CPU queues seeded across two
@@ -3663,63 +3654,83 @@ kernel_test_in!(
     smoke_scheduler_vruntime_accumulates_and_floor_inits
 );
 
-/// EEVDF wake-preemption policy (`eevdf::eevdf_should_preempt`), the pure rule
-/// behind `EevdfScheduler::wakeup_preempt`. Pins the three behaviours that
-/// distinguish it from both the naive "preempt every wake" (which de-batched
-/// pipe/msg) and a flat run-time floor (which lost the futex win):
-///   - a starved sleeper (earlier `d_eff` than the runner's protected deadline)
-///     preempts — the futex wait/wake handoff;
-///   - a balanced peer (equal deadline) does NOT preempt — no de-batch;
-///   - a woken CPU hog (later deadline) does NOT preempt — no starvation of the
-///     runner; and class rank always dominates within the rule.
+/// Linux checks eligibility before protecting the running entity. Exercise
+/// both orderings, exact eligibility boundaries, and the bounded-credit view.
 fn smoke_eevdf_wakeup_preempt_rule() -> TestResult {
-    use crate::eevdf::eevdf_should_preempt as should;
-    use crate::priority::SchedClass;
-    use crate::EEVDF_BASE_SLICE as BASE;
-
-    // `runner_now` = the runner's CURRENT effective virtual runtime.
-    let runner_now: u64 = 10 * BASE;
-
-    // Starved sleeper: deadline a base slice before the runner's clock => preempt.
-    if !should(
-        SchedClass::Default,
-        runner_now,
-        SchedClass::Default,
-        runner_now - BASE,
-    ) {
-        return TestResult::Fail("starved sleeper (d_eff before runner_now) must preempt");
+    use crate::eevdf::FairWake;
+    use crate::policy::{CpuSchedContext, CurrentTask, QuantumUnit, WakePreemption};
+    use crate::{CpuId, Priority, SchedClass, TaskId, EEVDF_BASE_SLICE as BASE};
+    let decide = |start: u64, elapsed: u64, floor: u64, peers: &[u64]| {
+        let ctx = CpuSchedContext {
+            cpu: CpuId::BOOT,
+            vfloor: floor,
+            elapsed,
+            quantum_unit: QuantumUnit::Nanos,
+            current: CurrentTask {
+                id: TaskId::NONE,
+                class: SchedClass::Default,
+                priority: Priority::NORMAL,
+                vruntime: start,
+                vdeadline: start.saturating_add(BASE),
+            },
+        };
+        let mut fair = FairWake::new(&ctx);
+        for &v in peers {
+            fair.observe(v);
+        }
+        fair.decision()
+    };
+    if decide(10 * BASE, 0, 10 * BASE, &[9 * BASE]) != WakePreemption::Now {
+        return TestResult::Fail("ineligible current retained protection against an owed sleeper");
     }
-    // Peer exactly caught up (equal): strict-less-than is false => no preempt.
-    if should(
-        SchedClass::Default,
-        runner_now,
-        SchedClass::Default,
-        runner_now,
-    ) {
-        return TestResult::Fail("caught-up peer (equal) must NOT preempt");
+    if decide(0, 0, 0, &[0]) != WakePreemption::After(1)
+        || decide(0, 1, 0, &[0]) != WakePreemption::Now
+    {
+        return TestResult::Fail("equal-runtime eligibility boundary must be exact");
     }
-    // Briefly-blocked / not-yet-due peer: deadline after the runner's clock =>
-    // no preempt (this is what preserves pipe/msg batching until the runner has
-    // actually run ~a base slice).
-    if should(
-        SchedClass::Default,
-        runner_now,
-        SchedClass::Default,
-        runner_now + BASE,
-    ) {
-        return TestResult::Fail("not-yet-due peer (d_eff after runner_now) must NOT preempt");
+    // The other queued peer changes eligibility. A pairwise comparison against
+    // the earliest sleeper alone would incorrectly preempt this eligible runner.
+    let peers = [9 * BASE, 20 * BASE];
+    if decide(10 * BASE, 0, 10 * BASE, &peers) != WakePreemption::After(BASE)
+        || decide(10 * BASE, BASE - 1, 10 * BASE, &peers) != WakePreemption::After(BASE)
+        || decide(10 * BASE, BASE, 10 * BASE, &peers) != WakePreemption::Now
+    {
+        return TestResult::Fail("eligible current lost protection or kept an expired request");
     }
-    // Class rank dominates both ways.
-    if !should(
-        SchedClass::Default,
-        runner_now,
-        SchedClass::Realtime,
-        runner_now + 100 * BASE,
-    ) {
-        return TestResult::Fail("higher-class wakee must preempt regardless of deadline");
+    if decide(10 * BASE, 0, 10 * BASE, &[20 * BASE]) != WakePreemption::After(10 * BASE + 1) {
+        return TestResult::Fail("ahead-of-service wakee preempted an eligible current");
     }
-    if should(SchedClass::Default, runner_now, SchedClass::Idle, 0) {
-        return TestResult::Fail("lower-class wakee must never preempt");
+    if decide(1, 0, 0, &[1, 2]) != WakePreemption::After(1)
+        || decide(1, 1, 0, &[1, 2]) != WakePreemption::Now
+    {
+        return TestResult::Fail("fractional average was rounded across eligibility boundary");
+    }
+    if decide(0, 0, 10 * BASE, &[1]) != WakePreemption::After(1) {
+        return TestResult::Fail("runner and peer used different sleeper-credit bounds");
+    }
+    if decide(u64::MAX - BASE, 0, 0, &[u64::MAX, u64::MAX]) != WakePreemption::After(BASE + 1) {
+        return TestResult::Fail("large runtimes overflowed eligibility accounting");
+    }
+    // Duplicating an identical peer leaves both the average and the earliest
+    // deadline unchanged. The single-peer shortcut must therefore agree with
+    // the general path, including clamped and saturated virtual clocks.
+    for start in [0, BASE, 10 * BASE, u64::MAX - BASE, u64::MAX] {
+        for peer in [0, BASE, 9 * BASE, 20 * BASE, u64::MAX] {
+            for elapsed in [0, 1, BASE - 1, BASE, u64::MAX] {
+                for floor in [0, 10 * BASE, u64::MAX] {
+                    if decide(start, elapsed, floor, &[peer])
+                        != decide(start, elapsed, floor, &[peer, peer])
+                    {
+                        return TestResult::Fail(
+                            "single-peer wake decision disagrees with equal peers",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if decide(0, 0, 0, &[]) != WakePreemption::KeepRunning {
+        return TestResult::Fail("empty queue requested preemption");
     }
     TestResult::Pass
 }
@@ -6134,3 +6145,122 @@ fn smoke_scheduler_task_cap_transfer_between_tasks() -> TestResult {
 }
 #[cfg(feature = "native-ring")]
 kernel_test_in!("scheduler", smoke_scheduler_task_cap_transfer_between_tasks);
+
+fn smoke_class_wake_preemption_respects_priority_and_protection() -> TestResult {
+    use crate::policy::{CpuSchedContext, CurrentTask, RunQueue, Scheduler};
+    use crate::{CpuId, Priority, SchedClass, TaskSpec};
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let peer = crate::spawn(async {});
+    let mut ctx = CpuSchedContext {
+        cpu: CpuId(cpu as u32),
+        vfloor: 0,
+        elapsed: 0,
+        quantum_unit: crate::policy::active_quantum_unit(),
+        current: CurrentTask {
+            id: crate::TaskId::NONE,
+            class: SchedClass::Default,
+            priority: Priority::NORMAL,
+            vruntime: 0,
+            vdeadline: crate::EEVDF_BASE_SLICE,
+        },
+    };
+    let mut valid = true;
+    {
+        let mut ready = crate::READY[cpu].lock();
+        let queue = ready.as_mut().unwrap();
+        for (class, priority, elapsed, expected) in [
+            (SchedClass::Default, Priority::NORMAL, 0, false),
+            (SchedClass::Default, Priority::NORMAL, 1, true),
+            (SchedClass::Default, Priority::HIGH, 0, true),
+            (SchedClass::Batch, Priority::HIGH, u64::MAX, false),
+            (SchedClass::Realtime, Priority::NORMAL, 0, true),
+        ] {
+            queue.iter_mut().find(|s| s.id == peer).unwrap().spec = TaskSpec {
+                class,
+                priority,
+                ..TaskSpec::unthrottled()
+            };
+            ctx.elapsed = elapsed;
+            valid &=
+                crate::ClassScheduler.wakeup_preempt(&ctx, &RunQueue::projected(queue)) == expected;
+            if class == SchedClass::Default && priority == Priority::NORMAL && elapsed == 0 {
+                valid &= crate::ClassScheduler.wakeup_preemption(&ctx, &RunQueue::projected(queue))
+                    == crate::policy::WakePreemption::After(1);
+            }
+        }
+        ctx.current.class = SchedClass::Realtime;
+        ctx.elapsed = u64::MAX;
+        valid &= !crate::ClassScheduler.wakeup_preempt(&ctx, &RunQueue::projected(queue));
+        queue
+            .front()
+            .unwrap()
+            .awake
+            .flag
+            .store(false, core::sync::atomic::Ordering::Release);
+        ctx.current.class = SchedClass::Idle;
+        valid &= !crate::ClassScheduler.wakeup_preempt(&ctx, &RunQueue::projected(queue));
+    }
+    crate::__reset_queues_for_test();
+    if valid {
+        TestResult::Pass
+    } else {
+        TestResult::Fail(
+            "class wake preemption violated priority, protection, FIFO or runnable state",
+        )
+    }
+}
+kernel_test_in!(
+    "scheduler/policy",
+    smoke_class_wake_preemption_respects_priority_and_protection
+);
+
+fn smoke_wake_arriving_during_activation_keeps_notification() -> TestResult {
+    use core::sync::atomic::Ordering;
+    crate::__reset_queues_for_test();
+    let cpu = narf_lib::percpu::current_cpu();
+    let task = crate::spawn_with_spec(
+        core::future::pending::<()>(),
+        crate::TaskSpec {
+            affinity: crate::Affinity::pinned(crate::CpuId(cpu as u32)),
+            ..crate::TaskSpec::unthrottled()
+        },
+    );
+    let _ = crate::poll_one_round();
+    let cell = crate::PARKED[cpu]
+        .lock()
+        .as_ref()
+        .and_then(|slots| slots.get(&task))
+        .map(|entry| entry.slot.awake.clone());
+    let Some(cell) = cell else {
+        crate::__reset_queues_for_test();
+        return TestResult::Fail("activation race fixture did not park");
+    };
+    let wake = crate::make_waker(cell);
+    wake.wake_by_ref();
+    // Target claims a batch. A producer wakes again before the target drains
+    // the coalesced intrusive node; its notification belongs to the next pass.
+    let initial = crate::WAKE_PENDING[cpu].swap(false, Ordering::SeqCst);
+    wake.wake();
+    crate::activate_wake_list(cpu);
+    let retained = crate::wake_notification_pending(cpu);
+    crate::activate_pending_wakes(cpu);
+    let valid = initial
+        && retained
+        && !crate::wake_notification_pending(cpu)
+        && !crate::need_resched_pending(cpu)
+        && crate::READY[cpu]
+            .lock()
+            .as_ref()
+            .is_some_and(|queue| queue.len() == 1 && queue[0].id == task);
+    crate::__reset_queues_for_test();
+    if valid {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("activation erased a racing notification or duplicated ownership")
+    }
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_wake_arriving_during_activation_keeps_notification
+);

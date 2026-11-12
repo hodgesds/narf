@@ -44,7 +44,7 @@ pub trait Scheduler: Send + Sync + 'static {
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle>;
     fn pick_wakeup(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> { None }
     fn on_task_runtime(&self, cpu: CpuId, runtime: TaskRuntime) { }
-    fn wakeup_preempt(&self, cpu: CpuId, current: &CurrentTask, queue: &RunQueue<'_>) -> bool { false }
+    fn wakeup_preempt(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) -> bool { false }
     // lifecycle (all defaulted): on_install, on_cpu_attach, on_cpu_detach,
     //                            on_task_queue_event, on_cpu_state_change, on_uninstall
 }
@@ -95,13 +95,20 @@ generic idle-sibling pull hint, which would let a thief split the pair that
 co-location and the urgent buddy are establishing.
 
 ### `wakeup_preempt` — defaulted, opt-in
-Returns `true` iff the running task should cede at its next cooperative
-preemption point because a wake just made a peer runnable. Default `false`
-(FIFO/Priority/Class do not wake-preempt). This is NARF's analogue of Linux
-`check_preempt_wakeup_fair()` (`/usr/src/linux/kernel/sched/fair.c`). It is
-consulted once per wake at the waker's syscall-exit (the sticky per-CPU
-`WAKE_PREEMPT` request set by `note_wake_preempt`), never on a no-wake exit, so
-its cost is paid only when a wake actually happened.
+
+The target CPU invokes `wakeup_preemption(ctx, queue)` after activating pending
+wakes at a safe user return. Its default implementation adapts the boolean hook.
+A policy can instead return `WakePreemption::After(elapsed_cycles)` to retain a
+check until slice protection expires. The task stores that deadline locally;
+ordinary returns test it in O(1), and a new dispatch clears it. No recovery
+timer is introduced. `CurrentTask` includes the dispatched priority.
+
+The boolean hook returns `true` when a runnable peer should preempt the current
+task, and defaults to `false`. Class and EEVDF implement protected wake
+preemption; FIFO retains its default. The queue is inspected when activation
+adds runnable work or a retained policy deadline becomes due. An activation
+node belonging to the currently claimed direct-handoff task does not trigger a
+queue-policy scan merely to rearm that same task.
 
 ### Lifecycle hooks — defaulted
 The default ClassScheduler uses per-task blocking-I/O wake metadata with a
@@ -138,45 +145,45 @@ dispatch sites in `lib.rs` (`poll_one_round`, `run_until_empty`) with the
 extra `rdtsc`. A parked task's `vruntime` is frozen (it is not charged while it
 is not running), which is exactly the "sleeper credit" that lets an
 eligibility policy react to a just-woken task. Per-CPU `VFLOOR[cpu]` tracks the
-minimum vruntime dispatched, so a long sleeper's credit can be clamped to one
+maximum vruntime dispatched, so a long sleeper's credit can be clamped to one
 base slice (Linux `place_entity()`'s lag clamp) and cross-CPU origin skew after a
 steal can be renormalized in core (policy never writes slots).
 
 ## 5. EEVDF-lite and its Linux lineage
-`EevdfScheduler` mirrors Linux EEVDF (`kernel/sched/fair.c`) with equal weights:
+`EevdfScheduler` adapts Linux 7.0-rc3 `kernel/sched/fair.c` to NARF's
+existing equal-weight accounting and uniform virtual requests:
 
-- **Virtual deadline** `d = v_eff + BASE_SLICE`, where
-  `v_eff = max(vruntime, VFLOOR - BASE_SLICE)` (bounded lag). Linux:
-  `se->deadline = se->vruntime + calc_delta_fair(se->slice, se)`.
-- **`pick_next`**: within the top eligibility tier and class rank, pick minimum
-  `d` (Linux `__pick_eevdf()`; with uniform slices this reduces to min-`v_eff`).
-- **`wakeup_preempt`**: preempt iff the best runnable sibling's `d` is strictly
-  earlier than the runner's *protected* deadline `D_run = vruntime_at_dispatch +
-  BASE_SLICE`. This is Linux's `RUN_TO_PARITY` + eligibility in one comparison: a
-  just-slept task (clamped at the floor) has an early `d` and preempts
-  immediately (→ fast futex wait/wake handoff); a balanced peer has
-  `d >= D_run` and does **not** preempt, so the runner batches out its base
-  slice (→ no de-batch of pipe/msg/redis-pipeline throughput). No wall-clock
-  threshold is involved — the batching hysteresis is the base slice, a
-  first-class scheduling quantum, not a tuned constant.
-- **`BASE_SLICE`** is derived from `DEFAULT_SLICE_CYCLES` (not a new magic
-  number) and is comparable to Linux's `sysctl_sched_base_slice` (700 µs). The
-  tick/CPL3 slice preemption (`try_preempt_user`) and the `FAIR_QUANTUM_DIV`
-  fair-share floor remain the backstops. A tick that lands in a user syscall
-  records either decision in that task's sticky reschedule bit for syscall
-  exit; EEVDF only re-orders picks and supplies the wake-preempt rule.
+- **Virtual deadline:** `d = v_eff + BASE_SLICE`, where
+  `v_eff = max(vruntime, VFLOOR - BASE_SLICE)` bounds sleeper credit.
+- **Pick:** within the top budget eligibility tier and class, choose the
+  earliest deadline. Uniform requests make the minimum-runtime peer the
+  earliest deadline candidate.
+- **Wake:** follow `vruntime_eligible` and `__pick_eevdf` ordering. Include the
+  runner's elapsed service when computing runnable eligibility. An ineligible
+  runner loses slice protection immediately. An eligible runner retains its
+  virtual request until it expires, then competes with eligible peers by
+  deadline. ClassScheduler applies this rule only within its strict
+  class/priority tier; equal-priority realtime FIFO/RR order remains intact.
+- **Deferred check:** retain the earlier applicable boundary: protection expiry
+  or the first cycle at which current becomes ineligible. Equal-weight
+  eligibility compares exact sums, without rounding the average or imposing a
+  fixed wall-time grace period. `After` remains a request for the core's existing
+  safe-boundary recheck; it does not arm a new timer.
 
-Why this is correct where a flat "minimum run time before a wake may preempt"
-floor is not: the floor cannot tell a *starved sleeper that should preempt now*
-from a *balanced peer that should not* — only a two-task virtual-time comparison
-can. EEVDF makes that comparison; the floor guesses.
+Both sides of the comparison use the same bounded-credit view. One
+allocation-free O(n) scan accumulates the runtime sum and earliest candidate;
+NARF does not yet provide Linux's weighted/group accounting, variable request
+sizes, persistent per-entity deadlines or augmented runqueue tree. This change
+borrows the eligibility-before-protection decision, not those data structures.
+`BASE_SLICE` remains derived from `DEFAULT_SLICE_CYCLES`. Existing core budget,
+class, affinity and safe context-switch checks remain authoritative.
 
 ## 6. Selecting a policy
 `install_scheduler(&cap, impl)` performs a cap-gated rolling swap;
 `current_scheduler_name()` reflects the active policy. Boot arg
 `sched_policy=<fifo|priority|class|eevdf>` and the writable debugfs
 `sched/policy` knob select among the built-ins. The default (installed by
-`install_default_if_unset`) is `eevdf`; `fifo` remains available as the naive,
+`install_default_if_unset`) is `class`; `fifo` remains available as the naive,
 zero-accounting reference and for A/B measurement.
 
 ## 7. Checklist for a new policy
