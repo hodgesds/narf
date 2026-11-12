@@ -1252,6 +1252,9 @@ pub(crate) fn direct_handoff_is_local(home: usize, destination: usize) -> bool {
 /// queue is busy, ownership stays unchanged and the later waker-requeue hint
 /// remains the fallback. A successful move still uses the ordinary migration
 /// enqueue path, including policy events and affinity/lifecycle validation.
+// Out of line: moves a 688-byte `TaskSlot` through `Option` layers, and
+// inlined into the raw-waker path it made every wake reserve that frame.
+#[inline(never)]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn try_sync_wake_affine(home: u32, cell: *const WakeCell) -> Option<u32> {
     let source = home as usize;
@@ -3735,6 +3738,9 @@ fn parked_wake_push(cell: &WakeCell) -> Option<u32> {
 /// already have capacity, so the raw-waker path cannot allocate or wait behind
 /// a queue owner. Observing policies retain executor-boundary activation so an
 /// IRQ never invokes arbitrary policy callbacks.
+// Out of line: moves a 688-byte `TaskSlot` through `Option` layers, and
+// inlined into the raw-waker path it made every wake reserve that frame.
+#[inline(never)]
 fn try_activate_parked_local(cell: &WakeCell) -> bool {
     let token = cell.parked_location.load(Ordering::SeqCst);
     if token == NOT_PARKED {
@@ -5512,6 +5518,9 @@ pub fn wake_preempt_task(waker: Waker, expected_task: u64) {
 /// `false` so the caller falls back to kicking `home`, so a wake is never lost.
 /// This is the same non-blocking move as [`try_sync_wake_affine`], generalized
 /// to a policy-selected `target` instead of the waker's CPU.
+// Out of line: moves a 688-byte `TaskSlot` through `Option` layers, and
+// inlined into the raw-waker path it made every wake reserve that frame.
+#[inline(never)]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
     let source = home as usize;
