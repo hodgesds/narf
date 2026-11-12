@@ -833,7 +833,9 @@ fn de_napc_v3_native() -> Vec<u8> {
 fn de_owner(factory: &super::super::efuse::Factory, interface_index: u8) -> Prepared<Port, Block> {
     use super::super::rtl8192de::{
         calib::IqkMatrix,
+        dm::Dm,
         init::Radio,
+        lck::LcOutcome,
         phy::{PgStore, MAX_PG_GROUP},
         txpower::{Efuse, PowerLevels, CHANNEL_MAX_NUMBER},
         Band, BandSet, MacPhyMode, RfType,
@@ -890,6 +892,20 @@ fn de_owner(factory: &super::super::efuse::Factory, interface_index: u8) -> Prep
                 pwrgroup_cnt: 0,
             }),
             rf_on: true,
+            // Fresh `rtl92de_dm_init` state, exactly what
+            // `configure()` stores (init.rs); the DM state is
+            // report-only for the prepare/admit path under test.
+            dm: Dm::new(),
+            // `lc_calibrate`'s initial outcome for this 1-path RF
+            // (lck.rs); the fixture never runs calibration, and
+            // `path_count` is the load-bearing field (cf. the
+            // `configure` end-to-end test asserting it).
+            lc: LcOutcome {
+                scan_wait_us: 0,
+                path_count: RfType::OneT1R.paths(),
+                poll_ms: [0; 2],
+                poll_timed_out: [false; 2],
+            },
         },
         efuse: Efuse {
             cck: [[0; CHANNEL_MAX_NUMBER]; 2],
