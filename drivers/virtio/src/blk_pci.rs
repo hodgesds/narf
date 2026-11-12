@@ -19,7 +19,7 @@ use crate::pci::{
     CC_DRIVER_FEATURE_SELECT, CC_NUM_QUEUES, CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER,
     CC_QUEUE_ENABLE, CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
-use crate::queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_WRITE};
+use crate::queue::{Virtqueue, VirtqueueLayout};
 use crate::{
     VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
     VIRTIO_STATUS_FEATURES_OK,
@@ -53,6 +53,10 @@ pub const VIRTIO_BLK_F_FLUSH: u64 = 9;
 /// integration test; the 64 KiB experiment could leave QEMU without a used
 /// entry during Fedora's large DSO reads.
 pub const MAX_READ_SECTORS: u16 = 8;
+/// Most sectors one request moves (128 KiB): the chain is one payload
+/// descriptor, so this is a per-request DMA allocation bound, not a
+/// device limit (`seg_max` is not negotiated).
+pub const MAX_IO_SECTORS: u16 = 256;
 
 /// virtio-blk completion status.
 pub const VIRTIO_BLK_S_OK: u8 = 0;
@@ -131,14 +135,15 @@ mod capacity_tests {
 // Written only after a request has already failed to complete for one second,
 // then read by the feature-gated fatal stall watchdog. Keeping diagnostics off
 // the normal submit/poll path avoids perturbing timing-sensitive failures.
-static STALLED_QUEUE_STATE: AtomicU64 = AtomicU64::new(0);
-static STALLED_REQUEST: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALLED_QUEUE_STATE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STALLED_REQUEST: AtomicU64 = AtomicU64::new(0);
 
 /// Last virtio-blk timeout snapshot for the fatal stall watchdog.
 ///
 /// Returns `(sector, head, avail_idx, last_used_idx, device_used_idx,
-/// num_free, status)`, or `None` if no request has crossed the one-second
-/// threshold.
+/// num_free, status)`, or `None` if no request has crossed the stall
+/// threshold ([`crate::blk_mq::STALL_REPORT_MS`]). `sector` is 0: the
+/// queued request table reports by slot, not sector.
 pub fn stalled_queue_snapshot() -> Option<(u64, u16, u16, u16, u16, u16, u8)> {
     let state = STALLED_QUEUE_STATE.load(Ordering::Acquire);
     if state == 0 {
@@ -156,15 +161,6 @@ pub fn stalled_queue_snapshot() -> Option<(u64, u16, u16, u16, u16, u16, u8)> {
     ))
 }
 
-/// virtio-blk request header (VirtIO 1.2 §5.2.6).
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-struct BlkHeader {
-    type_tag: u32,
-    _resv: u32,
-    sector: u64,
-}
-
 /// Probed live virtio-blk-pci controller. Holds the live
 /// register-region maps + DMA buffers for the queue + per-request
 /// header/status pool.
@@ -172,20 +168,13 @@ pub struct VirtioBlkPci {
     common: VirtioRegion,
     /// Mandatory block configuration; capacity is always in 512-byte sectors.
     device_cfg: VirtioRegion,
-    notify: VirtioRegion,
-    /// `notify_off_multiplier` from the Notify cap header.
-    notify_off_multiplier: u32,
-    queue: IrqSafeSpinLock<Option<Virtqueue>>,
+    /// Queue 0 with its queued request table (chains, header/status
+    /// slots, completion matching) — see [`crate::blk_mq`].
+    mq: alloc::sync::Arc<crate::blk_mq::BlkQueue>,
     /// DMA buffer holding the descriptor table + avail + used rings.
     _q_buf: DmaBuffer,
-    /// Per-request scratch (16-byte header + 1-byte status + pad to
-    /// 64 bytes) — single-request driver until the multi-inflight
-    /// path lands.
-    pool: DmaBuffer,
     /// Negotiated queue size.
     qsize: u16,
-    /// `queue_notify_off` for queue 0, captured at probe time.
-    queue_notify_off: u16,
     /// IDT vector allocated for queue-0 MSI-X delivery, or `None`
     /// when the driver is running in polled mode.
     pub irq_vector: Option<u8>,
@@ -355,27 +344,28 @@ impl VirtioBlkPci {
             );
         }
 
-        // 8. Per-request pool — single 4 KiB page; layout is 16 bytes
-        //    of header + 1 byte of status + padding (64 bytes per
-        //    slot, 64 slots / page).
-        let pool =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+        // 8. Per-request header/status slots: one per chain the queue can
+        //    hold (three descriptors each), 64 bytes per slot.
+        let slots = (qsize / 3).max(1) as usize;
+        let pool = alloc_coherent(
+            (slots * crate::blk_mq::SLOT_BYTES).max(4096),
+            DomainId::DRIVER_0,
+        )
+        .map_err(|_| VirtioPciError::BarMapFailed)?;
 
         // SAFETY: Virtqueue::new wipes the layout regions; the
         // backing pages may be recycled (alloc_frame doesn't zero).
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let queue = unsafe { Virtqueue::new(layout) };
+        let notify_off = (queue_notify_off as u64) * (notify_off_multiplier as u64);
+        let mq = crate::blk_mq::BlkQueue::new(queue, qsize, notify, notify_off, pool);
 
         Ok(Self {
             common,
             device_cfg,
-            notify,
-            notify_off_multiplier,
-            queue: IrqSafeSpinLock::new(Some(queue)),
+            mq,
             _q_buf: q_buf,
-            pool,
             qsize,
-            queue_notify_off,
             irq_vector: None,
             msix: None,
             ready: true,
@@ -454,164 +444,48 @@ impl VirtioBlkPci {
         }
         self.irq_vector = Some(v);
         self.msix = Some(table);
+        // Completions are reaped in the handler from now on (and still by
+        // any waiter that looks first).
+        self.mq.install_isr(v);
         Ok(v)
     }
 
-    /// Issue a single 512-byte write at `sector`. Polled.
+    /// Issue a single 512-byte write at `sector`.
     pub fn write_sector(&self, sector: u64, data: &[u8; 512]) -> Result<(), VirtioPciError> {
         self.write_sectors(sector, data)
     }
 
+    /// The queued request table (see [`crate::blk_mq`]).
+    pub fn mq(&self) -> &alloc::sync::Arc<crate::blk_mq::BlkQueue> {
+        &self.mq
+    }
+
     /// Write a contiguous sector range with one descriptor chain. In
-    /// particular, a filesystem metadata node must not be split into separate
-    /// 512-byte commands. The request owns its DMA payload until completion.
+    /// particular, a filesystem metadata node must not be split into
+    /// separate 512-byte commands. The request's own DMA payload stays
+    /// pinned until the device completes it; the wait holds no lock and
+    /// shares the queue with every other request in flight.
     pub fn write_sectors(&self, sector: u64, data: &[u8]) -> Result<(), VirtioPciError> {
-        if data.is_empty()
-            || data.len() % 512 != 0
-            || data.len() / 512 > u16::MAX as usize
-            || sector.checked_add((data.len() / 512) as u64).is_none()
-        {
-            return Err(VirtioPciError::InvalidArgument);
+        if data.is_empty() || data.len() % 512 != 0 || data.len() > MAX_IO_SECTORS as usize * 512 {
+            return Err(VirtioPciError::QueueTooSmall);
         }
-        // Build header into the per-request pool slot 0.
-        let pool_phys = self.pool.dma_addr().raw();
-        let header_phys = pool_phys;
-        let status_phys = pool_phys + 16;
-        // SAFETY: identity-mapped DMA buffer.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
-                BlkHeader {
-                    type_tag: VIRTIO_BLK_T_OUT,
-                    _resv: 0,
-                    sector,
-                },
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
-                0xFFu8,
-            );
-        }
-        // Stage the complete request into one contiguous DMA allocation.
-        let payload = alloc_coherent(data.len().max(4096), DomainId::DRIVER_0)
+        let payload = alloc_coherent(data.len(), DomainId::DRIVER_0)
             .map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.dma_addr().raw();
-        // This is coherent RAM. Copy before add_buffer publishes the chain
-        // through its release barrier; byte-wise volatile stores only prevent
-        // the compiler from using memcpy/vector stores for the same bytes.
         // SAFETY: the fresh DMA allocation covers data.len() bytes, cannot
-        // overlap the caller's live slice, and remains owned until completion.
+        // overlap the caller's live slice, and stays pinned by the request
+        // until completion.
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), payload.cpu_mut_ptr::<u8>(), data.len());
         }
-        // For Write, payload is read-only from the device's POV.
-        let descs = [
-            VirtqDesc {
-                addr: header_phys,
-                len: 16,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: payload_phys,
-                len: data.len() as u32,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: status_phys,
-                len: 1,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-        ];
-        let head = {
-            let mut g = self.queue.lock();
-            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
-        };
-        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped notify region.
-        unsafe {
-            self.notify.write16(notify_off, 0);
-        }
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
-        // during the IDENTIFY-style probe completion wait.
-        let mut q_err = false;
-        // A submitted DMA request owns `payload` and its descriptor chain
-        // until the device publishes a terminal used-ring entry. Returning on
-        // an arbitrary timeout used to drop `payload` while the device could
-        // still write to it and leaked the three descriptors permanently.
-        // Reusing an abandoned chain can exhaust or corrupt the queue. Keep
-        // pumping in bounded wall-clock slices, but do not abandon an
-        // in-flight request.
-        let done = loop {
-            let completed = narf_scheduler::responsive_spin_until(
-                || {
-                    let elem = {
-                        let mut g = self.queue.lock();
-                        match g.as_mut() {
-                            Some(q) => q.poll_used(),
-                            None => {
-                                q_err = true;
-                                return true;
-                            }
-                        }
-                    };
-                    matches!(elem, Some((id, _)) if id == head as u32)
-                },
-                narf_time::Deadline::after_ms(1_000),
-            );
-            if completed || q_err {
-                break completed;
-            }
-            let (avail, last_used, device_used, free) = {
-                let g = self.queue.lock();
-                g.as_ref()
-                    .map(Virtqueue::diagnostic_snapshot)
-                    .unwrap_or((0, 0, 0, 0))
-            };
-            // SAFETY: `status_phys` is the live DMA status byte allocated for
-            // this request; the descriptor chain remains owned until the
-            // device completes it, so the byte is valid for this diagnostic
-            // volatile read.
-            let status = unsafe {
-                core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-            };
-            STALLED_REQUEST.store(
-                (sector << 16) | ((status as u64) << 8) | head as u64,
-                Ordering::Relaxed,
-            );
-            STALLED_QUEUE_STATE.store(
-                ((avail as u64) << 48)
-                    | ((last_used as u64) << 32)
-                    | ((device_used as u64) << 16)
-                    | free as u64,
-                Ordering::Release,
-            );
-        };
-        if q_err {
-            return Err(VirtioPciError::NoQueues);
-        }
-        debug_assert!(done);
-        // SAFETY: identity-mapped DMA.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-        };
-        if status != VIRTIO_BLK_S_OK {
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-        let mut g = self.queue.lock();
-        if let Some(q) = g.as_mut() {
-            q.free_chain(head);
-        }
-        let _ = payload;
-        Ok(())
+        compiler_fence(Ordering::Release);
+        let status = crate::blk_mq::submit_sync(
+            &self.mq,
+            crate::blk_mq::BlkOp::Write,
+            sector,
+            Some(alloc::sync::Arc::new(payload)),
+            data.len(),
+        )?;
+        crate::blk_mq::ok(status)
     }
 
     /// Whether VIRTIO_BLK_F_FLUSH was negotiated at probe time.
@@ -628,425 +502,53 @@ impl VirtioBlkPci {
     /// no guest-drainable cache and the write-through treatment is
     /// honest. A device status other than S_OK maps to an error:
     /// a flush that did not happen must surface, never report
-    /// success (#841). Submission mirrors `write_sector` (pool
-    /// slot 0, notify, polled used-ring wait).
+    /// success (#841).
     pub fn flush_cache(&self) -> Result<(), VirtioPciError> {
         if !self.flush_supported {
             return Ok(());
         }
-        // Build header into the per-request pool slot 0.
-        let pool_phys = self.pool.dma_addr().raw();
-        let header_phys = pool_phys;
-        let status_phys = pool_phys + 16;
-        // SAFETY: identity-mapped DMA buffer.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
-                BlkHeader {
-                    type_tag: VIRTIO_BLK_T_FLUSH,
-                    _resv: 0,
-                    sector: 0,
-                },
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
-                0xFFu8,
-            );
-        }
-        // Flush carries no payload: header + device-written status.
-        let descs = [
-            VirtqDesc {
-                addr: header_phys,
-                len: 16,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: status_phys,
-                len: 1,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-        ];
-        let mut q_err = false;
-        let head = {
-            let mut g = self.queue.lock();
-            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
-        };
-        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped notify region.
-        unsafe {
-            self.notify.write16(notify_off, 0);
-        }
-        // Same no-abandon rule as `write_sector`: a submitted chain
-        // stays owned until the device publishes its used-ring
-        // entry, however many 1 s slices the wait takes.
-        let done = loop {
-            let completed = narf_scheduler::responsive_spin_until(
-                || {
-                    let elem = {
-                        let mut g = self.queue.lock();
-                        match g.as_mut() {
-                            Some(q) => q.poll_used(),
-                            None => {
-                                q_err = true;
-                                return true;
-                            }
-                        }
-                    };
-                    matches!(elem, Some((id, _)) if id == head as u32)
-                },
-                narf_time::Deadline::after_ms(1_000),
-            );
-            if completed || q_err {
-                break completed;
-            }
-            let (avail, last_used, device_used, free) = {
-                let g = self.queue.lock();
-                g.as_ref()
-                    .map(Virtqueue::diagnostic_snapshot)
-                    .unwrap_or((0, 0, 0, 0))
-            };
-            // SAFETY: `status_phys` is the live DMA status byte allocated for
-            // this request; the descriptor chain remains owned until the
-            // device completes it, so the byte is valid for this diagnostic
-            // volatile read.
-            let status = unsafe {
-                core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-            };
-            STALLED_REQUEST.store(((status as u64) << 8) | head as u64, Ordering::Relaxed);
-            STALLED_QUEUE_STATE.store(
-                ((avail as u64) << 48)
-                    | ((last_used as u64) << 32)
-                    | ((device_used as u64) << 16)
-                    | free as u64,
-                Ordering::Release,
-            );
-        };
-        if q_err {
-            return Err(VirtioPciError::NoQueues);
-        }
-        debug_assert!(done);
-        // SAFETY: identity-mapped DMA.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-        };
-        if status != VIRTIO_BLK_S_OK {
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-        let mut g = self.queue.lock();
-        if let Some(q) = g.as_mut() {
-            q.free_chain(head);
-        }
-        Ok(())
+        let status = crate::blk_mq::submit_sync(&self.mq, crate::blk_mq::BlkOp::Flush, 0, None, 0)?;
+        crate::blk_mq::ok(status)
     }
 
     /// Issue a single 512-byte read at `sector` and copy the result
-    /// into `out`. Polled — the IRQ-driven path lands once we wire
-    /// MSI-X for virtio-pci (a follow-up).
+    /// into `out`.
     pub fn read_sector(&self, sector: u64, out: &mut [u8; 512]) -> Result<(), VirtioPciError> {
-        // Build header + status into the per-request pool slot 0.
-        let pool_phys = self.pool.dma_addr().raw();
-        let header_phys = pool_phys;
-        let status_phys = pool_phys + 16;
-        // SAFETY: identity-mapped DMA buffer.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
-                BlkHeader {
-                    type_tag: VIRTIO_BLK_T_IN,
-                    _resv: 0,
-                    sector,
-                },
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
-                0xFFu8,
-            );
-        }
-
-        // Allocate a 4 KiB DMA scratch buffer for the read payload.
-        // (DMA buffers are page-sized; we only consume 512 bytes.)
-        let payload =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.dma_addr().raw();
-        // SAFETY: page-sized DMA buffer; zero the first 512 bytes so
-        // a stale read shows up clearly if the device misses our
-        // request.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            for i in 0..512usize {
-                core::ptr::write_volatile(payload.cpu_mut_ptr_at::<u8>(i as u64), 0);
-            }
-        }
-
-        let descs = [
-            VirtqDesc {
-                addr: header_phys,
-                len: 16,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: payload_phys,
-                len: 512,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: status_phys,
-                len: 1,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-        ];
-
-        let head = {
-            let mut g = self.queue.lock();
-            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
-        };
-
-        // Notify queue 0. The notify register address is
-        //   notify_base + queue_notify_off * notify_off_multiplier
-        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: notify cap region is identity-mapped MMIO; offset
-        // bounded by the device's queue_notify_off.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            self.notify.write16(notify_off, 0);
-        }
-
-        // Poll the used ring for our completion. responsive_spin_until
-        // ticks sleep_pumps so cursor/FB stay alive on slow I/O.
-        let mut q_err = false;
-        // The DMA payload and descriptor chain remain device-owned until a
-        // used-ring entry arrives. A timeout is not a terminal completion:
-        // dropping the payload and leaking the chain here eventually exhausted
-        // the queue while Plasma streamed its DSOs.
-        let done = loop {
-            let completed = narf_scheduler::responsive_spin_until(
-                || {
-                    let elem = {
-                        let mut g = self.queue.lock();
-                        match g.as_mut() {
-                            Some(q) => q.poll_used(),
-                            None => {
-                                q_err = true;
-                                return true;
-                            }
-                        }
-                    };
-                    matches!(elem, Some((id, _)) if id == head as u32)
-                },
-                narf_time::Deadline::after_ms(1_000),
-            );
-            if completed || q_err {
-                break completed;
-            }
-        };
-        if q_err {
-            return Err(VirtioPciError::NoQueues);
-        }
-        debug_assert!(done);
-
-        // Read the status byte; non-zero means I/O error.
-        // SAFETY: identity-mapped DMA.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-        };
-        if status != VIRTIO_BLK_S_OK {
-            // Free chain to avoid leak.
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-
-        // Copy the payload out. The completion check above is what makes the
-        // device's writes visible; fence so the compiler cannot hoist this
-        // bulk copy above it.
-        compiler_fence(Ordering::Acquire);
-        // SAFETY: identity-mapped DMA page of at least `out.len()` bytes,
-        // freshly allocated so it cannot overlap `out`. Bulk copy rather than
-        // a per-byte volatile loop — see `read_sectors`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(payload.cpu_ptr::<u8>(), out.as_mut_ptr(), out.len());
-        }
-
-        // Free the descriptor chain.
-        let mut g = self.queue.lock();
-        if let Some(q) = g.as_mut() {
-            q.free_chain(head);
-        }
-        // payload drops here — controller doesn't reference it after
-        // the used-ring entry arrived.
-        let _ = payload;
-        Ok(())
+        self.read_sectors(sector, 1, out)
     }
 
-    /// Read `count` contiguous 512-byte sectors from `sector` in ONE virtio
-    /// request — a single submit→poll round-trip instead of one per sector.
-    /// `count` is clamped to 1..=8 (one 4 KiB DMA page holds 8 sectors);
-    /// `out` must be at least `count*512` bytes. This is the batched
-    /// counterpart to `read_sector`: a sequential file read (ext2 streaming a
-    /// DSO) pays ~1/8 the `responsive_spin_until` round-trips.
+    /// Read `count` sectors (at most [`MAX_IO_SECTORS`]) at `sector` into
+    /// `out` with one descriptor chain.
     pub fn read_sectors(
         &self,
         sector: u64,
         count: u16,
         out: &mut [u8],
     ) -> Result<(), VirtioPciError> {
-        // Keep each transfer within one DMA page. Multi-page coherent buffers
-        // are supported by the allocator, but virtio-blk completion for larger
-        // descriptors needs its own QEMU integration gate before this path can
-        // safely raise the ceiling.
-        let count = count.clamp(1, MAX_READ_SECTORS);
+        let count = count.clamp(1, MAX_IO_SECTORS);
         let bytes = count as usize * 512;
         if out.len() < bytes {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let pool_phys = self.pool.dma_addr().raw();
-        let header_phys = pool_phys;
-        let status_phys = pool_phys + 16;
-        // SAFETY: identity-mapped DMA buffer.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
-                BlkHeader {
-                    type_tag: VIRTIO_BLK_T_IN,
-                    _resv: 0,
-                    sector,
-                },
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
-                0xFFu8,
-            );
-        }
-
         let payload =
             alloc_coherent(bytes, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.dma_addr().raw();
-        // SAFETY: coherent DMA buffer of >= `bytes`; zero the bytes we'll read
-        // so a missed device write shows up clearly.
-        //
-        // `write_bytes`, not a volatile byte loop: this ran one
-        // `write_volatile` per byte, which the compiler cannot vectorise or
-        // turn into a `memset`, so every 4 KiB read paid 4096 separate
-        // single-byte stores. On a filesystem workload that is the dominant
-        // cost of a transfer — the stall watchdog caught a CPU sitting in
-        // exactly this loop. Volatility buys nothing here: the buffer is not
-        // MMIO, and the ordering that matters is the fence below, which is
-        // what publishes these zeroes before the device is notified.
-        unsafe {
-            core::ptr::write_bytes(payload.cpu_mut_ptr::<u8>(), 0, bytes);
-        }
-
-        let descs = [
-            VirtqDesc {
-                addr: header_phys,
-                len: 16,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: payload_phys,
-                len: bytes as u32,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: status_phys,
-                len: 1,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-        ];
-
-        let head = {
-            let mut g = self.queue.lock();
-            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
-        };
-
-        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: notify cap region is identity-mapped MMIO.
-        unsafe {
-            self.notify.write16(notify_off, 0);
-        }
-
-        let mut q_err = false;
-        // The DMA payload and descriptor chain remain device-owned until a
-        // used-ring entry arrives. A timeout is not a terminal completion.
-        let done = loop {
-            let completed = narf_scheduler::responsive_spin_until(
-                || {
-                    let elem = {
-                        let mut g = self.queue.lock();
-                        match g.as_mut() {
-                            Some(q) => q.poll_used(),
-                            None => {
-                                q_err = true;
-                                return true;
-                            }
-                        }
-                    };
-                    matches!(elem, Some((id, _)) if id == head as u32)
-                },
-                narf_time::Deadline::after_ms(1_000),
-            );
-            if completed || q_err {
-                break completed;
-            }
-        };
-        if q_err {
-            return Err(VirtioPciError::NoQueues);
-        }
-        debug_assert!(done);
-
-        // SAFETY: identity-mapped DMA.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-        };
-        if status != VIRTIO_BLK_S_OK {
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-
-        // The used-ring entry above is what makes the device's writes
-        // visible; keep the compiler from hoisting this copy above that
-        // check now that it is a single bulk move rather than a sequence of
-        // volatile reads.
+        let payload = alloc::sync::Arc::new(payload);
+        let status = crate::blk_mq::submit_sync(
+            &self.mq,
+            crate::blk_mq::BlkOp::Read,
+            sector,
+            Some(alloc::sync::Arc::clone(&payload)),
+            bytes,
+        )?;
+        crate::blk_mq::ok(status)?;
+        // The completion made the device's writes visible; fence so the
+        // bulk copy cannot be hoisted above it.
         compiler_fence(Ordering::Acquire);
-        // SAFETY: identity-mapped DMA page holding at least `bytes`, and
-        // `out` is `bytes` long (checked above); the regions cannot overlap
-        // because `payload` is a freshly allocated coherent buffer.
-        //
-        // A bulk copy for the same reason as the zeroing above: this was one
-        // `read_volatile` per byte, so a 4 KiB read cost 4096 single-byte
-        // loads that could not be vectorised.
+        // SAFETY: a live coherent buffer of `bytes` bytes, separately
+        // allocated so it cannot overlap `out`.
         unsafe {
             core::ptr::copy_nonoverlapping(payload.cpu_ptr::<u8>(), out.as_mut_ptr(), bytes);
         }
-
-        let mut g = self.queue.lock();
-        if let Some(q) = g.as_mut() {
-            q.free_chain(head);
-        }
-        let _ = payload;
         Ok(())
     }
 
@@ -1055,455 +557,65 @@ impl VirtioBlkPci {
         self.qsize
     }
 
-    /// Submit a single 512-byte read without waiting for the device.
-    /// Returns the descriptor chain head + the payload DmaBuffer +
-    /// the (status, payload) phys addresses. Caller must keep the
-    /// returned `payload` alive until drain completes.
-    pub fn submit_read(&self, sector: u64) -> Result<(u16, DmaBuffer, u64, u64), VirtioPciError> {
-        let pool_phys = self.pool.dma_addr().raw();
-        let header_phys = pool_phys;
-        let status_phys = pool_phys + 16;
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
-                BlkHeader {
-                    type_tag: VIRTIO_BLK_T_IN,
-                    _resv: 0,
-                    sector,
-                },
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
-                0xFFu8,
-            );
-        }
-        let payload =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.dma_addr().raw();
-        let descs = [
-            VirtqDesc {
-                addr: header_phys,
-                len: 16,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: payload_phys,
-                len: 512,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: status_phys,
-                len: 1,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-        ];
-        let head = {
-            let mut g = self.queue.lock();
-            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
-        };
-        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped notify region.
-        unsafe {
-            self.notify.write16(notify_off, 0);
-        }
-        Ok((head, payload, status_phys, payload_phys))
-    }
-
-    /// Drain a previously submitted read. Returns Ok if the device
-    /// reported success and the payload was copied into `out`.
-    pub fn drain_read(
-        &self,
-        head: u16,
-        status_phys: u64,
-        payload_phys: u64,
-        out: &mut [u8; 512],
-    ) -> Result<(), VirtioPciError> {
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
-        // while waiting for our completion. Foreign-id used entries
-        // are consumed inline and don't count against the bound.
-        let mut q_err = false;
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                let elem = {
-                    let mut g = self.queue.lock();
-                    match g.as_mut() {
-                        Some(q) => q.poll_used(),
-                        None => {
-                            q_err = true;
-                            return true;
-                        }
-                    }
-                };
-                matches!(elem, Some((id, _)) if id == head as u32)
-            },
-            narf_time::Deadline::after_ms(1_000),
-        );
-        if q_err {
-            return Err(VirtioPciError::NoQueues);
-        }
-        if !done {
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::QueueTooSmall);
-        }
-        // SAFETY: identity-mapped DMA.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-        };
-        if status != VIRTIO_BLK_S_OK {
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-        // The completion check above makes the device's writes visible;
-        // fence so the bulk copy cannot be hoisted above it.
-        compiler_fence(Ordering::Acquire);
-        // SAFETY: identity-mapped DMA page of at least `out.len()` bytes,
-        // separately allocated so it cannot overlap `out`. Bulk copy rather
-        // than a per-byte volatile loop — see `read_sectors`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                narf_memory::PhysAddr::new(payload_phys).kernel_ptr::<u8>(),
-                out.as_mut_ptr(),
-                out.len(),
-            );
-        }
-        let mut g = self.queue.lock();
-        if let Some(q) = g.as_mut() {
-            q.free_chain(head);
-        }
-        Ok(())
-    }
-
-    /// Submit a single 512-byte write without waiting for the device.
-    /// Returns the descriptor chain head + the payload DmaBuffer +
-    /// the status phys address. Caller must keep the returned
-    /// `payload` alive until drain completes.
-    pub fn submit_write(
-        &self,
-        sector: u64,
-        data: &[u8; 512],
-    ) -> Result<(u16, DmaBuffer, u64), VirtioPciError> {
-        let pool_phys = self.pool.dma_addr().raw();
-        let header_phys = pool_phys;
-        let status_phys = pool_phys + 16;
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
-                BlkHeader {
-                    type_tag: VIRTIO_BLK_T_OUT,
-                    _resv: 0,
-                    sector,
-                },
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
-                0xFFu8,
-            );
-        }
-        let payload =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.dma_addr().raw();
-        // SAFETY: page-sized DMA buffer; copy in caller's data.
-        unsafe {
-            for (i, &byte) in data.iter().enumerate() {
-                core::ptr::write_volatile(payload.cpu_mut_ptr_at::<u8>(i as u64), byte);
-            }
-        }
-        // Write payload is read-only from the device's POV (no
-        // VIRTQ_DESC_F_WRITE on the payload desc).
-        let descs = [
-            VirtqDesc {
-                addr: header_phys,
-                len: 16,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: payload_phys,
-                len: 512,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: status_phys,
-                len: 1,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-        ];
-        let head = {
-            let mut g = self.queue.lock();
-            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
-        };
-        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped notify region.
-        unsafe {
-            self.notify.write16(notify_off, 0);
-        }
-        Ok((head, payload, status_phys))
-    }
-
-    /// Drain a previously submitted write. Returns Ok if the device
-    /// reported success.
-    pub fn drain_write(&self, head: u16, status_phys: u64) -> Result<(), VirtioPciError> {
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
-        // while waiting for our write completion.
-        let mut q_err = false;
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                let elem = {
-                    let mut g = self.queue.lock();
-                    match g.as_mut() {
-                        Some(q) => q.poll_used(),
-                        None => {
-                            q_err = true;
-                            return true;
-                        }
-                    }
-                };
-                matches!(elem, Some((id, _)) if id == head as u32)
-            },
-            narf_time::Deadline::after_ms(1_000),
-        );
-        if q_err {
-            return Err(VirtioPciError::NoQueues);
-        }
-        if !done {
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::QueueTooSmall);
-        }
-        // SAFETY: identity-mapped DMA.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-        };
-        let mut g = self.queue.lock();
-        if let Some(q) = g.as_mut() {
-            q.free_chain(head);
-        }
-        if status != VIRTIO_BLK_S_OK {
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-        Ok(())
-    }
-
-    /// IRQ-driven variant of `read_sector`. Submits the request,
-    /// then polls on `narf_interrupts::fire_count(irq_vector)` —
-    /// the same atomic `wait_for_irq.await` consumes. Falls through
-    /// to the polled `read_sector` if MSI-X isn't enabled yet.
+    /// IRQ-driven variant of `read_sector`: the same queued request, whose
+    /// wait parks on the queue's MSI-X vector when one is bound (and polls
+    /// the used ring otherwise).
     pub fn read_sector_irq(&self, sector: u64, out: &mut [u8; 512]) -> Result<(), VirtioPciError> {
-        let v = match self.irq_vector {
-            Some(v) => v,
-            None => return self.read_sector(sector, out),
-        };
-        // Build header.
-        let pool_phys = self.pool.dma_addr().raw();
-        let header_phys = pool_phys;
-        let status_phys = pool_phys + 16;
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
-                BlkHeader {
-                    type_tag: VIRTIO_BLK_T_IN,
-                    _resv: 0,
-                    sector,
-                },
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
-                0xFFu8,
-            );
-        }
-        let payload =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.dma_addr().raw();
-        // SAFETY: page-sized.
-        unsafe {
-            for i in 0..512usize {
-                core::ptr::write_volatile(payload.cpu_mut_ptr_at::<u8>(i as u64), 0);
-            }
-        }
-        let descs = [
-            VirtqDesc {
-                addr: header_phys,
-                len: 16,
-                flags: 0,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: payload_phys,
-                len: 512,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-            VirtqDesc {
-                addr: status_phys,
-                len: 1,
-                flags: VIRTQ_DESC_F_WRITE,
-                next: 0,
-            },
-        ];
-
-        let _ = v; // fire_count is observed by the caller, not here.
-        let head = {
-            let mut g = self.queue.lock();
-            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
-        };
-
-        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped notify region.
-        unsafe {
-            self.notify.write16(notify_off, 0);
-        }
-
-        // Wait for the used ring to surface our head. We don't break
-        // on `fire_count > baseline` — a stale or coalesced MSI-X
-        // delivery (from a prior submission, an enable-interrupts
-        // bookkeeping race, etc.) can advance fire_count *before* the
-        // device actually completes this request. The IRQ will still
-        // fire during this poll (MSI-X is wired), so the caller's
-        // post-submit fire_count check still observes the wakeup.
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive.
-        let mut q_err = false;
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                let elem = {
-                    let mut g = self.queue.lock();
-                    match g.as_mut() {
-                        Some(q) => q.poll_used(),
-                        None => {
-                            q_err = true;
-                            return true;
-                        }
-                    }
-                };
-                matches!(elem, Some((id, _)) if id == head as u32)
-            },
-            narf_time::Deadline::after_ms(1_000),
-        );
-        if q_err {
-            return Err(VirtioPciError::NoQueues);
-        }
-        if !done {
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::QueueTooSmall);
-        }
-        // SAFETY: identity-mapped DMA.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
-        };
-        if status != VIRTIO_BLK_S_OK {
-            let mut g = self.queue.lock();
-            if let Some(q) = g.as_mut() {
-                q.free_chain(head);
-            }
-            return Err(VirtioPciError::DeviceRejectedFeatures);
-        }
-        // The completion check above makes the device's writes visible;
-        // fence so the bulk copy cannot be hoisted above it.
-        compiler_fence(Ordering::Acquire);
-        // SAFETY: identity-mapped DMA page of at least `out.len()` bytes,
-        // separately allocated so it cannot overlap `out`. Bulk copy rather
-        // than a per-byte volatile loop — see `read_sectors`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(payload.cpu_ptr::<u8>(), out.as_mut_ptr(), out.len());
-        }
-        let mut g = self.queue.lock();
-        if let Some(q) = g.as_mut() {
-            q.free_chain(head);
-        }
-        let _ = payload;
-        Ok(())
+        self.read_sectors(sector, 1, out)
     }
 }
 
-/// Async, IRQ-driven 512-byte read from `sector`. Submits the
-/// request against the singleton CONTROLLER, awaits MSI-X delivery
-/// via [`narf_interrupts::wait_for_irq_until`], drains the used
-/// ring, and returns the device-written data.
-///
-/// The IRQ wait is bounded by a 5-second deadline. Typical virtio-
-/// blk completions land in microseconds; this is the "device
-/// wedged / lost MSI / EC quirk" fallback. On expiry we surface
-/// `CompletionTimeout` so the upper layer can retry or abandon.
+/// Async, IRQ-driven 512-byte read from `sector`: one queued request on
+/// the singleton controller, awaited beside every other request in flight.
 pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciError> {
-    let vector = {
+    let mq = {
         let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
-        c.irq_vector
+        alloc::sync::Arc::clone(c.mq())
     };
-    // Construct waiter BEFORE submit so a synchronously-delivered
-    // MSI-X (QEMU completes virtio-blk reads inline) can't slip past
-    // us — the future's baseline is the pre-submit fire_count.
-    let waiter = vector
-        .map(|v| narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000)));
-    let (head, payload, status_phys, payload_phys) = {
-        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
-        c.submit_read(sector)?
-    };
-    if let Some(w) = waiter {
-        // Outer Result is the timeout (Err = Elapsed); inner is the
-        // IRQ future's own output. We only care that the IRQ fired
-        // OR that the deadline expired.
-        if w.await.is_err() {
-            return Err(VirtioPciError::CompletionTimeout);
-        }
-    }
+    let payload = alloc::sync::Arc::new(
+        alloc_coherent(512, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?,
+    );
+    let status = crate::blk_mq::submit_async(
+        mq,
+        crate::blk_mq::BlkOp::Read,
+        sector,
+        Some(alloc::sync::Arc::clone(&payload)),
+        512,
+    )
+    .await?;
+    crate::blk_mq::ok(status)?;
+    compiler_fence(Ordering::Acquire);
     let mut out = [0u8; 512];
-    let r = {
-        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
-        c.drain_read(head, status_phys, payload_phys, &mut out)
-    };
-    drop(payload);
-    r.map(|()| out)
+    // SAFETY: a live 512-byte coherent buffer the device finished writing.
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload.cpu_ptr::<u8>(), out.as_mut_ptr(), 512);
+    }
+    Ok(out)
 }
 
 /// Async, IRQ-driven 512-byte write to `sector`. Mirrors
-/// [`read_sector_irq_async`] — see that doc for the protocol and
-/// the 5-second wait deadline.
+/// [`read_sector_irq_async`].
 pub async fn write_sector_irq_async(sector: u64, data: [u8; 512]) -> Result<(), VirtioPciError> {
-    let vector = {
+    let mq = {
         let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
-        c.irq_vector
+        alloc::sync::Arc::clone(c.mq())
     };
-    let waiter = vector
-        .map(|v| narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(5_000)));
-    let (head, payload, status_phys) = {
-        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
-        c.submit_write(sector, &data)?
-    };
-    if let Some(w) = waiter {
-        if w.await.is_err() {
-            return Err(VirtioPciError::CompletionTimeout);
-        }
+    let payload =
+        alloc_coherent(512, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+    // SAFETY: fresh 512-byte coherent buffer, pinned by the request.
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), payload.cpu_mut_ptr::<u8>(), 512);
     }
-    let r = {
-        let (_gate, c) = probed_device().ok_or(VirtioPciError::NoQueues)?;
-        c.drain_write(head, status_phys)
-    };
-    drop(payload);
-    r
+    compiler_fence(Ordering::Release);
+    let status = crate::blk_mq::submit_async(
+        mq,
+        crate::blk_mq::BlkOp::Write,
+        sector,
+        Some(alloc::sync::Arc::new(payload)),
+        512,
+    )
+    .await?;
+    crate::blk_mq::ok(status)
 }
 
 // ── Driver-match registration ────────────────────────────────────────
@@ -1537,37 +649,32 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         if out.len() < need {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        // Interrupts stay enabled for the whole transfer: hold the device's
-        // request gate, not the IRQ-masking CONTROLLER lock. See `ReqGate`.
-        let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        {
-            // Batch one 4 KiB page per virtio round-trip.
-            let mut done: u16 = 0;
-            while done < n_blocks {
-                let want = core::cmp::min(MAX_READ_SECTORS, n_blocks - done);
-                let off = done as usize * 512;
-                let chunk = match dev.read_sectors(
-                    lba + done as u64,
-                    want,
-                    &mut out[off..off + want as usize * 512],
-                ) {
-                    Ok(()) => want,
-                    Err(_) if want > 8 => {
-                        let small = 8u16.min(n_blocks - done);
-                        dev.read_sectors(
-                            lba + done as u64,
-                            small,
-                            &mut out[off..off + small as usize * 512],
-                        )
-                        .map_err(|_| narf_block::BlockIoError::DriverError)?;
-                        small
-                    }
-                    Err(_) => return Err(narf_block::BlockIoError::DriverError),
-                };
-                done += chunk;
-            }
-            Ok(())
+        // The gate is held only to reach the device; the transfer itself
+        // waits on its own queued request, beside everyone else's.
+        let dev = probed_device_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let mut done: u16 = 0;
+        while done < n_blocks {
+            let want = core::cmp::min(MAX_IO_SECTORS, n_blocks - done);
+            let off = done as usize * 512;
+            dev.read_sectors(
+                lba + done as u64,
+                want,
+                &mut out[off..off + want as usize * 512],
+            )
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            done += want;
         }
+        Ok(())
+    }
+    /// The queued request path (see [`crate::blk_mq`]): what `SyncBlock`
+    /// submits through, many requests in flight at once.
+    fn queue(&self) -> Option<alloc::sync::Arc<dyn narf_block::BlockQueue>> {
+        probed_device_ref().map(|dev| {
+            alloc::sync::Arc::new(crate::blk_mq::VirtioBlkQueue::new(
+                alloc::sync::Arc::clone(dev.mq()),
+                dev.flush_supported(),
+            )) as alloc::sync::Arc<dyn narf_block::BlockQueue>
+        })
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         if n_blocks == 0 {
@@ -1580,17 +687,22 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         if lba.checked_add(u64::from(n_blocks)).is_none() {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
-        // Same reasoning as `read` above.
-        let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        dev.write_sectors(lba, &data[..need])
-            .map_err(|_| narf_block::BlockIoError::DriverError)
+        let dev = probed_device_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let mut done = 0usize;
+        while done < need {
+            let n = (need - done).min(MAX_IO_SECTORS as usize * 512);
+            dev.write_sectors(lba + (done / 512) as u64, &data[done..done + n])
+                .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            done += n;
+        }
+        Ok(())
     }
     /// Drain the device write cache via T_FLUSH when negotiated
     /// (#841). A failed flush surfaces as `DriverError`, never as
     /// silent success — the SyncBlock Flush advertisement is only
     /// honest if this is real.
     fn flush(&self) -> Result<(), narf_block::BlockIoError> {
-        let (_gate, dev) = probed_device().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let dev = probed_device_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         dev.flush_cache()
             .map_err(|_| narf_block::BlockIoError::DriverError)
     }
@@ -1741,6 +853,18 @@ fn probed_device() -> Option<(ReqGate<'static>, &'static VirtioBlkPci)> {
     Some((gate, unsafe { &*slot.dev.get() }))
 }
 
+/// The installed controller for the data path, without the gate. Sound
+/// because the only `&mut` into the cell (`with_controller_mut`,
+/// `enable_msix_for_probed`) exists under the gate and is used only before
+/// the controller serves I/O (MSI-X enable at probe / in a smoke before its
+/// transfers); the data path reads `mq` (an `Arc`) and the negotiated
+/// flags, which those paths never change.
+fn probed_device_ref() -> Option<&'static VirtioBlkPci> {
+    let slot = probed_slot()?;
+    // SAFETY: see above.
+    Some(unsafe { &*slot.dev.get() })
+}
+
 /// The installed controller's address, or `None` before probe. Test hook
 /// for the install-once invariant `with_device_unlocked` relies on.
 #[doc(hidden)]
@@ -1769,10 +893,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: caller-authority, exclusive ownership of the device's
     // cfg + BAR windows for the duration of bring_up.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let dev = match unsafe { VirtioBlkPci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { VirtioBlkPci::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    // MSI-X-driven completions (Linux `virtblk_probe` → `init_vq` with
+    // per-queue vectors); the polled path remains the fallback.
+    // SAFETY: caller-authority over the device, exclusive before install.
+    let _ = unsafe { dev.enable_msix(&cap, &device) };
     // Leak the slot: an in-flight transfer may hold a reference into it,
     // and freeing that under a live guard would be a use-after-free
     // reachable only under load. `probe` early-returns when a controller
