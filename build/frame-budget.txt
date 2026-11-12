@@ -1,0 +1,164 @@
+# Kernel functions whose stack frame exceeds the 8 KiB budget
+# (build/xtask/src/frame_budget.rs). <bytes> <function>. This list
+# may only shrink: lower an entry when its frame shrinks, remove it
+# when the function fits. Regenerate: NARF_FRAME_BUDGET_WRITE=1.
+31416 narf_drivers_wireless::ath11k::runtime::Shared<Io,Irq,Q>::rebuild_after_transport_reset::{{closure}}
+30840 narf_drivers_wireless::iwlwifi::bootstrap::schedule::{{closure}}
+30744 narf_drivers_wireless::iwlwifi::bootstrap::Owner::start::{{closure}}
+29816 narf_drivers_wireless::iwlwifi::device::dhcp_composition::Guard::build_native_wide
+29784 narf_drivers_wireless::ath11k::ahb_live::crash_monitor_task::{{closure}}
+29672 narf_drivers_wireless::rtl8xxxu::interface::interface_power::<impl narf_drivers_wireless::rtl8xxxu::interface::Device<C,B,E>>::request_admin::{{closure}}
+29480 narf_drivers_wireless::ath11k::runtime::start_ahb
+29096 narf_drivers_wireless::rtl8xxxu::receive_runtime::receive_retune::<impl narf_drivers_wireless::rtl8xxxu::receive_runtime::Receiver<C,B>>::restore_channel::{{closure}}
+28824 <core::slice::iter::Iter<T> as core::iter::traits::iterator::Iterator>::all
+28248 narf_drivers_wireless::iwlwifi::mvm_device::p2p::<impl narf_drivers_wireless::iwlwifi::mvm_device::Device>::p2p_begin_locked::{{closure}}
+27416 narf_drivers_wireless_mt76::mt7921::firmware_transport::provision_radio_inner::{{closure}}
+27272 narf_drivers_wireless_mt76::mt7921::firmware_transport::retire_for_removal::{{closure}}
+27256 narf_drivers_wireless_mt76::mt7921::firmware_transport::retire_for_removal
+27224 narf_drivers_wireless_mt76::mt7921::firmware_transport::KeyWork<T>::prepare
+26728 <narf_drivers_wireless::iwlwifi::device::dhcp_composition::Guard as core::ops::drop::Drop>::drop
+26440 narf_drivers_gpu::amdgpu_navi48_platform::present_damaged
+26264 <narf_drivers_wireless::ath11k::future_heap::HeapFuture<F> as core::future::future::Future>::poll
+25688 narf_drivers_wireless::rtw89::bootstrap::Bootstrap::generation::{{closure}}
+25608 narf_drivers_gpu::amdgpu_navi48_platform::kick_presenters
+24888 narf_drivers_gpu::amdgpu_navi48_boot::modeset::planes::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::update_display_planes::{{closure}}
+24664 narf_drivers_gpu::amdgpu_navi48_platform::restore_displays
+24648 narf_drivers_wireless::cyw43439::interface::attach_runtime::{{closure}}
+24168 narf_drivers_gpu::amdgpu_navi48_platform::request_display_cursor_content
+24152 narf_drivers_gpu::amdgpu_navi48_platform::defer_scanout_cursor
+24152 narf_drivers_gpu::amdgpu_navi48_platform::kick_display_clients
+23992 narf_drivers_wireless::rtw89::efuse_be::BeFactory::read
+23976 narf_drivers_wireless::rtw89::efuse_be::read_factory
+23928 narf_drivers_wireless::iwlwifi::mvm_boot::station::<impl narf_drivers_wireless::iwlwifi::mvm_boot::Owner>::station_join::{{closure}}
+22824 narf_drivers_gpu::amdgpu_navi48_boot::fams2::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::disable_display_fams2::{{closure}}
+22792 <narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot as narf_drivers_gpu::amdgpu_navi48_boot::bandwidth::UclkPin>::disable_fams2::{{closure}}
+21928 narf_drivers_wireless::ath11k::pci::probe
+21720 narf_drivers_wireless::ath10k::pci::probe
+21368 narf_drivers_wireless::ath10k::pci::queue_recovery::{{closure}}
+21240 narf_drivers_wireless::ath10k::pci::restart_parked
+20968 narf_drivers_wireless::rtlwifi::pci::probe
+20552 narf_drivers_gpu::amdgpu::claim_navi48
+20472 narf_drivers_wireless::iwlwifi::device::dhcp_composition::check
+20168 narf_drivers_wireless::ath11k::iface::pci_virtual_create
+20000 narf_drivers_wireless::rtw89::bootstrap::attach_cold
+19848 narf_drivers_wireless::iwlwifi::device::dhcp_composition::composition
+19240 narf_fb::amdgpu_boot::bring_up_navi48
+19192 narf_drivers_wireless::iwlwifi::device::dhcp_composition::run
+19112 narf_drivers_gpu::amdgpu_navi48_platform::restart::{{closure}}
+18808 narf_drivers_wireless::iwlwifi::mvm_device::ap::<impl narf_drivers_wireless::iwlwifi::mvm_device::Device>::apply_ap::{{closure}}
+18408 narf_drivers_wireless::ath11k::iface::register_ahb
+18392 narf_drivers_gpu::amdgpu_navi48_platform::status
+18280 <narf_drivers_gpu::amdgpu_navi48_boot::Hardware as narf_drivers_gpu::amdgpu_navi48_boot::Backend>::step::{{closure}}
+18008 <narf_drivers_wireless::iwlwifi::device::Device as narf_wireless::WirelessNetIface>::roam::{{closure}}
+17848 narf_drivers_wireless::rtlwifi::prepare_native::prepare_rtl8192ee::{{closure}}
+17624 narf_drivers_gpu::amdgpu_navi48_boot::modeset::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::light_inner::{{closure}}
+17496 narf_drivers_gpu::amdgpu_rdna2_modeset::multi::Group::bring_up::{{closure}}
+16632 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::after_reset
+16520 narf_drivers_gpu::amdgpu_navi48_boot::modeset::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::retain_retrained_modeset
+16472 narf_userspace::abi_test_support::with_setup
+16384 narf_drivers_gpu::amdgpu_rdna2_platform::monitor_pass::{{closure}}
+16264 narf_drivers_gpu::amdgpu_rdna2_platform::light::{{closure}}
+16072 narf_capabilities::Cap<T,R>::invoke
+16000 narf_drivers_wireless::rtlwifi::prepare::station::<impl narf_drivers_wireless::rtlwifi::prepare::Prepared<I,M>>::connect_station::{{closure}}::{{closure}}
+15784 narf_drivers_gpu::amdgpu_navi48_platform::presenter::{{closure}}
+15784 narf_drivers_gpu::amdgpu_rdna2_modeset::multi::Group::new
+15608 narf_drivers_gpu::amdgpu_navi48_boot::mst::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::mst_affected_streams
+15528 narf_drivers_gpu::amdgpu_navi48_boot::mst::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::service_display_mst::{{closure}}
+15192 narf_drivers_gpu::amdgpu_navi48_boot::fams2::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::configure_fams2::{{closure}}
+15176 narf_drivers_wireless::rtlwifi::prepare_native::initialize_registered_on_channel::{{closure}}
+15144 <core::iter::adapters::map::Map<I,F> as core::iter::traits::iterator::Iterator>::fold
+15144 narf_drivers_wireless_mt76::iface::p2p::P2pDeviceIface::request::{{closure}}
+15112 narf_drivers_gpu::amdgpu_navi48_boot::modeset::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::running_pstate
+15080 <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter
+14696 <narf_drivers_wireless_mt76::iface::p2p::P2pDeviceIface as narf_wireless::WirelessNetIface>::mgmt_tx_radio_async::{{closure}}
+14664 narf_drivers_wireless::ath9k::ar9300_owner::compose
+14648 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::start_display_scanout::{{closure}}
+14600 narf_drivers_gpu::amdgpu_navi48_platform::kick_lfc_service::{{closure}}
+14472 narf_drivers_wireless_mt76::iface::ap::<impl narf_drivers_wireless_mt76::iface::Mt76Iface>::poll_ap::{{closure}}
+14424 narf_drivers_wireless_mt76::iface::Mt76Iface::poll_data::{{closure}}
+14408 narf_drivers_gpu::amdgpu_mes12_hw::Engine<I>::start::{{closure}}
+14408 narf_drivers_gpu::amdgpu_navi48_platform::publish_console
+14408 narf_drivers_wireless::rtl8xxxu::rtl8xxxu_probe::{{closure}}
+14384 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::scanout::<impl narf_drivers_gpu::amdgpu_dcn401_otg::Otg>::scanout_framebuffer
+14376 narf_drivers_wireless::ath11k::ahb_probe::ahb_dt_probe
+14352 <narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot as narf_drivers_gpu::amdgpu_navi48_boot::teardown::Backend>::completed
+14352 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::display_scanout_framebuffer
+14352 narf_drivers_gpu::amdgpu_navi48_boot::modeset::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::refresh_pstate
+14344 narf_drivers_wireless::rtlwifi::prepare_native::prepare_rtl8723be::{{closure}}
+14336 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::display_status
+14072 narf_drivers_wireless_mt76::mt7921::firmware_transport::boot_p2p::maintenance::{{closure}}::{{closure}}::{{closure}}
+14040 narf_drivers_wireless_mt76::mt7921::pci::claim_firmware_transport
+14024 narf_drivers_wireless_mt76::iface::ap::<impl narf_drivers_wireless_mt76::iface::Mt76Iface>::ap_request::{{closure}}
+13976 narf_drivers_gpu::intel_gpu_gt_runtime::Owner::service_media_guc
+13976 narf_drivers_wireless_mt76::mt7921::firmware_transport::boot_ap::request::{{closure}}::{{closure}}
+13912 <narf_drivers_wireless::Mt76SystemPm as narf_power::system_pm::AsyncSystemPm>::prepare_suspend_target::{{closure}}
+13848 narf_time::timer::timers_prepare_cpu
+13816 narf_drivers_wireless_mt76::mt7921::firmware_transport::boot_p2p::management_tx::transmit::{{closure}}::{{closure}}::{{closure}}
+13800 narf_drivers_wireless_mt76::mt7921::firmware_transport::boot_ap::cleanup::{{closure}}::{{closure}}::{{closure}}
+13792 narf_drivers_wireless_mt76::mt7921::firmware_transport::hardware::Transport::new
+13768 <narf_drivers_wireless_mt76::iface::p2p::P2pDeviceIface as narf_wireless::WirelessNetIface>::delete_control_interface_async::{{closure}}
+13752 narf_drivers_wireless_mt76::mt7921::firmware_transport::boot_p2p::delete::{{closure}}::{{closure}}
+13720 <narf_drivers_wireless_mt76::iface::p2p::P2pDeviceIface as narf_wireless::WirelessNetIface>::register_mgmt_frame_radio_async::{{closure}}
+13672 narf_drivers_wireless_mt76::iface::Mt76Iface::finish_teardown::{{closure}}
+13672 narf_drivers_wireless_mt76::mt7921::firmware_transport::boot_p2p::management::register::{{closure}}::{{closure}}::{{closure}}
+13672 narf_drivers_wireless_mt76::mt7921::firmware_transport::boot_p2p::request::{{closure}}::{{closure}}
+13656 narf_drivers_wireless::ath9k::ar5008_owner::compose
+13656 narf_drivers_wireless::ath9k::ar9280_owner::compose
+13656 narf_drivers_wireless::ath9k::ar9287_owner::compose
+13656 narf_drivers_wireless_mt76::mt7921::firmware_transport::reset_boot_transport::{{closure}}
+13656 narf_drivers_wireless_mt76::mt7921::firmware_transport::resume_boot_radio::{{closure}}
+13656 narf_drivers_wireless_mt76::mt7921::firmware_transport::suspend_boot_radio::{{closure}}
+13640 narf_drivers_wireless_mt76::mt7921::firmware_transport::prepare_boot_keys
+13624 narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::plane_update::<impl narf_drivers_gpu::amdgpu_dcn401_otg::fetch::surface::Surfaces>::update_live_planes::{{closure}}::{{closure}}
+13560 narf_drivers_wireless::ath10k::interface::publish_with_mac
+13528 narf_drivers_wireless::iwlwifi::probe
+13144 narf_drivers_wireless::ath11k::iface::register_pci_netdev
+13080 narf_drivers_wireless::iwlwifi::ap_session::Session::prepare_native::{{closure}}
+12424 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::draw_inputs
+12408 narf_scheduler::block_on_inner
+12216 <narf_drivers_gpu::amdgpu_rdna2_boot::Hardware as narf_drivers_gpu::amdgpu_rdna2_boot::Backend>::step::{{closure}}
+12072 narf_drivers_gpu::amdgpu_navi48_boot::modeset::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::start_frl_link::{{closure}}
+11976 narf_drivers_wireless::ath11k::iface::register_pci
+11912 narf_drivers_wireless::ath10k::interface::ap::<impl narf_drivers_wireless::ath10k::interface::Device<T>>::ap_control::{{closure}}
+11640 narf_drivers_wireless::iwlwifi::connection::Connection::associate_links_in_domain::{{closure}}
+11544 <core::pin::Pin<P> as core::future::future::Future>::poll
+11256 alloc::sync::Arc<T,A>::new_cyclic_in
+11032 narf_drivers_gpu::amdgpu_dcn401_otg::dp_phy::training::frontend::video::<impl narf_drivers_gpu::amdgpu_dcn401_otg::Engine<I>>::dp_audio_verify_transport
+10952 <narf_drivers_wireless::rtl8xxxu::interface::Device<C,B,E> as narf_wireless::WirelessNetIface>::associate::{{closure}}
+10952 narf_drivers_gpu::intel_gpu_xelpg_resources::compute_ip_vblank
+10904 narf_drivers_gpu::amdgpu_navi48_platform::converge_streams::{{closure}}
+10776 narf_drivers_wireless::rtl8xxxu::service_runtime::Service<C,B,E>::connect::{{closure}}
+10680 narf_drivers_gpu::intel_gpu_gt_runtime::Owner::cold_start
+10568 narf_drivers_wireless::ath10k::wmi_runtime::data::<impl narf_drivers_wireless::ath10k::wmi_runtime::Radio<T>>::start_data_with_nonce_checked::{{closure}}
+10536 narf_drivers_wireless::ath9k::initialize_owner_inner::{{closure}}
+10504 narf_drivers_wireless::ath9k::reset_owner_geometry_inner::{{closure}}
+10456 narf_drivers_wireless::ath11k::ahb_live::bring_up_task::{{closure}}
+10456 narf_drivers_wireless::rtw89::bootstrap::advance::{{closure}}
+10328 narf_drivers_wireless::iwlwifi::mvm_device::Device::execute::{{closure}}
+10296 narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot::new
+10216 narf_drivers_wireless::rtw89::pci_reset::<impl narf_drivers_wireless::rtw89::startup::Startup>::claim_reset
+10184 narf_drivers_wireless::cyw43439::station::policy::<impl narf_drivers_wireless::cyw43439::station::Station<R>>::initialize_live::{{closure}}
+9696 narf_drivers_qcom_soc::fixtures::run
+9512 narf_drivers_net_igb::igb::vmdq::VtState::set_vf_vlan_admin
+9432 narf_drivers_wireless::ath11k::ahb_live::LiveAhb<E>::core_ready::{{closure}}
+9096 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::admit_config
+9064 narf_drivers_wireless::rtl8xxxu::rtl8xxxu_probe
+9048 narf_drivers_wireless_mt76::mt7921::association::JoinPlan::prepare_native
+9016 <core::future::poll_fn::PollFn<F> as core::future::future::Future>::poll
+9000 narf_drivers_gpu::intel_gpu_gt_runtime::Owner::service_media_guc::{{closure}}
+8984 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prepare_media_transport
+8952 narf_drivers_wireless::brcmfmac::native_runtime::start::{{closure}}
+8888 narf_drivers_gpu::amdgpu_navi48_platform::suspend_gated::{{closure}}
+8872 core::ops::function::FnOnce::call_once
+8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table
+8680 narf_drivers_wireless::cyw43439::bootstrap::probe
+8664 narf_drivers_wireless::iwlwifi::device::ap::<impl narf_drivers_wireless::iwlwifi::device::Device>::ap_control::{{closure}}
+8648 <narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot as narf_drivers_gpu::amdgpu_navi48_boot::teardown::Backend>::step::{{closure}}
+8632 narf_drivers_wireless::rtw88::system_pm_native::Native::resume_cold::{{closure}}
+8576 narf_userspace::sysvipc::sys_msgget
+8456 narf_drivers_gpu::amdgpu_dcn401_dml::pstate::subvp::admit_subvp
+8440 narf_drivers_gpu::amdgpu_vcn_navi48::av1_320_words::keyframe_message
+8376 narf_drivers_gpu::intel_gpu_xelpg_external::MtlExternalService::connect_output
+8360 narf_userspace::abi_test_support::with_memfs
+8296 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prove_media_transport::{{closure}}::{{closure}}
+8296 narf_memory::compress::lz4_encode
