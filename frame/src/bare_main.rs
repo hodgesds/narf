@@ -4822,30 +4822,45 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     );
                 }
             }
-            // Run stages one at a time.
-            for s in narf_init::Stage::ALL {
-                if (s as u8) > (last_stage as u8) {
-                    break;
-                }
-                let _ = narf_init::run_stage(s);
-                // The boot stack runs every initcall. One that reached past its
-                // bottom is named here, before what lies below is relied on.
-                #[cfg(target_arch = "aarch64")]
-                {
-                    let stack = aarch64::boot_stack::usage();
-                    if stack.guard_written != 0 {
-                        panic!(
-                            "boot stack overflow in init stage {}: {} of {} bytes used, \
+            // Run the initcalls on a kernel init stack, not on the boot
+            // stack: Linux runs `do_initcalls` in the `kernel_init` kthread.
+            // The boot stack is fixed and, on aarch64, sits next to the boot
+            // page tables; the init stack is an ordinary kernel-task stack
+            // with its canary (and the guard page once task stacks are
+            // vmapped), its depth measured. Still synchronous: the stages run
+            // on this CPU, in order, before boot continues.
+            const INIT_STACK_BYTES: usize = 128 * 1024;
+            let init_depth =
+                narf_scheduler::stackful::run_on_kernel_stack(INIT_STACK_BYTES, move || {
+                    // Run stages one at a time.
+                    for s in narf_init::Stage::ALL {
+                        if (s as u8) > (last_stage as u8) {
+                            break;
+                        }
+                        let _ = narf_init::run_stage(s);
+                        // The boot stack runs every initcall. One that reached past its
+                        // bottom is named here, before what lies below is relied on.
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            let stack = aarch64::boot_stack::usage();
+                            if stack.guard_written != 0 {
+                                panic!(
+                                    "boot stack overflow in init stage {}: {} of {} bytes used, \
                              {} guard words written, lowest at phys {:#x?}",
-                            s.name(),
-                            stack.used,
-                            stack.size,
-                            stack.guard_written,
-                            stack.lowest_written
-                        );
+                                    s.name(),
+                                    stack.used,
+                                    stack.size,
+                                    stack.guard_written,
+                                    stack.lowest_written
+                                );
+                            }
+                        }
                     }
-                }
-            }
+                });
+            let _ = writeln!(
+                console::Writer,
+                "  init stack: {init_depth} of {INIT_STACK_BYTES} bytes used by the initcalls"
+            );
             let _ = narf_init::print_summary(&mut console::Writer);
             #[cfg(target_arch = "aarch64")]
             {

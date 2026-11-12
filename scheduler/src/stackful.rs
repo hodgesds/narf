@@ -731,6 +731,65 @@ where
     false
 }
 
+/// Run `f` to completion on a fresh `stack_bytes` kernel stack, on this CPU,
+/// before returning — the boot CPU's `kernel_init`.
+///
+/// Linux runs `do_initcalls` in the `kernel_init` kthread, on an ordinary
+/// kernel-thread stack, never on the boot CPU's bootstrap stack: that stack is
+/// fixed, small, and sits next to boot data (here, on aarch64, the boot page
+/// tables — an initcall that overran it cleared kernel-image L2 descriptors).
+/// This gives the initcalls the same kind of stack a kernel task gets, from
+/// the same allocator — with its overflow canary, and the guard page once
+/// task stacks are vmapped — and its depth is measured.
+///
+/// It is not an executor task: `CURRENT_TASK` stays 0, so the `block_on`
+/// family remains usable exactly as on the caller's stack, and the boot
+/// sequence stays synchronous. Preemption is off, as it is for the caller. If
+/// the body parks its continuation (a sync wait inside), the continuation is
+/// simply resumed again until it completes.
+///
+/// Returns the deepest the body went, in bytes from the stack top (measured
+/// from paint laid below the initial frame).
+///
+/// # Panics
+/// If the body overran the stack's canary (`check_stack_canary`).
+pub fn run_on_kernel_stack<F>(stack_bytes: usize, f: F) -> usize
+where
+    F: FnOnce() + Send + 'static,
+{
+    const PAINT: u8 = 0xA5;
+    // The initial frame `KernelTask` builds lives in the top page.
+    const FRAME_RESERVE: usize = 4096;
+    let mut body = Some(f);
+    let mut task = KernelTask::with_stack_size(
+        core::future::poll_fn(move |_| {
+            if let Some(f) = body.take() {
+                f();
+            }
+            Poll::Ready(())
+        }),
+        stack_bytes,
+    );
+    task.set_no_preempt(true);
+    let paint_from = STACK_CANARY_WORDS * 8;
+    let paint_to = task.stack.len().saturating_sub(FRAME_RESERVE);
+    if paint_from < paint_to {
+        task.stack[paint_from..paint_to].fill(PAINT);
+    }
+    let mut exec_ctx = KernelContext::default();
+    let waker = KernelTask::no_op_waker();
+    // SAFETY: the task and context are owned here and polled by no one else.
+    while unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } != Poll::Ready(()) {
+        core::hint::spin_loop();
+    }
+    task.check_stack_canary();
+    let untouched = task.stack[paint_from..paint_to]
+        .iter()
+        .take_while(|byte| **byte == PAINT)
+        .count();
+    task.stack.len() - paint_from - untouched
+}
+
 /// The current stackful task's kernel stack as `(bottom, top)`, or `None`
 /// when this CPU is not running one (the executor's own stack, or before the
 /// first switch-in).
