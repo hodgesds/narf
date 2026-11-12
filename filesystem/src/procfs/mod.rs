@@ -2946,8 +2946,9 @@ fn page_cache_stats() -> PageCacheStats {
 
 /// Where every allocator-managed page is, in kB: Linux's `/proc/meminfo`
 /// split, with NARF lines for what Linux has no field for. The disjoint
-/// parts (`Cached`, `AnonPages`, `Slab`, `KernelStack`, `NarfStackCache`,
-/// `PageTables`, `NarfUnaccounted`) sum to `MemTotal - MemFree`;
+/// parts (`Reserved`, `Cached`, `AnonPages`, `Slab`, `KernelStack`,
+/// `NarfStackCache`, `PageTables`, `NarfUnaccounted`) sum to
+/// `MemTotal - MemFree`;
 /// `NarfUnaccounted` is the remainder no counter claims yet, so a growing
 /// value names a missing counter instead of hiding it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3007,8 +3008,12 @@ pub fn mem_breakdown() -> MemBreakdown {
         shrinkable_kb: narf_memory::reclaim::shrinkable_pages() as u64 * 4,
         user_charged_kb,
     };
+    // `MemTotal` counts boot-reserved frames (kernel image, firmware and
+    // excluded ranges) that the buddy never manages; they are a part of
+    // their own, not unaccounted memory.
     m.unaccounted_kb = total_kb
         .saturating_sub(free_kb)
+        .saturating_sub(m.reserved_kb)
         .saturating_sub(m.claimed_kb());
     m
 }
@@ -4113,7 +4118,9 @@ fn smoke_meminfo_breakdown_accounts_every_page() -> TestResult {
     const SLACK_KB: i64 = 1024; // other CPUs keep allocating meanwhile
     let delta = |a: u64, b: u64| b as i64 - a as i64;
     let before = mem_breakdown();
-    if before.free_kb + before.claimed_kb() + before.unaccounted_kb != before.total_kb {
+    if before.free_kb + before.reserved_kb + before.claimed_kb() + before.unaccounted_kb
+        != before.total_kb
+    {
         return TestResult::Fail("meminfo parts do not sum to MemTotal");
     }
     let mut heap: Vec<Vec<u8>> = Vec::new();
