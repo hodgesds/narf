@@ -167,9 +167,12 @@
 //! - This owner has no VIF concept, so the station-mode rule
 //!   that a peer station takes the VIF's main MACID instead
 //!   of a pool MACID (`mac80211.c`, `rtw89_vif_get_main_macid`)
-//!   is not modeled; MLD links take pool MACIDs exactly like
-//!   the single-link owner does. VIF composition (including
-//!   `Prepared` MLD admission) is a follow-up.
+//!   is not modeled here; MLD links take pool MACIDs exactly like
+//!   the single-link owner does. VIF composition lives on the
+//!   Prepared owner (`prepared_8922a::Prepared8922a`): it holds
+//!   the VIF record and admits the TDLS peer at the VIF's main
+//!   MACID via [`admit_with_macid`], and it admits MLDs via
+//!   [`admit_mld`].
 //! - Role-maintain / DMAC / join-info / CAM H2Cs that Linux
 //!   sends around link add/assoc/disconnect are not built
 //!   here: like the single-link owner, this module builds
@@ -431,6 +434,9 @@ pub(super) enum Error {
     LinkNotFound,
     /// A link with this 802.11 link ID is already admitted.
     LinkAlreadyActive,
+    /// Admission at a caller-owned MACID outside the chip's
+    /// 32-slot range (`admit_with_macid`).
+    MacIdOutOfRange,
 }
 
 /// MACID allocator over the chip's station slots
@@ -961,6 +967,30 @@ pub(super) fn admit(
 ) -> Result<Station, Error> {
     let six_ghz = validate(req)?;
     let macid = pool.alloc()?;
+    build_station(factory, facet, req, macid, six_ghz)
+}
+
+/// Admit one EHT station at a caller-owned MACID. The
+/// Prepared owner uses this for the station-mode rule
+/// (Linux `mac80211.c` `__rtw89_ops_sta_add`: a TDLS peer
+/// on a station-mode VIF takes the VIF's main MACID,
+/// `rtw89_vif_get_main_macid`, instead of a pool MACID).
+/// The MACID is NOT allocated from any pool here: the
+/// caller owns it already (the VIF's base slot is marked
+/// used in the shared pool), and the caller releases it by
+/// dropping the VIF, never by freeing this station's
+/// MACID. The request is validated exactly as in
+/// [`admit`]; a refused request consumes nothing.
+pub(super) fn admit_with_macid(
+    factory: &BeFactory,
+    facet: EhtStation,
+    req: &Request,
+    macid: u8,
+) -> Result<Station, Error> {
+    let six_ghz = validate(req)?;
+    if macid as usize >= chip_8922a::SUPPORT_MACID_NUM {
+        return Err(Error::MacIdOutOfRange);
+    }
     build_station(factory, facet, req, macid, six_ghz)
 }
 

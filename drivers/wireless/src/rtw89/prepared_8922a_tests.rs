@@ -11,7 +11,7 @@ use super::mac_pre_init_8922a::{Cid, HalChipVer};
 use super::prepared::{self, Files};
 use super::prepared_8922a::*;
 use super::ra_mask::{EhtCaps, StationCaps};
-use super::station_8922a::{Band, Error as StationError, Request, SixGhzAdmission};
+use super::station_8922a::{Band, Error as StationError, LinkRequest, Request, SixGhzAdmission};
 use super::tx_8922a::{PrepareArgs, DATA_RING_DEPTH};
 use super::txrx_be::{encode_txwd_be, fill_txwd_info_v2, TxwdBeInfo, TxwdInfoV2};
 use alloc::collections::BTreeMap;
@@ -762,4 +762,507 @@ fn smoke_rtw89_prepared_8922a_prepare_data_with_info() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_prepared_8922a_prepare_data_with_info
+);
+
+const MLD_ADDR: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+fn link1_req() -> Request<'static> {
+    Request {
+        peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBC],
+        band: Band::Ghz2,
+        width_mhz: 40,
+        primary: 6,
+        nss: 2,
+        aid: 7,
+        port: 0,
+        ap_mode: false,
+        station_mode: true,
+        eht_support: true,
+        punctured: 0,
+        peer_ies: &[],
+        has_he: true,
+        mgq_rpt_en: false,
+        p2p: false,
+        six_ghz: None,
+    }
+}
+
+fn two_mld_links() -> [LinkRequest<'static>; 2] {
+    [
+        LinkRequest {
+            link_id: 0,
+            req: base_req(),
+        },
+        LinkRequest {
+            link_id: 1,
+            req: link1_req(),
+        },
+    ]
+}
+
+fn link1_caps() -> StationCaps {
+    StationCaps {
+        band: Band::Ghz2,
+        width_mhz: 40,
+        ..eht_caps()
+    }
+}
+
+/// Fresh owner with rings programmed (same pre-init halves +
+/// ring programming as the full-sequence test).
+fn programmed_owner() -> Result<(Prepared8922a, Model), &'static str> {
+    let mut owner = Prepared8922a::new(factory(), 0).map_err(|_| "Prepared8922a::new failed")?;
+    let mut regs = Model::new();
+    owner
+        .pre_init_dma_before_reset(&mut regs, 256, 256)
+        .map_err(|_| "pre_init before_reset failed")?;
+    let mut regs = Model::new().with32(INIT_CFG1, 0).with_bound_clears();
+    owner
+        .pre_init_dma_after_reset(&mut regs)
+        .map_err(|_| "pre_init after_reset failed")?;
+    let tx_phys: [u64; TXCH_NUM] = core::array::from_fn(|i| 0x1_0000 + (i as u64) * 0x800);
+    let rx_phys: [u64; 2] = [0x2_0000, 0x2_1000];
+    owner
+        .program_rings(&mut regs, &tx_phys, &rx_phys, 256, 256)
+        .map_err(|_| "program_rings failed")?;
+    Ok((owner, regs))
+}
+
+fn smoke_rtw89_prepared_8922a_mld_admit() -> TestResult {
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let links = two_mld_links();
+    let base = match owner.admit_mld(MLD_ADDR, &links) {
+        Ok(base) => base,
+        Err(_) => return TestResult::Fail("admit_mld failed"),
+    };
+    if base != 0 {
+        return TestResult::Fail("first MLD base MACID not 0");
+    }
+    let Some(mld) = owner.mld(0) else {
+        return TestResult::Fail("admitted MLD not retained");
+    };
+    if mld.mld_addr != MLD_ADDR
+        || mld.base_macid != 0
+        || mld.aid != 7
+        || mld.port != 0
+        || mld.link_count() != 2
+    {
+        return TestResult::Fail("admitted MLD record mismatch");
+    }
+    // Strided per-link MACIDs + instance indexes.
+    let l0 = match mld.link(0) {
+        Some(v) => v,
+        None => return TestResult::Fail("link 0 missing"),
+    };
+    let l1 = match mld.link(1) {
+        Some(v) => v,
+        None => return TestResult::Fail("link 1 missing"),
+    };
+    if l0.macid() != 0 || l0.index != 0 || l1.macid() != 16 || l1.index != 1 {
+        return TestResult::Fail("per-link MACID/index mismatch");
+    }
+    if mld.designated_link().map(|link| link.link_id) != Some(0) {
+        return TestResult::Fail("designated link must be link 0");
+    }
+    // Per-link TXWD EHT fields.
+    if owner.txwd_info_eht_mld(0, 0) != Some((0, 0))
+        || owner.txwd_info_eht_mld(0, 1) != Some((0, 0))
+    {
+        return TestResult::Fail("per-link TXWD EHT fields mismatch");
+    }
+    if owner.txwd_info_eht_mld(0, 9).is_some() || owner.txwd_info_eht_mld(9, 0).is_some() {
+        return TestResult::Fail("unknown MLD/link must have no TXWD fields");
+    }
+    // Per-link RA: w0 carries the link MACID (bits 8..16), w3
+    // carries the phy index as band_num (low byte) and the
+    // band (bits 29..31) — link 0: MACID 0, phy 0, 5 GHz;
+    // link 1: MACID 16, phy 1, 2.4 GHz.
+    let ra0 = match owner.station_ra_mld(0, 0, &eht_caps()) {
+        Ok(ra) => ra,
+        Err(_) => return TestResult::Fail("link 0 RA failed"),
+    };
+    if (ra0[0] >> 8) & 0xFF != 0 || ra0[3] & 0xFF != 0 || (ra0[3] >> 29) & 0x3 != 1 {
+        return TestResult::Fail("link 0 RA MACID/phy/band wrong");
+    }
+    let ra1 = match owner.station_ra_mld(0, 1, &link1_caps()) {
+        Ok(ra) => ra,
+        Err(_) => return TestResult::Fail("link 1 RA failed"),
+    };
+    if (ra1[0] >> 8) & 0xFF != 16 || ra1[3] & 0xFF != 1 || (ra1[3] >> 29) & 0x3 != 0 {
+        return TestResult::Fail("link 1 RA MACID/phy/band wrong");
+    }
+    // BA-CAM through the designated link: MLD_EN set,
+    // BAND_SEL clear (link 0, mac_idx 0).
+    let idx = match owner.acquire_bacam_mld(0, 0) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("designated BA-CAM acquire failed"),
+    };
+    if idx != 0 {
+        return TestResult::Fail("designated BA-CAM first slot must be 0");
+    }
+    let h2c = match owner.ba_h2c_mld(0, 0, bacam_v1::bmap_size(64), 0, idx as u32) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("designated BA-CAM H2C failed"),
+    };
+    if h2c.w0 != 0x3 || h2c.w1 != 0x0800_0500 {
+        return TestResult::Fail("MLD BA-CAM H2C golden mismatch");
+    }
+    if owner.release_bacam_mld(0, idx).is_err() {
+        return TestResult::Fail("designated BA-CAM release failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_mld_admit
+);
+
+fn smoke_rtw89_prepared_8922a_mld_data_and_teardown() -> TestResult {
+    let (mut owner, mut regs) = match programmed_owner() {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let links = two_mld_links();
+    if owner.admit_mld(MLD_ADDR, &links) != Ok(0) {
+        return TestResult::Fail("admit_mld failed");
+    }
+    // Data submit to a link MACID is admitted (link 1: 16).
+    let mut body = [0u8; 32];
+    if encode_txwd_be(
+        &TxwdBeInfo {
+            channel: 0,
+            qsel: 0,
+            mac_id: 16,
+            pkt_size: 100,
+        },
+        &mut body,
+    )
+    .is_none()
+    {
+        return TestResult::Fail("encode_txwd_be failed");
+    }
+    let mut bd = vec![TxBd::default(); DATA_RING_DEPTH as usize];
+    let prepared = match owner.prepare_data(PrepareArgs {
+        channel: 0,
+        mac_id: 16,
+        qsel: 0,
+        body: &body,
+        header_dma: 0x20000,
+        frame_dma: 0x10000,
+        frame_len: 100,
+        bd: &mut bd,
+    }) {
+        Ok(prepared) => prepared,
+        Err(_) => return TestResult::Fail("prepare_data to link MACID refused"),
+    };
+    if prepared.header.len() != 46 {
+        return TestResult::Fail("link data header length wrong");
+    }
+    let wp = match owner.kick_data(&mut regs, &prepared) {
+        Ok(wp) => wp,
+        Err(_) => return TestResult::Fail("kick_data to link MACID failed"),
+    };
+    if wp != 1 || regs.regs16.get(&0xB100) != Some(&1) {
+        return TestResult::Fail("kick_data doorbell wrong");
+    }
+    // Per-link teardown: drop link 1, the MLD survives on
+    // link 0 — and its MACID stops admitting data.
+    if owner.release_mld_link(0, 1) != Ok(16) {
+        return TestResult::Fail("link 1 release failed");
+    }
+    if owner.mld(0).is_none_or(|mld| {
+        mld.link_count() != 1 || mld.designated_link().map(|l| l.link_id) != Some(0)
+    }) {
+        return TestResult::Fail("link 1 teardown state mismatch");
+    }
+    let mut bd = vec![TxBd::default(); DATA_RING_DEPTH as usize];
+    if owner
+        .prepare_data(PrepareArgs {
+            channel: 0,
+            mac_id: 16,
+            qsel: 0,
+            body: &body,
+            header_dma: 0x20000,
+            frame_dma: 0x10000,
+            frame_len: 100,
+            bd: &mut bd,
+        })
+        .is_ok()
+    {
+        return TestResult::Fail("prepare_data to released link MACID accepted");
+    }
+    // Re-add link 1 on a new channel: it retakes instance
+    // index 1 and MACID 16.
+    let rejoin = LinkRequest {
+        link_id: 1,
+        req: Request {
+            peer: [0x66, 0x77, 0x88, 0x99, 0xAA, 0xBC],
+            band: Band::Ghz5,
+            width_mhz: 80,
+            primary: 44,
+            ..base_req()
+        },
+    };
+    if owner.add_mld_link(0, &rejoin) != Ok(16) {
+        return TestResult::Fail("link 1 re-add failed");
+    }
+    // Drop link 0: link 1 becomes designated, so the next
+    // BA-CAM H2C carries its MACID and BAND_SEL set.
+    if owner.release_mld_link(0, 0) != Ok(0) {
+        return TestResult::Fail("link 0 release failed");
+    }
+    let idx = match owner.acquire_bacam_mld(0, 0) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("link 1 BA-CAM acquire failed"),
+    };
+    let h2c = match owner.ba_h2c_mld(0, 0, bacam_v1::bmap_size(64), 0, idx as u32) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("link 1 BA-CAM H2C failed"),
+    };
+    if h2c.w0 != 0x1003 || h2c.w1 != 0x0800_0700 {
+        return TestResult::Fail("link 1 BA-CAM H2C golden mismatch");
+    }
+    if owner.release_bacam_mld(0, idx).is_err() {
+        return TestResult::Fail("link 1 BA-CAM release failed");
+    }
+    // Whole-MLD release; the pool is fully reusable.
+    owner.release_mld(0);
+    if owner.mld(0).is_some() {
+        return TestResult::Fail("released MLD still retained");
+    }
+    if owner.admit_station(&base_req()) != Ok(0) {
+        return TestResult::Fail("MACID not returned to the pool");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_mld_data_and_teardown
+);
+
+fn smoke_rtw89_prepared_8922a_mld_refusals() -> TestResult {
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    // Unknown MLD base: every per-link route refuses NoMld;
+    // whole-MLD release is an idempotent no-op.
+    if owner.station_ra_mld(9, 0, &eht_caps()) != Err(Error::NoMld) {
+        return TestResult::Fail("station_ra_mld for unknown MLD accepted");
+    }
+    if owner.acquire_bacam_mld(9, 0) != Err(Error::NoMld) {
+        return TestResult::Fail("acquire_bacam_mld for unknown MLD accepted");
+    }
+    if owner.ba_h2c_mld(9, 0, 0, 0, 0) != Err(Error::NoMld) {
+        return TestResult::Fail("ba_h2c_mld for unknown MLD accepted");
+    }
+    if owner.release_bacam_mld(9, 0) != Err(Error::NoMld) {
+        return TestResult::Fail("release_bacam_mld for unknown MLD accepted");
+    }
+    if owner.txwd_info_eht_mld(9, 0).is_some() {
+        return TestResult::Fail("txwd_info_eht_mld for unknown MLD accepted");
+    }
+    if owner.add_mld_link(9, &two_mld_links()[0]) != Err(Error::NoMld) {
+        return TestResult::Fail("add_mld_link for unknown MLD accepted");
+    }
+    if owner.release_mld_link(9, 0) != Err(Error::NoMld) {
+        return TestResult::Fail("release_mld_link for unknown MLD accepted");
+    }
+    owner.release_mld(9);
+    // Empty link list is refused with no MACID consumed.
+    if owner.admit_mld(MLD_ADDR, &[]) != Err(Error::Station(StationError::NoLinks)) {
+        return TestResult::Fail("empty MLD admission not refused");
+    }
+    let links = two_mld_links();
+    if owner.admit_mld(MLD_ADDR, &links) != Ok(0) {
+        return TestResult::Fail("admit_mld failed");
+    }
+    // Unknown link on a known MLD.
+    if owner.station_ra_mld(0, 9, &eht_caps()) != Err(Error::Station(StationError::LinkNotFound)) {
+        return TestResult::Fail("station_ra_mld for unknown link accepted");
+    }
+    if owner.release_mld_link(0, 9) != Err(Error::Station(StationError::LinkNotFound)) {
+        return TestResult::Fail("release_mld_link for unknown link accepted");
+    }
+    if owner.txwd_info_eht_mld(0, 9).is_some() {
+        return TestResult::Fail("txwd_info_eht_mld for unknown link accepted");
+    }
+    // release_station must not free an MLD link MACID, and
+    // the single-link RA route stays closed to link MACIDs.
+    owner.release_station(16);
+    if owner.mld(0).is_none_or(|mld| mld.link_count() != 2) {
+        return TestResult::Fail("release_station freed an MLD link");
+    }
+    if owner.station_ra(16, &eht_caps()) != Err(Error::NoStation) {
+        return TestResult::Fail("station_ra for a link MACID accepted");
+    }
+    owner.release_mld(0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_mld_refusals
+);
+
+fn smoke_rtw89_prepared_8922a_vif_tdls_peer() -> TestResult {
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    let vif_addr = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let main = match owner.add_vif(vif_addr, VifRole::Station) {
+        Ok(main) => main,
+        Err(_) => return TestResult::Fail("add_vif failed"),
+    };
+    if main != 0 {
+        return TestResult::Fail("first VIF main MACID not 0");
+    }
+    let Some(vif) = owner.vif(0) else {
+        return TestResult::Fail("admitted VIF not retained");
+    };
+    if vif.addr != vif_addr
+        || vif.role != VifRole::Station
+        || vif.main_macid() != 0
+        || vif.main_port() != 0
+    {
+        return TestResult::Fail("VIF record mismatch");
+    }
+    if owner
+        .vif_by_addr(vif_addr)
+        .is_none_or(|v| v.main_macid() != 0)
+    {
+        return TestResult::Fail("vif_by_addr mismatch");
+    }
+    if owner.add_vif(vif_addr, VifRole::Station) != Err(Error::VifExists) {
+        return TestResult::Fail("duplicate VIF address accepted");
+    }
+    // The TDLS peer takes the VIF main MACID, not a pool
+    // MACID — and the next pool station skips it.
+    if owner.admit_tdls_peer(0, &base_req()) != Ok(0) {
+        return TestResult::Fail("admit_tdls_peer failed");
+    }
+    if owner.station(0).is_none_or(|st| st.peer != base_req().peer) {
+        return TestResult::Fail("TDLS peer not retained as station 0");
+    }
+    if owner.admit_station(&base_req()) != Ok(1) {
+        return TestResult::Fail("pool station took the VIF main MACID");
+    }
+    // Releasing the peer drops its record but never frees the
+    // VIF's MACID: the next pool station is 2, not 0.
+    owner.release_station(0);
+    if owner.station(0).is_some() {
+        return TestResult::Fail("released TDLS peer still retained");
+    }
+    if owner.admit_station(&base_req()) != Ok(2) {
+        return TestResult::Fail("peer release freed the VIF main MACID");
+    }
+    // Removing the VIF returns its base to the pool.
+    owner.release_station(1);
+    owner.release_station(2);
+    owner.remove_vif(0);
+    if owner.vif(0).is_some() {
+        return TestResult::Fail("removed VIF still retained");
+    }
+    if owner.admit_station(&base_req()) != Ok(0) {
+        return TestResult::Fail("VIF base MACID not returned to the pool");
+    }
+    // A live TDLS peer dissolves with its VIF.
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    if owner.add_vif(vif_addr, VifRole::Station) != Ok(0) {
+        return TestResult::Fail("add_vif failed");
+    }
+    if owner.admit_tdls_peer(0, &base_req()) != Ok(0) {
+        return TestResult::Fail("admit_tdls_peer failed");
+    }
+    owner.remove_vif(0);
+    if owner.station(0).is_some() || owner.vif(0).is_some() {
+        return TestResult::Fail("VIF removal left its TDLS peer behind");
+    }
+    if owner.admit_station(&base_req()) != Ok(0) {
+        return TestResult::Fail("VIF base MACID not returned to the pool");
+    }
+    // AP-mode VIFs and unknown VIFs refuse the peer; a
+    // wrong-port request refuses too.
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    if owner.add_vif(vif_addr, VifRole::Ap) != Ok(0) {
+        return TestResult::Fail("add_vif failed");
+    }
+    if owner.admit_tdls_peer(0, &base_req()) != Err(Error::NotStationMode) {
+        return TestResult::Fail("TDLS peer on AP-mode VIF accepted");
+    }
+    if owner.admit_tdls_peer(9, &base_req()) != Err(Error::NoVif) {
+        return TestResult::Fail("TDLS peer on unknown VIF accepted");
+    }
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    if owner.add_vif(vif_addr, VifRole::Station) != Ok(0) {
+        return TestResult::Fail("add_vif failed");
+    }
+    let mut wrong_port = base_req();
+    wrong_port.port = 1;
+    if owner.admit_tdls_peer(0, &wrong_port) != Err(Error::PortMismatch) {
+        return TestResult::Fail("wrong-port TDLS peer accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_vif_tdls_peer
+);
+
+fn smoke_rtw89_prepared_8922a_vif_ports() -> TestResult {
+    let mut owner = match Prepared8922a::new(factory(), 0) {
+        Ok(owner) => owner,
+        Err(_) => return TestResult::Fail("Prepared8922a::new failed"),
+    };
+    // Five VIFs take the five hardware ports (mains 0..4).
+    for i in 0..5u8 {
+        let addr = [0x02, 0, 0, 0, 0, i];
+        let main = match owner.add_vif(addr, VifRole::Station) {
+            Ok(main) => main,
+            Err(_) => return TestResult::Fail("add_vif failed"),
+        };
+        if main != i {
+            return TestResult::Fail("VIF main MACID not lowest free");
+        }
+        if owner.vif(i).is_none_or(|v| v.main_port() != i) {
+            return TestResult::Fail("VIF port not lowest free");
+        }
+    }
+    // The sixth VIF has no port: refused, and the MACID its
+    // failed admission allocated is freed again (the next
+    // pool station takes it).
+    if owner.add_vif([0x02, 0, 0, 0, 0, 5], VifRole::Station) != Err(Error::NoPort) {
+        return TestResult::Fail("sixth VIF not refused");
+    }
+    if owner.admit_station(&base_req()) != Ok(5) {
+        return TestResult::Fail("failed VIF admission leaked its MACID");
+    }
+    // Removing a VIF frees its port and base together.
+    owner.release_station(5);
+    owner.remove_vif(2);
+    let main = match owner.add_vif([0x02, 0, 0, 0, 0, 6], VifRole::Station) {
+        Ok(main) => main,
+        Err(_) => return TestResult::Fail("VIF re-add after removal failed"),
+    };
+    if main != 2 || owner.vif(2).is_none_or(|v| v.main_port() != 2) {
+        return TestResult::Fail("removed VIF port/base not reused");
+    }
+    owner.remove_vif(9);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_prepared_8922a_vif_ports
 );

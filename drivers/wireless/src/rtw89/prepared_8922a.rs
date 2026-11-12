@@ -37,8 +37,22 @@
 //!    `kick_h2c` (CH12), then `observe_data_rp` /
 //!    `observe_data_report` for completions.
 //!
+//! MLO composition (see the "MLO model" section below):
+//! `admit_mld` retains `MldStation`s alongside the shared
+//! `MacIdPool`; per-link BA-CAM acquire/H2C/release,
+//! per-link RA (phy index = link instance index), and
+//! per-link TXWD EHT fields route through the designated
+//! link; `release_mld_link` / `release_mld` tear links down
+//! one at a time or whole.
+//!
+//! VIF composition lives here too: `add_vif` holds one VIF
+//! record per interface (main MACID + port, Linux
+//! `rtw89_ops_add_interface` order), and the station-mode
+//! TDLS peer takes the VIF's main MACID (`admit_tdls_peer`)
+//! instead of a pool MACID.
+//!
 //! What this owner deliberately does NOT own (later steps):
-//! - MLO multi-link, legacy-mode admission.
+//! - Legacy-mode admission.
 //! - The register-level 6 GHz TX-power program
 //!   (`rtw8922a_set_txpwr`: by-rate / limit / limit-RU pages on
 //!   BE registers, shape, diff, ref, SAR-diff) and the wide-6 GHz
@@ -48,6 +62,67 @@
 //!   registers.
 //! - Firmware download (`prepared::load` selects the image; the
 //!   download plan + secure loader are a separate lane).
+//! - Link-lifecycle H2Cs (role-maintain / DMAC / join-info /
+//!   CAM around link add/assoc/disconnect, issue #1918): the
+//!   MLD composition here builds CCTL + BA-CAM bodies only,
+//!   like the single-link owner, and never sends them; the
+//!   H2C bodies those lifecycle steps need are a later lane.
+//!
+//! ## MLO model (Linux grounding)
+//!
+//! The MLD model is the station owner's (`station_8922a.rs`,
+//! torvalds/linux master `7475ea8b`); the VIF paths below
+//! were read from current torvalds/linux master
+//! (`drivers/net/wireless/realtek/rtw89`, codebrowser,
+//! November 2026) and carry the line numbers as read there:
+//!
+//! - VIF: `rtw89_ops_add_interface` (`mac80211.c:165`)
+//!   acquires one MACID (`rtw89_acquire_mac_id`, which
+//!   searches only the 16 base slots while MLO is on,
+//!   `core.c:5731`) and one port (bitmap over
+//!   `RTW89_PORT_NUM` = 5, `core.h:592`), then
+//!   `rtw89_init_vif` (`core.c:5755`) precomputes the link
+//!   instances: instance `index` gets
+//!   `mac_id = mac_id + index * support_mld_num` (16),
+//!   `mac_idx = RTW89_MAC_0 + index`,
+//!   `phy_idx = RTW89_PHY_0 + index` (`RTW89_PHY_0` = 0),
+//!   and every instance shares the one port ("multi-link use
+//!   the same port id on different HW bands"). Removal
+//!   (`mac80211.c:239`) releases the main MACID
+//!   (`rtw89_vif_get_main_macid` = `links_inst[0].mac_id`,
+//!   `core.h:6237`) and the main port.
+//! - Station-mode peer: `__rtw89_ops_sta_add`
+//!   (`mac80211.c:479`) takes the VIF's main MACID for a
+//!   TDLS peer on a station-mode VIF ("for station mode,
+//!   assign the mac_id from itself", `mac80211.c:495`);
+//!   every other station acquires a fresh pool MACID. The
+//!   AP peer on a station-mode VIF is therefore a pool
+//!   station, not a VIF-MACID station.
+//! - Per-link RA: `rtw89_phy_ra_sta_update` (`phy.c:498`)
+//!   reports `ra->band_num = rtwvif_link->phy_idx`, and the
+//!   station link is bound to the VIF link instance of the
+//!   same index (`rtw89_init_sta`, `core.c:5790`), so a
+//!   link's RA phy index is its instance index.
+//!
+//! Deliberate differences from Linux:
+//! - The pool keeps the full 32-slot range for single-link
+//!   admission (the station owner's documented difference);
+//!   a VIF reserves only its base slot, not the strided
+//!   `base + 16` slot, so a VIF's second link instance has a
+//!   precomputed identity but no pool reservation yet —
+//!   VIF link setup beyond instance 0 belongs to the
+//!   link-lifecycle lane (#1918).
+//! - A TDLS peer release never frees the VIF's MACID here.
+//!   Linux `__rtw89_ops_sta_remove` (`mac80211.c:622`)
+//!   releases the shared main MACID bit for TDLS peers,
+//!   which would free the VIF's own MACID while the VIF is
+//!   still up; this owner keeps the base reserved until
+//!   `remove_vif`, so a peer release only drops the peer
+//!   record.
+//! - A TDLS MLD (an MLD peer taking the VIF main MACID as
+//!   its base) is not admitted: `admit_mld` always takes
+//!   its base from the pool. That composition is a
+//!   follow-up once a TDLS MLD need is established.
 //!
 //! What this owner DOES own since the remainder lane:
 //! - FWCMD header framing for H2C bodies
@@ -100,7 +175,7 @@ use super::mac_pre_init_8922a::{self, HalChipVer};
 use super::power;
 use super::ra_mask::{self, StationCaps};
 use super::rx_packet::Ack;
-use super::station_8922a::{self, Request, Station};
+use super::station_8922a::{self, LinkRequest, MldStation, Request, Station};
 use super::tx_8922a::{self, H2cPrepared, PrepareArgs, Prepared, Retained, TXWD_INFO_SIZE};
 use super::tx_transport::Completion;
 
@@ -136,6 +211,22 @@ pub(super) enum Error {
     NotProgrammed,
     /// No admitted station owns this MACID.
     NoStation,
+    /// No admitted MLD owns this base MACID.
+    NoMld,
+    /// No VIF owns this main MACID (or address).
+    NoVif,
+    /// A VIF with this address is already admitted.
+    VifExists,
+    /// Out of hardware ports (`RTW89_PORT_NUM` VIFs admitted).
+    NoPort,
+    /// TDLS peer admission on a VIF that is not station-mode
+    /// (Linux `__rtw89_ops_sta_add` takes the VIF main MACID
+    /// only for a TDLS peer on a station-mode VIF).
+    NotStationMode,
+    /// TDLS peer request's port disagrees with its VIF's port
+    /// (Linux programs one port id per VIF into every assoc
+    /// CCTL).
+    PortMismatch,
     /// Out of DMA-coherent memory (ring allocation, header/frame
     /// allocation, or transport-owner construction).
     NoMemory,
@@ -179,6 +270,61 @@ impl From<station_8922a::Error> for Error {
 impl From<ra_mask::Error> for Error {
     fn from(error: ra_mask::Error) -> Self {
         Error::Ra(error)
+    }
+}
+
+/// Hardware port count (`RTW89_PORT_NUM`, Linux `core.h:592`:
+/// `RTW89_PORT_0`..`RTW89_PORT_4`). One port per VIF; all of
+/// a VIF's link instances share it (`rtw89_init_vif`,
+/// `core.c:5755`).
+const RTW89_PORT_NUM: usize = 5;
+
+/// Role of an admitted VIF: the two roles Linux's
+/// station-add/remove paths branch on (`__rtw89_ops_sta_add`
+/// / `__rtw89_ops_sta_remove`, `mac80211.c`). Monitor, P2P,
+/// mesh, and AP-VLAN roles are not modeled: this owner
+/// composes station + AP only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VifRole {
+    /// Station-mode VIF (`NL80211_IFTYPE_STATION`).
+    Station,
+    /// AP-mode VIF (`NL80211_IFTYPE_AP`).
+    Ap,
+}
+
+/// One admitted VIF: its address, role, and the one MACID +
+/// port Linux `rtw89_ops_add_interface` (`mac80211.c:165`)
+/// acquires for it. The main MACID is the base
+/// (`rtw89_vif_get_main_macid` = `links_inst[0].mac_id`,
+/// `core.h:6237`); link instance `index` precomputes
+/// `base + index * MLD_MACID_STRIDE`, `mac_idx = index`,
+/// `phy_idx = index` (`rtw89_init_vif`, `core.c:5755`) —
+/// but only the base slot is reserved in the shared pool
+/// (see the module docs). The VIF owns its base slot until
+/// [`Prepared8922a::remove_vif`]; TDLS peers admitted
+/// against it share the base without owning it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Vif {
+    /// Interface address.
+    pub(super) addr: [u8; 6],
+    /// VIF role.
+    pub(super) role: VifRole,
+    /// Base MACID acquired for this VIF (its main MACID).
+    pub(super) base_macid: u8,
+    /// Hardware port acquired for this VIF.
+    pub(super) port: u8,
+}
+
+impl Vif {
+    /// The VIF's main MACID (`rtw89_vif_get_main_macid`).
+    pub(super) fn main_macid(self) -> u8 {
+        self.base_macid
+    }
+
+    /// The VIF's main port (`rtw89_vif_get_main_port`,
+    /// `core.h:6243`).
+    pub(super) fn main_port(self) -> u8 {
+        self.port
     }
 }
 
@@ -278,6 +424,19 @@ pub(crate) struct Prepared8922a {
     chip_version: u8,
     pool: station_8922a::MacIdPool,
     stations: Vec<Station>,
+    /// Admitted MLD stations, keyed by base MACID
+    /// (`MldStation::base_macid`).
+    mlds: Vec<MldStation>,
+    /// Admitted VIFs, keyed by main MACID
+    /// (`Vif::base_macid`).
+    vifs: Vec<Vif>,
+    /// TDLS peers admitted at a VIF's main MACID: single-link
+    /// station records that share the VIF's base slot without
+    /// owning it (see [`Self::admit_tdls_peer`]).
+    vif_peers: Vec<Station>,
+    /// Hardware ports held by admitted VIFs
+    /// (`RTW89_PORT_NUM` slots, lowest free first).
+    ports_used: [bool; RTW89_PORT_NUM],
     data: tx_8922a::DataTx,
     h2c: tx_8922a::H2cTx,
     rings_programmed: bool,
@@ -330,6 +489,10 @@ impl Prepared8922a {
             chip_version,
             pool: station_8922a::MacIdPool::new(),
             stations: Vec::new(),
+            mlds: Vec::new(),
+            vifs: Vec::new(),
+            vif_peers: Vec::new(),
+            ports_used: [false; RTW89_PORT_NUM],
             data: tx_8922a::DataTx::new()?,
             h2c: tx_8922a::H2cTx::new(tx_8922a::DATA_RING_DEPTH)?,
             rings_programmed: false,
@@ -504,7 +667,7 @@ impl Prepared8922a {
             outcome.work_done += rpq_out.work;
         }
         if events.rx {
-            let admitted: Vec<u8> = self.stations.iter().map(|station| station.macid).collect();
+            let admitted: Vec<u8> = self.admitted_macids();
             let rxq_out = self
                 .completion
                 .drain_rxq(regs, rxq, remaining, &admitted)
@@ -617,14 +780,78 @@ impl Prepared8922a {
         Ok(macid)
     }
 
-    /// Admitted station by MACID, if any.
+    /// Admitted single-link station by MACID, if any: a pool
+    /// station or a VIF TDLS peer (both are plain
+    /// single-link records). MLD links are NOT visible here —
+    /// use [`Self::mld`] + [`MldStation::link`] for those, so
+    /// a link MACID can never take the single-link BA-CAM /
+    /// RA path by accident.
     pub(super) fn station(&self, macid: u8) -> Option<&Station> {
-        self.stations.iter().find(|station| station.macid == macid)
+        self.stations
+            .iter()
+            .chain(self.vif_peers.iter())
+            .find(|station| station.macid == macid)
+    }
+
+    /// Mutable access to an admitted single-link station by
+    /// MACID (pool station or VIF TDLS peer, as in
+    /// [`Self::station`]).
+    fn station_mut(&mut self, macid: u8) -> Option<&mut Station> {
+        if let Some(index) = self
+            .stations
+            .iter()
+            .position(|station| station.macid == macid)
+        {
+            return Some(&mut self.stations[index]);
+        }
+        if let Some(index) = self
+            .vif_peers
+            .iter()
+            .position(|station| station.macid == macid)
+        {
+            return Some(&mut self.vif_peers[index]);
+        }
+        None
+    }
+
+    /// True when `macid` is admitted anywhere on this owner:
+    /// a pool station, a VIF TDLS peer, or any link of any
+    /// admitted MLD. Data submit (`prepare_data`) and the RX
+    /// drain admit on this, not on [`Self::station`] alone,
+    /// so frames to an MLD link MACID are accepted.
+    fn is_admitted(&self, macid: u8) -> bool {
+        self.station(macid).is_some()
+            || self
+                .mlds
+                .iter()
+                .any(|mld| mld.links.iter().flatten().any(|link| link.macid() == macid))
+    }
+
+    /// Every admitted MACID on this owner, for the RX drain's
+    /// admission list: pool stations, VIF TDLS peers, and
+    /// every link of every admitted MLD.
+    fn admitted_macids(&self) -> Vec<u8> {
+        let mut macids: Vec<u8> = self
+            .stations
+            .iter()
+            .chain(self.vif_peers.iter())
+            .map(|station| station.macid)
+            .collect();
+        for mld in &self.mlds {
+            for link in mld.links.iter().flatten() {
+                macids.push(link.macid());
+            }
+        }
+        macids
     }
 
     /// Release a station: its MACID returns to the pool and its
-    /// record is dropped. Idempotent: releasing an unknown MACID
-    /// is a no-op.
+    /// record is dropped — except for a VIF TDLS peer, whose
+    /// record is dropped but whose MACID stays with the VIF
+    /// (see [`Self::admit_tdls_peer`]). Idempotent: releasing
+    /// an unknown MACID is a no-op. Releasing an MLD link
+    /// MACID here is also a no-op: links release through
+    /// [`Self::release_mld_link`] / [`Self::release_mld`].
     pub(super) fn release_station(&mut self, macid: u8) {
         if let Some(index) = self
             .stations
@@ -633,6 +860,14 @@ impl Prepared8922a {
         {
             let station = self.stations.remove(index);
             station.release_macid(&mut self.pool);
+            return;
+        }
+        if let Some(index) = self
+            .vif_peers
+            .iter()
+            .position(|station| station.macid == macid)
+        {
+            self.vif_peers.remove(index);
         }
     }
 
@@ -658,11 +893,7 @@ impl Prepared8922a {
     /// BlockAck session (`BaCam::acquire`); the index feeds
     /// [`Self::ba_h2c`].
     pub(super) fn acquire_bacam(&mut self, macid: u8, tid: u8) -> Result<usize, Error> {
-        let station = self
-            .stations
-            .iter_mut()
-            .find(|station| station.macid == macid)
-            .ok_or(Error::NoStation)?;
+        let station = self.station_mut(macid).ok_or(Error::NoStation)?;
         station
             .bacam
             .acquire(tid)
@@ -689,15 +920,279 @@ impl Prepared8922a {
     /// Release a BA-CAM bitmap slot acquired via
     /// [`Self::acquire_bacam`].
     pub(super) fn release_bacam(&mut self, macid: u8, idx: usize) -> Result<(), Error> {
-        let station = self
-            .stations
-            .iter_mut()
-            .find(|station| station.macid == macid)
-            .ok_or(Error::NoStation)?;
+        let station = self.station_mut(macid).ok_or(Error::NoStation)?;
         station
             .bacam
             .release(idx)
             .map_err(|error| Error::Station(station_8922a::Error::BaCam(error)))
+    }
+
+    // ── MLD composition ──────────────────────────────────────────
+    //
+    // The MLD owner (`station_8922a::admit_mld`) owns the
+    // per-link records; this owner retains them alongside the
+    // shared `MacIdPool` and routes the per-link firmware
+    // artifacts through the designated link, exactly as Linux
+    // builds BA-CAM from the designated link
+    // (`rtw89_fw_h2c_ba_cam_v1`, `fw.c:2922`) and assoc per
+    // link (`__rtw89_ops_sta_assoc`, `mac80211.c`).
+
+    /// Admit one EHT MLD station with the chip-default facet
+    /// (`EhtStation::new_8922ae`), retaining its
+    /// `MldStation` alongside the shared `MacIdPool`.
+    /// Returns the MLD base MACID; link instance `index`
+    /// owns `base + index * MLD_MACID_STRIDE`. The record is
+    /// retained until [`Self::release_mld`]; a refused
+    /// request consumes no MACID.
+    pub(super) fn admit_mld(
+        &mut self,
+        mld_addr: [u8; 6],
+        links: &[LinkRequest<'_>],
+    ) -> Result<u8, Error> {
+        let facet = EhtStation::new_8922ae().ok_or(Error::EhtUnavailable)?;
+        let mld = station_8922a::admit_mld(&self.factory, facet, &mut self.pool, mld_addr, links)?;
+        let base_macid = mld.base_macid;
+        self.mlds.push(mld);
+        Ok(base_macid)
+    }
+
+    /// Admitted MLD by base MACID, if any.
+    pub(super) fn mld(&self, base_macid: u8) -> Option<&MldStation> {
+        self.mlds.iter().find(|mld| mld.base_macid == base_macid)
+    }
+
+    /// Mutable access to an admitted MLD by base MACID.
+    fn mld_mut(&mut self, base_macid: u8) -> Option<&mut MldStation> {
+        self.mlds
+            .iter_mut()
+            .find(|mld| mld.base_macid == base_macid)
+    }
+
+    /// Admit one more link to an admitted MLD (Linux
+    /// `__rtw89_ops_set_sta_links`: set-link, link-add,
+    /// link-assoc). The new link takes the lowest free
+    /// instance index, whose MACID slot was already reserved
+    /// by the MLD base allocation. Returns the new link's
+    /// MACID. A refused request leaves the MLD untouched.
+    pub(super) fn add_mld_link(
+        &mut self,
+        base_macid: u8,
+        link: &LinkRequest<'_>,
+    ) -> Result<u8, Error> {
+        let facet = EhtStation::new_8922ae().ok_or(Error::EhtUnavailable)?;
+        let index = self
+            .mlds
+            .iter()
+            .position(|mld| mld.base_macid == base_macid)
+            .ok_or(Error::NoMld)?;
+        // Disjoint field borrows: the link slot out of `mlds`,
+        // the factory for the new link's CCTLs.
+        let mld = &mut self.mlds[index];
+        mld.add_link(&self.factory, facet, link)
+            .map_err(Error::Station)
+    }
+
+    /// Remove one link from an admitted MLD (Linux
+    /// `__rtw89_ops_clr_sta_links`: disassoc, disconnect,
+    /// remove, unset-link). Returns the removed link's
+    /// MACID, which returns to the pool; the MLD survives
+    /// on the remaining link. Release the link's BA-CAM
+    /// slots before removing it when it is the designated
+    /// link: its map goes away with it.
+    pub(super) fn release_mld_link(&mut self, base_macid: u8, link_id: u8) -> Result<u8, Error> {
+        let index = self
+            .mlds
+            .iter()
+            .position(|mld| mld.base_macid == base_macid)
+            .ok_or(Error::NoMld)?;
+        // Disjoint field borrows: the link slot out of `mlds`,
+        // the pool for the freed MACID.
+        let mld = &mut self.mlds[index];
+        let link = mld
+            .remove_link(&mut self.pool, link_id)
+            .map_err(Error::Station)?;
+        Ok(link.macid())
+    }
+
+    /// Release a whole MLD: every remaining link's MACID
+    /// returns to the pool and the record is dropped.
+    /// Idempotent: releasing an unknown base MACID is a
+    /// no-op.
+    pub(super) fn release_mld(&mut self, base_macid: u8) {
+        if let Some(index) = self
+            .mlds
+            .iter()
+            .position(|mld| mld.base_macid == base_macid)
+        {
+            let mld = self.mlds.remove(index);
+            mld.release_all(&mut self.pool);
+        }
+    }
+
+    /// Acquire a BA-CAM bitmap slot for a BlockAck session on
+    /// the MLD's designated link (`MldStation::acquire_bacam`);
+    /// the index feeds [`Self::ba_h2c_mld`].
+    pub(super) fn acquire_bacam_mld(&mut self, base_macid: u8, tid: u8) -> Result<usize, Error> {
+        let mld = self.mld_mut(base_macid).ok_or(Error::NoMld)?;
+        mld.acquire_bacam(tid).map_err(Error::Station)
+    }
+
+    /// Build a BA-CAM v1 H2C body for one of the MLD's
+    /// designated link's BlockAck sessions: MLD on,
+    /// band-select from the designated link's MAC index
+    /// (Linux `rtw89_fw_h2c_ba_cam_v1`). `bitmap_idx` must
+    /// come from [`Self::acquire_bacam_mld`].
+    pub(super) fn ba_h2c_mld(
+        &self,
+        base_macid: u8,
+        tid: u32,
+        bmap_size: u32,
+        ssn: u32,
+        bitmap_idx: u32,
+    ) -> Result<bacam_v1::BaCamH2c, Error> {
+        let mld = self.mld(base_macid).ok_or(Error::NoMld)?;
+        mld.ba_h2c(tid, bmap_size, ssn, bitmap_idx)
+            .map_err(Error::Station)
+    }
+
+    /// Release a BA-CAM bitmap slot acquired via
+    /// [`Self::acquire_bacam_mld`] on the designated link.
+    pub(super) fn release_bacam_mld(&mut self, base_macid: u8, idx: usize) -> Result<(), Error> {
+        let mld = self.mld_mut(base_macid).ok_or(Error::NoMld)?;
+        mld.release_bacam(idx).map_err(Error::Station)
+    }
+
+    /// Fill the BE RA v1 command for one admitted MLD link
+    /// (`ra_mask::build`): fresh station update (`upd` flags
+    /// false), phy index = the link's instance index (Linux
+    /// `phy.c:498`: `ra->band_num = rtwvif_link->phy_idx`;
+    /// `rtw89_init_vif` gives `phy_idx = RTW89_PHY_0 +
+    /// index`, `RTW89_PHY_0` = 0).
+    pub(super) fn station_ra_mld(
+        &self,
+        base_macid: u8,
+        link_id: u8,
+        caps: &StationCaps,
+    ) -> Result<[u32; 6], Error> {
+        let mld = self.mld(base_macid).ok_or(Error::NoMld)?;
+        let link = mld
+            .link(link_id)
+            .ok_or(Error::Station(station_8922a::Error::LinkNotFound))?;
+        ra_mask::build(caps, link.macid(), link.index as u8, false, false).map_err(Error::Ra)
+    }
+
+    /// EHT contribution to the BE TXWD_INFO block for one
+    /// admitted MLD link: (info4 bits, info7 bits) from that
+    /// link's facet. `None` when the MLD or link is not
+    /// admitted, or the facet cannot encode its NLTF value.
+    pub(super) fn txwd_info_eht_mld(&self, base_macid: u8, link_id: u8) -> Option<(u32, u32)> {
+        self.mld(base_macid)?.txwd_info_eht(link_id)
+    }
+
+    // ── VIF composition ──────────────────────────────────────────
+    //
+    // The VIF record is the interface Linux
+    // `rtw89_ops_add_interface` creates: one MACID + one port
+    // from the shared pools, link instances precomputed off
+    // the base (see the module docs). The station-mode TDLS
+    // peer is the one station that does NOT take a pool
+    // MACID.
+
+    /// Admit one VIF: acquire the lowest free pool MACID as
+    /// its base (main MACID) and the lowest free hardware
+    /// port, in Linux `rtw89_ops_add_interface` order (MACID
+    /// first, then port). Returns the main MACID. A refused
+    /// request — pool exhausted, no port free, or a VIF with
+    /// this address already admitted — consumes nothing: a
+    /// port failure after a MACID allocation frees the MACID
+    /// again.
+    pub(super) fn add_vif(&mut self, addr: [u8; 6], role: VifRole) -> Result<u8, Error> {
+        if self.vifs.iter().any(|vif| vif.addr == addr) {
+            return Err(Error::VifExists);
+        }
+        let base_macid = self.pool.alloc().map_err(Error::Station)?;
+        let port = match self
+            .ports_used
+            .iter()
+            .position(|used| !*used)
+            .map(|index| index as u8)
+        {
+            Some(port) => port,
+            None => {
+                self.pool.free(base_macid);
+                return Err(Error::NoPort);
+            }
+        };
+        self.ports_used[port as usize] = true;
+        self.vifs.push(Vif {
+            addr,
+            role,
+            base_macid,
+            port,
+        });
+        Ok(base_macid)
+    }
+
+    /// Admitted VIF by main MACID, if any.
+    pub(super) fn vif(&self, main_macid: u8) -> Option<&Vif> {
+        self.vifs.iter().find(|vif| vif.base_macid == main_macid)
+    }
+
+    /// Admitted VIF by interface address, if any.
+    pub(super) fn vif_by_addr(&self, addr: [u8; 6]) -> Option<&Vif> {
+        self.vifs.iter().find(|vif| vif.addr == addr)
+    }
+
+    /// Admit a TDLS peer on a station-mode VIF at the VIF's
+    /// main MACID (Linux `__rtw89_ops_sta_add`,
+    /// `mac80211.c:495`: "for station mode, assign the
+    /// mac_id from itself"). The peer takes no pool MACID:
+    /// the VIF's base slot is already marked used, and the
+    /// peer record is retained in [`Self::vif_peers`] so
+    /// releasing it never frees the VIF's MACID (see the
+    /// module docs for the deliberate difference from
+    /// Linux's remove path). Returns the MACID — the VIF's
+    /// main MACID. The request's port must be the VIF's
+    /// port: Linux programs one port id per VIF into every
+    /// assoc CCTL.
+    pub(super) fn admit_tdls_peer(
+        &mut self,
+        vif_main_macid: u8,
+        req: &Request,
+    ) -> Result<u8, Error> {
+        let vif = self.vif(vif_main_macid).ok_or(Error::NoVif)?;
+        if vif.role != VifRole::Station {
+            return Err(Error::NotStationMode);
+        }
+        if req.port != vif.port {
+            return Err(Error::PortMismatch);
+        }
+        let facet = EhtStation::new_8922ae().ok_or(Error::EhtUnavailable)?;
+        let station = station_8922a::admit_with_macid(&self.factory, facet, req, vif.base_macid)?;
+        let macid = station.macid;
+        self.vif_peers.push(station);
+        Ok(macid)
+    }
+
+    /// Remove a VIF: its base MACID returns to the pool and
+    /// its port is freed (Linux `rtw89_ops_remove_interface`
+    /// releases `rtw89_vif_get_main_macid` + the main port).
+    /// Any TDLS peers admitted against it dissolve with it:
+    /// their records die here, and the base returns to the
+    /// pool exactly once. Idempotent: removing an unknown
+    /// main MACID is a no-op.
+    pub(super) fn remove_vif(&mut self, main_macid: u8) {
+        if let Some(index) = self
+            .vifs
+            .iter()
+            .position(|vif| vif.base_macid == main_macid)
+        {
+            let vif = self.vifs.remove(index);
+            self.vif_peers
+                .retain(|station| station.macid != vif.base_macid);
+            self.ports_used[vif.port as usize] = false;
+            self.pool.free(vif.base_macid);
+        }
     }
 
     /// Reserve a data slot, build the header, and fill the TXBD —
@@ -709,7 +1204,7 @@ impl Prepared8922a {
         if !self.rings_programmed {
             return Err(Error::NotProgrammed);
         }
-        if self.station(args.mac_id).is_none() {
+        if !self.is_admitted(args.mac_id) {
             return Err(Error::NoStation);
         }
         self.data.prepare(args).map_err(Error::Transport)
@@ -727,7 +1222,7 @@ impl Prepared8922a {
         if !self.rings_programmed {
             return Err(Error::NotProgrammed);
         }
-        if self.station(args.mac_id).is_none() {
+        if !self.is_admitted(args.mac_id) {
             return Err(Error::NoStation);
         }
         self.data
