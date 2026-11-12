@@ -2367,6 +2367,53 @@ fn cache_spill(
     }
 }
 
+/// Test-only: route this CPU's order-0 frees into another CPU's cache, to
+/// strand free pages on remote CPUs the way a busy machine does.
+#[cfg(feature = "kernel-test")]
+static TEST_FREE_CACHE_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// The CPU whose cache an order-0 free lands in: the caller's own.
+#[inline]
+fn free_cache_cpu() -> usize {
+    #[cfg(feature = "kernel-test")]
+    {
+        let forced = TEST_FREE_CACHE_CPU.load(Ordering::Relaxed);
+        if forced != usize::MAX {
+            return forced.min(narf_lib::percpu::MAX_CPUS - 1);
+        }
+    }
+    narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)
+}
+
+/// Return every CPU's cached free frames, on every node, to the buddy zones
+/// so they can coalesce (Linux `drain_all_pages(NULL)`). The allocation slow
+/// path runs this before it gives up; Linux drains the same way from
+/// `__alloc_pages_direct_reclaim` before the final retry. A high-order
+/// request can never be served from order-0 cache entries, so the drain
+/// is what lets their buddies merge back into the block it needs.
+///
+/// Takes each node's drain lock and every CPU's cache lock in turn; the
+/// caller holds no allocator lock.
+pub fn drain_all_frame_caches() {
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let mut nodes = online_node_mask() | 1;
+    while nodes != 0 {
+        let node = nodes.trailing_zeros() as usize;
+        nodes &= nodes - 1;
+        if node >= MAX_NUMA_NODES {
+            break;
+        }
+        if FRAME_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+            && PAIR_CACHE_FREE[node].load(Ordering::Relaxed) == 0
+        {
+            continue;
+        }
+        with_node_frame_caches_drained(node, |_| ());
+    }
+}
+
 /// Cache an order-0 free on the calling CPU.
 fn free_order0_to_cache(node: usize, frame: u64) -> CacheFree {
     let node = node.min(MAX_NUMA_NODES - 1);
@@ -2376,7 +2423,7 @@ fn free_order0_to_cache(node: usize, frame: u64) -> CacheFree {
     let Some(word) = FRAME_INDEX.slot(frame) else {
         return CacheFree::Declined;
     };
-    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let cpu = free_cache_cpu();
     let mut cache = FRAME_CACHES[cpu].0.lock();
     if frame_cache_bypassed(node) {
         return CacheFree::Declined;
@@ -2913,6 +2960,15 @@ pub fn alloc_pages_on_ctx(
     // IRQ-masked callers, so allocations made under an IRQ-safe metadata lock
     // fall through to their caller's non-contiguous/failure path rather than
     // recursively entering migration while that metadata is locked.
+    // Every node's per-CPU caches, not only the preferred node's (which the
+    // inner path drained already): a NUMA fallback or a block whose buddies
+    // sit in another node's caches needs them back in the zones too.
+    let r = if r.is_err() {
+        drain_all_frame_caches();
+        alloc_pages_on_inner(node, order, ctx.migrate_type())
+    } else {
+        r
+    };
     let r = retry_after_direct_compaction(r, node, order, ctx.migrate_type());
     if r.is_err() {
         note_block_failure(order, BLOCK_FAIL_BUDDY);
@@ -3900,6 +3956,53 @@ fn smoke_pagetable_registry_churn_is_constant() -> narf_kernel_test::TestResult 
 }
 #[cfg(feature = "kernel-test")]
 narf_kernel_test::kernel_test_in!("memory/frame", smoke_pagetable_registry_churn_is_constant);
+
+/// Free pages stranded in OTHER CPUs' caches must come back for a high-order
+/// request. An order-6 block is split and its 64 pages are freed into 32
+/// different CPUs. caches; the block is then not in the zone (an exact-range
+/// reservation of it fails). The slow path's drain returns every cached page
+/// to the zone, the buddies merge, and the same reservation succeeds.
+#[cfg(feature = "kernel-test")]
+fn smoke_frame_drain_returns_remote_cpu_pages_for_high_order() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const ORDER: u8 = 6;
+    const PAGES: u64 = 1 << ORDER;
+    if !FRAME_CACHE_ENABLED.load(Ordering::Acquire) {
+        return TestResult::Skip("per-CPU frame caches are off");
+    }
+    let Ok(block) = alloc_pages_on(current_cpu_node(), ORDER) else {
+        return TestResult::Skip("no order-6 block");
+    };
+    if !split_block(block, ORDER) {
+        free_pages(block, ORDER);
+        return TestResult::Fail("split_block refused a live order-6 block");
+    }
+    let base = block.start_address();
+    for i in 0..PAGES {
+        // 32 caches at the top of the CPU range: no running CPU allocates
+        // from them, so nothing but the drain can take these pages back out.
+        let cpu = narf_lib::percpu::MAX_CPUS - 1 - (i % 32) as usize;
+        TEST_FREE_CACHE_CPU.store(cpu, Ordering::Relaxed);
+        free_frame(PhysFrame::new(PhysAddr::new(base.raw() + i * PAGE_SIZE)));
+    }
+    TEST_FREE_CACHE_CPU.store(usize::MAX, Ordering::Relaxed);
+    // Stranded: the pages are free but not in the zone.
+    if reserve_frame_range(base, PAGES) {
+        free_movable_range(base, PAGES);
+        return TestResult::Fail("frees bypassed the per-CPU caches; scenario not built");
+    }
+    drain_all_frame_caches();
+    if !reserve_frame_range(base, PAGES) {
+        return TestResult::Fail("drained pages did not return to the zone as one block");
+    }
+    free_movable_range(base, PAGES);
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "memory/frame",
+    smoke_frame_drain_returns_remote_cpu_pages_for_high_order
+);
 
 /// `frame-poison-check`: a freed block holds the poison on every frame, and
 /// is handed out again (verified) without complaint.
