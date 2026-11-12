@@ -1099,81 +1099,87 @@ where
 }
 
 pub(super) fn start_boot() -> narf_init::InitResult {
-    use core::fmt::Write;
     use narf_init::InitResult;
     BOOT_STARTED.store(true, core::sync::atomic::Ordering::Release);
     if crate::module_host::owns_discovery() {
         return InitResult::Ok;
     }
-    // Before executor polling, regular Mutex (no IRQ spinlock) retained.
-    // This future is self-waking and never depends on another executor task.
-    let result = narf_scheduler::block_on_spin(provision_boot_radio());
-    if result == Err(Error::DeviceGone) && !super::pci::is_probed() {
+    // No device, nothing to bring up — and no bring-up future to build.
+    if !super::pci::is_probed() {
         return InitResult::NotPresent;
     }
+    // Bring the radio up on a kernel task, not here. An initcall runs on the
+    // boot CPU's boot stack, and `block_on_spin` keeps the future it drives in
+    // its own frame: `provision_boot_radio()`'s state machine is large enough
+    // that its fields reached below the boot stack and overwrote the kernel
+    // image's page-table entries (aarch64, under KASLR). Linux likewise runs
+    // blocking device bring-up from a worker, not on the boot stack. The
+    // future is boxed by `spawn`; the outcome is reported when it lands.
+    narf_scheduler::spawn(boot_radio());
+    InitResult::Ok
+}
+
+/// The radio's boot bring-up: the first firmware provisioning attempt, then
+/// background retry or verified-reset recovery when it fails. Runs as a
+/// kernel task ([`start_boot`]).
+async fn boot_radio() {
+    use core::fmt::Write;
+    let result = provision_boot_radio().await;
     let _ = writeln!(
         narf_console::Writer,
         "mt76: firmware {result:?}; retained {:?}; station idle; packet service awaits association",
         boot_status()
     );
     if result.is_ok() {
-        InitResult::Ok
-    } else if matches!(
+        return;
+    }
+    if matches!(
         boot_status(),
         BootStatus::Absent | BootStatus::Retained(State::RadioReady(_))
     ) {
         // No firmware attempt yet (or net authority arrived after radio bring-up):
-        // retry the same parked binding in the background as late firmware scans
-        // or userspace staging complete, falling back to verified reset recovery
-        // if the subsequent first hardware attempt fails.
-        narf_scheduler::spawn(async {
-            let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
-                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
-            })
-            .await;
-            if outcome.is_ok() {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "mt76: staged firmware provisioned; retained {:?}",
-                    boot_status()
-                );
-                return;
-            }
-            if !matches!(boot_status(), BootStatus::Absent) {
-                for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
-                    narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
-                    let result = reset_boot_transport(None).await;
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "mt76: initial radio recovery {result:?}"
-                    );
-                    if result.is_ok() {
-                        let _ = provision_boot_radio().await;
-                        return;
-                    }
-                }
-            }
-        });
-        InitResult::Error("MT76 firmware preflight (provisioning available)")
+        // retry the same parked binding as late firmware scans or userspace
+        // staging complete, falling back to verified reset recovery if the
+        // subsequent first hardware attempt fails.
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: firmware preflight failed; provisioning retries in the background"
+        );
+        let outcome = retry_preflight_until(120, boot_status, provision_boot_radio, || {
+            narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000))
+        })
+        .await;
+        if outcome.is_ok() {
+            let _ = writeln!(
+                narf_console::Writer,
+                "mt76: staged firmware provisioned; retained {:?}",
+                boot_status()
+            );
+            return;
+        }
+        if matches!(boot_status(), BootStatus::Absent) {
+            return;
+        }
     } else {
         // Recovery after initial firmware/radio failure has no registered
         // interface yet. Keep ownership in the same retained worker and only
         // publish an interface after a successful fresh identity query.
-        narf_scheduler::spawn(async {
-            for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
-                narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
-                let result = reset_boot_transport(None).await;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "mt76: initial radio recovery {result:?}"
-                );
-                if result.is_ok() {
-                    let _ = provision_boot_radio().await;
-                    return;
-                }
-            }
-        });
-        InitResult::Error("MT76 firmware startup (owner retained)")
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: firmware startup failed; owner retained, recovering"
+        );
+    }
+    for delay_ns in [1_000_000_000, 5_000_000_000, 30_000_000_000] {
+        narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(delay_ns)).await;
+        let result = reset_boot_transport(None).await;
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: initial radio recovery {result:?}"
+        );
+        if result.is_ok() {
+            let _ = provision_boot_radio().await;
+            return;
+        }
     }
 }
 
