@@ -2369,6 +2369,12 @@ fn shrink_scan(nr_pages: usize) -> usize {
     freed * PAGES_PER_CACHED_PAGE
 }
 
+/// Kernel tests: drop every unmapped clean page, as a reclaim request
+/// for all of them would.
+pub(crate) fn shrink_all_for_test() -> usize {
+    shrink_scan(usize::MAX / 2)
+}
+
 /// Cache pages a reclaim pass looks at per page it frees, at most.
 const RECLAIM_SCAN_FACTOR: usize = 4;
 

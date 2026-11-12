@@ -4091,10 +4091,25 @@ pub(crate) fn note_file_written(
 }
 
 mod writeback;
+/// Kernel tests: `(dirty, listed idle-dirty, mappings)` of `ops`'s cached
+/// page at `offset`, if there is one.
+pub(crate) fn cached_page_state_for_test(
+    ops: &dyn FileOps,
+    offset: u64,
+) -> Option<(bool, bool, usize)> {
+    let identity = shared_file_identity(ops);
+    let pages = SHARED_FILE_PAGES.lock();
+    let phys = pages
+        .by_file
+        .get(&SharedFilePages::key(identity, offset & !4095))?;
+    let page = pages.by_phys.get(phys)?;
+    Some((page.dirty, page.idle_dirty, page.mappings))
+}
 /// Kernel tests: run the flusher's mapped-page reclaim step directly.
 pub(crate) fn reclaim_mapped_for_test(target: usize) -> usize {
     writeback::reclaim_mapped(target)
 }
+pub(crate) use writeback::shrink_all_for_test;
 pub(crate) use writeback::{
     device_mapped, forget_device, read_epoch, sync_all_files_async, write_and_note,
 };
