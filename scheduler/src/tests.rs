@@ -6810,3 +6810,99 @@ kernel_test_in!(
     "scheduler/mm-exit",
     smoke_scheduler_exec_displacing_last_user_releases_old_mm
 );
+
+/// After many address spaces lose their last task, the only references left
+/// are the per-CPU lazy holders (the executor's root handoff and the direct
+/// handoff's root cell, Linux's lazy-TLB `active_mm`): at most two per CPU,
+/// however many exited. Each of those already went through `exit_mmap`, so it
+/// pins one root page and nothing else.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_lazy_mm_holders_bounded_by_cpus() -> TestResult {
+    extern crate alloc;
+    use crate::{spawn_user, TaskSpec};
+
+    const SPACES: usize = 48;
+    crate::__reset_queues_for_test();
+    let mut roots = alloc::vec::Vec::with_capacity(SPACES);
+    for _ in 0..SPACES {
+        let space = match mm_exit_fixture() {
+            Ok(space) => space,
+            Err(result) => return result,
+        };
+        roots.push(space.root.raw());
+        spawn_user(
+            crate::alloc_task_id(),
+            async {},
+            TaskSpec::unthrottled(),
+            space,
+        );
+    }
+    crate::run_until_empty();
+    let mut live = 0usize;
+    for &root in &roots {
+        if let Some(info) = narf_memory::as_origin::info(root) {
+            live += 1;
+            if info.user_tasks != Some(0) {
+                return TestResult::Fail("a finished space still counts a user");
+            }
+        }
+    }
+    let cpus = (narf_lib::smp::cpu_count() as usize).max(1);
+    if live > 2 * cpus {
+        return TestResult::Fail("lazy holders kept more roots than two per CPU");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "scheduler/mm-exit",
+    smoke_scheduler_lazy_mm_holders_bounded_by_cpus
+);
+
+/// Linux `exit_mm`: an exiting task gives up its user reference in its own
+/// context — the last one runs `exit_mmap` there — and the later slot drop
+/// must not give it up a second time (an underflow of the user count). A
+/// second `exit_mm` is a no-op.
+#[cfg(target_arch = "x86_64")]
+fn smoke_scheduler_exit_mm_releases_once() -> TestResult {
+    extern crate alloc;
+    use crate::{spawn_user, TaskSpec};
+
+    crate::__reset_queues_for_test();
+    let space = match mm_exit_fixture() {
+        Ok(space) => space,
+        Err(result) => return result,
+    };
+    let tid = spawn_user(
+        crate::alloc_task_id(),
+        async {},
+        TaskSpec::unthrottled(),
+        space.clone(),
+    );
+    if space.mmget_not_zero().is_none() {
+        return TestResult::Fail("a spawned task's space had no user");
+    }
+    if !crate::exit_mm(tid) {
+        return TestResult::Fail("exit_mm found no user reference to give up");
+    }
+    let regions = space.region_count();
+    let tables = space.page_table_frames();
+    let again = crate::exit_mm(tid);
+    let refused = space.mmget_not_zero().is_none();
+    crate::run_until_empty();
+    if regions != 0 || tables != 1 {
+        return TestResult::Fail("the last exit_mm did not run exit_mmap");
+    }
+    if again {
+        return TestResult::Fail("a second exit_mm gave up a reference again");
+    }
+    if !refused {
+        return TestResult::Fail("mmget_not_zero succeeded after exit_mm");
+    }
+    if space.scheduler_user_tasks() != 0 {
+        return TestResult::Fail("the slot drop released the user a second time");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("scheduler/mm-exit", smoke_scheduler_exit_mm_releases_once);
