@@ -30,12 +30,22 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The calling task (0 when the kernel cannot say, as on the host harness,
+/// whose operations all run in one thread).
+fn task() -> u64 {
+    narf_filesystem::killable::current_task()
+}
+
 #[derive(Default)]
 struct State {
     /// Operations joined.
     joined: usize,
-    /// A close is held.
+    /// Joins per task, so code deep in an operation can tell whether the
+    /// task running it is joined ([`TxnGate::joined_by_current`]).
+    owners: alloc::vec::Vec<(u64, usize)>,
+    /// A close is held, and by which task.
     closed: bool,
+    closer: u64,
     /// Closes waiting, in arrival order: they go before any new join.
     closers: VecDeque<u64>,
     /// Every parked future, to wake when the state changes.
@@ -53,6 +63,24 @@ impl State {
 
     fn unpark(&mut self, id: u64) {
         self.wakers.retain(|(w, _)| *w != id);
+    }
+
+    fn own(&mut self, task: u64) {
+        self.joined += 1;
+        match self.owners.iter_mut().find(|(t, _)| *t == task) {
+            Some((_, n)) => *n += 1,
+            None => self.owners.push((task, 1)),
+        }
+    }
+
+    fn disown(&mut self, task: u64) {
+        self.joined = self.joined.saturating_sub(1);
+        if let Some(at) = self.owners.iter().position(|(t, _)| *t == task) {
+            self.owners[at].1 -= 1;
+            if self.owners[at].1 == 0 {
+                self.owners.swap_remove(at);
+            }
+        }
     }
 
     fn take_wakers(&mut self) -> VecDeque<(u64, Waker)> {
@@ -101,15 +129,23 @@ impl TxnGate {
         }
     }
 
-    /// Whether a close is held (by the running code, if it runs at all
-    /// while one is: nothing joined runs then).
-    pub(crate) fn is_closed(&self) -> bool {
-        self.state.lock().closed
+    /// Whether the calling task holds the close. Where the kernel cannot
+    /// name the task (the host harness, one thread), whether any close is
+    /// held: nothing joined runs while one is.
+    pub(crate) fn closed_by_current(&self) -> bool {
+        let state = self.state.lock();
+        let me = task();
+        state.closed && (me == 0 || state.closer == me)
     }
 
-    /// Operations joined right now.
-    pub(crate) fn joined(&self) -> usize {
-        self.state.lock().joined
+    /// Whether the calling task is joined. Where the kernel cannot name the
+    /// task, whether any operation is.
+    pub(crate) fn joined_by_current(&self) -> bool {
+        let state = self.state.lock();
+        match task() {
+            0 => state.joined > 0,
+            me => state.owners.iter().any(|(t, _)| *t == me),
+        }
     }
 
     fn wake_all(&self) {
@@ -121,15 +157,15 @@ impl TxnGate {
 
     /// Count one join back in at once, even past a waiting or held close:
     /// only for [`Upgrade`]'s cancellation, which leaves again right after.
-    fn force_join(&self) {
-        self.state.lock().joined += 1;
+    fn force_join(&self, task: u64) {
+        self.state.lock().own(task);
     }
 
     /// Leave without a guard ([`Upgrade`]).
-    fn leave(&self) {
+    fn leave(&self, task: u64) {
         {
             let mut state = self.state.lock();
-            state.joined = state.joined.saturating_sub(1);
+            state.disown(task);
             if state.joined != 0 {
                 return;
             }
@@ -151,9 +187,13 @@ impl<'a> Future for JoinFuture<'a> {
         let this = self.get_mut();
         let mut state = this.gate.state.lock();
         if !state.closed && state.closers.is_empty() {
-            state.joined += 1;
+            let me = task();
+            state.own(me);
             state.unpark(this.id);
-            return Poll::Ready(Joined { gate: this.gate });
+            return Poll::Ready(Joined {
+                gate: this.gate,
+                task: me,
+            });
         }
         state.park(this.id, cx.waker());
         Poll::Pending
@@ -169,11 +209,12 @@ impl Drop for JoinFuture<'_> {
 /// One operation joined to the running transaction.
 pub(crate) struct Joined<'a> {
     gate: &'a TxnGate,
+    task: u64,
 }
 
 impl Drop for Joined<'_> {
     fn drop(&mut self) {
-        self.gate.leave();
+        self.gate.leave(self.task);
     }
 }
 
@@ -197,6 +238,7 @@ impl<'a> Future for CloseFuture<'a> {
         if !state.closed && state.joined == 0 && state.closers.front() == Some(&this.id) {
             state.closers.pop_front();
             state.closed = true;
+            state.closer = task();
             state.unpark(this.id);
             this.queued = false;
             return Poll::Ready(Closed { gate: this.gate });
@@ -232,7 +274,11 @@ pub(crate) struct Closed<'a> {
 
 impl Drop for Closed<'_> {
     fn drop(&mut self) {
-        self.gate.state.lock().closed = false;
+        {
+            let mut state = self.gate.state.lock();
+            state.closed = false;
+            state.closer = 0;
+        }
         self.gate.wake_all();
     }
 }
@@ -246,14 +292,20 @@ impl Drop for Closed<'_> {
 /// counts it out.
 pub(crate) struct Upgrade<'a> {
     gate: &'a TxnGate,
+    task: u64,
     out: bool,
 }
 
 impl<'a> Upgrade<'a> {
     /// Step out of the join the caller holds.
     pub(crate) fn step_out(gate: &'a TxnGate) -> Self {
-        gate.leave();
-        Upgrade { gate, out: true }
+        let task = task();
+        gate.leave(task);
+        Upgrade {
+            gate,
+            task,
+            out: true,
+        }
     }
 
     /// Join again, waiting behind any close.
@@ -266,7 +318,7 @@ impl<'a> Upgrade<'a> {
 impl Drop for Upgrade<'_> {
     fn drop(&mut self) {
         if self.out {
-            self.gate.force_join();
+            self.gate.force_join(self.task);
         }
     }
 }

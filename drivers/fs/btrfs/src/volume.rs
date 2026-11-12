@@ -2715,10 +2715,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// inode and directory locks keep stable. With nothing joined it closes
     /// first (mount, unmount, tests).
     pub(crate) async fn exclusive<T>(&self, work: impl core::future::Future<Output = T>) -> T {
-        if self.txn_gate.is_closed() {
+        if self.txn_gate.closed_by_current() {
             return work.await;
         }
-        let upgrade = (self.txn_gate.joined() > 0)
+        let upgrade = self
+            .txn_gate
+            .joined_by_current()
             .then(|| crate::txn_gate::Upgrade::step_out(&self.txn_gate));
         let out = {
             let _closed = self.txn_gate.close().await;
@@ -2733,7 +2735,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Whether the transaction is closed (by the running code, when it is
     /// the one asking: nothing joined runs while it is).
     pub(crate) fn txn_closed(&self) -> bool {
-        self.txn_gate.is_closed()
+        self.txn_gate.closed_by_current()
     }
 
     /// Test-only: close the transaction, as a commit would.

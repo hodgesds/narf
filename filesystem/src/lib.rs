@@ -67,6 +67,7 @@ extern crate alloc;
 
 pub mod bluetooth;
 pub mod bpffs;
+pub mod killable;
 #[cfg(feature = "cgroup")]
 pub mod cgroupfs;
 pub mod console_tty;
