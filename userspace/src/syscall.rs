@@ -4619,11 +4619,9 @@ pub fn kernel_syscall_entry_plain_with_state(
     //    read / wait could ever observe EINTR from a handled signal
     //    (stress-ng --dup ran at 0.003x Linux on exactly this).
     if !user_state.is_null() {
-        // Linux drives ITIMER_REAL from an independent hrtimer. Check the
-        // cached earliest deadline before every kernel→user transition so a
-        // syscall-dense task cannot indefinitely defer SIGALRM merely because
-        // timer IRQs keep landing at CPL=0. The no-timer common path is one
-        // atomic load; the locked all-task scan runs only after a deadline.
+        // CPU-clock itimers sampled at the kernel→user transition (one atomic
+        // load when none is armed). ITIMER_REAL is an hrtimer and raises
+        // SIGALRM from its own expiry.
         crate::handlers::timer_tick_raise_due_signals();
         let restart_pending = syscall_frame_is_restart_pending(
             entry_rip,
