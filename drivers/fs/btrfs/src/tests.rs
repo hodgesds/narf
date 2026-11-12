@@ -31,6 +31,7 @@ mod root_collapse;
 mod safety;
 mod snapshot_gen;
 mod snapshots;
+mod two_handles;
 mod write_buffers;
 
 // ── Shared test harness ────────────────────────────────────────────
