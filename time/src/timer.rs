@@ -818,6 +818,19 @@ pub(crate) fn expire_remote_global(cpu: usize) -> u64 {
     cpu_bases(cpu).map_or(0, |b| run_base(&b.bases[BASE_GLOBAL]))
 }
 
+/// Test-only: [`expire_remote_global`] for smokes in crates above `time`
+/// (the cross-CPU timer migration race needs pinned scheduler tasks).
+#[doc(hidden)]
+pub fn __expire_global_for_test(cpu: usize) -> u64 {
+    expire_remote_global(cpu)
+}
+
+/// Test-only: [`global_next`] for smokes in crates above `time`.
+#[doc(hidden)]
+pub fn __global_next_for_test(cpu: usize) -> u64 {
+    global_next(cpu)
+}
+
 /// `run_local_timers` from the tick: raise the softirq when a base is due.
 pub fn timer_tick() {
     let Some(b) = cpu_bases(this_cpu()) else {
