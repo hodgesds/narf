@@ -69,9 +69,10 @@ memory-window ownership and do not use this control-register path.
   stripping stays OFF per the net spec). The driver also negotiates
   `VIRTIO_NET_F_GUEST_ANNOUNCE` when offered: on a config-change interrupt
   that raises `VIRTIO_NET_S_ANNOUNCE` it sends a gratuitous ARP for the
-  interface's primary IPv4 address and acks with
-  `VIRTIO_NET_CTRL_ANNOUNCE_ACK`; the IPv6 unsolicited-NA half has no stack
-  emit surface yet (issue #1536). The driver
+  interface's primary IPv4 address and one unsolicited Neighbor
+  Advertisement per usable (Preferred/Deprecated) IPv6 address via the
+  stack's `send_unsolicited_na` surface (#1536), and acks with
+  `VIRTIO_NET_CTRL_ANNOUNCE_ACK`. The driver
   honors the frame-ring `TxMeta::more` batching hint while checking for a notify
   at an exhausted TX buffer pool, a full TX ring, or an explicit flush boundary.
   Copy-path TX buffer acquisition reclaims completed descriptors before
