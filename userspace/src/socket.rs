@@ -5212,8 +5212,8 @@ impl SocketFile {
             // and is always writable. A connecting socket (#1532)
             // reports POLL_OUT once its open completes (and never
             // POLL_IN — no data can arrive before connect). A
-            // listening SCO socket reports nothing — no connection
-            // can ever arrive (#817).
+            // listening SCO socket reports POLL_IN while a
+            // peer-initiated link awaits accept (#814).
             SocketState::BluetoothConn {
                 listen,
                 channel,
@@ -5222,10 +5222,26 @@ impl SocketFile {
                 sco,
                 sco_link,
                 sco_pending,
+                bound,
                 ..
             } => {
                 if sco.listening {
-                    0
+                    let local: Option<[u8; 6]> = bound
+                        .as_ref()
+                        .and_then(|b| b.get(..6).and_then(|s| s.try_into().ok()));
+                    let ready = local
+                        .and_then(|l| Self::bt_route_controller(&l))
+                        .is_some_and(narf_filesystem::bluetooth::bt_pending_sco);
+                    // Reconcile the durable accept cell against this
+                    // level so it clears once accept drains the
+                    // pending link (else a re-arm spuriously returns
+                    // Ready and a timed poll spins).
+                    self.set_listener_readiness(ready);
+                    if ready {
+                        narf_filesystem::POLL_IN
+                    } else {
+                        0
+                    }
                 } else if sco_pending.is_some() {
                     // A SCO connect in flight suppresses POLLOUT
                     // (`bt_sock_poll`: BT_CONNECT/CONNECT2/CONFIG →
@@ -5938,14 +5954,7 @@ impl SocketFile {
             SocketOp::Listen { .. } if self.protocol == BTPROTO_SCO => self.sco_listen(),
             SocketOp::Listen { .. } if self.protocol == BTPROTO_L2CAP => self.bt_listen_l2cap(),
             SocketOp::Listen { .. } if self.protocol == BTPROTO_RFCOMM => self.bt_listen_rfcomm(),
-            // `sco_sock_accept`: only a listener accepts, and with no
-            // controller no connection ever arrives to accept.
-            SocketOp::Accept if self.protocol == BTPROTO_SCO => match &*self.state.lock() {
-                SocketState::BluetoothConn { sco, .. } if sco.listening => {
-                    SocketOpResult::Err(SockError::WouldBlock)
-                }
-                _ => SocketOpResult::Err(SockError::BadFdState),
-            },
+            SocketOp::Accept if self.protocol == BTPROTO_SCO => self.bt_accept_sco(),
             SocketOp::Accept
                 if self.protocol == BTPROTO_L2CAP || self.protocol == BTPROTO_RFCOMM =>
             {
@@ -6210,6 +6219,73 @@ impl SocketFile {
         SocketOpResult::Accepted {
             socket: child,
             peer: Some(self.bt_channel_peer_sockaddr(&accepted)),
+        }
+    }
+
+    /// `sco_sock_accept` (#814 remainder): claim the oldest
+    /// unclaimed peer-initiated SCO link on the routed controller
+    /// for this listening socket. Only a listener accepts (EBADFD
+    /// otherwise); no pending link is EAGAIN. The child carries the
+    /// claimed link (`BtScoState`) and the listener's bound address,
+    /// and reports the peer bdaddr as its peer sockaddr — the same
+    /// shape `bt_accept` builds for L2CAP/RFCOMM, with the link
+    /// claimed through the broker instead of a PSM-keyed pending
+    /// channel.
+    fn bt_accept_sco(self: &Arc<Self>) -> SocketOpResult {
+        let (bound_body, listening) = {
+            let state = self.state.lock();
+            let SocketState::BluetoothConn { bound, sco, .. } = &*state else {
+                return SocketOpResult::Err(SockError::InvalidArg);
+            };
+            (bound.clone(), sco.listening)
+        };
+        if !listening {
+            return SocketOpResult::Err(SockError::BadFdState);
+        }
+        let Some(bound_body) = bound_body else {
+            return SocketOpResult::Err(SockError::BadFdState);
+        };
+        let local: [u8; 6] = match bound_body.get(..6).and_then(|b| b.try_into().ok()) {
+            Some(b) => b,
+            None => return SocketOpResult::Err(SockError::InvalidArg),
+        };
+        let Some(dev) = Self::bt_route_controller(&local) else {
+            return SocketOpResult::Err(SockError::NoDevice);
+        };
+        let Some((handle, peer, mtu, dev_class)) =
+            narf_filesystem::bluetooth::bt_take_pending_sco(dev)
+        else {
+            return SocketOpResult::Err(SockError::WouldBlock);
+        };
+        let child = SocketFile::with_protocol(AF_BLUETOOTH, self.kind, self.protocol);
+        {
+            let mut state = child.state.lock();
+            if let SocketState::BluetoothConn {
+                sco_link,
+                bound: child_bound,
+                ..
+            } = &mut *state
+            {
+                *sco_link = Some(BtScoState {
+                    dev,
+                    handle,
+                    peer,
+                    mtu,
+                    dev_class,
+                });
+                *child_bound = Some(bound_body);
+            }
+        }
+        // Reconcile the durable accept cell against the post-claim
+        // pending state, so it clears once accept drains the last
+        // pending link.
+        let _ = self.poll_readiness();
+        SocketOpResult::Accepted {
+            socket: child,
+            peer: Some(SockAddr {
+                family: AF_BLUETOOTH,
+                body: peer.to_vec(),
+            }),
         }
     }
 

@@ -2260,6 +2260,33 @@ impl PumpCore {
         BtScoConnectResult::Aborted
     }
 
+    /// Claim the oldest unclaimed SCO link on this controller for a
+    /// listening socket's accept (#814 remainder): a peer-initiated
+    /// link staged by Synchronous Connection Complete with no
+    /// matching outbound setup, in arrival order. A link whose peer
+    /// has an outbound setup in flight is never claimed here — it
+    /// belongs to the connecting socket's `sco_connect_status`
+    /// poll. Returns (SCO handle, peer bdaddr, MTU, peer class).
+    /// The claim marks the link so a second accept (or connect
+    /// poll) sees it as already claimed, mirroring
+    /// `take_pending_channel` for L2CAP.
+    pub fn take_pending_sco(&mut self) -> Option<(u16, [u8; 6], u16, [u8; 3])> {
+        let pos = self.sco_links.iter().position(|l| {
+            !l.claimed && self.pending_sco.as_ref().is_none_or(|p| p.peer != l.peer)
+        })?;
+        let link = &mut self.sco_links[pos];
+        link.claimed = true;
+        Some((link.handle, link.peer, link.mtu, link.dev_class))
+    }
+
+    /// Whether an accept-claimable SCO link is pending on this
+    /// controller (non-consuming peek for poll/accept readiness).
+    pub fn pending_sco(&self) -> bool {
+        self.sco_links
+            .iter()
+            .any(|l| !l.claimed && self.pending_sco.as_ref().is_none_or(|p| p.peer != l.peer))
+    }
+
     /// Send one SCO frame on the open link (`handle`). A payload
     /// larger than the link MTU is TooBig (the socket layer reports
     /// EINVAL, per Linux `sco_send_frame`); a transport that cannot
@@ -6098,6 +6125,25 @@ pub fn disconnect_sco(dev: u16, handle: u16) -> bool {
 /// no setup is in flight for this peer.
 pub fn cancel_sco_connect(dev: u16, peer: [u8; 6]) {
     let _ = with_core(dev as usize, |core| core.cancel_sco_connect(peer));
+}
+
+/// Claim the oldest unclaimed SCO link on controller `dev` for a
+/// listening socket's accept (see `PumpCore::take_pending_sco`).
+/// `None` when nothing is pending or no pump exists.
+pub fn take_pending_sco(dev: u16) -> Option<(u16, [u8; 6], u16, [u8; 3])> {
+    let mut pumps = PUMPS.lock();
+    let slot = find_slot_mut(&mut pumps, dev as usize)?;
+    slot.core.as_mut()?.take_pending_sco()
+}
+
+/// Whether an accept-claimable SCO link is pending on controller
+/// `dev` (non-consuming peek for poll/accept readiness).
+pub fn pending_sco(dev: u16) -> bool {
+    let pumps = PUMPS.lock();
+    let Some(slot) = pumps.iter().find(|s| s.index == dev as usize) else {
+        return false;
+    };
+    slot.core.as_ref().map(|c| c.pending_sco()).unwrap_or(false)
 }
 
 /// Claim the oldest unclaimed RFCOMM DLC opened by a peer to server
@@ -13507,6 +13553,65 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/pump", smoke_pump_sco_connect_send_recv);
+
+    /// #814 remainder: a peer-initiated SCO link — Synchronous
+    /// Connection Complete with no outbound setup in flight — stages
+    /// as an accept-claimable link: `pending_sco` peeks it,
+    /// `take_pending_sco` claims it once (handle, peer, MTU,
+    /// class), and a second take finds nothing. The ACL seed is
+    /// injected the same way the connect fixture does (the paging
+    /// half is covered by the classic fixtures).
+    fn smoke_pump_sco_accept_pending() -> TestResult {
+        reset_all();
+        let fake = Arc::new(ScriptedTransport::new());
+        if let Err(e) = central_bring_up(fake.clone()) {
+            reset_all();
+            return TestResult::Fail(e);
+        }
+        let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+        let acl_handle = 0x0042;
+        let sco_handle = 0x0043;
+        fake.enqueue_event(classic_connection_complete(acl_handle, peer));
+        let _ = pump_once(0);
+        if connection_count(0) != Some(1) {
+            reset_all();
+            return TestResult::Fail("ACL seed did not land a connection");
+        }
+        if pending_sco(0) {
+            reset_all();
+            return TestResult::Fail("no SCO link should be pending before the peer opens one");
+        }
+        // Peer-initiated SCO: no `sco_connect` call — the peer's
+        // Synchronous Connection Complete arrives unprompted.
+        fake.enqueue_event(sync_connection_complete_event(0, sco_handle, peer, 60, 60));
+        let _ = pump_once(0);
+        if !pending_sco(0) {
+            reset_all();
+            return TestResult::Fail("peer-initiated SCO link did not stage as pending");
+        }
+        match take_pending_sco(0) {
+            Some((handle, claimed_peer, mtu, dev_class))
+                if handle == sco_handle
+                    && claimed_peer == peer
+                    && mtu == 64
+                    && dev_class == [0, 0, 0] => {}
+            _ => {
+                reset_all();
+                return TestResult::Fail("take_pending_sco did not claim the peer link");
+            }
+        }
+        if pending_sco(0) {
+            reset_all();
+            return TestResult::Fail("claimed SCO link still reports pending");
+        }
+        if take_pending_sco(0).is_some() {
+            reset_all();
+            return TestResult::Fail("second take_pending_sco claimed a link");
+        }
+        reset_all();
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/pump", smoke_pump_sco_accept_pending);
 
     /// #814: SCO connect with no live ACL pages first — inquiry,
     /// Create Connection, Connection Complete, then Setup Sync —

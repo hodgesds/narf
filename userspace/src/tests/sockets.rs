@@ -1936,6 +1936,10 @@ kernel_test_in!("userspace", smoke_socket_stack_errno_passthrough);
 // this layer never touches a real controller.
 
 /// Scripted fake for the L2CAP/RFCOMM bridge + HCI ioctl providers.
+///
+/// A scripted SCO link: (SCO handle, peer bdaddr, MTU, peer class).
+type FakeScoLink = (u16, [u8; 6], u16, [u8; 3]);
+
 struct FakeBt {
     /// The fixture controller's bdaddr (hci_dev_info bytes 10..16).
     dev_bdaddr: [u8; 6],
@@ -1978,6 +1982,8 @@ struct FakeBt {
     connect_cancels: alloc::vec::Vec<(u16, [u8; 7], u16, bool, bool)>,
     /// Open SCO links: (handle, peer, mtu, dev_class).
     sco_links: alloc::vec::Vec<(u16, [u8; 6], u16, [u8; 3])>,
+    /// Peer-initiated SCO links awaiting accept: (dev, link).
+    sco_accept_pending: alloc::vec::Vec<(u16, FakeScoLink)>,
     /// SCO setups in flight: (dev, peer).
     sco_pending: alloc::vec::Vec<(u16, [u8; 6])>,
     /// Staged inbound SCO frames: (handle, payload).
@@ -2011,6 +2017,7 @@ impl FakeBt {
             connect_calls: alloc::vec::Vec::new(),
             connect_cancels: alloc::vec::Vec::new(),
             sco_links: alloc::vec::Vec::new(),
+            sco_accept_pending: alloc::vec::Vec::new(),
             sco_pending: alloc::vec::Vec::new(),
             rx_sco: alloc::vec::Vec::new(),
             sent_sco: alloc::vec::Vec::new(),
@@ -2432,6 +2439,40 @@ fn fake_bt_sco_cancel_connect(_dev: u16, peer: [u8; 6]) {
     FAKE_BT.lock().sco_pending.retain(|(_, p)| *p != peer);
 }
 
+/// Script a peer-initiated SCO link awaiting accept (handle,
+/// peer, the fixture SCO MTU, the peer's class from its inquiry
+/// record).
+fn fake_bt_script_sco_link(handle: u16, peer: [u8; 6]) {
+    let mut fake = FAKE_BT.lock();
+    let mtu = fake.sco_mtu;
+    fake.sco_accept_pending
+        .push((0, (handle, peer, mtu, [0x10, 0x01, 0x00])));
+}
+
+/// SCO accept: claim the oldest scripted peer-initiated link on
+/// `dev`. The claimed link joins the open links so the accepted
+/// socket's send/recv/drain reach it.
+fn fake_bt_take_pending_sco(dev: u16) -> Option<FakeScoLink> {
+    let mut fake = FAKE_BT.lock();
+    let idx = fake
+        .sco_accept_pending
+        .iter()
+        .position(|(d, _)| *d == dev)?;
+    let (_, link) = fake.sco_accept_pending.remove(idx);
+    if !fake.sco_links.iter().any(|(h, _, _, _)| *h == link.0) {
+        fake.sco_links.push(link);
+    }
+    Some(link)
+}
+
+fn fake_bt_pending_sco(dev: u16) -> bool {
+    FAKE_BT
+        .lock()
+        .sco_accept_pending
+        .iter()
+        .any(|(d, _)| *d == dev)
+}
+
 /// Reset the fake and install it as the bridge + HCI providers.
 fn install_fake_bt_bridge() {
     *FAKE_BT.lock() = FakeBt::new();
@@ -2471,6 +2512,8 @@ fn install_fake_bt_bridge() {
         fake_bt_sco_rx_pending,
         fake_bt_disconnect_sco,
         fake_bt_sco_cancel_connect,
+        fake_bt_take_pending_sco,
+        fake_bt_pending_sco,
     );
 }
 
@@ -3426,6 +3469,132 @@ fn smoke_bt_sco_connect_send_recv() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/bt_sco", smoke_bt_sco_connect_send_recv);
+
+/// SCO listen/accept/send/recv (#814 remainder): bind → listen →
+/// accept (EBADFD before listen, EAGAIN with no pending link, then
+/// a scripted peer-initiated link) → getpeername → SCO_OPTIONS /
+/// SCO_CONNINFO → recv a staged frame → send → shutdown
+/// disconnects. Poll reports POLL_IN while the link awaits accept
+/// and clears once accept drains it.
+fn smoke_bt_sco_listen_accept_send_recv() -> TestResult {
+    use narf_filesystem::FileOps;
+
+    install_fake_bt_bridge();
+    let server = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_BLUETOOTH,
+        crate::socket::SOCK_SEQPACKET,
+        crate::socket::BTPROTO_SCO,
+    );
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Accept),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::BadFdState)
+    ) {
+        return TestResult::Fail("SCO accept without listen should be EBADFD");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: bt_sco_addr([0; 6])
+        }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("SCO bind failed");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Listen { backlog: 8 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("SCO listen failed");
+    }
+    if server.poll_readiness() & narf_filesystem::POLL_IN != 0 {
+        return TestResult::Fail("SCO listener should not be readable with no pending link");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Accept),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock)
+    ) {
+        return TestResult::Fail("accept with no pending SCO link should be EAGAIN");
+    }
+    let peer = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5];
+    fake_bt_script_sco_link(0x0043, peer);
+    if server.poll_readiness() & narf_filesystem::POLL_IN == 0 {
+        return TestResult::Fail("SCO listener should be readable with a pending link");
+    }
+    let child = match server.dispatch_op(crate::socket::SocketOp::Accept) {
+        crate::socket::SocketOpResult::Accepted {
+            socket,
+            peer: Some(p),
+        } if p.family == crate::socket::AF_BLUETOOTH && p.body == peer.to_vec() => socket,
+        _ => return TestResult::Fail("accept did not return Accepted with the peer bdaddr"),
+    };
+    if server.poll_readiness() & narf_filesystem::POLL_IN != 0 {
+        return TestResult::Fail("SCO listener should clear once accept drains the link");
+    }
+    if !matches!(
+        server.dispatch_op(crate::socket::SocketOp::Accept),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock)
+    ) {
+        return TestResult::Fail("second accept with no pending SCO link should be EAGAIN");
+    }
+    match child.dispatch_op(crate::socket::SocketOp::GetPeerName) {
+        crate::socket::SocketOpResult::Addr(addr)
+            if addr.family == crate::socket::AF_BLUETOOTH && addr.body == peer.to_vec() => {}
+        _ => return TestResult::Fail("SCO getpeername did not report the peer"),
+    }
+    let mut opt = [0u8; 2];
+    match child.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SCO,
+        name: crate::socket::SCO_OPTIONS,
+        buf: &mut opt,
+    }) {
+        crate::socket::SocketOpResult::OptValue { n } if n == 2 && opt == 64u16.to_ne_bytes() => {}
+        _ => return TestResult::Fail("SCO_OPTIONS did not report mtu 64 on the accepted link"),
+    }
+    let mut info = [0u8; 5];
+    match child.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SCO,
+        name: crate::socket::SCO_CONNINFO,
+        buf: &mut info,
+    }) {
+        crate::socket::SocketOpResult::OptValue { n }
+            if n == 5 && info == [0x43, 0x00, 0x10, 0x01, 0x00] => {}
+        _ => {
+            return TestResult::Fail(
+                "SCO_CONNINFO did not report handle/class on the accepted link",
+            );
+        }
+    }
+    fake_bt_stage_sco_rx(0x0043, b"echo");
+    let mut out = [0u8; 16];
+    match child.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    }) {
+        crate::socket::SocketOpResult::Received { n, .. } if n == 4 && &out[..4] == b"echo" => {}
+        _ => return TestResult::Fail("SCO recv did not return the staged frame"),
+    }
+    match child.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"voice",
+        flags: 0,
+        addr: None,
+    }) {
+        crate::socket::SocketOpResult::Ok(5) => {}
+        _ => return TestResult::Fail("SCO send did not report 5 bytes"),
+    }
+    if FAKE_BT.lock().sent_sco != alloc::vec![(0x0043u16, b"voice".to_vec())] {
+        return TestResult::Fail("SCO send did not reach the fake bridge");
+    }
+    if !matches!(
+        child.dispatch_op(crate::socket::SocketOp::Shutdown { how: 0 }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("SCO shutdown failed");
+    }
+    if !FAKE_BT.lock().disconnected_sco.contains(&0x0043u16) {
+        return TestResult::Fail("SCO shutdown did not disconnect the link");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/bt_sco", smoke_bt_sco_listen_accept_send_recv);
 
 /// SCO error paths: send/recv/getpeername/SCO_OPTIONS without a
 /// link, connect with no pump, double connect, MSG_OOB send,

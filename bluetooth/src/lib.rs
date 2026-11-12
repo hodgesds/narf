@@ -274,6 +274,8 @@ pub fn register_initcalls() {
             crate::pump::sco_rx_pending,
             crate::pump::disconnect_sco,
             crate::pump::cancel_sco_connect,
+            crate::pump::take_pending_sco,
+            crate::pump::pending_sco,
         );
         InitResult::Ok
     });
