@@ -8025,16 +8025,23 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
     Ok(())
 }
 
-/// One step of a long operation — a truncate, a fallocate — under the
-/// volume's operation lock, as `autogrow!` runs a whole operation: refused
-/// on a filesystem that no longer takes writes, preceded by orphan reaping,
-/// and retried after growing the filesystem by a chunk when it runs out of
-/// space. The lock is released when the step is done, so other operations
-/// run between two steps; the caller holds the inode's own lock
-/// (`MmapAnchor::content_lock`, Linux `inode_lock`) across all of them, and
-/// yields between steps ([`step_break`]). Linux likewise ends and restarts
-/// its transaction between steps and calls `btrfs_btree_balance_dirty`,
-/// which may sleep.
+/// One step of a long operation — a truncate, a fallocate — excluding the
+/// running operation, as `autogrow!` runs a whole operation: refused on a
+/// filesystem that no longer takes writes, preceded by orphan reaping, and
+/// retried after growing the filesystem by a chunk when it runs out of
+/// space. The exclusion is released when the step is done, so other
+/// operations and commits run between two steps; the caller holds the
+/// inode's own lock (`MmapAnchor::content_lock`, Linux `inode_lock`) across
+/// all of them, and yields between steps ([`step_break`]). Linux likewise
+/// ends and restarts its transaction between steps (a fresh
+/// `btrfs_start_transaction` joins the running one) and calls
+/// `btrfs_btree_balance_dirty`, which may sleep.
+///
+/// A step does not wait in the operation queue (`op_lock`): it takes
+/// `commit_excl` directly ([`crate::volume::VolCore::begin_commit`]), so it
+/// waits for the operation in flight and at most the one at the head of the
+/// queue, never for every operation queued behind it. One step is a bounded
+/// amount of work, so neither do those operations wait long for it.
 pub(crate) async fn locked_step<B, F, Fut, T>(vol: &BtrfsVolume<B>, mut op: F) -> Result<T, FsError>
 where
     B: BlockDevice + 'static,
@@ -8044,7 +8051,7 @@ where
     if !vol.admits_writes() {
         return Err(FsError::ReadOnly);
     }
-    let _op = vol.begin_op().await;
+    let _op = vol.begin_commit().await;
     if !vol.admits_writes() {
         return Err(FsError::ReadOnly);
     }

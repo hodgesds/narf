@@ -422,8 +422,9 @@ its own, for the crash tests of the `release` scenario
 (`smoke_btrfs_fallocate_reserves_in_steps`).
 
 A truncate or fallocate holds its inode's own lock (`MmapAnchor::content_lock`,
-Linux `inode_lock`) from start to end, and takes the volume's operation lock
-one step at a time (`write::locked_step`, with the orphan reaping and the
+Linux `inode_lock`) from start to end, and excludes the running operation
+one step at a time (`write::locked_step`: `commit_excl` without waiting in
+the operation queue, as an `fsync` does; with the orphan reaping and the
 grow-and-retry `autogrow!` gives a whole operation), yielding between steps
 (`write::step_break`, Linux ending its transaction and
 `btrfs_btree_balance_dirty`). Other operations of the filesystem run between

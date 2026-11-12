@@ -2647,7 +2647,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     /// Exclude the running operation for a commit forced from outside any
-    /// operation, ahead of the operations still queued (see `commit_excl`).
+    /// operation, or for one step of a truncate or fallocate, ahead of the
+    /// operations still queued (see `commit_excl`).
     pub(crate) async fn begin_commit(&self) -> narf_lib::mutex::MutexGuard<'_, ()> {
         self.commit_excl.lock().await
     }
