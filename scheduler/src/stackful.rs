@@ -8040,11 +8040,12 @@ pub mod tests {
         for _ in 0..TASKS {
             crate::spawn_stackful(sleeper());
         }
-        // Drive enough rounds that the LAPIC tick (every
-        // ~10 ms on QEMU) fires multiple times and drains the
-        // wheel. 1024 rounds with timer_pump activity is
-        // ample.
-        for _ in 0..1024 {
+        // Drive rounds until every sleeper finished or 1 s passed. The
+        // sleepers park on hrtimers now (no self-wake polling), so a fixed
+        // round count can finish before their ~300 µs deadline; each round
+        // expires this CPU's due timers.
+        let end = narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(1_000_000_000));
+        while narf_time::now_cycles() < end {
             crate::poll_one_round();
             if (DONE.load(Ordering::Acquire) as usize) >= TASKS {
                 break;

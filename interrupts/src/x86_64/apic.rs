@@ -1375,6 +1375,12 @@ pub unsafe fn start_timer_tsc_deadline(timer_vector: u8, period_cycles: u64) {
     // `hrtimers_prepare_cpu`: this CPU's base exists before its first tick.
     narf_time::hrtimer::hrtimers_prepare_cpu(cpu);
     TSC_DEADLINE_PERIOD_CYCLES[cpu].store(period_cycles, Ordering::Release);
+    // The local TSC-deadline clockevent is the hrtimer programmer
+    // (`tick_program_event`) whether or not the HPET pump comes up; the pump,
+    // when it does, installs a programmer that also drives this one.
+    if !narf_time::hrtimer::arm_callback_installed() {
+        narf_time::hrtimer::set_arm_callback(arm_hrtimer_event);
+    }
     // SAFETY: caller upholds CPL=0 + LAPIC live.
     let now = unsafe { core::arch::x86_64::_rdtsc() };
     let first = now.wrapping_add(period_cycles);
