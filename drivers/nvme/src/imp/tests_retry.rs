@@ -300,42 +300,45 @@ kernel_test_in!(
     smoke_nvme_late_completion_is_polled_qemu
 );
 
-/// The cap-addressed submit path (`nvme_submit_blocking`) hands the device
-/// the caller's own DMA buffer. When its request fails with a timeout the
-/// controller has been reset at the timeout site — confirmed disabled, so
-/// nothing can still write the buffer — and the buffer is returned to the
-/// caller as usual: not retained, its reference count unchanged.
+/// The queued block path (`NvmeBlockDevice::submit` → `req::NvmeRequest`)
+/// hands the device the caller's own DMA buffer. When its request fails
+/// with a timeout the controller has been reset at the timeout site —
+/// confirmed disabled, so nothing can still write the buffer — and the
+/// request's pin on the buffer is released with the reset: not retained,
+/// its reference count unchanged.
 fn smoke_nvme_timed_out_buffer_released_after_confirmed_reset_qemu() -> TestResult {
-    use narf_block::{BlockError, BlockOp, BlockRequest, QosHint};
+    use narf_block::{BlockDevice, BlockError, BlockOp, BlockRequest, QosHint};
     use narf_io::{alloc_coherent, register_with_cap, resolve_cap};
     use narf_lib::id::DomainId;
     with_fault_fixture(|_d, hooks| {
         let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "alloc_coherent failed")?;
         let write_cap = register_with_cap(buf);
-        let cap = write_cap
-            .derive::<narf_capabilities::Read>()
-            .map_err(|_| "derive Read from live write cap failed")?;
-        let req = BlockRequest {
-            op: BlockOp::Read,
-            lba: SCRATCH_LBA,
-            blocks: 1,
-            buffer: cap,
-            qos: QosHint::Latency,
-            user_tag: 0,
+        let request = || -> Result<BlockRequest, &'static str> {
+            Ok(BlockRequest {
+                op: BlockOp::Read,
+                lba: SCRATCH_LBA,
+                blocks: 1,
+                buffer: write_cap
+                    .derive::<narf_capabilities::Read>()
+                    .map_err(|_| "derive Read from live write cap failed")?,
+                qos: QosHint::Latency,
+                user_tag: 0,
+            })
         };
-        let buffer = resolve_cap(&req.buffer).ok_or("cap did not resolve to its buffer")?;
+        let buffer = resolve_cap(&write_cap).ok_or("cap did not resolve to its buffer")?;
         let refs0 = Arc::strong_count(&buffer);
         let retained0 = super::retained_io_buffers();
         let replays0 = super::io_replays();
+        let dev = super::NvmeBlockDevice;
 
         hooks.lose(u32::MAX);
-        let r = super::nvme_submit_blocking(&req, Some(buffer.clone()));
+        let r = narf_scheduler::block_on_spin(dev.submit(request()?)).result;
         hooks.lose(0);
         if r != Err(BlockError::IOError) {
             return Err("a submit that keeps timing out did not return the I/O error");
         }
         if super::io_replays() != replays0 + IO_MAX_RETRIES as u64 {
-            return Err("the cap-addressed submit was not replayed IO_MAX_RETRIES times");
+            return Err("the queued submit was not replayed IO_MAX_RETRIES times");
         }
         // Reset at the timeout site: alive again, hence confirmed stopped
         // in between.
@@ -346,9 +349,13 @@ fn smoke_nvme_timed_out_buffer_released_after_confirmed_reset_qemu() -> TestResu
             return Err("the buffer was retained although the controller was confirmed disabled");
         }
         // And the same request works once the device answers.
-        if super::nvme_submit_blocking(&req, Some(buffer.clone())).is_err() {
+        if narf_scheduler::block_on_spin(dev.submit(request()?))
+            .result
+            .is_err()
+        {
             return Err("the request did not succeed once the device answered");
         }
+        narf_io::unregister(write_cap);
         Ok(())
     })
 }
@@ -357,53 +364,63 @@ kernel_test_in!(
     smoke_nvme_timed_out_buffer_released_after_confirmed_reset_qemu
 );
 
-/// The other half: when the controller could NOT be shown disabled after
-/// the timeout it may still write the buffer, so one reference is leaked
-/// and the memory can never be recycled under that write — whether the
-/// controller is merely dead-and-unstopped, or its gate cannot even be
-/// taken to find out. A controller that is alive again, or dead but
-/// confirmed stopped, retains nothing. Device-less slots: only the
-/// decision is under test.
+/// The other half: when the controller could NOT be shown disabled at the
+/// teardown that follows a timeout, it may still write the command's
+/// pages, so the queue leaks them — the payload pin and the PRP page — and
+/// the memory can never be recycled under that write. A teardown after a
+/// confirmed stop frees them. Device-less fake queue: only the decision
+/// is under test.
 fn smoke_nvme_timed_out_buffer_retained_while_device_live() -> TestResult {
+    use super::mq::{Cmd, CmdResources};
+    use super::tests_cid::fake_cid_controller_with;
     use narf_io::alloc_coherent;
     use narf_lib::id::DomainId;
     let Ok(buf) = alloc_coherent(4096, DomainId::DRIVER_0) else {
         return TestResult::Fail("alloc_coherent failed");
     };
     let buffer = Arc::new(buf);
-    let slot_with = |dead: bool, stop_confirmed: bool| {
-        let mut c = super::Controller::new(0);
-        c.dead = dead;
-        c.stop_confirmed = stop_confirmed;
-        super::leak_slot(u32::MAX, None, c)
-    };
     let retained0 = super::retained_io_buffers();
+    let post = |fx: &super::tests_cid::FakeCidCtrl| -> Option<Cmd> {
+        let q = fx.ctrl.io_queues()[0].clone();
+        let tag = q.try_alloc_tag(None)?;
+        let mut sqe = super::Sqe::zero();
+        sqe.cdw0 = super::IoOpcode::Read as u32;
+        sqe.nsid = 1;
+        sqe.prp1 = buffer.dma_addr().raw();
+        let res = CmdResources {
+            prp_list: q.prp_page(),
+            hold: Some(Arc::clone(&buffer)),
+        };
+        let id = q.post(tag, sqe, res).ok()?;
+        Some(Cmd::new(q, id))
+    };
 
-    // Alive again (it was reset), and dead-but-confirmed-stopped: quiet.
-    super::retain_buffer_while_device_live(slot_with(false, false), &buffer);
-    super::retain_buffer_while_device_live(slot_with(true, true), &buffer);
+    // Confirmed stopped: the pages come back.
+    let Some(fx) = fake_cid_controller_with(None) else {
+        return TestResult::Fail("fake controller setup failed");
+    };
+    let Some(cmd) = post(&fx) else {
+        return TestResult::Fail("post failed");
+    };
+    drop(cmd);
+    fx.ctrl.io_queues()[0].teardown(true);
     if Arc::strong_count(&buffer) != 1 || super::retained_io_buffers() != retained0 {
         return TestResult::Fail("a buffer was retained for a controller that cannot DMA");
     }
 
-    // Dead and never confirmed stopped: the device may still write it.
-    super::retain_buffer_while_device_live(slot_with(true, false), &buffer);
-    if Arc::strong_count(&buffer) != 2 || super::retained_io_buffers() != retained0 + 1 {
-        return TestResult::Fail("the buffer of a possibly-live command was not retained");
+    // Never confirmed stopped: the device may still write them.
+    let Some(fx) = fake_cid_controller_with(None) else {
+        return TestResult::Fail("fake controller setup failed");
+    };
+    let Some(cmd) = post(&fx) else {
+        return TestResult::Fail("post failed");
+    };
+    drop(cmd);
+    fx.ctrl.io_queues()[0].teardown(false);
+    if Arc::strong_count(&buffer) != 2 || super::retained_io_buffers() != retained0 + 2 {
+        return TestResult::Fail("the pages of a possibly-live command were not retained");
     }
-
-    // The gate cannot be taken: nothing is known, so fail closed.
-    let stuck = slot_with(false, false);
-    stuck.req_gate.store(true, Ordering::Release);
-    super::GATE_STALL_WARN_MS_FOR_TEST.store(10, Ordering::Release);
-    super::GATE_STALL_FAIL_MS_FOR_TEST.store(30, Ordering::Release);
-    super::retain_buffer_while_device_live(stuck, &buffer);
-    super::GATE_STALL_WARN_MS_FOR_TEST.store(0, Ordering::Release);
-    super::GATE_STALL_FAIL_MS_FOR_TEST.store(0, Ordering::Release);
-    if Arc::strong_count(&buffer) != 3 || super::retained_io_buffers() != retained0 + 2 {
-        return TestResult::Fail("the buffer was not retained when the controller was unreachable");
-    }
-    // The two leaked references are the point of the test; the page stays
+    // The leaked reference is the point of the test; the page stays
     // allocated for the rest of the boot.
     TestResult::Pass
 }
