@@ -70,7 +70,13 @@ fn with_btrfs(seed: &[u8], body: impl FnOnce(&Fixture) -> Result<(), &'static st
         *COH_AS.lock() = Some(Arc::clone(&aspace));
         crate::handlers::install_address_space_lookup(lookup_coh_as);
         let result = (|| {
-            let volume = crate::abi_fault_write_tests::btrfs_volume_with_file(seed)?;
+            // The free-space-tree fixture: the allocator the soak's root
+            // uses. On the primary fixture (no free-space tree) the replay
+            // ran out of space after a few dozen operations.
+            let volume = crate::abi_fault_write_tests::btrfs_volume_with_file_on(
+                crate::abi_fault_write_tests::BTRFS_FST_FIXTURE_SPARSE,
+                seed,
+            )?;
             let open = || {
                 crate::handlers::poll_io_to_completion(volume.root().lookup_async("narf.txt"))
                     .and_then(|r| r.ok())

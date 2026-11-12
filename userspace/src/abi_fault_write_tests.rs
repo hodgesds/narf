@@ -467,7 +467,23 @@ pub(crate) fn btrfs_decode_sparse(sparse: &[u8]) -> alloc::vec::Vec<u8> {
 pub(crate) fn btrfs_volume_with_file(
     seed: &[u8],
 ) -> Result<Arc<narf_drivers_fs_btrfs::volume::BtrfsVolume<RamBlockDevice>>, &'static str> {
-    let device = RamBlockDevice::from_image(512, btrfs_decode_sparse(BTRFS_FIXTURE_SPARSE));
+    btrfs_volume_with_file_on(BTRFS_FIXTURE_SPARSE, seed)
+}
+
+/// The btrfs driver's free-space-tree fixture: 16 MiB, mixed block groups,
+/// with the free-space tree a `root-rw` root requires, so writes go through
+/// the allocator the real root uses (reclaiming freed space) rather than
+/// the append-only one of a filesystem without the tree, which a long mixed
+/// workload runs out of within a few dozen operations.
+pub(crate) const BTRFS_FST_FIXTURE_SPARSE: &[u8] =
+    include_bytes!("../../drivers/fs/btrfs/testdata/fixture-fst.img.sparse");
+
+/// [`btrfs_volume_with_file`] on the fixture `sparse`.
+pub(crate) fn btrfs_volume_with_file_on(
+    sparse: &[u8],
+    seed: &[u8],
+) -> Result<Arc<narf_drivers_fs_btrfs::volume::BtrfsVolume<RamBlockDevice>>, &'static str> {
+    let device = RamBlockDevice::from_image(512, btrfs_decode_sparse(sparse));
     let volume = crate::handlers::poll_io_to_completion(
         narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(device, narf_lib::id::DomainId::DRIVER_0),
     )
