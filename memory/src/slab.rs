@@ -1187,6 +1187,11 @@ pub unsafe fn try_dealloc_atomic(
                 .fetch_add(1, Ordering::Relaxed);
             return Err(AtomicDeallocFull);
         }
+        // A sampled allocation freed from IRQ context is retired from the
+        // site audit like any other free (allocation-free, IRQ-safe lock).
+        if site_audit::armed() && c >= site_audit::SMALL_MIN_CLASS {
+            site_audit::forget(ptr.as_ptr() as usize);
+        }
         let blk = ptr.cast::<FreeBlock>();
         // SAFETY: caller hands us ownership of the block; the push
         // below is what publishes it as free. IRQ context — the
