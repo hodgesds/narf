@@ -157,8 +157,6 @@ mod errno_linux_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod ip_fragment_tests;
 #[cfg(any(test, feature = "kernel-test"))]
-mod watchdog_tests;
-#[cfg(any(test, feature = "kernel-test"))]
 mod ip_output_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod ipv6_e2e_tests;
@@ -176,6 +174,8 @@ mod tests;
 mod tls_client_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod udp_gso_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod watchdog_tests;
 
 use alloc::boxed::Box;
 use alloc::string::String;
