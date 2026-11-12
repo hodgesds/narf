@@ -114,6 +114,13 @@ pub fn register_local(dev: &'static dyn ClockEvent) {
 /// their periodic tick. `budget_deadline` replaces the task execution deadline.
 pub fn set_idle_tick(stop_tick: bool, budget_deadline: Option<u64>) -> bool {
     let cpu = narf_lib::percpu::current_cpu();
+    // Timer migration: a CPU entering tickless idle hands its global timers
+    // to the active CPUs before its next event is computed.
+    if stop_tick && crate::nohz_idle_enabled() {
+        crate::timer_migration::tmigr_cpu_deactivate();
+    } else {
+        crate::timer_migration::tmigr_cpu_activate();
+    }
     LOCAL
         .get(cpu)
         .and_then(|slot| slot.get())
@@ -125,6 +132,7 @@ pub fn set_idle_tick(stop_tick: bool, budget_deadline: Option<u64>) -> bool {
 /// Restore preemption before entering a runnable task, including nested polls.
 pub fn restart_local_tick() {
     let cpu = narf_lib::percpu::current_cpu();
+    crate::timer_migration::tmigr_cpu_activate();
     if !crate::periodic_tick_wanted(cpu) {
         set_idle_tick(false, None);
     }

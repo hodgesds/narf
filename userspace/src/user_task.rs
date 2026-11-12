@@ -567,6 +567,10 @@ pub struct UserTaskCtx {
     /// (`try_to_wake_up`). Keeping the executor waker beside the task gives
     /// NARF the same durable fallback without scanning run queues.
     scheduler_waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Timer-wheel timeout for coarse park backstops (the console
+    /// byte-waker fallback), created on first use.
+    pub coarse_timeout:
+        narf_lib::sync::IrqSafeSpinLock<Option<narf_scheduler::narf_time::timer::TimeoutHandle>>,
     /// `restart_block` of a timed FUTEX_WAIT interrupted by a signal: the
     /// word it waited on and its ABSOLUTE monotonic deadline. Linux restarts
     /// such a wait through `futex_wait_restart` with the stored expiry, so
@@ -943,6 +947,7 @@ impl UserTaskCtx {
             syscall_parked_restarting: AtomicBool::new(false),
             syscall_restart_kind: AtomicU32::new(SYSCALL_RESTART_SYS),
             scheduler_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            coarse_timeout: narf_lib::sync::IrqSafeSpinLock::new(None),
             futex_restart_uaddr: AtomicU64::new(0),
             futex_restart_deadline_ns: AtomicU64::new(0),
             nanosleep_restart_req: AtomicU64::new(0),
@@ -1835,14 +1840,17 @@ fn park_should_block(
         // now durable; the byte-waker slot is not, so its net stays.
         // Convert via `ns_to_cycles` (precise inverse of `cycles_to_ns`), NOT
         // `* cycles_per_ns()` — see the deadline-park note above.
+        // A coarse backstop that is almost always cancelled by the byte
+        // arriving first: a timer-wheel timeout (`schedule_timeout`), not an
+        // hrtimer, as Linux uses for such waits. Not deferrable: it exists
+        // for the case where the byte wake was lost, so it must fire.
         const BYTE_WAKER_FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
-        let now = narf_scheduler::narf_time::monotonic_ns();
-        arm_park_timer(
-            sleep_handle,
-            now.saturating_add(BYTE_WAKER_FALLBACK_NS),
-            uc.timer_slack(),
-            waker,
-        );
+        use narf_scheduler::narf_time::timer;
+        let expires = timer::jiffies() + timer::ns_to_jiffies(BYTE_WAKER_FALLBACK_NS);
+        uc.coarse_timeout
+            .lock()
+            .get_or_insert_with(|| timer::TimeoutHandle::new(0))
+            .arm(expires, waker);
         return true;
     }
 

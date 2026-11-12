@@ -901,15 +901,31 @@ fn expire_hard(base: &'static HrTimerCpuBase) -> Ktime {
 /// timers, raises the soft expiry if due, and returns the next event in
 /// clockevent cycles (`u64::MAX` when none) for the caller to program.
 pub fn hrtimer_interrupt() -> u64 {
+    // `run_local_timers`: raise the timer softirq when a wheel base is due.
+    crate::timer::timer_tick();
     let Some(base) = cpu_base(this_cpu()) else {
-        return u64::MAX;
+        return ns_to_deadline_cycles(crate::timer::next_timer_event_ns_local());
     };
-    if base.next_event.load(Ordering::Acquire) > crate::monotonic_ns()
+    let next = if base.next_event.load(Ordering::Acquire) > crate::monotonic_ns()
         && !base.retrigger.swap(false, Ordering::AcqRel)
     {
-        return ns_to_deadline_cycles(base.next_event.load(Ordering::Acquire));
+        base.next_event.load(Ordering::Acquire)
+    } else {
+        expire_hard(base)
+    };
+    // The clockevent also carries the timer wheel's next expiry.
+    ns_to_deadline_cycles(next.min(crate::timer::next_timer_event_ns_local()))
+}
+
+/// Make `cpu` re-evaluate its next event now: set its retrigger flag, then
+/// send it the reschedule IPI (`trigger_dyntick_cpu`). Used when a timer is
+/// queued on another CPU's base.
+pub fn kick_cpu_next_event(cpu: u32) {
+    if let Some(base) = cpu_base(cpu as usize) {
+        base.retrigger.store(true, Ordering::Release);
+        fence(Ordering::SeqCst);
+        remote_kick(cpu);
     }
-    ns_to_deadline_cycles(expire_hard(base))
 }
 
 /// `hrtimer_run_queues`: the periodic-tick (low-resolution) expiry path, for
@@ -934,6 +950,8 @@ pub fn hrtimer_run_softirq() -> u64 {
         return 0;
     };
     let before = base.nr_events.load(Ordering::Relaxed);
+    // `TIMER_SOFTIRQ`: the timer wheel expires in the same context.
+    let wheel = crate::timer::run_timer_softirq();
     let now = crate::monotonic_ns();
     // Load first: this runs on every executor round, and an unconditional
     // swap would dirty the line each time.
@@ -953,7 +971,7 @@ pub fn hrtimer_run_softirq() -> u64 {
         });
         let _ = next;
     }
-    base.nr_events.load(Ordering::Relaxed) - before
+    base.nr_events.load(Ordering::Relaxed) - before + wheel
 }
 
 /// Expire every CPU's due hard timers from this CPU (tick broadcast for a
@@ -992,6 +1010,7 @@ pub fn retrigger_next_event() {
         let mut g = base.inner.lock();
         let next = update_next_event(base, &mut g);
         drop(g);
+        let next = next.min(crate::timer::next_timer_event_ns_local());
         tick_program_event(next);
         next
     });
@@ -1036,8 +1055,10 @@ fn clock_was_set_bases() {
 /// local clockevent must fire for (`None` when idle with no timers). Lock-free
 /// and IRQ-safe; used by tickless idle and the timer interrupt.
 pub fn next_event_cycles_local() -> Option<u64> {
-    let base = cpu_base(this_cpu())?;
-    let n = base.next_event.load(Ordering::Acquire);
+    let hr = cpu_base(this_cpu()).map_or(KTIME_MAX, |b| b.next_event.load(Ordering::Acquire));
+    // `tick_nohz_next_event`: the earlier of the next hrtimer and the next
+    // timer-wheel expiry that may wake this CPU.
+    let n = hr.min(crate::timer::next_timer_event_ns_local());
     (n != KTIME_MAX).then(|| ns_to_deadline_cycles(n))
 }
 
