@@ -60,11 +60,12 @@ use crate::rmi4_core::{
 
 // ── Device ID table ────────────────────────────────────────────────
 //
-// Mirror of Linux `rmi_id[]` in `hid-rmi.c:753`. Both numeric IDs
-// and the "any device on HID_GROUP_RMI bus group" catch-all
-// fallback are kept — modern Synaptics OEM touchpads (ThinkPad,
-// Yoga, Surface, MSI laptops) all bind through the HID-group
-// route on the wire, not specific USB VIDs.
+// Mirror of Linux `rmi_id[]` in `hid-rmi.c:753`. Only the
+// numeric IDs are kept — the "any device on HID_GROUP_RMI bus
+// group" catch-all is NOT implemented (issue #1718), so modern
+// Synaptics OEM touchpads (ThinkPad, Yoga, Surface, MSI
+// laptops) that bind through the HID-group route on Linux fall
+// through to the PTP / generic binders here instead.
 
 /// USB vendor ID for Synaptics (Linux `USB_VENDOR_ID_SYNAPTICS`,
 /// `hid-ids.h:1350`).
@@ -118,10 +119,11 @@ pub struct DeviceMatch {
     pub quirks: DeviceQuirks,
 }
 
-/// The explicit device list (Linux `rmi_id[]:754-759`). The final
-/// "any device in HID_GROUP_RMI" catch-all is checked separately
-/// by the USB-HID glue, since group matching is a transport
-/// concern.
+/// The explicit device list (Linux `rmi_id[]:754-759`). The
+/// "any device in HID_GROUP_RMI" catch-all is NOT implemented
+/// (issue #1718): only this explicit table matches, and the
+/// USB-HID glue falls through to the PTP / generic binders for
+/// group-route devices.
 pub const RMI_DEVICE_TABLE: &[DeviceMatch] = &[
     DeviceMatch {
         vendor: USB_VENDOR_ID_RAZER,
@@ -852,11 +854,13 @@ impl<'d> HidRmiSession<'d> {
 /// transport layer owns probing). This initcall prints the "loaded"
 /// banner so the FB panel + boot smoke can confirm the driver is
 /// linked, mirroring how Linux logs `module_hid_driver(rmi_driver)`.
+/// The HID_GROUP_RMI catch-all is not implemented (issue #1718),
+/// so the banner counts explicit table rows only.
 pub fn register_initcalls() {
     use core::fmt::Write as _;
     let _ = writeln!(
         narf_console::Writer,
-        "  hid-rmi: loaded ({} explicit USB IDs + HID-group catch-all)",
+        "  hid-rmi: loaded ({} explicit USB IDs)",
         RMI_DEVICE_TABLE.len(),
     );
 }
