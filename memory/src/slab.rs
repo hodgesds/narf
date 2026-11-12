@@ -1926,9 +1926,13 @@ pub fn drain_over_watermark() {
                 still_over = true;
                 break;
             }
+            // Keep the class's `min_partial` cache unless a legacy scan is
+            // what is wanted; the keep bound is re-checked under the class
+            // lock, since another CPU may be draining this class too.
+            let keep_now = if legacy_want > excess { 0 } else { keep };
             // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s
             // blocks. Called from the sleepable maintenance context per the doc.
-            let freed = unsafe { reclaim_class_frames(c, target) };
+            let freed = unsafe { reclaim_class_frames_keeping(c, target, keep_now) };
             shed += freed;
             if freed == 0 {
                 break;
@@ -2127,14 +2131,39 @@ pub fn reclaim_empty_frames_to_buddy(target_pages: usize) -> usize {
 /// the buddy exactly once. The central free list holds only this class's
 /// blocks.
 unsafe fn detach_class_frames(c: usize, max_pages: usize, frames: &mut [usize]) -> usize {
+    // SAFETY: forwarded caller contract.
+    unsafe { detach_class_frames_keeping(c, max_pages, frames, 0) }
+}
+
+/// [`detach_class_frames`], but leaving at least `keep_empty` tracked empty
+/// frames on the class. The bound is applied under the class lock, so
+/// concurrent maintenance drains on several CPUs cannot together overshoot
+/// the class's [`min_empty_frames`] cache (each reads the count it may
+/// release in the same critical section that releases it). A nonzero
+/// `keep_empty` also confines the pass to tracked frames.
+///
+/// # Safety
+/// As [`detach_class_frames`].
+unsafe fn detach_class_frames_keeping(
+    c: usize,
+    max_pages: usize,
+    frames: &mut [usize],
+    keep_empty: usize,
+) -> usize {
     let class = &CLASSES[c];
     let block_size = class_size(c);
     let n_blocks = PAGE_SIZE_USIZE / block_size;
-    let limit = max_pages.min(frames.len());
+    let mut limit = max_pages.min(frames.len());
     if n_blocks == 0 || limit == 0 {
         return 0;
     }
     let mut g = class.head.lock();
+    if keep_empty != 0 {
+        limit = limit.min(g.frames.counts().1.saturating_sub(keep_empty));
+        if limit == 0 {
+            return 0;
+        }
+    }
     // SAFETY: class lock owns both central representations and the caller
     // returns the detached frames after this function releases that lock.
     let detached_pages =
@@ -2176,10 +2205,20 @@ unsafe fn free_detached_slab_frames(frames: &[usize]) {
 /// # Safety
 /// `c < N_CLASSES`. The central free list holds only this class's blocks.
 unsafe fn reclaim_class_frames(c: usize, max_pages: usize) -> usize {
+    // SAFETY: forwarded caller contract.
+    unsafe { reclaim_class_frames_keeping(c, max_pages, 0) }
+}
+
+/// [`reclaim_class_frames`] that leaves `keep_empty` tracked empty frames
+/// (see [`detach_class_frames_keeping`]).
+///
+/// # Safety
+/// As [`reclaim_class_frames`].
+unsafe fn reclaim_class_frames_keeping(c: usize, max_pages: usize, keep_empty: usize) -> usize {
     let mut frames = [0usize; SLAB_RECLAIM_BATCH_FRAMES];
     // SAFETY: caller proves the class index/list invariant; every detached
     // frame is consumed exactly once immediately below.
-    let detached = unsafe { detach_class_frames(c, max_pages, &mut frames) };
+    let detached = unsafe { detach_class_frames_keeping(c, max_pages, &mut frames, keep_empty) };
     // SAFETY: exactly the initialized detached prefix is passed once.
     unsafe { free_detached_slab_frames(&frames[..detached]) };
     detached
