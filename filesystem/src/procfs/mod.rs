@@ -2992,7 +2992,7 @@ pub fn mem_breakdown() -> MemBreakdown {
     let kernel_stack_kb = stack_live as u64 / 1024;
     let stack_cache_kb = stack_cached as u64 / 1024;
     let cached_kb = page_cache_stats().pages as u64 * 4;
-    let user_charged_kb = narf_memory::cgroup_charge::user_charged_bytes() / 1024;
+    let user_charged_kb = narf_memory::frame::user_charged_bytes() / 1024;
     let mut m = MemBreakdown {
         total_kb,
         free_kb,
