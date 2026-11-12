@@ -207,6 +207,22 @@ fn warn_cmdline_truncated(received: usize, kept: usize) {
     }
 }
 
+/// Report on the boot UART that no devicetree was found and the memory map
+/// is a guess (see [`warn_cmdline_truncated`] for the channel).
+fn warn_no_dtb() {
+    use core::fmt::Write as _;
+    let mut line = LineBuf::<160>::new();
+    let _ = core::write!(
+        line,
+        "boot: WARN: no devicetree found (handoff, {:#x}, or RAM scan); \
+         assuming 128 MiB of RAM at 0x40000000\r\n",
+        runner_dtb_addr()
+    );
+    for &b in line.as_slice() {
+        uart_putc(b);
+    }
+}
+
 /// Physical address of the boot devicetree: the bootloader's `x0` when
 /// non-null, else the result of scanning low RAM for the FDT magic (the
 /// same lookup [`parse_raw`] uses). Exposed so the GIC can be discovered
@@ -346,7 +362,10 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         }
     } else {
         // Preserve direct-QEMU fallback for ELF boots that provide no
-        // discoverable DTB.
+        // discoverable DTB. Say so: a kernel image larger than the guessed
+        // 128 MiB reserves all of it, and boot then dies on its first
+        // allocation with nothing pointing back here.
+        warn_no_dtb();
         // SAFETY: single-threaded boot owns the static map and the
         // returned slice becomes immutable before secondary CPUs start.
         unsafe {
@@ -626,13 +645,31 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
     }
 }
 
+/// Physical address xtask's QEMU runner loads the DTB at for a raw-ELF boot:
+/// the image's link-time physical end, raised to 0x4800_0000 and rounded up
+/// to 1 MiB — `dtb_load_addr` in build/xtask/src/aarch64_initrd.rs, from the
+/// same ELF extents. The boot stub's `.Lfdt_pick` probes the same address.
+fn runner_dtb_addr() -> u64 {
+    const FLOOR: u64 = 0x4800_0000;
+    const ALIGN: u64 = 1024 * 1024;
+    unsafe extern "C" {
+        static __kernel_phys_bounds: [u64; 2];
+    }
+    // SAFETY: two linker-populated words inside the image, read-only (see
+    // `.kernel_bounds` in build/linker/aarch64.ld). The end is the link-time
+    // value, which is what the runner computed the address from.
+    let end = unsafe { core::ptr::addr_of!(__kernel_phys_bounds).read() }[1];
+    end.max(FLOOR).saturating_add(ALIGN - 1) & !(ALIGN - 1)
+}
+
 /// Search low RAM for the FDT magic (`0xd00dfeed` big-endian). QEMU
 /// loads the DTB at an address determined by kernel size, so the
 /// exact offset isn't predictable from outside; scanning is the
 /// reliable fallback when the bootloader-provided pointer is absent.
 ///
-/// Walks 4-byte-aligned positions in the first 32 MiB of the virt
-/// RAM region (0x4000_0000..0x4200_0000). Returns the first match.
+/// Checks the historical fixed address, then where xtask's runner loads
+/// it ([`runner_dtb_addr`]), then walks 4-byte-aligned positions in the
+/// first 256 MiB of the virt RAM region. Returns the first match.
 ///
 /// # Safety
 /// The scanned range is identity-mapped Normal memory by the boot
@@ -642,12 +679,26 @@ unsafe fn scan_for_dtb() -> Option<PhysAddr> {
     // the historical fixed address via `-device loader`, so a single
     // direct check usually wins. xtask now places the DTB dynamically
     // above the kernel image (`dtb_load_addr`), so this usually misses
-    // and the scan below is the operative path.
+    // and the runner address below is the operative path.
     const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
     // SAFETY: address is inside the lo_L1[1] Normal-mapped block.
     let v = unsafe { core::ptr::read_volatile(DTB_LOAD_ADDR as *const u32) }.to_be();
     if v == 0xd00d_feed {
         return Some(PhysAddr::new(DTB_LOAD_ADDR));
+    }
+
+    // Where xtask's QEMU runner loads it for a raw-ELF boot (`dtb_load_addr`
+    // in build/xtask/src/aarch64_initrd.rs): the first 1 MiB boundary at or
+    // above both the image's physical end and 0x4800_0000. Once the image
+    // reaches past the scan window below, this is the only step that finds
+    // it. Probed only inside the identity-mapped 1 GiB block.
+    let runner = runner_dtb_addr();
+    if runner < 0x8000_0000 {
+        // SAFETY: inside the lo_L1[1] Normal-mapped block; aligned read.
+        let v = unsafe { core::ptr::read_volatile(runner as *const u32) }.to_be();
+        if v == 0xd00d_feed {
+            return Some(PhysAddr::new(runner));
+        }
     }
 
     // Fallback: scan low RAM in case some other loader placed the

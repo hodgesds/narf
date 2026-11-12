@@ -612,6 +612,29 @@ _start_rust_entry:
     cmp  w0, w1
     b.eq .Lfdt_have
 
+    /* 2b. Where xtask's QEMU runner loads it for a raw-ELF boot: the first
+     * 1 MiB boundary at or above both the image's physical end and
+     * 0x4800_0000 (`dtb_load_addr` in build/xtask/src/aarch64_initrd.rs).
+     * Once the image reaches past 0x5000_0000 the scan below cannot see it,
+     * so this is the step that finds it. Probed only below 0x8000_0000, the
+     * 1 GiB of RAM the boot map treats as present. */
+    ldr  x2, =__kernel_end              /* link-time phys: the value */
+    movz x3, #0x4800, lsl #16
+    cmp  x2, x3
+    csel x2, x2, x3, hi
+    movz x3, #0xF, lsl #16
+    movk x3, #0xFFFF                    /* x3 = 1 MiB - 1 */
+    add  x2, x2, x3
+    and  x2, x2, #0xFFFFFFFFFFF00000
+    movz x3, #0x8000, lsl #16
+    cmp  x2, x3
+    b.hs 4f
+    ldr  w0, [x2]
+    rev  w0, w0
+    cmp  w0, w1
+    b.eq .Lfdt_have
+4:
+
     /* 3. Scan [0x4000_0000, 0x5000_0000) on 4-byte strides. Bounded, and the
      * same window the Rust fallback uses. */
     movz x2, #0x4000, lsl #16
