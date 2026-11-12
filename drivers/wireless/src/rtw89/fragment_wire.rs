@@ -92,3 +92,13 @@ pub(super) fn recipe() -> [u8; 32] {
     hash.update(b"RX everyoriginal native descriptor/profile/peer/current association proof before optional fourentry2s/4096reassembly; eachCCMP MIC then same originalkeycolor/PN+1, no plain/protected/key epoch mixing; original EAPOL/PMF owner and terminal installs, openplainMSDU separate original peer cache; no premature Ethernet/key/port; pending train/cache blocks LPS, source RFtracking current and awake restore receipt unchanged");
     hash.finalize()
 }
+/// RTL8852A fragment recipe: the same bounded plaintext split as B, over
+/// the A v0 TXWD path (MACID0 ch1/20, TX-A, RX-AB).
+pub(super) fn recipe_a() -> [u8; 32] {
+    let mut hash = narf_crypto::sha256::Sha256::new();
+    hash.update(b"RTL8852A MACID0 ch1/20 TX-A RX-AB software fragmentation v1; threshold256..2346 even plaintext hdr+body+FCS; crypto overhead after split; max16 complete original fragments sameoneSN frag0..15/MF originalAAD; no groupRA/AMSDU/AMPDU/+HTC/MLD");
+    hash.update(b"fixed CCK1 long-preamble data/management wholetrain no firmwareRA/multirate fallback; final314us ACK+SIFS, earlier2ACK+3SIFS+nextprotectedMPDU+FCS; hostSW_SEQ+originalfragno, no management HWSSN rewrite; no host hardware crypto");
+    hash.update(b"retained wholetrain before issue; prePN original source/peer/port/prefix/BA/size/nativequeue; exact immutable bytes/key identity no PN/SN on Busy; one original terminal DMA+RPQ radio-success MPDU at a time; actual original cap/full joint program/current key and final RX prefix at descriptor/doorbell; cancel/loss retains issuedDMA and denies futureparts");
+    hash.update(b"RX everyoriginal native descriptor/profile/peer/current association proof before optional fourentry2s/4096reassembly; eachCCMP MIC then same originalkeycolor/PN+1, no plain/protected/key epoch mixing; original EAPOL/PMF owner and terminal installs, openplainMSDU separate original peer cache; no premature Ethernet/key/port; pending train/cache blocks LPS, source RFtracking current and awake restore receipt unchanged");
+    hash.finalize()
+}

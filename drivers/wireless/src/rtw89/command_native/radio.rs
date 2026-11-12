@@ -1092,10 +1092,12 @@ pub(super) struct Port<'a> {
     full: Option<Arc<radio_policy::Qualification>>,
     chip: Option<ChipProgram>,
 }
-/// The chip-specific signed full program (RTL8852C `N5CB` v2 + `N5CC`,
-/// RTL8851B `N51B` v2 + `N51C`) that encloses the calibration scope.
+/// The chip-specific signed full program (RTL8852A `N5AB` v2 + `N5AC`,
+/// RTL8852C `N5CB` v2 + `N5CC`, RTL8851B `N51B` v2 + `N51C`) that encloses
+/// the calibration scope.
 #[derive(Clone)]
 pub(super) enum ChipProgram {
+    A(Arc<crate::rtw89::radio_policy_a::Qualification>),
     C(Arc<radio_policy_c::Qualification>),
     N51(Arc<crate::rtw89::radio_policy_51::Qualification>),
 }
@@ -1117,9 +1119,10 @@ impl<'a> Port<'a> {
         &mut self,
         operation: impl FnOnce(&mut NativeIo) -> Result<T, power::Error>,
     ) -> Result<T, power::Error> {
-        // RTL8852C / RTL8851B: the signed chip full program encloses the
-        // calibration scope.
+        // RTL8852A / RTL8852C / RTL8851B: the signed chip full program
+        // encloses the calibration scope.
         match self.chip.clone() {
+            Some(ChipProgram::A(a)) => a.with_current(|| self.current_b(operation)),
             Some(ChipProgram::C(c)) => c.with_current(|| self.current_b(operation)),
             Some(ChipProgram::N51(n51)) => n51.with_current(|| self.current_b(operation)),
             None => self.current_b(operation),
@@ -1173,11 +1176,12 @@ impl Native {
             .clone()
             .or_else(|| self.ordinary.as_ref().and_then(|g| g.b().cloned()))
     }
-    /// The installed chip full program, if any (C or RTL8851B).
+    /// The installed chip full program, if any (A, C or RTL8851B).
     pub(super) fn chip_program(&self) -> Option<ChipProgram> {
-        self.qualification_c
+        self.qualification_a
             .clone()
-            .map(ChipProgram::C)
+            .map(ChipProgram::A)
+            .or_else(|| self.qualification_c.clone().map(ChipProgram::C))
             .or_else(|| self.qualification_51.clone().map(ChipProgram::N51))
     }
     pub(super) fn radio_io(&mut self) -> Result<Port<'_>, power::Error> {
@@ -1696,6 +1700,9 @@ impl Native {
         if self.chip == ChipId::Rtl8851B {
             return self.radio_profile_current_51();
         }
+        if self.chip == ChipId::Rtl8852A {
+            return self.radio_profile_current_a();
+        }
         if self.chip != ChipId::Rtl8852C {
             return self.phy_profile_current();
         }
@@ -1712,6 +1719,29 @@ impl Native {
             let phycap = self.phycap.as_ref().ok_or(power::Error::Unsupported)?;
             // Only a receipt earned through the V1 (0x7140) block binds C.
             if !phycap.is_c() {
+                return Err(power::Error::Access);
+            }
+            phycap.initial_profile()
+        })
+        .map_err(|_| power::Error::Access)?
+    }
+    /// RTL8852A: the actual RTL8852A identity and an RTL8852A-decoded
+    /// firmware receipt (2T2R TX-A RX-AB, `Receipt::initial_profile`).
+    fn radio_profile_current_a(&self) -> Result<(), power::Error> {
+        crate::rtw88::pci_park::invoke(&self.authority, || {
+            if self.state != State::Active
+                || self
+                    .factory
+                    .as_ref()
+                    .and_then(|factory| factory.identity())
+                    .is_none_or(|identity| identity.chip() != ChipId::Rtl8852A)
+            {
+                return Err(power::Error::Terminal);
+            }
+            let phycap = self.phycap.as_ref().ok_or(power::Error::Unsupported)?;
+            // Only a receipt earned through the B (0x8140) block and
+            // decoded as A binds A.
+            if !phycap.is_a() {
                 return Err(power::Error::Access);
             }
             phycap.initial_profile()

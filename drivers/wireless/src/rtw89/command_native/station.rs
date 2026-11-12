@@ -201,6 +201,9 @@ impl Native {
     /// RTL8852C (`radio_policy_c::Qualification::tx_current`) refuses every
     /// frame on a DFS/NO_IR active span: it has no witness grant.
     pub(super) fn station_tx_current(&self) -> Result<(), packet::Error> {
+        if let Some(a) = self.qualification_a.as_ref() {
+            return a.tx_current().map_err(|_| packet::Error::Access);
+        }
         if let Some(c) = self.qualification_c.as_ref() {
             return c.tx_current().map_err(|_| packet::Error::Access);
         }

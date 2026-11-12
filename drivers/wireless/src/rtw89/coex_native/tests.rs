@@ -379,9 +379,28 @@ fn smoke_rtw89_scoreboard_rmw_sets_and_clears_wlrfk_only() -> TestResult {
     }
     TestResult::Pass
 }
+fn smoke_rtw8852a_btc_abi_rows_follow_rtw89_btc_ver_defs() -> TestResult {
+    if ProtocolA::for_version([0, 13, 37, 0]) != Some(ProtocolA::Tdma3)
+        || ProtocolA::for_version([0, 13, 129, 4]) != Some(ProtocolA::Tdma3)
+        || ProtocolA::for_version([0, 13, 36, 255]) != Some(ProtocolA::Tdma1)
+        || ProtocolA::for_version([0, 13, 0, 0]) != Some(ProtocolA::Tdma1)
+        || [[0, 12, 255, 255], [0, 14, 0, 0], [0, 29, 29, 0]]
+            .iter()
+            .any(|v| ProtocolA::for_version(*v).is_some())
+        || ProtocolA::Tdma3.tag() != 3
+        || ProtocolA::Tdma1.tag() != 1
+    {
+        return TestResult::Fail("A BTC ABI rows differ from rtw89_btc_ver_defs");
+    }
+    TestResult::Pass
+}
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_scoreboard_rmw_sets_and_clears_wlrfk_only
+);
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_btc_abi_rows_follow_rtw89_btc_ver_defs
 );
 /// RTL8851B `rtw8851b_btc_set_rfe`/`rtw8851b_btc_init_cfg` on one RF path:
 /// the cxinit encoding per antenna layout, path-A-only trx masks with the

@@ -76,9 +76,19 @@ pub(super) struct BasicPreflight {
 /// the signed `N5CB` v2 + `N5CC` program, which carries no such companion.
 /// B-only program accessors ([`Self::b`]) therefore see "no program" on C.
 /// RTL8851B holds the signed `N51B` v2 + `N51C` program
-/// (`radio_policy_51`), likewise without a B companion.
+/// (`radio_policy_51`), likewise without a B companion. RTL8852A holds the
+/// signed `N5AB` v2 + `N5AC` program (`radio_policy_a`) with its fragment
+/// companion (`N5AF`); A-only program accessors ([`Self::a`]) therefore see
+/// "no program" on B, C and RTL8851B.
+///
+/// No production path installs an `OrdinaryGrant::A` yet: the A RF program
+/// owner (`preflight_radio_a` / `prepare_radio_a`) does not exist, and
+/// installing the grant without the owner having run the recipe would admit
+/// ordinary TX without the measured RF program. The variant is the seam the
+/// owner lane will install through.
 #[derive(Clone)]
 enum OrdinaryGrant {
+    A(alloc::sync::Arc<super::radio_policy_a::Qualification>),
     B(alloc::sync::Arc<super::radio_policy::Qualification>),
     C(alloc::sync::Arc<super::radio_policy_c::Qualification>),
     N51(alloc::sync::Arc<super::radio_policy_51::Qualification>),
@@ -86,6 +96,7 @@ enum OrdinaryGrant {
 impl OrdinaryGrant {
     fn current(&self) -> Result<(), super::power::Error> {
         match self {
+            Self::A(q) => q.current().map_err(|_| super::power::Error::Access),
             Self::B(q) => q.current().map_err(|_| super::power::Error::Access),
             Self::C(q) => q.current().map_err(|_| super::power::Error::Access),
             Self::N51(q) => q.current().map_err(|_| super::power::Error::Access),
@@ -97,17 +108,29 @@ impl OrdinaryGrant {
         operation: impl FnOnce() -> Result<T, super::power::Error>,
     ) -> Result<T, super::power::Error> {
         match self {
+            Self::A(q) => q.with_current(operation),
             Self::B(q) => q.with_current(operation),
             Self::C(q) => q.with_current(operation),
             Self::N51(q) => q.with_current(operation),
         }
     }
-    /// The RTL8852B program and its companions; `None` ("no program") on C
-    /// and RTL8851B.
+    /// The RTL8852A program and its fragment companion; `None` ("no
+    /// program") on B, C and RTL8851B.
+    // No consumer yet: the A RF program owner (`preflight_radio_a` /
+    // `prepare_radio_a`) will read the installed A grant through it.
+    #[allow(dead_code)]
+    fn a(&self) -> Option<&alloc::sync::Arc<super::radio_policy_a::Qualification>> {
+        match self {
+            Self::A(q) => Some(q),
+            Self::B(_) | Self::C(_) | Self::N51(_) => None,
+        }
+    }
+    /// The RTL8852B program and its companions; `None` (\"no program\") on A,
+    /// C and RTL8851B.
     fn b(&self) -> Option<&alloc::sync::Arc<super::radio_policy::Qualification>> {
         match self {
             Self::B(q) => Some(q),
-            Self::C(_) | Self::N51(_) => None,
+            Self::A(_) | Self::C(_) | Self::N51(_) => None,
         }
     }
 }
@@ -181,6 +204,12 @@ pub struct Native {
     radio_shutdown: super::radio_shutdown::Shutdown,
     ordinary: Option<OrdinaryGrant>,
     full_qualification: Option<alloc::sync::Arc<super::radio_policy::Qualification>>,
+    /// RTL8852A signed full program (N5AB v2 + N5AC records, N5AF fragment
+    /// companion) gating every A radio access together with the N5AB
+    /// calibration record. No production path installs it yet: the A RF
+    /// program owner (`preflight_radio_a` / `prepare_radio_a`) does not
+    /// exist.
+    qualification_a: Option<alloc::sync::Arc<super::radio_policy_a::Qualification>>,
     /// RTL8852C signed full program (N5CB v2 + N5CC records) gating every
     /// C radio access together with the C calibration record.
     qualification_c: Option<alloc::sync::Arc<super::radio_policy_c::Qualification>>,
@@ -373,6 +402,7 @@ impl Native {
             radio_shutdown: super::radio_shutdown::Shutdown::default(),
             ordinary: None,
             full_qualification: None,
+            qualification_a: None,
             qualification_c: None,
             qualification_51: None,
             operating: Some(super::phy_operating::Operating::default()),
@@ -573,6 +603,9 @@ impl Native {
         Ok(())
     }
     fn calibration_access(&mut self) -> Result<(), super::power::Error> {
+        if let Some(a) = self.qualification_a.as_ref() {
+            a.current().map_err(|_| super::power::Error::Access)?;
+        }
         if let Some(c) = self.qualification_c.as_ref() {
             c.current().map_err(|_| super::power::Error::Access)?;
         }
