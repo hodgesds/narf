@@ -439,6 +439,7 @@ pub mod aarch64;
 
 mod canary;
 mod cross_crate_init;
+mod init_depth;
 pub(crate) mod kstack_overflow;
 mod measure;
 mod reclaim_wait;
@@ -1913,7 +1914,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "kaslr: image page {va:#x} is mapped to {got:#x?}, not {:#x}, \
                              at slide {:#x}",
                             narf_memory::kaslr::image_virt_to_phys(va),
-                            narf_memory::kaslr::kernel_slide()
+                            narf_memory::kaslr::KERNEL_SLIDE
+                                .load(core::sync::atomic::Ordering::Relaxed)
                         );
                     }
                 }
@@ -4263,12 +4265,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     };
                     let root = fs.root();
                     // Read a file straight off the disk.
-                    let read = narf_scheduler::block_on(async {
+                    let read = narf_scheduler::block_on(alloc::boxed::Box::pin(async {
                         let file = root.lookup_async("big.dat").await?;
                         let mut buf = [0u8; 24];
                         let n = file.read(0, &mut buf).await?;
                         Ok::<_, narf_filesystem::FsError>((buf, n))
-                    });
+                    }));
                     match read {
                         Ok((buf, n)) => {
                             let _ = writeln!(
@@ -4334,7 +4336,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         None => break,
                     };
                     let name = entry.name;
-                    let ok = narf_scheduler::block_on(async {
+                    let ok = narf_scheduler::block_on(alloc::boxed::Box::pin(async {
                         // Grow the filesystem by a few chunks up front, while its
                         // extent/free-space trees are still single leaves (chunk
                         // growth requires that). This exercises per-block-group
@@ -4553,7 +4555,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         } else {
                             Err(())
                         }
-                    });
+                    }));
                     return match ok {
                         Ok(()) => {
                             let _ = writeln!(
@@ -4840,6 +4842,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // vmapped), its depth measured. Still synchronous: the stages run
             // on this CPU, in order, before boot continues.
             const INIT_STACK_BYTES: usize = 128 * 1024;
+            narf_init::set_initcall_hook(init_depth::hook);
             let init_depth =
                 narf_scheduler::stackful::run_on_kernel_stack(INIT_STACK_BYTES, move || {
                     // Run stages one at a time.
@@ -4869,8 +4872,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 });
             let _ = writeln!(
                 console::Writer,
-                "  init stack: {init_depth} of {INIT_STACK_BYTES} bytes used by the initcalls"
+                "  init stack: {} of {INIT_STACK_BYTES} bytes used by the initcalls",
+                init_depth.max(init_depth::peak_from_top())
             );
+            init_depth::print_top(&mut console::Writer);
             let _ = narf_init::print_summary(&mut console::Writer);
             #[cfg(target_arch = "aarch64")]
             {
