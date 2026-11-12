@@ -133,7 +133,9 @@ fn scan(out: &mut [u64; SITE_DEPTH]) {
     let tend = core::ptr::addr_of!(__text_end) as u64;
     let rsp: u64;
     // SAFETY: reads the stack pointer; no memory or flags are touched.
-    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags))
+    };
     let mut n = 0;
     for i in 0..SCAN_WORDS as u64 {
         // SAFETY: words just above the live stack pointer belong to this

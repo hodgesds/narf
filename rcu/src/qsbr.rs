@@ -112,7 +112,10 @@ pub struct Census {
 
 /// Snapshot the deferred-reclaim backlog. Lock-free; relaxed sums.
 pub fn census() -> Census {
-    let sum = |a: &[AtomicU64]| a.iter().fold(0u64, |t, c| t.wrapping_add(c.load(Ordering::Relaxed)));
+    let sum = |a: &[AtomicU64]| {
+        a.iter()
+            .fold(0u64, |t, c| t.wrapping_add(c.load(Ordering::Relaxed)))
+    };
     Census {
         retired: sum(&RETIRED),
         destroyed: sum(&DESTROYED),
