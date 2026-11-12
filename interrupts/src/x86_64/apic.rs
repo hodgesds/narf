@@ -1309,6 +1309,19 @@ pub(crate) fn arm_hrtimer_event(deadline_cycles: u64) {
     arm_tsc_deadline(deadline_cycles, true);
 }
 
+/// Test-only: install this CPU-local LAPIC programmer as the hrtimer
+/// clockevent programmer when none is installed (the kernel-test boot runs
+/// without the timer pump, so its sleeps poll). Returns whether it did; the
+/// caller undoes it with `narf_time::hrtimer::clear_arm_callback`.
+#[doc(hidden)]
+pub fn __test_install_hrtimer_programmer() -> bool {
+    if narf_time::hrtimer::arm_callback_installed() {
+        return false;
+    }
+    narf_time::hrtimer::set_arm_callback(arm_hrtimer_event);
+    true
+}
+
 /// Arm LAPIC TSC-deadline mode firing IRQ `timer_vector` every
 /// `period_cycles` TSC ticks. Computes the first deadline from
 /// `rdtsc() + period_cycles`, programs LVT_TIMER for deadline

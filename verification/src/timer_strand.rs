@@ -1,9 +1,10 @@
 //! Timer expiry with one CPU stuck, on real CPUs under tickless idle.
 //!
 //! These run with the production clock setup the kernel-test boot leaves
-//! out: the HPET/LAPIC timer pump installs the clockevent programmer
-//! (without it every sleep self-wakes and polls), and user-task SMP is on so
-//! idle CPUs halt with interrupts enabled instead of spin-polling.
+//! out: each CPU's LAPIC TSC-deadline clockevent is the hrtimer programmer
+//! (without one every sleep self-wakes and polls), and user-task SMP is on so
+//! idle CPUs halt with interrupts enabled instead of spin-polling. Both are
+//! undone afterwards.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -53,27 +54,30 @@ fn pinned(cpu: usize) -> TaskSpec {
 struct ProdTimers {
     aps: u64,
     user_smp: bool,
+    installed_programmer: bool,
 }
 
 impl ProdTimers {
     /// `None` when the boot has no programmable clockevent or no AP stops
     /// its tick.
     fn enter(aps: u64) -> Option<Self> {
-        if !narf_interrupts::x86_64::timer_pump::is_initialised()
-            && narf_interrupts::x86_64::timer_pump::init().is_err()
-        {
+        let installed_programmer =
+            narf_interrupts::x86_64::apic::__test_install_hrtimer_programmer();
+        if !narf_time::hrtimer::arm_callback_installed() {
             return None;
         }
         let this = Self {
             aps,
             user_smp: narf_scheduler::__test_set_user_task_smp(true),
+            installed_programmer,
         };
         narf_time::set_nohz_idle_enabled(true);
         // An idle AP stops its tick at its next idle entry; let every AP
         // pass through one.
         this.kick_aps();
         let tickless = wait_for(1_000_000_000, || {
-            (0..MAX_CPUS).any(|cpu| aps & (1u64 << cpu) != 0 && !narf_time::periodic_tick_wanted(cpu))
+            (0..MAX_CPUS)
+                .any(|cpu| aps & (1u64 << cpu) != 0 && !narf_time::periodic_tick_wanted(cpu))
         });
         if !tickless {
             this.restore();
@@ -102,6 +106,9 @@ impl ProdTimers {
     fn restore(self) {
         narf_time::set_nohz_idle_enabled(false);
         narf_scheduler::__test_set_user_task_smp(self.user_smp);
+        if self.installed_programmer {
+            narf_time::hrtimer::clear_arm_callback();
+        }
         // Every AP dispatches once, so its periodic tick runs again.
         self.kick_aps();
     }
@@ -177,8 +184,8 @@ fn timer_fires_behind_stuck_cpu(masked: bool) -> TestResult {
     // Halfway through the sleep the sleeper's CPU must be tickless-idle, or
     // the test does not test what it is named for.
     let _ = wait_for(SLEEP_NS / 2, || false);
-    let idle = narf_scheduler::__test_cpu_halted(sleeper)
-        && !narf_time::periodic_tick_wanted(sleeper);
+    let idle =
+        narf_scheduler::__test_cpu_halted(sleeper) && !narf_time::periodic_tick_wanted(sleeper);
     let woke = wait_for(SLEEP_NS + 4 * TIMER_LATE_BOUND_NS, || {
         WOKE_NS.load(Ordering::Acquire) != 0
     });
@@ -228,4 +235,92 @@ fn smoke_timer_fires_while_other_cpu_busy() -> TestResult {
 kernel_test_in!(
     "scheduler/strand/timer",
     smoke_timer_fires_while_other_cpu_busy
+);
+
+static REMOTE_FIRED_NS: AtomicU64 = AtomicU64::new(0);
+static REMOTE_FIRED_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+fn remote_timer_fn(_: &narf_time::hrtimer::HrTimer) -> narf_time::hrtimer::HrtimerRestart {
+    REMOTE_FIRED_NS.store(narf_time::monotonic_ns(), Ordering::Release);
+    REMOTE_FIRED_CPU.store(narf_lib::percpu::current_cpu(), Ordering::Release);
+    narf_time::hrtimer::HrtimerRestart::NoRestart
+}
+
+static REMOTE_TIMER: narf_time::hrtimer::HrTimer = narf_time::hrtimer::HrTimer::new(
+    remote_timer_fn,
+    narf_time::hrtimer::ClockId::Monotonic,
+    narf_time::hrtimer::HrtimerMode::ABS_HARD,
+);
+
+/// A timer queued from here onto a tickless-idle AP's base, earlier than
+/// anything that AP has programmed, sends exactly one re-program IPI and
+/// fires on that AP on time (Linux `trigger_dyntick_cpu`): the AP's re-arm
+/// is not lost across its idle entry. Then a cancel from here while the
+/// timer is queued on the AP, and an unpinned restart from here, which
+/// moves it to this CPU's base.
+fn smoke_hrtimer_remote_earlier_event_rearms_by_ipi() -> TestResult {
+    use narf_time::hrtimer::{self, HrtimerMode};
+    const DELAY_NS: u64 = 10_000_000;
+    let me = narf_lib::percpu::current_cpu();
+    let live = live_aps();
+    let Some(ap) = (0..MAX_CPUS).find(|cpu| live & (1u64 << cpu) != 0) else {
+        return TestResult::Skip("needs a second CPU that really came up");
+    };
+    hrtimer::hrtimers_prepare_cpu(ap);
+    let Some(prod) = ProdTimers::enter(live) else {
+        return TestResult::Skip("no programmable tickless clockevent");
+    };
+    let quiet = wait_for(1_000_000_000, || {
+        narf_scheduler::__test_cpu_halted(ap)
+            && !narf_time::periodic_tick_wanted(ap)
+            && hrtimer::next_event_ns_of(ap)
+                .is_none_or(|n| n > narf_time::monotonic_ns() + 10 * DELAY_NS)
+    });
+    if !quiet {
+        prod.restore();
+        return TestResult::Skip("the AP never went tickless-idle without a near timer");
+    }
+    REMOTE_FIRED_NS.store(0, Ordering::Release);
+    REMOTE_FIRED_CPU.store(usize::MAX, Ordering::Release);
+    let kicks = hrtimer::remote_kicks();
+    let start = narf_time::monotonic_ns();
+    // SAFETY: the timer is a static.
+    unsafe { hrtimer::hrtimer_start_on(&REMOTE_TIMER, ap, start + DELAY_NS, 0, HrtimerMode::ABS) };
+    let sent = hrtimer::remote_kicks() - kicks;
+    let fired = wait_for(DELAY_NS + 4 * TIMER_LATE_BOUND_NS, || {
+        REMOTE_FIRED_NS.load(Ordering::Acquire) != 0
+    });
+    let fired_at = REMOTE_FIRED_NS.load(Ordering::Acquire);
+    let fired_on = REMOTE_FIRED_CPU.load(Ordering::Acquire);
+
+    let far = start + 1_000_000_000_000;
+    // SAFETY: as above.
+    unsafe { hrtimer::hrtimer_start_on(&REMOTE_TIMER, ap, far, 0, HrtimerMode::ABS) };
+    let queued_remote = REMOTE_TIMER.is_queued() && REMOTE_TIMER.cpu() == Some(ap as u32);
+    let cancelled = hrtimer::hrtimer_cancel(&REMOTE_TIMER) && !REMOTE_TIMER.is_queued();
+    // SAFETY: as above.
+    unsafe { hrtimer::hrtimer_start_range_ns(&REMOTE_TIMER, far, 0, HrtimerMode::ABS) };
+    let moved_here = REMOTE_TIMER.cpu() == Some(me as u32);
+    hrtimer::hrtimer_cancel(&REMOTE_TIMER);
+    prod.restore();
+    if sent != 1 {
+        return TestResult::Fail("an earlier remote timer did not send exactly one IPI");
+    }
+    if !fired || fired_on != ap {
+        return TestResult::Fail("a timer queued on an idle AP's base did not fire there");
+    }
+    if fired_at.saturating_sub(start) > DELAY_NS + TIMER_LATE_BOUND_NS {
+        return TestResult::Fail("a timer queued on an idle AP's base fired late");
+    }
+    if !queued_remote || !cancelled {
+        return TestResult::Fail("cancel from another CPU did not unlink the timer");
+    }
+    if !moved_here {
+        return TestResult::Fail("an unpinned restart did not move the timer to this CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/strand/timer",
+    smoke_hrtimer_remote_earlier_event_rearms_by_ipi
 );
