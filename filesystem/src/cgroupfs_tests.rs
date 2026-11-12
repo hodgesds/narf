@@ -3571,3 +3571,79 @@ kernel_test_in!(
     "filesystem/cgroupfs/memcg",
     smoke_memcg_page_cache_is_charged
 );
+
+// ── cgroup.procs / cgroup.threads never list pid 0 ──────────────────
+//
+// A shell that reads `cgroup.procs` and `kill -9`s each entry kills its own
+// process group on a `0`. Linux lists only tasks the reader can name. Drive
+// the membership paths with a 0 (fork of a pid-less child, a thread with no
+// tid) next to real members, exit
+// some, and require every listed line to be a nonzero member still alive.
+fn smoke_cgroup_procs_never_lists_pid_zero() -> TestResult {
+    use crate::cgroupfs::{fork_inherit, fork_thread_inherit, thread_exited};
+
+    let root = root_dir();
+    let name = "t_procs_zero";
+    let child = match poll_once(root.mkdir(name)) {
+        Some(Ok(c)) => c,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    let parent: u64 = 3_300_000_201;
+    let kids: [u64; 3] = [3_300_000_202, 3_300_000_203, 3_300_000_204];
+    let thread: u64 = 3_300_000_205;
+    let cleanup = || {
+        for pid in [parent, kids[0], kids[1], kids[2], thread] {
+            thread_exited(pid);
+            task_exited(pid);
+        }
+        let _ = poll_once(root.rmdir(name));
+    };
+    if attach_pid(&child, parent).is_err() {
+        cleanup();
+        return TestResult::Fail("attach parent failed");
+    }
+    for kid in kids {
+        fork_inherit(parent, kid);
+    }
+    fork_inherit(parent, 0);
+    fork_thread_inherit(parent, parent, thread);
+    fork_thread_inherit(parent, parent, 0);
+    // Exits: a forked child and the thread go away.
+    task_exited(kids[1]);
+    thread_exited(thread);
+
+    let lists = [
+        read_attr(&child, "cgroup.procs").unwrap_or_default(),
+        read_attr(&child, "cgroup.threads").unwrap_or_default(),
+    ];
+    let live = [parent, kids[0], kids[2]];
+    for list in &lists {
+        for line in list.lines() {
+            match line.trim().parse::<u64>() {
+                Ok(0) => {
+                    cleanup();
+                    return TestResult::Fail("a cgroup listing contained pid 0");
+                }
+                Ok(pid) if live.contains(&pid) => {}
+                _ => {
+                    cleanup();
+                    return TestResult::Fail("a cgroup listing named an exited or foreign task");
+                }
+            }
+        }
+    }
+    let procs = &lists[0];
+    if live
+        .iter()
+        .any(|pid| !procs.lines().any(|l| l.trim() == pid.to_string()))
+    {
+        cleanup();
+        return TestResult::Fail("a live member is missing from cgroup.procs");
+    }
+    cleanup();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_procs_never_lists_pid_zero
+);
