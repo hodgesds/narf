@@ -3442,6 +3442,168 @@ mod tests {
         smoke_reclaim_frees_clean_mapped_pages_and_keeps_stores
     );
 
+    /// Store `bytes` at user address `va` of `aspace` through the page
+    /// tables: the address space is made current and the store goes through
+    /// `copy_to_user`. With CR0.WP set the CPU enforces a read-only PTE for
+    /// this kernel-mode store too, so a store to a clean shared file page
+    /// takes the real #PF, the trap handler's present-read-only path calls
+    /// the write-notify hook and re-installs the PTE writable, and the store
+    /// is retried — the path a user store takes (only the U bit differs).
+    #[cfg(target_arch = "x86_64")]
+    fn store_through_ptes(aspace: &Arc<AddressSpace>, va: u64, bytes: &[u8]) -> bool {
+        // SAFETY: CPL0; the value is restored below.
+        let saved = unsafe { narf_arch::x86_64::cr::read_cr3() };
+        if aspace.activate().is_err() {
+            return false;
+        }
+        // SAFETY: `va` lies in the test's live mapping, which the active
+        // root now translates; the guarded copy opens SMAP itself.
+        let stored = unsafe { crate::handlers::copy_to_user(va, bytes) }.is_ok();
+        // SAFETY: `saved` is the root this CPU ran on before `activate`.
+        unsafe { narf_arch::x86_64::cr::write_cr3(saved) };
+        stored
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn pread_all(fd: u32, offset: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        let ret = call_syscall(
+            crate::handlers::sys_pread64,
+            SyscallArgs {
+                arg0: fd as u64,
+                arg1: buf.as_mut_ptr() as u64,
+                arg2: len as u64,
+                arg3: offset,
+                ..SyscallArgs::default()
+            },
+        )
+        .ok()?;
+        (ret.value as usize == len).then_some(buf)
+    }
+
+    /// The soak's cases through the real write-notify fault. Case (2):
+    /// `pwrite` 0xbd, a store of 0xaf through the mapping over part of it,
+    /// munmap, `pread` must return 0xaf. Case (1): two stores through two
+    /// mappings, the second over the first; a fresh mapping, faulted and
+    /// read through the page tables, must show the second. Both before and
+    /// after writeback.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stores_through_real_ptes_take_the_write_notify_fault() -> TestResult {
+        const PAGES: usize = 8;
+        const LEN: u64 = (PAGES * 4096) as u64;
+        let _kernel_buffers = crate::handlers::kernel_buffers_guard();
+        let (aspace, file, fd) = match fallback_test_setup(vec![0x11; PAGES * 4096]) {
+            Ok(setup) => setup,
+            Err(result) => return result,
+        };
+        let outcome = (|| -> Result<(), &'static str> {
+            // Case (2).
+            let src = vec![0xbdu8; 3 * 4096 + 700];
+            call_syscall(
+                crate::handlers::sys_pwrite64,
+                SyscallArgs {
+                    arg0: fd as u64,
+                    arg1: src.as_ptr() as u64,
+                    arg2: src.len() as u64,
+                    arg3: 4096 + 900,
+                    ..SyscallArgs::default()
+                },
+            )
+            .map_err(|_| "pwrite64 failed")?;
+            let (base, _) = mmap_shared_faulted(&aspace, fd, LEN).map_err(|_| "mmap failed")?;
+            for page in 0..PAGES as u64 {
+                // SAFETY: the test's live mapping.
+                let _ = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(base + page * 4096)) };
+            }
+            let page1 = aspace
+                .page_backing(narf_memory::VirtAddr::new(base + 4096))
+                .map(|(_, phys)| phys)
+                .ok_or("page 1 did not fault in")?;
+            if crate::mapped_file::shared_page_write_enabled(page1.raw()) {
+                return Err("a clean page was mapped writable before any store");
+            }
+            let (m_from, m_len) = (2 * 4096 + 1500, 4096 + 2100);
+            if !store_through_ptes(&aspace, base + m_from, &vec![0xafu8; m_len]) {
+                return Err("a store through the page tables faulted for good");
+            }
+            let page2 = aspace
+                .page_backing(narf_memory::VirtAddr::new(base + 2 * 4096))
+                .map(|(_, phys)| phys)
+                .ok_or("page 2 is not mapped")?;
+            if !crate::mapped_file::shared_page_write_enabled(page2.raw()) {
+                return Err("the hardware write fault did not record the store as dirty");
+            }
+            call_syscall(
+                crate::handlers::sys_munmap,
+                SyscallArgs {
+                    arg0: base,
+                    arg1: LEN,
+                    ..SyscallArgs::default()
+                },
+            )
+            .map_err(|_| "munmap failed")?;
+            let read = pread_all(fd, m_from, m_len).ok_or("pread failed")?;
+            if read.iter().any(|b| *b != 0xaf) {
+                return Err("case (2): pread after munmap returned the pwrite's bytes");
+            }
+            call_syscall(crate::handlers::sys_sync, SyscallArgs::default())
+                .map_err(|_| "sync failed")?;
+            let read = pread_all(fd, m_from, m_len).ok_or("pread failed")?;
+            if read.iter().any(|b| *b != 0xaf)
+                || file.bytes.lock()[m_from as usize..m_from as usize + m_len]
+                    .iter()
+                    .any(|b| *b != 0xaf)
+            {
+                return Err("case (2): the store did not reach the file through writeback");
+            }
+
+            // Case (1): two generations, then a fresh mapping.
+            for (byte, from, len) in [(0xc1u8, 3 * 4096 + 1808, 3 * 4096), (0x93u8, 3 * 4096 + 900, 2 * 4096 + 500)] {
+                let (base, _) = mmap_shared_faulted(&aspace, fd, LEN).map_err(|_| "mmap failed")?;
+                for page in 0..PAGES as u64 {
+                    // SAFETY: the test's live mapping.
+                    let _ = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(base + page * 4096)) };
+                }
+                if !store_through_ptes(&aspace, base + from, &vec![byte; len]) {
+                    return Err("a store through the page tables faulted for good");
+                }
+                call_syscall(
+                    crate::handlers::sys_munmap,
+                    SyscallArgs {
+                        arg0: base,
+                        arg1: LEN,
+                        ..SyscallArgs::default()
+                    },
+                )
+                .map_err(|_| "munmap failed")?;
+            }
+            let (base, _) = mmap_shared_faulted(&aspace, fd, LEN).map_err(|_| "mmap failed")?;
+            // SAFETY: the test's live mapping.
+            let _ = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(base + 4 * 4096)) };
+            let fresh = aspace
+                .page_backing(narf_memory::VirtAddr::new(base + 4 * 4096))
+                .map(|(_, phys)| phys)
+                .ok_or("the fresh mapping did not fault in")?;
+            // SAFETY: the frame backing the test's own mapping.
+            let bytes = unsafe { core::slice::from_raw_parts(fresh.kernel_ptr::<u8>(), 4096) };
+            // Page 4 = [16384, 20480): 0x93 covers [13188, 21880).
+            if bytes.iter().any(|b| *b != 0x93) {
+                return Err("case (1): a fresh mapping showed the older generation");
+            }
+            Ok(())
+        })();
+        fallback_test_teardown();
+        match outcome {
+            Ok(()) => TestResult::Pass,
+            Err(why) => TestResult::Fail(why),
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "userspace/writeback",
+        smoke_stores_through_real_ptes_take_the_write_notify_fault
+    );
+
     /// write(2) must be visible through a live generic-fallback mapping,
     /// and a later msync must not resurrect the pre-write bytes: the
     /// fallback page's snapshot marks the whole page dirty after one
