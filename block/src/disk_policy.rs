@@ -849,16 +849,88 @@ impl PolicyGuard {
     }
 
     fn permits_write(&self) -> bool {
-        match policy() {
-            DiskPolicy::All => true,
-            DiskPolicy::BootOnly => disk_trusted(self.disk),
-            DiskPolicy::RootRo => log_stick_writable(self.dev),
-            DiskPolicy::RootRw => {
-                dev_writable(self.dev)
-                    || self.write_parent.is_some_and(dev_writable)
-                    || log_stick_writable(self.dev)
-            }
+        permits_write(self.disk, self.dev, self.write_parent)
+    }
+}
+
+/// Whether the active policy lets writes reach registry entry `dev` of
+/// `disk` (`write_parent`: the whole-disk entry a partition inherits a
+/// writable designation from). Evaluated per request: the designation can
+/// change after the device was registered.
+fn permits_write(disk: DiskId, dev: DevId, write_parent: Option<DevId>) -> bool {
+    match policy() {
+        DiskPolicy::All => true,
+        DiskPolicy::BootOnly => disk_trusted(disk),
+        DiskPolicy::RootRo => log_stick_writable(dev),
+        DiskPolicy::RootRw => {
+            dev_writable(dev) || write_parent.is_some_and(dev_writable) || log_stick_writable(dev)
         }
+    }
+}
+
+/// Log one refusal per guard (`warned`), count it, and return `ReadOnly`.
+fn refuse_write(name: &str, warned: &AtomicBool, lba: u64, n_blocks: u32) {
+    REFUSED.fetch_add(1, Ordering::Relaxed);
+    if !warned.swap(true, Ordering::Relaxed) {
+        let policy = policy();
+        let why = match policy {
+            DiskPolicy::BootOnly => "it is not the boot medium",
+            DiskPolicy::RootRo => "nothing is writable",
+            _ => "it is not the designated root partition",
+        };
+        let _ = writeln!(
+            narf_console::Writer,
+            "disks: refused write to {name} (lba {lba}, {n_blocks} blocks): \
+             {ARG}={} and {why}; further refusals are silent",
+            policy.as_str(),
+        );
+    }
+}
+
+/// The policy guard on a device's asynchronous queue: the same per-request
+/// write gate as [`PolicyGuard`]'s sync methods, so a filesystem submitting
+/// through [`crate::SyncBlock`] cannot write around the policy.
+pub struct PolicyQueue {
+    name: &'static str,
+    disk: DiskId,
+    dev: DevId,
+    write_parent: Option<DevId>,
+    warned: AtomicBool,
+    inner: Arc<dyn crate::BlockQueue>,
+}
+
+impl core::fmt::Debug for PolicyQueue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PolicyQueue")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl crate::BlockQueue for PolicyQueue {
+    fn limits(&self) -> crate::QueueLimits {
+        self.inner.limits()
+    }
+    fn submit(&self, req: crate::BlockRequest) -> crate::BoxedCompletion {
+        if crate::queue::op_writes(req.op) && !permits_write(self.disk, self.dev, self.write_parent)
+        {
+            refuse_write(self.name, &self.warned, req.lba, req.blocks);
+            return crate::queue::ready_completion(
+                req.user_tag,
+                Err(crate::BlockError::PermissionDenied),
+            );
+        }
+        self.inner.submit(req)
+    }
+    /// Forwarded even when writes are refused, as the sync `flush` is.
+    fn flush(&self) -> crate::BoxedResult {
+        self.inner.flush()
+    }
+    fn cancel(&self, tag: u64) -> crate::BoxedCancel {
+        self.inner.cancel(tag)
+    }
+    fn in_flight(&self) -> usize {
+        self.inner.in_flight()
     }
 }
 
@@ -895,26 +967,23 @@ impl BlockDeviceSync for PolicyGuard {
         }
         self.refuse(lba, n_blocks)
     }
+    /// The inner device's queue behind the same write gate.
+    fn queue(&self) -> Option<Arc<dyn crate::BlockQueue>> {
+        let inner = self.inner.queue()?;
+        Some(Arc::new(PolicyQueue {
+            name: self.name,
+            disk: self.disk,
+            dev: self.dev,
+            write_parent: self.write_parent,
+            warned: AtomicBool::new(false),
+            inner,
+        }))
+    }
 }
 
 impl PolicyGuard {
     fn refuse(&self, lba: u64, n_blocks: u16) -> Result<(), BlockIoError> {
-        REFUSED.fetch_add(1, Ordering::Relaxed);
-        if !self.warned.swap(true, Ordering::Relaxed) {
-            let policy = policy();
-            let why = match policy {
-                DiskPolicy::BootOnly => "it is not the boot medium",
-                DiskPolicy::RootRo => "nothing is writable",
-                _ => "it is not the designated root partition",
-            };
-            let _ = writeln!(
-                narf_console::Writer,
-                "disks: refused write to {} (lba {lba}, {n_blocks} blocks): \
-                 {ARG}={} and {why}; further refusals are silent",
-                self.name,
-                policy.as_str(),
-            );
-        }
+        refuse_write(self.name, &self.warned, lba, n_blocks as u32);
         Err(BlockIoError::ReadOnly)
     }
 }
