@@ -189,14 +189,29 @@ kernel_test_in!(
 fn smoke_killable_wait_ready_operation_arms_nothing() -> TestResult {
     const TASK: u64 = 0x6b11_ab20;
     let _fixture = DetachFixture::new(TASK);
-    // Even with SIGKILL already pending, a completed operation is reported
-    // as completed: its side effects happened.
-    crate::handlers::raise_signal_pending(TASK, 9);
     let waker = counting_waker();
     let mut cx = Context::from_waker(&waker);
     let mut wait = KillableWait::new(TASK, Box::pin(async { 3usize }));
     if Pin::new(&mut wait).poll(&mut cx) != Poll::Ready(Ok(3)) {
         return TestResult::Fail("a ready operation was not reported");
+    }
+    // With SIGKILL already pending nothing starts, not even an operation
+    // that would complete at once (Linux tests `fatal_signal_pending` before
+    // the work).
+    crate::handlers::raise_signal_pending(TASK, 9);
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran2 = ran.clone();
+    let mut killed = KillableWait::new(
+        TASK,
+        Box::pin(async move {
+            ran2.store(true, Ordering::Release);
+            3usize
+        }),
+    );
+    if Pin::new(&mut killed).poll(&mut cx) != Poll::Ready(Err(Killed))
+        || ran.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("a task with SIGKILL pending started an operation");
     }
     if crate::handlers::dbg_has_signal_waker(TASK) {
         return TestResult::Fail("a ready operation registered a signal waker");
@@ -213,6 +228,8 @@ struct NeverFile {
     reads: AtomicUsize,
     writes: AtomicUsize,
     release: Arc<AtomicBool>,
+    /// SIGKILL arrives for [`SYSCALL_TASK`] while its I/O is queued.
+    kill_when_queued: Arc<AtomicBool>,
 }
 
 impl NeverFile {
@@ -221,11 +238,22 @@ impl NeverFile {
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             release: Arc::new(AtomicBool::new(false)),
+            kill_when_queued: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// The task is killed once its operation has started and is queued: a
+    /// task with SIGKILL already pending starts nothing at all.
+    fn kill_when_queued(&self) {
+        self.kill_when_queued.store(true, Ordering::Release);
+    }
+
+    fn gate(&self) -> Gate {
+        Gate(self.release.clone(), self.kill_when_queued.clone())
     }
 }
 
-struct Gate(Arc<AtomicBool>);
+struct Gate(Arc<AtomicBool>, Arc<AtomicBool>);
 
 impl Future for Gate {
     type Output = ();
@@ -233,6 +261,9 @@ impl Future for Gate {
         if self.0.load(Ordering::Acquire) {
             Poll::Ready(())
         } else {
+            if self.1.swap(false, Ordering::AcqRel) {
+                crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+            }
             Poll::Pending
         }
     }
@@ -242,7 +273,7 @@ impl FileOps for NeverFile {
     fn read<'a>(&'a self, _: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             self.reads.fetch_add(1, Ordering::Relaxed);
-            Gate(self.release.clone()).await;
+            self.gate().await;
             buf.fill(0x5a);
             Ok(buf.len())
         })
@@ -250,7 +281,7 @@ impl FileOps for NeverFile {
 
     fn write<'a>(&'a self, _: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            Gate(self.release.clone()).await;
+            self.gate().await;
             self.writes.fetch_add(buf.len(), Ordering::Relaxed);
             Ok(buf.len())
         })
@@ -343,7 +374,7 @@ fn smoke_killable_read_of_a_stuck_file_returns_on_sigkill() -> TestResult {
     let file = NeverFile::new();
     let ops: Arc<dyn FileOps> = file.clone();
     let mut staging = alloc::vec![0u8; 4096];
-    crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+    file.kill_when_queued();
     let outcome = read(&ops, 0, &mut staging, 4096, ReadOptions::default());
     if outcome != Err(Killed) {
         return TestResult::Fail("a read parked on a stuck file did not end on SIGKILL");
@@ -375,7 +406,7 @@ fn smoke_killable_write_completes_after_its_writer_is_killed() -> TestResult {
     let file = NeverFile::new();
     let ops: Arc<dyn FileOps> = file.clone();
     let mut payload = alloc::vec![0xa5u8; 1500];
-    crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+    file.kill_when_queued();
     if write(&ops, 0, &mut payload) != Err(Killed) {
         return TestResult::Fail("a write parked on a stuck file did not end on SIGKILL");
     }
@@ -441,7 +472,7 @@ fn smoke_killable_fill_frame_frees_the_frame_of_a_killed_fault() -> TestResult {
     };
     let frame = frame.start_address();
     let released_before = FRAMES_RELEASED.load(Ordering::Relaxed);
-    crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+    file.kill_when_queued();
     if fill_frame(&ops, 0, frame, 4096) != Err(Killed) {
         return TestResult::Fail("a fault parked on a stuck file did not end on SIGKILL");
     }
@@ -484,7 +515,7 @@ fn smoke_killable_exec_image_read_ends_on_sigkill() -> TestResult {
         size: 1 << 20,
     };
     let mut header = [0u8; 64];
-    crate::handlers::raise_signal_pending(SYSCALL_TASK, 9);
+    file.kill_when_queued();
     if image.read_exact_at(0, &mut header) != Err(crate::elf::ElfError::ImageReadFailed) {
         return TestResult::Fail("an image read of a stuck file did not end on SIGKILL");
     }
@@ -932,4 +963,105 @@ fn smoke_killable_fsync_thread_does_not_hold_its_group() -> TestResult {
 kernel_test_in!(
     "userspace/killable",
     smoke_killable_fsync_thread_does_not_hold_its_group
+);
+
+static STORM: IrqSafeSpinLock<Vec<Detached>> = IrqSafeSpinLock::new(Vec::new());
+
+fn retain_storm(op: Detached) {
+    STORM.lock().push(op);
+}
+
+const STORM_TASK: u64 = 0x6b11_5707;
+
+fn storm_task() -> u64 {
+    STORM_TASK
+}
+
+/// A kill storm against a device that does not complete: read-like
+/// operations (their waits killable) and write-like ones (a commit that
+/// must finish) are killed while queued. The reads give up at once and are
+/// not detached; a task already killed starts nothing; only the write-like
+/// operations stay detached, as many as were in flight, and they finish
+/// once the device does. The detached count returns to where it was.
+fn smoke_killable_kill_storm_leaves_only_the_operations_holding_state() -> TestResult {
+    const READS: usize = 40;
+    const WRITES: usize = 3;
+    let _fixture = DetachFixture::new(STORM_TASK);
+    crate::handlers::install_task_id_lookup(storm_task);
+    STORM.lock().clear();
+    let waker = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let ready = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let before = super::abandoned_in_flight();
+    let mut waits = Vec::new();
+    for i in 0..READS + WRITES {
+        let stuck = Stuck {
+            ready: ready.clone(),
+            drops: drops.clone(),
+        };
+        let op: OwnedWait<usize> = if i < READS {
+            // A read: queued for the device behind a killable wait.
+            Box::pin(async move {
+                narf_filesystem::killable::killable(stuck)
+                    .await
+                    .unwrap_or(0)
+            })
+        } else {
+            // A write in a transaction: its wait is not killable.
+            Box::pin(stuck)
+        };
+        let mut wait = KillableWait::new(STORM_TASK, op).detach_with(retain_storm);
+        if Pin::new(&mut wait).poll(&mut cx) != Poll::Pending {
+            return TestResult::Fail("an operation on a stalled device completed");
+        }
+        waits.push(wait);
+    }
+    crate::handlers::raise_signal_pending(STORM_TASK, 9);
+    for (i, mut wait) in waits.into_iter().enumerate() {
+        let woke = Pin::new(&mut wait).poll(&mut cx);
+        let expected = if i < READS {
+            // A queued read gives up at its killable wait: done, nothing
+            // left to detach.
+            Poll::Ready(Ok(0))
+        } else {
+            Poll::Ready(Err(Killed))
+        };
+        if woke != expected {
+            return TestResult::Fail("a queued wait outlived SIGKILL");
+        }
+    }
+    // A task with SIGKILL pending starts nothing more.
+    let (op, _, never) = stuck();
+    let mut late = KillableWait::new(STORM_TASK, op).detach_with(retain_storm);
+    if Pin::new(&mut late).poll(&mut cx) != Poll::Ready(Err(Killed)) {
+        return TestResult::Fail("a killed task started an operation");
+    }
+    drop(late);
+    if never.load(Ordering::Relaxed) != 1 || STORM.lock().len() != WRITES {
+        return TestResult::Fail("more than the operations holding state were detached");
+    }
+    // The device is still stalled: the detached writes wait for it.
+    let mut detached = core::mem::take(&mut *STORM.lock());
+    detached.retain_mut(|op| op.as_mut().poll(&mut cx) == Poll::Pending);
+    if detached.len() != WRITES || drops.load(Ordering::Relaxed) != READS {
+        return TestResult::Fail("a detached write finished before its device, or a read lingered");
+    }
+    if super::abandoned_in_flight() != before + WRITES {
+        return TestResult::Fail("the detached count is not the operations still holding state");
+    }
+    // The device recovers: the rest finish and the count is back.
+    ready.store(true, Ordering::Release);
+    detached.retain_mut(|op| op.as_mut().poll(&mut cx) == Poll::Pending);
+    if !detached.is_empty() || super::abandoned_in_flight() != before {
+        return TestResult::Fail("the detached operations did not finish once the device did");
+    }
+    if drops.load(Ordering::Relaxed) != READS + WRITES {
+        return TestResult::Fail("an operation was leaked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/killable",
+    smoke_killable_kill_storm_leaves_only_the_operations_holding_state
 );

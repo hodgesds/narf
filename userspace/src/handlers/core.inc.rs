@@ -545,8 +545,8 @@ static SYNC_WAIT_HOOKS: narf_filesystem::sync_wait::SyncWaitHooks =
     };
 
 static KILL_HOOKS: narf_filesystem::killable::KillHooks = narf_filesystem::killable::KillHooks {
-    current: current_task_id,
-    pending: task_fatal_signal_pending,
+    current: crate::killable_wait::hook_current,
+    pending: crate::killable_wait::hook_pending,
     arm: register_signal_waker,
     disarm: drop_signal_waker,
 };
