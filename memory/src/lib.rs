@@ -114,6 +114,8 @@ pub use addr::{
     direct_map_activate_at, direct_map_base, direct_map_live, direct_map_phys_end,
     KERNEL_DIRECT_MAP_BASE, KERNEL_DIRECT_MAP_PML4_BASE, KERNEL_DIRECT_MAP_PML4_SLOTS,
 };
+#[cfg(target_arch = "aarch64")]
+pub use addr::{direct_map_base, direct_map_live, direct_map_phys_end};
 pub use addr::{PhysAddr, VirtAddr};
 pub use domain_state::{restore_domain_state, save_domain_state, DomainSavedState};
 
