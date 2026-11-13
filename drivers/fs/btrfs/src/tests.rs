@@ -14305,3 +14305,396 @@ fn smoke_btrfs_abort_refusals_stay_audible() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_abort_refusals_stay_audible);
+
+// ── A killed task's operation, finished by another scheduler task ────────
+
+/// The task whose operation the hand-off test's other task is finishing,
+/// published only while that task polls it (the userspace hand-off keeps it
+/// per CPU in the same way).
+static HANDOFF_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HANDOFF_JOINED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static HANDOFF_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The task the hand-off tests have "killed" (0: none).
+static HANDOFF_KILLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The userspace hooks' shape: inside a hand-off the current task is the
+/// owner, and the owner of a handed-off operation counts as killed.
+static HANDOFF_HOOKS: narf_filesystem::killable::KillHooks = narf_filesystem::killable::KillHooks {
+    current: || match HANDOFF_OWNER.load(core::sync::atomic::Ordering::Acquire) {
+        0 => narf_scheduler::current_task_id().raw(),
+        owner => owner,
+    },
+    pending: |task| task != 0 && task == HANDOFF_KILLED.load(core::sync::atomic::Ordering::Acquire),
+    arm: |_, _| {},
+    disarm: |_| {},
+    owner: || HANDOFF_OWNER.load(core::sync::atomic::Ordering::Acquire),
+};
+
+/// Polls `inner` as `owner`'s handed-off operation, like the userspace
+/// `killable_wait` hand-off of a killed task's operation.
+struct HandedOff<F> {
+    owner: u64,
+    inner: core::pin::Pin<alloc::boxed::Box<F>>,
+}
+
+impl<F: core::future::Future<Output = ()>> core::future::Future for HandedOff<F> {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        let this = self.get_mut();
+        HANDOFF_OWNER.store(this.owner, core::sync::atomic::Ordering::Release);
+        let out = this.inner.as_mut().poll(cx);
+        HANDOFF_OWNER.store(0, core::sync::atomic::Ordering::Release);
+        out
+    }
+}
+
+/// A killed task's operation is not dropped: it is handed to another
+/// scheduler task to finish. That task must still be the operation as far
+/// as the transaction is concerned. Asked by the new task's id, the gate
+/// said "not joined": a commit run there read through the killable path a
+/// commit must never take and gave up, losing every operation in its batch
+/// (the kill soak's "transaction commit failed (Busy|InvalidData), N
+/// operation(s) lost"), and `exclusive` — which a joined operation uses to
+/// step out, close and commit — waited for its own join to leave.
+///
+/// Here this test task joins, as the killed task's operation did, and the
+/// operation goes on in a spawned task as a hand-off: it must see itself
+/// joined, and its `exclusive` must run and finish while the join is held.
+fn smoke_btrfs_handed_off_operation_keeps_its_transaction() -> TestResult {
+    use core::sync::atomic::Ordering;
+    let vol = match mount_fixture() {
+        Ok(vol) => vol,
+        Err(_) => return TestResult::Fail("hand-off fixture failed to mount"),
+    };
+    HANDOFF_JOINED.store(0, Ordering::Release);
+    HANDOFF_DONE.store(false, Ordering::Release);
+    let saved = narf_filesystem::killable::replace_kill_hooks(Some(&HANDOFF_HOOKS));
+    let owner = crate::txn_gate::identity();
+    let Some(joined) = poll_once(vol.join_txn()) else {
+        narf_filesystem::killable::replace_kill_hooks(saved);
+        return TestResult::Fail("joining the transaction blocked");
+    };
+    let handed = Arc::clone(&vol);
+    narf_scheduler::spawn(HandedOff {
+        owner,
+        inner: alloc::boxed::Box::pin(async move {
+            HANDOFF_JOINED.store(1 + u8::from(handed.txn_joined()), Ordering::Release);
+            handed.exclusive(async {}).await;
+            HANDOFF_DONE.store(true, Ordering::Release);
+        }),
+    });
+    for _ in 0..100_000 {
+        if HANDOFF_DONE.load(Ordering::Acquire) {
+            break;
+        }
+        narf_scheduler::poll_one_round();
+    }
+    let done = HANDOFF_DONE.load(Ordering::Acquire);
+    let saw_joined = HANDOFF_JOINED.load(Ordering::Acquire);
+    // A stuck hand-off finishes once the join goes; run it out either way.
+    drop(joined);
+    for _ in 0..100_000 {
+        if HANDOFF_DONE.load(Ordering::Acquire) {
+            break;
+        }
+        narf_scheduler::poll_one_round();
+    }
+    narf_filesystem::killable::replace_kill_hooks(saved);
+    if saw_joined != 2 {
+        return TestResult::Fail("a handed-off operation did not see its own join");
+    }
+    if !done {
+        return TestResult::Fail(
+            "a handed-off operation waited for its own join to close the transaction",
+        );
+    }
+    if vol.txn_closed() || poll_once(vol.close_txn()).is_none() {
+        return TestResult::Fail("the hand-off left the transaction joined or closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_handed_off_operation_keeps_its_transaction
+);
+
+// ── A kill landing in every phase of a commit ───────────────────────────
+
+/// Which device I/O the stall device holds (`u64::MAX`: none), how many it
+/// has seen, whether the held one may go, and its waker.
+static STALL_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static STALL_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static STALL_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static STALL_GO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static STALL_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Every I/O yields once before it completes, so whoever holds the device
+/// across it makes the next comer wait — the contention a kill acts on.
+static STALL_YIELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Pending once (waking itself), then ready.
+struct YieldOnce(bool);
+
+impl core::future::Future for YieldOnce {
+    type Output = ();
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.0 {
+            return core::task::Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        core::task::Poll::Pending
+    }
+}
+
+/// A RAM device that holds its `STALL_AT`-th I/O until released: the point
+/// at which the test kills the task running the commit.
+struct StallDevice {
+    inner: Arc<narf_block::ram::RamBlockDevice>,
+}
+
+struct Stall;
+
+impl core::future::Future for Stall {
+    type Output = ();
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        use core::sync::atomic::Ordering;
+        if STALL_GO.load(Ordering::Acquire) {
+            return core::task::Poll::Ready(());
+        }
+        *STALL_WAKER.lock() = Some(cx.waker().clone());
+        STALL_HELD.store(true, Ordering::Release);
+        if STALL_GO.load(Ordering::Acquire) {
+            return core::task::Poll::Ready(());
+        }
+        core::task::Poll::Pending
+    }
+}
+
+impl narf_block::BlockDevice for StallDevice {
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.inner.physical_block_size()
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.inner.capacity_blocks()
+    }
+    fn supports(&self, feat: narf_block::BlockFeature) -> bool {
+        self.inner.supports(feat)
+    }
+    fn submit(
+        &self,
+        req: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        use core::sync::atomic::Ordering;
+        let n = STALL_SEEN.fetch_add(1, Ordering::AcqRel);
+        let stall = n == STALL_AT.load(Ordering::Acquire);
+        let yield_once = STALL_YIELD.load(Ordering::Acquire);
+        let io = self.inner.submit(req);
+        async move {
+            if stall {
+                Stall.await;
+            }
+            if yield_once {
+                YieldOnce(false).await;
+            }
+            io.await
+        }
+    }
+    fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.flush()
+    }
+    fn discard(
+        &self,
+        range: narf_block::LbaRange,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.discard(range)
+    }
+    fn cancel(
+        &self,
+        tag: u64,
+    ) -> impl core::future::Future<Output = narf_block::CancelResult> + Send {
+        self.inner.cancel(tag)
+    }
+}
+
+static PHASE_RESULT: narf_lib::sync::IrqSafeSpinLock<Option<Result<(), FsError>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static PHASE_READER_STOP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static PHASE_READER_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// A commit whose task is killed part-way finishes, wherever the kill lands.
+///
+/// The commit is started by this test task (it closes the transaction as
+/// this task), then held at its `at`-th device I/O — with the node cache
+/// emptied, that walks the commit's reads of the extent, free-space and
+/// root trees, its node writes and its superblock — and its task is killed:
+/// the rest is handed to another scheduler task, as the userspace hand-off
+/// does with a killed task's operation, and the killed owner's killable
+/// waits fire. A live reader keeps the device busy meanwhile (every I/O
+/// yields once), so the commit's reads queue for it — the wait a kill ends.
+/// No read on the commit's behalf may give up: the commit must succeed, the
+/// filesystem stay writable, and the data read back.
+///
+/// Before the hand-off kept the operation's identity, the reads after the
+/// kill were judged outside any commit, gave up, and the commit failed with
+/// its batch lost — the kill soak's "transaction commit failed".
+fn smoke_btrfs_commit_survives_a_kill_in_every_phase() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    const MAX_IO: u64 = 400;
+    let image = decode_sparse(FIXTURE_SPARSE);
+    let saved = narf_filesystem::killable::replace_kill_hooks(Some(&HANDOFF_HOOKS));
+    let restore = |result: TestResult| {
+        narf_filesystem::killable::replace_kill_hooks(saved);
+        HANDOFF_KILLED.store(0, Ordering::Release);
+        STALL_AT.store(u64::MAX, Ordering::Release);
+        result
+    };
+    let mut phases = 0u64;
+    for at in 0..MAX_IO {
+        STALL_AT.store(u64::MAX, Ordering::Release);
+        STALL_GO.store(false, Ordering::Release);
+        STALL_HELD.store(false, Ordering::Release);
+        HANDOFF_KILLED.store(0, Ordering::Release);
+        let device = Arc::new(StallDevice {
+            inner: narf_block::ram::RamBlockDevice::from_image(512, image.clone()),
+        });
+        let vol = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+            Some(Ok(vol)) => vol,
+            _ => return restore(TestResult::Fail("stall fixture failed to mount")),
+        };
+        let file = match poll_once(vol.root().create("killed-commit.dat")) {
+            Some(Ok(file)) => file,
+            _ => return restore(TestResult::Fail("create failed")),
+        };
+        let data = alloc::vec![(at as u8) ^ 0x5a; 96 * 1024];
+        if !matches!(poll_once(file.write(0, &data)), Some(Ok(n)) if n == data.len()) {
+            return restore(TestResult::Fail("staging the batch failed"));
+        }
+        vol.__test_empty_node_cache();
+        STALL_SEEN.store(0, Ordering::Release);
+        STALL_AT.store(at, Ordering::Release);
+        let owner = crate::txn_gate::identity();
+        let committing = Arc::clone(&vol);
+        let mut commit: core::pin::Pin<
+            alloc::boxed::Box<dyn core::future::Future<Output = Result<(), FsError>> + Send>,
+        > = alloc::boxed::Box::pin(async move { committing.sync_to_disk().await });
+        // Run the commit as this task until it reaches the held I/O.
+        let mut finished = None;
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        for _ in 0..100_000 {
+            match commit.as_mut().poll(&mut cx) {
+                core::task::Poll::Ready(result) => {
+                    finished = Some(result);
+                    break;
+                }
+                core::task::Poll::Pending if STALL_HELD.load(Ordering::Acquire) => break,
+                core::task::Poll::Pending => {}
+            }
+        }
+        if let Some(result) = finished {
+            // The commit did fewer I/Os than `at`: every phase is covered.
+            if result.is_err() {
+                return restore(TestResult::Fail("an undisturbed commit failed"));
+            }
+            break;
+        }
+        phases += 1;
+        // Kill this task; its commit goes on elsewhere, while a live reader
+        // contends for the device.
+        *PHASE_RESULT.lock() = None;
+        HANDOFF_KILLED.store(owner, Ordering::Release);
+        STALL_YIELD.store(true, Ordering::Release);
+        PHASE_READER_STOP.store(false, Ordering::Release);
+        PHASE_READER_DONE.store(false, Ordering::Release);
+        let reader_vol = Arc::clone(&vol);
+        narf_scheduler::spawn(async move {
+            let mut buf = alloc::vec![0u8; 16 * 1024];
+            while !PHASE_READER_STOP.load(Ordering::Acquire) {
+                reader_vol.__test_empty_node_cache();
+                if let Ok(file) = reader_vol.root().lookup_async("killed-commit.dat").await {
+                    let _ = file.read(0, &mut buf).await;
+                }
+                YieldOnce(false).await;
+            }
+            PHASE_READER_DONE.store(true, Ordering::Release);
+        });
+        narf_scheduler::spawn(HandedOff {
+            owner,
+            inner: alloc::boxed::Box::pin(async move {
+                let result = commit.await;
+                *PHASE_RESULT.lock() = Some(result);
+            }),
+        });
+        STALL_GO.store(true, Ordering::Release);
+        if let Some(waker) = STALL_WAKER.lock().take() {
+            waker.wake();
+        }
+        let mut result = None;
+        for _ in 0..1_000_000 {
+            result = PHASE_RESULT.lock().take();
+            if result.is_some() {
+                break;
+            }
+            narf_scheduler::poll_one_round();
+        }
+        HANDOFF_KILLED.store(0, Ordering::Release);
+        STALL_AT.store(u64::MAX, Ordering::Release);
+        PHASE_READER_STOP.store(true, Ordering::Release);
+        for _ in 0..1_000_000 {
+            if PHASE_READER_DONE.load(Ordering::Acquire) {
+                break;
+            }
+            narf_scheduler::poll_one_round();
+        }
+        STALL_YIELD.store(false, Ordering::Release);
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                return restore(TestResult::Fail(
+                    "a commit gave up when its task was killed part-way",
+                ))
+            }
+            None => {
+                return restore(TestResult::Fail(
+                    "a commit whose task was killed part-way never finished",
+                ))
+            }
+        }
+        if vol.is_core_read_only() {
+            return restore(TestResult::Fail(
+                "a killed commit left the filesystem read-only",
+            ));
+        }
+        let mut back = alloc::vec![0u8; data.len()];
+        if !matches!(poll_once(file.read(0, &mut back)), Some(Ok(n)) if n == data.len())
+            || back != data
+        {
+            return restore(TestResult::Fail("a killed commit lost the data it carried"));
+        }
+    }
+    if phases == 0 {
+        return restore(TestResult::Fail("the commit did no I/O to hold"));
+    }
+    restore(TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_commit_survives_a_kill_in_every_phase
+);
