@@ -1145,6 +1145,7 @@ pub fn init_per_task_state() {
         crate::ns_last_pid_for_current,
         crate::set_ns_last_pid_for_current,
     );
+    crate::futex_policy::register_sysctls();
     // `/proc/sys/kernel/{sem,msg*,shm*}` are the caller's IPC-namespace
     // limits, which live in `sysvipc`; same reasoning as the two above, and
     // installing them here (rather than only in `frame`'s cross-crate init)

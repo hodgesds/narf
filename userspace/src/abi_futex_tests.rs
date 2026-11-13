@@ -12,6 +12,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 use narf_memory::AddressSpace;
 
+#[cfg(feature = "kernel-test")]
+#[path = "futex_policy_tests.rs"]
+mod policy_tests;
+
 const FUTEX_WAKE: u64 = 1;
 const FUTEX_REQUEUE: u64 = 3;
 const FUTEX_CMP_REQUEUE: u64 = 4;

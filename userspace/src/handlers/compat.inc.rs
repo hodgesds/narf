@@ -10466,7 +10466,25 @@ struct FutexWaiter {
     q: Option<alloc::sync::Arc<FutexQ>>,
 }
 
-type FutexWaitQueue = futex_queue::Queue<FutexWaiter>;
+struct FutexWaitQueue {
+    entries: futex_queue::Queue<FutexWaiter>,
+    policy: Option<alloc::sync::Arc<dyn crate::futex_policy::FutexWakePolicy>>,
+}
+
+impl FutexWaitQueue {
+    const fn new() -> Self {
+        Self { entries: futex_queue::Queue::new(), policy: None }
+    }
+}
+
+impl core::ops::Deref for FutexWaitQueue {
+    type Target = futex_queue::Queue<FutexWaiter>;
+    fn deref(&self) -> &Self::Target { &self.entries }
+}
+
+impl core::ops::DerefMut for FutexWaitQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.entries }
+}
 
 #[repr(align(64))]
 struct FutexWaitBucket {
@@ -10483,6 +10501,96 @@ impl FutexWaitBucket {
 
 static FUTEX_WAITERS: [FutexWaitBucket; FUTEX_BUCKET_COUNT] =
     [const { FutexWaitBucket::new() }; FUTEX_BUCKET_COUNT];
+
+/// Called only by the serialized, authorized policy installer. The registry
+/// retains every custom policy, so replacing a bucket reference cannot run a
+/// custom destructor under its lock. Wakes never take the registry lock.
+pub(crate) fn publish_futex_wake_policy(
+    policy: Option<alloc::sync::Arc<dyn crate::futex_policy::FutexWakePolicy>>,
+) {
+    for bucket in &FUTEX_WAITERS {
+        bucket.values.lock().policy = policy.clone();
+    }
+}
+
+fn futex_waiter_info(waiter: &FutexWaiter) -> crate::futex_policy::FutexWaiterInfo {
+    crate::futex_policy::FutexWaiterInfo {
+        task_id: waiter.tid,
+        wait_index: waiter.slot.checked_sub(1).map(|index| index as usize),
+    }
+}
+
+// Keep the FIFO scan in its caller; custom ranking must not add its call
+// frame and register spills to every ordinary single wake.
+#[inline(always)]
+fn futex_select_waiter(
+    queue: &FutexWaitQueue,
+    key: FutexKey,
+    bitset: u32,
+) -> Option<futex_queue::Handle> {
+    if let Some(policy) = &queue.policy {
+        return futex_select_ranked_waiter(&queue.entries, policy.as_ref(), key, bitset);
+    }
+    queue.iter().find(|(_, w)| w.key == key && w.bitset & bitset != 0)
+        .map(|(handle, _)| handle)
+}
+
+#[inline(never)]
+fn futex_select_ranked_waiter(
+    queue: &futex_queue::Queue<FutexWaiter>,
+    policy: &dyn crate::futex_policy::FutexWakePolicy,
+    key: FutexKey,
+    bitset: u32,
+) -> Option<futex_queue::Handle> {
+    let mut eligible = queue.iter().filter(|(_, w)| w.key == key && w.bitset & bitset != 0);
+    let (mut best, waiter) = eligible.next()?;
+    let mut best_rank = policy.rank(futex_waiter_info(waiter));
+    for (handle, waiter) in eligible {
+        let rank = policy.rank(futex_waiter_info(waiter));
+        if rank > best_rank {
+            best = handle;
+            best_rank = rank;
+        }
+    }
+    Some(best)
+}
+
+/// Custom multi-wakes rank each eligible waiter once, then sort by rank and
+/// arrival position. This avoids repeated O(n) selection for each wake. The
+/// default FIFO path retains its one-pass scan and existing allocation shape.
+#[inline(always)]
+fn futex_take_wake_waiters(
+    queue: &mut FutexWaitQueue,
+    key: FutexKey,
+    n: u32,
+    bitset: u32,
+) -> alloc::vec::Vec<FutexWaiter> {
+    if n == 0 { return alloc::vec::Vec::new(); }
+    let Some(policy) = &queue.policy else {
+        return futex_take_waiters(queue, key, n, bitset);
+    };
+    futex_take_ranked_waiters(&mut queue.entries, policy.as_ref(), key, n, bitset)
+}
+
+#[inline(never)]
+fn futex_take_ranked_waiters(
+    queue: &mut futex_queue::Queue<FutexWaiter>,
+    policy: &dyn crate::futex_policy::FutexWakePolicy,
+    key: FutexKey,
+    n: u32,
+    bitset: u32,
+) -> alloc::vec::Vec<FutexWaiter> {
+    let mut ranked: alloc::vec::Vec<_> = queue.iter()
+        .filter(|(_, w)| w.key == key && w.bitset & bitset != 0)
+        .enumerate()
+        .map(|(order, (handle, waiter))| {
+            (core::cmp::Reverse(policy.rank(futex_waiter_info(waiter))), order, handle)
+        }).collect();
+    ranked.sort_unstable_by_key(|&(rank, order, _)| (rank, order));
+    ranked.into_iter().take(n as usize)
+        .map(|(_, _, handle)| queue.remove(handle).expect("ranked futex waiter"))
+        .collect()
+}
 
 #[inline]
 fn futex_wait_bucket(key: FutexKey) -> &'static FutexWaitBucket {
@@ -10609,8 +10717,7 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
     if n == 1 {
         let waiter = {
             let mut queue = futex_wait_bucket(key).values.lock();
-            let handle = queue.iter().find(|(_, w)| w.key == key && w.bitset & bitset != 0)
-                .map(|(handle, _)| handle);
+            let handle = futex_select_waiter(&queue, key, bitset);
             handle.and_then(|h| queue.remove(h))
         };
         if let Some(waiter) = waiter {
@@ -10621,7 +10728,7 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
     }
     let drained = {
         let mut queue = futex_wait_bucket(key).values.lock();
-        futex_take_waiters(&mut queue, key, n, bitset)
+        futex_take_wake_waiters(&mut queue, key, n, bitset)
     };
     let count = drained.len();
     // Broadcast wakes spread across owners instead of forming a serial chain
@@ -10645,7 +10752,7 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
 pub(crate) fn futex_wake_one_key_spread(key: FutexKey) -> usize {
     let waiter = {
         let mut queue = futex_wait_bucket(key).values.lock();
-        let handle = queue.iter().find(|(_, w)| w.key == key).map(|(handle, _)| handle);
+        let handle = futex_select_waiter(&queue, key, FUTEX_BITSET_MATCH_ANY);
         handle.and_then(|h| queue.remove(h))
     };
     if let Some(waiter) = waiter {
