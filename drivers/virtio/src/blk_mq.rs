@@ -30,7 +30,7 @@ use core::task::{Context, Poll, Waker};
 
 use narf_io::DmaBuffer;
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_time::timer::{self as wheel, TimerList};
+use narf_time::timer::{self as wheel, TimerList, TimerRef};
 
 use crate::blk_pci::{
     STALLED_QUEUE_STATE, STALLED_REQUEST, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN,
@@ -634,10 +634,10 @@ fn isr(cookie: u64) -> narf_interrupts::IrqStatus {
     narf_interrupts::IrqStatus::Handled
 }
 
-fn timeout_timer(t: &TimerList) {
+fn timeout_timer(r: TimerRef) {
     // SAFETY: only `QueueTimer` uses this callback; `timer` is its first
     // field (repr(C)); the queue deletes the timer before it is freed.
-    let qt = unsafe { &*(t as *const TimerList as *const QueueTimer) };
+    let qt = unsafe { &*(r.as_ptr() as *const QueueTimer) };
     let q = qt.queue.load(Ordering::Acquire);
     if !q.is_null() {
         // SAFETY: as above.

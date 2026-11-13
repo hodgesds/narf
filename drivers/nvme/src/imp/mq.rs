@@ -58,7 +58,7 @@ use narf_io::pool::DmaPool;
 use narf_io::DmaBuffer;
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_time::timer::{self as wheel, TimerList};
+use narf_time::timer::{self as wheel, TimerList, TimerRef};
 
 use super::{note_stray_cqe, peek_cqe, write_sqe, Cqe, NvmeError, Sqe, REG_DOORBELL_BASE};
 
@@ -986,11 +986,11 @@ fn isr(cookie: u64) -> narf_interrupts::IrqStatus {
 }
 
 /// The queue timeout timer's callback (`blk_rq_timed_out_timer`).
-fn timeout_timer(t: &TimerList) {
+fn timeout_timer(r: TimerRef) {
     // SAFETY: only `QueueTimer` uses this callback; `timer` is its first
     // field (repr(C)), and the queue it points at deletes the timer
     // synchronously before it is freed.
-    let qt = unsafe { &*(t as *const TimerList as *const QueueTimer) };
+    let qt = unsafe { &*(r.as_ptr() as *const QueueTimer) };
     let q = qt.queue.load(Ordering::Acquire);
     if q.is_null() {
         return;
