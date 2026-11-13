@@ -977,4 +977,198 @@ mod tests {
         "filesystem/dcache",
         smoke_dcache_mutation_invalidates_case_variant_aliases
     );
+
+    /// A directory whose lookups fail with an injected error until it is
+    /// cleared — a device returning EIO, or a lookup abandoned because its
+    /// caller was killed — and otherwise answer from a MemFs root.
+    struct FaultyDir {
+        inner: Arc<dyn DirOps>,
+        fault: IrqSafeSpinLock<Option<FsError>>,
+    }
+
+    impl FaultyDir {
+        fn injected(&self) -> Option<FsError> {
+            *self.fault.lock()
+        }
+    }
+
+    impl DirOps for FaultyDir {
+        fn ino(&self) -> u64 {
+            self.inner.ino()
+        }
+
+        fn rcu_walkable(&self) -> bool {
+            true
+        }
+
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            self.try_lookup(name).ok()
+        }
+
+        fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+            self.try_lookup_dir(name).ok()
+        }
+
+        fn try_lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+            match self.injected() {
+                Some(error) => Err(error),
+                None => self.inner.try_lookup(name),
+            }
+        }
+
+        fn try_lookup_dir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+            match self.injected() {
+                Some(error) => Err(error),
+                None => self.inner.try_lookup_dir(name),
+            }
+        }
+
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = crate::DirEntry> + 'a> {
+            self.inner.iter()
+        }
+    }
+
+    /// `present` (a file) and `sub/leaf` (a file in a directory) under a
+    /// fault-injecting root.
+    fn faulty_tree(name: &'static str) -> Result<(Arc<FaultyDir>, Arc<Dentry>), &'static str> {
+        let fs = crate::MemFs::new(name);
+        let inner = crate::FsInstance::root(&fs);
+        if !matches!(poll_once(inner.create("present")), Some(Ok(_))) {
+            return Err("creating the fixture file failed");
+        }
+        let Some(Ok(sub)) = poll_once(inner.mkdir("sub")) else {
+            return Err("creating the fixture directory failed");
+        };
+        if !matches!(poll_once(sub.create("leaf")), Some(Ok(_))) {
+            return Err("creating the fixture leaf failed");
+        }
+        let dir = Arc::new(FaultyDir {
+            inner,
+            fault: IrqSafeSpinLock::new(None),
+        });
+        let root = Dentry::root(Arc::clone(&dir) as Arc<dyn DirOps>);
+        Ok((dir, root))
+    }
+
+    /// Whether the dcache holds a negative dentry for `path` (which would
+    /// make every later RCU walk answer ENOENT without asking the
+    /// filesystem).
+    fn cached_negative(root: &Arc<Dentry>, path: &str) -> bool {
+        matches!(
+            map_fast_file(resolve_file(Arc::clone(root), path)),
+            Some(Err(FsError::NotFound))
+        ) || matches!(
+            resolve_directory(Arc::clone(root), path),
+            FastDirectory::Negative
+        )
+    }
+
+    /// Every reference walk — sync and async, file- and directory-shaped,
+    /// at the leaf and mid-path — returns the injected lookup failure, and
+    /// leaves no negative dentry behind; once the failure clears, the same
+    /// names resolve.
+    fn lookup_failure_is_returned_and_never_cached(error: FsError) -> Result<(), &'static str> {
+        let (dir, root) = faulty_tree("lookup-failure")?;
+        *dir.fault.lock() = Some(error);
+
+        if crate::resolve_dentry(Arc::clone(&root), "present").err() != Some(error) {
+            return Err("sync walk did not return the leaf lookup's failure");
+        }
+        if crate::resolve_dentry(Arc::clone(&root), "sub/leaf").err() != Some(error) {
+            return Err("sync walk did not return a mid-path lookup's failure");
+        }
+        if crate::resolve_directory_dentry(Arc::clone(&root), "sub").err() != Some(error) {
+            return Err("sync directory walk did not return the lookup's failure");
+        }
+        match poll_once(crate::resolve_async_dentry(Arc::clone(&root), "present")) {
+            Some(Err(found)) if found == error => {}
+            _ => return Err("async walk did not return the leaf lookup's failure"),
+        }
+        match poll_once(crate::resolve_async_dentry(Arc::clone(&root), "sub/leaf")) {
+            Some(Err(found)) if found == error => {}
+            _ => return Err("async walk did not return a mid-path lookup's failure"),
+        }
+        match poll_once(crate::resolve_directory_dentry_async(
+            Arc::clone(&root),
+            "sub",
+        )) {
+            Some(Err(found)) if found == error => {}
+            _ => return Err("async directory walk did not return the lookup's failure"),
+        }
+        if cached_negative(&root, "present") || cached_negative(&root, "sub") {
+            return Err("a failed lookup was cached as a negative dentry");
+        }
+
+        // The failure clears (the device recovers; another, live task
+        // looks): the names are found, not answered from the dcache.
+        *dir.fault.lock() = None;
+        if crate::resolve_dentry(Arc::clone(&root), "present").is_err() {
+            return Err("the file was not found once the lookup failure cleared");
+        }
+        match poll_once(crate::resolve_async_dentry(Arc::clone(&root), "sub/leaf")) {
+            Some(Ok(_)) => {}
+            _ => return Err("the nested file was not found once the lookup failure cleared"),
+        }
+        Ok(())
+    }
+
+    fn verdict(outcome: Result<(), &'static str>) -> TestResult {
+        match outcome {
+            Ok(()) => TestResult::Pass,
+            Err(why) => TestResult::Fail(why),
+        }
+    }
+
+    /// (a) A lookup that hits a device error is EIO to its caller and is
+    /// not remembered as a miss.
+    fn smoke_dcache_lookup_io_error_is_returned_not_cached() -> TestResult {
+        verdict(lookup_failure_is_returned_and_never_cached(FsError::Io(
+            narf_block::BlockError::IOError,
+        )))
+    }
+    kernel_test_in!(
+        "filesystem/dcache/lookup_errors",
+        smoke_dcache_lookup_io_error_is_returned_not_cached
+    );
+
+    /// (b) A lookup abandoned because its caller was killed is EINTR to
+    /// that caller only: the next lookup of the name finds it.
+    fn smoke_dcache_lookup_interrupted_is_returned_not_cached() -> TestResult {
+        verdict(lookup_failure_is_returned_and_never_cached(
+            FsError::Interrupted,
+        ))
+    }
+    kernel_test_in!(
+        "filesystem/dcache/lookup_errors",
+        smoke_dcache_lookup_interrupted_is_returned_not_cached
+    );
+
+    /// (c) A genuine miss is still cached negative, by both walks, so a
+    /// repeated probe of an absent name never reaches the filesystem.
+    fn smoke_dcache_lookup_miss_still_caches_negative() -> TestResult {
+        verdict((|| {
+            let (_dir, root) = faulty_tree("lookup-miss")?;
+            if crate::resolve_dentry(Arc::clone(&root), "absent").err() != Some(FsError::NotFound) {
+                return Err("sync walk of an absent name was not ENOENT");
+            }
+            if !cached_negative(&root, "absent") {
+                return Err("sync walk did not cache the miss");
+            }
+            match poll_once(crate::resolve_async_dentry(
+                Arc::clone(&root),
+                "absent-async",
+            )) {
+                Some(Err(FsError::NotFound)) => {}
+                _ => return Err("async walk of an absent name was not ENOENT"),
+            }
+            if !cached_negative(&root, "absent-async") {
+                return Err("async walk did not cache the miss");
+            }
+            Ok(())
+        })())
+    }
+    kernel_test_in!(
+        "filesystem/dcache/lookup_errors",
+        smoke_dcache_lookup_miss_still_caches_negative
+    );
 }
