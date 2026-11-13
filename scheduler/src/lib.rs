@@ -8936,6 +8936,18 @@ pub fn cooperative_yield() -> bool {
 /// `read_poll_timeout` does, the condition is evaluated once more after
 /// the deadline has passed, so one that became true between the last
 /// check and the expiry is not reported as a timeout.
+/// What a sync→async bridge wait does between checks: the sleep pumps, and
+/// the timer softirq the executor round runs, so a waiter outside the
+/// executor (polled driver paths, `block_on` callers, boot-time tests)
+/// still sees timer-wheel timers — request timeouts — expire. Never
+/// inlined: `responsive_spin_until` is inlined into hundreds of driver
+/// waits, and this body must not land in each of their frames.
+#[inline(never)]
+fn bridge_pump() {
+    sleep_pumps::run();
+    let _ = narf_time::hrtimer::hrtimer_run_softirq();
+}
+
 #[inline]
 pub fn responsive_spin_until<F: FnMut() -> bool>(
     mut done: F,
@@ -8955,11 +8967,7 @@ pub fn responsive_spin_until<F: FnMut() -> bool>(
             return done;
         }
         if i & 0xFFF == 0 {
-            sleep_pumps::run();
-            // The timer softirq the executor round runs: a waiter outside
-            // the executor (polled driver paths, boot-time tests) still
-            // sees timer-wheel timers — request timeouts — expire.
-            let _ = narf_time::hrtimer::hrtimer_run_softirq();
+            bridge_pump();
         }
         core::hint::spin_loop();
         i = i.wrapping_add(1);
@@ -9072,8 +9080,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
                 // timer wheel as the executor round would (a future
                 // waiting on a timer-wheel timer is woken here, not
                 // by an executor that is not running).
-                sleep_pumps::run();
-                let _ = narf_time::hrtimer::hrtimer_run_softirq();
+                bridge_pump();
                 if allow_halt && !awake.flag.load(Ordering::Acquire) {
                     // Cooperative path: idle until something
                     // fires an IRQ. IRQ handler (or the future's
