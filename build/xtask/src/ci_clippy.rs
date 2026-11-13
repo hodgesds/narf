@@ -161,6 +161,8 @@ pub fn run(args: &Args, root: &Path) -> Result<()> {
         "--format-version=1",
     ]))?;
     let mut seen = BTreeSet::new();
+    // Lint every context before failing, so one run reports all of them.
+    let mut failed = Vec::new();
     for context in CONTEXTS {
         let frame_features = context
             .split(',')
@@ -198,8 +200,12 @@ pub fn run(args: &Args, root: &Path) -> Result<()> {
             .args(clippy_args(Some(&target), &selected, features));
         eprintln!("clippy-changed ({context}): {cmd:?}");
         if !args.dry_run && !cmd.status().context("run targeted Clippy")?.success() {
-            bail!("targeted Clippy failed ({context})");
+            eprintln!("clippy-changed: targeted Clippy failed ({context})");
+            failed.push(*context);
         }
+    }
+    if !failed.is_empty() {
+        bail!("targeted Clippy failed ({})", failed.join("; "));
     }
     Ok(())
 }

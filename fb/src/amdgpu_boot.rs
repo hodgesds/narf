@@ -242,7 +242,7 @@ fn bring_up_navi22(
     if result.is_ok() {
         // Polls only the owner lock; the forwarding tasks run later on
         // the executor.
-        if let Err(error) = block_on_boxed(|| platform::start_fault_service()) {
+        if let Err(error) = block_on_boxed(platform::start_fault_service) {
             use core::fmt::Write;
             let _ = writeln!(
                 narf_console::Writer,
@@ -284,7 +284,7 @@ fn navi22_after_bring_up(
     let runpm = narf_drivers_gpu::amdgpu_navi22_runtime_pm::parse_runpm(
         narf_boot::args().value("amdgpu.runpm"),
     );
-    let gfxoff = block_on_boxed(|| platform::gfxoff_available());
+    let gfxoff = block_on_boxed(platform::gfxoff_available);
     let runtime_mode = narf_drivers_gpu::amdgpu_navi22_runtime_pm::detect_mode(
         runpm,
         gfxoff,
@@ -318,7 +318,7 @@ fn navi22_after_bring_up(
     }
     // Publish the sysfs power controls (`pp_features`,
     // `power_dpm_force_performance_level`) with the running PMFW mask.
-    block_on_boxed(|| narf_drivers_gpu::amdgpu_rdna2_power_controls::publish());
+    block_on_boxed(narf_drivers_gpu::amdgpu_rdna2_power_controls::publish);
     // S3 through the async system-PM phase (quiesce, save PCI state;
     // resume rebuilds the owner, as recovery does).
     // SAFETY: same console hook and user-mapping policy as recovery.
@@ -581,7 +581,7 @@ fn navi22_native_display() {
 fn report_displays() {
     use core::fmt::Write;
     use narf_drivers_gpu::amdgpu_rdna2_display::{Detection, Signal};
-    let reports = match block_on_boxed(|| platform::detect_displays()) {
+    let reports = match block_on_boxed(platform::detect_displays) {
         Ok(reports) => reports,
         Err(error) => {
             let _ = writeln!(
