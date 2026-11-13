@@ -18,6 +18,7 @@ pub(super) mod btcoex;
 pub(super) mod calib;
 pub(super) mod edma;
 pub(super) mod eeprom;
+pub(super) mod gen_timer;
 pub(super) mod ini;
 pub(super) mod initvals;
 pub(super) mod initvals_ar9462;

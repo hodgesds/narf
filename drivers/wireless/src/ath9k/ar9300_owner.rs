@@ -129,6 +129,9 @@ pub(super) struct Owner {
     /// `ath9k_init_wow`: present only for an AR9462 whose PCI subsystem
     /// carries `ATH9K_PCI_WOW` (`pci.c`); `ah->wow`.
     wow: Option<ar9003::wow::Wow>,
+    /// `ah->hw_gen_timers`: the generic-timer table; `tsf2_enabled`
+    /// gates the TSF2 restart `wow_resume` performs (#2071).
+    gen_timers: ar9003::gen_timer::GenTimerTable,
     /// `ATH_OP_WOW_ENABLED`: system suspend left the associated station
     /// armed in WoW sleep instead of retiring it.
     wow_sleeping: bool,
@@ -412,6 +415,7 @@ pub(super) fn probe(
         fullsleep: false,
         pinned: false,
         wow,
+        gen_timers: ar9003::gen_timer::GenTimerTable::default(),
         wow_sleeping: false,
     }));
     *OWNER.lock() = Some(owner.clone());
@@ -1196,8 +1200,10 @@ fn wow_suspend(o: &mut Owner) -> Result<bool, narf_power::device_pm::DeviceSuspe
 /// in-place reset that restarts the RX DMA `ath9k_hw_wow_enable` stopped),
 /// then `ath9k_hw_wow_wakeup` (wake reason, PME clear, event clear,
 /// `INIT_RSSI_THR`) and its `ath9k_hw_configpcipowersave(ah, false)`
-/// (`ar9003::serdes::configure`). TSF2 has no generic-timer owner here, so
-/// `tsf2_restart` is only reported. The supervisor then runs
+/// (`ar9003::serdes::configure`), plus the TSF2 restart when `wakeup`
+/// reports the TSF2 enable clear and a TSF2 generic timer was enabled
+/// (`ar9003::gen_timer::GenTimerTable::start_tsf2`, #2071). The
+/// supervisor then runs
 /// `ath_restart_work`'s hang check, i.e. the in-place reset, keeping the
 /// station generation and its association. A failed interrupt restore
 /// closes the generation; the supervisor retires it.
@@ -1223,6 +1229,11 @@ fn wow_resume(o: &mut Owner) -> Result<(), narf_power::device_pm::DeviceSuspendE
         .wakeup(&mut io, &revision)
         .map_err(|_| DeviceSuspendError::DriverError)?;
     o.wow = Some(wow);
+    if wakeup.tsf2_restart && o.gen_timers.tsf2_enabled() {
+        o.gen_timers
+            .start_tsf2(&mut io)
+            .map_err(|_| DeviceSuspendError::DriverError)?;
+    }
     if wakeup.restore_pcie_powersave {
         let tables = ar9003::ini::Tables::for_revision(&revision, &o.identity, o.pll_pwrsave);
         ar9003::serdes::configure(&mut io, &revision, &tables, false, o.wa, o.aspm_l1_fix)
