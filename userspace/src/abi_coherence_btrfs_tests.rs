@@ -861,3 +861,255 @@ fn diagnose(fx: &Fixture, op: usize, model: &[u8], at: u64, got: u8) -> &'static
 // error (ENOENT from pwrite after ~50 operations), routed to the btrfs
 // driver; run it with `--subsystem syscall_abi/btrfs_integrity`.
 kernel_test_in!("syscall_abi/btrfs_integrity", smoke_btrfs_integrity_replay);
+
+// ── A killed plain reader leaves its wait for the device ───────────────
+
+/// A device that holds every scatter-gather request while `hold` is set, as
+/// a saturated disk whose queue is full of other tasks' requests does, and
+/// lets them go on `release`.
+struct HangDevice {
+    inner: Arc<narf_block::ram::RamBlockDevice>,
+    hold: core::sync::atomic::AtomicBool,
+    held: core::sync::atomic::AtomicUsize,
+    waiters: IrqSafeSpinLock<alloc::vec::Vec<core::task::Waker>>,
+}
+
+impl core::fmt::Debug for HangDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HangDevice").finish_non_exhaustive()
+    }
+}
+
+impl HangDevice {
+    fn release(&self) {
+        self.hold
+            .store(false, core::sync::atomic::Ordering::Release);
+        let waiters = core::mem::take(&mut *self.waiters.lock());
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+}
+
+/// Pending while the device holds; woken by [`HangDevice::release`].
+struct HoldGate<'a>(&'a HangDevice);
+
+impl core::future::Future for HoldGate<'_> {
+    type Output = ();
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if !self.0.hold.load(core::sync::atomic::Ordering::Acquire) {
+            return core::task::Poll::Ready(());
+        }
+        self.0
+            .held
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        self.0.waiters.lock().push(cx.waker().clone());
+        core::task::Poll::Pending
+    }
+}
+
+impl narf_block::BlockDevice for HangDevice {
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.inner.physical_block_size()
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.inner.capacity_blocks()
+    }
+    fn supports(&self, feature: narf_block::BlockFeature) -> bool {
+        self.inner.supports(feature)
+    }
+    fn submit(
+        &self,
+        req: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        self.inner.submit(req)
+    }
+    fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.flush()
+    }
+    fn discard(
+        &self,
+        range: narf_block::LbaRange,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.discard(range)
+    }
+    fn cancel(
+        &self,
+        tag: u64,
+    ) -> impl core::future::Future<Output = narf_block::CancelResult> + Send {
+        self.inner.cancel(tag)
+    }
+    fn submit_sg(
+        &self,
+        req: narf_block::SgRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        // Boxed so this device's futures are no larger than a real device's:
+        // the volume's futures are instantiated for it too, and the kernel
+        // frame budget counts them.
+        alloc::boxed::Box::pin(async move {
+            HoldGate(self).await;
+            self.inner.submit_sg(req).await
+        })
+            as core::pin::Pin<
+                alloc::boxed::Box<
+                    dyn core::future::Future<Output = narf_block::BlockCompletion> + Send + '_,
+                >,
+            >
+    }
+}
+
+static KILLED_READER_TASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn killed_reader_task() -> u64 {
+    KILLED_READER_TASK.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+static KILLED_READER_WAKES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn killed_reader_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    unsafe fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    unsafe fn wake(_: *const ()) {
+        KILLED_READER_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    unsafe fn drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
+    // SAFETY: the vtable touches only a static atomic and ignores the pointer.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+}
+
+/// Signal tables and the pinned task id, put back on drop.
+struct KilledReaderFixture(u64);
+
+impl KilledReaderFixture {
+    fn new(task: u64) -> Self {
+        KILLED_READER_TASK.store(task, core::sync::atomic::Ordering::Relaxed);
+        crate::handlers::install_task_id_lookup(killed_reader_task);
+        crate::handlers::__test_signal_reset();
+        crate::handlers::signal_waker_init();
+        KILLED_READER_WAKES.store(0, core::sync::atomic::Ordering::Relaxed);
+        Self(task)
+    }
+}
+
+impl Drop for KilledReaderFixture {
+    fn drop(&mut self) {
+        crate::handlers::clear_signal_pending(self.0, 9);
+        crate::handlers::drop_signal_waker(self.0);
+        crate::handlers::__test_reset_task_id_lookup();
+        KILLED_READER_TASK.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn killed_reader(device: &Arc<HangDevice>) -> Result<(), &'static str> {
+    use core::future::Future;
+    use core::sync::atomic::Ordering;
+    use core::task::{Context, Poll};
+    const TASK: u64 = 0x6b11_b7f5;
+    const LEN: usize = 64 * 1024;
+    let want: alloc::vec::Vec<u8> = (0..LEN).map(|i| (i % 253) as u8).collect();
+    type Volume = narf_drivers_fs_btrfs::volume::BtrfsVolume<HangDevice>;
+    let mount = || -> Result<Arc<Volume>, &'static str> {
+        crate::handlers::poll_io_to_completion(Volume::mount(
+            device.clone(),
+            narf_lib::id::DomainId::DRIVER_0,
+        ))
+        .and_then(|r| r.ok())
+        .ok_or("mounting the btrfs fixture failed")
+    };
+    {
+        let volume = mount()?;
+        let file = crate::handlers::poll_io_to_completion(volume.root().create("narf.txt"))
+            .and_then(|r| r.ok())
+            .ok_or("creating narf.txt failed")?;
+        if crate::handlers::poll_io_to_completion(file.write(0, &want)) != Some(Ok(LEN)) {
+            return Err("seeding narf.txt failed");
+        }
+        if crate::handlers::poll_io_to_completion(volume.sync_to_disk()) != Some(Ok(())) {
+            return Err("sync failed");
+        }
+    }
+    // A fresh mount: the file's extent is read from the device.
+    let volume = mount()?;
+    let file = crate::handlers::poll_io_to_completion(volume.root().lookup_async("narf.txt"))
+        .and_then(|r| r.ok())
+        .ok_or("lookup of narf.txt failed")?;
+
+    let fixture = KilledReaderFixture::new(TASK);
+    device.hold.store(true, Ordering::Release);
+    let mut buf = alloc::vec![0u8; LEN];
+    let waker = killed_reader_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut read = file.read(0, &mut buf);
+    // The plain read reaches the device and waits there.
+    let mut polls = 0;
+    while device.held.load(Ordering::Acquire) == 0 {
+        match read.as_mut().poll(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(_) => return Err("the read finished without going to the device"),
+        }
+        polls += 1;
+        if polls > 100_000 {
+            return Err("the read never reached the device");
+        }
+    }
+    // SIGKILL: the reader wakes and leaves at once, the device still holding.
+    crate::handlers::raise_signal_pending(TASK, 9);
+    if KILLED_READER_WAKES.load(Ordering::Relaxed) == 0 {
+        return Err("SIGKILL did not wake the reader waiting on the device");
+    }
+    match read.as_mut().poll(&mut cx) {
+        Poll::Ready(Err(_)) => {}
+        Poll::Ready(Ok(_)) => return Err("a killed reader returned data"),
+        Poll::Pending => return Err("a killed reader went on waiting for the device"),
+    }
+    drop(read);
+    drop(fixture);
+    // The device answers again, and the volume is whole: nothing of the
+    // abandoned request leaked into a later one.
+    device.release();
+    let mut again = alloc::vec![0u8; LEN];
+    if crate::handlers::poll_io_to_completion(file.read(0, &mut again)) != Some(Ok(LEN))
+        || again != want
+    {
+        return Err("a later read of the file did not return its contents");
+    }
+    Ok(())
+}
+
+/// A plain reader (no operation, no commit) queued on the device is ended
+/// by SIGKILL at once — it does not wait for the device to answer — and the
+/// request it left behind completes into pages the page list owns
+/// (`folio_lock_killable` in `filemap_read`).
+fn smoke_btrfs_coherence_killed_reader_leaves_the_device_wait() -> TestResult {
+    let device = Arc::new(HangDevice {
+        inner: narf_block::ram::RamBlockDevice::from_image(
+            512,
+            crate::abi_fault_write_tests::btrfs_decode_sparse(
+                crate::abi_fault_write_tests::BTRFS_FST_FIXTURE_SPARSE,
+            ),
+        ),
+        hold: core::sync::atomic::AtomicBool::new(false),
+        held: core::sync::atomic::AtomicUsize::new(0),
+        waiters: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+    });
+    let result = killed_reader(&device);
+    device.release();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "syscall_abi/coherence/btrfs",
+    smoke_btrfs_coherence_killed_reader_leaves_the_device_wait
+);

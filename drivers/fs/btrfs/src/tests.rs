@@ -32,6 +32,7 @@ mod overwrite_cost;
 mod release_cost;
 mod root_collapse;
 mod safety;
+mod sg_io;
 mod snapshot_gen;
 mod snapshots;
 mod two_handles;
@@ -14504,7 +14505,10 @@ impl narf_block::BlockDevice for StallDevice {
         let stall = n == STALL_AT.load(Ordering::Acquire);
         let yield_once = STALL_YIELD.load(Ordering::Acquire);
         let io = self.inner.submit(req);
-        async move {
+        // Boxed so this fixture's futures are no larger than a real
+        // device's: the volume's futures are instantiated for it too, and
+        // the kernel frame budget counts them.
+        alloc::boxed::Box::pin(async move {
             if stall {
                 Stall.await;
             }
@@ -14512,7 +14516,38 @@ impl narf_block::BlockDevice for StallDevice {
                 YieldOnce(false).await;
             }
             io.await
-        }
+        })
+            as core::pin::Pin<
+                alloc::boxed::Box<
+                    dyn core::future::Future<Output = narf_block::BlockCompletion> + Send + '_,
+                >,
+            >
+    }
+    /// The volume's reads and writes are scatter-gather requests: the same
+    /// stall / yield policy, counted on the same request counter.
+    fn submit_sg(
+        &self,
+        req: narf_block::SgRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        use core::sync::atomic::Ordering;
+        let n = STALL_SEEN.fetch_add(1, Ordering::AcqRel);
+        let stall = n == STALL_AT.load(Ordering::Acquire);
+        let yield_once = STALL_YIELD.load(Ordering::Acquire);
+        let io = self.inner.submit_sg(req);
+        alloc::boxed::Box::pin(async move {
+            if stall {
+                Stall.await;
+            }
+            if yield_once {
+                YieldOnce(false).await;
+            }
+            io.await
+        })
+            as core::pin::Pin<
+                alloc::boxed::Box<
+                    dyn core::future::Future<Output = narf_block::BlockCompletion> + Send + '_,
+                >,
+            >
     }
     fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
         self.inner.flush()
