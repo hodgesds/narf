@@ -2017,11 +2017,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if replacement.capacity < source.capacity {
             return Err(FsError::NoSpace);
         }
-        // Copy what the member holds verified, from a good mirror where its
-        // own copy is bad (Linux `btrfs_dev_replace` copies through scrub,
-        // which checks every block and repairs from another mirror). A
-        // stripe of a mirrored profile holds its chunk 1:1, so it is read
-        // logically; a striped profile's stripe is copied as it is.
+        // Copy what the member holds verified, from a good copy where its
+        // own is bad (Linux `btrfs_dev_replace` copies through scrub, which
+        // checks every block and repairs it from another mirror or, on
+        // RAID5/6, rebuilds it from the rest of its full stripe). A stripe
+        // of a mirrored profile holds its chunk 1:1 and is read logically; a
+        // striped profile's stripe is copied piece by piece through the
+        // logical addresses it holds ([`Self::copy_striped_member`]).
         let csum_root = if self.verify_checksums {
             let (root_tree, _) = self.root_tree_root();
             Some(
@@ -2040,6 +2042,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     (Ok(a), Ok(b)) if a == b
                 ) && g.chunk_map.raid56_set(chunk).is_err()
             };
+            if !linear && self.verify_checksums {
+                self.copy_striped_member(devid, chunk, csum_root, &replacement)
+                    .await?;
+                continue;
+            }
             let mut offset = 0u64;
             while offset < length {
                 let take = (length - offset).min(128 * 1024) as usize;
@@ -2066,6 +2073,112 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         }
         source.device.flush_result().await.map_err(FsError::Io)?;
         Ok(())
+    }
+
+    /// Device replace of a striped chunk's stripe on member `devid` (RAID0,
+    /// RAID10, RAID5, RAID6): every piece of the chunk that member holds is
+    /// read through its logical address, verified and repaired like any
+    /// read ([`Self::read_chunk_verified`]: a RAID10 piece from its other
+    /// copy, a RAID5/6 data piece rebuilt from its full stripe), and written
+    /// at the member's physical offset on `replacement`. A RAID5/6 parity
+    /// piece is recomputed from the verified data of its full stripe — Linux
+    /// scrub (`scrub_raid56_parity_stripe`) checks parity against the data
+    /// the same way. RAID0 has no second copy: a piece bad on the member
+    /// fails the replace (Linux scrub skips writing a sector it could not
+    /// repair and reports it; refusing the replace keeps the bad bytes off
+    /// the new member either way).
+    ///
+    /// Boxed out of line: the future is built in this frame, not in the
+    /// replace's.
+    #[inline(never)]
+    fn copy_striped_member<'a>(
+        &'a self,
+        devid: u64,
+        chunk: u64,
+        csum_root: Option<u64>,
+        replacement: &'a VolumeDevice<B>,
+    ) -> crate::write::BoxFut<'a, ()> {
+        Box::pin(self.copy_striped_member_inner(devid, chunk, csum_root, replacement))
+    }
+
+    async fn copy_striped_member_inner(
+        &self,
+        devid: u64,
+        chunk: u64,
+        csum_root: Option<u64>,
+        replacement: &VolumeDevice<B>,
+    ) -> Result<(), FsError> {
+        let (chunk_start, chunk_len) = self.state.lock().chunk_map.chunk_bounds(chunk)?;
+        let end = chunk_start + chunk_len;
+        let raid56 = self.state.lock().chunk_map.raid56_set(chunk_start);
+        match raid56 {
+            Err(FsError::Unsupported) => {
+                let mut logical = chunk_start;
+                while logical < end {
+                    let (take, on_member) = {
+                        let g = self.state.lock();
+                        let take = g.chunk_map.max_contiguous(logical)?;
+                        let on_member: Vec<u64> = g
+                            .chunk_map
+                            .map_logical_stripes(logical)?
+                            .into_iter()
+                            .filter(|loc| loc.devid == devid)
+                            .map(|loc| loc.physical)
+                            .collect();
+                        (take, on_member)
+                    };
+                    if !on_member.is_empty() {
+                        let bytes = self
+                            .read_chunk_verified(logical, take as usize, true, true, csum_root)
+                            .await?;
+                        for physical in on_member {
+                            replacement.write(physical, &bytes, false).await?;
+                        }
+                    }
+                    logical += take;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+            Ok(_) => {
+                let mut row = chunk_start;
+                while row < end {
+                    let set = self.state.lock().chunk_map.raid56_set(row)?;
+                    let stripe_len = set.stripe_len as usize;
+                    let parity_here = set.parity.iter().any(|loc| loc.devid == devid);
+                    let mut data: Vec<Vec<u8>> = Vec::with_capacity(set.data.len());
+                    for (index, loc) in set.data.iter().enumerate() {
+                        if loc.devid != devid && !parity_here {
+                            continue;
+                        }
+                        let logical = row + index as u64 * set.stripe_len;
+                        let bytes = self
+                            .read_chunk_verified(logical, stripe_len, true, true, csum_root)
+                            .await?;
+                        if loc.devid == devid {
+                            replacement.write(loc.physical, &bytes, false).await?;
+                        }
+                        data.push(bytes);
+                    }
+                    if parity_here {
+                        let slices: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+                        let (p, q) = crate::raid56::syndromes(&slices, set.parity.len() == 2)?;
+                        for (index, loc) in set.parity.iter().enumerate() {
+                            if loc.devid == devid {
+                                let parity = if index == 0 {
+                                    p.as_slice()
+                                } else {
+                                    q.as_slice()
+                                };
+                                replacement.write(loc.physical, parity, false).await?;
+                            }
+                        }
+                    }
+                    row += set.stripe_len * set.data.len() as u64;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Remove a member, first relocating every chunk stripe that resides on it
@@ -4111,11 +4224,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             WRITE_OUT_HELD.store(true, core::sync::atomic::Ordering::Release);
             narf_time::sleep_ms(1).await;
         }
-        let refs: Vec<(u64, &[u8])> = job
-            .nodes
-            .iter()
-            .map(|(a, b)| (*a, b.as_slice()))
-            .collect();
+        let refs: Vec<(u64, &[u8])> = job.nodes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
         self.write_nodes(&refs, job.root_admin).await?;
         drop(refs);
         // Stand in for a crash at the one instant the COW invariant is load

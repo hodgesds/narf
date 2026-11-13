@@ -697,6 +697,25 @@ cancellation of the reading operation, which the write path does not yet
 make safe in general) can leave its device write in flight after the range
 is released — the same exposure as any dropped write future.
 
+Relocation (balance, device removal) and device replace copy what they read
+verified, never the raw first copy (`read_chunk_verified`): a tree block by
+its bytenr and checksum, a data sector by its stored checksum, each from the
+first good copy, which repairs the bad one — Linux relocation reads extents
+through the verified paths, and `btrfs_dev_replace` copies through scrub. A
+replaced member's stripe of a striped profile (RAID0/10/5/6) is copied piece
+by piece through the logical addresses it holds (`copy_striped_member`): a
+RAID10 piece from its other copy, a RAID5/6 data piece rebuilt from its full
+stripe, a RAID5/6 parity piece recomputed from the verified data of its full
+stripe (scrub's `scrub_raid56_parity_stripe` checks parity the same way). A
+piece with no good copy (RAID0, or every copy bad) fails the operation
+instead of being copied; Linux scrub skips writing such a sector and reports
+it. Free space and unchecksummed data are copied as they are. Tests:
+`smoke_btrfs_balance_does_not_propagate_a_corrupt_copy`,
+`smoke_btrfs_replace_raid{1,10}_does_not_propagate_a_corrupt_copy`,
+`smoke_btrfs_replace_raid{5,6}_rebuilds_a_corrupt_stripe`,
+`smoke_btrfs_replace_raid0_refuses_a_corrupt_stripe`
+(`drivers/fs/btrfs/lifecycle`).
+
 A write-path future dropped at any await point leaves the filesystem
 consistent (`smoke_btrfs_dropped_write_path_future_leaves_the_commit_clean`,
 `drivers/fs/btrfs/race`). A killed task's operation is handed off to finish,

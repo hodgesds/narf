@@ -21,8 +21,8 @@ mod admitted_ops;
 mod batch_commit;
 mod cache_bounds;
 mod cache_off;
-mod commit_scale;
 mod commit_handover;
+mod commit_scale;
 mod concurrent_ops;
 mod data_cache;
 mod extent_window;
@@ -38,6 +38,7 @@ mod sg_io;
 mod snapshot_gen;
 mod snapshots;
 mod two_handles;
+mod verified_copies;
 mod write_buffers;
 
 // ── Shared test harness ────────────────────────────────────────────
