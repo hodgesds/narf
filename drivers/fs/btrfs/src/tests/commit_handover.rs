@@ -285,7 +285,10 @@ fn failed_handover() -> Result<(), &'static str> {
     if !vol.transaction_aborted() || vol.supports_writes() {
         return Err("a failed write-out with a later transaction open did not abort");
     }
-    if !matches!(poll_once(root.create("after")), Some(Err(FsError::ReadOnly))) {
+    if !matches!(
+        poll_once(root.create("after")),
+        Some(Err(FsError::ReadOnly))
+    ) {
         return Err("a write after the abort was not refused with ReadOnly");
     }
     if poll_once(vol.sync_to_disk()).is_some_and(|r| r.is_ok()) {

@@ -2286,7 +2286,10 @@ async fn flush_batch_from_inner<B: BlockDevice + 'static>(
 /// its write-out left queued. Boxed out of line, so the commit future is not
 /// built in the caller's frame.
 #[inline(never)]
-fn freeze_batch<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>, origin: FlushOrigin) -> BoxFut<'_, ()> {
+fn freeze_batch<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    origin: FlushOrigin,
+) -> BoxFut<'_, ()> {
     Box::pin(flush_batch_closed(vol, origin, false))
 }
 
