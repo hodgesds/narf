@@ -337,7 +337,17 @@ struct WritableSparseDevice {
     overlay: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
+/// Test-only: while set, every [`WritableSparseDevice`] fails its cache
+/// flushes (a device whose REQ_PREFLUSH errors).
+static FAIL_FLUSHES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 impl narf_block::BlockDeviceSync for WritableSparseDevice {
+    fn flush(&self) -> Result<(), narf_block::BlockIoError> {
+        if FAIL_FLUSHES.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(narf_block::BlockIoError::DriverError);
+        }
+        Ok(())
+    }
     fn lba_size(&self) -> u32 {
         self.lba_size
     }

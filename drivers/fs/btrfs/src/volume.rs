@@ -4368,9 +4368,16 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// flush, so the superblock mirrors (written without FUA) are durable as
     /// well. Safe from a pre-shutdown hook while the block devices still run:
     /// it waits for the running operation, takes no IRQ-masking lock across
-    /// I/O, and on a read-only or aborted filesystem only flushes.
+    /// I/O, and on a read-only filesystem only flushes.
+    ///
+    /// An aborted filesystem flushes and then fails with `ReadOnly`: changes
+    /// it accepted were lost with the transaction that aborted, so a sync —
+    /// the one before power-off included — must not report them durable
+    /// (Linux `btrfs_sync_fs` gets -EROFS from `btrfs_attach_transaction_barrier`
+    /// once `BTRFS_FS_ERROR` is set, and `sync_filesystem` returns it).
     pub async fn sync_fs(&self) -> Result<(), FsError> {
-        if !self.core_read_only() && !self.aborted.load(core::sync::atomic::Ordering::Acquire) {
+        let aborted = self.aborted.load(core::sync::atomic::Ordering::Acquire);
+        if !self.core_read_only() && !aborted {
             // Evict what no handle holds any more before the commit, as
             // Linux runs the delayed iputs before a filesystem goes away
             // (`close_ctree`), so a syncfs before shutdown leaves no orphan
@@ -4378,7 +4385,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             self.run_delayed_iputs().await;
             self.sync_to_disk_exclusive().await?;
         }
-        self.flush().await
+        self.flush().await?;
+        if aborted {
+            return Err(FsError::ReadOnly);
+        }
+        Ok(())
     }
 
     pub fn sync_to_disk(&self) -> crate::write::BoxFut<'_, ()> {
@@ -4823,8 +4834,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             .iter()
             .map(|(&devid, member)| (devid, member.clone()))
             .collect();
-        for (_, member) in &members {
-            member.device.flush_result().await.map_err(FsError::Io)?;
+        // `barrier_all_devices`: a member whose pre-flush failed is counted
+        // (`wait_dev_flush` → `BTRFS_DEV_STAT_FLUSH_ERRS`) and the superblock
+        // is not written, so the commit fails and the filesystem aborts.
+        for (devid, member) in &members {
+            self.flush_member(*devid, member).await?;
         }
         let max_errors = members.len().saturating_sub(1);
         let mut errors = 0usize;
@@ -4883,11 +4897,31 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// (`blkdev_issue_flush`). The durability barrier of `fsync` and of every
     /// commit.
     pub async fn flush(&self) -> Result<(), FsError> {
-        let members: Vec<Arc<VolumeDevice<B>>> = self.devices.lock().values().cloned().collect();
-        for member in members {
-            member.device.flush_result().await.map_err(FsError::Io)?;
+        let members: Vec<(u64, Arc<VolumeDevice<B>>)> = self
+            .devices
+            .lock()
+            .iter()
+            .map(|(&devid, member)| (devid, member.clone()))
+            .collect();
+        for (devid, member) in &members {
+            self.flush_member(*devid, member).await?;
         }
         Ok(())
+    }
+
+    /// Flush one member's volatile write cache. A failure is counted against
+    /// the member and printed, as Linux `wait_dev_flush` does
+    /// (`btrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_FLUSH_ERRS)`), and
+    /// returned.
+    async fn flush_member(&self, devid: u64, member: &VolumeDevice<B>) -> Result<(), FsError> {
+        match member.device.flush_result().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.dev_stats
+                    .inc_and_print(devid, crate::repair::DEV_STAT_FLUSH_ERRS);
+                Err(FsError::Io(error))
+            }
+        }
     }
 
     /// Read the selected raw superblock and normalize it to primary-copy form.

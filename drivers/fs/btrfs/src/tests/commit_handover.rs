@@ -319,3 +319,163 @@ kernel_test_in!(
     "drivers/fs/btrfs/commit",
     smoke_btrfs_failed_write_out_with_a_later_transaction_aborts
 );
+
+/// The power-off sync (`narf_filesystem::sync_all::sync_one`, the `syncfs`
+/// every mounted filesystem gets before the disks shut down) makes durable
+/// everything written before it, fsynced or not: a file written and never
+/// synced; a commit handed over and still in its write-out when the sync
+/// starts, which the sync waits for rather than reporting success past it;
+/// and a later write staged into the next transaction during that write-out.
+/// After the sync, a crash image holds every file at its full length and
+/// contents. On an aborted filesystem the sync reports the failure instead
+/// of success (Linux `btrfs_sync_fs` returns -EROFS).
+fn poweroff_sync() -> Result<(), &'static str> {
+    use narf_filesystem::FsInstance;
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = mount_writable(device.clone()).map_err(|_| "fixture did not mount")?;
+    let fs: Arc<dyn FsInstance> = vol.clone();
+    let root = vol.root();
+    let body = |tag: u8, len: usize| -> Vec<u8> {
+        (0..len).map(|i| tag ^ (i as u8).wrapping_mul(31)).collect()
+    };
+    let files: [(&str, Vec<u8>); 3] = [
+        ("unsynced", body(1, 300_000)),
+        ("handed-over", body(2, 200_000)),
+        ("later", body(3, 250_000)),
+    ];
+    let write = |name: &str, bytes: &[u8]| -> Result<(), &'static str> {
+        let file = match poll_once(root.create(name)) {
+            Some(Ok(file)) => file,
+            _ => return Err("create failed"),
+        };
+        match poll_once(file.write(0, bytes)) {
+            Some(Ok(n)) if n == bytes.len() => Ok(()),
+            _ => Err("write failed"),
+        }
+    };
+    write(files[0].0, &files[0].1)?;
+    write(files[1].0, &files[1].1)?;
+    // A commit handed over and held in its write-out.
+    let hold = HoldWriteOut::new();
+    let mut commit = alloc::boxed::Box::pin(crate::write::flush_batch(&vol));
+    if poll_n(commit.as_mut(), 64).is_some() || !HoldWriteOut::held() {
+        return Err("the commit did not reach its write-out");
+    }
+    // A write into the next transaction meanwhile.
+    write(files[2].0, &files[2].1)?;
+    // The power-off sync starts with the write-out still held: it must wait.
+    let mut sync = alloc::boxed::Box::pin(narf_filesystem::sync_all::sync_one(&fs));
+    if poll_n(sync.as_mut(), 64).is_some() {
+        return Err("the power-off sync returned while a write-out was held");
+    }
+    drop(hold);
+    match poll_n(commit.as_mut(), 1 << 22) {
+        Some(Ok(())) => {}
+        _ => return Err("the held write-out did not finish"),
+    }
+    drop(commit);
+    match poll_n(sync.as_mut(), 1 << 22) {
+        Some(Ok(())) => {}
+        Some(Err(_)) => return Err("the power-off sync failed"),
+        None => return Err("the power-off sync never finished"),
+    }
+    drop(sync);
+    let after = mount_writable(crash_image(&device)).map_err(|_| "crash image did not mount")?;
+    for (name, bytes) in &files {
+        let file = match poll_once(after.root().lookup_async(name)) {
+            Some(Ok(file)) => file,
+            _ => return Err("a file written before the power-off sync is missing"),
+        };
+        if read_all(&file, bytes.len() + 16).as_deref() != Some(bytes.as_slice()) {
+            return Err("a file written before the power-off sync lost data");
+        }
+    }
+    drop(after);
+    // An aborted filesystem: the sync must fail, not report success.
+    vol.arm_crash_before_super();
+    let file = match poll_once(root.lookup_async(files[2].0)) {
+        Some(Ok(file)) => file,
+        _ => return Err("lookup failed"),
+    };
+    if poll_once(file.write(0, b"lost")).is_none() {
+        return Err("the write before the failing commit never completed");
+    }
+    match poll_once(narf_filesystem::sync_all::sync_one(&fs)) {
+        Some(Err(_)) => {}
+        Some(Ok(())) => return Err("the power-off sync reported success over a failed commit"),
+        None => return Err("the failing power-off sync never finished"),
+    }
+    if !vol.transaction_aborted() {
+        return Err("the failed commit did not abort");
+    }
+    match poll_once(narf_filesystem::sync_all::sync_one(&fs)) {
+        Some(Err(_)) => Ok(()),
+        _ => Err("a sync of an aborted filesystem reported success"),
+    }
+}
+
+fn smoke_btrfs_poweroff_sync_makes_unsynced_writes_durable() -> TestResult {
+    match poweroff_sync() {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/commit",
+    smoke_btrfs_poweroff_sync_makes_unsynced_writes_durable
+);
+
+/// A cache flush that fails under a commit's superblock (Linux
+/// `barrier_all_devices` → `wait_dev_flush`): the superblock is not written,
+/// the failure is counted against the device (`BTRFS_DEV_STAT_FLUSH_ERRS`),
+/// the filesystem aborts, and the sync — the power-off one included —
+/// reports the failure, then and on every later sync.
+fn flush_failure() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = mount_writable(device.clone()).map_err(|_| "fixture did not mount")?;
+    let fs: Arc<dyn FsInstance> = vol.clone();
+    let base = vol.superblock().generation;
+    let file = match poll_once(vol.root().create("flushed")) {
+        Some(Ok(file)) => file,
+        _ => return Err("create failed"),
+    };
+    if !matches!(poll_once(file.write(0, b"never durable")), Some(Ok(13))) {
+        return Err("write failed");
+    }
+    super::FAIL_FLUSHES.store(true, Ordering::Release);
+    let synced = poll_once(narf_filesystem::sync_all::sync_one(&fs));
+    super::FAIL_FLUSHES.store(false, Ordering::Release);
+    if !matches!(synced, Some(Err(_))) {
+        return Err("a sync whose cache flush failed reported success");
+    }
+    if vol.dev_stats(1)[crate::repair::DEV_STAT_FLUSH_ERRS] == 0 {
+        return Err("the failed flush was not counted against the device");
+    }
+    if !vol.transaction_aborted() || vol.durable_gen() != base {
+        return Err("a failed flush did not abort, or a superblock went out past it");
+    }
+    if !matches!(
+        poll_once(narf_filesystem::sync_all::sync_one(&fs)),
+        Some(Err(_))
+    ) {
+        return Err("a later sync of the aborted filesystem reported success");
+    }
+    let after = mount_writable(crash_image(&device)).map_err(|_| "crash image did not mount")?;
+    if after.superblock().generation != base {
+        return Err("the device moved past the last durable generation");
+    }
+    Ok(())
+}
+
+fn smoke_btrfs_failed_flush_aborts_and_fails_the_sync() -> TestResult {
+    match flush_failure() {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/commit",
+    smoke_btrfs_failed_flush_aborts_and_fails_the_sync
+);
