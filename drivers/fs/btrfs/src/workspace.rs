@@ -117,5 +117,21 @@ fn new_zstd() -> Box<ruzstd::decoding::FrameDecoder> {
 #[cold]
 #[inline(never)]
 fn new_zlib() -> Box<miniz_oxide::inflate::core::DecompressorOxide> {
-    Box::default()
+    // `DecompressorOxide::default()` is "all fields set to 0" (its `State`
+    // starts at discriminant 0), so zero the 10 KiB in the heap directly:
+    // `Box::default()` built the value on the stack and copied it in, a
+    // frame over the 8 KiB budget whenever the compiler did not elide it.
+    use alloc::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+    type Inflater = miniz_oxide::inflate::core::DecompressorOxide;
+    let layout = Layout::new::<Inflater>();
+    // SAFETY: the layout is that of a sized, non-zero-size type.
+    let p = unsafe { alloc_zeroed(layout) }.cast::<Inflater>();
+    if p.is_null() {
+        handle_alloc_error(layout);
+    }
+    // SAFETY: every field of `DecompressorOxide` is an integer, an integer
+    // array or the `State` enum whose `Start` variant is 0, so the zeroed
+    // block is a valid value equal to `Default::default()`; it came from the
+    // global allocator with the type's layout, so the `Box` may own it.
+    unsafe { Box::from_raw(p) }
 }
