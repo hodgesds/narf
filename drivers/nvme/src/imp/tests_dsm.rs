@@ -41,6 +41,13 @@ struct FakeCtrl {
     dsm_dma: u64,
 }
 
+impl Drop for FakeCtrl {
+    fn drop(&mut self) {
+        // The CQ was pre-staged for every command (see `fake_controller`).
+        super::mq::REAP_ONE_FOR_TEST.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
 fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
     let sq = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
     let cq = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
@@ -103,6 +110,9 @@ fn fake_controller(oncs: u16, nsze: u64, cqe0_status: u16) -> Option<FakeCtrl> {
     ctrl.dsm_page = Some(dsm);
     ctrl.io_queues
         .push(IoQueue::new(1, FAKE_DEPTH, sq, cq, bar_region, 4, None));
+    // Every slot already holds its command's completion: one per look, so
+    // the reaper does not consume command k+1's entry before it is posted.
+    super::mq::REAP_ONE_FOR_TEST.store(true, core::sync::atomic::Ordering::Release);
     Some(FakeCtrl {
         ctrl,
         _bar: bar,
