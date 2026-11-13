@@ -283,6 +283,19 @@ impl TimerState {
 }
 
 /// `timerfd_tmrproc`: the fd's hrtimer expired.
+///
+/// Linux (`fs/timerfd.c`: `timerfd_tmrproc` → `timerfd_triggered`) counts
+/// the expiry unconditionally — the hrtimer firing IS the expiry — and wakes
+/// the fd's wait queue on every one (`wake_up_locked_poll(&ctx->wqh,
+/// EPOLLIN)`), which runs `ep_poll_callback` for an epoll watching it.
+///
+/// It must not re-read the clock and re-check the deadline: the hrtimer core
+/// decided the timer was due against the base time it sampled once
+/// (`__hrtimer_run_queues`' `basenow`). A wall-offset change in between (an
+/// NTP slew chunk or a step lowering CLOCK_REALTIME/TAI) makes the re-read
+/// earlier than the deadline; re-arming at that same deadline then put the
+/// timer straight back at the head of a queue whose stale `basenow` says it
+/// is due, and the expiry loop ran it again, for ever, in hard IRQ.
 fn timerfd_tmrproc(
     t: &narf_scheduler::narf_time::hrtimer::HrTimer,
 ) -> narf_scheduler::narf_time::hrtimer::HrtimerRestart {
@@ -293,10 +306,22 @@ fn timerfd_tmrproc(
     let now = hrtimer::clock_now(tfd.clock);
     let (expired, next) = {
         let mut s = tfd.state.lock();
-        (s.expire(now), s.next_fire_ns)
+        // The deadline this hrtimer was armed for is due by the hrtimer
+        // core's clock: count it even if `now` reads earlier. (A `tick()` in
+        // task context may already have counted it and moved `next_fire_ns`
+        // on; then only what `now` says is due counts.)
+        let due = if s.next_fire_ns != 0 && s.next_fire_ns <= t.expires() {
+            now.max(s.next_fire_ns)
+        } else {
+            now
+        };
+        (s.expire(due), s.next_fire_ns)
     };
     if expired {
-        tfd.readiness.set(POLL_IN, 0);
+        // Every expiry wakes the wait queue, rising edge or not (an unread
+        // periodic timerfd keeps POLL_IN set; EPOLLET watchers still get
+        // each expiry, as on Linux).
+        tfd.readiness.set_event(POLL_IN, 0, POLL_IN);
     }
     if next == 0 {
         return HrtimerRestart::NoRestart;
@@ -366,6 +391,19 @@ impl TimerFd {
         }
         let remaining = s.next_fire_ns.saturating_sub(self.now());
         (remaining, s.interval_ns)
+    }
+
+    /// Run the expiry callback now, as the hrtimer core would once it found
+    /// the timer due (tests: an expiry whose clock re-read is early).
+    #[doc(hidden)]
+    pub fn __test_run_expiry(&self) {
+        let _ = timerfd_tmrproc(&self.timer);
+    }
+
+    /// Pending expirations not yet read out (tests).
+    #[doc(hidden)]
+    pub fn __test_expirations(&self) -> u64 {
+        self.state.lock().expirations
     }
 
     /// Count an expiry the callback has not delivered yet (its interrupt may
