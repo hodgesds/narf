@@ -596,10 +596,55 @@ pub(crate) struct CommitHold<'a>(&'a core::sync::atomic::AtomicUsize);
 /// A wait on a syscall's behalf that SIGKILL ends ([`narf_filesystem::killable`]).
 /// The error never reaches the caller's program: a task sent SIGKILL does
 /// not return from its system call.
+///
+/// It is [`FsError::Interrupted`] (Linux `-EINTR` from a `*_killable` wait),
+/// distinct from every answer about the filesystem: a lookup or read that
+/// ends this way must not be taken for a miss, corruption or a busy object.
 pub(crate) async fn killable<F: core::future::Future>(future: F) -> Result<F::Output, FsError> {
     narf_filesystem::killable::killable(future)
         .await
-        .ok_or(FsError::Busy)
+        .ok_or(FsError::Interrupted)
+}
+
+/// What became of the copies a verified read tried, for the error it reports
+/// when none served.
+///
+/// A copy that was read but failed verification is corruption
+/// (`InvalidData`, which `with_root_retry!` re-reads from a moved root).
+/// Copies that could not be read at all report the device's error, as
+/// `btrfs_read_extent_buffer` returns `-EIO`: a failed device is not a
+/// corrupt tree. A killed caller's abandoned wait ends the read at once with
+/// [`FsError::Interrupted`]; the next copy's wait would be abandoned too, and
+/// the caller must not read it as corruption.
+#[derive(Default)]
+struct CopyFailure {
+    mismatched: bool,
+    read_error: Option<FsError>,
+}
+
+impl CopyFailure {
+    fn read_failed(&mut self, error: FsError) -> Result<(), FsError> {
+        if error == FsError::Interrupted {
+            return Err(error);
+        }
+        // Only a device or allocation failure is reported as such; a copy
+        // with no usable stripe (a missing member) stays what it was.
+        if error.is_walk_failure() {
+            self.read_error = Some(error);
+        }
+        Ok(())
+    }
+
+    fn mismatch(&mut self) {
+        self.mismatched = true;
+    }
+
+    fn into_error(self) -> FsError {
+        match (self.mismatched, self.read_error) {
+            (false, Some(error)) => error,
+            _ => FsError::InvalidData,
+        }
+    }
 }
 
 /// One running operation ([`VolCore::begin_op`], [`VolCore::begin_data_op`],
@@ -2156,20 +2201,19 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     ) -> Result<Vec<u8>, FsError> {
         let mut buf = crate::databuf::zeroed(len)?;
         let copies = self.logical_read_copies(logical)?;
+        let mut failure = CopyFailure::default();
         for copy in 0..copies {
-            if self
-                .read_logical_copy(logical, &mut buf, copy)
-                .await
-                .is_err()
-            {
+            if let Err(error) = self.read_logical_copy(logical, &mut buf, copy).await {
+                failure.read_failed(error)?;
                 continue;
             }
             let digest = crate::checksum::digest(self.csum_type, &buf)?;
             if digest.get(..stored.len()) == Some(stored) {
                 return Ok(buf);
             }
+            failure.mismatch();
         }
-        Err(FsError::InvalidData)
+        Err(failure.into_error())
     }
 
     /// Read one b-tree node (a `nodesize` block) at logical address `logical`,
@@ -2195,6 +2239,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // lock). The torn image fails its checksum; by the time the read is
         // retried the writer has finished and published the new bytes in the
         // cache. A block that is genuinely bad fails every attempt.
+        // Only a copy that failed verification is worth reading again; a
+        // killed caller's abandoned wait ends the read at once.
         let mut last = FsError::InvalidData;
         for _ in 0..3 {
             match self.read_node_attempt(logical).await {
@@ -2202,6 +2248,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     self.stats.note_read(&node);
                     return Ok(node);
                 }
+                Err(FsError::Interrupted) => return Err(FsError::Interrupted),
                 Err(error) => last = error,
             }
         }
@@ -2225,15 +2272,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
         let mut buf = vec![0u8; self.nodesize()];
         let copies = self.logical_read_copies(logical)?;
+        let mut failure = CopyFailure::default();
         for copy in 0..copies {
-            if self
-                .read_logical_copy(logical, &mut buf, copy)
-                .await
-                .is_err()
-            {
+            if let Err(error) = self.read_logical_copy(logical, &mut buf, copy).await {
+                failure.read_failed(error)?;
                 continue;
             }
             if format::le64(&buf, 48)? != logical {
+                failure.mismatch();
                 continue;
             }
             if self.verify_checksums
@@ -2243,6 +2289,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     &buf[..format::CSUM_SIZE],
                 )?
             {
+                failure.mismatch();
                 continue;
             }
             crate::stats::note_device_read();
@@ -2261,7 +2308,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             drop(retired);
             return Ok(shared);
         }
-        Err(FsError::InvalidData)
+        Err(failure.into_error())
     }
 
     // ── Mount ──────────────────────────────────────────────────────
