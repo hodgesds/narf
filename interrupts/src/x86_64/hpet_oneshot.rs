@@ -211,12 +211,12 @@ pub unsafe fn arm_oneshot(deadline_ticks: u64, handler: fn()) -> Result<(), Hpet
     };
     crate::install_handler(vector, slot0_irq);
 
-    // Pick the destination CPU. Use the BSP — apic_id_at(0). Local
+    // Pick the destination CPU. Use the BSP — logical CPU 0. Local
     // APIC IDs > 255 require either x2APIC IOAPIC redirection or
     // an interrupt remapping unit; both are out of scope for this
     // pass. Reject CPUs we can't address through the legacy
     // 8-bit dest field.
-    let dest_apic = match narf_acpi::apic_id_at(0) {
+    let dest_apic = match narf_acpi::apic_id_of_cpu(0) {
         Some(id) if id <= 0xFF => id as u8,
         Some(_) => {
             SLOT0.armed.store(false, Ordering::Release);

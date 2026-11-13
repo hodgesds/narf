@@ -65,7 +65,7 @@ fn others(me: usize) -> u64 {
         if cpu == me || !narf_lib::smp::is_online(cpu as u32) {
             continue;
         }
-        if narf_acpi::apic_id_at(cpu).is_some() {
+        if narf_acpi::apic_id_of_cpu(cpu).is_some() {
             mask |= 1u64 << cpu;
         }
     }
@@ -87,7 +87,7 @@ pub fn stop_other_cpus() -> (u64, u64) {
         if targets & (1u64 << cpu) == 0 {
             continue;
         }
-        if let Some(apic) = narf_acpi::apic_id_at(cpu) {
+        if let Some(apic) = narf_acpi::apic_id_of_cpu(cpu) {
             // SAFETY: the LAPIC was initialised at boot (this is installed
             // from its bring-up); an NMI IPI only interrupts the target.
             unsafe { super::apic::send_nmi_ipi(apic) };

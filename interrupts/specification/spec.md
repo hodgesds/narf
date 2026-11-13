@@ -41,6 +41,16 @@ earliest event of any base. The aarch64 generic timer runs
 timer transitions serialize against their ISR with IRQ masking and restore the
 caller's original IRQ state.
 
+CPU masks handed to `apic::send_fixed_ipi` (reschedule, TLB shootdown,
+membarrier) and the panic-stop / stall NMIs name **logical** CPUs; each
+target is resolved to its APIC ID through `narf_acpi::apic_id_of_cpu`
+before the ICR write or the KVM `PV_SEND_IPI` bitmap (identity before the
+MADT is parsed). Drivers steer MSI/MSI-X at logical CPU `c` with
+`apic_id_of_cpu(c)`, at the running CPU with `current_cpu_target_id()`;
+`cpu_of_apic_id(apic)` is the inverse. There is no MADT-index lookup in
+this crate's interface: firmware order is not CPU order (the Ryzen 7600X
+MADT lists APIC IDs 0,2,4,..,1,3,..).
+
 ```rust
 pub fn register_irq(n: IrqNum, target: IrqTarget, domain: DomainId);
 pub enum IrqTarget {

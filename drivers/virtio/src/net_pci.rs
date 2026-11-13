@@ -1943,8 +1943,8 @@ impl VirtioNetPci {
             let cpu = if partition { k } else { 0 };
             // Fall back to the BSP's APIC id (cpu 0) if the topology lookup
             // fails — delivery still works, just not core-local.
-            let apic = narf_interrupts::apic_id_at(cpu)
-                .or_else(|| narf_interrupts::apic_id_at(0))
+            let apic = narf_interrupts::apic_id_of_cpu(cpu)
+                .or_else(|| narf_interrupts::apic_id_of_cpu(0))
                 .unwrap_or(0);
             targets.push((2 * k as u16, apic));
         }
@@ -2016,7 +2016,7 @@ impl VirtioNetPci {
         device: &BusDevice,
     ) -> Result<u8, VirtioPciError> {
         // Config changes are rare; route to the BSP.
-        let apic = narf_interrupts::apic_id_at(0).unwrap_or(0);
+        let apic = narf_interrupts::apic_id_of_cpu(0).unwrap_or(0);
         let mut guard = self.msix.lock();
         if guard.is_none() {
             // SAFETY: caller owns the device.

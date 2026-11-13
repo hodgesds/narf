@@ -219,7 +219,7 @@ pub fn init() -> Result<(), TimerPumpInitError> {
         return Err(bail(TimerPumpInitError::NoComparators));
     }
 
-    let dest_apic = match narf_acpi::apic_id_at(0) {
+    let dest_apic = match narf_acpi::apic_id_of_cpu(0) {
         Some(id) if id <= 0xFF => id as u8,
         _ => return Err(bail(TimerPumpInitError::NoLocalApic)),
     };

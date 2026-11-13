@@ -136,21 +136,21 @@ _ap_long_mode_start:
     mov gs, ax
     mov ss, ax
 
-    /* Read this AP's APIC ID (CPUID leaf 1 EBX[31:24]) — used as the
-     * logical CPU index. QEMU `-smp N` assigns APIC ids 0..N-1, so
-     * APIC id == logical id. */
+    /* Read this AP's APIC ID (CPUID leaf 1 EBX[31:24]). AP_STACKS is
+     * indexed by APIC ID; `_ap_start_rust` maps it to the logical CPU
+     * id (equal only on a gap-free topology). */
     mov eax, 1
     cpuid
     shr ebx, 24
-    movzx rdi, bl                       /* rdi = logical_id */
+    movzx rdi, bl                       /* rdi = apic_id */
 
-    /* rsp = AP_STACKS[logical_id]. RIP-relative load: the relative
+    /* rsp = AP_STACKS[apic_id]. RIP-relative load: the relative
      * offset between the instruction and ap_param_stacks is preserved
      * when the trampoline is copied to TRAMPOLINE_PHYS. */
     mov rsi, qword ptr [rip + ap_param_stacks]
     mov rsp, qword ptr [rsi + rdi * 8]
 
-    /* Tail-call into Rust: rdi already holds logical_id. */
+    /* Tail-call into Rust: rdi already holds apic_id. */
     mov rax, qword ptr [rip + ap_param_rust_entry]
     jmp rax
 

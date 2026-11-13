@@ -1062,33 +1062,55 @@ fn smoke_vector_never_hands_out_fixed_vectors() -> TestResult {
 kernel_test_in!("interrupts", smoke_vector_never_hands_out_fixed_vectors);
 
 #[cfg(target_arch = "x86_64")]
-fn smoke_apic_id_of_cpu_is_by_identity_not_madt_order() -> TestResult {
-    // Scheduler CPU ids are APIC IDs. Steering an MSI by MADT position
-    // instead reaches the wrong CPU whenever firmware lists CPUs out of
-    // APIC-ID order, so the lookup must be by value.
+fn smoke_cpu_apic_map_is_dense_and_matches_hardware() -> TestResult {
+    // Logical CPU ids are dense 0..n over the MADT's enabled processors,
+    // boot CPU first, and each maps to a listed APIC ID and back. The
+    // map — not the MADT's firmware order, and not "logical id == APIC
+    // ID" — is what every IPI / MSI / NMI destination goes through, so
+    // the running CPU's own LAPIC must report the APIC ID its logical id
+    // maps to. A topology with APIC-ID gaps (`NARF_QEMU_SMP=6,sockets=2,
+    // cores=3`: APIC IDs 0,1,2,4,5,6) exercises the non-identity case.
     let mut listed = 0usize;
     while let Some(apic) = narf_acpi::apic_id_at(listed) {
-        if crate::apic_id_of_cpu(apic as usize) != Some(apic) {
-            return TestResult::Fail("listed APIC ID not resolved to itself");
+        let Some(cpu) = crate::cpu_of_apic_id(apic) else {
+            return TestResult::Fail("listed APIC ID has no logical CPU");
+        };
+        if crate::apic_id_of_cpu(cpu) != Some(apic) {
+            return TestResult::Fail("logical CPU does not map back to its APIC ID");
         }
         listed += 1;
     }
     if listed == 0 {
         return TestResult::Skip("no MADT processor entries");
     }
-    let absent =
-        (0..=255usize).find(|id| (0..listed).all(|i| narf_acpi::apic_id_at(i) != Some(*id as u32)));
+    if (0..listed).any(|cpu| crate::apic_id_of_cpu(cpu).is_none())
+        || crate::apic_id_of_cpu(listed).is_some()
+    {
+        return TestResult::Fail("logical CPU ids are not dense 0..n");
+    }
+    let absent = (0..=255u32).find(|id| (0..listed).all(|i| narf_acpi::apic_id_at(i) != Some(*id)));
     if let Some(absent) = absent {
-        if crate::apic_id_of_cpu(absent).is_some() {
+        if crate::cpu_of_apic_id(absent).is_some() {
             return TestResult::Fail("APIC ID absent from the MADT was accepted");
         }
+    }
+    // The running CPU's hardware APIC ID is what its logical id maps to
+    // (TSC_AUX was set from the map at AP bring-up; the boot CPU is 0).
+    let (cpu, hw) = narf_lib::sync::without_interrupts(|| {
+        // SAFETY: the LAPIC is up for any kernel test.
+        (narf_lib::percpu::current_cpu(), unsafe {
+            crate::current_cpu_target_id()
+        })
+    });
+    if crate::apic_id_of_cpu(cpu) != Some(hw) {
+        return TestResult::Fail("this CPU's LAPIC ID is not what its logical id maps to");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
-    "interrupts",
-    smoke_apic_id_of_cpu_is_by_identity_not_madt_order
+    "interrupts/topology",
+    smoke_cpu_apic_map_is_dense_and_matches_hardware
 );
 
 fn smoke_vector_alloc_block_zero_rejected() -> TestResult {

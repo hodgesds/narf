@@ -558,9 +558,12 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
 fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
     // KVM PV_SEND_IPI: the whole target set in ONE hypercall instead of a
     // vmexit-per-target ICR loop (either mode below). Falls through to the
-    // architectural paths off-KVM or if the host rejects the call.
-    if narf_memory::kvm_pv::pv_send_ipi(cpu_mask, vector) {
-        return;
+    // architectural paths off-KVM, if a target's APIC ID is outside the
+    // hypercall's 64-bit window, or if the host rejects the call.
+    if let Some(apic_mask) = apic_mask_of(cpu_mask) {
+        if narf_memory::kvm_pv::pv_send_ipi(apic_mask, vector) {
+            return;
+        }
     }
     if !X2APIC_ACTIVE.load(Ordering::Acquire) {
         // xAPIC MMIO fallback. Same ICR fields as below, but split
@@ -580,32 +583,58 @@ fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
         // with a stale TLB entry live on another core.
         let mut m = cpu_mask;
         while m != 0 {
-            let cpu = m.trailing_zeros();
+            let apic = dest_apic_of_cpu(m.trailing_zeros());
             m &= m - 1;
             // SAFETY: LAPIC MMIO reached via `lapic_reg`; ICR writes are
             // architectural. `xapic_icr_send` serialises on Delivery
             // Status, which keeps a second target's ICR_LO from overwriting
             // an IPI still in flight (SDM Vol 3 §10.6.1), and masks
             // interrupts across the register pair.
-            unsafe { xapic_icr_send((cpu & 0xFF) << 24, u32::from(vector) | (1 << 14)) };
+            unsafe { xapic_icr_send((apic & 0xFF) << 24, u32::from(vector) | (1 << 14)) };
         }
         return;
     }
     let mut m = cpu_mask;
     while m != 0 {
-        let cpu = m.trailing_zeros();
+        let apic = dest_apic_of_cpu(m.trailing_zeros());
         m &= m - 1;
         // Fixed delivery, edge-triggered, level-assert,
         // physical destination, no shorthand. Dest in high
         // 32 bits (x2APIC full APIC ID).
         let icr: u64 = (vector as u64)
             | (1u64 << 14)             // level = assert
-            | ((cpu as u64) << 32); // destination APIC id
-                                    // SAFETY: x2APIC confirmed active above.
+            | ((apic as u64) << 32); // destination APIC id
+                                     // SAFETY: x2APIC confirmed active above.
         unsafe {
             wrmsr_icr(icr);
         }
     }
+}
+
+/// The APIC ID to put in an ICR to reach logical CPU `cpu` (Linux
+/// `per_cpu(x86_cpu_to_apicid, cpu)`): the MADT-derived map, or `cpu`
+/// itself before the MADT is parsed — the only CPU then is the boot CPU,
+/// and on a gap-free topology the two agree anyway.
+#[inline]
+fn dest_apic_of_cpu(cpu: u32) -> u32 {
+    narf_acpi::apic_id_of_cpu(cpu as usize).unwrap_or(cpu)
+}
+
+/// `cpu_mask` (bit = logical CPU) as a bitmap of destination APIC IDs, the
+/// form `KVM_HC_SEND_IPI` takes. `None` when an APIC ID is >= 64 and does
+/// not fit the single-window call.
+fn apic_mask_of(cpu_mask: u64) -> Option<u64> {
+    let mut out = 0u64;
+    let mut m = cpu_mask;
+    while m != 0 {
+        let apic = dest_apic_of_cpu(m.trailing_zeros());
+        m &= m - 1;
+        if apic >= 64 {
+            return None;
+        }
+        out |= 1u64 << apic;
+    }
+    Some(out)
 }
 
 /// Send a fixed-vector IPI to every CPU in `cpu_mask`. Thin public

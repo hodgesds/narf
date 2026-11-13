@@ -535,7 +535,7 @@ mod stall_wd {
                 if halted || awake == 0 {
                     continue; // idle-halted or nothing runnable — not a spin
                 }
-                if let Some(apic) = narf_acpi::apic_id_at(cpu) {
+                if let Some(apic) = narf_acpi::apic_id_of_cpu(cpu) {
                     // SAFETY: LAPIC initialised at boot.
                     unsafe {
                         narf_interrupts::x86_64::apic::send_nmi_ipi(apic as u32);
