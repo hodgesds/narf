@@ -994,3 +994,227 @@ kernel_test_in!(
     "drivers/nvme/mq",
     smoke_nvme_mq_irq_wakes_waiter_on_other_cpu_qemu
 );
+
+// ── Bridged waits in the harness's IRQ-masked context ─────────────
+
+/// Every I/O queue's counters, summed: (ISR-published completions,
+/// completions found only by the timeout's poll).
+fn isr_and_missed() -> (u64, u64) {
+    super::with_controller(|c| {
+        c.io_queues().iter().fold((0, 0), |(isr, missed), q| {
+            let s = q.stats();
+            (isr + s.reaped_isr, missed + s.irq_missed)
+        })
+    })
+    .unwrap_or((0, 0))
+}
+
+/// One read of `blocks` at `lba` through the queued block path, with its
+/// own buffer. `true` when it succeeded.
+async fn bridged_read(lba: u64, blocks: u32, bytes: usize) -> bool {
+    let Ok(buf) = alloc_coherent(bytes, DomainId::DRIVER_0) else {
+        return false;
+    };
+    let cap = register_with_cap(buf);
+    let req = BlockRequest {
+        op: BlockOp::Read,
+        lba,
+        blocks,
+        buffer: cap.derive().expect("derive"),
+        qos: QosHint::Latency,
+        user_tag: lba,
+    };
+    let c = super::NvmeBlockDevice.submit(req).await;
+    narf_io::unregister(cap);
+    c.result.is_ok()
+}
+
+/// Await every future of `futs` from ONE task (what btrfs's `join_all`
+/// does with a bio's member writes). Returns how many failed.
+async fn join_reads(mut futs: Vec<Pin<Box<dyn Future<Output = bool> + Send>>>) -> usize {
+    let mut failed = 0usize;
+    core::future::poll_fn(move |cx| {
+        futs.retain_mut(|f| match f.as_mut().poll(cx) {
+            Poll::Ready(ok) => {
+                failed += usize::from(!ok);
+                false
+            }
+            Poll::Pending => true,
+        });
+        if futs.is_empty() {
+            Poll::Ready(failed)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+static BRIDGED_DONE: AtomicUsize = AtomicUsize::new(0);
+static BRIDGED_FAILS: AtomicUsize = AtomicUsize::new(0);
+
+fn smoke_nvme_mq_bridged_waits_complete_by_interrupt_qemu() -> TestResult {
+    // The kernel-test harness runs on the BSP with IRQs masked, and the
+    // BSP is every I/O queue's MSI-X target. A test (or boot path) that
+    // `block_on`s IRQ-driven I/O from there — btrfs mounting and writing
+    // through the queued NVMe path — must still have its completions
+    // published by the queue's interrupt: a bridged wait is a sleeping
+    // wait, and a sleeping wait takes interrupts (Linux: `schedule()` runs
+    // with them enabled). Before that, the bridge's "halt until an IRQ"
+    // spun with the IRQ held off in the LAPIC, every command ended at its
+    // timeout ("timeout, completion polled", `irq_missed`), and the
+    // racing-writers smoke crawled at one batch per 30 s.
+    //
+    // Phase 1: N reads awaited concurrently from ONE future on the BSP.
+    // Phase 2: K tasks on other CPUs each await M reads (completed by the
+    // BSP's ISR), while the BSP waits for them in a self-waking loop — a
+    // bridge that never halts, as btrfs's commit loop is.
+    const N: usize = 32;
+    const K: usize = 3;
+    const M: usize = 8;
+    let qemu = match install_qemu_controller_handle() {
+        None => return TestResult::Skip("no QEMU NVMe controller"),
+        Some(Err(e)) => return TestResult::Fail(e),
+        Some(Ok(q)) => q,
+    };
+    let polled = super::with_controller(|c| {
+        c.io_queue_count() == 0 || c.io_queues().iter().any(|q| q.vector.is_none())
+    })
+    .unwrap_or(true);
+    if polled {
+        qemu.tear_down();
+        return TestResult::Skip("I/O queues are polled (no MSI-X)");
+    }
+    // A missed interrupt surfaces at the timeout: make that seconds, not
+    // the production 30 s, so a regression fails instead of crawling.
+    super::IO_TIMEOUT_MS_FOR_TEST.store(3_000, Ordering::Release);
+    let result = bridged_waits_body(N, K, M);
+    super::IO_TIMEOUT_MS_FOR_TEST.store(0, Ordering::Release);
+    qemu.tear_down();
+    result
+}
+
+fn bridged_waits_body(n: usize, k: usize, m: usize) -> TestResult {
+    use core::fmt::Write as _;
+    let irqs_masked = !narf_arch::interrupts_enabled();
+    let lba_bytes = super::with_controller(|c| c.lba_bytes as usize).unwrap_or(512);
+    let bytes = 4096.max(lba_bytes);
+    let blocks = (bytes / lba_bytes) as u32;
+
+    // ── Phase 1: one task, N commands in flight on the BSP's queue.
+    let (isr0, missed0) = isr_and_missed();
+    let t0 = narf_time::now_cycles();
+    let futs: Vec<Pin<Box<dyn Future<Output = bool> + Send>>> = (0..n)
+        .map(|i| {
+            let f: Pin<Box<dyn Future<Output = bool> + Send>> = Box::pin(bridged_read(
+                8192 + (i as u64) * blocks as u64,
+                blocks,
+                bytes,
+            ));
+            f
+        })
+        .collect();
+    let failed = narf_scheduler::block_on(join_reads(futs));
+    let one_task_us = narf_time::cycles_to_ns(narf_time::now_cycles() - t0) / 1_000;
+    let (isr1, missed1) = isr_and_missed();
+    let peak = super::with_controller(|c| c.io_peak_in_flight()).unwrap_or(0);
+    let _ = writeln!(
+        narf_console::Writer,
+        "nvme-mq: bridged (irqs masked at entry: {irqs_masked}): {n} reads from one task in \
+         {one_task_us} us, peak in flight {peak}; isr {} irq_missed {}",
+        isr1 - isr0,
+        missed1 - missed0,
+    );
+    if failed != 0 {
+        return TestResult::Fail("a read awaited from one task failed");
+    }
+    if missed1 != missed0 {
+        return TestResult::Fail(
+            "one task's reads were found only by the timeout's poll (interrupt never taken)",
+        );
+    }
+    if isr1 - isr0 < n as u64 {
+        return TestResult::Fail("one task's completions were not published by the ISR");
+    }
+    if one_task_us > 1_000_000 {
+        return TestResult::Fail("N concurrent reads from one task took over 1 s");
+    }
+
+    // ── Phase 2: K tasks on other CPUs, the BSP spinning in a bridge.
+    let me = narf_lib::percpu::current_cpu();
+    let others: Vec<usize> = (0..narf_lib::percpu::MAX_CPUS)
+        .filter(|&c| c != me && narf_lib::smp::is_online(c as u32))
+        .take(k)
+        .collect();
+    if others.is_empty() {
+        return TestResult::Pass;
+    }
+    BRIDGED_DONE.store(0, Ordering::Release);
+    BRIDGED_FAILS.store(0, Ordering::Release);
+    let t1 = narf_time::now_cycles();
+    for (t, &cpu) in others.iter().enumerate() {
+        let base = 16384 + (t * m) as u64 * blocks as u64;
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                let futs: Vec<Pin<Box<dyn Future<Output = bool> + Send>>> =
+                    (0..m)
+                        .map(|i| {
+                            let f: Pin<Box<dyn Future<Output = bool> + Send>> = Box::pin(
+                                bridged_read(base + (i as u64) * blocks as u64, blocks, bytes),
+                            );
+                            f
+                        })
+                        .collect();
+                let failed = join_reads(futs).await;
+                BRIDGED_FAILS.fetch_add(failed, Ordering::AcqRel);
+                BRIDGED_DONE.fetch_add(1, Ordering::AcqRel);
+            },
+            cpu as u32,
+        );
+    }
+    let tasks = others.len();
+    let deadline = narf_time::Deadline::after_ms(20_000);
+    let finished = narf_scheduler::block_on(async {
+        while BRIDGED_DONE.load(Ordering::Acquire) < tasks {
+            if deadline.expired() {
+                return false;
+            }
+            narf_scheduler::yield_now().await;
+        }
+        true
+    });
+    let tasks_us = narf_time::cycles_to_ns(narf_time::now_cycles() - t1) / 1_000;
+    let (isr2, missed2) = isr_and_missed();
+    let _ = writeln!(
+        narf_console::Writer,
+        "nvme-mq: bridged: {tasks} task(s) x {m} reads on other CPUs in {tasks_us} us while the \
+         BSP spun in a bridge; isr {} irq_missed {}",
+        isr2 - isr1,
+        missed2 - missed1,
+    );
+    if !finished {
+        return TestResult::Fail("reads from other CPUs did not finish in 20 s");
+    }
+    if BRIDGED_FAILS.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("a read from another CPU failed");
+    }
+    if missed2 != missed1 {
+        return TestResult::Fail(
+            "other tasks' reads were found only by the timeout's poll (interrupt never taken)",
+        );
+    }
+    if isr2 - isr1 < (tasks * m) as u64 {
+        return TestResult::Fail("other tasks' completions were not published by the ISR");
+    }
+    if tasks_us > 2_000_000 {
+        return TestResult::Fail("reads from other CPUs took over 2 s");
+    }
+    if narf_arch::interrupts_enabled() == irqs_masked {
+        return TestResult::Fail("the bridge did not restore the caller's interrupt state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/mq",
+    smoke_nvme_mq_bridged_waits_complete_by_interrupt_qemu
+);

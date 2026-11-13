@@ -124,6 +124,11 @@ hardware registers**. Use the right primitive from `narf_scheduler`:
 | `block_on_spin(fut)` | Same as above but caller holds an `IrqSafeSpinLock`, is in an IRQ handler, or runs in a panic / SMP-startup path with IRQs disabled | yes | 100% spin |
 | `sleep_pumps::run()` | Inside any waiting loop (or as a periodic tick) — drives FB drain, cursor pump, future audio drain | yes | trivial |
 
+**`block_on` takes interrupts.** Entered with IRQs masked from process
+context (only the kernel-test harness, on the BSP), it unmasks them for
+the wait, re-masks before returning, and reports the first such entry
+on the console. `block_on_spin` keeps the caller's masked state.
+
 **Constraints both `block_on` variants share:**
 - **Never call from inside an executor poll** — re-entrant deadlock; the
   executor's polling loop blocks waiting for a future that needs the

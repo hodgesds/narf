@@ -9171,8 +9171,94 @@ pub fn responsive_spin_until<F: FnMut() -> bool>(
 /// - The awaited future must be IRQ-driven or self-waking. A
 ///   future that depends on another scheduler task to make
 ///   progress will hang because block_on doesn't run the executor.
+///
+/// **A bridged wait takes interrupts.** Entered with IRQs masked from
+/// process context (the kernel-test harness on the BSP), `block_on`
+/// unmasks them for the wait and masks them again before it returns — see
+/// [`sleeping_wait_enter`] — and says so once on the console: no
+/// production path is known to do it.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     block_on_inner(fut, /* allow_halt = */ true)
+}
+
+/// Interrupt state of a [`block_on`] wait: a sleeping wait runs with
+/// interrupts deliverable, as Linux's do (`schedule()` from a task that
+/// sleeps in `wait_for_completion` / `wait_event` runs the CPU with IRQs
+/// enabled; sleeping with them masked is a `might_sleep` bug).
+///
+/// The bridge's idle is "halt until an IRQ". Entered with IRQs masked it
+/// could only spin — `halt_until_irq` with IF=0 is a pause — and no
+/// interrupt was ever taken on this CPU for the whole wait: a device
+/// interrupt targeting it stayed pending in the local APIC while its
+/// waiter, bridged here, waited for exactly that interrupt. The
+/// kernel-test harness runs on the BSP with IRQs masked and the BSP is
+/// every NVMe queue's MSI-X target, so every command a harness test
+/// awaited through `block_on` ended only at its 30 s timeout ("timeout,
+/// completion polled", `irq_missed`) — the racing-writers smoke crawled
+/// at one batch per 30 s. A self-waking future (a `yield_now` loop) never
+/// reached the idle at all, so masking around the idle alone would not
+/// do: the whole wait runs unmasked.
+///
+/// Not from interrupt context (a handler must not take nested IRQs, and
+/// must use [`block_on_spin`] anyway): there the state is left as is.
+/// The caller-holds-no-`IrqSafeSpinLock` rule of [`block_on`] is what
+/// makes unmasking sound — a handler on this CPU cannot spin on a lock
+/// the interrupted waiter holds.
+///
+/// The first masked entry is reported on the console and every one is
+/// counted ([`masked_bridge_entries`]): the kernel-test harness does it by
+/// design; anywhere else it is a caller worth knowing about, not a
+/// condition to absorb silently. (No call-site capture: `#[track_caller]`
+/// on `block_on` changes how it inlines into its callers, whose frames the
+/// kernel's frame budget bounds.)
+///
+/// Returns whether it unmasked; [`sleeping_wait_exit`] masks again.
+/// Out of line, and no drop guard: `block_on_inner` is inlined into every
+/// caller, whose stack frames the kernel's frame budget bounds.
+#[inline(never)]
+fn sleeping_wait_enter() -> bool {
+    let unmask = !narf_arch::interrupts_enabled()
+        && !narf_lib::context::in_irq()
+        && !narf_lib::context::in_trap_handler();
+    if unmask {
+        note_masked_bridge();
+        // SAFETY: process context (not in a handler), no IRQ-unsafe lock
+        // held by the `block_on` contract; the IDT / vector table and the
+        // interrupt controller are live before any bridged wait. Masked
+        // again by `sleeping_wait_exit` before `block_on` returns.
+        unsafe { narf_arch::enable_interrupts() };
+    }
+    unmask
+}
+
+static MASKED_BRIDGE_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// How many `block_on` waits were entered with IRQs masked (and unmasked
+/// for the wait) since boot.
+pub fn masked_bridge_entries() -> u64 {
+    MASKED_BRIDGE_ENTRIES.load(Ordering::Relaxed)
+}
+
+/// Count a masked entry; report the first on the console.
+fn note_masked_bridge() {
+    use core::fmt::Write as _;
+    if MASKED_BRIDGE_ENTRIES.fetch_add(1, Ordering::Relaxed) == 0 {
+        let _ = writeln!(
+            narf_console::Writer,
+            "sched: block_on entered with IRQs masked on CPU {}; unmasked for the wait \
+             (reported once; counted in masked_bridge_entries)",
+            narf_lib::percpu::current_cpu()
+        );
+    }
+}
+
+/// Undo [`sleeping_wait_enter`]: mask again when it unmasked.
+#[inline(never)]
+fn sleeping_wait_exit(unmasked: bool) {
+    if unmasked {
+        // SAFETY: restores the masked state `sleeping_wait_enter` found.
+        unsafe { narf_arch::disable_interrupts() };
+    }
 }
 
 /// Spin-only sync→async bridge. Same shape as [`block_on`] but
@@ -9216,6 +9302,10 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     // again until the future completes.
     // SAFETY: Valid memory or trusted environment
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    // The halting bridge is a sleeping wait: interrupts are taken for its
+    // duration (see `sleeping_wait_enter`). The spinning one keeps the
+    // caller's masked state — that is what it is for.
+    let unmasked = allow_halt && sleeping_wait_enter();
     let awake = Arc::new(WakeCell {
         blocking_wake: AtomicBool::new(false),
         flag: AtomicBool::new(true),
@@ -9244,7 +9334,10 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         // the poll body is observable on the next iteration.
         awake.flag.store(false, Ordering::Release);
         match fut.as_mut().poll(&mut ctx) {
-            Poll::Ready(v) => return v,
+            Poll::Ready(v) => {
+                sleeping_wait_exit(unmasked);
+                return v;
+            }
             Poll::Pending => {
                 // Tick the sleep pumps so cursor/FB/serial stay
                 // alive while we wait for an IRQ wake or self-
