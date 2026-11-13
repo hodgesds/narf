@@ -876,6 +876,32 @@ pub enum FsError {
     /// queued behind one that hung, or any job of a context that caused a
     /// hang (`-ECANCELED`). Maps to `ECANCELED`.
     Canceled,
+    /// A wait on the caller's behalf was abandoned because the calling task
+    /// was sent a fatal signal ([`killable`]): Linux's `-EINTR` from a
+    /// `*_killable` wait (`folio_lock_killable`, `mutex_lock_killable`).
+    /// Maps to `EINTR`.
+    ///
+    /// It says nothing about the object the operation was looking at. A
+    /// lookup that ends this way must not be remembered as a miss: the name
+    /// may well exist, and only the killed caller gets the error.
+    Interrupted,
+}
+
+impl FsError {
+    /// Whether this error means the operation could not be carried out —
+    /// the device failed, the caller was killed, memory ran out — rather
+    /// than an answer about the namespace (`NotFound`, a type mismatch, a
+    /// permission refusal).
+    ///
+    /// Path walks propagate such an error to the system call as is (Linux
+    /// `lookup_slow` returning the filesystem's `ERR_PTR`) and never cache
+    /// it: a later lookup of the same name asks the filesystem again.
+    pub fn is_walk_failure(self) -> bool {
+        matches!(
+            self,
+            FsError::Io(_) | FsError::Interrupted | FsError::OutOfMemory
+        )
+    }
 }
 
 /// Type-erased owner retained for the lifetime of a shared device mapping.
@@ -2454,6 +2480,12 @@ pub trait DirOps: Send + Sync {
     }
 
     /// Resolve a single name component. Returns `None` if absent.
+    ///
+    /// This is the infallible convenience form. A directory whose lookup
+    /// can fail for a reason other than absence (device I/O, a killed
+    /// caller's abandoned wait, allocation) MUST also override
+    /// [`DirOps::try_lookup`] so the failure is not mistaken for a miss;
+    /// its `lookup` then answers `None` for a failure as well.
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>>;
 
     /// Look up a child as a directory (so multi-segment `resolve`
@@ -2461,8 +2493,30 @@ pub trait DirOps: Send + Sync {
     /// Stage 3 only has flat directories at the top level so the
     /// default returns `None`; the initramfs nests via `/`-in-name
     /// (CPIO encodes paths whole), not via subdirectory entries.
+    ///
+    /// Infallible convenience form; see [`DirOps::try_lookup_dir`].
     fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
         None
+    }
+
+    /// Fallible synchronous lookup, Linux `->lookup`'s three outcomes:
+    /// `Ok(node)` (a positive dentry), `Err(FsError::NotFound)` (the name
+    /// is absent — a negative dentry may be cached), or any other error
+    /// (`ERR_PTR(err)`: nothing is cached and the error reaches the caller,
+    /// e.g. `Io` → EIO, `Interrupted` → EINTR, `OutOfMemory` → ENOMEM).
+    ///
+    /// The VFS path walks call this, never [`DirOps::lookup`]. The default
+    /// wraps `lookup`, which is exact for a directory whose lookup cannot
+    /// fail (an in-memory or synthetic one).
+    fn try_lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        self.lookup(name).ok_or(FsError::NotFound)
+    }
+
+    /// Fallible form of [`DirOps::lookup_dir`], with the outcomes of
+    /// [`DirOps::try_lookup`]. `Err(FsError::NotFound)` means no directory
+    /// of that name (the name may still be a non-directory).
+    fn try_lookup_dir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        self.lookup_dir(name).ok_or(FsError::NotFound)
     }
 
     /// Inode number of the entry `name`, as `getdents` reports it in
@@ -2507,18 +2561,19 @@ pub trait DirOps: Send + Sync {
     }
 
     /// Resolve a single name component asynchronously. Default
-    /// falls back to the sync `lookup`, so directories that only
+    /// falls back to the sync `try_lookup`, so directories that only
     /// implement the sync side (procfs, devfs, initramfs) work
-    /// transparently with async callers (resolve_async).
+    /// transparently with async callers (resolve_async). The error
+    /// contract is [`DirOps::try_lookup`]'s.
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        let r = self.lookup(name).ok_or(FsError::NotFound);
+        let r = self.try_lookup(name);
         Box::pin(async move { r })
     }
 
     /// Look up a child as a directory asynchronously. Default
-    /// falls back to the sync `lookup_dir`.
+    /// falls back to the sync `try_lookup_dir`.
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        let r = self.lookup_dir(name).ok_or(FsError::NotFound);
+        let r = self.try_lookup_dir(name);
         Box::pin(async move { r })
     }
 
@@ -3104,25 +3159,36 @@ pub fn resolve_dentry(root: Arc<Dentry>, path: &str) -> Result<Arc<dyn FileOps>,
         if let Some(prev) = last_component.take() {
             let current_dir = current.directory().ok_or(FsError::NotFound)?;
             let token = pathwalk::lookup_token(&current, prev);
-            match current_dir.lookup_dir(prev) {
-                Some(d) => {
+            match current_dir.try_lookup_dir(prev) {
+                Ok(d) => {
                     current = token
                         .and_then(|token| {
                             pathwalk::cache_directory(&current, prev, token, d.clone())
                         })
                         .unwrap_or_else(|| pathwalk::reference_directory(&current, prev, d));
                 }
-                None => {
-                    if let Some(token) = token {
-                        if let Some(file) = current_dir.lookup(prev) {
-                            let file_type = file.stat().mode.file_type;
-                            let _ = pathwalk::cache_file(&current, prev, token, file, file_type);
-                        } else {
-                            pathwalk::cache_negative(&current, prev, token);
+                // Only a genuine miss of both lookup shapes is cached as a
+                // negative dentry; any other failure reaches the caller and
+                // leaves the dcache untouched (Linux `lookup_slow`).
+                Err(FsError::NotFound) => {
+                    match current_dir.try_lookup(prev) {
+                        Ok(file) => {
+                            if let Some(token) = token {
+                                let file_type = file.stat().mode.file_type;
+                                let _ =
+                                    pathwalk::cache_file(&current, prev, token, file, file_type);
+                            }
                         }
+                        Err(FsError::NotFound) => {
+                            if let Some(token) = token {
+                                pathwalk::cache_negative(&current, prev, token);
+                            }
+                        }
+                        Err(error) => return Err(error),
                     }
                     return Err(FsError::NotFound);
                 }
+                Err(error) => return Err(error),
             }
         }
         last_component = Some(segment);
@@ -3131,15 +3197,25 @@ pub fn resolve_dentry(root: Arc<Dentry>, path: &str) -> Result<Arc<dyn FileOps>,
     let leaf = last_component.ok_or(FsError::InvalidPath)?;
     let current_dir = current.directory().ok_or(FsError::NotFound)?;
     let token = pathwalk::lookup_token(&current, leaf);
-    let Some(file) = current_dir.lookup(leaf) else {
-        if let Some(token) = token {
-            if let Some(directory) = current_dir.lookup_dir(leaf) {
-                let _ = pathwalk::cache_directory(&current, leaf, token, directory);
-            } else {
-                pathwalk::cache_negative(&current, leaf, token);
+    let file = match current_dir.try_lookup(leaf) {
+        Ok(file) => file,
+        Err(FsError::NotFound) => {
+            match current_dir.try_lookup_dir(leaf) {
+                Ok(directory) => {
+                    if let Some(token) = token {
+                        let _ = pathwalk::cache_directory(&current, leaf, token, directory);
+                    }
+                }
+                Err(FsError::NotFound) => {
+                    if let Some(token) = token {
+                        pathwalk::cache_negative(&current, leaf, token);
+                    }
+                }
+                Err(error) => return Err(error),
             }
+            return Err(FsError::NotFound);
         }
-        return Err(FsError::NotFound);
+        Err(error) => return Err(error),
     };
     if let Some(token) = token {
         let file_type = file.stat().mode.file_type;
@@ -3171,10 +3247,14 @@ pub fn resolve_cached_dentry(
 
 /// Resolve a directory-only relative walk. RCU cache hits call no filesystem
 /// method; a miss performs the ordinary reference walk and warms each dentry.
-fn resolve_directory_dentry(root: Arc<Dentry>, path: &str) -> Option<Arc<Dentry>> {
+///
+/// `Err(NotFound)` covers both an absent component and one that is not a
+/// directory; any other error is the filesystem's lookup failure, returned
+/// as is and never cached.
+fn resolve_directory_dentry(root: Arc<Dentry>, path: &str) -> Result<Arc<Dentry>, FsError> {
     match pathwalk::resolve_directory(root.clone(), path) {
-        pathwalk::FastDirectory::Hit(directory) => return Some(directory),
-        pathwalk::FastDirectory::Negative => return None,
+        pathwalk::FastDirectory::Hit(directory) => return Ok(directory),
+        pathwalk::FastDirectory::Negative => return Err(FsError::NotFound),
         pathwalk::FastDirectory::Retry => {}
     }
     let mut current = root;
@@ -3183,30 +3263,44 @@ fn resolve_directory_dentry(root: Arc<Dentry>, path: &str) -> Option<Arc<Dentry>
             continue;
         }
         if component == ".." {
-            return None;
+            return Err(FsError::InvalidPath);
         }
-        let directory = current.directory()?;
+        let directory = current.directory().ok_or(FsError::NotFound)?;
         let token = pathwalk::lookup_token(&current, component);
-        let Some(next) = directory.lookup_dir(component) else {
-            if let Some(token) = token {
-                if let Some(file) = directory.lookup(component) {
-                    let file_type = file.stat().mode.file_type;
-                    let _ = pathwalk::cache_file(&current, component, token, file, file_type);
-                } else {
-                    pathwalk::cache_negative(&current, component, token);
+        let next = match directory.try_lookup_dir(component) {
+            Ok(next) => next,
+            Err(FsError::NotFound) => {
+                match directory.try_lookup(component) {
+                    Ok(file) => {
+                        if let Some(token) = token {
+                            let file_type = file.stat().mode.file_type;
+                            let _ =
+                                pathwalk::cache_file(&current, component, token, file, file_type);
+                        }
+                    }
+                    Err(FsError::NotFound) => {
+                        if let Some(token) = token {
+                            pathwalk::cache_negative(&current, component, token);
+                        }
+                    }
+                    Err(error) => return Err(error),
                 }
+                return Err(FsError::NotFound);
             }
-            return None;
+            Err(error) => return Err(error),
         };
         current = token
             .and_then(|token| pathwalk::cache_directory(&current, component, token, next.clone()))
             .unwrap_or_else(|| pathwalk::reference_directory(&current, component, next));
     }
-    Some(current)
+    Ok(current)
 }
 
+/// [`resolve_directory_dentry`] for the `Option`-shaped mount-registry
+/// helpers. A lookup failure reads as "no directory" to their callers, but
+/// nothing about it is cached, so the next walk asks the filesystem again.
 fn resolve_directory_cached(root: Arc<Dentry>, path: &str) -> Option<Arc<dyn DirOps>> {
-    resolve_directory_dentry(root, path)?.directory()
+    resolve_directory_dentry(root, path).ok()?.directory()
 }
 
 /// Resolve a directory path through the dentry/reference-walk state machine.
@@ -3237,18 +3331,22 @@ pub fn resolve_directory_dentry_async<'a>(
             let token = pathwalk::lookup_token(&current, component);
             let next = match directory.lookup_dir_async(component).await {
                 Ok(directory) => directory,
-                Err(FsError::Unsupported) => {
-                    directory.lookup_dir(component).ok_or(FsError::NotFound)?
-                }
+                Err(FsError::Unsupported) => directory.try_lookup_dir(component)?,
                 Err(FsError::NotFound) => {
                     // A miss from the directory-shaped hook does not prove
                     // the name absent: it may be a regular file. Preserve
                     // that positive dentry so failure classification can
                     // distinguish ENOTDIR from ENOENT. This is the mirror of
                     // the file resolver's final-directory handling below.
+                    // Only a miss of both shapes is cached negative; a
+                    // lookup failure is returned and leaves no dentry.
                     let file = match directory.lookup_async(component).await {
                         Ok(file) => Some(file),
-                        Err(FsError::Unsupported) => directory.lookup(component),
+                        Err(FsError::Unsupported) => match directory.try_lookup(component) {
+                            Ok(file) => Some(file),
+                            Err(FsError::NotFound) => None,
+                            Err(error) => return Err(error),
+                        },
                         Err(FsError::NotFound) => None,
                         Err(error) => return Err(error),
                     };
@@ -3422,14 +3520,15 @@ pub fn resolve_async_dentry_ext<'a>(
                     let dir_token = pathwalk::lookup_token(&current, &seg);
                     let next = match current_dir.lookup_dir_async(&seg).await {
                         Ok(d) => d,
-                        Err(FsError::Unsupported) => match current_dir.lookup_dir(&seg) {
-                            Some(directory) => directory,
-                            None => {
+                        Err(FsError::Unsupported) => match current_dir.try_lookup_dir(&seg) {
+                            Ok(directory) => directory,
+                            Err(FsError::NotFound) => {
                                 if let Some(token) = file_token {
                                     pathwalk::cache_negative(&current, &seg, token);
                                 }
                                 return Err(FsError::NotFound);
                             }
+                            Err(e) => return Err(e),
                         },
                         Err(FsError::NotFound) => {
                             if let Some(token) = file_token {
@@ -3462,7 +3561,11 @@ pub fn resolve_async_dentry_ext<'a>(
                     // Only cache Negative after both lookup shapes miss.
                     let directory = match current_dir.lookup_dir_async(&seg).await {
                         Ok(directory) => Some(directory),
-                        Err(FsError::Unsupported) => current_dir.lookup_dir(&seg),
+                        Err(FsError::Unsupported) => match current_dir.try_lookup_dir(&seg) {
+                            Ok(directory) => Some(directory),
+                            Err(FsError::NotFound) => None,
+                            Err(error) => return Err(error),
+                        },
                         Err(FsError::NotFound) => None,
                         Err(error) => return Err(error),
                     };
@@ -3550,9 +3653,7 @@ pub fn resolve_async_dentry_ext<'a>(
             let dir_token = pathwalk::lookup_token(&current, &seg);
             let next = match current_dir.lookup_dir_async(&seg).await {
                 Ok(d) => d,
-                Err(FsError::Unsupported) => {
-                    current_dir.lookup_dir(&seg).ok_or(FsError::NotFound)?
-                }
+                Err(FsError::Unsupported) => current_dir.try_lookup_dir(&seg)?,
                 Err(e) => return Err(e),
             };
             let next_dentry = dir_token
@@ -5313,40 +5414,47 @@ fn build_bind_fs(
     }
     let mut dir = source_root_dir;
     for c in &comps[..comps.len() - 1] {
-        dir = dir.lookup_dir(c).ok_or(FsError::NotFound)?;
+        dir = dir.try_lookup_dir(c)?;
     }
     let last = comps[comps.len() - 1];
     // Dispatch on the leaf's actual type, not on which lookup succeeds: some
     // filesystems expose a directory as a Dir-typed FileOps via `lookup` too.
     // A directory leaf binds as a subtree (BindMount); anything else binds as a
-    // single file (FileMount).
-    if let Some(node) = dir.lookup(last) {
-        if node.stat().mode.file_type == FileType::Dir {
-            if let Some(d) = dir.lookup_dir(last) {
-                return Ok(Arc::new(BindMount {
-                    root: d,
-                    fs_name,
-                    backing_identity: source_fs.backing_identity(),
-                    source: source_fs.clone(),
-                }));
+    // single file (FileMount). A lookup failure other than a miss is the
+    // bind's error (`kern_path` returning the filesystem's error).
+    match dir.try_lookup(last) {
+        Ok(node) => {
+            if node.stat().mode.file_type == FileType::Dir {
+                match dir.try_lookup_dir(last) {
+                    Ok(d) => {
+                        return Ok(Arc::new(BindMount {
+                            root: d,
+                            fs_name,
+                            backing_identity: source_fs.backing_identity(),
+                            source: source_fs.clone(),
+                        }));
+                    }
+                    Err(FsError::NotFound) => {}
+                    Err(error) => return Err(error),
+                }
             }
+            return Ok(Arc::new(FileMount {
+                file: node,
+                fs_name,
+                backing_identity: source_fs.backing_identity(),
+            }));
         }
-        return Ok(Arc::new(FileMount {
-            file: node,
-            fs_name,
-            backing_identity: source_fs.backing_identity(),
-        }));
+        Err(FsError::NotFound) => {}
+        Err(error) => return Err(error),
     }
     // Some filesystems only expose child directories via `lookup_dir`.
-    if let Some(d) = dir.lookup_dir(last) {
-        return Ok(Arc::new(BindMount {
-            root: d,
-            fs_name,
-            backing_identity: source_fs.backing_identity(),
-            source: source_fs.clone(),
-        }));
-    }
-    Err(FsError::NotFound)
+    let d = dir.try_lookup_dir(last)?;
+    Ok(Arc::new(BindMount {
+        root: d,
+        fs_name,
+        backing_identity: source_fs.backing_identity(),
+        source: source_fs.clone(),
+    }))
 }
 
 impl VfsRegistry {

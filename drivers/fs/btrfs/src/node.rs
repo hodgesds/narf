@@ -8,7 +8,6 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::fmt::Write as _;
 
 use narf_block::BlockDevice;
 use narf_filesystem::{
@@ -303,21 +302,6 @@ macro_rules! with_root_retry {
             }
         }
     }};
-}
-
-/// The synchronous VFS lookups can only say "absent", so an I/O or
-/// consistency error there would surface as a silent ENOENT. Log those
-/// (not plain misses), a bounded number of times.
-fn note_lookup_error(name: &str, error: FsError) {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static LOGGED: AtomicU32 = AtomicU32::new(0);
-    if matches!(error, FsError::NotFound) || LOGGED.fetch_add(1, Ordering::Relaxed) >= 32 {
-        return;
-    }
-    let _ = writeln!(
-        narf_console::Writer,
-        "btrfs: lookup of {name:?} failed ({error:?}); reported as absent"
-    );
 }
 
 /// One btrfs inode presented to the VFS. A node records the fs tree it lives in:
@@ -1462,24 +1446,28 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
         // system call the wait parks the task ([`narf_filesystem::wait_sync`]):
         // spinning here once held a CPU whose own tasks the lock it waited
         // for had been handed to, and the filesystem stopped.
-        match narf_filesystem::wait_sync(self.lookup_async(name)) {
-            Ok(node) => Some(node),
-            Err(error) => {
-                note_lookup_error(name, error);
-                None
-            }
-        }
+        //
+        // The VFS walks call `try_lookup`, which reports a failure as such;
+        // this `Option` form is for callers that only ask whether a name
+        // resolves.
+        self.try_lookup(name).ok()
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
-        // See `lookup`.
-        match narf_filesystem::wait_sync(self.lookup_dir_async(name)) {
-            Ok(node) => Some(node),
-            Err(error) => {
-                note_lookup_error(name, error);
-                None
-            }
-        }
+        self.try_lookup_dir(name).ok()
+    }
+
+    /// `btrfs_lookup`'s outcomes: the node, `NotFound` for a name the tree
+    /// does not hold, or the error that stopped the lookup — `Io` from the
+    /// device, `Interrupted` when this task was killed while it waited,
+    /// `InvalidData` for a corrupt tree. Only `NotFound` may become a
+    /// negative dentry.
+    fn try_lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        narf_filesystem::wait_sync(self.lookup_async(name))
+    }
+
+    fn try_lookup_dir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        narf_filesystem::wait_sync(self.lookup_dir_async(name))
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {

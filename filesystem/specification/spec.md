@@ -299,7 +299,22 @@ pub trait DirOps {
     fn dcache_identity(&self) -> (usize, u64, u64); // superblock, inode namespace, inode
     fn rcu_walkable(&self) -> bool;
     fn dcache_case_insensitive(&self) -> bool;
+
+    // Name lookup. Ok(node) = positive; Err(NotFound) = the name is absent;
+    // any other Err = the lookup failed (Linux `->lookup` returning ERR_PTR).
+    fn try_lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError>;    // default: lookup().ok_or(NotFound)
+    fn try_lookup_dir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError>; // default: lookup_dir().ok_or(NotFound)
+    fn lookup_async(&self, name: &str) -> FsFuture<'_, Arc<dyn FileOps>>;     // default: try_lookup
+    fn lookup_dir_async(&self, name: &str) -> FsFuture<'_, Arc<dyn DirOps>>;  // default: try_lookup_dir
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>>;                 // infallible convenience
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>>;              // infallible convenience
 }
+
+impl FsError {
+    pub fn is_walk_failure(self) -> bool; // Io | Interrupted | OutOfMemory
+}
+// FsError::Interrupted: a killable wait (narf_filesystem::killable) was
+// abandoned because the caller was sent SIGKILL. Maps to EINTR.
 
 pub fn begin_path_mutation(
     parent: &dyn DirOps,
@@ -365,6 +380,24 @@ pub fn begin_path_mutation(
   filesystems retain reference walk until they provide an equivalent validity
   contract; this is the NARF equivalent of Linux returning `-ECHILD` from an
   RCU lookup that cannot safely complete locklessly.
+- Lookup has Linux `->lookup`'s three outcomes. `Ok` is a positive entry;
+  `Err(FsError::NotFound)` means the name is absent, and only that may become
+  a negative dentry; any other error means the lookup could not answer — a
+  device error (`Io`, EIO), an abandoned killable wait (`Interrupted`, EINTR,
+  seen only by the killed caller), allocation failure (`OutOfMemory`,
+  ENOMEM), corruption (`InvalidData`). Reference walk (sync and async)
+  returns such an error to its caller and caches nothing for that name, so
+  the next lookup asks the filesystem again (`lookup_slow` propagating the
+  `ERR_PTR`). A directory whose lookup can fail must override `try_lookup` /
+  `try_lookup_dir` (and its async forms); the `Option` forms collapse a
+  failure into `None` and are not used by the walk. A directory with no
+  synchronous answer (FAT, exFAT, MINIX, UDF, SquashFS, ISO 9660, 9p, FUSE)
+  returns `Err(Unsupported)` from the `try_*` forms rather than a miss.
+  Overlay lookups fail with a layer's walk failure (`is_walk_failure`)
+  instead of treating it as absence in that layer (`ovl_lookup_single`). The
+  syscall layer maps a walk failure on the path to its errno before any
+  ENOENT/ENOTDIR classification, and `open` does not fall through to its
+  directory or `O_CREAT` handling on one.
 - `dcache_identity` is the inode-alias key used by the dcache and must be
   wait-free. Its default object address is valid for filesystems that retain
   one `DirOps` object per inode. A participating backend that creates fresh

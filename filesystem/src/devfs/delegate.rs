@@ -81,6 +81,24 @@ impl DirOps for DelegateDir {
             .or_else(|| dynamic_lookup_dir(self.overlay, name))
     }
 
+    fn try_lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        match self.inner.try_lookup(name) {
+            Err(FsError::NotFound) => {
+                dynamic_lookup_file(self.overlay, name).ok_or(FsError::NotFound)
+            }
+            other => other,
+        }
+    }
+
+    fn try_lookup_dir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        match self.inner.try_lookup_dir(name) {
+            Err(FsError::NotFound) => {
+                dynamic_lookup_dir(self.overlay, name).ok_or(FsError::NotFound)
+            }
+            other => other,
+        }
+    }
+
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             match self.inner.lookup_async(name).await {
