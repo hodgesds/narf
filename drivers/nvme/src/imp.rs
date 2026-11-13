@@ -617,6 +617,26 @@ pub struct Controller {
     flushes_completed: u64,
 }
 
+impl Drop for Controller {
+    /// A controller that goes out of scope without having been stopped
+    /// (the smokes' stack-local controllers; a failed probe) is stopped
+    /// here — CC.EN=0, MSI-X disabled, queues torn down, vectors and
+    /// handlers released — so its IDT vectors and DMA pages do not leak,
+    /// with the same confirmed-stop discipline as `disable_after_failure`
+    /// (pages are leaked, not freed, when CSTS.RDY never drops). Installed
+    /// controllers live in leaked slots and never reach this.
+    fn drop(&mut self) {
+        let live = self.admin.is_some()
+            || !self.io_queues.is_empty()
+            || self.admin_irq_vector.is_some()
+            || !self.io_irq_vectors.is_empty()
+            || self.irq_vector.is_some();
+        if live {
+            self.disable_inner(None);
+        }
+    }
+}
+
 impl core::fmt::Debug for Controller {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Controller")
@@ -1890,6 +1910,12 @@ impl Controller {
     /// leaked with `mem::forget` rather than returned to the allocator.
     /// Returns `true` when the controller was confirmed stopped.
     pub fn disable_after_failure(&mut self, cap: &Cap<BusDeviceCap, Write>) -> bool {
+        self.disable_inner(Some(cap))
+    }
+
+    /// [`Self::disable_after_failure`]; without `cap` the function's
+    /// bus-master enable is left as is (a dropped controller has no cap).
+    fn disable_inner(&mut self, cap: Option<&Cap<BusDeviceCap, Write>>) -> bool {
         let timeout_ms = self.caps.map(|c| c.ready_timeout_ms()).unwrap_or(500);
         let stopped = match self.bar0_region.as_ref() {
             Some(bar) => {
@@ -1935,7 +1961,7 @@ impl Controller {
             narf_interrupts::dispatch::clear_handler(v);
             let _ = narf_interrupts::vector::free(v);
         }
-        if let Some(device) = self.device {
+        if let (Some(device), Some(cap)) = (self.device, cap) {
             let _ = narf_bus::pci::clear_command(cap, &device, narf_bus::pci::cmd::BUS_MASTER);
         }
         let admin = self.admin.take();

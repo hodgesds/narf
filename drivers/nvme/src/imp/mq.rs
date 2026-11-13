@@ -86,6 +86,14 @@ const ISR_NAME: &str = "nvme";
 /// request (an Abort admin command).
 pub const STATUS_COMMAND_ABORT_REQUESTED: u16 = 0x07;
 
+/// Test hook: when set, `process_cq` consumes at most one CQE per look. The
+/// RAM-backed fake controllers pre-stage a completion for every command a
+/// smoke will post; a reaper that drained them all at the first look would
+/// drop the later ones as strays before their commands exist. Only the
+/// in-kernel smokes set it.
+#[doc(hidden)]
+pub static REAP_ONE_FOR_TEST: AtomicBool = AtomicBool::new(false);
+
 // ── command slot ──────────────────────────────────────────────────
 
 /// Free: no command uses this tag.
@@ -632,6 +640,9 @@ impl IoQueue {
                         reclaim[n_reclaim] = tag;
                         n_reclaim += 1;
                     }
+                }
+                if REAP_ONE_FOR_TEST.load(Ordering::Relaxed) {
+                    break;
                 }
             }
             if n > 0 {
