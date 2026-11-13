@@ -136,14 +136,17 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
         // SAFETY: Valid memory or trusted environment
         return unsafe { builtin_exit(fd, sc) };
     }
-    // `reboot` / `poweroff`: no coreutils binary exists for these. The
-    // kernel flushes the persistent boot log before the transition.
+    // `reboot` / `poweroff`: no coreutils binary exists for these. Like
+    // the `reboot` binary (busybox / util-linux without `-n`), sync first:
+    // `reboot(2)` does not ("reboot doesn't sync: do that yourself").
     if name == b"reboot" || name == b"poweroff" {
         let howto: i32 = if name == b"poweroff" {
             0x4321_fedc
         } else {
             0x0123_4567
         };
+        // SAFETY: no arguments.
+        unsafe { libc::sync() };
         // SAFETY: no pointer arguments.
         let _ = unsafe { libc::sys::reboot(howto) };
         // SAFETY: fd is the shell's stderr-equivalent output fd.

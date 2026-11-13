@@ -118,6 +118,7 @@ mod arch_syscalls {
     pub const SYS_FLOCK: u64 = 73;
     pub const SYS_FSYNC: u64 = 74;
     pub const SYS_FDATASYNC: u64 = 75;
+    pub const SYS_SYNC: u64 = 162;
     pub const SYS_TRUNCATE: u64 = 76;
     pub const SYS_FTRUNCATE: u64 = 77;
     pub const SYS_GETCWD: u64 = 79;
@@ -263,6 +264,7 @@ mod arch_syscalls {
     pub const SYS_LSTAT: u64 = 79;
     pub const SYS_FSYNC: u64 = 82;
     pub const SYS_FDATASYNC: u64 = 83;
+    pub const SYS_SYNC: u64 = 81;
     pub const SYS_TIMERFD_CREATE: u64 = 85;
     pub const SYS_TIMERFD_SETTIME: u64 = 86;
     pub const SYS_EXIT_TASK: u64 = 93;
@@ -873,6 +875,14 @@ pub fn fdatasync(fd: u32) -> i32 {
     } else {
         0
     }
+}
+
+/// `sync()` — commit every filesystem's dirty data (Linux `ksys_sync`).
+/// Cannot fail.
+#[inline]
+pub fn sync() {
+    // SAFETY: SYS_SYNC takes no arguments.
+    let _ = unsafe { syscall0(SYS_SYNC) };
 }
 
 /// `times(buf)` — write `[utime, stime, cutime, cstime]` (POSIX

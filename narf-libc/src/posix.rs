@@ -548,10 +548,10 @@ pub unsafe extern "C" fn fdatasync(fd: c_int) -> c_int {
     narf_user_runtime::fdatasync(fd as u32)
 }
 
-/// `sync()` — POSIX-shaped global flush. Structural no-op.
+/// `sync()` — commit every filesystem's dirty data (`sync(2)`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sync() {
-    // Nothing to flush.
+    narf_user_runtime::sync();
 }
 
 /// `pread(fd, buf, count, offset)` — read at the explicit offset
