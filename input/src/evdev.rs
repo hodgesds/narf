@@ -255,6 +255,7 @@ pub mod key {
     pub const KEY_VOLUMEDOWN: u16 = 114;
     pub const KEY_VOLUMEUP: u16 = 115;
     pub const KEY_POWER: u16 = 116;
+    pub const KEY_WAKEUP: u16 = 143;
     pub const KEY_KPEQUAL: u16 = 117;
     pub const KEY_PAUSE: u16 = 119;
     pub const KEY_KPCOMMA: u16 = 121;
@@ -388,6 +389,8 @@ pub mod bus {
     pub const VIRTUAL: u16 = 0x06;
     pub const I8042: u16 = 0x11;
     pub const I2C: u16 = 0x18;
+    /// `BUS_HOST`: devices on the host platform itself (ACPI buttons).
+    pub const HOST: u16 = 0x19;
 }
 
 /// Linux `INPUT_PROP_*` device-property codes.
