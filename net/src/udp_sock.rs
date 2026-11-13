@@ -441,21 +441,6 @@ pub(crate) fn neighbor_resolved(net_ns_id: u64, iface_name: &str, neighbor: [u8;
     }
 }
 
-/// The neighbours UDP frames are waiting for, once each.
-pub(crate) fn pending_neighbours() -> Vec<(u64, String, [u8; 4])> {
-    let q = PENDING_UDP4.lock();
-    let mut out: Vec<(u64, String, [u8; 4])> = Vec::new();
-    for p in q.iter() {
-        if !out
-            .iter()
-            .any(|(ns, name, ip)| *ns == p.net_ns_id && name == &p.iface && *ip == p.neighbor)
-        {
-            out.push((p.net_ns_id, p.iface.clone(), p.neighbor));
-        }
-    }
-    out
-}
-
 /// Resolution of `neighbor` gave up: drop the UDP frames waiting for it, as
 /// `neigh_invalidate` frees the neighbour's queue.
 pub(crate) fn neighbor_failed(net_ns_id: u64, iface_name: &str, neighbor: [u8; 4]) {
