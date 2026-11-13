@@ -91,6 +91,14 @@ pub trait ClockEvent: Sync + Send {
         ClockEventKind::Shared
     }
 
+    /// Whether this CPU's device can stop its periodic tick and program
+    /// one-shot events for idle (Linux `CLOCK_EVT_FEAT_ONESHOT`, the
+    /// precondition for NOHZ idle). A periodic-only device keeps ticking
+    /// through idle.
+    fn can_stop_idle_tick(&self) -> bool {
+        false
+    }
+
     /// Replace the local idle budget deadline and stop/restart the periodic
     /// tick. Returns false when this device cannot provide tickless idle.
     /// Implementations preserve IRQ state and retain independent wheel events.
@@ -114,19 +122,22 @@ pub fn register_local(dev: &'static dyn ClockEvent) {
 /// their periodic tick. `budget_deadline` replaces the task execution deadline.
 pub fn set_idle_tick(stop_tick: bool, budget_deadline: Option<u64>) -> bool {
     let cpu = narf_lib::percpu::current_cpu();
+    let dev = LOCAL.get(cpu).and_then(|slot| slot.get());
+    // NOHZ idle only on a device that can stop its tick and program the
+    // next event (Linux `tick_nohz_stop_tick` needs a oneshot clockevent).
+    // A periodic-only tick keeps running through idle, and so does this
+    // CPU's share of the global timers: it must stay active in the timer
+    // migration hierarchy, or no CPU would be told to expire them.
+    let stop =
+        stop_tick && crate::nohz_idle_enabled() && dev.is_some_and(|dev| dev.can_stop_idle_tick());
     // Timer migration: a CPU entering tickless idle hands its global timers
     // to the active CPUs before its next event is computed.
-    if stop_tick && crate::nohz_idle_enabled() {
+    if stop {
         crate::timer_migration::tmigr_cpu_deactivate();
     } else {
         crate::timer_migration::tmigr_cpu_activate();
     }
-    LOCAL
-        .get(cpu)
-        .and_then(|slot| slot.get())
-        .is_some_and(|dev| {
-            dev.set_idle_tick(stop_tick && crate::nohz_idle_enabled(), budget_deadline)
-        })
+    dev.is_some_and(|dev| dev.set_idle_tick(stop, budget_deadline))
 }
 
 /// Restore preemption before entering a runnable task, including nested polls.
@@ -262,8 +273,15 @@ pub fn select_primary(hz: u32, vector: u8) -> Option<&'static dyn ClockEvent> {
         }
         PRIMARY_IDX.store(idx + 1, Ordering::Release);
         TICK_VECTOR.store(vector, Ordering::Release);
+        if dev.kind() != ClockEventKind::PerCpu {
+            // A shared device ticks one CPU; the others would halt with
+            // nothing to wake them but IPIs.
+            crate::set_tick_reliable(false);
+        }
         return Some(*dev);
     }
+    // No tick at all: a halted CPU would wait for an unrelated interrupt.
+    crate::set_tick_reliable(false);
     None
 }
 

@@ -158,12 +158,27 @@ fn wheel_arm(deadline_cycles: u64) {
 
 fn arm_hpet(deadline_cycles: u64) {
     let gsi = STATE.gsi.load(Ordering::Relaxed);
-    let target = deadline_cycles_to_hpet_target(deadline_cycles);
-    // SAFETY: HPET window initialised at boot (init() checked);
-    // GSI is the one we registered against the IOAPIC; comparator
-    // 0 is the one we routed.
-    // SAFETY: Valid memory or trusted environment
-    let _ = unsafe { narf_time::hpet::arm_oneshot(0, gsi, target) };
+    let mut target = deadline_cycles_to_hpet_target(deadline_cycles);
+    // Linux `clockevents_program_event` → `clockevents_program_min_delta`:
+    // when the device reports -ETIME (the counter reached the comparator
+    // before it was armed — on real HPETs every MMIO access costs about a
+    // microsecond, and a match only fires on equality), re-arm at the
+    // minimum delta from now, growing it until the arm holds. Without this a
+    // near or past deadline left the comparator behind the counter and the
+    // broadcast silent until some later arm.
+    let mut delta = narf_time::hpet::MIN_PROG_TICKS;
+    for _ in 0..10 {
+        // SAFETY: HPET window initialised at boot (init() checked); GSI is
+        // the one we registered against the IOAPIC; comparator 0 is the one
+        // we routed.
+        match unsafe { narf_time::hpet::arm_oneshot_checked(0, gsi, target) } {
+            Err(narf_time::hpet::ArmError::Expired) => {
+                target = narf_time::hpet::read_counter().wrapping_add(delta);
+                delta = delta.saturating_mul(2);
+            }
+            _ => return,
+        }
+    }
 }
 
 /// Synchronous IRQ handler installed against our IDT vector.
@@ -267,9 +282,13 @@ pub fn init() -> Result<(), TimerPumpInitError> {
     // reliable LAPIC one-shot, it alone drives wheel deadlines. Retain HPET for
     // a failed LAPIC probe, an HPET primary, or the unreliable legacy LAPIC
     // InitialCount mode.
-    let reliable_lapic = narf_time::clockevent::primary().is_some_and(|dev| dev.name() == "lapic")
-        && narf_time::tick_reliable();
-    USE_HPET_FALLBACK.store(!reliable_lapic, Ordering::Release);
+    // A periodic-only LAPIC (InitialCount mode, no TSC-deadline) ticks
+    // reliably but cannot fire at an arbitrary deadline: HPET is then the
+    // one-shot broadcast device for precise hrtimer events (Linux
+    // tick-broadcast with HPET).
+    let oneshot_lapic = narf_time::clockevent::primary()
+        .is_some_and(|dev| dev.name() == "lapic" && dev.can_stop_idle_tick());
+    USE_HPET_FALLBACK.store(!oneshot_lapic, Ordering::Release);
 
     // Install the wheel callback last — it's the gate that lets
     // future `register` calls actually program HPET. Anything

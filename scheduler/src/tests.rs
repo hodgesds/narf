@@ -6913,6 +6913,9 @@ static BRIDGE_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> 
     narf_lib::sync::IrqSafeSpinLock::new(None);
 static BRIDGE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static BRIDGE_WOKE_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether the waker saw the bridge's CPU published as halted before waking.
+static BRIDGE_SAW_HALTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 fn smoke_block_on_bridge_is_kicked_by_cross_cpu_wake() -> TestResult {
     // `block_on` on this CPU halts waiting for a future that a task on
@@ -6936,6 +6939,7 @@ fn smoke_block_on_bridge_is_kicked_by_cross_cpu_wake() -> TestResult {
     };
     BRIDGE_DONE.store(false, Ordering::SeqCst);
     BRIDGE_WOKE_AT.store(0, Ordering::SeqCst);
+    BRIDGE_SAW_HALTED.store(false, Ordering::SeqCst);
     *BRIDGE_WAKER.lock() = None;
     let ipis0 = crate::__test_resched_ipis_sent(other);
     let irqs_were_on = narf_arch::interrupts_enabled();
@@ -6943,8 +6947,18 @@ fn smoke_block_on_bridge_is_kicked_by_cross_cpu_wake() -> TestResult {
     unsafe { narf_arch::enable_interrupts() };
     crate::spawn_stackful_pinned(
         async move {
-            // Long enough for the bridge to be committed to its halt.
+            // Long enough for the bridge to be committed to its halt; then
+            // wake it while it is published as halted (a periodic tick wakes
+            // it briefly now and then; waking in such a window needs no IPI).
             crate::narf_time::sleep_ms(40).await;
+            let until = narf_time::Deadline::after_ms(100);
+            while !crate::CPU_HALTED[me].load(Ordering::SeqCst) && !until.expired() {
+                core::hint::spin_loop();
+            }
+            BRIDGE_SAW_HALTED.store(
+                crate::CPU_HALTED[me].load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             BRIDGE_WOKE_AT.store(narf_time::now_cycles(), Ordering::SeqCst);
             BRIDGE_DONE.store(true, Ordering::SeqCst);
             let w = BRIDGE_WAKER.lock().take();
@@ -6988,6 +7002,9 @@ fn smoke_block_on_bridge_is_kicked_by_cross_cpu_wake() -> TestResult {
             narf_console::Writer,
             "block_on bridge: woken from CPU {other} after {latency_us} us; {ipis} resched IPI(s) sent"
         );
+    }
+    if !BRIDGE_SAW_HALTED.load(Ordering::SeqCst) {
+        return TestResult::Fail("the bridge never published a halt in 100 ms (it spins)");
     }
     if ipis == 0 {
         return TestResult::Fail("the wake sent no reschedule IPI to the halted bridge");

@@ -318,6 +318,17 @@ pub static APIC_SPURIOUS_COUNT: core::sync::atomic::AtomicU64 =
 /// # Safety
 /// `init_bsp` must have run; caller still owns IRQ masking.
 pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
+    // Periodic mode expires this CPU's hrtimers from its own tick
+    // (`on_timer_tick` → `hrtimer_run_queues`, Linux's low-resolution
+    // mode), so timers need no per-event programming here; publish that a
+    // clockevent backs them, as the TSC-deadline path does, so a sleeper
+    // does not self-wake and poll. `arm_hrtimer_event` is a no-op on a CPU
+    // without TSC-deadline; the HPET pump, when it comes up, installs the
+    // programmer that also arms the precise broadcast.
+    narf_time::hrtimer::hrtimers_prepare_cpu(tsc_cpu());
+    if !narf_time::hrtimer::arm_callback_installed() {
+        narf_time::hrtimer::set_arm_callback(arm_hrtimer_event);
+    }
     if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         // x2APIC MSR path.
         // SAFETY: APIC is enabled by init_bsp.
@@ -398,6 +409,10 @@ pub static LVT_TIMER_READBACK: core::sync::atomic::AtomicU32 =
 pub struct LapicClockEvent;
 
 impl narf_time::clockevent::ClockEvent for LapicClockEvent {
+    fn can_stop_idle_tick(&self) -> bool {
+        tsc_deadline_active()
+    }
+
     fn set_idle_tick(&self, stop_tick: bool, budget_deadline: Option<u64>) -> bool {
         // The TSC-deadline MSR compares against the raw counter; scheduler
         // and hrtimer deadlines are monotonic counter time (which excludes
@@ -497,10 +512,19 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
             unsafe {
                 start_timer(vector, initial_count);
             }
-            // Uncalibrated fixed-count periodic: under TCG (qemu64, no
-            // TSC-deadline) a tick can be dropped or late, so the executor
-            // must not halt indefinitely on a near-term wheel deadline.
-            narf_time::set_tick_reliable(false);
+            // Periodic LAPIC tick on every CPU (each AP arms its own in
+            // `smp.rs`): it keeps firing through `hlt` (C1), so a halted CPU
+            // is always woken within one period — Linux's periodic-tick idle
+            // (`default_idle` → `sti; hlt`, woken by the tick, a device IRQ
+            // or a reschedule IPI). The tick cannot be stopped or programmed
+            // per event (`can_stop_idle_tick` is false), so there is no
+            // NOHZ idle here; precise deadlines go through the HPET
+            // broadcast (`timer_pump`), and between those a timer fires at
+            // the next tick at the latest, as in Linux's low-resolution
+            // mode. This used to publish "unreliable", which made every
+            // idle CPU busy-poll in 1 ms slices at 100% CPU instead of
+            // halting.
+            narf_time::set_tick_reliable(true);
         }
         Ok(())
     }
@@ -1364,6 +1388,13 @@ fn arm_tsc_deadline(deadline_cycles: u64, hrtimer_event: bool) {
             narf_arch::current::enable_interrupts();
         }
     }
+}
+
+/// Whether THIS CPU's LAPIC timer runs in TSC-deadline (one-shot,
+/// per-event programmable) mode. False in the periodic InitialCount mode
+/// CPUs without TSC-deadline use (AMD Zen 2/4 desktops among them).
+pub fn tsc_deadline_active() -> bool {
+    TSC_DEADLINE_PERIOD_CYCLES[tsc_cpu()].load(Ordering::Relaxed) != 0
 }
 
 /// Reprogram this CPU's LAPIC deadline if `deadline_cycles` is materially

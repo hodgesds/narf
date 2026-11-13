@@ -47,12 +47,15 @@ use core::task::{Context, Poll};
 /// CPU may halt indefinitely between deadlines and trust the next tick to
 /// wake it.
 ///
-/// `false` means the tick fell back to an uncalibrated periodic source (the
-/// LAPIC InitialCount fixed-count fallback when CPUID reports no TSC-deadline,
-/// e.g. QEMU `qemu64` under TCG). There a tick can be dropped or arrive late,
-/// so a halted CPU can sleep past a near-term timer-wheel deadline. The
-/// executor consults this to spin-poll the wheel instead of halting when the
-/// tick is not dependable. See `scheduler`'s idle path.
+/// `false` means no per-CPU tick was armed (no clockevent passed its probe,
+/// or the selected one is a shared device that ticks only one CPU), so a
+/// halted CPU might never be woken; the executor then spin-polls instead of
+/// halting. A periodic per-CPU tick — the LAPIC InitialCount mode of CPUs
+/// without TSC-deadline included — IS reliable: it wakes a halted CPU every
+/// period, exactly as Linux's periodic-tick idle relies on. Whether the tick
+/// can also be stopped for NOHZ idle is a separate, per-device question
+/// (`clockevent::ClockEvent::can_stop_idle_tick`). See `scheduler`'s idle
+/// path.
 static TICK_RELIABLE: AtomicBool = AtomicBool::new(true);
 
 /// Publish whether the selected primary clock-event tick is reliable.
