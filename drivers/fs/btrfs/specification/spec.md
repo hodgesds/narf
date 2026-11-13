@@ -750,6 +750,33 @@ in the reference tree):
 | frozen dirty extent buffers stay in memory until written | `btrfs_uninhibit_all_eb_writeback` 2580 | nodes cached only after `write_nodes` | (4) **dirty nodes stay readable**: the frozen commit's nodes go into the node cache at freeze as *dirty* entries the budget may not evict and that a device read never replaces, until the lane has written them; a reader of a published root must never read an unwritten block from the device |
 | SUPER_COMMITTED / COMPLETED, `btrfs_finish_extent_commit` (2979 extent-tree.c), `last_trans_committed` | 2599–2620 | `write_staged_super` → `unpin_all`; `durable_gen` | (5) **durability waits**: fsync / sync / msync wait in `commit_through` for `durable_gen ≥` their generation, i.e. for the lane, not for the gate; a write-out failure after a later batch opened aborts the filesystem (Linux `btrfs_handle_fs_error` / `cleanup_transaction` at `scrub_continue`), since the later batch is built on roots that never became durable |
 
+Three couplings in today's code that the hand-over must change first,
+because they are only correct while commits are fully serialised:
+
+- **Pins are global** (`pin_extent` / `unpin_all`). `write_staged_super`
+  unpins everything once a superblock lands; with commit N+1 frozen while
+  N's image is written, that would release N+1's freed blocks before any
+  superblock without them is durable. Pins must carry the generation that
+  freed them and `write_staged_super` release only those ≤ the generation
+  it wrote (Linux `btrfs_finish_extent_commit` unpins per transaction,
+  `fs_info->pinned_extents` per `cur_trans`).
+- **The staged superblock image is set at publish** (`stage_superblock` in
+  `commit_txn`). Under a lane, an image may only be staged once every node
+  it references is written: stage it in the lane after `write_nodes`, so
+  the staged image is always the newest fully written commit (Linux writes
+  `super_for_commit` after `btrfs_write_and_wait_transaction`).
+- **`write_nodes` invalidates the cache before writing** (the epoch
+  bumps). With readers on published roots during the write-out, the
+  frozen nodes must stay as dirty cache entries through the write
+  (invalidation must skip them, eviction must skip them, a device fill
+  must never replace them) and become clean after it.
+
+Implementation order, one commit and test each: generation-tagged pins;
+dirty node-cache entries; publish before write-out (gate still held:
+no behaviour change, crash tests must pass); the lane and staging in the
+lane; then releasing the gate and `txn_lock` at the hand-over; then the
+failure path (abort when a write-out fails with a later batch open).
+
 Waits inside an operation stay non-killable; the fix is the shorter hold,
 not a killable wait. Tests, one per step: a commit held in its write-out
 (test `IO_GATE` on the lane) does not block a new operation's
