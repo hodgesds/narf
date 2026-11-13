@@ -30,19 +30,39 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The caller's identity: the scheduler task being polled on this CPU, or —
-/// where none is (a boot initcall driven by `block_on`, the host harness's
-/// one thread) — the CPU, which such a caller does not leave. Never 0, and
-/// never shared with a task: an anonymous caller must not be taken for one
-/// that holds a close or a join. It once was: the boot-time btrfs write
+/// The caller's identity: the task whose operation is running — the
+/// scheduler task being polled on this CPU, or, for a killed task's
+/// operation handed off to another scheduler task to finish
+/// ([`narf_filesystem::killable::operation_owner`]), the task it started in —
+/// or, where there is no task (a boot initcall driven by `block_on`, the host
+/// harness's one thread), the CPU, which such a caller does not leave. Never
+/// 0, and never shared with a task: an anonymous caller must not be taken for
+/// one that holds a close or a join. It once was: the boot-time btrfs write
 /// smoke, run under `block_on`, took itself for the commit timer task while
 /// the timer held the transaction closed, and committed inside the timer's
 /// commit (aarch64, whose slower boot let the 30 s timer fire mid-smoke).
+///
+/// The hand-off case is load-bearing for data. An operation joins (or a
+/// commit closes) as its task; when that task is killed mid-operation, the
+/// operation finishes in another scheduler task. Asked by that task's id,
+/// the gate answered "not joined, not closed": a commit's reads took the
+/// killable path a commit must never take and gave up (`Busy`), losing every
+/// operation in the batch, and `exclusive` waited to close a transaction
+/// the operation itself held.
 fn task() -> u64 {
-    match narf_scheduler::current_task_id().raw() {
-        0 => (1 << 63) | narf_lib::percpu::current_cpu() as u64,
-        id => id,
+    match narf_filesystem::killable::operation_owner() {
+        0 => match narf_scheduler::current_task_id().raw() {
+            0 => (1 << 63) | narf_lib::percpu::current_cpu() as u64,
+            id => id,
+        },
+        owner => owner,
     }
+}
+
+/// Test-only: the identity the gate records for the running code.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn identity() -> u64 {
+    task()
 }
 
 #[derive(Default)]

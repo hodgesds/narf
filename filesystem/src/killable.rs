@@ -47,6 +47,18 @@ pub fn install_kill_hooks(hooks: &'static KillHooks) {
     );
 }
 
+/// Test-only: install `hooks` (or none) and return what was installed, so a
+/// test that models a hand-off can put the boot hooks back.
+#[doc(hidden)]
+pub fn replace_kill_hooks(hooks: Option<&'static KillHooks>) -> Option<&'static KillHooks> {
+    let new = hooks.map_or(core::ptr::null_mut(), |h| {
+        h as *const KillHooks as *mut KillHooks
+    });
+    let old = HOOKS.swap(new, Ordering::AcqRel);
+    // SAFETY: only `&'static KillHooks` are ever stored.
+    unsafe { old.as_ref() }
+}
+
 fn hooks() -> Option<&'static KillHooks> {
     // SAFETY: only `install_kill_hooks` stores, and only a `&'static`.
     unsafe { HOOKS.load(Ordering::Acquire).as_ref() }

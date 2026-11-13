@@ -2891,6 +2891,19 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.txn_gate.join()
     }
 
+    /// Test-only: empty the node cache, so what reads tree blocks next reads
+    /// them from the device.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_empty_node_cache(&self) {
+        self.nodes.lock().shrink(0);
+    }
+
+    /// Test-only: whether the running code is joined to the transaction.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn txn_joined(&self) -> bool {
+        self.txn_gate.joined_by_current()
+    }
+
     /// The cross-directory rename lock (see the field).
     pub(crate) fn rename_lock(&self) -> &Mutex<()> {
         &self.rename_lock
