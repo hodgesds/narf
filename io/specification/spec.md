@@ -169,6 +169,14 @@ every frame read/write into the device's domain (`dma_addr(i)` becomes the
 IOVA) and the mappings are torn down when the list drops; identity /
 disabled modes use the frame address. The frames themselves are never freed
 by `io/`: they are the caller's, kept allocated for the list's lifetime.
+`unregister_pages` / `unregister` clear the registry slot and then
+`object_table::release` the index, so a caller with a payload per block
+request (a filesystem's every read and write) does not grow the object table
+or this registry: the index is handed to a later registration under a greater
+generation, and every copy of the old cap — a split child, a request a device
+still owns after a timeout, a killed waiter's abandoned request — fails
+`check_live` instead of resolving to the new payload
+(`smoke_io_registry_bounded_by_live_objects`).
 
 **Per-domain IOMMU translation** (module `iommu`, `iova`; Linux
 `iommu.c` + `dma-iommu.c` + `iova.c` + `generic_pt/fmt/{amdv1,vtdss}.h`).

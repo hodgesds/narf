@@ -88,12 +88,11 @@ enum Registered {
 /// `slot.index` is the registry slot, so devices can `resolve()`
 /// back to the buffer from a `BlockRequest::buffer` field.
 pub fn register_with_cap(mut buf: DmaBuffer) -> Cap<DmaBuffer, narf_capabilities::Write> {
-    // `Cap::bootstrap` registers a fresh DmaBuffer object-table entry
-    // and mints the cap for it (SEC-B5, #1293: `Cap::mint` is
-    // crate-private to `capabilities/`, so this is the only way to
-    // mint from outside the crate). The slot's generation is 1 for a
-    // fresh entry — the same value the old hand-built slot read back
-    // via `current_epoch` — and `slot.index` is the registry index.
+    // `Cap::bootstrap` registers a DmaBuffer object-table entry (a
+    // released index under a greater generation, or a fresh one) and
+    // mints the cap for it (SEC-B5, #1293: `Cap::mint` is crate-private
+    // to `capabilities/`, so this is the only way to mint from outside
+    // the crate); `slot.index` is the registry index.
     let cap: Cap<DmaBuffer, narf_capabilities::Write> = Cap::bootstrap();
     let index = cap.slot().index;
     buf.slot_index = Some(index);
@@ -145,25 +144,32 @@ pub fn resolve_pages_cap<R: narf_capabilities::Rights>(
 /// drops (typically immediately if no in-flight `resolve()` Arc is
 /// held).
 pub fn unregister<R: narf_capabilities::Rights>(cap: Cap<DmaBuffer, R>) {
-    let index = cap.slot().index;
-    let _ = narf_capabilities::object_table::bump_epoch(index);
-    let mut r = REGISTRY.lock();
-    if let Some(slot) = r.get_mut(index as usize) {
-        *slot = None;
-    }
+    unregister_by_index(cap.slot().index);
 }
 
 /// Index-keyed counterpart to `unregister`. Used by the driver
 /// framework's reclaim path to drop a `Cap<DmaBuffer, _>`'s backing
 /// without the framework having to round-trip through the typed cap.
-/// Bumps the object-table epoch (so every outstanding cap fails
-/// `check_live`) and clears the registry slot.
+/// Clears the registry slot, then releases the object-table index: every
+/// outstanding cap fails `check_live` (the epoch moved) and the index may be
+/// handed to the next registration under a greater generation. The slot is
+/// cleared first so that registration, which installs its object after
+/// taking the index, can never have its entry wiped by the releaser.
 pub fn unregister_by_index(index: u32) {
-    let _ = narf_capabilities::object_table::bump_epoch(index);
-    let mut r = REGISTRY.lock();
-    if let Some(slot) = r.get_mut(index as usize) {
-        *slot = None;
+    {
+        let mut r = REGISTRY.lock();
+        if let Some(slot) = r.get_mut(index as usize) {
+            *slot = None;
+        }
     }
+    let _ = narf_capabilities::object_table::release(index);
+}
+
+/// Registry slots in use (diagnostics): the registry grows to the highest
+/// object index it has seen, which index reuse keeps bounded by the peak
+/// number of live objects.
+pub fn registry_len() -> usize {
+    REGISTRY.lock().len()
 }
 
 /// Resolve a capability slot index to the underlying DmaBuffer.
