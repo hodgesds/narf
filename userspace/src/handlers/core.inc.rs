@@ -579,6 +579,7 @@ static KILL_HOOKS: narf_filesystem::killable::KillHooks = narf_filesystem::killa
     pending: crate::killable_wait::hook_pending,
     arm: register_signal_waker,
     disarm: drop_signal_waker,
+    owner: crate::killable_wait::hook_owner,
 };
 
 /// Test hook: drop any installed current-task lookup so
