@@ -747,12 +747,13 @@ fn smoke_ntp_apply_sample_large_offset_steps() -> TestResult {
     wall::__test_reset();
     const NOW_SEC: i64 = 1_700_000_000;
 
-    // +3600 s: over the 128 ms step threshold, so it steps at once.
-    match apply_sample(3_600_000_000_000, 1_000_000, 1_000_000, 2, NOW_SEC) {
-        DisciplineOutcome::Stepped(3_600_000_000_000) => {}
-        _ => return TestResult::Fail("a 3600 s sample should step, not slew or refuse"),
+    // +600 s: above the 128 ms step threshold but below the 1000 s panic
+    // threshold, so this is an accepted sample that steps at once.
+    match apply_sample(600_000_000_000, 1_000_000, 1_000_000, 2, NOW_SEC) {
+        DisciplineOutcome::Stepped(600_000_000_000) => {}
+        _ => return TestResult::Fail("a 600 s sample should step, not slew or refuse"),
     }
-    if wall::wall_offset_ns() != 3_600_000_000_000 {
+    if wall::wall_offset_ns() != 600_000_000_000 {
         return TestResult::Fail("a stepped sample did not move the wall offset by the offset");
     }
     // The step consumed the pending phase.
