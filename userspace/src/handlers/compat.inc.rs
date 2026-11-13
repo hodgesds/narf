@@ -2733,6 +2733,10 @@ fn do_execve_resolved(
             match read {
                 Some(Ok(0)) => break, // short read at EOF
                 Some(Ok(n)) => off += n,
+                // A read a fatal signal ended is -EINTR (`kernel_read`
+                // returns the wait's error), not a storage failure; every
+                // other read failure of the image is -EIO, as before.
+                Some(Err(narf_filesystem::FsError::Interrupted)) => return Err(-EINTR),
                 Some(Err(e)) => {
                     use core::fmt::Write as _;
                     let _ = writeln!(
