@@ -251,3 +251,68 @@ kernel_test_in!(
     "drivers/fs/btrfs/commit",
     smoke_btrfs_operations_join_the_next_transaction_during_a_write_out
 );
+
+/// A write-out that fails with a later transaction already open aborts the
+/// filesystem: the later operations were built on trees that never became
+/// durable. Nothing is lost silently — the abort is loud, later writes get
+/// EROFS — and the device keeps the last durable generation.
+fn failed_handover() -> Result<(), &'static str> {
+    use narf_filesystem::FsInstance;
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = mount_writable(device.clone()).map_err(|_| "fixture did not mount")?;
+    let root = vol.root();
+    let base = vol.superblock().generation;
+    if !matches!(poll_once(root.create("doomed")), Some(Ok(_))) {
+        return Err("create failed");
+    }
+    let hold = HoldWriteOut::new();
+    let mut commit = alloc::boxed::Box::pin(crate::write::flush_batch(&vol));
+    if poll_n(commit.as_mut(), 64).is_some() || !HoldWriteOut::held() {
+        return Err("the commit did not reach its write-out");
+    }
+    if !matches!(poll_once(root.create("later")), Some(Ok(_))) {
+        return Err("an operation beside the held write-out failed");
+    }
+    // The write-out fails: its nodes go out, its superblock never does.
+    vol.arm_crash_before_super();
+    drop(hold);
+    match poll_n(commit.as_mut(), 1 << 22) {
+        Some(Err(_)) => {}
+        Some(Ok(())) => return Err("a failed write-out reported success"),
+        None => return Err("the failing write-out never finished"),
+    }
+    drop(commit);
+    if !vol.transaction_aborted() || vol.supports_writes() {
+        return Err("a failed write-out with a later transaction open did not abort");
+    }
+    if !matches!(poll_once(root.create("after")), Some(Err(FsError::ReadOnly))) {
+        return Err("a write after the abort was not refused with ReadOnly");
+    }
+    if poll_once(vol.sync_to_disk()).is_some_and(|r| r.is_ok()) {
+        return Err("the later transaction committed on top of the failed one");
+    }
+    if vol.durable_gen() != base {
+        return Err("a superblock was written after the failed write-out");
+    }
+    let cut = mount_writable(crash_image(&device)).map_err(|_| "remount failed")?;
+    if cut.superblock().generation != base {
+        return Err("the device moved past the last durable generation");
+    }
+    for name in ["doomed", "later"] {
+        if poll_once(cut.root().lookup_async(name)).is_some_and(|r| r.is_ok()) {
+            return Err("an operation of the failed commits reached the device");
+        }
+    }
+    Ok(())
+}
+
+fn smoke_btrfs_failed_write_out_with_a_later_transaction_aborts() -> TestResult {
+    match failed_handover() {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/commit",
+    smoke_btrfs_failed_write_out_with_a_later_transaction_aborts
+);

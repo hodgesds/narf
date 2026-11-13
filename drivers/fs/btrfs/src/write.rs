@@ -2298,6 +2298,16 @@ async fn flush_batch_closed<B: BlockDevice + 'static>(
     write_out: bool,
 ) -> Result<(), FsError> {
     let _txn = vol.txn_lock().lock().await;
+    if vol.transaction_aborted() {
+        // A write-out failed under this batch: it was built on trees that
+        // never became durable, and the failure already put the in-memory
+        // roots back to the last durable commit and said the batch is lost
+        // (`finish_write_out`). Committing it now would publish it over
+        // them again, so it is dropped (Linux `cleanup_transaction` /
+        // `btrfs_cleanup_one_transaction` on an aborted filesystem).
+        let _ = vol.fs_batch().lock().await.take();
+        return Err(FsError::ReadOnly);
+    }
     let batch = vol.fs_batch().lock().await.take();
     // Declared after `_txn`, so it is dropped first: while it puts a batch
     // back, no other batch can have opened (`batch_begin` takes `txn_lock`).

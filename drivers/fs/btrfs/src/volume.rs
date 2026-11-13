@@ -1880,7 +1880,6 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     /// Whether a transaction has been aborted on this volume.
-    #[cfg(feature = "kernel-test")]
     pub(crate) fn transaction_aborted(&self) -> bool {
         self.aborted.load(core::sync::atomic::Ordering::Acquire)
     }

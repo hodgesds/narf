@@ -708,9 +708,11 @@ puts its batch back for the next flush (`UnfinishedCommit`: the publish in
 `commit_txn` is one synchronous step, everything before it is fresh block
 writes and pins), and one dropped after it is done in memory; a staged
 superblock whose write was dropped is put back (`write_staged_super`), so
-committed transactions still become durable at the next sync. A multi-step
-operation (truncate's tail zeroing then its size change) dropped between
-steps commits the steps it staged; that is not yet rolled back.
+committed transactions still become durable at the next sync; a commit's
+write-out dropped half-way stays queued and is finished by whoever next
+needs it (§8). A multi-step operation (truncate's tail zeroing then its size
+change) dropped between steps commits the steps it staged; that is not yet
+rolled back (§8 says why the hand-over does not change it).
 
 ## 5. Architecture notes
 
@@ -727,65 +729,70 @@ Stage 4: persistent filesystem compatibility.
 
 ## 8. Open questions
 
-### Planned: commit stages and the UNBLOCKED hand-over (Linux `transaction.c`)
+### Commit stages and the UNBLOCKED hand-over (Linux `transaction.c`)
 
-Today a commit (`flush_batch_from` → `commit_batch` → `commit_txn_inner`)
-holds the transaction closed (`txn_gate` close) and `txn_lock` from the
-moment it takes the batch until its last node is written: tree updates,
-`write_nodes`, publish, and (when the staged quota fills) the superblock.
-`batch_begin` takes `txn_lock` first, so every new operation — a killed
-task's `msync` included — waits for the whole write-out (soak 3cde4aa39:
-24 tasks queued at `write.rs:1429`, fsync tens of seconds). Linux lets new
-operations join the *next* transaction as soon as this one's trees are
-frozen. The mapping, stage by stage (line numbers: `fs/btrfs/transaction.c`
-in the reference tree):
+A commit (`flush_batch_from` → `commit_batch` → `commit_txn_inner`) holds
+the transaction closed (`txn_gate` close) and `txn_lock` only while it
+freezes and publishes its trees; its write-out runs with the transaction
+open again, so new operations join the next transaction instead of waiting
+for the previous one's I/O (soak 3cde4aa39 had 24 tasks queued at
+`batch_begin` behind a write-out, fsync taking tens of seconds). The stages
+and their Linux counterparts (`fs/btrfs/transaction.c` in the reference
+tree):
 
-| Linux | Where | NARF today | NARF planned |
-|---|---|---|---|
-| RUNNING: `join_transaction`, `num_writers++` | `start_transaction` | `txn_gate::join` (+ `op_lock` for namespace ops), `batch_begin` | unchanged |
-| COMMIT_PREP / COMMIT_START: stop new joins, wait for `prev_trans` ≥ SUPER_COMMITTED/COMPLETED | 2322–2360, 2332–2337 | `txn_gate::close` waits for joined ops; `txn_lock` | same, plus: wait for the previous commit's write-out lane only before *this* commit's own write-out, not before freezing |
-| COMMIT_DOING: wait `num_extwriters == 0`, run delayed refs, `commit_cowonly_roots` (1352, 2509), `switch_commit_roots` (2534) | 2387–2534 | `commit_txn_inner` up to the publish block (extent/csum/root/FST/BGT path COW, superblock image) | (1) **freeze**: everything up to and including the synchronous publish (`commit_roots`, `publish_subvol_root`, `set_free_view`, `stage_superblock`), *before* any node write |
-| UNBLOCKED: `running_transaction = NULL`, wake `transaction_wait` | 2561–2566 | — (gate reopens only after write-out) | (2) **hand-over**: drop the gate close and `txn_lock` right after the freeze; the next batch opens at gen+1 on the published roots and free-space view, minus pinned extents (unchanged pin rules) |
-| `btrfs_write_and_wait_transaction` (1283), `write_all_supers` | 2583–2592 | `write_nodes` inside the closed section; staged super at sync | (3) **write-out lane**: one ordered lane (a mutex taken in commit order before the gate is released) runs `write_nodes` of the frozen commit, then its staged superblock when due; the next commit's write-out waits for it (`prev_trans` ≥ COMPLETED) so superblock generations stay strictly sequential |
-| frozen dirty extent buffers stay in memory until written | `btrfs_uninhibit_all_eb_writeback` 2580 | nodes cached only after `write_nodes` | (4) **dirty nodes stay readable**: the frozen commit's nodes go into the node cache at freeze as *dirty* entries the budget may not evict and that a device read never replaces, until the lane has written them; a reader of a published root must never read an unwritten block from the device |
-| SUPER_COMMITTED / COMPLETED, `btrfs_finish_extent_commit` (2979 extent-tree.c), `last_trans_committed` | 2599–2620 | `write_staged_super` → `unpin_all`; `durable_gen` | (5) **durability waits**: fsync / sync / msync wait in `commit_through` for `durable_gen ≥` their generation, i.e. for the lane, not for the gate; a write-out failure after a later batch opened aborts the filesystem (Linux `btrfs_handle_fs_error` / `cleanup_transaction` at `scrub_continue`), since the later batch is built on roots that never became durable |
+| Linux | NARF |
+|---|---|
+| RUNNING: `join_transaction`, `num_writers++` | `txn_gate::join` (+ `op_lock` for namespace ops), `batch_begin` |
+| COMMIT_PREP: wait for `prev_trans` to reach TRANS_STATE_COMPLETED (2326–2345), new writers still join | `flush_batch_from` (transaction not closed by the caller): `finish_write_out` before closing |
+| COMMIT_START / COMMIT_DOING: no new joins, wait for writers, run delayed refs, `commit_cowonly_roots`, `switch_commit_roots` | `VolCore::exclusive` closes; `commit_txn_inner` up to the publish: tree updates, node stamping, superblock image (`bytes_used` summed over the dirty extent tree) |
+| frozen dirty extent buffers stay in memory until written (`btrfs_uninhibit_all_eb_writeback`, 2580) | every new node of the commit is a **dirty** node-cache entry from the freeze to the end of its write-out (`NodeCache::mark_dirty`): outside the budget, never evicted, invalidated, forgotten or replaced by a device fill; written, it becomes an ordinary clean entry; a commit that fails before publishing discards them (`DirtyNodes`) |
+| UNBLOCKED: `running_transaction = NULL`, wake `transaction_wait` (2561–2566) | publish (`queue_write_out`, then `commit_roots`, `publish_subvol_root`, `set_free_view`, `forget_node` of replaced blocks), then the close and `txn_lock` drop: the next batch opens at gen+1 on the published roots and free-space view, minus pinned extents |
+| `btrfs_write_and_wait_transaction` (2584), `write_all_supers` (2591) | the **write-out lane** (`BtrfsVolume::finish_write_out`): one queued `WriteOut` (nodes, superblock image) at a time; `write_nodes`, then the image is staged (only now: a staged image is always the newest fully written commit) and written when due (`MAX_STAGED_COMMITS`) |
+| SUPER_COMMITTED / COMPLETED, `btrfs_finish_extent_commit` (extent-tree.c) | `write_staged_super` → `note_durable` → `unpin_through(gen)`: pins carry the generation that freed them, and a superblock releases only those at or below its own |
+| `cleanup_transaction` / `btrfs_handle_fs_error` on a write-out error (`scrub_continue`) | a failed write-out aborts the filesystem (loudly: every operation since the last durable generation is lost), puts the batch's subvolume roots back to the last durable commit (`WriteOut::rollback`), and a batch opened over it is dropped at its flush instead of committed (`flush_batch_closed`) |
 
-Three couplings in today's code that the hand-over must change first,
-because they are only correct while commits are fully serialised:
+Who finishes the write-out: the committer, once the transaction is open
+again (`flush_batch_from` for an operation that filled the batch or the
+commit timer; `commit_through` for `fsync`/`syncfs`/`msync`), or — if that
+caller's future was cancelled — whoever next needs it: every commit before
+it starts (`commit_txn_inner`, so every other transaction run under
+`exclusive` sees it complete), administrative work (`begin_admin`, which
+reads and writes the device directly), `write_staged_super` and so every
+sync, and the last-unmount commit (`core_is_dirty` counts a queued
+write-out). The `WriteOut` stays queued until it has succeeded, so a
+cancelled write-out is redone from the start (rewriting a node with the
+same bytes is harmless). A caller that keeps the transaction closed across
+a flush (`sync_to_disk`, administrative work) gets the commit complete,
+write-out and all, as before the hand-over.
 
-- **Pins are global** (`pin_extent` / `unpin_all`). `write_staged_super`
-  unpins everything once a superblock lands; with commit N+1 frozen while
-  N's image is written, that would release N+1's freed blocks before any
-  superblock without them is durable. Pins must carry the generation that
-  freed them and `write_staged_super` release only those ≤ the generation
-  it wrote (Linux `btrfs_finish_extent_commit` unpins per transaction,
-  `fs_info->pinned_extents` per `cur_trans`).
-- **The staged superblock image is set at publish** (`stage_superblock` in
-  `commit_txn`). Under a lane, an image may only be staged once every node
-  it references is written: stage it in the lane after `write_nodes`, so
-  the staged image is always the newest fully written commit (Linux writes
-  `super_for_commit` after `btrfs_write_and_wait_transaction`).
-- **`write_nodes` invalidates the cache before writing** (the epoch
-  bumps). With readers on published roots during the write-out, the
-  frozen nodes must stay as dirty cache entries through the write
-  (invalidation must skip them, eviction must skip them, a device fill
-  must never replace them) and become clean after it.
+Durability waits: `commit_through(target)` first finishes a write-out that
+may already carry `target`, then — only if `target` is still in the open
+batch — closes the transaction for the freeze alone
+(`flush_batch_handing_over`) and waits for the write-out and superblock
+outside it. A change staged after a hand-over belongs to the next
+generation and is covered by the next commit, never reported durable on the
+earlier superblock. Waits inside an operation stay non-killable; a killed
+task's operation is no longer queued behind a write-out because nothing it
+waits for (the gate, `txn_lock`, `fs_batch`) is held across one.
 
-Implementation order, one commit and test each: generation-tagged pins;
-dirty node-cache entries; publish before write-out (gate still held:
-no behaviour change, crash tests must pass); the lane and staging in the
-lane; then releasing the gate and `txn_lock` at the hand-over; then the
-failure path (abort when a write-out fails with a later batch open).
+Tests (`drivers/fs/btrfs/commit`, `src/tests/commit_handover.rs`):
+dirty node-cache entries survive invalidation, eviction, shrink and a
+device fill; a cancelled write-out is finished by the next sync, and a crash
+image cut before it shows the old generation; with a write-out held
+(`WRITE_OUT_HOLD`), a new operation completes, an fsync after the hand-over
+waits for the next commit, and crash images cut during, between and after
+the two overlapping commits each show exactly one generation; a failed
+write-out with a later batch open aborts and leaves the device at the last
+durable generation. `smoke_btrfs_superblock_releases_only_its_own_pins`
+covers the per-generation pins.
 
-Waits inside an operation stay non-killable; the fix is the shorter hold,
-not a killable wait. Tests, one per step: a commit held in its write-out
-(test `IO_GATE` on the lane) does not block a new operation's
-`batch_begin`; an fsync issued after the hand-over is covered by the next
-commit and never reports durable early; a SIGKILLed task queued behind a
-write-out is not held for its duration; a failed write-out with a later
-batch open aborts and loses nothing silently. Read repair (§4) already
-treats the lane's writes like any other: they register their ranges in
-`IoRanges`.
+A multi-step operation (truncate's tail zeroing then its size change)
+dropped between its steps still commits the steps it staged. The hand-over
+does not change that: what is missing is a savepoint inside the batch, and
+other inodes' operations stage into the same batch between the steps, so
+putting the batch back to its state before the first step would lose them.
+Linux has no such case (a truncate is not cancellable); a killed task's
+truncate is handed off and finishes.
 
 The named mount path retains the implementation's existing format and option
 limits; registration does not add support for further on-disk features.
