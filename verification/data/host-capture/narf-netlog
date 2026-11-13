@@ -1,0 +1,207 @@
+#!/usr/bin/bash
+# Mirror the kernel log and every thread's wait to another machine over UDP.
+#
+#   narf-netlog HOST PORT [interval-seconds]          (interval default: 2)
+#
+# Receiver, on any other machine on the LAN:
+#   socat -u UDP-RECV:PORT,reuseaddr - | tee narf-netlog-$(date +%s).txt
+#
+# Why: on the desktop hangs so far every on-disk record stopped at the same
+# instant (kernel log, process samples, journal), so the disk cannot say
+# whether the kernel stopped, the filesystem stopped committing, or only the
+# session stopped. This stream does not touch the disk. If it keeps arriving
+# after the screen froze, it names what every thread waits on; if it stops
+# at the same instant, the kernel (or its network path) stopped too.
+#
+# Lines go out in batches of at most ~1200 bytes (bash's stdio may split a
+# batch into smaller datagrams at line ends); every line starts with
+# "<boot> <seq>" so loss and reordering show. Line kinds:
+#   K <kernel log line>
+#   H up=<uptime> load=<loadavg> sent=<lines> dropped=<lines>
+#   C <cpu line of /proc/stat>             (every sample)
+#   M <meminfo line>                       (first five lines, every sample)
+#   Q <line of /proc/narf/nvme_queues>     (every sample)
+#   T <pid> <tid> <state> <comm> | <syscall> | <wchan>
+#       a thread whose state, syscall or wchan changed since the previous
+#       sample (every thread on every 15th sample)
+#   N <line of /proc/narf/tasks>           (every 5th sample)
+#
+# Built to outlive what it watches: the per-sample work is shell builtins on
+# /proc (which kept answering in earlier hangs after file reads stopped); the
+# only other process is one long-lived `dmesg --follow`. Lines produced before
+# the network is up wait in memory (bounded) and go out once a send works.
+# Test hooks: NARF_NETLOG_PROC (procfs root), NARF_NETLOG_KMSG (kernel log
+# command), NARF_NETLOG_ROUNDS (stop after that many samples).
+export LC_ALL=C
+host=${1:?usage: narf-netlog HOST PORT [interval]}
+port=${2:?usage: narf-netlog HOST PORT [interval]}
+interval=${3:-2}
+proc=${NARF_NETLOG_PROC:-/proc}
+rounds=${NARF_NETLOG_ROUNDS:-0}
+boot=unknown
+[ -r "$proc/sys/kernel/random/boot_id" ] && read -r boot < "$proc/sys/kernel/random/boot_id"
+boot=${boot%%-*}
+seq=0 sent=0 dropped=0 connected=0
+max_queued=20000
+declare -a queue=()
+declare -A last_thread=()
+
+connect() {
+    exec 3>&- 2> /dev/null
+    if exec 3> "/dev/udp/$host/$port"; then
+        connected=1
+    else
+        connected=0
+    fi
+} 2> /dev/null
+
+add() {
+    if ((${#queue[@]} >= max_queued)); then
+        # Keep the newest lines: the onset of a hang matters more than boot.
+        queue=("${queue[@]:1000}")
+        ((dropped += 1000))
+    fi
+    queue+=("$boot $((seq++)) $1")
+}
+
+# Send queued lines, packed into datagrams of whole lines. On a failed send
+# the unsent lines stay queued for the next flush.
+flush() {
+    local packet='' start=0 i=0 n=${#queue[@]} line
+    ((n)) || return
+    ((connected)) || connect
+    ((connected)) || return
+    while ((i < n)); do
+        line=${queue[i]:0:1100}
+        if [ -n "$packet" ] && ((${#packet} + ${#line} + 1 > 1200)); then
+            if ! printf '%s' "$packet" >&3 2> /dev/null; then
+                connected=0
+                break
+            fi
+            ((sent += i - start))
+            start=$i packet=''
+        fi
+        packet+=$line$'\n'
+        ((i++))
+    done
+    if ((connected)) && [ -n "$packet" ]; then
+        if printf '%s' "$packet" >&3 2> /dev/null; then
+            ((sent += i - start))
+            start=$i
+        else
+            connected=0
+        fi
+    fi
+    queue=("${queue[@]:start}")
+}
+
+sample_threads() {
+    local full=$1 task pid tid state comm nr a0 a1 a2 a3 _ wchan statline key value
+    for task in "$proc"/[0-9]*/task/[0-9]*; do
+        [ -d "$task" ] || continue
+        tid=${task##*/}
+        pid=${task%/task/*}
+        pid=${pid##*/}
+        IFS= read -r comm 2> /dev/null < "$task/comm" || continue
+        state=?
+        if IFS= read -r statline 2> /dev/null < "$task/stat"; then
+            statline=${statline##*) }
+            state=${statline%% *}
+        fi
+        nr=? a0='' a1='' a2='' a3=''
+        read -r nr a0 a1 a2 a3 _ 2> /dev/null < "$task/syscall"
+        wchan=?
+        IFS= read -r wchan 2> /dev/null < "$task/wchan"
+        key=$pid/$tid
+        value="$state $comm | $nr $a0 $a1 $a2 $a3 | $wchan"
+        if ((full)) || [ "${last_thread[$key]-}" != "$value" ]; then
+            add "T $pid $tid $value"
+            last_thread[$key]=$value
+        fi
+    done
+}
+
+sample() {
+    local round=$1 up idle line i
+    read -r up idle 2> /dev/null < "$proc/uptime"
+    IFS= read -r line 2> /dev/null < "$proc/loadavg"
+    add "H up=$up load=$line sent=$sent dropped=$dropped queued=${#queue[@]}"
+    while IFS= read -r line; do
+        case $line in cpu*) add "C $line" ;; esac
+    done 2> /dev/null < "$proc/stat"
+    i=0
+    while IFS= read -r line && ((i++ < 5)); do
+        add "M $line"
+    done 2> /dev/null < "$proc/meminfo"
+    if [ -r "$proc/narf/nvme_queues" ]; then
+        while IFS= read -r line; do add "Q $line"; done < "$proc/narf/nvme_queues"
+    fi
+    sample_threads $((round % 15 == 0))
+    if ((round % 5 == 0)) && [ -r "$proc/narf/tasks" ]; then
+        while IFS= read -r line; do add "N $line"; done < "$proc/narf/tasks"
+    fi
+}
+
+# Uptime in centiseconds into $now, without a subshell.
+uptime_cs() {
+    local up _
+    read -r up _ 2> /dev/null < "$proc/uptime"
+    up=${up/./}
+    now=$((10#${up:-0}))
+}
+
+# A timed read on a FIFO nobody writes to sleeps without starting a process.
+nap_fd=''
+if fifo=$(mktemp -u "${XDG_RUNTIME_DIR:-/dev/shm}/narf-netlog.XXXXXX" 2> /dev/null) &&
+    mkfifo "$fifo" 2> /dev/null && exec {nap_fd}<> "$fifo"; then
+    rm -f "$fifo"
+fi
+nap() {
+    if [ -n "$nap_fd" ]; then
+        read -r -t "$1" -u "$nap_fd"
+    else
+        sleep "$1"
+    fi
+}
+
+kmsg_cmd=${NARF_NETLOG_KMSG:-dmesg --follow --color=never}
+coproc KMSG { eval "exec $kmsg_cmd" 2>&1; }
+# bash closes a coprocess's descriptors when it exits; keep a copy so the
+# lines it wrote before exiting can still be read.
+exec {kmsg_fd}<&"${KMSG[0]}"
+kmsg_open=1
+round=0
+next=0
+while :; do
+    # Drain kernel lines; with none, the timed read is the loop's sleep.
+    n=0
+    while ((kmsg_open)); do
+        IFS= read -r -t 0.25 -u "$kmsg_fd" line
+        status=$?
+        if ((status == 0)); then
+            add "K $line"
+            ((++n >= 400)) && break
+        elif ((status > 128)); then
+            break
+        else
+            kmsg_open=0
+        fi
+    done
+    ((kmsg_open)) || nap 0.25
+    uptime_cs
+    if ((now >= next)); then
+        sample "$round"
+        ((round++))
+        next=$((now + interval * 100))
+    fi
+    flush
+    if ((rounds > 0 && round >= rounds)); then
+        # Test mode: send what the kernel log still holds, then stop.
+        while ((kmsg_open)) && IFS= read -r -t 0.5 -u "$kmsg_fd" line; do
+            add "K $line"
+            ((${#queue[@]} >= 400)) && flush
+        done
+        flush
+        break
+    fi
+done

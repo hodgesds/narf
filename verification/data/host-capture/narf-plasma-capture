@@ -13,7 +13,7 @@ boot_id=$(cat /proc/sys/kernel/random/boot_id)
 case "$boot_id" in ''|*[!a-fA-F0-9-]*) exit 1 ;; esac
 output=/narf-diagnostics/plasma-$boot_id
 mkdir -p "$output/process-maps" || exit 1
-printf 'capture-version: 12-network-pci-init-audit\n' > "$output/capture-version.txt"
+printf 'capture-version: 13-netlog\n' > "$output/capture-version.txt"
 
 # Keep stream writes bounded and batched: dmesg's per-line writes otherwise
 # force repeated root-filesystem transactions while other services page in.
@@ -39,6 +39,23 @@ network_snapshots() {
     # A stuck network query must not hide independent process/seat streams.
     timeout --kill-after=2s 240s /usr/bin/bash "$helper" 2>&1 |
         batched_stream > "$output/network.log"
+}
+
+# Off-machine mirror of the kernel log and every thread's wait, for hangs that
+# stop the disk: /etc/narf-netlog holds "HOST PORT [interval]" (the receiver
+# runs `socat -u UDP-RECV:PORT,reuseaddr -` on HOST). Its own unit, so the
+# capture's 600 s runtime limit does not end it; inside this cgroup if
+# systemd-run is unavailable.
+netlog_stream() {
+    local helper=${BASH_SOURCE[0]%/*}/narf-netlog host port interval
+    [ -r /etc/narf-netlog ] && [ -r "$helper" ] || return 0
+    read -r host port interval < /etc/narf-netlog || return 0
+    [[ $host =~ ^[0-9A-Za-z.:-]+$ && $port =~ ^[0-9]+$ ]] || return 0
+    [[ ${interval:-2} =~ ^[0-9]+$ ]] || interval=2
+    printf 'netlog: udp %s:%s every %ss\n' "$host" "$port" "${interval:-2}" >> "$output/capture-version.txt"
+    systemd-run --no-block --quiet --unit=narf-netlog --property=Nice=-10 \
+        /usr/bin/bash "$helper" "$host" "$port" "${interval:-2}" 2> /dev/null ||
+        /usr/bin/bash "$helper" "$host" "$port" "${interval:-2}" &
 }
 
 # Capture the missing identity of a blocked compositor read. No trap hooks.
@@ -208,6 +225,7 @@ seat_snapshots() {
     done
 }
 
+netlog_stream
 seat_snapshots &
 boot_console_snapshots &
 kernel_snapshots &
