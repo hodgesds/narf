@@ -358,6 +358,25 @@ fn install_qemu_controller_handle() -> Option<Result<InstalledQemu, &'static str
     let Ok((_h, cap)) = claim_device_cap(&authority, dev.addr) else {
         return Some(Err("claim_device_cap failed"));
     };
+    // A smoke that installed this function earlier and returned without
+    // `tear_down` left its controller in the slot `install_controller` is
+    // about to overwrite — slots are leaked, so its I/O queues' IDT
+    // vectors would be lost with it. The queue count is bounded by the
+    // free vectors, so a few such smokes leave a later 16-queue bring-up
+    // with fewer queues and a fake IRQ-driven controller with none.
+    // Release it first; this install brings the device up afresh anyway.
+    if let narf_bus::BusAddr::Pcie(bdf) = dev.addr {
+        let prev = super::CONTROLLERS
+            .lock()
+            .iter()
+            .find(|s| s.bdf == Some(bdf))
+            .copied();
+        if let Some(slot) = prev {
+            if let Ok(mut old) = super::acquire(slot) {
+                let _ = old.disable_after_failure(&cap);
+            }
+        }
+    }
     let mut ctrl = Controller::from_device(dev);
     if ctrl.bring_up(&cap).is_err() {
         return Some(Err("bring_up failed"));
