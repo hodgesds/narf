@@ -2217,6 +2217,11 @@ fn open_impl_reserved(
     //   the registry finds the longest-matching mount.
     // - Explicit-mount: arg2/arg3 = (ptr, len). The path is relative.
     //   Useful when the caller already knows the mount.
+    // A walk that could not be carried out — the device failed, this task
+    // was killed while it waited, memory ran out — is the open's error, as
+    // `lookup_slow`'s ERR_PTR is in `path_openat`. It is not a miss: the
+    // directory and O_CREAT fallbacks below must not run on it.
+    let mut walk_failure: Option<narf_filesystem::FsError> = None;
     let ops = if let Some(FastCreateResolution::Existing { node, .. }) = fast_create.as_ref() {
         Some(Arc::clone(node))
     } else if fast_create.is_some() {
@@ -2229,8 +2234,15 @@ fn open_impl_reserved(
                 // here and is handled by the directory branch below.
                 fs.root_file()
             } else {
-                poll_blocking(narf_filesystem::resolve_async_dentry(root, rel))
-                    .and_then(|r| r.ok())
+                match poll_blocking(narf_filesystem::resolve_async_dentry(root, rel))? {
+                    Ok(file) => Some(file),
+                    Err(error) => {
+                        if error.is_walk_failure() {
+                            walk_failure = Some(error);
+                        }
+                        None
+                    }
+                }
             }
         })
         .flatten()
@@ -2249,6 +2261,10 @@ fn open_impl_reserved(
             })
             .flatten()
     };
+    if let (None, Some(error)) = (ops.as_ref(), walk_failure) {
+        ctx.set_return(errno_ret(copy_fs_errno(error)));
+        return;
+    }
 
     // Directory open: hand back a directory fd (a `DirFdFile` carrying the
     // `DirOps`) when the path names a directory, either because it didn't
@@ -4344,6 +4360,9 @@ fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NoSpace => -ENOSPC,
         FsError::QuotaExceeded => -EDQUOT,
         FsError::Io(_) => -EIO,
+        // The path walk's own failures (`lookup_slow`'s ERR_PTR).
+        FsError::Interrupted => -EINTR,
+        FsError::OutOfMemory => -ENOMEM,
         FsError::ArgumentListTooLong => -E2BIG,
         _ => -EPERM,  // `if (!dir->i_op->unlink)`
     };
@@ -4401,6 +4420,9 @@ fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::NoSpace => -ENOSPC,  // from ->rmdir
         FsError::QuotaExceeded => -EDQUOT,  // ditto
         FsError::Io(_) => -EIO,
+        // The path walk's own failures (`lookup_slow`'s ERR_PTR).
+        FsError::Interrupted => -EINTR,
+        FsError::OutOfMemory => -ENOMEM,
         FsError::ArgumentListTooLong => -E2BIG,
         FsError::Unsupported => -EPERM,  // `if (!dir->i_op->rmdir)`
         _ => -EPERM,
@@ -4436,6 +4458,9 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::SymlinkLoop => -ELOOP,
         FsError::NoSpace => -ENOSPC,
         FsError::Io(_) => -EIO,
+        // The path walk's own failures (`lookup_slow`'s ERR_PTR).
+        FsError::Interrupted => -EINTR,
+        FsError::OutOfMemory => -ENOMEM,
         FsError::ArgumentListTooLong => -E2BIG,
         // "everything else → EPERM", per the doc comment above.
         _ => -EPERM,
