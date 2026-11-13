@@ -678,10 +678,11 @@ async fn truncate_once<B: BlockDevice + 'static>(
     new_size: u64,
     drop_from: u64,
 ) -> Result<(), FsError> {
-    // Boxed: this future sat at the 8 KiB frame budget (64 KiB task
-    // stacks), and the subvolume check's state is the largest it holds.
+    // The tree reads are boxed: this future sat at the 8 KiB frame budget
+    // (64 KiB task stacks), and the subvolume check's and the reads' states
+    // are the largest it holds.
     alloc::boxed::Box::pin(ensure_private_subvol(vol)).await?;
-    let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
+    let inode = InodeItem::decode(&alloc::boxed::Box::pin(inode_body(vol, ino)).await?)?;
     if !inode.is_regular() {
         return Err(FsError::Unsupported);
     }
@@ -695,14 +696,15 @@ async fn truncate_once<B: BlockDevice + 'static>(
         // later grows (`btrfs_truncate_block(inode, newsize, 0, 0)`).
         if new_size % ss != 0 {
             let sector_end = align_up(new_size, ss).min(old_size);
-            zero_if_dirty(vol, ino, new_size, sector_end, old_size).await?;
+            alloc::boxed::Box::pin(zero_if_dirty(vol, ino, new_size, sector_end, old_size)).await?;
         }
         // Only the items from the cut on are read (and, below a sector, the
         // one at offset 0, which may be inline).
         let (fs_root, _) = vol.fs_tree_root();
         let cut = drop_from.max(align_up(new_size, ss));
         let from = if new_size < ss { 0 } else { cut };
-        let items = file_items_in(vol, fs_root, ino, from, u64::MAX).await?;
+        let items =
+            alloc::boxed::Box::pin(file_items_in(vol, fs_root, ino, from, u64::MAX)).await?;
         let gen = batch_gen(vol).await?;
         let mut extra = Vec::new();
         let mut inline_removed = 0u64;
@@ -716,7 +718,10 @@ async fn truncate_once<B: BlockDevice + 'static>(
                     extra.push(Edit::Delete(inline.key));
                 } else {
                     let mut data = crate::databuf::zeroed(new_size as usize)?;
-                    crate::extent::read_file(vol, fs_root, ino, old_size, 0, &mut data).await?;
+                    alloc::boxed::Box::pin(crate::extent::read_file(
+                        vol, fs_root, ino, old_size, 0, &mut data,
+                    ))
+                    .await?;
                     extra.push(Edit::Upsert(
                         inline.key,
                         super::file_extent_inline(gen, &data),
@@ -733,13 +738,20 @@ async fn truncate_once<B: BlockDevice + 'static>(
         if new_size == old_size && carved.edits.is_empty() && extra.is_empty() {
             return Ok(());
         }
-        stage(vol, ino, carved, extra, Some(new_size), true).await
+        alloc::boxed::Box::pin(stage(vol, ino, carved, extra, Some(new_size), true)).await
     } else {
         // Growing: zero the stale tail of the old last sector, then only the
         // size moves (`NO_HOLES`) or explicit holes fill the gap.
         if old_size % ss != 0 {
             let sector_end = align_up(old_size, ss);
-            zero_if_dirty(vol, ino, old_size, sector_end.min(new_size), sector_end).await?;
+            alloc::boxed::Box::pin(zero_if_dirty(
+                vol,
+                ino,
+                old_size,
+                sector_end.min(new_size),
+                sector_end,
+            ))
+            .await?;
         }
         let extra = if no_holes(vol) {
             Vec::new()
@@ -751,7 +763,15 @@ async fn truncate_once<B: BlockDevice + 'static>(
             let gen = batch_gen(vol).await?;
             hole_edits(&items, lo, hi, ino, gen)
         };
-        stage(vol, ino, Carve::default(), extra, Some(new_size), true).await
+        alloc::boxed::Box::pin(stage(
+            vol,
+            ino,
+            Carve::default(),
+            extra,
+            Some(new_size),
+            true,
+        ))
+        .await
     }
 }
 

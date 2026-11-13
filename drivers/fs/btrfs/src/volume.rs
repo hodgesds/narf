@@ -3242,7 +3242,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// them from the device.
     #[cfg(feature = "kernel-test")]
     pub(crate) fn __test_empty_node_cache(&self) {
-        self.nodes.lock().shrink(0);
+        // `shrink` frees up to the bytes it is given.
+        self.nodes.lock().shrink(usize::MAX);
     }
 
     /// Test-only: whether the running code is joined to the transaction.

@@ -2227,17 +2227,26 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
 /// here. Releasing first also lets a concurrent operation open the next batch
 /// instead of blocking behind this one's I/O.
 pub(crate) fn flush_batch<'a, B: BlockDevice + 'static>(vol: &'a BtrfsVolume<B>) -> BoxFut<'a, ()> {
-    Box::pin(flush_batch_from(vol, FlushOrigin::Elsewhere))
+    flush_batch_from(vol, FlushOrigin::Elsewhere)
 }
 
-async fn flush_batch_from<B: BlockDevice + 'static>(
+/// Boxed: a commit is a large future, and every operation that fills its
+/// batch awaits one; inline, it pushed their poll frames past the budget.
+fn flush_batch_from<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    origin: FlushOrigin,
+) -> BoxFut<'_, ()> {
+    Box::pin(flush_batch_from_inner(vol, origin))
+}
+
+async fn flush_batch_from_inner<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     origin: FlushOrigin,
 ) -> Result<(), FsError> {
     // A commit closes the transaction: every operation joined to it has
     // left, and none joins until it is done (`VolCore::exclusive`).
     if !vol.txn_closed() {
-        return vol.exclusive(Box::pin(flush_batch_from(vol, origin))).await;
+        return vol.exclusive(flush_batch_from(vol, origin)).await;
     }
     let _txn = vol.txn_lock().lock().await;
     let batch = vol.fs_batch().lock().await.take();
@@ -2277,14 +2286,14 @@ async fn flush_batch_from<B: BlockDevice + 'static>(
 /// and the roots put back.
 struct UnfinishedCommit<'a, B: BlockDevice + 'static> {
     vol: &'a BtrfsVolume<B>,
-    batch: Option<FsBatch>,
+    batch: Option<Box<FsBatch>>, // boxed: keeps every commit caller's frame small
 }
 
 impl<'a, B: BlockDevice + 'static> UnfinishedCommit<'a, B> {
     fn new(vol: &'a BtrfsVolume<B>, batch: Option<&FsBatch>) -> Self {
         Self {
             vol,
-            batch: batch.filter(|b| b.ops > 0).cloned(),
+            batch: batch.filter(|b| b.ops > 0).cloned().map(Box::new),
         }
     }
 
@@ -2303,7 +2312,7 @@ impl<B: BlockDevice + 'static> Drop for UnfinishedCommit<'_, B> {
         }
         if let Some(mut slot) = self.vol.fs_batch().try_lock() {
             if slot.is_none() {
-                *slot = Some(batch);
+                *slot = Some(*batch);
                 return;
             }
         }
