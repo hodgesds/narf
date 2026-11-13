@@ -6906,3 +6906,98 @@ fn smoke_scheduler_exit_mm_releases_once() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("scheduler/mm-exit", smoke_scheduler_exit_mm_releases_once);
+
+// ── block_on bridge: a cross-CPU wake kicks the halted bridge ──────
+
+static BRIDGE_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static BRIDGE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BRIDGE_WOKE_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn smoke_block_on_bridge_is_kicked_by_cross_cpu_wake() -> TestResult {
+    // `block_on` on this CPU halts waiting for a future that a task on
+    // another CPU completes. The waker must IPI this CPU (the bridge
+    // publishes its halt as the executor's idle path does), so the bridge
+    // returns within microseconds of the wake — not at this CPU's next
+    // unrelated interrupt, which on a tickless CPU may be far away. The
+    // bridge takes its halting path only on a reliable tick with IRQs
+    // enabled; elsewhere it spins and there is nothing to test.
+    use core::future::Future;
+    use core::sync::atomic::Ordering;
+    use core::task::Poll;
+    if !narf_time::tick_reliable() {
+        return TestResult::Skip("no reliable tick: block_on spins instead of halting");
+    }
+    let me = narf_lib::percpu::current_cpu();
+    let Some(other) =
+        (0..narf_lib::percpu::MAX_CPUS).find(|&c| c != me && narf_lib::smp::is_online(c as u32))
+    else {
+        return TestResult::Skip("no second online CPU");
+    };
+    BRIDGE_DONE.store(false, Ordering::SeqCst);
+    BRIDGE_WOKE_AT.store(0, Ordering::SeqCst);
+    *BRIDGE_WAKER.lock() = None;
+    let ipis0 = crate::__test_resched_ipis_sent(other);
+    let irqs_were_on = narf_arch::interrupts_enabled();
+    // SAFETY: the bridge halts only with IRQs enabled; restored below.
+    unsafe { narf_arch::enable_interrupts() };
+    crate::spawn_stackful_pinned(
+        async move {
+            // Long enough for the bridge to be committed to its halt.
+            crate::narf_time::sleep_ms(40).await;
+            BRIDGE_WOKE_AT.store(narf_time::now_cycles(), Ordering::SeqCst);
+            BRIDGE_DONE.store(true, Ordering::SeqCst);
+            let w = BRIDGE_WAKER.lock().take();
+            if let Some(w) = w {
+                w.wake();
+            }
+        },
+        other as u32,
+    );
+    // A backstop so a task that never runs cannot hang the suite: the
+    // sleep arms a timer the bridge's pump expires.
+    let mut give_up = core::pin::pin!(crate::narf_time::sleep_ms(5_000));
+    let outcome = crate::block_on(core::future::poll_fn(|cx| {
+        if BRIDGE_DONE.load(Ordering::SeqCst) {
+            return Poll::Ready(true);
+        }
+        *BRIDGE_WAKER.lock() = Some(cx.waker().clone());
+        if BRIDGE_DONE.load(Ordering::SeqCst) {
+            return Poll::Ready(true);
+        }
+        if give_up.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(false);
+        }
+        Poll::Pending
+    }));
+    let returned_at = narf_time::now_cycles();
+    if !irqs_were_on {
+        // SAFETY: counterpart to the enable above.
+        unsafe { narf_arch::disable_interrupts() };
+    }
+    if !outcome {
+        return TestResult::Fail("the pinned waker task never ran (bridge gave up after 5 s)");
+    }
+    let latency_us =
+        narf_time::cycles_to_ns(returned_at.wrapping_sub(BRIDGE_WOKE_AT.load(Ordering::SeqCst)))
+            / 1_000;
+    let ipis = crate::__test_resched_ipis_sent(other).wrapping_sub(ipis0);
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "block_on bridge: woken from CPU {other} after {latency_us} us; {ipis} resched IPI(s) sent"
+        );
+    }
+    if ipis == 0 {
+        return TestResult::Fail("the wake sent no reschedule IPI to the halted bridge");
+    }
+    if latency_us > 5_000 {
+        return TestResult::Fail("the bridge woke more than 5 ms after the wake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler/bridge",
+    smoke_block_on_bridge_is_kicked_by_cross_cpu_wake
+);

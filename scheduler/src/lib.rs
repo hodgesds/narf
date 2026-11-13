@@ -1665,6 +1665,18 @@ static WAKE_PRESSURE: [core::sync::atomic::AtomicU32; narf_lib::percpu::MAX_CPUS
 static CPU_HALTED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
     [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
+/// "The CPU is halted in a `block_on` bridge, not in its executor." The
+/// bridge (`bridge_idle_wait`) publishes `CPU_HALTED` like the executor's
+/// idle path — so a waker IPIs it through the unchanged `resched_remote`
+/// handshake and its HLT is broken by the wake, not by the CPU's next
+/// unrelated interrupt — and this flag beside it. Wake-time placement
+/// (`cpu_halted_and_schedulable`) reads both: a halted executor will run
+/// whatever is migrated to it; a CPU parked in `block_on` — outside its
+/// executor, possibly for the whole of a boot-time mount — will not, and a
+/// task moved there could be the very one the bridged future waits for.
+static BRIDGE_HALTED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
+    [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
+
 /// Wake delivery is distinct from a policy-approved preemption. The producer
 /// publishes queue ownership before this flag; the target clears it BEFORE
 /// activation, so a concurrent producer cannot have its notification erased.
@@ -6343,6 +6355,7 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Op
 fn cpu_halted_and_schedulable(cpu: usize) -> bool {
     cpu < CPU_HALTED.len()
         && CPU_HALTED[cpu].load(Ordering::SeqCst)
+        && !BRIDGE_HALTED[cpu].load(Ordering::SeqCst)
         && matches!(
             policy::cpu_state(CpuId(cpu as u32)),
             CpuState::Active | CpuState::Idle
@@ -6830,6 +6843,80 @@ fn idle_wait(next_deadline: Option<u64>) {
     let t0 = narf_time::now_cycles();
     idle_wait_inner(next_deadline);
     credit_idle_since(narf_lib::percpu::current_cpu(), t0);
+}
+
+/// The `block_on` bridge's halt: `idle_wait(None)` made race-free the way
+/// the executor's idle commit is.
+///
+/// Two wakes used to be lost here, each costing the bridged future a wait
+/// until this CPU's next unrelated interrupt (on a tickless CPU, the next
+/// armed timer):
+///
+/// 1. Same-CPU IRQ-before-HLT: the awake check and the `hlt` ran with IRQs
+///    enabled, so a device interrupt that completed the future's wait in
+///    between was serviced, then the CPU halted anyway (the executor's
+///    "BUG FIX (intermittent permanent SMP wedge)" race, in a second
+///    place). An NVMe completion lands right after the poll that posted
+///    it — inside that window often enough to stall whole boot mounts.
+/// 2. Cross-CPU wake without a kick: `resched_remote` sends its IPI only
+///    to a CPU published as halted, and the bridge published nothing, so a
+///    wake from another CPU's interrupt or task set the awake flag and
+///    left this CPU in `hlt`.
+///
+/// Linux parity: a task blocked in `wait_for_completion` lets its CPU
+/// idle through the scheduler, whose idle entry is `sti;hlt` after
+/// `need_resched()` under `local_irq_disable()` and whose
+/// `TIF_POLLING_NRFLAG` / `set_nr_and_not_polling` handshake makes
+/// `try_to_wake_up` IPI an idle CPU. Here: IRQs masked, `CPU_HALTED` (and
+/// [`BRIDGE_HALTED`], for placement) published, SeqCst fence, re-check of
+/// the awake flag and the `NEED_RESCHED` request (consumed, as the
+/// executor's commit consumes it), then `idle_halt_then_disable`
+/// (`sti;hlt;cli`) so an IPI or device IRQ that raced into the window is
+/// taken by the halt itself. The waker's side is `resched_remote`,
+/// unchanged: flag, fence, load `CPU_HALTED` → IPI.
+///
+/// Off a reliable tick, or with IRQs already masked, the old bounded spin
+/// stays (nothing to race against: no `hlt`).
+// Out of line: `block_on_inner` is a generic `#[inline]` and inlines into
+// every caller's frame; the halt path is cold and must not add to those
+// frames (the kernel stack-frame budget caught it in six drivers).
+#[inline(never)]
+fn bridge_idle_wait(awake: &WakeCell) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= BRIDGE_HALTED.len()
+        || !narf_time::tick_reliable()
+        || !narf_arch::interrupts_enabled()
+    {
+        idle_wait(None);
+        return;
+    }
+    let t0 = narf_time::now_cycles();
+    // SAFETY: re-enabled below on every path; masking IRQs across the
+    // check and the halt is what closes race 1.
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
+    // Placement flag first, so no waker ever observes "halted executor"
+    // without "in a bridge" for this CPU.
+    BRIDGE_HALTED[cpu].store(true, Ordering::SeqCst);
+    CPU_HALTED[cpu].store(true, Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let woke =
+        awake.flag.load(Ordering::SeqCst) || NEED_RESCHED[cpu].swap(false, Ordering::SeqCst);
+    if !woke {
+        // SAFETY: IRQs are masked (above) and the final check passed;
+        // returns with IRQs masked.
+        unsafe {
+            narf_arch::idle_halt_then_disable();
+        }
+    }
+    CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+    BRIDGE_HALTED[cpu].store(false, Ordering::SeqCst);
+    // SAFETY: restores the enabled state this function was entered with.
+    unsafe {
+        narf_arch::enable_interrupts();
+    }
+    credit_idle_since(cpu, t0);
 }
 
 #[inline]
@@ -9173,10 +9260,12 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
                     // Cooperative path: idle until something
                     // fires an IRQ. IRQ handler (or the future's
                     // own wake_by_ref) flips awake, then we return.
-                    // `idle_wait` HLTs on a reliable tick and
+                    // `bridge_idle_wait` HLTs race-free on a reliable
+                    // tick (the wake above re-checked under masked
+                    // IRQs with the halt published to wakers) and
                     // bounded-spins on the InitialCount fallback, so
                     // a dropped tick can't wedge a blocked caller.
-                    idle_wait(None);
+                    bridge_idle_wait(&awake);
                 } else {
                     // Spin path: re-poll immediately. Cheap
                     // back-off via spin_loop hint.
