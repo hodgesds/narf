@@ -1343,7 +1343,7 @@ const HOST_ANCHORED: &str = "\0";
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
 pub(crate) fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
-    stat_ino_path_dir_aware(path).map(|(s, ..)| s)
+    stat_ino_path_dir_aware(path).ok().map(|(s, ..)| s)
 }
 
 // Same resolution as `stat_path_dir_aware`, but also returns the file's
@@ -1379,12 +1379,24 @@ pub(crate) fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 /// name is free — so `mkdir` on it fails with EEXIST it cannot explain, and a
 /// shell following `a -> b -> a` reports "No such file" for a link that
 /// plainly exists.
-fn path_lookup_errno(path: &str) -> i64 {
-    // A walk that could not be carried out (EIO, EINTR for a killed caller,
-    // ENOMEM) is reported as such: it says nothing about whether the name
-    // exists, and calling it ENOENT tells the caller the name is free.
-    if let Some(error) = path_walk_failure(path) {
-        return copy_fs_errno(error);
+///
+/// `first` is the error the caller's own lookup of `path` failed with, when
+/// it has one: Linux returns the lookup's error as it is (`filename_lookup`
+/// → `link_path_walk`), so a walk that could not be carried out (EIO, EINTR
+/// for a killed caller, ENOMEM) is that error, never re-asked. Walking the
+/// path again to find out would answer a different question — a transient
+/// EIO gone by the second walk came back as ENOENT, telling the caller the
+/// name is free. Only a caller with no error of its own (`None`, a lookup
+/// that reports none) has the path walked again for one.
+fn path_lookup_errno(path: &str, first: Option<narf_filesystem::FsError>) -> i64 {
+    match first {
+        Some(error) if error.is_walk_failure() => return copy_fs_errno(error),
+        Some(_) => {}
+        None => {
+            if let Some(error) = path_walk_failure(path) {
+                return copy_fs_errno(error);
+            }
+        }
     }
     let trimmed = path.trim_end_matches('/');
     // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
@@ -1405,7 +1417,7 @@ fn path_lookup_errno(path: &str) -> i64 {
         prefix.push_str(comp);
         // Non-final components are always followed, as in a real walk.
         match stat_ino_path_dir_aware_ext(&prefix, true) {
-            Some((st, ..)) => {
+            Ok((st, ..)) => {
                 if st.mode.file_type != narf_filesystem::FileType::Dir {
                     return ENOTDIR;
                 }
@@ -1421,11 +1433,12 @@ fn path_lookup_errno(path: &str) -> i64 {
                     return EACCES;
                 }
             }
-            // This ancestor did not resolve. A cycle here stops the walk just
-            // as a missing component does, but means something quite
-            // different, so ask before defaulting.
-            None if path_symlink_loop(&prefix) => return ELOOP,
-            None => return ENOENT,
+            // This ancestor did not resolve: its lookup's own error. A
+            // cycle stops the walk just as a missing component does, but
+            // means something quite different.
+            Err(error) if error.is_walk_failure() => return copy_fs_errno(error),
+            Err(narf_filesystem::FsError::SymlinkLoop) => return ELOOP,
+            Err(_) => return ENOENT,
         }
     }
     // Every ancestor resolved. An over-long leaf can be neither a file nor
@@ -1434,7 +1447,11 @@ fn path_lookup_errno(path: &str) -> i64 {
         return ENAMETOOLONG;
     }
     // Every ancestor resolved, so any cycle is in the final component.
-    if path_symlink_loop(path) {
+    let looped = match first {
+        Some(error) => error == narf_filesystem::FsError::SymlinkLoop,
+        None => path_symlink_loop(path),
+    };
+    if looped {
         return ELOOP;
     }
     ENOENT
@@ -1551,11 +1568,11 @@ pub(crate) fn user_path_lookup(
             follow_final = false;
         }
     }
-    let Some((stat, _ino, _rdev, uid, gid, _attrs)) =
-        stat_ino_path_dir_aware_ext(&path, follow_final)
-    else {
-        return Err(path_lookup_errno(&path));
-    };
+    let (stat, _ino, _rdev, uid, gid, _attrs) =
+        match stat_ino_path_dir_aware_ext(&path, follow_final) {
+            Ok(found) => found,
+            Err(error) => return Err(path_lookup_errno(&path, Some(error))),
+        };
     if !path_ancestors_searchable(&path, task) {
         return Err(EACCES);
     }
@@ -1695,9 +1712,9 @@ fn literal_prefix_is_dir(task: u64, prefix: &str) -> Result<alloc::string::Strin
         return Err(ELOOP);
     };
     match stat_ino_path_dir_aware_ext(&resolved, true) {
-        Some((st, ..)) if st.mode.file_type == narf_filesystem::FileType::Dir => Ok(resolved),
-        Some(_) => Err(ENOTDIR),
-        None => Err(path_lookup_errno(&resolved)),
+        Ok((st, ..)) if st.mode.file_type == narf_filesystem::FileType::Dir => Ok(resolved),
+        Ok(_) => Err(ENOTDIR),
+        Err(error) => Err(path_lookup_errno(&resolved, Some(error))),
     }
 }
 
@@ -1738,7 +1755,7 @@ fn path_symlink_loop(path: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn stat_ino_path_dir_aware(path: &str) -> Option<PathStat> {
+fn stat_ino_path_dir_aware(path: &str) -> Result<PathStat, narf_filesystem::FsError> {
     stat_ino_path_dir_aware_ext(path, true)
 }
 
@@ -1761,7 +1778,15 @@ type PathStat = (
     narf_filesystem::InodeAttrs,
 );
 
-fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathStat> {
+/// On failure, the error the path's lookup failed with (Linux
+/// `filename_lookup`'s): a walk that could not be carried out (EIO, EINTR,
+/// ENOMEM) is returned as soon as it happens, without trying the path's
+/// other shapes, and otherwise the first walk's error (`NotFound` when no
+/// walk took place).
+fn stat_ino_path_dir_aware_ext(
+    path: &str,
+    follow_final: bool,
+) -> Result<PathStat, narf_filesystem::FsError> {
     stat_ino_path_dir_aware_depth(path, follow_final, 0)
 }
 
@@ -1773,8 +1798,10 @@ fn stat_ino_path_dir_aware_depth(
     path: &str,
     follow_final: bool,
     depth: u8,
-) -> Option<PathStat> {
+) -> Result<PathStat, narf_filesystem::FsError> {
     const MAX_STAT_RETRY: u8 = 2;
+    // The first walk's error, if it failed.
+    let mut first: Option<narf_filesystem::FsError> = None;
     let file = current_resolve_absolute(path, |fs, root, rel| {
         if rel.is_empty() {
             // A file-rooted mount (mount --bind of a file, e.g. systemd's
@@ -1803,7 +1830,7 @@ fn stat_ino_path_dir_aware_depth(
                 rel,
                 follow_final,
             ))
-            .and_then(|r| r.ok())
+            .and_then(|r| r.map_err(|error| first = Some(error)).ok())
             // rdev() is needed by seatd/libudev, which validate a
             // device node's type via the MAJOR:MINOR from a PATH
             // stat (not just fstat) — a 0 rdev reads as "not an
@@ -1815,9 +1842,23 @@ fn stat_ino_path_dir_aware_depth(
         }
     })
     .flatten();
-    if file.is_some() {
-        return file;
+    if let Some(file) = file {
+        return Ok(file);
     }
+    // The lookup could not be carried out: that is the answer, as it is
+    // `filename_lookup`'s. Trying the path's other shapes now could only
+    // turn it into a wrong ENOENT.
+    if let Some(error) = first.filter(|error| error.is_walk_failure()) {
+        return Err(error);
+    }
+    // A retry's walk failure is the answer too; otherwise the first walk's
+    // error stands.
+    let retried = |result: Result<PathStat, narf_filesystem::FsError>| {
+        result.map_err(|error| match first {
+            Some(first) if !error.is_walk_failure() => first,
+            _ => error,
+        })
+    };
     // A FOLLOWED `/proc/<pid>/{root,cwd,exe}` resolves to its target, exactly
     // as `open(2)` does — `stat("/proc/self/root")` must describe the task's
     // root directory, not fail. The walk above cannot reach an absolute target
@@ -1832,7 +1873,7 @@ fn stat_ino_path_dir_aware_depth(
         if let Some(target) = proc_task_link_target(current_task_id(), probe) {
             let host = apply_chroot(&target);
             if host != probe && depth < MAX_STAT_RETRY {
-                return stat_ino_path_dir_aware_depth(&host, true, depth + 1);
+                return retried(stat_ino_path_dir_aware_depth(&host, true, depth + 1));
             }
         }
     }
@@ -1850,7 +1891,7 @@ fn stat_ino_path_dir_aware_depth(
         // stable id) so a dir is distinguishable from its parent —
         // systemd's rm_rf root-guard aborts ("Attempted to remove entire
         // root file system") when a dir and its parent share st_ino.
-        return Some((
+        return Ok((
             narf_filesystem::Stat {
                 size: 0,
                 blocks: 0,
@@ -1877,7 +1918,7 @@ fn stat_ino_path_dir_aware_depth(
         for b in path.trim_end_matches('/').bytes() {
             ino = ino.wrapping_mul(1099511628211).wrapping_add(b as u64);
         }
-        return Some((
+        return Ok((
             narf_filesystem::Stat {
                 size: 0,
                 blocks: 0,
@@ -1928,19 +1969,23 @@ fn stat_ino_path_dir_aware_depth(
                         if let Some(target) =
                             fd_path_for_task(task, fd).filter(|p| p.starts_with('/'))
                         {
-                            return stat_ino_path_dir_aware_depth(
+                            return retried(stat_ino_path_dir_aware_depth(
                                 &apply_chroot(&target),
                                 false,
                                 depth + 1,
-                            );
+                            ));
                         }
                     }
                 }
-                return stat_ino_path_dir_aware_depth(&expanded, follow_final, depth + 1);
+                return retried(stat_ino_path_dir_aware_depth(
+                    &expanded,
+                    follow_final,
+                    depth + 1,
+                ));
             }
         }
     }
-    None
+    Err(first.unwrap_or(narf_filesystem::FsError::NotFound))
 }
 
 /// `FileOps` backing an open *directory* fd (from `open(path,
@@ -2669,7 +2714,7 @@ fn do_execve_resolved(
                 {
                     return Err(-EACCES);
                 }
-                return Err(-path_lookup_errno(&ep));
+                return Err(-path_lookup_errno(&ep, None));
             }
             // Genuinely-wedged device (2G-poll backstop exhausted) → EIO.
             // Loud: a silent EIO here cost a full debugging session (bash

@@ -397,7 +397,12 @@ pub fn begin_path_mutation(
   instead of treating it as absence in that layer (`ovl_lookup_single`). The
   syscall layer maps a walk failure on the path to its errno before any
   ENOENT/ENOTDIR classification, and `open` does not fall through to its
-  directory or `O_CREAT` handling on one.
+  directory or `O_CREAT` handling on one. That errno is the failing walk's
+  own: the stat helpers (`stat_ino_path_dir_aware_ext` and its callers)
+  return the lookup's error and hand it to `path_lookup_errno`, which
+  re-walks the path only for a caller that has no error of its own — a
+  second walk after an error that has cleared would find nothing wrong and
+  report ENOENT.
 - `dcache_identity` is the inode-alias key used by the dcache and must be
   wait-free. Its default object address is valid for filesystems that retain
   one `DirOps` object per inode. A participating backend that creates fresh

@@ -250,6 +250,7 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // The filesystem's device number, for the file cache: what it holds for
     // this mount is written before the mount goes, and dropped after.
     let device = stat_ino_path_dir_aware(target.as_str())
+        .ok()
         .map(|stat| stat.5.dev)
         .filter(|device| *device != 0);
     if !lazy

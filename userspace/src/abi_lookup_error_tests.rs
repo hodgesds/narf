@@ -12,13 +12,13 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use narf_block::ram::RamBlockDevice;
 use narf_block::{
     BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockOp, BlockRequest, CancelResult,
-    LbaRange,
+    LbaRange, SgRequest,
 };
 use narf_filesystem::{Dentry, FsError, FsInstance};
 
@@ -27,6 +27,9 @@ use crate::abi_test_support::*;
 const PASS: u8 = 0;
 const FAIL_READS: u8 = 1;
 const STALL_READS: u8 = 2;
+/// Fail reads while `fail_left` lasts, then pass: an error that has
+/// cleared by the time anything walks the path again.
+const FAIL_COUNTED: u8 = 3;
 
 /// A RAM disk whose reads can be made to fail (EIO) or to wait until
 /// released (a device that is slow to answer).
@@ -34,6 +37,10 @@ struct FaultyDevice {
     inner: Arc<RamBlockDevice>,
     mode: AtomicU8,
     release: AtomicBool,
+    /// Reads failed so far.
+    failed: AtomicU32,
+    /// Reads [`FAIL_COUNTED`] still fails.
+    fail_left: AtomicU32,
 }
 
 impl FaultyDevice {
@@ -47,11 +54,40 @@ impl FaultyDevice {
             inner: RamBlockDevice::from_image(512, image),
             mode: AtomicU8::new(PASS),
             release: AtomicBool::new(false),
+            failed: AtomicU32::new(0),
+            fail_left: AtomicU32::new(0),
         })
     }
 
     fn set(&self, mode: u8) {
         self.mode.store(mode, Ordering::Release);
+    }
+
+    /// What this request meets: `FAIL_READS` (an I/O error), `STALL_READS`
+    /// (wait for `release`) or `PASS`.
+    fn fault(&self, op: BlockOp) -> u8 {
+        let read = op == BlockOp::Read;
+        let mode = match self.mode.load(Ordering::Acquire) {
+            FAIL_COUNTED
+                if read
+                    && self
+                        .fail_left
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok() =>
+            {
+                FAIL_READS
+            }
+            FAIL_COUNTED => PASS,
+            mode => mode,
+        };
+        match (read, mode) {
+            (true, FAIL_READS) => {
+                self.failed.fetch_add(1, Ordering::AcqRel);
+                FAIL_READS
+            }
+            (true, STALL_READS) => STALL_READS,
+            _ => PASS,
+        }
     }
 }
 
@@ -88,23 +124,44 @@ impl BlockDevice for FaultyDevice {
     }
 
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
-        let read = req.op == BlockOp::Read;
-        let mode = self.mode.load(Ordering::Acquire);
+        let fault = self.fault(req.op);
         // Boxed: btrfs's read paths are instantiated for this device and
         // inline its future; kept on the heap, their frames stay what they
         // are for the RAM disk (build/frame-budget.txt).
         Box::pin(async move {
-            if read && mode == FAIL_READS {
-                return BlockCompletion {
+            match fault {
+                FAIL_READS => BlockCompletion {
                     tag: 0,
                     user_tag: req.user_tag,
                     result: Err(BlockError::IOError),
-                };
+                },
+                STALL_READS => {
+                    Stall(&self.release).await;
+                    self.inner.submit(req).await
+                }
+                _ => self.inner.submit(req).await,
             }
-            if read && mode == STALL_READS {
-                Stall(&self.release).await;
+        })
+    }
+
+    /// btrfs reads tree blocks and data through scatter-gather requests;
+    /// without this the trait's default refused every one of them and no
+    /// fixture mounted on the device.
+    fn submit_sg(&self, req: SgRequest) -> impl Future<Output = BlockCompletion> + Send {
+        let fault = self.fault(req.op);
+        Box::pin(async move {
+            match fault {
+                FAIL_READS => BlockCompletion {
+                    tag: 0,
+                    user_tag: req.user_tag,
+                    result: Err(BlockError::IOError),
+                },
+                STALL_READS => {
+                    Stall(&self.release).await;
+                    self.inner.submit_sg(req).await
+                }
+                _ => self.inner.submit_sg(req).await,
             }
-            self.inner.submit(req).await
         })
     }
 
@@ -233,6 +290,60 @@ fn smoke_lookup_errors_btrfs_io_error_is_eio_and_not_cached() -> TestResult {
 kernel_test_in!(
     "syscall_abi/lookup_errors/btrfs",
     smoke_lookup_errors_btrfs_io_error_is_eio_and_not_cached
+);
+
+const TRANSIENT_MOUNT: &str = "/lookup-transient";
+const TRANSIENT_PATH: &[u8] = b"/lookup-transient/narf.txt\0";
+
+/// A device error during the lookup is the lookup's answer even when it has
+/// cleared by the time the error is classified: `stat` returns -EIO, not
+/// -ENOENT (Linux returns `filename_lookup`'s error as it is; walking the
+/// path a second time to find out why it failed found nothing wrong and
+/// said the name was free).
+fn smoke_lookup_errors_btrfs_transient_io_error_is_eio() -> TestResult {
+    with_setup(|| {
+        let device = FaultyDevice::new();
+        let (_volume, handle) = mount_with_file(&device, TRANSIENT_MOUNT)?;
+        let outcome = (|| {
+            let mut sb = [0u8; STAT_SIZE];
+            let path = TRANSIENT_PATH.as_ptr() as u64;
+            // How many failed reads one walk of the path takes to give up
+            // (every copy, every retry): measured on a single walk, with the
+            // error lasting.
+            let root = mount_root(TRANSIENT_MOUNT)?;
+            narf_memory::reclaim::drop_slab();
+            device.failed.store(0, Ordering::Release);
+            device.set(FAIL_READS);
+            let walked = crate::handlers::poll_io_to_completion(
+                narf_filesystem::resolve_async_dentry_ext(root, "narf.txt", true),
+            );
+            device.set(PASS);
+            if !matches!(walked, Some(Err(FsError::Io(_)))) {
+                return Err("a walk through a lasting read error did not fail with Io");
+            }
+            // The stat's own walk fails; the error has cleared before
+            // anything could walk the path again.
+            let budget = device.failed.load(Ordering::Acquire);
+            narf_memory::reclaim::drop_slab();
+            device.fail_left.store(budget, Ordering::Release);
+            device.set(FAIL_COUNTED);
+            if call_stat(path, sb.as_mut_ptr() as u64) != Some(-narf_lib::errno::EIO) {
+                return Err("stat through a read error that then cleared was not -EIO");
+            }
+            device.set(PASS);
+            if call_stat(path, sb.as_mut_ptr() as u64) != Some(0) {
+                return Err("the file did not stat after the transient error");
+            }
+            Ok(())
+        })();
+        device.set(PASS);
+        let _ = registry().unmount(&handle, TRANSIENT_MOUNT);
+        outcome
+    })
+}
+kernel_test_in!(
+    "syscall_abi/lookup_errors/btrfs",
+    smoke_lookup_errors_btrfs_transient_io_error_is_eio
 );
 
 const KILL_MOUNT: &str = "/lookup-kill";

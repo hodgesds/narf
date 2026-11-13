@@ -2002,7 +2002,7 @@ fn open_impl_reserved(
         let errno = if resolve_dir_absolute(parent).is_some() {
             EISDIR
         } else {
-            path_lookup_errno(path)
+            path_lookup_errno(path, None)
         };
         ctx.set_return(errno_ret(errno));
         return;
@@ -2114,7 +2114,7 @@ fn open_impl_reserved(
                 let errno = if stat_path_dir_aware(path).is_some() {
                     ENOTDIR
                 } else {
-                    path_lookup_errno(path)
+                    path_lookup_errno(path, None)
                 };
                 ctx.set_return(errno_ret(errno));
             }
@@ -2471,7 +2471,7 @@ fn open_impl_reserved(
                 // a device error for a caller that merely named a missing
                 // directory.
                 None => {
-                    ctx.set_return(errno_ret(path_lookup_errno(path)));
+                    ctx.set_return(errno_ret(path_lookup_errno(path, None)));
                     return;
                 }
                 Some(None) => {
@@ -2488,7 +2488,7 @@ fn open_impl_reserved(
             // as a fatal EPERM. A non-directory prefix component is
             // -ENOTDIR (`open("/etc/passwd/x")`), as for stat — see
             // `path_lookup_errno`.
-            ctx.set_return(errno_ret(path_lookup_errno(path)));
+            ctx.set_return(errno_ret(path_lookup_errno(path, None)));
             return;
         }
     };
@@ -3554,7 +3554,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
         Some(p) => p,
         None => {
-            return SyscallReturn::ok((-path_lookup_errno(path_ref)) as u64);
+            return SyscallReturn::ok((-path_lookup_errno(path_ref, None)) as u64);
         }
     };
     if let Err(errno) = mnt_want_write(path_ref) {
@@ -4191,8 +4191,8 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // InvalidPath. busybox `ls /bin` lands here, so synthesise a
     // directory-shaped stat for the mount root.
     let (s, ino, rdev, uid, gid, attrs) = match stat_ino_path_dir_aware_ext(path, follow_final) {
-        Some(tuple) => tuple,
-        None => {
+        Ok(tuple) => tuple,
+        Err(error) => {
             // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
             // like libwayland's wl_socket_lock require the real errno.
             //
@@ -4202,7 +4202,9 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
             // a prefix is a file and creating it never will work. The
             // resolver reports no reason, so the walk is re-classified on
             // this failure path — see `path_lookup_errno`.
-            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(path)) as u64));
+            ctx.set_return(SyscallReturn::ok(
+                (-path_lookup_errno(path, Some(error))) as u64,
+            ));
             return;
         }
     };
@@ -4529,8 +4531,9 @@ fn path_is_strictly_under(path: &str, ancestor: &str) -> bool {
 }
 
 /// What `lookup_one_qstr_excl` finds at a normalised absolute path, without
-/// following a final symlink: `None` = negative dentry, `Some(is_dir)`.
-fn namespace_node_kind(path: &str) -> Option<bool> {
+/// following a final symlink: `Ok(is_dir)`, or the lookup's error (a
+/// negative dentry is `NotFound`).
+fn namespace_node_kind(path: &str) -> Result<bool, narf_filesystem::FsError> {
     stat_ino_path_dir_aware_ext(path, false)
         .map(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
 }
@@ -4549,14 +4552,16 @@ fn parentat_dir(path: &str, last: LastComponent) -> Result<alloc::string::String
     // The dir-aware stat covers real directories, mount roots, synthetic
     // mount ancestors and — since intermediate components are followed —
     // a symlink to a directory (`/proc/self/…`).
-    if stat_ino_path_dir_aware(dir)
-        .is_some_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
+    let found = stat_ino_path_dir_aware(dir);
+    if found
+        .as_ref()
+        .is_ok_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
     {
         return Ok(alloc::string::String::from(dir));
     }
     // `path_lookup_errno` classifies every component BEFORE the leaf, so
     // hand it a path whose parent is `dir`.
-    Err(-path_lookup_errno(&alloc::format!("{dir}/.")))
+    Err(-path_lookup_errno(&alloc::format!("{dir}/."), found.err()))
 }
 
 /// `fs/namei.c::filename_create` up to (not including) `mnt_want_write`,
@@ -4577,8 +4582,15 @@ fn parentat_dir(path: &str, last: LastComponent) -> Result<alloc::string::String
 /// node.
 fn filename_create_check(path: &str, last: LastComponent) -> Result<(), i64> {
     parentat_dir(path, last)?;
-    if !last.is_norm() || namespace_node_kind(path).is_some() {
+    if !last.is_norm() {
         return Err(-EEXIST);
+    }
+    match namespace_node_kind(path) {
+        Ok(_) => return Err(-EEXIST),
+        // `filename_create`'s lookup failed outright: its error, not a
+        // creation over a name nobody could look up.
+        Err(error) if error.is_walk_failure() => return Err(-copy_fs_errno(error)),
+        Err(_) => {}
     }
     if last == LastComponent::NormSlash {
         return Err(-ENOENT);
@@ -4952,9 +4964,9 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     // -ENOTDIR) whatever is wrong with the new name. A trailing slash makes
     // the lookup demand a directory: `link("file/", x)` is -ENOTDIR.
     let old_is_dir = match namespace_node_kind(&old_path) {
-        Some(is_dir) => is_dir,
-        None => {
-            ctx.set_return(errno_ret(path_lookup_errno(&old_path)));
+        Ok(is_dir) => is_dir,
+        Err(error) => {
+            ctx.set_return(errno_ret(path_lookup_errno(&old_path, Some(error))));
             return;
         }
     };
@@ -5110,7 +5122,7 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
     let Some(dir) = resolve_dir_absolute(dir_path) else {
         // The walk to the target directory failed; say why (ENOENT, or
         // ENOTDIR for a file component) as `link_path_walk` does.
-        return -path_lookup_errno(new_path);
+        return -path_lookup_errno(new_path, None);
     };
     match poll_blocking(dir.link_node(&new_leaf, node)) {
         Some(Ok(())) => {
@@ -5238,7 +5250,7 @@ fn readlink_impl(
             if stat_path_dir_aware(&path).is_some() {
                 ctx.set_return(errno_ret(EINVAL));
             } else {
-                ctx.set_return(errno_ret(path_lookup_errno(&path)));
+                ctx.set_return(errno_ret(path_lookup_errno(&path, None)));
             }
             return;
         }
@@ -8077,7 +8089,8 @@ fn xattr_lookup(
     // With LOOKUP_FOLLOW a dangling final symlink is -ENOENT too: the walk
     // above left it unexpanded, and the xattr resolver (which never follows)
     // would otherwise find the link itself.
-    let exists = stat_ino_path_dir_aware_ext(&resolved, follow).is_some()
+    let found = stat_ino_path_dir_aware_ext(&resolved, follow);
+    let exists = found.is_ok()
         || match xattr_target(&resolved) {
             Some(XattrTarget::File(file)) => {
                 !follow || file.stat().mode.file_type != narf_filesystem::FileType::Symlink
@@ -8086,7 +8099,7 @@ fn xattr_lookup(
             None => false,
         };
     if !exists {
-        return Err(-path_lookup_errno(&resolved));
+        return Err(-path_lookup_errno(&resolved, found.err()));
     }
     Ok((resolved, follow))
 }
@@ -9121,9 +9134,11 @@ pub(crate) fn do_utimes(
         .or_else(|| resolve_dir_absolute(&path).map(XattrTarget::Dir));
     // A node only `stat` can see (a synthetic filesystem) still exists; it
     // keeps the old lenient accept, since there is nothing to stamp.
-    if target.is_none() && stat_ino_path_dir_aware_ext(&path, follow).is_none() {
-        ctx.set_return(errno_ret(path_lookup_errno(&path)));
-        return;
+    if target.is_none() {
+        if let Err(error) = stat_ino_path_dir_aware_ext(&path, follow) {
+            ctx.set_return(errno_ret(path_lookup_errno(&path, Some(error))));
+            return;
+        }
     }
     let (atime, mtime, touch) = match utimes_request(times) {
         Ok(req) => req,

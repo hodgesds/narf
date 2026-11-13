@@ -95,6 +95,6 @@ pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str, last: LastCo
         // The parent path/filesystem didn't resolve, or the async poll never
         // completed → the target directory can't exist. `link_path_walk`
         // says why: ENOENT, or ENOTDIR for a file component.
-        _ => ctx.set_return(errno_ret(path_lookup_errno(path))),
+        _ => ctx.set_return(errno_ret(path_lookup_errno(path, None))),
     }
 }

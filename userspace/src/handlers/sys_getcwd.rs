@@ -57,7 +57,7 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
     // removed. That was the `getcwd: cannot access parent directories`
     // every SSH login printed from its home directory, while a cwd like
     // /tmp, which happens to exist on both sides, kept working.
-    if stat_ino_path_dir_aware_ext(&resolve_cwd_path(task, &cwd), true).is_none() {
+    if stat_ino_path_dir_aware_ext(&resolve_cwd_path(task, &cwd), true).is_err() {
         ctx.set_return(errno_ret(ENOENT));
         return;
     }

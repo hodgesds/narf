@@ -81,7 +81,7 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
             // The walk to the parent failed: -ENOENT for a missing
             // component, but -ENOTDIR when one is a file (`mkdir("f/x")`),
             // -EACCES / -ELOOP as `link_path_walk` reports them.
-            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(path_ref)) as u64));
+            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(path_ref, None)) as u64));
             return;
         }
     };

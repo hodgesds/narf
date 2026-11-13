@@ -142,7 +142,7 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
         return;
     }
 
-    ctx.set_return(errno_ret(path_lookup_errno(&path)));
+    ctx.set_return(errno_ret(path_lookup_errno(&path, None)));
 }
 
 /// `chmod_common` on a directory reached through `DirOps`.

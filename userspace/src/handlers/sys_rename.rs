@@ -171,19 +171,21 @@ fn rename_walk_parent(
             // The walk goes THROUGH the named directory, so the path
             // itself must resolve as one (its leaf is rejected with
             // EBUSY right after the EXDEV check, so no probe is needed).
-            if stat_ino_path_dir_aware(path)
-                .is_some_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
+            let found = stat_ino_path_dir_aware(path);
+            if found
+                .as_ref()
+                .is_ok_and(|(st, ..)| st.mode.file_type == narf_filesystem::FileType::Dir)
             {
                 Ok((alloc::string::String::from(path), None))
             } else {
-                Err(-path_lookup_errno(&alloc::format!("{path}/.")))
+                Err(-path_lookup_errno(&alloc::format!("{path}/."), found.err()))
             }
         }
         _ => {
             let dir = parent_of_abs(path);
             match probe_rename_side(path) {
                 Some(side) => Ok((alloc::string::String::from(dir), Some(side))),
-                None => Err(-path_lookup_errno(&alloc::format!("{dir}/."))),
+                None => Err(-path_lookup_errno(&alloc::format!("{dir}/."), None)),
             }
         }
     }

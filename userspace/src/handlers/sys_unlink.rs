@@ -76,9 +76,9 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str, last: LastC
     // remove the file.
     if last == LastComponent::NormSlash {
         let errno = match namespace_node_kind(path) {
-            None => path_lookup_errno(path),
-            Some(true) => EISDIR,
-            Some(false) => ENOTDIR,
+            Err(error) => path_lookup_errno(path, Some(error)),
+            Ok(true) => EISDIR,
+            Ok(false) => ENOTDIR,
         };
         ctx.set_return(errno_ret(errno));
         return;
@@ -137,6 +137,6 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str, last: LastC
         // The parent path/filesystem didn't resolve at all → the target
         // can't exist. `link_path_walk` says why: ENOENT for an absent
         // component, ENOTDIR when one is a file (`unlink("f/x")`).
-        _ => ctx.set_return(errno_ret(path_lookup_errno(path))),
+        _ => ctx.set_return(errno_ret(path_lookup_errno(path, None))),
     }
 }

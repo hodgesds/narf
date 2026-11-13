@@ -194,7 +194,7 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32, follow: bool, e
         // `user_path_at` failing: -ENOTDIR for a non-directory ancestor,
         // -ELOOP, -EACCES for an unsearchable ancestor, -ENAMETOOLONG —
         // not only -ENOENT, which is all this used to report.
-        ctx.set_return(errno_ret(path_lookup_errno(path)));
+        ctx.set_return(errno_ret(path_lookup_errno(path, None)));
     }
 }
 
