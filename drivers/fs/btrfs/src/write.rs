@@ -6551,6 +6551,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // operation reads part of these very trees straight back, and without
     // the cache every one of those reads is a miss the write itself created.
     let refs: Vec<(u64, &[u8])> = nodes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+    vol.mark_nodes_dirty(&refs);
     vol.write_nodes(&refs, txn.root_flags.is_some()).await?;
     drop(refs);
 

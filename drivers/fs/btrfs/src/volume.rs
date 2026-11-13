@@ -146,10 +146,21 @@ impl<B: BlockDevice> VolumeDevice<B> {
 ///
 /// The budget is [`crate::cache_budget::NODE_CACHE`] of RAM; it used to be a
 /// fixed 4,096 nodes, 64 MiB at 16 KiB whatever the machine.
+///
+/// `dirty` holds a frozen commit's nodes from the moment the commit fixes
+/// them until its write-out has put them on the device (Linux keeps a
+/// transaction's dirty extent buffers in memory until
+/// `btrfs_write_and_wait_transaction` has written them). Readers of the
+/// trees that commit published find them there; nothing may evict,
+/// invalidate or replace them meanwhile, because the device does not hold
+/// them yet: they sit outside the two generations and the budget, an
+/// invalidation of their range leaves them alone, and a device fill of
+/// their address is not published.
 #[derive(Debug)]
 struct NodeCache {
     young: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
     old: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
+    dirty: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
     /// Bytes charged for `young` and `old` ([`node_charge`]).
     young_bytes: usize,
     old_bytes: usize,
@@ -210,6 +221,7 @@ impl NodeCache {
         Self {
             young: BTreeMap::new(),
             old: BTreeMap::new(),
+            dirty: BTreeMap::new(),
             young_bytes: 0,
             old_bytes: 0,
             budget,
@@ -231,6 +243,9 @@ impl NodeCache {
 
     /// The cached node at `logical`, which becomes young again.
     fn get(&mut self, logical: u64) -> Option<(Arc<alloc::vec::Vec<u8>>, Option<RetiredNodes>)> {
+        if let Some(hit) = self.dirty.get(&logical) {
+            return Some((hit.clone(), None));
+        }
         if let Some(hit) = self.young.get(&logical) {
             return Some((hit.clone(), None));
         }
@@ -241,8 +256,12 @@ impl NodeCache {
     }
 
     /// Cache `node` at `logical`. Returns the generation this retired, if
-    /// it turned the cache over.
+    /// it turned the cache over. A dirty node at `logical` is not replaced:
+    /// it is newer than anything the device can have returned.
     fn insert(&mut self, logical: u64, node: Arc<alloc::vec::Vec<u8>>) -> Option<RetiredNodes> {
+        if self.dirty.contains_key(&logical) {
+            return None;
+        }
         if let Some(stale) = self.old.remove(&logical) {
             self.old_bytes -= node_charge(&stale);
         }
@@ -265,7 +284,34 @@ impl NodeCache {
         retired
     }
 
-    /// Drop the node cached at `logical`, if any.
+    /// Hold `node` at `logical` as dirty until [`Self::clean`]: a frozen
+    /// commit's node, not on the device yet. Any clean copy of the address
+    /// goes, and the epoch moves so no fill in flight publishes over it.
+    fn mark_dirty(&mut self, logical: u64, node: Arc<alloc::vec::Vec<u8>>) {
+        self.remove(logical);
+        self.dirty.insert(logical, node);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// The write-out of the dirty node at `logical` ended. Written, it becomes
+    /// an ordinary young entry; not written, it is dropped, and the next
+    /// reader goes to the device (a failed write-out aborts the filesystem,
+    /// and an unpublished commit's blocks are referenced by no tree). The
+    /// epoch moves either way, so a fill that read the address before the
+    /// write finished does not publish what it read.
+    fn clean(&mut self, logical: u64, written: bool) -> Option<RetiredNodes> {
+        let node = self.dirty.remove(&logical)?;
+        self.epoch = self.epoch.wrapping_add(1);
+        written.then(|| self.insert(logical, node)).flatten()
+    }
+
+    /// Whether `logical` is held dirty.
+    fn is_dirty(&self, logical: u64) -> bool {
+        self.dirty.contains_key(&logical)
+    }
+
+    /// Drop the node cached at `logical`, if any. A dirty node stays: until
+    /// its write-out ends, the cache is the only place it exists.
     fn remove(&mut self, logical: u64) {
         if let Some(node) = self.young.remove(&logical) {
             self.young_bytes -= node_charge(&node);
@@ -404,6 +450,65 @@ fn node_shrinker_scan(nr: usize) -> usize {
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_node_cache_keeps_what_is_used() -> bool {
     NodeCache::__test_keeps_what_is_used()
+}
+
+/// Test-only: a dirty node survives everything that drops clean ones — an
+/// invalidation of its range, eviction by a full cache, a shrink, a
+/// `forget` — and a device fill of its address does not replace it; once
+/// written it is an ordinary clean entry, and a dirty node whose write-out
+/// failed is gone.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_node_cache_dirty_entries() -> Result<(), &'static str> {
+    const NODESIZE: usize = 16 * 1024;
+    let budget = 8 * (NODESIZE + NODE_ENTRY_OVERHEAD);
+    let mut cache = NodeCache::new(budget);
+    let frozen = Arc::new(alloc::vec![0xAAu8; NODESIZE]);
+    let at = 4 * NODESIZE as u64;
+    let _ = cache.insert(at, Arc::new(alloc::vec![0x11u8; NODESIZE]));
+    cache.mark_dirty(at, frozen.clone());
+    let holds = |cache: &mut NodeCache| {
+        cache
+            .get(at)
+            .is_some_and(|(node, _)| Arc::ptr_eq(&node, &frozen))
+    };
+    if !holds(&mut cache) {
+        return Err("a dirty node did not replace the clean copy of its address");
+    }
+    // A device fill of the address (stale bytes) is not published.
+    let _ = cache.insert(at, Arc::new(alloc::vec![0x22u8; NODESIZE]));
+    // Invalidation, as a write of an overlapping range does.
+    for addr in cache.cached_in(at, at + NODESIZE as u64) {
+        cache.invalidate(addr);
+    }
+    cache.remove(at);
+    // Eviction: far more clean nodes than the budget holds, then a shrink.
+    for n in 0..64u64 {
+        let _ = cache.insert(
+            (100 + n) * NODESIZE as u64,
+            Arc::new(alloc::vec![0u8; NODESIZE]),
+        );
+    }
+    cache.shrink(usize::MAX);
+    if !holds(&mut cache) {
+        return Err("a dirty node was replaced, invalidated or evicted");
+    }
+    if cache.bytes() != 0 {
+        return Err("a dirty node was charged to the budget");
+    }
+    let _ = cache.clean(at, true);
+    if !holds(&mut cache) || cache.is_dirty(at) {
+        return Err("a written dirty node did not become a clean entry");
+    }
+    cache.shrink(usize::MAX);
+    if cache.get(at).is_some() {
+        return Err("a written node stayed unevictable");
+    }
+    cache.mark_dirty(at, frozen.clone());
+    let _ = cache.clean(at, false);
+    if cache.get(at).is_some() {
+        return Err("a node whose write-out failed stayed cached");
+    }
+    Ok(())
 }
 
 /// Test-only: fill a node cache with a 16-node budget far past it and
@@ -3777,6 +3882,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if refused {
             return Err(FsError::ReadOnly);
         }
+        // Nodes a frozen commit holds dirty in the cache: readers keep
+        // finding them there through the write, and the write makes them
+        // clean (or drops them, if it failed).
+        let dirty: Vec<bool> = {
+            let cache = self.nodes.lock();
+            nodes.iter().map(|&(l, _)| cache.is_dirty(l)).collect()
+        };
         for &(logical, buf) in nodes {
             self.stats.note_write(buf);
             let _ = self.invalidate_nodes(logical, buf.len());
@@ -3794,11 +3906,29 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         for &(logical, buf) in nodes {
             epoch = self.invalidate_nodes(logical, buf.len());
         }
-        written?;
-        for &(logical, buf) in nodes {
-            self.cache_written_node(logical, buf, epoch);
+        if written.is_ok() {
+            for (&(logical, buf), _) in nodes.iter().zip(&dirty).filter(|(_, &d)| !d) {
+                self.cache_written_node(logical, buf, epoch);
+            }
         }
-        Ok(())
+        let ok = written.is_ok();
+        for (&(logical, _), _) in nodes.iter().zip(&dirty).filter(|(_, &d)| d) {
+            let retired = self.nodes.lock().clean(logical, ok);
+            drop(retired);
+        }
+        written
+    }
+
+    /// Hold a frozen commit's nodes dirty in the node cache until
+    /// [`Self::write_nodes`] has written them: from here on a reader of the
+    /// trees they belong to finds them in memory, never on a device that
+    /// does not have them yet.
+    pub(crate) fn mark_nodes_dirty(&self, nodes: &[(u64, &[u8])]) {
+        let nodesize = self.nodesize();
+        for &(logical, buf) in nodes.iter().filter(|(_, b)| b.len() == nodesize) {
+            let node = Arc::new(buf.to_vec());
+            self.nodes.lock().mark_dirty(logical, node);
+        }
     }
 
     /// Keep a multi-stage operation (truncate's tail zeroing then its size

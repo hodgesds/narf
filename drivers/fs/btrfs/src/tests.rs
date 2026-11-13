@@ -22,6 +22,7 @@ mod batch_commit;
 mod cache_bounds;
 mod cache_off;
 mod commit_scale;
+mod commit_handover;
 mod concurrent_ops;
 mod data_cache;
 mod extent_window;
