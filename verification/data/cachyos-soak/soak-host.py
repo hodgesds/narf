@@ -189,6 +189,9 @@ class Serial:
         self.last_pulse_line = ""
         self.last_up = "?"
         self.lines = 0
+        # Longest STUCK(<n>s) any SOAK-PROBE line has reported, and that line.
+        self.stuck_secs = 0
+        self.stuck_line = ""
         threading.Thread(target=self.follow, daemon=True).start()
 
     def follow(self):
@@ -218,6 +221,11 @@ class Serial:
         if "SOAK-START" in text:
             self.started = True
             self.last_pulse = time.monotonic()
+        if "SOAK-PROBE" in text:
+            for n in re.findall(r"STUCK\(([0-9]+)s\)", text):
+                if int(n) > self.stuck_secs:
+                    self.stuck_secs = int(n)
+                    self.stuck_line = text
         if "SOAK-PHASE heavy" in text:
             self.heavy = True
         if "SOAK-END" in text:
@@ -379,6 +387,9 @@ def main():
     ap.add_argument("--deadline", type=int, required=True,
                     help="seconds after which QEMU is quit regardless")
     ap.add_argument("--stall", type=int, default=30)
+    ap.add_argument("--stop-on-probe", type=int, default=0,
+                    help="end the run when a probe has been stuck this many seconds: "
+                         "SysRq-T (task states) on the console, then register dumps")
     ap.add_argument("--linger", type=int, default=60)
     ap.add_argument("--rip-every", type=float, default=5.0)
     args = ap.parse_args()
@@ -464,6 +475,21 @@ def main():
                     break
                 time.sleep(2)
             verdict = "completed"
+            break
+        if args.stop_on_probe and serial.stuck_secs >= args.stop_on_probe:
+            event(f"PROBE STUCK {serial.stuck_secs} s: {serial.stuck_line[:300]}")
+            for i in range(3):
+                registers(f"probe-{i}")
+                time.sleep(1)
+            # Linux SysRq-T: every task's state and blocked syscall, on the
+            # console, without changing the system's timing beforehand.
+            try:
+                qmp.hmp("sendkey alt-sysrq-t")
+            except (OSError, ValueError):
+                pass
+            time.sleep(15)
+            registers("probe-final")
+            verdict = "probe-stuck"
             break
         if serial.started and serial.last_pulse and now - serial.last_pulse > args.stall:
             event(f"STALL: no SOAK-PULSE for {args.stall} s; last: {serial.last_pulse_line}")

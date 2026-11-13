@@ -27,6 +27,8 @@
 #
 #   SOAK_WRAPPER=<cmd>   prefix for the cargo/QEMU command (a build slot)
 #   SOAK_KERNEL=<elf>    boot this kernel instead of building the tree
+#   SOAK_STOP_ON=probe   end the run at the first probe stuck SOAK_STOP_SECS
+#                        (default 20) seconds: SysRq-T and register dumps
 #   SOAK_STALL=<n>       seconds without a pulse from the guest that count as
 #                        a stall and end the run (default 90)
 #   SOAK_DEADLINE=<n>    seconds after QEMU's first output at which the run is
@@ -143,7 +145,9 @@ main() {
     --http-port $HTTP_PORT --tls-port $TLS_PORT --udp-port $UDP_PORT \
     --ssh $SSH_VIRTIO --ssh $SSH_E1000 --inbound $IN_VIRTIO --inbound $IN_E1000 \
     --guest-host 10.0.2.2 --guest-host 10.0.3.2 \
-    --rip-every 2 --stall "$SOAK_STALL" --deadline "$DEADLINE" > "$RUN/host.log" 2>&1 &
+    --rip-every 2 --stall "$SOAK_STALL" --deadline "$DEADLINE" \
+    --stop-on-probe "$([ "${SOAK_STOP_ON:-}" = probe ] && echo "${SOAK_STOP_SECS:-20}" || echo 0)" \
+    > "$RUN/host.log" 2>&1 &
   HOST_PID=$!
   trap 'kill $HOST_PID 2> /dev/null || true' EXIT
 
