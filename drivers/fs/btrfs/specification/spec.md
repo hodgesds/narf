@@ -697,6 +697,21 @@ cancellation of the reading operation, which the write path does not yet
 make safe in general) can leave its device write in flight after the range
 is released — the same exposure as any dropped write future.
 
+A write-path future dropped at any await point leaves the filesystem
+consistent (`smoke_btrfs_dropped_write_path_future_leaves_the_commit_clean`,
+`drivers/fs/btrfs/race`). A killed task's operation is handed off to finish,
+so this is only reached by cancellation, but the property is kept anyway:
+an operation dropped before staging leaves its batch as it was (the COW
+snapshot is parked in the batch; only allocator carve-outs of unreferenced
+blocks leak until the commit); a batch commit dropped before it publishes
+puts its batch back for the next flush (`UnfinishedCommit`: the publish in
+`commit_txn` is one synchronous step, everything before it is fresh block
+writes and pins), and one dropped after it is done in memory; a staged
+superblock whose write was dropped is put back (`write_staged_super`), so
+committed transactions still become durable at the next sync. A multi-step
+operation (truncate's tail zeroing then its size change) dropped between
+steps commits the steps it staged; that is not yet rolled back.
+
 ## 5. Architecture notes
 
 The registration interface is shared by x86_64 and aarch64. Volume construction

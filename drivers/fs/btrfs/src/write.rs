@@ -1332,7 +1332,7 @@ pub(crate) const MAX_BATCH_OPS: usize = 512;
 ///    [`CowState`]).
 ///  * `gen` — one generation for every node the batch stamps, matching the one
 ///    superblock it eventually writes.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SubvolBatch {
     cow: CowState,
     base_root: (u64, u8),
@@ -1340,7 +1340,7 @@ pub(crate) struct SubvolBatch {
     ops: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct FsBatch {
     gen: u64,
     /// Per-subvolume COW states staged into this batch. One core serves every
@@ -2241,7 +2241,10 @@ async fn flush_batch_from<B: BlockDevice + 'static>(
     }
     let _txn = vol.txn_lock().lock().await;
     let batch = vol.fs_batch().lock().await.take();
-    match batch {
+    // Declared after `_txn`, so it is dropped first: while it puts a batch
+    // back, no other batch can have opened (`batch_begin` takes `txn_lock`).
+    let mut unfinished = UnfinishedCommit::new(vol, batch.as_ref());
+    let result = match batch {
         Some(batch) if batch.trees.contains_key(&vol.fs_tree_id()) => {
             commit_batch(vol, batch, origin).await
         }
@@ -2252,6 +2255,68 @@ async fn flush_batch_from<B: BlockDevice + 'static>(
             commit_batch(&owner, batch, origin).await
         }
         None => Ok(()),
+    };
+    unfinished.finished();
+    result
+}
+
+/// A batch commit's future dropped before it finished (its caller's future
+/// was cancelled — never a kill, which hands the operation off to finish).
+///
+/// The batch was taken out of `fs_batch`, and its operations were reported
+/// successful and are already visible: the in-memory fs roots point at its
+/// blocks. Losing it would let the next batch open on those roots with none
+/// of their extents recorded. Until the commit publishes (the synchronous
+/// step in `commit_txn` that advances the in-memory superblock generation to
+/// the batch's), nothing it did is visible beyond fresh, unreferenced block
+/// writes and extra pins, so the untouched batch is put back and the next
+/// flush commits it again (allocating, and writing, the same blocks). After
+/// the publish there is nothing to undo here; the staged superblock has its
+/// own guard (`write_staged_super`). If the batch cannot be put back, the
+/// operations are lost as in a failed commit: the transaction is aborted
+/// and the roots put back.
+struct UnfinishedCommit<'a, B: BlockDevice + 'static> {
+    vol: &'a BtrfsVolume<B>,
+    batch: Option<FsBatch>,
+}
+
+impl<'a, B: BlockDevice + 'static> UnfinishedCommit<'a, B> {
+    fn new(vol: &'a BtrfsVolume<B>, batch: Option<&FsBatch>) -> Self {
+        Self {
+            vol,
+            batch: batch.filter(|b| b.ops > 0).cloned(),
+        }
+    }
+
+    fn finished(&mut self) {
+        self.batch = None;
+    }
+}
+
+impl<B: BlockDevice + 'static> Drop for UnfinishedCommit<'_, B> {
+    fn drop(&mut self) {
+        let Some(batch) = self.batch.take() else {
+            return;
+        };
+        if self.vol.superblock().generation >= batch.gen {
+            return; // published: the commit is done in memory
+        }
+        if let Some(mut slot) = self.vol.fs_batch().try_lock() {
+            if slot.is_none() {
+                *slot = Some(batch);
+                return;
+            }
+        }
+        self.vol.abort_transaction();
+        for (&tree_id, tree) in &batch.trees {
+            let (root, level) = tree.base_root;
+            BtrfsVolume::view_for_tree(self.vol.core(), tree_id).advance_fs_root(root, level);
+        }
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs: a commit was abandoned and its batch could not be kept; aborting: the filesystem is now read-only"
+        );
     }
 }
 

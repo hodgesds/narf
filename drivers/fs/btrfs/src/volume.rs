@@ -3849,20 +3849,47 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             // data already covered by a durable superblock).
             return self.flush().await;
         };
+        // A caller whose future is dropped mid-write must not take the image
+        // with it: the in-memory trees already describe it, and with it gone
+        // a later sync would find nothing staged and flush only, leaving the
+        // committed transactions never durable. Put back on drop; rewriting
+        // a superblock that partly landed is idempotent.
+        struct KeepStaged<'a> {
+            slot: &'a IrqSafeSpinLock<Option<(alloc::vec::Vec<u8>, bool)>>,
+            image: Option<(alloc::vec::Vec<u8>, bool)>,
+        }
+        impl Drop for KeepStaged<'_> {
+            fn drop(&mut self) {
+                if let Some(image) = self.image.take() {
+                    let mut slot = self.slot.lock();
+                    if slot.is_none() {
+                        *slot = Some(image);
+                    }
+                }
+            }
+        }
+        let mut keep = KeepStaged {
+            slot: &self.staged_super,
+            image: Some((raw, root_admin)),
+        };
         // Every staged commit's nodes were written before this point. The
         // superblock writer issues the one pre-flush that makes them durable
         // before the FUA primary (`write_all_supers`).
+        let raw = keep
+            .image
+            .as_ref()
+            .map(|(raw, _)| raw.clone())
+            .unwrap_or_default();
         let written = if root_admin {
             self.write_superblock_root_admin(&raw).await
         } else {
             self.write_superblock(&raw).await
         };
-        if let Err(error) = written {
-            // Keep the image: it is still what the in-memory trees describe.
-            // The filesystem is now in its error state and takes no writes.
-            *self.staged_super.lock() = Some((raw, root_admin));
-            return Err(error);
-        }
+        // On failure `keep` puts the image back as it drops: it is still what
+        // the in-memory trees describe. The filesystem is then in its error
+        // state and takes no writes.
+        written?;
+        keep.image = None;
         self.staged_count
             .store(0, core::sync::atomic::Ordering::Release);
         // Only now, exactly as `btrfs_finish_extent_commit` runs only after

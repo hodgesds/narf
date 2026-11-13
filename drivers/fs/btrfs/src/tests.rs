@@ -14734,3 +14734,163 @@ kernel_test_in!(
     "drivers/fs/btrfs/race",
     smoke_btrfs_commit_survives_a_kill_in_every_phase
 );
+
+// ── Cancellation fuzz: drop a write-path future after its N-th poll ─────
+
+/// One write-path operation of the cancellation fuzz, as a boxed future
+/// over `file`.
+fn fuzz_op<'a>(
+    kind: u8,
+    file: &'a Arc<dyn narf_filesystem::FileOps>,
+    data: &'a [u8],
+) -> core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<(), FsError>> + Send + 'a>,
+> {
+    match kind {
+        0 => alloc::boxed::Box::pin(async move { file.write(0, data).await.map(|_| ()) }),
+        1 => alloc::boxed::Box::pin(async move { file.write(256 * 1024, data).await.map(|_| ()) }),
+        2 => alloc::boxed::Box::pin(async move { file.truncate(4096).await }),
+        3 => alloc::boxed::Box::pin(async move { file.fsync(false).await }),
+        _ => alloc::boxed::Box::pin(async move {
+            file.write(8192, data).await?;
+            file.fsync(true).await
+        }),
+    }
+}
+
+const FUZZ_KINDS: [&str; 5] = [
+    "write",
+    "append-write",
+    "truncate",
+    "fsync",
+    "write+fdatasync",
+];
+
+/// Whether a dropped write-path future can break the filesystem: for each
+/// operation kind and every N, start it with every device I/O yielding
+/// once (so each I/O is an await point that returns), poll it N times,
+/// drop it, then commit, and check the commit succeeds, the filesystem
+/// stays writable, its tree checks pass, and a fresh mount of the device
+/// reads a file whose bytes are the old or the new ones.
+///
+/// NARF never drops a filesystem future that has started — a killed
+/// task's operation is handed off to finish (`killable_wait`) — so this
+/// is the stronger property: an operation abandoned at any await point
+/// must leave the transaction, the batch and the gate as it found them.
+fn smoke_btrfs_dropped_write_path_future_leaves_the_commit_clean() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    let image = decode_sparse(FIXTURE_SPARSE);
+    let old = alloc::vec![0x11u8; 128 * 1024];
+    let new = alloc::vec![0x22u8; 64 * 1024];
+    let mut cases = 0u32;
+    let fail = |what: &'static str, kind: u8, n: u32| {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "btrfs cancellation fuzz: {} dropped after poll {}: {}",
+            FUZZ_KINDS[kind as usize],
+            n,
+            what
+        );
+        STALL_YIELD.store(false, Ordering::Release);
+        TestResult::Fail(what)
+    };
+    for kind in 0..FUZZ_KINDS.len() as u8 {
+        for n in 1u32..400 {
+            STALL_AT.store(u64::MAX, Ordering::Release);
+            STALL_YIELD.store(false, Ordering::Release);
+            let device = Arc::new(StallDevice {
+                inner: narf_block::ram::RamBlockDevice::from_image(512, image.clone()),
+            });
+            let vol = match poll_once(BtrfsVolume::mount(Arc::clone(&device), DomainId::DRIVER_0)) {
+                Some(Ok(vol)) => vol,
+                _ => return fail("fixture failed to mount", kind, n),
+            };
+            let file = match poll_once(vol.root().create("fuzz.dat")) {
+                Some(Ok(file)) => file,
+                _ => return fail("create failed", kind, n),
+            };
+            if !matches!(poll_once(file.write(0, &old)), Some(Ok(_)))
+                || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+            {
+                return fail("seeding failed", kind, n);
+            }
+            // The operation, every I/O an await point, cut after poll n.
+            vol.__test_empty_node_cache();
+            STALL_YIELD.store(true, Ordering::Release);
+            let mut finished = false;
+            {
+                let mut op = fuzz_op(kind, &file, &new);
+                let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+                for _ in 0..n {
+                    if let core::task::Poll::Ready(result) = op.as_mut().poll(&mut cx) {
+                        if result.is_err() {
+                            return fail("the undisturbed operation failed", kind, n);
+                        }
+                        finished = true;
+                        break;
+                    }
+                }
+                // Dropped here, mid-flight unless it finished.
+            }
+            STALL_YIELD.store(false, Ordering::Release);
+            cases += 1;
+            match poll_once(vol.sync_to_disk()) {
+                Some(Ok(())) => {}
+                Some(Err(_)) => return fail("the commit after the drop failed", kind, n),
+                None => return fail("the commit after the drop never finished", kind, n),
+            }
+            if vol.is_core_read_only() {
+                return fail("the drop left the filesystem read-only", kind, n);
+            }
+            if !matches!(poll_once(crate::rw_gate::check_trees(&vol)), Some(Ok(()))) {
+                return fail(
+                    "the tree checks refused the filesystem after the drop",
+                    kind,
+                    n,
+                );
+            }
+            // A later operation and commit still work.
+            if !matches!(poll_once(file.write(512 * 1024, &new)), Some(Ok(_)))
+                || !matches!(poll_once(vol.sync_to_disk()), Some(Ok(())))
+            {
+                return fail("a write and commit after the drop failed", kind, n);
+            }
+            drop(file);
+            drop(vol);
+            // What reached the device mounts and reads back sanely.
+            let again = match poll_once(BtrfsVolume::mount(Arc::clone(&device), DomainId::DRIVER_0))
+            {
+                Some(Ok(vol)) => vol,
+                _ => return fail("the device did not mount again after the drop", kind, n),
+            };
+            let reread = match poll_once(again.root().lookup_async("fuzz.dat")) {
+                Some(Ok(file)) => file,
+                _ => return fail("the file was lost after the drop", kind, n),
+            };
+            let mut head = alloc::vec![0u8; 4096];
+            match poll_once(reread.read(0, &mut head)) {
+                Some(Ok(4096)) if head.iter().all(|&b| b == 0x11 || b == 0x22) => {}
+                _ => {
+                    return fail(
+                        "the file's bytes are neither old nor new after the drop",
+                        kind,
+                        n,
+                    )
+                }
+            }
+            if finished {
+                break;
+            }
+        }
+    }
+    if cases == 0 {
+        return TestResult::Fail("the fuzz ran no case");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/race",
+    smoke_btrfs_dropped_write_path_future_leaves_the_commit_clean
+);
