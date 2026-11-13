@@ -6883,9 +6883,7 @@ fn idle_wait(next_deadline: Option<u64>) {
 #[inline(never)]
 fn bridge_idle_wait(awake: &WakeCell) {
     let cpu = narf_lib::percpu::current_cpu();
-    if cpu >= BRIDGE_HALTED.len()
-        || !narf_time::tick_reliable()
-        || !narf_arch::interrupts_enabled()
+    if cpu >= BRIDGE_HALTED.len() || !narf_time::tick_reliable() || !narf_arch::interrupts_enabled()
     {
         idle_wait(None);
         return;
@@ -6901,8 +6899,7 @@ fn bridge_idle_wait(awake: &WakeCell) {
     BRIDGE_HALTED[cpu].store(true, Ordering::SeqCst);
     CPU_HALTED[cpu].store(true, Ordering::SeqCst);
     core::sync::atomic::fence(Ordering::SeqCst);
-    let woke =
-        awake.flag.load(Ordering::SeqCst) || NEED_RESCHED[cpu].swap(false, Ordering::SeqCst);
+    let woke = awake.flag.load(Ordering::SeqCst) || NEED_RESCHED[cpu].swap(false, Ordering::SeqCst);
     if !woke {
         // SAFETY: IRQs are masked (above) and the final check passed;
         // returns with IRQs masked.

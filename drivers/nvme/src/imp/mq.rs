@@ -779,7 +779,11 @@ impl IoQueue {
         slot.status.store(cqe.status, Ordering::Relaxed);
         slot.cmd_specific.store(cqe.cmd_specific, Ordering::Relaxed);
         slot.isr_completed.store(
-            if from_irq { narf_time::now_cycles().max(1) } else { 0 },
+            if from_irq {
+                narf_time::now_cycles().max(1)
+            } else {
+                0
+            },
             Ordering::Relaxed,
         );
         // Publish the status before the state the owner reads.
@@ -836,9 +840,8 @@ impl IoQueue {
                 if isr_at != 0 {
                     // The handler published it: how long did its wake take
                     // to reach us?
-                    let pickup_ns = narf_time::cycles_to_ns(
-                        narf_time::now_cycles().saturating_sub(isr_at),
-                    );
+                    let pickup_ns =
+                        narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(isr_at));
                     self.pickup_max_ns.fetch_max(pickup_ns, Ordering::Relaxed);
                     if pickup_ns > SLOW_PICKUP_NS {
                         self.slow_pickups.fetch_add(1, Ordering::Relaxed);
