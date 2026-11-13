@@ -209,7 +209,9 @@ fn clippy_args(
     selected: &[String],
     features: BTreeSet<String>,
 ) -> Vec<String> {
-    let mut args = ["clippy", "--locked", "--no-deps"]
+    // `--keep-going`: report every crate's lints in one run instead of
+    // stopping at the first crate that fails, so one pass lists all of them.
+    let mut args = ["clippy", "--locked", "--no-deps", "--keep-going"]
         .map(str::to_string)
         .to_vec();
     if let Some(target) = target {

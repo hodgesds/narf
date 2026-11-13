@@ -816,6 +816,10 @@ pub fn submit_async(
     }
 }
 
+/// A scatter-gather payload: the `(dma, len)` segments to chain, and the page
+/// list that keeps their frames allocated until the request completes.
+type SgPayload = (Vec<(u64, u32)>, Arc<narf_io::sg::PageList>);
+
 /// Future of [`submit_async`].
 pub struct Submit {
     q: Arc<BlkQueue>,
@@ -824,7 +828,7 @@ pub struct Submit {
     payload: Option<Arc<DmaBuffer>>,
     len: usize,
     /// Scatter-gather form: the segments and the page list that backs them.
-    segs: Option<(Vec<(u64, u32)>, Arc<narf_io::sg::PageList>)>,
+    segs: Option<SgPayload>,
     req: Option<Req>,
 }
 
