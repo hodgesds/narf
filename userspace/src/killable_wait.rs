@@ -69,10 +69,66 @@ fn fatal_signal_pending(task: u64) -> bool {
 static ABANDONED: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, usize>> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
 
-/// The killed task a detached operation polled on this CPU belongs to, 0
-/// when none is being polled.
-static ABANDONED_OWNER: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+/// Which killed task each scheduler task is finishing an operation for:
+/// `scheduler task → killed task`, set while that scheduler task polls an
+/// [`Abandoned`] operation.
+///
+/// Keyed by the task, as Linux keys "this task is dying" to the task itself
+/// (`fatal_signal_pending(current)`), never to the CPU. It used to be a
+/// per-CPU slot set around the poll, and whatever else ran on that CPU
+/// before the slot was restored — a poll that yielded or was preempted, a
+/// commit or writeback task — was taken for the killed task: every killable
+/// wait it started gave up at once, failing reads and commits nobody killed.
+static FINISHING_FOR: narf_lib::sync::IrqSafeSpinLock<alloc::collections::BTreeMap<u64, u64>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Entries in [`FINISHING_FOR`]; lets [`hook_current`] skip the lock when no
+/// abandoned operation is being polled anywhere.
+static FINISHING_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The scheduler task running on this CPU (0 outside any poll).
+fn current_scheduler_task() -> u64 {
+    narf_scheduler::current_task_id().raw()
+}
+
+/// The killed task scheduler task `poller` is finishing an operation for.
+fn finishing_for(poller: u64) -> Option<u64> {
+    if FINISHING_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    FINISHING_FOR.lock().get(&poller).copied()
+}
+
+/// Record that `poller` now finishes for `owner` (`Some`) or for nobody
+/// (`None`); returns what it was finishing for before.
+fn set_finishing_for(poller: u64, owner: Option<u64>) -> Option<u64> {
+    use core::sync::atomic::Ordering::AcqRel;
+    let mut map = FINISHING_FOR.lock();
+    let previous = match owner {
+        Some(owner) => map.insert(poller, owner),
+        None => map.remove(&poller),
+    };
+    match (previous.is_some(), owner.is_some()) {
+        (false, true) => {
+            FINISHING_COUNT.fetch_add(1, AcqRel);
+        }
+        (true, false) => {
+            FINISHING_COUNT.fetch_sub(1, AcqRel);
+        }
+        _ => {}
+    }
+    previous
+}
+
+/// Test access: run `body` as if scheduler task `poller` were finishing an
+/// operation for killed task `owner`.
+#[allow(dead_code)]
+pub(crate) fn __test_finishing_for<R>(poller: u64, owner: u64, body: impl FnOnce() -> R) -> R {
+    let previous = set_finishing_for(poller, Some(owner));
+    let result = body();
+    set_finishing_for(poller, previous);
+    result
+}
 
 /// Killed operations still finishing in the scheduler (for tests).
 #[cfg(feature = "kernel-test")]
@@ -82,15 +138,16 @@ pub(crate) fn abandoned_in_flight() -> usize {
 
 /// The `current` hook of [`narf_filesystem::killable`]: inside a detached
 /// operation, the killed task it belongs to.
+///
+/// [`hook_owner`] is its `owner` hook: the killed task alone, 0 for a task
+/// running its own operation.
 pub(crate) fn hook_current() -> u64 {
-    let cpu = narf_lib::percpu::current_cpu();
-    match ABANDONED_OWNER
-        .get(cpu)
-        .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed))
-    {
-        0 => crate::handlers::current_task_id(),
-        owner => owner,
-    }
+    finishing_for(current_scheduler_task()).unwrap_or_else(crate::handlers::current_task_id)
+}
+
+/// The `owner` hook of [`narf_filesystem::killable`].
+pub(crate) fn hook_owner() -> u64 {
+    finishing_for(current_scheduler_task()).unwrap_or(0)
 }
 
 /// The `pending` hook of [`narf_filesystem::killable`]: a fatal signal is
@@ -119,14 +176,14 @@ impl Future for Abandoned {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        let slot = ABANDONED_OWNER.get(narf_lib::percpu::current_cpu());
-        let previous = slot.map_or(0, |s| {
-            s.swap(this.task, core::sync::atomic::Ordering::Relaxed)
-        });
+        // The identity belongs to the scheduler task doing the poll, and
+        // only to it: another task that runs on this CPU meanwhile is
+        // itself. The poll begins and ends in the same task even if it
+        // moves CPUs in between.
+        let poller = current_scheduler_task();
+        let previous = set_finishing_for(poller, Some(this.task));
         let result = this.op.as_mut().poll(cx);
-        if let Some(slot) = slot {
-            slot.store(previous, core::sync::atomic::Ordering::Relaxed);
-        }
+        set_finishing_for(poller, previous);
         result
     }
 }

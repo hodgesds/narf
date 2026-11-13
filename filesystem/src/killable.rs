@@ -22,6 +22,19 @@ pub struct KillHooks {
     pub arm: fn(u64, Waker),
     /// Forget the waker [`KillHooks::arm`] registered for task `id`.
     pub disarm: fn(u64),
+    /// The killed task whose operation the *current scheduler task* is
+    /// finishing after its owner was killed, 0 when it is running its own.
+    /// Task-local: never inferred from the CPU.
+    pub owner: fn() -> u64,
+}
+
+/// The task the running operation belongs to when it was handed off from a
+/// killed task ([`KillHooks::owner`]), 0 otherwise. A filesystem that keys
+/// state to the task that started an operation (btrfs's transaction gate)
+/// uses this so the handed-off operation is still recognised as that
+/// task's.
+pub fn operation_owner() -> u64 {
+    hooks().map_or(0, |h| (h.owner)())
 }
 
 static HOOKS: AtomicPtr<KillHooks> = AtomicPtr::new(core::ptr::null_mut());
