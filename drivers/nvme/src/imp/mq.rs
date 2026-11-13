@@ -8,16 +8,19 @@
 //! held only to walk fresh CQEs. Nothing here is held across an `.await`:
 //! a waiter owns a tag, not the queue.
 //!
-//! Completions are consumed by whoever notices them first — the queue's
-//! MSI-X handler ([`isr`], Linux `nvme_irq` → `nvme_process_cq`), or any
-//! waiter that sees a fresh phase bit at the CQ head (the polled path,
-//! Linux `nvme_poll`, which is also the lost-interrupt fallback and the
-//! only path on a queue created without a vector). Either way
-//! [`IoQueue::process_cq`] matches each CQE to its command id, publishes
-//! the status in the command's slot and wakes the owner by reference; the
-//! owner reaps the slot — drops the PRP page back to the pool, releases
-//! its hold on the payload, returns the tag — in process context, never
-//! in the interrupt.
+//! Completions are consumed as `nvme-pci` consumes them. On an IRQ-driven
+//! queue only the queue's MSI-X handler ([`isr`], Linux `nvme_irq` →
+//! `nvme_process_cq`) reaps the CQ; a waiter sleeps until the handler
+//! wakes it and never looks at the CQ on its own — a lost or undelivered
+//! interrupt therefore surfaces at the command's timeout (below), loudly,
+//! instead of as a silent slowdown. On a queue created without a vector
+//! (the polled fallback, Linux's `poll_queues`) the waiter reaps
+//! (`nvme_poll`), re-polling cooperatively until its completion lands.
+//! Either way [`IoQueue::process_cq`] matches each CQE to its command id,
+//! publishes the status in the command's slot and wakes the owner by
+//! reference; the owner reaps the slot — drops the PRP page back to the
+//! pool, releases its hold on the payload, returns the tag — in process
+//! context, never in the interrupt.
 //!
 //! A command whose owner went away while it was in flight (its future was
 //! dropped) is *abandoned*, not freed: the device may still read or write
@@ -28,10 +31,12 @@
 //! Timeouts follow blk-mq: one timer per queue (`blk_rq_timed_out_timer`),
 //! armed for the earliest outstanding deadline, whose expiry marks every
 //! expired command and wakes its owner (`blk_mq_timeout_work` →
-//! `nvme_timeout`). The owner decides what the timeout means — a last
-//! look at the CQ, then the controller reset + replay the block entry
-//! points perform — exactly as before, but no waiter polls a deadline of
-//! its own on the hot path.
+//! `nvme_timeout`). The owner then does what `nvme_timeout` does, in its
+//! order: "did we miss an interrupt?" — one poll of the CQ; a completion
+//! found there finishes the command with the warning `I/O tag … QID …
+//! timeout, completion polled` and a per-queue `irq_missed` count;
+//! otherwise the controller reset + replay the block entry points
+//! perform. No waiter polls a deadline of its own on the hot path.
 //!
 //! Teardown ([`IoQueue::teardown`], Linux `nvme_suspend_queue` +
 //! `nvme_cancel_request`) quiesces the queue under the submission lock,
@@ -44,9 +49,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::future::Future;
 use core::mem::ManuallyDrop;
-use core::pin::Pin;
 use core::sync::atomic::{
     compiler_fence, AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
     Ordering,
@@ -74,10 +77,11 @@ pub fn io_queue_depth(mqes: u16) -> u16 {
     (mqes as u32 + 1).clamp(IO_QUEUE_DEPTH_MIN as u32, IO_QUEUE_DEPTH_MAX as u32) as u16
 }
 
-/// How long one wait may park before the CQ is checked regardless of
-/// whether the queue's vector fired: the phase-poll fallback for a lost or
-/// never-delivered MSI, and the only clock on a polled queue.
-pub const CQ_POLL_SLICE_MS: u64 = 250;
+/// An owner that picks up an ISR-published completion later than this is
+/// a slow pickup: the handler ran, but its wake took this long to reach
+/// the waiter (a lost IPI, a CPU asleep through its kick). Counted per
+/// queue for the boot diagnostics (`/proc/narf/nvme_queues`).
+pub const SLOW_PICKUP_NS: u64 = 10_000_000;
 
 /// Handler name under which every queue's ISR is installed.
 const ISR_NAME: &str = "nvme";
@@ -150,6 +154,10 @@ struct CmdSlot {
     deadline_ns: AtomicU64,
     /// The vector's `fire_count` at posting, for the timeout report.
     fires_at_submit: AtomicU64,
+    /// `now_cycles()` when the ISR published this command's completion; 0
+    /// when it was reaped from process context. The owner's pickup
+    /// latency is measured against it.
+    isr_completed: AtomicU64,
     waker: IrqSafeSpinLock<Option<Waker>>,
     res: IrqSafeSpinLock<Option<CmdResources>>,
 }
@@ -167,6 +175,7 @@ impl CmdSlot {
             started: AtomicU64::new(0),
             deadline_ns: AtomicU64::new(u64::MAX),
             fires_at_submit: AtomicU64::new(0),
+            isr_completed: AtomicU64::new(0),
             waker: IrqSafeSpinLock::new(None),
             res: IrqSafeSpinLock::new(None),
         }
@@ -256,11 +265,48 @@ pub struct IoQueue {
     /// Diagnostics: handler invocations, completions matched to a command.
     isr_runs: AtomicU64,
     reaped: AtomicU64,
+    /// Of `reaped`, how many the ISR published and how many a
+    /// process-context poll did (a polled queue's waiter, a sync path's
+    /// spin, or the timeout's one look).
+    reaped_isr: AtomicU64,
+    reaped_poll: AtomicU64,
+    /// Completions of an IRQ-driven queue found only by the timeout's
+    /// poll: the interrupt was missed (Linux "timeout, completion polled").
+    irq_missed: AtomicU64,
+    /// ISR-published completions the owner picked up more than
+    /// [`SLOW_PICKUP_NS`] after the handler ran, and the slowest pickup.
+    slow_pickups: AtomicU64,
+    pickup_max_ns: AtomicU64,
+    /// Where the queue's interrupt is routed: MSI-X table entry and the
+    /// APIC ID the entry targets (`u32::MAX` = not an MSI-X queue).
+    msix_entry: AtomicU32,
+    target_apic: AtomicU32,
     /// Completions whose command id matched no in-flight command.
     strays: AtomicU64,
     /// ISR registration: the leaked `Arc` the cookie points at.
     isr_cookie: AtomicU64,
     timer: Box<QueueTimer>,
+}
+
+/// A queue's completion-path counters, for the boot log and
+/// `/proc/narf/nvme_queues`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueueStats {
+    pub qid: u16,
+    pub depth: u16,
+    pub vector: Option<u8>,
+    /// MSI-X table entry and target APIC ID (`None` on a polled queue).
+    pub msix_entry: Option<u16>,
+    pub target_apic: Option<u32>,
+    pub posted: u64,
+    pub in_flight: usize,
+    pub isr_runs: u64,
+    pub reaped_isr: u64,
+    pub reaped_poll: u64,
+    pub irq_missed: u64,
+    pub slow_pickups: u64,
+    pub pickup_max_ns: u64,
+    pub strays: u64,
 }
 
 impl core::fmt::Debug for IoQueue {
@@ -339,6 +385,13 @@ impl IoQueue {
             posted: AtomicU64::new(0),
             isr_runs: AtomicU64::new(0),
             reaped: AtomicU64::new(0),
+            reaped_isr: AtomicU64::new(0),
+            reaped_poll: AtomicU64::new(0),
+            irq_missed: AtomicU64::new(0),
+            slow_pickups: AtomicU64::new(0),
+            pickup_max_ns: AtomicU64::new(0),
+            msix_entry: AtomicU32::new(u32::MAX),
+            target_apic: AtomicU32::new(u32::MAX),
             strays: AtomicU64::new(0),
             isr_cookie: AtomicU64::new(0),
             timer: Box::new(QueueTimer {
@@ -365,6 +418,52 @@ impl IoQueue {
         let cookie = Arc::into_raw(Arc::clone(self)) as u64;
         self.isr_cookie.store(cookie, Ordering::Release);
         narf_interrupts::install_handler_named(v, ISR_NAME, cookie, isr);
+    }
+
+    /// Record where this queue's interrupt is routed (MSI-X table entry
+    /// `entry`, targeting APIC ID `apic`), for the boot log and the
+    /// `/proc` counters.
+    pub fn set_irq_route(&self, entry: u16, apic: u32) {
+        self.msix_entry.store(entry as u32, Ordering::Relaxed);
+        self.target_apic.store(apic, Ordering::Relaxed);
+    }
+
+    /// The queue's completion-path counters.
+    pub fn stats(&self) -> QueueStats {
+        let entry = self.msix_entry.load(Ordering::Relaxed);
+        let apic = self.target_apic.load(Ordering::Relaxed);
+        QueueStats {
+            qid: self.qid,
+            depth: self.depth,
+            vector: self.vector,
+            msix_entry: (entry != u32::MAX).then_some(entry as u16),
+            target_apic: (apic != u32::MAX).then_some(apic),
+            posted: self.posted.load(Ordering::Relaxed),
+            in_flight: self.in_flight(),
+            isr_runs: self.isr_runs.load(Ordering::Relaxed),
+            reaped_isr: self.reaped_isr.load(Ordering::Relaxed),
+            reaped_poll: self.reaped_poll.load(Ordering::Relaxed),
+            irq_missed: self.irq_missed.load(Ordering::Relaxed),
+            slow_pickups: self.slow_pickups.load(Ordering::Relaxed),
+            pickup_max_ns: self.pickup_max_ns.load(Ordering::Relaxed),
+            strays: self.strays(),
+        }
+    }
+
+    /// Completions of this IRQ-driven queue that only the timeout's poll
+    /// found (the interrupt was missed).
+    pub fn irq_missed(&self) -> u64 {
+        self.irq_missed.load(Ordering::Relaxed)
+    }
+
+    /// Completions the ISR published.
+    pub fn reaped_isr(&self) -> u64 {
+        self.reaped_isr.load(Ordering::Relaxed)
+    }
+
+    /// Completions a process-context poll published.
+    pub fn reaped_poll(&self) -> u64 {
+        self.reaped_poll.load(Ordering::Relaxed)
     }
 
     /// Commands at the device right now.
@@ -679,6 +778,10 @@ impl IoQueue {
         };
         slot.status.store(cqe.status, Ordering::Relaxed);
         slot.cmd_specific.store(cqe.cmd_specific, Ordering::Relaxed);
+        slot.isr_completed.store(
+            if from_irq { narf_time::now_cycles().max(1) } else { 0 },
+            Ordering::Relaxed,
+        );
         // Publish the status before the state the owner reads.
         if slot
             .state
@@ -687,6 +790,11 @@ impl IoQueue {
         {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
             self.reaped.fetch_add(1, Ordering::Relaxed);
+            if from_irq {
+                self.reaped_isr.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.reaped_poll.fetch_add(1, Ordering::Relaxed);
+            }
             slot.wake();
             return None;
         }
@@ -724,6 +832,22 @@ impl IoQueue {
                 // Late when its budget ran out before it was found — by the
                 // timer's mark or, where no timer wheel runs, by the clock.
                 let late = self.deadline_passed(tag);
+                let isr_at = slot.isr_completed.load(Ordering::Relaxed);
+                if isr_at != 0 {
+                    // The handler published it: how long did its wake take
+                    // to reach us?
+                    let pickup_ns = narf_time::cycles_to_ns(
+                        narf_time::now_cycles().saturating_sub(isr_at),
+                    );
+                    self.pickup_max_ns.fetch_max(pickup_ns, Ordering::Relaxed);
+                    if pickup_ns > SLOW_PICKUP_NS {
+                        self.slow_pickups.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if late && self.vector.is_some() {
+                    // Linux `nvme_timeout`: "Did we miss an interrupt?" — the
+                    // CQE was there, only the timeout's poll found it.
+                    self.irq_missed.fetch_add(1, Ordering::Relaxed);
+                }
                 if late {
                     super::note_late_completion(
                         self.bar0.phys.raw(),
@@ -731,6 +855,7 @@ impl IoQueue {
                         slot.opcode.load(Ordering::Relaxed),
                         tag,
                         slot.started.load(Ordering::Relaxed),
+                        isr_at == 0 && self.vector.is_some(),
                     );
                 }
                 self.reap(tag, true);
@@ -783,7 +908,7 @@ impl IoQueue {
             let _ = write!(
                 w,
                 "nvme: queue {}: sq {:#x} cq {:#x} depth {} in_flight {} free_tags {} isr_runs {} \
-                 reaped {} strays {}; cq[0..4] =",
+                 reaped {} (isr {} poll {} irq_missed {} slow_pickups {}) strays {}; cq[0..4] =",
                 self.qid,
                 self.sq_buf.dma_addr().raw(),
                 self.cq_buf.dma_addr().raw(),
@@ -792,6 +917,10 @@ impl IoQueue {
                 self.free_tags(),
                 self.isr_runs.load(Ordering::Relaxed),
                 self.reaped.load(Ordering::Relaxed),
+                self.reaped_isr.load(Ordering::Relaxed),
+                self.reaped_poll.load(Ordering::Relaxed),
+                self.irq_missed.load(Ordering::Relaxed),
+                self.slow_pickups.load(Ordering::Relaxed),
                 self.strays(),
             );
             for i in 0..4u16.min(self.depth) {
@@ -899,6 +1028,7 @@ impl IoQueue {
         slot.late.store(false, Ordering::Relaxed);
         slot.started.store(0, Ordering::Relaxed);
         slot.deadline_ns.store(u64::MAX, Ordering::Relaxed);
+        slot.isr_completed.store(0, Ordering::Relaxed);
         slot.state.store(FREE, Ordering::Release);
         self.free_tag(tag);
     }
@@ -1017,16 +1147,7 @@ fn timeout_timer(r: TimerRef) {
 pub struct Cmd {
     queue: Arc<IoQueue>,
     id: CmdId,
-    /// The wait armed for the next reason to look at the CQ: the vector
-    /// firing or the poll slice elapsing (IRQ queue), or the slice alone
-    /// (polled queue).
-    wait: Option<CmdWait>,
     done: bool,
-}
-
-enum CmdWait {
-    Irq(narf_time::Timeout<narf_interrupts::WaitForIrq>),
-    Slice(narf_time::SleepUntil),
 }
 
 impl core::fmt::Debug for Cmd {
@@ -1043,7 +1164,6 @@ impl Cmd {
         Self {
             queue,
             id,
-            wait: None,
             done: false,
         }
     }
@@ -1056,19 +1176,18 @@ impl Cmd {
         &self.queue
     }
 
-    fn arm(&mut self) {
-        let slice = narf_time::Deadline::after_ms(CQ_POLL_SLICE_MS);
-        self.wait = Some(match self.queue.vector {
-            Some(v) => CmdWait::Irq(narf_interrupts::wait_for_irq_until(v, slice)),
-            None => CmdWait::Slice(narf_time::sleep_until(slice)),
-        });
-    }
-
     /// Poll for the outcome. Pending while the command is in flight and
     /// its budget has not run out.
+    ///
+    /// On an IRQ-driven queue the waiter does not touch the CQ: the
+    /// queue's handler reaps and wakes it (Linux `nvme_irq`), and the
+    /// queue's timeout timer wakes it at the deadline, where
+    /// [`IoQueue::poll_cmd`] does `nvme_timeout`'s one poll. On a polled
+    /// queue the waiter reaps (`nvme_poll`) and asks to be polled again at
+    /// once — a cooperative busy-poll, as `blk_poll` with `cond_resched`.
     pub fn poll_outcome(&mut self, cx: &mut Context<'_>) -> Poll<CmdOutcome> {
         let tag = self.id.tag;
-        // Two rounds at most: one before and one after a fresh CQ look.
+        // Two rounds at most: one before and one after the registration.
         for round in 0..3 {
             if let Some(o) = self.queue.poll_cmd(tag) {
                 if o != CmdOutcome::TimedOut {
@@ -1082,41 +1201,29 @@ impl Cmd {
                 self.queue.register_waker(tag, cx.waker());
                 continue;
             }
-            // Anything fresh at the head is reaped here, by this waiter
-            // (the polled path / lost-interrupt fallback).
+            if self.queue.vector.is_some() {
+                // IRQ-driven: the handler or the timeout timer wakes us.
+                return Poll::Pending;
+            }
+            // Polled queue: anything fresh at the head is reaped here, by
+            // this waiter.
             if self.queue.cq_has_fresh() {
                 self.queue.process_cq(false);
                 continue;
             }
-            // Arm BEFORE the final check, so an interrupt landing between
-            // the check and the suspension resolves the wait at once.
-            if self.wait.is_none() {
-                self.arm();
-            }
-            let fired = match self.wait.as_mut() {
-                Some(CmdWait::Irq(w)) => Pin::new(w).poll(cx).is_ready(),
-                Some(CmdWait::Slice(s)) => Pin::new(s).poll(cx).is_ready(),
-                None => false,
-            };
-            if fired {
-                // The vector fired or the slice ran out: look again with a
-                // fresh wait armed.
-                self.wait = None;
-                if round < 2 {
-                    continue;
-                }
-                // Bounded: yield once and come back.
-                cx.waker().wake_by_ref();
-            }
+            // Nothing yet: come back at the next round (the executor runs
+            // its other tasks in between; a `block_on` bridge re-polls).
+            cx.waker().wake_by_ref();
             return Poll::Pending;
         }
         Poll::Pending
     }
 
     /// Synchronous wait for the outcome, for the gate-held paths (sync
-    /// wrappers, Flush/DSM under `&mut Controller`). Spins responsively;
-    /// never holds a lock. `TimedOut` leaves the command abandoned in the
-    /// slot.
+    /// wrappers, Flush/DSM under `&mut Controller`) — the polled wait
+    /// of early boot and of the paths that may not sleep. Spins
+    /// responsively on the CQ itself whatever the queue's kind; never
+    /// holds a lock. `TimedOut` leaves the command abandoned in the slot.
     pub fn wait_sync(mut self) -> CmdOutcome {
         let tag = self.id.tag;
         loop {
@@ -1130,16 +1237,13 @@ impl Cmd {
                 return o;
             }
             let q = Arc::clone(&self.queue);
-            let v = q.vector;
-            let baseline = v.map(narf_interrupts::fire_count);
-            let slice = narf_time::Deadline::after_ms(CQ_POLL_SLICE_MS);
+            // Bounded by the command's own deadline (`poll_cmd_peek` reports
+            // it); the outer deadline here only keeps the spin finite should
+            // the clock and the slot disagree.
+            let bound = narf_time::Deadline::after_ms(super::io_timeout_ms().max(1));
             let _ = narf_scheduler::responsive_spin_until(
-                || {
-                    q.cq_has_fresh()
-                        || q.poll_cmd_peek(tag)
-                        || v.is_some_and(|v| Some(narf_interrupts::fire_count(v)) != baseline)
-                },
-                slice,
+                || q.cq_has_fresh() || q.poll_cmd_peek(tag),
+                bound,
             );
             if self.queue.cq_has_fresh() {
                 self.queue.process_cq(false);

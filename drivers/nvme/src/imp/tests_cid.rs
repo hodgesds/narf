@@ -684,11 +684,16 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
     // on the same queue, or another queue sharing the vector, bumps it
     // too. The async wait must go round again — the pre-fix path declared
     // the completion lost on the spot (controller dead,
-    // `CompletionTimeout`). And a completion that arrives with NO
-    // interrupt must still be found, by the wait's poll slice, long
-    // before the command's budget.
+    // `CompletionTimeout`). And a completion whose interrupt is never
+    // delivered is NOT found early by some poll slice (Linux has none; it
+    // hid a missed interrupt as a silent slowdown): the waiter stays
+    // pending until the command's timeout, where `nvme_timeout`'s one
+    // poll finds it — "timeout, completion polled" — counted in the
+    // queue's `irq_missed`, without a command timeout or a dead
+    // controller.
     use core::future::Future;
     use core::task::{Context, Poll};
+    let budget = ShortIoBudget::set(60);
     let Some(mut fx) = fake_async_controller() else {
         return TestResult::Fail("fake async controller setup failed");
     };
@@ -696,6 +701,11 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
     let cq_io = fx.fake.cq_io;
     let buf_ptr: *const narf_io::DmaBuffer = &fx.fake._id_page;
     let timeouts0 = super::command_timeouts();
+    let late0 = super::late_completions();
+    let queue = fx.fake.ctrl.io_queues()[0].clone();
+    if queue.irq_missed() != 0 {
+        return TestResult::Fail("a fresh queue starts with interrupts missed");
+    }
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     let outcome = {
@@ -722,7 +732,21 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
         // Our completion, with no interrupt at all.
         // SAFETY: `cq_io` is the fake queue's live CQ page; slot 0.
         unsafe { stage_cqe(cq_io, 0, 0, 1, OWN_SENTINEL) };
-        let give_up = narf_time::Deadline::after_ms(super::ASYNC_CQ_POLL_MS * 8);
+        // Half the budget: still pending — nothing but the interrupt or
+        // the timeout ends an IRQ queue's wait.
+        let half = narf_time::Deadline::after_ms(30);
+        loop {
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                return TestResult::Fail(
+                    "a completion without an interrupt was polled before the timeout",
+                );
+            }
+            if half.expired() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let give_up = narf_time::Deadline::after_ms(2_000);
         loop {
             if let Poll::Ready(r) = fut.as_mut().poll(&mut cx) {
                 break Some(r);
@@ -733,6 +757,7 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
             core::hint::spin_loop();
         }
     };
+    drop(budget);
     match outcome {
         Some(Ok(())) => {}
         Some(Err(_)) => return TestResult::Fail("async read failed although its CQE arrived"),
@@ -740,6 +765,12 @@ fn smoke_nvme_async_spurious_wake_is_not_a_lost_completion() -> TestResult {
     }
     if fx.fake.ctrl.is_dead() || super::command_timeouts() != timeouts0 {
         return TestResult::Fail("a completed async command left the controller dead / timed out");
+    }
+    if super::late_completions() != late0 + 1 {
+        return TestResult::Fail("the timeout's polled completion was not logged as one");
+    }
+    if queue.irq_missed() != 1 || queue.reaped_isr() != 0 || queue.reaped_poll() != 1 {
+        return TestResult::Fail("the missed interrupt was not counted on the queue");
     }
     TestResult::Pass
 }
@@ -749,11 +780,13 @@ kernel_test_in!(
 );
 
 fn smoke_nvme_async_timeout_checks_cq_before_failing() -> TestResult {
-    // Polling before the deadline: "not yet" is not an error and a stray
-    // at the head is consumed without ending the command. At the deadline
-    // the CQ is looked at one last time: a completion sitting there is
-    // taken (late completion, no timeout); only an empty CQ makes the
-    // command lost (timeout counted, controller dead).
+    // Polling before the deadline: "not yet" is not an error, and an
+    // IRQ queue's waiter does not touch the CQ — a stray at the head stays
+    // there (the handler or the timeout's poll consumes it, Linux
+    // `nvme_timeout`). At the deadline the CQ is looked at one last time:
+    // the stray is consumed and counted, and a completion sitting behind
+    // it is taken (late completion, no timeout); only an empty CQ makes
+    // the command lost (timeout counted, controller dead).
     use core::future::Future;
     use core::task::{Context, Poll};
     let budget = ShortIoBudget::set(40);
@@ -784,8 +817,8 @@ fn smoke_nvme_async_timeout_checks_cq_before_failing() -> TestResult {
         if fut.as_mut().poll(&mut cx).is_ready() {
             return TestResult::Fail("a stray at the head ended the command");
         }
-        if super::stray_cqe_drops() != strays0 + 1 {
-            return TestResult::Fail("the stray was not consumed and counted");
+        if super::stray_cqe_drops() != strays0 {
+            return TestResult::Fail("an IRQ queue's waiter polled the CQ before its deadline");
         }
         // SAFETY: as above.
         unsafe { stage_cqe(cq_io, 1, 0, 1, OWN_SENTINEL) };
@@ -803,6 +836,9 @@ fn smoke_nvme_async_timeout_checks_cq_before_failing() -> TestResult {
         || ctrl.is_dead()
     {
         return TestResult::Fail("the last look's completion was not a late completion");
+    }
+    if super::stray_cqe_drops() != strays0 + 1 {
+        return TestResult::Fail("the timeout's poll did not consume and count the stray");
     }
 
     // Command 2 (tag 1): nothing ever arrives.

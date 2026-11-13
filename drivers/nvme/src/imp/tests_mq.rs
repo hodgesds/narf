@@ -296,8 +296,52 @@ fn install_qemu_controller() -> Option<Result<(), &'static str>> {
     None
 }
 
+/// No QEMU NVMe controller off x86_64: nothing to install or tear down.
+#[cfg(not(target_arch = "x86_64"))]
+struct InstalledQemu;
+
+#[cfg(not(target_arch = "x86_64"))]
+impl InstalledQemu {
+    fn tear_down(self) {}
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn install_qemu_controller_handle() -> Option<Result<InstalledQemu, &'static str>> {
+    None
+}
+
 #[cfg(target_arch = "x86_64")]
 fn install_qemu_controller() -> Option<Result<(), &'static str>> {
+    install_qemu_controller_handle().map(|r| r.map(|_| ()))
+}
+
+/// The installed controller of [`install_qemu_controller_handle`]: its
+/// instance and the device cap that lets a smoke stop it again.
+#[cfg(target_arch = "x86_64")]
+struct InstalledQemu {
+    instance: u32,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl InstalledQemu {
+    /// Stop the controller (CC.EN=0) and release its I/O queues' IDT
+    /// vectors. A smoke that installs a 16-queue controller and leaves it
+    /// behind costs the suite 16 of the IDT's free vectors; enough such
+    /// smokes and a later one that needs a vector (the fake IRQ-driven
+    /// controllers) finds none. The next smoke's install brings the device
+    /// up afresh, as every install here does.
+    fn tear_down(self) {
+        if let Some(slot) = super::slot_of(self.instance) {
+            if let Ok(mut ctrl) = super::acquire(slot) {
+                let _ = ctrl.disable_after_failure(&self.cap);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn install_qemu_controller_handle() -> Option<Result<InstalledQemu, &'static str>> {
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: kernel-test runs at boot with the allocator online and the
@@ -321,8 +365,8 @@ fn install_qemu_controller() -> Option<Result<(), &'static str>> {
     if ctrl.create_io_queues_preferred(&cap).is_err() {
         return Some(Err("create_io_queues_preferred failed"));
     }
-    super::install_controller(ctrl);
-    Some(Ok(()))
+    let instance = super::install_controller(ctrl);
+    Some(Ok(InstalledQemu { instance, cap }))
 }
 
 fn fill(buf: &DmaBuffer, seed: u8) {
@@ -805,4 +849,142 @@ fn smoke_nvme_mq_scatter_gather_round_trip_qemu() -> TestResult {
 kernel_test_in!(
     "drivers/nvme/mq",
     smoke_nvme_mq_scatter_gather_round_trip_qemu
+);
+
+// ── interrupt delivery to a waiter on another CPU (QEMU) ──────────
+
+/// State shared with the pinned waiter task of
+/// [`smoke_nvme_mq_irq_wakes_waiter_on_other_cpu_qemu`].
+static XCPU_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static XCPU_FAILS: AtomicUsize = AtomicUsize::new(0);
+static XCPU_MAX_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn smoke_nvme_mq_irq_wakes_waiter_on_other_cpu_qemu() -> TestResult {
+    // Every I/O queue's MSI-X entry targets CPU 0's APIC; a request is
+    // posted on the submitting CPU's queue. So a task on CPU k != 0 that
+    // awaits a read is completed by an ISR on CPU 0, which must wake it
+    // across CPUs — the shape of every userspace mount on the desktop,
+    // where it took 250 ms per request. With no poll slice left on an
+    // IRQ queue, the only ways a request ends are the interrupt's wake
+    // (fast) or the 30 s timeout: the test demands the former, from the
+    // queue's own counters (completions published by the ISR, none found
+    // by the timeout's poll, no slow pickups) and from the latency.
+    let qemu = match install_qemu_controller_handle() {
+        None => return TestResult::Skip("no QEMU NVMe controller"),
+        Some(Err(e)) => return TestResult::Fail(e),
+        Some(Ok(q)) => q,
+    };
+    let result = xcpu_irq_wake_body();
+    // Give the IDT its 16 vectors back (see `InstalledQemu::tear_down`).
+    qemu.tear_down();
+    result
+}
+
+fn xcpu_irq_wake_body() -> TestResult {
+    const N: usize = 12;
+    let (queues, any_polled) = super::with_controller(|c| {
+        (
+            c.io_queue_count(),
+            c.io_queues().iter().any(|q| q.vector.is_none()),
+        )
+    })
+    .unwrap_or((0, true));
+    if queues == 0 || any_polled {
+        return TestResult::Skip("I/O queues are polled (no MSI-X)");
+    }
+    let me = narf_lib::percpu::current_cpu();
+    let Some(other) =
+        (0..narf_lib::percpu::MAX_CPUS).find(|&c| c != me && narf_lib::smp::is_online(c as u32))
+    else {
+        return TestResult::Skip("no second online CPU");
+    };
+    let lba_bytes = super::with_controller(|c| c.lba_bytes as usize).unwrap_or(512);
+    let bytes = 4096.max(lba_bytes);
+    let blocks = (bytes / lba_bytes) as u32;
+    XCPU_DONE.store(false, Ordering::Release);
+    XCPU_FAILS.store(0, Ordering::Release);
+    XCPU_MAX_NS.store(0, Ordering::Release);
+    // The queue that CPU will use, with its counters before the run.
+    let qix = other % queues;
+    let before = super::with_controller(|c| c.io_queues()[qix].stats()).unwrap_or_default();
+    // SAFETY: APIC initialised; the queues' MSIs land in our IDT vectors.
+    unsafe { narf_arch::enable_interrupts() };
+    narf_scheduler::spawn_stackful_pinned(
+        async move {
+            let dev = super::NvmeBlockDevice;
+            for i in 0..N {
+                let Ok(buf) = alloc_coherent(bytes, DomainId::DRIVER_0) else {
+                    XCPU_FAILS.fetch_add(1, Ordering::AcqRel);
+                    break;
+                };
+                let cap = register_with_cap(buf);
+                let req = BlockRequest {
+                    op: BlockOp::Read,
+                    lba: 8192 + (i as u64) * blocks as u64,
+                    blocks,
+                    buffer: cap.derive().expect("derive"),
+                    qos: QosHint::Latency,
+                    user_tag: i as u64,
+                };
+                let t0 = narf_time::now_cycles();
+                let c = dev.submit(req).await;
+                let ns = narf_time::cycles_to_ns(narf_time::now_cycles().wrapping_sub(t0));
+                XCPU_MAX_NS.fetch_max(ns, Ordering::AcqRel);
+                narf_io::unregister(cap);
+                if c.result.is_err() {
+                    XCPU_FAILS.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            XCPU_DONE.store(true, Ordering::Release);
+        },
+        other as u32,
+    );
+    let finished = narf_scheduler::responsive_spin_until(
+        || XCPU_DONE.load(Ordering::Acquire),
+        narf_time::Deadline::after_ms(20_000),
+    );
+    // SAFETY: counterpart to the enable above.
+    unsafe { narf_arch::disable_interrupts() };
+    let after = super::with_controller(|c| c.io_queues()[qix].stats()).unwrap_or_default();
+    let max_us = XCPU_MAX_NS.load(Ordering::Acquire) / 1_000;
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "nvme-mq: {N} reads from CPU {other} on q{} (vec {:?} msix {:?} apic {:?}): \
+             max {max_us} us; isr {} poll {} irq_missed {} slow_pickups {} pickup_max {} us",
+            after.qid,
+            after.vector,
+            after.msix_entry,
+            after.target_apic,
+            after.reaped_isr.wrapping_sub(before.reaped_isr),
+            after.reaped_poll.wrapping_sub(before.reaped_poll),
+            after.irq_missed.wrapping_sub(before.irq_missed),
+            after.slow_pickups.wrapping_sub(before.slow_pickups),
+            after.pickup_max_ns / 1_000,
+        );
+    }
+    if !finished {
+        return TestResult::Fail("reads from another CPU did not finish in 20 s");
+    }
+    if XCPU_FAILS.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("a read from another CPU failed");
+    }
+    if after.reaped_isr.wrapping_sub(before.reaped_isr) < N as u64 {
+        return TestResult::Fail("completions were not published by the queue's ISR");
+    }
+    if after.irq_missed != before.irq_missed {
+        return TestResult::Fail("a completion was found only by the timeout's poll");
+    }
+    if after.slow_pickups != before.slow_pickups {
+        return TestResult::Fail("an ISR-published completion took >10 ms to reach its waiter");
+    }
+    if max_us > 50_000 {
+        return TestResult::Fail("a read awaited from another CPU took over 50 ms");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/nvme/mq",
+    smoke_nvme_mq_irq_wakes_waiter_on_other_cpu_qemu
 );

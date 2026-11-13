@@ -526,6 +526,10 @@ pub struct Controller {
     /// `io_queues[i]`. Empty for the polled-completion path
     /// (`create_io_queue`).
     io_irq_vectors: Vec<u8>,
+    /// How the I/O queues complete, for the boot log and
+    /// `/proc/narf/nvme_queues`: `"msix"` or `"polled (<why>)"` naming the
+    /// step at which the MSI-X path was given up.
+    io_queue_mode: &'static str,
     /// The gate-free data path's view of this controller: its queues and
     /// namespace geometry, rebuilt (`io_path_dirty`) whenever either
     /// changes and mirrored into the slot when the gate is released
@@ -895,7 +899,7 @@ impl Queue {
             self.advance_head(bar0);
             if cqe.is_for(cid) {
                 if expired {
-                    note_late_completion(bar0.phys.raw(), self.qid, opcode, cid, started);
+                    note_late_completion(bar0.phys.raw(), self.qid, opcode, cid, started, false);
                 }
                 return Ok(cqe);
             }
@@ -973,11 +977,6 @@ fn post_one_aer(admin: &mut Queue, bar0: &MmioRegion) {
         bar0.write32(admin.sq_db_off(), admin.sq_tail as u32);
     }
 }
-
-/// How long one wait of the async I/O path may park before the CQ is
-/// checked regardless of whether the queue's vector fired (see
-/// [`mq::CQ_POLL_SLICE_MS`]).
-pub const ASYNC_CQ_POLL_MS: u64 = mq::CQ_POLL_SLICE_MS;
 
 /// Subset of the IDENTIFY CONTROLLER page we currently parse.
 /// Layout per NVMe base spec §5.15.2.1.
@@ -1089,6 +1088,7 @@ impl Controller {
             io_path: None,
             io_path_dirty: false,
             io_irq_vectors: Vec::new(),
+            io_queue_mode: "none",
             bar0_region: None,
             identify: None,
             lba_bytes: 512,
@@ -2180,6 +2180,13 @@ impl Controller {
         q.install_isr();
         self.io_queues.push(q);
         self.io_path_dirty = true;
+        if !self.io_queue_mode.starts_with("polled") {
+            self.io_queue_mode = if irq_vec.is_some() {
+                "single queue on MSI-X"
+            } else {
+                "polled (single queue)"
+            };
+        }
         Ok(())
     }
 
@@ -2440,6 +2447,7 @@ impl Controller {
                     "nvme: Set Features (Number of Queues) failed ({e:?}); \
                      falling back to the single polled I/O queue"
                 );
+                self.io_queue_mode = "polled (Set Features Number of Queues failed)";
                 return Err(NvmeError::Msix);
             }
         };
@@ -2449,6 +2457,7 @@ impl Controller {
         // assumes.
         let granted = req.min(nsqa).min(ncqa);
         if granted == 0 {
+            self.io_queue_mode = "polled (controller granted no I/O queues)";
             return Err(NvmeError::Msix);
         }
 
@@ -2463,18 +2472,30 @@ impl Controller {
             Some(t) => t,
             None => match enable_msix(bus_dev_cap, &device) {
                 Ok(t) => t,
-                Err(_) => return Err(NvmeError::Msix),
+                Err(_) => {
+                    self.io_queue_mode = "polled (MSI-X capability unusable)";
+                    return Err(NvmeError::Msix);
+                }
             },
         };
         // I/O entries start at 1 when the table has room, leaving
         // entry 0 to the admin queue; a one-entry table shares
         // entry 0 (Linux `nvme_create_cq`).
         let io_base: u16 = if msix.size() <= 1 { 0 } else { 1 };
-        if msix.size() < granted + io_base {
+        // The MSI-X table bounds the queue count, it does not forbid the
+        // path: Linux `nvme_setup_irqs` takes however many vectors
+        // `pci_alloc_irq_vectors_affinity` can give (`result - 1` I/O
+        // queues on a table smaller than CPUs + 1). A drive whose table has
+        // fewer entries than this host has CPUs used to fall all the way
+        // back to the single polled queue here.
+        let granted = granted.min(msix.size().saturating_sub(io_base));
+        if granted == 0 {
+            self.io_queue_mode = "polled (MSI-X table has no I/O entry)";
             self.msix = Some(msix);
             return Err(NvmeError::Msix);
         }
         if msix.alloc_block(granted + io_base).is_err() {
+            self.io_queue_mode = "polled (MSI-X table entries already allocated)";
             self.msix = Some(msix);
             return Err(NvmeError::Msix);
         }
@@ -2505,6 +2526,7 @@ impl Controller {
         // `nvme_setup_io_queues` creates that many): run out after at
         // least one and that is the queue count.
         let mut granted = granted;
+        let target_apic = msix_target_apic_id();
         for i in 0..granted {
             let v = match narf_interrupts::vector::alloc() {
                 Ok(v) => v,
@@ -2513,6 +2535,7 @@ impl Controller {
                     break;
                 }
                 Err(_) => {
+                    self.io_queue_mode = "polled (no free IDT vector)";
                     self.msix = Some(msix);
                     return Err(NvmeError::Msix);
                 }
@@ -2521,11 +2544,12 @@ impl Controller {
             // MSI-X table exclusively (no concurrent writer); the
             // table-slot index was alloc_block'd above.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            if unsafe { msix.program_vector(io_base + i, msix_target_apic_id(), v) }.is_err() {
+            if unsafe { msix.program_vector(io_base + i, target_apic, v) }.is_err() {
                 let _ = narf_interrupts::vector::free(v);
                 for v in vectors {
                     let _ = narf_interrupts::vector::free(v);
                 }
+                self.io_queue_mode = "polled (MSI-X table entry could not be programmed)";
                 self.msix = Some(msix);
                 return Err(NvmeError::Msix);
             }
@@ -2541,6 +2565,7 @@ impl Controller {
             for v in vectors {
                 let _ = narf_interrupts::vector::free(v);
             }
+            self.io_queue_mode = "polled (MSI-X enable failed)";
             self.msix = Some(msix);
             return Err(NvmeError::Msix);
         }
@@ -2550,6 +2575,7 @@ impl Controller {
             let v = vectors[i as usize];
             match self.create_one_msix_queue(qid, io_base + i, admin_stride, v) {
                 Ok(q) => {
+                    q.set_irq_route(io_base + i, target_apic);
                     // The queue's handler goes in before the CQ can
                     // interrupt (the first completion is the first
                     // I/O's, after this returns).
@@ -2585,6 +2611,7 @@ impl Controller {
         self.io_irq_vectors = vectors;
         self.io_queues = queues;
         self.io_path_dirty = true;
+        self.io_queue_mode = "msix";
 
         Ok(granted as usize)
     }
@@ -2603,14 +2630,50 @@ impl Controller {
         &mut self,
         bus_dev_cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<usize, NvmeError> {
-        match self.create_io_queues_msix(bus_dev_cap, host_io_queue_pairs()) {
-            Ok(n) => Ok(n),
+        let n = match self.create_io_queues_msix(bus_dev_cap, host_io_queue_pairs()) {
+            Ok(n) => n,
             Err(NvmeError::Msix) => {
                 self.create_io_queue()?;
-                Ok(1)
+                1
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
+        };
+        self.log_io_queue_routes();
+        Ok(n)
+    }
+
+    /// The boot-log half of the completion-path self-diagnosis: how many
+    /// I/O queues exist, how they complete, and — for MSI-X queues — each
+    /// queue's IDT vector, MSI-X table entry and target APIC ID. Read with
+    /// the counters in `/proc/narf/nvme_queues` after some I/O, one boot
+    /// tells whether completions arrive by interrupt at all.
+    pub fn log_io_queue_routes(&self) {
+        use core::fmt::Write as _;
+        let mut w = narf_console::Writer;
+        let bdf = controller_bdf(self).map(ns::bdf_string).unwrap_or_default();
+        let _ = write!(
+            w,
+            "nvme: {bdf}: {} I/O queue(s), {}, depth {}, {} CPU(s):",
+            self.io_queues.len(),
+            self.io_queue_mode,
+            self.io_queues.first().map_or(0, |q| q.depth),
+            narf_lib::smp::cpu_count(),
+        );
+        for q in &self.io_queues {
+            let s = q.stats();
+            match (s.vector, s.msix_entry, s.target_apic) {
+                (Some(v), Some(e), Some(a)) => {
+                    let _ = write!(w, " q{} vec {v} msix {e} apic {a};", s.qid);
+                }
+                (Some(v), _, _) => {
+                    let _ = write!(w, " q{} vec {v};", s.qid);
+                }
+                _ => {
+                    let _ = write!(w, " q{} polled;", s.qid);
+                }
+            }
         }
+        let _ = writeln!(w);
     }
 
     /// Abort (§5.1, admin opcode 0x08): ask the controller to abort command
@@ -3982,14 +4045,35 @@ pub fn io_replays() -> u64 {
 /// queue means the interrupt and the phase check both failed to end the
 /// wait in time. Linux `nvme_timeout`: "I/O tag %d (%04x) QID %d timeout,
 /// completion polled".
-fn note_late_completion(bar: u64, qid: u16, opcode: u8, cid: u16, started: u64) {
+///
+/// `irq_missed` is the IRQ-driven-queue case: the handler never published
+/// this completion, so the interrupt was lost or never delivered. Logged
+/// with Linux's `nvme_timeout` text, rate-limited (the first 8, then every
+/// 64th) so a drive whose interrupts never arrive does not flood the
+/// console; the per-queue counts stay in `/proc/narf/nvme_queues`.
+fn note_late_completion(
+    bar: u64,
+    qid: u16,
+    opcode: u8,
+    cid: u16,
+    started: u64,
+    irq_missed: bool,
+) {
     use core::fmt::Write as _;
     let n = LATE_COMPLETIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 8 && n % 64 != 0 {
+        return;
+    }
     let ms = narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(started)) / 1_000_000;
+    let why = if irq_missed {
+        "interrupt missed"
+    } else {
+        "late completion"
+    };
     let _ = writeln!(
         narf_console::Writer,
-        "nvme: bar {bar:#x}: WARNING: opcode {opcode:#04x} cid {cid:#06x} queue {qid} timed out \
-         after {ms} ms, completion polled (late completion #{n})"
+        "nvme: bar {bar:#x}: I/O tag {cid} ({cid:04x}) QID {qid} timeout, completion polled \
+         (opcode {opcode:#04x}, after {ms} ms; {why} #{n})"
     );
 }
 
@@ -5541,7 +5625,66 @@ pub fn probe(
         });
     }
     register_controller(instance, device, cap);
+    register_queue_stats_proc();
     Ok(())
+}
+
+/// `/proc/narf/nvme_queues`: one line per I/O queue of every installed
+/// controller with its interrupt route and completion-path counters —
+/// the second half of the self-diagnosis `log_io_queue_routes` starts.
+/// An IRQ-driven queue whose `reaped_isr` stays 0 while `irq_missed`
+/// grows gets no interrupts; one whose `slow_pickups` grows gets them but
+/// its waiters are not woken promptly.
+#[derive(Debug)]
+struct NvmeQueuesProc;
+
+impl narf_filesystem::procfs::ProcFile for NvmeQueuesProc {
+    fn read(&self) -> Vec<u8> {
+        use core::fmt::Write as _;
+        let mut s = alloc::string::String::new();
+        let _ = writeln!(
+            s,
+            "# ctrl qid depth vector msix_entry target_apic posted in_flight isr_runs \
+             reaped_isr reaped_poll irq_missed slow_pickups pickup_max_us strays mode"
+        );
+        let n = CONTROLLERS.lock().len() as u32;
+        for instance in 0..n {
+            let _ = with_controller_at(instance, |c| {
+                for q in c.io_queues() {
+                    let st = q.stats();
+                    let _ = writeln!(
+                        s,
+                        "nvme{instance} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        st.qid,
+                        st.depth,
+                        st.vector.map_or(-1, i32::from),
+                        st.msix_entry.map_or(-1, i32::from),
+                        st.target_apic.map_or(-1i64, i64::from),
+                        st.posted,
+                        st.in_flight,
+                        st.isr_runs,
+                        st.reaped_isr,
+                        st.reaped_poll,
+                        st.irq_missed,
+                        st.slow_pickups,
+                        st.pickup_max_ns / 1_000,
+                        st.strays,
+                        c.io_queue_mode,
+                    );
+                }
+            });
+        }
+        s.into_bytes()
+    }
+}
+
+static QUEUE_STATS_PROC: AtomicBool = AtomicBool::new(false);
+
+fn register_queue_stats_proc() {
+    if QUEUE_STATS_PROC.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    narf_filesystem::procfs::register_proc("narf/nvme_queues", Arc::new(NvmeQueuesProc));
 }
 
 /// Publish controller `instance`: block devices (namespaces + partitions,

@@ -489,9 +489,21 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
 
     let dev = NvmeBlockDevice;
 
-    // Drive the future to completion by hand: the queued submit returns a
-    // pending future whose every poll looks at the CQ, so with no executor
-    // and no interrupts enabled a poll loop still finishes it.
+    // Drive the future to completion by hand. On an IRQ-driven queue only
+    // the queue's handler reaps the CQ (the waiter never polls it, as in
+    // Linux), so interrupts are enabled for the round trip: the handler
+    // publishes the completion and the poll loop below sees it.
+    struct IrqsOn;
+    impl Drop for IrqsOn {
+        fn drop(&mut self) {
+            // SAFETY: counterpart to the enable below; the kernel-test
+            // runner expects IRQs masked between tests.
+            unsafe { narf_arch::disable_interrupts() };
+        }
+    }
+    // SAFETY: APIC initialised; the queues' MSIs land in our IDT vectors.
+    unsafe { narf_arch::enable_interrupts() };
+    let _irqs = IrqsOn;
     fn poll_once<F: Future>(mut f: F) -> Option<F::Output> {
         unsafe fn no_clone(_: *const ()) -> RawWaker {
             RawWaker::new(core::ptr::null(), &VTAB)

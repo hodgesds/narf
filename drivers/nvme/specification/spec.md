@@ -72,12 +72,22 @@ multipath / fabrics (defer).
   completion lock held only to walk fresh CQEs. Nothing is held across an
   await. The host asks for one queue pair per CPU (`host_io_queue_pairs()`,
   Linux `nvme_setup_io_queues`), bounded by the controller's grant (Set
-  Features — Number of Queues), the MSI-X table and the IDT vector supply;
-  a CPU submits on queue `cpu % n`. Completions are reaped by whoever
-  notices them first — the queue's MSI-X handler (installed with the queue
-  as its cookie) or any waiter seeing a fresh phase bit — matched to their
-  command id, published in the slot and the owner woken by reference;
-  the owner reaps (frees) in process context. The gate-free data path is
+  Features — Number of Queues), the MSI-X table and the IDT vector supply
+  — each a *bound on the count*, as in Linux `nvme_setup_irqs`, never a
+  reason to fall back to polling (a table with fewer entries than CPUs
+  gives `size − 1` MSI-X queues); a CPU submits on queue `cpu % n`.
+  Completions are consumed as `nvme-pci` consumes them: on an IRQ-driven
+  queue only the queue's MSI-X handler (installed with the queue as its
+  cookie, Linux `nvme_irq` → `nvme_process_cq`) reaps the CQ, matching
+  CQEs to their command id, publishing in the slot and waking the owner by
+  reference; **a waiter on an IRQ-driven queue never looks at the CQ** (no
+  poll slice, no phase check of its own), so a lost or undelivered
+  interrupt is not a silent slowdown but surfaces at the command's
+  timeout (below). On a queue created without a vector (the polled
+  fallback, Linux `poll_queues`) the waiter reaps (`nvme_poll`) and asks to
+  be polled again at once — a cooperative busy-poll, `blk_poll` with
+  `cond_resched`. The owner reaps (frees) in process context either way.
+  The gate-free data path is
   `req::NvmeRequest`: one future per block request, posted on the
   submitting CPU's queue from an immutable snapshot of the controller's
   queues + geometry (`req::IoPath`, republished whenever the gate holder
@@ -107,13 +117,31 @@ multipath / fabrics (defer).
   **Timeouts are per queue, not per waiter** (blk-mq
   `blk_rq_timed_out_timer`): each `IoQueue` owns one `narf_time::timer::TimerList`
   armed for the earliest outstanding deadline; its expiry marks every
-  expired command and wakes its owner, who performs the last CQ look and
-  the reset + replay below. The sync wrappers (`NvmeNamespaceBlock::read`
-  / `write` through `sync_io`) stay polled: they post a tagged command on
-  the same queues and spin responsively for their own slot — no
-  `block_on` (they may be called from inside an executor poll), no IRQ
-  wait, and no longer one-in-flight per controller: the gate they hold
-  serialises the controller's scratch, not the device.
+  expired command and wakes its owner, who then does what Linux
+  `nvme_timeout` does, in its order: terminal states first (queue torn
+  down → `Reset`), then "did we miss an interrupt?" — **one** poll of the
+  CQ (`nvme_poll_irqdisable`); a completion found there completes the
+  command normally, logged `I/O tag <t> (<cid>) QID <q> timeout,
+  completion polled` (rate-limited: the first 8, then every 64th) and
+  counted in the queue's `irq_missed` (an IRQ-driven queue) as well as
+  the global `late_completions()`; otherwise the reset + replay below.
+  **Self-diagnosis of the completion path** (one boot answers "do this
+  drive's interrupts arrive?"): `create_io_queues_preferred` logs
+  `nvme: <bdf>: <n> I/O queue(s), <mode>, depth <d>, <cpus> CPU(s): q<i>
+  vec <v> msix <e> apic <a>; …` — `mode` is `msix` or `polled (<the step
+  that gave MSI-X up>)` — and `/proc/narf/nvme_queues` lists, per queue,
+  the same route with `isr_runs`, `reaped_isr`, `reaped_poll`,
+  `irq_missed`, `slow_pickups` (ISR-published completions the waiter
+  picked up more than 10 ms later: the interrupt arrived, the wake did
+  not reach the waiter) and `pickup_max_us` (`IoQueue::stats()`). The
+  sync wrappers (`NvmeNamespaceBlock::read` / `write` through `sync_io`)
+  stay polled — the paths that run before interrupts work or may not
+  sleep (early boot, panic, gate-held Flush/DSM): they post a tagged
+  command on the same queues and spin responsively on the CQ for their
+  own slot, bounded by the command's deadline — no `block_on` (they may
+  be called from inside an executor poll), no IRQ wait, and no longer
+  one-in-flight per controller: the gate they hold serialises the
+  controller's scratch, not the device.
   `controller_count()`, `instance_of(PcieAddr)`, `with_controller_at(instance,
   f)`, `admin_passthrough_at(instance, ..)`, `remove_controller(instance, cap)
   -> Option<bool>` (refuse I/O, unregister its block devices and node, then
@@ -290,12 +318,14 @@ multipath / fabrics (defer).
   reason to look at the CQ: `Ok(false)` — not yet — for a wake that
   was not this command's completion (another queue on a shared vector,
   the late MSI of an earlier polled Flush on the same queue), never a
-  lost completion. Each wait is bounded by `ASYNC_CQ_POLL_MS` (250 ms)
-  as well as the command's deadline (`IO_TIMEOUT_MS`, shared by all its
-  waits), so a completion whose interrupt never arrives is found by the
-  next check; only when the deadline has passed and a last look at the
-  CQ finds nothing does the poll return `CompletionTimeout` and mark
-  the controller dead. Waits are armed before the CQ check they follow,
+  lost completion. On an IRQ-driven queue the wait is **not** bounded
+  by any poll slice of its own (the former `ASYNC_CQ_POLL_MS`, 250 ms,
+  is gone): it ends with the handler's wake or at the command's deadline
+  (`IO_TIMEOUT_MS`), where the timeout path's one poll either finds the
+  completion ("timeout, completion polled", `irq_missed`) or, finding
+  nothing, returns `CompletionTimeout` and marks the controller dead.
+  On a vector-less queue the waiter re-polls cooperatively. The waker
+  is registered in the slot before the state re-check that follows it,
   which is what closes the lost-wakeup window. (`submit_io_finish`, the
   former single-shot drain, is gone.) The split
   lets a caller release the slot gate across the await — no
@@ -333,6 +363,18 @@ multipath / fabrics (defer).
   supervisor poll interval, permitting peer executor tasks to make progress.
 
 - PRP / SGL lists validated against the DMA buffer's bounds.
+- **An IRQ-driven I/O queue's waiter never reaps the CQ** (`mq::Cmd`,
+  Linux `nvme-pci`): the queue's handler publishes every completion and
+  wakes the owner; the only other look at the CQ is the one poll the
+  timeout path makes (`IoQueue::poll_cmd`, Linux `nvme_timeout`). A
+  completion found only there is logged "timeout, completion polled" and
+  counted (`IoQueue::stats().irq_missed`). No poll slice may be added to
+  the IRQ-queue wait: it turned a missing interrupt into a per-request
+  slowdown no gate noticed. Polled completion exists exactly where Linux
+  has it — vector-less queues and the synchronous pre-interrupt paths.
+- The MSI-X table size, the IDT vector supply and the controller's grant
+  bound the I/O queue *count*; none of them selects the polled fallback
+  while at least one I/O entry can be programmed.
 - No DMA buffer a command may still reference is freed: every I/O command's
   PRP-list page and payload pin live in its queue slot until its terminal
   completion (a dropped future abandons, never frees); a timed-out I/O
