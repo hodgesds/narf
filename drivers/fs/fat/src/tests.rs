@@ -1114,6 +1114,28 @@ fn smoke_fat_bootlog_policy() -> TestResult {
 }
 kernel_test_in!("drivers/fs/fat", smoke_fat_bootlog_policy);
 
+/// The flush loop marks a quiet log once per [`QUIET_MARK_MS`] without new
+/// records, and new records restart the period.
+fn smoke_fat_bootlog_quiet_mark() -> TestResult {
+    use crate::bootlog::quiet_mark_due;
+    let mut quiet = narf_time::Deadline::after_ms(0);
+    if quiet_mark_due(4096, &mut quiet) {
+        return TestResult::Fail("a flush that wrote records marked the log quiet");
+    }
+    if quiet_mark_due(0, &mut quiet) {
+        return TestResult::Fail("a write did not restart the quiet period");
+    }
+    let mut quiet = narf_time::Deadline::after_ms(0);
+    if !quiet_mark_due(0, &mut quiet) {
+        return TestResult::Fail("an expired quiet period with nothing written was not marked");
+    }
+    if quiet_mark_due(0, &mut quiet) {
+        return TestResult::Fail("a mark did not restart the quiet period");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_bootlog_quiet_mark);
+
 /// Marker-gated arming, sequential file naming, append and the size bound,
 /// end to end on a FAT12 volume in RAM.
 fn smoke_fat_bootlog_session_round_trip() -> TestResult {
