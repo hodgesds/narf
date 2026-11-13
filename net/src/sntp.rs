@@ -42,19 +42,19 @@
 //! the caller spins. The datagram path is independent of the stream
 //! recv-EOF fix (#1936 / PR #1941) — datagrams never had EOF semantics.
 //!
-//! ## Server discovery — explicit, by design
+//! ## Server discovery — explicit first, DHCP-advertised as fallback
 //!
-//! The client takes an explicit server IPv4 address. There is no discovery
-//! mechanism in-tree to learn one: the DHCP codec defines option 42
-//! (`OPT_NTP_SERVERS`, RFC 2132 §3.7) but `dhcp.rs` does not parse it, and
-//! no NTP-server config surface exists anywhere else. This module names no
-//! default server and hardcodes no pool address — a hardcoded pool would be
-//! a silent policy choice, and the wrong one on a private network. Callers
-//! that want a name resolved can use [`resolve_server`] (the UDP-only DNS
-//! stub, needs configured nameservers); the name itself is the caller's
-//! choice. DHCP option-42 parsing is a follow-up (#1955 bullet 2); the
-//! periodic poll daemon is [`poll_daemon`] / [`start_poll_daemon`]
-//! (issue #1956).
+//! The client takes an explicit server IPv4 address, and an explicit
+//! server always wins. When no explicit server is configured,
+//! [`select_server`] falls back to the first NTP server the DHCP lease
+//! advertised via option 42 (`DhcpLease.ntp`, RFC 2132 §8.3, parsed by
+//! `dhcp.rs` — issue #1955 bullet 1). This module names no default
+//! server and hardcodes no pool address — a hardcoded pool would be
+//! a silent policy choice, and the wrong one on a private network.
+//! Callers that want a name resolved can use [`resolve_server`] (the
+//! UDP-only DNS stub, needs configured nameservers); the name itself
+//! is the caller's choice. The periodic poll daemon is
+//! [`poll_daemon`] / [`start_poll_daemon`] (issue #1956).
 //!
 //! ## What this does not do
 //!
@@ -75,6 +75,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use crate::dhcp::DhcpLease;
 use crate::iface;
 use crate::pkt_ntp::{
     client_request, unix_to_ntp, NtpHeader, LI_ALARM_UNSYNCED, MODE_SERVER, NTP_HDR_LEN,
@@ -119,6 +120,13 @@ impl SntpConfig {
             timeout_ms: DEFAULT_TIMEOUT_MS,
         }
     }
+
+    /// A config for the server [`select_server`] picks: `explicit` when
+    /// given, else the first DHCP-advertised NTP server in `lease`.
+    /// Returns `None` when neither source names a server.
+    pub fn with_dhcp_fallback(explicit: Option<[u8; 4]>, lease: &DhcpLease) -> Option<Self> {
+        select_server(explicit, lease).map(Self::new)
+    }
 }
 
 /// One validated SNTP exchange: the §8 offset/delay plus the reply fields
@@ -148,6 +156,9 @@ pub struct SntpSample {
 pub enum SntpError {
     /// No ephemeral port was available to bind.
     BindFailed,
+    /// Neither an explicit server nor a DHCP-advertised NTP server was
+    /// configured (see [`select_server`]).
+    NoServer,
     /// No interface or route to the server (or the neighbour is
     /// unreachable).
     NoRoute,
@@ -220,6 +231,27 @@ fn short_to_ns(short: u32) -> i64 {
 /// Saturate an `i128` nanosecond value into `i64` (the sample's fields).
 fn saturate_ns(v: i128) -> i64 {
     v.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// Pick the NTP server for one exchange (issue #1955 bullet 2): an
+/// explicit server always wins; otherwise the first DHCP-advertised
+/// NTP server in the lease (option 42, RFC 2132 §8.3) is used. Only
+/// the first advertised server is returned — RFC 5905 §14 gives an
+/// SNTP client a single server, and multi-server selection is
+/// out of scope. A `0.0.0.0` entry is not a server and is skipped;
+/// `ntp_count` governs how many slots are live (the parser caps it
+/// at the 3-slot array). Returns `None` when neither source names a
+/// server — the caller reports that as [`SntpError::NoServer`].
+pub fn select_server(explicit: Option<[u8; 4]>, lease: &DhcpLease) -> Option<[u8; 4]> {
+    if let Some(server) = explicit {
+        return Some(server);
+    }
+    lease
+        .ntp
+        .iter()
+        .take(lease.ntp_count as usize)
+        .copied()
+        .find(|addr| *addr != [0, 0, 0, 0])
 }
 
 /// Validate a decoded reply against the request's transmit timestamp.
@@ -354,6 +386,20 @@ pub fn discipline_sample(sample: &SntpSample) -> DisciplineOutcome {
         sample.stratum,
         now_sec,
     )
+}
+
+/// One full synchronisation round against the server [`select_server`]
+/// picks: an explicit server when given, else the first
+/// DHCP-advertised NTP server in `lease`. Returns
+/// [`SntpError::NoServer`] when neither source names a server.
+/// This is the entry point a boot path or a future poll daemon calls
+/// when the server may come from DHCP.
+pub fn sync_once_with_lease(
+    explicit: Option<[u8; 4]>,
+    lease: &DhcpLease,
+) -> Result<(SntpSample, DisciplineOutcome), SntpError> {
+    let cfg = SntpConfig::with_dhcp_fallback(explicit, lease).ok_or(SntpError::NoServer)?;
+    sync_once(&cfg)
 }
 
 /// One full synchronisation round against an explicit server: exchange +
@@ -918,6 +964,70 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("net/sntp", smoke_sntp_poll_config_normalises);
+    fn lease_with_ntp(ntp: [[u8; 4]; 3], ntp_count: u8) -> DhcpLease {
+        DhcpLease {
+            ip: [10, 0, 9, 1],
+            netmask: [255, 255, 255, 0],
+            gateway: [10, 0, 9, 1],
+            server: [10, 0, 9, 1],
+            lease_secs: 3600,
+            ntp,
+            ntp_count,
+        }
+    }
+
+    fn smoke_sntp_select_server_prefers_explicit_then_dhcp() -> TestResult {
+        let dhcp_two = lease_with_ntp([[192, 0, 2, 53], [192, 0, 2, 54], [0, 0, 0, 0]], 2);
+        // An explicit server always wins, even when DHCP advertises one.
+        if select_server(Some([203, 0, 113, 7]), &dhcp_two) != Some([203, 0, 113, 7]) {
+            return TestResult::Fail("an explicit server should win over DHCP");
+        }
+        // No explicit server: the first DHCP-advertised server, not the
+        // second — RFC 5905 §14 gives an SNTP client a single server.
+        if select_server(None, &dhcp_two) != Some([192, 0, 2, 53]) {
+            return TestResult::Fail("the first DHCP NTP server should be picked");
+        }
+        // An empty lease names no server.
+        let empty = lease_with_ntp([[0, 0, 0, 0]; 3], 0);
+        if select_server(None, &empty).is_some() {
+            return TestResult::Fail("an empty lease should name no server");
+        }
+        if SntpConfig::with_dhcp_fallback(None, &empty).is_some() {
+            return TestResult::Fail("with_dhcp_fallback should be None without a server");
+        }
+        if sync_once_with_lease(None, &empty) != Err(SntpError::NoServer) {
+            return TestResult::Fail("sync with no server should be NoServer, not a hang");
+        }
+        // ntp_count governs: live slots are the first `ntp_count`, so
+        // garbage past the count must not leak out as a server.
+        let stale = lease_with_ntp([[0, 0, 0, 0], [192, 0, 2, 99], [0, 0, 0, 0]], 0);
+        if select_server(None, &stale).is_some() {
+            return TestResult::Fail("slots past ntp_count should not be servers");
+        }
+        // A 0.0.0.0 entry is not a server; the next live entry is used.
+        let zero_first = lease_with_ntp([[0, 0, 0, 0], [192, 0, 2, 54], [0, 0, 0, 0]], 2);
+        if select_server(None, &zero_first) != Some([192, 0, 2, 54]) {
+            return TestResult::Fail("a 0.0.0.0 entry should be skipped");
+        }
+        // The config builder carries the picked server on the standard
+        // port with the default timeout.
+        match SntpConfig::with_dhcp_fallback(None, &dhcp_two) {
+            Some(cfg)
+                if cfg.server == [192, 0, 2, 53]
+                    && cfg.port == NTP_PORT
+                    && cfg.timeout_ms == DEFAULT_TIMEOUT_MS => {}
+            _ => {
+                return TestResult::Fail(
+                    "with_dhcp_fallback should build a default config for the DHCP server",
+                );
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/sntp",
+        smoke_sntp_select_server_prefers_explicit_then_dhcp
+    );
 
     // ── End-to-end fixture ──────────────────────────────────────────
     //
@@ -1283,4 +1393,42 @@ mod tests {
         "net/sntp",
         smoke_sntp_poll_round_timeout_steps_down_end_to_end
     );
+    fn smoke_sntp_exchange_uses_dhcp_server_end_to_end() -> TestResult {
+        // No explicit server: the exchange must go to the first
+        // DHCP-advertised NTP server in the lease (issue #1955 bullet 2).
+        e2e_setup(50_000_000, true);
+        let lease = lease_with_ntp([E2E_SERVER, [10, 0, 9, 54], [0, 0, 0, 0]], 2);
+        let (sample, outcome) = match sync_once_with_lease(None, &lease) {
+            Ok(r) => r,
+            Err(_) => {
+                e2e_teardown();
+                return TestResult::Fail("exchange against the DHCP server failed");
+            }
+        };
+        if sample.server != E2E_SERVER {
+            e2e_teardown();
+            return TestResult::Fail("the sample should come from the DHCP server");
+        }
+        if !(50_000_000..=51_000_000).contains(&sample.offset_ns) {
+            e2e_teardown();
+            return TestResult::Fail("fixture offset should read ~+50 ms");
+        }
+        if !matches!(outcome, DisciplineOutcome::Slewed(_)) {
+            e2e_teardown();
+            return TestResult::Fail("a 50 ms sample should slew, not step");
+        }
+        // The request actually went to the DHCP server's address.
+        let saw_request = FAKE_TX.lock().iter().any(|f| {
+            f.len() >= ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + NTP_HDR_LEN
+                && f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20] == E2E_SERVER
+                && f[ETH_HDR_LEN + IPV4_HDR_LEN + 2] == 0
+                && f[ETH_HDR_LEN + IPV4_HDR_LEN + 3] == 123
+        });
+        e2e_teardown();
+        if !saw_request {
+            return TestResult::Fail("no NTP request frame reached the DHCP server");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/sntp", smoke_sntp_exchange_uses_dhcp_server_end_to_end);
 }
