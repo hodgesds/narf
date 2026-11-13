@@ -949,7 +949,10 @@ if [ "$SOAK_DIRTYEXIT" = 1 ]; then
   worker dirtyexit3 w_dirtyexit 3 exit
 fi
 worker trees w_trees
-worker integrity w_integrity "$NATIVE_SECS"
+# One integrity run, not a loop: each run truncates its files, so a rerun
+# started near the deadline would replace a finished run's verified state
+# with a partial one the host cannot check.
+(w_integrity "$NATIVE_SECS" >> "$D/out/integrity.log" 2>> "$D/err/integrity.log") &
 worker fsio1 $PY fsio "$HB/fsio1" "$W/fsio1" "$SOAK_SECS"
 worker fsio2 $PY fsio "$HB/fsio2" /home/narf/soak-fsio "$SOAK_SECS"
 worker journal w_journal

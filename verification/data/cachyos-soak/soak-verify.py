@@ -120,6 +120,16 @@ def main():
     for path, length, h in re.findall(r"INTEGRITY-FINAL (/narf-soak-data/\S+) len=(\d+) fnv=([0-9a-f]+)",
                                       serial):
         integ[path] = (int(length), int(h, 16))
+    # The guest's worker loop reruns the integrity run until the load
+    # deadline, and each run reopens its files with O_TRUNC. A run that
+    # started after the last INTEGRITY-FINAL and never printed its own left
+    # the files in its partial state: the earlier FINAL no longer describes
+    # them, so they are not judged.
+    last_final = serial.rfind("INTEGRITY-FINAL")
+    if integ and serial.rfind("INTEGRITY-SEED") > last_final >= 0:
+        print("integrity: a later run restarted the files after the last "
+              "INTEGRITY-FINAL and did not finish; not judged")
+        integ = {}
     if not durable and not integ:
         print("no data written under /narf-soak-data to check")
         os.unlink(part)
