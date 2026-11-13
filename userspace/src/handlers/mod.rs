@@ -27,6 +27,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+mod futex_queue;
 mod message_buffer;
 use message_buffer::MessageBuffer;
 

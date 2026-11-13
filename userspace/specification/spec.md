@@ -1308,6 +1308,22 @@ signed and, like Linux's dequeue-before-limit check, wake at most one matching
 waiter when that count is zero or negative. The separate futex2 `futex_wake`
 syscall keeps its strict zero-count no-op after address and mask validation;
 a negative count still selects at most one matching waiter.
+Matching waiters are selected in FIFO registration order, independent of task
+IDs. Refreshing a queued waker keeps its position; cancellation unlinks that
+registration, and a new registration joins the tail. Bitset filtering preserves
+the order of skipped waiters. Each hash bucket owns a FIFO list in a reusable
+slot arena, without per-key or per-task waiter trees. Links are direct slot
+indexes. Enqueue is amortized O(1), and removing a known handler-driven waiter
+is O(1); wake selection scans matching keys and bitsets within one bucket.
+Legacy park-loop registration/refresh searches that bucket by task identity.
+Requeue merges a duplicate legacy registration for the same task/key in place.
+Generation-checked handles prevent stale cancellation from removing a reused
+slot. A requeue updates the saved key and handle under both bucket locks;
+unqueue revalidates that location after locking. Cross-bucket movers append in
+source order; same-bucket movers keep their positions, matching Linux. The
+single-word wait stores its location inline; vector waits allocate a location
+array. Bucket arenas retain their high-water capacity for reuse. RT-priority
+ordering and PI boosting remain separate Linux compatibility gaps.
 `FUTEX_WAKE_OP` applies the same signed count rule independently to each wake
 queue. Its comparison codes are Linux's EQ, NE, LT, LE, GT, GE over the signed
 pre-operation value. An unknown comparison returns `ENOSYS` after the atomic
