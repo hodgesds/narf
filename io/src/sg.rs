@@ -40,6 +40,9 @@ pub struct PageList {
     domain: DomainId,
     /// Per-domain IOMMU mapping: the domain and one IOVA per page.
     iommu: Option<Box<(Arc<iommu::IommuDomain>, Vec<u64>)>>,
+    /// What keeps the frames allocated, dropped with the list (a bio's page
+    /// references: the pages go only after the last command over them).
+    owner: Option<Box<dyn core::any::Any + Send + Sync>>,
 }
 
 impl core::fmt::Debug for PageList {
@@ -74,7 +77,17 @@ impl PageList {
             len,
             domain,
             iommu: None,
+            owner: None,
         })
+    }
+
+    /// Give the list ownership of what keeps its frames allocated: `owner`
+    /// drops with the list, i.e. after the last command naming it completed.
+    /// A caller whose wait may end early (a killable read) parks the frames
+    /// here instead of freeing them under a device still writing them.
+    pub fn with_owner(mut self, owner: Box<dyn core::any::Any + Send + Sync>) -> Self {
+        self.owner = Some(owner);
+        self
     }
 
     /// Payload bytes.

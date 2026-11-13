@@ -177,6 +177,11 @@ generation, and every copy of the old cap — a split child, a request a device
 still owns after a timeout, a killed waiter's abandoned request — fails
 `check_live` instead of resolving to the new payload
 (`smoke_io_registry_bounded_by_live_objects`).
+`PageList::with_owner(Box<dyn Any + Send + Sync>)` lets the caller park
+what keeps them allocated in the list itself (a bio's page references): the
+owner drops with the list, after the last command over it completed, so a
+waiter that gives up early (a killable read) can drop its future without
+freeing frames a device is still writing.
 
 **Per-domain IOMMU translation** (module `iommu`, `iova`; Linux
 `iommu.c` + `dma-iommu.c` + `iova.c` + `generic_pt/fmt/{amdv1,vtdss}.h`).
