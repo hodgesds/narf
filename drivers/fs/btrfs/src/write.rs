@@ -1668,7 +1668,6 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     // operation's tree reads and its staging would hand it a tree that moved
     // (a fresh root with no METADATA_ITEM yet, a closed batch), so it waits
     // for the running operations to finish (`txn_gate`).
-    let _op = vol.begin_commit().await?;
     let stale = {
         let guard = vol.fs_batch().lock().await;
         match guard.as_ref() {
@@ -1684,8 +1683,10 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
     if stale {
         // Sync rather than merely commit: the point is durability, and a
         // committed transaction whose superblock is still staged is not
-        // durable. This is the timer's whole purpose.
-        vol.sync_to_disk().await?;
+        // durable. This is the timer's whole purpose. The transaction is
+        // closed only to freeze the commit (`commit_through`), not for its
+        // write-out.
+        vol.sync_to_disk_exclusive().await?;
     }
     Ok(())
 }
@@ -2053,11 +2054,15 @@ fn fatal_errors_panic() -> bool {
     on
 }
 
-/// Commit one closed batch as a single transaction.
+/// Commit one closed batch as a single transaction. With `write_out` set
+/// the commit's write-out is finished before returning; without it the
+/// write-out is left queued for the caller to finish once the transaction
+/// is open again (the hand-over, [`flush_batch_from`]).
 async fn commit_batch<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     batch: FsBatch,
     origin: FlushOrigin,
+    write_out: bool,
 ) -> Result<(), FsError> {
     if batch.ops == 0 {
         // Nothing staged. `batch_gen` opens a batch before its caller has
@@ -2072,7 +2077,7 @@ async fn commit_batch<B: BlockDevice + 'static>(
         .map(|(&id, t)| (id, t.base_root))
         .collect();
     let silent_losses = origin.silent_losses(batch.ops);
-    let result = commit_batch_inner(vol, batch).await;
+    let result = commit_batch_inner(vol, batch, base_roots.clone(), write_out).await;
     if let Err(error) = &result {
         use core::fmt::Write as _;
         let _ = writeln!(
@@ -2136,6 +2141,8 @@ async fn commit_batch<B: BlockDevice + 'static>(
 async fn commit_batch_inner<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     mut batch: FsBatch,
+    rollback: Vec<(u64, (u64, u8))>,
+    write_out: bool,
 ) -> Result<(), FsError> {
     let primary_id = vol.fs_tree_id();
     let primary = batch
@@ -2179,10 +2186,14 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
             },
         });
     }
-    commit_txn(
+    commit_txn_with(
         vol,
         batch.gen,
         batch.alloc,
+        CommitEnd {
+            write_out,
+            rollback,
+        },
         Txn {
             chunk_alloc: None,
             fs: FsCommit {
@@ -2230,6 +2241,17 @@ pub(crate) fn flush_batch<'a, B: BlockDevice + 'static>(vol: &'a BtrfsVolume<B>)
     flush_batch_from(vol, FlushOrigin::Elsewhere)
 }
 
+/// [`flush_batch`] by a caller that holds the transaction closed and will
+/// let it open again before it waits for the commit's write-out
+/// ([`BtrfsVolume::finish_write_out`]): the commit is frozen and published,
+/// its write-out left queued.
+#[inline(never)]
+pub(crate) fn flush_batch_handing_over<'a, B: BlockDevice + 'static>(
+    vol: &'a BtrfsVolume<B>,
+) -> BoxFut<'a, ()> {
+    Box::pin(flush_batch_closed(vol, FlushOrigin::Elsewhere, false))
+}
+
 /// Boxed: a commit is a large future, and every operation that fills its
 /// batch awaits one; inline, it pushed their poll frames past the budget.
 fn flush_batch_from<B: BlockDevice + 'static>(
@@ -2243,11 +2265,38 @@ async fn flush_batch_from_inner<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     origin: FlushOrigin,
 ) -> Result<(), FsError> {
-    // A commit closes the transaction: every operation joined to it has
-    // left, and none joins until it is done (`VolCore::exclusive`).
-    if !vol.txn_closed() {
-        return vol.exclusive(flush_batch_from(vol, origin)).await;
+    if vol.txn_closed() {
+        // The caller keeps the transaction closed past this commit: it gets
+        // the commit complete, write-out and all, as before the hand-over.
+        return flush_batch_closed(vol, origin, true).await;
     }
+    // The hand-over (Linux `btrfs_commit_transaction`):
+    //  - COMMIT_PREP: the previous commit completes first, while operations
+    //    still join the running transaction (`prev_trans` waited for to
+    //    reach TRANS_STATE_COMPLETED before COMMIT_START);
+    //  - COMMIT_START .. UNBLOCKED: the transaction closes — every joined
+    //    operation has left, none joins (`VolCore::exclusive`) — for as long
+    //    as freezing and publishing the trees takes;
+    //  - UNBLOCKED .. COMPLETED: open again, so new operations join the
+    //    next transaction while this one's nodes and superblock are written.
+    vol.commit_handing_over(freeze_batch(vol, origin)).await
+}
+
+/// The freeze [`flush_batch_from`] hands over: [`flush_batch_closed`] with
+/// its write-out left queued. Boxed out of line, so the commit future is not
+/// built in the caller's frame.
+#[inline(never)]
+fn freeze_batch<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>, origin: FlushOrigin) -> BoxFut<'_, ()> {
+    Box::pin(flush_batch_closed(vol, origin, false))
+}
+
+/// [`flush_batch_from`] with the transaction closed; `write_out` as in
+/// [`commit_batch`].
+async fn flush_batch_closed<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    origin: FlushOrigin,
+    write_out: bool,
+) -> Result<(), FsError> {
     let _txn = vol.txn_lock().lock().await;
     let batch = vol.fs_batch().lock().await.take();
     // Declared after `_txn`, so it is dropped first: while it puts a batch
@@ -2255,13 +2304,13 @@ async fn flush_batch_from_inner<B: BlockDevice + 'static>(
     let mut unfinished = UnfinishedCommit::new(vol, batch.as_ref());
     let result = match batch {
         Some(batch) if batch.trees.contains_key(&vol.fs_tree_id()) => {
-            commit_batch(vol, batch, origin).await
+            commit_batch(vol, batch, origin, write_out).await
         }
         // Staged through mounts of other subvolumes (or the commit timer):
         // commit it anchored at one of its subvolumes.
         Some(batch) => {
             let owner = BtrfsVolume::view_for_tree(vol.core(), batch.tree_id());
-            commit_batch(&owner, batch, origin).await
+            commit_batch(&owner, batch, origin, write_out).await
         }
         None => Ok(()),
     };
@@ -5853,10 +5902,40 @@ fn commit_txn<'a, B: BlockDevice + 'static>(
     alloc: Allocator,
     txn: Txn,
 ) -> BoxFut<'a, ()> {
+    commit_txn_with(
+        vol,
+        gen,
+        alloc,
+        CommitEnd {
+            write_out: true,
+            rollback: Vec::new(),
+        },
+        txn,
+    )
+}
+
+/// How a commit ends once it has published.
+struct CommitEnd {
+    /// Finish the write-out before returning, rather than leave it queued
+    /// for a caller that releases the transaction first.
+    write_out: bool,
+    /// The subvolume roots to put back in memory if the write-out fails
+    /// ([`crate::volume::WriteOut::rollback`]).
+    rollback: Vec<(u64, (u64, u8))>,
+}
+
+#[inline(never)]
+fn commit_txn_with<'a, B: BlockDevice + 'static>(
+    vol: &'a BtrfsVolume<B>,
+    gen: u64,
+    alloc: Allocator,
+    end: CommitEnd,
+    txn: Txn,
+) -> BoxFut<'a, ()> {
     Box::pin(async move {
         commit_phase(1);
         let started = narf_time::now_cycles();
-        let result = commit_txn_inner(vol, gen, alloc, txn).await;
+        let result = commit_txn_inner(vol, gen, alloc, end, txn).await;
         note_commit_time(gen, narf_time::now_cycles().saturating_sub(started));
         if let Err(error) = &result {
             use core::fmt::Write as _;
@@ -5891,6 +5970,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     gen: u64,
     mut alloc: Allocator,
+    end: CommitEnd,
     txn: Txn,
 ) -> Result<(), FsError> {
     // The previous commit is complete — its nodes and superblock written —
@@ -6627,6 +6707,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         nodes,
         raw_super: raw,
         root_admin: txn.root_flags.is_some(),
+        rollback: end.rollback,
     })
     .await?;
     dirty.published();
@@ -6694,8 +6775,12 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         }
     }
     // ── Write-out (Linux `btrfs_write_and_wait_transaction`, then
-    // `write_all_supers`), with the transaction still closed.
-    vol.finish_write_out().await
+    // `write_all_supers`): here, with the transaction still closed, unless
+    // the caller hands the transaction over first.
+    if end.write_out {
+        vol.finish_write_out().await?;
+    }
+    Ok(())
 }
 
 /// A frozen commit's nodes held dirty in the node cache until it publishes

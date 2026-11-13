@@ -138,6 +138,10 @@ pub(crate) struct WriteOut {
     pub(crate) raw_super: Vec<u8>,
     /// [`BtrfsVolume::write_node_root_admin`]'s gate.
     pub(crate) root_admin: bool,
+    /// Subvolume roots, `(tree, (root, level))`, as the last durable commit
+    /// left them: put back if the write-out fails, so what readers see is
+    /// what the device holds.
+    pub(crate) rollback: Vec<(u64, (u64, u8))>,
 }
 
 /// Test-only: while set, a write-out waits before writing anything, as one
@@ -3320,6 +3324,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     pub(crate) async fn begin_admin(&self) -> Result<OpGuard<'_>, FsError> {
         let queue = killable(self.op_lock.lock()).await?;
         let closed = killable(self.txn_gate.close()).await?;
+        // Administrative work reads and writes the device under the closed
+        // transaction: the last commit's write-out completes first.
+        self.finish_write_out().await?;
         Ok(OpGuard::Admin {
             _closed: closed,
             _queue: queue,
@@ -3353,6 +3360,10 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             .joined_by_current()
             .then(|| crate::txn_gate::Upgrade::step_out(&self.txn_gate));
         let out = {
+            // No write-out wait here: what `work` commits finishes the
+            // previous write-out first (`commit_txn_inner`), and a second
+            // await before `work` would keep a third copy of it in every
+            // caller's future.
             let _closed = self.txn_gate.close().await;
             work.await
         };
@@ -3360,6 +3371,50 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             upgrade.step_in().await;
         }
         out
+    }
+
+    /// Run a commit's freeze (`freeze`, which publishes and leaves its
+    /// write-out queued) with the transaction closed, and its write-out with
+    /// the transaction open — Linux `btrfs_commit_transaction` from
+    /// COMMIT_PREP to COMPLETED:
+    ///
+    /// - the previous commit's write-out completes first, with the
+    ///   transaction still open (COMMIT_PREP waits for `prev_trans` to reach
+    ///   TRANS_STATE_COMPLETED before COMMIT_START);
+    /// - the transaction closes for the freeze (COMMIT_START .. DOING);
+    /// - it opens again (UNBLOCKED), and this commit's write-out runs while
+    ///   new operations join the next transaction (to COMPLETED).
+    ///
+    /// A joined caller (an operation that filled the batch) steps out for
+    /// all of it, as [`Self::exclusive`] does, and joins again only once its
+    /// commit is complete: its own join is not what holds the next commit's
+    /// close back while this write-out runs.
+    pub(crate) async fn commit_handing_over(
+        &self,
+        freeze: impl core::future::Future<Output = Result<(), FsError>>,
+    ) -> Result<(), FsError> {
+        if self.txn_gate.closed_by_current() {
+            freeze.await?;
+            return self.finish_write_out().await;
+        }
+        let upgrade = self
+            .txn_gate
+            .joined_by_current()
+            .then(|| crate::txn_gate::Upgrade::step_out(&self.txn_gate));
+        let result = async {
+            self.finish_write_out().await?;
+            {
+                let _closed = self.txn_gate.close().await;
+                self.finish_write_out().await?;
+                freeze.await?;
+            }
+            self.finish_write_out().await
+        }
+        .await;
+        if let Some(upgrade) = upgrade {
+            upgrade.step_in().await;
+        }
+        result
     }
 
     /// Whether the transaction is closed (by the running code, when it is
@@ -4012,7 +4067,16 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// trees in memory were published on top of blocks the device does not
     /// have, so nothing may be committed over them (Linux
     /// `btrfs_handle_fs_error` / `cleanup_transaction`).
-    pub(crate) async fn finish_write_out(&self) -> Result<(), FsError> {
+    ///
+    /// Boxed, and out of line so the future is built in this frame: it is
+    /// awaited from every closer of the transaction, and its state would
+    /// otherwise sit in each of their frames.
+    #[inline(never)]
+    pub(crate) fn finish_write_out(&self) -> crate::write::BoxFut<'_, ()> {
+        Box::pin(self.finish_write_out_inner())
+    }
+
+    async fn finish_write_out_inner(&self) -> Result<(), FsError> {
         let mut slot = self.write_out.lock().await;
         let result = match slot.as_ref() {
             None => return Ok(()),
@@ -4022,6 +4086,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         drop(slot);
         if let Err(error) = result {
             self.abort_transaction();
+            for &(tree, (root, level)) in job.iter().flat_map(|job| &job.rollback) {
+                BtrfsVolume::view_for_tree(self.core(), tree).advance_fs_root(root, level);
+            }
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
@@ -4150,17 +4217,43 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// after it finds its generation durable and returns (Linux joins an
     /// `fsync` to the transaction already committing,
     /// `btrfs_commit_transaction` with `cur_trans->state >= COMMIT_START`).
-    async fn commit_through(&self, target: u64) -> Result<(), FsError> {
+    ///
+    /// The transaction is closed only while the commit freezes and publishes
+    /// its trees; the write-out it waits for runs with the transaction open,
+    /// so operations queued behind the sync join the next transaction instead
+    /// of waiting for this one's I/O (Linux TRANS_STATE_UNBLOCKED). A commit
+    /// already writing out `target` is waited for, not repeated; a change
+    /// staged after the hand-over is in the open transaction and needs the
+    /// next commit, never this one.
+    ///
+    /// Boxed, out of line: every `fsync`/`msync`/`syncfs` future would
+    /// otherwise hold the commit's and the write-out's states inline.
+    #[inline(never)]
+    fn commit_through(&self, target: u64) -> crate::write::BoxFut<'_, ()> {
+        Box::pin(self.commit_through_inner(target))
+    }
+
+    async fn commit_through_inner(&self, target: u64) -> Result<(), FsError> {
         if self.durable_gen() >= target {
             return Ok(());
         }
-        let _commit = self.begin_commit().await?;
+        // A commit that published `target` may still be writing it out (its
+        // superblock goes out with it: `MAX_STAGED_COMMITS`).
+        self.finish_write_out().await?;
         if self.durable_gen() >= target {
             return Ok(());
         }
-        // No orphan eviction here: what an fsync owes is the commit
-        // (eviction runs at the final iput and in the background reaper).
-        self.sync_to_disk().await
+        if self.superblock().generation < target {
+            let commit = self.begin_commit().await?;
+            if self.superblock().generation < target {
+                // No orphan eviction here: what an fsync owes is the commit
+                // (eviction runs at the final iput and in the background
+                // reaper).
+                crate::write::flush_batch_handing_over(self).await?;
+            }
+            drop(commit);
+        }
+        self.write_staged_super().await
     }
 
     /// `syncfs`: [`Self::sync_to_disk_exclusive`] plus a trailing device
@@ -4199,7 +4292,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // A published commit still being written out stages its image only
         // when its nodes are out.
         self.finish_write_out().await?;
-        self.write_staged_now().await
+        self.write_staged_now_boxed().await
+    }
+
+    /// [`Self::write_staged_now`], boxed out of line (see
+    /// [`Self::finish_write_out`]).
+    #[inline(never)]
+    fn write_staged_now_boxed(&self) -> crate::write::BoxFut<'_, ()> {
+        Box::pin(self.write_staged_now())
     }
 
     /// [`Self::write_staged_super`] without finishing the write-out first:
