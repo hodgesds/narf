@@ -2485,7 +2485,7 @@ impl ColdBoot {
         selection: &mut Selection,
         pipe: u8,
         encoders: modeset::StreamEncoders,
-    ) -> Result<otg::ScanoutRunning, ModesetError> {
+    ) -> Result<alloc::boxed::Box<otg::ScanoutRunning>, ModesetError> {
         let link = self.mst.get(&port).ok_or(MstFailure::Invalid)?;
         link.require_transaction_idle()?;
         let uhbr = matches!(selection.rate, DpRate::Uhbr(_));

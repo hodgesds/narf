@@ -548,7 +548,7 @@ fn start_hdmi(
 /// the chain fixtures below it run on the 64 KiB aarch64 stack.
 impl Chain {
     #[inline(never)]
-    fn start(&mut self) -> core::future::Ready<Result<ScanoutRunning, Error>> {
+    fn start(&mut self) -> core::future::Ready<Result<alloc::boxed::Box<ScanoutRunning>, Error>> {
         let c = self.clock;
         core::future::ready(run_boxed(|| {
             self.surfaces
@@ -618,7 +618,7 @@ fn every_pipe(c: &mut Chain, (_, s, p): (u8, u8, u8)) -> Result<(), &'static str
         || live.stream != s
         || live.address != c.address
         || c.e.status.state != State::ScanoutRunning(p)
-        || c.e.status.scanout != Some(live)
+        || c.e.status.scanout != Some(*live)
     {
         return Err("running record");
     }
@@ -1167,7 +1167,7 @@ fn second_display(c: &mut Chain, (t, s, p): (u8, u8, u8)) -> Result<(), &'static
     if run(c.e.prepare(other.timing, other.clock)).is_err() {
         return Err("timing staged next to a live display");
     }
-    if c.e.select_display(0).is_err() || c.e.status.scanout != Some(live) {
+    if c.e.select_display(0).is_err() || c.e.status.scanout != Some(*live) {
         return Err("first display's records restored");
     }
     if c.e.displays.siblings.pipes != 1 << q || c.e.displays.siblings.live != [None; 4] {

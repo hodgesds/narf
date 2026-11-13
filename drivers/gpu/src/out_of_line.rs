@@ -5,23 +5,23 @@
 //! once: the Navi48 display monitor reached 26 KiB of a 64 KiB task stack
 //! that way. `Box::pin(step).await` moves the step's state to the heap but
 //! neither stops LLVM inlining its poll (`Pin<Box<F>>::poll` is a direct
-//! call) nor keeps the future off the caller's frame: `Box::pin(f)` builds
-//! `f` (tens of KiB for a modeset step) on the stack before allocating.
-//! [`boxed!`] allocates first and builds the future into the allocation,
-//! and polls it through a function of its own, entered only while the step
-//! runs.
+//! call) nor keeps the future off the caller's frame: the future is built
+//! on the caller's stack (at its full size, tens of KiB for a modeset step)
+//! and then moved into the box. [`boxed!`] builds it in a function of its
+//! own, called and returned from before the caller awaits, straight into
+//! the allocation, and polls it through a function of its own, entered only
+//! while the step runs.
 use alloc::boxed::Box;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-/// `boxed!(future)`: the future built on the heap and polled out of line.
+/// `boxed!(future)`: the future built on the heap out of line and polled
+/// out of line. The expression is evaluated in a closure: it may not use
+/// `?` or `.await`.
 macro_rules! boxed {
     ($fut:expr) => {
-        $crate::out_of_line::OutOfLine::new(::alloc::boxed::Box::write(
-            ::alloc::boxed::Box::new_uninit(),
-            $fut,
-        ))
+        $crate::out_of_line::OutOfLine::build(|| $fut)
     };
 }
 pub(crate) use boxed;
@@ -31,9 +31,11 @@ pub(crate) use boxed;
 pub(crate) struct OutOfLine<F>(Pin<Box<F>>);
 
 impl<F> OutOfLine<F> {
-    #[inline(always)]
-    pub(crate) fn new(fut: Box<F>) -> Self {
-        Self(Box::into_pin(fut))
+    /// `make`'s future, built in this frame (not the caller's) into a fresh
+    /// allocation.
+    #[inline(never)]
+    pub(crate) fn build(make: impl FnOnce() -> F) -> Self {
+        Self(Box::into_pin(Box::write(Box::new_uninit(), make())))
     }
 }
 
