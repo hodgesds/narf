@@ -1900,7 +1900,7 @@ whoever's job that is.
   `fsync`/`fdatasync` write the whole file's dirty pages first, whoever
   dirtied them, then call the filesystem's own fsync; `msync(MS_SYNC)` does
   the same for the file range each VMA covers; `sync`, `syncfs` (every file on
-  the descriptor's device), an unmount and the pre-shutdown sync write every
+  the descriptor's device), an unmount and the forced power-off's emergency sync write every
   file's, including files nothing has open any more. The flusher is an
   ordinary task that may run on any CPU; it exists from the first writable
   shared file mapping until no user task is left and nothing unmapped is

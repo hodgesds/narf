@@ -2089,9 +2089,9 @@ pub(crate) fn sync_all_files(device: Option<u64>) -> Result<(), FsError> {
 }
 
 /// [`sync_all_files`] for a caller that is a task, not a syscall: the
-/// orderly and emergency power-off paths, which do not go through
-/// `reboot(2)` and so not through the pre-shutdown sync. Same engine, same
-/// batches, awaited instead of driven.
+/// emergency sync of a forced orderly power-off (`reboot(2)` itself does not
+/// sync; userspace has). Same engine, same batches, awaited instead of
+/// driven.
 pub(crate) async fn sync_all_files_async() {
     super::release_deferred_slots();
     if FILE_ENTRIES.load(Ordering::Acquire) == 0 {

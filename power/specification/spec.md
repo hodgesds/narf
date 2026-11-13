@@ -1202,32 +1202,68 @@ evaluated. PM1 writes preserve every non-sleep control bit. On aarch64,
 SMC conduit. Both entry points halt forever if the platform call unexpectedly
 returns.
 
-Before the platform call every transition runs, in this order
-(`system::before_transition`): (1) the pre-shutdown filesystem sync
-(`install_pre_shutdown_sync(fn())`, installed by `narf_userspace`:
-`narf_filesystem::sync_all::sync_all`, i.e. every mounted filesystem's
-`syncfs`, then one flush per disk this boot may have written); (2) the
-persistent-log flush; (3) the device shutdown hooks
-(`register_shutdown_hook`, reverse registration order; NVMe Flush + CC.SHN).
-A transition requested from interrupt context is refused and turned into an
-orderly power-off request; a second concurrent transition parks.
-`power_off_synced() -> !` skips step (1) for a caller that already synced.
+Before the platform call every transition runs `system::before_transition()`
+— Linux `kernel_shutdown_prepare` / `kernel_restart_prepare`: (1) the
+persistent-log flush; (2) the device shutdown hooks (`register_shutdown_hook`,
+reverse registration order; NVMe Flush + CC.SHN), NARF's `device_shutdown()`.
+**No filesystem sync**: Linux `reboot(2)` "doesn't sync: do that yourself
+before calling this" — userspace (systemd-shutdown, the `reboot` binary, the
+in-tree shell's `reboot` / `poweroff` builtins) syncs and unmounts or remounts
+read-only first. A transition requested from interrupt context is refused and
+handed to the orderly worker as a kernel power-off; a second concurrent
+transition parks.
 
 ```rust
-// orderly: Linux orderly_poweroff / hw_protection_shutdown
-pub fn orderly::orderly_poweroff(reason: OrderlyReason, sync_budget_ms: Option<u64>) -> bool; // IRQ-safe
-pub fn orderly::hw_protection_shutdown(reason: &str, ms_until_forced: u64);
+// orderly: Linux orderly_poweroff / __hw_protection_trigger
+pub fn orderly::orderly_poweroff(reason: OrderlyReason, force: bool) -> bool; // IRQ-safe
+pub fn orderly::hw_protection_shutdown(reason: &str, ms_until_forced: u64);   // IRQ-safe
+pub fn orderly::run_cmd(cmd: &str) -> Result<(), i32>;      // argv_split + usermode helper
+pub async fn orderly::emergency_sync();                      // bounded, EMERGENCY_SYNC_BUDGET_MS
+pub fn orderly::sync_report_line(r: &SyncReport) -> String; // "synced X of N filesystem(s) (M failed), ..."
+pub type orderly::UsermodeHelper = fn(argv: &[&str], envp: &[&str]) -> Result<(), i32>; // UMH_WAIT_EXEC
+pub fn orderly::install_usermode_helper(UsermodeHelper);     // narf_userspace::umh at wait_init
 // button: ACPI power button as an input device (Linux acpi_button)
 pub fn button::report_power_button() -> PressOutcome;
+// sysctl (narf_filesystem::procfs::sys_kernel), Linux kernel/reboot.c poweroff_cmd
+/proc/sys/kernel/poweroff_cmd   // 0644 proc_dostring, default "/sbin/poweroff"
 ```
 
-The orderly worker (spawned by a Stage::Late initcall) syncs every filesystem
-from task context, bounded by the request's budget (default 60 s), then calls
-`power_off_synced`. `hw_protection_shutdown` additionally arms a forced
-power-off if no transition has started within twice the budget. The ACPI
-power button reports `KEY_POWER` press + release on its own evdev device;
-with no reader open on it (no logind) it requests the orderly power-off. No
+The orderly worker (spawned by a Stage::Late initcall) serves one request at
+a time, as `poweroff_work` does: it runs `kernel.poweroff_cmd` through the
+usermode helper (`narf_userspace::umh::call_usermodehelper_exec`: the program
+resolved under PID 1's root, root credentials, no parent — reaped by the
+kernel — returning once the image is exec'd). If the helper starts,
+userspace owns the shutdown and the kernel does nothing more. If it cannot
+start and the request is `force`d, the worker runs `emergency_sync()`
+(mapped pages, then every filesystem's `syncfs`, then a flush per disk,
+bounded by 60 s) and then `system::power_off()`. An unforced request whose
+helper fails does nothing more. `force` is sticky across a pending request.
+`hw_protection_shutdown` (once per boot) requests a forced orderly power-off
+and arms a statically spawned watchdog that forces `power_off()` (no sync)
+`ms_until_forced` later if no transition has started. The ACPI power button
+reports `KEY_POWER` press + release on its own evdev device; with no reader
+open on it (no logind) it requests an **unforced** orderly power-off. No
 power-off ever runs in the notifying (IRQ / SCI subscriber) context.
+
+#### 3.6.1 Power-off paths vs Linux
+
+Linux line numbers are against the reference tree at `~/git/linux`
+(`kernel/reboot.c`, `fs/sync.c`, `drivers/acpi/button.c`,
+`drivers/base/core.c`, `drivers/nvme/host/pci.c`, `kernel/panic.c`).
+
+| Path | Linux | NARF |
+|---|---|---|
+| `reboot(2)` RESTART / RESTART2 | `SYSCALL_DEFINE4(reboot)` reboot.c:728 → `kernel_restart` :287 → `kernel_restart_prepare` :100 (reboot notifiers, `usermodehelper_disable`, `device_shutdown` core.c:4805) → `syscore_shutdown` → `machine_restart`. No sync (comment at :726). | `sys_reboot` `userspace/src/handlers/sys_reboot.rs:94,105` → `system::reboot` `power/src/system.rs:149` → `begin_transition` :106 → `before_transition` :83 (log flush, device hooks) → FADT RESET_REG / CF9 (PSCI SYSTEM_RESET on aarch64). No sync. |
+| `reboot(2)` POWER_OFF / HALT | reboot.c:778,782 → `kernel_halt` :315 / `kernel_power_off` :705 → `kernel_shutdown_prepare` :302 → `do_kernel_power_off_prepare` → `migrate_to_reboot_cpu` → `syscore_shutdown` → `machine_power_off`. No sync. | `sys_reboot` :121 → `system::power_off` `system.rs:182` → `before_transition` → ACPI S5 (PSCI SYSTEM_OFF). HALT powers off too (LINUX-GAP: no halted-but-powered state). No sync. |
+| Power button, consumer open | `acpi_button_notify` button.c:440: `KEY_POWER` 1/0 + SYN (:466–469), netlink event (:471); logind's `HandlePowerKey=` decides. | `button::report_press_on` `power/src/button.rs:83`: `KEY_POWER` 1/0 + SYN to the readers; nothing else. |
+| Power button, no consumer | Nothing — powering off is userspace's job. | NARF extension: `orderly_poweroff(PowerButton, false)` → worker → `run_cmd(poweroff_cmd)` (what logind would start); helper failure → nothing more. No kernel sync, no device shutdown. |
+| `orderly_poweroff(force)` | reboot.c:914 → `poweroff_work_func` :900 → `__orderly_poweroff` :877: `run_cmd(poweroff_cmd)` :842 (`call_usermodehelper(.., UMH_WAIT_EXEC)`, env `HOME=/`, `PATH=/sbin:/bin:/usr/sbin:/usr/bin`); on failure and `force`: `emergency_sync()` + `kernel_power_off()`. | `orderly::orderly_poweroff` `power/src/orderly.rs:120` → worker `start_worker` :209 → `orderly_poweroff_work` :316: `run_cmd` :274 → `umh::call_usermodehelper_exec` `userspace/src/umh.rs:80`; on failure and `force`: `emergency_sync` :429, then `system::power_off`. |
+| `emergency_sync()` | fs/sync.c:134 queues `do_sync_work` :115 (inodes, `sync_fs` nowait, bdevs, then again with wait) and returns; `kernel_power_off` runs concurrently with it. | Awaited, bounded 60 s: mapped pages, `sync_all` (every superblock's `syncfs`, then a flush per written disk), then the power-off. **Stronger than Linux**: the sync finishes before any device shutdown hook runs. |
+| Running user tasks on the forced path | Neither `emergency_sync` nor `kernel_power_off` freezes or kills tasks; `device_shutdown` → `nvme_shutdown` pci.c:3868 → `nvme_dev_disable(shutdown=true)` :3291 freezes the queues (:3301) and waits `NVME_IO_TIMEOUT` for in-flight I/O (:3307) before CC.SHN; a later submitter blocks in `blk_queue_enter`. | Same: no freeze or kill. `nvme::shutdown_all_controllers` `drivers/nvme/src/imp.rs:6134` refuses new requests and waits up to 30 s for in-flight I/O before Flush + CC.SHN. LINUX-GAP: a request submitted after the shutdown started fails (`slot_of` :4772 returns `None`) instead of blocking on a frozen queue. |
+| Hardware protection | `__hw_protection_trigger` reboot.c:1028: once (`allow_proceed`), `hw_failure_emergency_schedule(ms_until_forced)`, `orderly_poweroff(true)`; `hw_failure_emergency_action_func` :962 → `kernel_power_off()` (no sync) → `emergency_restart()`. | `orderly::hw_protection_shutdown` :517: once, arms the watchdog `hw_failure_emergency_watchdog` :484 (`power_off()`, no sync, after `ms_until_forced`), `orderly_poweroff(HwProtection, true)`. LINUX-GAP: no `hw_protection=reboot` action, no `emergency_restart` after a failed forced power-off. |
+| Kernel power-off asked from IRQ | n/a (`kernel_power_off` sleeps; never called from IRQ). | `begin_transition` refuses, requests `IrqContextRequest`; the worker runs `power_off()` (no helper, no sync). |
+| Panic | `panic()` panic.c:718–742: `panic_timeout` > 0 → `emergency_restart()` after the delay; 0 (default) → spin forever. | `console::panic_sink` `console/src/lib.rs:606` halts forever (the default). LINUX-GAP: no `panic=N` reboot. |
+| SysRq o / b / s / u, Ctrl-Alt-Del | `sysrq_handle_poweroff` → `do_poweroff` power/poweroff.c:19 (`kernel_power_off`); `emergency_restart`; `emergency_sync`; `emergency_remount`; `ctrl_alt_del` reboot.c:828 (C_A_D → `kernel_restart`, else SIGINT to pid 1). | LINUX-GAP: only SysRq-T is implemented (`sysrq_pump` `userspace/src/handlers/core.inc.rs:15623`); `LINUX_REBOOT_CMD_CAD_ON/OFF` are accepted no-ops and Ctrl-Alt-Del is not delivered to pid 1. |
 
 **Why two quiesce variants.** A driver that has only a single
 `quiesce` method must conservatively assume power loss, which means
@@ -1375,6 +1411,16 @@ drain cadence.
 - C-state exit latency accounting is honest — we never enter a
   state whose worst-case exit would miss the next timer deadline.
 - Thermal emergency shutdown is idempotent and signal-safe.
+- The kernel never syncs filesystems or shuts block devices down on its own
+  initiative while it lets user tasks run, except on the forced fallback of
+  an orderly power-off whose userspace command could not be started (and the
+  hardware-protection watchdog): there, as in Linux, tasks are not frozen;
+  the emergency sync completes (bounded) before any device shutdown hook
+  runs, and the block driver drains in-flight I/O before it shuts the device
+  down. `reboot(2)` and the orderly power-off never sync on userspace's
+  behalf.
+- A sync report counts a filesystem whose `syncfs` failed as failed, never
+  as synced.
 - DVFS changes are bounded: no transition takes longer than its
   declared `transition_latency`.
 - Per-CPU HWP/CPPC registers are enabled, read, and written only while

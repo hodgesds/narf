@@ -19,7 +19,7 @@
 //! on failure they `halt_forever` rather than letting the caller
 //! limp on with a half-broken transition in flight.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ── Device shutdown hooks ──────────────────────────────────────────
 
@@ -34,9 +34,8 @@ static SHUTDOWN_HOOKS: narf_lib::sync::IrqSafeSpinLock<HookList> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 /// Register `hook` under `name` (idempotent on `name`). Hooks run on every
-/// [`reboot`] and [`power_off`], after the pre-shutdown filesystem sync and
-/// the persistent-log flush, in reverse registration order (Linux shuts
-/// devices down in reverse probe order).
+/// [`reboot`] and [`power_off`], after the persistent-log flush, in reverse
+/// registration order (Linux shuts devices down in reverse probe order).
 pub fn register_shutdown_hook(name: &'static str, hook: ShutdownHook) {
     let mut g = SHUTDOWN_HOOKS.lock();
     if let Some(e) = g.iter_mut().find(|(n, _)| *n == name) {
@@ -66,72 +65,22 @@ pub fn __swap_shutdown_hooks_for_test(
     core::mem::replace(&mut *SHUTDOWN_HOOKS.lock(), hooks)
 }
 
-// ── Pre-shutdown filesystem sync ───────────────────────────────────
+// ── Transition prologue ────────────────────────────────────────────
 
-/// The step that makes every mounted filesystem durable before any device
-/// is shut down. The filesystem walk needs the syscall layer's way of
-/// waiting on a future from synchronous code (a stackful task parks on the
-/// filesystem's waker), which lives above this crate, so the layer that owns
-/// it installs it ([`install_pre_shutdown_sync`]; `narf_userspace` does at
-/// init). It must be bounded.
-pub type PreShutdownSync = fn();
-
-/// `PreShutdownSync as usize`; 0 = none installed.
-static PRE_SHUTDOWN_SYNC: AtomicUsize = AtomicUsize::new(0);
-
-/// Install the pre-shutdown sync step (idempotent; the last one wins).
-pub fn install_pre_shutdown_sync(hook: PreShutdownSync) {
-    PRE_SHUTDOWN_SYNC.store(hook as usize, Ordering::Release);
-}
-
-/// Swap the installed sync step, returning the previous one. Test-only.
-#[doc(hidden)]
-pub fn __swap_pre_shutdown_sync_for_test(hook: Option<PreShutdownSync>) -> Option<PreShutdownSync> {
-    let old = PRE_SHUTDOWN_SYNC.swap(hook.map_or(0, |h| h as usize), Ordering::AcqRel);
-    // SAFETY: a non-zero value was stored from a `PreShutdownSync`.
-    (old != 0).then(|| unsafe { core::mem::transmute::<usize, PreShutdownSync>(old) })
-}
-
-/// Run the installed pre-shutdown sync step. Returns whether one was
-/// installed.
-pub fn run_pre_shutdown_sync() -> bool {
-    let h = PRE_SHUTDOWN_SYNC.load(Ordering::Acquire);
-    if h == 0 {
-        return false;
-    }
-    // SAFETY: stored as `PreShutdownSync as usize` by
-    // `install_pre_shutdown_sync`.
-    let f: PreShutdownSync = unsafe { core::mem::transmute::<usize, PreShutdownSync>(h) };
-    f();
-    true
-}
-
-/// Whether filesystems still need syncing on the way down. The orderly
-/// path ([`crate::orderly`]) syncs asynchronously, with its own bound, before
-/// it calls [`power_off_synced`]; every other caller syncs here.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SyncStep {
-    /// Run the pre-shutdown sync first (every ordinary transition).
-    Sync,
-    /// The caller already synced (or gave up on it with a logged reason).
-    AlreadyDone,
-}
-
-/// Everything that runs before the platform reset / S5 write, in this
-/// order, which is the point:
+/// Everything that runs before the platform reset / S5 write — Linux
+/// `kernel_shutdown_prepare` / `kernel_restart_prepare` (`kernel/reboot.c`),
+/// whose `device_shutdown()` NARF runs as the shutdown hooks:
 ///
-/// 1. the pre-shutdown filesystem sync (every mounted filesystem's `syncfs`,
-///    then a flush of every disk this boot wrote) — Linux userspace's final
-///    `sync()` plus the kernel's `emergency_sync` for the forced paths;
-/// 2. the persistent-log flush;
-/// 3. the device shutdown hooks (NVMe Flush + CC.SHN, ...).
+/// 1. the persistent-log flush (Linux `kmsg_dump(KMSG_DUMP_SHUTDOWN)`, run
+///    there after `device_shutdown`; here first, while the log's backing
+///    device is still up);
+/// 2. the device shutdown hooks (NVMe Flush + CC.SHN, ...).
 ///
-/// The sync must precede (3): a filesystem commit issued after the NVMe
-/// controller has been sent CC.SHN never reaches the media.
-pub fn before_transition(sync: SyncStep) {
-    if sync == SyncStep::Sync {
-        run_pre_shutdown_sync();
-    }
+/// No filesystem sync: Linux's `reboot(2)` "doesn't sync: do that yourself
+/// before calling this" — userspace (systemd-shutdown, the `reboot` binary)
+/// syncs and remounts read-only first, and the kernel's own forced paths
+/// ([`crate::orderly`]) run their emergency sync before they call in here.
+pub fn before_transition() {
     narf_console::run_persist_hook(None);
     run_shutdown_hooks();
 }
@@ -139,7 +88,7 @@ pub fn before_transition(sync: SyncStep) {
 /// Set by the first reboot / power-off to start; the transition runs once.
 static TRANSITION_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Whether a reboot / power-off has begun (the forced-fallback timer of
+/// Whether a reboot / power-off has begun (the emergency watchdog of
 /// [`crate::orderly::hw_protection_shutdown`] checks it).
 pub fn transition_started() -> bool {
     TRANSITION_STARTED.load(Ordering::Acquire)
@@ -147,11 +96,11 @@ pub fn transition_started() -> bool {
 
 /// Gate every `-> !` transition entry point:
 ///
-/// - **Never from interrupt context.** The sync and the device shutdown
-///   hooks wait on I/O and on locks the interrupted code may hold (the NVMe
-///   request gate held by the very I/O the IRQ interrupted). An IRQ-context
-///   caller is turned into an orderly power-off request served by the
-///   task-context worker, and this CPU parks.
+/// - **Never from interrupt context.** The device shutdown hooks wait on I/O
+///   and on locks the interrupted code may hold (the NVMe request gate held
+///   by the very I/O the IRQ interrupted). An IRQ-context caller is turned
+///   into a request the task-context orderly worker serves with a kernel
+///   power-off, and this CPU parks.
 /// - **Once.** A second, concurrent caller parks instead of running the
 ///   hooks a second time against devices the first is shutting down.
 fn begin_transition(what: &str) {
@@ -161,7 +110,7 @@ fn begin_transition(what: &str) {
             narf_console::Writer,
             "{what}: refused from interrupt context; handing over to the orderly power-off worker"
         );
-        crate::orderly::orderly_poweroff(crate::orderly::OrderlyReason::IrqContextRequest, None);
+        crate::orderly::orderly_poweroff(crate::orderly::OrderlyReason::IrqContextRequest, true);
         narf_arch::halt_forever();
     }
     if TRANSITION_STARTED.swap(true, Ordering::AcqRel) {
@@ -191,16 +140,17 @@ const PORT_CF9: u16 = 0xCF9;
 #[cfg(target_arch = "x86_64")]
 const CF9_HARD_RESET: u8 = 0x06;
 
-/// Reboot the system. Tries ACPI FADT.RESET_REG first, then
+/// Reboot the system — Linux `kernel_restart`; no filesystem sync (see
+/// [`before_transition`]). Tries ACPI FADT.RESET_REG first, then
 /// falls back to legacy port 0xCF9 on x86_64. Never returns on
 /// success; halts forever on failure (the platform is in a
 /// state we can't recover from).
 #[cfg(target_arch = "x86_64")]
 pub fn reboot() -> ! {
     begin_transition("reboot");
-    // Filesystem sync, final persistent-log flush, then device shutdown
-    // (NVMe Flush + CC.SHN, ...).
-    before_transition(SyncStep::Sync);
+    // Final persistent-log flush, then device shutdown (NVMe Flush + CC.SHN,
+    // ...). No sync: see [`before_transition`].
+    before_transition();
     // SAFETY: both reboot mechanisms hard-reset the platform —
     // they can't safely return.
     // SAFETY: Valid memory or trusted environment
@@ -221,27 +171,17 @@ pub fn reboot() -> ! {
     narf_arch::halt_forever();
 }
 
-/// Power off the system via ACPI S5. Reads `\_S5` from the AML
+/// Power off the system via ACPI S5 — Linux `kernel_power_off`: device
+/// shutdown, then the platform call; no filesystem sync (see
+/// [`before_transition`]). Reads `\_S5` from the AML
 /// namespace for the SLP_TYPa / SLP_TYPb pair and uses that pair verbatim:
 /// SLP_TYP is a platform-specific encoding, and zero is valid for S5 on QEMU
 /// q35. Falls back to the legacy values only when `_S5` is unavailable.
 /// Never returns on success.
 #[cfg(target_arch = "x86_64")]
 pub fn power_off() -> ! {
-    power_off_after(SyncStep::Sync)
-}
-
-/// [`power_off`] for a caller that already synced every filesystem itself
-/// (the orderly path, which bounds its sync with a deadline).
-#[cfg(target_arch = "x86_64")]
-pub fn power_off_synced() -> ! {
-    power_off_after(SyncStep::AlreadyDone)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn power_off_after(sync: SyncStep) -> ! {
     begin_transition("power-off");
-    before_transition(sync);
+    before_transition();
     let (slp_typ_a, slp_typ_b) = select_s5_sleep_types(narf_aml::evaluate_s5());
     // SAFETY: enters S5 — the platform powers off; this call
     // is documented to never return.
@@ -261,7 +201,7 @@ fn power_off_after(sync: SyncStep) -> ! {
 #[cfg(target_arch = "aarch64")]
 pub fn reboot() -> ! {
     begin_transition("reboot");
-    before_transition(SyncStep::Sync);
+    before_transition();
     // QEMU/KVM use HVC while bare-metal firmware commonly uses SMC. The
     // architecture PSCI layer owns that selection and the SMCCC clobber set.
     let _ = narf_arch::aarch64::psci::system_reset();
@@ -271,19 +211,8 @@ pub fn reboot() -> ! {
 /// aarch64 power-off via PSCI SYSTEM_OFF.
 #[cfg(target_arch = "aarch64")]
 pub fn power_off() -> ! {
-    power_off_after(SyncStep::Sync)
-}
-
-/// See the x86_64 [`power_off_synced`].
-#[cfg(target_arch = "aarch64")]
-pub fn power_off_synced() -> ! {
-    power_off_after(SyncStep::AlreadyDone)
-}
-
-#[cfg(target_arch = "aarch64")]
-fn power_off_after(sync: SyncStep) -> ! {
     begin_transition("power-off");
-    before_transition(sync);
+    before_transition();
     let _ = narf_arch::aarch64::psci::system_off();
     narf_arch::halt_forever();
 }
@@ -295,10 +224,5 @@ pub fn reboot() -> ! {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn power_off() -> ! {
-    narf_arch::halt_forever();
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub fn power_off_synced() -> ! {
     narf_arch::halt_forever();
 }

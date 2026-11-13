@@ -3562,14 +3562,11 @@ fn suspend_busy_driver_aborts_and_rolls_back() -> TestResult {
 }
 kernel_test_in!("power/suspend", suspend_busy_driver_aborts_and_rolls_back);
 
-// ── Shutdown ordering: filesystem sync before device shutdown ──────────
+// ── Shutdown: Linux reboot(2) / orderly_poweroff semantics ─────────────
 
 static TRANSITION_LOG: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<&'static str>> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-fn transition_log_sync() {
-    TRANSITION_LOG.lock().push("sync");
-}
 fn transition_log_nvme() {
     TRANSITION_LOG.lock().push("nvme-flush+shn");
 }
@@ -3577,70 +3574,68 @@ fn transition_log_other() {
     TRANSITION_LOG.lock().push("other-device");
 }
 
-/// Every reboot / power-off / halt runs the pre-shutdown filesystem sync
-/// BEFORE any device shutdown hook (NVMe Flush + CC.SHN): a commit issued
-/// after CC.SHN would never reach the media. Hooks still run in reverse
-/// registration order, and the orderly path (already synced) skips only the
-/// sync.
-fn smoke_power_shutdown_syncs_before_device_hooks() -> TestResult {
-    use crate::system::{
-        __swap_pre_shutdown_sync_for_test, __swap_shutdown_hooks_for_test, before_transition,
-        SyncStep,
-    };
-    let saved_sync = __swap_pre_shutdown_sync_for_test(Some(transition_log_sync));
+static MAPPED_SYNC_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn counting_mapped_sync(
+) -> core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = ()> + Send>> {
+    MAPPED_SYNC_CALLS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    alloc::boxed::Box::pin(async {})
+}
+
+/// `reboot(2)` RESTART / POWER_OFF / HALT reach `system::reboot` /
+/// `system::power_off`, whose prologue is `before_transition`: Linux
+/// `kernel_restart` / `kernel_power_off` — "reboot doesn't sync: do that
+/// yourself before calling this". The prologue runs the device shutdown
+/// hooks in reverse registration order and nothing else: no filesystem sync
+/// (`sync_all` not started) and no mapped-page write-back.
+fn smoke_power_reboot_path_does_not_sync() -> TestResult {
+    use crate::system::{__swap_shutdown_hooks_for_test, before_transition};
+    use core::sync::atomic::Ordering;
     let saved_hooks = __swap_shutdown_hooks_for_test(alloc::vec![
         ("nvme", transition_log_nvme as crate::system::ShutdownHook),
         ("other", transition_log_other as crate::system::ShutdownHook),
     ]);
+    let saved_mapped = crate::orderly::__swap_mapped_page_sync_for_test(Some(counting_mapped_sync));
+    MAPPED_SYNC_CALLS.store(0, Ordering::Release);
     TRANSITION_LOG.lock().clear();
-    before_transition(SyncStep::Sync);
-    let full = TRANSITION_LOG.lock().clone();
-    TRANSITION_LOG.lock().clear();
-    before_transition(SyncStep::AlreadyDone);
-    let synced = TRANSITION_LOG.lock().clone();
+    let syncs_before = narf_filesystem::sync_all::runs();
+    before_transition();
+    let syncs_after = narf_filesystem::sync_all::runs();
+    let log = TRANSITION_LOG.lock().clone();
+    crate::orderly::__swap_mapped_page_sync_for_test(saved_mapped);
     __swap_shutdown_hooks_for_test(saved_hooks);
-    __swap_pre_shutdown_sync_for_test(saved_sync);
-    if full != ["sync", "other-device", "nvme-flush+shn"] {
-        return TestResult::Fail("sync must run first, then hooks in reverse registration order");
+    if log != ["other-device", "nvme-flush+shn"] {
+        return TestResult::Fail("device hooks must run in reverse registration order");
     }
-    if synced != ["other-device", "nvme-flush+shn"] {
-        return TestResult::Fail("an already-synced transition must still run every hook");
+    if syncs_after != syncs_before || MAPPED_SYNC_CALLS.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("the reboot(2) path synced on its own");
     }
-    // The production sync step's install wiring is asserted by the
-    // userspace suite (`smoke_userspace_wait_init_installs_pre_shutdown_sync`):
-    // the installer is userspace's boot init, which lives above this crate
-    // and — in a kernel-test boot — runs only when a userspace test
-    // establishes it, so this smoke's verdict must not depend on which
-    // other suites shared the boot. The swaps above restored whatever was
-    // installed (production hook or none) verbatim.
     TestResult::Pass
 }
-kernel_test_in!(
-    "power/shutdown",
-    smoke_power_shutdown_syncs_before_device_hooks
-);
+kernel_test_in!("power/shutdown", smoke_power_reboot_path_does_not_sync);
 
 /// `orderly_poweroff` only records the request and wakes the worker — it is
-/// callable from interrupt context — the first reason wins, and a later
-/// request may only shorten the sync budget.
+/// callable from interrupt context — the first reason wins, and `force` is
+/// sticky (Linux: "do not override the pending "true"").
 fn smoke_power_orderly_request_is_irq_safe() -> TestResult {
     use crate::orderly::{
-        __hold_worker_for_test, __reset_for_test, orderly_poweroff, pending, sync_budget_ms,
-        OrderlyReason, DEFAULT_SYNC_BUDGET_MS,
+        __hold_worker_for_test, __reset_for_test, orderly_poweroff, pending, pending_forced,
+        take_request, OrderlyReason,
     };
     __hold_worker_for_test(true);
     __reset_for_test();
     let before = pending();
     narf_lib::context::enter_irq();
-    let first = orderly_poweroff(OrderlyReason::PowerButton, None);
+    let first = orderly_poweroff(OrderlyReason::PowerButton, false);
     narf_lib::context::exit_irq();
-    let second = orderly_poweroff(OrderlyReason::HwProtection, Some(5_000));
-    let third = orderly_poweroff(OrderlyReason::HwProtection, Some(9_000));
+    let unforced = pending_forced();
+    let second = orderly_poweroff(OrderlyReason::HwProtection, true);
+    let third = orderly_poweroff(OrderlyReason::PowerService, false);
     let reason = pending();
-    let budget = sync_budget_ms();
+    let forced = pending_forced();
+    let taken = take_request();
+    let cleared = pending().is_none() && !pending_forced();
     __reset_for_test();
-    let default_budget = sync_budget_ms();
-    let cleared = pending();
     __hold_worker_for_test(false);
     if before.is_some() {
         return TestResult::Fail("an orderly power-off was already pending");
@@ -3651,8 +3646,13 @@ fn smoke_power_orderly_request_is_irq_safe() -> TestResult {
     if reason != Some(OrderlyReason::PowerButton) {
         return TestResult::Fail("the first request's reason must win");
     }
-    if budget != 5_000 || default_budget != DEFAULT_SYNC_BUDGET_MS || cleared.is_some() {
-        return TestResult::Fail("sync budget must only shorten and default when unset");
+    if unforced || !forced {
+        return TestResult::Fail(
+            "force must be set by a forced request and never cleared by a later one",
+        );
+    }
+    if taken != Some((OrderlyReason::PowerButton, true)) || !cleared {
+        return TestResult::Fail("taking the request must return it and clear it");
     }
     TestResult::Pass
 }
@@ -3661,10 +3661,13 @@ kernel_test_in!("power/shutdown", smoke_power_orderly_request_is_irq_safe);
 /// ACPI power button, as Linux `acpi_button_notify`: with a reader open on
 /// the "Power Button" device the press is `KEY_POWER` 1, SYN, `KEY_POWER` 0,
 /// SYN for userspace (logind) and nothing else happens; with no reader the
-/// kernel requests the orderly power-off instead and queues no events.
+/// kernel requests an UNFORCED orderly power-off instead and queues no
+/// events.
 fn smoke_power_button_reports_key_power_or_falls_back() -> TestResult {
     use crate::button::{power_button_caps, report_press_on, PressOutcome, KEY_POWER};
-    use crate::orderly::{__hold_worker_for_test, __reset_for_test, pending, OrderlyReason};
+    use crate::orderly::{
+        __hold_worker_for_test, __reset_for_test, pending, pending_forced, OrderlyReason,
+    };
     use narf_input::evdev::{EventType, ROUTER};
 
     __hold_worker_for_test(true);
@@ -3674,6 +3677,19 @@ fn smoke_power_button_reports_key_power_or_falls_back() -> TestResult {
         ROUTER.unregister_device(id);
         __hold_worker_for_test(false);
         return TestResult::Fail("power button device does not declare KEY_POWER");
+    }
+    // `acpi_button_add`'s identity, which udev / logind match on.
+    if node.caps.name != "Power Button"
+        || node.caps.phys != "LNXPWRBN/button/input0"
+        || node.caps.id.bustype != narf_input::evdev::bus::HOST
+        || node.caps.id.product != 1
+        || !node
+            .caps
+            .has(EventType::Key, narf_input::evdev::key::KEY_WAKEUP)
+    {
+        ROUTER.unregister_device(id);
+        __hold_worker_for_test(false);
+        return TestResult::Fail("power button identity differs from acpi_button_add");
     }
 
     // A listener (logind) has the device open.
@@ -3698,6 +3714,7 @@ fn smoke_power_button_reports_key_power_or_falls_back() -> TestResult {
         any
     };
     let pending_without_reader = pending();
+    let forced = pending_forced();
 
     __reset_for_test();
     __hold_worker_for_test(false);
@@ -3727,12 +3744,302 @@ fn smoke_power_button_reports_key_power_or_falls_back() -> TestResult {
     if pending_without_reader != Some(OrderlyReason::PowerButton) {
         return TestResult::Fail("orderly power-off request missing its reason");
     }
+    if forced {
+        return TestResult::Fail("a button press must not force the power-off");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "power/shutdown",
     smoke_power_button_reports_key_power_or_falls_back
 );
+
+// ── Orderly power-off work (Linux `__orderly_poweroff`) ────────────────
+
+static HELPER_CALLS: narf_lib::sync::IrqSafeSpinLock<
+    alloc::vec::Vec<(
+        alloc::vec::Vec<alloc::string::String>,
+        alloc::vec::Vec<alloc::string::String>,
+    )>,
+> = narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn record_helper(argv: &[&str], envp: &[&str]) {
+    HELPER_CALLS.lock().push((
+        argv.iter()
+            .map(|s| alloc::string::String::from(*s))
+            .collect(),
+        envp.iter()
+            .map(|s| alloc::string::String::from(*s))
+            .collect(),
+    ));
+}
+
+fn helper_starts(argv: &[&str], envp: &[&str]) -> Result<(), i32> {
+    record_helper(argv, envp);
+    Ok(())
+}
+
+fn helper_missing(argv: &[&str], envp: &[&str]) -> Result<(), i32> {
+    record_helper(argv, envp);
+    Err(2)
+}
+
+/// Run one orderly power-off request through the real work function with a
+/// recording sync and power-off. Returns the outcome and the step log.
+fn run_orderly_work(
+    reason: crate::orderly::OrderlyReason,
+    force: bool,
+) -> (
+    Option<crate::orderly::OrderlyOutcome>,
+    alloc::vec::Vec<&'static str>,
+) {
+    let log = narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+    let outcome = poll_until_ready(crate::orderly::orderly_poweroff_work(
+        reason,
+        force,
+        crate::orderly::run_poweroff_cmd,
+        || async { log.lock().push("sync") },
+        || log.lock().push("power-off"),
+    ));
+    let steps = log.lock().clone();
+    (outcome, steps)
+}
+
+/// A power-button press nobody listens to runs `kernel.poweroff_cmd` —
+/// argv split on whitespace, Linux `run_cmd`'s environment — and nothing
+/// else: no kernel sync, no kernel power-off; userspace owns the shutdown.
+/// If the command cannot be started the unforced request does nothing more
+/// (Linux `__orderly_poweroff(false)`).
+fn smoke_orderly_button_runs_poweroff_cmd() -> TestResult {
+    use crate::button::{power_button_caps, report_press_on};
+    use crate::orderly::{
+        __hold_worker_for_test, __reset_for_test, __swap_usermode_helper_for_test, take_request,
+        OrderlyOutcome, HELPER_ENVP,
+    };
+    use narf_filesystem::procfs::sys_kernel::{poweroff_cmd, set_poweroff_cmd};
+    use narf_input::evdev::ROUTER;
+
+    __hold_worker_for_test(true);
+    __reset_for_test();
+    let saved_cmd = poweroff_cmd();
+    let saved_helper = __swap_usermode_helper_for_test(Some(helper_starts));
+    HELPER_CALLS.lock().clear();
+    let _ = set_poweroff_cmd("/sbin/poweroff");
+
+    let (id, node) = ROUTER.register_device(power_button_caps());
+    let _ = report_press_on(&node);
+    let request = take_request();
+    let (started, started_steps) = match request {
+        Some((reason, force)) => run_orderly_work(reason, force),
+        None => (None, alloc::vec::Vec::new()),
+    };
+    let calls_default = core::mem::take(&mut *HELPER_CALLS.lock());
+
+    // A configured command with arguments.
+    let _ = set_poweroff_cmd("/usr/bin/systemctl  poweroff --no-wall");
+    let _ = report_press_on(&node);
+    let configured = take_request().map(|(r, f)| run_orderly_work(r, f));
+    let calls_configured = core::mem::take(&mut *HELPER_CALLS.lock());
+
+    // The command cannot be started: not forced, so nothing more.
+    __swap_usermode_helper_for_test(Some(helper_missing));
+    let _ = report_press_on(&node);
+    let failed = take_request().map(|(r, f)| run_orderly_work(r, f));
+
+    ROUTER.unregister_device(id);
+    __swap_usermode_helper_for_test(saved_helper);
+    let _ = set_poweroff_cmd(&saved_cmd);
+    __reset_for_test();
+    __hold_worker_for_test(false);
+
+    if started != Some(OrderlyOutcome::HelperStarted) || !started_steps.is_empty() {
+        return TestResult::Fail("a started poweroff command must be the whole kernel action");
+    }
+    let envp: alloc::vec::Vec<alloc::string::String> = HELPER_ENVP
+        .iter()
+        .map(|s| alloc::string::String::from(*s))
+        .collect();
+    if calls_default.len() != 1
+        || calls_default[0].0 != ["/sbin/poweroff"]
+        || calls_default[0].1 != envp
+    {
+        return TestResult::Fail("the press did not run /sbin/poweroff with run_cmd's environment");
+    }
+    if configured.map(|(o, _)| o) != Some(Some(OrderlyOutcome::HelperStarted))
+        || calls_configured.len() != 1
+        || calls_configured[0].0 != ["/usr/bin/systemctl", "poweroff", "--no-wall"]
+    {
+        return TestResult::Fail("kernel.poweroff_cmd was not split into argv and run");
+    }
+    match failed {
+        Some((Some(OrderlyOutcome::HelperFailed(2)), steps)) if steps.is_empty() => {}
+        _ => {
+            return TestResult::Fail(
+                "an unforced request whose command fails must not sync or power off",
+            )
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/orderly", smoke_orderly_button_runs_poweroff_cmd);
+
+static INFLIGHT_WRITE_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn hook_checks_inflight_io() {
+    TRANSITION_LOG.lock().push(
+        if INFLIGHT_WRITE_DONE.load(core::sync::atomic::Ordering::Acquire) {
+            "shn-after-io"
+        } else {
+            "shn-during-io"
+        },
+    );
+}
+
+/// A user write still in flight: pending for a few polls, then done.
+struct InFlightWrite(u32);
+
+impl core::future::Future for InFlightWrite {
+    type Output = ();
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.0 == 0 {
+            INFLIGHT_WRITE_DONE.store(true, core::sync::atomic::Ordering::Release);
+            return core::task::Poll::Ready(());
+        }
+        self.0 -= 1;
+        core::task::Poll::Pending
+    }
+}
+
+/// The forced fallback (Linux `__orderly_poweroff(true)` after the helper
+/// failed): emergency sync, then the kernel power-off. The sync — here a
+/// user task's write still in flight, which the sync waits for — completes
+/// before any device is shut down: the block device's shutdown hook never
+/// runs while that I/O is outstanding.
+fn smoke_orderly_forced_fallback_syncs_then_powers_off() -> TestResult {
+    use crate::orderly::{
+        __swap_usermode_helper_for_test, orderly_poweroff_work, run_poweroff_cmd, OrderlyOutcome,
+        OrderlyReason,
+    };
+    use core::sync::atomic::Ordering;
+
+    let saved_helper = __swap_usermode_helper_for_test(Some(helper_missing));
+    let saved_hooks = crate::system::__swap_shutdown_hooks_for_test(alloc::vec![(
+        "nvme",
+        hook_checks_inflight_io as crate::system::ShutdownHook
+    )]);
+    HELPER_CALLS.lock().clear();
+    TRANSITION_LOG.lock().clear();
+    INFLIGHT_WRITE_DONE.store(false, Ordering::Release);
+
+    let sync_started = core::sync::atomic::AtomicBool::new(false);
+    let outcome = poll_until_ready(orderly_poweroff_work(
+        OrderlyReason::HwProtection,
+        true,
+        run_poweroff_cmd,
+        || {
+            sync_started.store(true, Ordering::Release);
+            InFlightWrite(3)
+        },
+        // `kernel_power_off`'s device-shutdown step, against the swapped
+        // hook list.
+        crate::system::before_transition,
+    ));
+    let log = TRANSITION_LOG.lock().clone();
+    let helper_tried = HELPER_CALLS.lock().len();
+
+    crate::system::__swap_shutdown_hooks_for_test(saved_hooks);
+    __swap_usermode_helper_for_test(saved_helper);
+
+    if helper_tried != 1 {
+        return TestResult::Fail("the forced request did not try the poweroff command first");
+    }
+    if outcome != Some(OrderlyOutcome::Forced(2)) || !sync_started.load(Ordering::Acquire) {
+        return TestResult::Fail("a forced request whose command fails must sync and power off");
+    }
+    if log != ["shn-after-io"] {
+        return TestResult::Fail("a block device was shut down while user I/O was in flight");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/orderly",
+    smoke_orderly_forced_fallback_syncs_then_powers_off
+);
+
+/// An interrupt-context `power_off()` request is served by the worker as
+/// the kernel power-off the caller asked for: no poweroff command, no sync.
+fn smoke_orderly_irq_request_is_kernel_power_off() -> TestResult {
+    use crate::orderly::{OrderlyOutcome, OrderlyReason, __swap_usermode_helper_for_test};
+    let saved_helper = __swap_usermode_helper_for_test(Some(helper_starts));
+    HELPER_CALLS.lock().clear();
+    let (outcome, steps) = run_orderly_work(OrderlyReason::IrqContextRequest, true);
+    let calls = HELPER_CALLS.lock().len();
+    __swap_usermode_helper_for_test(saved_helper);
+    if outcome != Some(OrderlyOutcome::KernelPowerOff) || steps != ["power-off"] || calls != 0 {
+        return TestResult::Fail("an IRQ-context power-off must be a plain kernel power-off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/orderly",
+    smoke_orderly_irq_request_is_kernel_power_off
+);
+
+/// `hw_protection_shutdown` (Linux `__hw_protection_trigger`): once per
+/// boot it arms the forced power-off for `ms_until_forced` and requests a
+/// FORCED orderly power-off; a second trip changes nothing.
+fn smoke_orderly_hw_protection_arms_once() -> TestResult {
+    use crate::orderly::{
+        __emergency_delay_ms_for_test, __hold_worker_for_test, __reset_for_test,
+        hw_protection_shutdown, pending, pending_forced, OrderlyReason,
+    };
+    __hold_worker_for_test(true);
+    __reset_for_test();
+    narf_lib::context::enter_irq();
+    hw_protection_shutdown("test trip", 7_000);
+    narf_lib::context::exit_irq();
+    let reason = pending();
+    let forced = pending_forced();
+    let armed = __emergency_delay_ms_for_test();
+    hw_protection_shutdown("second trip", 1_000);
+    let rearmed = __emergency_delay_ms_for_test();
+    // Disarm before releasing the hold: the watchdog re-checks the armed
+    // delay after its sleep and goes back to waiting.
+    __reset_for_test();
+    __hold_worker_for_test(false);
+    if reason != Some(OrderlyReason::HwProtection) || !forced {
+        return TestResult::Fail("a protection trip must request a forced orderly power-off");
+    }
+    if armed != 7_000 || rearmed != 7_000 {
+        return TestResult::Fail(
+            "the emergency power-off must be armed once, with the first delay",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/orderly", smoke_orderly_hw_protection_arms_once);
+
+/// The emergency sync's report counts what actually happened: a filesystem
+/// whose `syncfs` failed (an aborted btrfs) is failed, never synced.
+fn smoke_orderly_sync_report_is_honest() -> TestResult {
+    let line = crate::orderly::sync_report_line(&narf_filesystem::sync_all::SyncReport {
+        filesystems: 54,
+        fs_errors: 1,
+        disks_flushed: 2,
+        flush_errors: 0,
+    });
+    if !line.contains("synced 53 of 54 filesystem(s) (1 failed)")
+        || !line.contains("flushed 2 of 2 disk(s) (0 failed)")
+    {
+        return TestResult::Fail("the sync report counts a failed filesystem as synced");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/orderly", smoke_orderly_sync_report_is_honest);
 
 // ── Power service (event → policy → action) ─────────────────────────
 
@@ -4386,10 +4693,10 @@ fn poll_until_ready<F: core::future::Future>(future: F) -> Option<F::Output> {
     None
 }
 
-/// The sync both the orderly power-off and the forced (emergency) one run
-/// writes the unwritten mapped pages before it syncs the filesystems — the
-/// `reboot(2)` path already did; these two skipped them — and a stuck
-/// device cannot hold it past its deadline.
+/// The emergency sync of the forced fallback writes the unwritten mapped
+/// pages before it syncs the filesystems (Linux `do_sync_work`: inodes'
+/// pages, then `sync_fs`), and a stuck device cannot hold it past its
+/// deadline.
 fn smoke_orderly_sync_writes_mapped_pages_first() -> TestResult {
     use core::sync::atomic::Ordering;
     let saved = crate::orderly::__swap_mapped_page_sync_for_test(Some(recording_mapped_sync));

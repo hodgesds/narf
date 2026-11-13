@@ -1,28 +1,44 @@
-//! Orderly power-off from contexts that must not power off themselves —
-//! Linux `kernel/reboot.c::orderly_poweroff` / `hw_protection_shutdown`.
+//! Orderly power-off — Linux `kernel/reboot.c::orderly_poweroff` /
+//! `__hw_protection_trigger`.
 //!
-//! Linux never powers the machine off from the code that noticed the reason:
-//! the ACPI power button only reports `KEY_POWER` (`acpi_button_notify`) and
-//! logind decides; a thermal trip calls `orderly_poweroff(force)` /
-//! `hw_protection_shutdown`, which queue `poweroff_work` so the shutdown runs
-//! from a workqueue (task context), first trying the userspace `poweroff`
-//! helper and, if that fails and `force` is set, falling back to
-//! `emergency_sync()` + `kernel_power_off()`. `hw_protection_shutdown`
-//! additionally arms `hw_failure_emergency_poweroff(ms)`: if nothing has
-//! powered the machine off when the delay expires, it is forced.
+//! Linux never powers the machine off from the code that noticed the reason.
+//! `orderly_poweroff(force)` (callable from any context) only queues
+//! `poweroff_work`; the work runs `__orderly_poweroff(force)`, which starts
+//! the userspace `kernel.poweroff_cmd` (default `/sbin/poweroff`) as a
+//! usermode helper with `UMH_WAIT_EXEC`. When the helper starts, userspace
+//! (systemd) owns the shutdown: it stops services, syncs, unmounts / remounts
+//! read-only and finally calls `reboot(LINUX_REBOOT_CMD_POWER_OFF)`. Only if
+//! the helper could not be started and `force` is set does the kernel take
+//! over: `emergency_sync()` then `kernel_power_off()`.
+//! `__hw_protection_trigger` (thermal trips) additionally arms
+//! `hw_failure_emergency_action_work`: if the machine is still up
+//! `ms_until_forced` later, `kernel_power_off()` (no sync) is forced.
 //!
-//! NARF has no usermode helper, so the worker here is that forced fallback,
-//! made orderly: sync every mounted filesystem (bounded), then
-//! [`crate::system::power_off_synced`], which still runs the device shutdown
-//! hooks (NVMe Flush + CC.SHN). [`orderly_poweroff`] only records the request
-//! and wakes the worker, so it is safe from interrupt context and from under
-//! IRQ-disabling spinlocks.
+//! NARF mirrors that:
+//!
+//! - [`orderly_poweroff`] records the request and wakes the worker; it is
+//!   safe from interrupt context and from under IRQ-disabling spinlocks.
+//! - The worker ([`start_worker`]) runs the command through the usermode
+//!   helper the userspace layer installs ([`install_usermode_helper`]).
+//! - The forced fallback ([`emergency_sync`] + [`crate::system::power_off`])
+//!   runs only when the helper failed and the request was forced. NARF's
+//!   emergency sync is bounded and finishes BEFORE the device shutdown hooks
+//!   run, where Linux's `emergency_sync()` only queues `do_sync_work` and
+//!   `kernel_power_off()` proceeds concurrently with it — a deliberate
+//!   strengthening: a filesystem commit that lands after NVMe CC.SHN never
+//!   reaches the media. Like Linux, the forced path neither freezes nor kills
+//!   user tasks; I/O already in flight when the device shutdown starts is
+//!   drained by the driver (NVMe waits `NVME_IO_TIMEOUT` for it, as
+//!   `nvme_dev_disable(shutdown = true)` does).
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use narf_filesystem::sync_all::SyncReport;
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Why an orderly power-off was requested.
@@ -33,7 +49,9 @@ pub enum OrderlyReason {
     /// A hardware-protection trip (critical temperature).
     HwProtection,
     /// `reboot()` / `power_off()` was called from interrupt context, which
-    /// is refused and turned into this request.
+    /// is refused and turned into this request. The worker runs the kernel
+    /// power-off the caller asked for — no helper, no sync, as
+    /// `kernel_power_off` itself does neither.
     IrqContextRequest,
     /// The power service's policy requested a power-off (e.g. a
     /// re-policied button action); executed by the service's action
@@ -71,41 +89,48 @@ impl OrderlyReason {
     }
 }
 
-/// Bound on the filesystem sync when the requester gave none. A sync that
-/// has not finished by then is abandoned with a loud log and the device
-/// shutdown hooks run anyway (NVMe CC.SHN still commits the drive's cache).
-pub const DEFAULT_SYNC_BUDGET_MS: u64 = 60_000;
+/// Bound on the forced fallback's [`emergency_sync`]. Linux's
+/// `emergency_sync` is unbounded but asynchronous (the power-off does not
+/// wait for it); NARF waits for it, so it must be bounded: a sync that has
+/// not finished by then is abandoned with a loud log and the device shutdown
+/// hooks run anyway (NVMe CC.SHN still commits the drive's cache).
+pub const EMERGENCY_SYNC_BUDGET_MS: u64 = 60_000;
 
 /// Pending request (`OrderlyReason::encode`), 0 = none.
 static REQUEST: AtomicU8 = AtomicU8::new(0);
-/// Sync budget for the pending request, ms (0 = [`DEFAULT_SYNC_BUDGET_MS`]).
-/// A later request can only shorten it.
-static BUDGET_MS: AtomicU64 = AtomicU64::new(0);
+/// Linux `poweroff_force`: sticky once any request asked for it, so a later
+/// unforced request never clears a pending forced one.
+static FORCE: AtomicBool = AtomicBool::new(false);
 /// The worker's waker, parked while no request is pending.
 static WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
 static WORKER_SPAWNED: AtomicBool = AtomicBool::new(false);
-/// Test-only: while set, the worker does not act on a pending request, so a
-/// model test can raise one without powering the test machine off.
+/// Test-only: while set, the worker and the emergency watchdog do not act,
+/// so a model test can raise a request without powering the test machine
+/// off.
 static HOLD: AtomicBool = AtomicBool::new(false);
 
-/// Request an orderly power-off: record `reason` (the first one wins) and
-/// the sync budget, then wake the worker. Returns `true` when this call made
-/// the request, `false` when one was already pending.
+/// Linux `orderly_poweroff(force)`: record `reason` (the first pending one
+/// wins) and `force`, then wake the worker. Returns `true` when this call
+/// made the request, `false` when one was already pending (Linux
+/// `schedule_work` on a pending work is a no-op too).
 ///
 /// Safe from any context, including interrupt handlers: no allocation, no
 /// sleeping, one IRQ-safe lock for the waker. If the worker is not running
 /// yet (early boot) the request waits for it.
-pub fn orderly_poweroff(reason: OrderlyReason, sync_budget_ms: Option<u64>) -> bool {
-    if let Some(ms) = sync_budget_ms {
-        let ms = ms.max(1);
-        let _ = BUDGET_MS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-            (cur == 0 || ms < cur).then_some(ms)
-        });
+pub fn orderly_poweroff(reason: OrderlyReason, force: bool) -> bool {
+    if force {
+        // "do not override the pending "true"".
+        FORCE.store(true, Ordering::Release);
     }
     let first = REQUEST
         .compare_exchange(0, reason.encode(), Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
-    let waker = WAKER.lock().take();
+    wake(&WAKER);
+    first
+}
+
+fn wake(slot: &IrqSafeSpinLock<Option<Waker>>) {
+    let waker = slot.lock().take();
     if let Some(w) = waker {
         if narf_lib::context::in_irq() {
             // Never run the wake (and its Arc traffic) inside the IRQ.
@@ -114,7 +139,6 @@ pub fn orderly_poweroff(reason: OrderlyReason, sync_budget_ms: Option<u64>) -> b
             w.wake();
         }
     }
-    first
 }
 
 /// The pending request, if any.
@@ -122,22 +146,36 @@ pub fn pending() -> Option<OrderlyReason> {
     OrderlyReason::decode(REQUEST.load(Ordering::Acquire))
 }
 
-/// Sync budget the worker would use for the pending request.
-pub fn sync_budget_ms() -> u64 {
-    match BUDGET_MS.load(Ordering::Acquire) {
-        0 => DEFAULT_SYNC_BUDGET_MS,
-        ms => ms,
+/// Whether the pending request is forced.
+pub fn pending_forced() -> bool {
+    FORCE.load(Ordering::Acquire)
+}
+
+/// Take the pending request: its reason and whether it is forced.
+pub(crate) fn take_request() -> Option<(OrderlyReason, bool)> {
+    let force = FORCE.swap(false, Ordering::AcqRel);
+    match OrderlyReason::decode(REQUEST.swap(0, Ordering::AcqRel)) {
+        Some(r) => Some((r, force)),
+        None => {
+            if force {
+                FORCE.store(true, Ordering::Release);
+            }
+            None
+        }
     }
 }
 
-/// Clear any pending request. Test-only.
+/// Clear any pending request and the hardware-protection latch. Test-only.
 #[doc(hidden)]
 pub fn __reset_for_test() {
     REQUEST.store(0, Ordering::Release);
-    BUDGET_MS.store(0, Ordering::Release);
+    FORCE.store(false, Ordering::Release);
+    HW_PROTECTION_TRIGGERED.store(false, Ordering::Release);
+    EMERGENCY_DELAY_MS.store(0, Ordering::Release);
 }
 
-/// Hold (or release) the worker. Test-only; see [`HOLD`].
+/// Hold (or release) the worker and the emergency watchdog. Test-only; see
+/// [`HOLD`].
 #[doc(hidden)]
 pub fn __hold_worker_for_test(hold: bool) {
     HOLD.store(hold, Ordering::Release);
@@ -148,34 +186,180 @@ pub fn __hold_worker_for_test(hold: bool) {
 struct RequestPending;
 
 impl Future for RequestPending {
-    type Output = OrderlyReason;
+    type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<OrderlyReason> {
-        let ready = || pending().filter(|_| !HOLD.load(Ordering::Acquire));
-        if let Some(r) = ready() {
-            return Poll::Ready(r);
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let ready = || pending().is_some() && !HOLD.load(Ordering::Acquire);
+        if ready() {
+            return Poll::Ready(());
         }
         *WAKER.lock() = Some(cx.waker().clone());
         // Re-check after publishing the waker: a request that landed between
         // the first check and the store would otherwise sleep forever.
-        match ready() {
-            Some(r) => Poll::Ready(r),
-            None => Poll::Pending,
+        if ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 }
 
-/// Spawn the worker task (idempotent). Called from a Stage::Late initcall,
-/// once the executor runs.
+/// Spawn the worker and the hardware-protection watchdog (idempotent).
+/// Called from a Stage::Late initcall, once the executor runs.
 pub fn start_worker() {
     if WORKER_SPAWNED.swap(true, Ordering::AcqRel) {
         return;
     }
+    // Linux `poweroff_work`: one request at a time, and a request after a
+    // helper that started (a second button press while systemd is already
+    // shutting down) runs the command again.
     narf_scheduler::spawn(async {
-        let reason = RequestPending.await;
-        run(reason).await;
+        loop {
+            RequestPending.await;
+            let Some((reason, force)) = take_request() else {
+                continue;
+            };
+            let _ = orderly_poweroff_work(
+                reason,
+                force,
+                run_poweroff_cmd,
+                emergency_sync,
+                kernel_power_off,
+            )
+            .await;
+        }
     });
+    narf_scheduler::spawn(hw_failure_emergency_watchdog());
 }
+
+// ── Usermode helper (Linux `call_usermodehelper(.., UMH_WAIT_EXEC)`) ──
+
+/// Start `argv[0]` as a user process with `argv` / `envp` and return once
+/// it has been exec'd (Linux `UMH_WAIT_EXEC`): `Ok` when the program is
+/// running, `Err(errno)` when it could not be started. Installed by
+/// `narf_userspace`, which owns process creation.
+pub type UsermodeHelper = fn(argv: &[&str], envp: &[&str]) -> Result<(), i32>;
+
+static USERMODE_HELPER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the usermode helper. Idempotent.
+pub fn install_usermode_helper(helper: UsermodeHelper) {
+    USERMODE_HELPER.store(helper as usize, Ordering::Release);
+}
+
+/// Swap the helper, returning the old one. Test-only.
+#[doc(hidden)]
+pub fn __swap_usermode_helper_for_test(helper: Option<UsermodeHelper>) -> Option<UsermodeHelper> {
+    let old = USERMODE_HELPER.swap(helper.map_or(0, |h| h as usize), Ordering::AcqRel);
+    // SAFETY: only `UsermodeHelper` pointers (or 0) are stored.
+    (old != 0).then(|| unsafe { core::mem::transmute::<usize, UsermodeHelper>(old) })
+}
+
+fn usermode_helper() -> Option<UsermodeHelper> {
+    let raw = USERMODE_HELPER.load(Ordering::Acquire);
+    // SAFETY: only `UsermodeHelper` pointers (or 0) are stored.
+    (raw != 0).then(|| unsafe { core::mem::transmute::<usize, UsermodeHelper>(raw) })
+}
+
+/// The helper's environment (`kernel/reboot.c::run_cmd`).
+pub const HELPER_ENVP: [&str; 2] = ["HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin"];
+
+/// `ENOENT`: what the helper reports for a missing program.
+const ENOENT: i32 = 2;
+
+/// Linux `run_cmd(cmd)`: `argv_split` on whitespace, then the usermode
+/// helper with [`HELPER_ENVP`]. An empty command has no program (`ENOENT`,
+/// as `call_usermodehelper_exec` with a NULL path reports); no helper
+/// installed (no userspace layer) reports the same.
+pub fn run_cmd(cmd: &str) -> Result<(), i32> {
+    let argv: Vec<&str> = cmd.split_ascii_whitespace().collect();
+    if argv.is_empty() {
+        return Err(ENOENT);
+    }
+    match usermode_helper() {
+        Some(helper) => helper(&argv, &HELPER_ENVP),
+        None => Err(ENOENT),
+    }
+}
+
+/// `run_cmd(poweroff_cmd)`, reading the live `kernel.poweroff_cmd`.
+pub(crate) fn run_poweroff_cmd() -> Result<(), i32> {
+    let cmd: String = narf_filesystem::procfs::sys_kernel::poweroff_cmd();
+    use core::fmt::Write as _;
+    let _ = writeln!(narf_console::Writer, "power: running '{cmd}'");
+    run_cmd(&cmd)
+}
+
+// ── The work ───────────────────────────────────────────────────────
+
+/// What one orderly power-off request did (the worker's return value; the
+/// forced path does not return in production).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OrderlyOutcome {
+    /// The poweroff command was started: userspace now owns the shutdown.
+    HelperStarted,
+    /// The command could not be started and the request was not forced:
+    /// nothing more happens (Linux `__orderly_poweroff(false)`).
+    HelperFailed(i32),
+    /// The command could not be started and the request was forced: the
+    /// emergency sync ran, then the kernel power-off.
+    Forced(i32),
+    /// An interrupt-context `power_off()`: the kernel power-off ran.
+    KernelPowerOff,
+}
+
+/// Linux `__orderly_poweroff(force)`, with the three steps it takes passed
+/// in so a model test can run it without powering the machine off: `run`
+/// starts the poweroff command, `sync` is the emergency sync, `power_off`
+/// the kernel power-off (in production [`crate::system::power_off`], which
+/// does not return).
+pub(crate) async fn orderly_poweroff_work<S, F>(
+    reason: OrderlyReason,
+    force: bool,
+    run: impl FnOnce() -> Result<(), i32>,
+    sync: S,
+    power_off: impl FnOnce(),
+) -> OrderlyOutcome
+where
+    S: FnOnce() -> F,
+    F: Future<Output = ()>,
+{
+    use core::fmt::Write as _;
+    if reason == OrderlyReason::IrqContextRequest {
+        power_off();
+        return OrderlyOutcome::KernelPowerOff;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "power: orderly power-off ({})",
+        reason.as_str()
+    );
+    let err = match run() {
+        Ok(()) => return OrderlyOutcome::HelperStarted,
+        Err(e) => e,
+    };
+    if !force {
+        let _ = writeln!(
+            narf_console::Writer,
+            "power: failed to start orderly shutdown (errno {err}); not forced, nothing more to do"
+        );
+        return OrderlyOutcome::HelperFailed(err);
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "power: failed to start orderly shutdown (errno {err}): forcing the issue"
+    );
+    sync().await;
+    power_off();
+    OrderlyOutcome::Forced(err)
+}
+
+/// The forced fallback's kernel power-off (Linux `kernel_power_off`).
+fn kernel_power_off() {
+    crate::system::power_off();
+}
+
+// ── Emergency sync (Linux `fs/sync.c::emergency_sync`) ────────────
 
 /// Writes back the file data that lives only in the kernel's own caches
 /// above the filesystems — dirty `MAP_SHARED` pages — so that a filesystem
@@ -183,7 +367,7 @@ pub fn start_worker() {
 /// cache.
 pub type MappedPageSync = fn() -> Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send>>;
 
-static MAPPED_PAGE_SYNC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static MAPPED_PAGE_SYNC: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the [`MappedPageSync`] hook. Idempotent.
 pub fn install_mapped_page_sync(hook: MappedPageSync) {
@@ -204,12 +388,11 @@ fn mapped_page_sync() -> Option<MappedPageSync> {
     (raw != 0).then(|| unsafe { core::mem::transmute::<usize, MappedPageSync>(raw) })
 }
 
-/// The filesystem sync of a power-off that does not go through `reboot(2)`:
-/// first the mapped pages (the hook), then `filesystems` — the order of
-/// Linux's `sync()`, which writes the page cache before the filesystems
-/// commit. Both are bounded together by `deadline`: a device that stops
-/// answering must not keep a thermal power-off from happening. Returns
-/// `None` when the deadline cut it short.
+/// The emergency sync's write-back: first the mapped pages (the hook), then
+/// `filesystems` — the order of Linux's `do_sync_work`, which writes the
+/// inodes' pages before `sync_fs`. Both are bounded together by `deadline`:
+/// a device that stops answering must not keep a forced power-off from
+/// happening. Returns `None` when the deadline cut it short.
 pub(crate) async fn shutdown_sync<F: Future>(
     deadline: narf_time::Deadline,
     filesystems: F,
@@ -225,93 +408,131 @@ pub(crate) async fn shutdown_sync<F: Future>(
     .ok()
 }
 
-/// How long the forced power-off of a hardware protection shutdown spends
-/// syncing before it powers off anyway (Linux `emergency_sync` is likewise
-/// best effort).
-const EMERGENCY_SYNC_MS: u64 = 2_000;
+/// The console line for a finished sync. Counts what actually succeeded: a
+/// filesystem whose `syncfs` failed (an aborted btrfs) is reported as failed,
+/// never as synced.
+pub fn sync_report_line(r: &SyncReport) -> String {
+    alloc::format!(
+        "power: synced {} of {} filesystem(s) ({} failed), flushed {} of {} disk(s) ({} failed)",
+        r.filesystems.saturating_sub(r.fs_errors),
+        r.filesystems,
+        r.fs_errors,
+        r.disks_flushed.saturating_sub(r.flush_errors),
+        r.disks_flushed,
+        r.flush_errors
+    )
+}
 
-/// The worker body after a request: sync (bounded), then power off.
-async fn run(reason: OrderlyReason) {
+/// Linux `emergency_sync()`: write back what can still be written — mapped
+/// pages, then every mounted filesystem's `syncfs`, then a flush per disk —
+/// bounded by [`EMERGENCY_SYNC_BUDGET_MS`].
+pub async fn emergency_sync() {
     use core::fmt::Write as _;
-    let budget = sync_budget_ms();
-    let _ = writeln!(
-        narf_console::Writer,
-        "power: orderly power-off ({}): syncing filesystems (budget {} ms)",
-        reason.as_str(),
-        budget
-    );
-    let deadline = narf_time::Deadline::after_ms(budget);
+    let deadline = narf_time::Deadline::after_ms(EMERGENCY_SYNC_BUDGET_MS);
     match shutdown_sync(deadline, narf_filesystem::sync_all::sync_all()).await {
         Some(r) => {
-            let _ = writeln!(
-                narf_console::Writer,
-                "power: synced {} filesystem(s) ({} failed), flushed {} disk(s) ({} failed)",
-                r.filesystems,
-                r.fs_errors,
-                r.disks_flushed,
-                r.flush_errors
-            );
+            let _ = writeln!(narf_console::Writer, "{}", sync_report_line(&r));
+            let _ = writeln!(narf_console::Writer, "power: emergency sync complete");
         }
         None => {
             let _ = writeln!(
                 narf_console::Writer,
-                "power: WARNING: filesystem sync did not finish in {budget} ms; \
+                "power: WARNING: emergency sync did not finish in {EMERGENCY_SYNC_BUDGET_MS} ms; \
                  powering off anyway (device shutdown still flushes the disks)"
             );
         }
     }
-    crate::system::power_off_synced();
 }
 
-/// Linux `hw_protection_shutdown(reason, ms_until_forced)`: request an
-/// orderly power-off whose filesystem sync gets at most `ms_until_forced`,
-/// and — when called from task context — arm an independent timer that
-/// forces the power-off if no transition has started `ms_until_forced`
-/// later still (Linux `hw_failure_emergency_poweroff`): the worker may be
-/// starved, or stuck in a filesystem that never yields. The forced path
-/// skips the filesystem sync but still runs the device shutdown hooks.
+// ── Hardware protection (Linux `__hw_protection_trigger`) ──────────
+
+/// Linux `__hw_protection_trigger`'s `allow_proceed`: a protection shutdown
+/// is initiated once.
+static HW_PROTECTION_TRIGGERED: AtomicBool = AtomicBool::new(false);
+/// Armed delay of `hw_failure_emergency_action_work`, ms (0 = unarmed).
+static EMERGENCY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+static EMERGENCY_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
+
+/// Resolves to the armed delay once the watchdog has been armed.
+#[derive(Debug)]
+struct EmergencyArmed;
+
+impl Future for EmergencyArmed {
+    type Output = u64;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
+        let ready = || match EMERGENCY_DELAY_MS.load(Ordering::Acquire) {
+            0 => None,
+            ms => Some(ms),
+        };
+        if let Some(ms) = ready() {
+            return Poll::Ready(ms);
+        }
+        *EMERGENCY_WAKER.lock() = Some(cx.waker().clone());
+        match ready() {
+            Some(ms) => Poll::Ready(ms),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// Linux `hw_failure_emergency_action_func`: `ms_until_forced` after a
+/// protection trip, if the machine is still up — the helper hung, or
+/// userspace's shutdown is stuck — force `kernel_power_off()`. Like Linux it
+/// does not sync. Spawned once by [`start_worker`], so arming it needs no
+/// allocation and works from interrupt context.
+async fn hw_failure_emergency_watchdog() {
+    use core::fmt::Write as _;
+    let delay = loop {
+        let delay = EmergencyArmed.await;
+        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(delay).as_instant()).await;
+        // Disarmed meanwhile (a model test's reset), or held: wait again.
+        if EMERGENCY_DELAY_MS.load(Ordering::Acquire) == 0 || HOLD.load(Ordering::Acquire) {
+            EMERGENCY_DELAY_MS.store(0, Ordering::Release);
+            continue;
+        }
+        break delay;
+    };
+    if crate::system::transition_started() {
+        return;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "power: EMERGENCY: hardware protection timed out after {delay} ms; trying forced shutdown"
+    );
+    kernel_power_off();
+}
+
+/// Linux `hw_protection_shutdown(reason, ms_until_forced)`
+/// (`__hw_protection_trigger(.., HWPROT_ACT_SHUTDOWN)`): once per boot, arm
+/// the forced power-off for `ms_until_forced` later (0 = never) and request a
+/// forced orderly power-off — the poweroff command, or, if it cannot be
+/// started, the emergency sync and the kernel power-off.
 ///
-/// Returns immediately; never powers off from the caller's own frame.
+/// Returns immediately; never powers off from the caller's own frame. Safe
+/// from interrupt context.
+///
+/// LINUX-GAP: the `hw_protection=reboot` action (`orderly_reboot`) is not
+/// implemented; the protection action is always a shutdown.
 pub fn hw_protection_shutdown(reason: &str, ms_until_forced: u64) {
     use core::fmt::Write as _;
     let _ = writeln!(
         narf_console::Writer,
-        "power: hardware protection shutdown ({reason})"
+        "power: HARDWARE PROTECTION shutdown ({reason})"
     );
-    orderly_poweroff(OrderlyReason::HwProtection, Some(ms_until_forced));
-    if narf_lib::context::in_irq() {
-        // No allocation from an IRQ; the worker's own sync bound applies.
+    // "Shutdown should be initiated only once."
+    if HW_PROTECTION_TRIGGERED.swap(true, Ordering::AcqRel) {
         return;
     }
-    static FORCED_ARMED: AtomicBool = AtomicBool::new(false);
-    if FORCED_ARMED.swap(true, Ordering::AcqRel) {
-        return;
+    if ms_until_forced > 0 {
+        EMERGENCY_DELAY_MS.store(ms_until_forced, Ordering::Release);
+        wake(&EMERGENCY_WAKER);
     }
-    let delay = ms_until_forced.saturating_mul(2).max(1_000);
-    narf_scheduler::spawn(async move {
-        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(delay).as_instant()).await;
-        if crate::system::transition_started() {
-            return;
-        }
-        let _ = writeln!(
-            narf_console::Writer,
-            "power: EMERGENCY: orderly power-off did not start within {delay} ms; forcing power-off"
-        );
-        // Linux `emergency_sync`: what can still be written in a bounded
-        // time, mapped pages first, then the filesystems.
-        let deadline = narf_time::Deadline::after_ms(EMERGENCY_SYNC_MS);
-        if shutdown_sync(deadline, narf_filesystem::sync_all::sync_all())
-            .await
-            .is_none()
-        {
-            let _ = writeln!(
-                narf_console::Writer,
-                "power: EMERGENCY: sync did not finish in {EMERGENCY_SYNC_MS} ms"
-            );
-        }
-        if crate::system::transition_started() {
-            return;
-        }
-        crate::system::power_off_synced();
-    });
+    orderly_poweroff(OrderlyReason::HwProtection, true);
+}
+
+/// The armed emergency delay (0 = unarmed). Test-only.
+#[doc(hidden)]
+pub fn __emergency_delay_ms_for_test() -> u64 {
+    EMERGENCY_DELAY_MS.load(Ordering::Acquire)
 }

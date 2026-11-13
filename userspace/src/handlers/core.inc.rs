@@ -14164,12 +14164,13 @@ pub fn wait_init() {
     if !SYSRQ_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         narf_scheduler::sleep_pumps::register(sysrq_pump);
     }
-    // Every reboot / power-off / halt syncs every mounted filesystem before
-    // the device shutdown hooks (NVMe Flush + CC.SHN) run. Idempotent.
-    narf_power::system::install_pre_shutdown_sync(pre_shutdown_sync);
-    // The orderly and emergency power-offs (power button, thermal trip) do
-    // not go through `reboot(2)`: they write the unwritten mapped pages
-    // through this hook before their own filesystem sync.
+    // The orderly power-off (power button with no logind, thermal trip)
+    // runs `kernel.poweroff_cmd` through this usermode helper, as Linux
+    // `__orderly_poweroff` does. `reboot(2)` itself does not sync: userspace
+    // has synced and remounted read-only before it calls it. Idempotent.
+    narf_power::orderly::install_usermode_helper(crate::umh::call_usermodehelper_exec);
+    // The forced fallback's emergency sync writes the unwritten mapped pages
+    // through this hook before it syncs the filesystems.
     narf_power::orderly::install_mapped_page_sync(mapped_page_sync);
     *PARENT_OF.lock() = Some(BTreeMap::new());
     parent_child_counts_init();
@@ -21279,45 +21280,3 @@ pub(crate) fn shm_ipc_namespace_drop(ipc_ns: u64) {
 /// continue to use `narf_userspace::handlers::sleep_pumps`.
 pub use narf_scheduler::sleep_pumps;
 
-/// Regression coverage for the shutdown sync wiring: `wait_init` — the
-/// userspace init a real boot runs once — must install the production
-/// pre-shutdown filesystem sync into `narf_power::system`, so every
-/// reboot / power-off / halt syncs filesystems before the device
-/// shutdown hooks (NVMe Flush + CC.SHN) run.
-///
-/// The assertion lives here, not in the `power/shutdown` ordering smoke:
-/// the installer is this crate's boot init, and in a kernel-test boot it
-/// runs only when a userspace test establishes it. The power smoke used
-/// to assert the installed hook itself and passed only in boots where a
-/// userspace test had already run — under the split kernel-test runner
-/// its boot contains no userspace test, and the assertion failed on a
-/// precondition this layer owns. Assert identity, not mere presence:
-/// the installed hook must be exactly `pre_shutdown_sync`.
-#[cfg(feature = "kernel-test")]
-mod pre_shutdown_sync_install_tests {
-    use narf_kernel_test::{kernel_test_in, TestResult};
-
-    fn smoke_userspace_wait_init_installs_pre_shutdown_sync() -> TestResult {
-        super::wait_init();
-        let installed = narf_power::system::__swap_pre_shutdown_sync_for_test(None);
-        // Restore before asserting: a failure must not leave the slot
-        // empty for later tests in the boot.
-        if let Some(hook) = installed {
-            narf_power::system::install_pre_shutdown_sync(hook);
-        }
-        // Compare in the slot's own representation — the hook stored as a
-        // code address (`install_pre_shutdown_sync` stores `hook as usize`);
-        // a fn-pointer `==` is not a meaningful comparison.
-        let expected: narf_power::system::PreShutdownSync = super::pre_shutdown_sync;
-        if installed.map(|hook| hook as usize) != Some(expected as usize) {
-            return TestResult::Fail(
-                "wait_init did not install the production pre-shutdown sync: reboot would skip the fs sync",
-            );
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!(
-        "userspace",
-        smoke_userspace_wait_init_installs_pre_shutdown_sync
-    );
-}

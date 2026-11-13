@@ -243,7 +243,9 @@ multipath / fabrics (defer).
   `clamp(RTD3E, 5 s, 60 s)`, Linux `nvme_disable_ctrl(shutdown)`; I/O refused
   afterwards). `shutdown_all_controllers()` is registered as the
   `narf_power::system` shutdown hook `"nvme"`, run on every reboot /
-  power-off after the filesystem sync and the persistent-log flush. It
+  power-off after the persistent-log flush (Linux `device_shutdown`; the
+  filesystems were synced by userspace, or by the emergency sync of a forced
+  orderly power-off, before the transition began). It
   refuses new requests, waits up to `SHUTDOWN_DRAIN_TIMEOUT_MS` (30 s, Linux
   `NVME_IO_TIMEOUT`) per controller for the in-flight command to release the
   request gate, then flushes + sends CC.SHN; a controller that never drains
