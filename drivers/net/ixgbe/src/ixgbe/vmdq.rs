@@ -52,16 +52,17 @@
 //! yet, and the `EICR_MAILBOX` cause bit's numeric value was not
 //! verifiable against Linux ixgbe @ cbbddb6 from the sources
 //! available to this lane, so no cause bit is programmed; wiring
-//! the misc-vector cause to the pump is the follow-up), PCI SR-IOV
-//! config-space enablement (VF devices appearing on the bus is a
-//! PCI-layer step, not device registers),
+//! the misc-vector cause to the pump is the follow-up),
 //! `SET_MULTICAST` / `GET_RETA` / `GET_RSS_KEY` / `UPDATE_XCAST_MODE`
 //! / link-state / IPSEC / `FEATURES_NEGOTIATE` (all NACKed),
 //! 32-VF mode (4 queues/pool — `MTQC_32VF` needs its `MRQC` 32-pool
 //! no-RSS pairing grounded before it is programmed), spoof-check
 //! enforcement (only the `VMECM` counting bit is set on RESET;
 //! `PFVFSPOOF` anti-spoofing is not programmed), and DCB+VT
-//! combinations.
+//! combinations. (PCI SR-IOV config-space enablement is not a
+//! follow-up anymore: it lives in [`super::Ixgbe::sriov_enable`]
+//! (#2050) — VF devices appearing on the bus is a PCI-layer step,
+//! not device registers, so it is not programmed here.)
 //!
 //! Register map (settled by #1397): this module programs `MRQC`
 //! through the shared authority `regs::REG_MRQC` (canonical
