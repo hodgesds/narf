@@ -1380,6 +1380,12 @@ pub(crate) fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 /// shell following `a -> b -> a` reports "No such file" for a link that
 /// plainly exists.
 fn path_lookup_errno(path: &str) -> i64 {
+    // A walk that could not be carried out (EIO, EINTR for a killed caller,
+    // ENOMEM) is reported as such: it says nothing about whether the name
+    // exists, and calling it ENOENT tells the caller the name is free.
+    if let Some(error) = path_walk_failure(path) {
+        return copy_fs_errno(error);
+    }
     let trimmed = path.trim_end_matches('/');
     // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
     let Some((parent, leaf)) = trimmed.rsplit_once('/') else {
@@ -1703,6 +1709,23 @@ fn literal_prefix_is_dir(task: u64, prefix: &str) -> Result<alloc::string::Strin
 /// hop count here: a second implementation of the walk would be free to
 /// disagree with the first about what counts as a hop, and then the errno
 /// would depend on which one ran.
+/// The walk failure (see [`narf_filesystem::FsError::is_walk_failure`]) that
+/// stops resolving `path`, if that is why it fails. Runs only from the
+/// failure classifier, like [`path_symlink_loop`]; nothing a failed lookup
+/// returned was cached, so this walk asks the filesystem again.
+fn path_walk_failure(path: &str) -> Option<narf_filesystem::FsError> {
+    current_resolve_absolute(path, |_fs, root, rel| {
+        if rel.is_empty() {
+            return None;
+        }
+        match poll_blocking(narf_filesystem::resolve_async_dentry_ext(root, rel, true)) {
+            Some(Err(error)) if error.is_walk_failure() => Some(error),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
 fn path_symlink_loop(path: &str) -> bool {
     current_resolve_absolute(path, |_fs, root, rel| {
         // A mount root is a directory, never a symlink, so it cannot cycle.
