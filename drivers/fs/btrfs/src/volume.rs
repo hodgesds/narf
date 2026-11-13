@@ -1873,12 +1873,40 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if replacement.capacity < source.capacity {
             return Err(FsError::NoSpace);
         }
-        for (start, length) in crate::write::device_extent_ranges(self, devid).await? {
+        // Copy what the member holds verified, from a good mirror where its
+        // own copy is bad (Linux `btrfs_dev_replace` copies through scrub,
+        // which checks every block and repairs from another mirror). A
+        // stripe of a mirrored profile holds its chunk 1:1, so it is read
+        // logically; a striped profile's stripe is copied as it is.
+        let csum_root = if self.verify_checksums {
+            let (root_tree, _) = self.root_tree_root();
+            Some(
+                crate::roots::find_root(self, root_tree, format::CSUM_TREE_OBJECTID)
+                    .await?
+                    .0,
+            )
+        } else {
+            None
+        };
+        for (start, length, chunk) in crate::write::device_extents(self, devid).await? {
+            let linear = {
+                let g = self.state.lock();
+                matches!(
+                    (g.chunk_map.max_contiguous(chunk), g.chunk_map.chunk_remaining(chunk)),
+                    (Ok(a), Ok(b)) if a == b
+                ) && g.chunk_map.raid56_set(chunk).is_err()
+            };
             let mut offset = 0u64;
             while offset < length {
                 let take = (length - offset).min(128 * 1024) as usize;
-                let mut bytes = vec![0u8; take];
-                source.read(start + offset, &mut bytes, false).await?;
+                let bytes = if linear && self.verify_checksums {
+                    self.read_chunk_verified(chunk + offset, take, true, true, csum_root)
+                        .await?
+                } else {
+                    let mut bytes = vec![0u8; take];
+                    source.read(start + offset, &mut bytes, false).await?;
+                    bytes
+                };
                 replacement.write(start + offset, &bytes, false).await?;
                 offset += take as u64;
             }
@@ -2422,6 +2450,58 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         dst: &mut [u8],
     ) -> Result<(), FsError> {
         self.member(devid)?.read(offset, dst, false).await
+    }
+
+    /// Read `len` bytes of a chunk being relocated or copied to a new
+    /// member, verified as Linux reads them (`relocate_data_extent` /
+    /// `relocate_tree_block` read through the ordinary verified paths;
+    /// `btrfs_dev_replace` copies through scrub): a tree block through its
+    /// own bytenr and checksum, a data sector through its stored checksum,
+    /// each from the first good mirror (repairing the bad one). Bytes that
+    /// are neither — free space, a data sector without a checksum — are read
+    /// as they are. A data sector bad on every copy fails the copy.
+    ///
+    /// `metadata`/`data`: the chunk's block-group type; a mixed chunk tries
+    /// each block as a tree block first.
+    pub(crate) async fn read_chunk_verified(
+        &self,
+        logical: u64,
+        len: usize,
+        metadata: bool,
+        data: bool,
+        csum_root: Option<u64>,
+    ) -> Result<Vec<u8>, FsError> {
+        if !metadata {
+            return match (data, csum_root) {
+                (true, Some(root)) => crate::csum::read_checked(self, root, logical, len).await,
+                _ => self.read_logical(logical, len).await,
+            };
+        }
+        let mut out = crate::databuf::zeroed(len)?;
+        let block = self.nodesize();
+        let mut done = 0usize;
+        while done < len {
+            let at = logical + done as u64;
+            let take = (len - done).min(block - (at % block as u64) as usize);
+            let mut filled = false;
+            if metadata && take == self.nodesize() && at % self.nodesize() as u64 == 0 {
+                // One attempt, no retry loop: most of a metadata chunk can be
+                // free space, which never verifies.
+                if let Ok(node) = Box::pin(self.read_node_attempt(at, None)).await {
+                    out[done..done + take].copy_from_slice(&node);
+                    filled = true;
+                }
+            }
+            if !filled {
+                let bytes = match (data, csum_root) {
+                    (true, Some(root)) => crate::csum::read_checked(self, root, at, take).await?,
+                    _ => self.read_logical(at, take).await?,
+                };
+                out[done..done + take].copy_from_slice(&bytes);
+            }
+            done += take;
+        }
+        Ok(out)
     }
 
     /// Test-only: `(devid, physical)` of every direct copy of `logical`.

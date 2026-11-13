@@ -9729,6 +9729,29 @@ pub(crate) async fn device_extent_ranges<B: BlockDevice + 'static>(
     Ok(ranges)
 }
 
+/// [`device_extent_ranges`] with each extent's chunk: `(physical start,
+/// length, chunk logical start)` (`btrfs_dev_extent::chunk_offset`).
+pub(crate) async fn device_extents<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    devid: u64,
+) -> Result<Vec<(u64, u64, u64)>, FsError> {
+    let (root_tree, _) = vol.root_tree_root();
+    let dev_root = roots::find_root(vol, root_tree, format::DEV_TREE_OBJECTID)
+        .await?
+        .0;
+    let (logical, _) = read_fs_oversized(vol, dev_root).await?;
+    let mut extents = Vec::new();
+    for slot in 0..nritems(&logical)? as usize {
+        let key = leaf_item_key(&logical, slot)?;
+        if key.objectid == devid && key.item_type == format::DEV_EXTENT_KEY {
+            let body = leaf_item_data(&logical, slot)?;
+            extents.push((key.offset, le64(body, 24)?, le64(body, 16)?));
+        }
+    }
+    extents.sort_unstable();
+    Ok(extents)
+}
+
 #[derive(Clone, Debug)]
 struct GrowthChunk {
     logical: u64,
@@ -10220,6 +10243,22 @@ async fn copy_chunk_to_relocation<B: BlockDevice + 'static>(
 
     let mut target = crate::chunk::ChunkMap::new();
     target.add_chunk_item(relocation.new.logical, &relocation.new.item)?;
+    // Read what is copied through verification and mirror fallback, as
+    // Linux relocation reads extents: an unchecked read took the first copy
+    // as it was, and a corrupt one became every copy of the new chunk.
+    let kind = le64(&relocation.old.item, 24)?;
+    let metadata = kind & (format::BLOCK_GROUP_METADATA | format::BLOCK_GROUP_SYSTEM) != 0;
+    let data = kind & format::BLOCK_GROUP_DATA != 0;
+    let csum_root = if data && vol.verify_checksums() {
+        let (root_tree, _) = vol.root_tree_root();
+        Some(
+            roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
+                .await?
+                .0,
+        )
+    } else {
+        None
+    };
     let mut copied = 0u64;
     while copied < relocation.old.length {
         let logical = relocation.old.logical + copied;
@@ -10227,7 +10266,9 @@ async fn copy_chunk_to_relocation<B: BlockDevice + 'static>(
         let take = (relocation.old.length - copied)
             .min(contiguous)
             .min(128 * 1024) as usize;
-        let bytes = vol.read_logical(logical, take).await?;
+        let bytes = vol
+            .read_chunk_verified(logical, take, metadata, data, csum_root)
+            .await?;
         match target.raid56_set(logical) {
             Ok(set) => write_raid56_via_map(vol, logical, &bytes, &set).await?,
             Err(FsError::Unsupported) => {
