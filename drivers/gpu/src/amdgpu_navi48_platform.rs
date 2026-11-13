@@ -7860,7 +7860,7 @@ pub async unsafe fn start_display_scanout(
         .as_mut()
         .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
     // SAFETY: serialized retained owners; caller excludes external writers.
-    unsafe { boot.start_display_scanout(pipe).await }
+    unsafe { boot.start_display_scanout(pipe).await }.map(|s| *s)
 }
 
 /// Re-verify a live scanout; an underflow returns the pipe to black.

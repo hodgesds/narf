@@ -2532,18 +2532,14 @@ impl ColdBoot {
         }
         let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
         let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        let otg = self.otg.as_mut().map_err(|e| *e)?;
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        let pool = &self.sequence.backend.pool;
         // SAFETY: matching retained owners are serialized; caller excludes external writers.
         unsafe {
-            crate::out_of_line::boxed!(self.otg.as_mut().map_err(|e| *e)?.update_live_planes(
-                &self.sequence.backend.pool,
-                self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
-                self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
-                gmc,
-                pipe,
-                request,
-                plan,
-                crystal,
-                content,
+            crate::out_of_line::boxed!(otg.update_live_planes(
+                pool, clocks, dccg, gmc, pipe, request, plan, crystal, content,
             ))
             .await
         }
@@ -2721,7 +2717,7 @@ impl ColdBoot {
     pub async unsafe fn start_display_scanout(
         &mut self,
         pipe: u8,
-    ) -> Result<otg::ScanoutRunning, otg::Error> {
+    ) -> Result<alloc::boxed::Box<otg::ScanoutRunning>, otg::Error> {
         let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
         let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
         // SAFETY: matching retained owners are serialized; caller excludes external writers.

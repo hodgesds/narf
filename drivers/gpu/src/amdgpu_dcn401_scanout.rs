@@ -1082,7 +1082,9 @@ impl Surfaces {
         pipe: u8,
         crystal_khz: u32,
         mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
-    ) -> Result<ScanoutRunning, Error> {
+    ) -> Result<alloc::boxed::Box<ScanoutRunning>, Error> {
+        // The report (2.7 KiB) is returned boxed: by value it was moved
+        // through every frame of the link start above it.
         let (stream, video_pipe) = e.running_video()?;
         let d = e.status.deadlines.ok_or(Error::Invalid)?;
         if d.pipe != pipe || video_pipe != pipe {
@@ -1111,7 +1113,7 @@ impl Surfaces {
         .await;
         match result {
             Ok((frame_before, frame_after)) => {
-                let report = ScanoutRunning {
+                let report = alloc::boxed::Box::new(ScanoutRunning {
                     pipe,
                     odm: p.odm,
                     mpc: p.mpc,
@@ -1121,8 +1123,8 @@ impl Surfaces {
                     overlays: p.overlays,
                     frame_before,
                     frame_after,
-                };
-                e.status.scanout = Some(report);
+                });
+                e.status.scanout = Some(*report);
                 e.status.state = State::ScanoutRunning(pipe);
                 Ok(report)
             }
@@ -1386,7 +1388,7 @@ impl Otg {
         gmc: &mut Gmc,
         pipe: u8,
         crystal_khz: u32,
-    ) -> Result<ScanoutRunning, Error> {
+    ) -> Result<alloc::boxed::Box<ScanoutRunning>, Error> {
         // Display k scans out on pipe k: address that display's records.
         self.0.select_display(pipe)?;
         let regs = self.0.io.0;

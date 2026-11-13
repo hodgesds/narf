@@ -59,6 +59,21 @@ pub fn admit_subvp(
     }
     let mut main = mcache_shapes(soc, &[*mode], Policy::NATIVE)?;
     let p = prepare(soc, &mut main)?;
+    expand_subvp(soc, uclk, mode, mall_bytes, &main, &p)
+}
+
+/// `admit_subvp`'s phantom expansion, out of line: its 8 KiB of state is
+/// then not under the normal admission and mode support `admit_subvp` runs
+/// first, which the deadline bound reaches from a display's scanout start.
+#[inline(never)]
+fn expand_subvp(
+    soc: &Soc,
+    uclk: &UclkLevels,
+    mode: &Mode,
+    mall_bytes: u32,
+    main: &[Shape],
+    p: &Prepared,
+) -> Result<Option<Supported>, Error> {
     let s = main[0];
     let pl = s.plane;
     if main.len() != 1

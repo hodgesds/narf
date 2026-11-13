@@ -1060,7 +1060,26 @@ fn admit_config(
     }
     admit_native(soc, modes)?;
     let mut shapes = mcache_shapes(soc, modes, Policy::NATIVE)?;
-    let mut p = prepare(soc, &mut shapes)?;
+    let p = prepare(soc, &mut shapes)?;
+    search_config(soc, uclk, modes, fams2, drr, candidates, shapes, p)
+}
+
+/// `admit_config`'s P-state search, out of line: its 9 KiB of search state
+/// is then not under the native admission `admit_config` runs first (mode
+/// support down to `program`), which the deadline bound reaches from a
+/// display's scanout start.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn search_config(
+    soc: &Soc,
+    uclk: &UclkLevels,
+    modes: &[Mode],
+    fams2: bool,
+    drr: [Option<crate::amdgpu_freesync::Drr>; MAX_STREAMS],
+    candidates: &mut Vec<Strategy>,
+    mut shapes: Vec<Shape>,
+    mut p: Prepared,
+) -> Result<Pstate, Error> {
     let table = min_clock_table(soc, uclk);
     if table.is_empty() {
         return Ok(Pstate::Pinned(Pinned::Unsupported));

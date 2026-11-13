@@ -3979,7 +3979,7 @@ impl ColdBoot {
             // The linked selection and scanout (4 KiB) come back boxed:
             // returned by value they sat in this frame twice, as the poll's
             // output and as the moved result.
-            let linked = crate::out_of_line::boxed!(async {
+            let linked = crate::out_of_line::boxed!(async move {
                 self.start_link(*selection, pipe, pipes.encoders)
                     .await
                     .map(alloc::boxed::Box::new)
@@ -3992,7 +3992,7 @@ impl ColdBoot {
                 output,
                 encoders: pipes.encoders,
                 plan: *plan,
-                scanout: linked.1,
+                scanout: *linked.1,
                 modes: [None; MAX_MODES],
             }))
         }
@@ -4076,19 +4076,27 @@ impl ColdBoot {
         selection: Selection,
         pipe: u8,
         encoders: StreamEncoders,
-    ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
+    ) -> Result<(Selection, alloc::boxed::Box<otg::ScanoutRunning>), ModesetError> {
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let port = selection.port;
             if let Some(stream) = selection.mst {
                 let mut selection = selection;
-                let scanout = self
-                    .start_mst_stream(port, stream, &mut selection, pipe, encoders)
-                    .await?;
+                let scanout = crate::out_of_line::boxed!(self.start_mst_stream(
+                    port,
+                    stream,
+                    &mut selection,
+                    pipe,
+                    encoders
+                ))
+                .await?;
                 return Ok((selection, scanout));
             }
             if let Some(rate) = selection.frl {
-                return self.start_frl_link(selection, rate, pipe, encoders).await;
+                return crate::out_of_line::boxed!(
+                    self.start_frl_link(selection, rate, pipe, encoders)
+                )
+                .await;
             }
             if selection.hdmi {
                 if selection.scdc {
@@ -4098,30 +4106,31 @@ impl ColdBoot {
                     self.teardowns
                         .checkpoint_activation(pipe, super::TeardownStep::PreLinkScdc);
                 }
-                self.configure_scdc(&selection).await?;
+                crate::out_of_line::boxed!(self.configure_scdc(&selection)).await?;
                 let request = otg::HdmiLinkRequest {
                     stream: encoders.stream_enc,
                     pipe,
                     avi: selection.avi,
                     hdr: selection.hdr_packet(),
                 };
-                self.prepare_display_hdmi_link(port, request).await?;
+                crate::out_of_line::boxed!(self.prepare_display_hdmi_link(port, request)).await?;
                 self.teardowns
                     .checkpoint_activation(pipe, super::TeardownStep::Scdc);
-                self.start_display_hdmi_video(port).await?;
+                crate::out_of_line::boxed!(self.start_display_hdmi_video(port)).await?;
                 self.teardowns
                     .checkpoint_activation(pipe, super::TeardownStep::Video);
-                let scanout = self.start_display_scanout(pipe).await?;
+                let scanout = crate::out_of_line::boxed!(self.start_display_scanout(pipe)).await?;
                 self.teardowns
                     .checkpoint_activation(pipe, super::TeardownStep::Scanout);
                 // As Linux's post-enable: audio after the stream runs.
                 let mut selection = selection;
-                self.start_stream_audio(&mut selection, true, encoders)
+                crate::out_of_line::boxed!(self.start_stream_audio(&mut selection, true, encoders))
                     .await?;
                 return Ok((selection, scanout));
             }
             if selection.uhbr() {
-                return self.start_uhbr_link(selection, pipe, encoders).await;
+                return crate::out_of_line::boxed!(self.start_uhbr_link(selection, pipe, encoders))
+                    .await;
             }
             let mut selection = selection;
             let mut trained = false;
@@ -4133,16 +4142,16 @@ impl ColdBoot {
                 let DpRate::Legacy(rate) = link else {
                     continue;
                 };
-                self.enable_display_dp_phy(
+                crate::out_of_line::boxed!(self.enable_display_dp_phy(
                     port,
                     otg::DpPhySettings {
                         lanes,
                         rate,
                         mst: false,
                     },
-                )
+                ))
                 .await?;
-                match self.train_display_dp_link(port, false).await {
+                match crate::out_of_line::boxed!(self.train_display_dp_link(port, false)).await {
                     Ok(_) => {
                         (selection.lanes, selection.rate) = (lanes, link);
                         trained = true;
@@ -4157,42 +4166,44 @@ impl ColdBoot {
                             .is_ok_and(|s| s.state == otg::State::DpLinkRefused(transmitter)) =>
                     {
                         refused = e.into();
-                        self.stop_display_dp_link(port).await?;
+                        crate::out_of_line::boxed!(self.stop_display_dp_link(port)).await?;
                     }
                     Err(e) => return Err(e.into()),
                 }
             }
             if !trained {
                 if matches!(refused, ModesetError::Display(otg::Error::DpTraining(_))) {
-                    self.verify_dp_link(&selection, &candidates).await?;
+                    crate::out_of_line::boxed!(self.verify_dp_link(&selection, &candidates))
+                        .await?;
                 }
                 return Err(refused);
             }
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Link);
-            self.prepare_display_dp_frontend(
+            crate::out_of_line::boxed!(self.prepare_display_dp_frontend(
                 port,
                 otg::DpFrontendRequest {
                     vsc_colorimetry: selection.vsc_colorimetry,
                     hdr: selection.hdr_packet(),
                     ..otg::DpFrontendRequest::new(encoders.stream_enc, pipe)
                 },
-            )
+            ))
             .await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Frontend);
-            self.start_display_dp_video(port).await?;
+            crate::out_of_line::boxed!(self.start_display_dp_video(port)).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Video);
             // link_set_dpms_on's enable_stream_features once the stream
             // runs; Linux ignores the AUX result.
-            let _ = self
-                .set_display_dp_ignore_msa(port, selection.vrr_supported())
-                .await;
-            let scanout = self.start_display_scanout(pipe).await?;
+            let _ = crate::out_of_line::boxed!(
+                self.set_display_dp_ignore_msa(port, selection.vrr_supported())
+            )
+            .await;
+            let scanout = crate::out_of_line::boxed!(self.start_display_scanout(pipe)).await?;
             self.teardowns
                 .checkpoint_activation(pipe, super::TeardownStep::Scanout);
-            self.start_stream_audio(&mut selection, false, encoders)
+            crate::out_of_line::boxed!(self.start_stream_audio(&mut selection, false, encoders))
                 .await?;
             Ok((selection, scanout))
         }
@@ -4339,7 +4350,7 @@ impl ColdBoot {
         selection: Selection,
         pipe: u8,
         encoders: StreamEncoders,
-    ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
+    ) -> Result<(Selection, alloc::boxed::Box<otg::ScanoutRunning>), ModesetError> {
         let port = selection.port;
         let (Some(hpo_stream), Some(hpo_link)) =
             (encoders.hpo_dp_stream_enc, encoders.hpo_dp_link_enc)
@@ -4430,7 +4441,7 @@ impl ColdBoot {
         rate: FrlRate,
         pipe: u8,
         encoders: StreamEncoders,
-    ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
+    ) -> Result<(Selection, alloc::boxed::Box<otg::ScanoutRunning>), ModesetError> {
         let port = selection.port;
         let bpc = depth_bpc(selection.depth);
         let encoding = selection.encoding;
@@ -4629,8 +4640,9 @@ impl ColdBoot {
         };
         // SAFETY: as above.
         // The result comes back boxed (as in light_inner).
-        match crate::out_of_line::boxed!(async {
-            unsafe { self.start_link(m.selection, m.pipe, m.encoders) }
+        let (this, selection, pipe, encoders) = (&mut *self, m.selection, m.pipe, m.encoders);
+        match crate::out_of_line::boxed!(async move {
+            unsafe { this.start_link(selection, pipe, encoders) }
                 .await
                 .map(alloc::boxed::Box::new)
         })
@@ -4638,7 +4650,7 @@ impl ColdBoot {
         {
             Ok(linked) => {
                 m.selection = linked.0;
-                m.scanout = linked.1;
+                m.scanout = *linked.1;
                 self.teardowns.finish_retrain(m.pipe, None);
                 self.retain_retrained_modeset(m, &soc);
                 Ok(())
@@ -5449,15 +5461,16 @@ impl ColdBoot {
             new.iter().zip(&new_pipes).zip(&new_plans).zip(&extra)
         {
             self.select_display(pipe)?;
-            let clocks = crate::out_of_line::boxed!(async {
-                self.prepare_display_pipe_clocks_beside(pipe_clock_request(pipe, plan, &selection))
+            let this = &mut *self;
+            let clocks = crate::out_of_line::boxed!(async move {
+                this.prepare_display_pipe_clocks_beside(pipe_clock_request(pipe, plan, &selection))
                     .await
                     .map_err(ModesetError::PipeClocks)?;
                 if selection.dsc.is_some() {
-                    self.start_display_dscclk(pipe)?;
+                    this.start_display_dscclk(pipe)?;
                 }
                 for q in d.odm {
-                    self.prepare_display_pipe_clocks_beside(dccg::Request {
+                    this.prepare_display_pipe_clocks_beside(dccg::Request {
                         pipe: q,
                         dpp_khz: plan.clocks.dppclk_khz,
                         pixel: dccg::PixelClock::OdmSegment,
@@ -5465,11 +5478,11 @@ impl ColdBoot {
                     .await
                     .map_err(ModesetError::PipeClocks)?;
                     if selection.dsc.is_some() {
-                        self.start_display_dscclk(q)?;
+                        this.start_display_dscclk(q)?;
                     }
                 }
                 for q in d.mpc {
-                    self.prepare_display_pipe_clocks_beside(dccg::Request {
+                    this.prepare_display_pipe_clocks_beside(dccg::Request {
                         pipe: q,
                         dpp_khz: plan.clocks.dppclk_khz,
                         pixel: dccg::PixelClock::OdmSegment,
@@ -5484,7 +5497,7 @@ impl ColdBoot {
                         .ok_or(ModesetError::Display(otg::Error::Invalid))?
                         .dppclk_khz;
                     for q in o.all() {
-                        self.prepare_display_pipe_clocks_beside(dccg::Request {
+                        this.prepare_display_pipe_clocks_beside(dccg::Request {
                             pipe: q,
                             dpp_khz: dpp,
                             pixel: dccg::PixelClock::OdmSegment,
