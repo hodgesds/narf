@@ -7406,8 +7406,11 @@ pub async unsafe fn monitor_displays(
                 // the retrain land in it and show once scanout resumes.
                 let mut m = m;
                 // SAFETY: as above.
-                if let Err(e) =
-                    crate::out_of_line::boxed!(unsafe { boot.retrain_modeset(&mut m) }).await
+                if let Err(e) = crate::out_of_line::boxed!(
+                    // SAFETY: as above.
+                    unsafe { boot.retrain_modeset(&mut m) }
+                )
+                .await
                 {
                     // A refused retrain whose link stopped again is ordinary
                     // teardown from timing on: retire it (writers, planes,
@@ -7500,9 +7503,10 @@ pub async unsafe fn monitor_displays(
             match boot.mst_affected_streams(port, &[], &|_| None) {
                 // SAFETY: as above.
                 Some(affected) => {
-                    crate::out_of_line::boxed!(unsafe {
-                        modeset_affected(boot, displays, affected, &mut steps)
-                    })
+                    crate::out_of_line::boxed!(
+                        // SAFETY: as above.
+                        unsafe { modeset_affected(boot, displays, affected, &mut steps) }
+                    )
                     .await?
                 }
                 None => relight = true,

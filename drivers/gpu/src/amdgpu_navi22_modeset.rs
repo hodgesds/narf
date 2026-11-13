@@ -1005,6 +1005,8 @@ impl Pipeline {
 impl PipelineInner {
     /// # Safety
     /// As [`Pipeline::new`].
+    // Builds the inner state and returns it wrapped in its `Pipeline` handle.
+    #[allow(clippy::new_ret_no_self)]
     unsafe fn new(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,

@@ -4642,6 +4642,7 @@ impl ColdBoot {
         // The result comes back boxed (as in light_inner).
         let (this, selection, pipe, encoders) = (&mut *self, m.selection, m.pipe, m.encoders);
         match crate::out_of_line::boxed!(async move {
+            // SAFETY: as above; `this` is the caller's `&mut self`.
             unsafe { this.start_link(selection, pipe, encoders) }
                 .await
                 .map(alloc::boxed::Box::new)
@@ -5513,9 +5514,11 @@ impl ColdBoot {
                 // SAFETY: the caller's obligations; earlier displays stay lit.
                 // Boxed: lighting's state is tens of KiB.
                 Ok(()) => {
-                    crate::out_of_line::boxed!(unsafe {
-                        self.light(pipe, crtc, *d, &selection, plan, &mut fill)
-                    })
+                    crate::out_of_line::boxed!(
+                        // SAFETY: the caller's obligations; earlier displays
+                        // stay lit.
+                        unsafe { self.light(pipe, crtc, *d, &selection, plan, &mut fill) }
+                    )
                     .await
                 }
                 Err(e) => Err(e),

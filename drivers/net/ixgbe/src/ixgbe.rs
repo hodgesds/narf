@@ -2350,6 +2350,7 @@ impl Ixgbe {
     /// One watchdog pass, synchronously (the fixture): the core
     /// watchdog's check, then `ndo_tx_timeout` if it fired. Returns
     /// true when recovery fired and succeeded.
+    #[cfg(target_arch = "x86_64")]
     fn check_tx_watchdog_at(&self, now: u64) -> bool {
         use narf_net::watchdog::NetdevWatchdog;
         if !self.tx_timed_out(now) {

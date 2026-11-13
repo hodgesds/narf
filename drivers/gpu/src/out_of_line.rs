@@ -35,7 +35,10 @@ impl<F> OutOfLine<F> {
     /// allocation.
     #[inline(never)]
     pub(crate) fn build(make: impl FnOnce() -> F) -> Self {
-        Self(Box::into_pin(Box::write(Box::new_uninit(), make())))
+        let mut slot = Box::<F>::new_uninit();
+        slot.write(make());
+        // SAFETY: `slot` was initialised by the `write` just above.
+        Self(Box::into_pin(unsafe { slot.assume_init() }))
     }
 }
 

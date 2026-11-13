@@ -1479,7 +1479,7 @@ impl Otg {
     pub fn scanout_framebuffer(&self, pipe: u8) -> Result<GenericFb, Error> {
         // Display k scans out on pipe k: read that display's records.
         let status = self.display_status(pipe).ok_or(Error::Invalid)?;
-        self.1.scanout_framebuffer(&status, pipe)
+        self.1.scanout_framebuffer(status, pipe)
     }
     /// Make CPU writes to the live surface visible to display fetch: the
     /// native HDP flush used by staged uploads.

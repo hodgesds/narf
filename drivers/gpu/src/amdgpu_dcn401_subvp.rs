@@ -92,7 +92,7 @@ fn expand_subvp(
     }
     let table = min_clock_table(soc, uclk);
     for lat in 0..table.len() {
-        let Ok((base, _)) = run(soc, &main, &p, &table, uclk, lat, &Overrides::NONE) else {
+        let Ok((base, _)) = run(soc, main, p, &table, uclk, lat, &Overrides::NONE) else {
             continue;
         };
         let m = meta(&mode.timing, 1, s.phantom_lines(base.lat.urgent));

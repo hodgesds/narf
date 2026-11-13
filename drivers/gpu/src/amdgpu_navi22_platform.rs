@@ -2095,6 +2095,8 @@ async unsafe fn monitor_pass() {
             .map(|()| None),
         // SAFETY: as above.
         Action::Light { .. } => {
+            // SAFETY: serialized by the owner lock; the monitor is the only
+            // display client after boot.
             alloc::boxed::Box::pin(unsafe { light(boot, |_, row| row.fill(0)) })
                 .await
                 .map(Some)

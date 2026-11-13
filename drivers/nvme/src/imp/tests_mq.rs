@@ -291,6 +291,12 @@ kernel_test_in!(
 
 /// Install a fresh controller for `nvme0` with the preferred (MSI-X,
 /// per-CPU) queue set. `None` without a QEMU NVMe device.
+#[cfg(not(target_arch = "x86_64"))]
+fn install_qemu_controller() -> Option<Result<(), &'static str>> {
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
 fn install_qemu_controller() -> Option<Result<(), &'static str>> {
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
