@@ -4599,7 +4599,7 @@ pub struct MountNamespace {
 }
 
 /// Every private mount namespace still alive, weakly. `sync(2)` and the
-/// pre-shutdown sync walk every superblock in the system (Linux
+/// emergency sync of a forced power-off walk every superblock in the system (Linux
 /// `iterate_supers` over the global `super_blocks` list), not just the ones
 /// reachable from the initial namespace: a filesystem mounted only inside an
 /// `unshare(CLONE_NEWNS)` sandbox has dirty state too. Dead entries are pruned

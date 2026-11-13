@@ -221,7 +221,9 @@ win over file-rooted ones). `sync_all::sync_all() -> impl Future<Output =
 SyncReport>` is Linux `ksys_sync`: `syncfs` each of them, then
 `flush_block_devices()` — one flush per disk that has an entry the
 `narf.disks` policy lets write (a read-only disk received no write from this
-boot). `sync(2)` and the pre-shutdown step of every reboot / power-off use it.
+boot). `sync(2)` and the emergency sync of a forced orderly power-off
+(`narf_power::orderly::emergency_sync`) use it; `reboot(2)` does not sync
+(userspace has). `sync_all::runs()` counts the passes started.
 
 `/dev` block nodes (`BlockFile`) split a request into device calls of at
 most `max_chunk_lbas(block_size)` LBAs (≤ 65 535, ≤ 1 MiB) and return the
