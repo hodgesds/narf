@@ -420,22 +420,43 @@ kernel_test_in!(
 // ── Finding 2: one request per superblock copy ──────────────────────
 
 fn smoke_btrfs_io_run_shapes() -> TestResult {
-    use crate::volume::io_run;
+    use crate::bio::{run_of, Run};
+    let shape = |offset, len, bs| run_of(offset, len, bs).ok();
     // A 4 KiB superblock at 64 KiB on 512-byte blocks: one 8-block run.
-    if io_run(65536, 4096, 512, 65536) != (128, 8, 0, 4096) {
+    let sb = Run {
+        lba: 128,
+        blocks: 8,
+        head: 0,
+        bytes: 4096,
+    };
+    if shape(65536, 4096, 512) != Some(sb) || !sb.aligned(4096) {
         return TestResult::Fail("superblock is not one 8-block run");
     }
     // A 16 KiB node: one 32-block run.
-    if io_run(1 << 20, 16384, 512, 65536) != (2048, 32, 0, 16384) {
+    let node = Run {
+        lba: 2048,
+        blocks: 32,
+        head: 0,
+        bytes: 16384,
+    };
+    if shape(1 << 20, 16384, 512) != Some(node) || !node.aligned(16384) {
         return TestResult::Fail("tree node is not one run");
     }
-    // Unaligned range: starts inside a block and spills into the next.
-    if io_run(1000, 100, 512, 65536) != (1, 2, 488, 100) {
+    // Unaligned range: starts inside a block and spills into the next — a
+    // read-modify-write of two blocks.
+    let odd = Run {
+        lba: 1,
+        blocks: 2,
+        head: 488,
+        bytes: 1024,
+    };
+    if shape(1000, 100, 512) != Some(odd) || odd.aligned(100) {
         return TestResult::Fail("unaligned range shape wrong");
     }
-    // Larger than the scratch: capped at the scratch size.
-    if io_run(0, 200_000, 4096, 65536) != (0, 16, 0, 65536) {
-        return TestResult::Fail("long range not capped at the scratch");
+    // A long range is ONE request (the block layer splits it to the device's
+    // limits), no longer capped at a scratch buffer.
+    if shape(0, 200_000, 4096).map(|r| (r.blocks, r.bytes)) != Some((49, 200_704)) {
+        return TestResult::Fail("long range is not one run");
     }
     TestResult::Pass
 }

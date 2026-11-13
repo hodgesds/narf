@@ -615,6 +615,27 @@ result with the manifest the guest printed. `--jobs` guests (direct
 `-kernel` boot, `-smp 1`, 1 GiB each, own image copy, seed + job index) run
 in parallel; the default run finishes in well under three minutes.
 
+Every read or write of a member device is one scatter-gather request over the
+caller's own pages (`src/bio.rs`, Linux `btrfs_submit_bio` → `btrfs_map_bio`),
+and nothing of the volume is held across a device round trip: N readers have
+N requests at the device, and how many are in flight is the device queue's
+business, not the volume's (it once serialised every read, exec and page
+fault of a mount behind one 64 KiB coherent buffer per member;
+`smoke_btrfs_sg_concurrent_readers_overlap`). A buffer the device cannot take
+in place — outside the kernel direct map, starting or ending inside a device
+block (read-modify-written under a per-member lock that serialises only such
+runs), a segment the device refuses, or a plain reader's wait that SIGKILL may
+end — goes through a bounce of order-0 frames the page list owns, so a
+request a killed reader abandoned completes into frames that outlive it
+(`io/` `PageList::with_owner`;
+`smoke_btrfs_coherence_killed_reader_leaves_the_device_wait`). A node and a
+superblock copy are one request each whatever the logical block size (the
+block layer splits only to the device's limits), so the FUA primary
+superblock is never torn into per-block writes. A commit writes every new
+node — and every mirror of one — in flight together (`write_nodes`,
+`bio::join_all`, which waits for every request even after a failure) and
+then the superblock exactly as before: pre-flush, FUA primary, mirrors.
+
 ## 5. Architecture notes
 
 The registration interface is shared by x86_64 and aarch64. Volume construction

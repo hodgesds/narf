@@ -1903,16 +1903,21 @@ async fn batch_stage_refs<B: BlockDevice + 'static>(
             }
         }
     }
+    let mut stamped: Vec<(u64, Vec<u8>)> = Vec::with_capacity(dirty.len());
     for (addr, mut buf, _lvl) in dirty {
-        let written = match stamp_node(&mut buf, addr, batch.gen, vol.csum_type()) {
-            Ok(()) => vol.write_node(addr, &buf).await,
-            Err(e) => Err(e),
-        };
-        if let Err(e) = written {
+        if let Err(e) = stamp_node(&mut buf, addr, batch.gen, vol.csum_type()) {
             batch.alloc = snapshot_alloc;
             return Err(e);
         }
+        stamped.push((addr, buf));
     }
+    let refs: Vec<(u64, &[u8])> = stamped.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+    if let Err(e) = vol.write_nodes(&refs, false).await {
+        batch.alloc = snapshot_alloc;
+        return Err(e);
+    }
+    drop(refs);
+    drop(stamped);
     let subvol = batch.trees.get_mut(&tree_id).ok_or(FsError::InvalidData)?;
     subvol.cow = state;
     subvol.ops += 1;
@@ -5763,6 +5768,11 @@ fn note_commit_time(gen: u64, cycles: u64) {
     }
 }
 
+// Out of line: the commit future (~7 KiB of state) is built on this frame
+// before it is boxed. Inlined, that temporary merged into every caller's
+// poll frame — the snapshot, subvolume and truncate paths — and pushed each
+// past the 8 KiB frame budget (64 KiB guarded task stacks).
+#[inline(never)]
 fn commit_txn<'a, B: BlockDevice + 'static>(
     vol: &'a BtrfsVolume<B>,
     gen: u64,
@@ -5817,13 +5827,15 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
 
     let (old_ext, old_ext_level) =
         roots::find_root(vol, root_tree, format::EXTENT_TREE_OBJECTID).await?;
-    let (meta_changes, data_changes, ref_audit) = resolve_ref_changes(
+    // Boxed, as the path-COW applies below: a large state of a commit future
+    // every caller builds on its stack.
+    let (meta_changes, data_changes, ref_audit) = Box::pin(resolve_ref_changes(
         vol,
         old_ext,
         &txn,
         gen,
         matches!(quota_mode, QuotaMode::Simple { .. }),
-    )
+    ))
     .await?;
     let touch_csum = !txn.new_data.is_empty() || !data_changes.released.is_empty();
     let old_csum = match touch_csum {
@@ -6060,13 +6072,14 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // previous pass is applied, an extent item is keyed by its block, and a
     // group's `used` is its committed value plus the net of the lists.
     commit_phase(2);
+    // The csum tree's apply is boxed: with the phase's locals live around
+    // it, it was the largest state of this commit future, which is built on
+    // every caller's stack (64 KiB task stacks, 8 KiB frame budget).
     let csum_out = match old_csum {
-        Some((root, level)) => Some(
-            PathCow::new(vol, gen, root, level)
-                .await?
-                .apply(&mut alloc, &csum_edits)
-                .await?,
-        ),
+        Some((root, level)) => {
+            let cow = PathCow::new(vol, gen, root, level).await?;
+            Some(Box::pin(cow.apply(&mut alloc, &csum_edits)).await?)
+        }
         None => None,
     };
     commit_phase(3);
@@ -6243,7 +6256,10 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
                 edit.mark_free(group, start, len)?;
             }
             let fst_edits = fst_window.take_edits(edit.into_items());
-            cow.apply_edits(&mut alloc, &fst_edits).await?;
+            // The path-COW applies are boxed (here and below): with the
+            // phase's locals live around them they are the largest states of
+            // this commit future, which every caller builds on its stack.
+            Box::pin(cow.apply_edits(&mut alloc, &fst_edits)).await?;
         }
 
         // Extent tree: an item per new block, none for a freed or dropped
@@ -6313,9 +6329,9 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
             ));
         }
         let (ext_edits, bg_edits) = split_block_group_edits(ext_edits, bg_home);
-        ext_cow.apply_edits(&mut alloc, &ext_edits).await?;
+        Box::pin(ext_cow.apply_edits(&mut alloc, &ext_edits)).await?;
         if let Some(cow) = bgt_cow.as_mut() {
-            cow.apply_edits(&mut alloc, &bg_edits).await?;
+            Box::pin(cow.apply_edits(&mut alloc, &bg_edits)).await?;
         }
 
         for (addr, owner, level) in add_new {
@@ -6411,14 +6427,16 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     let (root_root_addr, root_root_level) = tree_root_addr(&root_addrs, root_groups.len(), ns);
 
     // Nothing has been written yet: refuse to free a block anything else may
-    // still reference (Linux `update_ref_for_cow`), aborting instead.
-    verify_freed_tree_blocks(
+    // still reference (Linux `update_ref_for_cow`), aborting instead. Boxed:
+    // its state is the largest this commit future holds, and the future is
+    // built on every caller's stack (64 KiB task stacks, 8 KiB frame budget).
+    Box::pin(verify_freed_tree_blocks(
         vol,
         old_ext,
         &freed_meta,
         &ref_audit.freed_bodies,
         &ref_audit.full_released,
-    )
+    ))
     .await?;
 
     // Pin everything this transaction freed BEFORE its replacement nodes go
@@ -6455,16 +6473,12 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         nodes.push((addr, buf));
     }
     nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
-    for (addr, buf) in &nodes {
-        // Cache each node as it is written: the next operation reads part
-        // of these very trees straight back, and without this every one of
-        // those reads is a miss the write itself created.
-        if txn.root_flags.is_some() {
-            vol.write_node_root_admin(*addr, buf).await?;
-        } else {
-            vol.write_node(*addr, buf).await?;
-        }
-    }
+    // Every node of the commit in flight together, then cached: the next
+    // operation reads part of these very trees straight back, and without
+    // the cache every one of those reads is a miss the write itself created.
+    let refs: Vec<(u64, &[u8])> = nodes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+    vol.write_nodes(&refs, txn.root_flags.is_some()).await?;
+    drop(refs);
 
     // Stand in for a crash at the one instant the COW invariant is load
     // bearing: nodes written, superblock still pointing at the previous tree.
@@ -9368,9 +9382,9 @@ async fn write_owned_tree<B: BlockDevice + 'static>(
     let groups = group_items(vol, &leaf)?;
     let addrs = alloc_nodes(alloc, vol, tree_block_count(groups.len(), vol.nodesize()))?;
     let (nodes, root, level) = pack_tree_at(vol, &leaf, &groups, &addrs, gen)?;
-    for (addr, buf) in &nodes {
-        vol.write_logical(*addr, buf).await?;
-    }
+    let refs: Vec<(u64, &[u8])> = nodes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+    vol.write_nodes(&refs, false).await?;
+    drop(refs);
     Ok((root, level))
 }
 
@@ -11060,9 +11074,9 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     for chunk in &chunks {
         vol.add_chunk_item_mapping(chunk.logical, &chunk.item)?;
     }
-    for (addr, buf) in &nodes {
-        vol.write_logical(*addr, buf).await?;
-    }
+    let refs: Vec<(u64, &[u8])> = nodes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+    vol.write_nodes(&refs, false).await?;
+    drop(refs);
 
     let bytes_used =
         total_block_group_used(vol, bgt_root.map_or(ext_root_addr, |(addr, _)| addr)).await?;

@@ -678,7 +678,9 @@ async fn truncate_once<B: BlockDevice + 'static>(
     new_size: u64,
     drop_from: u64,
 ) -> Result<(), FsError> {
-    ensure_private_subvol(vol).await?;
+    // Boxed: this future sat at the 8 KiB frame budget (64 KiB task
+    // stacks), and the subvolume check's state is the largest it holds.
+    alloc::boxed::Box::pin(ensure_private_subvol(vol)).await?;
     let inode = InodeItem::decode(&inode_body(vol, ino).await?)?;
     if !inode.is_regular() {
         return Err(FsError::Unsupported);
