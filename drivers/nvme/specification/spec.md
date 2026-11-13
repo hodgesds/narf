@@ -288,9 +288,9 @@ multipath / fabrics (defer).
   `nvme_create_cq`: `vector = num_vecs == 1 ? 0 : qid`); I/O queues
   use entries `1..=granted` with `IV = qid`, `IEN = 1`, one IDT
   vector + installed handler each. Every entry is steered at one CPU —
-  scheduler CPU 0, resolved to a real APIC ID with
-  `narf_interrupts::apic_id_of_cpu` (the bring-up CPU if firmware lists
-  no APIC ID 0; a literal 0 only when the topology is unknown) — since
+  logical CPU 0 (the boot CPU), resolved to its real APIC ID with
+  `narf_interrupts::apic_id_of_cpu` (a literal 0 only when the topology
+  is unknown) — since
   completions are consumed by whichever CPU is waiting. An entry that
   cannot be programmed is never advertised as a vector: a failed admin
   entry leaves the admin queue vector-less (so a single I/O queue that

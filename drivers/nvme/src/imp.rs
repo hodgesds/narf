@@ -267,20 +267,17 @@ pub static FAIL_MSIX_PROGRAM_FOR_TEST: AtomicU32 = AtomicU32::new(0);
 /// Every entry targets one CPU, as before: completions are consumed by
 /// whichever CPU is waiting (the vector's global `fire_count`), so the
 /// target only has to be a CPU that exists and takes interrupts. That CPU
-/// is scheduler CPU 0, resolved to a real APIC ID through
+/// is logical CPU 0 (the boot CPU), resolved to its real APIC ID through
 /// `narf_interrupts::apic_id_of_cpu` (as `drivers/net/igc` does) instead of
-/// the literal 0 the entries used to carry: scheduler CPU ids are APIC
-/// IDs, so on a machine whose firmware lists an enabled CPU with APIC ID 0
-/// the destination is unchanged, and on one that does not — where a
-/// literal 0 addressed no CPU at all and every interrupt was lost — the
-/// entries go to the CPU doing the bring-up. 0 when the topology is not
-/// known (no MADT), as before.
+/// the literal 0 the entries used to carry: on a machine whose boot CPU
+/// has APIC ID 0 the destination is unchanged, and on one where it does
+/// not — where a literal 0 addressed another CPU or none, and every
+/// interrupt was lost — the entries go to the boot CPU. 0 when the
+/// topology is not known (no MADT), as before.
 fn msix_target_apic_id() -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        narf_interrupts::apic_id_of_cpu(0)
-            .or_else(|| narf_interrupts::apic_id_of_cpu(narf_lib::percpu::current_cpu()))
-            .unwrap_or(0)
+        narf_interrupts::apic_id_of_cpu(0).unwrap_or(0)
     }
     // No APIC: the argument is the ITS DeviceID, which this driver has
     // always passed as 0.
@@ -1915,6 +1912,31 @@ impl Controller {
 
     /// [`Self::disable_after_failure`]; without `cap` the function's
     /// bus-master enable is left as is (a dropped controller has no cap).
+    /// Free every IDT vector this controller allocated (handlers first),
+    /// each exactly once: the admin queue's and the I/O queues'
+    /// (`irq_vector` aliases one of them — the admin vector on the
+    /// single-pair path, the first I/O vector on the multi-queue path — and
+    /// must not be freed twice, nor the admin vector forgotten, which
+    /// leaked one IDT vector and its handler per multi-queue bring-up,
+    /// i.e. per controller reset). The caller guarantees no MSI-X entry
+    /// can still deliver to them: the table is disabled, or the function
+    /// was reset and its table re-programmed by a newer bring-up.
+    fn free_irq_vectors(&mut self) {
+        let mut vectors: Vec<u8> = self
+            .irq_vector
+            .take()
+            .into_iter()
+            .chain(self.admin_irq_vector.take())
+            .chain(self.io_irq_vectors.drain(..))
+            .collect();
+        vectors.sort_unstable();
+        vectors.dedup();
+        for v in vectors {
+            narf_interrupts::dispatch::clear_handler(v);
+            let _ = narf_interrupts::vector::free(v);
+        }
+    }
+
     fn disable_inner(&mut self, cap: Option<&Cap<BusDeviceCap, Write>>) -> bool {
         let timeout_ms = self.caps.map(|c| c.ready_timeout_ms()).unwrap_or(500);
         let stopped = match self.bar0_region.as_ref() {
@@ -1942,25 +1964,7 @@ impl Controller {
             // the controller is disabled (or abandoned) so no source fires.
             unsafe { table.disable() };
         }
-        // Every vector this controller allocated, each exactly once: the
-        // admin queue's, and the I/O queues' (`irq_vector` aliases one of
-        // them — the admin vector on the single-pair path, the first I/O
-        // vector on the multi-queue path — and must not be freed twice,
-        // nor the admin vector forgotten, which leaked one IDT vector and
-        // its handler per multi-queue bring-up, i.e. per controller reset).
-        let mut vectors: Vec<u8> = self
-            .irq_vector
-            .take()
-            .into_iter()
-            .chain(self.admin_irq_vector.take())
-            .chain(self.io_irq_vectors.drain(..))
-            .collect();
-        vectors.sort_unstable();
-        vectors.dedup();
-        for v in vectors {
-            narf_interrupts::dispatch::clear_handler(v);
-            let _ = narf_interrupts::vector::free(v);
-        }
+        self.free_irq_vectors();
         if let (Some(device), Some(cap)) = (self.device, cap) {
             let _ = narf_bus::pci::clear_command(cap, &device, narf_bus::pci::cmd::BUS_MASTER);
         }
@@ -4051,14 +4055,7 @@ pub fn io_replays() -> u64 {
 /// with Linux's `nvme_timeout` text, rate-limited (the first 8, then every
 /// 64th) so a drive whose interrupts never arrive does not flood the
 /// console; the per-queue counts stay in `/proc/narf/nvme_queues`.
-fn note_late_completion(
-    bar: u64,
-    qid: u16,
-    opcode: u8,
-    cid: u16,
-    started: u64,
-    irq_missed: bool,
-) {
+fn note_late_completion(bar: u64, qid: u16, opcode: u8, cid: u16, started: u64, irq_missed: bool) {
     use core::fmt::Write as _;
     let n = LATE_COMPLETIONS.fetch_add(1, Ordering::Relaxed) + 1;
     if n > 8 && n % 64 != 0 {
@@ -4731,6 +4728,17 @@ fn leak_slot(
 /// that guard would be a use-after-free reachable only under load. Outside
 /// the harness every probe installs a new function exactly once, so
 /// nothing accumulates.
+///
+/// The slot is leaked, its IDT vectors are not: when the replacement drives
+/// the same function, its bring-up reset the device (CC.EN=0 deletes every
+/// queue) and re-programmed the MSI-X table, so no entry can deliver to the
+/// old controller's vectors any more; they and their handlers are freed
+/// here (Linux reuses a function's vectors across `nvme_reset_work`).
+/// Leaking them cost every reinstall up to 17 of the ~200 free vectors, and
+/// the queue count is bounded by the free vectors, so a few dozen
+/// reinstalls left later bring-ups polled and the `interrupts` smokes with
+/// no vector at all. The old controller's MSI-X handle is dropped without
+/// touching the table, which now belongs to the replacement.
 pub(crate) fn install_controller(ctrl: Controller) -> u32 {
     let bdf = controller_bdf(&ctrl);
     let mut g = CONTROLLERS.lock();
@@ -4738,18 +4746,27 @@ pub(crate) fn install_controller(ctrl: Controller) -> u32 {
         Some(b) => g.iter().position(|s| s.bdf == Some(b)),
         None => (!g.is_empty()).then_some(0),
     };
-    match pos {
+    let (instance, superseded) = match pos {
         Some(i) => {
             let instance = g[i].instance;
-            g[i] = leak_slot(instance, bdf, ctrl);
-            instance
+            let old = core::mem::replace(&mut g[i], leak_slot(instance, bdf, ctrl));
+            (instance, bdf.is_some().then_some(old))
         }
         None => {
             let instance = g.len() as u32;
             g.push(leak_slot(instance, bdf, ctrl));
-            instance
+            (instance, None)
+        }
+    };
+    drop(g);
+    if let Some(old) = superseded {
+        // A holder that took the old slot before the swap finishes first.
+        if let Ok(mut old) = acquire(old) {
+            let _ = old.msix.take();
+            old.free_irq_vectors();
         }
     }
+    instance
 }
 
 fn slot_of(instance: u32) -> Option<&'static InstalledController> {

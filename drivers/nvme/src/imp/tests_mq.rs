@@ -358,25 +358,6 @@ fn install_qemu_controller_handle() -> Option<Result<InstalledQemu, &'static str
     let Ok((_h, cap)) = claim_device_cap(&authority, dev.addr) else {
         return Some(Err("claim_device_cap failed"));
     };
-    // A smoke that installed this function earlier and returned without
-    // `tear_down` left its controller in the slot `install_controller` is
-    // about to overwrite — slots are leaked, so its I/O queues' IDT
-    // vectors would be lost with it. The queue count is bounded by the
-    // free vectors, so a few such smokes leave a later 16-queue bring-up
-    // with fewer queues and a fake IRQ-driven controller with none.
-    // Release it first; this install brings the device up afresh anyway.
-    if let narf_bus::BusAddr::Pcie(bdf) = dev.addr {
-        let prev = super::CONTROLLERS
-            .lock()
-            .iter()
-            .find(|s| s.bdf == Some(bdf))
-            .copied();
-        if let Some(slot) = prev {
-            if let Ok(mut old) = super::acquire(slot) {
-                let _ = old.disable_after_failure(&cap);
-            }
-        }
-    }
     let mut ctrl = Controller::from_device(dev);
     if ctrl.bring_up(&cap).is_err() {
         return Some(Err("bring_up failed"));
@@ -911,9 +892,14 @@ fn xcpu_irq_wake_body() -> TestResult {
     if queues == 0 || any_polled {
         return TestResult::Skip("I/O queues are polled (no MSI-X)");
     }
+    // The highest online CPU: on a topology with APIC-ID gaps
+    // (`NARF_QEMU_SMP=6,sockets=2,cores=3`, APIC IDs 0,1,2,4,5,6) it is
+    // the one whose APIC ID differs from its logical id, so the ISR's
+    // cross-CPU wake has to resolve the destination through the CPU map.
     let me = narf_lib::percpu::current_cpu();
-    let Some(other) =
-        (0..narf_lib::percpu::MAX_CPUS).find(|&c| c != me && narf_lib::smp::is_online(c as u32))
+    let Some(other) = (0..narf_lib::percpu::MAX_CPUS)
+        .rev()
+        .find(|&c| c != me && narf_lib::smp::is_online(c as u32))
     else {
         return TestResult::Skip("no second online CPU");
     };
@@ -970,8 +956,9 @@ fn xcpu_irq_wake_body() -> TestResult {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "nvme-mq: {N} reads from CPU {other} on q{} (vec {:?} msix {:?} apic {:?}): \
+            "nvme-mq: {N} reads from CPU {other} (APIC {:?}) on q{} (vec {:?} msix {:?} apic {:?}): \
              max {max_us} us; isr {} poll {} irq_missed {} slow_pickups {} pickup_max {} us",
+            narf_interrupts::apic_id_of_cpu(other),
             after.qid,
             after.vector,
             after.msix_entry,
