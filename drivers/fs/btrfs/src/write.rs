@@ -5893,6 +5893,11 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     mut alloc: Allocator,
     txn: Txn,
 ) -> Result<(), FsError> {
+    // The previous commit is complete — its nodes and superblock written —
+    // before this one reads the trees it published (Linux
+    // `btrfs_commit_transaction` waits for `prev_trans` to reach
+    // TRANS_STATE_COMPLETED before COMMIT_START).
+    vol.finish_write_out().await?;
     let nodesize = vol.nodesize() as u64;
     let ns = vol.nodesize();
     let ss = u64::from(vol.sectorsize());
@@ -6525,7 +6530,7 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         vol.pin_extent(gen, bytenr, len);
     }
 
-    // ── Write every new node (extent-tree path-COW nodes are stamped here) ─
+    // ── Freeze: every new node, stamped (extent-tree path-COW nodes here) ──
     let mut nodes: Vec<(u64, Vec<u8>)> = Vec::new();
     nodes.extend(fs_nodes);
     // Path-COW nodes arrive unstamped, like the extent tree's below.
@@ -6547,23 +6552,13 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         nodes.push((addr, buf));
     }
     nodes.extend(pack_tree_at(vol, &root_logical, &root_groups, &root_addrs, gen)?.0);
-    // Every node of the commit in flight together, then cached: the next
-    // operation reads part of these very trees straight back, and without
-    // the cache every one of those reads is a miss the write itself created.
-    let refs: Vec<(u64, &[u8])> = nodes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
-    vol.mark_nodes_dirty(&refs);
-    vol.write_nodes(&refs, txn.root_flags.is_some()).await?;
-    drop(refs);
-
-    // Stand in for a crash at the one instant the COW invariant is load
-    // bearing: nodes written, superblock still pointing at the previous tree.
-    #[cfg(feature = "kernel-test")]
-    if vol.take_crash_before_super() {
-        // The errno is irrelevant — what matters is returning without ever
-        // reaching the superblock write, leaving the on-disk state exactly as
-        // a crash here would.
-        return Err(FsError::Unsupported);
-    }
+    // The trees are fixed. From here until the write-out has put them on the
+    // device, their nodes live in the node cache as dirty entries: the reads
+    // below (the block groups' `used`) and every reader of the trees this
+    // commit publishes find them there (Linux keeps the transaction's dirty
+    // extent buffers in memory until `btrfs_write_and_wait_transaction`).
+    // Dropped again if the commit fails before it publishes.
+    let mut dirty = DirtyNodes::hold(vol, &nodes);
 
     let mut raw = vol.read_raw_superblock().await?;
     let old_gen = le64(&raw, 72)?;
@@ -6619,17 +6614,22 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
         vol.add_chunk_item_mapping(chunk.logical, &chunk.chunk_item)?;
         vol.set_chunk_root(chunk.chunk.root, chunk.chunk.level);
     }
-    // Stage rather than write. The tree blocks are already out and
-    // `commit_roots` below advances the in-memory roots, so readers see this
-    // commit immediately; only durability is deferred. A crash before the
-    // staged image lands discards it and every commit batched with it, and the
-    // filesystem falls back to the last superblock on disk — intact because
-    // the blocks it references stay pinned until this image is written.
+    // ── Publish (Linux `switch_commit_roots`, then TRANS_STATE_UNBLOCKED) ──
     //
-    // The pins are NOT released here. They drop in `sync_to_disk`, after the
-    // superblock reaches the device, mirroring `btrfs_finish_extent_commit`
-    // running only after `write_all_supers`.
-    let staged_full = vol.stage_superblock(raw, txn.root_flags.is_some());
+    // The write-out is queued first: once the roots below are published the
+    // commit can no longer be taken back, and from then on its write-out
+    // belongs to the filesystem, not to this future — whoever needs the
+    // commit complete next finishes it if this caller is cancelled
+    // ([`BtrfsVolume::finish_write_out`]). Nothing awaits between queuing it
+    // and publishing.
+    vol.queue_write_out(crate::volume::WriteOut {
+        gen,
+        nodes,
+        raw_super: raw,
+        root_admin: txn.root_flags.is_some(),
+    })
+    .await?;
+    dirty.published();
     vol.set_bytes_used_summed(true);
 
     if let Some(f) = alloc.floor() {
@@ -6681,21 +6681,52 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     };
     let audit = advanced.is_some() && crate::allocator::view_audit();
     vol.set_free_view(advanced);
-    if audit {
-        crate::allocator::audit_view(vol).await?;
-    }
     // The replaced blocks are in no tree any more.
     for &(addr, _) in &freed_meta {
         vol.forget_node(addr);
     }
-    // Bound how much a crash discards and how long pinned extents withhold
-    // space. `sync_to_disk` is the same path `fsync` takes, so the batch is
-    // forced out by exactly one mechanism.
     vol.commit_stats().note_commit(rounds_run);
-    if staged_full {
-        vol.write_staged_super().await?;
+    if audit {
+        if let Err(error) = crate::allocator::audit_view(vol).await {
+            // Published: nothing to take back, so the filesystem stops.
+            vol.abort_transaction();
+            return Err(error);
+        }
     }
-    Ok(())
+    // ── Write-out (Linux `btrfs_write_and_wait_transaction`, then
+    // `write_all_supers`), with the transaction still closed.
+    vol.finish_write_out().await
+}
+
+/// A frozen commit's nodes held dirty in the node cache until it publishes
+/// ([`crate::volume::BtrfsVolume::mark_nodes_dirty`]). A commit that fails
+/// before publishing drops them again: no tree references their addresses,
+/// which the allocator hands out again.
+struct DirtyNodes<'a, B: BlockDevice + 'static> {
+    vol: &'a BtrfsVolume<B>,
+    addrs: Vec<u64>,
+}
+
+impl<'a, B: BlockDevice + 'static> DirtyNodes<'a, B> {
+    fn hold(vol: &'a BtrfsVolume<B>, nodes: &[(u64, Vec<u8>)]) -> Self {
+        let refs: Vec<(u64, &[u8])> = nodes.iter().map(|(a, b)| (*a, b.as_slice())).collect();
+        vol.mark_nodes_dirty(&refs);
+        Self {
+            vol,
+            addrs: nodes.iter().map(|&(a, _)| a).collect(),
+        }
+    }
+
+    /// Published: the write-out owns the dirty entries now.
+    fn published(&mut self) {
+        self.addrs.clear();
+    }
+}
+
+impl<B: BlockDevice + 'static> Drop for DirtyNodes<'_, B> {
+    fn drop(&mut self) {
+        self.vol.discard_dirty_nodes(&self.addrs);
+    }
 }
 
 // ── Namespace mutations (create / unlink) ──────────────────────────

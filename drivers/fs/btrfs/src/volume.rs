@@ -125,6 +125,30 @@ impl<B: BlockDevice> VolumeDevice<B> {
     }
 }
 
+/// A published commit's write-out: its new nodes and the superblock image
+/// that names them ([`BtrfsVolume::finish_write_out`]).
+#[derive(Debug)]
+pub(crate) struct WriteOut {
+    /// The commit's generation.
+    pub(crate) gen: u64,
+    /// Every node the commit allocated, stamped; dirty in the node cache
+    /// until written.
+    pub(crate) nodes: Vec<(u64, Vec<u8>)>,
+    /// The superblock image, staged once the nodes are out.
+    pub(crate) raw_super: Vec<u8>,
+    /// [`BtrfsVolume::write_node_root_admin`]'s gate.
+    pub(crate) root_admin: bool,
+}
+
+/// Test-only: while set, a write-out waits before writing anything, as one
+/// held up by a saturated device would; [`WRITE_OUT_HELD`] once one has.
+#[cfg(feature = "kernel-test")]
+pub(crate) static WRITE_OUT_HOLD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "kernel-test")]
+pub(crate) static WRITE_OUT_HELD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Cached metadata nodes, keyed by logical address.
 ///
 /// `epoch` is what makes filling the cache safe against a concurrent write.
@@ -293,12 +317,12 @@ impl NodeCache {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// The write-out of the dirty node at `logical` ended. Written, it becomes
-    /// an ordinary young entry; not written, it is dropped, and the next
-    /// reader goes to the device (a failed write-out aborts the filesystem,
-    /// and an unpublished commit's blocks are referenced by no tree). The
-    /// epoch moves either way, so a fill that read the address before the
-    /// write finished does not publish what it read.
+    /// The dirty node at `logical` is done with. Written, it becomes an
+    /// ordinary young entry; discarded (its commit failed before it
+    /// published, so no tree references the address), it is dropped and the
+    /// next reader goes to the device. The epoch moves either way, so a fill
+    /// that read the address before the write finished does not publish what
+    /// it read.
     fn clean(&mut self, logical: u64, written: bool) -> Option<RetiredNodes> {
         let node = self.dirty.remove(&logical)?;
         self.epoch = self.epoch.wrapping_add(1);
@@ -455,8 +479,8 @@ pub(crate) fn __test_node_cache_keeps_what_is_used() -> bool {
 /// Test-only: a dirty node survives everything that drops clean ones — an
 /// invalidation of its range, eviction by a full cache, a shrink, a
 /// `forget` — and a device fill of its address does not replace it; once
-/// written it is an ordinary clean entry, and a dirty node whose write-out
-/// failed is gone.
+/// written it is an ordinary clean entry, and a discarded one (its commit
+/// failed before publishing) is gone.
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_node_cache_dirty_entries() -> Result<(), &'static str> {
     const NODESIZE: usize = 16 * 1024;
@@ -506,7 +530,7 @@ pub(crate) fn __test_node_cache_dirty_entries() -> Result<(), &'static str> {
     cache.mark_dirty(at, frozen.clone());
     let _ = cache.clean(at, false);
     if cache.get(at).is_some() {
-        return Err("a node whose write-out failed stayed cached");
+        return Err("a discarded dirty node stayed cached");
     }
     Ok(())
 }
@@ -1373,6 +1397,10 @@ pub struct VolCore<B: BlockDevice> {
     /// the last superblock on disk — which is intact precisely because the
     /// blocks it references are pinned until this image lands.
     staged_super: IrqSafeSpinLock<Option<(alloc::vec::Vec<u8>, bool)>>,
+    /// The published commit whose write-out has not finished (Linux: the
+    /// transaction between TRANS_STATE_UNBLOCKED and TRANS_STATE_COMPLETED);
+    /// see [`BtrfsVolume::finish_write_out`].
+    write_out: Mutex<Option<WriteOut>>,
     /// Commits staged since the superblock last reached disk.
     staged_count: core::sync::atomic::AtomicUsize,
     /// Multi-stage operations in flight ([`VolCore::hold_commits`]): while
@@ -1490,7 +1518,11 @@ pub struct VolCore<B: BlockDevice> {
 /// with staged operations, or a committed transaction whose superblock is
 /// only staged. A batch lock held by someone else counts as dirty.
 fn core_is_dirty<B: BlockDevice>(core: &VolCore<B>) -> Option<u64> {
-    let staged = core.staged_super.lock().is_some();
+    let staged = core.staged_super.lock().is_some()
+        || match core.write_out.try_lock() {
+            Some(slot) => slot.is_some(),
+            None => true,
+        };
     let batch_tree = match core.fs_batch.try_lock() {
         Some(guard) => guard
             .as_ref()
@@ -1708,8 +1740,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             // staged, under the lock every new batch must take.
             let _txn = self.txn_lock().lock().await;
             let mut batch = self.fs_batch().lock().await;
-            let pending =
-                batch.as_ref().is_some_and(|b| b.has_ops()) || self.staged_super.lock().is_some();
+            let pending = batch.as_ref().is_some_and(|b| b.has_ops())
+                || self.staged_super.lock().is_some()
+                || self.write_out_pending();
             if pending {
                 continue;
             }
@@ -3168,6 +3201,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             frozen: core::sync::atomic::AtomicBool::new(false),
             devices: IrqSafeSpinLock::new(devices),
             staged_super: IrqSafeSpinLock::new(None),
+            write_out: Mutex::new(None),
             staged_count: core::sync::atomic::AtomicUsize::new(0),
             commit_holds: core::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "kernel-test")]
@@ -3911,10 +3945,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 self.cache_written_node(logical, buf, epoch);
             }
         }
-        let ok = written.is_ok();
-        for (&(logical, _), _) in nodes.iter().zip(&dirty).filter(|(_, &d)| d) {
-            let retired = self.nodes.lock().clean(logical, ok);
-            drop(retired);
+        // A failed write leaves them dirty: the write-out that failed aborts
+        // the filesystem, and they stay what readers of its published trees
+        // see.
+        if written.is_ok() {
+            for (&(logical, _), _) in nodes.iter().zip(&dirty).filter(|(_, &d)| d) {
+                let retired = self.nodes.lock().clean(logical, true);
+                drop(retired);
+            }
         }
         written
     }
@@ -3929,6 +3967,107 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             let node = Arc::new(buf.to_vec());
             self.nodes.lock().mark_dirty(logical, node);
         }
+    }
+
+    /// Drop dirty nodes of a commit that failed before it published.
+    pub(crate) fn discard_dirty_nodes(&self, addrs: &[u64]) {
+        for &logical in addrs {
+            let retired = self.nodes.lock().clean(logical, false);
+            drop(retired);
+        }
+    }
+
+    /// Hand a published commit's write-out to the filesystem. The lane must
+    /// be empty: every commit finishes the previous write-out before it
+    /// starts ([`Self::finish_write_out`]), and only a commit, with the
+    /// transaction closed, queues one.
+    pub(crate) async fn queue_write_out(&self, job: WriteOut) -> Result<(), FsError> {
+        let mut slot = self.write_out.lock().await;
+        if slot.is_some() {
+            return Err(FsError::InvalidData);
+        }
+        *slot = Some(job);
+        Ok(())
+    }
+
+    /// Whether a published commit's write-out has not finished.
+    pub(crate) fn write_out_pending(&self) -> bool {
+        match self.write_out.try_lock() {
+            Some(slot) => slot.is_some(),
+            None => true,
+        }
+    }
+
+    /// Finish the published commit's write-out, if one is outstanding: its
+    /// nodes, then its superblock image, staged and — when due — written
+    /// (Linux `btrfs_write_and_wait_transaction`, then `write_all_supers`
+    /// for `super_for_commit`). Commits are written in the order they
+    /// published, and a superblock only after every node it references.
+    ///
+    /// Whoever needs the commit complete calls this: the committer, the next
+    /// commit before it starts, a sync. The job stays queued until it has
+    /// succeeded, so a caller cancelled half-way leaves it for the next one,
+    /// which writes it again from the start (rewriting a node with the same
+    /// bytes is harmless). A failed write-out aborts the filesystem: the
+    /// trees in memory were published on top of blocks the device does not
+    /// have, so nothing may be committed over them (Linux
+    /// `btrfs_handle_fs_error` / `cleanup_transaction`).
+    pub(crate) async fn finish_write_out(&self) -> Result<(), FsError> {
+        let mut slot = self.write_out.lock().await;
+        let result = match slot.as_ref() {
+            None => return Ok(()),
+            Some(job) => self.run_write_out(job).await,
+        };
+        let job = slot.take();
+        drop(slot);
+        if let Err(error) = result {
+            self.abort_transaction();
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "btrfs: ================================================================\n\
+                 btrfs: FILESYSTEM IS NOW READ-ONLY\n\
+                 btrfs:   writing out the commit of generation {} failed: {error:?}\n\
+                 btrfs:   every operation since generation {} is lost\n\
+                 btrfs:   every later write returns EROFS until the next mount\n\
+                 btrfs: ================================================================",
+                job.as_ref().map_or(0, |job| job.gen),
+                self.durable_gen(),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn run_write_out(&self, job: &WriteOut) -> Result<(), FsError> {
+        #[cfg(feature = "kernel-test")]
+        while WRITE_OUT_HOLD.load(core::sync::atomic::Ordering::Acquire) {
+            WRITE_OUT_HELD.store(true, core::sync::atomic::Ordering::Release);
+            narf_time::sleep_ms(1).await;
+        }
+        let refs: Vec<(u64, &[u8])> = job
+            .nodes
+            .iter()
+            .map(|(a, b)| (*a, b.as_slice()))
+            .collect();
+        self.write_nodes(&refs, job.root_admin).await?;
+        drop(refs);
+        // Stand in for a crash at the one instant the COW invariant is load
+        // bearing: nodes written, superblock still pointing at the previous
+        // tree. The errno is irrelevant — what matters is never reaching the
+        // superblock write, leaving the device exactly as a crash here would.
+        #[cfg(feature = "kernel-test")]
+        if self.take_crash_before_super() {
+            return Err(FsError::Unsupported);
+        }
+        // Staged only now that every node it references is on the device:
+        // the staged image is always the newest fully written commit. The
+        // pins are released after it is written, not here
+        // (`btrfs_finish_extent_commit` after `write_all_supers`).
+        if self.stage_superblock(job.raw_super.clone(), job.root_admin) {
+            self.write_staged_now().await?;
+        }
+        Ok(())
     }
 
     /// Keep a multi-stage operation (truncate's tail zeroing then its size
@@ -4057,6 +4196,15 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// of its own left to flush, and calling back into the batch machinery
     /// from inside a commit makes the two mutually recursive for no gain.
     pub(crate) async fn write_staged_super(&self) -> Result<(), FsError> {
+        // A published commit still being written out stages its image only
+        // when its nodes are out.
+        self.finish_write_out().await?;
+        self.write_staged_now().await
+    }
+
+    /// [`Self::write_staged_super`] without finishing the write-out first:
+    /// the write-out's own last step.
+    async fn write_staged_now(&self) -> Result<(), FsError> {
         let staged = self.staged_super.lock().take();
         let Some((raw, root_admin)) = staged else {
             // Nothing outstanding; the barrier is all that is owed (fsync of
