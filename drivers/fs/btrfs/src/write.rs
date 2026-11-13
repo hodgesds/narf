@@ -1502,7 +1502,7 @@ async fn batch_gen<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<u64
 /// superblock are between that space and the allocator.
 ///
 /// Both have to be cleared, which is why this syncs rather than merely
-/// committing: `unpin_all` runs only after the superblock reaches the device,
+/// committing: `unpin_through` runs only after the superblock reaches the device,
 /// so a commit alone hands back nothing the previous transaction freed. That
 /// ordering is not incidental — it is the whole point of the pinned set — so
 /// the way to get the space is to complete it, not to skip it.
@@ -6519,10 +6519,10 @@ async fn commit_txn_inner<B: BlockDevice + 'static>(
     // between here and the superblock write cannot find the committed tree
     // pointing at reused space.
     for &(addr, _) in &freed_meta {
-        vol.pin_extent(addr, nodesize);
+        vol.pin_extent(gen, addr, nodesize);
     }
     for &(bytenr, len) in &data_changes.released {
-        vol.pin_extent(bytenr, len);
+        vol.pin_extent(gen, bytenr, len);
     }
 
     // ── Write every new node (extent-tree path-COW nodes are stamped here) ─

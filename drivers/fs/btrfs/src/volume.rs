@@ -542,7 +542,7 @@ impl<B: BlockDevice> Drop for RootPin<B> {
 /// started before that commit has finished, RCU-style.
 #[derive(Debug, Default)]
 pub(crate) struct ReaderEpochs {
-    /// Advanced by every durable commit ([`VolCore::unpin_all`]).
+    /// Advanced by every durable commit ([`VolCore::unpin_through`]).
     current: u64,
     /// Running readers per the epoch they started in.
     active: BTreeMap<u64, u32>,
@@ -1295,12 +1295,15 @@ pub struct VolCore<B: BlockDevice> {
     /// that has already been overwritten — silent corruption, and invisible to
     /// `btrfs check` until after the crash.
     ///
-    /// NARF flips the superblock on every write, so today the set is emptied
-    /// before the next allocation and never withholds anything. It exists so
-    /// that stops being what makes the invariant hold. Linux keeps it on the
-    /// transaction; it sits here until NARF has a transaction object, which is
-    /// sound only while at most one commit is in flight.
-    pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
+    /// Each range carries the generation of the transaction that freed it,
+    /// `(gen, start, len)`, and a superblock of generation `g` releases only
+    /// the ranges freed at or below `g` (Linux keeps the set per transaction
+    /// and `btrfs_finish_extent_commit` releases one transaction's set once
+    /// that transaction's superblock is written). With one commit frozen
+    /// while the previous one's superblock is still going out, a global
+    /// release would hand the newer commit's freed blocks back before any
+    /// durable superblock stopped referencing them.
+    pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64, u64)>>,
     /// Tree roots a lock-free reader is walking from, with a count per
     /// address ([`BtrfsVolume::pin_live_root`]). A reader verifies every
     /// child it reads against its parent's pointer (generation, level, first
@@ -3974,8 +3977,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.staged_count
             .store(0, core::sync::atomic::Ordering::Release);
         // Only now, exactly as `btrfs_finish_extent_commit` runs only after
-        // `write_all_supers`.
-        self.unpin_all();
+        // `write_all_supers` — and only what the transactions this image
+        // covers freed.
+        self.unpin_through(format::super_generation(&raw).unwrap_or(0));
         Ok(())
     }
 
@@ -3995,10 +3999,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             .swap(false, core::sync::atomic::Ordering::AcqRel)
     }
 
-    /// Withhold `[start, start + len)` from allocation until [`Self::unpin_all`].
-    pub(crate) fn pin_extent(&self, start: u64, len: u64) {
+    /// Withhold `[start, start + len)`, freed by the transaction of
+    /// generation `gen`, from allocation until a superblock of `gen` or later
+    /// is durable ([`Self::unpin_through`]).
+    pub(crate) fn pin_extent(&self, gen: u64, start: u64, len: u64) {
         if len != 0 {
-            self.pinned.lock().push((start, len));
+            self.pinned.lock().push((gen, start, len));
         }
     }
 
@@ -4006,7 +4012,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// readers that may still reference it are running, for the allocator to
     /// subtract.
     pub(crate) fn pinned_ranges(&self) -> alloc::vec::Vec<(u64, u64)> {
-        let mut ranges = self.pinned.lock().clone();
+        let mut ranges: alloc::vec::Vec<(u64, u64)> = self
+            .pinned
+            .lock()
+            .iter()
+            .map(|&(_, start, len)| (start, len))
+            .collect();
         ranges.extend(
             self.reader_epochs
                 .lock()
@@ -4091,12 +4102,27 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.reader_roots.lock().keys().map(|&a| (a, n)).collect()
     }
 
-    /// Release every pinned extent. The caller must have made a superblock
-    /// durable that no longer references any of them — that ordering is the
-    /// entire point of pinning, so calling this earlier reintroduces exactly
-    /// the corruption the set prevents.
-    pub(crate) fn unpin_all(&self) {
-        let ranges = core::mem::take(&mut *self.pinned.lock());
+    /// Release the extents freed by transactions of generation `gen` or
+    /// older (Linux `btrfs_finish_extent_commit` for each transaction up to
+    /// the one whose superblock was written). The caller must have made a
+    /// superblock of generation `gen` durable — it no longer references any
+    /// of them; that ordering is the entire point of pinning, so calling this
+    /// earlier reintroduces exactly the corruption the set prevents. Extents
+    /// a newer transaction freed stay pinned: the durable superblock still
+    /// names the trees that use them.
+    pub(crate) fn unpin_through(&self, gen: u64) {
+        let ranges: alloc::vec::Vec<(u64, u64)> = {
+            let mut pinned = self.pinned.lock();
+            let mut released = alloc::vec::Vec::new();
+            pinned.retain(|&(freed_at, start, len)| {
+                let release = freed_at <= gen;
+                if release {
+                    released.push((start, len));
+                }
+                !release
+            });
+            released
+        };
         self.reader_epochs.lock().retire(ranges);
     }
 

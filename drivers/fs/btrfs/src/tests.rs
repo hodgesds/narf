@@ -3568,15 +3568,15 @@ fn smoke_btrfs_commit_keeps_freed_space_for_older_readers() -> TestResult {
     };
     const RANGE: (u64, u64) = (0x7000_0000, 0x4000);
     const LATER: (u64, u64) = (0x7100_0000, 0x4000);
-    vol.pin_extent(RANGE.0, RANGE.1);
+    vol.pin_extent(1, RANGE.0, RANGE.1);
     let older = vol.begin_reader();
-    vol.unpin_all();
+    vol.unpin_through(u64::MAX);
     if !vol.pinned_ranges().contains(&RANGE) {
         return TestResult::Fail("a commit released space a running reader may use");
     }
     let newer = vol.begin_reader();
-    vol.pin_extent(LATER.0, LATER.1);
-    vol.unpin_all();
+    vol.pin_extent(1, LATER.0, LATER.1);
+    vol.unpin_through(u64::MAX);
     drop(older);
     let ranges = vol.pinned_ranges();
     if ranges.contains(&RANGE) {
@@ -3589,13 +3589,45 @@ fn smoke_btrfs_commit_keeps_freed_space_for_older_readers() -> TestResult {
     if !vol.pinned_ranges().is_empty() {
         return TestResult::Fail("space stayed withheld with no reader running");
     }
-    vol.pin_extent(RANGE.0, RANGE.1);
-    vol.unpin_all();
+    vol.pin_extent(1, RANGE.0, RANGE.1);
+    vol.unpin_through(u64::MAX);
     if !vol.pinned_ranges().is_empty() {
         return TestResult::Fail("a commit with no reader running withheld its space");
     }
     TestResult::Pass
 }
+
+/// A superblock releases only what the transactions it covers freed (Linux
+/// `btrfs_finish_extent_commit`, per transaction): a later transaction's
+/// freed blocks stay pinned until a superblock of its own generation is
+/// durable, because the one just written still names the trees using them.
+fn smoke_btrfs_superblock_releases_only_its_own_pins() -> TestResult {
+    let vol = match mount_fixture() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fixture failed to mount"),
+    };
+    const OLD: (u64, u64) = (0x7000_0000, 0x4000);
+    const NEW: (u64, u64) = (0x7100_0000, 0x4000);
+    vol.pin_extent(10, OLD.0, OLD.1);
+    vol.pin_extent(11, NEW.0, NEW.1);
+    vol.unpin_through(10);
+    let ranges = vol.pinned_ranges();
+    if ranges.contains(&OLD) {
+        return TestResult::Fail("a superblock kept its own transaction's pins");
+    }
+    if !ranges.contains(&NEW) {
+        return TestResult::Fail("a superblock released a later transaction's pins");
+    }
+    vol.unpin_through(11);
+    if !vol.pinned_ranges().is_empty() {
+        return TestResult::Fail("the later superblock kept its transaction's pins");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs/cache",
+    smoke_btrfs_superblock_releases_only_its_own_pins
+);
 kernel_test_in!(
     "drivers/fs/btrfs/cache",
     smoke_btrfs_commit_keeps_freed_space_for_older_readers
