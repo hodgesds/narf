@@ -619,8 +619,8 @@ fn format_wchan(name: Option<String>) -> String {
 /// Linux ref: `fs/proc/base.c:proc_pid_syscall` → `task_current_syscall()`.
 /// Format: `nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc\n`, or `"running\n"` for
 /// a task that is not blocked (which is what `task_current_syscall` reports
-/// for anything still on a CPU), or `"-1 0x0 … 0x0\n"` for a task blocked
-/// outside a syscall.
+/// for anything still on a CPU), or `"-1 sp pc\n"` for a task blocked
+/// outside a syscall (`"-1 0x0 … 0x0\n"` when not even its frame is known).
 ///
 /// The frame comes from the parked task's saved register state — the same
 /// place Linux reads it (`pt_regs`), and the same snapshot `PTRACE_GETREGS`
@@ -639,6 +639,11 @@ fn render_syscall(pid: u64) -> String {
 /// with no parked frame.
 fn format_syscall(frame: Option<[u64; 9]>, state: impl FnOnce() -> char) -> String {
     match frame {
+        // `proc_pid_syscall`: a task blocked outside any syscall (in a page
+        // fault, say) prints its -1 with only SP and PC.
+        Some(frame) if frame[0] as i64 == -1 => {
+            format!("-1 {:#x} {:#x}\n", frame[7], frame[8])
+        }
         Some(frame) => format!(
             "{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
             frame[0] as i64,
@@ -1710,16 +1715,23 @@ kernel_test_in!(
 );
 
 /// Thread 7 is parked in `futex(0x1000, 128, 0)`; thread 8 sleeps outside a
-/// syscall. Each `task/<tid>/{syscall,wchan}` must describe ITS thread.
+/// syscall; thread 10 is parked in a page fault (its frame is known, its
+/// syscall number is -1). Each `task/<tid>/{syscall,wchan}` must describe ITS
+/// thread.
 fn test_thread_stat(tid: u64) -> Option<super::ThreadStat> {
     let parked = tid == 7;
-    (tid == 7 || tid == 8).then(|| super::ThreadStat {
+    let syscall = match tid {
+        7 => Some([202, 0x1000, 128, 0, 0, 0, 0, 0x7fff_e000, 0x0040_2000]),
+        10 => Some([u64::MAX, 0, 0, 0, 0, 0, 0, 0x7fff_d000, 0x0040_3000]),
+        _ => None,
+    };
+    matches!(tid, 7 | 8 | 10).then(|| super::ThreadStat {
         comm: alloc::string::String::from("worker"),
         utime_ticks: 0,
         stime_ticks: 0,
         state: 'S',
         tgid: Some(1),
-        syscall: parked.then_some([202, 0x1000, 128, 0, 0, 0, 0, 0x7fff_e000, 0x0040_2000]),
+        syscall,
         wchan: parked.then(|| alloc::string::String::from("futex")),
     })
 }
@@ -1755,6 +1767,8 @@ fn smoke_task_tid_syscall_and_wchan_describe_the_thread() -> TestResult {
     let parked_wchan = read(7, "wchan");
     let idle_syscall = read(8, "syscall");
     let idle_wchan = read(8, "wchan");
+    let fault_syscall = read(10, "syscall");
+    let fault_wchan = read(10, "wchan");
     let gone = read(9, "syscall");
     super::__test_thread_stat_hook_restore(prev);
 
@@ -1771,6 +1785,12 @@ fn smoke_task_tid_syscall_and_wchan_describe_the_thread() -> TestResult {
         || idle_wchan.as_deref() != Some("0")
     {
         return TestResult::Fail("a thread blocked outside a syscall reads -1 / 0");
+    }
+    // `proc_pid_syscall`: "%d 0x%llx 0x%llx\n" for nr < 0.
+    if fault_syscall.as_deref() != Some("-1 0x7fffd000 0x403000\n")
+        || fault_wchan.as_deref() != Some("0")
+    {
+        return TestResult::Fail("a thread parked in a page fault reads -1 sp pc / 0");
     }
     if gone.as_deref() != Some("") {
         return TestResult::Fail("a vanished thread's syscall file reads empty");

@@ -735,6 +735,11 @@ impl Default for UserTaskCtx {
     }
 }
 
+/// Syscall-number slot of a frame parked outside any syscall (an exception
+/// or interrupt from user mode): Linux's -1, which `/proc/<pid>/syscall`
+/// prints as `-1 <sp> <pc>`.
+pub const NOT_IN_SYSCALL: u64 = u64::MAX;
+
 /// Syscall number + six arguments from a parked task's saved registers (see
 /// [`UserTaskCtx::blocked_syscall`] for the layouts). `top` is the task's own
 /// kernel stack top, or 0; `state` is its longjmp-model [`UserState`] buffer.
@@ -752,10 +757,18 @@ pub(crate) unsafe fn saved_syscall_regs(top: u64, state: *const u8) -> Option<[u
         // task's kernel stack.
         let last = unsafe { core::ptr::read_volatile((top - 8) as *const u64) };
         if last & 3 == 3 && last <= 0xffff {
-            // `int 0x80`: a TrapFrame ends at `top` (its last word is SS).
+            // A TrapFrame ends at `top` (its last word is SS): `int 0x80`, or
+            // an exception or interrupt taken from user mode.
             let f = top - core::mem::size_of::<TrapFrame>() as u64;
             // SAFETY: as above.
             let t = unsafe { core::ptr::read_volatile(f as *const TrapFrame) };
+            if t.vector != 0x80 {
+                // Parked outside any syscall — a page fault waiting for a
+                // read, say. Linux's `syscall_get_nr` is -1 there (orig_ax),
+                // and `task_current_syscall` reports only SP and PC; the
+                // user's rax is not a syscall number.
+                return Some([NOT_IN_SYSCALL, 0, 0, 0, 0, 0, 0, t.rsp, t.rip]);
+            }
             return Some([t.rax, t.rdi, t.rsi, t.rdx, t.r10, t.r8, t.r9, t.rsp, t.rip]);
         }
         // `syscall`: UserState below the 16-byte domain snapshot.
@@ -869,16 +882,13 @@ impl UserTaskCtx {
         if !self.parked_in_syscall.load(Ordering::Acquire) {
             return None;
         }
+        let nr = if regs[0] == NOT_IN_SYSCALL {
+            NOT_IN_SYSCALL
+        } else {
+            u64::from(crate::syscall::syscall_number(regs[0] as u32))
+        };
         Some([
-            u64::from(crate::syscall::syscall_number(regs[0] as u32)),
-            regs[1],
-            regs[2],
-            regs[3],
-            regs[4],
-            regs[5],
-            regs[6],
-            regs[7],
-            regs[8],
+            nr, regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7], regs[8],
         ])
     }
 
