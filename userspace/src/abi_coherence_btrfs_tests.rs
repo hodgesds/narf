@@ -1011,7 +1011,6 @@ impl Drop for KilledReaderFixture {
 }
 
 fn killed_reader(device: &Arc<HangDevice>) -> Result<(), &'static str> {
-    use core::future::Future;
     use core::sync::atomic::Ordering;
     use core::task::{Context, Poll};
     const TASK: u64 = 0x6b11_b7f5;
