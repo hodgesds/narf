@@ -288,6 +288,7 @@ pub(crate) async fn read_exact_from<B: BlockDevice>(
 /// logical block size, and the FUA primary superblock can never be torn into
 /// per-block writes. A range that starts or ends inside a block is
 /// read-modify-written under `rmw`, which serialises only such runs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_exact_to<B: BlockDevice>(
     device: &B,
     block_size: usize,
