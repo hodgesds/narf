@@ -24,8 +24,9 @@
 //! `mci_enabled` flag threads the Linux branches so they stay visible. The
 //! TSF2 restart in `wow_wakeup` is reported as `tsf2_restart`: Linux only
 //! restarts it when a TSF2 generic timer was enabled
-//! (`hw.c::ath9k_hw_gen_timer_start_tsf2`), and this tree has no
-//! generic-timer table yet.
+//! (`hw.c::ath9k_hw_gen_timer_start_tsf2`); the table lives in
+//! `ar9003::gen_timer::GenTimerTable`, and `wow_resume` restarts TSF2
+//! when the wakeup reports it and the table says a TSF2 timer was enabled.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
 use super::power::MAX_RATE_POWER;
