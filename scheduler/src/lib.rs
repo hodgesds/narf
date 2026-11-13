@@ -5659,6 +5659,14 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Op
         notify_wake_cpu_once(home, notified);
         return;
     }
+    // Hard hrtimer expiry invokes this waker directly, including before the
+    // architecture dispatcher publishes its IRQ-depth marker. With IRQs masked,
+    // retain the durable owner notification and leave activation to the executor:
+    // placement can invoke policy callbacks and grow the destination's queue.
+    if !narf_arch::current::asm::interrupts_enabled() {
+        notify_wake_cpu_once(home, notified);
+        return;
+    }
     // Snapshot the registered affinity before taking the policy lock. Missing
     // registration permits any CPU here; migration validates the live slot.
     let allowed_set = task_affinity(TaskId(task));

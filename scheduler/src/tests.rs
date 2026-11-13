@@ -965,6 +965,76 @@ kernel_test_in!(
     smoke_scheduler_parked_wake_notifies_each_destination_once
 );
 
+fn smoke_scheduler_masked_wake_defers_placement() -> TestResult {
+    use crate::{CpuId, RunQueue, Scheduler, TaskHandle};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    static PLACEMENTS: AtomicUsize = AtomicUsize::new(0);
+    struct PlacementProbe;
+    impl Scheduler for PlacementProbe {
+        fn name(&self) -> &'static str {
+            "masked-wake-placement-probe"
+        }
+        fn pick_next(&self, _: CpuId, _: &RunQueue<'_>) -> Option<TaskHandle> {
+            None
+        }
+        fn select_task_rq(
+            &self,
+            _: CpuId,
+            _: CpuId,
+            _: &dyn Fn(CpuId) -> bool,
+            _: &dyn Fn(CpuId) -> bool,
+            _: &dyn Fn(CpuId) -> bool,
+        ) -> Option<CpuId> {
+            PLACEMENTS.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+    if narf_lib::smp::ever_online_bitmap() != 1 {
+        return TestResult::Skip("requires exclusive scheduler policy ownership");
+    }
+    crate::__reset_queues_for_test();
+    let cap: Cap<crate::SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&cap, PlacementProbe).is_err() {
+        return TestResult::Fail("install placement probe failed");
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    let task = crate::spawn(async {});
+    let slot = crate::READY[cpu]
+        .lock()
+        .as_mut()
+        .and_then(|ready| ready.pop_front())
+        .expect("test task missing");
+    let cell = slot.awake.clone();
+    cell.flag.store(false, Ordering::SeqCst);
+    crate::enqueue_on(cpu, slot, crate::policy::TaskEnqueueReason::Requeued);
+    let stealing = crate::STEAL_ENABLED.swap(true, Ordering::AcqRel);
+    crate::WAKE_PRESSURE[cpu].store(1, Ordering::Release);
+    PLACEMENTS.store(0, Ordering::Relaxed);
+    let waker = crate::make_waker(cell.clone());
+    // Match LAPIC expiry before the generic IRQ dispatcher marks in_irq().
+    narf_lib::sync::without_interrupts(|| waker.wake_by_ref());
+    let staged = PLACEMENTS.load(Ordering::Relaxed) == 0
+        && cell.flag.load(Ordering::SeqCst)
+        && crate::wake_notification_pending(cpu)
+        && crate::PARKED_WAKE_INBOX[cpu].len.load(Ordering::Acquire) == 1;
+    crate::drain_wake_list(cpu);
+    let activated = crate::READY[cpu]
+        .lock()
+        .as_ref()
+        .is_some_and(|ready| ready.len() == 1 && ready.front().is_some_and(|slot| slot.id == task));
+    crate::STEAL_ENABLED.store(stealing, Ordering::Release);
+    let restored = crate::install_scheduler(&cap, crate::ClassScheduler).is_ok();
+    crate::__reset_queues_for_test();
+    if staged && activated && restored {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("masked wake entered placement callbacks or lost its activation")
+    }
+}
+kernel_test_in!("scheduler", smoke_scheduler_masked_wake_defers_placement);
+
 fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
     // With work-stealing on and per-CPU queues seeded across two
     // NUMA nodes, a steal should pull from a same-node victim first.

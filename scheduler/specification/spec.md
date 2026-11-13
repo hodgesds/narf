@@ -196,6 +196,8 @@ pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 pub fn note_urgent_wake_preempt(woken: u64);
 /// Consume one exact waiter's waker; preserve ordinary remote placement.
 pub fn wake_preempt_task(waker: core::task::Waker, expected_task: u64);
+/// Recognize task wakers whose wake_by_ref can publish with IRQs masked.
+pub fn is_scheduler_waker(waker: &core::task::Waker) -> bool;
 /// Alias a native task waker with advisory blocking-I/O wake metadata.
 pub fn blocking_io_waker(waker: &core::task::Waker, expected_task: u64)
     -> core::task::Waker;
@@ -445,6 +447,11 @@ placement skips a duplicate notification to that same CPU, even if the CPU has
 already claimed the batch. A changed destination is still notified, and the
 original inbox owner keeps its notification so it can drain the pinned node.
 Independent wakes retain the pending-bit and halt-handshake checks.
+Scheduler wakers invoked with interrupts masked publish the awake bit and
+activation node and notify its owner, but skip optional placement callbacks
+and migration. This includes direct hard-hrtimer expiry before architecture
+IRQ-depth accounting begins. The executor or safe user-return boundary performs
+activation where queue growth and policy callbacks are permitted.
 Both channels and the pending queues participate in the idle-halt handshake.
 Idle destination selection excludes CPUs with pending activation.
 
