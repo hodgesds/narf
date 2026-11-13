@@ -170,6 +170,26 @@ record together and releases data through the ordinary COW/backref transaction.
 Read-only mounts do not recover orphans. Final-view Drop only makes previously
 accepted changes durable, leaving any unreaped orphan record for recovery.
 
+Read repair (`src/repair.rs`; Linux `btrfs_repair_io_failure`). A read of a
+mirrored range (DUP, RAID1/1C3/1C4, RAID10) that verified a good copy after
+a bad one rewrites the bad copy from it before returning: a tree block
+(`read_node*`) repairs the first copy that failed its bytenr, checksum or —
+for a child read through its parent (`btree::read_child_shared`,
+`read_node_expecting`) — the parent's generation / level / first-key check,
+as `btrfs_read_extent_buffer` → `btrfs_repair_eb_io_failure`; a data sector
+read through its checksum (`read_logical_checked`, every ordinary file read)
+repairs every copy that failed before the good one, as
+`btrfs_end_repair_bio`. A copy whose read failed with a device error counts
+as failed too. Per-device error counters follow `btrfs_dev_stat_inc_and_print`
+(`BtrfsVolume::dev_stats(devid)`: write, read, flush, corruption, generation;
+a data checksum mismatch counts `corrupt`, a device read error `rd`, a
+failed repair write `wr`) and are kept in memory only — Linux also persists
+them in the device tree's `DEV_STATS` item, NARF does not yet. A repair
+prints `read error corrected: ino I off O (dev devid D sector S)` (metadata:
+`ino 0`, `off` the block's logical address), rate-limited as `btrfs_info_rl`
+(100 per 5 s). `BtrfsVolume::repair_stats()` counts repairs and each kind of
+skip. The read never fails because of its repair.
+
 ## 4. Invariants
 
 Without a free-space tree (never under `root-rw`, which requires one) the
@@ -635,6 +655,47 @@ superblock is never torn into per-block writes. A commit writes every new
 node — and every mirror of one — in flight together (`write_nodes`,
 `bio::join_all`, which waits for every request even after a failure) and
 then the superblock exactly as before: pre-flush, FUA primary, mirrors.
+
+Read repair never writes over a block anything references other than with
+the bytes every mirror of it must hold. btrfs never rewrites a referenced
+tree block or data extent in place (Linux repair relies on the same), and
+NARF's own rewrites of a logical range are: a batch's blocks written out per
+operation, each sealed once published (`CowState::sealed`) and COWed to a
+fresh address by the next operation, so a published block is written once;
+commit write-out of fresh blocks (`write_nodes`); data always to fresh
+extents (no `nodatacow`; PREALLOC is carved, never written in place); chunk
+relocation copying a chunk to new stripes and swapping its mapping. What can
+change a range between a bad read and its repair is a free and reallocation
+(a lock-free reader of an older root still reaches the block) or a write in
+flight. So a repair writes the bad copy only when all of these hold
+(`smoke_btrfs_repair_*`):
+
+- the filesystem is writable and healthy — not read-only (`sb_rdonly` in
+  `btrfs_repair_io_failure`), not degraded, not aborted — and verifies
+  checksums;
+- the range is a direct copy of a non-RAID5/6 chunk, inside one stripe, and
+  the bad copy's physical range covers no superblock copy (superblocks are
+  repaired only by a commit). RAID5/6 is not repaired (skipped, counted);
+- no write to any byte of the logical range is in flight, and none can start
+  until the repair finishes: every logical write (`write_stripes`, hence
+  `write_logical` and `write_nodes`) registers its range for its duration
+  and waits for an overlapping repair; a repair registers its own range only
+  when no write overlaps, else skips (`skipped_busy`). A chunk mapping swap
+  (`replace_chunk_item_mapping`) registers the chunk's range, and the repair
+  resolves the mapping only after registering, so it never writes through a
+  stale mapping to physical space a relocation released;
+- under that exclusion, the good copy re-read from the device is
+  byte-identical to the bytes verified (a range freed, reallocated and
+  rewritten since no longer matches: `skipped_changed`), and the bad copy
+  re-read still fails the check it failed (a copy that verifies now is left
+  alone, even if it differs).
+
+The repair therefore writes exactly what the good mirror holds at that
+instant, with no write to the range able to land in between. Its own reads
+are not killable; a repair future dropped mid-write (only through
+cancellation of the reading operation, which the write path does not yet
+make safe in general) can leave its device write in flight after the range
+is released — the same exposure as any dropped write future.
 
 ## 5. Architecture notes
 

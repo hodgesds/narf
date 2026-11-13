@@ -137,8 +137,9 @@ pub(crate) async fn read_child_shared<B: BlockDevice + 'static>(
     parent: &[u8],
     slot: usize,
 ) -> Result<Arc<Vec<u8>>, FsError> {
+    let check = |child: &[u8]| verify_child(parent, slot, child).is_ok();
     let child = vol
-        .read_node_shared(internal_blockptr(parent, slot)?)
+        .read_node_expecting(internal_blockptr(parent, slot)?, Some(&check))
         .await?;
     verify_child(parent, slot, &child)?;
     Ok(child)
@@ -344,8 +345,9 @@ pub(crate) async fn contains_key<B: BlockDevice + 'static>(
             return Err(FsError::InvalidData);
         }
         let slot = internal_child_slot(&node, n, key)?;
+        let check = |child: &[u8]| verify_child(&node, slot, child).is_ok();
         let child = vol
-            .read_node_shared(internal_blockptr(&node, slot)?)
+            .read_node_expecting(internal_blockptr(&node, slot)?, Some(&check))
             .await?;
         verify_child(&node, slot, &child)?;
         node = child;

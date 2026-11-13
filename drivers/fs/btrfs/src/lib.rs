@@ -46,6 +46,7 @@ pub mod lzo;
 pub mod mount_opts;
 pub mod node;
 pub mod registry;
+pub(crate) mod repair;
 pub mod roots;
 pub mod rw_gate;
 pub mod stats;

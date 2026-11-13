@@ -617,6 +617,13 @@ pub(crate) async fn killable<F: core::future::Future>(future: F) -> Result<F::Ou
         .ok_or(FsError::Interrupted)
 }
 
+/// Mark direct copy `copy` as one a repair should rewrite.
+fn note_bad_copy(bad: &mut u32, copy: usize) {
+    if copy < 32 {
+        *bad |= 1 << copy;
+    }
+}
+
 /// What became of the copies a verified read tried, for the error it reports
 /// when none served.
 ///
@@ -1334,6 +1341,15 @@ pub struct VolCore<B: BlockDevice> {
     aborted: core::sync::atomic::AtomicBool,
     /// Operations turned away since the abort. See [`Self::note_refused`].
     refused_after_abort: core::sync::atomic::AtomicU64,
+    /// Logical writes and read repairs in flight ([`crate::repair`]).
+    pub(crate) io_ranges: crate::repair::IoRanges,
+    /// What read repair has done.
+    pub(crate) repair_counters: crate::repair::RepairCounters,
+    /// Per-device error counters (`btrfs_device::dev_stat_values`).
+    pub(crate) dev_stats: crate::repair::DevStats,
+    /// Test hook between a read's verification and its repair.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) repair_hook: IrqSafeSpinLock<Option<crate::repair::RepairHook>>,
     /// `BTRFS_FS_QUOTA_OVERRIDE` — see [`Self::quota_override`].
     quota_override: core::sync::atomic::AtomicBool,
     /// Operations accumulated into the transaction that has not committed yet.
@@ -2158,27 +2174,281 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// supplied on-disk data checksum. Unlike [`Self::read_logical`], checksum
     /// failure is part of copy selection, so a readable-but-corrupt primary DUP
     /// stripe falls back to its mirror.
+    ///
+    /// A copy that failed before the good one is then rewritten from it
+    /// (Linux `btrfs_end_repair_bio` → `btrfs_repair_io_failure` for every
+    /// mirror tried before the good one; see [`crate::repair`]). `owner` is
+    /// the `(inode, file offset)` of `logical`, for the repair message.
     pub(crate) async fn read_logical_checked(
         &self,
         logical: u64,
         len: usize,
         stored: &[u8],
+        owner: Option<(u64, u64)>,
     ) -> Result<Vec<u8>, FsError> {
         let mut buf = crate::databuf::zeroed(len)?;
         let copies = self.logical_read_copies(logical)?;
         let mut failure = CopyFailure::default();
+        let mut bad = 0u32;
         for copy in 0..copies {
             if let Err(error) = self.read_logical_copy(logical, &mut buf, copy).await {
                 failure.read_failed(error)?;
+                self.note_copy_read_error(logical, copy, error, &mut bad, true);
                 continue;
             }
             let digest = crate::checksum::digest(self.csum_type, &buf)?;
             if digest.get(..stored.len()) == Some(stored) {
+                if bad != 0 {
+                    self.repair_copies(crate::repair::Request {
+                        logical,
+                        good: &buf,
+                        good_copy: copy,
+                        bad,
+                        verify: crate::repair::Verify::Data(stored),
+                        owner: owner.unwrap_or((0, logical)),
+                    })
+                    .await;
+                }
                 return Ok(buf);
             }
+            // `btrfs_data_csum_ok`: a data checksum mismatch counts against
+            // the device the copy came from.
+            if let Some(devid) = self.copy_devid(logical, copy) {
+                self.dev_stats
+                    .inc_and_print(devid, crate::repair::DEV_STAT_CORRUPTION_ERRS);
+            }
+            note_bad_copy(&mut bad, copy);
             failure.mismatch();
         }
         Err(failure.into_error())
+    }
+
+    /// The member device direct copy `copy` of `logical` lives on.
+    fn copy_devid(&self, logical: u64, copy: usize) -> Option<u64> {
+        let g = self.state.lock();
+        let locations = g.chunk_map.map_logical_stripes(logical).ok()?;
+        locations.get(copy).map(|location| location.devid)
+    }
+
+    /// A direct copy could not be read: a device error counts against the
+    /// device (`btrfs_log_dev_io_error`, `BTRFS_DEV_STAT_READ_ERRS`) and,
+    /// when `mark`, marks the copy for repair (Linux rewrites a mirror it
+    /// failed to read like one that failed verification). A copy with no
+    /// usable stripe (a missing member) is neither.
+    fn note_copy_read_error(
+        &self,
+        logical: u64,
+        copy: usize,
+        error: FsError,
+        bad: &mut u32,
+        mark: bool,
+    ) {
+        if !matches!(error, FsError::Io(_)) {
+            return;
+        }
+        if let Some(devid) = self.copy_devid(logical, copy) {
+            self.dev_stats
+                .inc_and_print(devid, crate::repair::DEV_STAT_READ_ERRS);
+            if mark {
+                note_bad_copy(bad, copy);
+            }
+        }
+    }
+
+    /// Rewrite the copies a read found bad from the one it verified
+    /// ([`crate::repair`]). Best effort: the read has its bytes whatever
+    /// becomes of the repair. Boxed so a read's own future stays small.
+    fn repair_copies<'a>(
+        &'a self,
+        req: crate::repair::Request<'a>,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.repair_copies_inner(req))
+    }
+
+    async fn repair_copies_inner(&self, req: crate::repair::Request<'_>) {
+        use crate::repair::{RepairCounters as C, Verify};
+        let counters = &self.repair_counters;
+        // `btrfs_repair_io_failure`: nothing is written to a filesystem
+        // mounted read-only or past a critical error. NARF also writes
+        // nothing degraded or while a remount to read-only drains
+        // (`frozen`), and a copy is only known good when it was verified
+        // against its checksum.
+        if self.core_read_only()
+            || self.frozen.load(core::sync::atomic::Ordering::Acquire)
+            || self.degraded
+            || self.aborted.load(core::sync::atomic::Ordering::Acquire)
+            || !self.verify_checksums
+        {
+            C::bump(&counters.skipped_read_only);
+            return;
+        }
+        let len = req.good.len() as u64;
+
+        #[cfg(feature = "kernel-test")]
+        if let Some(hook) = self.repair_hook.lock().as_ref() {
+            (hook.0)(req.logical);
+        }
+
+        // Rule 3: no write to the range in flight, none can start until this
+        // is done, and the chunk mapping cannot change under it (a mapping
+        // swap registers the chunk's range as a write) — so the mapping is
+        // resolved only now.
+        let Some(_range) = self.io_ranges.try_begin_repair(req.logical, len) else {
+            C::bump(&counters.skipped_busy);
+            return;
+        };
+        let (locations, contiguous, raid56) = {
+            let g = self.state.lock();
+            (
+                g.chunk_map.map_logical_stripes(req.logical),
+                g.chunk_map.max_contiguous(req.logical),
+                g.chunk_map.raid56_set(req.logical).is_ok(),
+            )
+        };
+        let (Ok(locations), Ok(contiguous)) = (locations, contiguous) else {
+            C::bump(&counters.skipped_unsupported);
+            return;
+        };
+        if raid56 || contiguous < len || req.good_copy >= locations.len() {
+            C::bump(&counters.skipped_unsupported);
+            return;
+        }
+
+        // Rule 4: the good copy still holds exactly what was verified.
+        let Ok(mut buf) = crate::databuf::zeroed(req.good.len()) else {
+            C::bump(&counters.failed);
+            return;
+        };
+        let good = locations[req.good_copy];
+        if self
+            .read_physical_unkillable(good.devid, good.physical, &mut buf)
+            .await
+            .is_err()
+            || buf.as_slice() != req.good
+        {
+            C::bump(&counters.skipped_changed);
+            return;
+        }
+
+        for (copy, bad) in locations.iter().enumerate() {
+            if copy >= 32 || req.bad & (1 << copy) == 0 || copy == req.good_copy {
+                continue;
+            }
+            // Never a superblock copy: those are written by a commit only.
+            let end = bad.physical.saturating_add(len);
+            if format::SUPERBLOCK_MIRROR_OFFSETS
+                .iter()
+                .any(|&sb| sb < end && bad.physical < sb + format::SUPERBLOCK_SIZE as u64)
+            {
+                C::bump(&counters.skipped_unsupported);
+                continue;
+            }
+            // The bad copy must still fail the check it failed: one that
+            // verifies now was rewritten since, and is not ours to touch.
+            let still_bad = match self
+                .read_physical_unkillable(bad.devid, bad.physical, &mut buf)
+                .await
+            {
+                Ok(()) => !match req.verify {
+                    Verify::Node(expect) => {
+                        self.node_verifies(req.logical, &buf) && expect.is_none_or(|ok| ok(&buf))
+                    }
+                    Verify::Data(stored) => crate::checksum::digest(self.csum_type, &buf)
+                        .is_ok_and(|digest| digest.get(..stored.len()) == Some(stored)),
+                },
+                Err(FsError::Io(_)) => true,
+                Err(_) => {
+                    C::bump(&counters.skipped_unsupported);
+                    continue;
+                }
+            };
+            if !still_bad {
+                C::bump(&counters.skipped_changed);
+                continue;
+            }
+            match self
+                .write_physical_on(bad.devid, bad.physical, req.good)
+                .await
+            {
+                Ok(()) => {
+                    C::bump(&counters.repaired);
+                    crate::repair::report_corrected(
+                        req.owner.0,
+                        req.owner.1,
+                        bad.devid,
+                        bad.physical,
+                    );
+                }
+                Err(_) => {
+                    C::bump(&counters.failed);
+                    self.dev_stats
+                        .inc_and_print(bad.devid, crate::repair::DEV_STAT_WRITE_ERRS);
+                }
+            }
+        }
+    }
+
+    /// The checks a node read applies: its recorded bytenr, and its
+    /// checksum when the mount verifies them.
+    fn node_verifies_as_read(&self, logical: u64, buf: &[u8]) -> Result<bool, FsError> {
+        if format::le64(buf, 48)? != logical {
+            return Ok(false);
+        }
+        Ok(!self.verify_checksums
+            || crate::checksum::verify(
+                self.csum_type,
+                &buf[format::CSUM_SIZE..],
+                &buf[..format::CSUM_SIZE],
+            )?)
+    }
+
+    /// A tree block's own checks: the bytenr it records and its checksum.
+    fn node_verifies(&self, logical: u64, buf: &[u8]) -> bool {
+        format::le64(buf, 48).ok() == Some(logical)
+            && crate::checksum::verify(
+                self.csum_type,
+                &buf[format::CSUM_SIZE..],
+                &buf[..format::CSUM_SIZE],
+            )
+            .unwrap_or(false)
+    }
+
+    /// [`Self::read_physical_on`] that a fatal signal does not end: a
+    /// repair's reads are part of the repair, which runs to its end.
+    async fn read_physical_unkillable(
+        &self,
+        devid: u64,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), FsError> {
+        self.member(devid)?.read(offset, dst, false).await
+    }
+
+    /// Test-only: `(devid, physical)` of every direct copy of `logical`.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_copy_locations(&self, logical: u64) -> Vec<(u64, u64)> {
+        let g = self.state.lock();
+        g.chunk_map
+            .map_logical_stripes(logical)
+            .map(|v| v.iter().map(|l| (l.devid, l.physical)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Test-only: run `hook` between a read's verification and its repair.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_set_repair_hook(&self, hook: Option<crate::repair::RepairHook>) {
+        *self.repair_hook.lock() = hook;
+    }
+
+    /// What read repair has done on this filesystem.
+    pub fn repair_stats(&self) -> crate::repair::RepairStats {
+        self.repair_counters.snapshot()
+    }
+
+    /// The error counters of member `devid` (`BTRFS_IOC_GET_DEV_STATS`
+    /// order: write, read, flush, corruption, generation).
+    pub fn dev_stats(&self, devid: u64) -> [u32; 5] {
+        self.dev_stats.get(devid)
     }
 
     /// Read one b-tree node (a `nodesize` block) at logical address `logical`,
@@ -2198,6 +2468,21 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// descent used to copy 16 KiB per level. Callers that need to mutate a node still take `read_node` and
     /// get their own copy.
     pub async fn read_node_shared(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
+        self.read_node_expecting(logical, None).await
+    }
+
+    /// [`Self::read_node_shared`] for a child reached through a parent
+    /// pointer: `expect` is the parent's check of the child (generation,
+    /// level, first key — Linux `btrfs_tree_parent_check`, applied by
+    /// `btrfs_validate_extent_buffer` to each mirror). A copy that fails it
+    /// is a bad mirror like one that fails its checksum: the next copy is
+    /// read, and a good one repairs it. A cache hit is returned unchecked;
+    /// the caller still applies its check.
+    pub(crate) async fn read_node_expecting(
+        &self,
+        logical: u64,
+        expect: Option<crate::repair::ParentCheck<'_>>,
+    ) -> Result<Arc<Vec<u8>>, FsError> {
         // A block of the running batch is rewritten in place at the same
         // address by later operations, and another CPU can read it from the
         // device in the middle of that write (a reader takes no operation
@@ -2208,7 +2493,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // killed caller's abandoned wait ends the read at once.
         let mut last = FsError::InvalidData;
         for _ in 0..3 {
-            match self.read_node_attempt(logical).await {
+            match self.read_node_attempt(logical, expect).await {
                 Ok(node) => {
                     self.stats.note_read(&node);
                     return Ok(node);
@@ -2220,7 +2505,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         Err(last)
     }
 
-    async fn read_node_attempt(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
+    async fn read_node_attempt(
+        &self,
+        logical: u64,
+        expect: Option<crate::repair::ParentCheck<'_>>,
+    ) -> Result<Arc<Vec<u8>>, FsError> {
         // Serve from the node cache when nothing has written this address
         // since it was filled. A hit skips both the device read and the
         // full-node checksum verification; the clone is a memcpy against an
@@ -2238,24 +2527,35 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let mut buf = vec![0u8; self.nodesize()];
         let copies = self.logical_read_copies(logical)?;
         let mut failure = CopyFailure::default();
+        // `btrfs_read_extent_buffer` repairs the first mirror that failed
+        // (`failed_mirror`) once a later one verified.
+        let mut bad = 0u32;
         for copy in 0..copies {
             if let Err(error) = self.read_logical_copy(logical, &mut buf, copy).await {
                 failure.read_failed(error)?;
+                // Every failed read counts; only the first failure is
+                // repaired (`failed_mirror`).
+                let first = bad == 0;
+                self.note_copy_read_error(logical, copy, error, &mut bad, first);
                 continue;
             }
-            if format::le64(&buf, 48)? != logical {
+            if !self.node_verifies_as_read(logical, &buf)? || expect.is_some_and(|ok| !ok(&buf)) {
                 failure.mismatch();
+                if bad == 0 {
+                    note_bad_copy(&mut bad, copy);
+                }
                 continue;
             }
-            if self.verify_checksums
-                && !crate::checksum::verify(
-                    self.csum_type,
-                    &buf[format::CSUM_SIZE..],
-                    &buf[..format::CSUM_SIZE],
-                )?
-            {
-                failure.mismatch();
-                continue;
+            if bad != 0 {
+                self.repair_copies(crate::repair::Request {
+                    logical,
+                    good: &buf,
+                    good_copy: copy,
+                    bad,
+                    verify: crate::repair::Verify::Node(expect),
+                    owner: (0, logical),
+                })
+                .await;
             }
             crate::stats::note_device_read();
             let shared = Arc::new(core::mem::take(&mut buf));
@@ -2692,6 +2992,11 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             nodes: node_cache,
             aborted: core::sync::atomic::AtomicBool::new(false),
             refused_after_abort: core::sync::atomic::AtomicU64::new(0),
+            io_ranges: crate::repair::IoRanges::default(),
+            repair_counters: crate::repair::RepairCounters::default(),
+            dev_stats: crate::repair::DevStats::default(),
+            #[cfg(feature = "kernel-test")]
+            repair_hook: IrqSafeSpinLock::new(None),
             quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
             stats: crate::stats::CommitStats::default(),
@@ -3316,6 +3621,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// `btrfs_map_bio`: one bio per mirror, all in flight together), split at
     /// chunk / stripe boundaries. No cache bookkeeping: the callers'.
     async fn write_stripes(&self, logical: u64, src: &[u8]) -> Result<(), FsError> {
+        // Held until every mirror's write finished: a read repair of any byte
+        // of this range waits for it, or this waits for the repair.
+        let _writing = self.io_ranges.begin_write(logical, src.len() as u64).await;
         let mut done = 0usize;
         while done < src.len() {
             let at = logical
@@ -4136,11 +4444,17 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
 
     /// Publish replacement geometry for an existing logical chunk after its
     /// new physical contents and COWed chunk tree are durable.
-    pub(crate) fn replace_chunk_item_mapping(
+    ///
+    /// The chunk's whole logical range is registered as written across the
+    /// swap, so a read repair never writes through the old geometry to
+    /// physical space the swap hands back ([`crate::repair`]).
+    pub(crate) async fn replace_chunk_item_mapping(
         &self,
         logical: u64,
         chunk: &[u8],
     ) -> Result<(), FsError> {
+        let length = format::le64(chunk, 0)?;
+        let _swapping = self.io_ranges.begin_write(logical, length).await;
         self.state
             .lock()
             .chunk_map

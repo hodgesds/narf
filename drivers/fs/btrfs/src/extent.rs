@@ -275,6 +275,7 @@ pub async fn read_file<B: BlockDevice + 'static>(
                             logical + done as u64,
                             take,
                             le64(body, 0)?,
+                            Some((ino, ov_start + done as u64)),
                         )
                         .await?;
                         dst[d0 + done..d0 + done + take].copy_from_slice(&data);
@@ -298,6 +299,9 @@ pub async fn read_file<B: BlockDevice + 'static>(
                             generation: le64(body, 0)?,
                         },
                         sectorsize,
+                        // `btrfs_submit_compressed_read`: the file offset
+                        // the extent's first byte maps to.
+                        Some((ino, file_start.saturating_sub(extent_offset))),
                     )
                     .await?;
                     let src_start = (extent_offset + (ov_start - file_start)) as usize;
@@ -326,6 +330,7 @@ async fn read_uncompressed_cached<B: BlockDevice + 'static>(
     logical: u64,
     len: usize,
     generation: u64,
+    file_pos: Option<(u64, u64)>,
 ) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
     use crate::decompress_cache as cache;
     let core: alloc::sync::Weak<crate::volume::VolCore<B>> =
@@ -348,7 +353,9 @@ async fn read_uncompressed_cached<B: BlockDevice + 'static>(
     }
     let epoch = if cacheable { cache::epoch(&handle) } else { 0 };
     let (data, fully_verified) = match csum_root {
-        Some(root) => crate::csum::read_checked_for_cache(vol, root, logical, len).await?,
+        Some(root) => {
+            crate::csum::read_checked_for_cache(vol, root, logical, len, file_pos).await?
+        }
         None => (vol.read_logical(logical, len).await?, false),
     };
     let data = alloc::sync::Arc::new(data);
@@ -368,6 +375,7 @@ async fn read_compressed_cached<B: BlockDevice + 'static>(
     csum_root: Option<u64>,
     id: crate::decompress_cache::ExtentId,
     sectorsize: usize,
+    file_pos: Option<(u64, u64)>,
 ) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
     use crate::decompress_cache as cache;
     // Keyed by the shared core, not this mount's view: every subvolume mount
@@ -383,7 +391,15 @@ async fn read_compressed_cached<B: BlockDevice + 'static>(
     let epoch = cache::epoch(&handle);
     let raw = match csum_root {
         Some(root) => {
-            crate::csum::read_checked(vol, root, id.disk_bytenr, id.disk_num_bytes as usize).await?
+            crate::csum::read_checked_for_cache(
+                vol,
+                root,
+                id.disk_bytenr,
+                id.disk_num_bytes as usize,
+                file_pos,
+            )
+            .await?
+            .0
         }
         None => {
             vol.read_logical(id.disk_bytenr, id.disk_num_bytes as usize)

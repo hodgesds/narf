@@ -11163,7 +11163,8 @@ async fn grow_or_balance<B: BlockDevice + 'static>(
     vol.set_superblock_levels(root_root_level, Some(chunk_root_level));
     vol.commit_sys_chunk_array(sys_array)?;
     for relocation in &relocations {
-        vol.replace_chunk_item_mapping(relocation.new.logical, &relocation.new.item)?;
+        vol.replace_chunk_item_mapping(relocation.new.logical, &relocation.new.item)
+            .await?;
     }
     Ok(BalanceStats {
         considered,
