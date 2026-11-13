@@ -25,7 +25,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 /// Text words that make up one site key.
 pub const SITE_DEPTH: usize = 12;
-/// Stack words scanned for them.
+/// Stack words scanned for them (x86_64 kernel `scan()` only; the other
+/// targets' stub `scan()` never reads the stack, so the const is gated to
+/// match its sole use site instead of tripping dead-code there).
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
 const SCAN_WORDS: usize = 160;
 /// Distinct sites tracked; the rest pool in site 0 ("other").
 const MAX_SITES: usize = 4096;

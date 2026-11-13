@@ -381,10 +381,12 @@ pub fn __set_idle_timeout_for_test(jiffies: u64) {
 #[doc(hidden)]
 pub fn __pool_idle_workers(cpu: usize) -> usize {
     let p = CPU_POOLS[cpu.min(MAX_CPUS - 1)][0].load(Ordering::Acquire);
-    // SAFETY: pools are leaked.
-    (!p.is_null())
-        .then(|| unsafe { &*p }.inner.lock().idle.len())
-        .unwrap_or(0)
+    if !p.is_null() {
+        // SAFETY: pools are leaked.
+        unsafe { &*p }.inner.lock().idle.len()
+    } else {
+        0
+    }
 }
 
 /// `MAX_IDLE_WORKERS_RATIO`.
@@ -1551,8 +1553,10 @@ pub fn __pool_workers(cpu: Option<usize>) -> usize {
         None => &UNBOUND_POOL,
     };
     let p = slot.load(Ordering::Acquire);
-    // SAFETY: pools are leaked.
-    (!p.is_null())
-        .then(|| unsafe { &*p }.inner.lock().nr_workers)
-        .unwrap_or(0)
+    if !p.is_null() {
+        // SAFETY: pools are leaked.
+        unsafe { &*p }.inner.lock().nr_workers
+    } else {
+        0
+    }
 }
