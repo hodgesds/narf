@@ -124,7 +124,7 @@ fn cancelled_write_out_is_finished() -> Result<(), &'static str> {
     if after.superblock().generation != base + 1 {
         return Err("the finished write-out's superblock is not on the device");
     }
-    if !poll_once(after.root().lookup_async("kept")).is_some_and(|r| r.is_ok()) {
+    if poll_once(after.root().lookup_async("kept")).is_none_or(|r| r.is_err()) {
         return Err("the finished write-out lost its commit");
     }
     Ok(())
@@ -213,7 +213,7 @@ fn handover() -> Result<(), &'static str> {
     // Cut 2: the first commit complete, the second not committed.
     let cut = mount_writable(crash_image(&device)).map_err(|_| "cut 2 did not mount")?;
     if cut.superblock().generation != base + 1
-        || !poll_once(cut.root().lookup_async("first")).is_some_and(|r| r.is_ok())
+        || poll_once(cut.root().lookup_async("first")).is_none_or(|r| r.is_err())
     {
         return Err("cut 2 is not the first commit");
     }
