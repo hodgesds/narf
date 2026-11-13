@@ -139,7 +139,8 @@ pub fn peak_from_top() -> usize {
 }
 
 /// The deepest initcall measured: `(stage, name, bytes)`.
-pub fn deepest() -> Option<(&'static str, &'static str, usize)> {
+#[cfg(feature = "kernel-test")]
+fn deepest() -> Option<(&'static str, &'static str, usize)> {
     TOP_TEN.lock()[0].map(|r| (r.stage, r.name, r.depth))
 }
 
