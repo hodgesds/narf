@@ -153,6 +153,31 @@ pub(crate) static WRITE_OUT_HOLD: core::sync::atomic::AtomicBool =
 pub(crate) static WRITE_OUT_HELD: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// A data extent withheld from allocation while its write is in flight
+/// ([`BtrfsVolume::hold_inflight_data`]); released on drop.
+pub(crate) struct InflightData<'a> {
+    list: &'a IrqSafeSpinLock<Vec<(u64, u64)>>,
+    range: (u64, u64),
+}
+
+impl Drop for InflightData<'_> {
+    fn drop(&mut self) {
+        let mut list = self.list.lock();
+        if let Some(at) = list.iter().position(|r| *r == self.range) {
+            list.swap_remove(at);
+        }
+    }
+}
+
+/// Test-only: while set, a data write waits before its device write
+/// ([`DATA_WRITE_HELD`] once one has), as one held up by a slow device.
+#[cfg(feature = "kernel-test")]
+pub(crate) static DATA_WRITE_HOLD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "kernel-test")]
+pub(crate) static DATA_WRITE_HELD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Cached metadata nodes, keyed by logical address.
 ///
 /// `epoch` is what makes filling the cache safe against a concurrent write.
@@ -1441,6 +1466,14 @@ pub struct VolCore<B: BlockDevice> {
     /// release would hand the newer commit's freed blocks back before any
     /// durable superblock stopped referencing them.
     pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64, u64)>>,
+    /// Data extents carved for a write whose data is still being written,
+    /// with no transaction lock held (Linux: the reserved extent of an
+    /// ordered extent, `btrfs_reserve_extent` before the bio, the file
+    /// extent item inserted only by `btrfs_finish_ordered_io`). Every
+    /// allocator withholds them ([`BtrfsVolume::pinned_ranges`]): the batch
+    /// they were carved from may commit — without recording them — before
+    /// the write stages them into a later one. See [`InflightData`].
+    data_inflight: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
     /// Tree roots a lock-free reader is walking from, with a count per
     /// address ([`BtrfsVolume::pin_live_root`]). A reader verifies every
     /// child it reads against its parent's pointer (generation, level, first
@@ -3323,6 +3356,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             #[cfg(feature = "kernel-test")]
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            data_inflight: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             reader_roots: IrqSafeSpinLock::new(BTreeMap::new()),
             reader_epochs: IrqSafeSpinLock::new(ReaderEpochs::default()),
             evicting: IrqSafeSpinLock::new(BTreeSet::new()),
@@ -3559,6 +3593,37 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     #[cfg(feature = "kernel-test")]
     pub(crate) fn txn_joined(&self) -> bool {
         self.txn_gate.joined_by_current()
+    }
+
+    /// Withhold the data extent `[start, start + len)`, just carved from the
+    /// open batch, from every allocator until the returned guard drops —
+    /// after its write has been staged, or when the write gives up (the
+    /// carve is then returned: the batch that carved it frees it at its
+    /// commit, which does not record it).
+    pub(crate) fn hold_inflight_data(&self, start: u64, len: u64) -> InflightData<'_> {
+        self.data_inflight.lock().push((start, len));
+        InflightData {
+            list: &self.data_inflight,
+            range: (start, len),
+        }
+    }
+
+    /// Test-only: the data extents being written outside any transaction.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn inflight_data(&self) -> alloc::vec::Vec<(u64, u64)> {
+        self.data_inflight.lock().clone()
+    }
+
+    /// Leave the running transaction for a stretch of work that holds
+    /// nothing a commit needs — a data write between its extent carve and
+    /// its staging (Linux writes data with no transaction handle) — so a
+    /// commit, and every operation queued behind it, need not wait for its
+    /// I/O. `None` when the caller is not joined, or when a multi-stage
+    /// operation keeps its stages in one transaction ([`Self::hold_commits`]).
+    /// Join again with [`crate::txn_gate::Upgrade::step_in`].
+    pub(crate) fn step_out_for_io(&self) -> Option<crate::txn_gate::Upgrade<'_>> {
+        (!self.commits_held() && self.txn_gate.joined_by_current())
+            .then(|| crate::txn_gate::Upgrade::step_out(&self.txn_gate))
     }
 
     /// The cross-directory rename lock (see the field).
@@ -4515,6 +4580,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             .iter()
             .map(|&(_, start, len)| (start, len))
             .collect();
+        ranges.extend(self.data_inflight.lock().iter().copied());
         ranges.extend(
             self.reader_epochs
                 .lock()

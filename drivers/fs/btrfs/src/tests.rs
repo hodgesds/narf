@@ -30,6 +30,7 @@ mod group_commit;
 mod grow_tall;
 mod inode_lock;
 mod mirror_repair;
+mod ordered_data;
 mod overwrite_cost;
 mod release_cost;
 mod root_collapse;

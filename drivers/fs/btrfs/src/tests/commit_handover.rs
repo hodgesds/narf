@@ -18,7 +18,7 @@ kernel_test_in!(
 );
 
 /// Poll `future` up to `polls` times; its output if it finished.
-fn poll_n<F: core::future::Future + ?Sized>(
+pub(super) fn poll_n<F: core::future::Future + ?Sized>(
     mut future: core::pin::Pin<&mut F>,
     polls: u32,
 ) -> Option<F::Output> {
@@ -43,7 +43,7 @@ fn poll_n<F: core::future::Future + ?Sized>(
 }
 
 /// The device as a crash at this instant would leave it.
-fn crash_image(device: &WritableSparseDevice) -> Arc<WritableSparseDevice> {
+pub(super) fn crash_image(device: &WritableSparseDevice) -> Arc<WritableSparseDevice> {
     Arc::new(WritableSparseDevice {
         runs: device.runs.clone(),
         total: device.total,

@@ -813,6 +813,33 @@ putting the batch back to its state before the first step would lose them.
 Linux has no such case (a truncate is not cancellable); a killed task's
 truncate is handed off and finishes.
 
+### Data written outside the transaction (Linux ordered extents)
+
+A file write (`cow_write_file_once`) writes its data holding no transaction
+lock, as Linux writes a buffered write's delalloc range through an ordered
+extent (`cow_file_range` reserves the extent, the bio goes out with no
+transaction handle, `btrfs_finish_ordered_io` inserts the file-extent item
+and checksums). Per extent: carve it from the open batch's allocator under
+`fs_batch`, held only for the carve; withhold it from every allocator
+(`hold_inflight_data`, part of `pinned_ranges`) — the batch it came from may
+commit without it; write the data with the operation stepped out of the
+running transaction (`step_out_for_io`; not while `hold_commits` keeps a
+multi-stage operation in one transaction). Then join again and stage the
+file-extent items, checksums and inode, at the generation of whichever
+batch is open then, with the qgroup reservation taken at staging.
+
+Invariants: nothing records an extent whose data is not on the device
+(staging follows the completed write, and a superblock's pre-flush makes it
+durable); a reader sees the old extents until staging; the caller's inode
+lock keeps truncate, punch, fallocate, fsync and other writes of the file
+out until it is staged; a failed or abandoned write stages nothing and
+gives its carve back (the carving batch frees it at its commit; the
+withholding ends); a killed task's write is handed off and finishes. Tests:
+`smoke_btrfs_data_write_holds_no_transaction_lock` (another file's write, a
+create and a commit complete while a data write is held; a crash image then
+holds the old data; the held extent is not reused),
+`smoke_btrfs_abandoned_data_write_returns_its_extent`.
+
 The named mount path retains the implementation's existing format and option
 limits; registration does not add support for further on-disk features.
 

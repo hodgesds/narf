@@ -1112,24 +1112,6 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
         usize::try_from(rewrite_len.min(MAX_WRITE_EXTENT)).map_err(|_| FsError::InvalidData)?;
     let mut tile = crate::databuf::zeroed(tile_cap)?;
 
-    // Join the open transaction (opening one if this is the first operation).
-    // The data extents tiled below are carved from the batch's allocator, not
-    // a fresh one: a fresh allocator reads the on-disk free-space tree, which
-    // the batch has not updated yet, so it would hand out space the batch has
-    // already given to an earlier operation.
-    let mut guard = batch_begin(vol).await?;
-    let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
-    let gen = batch.gen;
-    // Reserve before allocating. A write that would cross a hard limit is
-    // refused here, having written no data, allocated nothing and staged
-    // nothing — which is what makes the rejection atomic without any unwinding.
-    //
-    // Both halves are reserved up front, which means counting this write's
-    // edits before building them: one delete per extent the rewrite displaces,
-    // one insert per extent it lays down, and the inode. Doing it here rather
-    // than beside `batch_stage` below is what keeps the refusal free of
-    // consequences — by then the data extents have been allocated and written,
-    // and a rejection would strand them until the batch commits.
     let items: Vec<fileops::FileItem> = extents
         .iter()
         .map(|(k, b)| fileops::FileItem::decode(*k, b.clone()))
@@ -1144,16 +1126,26 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     )?;
     let displaced = affected.iter().filter(|hit| **hit).count() + converted.edits.len();
     let laid_down = rewrite_len.div_ceil(MAX_WRITE_EXTENT) as usize;
-    qgroup_begin_op(batch);
-    qgroup_reserve(vol, batch, vol.fs_tree_id(), rewrite_len).await?;
-    qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), displaced + laid_down + 1).await?;
 
-    // ── Tile the content into fresh extents; write each + its checksums ─
-    // A failure part-way gives the extents already taken back to the batch's
-    // allocator; nothing has been staged yet.
-    let snapshot_alloc = batch.alloc.clone();
-    let mut new_data: Vec<DataRef> = Vec::new();
-    let mut new_eds: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
+    // ── Write the data, holding no transaction lock (Linux: the buffered
+    // write's delalloc range becomes an ordered extent — `cow_file_range`
+    // reserves its extent, the bio goes out with no transaction handle, and
+    // only `btrfs_finish_ordered_io` joins a transaction to insert the file
+    // extent item and checksums). ──
+    //
+    // Each extent is carved from the open batch's allocator under the batch
+    // lock, held only for the carve, and withheld from every allocator until
+    // it is staged or given back (`hold_inflight_data`): the batch it was
+    // carved from may commit without it meanwhile. The operation also steps
+    // out of the running transaction for the I/O, so a commit — and every
+    // operation queued behind one — never waits for this data. The inode
+    // lock the caller holds keeps truncate, punch, fallocate, fsync and other
+    // writes of this file out until it is staged; a reader sees the old
+    // extents until then, and the new data only in extents nothing else
+    // references.
+    let mut written: Vec<(u64, u64, u64, u64, u8, Vec<u8>)> = Vec::new();
+    let mut holds: Vec<crate::volume::InflightData<'_>> = Vec::new();
+    let stepped_out = vol.step_out_for_io();
     let tiled: Result<(), FsError> = async {
         let mut window_off = 0u64;
         while window_off < rewrite_len {
@@ -1208,36 +1200,82 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
                 None => (plain, format::COMPRESS_NONE),
             };
             let disk_len = payload.len() as u64;
-            let e_data = batch.alloc.alloc_data(vol, disk_len)?;
+            // The data extents are carved from the batch's allocator, not a
+            // fresh one: a fresh allocator reads the on-disk free-space tree,
+            // which the batch has not updated yet, so it would hand out space
+            // the batch has already given to an earlier operation.
+            let e_data = {
+                let mut guard = batch_begin(vol).await?;
+                let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+                batch.alloc.alloc_data(vol, disk_len)?
+            };
+            holds.push(vol.hold_inflight_data(e_data, disk_len));
+            // Test-only: the first data write while the hold is set waits
+            // here, as one on a slow device would; later ones pass.
+            #[cfg(feature = "kernel-test")]
+            if crate::volume::DATA_WRITE_HOLD.load(core::sync::atomic::Ordering::Acquire)
+                && !crate::volume::DATA_WRITE_HELD.swap(true, core::sync::atomic::Ordering::AcqRel)
+            {
+                while crate::volume::DATA_WRITE_HOLD.load(core::sync::atomic::Ordering::Acquire) {
+                    narf_time::sleep_ms(1).await;
+                }
+            }
             vol.write_logical(e_data, payload).await?;
             let csums = if nodatasum {
                 Vec::new()
             } else {
                 crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?
             };
-            let file_off = rewrite_start + window_off;
-            new_data.push(DataRef {
-                id: DataRefId {
-                    bytenr: e_data,
-                    len: disk_len,
-                    ref_root: vol.fs_tree_id(),
-                    objectid: ino,
-                    offset: file_off,
-                },
+            written.push((
+                rewrite_start + window_off,
+                e_data,
+                disk_len,
+                ext_len,
+                compression,
                 csums,
-            });
-            new_eds.push((
-                BtrfsKey::new(ino, format::EXTENT_DATA_KEY, file_off),
-                file_extent_reg_encoded(gen, e_data, disk_len, ext_len, compression),
             ));
             window_off += ext_len;
         }
         Ok(())
     }
     .await;
-    if let Err(error) = tiled {
-        batch.alloc = snapshot_alloc;
-        return Err(error);
+    if let Some(upgrade) = stepped_out {
+        upgrade.step_in().await;
+    }
+    // A failure gives every extent carved so far back (`holds` drops): the
+    // batch that carved it frees it at its commit, which records none of it.
+    tiled?;
+
+    // ── Stage: the ordered extent's finish (`btrfs_finish_ordered_io`) ──
+    // Into whichever transaction is open now — a commit may have closed the
+    // one the extents were carved from. Only now is anything recorded, so
+    // no commit can name an extent whose data is not on the device.
+    let mut guard = batch_begin(vol).await?;
+    let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+    let gen = batch.gen;
+    // Reserved here, at staging, under the lock that keeps another
+    // operation's reservation from mixing with this one's. A refusal stages
+    // nothing and gives the written extents back.
+    qgroup_begin_op(batch);
+    qgroup_reserve(vol, batch, vol.fs_tree_id(), rewrite_len).await?;
+    qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), displaced + laid_down + 1).await?;
+    let mut new_data: Vec<DataRef> = Vec::new();
+    let mut new_eds: Vec<(BtrfsKey, Vec<u8>)> = Vec::new();
+    for (file_off, e_data, disk_len, ext_len, compression, csums) in written {
+        new_data.push(DataRef {
+            id: DataRefId {
+                bytenr: e_data,
+                len: disk_len,
+                ref_root: vol.fs_tree_id(),
+                objectid: ino,
+                offset: file_off,
+            },
+            csums,
+        });
+        new_eds.push((
+            BtrfsKey::new(ino, format::EXTENT_DATA_KEY, file_off),
+            file_extent_reg_encoded(gen, e_data, disk_len, ext_len, compression),
+        ));
     }
 
     // ── Path-COW the fs tree: drop only intersected EXTENT_DATA, add the new tiling,
@@ -1257,8 +1295,9 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     for (key, body) in &new_eds {
         edits.push(Edit::Upsert(*key, body.clone()));
     }
-    // The inode item read at the top is still the tree's: nothing has been
-    // staged since, and the operation lock keeps every other mutator out.
+    // The inode item read at the top is still the tree's: nothing has
+    // changed it since — the inode lock keeps every other writer of this
+    // file out, including across the data write above.
     let inode_key = BtrfsKey::new(ino, format::INODE_ITEM_KEY, 0);
     let mut new_inode = fresh;
     new_inode[0..8].copy_from_slice(&gen.to_le_bytes()); // generation
@@ -1276,6 +1315,9 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     batch_stage_refs(vol, batch, &edits, dropped_data, converted.added, new_data).await?;
     let full = batch.is_full() && !vol.commits_held();
     drop(guard);
+    // Staged: the batch records the extents now, and its allocator has them
+    // (carved from it, or withheld from it when it was built).
+    drop(holds);
     if full {
         flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
     }
