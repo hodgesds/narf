@@ -15,6 +15,10 @@ pub(super) struct Receipt {
     tx_diversity: bool,
     /// Earned through the RTL8852C V1 register block (0x7140..0x7164).
     c: bool,
+    /// Decoded for RTL8852A (`chip->tx_nss`/`rx_nss` 2, `rf_path_num` 2)
+    /// through the B 0x8140 register block (`rtw8852a_h2c_regs` is
+    /// `R_AX_H2CREG_DATA0`, the B block).
+    a: bool,
     /// Decoded for RTL8851B (`chip->tx_nss`/`rx_nss` 1, `rf_path_num` 1)
     /// through the B 0x8140 register block.
     n51: bool,
@@ -47,8 +51,17 @@ impl Receipt {
             rx_paths: if rx_ant == 1 { 2 } else { 3 },
             tx_diversity,
             c,
+            a: false,
             n51: false,
         })
+    }
+    /// mac.c `rtw89_mac_setup_phycap_part0` for RTL8852A (rtw8852a.c
+    /// `tx_nss`/`rx_nss` 2, `rf_path_num` 2): the same AX part0 decode as
+    /// B, marked A so only the A register block binds it.
+    pub(in crate::rtw89) fn decode_a(words: [u32; 4]) -> Result<Self, Error> {
+        let mut receipt = Self::decode_for(false, words)?;
+        receipt.a = true;
+        Ok(receipt)
     }
     /// mac.c `rtw89_mac_setup_phycap_part0` for RTL8851B (rtw8851b.c
     /// `tx_nss`/`rx_nss` 1, `rf_path_num` 1): NSS is clamped to 1 (zero
@@ -73,8 +86,12 @@ impl Receipt {
             rx_paths: 1,
             tx_diversity: tx == 1 && tx_ant == 2 && rx_ant == 2,
             c: false,
+            a: false,
             n51: true,
         })
+    }
+    pub(super) fn is_a(&self) -> bool {
+        self.a
     }
     pub(super) fn is_c(&self) -> bool {
         self.c
@@ -143,6 +160,8 @@ impl Receipt {
             &b"NARF RTL8851B firmware GET_FEATURE part0 1T1R TXA RXA v1"[..]
         } else if self.c {
             b"NARF RTL8852C firmware GET_FEATURE part0 2T2R TXA RXAB v1"
+        } else if self.a {
+            b"NARF RTL8852A firmware GET_FEATURE part0 2T2R TXA RXAB v1"
         } else {
             b"NARF RTL8852B firmware GET_FEATURE part0 2T2R TXA RXAB v1"
         });

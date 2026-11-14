@@ -399,3 +399,36 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw8852c_phycap_uses_v1_register_block_and_binds_c_receipt
 );
+
+/// rtw8852a.c `rtw8852a_h2c_regs` (`R_AX_H2CREG_DATA0`, the B block): the
+/// same AX GET_FEATURE part0 exchange through 0x8140..0x8164, and an
+/// A-bound receipt whose fingerprint differs from B's.
+fn smoke_rtw8852a_phycap_uses_b_register_block_and_binds_a_receipt() -> TestResult {
+    let words = [0x00020403, 2, 0, 0x00020200];
+    let mut model = Model::new(0, words);
+    let mut mailbox = Mailbox::for_chip(crate::rtw89::mac::ChipId::Rtl8852A);
+    let receipt = match ready(mailbox.phycap(&mut model)) {
+        Some(Ok(value)) => value,
+        _ => return TestResult::Fail("A PHY_CAP query failed"),
+    };
+    if !receipt.is_a()
+        || receipt.is_c()
+        || receipt.is_51()
+        || receipt.words() != words
+        || receipt.initial_profile().is_err()
+        || model.word(0x8140) != 0x103
+        || model.bytes[0x8164] != 0
+        || model.bytes[0x8160] != 0
+    {
+        return TestResult::Fail("RTL8852A PHY_CAP did not use the B H2CREG/C2HREG block");
+    }
+    let b = Receipt::decode(words).unwrap();
+    if b.is_a() || b.fingerprint() == receipt.fingerprint() {
+        return TestResult::Fail("RTL8852A receipt is not distinct from a B receipt");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw8852a_phycap_uses_b_register_block_and_binds_a_receipt
+);

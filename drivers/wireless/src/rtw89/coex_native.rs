@@ -116,6 +116,40 @@ impl Protocol51 {
         Protocol.off_policy()
     }
 }
+/// RTL8852A coex.c `rtw89_btc_ver_defs` rows: 0.13.37.0 is field-for-field
+/// the RTL8852B 0.29.29 row (`fcxtdma` 3, `fcxslots` 1, `fcxinit` 0,
+/// `fcxctrl` 1), so B's [`Protocol`] encodings apply; 0.13.0.0 is the
+/// older ABI (`fcxtdma` 1, `fcxslots` 1, `fcxinit` 0, `fcxctrl` 0) with
+/// the same init encoding. Linux takes the first row at or below the
+/// firmware; NARF stops at the 0.13 series (no newer ABI guessing).
+/// Only the version row and its tag are bound here (by the A calibration
+/// board); the `init`/`off_policy` owner encodings land with the A coex
+/// owner (`prepare_a`), which does not exist yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProtocolA {
+    Tdma3,
+    Tdma1,
+}
+impl ProtocolA {
+    pub fn for_version(v: [u8; 4]) -> Option<Self> {
+        let code = u32::from_be_bytes(v);
+        let at = |sub| u32::from_be_bytes([0, 13, sub, 0]);
+        if (at(37)..u32::from_be_bytes([0, 14, 0, 0])).contains(&code) {
+            Some(Self::Tdma3)
+        } else if (at(0)..at(37)).contains(&code) {
+            Some(Self::Tdma1)
+        } else {
+            None
+        }
+    }
+    /// Identity byte bound into the A calibration recipe.
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::Tdma3 => 3,
+            Self::Tdma1 => 1,
+        }
+    }
+}
 /// RTL8852C coex.c `rtw89_btc_ver_defs` rows: every C row has `fcxinit` 0
 /// and `fcxctrl` 1 (B's init/ctrl encodings); 0.27.0..0.27.97 use
 /// `fcxtdma` 3 / `fcxslots` 1 (B's policy encoding) and 0.27.97 onward

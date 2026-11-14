@@ -125,6 +125,7 @@ kernel_test_in!(
 );
 
 struct FactoryModel {
+    chip: ChipId,
     rfe: u8,
     cut: u8,
     trim: u8,
@@ -162,7 +163,7 @@ impl super::super::power::Io for FactoryModel {
 }
 impl super::super::factory::Source for FactoryModel {
     fn profile(&self) -> (ChipId, u8) {
-        (ChipId::Rtl8852B, self.cut)
+        (self.chip, self.cut)
     }
     async fn physical(
         &mut self,
@@ -230,6 +231,7 @@ fn smoke_rtw89_b_calibration_identity_binds_actual_factory_and_verified_assets()
     let mut identities = alloc::vec::Vec::new();
     for variant in 0..6 {
         let mut model = FactoryModel {
+            chip: ChipId::Rtl8852B,
             rfe: if variant == 1 { 5 } else { 1 },
             cut: if variant == 2 { 0 } else { 1 },
             trim: if variant == 3 { 254 } else { 255 },
@@ -278,6 +280,99 @@ fn smoke_rtw89_b_calibration_identity_binds_actual_factory_and_verified_assets()
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_calibration_identity_binds_actual_factory_and_verified_assets
+);
+fn smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets() -> TestResult {
+    // The N5AB artifact: signed, exact and revocable, mirroring B.
+    let board = Board {
+        identity: [7; 32],
+        mac: [2, 4, 6, 8, 10, 12],
+        device: 0x8852,
+        chip: ChipId::Rtl8852A,
+    };
+    let mut bytes = image(board);
+    bytes[..4].copy_from_slice(b"N5AB");
+    let cap = authority();
+    if !matches!(
+        Calibration::from_verified(&bytes, None, board, cap),
+        Err(Error::Unsigned)
+    ) {
+        return TestResult::Fail("unsigned A calibration accepted");
+    }
+    let calibration = Calibration::from_verified(&bytes, Some([3; 32]), board, cap).unwrap();
+    if !calibration.matches(board) || calibration.check(&domain()).is_err() {
+        return TestResult::Fail("exact measured A calibration bound rejected");
+    }
+    cap.revoke();
+    if !matches!(calibration.current(), Err(Error::Authority)) {
+        return TestResult::Fail("revoked A qualification remained usable");
+    }
+    // The A board identity: real A factory + verified A assets, both
+    // BTC ABI rows admitted, newer ABI refused.
+    let device = narf_bus::DeviceId {
+        vendor: 0x10ec,
+        device: 0x8852,
+        class: 0x028000,
+        subsystem_vendor: 1,
+        subsystem_id: 2,
+    };
+    let mut model = FactoryModel {
+        chip: ChipId::Rtl8852A,
+        rfe: 5,
+        cut: 1,
+        trim: 255,
+    };
+    let mut factory = Factory::default();
+    if ready(factory.read(&mut model)) != Some(Ok(())) {
+        return TestResult::Fail("real A factory parser fixture");
+    }
+    let mut identity = None;
+    for version in [[0, 13, 37, 0], [0, 13, 0, 0]] {
+        let image = super::super::prepared::load(
+            &mut Files { version, body: 0 },
+            ChipId::Rtl8852A,
+            model.cut,
+        )
+        .unwrap();
+        let assets = Assets::from_prepared(&image).unwrap();
+        let next = Board::new_a(&factory, device, &assets).unwrap().identity();
+        if identity == Some(next) {
+            return TestResult::Fail("both A BTC ABI rows reused one calibration identity");
+        }
+        identity = Some(next);
+    }
+    let image = super::super::prepared::load(
+        &mut Files {
+            version: [0, 14, 0, 0],
+            body: 0,
+        },
+        ChipId::Rtl8852A,
+        model.cut,
+    )
+    .unwrap();
+    let newer = Assets::from_prepared(&image).unwrap();
+    if Board::new_a(&factory, device, &newer).is_ok() {
+        return TestResult::Fail("unsupported A coex ABI acquired measured board identity");
+    }
+    let mut bad_device = device;
+    bad_device.device = 0xb852;
+    let image = super::super::prepared::load(
+        &mut Files {
+            version: [0, 13, 37, 0],
+            body: 0,
+        },
+        ChipId::Rtl8852A,
+        model.cut,
+    )
+    .unwrap();
+    let assets = Assets::from_prepared(&image).unwrap();
+    if Board::new_a(&factory, bad_device, &assets).is_ok() {
+        return TestResult::Fail("B device acquired an A board identity");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_calibration_is_n5ab_and_new_a_binds_factory_and_assets
 );
 
 /// Explicit inert artifact/policy boundary for native revocation regressions.

@@ -23,6 +23,9 @@ pub(super) struct Mailbox {
     /// RTL8851B (rtw8851b.c `rtw8851b_h2c_regs` is the B block): the
     /// receipt is decoded with the one-path RTL8851B rule.
     n51: bool,
+    /// RTL8852A (rtw8852a.c `rtw8852a_h2c_regs` is the B block): the
+    /// receipt is decoded with the A rule (same AX part0 as B, marked A).
+    a: bool,
 }
 impl Default for Mailbox {
     fn default() -> Self {
@@ -37,6 +40,7 @@ impl Mailbox {
             c2h: 0,
             base,
             n51: false,
+            a: false,
         }
     }
     /// rtw8852c.c `rtw8852c_h2c_regs`/`rtw8852c_c2h_regs` with
@@ -47,6 +51,11 @@ impl Mailbox {
         } else if chip == super::mac::ChipId::Rtl8851B {
             Self {
                 n51: true,
+                ..Self::default()
+            }
+        } else if chip == super::mac::ChipId::Rtl8852A {
+            Self {
+                a: true,
                 ..Self::default()
             }
         } else {
@@ -96,6 +105,8 @@ impl Mailbox {
         // consumption bind this one-shot query; source counters are retained.
         let receipt = if self.n51 {
             super::firmware_phycap::Receipt::decode_51(words)?
+        } else if self.a {
+            super::firmware_phycap::Receipt::decode_a(words)?
         } else {
             super::firmware_phycap::Receipt::decode_for(self.base == 0x7140, words)?
         };

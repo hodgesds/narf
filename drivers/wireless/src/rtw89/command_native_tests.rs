@@ -102,6 +102,7 @@ impl Fixture {
             radio_shutdown: super::super::radio_shutdown::Shutdown::default(),
             ordinary: None,
             full_qualification: None,
+            qualification_a: None,
             qualification_c: None,
             qualification_51: None,
             operating: Some(super::super::phy_operating::Operating::default()),
@@ -990,6 +991,205 @@ fn smoke_rtw89_native_dma_reclaim_requires_verified_stop_proof() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_native_dma_reclaim_requires_verified_stop_proof
+);
+
+/// Minimal A factory source: the same sparse AX records as
+/// `factory::tests::SourceModel` (MAC [2,4,6,8,10,12], xtal 0x33, rfe 5,
+/// country "US", autoload 32, phycap [0..128] with the extra bytes
+/// [0xaa, 0x1f, 255, 255, 255] at 0x69..0x6e).
+struct FactorySource {
+    raw: [u8; 1216],
+    extra: [u8; 5],
+    phycap: [u8; 128],
+}
+impl FactorySource {
+    fn new() -> Self {
+        let mut raw = [255; 1216];
+        let mut cursor = 4;
+        for (offset, bytes) in [
+            (0x400, [2, 4]),
+            (0x402, [6, 8]),
+            (0x404, [10, 12]),
+            (0x2b8, [255, 0x33]),
+            (0x2ca, [5, b'U']),
+            (0x2cc, [b'S', 255]),
+        ] {
+            let block = offset / 8;
+            raw[cursor] = (block >> 4) as u8;
+            raw[cursor + 1] = ((block & 15) << 4) as u8 | (15 ^ (1 << ((offset % 8) / 2)));
+            raw[cursor + 2..cursor + 4].copy_from_slice(&bytes);
+            cursor += 4;
+        }
+        Self {
+            raw,
+            extra: [0xaa, 0x1f, 255, 255, 255],
+            phycap: core::array::from_fn(|i| i as u8),
+        }
+    }
+}
+impl super::super::power::Io for FactorySource {
+    fn read8(&mut self, _: u32) -> Result<u8, super::super::power::Error> {
+        panic!("A factory source has no register read")
+    }
+    fn read16(&mut self, a: u32) -> Result<u16, super::super::power::Error> {
+        if a != 0xa {
+            panic!("A factory source autoload read outside 0xa");
+        }
+        Ok(32)
+    }
+    fn read32(&mut self, _: u32) -> Result<u32, super::super::power::Error> {
+        panic!("A factory source has no register read")
+    }
+    fn write8(&mut self, _: u32, _: u8) -> Result<(), super::super::power::Error> {
+        panic!("A factory source has no register write")
+    }
+    fn write16(&mut self, _: u32, _: u16) -> Result<(), super::super::power::Error> {
+        panic!("A factory source has no register write")
+    }
+    fn write32(&mut self, _: u32, _: u32) -> Result<(), super::super::power::Error> {
+        panic!("A factory source has no register write")
+    }
+    fn now_us(&self) -> u64 {
+        0
+    }
+    async fn delay_us(&mut self, _: u64) {}
+    async fn read_ecv(&mut self) -> Result<Option<u8>, super::super::power::Error> {
+        panic!("A factory source has no ECV read")
+    }
+}
+impl super::super::factory::Source for FactorySource {
+    fn profile(&self) -> (ChipId, u8) {
+        (ChipId::Rtl8852A, 1)
+    }
+    async fn physical(
+        &mut self,
+        start: u16,
+        output: &mut [u8],
+    ) -> Result<(), super::super::power::Error> {
+        match (start, output.len()) {
+            (0, 1216) => output.copy_from_slice(&self.raw),
+            (0x580, 128) => {
+                output.copy_from_slice(&self.phycap);
+                output[0x69..0x6e].copy_from_slice(&self.extra);
+            }
+            _ => panic!("A factory source read outside the A physical proof"),
+        };
+        Ok(())
+    }
+}
+/// Minimal PCIe model for the A RX setup: the MMIO bytes plus the
+/// config-space PCIe capability the `rx_dma` model carries (cap pointer
+/// 0x40, PCIe id, version 2, DEVCTL2 LTR on).
+struct RxModel {
+    bytes: Vec<u8>,
+}
+impl RxModel {
+    fn new() -> Self {
+        let mut bytes = vec![0; 0x10100];
+        bytes[0x1010..0x1014].copy_from_slice(&0xb0f03u32.to_le_bytes());
+        bytes[0x9a00] = 2;
+        bytes[0x10034] = 0x40;
+        bytes[0x10040] = 0x10;
+        bytes[0x10042] = 2;
+        bytes[0x10069] = 4;
+        Self { bytes }
+    }
+}
+impl super::super::power::Io for RxModel {
+    fn read8(&mut self, a: u32) -> Result<u8, super::super::power::Error> {
+        Ok(self.bytes[a as usize])
+    }
+    fn read16(&mut self, a: u32) -> Result<u16, super::super::power::Error> {
+        Ok(u16::from_le_bytes(
+            self.bytes[a as usize..a as usize + 2].try_into().unwrap(),
+        ))
+    }
+    fn read32(&mut self, a: u32) -> Result<u32, super::super::power::Error> {
+        Ok(u32::from_le_bytes(
+            self.bytes[a as usize..a as usize + 4].try_into().unwrap(),
+        ))
+    }
+    fn write8(&mut self, a: u32, v: u8) -> Result<(), super::super::power::Error> {
+        self.bytes[a as usize] = v;
+        Ok(())
+    }
+    fn write16(&mut self, a: u32, v: u16) -> Result<(), super::super::power::Error> {
+        self.bytes[a as usize..a as usize + 2].copy_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    fn write32(&mut self, a: u32, v: u32) -> Result<(), super::super::power::Error> {
+        self.bytes[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    fn now_us(&self) -> u64 {
+        0
+    }
+    async fn delay_us(&mut self, _: u64) {}
+    async fn read_ecv(&mut self) -> Result<Option<u8>, super::super::power::Error> {
+        Ok(None)
+    }
+}
+impl super::super::pcie::Interface for RxModel {
+    async fn config_read8(&mut self, a: u16) -> Result<u8, super::super::power::Error> {
+        Ok(self.bytes[0x10000 + a as usize])
+    }
+    async fn config_write8(&mut self, a: u16, v: u8) -> Result<(), super::super::power::Error> {
+        self.bytes[0x10000 + a as usize] = v;
+        Ok(())
+    }
+    async fn phy_read(
+        &mut self,
+        _: super::super::phy_access::Generation,
+        _: u8,
+    ) -> Result<u16, super::super::power::Error> {
+        Err(super::super::power::Error::Unsupported)
+    }
+    async fn phy_write(
+        &mut self,
+        _: super::super::phy_access::Generation,
+        _: u8,
+        _: u16,
+    ) -> Result<(), super::super::power::Error> {
+        Err(super::super::power::Error::Unsupported)
+    }
+}
+fn smoke_rtw89_native_a_radio_access_requires_factory_phycap_and_polling_rx() -> TestResult {
+    let mut f = Fixture::aperture(ChipId::Rtl8852A, 0x40020).unwrap();
+    f.activate().unwrap();
+    // No factory PHY-cap yet: refused.
+    if f.native.radio_access().is_ok() {
+        return TestResult::Fail("A radio access admitted without a factory PHY-cap");
+    }
+    let mut source = FactorySource::new();
+    let mut factory = super::super::factory::Factory::default();
+    if ready(factory.read(&mut source)) != Some(Ok(())) || factory.a_phycap().is_none() {
+        return TestResult::Fail("A factory read did not complete the A PHY-cap window");
+    }
+    f.native.factory = Some(factory);
+    // Factory PHY-cap present but RX still New: refused.
+    if f.native.radio_access().is_ok() {
+        return TestResult::Fail("A radio access admitted before RX reached Polling");
+    }
+    let mut model = RxModel::new();
+    // SAFETY: private RAM model with no DMA/reset/IRQ producer; the outer
+    // fixture retains every allocation and fences it before destruction.
+    if ready(unsafe {
+        f.native
+            .receive
+            .prepare_for(&mut model, ChipId::Rtl8852A, 4)
+    }) != Some(Ok(()))
+        || f.native.receive.state() != super::super::rx_dma::State::Polling
+    {
+        return TestResult::Fail("A RX preparation did not reach Polling");
+    }
+    match f.native.radio_access() {
+        Ok(()) => TestResult::Pass,
+        Err(_) => TestResult::Fail("A radio access refused with factory PHY-cap and Polling RX"),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_native_a_radio_access_requires_factory_phycap_and_polling_rx
 );
 
 #[cfg(feature = "kernel-test")]
