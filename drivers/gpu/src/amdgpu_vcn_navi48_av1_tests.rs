@@ -230,10 +230,14 @@ fn vcn5_av1_bad_pixels_guards_feedback_or_delivery_quarantine_arena() -> TestRes
     // with the wrapper assertions; cases 2..=11 call decode_av1_frame
     // directly on the same engine and assert the same expected error.
     //
-    // Two pieces of fixture hygiene keep the shared engine honest
+    // Three pieces of fixture hygiene keep the shared engine honest
     // between cases (each is a no-op when already aligned):
     // - every fault flag is reset before each case, so a leftover fault
     //   cannot change the next case's decode;
+    // - the engine state is re-established as Av1Testing before each
+    //   direct decode_av1_frame call: case 1 leaves it Failed, and
+    //   emit()'s state gate refuses Failed (Busy) — prove_av1 would
+    //   have made this transition, but cases 2..=11 bypass it;
     // - after each decode the ring read pointer is repaired and the AV1
     //   model stage counter realigned. Fault 4 refuses its Decode IB,
     //   so the fake's ring processor returns early without advancing
@@ -272,6 +276,14 @@ fn vcn5_av1_bad_pixels_guards_feedback_or_delivery_quarantine_arena() -> TestRes
                 let memory = engine.av1_memory.as_ref().unwrap();
                 (memory.mapping(), memory.address())
             };
+            // decode_av1_frame submits through emit(), whose state gate
+            // refuses State::Failed. Case 1 leaves the engine Failed
+            // (prove_av1 maps any error there); the wrapper would have
+            // re-entered Av1Testing, but these cases bypass it, so
+            // re-establish the testing state here. Idempotent: later
+            // cases leave the state at Av1Testing already, since the
+            // direct path never maps errors back to Failed.
+            engine.state = State::Av1Testing;
             assert_eq!(
                 run(engine.decode_av1_frame(map, base, d::STREAM, d::fixed(), 0, &mut observer)),
                 Err(expected)
