@@ -197,8 +197,19 @@ fn smoke_i915_object_async_live_discovery_and_early_refusal() -> TestResult {
         );
         assert!(mailbox.pending.lock().is_empty());
     }
-    // All refusals precede proto-context finalization: it is still mutable.
+    // The refusals looked the context up, and an execbuffer lookup
+    // finalizes a proto-context (spec: created contexts stay proto
+    // until execbuffer, GETPARAM or reset-stats lookup), so the same
+    // context no longer accepts its first engine map.
     let param = engines_param(&user.wire, id, &[(1, 1)], 8192);
+    user.wire.store(64, &param);
+    assert_eq!(
+        file.dispatch_card(card, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+        Some(Err(FsError::InvalidData))
+    );
+    // A fresh proto-context still accepts its first map.
+    let fresh = prototype(&file, card, &user);
+    let param = engines_param(&user.wire, fresh, &[(1, 1)], 8192);
     user.wire.store(64, &param);
     assert_eq!(
         file.dispatch_card(card, abi::GEM_CONTEXT_SETPARAM, 64, &user),
@@ -845,8 +856,19 @@ fn smoke_i915_object_async_imported_storage_refuses_before_context_or_dma() -> T
     refused_storage(&file, card, &user, &mailbox, [handles[0], imported], id);
     assert_eq!(arena.live_allocations(), baseline);
     assert_eq!(w.0.borrow().writes.len(), writes);
-    // Even after every negative, the same proto-context accepts its first map.
+    // The refusals looked the context up, and an execbuffer lookup
+    // finalizes a proto-context (spec: created contexts stay proto
+    // until execbuffer, GETPARAM or reset-stats lookup), so the same
+    // context no longer accepts its first engine map.
     let param = engines_param(&user.wire, id, &[(1, 1)], 8192);
+    user.wire.store(64, &param);
+    assert_eq!(
+        file.dispatch_card(card, abi::GEM_CONTEXT_SETPARAM, 64, &user),
+        Some(Err(FsError::InvalidData))
+    );
+    // A fresh proto-context still accepts its first map.
+    let fresh = prototype(&file, card, &user);
+    let param = engines_param(&user.wire, fresh, &[(1, 1)], 8192);
     user.wire.store(64, &param);
     assert_eq!(
         file.dispatch_card(card, abi::GEM_CONTEXT_SETPARAM, 64, &user),
