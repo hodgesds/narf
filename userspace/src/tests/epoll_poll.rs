@@ -3451,8 +3451,7 @@ fn smoke_epoll_nested_timerfd_expiry_wakes_outer_waiters() -> TestResult {
         );
     }
     let give_up = narf_scheduler::narf_time::Deadline::after_ms(3_000);
-    while !(flag_a.0.load(Ordering::SeqCst) && flag_b.0.load(Ordering::SeqCst))
-        && !give_up.expired()
+    while !(flag_a.0.load(Ordering::SeqCst) && flag_b.0.load(Ordering::SeqCst) || give_up.expired())
     {
         // The pinned task and the other CPU's timer interrupt run meanwhile.
         core::hint::spin_loop();

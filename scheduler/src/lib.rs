@@ -6263,10 +6263,12 @@ fn notify_wake_cpu_once(cpu: u32, notified: Option<u32>) {
 /// the plain kick, so a wake is never dropped.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Option<u32>) {
-    // A self-rearm is not newly runnable peer work.
-    if CURRENT_TASK
-        .get(home as usize)
-        .is_some_and(|slot| slot.0.load(Ordering::Acquire) == task)
+    // A self-rearm is not newly runnable peer work. A bridge waker has no
+    // task id: zero also means no task is running, so it is never a self-wake.
+    if task != TaskId::NONE.raw()
+        && CURRENT_TASK
+            .get(home as usize)
+            .is_some_and(|slot| slot.0.load(Ordering::Acquire) == task)
     {
         return;
     }
