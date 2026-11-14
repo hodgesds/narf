@@ -34,7 +34,7 @@ use crate::arp_cache;
 use crate::iface;
 use crate::pkt::{
     self, parse_arp, parse_eth_header, parse_ipv4, ARP_OP_REPLY, ARP_OP_REQUEST, ETHERTYPE_ARP,
-    ETHERTYPE_IPV4, ETH_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
+    ETHERTYPE_IPV4, ETHERTYPE_IPV6, ETH_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP,
 };
 
 pub use crate::tcp::core::{
@@ -528,11 +528,11 @@ fn rx_handler_with(
     }
 }
 
-/// Parse L2 and hand the frame to the ARP or IPv4 protocol handler. Split out
-/// of `rx_handler` so the GRO path can dispatch a coalesced frame through the
-/// identical sequence. `csum_verified` is Linux's `CHECKSUM_UNNECESSARY`: GRO
-/// already validated the IPv4 header and TCP checksums, so they are not summed
-/// a second time.
+/// Parse L2 and hand the frame to the ARP, IPv4 or IPv6 protocol handler.
+/// Split out of `rx_handler` so the GRO path can dispatch a coalesced frame
+/// through the identical sequence. `csum_verified` is Linux's
+/// `CHECKSUM_UNNECESSARY`: GRO already validated the IPv4 header and TCP
+/// checksums, so they are not summed a second time.
 fn dispatch_l3(iface_name: Option<&str>, net_ns_id: u64, frame: &[u8], csum_verified: bool) {
     let (eth, body) = match parse_eth_header(frame) {
         Some(t) => t,
@@ -543,8 +543,41 @@ fn dispatch_l3(iface_name: Option<&str>, net_ns_id: u64, frame: &[u8], csum_veri
         ETHERTYPE_IPV4 => {
             handle_ipv4(body, net_ns_id, iface_name.unwrap_or(""), csum_verified);
         }
+        ETHERTYPE_IPV6 => {
+            // The IPv6 stack resolves its namespace from the iface name
+            // (`iface::lookup`, as in `handle_tcp6`/`handle_udp6`), so the
+            // arm passes the same `iface_name.unwrap_or("")` the IPv4 arm
+            // uses. There is no IPv6 forwarding path (cf. #2034), so a
+            // unicast packet whose destination is not assigned to this
+            // node is dropped here, mirroring the IPv4
+            // `deliver_locally_in` gate in `handle_ipv4` — without it the
+            // host would answer Echo Requests addressed to other nodes.
+            // Multicast (ff00::/8: NDP/RA/MLD) and loopback (::1) always
+            // pass. NOTE: this calls `rx_frame`, not `rx_frame_l2` — the
+            // `L2Dst` threading lives on open draft #2038 and does not
+            // exist on main yet; switching the arm once #2038 lands is a
+            // one-line follow-up.
+            if ipv6_deliver_locally(net_ns_id, body) {
+                let _ = crate::ipv6_stack::rx_frame(iface_name.unwrap_or(""), body);
+            }
+        }
         _ => {}
     }
+}
+
+/// True iff an IPv6 packet in `body` (frame after the Ethernet header) is
+/// addressed to this node: multicast, loopback, or an address in the
+/// interface address table for `net_ns_id`. Malformed headers return
+/// false (`rx_frame` would reject them too).
+fn ipv6_deliver_locally(net_ns_id: u64, body: &[u8]) -> bool {
+    if body.len() < crate::pkt_ipv6::IPV6_HDR_LEN || body[0] >> 4 != 6 {
+        return false;
+    }
+    let mut dst = [0u8; 16];
+    dst.copy_from_slice(&body[24..40]);
+    dst[0] == 0xff
+        || dst == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        || crate::ipv6::addrs::is_local_in(net_ns_id, &dst)
 }
 
 /// Per-CPU software GRO (receive-side coalescing). Off by default; enabling

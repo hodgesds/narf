@@ -2623,3 +2623,181 @@ kernel_test_in!(
     "net/ipv6_e2e",
     smoke_v6_icmp6_rx_frag_timeout_needs_first_segment
 );
+
+// ── Smoke 28: dispatch_l3 ETHERTYPE_IPV6 arm routes into rx_frame ────
+//
+// Same shape as smoke 19, but the Echo Request arrives as a full
+// Ethernet frame through `tcp_stack::rx_handler` — i.e. through the
+// production L2→L3 dispatch (`dispatch_l3`), not via a direct
+// `rx_frame` call. Before #2036 the frame fell into dispatch_l3's
+// `_ => {}` and was dropped; now the Echo Reply must be emitted.
+//
+// Linux ref: `ip6_rcv` → `icmpv6_rcv` → `icmpv6_echo_reply`
+//   (RFC 4443 §4.2).
+
+fn smoke_v6_dispatch_l3_routes_ipv6_echo() -> TestResult {
+    const IFACE: &str = "v6e2e-28";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    // Full Ethernet frame through production dispatch.
+    let req_body = crate::ipv6::icmp6_sock::build_echo_request(0xBEEF, 7, b"narf-v6");
+    let mut frame = build_icmpv6_frame(PEER_MAC, MAC, PEER_IP, ll, &req_body);
+    crate::tcp_stack::rx_handler(IFACE, &mut frame);
+
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail("expected exactly one emitted frame (Echo Reply via dispatch_l3)");
+    }
+    let (dst_mac, src_mac, ip, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("emitted frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC {
+        return TestResult::Fail("Echo Reply eth dst != peer MAC");
+    }
+    if src_mac != MAC {
+        return TestResult::Fail("Echo Reply eth src != our MAC");
+    }
+    if ip.src_ip != ll || ip.dst_ip != PEER_IP {
+        return TestResult::Fail("Echo Reply IPv6 src/dst wrong (want our ll -> peer)");
+    }
+    if ip.next_header != NEXT_HEADER_ICMPV6 {
+        return TestResult::Fail("Echo Reply next-header != 58");
+    }
+    if body.len() < 8 || body[0] != 129 || body[1] != 0 {
+        return TestResult::Fail("Echo Reply type/code != 129/0");
+    }
+    if u16::from_be_bytes([body[4], body[5]]) != 0xBEEF {
+        return TestResult::Fail("Echo Reply id mismatch");
+    }
+    if u16::from_be_bytes([body[6], body[7]]) != 7 {
+        return TestResult::Fail("Echo Reply seq mismatch");
+    }
+    if &body[8..] != b"narf-v6" {
+        return TestResult::Fail("Echo Reply payload not echoed unmodified (RFC 4443 §4.2)");
+    }
+    if !icmp6_checksum_ok(ip.src_ip, ip.dst_ip, &body) {
+        return TestResult::Fail("Echo Reply checksum does not verify (RFC 4443 §2.3)");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_dispatch_l3_routes_ipv6_echo);
+
+// ── Smoke 29: dispatch_l3 drops a unicast Echo to a foreign address ───
+//
+// The destination-ownership gate in the IPv6 arm (#2036): an Echo
+// Request addressed to an address this node does not own must go
+// unanswered — and must not even reach `rx_frame` (nothing queued
+// pending resolution). Mirrors the IPv4 precedent
+// `smoke_icmp_echo_foreign_destination_not_answered` in e2e_tests.rs.
+
+fn smoke_v6_dispatch_l3_drops_foreign_unicast_echo() -> TestResult {
+    const IFACE: &str = "v6e2e-29";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+    // 2001:db8::1 — documentation prefix, never assigned to this node.
+    const FOREIGN_IP: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    ];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    seed_peer(IFACE, PEER_IP, PEER_MAC);
+
+    let req_body = crate::ipv6::icmp6_sock::build_echo_request(0xBEEF, 7, b"narf-v6");
+    let mut frame = build_icmpv6_frame(PEER_MAC, MAC, PEER_IP, FOREIGN_IP, &req_body);
+    crate::tcp_stack::rx_handler(IFACE, &mut frame);
+
+    let frames = drain_v6();
+    if !frames.is_empty() {
+        return TestResult::Fail("echo request for a foreign address was answered");
+    }
+    if ipv6_stack::__pending_icmp6_test_count(0) != 0 {
+        return TestResult::Fail("foreign echo request left a queued reply pending resolution");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/ipv6_e2e",
+    smoke_v6_dispatch_l3_drops_foreign_unicast_echo
+);
+
+// ── Smoke 30: dispatch_l3 delivers multicast NS to the stack ──────────
+//
+// Same shape as smoke 21, but the NS arrives as a full Ethernet frame
+// (multicast dst MAC, solicited-node multicast IPv6 dst) through
+// `tcp_stack::rx_handler`. The ownership gate must let multicast
+// through (ff00::/8) so NDP still works: the solicited NA must be
+// emitted.
+
+fn smoke_v6_dispatch_l3_multicast_ns_reaches_stack() -> TestResult {
+    const IFACE: &str = "v6e2e-30";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x42];
+    const PEER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+    const PEER_IP: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x99];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+
+    let snm = addrs::solicited_node_multicast(&ll);
+    let ns_body = ndp::build_ns(ll, PEER_MAC);
+    let mut frame = build_icmpv6_frame(PEER_MAC, multicast_mac(&snm), PEER_IP, snm, &ns_body);
+    crate::tcp_stack::rx_handler(IFACE, &mut frame);
+
+    let frames = drain_v6();
+    if frames.len() != 1 {
+        return TestResult::Fail(
+            "expected exactly one emitted frame (solicited NA via dispatch_l3)",
+        );
+    }
+    let (dst_mac, src_mac, ip, body) = match decode_v6_frame(&frames[0]) {
+        Some(t) => t,
+        None => return TestResult::Fail("emitted frame does not decode as IPv6"),
+    };
+    if dst_mac != PEER_MAC {
+        return TestResult::Fail("NA eth dst != solicitor MAC (Source LL Address option)");
+    }
+    if src_mac != MAC {
+        return TestResult::Fail("NA eth src != our MAC");
+    }
+    if ip.src_ip != ll || ip.dst_ip != PEER_IP {
+        return TestResult::Fail("NA IPv6 src/dst wrong (want target -> solicitor)");
+    }
+    if ip.hop_limit != 255 {
+        return TestResult::Fail("NA hop limit != 255 (RFC 4861 §7.1.2)");
+    }
+    if body.len() < 24 || body[0] != 136 || body[1] != 0 {
+        return TestResult::Fail("NA type/code != 136/0");
+    }
+    let flags = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+    if flags != (NA_FLAG_SOLICITED | NA_FLAG_OVERRIDE) {
+        return TestResult::Fail("solicited NA flags != S|O (RFC 4861 §7.2.4)");
+    }
+    if body[8..24] != ll {
+        return TestResult::Fail("NA target != our addr");
+    }
+    if !icmp6_checksum_ok(ip.src_ip, ip.dst_ip, &body) {
+        return TestResult::Fail("NA checksum does not verify");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/ipv6_e2e",
+    smoke_v6_dispatch_l3_multicast_ns_reaches_stack
+);
