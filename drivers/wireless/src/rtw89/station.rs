@@ -3212,7 +3212,11 @@ impl State {
             return Err(Error::Profile);
         }
         let tpe = if channel.six.power() == 2 {
-            six::tpe(ies, &bss.channel).map_err(|()| Error::Profile)?
+            // The 8852C station is HE20-only: the used chandef
+            // is always 20 MHz, so the 20 MHz rearrange stands
+            // even on a wider AP channel.
+            six::tpe(ies, &bss.channel, association::phy::Width::Twenty)
+                .map_err(|()| Error::Profile)?
         } else {
             None
         };

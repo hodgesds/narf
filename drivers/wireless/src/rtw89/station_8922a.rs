@@ -54,17 +54,17 @@
 //!   on the remaining link. See the "MLO model" section
 //!   below for the Linux grounding and the deliberate
 //!   differences from it.
-//! - 2.4/5 GHz only, plus 6 GHz at 20 MHz with a 6 GHz power
-//!   program. A 6 GHz request must carry [`SixGhzAdmission`]
+//! - 2.4/5 GHz only, plus 6 GHz at 20/40/80/160 MHz with a 6 GHz
+//!   power program. A 6 GHz request must carry [`SixGhzAdmission`]
 //!   (the AP's client power type + the regd.c TPE constraint from
 //!   [`tpe`]); without it admission is refused
 //!   (`SixGhzPowerMissing`), so 6 GHz is never transmitted with
-//!   unprogrammed power. The TPE is the primary-20 MHz
-//!   subchannel constraint only, so wider 6 GHz widths are
-//!   refused (`SixGhzWidthUnsupported`): a wide station would
-//!   need the full-width EIRP/PSD rearrange (a follow-up), and
-//!   admitting it on the primary subchannel's constraint alone
-//!   could over-permit power on the other subchannels.
+//!   unprogrammed power. The TPE is rearranged to the full
+//!   operating width (EIRP: the minimum over the width entries up
+//!   to the used width; PSD: the minimum over every used 20 MHz
+//!   subchannel), so a wide station is admitted on the constraint
+//!   of its whole channel, never on the primary subchannel's
+//!   constraint alone.
 //!   The admitted [`Station`] records the program as
 //!   [`SixGhzProgram`], including the phy.c TPE constraint in
 //!   MAC units the `rtw8922a_set_txpwr` limit program
@@ -205,7 +205,7 @@ use super::{
     radio_power_c::{tpe_mac, SixGhzPower},
     rfk,
 };
-use narf_wireless::association::six_ghz::SixGhzChannel;
+use narf_wireless::association::{phy::Width, six_ghz::SixGhzChannel};
 use narf_wireless::reg::PowerType6Ghz;
 
 /// Stride between an MLD link's MACIDs: one base MACID per
@@ -229,7 +229,7 @@ pub(super) enum Band {
     /// 5 GHz.
     Ghz5,
     /// 6 GHz (admitted only with a [`SixGhzAdmission`] power
-    /// program; 20 MHz only, see the module docs).
+    /// program; 20/40/80/160 MHz, see the module docs).
     Ghz6,
 }
 
@@ -321,20 +321,21 @@ impl SixGhzProgram {
 }
 
 /// The 8922A 6 GHz TPE entry point: the regd.c
-/// `rtw89_calculate_tpe` constraint (dBm) for a 20 MHz
-/// station on the primary inside the AP's HE 6 GHz channel
-/// `ap`, from the AP's Transmit Power Envelope elements in
-/// `ies`. It is the shared mac80211/regd.c parse
-/// (`station_six_ghz::tpe`, the 8852C template: validate,
-/// parse, rearrange to the used 20 MHz chandef, intersect
-/// the local and regulatory-client EIRP/PSD limits); the
-/// 8922A owner adds the admission rules around its result
+/// `rtw89_calculate_tpe` constraint (dBm) for a station of width
+/// `used` on the primary inside the AP's HE 6 GHz channel `ap`,
+/// from the AP's Transmit Power Envelope elements in `ies`. It is
+/// the shared mac80211/regd.c parse
+/// (`station_six_ghz::tpe`, the 8852C template: validate, parse,
+/// rearrange to the used chandef, intersect the local and
+/// regulatory-client EIRP/PSD limits); the 8922A owner adds the
+/// admission rules around its result
 /// ([`SixGhzProgram::from_admission`]) rather than a second
 /// copy of the parse. `Ok(None)`: no valid default-category
-/// TPE. `Err`: an 80+80 MHz AP channel or a primary outside
-/// `ap` — the caller refuses the join.
-pub(super) fn tpe(ies: &[u8], ap: &SixGhzChannel) -> Result<Option<i8>, ()> {
-    super::station::six::tpe(ies, ap)
+/// TPE. `Err`: an 80+80 MHz AP channel, a primary outside `ap`,
+/// or a used width wider than the AP channel — the caller
+/// refuses the join.
+pub(super) fn tpe(ies: &[u8], ap: &SixGhzChannel, used: Width) -> Result<Option<i8>, ()> {
+    super::station::six::tpe(ies, ap, used)
 }
 
 /// One admission request: the peer, the link, and the
@@ -397,8 +398,9 @@ pub(super) enum Error {
     /// A Standard-Power TPE constraint below -10 dBm
     /// (`RTW89_MIN_VALID_POWER_CONSTRAINT`, regd.c `-EINVAL`).
     SixGhzTpeBelowMinimum,
-    /// A 6 GHz width above 20 MHz (the TPE rearrange is
-    /// validated for the primary 20 MHz subchannel only).
+    /// A 6 GHz legacy width above 20 MHz (legacy admission
+    /// is HE20-only; the EHT path admits 20/40/80/160 MHz
+    /// with the full-width TPE rearrange).
     SixGhzWidthUnsupported,
     /// TX-power program build failure for this station's
     /// channel (missing firmware TXPWR elements, a refused
@@ -711,9 +713,6 @@ fn validate(req: &Request) -> Result<Option<SixGhzProgram>, Error> {
     };
     if !chip_8922a::SUPPORT_BANDWIDTHS_MHZ.contains(&req.width_mhz) {
         return Err(Error::WidthNotAdvertised);
-    }
-    if req.band == Band::Ghz6 && req.width_mhz != 20 {
-        return Err(Error::SixGhzWidthUnsupported);
     }
     if req.nss == 0 || req.nss as usize > chip_8922a::TX_NSS {
         return Err(Error::NssOutOfRange);
