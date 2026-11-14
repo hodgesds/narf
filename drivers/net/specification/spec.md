@@ -62,7 +62,14 @@ Intel adopts it over MDIC (e1000: `phy_id` / `phy_link_up` /
 and ixgbe, which has no in-tree MDIO transport, are follow-ups —
 ixgbe's LINKS speed decode rides with the #791 carrier lane).
 The trait's MMD accessors are the transport the #794 EEE surface
-will ride; no EEE policy lives here.
+rides: `eee_advertisement` / `eee_partner` /
+`set_eee_advertisement` / `eee_status` over AN MMD 7.60–7.63,
+decoded by the shared `eee_modes_from_mmd` /
+`eee_mmd_adv_words` (100M/1G/2.5G — the same decode e1000, igb
+and igc now delegate to). PHY-side `active` is the negotiated
+intersection, ungated on link-up; `tx_lpi` is MAC-side and
+reads `false` here. Realtek's internal PHYs keep the
+paged-emulation advertisement path (`advertise_eee`).
 
 Every wired PCIe family dual-publishes (issue #784). The capability-gated
 frame-ring registration above is unchanged — stack-daemon and XDP consumers
@@ -610,8 +617,8 @@ frame itself and builds its descriptors from the shared builders.
   from VER_70, +10000FD on VER_80 only). The 8125 family
   programs the TX LPI idle timer register (0x6048 =
   MTU + 14 + 0x20) at bring-up. EEE PHY advertisement is
-  programmed from the `Stage::Late` PHY pass through the OCP
-  window: the emulated AN MMD advertisement registers
+  programmed on rtl8125/rtl8126/rtl8127 from the `Stage::Late`
+  PHY pass through the OCP window: the emulated AN MMD advertisement registers
   (7.60 → page 0xa5d reg 0x10, 7.62 → page 0xa6d reg 0x12)
   carry the chip's LPI caps, written only when they differ
   and read back for verification, and auto-negotiation

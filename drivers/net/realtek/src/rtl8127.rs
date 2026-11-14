@@ -2576,6 +2576,50 @@ fn configure_phy(mmio: &MmioRegion) {
             e
         );
     }
+
+    // EEE PHY advertisement (#794; same shape as rtl8125): program
+    // the emulated AN MMD advertisement registers for this chip's
+    // LPI caps (MAC version 80 — the same value `eee_caps`
+    // reports), then restart auto-negotiation iff the
+    // advertisement changed so the link partner negotiates EEE
+    // on the next exchange. This runs last so the advertisement
+    // is the final PHY-page programming before the link is used.
+    // A failure here is logged, not fatal: the interface still
+    // works, just without EEE advertisement.
+    let caps = crate::features::eee_lpi_caps(80);
+    match access.advertise_eee(caps) {
+        Ok(true) => match access.restart_aneg() {
+            Ok(true) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8127: EEE advertisement programmed; autonegotiation restarted",
+                );
+            }
+            Ok(false) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8127: EEE advertisement programmed; autonegotiation disabled, \
+                     takes effect at the next autonegotiation",
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  rtl8127: EEE advertisement programmed but autonegotiation restart \
+                     failed: {:?}",
+                    e
+                );
+            }
+        },
+        Ok(false) => {}
+        Err(e) => {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  rtl8127: EEE advertisement failed: {:?}; link partner will not negotiate EEE",
+                e
+            );
+        }
+    }
 }
 
 /// Run the PHY bring-up sequence once the firmware registry exists.

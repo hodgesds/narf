@@ -151,22 +151,19 @@ impl EeeRegs for MmioEeeRegs<'_> {
 }
 
 /// Decode an EEE advertisement pair (MMD 7/60 + 7/62) into the
-/// `EeeStatus` bit encoding — the same decode as igc's `modes()`.
+/// `EeeStatus` bit encoding — the shared decode
+/// ([`crate::phy::eee_modes_from_mmd`]); this keeps the name
+/// the existing call sites and smokes use.
 pub fn eee_modes(local: u16, local2: u16) -> u32 {
-    (if local & 0x2 != 0 { EEE_ADV_100M } else { 0 })
-        | (if local & 0x4 != 0 { EEE_ADV_1G } else { 0 })
-        | (if local2 & 0x1 != 0 { EEE_ADV_2_5G } else { 0 })
+    crate::phy::eee_modes_from_mmd(local, local2)
 }
 
 /// MMD advertisement words (7/60, 7/62) for an advertised set:
-/// 7/60 bit 1 = 100M, bit 2 = 1G; 7/62 bit 0 = 2.5G. The inverse
-/// of [`eee_modes`] (igc's `setup_link` writes the same words).
+/// the shared encode ([`crate::phy::eee_mmd_adv_words`]),
+/// the inverse of [`eee_modes`] (igc's `setup_link` writes the
+/// same words).
 pub fn eee_mmd_adv(advertised: u32) -> (u16, u16) {
-    (
-        (if advertised & EEE_ADV_100M != 0 { 2 } else { 0 })
-            | (if advertised & EEE_ADV_1G != 0 { 4 } else { 0 }),
-        u16::from(advertised & EEE_ADV_2_5G != 0),
-    )
+    crate::phy::eee_mmd_adv_words(advertised)
 }
 
 /// Next IPCNFG word for an advertised set: rewrite only the

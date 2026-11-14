@@ -1314,6 +1314,162 @@ mod tests {
         smoke_phy_trait_paged_and_mmd
     );
 
+    fn smoke_phy_trait_eee_shared_surface() -> TestResult {
+        use crate::phy::{
+            eee_mmd_adv_words, eee_modes_from_mmd, eee_status_from, EEE_ADV_100M, EEE_ADV_1G,
+            EEE_ADV_2_5G, EEE_MMD_ADV, EEE_MMD_ADV2, EEE_MMD_DEV, EEE_MMD_LP_ADV, EEE_MMD_LP_ADV2,
+        };
+        use narf_net::nic::EeeStatus;
+        // The shared constants are pinned as literals, not read
+        // back from the constants: a wrong register number must
+        // fail here instead of agreeing with the trait.
+        if EEE_MMD_DEV != 7
+            || EEE_MMD_ADV != 60
+            || EEE_MMD_LP_ADV != 61
+            || EEE_MMD_ADV2 != 62
+            || EEE_MMD_LP_ADV2 != 63
+        {
+            return TestResult::Fail("shared EEE MMD device/registers are not 7/60-63");
+        }
+        if EEE_ADV_100M != 8 || EEE_ADV_1G != 16 || EEE_ADV_2_5G != 32 {
+            return TestResult::Fail("shared EEE mode bits are not 8/16/32");
+        }
+        // Pure decode/encode, pinned as literals (Linux mdio.h
+        // bit map: 7/60 bit 1 = 100M, bit 2 = 1G, 7/62 bit 0
+        // = 2.5G — the same values e1000/igb/igc already decode).
+        if eee_modes_from_mmd(0x0006, 0x0001) != 0x38
+            || eee_modes_from_mmd(0x0002, 0x0000) != EEE_ADV_100M
+            || eee_modes_from_mmd(0x0000, 0x0000) != 0
+        {
+            return TestResult::Fail("shared EEE MMD mode decode wrong");
+        }
+        // Bits outside the three known modes never leak: 10GT
+        // (7/60 bit 3) and 5G (7/62 bit 1) plus reserved bits.
+        if eee_modes_from_mmd(0xFFF9, 0xFFFE) != 0
+            || eee_modes_from_mmd(0x000E, 0x0002) != (EEE_ADV_100M | EEE_ADV_1G)
+        {
+            return TestResult::Fail("shared EEE decode leaked non-EEE bits");
+        }
+        if eee_mmd_adv_words(0x38) != (0x0006, 0x0001)
+            || eee_mmd_adv_words(EEE_ADV_100M | EEE_ADV_1G) != (0x0006, 0x0000)
+            || eee_mmd_adv_words(0) != (0, 0)
+        {
+            return TestResult::Fail("shared EEE MMD advertisement words wrong");
+        }
+        // PHY-side status: active is the negotiated
+        // intersection; tx_lpi is always false (MAC-side).
+        if eee_status_from(0x38, 0x18)
+            != (EeeStatus {
+                advertised: 0x38,
+                partner: 0x18,
+                active: true,
+                tx_lpi: false,
+            })
+            || eee_status_from(0x18, 0x20).active
+            || eee_status_from(0, 0).active
+        {
+            return TestResult::Fail("shared EEE status derivation wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_trait_eee_shared_surface
+    );
+
+    fn smoke_phy_trait_eee_end_to_end() -> TestResult {
+        use crate::phy::{Phy, EEE_ADV_100M, EEE_ADV_1G, EEE_ADV_2_5G};
+        // Set-then-read round-trip through the trait's MMD
+        // transport on the scripted fake: the words on the wire
+        // are the spec's, the decode is the shared one.
+        let phy = FakeMdio::new(0x0024, 0x01e1, 0x0200, 0x01c1, 0x0800, 0x1000);
+        if phy
+            .set_eee_advertisement(EEE_ADV_100M | EEE_ADV_1G | EEE_ADV_2_5G)
+            .is_err()
+        {
+            return TestResult::Fail("trait set_eee_advertisement failed");
+        }
+        match (phy.read_mmd(7, 60), phy.read_mmd(7, 62)) {
+            (Ok(0x0006), Ok(0x0001)) => {}
+            _ => return TestResult::Fail("trait set_eee_advertisement wrote wrong MMD words"),
+        }
+        match phy.eee_advertisement() {
+            Ok(0x38) => {}
+            _ => return TestResult::Fail("trait eee_advertisement did not read back 0x38"),
+        }
+        // Partner advertises 100M+1G only: status is active on
+        // the intersection, tx_lpi false (PHY-side read).
+        if phy.write_mmd(7, 61, 0x0006).is_err() || phy.write_mmd(7, 63, 0x0000).is_err() {
+            return TestResult::Fail("trait write_mmd failed for the partner words");
+        }
+        match phy.eee_partner() {
+            Ok(0x18) => {}
+            _ => return TestResult::Fail("trait eee_partner did not decode 0x18"),
+        }
+        match phy.eee_status() {
+            Ok(s) if s.active && s.advertised == 0x38 && s.partner == 0x18 && !s.tx_lpi => {}
+            _ => return TestResult::Fail("trait eee_status wrong for a negotiated link"),
+        }
+        // Disable: words cleared, status inactive.
+        if phy.set_eee_advertisement(0).is_err() {
+            return TestResult::Fail("trait set_eee_advertisement(0) failed");
+        }
+        match phy.eee_advertisement() {
+            Ok(0) => {}
+            _ => return TestResult::Fail("trait eee_advertisement nonzero after disable"),
+        }
+        match phy.eee_status() {
+            Ok(s) if !s.active => {}
+            _ => return TestResult::Fail("trait eee_status active after disable"),
+        }
+        // Disjoint partner: advertised 100M only, partner 1G
+        // only → not active, even though both advertise EEE.
+        if phy.set_eee_advertisement(EEE_ADV_100M).is_err() || phy.write_mmd(7, 61, 0x0004).is_err()
+        {
+            return TestResult::Fail("trait EEE setup failed for the disjoint case");
+        }
+        match phy.eee_status() {
+            Ok(s) if !s.active && s.advertised == EEE_ADV_100M && s.partner == EEE_ADV_1G => {}
+            _ => return TestResult::Fail("trait eee_status active on disjoint advertisements"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_trait_eee_end_to_end
+    );
+
+    fn smoke_phy_shared_eee_matches_realtek_words() -> TestResult {
+        use crate::features::{eee_adv, eee_adv2, eee_lpi_caps};
+        use crate::phy::eee_modes_from_mmd;
+        // Cross-party check: the Realtek caps-based encode
+        // (`features::eee_adv` / `eee_adv2`, grounded in Linux
+        // `rtl_set_eee_txidle_timer` / `rtlgen` caps) and the
+        // shared decode must agree on the modes the shared
+        // surface knows. The 5G (ver 70/80) and 10G (ver 80)
+        // words are deliberately outside the shared decode —
+        // they must be ignored, not misdecoded.
+        for (ver, want_adv, want_adv2, want_modes) in [
+            (61u32, 0x0006u16, 0x0000u16, 0x18u32),
+            (63, 0x0006, 0x0001, 0x38),
+            (70, 0x0006, 0x0003, 0x38),
+            (80, 0x000e, 0x0003, 0x38),
+        ] {
+            let caps = eee_lpi_caps(ver);
+            if eee_adv(caps) != want_adv || eee_adv2(caps) != want_adv2 {
+                return TestResult::Fail("Realtek EEE words disagree with the pinned table");
+            }
+            if eee_modes_from_mmd(want_adv, want_adv2) != want_modes {
+                return TestResult::Fail("shared EEE decode disagrees with the Realtek words");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/realtek-phy-access",
+        smoke_phy_shared_eee_matches_realtek_words
+    );
+
     fn smoke_phy_merge_sample() -> TestResult {
         use crate::phy::{merge_phy_sample, PhyLink};
         use crate::publish::LinkSample;

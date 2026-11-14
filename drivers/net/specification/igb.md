@@ -204,7 +204,9 @@ EEE advertisement + ethtool get/set for the copper parts, in
 real impl, pure word helpers, scripted `FakeRegs` fixture) with
 wiring as `Igb::eee_status` / `Igb::set_eee` and an `eee` field
 on `EthtoolInfo` (populated from a live read; `None` while the
-part is not EEE-capable or the PHY does not answer).
+part is not EEE-capable or the PHY does not answer). The MMD
+decode/encode (`eee_modes` / `eee_mmd_adv`) delegate to the
+shared `narf_drivers_net_core::phy` surface (issue #794).
 
 - Capability gate: copper device ids only — I210 copper /
   flashless, I211 copper, 82576, 82576_NS, I350 copper.
