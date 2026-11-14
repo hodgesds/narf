@@ -633,8 +633,29 @@ pub(super) struct BeFactory {
     pub(super) secure: SecureInfo,
 }
 
-fn read_mac(io: &mut impl Io, hci: Hci, hci_log: &[u8]) -> [u8; 6] {
+/// EFUSE MAC from BAR registers (`rtw8922a_read_efuse_mac_addr`,
+/// `rtw8922a.c:829..847`): three `read16` at `base`, little-endian.
+/// No EFUSE dump or power sequencing: the BAR registers hold the MAC
+/// directly once the device is powered.
+fn read_mac_addr(io: &mut impl Io, base: u32) -> [u8; 6] {
     let mut mac = [0u8; 6];
+    for i in 0..3 {
+        let v = io.read16((base + (i as u32) * 2) as u64);
+        mac[i * 2] = (v & 0xFF) as u8;
+        mac[i * 2 + 1] = (v >> 8) as u8;
+    }
+    mac
+}
+
+/// PCIe EFUSE MAC from BAR registers (`MAC_ADDR_PCIE` 0x3104), for the
+/// shared `efuse::read_mac_with` RTL8922A arm: the PCIe MAC is read from
+/// the BAR, not from the logical map (`rtw8922a_read_efuse_pci_sdio`,
+/// `rtw8922a.c:846..847`).
+pub(super) fn read_mac_pcie(io: &mut impl Io) -> [u8; 6] {
+    read_mac_addr(io, MAC_ADDR_PCIE)
+}
+
+fn read_mac(io: &mut impl Io, hci: Hci, hci_log: &[u8]) -> [u8; 6] {
     match hci {
         Hci::Pcie | Hci::Usb => {
             let base = if hci == Hci::Pcie {
@@ -642,17 +663,14 @@ fn read_mac(io: &mut impl Io, hci: Hci, hci_log: &[u8]) -> [u8; 6] {
             } else {
                 MAC_ADDR_USB
             };
-            for i in 0..3 {
-                let v = io.read16((base + (i as u32) * 2) as u64);
-                mac[i * 2] = (v & 0xFF) as u8;
-                mac[i * 2 + 1] = (v >> 8) as u8;
-            }
+            read_mac_addr(io, base)
         }
         Hci::Sdio => {
+            let mut mac = [0u8; 6];
             mac.copy_from_slice(&hci_log[MAC_ADDR_SDIO_LOG_OFF..MAC_ADDR_SDIO_LOG_OFF + 6]);
+            mac
         }
     }
-    mac
 }
 
 impl BeFactory {

@@ -133,12 +133,12 @@ pub(super) const fn matches_ack(ack: &Ack, framed: &FramedH2c) -> bool {
 }
 
 /// `chip->h2c_desc_size` for RTL8922A: `sizeof(struct
-/// rtw89_rxdesc_short_v2)` = 6 dwords (`rtw8922a.c:3271`,
-/// `core.h:1190`).
+/// rtw89_rxdesc_short_v2)` = 6 dwords (`rtw8922a.c:3326`,
+/// `core.h:1199`).
 pub(super) const FWCMD_TXDESC_LEN: usize = 24;
-/// `RTW89_CORE_RX_TYPE_H2C` (`core.h:236`).
+/// `RTW89_CORE_RX_TYPE_H2C` (`core.h:240`).
 pub(super) const RPKT_TYPE_H2C: u32 = 13;
-/// `RTW89_CORE_RX_TYPE_FWDL` (`core.h:237`).
+/// `RTW89_CORE_RX_TYPE_FWDL` (`core.h:241`).
 pub(super) const RPKT_TYPE_FWDL: u32 = 14;
 /// `BE_RXD_RPKT_LEN_MASK` GENMASK(13, 0) (`txrx.h:490`).
 const BE_RXD_RPKT_LEN_MASK: u32 = 0x3FFF;
@@ -147,7 +147,7 @@ const BE_RXD_RPKT_TYPE_MASK: u32 = 0x3F << 24;
 
 /// The PCIe FWCMD TX descriptor Linux pushes in front of every CH12
 /// buffer (`pci.c:1551 rtw89_pci_fwcmd_submit` →
-/// `rtw89_core_fill_txdesc_fwcmd_v2`, `core.c:1882`): zeroed, with
+/// `rtw89_core_fill_txdesc_fwcmd_v2`, `core.c:1937`): zeroed, with
 /// dword0 = `pkt_size` (the H2C bytes behind the descriptor,
 /// `rtw89_core_tx_update_desc_info`) | `RPKT_TYPE` — FWDL for section
 /// packets (`rtw89_h2c_tx(skb, true)`), H2C for everything else
