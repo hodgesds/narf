@@ -142,9 +142,28 @@ fn scenario_fault_then_write(fx: &TwoOpens) -> Result<(), &'static str> {
     let base = map_shared(fx.fd1, 3 * PAGE)?;
     fault(&fx.aspace, base + 2 * PAGE)?;
     let seed = content(3 * PAGE as usize - 100);
-    if mapped_bytes(&fx.aspace, base + 2 * PAGE, 32)?
-        != seed[2 * PAGE as usize..2 * PAGE as usize + 32]
-    {
+    let got = mapped_bytes(&fx.aspace, base + 2 * PAGE, 32)?;
+    let want = &seed[2 * PAGE as usize..2 * PAGE as usize + 32];
+    if got != want {
+        // #1025: this check fails intermittently on aarch64 only, and
+        // the bare failure string cannot tell a zero fill from a
+        // stale page or a wrong-offset fill. Log both sides (hex) so
+        // the next CI failure is diagnosable: all-zero `got` points
+        // at a short/zero fill, `got` equal to the seed's head points
+        // at a wrong-offset fill, anything else at a stale page.
+        use core::fmt::Write as _;
+        let mut got_hex = alloc::string::String::new();
+        let mut want_hex = alloc::string::String::new();
+        for b in &got {
+            let _ = write!(got_hex, "{b:02x}");
+        }
+        for b in want {
+            let _ = write!(want_hex, "{b:02x}");
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "FAULT-WRITE-SEED got={got_hex} want={want_hex}"
+        );
         return Err("the faulted page does not show the seed bytes");
     }
     let new_bytes = alloc::vec![0xC3u8; PAGE as usize];
