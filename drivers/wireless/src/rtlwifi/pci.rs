@@ -487,8 +487,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 }
 
 /// Park PCI DMA, map BAR2, apply the existing power table and read factory
-/// EFUSE identity with device IRQs masked. Retains the qualified 8188EE
-/// firmware owner; probe starts it asynchronously after publishing ownership.
+/// EFUSE identity with device IRQs masked. Retains the qualified firmware
+/// owner; probe starts it asynchronously after publishing ownership.
 /// Its one-shot continuation retains LLT/native rings and qualifies RF/BB/MAC.
 /// Public native station control separately gates packet DMA and association
 /// under signed board/current regulatory policy; device IRQs remain masked.
@@ -506,14 +506,22 @@ pub unsafe fn bring_up(
     // no BT coexistence) RTL8192CE / RTL8188CE and (qualified version,
     // provisioned map, path-A TX power; BT-coexist boards included: the
     // coexistence owner runs) RTL8723BE and (non-test chip, autoloaded map,
-    // a PROM MAC/PHY mode whose function bandset holds 2.4 GHz) RTL8192DE.
+    // a PROM MAC/PHY mode whose function bandset holds 2.4 GHz) RTL8192DE
+    // and (qualified 8723-series version with BT_FUNC, provisioned map;
+    // BT-coexist boards included: the coexistence owner binds) RTL8723AE.
     // Every other matched chip stays diagnostic.
     let rtl8192ce = super::rtl8192ce::is_8192ce(did);
     let rtl8723be = did == RTL_DEV_8723BE;
     let rtl8192de = did == RTL_DEV_8192DE;
+    let rtl8723ae = did == RTL_DEV_8723AE;
     let retained = matches!(
         did,
-        RTL_DEV_8188EE | RTL_DEV_8821AE | RTL_DEV_8192EE | RTL_DEV_8723BE | RTL_DEV_8192DE
+        RTL_DEV_8188EE
+            | RTL_DEV_8821AE
+            | RTL_DEV_8192EE
+            | RTL_DEV_8723BE
+            | RTL_DEV_8192DE
+            | RTL_DEV_8723AE
     ) || rtl8192ce;
     let (registers, factory) = crate::rtw88::pci_park::invoke(cap, || -> Result<_, ProbeError> {
         let registers = crate::rtw88::pci_park::map_bar_control(device, cap, 2)
@@ -524,6 +532,8 @@ pub unsafe fn bring_up(
                 && registers.len < super::rtl8821ae::MMIO_SIZE as u64)
             || (device.id.device == RTL_DEV_8192EE
                 && registers.len < super::rtl8192ee::MMIO_SIZE as u64)
+            || (device.id.device == RTL_DEV_8723AE
+                && registers.len < super::rtl8723ae::MMIO_SIZE as u64)
             || (rtl8192ce && registers.len < super::rtl8192ce::MMIO_SIZE as u64)
             || (rtl8723be && registers.len < super::rtl8723be::MMIO_SIZE as u64)
         {
@@ -651,6 +661,32 @@ pub unsafe fn bring_up(
                     )
                     .is_ok_and(|facts| facts.mac == factory.mac)
                 }) && txpower::Efuse::from_logical(&factory.logical).is_ok()
+            });
+
+        // RTL8723AE: the facts `configure_rtl8723ae` would re-derive.
+        // `_rtl8723e_read_chip_version` must qualify (no `TRP_VAUX_EN`
+        // test chip, `BT_FUNC` set so Linux assigns `RF_1T1R`), the map
+        // must be provisioned (`REG_9346CR` EFUSE boot, autoload,
+        // `0x8129`) and the EFUSE MAC must be the factory identity. A
+        // BT-coexist board is the norm for this combo chip, not a refusal.
+        let admissible = admissible
+            && (!rtl8723ae || {
+                use super::rtl8723ae::{adapter, version};
+                // SAFETY: BAR2 mapped, length checked above, owned exclusively.
+                let (sys_cfg, gpio, multi, cr9346) = unsafe {
+                    (
+                        registers.read32(u64::from(version::REG_SYS_CFG)),
+                        registers.read32(u64::from(version::REG_GPIO_OUTSTS)),
+                        registers.read32(u64::from(version::REG_MULTI_FUNC_CTRL)),
+                        registers.read8(u64::from(adapter::REG_9346CR)),
+                    )
+                };
+                version::Version::from_registers(sys_cfg, || gpio, || multi).is_ok_and(
+                    |qualified| {
+                        adapter::Adapter::from_hardware(qualified, cr9346, multi, &factory.logical)
+                            .is_ok_and(|facts| facts.mac == factory.mac)
+                    },
+                )
             });
 
         // RTL8192DE: the facts `configure_rtl8192de` / `prepare_rtl8192de`

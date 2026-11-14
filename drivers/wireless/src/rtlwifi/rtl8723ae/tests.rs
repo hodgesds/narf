@@ -2183,3 +2183,216 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723ae",
     smoke_rtl8723ae_dm_run_gates_and_notifies
 );
+
+// ── composed PCI startup admission ────────────────────────────────────────
+
+/// `power::Io` over the firmware fake: the card-enable flow's `0x05[0]`
+/// state-transition bit completes in hardware before its next read (as the
+/// `power_tests` model does), and `0x06[1]` is the power-ready bit the
+/// `0x06` poll waits on. The clear is a model of the hardware transition,
+/// not a driver write.
+struct PwrIo(FwFake);
+impl crate::rtlwifi::power::Io for PwrIo {
+    fn read8(&self, offset: u16) -> Result<u8, crate::rtlwifi::power::PwrSeqError> {
+        let value = self
+            .0
+            .read8(offset)
+            .map_err(|_| crate::rtlwifi::power::PwrSeqError::Access)?;
+        if offset == 5 && value & 1 != 0 {
+            self.0 .0.lock().regs[5] &= !1;
+        }
+        Ok(value)
+    }
+    fn write8(&self, offset: u16, value: u8) -> Result<(), crate::rtlwifi::power::PwrSeqError> {
+        self.0
+            .write8(offset, value)
+            .map_err(|_| crate::rtlwifi::power::PwrSeqError::Access)
+    }
+}
+
+/// The probe admission gate for `0x8723`, composed end to end against one
+/// target fake: the measured chip version qualifies, the adapter facts
+/// decode from the provisioned map with the factory MAC, the exact
+/// `rtl8723A_card_enable_flow` runs (`REG_RSV_CTRL = 0` prefix), the
+/// firmware owner runs `run_8723ae` (post-flow power segment, CR gates
+/// cleared, `rtl8723fw.bin` paged download to `Ready`), and the C2H
+/// mailbox delivers a BT-info event the coexistence owner ingests. A test
+/// chip, a part without `BT_FUNC`, an unprovisioned map and a wrong-signature
+/// image are all refused cleanly, the test chip before any register write.
+///
+/// Fixture-validated only; nothing here ran on silicon, and the PCI probe
+/// path itself (BAR mapping, EFUSE read, `bring_up` retention) is not
+/// reachable from this rig — the smoke pins the exact qualification probe
+/// re-derives from the same registers and map.
+fn smoke_rtl8723ae_pci_startup_admission() -> TestResult {
+    use crate::rtlwifi::firmware_transport::{Owner as TransportOwner, Stage};
+    use crate::rtlwifi::power::power_on_with;
+    use adapter::*;
+    // One fake for the whole bring-up, as probe sees one BAR2.
+    let io = fw_fake(true, true, true, true);
+    {
+        let mut g = io.0.lock();
+        // Power-ready for the card-enable flow's `0x06[1]` poll.
+        g.regs[6] = 0x02;
+        // EFUSE autoload OK and the BT strap, as probe reads them.
+        g.regs[usize::from(REG_9346CR)] = CR9346_AUTOLOAD_OK;
+        g.regs[usize::from(version::REG_MULTI_FUNC_CTRL)
+            ..usize::from(version::REG_MULTI_FUNC_CTRL) + 4]
+            .copy_from_slice(&MULTI_BT_FUNC_EN.to_le_bytes());
+    }
+    // (1) Version, read through the fake as probe reads MMIO.
+    let sys_cfg = match io.read32(version::REG_SYS_CFG) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("8723AE admission SYS_CFG unreadable"),
+    };
+    let gpio = match io.read32(version::REG_GPIO_OUTSTS) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("8723AE admission GPIO_OUTSTS unreadable"),
+    };
+    let multi = match io.read32(version::REG_MULTI_FUNC_CTRL) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("8723AE admission MULTI_FUNC_CTRL unreadable"),
+    };
+    let cr9346 = match io.read8(REG_9346CR) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("8723AE admission 9346CR unreadable"),
+    };
+    let qualified = match version::Version::from_registers(sys_cfg, || gpio, || multi) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("8723AE admission version refused"),
+    };
+    if !qualified.is_umc_a_cut()
+        || qualified.firmware() != version::FW_NORMAL
+        || qualified.polarity() != version::Polarity::LowActive
+    {
+        return TestResult::Fail("8723AE admission A-cut version / rtl8723fw.bin");
+    }
+    // (2) Adapter facts from the provisioned map; the EFUSE MAC is the
+    // factory identity probe's `read_factory` returns.
+    let map = provisioned();
+    let facts = match Adapter::from_hardware(qualified, cr9346, multi, &map) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("8723AE admission adapter facts refused"),
+    };
+    if facts.mac != [0x00, 0xe0, 0x4c, 0x87, 0x23, 0xae]
+        || !facts.bt.coexistence
+        || facts.bt.kind != BT_RTL8723A
+    {
+        return TestResult::Fail("8723AE admission adapter facts / BT strap");
+    }
+    // (3) Pwrseq: probe's power-on for 0x8723 is the exact
+    // `rtl8723A_card_enable_flow` after the `REG_RSV_CTRL = 0` prefix.
+    if power_on_with(&PwrIo(io.clone()), super::super::regs::RTL_DEV_8723AE).is_err() {
+        return TestResult::Fail("8723AE admission card enable flow failed");
+    }
+    {
+        let g = io.0.lock();
+        if g.regs[0x301] != 0
+            || g.regs[0x1c] != 0
+            || crate::rtlwifi::power::RTL8723AE_PWR_ON.len() != 10
+        {
+            return TestResult::Fail("8723AE admission enable prefix / flow rows");
+        }
+    }
+    // (4) Power segment + firmware download through the production
+    // transport: `run_8723ae` (6 s bound) on the A-cut image.
+    let owner = TransportOwner::new(io.clone(), super::super::regs::RTL_DEV_8723AE);
+    let bytes = image(0x2d6e);
+    let info = match narf_scheduler::block_on(owner.initialize(&bytes)) {
+        Ok(info) => info,
+        Err(_) => return TestResult::Fail("8723AE admission firmware download failed"),
+    };
+    if info.version != 21 || info.payload != 0x2d6e || owner.status().stage != Stage::Ready {
+        return TestResult::Fail("8723AE admission firmware info / Ready stage");
+    }
+    {
+        let g = io.0.lock();
+        // The post-flow ePHY round landed and the paged image reassembles.
+        if g.regs[0x302] & 0x10 == 0
+            || g.regs[0x369] & 0x80 == 0
+            || g.pages.len() != 3
+            || g.pages[0][..] != bytes[fw::HEADER..fw::HEADER + fw::PAGE]
+            || g.pages[1][..] != bytes[fw::HEADER + fw::PAGE..fw::HEADER + 2 * fw::PAGE]
+            || g.pages[2][..0x2d6e - 2 * fw::PAGE] != bytes[fw::HEADER + 2 * fw::PAGE..]
+            || g.pages[2][0x2d6e - 2 * fw::PAGE..] != [0, 0]
+        {
+            return TestResult::Fail("8723AE admission post-flow / paged image");
+        }
+    }
+    // (5) C2H: a firmware-closed BT-info event drains from the mailbox and
+    // the coexistence owner bound to the adapter facts ingests it.
+    {
+        let mut g = io.0.lock();
+        g.regs[usize::from(c2h::REG_C2HEVT_MSG_NORMAL)] = 0x2c;
+        g.regs[usize::from(c2h::REG_C2HEVT_MSG_NORMAL) + 1] = 7;
+        g.regs[usize::from(c2h::REG_C2HEVT_CLOSE)] = c2h::C2H_EVT_FW_CLOSE;
+        g.regs[usize::from(c2h::REG_C2HEVT_MSG_NORMAL) + 2] = 0x05;
+        g.regs[usize::from(c2h::REG_C2HEVT_MSG_NORMAL) + 3] = 0x03;
+    }
+    let event = match c2h::drain(&io) {
+        Ok(c2h::Outcome::Dispatched(c2h::Event::BtInfo(info))) => info,
+        _ => return TestResult::Fail("8723AE admission C2H BT info not dispatched"),
+    };
+    if !io.0.lock().writes.contains(&(c2h::REG_C2HEVT_CLOSE, 0, 1)) {
+        return TestResult::Fail("8723AE admission C2H close write missing");
+    }
+    let mut coex = coex::Owner::bind(&facts.bt);
+    if coex.pattern() != crate::rtlwifi::btcoex::TdmaPattern::WifiOnly {
+        return TestResult::Fail("8723AE admission coex initial pattern");
+    }
+    coex.ingest(&event);
+    if coex.periodical() != Some(crate::rtlwifi::btcoex::TdmaPattern::BtOnly) {
+        return TestResult::Fail("8723AE admission coex connected periodical");
+    }
+    // Refusals: a second start, a test chip, a part without BT_FUNC, an
+    // unprovisioned map and a wrong-signature image.
+    if narf_scheduler::block_on(owner.initialize(&bytes)) != Err(FwError::AlreadyStarted) {
+        return TestResult::Fail("8723AE admission second start admitted");
+    }
+    if version::Version::from_registers(
+        version::TRP_VAUX_EN | version::BT_FUNC | version::VENDOR_ID,
+        || 0,
+        || 0,
+    ) != Err(version::Error::TestChip)
+        || version::Version::from_registers(version::VENDOR_ID, || 0, || 0)
+            != Err(version::Error::NotSeries)
+    {
+        return TestResult::Fail("8723AE admission test chip / non-series version");
+    }
+    let test_chip = fw_fake(true, true, true, true);
+    {
+        let mut g = test_chip.0.lock();
+        g.regs[0xf0..0xf4].copy_from_slice(
+            &(version::TRP_VAUX_EN | version::BT_FUNC | version::VENDOR_ID).to_le_bytes(),
+        );
+    }
+    let refused = TransportOwner::new(test_chip.clone(), super::super::regs::RTL_DEV_8723AE);
+    if narf_scheduler::block_on(refused.initialize(&bytes)) != Err(FwError::Unsupported)
+        || !test_chip.0.lock().writes.is_empty()
+        || refused.status().stage != Stage::Failed
+    {
+        return TestResult::Fail("8723AE admission test chip ran the runtime");
+    }
+    let mut bad = map.clone();
+    bad[0] = 0;
+    if Adapter::from_hardware(qualified, cr9346, multi, &bad).is_ok()
+        || Adapter::from_hardware(qualified, 0, multi, &map).is_ok()
+    {
+        return TestResult::Fail("8723AE admission unprovisioned map admitted");
+    }
+    let mut wrong = image(0x100);
+    wrong[0] = 0x01;
+    wrong[1] = 0x53;
+    let bad_image = TransportOwner::new(
+        fw_fake(true, true, false, true),
+        super::super::regs::RTL_DEV_8723AE,
+    );
+    if narf_scheduler::block_on(bad_image.initialize(&wrong)) != Err(FwError::Image) {
+        return TestResult::Fail("8723AE admission wrong-signature image admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723ae",
+    smoke_rtl8723ae_pci_startup_admission
+);
