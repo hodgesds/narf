@@ -11,7 +11,8 @@ where
     pub(super) async fn retune_once(&self, channel: u8) -> Result<bool, Error> {
         let _control = self.lifecycle.control.lock().await;
         // 5 GHz plan channels pass this shape check; `allow_channel` below
-        // admits them only on the dual-band RTL8821AE profile.
+        // admits them only on the dual-band RTL8821AE and RTL8192DE
+        // profiles.
         if !crate::rtlwifi::rtl8821ae::envelope::station_channel(channel)
             || self.removed.load(Ordering::Acquire)
             || self.lifecycle.suspended.load(Ordering::Acquire)

@@ -38,6 +38,24 @@ kernel_test_in!(
     smoke_rtl8192de_mode_from_prom
 );
 
+/// Cold bring-up default channel per function (`sw_consequences`):
+/// dual-dual MAC0 starts on 5 GHz channel 36, dual-dual MAC1 and every
+/// single/dual-single function on channel 1.
+fn smoke_rtl8192de_default_channel() -> TestResult {
+    check(
+        default_channel(MacPhyMode::DualMacDualPhy, 0) == 36
+            && default_channel(MacPhyMode::DualMacDualPhy, 1) == 1
+            && default_channel(MacPhyMode::SingleMacSinglePhy, 0) == 1
+            && default_channel(MacPhyMode::DualMacSinglePhy, 0) == 1
+            && default_channel(MacPhyMode::DualMacSinglePhy, 1) == 1,
+        "RTL8192DE default channel",
+    )
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8192de",
+    smoke_rtl8192de_default_channel
+);
+
 /// PHY-control words: PCI base `0xf0` plus mode bits; USB clears bits
 /// 0–2 of the current value first (current `0xff` proves the clear).
 fn smoke_rtl8192de_phy_ctrl_words() -> TestResult {

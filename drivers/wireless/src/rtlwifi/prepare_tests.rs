@@ -989,3 +989,57 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8192de_native_channel_admission
 );
+
+/// RTL8192DE 5 GHz admission at the interface layer: the
+/// `rtl8192de::allow_channel` decision `NativeEnvironment::allow_channel`
+/// applies — a dual-dual MAC0 function admits 5 GHz channels 36/165, a
+/// dual-dual MAC1 function admits 2.4 GHz channel 6, and the cross-band
+/// requests (MAC0 on 6 or 1, MAC1 on 36) are refused — mirroring
+/// `smoke_rtl8192de_native_channel_admission` at the prepare layer, over
+/// the same signed v3 NAPC fixture in the firmware registry.
+pub(crate) fn smoke_rtl8192de_interface_channel_admission() -> TestResult {
+    let factory = de_factory();
+    let domain = de_domain();
+    let mode = match super::super::rtl8192de::mode_from_prom(
+        super::super::rtl8192de::Interface::Pci,
+        &factory.logical,
+    ) {
+        Some(mode) => mode,
+        None => return TestResult::Fail("8192DE interface admission PROM mode unreadable"),
+    };
+    if mode != super::super::rtl8192de::MacPhyMode::DualMacDualPhy {
+        return TestResult::Fail("8192DE interface admission fixture is not dual-dual");
+    }
+    let (write, _read) = narf_firmware::bootstrap_authority();
+    narf_firmware::install_trusted_loader_authority(write);
+    match crate::firmware_asset::tests::install(
+        &write,
+        "rtlwifi/rtl8192de-cal-v3-00e04c8192de.bin",
+        &de_napc_v3_native(),
+        true,
+    ) {
+        Ok(()) => {}
+        Err(_) => {
+            return TestResult::Fail("8192DE interface admission fixture NAPC install");
+        }
+    }
+    for (interface_index, channel) in [(0u8, 36u8), (0, 165), (1, 6)] {
+        if super::super::rtl8192de::allow_channel(&factory, &domain, mode, interface_index, channel)
+            .is_err()
+        {
+            return TestResult::Fail("8192DE interface admission refused an in-band channel");
+        }
+    }
+    for (interface_index, channel) in [(0u8, 6u8), (0, 1), (1, 36)] {
+        if super::super::rtl8192de::allow_channel(&factory, &domain, mode, interface_index, channel)
+            .is_ok()
+        {
+            return TestResult::Fail("8192DE interface admission admitted a cross-band channel");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192de_interface_channel_admission
+);

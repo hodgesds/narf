@@ -31,9 +31,18 @@ pub(super) struct Lifecycle {
 
 impl Lifecycle {
     pub(super) fn new() -> Self {
+        Self::with_channel(1)
+    }
+    /// A lifecycle starting on `channel`: the cold bring-up channel for
+    /// the function's band (an RTL8192DE dual-dual MAC0 function starts
+    /// on 36, every other function on 1). The channel is the provision
+    /// default only; an explicit retune still goes through
+    /// `allow_channel`, so an explicit channel-1 request on a 5 GHz
+    /// function is refused, never remapped.
+    pub(super) fn with_channel(channel: u8) -> Self {
         Self {
             control: Mutex::new(()),
-            channel: AtomicU8::new(1),
+            channel: AtomicU8::new(channel),
             generation: AtomicU64::new(1),
             publications: AtomicUsize::new(0),
             rebuilding: AtomicBool::new(false),

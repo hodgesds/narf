@@ -304,6 +304,41 @@ pub fn native_channel(channel: u8, mode: MacPhyMode, interface_index: u8) -> boo
     }
 }
 
+/// Cold bring-up channel for one 8192DE function: the Linux default for
+/// the function's band (`rtl92d_init_sw_vars` [`sw_consequences`]) — 36
+/// on 5 GHz (dual-dual MAC0), 1 otherwise. This is the channel the
+/// lifecycle starts on, so a dual-dual MAC0 function provisions on 5 GHz
+/// with no explicit retune; an explicit channel-1 request on MAC0 is
+/// still refused by [`native_channel`], never remapped.
+pub fn default_channel(mode: MacPhyMode, interface_index: u8) -> u8 {
+    sw_consequences(mode, mode_info(mode, interface_index).current_band).default_channel
+}
+
+/// Interface-layer channel admission for one 8192DE function: the
+/// [`native_channel`] gate for the function's mode and bandset, then the
+/// 20 MHz [`envelope::Calibration`] permission on the requested channel
+/// under the current domain. A dual-dual MAC0 function admits the 5 GHz
+/// plan, a dual-dual MAC1 function admits 2.4 GHz channels 1-11, and a
+/// cross-band request is refused with
+/// [`super::channel_power::Error::Policy`] before any calibration is
+/// staged — the same admission the prepare layer's `admit_rtl8192de`
+/// applies, so the 5 GHz plan admitted there is also admitted at the
+/// interface layer.
+pub fn allow_channel(
+    factory: &super::efuse::Factory,
+    domain: &narf_wireless::reg::RegulatoryDomain,
+    mode: MacPhyMode,
+    interface_index: u8,
+    channel: u8,
+) -> Result<(), super::channel_power::Error> {
+    if !native_channel(channel, mode, interface_index) {
+        return Err(super::channel_power::Error::Policy);
+    }
+    envelope::Calibration::load_registered(factory)?
+        .permission(domain, channel)
+        .map(|_| ())
+}
+
 /// `REG_MAX_AGGR_NUM` per mode (Linux `_rtl92d_phy_config_mac`):
 /// single MAC writes `0x0B`, any dual mode writes `0x07`.
 pub fn max_aggr_num(mode: MacPhyMode) -> u8 {
