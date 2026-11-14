@@ -1944,6 +1944,8 @@ struct Session<B: Backend> {
     wow_nlo: Option<Arc<scan::nlo::Plan>>,
     /// The running host scheduled scan (NL80211_CMD_START_SCHED_SCAN).
     sched: Option<scan::sched::Running>,
+    /// Sub-step within `associate_station_as` for cold timeout diagnostics.
+    pub(super) associate_step: &'static str,
 }
 impl<B: Backend> Session<B> {
     fn new(backend: B, firmware: Firmware) -> Self {
@@ -1973,6 +1975,7 @@ impl<B: Backend> Session<B> {
             wow_config: None,
             wow_nlo: None,
             sched: None,
+            associate_step: "init",
         }
     }
     fn stage(&mut self, stage: Stage) {

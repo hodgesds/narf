@@ -2643,6 +2643,17 @@ fn live_join_wpa2(channel: u8, ofdm: bool, entropy_failure: bool) -> TestResult 
     if eapol_frames.len() < 2 {
         return TestResult::Fail("expected at least M2 and M4 emitted");
     }
+    let rx_filter = frames.iter().find(|(scatter, f)| {
+        !scatter
+            && f.len() == 64 + 68
+            && f[36] == 0x0a
+            && f[37] == 0xa0
+            && f[64 + 4] == 1
+            && f[64 + 8..64 + 12] == 0x8000_0000u32.to_le_bytes()
+    });
+    if rx_filter.is_none() {
+        return TestResult::Fail("STA RX filter (MCU_CE_CMD_SET_RX_FILTER 0x0a) not emitted");
+    }
 
     let secure_sta_rec = frames.iter().find(|(scatter, f)| {
         !scatter

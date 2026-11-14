@@ -79,7 +79,7 @@ pub(super) fn descriptor(
             | 2 << 16
             | 12 << 11
             | u32::from(vif.bmc()),
-        1 << 31 | 1 << 13 | u32::from(header.multicast) << 10 | u32::from(header.subtype),
+        1 << 31 | u32::from(header.multicast) << 10 | u32::from(header.subtype),
         1 << 28 | 15 << 11 | u32::from(header.multicast || no_ack),
         0,
         u32::from(header.add_ba) << 14,

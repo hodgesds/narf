@@ -59,11 +59,7 @@ pub(super) fn management(
     let words = [
         (frame.len() as u32 + 32) | (0x10 << 25), // CT, LMAC ALTX0.
         (1 << 31) | (u32::from(tid) << 20) | (2 << 16) | (12 << 11) | u32::from(wcid),
-        (1 << 31)
-            | (1 << 13)
-            | (u32::from(multicast) << 10)
-            | subtype
-            | if is_data { 2 << 4 } else { 0 },
+        (1 << 31) | (u32::from(multicast) << 10) | subtype | if is_data { 2 << 4 } else { 0 },
         (1 << 28) | (15 << 11) | (u32::from(protected) << 1) | u32::from(multicast),
         0,
         if add_ba { 1 << 14 } else { 0 },
@@ -417,6 +413,16 @@ impl Tokens {
     }
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+    pub(super) fn pending_head(&self) -> Option<(usize, u16, usize, bool, Option<u8>)> {
+        let front = self.pending.front()?;
+        Some((
+            self.pending.len(),
+            front.token,
+            front.slot,
+            front.dma,
+            front.firmware,
+        ))
     }
     pub fn begin(&mut self, token: u16) -> Result<(), Error> {
         self.available()?;

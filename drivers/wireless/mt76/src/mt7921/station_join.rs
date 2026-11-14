@@ -1903,8 +1903,10 @@ impl<B: Backend> Session<B> {
         // Commit, at most the shared plan's MAX_ANTI_CLOGGING (3) token
         // retries, then Confirm; the plan fails any further token request.
         for _ in 0..5 {
+            self.associate_step = "auth-sae-tx";
             self.send_management(&frame, u16::from(self.station.link.peer()))
                 .await?;
+            self.associate_step = "auth-sae-rx";
             let step = self
                 .wait_station_rx(3_000, |_, packet| {
                     if let Some(reply) = rx_on_channel(packet, rx_channel) {
@@ -1936,6 +1938,7 @@ impl<B: Backend> Session<B> {
         plan: &mut JoinPlan,
         rx_channel: u8,
     ) -> Result<Vec<u8>, Error> {
+        self.associate_step = "auth-open-rx";
         self.wait_station_rx(3_000, |_, packet| {
             if let Some(frame) = rx_on_channel(packet, rx_channel) {
                 if let Some(assoc) = plan
@@ -2147,6 +2150,18 @@ impl<B: Backend> Session<B> {
             self.exchange_station(Command::Unified { id: 3 }, &peer_record)
                 .await?;
 
+            // Enable standard STA RX filter (`MT7921_FILTER_ENABLE` without
+            // monitor promiscuity) before sending Authentication, matching
+            // Linux `mt7921_configure_filter`.
+            self.notify(
+                Command::Ce {
+                    id: 0x0a,
+                    query: false,
+                },
+                &super::monitor::filter(false),
+            )
+            .await?;
+
             // 3. Send Authentication Request:
             self.stage(Stage::Authenticate);
             let aid = loop {
@@ -2159,8 +2174,10 @@ impl<B: Backend> Session<B> {
                                 .start_pmksa_authentication(*pmkid)
                                 .map_err(|_| Error::Busy)?
                                 .to_vec();
+                            self.associate_step = "auth-pmksa-tx";
                             self.send_management(&auth_req, u16::from(self.station.link.peer()))
                                 .await?;
+                            self.associate_step = "auth-pmksa-rx";
                             let request = self
                                 .open_authentication_response(&mut plan, rx_channel)
                                 .await?;
@@ -2180,6 +2197,7 @@ impl<B: Backend> Session<B> {
                         }
                         _ => {
                             let auth_req = plan.start_authentication().map_err(|_| Error::Busy)?;
+                            self.associate_step = "auth-open-tx";
                             self.send_management(auth_req, u16::from(self.station.link.peer()))
                                 .await?;
                             // 4. Wait for Authentication Response:
@@ -2201,10 +2219,12 @@ impl<B: Backend> Session<B> {
                         None => assoc_req,
                     };
                     self.stage(Stage::Associate);
+                    self.associate_step = "assoc-tx";
                     self.send_management(&assoc_req, u16::from(self.station.link.peer()))
                         .await?;
 
                     // 6. Wait for Association Response:
+                    self.associate_step = "assoc-rx";
                     self.wait_station_rx(3_000, |_, packet| {
                         if let Some(frame) = rx_on_channel(packet, rx_channel) {
                             if let Some(aid) =
@@ -2416,6 +2436,7 @@ impl<B: Backend> Session<B> {
                     let mut established = false;
                     // Retry replies remain bounded by the operation's 30 s budget.
                     for _ in 0..16 {
+                        self.associate_step = "eapol-rx";
                         let result = self
                             .wait_station_rx(3_000, |backend, packet| {
                                 if let Some(pdu) = peer_eapol(packet, own, bss.bssid, rx_channel) {
@@ -2430,6 +2451,7 @@ impl<B: Backend> Session<B> {
                             .await?;
                         match result {
                             EapolRx::Pairwise1(m1) => {
+                                self.associate_step = "eapol-m1-tx";
                                 self.send_management(
                                     &wrap_eapol_frame(own, bss.bssid, &m1.reply),
                                     u16::from(self.station.link.peer()),
@@ -2447,6 +2469,7 @@ impl<B: Backend> Session<B> {
                                 {
                                     return Err(Error::MalformedEvent);
                                 }
+                                self.associate_step = "eapol-m3-tx";
                                 self.send_management(
                                     &wrap_eapol_frame(own, bss.bssid, &m3.reply),
                                     u16::from(self.station.link.peer()),

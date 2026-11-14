@@ -165,7 +165,7 @@ fn config_request(info: RadioInfo, config: Channel) -> Result<[u8; 20], Error> {
     body[16] = 1;
     Ok(body)
 }
-fn filter(monitor: bool) -> [u8; 68] {
+pub(super) fn filter(monitor: bool) -> [u8; 68] {
     let mut body = [0; 68];
     body[4] = 1;
     body[8..12].copy_from_slice(&(0x8000_0000u32 | if monitor { 0x60 } else { 0 }).to_le_bytes());
