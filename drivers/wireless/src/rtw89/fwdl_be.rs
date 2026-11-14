@@ -34,7 +34,7 @@
 //!    responsive spin.
 //!
 //! Only the PCIe DLE/HFC tables are transcribed (`rtw8922a_dle_mem_pcie`
-//! / `rtw8922a_hfc_param_ini_pcie`, `rtw8922a.c:50/178`); the USB/SDIO
+//! / `rtw8922a_hfc_param_ini_pcie`, `rtw8922a.c:50/180`); the USB/SDIO
 //! arms of `dmac_func_pre_en_be` are not reachable from this driver.
 //!
 //! Polls are bounded read counts derived from the Linux

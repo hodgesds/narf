@@ -20,8 +20,25 @@ fn smoke_rtw89_fwcmd_descriptor_matches_linux() -> TestResult {
             return TestResult::Fail("command length outside AX bound");
         }
     }
-    if descriptor(ChipId::Rtl8922A, Kind::Header, 72) != Err(Error::Unsupported) {
-        return TestResult::Fail("BE used AX firmware command descriptor");
+    // BE (RTL8922A): the 24-byte short-v2 FWCMD descriptor, not the AX one:
+    // dword0 = length | RPKT_TYPE<<24, H2C (13) for headers, FWDL (14) for
+    // sections (`fwcmd_8922a::fwcmd_txdesc`).
+    let mut expected_be = [0u8; 24];
+    expected_be[..4].copy_from_slice(&((72u32) | (13 << 24)).to_le_bytes());
+    if descriptor(ChipId::Rtl8922A, Kind::Header, 72).as_deref() != Ok(&expected_be[..]) {
+        return TestResult::Fail("BE H2C descriptor bytes wrong");
+    }
+    expected_be[..4].copy_from_slice(&((72u32) | (14 << 24)).to_le_bytes());
+    if descriptor(ChipId::Rtl8922A, Kind::Section, 72).as_deref() != Ok(&expected_be[..]) {
+        return TestResult::Fail("BE FWDL descriptor bytes wrong");
+    }
+    // The BE bound is the 14-bit length field, not the AX 2020-byte bound.
+    if descriptor(ChipId::Rtl8922A, Kind::Header, 2021).is_err()
+        || descriptor(ChipId::Rtl8922A, Kind::Header, 0x3fff).is_err()
+        || descriptor(ChipId::Rtl8922A, Kind::Header, 0).is_ok()
+        || descriptor(ChipId::Rtl8922A, Kind::Header, 0x4000).is_ok()
+    {
+        return TestResult::Fail("BE descriptor length bound wrong");
     }
     if txbd(0x12_3456_7890, 2044) != Ok([0xfc, 7, 0x80, 0x44, 0x90, 0x78, 0x56, 0x34])
         || txbd((1 << 40) - 2044, 2044).is_err()

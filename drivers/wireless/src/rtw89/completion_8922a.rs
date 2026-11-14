@@ -72,9 +72,11 @@
 //!   `mac_pre_init_8922a`), `cid` retention (now
 //!   `mac_pre_init_8922a::HalChipVer`), AX-path 8922A refusals
 //!   (verified already-delivered: see `tx_transport`,
-//!   `packet_format`, `packet_core`, `efuse`, `factory`,
-//!   `fifo`, `bdram`, `command_queue`, `download_dma`,
-//!   `irq::Mask::config`, `station_control::Controller::new`).
+//!   `packet_format`, `packet_core`, `factory`,
+//!   `fifo`, `bdram`, `download_dma`,
+//!   `irq::Mask::config`, `station_control::Controller::new`;
+//!   `command_queue::descriptor` and `efuse::read_mac_with` now
+//!   route BE instead of refusing).
 //!   (6 GHz admission is done: `station_8922a` TPE + power
 //!   program, 20 MHz only; the register-level
 //!   `rtw8922a_set_txpwr` program and wide-6 GHz TPE are the

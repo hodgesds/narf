@@ -12,6 +12,9 @@ struct Model {
     writes: Vec<(u64, usize, u32)>,
     delays: Vec<u64>,
     physical_reads: usize,
+    /// RTL8922A PCIe EFUSE MAC as seen at BAR `0x3104`
+    /// (`efuse_be::MAC_ADDR_PCIE`, `rtw8922a.c:847`).
+    be_mac: [u8; 6],
 }
 impl Model {
     fn new() -> Self {
@@ -31,6 +34,7 @@ impl Model {
             writes: Vec::new(),
             delays: Vec::new(),
             physical_reads: 0,
+            be_mac: [2, 0xe0, 0x4c, 1, 2, 3],
         }
     }
     fn iso(&self) -> u16 {
@@ -46,6 +50,14 @@ impl Io for Model {
         self.writes.push((a, 1, v as u32));
     }
     fn read16(&mut self, a: u64) -> u16 {
+        // RTL8922A PCIe EFUSE MAC window (`0x3104..0x310a`): the BAR MAC
+        // read is three `read16` at 0x3104/0x3106/0x3108.
+        if (0x3104..0x3109).contains(&a) {
+            let off = (a - 0x3104) as usize;
+            let lo = self.be_mac.get(off).copied().unwrap_or(0);
+            let hi = self.be_mac.get(off + 1).copied().unwrap_or(0);
+            return u16::from_le_bytes([lo, hi]);
+        }
         u16::from_le_bytes([self.regs[a as usize], self.regs[a as usize + 1]])
     }
     fn write16(&mut self, a: u64, v: u16) {
@@ -157,13 +169,19 @@ kernel_test_in!(
     smoke_rtw89_ax_efuse_truncation_and_bounds
 );
 
-fn smoke_rtw89_ax_efuse_failure_cleanup_and_be_rejection() -> TestResult {
+fn smoke_rtw89_ax_efuse_failure_cleanup_and_be_bar_mac() -> TestResult {
     let mut model = Model::new();
-    if read_mac_with(&mut model, ChipId::Rtl8922A, 0) != Err(EfuseError::UnsupportedChip)
+    // BE (RTL8922A): the PCIe MAC comes from the BAR registers, with no
+    // AX EFUSE write and no physical-map read (`efuse_be::read_mac_pcie`).
+    if read_mac_with(&mut model, ChipId::Rtl8922A, 0) != Ok([2, 0xe0, 0x4c, 1, 2, 3])
         || !model.writes.is_empty()
         || model.physical_reads != 0
     {
-        return TestResult::Fail("rtw89 applied AX EFUSE protocol to BE silicon");
+        return TestResult::Fail("rtw89 did not read BE PCIe MAC from BAR registers");
+    }
+    model.be_mac = [0; 6];
+    if read_mac_with(&mut model, ChipId::Rtl8922A, 0) != Err(EfuseError::MacUninitialized) {
+        return TestResult::Fail("rtw89 accepted unprogrammed BE MAC");
     }
     model.stalled = true;
     if read_mac_with(&mut model, ChipId::Rtl8852B, 0) != Err(EfuseError::Timeout)
@@ -178,5 +196,5 @@ fn smoke_rtw89_ax_efuse_failure_cleanup_and_be_rejection() -> TestResult {
 }
 kernel_test_in!(
     "drivers/wireless/rtw89",
-    smoke_rtw89_ax_efuse_failure_cleanup_and_be_rejection
+    smoke_rtw89_ax_efuse_failure_cleanup_and_be_bar_mac
 );

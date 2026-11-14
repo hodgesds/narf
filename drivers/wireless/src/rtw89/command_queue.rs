@@ -24,7 +24,21 @@ pub enum Kind {
 
 /// The descriptor goes immediately before the H2C header or raw section. It
 /// has no WP sequence/address-info extension. C uses RX-like16; A/B/51 TXWD24.
+/// BE (RTL8922A) uses the 24-byte short-v2 FWCMD descriptor
+/// (`fwcmd_8922a::fwcmd_txdesc`): dword0 = length | RPKT_TYPE<<24, H2C for
+/// headers and FWDL for sections, with the 14-bit length bound — the AX
+/// 2020-byte bound does not apply to BE.
 pub fn descriptor(chip: ChipId, kind: Kind, length: usize) -> Result<Vec<u8>, Error> {
+    if chip == ChipId::Rtl8922A {
+        // BE mirror: `fwcmd_8922a::fwcmd_txdesc` (Linux
+        // `rtw89_core_fill_txdesc_fwcmd_v2`, `core.c:1937`;
+        // `chip->h2c_desc_size` = sizeof(struct rtw89_rxdesc_short_v2),
+        // `rtw8922a.c:3326`). Section packets take the FWDL type
+        // (`rtw89_h2c_tx(skb, true)`), everything else H2C.
+        let desc = super::fwcmd_8922a::fwcmd_txdesc(length, kind == Kind::Section)
+            .ok_or(Error::BadLength)?;
+        return Ok(desc.to_vec());
+    }
     if length == 0 || length > 2020 {
         return Err(Error::BadLength);
     }
