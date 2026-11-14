@@ -489,3 +489,447 @@ kernel_test_in!(
     "drivers/wireless/rtw89",
     smoke_rtw89_b_power_plan_fills_wide_limit_and_ru_pages_like_linux
 );
+/// Linux rtw8852a_table.c (SHA256 b5ff4992...) TX-power tables, verbatim:
+/// the 24-entry byrate cfg, the 12 delta-swing arrays, and the four sparse
+/// limit tables (2184 + 2327 + 1092 + 1950 designated entries), with the
+/// phy.c WW-fallback rule for a zero entry under another regd.
+fn smoke_rtw89_a_power_tables_match_linux_txpwr_tables() -> TestResult {
+    if tables_a::BYRATE.len() != 24
+        || tables_a::LMT_2G.len() != 2184
+        || tables_a::LMT_5G.len() != 2327
+        || tables_a::LMT_RU_2G.len() != 1092
+        || tables_a::LMT_RU_5G.len() != 1950
+    {
+        return TestResult::Fail("A TX-power table entry counts differ from Linux");
+    }
+    // phy.c `rtw89_phy_load_txpwr_byrate` decode: band 0 is exactly the B
+    // frozen byrate (both chips share the values); band 1 has no CCK row.
+    let (by0, off0) = tables_a::byrate(0);
+    let (by1, off1) = tables_a::byrate(1);
+    if by0 != defaults::DEFAULT.byrate
+        || by1[..4] != [0; 4]
+        || by1[4..] != defaults::DEFAULT.byrate[4..]
+        || off0 != [0; 5]
+        || off1 != [0; 5]
+    {
+        return TestResult::Fail("A byrate decode differs from the Linux cfg table");
+    }
+    let lmt = tables_a::lmt;
+    let ru = tables_a::lmt_ru;
+    let ww = tables_a::WW;
+    // 2.4GHz WW spot values (ch is `rtw89_channel_to_idx`).
+    if lmt(false, 0, 0, 0, 0, ww, 0) != 56
+        || lmt(false, 0, 0, 1, 0, ww, 0) != 58
+        || lmt(false, 0, 0, 2, 0, ww, 0) != 58
+        || lmt(false, 0, 1, 2, 1, ww, 0) != 34
+        || lmt(false, 0, 0, 0, 0, ww, 13) != 76
+        || lmt(false, 0, 1, 0, 0, ww, 13) != 64
+        || lmt(false, 0, 0, 2, 0, ww, 11) != 54
+        || lmt(false, 1, 0, 2, 0, ww, 2) != 56
+        || ru(false, 0, 0, ww, 0) != 32
+        || ru(false, 2, 0, ww, 0) != 52
+        || ru(false, 2, 1, ww, 0) != 40
+    {
+        return TestResult::Fail("A 2.4GHz WW limits/RU differ from the Linux table");
+    }
+    // 5GHz WW spot values.
+    if lmt(true, 0, 0, 1, 0, ww, 0) != 30
+        || lmt(true, 0, 1, 2, 1, ww, 0) != 6
+        || lmt(true, 0, 0, 2, 0, ww, 8) != 52
+        || lmt(true, 0, 0, 1, 0, ww, 37) != 54
+        || lmt(true, 1, 0, 2, 0, ww, 1) != 30
+        || lmt(true, 2, 0, 2, 0, ww, 3) != 30
+        || lmt(true, 0, 0, 1, 0, ww, 48) != 0
+        || ru(true, 0, 0, ww, 0) != 22
+        || ru(true, 2, 1, ww, 0) != 18
+        || ru(true, 0, 1, ww, 46) != 16
+        || ru(true, 0, 0, ww, 52) != 0
+    {
+        return TestResult::Fail("A 5GHz WW limits/RU differ from the Linux table");
+    }
+    // phy.c `rtw89_phy_read_txpwr_limit{,_ru}` WW fallback: a zero entry
+    // under the requested regd falls back to WW; an unlisted regd reads 0
+    // raw and WW through the fallback. (FCC ch1 CCK is 76, not WW's 56;
+    // ETSI ch13 MCS is 58.)
+    if tables_a::lmt_or_ww(false, 0, 0, 0, 0, tables_a::FCC, 0) != 76
+        || tables_a::lmt_or_ww(false, 0, 0, 2, 0, tables_a::ETSI, 12) != 58
+        || tables_a::lmt(false, 0, 0, 0, 0, 8, 0) != 0
+        || tables_a::lmt_or_ww(false, 0, 0, 0, 0, 8, 0) != 56
+        || tables_a::lmt_ru_or_ww(false, 2, 0, tables_a::FCC, 0) != 76
+    {
+        return TestResult::Fail("A regd limit fallback differs from phy.c");
+    }
+    // `rtw89_8852a_trk_cfg` delta-swing rows (fw.h trk types 4..=15).
+    if !tables_a::delta_swing(4, 0).is_some_and(|r| r[..4] == [0, 1, 1, 2])
+        || !tables_a::delta_swing(4, 2).is_some_and(|r| r[29] == 9)
+        || !tables_a::delta_swing(8, 0).is_some_and(|r| r[..4] == [0, 1, 1, 1])
+        || !tables_a::delta_swing(8, 0).is_some_and(|r| r[29] == 7)
+        || !tables_a::delta_swing(15, 0).is_some_and(|r| r[29] == 10)
+        || tables_a::delta_swing(8, 1).is_some()
+        || tables_a::delta_swing(0, 0).is_some()
+        || tables_a::delta_swing(3, 0).is_some()
+        || tables_a::delta_swing(16, 0).is_some()
+        || tables_a::delta_swing(4, 3).is_some()
+    {
+        return TestResult::Fail("A delta-swing trk_cfg mapping differs from Linux");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_power_tables_match_linux_txpwr_tables
+);
+/// Linux rtw8852a_table.c WW 20MHz rows, end to end through the A plan:
+/// per-primary limits/RU, band-1 byrate without CCK, no shape step, and
+/// distinct bindings per primary (and per chip: the A ch1 binding differs
+/// from the B ch1 binding even where the rows agree).
+fn smoke_rtw89_a_power_plan_selects_actual_primary_limits() -> TestResult {
+    use narf_wireless::association::channel::Band;
+    let digest = |plan: &Plan| {
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        plan.bind(&mut hash);
+        hash.finalize()
+    };
+    let Ok(initial) = Plan::fixture_defaults_a() else {
+        return TestResult::Fail("initial A power fixture");
+    };
+    if initial.channel() != Profile::INITIAL
+        || initial.chip() != Chip::A
+        || initial.byrate != tables_a::byrate(0).0
+        || initial.offset != [0; 5]
+        || initial.shape != [0; 2]
+        || initial.limits_and_ru()
+            != (
+                [[56, 0, 0, 0, 58, 0, 58, 0], [44, 0, 0, 0, 46, 0, 46, 34]],
+                [[32, 42, 52], [20, 30, 40]],
+            )
+    {
+        return TestResult::Fail("initial A plan lost its exact channel1 source limits");
+    }
+    let Ok(baseline) = Plan::fixture_defaults() else {
+        return TestResult::Fail("initial B power fixture");
+    };
+    if baseline.chip() != Chip::B || digest(&initial) == digest(&baseline) {
+        return TestResult::Fail("A ch1 binding aliases the B ch1 binding");
+    }
+    let mut seen = alloc::vec::Vec::new();
+    for primary in 1..=14u8 {
+        let Some(profile) = Profile::new(Band::Ghz2, primary) else {
+            return TestResult::Fail("typed2.4GHz primary refused");
+        };
+        let Ok(plan) = Plan::fixture_defaults_a_for_channel(profile) else {
+            return TestResult::Fail("per-channel A power fixture");
+        };
+        if plan.channel() != profile
+            || plan.chip() != Chip::A
+            || plan.limits_and_ru() != channel20_a(profile)
+            || plan.byrate != tables_a::byrate(0).0
+            || plan.shape != [0; 2]
+        {
+            return TestResult::Fail("A plan did not select the actual primary limits/RU");
+        }
+        let hash = digest(&plan);
+        if seen.contains(&hash) {
+            return TestResult::Fail("distinct 2.4GHz primaries share one A power binding");
+        }
+        seen.push(hash);
+    }
+    if digest(&initial) != seen[0] {
+        return TestResult::Fail("channel1 A fixture binding changed between constructors");
+    }
+    // Hardcoded WW rows: ch12/ch13 differ from B, ch14 is CCK-only.
+    let at = |primary: u8| {
+        let profile = Profile::new(Band::Ghz2, primary).unwrap();
+        Plan::fixture_defaults_a_for_channel(profile).unwrap()
+    };
+    if at(12).limits_and_ru()
+        != (
+            [[56, 0, 0, 0, 56, 0, 54, 0], [44, 0, 0, 0, 42, 0, 42, 34]],
+            [[32, 42, 52], [20, 30, 40]],
+        )
+        || at(13).limits_and_ru()
+            != (
+                [[48, 0, 0, 0, 52, 0, 50, 0], [38, 0, 0, 0, 40, 0, 40, 34]],
+                [[32, 36, 40], [20, 30, 26]],
+            )
+        || at(14).limits_and_ru()
+            != (
+                [[76, 0, 0, 0, 0, 0, 0, 0], [64, 0, 0, 0, 0, 0, 0, 0]],
+                [[0, 0, 0], [0, 0, 0]],
+            )
+    {
+        return TestResult::Fail("frozen A 2.4GHz limits differ from the Linux table");
+    }
+    // 5GHz: no CCK byrate, no shape, and the A table covers only 25 of the
+    // 28 primaries (169/173/177 are unlisted cells and read 0, unlike B).
+    let mut seen5 = alloc::vec::Vec::new();
+    for primary in super::super::operating_channel::GHZ5 {
+        let Some(profile) = Profile::new(Band::Ghz5, primary) else {
+            return TestResult::Fail("typed5GHz primary refused");
+        };
+        let Ok(plan) = Plan::fixture_defaults_a_for_channel(profile) else {
+            return TestResult::Fail("5GHz A power fixture");
+        };
+        if plan.limits_and_ru() != channel20_a(profile)
+            || plan.byrate[..4] != [0; 4]
+            || plan.byrate[4..] != tables_a::byrate(1).0[4..]
+            || plan.shape != [0; 2]
+        {
+            return TestResult::Fail("5GHz A plan limits/RU/byrate differ from the Linux tables");
+        }
+        let hash = digest(&plan);
+        if seen5.contains(&hash) {
+            return TestResult::Fail("distinct 5GHz primaries share one A power binding");
+        }
+        seen5.push(hash);
+    }
+    let at5 = |primary: u8| {
+        let profile = Profile::new(Band::Ghz5, primary).unwrap();
+        Plan::fixture_defaults_a_for_channel(profile).unwrap()
+    };
+    if at5(144).limits[0][4] != 54
+        || at5(144).limits[1][7] != 30
+        || at5(149).limits[1][4] != 16
+        || at5(52).limits[0][6] != 52
+        || at5(36).ru != [[22, 30, 30], [8, 18, 18]]
+        || at5(48).ru[1] != [4, 16, 18]
+        || at5(169).limits != [[0; 8]; 2]
+        || at5(169).ru != [[0; 3]; 2]
+        || at5(177).limits != [[0; 8]; 2]
+    {
+        return TestResult::Fail("frozen A 5GHz limits differ from the Linux table");
+    }
+    // No shape writes on either band: `rtw8852a_set_txpwr` has no
+    // tx-shape step, so the A program writes neither the CCK DFIR nor
+    // the 0x14494 shape word (the B 2.4GHz program writes both).
+    for primary in [1u8, 36] {
+        let band = if primary == 1 { Band::Ghz2 } else { Band::Ghz5 };
+        let profile = Profile::new(band, primary).unwrap();
+        let plan = Plan::fixture_defaults_a_for_channel(profile).unwrap();
+        let mut shape = false;
+        if plan
+            .visit(|a, _, _| {
+                shape |= a == 0x14494 || (0x12300..0x12320).contains(&a);
+                Ok(())
+            })
+            .is_err()
+            || shape
+        {
+            return TestResult::Fail("A power program wrote a tx-shape control");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_power_plan_selects_actual_primary_limits
+);
+/// Firmware-element override over the A static tables: the shared byrate/
+/// limit/RU selection still applies, the missing-only fallback is the A
+/// static plan (not B's), rfe 255 fails closed, and a TX_SHAPE_LMT
+/// element is ignored (Linux `rtw8852a_set_txpwr` has no shape step).
+fn smoke_rtw89_a_power_rfe_selection_and_static_fallback() -> TestResult {
+    let a = element(9, 0, 9, &[0, 0, 0, 0, 4, 0xf9, 0xfe, 1, 6]);
+    let b = element(9, 11, 9, &[0, 0, 0, 0, 4, 0xe1, 0xe5, 0xfd, 3]);
+    let c = element(9, 0, 9, &[0, 0, 0, 0, 4, 20, 24, 28, 32]);
+    let d = element(9, 11, 11, &[0, 0, 0, 0, 4, 0xa1, 0xc1, 0xe1, 0xf1, 0, 0]);
+    let elements = [a, b, c, d];
+    let exact = Plan::from_elements_a(&elements, 11).unwrap();
+    let default = Plan::from_elements_a(&elements, 7).unwrap();
+    if exact.byrate[..4] != [-95, -63, -31, -15]
+        || default.byrate[..4] != [20, 24, 28, 32]
+        || exact.byrate[4..] != [0; 40]
+        || exact.offset != [0; 5]
+        || exact.chip() != Chip::A
+    {
+        return TestResult::Fail("A power RFE last-match/default byrate changed");
+    }
+    let lmt = element(10, 0, 7, &[0, 1, 2, 1, 0, 0, 0xf9]);
+    let ru = element(13, 0, 5, &[2, 1, 0, 0, 0xf5]);
+    let shape = element(16, 0, 4, &[0, 1, 0, 3]);
+    let p = Plan::from_elements_a(&[lmt, ru, shape], 1).unwrap();
+    if p.limits[1][7] != -7 || p.ru[1][2] != -11 || p.shape != [0; 2] {
+        return TestResult::Fail("A power limit/RU override or shape ignore changed");
+    }
+    if Plan::from_elements_a(&[], 255).is_ok()
+        || Plan::from_elements_a(&[], 1).unwrap() != Plan::fixture_defaults_a().unwrap()
+        || Plan::from_elements_a(&[], 1).unwrap() == Plan::fixture_defaults().unwrap()
+    {
+        return TestResult::Fail("A power missing-only fallback is not the A static plan");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_power_rfe_selection_and_static_fallback
+);
+/// phy.c `rtw89_phy_fill_txpwr_limit_{40m,80m}_ax` and `_ru_{40m,80m}_ax`
+/// over the A WW rows: center/primary/subchannel sources, the 0p5 minimum,
+/// zero CCK on 5GHz, and the page bytes the A plan emits.
+fn smoke_rtw89_a_power_plan_fills_wide_pages_like_linux() -> TestResult {
+    use super::super::operating_channel::Width;
+    // 2.4GHz HT40: primary 1, secondary above, center 3.
+    let Some(ht40) = Profile::new_2ghz_40(1, true) else {
+        return TestResult::Fail("2.4GHz HT40 profile");
+    };
+    let Ok(plan) = Plan::fixture_defaults_a_for_channel(ht40) else {
+        return TestResult::Fail("2.4GHz HT40 A power fixture");
+    };
+    for n in 0..2 {
+        let (cck20, cck40, ofdm, mcs20, mcs40, ru1, ru5) = if n == 0 {
+            (
+                [56, 0],
+                [58, 0],
+                [58, 0],
+                [58, 0],
+                [56, 0],
+                [32, 42, 52],
+                [32, 42, 52],
+            )
+        } else {
+            (
+                [44, 0],
+                [46, 0],
+                [46, 0],
+                [46, 34],
+                [46, 34],
+                [20, 30, 40],
+                [20, 30, 40],
+            )
+        };
+        if plan.limits[n][0..2] != cck20
+            || plan.limits[n][2..4] != cck40
+            || plan.limits[n][4..6] != ofdm
+            || plan.limits[n][6..8] != mcs20
+            || plan.extra[n][0..2] != mcs20
+            || plan.extra[n][14..16] != mcs40
+            || plan.ru[n] != ru1
+            || plan.ru_extra[n][0] != ru5
+            || plan.ru_extra[n][1] != [0; 3]
+        {
+            return TestResult::Fail("2.4GHz HT40 A page differs from Linux fill_40m");
+        }
+    }
+    // 5GHz VHT80: primary 44 (UPPER), center 42, subchannels 36..48.
+    let Some(vht80) = Profile::new_5ghz(44, Width::Mhz80) else {
+        return TestResult::Fail("5GHz 80MHz profile");
+    };
+    let Ok(plan) = Plan::fixture_defaults_a_for_channel(vht80) else {
+        return TestResult::Fail("5GHz 80MHz A power fixture");
+    };
+    for n in 0..2 {
+        let (ofdm, mcs, mcs40, mcs80, ru36, ru40, ru44, ru48) = if n == 0 {
+            (
+                [30, 0],
+                [30, 0],
+                [30, 0],
+                [30, 0],
+                [22, 30, 30],
+                [22, 30, 30],
+                [22, 30, 30],
+                [20, 30, 30],
+            )
+        } else {
+            (
+                [18, 0],
+                [18, 6],
+                [18, 6],
+                [18, 6],
+                [8, 18, 18],
+                [8, 18, 18],
+                [8, 18, 18],
+                [4, 16, 18],
+            )
+        };
+        if plan.limits[n][0..4] != [0; 4]
+            || plan.limits[n][4..6] != ofdm
+            || plan.limits[n][6..8] != mcs
+            || plan.extra[n][0..2] != mcs
+            || plan.extra[n][2..4] != mcs
+            || plan.extra[n][4..6] != mcs
+            || plan.extra[n][14..16] != mcs40
+            || plan.extra[n][16..18] != mcs40
+            || plan.extra[n][22..24] != mcs80
+            || plan.extra[n][28..30] != mcs40
+            || plan.ru[n] != ru36
+            || plan.ru_extra[n] != [ru40, ru44, ru48]
+        {
+            return TestResult::Fail("5GHz 80MHz A page differs from Linux fill_80m");
+        }
+    }
+    let digest = |plan: &Plan| {
+        let mut hash = narf_crypto::sha256::Sha256::new();
+        plan.bind(&mut hash);
+        hash.finalize()
+    };
+    let narrow = Plan::fixture_defaults_a_for_channel(vht80.narrowed()).unwrap();
+    if digest(&plan) == digest(&narrow) || narrow.extra != [[0; 32]; 2] {
+        return TestResult::Fail("wide A plan aliases the 20MHz binding");
+    }
+    // A supports 20/40/80MHz only; 160MHz is refused like on B.
+    let Some(wide160) = Profile::new_5ghz_160(44) else {
+        return TestResult::Fail("5GHz 160MHz profile");
+    };
+    if Plan::fixture_defaults_a_for_channel(wide160).is_ok() {
+        return TestResult::Fail("160MHz A plan was admitted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_power_plan_fills_wide_pages_like_linux
+);
+/// The A program through `Power::prepare` on the inert model: the AX
+/// byrate/offset/limit/RU words land with the A table values (RF units
+/// shifted >> 1 at emit), the reference-control tail lands, no tx-shape
+/// word is written on either band, and a replay is refused.
+fn smoke_rtw89_a_power_prepare_emits_ax_program_without_shape() -> TestResult {
+    let word = |io: &Model, a: u32| {
+        u32::from_le_bytes(io.bytes[a as usize..a as usize + 4].try_into().unwrap())
+    };
+    for (primary, band, byrate0, lmt0, ru0) in [
+        (
+            1u8,
+            narf_wireless::association::channel::Band::Ghz2,
+            0x2828_2828u32,
+            0x0000_001cu32,
+            0x0000_0010u32,
+        ),
+        (
+            36u8,
+            narf_wireless::association::channel::Band::Ghz5,
+            0x0000_0000u32,
+            0x0000_0000u32,
+            0x0000_000bu32,
+        ),
+    ] {
+        let profile = Profile::new(band, primary).unwrap();
+        let plan = Plan::fixture_defaults_a_for_channel(profile).unwrap();
+        let mut io = Model::new(0xa5, 0);
+        let mut owner = Power::default();
+        // SAFETY: exact inert A words and explicitly private power configuration only.
+        let r = unsafe { owner.prepare(&mut io, &plan) };
+        if r != Ok(()) || owner.state() != State::Configured || io.count != 49 {
+            return TestResult::Fail("A power prepare did not emit the 49 AX words");
+        }
+        if word(&io, 0xd2c0) != byrate0
+            || word(&io, 0xd2ec) != lmt0
+            || word(&io, 0xd33c) != ru0
+            || io.bytes[0x14494..0x14498] != [0xa5; 4]
+            || io.bytes[0x12300..0x12304] != [0xa5; 4]
+            || io.bytes[0x15804..0x15808] == [0xa5; 4]
+            || io.bytes[0xd200..0xd204] == [0xa5; 4]
+        {
+            return TestResult::Fail("A power prepare words/reference/shape differ from Linux");
+        }
+        // SAFETY: one completed attempt must reject before touching the model.
+        if unsafe { owner.prepare(&mut io, &plan) } != Err(Error::Terminal) {
+            return TestResult::Fail("A power prepare replayed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtw89",
+    smoke_rtw89_a_power_prepare_emits_ax_program_without_shape
+);
