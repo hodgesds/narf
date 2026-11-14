@@ -487,7 +487,23 @@ pub(crate) async fn setup_mediatek(
         interface,
     };
     let name = read_identity(&io, product_id).await?;
-    let cap = btusb::firmware_cap(&name).ok_or(MtkError::FirmwareUnavailable)?;
+    let cap = btusb::firmware_cap(&name)
+        .or_else(|| {
+            if product_id == 0x3604 || name.contains("7925") {
+                btusb::firmware_cap("mediatek/mt7925/BT_RAM_CODE_MT7925_1_1_hdr.bin")
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "  btusb-mtk: firmware '{}' not found in registry",
+                name
+            );
+            MtkError::FirmwareUnavailable
+        })?;
     let view = narf_firmware::view_of(&cap).map_err(|_| MtkError::FirmwareUnavailable)?;
     download_and_enable(&io, view.bytes).await?;
     // WMT status/complete events may also be queued on the ordinary event

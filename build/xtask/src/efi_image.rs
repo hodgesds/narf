@@ -97,6 +97,7 @@ pub fn run(args: &Args) -> Result<()> {
         build.features = without_kernel_test_features(&build.features);
     }
     ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
     if args.smoke {
         ensure_feature(&mut build.features, "boot-smoke");
     }
