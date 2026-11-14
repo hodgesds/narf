@@ -521,8 +521,15 @@ impl<E: AhbEnv> LiveAhb<E> {
         let Some(cfg) = CoreConfig::for_hw(&hw) else {
             return Err(failed(EINVAL));
         };
+        // Box the core and the DP hooks at creation: both are large
+        // by-value structs (`Ath11kCore`, and `DpHooks` holding the `Dp`),
+        // and holding them by value across `qmi_firmware_ready` blew the
+        // 8 KiB kernel stack-frame budget (the `qmi_ready` closure measured
+        // 10_872 bytes on main). Holding `Box`es keeps the future's state
+        // and the poll's by-value moves pointer-sized; behaviour is
+        // unchanged.
         let mut core = match Ath11kCore::new(hif, w, cfg) {
-            Ok(c) => c,
+            Ok(c) => Box::new(c),
             Err((e, hif, _w)) => {
                 self.hif = Some(hif);
                 self.failure = Some(e);
@@ -534,23 +541,23 @@ impl<E: AhbEnv> LiveAhb<E> {
             ep_base_data: m.ep_base_data,
             config: hw.msi,
         });
-        let mut hooks = DpHooks::new(
+        let mut hooks = Box::new(DpHooks::new(
             DpHwParams::for_rev(hw.hw_rev),
             hw.hw_rev as u32,
             DpRingSizes::LINUX,
             msi,
-        );
-        let r = core.qmi_firmware_ready(&mut hooks).await;
+        ));
+        let r = core.qmi_firmware_ready(&mut *hooks).await;
         let dp = hooks.dp.take().map(Box::new);
         match (r, dp) {
             (Ok(()), Some(dp)) => {
-                self.outcome = Some(LiveOutcome::Ready(Box::new(core), dp));
+                self.outcome = Some(LiveOutcome::Ready(core, dp));
                 Ok(())
             }
             (r, dp) => {
                 let e = r.err().unwrap_or(TransportError::new(0, 0, ENODEV));
                 self.failure = Some(e);
-                self.outcome = Some(LiveOutcome::Stranded(Box::new(core), dp));
+                self.outcome = Some(LiveOutcome::Stranded(core, dp));
                 Err(failed(e.errno))
             }
         }

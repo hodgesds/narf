@@ -457,8 +457,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     if let Some(native) = native {
         // Initial boot and a later missing-input retry share the exact same
         // retained binding and async admission lock.
+        // Box the scheduled drive future: its state (the provision chain
+        // through `prepare_rtl8821ae` / `prepare_rtl8192de`) is large, and
+        // holding it by value in this block blew the 8 KiB kernel
+        // stack-frame budget (`rtlwifi::pci::probe` measured 20_984 bytes
+        // on main). Behaviour is unchanged.
         narf_scheduler::spawn(async move {
-            if let Err(error) = drive_scheduled(
+            if let Err(error) = Box::pin(drive_scheduled(
                 120,
                 || {
                     with_controller_at(address, |dev| {
@@ -471,7 +476,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 },
                 || native.provision(),
                 || narf_time::sleep_cycles(narf_time::wall::ns_to_cycles(500_000_000)),
-            )
+            ))
             .await
             {
                 use core::fmt::Write;
