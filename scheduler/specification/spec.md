@@ -196,6 +196,8 @@ pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 pub fn note_urgent_wake_preempt(woken: u64);
 /// Consume one exact waiter's waker; preserve ordinary remote placement.
 pub fn wake_preempt_task(waker: core::task::Waker, expected_task: u64);
+/// Recognize task wakers whose wake_by_ref can publish with IRQs masked.
+pub fn is_scheduler_waker(waker: &core::task::Waker) -> bool;
 /// Alias a native task waker with advisory blocking-I/O wake metadata.
 pub fn blocking_io_waker(waker: &core::task::Waker, expected_task: u64)
     -> core::task::Waker;
@@ -435,12 +437,57 @@ awake state, affinity, and CPU idle/lock state. They deliberately maintain no
 per-poll, per-pop, per-requeue, or global per-wake counters on the normal
 scheduling path.
 
-Cross-CPU wakes stage owned task slots in the target CPU's wake inbox and send
-a reschedule IPI on the empty-to-nonempty edge. The IPI is notification-only;
-it must not grow a ready queue or invoke a policy callback in hard-IRQ context.
-The target drains the inbox under its own queue and policy locks at the next
-executor round boundary. The mirrored inbox length and `NEED_RESCHED` flag
-remain part of the idle-halt lost-wake handshake.
+Cross-CPU wakes publish owned task slots or pinned, intrusive parked-wake nodes
+before setting the target's `WAKE_PENDING` notification. Its false-to-true edge
+sends an IPI even to a busy CPU; subsequent wakes coalesce until the target
+claims the batch. A halted target retains the final halt-race kick. Notification
+does not set `NEED_RESCHED`: that flag carries policy, timer, and control requests.
+Within one wake, parked-node publication records the CPU it notified; later
+placement skips a duplicate notification to that same CPU, even if the CPU has
+already claimed the batch. A changed destination is still notified, and the
+original inbox owner keeps its notification so it can drain the pinned node.
+Independent wakes retain the pending-bit and halt-handshake checks.
+Scheduler wakers invoked with interrupts masked publish the awake bit and
+activation node and notify its owner, but skip optional placement callbacks
+and migration. This includes direct hard-hrtimer expiry before architecture
+IRQ-depth accounting begins. The executor or safe user-return boundary performs
+activation where queue growth and policy callbacks are permitted.
+Both channels and the pending queues participate in the idle-halt handshake.
+Idle destination selection excludes CPUs with pending activation.
+
+The IPI handler must not grow a ready queue or invoke a policy callback.
+Activation runs on the target at an executor boundary or through
+`stackful::finish_user_return()`, on the task's own stack after IRQ accounting,
+EOI, and lock release. The latter enables interrupts for activation, invokes
+`Scheduler::wakeup_preemption` against the activated queue, and honors an approved
+request through the existing own-stack switch. It clears the notification before
+activation and masks interrupts before rechecking; architecture return code
+must keep them masked until SYSRET/IRET/ERET restores user state. Thus a late
+wake is either processed by the loop or delivered as a pending user-mode IRQ.
+`CurrentTask` includes the dispatched priority as well as class and virtual
+runtime. The class policy preserves equal-priority realtime FIFO order and
+batch/idle batching, and preempts for higher class/priority. For equal-priority
+fair peers it shares EEVDF's equal-weight adaptation of Linux `vruntime_eligible`
+and `__pick_eevdf`: include the running task's elapsed service in the runnable
+average, drop protection immediately when current is ineligible, otherwise
+honor its virtual request deadline before comparing eligible deadlines. The
+same bounded sleeper-credit view applies to the runner and queued peers. Exact
+wide sums avoid rounding eligibility across a boundary. The decision uses one
+allocation-free O(n) scan of the existing queue; weighted/group scheduling,
+variable request sizes and Linux's augmented tree are not introduced.
+`Scheduler::wakeup_preemption` returns `KeepRunning`, `Now`, or `After(elapsed)`.
+The default adapter preserves the existing boolean `wakeup_preempt` hook.
+`After` retains an O(1) deadline check in the running task until a subsequent
+user-return boundary reaches the requested dispatch-relative time; it neither
+expires the task's quantum nor creates a periodic recovery timer. An actual
+dispatch clears the old deadline. Direct task-to-task transfers publish the
+target's policy snapshot only after validation succeeds and restore the root's
+snapshot on a direct return; an intervening executor dispatch supplies its own
+fresh snapshot instead.
+The same user-return loop drains this CPU's deferred IRQ wakers outside hard-IRQ
+context before activation. Its no-work check uses the library's cache-line
+isolated local presence flag, so a syscall does not scan deferred slots or
+consult a global wake counter.
 
 #### 3.1.1 Pluggable scheduling policy
 

@@ -1206,6 +1206,9 @@ unsafe fn try_direct_handoff(
             }
         };
 
+        let root_sched = crate::current_sched_snapshot(cpu);
+        crate::publish_sched_snapshot(cpu, target.sched);
+
         // SAFETY: source is the uniquely running task whose continuation this
         // switch saves; no executor can access its off-queue slot concurrently.
         source_ref
@@ -1246,6 +1249,11 @@ unsafe fn try_direct_handoff(
         // An ordinary return may later re-dispatch this source on another CPU;
         // never use the captured old CPU to clean up a newer handoff there.
         let resumed_cpu = this_cpu();
+        // A direct return retains the root's dispatch. An executor return
+        // publishes a fresh snapshot (possibly on a different CPU); keep it.
+        if crate::CURRENT_SCHED[resumed_cpu].id.load(Ordering::Relaxed) != source_cell.task {
+            crate::publish_sched_snapshot(resumed_cpu, root_sched);
+        }
         if DIRECT_HANDOFF[resumed_cpu]
             .returned_root
             .load(Ordering::Acquire)
@@ -1672,6 +1680,7 @@ fn this_cpu() -> usize {
 /// instead of eight.
 #[inline]
 fn stamp_slice_start(task: &KernelTask, cpu: usize) {
+    task.wake_preempt_at.store(0, Ordering::Release);
     let now = narf_time::now_cycles();
     task.tsc_started.store(now, Ordering::Release);
     #[cfg(feature = "instruction-quantum")]
@@ -1976,6 +1985,8 @@ pub struct KernelTask {
     /// timer tick landed in its non-preemptible syscall continuation. The tick
     /// makes the scheduling decision; syscall exit only consumes this bit.
     need_resched: AtomicBool,
+    /// Deferred policy reconsideration, owned by this dispatch (TSC deadline).
+    wake_preempt_at: AtomicU64,
     /// Opt-out: when true the trap-handler hook skips preempting
     /// this task. Use for drivers that hold hardware locks across
     /// an `.await`-free critical section.
@@ -2201,6 +2212,7 @@ impl KernelTask {
             instruction_limit: AtomicU64::new(DEFAULT_SLICE_INSTRUCTIONS),
             slice_cycles: AtomicU64::new(DEFAULT_SLICE_CYCLES),
             need_resched: AtomicBool::new(false),
+            wake_preempt_at: AtomicU64::new(0),
             no_preempt: AtomicBool::new(false),
             user_preempt: AtomicBool::new(false),
             preempted: AtomicBool::new(false),
@@ -4274,8 +4286,12 @@ pub unsafe fn maybe_resched_syscall_exit() {
     }
     // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield
     // keeps its Box alive across the user round-trip).
+    let policy_resched =
+        crate::need_resched_pending(cpu) && crate::NEED_RESCHED[cpu].swap(false, Ordering::AcqRel);
+    // SAFETY: p is pinned by this CPU's in-flight own-stack poll.
     let deferred_resched = unsafe { consume_syscall_exit_hint(&(*p).need_resched) }
-        || crate::user_policy::take_request(cpu);
+        | crate::user_policy::take_request(cpu)
+        | policy_resched;
     // Both hints are cold in the ordinary syscall path.  Avoid an
     // unconditional RMW when they are clear: the per-CPU byte arrays share
     // cache lines, so `swap(false)` made independent CPUs contend on every
@@ -4347,6 +4363,89 @@ pub unsafe fn maybe_resched_syscall_exit() {
         // tsc_started) when re-polled. Proven safe from syscall context — the
         // own-stack park paths (own_stack_park / wait4) switch out the same way.
         yield_current_stackful_from(cpu, p, false);
+    }
+}
+
+/// Finish an own-stack return to user mode with interrupts masked. A wake IPI
+/// received during a syscall stays pending until here. Queue growth and policy
+/// callbacks run with interrupts enabled on the task stack, after hard-IRQ
+/// accounting/EOI; the final masked recheck closes the late-IPI return window.
+///
+/// # Safety
+/// Called only immediately before an architecture return to user mode, on the
+/// current task's kernel stack, after dropping all locks and hard-IRQ guards.
+/// The caller must keep interrupts masked through the final register restore.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub unsafe fn finish_user_return() {
+    if !USE_OWN_STACK.load(Ordering::Acquire) {
+        return;
+    }
+    loop {
+        let cpu = this_cpu();
+        let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+        if p.is_null() {
+            return;
+        }
+        // SAFETY: the in-flight own-stack poll pins p until this return ends.
+        let task = unsafe { &*p };
+        if !task.user_preempt.load(Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: all exit work has completed and the caller restores user IF.
+        unsafe { narf_arch::disable_interrupts() };
+        let deferred = narf_lib::deferred_wake::has_pending_local();
+        let mut notified = crate::wake_notification_pending(cpu);
+        let requested =
+            crate::need_resched_pending(cpu) || task.need_resched.load(Ordering::Acquire);
+        let reconsider_at = task.wake_preempt_at.load(Ordering::Acquire);
+        let reconsider = reconsider_at != 0 && narf_time::now_cycles() >= reconsider_at;
+        if !deferred && !notified && !requested && !reconsider {
+            return;
+        }
+        // SAFETY: on the task stack after EOI, with no locks/IRQ guards held.
+        // User tasks prohibit involuntary kernel-mode preemption.
+        unsafe { narf_arch::enable_interrupts() };
+        if deferred {
+            narf_lib::deferred_wake::drain_and_wake();
+            if this_cpu() != cpu {
+                // A foreign waker may yield; ownership after resume is local
+                // to the new CPU, not the CPU whose deferred batch we took.
+                continue;
+            }
+            notified |= crate::wake_notification_pending(cpu);
+        }
+        let activated = if notified {
+            crate::activate_pending_wakes(cpu)
+        } else {
+            0
+        };
+        // Linux wakeup_preempt_fair skips a second decision when rescheduling
+        // is already requested. Activation still runs first, so the executor
+        // sees every published wake before selecting the next task.
+        let resched_pending =
+            crate::need_resched_pending(cpu) || task.need_resched.load(Ordering::Acquire);
+        if resched_pending {
+            task.wake_preempt_at.store(0, Ordering::Release);
+        } else if activated != 0 || reconsider {
+            let started = task.tsc_started.load(Ordering::Acquire);
+            let elapsed = narf_time::now_cycles().saturating_sub(started);
+            let decision =
+                crate::wake_preempt_policy_decision(crate::current_task_id().raw(), elapsed);
+            let deadline = match decision {
+                crate::policy::WakePreemption::Now => {
+                    crate::resched_current();
+                    0
+                }
+                crate::policy::WakePreemption::After(at) if at > elapsed => {
+                    started.saturating_add(at)
+                }
+                _ => 0,
+            };
+            task.wake_preempt_at.store(deadline, Ordering::Release);
+        }
+        // SAFETY: same completed own-stack return boundary as this function.
+        unsafe { maybe_resched_syscall_exit() };
+        // A switch can migrate this task. Re-read CPU and current ownership.
     }
 }
 
@@ -7789,11 +7888,12 @@ pub mod tests {
         for _ in 0..TASKS {
             crate::spawn_stackful(sleeper());
         }
-        // Drive enough rounds that the LAPIC tick (every
-        // ~10 ms on QEMU) fires multiple times and drains the
-        // wheel. 1024 rounds with timer_pump activity is
-        // ample.
-        for _ in 0..1024 {
+        // Drive rounds until every sleeper finished or 1 s passed. The
+        // sleepers park on hrtimers now (no self-wake polling), so a fixed
+        // round count can finish before their ~300 µs deadline; each round
+        // expires this CPU's due timers.
+        let end = narf_time::now_cycles().saturating_add(narf_time::ns_to_cycles(1_000_000_000));
+        while narf_time::now_cycles() < end {
             crate::poll_one_round();
             if (DONE.load(Ordering::Acquire) as usize) >= TASKS {
                 break;
@@ -8457,6 +8557,9 @@ pub mod tests {
                     // its executor continuation pinned across the switch.
                     unsafe { yield_current_stackful() };
                 } else if !cooperative_yield() {
+                    parent.failed.store(true, Ordering::Release);
+                }
+                if crate::current_sched_snapshot(this_cpu()).id.raw() != cell.task {
                     parent.failed.store(true, Ordering::Release);
                 }
                 let observer_ran = parent.observer_ran.load(Ordering::Acquire);

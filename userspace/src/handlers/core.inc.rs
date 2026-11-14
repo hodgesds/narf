@@ -34,12 +34,25 @@ pub fn signal_waker_init() {
     for bucket in &SIGNAL_WAKERS {
         *bucket.values.lock() = Some(alloc::collections::BTreeMap::new());
     }
+    for tid in crate::task::task_ids() {
+        crate::user_task::with_user_task_ctx(tid, |ctx| {
+            ctx.signal_waker.lock().take();
+        });
+    }
 }
 
 pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
+    let mut waker = Some(waker);
+    if crate::task::with_task_local(task_id, |task| {
+        *task.uctx.signal_waker.lock() = waker.take();
+    }).is_some() {
+        return;
+    }
+    // Early/no-task callers retain the registry fallback. Ordinary user
+    // parks use their already-owned task and never allocate a map entry.
     let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
     if let Some(m) = g.as_mut() {
-        m.insert(task_id, waker);
+        m.insert(task_id, waker.expect("unresolved signal waiter"));
     }
 }
 
@@ -81,8 +94,7 @@ pub fn wake_signal(task_id: u64) {
 /// `sleep_deadline_ns` (`blocking_deadline_ns`, its own restart record, a
 /// local), so a cleared deadline never re-arms a fresh full timeout.
 pub(crate) fn signal_wake_up(task_id: u64, deliverable: bool) {
-    // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
-    // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
+    // The lookup retains the task while its wait state is accessed.
     let task_state = crate::user_task::with_user_task_ctx(task_id, |uctx| {
         if deliverable {
             uctx.signal_delivery_notified.store(true, Ordering::Release);
@@ -92,18 +104,26 @@ pub(crate) fn signal_wake_up(task_id: u64, deliverable: bool) {
         if signal_wake_cuts_deadline(deadline, sigwait_set, deliverable) {
             uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
+        let precise = uctx.signal_waker.lock().take();
+        let fallback = if precise.is_none() {
+            uctx.scheduler_waker()
+        } else {
+            None
+        };
         (
             uctx.sem_wait_pending.load(Ordering::Acquire).then(|| (
                 uctx.sem_wait_ipc_ns.load(Ordering::Relaxed),
                 uctx.sem_wait_id.load(Ordering::Relaxed),
             )),
-            uctx.scheduler_waker(),
+            fallback,
+            precise,
         )
     });
-    let waker = {
+    let mut task_state = task_state;
+    let waker = task_state.as_mut().and_then(|(_, _, waker)| waker.take()).or_else(|| {
         let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
         g.as_mut().and_then(|m| m.remove(&task_id))
-    };
+    });
     let had_wait_waker = waker.is_some();
     if let Some(w) = waker {
         w.wake();
@@ -117,18 +137,23 @@ pub(crate) fn signal_wake_up(task_id: u64, deliverable: bool) {
     if !had_wait_waker {
         if let Some(w) = task_state
             .as_ref()
-            .and_then(|(_, scheduler_waker)| scheduler_waker.as_ref())
+            .and_then(|(_, scheduler_waker, _)| scheduler_waker.as_ref())
         {
             w.wake_by_ref();
         }
     }
-    let sem_wait = task_state.and_then(|(sem_wait, _)| sem_wait);
+    let sem_wait = task_state.and_then(|(sem_wait, _, _)| sem_wait);
     if let Some((ipc_ns, id)) = sem_wait {
         crate::sysvipc::wake_sem_waiter_for_signal(task_id, ipc_ns, id);
     }
 }
 
 pub fn drop_signal_waker(task_id: u64) {
+    if crate::task::with_task_local(task_id, |task| {
+        task.uctx.signal_waker.lock().take();
+    }).is_some() {
+        return;
+    }
     let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
     if let Some(m) = g.as_mut() {
         m.remove(&task_id);
@@ -142,6 +167,11 @@ pub fn drop_signal_waker(task_id: u64) {
 /// that from an ordinary interruptible park is the whole question for the
 /// SMP signal-wake lost-wakeup.
 pub fn dbg_has_signal_waker(task_id: u64) -> bool {
+    if let Some(present) = crate::task::with_task_local(task_id, |task| {
+        task.uctx.signal_waker.lock().is_some()
+    }) {
+        return present;
+    }
     let g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
     g.as_ref().is_some_and(|m| m.contains_key(&task_id))
 }
@@ -1145,6 +1175,7 @@ pub fn init_per_task_state() {
         crate::ns_last_pid_for_current,
         crate::set_ns_last_pid_for_current,
     );
+    crate::futex_policy::register_sysctls();
     // `/proc/sys/kernel/{sem,msg*,shm*}` are the caller's IPC-namespace
     // limits, which live in `sysvipc`; same reasoning as the two above, and
     // installing them here (rather than only in `frame`'s cross-crate init)
@@ -14322,7 +14353,12 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
 /// or returns the baked/reaped result.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
-    own_stack_block_routed(ctx, true);
+    own_stack_block_routed(ctx, true, || false);
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn own_stack_block_futex(ctx: &mut dyn TrapContext, wait: &FutexQ) {
+    own_stack_block_routed(ctx, true, || wait.has_woken());
 }
 
 /// [`own_stack_block`] for a ptrace stop. A stop is not a child-wait: it ends
@@ -14334,11 +14370,11 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
 /// after the stop re-arms its own wait state.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn own_stack_block_ptrace_stop(ctx: &mut dyn TrapContext) {
-    own_stack_block_routed(ctx, false);
+    own_stack_block_routed(ctx, false, || false);
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn own_stack_block_routed(ctx: &mut dyn TrapContext, allow_wait: bool) {
+fn own_stack_block_routed(ctx: &mut dyn TrapContext, allow_wait: bool, completed: impl Fn() -> bool) {
     let is_wait = allow_wait && crate::user_task::current_user_task().is_some_and(|uctx| {
         // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
         unsafe {
@@ -14363,7 +14399,7 @@ fn own_stack_block_routed(ctx: &mut dyn TrapContext, allow_wait: bool) {
     if is_wait {
         own_stack_wait_child(ctx);
     } else {
-        crate::user_task::own_stack_park();
+        crate::user_task::own_stack_park_until(completed);
     }
 }
 
@@ -15399,14 +15435,7 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
     r |= has(signal_bits_contains(&SIGNAL_PENDING, tid), 1 << 0);
     r |= has(signal_bits_contains(&SIGNAL_MASK, tid), 1 << 1);
     r |= has(task_map_get(&SIGACTION_TABLE, tid).is_some(), 1 << 2);
-    r |= has(
-        SIGNAL_WAKERS[signal_waker_shard(tid)]
-            .values
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
-        1 << 3,
-    );
+    r |= has(dbg_has_signal_waker(tid), 1 << 3);
     r |= has(
         IO_WAKERS[io_waker_shard(tid)]
             .lock()

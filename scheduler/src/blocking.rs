@@ -71,7 +71,7 @@ unsafe fn wake_ref(data: *const ()) {
     mark_possible(home as usize);
     // Placement may already have kicked home before this metadata was
     // published. Publish another normal kick so its request is visible.
-    crate::resched_remote(home);
+    crate::notify_wake_cpu(home);
 }
 
 unsafe fn clone_raw(data: *const ()) -> RawWaker {

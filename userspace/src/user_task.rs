@@ -73,6 +73,25 @@ pub const SYSCALL_RESTART_NOINTR: u32 = 1;
 /// restarted (through `restart_block`) only when no handler runs.
 pub const SYSCALL_RESTART_RESTARTBLOCK: u32 = 2;
 
+/// Linux's initial `timer_slack_ns` (50 µs, `init_task`).
+pub const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
+
+/// `schedule_hrtimeout_range`: arm (or re-arm) a park's hrtimer sleeper for
+/// absolute monotonic `expires_ns` with `slack_ns` range. The sleeper is
+/// queued on the calling CPU's base and wakes `waker` by reference at expiry.
+fn arm_park_timer(
+    handle: &mut Option<narf_scheduler::narf_time::hrtimer::SleepHandle>,
+    expires_ns: u64,
+    slack_ns: u64,
+    waker: &core::task::Waker,
+) {
+    use narf_scheduler::narf_time::hrtimer::{HrtimerMode, SleepHandle};
+    match handle.as_ref() {
+        Some(h) => h.start(expires_ns, slack_ns, HrtimerMode::ABS, waker),
+        None => *handle = Some(SleepHandle::arm(expires_ns, slack_ns, waker)),
+    }
+}
+
 /// Per-task context the polling routine installs in
 /// [`current_user_task`] before transitioning to user mode. The
 /// trap handler picks up the pointer, populates `state` from the
@@ -104,6 +123,11 @@ pub struct UserTaskCtx {
     /// might briefly share visibility across cores — keeps the
     /// same shape.
     pub sleep_deadline_ns: AtomicU64,
+    /// `current->timer_slack_ns`: how far past a sleep/timeout deadline the
+    /// park's hrtimer may expire (`PR_SET_TIMERSLACK`). Inherited at fork.
+    pub timer_slack_ns: AtomicU64,
+    /// `current->default_timer_slack_ns`: what `PR_SET_TIMERSLACK(0)` restores.
+    pub default_timer_slack_ns: AtomicU64,
     /// Set true by `sys_epoll_wait`/`sys_poll` while parked so the
     /// poll routine registers this task's waker in the net-readiness
     /// table (`crate::handlers::register_io_waiter`). When inbound TCP
@@ -321,8 +345,8 @@ pub struct UserTaskCtx {
     /// Non-zero while this task is parked in a blocking `rt_sigtimedwait`:
     /// the userspace `sigset_t` it is waiting on (bit N-1 = signal N — the
     /// same layout as `SIGNAL_PENDING`). Routes the park to the signal
-    /// waker registry exactly like `flock_key` routes to the flock waiter
-    /// queue: `park_should_block` registers the task in `SIGNAL_WAKERS`
+    /// waker exactly like `flock_key` routes to the flock waiter
+    /// queue: `park_should_block` installs the task's precise signal waker
     /// (so `wake_signal` from any raise path fires it promptly) and breaks
     /// the park when `handlers::sigwait_should_wake` reports a signal in
     /// the set pending (mask ignored — sigwait consumes blocked signals,
@@ -464,6 +488,13 @@ pub struct UserTaskCtx {
     /// (`try_to_wake_up`). Keeping the executor waker beside the task gives
     /// NARF the same durable fallback without scanning run queues.
     scheduler_waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Precise interruptible-wait handle; reused across parks without a
+    /// task-id-indexed allocation. A signal takes it before invoking it.
+    pub(crate) signal_waker: narf_lib::sync::IrqSafeSpinLock<Option<core::task::Waker>>,
+    /// Single-word futex storage. Reuse requires unique Arc ownership, so a
+    /// delayed dequeued waker can never observe a new wait in the old record.
+    pub(crate) futex_wait_cache:
+        narf_lib::sync::IrqSafeSpinLock<Option<alloc::sync::Arc<crate::handlers::FutexQ>>>,
     /// `restart_block` of a timed FUTEX_WAIT interrupted by a signal: the
     /// word it waited on and its ABSOLUTE monotonic deadline. Linux restarts
     /// such a wait through `futex_wait_restart` with the stored expiry, so
@@ -773,6 +804,12 @@ impl UserTaskCtx {
         }
     }
 
+    /// This task's timer slack in ns (`current->timer_slack_ns`).
+    #[inline]
+    pub fn timer_slack(&self) -> u64 {
+        self.timer_slack_ns.load(Ordering::Relaxed)
+    }
+
     /// Construct a fresh context with all state zeroed.
     pub fn new() -> Self {
         Self {
@@ -780,6 +817,8 @@ impl UserTaskCtx {
             arch_jmp_buf: UnsafeCell::new([0; 8]),
             exit_reason: UnsafeCell::new(0),
             sleep_deadline_ns: AtomicU64::new(0),
+            timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
+            default_timer_slack_ns: AtomicU64::new(DEFAULT_TIMER_SLACK_NS),
             net_io_wait: AtomicBool::new(false),
             durable_io_wait: AtomicBool::new(false),
             sem_wait_pending: AtomicBool::new(false),
@@ -827,6 +866,8 @@ impl UserTaskCtx {
             syscall_parked_restarting: AtomicBool::new(false),
             syscall_restart_kind: AtomicU32::new(SYSCALL_RESTART_SYS),
             scheduler_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            signal_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            futex_wait_cache: narf_lib::sync::IrqSafeSpinLock::new(None),
             futex_restart_uaddr: AtomicU64::new(0),
             futex_restart_deadline_ns: AtomicU64::new(0),
             nanosleep_restart_req: AtomicU64::new(0),
@@ -1229,7 +1270,7 @@ fn park_while_stopped(waker: &core::task::Waker) -> bool {
 fn park_should_block(
     uc: &UserTaskCtx,
     waker: &core::task::Waker,
-    sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+    sleep_handle: &mut Option<narf_scheduler::narf_time::hrtimer::SleepHandle>,
 ) -> bool {
     let task_id = crate::handlers::current_task_id();
     // Watchdog liveness signal: this task's park loop ran (see
@@ -1377,7 +1418,7 @@ fn park_should_block(
         // busy-spin on a bit nobody clears.
         let signal_pending = crate::handlers::has_interrupting_signal(task_id);
         if now < deadline && !signal_pending {
-            // rt_sigtimedwait park: register in SIGNAL_WAKERS FIRST (every
+            // rt_sigtimedwait park: register the signal waker FIRST (every
             // raise path calls `wake_signal`, which fires this entry), THEN
             // re-check the wake condition — a signal raised in the
             // check→register window is caught by the re-check, a later one
@@ -1400,7 +1441,7 @@ fn park_should_block(
                 // release the sticky waiter reservation so signals it was
                 // waiting on resume normal handler delivery.
                 uc.sigwait_reserve.store(0, Ordering::Release);
-                // Signal-interruptible park: register in SIGNAL_WAKERS FIRST
+                // Signal-interruptible park: register the signal waker FIRST
                 // (every raise path — kill, itimer expiry, child exit — fires
                 // this entry via `wake_signal`), THEN re-check the pending
                 // set. A signal raised in the gate-check→register window is
@@ -1594,55 +1635,11 @@ fn park_should_block(
                 }
                 return true;
             }
-            let fire_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
-            // `refresh_waker_at`, NOT `refresh_waker`: the handle can outlive
-            // an earlier park with a DIFFERENT deadline (a futex park broken
-            // by its gen guard re-parks through here with a fresh deadline);
-            // refreshing only the waker would leave the slot pinned to the
-            // stale fire time and this park's backstop never fires.
-            let refreshed = sleep_handle.is_some_and(|h| {
-                narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
-                    h,
-                    fire_cycles,
-                    waker.clone(),
-                )
-            });
-            if !refreshed {
-                match narf_scheduler::narf_time::timer_wheel::register(fire_cycles, waker.clone()) {
-                    Ok(h) => *sleep_handle = Some(h),
-                    Err(_) => {
-                        // Timer wheel saturated (single global 1024-slot wheel): we
-                        // could NOT arm the lost-wake fallback timer. Blocking now
-                        // would rely SOLELY on the io/futex/signal waker; if that
-                        // wake then raced the idle-halt Dekker fence, the task
-                        // could strand with no fallback re-poll. This asymmetry
-                        // (own-stack park blocked anyway; `UserTaskFuture::poll`
-                        // ALREADY self-wakes on this exact failure) is a residual
-                        // permanent-wedge window that survives the futex seqlock
-                        // fix — the wheel saturates far more readily under SMP
-                        // (per-CPU idle-arming + concurrent parks contend one
-                        // global wheel). Mirror the poll path: DON'T block —
-                        // return false so own_stack_park re-executes and busy-
-                        // rechecks the condition, retrying the wheel next round
-                        // (it frees as other sleepers fire). Bounded busy-poll
-                        // under transient pressure, never a permanent wedge.
-                        uc.sleep_deadline_ns.store(0, Ordering::Release);
-                        // Clear the flock/sigwait routing too — this exit
-                        // skips the proceed-branch cleanup below, and a stale
-                        // key would make the task's NEXT unrelated park
-                        // register on the wrong waiter queue.
-                        uc.flock_key.store(0, Ordering::Release);
-                        uc.sigwait_set.store(0, Ordering::Release);
-                        if uc.net_io_wait.load(Ordering::Acquire) {
-                            #[cfg(feature = "syscall-trace")]
-                            crate::syscall::syscall_trace_account_park(
-                                crate::syscall::SyscallTraceParkEvent::TimerFull,
-                            );
-                        }
-                        return false;
-                    }
-                }
-            }
+            // `schedule_hrtimeout_range(deadline, current->timer_slack_ns)`:
+            // (re)arm this park's hrtimer sleeper on this CPU's base. Re-arming
+            // the same sleeper on every park keeps its expiry current (a futex
+            // park broken by its gen guard re-parks here with a new deadline).
+            arm_park_timer(sleep_handle, fire_ns, uc.timer_slack(), waker);
             if uc.net_io_wait.load(Ordering::Acquire) {
                 #[cfg(feature = "syscall-trace")]
                 crate::syscall::syscall_trace_account_park(
@@ -1684,7 +1681,7 @@ fn park_should_block(
         // parks again (timeout expiry is detected via blocking_deadline_ns).
         uc.sigwait_set.store(0, Ordering::Release);
         if let Some(h) = sleep_handle.take() {
-            narf_scheduler::narf_time::timer_wheel::cancel(h);
+            drop(h);
         }
         return false;
     }
@@ -1722,17 +1719,12 @@ fn park_should_block(
         // `* cycles_per_ns()` — see the deadline-park note above.
         const BYTE_WAKER_FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
         let now = narf_scheduler::narf_time::monotonic_ns();
-        let fire =
-            narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(BYTE_WAKER_FALLBACK_NS));
-        // `refresh_waker_at` — keep the slot's deadline current across
-        // repeated parks through one handle (see the deadline-park note).
-        let refreshed = sleep_handle.is_some_and(|h| {
-            narf_scheduler::narf_time::timer_wheel::refresh_waker_at(h, fire, waker.clone())
-        });
-        if !refreshed {
-            *sleep_handle =
-                narf_scheduler::narf_time::timer_wheel::register(fire, waker.clone()).ok();
-        }
+        arm_park_timer(
+            sleep_handle,
+            now.saturating_add(BYTE_WAKER_FALLBACK_NS),
+            uc.timer_slack(),
+            waker,
+        );
         return true;
     }
 
@@ -1749,7 +1741,7 @@ fn park_should_block(
 pub fn __test_park_should_block(
     uc: &UserTaskCtx,
     waker: &core::task::Waker,
-    sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+    sleep_handle: &mut Option<narf_scheduler::narf_time::hrtimer::SleepHandle>,
 ) -> bool {
     park_should_block(uc, waker, sleep_handle)
 }
@@ -1759,7 +1751,16 @@ pub fn __test_park_should_block(
 /// syscall handler that rewound RIP) so the sysret tail re-executes the syscall.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn own_stack_park() {
-    let mut sleep_handle: Option<narf_scheduler::narf_time::timer_wheel::SleepHandle> = None;
+    own_stack_park_until(|| false);
+}
+
+/// A handler-owned completion is checked on each park iteration. A completion
+/// racing this check still sets the scheduler's durable awake bit, so a yield
+/// returns here to observe it. Only the sleeper clears its own deadline; a
+/// delayed futex waker cannot clear a subsequent wait's state.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn own_stack_park_until(completed: impl Fn() -> bool) {
+    let mut sleep_handle: Option<narf_scheduler::narf_time::hrtimer::SleepHandle> = None;
     loop {
         let waker = match narf_scheduler::stackful::current_stackful_waker() {
             Some(w) => w,
@@ -1772,9 +1773,13 @@ pub fn own_stack_park() {
         // SAFETY: the in-flight task's poller-pinned UserTaskCtx; single-CPU
         // cooperative execution means no concurrent &mut to these fields.
         let uc = unsafe { &*uctx };
+        if completed() {
+            uc.sleep_deadline_ns.store(0, Ordering::Release);
+            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
+        }
         if !park_should_block(uc, &waker, &mut sleep_handle) {
             if let Some(h) = sleep_handle.take() {
-                narf_scheduler::narf_time::timer_wheel::cancel(h);
+                drop(h);
             }
             break;
         }
@@ -1824,7 +1829,7 @@ pub fn own_stack_park() {
             uc.net_io_wait.store(false, Ordering::Release);
             uc.durable_io_wait.store(false, Ordering::Release);
             if let Some(h) = sleep_handle.take() {
-                narf_scheduler::narf_time::timer_wheel::cancel(h);
+                drop(h);
             }
             break;
         }
@@ -2527,7 +2532,7 @@ pub struct UserTaskFuture {
     /// registers the slot once and refreshes it across spurious
     /// re-polls instead of self-waking every 1ms; the wheel fires the
     /// task's waker at the deadline. Cleared (cancelled) on wake.
-    sleep_handle: Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+    sleep_handle: Option<narf_scheduler::narf_time::hrtimer::SleepHandle>,
     /// This task's saved x87/SSE register file. `FXRSTOR`'d before
     /// every entry into user mode and `FXSAVE`'d on every trap-return,
     /// so the task's XMM/x87 state survives preemption + migration.
@@ -2762,8 +2767,8 @@ impl core::future::Future for UserTaskFuture {
                 crate::handlers::is_signal_pending(crate::handlers::current_task_id());
             if now < deadline && !signal_pending {
                 // rt_sigtimedwait park: same register-then-re-check shape as
-                // the own-stack `park_should_block` sigwait arm — register in
-                // SIGNAL_WAKERS (every raise path fires it via `wake_signal`)
+                // the own-stack `park_should_block` sigwait arm — register the
+                // signal waker (every raise path fires it via `wake_signal`)
                 // and break the park when a signal in the waited set (mask
                 // ignored) or any deliverable signal is pending; the rewound
                 // syscall re-executes and consumes / returns -EINTR.
@@ -2782,7 +2787,7 @@ impl core::future::Future for UserTaskFuture {
                     // Non-sigwait park — release the sticky waiter
                     // reservation (see `UserTaskCtx::sigwait_reserve`).
                     this.task.uctx.sigwait_reserve.store(0, Ordering::Release);
-                    // Signal-interruptible park: register in SIGNAL_WAKERS
+                    // Signal-interruptible park: register the signal waker
                     // FIRST (every raise path fires it via `wake_signal`),
                     // then RE-CHECK pending — closes the check→register
                     // window; see the own-stack `park_should_block` twin.
@@ -2792,7 +2797,7 @@ impl core::future::Future for UserTaskFuture {
                         crate::handlers::drop_signal_waker(tid);
                         this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
                         if let Some(h) = this.sleep_handle.take() {
-                            narf_scheduler::narf_time::timer_wheel::cancel(h);
+                            drop(h);
                         }
                         cx.waker().wake_by_ref();
                         return core::task::Poll::Pending;
@@ -2962,27 +2967,12 @@ impl core::future::Future for UserTaskFuture {
                 // fires a durable wake that normally revives us long before the
                 // timeout, and the check→register race is closed above.
                 let fire_ns = deadline;
-                let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
-                // `refresh_waker_at` — see the infinite-park note above.
-                let refreshed = this.sleep_handle.is_some_and(|h| {
-                    narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
-                        h,
-                        deadline_cycles,
-                        cx.waker().clone(),
-                    )
-                });
-                if !refreshed {
-                    this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
-                        deadline_cycles,
-                        cx.waker().clone(),
-                    )
-                    .ok();
-                    if this.sleep_handle.is_none() {
-                        // Wheel full or no arm callback: fall
-                        // back to a self-wake so the task still makes
-                        // progress (degraded, never wedged).
-                        cx.waker().wake_by_ref();
-                    }
+                let slack = this.task.uctx.timer_slack();
+                arm_park_timer(&mut this.sleep_handle, fire_ns, slack, cx.waker());
+                if !narf_scheduler::narf_time::hrtimer::arm_callback_installed() {
+                    // No clockevent programmer: self-wake so the task still
+                    // makes progress (degraded, never wedged).
+                    cx.waker().wake_by_ref();
                 }
                 return core::task::Poll::Pending;
             }
@@ -3017,7 +3007,7 @@ impl core::future::Future for UserTaskFuture {
             this.task.uctx.futex_namespace.store(0, Ordering::Release);
             this.task.uctx.sigwait_set.store(0, Ordering::Release);
             if let Some(h) = this.sleep_handle.take() {
-                narf_scheduler::narf_time::timer_wheel::cancel(h);
+                drop(h);
             }
         }
 

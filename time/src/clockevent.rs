@@ -293,16 +293,11 @@ pub fn primary() -> Option<&'static dyn ClockEvent> {
 /// dispatch lock NOT held; safe to call from any IRQ handler.
 #[inline]
 pub fn on_tick() {
-    let now = crate::now_cycles();
-    // Fire due wheel timers immediately on the tick — latency-sensitive
-    // workloads (redis epoll/network timeouts) need prompt timer wakes, not a
-    // deferred-queue hop. `fire_due` is now O(1) stack (drains one waker at a
-    // time, no ~1 KiB on-stack array), so it is safe to call from this
-    // IRQ-context tick even when it runs on a user task's own kernel stack (the
-    // per-task-own-stack model). The IRQ-only Arc-drop-in-trap concern is moot
-    // in practice: the wheel waker is never the last Arc ref (the task's slot
-    // owns one) outside the rare exited-task case.
-    let _ = crate::timer_wheel::fire_due(now);
+    // A shared (global) clockevent has no per-CPU deadline, so its tick is
+    // the broadcast expiry for every CPU's hrtimer base (Linux
+    // `tick_handle_periodic_broadcast`). Only bases with a due event are
+    // locked; expiry callbacks never free or allocate.
+    let _ = crate::hrtimer::hrtimer_run_all_bases();
     // NTP discipline: once per wall second. `monotonic_ns()` is atomics +
     // a cycle read, safe in IRQ context; `tick_second()` is one spinlock
     // plus atomics. Before any sample was applied the boot state has

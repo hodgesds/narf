@@ -134,6 +134,13 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
+    // futex_requeue validates both signed counts before resolving either key.
+    if matches!(cmd, FUTEX_REQUEUE | FUTEX_CMP_REQUEUE)
+        && ((val as i32) < 0 || (args.arg3 as i32) < 0)
+    {
+        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
     // `get_futex_key()`: "The futex address must be naturally aligned" —
     // `if (unlikely((address % size) != 0)) return -EINVAL;`, and only
     // then `if (!access_ok(...)) return -EFAULT;`. So a misaligned word is
@@ -224,26 +231,19 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // contract). A waiter not yet registered when we fire is caught
             // by the gen guard on its next poll.
             futex_bump_counter_key(key);
-            let woken = futex_wake_waiters_key_bitset(key, val, bitset);
+            // Classic futex has no FLAGS_STRICT zero-count shortcut. Linux
+            // tests ++ret >= (int)nr_wake after removing a matching waiter,
+            // so zero and negative signed counts both wake at most one.
+            let want = classic_futex_wake_count(val);
+            let woken = futex_wake_waiters_key_bitset(key, want, bitset);
             ctx.set_return(SyscallReturn::ok(woken as u64));
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             // futex(uaddr, REQUEUE, nr_wake, nr_requeue, uaddr2[, val3]):
             // wake up to `val` waiters on uaddr, move up to `arg3` more
             // onto uaddr2. CMP_REQUEUE first requires `*uaddr == val3`
-            // (-EAGAIN otherwise; Linux futex(2)). Linux returns the count
-            // WOKEN for REQUEUE, woken + requeued for CMP_REQUEUE.
-            //
-            // `futex_requeue()` order: the two counts, then key1, then
-            // key2, then the compare. Both counts are `int`, and a
-            // negative one is -EINVAL up front — a caller that passed
-            // INT_MAX+1 through an `unsigned` variable must learn that the
-            // request was malformed, not watch it silently wake everybody.
+            // (-EAGAIN otherwise; Linux futex(2)). Both return woken + moved.
             let uaddr2 = args.arg4;
-            if (args.arg2 as i32) < 0 || (args.arg3 as i32) < 0 {
-                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-                return;
-            }
             // `uaddr` came through the funnel above; the SECOND word needs
             // the same treatment, and gets it from the same function rather
             // than a hand-written pair of checks.
@@ -279,12 +279,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             let new_val = futex_read_user_word(uaddr2).unwrap_or(0);
             let (woken, moved) =
                 futex_requeue_waiters_keyed(key, key2, uaddr2, val, args.arg3 as u32, new_val);
-            let r = if op == FUTEX_CMP_REQUEUE {
-                woken + moved
-            } else {
-                woken
-            };
-            ctx.set_return(SyscallReturn::ok(r as u64));
+            ctx.set_return(SyscallReturn::ok((woken + moved) as u64));
         }
         FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => {
             futex_lock_pi(ctx, uaddr, key, deadline, op == FUTEX_TRYLOCK_PI)

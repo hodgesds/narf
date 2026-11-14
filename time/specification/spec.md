@@ -114,15 +114,63 @@ pub fn timer_cancel(t: Timer);
 pub fn next_deadline() -> Option<Instant>;
 ```
 
-- `sleep*` return the `SleepUntil` future (timer wheel; self-wake
-  fallback when no arm callback is installed). Wall-time helpers convert
+- `sleep*` return the `SleepUntil` future (an hrtimer sleeper, §3.2.1;
+  self-wake fallback when no clockevent programmer is installed). Wall-time
+  helpers convert
   through the calibrated ns→cycles scale, which is 1 cycle/ns until
   calibration; callers needing hardware-specified delays before frame's
   calibration must call `calibrate_clocks()` first. A literal cycle count
   passed to `sleep_cycles` is a different duration on every CPU.
 - hrtimer-grade precision (≤ 1 µs jitter target on a quiet CPU).
-- Timer wheel for bulk coarse-grained waits when the caller passes a
-  `TimerHint::Coarse` flag — amortises priority-queue cost.
+- Timer wheel (`timer_list`) for bulk coarse-grained kernel timeouts —
+  Stage 5 B, not yet present; every current sleep and timeout is an hrtimer.
+
+### 3.2.1 hrtimers (`narf_time::hrtimer`, Linux `kernel/time/hrtimer.c`)
+
+| Linux | NARF |
+| --- | --- |
+| `struct hrtimer_cpu_base` (per CPU) | `HrTimerCpuBase`, allocated per CPU at bring-up (`hrtimers_prepare_cpu`); a static array holds only pointers |
+| `HRTIMER_MAX_CLOCK_BASES` = MONOTONIC, REALTIME, BOOTTIME, TAI + `_SOFT` | same eight clock bases; REALTIME/TAI expiries convert through the wall (+TAI) offset, BOOTTIME = MONOTONIC (no suspend offset yet) |
+| `struct timerqueue_head` (rbtree, leftmost cached) | `timerqueue::TimerQueueHead`: intrusive red-black tree, earliest cached; FIFO on equal expiry |
+| `struct hrtimer`, `hrtimer_setup` | `HrTimer::new(fn, clock, mode)` — caller-owned storage, intrusive node |
+| `hrtimer_start_range_ns`, `_softexpires` / `expires` | `hrtimer_start_range_ns(timer, tim, delta, mode)`; expiry runs at `softexpires`, the clockevent is programmed for `expires` |
+| `switch_hrtimer_base` | an unpinned (re)start moves the timer to the calling CPU's base, except while its callback runs |
+| `hrtimer_try_to_cancel` / `hrtimer_cancel` | same (1 / 0 / -1; cancel waits out a running callback) |
+| `hrtimer_forward`, `hrtimer_get_remaining`, `hrtimer_active` | `HrTimer::forward`, `hrtimer_get_remaining`, `HrTimer::is_active` |
+| `hrtimer_interrupt` (hard expiry, re-program) | `hrtimer_interrupt()` from each CPU's own timer interrupt; returns the next event for the arch code to program |
+| `HRTIMER_SOFTIRQ` (`_SOFT` bases) | `hrtimer_run_softirq()` from the executor loop (raised by the hard interrupt) |
+| `hrtimer_run_queues` (low-res tick) | `hrtimer_run_queues()` from periodic-only clockevents (LAPIC InitialCount) |
+| `tick_program_event` | the arch arm callback (`set_arm_callback`): LAPIC TSC-deadline, aarch64 `CNTP_TVAL` |
+| `hrtimer_reprogram` / `retrigger_next_event` / `trigger_dyntick_cpu` | local earlier event: program at once; remote earlier event: publish under the remote base lock, then one reschedule IPI whose handler re-programs (`retrigger_next_event`) |
+| `tick_handle_periodic_broadcast` (global clockevent) | `hrtimer_run_all_bases()` from HPET / shared clockevent ticks |
+| `hrtimer_get_next_event` (nohz) | `next_event_cycles_local()` (lock-free, IRQ-safe) |
+| `hrtimers_cpu_dying` | `hrtimers_cpu_dying(cpu)`: moves every queued timer to the calling CPU |
+| `struct hrtimer_sleeper`, `hrtimer_wakeup`, `schedule_hrtimeout_range` | `SleepHandle` (`arm`, `start`, `refresh_waker`, drop = cancel); expiry wakes by reference |
+| `clock_was_set` | `clock_was_set()` re-evaluates every base; called by every wall-clock step (`clock_settime`, `settimeofday`, `ADJ_SETOFFSET`, an NTP step), not by slews |
+| `current->timer_slack_ns`, `PR_SET_TIMERSLACK` | `UserTaskCtx::timer_slack_ns` (`userspace/`), used as the range of every park timer (nanosleep, poll/select/epoll, futex) |
+
+Users today: `SleepUntil` (every kernel `sleep*`), the user-task park timer
+behind nanosleep/clock_nanosleep, poll/ppoll/select/pselect/epoll_wait,
+futex and rt_sigtimedwait timeouts and the console byte-waker backstop, the
+scheduler's hrtick, and in `userspace/`: POSIX timers (`posix_timer_fn`, one
+hrtimer per timer on its clock's base), ITIMER_REAL (`it_real_fn`, one per
+task) and timerfd (`timerfd_tmrproc`, one per fd). Those three callbacks run
+in hard IRQ, take only IRQ-safe locks, raise their signal or readiness
+through alloc-free paths, and restart a periodic timer at its next expiry.
+ITIMER_VIRTUAL/PROF stay on the tick, as in Linux (`run_posix_cpu_timers`).
+
+Every CPU's local clockevent installs itself as the programmer when it
+starts (the x86 TSC-deadline LAPIC; the aarch64 generic timer). An executor
+round (`poll_one_round`, the run loop) is the softirq context: it expires the
+CPU's due soft timers and any hard timer whose interrupt was not taken (a CPU
+that runs with interrupts masked — the kernel-test runner — gets no timer
+interrupt). Code that waits for a timer while spinning with interrupts
+masked must run such a round; Linux never sleeps with interrupts off.
+
+A sleeper whose waker is a scheduler task waker (`set_hardirq_waker_predicate`)
+is queued on a hard base and woken from the timer interrupt with
+`wake_by_ref`; any other waker uses the `_SOFT` base and is woken from the
+executor.
 
 ### 3.3 Clocksource / Clockevent abstractions (for arch backends)
 
@@ -147,7 +195,7 @@ rating that's also monotonic. Record the decision for telemetry.
 `ClockEvent::set_idle_tick(stop_tick, budget_deadline) -> bool` replaces the
 current CPU's idle budget deadline and stops or restarts its periodic tick.
 Unsupported devices return false and retain periodic operation. Implementations
-preserve caller IRQ state and independent wheel deadlines. `register_local`
+preserve caller IRQ state and the CPU's own next hrtimer event. `register_local`
 publishes a static backend once per CPU; steady transitions read it without a
 registry lock. `clockevent::set_idle_tick` also enforces the boot nohz policy;
 `restart_local_tick` restores preemption before runnable task dispatch.
@@ -246,7 +294,25 @@ single-shot drain, and PPS.
 - `sleep_until(d)` wakes the Future at time ≥ `d`; never earlier.
   Latency budget documented per stage.
 - Timer callbacks run inside the caller's domain (arriving as a waker
-  on a Future), never in IRQ context.
+  on a Future). Hrtimer expiry callbacks run in hard-IRQ context (hard
+  bases) or executor context (`_SOFT`), never with a base lock held; they
+  must not allocate, free, block or cancel their own timer. Sleeper expiry
+  wakes by reference only, so no `Arc` is released in IRQ context: the
+  `Waker` is dropped by the sleeper's owner, in task context.
+- Each CPU's timer interrupt expires only its own base and its clockevent
+  carries only its own next event: a CPU that is stuck (interrupts masked,
+  or never returning to its executor) delays only timers queued on it. No
+  global lock or counter is on the enqueue/expire path; nothing on it has a
+  capacity limit (intrusive nodes).
+- No lost re-arm: an enqueue that becomes a base's earliest event either
+  programs the local clockevent before returning, or (remote base) is
+  published under that base's lock before an unconditional reschedule IPI
+  whose handler re-programs from the base. A CPU entering tickless idle
+  reads its next event after disabling interrupts, so it either sees the
+  new event or takes the IPI after halting.
+- Lock order: one CPU-base lock at a time (migration releases the old base
+  before taking the new, with the timer marked migrating in between); a
+  sleeper's waker lock is taken with no base lock held.
 - Wall-clock jumps (NTP step) never leak into monotonic time.
 - Frequency changes from `arch/` (CPU DVFS) are invisible through
   this interface — the clocksource frequency is either invariant
@@ -260,10 +326,11 @@ single-shot drain, and PPS.
   for ordering. Fallback: HPET, then PM timer.
 - **Clockevent:** TSC-deadline (`CPUID.01H:ECX[24]`); fallback to
   LAPIC timer in one-shot mode.
-- A successfully probed, reliable TSC-deadline clockevent exclusively owns
-  timer-wheel deadline delivery. HPET is not armed for the same deadline;
-  it remains the fallback when LAPIC selection fails or only the unreliable
-  legacy InitialCount mode is available.
+- Every CPU's LAPIC TSC-deadline one-shot carries `min(periodic tick,
+  budget deadline, its own next hrtimer event)`. HPET is not armed for the
+  same events; it remains the fallback (programmed for the earliest event
+  of any base, expiring every base) when LAPIC selection fails or only the
+  unreliable legacy InitialCount mode is available.
 - **Boot calibration:** TSC ↔ PM timer or HPET cross-check to get
   frequency; CPUID leaf `0x15` on supported silicon.
 - **SMP sync:** TSC is architecturally synchronised across cores on
@@ -272,8 +339,10 @@ single-shot drain, and PPS.
 ### aarch64
 - **Clocksource:** Arm Generic Timer (`CNTPCT_EL0`), frequency from
   `CNTFRQ_EL0`.
-- **Clockevent:** physical timer compare register
-  (`CNTP_CVAL_EL0` + `CNTP_CTL_EL0`), per-CPU IRQ.
+- **Clockevent:** physical timer (`CNTP_TVAL_EL0` + `CNTP_CTL_EL0`),
+  per-CPU IRQ. Periodic; each tick runs `hrtimer_interrupt` and re-arms for
+  `min(period, next hrtimer event)`, and an earlier enqueue pulls it in.
+  No tickless idle yet, so remote enqueues need no IPI.
 - **SMP sync:** Generic Timer is architecturally coherent across
   PE's in the same domain; no cross-CPU offset needed in practice.
 

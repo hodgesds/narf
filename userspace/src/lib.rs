@@ -51,6 +51,7 @@ pub mod ephemeral_port;
 pub mod epoll;
 pub mod errno;
 pub mod fd;
+pub mod futex_policy;
 pub mod handlers;
 pub mod hwcap;
 pub mod init;

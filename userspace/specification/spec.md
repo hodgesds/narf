@@ -1303,6 +1303,71 @@ Private futex wait queues are keyed by `(address-space identity, user address)`;
 virtual address cannot consume one another's `FUTEX_WAKE_PRIVATE` events.
 Classic `FUTEX_WAIT` returns `EAGAIN` when the user word no longer equals the
 expected value; a stale wait is never reported as a successful wake.
+Classic `FUTEX_WAKE` and `FUTEX_WAKE_BITSET` interpret the low 32 count bits as
+signed and, like Linux's dequeue-before-limit check, wake at most one matching
+waiter when that count is zero or negative. The separate futex2 `futex_wake`
+syscall keeps its strict zero-count no-op after address and mask validation;
+a negative count still selects at most one matching waiter.
+By default, matching waiters are selected in FIFO registration order, independent of task
+IDs. Refreshing a queued waker keeps its position; cancellation unlinks that
+registration, and a new registration joins the tail. Bitset filtering preserves
+the order of skipped waiters. Each hash bucket owns a FIFO list in a reusable
+slot arena, without per-key or per-task waiter trees. Links are direct slot
+indexes. Enqueue is amortized O(1), and removing a known handler-driven waiter
+is O(1); wake selection scans matching keys and bitsets within one bucket.
+Legacy park-loop registration/refresh searches that bucket by task identity.
+Requeue merges a duplicate legacy registration for the same task/key in place.
+Generation-checked handles prevent stale cancellation from removing a reused
+slot. A requeue updates the saved key and handle under both bucket locks;
+unqueue revalidates that location after locking. Cross-bucket movers append in
+source order; same-bucket movers keep their positions, matching Linux. The
+single-word wait stores its location inline; vector waits allocate a location
+array. Bucket arenas retain their high-water capacity for reuse. RT-priority
+ordering and PI boosting remain separate Linux compatibility gaps.
+
+`narf_userspace::futex_policy::FutexWakePolicy` supplies an optional ordinary
+wake ordering: `name() -> &'static str` and
+`rank(FutexWaiterInfo { task_id, wait_index }) -> i64`. Higher ranks are selected
+first, with FIFO ties. IDs are kernel task IDs; `wait_index` is `None` for a
+legacy park registration and the zero-based wait-vector index otherwise.
+Ranking runs only on exact-key, bitset-eligible registrations under the bucket
+lock, with IRQs disabled. Implementations must be bounded, allocation-free and
+nonblocking; they must not enter scheduler, futex, or configuration operations.
+Policies may read their own immutable/atomic metadata. Cross-CPU raw virtual
+runtime is not a comparable rank; a lag policy needs normalized scheduler
+metadata. This interface does not implement PI or RT-priority parity.
+
+`register_policy(&Cap<SchedPolicy, Grant>, impl FutexWakePolicy)` registers a
+kernel implementation; `select_policy(&Cap<SchedPolicy, Grant>, name)` selects
+one at runtime. Both validate the capability through `invoke`. Names are unique
+1–32 character lowercase ASCII letters/digits/underscores/hyphens; `fifo` is
+reserved for the built-in default. Registrations persist for the kernel lifetime.
+No custom policy is registered by default. `current_policy_name()` reports the
+selected name. Userspace reads/writes `/proc/sys/kernel/futex_wake_policy` (0644)
+and reads `/proc/sys/kernel/futex_wake_policies` (0444) to list registered names.
+Writes require `CAP_SYS_NICE` in the initial user namespace, including writes
+through an already-open file. Unknown names return `EINVAL` without changing
+the active policy. Userspace selects kernel implementations, not executable code.
+
+Configuration writers serialize a rolling publication across bucket locks.
+Each locked dequeue batch sees one stable policy; after selection returns all
+buckets have the replacement. Wakers already dequeued may be delivered later.
+No queued entry, cancellation handle, or FIFO position is changed by selection.
+The wake portions of requeue and WAKE_OP use the policy; requeue movement keeps
+FIFO source order and the existing same-bucket position/destination-tail rules.
+Each WAKE_OP key is a separate dequeue batch. The default path adds no registry
+lookup, policy lock, allocation or Arc clone to wake/enqueue. Custom single-wake
+scans the eligible registrations without allocation; custom multi-wake ranks
+each once, sorts O(m log m) with O(m) temporary storage, and removes the selected
+handles under the same lock. The core retains matching, cancellation, generation
+checks and delivery after unlocking under every policy.
+
+`FUTEX_WAKE_OP` applies the same signed count rule independently to each wake
+queue. Its comparison codes are Linux's EQ, NE, LT, LE, GT, GE over the signed
+pre-operation value. An unknown comparison returns `ENOSYS` after the atomic
+word update but before waking either queue. `FUTEX_REQUEUE` and
+`FUTEX_CMP_REQUEUE` return the sum of woken and moved waiters and reject negative
+counts before resolving either address.
 The read-to-queue lost-wakeup guard uses one permanent atomic generation per
 hash bucket, occupying a fixed 4 KiB across all 64 buckets. Sampling and
 bumping a generation are O(1), allocation-free operations; no per-address
@@ -1318,6 +1383,21 @@ direct-handoff path without losing its exact parked owner; remote wakes retain
 ordinary placement. The helper does not change futex-key matching, successful
 wait completion, or generation ordering. Multi-wakes and exit-path spread
 wakes keep their ordinary fan-out behavior.
+Handler-driven waits publish an explicit completion under the bucket lock
+after wake removal and before scheduler notification. An acquire observation
+lets a successful unqueue avoid both the location and bucket locks. Requeue
+and cancellation do not publish completion. The sleeper checks its own wait
+record on every park iteration and clears its own deadline; wake delivery
+does not resolve a task ID or write another syscall's park state. A delayed
+notification retains the scheduler's ordinary spurious-wake semantics. Vector
+waits retain per-entry completion and the highest completed-index result.
+Single-word wait storage is cached in the task. It is reset only with unique
+Arc ownership; detached wake notifications retain their old record and force
+a fresh allocation if they overlap the next wait. Interruptible parks retain
+their precise signal waker in the task as well, avoiding a per-park map entry.
+Signal delivery consumes that handle and falls back to the task-lifetime
+scheduler handle between registrations. Callers without a registered task
+retain the signal registry fallback.
 
 Linux NUMA compatibility reports live topology rather than a structural
 single-node stub: `getcpu(2)` returns the current logical CPU and its

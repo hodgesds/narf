@@ -610,11 +610,11 @@ mod stall_wd {
         // SMP strand (finite futex park deaf to the parent's SIGALRM).
         let now_ns = narf_scheduler::narf_time::monotonic_ns();
         let now_cyc = narf_scheduler::narf_time::now_cycles();
-        let nd = narf_scheduler::narf_time::timer_wheel::next_deadline_cycles();
+        let nd = narf_scheduler::narf_time::hrtimer::next_event_cycles_any();
         let _ = writeln!(
             TrapWriter,
             "STALL-WD wheel: occ={} next={:?} now_cyc={now_cyc} now_ns={now_ns}",
-            narf_scheduler::narf_time::timer_wheel::occupied(),
+            narf_scheduler::narf_time::hrtimer::nr_queued_all(),
             nd
         );
         // Perf state: a leaked live event keeps `drain_irq_samples` scanning on
@@ -1152,6 +1152,25 @@ extern "C" fn irq_dispatch_body(frame: *mut TrapFrame) {
 ///     does not return.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
+    dispatch_trap(frame);
+    if scheduler_user_return_allowed(frame.cs, frame.vector) {
+        if frame.vector == 128 {
+            // SAFETY: the int80 handler has completed on the task stack.
+            unsafe { narf_scheduler::stackful::maybe_resched_syscall_exit() };
+        }
+        // SAFETY: dispatch dropped IRQ guards and returned to the task stack;
+        // common_trap keeps IRQs masked until its atomic return to user mode.
+        unsafe { narf_scheduler::stackful::finish_user_return() };
+    }
+}
+
+/// IST continuations must return on their exception stack without scheduling.
+/// In particular, NMI handling is not an ordinary interrupt-exit boundary.
+const fn scheduler_user_return_allowed(cs: u64, vector: u64) -> bool {
+    cs & 3 == 3 && !matches!(vector, 2 | 8 | 18 | 29)
+}
+
+fn dispatch_trap(frame: &mut TrapFrame) {
     // Software-interrupt syscall gate. `int 0x80` arrives here; the
     // caller's registers have been saved into `frame` already.
     // Convention: rax = syscall number, rdi/rsi/rdx/r10/r8/r9 =
@@ -1264,7 +1283,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             #[cfg(feature = "perf-dump")]
             perf_dump::on_tick(frame.rip, frame.cs);
         }
-        // Note: we don't call timer_wheel::fire_due from this trap
+        // Note: hrtimer expiry happens in the clockevent handlers below
         // context. fire_due drops Wakers, which deallocate via the
         // global Sleepable allocator — that's a panic in IRQ
         // context (IF=0). The wheel is advanced by:
@@ -3575,4 +3594,26 @@ fn smoke_x86_64_sigreturn_restores_arithmetic_rflags() -> TestResult {
 kernel_test_in!(
     "frame/x86_64",
     smoke_x86_64_sigreturn_restores_arithmetic_rflags
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_scheduler_return_excludes_ist_exceptions() -> TestResult {
+    for vector in [2, 8, 18, 29] {
+        if scheduler_user_return_allowed(0x23, vector) {
+            return TestResult::Fail("IST exception allowed to suspend its shared stack");
+        }
+    }
+    for vector in [0, 7, 14, 32, 128, 0xf0] {
+        if !scheduler_user_return_allowed(0x23, vector)
+            || scheduler_user_return_allowed(0x08, vector)
+        {
+            return TestResult::Fail("ordinary user return or kernel continuation misclassified");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_scheduler_return_excludes_ist_exceptions
 );

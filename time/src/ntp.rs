@@ -693,6 +693,9 @@ pub fn apply_sample(
         ntp.time_offset = 0;
         ntp.time_reftime = now_sec;
         crate::wall::adjust_wall_offset_ns(offset_ns);
+        drop(ntp);
+        // A step (not a slew) moves REALTIME/TAI hrtimers (`clock_was_set`).
+        crate::hrtimer::clock_was_set();
         return DisciplineOutcome::Stepped(offset_ns);
     }
 

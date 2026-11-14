@@ -1620,7 +1620,7 @@ pub fn itimer_real_check_due_irq(task: u64, now: u64) -> bool {
 /// IRQ's stack — the *user task's own kernel stack* under the per-task-own-stack
 /// model — and that large IRQ-path frame deterministically smashed the timer
 /// handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn. Same
-/// hazard the timer-wheel drain documents (`timer_wheel::drain_due_to_deferred`):
+/// hazard the timer-wheel drain documents (hrtimer expiry wakes by reference only):
 /// no big on-stack buffer in IRQ context.
 pub fn itimer_real_take_one_due_irq(now: u64, after: Option<u64>) -> Option<u64> {
     use core::ops::Bound;

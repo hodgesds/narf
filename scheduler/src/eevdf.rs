@@ -1,36 +1,15 @@
-//! EEVDF-lite scheduler policy — NARF's default.
+//! Equal-weight EEVDF policy and shared fair wake-preemption decision.
 //!
-//! An equal-weight approximation of Linux's EEVDF fair class
-//! (`/usr/src/linux/kernel/sched/fair.c`). Uses the core-owned per-task
-//! `vruntime` and per-CPU `VFLOOR` (see
-//! `specification/scheduling-policies.md` §4-5), so this policy holds NO
-//! per-task state of its own — every decision is a pure function of the lean
-//! [`SchedRow`] projection plus the CPU's virtual-time floor. The hot paths
-//! (`pick_next` per dispatch, `wakeup_preempt` per wake) are single O(n) scans
-//! over `Copy` rows with no allocation and no `TaskMeta` materialisation.
-//!
-//! Key quantities (all TSC cycles), mirroring Linux:
-//! - `v_eff = max(vruntime, VFLOOR - BASE)` — effective virtual runtime with a
-//!   bounded sleeper credit: a long-parked task's negative lag is clamped to one
-//!   base slice (Linux `place_entity()`'s lag clamp), so it cannot preempt
-//!   everything forever.
-//! - `d_eff = v_eff + BASE` — the task's virtual deadline (Linux
-//!   `se->deadline = vruntime + slice`). With uniform slices, "min deadline"
-//!   picks equal "min `v_eff`".
-//! - The runner's protected `vdeadline = vruntime_at_dispatch + BASE` (Linux
-//!   `RUN_TO_PARITY` slice protection), published in `CurrentTask`.
-//!
-//! `wakeup_preempt` cedes iff the best runnable sibling outranks the runner's
-//! class, or (same class) its `d_eff` is strictly earlier than the runner's
-//! protected `vdeadline`. A just-slept, starved task has an early `d_eff` and
-//! preempts (fast futex wait/wake handoff); a balanced peer's `d_eff` is not
-//! earlier than the protected deadline, so the runner batches out its slice (no
-//! de-batch of pipe/msg/redis-pipeline throughput). One rule, both behaviours —
-//! no wall-clock threshold.
+//! Linux 7.0-rc3 `kernel/sched/fair.c` (`vruntime_eligible`, `__pick_eevdf`,
+//! `wakeup_preempt_fair`) checks current eligibility BEFORE slice protection.
+//! The Class policy shares that wake decision within its class/priority tier.
+//! NARF uses equal-weight runtime, uniform virtual request sizes, and its
+//! existing bounded sleeper credit. This is not Linux's weighted/group runqueue
+//! or its persistent per-entity request/deadline implementation.
 
 use crate::affinity::CpuId;
 use crate::budget::BudgetEligibility;
-use crate::policy::{CpuSchedContext, RunQueue, SchedRow, Scheduler, TaskHandle};
+use crate::policy::{CpuSchedContext, RunQueue, SchedRow, Scheduler, TaskHandle, WakePreemption};
 use crate::priority::SchedClass;
 use crate::EEVDF_BASE_SLICE;
 
@@ -88,33 +67,99 @@ fn better_pick(a: PickKey, b: PickKey) -> bool {
     a.prio < b.prio
 }
 
-/// The wake-preemption rule (Linux `check_preempt_wakeup_fair`), pulled out as a
-/// pure function: cede iff the wakee outranks the runner's class, or (same
-/// class) the wakee's `d_eff` is strictly earlier than the runner's CURRENT
-/// virtual runtime `runner_now` (= vruntime-at-dispatch + what it has run since).
-///
-/// Comparing against the runner's *growing* clock — not a fixed dispatch
-/// deadline — is what distinguishes the two workloads with ONE rule:
-/// - a deeply-starved sleeper (a futex parent parked across many waker slices)
-///   has `d_eff ≪ runner_now`, so it preempts immediately → fast wait/wake
-///   handoff;
-/// - a briefly-blocked peer (a pipe/msg reader) has `d_eff ≈ dispatch + BASE`,
-///   which exceeds `runner_now` until the runner has actually run ~a base slice,
-///   so the runner keeps batching (and if it blocks first, no forced switch at
-///   all) → no de-batch.
-///
-/// Strict `<` so an exactly-caught-up peer does not preempt.
-#[inline]
-pub(crate) fn eevdf_should_preempt(
-    runner_class: SchedClass,
-    runner_now: u64,
-    wakee_class: SchedClass,
-    wakee_d_eff: u64,
-) -> bool {
-    if wakee_class.rank() != runner_class.rank() {
-        return wakee_class.rank() > runner_class.rank();
+/// Equal-weight adaptation of Linux's eligibility-before-protection ordering.
+/// The runner is detached from RunQueue, so include its live runtime explicitly.
+/// Uniform request sizes make the minimum-vruntime peer the earliest deadline;
+/// collecting it and the exact runtime sum needs one allocation-free scan.
+/// All runtime comparisons use the same bounded-credit view as EEVDF picks.
+#[derive(Debug)]
+pub(crate) struct FairWake {
+    start: u64,
+    now: u64,
+    deadline: u64,
+    elapsed: u64,
+    floor: u64,
+    peer_sum: u128,
+    peers: u64,
+    first: u64,
+}
+
+impl FairWake {
+    pub(crate) fn new(ctx: &CpuSchedContext) -> Self {
+        let start = v_eff(ctx.current.vruntime, ctx.vfloor);
+        Self {
+            start,
+            now: start.saturating_add(ctx.elapsed),
+            deadline: start
+                .saturating_add(ctx.current.vdeadline.saturating_sub(ctx.current.vruntime)),
+            elapsed: ctx.elapsed,
+            floor: ctx.vfloor,
+            peer_sum: 0,
+            peers: 0,
+            first: u64::MAX,
+        }
     }
-    wakee_d_eff < runner_now
+
+    pub(crate) fn observe(&mut self, vruntime: u64) {
+        let v = v_eff(vruntime, self.floor);
+        self.peer_sum += u128::from(v);
+        self.peers += 1;
+        self.first = self.first.min(v);
+    }
+
+    pub(crate) fn decision(self) -> WakePreemption {
+        if self.peers == 0 {
+            return WakePreemption::KeepRunning;
+        }
+        let peers = u128::from(self.peers);
+        let now = u128::from(self.now);
+        let single = self.peers == 1;
+        // Linux vruntime_eligible(): compare sums, without a rounded average.
+        // current <= (sum(peers) + current)/(nr_peers + 1) reduces to this.
+        let ineligible = if single {
+            self.now > self.first
+        } else {
+            now * peers > self.peer_sum
+        };
+        if ineligible {
+            // __pick_eevdf drops an ineligible current before protect_slice().
+            // The earliest peer is necessarily eligible in this case.
+            return WakePreemption::Now;
+        }
+        let first_eligible = if single {
+            self.first <= self.now
+        } else {
+            u128::from(self.first) * (peers + 1) <= self.peer_sum + now
+        };
+        let protected = self.now < self.deadline;
+        if !protected
+            && first_eligible
+            && self.first.saturating_add(EEVDF_BASE_SLICE) <= self.deadline
+        {
+            return WakePreemption::Now;
+        }
+
+        // With peers stationary, current first becomes ineligible one cycle
+        // past their average. Protection may end sooner when an eligible peer
+        // already has an earlier/equal deadline. Keep this exact boundary for
+        // the core's existing deferred check instead of a fixed grace period.
+        // A single peer's average is its runtime. Keep this common ping-pong
+        // case off the wide divide while retaining exact sums for larger queues.
+        let average = if single {
+            u128::from(self.first)
+        } else {
+            self.peer_sum / peers
+        };
+        let mut next = (average + 1).saturating_sub(u128::from(self.start));
+        if protected && first_eligible {
+            next = next.min(u128::from(self.deadline.saturating_sub(self.start)));
+        }
+        if next > u128::from(self.elapsed) && next <= u128::from(u64::MAX) {
+            WakePreemption::After(next as u64)
+        } else {
+            WakePreemption::KeepRunning
+        }
+    }
 }
 
 /// True if `row` is a dispatchable candidate (runnable, not throttled).
@@ -124,6 +169,31 @@ fn candidate(row: &SchedRow) -> bool {
 }
 
 impl Scheduler for EevdfScheduler {
+    fn wakeup_preemption(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) -> WakePreemption {
+        let mut fair = FairWake::new(ctx);
+        for row in queue.iter_sched() {
+            if !candidate(&row) || row.handle.task_id() == ctx.current.id {
+                continue;
+            }
+            if row.class != ctx.current.class {
+                if row.class.rank() > ctx.current.class.rank() {
+                    return WakePreemption::Now;
+                }
+                continue;
+            }
+            if row.class == SchedClass::Realtime {
+                if row.priority.raw() < ctx.current.priority.raw() {
+                    return WakePreemption::Now;
+                }
+                continue; // Equal-priority FIFO/RR ordering is core-owned.
+            }
+            if matches!(row.class, SchedClass::Default | SchedClass::Interactive) {
+                fair.observe(row.vruntime);
+            }
+        }
+        fair.decision()
+    }
+
     fn name(&self) -> &'static str {
         "eevdf"
     }
@@ -167,53 +237,6 @@ impl Scheduler for EevdfScheduler {
     }
 
     fn wakeup_preempt(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) -> bool {
-        let current = &ctx.current;
-        // Best runnable sibling (highest class, then earliest deadline). The
-        // runner is detached during its poll, so the queue holds only waiters;
-        // the id guard is belt-and-suspenders. The wakee deadline uses the RAW
-        // vruntime (not the clamped `d_eff` `pick_next` uses): the clamp bounds a
-        // long sleeper's credit for pick FAIRNESS, but in the preempt decision it
-        // would make every blocked peer look maximally starved.
-        let mut best: Option<(SchedClass, u64)> = None;
-        for row in queue.iter_sched() {
-            if !candidate(&row) || row.handle.task_id() == current.id {
-                continue;
-            }
-            let dl = row.vruntime.saturating_add(EEVDF_BASE_SLICE);
-            let take = match best {
-                None => true,
-                Some((bc, bd)) => {
-                    row.class.rank() > bc.rank() || (row.class.rank() == bc.rank() && dl < bd)
-                }
-            };
-            if take {
-                best = Some((row.class, dl));
-            }
-        }
-        let Some((wclass, wd)) = best else {
-            return false;
-        };
-        // A higher-scheduling-class wakee always preempts (Linux: a non-idle task
-        // preempts an idle one; RT preempts fair).
-        if wclass.rank() > current.class.rank() {
-            return true;
-        }
-        if wclass.rank() < current.class.rank() {
-            return false;
-        }
-        // Same class: RUN_TO_PARITY slice protection over the wake-preemption
-        // granularity window. Do NOT preempt the runner until it has run for
-        // `WAKE_PROTECT_SLICE` this dispatch — a cooperative producer/consumer
-        // (pipe/msg/switch) blocks on its own next op well before that, so it is
-        // never force-switched and keeps batching. A never-blocking spinner (the
-        // futex FUTEX_WAKE child) crosses the window and, if the wakee is more
-        // eligible, cedes then.
-        if ctx.elapsed < crate::WAKE_PROTECT_SLICE {
-            return false;
-        }
-        // Protection lapsed: cede iff the wakee is genuinely more eligible than
-        // the runner's current clock (dispatch vruntime + what it has run).
-        let runner_now = current.vruntime.saturating_add(ctx.elapsed);
-        eevdf_should_preempt(current.class, runner_now, wclass, wd)
+        self.wakeup_preemption(ctx, queue) == WakePreemption::Now
     }
 }

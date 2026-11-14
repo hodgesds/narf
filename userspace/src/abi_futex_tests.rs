@@ -12,8 +12,14 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 use narf_memory::AddressSpace;
 
+#[cfg(feature = "kernel-test")]
+#[path = "futex_policy_tests.rs"]
+mod policy_tests;
+
 const FUTEX_WAKE: u64 = 1;
 const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_CMP_REQUEUE: u64 = 4;
+const FUTEX_WAKE_OP: u64 = 5;
 const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE_FLAG: u64 = 128;
 const MATCH_ANY: u32 = 0xffff_ffff;
@@ -391,6 +397,512 @@ kernel_test_in!(
     smoke_abi_futex_wake_bitset_filters_waiters
 );
 
+/// Task creation order must not become wake order. Refresh and bitset skips
+/// retain arrival order; cancellation unlinks the middle, head and tail.
+fn smoke_abi_futex_wake_fifo_refresh_filter_and_cancel() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let p = &word as *const u32 as u64;
+        let tids = [0x7e_0444, 0x7e_0443, 0x7e_0442, 0x7e_0441];
+        let r = (|| {
+            let old = queue(true, p, 0x1, tids[0])?;
+            let skipped = queue(true, p, 0x2, tids[1])?;
+            let later = queue(true, p, 0x1, tids[2])?;
+            let refreshed = queue(true, p, 0x1, tids[0])?;
+            if futex(p, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 1, 0x1) != Some(1)
+                || refreshed.load(Ordering::Acquire) != 1
+                || old.load(Ordering::Acquire) != 0
+                || skipped.load(Ordering::Acquire) != 0
+                || later.load(Ordering::Acquire) != 0
+            {
+                return Err(
+                    "refresh or task ID changed the first matching waiter's queue position",
+                );
+            }
+            if futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0) != Some(1)
+                || skipped.load(Ordering::Acquire) != 1
+                || later.load(Ordering::Acquire) != 0
+            {
+                return Err("bitset skip changed the remaining waiters' order");
+            }
+            crate::handlers::__test_futex_drop_current(true, p, tids[2]);
+            let mut hits = alloc::vec::Vec::new();
+            for tid in tids {
+                hits.push(queue(true, p, MATCH_ANY, tid)?);
+            }
+            // Remove a middle node, the head, and the tail. Only tids[2] stays.
+            for i in [1, 0, 3] {
+                crate::handlers::__test_futex_drop_current(true, p, tids[i]);
+            }
+            let rejoined = queue(true, p, MATCH_ANY, tids[1])?;
+            if futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0) != Some(1)
+                || hits[2].load(Ordering::Acquire) != 1
+                || rejoined.load(Ordering::Acquire) != 0
+            {
+                return Err("cancellation damaged the queue or re-registration skipped its tail");
+            }
+            if futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0) != Some(1)
+                || rejoined.load(Ordering::Acquire) != 1
+                || hits
+                    .iter()
+                    .enumerate()
+                    .any(|(i, h)| i != 2 && h.load(Ordering::Acquire) != 0)
+                || futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0) != Some(0)
+            {
+                return Err("FIFO cancellation/re-registration woke the wrong registrations");
+            }
+            Ok(())
+        })();
+        for tid in tids {
+            crate::handlers::__test_futex_drop_current(true, p, tid);
+        }
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_wake_fifo_refresh_filter_and_cancel
+);
+
+fn smoke_abi_futex_requeue_preserves_fifo_and_destination_tail() -> TestResult {
+    with_setup(|| {
+        let words = [0u32; 256];
+        let p = words.as_ptr() as u64;
+        let bucket = crate::handlers::__test_futex_current_bucket_index(true, p)
+            .map_err(|_| "source futex key failed")?;
+        let p2 = words[1..]
+            .iter()
+            .map(|w| w as *const u32 as u64)
+            .find(|&p2| crate::handlers::__test_futex_current_bucket_index(true, p2) != Ok(bucket))
+            .ok_or("no distinct destination bucket")?;
+        let tids = [0x7e_0455, 0x7e_0454, 0x7e_0453, 0x7e_0452, 0x7e_0451];
+        let r = (|| {
+            let a = queue(true, p, MATCH_ANY, tids[0])?;
+            let b = queue(true, p, MATCH_ANY, tids[1])?;
+            let c = queue(true, p, MATCH_ANY, tids[2])?;
+            let d = queue(true, p2, MATCH_ANY, tids[3])?;
+            let e = queue(true, p2, MATCH_ANY, tids[4])?;
+            if call(
+                Syscall::Futex.raw(),
+                SyscallArgs {
+                    arg0: p,
+                    arg1: FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG,
+                    arg2: 1,
+                    arg3: 2,
+                    arg4: p2,
+                    arg5: 0,
+                },
+            ) != Some(3)
+                || a.load(Ordering::Acquire) != 1
+            {
+                return Err("requeue did not wake the source queue's first waiter");
+            }
+            let order = [d, e, b, c];
+            for i in 0..order.len() {
+                if futex(p2, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0) != Some(1)
+                    || order
+                        .iter()
+                        .enumerate()
+                        .any(|(j, h)| h.load(Ordering::Acquire) != u32::from(j <= i))
+                {
+                    return Err("requeue reordered movers or inserted ahead of existing destination waiters");
+                }
+            }
+            if futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 8, 0) != Some(0)
+                || futex(p2, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 8, 0) != Some(0)
+            {
+                return Err("requeue FIFO drain left a stale queue entry");
+            }
+            Ok(())
+        })();
+        for tid in tids {
+            crate::handlers::__test_futex_drop_current(true, p, tid);
+            crate::handlers::__test_futex_drop_current(true, p2, tid);
+        }
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_requeue_preserves_fifo_and_destination_tail
+);
+
+fn smoke_abi_futex_requeue_merges_legacy_refresh() -> TestResult {
+    with_setup(|| {
+        use crate::handlers::{
+            __test_futex_bucket_index, __test_futex_register_waiter_scoped, __test_futex_requeue,
+            __test_futex_waiter_count, futex_drop_waiter, futex_wake_waiters_for_test,
+        };
+        const SRC: u64 = 0x7e_4900;
+        const TID: u64 = 0x7e_0494;
+        for same_bucket in [false, true] {
+            let dst = (1..4096)
+                .map(|i| SRC + 4 * i)
+                .find(|&addr| {
+                    (__test_futex_bucket_index(0, addr) == __test_futex_bucket_index(0, SRC))
+                        == same_bucket
+                })
+                .ok_or("no suitable legacy requeue destination")?;
+            let old = Arc::new(AtomicU32::new(0));
+            let refreshed = Arc::new(AtomicU32::new(0));
+            let other = Arc::new(AtomicU32::new(0));
+            // Model a stale refresh under the source while a prior requeue's
+            // destination registration is still live for this same task.
+            __test_futex_register_waiter_scoped(0, SRC, TID, counting_waker(refreshed.clone()));
+            __test_futex_register_waiter_scoped(0, dst, TID, counting_waker(old.clone()));
+            __test_futex_register_waiter_scoped(0, dst, TID - 1, counting_waker(other.clone()));
+            let r = (|| {
+                if __test_futex_requeue(SRC, dst, 0, 1) != (0, 1)
+                    || __test_futex_waiter_count(SRC) != 0
+                    || __test_futex_waiter_count(dst) != 2
+                    || futex_wake_waiters_for_test(dst, 1) != 1
+                    || refreshed.load(Ordering::Acquire) != 1
+                    || old.load(Ordering::Acquire) != 0
+                    || other.load(Ordering::Acquire) != 0
+                    || futex_wake_waiters_for_test(dst, 1) != 1
+                    || other.load(Ordering::Acquire) != 1
+                    || futex_wake_waiters_for_test(dst, 1) != 0
+                {
+                    return Err(
+                        "legacy requeue duplicated a task or changed destination queue order",
+                    );
+                }
+                Ok(())
+            })();
+            for key in [SRC, dst] {
+                futex_drop_waiter(key, TID);
+                futex_drop_waiter(key, TID - 1);
+            }
+            r?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_requeue_merges_legacy_refresh
+);
+
+fn smoke_abi_futex_stale_handle_after_slot_reuse() -> TestResult {
+    with_setup(|| {
+        use crate::handlers::{
+            __test_futex_q_new, __test_futex_q_queue, __test_futex_q_unqueue,
+            __test_futex_waiter_count, futex_wake_waiters_for_test,
+        };
+        const WORD: u64 = 0x7e_4600;
+        let old = __test_futex_q_new(&[WORD]);
+        let current = __test_futex_q_new(&[WORD]);
+        let hits = Arc::new(AtomicU32::new(0));
+        let r = (|| {
+            __test_futex_q_queue(&old, 0, 0x7e_0460, counting_waker(hits.clone()));
+            if futex_wake_waiters_for_test(WORD, 1) != 1 {
+                return Err("first waiter was not woken");
+            }
+            // Its slot can be reused before the first waiter resumes unqueue.
+            __test_futex_q_queue(&current, 0, 0x7e_0461, counting_waker(hits.clone()));
+            if __test_futex_q_unqueue(&old, 1, 0x7e_0460) != Some(0)
+                || __test_futex_waiter_count(WORD) != 1
+                || futex_wake_waiters_for_test(WORD, 1) != 1
+                || hits.load(Ordering::Acquire) != 2
+                || __test_futex_q_unqueue(&current, 1, 0x7e_0461) != Some(0)
+            {
+                return Err("stale unqueue consumed a newer registration in the reused slot");
+            }
+            Ok(())
+        })();
+        let _ = __test_futex_q_unqueue(&old, 1, 0x7e_0460);
+        let _ = __test_futex_q_unqueue(&current, 1, 0x7e_0461);
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_stale_handle_after_slot_reuse
+);
+
+fn smoke_abi_futex_same_bucket_requeue_keeps_positions() -> TestResult {
+    with_setup(|| {
+        use crate::handlers::{
+            __test_futex_bucket_index, __test_futex_q_names, __test_futex_q_new,
+            __test_futex_q_queue, __test_futex_q_unqueue, __test_futex_requeue,
+            futex_wake_waiters_for_test,
+        };
+        const SRC: u64 = 0x7e_4700;
+        let dst = (1..4096)
+            .map(|i| SRC + 4 * i)
+            .find(|&addr| __test_futex_bucket_index(0, addr) == __test_futex_bucket_index(0, SRC))
+            .ok_or("no colliding futex key")?;
+        let keys = [SRC, dst, SRC, dst, SRC];
+        let waits: alloc::vec::Vec<_> = keys
+            .iter()
+            .map(|&key| (__test_futex_q_new(&[key]), Arc::new(AtomicU32::new(0))))
+            .collect();
+        for (i, (q, hits)) in waits.iter().enumerate() {
+            __test_futex_q_queue(q, 0, 0x7e_0475 - i as u64, counting_waker(hits.clone()));
+        }
+        let r = (|| {
+            if __test_futex_requeue(SRC, dst, 0, 3) != (0, 3)
+                || __test_futex_requeue(dst, dst, 0, 2) != (0, 2)
+                || waits.iter().any(|(q, _)| !__test_futex_q_names(q, 0, dst))
+            {
+                return Err("same-bucket requeue did not retarget the queued handles");
+            }
+            for i in 0..waits.len() {
+                if futex_wake_waiters_for_test(dst, 1) != 1
+                    || waits
+                        .iter()
+                        .enumerate()
+                        .any(|(j, (_, h))| h.load(Ordering::Acquire) != u32::from(j <= i))
+                {
+                    return Err("same-bucket or self requeue changed arrival order");
+                }
+            }
+            Ok(())
+        })();
+        for (i, (q, _)) in waits.iter().enumerate() {
+            let _ = __test_futex_q_unqueue(q, 1, 0x7e_0475 - i as u64);
+        }
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_same_bucket_requeue_keeps_positions
+);
+
+fn smoke_abi_futex_handles_survive_growth_and_requeue_return() -> TestResult {
+    with_setup(|| {
+        use crate::handlers::{
+            __test_futex_bucket_index, __test_futex_q_new, __test_futex_q_queue,
+            __test_futex_q_unqueue, __test_futex_requeue, __test_futex_waiter_count,
+            futex_wake_waiters_for_test,
+        };
+        const SRC: u64 = 0x7e_4800;
+        let dst = (1..4096)
+            .map(|i| SRC + 4 * i)
+            .find(|&addr| __test_futex_bucket_index(0, addr) != __test_futex_bucket_index(0, SRC))
+            .ok_or("no different futex bucket")?;
+        let waits: alloc::vec::Vec<_> = (0..128)
+            .map(|_| (__test_futex_q_new(&[SRC]), Arc::new(AtomicU32::new(0))))
+            .collect();
+        for (i, (q, hits)) in waits.iter().enumerate() {
+            __test_futex_q_queue(q, 0, 0x7e_4880 - i as u64, counting_waker(hits.clone()));
+        }
+        let r = (|| {
+            if __test_futex_requeue(SRC, dst, 0, 128) != (0, 128)
+                || __test_futex_requeue(dst, SRC, 0, 128) != (0, 128)
+            {
+                return Err("cross-bucket requeue round trip lost a waiter");
+            }
+            // Handles must survive arena growth and moving away/back, even
+            // though source slot indexes were reused in a different order.
+            for i in (0..128).step_by(2) {
+                if __test_futex_q_unqueue(&waits[i].0, 1, 0x7e_4880 - i as u64).is_some() {
+                    return Err("unwoken moved waiter was mistaken for a wake");
+                }
+            }
+            if __test_futex_waiter_count(SRC) != 64 || __test_futex_waiter_count(dst) != 0 {
+                return Err("cancellation after requeue left the wrong waiter count");
+            }
+            for i in (1..128).step_by(2) {
+                if futex_wake_waiters_for_test(SRC, 1) != 1
+                    || waits.iter().enumerate().any(|(j, (_, h))| {
+                        h.load(Ordering::Acquire) != u32::from(j % 2 == 1 && j <= i)
+                    })
+                {
+                    return Err("growth/requeue/cancellation changed FIFO selection");
+                }
+            }
+            Ok(())
+        })();
+        for (i, (q, _)) in waits.iter().enumerate() {
+            let _ = __test_futex_q_unqueue(q, 1, 0x7e_4880 - i as u64);
+        }
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_handles_survive_growth_and_requeue_return
+);
+
+/// Classic wake tests its signed limit after the first matching dequeue;
+/// futex2 adds a zero-count no-op. Exercise populated queues so a missing
+/// waiter cannot hide that distinction, and preserve bitset filtering.
+fn smoke_abi_futex_wake_signed_counts() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let p = &word as *const u32 as u64;
+        const TIDS: [u64; 3] = [0x7e_0048, 0x7e_0049, 0x7e_004a];
+        for api in 0..3 {
+            for (raw_count, classic_count) in [
+                (0u64, 1u32),
+                (u32::MAX as u64, 1),
+                (i32::MIN as u32 as u64, 1),
+                (2, 2),
+                (1u64 << 32, 1),
+                ((1u64 << 32) | 2, 2),
+            ] {
+                let hits = [
+                    queue(true, p, 0x1, TIDS[0])?,
+                    queue(true, p, 0x1, TIDS[1])?,
+                    queue(true, p, 0x2, TIDS[2])?,
+                ];
+                let result = (|| {
+                    let expected = if api == 2 && raw_count as u32 == 0 {
+                        0
+                    } else {
+                        classic_count
+                    };
+                    let returned = match api {
+                        0 => futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, raw_count, 0),
+                        1 => futex(p, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, raw_count, 0x1),
+                        _ => call(
+                            Syscall::FutexWake.raw(),
+                            a3(p, 0x1, raw_count, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE),
+                        ),
+                    };
+                    let total: u32 = hits.iter().map(|h| h.load(Ordering::Acquire)).sum();
+                    if returned != Some(i64::from(expected)) || total != expected {
+                        return Err(
+                            "futex wake did not apply the syscall's signed count semantics",
+                        );
+                    }
+                    if api != 0 && hits[2].load(Ordering::Acquire) != 0 {
+                        return Err("wake count normalization bypassed the bitset filter");
+                    }
+                    Ok(())
+                })();
+                for tid in TIDS {
+                    crate::handlers::__test_futex_drop_current(true, p, tid);
+                }
+                result?;
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_wake_signed_counts);
+
+/// Linux UAPI comparison numbers, tested on values below, equal to, and above
+/// a negative operand. Also check that an invalid comparison updates the word
+/// but leaves both queues intact.
+fn smoke_abi_futex_wake_op_comparisons() -> TestResult {
+    with_setup(|| {
+        let word = AtomicU32::new(0);
+        let word2 = AtomicU32::new(0);
+        let p = word.as_ptr() as u64;
+        let p2 = word2.as_ptr() as u64;
+        const T1: u64 = 0x7e_0071;
+        const T2: u64 = 0x7e_0072;
+        let comparisons = [
+            (0u32, [false, true, false]), // EQ
+            (1, [true, false, true]),     // NE
+            (2, [true, false, false]),    // LT
+            (3, [true, true, false]),     // LE
+            (4, [false, false, true]),    // GT
+            (5, [false, true, true]),     // GE
+            (6, [false; 3]),
+            (15, [false; 3]),
+        ];
+        for (cmp, expected) in comparisons {
+            for (old, second_wake) in [-2i32, -1, 0].into_iter().zip(expected) {
+                word2.store(old as u32, Ordering::Release);
+                let first = queue(true, p, 0x1, T1)?;
+                let second = queue(true, p2, 0x2, T2)?;
+                // ADD 1, compare the old signed value with -1.
+                let encoded = (1 << 28) | (cmp << 24) | (1 << 12) | 0xfff;
+                let result = call(
+                    Syscall::Futex.raw(),
+                    SyscallArgs {
+                        arg0: p,
+                        arg1: FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG,
+                        arg2: 1,
+                        arg3: 1,
+                        arg4: p2,
+                        arg5: encoded as u64,
+                    },
+                );
+                crate::handlers::__test_futex_drop_current(true, p, T1);
+                crate::handlers::__test_futex_drop_current(true, p2, T2);
+                let valid = cmp < 6;
+                let expected_result = if valid {
+                    1 + i64::from(second_wake)
+                } else {
+                    -38
+                };
+                if result != Some(expected_result)
+                    || first.load(Ordering::Acquire) != u32::from(valid)
+                    || second.load(Ordering::Acquire) != u32::from(second_wake)
+                    || word2.load(Ordering::Acquire) != old.wrapping_add(1) as u32
+                {
+                    return Err(
+                        "FUTEX_WAKE_OP comparison, side effect, or wake order differs from Linux",
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_wake_op_comparisons);
+
+fn smoke_abi_futex_wake_op_signed_counts() -> TestResult {
+    with_setup(|| {
+        let word = AtomicU32::new(0);
+        let word2 = AtomicU32::new(0);
+        let p = word.as_ptr() as u64;
+        let p2 = word2.as_ptr() as u64;
+        const TIDS: [u64; 6] = [
+            0x7e_0078, 0x7e_0079, 0x7e_007a, 0x7e_007b, 0x7e_007c, 0x7e_007d,
+        ];
+        for (n1, n2, expected1, expected2) in [
+            (0u64, 0u64, 1, 1),
+            (u32::MAX as u64, i32::MIN as u32 as u64, 1, 1),
+            (2, u32::MAX as u64, 2, 1),
+            (1u64 << 32, (1u64 << 32) | 2, 1, 2),
+        ] {
+            let hits = [
+                queue(true, p, 1, TIDS[0])?,
+                queue(true, p, 2, TIDS[1])?,
+                queue(true, p, 4, TIDS[2])?,
+                queue(true, p2, 1, TIDS[3])?,
+                queue(true, p2, 2, TIDS[4])?,
+                queue(true, p2, 4, TIDS[5])?,
+            ];
+            // SET 0 and EQ 0: both wake loops must run.
+            let result = call(
+                Syscall::Futex.raw(),
+                SyscallArgs {
+                    arg0: p,
+                    arg1: FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG,
+                    arg2: n1,
+                    arg3: n2,
+                    arg4: p2,
+                    arg5: 0,
+                },
+            );
+            for (index, tid) in TIDS.into_iter().enumerate() {
+                crate::handlers::__test_futex_drop_current(
+                    true,
+                    if index < 3 { p } else { p2 },
+                    tid,
+                );
+            }
+            let first: u32 = hits[..3].iter().map(|h| h.load(Ordering::Acquire)).sum();
+            let second: u32 = hits[3..].iter().map(|h| h.load(Ordering::Acquire)).sum();
+            if first != expected1
+                || second != expected2
+                || result != Some(i64::from(first + second))
+            {
+                return Err("FUTEX_WAKE_OP must normalize both signed counts independently");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_wake_op_signed_counts);
+
 /// futex2 `futex_wake(uaddr, mask, nr, flags)` is `futex_wake(..., mask)`:
 /// the same bitset filter, and the return value is the number actually
 /// woken (`ret`), not the `nr` requested.
@@ -463,6 +975,73 @@ fn smoke_abi_futex_requeue_ignores_bitset() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/futex", smoke_abi_futex_requeue_ignores_bitset);
+
+fn smoke_abi_futex_requeue_counts_moved_waiters() -> TestResult {
+    with_setup(|| {
+        let word = AtomicU32::new(0);
+        let word2 = AtomicU32::new(0);
+        let p = word.as_ptr() as u64;
+        let p2 = word2.as_ptr() as u64;
+        const TIDS: [u64; 3] = [0x7e_0081, 0x7e_0082, 0x7e_0083];
+        for op in [FUTEX_REQUEUE, FUTEX_CMP_REQUEUE] {
+            let hits = [
+                queue(true, p, 1, TIDS[0])?,
+                queue(true, p, 2, TIDS[1])?,
+                queue(true, p, 1, TIDS[2])?,
+            ];
+            let result = (|| {
+                let moved = call(
+                    Syscall::Futex.raw(),
+                    SyscallArgs {
+                        arg0: p,
+                        arg1: op | FUTEX_PRIVATE_FLAG,
+                        arg2: 0,
+                        arg3: 2,
+                        arg4: p2,
+                        arg5: 0,
+                    },
+                );
+                if moved != Some(2) || hits.iter().any(|h| h.load(Ordering::Acquire) != 0) {
+                    return Err("requeue must count moved waiters without waking them");
+                }
+                if futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 3, 0) != Some(1)
+                    || futex(p2, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 3, 2) != Some(1)
+                    || futex(p2, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 3, 0) != Some(1)
+                    || hits.iter().any(|h| h.load(Ordering::Acquire) != 1)
+                {
+                    return Err("requeue must preserve destination ownership and waiter bitsets");
+                }
+                Ok(())
+            })();
+            for tid in TIDS {
+                crate::handlers::__test_futex_drop_current(true, p, tid);
+                crate::handlers::__test_futex_drop_current(true, p2, tid);
+            }
+            result?;
+            for (wake, requeue) in [(u32::MAX as u64, 0), (0, i32::MIN as u32 as u64)] {
+                if call(
+                    Syscall::Futex.raw(),
+                    SyscallArgs {
+                        arg0: 0,
+                        arg1: op | FUTEX_PRIVATE_FLAG,
+                        arg2: wake,
+                        arg3: requeue,
+                        arg4: p2,
+                        arg5: 0,
+                    },
+                ) != Some(-22)
+                {
+                    return Err("negative requeue counts must be rejected before a bad address");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_requeue_counts_moved_waiters
+);
 
 // ════════════════════════════════════════════════════════════════════
 // PI futexes (`kernel/futex/pi.c`).

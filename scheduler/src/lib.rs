@@ -997,6 +997,14 @@ pub fn enable_user_task_smp() {
     USER_SMP_ENABLED.store(true, Ordering::Release);
 }
 
+/// Test-only: set whether user-task SMP is enabled and return the previous
+/// value. With it on, an idle CPU halts with interrupts enabled (as in a
+/// production boot) instead of spin-polling with them masked.
+#[doc(hidden)]
+pub fn __test_set_user_task_smp(on: bool) -> bool {
+    USER_SMP_ENABLED.swap(on, Ordering::AcqRel)
+}
+
 /// Whether user tasks may run on application processors. Consulted by
 /// [`TaskSpec::user_task`] (initial affinity) and the steal floor.
 #[inline]
@@ -1225,6 +1233,7 @@ pub(crate) struct DirectHandoffTarget {
     pub id: u64,
     pub cell: Arc<WakeCell>,
     pub addr_space: Option<Arc<AddressSpace>>,
+    pub sched: policy::CurrentTask,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -1251,6 +1260,9 @@ pub(crate) fn direct_handoff_is_local(home: usize, destination: usize) -> bool {
 /// queue is busy, ownership stays unchanged and the later waker-requeue hint
 /// remains the fallback. A successful move still uses the ordinary migration
 /// enqueue path, including policy events and affinity/lifecycle validation.
+// Out of line: moves a 688-byte `TaskSlot` through `Option` layers, and
+// inlined into the raw-waker path it made every wake reserve that frame.
+#[inline(never)]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn try_sync_wake_affine(home: u32, cell: *const WakeCell) -> Option<u32> {
     let source = home as usize;
@@ -1342,12 +1354,18 @@ fn claim_direct_handoff_slot(cpu: usize, slot: &TaskSlot) -> Option<DirectHandof
     slot.awake.direct_claimed.store(true, Ordering::Release);
     slot.awake.flag.store(false, Ordering::Release);
     slot.awake.blocking_wake.store(false, Ordering::Release);
-    publish_current_sched(cpu, slot);
     Some(DirectHandoffTarget {
         task,
         id: slot.awake.task,
         cell: slot.awake.clone(),
         addr_space: slot.addr_space.clone(),
+        sched: policy::CurrentTask {
+            id: slot.id,
+            class: slot.spec.class,
+            priority: slot.spec.priority,
+            vruntime: slot.vruntime,
+            vdeadline: slot.vruntime.wrapping_add(EEVDF_BASE_SLICE),
+        },
     })
 }
 
@@ -1429,13 +1447,15 @@ pub(crate) fn release_direct_handoff_target(cell: &WakeCell, completed: bool) {
     // A wake may have arrived while direct_claimed suppressed activation.
     // Re-stage after release, including completion so the adapter is reaped.
     if cell.flag.load(Ordering::SeqCst) {
-        if !try_activate_parked_local(cell) {
-            parked_wake_push(cell);
-        }
+        let notified = if try_activate_parked_local(cell) {
+            None
+        } else {
+            parked_wake_push(cell)
+        };
         let home = cell.cpu.load(Ordering::Acquire);
         note_runnable_peer(home, cell.task);
         user_policy::note_rt_wake(cell, home);
-        resched_remote(home);
+        notify_wake_cpu_once(home, notified);
     }
 }
 
@@ -1446,7 +1466,7 @@ pub(crate) fn fallback_urgent_wake(cell: &Arc<WakeCell>) {
     // Urgent (exact) wake: co-locate on `home`, never migrate to an idle sibling
     // (that would split the producer/consumer pair). Matches the urgent branch
     // of `wake_by_ref_impl` — kick `home` only.
-    resched_remote(home);
+    notify_wake_cpu(home);
 }
 
 /// Publish a direct target's identity/address space before its continuation is
@@ -1529,19 +1549,17 @@ static WAKE_PRESSURE: [core::sync::atomic::AtomicU32; narf_lib::percpu::MAX_CPUS
 static CPU_HALTED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
     [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
-/// Per-CPU reschedule request (Linux `TIF_NEED_RESCHED`). A waker publishes
-/// this for the target CPU as a SECOND, AUTHORITATIVE Dekker channel paired
-/// with `CPU_HALTED`: the waker stores it before the `resched_remote` SeqCst
-/// fence, the idle side stores `CPU_HALTED` then fences then loads it, so by
-/// the SeqCst-fence theorem a wake racing a halt is never both un-IPI'd AND
-/// unobserved. This hardens the wake path over `CPU_HALTED` alone: a wake that
-/// lands while the target is mid halt-poll (`CPU_HALTED` still false, so the
-/// IPI is correctly skipped) is nonetheless durable here and is caught by the
-/// halt commit's O(1) `swap(false)` — no reliance on a bounded idle spin to
-/// re-notice it. The idle path consumes (clears) it at each halt commit; a
-/// running CPU picks work up through the normal ready-queue awake scan and
-/// clears any stale request the next time it idles (one spurious poll, never a
-/// lost wake).
+/// Wake delivery is distinct from a policy-approved preemption. The producer
+/// publishes queue ownership before this flag; the target clears it BEFORE
+/// activation, so a concurrent producer cannot have its notification erased.
+/// A false->true edge interrupts even a busy remote CPU. The idle side also
+/// consumes it under the CPU_HALTED Dekker handshake.
+static WAKE_PENDING: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
+    [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
+
+/// Policy/timer/control request to reconsider the running task. Wake delivery
+/// uses WAKE_PENDING instead: receiving a wake does not by itself expire the
+/// current task's quantum. Both channels participate in the idle handshake.
 static NEED_RESCHED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
     [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
@@ -1568,16 +1586,6 @@ static VFLOOR: [VFloorCell; narf_lib::percpu::MAX_CPUS] =
 /// with the base slice); it is NOT a run-time floor. Tick/CPL3 slice preemption
 /// and the `FAIR_QUANTUM_DIV` fair-share floor remain the untouched backstops.
 pub(crate) const EEVDF_BASE_SLICE: u64 = stackful::DEFAULT_SLICE_CYCLES / 16;
-
-/// Wake-preemption granularity: how long a runner is protected from a
-/// same-class wake-preemption after dispatch (RUN_TO_PARITY window), in TSC
-/// cycles. NARF's analogue of Linux's classic `sched_wakeup_granularity_ns`.
-/// Smaller ⇒ faster producer/consumer handoff (futex wait/wake) but less IPC
-/// batching; larger ⇒ more batching but slower handoff. Tuned below the pick
-/// base slice so a wait/wake round-trip costs a fraction of a scheduling
-/// quantum while a cooperative pipe/msg waker (which blocks on its own next op
-/// within a few µs) still batches. `DEFAULT_SLICE_CYCLES / 32` ≈ 312 µs.
-pub(crate) const WAKE_PROTECT_SLICE: u64 = stackful::DEFAULT_SLICE_CYCLES / 32;
 
 /// Read a CPU's virtual-time floor (see [`VFLOOR`]). `0` before the CPU has
 /// dispatched anything.
@@ -1612,6 +1620,7 @@ struct CurrentSched {
     vruntime: core::sync::atomic::AtomicU64,
     vdeadline: core::sync::atomic::AtomicU64,
     class_rank: core::sync::atomic::AtomicU8,
+    priority: core::sync::atomic::AtomicI8,
 }
 static CURRENT_SCHED: [CurrentSched; narf_lib::percpu::MAX_CPUS] = [const {
     CurrentSched {
@@ -1619,6 +1628,7 @@ static CURRENT_SCHED: [CurrentSched; narf_lib::percpu::MAX_CPUS] = [const {
         vruntime: core::sync::atomic::AtomicU64::new(0),
         vdeadline: core::sync::atomic::AtomicU64::new(0),
         class_rank: core::sync::atomic::AtomicU8::new(0),
+        priority: core::sync::atomic::AtomicI8::new(0),
     }
 }; narf_lib::percpu::MAX_CPUS];
 
@@ -1739,35 +1749,58 @@ fn publish_current_sched(cpu: usize, slot: &TaskSlot) {
     );
     s.class_rank
         .store(slot.spec.class.rank(), Ordering::Relaxed);
+    s.priority
+        .store(slot.spec.priority.raw(), Ordering::Relaxed);
     // id LAST: a same-CPU reader that sees the matching id has, by program
     // order, also seen the fields above.
     s.id.store(slot.id.raw(), Ordering::Relaxed);
 }
 
-/// Ask the installed scheduler policy whether the running task (`current_id`)
-/// should cede because a wake made a peer runnable. Routed from
-/// `stackful::maybe_resched_syscall_exit`; the core owns the mechanism, the
-/// policy owns this decision (Linux `wakeup_preempt`). Allocation-free: it reads
-/// the cached [`CURRENT_SCHED`] snapshot (guarded by id — a mismatch means the
-/// snapshot is stale, so we decline) into a `Copy` `CurrentTask`, and scans the
-/// queue through the lean `iter_sched` projection. On policy-slot OR run-queue
-/// contention it returns `false` (keep running; the fair-quantum floor still
-/// bounds starvation — the deliberate opposite polarity to
-/// `has_other_runnable_work`, because the failure mode here is de-batching). No
-/// policy installed yet (early boot) falls back to the legacy term.
+/// Same-CPU dispatch identity used while a direct transfer suspends its root.
+pub(crate) fn current_sched_snapshot(cpu: usize) -> policy::CurrentTask {
+    let s = &CURRENT_SCHED[cpu];
+    policy::CurrentTask {
+        id: TaskId(s.id.load(Ordering::Relaxed)),
+        class: SchedClass::from_rank(s.class_rank.load(Ordering::Relaxed)),
+        priority: Priority(s.priority.load(Ordering::Relaxed)),
+        vruntime: s.vruntime.load(Ordering::Relaxed),
+        vdeadline: s.vdeadline.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn publish_sched_snapshot(cpu: usize, saved: policy::CurrentTask) {
+    let s = &CURRENT_SCHED[cpu];
+    s.vruntime.store(saved.vruntime, Ordering::Relaxed);
+    s.vdeadline.store(saved.vdeadline, Ordering::Relaxed);
+    s.class_rank.store(saved.class.rank(), Ordering::Relaxed);
+    s.priority.store(saved.priority.raw(), Ordering::Relaxed);
+    s.id.store(saved.id.raw(), Ordering::Relaxed);
+}
+
+/// Boolean adapter for callers that do not retain a deferred wake decision.
+/// The policy reads a same-CPU dispatch snapshot and a local queue projection;
+/// a stale snapshot or a contended policy/queue declines this optional check.
 pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
+    wake_preempt_policy_decision(current_id, elapsed) == policy::WakePreemption::Now
+}
+
+pub(crate) fn wake_preempt_policy_decision(
+    current_id: u64,
+    elapsed: u64,
+) -> policy::WakePreemption {
+    use policy::WakePreemption;
     let cpu = narf_lib::percpu::current_cpu();
     if cpu >= CURRENT_SCHED.len() {
-        return false;
+        return WakePreemption::KeepRunning;
     }
     let snap = &CURRENT_SCHED[cpu];
     if snap.id.load(Ordering::Relaxed) != current_id {
-        return false;
+        return WakePreemption::KeepRunning;
     }
     // Publish the runner's dispatch vruntime + how long it has run (`elapsed`).
     // The policy forms the runner's current clock as `vruntime + elapsed` and
-    // applies RUN_TO_PARITY protection using `elapsed` directly. See
-    // `EevdfScheduler::wakeup_preempt`.
+    // checks eligibility before protecting its virtual request. See
+    // `EevdfScheduler::wakeup_preemption`.
     let dispatch_vruntime = snap.vruntime.load(Ordering::Relaxed);
     let ctx = policy::CpuSchedContext {
         cpu: CpuId(cpu as u32),
@@ -1777,6 +1810,7 @@ pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
         current: policy::CurrentTask {
             id: TaskId(current_id),
             class: crate::priority::SchedClass::from_rank(snap.class_rank.load(Ordering::Relaxed)),
+            priority: crate::priority::Priority(snap.priority.load(Ordering::Relaxed)),
             vruntime: dispatch_vruntime,
             vdeadline: dispatch_vruntime.wrapping_add(EEVDF_BASE_SLICE),
         },
@@ -1786,13 +1820,13 @@ pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
         Some(s) => match READY[cpu].try_lock() {
             Some(q) => q
                 .as_ref()
-                .map(|d| s.wakeup_preempt(&ctx, &policy::RunQueue::projected(d)))
-                .unwrap_or(false),
-            None => false,
+                .map(|d| s.wakeup_preemption(&ctx, &policy::RunQueue::projected(d)))
+                .unwrap_or(WakePreemption::KeepRunning),
+            None => WakePreemption::KeepRunning,
         },
-        None => has_other_runnable_work(current_id),
+        None => WakePreemption::KeepRunning,
     })
-    .unwrap_or(false)
+    .unwrap_or(WakePreemption::KeepRunning)
 }
 
 /// Request a reschedule of the CURRENT CPU's running task — NARF's
@@ -1820,15 +1854,8 @@ pub(crate) fn need_resched_pending(cpu: usize) -> bool {
     cpu < NEED_RESCHED.len() && NEED_RESCHED[cpu].load(Ordering::Acquire)
 }
 
-/// Consume this CPU's reschedule request at the point a preempt actually commits
-/// to switching to the executor (Linux `clear_tsk_need_resched`). Without this a
-/// stale `NEED_RESCHED` — set by every `resched_remote` to a *running* CPU, IPI
-/// skipped — would re-fire the tick-rate preempt on every subsequent tick until
-/// the CPU next idled, collapsing the effective quantum. Safe against a racing
-/// waker: the wake published its slot to READY/the wake-list BEFORE storing
-/// `NEED_RESCHED`, so the executor's next round dispatches it regardless, and a
-/// wake that arrives after this clear re-sets the flag and is caught by the
-/// halt-commit backstop.
+/// Consume a policy/timer/control request when committing an executor switch.
+/// Wake delivery is independently retained by WAKE_PENDING and queue ownership.
 #[inline]
 pub(crate) fn clear_need_resched(cpu: usize) {
     if cpu < NEED_RESCHED.len() {
@@ -2037,6 +2064,7 @@ pub(crate) fn scheduler_on_tick(current_id: u64, elapsed: u64) {
         current: policy::CurrentTask {
             id: TaskId(current_id),
             class: crate::priority::SchedClass::from_rank(snap.class_rank.load(Ordering::Relaxed)),
+            priority: crate::priority::Priority(snap.priority.load(Ordering::Relaxed)),
             vruntime: dispatch_vruntime,
             vdeadline: dispatch_vruntime.wrapping_add(EEVDF_BASE_SLICE),
         },
@@ -2398,6 +2426,12 @@ pub fn __test_set_cpu_halted(cpu: usize, halted: bool) {
     }
 }
 
+/// Test-only: read a CPU's published halted flag.
+#[doc(hidden)]
+pub fn __test_cpu_halted(cpu: usize) -> bool {
+    cpu < narf_lib::percpu::MAX_CPUS && CPU_HALTED[cpu].load(Ordering::SeqCst)
+}
+
 /// Test-only: read a CPU's published reschedule request (`NEED_RESCHED`).
 #[doc(hidden)]
 pub fn __test_need_resched(cpu: usize) -> bool {
@@ -2424,6 +2458,43 @@ pub fn __test_set_wake_next(cpu: u32, task: u64) {
     }
 }
 
+/// Publish runnable work after queue publication. Batch remote IPIs until the
+/// target claims the notification, including while the target runs user code.
+#[inline]
+fn notify_wake_cpu(target_cpu: u32) {
+    let cpu = target_cpu as usize;
+    if cpu >= WAKE_PENDING.len() {
+        return;
+    }
+    let pending = WAKE_PENDING[cpu].swap(true, Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if cpu == narf_lib::percpu::current_cpu() {
+        return;
+    }
+    if !pending || CPU_HALTED[cpu].load(Ordering::SeqCst) {
+        local_scheduler_telemetry()
+            .resched_sent
+            .fetch_add(1, Ordering::Relaxed);
+        send_resched_ipi(target_cpu);
+    } else {
+        local_scheduler_telemetry()
+            .resched_skip
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub(crate) fn wake_notification_pending(cpu: usize) -> bool {
+    cpu < WAKE_PENDING.len() && WAKE_PENDING[cpu].load(Ordering::Acquire)
+}
+
+/// Runs on the target's task stack, outside hard IRQ context. Claim before
+/// drain so concurrent wakes retain their notification for the exit loop.
+pub(crate) fn activate_pending_wakes(cpu: usize) -> usize {
+    WAKE_PENDING[cpu].swap(false, Ordering::SeqCst);
+    activate_wake_list(cpu)
+}
+
 #[inline]
 fn resched_remote(target_cpu: u32) {
     let me = narf_lib::percpu::current_cpu() as u32;
@@ -2448,14 +2519,8 @@ fn resched_remote(target_cpu: u32) {
     send_resched_ipi(target_cpu);
 }
 
-/// Unconditional cross-core reschedule kick: send the IPI regardless of the
-/// target's published `CPU_HALTED`. Used for the wake-inbox empty->nonempty
-/// transition (Linux `__ttwu_queue_wakelist` -> `__smp_call_single_queue`
-/// always IPIs on the first entry). The IPI only interrupts or un-halts the
-/// target; the executor drains the inbox outside hard-IRQ context at its next
-/// round boundary. Gated by the caller on `was_empty` so it is one IPI per
-/// empty->nonempty edge, not one per wake (`llist_add`'s "first entry" gate).
-/// No-op for self / out-of-range.
+/// Publish a policy/timer/control request and interrupt a remote CPU even if
+/// it is busy. Ordinary runnable delivery uses notify_wake_cpu instead.
 #[inline]
 pub(crate) fn resched_remote_force(target_cpu: u32) {
     let me = narf_lib::percpu::current_cpu() as u32;
@@ -2860,6 +2925,11 @@ pub fn init() {
     steal::register_current_cpu();
     #[cfg(feature = "instruction-quantum")]
     instructions::init_current_cpu();
+    // Hrtimer sleepers whose waker is ours expire in hard IRQ: our
+    // `wake_by_ref` only publishes the awake bit and places the wake (no
+    // allocation, no free). Every other waker expires from the executor.
+    narf_time::hrtimer::hrtimers_init();
+    narf_time::hrtimer::set_hardirq_waker_predicate(is_scheduler_waker);
     for (cpu, q) in READY.iter().enumerate() {
         blocking::reset(cpu);
         *q.lock() = Some(VecDeque::new());
@@ -2916,6 +2986,7 @@ pub fn __reset_queues_for_test() {
         inbox.lock().clear();
         WAKE_INBOX_LEN[cpu].store(0, Ordering::Release);
         reset_parked_wakes(cpu);
+        WAKE_PENDING[cpu].store(false, Ordering::Release);
     }
     LIVE_USER_ADDRESS_SPACES.lock().clear();
     // Same for the per-task cap-table registry: slots dropped above
@@ -3600,8 +3671,9 @@ static WAKE_INBOX_LEN: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
 
 /// False→true wake transitions for tasks owned by [`PARKED`]. The raw waker
 /// cannot move a `TaskSlot` itself because it may run in IRQ context; it stages
-/// its task-owned intrusive node and the owning CPU performs activation at its
-/// next executor boundary, like Linux's `ttwu_queue` / `sched_ttwu_pending`.
+/// its task-owned intrusive node and the owning CPU performs activation at an
+/// executor or completed user-return boundary, like Linux's `ttwu_queue` /
+/// `sched_ttwu_pending`.
 /// The inbox owns one Arc reference per queued node, so IRQ wakes never allocate
 /// storage and an exited task's waker cannot leave a dangling link. Repeated
 /// wakes coalesce. Running tasks have no parked token; poll return observes
@@ -3622,15 +3694,17 @@ static PARKED_WAKE_INBOX: [ParkedWakeHead; narf_lib::percpu::MAX_CPUS] = [const 
     }
 };
     narf_lib::percpu::MAX_CPUS];
-fn parked_wake_push(cell: &WakeCell) {
+/// Return the CPU notified for this publication. Placement must still notify a
+/// different destination, but need not kick the queued node's owner twice.
+fn parked_wake_push(cell: &WakeCell) -> Option<u32> {
     'retry: loop {
         if cell.parked_location.load(Ordering::SeqCst) == NOT_PARKED
             || cell.task == TaskId::NONE.raw()
         {
-            return;
+            return None;
         }
         if cell.activation_queued.swap(true, Ordering::SeqCst) {
-            return;
+            return None;
         }
         let ptr = core::ptr::from_ref(cell).cast_mut();
         loop {
@@ -3644,7 +3718,7 @@ fn parked_wake_push(cell: &WakeCell) {
                 if cell.flag.load(Ordering::SeqCst) {
                     continue 'retry;
                 }
-                return;
+                return None;
             }
             let cpu = token % narf_lib::percpu::MAX_CPUS;
             let inbox = &PARKED_WAKE_INBOX[cpu];
@@ -3667,8 +3741,11 @@ fn parked_wake_push(cell: &WakeCell) {
             }
             // Kick the CPU actually owning this queued node. Migration may change
             // cell.cpu before the raw waker issues its ordinary placement kick.
-            resched_remote(cpu as u32);
-            return;
+            if CURRENT_TASK[cpu].0.load(Ordering::Acquire) != cell.task {
+                notify_wake_cpu(cpu as u32);
+                return Some(cpu as u32);
+            }
+            return None;
         }
     }
 }
@@ -3680,6 +3757,9 @@ fn parked_wake_push(cell: &WakeCell) {
 /// already have capacity, so the raw-waker path cannot allocate or wait behind
 /// a queue owner. Observing policies retain executor-boundary activation so an
 /// IRQ never invokes arbitrary policy callbacks.
+// Out of line: moves a 688-byte `TaskSlot` through `Option` layers, and
+// inlined into the raw-waker path it made every wake reserve that frame.
+#[inline(never)]
 fn try_activate_parked_local(cell: &WakeCell) -> bool {
     let token = cell.parked_location.load(Ordering::SeqCst);
     if token == NOT_PARKED {
@@ -3796,9 +3876,17 @@ fn wake_list_pending(cpu: usize) -> bool {
 /// slot, running the `Enqueued` policy callback locally (activate on the target,
 /// as in Linux). Drains front-to-back (arrival order → FIFO). `pop_front` retains
 /// the ring-buffer capacity, so a steady wake stream reuses it without
-/// allocating; a concurrent remote `push_back` is picked up in the same loop.
+/// allocating. Arrivals beyond this batch retain a notification for the next.
 fn drain_wake_list(cpu: usize) {
-    loop {
+    activate_pending_wakes(cpu);
+    reap_revoked_parked(cpu);
+}
+
+fn activate_wake_list(cpu: usize) -> usize {
+    let mut activated = 0;
+    // Bound this batch; new arrivals retain WAKE_PENDING for the next pass.
+    let count = WAKE_INBOX_LEN[cpu].load(Ordering::Acquire);
+    for _ in 0..count {
         let item = {
             let mut q = WAKE_INBOX[cpu].lock();
             let item = q.pop_front();
@@ -3808,6 +3896,7 @@ fn drain_wake_list(cpu: usize) {
         let Some((slot, reason)) = item else {
             break;
         };
+        activated += 1;
         // Local enqueue: `cpu` is us, so `with_scheduler` takes only our own slot
         // lock (the dispatch path already owns the round on this CPU) and
         // attributes the Enqueued event to this CPU.
@@ -3838,8 +3927,7 @@ fn drain_wake_list(cpu: usize) {
             }
         });
     }
-    drain_parked_wakes(cpu);
-    reap_revoked_parked(cpu);
+    activated + drain_parked_wakes(cpu)
 }
 
 /// Sleeping tasks still observe capability revocation at an executor boundary,
@@ -3870,7 +3958,8 @@ fn reap_revoked_parked(cpu: usize) {
     }
 }
 
-fn drain_parked_wakes(cpu: usize) {
+fn drain_parked_wakes(cpu: usize) -> usize {
+    let mut activated = 0;
     let mut batch = take_parked_wake_batch(cpu);
     while !batch.is_null() {
         // SAFETY: the detached node owns exactly one inbox Arc reference.
@@ -3888,8 +3977,8 @@ fn drain_parked_wakes(cpu: usize) {
         if home != cpu {
             // A queued activation can outlive a migration and a subsequent
             // sleep. Route the pinned node to its current parked owner.
-            parked_wake_push(&cell);
-            resched_remote(cell.cpu.load(Ordering::Acquire));
+            let notified = parked_wake_push(&cell);
+            notify_wake_cpu_once(cell.cpu.load(Ordering::Acquire), notified);
             continue;
         }
         let id = TaskId(cell.task);
@@ -3916,7 +4005,9 @@ fn drain_parked_wakes(cpu: usize) {
             continue;
         };
         enqueue_on(cpu, parked.slot, parked.reason);
+        activated += 1;
     }
+    activated
 }
 
 /// Publish parked ownership, then recheck the wake after the SeqCst token
@@ -4013,18 +4104,8 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
         policy::CpuState::Active | policy::CpuState::Idle
     );
     if cpu != me && cpu < narf_lib::percpu::MAX_CPUS && target_drains {
-        let was_empty = wake_list_push(cpu, slot, reason);
-        // Kick the target on the empty->nonempty edge. The IPI is deliberately
-        // notification-only: folding the inbox here would run ready-queue growth
-        // and policy callbacks in hard-IRQ context. The target drains at its next
-        // executor round boundary. Batched to one IPI per edge (`llist_add`'s
-        // first-entry gate); off the edge, fall back to the halted-only kick,
-        // which pairs with the idle-side Dekker handshake.
-        if was_empty {
-            resched_remote_force(cpu as u32);
-        } else {
-            resched_remote(cpu as u32);
-        }
+        wake_list_push(cpu, slot, reason);
+        notify_wake_cpu(cpu as u32);
         return;
     }
 
@@ -5276,50 +5357,61 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
 // needed: the awake bit IS the runnable bit, and the scan reads it
 // directly.
 
+/// Account one false-to-true wake transition, regardless of Waker ownership.
+#[inline]
+fn note_fresh_wake(cell: &WakeCell, home: u32) {
+    wake_race_stamp(cell, home);
+    note_runnable_peer(home, cell.task);
+    user_policy::note_rt_wake(cell, home);
+    // Placement counts fresh wakes, not repeated notifications of runnable work.
+    if let Some(pressure) = WAKE_PRESSURE.get(home as usize) {
+        pressure.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// Publish a consuming wake, leaving parked activation to the executor. An
 /// exact local handoff can claim the indexed parked owner before that drain.
 #[inline]
-fn publish_owned_wake(cell: &WakeCell) -> u32 {
+fn publish_owned_wake(cell: &WakeCell) -> (u32, Option<u32>) {
     let prev_awake = cell.flag.swap(true, Ordering::SeqCst);
-    if !prev_awake {
-        parked_wake_push(cell);
-    }
-    // Kick the owner's CPU if it's idle on another core (else the awake
-    // bit waits until that CPU's next timer tick — the cross-core wake
-    // tail). `resched_remote` no-ops for same-CPU / running targets.
+    let notified = if prev_awake {
+        None
+    } else {
+        parked_wake_push(cell)
+    };
+    // Home publication precedes the parked token, so load home after staging
+    // activation to observe any migration that changed the queued owner.
     let home = cell.cpu.load(Ordering::Acquire);
     if !prev_awake {
-        wake_race_stamp(cell, home);
-        note_runnable_peer(home, cell.task);
-        user_policy::note_rt_wake(cell, home);
+        note_fresh_wake(cell, home);
     }
-    home
+    (home, notified)
 }
 
 unsafe fn wake_raw(data: *const ()) {
     // wake-by-value: consume the Arc.
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
-    let home = publish_owned_wake(&arc);
+    let (home, notified) = publish_owned_wake(&arc);
     // Name this task its home CPU's next-buddy so the dispatch picks it ahead
     // of the tasks already queued in front of it (Linux `set_next_buddy`).
     record_wake_next(home, arc.task);
     // ttwu: the POLICY selects an idle sibling for a busy home and the CORE
     // migrates the wakee there and kicks it (or kicks `home` when idle/kept).
-    wake_place_and_kick(Arc::as_ptr(&arc), home, arc.task);
+    wake_place_and_kick(Arc::as_ptr(&arc), home, arc.task, notified);
 }
 
 unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) -> bool {
     let ptr = data as *const WakeCell;
+    let mut notified = None;
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
-    // SAFETY: Valid memory or trusted environment
     let prev_awake = unsafe {
         let prev = (*ptr).flag.swap(true, Ordering::SeqCst);
         if !prev {
             let cell = &*ptr;
             if urgent_task != Some(cell.task) || !try_activate_parked_local(cell) {
-                parked_wake_push(cell);
+                notified = parked_wake_push(cell);
             }
         }
         prev
@@ -5331,17 +5423,7 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) -> bool {
     let (home, task) = unsafe { ((*ptr).cpu.load(Ordering::Acquire), (*ptr).task) };
     if !prev_awake {
         // SAFETY: the caller holds a live Waker, so `ptr`'s WakeCell is valid.
-        unsafe { wake_race_stamp(&*ptr, home) };
-        note_runnable_peer(home, task);
-        // SAFETY: the native waker pins this WakeCell.
-        user_policy::note_rt_wake(unsafe { &*ptr }, home);
-        // Backlog gauge for wake-time placement (see WAKE_PRESSURE): one
-        // fresh wake toward `home` since its last dispatch round. Re-wakes
-        // of an already-awake slot add no queue load and are skipped by the
-        // prev_awake gate above.
-        if (home as usize) < WAKE_PRESSURE.len() {
-            WAKE_PRESSURE[home as usize].fetch_add(1, Ordering::AcqRel);
-        }
+        note_fresh_wake(unsafe { &*ptr }, home);
     }
     let mut dispatch_home = home;
     if urgent_task == Some(task) {
@@ -5369,14 +5451,14 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) -> bool {
         // Exact synchronous wake: already co-located by try_sync_wake_affine —
         // just kick its (local or home) CPU. No idle-sibling migrate here: that
         // would split the producer/consumer pair this path is establishing.
-        resched_remote(dispatch_home);
+        notify_wake_cpu_once(dispatch_home, notified);
     } else {
         // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
         record_wake_next(home, task);
         // ttwu placement: the POLICY picks an idle sibling when `home` is busy
         // and the CORE migrates the wakee there and kicks it (a PUSH at wake).
         // Stealing is NOT used on the wake path (it stays the periodic balancer).
-        wake_place_and_kick(ptr, dispatch_home, task);
+        wake_place_and_kick(ptr, dispatch_home, task, notified);
     }
     !prev_awake
 }
@@ -5415,7 +5497,7 @@ pub fn wake_preempt_task(waker: Waker, expected_task: u64) {
         // WakeCell Arc. It remains live until this function returns.
         let cell = unsafe { &*ptr };
         if cell.task == expected_task {
-            let home = publish_owned_wake(cell);
+            let (home, notified) = publish_owned_wake(cell);
             let cpu = narf_lib::percpu::current_cpu();
             if home as usize == cpu
                 && expected_task != current_task_id().raw()
@@ -5428,7 +5510,7 @@ pub fn wake_preempt_task(waker: Waker, expected_task: u64) {
                 stackful::note_local_urgent_wake_preempt(expected_task);
             } else {
                 record_wake_next(home, cell.task);
-                wake_place_and_kick(ptr, home, cell.task);
+                wake_place_and_kick(ptr, home, cell.task, notified);
                 if cell.cpu.load(Ordering::Acquire) as usize == cpu {
                     stackful::note_urgent_wake_preempt(expected_task);
                 }
@@ -5455,6 +5537,9 @@ pub fn wake_preempt_task(waker: Waker, expected_task: u64) {
 /// `false` so the caller falls back to kicking `home`, so a wake is never lost.
 /// This is the same non-blocking move as [`try_sync_wake_affine`], generalized
 /// to a policy-selected `target` instead of the waker's CPU.
+// Out of line: moves a 688-byte `TaskSlot` through `Option` layers, and
+// inlined into the raw-waker path it made every wake reserve that frame.
+#[inline(never)]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
     let source = home as usize;
@@ -5509,13 +5594,24 @@ fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
     }
 }
 
+/// Deduplicate only within this wake publication. The first notification follows
+/// the durable inbox node and already covers its owner's halt handshake, even
+/// if that owner consumes WAKE_PENDING before placement finishes. Independent
+/// wakes and a changed destination retain their own notification.
+#[inline]
+fn notify_wake_cpu_once(cpu: u32, notified: Option<u32>) {
+    if notified != Some(cpu) {
+        notify_wake_cpu(cpu);
+    }
+}
+
 /// Wake-time placement + kick — NARF's `ttwu_queue` mechanism, split exactly
 /// like Linux: the POLICY decides WHERE (`Scheduler::select_task_rq`, the
 /// analogue of `sched_class->select_task_rq`), and the scheduler CORE performs
 /// the mechanical migrate + enqueue + IPI (`set_task_cpu` + `ttwu_queue`).
 ///
-/// On a wake whose `home` (prev_cpu) is BUSY, ask the policy for an idle,
-/// affinity-permitted sibling; if it names one, MIGRATE the wakee's slot there
+/// On a wake whose `home` (prev_cpu) is BUSY, ask the policy for an
+/// affinity-permitted destination; if it names a different CPU, move the slot
 /// and let `enqueue_on` kick it. This is a PUSH at wake time — it does NOT rely
 /// on the idle sibling later PULLING the task via work-stealing (Linux uses
 /// stealing only in the periodic/newidle balancer, never on the wake path). If
@@ -5526,7 +5622,14 @@ fn try_migrate_wakee_to(home: u32, target: u32, cell: *const WakeCell) -> bool {
 /// non-blocking (`try_lock`), bounded CPU scan. Any migrate contention falls
 /// back to the plain `home` kick, so a wake is never dropped.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
+fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64, notified: Option<u32>) {
+    // A self-rearm is not newly runnable peer work.
+    if CURRENT_TASK
+        .get(home as usize)
+        .is_some_and(|slot| slot.0.load(Ordering::Acquire) == task)
+    {
+        return;
+    }
     // Placement is only actionable with migration enabled and a BUSY home. An
     // idle home is already being IPI'd to run the task itself (the cache-warm,
     // hot ping-pong path) — never migrate off an idle home.
@@ -5534,7 +5637,7 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
         || (home as usize) >= CPU_HALTED.len()
         || CPU_HALTED[home as usize].load(Ordering::SeqCst)
     {
-        resched_remote(home);
+        notify_wake_cpu_once(home, notified);
         return;
     }
     // Home is awake, but "not halted" is NOT the same as "backlogged": an
@@ -5553,17 +5656,27 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
     // scan per wake), whose lock acquisition was itself worth ~1.5 µs on
     // the cold-wake path.
     if WAKE_PRESSURE[home as usize].load(Ordering::Acquire) < 2 {
-        resched_remote(home);
+        notify_wake_cpu_once(home, notified);
         return;
     }
-    // Affinity predicate for CPU selection (lock-free registry read). `None`
-    // (task not registered) permits any CPU; the migrate's own
-    // `direct_handoff_slot_eligible` affinity check is the authoritative gate.
+    // Hard hrtimer expiry invokes this waker directly, including before the
+    // architecture dispatcher publishes its IRQ-depth marker. With IRQs masked,
+    // retain the durable owner notification and leave activation to the executor:
+    // placement can invoke policy callbacks and grow the destination's queue.
+    if !narf_arch::current::asm::interrupts_enabled() {
+        notify_wake_cpu_once(home, notified);
+        return;
+    }
+    // Snapshot the registered affinity before taking the policy lock. Missing
+    // registration permits any CPU here; migration validates the live slot.
     let allowed_set = task_affinity(TaskId(task));
-    let allowed = |c: crate::affinity::CpuId| allowed_set.is_none_or(|s| s.contains(c));
+    let allowed = |c: CpuId| allowed_set.is_none_or(|set| set.contains(c));
     let is_online = |c: crate::affinity::CpuId| narf_lib::smp::is_online(c.0);
     let is_idle = |c: crate::affinity::CpuId| {
-        (c.0 as usize) < CPU_HALTED.len() && CPU_HALTED[c.0 as usize].load(Ordering::SeqCst)
+        (c.0 as usize) < CPU_HALTED.len()
+            && CPU_HALTED[c.0 as usize].load(Ordering::SeqCst)
+            && !wake_notification_pending(c.0 as usize)
+            && !wake_list_pending(c.0 as usize)
     };
     let home_id = crate::affinity::CpuId(home);
     let waker = crate::affinity::CpuId(narf_lib::percpu::current_cpu() as u32);
@@ -5573,14 +5686,14 @@ fn wake_place_and_kick(cell: *const WakeCell, home: u32, task: u64) {
     .flatten();
     match target {
         Some(t) if t.0 != home && allowed(t) => {
-            // CORE mechanism: migrate to the policy-selected idle CPU; on success
+            // CORE mechanism: migrate to the policy-selected CPU; on success
             // `enqueue_on` kicked it. Any contention → kick `home` so the wake
             // still lands (never dropped).
             if !try_migrate_wakee_to(home, t.0, cell) {
-                resched_remote(home);
+                notify_wake_cpu_once(home, notified);
             }
         }
-        _ => resched_remote(home),
+        _ => notify_wake_cpu_once(home, notified),
     }
 }
 
@@ -5589,6 +5702,13 @@ unsafe fn drop_raw(data: *const ()) {
     unsafe {
         drop(Arc::<WakeCell>::from_raw(data as *const WakeCell));
     }
+}
+
+/// Whether `waker` is a scheduler task waker, whose `wake_by_ref` is safe in
+/// hard-IRQ context: it sets the awake flag and places the wake without
+/// allocating or releasing a reference.
+pub fn is_scheduler_waker(waker: &Waker) -> bool {
+    core::ptr::eq(waker.vtable(), &TASK_VTABLE)
 }
 
 fn make_waker(cell: Arc<WakeCell>) -> Waker {
@@ -5700,6 +5820,10 @@ pub fn poll_one_round() -> usize {
         0
     };
 
+    // An executor round is this CPU's softirq context: expire its due
+    // hrtimers (soft ones, and hard ones whose interrupt has not been taken —
+    // a caller driving rounds with interrupts masked gets no timer interrupt).
+    let _ = narf_time::hrtimer::hrtimer_run_softirq();
     // Fold any cross-core wakes into READY first (Linux `sched_ttwu_pending`)
     // so a remote-pushed task is visited this round.
     drain_wake_list(cpu);
@@ -6639,7 +6763,7 @@ pub fn run_until_empty() {
             // context already drops Wakers via `drain_and_wake` below, so the
             // alloc is permitted. Servicing the entry clears the past-due
             // deadline, so the next arm reverts to a full `now + period` slice.
-            let _ = narf_time::timer_wheel::fire_due(now);
+            let _ = narf_time::hrtimer::hrtimer_run_softirq();
             if now.wrapping_sub(last_pump_cycles) >= pump_interval_cycles {
                 last_pump_cycles = now;
                 // `run_io`, not `run`: the executor loop is running, so the
@@ -6701,7 +6825,7 @@ pub fn run_until_empty() {
             // awake flag, so the executor actually reaches this branch.
             // Non-IRQ context here, so the expired Waker's `Sleepable`
             // dealloc on drop is legal (same as the `any_runnable` fire_due).
-            if narf_time::timer_wheel::fire_due(narf_time::now_cycles()) > 0 {
+            if narf_time::hrtimer::hrtimer_run_softirq() > 0 {
                 continue;
             }
             // Idle path. Nothing is runnable — HLT the CPU until an
@@ -6744,7 +6868,7 @@ pub fn run_until_empty() {
                 }
             }
             let now = narf_time::now_cycles();
-            let wheel_deadline = narf_time::timer_wheel::next_deadline_cycles();
+            let wheel_deadline = narf_time::hrtimer::next_event_cycles_local();
             let budget_deadline = next_budget_replenishment(cpu, now);
             let next_deadline = match (wheel_deadline, budget_deadline) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -6816,7 +6940,8 @@ pub fn run_until_empty() {
             // our commit. `swap(false)` consumes it. The wake-list + ready-queue
             // scan remain the backstop for wake sources not routed through the
             // resched signal.
-            let woke_late = NEED_RESCHED[cpu].swap(false, Ordering::SeqCst)
+            let woke_late = WAKE_PENDING[cpu].swap(false, Ordering::SeqCst)
+                | NEED_RESCHED[cpu].swap(false, Ordering::SeqCst)
                 || wake_list_pending(cpu)
                 // An IRQ that landed since this round's last `drain_and_wake` may
                 // have stashed a waker in THIS CPU's deferred queue; without
@@ -6893,7 +7018,7 @@ pub fn run_until_empty() {
             if next_deadline.is_some() {
                 // After the wake (or if the deadline already passed),
                 // fire any due wakers in this non-IRQ context.
-                let _ = narf_time::timer_wheel::fire_due(narf_time::now_cycles());
+                let _ = narf_time::hrtimer::hrtimer_run_softirq();
             }
         }
     }
@@ -6928,7 +7053,7 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
         return true;
     }
     // A parked sleeper's deadline has already passed.
-    if let Some(d) = narf_time::timer_wheel::next_deadline_cycles_try() {
+    if let Some(d) = narf_time::hrtimer::next_event_cycles_local() {
         if narf_time::now_cycles() >= d {
             return true;
         }
@@ -7483,7 +7608,7 @@ pub fn run_forever() -> ! {
         // `sti;hlt;cli` — the same handshake as run_until_empty's idle
         // path, minus wheel/budget deadline handling (an empty CPU has no
         // queued sleepers or budget replenishments to serve).
-        let next_deadline = narf_time::timer_wheel::next_deadline_cycles();
+        let next_deadline = narf_time::hrtimer::next_event_cycles_local();
         let idle_plan = narf_power_core::executor::prepare_idle(narf_power_core::IdleHints {
             cpu,
             now_cycles: narf_time::now_cycles(),
@@ -7508,7 +7633,8 @@ pub fn run_forever() -> ! {
             // Authoritative O(1) resched check first (Linux `need_resched()`),
             // consumed via swap; the queue / deferred-wake / wake-list checks
             // below remain the backstop.
-            let need = NEED_RESCHED[cpu].swap(false, Ordering::SeqCst);
+            let need = WAKE_PENDING[cpu].swap(false, Ordering::SeqCst)
+                | NEED_RESCHED[cpu].swap(false, Ordering::SeqCst);
             let nonempty = READY[cpu]
                 .lock()
                 .as_ref()
@@ -7559,7 +7685,7 @@ pub fn run_forever() -> ! {
                 narf_power_core::executor::reflect_idle(cpu, idle_plan, elapsed);
             }
             if next_deadline.is_some() {
-                narf_time::timer_wheel::fire_due(narf_time::now_cycles());
+                narf_time::hrtimer::hrtimer_run_softirq();
             }
         } else {
             // Unreliable-tick / IF=0 contexts (kernel-test, InitialCount

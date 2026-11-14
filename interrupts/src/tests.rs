@@ -511,13 +511,17 @@ fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
             woken = true;
             break;
         }
+        // This waker is not a scheduler task waker, so its sleeper expires
+        // on the _SOFT base, from the executor (NARF's HRTIMER_SOFTIRQ). The
+        // test stands in for the executor; the interrupt raises the softirq.
+        let _ = narf_time::hrtimer::hrtimer_run_softirq();
         core::hint::spin_loop();
     }
     // SAFETY: re-disable IRQs before returning.
     unsafe { narf_arch::disable_interrupts() };
 
     if !woken {
-        return TestResult::Fail("timer_wheel never woke the sleep waker");
+        return TestResult::Fail("the hrtimer never woke the sleep waker");
     }
 
     if !matches!(Pin::new(&mut s).poll(&mut cx), Poll::Ready(())) {

@@ -16,13 +16,13 @@
 //! Per-CPU storage avoids cross-CPU contention. Bounded size means
 //! no allocation in IRQ context.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::Waker;
 
 use crate::sync::IrqSafeSpinLock;
 
-/// Max wakers stashed per CPU. 64 matches `timer_wheel::MAX_SLEEPERS`
-/// — one full wheel drain can fit without overflow. Bursts beyond
+/// Max wakers stashed per CPU. 64 covers one burst of device-IRQ wakes
+/// without overflow. Bursts beyond
 /// that are recoverable: the wake source (timer tick) re-fires on
 /// the next deadline; missed wakers stay parked until then.
 const MAX_PENDING: usize = 64;
@@ -48,6 +48,12 @@ static QUEUES: [IrqSafeSpinLock<Queue>; N_CPUS] = {
     const Q: IrqSafeSpinLock<Queue> = IrqSafeSpinLock::new(Queue::new());
     [Q; N_CPUS]
 };
+
+/// Published under the corresponding queue lock. Padding keeps independent
+/// IRQ producers from sharing the cache line read at every user return.
+#[repr(align(64))]
+struct PendingFlag(AtomicBool);
+static PENDING: [PendingFlag; N_CPUS] = [const { PendingFlag(AtomicBool::new(false)) }; N_CPUS];
 
 /// Diagnostic: total wakers that overflowed (lost). Surfaced for
 /// debugging — non-zero suggests sleep deadlines are firing
@@ -79,6 +85,7 @@ pub fn push_pending_iter<I: IntoIterator<Item = Waker>>(wakers: I) {
         for slot in q.slots.iter_mut() {
             if slot.is_none() {
                 *slot = Some(w);
+                PENDING[cpu].0.store(true, Ordering::Release);
                 QUEUED_WAKERS.fetch_add(1, Ordering::Relaxed);
                 placed = true;
                 break;
@@ -100,10 +107,10 @@ pub fn push_pending_iter<I: IntoIterator<Item = Waker>>(wakers: I) {
 
 /// Push ONE waker; on a full queue return it to the caller instead of
 /// dropping it. IRQ-safe (bounded array, no allocation). The caller owns
-/// the recovery — e.g. `timer_wheel::drain_due_to_deferred` re-registers
-/// the sleeper on the wheel so its wake is deferred one tick, never lost
-/// (a dropped WHEEL waker has no re-fire source: the wheel slot was
-/// already vacated, so the module-doc overflow rationale doesn't apply).
+/// the recovery (re-queueing the wake on its source) so the wake is
+/// deferred, never lost. Timer expiry no longer uses this queue: hrtimer
+/// sleepers wake by reference from their own CPU's base
+/// (`narf_time::hrtimer`).
 pub fn try_push_one(w: Waker) -> Result<(), Waker> {
     let cpu = crate::percpu::current_cpu();
     let cpu = if cpu < N_CPUS { cpu } else { 0 };
@@ -111,6 +118,7 @@ pub fn try_push_one(w: Waker) -> Result<(), Waker> {
     for slot in q.slots.iter_mut() {
         if slot.is_none() {
             *slot = Some(w);
+            PENDING[cpu].0.store(true, Ordering::Release);
             QUEUED_WAKERS.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -138,12 +146,12 @@ pub fn has_pending() -> bool {
 /// [`has_pending`]. Using the global counter there is a correctness+liveness
 /// bug: an empty-queue CPU sees "pending" because a DIFFERENT CPU has an
 /// undrained waker it cannot reach, so it never halts and spins in `run_forever`
-/// (observed as a core stuck at CPL=0 in the steal loop). Bounded scan of this
-/// CPU's fixed slot array under its own lock; no cross-CPU traffic.
+/// (observed as a core stuck at CPL=0 in the steal loop). One acquire load of
+/// the queue's published presence flag; no lock, scan, or cross-CPU counter.
 pub fn has_pending_local() -> bool {
     let cpu = crate::percpu::current_cpu();
     let cpu = if cpu < N_CPUS { cpu } else { 0 };
-    QUEUES[cpu].lock().slots.iter().any(Option::is_some)
+    PENDING[cpu].0.load(Ordering::Acquire)
 }
 
 /// Drain this CPU's pending queue and call wake() on each. Must
@@ -164,6 +172,9 @@ pub fn drain_and_wake() -> usize {
         for (i, slot) in q.slots.iter_mut().enumerate() {
             taken[i] = slot.take();
         }
+        // Clear before releasing the lock/calling wakers: a callback that
+        // queues another wake publishes its own durable true for the next pass.
+        PENDING[cpu].0.store(false, Ordering::Release);
     }
     let mut n = 0usize;
     for w in taken.into_iter().flatten() {
