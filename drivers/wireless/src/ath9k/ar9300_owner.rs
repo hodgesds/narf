@@ -574,7 +574,7 @@ async fn initialize(
         permission.budget(),
         identity.tx_chainmask,
     )?;
-    grant.invoke(|| ar9003::power::program(&mut io, &plan))?;
+    grant.invoke(|| ar9003::power::program(&mut io, o.revision.chip, &plan))?;
     o.prepared.power = plan;
     // `ath9k_start` resets the SerDes registers before the station
     // runs (`ath9k_hw_configpcipowersave(ah, false)`): the low-power
@@ -1027,7 +1027,7 @@ async fn hw_reset_in_place(
         permission.budget(),
         identity.tx_chainmask,
     )?;
-    grant.invoke(|| ar9003::power::program(&mut io, &plan))?;
+    grant.invoke(|| ar9003::power::program(&mut io, o.revision.chip, &plan))?;
     prepared.power = plan;
     let revision = o.revision;
     let mut calibration = ar9003::calib::Calibration::default();

@@ -385,6 +385,92 @@ kernel_test_in!(
     smoke_ath9k_ar9003_tx_iq_enabled_cals
 );
 
+fn ar9462_nf_limits() -> Result<(), &'static str> {
+    // `ar9003_hw_set_nf_limits` (`ar9003_phy.c:1376`): AR9462/AR9565
+    // override the 2 GHz and 5 GHz minima and nominals to -127 (the
+    // maxima stay the AR9300 -60).
+    for (srev, chip, two, five) in [
+        (
+            0x001c_03ff,
+            super::super::Chip::Ar9300,
+            LIMITS_2GHZ,
+            LIMITS_5GHZ,
+        ),
+        (
+            0x001c_04ff,
+            super::super::Chip::Ar9580,
+            LIMITS_2GHZ,
+            LIMITS_5GHZ,
+        ),
+        (
+            0x0024_01ff,
+            super::super::Chip::Ar9485,
+            LIMITS_2GHZ,
+            LIMITS_5GHZ,
+        ),
+        (
+            0x0028_02ff,
+            super::super::Chip::Ar9462,
+            LIMITS_9462_2GHZ,
+            LIMITS_9462_5GHZ,
+        ),
+        (
+            0x002c_02ff,
+            super::super::Chip::Ar9565,
+            LIMITS_9462_2GHZ,
+            LIMITS_9462_5GHZ,
+        ),
+    ] {
+        let revision = rev_for(srev, chip);
+        if limits(&revision, false) != two || limits(&revision, true) != five {
+            return Err("ar9003_hw_set_nf_limits differs");
+        }
+    }
+    // End to end: the reset tail loads the AR9462 nominal (-127) for a
+    // chain with no calibration pier, and the Model's NF measurement
+    // reports -90/-130/-50 dBm on chains 0/1/2, so the periodic long
+    // calibration sanitizes chain 1's -130 to the -127 nominal and
+    // chain 2's -50 to the -60 maximum (`Limits::sanitize`).
+    let mut io = Model::new();
+    let mut cal = Calibration::default();
+    let revision = rev_for(0x0028_02ff, super::super::Chip::Ar9462);
+    let report =
+        run(&mut cal, &mut io, &revision, 3, 2412).map_err(|_| "AR9462 init cal refused")?;
+    if report.default_nf != [-100, -127, -105] {
+        return Err("AR9462 default NF differs");
+    }
+    let mut periodic = Periodic::new(&revision, &report, IqTotals::default(), 0);
+    periodic
+        .start(&mut io)
+        .map_err(|_| "AR9462 reset NF load failed")?;
+    if io.wrote(NF_REGS[0], nf_field(-100)).is_none()
+        || io.wrote(NF_REGS[1], nf_field(-127)).is_none()
+    {
+        return Err("AR9462 reset-tail loadnf differs");
+    }
+    periodic
+        .tick(&mut io, 1000)
+        .map_err(|_| "AR9462 IQ tick failed")?;
+    let tick = periodic
+        .tick(&mut io, 30_000)
+        .map_err(|_| "AR9462 NF tick failed")?;
+    if !tick.longcal || tick.noise_floor != Some(-90) || periodic.private_nf() != [-90, -127, -60] {
+        return Err("AR9462 periodic NF limits differ");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9462_nf_limits_follow_set_nf_limits() -> TestResult {
+    match ar9462_nf_limits() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_nf_limits_follow_set_nf_limits
+);
+
 /// One TX IQ measurement's chan-info words: the fixture values whose
 /// `ar9003_hw_calc_iq_corr` gives magnitude 24 / phase 3
 /// (`iqc_coeff[0]` 3075). Unpacked inputs, all `i2_p` 1500:
@@ -402,6 +488,11 @@ fn tx_iq_post_proc_9565() -> Result<(), &'static str> {
     let revision = rev_for(0x002c_02ff, super::super::Chip::Ar9565);
     io.tx_iq_status(false, 1);
     io.tx_iq_measurement(0, 0, IQ_A);
+    // `ar9003_hw_override_ini` reads `AR_PHY_TX_IQCAL_CONTROL_0` after
+    // the INI tables ran; no INI row writes it, so the fixture states
+    // the bit: set here, as the generation's INI leaves it.
+    io.values
+        .insert(AR_PHY_TX_IQCAL_CONTROL_0, TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL);
     let mut cal = Calibration::default();
     let report =
         run(&mut cal, &mut io, &revision, 1, 2412).map_err(|_| "AR9565 init cal refused")?;
@@ -421,6 +512,7 @@ fn tx_iq_post_proc_9565() -> Result<(), &'static str> {
     };
     if tx_iq_cal.num_measures != [1, 0, 0]
         || tx_iq_cal.tx_corr_coeff[0][0] != 3075
+        || !report.tx_iq_cal_enabled
         || io.wrote(AR_PHY_TX_IQCAL_CORR_COEFF_B0, 3075).is_none()
         || io
             .writes
@@ -444,6 +536,110 @@ fn smoke_ath9k_ar9565_tx_iq_cal_post_proc() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     smoke_ath9k_ar9565_tx_iq_cal_post_proc
+);
+
+fn ar9462_tx_iq_cal_override_ini_gate() -> Result<(), &'static str> {
+    // `ar9003_hw_override_ini` (`ar9003_phy.c:709`) gates `TX_IQ_CAL` on
+    // AR9462/AR9565 on the `AR_PHY_TX_IQCAL_CONTROL_0` readback; `run`
+    // carries the decision in the `Report` and a fast channel change
+    // reuses it instead of re-reading (the bit is rewritten by
+    // `init_cal_pcoem` itself).
+    let revision = rev_for(0x0028_02ff, super::super::Chip::Ar9462);
+
+    // Bit set: the DELPT program and the TX IQ post-processing run.
+    let mut io = Model::new();
+    io.tx_iq_status(false, 1);
+    io.tx_iq_measurement(0, 0, IQ_A);
+    io.values
+        .insert(AR_PHY_TX_IQCAL_CONTROL_0, TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL);
+    let mut cal = Calibration::default();
+    let saved =
+        run(&mut cal, &mut io, &revision, 1, 2412).map_err(|_| "AR9462 init cal refused")?;
+    let Some(tx_iq_cal) = saved.tx_iq_cal else {
+        return Err("AR9462 TX IQ calibration did not complete with the gate open");
+    };
+    if !saved.tx_iq_cal_enabled
+        || tx_iq_cal.tx_corr_coeff[0][0] != 3075
+        || io.wrote(AR_PHY_TX_IQCAL_CONTROL_1, DELPT << 18).is_none()
+    {
+        return Err("AR9462 TX IQ calibration differs with the gate open");
+    }
+    // The fast channel change re-runs the post-processing from the
+    // carried decision, with a fresh DELPT program and AGC calibration.
+    let mark = io.writes.len();
+    let mut fast = Calibration::default();
+    let report = fast_channel_change(&mut fast, &mut io, &revision, 1, 2437, &saved)
+        .map_err(|_| "AR9462 fast channel change refused")?;
+    let phase = &io.writes[mark..];
+    if !report.tx_iq_cal_enabled
+        || report.tx_iq_cal != saved.tx_iq_cal
+        || !phase.iter().any(|w| w.0 == AR_PHY_TX_IQCAL_CONTROL_1)
+        || !phase
+            .iter()
+            .any(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
+    {
+        return Err("AR9462 fast channel change did not reuse the gate decision");
+    }
+
+    // Bit clear: no DELPT program, no TX IQ post-processing, but the AGC
+    // calibration still runs (the carrier-leak calibration forces it)
+    // and the run succeeds.
+    let mut io = Model::new();
+    let mut cal = Calibration::default();
+    let saved =
+        run(&mut cal, &mut io, &revision, 1, 2412).map_err(|_| "AR9462 init cal refused")?;
+    if saved.tx_iq_cal_enabled
+        || saved.tx_iq_cal.is_some()
+        || io.wrote(AR_PHY_TX_IQCAL_CONTROL_1, DELPT << 18).is_some()
+        || io.writes.iter().any(|w| w.0 == AR_PHY_TX_IQCAL_CONTROL_0)
+        || io
+            .wrote(AR_PHY_AGC_CONTROL, AGC_CLC_SUCCESS | AGC_CAL)
+            .is_none()
+        || saved.peak_caldac != [Some(36), None, None]
+        || cal.state() != State::Ready
+    {
+        return Err("AR9462 TX IQ calibration ran with the gate closed");
+    }
+    // The fast channel change carries the closed decision across a second
+    // hop: still no DELPT program, no AGC calibration, no post-processing.
+    let mark = io.writes.len();
+    let mut fast = Calibration::default();
+    let report = fast_channel_change(&mut fast, &mut io, &revision, 1, 2437, &saved)
+        .map_err(|_| "AR9462 fast channel change refused")?;
+    let phase = &io.writes[mark..];
+    if report.tx_iq_cal_enabled
+        || report.tx_iq_cal.is_some()
+        || phase.iter().any(|w| w.0 == AR_PHY_TX_IQCAL_CONTROL_1)
+        || phase
+            .iter()
+            .any(|w| w.0 == AR_PHY_AGC_CONTROL && w.1 & AGC_CAL != 0)
+    {
+        return Err("AR9462 fast channel change re-read the gate");
+    }
+    let mark = io.writes.len();
+    let mut fast = Calibration::default();
+    let report = fast_channel_change(&mut fast, &mut io, &revision, 1, 2484, &report)
+        .map_err(|_| "AR9462 second fast channel change refused")?;
+    if report.tx_iq_cal_enabled
+        || report.tx_iq_cal.is_some()
+        || io.writes[mark..]
+            .iter()
+            .any(|w| w.0 == AR_PHY_TX_IQCAL_CONTROL_1)
+    {
+        return Err("AR9462 second fast channel change re-read the gate");
+    }
+    Ok(())
+}
+
+fn smoke_ath9k_ar9462_tx_iq_cal_override_ini_gate() -> TestResult {
+    match ar9462_tx_iq_cal_override_ini_gate() {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "drivers/wireless/ath9k/ar9003",
+    smoke_ath9k_ar9462_tx_iq_cal_override_ini_gate
 );
 
 fn tx_iq_post_proc_9485() -> Result<(), &'static str> {
@@ -878,6 +1074,9 @@ fn fast_channel_change_fresh() -> Result<(), &'static str> {
     let revision = rev_for(0x002c_02ff, super::super::Chip::Ar9565);
     io.tx_iq_status(false, 1);
     io.tx_iq_measurement(0, 0, IQ_A);
+    // `ar9003_hw_override_ini`'s readback (see `tx_iq_post_proc_9565`).
+    io.values
+        .insert(AR_PHY_TX_IQCAL_CONTROL_0, TXIQCAL_CONTROL_0_ENABLE_TXIQ_CAL);
     io.values.insert(CL_TAB[0], 0x1111_1111);
     io.values.insert(CL_TAB[0] + 20, 0x2222_2222);
     io.values.insert(CL_TAB[0] + 60, 0x3333_3333);
@@ -902,8 +1101,9 @@ fn fast_channel_change_fresh() -> Result<(), &'static str> {
     if report.frequency_mhz != 5180
         || !report.five_ghz
         || report.tx_iq_cal != Some(tx_iq_cal)
+        || !report.tx_iq_cal_enabled
         || report.peak_caldac != [Some(36), None, None]
-        || report.default_nf != [-100, -115, -105]
+        || report.default_nf != [-100, -127, -105]
         || fast.state() != State::Ready
         || !phase
             .iter()
