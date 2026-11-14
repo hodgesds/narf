@@ -2597,8 +2597,12 @@ retiring suspend. Resume runs `ath_pci_resume`'s config 0x41 fix, then
 `wow_resume` (`ath9k_resume`): `Radio::wow_resume` restores the saved
 mask (`ar9003::irq::restore`), `Wow::wakeup` reads/clears the wake reason
 and `ath9k_hw_configpcipowersave(ah, false)` re-runs
-`ar9003::serdes::configure`; TSF2 has no generic-timer owner and is only
-reported. RX DMA, which `ath9k_hw_wow_enable` stopped (`AR_CR_RXD`), is
+`ar9003::serdes::configure`; TSF2 restarts through the generic-timer
+table (`ar9003::gen_timer::GenTimerTable`, `hw.c`'s `ath_gen_timer_table`
+shape: 16 slots, `timer_mask`, sticky `tsf2_enabled`): `wow_resume`
+calls `start_tsf2` — `AR_DC_AP_STA_EN` in `AR_DIRECT_CONNECT`,
+`AR_RESET_TSF2_ONCE` in `AR_RESET_TSF` — when `wakeup` reports the
+TSF2 enable clear and a TSF2 timer (index 8..15) was allocated. RX DMA, which `ath9k_hw_wow_enable` stopped (`AR_CR_RXD`), is
 restarted by the in-place reset with the association kept: Linux reaches
 it through `ath_restart_work` -> `ath_hw_rx_inactive_check` about 5 s
 later; here `wow_resume` queues `ResetType::RxInactive` directly (RX is
