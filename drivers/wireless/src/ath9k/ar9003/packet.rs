@@ -43,8 +43,10 @@
 //! instead of `IEEE80211_MAX_MPDU_LEN / 2`.
 #![cfg_attr(not(any(test, feature = "kernel-test")), allow(dead_code))]
 
+use super::btcoex::SharedMciLink;
 use super::edma::{self, RxQueue, Series, StatusRing, TxInfo, RXS_BYTES, TXC_WORDS, TXS_WORDS};
 use super::irq;
+use super::mci;
 use crate::ath9k::descriptor::{self, TxStatus as LegacyStatus, WORDS};
 use crate::ath9k::identity::{BringUpError, RegisterIo};
 use crate::ath9k::packet::{Delivery, Error, Phase, Port, ReceiveStep};
@@ -353,6 +355,10 @@ pub(in crate::ath9k) struct Packet<P: Port> {
     /// The last programmed `set_peer` (BSSID/AID, slot), which
     /// `ath9k_hw_reset` re-writes (`ath9k_hw_write_associd`, slot time).
     peer: Option<PeerProgram>,
+    /// The shared MCI link (`btcoex::MciLink`): the coexistence state
+    /// plus the DMA GPM ring. The owner holds the other clone; the
+    /// engine is reached only through this lock.
+    mci: SharedMciLink,
 }
 /// One `set_peer` program: BSSID/AID (or none) and the slot time.
 type PeerProgram = (Option<([u8; 6], u16)>, u32);
@@ -382,8 +388,13 @@ impl<P: Port> Packet<P> {
     /// AR9300 and configured the legacy station MAC/queue 0 while bus
     /// mastering, both receive FIFOs, every TX queue and IRQ delivery were
     /// off. No inherited DMA may refer to these fresh mappings and no other
-    /// actor can start the engines.
-    pub(in crate::ath9k) unsafe fn prepare(port: P, local: [u8; 6]) -> Result<Self, Error> {
+    /// actor can start the engines. `mci` is the owner's shared MCI link;
+    /// the packet engine reaches the coexistence engine only through it.
+    pub(in crate::ath9k) unsafe fn prepare(
+        port: P,
+        local: [u8; 6],
+        mci: SharedMciLink,
+    ) -> Result<Self, Error> {
         if local[0] & 1 != 0 || local == [0; 6] {
             return Err(Error::Packet);
         }
@@ -447,6 +458,7 @@ impl<P: Port> Packet<P> {
             reset: None,
             paused: None,
             peer: None,
+            mci,
         })
     }
     pub(in crate::ath9k) fn phase(&self) -> Phase {
@@ -542,6 +554,23 @@ impl<P: Port> Packet<P> {
             self.reset = Some(ResetType::Calibration);
         }
         result
+    }
+    /// One periodic MCI coexistence poll (`ar9003_mci_check_bt`) on the
+    /// owner's `RegisterIo` path: sync BT state, the 2G/5G switch and the
+    /// BT-info query/flush. A non-running owner has none; a chip without
+    /// a live MCI link is a no-op (the engine is not ready).
+    pub(in crate::ath9k) fn check_bt(&mut self) -> Result<(), Error> {
+        if self.phase != Phase::Running {
+            return Err(Error::State);
+        }
+        let mci = &self.mci;
+        with_io(&self.port, |io| {
+            let mut link = mci.lock();
+            if !link.mci_enabled() {
+                return Ok(());
+            }
+            mci::check_bt(io, &mut link.btcoex.mci)
+        })
     }
     /// Legacy frame at `rate` (`descriptor::transmit`).
     pub(in crate::ath9k) fn submit(&mut self, frame: &[u8], rate: usize) -> Result<u64, Error> {
@@ -772,7 +801,7 @@ impl<P: Port> Packet<P> {
             return Ok(false);
         }
         self.phase = Phase::Failed;
-        let mask = irq::enable(&self.port, true)?;
+        let mask = irq::enable(&self.port, true, self.mci.lock().mci_enabled())?;
         self.irq = Some(mask);
         self.full_imr = mask.imr;
         self.port.deliver(true)?;
@@ -796,9 +825,9 @@ impl<P: Port> Packet<P> {
         if self.phase != Phase::Running {
             return Err(Error::State);
         }
-        // No MCI engine is owned yet (follow-up: live-owner
-        // integration); MCI interrupts are not routed.
-        let events = irq::cause(&self.port, mask.imr, false)?;
+        // The live-MCI gate, from the shared link the owner holds
+        // (`hw.h::ath9k_hw_mci_is_enabled` plus the DMA ring).
+        let events = irq::cause(&self.port, mask.imr, self.mci.lock().mci_enabled())?;
         irq::kill(&self.port, mask.msi)?;
         let Some(events) = events else {
             return Ok(None);
@@ -812,6 +841,36 @@ impl<P: Port> Packet<P> {
             });
             self.phase = Phase::Failed;
             return Err(Error::Access);
+        }
+        if events.mci {
+            // `mci.c::ath_mci_intr` on the owner's `RegisterIo` path:
+            // sync the DMA ring, latch the cause, walk the GPM ring. A
+            // dead-card latch or a BT calibration request closes this
+            // generation, the NARF analogue of Linux queueing
+            // `RESET_TYPE_MCI` (the same code shape as the fatal path
+            // above).
+            let mci = &self.mci;
+            let (isr_live, outcome) = with_io(&self.port, |io| {
+                let mut link = mci.lock();
+                // Clone the ring out of the link first: the sync takes
+                // the DMA buffer by reference while mutating the engine
+                // behind the same lock.
+                let dma = link.dma.clone();
+                if let Some(dma) = &dma {
+                    mci::sync_gpm_ring(io, dma, &mut link.btcoex.mci);
+                }
+                let live = mci::get_isr(io, &mut link.btcoex.mci);
+                let outcome = if live {
+                    mci::handle_interrupt(io, &mut link.btcoex.mci)?
+                } else {
+                    mci::InterruptOutcome::default()
+                };
+                Ok((live, outcome))
+            })?;
+            if !isr_live || outcome.reset_requested {
+                self.phase = Phase::Failed;
+                return Err(Error::Access);
+            }
         }
         if events.rx_eol && mask.imr & irq::RX_EOL_ORN != 0 {
             // ath_isr: drop RXEOL|RXORN until the RX tasklet ran.

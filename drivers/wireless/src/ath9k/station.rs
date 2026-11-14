@@ -466,6 +466,16 @@ impl<P: Port, E: Environment, K: Engine> Radio<P, E, K> {
             ok => ok.map_err(Error::Transport),
         }
     }
+    /// One periodic MCI coexistence poll of a live station
+    /// (`ar9003_mci_check_bt`): sync BT state, the 2G/5G switch and the
+    /// BT-info query/flush. A failed poll never closes the generation
+    /// (Linux's `check_bt` is void); the supervisor logs it.
+    pub(super) fn check_bt(&mut self) -> Result<(), Error> {
+        if self.terminal() {
+            return Err(Error::State);
+        }
+        self.packet.check_bt().map_err(Error::Transport)
+    }
     /// Stop (if still running) and report whether the packet owner proved
     /// DMA quiescence and released its storage.
     pub(super) fn retire(&mut self) -> bool {
