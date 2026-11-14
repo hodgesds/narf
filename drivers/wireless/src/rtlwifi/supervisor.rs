@@ -68,7 +68,15 @@ where
                             Operation::Retune(channel) => device.retune_once(channel).await,
                             Operation::Resume => {
                                 device.lifecycle.suspended.store(false, Ordering::Release);
-                                device.recover_once().await
+                                let resumed = device.recover_once().await?;
+                                // `btc_ips_notify(ERFON)` (`ps.c::rtl_ips_nic_on`): the
+                                // NIC is back on after IPS, on the fresh
+                                // owner. Only a rebuild notifies; when nothing
+                                // was rebuilt there was no IPS exit.
+                                if resumed {
+                                    device.be8723_ips_notify_erfon().await?;
+                                }
+                                Ok(resumed)
                             }
                         }
                     }),

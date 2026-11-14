@@ -101,6 +101,12 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         }
         let _scan = self.scan_request.lock().await;
         self.scan_cache.lock().clear();
+        // `btc_scan_notify(1)` (`core.c::rtl_op_sw_scan_start`): the scan
+        // runs on the live owner, so the coexistence algorithm can yield
+        // the antenna. The (0) notify runs at the successful end below; a
+        // failed scan aborts and closes the owner, leaving no live coex
+        // owner to notify.
+        self.be8723_scan_notify(true).await.map_err(error)?;
         let home = self.lifecycle.channel.load(Ordering::Acquire);
         let multiple = channels.len() > 1;
         let mut observations: Vec<Observation> = Vec::new();
@@ -132,7 +138,26 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
         observations.retain(|entry| entry.current(now));
         let result = observations.iter().map(Observation::info).collect();
         *self.scan_cache.lock() = observations;
+        self.be8723_scan_notify(false).await.map_err(error)?;
         Ok(result)
+    }
+    /// `btc_scan_notify` for the RTL8723BE owner, if one is live
+    /// (`ready()` is the scan's own admission step, already run per channel
+    /// by `scan_one`; running it here too is a no-op on a live owner). Any
+    /// other chip, or no owner, is a no-op.
+    async fn be8723_scan_notify(&self, start: bool) -> Result<(), Error> {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return Ok(());
+        };
+        if owner.chip() != super::super::prepare::Chip::Rtl8723be {
+            return Ok(());
+        }
+        self.ready(owner).await?;
+        owner
+            .be8723_scan_notify(start)
+            .await
+            .map_err(|_| Error::State)
     }
     async fn scan_one(
         &self,

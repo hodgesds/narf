@@ -707,6 +707,20 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     pub(crate) fn rtl8821ae_tx_reports_settled(&self) -> bool {
         !self.rtl8821ae() || self.ae_tx_reports_settled()
     }
+    /// RTL8723BE: the latest C2H TX report matched to its frame
+    /// (`rtl_tx_report_handler` in `be8723_service_c2h`).
+    pub(crate) fn take_rtl8723be_tx_report(&mut self) -> Option<ae::TxReport> {
+        if !self.rtl8723be() {
+            return None;
+        }
+        self.packet.be8723.report.take()
+    }
+    /// RTL8723BE: every `SPE_RPT` request has its C2H report
+    /// (`rtl_check_tx_report_acked` without the 3 s timeout, which the
+    /// caller's deadline owns).
+    pub(crate) fn rtl8723be_tx_reports_settled(&self) -> bool {
+        !self.rtl8723be() || self.packet.be8723.reports.all_acked()
+    }
     /// RTL8821AE: firmware RA's current rate (`DESC_RATE*`) from C2H.
     pub(crate) fn rtl8821ae_ra_rate(&self) -> Option<u8> {
         if !self.rtl8821ae() {

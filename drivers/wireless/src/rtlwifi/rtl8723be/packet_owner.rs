@@ -39,7 +39,9 @@
 //! - Stop: `btc_halt_notify`, then the stopped owner's DMA idle proof
 //!   (`RTL8723_NIC_LPS_ENTER_FLOW`'s TX-buffer-empty / RXDMA-idle
 //!   conditions); `rtl8723be_card_disable` is the rebuild's power-down.
-use super::super::super::rtl8723be::{dm, h2c, packet::C2hQueue, rsvd_page, station as hw, trx};
+use super::super::super::rtl8723be::{
+    c2h, dm, h2c, packet::C2hQueue, rsvd_page, station as hw, trx,
+};
 use super::{
     extent, queue, Error, Memory, Mpdu, Pending, Phase, Port, Prepared, ReceiveStep, OWN,
     RX_BUFFER, RX_BYTES, TX_BYTES,
@@ -59,6 +61,9 @@ const RSVD_ATTEMPTS: usize = 5;
 const BCN_VALID_POLLS: usize = 20;
 /// `_rtl8723be_init_mac` `REG_CR` word.
 const CR_RUNNING: u16 = 0x02ff;
+/// Bound on frames awaiting their TX report, as in `packet_ae.rs`
+/// (`REPORT_WAIT` 64; Linux purges the `tx_report->queue` after 3 s).
+const REPORT_WAIT: usize = 64;
 /// Bound on queued C2H packets awaiting [`Prepared::be8723_service_c2h`].
 const C2H_QUEUE: usize = 32;
 
@@ -70,12 +75,20 @@ pub(in super::super) struct State {
     pub(in super::super) link: Option<(h2c::Peer, bool, u8)>,
     /// `rtlpriv->ra.ratr_state` (`DM_RATR_STA_INIT` 0).
     pub(in super::super) ratr_state: u8,
+    /// `rtl8723be_dm_watchdog` state (`dig_t` + `rtl_dm` fields), lazily
+    /// initialised from the live BB state on the first watchdog run.
+    pub(in super::super) dm: Option<dm::Dm>,
+    /// `mac->min_space_cfg` (`REG_AMPDU_MIN_SPACE` software cache).
+    pub(in super::super) min_space_cfg: u8,
     /// `bss_conf->use_short_preamble` / `use_short_slot` as programmed.
     pub(in super::super) erp_timing: Option<(bool, bool)>,
-    /// `rtlpriv->tx_report.sn`.
-    report_sn: u16,
-    /// Latest C2H TX report (`sn`, acknowledged).
-    pub(in super::super) report: Option<(u16, bool)>,
+    /// `rtlpriv->tx_report` sequence state.
+    pub(in super::super) reports: c2h::TxReportState,
+    /// `SW_DEFINE` and delivery id of frames awaiting their TX report
+    /// (`tx_report->queue`); bounded, oldest dropped as Linux's 3 s purge.
+    waiting: Vec<(u16, u64)>,
+    /// Latest C2H TX report matched to its frame.
+    pub(in super::super) report: Option<super::ae::TxReport>,
     /// RX C2H packets awaiting the coexistence dispatch.
     pub(in super::super) c2h: C2hQueue,
 }
@@ -88,8 +101,11 @@ impl State {
             },
             link: None,
             ratr_state: 0,
+            dm: None,
+            min_space_cfg: 0,
             erp_timing: None,
-            report_sn: 0,
+            reports: c2h::TxReportState::default(),
+            waiting: Vec::new(),
             report: None,
             c2h: C2hQueue::default(),
         }
@@ -262,11 +278,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             Some((_, _, index)) => index,
             None => RATR_INX_WIRELESS_MC,
         };
-        let tx_report = super::ae::wants_report(frame).then(|| {
-            let sn = (self.packet.be8723.report_sn.wrapping_add(1) & 0x3f) << 2;
-            self.packet.be8723.report_sn = self.packet.be8723.report_sn.wrapping_add(1);
-            sn
-        });
+        let tx_report =
+            super::ae::wants_report(frame).then(|| self.packet.be8723.reports.next_sn());
         let bw_40 = op.forty();
         // `_rtl_query_protection_mode`: CTS-to-self sets `rts_enable` and
         // `cts_enable`, RTS/CTS `rts_enable` only; both at `DESC_RATE24M`
@@ -276,6 +289,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             super::super::super::protection::Mode::RtsCts => (true, false),
             super::super::super::protection::Mode::CtsToSelf => (true, true),
         };
+        // `_rtl_qurey_shortpreamble_mode` (`base.c`): short preamble unless
+        // the frame goes at 1M (`DESC_RATE1M`); the RTS short flags are
+        // always false (`_rtl_query_protection_mode`).
+        let use_shortpreamble = self
+            .packet
+            .be8723
+            .erp_timing
+            .is_some_and(|(short, _)| short)
+            && hw_rate != trx::DESC_RATE1M;
         let descriptor = trx::TxDesc::fill(&trx::TxParams {
             pkt_size: frame.len() as u16,
             queue_sel: selector,
@@ -285,7 +307,7 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             use_driver_rate: link.is_none(),
             disable_fallback: link.is_none(),
             use_shortgi: short_gi,
-            use_shortpreamble: false,
+            use_shortpreamble,
             bw_40,
             // `_rtl_query_bandwidth_mode`: a unicast HT packet above 54M on
             // a 40 MHz station.
@@ -324,6 +346,15 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             prefix,
         });
         self.packet.serial = id;
+        if let Some(sn) = tx_report {
+            let waiting = &mut self.packet.be8723.waiting;
+            if waiting.len() == REPORT_WAIT {
+                waiting.remove(0);
+            }
+            waiting.try_reserve(1).map_err(|_| Error::Memory)?;
+            waiting.retain(|(s, _)| *s != sn);
+            waiting.push((sn, id));
+        }
         self.phase = Phase::Failed;
         let ring = &mut self.tx[queue];
         self.io.authority(true, || {
@@ -471,8 +502,8 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
     /// `rtl_c2hcmd_launcher`: every queued RX C2H packet through
     /// `rtl_c2h_content_parsing` on the coexistence owner (BT info / MP
     /// reports drive the coexistence algorithm, whose MP waits poll the same
-    /// queue); a TX report is recorded (`rtl_tx_report_handler`). Returns
-    /// the number of packets dispatched.
+    /// queue); a TX report is matched to its frame (`rtl_tx_report_handler`).
+    /// Returns the number of packets dispatched.
     pub(crate) async fn be8723_service_c2h(&mut self) -> Result<usize, Error> {
         if self.phase != Phase::Running {
             return Err(Error::State);
@@ -484,8 +515,22 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
             let outcome = coex
                 .c2h(&self.io, &mut self.packet.be8723.c2h, &pkt[..n])
                 .await?;
-            if let super::super::super::rtl8723be::coex::C2h::TxReport { sn, st, .. } = outcome {
-                self.packet.be8723.report = Some((sn, st == 0));
+            if let super::super::super::rtl8723be::coex::C2h::TxReport { sn, st, retry } = outcome {
+                self.packet.be8723.reports.record(sn);
+                if let Some(at) = self
+                    .packet
+                    .be8723
+                    .waiting
+                    .iter()
+                    .position(|(s, _)| *s == sn)
+                {
+                    let (_, id) = self.packet.be8723.waiting.remove(at);
+                    self.packet.be8723.report = Some(super::ae::TxReport {
+                        id,
+                        acked: st == 0,
+                        retry,
+                    });
+                }
             }
             self.phase = Phase::Running;
             served += 1;
@@ -624,6 +669,9 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.be8723_media_status(true).await?;
         self.phase = Phase::Running;
+        // `exhalbtc_connect_notify(ASSOCIATE_FINISH)`: the association is
+        // complete (the start notify ran in `connect_station`).
+        self.be8723_connect_notify(false).await?;
         Ok(())
     }
 
@@ -654,6 +702,82 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         coex.lps.report_linked = connect;
         coex.media_status(&self.io, &mut self.packet.be8723.c2h, connect)
             .await?;
+        Ok(())
+    }
+
+    /// `btc_scan_notify` (`core.c::rtl_op_sw_scan_start/complete`): the
+    /// shared station calls this around a software scan so the coexistence
+    /// algorithm can yield the antenna. Only a running owner takes it.
+    pub(crate) async fn be8723_scan_notify(&mut self, start: bool) -> Result<(), Error> {
+        if !self.transmit_ready() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let coex = self.rtl8723be_coex.as_deref_mut().ok_or(Error::State)?;
+        coex.scan(&self.io, &mut self.packet.be8723.c2h, start)
+            .await?;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `exhalbtc_connect_notify` (`ASSOCIATE_START` / `FINISH`): the shared
+    /// station calls this around the association. Only a running owner
+    /// takes it. (No caller for this notify exists in Linux v6.1 rtlwifi
+    /// core — only the `rtl_btc_connect_notify` wrapper and the halbtc
+    /// implementation — so the retained call sites are the association
+    /// boundaries the coex module documents.)
+    pub(crate) async fn be8723_connect_notify(&mut self, start: bool) -> Result<(), Error> {
+        if !self.transmit_ready() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let coex = self.rtl8723be_coex.as_deref_mut().ok_or(Error::State)?;
+        coex.connect(&self.io, &mut self.packet.be8723.c2h, start)
+            .await?;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `base.c::setup_special_tx` for one special frame (`btc::Packet`):
+    /// `btc_special_packet_notify`, then `rtl_lps_leave`. Only a running
+    /// owner takes it.
+    pub(crate) async fn be8723_special_packet_notify(
+        &mut self,
+        pkt: super::super::super::btcoex::btc::Packet,
+    ) -> Result<(), Error> {
+        if !self.transmit_ready() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let coex = self.rtl8723be_coex.as_deref_mut().ok_or(Error::State)?;
+        coex.special_packet(&self.io, &mut self.packet.be8723.c2h, pkt)
+            .await?;
+        coex.lps_leave(&self.io).await?;
+        self.packet.leisure = false;
+        self.phase = Phase::Running;
+        Ok(())
+    }
+
+    /// `btc_ips_notify` (`ps.c::_rtl_ps_inactive_ps` / `rtl_ips_nic_on`):
+    /// ERFOFF before the NIC goes off, ERFON after it comes back. On ERFON
+    /// Linux also runs `btc_scan_notify(1)` then `(0)` ("in some situation,
+    /// it doesn't scan after leaving IPS, and this will cause btcoex in
+    /// wrong state", `rtl_btc.c`). Only a running owner takes it.
+    pub(crate) async fn be8723_ips_notify(&mut self, rf_off: bool) -> Result<(), Error> {
+        if !self.transmit_ready() {
+            return Err(Error::State);
+        }
+        self.phase = Phase::Failed;
+        let coex = self.rtl8723be_coex.as_deref_mut().ok_or(Error::State)?;
+        coex.ips(&self.io, &mut self.packet.be8723.c2h, rf_off)
+            .await?;
+        if !rf_off {
+            coex.scan(&self.io, &mut self.packet.be8723.c2h, true)
+                .await?;
+            coex.scan(&self.io, &mut self.packet.be8723.c2h, false)
+                .await?;
+        }
+        self.phase = Phase::Running;
         Ok(())
     }
 
@@ -795,15 +919,16 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         Ok(())
     }
 
-    /// The composed part of `rtl8723be_dm_watchdog` (firmware out of power
-    /// save): `rtl8723be_dm_refresh_rate_adaptive_mask` ([`dm::ra_state`]
-    /// over the smoothed `undec_sm_pwdb`; a level change re-sends the mask
-    /// with `update_bw`), then `rtl_watchdog_wq_callback`'s
-    /// `btc_periodical` through the coexistence owner (with the queued C2H
-    /// first, as `c2hcmd_wq` runs ahead of it; the coexistence step also
-    /// runs in leisure PS, the DM step does not). The other DM steps keep
-    /// their `rtl8723be_hw_init` table values. Returns whether a mask was
-    /// sent.
+    /// The composed part of `rtl8723be_dm_watchdog` (`dm.c`, in the Linux
+    /// order): common info, false-alarm statistics, RSSI monitor, DIG,
+    /// dynamic EDCCA, CCK PD, the RA mask refresh (with `update_bw`), the
+    /// ATC switch's unlinked branch and the (empty) dynamic-TX-power step,
+    /// then `rtl_watchdog_wq_callback`'s `btc_periodical` through the
+    /// coexistence owner (with the queued C2H first, as `c2hcmd_wq` runs
+    /// ahead of it; the coexistence step also runs in leisure PS, the DM
+    /// steps do not). EDCA turbo, the ATC switch's linked branch and
+    /// TX-power tracking are not composed (`dm.rs` module note). Returns
+    /// whether a mask was sent.
     pub(super) async fn be8723_dm_watchdog(
         &mut self,
         undec_sm_pwdb: i64,
@@ -814,13 +939,44 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         }
         self.be8723_service_c2h().await?;
         let mut refreshed = false;
-        // The DM step runs only with the firmware out of power save;
+        // The DM steps run only with the firmware out of power save;
         // `btc_periodical` runs from `rtl_watchdog_wq_callback` either way.
-        if let (Some((peer, bw40, _)), false) = (self.packet.be8723.link, self.packet.leisure) {
-            if let Some(state) = dm::ra_state(undec_sm_pwdb, self.packet.be8723.ratr_state) {
-                self.be8723_install_rate_mask(peer, bw40, state, true)
+        if !self.packet.leisure {
+            let linked = self.packet.be8723.link.is_some();
+            if self.packet.be8723.dm.is_none() {
+                self.packet.be8723.dm = Some(dm::Dm::init(&self.io)?);
+            }
+            self.phase = Phase::Failed;
+            let dm = self.packet.be8723.dm.as_mut().ok_or(Error::State)?;
+            dm.one_entry_only = dm::common_info(linked);
+            let fa = dm::false_alarm(&self.io)?;
+            let rssi_h2c = dm::rssi_monitor(&self.io, dm, undec_sm_pwdb, linked)?;
+            if let Some(payload) = rssi_h2c {
+                self.rtl8723be_coex
+                    .as_deref_mut()
+                    .ok_or(Error::State)?
+                    .mailbox
+                    .fill(&self.io, h2c::H2C_RSSIBE_REPORT, &payload)
                     .await?;
-                refreshed = true;
+            }
+            dm::dig(&self.io, dm, linked, fa.cnt_all)?;
+            dm::dynamic_edcca(&self.io, dm.pre_edcca_enable)?;
+            dm::cck_packet_detection_thresh(&self.io, dm, linked, fa.cnt_cck_fail)?;
+            if !linked {
+                let bt_disabled = self
+                    .rtl8723be_coex
+                    .as_deref()
+                    .is_some_and(|coex| coex.btc.is_bt_disabled());
+                dm::atc_switch_unlinked(&self.io, dm, bt_disabled)?;
+            }
+            dm::dynamic_txpower();
+            self.phase = Phase::Running;
+            if let Some((peer, bw40, _)) = self.packet.be8723.link {
+                if let Some(state) = dm::ra_state(undec_sm_pwdb, self.packet.be8723.ratr_state) {
+                    self.be8723_install_rate_mask(peer, bw40, state, true)
+                        .await?;
+                    refreshed = true;
+                }
             }
         }
         self.phase = Phase::Failed;
