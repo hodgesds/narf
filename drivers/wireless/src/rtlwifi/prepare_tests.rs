@@ -740,3 +740,252 @@ kernel_test_in!(
     "drivers/wireless/rtlwifi",
     smoke_rtl8723be_retained_rings_init_mac_prefix_and_llt
 );
+
+/// Test board factory for the RTL8192DE native-admission test
+/// (synthetic values, not any board's).
+fn de_factory() -> super::super::efuse::Factory {
+    super::super::efuse::Factory {
+        mac: [0x00, 0xe0, 0x4c, 0x81, 0x92, 0xde],
+        logical: [0u8; 512],
+    }
+}
+
+/// US regulatory domain covering both bands: 2402-2472 MHz at 20 dBm
+/// plus the UNII-1/2/3 blocks at 30 dBm (no flags, so no DFS rule
+/// overlaps the test spans).
+fn de_domain() -> narf_wireless::reg::RegulatoryDomain {
+    use narf_wireless::reg::*;
+    RegulatoryDomain {
+        country_code: *b"US",
+        rules: vec![
+            RegRule {
+                freq_start_mhz: 2402,
+                freq_end_mhz: 2472,
+                max_bandwidth_mhz: 40,
+                max_power_dbm: 20,
+                flags: RegFlags::empty(),
+            },
+            RegRule {
+                freq_start_mhz: 5140,
+                freq_end_mhz: 5360,
+                max_bandwidth_mhz: 80,
+                max_power_dbm: 30,
+                flags: RegFlags::empty(),
+            },
+            RegRule {
+                freq_start_mhz: 5460,
+                freq_end_mhz: 5860,
+                max_bandwidth_mhz: 80,
+                max_power_dbm: 30,
+                flags: RegFlags::empty(),
+            },
+        ],
+    }
+}
+
+/// NAPC v3 fixture for the 8192DE native-admission test: 20 MHz rows
+/// on channels 6 (2.4 GHz), 36 and 165 (5 GHz), flat rising curves
+/// (`2 * index`, so a 20/30 dBm ceiling admits index 40 on every
+/// rate), CCK unmeasured on 5 GHz rows as the format requires.
+fn de_napc_v3_native() -> Vec<u8> {
+    let factory = de_factory();
+    let identity = super::super::radio::factory_identity(&factory);
+    let rows: [(u8, u8); 3] = [(6, 0), (36, 1), (165, 1)];
+    let total = 96 + rows.len() * 516;
+    let mut bytes = vec![0u8; total];
+    bytes[0..4].copy_from_slice(b"NAPC");
+    bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
+    bytes[6..8].copy_from_slice(&96u16.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(total as u32).to_le_bytes());
+    bytes[12..14].copy_from_slice(&0x10ecu16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&0x8193u16.to_le_bytes());
+    bytes[16..48].copy_from_slice(&identity);
+    bytes[48..54].copy_from_slice(&factory.mac);
+    bytes[56..58].copy_from_slice(&0i16.to_le_bytes());
+    bytes[58..60].copy_from_slice(&80i16.to_le_bytes());
+    bytes[60..62].copy_from_slice(&(rows.len() as u16).to_le_bytes());
+    for (i, (channel, band)) in rows.iter().enumerate() {
+        let row = &mut bytes[96 + i * 516..96 + (i + 1) * 516];
+        row[0] = *channel;
+        row[1] = *band;
+        row[2] = 20;
+        row[3] = 0;
+        for curve in 0..4u8 {
+            for idx in 0..64u8 {
+                let value = if *band == 1 && curve == 0 {
+                    i16::MAX
+                } else {
+                    i16::from(idx) * 2
+                };
+                let at = 4 + (usize::from(curve) * 64 + usize::from(idx)) * 2;
+                row[at..at + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+/// A dual-dual RTL8192DE owner in `RadioConfigured` on `interface_index`
+/// (0 = MAC0 on 5 GHz, 1 = MAC1 on 2.4 GHz), with a zeroed factory
+/// power store (`txpwr_fromeprom` clear, so the channel step takes the
+/// no-EEPROM levels) and a fresh IQK matrix — the state
+/// `configure_rtl8192de` leaves before `admit_rtl8192de` runs.
+fn de_owner(factory: &super::super::efuse::Factory, interface_index: u8) -> Prepared<Port, Block> {
+    use super::super::rtl8192de::{
+        calib::IqkMatrix,
+        dm::Dm,
+        init::Radio,
+        lck::LcOutcome,
+        phy::{PgStore, MAX_PG_GROUP},
+        txpower::{Efuse, PowerLevels, CHANNEL_MAX_NUMBER},
+        Band, BandSet, MacPhyMode, RfType,
+    };
+    let port = Port::new();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut address = 0x10000;
+    let mut owner = Prepared::allocate_for(Chip::Rtl8192de, port, 4, |bytes| {
+        address = (address + 255) & !255;
+        let block = Block {
+            address,
+            bytes: vec![0xa5; bytes],
+            drops: drops.clone(),
+        };
+        address += bytes as u64;
+        Ok(block)
+    })
+    .unwrap();
+    owner
+        .bind_rtl8192de_mode(MacPhyMode::DualMacDualPhy)
+        .unwrap();
+    let band = if interface_index == 0 {
+        Band::On5Ghz
+    } else {
+        Band::On2Ghz
+    };
+    let bandset = if interface_index == 0 {
+        BandSet::On5Ghz
+    } else {
+        BandSet::On2Ghz
+    };
+    owner.rtl8192de = Some(Box::new(super::de92_radio::De92Radio {
+        identity: super::super::radio::factory_identity(factory),
+        radio: Radio {
+            mode: MacPhyMode::DualMacDualPhy,
+            interface_index,
+            band,
+            rf_type: RfType::OneT1R,
+            chnlval: [0; 2],
+            iqk: IqkMatrix::new(),
+            receive_config: 0,
+            cck_high_power: false,
+            initialgain: [0; 4],
+            framesync: 0,
+            framesync_c34: 0,
+            power_levels: PowerLevels {
+                cck: [0; 2],
+                ofdm: [0; 2],
+                current: None,
+                from_eeprom: false,
+            },
+            pg: Some(PgStore {
+                mcs_offset: [[0; 16]; MAX_PG_GROUP],
+                pwrgroup_cnt: 0,
+            }),
+            rf_on: true,
+            // Fresh `rtl92de_dm_init` state, exactly what
+            // `configure()` stores (init.rs); the DM state is
+            // report-only for the prepare/admit path under test.
+            dm: Dm::new(),
+            // `lc_calibrate`'s initial outcome for this 1-path RF
+            // (lck.rs); the fixture never runs calibration, and
+            // `path_count` is the load-bearing field (cf. the
+            // `configure` end-to-end test asserting it).
+            lc: LcOutcome {
+                scan_wait_us: 0,
+                path_count: RfType::OneT1R.paths(),
+                poll_ms: [0; 2],
+                poll_timed_out: [false; 2],
+            },
+        },
+        efuse: Efuse {
+            cck: [[0; CHANNEL_MAX_NUMBER]; 2],
+            ht40_1s: [[0; CHANNEL_MAX_NUMBER]; 2],
+            ht40_2s: [[0; CHANNEL_MAX_NUMBER]; 2],
+            ht20_diff: [[0; CHANNEL_MAX_NUMBER]; 2],
+            legacy_ht_diff: [[0; CHANNEL_MAX_NUMBER]; 2],
+            pwrgroup_ht20: [[0; CHANNEL_MAX_NUMBER]; 2],
+            pwrgroup_ht40: [[0; CHANNEL_MAX_NUMBER]; 2],
+            regulatory: 0,
+            thermalmeter: 0,
+            crystalcap: 0,
+            delta_iqk: 0,
+            delta_lck: 0,
+            internal_pa_5g: [false; 2],
+            eeprom_c9: 0,
+            eeprom_cc: 0,
+            txpwr_fromeprom: false,
+            tssi_a: [0; 3],
+            tssi_b: [0; 3],
+        },
+        bandset,
+    }));
+    owner.phase = Phase::RadioConfigured;
+    owner
+}
+
+/// RTL8192DE native 5 GHz admission at the prepare layer: a dual-dual
+/// MAC0 function admits 5 GHz channels 36/165, a dual-dual MAC1 function
+/// admits 2.4 GHz channel 6, and the cross-band requests (MAC0 on 6,
+/// MAC1 on 36) are refused before any calibration is staged —
+/// mirroring `smoke_rtl8192de_native_channel` at the `admit_rtl8192de`
+/// layer, over a signed v3 NAPC fixture in the firmware registry.
+pub(crate) fn smoke_rtl8192de_native_channel_admission() -> TestResult {
+    let factory = de_factory();
+    let domain = de_domain();
+    let (write, _read) = narf_firmware::bootstrap_authority();
+    narf_firmware::install_trusted_loader_authority(write);
+    match crate::firmware_asset::tests::install(
+        &write,
+        "rtlwifi/rtl8192de-cal-v3-00e04c8192de.bin",
+        &de_napc_v3_native(),
+        true,
+    ) {
+        Ok(()) => {}
+        Err(_) => {
+            return TestResult::Fail("8192DE native admission fixture NAPC install");
+        }
+    }
+    for (interface_index, channel) in [(0u8, 36u8), (0, 165), (1, 6)] {
+        let mut owner = de_owner(&factory, interface_index);
+        match narf_scheduler::block_on(super::super::prepare_native::admit_rtl8192de(
+            &mut owner, &factory, &domain, channel,
+        )) {
+            Ok(()) => {}
+            Err(_) => {
+                return TestResult::Fail("8192DE native admission refused an in-band channel");
+            }
+        }
+        if owner.phase() != Phase::MacConfigured
+            || owner.rtl8192de_permission().map(|p| p.channel()) != Some(channel)
+        {
+            return TestResult::Fail("8192DE native admission did not reach MacConfigured");
+        }
+    }
+    for (interface_index, channel) in [(0u8, 6u8), (1, 36)] {
+        let mut owner = de_owner(&factory, interface_index);
+        if narf_scheduler::block_on(super::super::prepare_native::admit_rtl8192de(
+            &mut owner, &factory, &domain, channel,
+        ))
+        .is_ok()
+            || owner.phase() != Phase::RadioConfigured
+            || owner.rtl8192de_permission().is_some()
+        {
+            return TestResult::Fail("8192DE native admission admitted a cross-band channel");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi",
+    smoke_rtl8192de_native_channel_admission
+);

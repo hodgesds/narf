@@ -498,18 +498,20 @@ pub(super) async fn admit_rtl8192ee<I: super::firmware_transport::Io, M: Memory>
         .map_err(|_| Error::Power(super::channel_power::Error::Policy))
 }
 
-/// RTL8192DE retained continuation to an admitted 2.4 GHz station owner:
+/// RTL8192DE retained continuation to an admitted station owner:
 /// registry firmware (`rtl8192defw.bin`), the one-shot packet claim,
 /// DMA32 rings, the mode-dependent LLT (the mode is bound from the PROM
 /// before the prepare runs), the `rtl92de_hw_init` tail, then the channel
 /// from the signed per-board `N92D` envelope under current host policy,
 /// the operational MAC and the staged envelope the station re-proves at
 /// every publication. Packet DMA, CR gates and IRQs stay closed until
-/// the station service starts. The channel gate is 2.4 GHz channels 1-11
-/// (the composed legacy station) inside the function's own bandset
-/// (`rtl8192de::native_channel` over the PROM mode and the PCI function):
-/// a dual-dual MAC0 function (5 GHz bandset) is not admitted, MAC1 and
-/// single / dual-single functions are.
+/// the station service starts. The admitted channel is the
+/// [`super::rtl8192de::native_channel`] gate for the function's mode and
+/// bandset: a dual-dual MAC0 function (5 GHz bandset) admits the 5 GHz
+/// plan, a dual-dual MAC1 function admits 2.4 GHz channels 1-11, and a
+/// cross-band request is refused before any hardware is touched (the
+/// hardware channel switch silently no-ops on a band mismatch, so the
+/// gate is what refuses it).
 pub(super) async fn prepare_rtl8192de(
     firmware: Arc<Owner<PciIo>>,
     retained: Arc<Retained>,
@@ -520,14 +522,24 @@ pub(super) async fn prepare_rtl8192de(
         return Err(Error::State);
     }
     let interface_index = firmware.native().function().ok_or(Error::State)?;
-    let mode = super::rtl8192de::mode_from_prom(super::rtl8192de::Interface::Pci, &factory.logical)
-        .ok_or(Error::State)?;
-    // The composed station is the 2.4 GHz legacy one
-    // (`rtl8192de/packet_owner.rs`): channels 1-11 of the function's own
-    // bandset only.
-    if !(1..=11).contains(&channel)
-        || !super::rtl8192de::native_channel(channel, mode, interface_index)
-    {
+    // Gate before any mutation: the mode comes from the PROM on first
+    // bring-up and from the bound mode on a retained owner.
+    let mode = match firmware.status().stage {
+        super::firmware_transport::Stage::Detected => {
+            super::rtl8192de::mode_from_prom(super::rtl8192de::Interface::Pci, &factory.logical)
+                .ok_or(Error::State)?
+        }
+        super::firmware_transport::Stage::Ready => {
+            let storage = retained.lock().await;
+            storage
+                .as_ref()
+                .ok_or(Error::State)?
+                .rtl8192de_mode()
+                .ok_or(Error::State)?
+        }
+        _ => return Err(Error::State),
+    };
+    if !super::rtl8192de::native_channel(channel, mode, interface_index) {
         return Err(Error::State);
     }
     if firmware.status().stage == super::firmware_transport::Stage::Detected {
@@ -559,7 +571,10 @@ pub(super) async fn prepare_rtl8192de(
 /// RadioConfigured/ChannelConfigured → MacConfigured with a staged `N92D`
 /// envelope (20 MHz permission on `channel`) for the owner's probed device
 /// and measured RF type; a MacConfigured owner without one only stages it.
-/// Shared by native provisioning and the interface's readiness path.
+/// The [`super::rtl8192de::native_channel`] gate runs first: a cross-band
+/// request is refused before any calibration is loaded or any register is
+/// written (the hardware channel switch silently no-ops on a band
+/// mismatch). Shared by native provisioning and the interface's readiness path.
 pub(super) async fn admit_rtl8192de<I: super::firmware_transport::Io, M: Memory>(
     prepared: &mut Prepared<I, M>,
     factory: &super::efuse::Factory,
@@ -567,6 +582,14 @@ pub(super) async fn admit_rtl8192de<I: super::firmware_transport::Io, M: Memory>
     channel: u8,
 ) -> Result<(), Error> {
     use super::prepare::Phase;
+    let mode = prepared.rtl8192de_mode().ok_or(Error::State)?;
+    let interface_index = prepared
+        .rtl8192de_radio()
+        .ok_or(Error::State)?
+        .interface_index;
+    if !super::rtl8192de::native_channel(channel, mode, interface_index) {
+        return Err(Error::State);
+    }
     prepared.rtl8192de_binding().ok_or(Error::State)?;
     let calibration =
         super::rtl8192de::envelope::Calibration::load_registered(factory).map_err(Error::Power)?;
@@ -595,7 +618,30 @@ pub(super) async fn initialize_registered(
     retained: Arc<Retained>,
     factory: Arc<super::efuse::Factory>,
 ) -> Result<(), Error> {
-    initialize_registered_on_channel(firmware, retained, factory, 1).await
+    // A dual-dual MAC0 function starts on 5 GHz (its Linux default
+    // channel is 36); any other profile starts on channel 1. The
+    // native entry refuses a cross-band default, so the probe asks
+    // for the function's own band; an unreadable PROM falls back to
+    // channel 1 and the entry refuses with `State` as before.
+    let channel = if firmware.device_id() == super::regs::RTL_DEV_8192DE {
+        firmware
+            .native()
+            .function()
+            .and_then(|index| {
+                super::rtl8192de::mode_from_prom(super::rtl8192de::Interface::Pci, &factory.logical)
+                    .map(|mode| {
+                        super::rtl8192de::sw_consequences(
+                            mode,
+                            super::rtl8192de::mode_info(mode, index).current_band,
+                        )
+                        .default_channel
+                    })
+            })
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    initialize_registered_on_channel(firmware, retained, factory, channel).await
 }
 pub(super) async fn initialize_registered_on_channel(
     firmware: Arc<Owner<PciIo>>,
