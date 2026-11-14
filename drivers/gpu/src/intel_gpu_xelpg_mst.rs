@@ -210,13 +210,11 @@ impl MtlMstRoute {
             let vcpi = pipe as u8 + 1; // Intel's payload ID is pipe + 1.
             let fb =
                 alloc(&mode).ok_or(ExternalError::Modeset(ModesetError::InvalidFramebuffer))?;
-            let mut raw_edid = [0; EDID_CAPACITY];
-            raw_edid[..128].copy_from_slice(&edid);
             let master = self
                 .streams
                 .first()
                 .map_or(pipe.transcoder(), |s| s.route.pipe.transcoder());
-            let probe = MtlSinkProbe {
+            let mut probe = MtlSinkProbe {
                 mst: Some(MstStreamConfig {
                     master,
                     slots: slots as u8,
@@ -229,16 +227,23 @@ impl MtlMstRoute {
                 negotiated,
                 max_downspread: self.link.raw[DP_MAX_DOWNSPREAD],
                 ssc: false,
-                edid: raw_edid,
+                edid: [0; EDID_CAPACITY],
                 edid_len: 128,
                 dsc: None,
                 pipe_bpp: 24,
             };
+            // Copy the EDID straight into the probe's own buffer: a
+            // separate 512-byte staging array is a second stack slot in
+            // this frame, and `connect` is 120 bytes over the 8 KiB
+            // budget (CI run 43627487921).
+            probe.edid[..128].copy_from_slice(&edid);
             crate::intel_gpu_modeset::validate_framebuffer_mode(&fb, &mode)?;
             let branch = topology.branches[sink.branch].clone();
-            let endpoint = *topology
+            let sdp_streams = topology
                 .port(sink)
-                .ok_or(ExternalError::Mst(MstFailure::Sideband))?;
+                .ok_or(ExternalError::Mst(MstFailure::Sideband))?
+                .info
+                .sdp_streams;
             complete(crate::dp_mst_mgr::write_payload(
                 aux,
                 vcpi,
@@ -251,7 +256,7 @@ impl MtlMstRoute {
                     port: sink.port,
                     vcpi,
                     pbn: pbn as u16,
-                    sdp_stream_sinks: (0..endpoint.info.sdp_streams).collect(),
+                    sdp_stream_sinks: (0..sdp_streams).collect(),
                 };
                 match complete(
                     self.manager
