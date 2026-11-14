@@ -3,8 +3,11 @@
 //! RTL8723AE (PCI `0x8723`) is the 1T1R 802.11n + Bluetooth combo of the
 //! RTL8192C generation: 92CE-style linked TX rings, its own `pwrseq` flows,
 //! `rtl8723com` firmware download / PHY helpers and its own BT coexistence
-//! (`hal_btc.c` + `hal_bt_coexist.c`). It is not admitted yet (probe keeps it
-//! diagnostic).
+//! (`hal_btc.c` + `hal_bt_coexist.c`). Probe admits it under qualification
+//! (qualified 8723-series version with `BT_FUNC`, provisioned EFUSE map
+//! whose MAC is the factory identity); its firmware owner runs
+//! `run_8723ae`. Station admission (`prepare_rtl8723ae`,
+//! `prepare::Chip::Rtl8723ae`, packet path) is still open.
 //!
 //! ## References (GPL-2.0; NARF is GPL-2.0-or-later)
 //!

@@ -3342,14 +3342,18 @@ the coexistence owner runs every composed call site.
     `smoke_rtl8723be_native_join_rsvd_page_ra_mask_and_leave` (written,
     unexecuted).
 
-### RTL8723AE retained runtime (in progress, not admitted)
+### RTL8723AE retained runtime (probe-admitted; station admission open)
 
 `rtl8723ae/` + `rtl8723ae.rs` port Linux `rtl8723ae` and the `rtl8723com`
 pieces it uses (PCI `0x8723`, 1T1R 2.4 GHz HT with Bluetooth; the
 RTL8192C generation: 92CE-style descriptors, its own `pwrseq` flows and
-its own coexistence in `hal_btc.c` / `hal_bt_coexist.c`). Probe keeps the
-chip diagnostic (the firmware owner is built — `firmware_transport::Owner`
-admits `0x8723` via `run_8723ae` — but probe does not run it yet).
+its own coexistence in `hal_btc.c` / `hal_bt_coexist.c`). Probe admits
+the chip under qualification — `_rtl8723e_read_chip_version` qualifies
+(no `TRP_VAUX_EN` test chip, `BT_FUNC` set), the EFUSE map is
+provisioned (`REG_9346CR` EFUSE boot + autoload, `0x8129`) and its MAC
+is the factory identity — and retains the firmware owner, which runs
+`run_8723ae`. Station admission (`prepare_rtl8723ae`,
+`Chip::Rtl8723ae`, packet path) is still open.
 
 - `version` — `_rtl8723e_read_chip_version`: `NORMAL_CHIP | CHIP_8723`,
   `CHIP_VENDOR_UMC` from `REG_SYS_CFG[19]` with the `CHIP_VER_RTL_MASK` cut
@@ -3400,7 +3404,11 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   `smoke_rtl8723ae_firmware_paged_download`,
   `smoke_rtl8723ae_init_mac_post_flow_ephy`,
   `smoke_rtlwifi_8723ae_enable_prefix_and_card_enable_flow` (written,
-  unexecuted).
+  unexecuted). Probe admission is justified by the composed
+  `smoke_rtl8723ae_pci_startup_admission` (version → adapter → card-enable
+  flow → post-flow power → firmware download → C2H, with clean refusals
+  of a test chip, a non-BT part, an unprovisioned map and a
+  wrong-signature image).
 - `c2h` — the firmware-event mailbox (`rtl_8723e_c2h_command_handle`,
   `hal_btc.c:1690`): header byte at `REG_C2HEVT_MSG_NORMAL` (`0x01A0`,
   id low nibble / len high nibble, sequence at `0x01A1`, body from
@@ -3417,7 +3425,7 @@ admits `0x8723` via `run_8723ae` — but probe does not run it yet).
   `service_c2h`). `packet::Owner::service_c2h` schedules `c2h::drain`
   when `irq::IsrStatus::c2h_pending` is set, mirroring the `pci.c`
   fwevt gate, which is 8723AE-only (fixture-tested; no live IRQ caller
-  yet — probe keeps the chip diagnostic). Tests
+  yet — the station owner that would service it is still open). Tests
   `smoke_rtl8723ae_c2h_mailbox_close_protocol`,
   `smoke_rtl8723ae_c2h_mailbox_bt_info` (written, unexecuted).
 - `coex` — the 8723AE Bluetooth-coexistence owner, pass 1 (#1458): board
