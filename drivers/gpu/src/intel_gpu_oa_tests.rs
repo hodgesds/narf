@@ -1790,7 +1790,7 @@ fn smoke_oa_metrics_sysfs_uuid_id_follows_registry() -> TestResult {
     let card = Kobject::new_root("card46");
     install_metrics_for_test(46, &card);
     install_metrics_for_test(46, &card);
-    assert_eq!(card.child_names(), ["metrics"]);
+    assert_eq!(card.child_names(), ["metrics", "oa"]);
     let metrics = card.get_child("metrics").unwrap();
     assert!(metrics.child_names().is_empty());
     let name = |n| alloc::string::String::from_utf8(uuid(n).to_vec()).unwrap();
