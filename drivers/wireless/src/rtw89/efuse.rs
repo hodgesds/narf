@@ -115,6 +115,20 @@ pub(super) fn read_mac_with(
     chip: ChipId,
     cut: u8,
 ) -> Result<[u8; 6], EfuseError> {
+    if chip == ChipId::Rtl8922A {
+        // BE PCIe MAC is read from BAR registers, not the logical map
+        // (Linux `rtw8922a_read_efuse_mac_addr`, `rtw8922a.c:829..847`,
+        // reached from `rtw8922a_read_efuse_pci_sdio` with no EFUSE dump;
+        // in-tree `efuse_be::read_mac_pcie`). No AX EFUSE control is
+        // touched: no power-cut sequence, no physical reads. An
+        // unprogrammed BAR MAC is uninitialized, as on the AX path
+        // (Linux falls back to a random address there instead).
+        let mac = super::efuse_be::read_mac_pcie(io);
+        if !mac_is_valid(mac) {
+            return Err(EfuseError::MacUninitialized);
+        }
+        return Ok(mac);
+    }
     let logical_size = match chip {
         ChipId::Rtl8852A => 1536,
         ChipId::Rtl8852B | ChipId::Rtl8852C | ChipId::Rtl8851B => 2048,
@@ -182,8 +196,10 @@ pub(super) fn read_mac_with(
     Ok(mac)
 }
 
-/// Read the chip/cut-specific AX factory identity. BE generation has a
-/// different block layout/read protocol and is rejected before EFUSE MMIO.
+/// Read the chip/cut-specific factory identity MAC. AX chips read it from
+/// the logical EFUSE map; RTL8922A (BE) reads it from the PCIe BAR MAC
+/// registers (`efuse_be::read_mac_pcie`). The AX logical-map protocol is
+/// still never applied to BE silicon.
 ///
 /// # Safety
 /// Caller owns powered BAR2 exclusively, including SYS/PMC/EFUSE controls.
