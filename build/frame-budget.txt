@@ -86,7 +86,6 @@
 8984 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prepare_media_transport
 8952 narf_drivers_wireless::brcmfmac::native_runtime::start::{{closure}}
 8896 narf_drivers_gpu::intel_gpu_gt::media::MediaGuc<M,A>::start
-8792 narf_drivers_gpu::intel_gpu_xelpg_external::MtlExternalService::connect
 8696 miniz_oxide::deflate::core::HuffmanOxide::optimize_table
 8680 narf_drivers_wireless::cyw43439::bootstrap::probe
 8664 narf_drivers_wireless::iwlwifi::device::ap::<impl narf_drivers_wireless::iwlwifi::device::Device>::ap_control::{{closure}}
@@ -98,4 +97,3 @@
 8296 narf_memory::compress::lz4_encode
 8280 narf_drivers_gpu::amdgpu_navi48_boot::media_transport::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::prove_media_transport::{{closure}}::{{closure}}
 8216 narf_drivers_gpu::amdgpu_navi48_boot::modeset::<impl narf_drivers_gpu::amdgpu_navi48_boot::ColdBoot>::converge_uclk_pstate::{{closure}}
-8216 narf_drivers_gpu::intel_gpu_display_resources::Profile::capture_layout
