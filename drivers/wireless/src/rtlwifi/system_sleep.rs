@@ -103,6 +103,34 @@ where
             }
         }
     }
+    /// `btc_ips_notify` for the RTL8723BE owner, if `owner` is one. Any
+    /// other chip is a no-op.
+    async fn be8723_ips_notify(
+        &self,
+        owner: &mut Prepared<I, M>,
+        rf_off: bool,
+    ) -> Result<(), Error> {
+        if owner.chip() != super::super::prepare::Chip::Rtl8723be {
+            return Ok(());
+        }
+        owner
+            .be8723_ips_notify(rf_off)
+            .await
+            .map_err(|_| Error::State)
+    }
+
+    /// `btc_ips_notify(ERFON)` (`ps.c::rtl_ips_nic_on`) on the live
+    /// RTL8723BE owner after a rebuild: the NIC is back on, so the
+    /// coexistence algorithm leaves IPS (with the scan start+finish
+    /// resync `rtl_btc_ips_notify` adds). Any other chip, or no owner, is
+    /// a no-op.
+    pub(super) async fn be8723_ips_notify_erfon(&self) -> Result<(), Error> {
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return Ok(());
+        };
+        self.be8723_ips_notify(owner, false).await
+    }
     pub(super) async fn sleep_once(
         &self,
         system: bool,
@@ -175,6 +203,10 @@ where
             next?
         };
         if let Some(owner) = storage.as_mut() {
+            // `btc_ips_notify(ERFOFF)` (`ps.c::_rtl_ps_inactive_ps`): before
+            // the NIC goes off. Best effort: the owner is retired either
+            // way, and a non-running owner has nothing to notify.
+            let _ = self.be8723_ips_notify(owner, true).await;
             owner.abort_station();
             self.withdraw_interrupts(owner);
             if !owner.retire().await {

@@ -86,6 +86,12 @@ pub(crate) struct Device<I: Port<Buffer = M>, M: Memory, E: Environment> {
     rx: Arc<IrqSafeSpinLock<Option<narf_ipc::Consumer<Frame, RX_RING_N>>>>,
     tx: IrqSafeSpinLock<Option<narf_ipc::Producer<Frame, TX_RING_N>>>,
     leisure: IrqSafeSpinLock<Leisure>,
+    /// Latest special frame (`rtl_is_special_data`) awaiting its
+    /// `btc_special_packet_notify`, recorded by `enqueue` and flushed by
+    /// the worker loop before the frame is drained. A second special frame
+    /// before the flush replaces the first; the notify carries the latest
+    /// class.
+    special_pending: IrqSafeSpinLock<Option<super::btcoex::btc::Packet>>,
     lifecycle: lifecycle::Lifecycle,
     work: Mutex<Option<supervisor::Work>>,
     scan_request: Mutex<()>,
@@ -130,31 +136,36 @@ pub fn set_leisure_power_save(enabled: bool) {
 fn busy(rx: u32, tx: u32) -> bool {
     rx + tx > 8 || rx > 2
 }
-/// Linux `rtl_is_special_data` (TX): EAPOL, ARP and DHCP (UDP 67/68)
-/// leave LPS before transmission.
-fn special(frame: &[u8]) -> bool {
+/// Linux `rtl_is_special_data` (TX) class: EAPOL, ARP and DHCP (UDP 67/68).
+fn special_class(frame: &[u8]) -> Option<super::btcoex::btc::Packet> {
+    use super::btcoex::btc::Packet;
     match frame.get(12..14) {
-        Some([0x88, 0x8e]) | Some([0x08, 0x06]) => true,
+        Some([0x88, 0x8e]) => Some(Packet::Eapol),
+        Some([0x08, 0x06]) => Some(Packet::Arp),
         Some([0x08, 0x00]) => {
-            let Some(&version) = frame.get(14) else {
-                return false;
-            };
+            let &version = frame.get(14)?;
             let ihl = usize::from(version & 15) * 4;
             if version >> 4 != 4 || ihl < 20 || frame.get(23) != Some(&17) {
-                return false;
+                return None;
             }
             let at = 14 + ihl;
             match (frame.get(at..at + 2), frame.get(at + 2..at + 4)) {
                 (Some(src), Some(dst)) => {
                     let src = u16::from_be_bytes([src[0], src[1]]);
                     let dst = u16::from_be_bytes([dst[0], dst[1]]);
-                    matches!((src, dst), (68, 67) | (67, 68))
+                    matches!((src, dst), (68, 67) | (67, 68)).then_some(Packet::Dhcp)
                 }
-                _ => false,
+                _ => None,
             }
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// Linux `rtl_is_special_data` (TX): EAPOL, ARP and DHCP (UDP 67/68)
+/// leave LPS before transmission.
+fn special(frame: &[u8]) -> bool {
+    special_class(frame).is_some()
 }
 impl<I: Port<Buffer = M>, M: Memory, E: Environment> core::fmt::Debug for Device<I, M, E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -268,6 +279,7 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             rx: Arc::new(IrqSafeSpinLock::new(Some(consumer))),
             tx: IrqSafeSpinLock::new(Some(producer)),
             leisure: IrqSafeSpinLock::new(Leisure::default()),
+            special_pending: IrqSafeSpinLock::new(None),
             lifecycle: lifecycle::Lifecycle::with_channel(initial_channel),
             work: Mutex::new(None),
             scan_request: Mutex::new(()),
@@ -488,13 +500,55 @@ impl<I: Port<Buffer = M> + 'static, M: Memory + 'static, E: Environment + 'stati
             signal.raise();
         }
         match result {
-            Ok(Some(result)) => result,
+            Ok(Some(result)) => {
+                if result.is_ok() {
+                    self.note_special(bytes);
+                }
+                result
+            }
             Ok(None) => Err(()),
             Err(_) => {
                 self.abort_generation(generation);
                 Err(())
             }
         }
+    }
+    /// Record a special frame (`rtl_is_special_data`) for the worker
+    /// loop's `btc_special_packet_notify`: the async notify must run before
+    /// the frame is transmitted, and `enqueue` is the last synchronous
+    /// point that sees the frame before the worker loop drains it. Only the
+    /// RTL8723BE owner consumes the record.
+    fn note_special(&self, bytes: &[u8]) {
+        // No chip gate here: `enqueue` is synchronous and the chip is only
+        // known through the prepared owner; the flush below is chip-gated,
+        // so on any other chip the record simply sits unconsumed.
+        if let Some(pkt) = special_class(bytes) {
+            *self.special_pending.lock() = Some(pkt);
+        }
+    }
+    /// `btc_special_packet_notify` (`base.c::setup_special_tx`) for a
+    /// special frame recorded by `enqueue`: runs before the worker loop's
+    /// `drain()` transmits it, so the coexistence algorithm yields the
+    /// antenna first. The record stays pending while the owner is not
+    /// ready to transmit; a frame already sent by a stack-driven drain is
+    /// notified after the fact (best effort). Any other chip, or no record,
+    /// is a no-op.
+    async fn be8723_flush_special(&self) -> Result<(), Error> {
+        let Some(pkt) = *self.special_pending.lock() else {
+            return Ok(());
+        };
+        let mut storage = self.prepared.lock().await;
+        let Some(owner) = storage.as_mut() else {
+            return Ok(());
+        };
+        if owner.chip() != super::prepare::Chip::Rtl8723be || !owner.transmit_ready() {
+            return Ok(());
+        }
+        *self.special_pending.lock() = None;
+        owner
+            .be8723_special_packet_notify(pkt)
+            .await
+            .map_err(|_| Error::State)
     }
     fn progress(&self) -> Vec<Received> {
         if self.lifecycle.rebuilding.load(Ordering::Acquire)
@@ -1972,6 +2026,12 @@ pub(super) fn publish(device: Arc<Native>) -> Result<(), Error> {
             // Snapshot before servicing so a vector raised mid-pass is seen.
             let signal = device.environment.interrupt();
             let seen = signal.as_ref().map(|s| s.count());
+            // A special frame recorded by `enqueue` is notified to the
+            // coexistence owner before the drain below transmits it
+            // (`base.c::setup_special_tx` ordering). Best effort: a failed
+            // notify leaves the owner for the next pass to abort, it must
+            // not stall the worker loop.
+            let _ = device.be8723_flush_special().await;
             device.drain();
             // The periodic steps run from the watchdog work; only a
             // data-path LPS leave is served here, without waiting for it.

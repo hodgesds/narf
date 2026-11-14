@@ -2,9 +2,11 @@
 //! RTL8723BE native packet/station owner over a register-file and DMA model.
 //! Written; not yet executed (no QEMU in this lane).
 use super::super::super::super::{
-    btcoex::btc::{ChipInterface, ChipType, HwPg},
+    btcoex::btc::{ChipInterface, ChipType, HwPg, Packet},
     firmware_transport::{Error as AccessError, Io},
-    rtl8723be::{adapter, envelope, h2c, init, mac, station as hw, tests as be, txpower, version},
+    rtl8723be::{
+        adapter, dm, envelope, h2c, init, mac, station as hw, tests as be, txpower, version,
+    },
 };
 use super::super::super::{Chip, Error, Memory, Phase, Prepared, RX_BASE, TX_BASES};
 use super::super::{Port, OWN};
@@ -186,8 +188,9 @@ const RCR: u32 = 0xf400_7a0e;
 
 /// A MacConfigured 8723BE owner with published rings (as `prepare` would
 /// leave them), a bound coexistence owner (no BT), a configured radio and
-/// an `NAPC` permission for channel 6 / 20 MHz.
-fn owner() -> Option<(Prepared<BePort, Block>, BePort)> {
+/// an `NAPC` permission for channel 6 / 20 MHz, or — with `forty` — a v2
+/// permission for 40 MHz (primary 3 above).
+fn owner_with(forty: bool) -> Option<(Prepared<BePort, Block>, BePort)> {
     let port = BePort::new();
     let mut owner =
         Prepared::allocate_for(Chip::Rtl8723be, port.clone(), 4, |b| Ok(port.block(b))).ok()?;
@@ -196,16 +199,31 @@ fn owner() -> Option<(Prepared<BePort, Block>, BePort)> {
     }
     port.set32(RX_BASE, owner.receive.as_ref()?.address() as u32);
     let factory = be::be_factory();
-    let cal = envelope::Calibration::from_verified(
-        &be::be_napc_fixture(1, 0, 80, &[(6, 20, 0, be::be_rising)]),
-        Some([0xab; 32]),
-        &factory,
-    )
-    .ok()?;
-    owner.rtl8723be_power = Some(
-        cal.permission_for(&be::be_us_domain(), envelope::Operating::twenty(6))
-            .ok()?,
-    );
+    let (fixture, operating) = if forty {
+        (
+            be::be_napc_fixture(
+                2,
+                0,
+                80,
+                &[
+                    (6, 20, 0, be::be_rising),
+                    (3, 40, 1, be::be_rising),
+                    (9, 40, 2, be::be_rising),
+                ],
+            ),
+            envelope::Operating {
+                width: envelope::Width::W40Above,
+                channel: 3,
+            },
+        )
+    } else {
+        (
+            be::be_napc_fixture(1, 0, 80, &[(6, 20, 0, be::be_rising)]),
+            envelope::Operating::twenty(6),
+        )
+    };
+    let cal = envelope::Calibration::from_verified(&fixture, Some([0xab; 32]), &factory).ok()?;
+    owner.rtl8723be_power = Some(cal.permission_for(&be::be_us_domain(), operating).ok()?);
     let logical = be::provisioned();
     let facts = adapter::Adapter::from_hardware(
         version::Version::from_registers(version::CHIP_8723B, 0).ok()?,
@@ -243,6 +261,14 @@ fn owner() -> Option<(Prepared<BePort, Block>, BePort)> {
     owner.published = true;
     owner.phase = Phase::MacConfigured;
     Some((owner, port))
+}
+
+fn owner() -> Option<(Prepared<BePort, Block>, BePort)> {
+    owner_with(false)
+}
+
+fn owner40() -> Option<(Prepared<BePort, Block>, BePort)> {
+    owner_with(true)
 }
 
 fn tx_word(owner: &Prepared<BePort, Block>, queue: usize, slot: usize, word: usize) -> u32 {
@@ -412,4 +438,325 @@ fn smoke_rtl8723be_native_join_rsvd_page_ra_mask_and_leave() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/rtlwifi/rtl8723be",
     smoke_rtl8723be_native_join_rsvd_page_ra_mask_and_leave
+);
+
+/// HT/40 MHz rate-mask install (`rtl8723be_update_hal_rate_mask` N rows):
+/// an HT peer on the 40 MHz owner installs `RATR_INX_WIRELESS_NGB` (0)
+/// with the `H2C_RA_MASK` command sent. The join-flow install is covered
+/// by the GB test above; the HT-specific code is the N-row computation
+/// (`h2c::rate_mask`) and the NGB index.
+fn smoke_rtl8723be_ht40_rate_mask_n_rows() -> TestResult {
+    let Some((mut owner, port)) = owner40() else {
+        return TestResult::Fail("fixture");
+    };
+    if owner.start_packets().is_err() {
+        return TestResult::Fail("start_packets refused a prepared 40 MHz owner");
+    }
+    let peer = h2c::Peer {
+        legacy: 0x0fff,
+        ht: Some([0xff, 0x00]),
+        sgi20: false,
+        sgi40: false,
+    };
+    if run(owner.install_rtl8723be_rate_mask(peer, true, 0)).is_err()
+        || owner.rate_mask() != Some(0)
+        || owner.packet.be8723.link != Some((peer, true, 0))
+        || port
+            .wrote(1, h2c::REG_HMEBOX_0 + 4, h2c::H2C_RA_MASK.into())
+            .is_none()
+    {
+        return TestResult::Fail("HT40 RA mask install (NGB, ratr_index 0)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_ht40_rate_mask_n_rows
+);
+
+/// A legacy DATA frame at 24M with short preamble sets TXD DW5 bit 4; the
+/// same frame at 1M does not (Linux `_rtl_qurey_shortpreamble_mode`:
+/// short preamble unless `hw_rate == 1M`); a long-preamble peer does not
+/// either. Capability 0x0421 carries short preamble, 0x0401 does not.
+fn smoke_rtl8723be_short_preamble_descriptor_bit() -> TestResult {
+    for (capability, rate, short) in [
+        (0x0421u16, 8u8, true),
+        (0x0421, 0, false),
+        (0x0401, 8, false),
+    ] {
+        let Some((mut owner, _port)) = owner() else {
+            return TestResult::Fail("fixture");
+        };
+        if owner.start_packets().is_err()
+            || run(owner.prepare_station_peer(PEER, 0x0fff, 0x0015, capability)).is_err()
+        {
+            return TestResult::Fail("start / prepare");
+        }
+        let mut data = vec![0u8; 30];
+        data[0] = 0x08;
+        data[1] = 0x01;
+        data[4..10].copy_from_slice(&PEER);
+        data[10..16].copy_from_slice(&be::be_factory().mac);
+        data[16..22].copy_from_slice(&PEER);
+        let slot = owner.packet.next[4];
+        if owner.submit(&data, rate).is_err() {
+            return TestResult::Fail("data submit");
+        }
+        if (tx_word(&owner, 4, slot, 5) & (1 << 4) != 0) != short {
+            return TestResult::Fail("TXD DW5 short-preamble bit");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_short_preamble_descriptor_bit
+);
+
+/// TX-report matching (`base.c::rtl_tx_report_handler`): a Null DATA
+/// frame mints report sequence 4 (`(1 & 0x3f) << 2`); the firmware's V1
+/// TX-report C2H (`id 3`, `st 0`, `sn 4`) matches it to the frame id,
+/// marks it acknowledged, and settles the report state.
+fn smoke_rtl8723be_tx_report_match_and_settled() -> TestResult {
+    let Some((mut owner, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    port.set8(hw::REG_BCN_PSR_RPT + 1, 0xc0);
+    if owner.start_packets().is_err()
+        || run(owner.prepare_station_peer(PEER, 0x0fff, 0x0015, 0x0421)).is_err()
+        || run(owner.complete_station_peer(PEER, 5)).is_err()
+    {
+        return TestResult::Fail("start / prepare / complete");
+    }
+    let peer = h2c::Peer {
+        legacy: 0x0fff,
+        ht: None,
+        sgi20: false,
+        sgi40: false,
+    };
+    if run(owner.install_rtl8723be_rate_mask(peer, false, 0)).is_err() {
+        return TestResult::Fail("RA mask install");
+    }
+    let mut null = vec![0u8; 30];
+    null[0] = 0x48;
+    null[1] = 0x01;
+    null[4..10].copy_from_slice(&PEER);
+    null[10..16].copy_from_slice(&be::be_factory().mac);
+    null[16..22].copy_from_slice(&PEER);
+    let Ok(id) = owner.submit(&null, 8) else {
+        return TestResult::Fail("Null DATA submit");
+    };
+    if owner.packet.be8723.waiting.len() != 1 || owner.packet.be8723.waiting[0].0 != 4 {
+        return TestResult::Fail("TX-report sequence not queued");
+    }
+    let mut report = [0u8; 16];
+    report[0] = 3;
+    report[8] = 4;
+    let rx = owner.packet.receive;
+    owner.buffers[rx].write_bytes(0, &report).unwrap();
+    let ring = owner.receive.as_mut().unwrap();
+    ring.write32(rx * 32, 16).unwrap();
+    ring.write32(rx * 32 + 8, 1 << 28).unwrap();
+    if !matches!(owner.poll_receive_step(), Ok(s) if s.consumed && owner.packet.be8723.c2h.len() == 1)
+        || run(owner.be8723_service_c2h()) != Ok(1)
+    {
+        return TestResult::Fail("TX-report C2H not dispatched");
+    }
+    match owner.take_rtl8723be_tx_report() {
+        Some(r) if r.id == id && r.acked && r.retry == 0 => {}
+        _ => return TestResult::Fail("TX-report not matched to the frame"),
+    }
+    if !owner.rtl8723be_tx_reports_settled() {
+        return TestResult::Fail("TX reports not settled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_tx_report_match_and_settled
+);
+
+/// The shared-station coexistence call sites on the 8723BE owner: scan,
+/// connect and special-packet notifies run without error and leave the
+/// owner Running; IPS enter writes hardware registers (the 2-antenna
+/// `ex_btc8723b2ant_*_notify` implementations are log-only for scan /
+/// connect / special, so only the return and the phase are asserted
+/// there); IPS leave returns the owner to the running state.
+fn smoke_rtl8723be_coex_notify_scan_connect_special_ips() -> TestResult {
+    let Some((mut owner, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    if owner.start_packets().is_err() {
+        return TestResult::Fail("start_packets refused a prepared owner");
+    }
+    if run(owner.be8723_scan_notify(true)).is_err()
+        || run(owner.be8723_scan_notify(false)).is_err()
+        || run(owner.be8723_connect_notify(true)).is_err()
+        || run(owner.be8723_connect_notify(false)).is_err()
+        || run(owner.be8723_special_packet_notify(Packet::Dhcp)).is_err()
+        || owner.phase != Phase::Running
+        || owner.packet.leisure
+    {
+        return TestResult::Fail("scan / connect / special-packet notify");
+    }
+    let writes = port.0.lock().writes.len();
+    if run(owner.be8723_ips_notify(true)).is_err()
+        || owner.phase != Phase::Running
+        || port.0.lock().writes.len() <= writes
+    {
+        return TestResult::Fail("IPS notify enter");
+    }
+    if run(owner.be8723_ips_notify(false)).is_err() || owner.phase != Phase::Running {
+        return TestResult::Fail("IPS notify leave");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_coex_notify_scan_connect_special_ips
+);
+
+/// The composed `rtl8723be_dm_watchdog` pure steps over the register
+/// model: false-alarm counts (8723BE includes fast-fsync / SB-search in
+/// `cnt_all`), first-connect DIG (IGI from the RSSI), the CCK packet
+/// detection threshold, dynamic EDCCA enable, and the ATC unlinked branch
+/// (CFO-track enable + crystal-cap re-apply on drift).
+fn smoke_rtl8723be_dm_steps_false_alarm_dig_cck_edcca_atc() -> TestResult {
+    let port = BePort::new();
+    port.set32(dm::DM_REG_OFDM_FA_TYPE1_11N, 0x0002_0003);
+    port.set32(dm::DM_REG_OFDM_FA_TYPE2_11N, 0x0004_0005);
+    port.set32(dm::DM_REG_OFDM_FA_TYPE3_11N, 0x0006_0007);
+    port.set32(dm::DM_REG_OFDM_FA_TYPE4_11N, 8);
+    port.set32(dm::DM_REG_CCK_FA_RST_11N, 0x11);
+    port.set32(dm::DM_REG_CCK_FA_MSB_11N, 0x0200_0000);
+    port.set32(dm::DM_REG_CCK_CCA_CNT_11N, 0x0304);
+    let Ok(fa) = dm::false_alarm(&port) else {
+        return TestResult::Fail("false_alarm");
+    };
+    if fa.cnt_ofdm_fail != 30
+        || fa.cnt_cck_fail != 0x211
+        || fa.cnt_cck_cca != 0x403
+        || fa.cnt_all != 559
+        || fa.cnt_cca_all != 1032
+    {
+        return TestResult::Fail("false-alarm counts");
+    }
+    port.set32(dm::ROFDM0_XAAGCCORE1, 0x30);
+    port.set32(dm::REG_MAC_PHY_CTRL, 0x20 << 12);
+    port.set32(dm::ROFDM1_CFOTRACKING, 0);
+    let Ok(mut state) = dm::Dm::init(&port) else {
+        return TestResult::Fail("Dm::init");
+    };
+    if state.cur_igvalue != 0x30 || state.crystal_cap != 0x20 || state.atc_status != 0 {
+        return TestResult::Fail("Dm::init live reads");
+    }
+    state.useramask = false;
+    match dm::rssi_monitor(&port, &mut state, 55, false) {
+        Ok(None) if port.reg8(dm::RSSI_REPORT_BYTE) == 55 && state.rssi_val_min == 0 => {}
+        _ => return TestResult::Fail("rssi_monitor non-useramask path"),
+    }
+    state.useramask = true;
+    match dm::rssi_monitor(&port, &mut state, 40, true) {
+        Ok(Some([0, 0x20, 40])) if state.rssi_val_min == 40 => {}
+        _ => return TestResult::Fail("rssi_monitor useramask path"),
+    }
+    if dm::dig(&port, &mut state, true, 100).is_err()
+        || state.cur_igvalue != 40
+        || port.reg32(dm::ROFDM0_XAAGCCORE1) & 0x7f != 40
+        || !state.media_connect_0
+    {
+        return TestResult::Fail("dig first-connect IGI");
+    }
+    if dm::cck_packet_detection_thresh(&port, &mut state, true, 5).is_err()
+        || port.reg32(dm::RCCK0_CCA) & 0x00ff_0000 != 0xcd << 16
+        || state.cur_cck_cca_thres != 0xcd
+    {
+        return TestResult::Fail("cck_packet_detection_thresh");
+    }
+    port.set32(dm::ROFDM0_XAAGCCORE1, 0x30);
+    port.set32(dm::ROFDM0_XBAGCCORE1, 0x30);
+    if dm::dynamic_edcca(&port, false).is_err()
+        || port.reg8(dm::ROFDM0_ECCATHRESHOLD) != 0x03
+        || port.reg8(dm::ROFDM0_ECCATHRESHOLD + 2) != 0x00
+    {
+        return TestResult::Fail("dynamic_edcca enable");
+    }
+    if dm::atc_switch_unlinked(&port, &mut state, true).is_err()
+        || state.atc_status != 1
+        || port.reg32(dm::ROFDM1_CFOTRACKING) & (1 << 11) == 0
+    {
+        return TestResult::Fail("atc_switch_unlinked CFO-track enable");
+    }
+    port.set32(dm::REG_MAC_PHY_CTRL, 0x10 << 12);
+    if dm::atc_switch_unlinked(&port, &mut state, true).is_err()
+        || port.reg32(dm::REG_MAC_PHY_CTRL) != 0x820 << 12
+    {
+        return TestResult::Fail("atc_switch_unlinked crystal-cap re-apply");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_dm_steps_false_alarm_dig_cck_edcca_atc
+);
+
+/// The composed `rtl8723be_dm_watchdog` on a linked owner at RSSI 60:
+/// the RA level rises to `STA_HIGH`, DIG takes the first-connect IGI 50,
+/// dynamic EDCCA enables, the CCK threshold goes to 0xcd, and the RSSI
+/// H2C report is sent.
+fn smoke_rtl8723be_dm_watchdog_linked_refresh() -> TestResult {
+    let Some((mut owner, port)) = owner() else {
+        return TestResult::Fail("fixture");
+    };
+    port.set8(hw::REG_BCN_PSR_RPT + 1, 0xc0);
+    if owner.start_packets().is_err()
+        || run(owner.prepare_station_peer(PEER, 0x0fff, 0x0015, 0x0421)).is_err()
+        || run(owner.complete_station_peer(PEER, 5)).is_err()
+    {
+        return TestResult::Fail("start / prepare / complete");
+    }
+    let peer = h2c::Peer {
+        legacy: 0x0fff,
+        ht: None,
+        sgi20: false,
+        sgi40: false,
+    };
+    if run(owner.install_rtl8723be_rate_mask(peer, false, 0)).is_err() {
+        return TestResult::Fail("RA mask install");
+    }
+    port.set32(dm::ROFDM0_XAAGCCORE1, 0x30);
+    port.set32(dm::ROFDM0_XBAGCCORE1, 0x30);
+    port.set32(dm::DM_REG_OFDM_FA_TYPE1_11N, 0x0001_0002);
+    port.set32(dm::DM_REG_OFDM_FA_TYPE2_11N, 0x0002_0003);
+    port.set32(dm::DM_REG_OFDM_FA_TYPE3_11N, 0x0001_0001);
+    port.set32(dm::DM_REG_OFDM_FA_TYPE4_11N, 1);
+    port.set32(dm::DM_REG_CCK_FA_RST_11N, 0x05);
+    port.set32(dm::DM_REG_CCK_FA_MSB_11N, 0);
+    port.set32(dm::DM_REG_CCK_CCA_CNT_11N, 0x0102);
+    port.set32(dm::RCCK0_CCA, 0);
+    port.set32(dm::REG_MAC_PHY_CTRL, 0x20 << 12);
+    port.set32(dm::ROFDM1_CFOTRACKING, 0);
+    port.set32(dm::ROFDM0_ECCATHRESHOLD, 0);
+    if run(owner.rtl8723be_dm_watchdog(60, 1000)) != Ok(true)
+        || owner.packet.be8723.ratr_state != 1
+        || port.reg32(dm::ROFDM0_XAAGCCORE1) & 0x7f != 50
+        || port.reg8(dm::ROFDM0_ECCATHRESHOLD) != 0x03
+        || port.reg32(dm::RCCK0_CCA) & 0x00ff_0000 != 0xcd << 16
+        || port
+            .wrote(1, h2c::REG_HMEBOX_0 + 4, h2c::H2C_RSSIBE_REPORT.into())
+            .is_none()
+        || !owner
+            .packet
+            .be8723
+            .dm
+            .as_ref()
+            .is_some_and(|d| d.rssi_val_min == 60 && d.cur_igvalue == 50)
+    {
+        return TestResult::Fail("dm_watchdog linked refresh");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/rtlwifi/rtl8723be",
+    smoke_rtl8723be_dm_watchdog_linked_refresh
 );

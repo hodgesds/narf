@@ -79,6 +79,7 @@ pub mod dm;
 pub mod envelope;
 pub mod fw;
 pub mod h2c;
+pub mod ht;
 pub mod init;
 pub mod iqk;
 pub mod llt;

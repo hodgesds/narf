@@ -539,6 +539,130 @@ impl<I: Port<Buffer = M>, M: Memory> Prepared<I, M> {
         self.packet.width = width;
         self.check_station_policy(environment)
     }
+    /// RTL8723BE: the AP's offered HT40 geometry with its `NAPC` 40 MHz
+    /// permission, when the envelope measures it, current host policy
+    /// admits it and it admits HT (MCS0-7). `None` keeps the HT20 form.
+    /// 8723BE is 2.4 GHz only (`Operating` has no 5 GHz point).
+    pub(super) fn rtl8723be_wide(
+        &self,
+        candidate: &Candidate,
+        environment: &impl Environment,
+    ) -> Result<
+        Option<(
+            super::super::super::ht::Geometry,
+            super::super::super::rtl8723be::envelope::Permission,
+        )>,
+        Error,
+    > {
+        use super::super::super::rtl8723be::{
+            envelope::{Operating, Width},
+            ht,
+        };
+        let Some(base) = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8723be())
+        else {
+            return Ok(None);
+        };
+        let offer = association::phy::Offer::from_elements(
+            ht::local(true),
+            &candidate.bss.information_elements,
+            candidate.bss.channel,
+        )
+        .map_err(Error::Management)?;
+        let Some(offer) = offer else {
+            return Ok(None);
+        };
+        let Ok(Some(g)) = Self::offered_width(offer.width(), offer.ht().operation()) else {
+            return Ok(None);
+        };
+        if g.primary() >= 36 {
+            return Ok(None);
+        }
+        let op = Operating {
+            width: if g.prime() == 1 {
+                Width::W40Above
+            } else {
+                Width::W40Below
+            },
+            channel: g.primary(),
+        };
+        Ok(base
+            .permission_for(&environment.domain()?, op)
+            .ok()
+            .filter(ht::admitted)
+            .map(|p| (g, p)))
+    }
+    /// RTL8723BE `rtl_op_config` channel/width change on the running owner,
+    /// as [`Self::retune_rtl8192ce`]: the `NAPC` permission for the target
+    /// operating point (`width` 40 MHz on the provisioned primary, else
+    /// 20 MHz) is re-derived under current host policy, then
+    /// `Prepared::configure_rtl8723be_channel` (`rtl8723be_phy_sw_chnl` at
+    /// the wide channel with the admitted per-path indices, then
+    /// `rtl8723be_phy_set_bw_mode`) runs inside that permission's authority.
+    /// No frame may be outstanding; the old receive epoch is retired. A
+    /// failure leaves the owner failed.
+    pub(super) async fn retune_rtl8723be(
+        &mut self,
+        width: Option<super::super::super::ht::Geometry>,
+        environment: &impl Environment,
+    ) -> Result<(), Error> {
+        use super::super::super::rtl8723be::envelope::{Operating, Width};
+        let current = self.rtl8723be_power.ok_or(Error::State)?;
+        let channel = current.channel();
+        let op = match width {
+            None => Operating::twenty(channel),
+            Some(g) if g.primary() == channel => Operating {
+                width: if g.prime() == 1 {
+                    Width::W40Above
+                } else {
+                    Width::W40Below
+                },
+                channel,
+            },
+            Some(_) => return Err(Error::Profile),
+        };
+        if current.operating() == op && self.packet.width == width {
+            return Ok(());
+        }
+        if !self.transmit_ready()
+            || self.station.pending.is_some()
+            || !matches!(self.station.phase, Phase::Joining | Phase::Configuring)
+        {
+            return Err(Error::State);
+        }
+        self.check_station_policy(environment)?;
+        let base = self
+            .station
+            .calibration
+            .as_ref()
+            .and_then(|base| base.rtl8723be())
+            .ok_or(Error::Profile)?
+            .clone();
+        let permission = base
+            .permission_for(&environment.domain()?, op)
+            .map_err(|e| Error::Radio(RadioError::Power(e)))?;
+        if width.is_some() && !super::super::super::rtl8723be::ht::admitted(&permission) {
+            return Err(Error::Profile);
+        }
+        self.station.retire_receive();
+        let domain = environment.domain()?;
+        let owner = &mut *self;
+        super::super::super::station_power::wait_rtl8723be(
+            base.clone(),
+            permission,
+            environment,
+            async {
+                owner.io.authority(true, || Ok(()))?;
+                owner.configure_rtl8723be_channel(&base, &domain, op).await
+            },
+        )
+        .await?;
+        self.packet.width = width;
+        self.check_station_policy(environment)
+    }
     pub(super) async fn select_station_width(
         &mut self,
         width: Option<Geometry>,

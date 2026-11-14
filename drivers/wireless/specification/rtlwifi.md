@@ -3331,15 +3331,26 @@ the coexistence owner runs every composed call site.
     stays off. `pci.rs::bring_up` retains `0xb723` when the BAR covers the
     8723BE MMIO, `_rtl8723be_read_chip_version` qualifies, the map is
     provisioned with the factory MAC and the path-A TX power decodes.
-  - Not composed (follow-ups): HT/40 MHz on this profile (the station
-    stays legacy 20 MHz; `rtl8723be_update_hal_rate_mask` N rows are never
-    installed), the `btc_scan_notify` / `connect` / `special_packet` / IPS
-    call sites from the shared station, `rtl8723be_dm_watchdog` steps other
-    than the RA refresh, short-preamble TX (as the other native profiles),
-    TX-report matching for the station, ASPM. Tests
+  - Not composed (follow-ups): ASPM (PCIe programme #1849, not wifi).
+    Composed: HT/40 MHz on this profile (`rtl8723be_update_hal_rate_mask`
+    N rows via `ht.rs`, `rtl8723be_wide` / `retune_rtl8723be`; the
+    host-API capability publication is a separate follow-up — nl80211
+    still publishes no HT for 8723BE), the `btc_scan_notify` / `connect` /
+    `special_packet` / IPS call sites from the shared station (handshake
+    EAPOL replies produced inside the sync TX path are not covered — no
+    async pre-TX site exists there), `rtl8723be_dm_watchdog` steps beyond
+    the RA refresh except EDCA turbo, the ATC switch's linked branch and
+    TX-power tracking (see `dm.rs`), short-preamble TX, TX-report
+    matching for the station. Tests
     `smoke_rtl8723be_station_registers_and_rsvd_page`,
     `smoke_rtl8723be_native_owner_start_descriptors_receipt_and_rx`,
-    `smoke_rtl8723be_native_join_rsvd_page_ra_mask_and_leave` (written,
+    `smoke_rtl8723be_native_join_rsvd_page_ra_mask_and_leave`,
+    `smoke_rtl8723be_ht40_rate_mask_n_rows`,
+    `smoke_rtl8723be_short_preamble_descriptor_bit`,
+    `smoke_rtl8723be_tx_report_match_and_settled`,
+    `smoke_rtl8723be_coex_notify_scan_connect_special_ips`,
+    `smoke_rtl8723be_dm_steps_false_alarm_dig_cck_edcca_atc`,
+    `smoke_rtl8723be_dm_watchdog_linked_refresh` (written,
     unexecuted).
 
 ### RTL8723AE retained runtime (probe-admitted; station admission open)
