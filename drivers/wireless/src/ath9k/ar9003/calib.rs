@@ -1398,8 +1398,8 @@ fn cl_cal_post_proc(
 ) -> Result<Option<TxClCal>, BringUpError> {
     if let Some(saved) = saved {
         for chain in chains(tx_chainmask) {
-            for j in 0..MAX_CL_TAB_ENTRY {
-                write(io, CL_TAB[chain] + 4 * j as u64, saved.table[chain][j])?;
+            for (j, value) in saved.table[chain].iter().enumerate() {
+                write(io, CL_TAB[chain] + 4 * j as u64, *value)?;
             }
         }
         return Ok(Some(saved));
@@ -1409,8 +1409,8 @@ fn cl_cal_post_proc(
     }
     let mut table = [[0u32; MAX_CL_TAB_ENTRY]; 3];
     for chain in chains(tx_chainmask) {
-        for j in 0..MAX_CL_TAB_ENTRY {
-            table[chain][j] = read(io, CL_TAB[chain] + 4 * j as u64)?;
+        for (j, slot) in table[chain].iter_mut().enumerate() {
+            *slot = read(io, CL_TAB[chain] + 4 * j as u64)?;
         }
     }
     Ok(Some(TxClCal { table }))
