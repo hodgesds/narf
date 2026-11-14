@@ -103,11 +103,33 @@ impl CoherentMem for Mem {
         &self.1
     }
 }
-struct Dma;
+/// The fixture DMA: RAM buffers plus a recorded BDF window — the
+/// `fixed_bdf_addr` parts write the board file through it (the
+/// production `Dma32::iomem_write` maps the window with `MmioRegs`;
+/// the default `DmaAllocator::iomem_write` refuses with `EIO`, which
+/// would fail the IPQ BDF leg at `BDF_IOREMAP`). Same bounds check as
+/// the direct WLFW fixture's `TestDma`.
+#[derive(Default)]
+struct Dma {
+    iomem: Vec<(u64, usize, Vec<u8>)>,
+}
 impl DmaAllocator for Dma {
     type Mem = Mem;
     fn alloc_coherent(&mut self, size: usize) -> Option<Mem> {
         Some(Mem(0x1000_0000, alloc::vec![0; size]))
+    }
+    fn iomem_write(
+        &mut self,
+        phys: u64,
+        map_len: usize,
+        off: usize,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        if off.checked_add(data.len()).is_none_or(|end| end > map_len) {
+            return Err(super::super::wlfw::EINVAL);
+        }
+        self.iomem.push((phys, off, data.to_vec()));
+        Ok(())
     }
 }
 
@@ -195,7 +217,7 @@ impl AhbEnv for Env {
         (FakeSmc::ok(), FakeAlloc::default())
     }
     fn dma(&mut self) -> Dma {
-        Dma
+        Dma::default()
     }
     fn bind_lines(
         &mut self,
@@ -3536,10 +3558,17 @@ kernel_test_in!(
 
 /// Crash recovery through the remote restart: after a `fatal` crash the
 /// restart shuts the dead remote down, boots it again (the fixture
-/// remote re-asserts `ready` on the next boot) and re-registers GLINK;
-/// the WLFW leg then times out — there is no WLFW server behind the
-/// fixture edge (that fixture is the WLFW lane's) — so the restart
-/// reports the timeout while the remote is back `Running`.
+/// remote re-asserts `ready` on the next boot), re-registers GLINK and
+/// runs the WLFW leg to FW_READY against the fake WLFW server (the
+/// IPQ6018 flavor: REQUEST_MEM with the fixture DT's HOST_DDR region,
+/// BDF through the `bdf_addr` window, cold-boot calibration) — the
+/// `AhbWlfw` the restart returns is what the crash-monitor task hands
+/// to the shared runtime rebuild. The server attaches lazily, as the
+/// WCN6750 live test does: the SMEM GLINK descriptor + FIFOs already
+/// exist from the first boot, and the re-register in `glink_start`
+/// only resets the RX tail / TX head, so a server attached before it
+/// still sees the host's fresh VERSION at the drained tail and its own
+/// pre-register OPEN at FIFO offset 0.
 fn smoke_ath11k_ahb_live_smp2p_crash_restart() -> TestResult {
     let (mut live, p) = booted_live();
     kt_assert_eq!(live.rproc_state(), Some(RprocState::Running));
@@ -3553,23 +3582,119 @@ fn smoke_ath11k_ahb_live_smp2p_crash_restart() -> TestResult {
     // shutdown from `Crashed` runs no pump, so the ticks survive it.
     live.env.smem.set(word, 0);
     live.env.ticks.store(0, Ordering::Relaxed);
-    let r = run(live.restart_transport(&p));
-    kt_assert!(
-        matches!(r, Some(Err(AhbError::Failed(_)))),
-        "WLFW leg times out without a server"
+    // The WLFW leg needs the board file, as the direct IPQ6018
+    // fixture does (the BDF download is the ELF `board.bin`).
+    live.env.files.insert(
+        String::from("ath11k/IPQ6018/hw1.0/board.bin"),
+        elf_board(128),
     );
+    // Drive the restart with the server pumped once per host poll:
+    // the WLFW leg's waits yield once each, so the pump between polls
+    // answers them, as `pump_to_ready` does for the direct fixtures.
+    let smem_regs = live.env.smem;
+    let (pid, size) = (live.env.pid, live.env.smem_size);
+    let smem = Smem::probe(smem_regs, size).unwrap();
+    let mut server: Option<GlinkWlfwServer<'_>> = None;
+    let out = {
+        let mut fut = pin!(live.restart_transport(&p));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut out = None;
+        for _ in 0..200_000 {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                out = Some(v);
+                break;
+            }
+            if server.is_none() {
+                // Attach once the host registered the edge (descriptor
+                // + host TX FIFO + pre-allocated remote FIFO), as the
+                // WCN6750 live test does.
+                if let (Ok(d), Ok(tx), Ok(rx)) = (
+                    smem.get(pid, SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR),
+                    smem.get(pid, SMEM_GLINK_NATIVE_XPRT_FIFO_0),
+                    smem.get(pid, SMEM_GLINK_NATIVE_XPRT_FIFO_1),
+                ) {
+                    server = Some(GlinkWlfwServer::unattached(
+                        GlinkRemote {
+                            regs: smem_regs,
+                            desc: d.offset,
+                            host_tx: (tx.offset, tx.len),
+                            host_rx: (rx.offset, rx.len),
+                        },
+                        ServerChip::Ipq6018,
+                        fixture_cap(0x21, 0x65, 0x9870, 0x2),
+                        alloc::vec![alloc::vec![
+                            MemSeg {
+                                size: 0x10_0000,
+                                mem_type: HOST_DDR_REGION_TYPE as i32,
+                                mem_cfg: Vec::new(),
+                            },
+                            MemSeg {
+                                size: 0x4_0000,
+                                mem_type: BDF_MEM_REGION_TYPE as i32,
+                                mem_cfg: Vec::new(),
+                            },
+                        ]],
+                        None,
+                    ));
+                }
+            }
+            if let Some(s) = server.as_mut() {
+                s.pump();
+            }
+        }
+        out
+    };
+    let Some(Ok(w)) = out else {
+        return TestResult::Fail("restart WLFW leg did not reach FW_READY");
+    };
     kt_assert_eq!(
         live.rproc_state(),
         Some(RprocState::Running),
         "remote restarted"
     );
     // `glink_start` re-ran: the GLINK descriptor is allocated.
-    let smem = Smem::probe(live.env.smem, live.env.smem_size).unwrap();
     kt_assert!(
         smem.get(live.env.pid, SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR)
             .is_ok(),
         "glink re-registered"
     );
+    let Some(s) = server else {
+        return TestResult::Fail("server never attached");
+    };
+    // The WLFW leg ran to completion through the real restart path:
+    // the exact IPQ6018 request sequence, no decode errors, and the
+    // fixed-memory assignment from the fixture DT's HOST_DDR region
+    // (HOST_DDR at the region, BDF at the chip's `bdf_addr`).
+    kt_assert_eq!(
+        s.reqs,
+        alloc::vec![
+            QMI_WLANFW_IND_REGISTER_REQ_V01,
+            QMI_WLANFW_HOST_CAP_REQ_V01,
+            QMI_WLANFW_RESPOND_MEM_REQ_V01,
+            QMI_WLANFW_CAP_REQ_V01,
+            QMI_WLANFW_BDF_DOWNLOAD_REQ_V01,
+            QMI_WLANFW_M3_INFO_REQ_V01,
+            QMI_WLANFW_WLAN_MODE_REQ_V01,
+        ]
+    );
+    kt_assert_eq!(s.decode_errs, 0);
+    kt_assert!(s.out_qrtr.is_empty());
+    kt_assert!(s.fw_ready_sent);
+    kt_assert_eq!(s.init_done_sent, 2);
+    kt_assert_eq!(s.bdf_segs, alloc::vec![(0, 1)]);
+    kt_assert_eq!(s.bdf_data, alloc::vec![false]);
+    kt_assert_eq!(
+        w.target_mem_list(),
+        alloc::vec![
+            (0x8000_0000, 0x10_0000, HOST_DDR_REGION_TYPE as i32),
+            (0x4abc_0000, 0x4_0000, BDF_MEM_REGION_TYPE as i32),
+        ]
+    );
+    kt_assert_eq!(s.respond_mem, w.target_mem_list());
+    // ...and the board bytes went through the BDF window at the
+    // chip's `bdf_addr` (read back through the restart's `Wlfw` DMA).
+    kt_assert_eq!(w.dma.iomem, alloc::vec![(0x4abc_0000, 0, elf_board(128))]);
     TestResult::Pass
 }
 kernel_test_in!(
