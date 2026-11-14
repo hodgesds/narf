@@ -955,6 +955,35 @@ tables (`mci_wlan_weights` for AR9462/AR9565, `ar9003_wlan_weights`
 otherwise) with the concurrent-TX priority overlay; `enable_mci` /
 `disable_mci` write the weights and the quiet-ack CTS enable.
 
+2WIRE/3WIRE: `btcoex::init_btcoex_hw` computes the `AR_BT_COEX_MODE`
+/ `MODE2` / `MODE3` register images from the fixed Linux config
+(slotted mode, TX-state/TX-frame extend, quiet collision,
+priority time 2, first slot 5, hold-RX-clear, beacon-miss threshold
+50) — the `AR_SREV_9300_20_OR_LATER` rx-clear-polarity inversion
+always applies, and the SoC first-slot (`0x1d`) / time-extend (`0xa`)
+overrides plus the mode3 image are ported behind an `is_soc` flag
+(no in-tree part is a SoC). `init_2wire` / `init_3wire` program the
+baseband input-enable bits, the BT-active/BT-priority input muxes
+(`AR_GPIO_INPUT_MUX1`, non-SoC only) and the GPIO request-in wiring
+(drive NO in `AR_GPIO_OE_OUT`); `enable_2wire` only requests the
+WLAN-active GPIO out muxed to TX_FRAME, while `enable_3wire` programs
+the mode/weight registers (`AR_BT_COEX_WL_WEIGHTS0`/`1` `0x8174` /
+`0x81c4`, `AR_BT_COEX_BT_WEIGHTS(i)` `0x83ac + i * 4` — distinct from
+the MCI weight registers), the quiet-ack CTS enable, clears
+`AR_PCU_BT_ANT_PREVENT_RX` and requests WLAN-active out muxed to
+RX_CLEAR_EXTERNAL. `deinit` is a no-op on AR9003 (Linux's
+`ath9k_hw_gpio_free` returns early for non-SoC parts).
+`btcoex_enable` / `btcoex_disable` dispatch on the scheme (NONE
+returns early on enable; MCI delegates to `enable_mci` /
+`disable_mci`; 3WIRE disable parks the mode at `AR_BT_QUIET |
+AR_BT_MODE` and zeroes the weights); enable programs the BT-active
+pull-down in `AR_GPIO_PDPU` for the non-MCI schemes. The
+pre-AR9300 `AR_BT_COEX_WEIGHT` writes, the pre-AR9300
+`set_gpio` in disable and the AR9271 `0x50040` clear are not ported
+(no in-tree part takes those branches). The owner does not call any
+of these paths yet (see below); the dispatcher is the surface it
+will call.
+
 GPIO: `observation_set_up` routes the MCI (or TX/RX, or BT) observation
 signals to GPIO 0..3 (and 5) per the `ATH_MCI_CONFIG_MCI_OBS_*` bits;
 the MCI GPIO mux values are `MCI_WLAN_DATA 0x16`, `MCI_WLAN_CLK 0x17`,
@@ -999,7 +1028,9 @@ Not in this step: the live-owner integration (owner holds `Btcoex`,
 `service_begin` routes `Events.mci`, reset path calls
 `start_reset`/`end_reset`, periodic `check_bt`, channel change calls
 `switch_2g5g`/`update_wlan_channels`, applying the computed scheme and
-recording HT state); the 2WIRE/3WIRE btcoex enable/init paths; the WoW
+recording HT state, and the owner calls
+`init_btcoex_hw` / `init_2wire` / `init_3wire` / `btcoex_enable` /
+`btcoex_disable` / `deinit` for the 2WIRE/3WIRE schemes); the WoW
 `mci_enabled` flag integration (open draft PR #1921 wires it once MCI
 lands). Fixture tests cover the message exchange end to end, capability
 gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
