@@ -538,6 +538,55 @@ fn smoke_subsystem_prefix_selection() -> TestResult {
 }
 kernel_test_in!("verification", smoke_subsystem_prefix_selection);
 
+/// Regression guard (Go `runtime.vdsoParseSymbols` SIGSEGV in `agy`):
+/// the embedded vDSO's `PT_DYNAMIC` segment must be read-only (`PF_R`,
+/// never `PF_W`). Otherwise glibc `ld-linux` checks `!(p_flags & PF_W)`
+/// before relocating `.dynamic` entries in place, and Go then adds
+/// `loadOffset` a second time, producing non-canonical pointers.
+fn smoke_vdso_pt_dynamic_is_readonly() -> TestResult {
+    const PT_DYNAMIC: u32 = 2;
+    const PF_W: u32 = 2;
+    const PF_R: u32 = 4;
+    let bytes = core::hint::black_box(NARF_VDSO_ELF);
+    if bytes.is_empty() {
+        return TestResult::Skip("host lacked clang/ld.lld to build vDSO");
+    }
+    if bytes.len() < 64 || bytes[0..4] != *b"\x7fELF" || bytes[4] != 2 || bytes[5] != 1 {
+        return TestResult::Fail("NARF_VDSO_ELF is not a valid little-endian ELF64 image");
+    }
+    let phoff = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes(bytes[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(bytes[56..58].try_into().unwrap()) as usize;
+    if phentsize < 56 || phnum == 0 {
+        return TestResult::Fail("NARF_VDSO_ELF has malformed program header table");
+    }
+    let mut saw_dynamic = false;
+    for i in 0..phnum {
+        let Some(off) = phoff.checked_add(i.saturating_mul(phentsize)) else {
+            return TestResult::Fail("NARF_VDSO_ELF phdr offset overflow");
+        };
+        let Some(phdr) = bytes.get(off..off + phentsize) else {
+            return TestResult::Fail("NARF_VDSO_ELF phdr extends past EOF");
+        };
+        let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
+        if p_type == PT_DYNAMIC {
+            saw_dynamic = true;
+            let p_flags = u32::from_le_bytes(phdr[4..8].try_into().unwrap());
+            if p_flags & PF_W != 0 {
+                return TestResult::Fail("vDSO PT_DYNAMIC must not have PF_W");
+            }
+            if p_flags & PF_R == 0 {
+                return TestResult::Fail("vDSO PT_DYNAMIC must have PF_R");
+            }
+        }
+    }
+    if !saw_dynamic {
+        return TestResult::Fail("NARF_VDSO_ELF missing PT_DYNAMIC phdr");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("verification", smoke_vdso_pt_dynamic_is_readonly);
+
 // `smoke_arch_percpu_basic` migrated to arch/src/tests.rs (subsystem `"arch"`).
 
 // `smoke_monotonic_advances` migrated to time/src/tests.rs (subsystem `"time"`).
