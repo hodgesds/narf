@@ -960,7 +960,7 @@ impl Xhci {
         let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH != 0,
-            narf_time::Deadline::after_ms(100),
+            narf_time::Deadline::after_ms(500),
         );
 
         // HCRST — only way to clear HCE (xHCI §5.4.1.1).
@@ -968,10 +968,16 @@ impl Xhci {
         unsafe {
             mmio.write32(op_off + OP_USBCMD, USBCMD_HCRST);
         }
+        // Intel xHCI quirk: pause 1 ms after writing HCRST before accessing registers.
+        let pause_dl = narf_time::Deadline::after_ms(1);
+        while !pause_dl.expired() {
+            narf_scheduler::sleep_pumps::run();
+            core::hint::spin_loop();
+        }
         let reset_ok = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBCMD) } & USBCMD_HCRST == 0,
-            narf_time::Deadline::after_ms(100),
+            narf_time::Deadline::after_ms(5_000),
         );
         if !reset_ok {
             return Err(XhciError::ResetTimeout);
@@ -979,7 +985,7 @@ impl Xhci {
         let cnr_clear = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_CNR == 0,
-            narf_time::Deadline::after_ms(1_000),
+            narf_time::Deadline::after_ms(5_000),
         );
         if !cnr_clear {
             return Err(XhciError::NotReady);
@@ -1109,7 +1115,7 @@ impl Xhci {
         let running = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH == 0,
-            narf_time::Deadline::after_ms(100),
+            narf_time::Deadline::after_ms(1_000),
         );
         if !running {
             return Err(XhciError::StartFailed);
@@ -1450,11 +1456,11 @@ impl Xhci {
         // Wait for HCH = 1. responsive_spin_until keeps cursor/FB
         // alive while the controller halts. xHCI 1.2 §5.4.1.1 says
         // the controller must halt within 16 ms of clearing R/S; use
-        // a 100 ms budget so a slow controller still has headroom.
+        // a 500 ms budget so a slow controller still has headroom.
         let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH != 0,
-            narf_time::Deadline::after_ms(100),
+            narf_time::Deadline::after_ms(500),
         );
 
         // Reset.
@@ -1462,24 +1468,30 @@ impl Xhci {
         unsafe {
             mmio.write32(op_off + OP_USBCMD, USBCMD_HCRST);
         }
+        // Intel xHCI quirk: pause 1 ms after writing HCRST before accessing registers.
+        let pause_dl = narf_time::Deadline::after_ms(1);
+        while !pause_dl.expired() {
+            narf_scheduler::sleep_pumps::run();
+            core::hint::spin_loop();
+        }
         // responsive_spin_until ticks sleep_pumps across HCRST
         // self-clear. xHCI §4.2: HCRST should self-clear within
-        // 100 ms on a healthy controller.
+        // 100 ms on a healthy controller; allow 5,000 ms for slow firmware.
         let reset_ok = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBCMD) } & USBCMD_HCRST == 0,
-            narf_time::Deadline::after_ms(100),
+            narf_time::Deadline::after_ms(5_000),
         );
         if !reset_ok {
             return Err(XhciError::ResetTimeout);
         }
         // Wait for CNR = 0. xHCI §4.2: post-reset the controller may
         // hold CNR for up to ~1 s while it loads device-context
-        // structures and runs internal POST.
+        // structures and runs internal POST; allow 5,000 ms for slow firmware.
         let cnr_clear = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_CNR == 0,
-            narf_time::Deadline::after_ms(1_000),
+            narf_time::Deadline::after_ms(5_000),
         );
         if !cnr_clear {
             return Err(XhciError::NotReady);
@@ -1670,7 +1682,7 @@ impl Xhci {
         let running = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH == 0,
-            narf_time::Deadline::after_ms(100),
+            narf_time::Deadline::after_ms(1_000),
         );
         if !running {
             return Err(XhciError::StartFailed);
@@ -1832,35 +1844,28 @@ impl Xhci {
             mmio.write32(op_off + OP_USBSTS, USBSTS_EINT);
         }
 
-        // Try MSI-X first, fall back to legacy INTx via PCI _PRT +
-        // IOAPIC programming, fall back to polling if neither works.
+        // Try MSI-X first, then standard MSI, fall back to legacy INTx via PCI _PRT +
+        // IOAPIC programming, fall back to polling if none work.
         // Cap-walking failures, firmware MSI-X disable bits, and
         // platforms whose firmware never enabled MSI-X all land in
-        // the INTx path. PCIe Base Spec §6.1 (MSI-X Capability) +
+        // the MSI/INTx path. PCIe Base Spec §6.1 (MSI-X Capability) +
         // §6.1.4 (INTx Emulation) describe the fallback contract.
         //   <https://pcisig.com/specifications/pciexpress/>
         let (msix, irq_vector) = match Self::try_enable_msix(cap, device) {
             Ok((tbl, v)) => (Some(tbl), Some(v)),
-            Err(_) => match Self::try_install_intx(cap, device) {
-                Some(v) => (None, Some(v)),
-                None => (None, None),
+            Err(_) => match Self::try_enable_msi(cap, device) {
+                Ok(v) => (None, Some(v)),
+                Err(_) => match Self::try_install_intx(cap, device) {
+                    Some(v) => (None, Some(v)),
+                    None => (None, None),
+                },
             },
         };
-        // After MSI-X enable, re-write IMAN so an implementation that
-        // registers interrupter→MSI-X-vector binding on the IMAN.IE
-        // transition observes IE=1 *while* MSI-X is already enabled
-        // in PCI cfg. xHCI 1.2 §5.5.2.1 specifies IE as the gate that
-        // permits the interrupter to assert interrupts; the spec is
-        // silent on the exact moment the host bus translates the
-        // interrupter to a delivered MSI/MSI-X message, but in
-        // practice the registration is wired to the IMAN.IE write
-        // path. We wrote IMAN earlier (during IR0 setup) when MSI-X
-        // wasn't yet enabled in PCI cfg — re-issuing the same write
-        // here re-arms the registration so subsequent Transfer
-        // Events deliver. INTx-fallback path doesn't need this; the
-        // legacy path delivers via IOAPIC redirection set up by
-        // `try_install_intx`.
-        if msix.is_some() {
+        // After MSI/MSI-X enable, re-write IMAN so an implementation that
+        // registers interrupter→vector binding on the IMAN.IE
+        // transition observes IE=1 *while* MSI/MSI-X is already enabled
+        // in PCI cfg.
+        if msix.is_some() || irq_vector.is_some() {
             // SAFETY: identity-mapped MMIO; same offset as the
             // earlier write.
             // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -1989,6 +1994,29 @@ impl Xhci {
         Ok((msix, v))
     }
 
+    /// Walk the controller's standard MSI capability, allocate an IDT
+    /// vector, program delivery to BSP, and enable MSI. Returns the
+    /// allocated vector on success.
+    #[cfg(target_arch = "x86_64")]
+    fn try_enable_msi(
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<u8, XhciError> {
+        let mut cfg = narf_bus::msi::enable_msi(cap, device, 1).map_err(|_| XhciError::NoMemory)?;
+        let v = narf_interrupts::vector::alloc().map_err(|_| XhciError::NoMemory)?;
+        let _ = unsafe { narf_bus::msi::program_msi(&mut cfg, 0, v) }.map_err(|_| XhciError::NoMemory)?;
+        unsafe { narf_bus::msi::enable(&cfg) }.map_err(|_| XhciError::NoMemory)?;
+        narf_interrupts::install_handler(v, xhci_isr);
+        Ok(v)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn try_enable_msi(
+        _cap: &Cap<BusDeviceCap, Write>,
+        _device: &BusDevice,
+    ) -> Result<u8, XhciError> {
+        Err(XhciError::NoMemory)
+    }
+
     /// Legacy INTx fallback: read PCI INTERRUPT_PIN, look up the
     /// (bridge, slot, pin) triple in the AML `_PRT` routing
     /// table, allocate an IDT vector, install a fire-counter
@@ -2021,10 +2049,22 @@ impl Xhci {
         // pin is 1-based. Map between them.
         let prt_pin = pin - 1;
         // Today every QEMU q35 bridge AML lives at "\\_SB.PCI0";
-        // real consumer BIOSes match this convention. Multi-root
-        // systems (rare) need bridge resolution from the device's
-        // segment/bus, filed as a follow-up if it ever fires.
-        let route = narf_aml::irq_routing::route_for("\\_SB.PCI0", slot, prt_pin)?;
+        // real consumer BIOSes match this convention, though some Intel systems
+        // use "\\_SB_.PC00" or similar. Fall back to scanning all registered routes.
+        let route = narf_aml::irq_routing::route_for("\\_SB.PCI0", slot, prt_pin)
+            .or_else(|| narf_aml::irq_routing::route_for("\\_SB_.PC00", slot, prt_pin))
+            .or_else(|| {
+                let mut found = None;
+                narf_aml::irq_routing::for_each_route(|r| {
+                    if found.is_none() {
+                        let r_slot = ((r.entry.address >> 16) & 0xFFFF) as u32;
+                        if r_slot as u8 == slot && r.entry.pin == prt_pin {
+                            found = Some(r.clone());
+                        }
+                    }
+                });
+                found
+            })?;
         if route.entry.source.is_some() {
             // Named-link _PRT entry — needs link-device _CRS
             // evaluation to learn the current GSI. Not yet
@@ -6191,7 +6231,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             | (AMD_VENDOR, AMD_PHX_15C1),
     );
     if !is_xhci_class && !is_explicit_match {
-        return Err(narf_bus::ProbeError::BadDevice);
+        return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     narf_bus::pci::set_command(
         &cap,
