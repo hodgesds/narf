@@ -1856,9 +1856,13 @@ multicast layers a kernel network stack also needs.
   `poll_round` (one `sync_once` + transition, fixture-tested
   end-to-end), `poll_daemon` / `start_poll_daemon` (exchange first,
   then sleep 2^poll seconds between rounds; stops on demobilise).
-  Out of scope: discovery (DHCP option 42 unparsed — #1955 bullet 2),
-  authentication (no MAC/Autokey/NTS), multi-server selection
-  (§9/§10, waits on a second source existing), IPv6.
+  Surfaced (issue #1955 bullet 2): `select_server` (explicit server
+  wins, else first DHCP option-42 NTP server in `DhcpLease.ntp`),
+  `SntpConfig::with_dhcp_fallback`, `sync_once_with_lease`
+  (`NoServer` when neither source names a server).
+  Out of scope: authentication (no MAC/Autokey/NTS),
+  multi-server selection (§9/§10, waits on a second source
+  existing), IPv6.
 
 ### WebSocket (`ws`)
 - **RFC 6455** — The WebSocket Protocol (I. Fette & A. Melnikov,
