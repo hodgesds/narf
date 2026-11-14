@@ -438,11 +438,9 @@ fn smoke_mtl_hpd_generation_gate_and_imr_refusal() -> TestResult {
     for generation in [
         crate::intel_gpu::Generation::TigerLake,
         crate::intel_gpu::Generation::AlderLake,
-        crate::intel_gpu::Generation::LunarLake,
-        crate::intel_gpu::Generation::PantherLake,
     ] {
         if poll_hpd_event(&NoAccess, generation).is_some() || !teardown_hpd(&NoAccess, generation) {
-            return TestResult::Fail("non-MTL generations must not touch the MTL HPD block");
+            return TestResult::Fail("Gen12 generations must not touch the PICA HPD block");
         }
     }
     // An IMR that refuses the mask must stop setup before IER.
@@ -497,6 +495,15 @@ fn smoke_mtl_hpd_fresh_teardown_touches_nothing() -> TestResult {
     let before = io.writes.borrow().len();
     if !monitor.teardown(&io) || io.writes.borrow().len() == before {
         return TestResult::Fail("initialized teardown must withdraw owned sources");
+    }
+    for generation in [
+        crate::intel_gpu::Generation::MeteorLake,
+        crate::intel_gpu::Generation::LunarLake,
+        crate::intel_gpu::Generation::PantherLake,
+    ] {
+        if !crate::intel_gpu_xelpg_hpd::hpd_generation_supported(generation) {
+            return TestResult::Fail("Display 14/20/30 must admit PICA HPD block");
+        }
     }
     TestResult::Pass
 }

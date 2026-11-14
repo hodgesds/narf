@@ -770,14 +770,24 @@ impl MtlHpdMonitor {
 static MTL_HPD: IrqSafeSpinLock<MtlHpdMonitor> =
     IrqSafeSpinLock::new(MtlHpdMonitor::new(MtlHpdConfig::TYPE_C));
 
-/// Poll the process-wide MTL monitor once. Only Meteor Lake (display 14)
-/// windows reach the registers; every other generation returns `None`
-/// before any access.
+/// Whether `generation` uses the PICA / XELPDP Type-C hotplug block.
+pub(crate) const fn hpd_generation_supported(generation: crate::intel_gpu::Generation) -> bool {
+    matches!(
+        generation,
+        crate::intel_gpu::Generation::MeteorLake
+            | crate::intel_gpu::Generation::LunarLake
+            | crate::intel_gpu::Generation::PantherLake
+    )
+}
+
+/// Poll the process-wide MTL/LNL/PTL monitor once. Only Display 14/20/30
+/// windows reach the registers; earlier generations return `None` before
+/// any access.
 pub fn poll_hpd_event<M: MmioWindow + ?Sized>(
     io: &M,
     generation: crate::intel_gpu::Generation,
 ) -> Option<MtlHpdEvent> {
-    if generation != crate::intel_gpu::Generation::MeteorLake {
+    if !hpd_generation_supported(generation) {
         return None;
     }
     MTL_HPD.lock().poll(io)
@@ -795,7 +805,7 @@ pub fn teardown_hpd<M: MmioWindow + ?Sized>(
     io: &M,
     generation: crate::intel_gpu::Generation,
 ) -> bool {
-    if generation != crate::intel_gpu::Generation::MeteorLake {
+    if !hpd_generation_supported(generation) {
         return true;
     }
     MTL_HPD.lock().teardown(io)

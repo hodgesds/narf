@@ -139,6 +139,13 @@ pub enum Refusal {
 
 /// `intel_fbc_check_plane` for display 14.
 pub fn check_plane(plane: &Plane) -> Result<(), Refusal> {
+    check_plane_for(plane, false)
+}
+
+/// `intel_fbc_check_plane` for display 14 (`display20 == false`, enforces
+/// `Wa_14016291713` against PSR1) or display >= 20 (`display20 == true`,
+/// allows PSR1 alongside FBC while still refusing selective update).
+pub fn check_plane_for(plane: &Plane, display20: bool) -> Result<(), Refusal> {
     if !plane.kms_owned {
         return Err(Refusal::NotKmsOwned);
     }
@@ -148,7 +155,7 @@ pub fn check_plane(plane: &Plane) -> Result<(), Refusal> {
     if plane.selective_update {
         return Err(Refusal::SelectiveUpdate);
     }
-    if plane.psr1 {
+    if !display20 && plane.psr1 {
         return Err(Refusal::Psr1);
     }
     if plane.format == Format::Other {
@@ -249,18 +256,32 @@ pub struct Fbc {
     cfb_bytes: u64,
     limit: u32,
     override_stride: u16,
+    display20: bool,
     enabled: bool,
     active: bool,
 }
 
 impl Fbc {
-    /// An owner over a placed CFB (`cfb_offset` within DSM, below 2^28).
+    /// An owner over a placed CFB (`cfb_offset` within DSM, below 2^28) for display 14.
     pub fn new(cfb_offset: u32, cfb_bytes: u64, limit: u32, override_stride: u16) -> Self {
+        Self::new_for(cfb_offset, cfb_bytes, limit, override_stride, false)
+    }
+    /// An owner over a placed CFB (`cfb_offset` within DSM, below 2^28) for
+    /// display 14 (`display20 == false`, with Wa_22014263786) or display >= 20
+    /// (`display20 == true`, omitting Wa_22014263786 and Wa_14016291713).
+    pub fn new_for(
+        cfb_offset: u32,
+        cfb_bytes: u64,
+        limit: u32,
+        override_stride: u16,
+        display20: bool,
+    ) -> Self {
         Self {
             cfb_offset,
             cfb_bytes,
             limit,
             override_stride,
+            display20,
             enabled: false,
             active: false,
         }
@@ -287,8 +308,11 @@ impl Fbc {
         if self.enabled {
             return;
         }
-        let chicken = regs.read32(DPFC_CHICKEN);
-        regs.write32(DPFC_CHICKEN, chicken | DPFC_CHICKEN_FORCE_SLB_INVALIDATION);
+        // Wa_22014263786 applies to display 11.00..=14.00 only, not display >= 20.
+        if !self.display20 {
+            let chicken = regs.read32(DPFC_CHICKEN);
+            regs.write32(DPFC_CHICKEN, chicken | DPFC_CHICKEN_FORCE_SLB_INVALIDATION);
+        }
         let gate = regs.read32(PIPE_CLKGATE_DIS2);
         regs.write32(PIPE_CLKGATE_DIS2, gate | DPFC_GATING_DIS);
         regs.write32(DPFC_CB_BASE, self.cfb_offset);
@@ -357,7 +381,7 @@ impl Fbc {
         regs: &M,
         plane: &Plane,
     ) -> Result<(), Refusal> {
-        if let Err(refusal) = check_plane(plane) {
+        if let Err(refusal) = check_plane_for(plane, self.display20) {
             self.disable(regs);
             return Err(refusal);
         }

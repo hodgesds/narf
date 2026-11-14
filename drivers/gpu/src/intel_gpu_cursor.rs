@@ -19,7 +19,7 @@ use crate::{
     intel_gpu_gem::{GemObject, GemState, Placement},
     intel_gpu_ggtt_ranges::{Lease, Ledger},
     intel_gpu_gtt::{PteFormat, GGTT_ARRAY_BASE},
-    intel_gpu_scanout_io::{display_pat_programmed_ip, display_pte_ip, DisplayAccess},
+    intel_gpu_scanout_io::{display_pat_programmed_for, display_pte_for, DisplayAccess},
 };
 use alloc::{sync::Arc, vec::Vec};
 use narf_filesystem::FsError;
@@ -91,8 +91,11 @@ impl<M: DisplayAccess + Clone> Owner<M> {
         family: Option<crate::intel_gpu_gt::Gen12Platform>,
         generation: Generation,
     ) -> Result<Self, FsError> {
-        let pte = display_pte_ip(generation, io.display_ip()).ok_or(FsError::Unsupported)?;
-        if !io.access_ok() || !display_pat_programmed_ip(&io, generation, io.display_ip()) {
+        let pte = display_pte_for(generation, io.display_ip(), io.discrete_display())
+            .ok_or(FsError::Unsupported)?;
+        if !io.access_ok()
+            || !display_pat_programmed_for(&io, generation, io.display_ip(), io.discrete_display())
+        {
             return Err(FsError::NoDevice);
         }
         if io.read32(0x70080) != 0 || (family.is_some() && io.read32(0x700a0) != 0) {

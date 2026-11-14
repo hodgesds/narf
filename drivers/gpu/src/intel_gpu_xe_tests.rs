@@ -2433,3 +2433,9 @@ mod gen12_media {
 mod bmg_smallbar {
     include!("intel_gpu_bmg_smallbar_tests.rs");
 }
+mod lr {
+    include!("intel_gpu_xe_lr_tests.rs");
+}
+mod vram_evict {
+    include!("intel_gpu_vram_evict_tests.rs");
+}

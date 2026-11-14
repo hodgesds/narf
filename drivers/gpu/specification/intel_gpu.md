@@ -7370,3 +7370,39 @@ intel_dpll_mgr.c, intel_dkl_phy.c, intel_dp_mst.c and their register headers;
 the existing vendor-neutral MST/DP protocol implementations are shared.
 No Intel silicon, Thunderbolt dock or Mesa acceptance is claimed by native
 register/sideband fixtures. Test and build results are recorded in STATUS.md.
+
+## Completion of Intel iGPU and Discrete Arc Support
+
+- **Long-Running (`LR_MODE`) & Fault-Mode (`FAULT_MODE`) VMs + `PREFETCH`**:
+  `DRM_XE_VM_CREATE_FLAG_LR_MODE` (flag `2`, plus `SCRATCH_PAGE`) and
+  `DRM_XE_VM_CREATE_FLAG_FAULT_MODE` (flag `4`, requiring `LR_MODE`) are
+  admitted in `intel_gpu_xe` / `intel_gpu_xe_vm`. Long-running VMs forbid
+  `SYNCOBJ` / `TIMELINE_SYNCOBJ` out-syncs, allow zero-operation
+  `USER_FENCE` barriers, suppress the finite 5s/15s job watchdog while
+  canceling active jobs on `EXEC_QUEUE_DESTROY`, and admit
+  `DRM_XE_VM_BIND_OP_PREFETCH` (`op == 4`, `FAULT_MODE` only) to revalidate
+  invalidated `MAP_USERPTR` ranges and migrate/evict mapped BOs between
+  system memory (`region = 0`) and VRAM (`region = 1`).
+- **Discrete VRAM Eviction, Small-BAR & Bidirectional Flat-CCS**:
+  `DRM_XE_GEM_CPU_CACHING_WB` and small-BAR `NEEDS_VISIBLE_VRAM` admissions,
+  bidirectional Flat-CCS save on VRAM eviction and restore on VRAM migration
+  via `BCS0` / `intel_gpu_vram_clear`, dynamic OOM eviction during
+  `GEM_CREATE` (pinning active scanout, CPU-mapped, VM-private, and busy
+  objects), automatic exec re-migration of `preferred_vram()` BOs, and
+  system-suspend drain (`allow_scanout = true`) are active across DG2 and
+  Battlemage.
+- **Integrated Display 20 / 30 (Lunar Lake & Panther Lake) Parity**:
+  Display-20 PSR1 (`SRD_STATUS` SCL >= 1 precondition, entry setup frames,
+  `Wa_18037818876`, `Wa_16025596647`), FBC on HDR planes (`Wa_18038517565`,
+  skipping `Wa_22014263786`), DPT tiled panning via `DptLayout::with_origin`,
+  S3 `panel_off` / `panel_on` relight & `system_suspend_admitted` (for
+  display 20 and proved display 30), and PICA / Type-C external output +
+  HPD/HDMI/DP routing (`MtlExternalService` across Meteor Lake, Lunar Lake,
+  and Panther Lake) are wired into the shared KMS/external paths.
+- **Discrete Arc Display Bring-Up (`DG2` Display 13 & `BMG` `Xe2_HPD` 14.01)**:
+  `DiscreteDisplayIp::{Dg2, Xe2Hpd}` identifies discrete display engines on
+  `Alchemist` and `Battlemage` (`GMD_ID_DISPLAY` 14.01), seeding DRM mode
+  state (`intel_vram_scanout = true`) in `probe_discrete` and installing KMS
+  via `install_discrete` when firmware Pipe A is lit. `PteFormat::encode_ggtt_vram`
+  and `Presenter::with_vram_scanout` program GGTT entries with `PTE_DM`, and
+  `addfb2_intel` marks admitted VRAM scanouts non-evictable under normal OOM.

@@ -112,6 +112,61 @@ pub(crate) fn revoke_window(
     narf_filesystem::mmap_relocation::revoke(start, len, vram_alias_census, refault)
 }
 
+/// True if `object` currently has any live CPU mmap or unretired shared-frame
+/// fork alias, precluding storage relocation.
+pub(crate) fn has_active_aliases(object: &GemObject) -> bool {
+    let index = BACKINGS.lock();
+    let Some(backing) = index.iter().filter_map(Weak::upgrade).find(|b| {
+        core::ptr::eq(Arc::as_ptr(&b.object), object) && !b.retired.load(Ordering::Acquire)
+    }) else {
+        return false;
+    };
+    if backing.owners.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+    let frames = FRAMES.lock();
+    backing.frames.iter().any(|phys| {
+        frames
+            .get(phys)
+            .is_some_and(|(owner, count)| Arc::ptr_eq(owner, &backing) && *count != 0)
+    })
+}
+
+/// Retire an inactive `CpuBacking` before migrating `object`'s storage to new
+/// physical frames so subsequent mappings re-register cleanly. Returns `Busy`
+/// if any CPU mmap or shared-frame alias is still active.
+pub(crate) fn retire_object(object: &Arc<GemObject>) -> Result<(), FsError> {
+    let mut index = BACKINGS.lock();
+    index.retain(|weak| weak.strong_count() != 0);
+    let Some(backing) = index
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find(|b| Arc::ptr_eq(&b.object, object) && !b.retired.load(Ordering::Acquire))
+    else {
+        return Ok(());
+    };
+    let mut frames = FRAMES.lock();
+    if backing.retired.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if backing.owners.load(Ordering::Acquire) != 0
+        || backing.frames.iter().any(|phys| {
+            frames
+                .get(phys)
+                .is_some_and(|(owner, count)| Arc::ptr_eq(owner, &backing) && *count != 0)
+        })
+    {
+        return Err(FsError::Busy);
+    }
+    backing.retired.store(true, Ordering::Release);
+    for phys in &backing.frames {
+        let (owner, count) = frames.remove(phys).expect("registered Intel CPU frame");
+        assert!(Arc::ptr_eq(&owner, &backing) && count == 0);
+        drop(owner);
+    }
+    Ok(())
+}
+
 pub(super) fn backing(
     object: Arc<GemObject>,
     offset: u64,

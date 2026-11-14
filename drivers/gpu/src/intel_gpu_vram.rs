@@ -165,6 +165,7 @@ pub struct Vram {
     /// (xe_vram.c dpa_base 0, io_start + tile offset).
     bar: u64,
     page_size: u64,
+    resident: IrqSafeSpinLock<alloc::vec::Vec<alloc::sync::Weak<crate::intel_gpu_gem::GemObject>>>,
 }
 
 #[derive(Debug, Default)]
@@ -245,6 +246,7 @@ impl Vram {
             layout,
             bar: bar.phys.raw(),
             page_size,
+            resident: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
         }))
     }
 
@@ -359,6 +361,48 @@ impl Vram {
         true
     }
 
+    pub(crate) fn track(&self, object: &Arc<crate::intel_gpu_gem::GemObject>) {
+        let mut resident = self.resident.lock();
+        resident.retain(|weak| weak.strong_count() != 0);
+        if !resident
+            .iter()
+            .filter_map(alloc::sync::Weak::upgrade)
+            .any(|live| Arc::ptr_eq(&live, object))
+        {
+            resident.push(Arc::downgrade(object));
+        }
+    }
+
+    pub(crate) fn eviction_candidates(
+        &self,
+        visible_only: bool,
+        min_bytes: u64,
+        allow_scanout: bool,
+    ) -> alloc::vec::Vec<Arc<crate::intel_gpu_gem::GemObject>> {
+        let mut resident = self.resident.lock();
+        resident.retain(|weak| weak.strong_count() != 0);
+        let mut chosen = alloc::vec::Vec::new();
+        let mut gathered = 0u64;
+        for object in resident.iter().filter_map(alloc::sync::Weak::upgrade) {
+            if !object.in_vram_pool(self) {
+                continue;
+            }
+            if visible_only && object.is_gpu_only() {
+                continue;
+            }
+            if !object.is_evictable(allow_scanout) {
+                continue;
+            }
+            let sz = object.size();
+            chosen.push(object);
+            gathered = gathered.saturating_add(sz);
+            if min_bytes != 0 && min_bytes != u64::MAX && gathered >= min_bytes {
+                break;
+            }
+        }
+        chosen
+    }
+
     /// Reopen kernel CPU access once the function is in D0 with a running GT.
     pub(crate) fn open_cpu_access(&self) {
         self.cpu_gate.lock().closed = false;
@@ -425,18 +469,17 @@ impl VramAllocation {
     ) -> Result<(), crate::intel_gpu_gt::lnl::Error> {
         self.vram.smallbar_access(m)
     }
-    pub(crate) fn pool_is(&self, pool: &Arc<Vram>) -> bool {
-        Arc::ptr_eq(&self.vram, pool)
+    pub(crate) fn pool_is_ref(&self, pool: &Vram) -> bool {
+        core::ptr::eq(Arc::as_ptr(&self.vram), pool)
+    }
+    pub(crate) fn pool(&self) -> &Arc<Vram> {
+        &self.vram
     }
     pub(crate) fn page_size(&self) -> u64 {
         self.vram.page_size()
     }
     pub(crate) fn requires_ccs_clear(&self) -> bool {
         self.vram.requires_ccs_clear()
-    }
-    /// See [`Vram::cpu_access`].
-    pub(crate) fn cpu_access(&self) -> Option<CpuAccess<'_>> {
-        self.vram.cpu_access()
     }
     fn reservation(&self) -> &LocalRange {
         self.reservation.as_ref().expect("live VRAM reservation")

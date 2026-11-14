@@ -92,7 +92,8 @@ use crate::intel_gpu_xelpg_external::{
 };
 use crate::intel_gpu_xelpg_pipes::PipeEnableError;
 use crate::intel_gpu_xelpg_tc::{
-    connect as tc_connect, connection_intact, disconnect as tc_disconnect, TcConnection, TcMode,
+    connect_for as tc_connect_for, connection_intact, disconnect as tc_disconnect, TcConnection,
+    TcMode,
 };
 
 include!("intel_gpu_xelpg_hdmi_tables.rs");
@@ -431,9 +432,10 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     legacy_port: bool,
     ddc: Option<PinPair>,
 ) -> Result<MtlHdmiProbe, HdmiError> {
-    if generation != Generation::MeteorLake {
+    if !crate::intel_gpu_xelpg_hpd::hpd_generation_supported(generation) {
         return Err(ExternalError::UnsupportedGeneration.into());
     }
+    let display20 = matches!(generation, Generation::LunarLake | Generation::PantherLake);
     if port == XeLpgPort::A {
         return Err(ExternalError::UnsupportedPort.into());
     }
@@ -445,7 +447,7 @@ pub fn probe_hdmi<M: MmioWindow + ?Sized>(
     // A legacy Type-C port is owned in legacy mode before its DDC is used,
     // as the DP probe owns the PHY before AUX.
     let tc = if type_c {
-        let conn = tc_connect(io, port, true, HDMI_LANES)?;
+        let conn = tc_connect_for(io, port, true, HDMI_LANES, display20)?;
         if conn.mode != TcMode::Legacy {
             let _ = tc_disconnect(io, &conn);
             return Err(HdmiError::NotLegacy);

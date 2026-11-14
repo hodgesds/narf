@@ -1149,6 +1149,9 @@ pub struct Card {
     /// Fixed MTL/Arrow opaque XR30 LINEAR native input; no output-depth claim.
     #[cfg(feature = "intel")]
     pub(crate) intel_xr30: bool,
+    /// Discrete Arc display (`DG2` / `BMG`) admitting local VRAM scanout BOs.
+    #[cfg(feature = "intel")]
+    pub(crate) intel_vram_scanout: bool,
     #[cfg(feature = "intel")]
     intel_blob_pins: Vec<(u32, usize)>,
     /// A released master still owns hardware until serialized restoration.
@@ -1477,6 +1480,8 @@ impl Card {
             intel_tile4: false,
             #[cfg(feature = "intel")]
             intel_xr30: false,
+            #[cfg(feature = "intel")]
+            intel_vram_scanout: false,
             #[cfg(feature = "intel")]
             intel_display: false,
             #[cfg(feature = "intel")]
@@ -2826,9 +2831,9 @@ impl Card {
                 return Err(CardError::InvalidDimensions);
             }
         }
-        // VRAM pages have no CPU physical address for the scanout copy, and
-        // no display reads them here.
-        if object.is_vram() {
+        // On integrated GPUs VRAM pages have no display-DMA backing here;
+        // discrete Arc display (`intel_vram_scanout`) scans directly from VRAM.
+        if object.is_vram() && !self.intel_vram_scanout {
             return Err(CardError::InvalidDimensions);
         }
         if xe && !xr30 && !object.scanout() {

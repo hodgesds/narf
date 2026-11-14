@@ -300,20 +300,24 @@ impl ExecWire {
     /// Linux `parse_execbuf2_extensions`: when I915_EXEC_USE_EXTENSIONS is
     /// set, `cliprects_ptr` heads a chain of `i915_user_extension`
     /// structs; walk it and return the OA format selector of the
-    /// `drm_i915_gem_execbuffer_ext_perf` extension, if present. Any other
-    /// extension name is rejected (NARF defines no other execbuffer
-    /// extension), a second perf extension is rejected (Linux requires the
-    /// chain to hold each extension at most once), and a nonzero perf
-    /// `flags` word is rejected (MBZ). Without USE_EXTENSIONS the
-    /// cliprects fields are clip rects, not extensions, and no walk
-    /// happens. The caller applies the HOLD_PREEMPTION rule to the
-    /// returned selector; this function only parses and validates it.
+    /// `drm_i915_gem_execbuffer_ext_perf` extension, if present.
+    /// `EXECBUFFER_EXT_TIMELINE_FENCES` is skipped here and parsed by
+    /// `SyncRequest::read`; any other extension name is rejected, a second
+    /// perf extension is rejected (Linux requires the chain to hold each
+    /// extension at most once), and a nonzero perf `flags` word is
+    /// rejected (MBZ). Without USE_EXTENSIONS the cliprects fields are clip
+    /// rects, not extensions, and no walk happens. The caller applies the
+    /// HOLD_PREEMPTION rule to the returned selector; this function only
+    /// parses and validates it.
     pub(crate) fn perf_extension(&self, user: &dyn IoctlContext) -> Result<Option<u64>, FsError> {
         if self.flags() & abi::EXEC_USE_EXTENSIONS == 0 {
             return Ok(None);
         }
         let mut perf: Option<u64> = None;
         abi::user_extensions(user, self.cliprects_ptr(), |address, name| {
+            if name == abi::EXECBUFFER_EXT_TIMELINE_FENCES {
+                return Ok(());
+            }
             if name != abi::EXECBUFFER_EXT_PERF {
                 return Err(FsError::InvalidData);
             }
@@ -554,6 +558,15 @@ pub(crate) struct VmMapping {
 /// mappings is handled; a read-only mapping does not cover (the query
 /// writes the report).
 pub(crate) fn mappings_cover(mappings: &[VmMapping], address: u64, size: u64) -> bool {
+    mappings_cover_any(mappings, address, size, true)
+}
+
+pub(crate) fn mappings_cover_any(
+    mappings: &[VmMapping],
+    address: u64,
+    size: u64,
+    writable_only: bool,
+) -> bool {
     if size == 0 {
         return false;
     }
@@ -562,7 +575,7 @@ pub(crate) fn mappings_cover(mappings: &[VmMapping], address: u64, size: u64) ->
     };
     let mut spans: Vec<(u64, u64)> = Vec::new();
     for m in mappings {
-        if !m.writable {
+        if writable_only && !m.writable {
             continue;
         }
         let Some(m_end) = m.va.checked_add(m.length) else {

@@ -77,6 +77,18 @@ pub(crate) const fn display_pte_ip(
     }
 }
 
+/// [`display_pte_ip`] extended with discrete Arc display IPs (`DG2`, `Xe2_HPD`).
+pub(crate) const fn display_pte_for(
+    generation: Generation,
+    ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
+    discrete: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
+) -> Option<(PteFormat, u8)> {
+    match discrete {
+        Some(disc) => Some((disc.pte_format(), 0)),
+        None => display_pte_ip(generation, ip),
+    }
+}
+
 /// [`owned_status`] for an owner whose install proved its display IP:
 /// display 30.00 takes `gen8_de_pipe_fault_mask`'s display >= 20 set.
 pub(crate) const fn owned_status_ip(
@@ -88,6 +100,23 @@ pub(crate) const fn owned_status_ip(
             owned_status(Generation::LunarLake)
         }
         _ => owned_status(generation),
+    }
+}
+
+/// [`owned_status_ip`] extended with discrete Arc display IPs.
+pub(crate) const fn owned_status_for(
+    generation: Generation,
+    ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
+    discrete: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
+) -> u32 {
+    match discrete {
+        Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg2) => {
+            owned_status(Generation::AlderLake)
+        }
+        Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Xe2Hpd) => {
+            owned_status(Generation::MeteorLake)
+        }
+        None => owned_status_ip(generation, ip),
     }
 }
 
@@ -104,6 +133,20 @@ pub(crate) fn display_pat_programmed_ip(
             io.read32(0x480c) == 0x3c
         }
         _ => display_pat_programmed(io, generation),
+    }
+}
+
+/// [`display_pat_programmed_ip`] extended with discrete Arc display IPs.
+pub(crate) fn display_pat_programmed_for(
+    io: &(impl MmioWindow + ?Sized),
+    generation: Generation,
+    ip: Option<crate::intel_gpu_xe2lpd::DisplayIp>,
+    discrete: Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp>,
+) -> bool {
+    match discrete {
+        Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Dg2)
+        | Some(crate::intel_gpu_xe2lpd::DiscreteDisplayIp::Xe2Hpd) => true,
+        None => display_pat_programmed_ip(io, generation, ip),
     }
 }
 
@@ -146,6 +189,11 @@ pub(crate) unsafe trait DisplayAccess: MmioWindow {
     /// alone does not determine it (Panther Lake's display 30.00). `None`
     /// keeps every generation-level profile.
     fn display_ip(&self) -> Option<crate::intel_gpu_xe2lpd::DisplayIp> {
+        None
+    }
+    /// The discrete Arc display IP proved by [`DiscreteDisplayIp::identify`].
+    /// `None` keeps integrated generation-level profiles.
+    fn discrete_display(&self) -> Option<crate::intel_gpu_xe2lpd::DiscreteDisplayIp> {
         None
     }
 }
@@ -224,7 +272,9 @@ impl<M: DisplayAccess> PollIo<M> {
         // Lunar Lake is admitted only as display 20.00, which the KMS owner
         // verified (GMD_ID_DISPLAY) before installing; Panther Lake only as
         // the display 30.00 its install proved (`display_ip`).
-        let Some((format, _)) = display_pte_ip(generation, mmio.display_ip()) else {
+        let Some((format, _)) =
+            display_pte_for(generation, mmio.display_ip(), mmio.discrete_display())
+        else {
             return Err(IoError::Unsupported);
         };
         if pipe != Pipe::A {
@@ -248,7 +298,7 @@ impl<M: DisplayAccess> PollIo<M> {
             }
         }
 
-        let status = owned_status_ip(generation, mmio.display_ip());
+        let status = owned_status_for(generation, mmio.display_ip(), mmio.discrete_display());
         let mut owner = Self {
             mmio,
             bar_len,
@@ -384,7 +434,7 @@ impl<M: DisplayAccess> PollIo<M> {
         if ier == u32::MAX || !mmio.access_ok() {
             return Err(IoError::Unavailable);
         }
-        let status = owned_status_ip(generation, mmio.display_ip());
+        let status = owned_status_for(generation, mmio.display_ip(), mmio.discrete_display());
         Ok(SavedStatus {
             ier: ier & status,
             imr: imr & status,

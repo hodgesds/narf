@@ -1772,15 +1772,20 @@ impl<'a, M: MmioWindow + ?Sized> XeLpgModeset<'a, M> {
         };
         let base = Transcoder::A.base();
         let xe3 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe3Lpd;
-        if xe3 {
+        let xe2 = self.ip == crate::intel_gpu_xe2lpd::DisplayIp::Xe2Lpd;
+        if xe3 || xe2 {
             // intel_set_transcoder_timings, display >= 13: the set-context
-            // latency first — the VRR-TG value (1 while the TG runs on
-            // CRTC 1, 0 otherwise; wa_14015401596 floor), which the
-            // display-30 VRR guardband assumes.
-            self.mmio.write32(
-                crate::intel_gpu_xe3lpd::TRANS_SET_CONTEXT_LATENCY_A,
-                crate::intel_gpu_vrr::set_context_latency_for_crtc(1),
-            );
+            // latency first — on display 30 the VRR-TG value (1 while
+            // the TG runs on CRTC 1, 0 otherwise; wa_14015401596 floor);
+            // on display 20 at least 1 so SRD_STATUS updates properly
+            // when PSR1 runs (_intel_psr_min_set_context_latency).
+            let scl = if xe2 {
+                crate::intel_gpu_vrr::set_context_latency_for_crtc(1).max(1)
+            } else {
+                crate::intel_gpu_vrr::set_context_latency_for_crtc(1)
+            };
+            self.mmio
+                .write32(crate::intel_gpu_xe3lpd::TRANS_SET_CONTEXT_LATENCY_A, scl);
         }
         self.mmio.write32(base + TRANS_HTOTAL_OFFSET, prog.htotal);
         self.mmio.write32(base + TRANS_HBLANK_OFFSET, prog.hblank);

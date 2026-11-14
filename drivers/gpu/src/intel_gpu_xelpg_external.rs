@@ -149,7 +149,7 @@ use crate::intel_gpu_xelpg_hpd::{LiveMode, MtlHpdConfig, MtlHpdEvent, MtlHpdKind
 use crate::intel_gpu_xelpg_pipes::{ExternalPipe, PipeEnableError, Pipes};
 use crate::intel_gpu_xelpg_resources::ResourceError;
 use crate::intel_gpu_xelpg_tc::{
-    aux_power_disable, aux_power_enable, connect as tc_connect, connection_intact,
+    aux_power_disable, aux_power_enable, connect_for as tc_connect_for, connection_intact,
     disconnect as tc_disconnect, TcConnection, TcError, TcMode,
 };
 
@@ -661,9 +661,10 @@ fn probe_link<M: MmioWindow + ?Sized>(
     port: XeLpgPort,
     legacy_port: bool,
 ) -> Result<LinkProbe, ExternalError> {
-    if generation != Generation::MeteorLake {
+    if !crate::intel_gpu_xelpg_hpd::hpd_generation_supported(generation) {
         return Err(ExternalError::UnsupportedGeneration);
     }
+    let display20 = matches!(generation, Generation::LunarLake | Generation::PantherLake);
     if port == XeLpgPort::A {
         return Err(ExternalError::UnsupportedPort);
     }
@@ -672,7 +673,7 @@ fn probe_link<M: MmioWindow + ?Sized>(
         return Err(ExternalError::PortBusy);
     }
     let tc = match port.tc_index() {
-        Some(_) => Some(tc_connect(io, port, legacy_port, 1)?),
+        Some(_) => Some(tc_connect_for(io, port, legacy_port, 1, display20)?),
         None => None,
     };
     let rollback = |e: ExternalError| {
@@ -2159,6 +2160,8 @@ pub struct MtlExternalService {
     route: Option<MtlRoute>,
     /// The live mode the retained route was connected in (for `Redetect`).
     live: LiveMode,
+    /// Active display generation for `probe_link` / `probe_hdmi`.
+    generation: Generation,
     policy: MtlPortPolicy,
     /// What activations share the display with (panel, pipe-DMC sink).
     display: MtlDisplay,
@@ -2183,6 +2186,7 @@ impl MtlExternalService {
         Self {
             route: None,
             live: LiveMode::Native,
+            generation: Generation::MeteorLake,
             policy,
             display: MtlDisplay::NONE,
             presence: None,
@@ -2195,6 +2199,12 @@ impl MtlExternalService {
         let mut service = Self::new();
         service.presence = Some(presence);
         service
+    }
+
+    /// Set the display generation (`MeteorLake`, `LunarLake`, `PantherLake`)
+    /// used on subsequent connect passes.
+    pub fn set_generation(&mut self, generation: Generation) {
+        self.generation = generation;
     }
 
     /// What activations share the display with.
@@ -2212,6 +2222,11 @@ impl MtlExternalService {
     fn publish(&self) {
         if let Some(presence) = self.presence {
             presence.publish(self.route.as_ref());
+            let non_psr_pipes = match self.route.as_ref() {
+                Some(route) if route.live() => 1u8 << (route.pipe() as u8),
+                _ => 0,
+            };
+            crate::intel_gpu_psr::set_non_psr_pipes(non_psr_pipes);
         }
     }
 
@@ -2255,7 +2270,7 @@ impl MtlExternalService {
             },
             RoutePlan::Hdmi => self.connect_hdmi(io, port, legacy, alloc),
             RoutePlan::Dp | RoutePlan::DpThenHdmi => {
-                match probe_link(io, Generation::MeteorLake, port, legacy) {
+                match probe_link(io, self.generation, port, legacy) {
                     Ok(link) => self.connect_output(io, link, alloc),
                     Err(e) if plan == RoutePlan::DpThenHdmi && dpcd_absent(&e) => {
                         self.connect_hdmi(io, port, legacy, alloc)
@@ -2373,7 +2388,7 @@ impl MtlExternalService {
         alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
     ) -> ServiceOutcome {
         let ddc = self.policy.ddc_pin(port);
-        let mut probe = match probe_hdmi(io, Generation::MeteorLake, port, legacy, ddc) {
+        let mut probe = match probe_hdmi(io, self.generation, port, legacy, ddc) {
             Ok(probe) => probe,
             Err(e) => {
                 return ServiceOutcome::Refused {
@@ -2675,8 +2690,21 @@ pub fn handle_mtl_event<M: MmioWindow + ?Sized>(
     display: &MtlDisplay,
     alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
 ) -> Option<ServiceOutcome> {
+    handle_mtl_event_for(io, Generation::MeteorLake, event, display, alloc)
+}
+
+/// Act on one hotplug event for `generation` (`MeteorLake`, `LunarLake`,
+/// `PantherLake`) with the process-wide service.
+pub fn handle_mtl_event_for<M: MmioWindow + ?Sized>(
+    io: &M,
+    generation: Generation,
+    event: MtlHpdEvent,
+    display: &MtlDisplay,
+    alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
+) -> Option<ServiceOutcome> {
     let mut service = SERVICE.try_lock()?;
     service.set_display(*display);
+    service.set_generation(generation);
     let port = event.pin.port();
     // A refused DC exit is protocol-neutral; it is reported through the
     // DP route error that carries ExternalError::DisplayPower.
@@ -2690,13 +2718,13 @@ pub fn handle_mtl_event<M: MmioWindow + ?Sized>(
     )
 }
 
-/// Poll the process-wide MTL hotplug owner once (inside the DC-off
-/// bracket). Non-MTL generations return `None` before any access.
+/// Poll the process-wide MTL/LNL/PTL hotplug owner once (inside the DC-off
+/// bracket). Earlier generations return `None` before any access.
 pub fn poll_mtl_event<M: MmioWindow + ?Sized>(
     io: &M,
     generation: Generation,
 ) -> Option<MtlHpdEvent> {
-    if generation != Generation::MeteorLake {
+    if !crate::intel_gpu_xelpg_hpd::hpd_generation_supported(generation) {
         return None;
     }
     with_dc_off(|| crate::intel_gpu_xelpg_hpd::poll_hpd_event(io, generation))
@@ -2704,10 +2732,8 @@ pub fn poll_mtl_event<M: MmioWindow + ?Sized>(
         .flatten()
 }
 
-/// Process-wide entry for the display runtime: poll the MTL hotplug owner
-/// once and act on the event. Non-MTL generations return `None` before
-/// any register access; a concurrent service pass returns `None` rather
-/// than waiting.
+/// Process-wide entry for the display runtime: poll the PICA/XELPDP hotplug
+/// owner once and act on the event.
 pub fn service_mtl_external<M: MmioWindow + ?Sized>(
     io: &M,
     generation: Generation,
@@ -2715,7 +2741,7 @@ pub fn service_mtl_external<M: MmioWindow + ?Sized>(
     alloc: &mut dyn FnMut(&Mode) -> Option<Framebuffer>,
 ) -> Option<ServiceOutcome> {
     let event = poll_mtl_event(io, generation)?;
-    handle_mtl_event(io, event, display, alloc)
+    handle_mtl_event_for(io, generation, event, display, alloc)
 }
 
 /// Whether the process-wide MTL route is absent or locally stopped (its
@@ -2737,7 +2763,7 @@ pub fn route_live() -> bool {
 /// Process-wide reset/suspend teardown: stop/release the route, then
 /// withdraw the hotplug sources. `false` when anything stays retained.
 pub fn teardown_mtl_external<M: MmioWindow + ?Sized>(io: &M, generation: Generation) -> bool {
-    if generation != Generation::MeteorLake {
+    if !crate::intel_gpu_xelpg_hpd::hpd_generation_supported(generation) {
         return true;
     }
     let Some(mut service) = SERVICE.try_lock() else {

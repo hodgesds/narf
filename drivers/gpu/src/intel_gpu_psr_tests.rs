@@ -226,6 +226,8 @@ fn smoke_psr_qualify_follows_compute_config() -> TestResult {
             wm_level_disabled: true,
             tp1_wakeup_us: 2500,
             tp2_tp3_wakeup_us: 2500,
+            display20: false,
+            entry_setup_frames: 0,
         })
     );
     // idle = max(6, sync_latency + 1), at most 0xf.

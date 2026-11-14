@@ -257,11 +257,11 @@ pub(crate) fn ptl_profile(
     }
 }
 
-/// The display-preserving profile is D0-only: system suspend would lose the
-/// panel's GGTT surface and display-20 relight is not owned, so suspend is
-/// refused (the BMG small-BAR profile's precedent).
-pub(crate) fn system_suspend_admitted(smallbar: bool, lnl_display: bool) -> bool {
-    !smallbar && !lnl_display
+/// Small-BAR discrete profiles remain D0-only until aperture-free CPU/GTT
+/// eviction lands; Display 20 (Lunar Lake) and Display 30 (Panther Lake)
+/// own panel power-off/on and relight across S3.
+pub(crate) fn system_suspend_admitted(smallbar: bool, _lnl_display: bool) -> bool {
+    !smallbar
 }
 
 struct Owner {
@@ -3536,8 +3536,37 @@ impl narf_power::system_pm::AsyncSystemPm for Owner {
             } else {
                 None
             };
-            // S3 may lose both data and flat CCS. Until VRAM preservation or
-            // migration is owned, retained objects/CPU BAR mappings prevent it.
+            // Evict any idle VRAM allocations (including DG2 Flat-CCS metadata)
+            // to system memory before suspend powers down LMEM.
+            if self
+                .pending
+                .card
+                .intel_vram_used()
+                .is_some_and(|used| used != 0)
+            {
+                if let (Some(pool), Some(backend)) = (
+                    crate::drm_registry::DrmCard::intel_vram(&*self.pending.card),
+                    crate::drm_registry::DrmCard::intel_user_backend(&*self.pending.card),
+                ) {
+                    if let Some(status) = backend.status().filter(|s| s.epoch != 0) {
+                        if crate::intel_gpu_xe::evict_vram_for(
+                            backend.as_ref(),
+                            &pool,
+                            false,
+                            0,
+                            status.epoch,
+                            true,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Err(E::Busy);
+                        }
+                    }
+                }
+            }
+            // S3 may lose both data and flat CCS. If un-evictable objects remain,
+            // refuse suspend cleanly.
             if self
                 .pending
                 .card
@@ -3724,8 +3753,71 @@ pub async fn kernel_ppgtt_probe(
         .map_err(RuntimeError::Gt)
 }
 
-/// Arc cards bind to a GT-only device; no display or local-memory region is
-/// invented. BAR0 and authority remain with the per-function startup service.
+fn seed_discrete_display_card(
+    ip: crate::intel_gpu_xe2lpd::DiscreteDisplayIp,
+    console: Option<&crate::intel_gpu::ActiveScanout>,
+) -> crate::drm::card::Card {
+    use crate::drm::card::{
+        Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType, NativeOutput,
+    };
+    let mut kms = Card::new("intel-gpu", "NARF Intel Arc Display", (1, 0, 0));
+    kms.native_atomic = true;
+    kms.intel_display = true;
+    kms.intel_vram_scanout = true;
+    let (mode, status) = match console {
+        Some(c) => (
+            Some(crate::Mode {
+                width: c.width,
+                height: c.height,
+                refresh_hz: 60,
+                bpp: 32,
+            }),
+            ConnectorStatus::Connected,
+        ),
+        None => (None, ConnectorStatus::Disconnected),
+    };
+    kms.crtcs.push(Crtc {
+        id: 1,
+        mode,
+        enabled: console.is_some(),
+        primary_fb: None,
+        x: 0,
+        y: 0,
+    });
+    kms.vrr_enabled.push((1, false));
+    kms.encoders.push(Encoder {
+        id: 2,
+        encoder_type: EncoderType::Tmds,
+        possible_crtcs: 0x1,
+        possible_clones: 0,
+        crtc_id: console.is_some().then_some(1),
+    });
+    let modes = mode.into_iter().collect();
+    kms.connectors.push(Connector {
+        id: 3,
+        connector_type: ConnectorType::DisplayPort,
+        connector_type_id: 1,
+        status,
+        encoder_id: console.is_some().then_some(2),
+        modes,
+    });
+    kms.native.push(NativeOutput {
+        connector: 3,
+        edid: None,
+        timings: alloc::vec::Vec::new(),
+        color_format: None,
+        broadcast_rgb: Some(0),
+        vrr_capable: None,
+        colorspace: Some(0),
+        hdr_output_metadata: Some(0),
+        max_bpc: Some(8),
+    });
+    let _ = ip;
+    kms
+}
+
+/// Arc cards bind to a GT-only device or discrete display (`DG2` / `BMG`).
+/// BAR0 and authority remain with the per-function startup service.
 pub(crate) fn probe_discrete(
     device: BusDevice,
     cap: Cap<BusDeviceCap, Write>,
@@ -3774,8 +3866,21 @@ pub(crate) fn probe_discrete(
         // SAFETY: this card's own BAR2, owned exclusively by this probe.
         unsafe { card.install_lmem_bar(lmem) };
     }
-    let assigned = crate::drm_registry::register_drm_card(card.clone());
+    let display_window = crate::intel_gpu_gt_hw::AuthorizedWindow::new(bar, cap);
+    let discrete_display =
+        crate::intel_gpu_xe2lpd::DiscreteDisplayIp::identify(&display_window, platform).ok();
+    let discrete_console = discrete_display
+        .and_then(|_| crate::intel_gpu_xe2lpd::discrete_pipe_a_scanout(&display_window));
+    let assigned = if let Some(ip) = discrete_display {
+        let kms = seed_discrete_display_card(ip, discrete_console.as_ref());
+        crate::drm_registry::register_drm_card_with_state(card.clone(), kms)
+    } else {
+        crate::drm_registry::register_drm_card(card.clone())
+    };
     install(assigned, card, device, cap, bar, None);
+    if let (Some(ip), Some(console)) = (discrete_display, discrete_console) {
+        crate::intel_gpu_kms::install_discrete(assigned, ip, bar, device, cap, console);
+    }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("intel-gpu"),
         kind: narf_drivers::BoundKind::Graphics,

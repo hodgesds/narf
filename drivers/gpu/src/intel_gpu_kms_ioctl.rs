@@ -909,10 +909,10 @@ impl Plan {
                             || target.modifier == TILE4_MODIFIER && card.intel_tile4))
                     || target.offsets != [0, 0]
                     || target.chroma_pitch != 0
-                    || !object.object.is_wc()
                     || !object.object.scanout()
-                    || object.object.is_vram()
                     || object.object.is_userptr()
+                    || !((card.intel_vram_scanout && object.object.is_vram())
+                        || object.object.is_wc())
                 {
                     return Err(FsError::Unsupported);
                 }
@@ -1086,7 +1086,9 @@ impl Plan {
             }
             let extent = u64::from(target.pitch) * u64::from(geometry.height);
             let size = if let Some(intel) = &target.intel {
-                if intel.object.is_vram() || intel.object.is_userptr() {
+                if (intel.object.is_vram() && (!card.intel_vram_scanout || !intel.object.scanout()))
+                    || intel.object.is_userptr()
+                {
                     return Err(FsError::Unsupported);
                 }
                 intel.object.size()
@@ -1180,6 +1182,9 @@ trait Backend {
     fn valid(&self) -> Result<(), FsError> {
         Ok(())
     }
+    fn allows_vram_scanout(&self) -> bool {
+        false
+    }
     #[cfg(any(test, feature = "kernel-test"))]
     fn geometry(&self) -> Geometry;
     fn console_fb(&self) -> narf_graphics_driver::generic::GenericFb;
@@ -1254,6 +1259,9 @@ trait Backend {
 impl<M: crate::intel_gpu_kms::Platform> Backend for crate::intel_gpu_kms::Guard<'_, M> {
     fn valid(&self) -> Result<(), FsError> {
         self.ownership_valid()
+    }
+    fn allows_vram_scanout(&self) -> bool {
+        crate::intel_gpu_kms::Guard::allows_vram_scanout(self)
     }
     #[cfg(any(test, feature = "kernel-test"))]
     fn geometry(&self) -> Geometry {
@@ -1621,10 +1629,9 @@ async fn execute_plan<B: Backend>(
             let fb = plan.framebuffer.as_ref().ok_or(FsError::InvalidData)?;
             let direct = fb.intel.as_ref().filter(|i| {
                 fb.format == PixelFormat::Xrgb8888
-                    && i.object.is_wc()
-                    && i.object.scanout()
-                    && !i.object.is_vram()
                     && !i.object.is_userptr()
+                    && i.object.scanout()
+                    && ((backend.allows_vram_scanout() && i.object.is_vram()) || i.object.is_wc())
             });
             let direct = if direct.is_some() {
                 match backend.check(plan.geometry) {
