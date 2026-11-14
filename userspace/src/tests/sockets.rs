@@ -1004,42 +1004,185 @@ fn smoke_socket_inet6_udp_loopback_round_trip() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_inet6_udp_loopback_round_trip);
 
-fn smoke_socket_inet6_udp_preserves_scope_id() -> TestResult {
-    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
-    let mut body = alloc::vec::Vec::new();
-    body.extend_from_slice(&9000u16.to_be_bytes());
+fn make_sockaddr_in6(ip: [u8; 16], port: u16, scope_id: u32) -> crate::socket::SockAddr {
+    let mut body = alloc::vec::Vec::with_capacity(26);
+    body.extend_from_slice(&port.to_be_bytes());
     body.extend_from_slice(&0u32.to_be_bytes());
-    body.extend_from_slice(&[0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-    body.extend_from_slice(&7u32.to_ne_bytes());
-    let addr = crate::socket::SockAddr {
+    body.extend_from_slice(&ip);
+    body.extend_from_slice(&scope_id.to_ne_bytes());
+    crate::socket::SockAddr {
         family: crate::socket::AF_INET6,
         body,
-    };
-    if !matches!(
-        sock.dispatch_op(crate::socket::SocketOp::Connect { addr }),
-        crate::socket::SocketOpResult::Ok(0)
-    ) {
-        sock.unregister();
-        return TestResult::Fail("scoped UDP6 connect failed");
     }
-    let peer = sock.peer_addr();
-    sock.unregister();
-    match peer {
-        Some(peer)
-            if peer.body.len() == 26
-                && u32::from_ne_bytes([
-                    peer.body[22],
-                    peer.body[23],
-                    peer.body[24],
-                    peer.body[25],
-                ]) == 7 =>
-        {
-            TestResult::Pass
+}
+
+fn smoke_socket_inet6_udp_preserves_scope_id() -> TestResult {
+    const IFACE: &str = "v6-udp-scope";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x71];
+    const PEER: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+
+    narf_net::iface::register(IFACE, MAC, |_, _| Ok(()));
+    let ifindex = match narf_net::iface::ifindex_of(IFACE) {
+        Some(idx) => idx,
+        None => {
+            narf_net::iface::unregister(IFACE);
+            return TestResult::Fail("registered test iface has no ifindex");
         }
-        _ => TestResult::Fail("UDP6 getpeername lost sin6_scope_id"),
+    };
+    let ll = narf_net::ipv6::slaac::link_local(IFACE, MAC, 0);
+    narf_net::ipv6::slaac::dad_passed(IFACE, &ll.addr);
+
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let result = (|| -> Result<(), &'static str> {
+        let addr = make_sockaddr_in6(PEER, 9000, ifindex);
+        if !matches!(
+            sock.dispatch_op(crate::socket::SocketOp::Connect { addr }),
+            crate::socket::SocketOpResult::Ok(0)
+        ) {
+            return Err("scoped UDP6 connect failed");
+        }
+        let peer = sock.peer_addr().ok_or("UDP6 getpeername returned None")?;
+        if peer.body.len() != 26
+            || u32::from_ne_bytes([peer.body[22], peer.body[23], peer.body[24], peer.body[25]])
+                != ifindex
+        {
+            return Err("UDP6 getpeername lost sin6_scope_id");
+        }
+        let local = sock.local_addr().ok_or("UDP6 getsockname returned None")?;
+        if local.body.len() < 22 || local.body[6..22] != ll.addr {
+            return Err("UDP6 getsockname did not select interface link-local address");
+        }
+        Ok(())
+    })();
+
+    sock.unregister();
+    narf_net::ipv6::addrs::remove(IFACE, &ll.addr);
+    narf_net::iface::unregister(IFACE);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(error) => TestResult::Fail(error),
     }
 }
 kernel_test_in!("userspace", smoke_socket_inet6_udp_preserves_scope_id);
+
+fn smoke_socket_inet6_udp_connect_source_selection() -> TestResult {
+    const IFACE: &str = "v6-udp-srcsel";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x72];
+    const GLOBAL_DST: [u8; 16] = [
+        0x26, 0x00, 0x48, 0x0e, 0x30, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 2,
+    ];
+    const GATEWAY_LL: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const GLOBAL_SRC: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x42,
+    ];
+
+    narf_net::ipv6::route::__reset_for_test();
+    narf_net::ipv6::addrs::__reset_for_test();
+    narf_net::iface::register(IFACE, MAC, |_, _| Ok(()));
+    let ll = narf_net::ipv6::slaac::link_local(IFACE, MAC, 0);
+    narf_net::ipv6::slaac::dad_passed(IFACE, &ll.addr);
+
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);
+    let result = (|| -> Result<(), &'static str> {
+        // Without a route to GLOBAL_DST, UDP connect(port=0) fails with ENETUNREACH.
+        if !matches!(
+            sock.dispatch_op(crate::socket::SocketOp::Connect {
+                addr: make_sockaddr_in6(GLOBAL_DST, 0, 0),
+            }),
+            crate::socket::SocketOpResult::Err(crate::socket::SockError::NetUnreach)
+        ) {
+            return Err("UDP6 connect without route did not return ENETUNREACH");
+        }
+
+        // With a default route and only a link-local address, connect(port=0)
+        // succeeds and populates the link-local source for glibc RFC 6724.
+        narf_net::ipv6::route::add(narf_net::ipv6::route::Route {
+            prefix: [0u8; 16],
+            prefix_len: 0,
+            gateway: Some(GATEWAY_LL),
+            iface: alloc::string::String::from(IFACE),
+            metric: 100,
+            valid_deadline_ns: 0,
+        });
+        if !matches!(
+            sock.dispatch_op(crate::socket::SocketOp::Connect {
+                addr: make_sockaddr_in6(GLOBAL_DST, 0, 0),
+            }),
+            crate::socket::SocketOpResult::Ok(0)
+        ) {
+            return Err("UDP6 connect(port=0) with default route failed");
+        }
+        let local_ll = sock
+            .local_addr()
+            .ok_or("getsockname failed after port=0 connect")?;
+        if local_ll.body.len() < 22 || local_ll.body[6..22] != ll.addr {
+            return Err("getsockname did not populate link-local source after port=0 connect");
+        }
+
+        // AF_UNSPEC disconnect clears peer and resets unbound local_addr to ::.
+        if !matches!(
+            sock.dispatch_op(crate::socket::SocketOp::Connect {
+                addr: crate::socket::SockAddr {
+                    family: crate::socket::AF_UNSPEC,
+                    body: alloc::vec::Vec::new(),
+                },
+            }),
+            crate::socket::SocketOpResult::Ok(0)
+        ) {
+            return Err("UDP6 AF_UNSPEC disconnect failed");
+        }
+        if sock.peer_addr().is_some() {
+            return Err("UDP6 peer_addr remained set after AF_UNSPEC disconnect");
+        }
+        let local_unspec = sock
+            .local_addr()
+            .ok_or("getsockname failed after disconnect")?;
+        if local_unspec.body.len() < 22 || local_unspec.body[6..22] != [0u8; 16] {
+            return Err("getsockname did not reset to :: after AF_UNSPEC disconnect");
+        }
+
+        // Adding a preferred global address updates source selection for connect(8080).
+        narf_net::ipv6::addrs::add_in(
+            0,
+            narf_net::ipv6::addrs::Ipv6IfAddr {
+                iface: alloc::string::String::from(IFACE),
+                addr: GLOBAL_SRC,
+                prefix_len: 64,
+                state: narf_net::ipv6::addrs::AddrState::Preferred,
+                scope: narf_net::ipv6::addrs::AddrScope::Global,
+                preferred_deadline_ns: u64::MAX,
+                valid_deadline_ns: u64::MAX,
+                temporary: false,
+            },
+        );
+        if !matches!(
+            sock.dispatch_op(crate::socket::SocketOp::Connect {
+                addr: make_sockaddr_in6(GLOBAL_DST, 8080, 0),
+            }),
+            crate::socket::SocketOpResult::Ok(0)
+        ) {
+            return Err("UDP6 connect with global address failed");
+        }
+        let local_global = sock
+            .local_addr()
+            .ok_or("getsockname failed after global connect")?;
+        if local_global.body.len() < 22 || local_global.body[6..22] != GLOBAL_SRC {
+            return Err("getsockname did not pick preferred global source");
+        }
+        Ok(())
+    })();
+
+    sock.unregister();
+    narf_net::ipv6::route::remove(&[0u8; 16], 0, IFACE);
+    narf_net::ipv6::addrs::remove(IFACE, &GLOBAL_SRC);
+    narf_net::ipv6::addrs::remove(IFACE, &ll.addr);
+    narf_net::iface::unregister(IFACE);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(error) => TestResult::Fail(error),
+    }
+}
+kernel_test_in!("userspace", smoke_socket_inet6_udp_connect_source_selection);
 
 fn smoke_socket_inet6_v6only_rejects_change_after_bind() -> TestResult {
     let sock = crate::socket::SocketFile::new(crate::socket::AF_INET6, crate::socket::SOCK_DGRAM);

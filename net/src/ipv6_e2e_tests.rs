@@ -2801,3 +2801,89 @@ kernel_test_in!(
     "net/ipv6_e2e",
     smoke_v6_dispatch_l3_multicast_ns_reaches_stack
 );
+
+fn smoke_v6_icmp6_dest_unreach_aborts_syn_sent() -> TestResult {
+    const IFACE: &str = "v6e2e-icmp6-err";
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x55];
+    const GW_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0xaa];
+    const LOCAL_IP: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x55,
+    ];
+    const GW_IP: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const REMOTE_IP: [u8; 16] = [
+        0x26, 0x00, 0x48, 0x0e, 0x30, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 2,
+    ];
+
+    reset_v6(IFACE, MAC);
+    let ll = addrs::link_local_from_mac(MAC);
+    slaac::link_local(IFACE, MAC, 0);
+    slaac::dad_passed(IFACE, &ll);
+    addrs::add_in(
+        0,
+        addrs::Ipv6IfAddr {
+            iface: alloc::string::String::from(IFACE),
+            addr: LOCAL_IP,
+            prefix_len: 64,
+            state: addrs::AddrState::Preferred,
+            scope: addrs::AddrScope::Global,
+            preferred_deadline_ns: u64::MAX,
+            valid_deadline_ns: u64::MAX,
+            temporary: false,
+        },
+    );
+    crate::ipv6::route::add(crate::ipv6::route::Route {
+        prefix: [0u8; 16],
+        prefix_len: 0,
+        gateway: Some(GW_IP),
+        iface: alloc::string::String::from(IFACE),
+        metric: 100,
+        valid_deadline_ns: 0,
+    });
+    ndp::neigh_upsert(ndp::Neigh {
+        iface: alloc::string::String::from(IFACE),
+        ip: GW_IP,
+        mac: Some(GW_MAC),
+        state: ndp::NeighState::Reachable,
+        is_router: true,
+        deadline_ns: u64::MAX,
+    });
+
+    let cases = [
+        (0u8, narf_lib::errno::ENETUNREACH as i32),
+        (3u8, narf_lib::errno::EHOSTUNREACH as i32),
+        (4u8, narf_lib::errno::ECONNREFUSED as i32),
+    ];
+
+    for (i, &(code, want_errno)) in cases.iter().enumerate() {
+        drain_v6();
+        let id = match crate::tcp::core::connect6_start_in(
+            0,
+            REMOTE_IP,
+            8080 + i as u16,
+            crate::tcp::core::ConnectOptions::default(),
+        ) {
+            Ok(id) => id,
+            Err(_) => return TestResult::Fail("connect6_start_in failed before ICMPv6 error"),
+        };
+        let frames = drain_v6();
+        let syn_frame = match frames.first() {
+            Some(f) if f.len() > ETH_HDR_LEN + IPV6_HDR_LEN => f,
+            _ => return TestResult::Fail("connect6_start_in did not emit TCPv6 SYN"),
+        };
+        let icmp_body = crate::pkt_ipv6::destination_unreachable(code, &syn_frame[ETH_HDR_LEN..]);
+        let mut frame = build_icmpv6_frame(GW_MAC, MAC, GW_IP, LOCAL_IP, &icmp_body);
+        crate::tcp_stack::rx_handler(IFACE, &mut frame);
+
+        match crate::tcp::core::connect_status(id) {
+            crate::tcp::core::ConnectStatus::Failed(err) if err == want_errno => {}
+            _ => {
+                return TestResult::Fail(
+                    "ICMPv6 DestUnreach did not abort SYN_SENT with expected errno",
+                )
+            }
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("net/ipv6_e2e", smoke_v6_icmp6_dest_unreach_aborts_syn_sent);

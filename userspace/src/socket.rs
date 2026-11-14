@@ -1607,6 +1607,9 @@ enum SocketState {
         local_scope_id: u32,
         inbox: VecDeque<DgramPacket6>,
         peer: Option<([u8; 16], u16, u32)>,
+        /// `SOCK_BINDADDR_LOCK`: bind() named a specific address, so a
+        /// disconnect keeps it.
+        addr_locked: bool,
         port_locked: bool,
         rmem: usize,
     },

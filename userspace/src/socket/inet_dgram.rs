@@ -429,7 +429,7 @@ fn lookup(
 /// the owning interface address — 127.0.0.1 for the whole loopback /8
 /// (`ip_route_output_key_hash_rcu`, `net/ipv4/route.c:2768`). Anything else
 /// takes its egress interface's address; no interface at all is ENETUNREACH.
-fn select_source(ns: u64, daddr: u32, dev: u32) -> Result<u32, SockError> {
+pub(super) fn select_source(ns: u64, daddr: u32, dev: u32) -> Result<u32, SockError> {
     let d = daddr.to_be_bytes();
     if d[0] == 127 {
         return Ok(INADDR_LOOPBACK);
