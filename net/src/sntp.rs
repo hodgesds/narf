@@ -52,8 +52,9 @@
 //! a silent policy choice, and the wrong one on a private network. Callers
 //! that want a name resolved can use [`resolve_server`] (the UDP-only DNS
 //! stub, needs configured nameservers); the name itself is the caller's
-//! choice. DHCP option-42 parsing and a periodic poll daemon are follow-ups
-//! (see the #1764 PR body for the issue numbers).
+//! choice. DHCP option-42 parsing is a follow-up (#1955 bullet 2); the
+//! periodic poll daemon is [`poll_daemon`] / [`start_poll_daemon`]
+//! (issue #1956).
 //!
 //! ## What this does not do
 //!
@@ -62,10 +63,11 @@
 //!   check is the replay defence §8 prescribes. A spoofed reply can still
 //!   move the clock by up to the panic threshold — the same exposure every
 //!   unauthenticated SNTP client has; NTS is follow-up work.
-//! - No multi-server selection, clock filter, or poll-interval adaptation
-//!   (RFC 5905 §10/§11/§13): one server, one exchange, one sample. The
-//!   discipline loop slews the phase and learns the frequency from
-//!   successive samples; the caller decides when to re-poll.
+//! - No multi-server selection or clock filter (RFC 5905 §10/§11):
+//!   one server, one association, one sample per round. The poll
+//!   daemon adapts that association's interval (§13) and honours
+//!   kiss-o'-death (§7.4); selection across servers waits on a
+//!   second source existing.
 //! - No IPv6: the in-tree UDP socket API is IPv4 (`UdpSocket` /
 //!   `SocketAddrV4`); an IPv6 client waits on a v6 socket surface.
 
@@ -364,6 +366,284 @@ pub fn sync_once(cfg: &SntpConfig) -> Result<(SntpSample, DisciplineOutcome), Sn
     Ok((sample, outcome))
 }
 
+// ── Periodic poll daemon (RFC 5905 §13/§14, §7.4; issue #1956) ────────
+//
+// `sync_once` is one exchange. A working desktop needs a loop that
+// re-polls on a schedule and keeps the discipline loop fed, adapting
+// the poll interval to the sync quality the way §13 prescribes and
+// honouring kiss-o'-death packets the way §7.4 prescribes. That loop
+// is here: [`PollState`] is the pure, unit-testable state machine,
+// [`poll_round`] is one exchange plus its state transition, and
+// [`poll_daemon`] / [`start_poll_daemon`] run it forever (or until
+// the server demobilises the association).
+//
+// Single server only, by design: RFC 5905 §14 says an SNTP client has
+// a single server, and §9/§10 clock selection only matters once more
+// than one source exists. When a second source arrives (e.g. the
+// DHCP-advertised server from #1955 bullet 2), the selection logic
+// goes here — one `PollState` per server, best-stratum/lowest-dispersion
+// wins — not in the callers.
+
+/// Default minimum poll exponent (RFC 5905 §13 SNTP default minpoll 6:
+/// 2^6 = 64 s between polls).
+pub const DEFAULT_MIN_POLL: u8 = 6;
+/// Default maximum poll exponent (RFC 5905 §13 SNTP default maxpoll 10:
+/// 2^10 = 1024 s between polls).
+pub const DEFAULT_MAX_POLL: u8 = 10;
+/// Kiss code: the server asks the client to reduce its polling rate
+/// (RFC 5905 §7.4).
+pub const KISS_RATE: [u8; 4] = *b"RATE";
+/// Kiss code: the server refuses service; demobilise (RFC 5905 §7.4).
+pub const KISS_DENY: [u8; 4] = *b"DENY";
+/// Kiss code: access restricted; demobilise (RFC 5905 §7.4).
+pub const KISS_RSTR: [u8; 4] = *b"RSTR";
+
+/// How many consecutive successful rounds make the clock "stable"
+/// enough to step the poll interval up one exponent (RFC 5905 §13:
+/// the interval grows while the clock stays synchronised). Two is
+/// the smallest count that distinguishes a fluke from stability
+/// without waiting minutes at minpoll.
+const STABLE_ROUNDS_TO_STEP_UP: u32 = 2;
+
+/// Poll-interval bounds for one association, as exponents: the
+/// interval is 2^`poll` seconds (RFC 5905 §13). Exponents are
+/// clamped to 0..=15 so the interval always fits in a `u64` of
+/// milliseconds and never exceeds ~9 h.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PollConfig {
+    /// Minimum poll exponent (SNTP default 6).
+    pub min_poll: u8,
+    /// Maximum poll exponent (SNTP default 10).
+    pub max_poll: u8,
+    /// Poll exponent the first round uses.
+    pub initial_poll: u8,
+}
+
+impl PollConfig {
+    /// The SNTP defaults: minpoll 6, maxpoll 10, start at minpoll.
+    pub fn new() -> Self {
+        Self {
+            min_poll: DEFAULT_MIN_POLL,
+            max_poll: DEFAULT_MAX_POLL,
+            initial_poll: DEFAULT_MIN_POLL,
+        }
+    }
+
+    /// Normalise: clamp every exponent to 0..=15, order min ≤ max,
+    /// clamp the initial exponent into [min, max].
+    fn normalised(self) -> Self {
+        let min_poll = self.min_poll.min(15);
+        let max_poll = self.max_poll.min(15);
+        let (min_poll, max_poll) = if min_poll <= max_poll {
+            (min_poll, max_poll)
+        } else {
+            (max_poll, min_poll)
+        };
+        Self {
+            min_poll,
+            max_poll,
+            initial_poll: self.initial_poll.clamp(min_poll, max_poll),
+        }
+    }
+}
+
+impl Default for PollConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What a kiss-o'-death packet tells the poll loop to do (RFC 5905 §7.4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KodAction {
+    /// RATE: back the poll interval off (one exponent, up to maxpoll).
+    BackOff,
+    /// DENY/RSTR: demobilise the association — stop polling this server.
+    Demobilise,
+    /// Any other code: not a §7.4 policy code, treat as a plain failure.
+    Failure,
+}
+
+/// The poll loop's per-association state: the current poll exponent
+/// plus the streaks that drive §13 adaptation. Pure data + pure
+/// transitions, so the adaptation is unit-testable without a network.
+#[derive(Copy, Clone, Debug)]
+pub struct PollState {
+    /// Bounds for this association.
+    pub config: PollConfig,
+    /// Current poll exponent; the interval is 2^`poll` seconds.
+    pub poll: u8,
+    /// Consecutive successful rounds since the last failure.
+    pub consecutive_successes: u32,
+    /// Consecutive failed rounds since the last success.
+    pub consecutive_failures: u32,
+    /// True once a DENY/RSTR kiss demobilised the association; the
+    /// daemon stops polling when this is set.
+    pub demobilised: bool,
+}
+
+impl PollState {
+    /// Fresh state at the configured initial poll exponent.
+    pub fn new(config: PollConfig) -> Self {
+        let config = config.normalised();
+        Self {
+            config,
+            poll: config.initial_poll,
+            consecutive_successes: 0,
+            consecutive_failures: 0,
+            demobilised: false,
+        }
+    }
+
+    /// Current poll interval, seconds (2^`poll`).
+    pub fn poll_interval_secs(&self) -> u64 {
+        1u64 << self.poll
+    }
+
+    /// Current poll interval, milliseconds (for the sleep between rounds).
+    pub fn poll_interval_ms(&self) -> u64 {
+        self.poll_interval_secs() * 1_000
+    }
+
+    /// A round succeeded (§13): the failure streak resets, and once
+    /// the clock has held for [`STABLE_ROUNDS_TO_STEP_UP`] rounds the
+    /// interval steps up one exponent, capped at maxpoll.
+    pub fn on_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+        if self.consecutive_successes >= STABLE_ROUNDS_TO_STEP_UP
+            && self.poll < self.config.max_poll
+        {
+            self.poll += 1;
+            self.consecutive_successes = 0;
+        }
+    }
+
+    /// A round failed (§13): the success streak resets and the
+    /// interval steps down one exponent, floored at minpoll, so a
+    /// flapping server is re-polled sooner rather than later.
+    pub fn on_failure(&mut self) {
+        self.consecutive_successes = 0;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.poll > self.config.min_poll {
+            self.poll -= 1;
+        }
+    }
+
+    /// A kiss-o'-death packet arrived (§7.4). The detection itself is
+    /// [`validate_reply`]'s job — this only applies the policy:
+    /// RATE backs the interval off one exponent (up to maxpoll) and
+    /// resets the success streak; DENY/RSTR demobilise the
+    /// association; any other code is a plain failure.
+    pub fn on_kiss_of_death(&mut self, code: [u8; 4]) -> KodAction {
+        match code {
+            KISS_RATE => {
+                self.consecutive_successes = 0;
+                if self.poll < self.config.max_poll {
+                    self.poll += 1;
+                }
+                KodAction::BackOff
+            }
+            KISS_DENY | KISS_RSTR => {
+                self.demobilised = true;
+                KodAction::Demobilise
+            }
+            _ => {
+                self.on_failure();
+                KodAction::Failure
+            }
+        }
+    }
+}
+
+/// What one poll round did.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PollRoundOutcome {
+    /// The exchange succeeded and the sample was disciplined.
+    Synced {
+        /// The validated sample from this round.
+        sample: SntpSample,
+        /// What the discipline loop did with it.
+        outcome: DisciplineOutcome,
+    },
+    /// The exchange failed for a non-KoD reason; the interval was
+    /// stepped down (see [`PollState::on_failure`]).
+    Failed {
+        /// The exchange error.
+        error: SntpError,
+    },
+    /// The server sent a RATE kiss: the interval was backed off.
+    BackedOff {
+        /// The kiss code (`b"RATE"`).
+        code: [u8; 4],
+    },
+    /// The server sent DENY/RSTR: the association is demobilised and
+    /// the daemon stops polling this server.
+    Demobilised {
+        /// The kiss code (`b"DENY"` or `b"RSTR"`).
+        code: [u8; 4],
+    },
+}
+
+/// One poll round: a [`sync_once`] exchange plus the state transition
+/// its outcome prescribes. The daemon calls this; tests drive it
+/// directly against the fixture server, so the transitions are
+/// exercised end-to-end without waiting out a real poll interval.
+pub fn poll_round(cfg: &SntpConfig, state: &mut PollState) -> PollRoundOutcome {
+    match sync_once(cfg) {
+        Ok((sample, outcome)) => {
+            state.on_success();
+            PollRoundOutcome::Synced { sample, outcome }
+        }
+        Err(SntpError::KissOfDeath(code)) => match state.on_kiss_of_death(code) {
+            KodAction::BackOff => PollRoundOutcome::BackedOff { code },
+            KodAction::Demobilise => PollRoundOutcome::Demobilised { code },
+            KodAction::Failure => PollRoundOutcome::Failed {
+                error: SntpError::KissOfDeath(code),
+            },
+        },
+        Err(error) => {
+            state.on_failure();
+            PollRoundOutcome::Failed { error }
+        }
+    }
+}
+
+/// The periodic poll daemon: exchange first (an association polls
+/// immediately on mobilisation, §13), then sleep for the current
+/// poll interval and repeat, until a DENY/RSTR kiss demobilises the
+/// association.
+///
+/// The round itself is synchronous — `exchange` spins with
+/// `drain_pump` for at most `timeout_ms` (default 3 s) — so the
+/// executor task is blocked for that long per round; the interval
+/// between rounds is ≥ 64 s at minpoll, which dwarfs it, and the
+/// spin keeps NIC RX flowing. There is no stop handle yet: the
+/// daemon runs until demobilised. A future multi-server daemon can
+/// add epoch-based stop (the hwmon monitor's pattern) when a second
+/// source exists.
+pub async fn poll_daemon(cfg: SntpConfig, poll_cfg: PollConfig) {
+    let mut state = PollState::new(poll_cfg);
+    loop {
+        if matches!(
+            poll_round(&cfg, &mut state),
+            PollRoundOutcome::Demobilised { .. }
+        ) {
+            return;
+        }
+        narf_time::sleep_ms(state.poll_interval_ms()).await;
+    }
+}
+
+/// Start the periodic poll daemon for one explicit server. Returns
+/// the spawned task id. Single server only — see the module docs on
+/// multi-server selection and the #1955 bullet-2 follow-up (a
+/// DHCP-advertised server as the source when no explicit server is
+/// configured).
+pub fn start_poll_daemon(cfg: SntpConfig, poll_cfg: PollConfig) -> narf_scheduler::TaskId {
+    narf_scheduler::spawn(poll_daemon(cfg, poll_cfg))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "kernel-test"))]
@@ -514,6 +794,131 @@ mod tests {
     }
     kernel_test_in!("net/sntp", smoke_sntp_short_format_conversions);
 
+    // ── Poll daemon: pure state machine (RFC 5905 §13/§14, §7.4) ───────
+
+    fn smoke_sntp_poll_state_adapts_up_and_down() -> TestResult {
+        // SNTP defaults: start at minpoll 6 → 64 s.
+        let mut st = PollState::new(PollConfig::new());
+        if st.poll != 6 || st.poll_interval_secs() != 64 || st.poll_interval_ms() != 64_000 {
+            return TestResult::Fail("a fresh poll state should start at minpoll 6 (64 s)");
+        }
+        // One success is not stable yet: the interval stays.
+        st.on_success();
+        if st.poll != 6 {
+            return TestResult::Fail("one success should not step the poll interval up");
+        }
+        // A second consecutive success is stable: step up to 7 (128 s).
+        st.on_success();
+        if st.poll != 7 || st.poll_interval_secs() != 128 {
+            return TestResult::Fail("two stable successes should step poll 6 -> 7 (128 s)");
+        }
+        // A failure steps back down to minpoll.
+        st.on_failure();
+        if st.poll != 6 {
+            return TestResult::Fail("a failure should step poll 7 -> 6");
+        }
+        // Failures never go below minpoll.
+        st.on_failure();
+        if st.poll != 6 {
+            return TestResult::Fail("failures should never step below minpoll");
+        }
+        // Successes cap at maxpoll 10 (1024 s).
+        let mut st = PollState::new(PollConfig {
+            initial_poll: 10,
+            ..PollConfig::new()
+        });
+        st.on_success();
+        st.on_success();
+        if st.poll != 10 || st.poll_interval_secs() != 1024 {
+            return TestResult::Fail("successes should never step above maxpoll 10 (1024 s)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/sntp", smoke_sntp_poll_state_adapts_up_and_down);
+
+    fn smoke_sntp_poll_kod_transitions() -> TestResult {
+        // RATE backs the interval off one exponent, no demobilisation.
+        let mut st = PollState::new(PollConfig::new());
+        if st.on_kiss_of_death(KISS_RATE) != KodAction::BackOff {
+            return TestResult::Fail("a RATE kiss should be BackOff");
+        }
+        if st.poll != 7 || st.demobilised {
+            return TestResult::Fail("RATE should step poll 6 -> 7 without demobilising");
+        }
+        // RATE at maxpoll stays at maxpoll.
+        let mut st = PollState::new(PollConfig {
+            initial_poll: 10,
+            ..PollConfig::new()
+        });
+        if st.on_kiss_of_death(KISS_RATE) != KodAction::BackOff {
+            return TestResult::Fail("a RATE kiss at maxpoll should still be BackOff");
+        }
+        if st.poll != 10 || st.demobilised {
+            return TestResult::Fail("RATE at maxpoll should stay at 10 without demobilising");
+        }
+        // DENY demobilises.
+        let mut st = PollState::new(PollConfig::new());
+        if st.on_kiss_of_death(KISS_DENY) != KodAction::Demobilise {
+            return TestResult::Fail("a DENY kiss should be Demobilise");
+        }
+        if !st.demobilised {
+            return TestResult::Fail("DENY should demobilise the association");
+        }
+        // RSTR demobilises too.
+        let mut st = PollState::new(PollConfig::new());
+        if st.on_kiss_of_death(KISS_RSTR) != KodAction::Demobilise || !st.demobilised {
+            return TestResult::Fail("an RSTR kiss should demobilise the association");
+        }
+        // An unknown kiss code is a plain failure: interval steps
+        // down, no demobilisation.
+        let mut st = PollState::new(PollConfig {
+            initial_poll: 8,
+            ..PollConfig::new()
+        });
+        if st.on_kiss_of_death(*b"INIT") != KodAction::Failure {
+            return TestResult::Fail("an unknown kiss code should be a plain failure");
+        }
+        if st.demobilised || st.poll != 7 {
+            return TestResult::Fail("an unknown kiss should step poll down, not demobilise");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/sntp", smoke_sntp_poll_kod_transitions);
+
+    fn smoke_sntp_poll_config_normalises() -> TestResult {
+        // Inverted bounds swap; the initial exponent clamps into range.
+        let cfg = PollConfig {
+            min_poll: 10,
+            max_poll: 6,
+            initial_poll: 9,
+        }
+        .normalised();
+        if cfg.min_poll != 6 || cfg.max_poll != 10 || cfg.initial_poll != 9 {
+            return TestResult::Fail("inverted poll bounds should swap, initial should clamp in");
+        }
+        // An initial exponent below min clamps up to min.
+        let cfg = PollConfig {
+            initial_poll: 2,
+            ..PollConfig::new()
+        }
+        .normalised();
+        if cfg.initial_poll != 6 {
+            return TestResult::Fail("an initial poll below min should clamp up to minpoll");
+        }
+        // Exponents above 15 clamp to 15 (the interval must stay a u64).
+        let cfg = PollConfig {
+            min_poll: 20,
+            max_poll: 30,
+            initial_poll: 25,
+        }
+        .normalised();
+        if cfg.min_poll != 15 || cfg.max_poll != 15 || cfg.initial_poll != 15 {
+            return TestResult::Fail("poll exponents above 15 should clamp to 15");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/sntp", smoke_sntp_poll_config_normalises);
+
     // ── End-to-end fixture ──────────────────────────────────────────
     //
     // A synthetic NIC captures the client's request frame; the capture
@@ -540,6 +945,9 @@ mod tests {
     static FAKE_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
     /// Whether the fixture server answers at all (timeout test clears it).
     static FAKE_ANSWER: IrqSafeSpinLock<bool> = IrqSafeSpinLock::new(true);
+    /// Kiss code the fixture server answers with, if any: stratum 0 +
+    /// this code instead of a time reply (KoD poll-round tests set it).
+    static FAKE_KOD: IrqSafeSpinLock<Option<[u8; 4]>> = IrqSafeSpinLock::new(None);
 
     const E2E_IFACE: &str = "sntp-e2e";
     const E2E_LOCAL: [u8; 4] = [10, 0, 9, 1];
@@ -568,7 +976,7 @@ mod tests {
             (FAKE_OFFSET_NS.load(Ordering::Relaxed) as i128 * (1i128 << 32) / 1_000_000_000) as u64;
         let t2 = req.transmit_timestamp.wrapping_add(off_units);
         let t3 = t2.wrapping_add((1u64 << 32) / 1_000); // +1 ms server processing
-        let reply = NtpHeader {
+        let mut reply = NtpHeader {
             leap_indicator: 0,
             version: NTP_VERSION_4,
             mode: MODE_SERVER,
@@ -583,6 +991,12 @@ mod tests {
             receive_timestamp: t2,
             transmit_timestamp: t3,
         };
+        // A configured kiss code replaces the time reply with a
+        // stratum-0 KoD packet carrying that code (§7.4).
+        if let Some(code) = *FAKE_KOD.lock() {
+            reply.stratum = STRATUM_UNSPECIFIED;
+            reply.reference_id = code;
+        }
         let payload = reply.encode();
         // UDP datagram (header + payload) for the deliver path.
         let udp_len = (UDP_HDR_LEN + payload.len()) as u16;
@@ -605,6 +1019,7 @@ mod tests {
         FAKE_TX.lock().clear();
         FAKE_OFFSET_NS.store(offset_ns, Ordering::Relaxed);
         *FAKE_ANSWER.lock() = answer;
+        *FAKE_KOD.lock() = None;
         narf_time::ntp::__test_reset();
         narf_time::wall::__test_reset();
 
@@ -621,6 +1036,12 @@ mod tests {
     fn e2e_teardown() {
         narf_time::ntp::__test_reset();
         narf_time::wall::__test_reset();
+    }
+
+    /// Make the fixture server answer the next exchanges with a
+    /// kiss-o'-death packet carrying `code` (call after `e2e_setup`).
+    fn e2e_set_kod(code: [u8; 4]) {
+        *FAKE_KOD.lock() = Some(code);
     }
 
     fn smoke_sntp_exchange_slew_end_to_end() -> TestResult {
@@ -721,4 +1142,145 @@ mod tests {
         }
     }
     kernel_test_in!("net/sntp", smoke_sntp_exchange_times_out_without_reply);
+
+    // ── Poll rounds end-to-end (fixture server + real exchange) ──────
+
+    fn smoke_sntp_poll_round_syncs_and_adapts_end_to_end() -> TestResult {
+        // Two good rounds against the fixture server: the first syncs
+        // at minpoll, the second is stable enough to step poll up.
+        e2e_setup(50_000_000, true);
+        let cfg = SntpConfig::new(E2E_SERVER);
+        let mut st = PollState::new(PollConfig::new());
+        match poll_round(&cfg, &mut st) {
+            PollRoundOutcome::Synced { sample, outcome } => {
+                if !(50_000_000..=51_000_000).contains(&sample.offset_ns) {
+                    e2e_teardown();
+                    return TestResult::Fail("first poll round should read ~+50 ms");
+                }
+                if !matches!(outcome, DisciplineOutcome::Slewed(_)) {
+                    e2e_teardown();
+                    return TestResult::Fail("a 50 ms round should slew, not step");
+                }
+            }
+            _ => {
+                e2e_teardown();
+                return TestResult::Fail("first poll round against the fixture server failed");
+            }
+        }
+        if st.poll != 6 {
+            e2e_teardown();
+            return TestResult::Fail("one good round should stay at minpoll 6");
+        }
+        match poll_round(&cfg, &mut st) {
+            PollRoundOutcome::Synced { .. } => {}
+            _ => {
+                e2e_teardown();
+                return TestResult::Fail("second poll round against the fixture server failed");
+            }
+        }
+        e2e_teardown();
+        if st.poll != 7 {
+            return TestResult::Fail("two stable rounds should step poll 6 -> 7");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/sntp",
+        smoke_sntp_poll_round_syncs_and_adapts_end_to_end
+    );
+
+    fn smoke_sntp_poll_round_kod_rate_backs_off_end_to_end() -> TestResult {
+        // The fixture server answers RATE: the round reports BackedOff
+        // and the interval steps up, without demobilising.
+        e2e_setup(50_000_000, true);
+        e2e_set_kod(KISS_RATE);
+        let cfg = SntpConfig::new(E2E_SERVER);
+        let mut st = PollState::new(PollConfig::new());
+        match poll_round(&cfg, &mut st) {
+            PollRoundOutcome::BackedOff { code } => {
+                if code != KISS_RATE {
+                    e2e_teardown();
+                    return TestResult::Fail("a RATE round should report the RATE code");
+                }
+            }
+            _ => {
+                e2e_teardown();
+                return TestResult::Fail("a RATE reply should back off, not sync or fail");
+            }
+        }
+        e2e_teardown();
+        if st.poll != 7 || st.demobilised {
+            return TestResult::Fail("RATE should step poll 6 -> 7 without demobilising");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/sntp",
+        smoke_sntp_poll_round_kod_rate_backs_off_end_to_end
+    );
+
+    fn smoke_sntp_poll_round_kod_deny_demobilises_end_to_end() -> TestResult {
+        // The fixture server answers DENY: the round reports
+        // Demobilised and the association is demobilised.
+        e2e_setup(50_000_000, true);
+        e2e_set_kod(KISS_DENY);
+        let cfg = SntpConfig::new(E2E_SERVER);
+        let mut st = PollState::new(PollConfig::new());
+        match poll_round(&cfg, &mut st) {
+            PollRoundOutcome::Demobilised { code } => {
+                if code != KISS_DENY {
+                    e2e_teardown();
+                    return TestResult::Fail("a DENY round should report the DENY code");
+                }
+            }
+            _ => {
+                e2e_teardown();
+                return TestResult::Fail("a DENY reply should demobilise, not sync or fail");
+            }
+        }
+        e2e_teardown();
+        if !st.demobilised {
+            return TestResult::Fail("DENY should demobilise the association");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/sntp",
+        smoke_sntp_poll_round_kod_deny_demobilises_end_to_end
+    );
+
+    fn smoke_sntp_poll_round_timeout_steps_down_end_to_end() -> TestResult {
+        // The server stays silent: the round reports Failed(Timeout)
+        // and the interval steps down, floored at minpoll.
+        e2e_setup(50_000_000, false);
+        let cfg = SntpConfig {
+            timeout_ms: 100,
+            ..SntpConfig::new(E2E_SERVER)
+        };
+        let mut st = PollState::new(PollConfig {
+            initial_poll: 8,
+            ..PollConfig::new()
+        });
+        match poll_round(&cfg, &mut st) {
+            PollRoundOutcome::Failed { error } => {
+                if error != SntpError::Timeout {
+                    e2e_teardown();
+                    return TestResult::Fail("a silent server should fail the round with Timeout");
+                }
+            }
+            _ => {
+                e2e_teardown();
+                return TestResult::Fail("a silent server should fail the round, not sync");
+            }
+        }
+        e2e_teardown();
+        if st.poll != 7 {
+            return TestResult::Fail("a failed round should step poll 8 -> 7");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "net/sntp",
+        smoke_sntp_poll_round_timeout_steps_down_end_to_end
+    );
 }

@@ -1818,8 +1818,16 @@ multicast layers a kernel network stack also needs.
   check, KoD), `compute_offset_delay`, `resolve_server` (DNS A
   lookup, caller-chosen name), `discipline_sample` /
   `sync_once` (feed the sample to `narf_time::ntp::apply_sample`).
-  Out of scope: discovery (DHCP option 42 unparsed), authentication
-  (no MAC/Autokey/NTS), multi-server selection, poll daemon, IPv6.
+  Surfaced (poll daemon, issue #1956): `PollConfig` (SNTP defaults
+  minpoll 6 / maxpoll 10, §13), `PollState` (pure §13 adaptation:
+  step up after two stable rounds, step down on failure; §7.4 KoD
+  policy — RATE backs off one exponent, DENY/RSTR demobilise),
+  `poll_round` (one `sync_once` + transition, fixture-tested
+  end-to-end), `poll_daemon` / `start_poll_daemon` (exchange first,
+  then sleep 2^poll seconds between rounds; stops on demobilise).
+  Out of scope: discovery (DHCP option 42 unparsed — #1955 bullet 2),
+  authentication (no MAC/Autokey/NTS), multi-server selection
+  (§9/§10, waits on a second source existing), IPv6.
 
 ### WebSocket (`ws`)
 - **RFC 6455** — The WebSocket Protocol (I. Fette & A. Melnikov,
