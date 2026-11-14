@@ -214,6 +214,9 @@ impl<P: Port> station::Engine for Packet<P> {
     fn long_calibration(&mut self) -> Result<Option<i32>, Error> {
         Packet::long_calibration(self)
     }
+    fn check_bt(&mut self) -> Result<(), Error> {
+        Packet::check_bt(self)
+    }
     fn interrupt(&self) -> Option<Arc<irq::Signal>> {
         Packet::interrupt(self)
     }

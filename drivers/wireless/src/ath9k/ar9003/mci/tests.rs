@@ -9,6 +9,7 @@
 use super::super::btcoex;
 use super::*;
 use alloc::{collections::BTreeMap, vec, vec::Vec};
+use narf_io::alloc_coherent_masked;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// Register-map mock with an op log and W1C MCI interrupt registers.
@@ -1552,6 +1553,85 @@ fn mci_bt_profile_flush() -> TestResult {
     TestResult::Pass
 }
 
+fn mci_sync_gpm_ring() -> TestResult {
+    // A real 512-byte coherent DMA buffer (schedule table + GPM ring),
+    // filled with the reserved pattern as the owner does at probe.
+    let mut dma = match alloc_coherent_masked(
+        MCI_DMA_BUF_BYTES,
+        narf_lib::id::DomainId::DRIVER_0,
+        u64::from(u32::MAX),
+    ) {
+        Ok(dma) => dma,
+        Err(_) => return TestResult::Fail("MCI DMA allocation failed in the fixture"),
+    };
+    {
+        let bytes = dma.as_mut_slice();
+        bytes.fill(MCI_GPM_RSVD_PATTERN);
+        // Slot 0: coex-agent version query; slot 1: BT calibration request.
+        bytes[MCI_GPM_DMA_OFFSET + MCI_GPM_COEX_B_GPM_TYPE] = GpmSubtype::CoexAgent as u8;
+        bytes[MCI_GPM_DMA_OFFSET + MCI_GPM_COEX_B_GPM_OPCODE] = GpmCoexOpcode::VersionQuery as u8;
+        bytes[MCI_GPM_DMA_OFFSET + 16 + MCI_GPM_COEX_B_GPM_TYPE] = GpmSubtype::BtCalReq as u8;
+        bytes[MCI_GPM_DMA_OFFSET + 16 + MCI_GPM_COEX_B_GPM_OPCODE] = 0;
+    }
+    // The engine as `setup` leaves it: ring filled, ready, 2G, awake.
+    let (mut io, mut btcoex) = live();
+    btcoex.mci.gpm_buf.fill(MCI_GPM_RSVD_PATTERN);
+    io.regs.insert(AR_MCI_GPM_1, 2 << AR_MCI_GPM_WRITE_PTR_S);
+    sync_gpm_ring(&mut io, &dma, &mut btcoex.mci);
+    // Both pending slots copied in.
+    if btcoex.mci.gpm_buf[MCI_GPM_COEX_B_GPM_TYPE] != GpmSubtype::CoexAgent as u8
+        || btcoex.mci.gpm_buf[MCI_GPM_COEX_B_GPM_OPCODE] != GpmCoexOpcode::VersionQuery as u8
+        || btcoex.mci.gpm_buf[16 + MCI_GPM_COEX_B_GPM_TYPE] != GpmSubtype::BtCalReq as u8
+    {
+        return TestResult::Fail("sync did not copy the pending DMA slots in");
+    }
+    // The walk consumes slot 0 (recycled) and advances past it; BT
+    // posts a different GPM into DMA slot 1 meanwhile.
+    recycle_gpm(&mut btcoex.mci, 0);
+    btcoex.mci.gpm_idx = 1;
+    {
+        let bytes = dma.as_mut_slice();
+        bytes[MCI_GPM_DMA_OFFSET + 16 + MCI_GPM_COEX_B_GPM_TYPE] = GpmSubtype::CoexAgent as u8;
+        bytes[MCI_GPM_DMA_OFFSET + 16 + MCI_GPM_COEX_B_GPM_OPCODE] =
+            GpmCoexOpcode::VersionResponse as u8;
+    }
+    sync_gpm_ring(&mut io, &dma, &mut btcoex.mci);
+    // The stale DMA slot 0 was cleared, so it cannot be re-processed;
+    // the CPU copy stays recycled.
+    if dma.as_slice()[MCI_GPM_DMA_OFFSET + MCI_GPM_COEX_B_GPM_TYPE] != MCI_GPM_RSVD_PATTERN
+        || btcoex.mci.gpm_buf[MCI_GPM_COEX_B_GPM_TYPE] != MCI_GPM_RSVD_PATTERN
+    {
+        return TestResult::Fail("sync did not clear the consumed DMA slot");
+    }
+    // The pending slot 1 keeps its unconsumed content: the DMA
+    // overwrite is not copied over it, and the DMA slot is not cleared.
+    if btcoex.mci.gpm_buf[16 + MCI_GPM_COEX_B_GPM_TYPE] != GpmSubtype::BtCalReq as u8
+        || dma.as_slice()[MCI_GPM_DMA_OFFSET + 16 + MCI_GPM_COEX_B_GPM_TYPE]
+            != GpmSubtype::CoexAgent as u8
+    {
+        return TestResult::Fail("sync clobbered or cleared a pending slot");
+    }
+    // A `check_gpm_offset` walk from slot 0 does not resurrect the
+    // consumed slot 0.
+    btcoex.mci.gpm_idx = 0;
+    sync_gpm_ring(&mut io, &dma, &mut btcoex.mci);
+    if btcoex.mci.gpm_buf[MCI_GPM_COEX_B_GPM_TYPE] != MCI_GPM_RSVD_PATTERN {
+        return TestResult::Fail("sync re-copied a consumed GPM after the index reset");
+    }
+    // A bogus write pointer syncs nothing.
+    {
+        let bytes = dma.as_mut_slice();
+        bytes[MCI_GPM_DMA_OFFSET + MCI_GPM_COEX_B_GPM_TYPE] = GpmSubtype::CoexAgent as u8;
+    }
+    io.regs
+        .insert(AR_MCI_GPM_1, 0xffff << AR_MCI_GPM_WRITE_PTR_S);
+    sync_gpm_ring(&mut io, &dma, &mut btcoex.mci);
+    if btcoex.mci.gpm_buf[MCI_GPM_COEX_B_GPM_TYPE] != MCI_GPM_RSVD_PATTERN {
+        return TestResult::Fail("sync copied from the DMA ring on a bogus write pointer");
+    }
+    TestResult::Pass
+}
+
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_message_exchange);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_send_gating);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_gpio_observation);
@@ -1571,4 +1651,5 @@ kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_list);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_scheme);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_status);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_bt_profile_flush);
+kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_sync_gpm_ring);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", mci_header_values);

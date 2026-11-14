@@ -131,6 +131,24 @@ fn mcu_dma_production_tx_descriptor_completion_and_wrap() -> TestResult {
         Ok(rig) => rig,
         Err(_) => return TestResult::Fail("transport DMA model allocation failed"),
     };
+    // All device-visible addresses, including MCU command and RX payloads,
+    // must fit the chip's Linux 32-bit DMA contract in Identity mode too.
+    let storage = hw.owner.storage.as_ref().unwrap();
+    for ring in [&storage.wm, &storage.fwdl, &storage.data]
+        .into_iter()
+        .chain(storage.rx.iter())
+    {
+        for buffer in core::iter::once(&ring.descriptors).chain(ring.buffers.iter()) {
+            if buffer
+                .dma_addr()
+                .raw()
+                .checked_add(buffer.len() as u64 - 1)
+                .is_none_or(|end| end > u64::from(u32::MAX))
+            {
+                return TestResult::Fail("MT7921/MT7922 DMA exceeds the 32-bit device mask");
+            }
+        }
+    }
     for turn in 0..DEPTH + 2 {
         let slot = turn % DEPTH;
         let next = (slot + 1) % DEPTH;

@@ -475,11 +475,12 @@ pub(super) fn power_on(io: &mut impl RegisterIo, wa: u32) -> Result<(), BringUpE
     set_reset(io, wa, false)
 }
 
-/// `hw.c::ath9k_hw_set_power_awake` for an AR9300 (no MCI): `AR_WA`, a
+/// `hw.c::ath9k_hw_set_power_awake` for an AR9300: `AR_WA`, a
 /// power-on reset only when the RTC reports SHUTDOWN (the AR9003 path does
 /// not reprogram the PLL here), force wake, the `POWER_UP_TIME / 50` poll and
 /// `AR_STA_ID1_PWR_SAV` clear. (The MCI power-awake LNA workaround is
-/// `mci::set_power_awake`.)
+/// `mci::set_power_awake`, which the owner runs right after this when MCI
+/// is live.)
 pub(super) fn set_power_awake(io: &mut impl RegisterIo, wa: u32) -> Result<(), BringUpError> {
     wa_write(io, wa);
     let status = io.read32(AR_RTC_STATUS);

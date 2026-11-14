@@ -249,6 +249,67 @@ fn mc_source_v6(ns: u64, ifindex: u32) -> [u8; 16] {
         .map_or(UNSPEC, |a| a.addr)
 }
 
+fn v4_mapped(v4: u32) -> [u8; 16] {
+    let b = v4.to_be_bytes();
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, b[0], b[1], b[2], b[3],
+    ]
+}
+
+fn select_source_v6(
+    ns: u64,
+    dst: [u8; 16],
+    scope_id: u32,
+    bound_dev: u32,
+) -> Result<([u8; 16], u32), SockError> {
+    let effective_scope = if scope_id != 0 { scope_id } else { bound_dev };
+    let link_local =
+        narf_net::ipv6::addrs::scope_of(&dst) == narf_net::ipv6::addrs::AddrScope::LinkLocal;
+    if link_local && effective_scope == 0 {
+        return Err(SockError::InvalidArg);
+    }
+    if dst == LOOPBACK || narf_net::ipv6::addrs::is_local_in(ns, &dst) {
+        return Ok((dst, if link_local { effective_scope } else { 0 }));
+    }
+    let scope_iface = if effective_scope != 0 {
+        Some(super::sockopt::ifindex_name(ns, effective_scope).ok_or(SockError::NetUnreach)?)
+    } else {
+        None
+    };
+    let iface = if link_local || super::sockopt::is_multicast_v6(&dst) {
+        match scope_iface {
+            Some(i) => i,
+            None => match narf_net::ipv6::route::lookup_in(ns, &dst, None) {
+                narf_net::ipv6::route::NextHop::Direct(i)
+                | narf_net::ipv6::route::NextHop::Gateway { iface: i, .. } => i,
+                narf_net::ipv6::route::NextHop::Unreachable => return Err(SockError::NetUnreach),
+            },
+        }
+    } else {
+        match narf_net::ipv6::route::lookup_in(ns, &dst, scope_iface.as_deref()) {
+            narf_net::ipv6::route::NextHop::Direct(i)
+            | narf_net::ipv6::route::NextHop::Gateway { iface: i, .. } => {
+                if let Some(ref pinned) = scope_iface {
+                    if &i != pinned {
+                        return Err(SockError::NetUnreach);
+                    }
+                }
+                i
+            }
+            narf_net::ipv6::route::NextHop::Unreachable => return Err(SockError::NetUnreach),
+        }
+    };
+    let src =
+        narf_net::ipv6::addrs::pick_source_in(ns, &iface, &dst).ok_or(SockError::NetUnreach)?;
+    let src_scope =
+        if narf_net::ipv6::addrs::scope_of(&src) == narf_net::ipv6::addrs::AddrScope::LinkLocal {
+            narf_net::iface::ifindex_of(&iface).unwrap_or(0)
+        } else {
+            0
+        };
+    Ok((src, src_scope))
+}
+
 impl SocketFile {
     pub(super) fn dispatch_inet6_dgram(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
@@ -275,6 +336,7 @@ impl SocketFile {
             local_scope_id: scope_id,
             inbox: VecDeque::new(),
             peer: old_peer,
+            addr_locked: addr != UNSPEC,
             port_locked,
             rmem: 0,
         };
@@ -389,14 +451,53 @@ impl SocketFile {
             self.inet6_dgram_disconnect();
             return SocketOpResult::Ok(0);
         }
-        let peer = match inet6_sockaddr_scoped(addr) {
-            Ok((_, 0, _)) => return SocketOpResult::Err(SockError::InvalidArg),
+        let mut peer = match inet6_sockaddr_scoped(addr) {
             Ok(v) => v,
             Err(e) => return SocketOpResult::Err(e),
         };
-        if mapped_v4(&peer.0).is_some() && self.options.lock().ipv6_v6only {
+        if peer.0 == UNSPEC {
+            let current_v4_mapped = match &*self.state.lock() {
+                SocketState::Inet6Dgram { local_addr, .. } => mapped_v4(local_addr).is_some(),
+                _ => false,
+            };
+            peer.0 = if current_v4_mapped {
+                v4_mapped(u32::from_be_bytes([127, 0, 0, 1]))
+            } else {
+                LOOPBACK
+            };
+        }
+        let (v6only, bound_dev) = {
+            let options = self.options.lock();
+            (options.ipv6_v6only, options.bindtodevice_index)
+        };
+        if mapped_v4(&peer.0).is_some() && v6only {
             return SocketOpResult::Err(SockError::NetUnreach);
         }
+        let ns = self.net_ns_id();
+        let (src_addr, src_scope, new_bound_dev) = if let Some(v4) = mapped_v4(&peer.0) {
+            let src_v4 = match inet_dgram::select_source(ns, u32::from_be_bytes(v4), bound_dev) {
+                Ok(s) => s,
+                Err(e) => return SocketOpResult::Err(e),
+            };
+            (v4_mapped(src_v4), 0, None)
+        } else {
+            let needs_scope = narf_net::ipv6::addrs::scope_of(&peer.0)
+                == narf_net::ipv6::addrs::AddrScope::LinkLocal
+                || super::sockopt::is_multicast_v6(&peer.0);
+            let new_dev = if needs_scope && peer.2 != 0 {
+                if bound_dev != 0 && bound_dev != peer.2 {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                Some(peer.2)
+            } else {
+                None
+            };
+            let (s, s_scope) = match select_source_v6(ns, peer.0, peer.2, bound_dev) {
+                Ok(v) => v,
+                Err(e) => return SocketOpResult::Err(e),
+            };
+            (s, s_scope, new_dev)
+        };
         {
             let mut guard = INET6_DGRAM_BOUND.lock();
             let map = guard.get_or_insert_with(BTreeMap::new);
@@ -404,7 +505,20 @@ impl SocketFile {
                 return SocketOpResult::Err(e);
             }
         }
-        if let SocketState::Inet6Dgram { peer: slot, .. } = &mut *self.state.lock() {
+        if let Some(dev) = new_bound_dev {
+            self.options.lock().bindtodevice_index = dev;
+        }
+        if let SocketState::Inet6Dgram {
+            local_addr,
+            local_scope_id,
+            peer: slot,
+            ..
+        } = &mut *self.state.lock()
+        {
+            if *local_addr == UNSPEC {
+                *local_addr = src_addr;
+                *local_scope_id = src_scope;
+            }
             *slot = Some(peer);
         }
         // `__ip6_datagram_connect` hands a v4-mapped peer to
@@ -428,16 +542,19 @@ impl SocketFile {
                 local_port,
                 local_scope_id,
                 peer,
+                addr_locked,
                 port_locked,
                 ..
             } = &mut *state
             {
                 *peer = None;
+                if !*addr_locked {
+                    *local_addr = UNSPEC;
+                    *local_scope_id = 0;
+                }
                 if !*port_locked && *local_port != 0 {
                     let port = *local_port;
-                    *local_addr = UNSPEC;
                     *local_port = 0;
-                    *local_scope_id = 0;
                     Some(port)
                 } else {
                     None
@@ -500,6 +617,7 @@ impl SocketFile {
                 Err(e) => return SocketOpResult::Err(e),
             },
             None => match connected {
+                Some((_, 0, _)) => return SocketOpResult::Err(SockError::InvalidArg),
                 Some(p) => p,
                 None => return SocketOpResult::Err(SockError::DestAddrReq),
             },

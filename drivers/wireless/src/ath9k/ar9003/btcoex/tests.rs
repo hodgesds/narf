@@ -2,8 +2,19 @@
 
 use super::super::mci::Mci;
 use super::*;
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// A 512-byte coherent DMA buffer (schedule table + GPM ring) for the
+/// `MciLink` gate, or `None` when the fixture cannot allocate one.
+fn mci_dma() -> Option<narf_io::DmaBuffer> {
+    narf_io::alloc_coherent_masked(
+        super::super::mci::MCI_DMA_BUF_BYTES,
+        narf_lib::id::DomainId::DRIVER_0,
+        u64::from(u32::MAX),
+    )
+    .ok()
+}
 
 /// Minimal register-map mock for the weight-register writes.
 struct BtcoexFixture {
@@ -609,6 +620,46 @@ fn btcoex_enable_disable_dispatcher() -> TestResult {
     }
     TestResult::Pass
 }
+fn btcoex_mci_link_gate() -> TestResult {
+    // MCI scheme + DMA ring: live (the engine has addresses to program).
+    let mut btcoex = Btcoex::new(Chip::Ar9462);
+    init_scheme(&mut btcoex, true, HW_CAP_MCI);
+    init_mci(&mut btcoex);
+    let Some(dma) = mci_dma() else {
+        return TestResult::Fail("MCI DMA allocation failed in the fixture");
+    };
+    let link = MciLink {
+        btcoex,
+        dma: Some(Arc::new(dma)),
+    };
+    if !link.mci_enabled() {
+        return TestResult::Fail("MCI scheme + DMA did not gate live");
+    }
+    // MCI scheme but no DMA ring: not live (setup never ran; address 0
+    // must never be programmed).
+    let mut btcoex = Btcoex::new(Chip::Ar9462);
+    init_scheme(&mut btcoex, true, HW_CAP_MCI);
+    init_mci(&mut btcoex);
+    let link = MciLink { btcoex, dma: None };
+    if link.mci_enabled() {
+        return TestResult::Fail("MCI scheme without DMA gated live");
+    }
+    // 3WIRE scheme with a DMA ring: not live (the engine is not MCI).
+    let mut btcoex = Btcoex::new(Chip::Ar9300);
+    init_scheme(&mut btcoex, true, 0);
+    init_mci(&mut btcoex);
+    let Some(dma) = mci_dma() else {
+        return TestResult::Fail("MCI DMA allocation failed in the fixture");
+    };
+    let link = MciLink {
+        btcoex,
+        dma: Some(Arc::new(dma)),
+    };
+    if link.mci_enabled() {
+        return TestResult::Fail("3WIRE scheme with DMA gated live");
+    }
+    TestResult::Pass
+}
 
 kernel_test_in!("drivers/wireless/ath9k/ar9003", btcoex_init_scheme);
 kernel_test_in!("drivers/wireless/ath9k/ar9003", btcoex_init_mci);
@@ -621,3 +672,4 @@ kernel_test_in!(
     "drivers/wireless/ath9k/ar9003",
     btcoex_enable_disable_dispatcher
 );
+kernel_test_in!("drivers/wireless/ath9k/ar9003", btcoex_mci_link_gate);

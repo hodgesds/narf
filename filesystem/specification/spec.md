@@ -438,6 +438,13 @@ pub trait DirOps {
         uid: u32,
         gid: u32,
     ) -> FsFuture<'_, Arc<dyn FileOps>>;
+    fn create_socket_with_attrs(
+        &self,
+        name: &str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'_, Arc<dyn FileOps>>;
 }
 pub struct ReadOptions { pub nonblocking: bool } // Default: false
 pub trait FileOps {
@@ -563,6 +570,12 @@ pub fn unmap_mapping_range(file: &dyn FileOps, new_len: u64) -> Result<(), FsErr
 mode as one create operation when the backend supports it. The default adapts
 legacy backends by creating first and applying both metadata updates; tmpfs /
 `MemFs` initialises the inode and its quota charge atomically before insertion.
+
+`DirOps::create_socket_with_attrs` carries the resolved filesystem owner and
+mode for a pathname Unix socket. `MemFs` / tmpfs initialise both ownership and
+the inode quota charge before publishing the node; overlayfs forwards all
+attributes to its upper directory. The default adapts legacy socket creators
+by applying ownership to the returned inode and propagating metadata errors.
 
 `FileOps::read_with_options` receives a `ReadOptions { nonblocking }` snapshot
 for one invocation. The default delegates to `read`, preserving ordinary files.

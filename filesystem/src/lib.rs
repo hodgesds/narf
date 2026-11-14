@@ -2720,6 +2720,24 @@ pub trait DirOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
+    /// Create a pathname socket with its creator's filesystem identity.
+    /// Legacy backends apply ownership after creation; backends with native
+    /// support must initialise ownership and its quota charge before publishing
+    /// the directory entry. Forwarding directories preserve all attributes.
+    fn create_socket_with_attrs<'a>(
+        &'a self,
+        name: &'a str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let file = self.create_socket(name, perms).await?;
+            file.set_owners(uid, gid).await?;
+            Ok(file)
+        })
+    }
+
     /// Create a device node named `name` of the given file type (char or
     /// block) with the Linux `dev_t` `rdev` (`(major << 8) | minor` in the
     /// common small-number encoding). Default: unsupported. devfs overrides it

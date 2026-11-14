@@ -95,15 +95,11 @@ impl Ring {
         }
         let mut buffers = Vec::with_capacity(DEPTH);
         for _ in 0..DEPTH {
-            // Behind a per-domain IOMMU every mapping honours the function's
-            // streaming mask, `dma_set_mask(&pdev->dev, DMA_BIT_MASK(32))`
-            // (mt7921/pci.c:mt7921_pci_probe). Identity keeps the 36-bit
-            // descriptor address reach for non-data rings.
-            let mask = if base == TX_DATA || dma.iommu_domain().is_some() {
-                u64::from(u32::MAX)
-            } else {
-                (1u64 << 36) - 1
-            };
+            // MT7921/MT7922 use DMA_BIT_MASK(32) in Linux mt7921_pci_probe.
+            // The generic mt76 descriptor's high-address field does not
+            // establish a wider device mask. Apply the same ceiling to
+            // physical addresses in Identity mode and to IOMMU IOVAs.
+            let mask = u64::from(u32::MAX);
             let buffer =
                 narf_io::alloc_coherent_for(dma, MAX_FRAME, narf_lib::id::DomainId::DRIVER_0, mask)
                     .map_err(|_| Error::Allocation)?;
@@ -111,7 +107,7 @@ impl Ring {
                 .dma_addr()
                 .raw()
                 .checked_add((MAX_FRAME - 1) as u64)
-                .is_none_or(|end| end >= 1 << 36)
+                .is_none_or(|end| end > mask)
             {
                 return Err(Error::DmaAddress);
             }
@@ -798,6 +794,61 @@ impl Hardware {
     fn update(&self, addr: u32, clear: u32, set: u32) -> Result<(), Error> {
         self.write(addr, (self.read(addr)? & !clear) | set)
     }
+    /// Snapshot only a terminal boot timeout. Never reads payloads or
+    /// changes device/ring ownership, and never runs in the polling loop.
+    #[cold]
+    #[inline(never)]
+    fn boot_timeout(&self, seq: u8, queued_events: usize) {
+        use core::fmt::Write;
+        let own = self.read(0x18060010);
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: boot timeout seq={seq} queued_events={queued_events} own={own:x?}"
+        );
+        // Only HIF ownership is safe to inspect while firmware owns the
+        // device. Each subsequent read also invokes current PCI authority.
+        if !matches!(own, Ok(value) if value & 1 == 0) {
+            return;
+        }
+        let _ = writeln!(
+            narf_console::Writer,
+            "mt76: boot timeout pci={:x?} dma={:x?} irq={:x?} fw={:x?}",
+            self.command(0, 0),
+            self.read(GLOBAL),
+            self.read(MT_WFDMA0_HOST_INT_STA),
+            self.read(0x7c0600f0),
+        );
+        let Some(storage) = &self.owner.storage else {
+            return;
+        };
+        for (name, ring, rx) in [
+            ("wm", &storage.wm, false),
+            ("fwdl", &storage.fwdl, false),
+            ("rx-pre", &storage.rx[0], true),
+            ("rx-post", &storage.rx[1], true),
+            ("rx-data", &storage.rx[2], true),
+        ] {
+            let slot = if rx || ring.pending {
+                ring.index
+            } else {
+                (ring.index + DEPTH - 1) % DEPTH
+            };
+            dma_barrier();
+            let _ = writeln!(
+                narf_console::Writer,
+                "mt76: boot ring {name} base={:#x} desc={:#x} cidx={:x?} didx={:x?} index={} pending={} slot={slot} ctrl={:#010x} buffer={:#x}",
+                ring.base,
+                ring.descriptors.dma_addr().raw(),
+                self.read(ring.base + 8),
+                self.read(ring.base + 12),
+                ring.index,
+                ring.pending,
+                ring.word(slot, 1),
+                ring.buffers[slot].dma_addr().raw(),
+            );
+        }
+    }
+
     fn program(&self, ring: &Ring, rx: bool) -> Result<(), Error> {
         self.write(ring.base, ring.descriptors.dma_addr().raw() as u32)?;
         self.write(ring.base + 4, DEPTH as u32)?;
@@ -1725,9 +1776,27 @@ impl Transport {
         })
         .map_err(|_| Error::Authority)?
     }
+    fn diagnose_boot_timeout(&self) {
+        if matches!(
+            self.session.state,
+            State::Failed {
+                stage: super::Stage::PatchSemaphore,
+                error: Error::Timeout,
+            }
+        ) {
+            self.session
+                .backend
+                .boot_timeout(self.session.seq, self.session.events.len());
+        }
+    }
+
     /// Start once. Dropping this borrowed future requests no reset/replay.
     pub async fn run(&mut self) -> Result<Report, Error> {
-        self.session.run().await
+        let result = self.session.run().await;
+        if result.is_err() {
+            self.diagnose_boot_timeout();
+        }
+        result
     }
     /// Query the real radio identity and select on-chip EFUSE calibration.
     /// This does not yet enable packet transmission or register an interface.
@@ -2088,10 +2157,18 @@ impl Transport {
     /// The caller closes carrier before awaiting. No association/key replay is
     /// attempted; a fresh scan/association is required after successful recovery.
     pub async fn recover(&mut self, expected_mac: [u8; 6]) -> Result<RadioInfo, Error> {
-        self.session.recover(expected_mac).await
+        let result = self.session.recover(expected_mac).await;
+        if result.is_err() {
+            self.diagnose_boot_timeout();
+        }
+        result
     }
     pub(super) async fn recover_unregistered(&mut self) -> Result<RadioInfo, Error> {
-        self.session.recover_unregistered().await
+        let result = self.session.recover_unregistered().await;
+        if result.is_err() {
+            self.diagnose_boot_timeout();
+        }
+        result
     }
     /// Retire the old originator and queue one true-user-MPDU sequence
     /// sample, then let the ordinary service owner perform ADDBA at SN+1.

@@ -3724,14 +3724,21 @@ pub(crate) fn create_unix_socket_node(path: &str) {
         return;
     }
     if let Some((parent, leaf)) = resolve_parent_dir_async(path_ref) {
-        // 0o755: the socket node's mode; apps chmod it afterwards. If a
-        // stale node already occupies the name the app should have
-        // unlink'd it first — ignore the collision (bind already vetted
-        // the address via LISTENERS).
-        if matches!(
-            poll_blocking(parent.create_socket(&leaf, 0o755)),
-            Some(Ok(_))
-        ) {
+        // Linux unix_bind_bsd applies umask to the socket's 0777 mode before
+        // vfs_mknod; inode_init_owner supplies fsuid and either the parent's
+        // setgid group or fsgid. A root-owned marker makes an unprivileged
+        // creator's later chmod fail with EPERM (e.g. Codex daemon startup).
+        let mode = (0o777 & !current_umask()) as u16;
+        let inherited = inherit_acls_from_parent(&*parent, mode, false);
+        if let Some(Ok(file)) = poll_blocking(parent.create_socket_with_attrs(
+            &leaf,
+            inherited.mode,
+            inherited.uid,
+            inherited.gid,
+        )) {
+            if let Some(acl) = inherited.access {
+                let _ = poll_blocking(file.set_xattr("system.posix_acl_access", &acl, 0));
+            }
             crate::mqueue::notify_create(&abs, false);
         }
     }

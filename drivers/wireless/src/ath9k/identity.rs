@@ -37,6 +37,11 @@ pub enum BringUpError {
     BadCalibration,
     Policy,
     BadState,
+    /// BT asked for its calibration window (`mci::start_reset`) or the
+    /// reset handshake demands a recalibration
+    /// (`mci::EndReset::RecalibrationNeeded`): nothing is terminal, the
+    /// caller retries the generation reset.
+    RecalibrationNeeded,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

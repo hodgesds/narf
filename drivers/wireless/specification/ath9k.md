@@ -951,6 +951,36 @@ carries the MCI bit (`0x80`, `ATH9K_INT_MCI` `0x200`) while MCI is
 enabled; the owner runs `get_isr` plus `handle_interrupt` on its
 `RegisterIo` path when it is set.
 
+Live-owner integration: the AR9300 owner holds the shared `MciLink`
+(`btcoex::Btcoex` + the 512-byte coherent DMA buffer: 256-byte
+schedule table followed by the 256-byte GPM ring, one
+`dmam_alloc_coherent` as in `mci.c::ath_mci_setup`), created at probe
+(`init_scheme` with coexistence compiled in, `init_mci`, DMA fill with
+the reserved pattern, `mci::setup`). The packet engine holds a clone
+and reaches the engine only through the link's lock. Linux walks the
+GPM ring in the DMA buffer itself; this port keeps the CPU-side ring,
+so `mci::sync_gpm_ring` copies between the two at every walk boundary
+(pending slots DMA→CPU into recycled slots only; consumed slots cleared
+in the DMA buffer so a later walk from slot 0 cannot re-process them).
+`irq::enable`/`resume` carry the MCI bit in the async-cause mask
+(`mac.c::__ath9k_hw_enable_interrupts`); `service_begin` routes
+`Events.mci` to `get_isr` + `handle_interrupt`, and a dead-card latch
+or a BT calibration request closes the generation (the analogue of
+Linux queueing `RESET_TYPE_MCI`). The reset path follows
+`hw.c::ath9k_hw_reset`: `start_reset` first (a BT calibration window
+skips the reset, retried by the supervisor), `stop_bt` after retiring,
+`mci::reset` before calibration, `init_cal_req`/`init_cal_done` around
+it, `end_reset` after (a `RecalibrationNeeded` re-arms the TIMING4
+gain/DC/IQ-cal bit and retries the generation reset), then the
+MCI-branch enable (`bt_stomp` NONE, `enable_mci`), `check_bt` and
+`update_wlan_channels` for the target (`allow_all=false`; the `true`
+case is "no primary station", which this owner never has). The
+supervisor runs `check_bt` on its 500 ms tick; suspend runs
+`set_full_sleep`. A failed MCI reset degrades the generation to
+no-coexistence (WLAN still comes up); a failed DMA allocation or setup
+at probe leaves the engine not-ready. `mci::reset` is never called
+without the DMA buffer, so address 0 is never programmed.
+
 Calibration: `init_cal_req` / `init_cal_done` exchange the WLAN
 calibration request/done GPMs; `start_reset` grants BT its window and
 waits up to 25 ms for calibration done; `end_reset` wakes BT back up
@@ -1046,6 +1076,9 @@ recording HT state, and the owner calls
 `init_btcoex_hw` / `init_2wire` / `init_3wire` / `btcoex_enable` /
 `btcoex_disable` / `deinit` for the 2WIRE/3WIRE schemes). Fixture tests
 cover the message exchange end to end, capability
+Not in this step: the 2WIRE/3WIRE btcoex enable/init paths; the WoW
+`mci_enabled` flag integration (issue #1935 wires it once MCI lands).
+Fixture tests cover the message exchange end to end, capability
 gating per chip/OTP, interrupt routing, GPIO mux programming, the GPM
 walk, the calibration handshake, and the BT profile list + duty-cycle
 scheme (profile add/update/remove, the SCO/ACL caps, status-update
